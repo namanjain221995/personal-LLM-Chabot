@@ -1,0 +1,10 @@
+# Runtime dependencies for the Salesforce sync worker (Python 3.11 in the container).
+# Ranged pins: latest compatible patch/minor is fine; majors are capped.
+httpx>=0.27,<1
+PyJWT>=2.8,<3
+cryptography>=42,<47
+duckdb>=1.0,<2
+pyarrow>=16,<22
+pandas>=2.2,<3
+PyYAML>=6.0,<7
+lancedb>=0.8,<1

@@ -1,0 +1,56 @@
+# SearXNG configuration for the TechSara platform (Phase 1 web search).
+# Self-hosted, private metasearch. Only the orchestrator talks to it (internal
+# docker network); it is never exposed to the host. The JSON output format is
+# enabled so the orchestrator's SearxngProvider can consume results.
+#
+# The literal "ultrasecretkey" below is replaced at container start by the
+# SEARXNG_SECRET env var (the official image's entrypoint does this sed swap) —
+# set SEARXNG_SECRET in .env.
+use_default_settings: true
+
+server:
+  secret_key: "ultrasecretkey"
+  limiter: false          # single trusted internal caller
+  image_proxy: false
+
+search:
+  safe_search: 1
+  formats:
+    - html
+    - json               # <- required by SearxngProvider
+
+ui:
+  static_use_hash: true
+
+# Engine supply is the real ceiling on how many sources a research answer can
+# read — not any cap in the orchestrator. Out of the box only four general
+# engines are live, and two of them (DuckDuckGo, Startpage) serve a CAPTCHA
+# almost immediately, while Brave suspends after a handful of queries. Once all
+# four are suspended, search returns ZERO results and the app quietly answers
+# from model knowledge instead of the web.
+#
+# Widening the pool spreads the same queries across many independent upstream
+# quotas, so no single engine is hit hard enough to suspend, and a suspension
+# that does happen costs a fraction of the results instead of all of them.
+# These all ship with SearXNG and need no API key and no account.
+engines:
+  - name: mojeek
+    disabled: false
+  - name: bing
+    disabled: false
+  - name: qwant
+    disabled: false
+  - name: yahoo
+    disabled: false
+  - name: dogpile
+    disabled: false
+  - name: mwmbl
+    disabled: false
+  - name: wikipedia
+    disabled: false
+  - name: stackexchange
+    disabled: false
+  - name: github
+    disabled: false
+  - name: arxiv
+    disabled: false

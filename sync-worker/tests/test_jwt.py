@@ -1,0 +1,151 @@
+import time
+
+import jwt
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+
+from syncworker.sf_auth import JWT_VALIDITY_SECONDS, build_jwt_assertion
+
+CLIENT_ID = "3MVG9test.client.id"
+USERNAME = "integration@techsarasolutions.com"
+LOGIN_URL = "https://login.salesforce.com"
+
+
+def _throwaway_keypair():
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    private_pem = key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    public_pem = key.public_key().public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    return private_pem, public_pem
+
+
+def test_assertion_decodes_with_expected_claims():
+    private_pem, public_pem = _throwaway_keypair()
+    now = int(time.time())
+
+    token = build_jwt_assertion(CLIENT_ID, USERNAME, LOGIN_URL, private_pem, now=now)
+
+    header = jwt.get_unverified_header(token)
+    assert header["alg"] == "RS256"
+
+    claims = jwt.decode(
+        token, public_pem, algorithms=["RS256"], audience=LOGIN_URL
+    )
+    assert claims["iss"] == CLIENT_ID
+    assert claims["sub"] == USERNAME
+    assert claims["aud"] == LOGIN_URL
+    assert claims["exp"] == now + JWT_VALIDITY_SECONDS  # now + 3 minutes
+
+
+def test_assertion_rejects_wrong_key():
+    private_pem, _ = _throwaway_keypair()
+    _, other_public_pem = _throwaway_keypair()
+
+    token = build_jwt_assertion(CLIENT_ID, USERNAME, LOGIN_URL, private_pem)
+
+    try:
+        jwt.decode(token, other_public_pem, algorithms=["RS256"], audience=LOGIN_URL)
+    except jwt.InvalidSignatureError:
+        pass
+    else:
+        raise AssertionError("signature verification should have failed")
+
+
+def test_assertion_expiry_enforced():
+    private_pem, public_pem = _throwaway_keypair()
+    stale_now = int(time.time()) - JWT_VALIDITY_SECONDS - 120
+
+    token = build_jwt_assertion(
+        CLIENT_ID, USERNAME, LOGIN_URL, private_pem, now=stale_now
+    )
+
+    try:
+        jwt.decode(token, public_pem, algorithms=["RS256"], audience=LOGIN_URL)
+    except jwt.ExpiredSignatureError:
+        pass
+    else:
+        raise AssertionError("expired assertion should have been rejected")
+
+
+# ---------------------------------------------------------------------------
+# The client-credentials grant
+# ---------------------------------------------------------------------------
+
+
+def test_a_secret_uses_client_credentials_and_signs_nothing(monkeypatch):
+    """No key is configured at all, so any attempt to build a JWT would crash.
+    Reaching the token endpoint at all proves the other branch was taken."""
+    import httpx
+
+    from syncworker.sf_auth import TokenManager
+    from syncworker.secrets import SalesforceCredentials
+
+    sent = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.update(dict(httpx.QueryParams(request.content.decode())))
+        return httpx.Response(200, json={
+            "access_token": "tok", "instance_url": "https://x.my.salesforce.com/"})
+
+    creds = SalesforceCredentials(
+        client_id="cid", username="u", login_url="https://x.my.salesforce.com",
+        client_secret="shhh",
+    )
+    tm = TokenManager(creds, http=httpx.Client(transport=httpx.MockTransport(handler)))
+    token, instance = tm.get_token()
+
+    assert token == "tok"
+    assert instance == "https://x.my.salesforce.com"  # trailing slash stripped
+    assert sent["grant_type"] == "client_credentials"
+    assert sent["client_id"] == "cid" and sent["client_secret"] == "shhh"
+    assert "assertion" not in sent
+
+
+def test_the_wrong_domain_error_says_which_url_to_use():
+    """Salesforce's own message ("request not supported on this domain") does
+    not mention My Domain, which is the whole fix."""
+    import httpx
+    import pytest
+
+    from syncworker.sf_auth import TokenManager
+    from syncworker.secrets import SalesforceCredentials
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={
+            "error": "invalid_grant",
+            "error_description": "request not supported on this domain"})
+
+    creds = SalesforceCredentials(
+        client_id="cid", username="u",
+        login_url="https://login.salesforce.com", client_secret="shhh",
+    )
+    tm = TokenManager(creds, http=httpx.Client(transport=httpx.MockTransport(handler)))
+    with pytest.raises(RuntimeError, match="My Domain"):
+        tm.get_token()
+
+
+def test_a_missing_run_as_user_is_named():
+    import httpx
+    import pytest
+
+    from syncworker.sf_auth import TokenManager
+    from syncworker.secrets import SalesforceCredentials
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={
+            "error": "invalid_grant",
+            "error_description": "no client credentials user enabled"})
+
+    creds = SalesforceCredentials(
+        client_id="cid", username="u",
+        login_url="https://x.my.salesforce.com", client_secret="shhh",
+    )
+    tm = TokenManager(creds, http=httpx.Client(transport=httpx.MockTransport(handler)))
+    with pytest.raises(RuntimeError, match="Run As"):
+        tm.get_token()

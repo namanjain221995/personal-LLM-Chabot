@@ -1,0 +1,852 @@
+# Salesforce sync configuration — the eight standard objects synced in Phase 1 (spec §7).
+#
+# Per object:
+#   fields:     columns pulled from Salesforce. Must include Id and SystemModstamp
+#               (Id drives the DuckDB upsert, SystemModstamp drives the incremental
+#               watermark). The loader rejects configs missing either.
+#   rag_fields: long-text fields that are chunked (~800 tokens, 100 overlap),
+#               embedded via the vLLM OpenAI-compatible /embeddings endpoint
+#               and stored in the LanceDB `chunks` table.
+#               Every rag_field must also be listed in fields.
+#
+# ── Adding a custom object later ─────────────────────────────────────────────
+# Append an entry like the one below (uncommented). No code change is needed:
+# the sync loop, Parquet/DuckDB storage and RAG indexing are driven entirely by
+# this file. The first sync after adding it performs a Bulk API full extract,
+# after which it switches to incremental SystemModstamp syncs automatically.
+#
+#   - name: Project__c
+#     fields:
+#       - Id
+#       - Name
+#       - Status__c
+#       - Account__c
+#       - Notes__c
+#       - SystemModstamp
+#     rag_fields:
+#       - Notes__c
+# ─────────────────────────────────────────────────────────────────────────────
+
+objects:
+- name: Account
+  fields:
+  - Id
+  - Name
+  - Type
+  - Industry
+  - NumberOfEmployees
+  - BillingCity
+  - BillingState
+  - BillingCountry
+  - Website
+  - Phone
+  - OwnerId
+  - CreatedDate
+  - LastModifiedDate
+  - Description
+  - AccountSource
+  - Jigsaw
+  - ParentId
+  - SicDesc
+  - SystemModstamp
+  rag_fields:
+  - Description
+- name: AccountContactRelation
+  fields:
+  - Id
+  - EndDate
+  - IsActive
+  - Relationship_Strength__c
+  - Roles
+  - StartDate
+  - SystemModstamp
+- name: Asset
+  fields:
+  - Id
+  - AccountId
+  - AssetLevel
+  - AssetProvidedById
+  - AssetServicedById
+  - ContactId
+  - Description
+  - InstallDate
+  - IsCompetitorProduct
+  - IsInternal
+  - Price
+  - Product2Id
+  - ProductCode
+  - PurchaseDate
+  - Quantity
+  - SerialNumber
+  - Status
+  - StockKeepingUnit
+  - UsageEndDate
+  - SystemModstamp
+  rag_fields:
+  - Description
+- name: AssetRelationship
+  fields:
+  - Id
+  - RelationshipType
+  - SystemModstamp
+- name: Campaign
+  fields:
+  - Id
+  - ActualCost
+  - AmountAllOpportunities
+  - AmountWonOpportunities
+  - BudgetedCost
+  - Description
+  - EndDate
+  - ExpectedResponse
+  - ExpectedRevenue
+  - IsActive
+  - NumberOfContacts
+  - NumberOfConvertedLeads
+  - NumberOfLeads
+  - NumberOfOpportunities
+  - NumberOfResponses
+  - NumberOfWonOpportunities
+  - NumberSent
+  - ParentId
+  - StartDate
+  - Status
+  - Type
+  - SystemModstamp
+  rag_fields:
+  - Description
+- name: Candidate_Training__c
+  fields:
+  - Id
+  - Candidate_Time_Zone_End_Time__c
+  - Candidate_Time_Zone_Start_Time__c
+  - SystemModstamp
+- name: Case
+  fields:
+  - Id
+  - CaseNumber
+  - AccountId
+  - ContactId
+  - Subject
+  - Status
+  - Priority
+  - Origin
+  - Type
+  - Reason
+  - IsClosed
+  - ClosedDate
+  - OwnerId
+  - CreatedDate
+  - LastModifiedDate
+  - Description
+  - IsEscalated
+  - SuppliedCompany
+  - SuppliedEmail
+  - SuppliedName
+  - SuppliedPhone
+  - SystemModstamp
+  rag_fields:
+  - Description
+  - Subject
+- name: ChangeRequest
+  fields:
+  - Id
+  - BusinessJustification
+  - BusinessReason
+  - Category
+  - ChangeType
+  - Description
+  - EstimatedEndTime
+  - EstimatedStartTime
+  - FinalReviewDateTime
+  - FinalReviewNotes
+  - RemediationPlan
+  - ReviewerId
+  - RiskImpactAnalysis
+  - SystemModstamp
+  rag_fields:
+  - BusinessJustification
+  - Description
+  - FinalReviewNotes
+  - RemediationPlan
+  - RiskImpactAnalysis
+- name: ChangeRequestRelatedItem
+  fields:
+  - Id
+  - Comment
+  - SystemModstamp
+  rag_fields:
+  - Comment
+- name: Contact
+  fields:
+  - Id
+  - FirstName
+  - LastName
+  - Email
+  - Phone
+  - Title
+  - Department
+  - AccountId
+  - MailingCity
+  - MailingState
+  - MailingCountry
+  - OwnerId
+  - CreatedDate
+  - LastModifiedDate
+  - Fax
+  - Jigsaw
+  - MobilePhone
+  - ReportsToId
+  - SystemModstamp
+- name: Contract
+  fields:
+  - Id
+  - ActivatedById
+  - ActivatedDate
+  - CompanySignedDate
+  - CompanySignedId
+  - ContractTerm
+  - CustomerSignedDate
+  - CustomerSignedId
+  - CustomerSignedTitle
+  - Description
+  - EndDate
+  - OwnerExpirationNotice
+  - Pricebook2Id
+  - SpecialTerms
+  - StartDate
+  - SystemModstamp
+  rag_fields:
+  - Description
+  - SpecialTerms
+- name: Idea
+  fields:
+  - Id
+  - Status
+  - SystemModstamp
+- name: Incident
+  fields:
+  - Id
+  - BusinessHoursId
+  - Category
+  - Description
+  - DetectedDateTime
+  - EndDateTime
+  - EntitlementId
+  - IsClosed
+  - IsMajorIncident
+  - IsStopped
+  - MilestoneStatus
+  - ParentIncidentId
+  - PriorityOverrideReason
+  - ReportedMethod
+  - ResolutionDateTime
+  - ResolutionSummary
+  - ResolvedById
+  - SlaExitDate
+  - SlaStartDate
+  - StartDateTime
+  - StopStartDate
+  - SubCategory
+  - Type
+  - SystemModstamp
+  rag_fields:
+  - Description
+  - ResolutionSummary
+- name: IncidentRelatedItem
+  fields:
+  - Id
+  - Comment
+  - SystemModstamp
+  rag_fields:
+  - Comment
+- name: Interview__c
+  fields:
+  - Id
+  - Advanced_to_Next_Round__c
+  - Application__c
+  - Approve_Stage__c
+  - Candidate_Feedback__c
+  - Candidate_Name__c
+  - Client_Feedback__c
+  - Company__c
+  - Date_of_Interview__c
+  - Description__c
+  - End_Time__c
+  - EndTime__c
+  - If_yes_why__c
+  - Incentive_eligiblle__c
+  - Interview_Status__c
+  - Interview_Support_provided__c
+  - Interview_Time_Zone__c
+  - Interview_Type__c
+  - Interviewer_s_Email__c
+  - Interviewer_s_Name__c
+  - JD_Link__c
+  - Job_Description__c
+  - Marketing__c
+  - Position__c
+  - Recruiter__c
+  - Recruiter_Name__c
+  - Recruiter_s_Email__c
+  - Recruiter_s_Name__c
+  - Request_Raised__c
+  - Resume_Link__c
+  - Round__c
+  - Schedule_Date__c
+  - Start_Time__c
+  - StartTime__c
+  - Support_not_provided_reason__c
+  - Support_Notes__c
+  - Vendor__c
+  - Vendor_Feedback__c
+  - Vendor_Name__c
+  - Why_not_eligible__c
+  - SystemModstamp
+  rag_fields:
+  - Candidate_Feedback__c
+  - Client_Feedback__c
+  - Description__c
+  - If_yes_why__c
+  - Job_Description__c
+  - Support_not_provided_reason__c
+  - Support_Notes__c
+  - Vendor_Feedback__c
+  - Why_not_eligible__c
+- name: Invoice__c
+  fields:
+  - Id
+  - Due_Date__c
+  - Type__c
+  - SystemModstamp
+- name: Lead
+  fields:
+  - Id
+  - FirstName
+  - LastName
+  - Company
+  - Email
+  - Phone
+  - Status
+  - LeadSource
+  - Industry
+  - Rating
+  - City
+  - State
+  - Country
+  - IsConverted
+  - ConvertedAccountId
+  - ConvertedContactId
+  - ConvertedOpportunityId
+  - OwnerId
+  - CreatedDate
+  - LastModifiedDate
+  - Jigsaw
+  - MobilePhone
+  - NumberOfEmployees
+  - Title
+  - Website
+  - SystemModstamp
+- name: Marketing__c
+  fields:
+  - Id
+  - Actual_Joining_Date__c
+  - Assign_to_Lead__c
+  - Initial_call_completed__c
+  - Introduction_script_created__c
+  - Job_boards_created__c
+  - Offer_Letter_Date__c
+  - Reason_for_paused__c
+  - Reason_for_Stop__c
+  - Recruiter__c
+  - Resume_Understanding_Session__c
+  - Status__c
+  - Tentative_Joining_Date__c
+  - SystemModstamp
+  rag_fields:
+  - Reason_for_paused__c
+  - Reason_for_Stop__c
+- name: Onboarding__c
+  fields:
+  - Id
+  - CGPA_Score__c
+  - Course_Name__c
+  - Declaration__c
+  - Degree__c
+  - Degree_End_Date__c
+  - Degree_Start_Date__c
+  - Education_Country__c
+  - Institute__c
+  - Institute_Country__c
+  - Institutes__c
+  - Niche__c
+  - Niche_Other__c
+  - Onboarding_Form_Link__c
+  - Onboarding_Form_Status__c
+  - Passport_Number__c
+  - WhatsApp_Number__c
+  - SystemModstamp
+- name: Opportunity
+  fields:
+  - Id
+  - Name
+  - AccountId
+  - StageName
+  - Amount
+  - Probability
+  - CloseDate
+  - Type
+  - LeadSource
+  - ForecastCategoryName
+  - IsClosed
+  - IsWon
+  - OwnerId
+  - CreatedDate
+  - LastModifiedDate
+  - Description
+  - NextStep
+  - Budget_Confirmed__c
+  - CampaignId
+  - ContractId
+  - Discovery_Completed__c
+  - Loss_Reason__c
+  - pandadoc__TrackingNumber__c
+  - ROI_Analysis_Completed__c
+  - SystemModstamp
+  rag_fields:
+  - Description
+  - NextStep
+- name: OpportunityLineItem
+  fields:
+  - Id
+  - Description
+  - ListPrice
+  - ProductCode
+  - ServiceDate
+  - TotalPrice
+  - SystemModstamp
+- name: Order
+  fields:
+  - Id
+  - ActivatedById
+  - ActivatedDate
+  - CompanyAuthorizedById
+  - CustomerAuthorizedById
+  - Description
+  - TotalAmount
+  - Type
+  - SystemModstamp
+  rag_fields:
+  - Description
+- name: OrderItem
+  fields:
+  - Id
+  - Description
+  - EndDate
+  - ListPrice
+  - ServiceDate
+  - SystemModstamp
+- name: Problem
+  fields:
+  - Id
+  - Category
+  - Description
+  - ParentProblemId
+  - PriorityOverrideReason
+  - ResolutionDateTime
+  - ResolutionSummary
+  - ResolvedById
+  - RootCauseSummary
+  - SubCategory
+  - SystemModstamp
+  rag_fields:
+  - Description
+  - ResolutionSummary
+  - RootCauseSummary
+- name: ProblemRelatedItem
+  fields:
+  - Id
+  - Comment
+  - SystemModstamp
+  rag_fields:
+  - Comment
+- name: Product2
+  fields:
+  - Id
+  - Description
+  - DisplayUrl
+  - ExternalDataSourceId
+  - ExternalId
+  - Family
+  - ProductCode
+  - QuantityUnitOfMeasure
+  - StockKeepingUnit
+  - SystemModstamp
+  rag_fields:
+  - Description
+- name: Quote
+  fields:
+  - Id
+  - AccountId
+  - AdditionalName
+  - BillingName
+  - ContactId
+  - ContractId
+  - Description
+  - Discount
+  - Email
+  - ExpirationDate
+  - Fax
+  - GrandTotal
+  - Phone
+  - QuoteToName
+  - ShippingHandling
+  - ShippingName
+  - Status
+  - Subtotal
+  - Tax
+  - TotalPrice
+  - SystemModstamp
+  rag_fields:
+  - Description
+- name: QuoteLineItem
+  fields:
+  - Id
+  - Description
+  - Discount
+  - ListPrice
+  - ServiceDate
+  - Subtotal
+  - TotalPrice
+  - SystemModstamp
+- name: Recruiter__c
+  fields:
+  - Id
+  - Assigned_Sr_Recruiter__c
+  - COMPASS_State_JSON__c
+  - COMPASS_State_Last_Saved_UTC__c
+  - COMPASS_State_Schema_Version__c
+  - Date_of_Joining__c
+  - Description__c
+  - Email__c
+  - Employment_Status__c
+  - Experience_Level__c
+  - First_Name__c
+  - Last_Name__c
+  - Last_Working_Date__c
+  - No_of_Assigned_Candidates__c
+  - On_Leave_Today__c
+  - PersonAccount__c
+  - Recruiter_Contact__c
+  - Recruiter_User__c
+  - Slack_User_Id__c
+  - Target_Per_Candidate__c
+  - Total_Target__c
+  - SystemModstamp
+  rag_fields:
+  - COMPASS_State_JSON__c
+  - Description__c
+- name: SocialPersona
+  fields:
+  - Id
+  - AreWeFollowing
+  - AuthorLabels
+  - Bio
+  - Followers
+  - Following
+  - InfluencerScore
+  - IsBlacklisted
+  - IsFollowingUs
+  - IsVerified
+  - ListedCount
+  - MediaProvider
+  - MediaType
+  - NumberOfFriends
+  - NumberOfTweets
+  - ProfileType
+  - R6SourceId
+  - RealName
+  - SourceApp
+  - TopicType
+  - SystemModstamp
+  rag_fields:
+  - Bio
+- name: SocialPost
+  fields:
+  - Id
+  - AnalyzerScore
+  - AssignedTo
+  - AttachmentType
+  - AttachmentUrl
+  - Classification
+  - CommentCount
+  - Content
+  - DeletedById
+  - EngagementLevel
+  - ExternalPostId
+  - HarvestDate
+  - HiddenById
+  - InboundLinkCount
+  - IsOutbound
+  - KeywordGroupName
+  - Language
+  - LikesAndVotes
+  - MediaProvider
+  - MediaType
+  - MessageType
+  - Notes
+  - OutboundSocialAccountId
+  - ParentId
+  - PersonaId
+  - PostPriority
+  - PostTags
+  - PostUrl
+  - R6PostId
+  - R6SourceId
+  - R6TopicId
+  - Recipient
+  - RecipientType
+  - ReplyToId
+  - ResponseContextExternalId
+  - ReviewedStatus
+  - ReviewScale
+  - ReviewScore
+  - Sentiment
+  - Shares
+  - SourceTags
+  - SpamRating
+  - Status
+  - StatusMessage
+  - ThreadSize
+  - TopicProfileName
+  - TopicType
+  - UniqueCommentors
+  - ViewCount
+  - WhoId
+  - SystemModstamp
+  rag_fields:
+  - Content
+  - Notes
+  - PostTags
+  - SourceTags
+  - StatusMessage
+- name: Solution
+  fields:
+  - Id
+  - IsPublished
+  - IsPublishedInPublicKb
+  - SolutionNote
+  - SystemModstamp
+  rag_fields:
+  - SolutionNote
+- name: Step_Deliverable_Definition__c
+  fields:
+  - Id
+  - Type__c
+  - SystemModstamp
+- name: User
+  fields:
+  - Id
+  - FirstName
+  - LastName
+  - Email
+  - Username
+  - Title
+  - Department
+  - IsActive
+  - UserRoleId
+  - ProfileId
+  - ManagerId
+  - CreatedDate
+  - LastModifiedDate
+  - SystemModstamp
+- name: WorkOrder
+  fields:
+  - Id
+  - AccountId
+  - AssetId
+  - BusinessHoursId
+  - CaseId
+  - ContactId
+  - Description
+  - Discount
+  - Duration
+  - DurationInMinutes
+  - DurationType
+  - EndDate
+  - EntitlementId
+  - GrandTotal
+  - IsClosed
+  - IsStopped
+  - LineItemCount
+  - LocationId
+  - MilestoneStatus
+  - ParentWorkOrderId
+  - Pricebook2Id
+  - Priority
+  - RootWorkOrderId
+  - ServiceAppointmentCount
+  - ServiceContractId
+  - SlaExitDate
+  - SlaStartDate
+  - StartDate
+  - Status
+  - StatusCategory
+  - StopStartDate
+  - Subject
+  - Subtotal
+  - Tax
+  - TotalPrice
+  - SystemModstamp
+  rag_fields:
+  - Description
+- name: WorkOrderLineItem
+  fields:
+  - Id
+  - AssetId
+  - Description
+  - Discount
+  - EndDate
+  - IsClosed
+  - ListPrice
+  - LocationId
+  - OrderId
+  - ParentWorkOrderLineItemId
+  - PricebookEntryId
+  - Priority
+  - Product2Id
+  - Quantity
+  - RootWorkOrderLineItemId
+  - ServiceAppointmentCount
+  - StartDate
+  - Status
+  - StatusCategory
+  - Subject
+  - Subtotal
+  - TotalPrice
+  - UnitPrice
+  - SystemModstamp
+  rag_fields:
+  - Description
+- name: WorkPlan
+  fields:
+  - Id
+  - Description
+  - WorkOrderLineItemId
+  - WorkPlanTemplateId
+  - SystemModstamp
+  rag_fields:
+  - Description
+- name: WorkPlanTemplate
+  fields:
+  - Id
+  - Description
+  - IsActive
+  - RelativeExecutionOrder
+  - SystemModstamp
+  rag_fields:
+  - Description
+- name: WorkPlanTemplateEntry
+  fields:
+  - Id
+  - ExecutionOrder
+  - SystemModstamp
+- name: WorkStep
+  fields:
+  - Id
+  - ActionDefinition
+  - ActionType
+  - Description
+  - EndTime
+  - PausedFlowInterviewId
+  - StartTime
+  - WorkOrderLineItemId
+  - WorkPlanExecutionOrder
+  - SystemModstamp
+  rag_fields:
+  - Description
+- name: WorkStepTemplate
+  fields:
+  - Id
+  - ActionDefinition
+  - ActionType
+  - Description
+  - IsActive
+  - SystemModstamp
+  rag_fields:
+  - Description
+- name: pandadoc__DocStatus__c
+  fields:
+  - Id
+  - pandadoc__InputJSON__c
+  - pandadoc__InputJSON_EV2__c
+  - pandadoc__Status__c
+  - SystemModstamp
+  rag_fields:
+  - pandadoc__InputJSON__c
+  - pandadoc__InputJSON_EV2__c
+- name: pandadoc__Object_Tokens__c
+  fields:
+  - Id
+  - pandadoc__Data__c
+  - SystemModstamp
+  rag_fields:
+  - pandadoc__Data__c
+- name: pandadoc__PandaDocDocument__c
+  fields:
+  - Id
+  - pandadoc__Account__c
+  - pandadoc__Contact__c
+  - pandadoc__Custom_Object_Id__c
+  - pandadoc__Editor_Version__c
+  - pandadoc__File_With_Content__c
+  - pandadoc__InputJSON__c
+  - pandadoc__InputJSON_EV2__c
+  - pandadoc__Is_Deleted__c
+  - pandadoc__Lead__c
+  - pandadoc__Opportunity__c
+  - pandadoc__ParentId__c
+  - pandadoc__Status__c
+  - pandadoc__Template_Id__c
+  - pandadoc__Template_Name__c
+  - pandadoc__UUID__c
+  - SystemModstamp
+  rag_fields:
+  - pandadoc__InputJSON__c
+  - pandadoc__InputJSON_EV2__c
+- name: pandadoc__PandaDocLog__c
+  fields:
+  - Id
+  - pandadoc__Description__c
+  - pandadoc__Level__c
+  - pandadoc__Location__c
+  - pandadoc__Log_Data__c
+  - SystemModstamp
+  rag_fields:
+  - pandadoc__Description__c
+  - pandadoc__Log_Data__c
+- name: pandadoc__Pricing_Item_Mapping__c
+  fields:
+  - Id
+  - pandadoc__Config_JSON__c
+  - SystemModstamp
+  rag_fields:
+  - pandadoc__Config_JSON__c
+- name: pandadoc__Recipient_Map__c
+  fields:
+  - Id
+  - pandadoc__Config_JSON__c
+  - SystemModstamp
+  rag_fields:
+  - pandadoc__Config_JSON__c
+- name: pandadoc__TriggerSetting__c
+  fields:
+  - Id
+  - pandadoc__Custom_Settings__c
+  - pandadoc__Enabled__c
+  - pandadoc__EV1_Ready__c
+  - pandadoc__EV2_Ready__c
+  - pandadoc__Title__c
+  - SystemModstamp
+  rag_fields:
+  - pandadoc__Custom_Settings__c

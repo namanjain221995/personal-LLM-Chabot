@@ -1,0 +1,86 @@
+# ---------------------------------------------------------------------------
+# Secrets — nothing here may ever be committed.
+#
+# .env holds the Salesforce Consumer Secret (read access to the PRODUCTION
+# org), the Hugging Face token and the SearXNG secret. The backup patterns
+# matter as much as .env itself: `cp .env .env.bak-123456` is the natural
+# thing to do before an edit, and an unignored copy leaks exactly the same
+# credentials under a name nobody thinks to check.
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+secrets/
+*.pem
+*.key
+*.p12
+.session_secret
+
+# ---------------------------------------------------------------------------
+# Data and generated artifacts
+#
+# The DuckDB warehouse, the LanceDB vector store and app.sqlite3 are all
+# rebuildable from Salesforce; none of them belong in version control.
+# ---------------------------------------------------------------------------
+data/
+reports/
+uploads/
+workspace/
+*.duckdb
+*.duckdb.wal
+*.sqlite3
+*.sqlite3-journal
+*.parquet
+lancedb/
+sf_dictionary.json
+
+# Model weights and caches (see VLLM_MODELS_DIR — tens of GB)
+models/
+*.safetensors
+*.gguf
+hf-cache/
+
+# ---------------------------------------------------------------------------
+# Backups left behind by edits — noise at best, secrets at worst
+# ---------------------------------------------------------------------------
+*.bak
+*.bak-*
+*.orig
+*.rej
+*~
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# ---------------------------------------------------------------------------
+# Node / Next.js
+# ---------------------------------------------------------------------------
+node_modules/
+.next/
+out/
+.turbo/
+*.tsbuildinfo
+npm-debug.log*
+yarn-error.log*
+
+# ---------------------------------------------------------------------------
+# Editors and OS
+# ---------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

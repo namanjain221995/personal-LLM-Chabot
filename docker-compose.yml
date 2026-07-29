@@ -1,0 +1,355 @@
+# TechSara Local AI Analysis Platform — docker-compose (spec §6, model serving per
+# the vLLM design: owner override of spec §4 on 2026-07-22 — all models on vLLM).
+# Secrets come ONLY from .env via ${VAR} interpolation. Never hardcode them here.
+
+name: sf-local-ai
+
+volumes:
+  hf-cache:
+  data:
+  reports:
+
+services:
+  # --------------------------------------------------------------------------
+  # vLLM model services — all OpenAI-compatible, all on nvcr.io/nvidia/vllm
+  # (arm64 verified on this box). Models auto-download from Hugging Face into
+  # the shared hf-cache volume on first start.
+  #
+  # GPU memory budget: --gpu-memory-utilization fractions of the 121 GB
+  # UNIFIED memory (this is not a discrete GPU — the fraction comes out of the
+  # same pool as the OS and every other container).
+  #   0.35 (vllm: 22 GB weights + ~10.5 GB KV at 262144 with fp8)
+  # + 0.14 (vllm-router/agent: 10 GB weights + ~4.7 GB KV at 65536)
+  # + 0.04 (vllm-embed)  ≈ 0.53, leaving ~57 GB for the orchestrator's
+  # in-process reranker, DuckDB/LanceDB, the frontend and the OS.
+  # Over-reserving here took the box to 0 GB free once — keep the sum ≲ 0.6.
+  # --------------------------------------------------------------------------
+
+  vllm:
+    # vLLM 0.23.x (official nightly, arm64). The NGC 26.05 image ships vLLM
+    # 0.20.1, whose Qwen3.6 loader cannot read a QUANTIZED Qwen3.6 checkpoint:
+    # NVIDIA's NVFP4 build dies on `layers.*.mlp.experts.w2_input_scale` and the
+    # compressed-tensors build on `lm_head.weight_scale`. 0.23 adds the missing
+    # parameter definitions (plus modelopt_mixed / nvfp4_per_token).
+    # NOTE: this image's ENTRYPOINT is already ["vllm","serve"], so `command`
+    # supplies ARGUMENTS ONLY — no leading "vllm serve".
+    image: vllm/vllm-openai:nightly
+    # MAIN model (2026-07-28): Qwen3.6-35B-A3B in NVIDIA NVFP4 (~22 GB), served
+    # from the local weights directory rather than the HF cache. MoE
+    # (35B total / 3B active), MULTIMODAL, with a reasoning stream — it serves
+    # every heavy path: chat, SQL, RAG, reports, vision, PDF, and the agent's
+    # planning + synthesis.
+    #
+    # Context: the native window is 262144 and this architecture has only TWO
+    # KV heads (head_dim 256, 40 layers) → ~80 KiB/token, halved again by
+    # --kv-cache-dtype fp8. The full 256K window therefore costs ~10 GB of KV,
+    # which is why it is affordable here where the old 4-KV-head model was not.
+    #
+    # --served-model-name keeps a stable, readable id in the API and in the
+    # trust metadata even though the weights load from a path.
+    #
+    # Performance flags (2026-07-28, from interview-analysis-v2 serve_model.sh,
+    # NVIDIA's DGX Spark recipe for this NVFP4 checkpoint): modelopt quant kernels,
+    # flashinfer attention + marlin MoE backends, chunked prefill and prefix
+    # caching. These speed up prefill/decode WITHOUT changing the memory budget
+    # (gpu-mem-util stays 0.35) or the context window (stays 262144), so the
+    # shared stack (router+embed) is unaffected.
+    # --max-num-batched-tokens 8192 is REQUIRED here: this is a hybrid-Mamba model,
+    # and --enable-prefix-caching forces "Mamba align" mode whose block_size (2096)
+    # must be <= max-num-batched-tokens (default 2048 → engine-core assertion fail).
+    # NOTE: --max-num-seqs is deliberately left at the vLLM default (NOT set to 4
+    # like serve_model.sh) — 4 would cap concurrency and throttle this shared,
+    # multi-consumer server. max-num-batched-tokens does not limit concurrency.
+    command: >
+      /models/Qwen3.6-35B-A3B-NVFP4
+      --served-model-name Qwen/Qwen3.6-35B-A3B-NVFP4
+      --host 0.0.0.0
+      --port 30000
+      --max-model-len 262144
+      --gpu-memory-utilization 0.35
+      --kv-cache-dtype fp8
+      --reasoning-parser qwen3
+      --trust-remote-code
+      --quantization modelopt
+      --attention-backend flashinfer
+      --moe-backend marlin
+      --enable-chunked-prefill
+      --enable-prefix-caching
+      --max-num-batched-tokens 8192
+    environment:
+      HF_TOKEN: ${HF_TOKEN}
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+      # Local weights, read-only: nothing in the container may modify them.
+      - ${VLLM_MODELS_DIR:-/home/techsphere/Documents/projects/vllm_models}:/models:ro
+    ports:
+      - "8000:30000"
+    shm_size: 32g
+    ipc: host
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:30000/health || exit 1"]
+      interval: 30s
+      retries: 60
+      start_period: 30m # ~65 GB download on first start
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  vllm-vision:
+    image: nvcr.io/nvidia/vllm:26.05-py3
+    # Vision model right-sized for this box (2026-07-23). Journey: the spec's
+    # Qwen3-VL-8B (16.6 GB) never fit; the 4B (8.9 GB) LOADED at
+    # gpu-mem 0.10 but crashed while actually processing an image — with
+    # gpt-oss-120b holding ~64 GB, the ~5 GB left was too little for the vision
+    # encoder's activation spike. Settled on the 2B (4.3 GB): it leaves enough
+    # headroom to run image inference reliably without swap. Still a solid
+    # OCR/document VL for invoices, contracts and screenshots.
+    # Opt-in via profile so a plain `up -d` never starts it:
+    #     docker compose --profile vision up -d vllm-vision
+    # The orchestrator does not wait on it; /health shows "degraded" while off,
+    # and only image-upload answers are affected.
+    profiles: ["vision"]
+    # --enforce-eager: Qwen3-VL's "deepstack" visual tokens overflow the
+    # CUDA-graph-captured buffer on real images ("Requested more deepstack
+    # tokens than available in buffer"); running eager avoids the fixed-size
+    # capture. Bonus: no graph capture → a little less memory on this tight box.
+    command: >
+      vllm serve Qwen/Qwen3-VL-2B-Instruct
+      --host 0.0.0.0
+      --port 30001
+      --max-model-len 8192
+      --gpu-memory-utilization 0.11
+      --enforce-eager
+    environment:
+      HF_TOKEN: ${HF_TOKEN}
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+    ports:
+      - "8001:30001"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:30001/health || exit 1"]
+      interval: 30s
+      retries: 60
+      start_period: 20m
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # The AGENT model (2026-07-28): Qwen3-VL-8B-Instruct-FP8 (~10 GB, local).
+  # The agent fans out several sub-steps per task, so running them on the
+  # small multimodal model keeps a heavy request from monopolising the main
+  # model's KV pool — planning and final synthesis still happen on the 35B.
+  # It also serves the cheap classification calls (route, auto-orchestration),
+  # where its INSTRUCT (non-thinking) nature is exactly what you want.
+  # Same nightly runtime as the main service; ENTRYPOINT is ["vllm","serve"].
+  vllm-router:
+    image: vllm/vllm-openai:nightly
+    command: >
+      /models/qwen3-vl-8b-fp8
+      --served-model-name Qwen/Qwen3-VL-8B-Instruct-FP8
+      --host 0.0.0.0
+      --port 30002
+      --max-model-len 65536
+      --gpu-memory-utilization 0.14
+      --kv-cache-dtype fp8
+    environment:
+      HF_TOKEN: ${HF_TOKEN}
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+      - ${VLLM_MODELS_DIR:-/home/techsphere/Documents/projects/vllm_models}:/models:ro
+    ports:
+      - "8002:30002"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:30002/health || exit 1"]
+      interval: 30s
+      retries: 60
+      start_period: 15m
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  vllm-embed:
+    image: nvcr.io/nvidia/vllm:26.05-py3
+    # vLLM v0.20 (26.05 image) uses `--runner pooling` for embedding models
+    # (the older `--task embed` flag was removed upstream).
+    command: >
+      vllm serve Qwen/Qwen3-Embedding-0.6B
+      --host 0.0.0.0
+      --port 30003
+      --max-model-len 4096
+      --gpu-memory-utilization 0.04
+      --runner pooling
+    environment:
+      HF_TOKEN: ${HF_TOKEN}
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+    ports:
+      - "8003:30003"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:30003/health || exit 1"]
+      interval: 30s
+      retries: 60
+      start_period: 10m
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  orchestrator:
+    build: ./orchestrator
+    environment:
+      # Live, READ-ONLY Salesforce lookups for data newer than the last sync
+      # or on objects the warehouse does not carry. Same read-only integration
+      # user as the sync worker; the client-credentials grant needs the org's
+      # My Domain URL.
+      SF_CLIENT_ID: ${SF_CLIENT_ID:-}
+      SF_CLIENT_SECRET: ${SF_CLIENT_SECRET:-}
+      SF_LOGIN_URL: ${SF_LOGIN_URL:-}
+      SF_API_VERSION: ${SF_API_VERSION:-v61.0}
+      SF_LIVE_ENABLED: ${SF_LIVE_ENABLED:-true}
+      OPENAI_BASE_URL: http://vllm:30000/v1
+      OPENAI_API_KEY: local-no-key
+      MAIN_MODEL: Qwen/Qwen3.6-35B-A3B-NVFP4
+      DEFAULT_MAX_CONTEXT: "32768"
+      # Cheap classification + agent sub-steps run on the small model.
+      ROUTER_BASE_URL: http://vllm-router:30002/v1
+      ROUTER_MODEL: Qwen/Qwen3-VL-8B-Instruct-FP8
+      AGENT_BASE_URL: http://vllm-router:30002/v1
+      AGENT_MODEL: Qwen/Qwen3-VL-8B-Instruct-FP8
+      # Vision runs on the multimodal main model (same endpoint).
+      VISION_BASE_URL: http://vllm:30000/v1
+      VISION_MODEL: Qwen/Qwen3.6-35B-A3B-NVFP4
+      EMBED_BASE_URL: http://vllm-embed:30003/v1
+      EMBED_MODEL: Qwen/Qwen3-Embedding-0.6B
+      RERANKER_MODEL: Qwen/Qwen3-Reranker-0.6B
+      RERANK_ENABLED: "true"
+      DUCKDB_PATH: /data/warehouse.duckdb
+      LANCEDB_DIR: /data/lancedb
+      PARQUET_DIR: /data/parquet
+      REPORTS_DIR: /reports
+      SESSION_SECRET: ${SESSION_SECRET:-}
+      # Phase 1 web search + Phase 6 token budget.
+      SEARCH_ENABLED: ${SEARCH_ENABLED:-false}
+      SEARCH_PROVIDER: ${SEARCH_PROVIDER:-searxng}
+      SEARXNG_URL: ${SEARXNG_URL:-http://searxng:8080}
+      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+      BRAVE_API_KEY: ${BRAVE_API_KEY:-}
+      SEARCH_MAX_RESULTS: ${SEARCH_MAX_RESULTS:-100}
+      FETCH_TIMEOUT_MS: ${FETCH_TIMEOUT_MS:-8000}
+      FETCH_MAX_BYTES: ${FETCH_MAX_BYTES:-5000000}
+      MODEL_MAX_CONTEXT: ${MODEL_MAX_CONTEXT:-262144}
+      MODEL_MAX_OUTPUT: ${MODEL_MAX_OUTPUT:-8192}
+      URL_ANALYSIS_ENABLED: ${URL_ANALYSIS_ENABLED:-true}
+      URL_MAX_PAGES: ${URL_MAX_PAGES:-5}
+      REPO_ANALYSIS_ENABLED: ${REPO_ANALYSIS_ENABLED:-true}
+      REPO_MAX_MB: ${REPO_MAX_MB:-300}
+      REPO_MAX_FILES: ${REPO_MAX_FILES:-20000}
+      WORKSPACE_TTL_HOURS: ${WORKSPACE_TTL_HOURS:-24}
+      WORKSPACE_QUOTA_GB: ${WORKSPACE_QUOTA_GB:-20}
+    volumes:
+      - data:/data
+      - reports:/reports
+      - hf-cache:/root/.cache/huggingface
+    ports:
+      - "8080:8080"
+    depends_on:
+      vllm:
+        condition: service_healthy
+      vllm-router:
+        condition: service_healthy
+      # vllm-vision is intentionally NOT a dependency — it runs under the
+      # "vision" profile (see above) and must never gate the app layer.
+      vllm-embed:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  sync-worker:
+    build: ./sync-worker
+    environment:
+      # AWS Secrets Manager was REMOVED (2026-07-28) — nothing here calls a
+      # cloud service. Salesforce credentials come from .env plus the signing
+      # key file below.
+      # Direct Salesforce JWT credentials (owner override): with the three
+      # identity vars plus EITHER key form below, Secrets Manager is skipped.
+      SF_CLIENT_ID: ${SF_CLIENT_ID:-}
+      SF_USERNAME: ${SF_USERNAME:-}
+      # For the client-credentials grant this MUST be the org's My Domain
+      # (https://<org>.my.salesforce.com) — Salesforce refuses that grant
+      # on login.salesforce.com.
+      SF_LOGIN_URL: ${SF_LOGIN_URL:-}
+      # Consumer Secret: simplest auth, no key or certificate needed.
+      SF_CLIENT_SECRET: ${SF_CLIENT_SECRET:-}
+      # The JWT signing key. It lives in the data volume (mode 600), NOT in
+      # .env — an .env value ends up in `docker inspect`, shell history and
+      # screenshots. Override with SF_PRIVATE_KEY_HOST_FILE to mount a key
+      # from the host instead.
+      SF_PRIVATE_KEY_FILE: ${SF_PRIVATE_KEY_HOST_FILE:+/run/secrets/sf_jwt_key.pem}
+      SF_PRIVATE_KEY_B64: ${SF_PRIVATE_KEY_B64:-}
+      SYNC_INTERVAL_MINUTES: "30"
+      EMBED_VIA: http://vllm-embed:30003/v1
+      EMBED_MODEL: Qwen/Qwen3-Embedding-0.6B
+      DUCKDB_PATH: /data/warehouse.duckdb
+      LANCEDB_DIR: /data/lancedb
+      PARQUET_DIR: /data/parquet
+    volumes:
+      - data:/data
+      # The object/field config, read-only and LIVE: without this it is baked
+      # into the image, so choosing a new object would need a rebuild rather
+      # than a restart.
+      - ./sync-worker/config.yaml:/app/config.yaml:ro
+      # The Salesforce JWT signing key, read-only. `:-/dev/null` keeps the
+      # mount valid (and compose parseable) when no key file is configured —
+      # the key then comes from SF_PRIVATE_KEY_B64 or AWS Secrets Manager.
+      - ${SF_PRIVATE_KEY_HOST_FILE:-/dev/null}:/run/secrets/sf_jwt_key.pem:ro
+    depends_on:
+      vllm-embed:
+        condition: service_healthy
+
+  # Phase 1: self-hosted metasearch for web search. Internal-only (no host
+  # port); only the orchestrator reaches it at http://searxng:8080. Enabling
+  # search means queries leave the machine — SEARCH_ENABLED gates that.
+  searxng:
+    image: searxng/searxng:latest
+    environment:
+      SEARXNG_SECRET: ${SEARXNG_SECRET:-please-change-me}
+      SEARXNG_BASE_URL: http://searxng:8080/
+    volumes:
+      - ./searxng:/etc/searxng:rw
+    restart: unless-stopped
+    profiles: ["search"]   # started only when web search is in use
+
+  frontend:
+    build: ./frontend
+    environment:
+      ORCHESTRATOR_URL: http://orchestrator:8080
+      NEXT_PUBLIC_APP_NAME: "TechSara AI"
+    ports:
+      - "3000:3000"
+    depends_on:
+      orchestrator:
+        condition: service_started

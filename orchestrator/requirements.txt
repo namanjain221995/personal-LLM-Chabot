@@ -1,0 +1,28 @@
+# Container requirements (Python 3.11 in-container).
+# NOTE: torch is provided by the nvcr.io/nvidia/pytorch base image — do NOT pin torch here.
+fastapi>=0.115
+# Phase 4: multipart dataset uploads (streamed, never base64 in the chat body)
+python-multipart>=0.0.9
+uvicorn[standard]>=0.30
+langgraph>=0.2
+openai>=1.50
+httpx>=0.27
+duckdb>=1.0
+lancedb>=0.15
+pandas>=2.2
+pyarrow>=17
+openpyxl>=3.1
+matplotlib>=3.8
+pydantic>=2.7
+# V2 auth (V2-DESIGN §3c): argon2 password hashing + signed session cookies.
+argon2-cffi>=23.1
+itsdangerous>=2.1
+# Reranker (Qwen3-Reranker-0.6B). Imported LAZILY inside the rag engine only —
+# the app and the test suite run without it. Disable at runtime with RERANK_ENABLED=false.
+transformers>=4.51
+# PDF engine for pandoc (pandoc --pdf-engine=weasyprint). Invoked as a
+# subprocess by pandoc; never imported by the app itself.
+weasyprint>=61
+pypdfium2>=4.30
+pillow>=10.0
+trafilatura>=1.12

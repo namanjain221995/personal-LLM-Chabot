@@ -1,0 +1,530 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ---------------------------------------------------------------------------
+   TechSara design tokens (§9). Dark is the primary theme (:root); light
+   overrides under html.light. Brand palette:
+   Navy Ink #0A1D37 · Boardroom Blue #143A66 · Slate #5B6B7F · Paper #F6F8FB
+   · Signal Teal #0E9F9A. Engine colors: SQL amber #B7791F, Records teal
+   #0E9F9A, Vision violet #6D5AE6, Report blue #2F6FB2.
+--------------------------------------------------------------------------- */
+
+:root {
+  /* brand constants */
+  --ts-navy: #0a1d37;
+  --ts-boardroom: #143a66;
+  --ts-slate: #5b6b7f;
+  --ts-paper: #f6f8fb;
+  --ts-teal: #0e9f9a;
+
+  /* Dark surfaces — neutral near-black (owner request 2026-07-23: match the
+     ChatGPT dark look rather than the original navy). Sidebar sits DARKER
+     than the thread; menus/bubbles/cards sit LIGHTER. */
+  --ts-bg: #000000;
+  --ts-sidebar: #0a0a0a;
+  /* User-message bubble: a clearly lighter pill, ChatGPT-style — it must read
+     as a distinct bubble against the black thread, not blend into it. */
+  --ts-bubble: #303030;
+  --ts-surface: #1e1e1e;
+  --ts-surface-2: #2a2a2a;
+  --ts-border: #262626;
+  --ts-text: #f5f5f5;
+  --ts-text-muted: #a3a3a3;
+  --ts-text-faint: #7a7a7a;
+  --ts-accent: #19bcb5; /* Signal Teal, lifted for AA on dark */
+  --ts-accent-strong: #0e9f9a;
+  --ts-accent-soft: rgba(14, 159, 154, 0.14);
+  --ts-danger: #ef5a5f;
+  --ts-danger-soft: rgba(229, 72, 77, 0.14);
+  /* Amber "heads up" state: trimmed input now, context meter 60-84% later. */
+  --ts-warn: #f0a92e;
+
+  /* engine identities (badges / drawer accents only) */
+  --ts-engine-sql: #b7791f;
+  --ts-engine-sql-ink: #e2ab52;
+  --ts-engine-rag: #0e9f9a;
+  --ts-engine-rag-ink: #33c7c0;
+  --ts-engine-vision: #6d5ae6;
+  --ts-engine-vision-ink: #a99cf3;
+  --ts-engine-report: #2f6fb2;
+  --ts-engine-report-ink: #82b0dd;
+  /* V2 §4f: Chat (slate) + Agent (violet, gradient dot) */
+  --ts-engine-chat: #5b6b7f;
+  --ts-engine-chat-ink: #a3b2c5;
+  --ts-engine-agent: #8b5cf6;
+  --ts-engine-agent-ink: #b79df8;
+
+  /* categorical chart palette — validated for CVD + contrast on both
+     surfaces (fixed assignment order, never cycled) */
+  --ts-chart-1: #0e9f9a;
+  --ts-chart-2: #2f6fb2;
+  --ts-chart-3: #b7791f;
+  --ts-chart-4: #6d5ae6;
+  --ts-chart-5: #c0566b;
+
+  /* type scale (§9): 13 / 14 / 16 / 20 / 28 */
+  --ts-fs-xs: 13px;
+  --ts-fs-sm: 14px;
+  --ts-fs-base: 16px;
+  --ts-fs-lg: 20px;
+  --ts-fs-xl: 28px;
+
+  --ts-radius: 10px;
+  --ts-hover-ms: 150ms;
+
+  /* SQL syntax colors (dark) */
+  --ts-sql-kw: #6fb4f2;
+  --ts-sql-str: #7fd6a3;
+  --ts-sql-num: #e2ab52;
+  --ts-sql-com: #7e8da3;
+}
+
+html.light {
+  --ts-bg: #ffffff;
+  --ts-sidebar: #f9f9f9;
+  --ts-bubble: #f0f0f0;
+  --ts-surface: #f4f4f4;
+  --ts-surface-2: #ececec;
+  --ts-border: #e3e3e3;
+  --ts-text: #0d0d0d;
+  --ts-text-muted: #5d5d5d;
+  --ts-text-faint: #8f8f8f;
+  --ts-accent: #0b7c77; /* Signal Teal, deepened for AA on paper */
+  --ts-accent-strong: #0e9f9a;
+  --ts-accent-soft: rgba(14, 159, 154, 0.12);
+  --ts-danger: #c62a30;
+  --ts-danger-soft: rgba(198, 42, 48, 0.1);
+  --ts-warn: #b26a00;
+
+  --ts-engine-sql-ink: #8a5a14;
+  --ts-engine-rag-ink: #0b7c77;
+  --ts-engine-vision-ink: #5140bd;
+  --ts-engine-report-ink: #26598f;
+  --ts-engine-chat-ink: #44546b;
+  --ts-engine-agent-ink: #6d28d9;
+
+  --ts-sql-kw: #1d5fae;
+  --ts-sql-str: #197a4b;
+  --ts-sql-num: #8a5a14;
+  --ts-sql-com: #5b6b7f;
+}
+
+/* ------------------------------------------------------------------ base */
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  background: var(--ts-bg);
+  color: var(--ts-text);
+  font-family: 'IBM Plex Sans', system-ui, sans-serif;
+  font-size: var(--ts-fs-base);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Visible focus ring everywhere (quality floor §9). */
+:focus-visible {
+  outline: 2px solid var(--ts-accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+::selection {
+  background: var(--ts-accent-soft);
+}
+
+a {
+  color: var(--ts-accent);
+}
+
+/* Subtle scrollbars that fit both themes. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--ts-border) transparent;
+}
+
+/* -------------------------------------------------- streaming indicators */
+
+@keyframes ts-caret-blink {
+  0%,
+  55% {
+    opacity: 1;
+  }
+  56%,
+  100% {
+    opacity: 0;
+  }
+}
+
+.stream-caret {
+  display: inline-block;
+  width: 7px;
+  height: 1.05em;
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  border-radius: 1px;
+  background: var(--ts-accent);
+  animation: ts-caret-blink 0.9s steps(1) infinite;
+}
+
+@keyframes ts-shimmer-slide {
+  from {
+    background-position: -320px 0;
+  }
+  to {
+    background-position: 320px 0;
+  }
+}
+
+.shimmer-line {
+  height: 14px;
+  border-radius: 6px;
+  background: linear-gradient(
+    90deg,
+    var(--ts-surface-2) 25%,
+    var(--ts-border) 50%,
+    var(--ts-surface-2) 75%
+  );
+  background-size: 320px 100%;
+  animation: ts-shimmer-slide 1.3s linear infinite;
+}
+
+/* --------------------------------------------- reasoning + agent (V2) */
+
+/* "Thinking…" label: a soft sheen sweeping through the text (§4d). */
+@keyframes ts-text-shimmer {
+  from {
+    background-position: 200% 0;
+  }
+  to {
+    background-position: -200% 0;
+  }
+}
+
+.thinking-shimmer {
+  background: linear-gradient(
+    90deg,
+    var(--ts-text-faint) 35%,
+    var(--ts-text) 50%,
+    var(--ts-text-faint) 65%
+  );
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: ts-text-shimmer 1.8s linear infinite;
+}
+
+/* Agent step spinner (§4e). */
+@keyframes ts-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.ts-spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--ts-border);
+  border-top-color: var(--ts-accent);
+  border-radius: 9999px;
+  animation: ts-spin 0.8s linear infinite;
+}
+
+/* ------------------------------------------- conversation menu (V3 §2) */
+
+@keyframes ts-menu-pop {
+  from {
+    opacity: 0;
+    transform: scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.menu-pop {
+  transform-origin: top right;
+  animation: ts-menu-pop 120ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+/* --------------------------------------------- search palette (V4 §2) */
+
+@keyframes ts-palette-in {
+  from {
+    opacity: 0;
+    transform: translateY(-6px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.palette-panel {
+  animation: ts-palette-in 130ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+@keyframes ts-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.palette-backdrop {
+  animation: ts-fade-in 130ms ease-out;
+}
+
+/* ------------------------------------------------------- proof drawer */
+
+.drawer-panel {
+  overflow: hidden;
+  animation: ts-drawer-open 240ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+@keyframes ts-drawer-open {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* ------------------------------------------------------------ markdown */
+
+.md {
+  line-height: 1.65;
+  word-wrap: break-word;
+}
+
+.md > * + * {
+  margin-top: 0.8em;
+}
+
+.md h1,
+.md h2,
+.md h3,
+.md h4 {
+  font-weight: 600;
+  line-height: 1.3;
+  margin-top: 1.2em;
+}
+
+.md h1 {
+  font-size: var(--ts-fs-lg);
+}
+
+.md h2 {
+  font-size: 18px;
+}
+
+.md h3,
+.md h4 {
+  font-size: var(--ts-fs-base);
+}
+
+.md ul,
+.md ol {
+  padding-left: 1.4em;
+}
+
+.md ul {
+  list-style: disc;
+}
+
+.md ol {
+  list-style: decimal;
+}
+
+.md li + li {
+  margin-top: 0.3em;
+}
+
+.md strong {
+  font-weight: 600;
+}
+
+.md a {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.md blockquote {
+  border-left: 3px solid var(--ts-border);
+  padding-left: 12px;
+  color: var(--ts-text-muted);
+}
+
+.md hr {
+  border: none;
+  border-top: 1px solid var(--ts-border);
+}
+
+.md .md-table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--ts-border);
+  border-radius: var(--ts-radius);
+}
+
+.md table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--ts-fs-sm);
+}
+
+.md th,
+.md td {
+  text-align: left;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--ts-border);
+  white-space: nowrap;
+}
+
+.md thead th {
+  font-weight: 600;
+  color: var(--ts-text-muted);
+  background: var(--ts-surface);
+  font-size: var(--ts-fs-xs);
+}
+
+.md tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.md code.inline-code {
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-size: 0.86em;
+  background: var(--ts-surface-2);
+  border: 1px solid var(--ts-border);
+  border-radius: 5px;
+  padding: 1px 5px;
+}
+
+/* --------------------------------------------------------- code blocks */
+
+.code-block pre {
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-size: var(--ts-fs-xs);
+  line-height: 1.6;
+  overflow-x: auto;
+  padding: 12px 14px;
+}
+
+.tok-kw {
+  color: var(--ts-sql-kw);
+  font-weight: 500;
+}
+
+.tok-str {
+  color: var(--ts-sql-str);
+}
+
+.tok-num {
+  color: var(--ts-sql-num);
+}
+
+.tok-com {
+  color: var(--ts-sql-com);
+  font-style: italic;
+}
+
+/* -------------------------------------------------------- file badges */
+
+.file-icon-docx {
+  background: rgba(47, 111, 178, 0.16);
+  color: var(--ts-engine-report-ink);
+}
+
+.file-icon-pdf {
+  background: rgba(198, 62, 62, 0.16);
+  color: var(--ts-danger);
+}
+
+.file-icon-xlsx,
+.file-icon-csv {
+  background: rgba(14, 159, 154, 0.16);
+  color: var(--ts-engine-rag-ink);
+}
+
+.file-icon-other {
+  background: var(--ts-surface-2);
+  color: var(--ts-text-muted);
+}
+
+/* --------------------------------------------------------- reduced motion */
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+
+  .stream-caret {
+    animation: none;
+  }
+
+  .shimmer-line {
+    animation: none;
+    background: var(--ts-surface-2);
+  }
+
+  .thinking-shimmer {
+    animation: none;
+    background: none;
+    color: var(--ts-text-muted);
+  }
+
+  .ts-spinner {
+    animation: none;
+    border-top-color: var(--ts-text-faint);
+  }
+}
+
+/* ------------------------------------------------- mermaid diagram host */
+
+.mermaid-host svg {
+  max-width: 100%;
+  height: auto;
+  display: block;
+  margin: 0 auto;
+}
+
+/* Fullscreen viewer: the wrapper is sized to natural-size x zoom, and the
+   SVG fills it — vector-crisp scaling with a real scrollable area (mermaid
+   sets an inline max-width, hence the !important). */
+.mermaid-full svg {
+  width: 100% !important;
+  height: 100% !important;
+  max-width: none !important;
+}
+
+/* ---------------------------------------------- context meter (Phase C) */
+
+/* Gentle attention pull at >=95% — never a flash. Respects reduced motion
+   through the global rule further up this file. */
+@keyframes ctx-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+
+.ctx-pulse {
+  animation: ctx-pulse 1.8s ease-in-out infinite;
+}

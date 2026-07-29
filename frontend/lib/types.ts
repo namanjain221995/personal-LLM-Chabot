@@ -1,0 +1,230 @@
+/**
+ * Shared types for the TechSara frontend.
+ * The SSE `meta` shape mirrors §10 of the master spec EXACTLY; V2-DESIGN §2
+ * extends it backward-compatibly (route "chat"/"agent", mode/model/effort
+ * keys, reasoning + step events). Unknown future meta keys must be tolerated.
+ */
+
+export type Engine = 'sql' | 'rag' | 'vision' | 'report' | 'chat' | 'agent' | 'search' | 'url' | 'repo';
+
+/**
+ * Historically two models. There is now ONE (Qwen3.6-35B-A3B) and the picker
+ * chooses EFFORT instead, so this is always "smart" in new requests — kept so
+ * stored prefs and older payloads keep working.
+ */
+export type ModelChoice = 'smart' | 'fast';
+
+/**
+ * Four levels on ONE model. Fast and Low answer without the reasoning pass;
+ * the difference is what tools they may use (Low may search, Fast may not).
+ * Medium and High think first and may also plan multi-step work.
+ */
+export type ReasoningEffort = 'fast' | 'low' | 'medium' | 'high';
+
+/** Salesforce toggle (V2 §1): "salesforce" is the v1 behavior. */
+export type ChatMode = 'salesforce' | 'assistant';
+
+/** `event: step` payload (V2 §2) — agent-mode plan/progress updates. */
+export interface AgentStep {
+  id: number;
+  title: string;
+  status: 'running' | 'done' | 'failed';
+  detail?: string;
+}
+
+export interface ChartSpec {
+  type: 'bar' | 'line' | 'area' | 'pie' | 'scatter';
+  x_key: string;
+  y_keys: string[];
+  title: string;
+  stacked: boolean;
+}
+
+export interface Citation {
+  record_id: string;
+  object: string;
+  url: string;
+}
+
+export interface ReportFile {
+  filename: string;
+  type: string;
+  size?: number;
+}
+
+export type DataRow = Record<string, unknown>;
+
+/**
+ * V5 (2026-07-23): a block of long text/code pasted into the composer, shown
+ * as a "PASTED" chip. Stored on a user message's `meta.pasted` so it survives
+ * server history, and folded into the model input at request time.
+ */
+export interface PastedText {
+  id: string;
+  content: string;
+  lines: number;
+  chars: number;
+}
+
+/**
+ * `event: meta` payload — single final JSON before `done` (§10).
+ * V2 (§2) adds mode / model / effort / steps; the frontend also persists the
+ * client-captured reasoning stream here (meta.reasoning, §4d) so it survives
+ * the server-side history round-trip. Unknown future keys pass through JSON
+ * untouched — nothing here may throw on extras.
+ */
+export interface Meta {
+  route: Engine;
+  sql?: string;
+  data?: DataRow[];
+  truncated?: boolean;
+  chart?: ChartSpec;
+  citations?: Citation[];
+  report_files?: ReportFile[];
+  /** V2 §2: request mode ("salesforce" | "assistant"). */
+  mode?: string;
+  /** V2 §2: served model id. */
+  model?: string;
+  /** V2 §2: reasoning effort used. */
+  effort?: string;
+  /** V2 §3b: agent plan steps (final statuses). */
+  steps?: AgentStep[];
+  /** V2 §4d: full reasoning text, stored client-side for history. */
+  reasoning?: string;
+  /** V2 §4d: client-measured "Thought for N s". */
+  reasoning_seconds?: number;
+  /** V5: long text/code the user pasted as chips on a user message. */
+  pasted?: PastedText[];
+  /** Phase 1: web-search sources for the answer's [n] citations. */
+  sources?: WebSource[];
+  /** Phase 1: set when search was requested but unavailable. */
+  search_unavailable?: boolean;
+  /** Phase 3: cited code excerpts (path:Lstart-Lend + snippet). */
+  code_sources?: CodeSource[];
+  /**
+   * Idempotency key for the generation that produced this answer. Sent back
+   * when persisting so a reply watched by two attached clients is stored
+   * exactly once (the server dedupes appends carrying a known id).
+   */
+  generation_id?: string;
+  /**
+   * Set when the prompt had to be shortened to fit the model's window —
+   * old turns dropped and/or an oversized message clipped. Surfaced inline so
+   * a user who pasted a large document knows part of it was not sent.
+   */
+  input_trimmed?: { dropped_turns: number; clipped_messages: number };
+  /** Phase A/C: this session's context accounting, for the meter. */
+  context?: ContextUsage;
+  /** The searches behind this answer, kept so history replays the panel. */
+  research?: Research;
+}
+
+export interface ContextUsage {
+  /** Prompt tokens this request actually used. */
+  tokens_used: number;
+  /** window − reserved output − safety margin. */
+  usable_budget: number;
+  window: number;
+  reserved_output: number;
+  /** tokens_used / usable_budget, 0-1+. */
+  fraction: number;
+  /** Turns folded into the rolling summary so far. */
+  summarized_turns: number;
+  /** Present when THIS request triggered a compaction. */
+  compacted?: { folded_turns: number };
+}
+
+/** Phase 3: a cited code excerpt from an indexed repo. */
+export interface CodeSource {
+  path: string;
+  start_line: number;
+  end_line: number;
+  snippet: string;
+}
+
+/** Phase 1: a cited web source. */
+export interface WebSource {
+  n: number;
+  title: string;
+  url: string;
+  domain: string;
+}
+
+/** One result a search returned, before anything was read. */
+export interface ResearchResult {
+  title: string;
+  url: string;
+  domain: string;
+}
+
+/** One search the model ran, with what it turned up. */
+export interface ResearchQuery {
+  query: string;
+  results: ResearchResult[];
+}
+
+/**
+ * Live research progress — the searches behind an answer, shown while they
+ * happen and kept on the message afterwards so reopening a chat replays them.
+ * `elapsedMs` is measured client-side, like reasoningSeconds.
+ */
+export interface Research {
+  queries: ResearchQuery[];
+  /** Sources queued for reading (set when the fetch phase starts). */
+  reading?: number;
+  /** Sources actually read (set when the fetch phase finishes). */
+  read?: number;
+  /** Wall-clock from the first search to the last, in ms. */
+  elapsedMs?: number;
+  /** True while searches are still arriving. */
+  active?: boolean;
+}
+
+export type MessageStatus = 'streaming' | 'done' | 'stopped' | 'error';
+
+export interface ChatMessage {
+  id: string;
+  role: 'user' | 'assistant';
+  content: string;
+  meta?: Meta;
+  status?: MessageStatus;
+  /** Populated when status === 'error' — the exact `error` event message. */
+  errorMessage?: string;
+  /** data: URL preview for a user-attached image. */
+  imageDataUrl?: string;
+  /** V8: filename of a user-attached PDF (shown as a chip in the bubble). */
+  pdfName?: string;
+  /** Live reasoning stream (V2 §4d) — folded into meta.reasoning on finish. */
+  reasoning?: string;
+  /** Client-measured thinking duration in whole seconds (V2 §4d). */
+  reasoningSeconds?: number;
+  /** Live agent step timeline (V2 §4e) — folded into meta.steps on finish. */
+  steps?: AgentStep[];
+  /** Phase 1: transient web-search progress line ("Reading N sources…"). */
+  searchStatus?: string;
+  /** Live research progress — folded into meta.research on finish. */
+  research?: Research;
+  createdAt: number;
+}
+
+export interface Conversation {
+  id: string;
+  title: string;
+  createdAt: number;
+  updatedAt: number;
+  /** V3 §2: pinned chats float to the top of the sidebar. */
+  pinned?: boolean;
+  /** V3 §2: archived chats leave Recents for the Archived disclosure. */
+  archived?: boolean;
+  messages: ChatMessage[];
+}
+
+export interface ConversationSummary {
+  id: string;
+  title: string;
+  createdAt: number;
+  updatedAt: number;
+  /** V3 §2 — always populated by the store; optional for older payloads. */
+  pinned?: boolean;
+  archived?: boolean;
+}

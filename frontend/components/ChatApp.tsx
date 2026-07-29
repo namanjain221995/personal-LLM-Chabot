@@ -1,0 +1,916 @@
+'use client';
+
+/**
+ * The chat shell (§9 + V2 §4): sidebar + header (title + engine badge) +
+ * centered 768px thread + pinned composer. Owns streaming state (token /
+ * reasoning / step events), server-backed history (offline cache +
+ * one-time migration), per-conversation composer prefs (Salesforce toggle,
+ * model, effort, agent), the V4 §2 search
+ * palette and the keyboard shortcuts (Ctrl/Cmd+K search · Ctrl/Cmd+Shift+O
+ * new chat · Esc close palette / stop · "/" focus composer).
+ */
+
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from 'react';
+
+/** useLayoutEffect on the client, useEffect on the server (no SSR warning). */
+const useIsomorphicLayoutEffect =
+  typeof window !== 'undefined' ? useLayoutEffect : useEffect;
+import { fetchMe } from '@/lib/auth';
+import { downloadMarkdown } from '@/lib/exportMarkdown';
+import { getHistoryStore, newId, setEvictListener } from '@/lib/history';
+import {
+  adoptDraftPrefs,
+  DEFAULT_PREFS,
+  loadPrefs,
+  removePrefs,
+  savePrefs,
+  type ChatPrefs,
+} from '@/lib/prefs';
+import { attachmentForResend, rememberAttachment } from '@/lib/attachments';
+import { shortcutAction } from '@/lib/searchPalette';
+import {
+  attachStream,
+  fetchServerActive,
+  getLiveStream,
+  isStreaming,
+  messagesDiscardedByRegenerate,
+  startStream,
+  stopStream,
+  streamingIds,
+  subscribeStreams,
+} from '@/lib/streams';
+import { latestUsage, meterView } from '@/lib/contextMeter';
+import type {
+  ChatMessage,
+  ConversationSummary,
+  Engine,
+  PastedText,
+} from '@/lib/types';
+import { Composer, type Attachment, type ComposerHandle } from './Composer';
+import { ConfirmDialog } from './ConfirmDialog';
+import { ContextMeter } from './ContextMeter';
+import { SummaryPanel } from './SummaryPanel';
+import { EmptyState } from './EmptyState';
+import { EngineBadge } from './EngineBadge';
+import { MessageRow } from './MessageRow';
+import { SearchPalette } from './SearchPalette';
+import { Sidebar } from './Sidebar';
+import { useToast } from './Providers';
+import { IconAlert, IconArrowDown, IconRefresh, IconSidebar } from './icons';
+
+const APP_NAME =
+  process.env.NEXT_PUBLIC_APP_NAME ?? 'TechSara AI';
+
+export function ChatApp() {
+  const [conversations, setConversations] = useState<ConversationSummary[]>([]);
+  const [archived, setArchived] = useState<ConversationSummary[]>([]);
+  const [activeId, setActiveId] = useState<string | null>(null);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [streaming, setStreaming] = useState(false);
+  const [unreachable, setUnreachable] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [atBottom, setAtBottom] = useState(true);
+  const [prefs, setPrefs] = useState<ChatPrefs>(DEFAULT_PREFS);
+  /** Conversations the SERVER is still generating for (polled; survives reloads). */
+  const [serverActive, setServerActive] = useState<string[]>([]);
+  /** Bumped on every stream notification so sidebar spinners re-render. */
+  const [, setStreamTick] = useState(0);
+  /**
+   * True until the mount effect has determined whether the restored chat has
+   * a generation still running. The composer stays locked meanwhile: a send
+   * in that window replaces (and destroys) the in-flight generation.
+   * Only a ?c= restore can collide with one, so a bare "/" never waits.
+   */
+  const [reconciling, setReconciling] = useState(false);
+
+  // Set BEFORE first paint, so the composer is never briefly interactive.
+  // A useState initializer cannot do this: it runs during SSR where there is
+  // no location, and hydration keeps the server's value.
+  useIsomorphicLayoutEffect(() => {
+    if (new URLSearchParams(window.location.search).has('c')) {
+      setReconciling(true);
+    }
+  }, []);
+  /** Armed regenerate awaiting confirmation (it would discard later turns). */
+  const [pendingRegenerate, setPendingRegenerate] = useState<{
+    messageId: string;
+    discarded: number;
+  } | null>(null);
+  /** Debounced draft text — the meter's only estimated component. */
+  const [draft, setDraft] = useState('');
+  const [compacting, setCompacting] = useState(false);
+  /** Set by "Compact now" so the ring drops at once, cleared on the next reply. */
+  const [compactedAt, setCompactedAt] = useState<number | null>(null);
+  const [summaryOpen, setSummaryOpen] = useState(false);
+  const draftTimer = useRef<number | null>(null);
+
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const composerRef = useRef<ComposerHandle>(null);
+  const messagesRef = useRef<ChatMessage[]>([]);
+  messagesRef.current = messages;
+  const activeIdRef = useRef<string | null>(null);
+  activeIdRef.current = activeId;
+  const prefsRef = useRef<ChatPrefs>(prefs);
+  prefsRef.current = prefs;
+  const serverActiveRef = useRef<string[]>([]);
+  serverActiveRef.current = serverActive;
+
+  /** Keep the URL pointing at the open chat so a reload lands back on it. */
+  const setUrlConversation = useCallback((id: string | null) => {
+    window.history.replaceState(null, '', id ? `/?c=${id}` : '/');
+  }, []);
+
+  const { toast } = useToast();
+
+  const refreshList = useCallback(() => {
+    const store = getHistoryStore();
+    setConversations(store.list());
+    setArchived(store.listArchived());
+  }, []);
+
+  // Initial load: cached history immediately, then auth check → one-time
+  // migration → server refresh (V2 §4a/§4b); evict-toast wiring, ?c= deep
+  // link, responsive sidebar default.
+  useEffect(() => {
+    setEvictListener((dropped) => {
+      toast(
+        `Storage is full — the oldest conversation ("${dropped.title}") was removed to make room.`,
+        'error',
+      );
+      refreshList();
+    });
+    refreshList();
+
+    // Reload keeps the open chat: restore ?c= from the cache immediately;
+    // server truth (and any still-running generation) is reconciled below.
+    const wanted = new URLSearchParams(window.location.search).get('c');
+    if (wanted) {
+      setActiveId(wanted);
+      activeIdRef.current = wanted;
+      setPrefs(loadPrefs(window.localStorage, wanted));
+      const cached = getHistoryStore().get(wanted);
+      if (cached) setMessages(cached.messages);
+    }
+
+    if (window.matchMedia('(max-width: 767px)').matches) {
+      setSidebarOpen(false);
+    }
+
+    let cancelled = false;
+    void (async () => {
+      const store = getHistoryStore();
+      // Whatever happens with auth/refresh below, the running-generation
+      // check MUST run before the composer unlocks — sending during that gap
+      // cancels the detached generation and silently loses its answer.
+      const settleReconcile = () => {
+        if (!cancelled) setReconciling(false);
+      };
+      const me = await fetchMe();
+      if (cancelled) return;
+      if (!me.ok) {
+        // There is no login to bounce to any more, so ANY failure here (the
+        // orchestrator still booting, a network blip) is handled the same way:
+        // carry on, but never leave a running generation unguarded.
+        if (wanted) {
+          const active = await fetchServerActive();
+          if (!cancelled) setServerActive(active);
+        }
+        settleReconcile();
+        return;
+      }
+      store.setActiveUser(me.username);
+      try {
+        const migrated = await store.migrateLocalConversations();
+        if (migrated > 0) {
+          toast(
+            `Moved ${migrated} local conversation${migrated === 1 ? '' : 's'} to your account.`,
+          );
+        }
+      } catch {
+        // Migration retries on the next sign-in; nothing is lost locally.
+      }
+      await store.refresh();
+      if (cancelled) return;
+      refreshList();
+
+      try {
+        if (wanted) {
+        // Still generating server-side? Re-join the live stream — it replays
+        // the partial answer instantly, then keeps streaming. Otherwise load
+        // server truth; FORCED when the chat ends on a user message, because
+        // a detached generation may have finished and saved its answer while
+        // this tab was closed or reloading.
+          const active = await fetchServerActive();
+          if (cancelled) return;
+          setServerActive(active);
+          if (active.includes(wanted)) {
+            setStreaming(true);
+            void attachStream(wanted).then((ok) => {
+              if (!ok && activeIdRef.current === wanted) {
+                // Finished during the reload gap — its answer is in history.
+                setStreaming(false);
+                void store.load(wanted, { force: true }).then((conv) => {
+                  if (conv && activeIdRef.current === wanted && !isStreaming(wanted)) {
+                    setMessages(conv.messages);
+                  }
+                });
+              }
+            });
+            return;
+          }
+          const cached = store.get(wanted);
+          const force = cached?.messages.at(-1)?.role === 'user';
+          const conv = await store.load(wanted, { force });
+          if (conv && !cancelled && activeIdRef.current === wanted) {
+            setMessages(conv.messages);
+          }
+        }
+      } finally {
+        settleReconcile();
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [refreshList, toast]);
+
+  const persist = useCallback(
+    (conversationId: string, msgs: ChatMessage[]) => {
+      getHistoryStore().saveMessages(conversationId, msgs);
+      refreshList();
+    },
+    [refreshList],
+  );
+
+  // Mirror live streams into the view + sidebar (lib/streams.ts): tokens for
+  // the OPEN chat update the thread; every chat's spinner state re-renders.
+  useEffect(() => {
+    return subscribeStreams((id) => {
+      setStreamTick((t) => t + 1);
+      const s = getLiveStream(id);
+      if (!s) return;
+      if (s.status !== 'streaming') {
+        refreshList(); // finished → reorder list
+        // Clear it from the polled set NOW: waiting for the next 8s poll left
+        // the sidebar spinner turning for seconds after the answer landed.
+        setServerActive((prev) =>
+          prev.includes(id) ? prev.filter((x) => x !== id) : prev,
+        );
+      }
+      if (id !== activeIdRef.current) return;
+      if (s.status !== 'streaming') setCompactedAt(null);
+      setMessages([...s.messages]);
+      setStreaming(s.status === 'streaming');
+      if (s.status === 'unreachable') setUnreachable(true);
+    });
+  }, [refreshList]);
+
+  // Poll for generations still running server-side: powers the sidebar
+  // spinner across reloads and pulls in answers that finished while this
+  // conversation wasn't on screen.
+  useEffect(() => {
+    let stopped = false;
+    async function tick() {
+      if (document.hidden) return;
+      const active = await fetchServerActive();
+      if (stopped) return;
+      setServerActive(active);
+      const id = activeIdRef.current;
+      if (
+        id &&
+        !isStreaming(id) &&
+        !active.includes(id) &&
+        messagesRef.current.at(-1)?.role === 'user'
+      ) {
+        // The open chat's detached generation finished — fetch its answer.
+        const conv = await getHistoryStore().load(id, { force: true });
+        if (!stopped && conv && activeIdRef.current === id && !isStreaming(id)) {
+          setMessages(conv.messages);
+          refreshList();
+        }
+      }
+    }
+    void tick();
+    const timer = window.setInterval(() => void tick(), 8000);
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
+  }, [refreshList]);
+
+  const stopStreaming = useCallback(() => {
+    stopStream(activeIdRef.current);
+  }, []);
+
+  const scrollToBottom = useCallback((smooth: boolean) => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const reduced = window.matchMedia(
+      '(prefers-reduced-motion: reduce)',
+    ).matches;
+    el.scrollTo({
+      top: el.scrollHeight,
+      behavior: smooth && !reduced ? 'smooth' : 'auto',
+    });
+  }, []);
+
+  // Auto-scroll while content grows, unless the user scrolled up (§9).
+  useEffect(() => {
+    if (atBottom) scrollToBottom(false);
+  }, [messages, atBottom, scrollToBottom]);
+
+  function handleScroll() {
+    const el = scrollRef.current;
+    if (!el) return;
+    setAtBottom(el.scrollHeight - el.scrollTop - el.clientHeight < 80);
+  }
+
+  /** Debounced (300 ms) so typing doesn't re-render the meter per keystroke. */
+  const handleDraftChange = useCallback((text: string) => {
+    if (draftTimer.current !== null) window.clearTimeout(draftTimer.current);
+    draftTimer.current = window.setTimeout(() => setDraft(text), 300);
+  }, []);
+
+  /** "Compact now" from the meter popover. */
+  const compactNow = useCallback(() => {
+    const id = activeIdRef.current;
+    if (!id || compacting) return;
+    setCompacting(true);
+    void (async () => {
+      try {
+        const res = await fetch('/api/chat/compact', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            conversation_id: id,
+            messages: messagesRef.current
+              .filter((m) => m.content)
+              .map((m) => ({ role: m.role, content: m.content })),
+          }),
+        });
+        const body = (await res.json()) as {
+          compacted?: boolean;
+          folded_turns?: number;
+          reason?: string;
+        };
+        if (!res.ok) throw new Error('compact failed');
+        toast(
+          body.compacted
+            ? `Compacted ${body.folded_turns} earlier message${
+                body.folded_turns === 1 ? '' : 's'
+              } into the summary.`
+            : (body.reason ?? 'Nothing to compact yet.'),
+        );
+        // The next request will be smaller; reflect that immediately rather
+        // than waiting for the following reply's meta.
+        if (body.compacted) {
+          // The next request will be much smaller; reflect that immediately
+          // instead of waiting for the following reply's meta.
+          setCompactedAt(Date.now());
+        }
+      } catch {
+        toast('Could not compact this conversation.', 'error');
+      } finally {
+        setCompacting(false);
+      }
+    })();
+  }, [compacting, toast]);
+
+  const updatePrefs = useCallback((next: ChatPrefs) => {
+    setPrefs(next);
+    savePrefs(window.localStorage, activeIdRef.current, next);
+  }, []);
+
+  const send = useCallback(
+    (text: string, attachment: Attachment | null, pasted: PastedText[]) => {
+      let conversationId = activeId;
+      if (!conversationId) {
+        const title =
+          text || (pasted.length ? 'Pasted text' : '') || attachment?.name || '';
+        const conv = getHistoryStore().create(title);
+        conversationId = conv.id;
+        setActiveId(conv.id);
+        activeIdRef.current = conv.id;
+        // The draft prefs become this conversation's prefs (V2 §4c).
+        setPrefs(adoptDraftPrefs(window.localStorage, conv.id));
+        refreshList();
+      }
+      setUrlConversation(conversationId);
+      const isPdf = attachment?.kind === 'pdf';
+      const isDataset = attachment?.kind === 'dataset';
+      const userMessage: ChatMessage = {
+        id: newId(),
+        role: 'user',
+        content: text,
+        imageDataUrl:
+          isPdf || isDataset ? undefined : attachment?.dataUrl,
+        // V8: a PDF attachment shows a chip (filename) in the bubble.
+        pdfName: isPdf || isDataset ? attachment?.name : undefined,
+        // V5: pasted blocks ride on meta so they round-trip through server
+        // history and are folded into the model input at request time.
+        meta: pasted.length ? { route: 'chat', pasted } : undefined,
+        createdAt: Date.now(),
+      };
+      // Keep the payload in memory so regenerate/retry re-send the same
+      // question WITH its attachment (never persisted — see lib/attachments).
+      if (attachment?.base64 && !isDataset) {
+        rememberAttachment(userMessage.id, {
+          kind: isPdf ? 'pdf' : 'image',
+          name: attachment.name,
+          base64: attachment.base64,
+        });
+      }
+      const turns = [...messagesRef.current, userMessage];
+      persist(conversationId, turns);
+      setAtBottom(true);
+      setUnreachable(false);
+      setStreaming(true);
+
+      if (isDataset && attachment?.file) {
+        // Datasets stream to their own endpoint and are then referenced by the
+        // conversation, so the chat request itself stays small.
+        void (async () => {
+          try {
+            const form = new FormData();
+            form.append('file', attachment.file as File);
+            form.append('conversation_id', conversationId);
+            const res = await fetch('/api/upload', { method: 'POST', body: form });
+            const body = (await res.json()) as { detail?: string; files?: number };
+            if (!res.ok) throw new Error(body.detail ?? 'upload failed');
+            toast(
+              `Profiled ${body.files ?? 0} file${body.files === 1 ? '' : 's'} from ${attachment.name}.`,
+            );
+          } catch (err) {
+            toast(
+              err instanceof Error ? err.message : 'That dataset could not be read.',
+              'error',
+            );
+          } finally {
+            void startStream({
+              conversationId,
+              turns,
+              prefs: prefsRef.current,
+            });
+          }
+        })();
+        return;
+      }
+
+      void startStream({
+        conversationId,
+        turns,
+        prefs: prefsRef.current,
+        image: isPdf ? null : attachment?.base64 ?? null,
+        pdf: isPdf ? attachment?.base64 ?? null : null,
+        pdfName: isPdf ? attachment?.name ?? null : null,
+      });
+    },
+    [activeId, persist, refreshList, setUrlConversation, toast],
+  );
+
+  /** Re-run the turn that produced the assistant message at `messageId`. */
+  const runRegenerate = useCallback(
+    async (messageId: string) => {
+      const id = activeIdRef.current;
+      if (!id || isStreaming(id)) return;
+      const msgs = messagesRef.current;
+      const idx = msgs.findIndex((m) => m.id === messageId);
+      if (idx === -1) return;
+      let userIdx = idx - 1;
+      while (userIdx >= 0 && msgs[userIdx].role !== 'user') userIdx--;
+      if (userIdx < 0) return;
+      const turns = msgs.slice(0, userIdx + 1);
+
+      // Re-send the SAME question, attachment included. Without this the model
+      // was re-asked "what's in this invoice?" with no invoice attached.
+      const { attachment, missing } = attachmentForResend(msgs[userIdx]);
+      if (missing) {
+        toast(
+          'Re-attach the file to regenerate this answer — its contents are no longer in memory.',
+          'error',
+        );
+        return;
+      }
+
+      // Regenerating an OLDER answer really does discard the turns after it.
+      // The sync path cannot shrink a thread (that guard is what stops a
+      // stale cache from destroying history), so this intentional shrink goes
+      // through the dedicated truncate endpoint — reached ONLY from here,
+      // and only after the user confirmed.
+      if (msgs.length > turns.length + 1) {
+        try {
+          await getHistoryStore().truncateMessages(id, turns.length);
+        } catch {
+          // The server refused (the thread changed elsewhere, or it is gone).
+          // Show truth rather than streaming into a thread we misread.
+          toast(
+            'This conversation changed elsewhere — reloaded it instead of regenerating.',
+            'error',
+          );
+          const conv = await getHistoryStore().load(id, { force: true });
+          if (conv && activeIdRef.current === id) setMessages(conv.messages);
+          return;
+        }
+        setMessages(turns);
+      }
+
+      setStreaming(true);
+      void startStream({
+        conversationId: id,
+        turns,
+        prefs: prefsRef.current,
+        image: attachment?.kind === 'image' ? attachment.base64 : null,
+        pdf: attachment?.kind === 'pdf' ? attachment.base64 : null,
+        pdfName: attachment?.kind === 'pdf' ? attachment.name : null,
+      });
+    },
+    [toast],
+  );
+
+  /**
+   * Regenerating an OLDER answer restarts the thread from that point and
+   * discards every later turn. That is destructive and irreversible, so it
+   * asks first; regenerating the last answer runs straight away.
+   */
+  const regenerate = useCallback(
+    (messageId: string) => {
+      const discarded = messagesDiscardedByRegenerate(
+        messagesRef.current,
+        messageId,
+      );
+      if (discarded > 0) {
+        setPendingRegenerate({ messageId, discarded });
+        return;
+      }
+      void runRegenerate(messageId);
+    },
+    [runRegenerate],
+  );
+
+  /** Banner retry: re-send the last user turn, attachment included. */
+  const retryLastTurn = useCallback(() => {
+    const id = activeIdRef.current;
+    if (!id || isStreaming(id)) return;
+    const msgs = messagesRef.current;
+    let userIdx = msgs.length - 1;
+    while (userIdx >= 0 && msgs[userIdx].role !== 'user') userIdx--;
+    if (userIdx < 0) {
+      setUnreachable(false);
+      return;
+    }
+    const { attachment, missing } = attachmentForResend(msgs[userIdx]);
+    if (missing) {
+      toast(
+        'Re-attach the file to retry this message — its contents are no longer in memory.',
+        'error',
+      );
+      return;
+    }
+    setUnreachable(false);
+    setStreaming(true);
+    void startStream({
+      conversationId: id,
+      turns: msgs.slice(0, userIdx + 1),
+      prefs: prefsRef.current,
+      image: attachment?.kind === 'image' ? attachment.base64 : null,
+      pdf: attachment?.kind === 'pdf' ? attachment.base64 : null,
+      pdfName: attachment?.kind === 'pdf' ? attachment.name : null,
+    });
+  }, [toast]);
+
+  // Leaving a chat NEVER stops its generation (ChatGPT behavior): it keeps
+  // streaming in the background with a spinner on its sidebar row, and its
+  // answer is saved to history when it finishes.
+  const newChat = useCallback(() => {
+    setSearchOpen(false);
+    setActiveId(null);
+    activeIdRef.current = null;
+    setMessages([]);
+    setUnreachable(false);
+    setStreaming(false);
+    setPrefs(DEFAULT_PREFS);
+    savePrefs(window.localStorage, null, DEFAULT_PREFS);
+    setUrlConversation(null);
+    composerRef.current?.focus();
+  }, [setUrlConversation]);
+
+  const selectConversation = useCallback(
+    (id: string) => {
+      const store = getHistoryStore();
+      setActiveId(id);
+      activeIdRef.current = id;
+      setPrefs(loadPrefs(window.localStorage, id));
+      setUnreachable(false);
+      setAtBottom(true);
+      setCompactedAt(null);
+      setUrlConversation(id);
+
+      const live = getLiveStream(id);
+      if (live) {
+        // This chat is generating in the background — adopt the live thread.
+        setMessages([...live.messages]);
+        setStreaming(live.status === 'streaming');
+      } else {
+        const cached = store.get(id);
+        if (cached) setMessages(cached.messages);
+        setStreaming(false);
+        if (serverActiveRef.current.includes(id)) {
+          // Still generating server-side (started before a reload) — re-join.
+          setStreaming(true);
+          void attachStream(id).then((ok) => {
+            if (!ok && activeIdRef.current === id) {
+              setStreaming(isStreaming(id));
+              void store.load(id, { force: true }).then((conv) => {
+                if (conv && activeIdRef.current === id && !isStreaming(id)) {
+                  setMessages(conv.messages);
+                }
+              });
+            }
+          });
+        } else {
+          // Server truth may be newer / not cached yet (V2 §4b); force a
+          // refetch when the chat ends on a user message — a detached
+          // generation may have saved its answer while we were away.
+          const force = cached?.messages.at(-1)?.role === 'user';
+          void store.load(id, { force }).then((conv) => {
+            if (conv && activeIdRef.current === id && !isStreaming(id)) {
+              setMessages(conv.messages);
+            }
+          });
+        }
+      }
+      if (window.matchMedia('(max-width: 767px)').matches) {
+        setSidebarOpen(false);
+      }
+    },
+    [setUrlConversation],
+  );
+
+  const renameConversation = useCallback(
+    (id: string, title: string) => {
+      getHistoryStore().rename(id, title);
+      refreshList();
+    },
+    [refreshList],
+  );
+
+  const deleteConversation = useCallback(
+    (id: string) => {
+      stopStream(id); // a deleted chat must not keep generating
+      getHistoryStore().remove(id);
+      removePrefs(window.localStorage, id);
+      refreshList();
+      if (activeIdRef.current === id) {
+        setActiveId(null);
+        activeIdRef.current = null;
+        setMessages([]);
+        setUrlConversation(null);
+      }
+      toast('Conversation deleted.');
+    },
+    [refreshList, setUrlConversation, toast],
+  );
+
+  /* ------------------------------------------------ V3 §2: row menu */
+
+  const pinConversation = useCallback(
+    (id: string, pinned: boolean) => {
+      getHistoryStore().setPinned(id, pinned);
+      refreshList();
+      toast(pinned ? 'Conversation pinned.' : 'Conversation unpinned.');
+    },
+    [refreshList, toast],
+  );
+
+  const archiveConversation = useCallback(
+    (id: string, archive: boolean) => {
+      getHistoryStore().setArchived(id, archive);
+      refreshList();
+      // An archived chat leaves Recents; if it was the open one, land on a
+      // fresh chat rather than showing a thread that is no longer listed.
+      if (archive && activeIdRef.current === id) newChat();
+      toast(archive ? 'Conversation archived.' : 'Conversation unarchived.');
+    },
+    [newChat, refreshList, toast],
+  );
+
+  const loadArchived = useCallback(() => {
+    void getHistoryStore()
+      .refreshArchived()
+      .then(() => refreshList());
+  }, [refreshList]);
+
+  const exportConversation = useCallback(
+    (id: string) => {
+      void (async () => {
+        const file = await getHistoryStore().exportMarkdown(id);
+        if (!file) {
+          toast('That conversation could not be exported.', 'error');
+          return;
+        }
+        downloadMarkdown(file);
+        toast(`Downloaded ${file.filename}`);
+      })();
+    },
+    [toast],
+  );
+
+  // Keyboard shortcuts (§9 + V4 §2). The map itself is pure and unit-tested
+  // in lib/searchPalette.ts; this only supplies the live context and runs the
+  // action it names.
+  useEffect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      const target = e.target as HTMLElement | null;
+      const action = shortcutAction(e, {
+        paletteOpen: searchOpen,
+        streaming: isStreaming(activeIdRef.current),
+        typing:
+          target?.tagName === 'INPUT' ||
+          target?.tagName === 'TEXTAREA' ||
+          target?.isContentEditable === true,
+      });
+      if (!action) return;
+      e.preventDefault();
+      switch (action) {
+        case 'open-search':
+          setSearchOpen(true);
+          return;
+        case 'close-palette':
+          setSearchOpen(false);
+          return;
+        case 'new-chat':
+          newChat();
+          return;
+        case 'stop-streaming':
+          stopStreaming();
+          return;
+        case 'focus-composer':
+          composerRef.current?.focus();
+      }
+    }
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [newChat, searchOpen, stopStreaming]);
+
+  const activeTitle =
+    conversations.find((c) => c.id === activeId)?.title ?? 'New chat';
+  const lastEngine: Engine | undefined = [...messages]
+    .reverse()
+    .find((m) => m.role === 'assistant' && m.meta)?.meta?.route;
+
+  // Chats generating right now — in this tab OR server-side (after reload).
+  const busyIds = Array.from(new Set([...streamingIds(), ...serverActive]));
+
+  return (
+    <div className="flex h-dvh overflow-hidden">
+      <Sidebar
+        open={sidebarOpen}
+        onClose={() => setSidebarOpen(false)}
+        conversations={conversations}
+        archived={archived}
+        activeId={activeId}
+        streamingIds={busyIds}
+        onNewChat={newChat}
+        onOpenSearch={() => setSearchOpen(true)}
+        onSelect={selectConversation}
+        onRename={renameConversation}
+        onDelete={deleteConversation}
+        onSetPinned={pinConversation}
+        onSetArchived={archiveConversation}
+        onExport={exportConversation}
+        onLoadArchived={loadArchived}
+      />
+
+      <SummaryPanel
+        conversationId={activeId}
+        open={summaryOpen}
+        onClose={() => setSummaryOpen(false)}
+      />
+
+      <ConfirmDialog
+        open={pendingRegenerate !== null}
+        title="Regenerate this response?"
+        body={`This will delete all messages after this point (${
+          pendingRegenerate?.discarded ?? 0
+        } message${pendingRegenerate?.discarded === 1 ? '' : 's'}).`}
+        confirmLabel="Regenerate"
+        onConfirm={() => {
+          const target = pendingRegenerate;
+          setPendingRegenerate(null);
+          if (target) void runRegenerate(target.messageId);
+        }}
+        onCancel={() => setPendingRegenerate(null)}
+      />
+
+      {/* Portals to <body> — see the note in SearchPalette.tsx. */}
+      <SearchPalette
+        open={searchOpen}
+        onClose={() => setSearchOpen(false)}
+        recents={conversations}
+        onSelect={selectConversation}
+        onNewChat={newChat}
+      />
+
+      <div className="flex min-w-0 flex-1 flex-col">
+        <header className="flex h-[52px] shrink-0 items-center gap-2 px-3">
+          <button
+            type="button"
+            onClick={() => setSidebarOpen((v) => !v)}
+            aria-label={sidebarOpen ? 'Hide sidebar' : 'Show sidebar'}
+            aria-expanded={sidebarOpen}
+            className="rounded-lg p-2 text-muted transition-colors duration-ts hover:bg-surface-2 hover:text-ink"
+          >
+            <IconSidebar size={17} />
+          </button>
+          <h1 className="min-w-0 flex-1 truncate text-sm font-semibold">
+            {activeId ? activeTitle : APP_NAME}
+          </h1>
+          {lastEngine && <EngineBadge engine={lastEngine} size="xs" />}
+        </header>
+
+        {unreachable && (
+          <div
+            role="alert"
+            className="flex flex-wrap items-center gap-3 border-b border-danger/40 bg-danger/10 px-4 py-2.5"
+          >
+            <IconAlert size={16} className="shrink-0 text-danger" />
+            <span className="min-w-0 flex-1 text-sm">
+              The orchestrator is unreachable — your message was kept and can
+              be re-sent.
+            </span>
+            <button
+              type="button"
+              onClick={retryLastTurn}
+              className="inline-flex items-center gap-1.5 rounded-md border border-border bg-surface px-2.5 py-1 text-xs font-medium transition-colors duration-ts hover:bg-surface-2"
+            >
+              <IconRefresh size={13} />
+              Retry
+            </button>
+          </div>
+        )}
+
+        <div
+          ref={scrollRef}
+          onScroll={handleScroll}
+          className="relative min-h-0 flex-1 overflow-y-auto"
+        >
+          {messages.length === 0 ? (
+            <EmptyState />
+          ) : (
+            <div className="mx-auto w-full max-w-thread space-y-6 px-4 py-6">
+              {messages.map((m, i) => (
+                <MessageRow
+                  key={m.id}
+                  message={m}
+                  isLast={i === messages.length - 1 && m.role === 'assistant'}
+                  onRegenerate={() => regenerate(m.id)}
+                  onRetry={() => regenerate(m.id)}
+                  onShowSummary={() => setSummaryOpen(true)}
+                />
+              ))}
+            </div>
+          )}
+        </div>
+
+        {!atBottom && messages.length > 0 && (
+          <div className="pointer-events-none relative">
+            <button
+              type="button"
+              onClick={() => scrollToBottom(true)}
+              className="pointer-events-auto absolute -top-12 left-1/2 z-10 inline-flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-border bg-surface px-3.5 py-1.5 text-xs font-medium shadow-lg transition-colors duration-ts hover:bg-surface-2"
+            >
+              Jump to latest
+              <IconArrowDown size={13} />
+            </button>
+          </div>
+        )}
+
+        <Composer
+          ref={composerRef}
+          streaming={streaming}
+          disabled={reconciling}
+          onDraftChange={handleDraftChange}
+          meter={
+            <ContextMeter
+              view={meterView(compactedAt ? null : latestUsage(messages), draft)}
+              compacting={compacting}
+              onCompactNow={compactNow}
+              compactDisabled={!activeId || streaming}
+            />
+          }
+          prefs={prefs}
+          onPrefsChange={updatePrefs}
+          onSend={send}
+          onStop={stopStreaming}
+        />
+      </div>
+    </div>
+  );
+}
