@@ -1,0 +1,200 @@
+@startuml 23-cicd-test-topology
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName "Inter, Segoe UI, sans-serif"
+skinparam defaultFontSize 13
+skinparam roundCorner 8
+skinparam shadowing false
+skinparam ArrowColor #4A5568
+skinparam ArrowFontColor #4A5568
+skinparam NoteBackgroundColor #FFFBEB
+skinparam NoteBorderColor #F59E0B
+' Layer palette — byte-identical across ALL 24 diagrams
+!$C_EDGE = "#2563EB"   /' frontend / edge '/
+!$C_APP  = "#7C3AED"   /' orchestrator / app logic '/
+!$C_GPU  = "#16A34A"   /' inference / GPU '/
+!$C_DATA = "#D97706"   /' storage / data '/
+!$C_EXT  = "#64748B"   /' external systems '/
+!$C_RISK = "#DC2626"   /' risk / trust boundary '/
+
+<style>
+activityDiagram {
+  activity {
+    BackGroundColor #F8FAFC
+    LineColor #64748B
+    LineThickness 1
+    .exists {
+      BackGroundColor #DCFCE7
+      LineColor #16A34A
+      LineThickness 2
+      FontColor #14532D
+    }
+    .partial {
+      BackGroundColor #FEF3C7
+      LineColor #D97706
+      LineThickness 2
+      FontColor #78350F
+    }
+    .missing {
+      BackGroundColor #FEE2E2
+      LineColor #DC2626
+      LineStyle 6-4
+      LineThickness 2
+      FontColor #991B1B
+    }
+    .manual {
+      BackGroundColor #EDE9FE
+      LineColor #7C3AED
+      LineThickness 2
+      FontColor #4C1D95
+    }
+  }
+  partition {
+    LineColor #94A3B8
+    LineThickness 1
+    FontColor #334155
+    FontStyle bold
+  }
+  diamond {
+    BackGroundColor #FEF3C7
+    LineColor #D97706
+  }
+  note {
+    BackGroundColor #FFFBEB
+    LineColor #F59E0B
+  }
+}
+</style>
+
+title Build → test → image → compose up → health gates — **what actually exists, and what does not**\nGround truth: **there is no CI of any kind**. Every green step below is a human typing a command.\n(evidence: infra-tests §17 — no `.github/`, no `.gitlab-ci.yml`, no `Jenkinsfile`, no `.circleci/`,\nno `Makefile`, no `pytest.ini`/`pyproject.toml`, no pre-commit config, no coverage tooling · git history = 1 commit `87b0643`)
+
+start
+
+partition "**1 · SOURCE**" {
+  #EDE9FE:**developer edits code on the DGX Spark host**\nrepo is a single commit `87b0643 first commit`\nworking tree: 18 modified + 16 untracked files; <<manual>>
+  #FEE2E2:**«MISSING» no CI trigger**\nno push / PR / tag hook exists anywhere.\n`git ls-files | rg -i 'ci|workflow|jenkins|pipeline'` → only `citations` paths; <<missing>>
+}
+
+partition "**2 · STATIC GATES**" {
+  #FEE2E2:**«MISSING» no lint gate**\n`next lint` exists as an npm script (frontend/package.json)\nbut nothing invokes it; orchestrator has **no ruff, no flake8**\n(`.ruff_cache` is gitignored at `.gitignore:60` — the tool is not installed); <<missing>>
+  #FEE2E2:**«MISSING» no type-check gate**\n`npx tsc --noEmit` is documented as a //manual// step\n(frontend/README.md:39); no mypy for Python (`.mypy_cache` ignored, tool absent); <<missing>>
+  #FEE2E2:**«MISSING» no dependency / CVE scan**\nno Dependabot, no `pip-audit`, no `npm audit` gate,\nno SBOM, no container image scan; <<missing>>
+}
+
+partition "**3 · TEST — three separate commands, typed by hand**" {
+  fork
+    #DCFCE7:**orchestrator**\n`python3 -m pytest tests/ -q` (README.md:298)\n**800 passed in 41.6 s**\n52 `test_*.py` files · 659 `def test_` · 8 913 LOC\nhost Python 3.12 (containers pin 3.11); <<exists>>
+  fork again
+    #DCFCE7:**sync-worker**\n`docker compose run` with tests bind-mounted back in\n(README.md:300-302 — the image excludes them)\n**104 passed in 1.1 s**\n10 test files · 97 `def test_` · 1 190 LOC; <<exists>>
+  fork again
+    #DCFCE7:**frontend**\n`npm test` → `vitest run` (frontend/package.json)\n**237 passed across 16 files**\n224 `it()` · 3 195 LOC · `environment: 'node'`\nno jsdom, no Testing Library, **no component rendering**; <<exists>>
+  end fork
+
+  #DCFCE7:**TOTAL: 1 141 passing · 0 failing · 100 % unit-level**; <<exists>>
+
+  #FEE2E2:**«MISSING» no coverage gate**\n`.coverage`/`htmlcov/` are gitignored (`.gitignore:62-63`)\nbut **no coverage package is installed** — coverage has never been measured; <<missing>>
+  #FEE2E2:**«MISSING» no integration / E2E stage**\n3 of the 8 critical flows have no end-to-end test at all:\n**RAG retrieval** (`engines/rag.py`, 0 tests) ·\n**upload → extract → report → PDF** (`POST /uploads`, `run_report_engine`,\n`_run_pandoc` — 0 tests) · **NL → SQL → guard → DuckDB** (every fake\nmodel returns a benign SELECT; a hostile one is never driven through); <<missing>>
+}
+
+partition "**4 · IMAGE**" {
+  #FEE2E2:**«MISSING» no image build, no registry push, no artefact publish**\nnothing is versioned, signed, scanned or promoted; <<missing>>
+  #EDE9FE:`docker compose up -d --build`\nbuilds `./orchestrator`, `./frontend`, `./sync-worker` locally.\nNo `USER` directive and no `HEALTHCHECK` in orchestrator/Dockerfile;\nbase tag `nvcr.io/nvidia/vllm:26.05-py3` is mutable and undigested; <<manual>>
+}
+
+partition "**5 · RUNTIME HEALTH GATES — the only automated gates that exist**" {
+  fork
+    #DCFCE7:**vllm** `curl /health`\ninterval 30 s · retries 60 · start_period **30 m**\ndocker-compose.yml:90-94; <<exists>>
+  fork again
+    #DCFCE7:**vllm-router** `curl /health`\nstart_period **15 m** · docker-compose.yml:173-177; <<exists>>
+  fork again
+    #DCFCE7:**vllm-embed** `curl /health`\nstart_period **10 m** · docker-compose.yml:204-208; <<exists>>
+  end fork
+
+  if (all three `service_healthy`?\ndocker-compose.yml:274-282) then (**yes**)
+    #FEF3C7:**orchestrator** starts —\nbut declares **no healthcheck of its own** and\n**no `restart:` policy**, so `docker compose ps`\ncannot tell "running" from "serving"; <<partial>>
+  else (**no**)
+    #FEE2E2:compose blocks — this is the ONLY\nautomated gate in the entire delivery path; <<missing>>
+    kill
+  endif
+
+  #FEF3C7:**frontend** starts on `service_started`, **not** `service_healthy`\n(docker-compose.yml:353-355) → the UI is reachable\nbefore the backend can answer a single request; <<partial>>
+
+  #FEF3C7:**sync-worker** starts after `vllm-embed: service_healthy`\n(docker-compose.yml:329-331). No healthcheck, no `restart:` policy —\nafter a host reboot the 4 model servers return and the\napplication layer does not; <<partial>>
+}
+
+#DCFCE7:`GET :8080/health` — the only post-deploy signal\nchecks `{vllm, vllm-router, vllm-embed, duckdb, app_db}`; <<exists>>
+
+stop
+
+' ══════════════════════════════════════════════════════════════════════
+note right
+  **REPRODUCIBILITY GAP — three different pinning regimes in one repo.**
+
+  · `orchestrator/requirements.txt:3-28` — every constraint is a **lower bound**
+    (`fastapi>=0.115`, `pydantic>=2.7`, `langgraph>=0.2`,
+    `openai>=1.50`, `transformers>=4.51`, `lancedb>=0.15`, …).
+    **No `==`, no upper bound, no lockfile anywhere in the repo.**
+    Two builds a week apart install different majors, with nothing to diff.
+    `torch` is deliberately unpinned and inherited from the base image
+    (`requirements.txt:2`), so the image is buildable on that base only.
+  · `sync-worker/requirements.txt` — **caps majors**
+    (`httpx>=0.27,<1`, `PyJWT>=2.8,<3`, `duckdb>=1.0,<2`, `pandas>=2.2,<3`,
+    `lancedb>=0.8,<1`). Still no hash lock, but bounded.
+  · `frontend/package-lock.json` — **fully locked.** The only
+    reproducible build in the repo.
+  · Container images use moving tags: `vllm/vllm-openai:nightly`
+    (docker-compose.yml:36,156) and `searxng/searxng:latest` (`:337`).
+    `README.md:273-276` warns operators **not** to `docker compose pull`
+    because a newer nightly "can silently break model loading" — i.e. the
+    deployment is reproducible only by never re-pulling.
+
+  `orchestrator/requirements-dev.txt` also omits `python-multipart`, which
+  `app/uploads.py:66-71` needs at import time — on a clean host installing
+  exactly that file, **12 test files fail at collection**. Latent only
+  because this machine happens to have it installed.
+end note
+
+note left
+  **THE SUITES ARE GOOD; THE PIPELINE IS ABSENT.** 1 141 assertions is
+  strong coverage for a system this size, and several tests encode real
+  regressions (8-thread SQLite race, lying-central-directory zip bomb,
+  background-vs-synchronous compaction race, prompt-injection canaries).
+
+  What no one can see, because nothing runs automatically:
+  · **5 tests cannot fail.** `test_search_off.py:9-29` re-implements the
+    gate locally and ends `assert True`; `test_search_engine.py:111-116`
+    asserts `settings.search_enabled in (True, False)`;
+    `test_conversation_integrity.py:553-566` monkeypatches the checker to
+    itself; `test_chart_pipeline.py:197-199` is `assert x is None or True`;
+    `test_history_v3.py:162-176` posts to a route that 404s.
+  · **6 files assert on source strings, not behaviour** — e.g.
+    `test_effort_depth.py:126-136` asserts a literal line of Python is
+    present. Behaviour-preserving refactors break them; behaviour changes
+    that keep the literal do not.
+  · **Three flake candidates**: a real TCP connect to `127.0.0.1:9`
+    (`test_context_budget.py:168-176`), a fixed `/tmp/many.json` path
+    (`test_sf_dictionary.py:82,84`), and 8 OS threads on one SQLite file
+    (`test_conversation_integrity.py:431-461`).
+  · `orchestrator/.dockerignore:5` excludes `tests/`, so the orchestrator
+    suite **cannot run inside the built image** — it is host-only, on a
+    different Python minor than the containers actually ship.
+end note
+
+legend right
+  |= Style |= Meaning |
+  |<#DCFCE7> | **exists today** — verified running, measured |
+  |<#EDE9FE> | exists, but **manual** — a human types it |
+  |<#FEF3C7> | exists but **partial** — gate is weaker than it looks |
+  |<#FEE2E2> | **«MISSING»** — dashed red border, does not exist at all |
+  ==
+  Measured totals — orchestrator **800 passed / 41.6 s** ·
+  sync-worker **104 passed / 1.1 s** · frontend **237 passed / 16 files**
+  → **1 141 passing, 0 failing, every one of them unit-level.**
+  ==
+  8 «MISSING» stages: CI trigger · lint · type-check · dependency/CVE
+  scan · coverage · integration/E2E · image build · artefact publish.
+  The only automated gate in the whole path is the compose
+  `depends_on: service_healthy` on three vLLM containers.
+end legend
+
+@enduml

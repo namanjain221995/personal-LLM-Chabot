@@ -1,0 +1,117 @@
+@startuml 21-network-ports
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName "Inter, Segoe UI, sans-serif"
+skinparam defaultFontSize 13
+skinparam roundCorner 8
+skinparam shadowing false
+skinparam ArrowColor #4A5568
+skinparam ArrowFontColor #4A5568
+skinparam NoteBackgroundColor #FFFBEB
+skinparam NoteBorderColor #F59E0B
+' Layer palette — byte-identical across ALL 24 diagrams
+!$C_EDGE = "#2563EB"   /' frontend / edge '/
+!$C_APP  = "#7C3AED"   /' orchestrator / app logic '/
+!$C_GPU  = "#16A34A"   /' inference / GPU '/
+!$C_DATA = "#D97706"   /' storage / data '/
+!$C_EXT  = "#64748B"   /' external systems '/
+!$C_RISK = "#DC2626"   /' risk / trust boundary '/
+
+!include <tupadr3/common>
+!include <tupadr3/font-awesome-5/network_wired>
+!include <tupadr3/font-awesome-5/microchip>
+!include <tupadr3/font-awesome-5/lock>
+!include <tupadr3/font-awesome-5/exclamation_triangle>
+!include <tupadr3/devicons2/python>
+!include <tupadr3/devicons2/nextjs>
+!include <tupadr3/font-awesome-5/search>
+!include <logos/salesforce>
+
+title Network & port exposure — what listens, what is published, what is authenticated\n(evidence: docker-compose.yml, orchestrator/app/auth.py, orchestrator/app/main.py)
+
+skinparam rectangle {
+  BorderThickness 2
+}
+
+rectangle "**LAN / any host interface**\nDocker publishes to 0.0.0.0 unless a bind address is given" as lan #FFF1F2 {
+  actor "Anyone who can\nreach the host" as att #DC2626
+}
+
+rectangle "**HOST — published ports (0.0.0.0)**" as hostns #FEF2F2 {
+  rectangle "**:3000** → frontend:3000\nNext.js UI\n<i>docker-compose.yml:351-352</i>\n**NO AUTH**" as p3000 #DBEAFE
+  rectangle "**:8080** → orchestrator:8080\nFastAPI — /chat /reports /health /auth /history /uploads\n<i>docker-compose.yml:272-273</i>\n**NO AUTH — require_user() never 401s**\n<i>auth.py:95-97</i>" as p8080 #FECACA
+  rectangle "**:8000** → vllm:30000\nOpenAI-compatible inference\n<i>docker-compose.yml:85-86</i>\n**NO AUTH — api_key is 'local-no-key'**" as p8000 #FECACA
+  rectangle "**:8001** → vllm-vision:30001\n<i>docker-compose.yml:132-133</i>\n(profile: vision)\n**NO AUTH**" as p8001 #FECACA
+  rectangle "**:8002** → vllm-router:30002\n<i>docker-compose.yml:170-171</i>\n**NO AUTH**" as p8002 #FECACA
+  rectangle "**:8003** → vllm-embed:30003\n<i>docker-compose.yml:201-202</i>\n**NO AUTH**" as p8003 #FECACA
+}
+
+rectangle "**INTERNAL — compose network only (no host port)**" as intns #F0FDF4 {
+  rectangle "searxng:8080\nmetasearch\n<i>docker-compose.yml:336-344</i>\nprofile: search — correctly NOT published" as sxi #DCFCE7
+  rectangle "sync-worker\n**no listening port at all**\n<i>docker-compose.yml:291-331</i>" as swi #DCFCE7
+}
+
+rectangle "**EGRESS — outbound from the orchestrator / sync-worker**" as eg #F8FAFC {
+  rectangle "Salesforce REST + SOQL\nHTTPS 443 · JWT Bearer / client-credentials\n<i>core/salesforce.py, syncworker/sf_auth.py</i>" as sfe #E2E8F0
+  rectangle "Arbitrary public HTTP(S)\nweb search · URL analysis · repo fetch\nchoke point: <i>core/net.py:103</i> safe_fetch()\nSSRF guard + 3 redirect hops + size cap" as webe #E2E8F0
+  rectangle "Hugging Face (model pull)\nHTTPS · HF_TOKEN\nfirst boot only" as hfe #E2E8F0
+}
+
+att -[#DC2626,bold]-> p3000 : "**unauthenticated**\nHTTP · full UI"
+att -[#DC2626,bold]-> p8080 : "**unauthenticated**\nPOST /chat · reads every\nconversation, queries CRM data"
+att -[#DC2626,bold]-> p8000 : "**unauthenticated**\nfree GPU inference\n(model DoS / theft of compute)"
+att -[#DC2626,bold]-> p8002 : "**unauthenticated**"
+att -[#DC2626,bold]-> p8003 : "**unauthenticated**"
+att -[#DC2626,dashed]-> p8001 : "when vision profile on"
+
+p3000 -[#2563EB]-> p8080 : "server-side proxy\nORCHESTRATOR_URL · JSON/SSE"
+p8080 -[#7C3AED]-> p8000 : "OpenAI /v1 · async"
+p8080 -[#7C3AED]-> p8002 : "OpenAI /v1 · async"
+p8080 -[#7C3AED]-> p8003 : "/v1/embeddings · async"
+p8080 -[#7C3AED]-> sxi : "GET /search · JSON · internal DNS"
+p8080 -[#7C3AED]-> sfe : "HTTPS · read-only SOQL"
+p8080 -[#7C3AED]-> webe : "HTTPS · via safe_fetch()"
+swi -[#7C3AED]-> sfe : "HTTPS · JWT Bearer · bulk pull"
+swi -[#7C3AED]-> p8003 : "embed chunks (batched)"
+p8000 -[#16A34A,dashed]-> hfe : "first boot only"
+
+note right of p8080 #FFE4E6
+  **The single highest-severity fact in this audit.**
+  `auth.py:17-20` states the no-auth design is
+  "NOT fine if the port is published to a network you
+  do not control — see the compose port bindings."
+  The compose port binding is `"8080:8080"`, which
+  Docker binds to **0.0.0.0**, not 127.0.0.1.
+  The precondition the code relies on is not met.
+
+  Fix (one line per service):
+  `- "127.0.0.1:8080:8080"`
+end note
+
+note right of intns #F0FDF4
+  Done correctly: SearXNG has **no** host port and
+  is reachable only as `http://searxng:8080` from
+  the orchestrator (docker-compose.yml:333-344).
+  This is the pattern the vLLM services should follow.
+end note
+
+note bottom of webe #FFFBEB
+  All user-influenced outbound fetches funnel through
+  ONE choke point, `core/net.py:103 safe_fetch()`:
+  DNS resolved and checked before connect, every
+  redirect hop re-validated, body + time capped.
+  Residual gap: resolve-then-connect is a TOCTOU
+  window (see SEC-03).
+end note
+
+legend right
+  |= Colour |= Meaning |
+  |<#FECACA> | published **and** unauthenticated |
+  |<#DBEAFE> | published, UI surface |
+  |<#DCFCE7> | internal only — not reachable off-host |
+  |<#E2E8F0> | outbound egress |
+  Solid red = unauthenticated inbound path.
+  Ports written `host:container`.
+end legend
+
+@enduml

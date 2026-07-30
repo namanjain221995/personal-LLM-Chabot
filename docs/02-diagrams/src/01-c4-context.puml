@@ -1,0 +1,90 @@
+@startuml 01-c4-context
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName "Inter, Segoe UI, sans-serif"
+skinparam defaultFontSize 13
+skinparam roundCorner 8
+skinparam shadowing false
+skinparam ArrowColor #4A5568
+skinparam ArrowFontColor #4A5568
+skinparam NoteBackgroundColor #FFFBEB
+skinparam NoteBorderColor #F59E0B
+' Layer palette — byte-identical across ALL 24 diagrams
+!$C_EDGE = "#2563EB"   /' frontend / edge '/
+!$C_APP  = "#7C3AED"   /' orchestrator / app logic '/
+!$C_GPU  = "#16A34A"   /' inference / GPU '/
+!$C_DATA = "#D97706"   /' storage / data '/
+!$C_EXT  = "#64748B"   /' external systems '/
+!$C_RISK = "#DC2626"   /' risk / trust boundary '/
+
+!include <C4/C4_Context>
+!include <tupadr3/common>
+!include <tupadr3/font-awesome-5/search>
+!include <tupadr3/font-awesome-5/user>
+!include <logos/salesforce>
+
+title C4 L1 — System context: TechSara local Salesforce AI analytics platform\n(evidence: docker-compose.yml, orchestrator/app/main.py, orchestrator/app/auth.py)
+
+LAYOUT_WITH_LEGEND()
+
+Person(analyst, "Analyst / owner", "Asks natural-language questions about Salesforce data; uploads documents, datasets and images; pastes URLs and GitHub repos")
+
+System_Boundary(host, "DGX Spark workstation — everything below runs on ONE air-gapped-by-intent host") {
+  System(platform, "TechSara AI Platform", "Next.js UI + FastAPI orchestrator + 13 engines + 4 local vLLM model servers + DuckDB/LanceDB warehouse + Salesforce sync worker.\n\n**No authentication of any kind** (auth.py:95-97); all app and model ports are published on 0.0.0.0 (docker-compose.yml).")
+}
+
+System_Ext(sf, "Salesforce org (PRODUCTION)", "System of record. Read-only integration user.\n· sync-worker: JWT Bearer / client-credentials, bulk pull every 30 min\n· orchestrator: live SOQL for objects the warehouse lacks")
+System_Ext(searx, "SearXNG (self-hosted)", "Default metasearch provider. Runs as a local container under the `search` profile — internal only, never published")
+System_Ext(brave, "Brave Search API", "Optional hosted provider — BRAVE_API_KEY")
+System_Ext(tavily, "Tavily API", "Optional hosted provider — TAVILY_API_KEY")
+System_Ext(web, "Arbitrary public websites & GitHub", "Fetched on the user's behalf for URL analysis and repo ingestion")
+System_Ext(hf, "Hugging Face Hub", "Model weight download on first boot only (HF_TOKEN)")
+
+Rel(analyst, platform, "Asks questions, uploads files", "HTTP :3000 (UI) and :8080 (API) — **unauthenticated**")
+Rel_Back(analyst, platform, "Streams tokens, tables, charts, citations", "SSE text/event-stream")
+
+Rel(platform, sf, "Bulk record pull + live SOQL", "HTTPS 443 · JWT Bearer · read-only")
+Rel(platform, searx, "Web search when SEARCH_ENABLED=true", "HTTP · internal network")
+Rel(platform, brave, "Web search (alternative provider)", "HTTPS · API key")
+Rel(platform, tavily, "Web search (alternative provider)", "HTTPS · API key")
+Rel(platform, web, "Fetch pages & repos via core/net.py safe_fetch()", "HTTPS · SSRF-guarded")
+Rel(platform, hf, "Pull model weights (first boot)", "HTTPS · HF_TOKEN")
+
+note right of host #FFE4E6
+  **Trust boundary — and the central risk.**
+  The design intent is a single-user machine
+  nobody else can reach (`auth.py:17-20`).
+  The implementation publishes :3000, :8080,
+  :8000, :8002 and :8003 on **0.0.0.0**, so on
+  any shared network the boundary drawn here
+  does not exist. See 21-network-ports and
+  finding SEC-01.
+end note
+
+note bottom of sf #FFFBEB
+  Production CRM data (Accounts, Opportunities,
+  Contacts, Cases…) is copied onto this host and
+  reachable through an unauthenticated API.
+  Data classification: **CRM / PII**.
+end note
+
+note bottom of web #FFFBEB
+  Content fetched here is **untrusted** and reaches
+  the model prompt (prompt-injection surface, SEC-05).
+  Egress is funnelled through one guarded choke
+  point, `core/net.py:103`.
+end note
+
+legend right
+  |= Colour |= Layer |
+  |<#2563EB> | frontend / edge |
+  |<#7C3AED> | orchestrator / app logic |
+  |<#16A34A> | inference / GPU |
+  |<#D97706> | storage / data |
+  |<#64748B> | external systems |
+  |<#DC2626> | risk / trust boundary |
+  Dashed red = trust boundary. Every arrow is
+  labelled protocol · payload · sync|async.
+end legend
+
+@enduml

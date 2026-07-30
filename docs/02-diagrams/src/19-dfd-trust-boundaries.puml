@@ -1,0 +1,317 @@
+@startuml 19-dfd-trust-boundaries
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName "Inter, Segoe UI, sans-serif"
+skinparam defaultFontSize 13
+skinparam roundCorner 8
+skinparam shadowing false
+skinparam ArrowColor #4A5568
+skinparam ArrowFontColor #4A5568
+skinparam NoteBackgroundColor #FFFBEB
+skinparam NoteBorderColor #F59E0B
+' Layer palette — byte-identical across ALL 24 diagrams
+!$C_EDGE = "#2563EB"   /' frontend / edge '/
+!$C_APP  = "#7C3AED"   /' orchestrator / app logic '/
+!$C_GPU  = "#16A34A"   /' inference / GPU '/
+!$C_DATA = "#D97706"   /' storage / data '/
+!$C_EXT  = "#64748B"   /' external systems '/
+!$C_RISK = "#DC2626"   /' risk / trust boundary '/
+
+hide stereotype
+
+skinparam rectangle<<tb>> {
+  BorderColor #DC2626
+  BorderStyle dashed
+  BorderThickness 2
+  BackgroundColor #FFFFFF
+  FontColor #B91C1C
+  FontStyle bold
+}
+skinparam rectangle<<level>> {
+  BorderColor #94A3B8
+  BorderThickness 2
+  BackgroundColor #F8FAFC
+  FontColor #334155
+  FontStyle bold
+}
+skinparam usecase {
+  BorderColor #7C3AED
+  BorderThickness 1
+}
+skinparam database {
+  BorderColor #D97706
+  BorderThickness 1
+}
+
+title Data-flow diagram — LEVEL 0 (context) and LEVEL 1 (decomposition), with trust boundaries\nEvery flow that carries Salesforce CRM or personal data is tagged **CRM·PII**\n(evidence: orchestrator/app/auth.py:95-97 · docker-compose.yml:86,133,171,202,272-273,351-352 · sync-worker/syncworker/main.py:106)
+
+' ══════════════════════════════════════════════════════════════════════
+' LEVEL 0 — one process, four external entities
+' ══════════════════════════════════════════════════════════════════════
+rectangle "  **LEVEL 0 — CONTEXT DFD**  ·  one process, four external entities  " as L0 <<level>> {
+
+  rectangle "**Analyst**\n(external entity)\nbrowser on the LAN —\n**no account, no credential**\n<i>auth.py:17-20, 89-97</i>" as l0_an #E2E8F0
+
+  usecase "**P0 · sf-local-ai platform**\nNext.js UI + FastAPI orchestrator\n+ 4 vLLM servers + sync worker\non one DGX Spark host\n<i>docker-compose.yml:5</i>" as l0_sys #EDE9FE
+
+  rectangle "**Salesforce org**\n(external entity)\nproduction CRM · 48 objects\n<i>sync-worker/config.yaml</i>" as l0_sf #E2E8F0
+
+  rectangle "**public web**\n(external entity)\npages · PDFs · GitHub repos\n**attacker-influenced**" as l0_web #E2E8F0
+
+  rectangle "**search providers**\n(external entity)\nsearxng (10 engines) · Tavily · Brave\n<i>config.py:193-196</i>" as l0_sp #E2E8F0
+}
+
+l0_an  -[#2563EB,bold]->  l0_sys : "**D1** question + image/PDF + uploads\nHTTP · JSON · **UNAUTHENTICATED** · async"
+l0_sys -[#D97706,bold]->  l0_an  : "**D2 · CRM·PII** answers, SQL rows,\ncitations, report files\nSSE text/event-stream · async"
+l0_sys -[#64748B]->       l0_sf  : "**D3** RS256 JWT / client-credentials,\nthen read-only SOQL\nHTTPS 443 · blocking"
+l0_sf  -[#D97706,bold]->  l0_sys : "**D4 · CRM·PII** every field verbatim —\nnames, emails, phones, amounts, notes\nBulk 2.0 CSV + REST JSON · blocking"
+l0_sys -[#64748B]->       l0_sp  : "**D5** rewritten query text\n(may echo the CRM question) · async"
+l0_web -[#DC2626,bold]->  l0_sys : "**D6 · UNTRUSTED** HTML / PDF / git tree\n→ straight into the model prompt"
+
+' ══════════════════════════════════════════════════════════════════════
+' LEVEL 1 — decomposition of P0
+' ══════════════════════════════════════════════════════════════════════
+rectangle "  **LEVEL 1 — DECOMPOSITION OF P0**  ·  processes, data stores, three trust boundaries  " as L1 <<level>> {
+
+  rectangle "**Analyst**\n(external entity)" as an #E2E8F0
+  rectangle "**Salesforce org**\n(external entity)" as sf #E2E8F0
+  rectangle "**public web** + **search providers**\n(external entities)" as web #E2E8F0
+
+  rectangle "**TRUST BOUNDARY 1 — HOST / LAN EDGE**\nsix ports published on 0.0.0.0 · nothing inside authenticates" as TB1 <<tb>> {
+
+    usecase "**P1 · frontend**\nNext.js route handler proxies\nthe orchestrator byte-for-byte\n<i>docker-compose.yml:349</i>" as fe #DBEAFE
+
+    usecase "**P2 · orchestrator**\nFastAPI · ONE uvicorn worker\n`POST /chat` = 412 LOC chain\n<i>main.py:274-685</i>" as orc #EDE9FE
+
+    usecase "**vllm** (MAIN)\nQwen3.6-35B-A3B-NVFP4, 262 144 ctx\n<i>docker-compose.yml:64-78</i>" as vllm #DCFCE7
+
+    usecase "**vllm-embed**\nQwen3-Embedding-0.6B (pooling)\n<i>docker-compose.yml:191-196</i>" as emb #DCFCE7
+
+    usecase "**searxng**\nmetasearch, `limiter: false`\n<i>searxng/settings.yml:13</i>" as sxng #DCFCE7
+
+    rectangle "**TRUST BOUNDARY 2 — UNTRUSTED CONTENT → PROMPT**\nweb pages · pasted URLs · cloned repos · uploaded archives" as TB2 <<tb>> {
+
+      usecase "**P2.4 · url · repo · search engines**\n`safe_fetch()` = the SSRF choke point\n<i>core/net.py:103-162</i>" as ioe #EDE9FE
+
+      usecase "**P2.5 · uploads + dataset engine**\nmagic sniff · zip-slip ×2 · 4 bomb caps\n<i>uploads.py:66-157</i>" as upl #EDE9FE
+
+      folder "**workspaces**\n`/data/workspaces` — git clones +\nextracted archives · TTL 24 h · 20 GB\n<i>config.py:214-216</i>" as ws #FEF3C7
+    }
+
+    rectangle "**TRUST BOUNDARY 3 — CRM / PII DATA**\nlocal replica of production Salesforce data" as TB3 <<tb>> {
+
+      usecase "**P2.2 · sql engine**\nNL → SQL → `guard_sql()` → DuckDB\n<i>sql.py:189-206 · sql_guard.py:129</i>" as sqle #EDE9FE
+
+      usecase "**P2.3 · rag engine**\nLanceDB search + Qwen3-Reranker\n<i>engines/rag.py:36-150</i>" as rage #EDE9FE
+
+      usecase "**sync-worker**\nsingle-threaded poll loop · 30 min\n<i>syncworker/main.py:106,259</i>" as sw #EDE9FE
+
+      database "**DuckDB warehouse**\none table per SF object\n**every column VARCHAR**\n<i>storage.py:38-56,140</i>" as ddb #FEF3C7
+
+      database "**LanceDB**\ntable `chunks` — embedded\nlong-text CRM fields, no index\n<i>rag_index.py:79-89</i>" as lance #FEF3C7
+
+      database "**app.sqlite3**\nconversations · messages ·\nsummaries · uploads · repo chunks\n<i>db.py:195-205</i>" as sqlite #FEF3C7
+
+      folder "**reports**\n`/reports` — .docx/.pdf narratives\n**and** CSV/XLSX warehouse exports\n<i>report.py:256 · sql.py:407-409</i>" as rp #FEF3C7
+    }
+  }
+}
+
+' Stack LEVEL 0 above LEVEL 1
+l0_sf -[hidden]down-> sf
+
+' ── Analyst-facing flows ───────────────────────────────────────────────
+an  -[#2563EB,bold]->  fe    : "**F1** HTTP :3000 · JSON\n**no auth, no session**"
+fe  -[#2563EB]->       orc   : "**F2** POST /chat · JSON · async\nbody size **unbounded**"
+orc -[#D97706,bold]->  fe    : "**F3 · CRM·PII**\nSSE text/event-stream"
+an  -[#DC2626,bold]->  rp    : "**F4 · CRM·PII** GET :8080/reports/{f}\n**unauthenticated · unscoped**"
+an  -[#DC2626,bold]->  vllm  : "**F5** POST :8000/v1/chat/completions\n**unauthenticated GPU**"
+an  -[#2563EB]->       upl   : "**F6 · UNTRUSTED**\nPOST /uploads · multipart"
+
+' ── Orchestrator internal dispatch ─────────────────────────────────────
+orc -[#7C3AED]->  sqle  : "**F7** in-process\n**blocking**"
+orc -[#7C3AED]->  rage  : "**F8** in-process · async"
+orc -[#7C3AED]->  ioe   : "**F9** in-process · async"
+orc -[#7C3AED]->  upl   : "**F10** in-process\n**blocking**"
+orc -[#D97706,bold]-> sqlite : "**F11 · CRM·PII** sqlite3 r/w\n**blocking on the loop**"
+orc -[#16A34A]-> vllm  : "**F12 · CRM·PII + UNTRUSTED**\nPOST /v1/chat/completions · async\nCRM rows //and// web text, one prompt"
+orc -[#16A34A]-> emb   : "**F13 · CRM·PII**\nPOST /v1/embeddings"
+
+' ── CRM boundary flows ─────────────────────────────────────────────────
+sqle  -[#D97706,bold]-> ddb   : "**F14 · CRM·PII** DuckDB read_only\n+ no external access · **blocking**"
+sqle  -[#D97706,bold]-> rp    : "**F15 · CRM·PII** file I/O\nCSV/XLSX export"
+rage  -[#D97706,bold]-> lance : "**F16 · CRM·PII**\nbrute-force vector scan"
+sf    -[#D97706,bold]-> sw    : "**F17 · CRM·PII** Bulk 2.0 CSV + SOQL\nJWT Bearer · HTTPS · **blocking**"
+sw    -[#D97706,bold]-> ddb   : "**F18 · CRM·PII** DELETE-then-INSERT txn\n+ Parquet batch · **blocking**"
+sw    -[#16A34A]->      emb   : "**F19 · CRM·PII** POST /embeddings\n32/batch · **blocking**"
+sw    -[#D97706,bold]-> lance : "**F20 · CRM·PII**\ndelete() per record, then add()"
+
+' ── Untrusted-content flows ────────────────────────────────────────────
+web -[#DC2626,bold]-> ioe : "**F21 · UNTRUSTED** HTML/PDF/git tree\nHTTPS via safe_fetch() · async"
+ioe -[#64748B]->      sxng: "**F22** GET /search?format=json\ninternal · unauthenticated"
+sxng -[#64748B]->     web : "**F23** HTTPS fan-out\n10 upstream engines"
+upl -[#D97706]->      ws  : "**F24 · UNTRUSTED** extract to disk\n**blocking on the loop**"
+ioe -[#D97706]->      ws  : "**F25 · UNTRUSTED**\ngit clone --depth 1"
+ioe -[#DC2626,bold]-> orc : "**F26 · UNTRUSTED**\ntext → `system` message"
+upl -[#DC2626,bold]-> orc : "**F27 · UNTRUSTED**\nprofile → prompt"
+
+' ══════════════════════════════════════════════════════════════════════
+' Notes — every one cites file:LINE
+' ══════════════════════════════════════════════════════════════════════
+note as N_AUTH #FEE2E2
+  **TB1 · the boundary that is not enforced.**
+  `auth.py:95-97` `require_user()` returns the single local user and
+  its own docstring says //"Never 401s now"//; `main.py:55-56` states
+  `/chat` and `/reports*` are deliberately auth-free. That is only safe
+  if the ports are private — but `docker-compose.yml:272-273` is
+  `"8080:8080"`, which Docker binds to **0.0.0.0**, and so are
+  `:86 :133 :171 :202 :351-352`. Every ownership comparison
+  (`main.py:343-344`, `main.py:701-709`) therefore compares one
+  identity with itself. `docker-compose.yml` declares **no `networks:` block**,
+  so every container can reach every other —
+  including the four unauthenticated model servers.
+  **Flows F1, F4, F5, F6 all cross TB1 unauthenticated.**
+end note
+N_AUTH .. TB1
+
+note as N_TB2 #FEE2E2
+  **TB2 · what crosses, and what mitigates it.** Web pages, pasted URLs,
+  cloned GitHub repos, uploaded datasets and CRM free-text all reach the
+  model prompt. Mitigations that do exist: content is fenced/delimited and
+  the system blocks are folded into one leading message first
+  (`llm.py:39-69`); uploaded datasets are **profiled, never executed**
+  (`config.py:169`, `core/profile.py`); a dual prompt-injection canary is
+  asserted never to reach the assembled prompt
+  (`tests/test_dataset_profile.py`). What does **not** exist: any
+  instruction-stripping, any provenance tainting of model input, and any
+  output-side egress check. Flows F21, F24-F27 all cross TB2.
+end note
+N_TB2 .. TB2
+
+note as N_OWN #FFFBEB
+  **Fall-open authorization.** `main.py:338-341` wraps
+  `db.conversation_owner()` in `try/except Exception: conv_owner = None`,
+  and `main.py:343` only 404s `if conv_owner is not None`. A SQLite
+  error therefore //skips// the check — the comment at `main.py:336-337`
+  asserts the opposite. Flow F2 is the affected hop.
+end note
+N_OWN .. orc
+
+note as N_BODY #FFFBEB
+  **Unbounded ingress on F2/F6.** `ChatRequest` (`main.py:184-199`)
+  caps neither `messages` nor the base64 `image`/`pdf` strings, and
+  `main.py:47-53` installs CORS as the only middleware — Starlette adds
+  no default body limit. `LiveGeneration.events` (`main.py:85,97`) also
+  retains every token frame for the generation's whole life.
+  Unauthenticated + 0.0.0.0 + unbounded = trivial OOM.
+end note
+N_BODY .. fe
+
+note as N_SQL #FFFBEB
+  **F14 is the prompt-injection sink.** `core/sql_guard.py:57-126` is a
+  hand-written scanner, not a parser: the checks run on `bare` but the
+  string that executes is `cleaned` (`sql_guard.py:156`), and an
+  `E'\''` escape-string desynchronises the two — a reproduced bypass
+  smuggles `; ATTACH` past both the stacked-statement check
+  (`:142`) and the keyword blocklist (`:146`).
+  What actually holds the line is `engines/sql.py:124-132`:
+  `read_only=True`, `enable_external_access=False`,
+  `autoinstall/autoload_known_extensions=False`.
+  Separately, `engines/sql.py:201,206` calls DuckDB **synchronously**, inside
+  an `async def` — one slow query stalls every user's SSE stream.
+end note
+N_SQL .. sqle
+
+note as N_NET #FFFBEB
+  **TB2 egress, F21.** `core/net.py:103-162` is the only place a
+  user-influenced URL is fetched: scheme allowlist (`:94-95`), DNS
+  resolved and //every// A record checked before connect (`:82-86`),
+  each of ≤3 redirect hops re-validated (`:147`), time and size capped.
+  Residual gaps — the validated IP is discarded at `net.py:99` and httpx
+  re-resolves at `:137` (**TOCTOU / DNS rebinding**); the size cap at
+  `:153-155` runs //after// `resp.content` has buffered the whole body;
+  `100.64.0.0/10` (CGNAT / Tailscale) is not blocked; there is no
+  total deadline and `socket.getaddrinfo` (`:76`) has no timeout.
+end note
+N_NET .. ioe
+
+note as N_ARC #FFFBEB
+  **F24 · hostile archives.** `core/archive.py` is the strongest module
+  in the repo — magic-byte sniffing, never `extractall()`, zip-slip
+  checked twice (`:157`, `:223`), symlinks/hardlinks/devices refused
+  (`:153-156`, `:251-253`), four bomb caps plus a live streaming budget
+  (`:200-208`). Two residual gaps: extraction is **fully synchronous**, called
+  from a FastAPI `async def` (`uploads.py:99/103`), so a multi-hundred-MB
+  archive runs on the event loop; and the byte budget is **per call**
+  (`archive.py:216`), so N concurrent uploads each get 2048 MB.
+  `enforce_quota_and_ttl` (`core/repo.py:94-119`) treats
+  `<workspace_dir>/uploads` as one entry, so a single TTL expiry
+  deletes every conversation's extracted uploads at once.
+end note
+N_ARC .. upl
+
+note as N_SYNC #FEE2E2
+  **TB3 ingress, F17-F20.** The RS256 signing key is written to
+  `/data/sf_jwt_key.pem` (`syncworker/secrets.py:50`) — i.e. **the same volume**
+  as the warehouse, mounted read-write into the orchestrator
+  (`docker-compose.yml:269`) and holds the warehouse the LLM queries.
+  The JWT itself carries no `iat`/`nbf` and no skew allowance
+  (`sf_auth.py:32-38`).
+  A RAG-indexing failure is swallowed at `syncworker/main.py:174-184`
+  while the watermark still advances at `:188` — a **permanent index gap**.
+  Salesforce deletes are never propagated
+  (`syncworker/main.py:147-154`), so F18/F20 leave withdrawn CRM
+  records readable forever.
+end note
+N_SYNC .. sw
+
+note as N_STORE #FFFBEB
+  **Data-store hygiene.** `db.connect()` (`db.py:195-205`) re-executes
+  16 DDL statements plus a full-table de-dup `DELETE` (`:181-186`) on
+  **every** call — 34 call sites (31 × `closing(connect())` in `db.py`,
+  plus `auth.py:48`, `health.py:79`, `main.py:36`), and one `POST /chat`
+  performs at least six. `uploads`, `url_documents`, `repos` and
+  `repo_chunks` carry **no foreign key** (`db.py:84,102,114,123`), so
+  `delete_conversation` (`db.py:334-340`) orphans them — and because
+  conversation ids are client-supplied (`history.py:92-97`), a
+  recreated id **inherits the previous conversation's rows**.
+  `auth.py:48` `_oldest_user()` leaks the connection it opens.
+  DuckDB per-object tables have no PRIMARY KEY or index
+  (`syncworker/storage.py:140`), so every upsert `DELETE … WHERE Id IN`
+  is a full scan.
+end note
+N_STORE .. sqlite
+
+note as N_RPT #FEE2E2
+  **F4 · the widest CRM leak.** `core/report_paths.py` correctly rejects
+  `..`, separators, absolute paths, dotfiles, NUL and symlink escape
+  (`:31-47`), but there is **no extension allowlist and no authentication** —
+  `main.py:257-259` and `:262-271` declare no
+  `Depends`. `/reports` receives both narrative `.docx`/`.pdf`
+  (`engines/report.py:256`) **and** CSV/XLSX exports of raw warehouse
+  rows (`engines/sql.py:407-409`), so anyone who can reach :8080 can
+  enumerate and download every export any analyst has ever produced.
+end note
+N_RPT .. rp
+
+legend right
+  |= Notation |= Meaning |
+  |<#E2E8F0> | external entity (square) — outside every boundary |
+  |<#EDE9FE> | process (ellipse) — orchestrator / app logic |
+  |<#DBEAFE> | process — frontend / edge |
+  |<#DCFCE7> | process — inference / GPU |
+  |<#FEF3C7> | data store (cylinder / folder) |
+  |<#FFFFFF> | dashed red rectangle = **trust boundary** |
+  ==
+  **Flow tags** — `CRM·PII` = carries Salesforce customer or personal
+  data · `UNTRUSTED` = carries attacker-influenceable content that
+  reaches the model prompt.
+  **Arrow colours** — blue #2563EB edge · purple #7C3AED app ·
+  green #16A34A inference · amber #D97706 data · grey #64748B external ·
+  red #DC2626 crosses a boundary without a control.
+  ==
+  10 of the 27 level-1 flows carry CRM·PII; 7 carry UNTRUSTED content;
+  F12 carries **both at once, in a single prompt**.
+end legend
+
+@enduml

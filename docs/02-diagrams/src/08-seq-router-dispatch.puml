@@ -1,0 +1,196 @@
+@startuml 08-seq-router-dispatch
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName "Inter, Segoe UI, sans-serif"
+skinparam defaultFontSize 13
+skinparam roundCorner 8
+skinparam shadowing false
+skinparam ArrowColor #4A5568
+skinparam ArrowFontColor #4A5568
+skinparam NoteBackgroundColor #FFFBEB
+skinparam NoteBorderColor #F59E0B
+' Layer palette — byte-identical across ALL 24 diagrams
+!$C_EDGE = "#2563EB"   /' frontend / edge '/
+!$C_APP  = "#7C3AED"   /' orchestrator / app logic '/
+!$C_GPU  = "#16A34A"   /' inference / GPU '/
+!$C_DATA = "#D97706"   /' storage / data '/
+!$C_EXT  = "#64748B"   /' external systems '/
+!$C_RISK = "#DC2626"   /' risk / trust boundary '/
+
+' --- sequence-specific rendering only; palette above is untouched ---
+skinparam ParticipantFontColor #FFFFFF
+skinparam ParticipantFontStyle bold
+skinparam ParticipantBorderColor #1F2937
+skinparam sequenceBoxBorderColor #DC2626
+skinparam sequenceBoxFontColor #DC2626
+skinparam sequenceBoxFontStyle bold
+skinparam sequenceLifeLineBorderColor #94A3B8
+skinparam sequenceGroupBorderColor #94A3B8
+skinparam maxMessageSize 300
+
+title Routing and dispatch — orchestrate.decide, router.route_request, both fallbacks and the hard "rag" default\n(evidence: orchestrator/app/engines/orchestrate.py:127-156 · orchestrator/app/engines/router.py:52-133 · orchestrator/app/graph.py:29-107 · orchestrator/app/main.py:403-643 · orchestrator/app/llm.py:78,112,283-299 · orchestrator/app/config.py:61,64,138,264)
+
+participant "orchestrator · worker()\nmain.py:383-677" as orch #7C3AED
+participant "engines/orchestrate\ndecide() · main.py:412" as decide #7C3AED
+participant "graph · LangGraph\nget_graph().ainvoke() · graph.py:90-107" as graph #7C3AED
+participant "engines/router\nroute_request() · router.py:92" as router #7C3AED
+
+box "GPU — two independent vLLM endpoints, neither health-gated on this path" #FEF2F2
+participant "vllm-router (AGENT)\nROUTER_BASE_URL · ROUTER_MODEL" as vrouter #16A34A
+participant "vllm (MAIN)\nOPENAI_BASE_URL · MAIN_MODEL" as vmain #16A34A
+end box
+
+participant "graph engine nodes\n_sql · _rag · _vision · _report · _chat" as engines #7C3AED
+
+autonumber
+
+== A · Pre-flight: should this turn be an agent turn, or use web search? ==
+
+orch -> decide : decide(text, history, effort) — gated by\ntext AND no pdf_data AND no image_data AND NOT request.agent\nmain.py:404-412
+decide -> decide : allowances(effort) — ALLOWED ceiling\nfast: no/no · low: no/yes · medium: yes/yes · high: yes/yes\norchestrate.py:114-124
+
+alt effort permits nothing, or the message is blank
+  decide --> orch : Plan(agent=False, search=False) — short circuit, no model call\norchestrate.py:135-136
+else a classification is worth making
+  decide -> vrouter : HTTP POST /v1/chat/completions · JSON · async\ntemperature 0.0 · max_tokens 40 · enable_thinking: false\ninput clipped to ROUTER_INPUT_CHAR_CAP = 6000\norchestrate.py:138-140, llm.py:283-299
+  vrouter --> decide : assistant text (expected to contain one JSON object)
+  decide -> decide : parse_plan(raw) — accepts fields only on literal True\norchestrate.py:98-110
+end
+
+note over decide, vrouter #FEE2E2
+  **F1 — this call sits ahead of the very first `status` frame on every text
+  turn** (main.py:412 precedes :415) and has **no timeout of its own**. The
+  only bound is the shared 300 s httpx client timeout (config.py:264 applied
+  at llm.py:78). A wedged router endpoint therefore means 300 s of a
+  completely silent UI before anything is emitted.
+  **F9** — the extractor is a greedy `\{.*\}` (orchestrate.py:38) with no
+  think-block and no code-fence stripping, unlike router.py and agent.py; two
+  JSON objects in the output span from the first brace to the last and fail.
+  Both parse failure and transport failure land in the same bare
+  `except Exception: return Plan(False, False)` (orchestrate.py:142-144) —
+  a dead GPU and a malformed answer are **indistinguishable**, and nothing
+  is logged.
+end note
+
+decide --> orch : Plan(agent, search) — intersected with the effort ceiling (orchestrate.py:145-146);\neffort "high" AND search implies agent = True (orchestrate.py:154-155)
+orch -> orch : emit("status", describe(plan)) — first SSE frame the user sees\nmain.py:415
+
+== B · Engine dispatch — first match wins (main.py:551-643) ==
+
+note over orch #FFFBEB
+  The nine-branch chain in front of the graph, in source order:
+  pdf → vision → repo → url → **agent** → search → dataset → assistant-chat,
+  and only then the LangGraph fallback (main.py:551-643). The router below is
+  reached **only** on the last branch: salesforce mode, no attachment, no
+  agent, no repo/url/dataset follow-up.
+end note
+
+alt want_agent (explicit request.agent or auto_plan.agent)
+  orch -> orch : run_agent_engine(...) — see 09-seq-agent-loop; the router is never consulted\nmain.py:592-601
+else salesforce mode, no attachment — LangGraph fallback
+  orch -> graph : ainvoke(message, session_id, image_base64, history, emit, model_choice, effort)\nin-process await · main.py:633-643
+  graph -> router : _router_node → route_request(message, bool(image_base64), history)\ngraph.py:29-41
+
+  alt an image is attached
+    router --> graph : "vision" — short circuit **before any model call**\nrouter.py:103-104
+  else short follow-up: 12 words or fewer
+    router -> router : prepend the previous user turn, truncated to 400 chars,\nas "(earlier question: ...)" so the follow-up inherits its subject\nrouter.py:106-110
+  end
+
+  == B1 · Primary classification on the small model ==
+
+  router -> vrouter : HTTP POST /v1/chat/completions · JSON · async\ntemperature 0.0 · max_tokens 200 · enable_thinking: false\nrouter.py:115-117, llm.py:283-299
+
+  alt primary call and parse both succeed
+    vrouter --> router : raw assistant text
+    router -> router : parse_route(raw): strip think block → take the FIRST fenced body →\nslice first brace to last brace → json.loads → obj["route"] must be in\nROUTES = (sql, rag, vision, report, chat)\nrouter.py:52-80
+    router --> graph : route
+  else primary raised — connection refused, 400 window error or read timeout
+    note over router #FEE2E2
+      **Swallowed fallback #1** — `except Exception: pass` (router.py:121-122).
+      All three causes are handled identically and **nothing is logged
+      anywhere in this module**.
+    end note
+
+    == B2 · Retry on the MAIN model ==
+
+    router -> vmain : HTTP POST /v1/chat/completions · JSON · async\ntemperature 0.0 · **max_tokens 50**\nrouter.py:126
+    note over router, vmain #FEE2E2
+      llm.chat_completion forces **enable_thinking: True** (llm.py:112), so a
+      thinking preamble is expected here — and max_tokens 50 can be consumed
+      **entirely by reasoning**, leaving parse_route nothing to match. This
+      retry is far more likely to fail than the primary it is covering for.
+    end note
+
+    alt fallback call and parse both succeed
+      vmain --> router : raw assistant text
+      router --> graph : route
+    else fallback also raised
+      note over router #FEE2E2
+        **Swallowed fallback #2** — a second bare `except Exception: pass`
+        (router.py:130-131), again with no logging.
+      end note
+      router --> graph : **hard default "rag"** — unconditional return\nrouter.py:133
+    end
+  end
+
+  note over router, vmain #FEE2E2
+    **F8 — honest timeout accounting.** Neither call has a timeout of its own:
+    `rg wait_for|timeout` over engines/*.py hits only url.py:36 and
+    search.py:315/338. The single bound is LLM_REQUEST_TIMEOUT = 300 s
+    (config.py:264 → llm.py:78). A wedged router endpoint **plus** a wedged
+    main endpoint therefore costs **600 s** before "rag" is returned — and
+    that 600 s is *on top of* the up-to-300 s already spent in step A.
+    There is no retry beyond this one hop, no circuit breaker, and **no
+    confidence score at all**: parse_route returns a route or None; no
+    threshold, probability or logprob exists anywhere in the file.
+    Consequence of the default: a total classifier outage silently sends
+    greetings and small talk into the vector-search engine.
+  end note
+
+  note over router #FFFBEB
+    **F2 — the think-strip is defeated on exactly the path where it matters.**
+    parse_route's strict branch reads the stripped text `t` (router.py:66) but
+    the lenient regex branch searches the **original, un-stripped** argument
+    (router.py:77), so a route word mentioned inside a think block can win over
+    the model's actual JSON answer.
+  end note
+
+  == B3 · Conditional edge to exactly five nodes ==
+
+  graph -> engines : conditional_edges on state["route"], map = sql | rag | vision | report | chat\ngraph.py:100-104
+  note over graph, engines #FFFBEB
+    There is **no default branch** in the edge map — a route outside ROUTES
+    would be a LangGraph KeyError. The only thing preventing it is
+    parse_route's membership check (router.py:71-73) plus the "rag" default,
+    i.e. correctness by construction rather than by guard. Every engine node
+    then goes straight to END (graph.py:105-106).
+    state["emit"] and state["message"] are read with bracket access
+    (graph.py:47,54,62,70,80-81) — a missing key surfaces as the terminal
+    `error` event. No timeouts, no retries in graph.py.
+  end note
+  engines -> engines : each node runs its engine and emits its OWN single final `meta` carrying `route`
+  engines --> graph : {"answer": str}
+  graph --> orch : state["answer"] · main.py:644
+  note over orch #FFFBEB
+    ChatState declares `route`, but main.py never reads it — the route the UI
+    displays comes from the engine's own meta payload, not from graph state.
+  end note
+end
+
+legend right
+  |= Colour |= Layer |
+  |<#2563EB> | frontend / edge |
+  |<#7C3AED> | orchestrator / app logic |
+  |<#16A34A> | inference / GPU |
+  |<#D97706> | storage / data |
+  |<#64748B> | external systems |
+  |<#DC2626> | risk / trust boundary |
+  Red-bordered box = trust boundary / risk zone.
+  Solid arrow = call · dashed arrow = return value.
+  Red note = swallowed exception, missing timeout or silent degradation.
+  Amber note = design constraint worth auditing.
+  Fn labels are the finding ids from docs/_evidence/orch-engines-core4.md.
+end legend
+
+@enduml

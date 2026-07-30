@@ -1,0 +1,97 @@
+@startuml 22-threat-model
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName "Inter, Segoe UI, sans-serif"
+skinparam defaultFontSize 13
+skinparam roundCorner 8
+skinparam shadowing false
+skinparam ArrowColor #4A5568
+skinparam ArrowFontColor #4A5568
+skinparam NoteBackgroundColor #FFFBEB
+skinparam NoteBorderColor #F59E0B
+' Layer palette — byte-identical across ALL 24 diagrams
+!$C_EDGE = "#2563EB"   /' frontend / edge '/
+!$C_APP  = "#7C3AED"   /' orchestrator / app logic '/
+!$C_GPU  = "#16A34A"   /' inference / GPU '/
+!$C_DATA = "#D97706"   /' storage / data '/
+!$C_EXT  = "#64748B"   /' external systems '/
+!$C_RISK = "#DC2626"   /' risk / trust boundary '/
+
+!include <tupadr3/common>
+!include <tupadr3/font-awesome-5/shield_alt>
+!include <tupadr3/font-awesome-5/exclamation_triangle>
+!include <tupadr3/font-awesome-5/lock>
+!include <tupadr3/font-awesome-5/database>
+!include <tupadr3/font-awesome-5/robot>
+
+title STRIDE threat model — control coverage by attack surface\n**green = control verified present and effective · amber = partial · red = missing**
+
+rectangle "**S · Spoofing / Elevation**" as S #FEE2E2 {
+  rectangle "**No authentication anywhere**\n`auth.py:95-97` require_user() never 401s\n`main.py:56` /chat and /reports* auth-free\nPublished on 0.0.0.0 (compose :272-273)\n<b>CONTROL: MISSING</b>\n→ SEC-01 (P0)" as t_auth #FECACA
+  rectangle "Conversation ownership check EXISTS\n`main.py:339-344` compares conv_owner vs viewer\nBUT `except Exception: conv_owner = None`\nfalls OPEN — a DB error skips the check\n<b>CONTROL: PARTIAL</b>\n→ SEC-02 (P1)" as t_idor #FED7AA
+}
+
+rectangle "**T · Tampering — LLM-generated SQL**" as T #ECFDF5 {
+  rectangle "**sql_guard.py** — hand-written scanner\n· one statement only, must start SELECT/WITH\n· comment-smuggling defeated (`UPD/**/ATE`)\n· string literals stripped before keyword scan\n· 24 filesystem/network table funcs blocked\n<b>CONTROL: PRESENT</b>" as t_guard #BBF7D0
+  rectangle "**Defence in depth** — `engines/sql.py:124-132`\nread_only=True · enable_external_access=False\nautoinstall/autoload extensions = False\nNeutralises `SELECT * FROM '/etc/passwd'`\n(which DOES pass the regex guard)\n<b>CONTROL: PRESENT</b>" as t_duck #BBF7D0
+  rectangle "Retry path skips the hallucination guard\n`sql.py:203-207` — `references_a_known_table()`\nis checked on attempt 1 only, not the retry\n<b>CONTROL: PARTIAL</b> → DATA-01 (P2)" as t_retry #FED7AA
+}
+
+rectangle "**I · Information disclosure — SSRF**" as I #ECFDF5 {
+  rectangle "**core/net.py** — single egress choke point\n· DNS resolved BEFORE connect, all A records checked\n· private/loopback/link-local/reserved/multicast blocked\n· 169.254.169.254 metadata covered by link-local\n· every redirect hop re-validated (max 3)\n· scheme allowlist http/https\n<b>CONTROL: PRESENT</b>" as t_ssrf #BBF7D0
+  rectangle "**TOCTOU / DNS rebinding window**\nresolve_public_ips() validates, then httpx does its\nOWN resolution when connecting. A short-TTL record\ncan answer public, then private.\n`net.py:99` → `net.py:137`\n<b>CONTROL: PARTIAL</b> → SEC-03 (P1)" as t_rebind #FED7AA
+  rectangle "**Body cap is applied AFTER full download**\n`net.py:153` slices `resp.content`, which has\nalready buffered the entire response in memory\n<b>CONTROL: PARTIAL</b> → PERF-02 (P2)" as t_body #FED7AA
+}
+
+rectangle "**T · Tampering — hostile archives**" as A #ECFDF5 {
+  rectangle "**core/archive.py** — exemplary\n· magic-byte sniffing, never trusts extension\n· manual member loop, never extractall()\n· zip-slip checked twice (name + realpath)\n· symlinks/hardlinks/devices refused\n· 4 bomb caps + LIVE streaming budget re-check\n· nested archives listed, never opened\n· .pkl/.xlsm/.so refused\n· .xlsx routed through the same caps\n<b>CONTROL: PRESENT — best module in the repo</b>" as t_zip #BBF7D0
+}
+
+rectangle "**I · Path traversal — report download**" as P #ECFDF5 {
+  rectangle "**core/report_paths.py**\n· rejects `..`, separators, absolute, hidden, NUL\n· realpath must stay inside REPORTS_DIR\n· symlink escape caught by resolve()\n<b>CONTROL: PRESENT</b>" as t_path #BBF7D0
+}
+
+rectangle "**T · Prompt injection — untrusted text into the model**" as PI #FEF3C7 {
+  rectangle "Web pages, pasted URLs, GitHub repos, uploaded\ndocuments and CRM free-text all reach the prompt.\nMitigations found: content is fenced/delimited and\nsystem blocks are folded first (`llm.py:39-69`);\nuploads are PROFILED not executed (`config.py:169`).\nNo instruction-stripping, no provenance tainting,\nno output-side egress check.\n<b>CONTROL: PARTIAL — inherent to the feature</b>\n→ SEC-05 (P2)" as t_pi #FDE68A
+}
+
+rectangle "**D · Denial of service**" as D #FEE2E2 {
+  rectangle "**Unbounded request body** — `ChatRequest`\n(`main.py:176-199`) caps neither `messages`\nlength nor the base64 `image`/`pdf` strings;\nStarlette sets no default body limit.\nUnauthenticated + 0.0.0.0 = trivial OOM.\n<b>CONTROL: MISSING</b> → REL-01 (P1)" as t_dos #FECACA
+  rectangle "**GPU exhaustion** — :8000/:8002/:8003 are\npublished and unauthenticated; anyone may submit\n262k-token prompts against the shared KV pool.\nNo rate limit, no quota, no API key.\n<b>CONTROL: MISSING</b> → SEC-01 / COST-01" as t_gpu #FECACA
+  rectangle "**Blocking DuckDB call on the event loop**\n`engines/sql.py:201,206` runs `_execute()` inline\ninside `async def`. net.py/health.py/rag.py all\ncorrectly use `asyncio.to_thread` — sql.py does not.\nOne slow query stalls EVERY user's SSE stream.\n<b>CONTROL: MISSING</b> → PERF-01 (P1)" as t_block #FECACA
+}
+
+rectangle "**R · Repudiation / Observability**" as R #FEF3C7 {
+  rectangle "42 broad `except Exception` handlers across\n`orchestrator/app` swallow errors; several persist\nnothing (`main.py:161` contextlib.suppress drops a\nlost answer silently). No correlation/trace id\npropagates browser → orchestrator → engine → model.\n<b>CONTROL: PARTIAL</b> → OBS-01 (P2)" as t_obs #FDE68A
+}
+
+rectangle "**Secret exposure**" as SEC #FEF3C7 {
+  rectangle "GOOD: `.gitignore` covers `.env`, `.env.*`,\n`secrets/`, `*.pem`, `*.key`; `git ls-files` confirms\nno secret is tracked; the JWT key is a mounted file\nnot an env var (compose:307-311, avoiding `docker inspect`).\nBAD: a plaintext `.env.bak-205921` sits in the tree,\nand `.env.example:7-14` still solicits AWS credentials\nfor a feature deleted on 2026-07-28.\n<b>CONTROL: PARTIAL</b> → SEC-04 (P2), SEC-06 (P2)" as t_sec #FDE68A
+}
+
+t_auth -[#DC2626,bold]-> t_gpu
+t_auth -[#DC2626,bold]-> t_dos
+t_ssrf -[#F59E0B]-> t_rebind
+t_ssrf -[#F59E0B]-> t_body
+t_guard -[#16A34A]-> t_duck
+t_guard -[#F59E0B]-> t_retry
+
+note as N #FFFBEB
+  **Reading this diagram.** Boxes are *controls*, not vulnerabilities.
+  Green controls were read line by line and confirmed effective — this
+  codebase's guard modules (`sql_guard`, `net`, `archive`, `report_paths`)
+  are materially better than typical. The severity concentrates almost
+  entirely in **deployment posture** (no auth + everything on 0.0.0.0),
+  not in the application's security logic.
+end note
+
+legend right
+  |= Colour |= Control state |
+  |<#BBF7D0> | present — verified effective |
+  |<#FED7AA> | partial — gap identified |
+  |<#FDE68A> | partial — inherent / accepted |
+  |<#FECACA> | missing |
+  IDs (SEC-01 …) index 03-report/FINDINGS.csv
+end legend
+
+@enduml

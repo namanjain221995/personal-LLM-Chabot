@@ -1,0 +1,224 @@
+@startuml 07-seq-chat-stream
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName "Inter, Segoe UI, sans-serif"
+skinparam defaultFontSize 13
+skinparam roundCorner 8
+skinparam shadowing false
+skinparam ArrowColor #4A5568
+skinparam ArrowFontColor #4A5568
+skinparam NoteBackgroundColor #FFFBEB
+skinparam NoteBorderColor #F59E0B
+' Layer palette — byte-identical across ALL 24 diagrams
+!$C_EDGE = "#2563EB"   /' frontend / edge '/
+!$C_APP  = "#7C3AED"   /' orchestrator / app logic '/
+!$C_GPU  = "#16A34A"   /' inference / GPU '/
+!$C_DATA = "#D97706"   /' storage / data '/
+!$C_EXT  = "#64748B"   /' external systems '/
+!$C_RISK = "#DC2626"   /' risk / trust boundary '/
+
+' --- sequence-specific rendering only; palette above is untouched ---
+skinparam ParticipantFontColor #FFFFFF
+skinparam ParticipantFontStyle bold
+skinparam ParticipantBorderColor #1F2937
+skinparam sequenceBoxBorderColor #DC2626
+skinparam sequenceBoxFontColor #DC2626
+skinparam sequenceBoxFontStyle bold
+skinparam sequenceLifeLineBorderColor #94A3B8
+skinparam sequenceGroupBorderColor #94A3B8
+skinparam maxMessageSize 300
+
+title Chat streaming — POST /chat, detached generation, SSE frames, stop and re-attach\n(evidence: orchestrator/app/main.py:274-796 · orchestrator/app/sse.py:34-54 · orchestrator/app/llm.py:215-262 · frontend/lib/streams.ts:82-393 · frontend/lib/sse.ts:126-301 · frontend/app/api/chat/route.ts:123-185)
+
+participant "Composer\n(React)" as composer #2563EB
+participant "ChatApp / MessageRow\n(React render)" as ui #2563EB
+participant "frontend · streams.ts + sse.ts\nlive registry · SSEParser" as streams #2563EB
+participant "frontend · Next route handlers\n/api/chat · /chat/stop · /chat/attach" as nextapi #2563EB
+
+box "Trust boundary — orchestrator :8080 published on 0.0.0.0, ZERO authentication" #FEF2F2
+participant "orchestrator\nPOST /chat (main.py:274)" as orch #7C3AED
+participant "LiveGeneration\ndetached asyncio.Task (main.py:62)" as gen #7C3AED
+participant "llm.stream_chat_events\n(llm.py:215)" as llm #7C3AED
+participant "vllm (MAIN)\nOPENAI_BASE_URL" as vllm #16A34A
+participant "app.sqlite3" as sqlite #D97706
+end box
+
+autonumber
+
+== 1 · Request: browser to detached generation ==
+
+composer -> streams : startStream(conversationId, turns, prefs) · in-process · async\nstreams.ts:307
+streams -> nextapi : HTTP POST /api/chat · JSON · async\nmessages[], session_id, conversation_id, mode, model, effort, agent, web_search\nstreams.ts:314-332
+
+note over nextapi #FFFBEB
+  **Unbounded buffering, no timeout.** req.json() materialises the whole
+  body, then JSON.stringify makes a second copy (chat/route.ts:126, :154-166).
+  Images and PDFs travel as base64 **inside** this body and there is no size
+  cap on either side — the orchestrator installs only CORSMiddleware
+  (main.py:47-53). The streaming fix exists for /api/upload and was never
+  applied here (upload/route.ts:5-8).
+end note
+
+nextapi -> orch : HTTP POST /chat · JSON ChatRequest · signal: req.signal · async\nchat/route.ts:154-166
+
+note right of nextapi #FEE2E2
+  The `cookie` header is forwarded (chat/route.ts:160-162) but it is dead
+  code: current_user() deletes the Request and returns the one local row
+  (auth.py:89-92), require_user() "never 401s" (auth.py:95-97).
+  **Every hop in this diagram is unauthenticated.**
+end note
+
+orch -> sqlite : db.conversation_owner(conv_key) · sqlite3 · **blocking on the event loop**\nmain.py:339
+
+note over orch, sqlite #FEE2E2
+  Ownership gate **fails open**: try/except Exception → conv_owner = None,
+  so the 404 at main.py:343-344 is skipped (main.py:338-341). The comment
+  directly above it asserts the opposite behaviour.
+  db.connect() also re-runs the schema + migration on **every** call
+  (db.py:203-204), and this call is blocking inside an async def.
+end note
+
+orch -> gen : previous.task.cancel() — pre-empt an in-flight generation on the same key, **not awaited**\nmain.py:348-350
+orch -> gen : LiveGeneration(conversation_id, user_id); _live_generations[conv_key] = gen\nmain.py:352-356
+orch -> gen : gen.task = asyncio.create_task(worker()) — outlives the HTTP request\nmain.py:679
+orch --> nextapi : 200 text/event-stream · StreamingResponse(gen.follow())\nCache-Control: no-cache · X-Accel-Buffering: no\nmain.py:681-685
+nextapi --> streams : 200 text/event-stream · upstream.body piped byte-for-byte, never re-parsed\nchat/route.ts:184
+
+== 2 · Generation: worker() to SSE frames ==
+
+gen -> gen : orchestrate.decide(...) then emit("status", ...) — the first frame the user ever sees\nmain.py:412-415
+gen -> llm : stream_chat_events(messages, model_choice, effort, temperature, max_tokens)\nchat.py:90-96 · agent.py:591-597
+llm -> vllm : POST /tokenize · JSON · **5 s** timeout — window probe inside context.fit_request\ncontext.py:109-112, config.py:135
+llm -> vllm : POST /v1/chat/completions · stream=true · JSON · **300 s** httpx timeout\nllm.py:235-243, config.py:264
+
+loop for every streamed delta
+  vllm --> llm : chunk · delta.reasoning (vLLM extension) or delta.content
+  llm --> gen : yield ("reasoning" | "token", delta) · async iterator\nllm.py:250-262
+  gen -> gen : publish(event, data) → events.append() + cond.notify_all()\nmain.py:95-98
+  gen --> nextapi : SSE frame · text/event-stream\nevent: token\ndata: {"text": str}\nsse.py:54
+  nextapi --> streams : identical bytes
+  streams -> streams : SSEParser.feed → toChatStreamEvent → consume()\nsse.ts:283-301, streams.ts:180-269
+  streams -> ui : notify() → re-render the assistant bubble\nstreams.ts:262
+end
+
+note over gen, streams #FFFBEB
+  **Exact wire vocabulary** — sse.py:34-44 raises ValueError on anything else,
+  and frontend/lib/sse.ts:216-217 drops anything else:
+  · `reasoning`  data: {"text": str}   — thinking deltas   (sse.py:36)
+  · `token`      data: {"text": str}   — answer text       (sse.py:34)
+  · `status`     data: {"text": str}   — progress label    (sse.py:39)
+  · `step`       data: {"id": int, "title": str, "status": "running"|"done"|"failed", "detail"?: str}
+  · `research`   data: {"phase": "query"|"reading"|"read", ...}
+  · `meta`       data: engine keys merged with mode/model/effort/generation_id
+  · `done`       data: {"session_id": str}
+  · `error`      data: {"message": str}
+  Frame format is literally `event: <name>` NEWLINE `data: <json>` NEWLINE NEWLINE.
+end note
+
+gen --> streams : SSE · event: meta\ndata: route, mode, model, effort, generation_id + optional input_trimmed / context / auto\n+ engine keys (sql, data, truncated, chart, citations, report_files, steps, sources)\nmain.py:364-381
+
+note over streams #FEE2E2
+  `meta` is the ONLY event parsed with **zero validation** — a bare
+  JSON.parse cast to Meta (sse.ts:202-203) — while `step` and `research`
+  are checked field by field (sse.ts:137-201). `meta` is exactly the event
+  that carries sql, data, chart and report_files into the UI.
+  Two live drifts: route "dataset" is missing from the frontend Engine union
+  (types.ts:8) and `auto` is missing from interface Meta (main.py:378-379).
+end note
+
+gen --> streams : SSE · event: done\ndata: {"session_id": str} — the only terminal success frame\nmain.py:647
+streams -> ui : finalize(status 'done') → saveMessages → localStorage + background PUT /history\nstreams.ts:157-163
+gen -> gen : _finalize_generation(): finish(); pop the registry entry\nmain.py:148-152
+
+alt gen.subscribers == 0 — nobody was attached at the end
+  gen -> sqlite : db.add_message(user_id, conversation_id, "assistant", answer, final_meta) · sqlite3 · blocking\nmain.py:161-168
+  note right of sqlite #FEE2E2
+    Wrapped in contextlib.suppress(Exception) (main.py:161) — a failed
+    persist is **silent**: no log, no retry, no client signal.
+    follow() decrements `subscribers` in a finally (main.py:119-120), so an
+    abandoned async generator whose aclose() is deferred keeps subscribers > 0
+    and suppresses this persist altogether (main.py:157).
+  end note
+end
+
+== 3 · Stop / abort ==
+
+composer -> streams : Stop pressed → stopStream(id)\nstreams.ts:82-92
+streams -> streams : controller.abort() runs **first** — the local reader dies before the server is told
+streams -> nextapi : HTTP POST /api/chat/stop · JSON · conversation_id and session_id both set to the same id\nstreams.ts:87-90
+nextapi -> orch : HTTP POST /chat/stop · raw req.text() passthrough, no validation\nchat/stop/route.ts:17-27
+orch -> gen : gen.task.cancel() → 200 {"stopped": true}\nmain.py:716-722
+gen -> gen : except asyncio.CancelledError → gen.cancelled = True\nmain.py:668-669
+
+note over gen, streams #FEE2E2
+  **Third, undocumented terminal state.** Cancellation emits NO terminal
+  frame: finish() makes follow() break (main.py:114-115) and the socket just
+  closes. sse.py:20-24 documents `done` and `error` as the only terminals;
+  streams.ts:264-268 silently maps the frameless close to status 'done'.
+  The caller fire-and-forgets with a catch that returns undefined
+  (streams.ts:91) and never inspects {stopped}, so a stop that fails leaves
+  the GPU generating with **zero** user-visible signal.
+  _owns()/_viewer_id() (main.py:693-709) compare one local identity to itself.
+end note
+
+== 4 · Re-attach after reload or tab switch ==
+
+ui -> streams : attachStream(conversationId)\nChatApp.tsx:215,627 → streams.ts:355
+streams -> streams : await getHistoryStore().load(id, force) — server truth before re-registering\nstreams.ts:362-370
+streams -> nextapi : HTTP GET /api/chat/attach/{id} · signal: req.signal\nstreams.ts:372-375
+nextapi -> orch : HTTP GET /chat/attach/<id> — id first matched against a 1-64 char A-Za-z0-9_- allowlist\nattach/[id]/route.ts:18,33-52
+
+alt a generation is still live and _owns(gen, viewer)
+  orch -> gen : gen.follow()
+  gen --> streams : **replay** of events[] from index 0, then live frames on the same connection\nmain.py:105-120, main.py:789-796
+  streams -> ui : the partial answer, reasoning and step list rebuild instantly
+  note over gen #FEE2E2
+    LiveGeneration.events is **unbounded** (main.py:85, :97): every token
+    frame is retained for the whole life of the generation purely so a
+    re-attach can replay it. No cap, no eviction, one buffer per concurrent
+    conversation, and lifespan() has no shutdown branch to drain them
+    (main.py:27-38).
+  end note
+else gen is None or gen.done
+  orch --> nextapi : 404 · detail "no active generation"\nmain.py:790-791
+  nextapi --> streams : 404 — client falls back to loading history\nattach/[id]/route.ts:62-64, streams.ts:376-380
+end
+
+== Failure path ==
+
+note over gen, streams #FEE2E2
+  Any uncaught exception in worker() → publish("error", {"message": str(exc)})
+  (main.py:670-672). The **raw exception string** reaches the browser
+  unsanitised and is never logged. If the stream raises *after* tokens were
+  emitted, `meta` never fires (chat.py:104) and the client is left holding a
+  partial answer with no meta, then an `error`.
+  Every non-2xx from /api/chat — including a 400 and a 502 wrapping an
+  upstream 422 — is flattened to "The orchestrator is unreachable."
+  (chat/route.ts:174-181, streams.ts:165-178), which is false.
+end note
+
+note over orch, vllm #FFFBEB
+  **No timeout bounds worker() as a whole.** The only bound is the per-call
+  httpx LLM_REQUEST_TIMEOUT = 300 s (config.py:264, llm.py:78). There is **no
+  keep-alive/heartbeat frame** and no `id:`/`retry:` field in sse.py, so a
+  long silent generation depends entirely on X-Accel-Buffering: no and on no
+  intermediary having an idle timeout. sse.ts has no idle detection either —
+  reader.read() awaits forever. **No retry exists anywhere on this path.**
+end note
+
+legend right
+  |= Colour |= Layer |
+  |<#2563EB> | frontend / edge |
+  |<#7C3AED> | orchestrator / app logic |
+  |<#16A34A> | inference / GPU |
+  |<#D97706> | storage / data |
+  |<#64748B> | external systems |
+  |<#DC2626> | risk / trust boundary |
+  Red-bordered box = trust boundary (unauthenticated, 0.0.0.0).
+  Solid arrow = request · dashed arrow = response/stream.
+  Amber note = unbounded resource or timeout gap.
+  Red note = swallowed error, fail-open or unauthenticated hop.
+  Every arrow is labelled protocol · payload · sync|async.
+end legend
+
+@enduml

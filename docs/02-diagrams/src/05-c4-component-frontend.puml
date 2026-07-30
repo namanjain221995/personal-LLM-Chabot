@@ -1,0 +1,250 @@
+@startuml 05-c4-component-frontend
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName "Inter, Segoe UI, sans-serif"
+skinparam defaultFontSize 13
+skinparam roundCorner 8
+skinparam shadowing false
+skinparam ArrowColor #4A5568
+skinparam ArrowFontColor #4A5568
+skinparam NoteBackgroundColor #FFFBEB
+skinparam NoteBorderColor #F59E0B
+' Layer palette — byte-identical across ALL 24 diagrams
+!$C_EDGE = "#2563EB"   /' frontend / edge '/
+!$C_APP  = "#7C3AED"   /' orchestrator / app logic '/
+!$C_GPU  = "#16A34A"   /' inference / GPU '/
+!$C_DATA = "#D97706"   /' storage / data '/
+!$C_EXT  = "#64748B"   /' external systems '/
+!$C_RISK = "#DC2626"   /' risk / trust boundary '/
+
+!include <C4/C4_Component>
+!include <tupadr3/common>
+!include <tupadr3/devicons2/react_original>
+!include <tupadr3/devicons2/nextjs>
+!include <tupadr3/devicons2/typescript>
+
+AddElementTag("ui",    $bgColor="#DBEAFE", $borderColor=$C_EDGE, $fontColor="#1E3A8A")
+AddElementTag("libc",  $bgColor="#EFF6FF", $borderColor=$C_EDGE, $fontColor="#1E3A8A")
+AddElementTag("route", $bgColor="#EDE9FE", $borderColor=$C_APP,  $fontColor="#4C1D95")
+AddElementTag("ext",   $bgColor="#F1F5F9", $borderColor=$C_EXT,  $fontColor="#334155")
+
+AddRelTag("sse",  $textColor=$C_EDGE, $lineColor=$C_EDGE, $lineThickness=3)
+AddRelTag("risk", $textColor=$C_RISK, $lineColor=$C_RISK, $lineStyle=DashedLine())
+
+AddBoundaryTag("trust", $borderColor=$C_RISK, $fontColor=$C_RISK, $borderStyle="dashed", $borderThickness="2")
+
+title C4 L3 — **frontend** internals: 10 App-Router API routes, the lib/ layer, the component tree\nThe SSE answer path is drawn thick in edge blue\n(evidence: frontend/lib/streams.ts:307-348 · frontend/lib/sse.ts:283-301 · frontend/app/api/chat/route.ts:123-185 · frontend/components/ChatApp.tsx:254-273)
+
+Container_Boundary(fe, "frontend — Next.js 15 App Router · React 19 · TypeScript · output:'standalone'") {
+
+  Boundary(browser, "Browser bundle — no auth, no CSP, no middleware.ts (next.config.mjs:1-8)", "client components", $tags="trust") {
+
+    Component(chatapp, "ChatApp", "client component · 916 LOC", "The god component (847 LOC in one function).\n14 useState · 6 useRef · 5 useEffect · 14 useCallback.\nOwns messages, streaming flag, prefs, reconcile lock.\nPolls /api/chat/active every 8000 ms (:301).", $tags="ui", $sprite="react_original")
+
+    Component(composer, "Composer", "client component · 423 LOC", "Auto-grow textarea, attachment classify + size caps\n(image 10 MB · PDF 25 MB · dataset 200 MB — CLIENT-SIDE ONLY),\npaste capture, Salesforce pill, ModelPicker, Send/Stop.", $tags="ui")
+
+    Component(messagerow, "MessageRow", "client component · 232 LOC", "One turn. **Not React.memo** — re-renders on every token.\nOrder: ReasoningAccordion → ResearchPanel → AgentTimeline →\nMarkdown → trim notice → error block → ProofDrawer.", $tags="ui")
+
+    Component(markdown, "Markdown + MermaidBlock", "react-markdown 10 · remark-gfm · mermaid 11", "No rehype-raw → raw HTML is downgraded to text.\nmermaid securityLevel:'strict' → DOMPurify on both\ndangerouslySetInnerHTML sites (MermaidBlock.tsx:311,420).", $tags="ui")
+
+    Component(proof, "ProofDrawer", "client component · 160 LOC", "The 'proof' bar built imperatively from `meta`:\nSqlBlock · CitationChips · WebSources · CodeCitations ·\nDataTable (≤500 rows, unvirtualised) · ChartView · FileCards.", $tags="ui")
+
+    Component(chart, "ChartView → EChart", "next/dynamic ssr:false · Apache ECharts", "ChartErrorBoundary — the app's ONLY React error boundary\n(ChartView.tsx:87). 5 series types + CanvasRenderer registered.\nNo reset path once failed (ChartErrorBoundary.tsx:29,47).", $tags="ui")
+
+    Component(chartlib, "lib/chartOption · chartTheme · chartFormat", "TypeScript · 861 LOC · pure", "The documented trust boundary for chart rendering:\n`type` is whitelist-checked, x_key/y_keys are only property\nlookups, every formatter is local, escapeHtml on tooltips.", $tags="libc")
+
+    Component(sidebar, "Sidebar + ConversationMenu", "client components · 652 LOC", "Pinned / Recents / Archived rail, inline rename, per-row menu,\nspinner driven by streamingIds, theme toggle.\n`body` is rendered TWICE (desktop aside + mobile drawer).", $tags="ui")
+
+    Component(meter, "ContextMeter + lib/contextMeter", "client + pure · 349 LOC", "Ring + breakdown popover + 'Compact now'.\nBudget constants 131072 / 8192 / 512 are hardcoded here and\nduplicate orchestrator/app/config.py:127,128,131.", $tags="ui")
+
+    Component(timeline, "AgentTimeline + ResearchPanel", "client components · 331 LOC", "Numbered agent steps (from `step` frames) and the web-research\npanel (from `research` frames): domains, elapsed, per-query hits.", $tags="ui")
+
+    Component(palette, "SearchPalette + lib/searchPalette", "client + pure · 828 LOC", "Ctrl/Cmd+K modal. Debounced, one AbortController at a time,\nTab-trapped, portalled to document.body.", $tags="ui")
+
+    Component(streams, "lib/streams.ts", "TypeScript · 393 LOC · MODULE STATE", "**The live-generation registry.** `streams` Map(convId → LiveStream)\nand `listeners` Set live for the tab's lifetime.\nstartStream · attachStream · stopStream · fetchServerActive ·\nconsume() = 90 LOC, 8-arm event reducer.", $tags="libc")
+
+    Component(ssel, "lib/sse.ts", "TypeScript · 301 LOC · pure", "Hand-rolled CRLF-safe SSEParser, toChatStreamEvent (97 LOC),\nmergeStep, foldStreamState, readChatStream async generator.\nDeliberately NOT the Vercel AI SDK — it drops the `meta` event.", $tags="libc")
+
+    Component(hist, "lib/history.ts + lib/historyApi.ts", "TypeScript · 1107 LOC", "localStorage cache `techsara.history.v1` with quota eviction,\nper-conversation push/pull chains, prefix-delta sync,\n409-on-shrink recovery. createServerHistoryStore = 470 LOC.", $tags="libc")
+
+    Component(prefs, "lib/prefs.ts · attachments.ts · pasted.ts", "TypeScript · 282 LOC", "Per-conversation composer prefs in localStorage (cap 200 entries);\nin-memory Map of raw attachment base64 for regenerate/retry —\nnever evicted, never bounded.", $tags="libc")
+
+    Component(contract, "lib/types.ts + lib/errors.ts", "TypeScript · 366 LOC · declaration + pure", "Meta / ChatMessage / Engine / ChartSpec unions consumed by\n37 modules, plus friendlyError() regex classifier.\nCompile-time only — nothing checks them at runtime.", $tags="libc", $sprite="typescript")
+  }
+
+  Container_Boundary(nodeside, "Next.js server runtime — all 10 routes are runtime:'nodejs' + dynamic:'force-dynamic', and ZERO of them authenticate") {
+
+    Component(rchat, "POST /api/chat", "app/api/chat/route.ts · 185 LOC", "The SSE chat endpoint. Buffers the whole JSON body,\nMOCK_MODE short-circuit to an 82-LOC fixture stream,\nthen pipes upstream.body through untouched (:184).", $tags="route", $sprite="nextjs")
+
+    Component(rattach, "GET /api/chat/attach/{id}", "attach/[id]/route.ts · 67 LOC", "Re-join a detached generation. The ONLY dynamic route that\nguards decodeURIComponent (:27-32). SAFE_ID = ^[\\w-]{1,64}$\nmatches history.py:34 exactly — no traversal possible.", $tags="route")
+
+    Component(rctl, "POST /api/chat/stop · /compact + GET /api/chat/active", "3 route handlers · 95 LOC", "Raw `await req.text()` passthrough for stop/compact —\nneither body is parsed or validated here.\nreq.signal is NOT forwarded on any of the three.", $tags="route")
+
+    Component(rhist, "GET|POST|PUT|DELETE /api/history/{...path}", "history/[...path]/route.ts · 73 LOC", "Allow-listed CRUD proxy: `search` (GET) or `conversations`\nwith ≤3 segments; anything else 404s. Query params are\nrebuilt from an explicit allowlist (q, limit, archived).", $tags="route")
+
+    Component(rup, "POST /api/upload", "upload/route.ts · 47 LOC", "Multipart STREAMED to the orchestrator (`duplex:'half'`) —\nthe only route that does not buffer. No content-type, size,\nfield or filename check of its own.", $tags="route")
+
+    Component(rmisc, "GET /api/auth/me · /api/reports · /api/reports/{filename}", "3 route handlers · 140 LOC", "Identity (used only to scope the localStorage key),\nreport listing and report download proxy.", $tags="route")
+
+    Component(proxy, "lib/proxy.ts", "TypeScript · 64 LOC", "proxyToOrchestrator(): forwards ONLY `cookie` + `content-type`,\nbuffers req.text() up and upstream.arrayBuffer() down,\nredirect:'manual', re-emits every upstream Set-Cookie verbatim.", $tags="libc")
+
+    Component(orchlib, "lib/orchestrator.ts", "TypeScript · 101 LOC · pure", "The wire contract: ChatRequestBody → OrchestratorChatRequest.\nlastUserContent() + IMAGE_ONLY_PROMPT / PDF_ONLY_PROMPT.\nReturns null (→ 400) when there is nothing to send.", $tags="libc")
+  }
+}
+
+System_Ext(orc, "orchestrator", "FastAPI · uvicorn · host :8080 — no auth, no rate limit", $tags="ext")
+
+' ===================== THE SSE PATH (thick, edge blue) =====================
+Rel(composer, chatapp, "onSend(text, attachment, pastedTexts) · in-process · sync", "Composer.tsx:141", $tags="sse")
+Rel(chatapp, streams, "startStream({conversationId, turns, prefs, image?, pdf?}) · async", "ChatApp.tsx:466", $tags="sse")
+Rel(streams, rchat, "**HTTP POST /api/chat · JSON · async** · signal: AbortController", "streams.ts:311-334", $tags="sse")
+Rel(rchat, orc, "**HTTP POST /chat · JSON · async** · signal relayed · NO timeout", "route.ts:154-166", $tags="sse")
+Rel(rchat, streams, "**200 text/event-stream** — upstream.body piped byte-for-byte, never re-parsed", "route.ts:184", $tags="sse")
+Rel(streams, ssel, "readChatStream(res.body) · async generator · await consume()", "streams.ts:181", $tags="sse")
+Rel(ssel, streams, "ChatStreamEvent: token · reasoning · status · step · research · meta · done · error", "sse.ts:105-118", $tags="sse")
+Rel(streams, chatapp, "notify(convId) → subscribeStreams cb → setMessages([...s.messages])", "streams.ts:60-62 · ChatApp.tsx:254-273", $tags="sse")
+Rel(chatapp, messagerow, "one MessageRow per message — re-rendered on **every** token", "ChatApp.tsx:868-877", $tags="sse")
+
+' ===================== component tree =====================
+Rel(chatapp, composer, "props: streaming · meter · prefs · onSend/onStop · sync", "ChatApp.tsx:895-912")
+Rel(chatapp, sidebar, "conversations · archived · streamingIds · CRUD callbacks", "ChatApp.tsx:773")
+Rel(chatapp, palette, "open / onSelect / onNewChat (Ctrl+K)", "ChatApp.tsx:813")
+Rel(composer, meter, "MeterView from latestUsage(messages) + draft tokens", "contextMeter.ts:95-113")
+Rel(messagerow, markdown, "message.content · sync render", "MessageRow.tsx:132-137")
+Rel(messagerow, timeline, "message.steps / message.research (live or persisted meta)", "MessageRow.tsx:85-90,128-130")
+Rel(messagerow, proof, "message.meta", "MessageRow.tsx:205")
+Rel(proof, chart, "spec = meta.chart · rows = meta.chart_data ?? meta.data", "ProofDrawer.tsx:61,151")
+Rel(chart, chartlib, "validateChart(spec, rows) + buildChartOption(spec, rows, palette) · pure", "ChartView.tsx:65-69")
+Rel(messagerow, contract, "friendlyError(raw) → plain sentence + disclosure", "MessageRow.tsx:18,165-203")
+
+' ===================== state + persistence =====================
+Rel(chatapp, hist, "getHistoryStore(): create · rename · remove · saveMessages · refresh · load", "ChatApp.tsx:26")
+Rel(streams, hist, "finalize() → saveMessages(convId, messages) → localStorage + queued push", "streams.ts:157-163")
+Rel(chatapp, prefs, "loadPrefs / savePrefs / rememberAttachment(messageId, base64)", "ChatApp.tsx:27-35")
+Rel(ssel, contract, "JSON.parse(ev.data) cast straight to Meta — **zero runtime validation**", "sse.ts:203", $tags="risk")
+
+' ===================== browser → next server =====================
+Rel(hist, rhist, "HTTP GET/POST/PUT/DELETE /api/history/* · JSON · async · no timeout, no signal", "historyApi.ts:129")
+Rel(palette, rhist, "HTTP GET /api/history/search?q=&limit= · JSON · abortable", "historyApi.ts:237")
+Rel(streams, rctl, "HTTP POST /api/chat/stop (fire-and-forget) · GET /api/chat/active (8 s poll)", "streams.ts:87,97")
+Rel(chatapp, rctl, "HTTP POST /api/chat/compact · JSON · async · no AbortController", "ChatApp.tsx:348")
+Rel(streams, rattach, "HTTP GET /api/chat/attach/{id} · SSE · async · signal forwarded", "streams.ts:372")
+Rel(chatapp, rup, "HTTP POST /api/upload · multipart FormData{file, conversation_id} · streamed", "ChatApp.tsx:444")
+Rel(chatapp, rmisc, "HTTP GET /api/auth/me — the username only scopes the localStorage cache key", "lib/auth.ts:20")
+
+' ===================== next server → orchestrator =====================
+Rel(rchat, orchlib, "toOrchestratorChatRequest(body) · pure · sync", "route.ts:144")
+Rel(rhist, proxy, "proxyToOrchestrator(req, '/history/' + parts.map(encodeURIComponent).join('/'))", "route.ts:53-56")
+Rel(proxy, orc, "HTTP method+body relayed · JSON · async · status preserved", "proxy.ts:33-42")
+Rel(rattach, orc, "**HTTP GET /chat/attach/{id} · SSE**: buffer replay then live", "attach/route.ts:43-53", $tags="sse")
+Rel(rctl, orc, "HTTP POST /chat/stop · /chat/compact + GET /chat/active · JSON · async", "3 handlers")
+Rel(rup, orc, "HTTP POST /uploads · multipart streamed (duplex:'half') · async", "upload/route.ts:20-35")
+Rel(rmisc, orc, "HTTP GET /auth/me · /reports · /reports/{filename} · JSON + file stream", "3 handlers")
+
+' ===================== callouts =====================
+note right of rchat #FEE2E2
+  **No timeout on the upstream fetch (:154); no retry;
+  no request-body size bound (:126).**
+  A non-2xx upstream is flattened to `502 "responded with
+  status N"` and the upstream error body is DISCARDED
+  (:174-181), so a Pydantic 422 (bad `model`/`effort`)
+  reaches the user as **"The orchestrator is unreachable"**
+  via markUnreachable (streams.ts:335-337, :172-173).
+  MOCK_MODE emits no `status`/`research` frames, so the
+  web-search UI is untestable offline (:40-121).
+end note
+
+note right of ssel #FEE2E2
+  `meta` is the ONLY event with no field validation:
+  `return {kind:'meta', meta: JSON.parse(ev.data)}` (sse.ts:203)
+  — while `step` and `research` are checked field-by-field.
+  `meta` is what carries sql, data, chart and report_files.
+  `Engine` (types.ts:8) has no `'dataset'` member although
+  engines/dataset.py:101 emits `{"route":"dataset"}`.
+  readChatStream's finally only releases the lock — it never
+  calls reader.cancel() (sse.ts:298-300), and there is no
+  idle timeout: a silent orchestrator leaves the generator
+  awaiting read() forever.
+end note
+
+note bottom of streams #FEE2E2
+  **Race 1 — register() overwrite (streams.ts:292).** startStream
+  never checks for an existing entry; the first LiveStream's
+  consume() loop keeps running with an un-aborted controller,
+  hits the !sawTerminal branch (:264-268) and saveMessages()
+  clobbers the newer turns in cache.
+  **Race 2 — attachStream double-register**: the guard at :356
+  is checked BEFORE the await at :364, and main.py:105-120
+  happily serves two subscribers.
+  Every non-2xx — including a 400 — becomes markUnreachable
+  (:165-178). No timeout anywhere: a stream with no terminal
+  frame stays `streaming` forever and Composer stays disabled.
+end note
+
+note bottom of rctl #FFFBEB
+  `GET /api/chat/active` converts **every** transport failure
+  into `200 {active: []}` (active/route.ts:26) — deliberate so a
+  failed poll paints no error, but it also hides a permanently
+  down orchestrator from the sidebar.
+  `POST /api/chat/compact` runs a full LLM summarisation pass
+  upstream with no timeout and no forwarded signal (:16-26).
+  stopStream() aborts the local reader first and never inspects
+  `{stopped}` (streams.ts:82-92) — a failed stop leaves the GPU
+  generating with zero user-visible signal.
+end note
+
+note bottom of rhist #FFFBEB
+  The allowlist comment at route.ts:26-27 does **not** hold:
+  `encodeURIComponent('..') === '..'`, so
+  `/api/history/conversations/../..` reaches the orchestrator's
+  `/` and `.../../X` reaches `/history/X`.
+  Blast radius is bounded (≤3 segments, embedded `/` becomes
+  `%2F`, only `/history/search` exists) — not exploitable today,
+  but the asserted invariant is false.
+  proxy.ts buffers the whole body both ways with no size bound
+  (:39, :60) — the largest is a full thread PUT carrying every
+  message's `meta.data` SQL rows.
+end note
+
+note bottom of rmisc #FEE2E2
+  `reports/[filename]/route.ts:20` calls `decodeURIComponent`
+  **unguarded** → a malformed escape is an unhandled 500. That is
+  the exact bug attach/[id]/route.ts:25-32 documents as fixed —
+  the fix was never applied here.
+  `GET /api/reports` (route.ts) has **no caller at all** (dead
+  code) and its mock shape `Array{name,…}` disagrees with the
+  real `{reports:[{filename,…}]}` and with ReportFile
+  (types.ts:74-78) — three shapes for one concept.
+end note
+
+note top of browser #FEE2E2
+  **TRUST BOUNDARY.** Everything inside is attacker-influenced
+  (model-authored markdown, backend-supplied hrefs) and there is
+  no CSP, no frame-ancestors and no img-src (next.config.mjs:1-8);
+  Markdown.tsx:55-72 sets no allowedElements, so a model-authored
+  image URL is a real outbound fetch.
+  ORCHESTRATOR_URL is correctly server-side only — the sole
+  NEXT_PUBLIC_* var is NEXT_PUBLIC_APP_NAME (layout.tsx:15).
+  Every `cookie` / `set-cookie` forwarding branch in this layer
+  (8 sites) is **dead code**: auth.py:89-92 never 401s, so any
+  caller who can reach :3000 or :8080 reads every conversation.
+end note
+
+legend right
+  |= Colour |= Layer |
+  |<#2563EB> | frontend / edge (components + lib + API routes' client contract) |
+  |<#7C3AED> | orchestrator / app logic (the Node-side route handlers) |
+  |<#16A34A> | inference / GPU (not present at this level) |
+  |<#D97706> | storage / data (localStorage only at this level) |
+  |<#64748B> | external systems |
+  |<#DC2626> | risk / trust boundary |
+  ==Notation==
+  **Thick blue arrow** = the SSE answer path, request leg and stream leg.
+  **Dashed red arrow** = an unvalidated / unsafe hop.
+  **Dashed red rectangle** = trust boundary.
+  Amber notes = swallowed error, unbounded resource or missing timeout.
+  Red notes = a defect that changes behaviour or security posture.
+  Arrow labels read: protocol · payload · sync|async.
+end legend
+
+@enduml

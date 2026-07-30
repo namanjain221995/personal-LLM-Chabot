@@ -1,0 +1,270 @@
+@startuml 12-seq-sf-sync
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName "Inter, Segoe UI, sans-serif"
+skinparam defaultFontSize 13
+skinparam roundCorner 8
+skinparam shadowing false
+skinparam ArrowColor #4A5568
+skinparam ArrowFontColor #4A5568
+skinparam NoteBackgroundColor #FFFBEB
+skinparam NoteBorderColor #F59E0B
+' Layer palette — byte-identical across ALL 24 diagrams
+!$C_EDGE = "#2563EB"   /' frontend / edge '/
+!$C_APP  = "#7C3AED"   /' orchestrator / app logic '/
+!$C_GPU  = "#16A34A"   /' inference / GPU '/
+!$C_DATA = "#D97706"   /' storage / data '/
+!$C_EXT  = "#64748B"   /' external systems '/
+!$C_RISK = "#DC2626"   /' risk / trust boundary '/
+
+<style>
+sequenceDiagram {
+  box {
+    LineColor #DC2626
+    LineThickness 2
+    LineStyle 6-4
+    FontColor #DC2626
+    FontStyle bold
+  }
+  arrow    { LineColor #4A5568  FontColor #334155 }
+  lifeLine { LineColor #94A3B8 }
+}
+</style>
+
+!include <tupadr3/common>
+!include <tupadr3/font-awesome-5/cogs>
+!include <tupadr3/font-awesome-5/cloud>
+!include <tupadr3/font-awesome-5/lock>
+!include <tupadr3/font-awesome-5/hdd>
+!include <tupadr3/font-awesome-5/database>
+!include <tupadr3/font-awesome-5/microchip>
+
+skinparam ParticipantFontColor #FFFFFF
+skinparam ParticipantFontStyle bold
+skinparam ParticipantPadding 12
+skinparam BoxPadding 14
+skinparam SequenceGroupBorderColor #7C3AED
+skinparam SequenceGroupHeaderFontColor #4C1D95
+skinparam SequenceDividerBorderColor #7C3AED
+
+title **12 · Salesforce sync cycle** — JWT bearer → watermarked extract → Parquet + DuckDB upsert → LanceDB re-index → **watermark committed LAST**\n(evidence: sync-worker/syncworker/main.py:106-194 and :259-301 · sf_auth.py:24-129 · sf_client.py:123-258 · storage.py:92-167 · rag_index.py:97-154)\n 
+
+autonumber "<b>[00]"
+
+box "TRUST BOUNDARY · JWT signing key" #FEF2F2
+participant "<$lock>\nsf_jwt_key.pem\n/data/sf_jwt_key.pem" as key #DC2626
+end box
+participant "<$cogs>\nsync-worker\nsyncworker/main.py" as sw #7C3AED
+participant "<$cloud>\nSalesforce org" as sf #64748B
+participant "<$hdd>\nParquet\nPARQUET_DIR" as pq #D97706
+participant "<$database>\nDuckDB warehouse\n/data/warehouse.duckdb" as duck #D97706
+participant "<$microchip>\nvllm-embed\nQwen3-Embedding-0.6B" as emb #16A34A
+participant "<$database>\nLanceDB\ntable: chunks" as lance #D97706
+
+loop every SYNC_INTERVAL_MINUTES (default 30) — main.py:280-291
+sw -> duck : ``Store(DUCKDB_PATH)`` — a FRESH connection per cycle (main.py:285)\n``CREATE TABLE IF NOT EXISTS _sync_meta`` (storage.py:80-85)
+note left of sw #FEE2E2
+  **No restart policy, no HEALTHCHECK.**
+  ``load_settings()``/``load_object_configs()`` run **outside** the try
+  (main.py:261-262 vs :281): a bad ``SYNC_INTERVAL_MINUTES`` or a malformed
+  ``config.yaml`` kills the process at startup — and ``sync-worker`` is the
+  **only** compose service without ``restart:`` (docker-compose.yml:291-334).
+end note
+
+== 1 · authenticate — JWT bearer assertion ==
+
+group TokenManager.get_token() — cached 25 min (sf_auth.py:47,58-68)
+  alt SF_CLIENT_SECRET is set  (secrets.py:130-138) — client_credentials, **no JWT is built**
+    sw -> sf : **POST {SF_LOGIN_URL}/services/oauth2/token** · HTTPS · form · sync\ngrant_type=client_credentials & client_id & client_secret — sf_auth.py:83
+  else JWT bearer grant  (the documented path)
+    sw -> key : read PEM — ``SF_PRIVATE_KEY_FILE`` | ``SF_PRIVATE_KEY_B64`` |\n``/data/sf_jwt_key.pem`` (secrets.py:140-151) · **file I/O · blocking**
+    key --> sw : RSA private key bytes  (``_check_pem`` only greps for "PRIVATE KEY", secrets.py:60-79)
+    sw -> sw : ``build_jwt_assertion`` — RS256 over\n{iss: client_id, sub: username, aud: login_url, exp: now+**180**s}\nsf_auth.py:24-39
+    note right of sw #FEE2E2
+      **Clock skew is entirely unhandled.** ``exp`` is wall-clock
+      ``time.time() + 180`` (sf_auth.py:32,37).
+      **There is no iat claim, no nbf claim, no jti claim**
+      and no skew allowance whatsoever. On a drifting
+      air-gapped DGX this fails as an opaque
+      ``RuntimeError: … HTTP 400`` (sf_auth.py:121-123) that names
+      neither the clock nor Salesforce's ``error_description`` —
+      the body parse is wrapped in ``except Exception: error = ""``
+      (sf_auth.py:106-109).
+    end note
+    sw -> sf : **POST {SF_LOGIN_URL}/services/oauth2/token** · HTTPS · form · sync\ngrant_type=jwt-bearer & assertion=<signed JWT> — sf_auth.py:98
+  end
+  sf --> sw : 200 {access_token, instance_url}\ncached for **TOKEN_TTL_SECONDS = 25 min** — a guess (sf_auth.py:45-47)
+  note over sw, sf #FEE2E2
+    **No retry, no backoff, no rate-limit awareness on the token POST.**
+    One transient 503 from the login host raises ``RuntimeError``, kills
+    the whole cycle, and the outer handler backs off 30 s → 30 min
+    (main.py:292-299). ``httpx.Client(timeout=30.0)`` (sf_auth.py:53) is
+    the only bound — and that client is **never closed**.
+  end note
+end
+
+== 2 · per configured object (48 in config.yaml) — main.py:106-194 ==
+
+loop for obj in objects  (run_cycle, main.py:239-250 — one failure does not stop the cycle)
+
+  sw -> duck : ``SELECT watermark FROM _sync_meta WHERE object_name = ?``\nstorage.py:92-97 · parameterised
+  duck --> sw : watermark  |  NULL
+  sw -> sw : ``cycle_start = now(UTC)`` — captured **BEFORE** any network call\nmain.py:115
+  note right of sw #ECFDF5
+    **Deliberate and correct.** The watermark that will be committed is
+    the time the extract *started*, not the time it finished, so records
+    modified **during** the extract are re-fetched next cycle. The
+    DELETE-by-Id upsert makes that replay idempotent (main.py:186-187).
+  end note
+
+  sw -> sf : **GET /services/data/{v}/sobjects/{obj}/describe** · Bearer · sync\nsf_client.py:165
+  sf --> sw : field metadata
+  sw -> sw : drop fields this user cannot see (main.py:128-136) then\n``adopt_new_fields`` up to SYNC_MAX_FIELDS=80 (main.py:142-145)
+  note left of sw #FFFBEB
+    ``except Exception`` on describe → keep configured fields
+    (main.py:122-126) and ``except Exception: return fields, rag_fields``
+    inside adoption (main.py:81-82) — the second logs **nothing at all**.
+  end note
+
+  alt watermark IS NULL — first sync → **Bulk API 2.0 full extract**
+    sw -> sf : **POST /services/data/{v}/jobs/query** · JSON\n{operation:"query", query: build_full_soql(obj, fields)} — sf_client.py:199
+    sf --> sw : {id: jobId}
+    loop poll until state == JobComplete  (sf_client.py:208-220)
+      sw -> sf : **GET /jobs/query/{id}** · every ``poll_interval`` = 5.0 s
+      sf --> sw : {state}  — Failed/Aborted → RuntimeError
+    end
+    note right of sf #FEE2E2
+      **UNBOUNDED POLL LOOP** — ``while True`` with no iteration cap,
+      no wall-clock deadline and no shutdown check (sf_client.py:208-220).
+      A job stuck in ``InProgress`` spins forever at 5 s, blocking all
+      47 other objects: ``run_cycle`` is a plain sequential loop
+      (main.py:239-243) and ``flag.stop`` is never read inside a cycle.
+    end note
+    sf --> sw : **GET /jobs/query/{id}/results** · Accept: text/csv\nmaxRecords=10000, ``Sforce-Locator`` paging — sf_client.py:224-238
+  else watermark present — **incremental REST SOQL**
+    sw -> sf : **GET /services/data/{v}/query?q=** · Bearer · sync\n``SELECT <fields> FROM <obj> WHERE SystemModstamp > <watermark>``\nsf_client.py:91-101, :244-246
+    sf --> sw : {records, done, nextRecordsUrl} — paged at sf_client.py:255-258
+  end
+  note over sw, sf #FFFBEB
+    **Injection is guarded**: object and every field are matched against
+    ``_IDENT_RE`` and the watermark against a strict datetime regex
+    (sf_client.py:78-83, :96-97). **Read-only is enforced three ways**:
+    GET/POST-only (sf_client.py:132-133), bulk operation allow-list
+    ``{query, queryAll}`` (:195-196), and no write endpoint exists.
+    **The only retry anywhere is a single 401 replay** (sf_client.py:138-143),
+    which re-POSTs and can create a **second** Bulk job for the same SOQL.
+    5xx, ConnectError, ReadTimeout and 403 REQUEST_LIMIT_EXCEEDED all
+    propagate immediately; ``check_api_limits`` (:50-75) only warns at 80 %.
+  end note
+
+  loop for each batch yielded lazily by the generator  (main.py:163-184)
+
+    sw -> sw : ``normalize_records(batch)`` — **every value cast to str | None**\nstorage.py:38-56 → every DuckDB column becomes VARCHAR
+    sw -> pq : ``write_parquet_batch`` → PARQUET_DIR/<obj>/<obj>_<UTCstamp>_<uuid8>.parquet\nstorage.py:59-68 · **file write · blocking**
+    note right of pq #FEE2E2
+      **Parquet is NOT idempotent.** Every replay writes *new*
+      uuid-named files (storage.py:64-68), so a crashed run's partial
+      files stay on disk forever beside the replay's. No retention,
+      no compaction, no directory bound anywhere.
+    end note
+
+    group ONE DuckDB transaction — storage.py:149-161 · ROLLBACK + re-raise on error (:162-164)
+      sw -> duck : ``BEGIN TRANSACTION``
+      sw -> duck : ``ALTER TABLE "<obj>" ADD COLUMN …`` for each drifted column (:151-154)
+      sw -> duck : ``DELETE FROM "<obj>" WHERE Id IN (SELECT Id FROM _staging_df)`` (:155-157)
+      sw -> duck : ``INSERT INTO "<obj>" BY NAME SELECT * FROM _staging_df`` (:158-160)
+      sw -> duck : ``COMMIT``
+    end
+    note right of duck #ECFDF5
+      **DuckDB IS idempotent.** DELETE-by-Id then INSERT inside one
+      transaction, plus an intra-batch ``drop_duplicates`` on Id keeping
+      the last (storage.py:133). Replaying the same batch yields
+      the same rows — proven by tests/test_upsert.py:27-61.
+      Cost: no PRIMARY KEY or index exists on any per-object table
+      (storage.py:140), so the DELETE is a full scan per batch.
+    end note
+
+    opt obj has rag_fields  (34 of 48 objects, 61 fields)
+      sw -> sw : ``chunk_text(str(value))`` — 800-word windows, 100 overlap\nchunking.py:14-40 · **whitespace-split "tokens"**
+      loop for each slice of EMBED_BATCH_SIZE = 32  (rag_index.py:45-46)
+        sw -> emb : **POST {EMBED_VIA}/embeddings** · JSON · sync\n{model: EMBED_MODEL, input: [≤32 chunks]} — rag_index.py:47-50
+        emb --> sw : {data:[{embedding}, …]}
+      end
+      note right of emb #FEE2E2
+        **GPU embedding blocks Salesforce pagination.** The extract
+        generators are lazy (sf_client.py:193-258), so the Bulk result
+        locator and the REST ``nextRecordsUrl`` stay open while thousands
+        of embeddings compute (rag_index.py concurrency).
+        **No retry, no backoff** on this POST (rag_index.py:47-51) — one
+        503 from a reloading vLLM aborts the batch's indexing.
+        ``timeout=300.0`` **per 32-text batch** (rag_index.py:41), with no
+        deadline across the unbounded number of batches.
+        **No re-embedding guard**: any ``SystemModstamp`` bump re-embeds
+        every chunk of that record — no hash, no modstamp comparison.
+      end note
+      loop for each changed record id  (rag_index.py:141-142)
+        sw -> lance : ``table.delete("record_id = '<Id>'")`` — **one call PER record**\nid pre-validated ``^[a-zA-Z0-9]{15,18}$`` (rag_index.py:26,108)
+      end
+      sw -> lance : ``table.add(rows)`` — rag_index.py:144
+    end
+    note over sw, lance #FEE2E2
+      **LanceDB is NOT idempotent in the failure direction.** Everything
+      this ``opt`` block raises is swallowed at **main.py:174-184**
+      (``event=rag_index_error``) — and the watermark **still advances**
+      two steps below. Those chunks are never re-indexed until the record
+      changes again. Same for a dimension change: ``_open_or_create_table``
+      ignores ``dim`` when the table exists (rag_index.py:73-89), so
+      ``table.add`` fails on schema mismatch **forever**.
+    end note
+  end
+
+  == 3 · commit the watermark LAST ==
+
+  sw -> duck : ``set_watermark(obj, cycle_start)`` — **main.py:188** →\n``INSERT … ON CONFLICT DO UPDATE`` (storage.py:99-106) · autocommitted
+  note over sw, duck #ECFDF5
+    **THE ORDERING IS THE CRASH-SAFETY PROPERTY.**
+    ``store.upsert`` commits at **main.py:167**; ``store.set_watermark``
+    runs at **main.py:188**, only after the whole ``for batch`` loop
+    (main.py:163-184) completes without raising.
+    Kill the process anywhere in between → the watermark is unchanged →
+    the next cycle re-runs the *same* SOQL and re-upserts the *same* rows,
+    and the DELETE-by-Id + INSERT transaction converges. **Correct.**
+    Costs of the replay: when the watermark was NULL,
+    **the entire Bulk full extract restarts from scratch** — no
+    resumability, no partial-progress marker, no reuse of the completed
+    job id. Separately, **Salesforce DELETEs are never propagated**
+    to DuckDB or LanceDB by any code path in this repo.
+  end note
+end
+
+sw -> duck : ``store.close()`` — main.py:289 (in a ``finally``)
+sw -> sw : ``flag.sleep(interval * 60)`` — main.py:291\non a cycle exception: backoff 30 s → ×2 → cap 30 min (main.py:292-299)
+note left of sw #FFFBEB
+  Interval drift: the sleep starts *after* the cycle, so the real period is
+  ``interval + cycle_duration`` (main.py:290-291). ``docker stop`` mid-extract
+  is not honoured — ``flag.stop`` is read only by ``_StopFlag.sleep`` and the
+  outer ``while`` (main.py:48, :280), so the container is SIGKILLed.
+end note
+end
+
+legend right
+  |= Colour |= Layer |
+  |<#2563EB> | frontend / edge |
+  |<#7C3AED> | orchestrator / app logic |
+  |<#16A34A> | inference / GPU |
+  |<#D97706> | storage / data |
+  |<#64748B> | external systems |
+  |<#DC2626> | risk / trust boundary |
+  ----
+  **Notation.** Solid arrow = request · dashed = response. Dashed red box =
+  trust boundary. Amber/red note = defect, unbounded resource or swallowed
+  error. Green note = a design decision verified correct. Notes cite ``file:LINE``.
+  ----
+  **Idempotency scorecard.** DuckDB **YES** (delete-by-Id + insert in one txn,
+  watermark last) · Parquet **NO** (fresh uuid file per replay) · LanceDB **NO**
+  in the failure direction (index error swallowed, watermark advances anyway) ·
+  Salesforce DELETEs **never propagated**. Single-threaded and fully
+  synchronous — no ``async`` anywhere in ``syncworker/``.
+end legend
+
+@enduml

@@ -1,0 +1,228 @@
+@startuml 09-seq-agent-loop
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName "Inter, Segoe UI, sans-serif"
+skinparam defaultFontSize 13
+skinparam roundCorner 8
+skinparam shadowing false
+skinparam ArrowColor #4A5568
+skinparam ArrowFontColor #4A5568
+skinparam NoteBackgroundColor #FFFBEB
+skinparam NoteBorderColor #F59E0B
+' Layer palette — byte-identical across ALL 24 diagrams
+!$C_EDGE = "#2563EB"   /' frontend / edge '/
+!$C_APP  = "#7C3AED"   /' orchestrator / app logic '/
+!$C_GPU  = "#16A34A"   /' inference / GPU '/
+!$C_DATA = "#D97706"   /' storage / data '/
+!$C_EXT  = "#64748B"   /' external systems '/
+!$C_RISK = "#DC2626"   /' risk / trust boundary '/
+
+' --- sequence-specific rendering only; palette above is untouched ---
+skinparam ParticipantFontColor #FFFFFF
+skinparam ParticipantFontStyle bold
+skinparam ParticipantBorderColor #1F2937
+skinparam sequenceBoxBorderColor #DC2626
+skinparam sequenceBoxFontColor #DC2626
+skinparam sequenceBoxFontStyle bold
+skinparam sequenceLifeLineBorderColor #94A3B8
+skinparam sequenceGroupBorderColor #94A3B8
+skinparam maxMessageSize 300
+
+title Agent multi-step tool loop — PLAN, concurrent EXECUTE, SYNTHESIZE; step guard and step failure\n(evidence: orchestrator/app/engines/agent.py:36-658 · orchestrator/app/main.py:592-601 · orchestrator/app/llm.py:78,215-262 · orchestrator/app/engines/sql.py:179-212 · orchestrator/app/engines/live_sf.py:140-148 · orchestrator/app/engines/search.py:416,446,454)
+
+participant "frontend\nsse.ts · mergeStep · step list UI" as fe #2563EB
+participant "orchestrator · worker()\nmain.py:592-601" as orch #7C3AED
+participant "engines/agent · LangGraph subgraph\nplan → execute → synthesize (agent.py:609-628)" as ag #7C3AED
+participant "execute_steps()\nSemaphore(3) · agent.py:369-405" as exec #7C3AED
+participant "sub-engines (lazily imported)\nsql · rag · live_sf · search" as sub #7C3AED
+participant "vllm (MAIN)\nOPENAI_BASE_URL" as vmain #16A34A
+participant "DuckDB warehouse\nLanceDB" as store #D97706
+
+box "Egress outside the host" #FEF2F2
+participant "Salesforce org" as sf #64748B
+participant "searxng + arbitrary\npublic websites" as web #64748B
+end box
+
+autonumber
+
+orch -> ag : run_agent_engine(message, history, emit,\neffort, salesforce = (mode != "assistant"), web = want_search)\nin-process await · main.py:592-601, agent.py:631-658
+
+== 1 · PLAN — one shot, one retry, then a degraded fallback ==
+
+loop for _attempt in range(2) — agent.py:197
+  ag -> vmain : HTTP POST /v1/chat/completions · JSON · async\ntemperature 0.1 · max_tokens 6000 · system = _PLAN_SYSTEM or _PLAN_SYSTEM_NO_SF\nagent.py:188-210
+  vmain --> ag : raw plan text
+  ag -> ag : parse_agent_plan → pydantic AgentPlan\nsteps 1..MAX_STEPS=8, unique ids, kind in (sql, rag, llm, web, salesforce)\nagent.py:59-97
+  alt parse or transport failed
+    ag -> ag : last_error = str(exc)[:400], appended to the retry prompt as an extra user turn\nagent.py:200-214
+  end
+end
+
+alt both attempts failed
+  ag -> ag : _fallback_plan(message) — a SINGLE kind="llm" step titled message[:60]\nagent.py:145-148, :215
+  note over ag #FEE2E2
+    The retry loop catches **every** Exception including timeouts and 400s
+    (agent.py:213-214) and logs nothing. A deep multi-tool request silently
+    collapses into one plain completion, and the user is never told: the
+    degraded plan streams a normal answer with route "agent".
+  end note
+end
+
+ag -> ag : coerce_allowed(plan, web=state["web"]) — mutates PlanStep.kind **in place**\nagent.py:164-174, :561-568
+
+note over ag #FFFBEB
+  **MAX-ITERATION GUARD — there is no iteration.** The subgraph is
+  plan → execute → synthesize → END with **no cycle** (agent.py:614-617) and
+  no step can enqueue another, so the loop cannot run away. The bound is
+  purely on step *count*, enforced twice:
+  · pydantic max_length = MAX_STEPS = 8 (agent.py:36, :67)
+  · the prompt budget step_budget(effort): medium 5, high 8 (agent.py:42, :48)
+  applied by **string substitution** on the literal "at most 8 " (agent.py:190) —
+  if either prompt constant is reworded, the budget silently stops applying.
+  _STEP_BUDGET and _SYNTH_TOKENS have no "fast"/"low" keys, so an explicit
+  agent=true at effort "fast" silently gets the medium values.
+end note
+
+== 2 · EXECUTE — asyncio.gather over the plan, at most 3 at a time ==
+
+ag -> exec : execute_steps(plan, history, emit, salesforce, effort, message)\nagent.py:571-580
+note over ag, exec #FEE2E2
+  **F7 — the `web` gate is enforced only at plan time.** _execute_node does
+  not forward `web` (agent.py:571-580), so a step that survived coercion
+  still reaches the live web branch at agent.py:337.
+end note
+
+loop for each PlanStep, up to STEP_CONCURRENCY = 3 concurrently (agent.py:378-381)
+  exec -> fe : SSE · event: step\ndata: {"id": int, "title": str, "status": "running"}\nagent.py:381-382
+
+  alt kind == "sql" and salesforce
+    exec -> sub : generate_and_run_sql(step.input, history=list(history))\nagent.py:257
+    sub -> vmain : SQL generation, then the chart-spec call · 1-2 completions\nsql.py:210-212
+    sub -> store : DuckDB query · file I/O · blocking\nsql.py:179-206
+    sub --> exec : rows; preview capped at SQL_PREVIEW_ROW_CAP (config.py:234)
+    note over exec, store #FEE2E2
+      **F3** — the synthesizer is handed `f"SQL result ({len(rows)} row(s)):"`
+      followed by only `rows[:30]`, with **no statement that this is a sample**
+      (agent.py:258-274). The direct SQL route carries an explicit "you are
+      shown only the FIRST FEW ROWS, quote the true row count" instruction
+      (sql.py:267-278), added because "314 rows came back and the summary said
+      29 records". The agent path never got that fix.
+    end note
+
+  else kind == "rag" and salesforce
+    exec -> store : select_context(step.input) → LanceDB vector search\nrag.py:91
+    exec -> vmain : answer completion · temperature 0.2 · max_tokens 5000, then build_citations\nagent.py:281-285
+
+  else kind == "salesforce" and salesforce  [the Salesforce gate]
+    exec -> sf : fetch_live(step.input, history) — SOQL against the **live production org**\nHTTPS · JWT Bearer · SF_LIVE_TIMEOUT · agent.py:293, live_sf.py:140-145
+    sf --> exec : rows → merge_rows + describe_rows (30-row cap, live_sf.py:148)
+    note over exec, sf #FEE2E2
+      Closed gate: when mode == "assistant" the planner is given
+      _PLAN_SYSTEM_NO_SF and _coerce_no_salesforce rewrites every non-llm kind
+      to "llm" (agent.py:131-160) — the gate is a **prompt plus a coercion**,
+      not a runtime capability check.
+      Degradation is invisible: SalesforceUnavailable / UnsafeSoql return a
+      prose apology and an empty sub-meta, yet the step still reports
+      status="done" (agent.py:294-303).
+      **F6** — agent.py:312-335 is a byte-equivalent duplicate of this branch
+      behind the identical condition: 24 lines of unreachable dead code.
+    end note
+
+  else kind == "web"
+    exec -> web : research_step(step.input, history, effort, emit)\nsearch backend query + arbitrary page fetches chosen by the model\nagent.py:341-343
+    exec -> fe : SSE · event: research\ndata: {"phase": "reading" | "read", "count": int}\nsearch.py:446, :454
+    note over exec, web #FEE2E2
+      **F4** — with **no sources** the branch has no `return` and **falls
+      through** (agent.py:351-352) into the llm tail: the step answers from
+      model knowledge, is reported status="done", and carries **no**
+      search_unavailable flag — unlike the direct search route, which sets
+      meta.search_unavailable = True (search.py:416).
+      Fetched page content is untrusted and reaches the model prompt.
+    end note
+
+  else kind == "llm", or the web branch fell through
+    exec -> vmain : chat_completion([_STEP_LLM_SYSTEM, recent_turns(history, 8), step.input])\ntemperature 0.3 · max_tokens 5000 · agent.py:357-364
+  end
+
+  alt the step raised
+    exec -> fe : SSE · event: step\ndata: {"id", "title", "status": "failed", "detail": _shorten(str(exc), 200)}\nagent.py:387-392
+    exec -> exec : output becomes "Step failed: <detail>"; the plan still "succeeds" as a whole;\nsibling steps are unaffected · agent.py:393-398
+    note over exec, fe #FEE2E2
+      **F5 — raw exception text is streamed to the browser** as step.detail
+      (agent.py:388-392): stack-free but unsanitised, and it may carry SOQL,
+      SQL, hostnames or driver messages. Nothing is logged server-side.
+      This is one of eleven bare `except` sites in the core-4 engines, **none**
+      of which log (evidence: orch-engines-core4.md).
+    end note
+  else the step succeeded
+    exec -> fe : SSE · event: step\ndata: {"id", "title", "status": "done", "detail": <short summary>}\nagent.py:399-402
+  end
+end
+
+exec -> exec : asyncio.gather(*(run(step) for step in plan.steps)) — **without return_exceptions=True**\nagent.py:405
+note over exec #FEE2E2
+  **F10** — because return_exceptions is not set, a BaseException that escapes
+  run() (notably asyncio.CancelledError from POST /chat/stop, main.py:721)
+  aborts the gather and leaves the sibling coroutines **still running** —
+  their Salesforce queries and page fetches complete with nobody listening.
+  Concurrent steps also share one `emit` callable, so research events from
+  parallel web steps interleave into a single frontend panel with no step id
+  (sse.ts:166-199).
+end note
+exec --> ag : List of {step, status, output, meta} — gather preserves plan order
+
+== 3 · SYNTHESIZE — one merged answer, one merged meta ==
+
+ag -> ag : renumber_web_sources(results) — mutates outputs and sub-metas in place,\n**before** the prompt is built, so plan-wide markers are what the model reads\nagent.py:411-452, :588
+note over ag #FFFBEB
+  Sources without a `url` are skipped (agent.py:435-437), leaving their local
+  [n] markers unmapped and pointing at whichever page ends up with that
+  plan-wide number.
+end note
+
+ag -> vmain : llm.stream_chat_events(_synthesis_messages(message, results),\nmodel_choice "smart" · temperature 0.2 · max_tokens _SYNTH_TOKENS: 6000 medium / 12000 high\nagent.py:591-597
+
+loop for every streamed delta
+  vmain --> ag : ("reasoning" | "token", delta)
+  ag -> fe : SSE · event: reasoning\ndata: {"text": str}   ·   event: token\ndata: {"text": str}\nagent.py:599, :602
+end
+
+ag -> fe : SSE · the SINGLE final event: meta = merge_step_meta(results)\nroute "agent", steps[], plus sql/data/truncated/chart/chart_data, citations, sources, report_files\nagent.py:467-518, :605
+note over ag, fe #FFFBEB
+  merge_step_meta rules: the **last** step with a truthy `sql` contributes the
+  whole _SQL_PAYLOAD_KEYS tuple atomically (agent.py:489-493); citations dedupe
+  on record_id, report files on filename, sources on url (agent.py:494-510).
+  Nothing enforces "exactly one meta per turn" at runtime — there is no engine
+  ABC, no Protocol and no return-type check anywhere; the contract is pure duck
+  typing re-declared per module (engines/__init__.py, chat.py:22, agent.py:34).
+end note
+ag --> orch : "".join(parts) → the answer string\nagent.py:606, :658
+
+note over ag, web #FEE2E2
+  **No timeout exists anywhere in agent.py.** `rg wait_for|timeout` over
+  engines/*.py hits only url.py:36 and search.py:315/338. The single bound is
+  the 300 s httpx client timeout (llm.py:78, config.py:264).
+  Worst case for ONE user message: plan 2 x 300 s, then ceil(8/3) = 3 waves of
+  (per-step model call + Salesforce/web fetch), then the synthesis stream —
+  **well past 20 minutes**, with the only cancellation path being the user
+  pressing Stop (POST /chat/stop → task.cancel(), main.py:716-722).
+  Model-call budget at 8 steps: 1-2 plan + 1 per llm/rag/web step + 1-2 per sql
+  step + 1 streaming synthesis = roughly **11-19 model calls per message**.
+end note
+
+legend right
+  |= Colour |= Layer |
+  |<#2563EB> | frontend / edge |
+  |<#7C3AED> | orchestrator / app logic |
+  |<#16A34A> | inference / GPU |
+  |<#D97706> | storage / data |
+  |<#64748B> | external systems |
+  |<#DC2626> | risk / trust boundary |
+  Red-bordered box = trust boundary (traffic leaving the host).
+  Solid arrow = call · dashed arrow = return value.
+  Red note = swallowed exception, silent degradation or missing timeout.
+  Amber note = design constraint or bound worth auditing.
+  Fn labels are the finding ids from docs/_evidence/orch-engines-core4.md.
+end legend
+
+@enduml

@@ -1,0 +1,339 @@
+@startuml 18-er-data-model
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName "Inter, Segoe UI, sans-serif"
+skinparam defaultFontSize 13
+skinparam roundCorner 8
+skinparam shadowing false
+skinparam ArrowColor #4A5568
+skinparam ArrowFontColor #4A5568
+skinparam NoteBackgroundColor #FFFBEB
+skinparam NoteBorderColor #F59E0B
+' Layer palette — byte-identical across ALL 24 diagrams
+!$C_EDGE = "#2563EB"   /' frontend / edge '/
+!$C_APP  = "#7C3AED"   /' orchestrator / app logic '/
+!$C_GPU  = "#16A34A"   /' inference / GPU '/
+!$C_DATA = "#D97706"   /' storage / data '/
+!$C_EXT  = "#64748B"   /' external systems '/
+!$C_RISK = "#DC2626"   /' risk / trust boundary '/
+
+!include <tupadr3/common>
+!include <tupadr3/font-awesome-5/database>
+!include <tupadr3/font-awesome-5/hdd>
+!include <tupadr3/font-awesome-5/search>
+!include <tupadr3/font-awesome-5/exclamation_triangle>
+
+title Entity-relationship model — three independent stores, one enforced FK graph\n(evidence: orchestrator/app/db.py:22-134, sync-worker/syncworker/storage.py:72-167, sync-worker/syncworker/rag_index.py:73-144)
+
+skinparam class {
+  BorderThickness 1
+}
+skinparam package {
+  BorderThickness 2
+}
+
+' ═══════════════════════════════════════════════════════════════════
+' TRUST BOUNDARY — one Docker volume holds all three stores + the SF key
+' ═══════════════════════════════════════════════════════════════════
+package "TRUST BOUNDARY — the single Docker `data` volume\n//mounted read-write into sync-worker AND into the orchestrator that executes LLM-authored SQL (docker-compose.yml:269)//\n//it also holds the Salesforce RSA signing key at /data/sf_jwt_key.pem (syncworker/secrets.py:50)//" as VOL #back:FFFFFF;line:DC2626;line.dashed {
+
+' ═══════════════════════════════════════════════════════════════════
+' (a) app.sqlite3 — the ONLY store with declared foreign keys
+' ═══════════════════════════════════════════════════════════════════
+package "app.sqlite3\n//stdlib sqlite3, one short-lived connection per call — db.py:195-205//\n**PRAGMA journal_mode=WAL** (db.py:201) · **PRAGMA foreign_keys=ON** (db.py:202)" as SQLITE #FFFBEB {
+
+  entity "**users**\n//db.py:23-28//" as users #FEF3C7 {
+    * **id** : INTEGER  <<PK, AUTOINCREMENT>>
+    --
+    * username : TEXT  <<UNIQUE, COLLATE NOCASE>>
+    * password_hash : TEXT  <<literal "!local-no-login" — auth.py:79>>
+    * created_at : TEXT
+  }
+
+  entity "**conversations**\n//db.py:29-37//" as conversations #FEF3C7 {
+    * **id** : TEXT  <<PK — CLIENT-SUPPLIED, history.py:92>>
+    --
+    * //user_id// : INTEGER  <<FK → users(id) ON DELETE CASCADE>>
+    * title : TEXT
+    * created_at : TEXT
+    * updated_at : TEXT
+    * pinned : INTEGER  <<DEFAULT 0, added by migrate() db.py:141-144>>
+    * archived : INTEGER  <<DEFAULT 0, added by migrate() db.py:141-144>>
+  }
+
+  entity "**messages**\n//db.py:38-51//" as messages #FEF3C7 {
+    * **id** : INTEGER  <<PK, AUTOINCREMENT>>
+    --
+    * //conversation_id// : TEXT  <<FK → conversations(id) ON DELETE CASCADE>>
+    * role : TEXT
+    * content : TEXT  <<NO INDEX — LIKE full-scans at db.py:963,972,995>>
+    meta : TEXT  <<JSON blob, json.loads at db.py:352>>
+    * created_at : TEXT
+    generation_id : TEXT  <<idempotency key, db.py:146>>
+  }
+
+  entity "**conversation_summaries**\n//db.py:55-65//" as summaries #FEF3C7 {
+    * **conversation_id** : TEXT  <<PK + FK → conversations(id) ON DELETE CASCADE>>
+    --
+    * summary : TEXT
+    * covers_through : INTEGER  <<count of folded messages>>
+    * token_estimate : INTEGER
+    * updated_at : TEXT
+  }
+
+  entity "**conversation_chunks**\n//db.py:69-78//" as convchunks #FEF3C7 {
+    * **id** : INTEGER  <<PK, AUTOINCREMENT>>
+    --
+    * //conversation_id// : TEXT  <<FK → conversations(id) ON DELETE CASCADE>>
+    * ordinal : INTEGER
+    * role : TEXT
+    * text : TEXT
+    * embedding : BLOB  <<unbounded, no size cap>>
+    * created_at : TEXT
+    UNIQUE(conversation_id, ordinal)
+  }
+
+  entity "**uploads**\n//db.py:84-93//" as uploads #FEE2E2 {
+    * **id** : TEXT  <<PK>>
+    --
+    * conversation_id : TEXT  <<**NO FOREIGN KEY** — db.py:86>>
+    * filename : TEXT
+    * bytes : INTEGER
+    * status : TEXT
+    profile : TEXT  <<JSON — the only data the dataset engine ever sees>>
+    notes : TEXT
+    * created_at : TEXT
+  }
+
+  entity "**url_documents**\n//db.py:102-110//" as urldocs #FEE2E2 {
+    * **id** : INTEGER  <<PK, AUTOINCREMENT>>
+    --
+    * conversation_id : TEXT  <<**NO FOREIGN KEY** — db.py:104>>
+    * url : TEXT
+    * title : TEXT
+    * text : TEXT  <<extracted readable text; source body capped at FETCH_MAX_BYTES=5 MB>>
+    * fetched_at : TEXT
+    UNIQUE(conversation_id, url)
+  }
+
+  entity "**repos**\n//db.py:114-122//" as repos #FEE2E2 {
+    * **id** : INTEGER  <<PK, AUTOINCREMENT>>
+    --
+    * conversation_id : TEXT  <<**NO FOREIGN KEY** — db.py:116>>
+    * repo_key : TEXT
+    * url : TEXT
+    * sha : TEXT  <<"" when git rev-parse fails — core/repo.py:213>>
+    * cloned_at : TEXT
+    UNIQUE(conversation_id, repo_key)
+  }
+
+  entity "**repo_chunks**\n//db.py:123-131//" as repochunks #FEE2E2 {
+    * **id** : INTEGER  <<PK, AUTOINCREMENT>>
+    --
+    * conversation_id : TEXT  <<**NO FOREIGN KEY** — db.py:125>>
+    * repo_key : TEXT  <<no FK to repos(repo_key) either>>
+    * path : TEXT
+    * start_line : INTEGER
+    * end_line : INTEGER
+    * text : TEXT
+  }
+}
+
+' ═══════════════════════════════════════════════════════════════════
+' (b) DuckDB warehouse — written by sync-worker, read read-only by orchestrator
+' ═══════════════════════════════════════════════════════════════════
+package "DuckDB warehouse\n//DUCKDB_PATH=/data/warehouse.duckdb — config.py:96, syncworker/config.py:43//\nwriter: **sync-worker** (1 conn/cycle) · reader: **orchestrator** read_only=True (schema_cache.py:40-47)" as DUCK #FFF7ED {
+
+  entity "**<Salesforce object>**\none table per config.yaml entry\n//Account, Contact, Opportunity, Case, …//\n//created at storage.py:138-142//" as sfobj #FED7AA {
+    Id : VARCHAR  <<**NO PRIMARY KEY, NO INDEX**>>
+    SystemModstamp : VARCHAR
+    Name : VARCHAR
+    …every configured field… : VARCHAR
+    --
+    CREATE TABLE "obj" AS SELECT * FROM _staging_df
+    ⇒ schema inferred, **every column VARCHAR**
+    (normalize_records str()-casts all — storage.py:38-56)
+    --
+    upsert = DELETE WHERE Id IN (…) + INSERT BY NAME
+    (storage.py:155-160) — **full scan per batch**
+    new columns adopted by ALTER TABLE ADD COLUMN
+    (storage.py:151-154)
+  }
+
+  entity "**_sync_meta**\n//storage.py:80-85//" as syncmeta #FED7AA {
+    * **object_name** : VARCHAR  <<PRIMARY KEY>>
+    --
+    watermark : VARCHAR  <<max SystemModstamp, "…Z" — storage.py:35>>
+    updated_at : TIMESTAMP
+    --
+    written LAST, after the whole batch loop
+    (syncworker/main.py:188) ⇒ crash-safe replay
+  }
+}
+
+' ═══════════════════════════════════════════════════════════════════
+' (c) LanceDB — vector store, written by sync-worker, read by the rag engine
+' ═══════════════════════════════════════════════════════════════════
+package "LanceDB\n//LANCEDB_DIR=/data/lancedb, LANCEDB_TABLE=chunks — config.py:97-98//" as LANCE #FFF7ED {
+
+  entity "**chunks**\n//schema at rag_index.py:79-89//" as chunks #FED7AA {
+    vector : fixed_size_list[float32, dim]  <<no PK, no unique key>>
+    --
+    text : string  <<one chunk of one rag_field>>
+    object : string  <<Salesforce object API name>>
+    record_id : string  <<15/18-char SF Id — rag_index.py:26>>
+    field : string
+    system_modstamp : string
+    --
+    write path: **delete per record_id then add**
+    (rag_index.py:141-144) — one delete call PER RECORD
+    read path: table.search(vec).limit(RAG_TOP_K=30)
+    (rag.py:43-49)
+  }
+}
+
+}
+' ── end TRUST BOUNDARY ─────────────────────────────────────────────
+
+' ── enforced foreign keys (SQLite, cascading) ──────────────────────
+users        ||-[#D97706,bold]-o{ conversations : "FK user_id\n**ON DELETE CASCADE** · db.py:31"
+conversations ||-[#D97706,bold]-o{ messages     : "FK conversation_id\n**ON DELETE CASCADE** · db.py:40"
+conversations ||-[#D97706,bold]-|| summaries    : "FK conversation_id (also PK)\n**ON DELETE CASCADE** · db.py:56"
+conversations ||-[#D97706,bold]-o{ convchunks   : "FK conversation_id\n**ON DELETE CASCADE** · db.py:71"
+
+' ── NON-enforced, string-only associations (SQLite) ────────────────
+conversations ||..[#DC2626,bold]o{ uploads     : "**conversation_id only — NO FK**\norphaned on delete · db.py:86"
+conversations ||..[#DC2626,bold]o{ urldocs     : "**conversation_id only — NO FK**\norphaned on delete · db.py:104"
+conversations ||..[#DC2626,bold]o{ repos       : "**conversation_id only — NO FK**\norphaned on delete · db.py:116"
+conversations ||..[#DC2626,bold]o{ repochunks  : "**conversation_id only — NO FK**\norphaned on delete · db.py:125"
+repos        ||..[#DC2626]o{ repochunks        : "repo_key — no FK,\nno cascade · db.py:126"
+
+' ── cross-store, application-level joins (nothing enforces these) ──
+sfobj ||..[#64748B]o{ chunks   : "Id → record_id\n//application join, rag_index.py:106-110//\nno constraint, no referential check"
+sfobj ||..[#64748B]|| syncmeta : "table name → object_name\n//by convention only, syncworker/main.py:106-115//"
+
+' ═══════════════════════════════════════════════════════════════════
+' Notes
+' ═══════════════════════════════════════════════════════════════════
+note bottom of uploads #FEE2E2
+  **ORPHAN DEFECT — the central data-model risk.**
+  `delete_conversation` executes exactly one statement:
+  `DELETE FROM conversations WHERE id=? AND user_id=?`
+  (**db.py:334-340**). `PRAGMA foreign_keys=ON` (db.py:202)
+  therefore cascades into `messages`, `conversation_summaries`
+  and `conversation_chunks` — and reaches **nothing else**.
+
+  `uploads`, `url_documents`, `repos`, `repo_chunks` declare
+  `conversation_id TEXT NOT NULL` with **no REFERENCES clause**
+  (db.py:86, 104, 116, 125). After the delete those rows survive
+  forever: no cascade, no TTL, no pruning job anywhere in
+  `orchestrator/app/` — the whole page text, code chunks and
+  dataset profiles of a "deleted" chat stay readable to anyone
+  who can guess or replay the conversation id.
+end note
+
+note right of messages #FFFBEB
+  **Every `connect()` re-runs DDL + migration** (db.py:203-204):
+  `executescript(_SCHEMA)` = 16 CREATE … IF NOT EXISTS, then
+  `migrate()` runs an **unconditional** de-duplicating
+  `DELETE FROM messages … GROUP BY conversation_id, generation_id`
+  (db.py:181-186) — a full scan + group-by of `messages` on
+  **every single database call**, with no one-time guard.
+
+  `sqlite3.connect()` is called with **no `timeout=`** (db.py:199),
+  so writes fail with "database is locked" after the stdlib
+  default 5 s under contention → HTTP 500.
+end note
+
+note top of SQLITE #FFFBEB
+  **Indexes — 6 declared in `_SCHEMA`:**
+  1. `idx_conversation_chunks_conv` (conversation_id, ordinal) — db.py:79-80
+     //redundant: UNIQUE(conversation_id, ordinal) at db.py:77 already indexes this//
+  2. `idx_uploads_conversation` (conversation_id, created_at) — db.py:94-95
+  3. `idx_conversations_user` (user_id, updated_at DESC) — db.py:96-97
+  4. `idx_messages_conversation` (conversation_id, id) — db.py:98-99
+  5. `idx_url_documents_conv` (conversation_id, id) — db.py:111-112
+  6. `idx_repo_chunks_conv` (conversation_id, repo_key, id) — db.py:132-133
+
+  **+ 1 created outside `_SCHEMA`**, in `migrate()`:
+  `idx_messages_generation` UNIQUE (conversation_id, generation_id)
+  WHERE generation_id IS NOT NULL — db.py:187-191 (partial, race fix)
+
+  **No index on `messages.content`** — every conversation search is a
+  full table scan (db.py:963, 972, 995).
+end note
+
+note bottom of sfobj #FEE2E2
+  **DuckDB has no keys at all.** Tables are born from
+  `CREATE TABLE "<obj>" AS SELECT * FROM _staging_df`
+  (storage.py:138-142), which carries no PK, no UNIQUE and
+  no index. Consequences:
+  • `DELETE … WHERE Id IN (SELECT Id FROM _staging_df)`
+    (storage.py:155-157) is a **full table scan per batch**.
+  • Nothing prevents duplicate `Id` rows; correctness rests
+    solely on `drop_duplicates(subset=["Id"])` (storage.py:133).
+  • Every column is **VARCHAR** because `normalize_records`
+    str()-casts each value (storage.py:38-56) — dates and
+    amounts cannot be compared or aggregated numerically by
+    the LLM-authored SQL without an explicit CAST.
+  • **Salesforce deletes are never propagated** — no tombstone
+    query, no `queryAll`, no reconciliation pass.
+end note
+
+note bottom of syncmeta #FFE4E6
+  `_sync_meta` is created in the **`main` schema**, and
+  `schema_cache` enumerates `information_schema.columns
+  WHERE table_schema='main'` (schema_cache.py:47-53) — so the
+  internal watermark table is handed to the SQL-writing LLM as
+  if it were a business object.
+end note
+
+note bottom of chunks #FEE2E2
+  **No dedup and no re-embed guard** (rag_index.py:97-154):
+  the indexer never compares incoming text to what is stored —
+  no content hash, no `system_modstamp` comparison. Any change
+  to any field bumps `SystemModstamp`, so every long-text chunk
+  of that record is re-embedded on the GPU.
+
+  `_open_or_create_table` **ignores `dim` when the table already
+  exists** (rag_index.py:77-78): switching `EMBED_MODEL` to a
+  different dimension silently appends mismatched vectors.
+end note
+
+note as TRUST #FFE4E6
+  **Why the dashed red boundary matters.**
+  `app.sqlite3`, `warehouse.duckdb`, `lancedb/`, `parquet/` and
+  the Salesforce **RSA signing key** `/data/sf_jwt_key.pem`
+  (syncworker/secrets.py:50) all live in ONE Docker volume that is
+  mounted into the orchestrator (docker-compose.yml:269) — the same
+  container that executes LLM-authored SQL.
+
+  The only thing separating model text from that key is the DuckDB
+  connection flags: `read_only=True`, `enable_external_access=False`,
+  `autoload_known_extensions=False` (sql.py:124-132), plus
+  `guard_sql`'s 22-entry filesystem/network table-function blocklist
+  (sql_guard.py:45-54). There is no filesystem-level isolation and no
+  separate secrets mount.
+
+  Note also that **no store enforces identity across the boundary**:
+  SQLite `conversations.id` is client-supplied (history.py:92), and
+  DuckDB/LanceDB carry no key at all.
+end note
+
+TRUST .[#DC2626,dashed]. VOL
+
+legend right
+  |= Colour |= Meaning |
+  |<#FEF3C7> | app.sqlite3 table **with** a declared FK / cascade |
+  |<#FEE2E2> | table or field carrying a data-model **risk** |
+  |<#FED7AA> | analytics store (DuckDB / LanceDB) — no keys at all |
+  Notation:
+  `||--o{` solid orange = **enforced** FK, ON DELETE CASCADE
+  `||..o{` dashed red   = column-name-only link, **no constraint**
+  `||..o{` dashed grey  = cross-store join made in application code
+  `*` = NOT NULL · **bold** = primary key · //italic// = foreign key
+  Stores: app.sqlite3 (SQLite/WAL) · DuckDB warehouse · LanceDB.
+  There is **no** cross-store transaction and no shared identity.
+end legend
+
+@enduml

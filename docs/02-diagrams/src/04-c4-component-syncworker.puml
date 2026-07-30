@@ -1,0 +1,290 @@
+@startuml 04-c4-component-syncworker
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName "Inter, Segoe UI, sans-serif"
+skinparam defaultFontSize 13
+skinparam roundCorner 8
+skinparam shadowing false
+skinparam ArrowColor #4A5568
+skinparam ArrowFontColor #4A5568
+skinparam NoteBackgroundColor #FFFBEB
+skinparam NoteBorderColor #F59E0B
+' Layer palette — byte-identical across ALL 24 diagrams
+!$C_EDGE = "#2563EB"   /' frontend / edge '/
+!$C_APP  = "#7C3AED"   /' orchestrator / app logic '/
+!$C_GPU  = "#16A34A"   /' inference / GPU '/
+!$C_DATA = "#D97706"   /' storage / data '/
+!$C_EXT  = "#64748B"   /' external systems '/
+!$C_RISK = "#DC2626"   /' risk / trust boundary '/
+
+!include <C4/C4_Component>
+!include <tupadr3/common>
+!include <tupadr3/font-awesome-5/cogs>
+!include <tupadr3/font-awesome-5/cloud>
+!include <tupadr3/font-awesome-5/lock>
+!include <tupadr3/font-awesome-5/shield_alt>
+!include <tupadr3/font-awesome-5/database>
+!include <tupadr3/font-awesome-5/hdd>
+!include <tupadr3/font-awesome-5/microchip>
+!include <tupadr3/font-awesome-5/file_alt>
+!include <tupadr3/font-awesome-5/server>
+!include <logos/salesforce>
+!include <logos/nvidia>
+
+title sync-worker — C4 Level 3 (components)\nSingle-threaded 30-minute polling loop: watermark -> pull -> Parquet -> DuckDB upsert -> LanceDB -> watermark-commit\n(evidence: sync-worker/syncworker/main.py:106-194,259-301 · storage.py:92-167 · sf_client.py:104-258 · sf_auth.py:24-129 · secrets.py:118-181)
+
+AddElementTag("edge", $bgColor=$C_EDGE, $fontColor="#FFFFFF", $borderColor=$C_EDGE)
+AddElementTag("app",  $bgColor=$C_APP,  $fontColor="#FFFFFF", $borderColor=$C_APP)
+AddElementTag("gpu",  $bgColor=$C_GPU,  $fontColor="#FFFFFF", $borderColor=$C_GPU)
+AddElementTag("data", $bgColor=$C_DATA, $fontColor="#FFFFFF", $borderColor=$C_DATA)
+AddElementTag("ext",  $bgColor=$C_EXT,  $fontColor="#FFFFFF", $borderColor=$C_EXT)
+AddElementTag("risk", $bgColor=$C_RISK, $fontColor="#FFFFFF", $borderColor=$C_RISK)
+AddBoundaryTag("trust", $borderColor=$C_RISK, $fontColor=$C_RISK, $borderStyle="dashed", $borderThickness="2")
+AddBoundaryTag("pkg",   $borderColor=$C_APP,  $fontColor=$C_APP,  $borderStyle="dotted")
+AddRelTag("risky",  $textColor=$C_RISK, $lineColor=$C_RISK)
+AddRelTag("commit", $textColor=$C_DATA, $lineColor=$C_DATA, $lineThickness="2")
+
+System_Ext(sforg, "Salesforce org", "REST + Bulk API 2.0, v61.0. Read-only by construction: POST /services/oauth2/token; POST /jobs/query then poll and GET results as text/csv; GET /query with nextRecordsUrl paging; GET /sobjects and /sobjects/{name}/describe. 48 objects · 631 fields configured (sync-worker/config.yaml).", $sprite="salesforce", $tags="ext")
+Container_Ext(vembed, "vllm-embed", "Qwen/Qwen3-Embedding-0.6B · :30003", "OpenAI-compatible /embeddings on the DGX Spark. THE ONLY GPU call in the whole sync-worker (rag_index.py:47-50).", $sprite="nvidia", $tags="gpu")
+
+Boundary(credtb, "CREDENTIAL BOUNDARY — the RSA signing key lives on the shared `data` volume, which docker-compose.yml:269 also mounts into the orchestrator that executes LLM-generated SQL (secrets.py:50)", "filesystem + env", $tags="trust") {
+  ContainerDb_Ext(creds, "env vars + /data/sf_jwt_key.pem", "process env + PEM on the `data` volume", "SF_CLIENT_ID · SF_USERNAME · SF_LOGIN_URL · then ONE of SF_CLIENT_SECRET | SF_PRIVATE_KEY_FILE | SF_PRIVATE_KEY_B64 | DEFAULT_KEY_PATH. NO AWS Secrets Manager: fetch_sf_credentials does `del secret_name, region` (secrets.py:172) and boto3 is absent (requirements.txt).", $sprite="lock", $tags="risk")
+}
+
+Boundary(sw, "sync-worker — one container, ONE thread, ZERO async (Dockerfile:34 `python -m syncworker.main`, uid 10001)", "container", $tags="pkg") {
+
+  Component(m_main, "main.py", "the loop · 305 LOC · sync_object = 89 LOC", "while not flag.stop: open Store -> run_cycle -> close Store -> sleep(SYNC_INTERVAL_MINUTES × 60). Per object: watermark -> describe/adopt -> full|incremental pull -> per-batch land -> watermark commit (:106-194). Backoff 30 s doubling to a 30 min cap (:29-30,:298-299).", $sprite="cogs", $tags="app")
+
+  Boundary(auth, "credential + auth path", "package", $tags="pkg") {
+    Component(m_secrets, "secrets.py", "181 LOC · env only", "credentials_from_env resolution order (:118-160): (1) SF_CLIENT_SECRET short-circuits everything (:130-138); (2) SF_PRIVATE_KEY_FILE (:140); (3) SF_PRIVATE_KEY_B64, base64 validate=True (:141,144-149); (4) /data/sf_jwt_key.pem if it exists (:150-151); else None. __repr__/__str__ redact (:92-95).", $sprite="lock", $tags="app")
+    Component(m_auth, "sf_auth.py", "129 LOC · PyJWT RS256 + httpx", "build_jwt_assertion -> claims {iss, sub, aud, exp = now + 180} (:32-38). TokenManager caches the access token for TOKEN_TTL_SECONDS = 25 min (:47) and refreshes reactively via invalidate() on a 401 (:70-73). client_secret present -> client_credentials grant instead, no JWT (:78-90).", $sprite="shield_alt", $tags="app")
+  }
+
+  Boundary(pull, "extraction path", "package", $tags="pkg") {
+    Component(m_client, "sf_client.py", "258 LOC · httpx timeout 120 s", "Read-only by construction: GET/POST only (:132-133), Bulk operations limited to query|queryAll (:195-196), object + every field checked against ^[A-Za-z][A-Za-z0-9_]*$ (:78-83) and the watermark against a strict datetime regex (:96). bulk_query and soql_query are GENERATORS — pagination is lazy.", $sprite="cloud", $tags="app")
+    Component(m_objects, "objects.py", "394 LOC · CLI, not the loop", "`python -m syncworker.objects` list|add|add-fields|remove|import-sheet. Intersects an org 'Objects, Fields' spreadsheet with what the integration user can actually read via a live describe, then REWRITES config.yaml (:149-152).", $sprite="server", $tags="app")
+  }
+
+  Boundary(land, "landing + indexing path", "package", $tags="pkg") {
+    Component(m_storage, "storage.py", "167 LOC · duckdb + pyarrow", "normalize_records (:38-56) casts EVERY value to str|None; write_parquet_batch -> PARQUET_DIR/<obj>/<obj>_<stamp>_<uuid8>.parquet (:59-69); Store.upsert = BEGIN -> ALTER ADD COLUMN for drift -> DELETE WHERE Id IN (staging) -> INSERT BY NAME -> COMMIT, ROLLBACK on any error (:124-167). Watermarks live in `_sync_meta` (:23,:92-106).", $sprite="database", $tags="app")
+    Component(m_rag, "rag_index.py", "154 LOC · lazy lancedb", "OpenAIEmbedder.embed slices into fixed windows of EMBED_BATCH_SIZE = 32 (:25,:45-46). RagIndexer.index_records builds {text, object, record_id, field, system_modstamp} rows, embeds the whole batch in one call (:128), then DELETES ONE FILTER PER RECORD and re-adds (:141-144).", $tags="app")
+    Component(m_chunk, "chunking.py", "41 LOC · pure, stdlib-free", "chunk_text(text, 800, 100) — sliding windows of whitespace-separated words with 100-word overlap, step 700 (:10-11,:34-40). Not configurable anywhere; rag_index.py:116 passes neither argument.", $tags="app")
+  }
+
+  Boundary(sup, "configuration + observability", "package", $tags="pkg") {
+    Component(m_config, "config.py + config.yaml", "87 + 852 LOC", "Frozen Settings from 11 env vars (:33-51). load_object_configs validates every object/field name, requires Id AND SystemModstamp, and requires every rag_field to appear in fields (:61-87). config.yaml holds 48 objects · 631 fields · 61 rag_fields across 34 objects.", $tags="app")
+    Component(m_log, "jsonlog.py", "39 LOC", "One JSON object per line on stdout; every `extra=` key is promoted verbatim into the payload (:26-28). json.dumps(default=str) (:31) means a log call can never crash the worker.", $sprite="file_alt", $tags="app")
+  }
+}
+
+ContainerDb_Ext(parquet, "Parquet lake", "PARQUET_DIR = /data/parquet", "One immutable file per batch per object. No retention, no compaction, no cleanup anywhere in the repo.", $sprite="hdd", $tags="data")
+ContainerDb_Ext(duck, "DuckDB warehouse", "DUCKDB_PATH = /data/warehouse.duckdb", "One table per Salesforce object plus `_sync_meta`. One writer (this worker); the orchestrator opens the same file read_only (schema_cache.py:40-47).", $sprite="database", $tags="data")
+ContainerDb_Ext(lance, "LanceDB", "LANCEDB_DIR = /data/lancedb · table `chunks`", "fixed_size_list<float32>[dim] + text/object/record_id/field/system_modstamp. NO vector index is ever created, so search is a brute-force scan.", $sprite="database", $tags="data")
+Container_Ext(orchestrator, "orchestrator", "FastAPI · :8080", "Reads the warehouse read-only and searches LanceDB. Shares the same `data` volume, so it also sees the RSA signing key.", $tags="app")
+Container_Ext(stdout, "stdout — `docker logs`", "JSON lines", "The ONLY telemetry: no metrics, no HEALTHCHECK (Dockerfile:1-34), no `restart:` policy on the compose service (docker-compose.yml:291-334).", $tags="ext")
+
+Rel(m_main, m_config, "load_settings() + load_object_configs(config_path) — ONCE at startup, never re-read", "file I/O + env · blocking · main.py:261-262")
+Rel(m_main, m_secrets, "fetch_sf_credentials() — ONCE for the process lifetime", "in-process call · blocking · main.py:269")
+Rel(m_secrets, creds, "read env, then Path.read_bytes on the PEM; _check_pem rejects certificates and thumbprints", "file I/O · blocking · secrets.py:102-115,:150-151", $tags="risky")
+Rel(m_auth, m_secrets, "holds the SalesforceCredentials dataclass BY REFERENCE (not frozen)", "in-process · sf_auth.py:49-56")
+Rel(m_client, m_auth, "get_token() -> (access_token, instance_url); invalidate() on a 401", "in-process · blocking · sf_client.py:134,:140")
+Rel(m_auth, sforg, "POST {SF_LOGIN_URL}/services/oauth2/token — jwt-bearer assertion OR client_credentials", "HTTPS · form-encoded · blocking · timeout 30 s · sf_auth.py:83,:98", $tags="risky")
+
+Rel(m_main, m_storage, "1 · get_watermark(object) -> ISO8601 or NULL", "DuckDB SELECT on `_sync_meta` · blocking · main.py:114 -> storage.py:92-97", $tags="commit")
+Rel(m_main, m_client, "2 · cycle_start = now(UTC) captured BEFORE any network call; then describe_fields + adopt_new_fields", "HTTPS GET /sobjects/{name}/describe · blocking · main.py:115,:120-145")
+Rel(m_client, sforg, "3 · watermark IS NULL -> Bulk API 2.0 full extract (POST /jobs/query, poll, GET results as text/csv)\notherwise -> REST SOQL incremental WHERE SystemModstamp > watermark", "HTTPS · Bearer · blocking generator · sf_client.py:193-238,:242-258 <- main.py:147-154")
+Rel(m_main, m_storage, "4 · normalize_records -> DataFrame -> write_parquet_batch", "file I/O · blocking · main.py:164-166 -> storage.py:59-69")
+Rel(m_storage, parquet, "one <object>_<UTCstamp>_<uuid8>.parquet per batch", "file write · blocking · storage.py:64-68")
+Rel(m_main, m_storage, "5 · upsert(object, df) — DELETE by Id then INSERT BY NAME inside ONE transaction", "DuckDB · blocking · main.py:167 -> storage.py:149-161", $tags="commit")
+Rel(m_storage, duck, "CREATE TABLE AS on first sight; then ALTER ADD COLUMN + DELETE + INSERT, ROLLBACK on error", "DuckDB write · blocking · storage.py:138-164")
+Rel(m_main, m_rag, "6 · index_records(object, batch, rag_fields) — wrapped in try/except that only LOGS", "in-process · blocking · main.py:174-184")
+Rel(m_rag, m_chunk, "chunk_text(str(value)) per configured rag_field", "pure function · rag_index.py:116")
+Rel(m_rag, vembed, "POST {EMBED_VIA}/embeddings — {model, input: batch of 32}", "HTTP · JSON · blocking · timeout 300 s PER BATCH · rag_index.py:47-51", $tags="risky")
+Rel(m_rag, lance, "table.delete(record_id = '<id>') once PER RECORD, then table.add(rows)", "file I/O · blocking · rag_index.py:141-144")
+Rel(m_main, m_storage, "7 · set_watermark(object, cycle_start) — LAST, and only if the whole batch loop finished without raising", "DuckDB INSERT ... ON CONFLICT DO UPDATE, autocommitted · main.py:188 -> storage.py:99-106", $tags="commit")
+
+Rel(m_main, m_log, "setup_logging() then event=startup|object_sync_start|batch_stored|rag_indexed|object_sync_done|cycle_done|cycle_error|stopped", "in-process · blocking · main.py:260,:264-266,:293-297")
+Rel(m_log, stdout, "one JSON object per line", "stdout · blocking · jsonlog.py:35-39")
+Rel(m_objects, sforg, "import-sheet -> GET /services/data/v61.0/sobjects/{name}/describe, one round trip per object, serially", "HTTPS · blocking · timeout 60 s · objects.py:280-284", $tags="risky")
+Rel(m_objects, m_config, "rewrites config.yaml with a single non-atomic write_text", "file write · blocking · objects.py:149-152", $tags="risky")
+Rel_U(duck, orchestrator, "read_only=True + enable_external_access=False", "DuckDB · schema_cache.py:40-47 · sql.py:124-132")
+Rel_U(lance, orchestrator, "vector search over `chunks`", "lancedb · rag.py:43-49")
+Rel_U(creds, orchestrator, "SAME `data` volume is mounted into the orchestrator container", "docker volume · docker-compose.yml:269,:319", $tags="risky")
+
+note right of m_storage #FFFBEB
+  **CRASH SAFETY — the ordering above is deliberate**
+  The watermark at step 7 (main.py:188) runs only AFTER the
+  whole `for batch in batches` loop (main.py:163-184) has
+  completed without raising. Consequences, verified:
+  · **DuckDB: IDEMPOTENT.** upsert is DELETE-by-Id then
+    INSERT inside one transaction (storage.py:149-161) plus
+    an intra-batch drop_duplicates(keep='last') (:133).
+    Die after step 5 and before step 7 -> the watermark is
+    unchanged, the next cycle re-runs the SAME query and
+    re-upserts the SAME rows. It converges. CORRECT.
+  · **Cost:** if the watermark was NULL, the replay repeats
+    the ENTIRE Bulk full extract. There is no resumability,
+    no partial-progress marker and no reuse of the completed
+    Bulk job id.
+  · **Parquet: NOT idempotent.** Every replay writes NEW
+    files with a fresh uuid4().hex[:8] (storage.py:64-68);
+    the crashed run's partial files stay forever.
+  · **Salesforce DELETEs are never propagated** to DuckDB or
+    LanceDB by any code path in this worker.
+end note
+
+note right of m_rag #DC2626
+  **THE WATERMARK ADVANCES OVER A FAILED RAG INDEX**
+  main.py:177-184 catches every exception from
+  index_records, logs `event=rag_index_error`, and then
+  main.py:188 sets the watermark ANYWAY. Those chunks are
+  never retried — the records will not be re-fetched until
+  their SystemModstamp changes again. LanceDB silently
+  diverges from DuckDB.
+  Aggravating factors:
+  · No re-embedding guard at all: no content hash, no
+    system_modstamp comparison, no chunk-level dedup, so any
+    change to ANY field re-embeds every long-text chunk of
+    that record on the GPU (rag_index.py:97-154).
+  · `dim` is honoured only at table creation (:73-89);
+    changing EMBED_MODEL makes table.add fail forever.
+  · No retry, no backoff on the embed POST (:47-51) — a
+    single 503 from a reloading vllm-embed aborts the batch.
+  · timeout=300 s is PER 32-text batch (:41) with no overall
+    deadline across an unbounded number of batches.
+end note
+
+note bottom of m_client #FFFBEB
+  **UNBOUNDED POLL, NO RETRY, NO RATE-LIMIT REACTION**
+  · The Bulk job poll is `while True` at 5 s with NO cap, NO
+    wall-clock deadline and NO shutdown check
+    (sf_client.py:208-220) — a job stuck in InProgress spins
+    forever and blocks every other object, because run_cycle
+    is a plain sequential loop (main.py:239-243).
+  · The ONLY retry anywhere is a single 401 re-auth
+    (:138-143), which replays a POST and can create a second
+    Bulk query job for the same SOQL.
+  · No 429 / Retry-After handling. check_api_limits (:50-75)
+    only WARNS at >= 80 % of the daily API quota; it never
+    throttles, sleeps or aborts.
+  · csv.DictReader's default field limit is 131 072 chars —
+    exactly the Salesforce Long Text Area maximum — and
+    nothing raises it, so one full-size long-text value
+    raises `_csv.Error` at :233 and aborts that object's
+    entire extract.
+  · resp.text for a 10 000-row CSV page is materialised, then
+    copied into io.StringIO, then into dicts: ~3× peak RAM.
+end note
+
+note bottom of m_auth #FFFBEB
+  **CLOCK SKEW AND TTL ARE BOTH UNHANDLED**
+  · exp = wall-clock now + 180 s with NO iat, NO nbf, NO jti
+    and no skew allowance (sf_auth.py:20,:32-38). On a DGX
+    with drifting time the flow fails as an opaque
+    `RuntimeError: ... HTTP 400` (:121-123) that names
+    neither the clock nor the error_description.
+  · The except at :106-109 swallows every JSON-parse failure
+    into `error = ""`, so an HTML 502 from a proxy loses all
+    diagnostic content — only the status code survives.
+  · TOKEN_TTL_SECONDS = 25 min is a GUESS (:45-47): this
+    grant returns no expires_in. It self-heals via the 401
+    retry at the cost of an extra round trip.
+  · The token POST has NO retry and NO backoff (:83,:98) —
+    one transient 503 from login.salesforce.com raises and
+    kills the whole cycle (caught only at main.py:292).
+  · `assert` at :67 is control flow and is stripped by
+    `python -O`, after which get_token can return (None, None).
+end note
+
+note bottom of m_chunk #FFFBEB
+  **"TOKENS" ARE WHITESPACE WORDS**
+  chunk_text splits on `text.split()` (chunking.py:30), so a
+  minified JSON blob with no spaces is ONE token -> ONE chunk
+  of arbitrary size -> one embedding request far past the
+  model's context window. config.yaml deliberately indexes
+  12 JSON-bearing fields as rag_fields (config.yaml:547,
+  786-787, 794, 815-816, 827, 834, 841, 852) — exactly the
+  pathological input class. Conversely, 800 whitespace words
+  of indented JSON or Rich Text HTML is far more than 800
+  model tokens. There is no cap on chunks per field and no
+  cap on total text entering embed (rag_index.py:128).
+end note
+
+note bottom of m_main #FFFBEB
+  **STARTUP, SHUTDOWN AND LIVENESS**
+  · load_settings() and load_object_configs() run OUTSIDE the
+    try (main.py:261-262 vs the `try:` at :281), so a
+    non-numeric SYNC_INTERVAL_MINUTES or malformed config.yaml
+    crashes the process at startup. There is NO `restart:` on
+    the sync-worker compose service (docker-compose.yml:291-334)
+    while every other service has one — the container simply
+    stays dead.
+  · No HEALTHCHECK in the Dockerfile (1-34) and none in compose.
+  · flag.stop is read ONLY by _StopFlag.sleep (:48) and the
+    outer while (:280). Neither run_cycle, sync_object, the Bulk
+    poll loop nor the embedding loop checks it — a `docker stop`
+    during a full extract waits out the grace period and SIGKILLs.
+  · Interval drift: the sleep at :291 starts AFTER the cycle, so
+    the real period is interval + cycle duration.
+  · Silent degradation: `except Exception: return fields, rag_fields`
+    (:81-82) and `except Exception: return []` (:210-211) log
+    NOTHING at all.
+end note
+
+note bottom of m_config #FFFBEB
+  **CONFIG DRIFT AND A READ-ONLY MOUNT**
+  · config.yaml is read once at startup (main.py:262) and never
+    re-read, so editing the live-mounted file does nothing until
+    the container restarts.
+  · The compose mount is `:ro` (docker-compose.yml:324), so
+    `python -m syncworker.objects add ...` run INSIDE the
+    container — which README.md:217-231 instructs — fails at
+    objects.py:152. Only `list` works in-container.
+  · objects.py `_live_describe` conflates EVERY non-200 (401,
+    403 REQUEST_LIMIT_EXCEEDED, 429, 500) with "object not
+    readable" (:284), and main:364 then writes a config with
+    that object DELETED.
+  · SYNC_MAX_FIELDS defaults to 80 (config.py:39) while
+    objects.py caps an imported object at 60 (:168) — runtime
+    adoption immediately widens it back toward 80.
+  · Boolean parsing accepts anything not in ("0","false","no")
+    as true, so SYNC_AUTO_FIELDS=off silently means TRUE (:38).
+end note
+
+note right of m_storage #FFFBEB
+  **WAREHOUSE SHAPE**
+  normalize_records casts every value to str|None
+  (storage.py:38-56), so CREATE TABLE AS SELECT (:140) makes
+  EVERY DuckDB column VARCHAR — dates and numbers arrive at the
+  SQL-writing model as text. No PRIMARY KEY and no index is ever
+  created, so `DELETE ... WHERE Id IN (...)` (:156) is a full
+  table scan per batch. `_sync_meta` lives in schema `main`, so
+  the orchestrator's introspection query
+  (schema_cache.py:47-53) exposes the watermark table to the LLM
+  as if it were a business table. The module defines `log` at
+  :21 and never uses it: a Parquet or upsert failure emits no
+  telemetry from this file at all.
+end note
+
+legend right
+  |= colour |= layer |
+  |<#2563EB>   | frontend / edge |
+  |<#7C3AED>   | orchestrator / app logic |
+  |<#16A34A>   | inference / GPU |
+  |<#D97706>   | storage / data |
+  |<#64748B>   | external systems |
+  |<#DC2626>   | risk / trust boundary |
+  ----
+  **Notation**
+  Dashed red rectangle = trust boundary (credential material crossing a shared volume).
+  Red arrow = credential-bearing, externally-reachable or config-mutating hop.
+  Thick amber arrows 1 -> 5 -> 7 = the crash-safety ordering:
+  read watermark, land the data, THEN commit the watermark. Never the other way round.
+  Dotted purple rectangle = Python package grouping, not a process boundary.
+  Every arrow label is "what · protocol · sync|async · file:LINE".
+  Amber notes = retry / timeout / unbounded resource / swallowed exception, each anchored to a read file:LINE.
+  "blocking" is stated on every hop because this service has NO async code at all:
+  one thread, one cycle at a time, one object at a time (main.py:239-243).
+endlegend
+
+@enduml

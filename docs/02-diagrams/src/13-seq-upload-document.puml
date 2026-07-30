@@ -1,0 +1,248 @@
+@startuml 13-seq-upload-document
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName "Inter, Segoe UI, sans-serif"
+skinparam defaultFontSize 13
+skinparam roundCorner 8
+skinparam shadowing false
+skinparam ArrowColor #4A5568
+skinparam ArrowFontColor #4A5568
+skinparam NoteBackgroundColor #FFFBEB
+skinparam NoteBorderColor #F59E0B
+' Layer palette — byte-identical across ALL 24 diagrams
+!$C_EDGE = "#2563EB"   /' frontend / edge '/
+!$C_APP  = "#7C3AED"   /' orchestrator / app logic '/
+!$C_GPU  = "#16A34A"   /' inference / GPU '/
+!$C_DATA = "#D97706"   /' storage / data '/
+!$C_EXT  = "#64748B"   /' external systems '/
+!$C_RISK = "#DC2626"   /' risk / trust boundary '/
+
+skinparam ParticipantFontColor #FFFFFF
+skinparam ParticipantFontStyle bold
+skinparam DatabaseFontColor #FFFFFF
+skinparam DatabaseFontStyle bold
+skinparam ActorFontColor #DC2626
+skinparam ActorBorderColor #DC2626
+skinparam SequenceGroupBackgroundColor #F8FAFC
+skinparam SequenceGroupBorderColor #94A3B8
+skinparam SequenceLifeLineBorderColor #CBD5E1
+skinparam maxMessageSize 260
+
+title Document & dataset lifecycle — upload → magic-byte sniff → archive caps → profile → vision/report → PDF export → guarded download\n(evidence: uploads.py:66-157 · core/archive.py:134-292 · core/profile.py:52-246 · engines/document.py:26-76 · engines/report.py:214-283 · core/report_paths.py:23-48)
+
+box "TRUST BOUNDARY — everything left of this line is UNAUTHENTICATED\nrequire_user() never 401s (auth.py:95-97) · /chat, /reports and /reports/{filename} declare no dependency (main.py:56)" #FEF2F2
+  actor "Owner /\nany LAN client" as user
+  participant "frontend" as fe $C_EDGE
+end box
+participant "orchestrator\nuploads.py" as up $C_APP
+participant "core/archive" as arc $C_APP
+database "workspace_dir" as ws $C_DATA
+participant "core/profile" as prof $C_APP
+database "app.sqlite3" as sqlite $C_DATA
+participant "engines/document\n+ core/pdf" as doc $C_APP
+participant "vllm (MAIN)" as vllm $C_GPU
+participant "engines/report" as rep $C_APP
+participant "pandoc →\nweasyprint" as pandoc $C_EXT
+database "REPORTS_DIR" as reports $C_DATA
+participant "core/\nreport_paths" as rp $C_APP
+
+autonumber "<b>[00]"
+
+== A · Dataset upload — POST /uploads ==
+
+user -> fe : **POST /api/upload**\nmultipart · async
+note right of user #FEE2E2
+**No validation at the edge.**
+No content-type, size, field or
+filename check anywhere in
+frontend/app/api/upload/route.ts.
+The 10/25/200 MB limits at
+Composer.tsx:42,65,68 are
+**client-side only** — over-cap
+bytes still transit the Next.js
+process before rejection.
+end note
+fe -> up : **POST /uploads** · streamed\n`duplex:'half'` · signal fwd · async
+
+up -> up : `dataset_uploads_enabled`? → 404\n(uploads.py:72-73)
+up -> sqlite : `conversation_owner(cid)`\nsqlite3 · **blocking on the loop**
+note over up #FEE2E2
+**Ownership fails open.** `owner is not None and owner != user.id`
+(uploads.py:76-78) — an **unknown conversation id is ACCEPTED**.
+main.py:758 writes the same rule the strict way: two rules, one concept.
+end note
+
+up -> ws : `enforce_quota_and_ttl()` · rmtree\nWORKSPACE_TTL_HOURS=24 ·\nWORKSPACE_QUOTA_GB=20 (config.py:215-216)
+note over up #FEE2E2
+Bare `except Exception: pass` (uploads.py:88-90) — a wedged sweep is
+invisible. It `rmtree`s top-level workspace entries **with no lock**
+(core/repo.py:108,119): a concurrent upload can lose files mid-write.
+end note
+
+up -> ws : `_stream_to_disk` · 1 MiB chunks\nfile I/O · **blocking**
+note over up
+**CAP 1 of 6 — size.** `UPLOAD_MAX_MB` env,
+default **200** (config.py:172) → HTTP **413**
+(uploads.py:44-61). Overshoot ≈ one 1 MiB chunk.
+end note
+note over up #FEE2E2
+• **MIME is NEVER checked** — `file.content_type` is not read once in uploads.py.
+• **Extension never rejects** — it only selects the branch (uploads.py:97,101).
+• `_stream_to_disk` sits **outside** the try/except (`:92` vs `:96`): an `OSError`
+  is a **500 + orphaned tree**. Reachable — multipart `filename="/"` →
+  `basename("")` → `open(<root>/_original/,"wb")` → `IsADirectoryError`.
+end note
+
+up -> arc : `sniff_format` / `is_zip_container`\n**8 magic bytes** · sync
+note over arc
+**CAP 2 of 6 — magic-byte sniff.** zip|gzip|parquet|pdf|unknown
+(archive.py:74-93). A renamed `.csv` that is really a zip cannot
+pick its own reader. Used at uploads.py:98,101,109.
+end note
+
+alt zip container AND NOT .xlsx
+  arc -> arc : `extract_zip` → `check_zip_container`\n(archive.py:212-230)
+else .tar / .tar.gz / .tgz OR gzip sniff
+  arc -> arc : `extract_tar` (archive.py:233-282)
+else single data file — **including .xlsx**
+  arc -> arc : **an .xlsx IS a zip** → `check_zip_container(label="spreadsheet")`\n**before** it is stored or read (uploads.py:109-110);\nre-asserted a second time at core/profile.py:167
+end
+note over arc
+**CAPS 3-6 — the archive caps** (`check_zip_container`, `_write_member`, `extract_tar`)
+• **member count** ≤ `ARCHIVE_MAX_FILES`, default **10000** (config.py:178) — archive.py:145,243
+• **per-member ratio** ≤ `ARCHIVE_MAX_RATIO`, default **200** (config.py:179) — archive.py:166-172
+• **header total** ≤ `ARCHIVE_MAX_UNCOMPRESSED_MB`, default **2048** (config.py:175) — archive.py:173,272
+• **live streaming budget** — same MB cap re-checked every 64 KiB, does not trust
+  the header — archive.py:200-208
+Also: symlink reject (:153), `safe_member_name` (:96), `resolves_inside` zip-slip
+re-check before every write (:223, :266), `REFUSED_SUFFIXES` .pkl/.pyc/.so/.xlsm (:38).
+end note
+note over arc #FEE2E2
+• `ARCHIVE_MAX_DEPTH` (default 1, config.py:182) is **never read** — depth-1 is
+  hard-coded by the `continue` at archive.py:221 / :265.
+• The ratio cap is **zip-only** (unpacked at :235, then unused for tar)
+  and **exempts every member ≤ 1 MiB** (:168).
+• The byte budget is **per-call, not global** (:216) — N concurrent uploads may
+  each spend 2048 MB. **No wall-clock cap**, and it runs **on the event loop**.
+• Only `BadZipFile`/`TarError` become `ArchiveError`; `zf.open` can still raise
+  `KeyError`/`RuntimeError`/`NotImplementedError` (:226) → generic 400 + lost upload.
+end note
+arc -> ws : write members · `open(dest,"wb")` only —\nthis extractor can never create a symlink (:195)
+arc --> up : `ArchivePlan{members, total_uncompressed,\nnested_archives, skipped}` — nested archives\nare **listed, never opened**
+
+up -> prof : `profile_directory(extract_dir)`\nsync call · **blocking**
+prof -> prof : DuckDB **`:memory:`** connection;\n`autoinstall/autoload_known_extensions=false`,\nHTTP/S3 filesystems disabled (core/profile.py:52-62)
+prof -> ws : `read_csv_auto(SAMPLE_SIZE=20000, IGNORE_ERRORS=true)`\n`read_json_auto` / `read_parquet` · file I/O · read-only
+note over prof
+**The dataset is NEVER EXECUTED — only sampled.**
+What leaves the file: shape, dtypes, null rate, cardinality,
+numeric min/max, `PROFILE_TOP_VALUES`=**5**, and a
+`PROFILE_SAMPLE_ROWS`=**5** row sample with every cell
+clipped to `PROFILE_CELL_CHARS`=**200** (config.py:184-188).
+String columns deliberately carry **no min/max value** —
+the module's security contract, core/profile.py:1-20, :112-118.
+Bounds: `PROFILE_MAX_FILES`=**40**, `PROFILE_MAX_COLUMNS`=**60**.
+end note
+note over prof #FEE2E2
+`src` is an inline table function, not a materialised table, so **every**
+`con.execute` re-reads the file: **up to ≈183 full passes** for a 60-column
+CSV (core/profile.py:83-154) — all of it blocking the single event loop.
+Per-file failures are swallowed to a class name (:243-246).
+end note
+prof --> up : `List[profile dict]`
+up -> sqlite : `save_upload(status = ready | rejected | failed)`\nsqlite3 · blocking
+up --> fe : **200** `{upload_id, filename, bytes,\nfiles, notes[:20], profile}` · JSON
+fe --> user : 200 · JSON, always re-labelled\n`content-type: application/json`
+
+== B · PDF turn — POST /chat carrying base64 ==
+
+user -> fe : **POST /api/chat** · JSON `{pdf, pdf_filename}` · async
+fe -> doc : **POST /chat** → `run_pdf_engine`\n(main.py:553-557) · SSE reply
+doc -> doc : `render_pdf(base64)` — b64decode → pdfium →\n**MAX_PDF_PAGES=6** · **RENDER_SCALE=2.0** ·\n**MAX_TEXT_CHARS=24000**
+note over doc
+Those three are **hard-coded** at core/pdf.py:18-20 —
+no env var, not configurable.
+end note
+note over doc #FEE2E2
+• **No upper bound on the upload at all**: `ChatRequest.pdf` has no
+  `max_length` (main.py:196) and no middleware limits the body
+  (main.py:47-53 installs only CORS).
+• **No try/except anywhere** in document.py — `binascii.Error` (bad base64)
+  or `PdfiumError` (corrupt / password-protected PDF) ends the turn as a raw
+  `error` SSE frame carrying `str(exc)` verbatim (main.py:670-672).
+• The user-controlled `filename` is interpolated straight into the prompt,
+  unsanitised (document.py:42).
+end note
+doc -> vllm : `chat.completions.create(stream=True)` · HTTP/JSON\n6 PNG data-URLs + text · `max_tokens=12000` · async
+vllm --> doc : `token` / `reasoning` deltas · streaming
+doc --> fe : **SSE text/event-stream** — `token`, `reasoning`,\n`meta {"route":"vision"}` (document.py:37,75)
+note over doc #FEE2E2
+`meta.model` is **wrong for every PDF turn**: main.py:307-308 labels it
+`settings.vision_model`, but the call used `model_choice="smart"`
+(document.py:70) — the MAIN model.
+end note
+
+== C · Report generation → PDF export → guarded download ==
+
+user -> rep : **POST /chat** routed to `report`\n(graph.py:67-71, :103) · async
+rep -> vllm : plan call · `temperature=0.2` ·\n`max_tokens=5000` · async
+rep -> rep : ≤ **MAX_SECTIONS = 6** (report.py:37),\nexecuted **strictly sequentially**
+note over rep #FEE2E2
+The per-section handler catches bare `Exception` and pastes `str(exc)`
+**into the report body** (report.py:249-251). No overall time budget for
+6 × (SQL gen + retry + execute + prose call) plus 2 pandoc runs.
+end note
+rep -> pandoc : `asyncio.create_subprocess_exec("pandoc", md,\n"--standalone", "--resource-path", tmp, "-o", out)`\nthen again with `--pdf-engine=weasyprint` (report.py:103-116) · async
+note over pandoc #FEE2E2
+• **No timeout** — `await proc.communicate()` (report.py:117) waits forever;
+  weasyprint resolving a remote resource hangs the whole generation.
+• The two conversions are **unguarded** (report.py:257-258): `.docx` OK +
+  `.pdf` fail (missing weasyprint/pandoc) ⇒ `RuntimeError` escapes, the turn
+  ends in `error`, and `report_files` is never emitted **though the .docx exists**.
+• `--standalone` permits raw HTML/CSS from model output or warehouse rows,
+  rendered by an engine that resolves `file:` and `http:` (report.py:113).
+• Name = `slugify(title)-%Y%m%d-%H%M%S`, **second** resolution — two reports
+  with one title in the same second silently overwrite (report.py:228-229).
+end note
+pandoc -> reports : write `<base>.docx` + `<base>.pdf`\nfile I/O · blocking
+rep --> fe : `meta {"route":"report",\n"report_files":[{filename,type,size}]}` · SSE
+
+user -> fe : **GET /api/reports/{filename}** · async
+fe -> fe : `SAFE_FILENAME` regex + explicit `..` `/` `\` checks\n(frontend/app/api/reports/[filename]/route.ts:13,22-27)
+note over fe #FEE2E2
+`decodeURIComponent` at `:20` is **not** wrapped — a malformed escape
+(`%`) throws `URIError` → unhandled 500. The identical bug was found and
+fixed at chat/attach/[id]/route.ts:25-32 and never back-ported here.
+`_req.signal` is not forwarded: an aborted download leaves the upstream running.
+end note
+fe -> rp : **GET /reports/{filename}** · HTTP\n**no auth, no cookie** · async
+rp -> rp : `resolve_report_file` — reject `..`, `/`, `\`, absolute,\ndotfile, NUL; then `resolve()` + `is_relative_to(base)`\ndefeats symlink escape (report_paths.py:23-48)
+rp -> reports : `FileResponse(path)` · file I/O · blocking
+note over rp #FEE2E2
+**Path safety is solid; authorisation does not exist.**
+• `GET /reports` and `GET /reports/{filename}` declare **no `Depends`**
+  (main.py:257-259, :262-271) — stated as intentional at main.py:55-56.
+• **No extension allowlist** — every regular file in REPORTS_DIR is
+  downloadable — and that directory also receives
+  **CSV/XLSX exports of warehouse query results** (engines/sql.py:407-409).
+• `list_reports` has no try/except and no bound: a file removed between
+  `iterdir()` and `stat()` is a 500 (report_paths.py:57-60).
+end note
+reports --> user : **200** `application/octet-stream` · streamed
+
+legend right
+|= colour |= layer |
+| <back:#2563EB>      </back> | frontend / edge — Next.js route handlers |
+| <back:#7C3AED>      </back> | orchestrator / app logic — FastAPI, one event loop |
+| <back:#16A34A>      </back> | inference / GPU — vLLM |
+| <back:#D97706>      </back> | storage / data — workspace, SQLite, reports volume |
+| <back:#64748B>      </back> | external system / OS subprocess |
+| <back:#DC2626>      </back> | risk · trust boundary |
+|= notation |= meaning |
+| pink box | trust boundary — no credential of any kind crosses it |
+| amber note | control that IS enforced, with env var + default |
+| red note | risk: missing cap, swallowed exception, unbounded resource |
+| arrow label | protocol · payload · sync/async |
+endlegend
+
+@enduml

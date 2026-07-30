@@ -1,0 +1,425 @@
+@startuml 20-class-engines
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName "Inter, Segoe UI, sans-serif"
+skinparam defaultFontSize 13
+skinparam roundCorner 8
+skinparam shadowing false
+skinparam ArrowColor #4A5568
+skinparam ArrowFontColor #4A5568
+skinparam NoteBackgroundColor #FFFBEB
+skinparam NoteBorderColor #F59E0B
+' Layer palette — byte-identical across ALL 24 diagrams
+!$C_EDGE = "#2563EB"   /' frontend / edge '/
+!$C_APP  = "#7C3AED"   /' orchestrator / app logic '/
+!$C_GPU  = "#16A34A"   /' inference / GPU '/
+!$C_DATA = "#D97706"   /' storage / data '/
+!$C_EXT  = "#64748B"   /' external systems '/
+!$C_RISK = "#DC2626"   /' risk / trust boundary '/
+
+!include <tupadr3/common>
+!include <tupadr3/devicons2/python>
+!include <tupadr3/font-awesome-5/robot>
+!include <tupadr3/font-awesome-5/cogs>
+!include <tupadr3/font-awesome-5/exclamation_triangle>
+
+title The engine layer — an implied contract that nothing enforces\n(evidence: orchestrator/app/engines/__init__.py:1-69, graph.py:13-104, main.py:553-612)
+
+skinparam class {
+  BorderThickness 1
+}
+skinparam package {
+  BorderThickness 2
+}
+
+' ═══════════════════════════════════════════════════════════════════
+' The contract — duck-typed, no ABC, no Protocol
+' ═══════════════════════════════════════════════════════════════════
+interface "EngineContract" as EC <<implicit — NOT enforced>> #FEF9C3 {
+  //There is no ABC, no Protocol, no base class.//
+  //engines/__init__.py holds only recent_turns() and//
+  //3 prompt constants — __init__.py:6, :24, :35, :57//
+  ..expected shape (by convention only)..
+  +{abstract} async run_<x>_engine(
+  +    message: str,
+  +    history: Sequence[dict],
+  +    emit: Emit) : str
+  ..type alias, re-declared **12 times** independently..
+  Emit = Callable[[str, dict], Awaitable[None]]
+  ..streaming protocol — checked by nothing at runtime..
+  emit("token" | "reasoning" | "status" | "step" | "research", dict)
+  **emit("meta", dict) — exactly once, last**
+}
+
+' ═══════════════════════════════════════════════════════════════════
+' TRUST BOUNDARY — everything downstream runs on attacker-chosen input
+' ═══════════════════════════════════════════════════════════════════
+package "TRUST BOUNDARY — dispatch on UNAUTHENTICATED input\n//POST /chat has no auth dependency (main.py:274-275); require_user() can never 401 (auth.py:95-97);//\n//port 8080 is published on 0.0.0.0 (docker-compose.yml:272-273)//" as BOUND #back:FEF2F2;line:DC2626;line.dashed {
+
+  class "graph.py\n//LangGraph StateGraph//" as graph #EDE9FE {
+    Emit = Callable[[str, dict], Awaitable[None]]
+    <<12th independent copy — graph.py:13>>
+    --
+    _router_node() → route_request()   <<graph.py:30>>
+    conditional edges → **5 nodes only**:
+    sql · rag · vision · report · chat  <<graph.py:100-104>>
+  }
+
+  class "main.py — /chat request worker\n//the real dispatcher//" as worker #EDE9FE {
+    emit(event, data)  <<defined main.py:363-381>>
+    merges generation_id / input_trimmed / context into "meta"
+    --
+    bypasses the graph for: agent, document(pdf),
+    vision(image), url, repo, dataset, search
+    <<main.py:553-612>>
+  }
+}
+
+' ═══════════════════════════════════════════════════════════════════
+' Engines reached through graph.py
+' ═══════════════════════════════════════════════════════════════════
+package "engines/ — routed by graph.py" as ROUTED #F5F3FF {
+
+  class "engines.chat" as chat #EDE9FE {
+    +async run_chat_engine(message, history, emit,
+    +    *, mode, model_choice, effort) : str
+    <<chat.py:66>>
+    --
+    emits: reasoning, token, meta{route:"chat"}
+    **no try/except at all** — chat.py:90-105
+  }
+
+  class "engines.sql" as sql #EDE9FE {
+    +async run_sql_engine(message, history, emit) : str
+    <<sql.py:285 — **169 LOC**>>
+    +async generate_and_run_sql(question, *, history,
+    +    fetch_cap) : (sql, cols, rows)  <<sql.py:179>>
+    +async attach_chart(meta, message, columns, rows,
+    +    title) : ChartResult?  <<sql.py:214>>
+    --
+    5 terminal branches; falls through to live_sf on NoSuchTable
+  }
+
+  class "engines.rag" as rag #EDE9FE {
+    +async run_rag_engine(message, history, emit) : str  <<rag.py:127>>
+    +async select_context(query) : List[dict]  <<rag.py:91>>
+    -_RERANKER : tuple|None  <<module global, no lock — rag.py:25>>
+  }
+
+  class "engines.report" as report #EDE9FE {
+    +async run_report_engine(message, history, emit) : str
+    <<report.py:214 — 70 LOC>>
+    -async _run_pandoc(md, out, resource_dir)  <<report.py:102>>
+    --
+    imports two **private** symbols across modules:
+    rag._answer_messages, sql._ask_chart_model  <<report.py:26-28>>
+  }
+
+  class "engines.vision" as vision #FEE2E2 {
+    +async run_vision_engine(message, **image_base64**,
+    +    history, emit) : str  <<vision.py:66>>
+    --
+    **emit is the 4th parameter, not the 3rd**
+    **`history` is declared and never read** — vision.py:69
+    -extract_json_block() : dict?  <<dead code — vision.py:55-63>>
+  }
+}
+
+' ═══════════════════════════════════════════════════════════════════
+' Engines the /chat worker calls directly — signatures diverge further
+' ═══════════════════════════════════════════════════════════════════
+package "engines/ — dispatched directly by main.py" as DIRECT #F5F3FF {
+
+  class "engines.agent" as agent #EDE9FE {
+    +async run_agent_engine(message, history, emit,
+    +    *, effort, salesforce, web) : str  <<agent.py:631>>
+    -async _run_step_impl(step, …) : (out, detail, meta)
+    <<agent.py:233 — **134 LOC**>>
+    -async execute_steps(plan, history, emit, …)
+    <<agent.py:369 — asyncio.Semaphore(3)>>
+    MAX_STEPS = 8 · STEP_CONCURRENCY = 3  <<agent.py:36-37>>
+    _compiled : CompiledGraph|None
+    <<module global, no lock — agent.py:621>>
+  }
+
+  class "engines.search" as search #FEE2E2 {
+    +async run_search_engine(message, history, emit,
+    +    **effort="medium"**) : str  <<search.py:460>>
+    +async research_step(question, history, effort,
+    +    emit) : (answer, sources)  <<search.py:420>>
+    --
+    **4th arg is positional, not keyword-only** (unlike chat/agent)
+    `research_step` takes emit **last and Optional** — a 2nd shape
+    -_cache / -_rate : dict
+    <<module globals, unbounded — search.py:125,140>>
+  }
+
+  class "engines.dataset" as dataset #FEE2E2 {
+    +async run_dataset_engine(message, **conversation_id**,
+    +    history, emit, *, model_choice, effort) : str
+    <<dataset.py:87>>
+    --
+    **emit is the 4th parameter**
+  }
+
+  class "engines.url" as url #FEE2E2 {
+    +async run_url_engine(message, **urls**,
+    +    **conversation_id**, history, emit) : str  <<url.py:80>>
+    --
+    **emit is the 5th parameter**
+  }
+
+  class "engines.repo" as repo #FEE2E2 {
+    +async run_repo_engine(message, **ref**,
+    +    **conversation_id**, history, emit) : str  <<repo.py:153>>
+    --
+    **emit is the 5th parameter**
+  }
+
+  class "engines.document" as document #FEE2E2 {
+    +async run_pdf_engine(message, **pdf_base64**,
+    +    **filename**, history, emit) : str  <<document.py:26>>
+    --
+    **emit is the 5th parameter**; name is not run_*_engine
+    reports meta{route:"**vision**"} — document.py:37, :75
+  }
+}
+
+' ═══════════════════════════════════════════════════════════════════
+' NOT engines — the contract violations
+' ═══════════════════════════════════════════════════════════════════
+package "in engines/ but NOT engines" as NOTENG #FEF2F2 {
+
+  class "engines.router" as router #FECACA {
+    +async route_request(message, has_image=False,
+    +    history=()) : str  <<router.py:92>>
+    +parse_route(text) : str?  <<router.py:52>>
+    ROUTES = (sql, rag, vision, report, chat)  <<router.py:17>>
+    --
+    **NO `emit` parameter · emits NOTHING · returns a route string**
+    terminal fallback: `return "rag"`  <<router.py:133>>
+  }
+
+  class "engines.orchestrate" as orchestrate #FECACA {
+    +async decide(message, history, effort) : **Plan**
+    <<orchestrate.py:127>>
+    +describe(plan) : str  <<orchestrate.py:159>>
+    +class Plan(agent: bool, search: bool, auto: bool)
+    <<orchestrate.py:77-81>>
+    --
+    **NO `emit` · emits NOTHING · returns a dataclass, not str**
+    dead import `settings` (:36) · dead field `Plan.auto` (:81)
+  }
+
+  class "engines.live_sf" as livesf #FECACA {
+    +async fetch_live(question, history=()) : (soql, rows)
+    <<live_sf.py:140>>
+    +async fetch_schema(question) : (kind, text)  <<live_sf.py:111>>
+    +describe_rows(rows, limit=30) : str  <<live_sf.py:148>>
+    --
+    **NO `emit` · never on a route · not in graph.py, not in main.py**
+    a **helper called from inside** sql.py:318-319 and agent.py:291
+    `history` declared on write_soql/fetch_live and **never used**
+  }
+}
+
+' ═══════════════════════════════════════════════════════════════════
+' Shared core services every engine leans on
+' ═══════════════════════════════════════════════════════════════════
+package "shared core services" as CORE #F0FDF4 {
+  class "app.llm" as llm #DCFCE7 {
+    +async stream_chat_events(messages, *, model_choice,
+    +    effort, …) : AsyncIterator[(kind, text)]  <<llm.py:212>>
+    +async chat_completion(...) : str  <<llm.py:91>>
+    +async stream_chat_completion(...)  <<llm.py:117>>
+    +async router_chat_completion(...)  <<llm.py:270>>
+    +async embed_texts(texts) : List[List[float]]  <<llm.py:330>>
+  }
+  class "engines.__init__" as base #DCFCE7 {
+    +recent_turns(history, n) : List[dict]  <<__init__.py:6>>
+    NO_DATA_MESSAGE · DIAGRAM_INSTRUCTION
+    CODE_INSTRUCTION  <<__init__.py:24, :35, :57>>
+  }
+  class "core.sql_guard + core.schema_cache" as guard #DCFCE7 {
+    +guard_sql(raw) : str  <<sql_guard.py:129>>
+    +schema_cache.get(path) : dict
+    <<schema_cache.py — read_only DuckDB>>
+  }
+  class "core.chart_pipeline" as chartp #DCFCE7 {
+    +async build_chart(...) : ChartResult?
+    <<chart_pipeline.py:94 — never raises>>
+  }
+  class "core.net" as net #DCFCE7 {
+    +async safe_fetch(url, *, timeout_ms, max_bytes,
+    +    accept)  <<net.py:103 — SSRF choke point>>
+  }
+  class "app.db" as db #DCFCE7 {
+    +get_uploads / get_url_documents / save_repo
+    +search_repo_chunks / add_message / list_messages …
+    **every function is synchronous sqlite3**  <<db.py:195-205>>
+  }
+}
+
+' ── realization of the implied contract ────────────────────────────
+chat     .[#7C3AED].|> EC
+sql      .[#7C3AED].|> EC
+rag      .[#7C3AED].|> EC
+report   .[#7C3AED].|> EC
+agent    .[#7C3AED].|> EC : "conforming shape:\n(message, history, emit)"
+vision   .[#DC2626,bold].|> EC
+search   .[#DC2626,bold].|> EC
+dataset  .[#DC2626,bold].|> EC
+url      .[#DC2626,bold].|> EC
+repo     .[#DC2626,bold].|> EC
+document .[#DC2626,bold].|> EC : "**divergent shape:**\nemit moves to arg 4 or 5"
+
+router      .[#DC2626,bold].> EC : "**VIOLATION** — no emit,\nnot an engine"
+orchestrate .[#DC2626,bold].> EC : "**VIOLATION** — no emit,\nreturns Plan not str"
+livesf      .[#DC2626,bold].> EC : "**VIOLATION** — no emit,\nnot routed; called from sql/agent"
+
+' ── dispatch edges ─────────────────────────────────────────────────
+graph  -[#7C3AED]-> router : "await route_request(...)\nin-process · async · 1-2 model calls"
+graph  -[#7C3AED]-> ROUTED : "await run_*_engine(msg, history, emit)\nin-process · async"
+worker -[#7C3AED]-> graph  : "get_graph().ainvoke(state)\nmain.py:633 · async"
+worker -[#7C3AED]-> orchestrate : "await decide(text, history, effort)\n**before the first status event** · main.py:412"
+worker -[#7C3AED]-> DIRECT : "await run_*_engine(... emit ...)\nin-process · async · graph bypassed"
+
+' ── calls into shared services ─────────────────────────────────────
+ROUTED -[#16A34A]-> llm   : "OpenAI-compatible HTTP\n/v1/chat/completions · SSE · async"
+DIRECT -[#16A34A]-> llm   : "OpenAI-compatible HTTP\n· async"
+sql    -[#16A34A]-> guard : "guard_sql(raw) → _execute()\n**sync DuckDB on the event loop** · sql.py:201,206"
+sql    -[#16A34A]-> chartp: "await build_chart(...)\nnever raises · sql.py:426"
+sql    -[#DC2626,bold]-> livesf : "NoSuchTable ⇒ live production org\nHTTPS · SOQL · sql.py:318-319"
+agent  -[#DC2626,bold]-> livesf : "step.kind=='salesforce'\nHTTPS · SOQL · agent.py:291"
+search -[#16A34A]-> net   : "await safe_fetch(url)\nHTTP(S) to arbitrary hosts · async"
+url    -[#16A34A]-> net   : "await safe_fetch(url)\nHTTP(S) · async"
+DIRECT -[#D97706]-> db    : "sqlite3 read/write\n**blocking file I/O on the event loop**"
+ROUTED -[#64748B,dashed]-> base : "recent_turns() + prompt constants\npure, in-process"
+DIRECT -[#64748B,dashed]-> base : "recent_turns() + prompt constants"
+
+' ═══════════════════════════════════════════════════════════════════
+' Notes — the actual findings
+' ═══════════════════════════════════════════════════════════════════
+note top of EC #FEF9C3
+  **There is genuinely no interface object in this codebase.**
+  `rg` over `orchestrator/app/engines/` finds no `ABC`, no
+  `Protocol`, no base class. `engines/__init__.py` contains one
+  helper and three prompt strings (__init__.py:6, :24, :35, :57).
+
+  The `Emit` alias is **copy-pasted into 12 modules**, each an
+  independent declaration that can drift without a type error:
+  chat.py:22 · agent.py:34 · graph.py:13 · sql.py:26 · rag.py:23
+  search.py:28 · report.py:30 · repo.py:20 · url.py:20
+  document.py:15 · vision.py:19 · dataset.py:25
+
+  Nothing checks at runtime that an engine returns `str`, that it
+  emits `meta` at all, or that it emits it only once. The rule is
+  written in comments only (graph.py:32-35, agent.py:604, chat.py:103).
+end note
+
+note bottom of vision #FEE2E2
+  **Signature drift — the contract's third parameter is not stable.**
+  `emit` sits at position 3 in chat/sql/rag/report/agent, position 4
+  in vision (vision.py:66) and dataset (dataset.py:87), and position 5
+  in url (url.py:80), repo (repo.py:153) and document (document.py:26).
+  `search` adds a 4th **positional** `effort` where chat and agent make
+  the same knob keyword-only (search.py:460 vs chat.py:66, agent.py:631).
+
+  Because there is no Protocol, none of this is a type error — it is
+  only ever caught by the call site being written correctly by hand.
+  `vision.run_vision_engine` even accepts `history` and never reads it
+  (vision.py:69), so follow-up questions about an image reach the model
+  with zero conversational context.
+end note
+
+note right of router #FFE4E6
+  **router.py — 2 swallowed exceptions, 0 log lines, no timeout.**
+  `except Exception: pass` at router.py:121-122 and :130-131 hide
+  connection-refused, HTTP 400 window errors and read timeouts
+  identically. The only bound is the 300 s OpenAI client timeout
+  (llm.py:78) applied twice: a wedged router endpoint plus a wedged
+  main endpoint costs **600 s** before the unconditional
+  `return "rag"` at router.py:133 — i.e. a total classifier outage
+  silently routes greetings into the vector-search engine.
+
+  There is no confidence score anywhere: `parse_route` returns a
+  route or `None`, never a probability (router.py:52-80).
+end note
+
+note right of orchestrate #FFE4E6
+  **orchestrate.decide runs on every text turn, unguarded.**
+  `except Exception → Plan(False, False)` (orchestrate.py:142-144)
+  and the same in `parse_plan` (:104-106) — no log, no retry, no
+  per-call timeout. It is awaited at main.py:412, **before** the
+  first `status` event is published at main.py:415, so a slow
+  router endpoint is indistinguishable from a hung request in the UI.
+
+  `_JSON_RE = \{.*\}` is greedy (:38) and, unlike router.py and
+  agent.py, this parser strips neither `<think>` blocks nor code
+  fences — two JSON objects in one reply silently downgrade the plan.
+end note
+
+note right of livesf #FFE4E6
+  **live_sf is a helper masquerading as an engine module.**
+  It lives in `engines/` and is never routed — `sql.py:318-319`
+  imports it lazily on the `NoSuchTable` branch and `agent.py:291`
+  on a `salesforce` step. Both reach the **live production org**
+  over HTTPS, so an engine failure mode escalates to a real CRM read.
+
+  `_object_hint` swallows everything to `""` (live_sf.py:57-58) and
+  `fetch_schema` swallows each describe failure (`continue`, :121-122).
+  `core/salesforce.py:123-131` does not wrap the token POST in `try`,
+  so a `ConnectError` escapes as a raw httpx exception — and
+  `agent.py:295` catches only `(SalesforceUnavailable, UnsafeSoql)`,
+  aborting the whole agent step chain on a network blip.
+end note
+
+note bottom of agent #FFE4E6
+  **agent.py swallows per step and ships the raw exception to the browser.**
+  `except Exception` at agent.py:387 turns any step failure into
+  `output = "Step failed: …"` with `str(exc)[:200]` emitted as
+  `step.detail` (agent.py:388-392) — stack-adjacent text rendered in the UI.
+  `asyncio.gather` at agent.py:405 is called **without**
+  `return_exceptions=True`, so a `CancelledError` on Stop aborts the
+  gather and leaves sibling coroutines running.
+
+  **No timeout exists anywhere in the engine layer** — `rg 'wait_for|timeout'`
+  over `engines/*.py` matches only url.py:36 and search.py:315/338.
+  The single bound is the 300 s client timeout (llm.py:78) with the
+  installed SDK's `DEFAULT_MAX_RETRIES == 2` ⇒ **900 s worst case per
+  LLM call**, and 24 lines of unreachable duplicate Salesforce branch
+  sit at agent.py:312-335.
+end note
+
+note bottom of db #FFE4E6
+  **Blocking I/O inside `async def` — the layer-wide defect.**
+  `db.*` is entirely synchronous `sqlite3` (db.py:195-205) yet is
+  awaited-adjacent from async engines: dataset.py:97, url.py:88/93,
+  repo.py:43/44/122/125. So is `sql._execute` (sql.py:117, called at
+  :201 and :206), `schema_cache.get` (sql.py:189/191),
+  `lancedb.search(...).to_list()` (rag.py:43-49),
+  `render_chart_png` (report.py:190) and `subprocess.run(git clone,
+  timeout=180)` (core/repo.py:182).
+
+  `report._run_pandoc` awaits `proc.communicate()` with **no timeout**
+  (report.py:117) — a weasyprint fetch of a remote resource hangs the
+  generation forever. The codebase knows the pattern: `net.py:121`
+  deliberately pushes a blocking `getaddrinfo` onto `asyncio.to_thread`.
+end note
+
+legend right
+  |= Colour |= Meaning |
+  |<#FEF9C3> | the implied contract — **no ABC / no Protocol exists** |
+  |<#EDE9FE> | conforming engine or dispatcher (orchestrator / app logic) |
+  |<#FEE2E2> | engine whose **signature diverges** from the contract |
+  |<#FECACA> | **not an engine at all** — no `emit`, never routed |
+  |<#DCFCE7> | shared core service |
+  Notation:
+  `..|>` purple dashed = satisfies the implied shape
+  `..|>` red bold      = "implements" it only loosely (emit moved)
+  `..>`  red bold      = declared in `engines/` but violates the contract
+  Solid arrow = in-process `await`; label gives protocol + payload + sync/async.
+  Dashed red rectangle = trust boundary (unauthenticated `POST /chat`).
+end legend
+
+@enduml

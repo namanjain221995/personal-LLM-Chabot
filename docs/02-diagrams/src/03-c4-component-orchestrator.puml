@@ -1,0 +1,351 @@
+@startuml 03-c4-component-orchestrator
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName "Inter, Segoe UI, sans-serif"
+skinparam defaultFontSize 13
+skinparam roundCorner 8
+skinparam shadowing false
+skinparam ArrowColor #4A5568
+skinparam ArrowFontColor #4A5568
+skinparam NoteBackgroundColor #FFFBEB
+skinparam NoteBorderColor #F59E0B
+' Layer palette — byte-identical across ALL 24 diagrams
+!$C_EDGE = "#2563EB"   /' frontend / edge '/
+!$C_APP  = "#7C3AED"   /' orchestrator / app logic '/
+!$C_GPU  = "#16A34A"   /' inference / GPU '/
+!$C_DATA = "#D97706"   /' storage / data '/
+!$C_EXT  = "#64748B"   /' external systems '/
+!$C_RISK = "#DC2626"   /' risk / trust boundary '/
+
+!include <C4/C4_Component>
+!include <tupadr3/common>
+!include <tupadr3/font-awesome-5/server>
+!include <tupadr3/font-awesome-5/network_wired>
+!include <tupadr3/font-awesome-5/robot>
+!include <tupadr3/font-awesome-5/search>
+!include <tupadr3/font-awesome-5/shield_alt>
+!include <tupadr3/font-awesome-5/lock>
+!include <tupadr3/font-awesome-5/database>
+!include <tupadr3/font-awesome-5/chart_bar>
+!include <tupadr3/font-awesome-5/file_alt>
+!include <logos/nextjs>
+
+title Orchestrator — C4 Level 3 (components)\nFastAPI entrypoint + LangGraph router -> the engines/ layer -> the core/ support layer\n(evidence: orchestrator/app/main.py:274-685 · graph.py:90-107 · engines/*.py · core/*.py)
+
+AddElementTag("edge", $bgColor=$C_EDGE, $fontColor="#FFFFFF", $borderColor=$C_EDGE)
+AddElementTag("app",  $bgColor=$C_APP,  $fontColor="#FFFFFF", $borderColor=$C_APP)
+AddElementTag("gpu",  $bgColor=$C_GPU,  $fontColor="#FFFFFF", $borderColor=$C_GPU)
+AddElementTag("data", $bgColor=$C_DATA, $fontColor="#FFFFFF", $borderColor=$C_DATA)
+AddElementTag("ext",  $bgColor=$C_EXT,  $fontColor="#FFFFFF", $borderColor=$C_EXT)
+AddElementTag("risk", $bgColor=$C_RISK, $fontColor="#FFFFFF", $borderColor=$C_RISK)
+AddBoundaryTag("trust", $borderColor=$C_RISK, $fontColor=$C_RISK, $borderStyle="dashed", $borderThickness="2")
+AddBoundaryTag("pkg",   $borderColor=$C_APP,  $fontColor=$C_APP,  $borderStyle="dotted")
+AddRelTag("risky", $textColor=$C_RISK, $lineColor=$C_RISK)
+
+Container_Ext(frontend, "frontend", "Next.js 15 / React 19 · :3000", "Browser SPA. Decodes exactly 8 SSE event names (frontend/lib/sse.ts:129-210); anything else is dropped.", $sprite="nextjs", $tags="edge")
+
+Boundary(tb, "TRUST BOUNDARY — unauthenticated HTTP surface (auth.py:89-97 never 401s; main.py:55-56)", "network", $tags="trust") {
+
+  Boundary(orch, "orchestrator — one uvicorn worker, one event loop (orchestrator/Dockerfile:52)", "container", $tags="pkg") {
+
+    Component(main_py, "main.py", "FastAPI 796 LOC · chat() = 412 LOC", "Routes /health /reports* /chat /chat/stop /chat/active /chat/compact /chat/attach. Owns LiveGeneration (:62), the emit() closure (:364-381) and the 9-branch engine dispatch (:551-643).", $sprite="server", $tags="app")
+    Component(graph_py, "graph.py", "LangGraph · 117 LOC", "Salesforce-mode fallback graph: entry node `router` fans out to exactly 5 engine nodes, each -> END (:92-106). Compiled once into the `_compiled` global (:110-117).", $sprite="network_wired", $tags="app")
+
+    Boundary(eng, "engines/ — 14 modules drawn as 13 components (vision.py and document.py both report route 'vision'). No ABC and no Protocol: the contract is a duck-typed `Emit = Callable[[str, dict], Awaitable[None]]` re-declared three times (chat.py:22, agent.py:34, graph.py:13)", "package", $tags="pkg") {
+      Component(e_orch, "orchestrate.py", "pre-flight planner · 167 LOC", "One non-thinking router-model call decides {agent, search}; the effort level is a ceiling the classifier can only narrow (ALLOWED :114-119). Emits NO SSE events.", $tags="app")
+      Component(e_router, "router.py", "classifier · 133 LOC", "Classifies into ROUTES = (sql, rag, vision, report, chat) (:17). has_image short-circuits to `vision` (:103). Terminal default is `rag` (:133). Emits NO SSE events.", $tags="app")
+      Component(e_agent, "agent.py", "LangGraph subgraph · 658 LOC", "PLAN -> EXECUTE -> SYNTHESIZE. <=8 pydantic-validated steps, Semaphore(3). EMITS: step (:382,391,400) · reasoning (:599) · token (:602) · one merged meta (:605).", $sprite="robot", $tags="app")
+      Component(e_chat, "chat.py", "plain stream · 105 LOC", "Assistant mode + the `chat` router class. EMITS: reasoning (:98) · token (:101) · meta {route:'chat'} (:104).", $tags="app")
+      Component(e_sql, "sql.py", "NL->DuckDB SQL · 453 LOC", "schema -> LLM SELECT -> guard -> read-only DuckDB -> 1 error-fed retry -> capped preview + export + chart -> streamed narrative. EMITS: token · status (:317) · meta (:288,314,330,347,359,394,452).", $tags="app")
+      Component(e_rag, "rag.py", "vector RAG · 151 LOC", "embed -> LanceDB top-30 -> optional Qwen3-Reranker top-8 -> cited answer. EMITS: token (:133,143) · meta {route:'rag', citations} (:150).", $tags="app")
+      Component(e_search, "search.py", "web research · 504 LOC", "rewrite -> provider -> round-robin merge -> SSRF-safe fetch -> tiered context. EMITS: status (:403,464,477) · research (:230,446,454,478,485) · token/reasoning · meta (:416,494).", $sprite="search", $tags="app")
+      Component(e_live, "live_sf.py", "NL->SOQL · 150 LOC", "write_soql -> guard_soql -> live org query; is_schema_question -> describe/sobjects. Emits nothing itself — sql.py and agent.py emit on its behalf.", $tags="app")
+      Component(e_repo, "repo.py", "GitHub Q&A · 183 LOC", "shallow_clone -> index -> overview; later turns answer from chunks with path:Lstart-Lend. EMITS: status (:31,37,40) · token (:131,166,173) · meta {route:'repo'} (:135,167,176).", $tags="app")
+      Component(e_url, "url.py", "pasted-link reader · 123 LOC", "safe_fetch -> extract -> store per conversation -> answer with [n] citations. EMITS: status (:32,41,44,49) · token (:96,104) · meta {route:'url'} (:97,108).", $tags="app")
+      Component(e_ds, "dataset.py", "upload Q&A · 130 LOC", "Answers from the STORED PROFILE only — never the file bytes. The ONLY engine that fences its context as untrusted data (DATA_START/DATA_END :27-28,71). EMITS: token (:100) · meta (:101,115).", $tags="app")
+      Component(e_vis, "vision.py + document.py", "multimodal · 96 + 76 LOC", "Image -> data URL (vision.py:38-52); PDF -> <=6 rendered pages + text (document.py:33). BOTH report route 'vision' (document.py:5,37,75). EMITS: token/reasoning · meta (vision.py:95, document.py:37,75).", $tags="app")
+      Component(e_report, "report.py", "docx/pdf builder · 283 LOC", "Plans <=6 sections, fills them via sql.py / rag.py, renders chart PNGs, then two pandoc subprocesses. EMITS: token (:280) · meta {route:'report', report_files} (:282).", $sprite="file_alt", $tags="app")
+    }
+
+    Boundary(cg, "core/ — GUARDS: the only application-layer barriers (blocklist-based; each is one bypass deep)", "package", $tags="trust") {
+      Component(c_guard, "sql_guard.py", "166 LOC · stdlib only", "guard_sql (:129) must reduce LLM SQL to one read-only SELECT/WITH. Hand-written scanner _scan (:57-126) strips comments + literals into `bare`, checks `bare`, but EXECUTES `cleaned` (:156).", $sprite="shield_alt", $tags="risk")
+      Component(c_net, "net.py", "162 LOC · httpx 0.28.1", "The single SSRF choke point (safe_fetch :103-162): scheme allow-list, pre-resolve every A/AAAA, block private/loopback/link-local/reserved, re-validate each of <=3 redirect hops, cap body at max_bytes.", $sprite="lock", $tags="risk")
+    }
+
+    Boundary(cd, "core/ — DATA & SCHEMA", "package", $tags="pkg") {
+      Component(c_schema, "schema_cache.py", "74 LOC · TTL 300 s", "SchemaCache.get(duckdb_path) -> {table: [(col, dtype)]} from information_schema.columns on a read_only + enable_external_access=false connection (:40-55). Module singleton at :74.", $sprite="database", $tags="data")
+      Component(c_dict, "sf_dictionary.py", "192 LOC", "Maps user vocabulary -> real Salesforce API names from an org export; hint_for(question) is prepended to both the SQL and the SOQL prompt.", $tags="data")
+      Component(c_sf, "salesforce.py", "268 LOC", "guard_soql (:55-90) + _authenticate (:111-141) + run_soql (:144-174) against the LIVE production org. MAX_ROWS = 200 (:29). Module-global _token singleton (:108).", $tags="data")
+      Component(c_cite, "citations.py", "47 LOC · pure", "build_citations(hits) -> [{record_id, object, url}] with url = SF_LIGHTNING_BASE_URL/<record_id> (:15). Dedupes on record_id (:43-45).", $tags="data")
+    }
+
+    Boundary(cc, "core/ — CHARTS & EXPORT", "package", $tags="pkg") {
+      Component(c_chart, "chart_pipeline.py", "247 LOC", "build_chart (:94-117) — the single entry point shared by sql.py, agent.py and report.py: decide -> optionally ask the model -> validate -> prepare data. Documented never to raise.", $sprite="chart_bar", $tags="data")
+      Component(c_png, "charts_png.py", "231 LOC · matplotlib Agg", "render_chart_png (:69-133) — the only SERVER-side renderer, for pandoc embedding. PNG_SUPPORTED = 8 types, funnel excluded (:41-48). The browser draws the same spec with ECharts.", $tags="data")
+      Component(c_exp, "exports.py + report_paths.py", "125 + 69 LOC", "cap_rows / apply_export_cap (PREVIEW 500, EXPORT 100 000) + export_csv / export_xlsx into REPORTS_DIR; resolve_report_file rejects .., separators, absolutes, dotfiles, NUL and symlink escape (report_paths.py:23-48).", $tags="data")
+    }
+
+    Boundary(ci, "core/ — INGESTION & EXTRACTION", "package", $tags="pkg") {
+      Component(c_extract, "extract.py + pdf.py", "108 + 67 LOC", "extract_readable(content_type, body) -> trafilatura / pypdfium2 / tag-strip; render_pdf -> <=6 pages at scale 2.0 as PNG data URLs plus <=24 000 chars of text layer (pdf.py:18-20).", $tags="data")
+      Component(c_arch, "archive.py + profile.py", "292 + 251 LOC", "Hostile-archive handling for /uploads: magic-byte sniff, zip-slip + symlink/device rejection, 4 independent bomb caps, depth-1 nesting; then DuckDB :memory: profiling of the extracted files.", $tags="data")
+      Component(c_repoidx, "repo_index.py + urls.py", "54 + 85 LOC", "index_repo -> <=6 000 chunks of 60 lines with 10-line overlap; extract_urls + select_relevant reduce a fetched page to the part that overlaps the question.", $tags="data")
+    }
+  }
+}
+
+Rel(frontend, main_py, "POST /chat — {message, mode, effort, agent, web_search, image/pdf base64}", "HTTP · JSON · async · NO auth dependency (main.py:274-275)", $tags="risky")
+Rel_U(main_py, frontend, "token · reasoning · status · step · research · meta · done · error", "SSE text/event-stream · async · one detached asyncio.Task per generation (main.py:679-685)")
+
+Rel(main_py, e_orch, "decide(text, history, effort) -> Plan(agent, search)", "in-process await · async · main.py:412")
+Rel(main_py, graph_py, "get_graph().ainvoke(ChatState) — fallback when no earlier branch matched", "await · async · main.py:633-643")
+Rel(main_py, e_agent, "run_agent_engine(salesforce = mode != 'assistant', web = want_search)", "await · async · main.py:592-601")
+Rel(main_py, e_search, "run_search_engine(effort) after rate_ok(user_key)", "await · async · main.py:604-606")
+Rel(main_py, e_ds, "run_dataset_engine(conversation_id)", "await · async · main.py:610-612")
+Rel(main_py, e_chat, "run_chat_engine(mode='assistant') — router bypassed entirely", "await · async · main.py:622-631")
+Rel(main_py, e_repo, "run_repo_engine(GithubRef)", "await · async · main.py:570-574")
+Rel(main_py, e_url, "run_url_engine(urls[:URL_MAX_PAGES])", "await · async · main.py:577-581")
+Rel(main_py, e_vis, "run_pdf_engine / run_vision_engine", "await · async · main.py:553-566")
+Rel(main_py, c_arch, "POST /uploads -> sniff_format -> extract -> profile", "multipart · BLOCKING on the event loop · uploads.py:98-110")
+
+Rel(graph_py, e_router, "route_request(message, has_image, history)", "await · async · graph.py:30,36-40")
+Rel(graph_py, e_sql, "route == 'sql'", "async · graph.py:100-104")
+Rel(graph_py, e_rag, "route == 'rag'", "async · graph.py:100-104")
+Rel(graph_py, e_report, "route == 'report'", "async · graph.py:100-104")
+Rel(graph_py, e_vis, "route == 'vision'", "async · graph.py:100-104")
+Rel(graph_py, e_chat, "route == 'chat'", "async · graph.py:100-104")
+
+Rel(e_agent, e_sql, "step.kind='sql' -> generate_and_run_sql + attach_chart", "await · async · agent.py:255-269")
+Rel(e_agent, e_rag, "step.kind='rag' -> select_context", "await · async · agent.py:279-286")
+Rel(e_agent, e_search, "step.kind='web' -> research_step(emit)", "await · async · agent.py:338-343")
+Rel(e_agent, e_live, "step.kind='salesforce' -> fetch_live", "await · async · agent.py:291-310")
+Rel(e_report, e_sql, "_sql_section -> generate_and_run_sql(fetch_cap=501)", "await · async · report.py:127-129")
+Rel(e_report, e_rag, "_rag_section -> select_context", "await · async · report.py:200")
+Rel(e_sql, e_live, "NoSuchTable -> live SOQL fallback", "await · async · sql.py:301-395")
+
+Rel(e_sql, c_guard, "guard_sql(model SQL) — 1st attempt AND retry", "sync call inside async def · sql.py:200,206")
+Rel(e_sql, c_schema, "format_schema(schema_cache.get(duckdb_path)) — called twice back to back", "BLOCKING DuckDB read on the event loop · sql.py:189,191")
+Rel(e_sql, c_dict, "hint_for(question) -> org API-name hint", "sync · sql.py:97-102")
+Rel(e_sql, c_chart, "attach_chart -> build_chart(mode=CHART_TRIGGER_MODE, ask_model)", "await · async · sql.py:426")
+Rel(e_sql, c_exp, "cap_rows(500) then export_csv / export_xlsx -> REPORTS_DIR", "BLOCKING file write on the event loop · sql.py:397-420")
+Rel(e_rag, c_cite, "build_citations(hits, SF_LIGHTNING_BASE_URL)", "sync · rag.py:146")
+Rel(e_live, c_sf, "run_soql -> guard_soql -> GET /services/data/{v}/query", "HTTPS · Bearer · async · salesforce.py:144-174", $tags="risky")
+Rel(e_search, c_net, "safe_fetch(url, 8 s, 5 MB) — 16-way concurrent", "HTTPS · async · search.py:313-318")
+Rel(e_url, c_net, "safe_fetch — strictly sequential, one URL at a time", "HTTPS · async · url.py:34-39,89-91")
+Rel(e_url, c_repoidx, "select_relevant(text, question, share)", "sync on the event loop · url.py:62")
+Rel(e_url, c_extract, "extract_readable(content_type, body, url)", "BLOCKING trafilatura/pypdfium2 on the loop · url.py:47")
+Rel(e_vis, c_extract, "render_pdf(pdf_base64)", "BLOCKING CPU + bitmap allocation on the loop · document.py:33")
+Rel(e_repo, c_repoidx, "index_repo(dest)", "BLOCKING walk of up to REPO_MAX_FILES on the loop · repo.py:42")
+Rel(e_report, c_chart, "build_chart(..., force=True)", "await · async · report.py:167-178")
+Rel(e_report, c_png, "render_chart_png(spec, columns, rows, chart-N.png)", "BLOCKING matplotlib render on the loop · report.py:190")
+Rel(e_report, c_exp, "slugify(plan['title']) -> <slug>-YYYYmmdd-HHMMSS.{docx,pdf}", "sync + 2 pandoc subprocesses · report.py:228-258")
+
+note right of main_py #FFFBEB
+  **UNAUTHENTICATED + UNBOUNDED**
+  · POST /chat and GET /reports* declare no auth
+    dependency (main.py:274-275, :257-271); the file
+    says so at main.py:55-56. auth.current_user()
+    never returns None (auth.py:89-92), so every
+    ownership branch is dead-on-the-false-side.
+  · Only CORSMiddleware is installed (main.py:47-53):
+    no request-size limit — ChatRequest.image / .pdf
+    are unbounded base64 (main.py:187-197).
+  · Catch-all at main.py:670-672 publishes raw
+    str(exc) to the browser; nothing is logged.
+  · No wall-clock budget on worker() (main.py:383-677).
+    The only bound is LLM_REQUEST_TIMEOUT = 300 s
+    (config.py:264 -> llm.py:78).
+  · lifespan has no shutdown branch (main.py:27-38):
+    _live_generations and _background_tasks are never
+    drained on SIGTERM.
+end note
+
+note bottom of e_router #FFFBEB
+  **SWALLOWED CLASSIFIER FAILURE — 600 s worst case**
+  Two bare `except Exception: pass` (router.py:121-122,
+  :130-131) hide connection-refused, 400 window errors
+  and timeouts identically; nothing is logged anywhere
+  in the file. A wedged vllm-router **plus** a wedged
+  vllm costs 2 × 300 s before the unconditional
+  `return "rag"` (router.py:133) — a total classifier
+  outage silently sends greetings into vector search.
+  There is no confidence score, threshold or logprob.
+end note
+
+note bottom of e_orch #FFFBEB
+  **ON THE CRITICAL PATH OF EVERY TEXT TURN**
+  orchestrate.decide has no timeout (orchestrate.py:138)
+  and runs at main.py:412 — BEFORE the first `status`
+  event at main.py:415. Two swallow-everything handlers
+  (:104-106, :142-144) make "endpoint dead" and "prompt
+  too long" both read as "do neither". `_JSON_RE` is
+  greedy `\{.*\}` (:38) with no <think>/fence stripping.
+end note
+
+note right of e_agent #FFFBEB
+  **NO TIMEOUT, NO CANCELLATION, RAW ERRORS TO THE UI**
+  · asyncio.gather at agent.py:405 has no
+    return_exceptions=True — a CancelledError on Stop
+    aborts the gather and leaves siblings running.
+  · Per-step catch-all (agent.py:387-398) ships
+    str(exc)[:200] to the browser as step.detail.
+  · Worst case: plan 2×300 s + ceil(8/3) waves +
+    synthesis, > 20 min, uncancellable (agent.py:397-400).
+  · agent.py:312-335 is 24 lines of UNREACHABLE duplicate
+    Salesforce branch (identical guard at :288).
+  · The `web` gate is applied only at plan time;
+    execute_steps never sees it (agent.py:571-580).
+end note
+
+note right of c_guard #DC2626
+  **GUARD IS ONE BYPASS DEEP** (reproduced)
+  `_scan` does not model DuckDB `E'…'` escape strings,
+  so `SELECT E'\'' , 1 ; DROP TABLE accounts` desyncs
+  `cleaned` from `bare` and defeats BOTH the stacked-
+  statement check (sql_guard.py:142) and the keyword
+  blocklist (:146) in one input. Replacement scans
+  (`FROM '/etc/passwd'`), quoted function names
+  (`"read_text"(…)`) and `duckdb_*` / `pragma_*`
+  metadata functions also pass.
+  What actually saves the system is NOT this module —
+  it is the DuckDB lockdown at sql.py:124-132
+  (read_only=True, enable_external_access=False,
+  autoinstall/autoload extensions=False).
+end note
+
+note right of c_net #DC2626
+  **SSRF: CORRECT, WITH TWO HOLES**
+  Blocked and verified: file:/gopher:/ftp:, IPv4 and
+  IPv6 private/loopback/link-local/reserved, decimal
+  and octal encodings, userinfo spoofing, multi-A
+  rebinding, redirect into private space, >3 hops.
+  NOT blocked:
+  · TOCTOU — resolve_public_ips returns validated IPs
+    and assert_url_is_fetchable throws them away
+    (net.py:87,:99); httpx re-resolves at connect
+    (:137). Nothing pins the address.
+  · 100.64.0.0/10 (CGNAT / Tailscale) is fetchable —
+    is_private is False on Python 3.12.
+  · No destination-port restriction, no total deadline,
+    no retry/circuit breaker; getaddrinfo (:76) has no
+    timeout and parks a thread-pool worker.
+  Reached ONLY from search.py:313 and url.py:34 —
+  core/repo.py:137 (api.github.com) bypasses it.
+end note
+
+note bottom of e_sql #FFFBEB
+  **THE EVENT LOOP STALLS HERE**
+  `_execute` is a plain `def` (sql.py:117) called from
+  an async function at :201 and :206, so the DuckDB
+  query — and every export of up to 100 000 rows
+  (:408) — runs on the single shared event loop and
+  stalls **all** concurrent SSE streams (one uvicorn
+  worker, orchestrator/Dockerfile:52).
+  The blanket `except Exception` at sql.py:203 treats a
+  dead vllm endpoint exactly like bad SQL and spends a
+  second LLM call re-prompting; the retry's output is
+  never re-checked by references_a_known_table (:193).
+end note
+
+note bottom of c_schema #FFFBEB
+  **STALE SCHEMA, DEAD KNOB**
+  invalidate() (schema_cache.py:27-31) has no caller, so
+  a table the sync-worker just created is invisible to
+  the SQL-writing model for up to the hard-coded 300 s
+  TTL (:74). SCHEMA_CACHE_TTL is read at config.py:265
+  and never consumed. get() returns the cached dict BY
+  REFERENCE (:22) — a mutating caller corrupts it for
+  every later request.
+end note
+
+note bottom of c_sf #FFFBEB
+  **LIVE PRODUCTION ORG, NO QUOTA**
+  live_sf._object_hint() calls `schema_cache()` — the
+  SchemaCache *instance*, which defines no `__call__` —
+  so it always raises TypeError, swallowed at
+  live_sf.py:57-58. The SOQL prompt therefore NEVER
+  receives the org-object context it was written to
+  carry. `history` is accepted by write_soql (:61) and
+  fetch_live (:141) and never used.
+  core/salesforce.py:108 holds the token in an unlocked
+  module global; only one 401 re-auth, no rate limit,
+  no circuit breaker, no per-user quota.
+end note
+
+note bottom of c_chart #FFFBEB
+  **SILENT CHART LOSS + A STREAM STALL**
+  build_chart's blanket `except Exception`
+  (chart_pipeline.py:115-117) turns every internal
+  defect into "no chart" plus one WARNING line.
+  `ask_model` has no timeout at this layer, and
+  attach_chart is awaited at sql.py:426 BEFORE the
+  narrative stream starts at :428 — a hung model call
+  stalls the whole /chat SSE response.
+  Good news: chart_prompt (:49-76) serialises only
+  aggregate column metadata, so no Salesforce cell
+  value ever reaches the chart model.
+end note
+
+note bottom of e_ds #FFFBEB
+  **PROMPT-INJECTION ASYMMETRY**
+  dataset.py is the ONLY engine that fences retrieved
+  content as untrusted (DATA_START/DATA_END,
+  dataset.py:27-28,:40-45,:71). Fetched web-page bodies
+  (search.py:374-378), pasted-page text (url.py:63) and
+  Salesforce record text from LanceDB (rag.py:105-112)
+  are pasted raw into the user turn with no delimiter.
+  Worse, main.py:502-510 re-injects stored page text as
+  a **system** message, and engines/__init__.py:16-19
+  keeps every system message forever.
+end note
+
+note bottom of e_report #FFFBEB
+  **UNBOUNDED SUBPROCESS, LOST ARTEFACTS**
+  _run_pandoc awaits communicate() with NO timeout
+  (report.py:117). The two conversions at :257-258 are
+  unguarded: if .docx succeeds and .pdf fails (missing
+  weasyprint/pandoc) the RuntimeError escapes, the turn
+  ends in an `error` event and report_files is never
+  emitted even though the .docx exists on disk.
+  Two reports with the same title in the same second
+  share a base_name and silently overwrite (:228).
+end note
+
+note as N_EGRESS #FFFBEB
+  **MODEL AND STORAGE EGRESS FROM THIS CONTAINER**
+  · vllm (MAIN) at OPENAI_BASE_URL — sql/rag/agent/chat/
+    report/vision/url/repo/search answers (llm.py:84,107,134).
+  · vllm-router (AGENT) at ROUTER_BASE_URL — router.py:116,
+    orchestrate.py:138, search.py:186,200 (thinking disabled).
+  · vllm-embed at EMBED_BASE_URL — rag.py retrieval and
+    recall (llm.py:342-348).
+  · DuckDB warehouse — read_only per query (sql.py:124,
+    schema_cache.py:40, health.py:54, profile.py:55).
+  · LanceDB — rag.py:43-49, on the event loop.
+  · app.sqlite3 — every db.* helper reopens the file and
+    re-runs the schema + migrations (db.py:195-205).
+  · searxng / Tavily / Brave, then arbitrary public URLs.
+  · Salesforce org — live SOQL via core/salesforce.py.
+end note
+
+legend right
+  |= colour |= layer |
+  |<#2563EB>   | frontend / edge |
+  |<#7C3AED>   | orchestrator / app logic |
+  |<#16A34A>   | inference / GPU |
+  |<#D97706>   | storage / data |
+  |<#64748B>   | external systems |
+  |<#DC2626>   | risk / trust boundary |
+  ----
+  **Notation**
+  Dashed red rectangle = trust boundary (no authentication crossing it).
+  Red arrow = unauthenticated or externally-reachable hop.
+  Dotted purple rectangle = Python package grouping, not a process boundary.
+  Every arrow label is "what · protocol · sync|async · file:LINE".
+  Amber notes = retry / timeout / unbounded resource / swallowed exception,
+  each anchored to a file:LINE that was read.
+  "BLOCKING ... on the loop" = a synchronous call made inside an `async def`;
+  this process runs ONE uvicorn worker with ONE event loop
+  (orchestrator/Dockerfile:52), so each one stalls every concurrent SSE stream.
+endlegend
+
+@enduml

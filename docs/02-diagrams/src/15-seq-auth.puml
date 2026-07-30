@@ -1,0 +1,267 @@
+@startuml 15-seq-auth
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName "Inter, Segoe UI, sans-serif"
+skinparam defaultFontSize 13
+skinparam roundCorner 8
+skinparam shadowing false
+skinparam ArrowColor #4A5568
+skinparam ArrowFontColor #4A5568
+skinparam NoteBackgroundColor #FFFBEB
+skinparam NoteBorderColor #F59E0B
+' Layer palette — byte-identical across ALL 24 diagrams
+!$C_EDGE = "#2563EB"   /' frontend / edge '/
+!$C_APP  = "#7C3AED"   /' orchestrator / app logic '/
+!$C_GPU  = "#16A34A"   /' inference / GPU '/
+!$C_DATA = "#D97706"   /' storage / data '/
+!$C_EXT  = "#64748B"   /' external systems '/
+!$C_RISK = "#DC2626"   /' risk / trust boundary '/
+
+skinparam ParticipantFontColor #FFFFFF
+skinparam ParticipantFontStyle bold
+skinparam DatabaseFontColor #FFFFFF
+skinparam DatabaseFontStyle bold
+skinparam ActorFontColor #DC2626
+skinparam ActorBorderColor #DC2626
+skinparam SequenceGroupBackgroundColor #F8FAFC
+skinparam SequenceGroupBorderColor #94A3B8
+skinparam SequenceLifeLineBorderColor #CBD5E1
+skinparam maxMessageSize 280
+
+title Identity & secrets — GET /auth/me → local_user() resolution → the dependency that can never 401,\nplus the SEPARATE Salesforce credential ladder and the dead AWS branch\n(evidence: auth.py:17-103 · main.py:56, :693-709 · core/salesforce.py:111-141 · sync-worker/syncworker/secrets.py:118-181 · sf_auth.py:20-100)
+
+box "TRUST BOUNDARY — the ONLY one that exists.\nAnything that can open a TCP connection to the published port is already 'the owner'.\ndocker-compose.yml:272-273 publishes 8080:8080 on 0.0.0.0 with no host-IP bind." #FEF2F2
+  actor "Any client\non the network" as client
+  participant "frontend" as fe $C_EDGE
+end box
+participant "orchestrator\nGET /auth/me" as api $C_APP
+participant "auth.local_user()" as auth $C_APP
+database "app.sqlite3\nusers" as sqlite $C_DATA
+participant "orchestrator\ncore/salesforce" as sfcore $C_APP
+participant "sync-worker\nsecrets.py + sf_auth.py" as sw $C_APP
+database "mounted PEM\n/run/secrets/sf_jwt_key.pem" as pem $C_DATA
+participant "Salesforce org" as sf $C_EXT
+participant "AWS Secrets Manager\n(REMOVED 2026-07-28)" as aws $C_RISK
+
+autonumber "<b>[00]"
+
+== A · "Who am I?" — the only identity call in the system ==
+
+client -> fe : **GET /api/auth/me** · HTTP · async
+fe -> api : **GET /auth/me** · HTTP · `cache:'no-store'`\n**no cookie forwarded** · async
+note over fe #FEE2E2
+`frontend/app/api/auth/me/route.ts:18` — raw `fetch`, **no timeout**,
+non-ok mapped to 502, bare `catch`. It does not use `lib/proxy.ts`,
+whose docstring wrongly claims it serves `/api/auth/~*` (proxy.ts:1-2).
+end note
+
+api -> auth : `local_user()` (auth.py:52, :100-103)
+
+alt `_cached_user_id` is already set — the normal case
+  auth -> sqlite : `db.get_user_by_id(_cached_user_id)`
+  alt row found
+    auth --> api : the row — **resolved once, then cached for the\nwhole process lifetime** (auth.py:54-57)
+  else row deleted underneath us
+    auth -> auth : `_cached_user_id = None` and fall through (auth.py:58-59)
+  end
+
+else `LOCAL_USERNAME` env var is set (auth.py:61)
+  auth -> sqlite : `db.get_user_by_username(LOCAL_USERNAME.strip())`
+  note over auth
+  `LOCAL_USERNAME` is read straight from `os.environ` (auth.py:43, :61).
+  It is **not** part of `Settings` (config.py) and is **not** set in
+  docker-compose.yml — the one env var that bypasses the config layer.
+  end note
+
+else `LOCAL_USERNAME` unset → adopt the OLDEST account (auth.py:68)
+  auth -> sqlite : `SELECT ~* FROM users ORDER BY id LIMIT 1`\n(`_oldest_user`, auth.py:46-49)
+  note over auth #FEE2E2
+  **Connection leak.** `_oldest_user` calls `db.connect()` and never closes it —
+  no `closing(...)`, no `con.close()` (auth.py:48-49). And `db.connect()` is not
+  cheap: it re-runs `executescript(_SCHEMA)` + `migrate()` incl. a full-table
+  `DELETE … GROUP BY` on **every** call (db.py:195-205, :181-192).
+  end note
+
+else fresh install — nothing matched
+  auth -> sqlite : `db.create_user(username, "!local-no-login")`\n(auth.py:77-79)
+  note over auth
+  The password hash is **deliberately unusable**: nothing verifies passwords
+  any more, and storing a real one would imply it does (auth.py:74-76).
+  `sqlite3.IntegrityError` is swallowed as a create race (auth.py:80-81);
+  `RuntimeError` → 500 only if create **and** lookup both fail (auth.py:83-84).
+  end note
+end
+
+auth -> auth : `_cached_user_id = int(row["id"])`\n(auth.py:59, :65, :71, :85)
+note over auth #FEE2E2
+`_cached_user_id` is a module-level mutable global read-modify-written
+**without a lock** (auth.py:39). `local_user()` is called both from the
+anyio threadpool (history/uploads sync routes) **and** directly on the
+event loop (`async def chat`, main.py:327). Two threads can both miss
+and both call `create_user` — which is why :80 swallows `IntegrityError`.
+end note
+
+api --> fe : `{"username": …, "local": true}` · JSON
+fe --> client : **200** · JSON — the UI uses this to **label** things and to key\nits localStorage cache. It is **not** a login check (auth.py:101-103)
+
+== B · require_user() — the dependency that can never fail ==
+
+note over api
+`current_user(request)` **deletes** its `Request` argument (auth.py:91) and
+returns `local_user()`. `require_user(request)` is literally
+`return current_user(request)` and its own docstring says **"Never 401s now."**
+(auth.py:95-97). There is no cookie, no bearer token, no session, no CSRF
+token, no origin check beyond CORS, and no rate limit anywhere.
+end note
+
+group Routes that DECLARE Depends(require_user) — the dependency always resolves
+  client -> api : `GET/POST/PUT/DELETE /history/~*` ·\n`POST /uploads` · `GET /uploads/{cid}`\n(history.py:82…:270 · uploads.py:70, :162)
+end
+group Routes with NO auth dependency at all
+  client -> api : **`POST /chat`** (main.py:274) ·\n**`GET /reports`** (main.py:257) ·\n**`GET /reports/{filename}`** (main.py:262)
+  note over api #FEE2E2
+  Stated as intentional at main.py:55-56: //"/chat and /reports~* remain auth-free."//
+  `current_user` is still called at main.py:327 — but only for personalisation
+  and the conversation-ownership compare, which is itself skipped whenever
+  `conv_owner is None` and is wrapped in `except Exception: conv_owner = None`
+  (main.py:338-344) — i.e. **it fails open**.
+  end note
+end
+group Routes gated by _owns() / _viewer_id() — a tautology
+  client -> api : `POST /chat/stop` · `GET /chat/active` ·\n`GET /chat/attach/{conversation_id}`\n(main.py:693-709, :712, :725, :782)
+  note over api #FEE2E2
+  `_owns(gen, viewer)` compares `gen.user_id` to `_viewer_id(request)`; both
+  resolve to the **same single `local_user()` id**, so the check compares one
+  identity to itself and these three routes are open to anything on the port.
+  end note
+end
+note over api #FEE2E2
+**Downstream consequences, all verified:**
+• Every `signed_in is None` / `user is None` branch in main.py
+  (:342, :354, :437, :450, :535, :654, :756-757) is **unreachable dead code**;
+  the `HTTPException(401)` at main.py:757 can never fire.
+• `settings.cors_allow_origins` (main.py:49) restricts **browsers only** — a
+  direct HTTP client is unaffected; `CORS_ALLOW_ORIGINS=~*` is accepted verbatim
+  and combines with `allow_credentials=True` (config.py:244-250, main.py:50).
+• Dead relics: `SESSION_COOKIE` (auth.py:35) has no reader; `session_secret_file`
+  (config.py:258-260) has zero readers; `argon2-cffi` and `itsdangerous` remain
+  installed and unused; main.py:46 still comments about the `ts_session` cookie.
+end note
+
+== C · Salesforce credentials — a SEPARATE ladder, unrelated to the identity above ==
+
+group C1 · orchestrator live SOQL — client-credentials ONLY (core/salesforce.py:111-141)
+  sfcore -> sfcore : `_authenticate()` — if `not settings.sf_client_secret`:\n`raise SalesforceUnavailable("live Salesforce lookups need\nSF_CLIENT_SECRET (client-credentials grant)")` (:118-122)
+  note over sfcore
+  The JWT-bearer grant deliberately **does not exist here** — that path lives
+  in the sync-worker and was not duplicated (core/salesforce.py:119-120).
+  end note
+  sfcore -> sf : **POST {SF_LOGIN_URL}/services/oauth2/token**\n`grant_type=client_credentials, client_id, client_secret`\nform-encoded · `timeout=30 s` · async
+  sf --> sfcore : `{access_token, instance_url}` → module-level `_token`\nsingleton, **TTL 25 min** (core/salesforce.py:29, :97, :108)
+  note over sfcore #FEE2E2
+  • `_token` is shared mutable module state with **no lock** — two concurrent
+    misses both POST and both write; last write wins, doubling OAuth sessions.
+  • A fresh `httpx.AsyncClient` per call — no pooling (:123, :148, :157, :180).
+  • The token POST is **not** wrapped in `try` (:123-131): a `ConnectError` /
+    `ReadTimeout` escapes as an httpx exception, not `SalesforceUnavailable`,
+    and `agent.py:295` catches only the latter — a blip aborts the step chain.
+  • Only one 401 re-auth retry (:154-162). No rate limit, no circuit breaker,
+    no per-user quota. The response body is never echoed (:132-134) — correct.
+  end note
+end
+
+group C2 · sync-worker credential ladder (secrets.credentials_from_env, secrets.py:118-160)
+  sw -> sw : require ALL THREE identity vars — `SF_CLIENT_ID`,\n`SF_USERNAME`, `SF_LOGIN_URL` — else return `None`\n(`_identity_present`, secrets.py:98-99, :127-128)
+
+  alt **SF_CLIENT_SECRET** non-blank — WINS FIRST (secrets.py:130-138)
+    sw -> sf : **POST /services/oauth2/token** ·\n`grant_type=client_credentials` (sf_auth.py:78-90)
+    note over sw #FEE2E2
+    `private_key_pem=b""` — **no key material is loaded or validated at all**.
+    A deployment that sets **both** a secret and a key silently ignores the key
+    (asserted deliberately by sync-worker/tests/test_secrets.py:179-186).
+    end note
+
+  else **SF_PRIVATE_KEY_FILE** — the mounted PEM (secrets.py:140, :142-143)
+    sw -> pem : `Path.read_bytes()` · file I/O · blocking
+    note over pem
+    docker-compose.yml:311 sets `SF_PRIVATE_KEY_FILE=/run/secrets/sf_jwt_key.pem`
+    **only** when `SF_PRIVATE_KEY_HOST_FILE` is set; :328 bind-mounts the host
+    file there **read-only**, defaulting to `/dev/null` so compose still parses.
+    end note
+    sw -> sw : reject a 40/64-hex **thumbprint** pasted as a path (:105-111);\n`_check_pem` requires b"PRIVATE KEY" in the first 200 bytes\nand names CERTIFICATE material explicitly (:60-79)
+
+  else **SF_PRIVATE_KEY_B64** (secrets.py:141, :144-149)
+    sw -> sw : `base64.b64decode(validate=True)` → on failure\n`ValueError("SF_PRIVATE_KEY_B64 is not valid base64")`\nre-raised `from exc`, then `_check_pem`
+
+  else **DEFAULT_KEY_PATH** exists on disk (secrets.py:50, :150-151)
+    sw -> pem : read `/data/sf_jwt_key.pem`
+    note over pem #FEE2E2
+    This probe runs **even when a caller passes an explicit `env` dict** — which
+    is why tests must monkeypatch it. Worse, it places the RSA signing key inside
+    the **`data` Docker volume**, which docker-compose.yml:269 also mounts into the
+    orchestrator container that executes LLM-generated SQL.
+    end note
+
+  else nothing matched
+    sw --> sw : `ValueError` naming the three identity vars **and**\nthe three key forms — never a value (secrets.py:176-181)
+  end
+
+  sw -> sw : `build_jwt_assertion` — RS256 over\n`{iss: client_id, sub: username, aud: SF_LOGIN_URL,\nexp: now + JWT_VALIDITY_SECONDS(180)}` (sf_auth.py:20-39)
+  sw -> sf : **POST /services/oauth2/token** ·\n`grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer`\n`assertion=<signed JWT>` (sf_auth.py:91-100) · sync httpx
+  note over sw
+  **Secret hygiene here is genuinely good.** `SalesforceCredentials.__repr__`
+  and `__str__` return the literal `"SalesforceCredentials(<redacted>)"`
+  (secrets.py:92-95), asserted by tests; no exception message embeds a value;
+  `.env`, `.env.bak-~*` and `secrets/` are gitignored and `git ls-files` shows
+  only `.env.example` tracked — **no secret is committed**.
+  end note
+  note over sw #FEE2E2
+  `login_url` is never validated as https or well-formed (secrets.py:155-158):
+  a typo'd `SF_LOGIN_URL` becomes both the JWT `aud` claim and the POST target,
+  unchecked (sf_auth.py:36, :76).
+  end note
+end
+
+group C3 · DEAD PATH — AWS Secrets Manager, removed 2026-07-28
+  sw -[#DC2626,dashed]->x aws : ""GetSecretValue(SF_SECRET_NAME)""\n**THIS CALL DOES NOT EXIST**
+  note over aws #FEE2E2
+  **Proof it is gone:**
+  • `sync-worker/syncworker/secrets.py:1-6` documents the removal; there is no
+    cloud call anywhere in the module.
+  • `fetch_sf_credentials(secret_name, region)` immediately `del`s both
+    arguments (secrets.py:172); no live caller passes them.
+  • `boto3` is **absent** from sync-worker/requirements.txt, and
+    `sync-worker/tests/test_secrets.py:72-76` asserts the string never appears.
+  • `docker-compose.yml:294` states: //"AWS Secrets Manager was REMOVED//
+    //(2026-07-28) — nothing here calls a cloud service."//
+  • `AWS_~*` has **zero references** outside `.env.example`.
+
+  **But it is still advertised — documentation drift,**
+  **and the reason this dead branch is drawn at all:**
+  • `.env.example:7-14` still ships `AWS_REGION`, `AWS_ACCESS_KEY_ID`,
+    `AWS_SECRET_ACCESS_KEY` and `SF_SECRET_NAME` with the comment
+    //"used ONLY to read the Salesforce secret from AWS Secrets Manager"//.
+  • `docker-compose.yml:327` still says the key //"comes from//
+    //SF_PRIVATE_KEY_B64 or AWS Secrets Manager"//.
+  • `sync-worker/tests/test_secrets.py:1` still says "Secrets Manager JSON second".
+  An operator following `.env.example` will populate cloud credentials that
+  nothing reads — real credentials on disk with no consumer.
+  end note
+end
+
+legend right
+|= colour |= layer |
+| <back:#2563EB>      </back> | frontend / edge |
+| <back:#7C3AED>      </back> | orchestrator / sync-worker app logic |
+| <back:#D97706>      </back> | storage / data — app.sqlite3, mounted PEM |
+| <back:#64748B>      </back> | external system — Salesforce org |
+| <back:#DC2626>      </back> | risk · trust boundary · dead path |
+|= notation |= meaning |
+| pink box | the ONLY trust boundary — nothing authenticates across it |
+| dashed red arrow ending in ""x"" | code path that no longer exists but is still documented |
+| amber note | behaviour that IS implemented, incl. controls that work |
+| red note | risk: no authz, leaked connection, unlocked global, doc drift |
+| arrow label | protocol · payload · sync/async |
+endlegend
+
+@enduml

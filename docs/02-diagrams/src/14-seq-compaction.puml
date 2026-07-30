@@ -1,0 +1,224 @@
+@startuml 14-seq-compaction
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName "Inter, Segoe UI, sans-serif"
+skinparam defaultFontSize 13
+skinparam roundCorner 8
+skinparam shadowing false
+skinparam ArrowColor #4A5568
+skinparam ArrowFontColor #4A5568
+skinparam NoteBackgroundColor #FFFBEB
+skinparam NoteBorderColor #F59E0B
+' Layer palette — byte-identical across ALL 24 diagrams
+!$C_EDGE = "#2563EB"   /' frontend / edge '/
+!$C_APP  = "#7C3AED"   /' orchestrator / app logic '/
+!$C_GPU  = "#16A34A"   /' inference / GPU '/
+!$C_DATA = "#D97706"   /' storage / data '/
+!$C_EXT  = "#64748B"   /' external systems '/
+!$C_RISK = "#DC2626"   /' risk / trust boundary '/
+
+skinparam ParticipantFontColor #FFFFFF
+skinparam ParticipantFontStyle bold
+skinparam DatabaseFontColor #FFFFFF
+skinparam DatabaseFontStyle bold
+skinparam ActorFontColor #DC2626
+skinparam ActorBorderColor #DC2626
+skinparam SequenceGroupBackgroundColor #F8FAFC
+skinparam SequenceGroupBorderColor #94A3B8
+skinparam SequenceLifeLineBorderColor #CBD5E1
+skinparam maxMessageSize 260
+
+title Context lifecycle — meter → warn 0.60 (dead) → background fold 0.70 → hard fold 0.80 → rolling summary → semantic recall\n(evidence: compaction.py:100-360 · context.py:97-138 · summarize.py:66-105 · recall.py:78-144 · main.py:536-549, :654-667 · config.py:146-156)
+
+box "TRUST BOUNDARY — unauthenticated; require_user() never 401s (auth.py:95-97)" #FEF2F2
+  actor "Owner /\nany LAN client" as user
+  participant "frontend" as fe $C_EDGE
+end box
+participant "orchestrator\n/chat worker()" as worker $C_APP
+participant "recall.py" as recall $C_APP
+participant "compaction.py" as comp $C_APP
+participant "context.py\n(token meter)" as ctx $C_APP
+participant "summarize.py" as sum $C_APP
+participant "vllm (MAIN)" as vllm $C_GPU
+participant "vllm-embed" as embed $C_GPU
+database "app.sqlite3\nconversation_summaries\nconversation_chunks" as sqlite $C_DATA
+
+autonumber "<b>[00]"
+
+== TURN N — everything below happens BEFORE the request goes out ==
+
+user -> fe : **POST /api/chat** · JSON · async
+fe -> worker : **POST /chat** · JSON → detached `asyncio.Task`\n(main.py:679) · reply is SSE text/event-stream
+
+group Semantic recall — within-conversation, embedding based
+  worker -> recall : `retrieve_block(conv_key, text)` (main.py:539)
+  recall -> sqlite : `get_conversation_chunks(cid)` · sqlite3 · **blocking**
+  note over sqlite #FEE2E2
+  Loads **every** chunk ever stored for the conversation —
+  unbounded row count and unbounded blob size (db.py:466-482).
+  end note
+  recall -> embed : `embed_texts([question])` · HTTP/JSON · async\ninput clipped to `EMBED_INPUT_CHAR_CAP`=8000
+  recall -> recall : brute-force `cosine` in pure Python over **all**\nchunks, no `await` inside the loop; keep\n`RETRIEVE_TOP_K`=**6** with score > 0 (recall.py:133-138)
+  note over recall #FEE2E2
+  Whole body is `try/except Exception: return None` (recall.py:128,143-144) —
+  an embedding-service outage degrades recall **silently and invisibly**.
+  end note
+  recall --> worker : `RECALL_HEADER` block, or `None`
+end
+
+worker -> comp : `compaction.prepare(conv_key, full_history, text,\nbase_url, model, emit, retrieved)` (main.py:540-548)
+
+comp -> sqlite : `db.get_summary(cid)` → `{summary, covers_through}`
+note over comp #FEE2E2
+**Read OUTSIDE the lock** (compaction.py:258). A detached background fold
+for the PREVIOUS turn may be inside `_lock_for()` about to `save_summary`,
+so this //measurement// can be stale. Partially compensated at :288-294.
+The module docstring's "cannot race" claim (:19-20) is true only of the fold.
+end note
+
+comp -> comp : `assemble(history, summary, covers, retrieved)` =\nsystem blocks → summary_block → retrieved → turns[covers_through:]\n(compaction.py:149-167)
+
+group Context meter — measure()
+  comp -> ctx : `measure(probe)` → `model_window` + `count_tokens`\n(compaction.py:100-118)
+  ctx -> vllm : **POST /tokenize** · JSON · `TOKENIZE_TIMEOUT`=**5.0 s**\n(context.py:105-121) · async
+  alt /tokenize answers
+    vllm --> ctx : `{count, max_model_len}` → caches the **served** window\n(context.py:118-119)
+  else any exception
+    ctx -> ctx : fall back to `estimate_messages` at\n`_CHARS_PER_TOKEN` = **3.0** (context.py:121-123)
+    note over ctx #FEE2E2
+    • The estimator counts **text parts only** — an image/PDF payload
+      is measured as ≈ **0 tokens** (context.py:86-92).
+    • `model_window` **permanently caches** the `MODEL_MAX_CONTEXT`
+      fallback (262144) when the probe fails (context.py:136-137).
+    • **No retry** on /tokenize.
+    end note
+  end
+  ctx --> comp : `Budget{window, output_reserved, usable, used}`\n`usable = window − output_reservation − CONTEXT_SAFETY_MARGIN(512)`\n`fraction = used / usable` (compaction.py:56-78)
+end
+
+alt fraction ≤ CONTEXT_WARN_THRESHOLD = **0.60**
+  note over comp #FEE2E2
+  **This branch does not exist in code.** `settings.context_warn_threshold`
+  is defined at config.py:146 and shipped at .env.example:96, and `rg` finds
+  **no other reference anywhere in the repository** — it is DEAD CONFIGURATION.
+  Nothing server-side ever emits a warn state; the UI receives only the raw
+  `meta.context.fraction` (main.py:376) and decides for itself.
+  end note
+
+else 0.60 < fraction ≤ 0.80
+  comp -> comp : nothing happens synchronously —\nthe **0.70 background path** may fire AFTER this turn
+
+else fraction > CONTEXT_COMPACT_THRESHOLD = **0.80** — HARD / SYNCHRONOUS
+  comp -> fe : `emit("status", {"text": "Compacting conversation…"})`\n**SSE** · the user waits for this (compaction.py:274)
+
+  loop ≤ _MAX_ADAPTIVE_ROUNDS = 4 · keep starts at KEEP_RECENT_TURNS = 8, halved to MIN_KEEP_RECENT = 2
+    comp -> comp : `compact(cid, history, keep=keep)`\n**`async with _lock_for(cid)`** — one `asyncio.Lock`\nper conversation (compaction.py:48-53, :217)
+    comp -> sqlite : `db.get_summary(cid)` **re-read UNDER the lock**\n(compaction.py:220)
+    comp -> comp : `covers = min(stored.covers_through, len(turns))`\n`boundary = max(covers, len(turns) − keep)`\n`boundary = min(boundary, len(turns) − 1)`\n← the in-flight turn is **never** folded (compaction.py:227)
+
+    alt boundary ≤ covers
+      comp --> comp : **return None — idempotent no-op**\n(compaction.py:228)
+    else fold turns[covers : boundary]
+      comp -> sum : `summarize(existing_summary, folded_turns)`\neach turn head-truncated to `_MAX_TURN_CHARS`=4000
+      sum -> vllm : `chat_completion` · `temperature=0.0` ·\n`max_tokens = SUMMARY_MAX_TOKENS` (**2000**) · async
+      opt len(summary)/3 > SUMMARY_MAX_TOKENS × 0.9
+        sum -> vllm : `condense(summary)` — a **second** completion\n(compaction.py:182-185, summarize.py:82-105)
+      end
+      comp -> sqlite : `save_summary(cid, summary, new_boundary,\nestimate_tokens(summary))` →\n`INSERT … ON CONFLICT(conversation_id) DO UPDATE`\n(compaction.py:186-188 → db.py:411-423)
+      comp -> recall : `index_folded(cid, folded, covers_through)`\n(compaction.py:192-194)
+      recall -> recall : `chunk_text` — `_CHUNK_CHARS`=1200,\n`_CHUNK_OVERLAP`=150; `ordinal = first_ordinal × 1000`
+      recall -> embed : `embed_texts(chunks)` — one call, all chunks · async
+      recall -> sqlite : `add_conversation_chunks` → per-row `INSERT OR REPLACE`\nin one transaction, `UNIQUE(conversation_id, ordinal)` (db.py:444-463)
+      note over recall #FEE2E2
+      `index_folded` is wrapped in a bare `except Exception: pass`
+      (compaction.py:195-196) — the summary is kept while
+      **semantic recall breaks permanently, with zero signal**.
+      `ordinal × 1000` also collides
+      silently if one turn produces > 1000 chunks (recall.py:86).
+      end note
+    end
+    comp -> ctx : re-`measure()` — **one more /tokenize round-trip per round**\nbreak when `fraction ≤ 0.80` or `keep ≤ 2` (compaction.py:303-307)
+  end
+  note over comp #FEE2E2
+  Worst case before the user sees a single token:
+  **4 summarizations, up to 4 condense calls and 5 measures** — each bounded only by
+  `LLM_REQUEST_TIMEOUT` = 300 s with the SDK's 2 retries — and
+  `compact()` swallows every exception, logs a warning, returns `None`
+  (compaction.py:231-239), so the chat proceeds on an uncompacted prompt.
+  end note
+end
+
+comp --> worker : `(history, info{tokens_used, usable_budget, window,\nreserved_output, fraction, summarized_turns, compacted?})`
+worker -> fe : `meta{..., "context": info}` · **SSE** (main.py:376)
+worker -> vllm : the actual answer · `stream_chat_events` · async
+vllm --> fe : `token` / `reasoning` frames → `done` (main.py:647)
+
+== TURN N — AFTER the answer has been delivered (detached) ==
+
+worker -> worker : `_spawn_background_compaction(conv_key,\nfull_history + [user_turn, assistant_turn])`\n**`asyncio.create_task`, deliberately NOT awaited**\n(main.py:654-667 → main.py:133-145)
+note over worker
+The task's strong reference is parked in the module-level
+`_background_tasks` set (main.py:130,144-145) so the loop
+cannot garbage-collect it mid-run.
+end note
+
+comp -> sqlite : `maybe_background_compact` → `get_summary` → `assemble`
+comp -> ctx : `measure(candidate)` → `/tokenize`
+alt fraction ≤ CONTEXT_BG_COMPACT_THRESHOLD = **0.70**
+  comp --> comp : `return None` — nothing to do (compaction.py:350)
+else fraction > 0.70
+  comp -> comp : `compact(cid, history)` — **no `keep` override**, so\n`KEEP_RECENT_TURNS`=8; same locked, idempotent fold as above
+  comp -> comp : park `_pending_notice[cid] =\n{folded_turns: n, background: True}` (compaction.py:353-357)
+end
+note over comp #FEE2E2
+• The **entire** body is `try/except Exception: return None` with **no logging**
+  (compaction.py:339, :359-360) — a permanently failing background fold is silent.
+• `_locks` and `_pending_notice` are **never evicted** (one entry per conversation,
+  process-lifetime growth).
+• `lifespan` has **no shutdown branch** (main.py:27-38): SIGTERM mid-fold drops
+  the summary — safe only because `covers_through` makes the re-fold a no-op.
+end note
+
+== TURN N+1 ==
+
+comp -> comp : `take_pending_notice(cid)` →\n`info["compacted"] = {folded_turns, background: true}`\n(compaction.py:322-326)
+worker -> fe : `meta.context.compacted` · **SSE** — the user is told about\nthe background fold **one turn late**, by design
+worker -> recall : `retrieve_block()` — the folded turns are now\nreachable **semantically** instead of verbatim (recall.py:117-144)
+
+note over comp, sqlite
+**WHY `covers_through` MAKES THIS IDEMPOTENT**
+`covers_through` is a monotone counter of **turns already folded**, one row per
+conversation (`conversation_summaries`, PK `conversation_id`, db.py:55-65).
+1. Every fold path re-reads it **under the per-conversation `asyncio.Lock`**
+   (compaction.py:217-222) and returns `None` when `boundary ≤ covers` (:228).
+2. `assemble` then slices `turns[covers_through:]` (:166) — a turn is either
+   **inside the summary** or **verbatim in the prompt**, never both.
+⇒ the detached 0.70 fold and the synchronous 0.80 fold **cannot double-fold**;
+   a crashed or cancelled fold simply re-runs; a re-delivered request is a no-op.
+⇒ `POST /history/…/truncate` resets the invariant: `history.py:235` →
+   `db.clear_summary` zeroes the counter **and** deletes `conversation_chunks`
+   (db.py:426-441), so the summary can never describe deleted turns.
+**Limits:** the lock is **in-process only** — safe solely because the image runs
+one uvicorn worker with no `--workers` (Dockerfile:52); and `prepare` reads the
+counter outside that lock (:258), so only the //fold// is serialised, not the //measure//.
+end note
+
+legend right
+|= colour |= layer |
+| <back:#2563EB>      </back> | frontend / edge |
+| <back:#7C3AED>      </back> | orchestrator / app logic — one process, one event loop |
+| <back:#16A34A>      </back> | inference / GPU — vllm (MAIN), vllm-embed |
+| <back:#D97706>      </back> | storage / data — app.sqlite3 |
+| <back:#DC2626>      </back> | risk · trust boundary |
+|= threshold |= env var (config.py) |= default |= effect |
+| warn | ""CONTEXT_WARN_THRESHOLD"" :146 | 0.60 | **none — dead config, zero readers** |
+| background | ""CONTEXT_BG_COMPACT_THRESHOLD"" :148 | 0.70 | detached fold AFTER the turn |
+| hard | ""CONTEXT_COMPACT_THRESHOLD"" :152 | 0.80 | synchronous fold BEFORE the request |
+|= notation |= meaning |
+| pink box | trust boundary — no credential crosses it |
+| amber note | behaviour that IS implemented, with its constants |
+| red note | risk: dead config, swallowed exception, stale read, unbounded growth |
+| arrow label | protocol · payload · sync/async |
+endlegend
+
+@enduml

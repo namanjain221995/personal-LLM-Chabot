@@ -1,0 +1,247 @@
+@startgantt 24-remediation-gantt
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName "Inter, Segoe UI, sans-serif"
+skinparam defaultFontSize 13
+skinparam roundCorner 8
+skinparam shadowing false
+skinparam ArrowColor #4A5568
+skinparam ArrowFontColor #4A5568
+skinparam NoteBackgroundColor #FFFBEB
+skinparam NoteBorderColor #F59E0B
+' Layer palette — byte-identical across ALL 24 diagrams
+!$C_EDGE = "#2563EB"   /' frontend / edge '/
+!$C_APP  = "#7C3AED"   /' orchestrator / app logic '/
+!$C_GPU  = "#16A34A"   /' inference / GPU '/
+!$C_DATA = "#D97706"   /' storage / data '/
+!$C_EXT  = "#64748B"   /' external systems '/
+!$C_RISK = "#DC2626"   /' risk / trust boundary '/
+
+title 90-day remediation plan — P0 → P3, sequenced with dependencies and owners\n**Day 1 = Mon 2026-08-03 · 12 working weeks · weekends closed · durations in working days**\nEvery item traces to a file:LINE in the evidence base. Owner is named in each bar.
+
+projectscale weekly
+Project starts 2026-08-03
+saturday are closed
+sunday are closed
+
+' ══════════════════════════════════════════════════════════════════════
+' P0 — WEEK 1 — deployment posture
+' ══════════════════════════════════════════════════════════════════════
+-- P0 · WEEK 1 · deployment posture --
+
+[P0-1  Bind published ports to 127.0.0.1 (or put authN in front)  ·  Platform] as [P01] lasts 3 days
+[P01] is colored in #DC2626/#FECACA
+
+note bottom
+  **P0-1 — the single highest-severity finding in the audit.**
+  `docker-compose.yml:86,133,171,202,272-273,351-352` publish :3000 :8000 :8001 :8002 :8003 :8080
+  on **0.0.0.0**, while `auth.py:95-97` `require_user()` never 401s and `main.py:55-56` keeps
+  `/chat` and `/reports*` deliberately auth-free. `auth.py:17-20` says the design is safe //only// if
+  the ports are private — the compose bindings mean they are not. One line per service:
+  `- "127.0.0.1:8080:8080"`. Nothing depends on this technically, but it is what keeps every
+  finding below from being remotely exploitable while it is being fixed.
+end note
+
+[M0 · host no longer reachable from the LAN] happens at [P01]'s end
+
+' ══════════════════════════════════════════════════════════════════════
+' P1 — WEEKS 1-3 — guard correctness, blocking I/O, resource caps
+' ══════════════════════════════════════════════════════════════════════
+-- P1 · WEEKS 1-3 · guard correctness, blocking I/O, resource caps --
+
+[P1-1  Fix the sql_guard E-string desync — checks run on `bare`, `cleaned` executes  ·  Backend] as [P11] lasts 12 days
+[P11] starts at [P01]'s end
+[P11] is colored in #EA580C/#FED7AA
+
+[P1-2  Pin the SSRF-validated IP — close the resolve-then-connect TOCTOU  ·  Backend] as [P12] lasts 5 days
+[P12] starts at [P01]'s end
+[P12] is colored in #EA580C/#FED7AA
+
+[P1-3  Off-load the blocking DuckDB call to a thread  ·  Backend] as [P13] lasts 3 days
+[P13] starts at [P12]'s end
+[P13] is colored in #EA580C/#FED7AA
+
+[P1-4  Cap the request body (ChatRequest fields + an ASGI size limit)  ·  Platform] as [P14] lasts 3 days
+[P14] starts at [P01]'s end
+[P14] is colored in #EA580C/#FED7AA
+
+[P1-5  Stream and cap fetch bodies instead of buffering resp.content  ·  Backend] as [P15] lasts 4 days
+[P15] starts at [P14]'s end
+[P15] is colored in #EA580C/#FED7AA
+
+[P1-6  Fix the fall-open conversation-ownership check  ·  Backend] as [P16] lasts 3 days
+[P16] starts at [P15]'s end
+[P16] is colored in #EA580C/#FED7AA
+
+note bottom
+  **P1-1** `core/sql_guard.py:57-126` scans into two buffers; `:129-157` validates `bare` but
+  returns `cleaned`. A reproduced input `SELECT E'\''…; ATTACH …` defeats **both** the
+  stacked-statement check (`:142`) and the keyword blocklist (`:146`). Replace the scanner with a
+  real parser, or at minimum model `E'…'`, `$$…$$`, quoted function names and DuckDB replacement
+  scans on string literals. Containment today rests entirely on `engines/sql.py:124-132`
+  (`read_only=True`, `enable_external_access=False`) — that is one control deep.
+  **P1-2** `core/net.py:99` discards the IPs `resolve_public_ips()` just validated and httpx
+  re-resolves when it connects at `:137`. Pin the address (connect-to / custom transport). While
+  in the file: add `100.64.0.0/10` to `_ip_is_blocked` (`:47-55`), give `socket.getaddrinfo`
+  (`:76`) a timeout, and add a total-request deadline (the `read` timeout is per-read, so a
+  slowloris survives indefinitely).
+  **P1-3** `engines/sql.py:201,206` runs DuckDB synchronously inside `async def`, on a single
+  uvicorn worker (`Dockerfile:52`) — one slow query stalls **every** user's SSE stream.
+  `health.py:122-123` already demonstrates the `asyncio.to_thread` pattern. `uploads.py:99/103`
+  (archive extraction), `main.py:259` (`list_reports`) and `main.py:499` (`select_relevant`) have
+  the same shape.
+  **P1-4** `main.py:184-199` bounds neither `messages` nor the base64 `image`/`pdf` strings, and
+  `main.py:47-53` installs CORS as the only middleware — Starlette adds no default body limit.
+  Also bound `LiveGeneration.events` (`main.py:85,97`), which retains every token frame for the
+  generation's whole life, and make `core/archive.py:216`'s byte budget global rather than
+  per-call.
+  **P1-5** `net.py:153-155` slices `resp.content` **after** httpx has already buffered the entire
+  response — the cap protects the prompt, not the process.
+  **P1-6** `main.py:338-341` wraps `db.conversation_owner()` in `except Exception:
+  conv_owner = None`, so `main.py:343` skips the 404 on any DB error. The comment at `:336-337`
+  asserts the opposite behaviour.
+end note
+
+[M1 · P1 closed — no fall-open guard, no event-loop stall] happens at [P11]'s end
+
+' ══════════════════════════════════════════════════════════════════════
+' P2 — WEEKS 4-8 — CI, reproducibility, data integrity, observability
+' ══════════════════════════════════════════════════════════════════════
+-- P2 · WEEKS 4-8 · CI, reproducibility, data integrity, observability --
+
+[P2-1  Add CI (GitHub Actions): pytest + vitest + next lint + tsc on every push  ·  Platform] as [P21] lasts 15 days
+[P21] starts at [P11]'s end
+[P21] is colored in #D97706/#FDE68A
+
+[P2-2  Lockfile + upper-bound pinning for the orchestrator; digest-pin the base image  ·  Platform] as [P22] lasts 5 days
+[P22] starts at [P11]'s end
+[P22] is colored in #D97706/#FDE68A
+
+[P2-3  FKs or explicit cleanup for the 4 orphaning tables  ·  Data] as [P23] lasts 6 days
+[P23] starts at [P22]'s end
+[P23] is colored in #D97706/#FDE68A
+
+[P2-4  Index the DuckDB Id columns  ·  Data] as [P24] lasts 4 days
+[P24] starts at [P23]'s end
+[P24] is colored in #D97706/#FDE68A
+
+[P2-5  Stop re-running the schema + migration on every connect() call site  ·  Data] as [P25] lasts 5 days
+[P25] starts at [P24]'s end
+[P25] is colored in #D97706/#FDE68A
+
+[P2-6  Remove the dead AWS config from .env.example; delete the plaintext .env backup  ·  Platform] as [P26] lasts 2 days
+[P26] starts at [P22]'s end
+[P26] is colored in #D97706/#FDE68A
+
+[P2-7  Correlation IDs + structured logs: browser → orchestrator → engine → model  ·  Backend] as [P27] lasts 10 days
+[P27] starts at [P21]'s end
+[P27] is colored in #D97706/#FDE68A
+
+note bottom
+  **P2-1** There is **no CI of any kind** — no `.github/`, `.gitlab-ci.yml`, `Jenkinsfile`,
+  `.circleci/`, `Makefile`, `pytest.ini`/`pyproject.toml`, pre-commit config or coverage tooling.
+  1 141 passing tests run only when a human types `README.md:298-302`. Wire the three existing
+  commands first, then add `next lint`, `npx tsc --noEmit` and a coverage floor. Delete rather
+  than bless the 5 tests that cannot fail: `test_search_off.py:9-29` (re-implements the gate
+  locally, ends `assert True`), `test_search_engine.py:111-116`
+  (`assert settings.search_enabled in (True, False)`),
+  `test_conversation_integrity.py:553-566` (monkeypatches the checker to itself),
+  `test_chart_pipeline.py:197-199` (`assert x is None or True`),
+  `test_history_v3.py:162-176` (posts to a route that 404s).
+  **P2-2** `orchestrator/requirements.txt:3-28` is 20 unbounded `>=` pins with **no lockfile**;
+  `sync-worker/requirements.txt` already caps majors and `frontend/package-lock.json` is fully
+  locked — adopt the sync-worker regime, then digest-pin `nvcr.io/nvidia/vllm:26.05-py3`
+  (`Dockerfile:14`) so the deployment stops depending on "never `docker compose pull`"
+  (`README.md:273-276`). Add `python-multipart`, `pypdfium2`, `pillow`, `trafilatura` to
+  `requirements-dev.txt` — without the first, 12 test files fail at collection on a clean host.
+  **P2-3** `db.py:84,102,114,123` declare no foreign key, so `delete_conversation`
+  (`db.py:334-340`) orphans `uploads`, `url_documents`, `repos`, `repo_chunks`. Conversation ids
+  are client-supplied (`history.py:92-97`), so a recreated id inherits
+  **the deleted conversation's rows**.
+  **P2-4** `syncworker/storage.py:140` creates every warehouse table with no PRIMARY KEY and no
+  index, so the upsert `DELETE … WHERE Id IN (…)` (`:156`) is a full table scan on every batch,
+  every 30 minutes, for all 48 objects.
+  **P2-5** `db.py:195-205` executes 16 DDL statements plus a full-table de-dup `DELETE`
+  (`:181-186`) on **every** call — 34 call sites (31 × `closing(connect())` in `db.py`, plus
+  `auth.py:48`, `health.py:79`, `main.py:36`); one `POST /chat` pays it at least six times.
+  Migrate once in `lifespan` (`main.py:27-38`) and cache. `auth.py:48` `_oldest_user()` also
+  leaks the connection it opens.
+  **P2-6** `.env.example:7-14` still solicits `AWS_REGION` / `AWS_ACCESS_KEY_ID` /
+  `AWS_SECRET_ACCESS_KEY` / `SF_SECRET_NAME` for a subsystem deleted on 2026-07-28
+  (`syncworker/secrets.py:1-6,172`; `tests/test_secrets.py:72` asserts `boto3` is absent).
+  18 of the template's 43 variables reach no container at all — there is no `env_file:` in
+  `docker-compose.yml`. `.env.bak-205921` sits plaintext in the working tree (gitignored, mode
+  600, but still on disk).
+  **P2-7** 42 broad `except Exception` handlers swallow errors across `orchestrator/app`;
+  `main.py:161` and `:676` use `contextlib.suppress` around a persist, so a lost answer is
+  silent. No correlation id propagates browser → orchestrator → engine → model.
+end note
+
+[M2 · CI green on every push; builds reproducible] happens at [P21]'s end
+
+' ══════════════════════════════════════════════════════════════════════
+' P3 — WEEKS 9-12 — end-to-end assurance, GPU budget, doc drift
+' ══════════════════════════════════════════════════════════════════════
+-- P3 · WEEKS 9-12 · end-to-end assurance, GPU budget, doc drift --
+
+[P3-1  Integration / E2E tests for the 8 critical paths  ·  QA] as [P31] lasts 20 days
+[P31] starts at [P27]'s end
+[P31] is colored in #16A34A/#DCFCE7
+
+[P3-2  GPU budget enforcement — the vision profile breaches the stated ceiling  ·  Platform] as [P32] lasts 6 days
+[P32] starts at [P27]'s end
+[P32] is colored in #16A34A/#DCFCE7
+
+[P3-3  Close docs / CHANGELOG drift  ·  Docs] as [P33] lasts 6 days
+[P33] starts at [P32]'s end
+[P33] is colored in #16A34A/#DCFCE7
+
+note bottom
+  **P3-1** Three of the eight critical flows have no end-to-end coverage at all.
+  **RAG retrieval** — `engines/rag.py` (151 LOC) has zero tests; `run_rag_engine` has no caller
+  in the suite, so LanceDB search, the Qwen3-Reranker load path and the citation contract
+  `README.md:52-53` calls non-negotiable are unexercised.
+  **upload → extract → report → PDF** — `POST /uploads` (`uploads.py:66-71`) is referenced by no
+  test; `run_report_engine` (`engines/report.py:214`) and `_run_pandoc` (`:102-121`, which shells
+  out to `pandoc --pdf-engine=weasyprint`) never execute, so the `.docx`/`.pdf` artefacts the
+  README advertises are never produced in CI.
+  **NL → SQL → guard → DuckDB as a composition** — every `fake_chat_completion` in the suite
+  returns a benign `SELECT`, so nothing proves a model emitting `DROP TABLE opportunities`
+  produces an SSE `error` frame rather than a query. Also join the two SSE halves: no test feeds
+  real orchestrator bytes into `frontend/lib/sse.ts readChatStream`.
+  **P3-2** `docker-compose.yml:25` sets a ≲0.60 GPU-fraction ceiling, but `--profile vision`
+  sums 0.35 + 0.11 + 0.14 + 0.04 = **0.64 ≈ 77 GB of 121 GB**, and the orchestrator holds a
+  further GPU reservation for the in-process reranker (`:283-289`, `RERANK_ENABLED: "true"`
+  `:244`) that sits outside the budget entirely. The compose header comment `:21-24` and
+  `README.md:283-288` both repeat the stale 0.53 sum that omits `vllm-vision`.
+  **P3-3** `frontend/README.md:11` still documents Recharts (replaced by ECharts), `:58-67`
+  documents `/login`, `middleware.ts` and the `ts_session` cookie (all removed on 2026-07-28),
+  `:69-72` documents a model picker that now chooses effort, and `:29` gives an
+  `ORCHESTRATOR_URL` default that is wrong inside the compose network.
+  `README.md:142` says `SEARCH_MAX_RESULTS=10` while `.env.example:55` and
+  `docker-compose.yml:256` say 100. `CHANGELOG.md:205-208` and `:406-412` describe superseded
+  models and context windows with no "superseded" marker. `.env.example:4` still names a model
+  replaced on 2026-07-28.
+end note
+
+[M3 · end of week 12 — 8 critical paths covered end-to-end] happens at [P31]'s end
+[M4 · Day 90 — re-run the full audit] happens on 2026-11-02
+
+legend right
+  |= Colour |= Priority |= Exit criterion |
+  |<#FECACA> | **P0** — week 1 | nothing on the box answers an unauthenticated caller |
+  |<#FED7AA> | **P1** — weeks 1-3 | no guard fails open; no blocking call on the event loop |
+  |<#FDE68A> | **P2** — weeks 4-8 | CI green on every push; builds reproducible; no orphan rows |
+  |<#DCFCE7> | **P3** — weeks 9-12 | 8 critical paths covered E2E; GPU budget enforced |
+  ==
+  ◇ = milestone. An arrow into a bar is a hard dependency
+  (`starts at <predecessor>'s end`). Owners: **Platform** (compose, CI,
+  packaging) · **Backend** (orchestrator/app) · **Data** (SQLite + DuckDB
+  + sync worker) · **QA** (test engineering) · **Docs**.
+  ==
+  **Critical path:** P0-1 → P1-1 → P2-1 → P2-7 → P3-1 = 60 working days.
+  P1-1 (sql_guard) and P2-1 (CI) are the two items that gate everything
+  downstream; start both the day their predecessor lands.
+end legend
+
+@endgantt

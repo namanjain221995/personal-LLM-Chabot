@@ -1,0 +1,114 @@
+@startuml 06-deployment
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName "Inter, Segoe UI, sans-serif"
+skinparam defaultFontSize 13
+skinparam roundCorner 8
+skinparam shadowing false
+skinparam ArrowColor #4A5568
+skinparam ArrowFontColor #4A5568
+skinparam NoteBackgroundColor #FFFBEB
+skinparam NoteBorderColor #F59E0B
+' Layer palette — byte-identical across ALL 24 diagrams
+!$C_EDGE = "#2563EB"   /' frontend / edge '/
+!$C_APP  = "#7C3AED"   /' orchestrator / app logic '/
+!$C_GPU  = "#16A34A"   /' inference / GPU '/
+!$C_DATA = "#D97706"   /' storage / data '/
+!$C_EXT  = "#64748B"   /' external systems '/
+!$C_RISK = "#DC2626"   /' risk / trust boundary '/
+
+!include <C4/C4_Deployment>
+!include <tupadr3/common>
+!include <tupadr3/devicons2/python>
+!include <tupadr3/devicons2/nextjs>
+!include <tupadr3/devicons2/docker>
+!include <tupadr3/font-awesome-5/microchip>
+!include <tupadr3/font-awesome-5/database>
+!include <tupadr3/font-awesome-5/hdd>
+!include <tupadr3/font-awesome-5/search>
+
+title Deployment — DGX Spark workstation, single Docker network, one shared GPU\n(evidence: docker-compose.yml)
+
+Deployment_Node(host, "DGX Spark workstation", "aarch64 · Linux 6.17 · 121 GB UNIFIED memory") {
+
+  Deployment_Node(gpu, "NVIDIA GPU — UNIFIED memory pool", "every service reserves `count: all` (docker-compose.yml:99-101)") {
+    Container(vllm, "vllm — MAIN model", "vllm/vllm-openai:nightly", "Qwen3.6-35B-A3B-NVFP4 (MoE 35B/3B active, multimodal, reasoning)\n--max-model-len 262144 · --kv-cache-dtype fp8\n**--gpu-memory-utilization 0.35** (~22 GB weights + ~10 GB KV)\nserves: chat, SQL, RAG, report, vision, agent synthesis\ndocker-compose.yml:28-101", $sprite="microchip")
+    Container(vllmr, "vllm-router — AGENT/CLASSIFIER model", "vllm/vllm-openai:nightly", "Qwen3-VL-8B-Instruct-FP8 (~10 GB)\n--max-model-len 65536 · --kv-cache-dtype fp8\n**--gpu-memory-utilization 0.14**\nserves: route classification + agent sub-steps\ndocker-compose.yml:155-184", $sprite="microchip")
+    Container(vllme, "vllm-embed", "nvcr.io/nvidia/vllm:26.05-py3", "Qwen3-Embedding-0.6B · --runner pooling\n--max-model-len 4096\n**--gpu-memory-utilization 0.04**\ndocker-compose.yml:186-215", $sprite="microchip")
+    Container(vllmv, "vllm-vision  «profile: vision»", "nvcr.io/nvidia/vllm:26.05-py3", "Qwen3-VL-2B-Instruct (4.3 GB) · --enforce-eager\n--max-model-len 8192\n**--gpu-memory-utilization 0.11**\nNOT started by a plain `up -d`\ndocker-compose.yml:103-146", $sprite="microchip")
+  }
+
+  Deployment_Node(app, "application containers", "same default compose network") {
+    Container(fe, "frontend", "Next.js 15 · React 19 · Node", "SSR + /api/* proxy routes\nORCHESTRATOR_URL=http://orchestrator:8080\ndocker-compose.yml:346-355", $sprite="nextjs")
+    Container(orc, "orchestrator", "FastAPI · uvicorn · Python 3.12", "13 engine modules + core guards\nin-process Qwen3-Reranker-0.6B (CPU/GPU)\ndocker-compose.yml:217-289", $sprite="python")
+    Container(sw, "sync-worker", "Python 3.12", "SYNC_INTERVAL_MINUTES=30\nno host port, no healthcheck, no restart policy\ndocker-compose.yml:291-331", $sprite="python")
+    Container(sx, "searxng  «profile: search»", "searxng/searxng:latest", "internal only — NO host port\ndocker-compose.yml:336-344", $sprite="search")
+  }
+
+  Deployment_Node(vol, "named volumes", "docker-compose.yml:7-10") {
+    ContainerDb(dvol, "data", "volume → /data", "warehouse.duckdb · lancedb/ · parquet/\napp.sqlite3 · workspaces/ · .session_secret", $sprite="database")
+    ContainerDb(rvol, "reports", "volume → /reports", "generated PDF/XLSX/CSV", $sprite="hdd")
+    ContainerDb(hvol, "hf-cache", "volume → ~/.cache/huggingface", "model weights (tens of GB)", $sprite="hdd")
+  }
+
+  Deployment_Node(bind, "host bind mounts", "read-only") {
+    ContainerDb(weights, "vllm_models/", "bind :ro", "local NVFP4 / FP8 checkpoints\ndocker-compose.yml:84, :169", $sprite="hdd")
+  }
+}
+
+Person(op, "Operator / analyst", "browser on the host — or on the LAN")
+
+Rel(op, fe, "http://<host>:3000", "TCP · published 0.0.0.0")
+Rel(op, orc, "http://<host>:8080 — DIRECT, unauthenticated", "TCP · published 0.0.0.0")
+Rel(fe, orc, "POST /chat · SSE · async", "internal DNS")
+Rel(orc, vllm, "OpenAI /v1 · JSON + SSE · async", "http://vllm:30000")
+Rel(orc, vllmr, "OpenAI /v1 · classification · async", "http://vllm-router:30002")
+Rel(orc, vllme, "OpenAI /v1/embeddings · async", "http://vllm-embed:30003")
+Rel(orc, vllmv, "OpenAI /v1 · vision (optional)", "http://vllm-vision:30001")
+Rel(orc, sx, "GET /search · JSON", "http://searxng:8080")
+Rel(orc, dvol, "DuckDB read-only + SQLite WAL", "file I/O")
+Rel(orc, rvol, "write reports", "file I/O")
+Rel(sw, dvol, "DuckDB read-write · upsert + watermark", "file I/O")
+Rel(sw, vllme, "embed chunks (batched)", "http://vllm-embed:30003")
+Rel(vllm, weights, "load checkpoint", "mmap :ro")
+Rel(vllmr, weights, "load checkpoint", "mmap :ro")
+
+note right of gpu #FFE4E6
+  **Single shared GPU, no isolation.**
+  Reserved fractions: 0.35 + 0.14 + 0.04 = **0.53**
+  ( + 0.11 = **0.64** when the vision profile is on ).
+  docker-compose.yml:18-25 warns the sum must stay
+  ≲ 0.6 and records that over-reserving once took
+  the box to 0 GB free.
+  Nothing enforces this at runtime — the guard is a
+  YAML comment.
+end note
+
+note right of sw #FFE4E6
+  **sync-worker has no `restart:` policy and no
+  healthcheck** (docker-compose.yml:291-331), unlike
+  every other service. If it exits, the warehouse
+  silently stops refreshing and /health still says ok.
+end note
+
+note bottom of orc #FFFBEB
+  `depends_on: service_healthy` for vllm, vllm-router,
+  vllm-embed (docker-compose.yml:274-282) — but
+  **start_period is 30m/15m/10m**, so a cold first boot
+  blocks the app layer for up to half an hour.
+  vllm-vision is deliberately NOT a dependency.
+end note
+
+legend right
+  |= Colour |= Layer |
+  |<#2563EB> | frontend / edge |
+  |<#7C3AED> | orchestrator / app logic |
+  |<#16A34A> | inference / GPU |
+  |<#D97706> | storage / data |
+  |<#64748B> | external systems |
+  |<#DC2626> | risk / trust boundary |
+  Ports shown as `host:container`. All published
+  ports bind 0.0.0.0 (every host interface).
+end legend
+
+@enduml

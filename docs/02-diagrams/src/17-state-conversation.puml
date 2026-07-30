@@ -1,0 +1,182 @@
+@startuml 17-state-conversation
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName "Inter, Segoe UI, sans-serif"
+skinparam defaultFontSize 13
+skinparam roundCorner 8
+skinparam shadowing false
+skinparam ArrowColor #4A5568
+skinparam ArrowFontColor #4A5568
+skinparam NoteBackgroundColor #FFFBEB
+skinparam NoteBorderColor #F59E0B
+' Layer palette — byte-identical across ALL 24 diagrams
+!$C_EDGE = "#2563EB"   /' frontend / edge '/
+!$C_APP  = "#7C3AED"   /' orchestrator / app logic '/
+!$C_GPU  = "#16A34A"   /' inference / GPU '/
+!$C_DATA = "#D97706"   /' storage / data '/
+!$C_EXT  = "#64748B"   /' external systems '/
+!$C_RISK = "#DC2626"   /' risk / trust boundary '/
+
+skinparam state {
+  FontColor #0F172A
+  AttributeFontSize 12
+  StartColor #2563EB
+  EndColor #DC2626
+}
+
+title State — one conversation key: the LiveGeneration lifecycle plus the archive flag\nGuards are the real conditions in the code, not idealised ones\n(evidence: orchestrator/app/main.py:62-120, :274-685, :688-796 · orchestrator/app/compaction.py:242-360 · orchestrator/app/history.py:116-131 · frontend/lib/streams.ts:27-32)
+
+state "**TRUST BOUNDARY** — every transition inside this region is reachable\nunauthenticated on host :8080. `_owns()` (main.py:701-709) is structurally\ncorrect but compares the single local identity to itself, because\n`current_user()` never returns None and `require_user()` never 401s\n(auth.py:89-92). Ports are published on 0.0.0.0 (docker-compose.yml:272-273)." as TB #FFFFFF##[dashed]DC2626 {
+
+  state "idle" as idle #DBEAFE##2563EB
+  idle : no entry in `_live_generations` for this conv_key
+  idle : `/chat/active` does not list it (main.py:725-737)
+  idle : client `LiveStream` absent → Composer enabled
+
+  state "streaming" as streaming #EDE9FE##7C3AED
+  state "tool-calling (agent)" as tooling #EDE9FE##7C3AED
+  state "detached" as detached #DDD6FE##7C3AED
+  state "stopped" as stopped #FEF3C7##D97706
+  state "failed" as failed #FEE2E2##DC2626
+  state "compacted" as compacted #DCFCE7##16A34A
+
+  streaming : `gen.done == False`, task alive
+  streaming : every frame appended to `gen.events` **and** notified
+  streaming : client mirror `StreamStatus = 'streaming'` (streams.ts:27-32)
+
+  tooling : engines.agent subgraph PLAN → EXECUTE → SYNTHESIZE
+  tooling : ≤ MAX_STEPS 8, STEP_CONCURRENCY 3 (agent.py:36-37)
+  tooling : emits `step` frames {id, title, running|done|failed}
+
+  detached : HTTP response gone, `asyncio.Task` still running
+  detached : `subscribers == 0`, buffer keeps growing
+  detached : still listed by `/chat/active` (main.py:725-737)
+
+  stopped : `gen.cancelled = True` (main.py:668-669)
+  stopped : stream closes with **no terminal frame at all**
+
+  failed : `gen.failed = True`; `error` frame carries `str(exc)` verbatim
+  compacted : rolling summary folded, `db.save_summary()` upserted
+
+  [*] --> idle : conversation row created\n**POST /history/conversations**\n(history.py:88-102)
+
+  idle --> streaming : **POST /chat** — LiveGeneration registered in\n`_live_generations[conv_key]`, `worker()` spawned as a\nDETACHED asyncio.Task, StreamingResponse returned\n(main.py:352-356, :679, :681-685)
+
+  streaming --> tooling : [ `want_agent` = `request.agent` ∨ `auto_plan.agent` ]\nengines.agent selected by the dispatch chain\n(main.py:417, :592)
+  tooling --> streaming : SYNTHESIZE streams the merged answer as\n`token` frames and one merged `meta` (agent.py:602, :605)
+
+  streaming --> detached : browser tab closed / reloaded / navigated away.\nThe HTTP request ends; the task deliberately does NOT\n(main.py:62-76). `req.signal` reaches Next.js only.
+  detached --> streaming : **GET /chat/attach/{id}** — `follow()` replays the\nwhole buffer from index 0, then streams live\n(main.py:105-120, :782-796)
+  detached --> idle : generation finished while `subscribers == 0` →\n`_finalize_generation()` persists the answer server-side\nso it is waiting in history after reload (main.py:148-168)
+
+  streaming --> stopped : **POST /chat/stop** → `gen.task.cancel()`.\nClosing the SSE stream alone no longer stops the model\n(main.py:712-722)
+  streaming --> stopped : a NEW send on the same conv_key —\n`previous.task.cancel()`, the newest message wins\n(main.py:348-350)
+  tooling --> stopped : same two guards — cancel targets the task,\nnot the agent phase
+  stopped --> idle : `CancelledError` → `finish()` → `follow()` breaks.\nNo `done` and no `error` frame; the client silently\nmaps this to `status:'done'` (streams.ts:264-268)
+
+  streaming --> failed : uncaught `Exception` in `worker()` →\n`publish("error", {"message": str(exc)})` (main.py:670-672)
+  failed --> idle : client `finalize({status:'error'})`, then\n`friendlyError()` re-labels the raw text\n(streams.ts:251-255 · errors.ts:61-104)
+
+  streaming --> compacted : [ `budget.fraction` > **0.80** =\nCONTEXT_COMPACT_THRESHOLD ] synchronous fold inside\n`compaction.prepare()` — up to 4 adaptive rounds\nhalving `keep` toward MIN_KEEP_RECENT 2\n(compaction.py:272-307, config.py:152-154)
+  compacted --> streaming : `assemble(summary, keep_recent turns, retrieved)`\nre-measured, then sent to the model (compaction.py:149-167)
+
+  idle --> compacted : [ background: `fraction` > **0.70** =\nCONTEXT_BG_COMPACT_THRESHOLD ] detached task spawned\nafter the answer (main.py:654-667 · compaction.py:330-360)
+  idle --> compacted : **POST /chat/compact** — "Compact now" in the meter\npopover; `compact(force=True)` folds everything but the most\nrecent turns regardless of fullness (main.py:745-779)
+  compacted --> idle : `db.save_summary()` upsert; the notice is parked in\n`_pending_notice` and rides out on the **next** reply\n(compaction.py:353-357, :322-326)
+}
+
+state "archived" as archived #FEF3C7##D97706
+archived : row flag on `conversations`, **orthogonal** to the states above
+archived : nothing prevents a send on an archived conversation
+
+idle --> archived : **PUT /history/conversations/{id}** `{archived:true}`\nmodel is `extra="forbid"` → 422 on an unknown key\n(history.py:116-131)
+archived --> idle : `{archived:false}`
+archived --> [*] : **DELETE /history/conversations/{id}** (history.py:257-263)
+idle --> [*] : **DELETE**, or truncate → `db.clear_summary()` which also\ndeletes `conversation_chunks` (history.py:235 · db.py:426-441)
+
+note right of detached #FEE2E2
+  `LiveGeneration.events` is **unbounded** (main.py:85,97): every
+  token frame is retained for the generation's whole life so a
+  late attach can replay it. Nothing evicts it.
+  `follow()` increments `subscribers` on first iteration and
+  decrements in `finally` (main.py:105-120) — an abandoned async
+  generator whose `aclose()` is deferred keeps `subscribers > 0`
+  and therefore **suppresses the server-side persist** at
+  main.py:157: the answer is lost from history.
+  On the client, `attachStream`'s "already streaming" guard is
+  checked BEFORE the `await` at streams.ts:364, so the 8 s poll
+  can double-register and open two readers on one generation.
+end note
+
+note left of stopped #FEE2E2
+  This is the **third, undocumented terminal state**: sse.py:20-24
+  documents only `done` and `error`.
+  The old task is cancelled but **never awaited** (main.py:348-350),
+  so its `finally` — including `db.add_message` — can run after the
+  new generation already replaced the registry entry.
+  Client-side, `stopStream()` aborts the local reader *before*
+  awaiting the server call and never inspects `{stopped}`
+  (streams.ts:82-92); the promise is `.catch(() => undefined)`, so a
+  stop that silently fails leaves the GPU generating with no signal.
+end note
+
+note right of compacted #FFFBEB
+  `prepare()` reads `db.get_summary` **outside** the per-conversation
+  lock (compaction.py:258-260) while a detached background fold for
+  the previous turn may already be inside `_lock_for()` about to
+  `save_summary` — the measurement can be stale. The module
+  docstring's "they cannot double-fold or race each other"
+  (compaction.py:19-20) is true only of the fold itself.
+  `maybe_background_compact` swallows every exception and returns
+  None with **no logging** (compaction.py:359-360).
+  `settings.context_warn_threshold` (config.py:146, .env.example:96)
+  has **zero other references** — dead configuration.
+end note
+
+note left of failed #FEE2E2
+  `str(exc)` is sent to the browser verbatim — no sanitisation, no
+  logging (main.py:670-672). `friendlyError()` then mis-classifies
+  several of them: the `NOT_FOUND_MODEL` regex ends in a bare
+  `not found`, so "conversation not found" (main.py:344) and
+  "report not found" (main.py:269) both render as *"The selected
+  model is not available on this machine right now."*
+  (errors.ts:59, :89-95).
+end note
+
+note bottom of archived #FFFBEB
+  The Sidebar's Archived disclosure only renders when
+  `archived.length > 0` (Sidebar.tsx:245), and that list comes from
+  the **local** cache; `onLoadArchived()` (which pulls
+  `?archived=true`) can only fire from inside that section. A
+  conversation archived on another device is therefore invisible
+  until some other path caches it.
+end note
+
+note top of idle #FFFBEB
+  `_live_generations` and `_background_tasks` are **never drained**:
+  `lifespan` has no shutdown branch (main.py:27-38), so SIGTERM
+  kills in-flight generations without a terminal frame.
+  The client's own state machine is coarser —
+  `StreamStatus = 'streaming' | 'done' | 'stopped' | 'error' |
+  'unreachable'` (streams.ts:27-32). It has **no** `detached` and
+  **no** `compacted` member, and `markUnreachable()` is used for
+  every non-2xx including a 400 (streams.ts:165-178).
+end note
+
+legend right
+  |= Colour |= Layer / meaning |
+  |<#2563EB> | frontend / edge — the client mirror of these states |
+  |<#7C3AED> | orchestrator / app logic — live generation states |
+  |<#16A34A> | inference / GPU — a state entered by a model call |
+  |<#D97706> | storage / data — a state that is a persisted row flag |
+  |<#64748B> | external systems |
+  |<#DC2626> | risk / trust boundary |
+  ==Notation==
+  **Dashed red rectangle** = trust boundary (unauthenticated region).
+  Guards in [brackets] are the literal conditions in the source.
+  Bold text on a transition is the HTTP trigger.
+  Red notes = data loss, unbounded resource or security posture.
+  Amber notes = silent degradation, dead config or stale read.
+end legend
+
+@enduml

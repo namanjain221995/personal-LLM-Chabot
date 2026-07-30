@@ -1,0 +1,114 @@
+@startuml 02-c4-container
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName "Inter, Segoe UI, sans-serif"
+skinparam defaultFontSize 13
+skinparam roundCorner 8
+skinparam shadowing false
+skinparam ArrowColor #4A5568
+skinparam ArrowFontColor #4A5568
+skinparam NoteBackgroundColor #FFFBEB
+skinparam NoteBorderColor #F59E0B
+' Layer palette — byte-identical across ALL 24 diagrams
+!$C_EDGE = "#2563EB"   /' frontend / edge '/
+!$C_APP  = "#7C3AED"   /' orchestrator / app logic '/
+!$C_GPU  = "#16A34A"   /' inference / GPU '/
+!$C_DATA = "#D97706"   /' storage / data '/
+!$C_EXT  = "#64748B"   /' external systems '/
+!$C_RISK = "#DC2626"   /' risk / trust boundary '/
+
+!include <C4/C4_Container>
+!include <tupadr3/common>
+!include <tupadr3/devicons2/python>
+!include <tupadr3/devicons2/nextjs>
+!include <tupadr3/devicons2/docker>
+!include <tupadr3/font-awesome-5/microchip>
+!include <tupadr3/font-awesome-5/database>
+!include <tupadr3/font-awesome-5/hdd>
+!include <tupadr3/font-awesome-5/search>
+!include <logos/salesforce>
+
+title C4 L2 — Containers, ports and protocols\n(evidence: docker-compose.yml, orchestrator/app/main.py, frontend/lib/proxy.ts, syncworker/main.py)
+
+Person(analyst, "Analyst / owner", "browser")
+
+System_Boundary(host, "DGX Spark host — single docker network `sf-local-ai`") {
+
+  Container(fe, "frontend", "Next.js 15 · React 19 · TypeScript", "App Router UI + 10 server-side /api/* proxy routes.\nHolds ORCHESTRATOR_URL server-side only.\n**host :3000 → :3000**", $sprite="nextjs")
+
+  Container(orc, "orchestrator", "FastAPI · uvicorn · Python 3.12", "8 HTTP routes + /auth /history /uploads routers.\n13 engine modules, 21 core modules, SSE fan-out,\nin-process Qwen3-Reranker-0.6B.\n**host :8080 → :8080 — NO AUTH**", $sprite="python")
+
+  Container(sw, "sync-worker", "Python 3.12 · standalone loop", "Salesforce JWT auth → object discovery → bulk pull →\nnormalize → Parquet → DuckDB upsert → chunk → embed →\nLanceDB → watermark. Every 30 min.\n**no port · no healthcheck · no restart policy**", $sprite="python")
+
+  Container(sx, "searxng", "searxng/searxng:latest", "Metasearch. profile:`search`.\n**internal only — no host port**", $sprite="search")
+
+  Container(vllm, "vllm — MAIN", "vLLM nightly · Qwen3.6-35B-A3B-NVFP4", "chat · SQL · RAG · report · vision · agent synthesis\nmax-model-len 262144 · gpu-mem 0.35\n**host :8000 → :30000 — NO AUTH**", $sprite="microchip")
+  Container(vllmr, "vllm-router — AGENT", "vLLM nightly · Qwen3-VL-8B-Instruct-FP8", "route classification + agent sub-steps\nmax-model-len 65536 · gpu-mem 0.14\n**host :8002 → :30002 — NO AUTH**", $sprite="microchip")
+  Container(vllme, "vllm-embed", "vLLM 26.05 · Qwen3-Embedding-0.6B", "--runner pooling · max-model-len 4096\ngpu-mem 0.04\n**host :8003 → :30003 — NO AUTH**", $sprite="microchip")
+  Container(vllmv, "vllm-vision «profile: vision»", "vLLM 26.05 · Qwen3-VL-2B-Instruct", "optional OCR/VL · --enforce-eager\ngpu-mem 0.11\n**host :8001 → :30001 — NO AUTH**", $sprite="microchip")
+
+  ContainerDb(duck, "DuckDB warehouse", "volume `data` → /data/warehouse.duckdb", "One table per Salesforce object + `_sync_meta`.\nOrchestrator opens READ-ONLY with\nenable_external_access=False.\nSync-worker opens READ-WRITE.", $sprite="database")
+  ContainerDb(lance, "LanceDB", "volume `data` → /data/lancedb", "table `chunks(vector, text, object, record_id …)`\nRAG index over long-text CRM fields", $sprite="database")
+  ContainerDb(sqlite, "app.sqlite3", "volume `data` → /data/app.sqlite3", "users · conversations · messages · uploads ·\nurl_documents · repo chunks · recall. WAL mode.", $sprite="database")
+  ContainerDb(pq, "Parquet landing", "volume `data` → /data/parquet", "one file per sync batch, per object", $sprite="hdd")
+  ContainerDb(rep, "reports", "volume `reports` → /reports", "generated PDF / XLSX / CSV", $sprite="hdd")
+  ContainerDb(hfc, "hf-cache", "volume `hf-cache`", "model weights", $sprite="hdd")
+}
+
+System_Ext(sf, "Salesforce org (PRODUCTION)", "REST + Bulk + SOQL, read-only")
+System_Ext(web, "Public web / GitHub", "untrusted content")
+
+Rel(analyst, fe, "HTTPS · HTML + SSE · async", "**:3000, unauthenticated**")
+Rel(analyst, orc, "**direct API access bypassing the UI**", "**:8080, unauthenticated**")
+
+Rel(fe, orc, "POST /chat · JSON → SSE passthrough · async", "server-side proxy, lib/proxy.ts")
+Rel(fe, orc, "GET /history/* · /auth/me · /reports · POST /uploads", "JSON")
+
+Rel(orc, vllm, "POST /v1/chat/completions · JSON + SSE · async", "OpenAI-compatible")
+Rel(orc, vllmr, "POST /v1/chat/completions · classification · async", "OpenAI-compatible")
+Rel(orc, vllme, "POST /v1/embeddings · async", "OpenAI-compatible")
+Rel(orc, vllmv, "POST /v1/chat/completions · multimodal · async", "optional")
+Rel(orc, sx, "GET /search?format=json · async", "internal DNS")
+Rel(orc, web, "GET via core/net.py safe_fetch() · SSRF-guarded", "HTTPS")
+Rel(orc, sf, "live SOQL when warehouse lacks the object", "HTTPS · client-credentials")
+Rel(orc, duck, "**blocking** DuckDB query on the event loop", "read-only")
+Rel(orc, lance, "vector search top-30 → rerank top-8", "read")
+Rel(orc, sqlite, "conversations, messages, uploads", "read-write · WAL")
+Rel(orc, rep, "write exports & reports", "file I/O")
+
+Rel(sw, sf, "JWT Bearer → bulk pull (SystemModstamp watermark)", "HTTPS")
+Rel(sw, pq, "write batch", "Parquet")
+Rel(sw, duck, "DELETE-by-Id + INSERT in one txn, then watermark", "read-write")
+Rel(sw, vllme, "embed chunks, batched", "OpenAI-compatible")
+Rel(sw, lance, "upsert chunk vectors", "write")
+
+note right of orc #FFE4E6
+  `/chat` and `/reports*` are explicitly auth-free
+  (`main.py:56`), and `/auth` + `/history` no longer
+  authenticate either (`auth.py:95-97`).
+  CORS is correctly restricted to localhost:3000
+  (`config.py:244-250`) — but CORS protects browsers,
+  not `curl`. SEC-01.
+end note
+
+note bottom of duck #FFFBEB
+  Two writers, one file: the orchestrator holds a
+  READ-ONLY handle while the sync-worker writes.
+  Tables are created by `CREATE TABLE AS SELECT`
+  (`storage.py:140`) — **no PK, no index on Id**, so
+  the per-batch `DELETE … WHERE Id IN (…)` is a full
+  scan. DATA-02.
+end note
+
+legend right
+  |= Colour |= Layer |
+  |<#2563EB> | frontend / edge |
+  |<#7C3AED> | orchestrator / app logic |
+  |<#16A34A> | inference / GPU |
+  |<#D97706> | storage / data |
+  |<#64748B> | external systems |
+  |<#DC2626> | risk / trust boundary |
+  Ports written `host → container`.
+end legend
+
+@enduml

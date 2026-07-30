@@ -1,0 +1,247 @@
+@startuml 16-activity-request-lifecycle
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName "Inter, Segoe UI, sans-serif"
+skinparam defaultFontSize 13
+skinparam roundCorner 8
+skinparam shadowing false
+skinparam ArrowColor #4A5568
+skinparam ArrowFontColor #4A5568
+skinparam NoteBackgroundColor #FFFBEB
+skinparam NoteBorderColor #F59E0B
+' Layer palette — byte-identical across ALL 24 diagrams
+!$C_EDGE = "#2563EB"   /' frontend / edge '/
+!$C_APP  = "#7C3AED"   /' orchestrator / app logic '/
+!$C_GPU  = "#16A34A"   /' inference / GPU '/
+!$C_DATA = "#D97706"   /' storage / data '/
+!$C_EXT  = "#64748B"   /' external systems '/
+!$C_RISK = "#DC2626"   /' risk / trust boundary '/
+
+skinparam activity {
+  BackgroundColor #F8FAFC
+  BorderColor #94A3B8
+  FontColor #0F172A
+  DiamondBackgroundColor #FFFFFF
+  DiamondBorderColor #7C3AED
+  DiamondFontColor #4C1D95
+  StartColor #2563EB
+  EndColor #DC2626
+  BarColor #7C3AED
+}
+skinparam swimlaneBorderColor #CBD5E1
+skinparam swimlaneTitleBackgroundColor #F1F5F9
+
+title Activity — one user message, end to end across six swimlanes\ncompose → /api/chat → validate → own → decide() → search → recall → compact → route → engine → vLLM → SSE → render → persist\n(evidence: frontend/lib/streams.ts:307-348 · orchestrator/app/main.py:274-685 · orchestrator/app/compaction.py:242-327 · orchestrator/app/engines/orchestrate.py:127-156)
+
+|#DBEAFE|Browser|
+start
+:Composer.submit() → ChatApp.send()\nbuilds the user ChatMessage, persist() → localStorage\n(Composer.tsx:137-146 · ChatApp.tsx:391-476);
+note right #FFFBEB
+  Attachment caps are **client-side only**:
+  image 10 MB · PDF 25 MB · dataset 200 MB
+  (Composer.tsx:42,65,68). Images and PDFs still
+  travel as base64 **inside the chat JSON body**;
+  only /api/upload streams (upload/route.ts:5-8).
+end note
+:streams.register() puts a LiveStream in the module Map,\nthen **HTTP POST /api/chat · JSON · async** with an AbortSignal\n(streams.ts:271-295, :311-334);
+
+|#BFDBFE|Next API|
+:route.ts:126 — `body = await req.json()`\n**whole body buffered in memory, unbounded**;
+note right #FFFBEB
+  `MOCK_MODE=true` short-circuits here into an 82-LOC
+  fixture stream (route.ts:40-121) that emits **no**
+  `status` and **no** `research` frames — so the whole
+  web-search UI is untestable offline.
+end note
+:toOrchestratorChatRequest(body) — last user turn, with the\nIMAGE_ONLY_PROMPT / PDF_ONLY_PROMPT fallback\n(orchestrator.ts:70-101);
+if (message, image or pdf present?) then (no)
+  :**400** `{message:"The request contains no user message…"}`\n(route.ts:145-150);
+  |Browser|
+  :markUnreachable() → the banner claims the orchestrator is\nunreachable even though it answered\n(streams.ts:335-337, :165-178);
+  stop
+else (yes)
+  |Next API|
+  :**HTTP POST {ORCHESTRATOR_URL}/chat · JSON · async**\nsignal relayed · **no timeout, no retry**\n(route.ts:154-166);
+endif
+
+|#EDE9FE|Orchestrator|
+:FastAPI parses `ChatRequest` — Pydantic Literals for\nmode · model · effort · web_search, then @model_validator\n`_require_input` (main.py:176-239);
+:`conv_key_outer = conversation_id or session_id`\nownership gate: `db.conversation_owner(conv_key_outer)`\n(main.py:329-344);
+note right #FEE2E2
+  **TRUST BOUNDARY CROSSED HERE — and it fails open.**
+  `try: … except Exception: conv_owner = None`
+  (main.py:338-341) while the comment at :336-337
+  asserts the opposite. `viewer` comes from
+  `current_user()` which **never returns None and never
+  401s** (auth.py:89-92), so this compares one local
+  identity to itself. Anyone who can reach :8080
+  is that identity.
+end note
+if (a generation is already running on this conv_key?) then (yes)
+  :`previous.task.cancel()` — the newest send wins\n(main.py:348-350);
+  note right #FFFBEB
+    The old worker is cancelled but **not awaited**, so its
+    `finally` (main.py:673-677) — including `db.add_message` —
+    can still run after the new generation replaced the
+    registry entry. Client-side this is Race 1 in
+    streams.ts:292 (register() overwrite).
+  end note
+endif
+:LiveGeneration registered; `worker()` spawned as a **DETACHED\nasyncio.Task** that outlives the HTTP request, and\nStreamingResponse(gen.follow(), text/event-stream,\nX-Accel-Buffering:no) returns at once (main.py:352-356, :679-685);
+
+if (text present ∧ no pdf ∧ no image ∧ not request.agent?) then (yes)
+  |#DCFCE7|Model (vLLM)|
+  :**vllm-router** — `orchestrate.decide()`\nPOST /v1/chat/completions · 1 non-thinking call ·\nmax_tokens=40 · enable_thinking:false\n(orchestrate.py:127-156 · llm.py:283-299);
+  |Orchestrator|
+  :`want_agent = request.agent ∨ plan.agent`;\nemit **`status`** = describe(plan) (main.py:412-415);
+  note right #FEE2E2
+    This call sits on the critical path of **every** text turn
+    at effort ≥ low and is emitted **before** any status frame,
+    so the user stares at an empty stream for its duration.
+    Its only bound is LLM_REQUEST_TIMEOUT = 300 s
+    (config.py:264). Every failure — dead endpoint, 400,
+    timeout — is swallowed identically into `Plan(False, False)`
+    (orchestrate.py:142-144); nothing is logged.
+  end note
+else (no — agent forced, or an attachment is present)
+  |Orchestrator|
+endif
+
+if (search_enabled ∧ web_search ≠ "off" ∧ no attachment ∧ text\n∧ (assistant mode ∨ web_search == "on")?) then (yes)
+  :`search.rate_ok(user_key)`; want_search from the plan,\nor `should_search()` for bare "auto"\n(main.py:423-449);
+  note right #FFFBEB
+    In **salesforce** mode only an explicit "on" searches —
+    auto-detection would answer CRM questions from the
+    internet (main.py:429-433). When the rate limit trips the
+    only signal is a `status` frame (main.py:438-441).
+  end note
+else (no — salesforce mode without an explicit "on")
+endif
+
+:`recall_block(user_id, text, conversation_id)` prepended\nas a **system** message (main.py:450-455);
+|#FEF3C7|Store|
+:**app.sqlite3** — `db.recall_conversations()`\n**blocking sqlite3 executed directly on the event loop**\n(main.py:451 → db.py); every db.connect() re-runs the\nschema + migration (db.py:203-204);
+|Orchestrator|
+:`compaction.prepare(conv_key, full_history, text, …)`\nreads `db.get_summary` **outside** the per-conversation lock\n(compaction.py:242-260);
+|#DCFCE7|Model (vLLM)|
+:`POST /tokenize` on the serving model to learn the real\nwindow and prompt cost · 5 s TOKENIZE_TIMEOUT\n(context.py:97-123, config.py:135);
+note right #FFFBEB
+  `count_tokens` catches **all** exceptions and falls back to
+  `estimate_messages` (context.py:121-123), which counts only
+  the text parts of multimodal content — **an image payload is
+  budgeted as ~0 tokens** (context.py:86-92). A failed probe
+  also caches MODEL_MAX_CONTEXT permanently (context.py:136-137).
+end note
+|Orchestrator|
+if (budget.fraction > 0.80  (CONTEXT_COMPACT_THRESHOLD)?) then (yes)
+  :emit **`status`** "Compacting conversation…" (compaction.py:274);
+  |#DCFCE7|Model (vLLM)|
+  :`summarize.summarize()` (+ optional `condense()`) — up to\n**4 adaptive rounds**, halving `keep` toward MIN_KEEP_RECENT 2,\nthen `db.save_summary()` upsert + `recall.index_folded()`\n(compaction.py:280-307, :186-196);
+  note right #FEE2E2
+    Worst case: 4 sequential summarisations plus up to 5
+    `measure()` probes **before the user sees a single token**,
+    each bounded only by the 300 s client timeout.
+    `recall.index_folded` failure is swallowed by a bare
+    `except Exception: pass` (compaction.py:195-196) — semantic
+    recall can be permanently broken with zero signal.
+  end note
+  |Orchestrator|
+else (no — assemble(summary, recent turns, retrieved) unchanged)
+endif
+
+|#F3E8FF|Engine|
+switch (engine dispatch — **first match wins** (main.py:551-643))
+case (pdf | image)
+  :engines.document / engines.vision;
+case (repo | url | dataset)
+  :engines.repo / url / dataset\n(per-conversation stores keyed by conv_key alone);
+case (want_agent)
+  :engines.agent — PLAN → EXECUTE → SYNTHESIZE\n≤ MAX_STEPS 8, STEP_CONCURRENCY 3\n(agent.py:36-37, :561-583);
+case (want_search)
+  :engines.search — searxng → safe_fetch → read,\nemits `research` frames (search.py:226-238);
+case (mode == "assistant")
+  :engines.chat;
+case (else — salesforce fallback)
+  :`get_graph().ainvoke()` → `router.route_request()`\n→ sql | rag | vision | report | chat\n(graph.py:100-104);
+  note right #FEE2E2
+    The router has **no confidence score**. Two bare
+    `except Exception: pass` blocks (router.py:121-122,
+    :130-131) hide connection-refused, 400 and timeout
+    identically; worst case a wedged router **plus** a wedged
+    main model costs **600 s** before the unconditional
+    `return "rag"` (router.py:133) — a greeting is then
+    answered by vector search.
+  end note
+endswitch
+
+|#DCFCE7|Model (vLLM)|
+:**vllm (MAIN)** — POST /v1/chat/completions, stream=true\nOpenAI-compatible · LLM_REQUEST_TIMEOUT 300 s\n(llm.py:78, config.py:264);
+|Engine|
+repeat
+  :`await emit("token", {"text": delta})`;
+repeat while (more deltas from the model?) is (yes)
+->no more deltas;
+:`await emit("meta", {route, sql?, data?, chart?,\ncitations?, sources?, steps?, report_files?})`;
+
+|Orchestrator|
+:`LiveGeneration.publish()` appends to the in-memory event\nbuffer and notifies `follow()` (main.py:95-120);
+note right #FEE2E2
+  The buffer is **unbounded** (main.py:85,97): every token frame
+  is retained for the generation's whole life so a late
+  `/chat/attach` can replay it. There is **no keep-alive frame**
+  and no `id:`/`retry:` field (sse.py), so a long silent
+  generation depends on no proxy having an idle timeout.
+end note
+:central `meta` merge — mode, model, effort, generation_id,\n`input_trimmed`, `context`, `auto` (main.py:364-381);\nthen emit **`done`** `{session_id}` (main.py:647);
+
+|#BFDBFE|Next API|
+:`new Response(upstream.body, SSE_HEADERS)` —\nthe stream is piped **byte-for-byte, never re-parsed**\n(route.ts:184);
+
+|Browser|
+:`readChatStream()` → SSEParser → toChatStreamEvent, then\n`consume()` folds token · reasoning · status · step · research ·\nmeta into the LiveStream and calls notify() after **every** event\n(sse.ts:283-301 · streams.ts:180-269);
+:ChatApp mirrors into React state → MessageRow re-renders\n(**not** memoised, so ProofDrawer + DataTable re-render per token),\nthen `finalize({status:'done'})` → `saveMessages()` → localStorage\n+ queued background push (streams.ts:157-163);
+note right #FFFBEB
+  If the body ends with **no terminal frame** — which is exactly
+  what cancellation produces (main.py:668-669 → finish() →
+  follow() breaks with no frame) — the client silently finalises
+  as `'done'` (streams.ts:264-268). A third, undocumented
+  terminal state (sse.py:20-24 documents only done/error).
+end note
+
+|Next API|
+:`PUT /api/history/conversations/{id}/messages`\nvia proxyToOrchestrator (historyApi.ts:182-184 · proxy.ts:21-64);
+|Orchestrator|
+:`history.replace_messages` — validates roles, one transaction,\nrefuses to shrink → **409 MessageCountWouldShrink**\n(history.py:151-190);
+|#FEF3C7|Store|
+:**app.sqlite3** `messages` — unique index\n`idx_messages_generation` makes a reply watched by two\nbrowsers store exactly once (db.py:187-191);
+|Orchestrator|
+:`_spawn_background_compaction()` — detached task, fires when\nfraction > 0.70 (CONTEXT_BG_COMPACT_THRESHOLD), its notice parked\nfor the **next** reply; then `_finalize_generation()`: finish(),\nunregister, and if `subscribers == 0` the **server** persists the\nanswer itself (main.py:654-667, :148-168 · compaction.py:330-360);
+note right #FFFBEB
+  `contextlib.suppress(Exception)` wraps both the persist
+  (main.py:161) and the whole shielded finalise (main.py:676) —
+  a failed write is silent and unlogged. `maybe_background_compact`
+  likewise catches everything and returns None with **no log**
+  (compaction.py:359-360). `lifespan` has no shutdown branch, so
+  neither registry is drained on SIGTERM (main.py:27-38).
+end note
+
+|Browser|
+stop
+
+legend right
+  |= Swimlane tint |= Layer colour |= Meaning |
+  |<#DBEAFE> |<#2563EB> | Browser — React client bundle |
+  |<#BFDBFE> |<#2563EB> | Next API — server-side /api/* route handlers |
+  |<#EDE9FE> |<#7C3AED> | Orchestrator — FastAPI /chat worker |
+  |<#F3E8FF> |<#7C3AED> | Engine — the 13 engine modules |
+  |<#DCFCE7> |<#16A34A> | Model (vLLM) — inference / GPU |
+  |<#FEF3C7> |<#D97706> | Store — app.sqlite3 / DuckDB / LanceDB |
+  ==Notation==
+  Diamonds are the branches that **really exist** in the code.
+  **Red notes** = fail-open, unbounded resource, or a swallowed
+  exception that changes behaviour or security posture.
+  Amber notes = missing timeout, silent degradation, magic number.
+  Every step cites file:LINE. Arrow text reads protocol · payload · sync|async.
+end legend
+
+@enduml
