@@ -51,6 +51,26 @@ describe('toOrchestratorChatRequest (§10 ChatRequest mapping)', () => {
     });
   });
 
+  it('forwards up to 5 images: image_base64 stays the first, `images` carries all', () => {
+    const out = toOrchestratorChatRequest({
+      messages: [{ role: 'user', content: 'compare these screenshots' }],
+      session_id: 's-img',
+      images: ['AAA', 'BBB', 'CCC'],
+    });
+    expect(out?.image_base64).toBe('AAA');
+    expect(out?.images).toEqual(['AAA', 'BBB', 'CCC']);
+  });
+
+  it('keeps the exact v1 key set for single-image sends (no `images` key)', () => {
+    const out = toOrchestratorChatRequest({
+      messages: [{ role: 'user', content: 'what is this?' }],
+      session_id: 's-one',
+      images: ['AAA'],
+    });
+    expect(out?.image_base64).toBe('AAA');
+    expect(out && 'images' in out).toBe(false);
+  });
+
   it('forwards the conversation as `messages` for within-chat memory', () => {
     const out = toOrchestratorChatRequest({
       messages: [{ role: 'user', content: 'hello' }],

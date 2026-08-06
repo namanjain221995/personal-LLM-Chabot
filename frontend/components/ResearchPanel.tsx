@@ -59,7 +59,8 @@ export function rankDomains(
 
 const TOP_DOMAINS = 4;
 
-function DomainBars({ research }: { research: Research }) {
+/** Exported for the ActivityPanel (2026-08-05) — same bars, different home. */
+export function DomainBars({ research }: { research: Research }) {
   const ranked = useMemo(() => rankDomains(research), [research]);
   if (ranked.length === 0) return null;
   const top = ranked.slice(0, TOP_DOMAINS);
@@ -101,7 +102,8 @@ function DomainBars({ research }: { research: Research }) {
   );
 }
 
-function QueryGroup({
+/** Exported for the ActivityPanel (2026-08-05). */
+export function QueryGroup({
   query,
   results,
 }: {

@@ -7,10 +7,13 @@ export function CopyButton({
   text,
   label,
   className = '',
+  variant = 'chip',
 }: {
   text: string;
   label: string;
   className?: string;
+  /** "icon": ghost icon-only button for the message action row. */
+  variant?: 'chip' | 'icon';
 }) {
   const [copied, setCopied] = useState(false);
 
@@ -28,6 +31,24 @@ export function CopyButton({
     }
     setCopied(true);
     setTimeout(() => setCopied(false), 1600);
+  }
+
+  if (variant === 'icon') {
+    return (
+      <button
+        type="button"
+        onClick={copy}
+        aria-label={copied ? 'Copied' : label}
+        title={copied ? 'Copied' : label}
+        className={`rounded-lg p-1.5 text-muted transition-colors duration-ts hover:bg-surface-2 hover:text-ink ${className}`}
+      >
+        {copied ? (
+          <IconCheck size={15} className="text-accent" />
+        ) : (
+          <IconCopy size={15} />
+        )}
+      </button>
+    );
   }
 
   return (

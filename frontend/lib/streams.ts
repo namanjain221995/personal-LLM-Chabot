@@ -298,7 +298,8 @@ export interface StartStreamOptions {
   conversationId: string;
   turns: ChatMessage[];
   prefs: ChatPrefs;
-  image?: string | null;
+  /** 2026-08-05: up to 5 attached images (base64, no data: prefix). */
+  images?: string[] | null;
   pdf?: string | null;
   pdfName?: string | null;
 }
@@ -325,7 +326,12 @@ export async function startStream(opts: StartStreamOptions): Promise<void> {
         effort: prefs.effort,
         agent: prefs.agent,
         web_search: prefs.webSearch,
-        ...(opts.image ? { image: opts.image } : {}),
+        // The single-image spelling stays for the proxy's v1 contract; the
+        // full list rides alongside when more than one image is attached.
+        ...(opts.images?.length ? { image: opts.images[0] } : {}),
+        ...(opts.images && opts.images.length > 1
+          ? { images: opts.images }
+          : {}),
         ...(opts.pdf
           ? { pdf: opts.pdf, pdf_filename: opts.pdfName ?? undefined }
           : {}),

@@ -12,10 +12,12 @@ import type { StorageLike } from './history';
 /**
  * Phase 1: web search — off (never), auto (model decides), on (force).
  *
- * The composer toggle for this is GONE (2026-07-28): the effort level decides.
- * "auto" is therefore the only value the UI produces, and the level's ceiling
- * does the real gating server-side — Fast refuses to search whatever this says.
- * The union is kept because stored prefs and the API still carry all three.
+ * The always-visible toggle is GONE (2026-07-28): by default the effort level
+ * decides ("auto"), and its ceiling does the real gating server-side — Fast
+ * refuses to search whatever this says. Since 2026-08-05 the composer's "+"
+ * menu can force "on", but only while Salesforce is OFF — Salesforce mode
+ * never searches the web, so sanitize() below keeps the pair coherent.
+ * "off" survives in the union because stored prefs and the API still carry it.
  */
 export type WebSearchMode = 'off' | 'auto' | 'on';
 
@@ -43,11 +45,10 @@ const MAX_ENTRIES = 200;
 
 function sanitize(raw: unknown): ChatPrefs {
   const p = (raw ?? {}) as Partial<ChatPrefs>;
+  const salesforce =
+    typeof p.salesforce === 'boolean' ? p.salesforce : DEFAULT_PREFS.salesforce;
   return {
-    salesforce:
-      typeof p.salesforce === 'boolean'
-        ? p.salesforce
-        : DEFAULT_PREFS.salesforce,
+    salesforce,
     model: p.model === 'fast' || p.model === 'smart' ? p.model : DEFAULT_PREFS.model,
     effort:
       p.effort === 'fast' ||
@@ -62,7 +63,12 @@ function sanitize(raw: unknown): ChatPrefs {
     // once switched Agent on would run the slow path at every level — both
     // with no visible control to undo it. Migrate them to what the level says.
     agent: false,
-    webSearch: p.webSearch === 'on' ? 'on' : DEFAULT_PREFS.webSearch,
+    // A forced web search ('on', settable from the "+" menu since 2026-08-05)
+    // is only coherent with Salesforce OFF: Salesforce mode never searches
+    // the web, its menu hides the toggle, so a stored 'on' there would be
+    // invisible and un-undoable — exactly the trap the agent migration above
+    // exists for. Normalize it away on load.
+    webSearch: p.webSearch === 'on' && !salesforce ? 'on' : DEFAULT_PREFS.webSearch,
   };
 }
 

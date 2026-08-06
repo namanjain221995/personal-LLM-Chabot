@@ -25,7 +25,9 @@ const config: Config = {
         ink: 'var(--ts-text)',
         muted: 'var(--ts-text-muted)',
         faint: 'var(--ts-text-faint)',
-        accent: 'var(--ts-accent)',
+        // rgb()+<alpha-value> so `accent/NN` opacity modifiers actually
+        // compile — as a bare var() Tailwind silently dropped them all.
+        accent: 'rgb(var(--ts-accent-rgb) / <alpha-value>)',
         'accent-strong': 'var(--ts-accent-strong)',
         navy: 'var(--ts-navy)',
         boardroom: 'var(--ts-boardroom)',
@@ -35,7 +37,9 @@ const config: Config = {
         'engine-rag': 'var(--ts-engine-rag)',
         'engine-vision': 'var(--ts-engine-vision)',
         'engine-report': 'var(--ts-engine-report)',
-        danger: 'var(--ts-danger)',
+        // Same alpha treatment as `accent`: `danger/NN` classes (toast
+        // borders, file-chip tints) silently compiled to nothing before.
+        danger: 'rgb(var(--ts-danger-rgb) / <alpha-value>)',
         warn: 'var(--ts-warn)',
       },
       fontFamily: {

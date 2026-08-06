@@ -1,312 +1,92 @@
 'use client';
 
 /**
- * Proof-drawer Chart section (§9): Recharts bar/line/area/pie/scatter with
- * stacked support, tooltips, ≤400ms draw-in, dark-mode aware.
+ * Proof-drawer Chart section (§9), rendered with Apache ECharts.
  *
- * Palette: the 5-slot categorical order (teal → blue → amber → violet →
- * rose) validated for CVD separation and ≥3:1 contrast on BOTH surfaces —
- * assigned in fixed order, never cycled. Pies with many categories fold the
- * tail into "Other" (the full rows stay in the Data tab).
+ * The component's interface is unchanged — `<ChartView spec data />` — and
+ * so is the contract it renders: a validated `ChartSpec` from `meta.chart`
+ * plus row objects. Only the renderer changed.
+ *
+ * The split is deliberate:
+ *
+ *   ChartView (here)   validate → resolve theme → build option → fall back
+ *   lib/chartOption    the trusted ChartSpec → EChartsOption adapter
+ *   EChart             the dynamically-imported ECharts canvas
+ *
+ * All the logic worth testing lives in lib/chartOption.ts and
+ * lib/chartTheme.ts, which are pure TypeScript and run under the existing
+ * node-environment vitest setup. This file is thin on purpose.
+ *
+ * Nothing here can execute backend-supplied configuration: the option is
+ * constructed by the adapter from a fixed set of spec fields, and this
+ * component never passes `spec` to ECharts.
  */
 
 import { useEffect, useMemo, useState } from 'react';
-import {
-  Area,
-  AreaChart,
-  Bar,
-  BarChart,
-  CartesianGrid,
-  Cell,
-  Legend,
-  Line,
-  LineChart,
-  Pie,
-  PieChart,
-  ResponsiveContainer,
-  Scatter,
-  ScatterChart,
-  Tooltip,
-  XAxis,
-  YAxis,
-} from 'recharts';
+import dynamic from 'next/dynamic';
 import type { ChartSpec, DataRow } from '@/lib/types';
+import { buildChartOption, validateChart } from '@/lib/chartOption';
+import { fallbackPalette, resolvePalette } from '@/lib/chartTheme';
 import { useTheme } from './Providers';
+import { ChartErrorBoundary } from './ChartErrorBoundary';
 
-const PALETTE = ['#0E9F9A', '#2F6FB2', '#B7791F', '#6D5AE6', '#C0566B'];
+// ECharts is not in the initial bundle and never renders on the server.
+const EChart = dynamic(() => import('./EChart'), {
+  ssr: false,
+  loading: () => <div className="h-[300px] w-full min-w-0" aria-hidden />,
+});
 
-const THEME_TOKENS = {
-  // Kept in sync with the CSS tokens in app/globals.css (Recharts needs
-  // literal colors, not var() references).
-  dark: {
-    grid: '#262626',
-    axis: '#262626',
-    text: '#a3a3a3',
-    surface: '#1e1e1e',
-    tooltipBg: '#2a2a2a',
-    tooltipText: '#f5f5f5',
-  },
-  light: {
-    grid: '#e3e3e3',
-    axis: '#e3e3e3',
-    text: '#5d5d5d',
-    surface: '#f4f4f4',
-    tooltipBg: '#ffffff',
-    tooltipText: '#0d0d0d',
-  },
-} as const;
-
-function usePrefersReducedMotion(): boolean {
-  const [reduced, setReduced] = useState(false);
-  useEffect(() => {
-    const mq = window.matchMedia('(prefers-reduced-motion: reduce)');
-    setReduced(mq.matches);
-    const onChange = (e: MediaQueryListEvent) => setReduced(e.matches);
-    mq.addEventListener('change', onChange);
-    return () => mq.removeEventListener('change', onChange);
-  }, []);
-  return reduced;
+function ChartUnavailable({ reason }: { reason: string }) {
+  return <p className="text-sm text-muted">{reason}</p>;
 }
 
-function formatNumber(v: unknown): string {
-  return typeof v === 'number' ? v.toLocaleString() : String(v);
-}
+const MESSAGES: Record<string, string> = {
+  'no-data': 'No rows to chart — the result is in the Data tab.',
+  'unsupported-type': 'This chart type is not supported here. The data is in the Data tab.',
+  'missing-x-column': 'The chart refers to a column this result does not have.',
+  'missing-y-column': 'The chart refers to a column this result does not have.',
+  'scatter-needs-numeric-x': 'A scatter chart needs two numeric columns.',
+  'no-numeric-values': 'Nothing numeric to plot — the data is in the Data tab.',
+  'part-to-whole-needs-positive-values':
+    'A pie or donut needs positive values. The data is in the Data tab.',
+};
 
-const MAX_PIE_SLICES = 6;
-
-export function ChartView({
-  spec,
-  data,
-}: {
-  spec: ChartSpec;
-  data: DataRow[];
-}) {
+function ChartCanvas({ spec, data }: { spec: ChartSpec; data: DataRow[] }) {
   const { theme } = useTheme();
-  const t = THEME_TOKENS[theme];
-  const reducedMotion = usePrefersReducedMotion();
+  // Resolving CSS custom properties needs a DOM. Start from the literal
+  // fallbacks so the first paint (and SSR) is correct, then swap in the
+  // real token values — and re-resolve whenever the theme changes, because
+  // a canvas cannot follow a `var()` the way an SVG attribute could.
+  const [palette, setPalette] = useState(() => fallbackPalette(theme));
+  useEffect(() => {
+    setPalette(resolvePalette(theme));
+  }, [theme]);
 
-  const animation = {
-    isAnimationActive: !reducedMotion,
-    animationDuration: 350, // §9: draw-in ≤ 400ms
-    animationEasing: 'ease-out' as const,
-  };
+  const problem = validateChart(spec, data);
+  const option = useMemo(
+    () => (problem ? null : buildChartOption(spec, data, palette)),
+    [spec, data, palette, problem],
+  );
 
-  const yKeys = spec.y_keys;
-  const multiSeries = yKeys.length >= 2;
-
-  const tooltipProps = {
-    cursor:
-      spec.type === 'bar'
-        ? { fill: t.grid, opacity: 0.35 }
-        : { stroke: t.grid },
-    contentStyle: {
-      background: t.tooltipBg,
-      border: `1px solid ${t.grid}`,
-      borderRadius: 10,
-      color: t.tooltipText,
-      fontSize: 13,
-    },
-    labelStyle: { color: t.tooltipText, fontWeight: 600 },
-    itemStyle: { color: t.text },
-    formatter: (value: unknown) => formatNumber(value),
-  };
-
-  const axisProps = {
-    tick: { fill: t.text, fontSize: 12 },
-    tickLine: false,
-    axisLine: { stroke: t.axis },
-  } as const;
-
-  const legend = multiSeries ? (
-    <Legend
-      wrapperStyle={{ fontSize: 13, color: t.text }}
-      iconType="circle"
-      iconSize={9}
-    />
-  ) : null;
-
-  const pieData = useMemo(() => {
-    if (spec.type !== 'pie') return [];
-    const key = yKeys[0];
-    const rows = data
-      .map((r) => ({
-        name: String(r[spec.x_key] ?? '—'),
-        value: Number(r[key] ?? 0),
-      }))
-      .sort((a, b) => b.value - a.value);
-    if (rows.length <= MAX_PIE_SLICES) return rows;
-    const head = rows.slice(0, MAX_PIE_SLICES - 1);
-    const other = rows
-      .slice(MAX_PIE_SLICES - 1)
-      .reduce((sum, r) => sum + r.value, 0);
-    return [...head, { name: 'Other', value: other }];
-  }, [spec, data, yKeys]);
-
-  let chart: React.ReactElement;
-
-  switch (spec.type) {
-    case 'bar':
-      chart = (
-        <BarChart data={data} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
-          <CartesianGrid vertical={false} stroke={t.grid} />
-          <XAxis dataKey={spec.x_key} {...axisProps} />
-          <YAxis {...axisProps} width={52} />
-          <Tooltip {...tooltipProps} />
-          {legend}
-          {yKeys.map((key, i) => (
-            <Bar
-              key={key}
-              dataKey={key}
-              stackId={spec.stacked ? 'stack' : undefined}
-              fill={PALETTE[i % PALETTE.length]}
-              stroke={t.surface}
-              strokeWidth={spec.stacked ? 1 : 0}
-              maxBarSize={36}
-              radius={
-                !spec.stacked || i === yKeys.length - 1
-                  ? [3, 3, 0, 0]
-                  : [0, 0, 0, 0]
-              }
-              {...animation}
-            />
-          ))}
-        </BarChart>
-      );
-      break;
-
-    case 'line':
-      chart = (
-        <LineChart data={data} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
-          <CartesianGrid vertical={false} stroke={t.grid} />
-          <XAxis dataKey={spec.x_key} {...axisProps} />
-          <YAxis {...axisProps} width={52} />
-          <Tooltip {...tooltipProps} />
-          {legend}
-          {yKeys.map((key, i) => (
-            <Line
-              key={key}
-              type="monotone"
-              dataKey={key}
-              stroke={PALETTE[i % PALETTE.length]}
-              strokeWidth={2}
-              dot={{ r: 3, strokeWidth: 0, fill: PALETTE[i % PALETTE.length] }}
-              activeDot={{ r: 5, stroke: t.surface, strokeWidth: 2 }}
-              {...animation}
-            />
-          ))}
-        </LineChart>
-      );
-      break;
-
-    case 'area':
-      chart = (
-        <AreaChart data={data} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
-          <CartesianGrid vertical={false} stroke={t.grid} />
-          <XAxis dataKey={spec.x_key} {...axisProps} />
-          <YAxis {...axisProps} width={52} />
-          <Tooltip {...tooltipProps} />
-          {legend}
-          {yKeys.map((key, i) => (
-            <Area
-              key={key}
-              type="monotone"
-              dataKey={key}
-              stackId={spec.stacked ? 'stack' : undefined}
-              stroke={PALETTE[i % PALETTE.length]}
-              strokeWidth={2}
-              fill={PALETTE[i % PALETTE.length]}
-              fillOpacity={0.22}
-              {...animation}
-            />
-          ))}
-        </AreaChart>
-      );
-      break;
-
-    case 'pie':
-      chart = (
-        <PieChart>
-          <Tooltip {...tooltipProps} />
-          <Legend
-            wrapperStyle={{ fontSize: 13, color: t.text }}
-            iconType="circle"
-            iconSize={9}
-          />
-          <Pie
-            data={pieData}
-            dataKey="value"
-            nameKey="name"
-            innerRadius="45%"
-            outerRadius="78%"
-            paddingAngle={2}
-            stroke={t.surface}
-            strokeWidth={2}
-            {...animation}
-          >
-            {pieData.map((entry, i) => (
-              <Cell key={entry.name} fill={PALETTE[i % PALETTE.length]} />
-            ))}
-          </Pie>
-        </PieChart>
-      );
-      break;
-
-    case 'scatter': {
-      const numericX =
-        data.length > 0 && typeof data[0][spec.x_key] === 'number';
-      chart = (
-        <ScatterChart margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
-          <CartesianGrid stroke={t.grid} />
-          <XAxis
-            dataKey={spec.x_key}
-            type={numericX ? 'number' : 'category'}
-            name={spec.x_key}
-            {...axisProps}
-          />
-          <YAxis
-            dataKey={yKeys[0]}
-            type="number"
-            name={yKeys[0]}
-            {...axisProps}
-            width={52}
-          />
-          <Tooltip {...tooltipProps} />
-          {legend}
-          {yKeys.map((key, i) => (
-            <Scatter
-              key={key}
-              name={key}
-              data={data}
-              dataKey={key}
-              fill={PALETTE[i % PALETTE.length]}
-              stroke={t.surface}
-              strokeWidth={1}
-              {...animation}
-            />
-          ))}
-        </ScatterChart>
-      );
-      break;
-    }
-
-    default:
-      return (
-        <p className="text-sm text-muted">
-          Unknown chart type — the data is available in the Data tab.
-        </p>
-      );
+  if (problem) {
+    return <ChartUnavailable reason={MESSAGES[problem] ?? MESSAGES['unsupported-type']} />;
+  }
+  if (!option) {
+    return <ChartUnavailable reason="Chart could not be displayed. The figures are in the Data tab." />;
   }
 
+  return <EChart option={option} height={300} ariaLabel={spec.title || 'Chart'} />;
+}
+
+export function ChartView({ spec, data }: { spec: ChartSpec; data: DataRow[] }) {
   return (
     <figure>
-      <figcaption className="mb-2 text-sm font-medium text-ink">
-        {spec.title}
-      </figcaption>
-      <div className="h-[300px] w-full min-w-0" role="img" aria-label={spec.title}>
-        <ResponsiveContainer width="100%" height="100%">
-          {chart}
-        </ResponsiveContainer>
-      </div>
+      {spec.title ? (
+        <figcaption className="mb-2 text-sm font-medium text-ink">{spec.title}</figcaption>
+      ) : null}
+      <ChartErrorBoundary>
+        <ChartCanvas spec={spec} data={data} />
+      </ChartErrorBoundary>
     </figure>
   );
 }

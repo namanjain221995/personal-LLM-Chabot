@@ -112,11 +112,20 @@ def test_salesforce_mode_still_allows_the_agent(spy):
     assert spy["decide"] == 1, "the agent classifier must still run"
 
 
-def test_an_explicit_web_search_still_works_in_salesforce_mode(spy):
-    """Turning search ON is a deliberate choice and is still honoured."""
+def test_an_explicit_web_search_is_refused_in_salesforce_mode(spy):
+    """Salesforce ON means NO web search at any effort level — even an
+    explicit web_search="on" (owner request 2026-08-05; until then "on" was
+    an escape hatch). The composer no longer offers the toggle in this mode,
+    and this guards the promise against any other client that still sends it:
+    the Salesforce router must handle the request as if "on" were never said.
+    """
+    from app.engines.orchestrate import Plan
+
+    spy["plan"] = Plan(agent=False, search=False)
     resp = ask("salesforce", web_search="on")
     routes = [d for e, d in _parse_sse(resp.text) if e == "meta"]
-    assert spy["graph"] == 0, "an explicit search request bypasses the warehouse"
+    assert spy["graph"] == 1, "the Salesforce router must still run"
+    assert spy["should_search"] == 0, "no auto-detection either"
     assert routes, "the request still produced an answer"
 
 

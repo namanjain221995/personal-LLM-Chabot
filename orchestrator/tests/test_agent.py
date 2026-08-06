@@ -159,7 +159,12 @@ def test_execute_emits_running_then_done_and_reuses_engines(monkeypatch):
     done = [d for _e, d in events if d["status"] == "done"]
     assert all(d.get("detail") for d in done)
     assert [r["status"] for r in results] == ["done", "done", "done"]
-    assert results[0]["meta"] == {"sql": "SELECT 1 AS n"}
+    # A sql step carries its whole result, not just the SQL text: the data
+    # is what a chart is drawn over, and dropping it here is what used to
+    # make agent-routed answers unchartable.
+    assert results[0]["meta"]["sql"] == "SELECT 1 AS n"
+    assert results[0]["meta"]["data"] == [{"n": 1}]
+    assert results[0]["meta"]["truncated"] is False
     assert results[1]["meta"]["citations"][0]["record_id"] == "001A"
 
 

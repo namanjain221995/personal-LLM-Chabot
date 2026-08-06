@@ -10,6 +10,7 @@ from typing import Awaitable, Callable, List, Optional, Sequence
 
 from . import DIAGRAM_INSTRUCTION, recent_turns
 from .. import llm
+from ..config import settings
 from ..core.pdf import render_pdf
 
 Emit = Callable[[str, dict], Awaitable[None]]
@@ -41,11 +42,28 @@ async def run_pdf_engine(
     instruction = message or "Read this document and summarize the key points."
     header = f'Document: {filename}\n\n' if filename else ""
 
+    # Unlimited-OCR pass (2026-08-06): scans and photographed pages carry no
+    # embedded text at all, and even born-digital PDFs lose table structure in
+    # plain extraction. The dedicated OCR model transcribes every rendered
+    # page; empty transcripts (service down/disabled) cost nothing.
+    from .ocr import ocr_images, transcript_block
+
+    ocr_texts: List[str] = []
+    if settings.ocr_enabled:
+        await emit(
+            "status",
+            {"text": f"Reading {shown} page{'s' if shown != 1 else ''} with OCR…"},
+        )
+        ocr_texts = await ocr_images(images)
+
     content: List[dict] = [{"type": "text", "text": header + instruction}]
     if text.strip():
         content.append(
             {"type": "text", "text": f"\n\nExtracted text:\n{text}"}
         )
+    ocr_block = transcript_block(ocr_texts, "page")
+    if ocr_block:
+        content.append({"type": "text", "text": ocr_block})
     for url in images:
         content.append({"type": "image_url", "image_url": {"url": url}})
     if total > shown:

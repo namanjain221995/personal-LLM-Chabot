@@ -2,12 +2,15 @@
 
 /**
  * Assistant-message markdown (§9): GFM tables, code blocks with copy button
- * in JetBrains Mono, safe external links.
+ * in JetBrains Mono, safe external links, and syntax highlighting
+ * (2026-08-06, ChatGPT-style): rehype-highlight tags tokens with hljs-*
+ * classes and globals.css maps them to theme-aware colors.
  */
 
 import { isValidElement, memo, type ReactNode } from 'react';
 import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import rehypeHighlight from 'rehype-highlight';
 import { isMermaidLanguage } from '@/lib/mermaid';
 import { CopyButton } from './CopyButton';
 import { MermaidBlock } from './MermaidBlock';
@@ -45,17 +48,20 @@ function CodeBlock({ children }: { children?: ReactNode }) {
         </span>
         <CopyButton text={code} label="Copy code" />
       </div>
-      <pre tabIndex={0}>
-        <code>{code}</code>
-      </pre>
+      {/* `children` is the <code> element WITH the hljs token spans —
+          re-rendering the extracted plain text here would throw the
+          highlighting away (it is still used for copy + mermaid above). */}
+      <pre tabIndex={0}>{children}</pre>
     </div>
   );
 }
 
 const components: Components = {
   pre: ({ children }) => <CodeBlock>{children}</CodeBlock>,
-  code: ({ children, ...props }) => (
-    <code className="inline-code" {...props}>
+  code: ({ children, className, ...props }) => (
+    // Block code keeps its hljs/language-* classes (the token colors);
+    // inline code — no className from the parser — gets the pill style.
+    <code className={className ?? 'inline-code'} {...props}>
       {children}
     </code>
   ),
@@ -74,7 +80,14 @@ const components: Components = {
 export const Markdown = memo(function Markdown({ text }: { text: string }) {
   return (
     <div className="md">
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        // detect:false — only fenced blocks with a language tag get
+        // highlighted; guessing on plain blocks colors prose-y output.
+        // Unknown languages (```mermaid included) pass through untouched.
+        rehypePlugins={[[rehypeHighlight, { detect: false }]]}
+        components={components}
+      >
         {text}
       </ReactMarkdown>
     </div>

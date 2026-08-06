@@ -21,14 +21,15 @@ export interface SentAttachment {
   base64: string;
 }
 
-const sent = new Map<string, SentAttachment>();
+const sent = new Map<string, SentAttachment[]>();
 
-/** Remember what was attached to the user message with this id. */
-export function rememberAttachment(
+/** Remember what was attached to the user message with this id —
+    up to 5 images or a single PDF (2026-08-05 multi-upload). */
+export function rememberAttachments(
   messageId: string,
-  attachment: SentAttachment,
+  attachments: SentAttachment[],
 ): void {
-  sent.set(messageId, attachment);
+  if (attachments.length) sent.set(messageId, attachments);
 }
 
 /** Strip a `data:...;base64,` prefix, returning the raw payload. */
@@ -40,37 +41,48 @@ export function base64FromDataUrl(dataUrl?: string | null): string | null {
   return payload || null;
 }
 
-export interface AttachmentLookup {
-  /** The attachment to re-send, when we still have it. */
-  attachment: SentAttachment | null;
-  /** True when the turn HAD an attachment we can no longer reconstruct. */
+export interface AttachmentsLookup {
+  /** The attachments to re-send, when we still have them (may be empty). */
+  attachments: SentAttachment[];
+  /** True when the turn HAD attachments we can no longer reconstruct. */
   missing: boolean;
 }
 
 /**
- * Recover the attachment for a user turn being re-sent.
+ * Recover the attachments for a user turn being re-sent.
  *
- * Images survive a reload: the persisted `imageDataUrl` IS the payload.
- * PDFs do not — only the filename is kept — so after a reload they report
- * `missing`, and the caller must ask the user to re-attach instead of
- * quietly sending a text-only prompt.
+ * Images survive a reload: the persisted `imageDataUrls` (or the legacy
+ * single `imageDataUrl`) ARE the payloads. PDFs do not — only the filename
+ * is kept — so after a reload they report `missing`, and the caller must ask
+ * the user to re-attach instead of quietly sending a text-only prompt.
  */
-export function attachmentForResend(message: {
+export function attachmentsForResend(message: {
   id: string;
   imageDataUrl?: string;
+  imageDataUrls?: string[];
   pdfName?: string;
-}): AttachmentLookup {
+}): AttachmentsLookup {
   const remembered = sent.get(message.id);
-  if (remembered) return { attachment: remembered, missing: false };
+  if (remembered) return { attachments: remembered, missing: false };
 
-  const fromPreview = base64FromDataUrl(message.imageDataUrl);
-  if (fromPreview) {
-    return {
-      attachment: { kind: 'image', name: 'image', base64: fromPreview },
-      missing: false,
-    };
+  const previews = message.imageDataUrls?.length
+    ? message.imageDataUrls
+    : message.imageDataUrl
+      ? [message.imageDataUrl]
+      : [];
+  const fromPreviews = previews
+    .map((p) => base64FromDataUrl(p))
+    .filter((b): b is string => Boolean(b))
+    .map((base64) => ({ kind: 'image' as const, name: 'image', base64 }));
+  if (fromPreviews.length === previews.length && fromPreviews.length > 0) {
+    return { attachments: fromPreviews, missing: false };
   }
-  return { attachment: null, missing: Boolean(message.pdfName || message.imageDataUrl) };
+  return {
+    attachments: [],
+    missing: Boolean(
+      message.pdfName || message.imageDataUrl || message.imageDataUrls?.length,
+    ),
+  };
 }
 
 /** Test seam. */

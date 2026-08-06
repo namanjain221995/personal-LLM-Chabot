@@ -17,14 +17,38 @@ def test_good_multi_series_line():
     assert spec.y_keys == ["won", "lost"]
 
 
-def test_model_dump_matches_section_10_wire_shape():
+def test_wire_dump_matches_section_10_wire_shape():
+    """THE compatibility test.
+
+    `wire_dump()` — not `model_dump()` — is the wire boundary. Optional
+    fields added for the ECharts migration are emitted only when they are
+    off their defaults, so a chart of one of the five original types
+    serializes to exactly the five keys it always did. Every conversation
+    already persisted was written in this shape and must keep rendering.
+    """
     spec = ChartSpec(type="bar", x_key="month", y_keys=["created", "closed"], title="Cases")
-    assert spec.model_dump() == {
+    assert spec.wire_dump() == {
         "type": "bar",
         "x_key": "month",
         "y_keys": ["created", "closed"],
         "title": "Cases",
         "stacked": False,
+    }
+
+
+def test_model_dump_carries_the_new_optional_fields():
+    """model_dump() is the full object; wire_dump() is the payload. Keeping
+    them different is what lets the spec grow without a wire change."""
+    spec = ChartSpec(type="bar", x_key="month", y_keys=["created"])
+    assert spec.model_dump() == {
+        "type": "bar",
+        "x_key": "month",
+        "y_keys": ["created"],
+        "title": "",
+        "stacked": False,
+        "bins": None,
+        "show_legend": True,
+        "show_values": False,
     }
 
 

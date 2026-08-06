@@ -34,6 +34,10 @@ def _float(name: str, default: float) -> float:
     return float(raw)
 
 
+#: Valid CHART_TRIGGER_MODE values. `automatic` is intentionally not one.
+CHART_TRIGGER_MODES = ("explicit", "hybrid")
+
+
 class Settings:
     """Orchestrator settings, resolved from the environment at construction."""
 
@@ -77,6 +81,15 @@ class Settings:
             "EMBED_BASE_URL", "http://vllm-embed:30003/v1"
         ).rstrip("/")
         self.embed_model: str = os.environ.get("EMBED_MODEL", "Qwen/Qwen3-Embedding-0.6B")
+        # Unlimited-OCR (2026-08-06): baidu's 3.3B document-OCR VLM on its own
+        # vLLM service. Uploaded images and rendered PDF pages are transcribed
+        # here FIRST; the transcript rides with the pixels to the main model.
+        # Disabled or unreachable → the pipeline runs pixels-only as before.
+        self.ocr_enabled: bool = _bool("OCR_ENABLED", True)
+        self.ocr_base_url: str = os.environ.get(
+            "OCR_BASE_URL", "http://vllm-ocr:30004/v1"
+        ).rstrip("/")
+        self.ocr_model: str = os.environ.get("OCR_MODEL", "baidu/Unlimited-OCR")
 
         # --- Reranker (lazy transformers import; needs torch → base image only) ---
         self.rerank_enabled: bool = _bool("RERANK_ENABLED", True)
@@ -182,6 +195,14 @@ class Settings:
         self.profile_top_values: int = _int("PROFILE_TOP_VALUES", 5)
         self.profile_max_files: int = _int("PROFILE_MAX_FILES", 40)
         self.profile_max_columns: int = _int("PROFILE_MAX_COLUMNS", 60)
+        # Small-file full-content path (2026-08-06, owner request: "the model
+        # should get ALL the data, like ChatGPT"): a table at or under this
+        # many rows ships to the prompt in FULL (cells still clipped), so the
+        # model can compute exact sums/group-bys. Larger files keep the
+        # profile-only rule. The char cap bounds the worst case (many wide
+        # columns) — over it, the file falls back to profile-only.
+        self.profile_full_rows_max: int = _int("PROFILE_FULL_ROWS_MAX", 200)
+        self.profile_full_chars: int = _int("PROFILE_FULL_CHARS", 60000)
 
         # --- Phase 1: web search (all off by default; SearXNG is the free,
         # self-hosted default provider once SEARXNG_URL is set). ---
@@ -211,6 +232,20 @@ class Settings:
         self.workspace_ttl_hours: int = _int("WORKSPACE_TTL_HOURS", 24)
         self.workspace_quota_gb: int = _int("WORKSPACE_QUOTA_GB", 20)
         self.repo_final_chunks: int = _int("REPO_FINAL_CHUNKS", 12)
+
+        # --- Charts (§8) ---
+        # explicit — a chart appears only when the user asked for one, in
+        #            words. This is the historical behaviour and the default.
+        # hybrid   — explicit requests still work, and a small set of
+        #            deterministic, high-confidence result shapes (time
+        #            series, category comparison, trusted Salesforce stage
+        #            funnel, small part-to-whole) chart themselves.
+        # There is no `automatic` mode: everything else stays text + table.
+        # An unrecognised value falls back to `explicit` rather than
+        # guessing, because the failure mode of guessing is charts appearing
+        # where nobody wanted them.
+        _mode = os.environ.get("CHART_TRIGGER_MODE", "explicit").strip().lower()
+        self.chart_trigger_mode: str = _mode if _mode in CHART_TRIGGER_MODES else "explicit"
 
         # --- Row caps (§8) ---
         self.sql_preview_row_cap: int = _int("SQL_PREVIEW_ROW_CAP", PREVIEW_ROW_CAP)  # 500

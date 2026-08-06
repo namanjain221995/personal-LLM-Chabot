@@ -1,5 +1,123 @@
 # Changelog
 
+## Unlimited-OCR — dedicated document OCR in the model stack (2026-08-06)
+
+New resident model: **baidu/Unlimited-OCR** (3.3B document-OCR VLM, MIT,
+`vllm-ocr` service on port 8004). The vLLM nightly already on this box has
+native `UnlimitedOCRForCausalLM` support, so it is the same runtime — no new
+image. Weights live in `vllm_models/unlimited-ocr` (~6.7 GB); the unified
+memory budget moves from ≈0.53 to ≈0.61, the accepted ceiling.
+
+What it does: every **uploaded image** and every **rendered PDF page** is
+transcribed by the OCR model first ("document parsing" prompt, detection
+markup stripped), and the transcript is handed to the main model alongside
+the pixels — scans, invoices, tables and handwriting now read reliably
+instead of depending on the general VLM's OCR. The PDF path emits a
+"Reading N pages with OCR…" status line.
+
+Failure policy: OCR is an enhancer, never a gate (`engines/ocr.py`). Service
+down, still loading, or `OCR_ENABLED=false` → empty transcript, pixels-only
+answer, exactly the pre-OCR behavior. Everything stays on this machine.
+
+Boot tuning (measured through two crash-loops): 0.08 + CUDA graphs left no
+KV memory at all; the working config is **0.09 + `--enforce-eager` +
+`--max-model-len 8192`** (client output capped at 6000). While the first
+config crash-looped (21 restarts) it thrashed the box enough that ordinary
+chats timed out — if "the model server did not respond" ever appears again,
+check `docker compose ps` for a restarting model container FIRST. The
+transcript cleaner strips the live output format ("type [bbox]Content"
+lines), verified against the real served model.
+
+## Small files ship whole — CSV/tables the model can actually compute on (2026-08-06)
+
+Uploaded datasets were profile-only by design (5 sample rows + statistics),
+so "sum the salary column" was honestly refused. Now a table at or under
+**PROFILE_FULL_ROWS_MAX=200 rows** (and under PROFILE_FULL_CHARS=60000 once
+serialized) ships to the model IN FULL as `full_rows` — cells still clipped,
+still delimited as untrusted data — and the system prompt splits the honesty
+rule: full-content files may be aggregated exactly; larger files keep the
+profile-only limits and say so. The canary leak tests (row-500 secret, long
+top-value) still pass untouched — those files are far over the threshold.
+Also fixed: the user-bubble chip labelled every non-image attachment "PDF";
+it now shows the real extension (CSV, XLSX, ZIP…).
+
+## Multi-image upload — up to 5 images per message (2026-08-05)
+
+The composer accepted exactly one attachment; now it takes **up to 5 images**
+in one turn (multi-select in the picker, or add one by one — paste included),
+each with its own removable chip. A PDF or dataset still stands alone: they
+run different server paths, so picking one replaces the images and vice
+versa. The user bubble shows every thumbnail.
+
+Contract: the frontend sends `images: [...]` alongside the legacy
+`image_base64` (kept as the first image, so single-image requests produce the
+exact v1 key set). `ChatRequest` validates the ceiling (`MAX_IMAGES = 5` —
+five 10 MB base64 uploads ≈ 67 MB of JSON, a deliberate cap) and the vision
+engine sends one `image_url` part per image to the multimodal model.
+Regenerate/retry re-send ALL images of a turn (`lib/attachments.ts` now
+remembers arrays; if any preview is unrecoverable after a reload it reports
+missing rather than silently re-asking with fewer images).
+
+## Message rows — ChatGPT-style actions, Activity panel, no empty box (2026-08-05)
+
+Four owner requests in one pass:
+
+- **The empty "• Chat" box is gone.** The proof drawer only rendered an
+  engine badge for plain chat answers — an empty frame under every message.
+  It now renders nothing unless there is something to prove (SQL, sources,
+  data, a chart, files).
+- **ChatGPT-style action row.** Copy · 👍 · 👎 · try again as quiet icon
+  buttons instead of labelled chips. Thumbs feedback persists client-side
+  per message (`lib/feedback.ts`, localStorage; there is no server feedback
+  endpoint yet).
+- **Activity panel.** A "Sources" book button appears on any finished answer
+  that thought or searched; it opens a right-side drawer (ChatGPT's
+  Activity) showing the thinking with its duration and the web research —
+  sources, domains, every search, elapsed time. Inline reasoning/research
+  now show only WHILE streaming; finished messages stay clean.
+- **Pure white ink.** Dark theme `--ts-text` was #f5f5f5 and read as dull;
+  now #ffffff (muted/faint lifted a step to keep the hierarchy).
+
+## Composer "+" menu — ChatGPT-style attach & tools popover (2026-08-05)
+
+The bare paperclip is gone. The composer now opens with a **"+" button** whose
+popover offers three things, exactly like ChatGPT's attach menu:
+
+- **Add photos & files** — the old paperclip path, unchanged: images (≤10 MB),
+  PDFs (≤25 MB) and datasets (≤200 MB) through the same hidden input.
+- **Web search** — a FORCE toggle, shown **only while Salesforce is off**.
+  Auto ("the level decides", 2026-07-28) is still the default and needs no
+  checkmark; checking this sends `web_search: "on"`. While forced, a
+  dismissible **Web search pill** appears next to the "+" so the active tool
+  is visible, and clicking it returns to auto.
+- **Salesforce** — the toggle now lives HERE, not as a second always-visible
+  pill (owner request: no double controls). A dismissible Salesforce pill
+  appears next to the "+" only while the mode is ON — click it (or the menu
+  item) to turn off. Turning it ON also drops a forced web search to auto.
+
+**Salesforce mode never searches the web — at any effort level (Fast, Low,
+Medium, High).** That was already true for auto-detection (2026-07-28); now
+the server refuses even an explicit `web_search: "on"` in Salesforce mode
+(previously an escape hatch), the menu hides the toggle there, and stored
+prefs that combine both are normalized on load. The trust footer's
+"no web search · nothing leaves this machine" line is therefore
+unconditional again. All menu decisions (items, toggle transitions, footer
+wording) live in `frontend/lib/composerMenu.ts` as pure functions with
+vitest coverage; `AttachMenu.tsx` is a thin shell following the ModelPicker
+popover pattern, and both the pill and the menu flip Salesforce through the
+same tested transition.
+
+Review fallout, all fixed: **every `accent/NN` Tailwind class in the app
+compiled to no CSS at all** (the `accent` color was a bare `var()`, so
+opacity modifiers were silently dropped — the Salesforce pill's teal tint,
+citation hover borders and the research progress fill never rendered; now
+`rgb(var(--ts-accent-rgb) / <alpha-value>)`). Escape closing any composer
+popover (AttachMenu, ModelPicker, ContextMeter) no longer ALSO stops a
+streaming answer — the popover consumes the key. The "+" menu moves focus
+into itself on open, honours Tab-to-close, and its arrow keys skip the
+disabled upload row while streaming. The trust footer no longer dims its
+strongest warning (Salesforce off + search forced on).
+
 ## Login removed — single-user local mode (2026-07-28)
 
 No sign-in, no sign-up, no password, no session cookie. Open the app and it is
@@ -763,3 +881,96 @@ frontend**. Verified live: a 2-file ZIP profiled (5,000 rows, 14.3% nulls),
 every malicious fixture rejected with a clear reason and nothing written
 outside the workspace, and "which column has the most missing values?"
 answered correctly through the normal chat flow (route `dataset`).
+
+---
+
+## Charts: Apache ECharts in the browser, nine types, and three real bugs
+
+The chart system was extended, not replaced. `ChartSpec` is still the
+contract, `meta.chart` is still the transport, there is still exactly one
+`meta` frame per turn, and reports still render server-side with matplotlib.
+What changed is the browser renderer, the number of chart types, and three
+things that were quietly broken.
+
+**Recharts → Apache ECharts.** The migration happens entirely behind the
+spec: `lib/chartOption.ts` is a trusted adapter that builds every ECharts
+option from a validated `ChartSpec`, and the component never hands `spec` to
+ECharts. This matters more than it sounds — an ECharts `formatter` may be a
+*function*, so a passthrough of unknown keys would be code execution. There
+is no passthrough, and `ChartSpec` has no field that could carry one.
+ECharts loads through `next/dynamic` with `ssr: false` and registers only the
+five chart types and four components this app draws, so it sits in a 588 KB
+on-demand chunk: a conversation with no chart never downloads it.
+
+**One vulnerability found and closed on the way.** ECharts renders a string
+returned from a tooltip formatter as HTML, and the labels are Salesforce
+values — an Account named `<img src=x onerror=…>` is a legal record. Every
+value interpolated into tooltip markup is escaped.
+
+**Nine types.** bar, line, area, pie, scatter (unchanged) plus
+horizontal_bar, donut, funnel, histogram. Two of the new ones need something
+a model cannot be trusted to supply, so it is not asked:
+
+- **Histogram bins** are computed in Python over the full result and shipped
+  as an already-binned (label, count) table, so the browser and the report
+  PNG cannot disagree about where the bars are.
+- **Funnel order** asserts a sequence. A funnel is drawn only when every
+  stage belongs to one trusted list — Salesforce's standard Opportunity,
+  Lead and Case picklists, or an operator's own via
+  `CHART_FUNNEL_STAGE_ORDER`. One unrecognised stage and it degrades to a
+  ranked horizontal bar instead of inventing an order. `sort: 'none'` in the
+  adapter keeps ECharts from re-sorting it back.
+
+**THE BUG (agent route).** `merge_step_meta` carried only `sql` forward from
+a sql step, so an agent-routed answer never had `meta.data` — and a chart is
+drawn over `meta.data`. The identical question answered by the direct SQL
+route drew a chart; answered through the agent it drew nothing, silently.
+The whole sql payload now travels as a unit from the one step that produced
+it, so a chart spec can never end up rendered over a different query's rows.
+
+**THE BUG (blank report images).** `render_chart_png` fell past every drawing
+branch for a type it did not handle, then still set the title and saved —
+embedding a captioned, completely empty PNG in a Word/PDF report. That looks
+deliberate and says nothing. Unsupported types now raise, every `ChartType`
+must appear in `PNG_SUPPORTED` or `PNG_TABLE_ONLY` or the module refuses to
+import, and a zero-byte file is never embedded.
+
+**THE BUG (a chart could destroy its container).** In reports, a matplotlib
+exception propagated out of `_sql_section` and took the section's prose,
+table and heading with it. In the browser there was no error boundary
+anywhere, so a chart render throw unmounted the entire React tree and left a
+white page. Both are now scoped: `ChartErrorBoundary` for the chart,
+try/except around chart creation only for the report. A chart is the least
+important thing on screen and must not be able to take the most important
+thing with it.
+
+**Trigger modes.** `CHART_TRIGGER_MODE=explicit` (default) is bit-for-bit the
+old behaviour. `hybrid` adds four deterministic shapes — time series,
+single-metric category comparison, trusted stage funnel, small part-to-whole
+— decided in Python with no extra model call. There is no `automatic` mode,
+and an unrecognised value falls back to `explicit`: the failure mode of
+guessing is charts appearing where nobody wanted them.
+
+**One fewer model call, and a safer one.** Unambiguous shapes now build their
+spec deterministically. The model is consulted only for an explicit request
+whose result has no single obvious reading — and it is shown column
+*metadata* (`ColumnProfile.to_prompt_dict`), never a row. Salesforce record
+values are data, not instructions, and they no longer reach that prompt at
+all.
+
+**Theme.** `--ts-chart-1..5` existed in `globals.css` since the design system
+landed but nothing consumed them — Recharts needs literal colors, so the same
+five hexes were duplicated in the component and kept in sync by hand. They
+are now resolved with `getComputedStyle` and re-resolved on theme change,
+with the literals kept only as an SSR/test fallback.
+
+Tests: **800 backend** (+163) / **237 frontend** (+37). Lint, `tsc --noEmit`
+and `next build` all pass; `First Load JS` for `/` is 185 kB with ECharts
+outside it.
+
+**Known limitation, not worked around:** the backend receives history as
+`{role, content}` pairs with no `meta`, so the *previous* chart spec is not
+recoverable server-side. Follow-ups work when the message says what to change
+("make it a line chart", "make it horizontal", "show the table instead"), and
+every follow-up produces a new assistant response rather than mutating a
+chart in browser memory — so what you see survives a reload.

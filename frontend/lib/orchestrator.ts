@@ -28,6 +28,8 @@ export interface ChatRequestBody {
   pdf_filename?: string;
   /** Phase 1: web search mode. */
   web_search?: string;
+  /** 2026-08-05: all attached images (max 5); `image` stays the first one. */
+  images?: string[];
 }
 
 /** Body the orchestrator's POST /chat endpoint accepts (§10 + V2 §1 + V8). */
@@ -45,6 +47,8 @@ export interface OrchestratorChatRequest {
   pdf?: string;
   pdf_filename?: string;
   web_search?: string;
+  /** 2026-08-05: all attached images; image_base64 remains the first. */
+  images?: string[];
 }
 
 /**
@@ -71,7 +75,13 @@ export function toOrchestratorChatRequest(
   body: ChatRequestBody,
 ): OrchestratorChatRequest | null {
   const text = lastUserContent(body).trim();
-  const image = body.image ?? null;
+  // 2026-08-05: `images` (max 5) wins over the single `image` spelling.
+  const images = body.images?.length
+    ? body.images
+    : body.image
+      ? [body.image]
+      : [];
+  const image = images[0] ?? null;
   const pdf = body.pdf ?? null;
   const message =
     text || (image ? IMAGE_ONLY_PROMPT : pdf ? PDF_ONLY_PROMPT : '');
@@ -84,6 +94,9 @@ export function toOrchestratorChatRequest(
       : {}),
     session_id: body.session_id ?? 'default',
     image_base64: image,
+    // Only sent when there genuinely are several — single-image requests
+    // keep producing the exact v1 key set.
+    ...(images.length > 1 ? { images } : {}),
     // V2 §1 fields: include only when the client sent them so v1-shaped
     // requests keep producing the exact v1 key set.
     ...(body.conversation_id !== undefined

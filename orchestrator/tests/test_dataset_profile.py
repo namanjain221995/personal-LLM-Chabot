@@ -106,6 +106,70 @@ def test_top_values_are_capped_in_count_and_length(csv_with_canaries):
 
 
 # ---------------------------------------------------------------------------
+# Small-file full-content path (2026-08-06): the WHOLE table ships when small
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def small_csv(tmp_path):
+    path = tmp_path / "team.csv"
+    lines = ["name,role,salary"]
+    for i in range(20):
+        lines.append(f"person{i},engineer,{1000 + i}")
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+def test_small_file_ships_every_row(small_csv):
+    prof = profiler.profile_tabular(str(small_csv))
+    assert prof["full_content"] is True
+    assert len(prof["full_rows"]) == 20
+    # An aggregate over full_rows is now computable — and exact.
+    assert sum(r["salary"] for r in prof["full_rows"]) == sum(
+        1000 + i for i in range(20)
+    )
+
+
+def test_large_file_stays_profile_only(csv_with_canaries):
+    prof = profiler.profile_tabular(str(csv_with_canaries))
+    assert "full_rows" not in prof
+    assert "full_content" not in prof
+
+
+def test_full_rows_cells_are_still_clipped(tmp_path):
+    path = tmp_path / "wide.csv"
+    secret_tail = "SECRET-TAIL-77aa"
+    path.write_text("id,blob\n1," + "y" * 500 + secret_tail + "\n")
+    prof = profiler.profile_tabular(str(path))
+    assert prof.get("full_content") is True
+    blob = prof["full_rows"][0]["blob"]
+    assert secret_tail not in blob
+    assert blob.endswith("…[truncated]")
+
+
+def test_char_cap_falls_back_to_profile_only(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "profile_full_chars", 100)
+    path = tmp_path / "small.csv"
+    path.write_text("id,text\n" + "\n".join(f"{i},row {i}" for i in range(20)))
+    prof = profiler.profile_tabular(str(path))
+    assert "full_rows" not in prof
+
+
+def test_full_rows_reach_the_prompt_for_small_files(small_csv):
+    prof = profiler.profile_tabular(str(small_csv))
+    messages = dataset.build_messages(
+        "what is the total salary?",
+        [{"filename": "team.csv", "bytes": 1, "status": "ready",
+          "profile": [prof], "notes": None}],
+        [],
+    )
+    prompt = json.dumps(messages)
+    assert "full_rows" in prompt
+    assert "person19" in prompt  # the LAST row is present, not just a sample
+    assert "FULL CONTENT" in prompt  # the system rule that permits computing
+
+
+# ---------------------------------------------------------------------------
 # THE canary tests — raw data must not reach the prompt
 # ---------------------------------------------------------------------------
 

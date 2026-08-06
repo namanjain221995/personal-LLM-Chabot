@@ -91,22 +91,25 @@ export function Providers({ children }: { children: ReactNode }) {
     <ThemeContext.Provider value={{ theme, toggleTheme }}>
       <ToastContext.Provider value={{ toast }}>
         {children}
+        {/* Top-center, ChatGPT-style (owner request 2026-08-05): errors as a
+            red pill, info neutral. Bottom-center hid them behind the
+            composer and its attachment chips. */}
         <div
           aria-live="polite"
           role="status"
-          className="pointer-events-none fixed bottom-5 left-1/2 z-[70] flex w-full max-w-md -translate-x-1/2 flex-col items-center gap-2 px-4"
+          className="pointer-events-none fixed left-1/2 top-5 z-[70] flex w-full max-w-md -translate-x-1/2 flex-col items-center gap-2 px-4"
         >
           {toasts.map((t) => (
             <div
               key={t.id}
-              className={`pointer-events-auto w-full rounded-ts border px-4 py-2.5 text-sm shadow-lg ${
+              className={`pointer-events-auto rounded-full border px-4 py-2 text-sm shadow-lg ${
                 t.tone === 'error'
-                  ? 'border-danger/40 bg-surface text-ink'
+                  ? 'border-danger/40 bg-danger/10 text-danger'
                   : 'border-border bg-surface text-ink'
               }`}
             >
               {t.tone === 'error' && (
-                <span className="mr-2 font-semibold text-danger">!</span>
+                <span className="mr-2 font-semibold">!</span>
               )}
               {t.text}
             </div>

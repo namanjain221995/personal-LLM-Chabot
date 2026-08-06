@@ -147,6 +147,24 @@ def profile_tabular(path: str, *, name: Optional[str] = None) -> Dict[str, Any]:
         out["sample_rows"] = [
             {n: clip(v) for n, v in zip(names, row[: len(names)])} for row in sample
         ]
+
+        # Small-file full-content path (2026-08-06): at or under the row
+        # threshold — with no columns cut — the ENTIRE table goes into the
+        # profile so the model can compute exact aggregates, ChatGPT-style.
+        # Cells still pass through clip(); the char cap catches the
+        # few-rows-but-very-wide case, falling back to profile-only.
+        if (
+            0 < rows <= settings.profile_full_rows_max
+            and not out.get("columns_truncated")
+        ):
+            all_rows = con.execute(f"SELECT * FROM {src}").fetchall()
+            full = [
+                {n: clip(v) for n, v in zip(names, row[: len(names)])}
+                for row in all_rows
+            ]
+            if len(json.dumps(full, default=str)) <= settings.profile_full_chars:
+                out["full_rows"] = full
+                out["full_content"] = True
     except Exception as exc:
         out["error"] = f"could not be read as a table: {type(exc).__name__}"
     finally:

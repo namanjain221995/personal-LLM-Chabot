@@ -371,8 +371,10 @@ dataset), paste capture, Salesforce toggle, effort picker, send/stop, context ri
 4. `handlePaste` `:207-228`: an image clipboard item becomes the attachment `:210-220`; text past
    `shouldAttachPaste` becomes a `PastedChip` `:221-227`.
 5. Render `:230-421`: chip row `:233-279`, rounded container `:283-403` with the textarea `:284-310`
-   (Enter submits `:292-297`), hidden file input `:313-325`, paperclip `:326-335`, Salesforce pill
-   `:338-353`, `ModelPicker` `:362-368`, meter + send/stop `:377-401`, trust footer `:405-418`.
+   (Enter submits `:292-297`), hidden file input, the "+" `AttachMenu` (2026-08-05: Add photos &
+   files · Web search [Salesforce off only] · Salesforce — replaced the paperclip; headless model in
+   `lib/composerMenu.ts`), Salesforce pill, Web-search pill (only while forced on), `ModelPicker`,
+   meter + send/stop, trust footer via `trustLine()`. (Line refs after this point predate the menu.)
 
 **State & side effects** — `FileReader` reads up to 25 MB (PDF) into an in-memory base64 data URL
 `:192-202`. `toast()` via `useToast` `:116`. Direct DOM style writes on the textarea `:125-128`.

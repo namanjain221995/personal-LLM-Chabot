@@ -17,14 +17,20 @@ from typing import Awaitable, Callable, List, Optional, Sequence, Tuple
 from . import NO_DATA_MESSAGE, recent_turns
 from .. import llm
 from ..config import settings
-from ..core.chart_spec import parse_chart_spec
+from ..core import chart_decision
+from ..core.chart_pipeline import ChartResult, build_chart
 from ..core.exports import cap_rows, export_csv, export_xlsx, slugify
 from ..core.schema_cache import format_schema, schema_cache
 from ..core.sql_guard import guard_sql
 
 Emit = Callable[[str, dict], Awaitable[None]]
 
-CHART_RE = re.compile(r"\b(chart|graph|plot|visuali[sz]e|visuali[sz]ation)\b", re.I)
+# The chart trigger now lives in core/chart_decision.py, where the mode
+# (explicit | hybrid), the named-type parse and the false-positive filter
+# sit together. Re-exported because the historical name is what callers and
+# tests reach for, and it is still exactly the pattern that used to gate
+# charting here.
+CHART_RE = chart_decision.LEGACY_CHART_RE
 EXPORT_RE = re.compile(r"\b(export|download|excel|xlsx|csv|spreadsheet)\b", re.I)
 _CSV_RE = re.compile(r"\bcsv\b", re.I)
 _THINK_RE = re.compile(r"<think>.*?</think>", re.S | re.I)
@@ -201,18 +207,40 @@ async def generate_and_run_sql(
         return sql2, columns, rows
 
 
-def _chart_messages(question: str, columns: Sequence[str]) -> List[dict]:
-    system = (
-        "Design a chart for a SQL result. Respond with ONLY a JSON object, "
-        'no prose: {"type": "bar|line|scatter|pie|area", "x_key": "<column>", '
-        '"y_keys": ["<column>", ...], "title": "<short title>", '
-        '"stacked": true or false}. '
-        f"Available columns: {', '.join(columns)}"
+async def _ask_chart_model(messages: List[dict]) -> str:
+    return await llm.chat_completion(messages, temperature=0.0, max_tokens=2500)
+
+
+async def attach_chart(
+    meta: dict,
+    message: str,
+    columns: Sequence[str],
+    rows: Sequence[Sequence],
+    title: str = "",
+) -> Optional[ChartResult]:
+    """Attach `meta.chart` (and `meta.chart_data` when needed). Never raises.
+
+    `meta.chart` keeps its historical shape. `meta.chart_data` is new and
+    OPTIONAL: it appears only when the chart draws something other than the
+    query result verbatim — histogram bins, or a funnel in trusted stage
+    order — so `meta.data` stays exactly what the SQL returned and the Data
+    tab is never silently re-sorted. Consumers written before this key fall
+    back to `meta.data`, which is all old payloads carry.
+    """
+    result = await build_chart(
+        message,
+        columns,
+        rows,
+        mode=settings.chart_trigger_mode,
+        ask_model=_ask_chart_model,
+        title=title,
     )
-    return [
-        {"role": "system", "content": system},
-        {"role": "user", "content": question},
-    ]
+    if result is None:
+        return None
+    meta["chart"] = result.spec.wire_dump()
+    if result.derived:
+        meta["chart_data"] = [dict(zip(result.columns, row)) for row in result.rows]
+    return result
 
 
 def _narrative_messages(
@@ -345,10 +373,25 @@ async def run_sql_engine(message: str, history: Sequence[dict], emit: Emit) -> s
             await emit(kind, {"text": delta})
             if kind == "token":
                 parts.append(delta)
-        await emit("meta", {
+        live_preview = live_rows[:settings.sql_preview_row_cap]
+        live_meta: dict = {
             "route": "sql", "sql": soql,
-            "data": live_rows[:settings.sql_preview_row_cap], "truncated": False,
-        })
+            "data": live_preview, "truncated": False,
+        }
+        # Live SOQL results chart exactly like warehouse results — the
+        # pipeline only ever sees (columns, rows), never where they came
+        # from. Scalar columns only: a nested Salesforce sub-object is not
+        # an axis.
+        if live_preview and isinstance(live_preview[0], dict):
+            live_cols = [
+                c for c in live_preview[0]
+                if not isinstance(live_preview[0][c], (dict, list))
+            ]
+            await attach_chart(
+                live_meta, message, live_cols,
+                [[r.get(c) for c in live_cols] for r in live_preview],
+            )
+        await emit("meta", live_meta)
         return "".join(parts)
 
     preview, truncated = cap_rows(rows, settings.sql_preview_row_cap)  # 500-row meta cap
@@ -376,16 +419,11 @@ async def run_sql_engine(message: str, history: Sequence[dict], emit: Emit) -> s
             }
         ]
 
-    # Chart spec ONLY when the user asked for a chart/graph/plot (§8).
-    if CHART_RE.search(message) and columns:
-        spec_raw = await llm.chat_completion(
-            _chart_messages(message, columns), temperature=0.0, max_tokens=2500
-        )
-        spec = parse_chart_spec(spec_raw, columns=columns)
-        if spec is not None:
-            meta["chart"] = spec.model_dump()
-        # invalid spec → no "chart" key → table only; the model's JSON is
-        # parsed and validated, NEVER executed.
+    # Chart spec (§8). In the default `explicit` trigger mode this fires on
+    # exactly the same requests it always did; `hybrid` additionally charts
+    # a few deterministic shapes. Never raises — a chart problem must not
+    # cost the user the answer that is about to stream.
+    await attach_chart(meta, message, columns, preview)
 
     parts: List[str] = []
     async for token in llm.stream_chat_completion(

@@ -243,6 +243,29 @@ export const IconGlobe = ({ size, className }: IconProps) => (
   </svg>
 );
 
+/* ------------------------------- message action row (ChatGPT-style row) */
+
+export const IconThumbUp = ({ size, className }: IconProps) => (
+  <svg {...base(size, className)}>
+    <path d="M7 10v11H4a1 1 0 0 1-1-1v-9a1 1 0 0 1 1-1h3Z" />
+    <path d="M7 11.5 11.4 3a2.6 2.6 0 0 1 2.5 3.2L13.2 9h5.6a2 2 0 0 1 1.9 2.6l-2.2 7a2 2 0 0 1-1.9 1.4H7" />
+  </svg>
+);
+
+export const IconThumbDown = ({ size, className }: IconProps) => (
+  <svg {...base(size, className)}>
+    <path d="M17 14V3h3a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1h-3Z" />
+    <path d="M17 12.5 12.6 21a2.6 2.6 0 0 1-2.5-3.2l.7-2.8H5.2a2 2 0 0 1-1.9-2.6l2.2-7A2 2 0 0 1 7.4 4H17" />
+  </svg>
+);
+
+export const IconBook = ({ size, className }: IconProps) => (
+  <svg {...base(size, className)}>
+    <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" />
+    <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2Z" />
+  </svg>
+);
+
 /* --------------------------------------------- Mermaid diagram controls */
 
 export const IconCode = ({ size, className }: IconProps) => (

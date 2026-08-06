@@ -44,11 +44,27 @@ def to_data_url(image_base64: str) -> str:
     return f"data:image/png;base64,{raw}"
 
 
-def build_user_content(message: str, image_base64: str) -> List[dict]:
-    """OpenAI multimodal content parts: text + image_url (data: URL)."""
+def build_user_content(
+    message: str, images: "str | Sequence[str]"
+) -> List[dict]:
+    """OpenAI multimodal content parts: text + one image_url per image
+    (2026-08-05: the composer sends up to 5). A bare string is accepted for
+    the single-image callers that predate the list form."""
+    imgs = [images] if isinstance(images, str) else list(images)
     return [
-        {"type": "text", "text": message or "Describe this image."},
-        {"type": "image_url", "image_url": {"url": to_data_url(image_base64)}},
+        {
+            "type": "text",
+            "text": message
+            or (
+                "Describe this image."
+                if len(imgs) <= 1
+                else "Describe these images."
+            ),
+        },
+        *(
+            {"type": "image_url", "image_url": {"url": to_data_url(i)}}
+            for i in imgs
+        ),
     ]
 
 
@@ -65,16 +81,39 @@ def extract_json_block(text: str) -> Optional[dict]:
 
 async def run_vision_engine(
     message: str,
-    image_base64: Optional[str],
+    images: "Optional[str | Sequence[str]]",
     history: Sequence[dict],
     emit: Emit,
 ) -> str:
-    if not image_base64:
+    imgs = [images] if isinstance(images, str) else list(images or [])
+    if not imgs:
         raise ValueError("the vision engine requires an attached image")
+
+    user_content = build_user_content(message, imgs)
+
+    # Unlimited-OCR pass (2026-08-06): screenshots, invoices and photographed
+    # documents get a dedicated OCR transcript alongside the pixels — the OCR
+    # model reads dense text/tables the general VLM misses. Photos with no
+    # text produce an empty transcript and add nothing.
+    from ..config import settings
+    from .ocr import ocr_images, transcript_block
+
+    if settings.ocr_enabled:
+        transcripts = await ocr_images(imgs)
+        block = transcript_block(transcripts, "image")
+        if block:
+            user_content.append(
+                {
+                    "type": "text",
+                    "text": block
+                    + "\n(Transcript from the OCR model — if it disagrees "
+                    "with the pixels, trust the pixels.)",
+                }
+            )
 
     messages: List[dict] = [
         {"role": "system", "content": _SYSTEM},
-        {"role": "user", "content": build_user_content(message, image_base64)},
+        {"role": "user", "content": user_content},
     ]
 
     parts: List[str] = []

@@ -71,3 +71,32 @@ def test_cors_origins_default_is_local_frontend_only(monkeypatch):
 def test_cors_origins_env_override(monkeypatch):
     monkeypatch.setenv("CORS_ALLOW_ORIGINS", "http://example.local:3000")
     assert Settings().cors_allow_origins == ["http://example.local:3000"]
+
+
+# --- CHART_TRIGGER_MODE -----------------------------------------------------
+
+
+def test_chart_trigger_mode_defaults_to_explicit(monkeypatch):
+    """The default must preserve today's behaviour exactly: a chart appears
+    only when the user asked for one."""
+    from app.config import Settings
+
+    monkeypatch.delenv("CHART_TRIGGER_MODE", raising=False)
+    assert Settings().chart_trigger_mode == "explicit"
+
+
+def test_chart_trigger_mode_accepts_hybrid(monkeypatch):
+    from app.config import Settings
+
+    monkeypatch.setenv("CHART_TRIGGER_MODE", "Hybrid")
+    assert Settings().chart_trigger_mode == "hybrid"
+
+
+def test_an_unknown_chart_trigger_mode_falls_back_to_explicit(monkeypatch):
+    """Including `automatic`, which is deliberately not implemented. The
+    failure mode of guessing is charts appearing where nobody wanted them."""
+    from app.config import Settings
+
+    for value in ("automatic", "", "  ", "yes-please"):
+        monkeypatch.setenv("CHART_TRIGGER_MODE", value)
+        assert Settings().chart_trigger_mode == "explicit"

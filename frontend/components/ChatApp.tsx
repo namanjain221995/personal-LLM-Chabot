@@ -32,7 +32,7 @@ import {
   savePrefs,
   type ChatPrefs,
 } from '@/lib/prefs';
-import { attachmentForResend, rememberAttachment } from '@/lib/attachments';
+import { attachmentsForResend, rememberAttachments } from '@/lib/attachments';
 import { shortcutAction } from '@/lib/searchPalette';
 import {
   attachStream,
@@ -389,11 +389,17 @@ export function ChatApp() {
   }, []);
 
   const send = useCallback(
-    (text: string, attachment: Attachment | null, pasted: PastedText[]) => {
+    (text: string, attachments: Attachment[], pasted: PastedText[]) => {
+      // Up to 5 images OR exactly one PDF/dataset (2026-08-05) — the
+      // Composer enforces the shape; `first` covers the exclusive kinds.
+      const first = attachments[0] ?? null;
+      const isPdf = first?.kind === 'pdf';
+      const isDataset = first?.kind === 'dataset';
+      const images = attachments.filter((a) => a.kind === 'image');
       let conversationId = activeId;
       if (!conversationId) {
         const title =
-          text || (pasted.length ? 'Pasted text' : '') || attachment?.name || '';
+          text || (pasted.length ? 'Pasted text' : '') || first?.name || '';
         const conv = getHistoryStore().create(title);
         conversationId = conv.id;
         setActiveId(conv.id);
@@ -403,29 +409,35 @@ export function ChatApp() {
         refreshList();
       }
       setUrlConversation(conversationId);
-      const isPdf = attachment?.kind === 'pdf';
-      const isDataset = attachment?.kind === 'dataset';
       const userMessage: ChatMessage = {
         id: newId(),
         role: 'user',
         content: text,
-        imageDataUrl:
-          isPdf || isDataset ? undefined : attachment?.dataUrl,
+        imageDataUrl: images[0]?.dataUrl,
+        imageDataUrls:
+          images.length > 1 ? images.map((i) => i.dataUrl) : undefined,
         // V8: a PDF attachment shows a chip (filename) in the bubble.
-        pdfName: isPdf || isDataset ? attachment?.name : undefined,
+        pdfName: isPdf || isDataset ? first?.name : undefined,
         // V5: pasted blocks ride on meta so they round-trip through server
         // history and are folded into the model input at request time.
         meta: pasted.length ? { route: 'chat', pasted } : undefined,
         createdAt: Date.now(),
       };
-      // Keep the payload in memory so regenerate/retry re-send the same
-      // question WITH its attachment (never persisted — see lib/attachments).
-      if (attachment?.base64 && !isDataset) {
-        rememberAttachment(userMessage.id, {
-          kind: isPdf ? 'pdf' : 'image',
-          name: attachment.name,
-          base64: attachment.base64,
-        });
+      // Keep the payloads in memory so regenerate/retry re-send the same
+      // question WITH its attachments (never persisted — see lib/attachments).
+      if (!isDataset) {
+        rememberAttachments(
+          userMessage.id,
+          isPdf && first?.base64
+            ? [{ kind: 'pdf', name: first.name, base64: first.base64 }]
+            : images
+                .filter((i) => i.base64)
+                .map((i) => ({
+                  kind: 'image' as const,
+                  name: i.name,
+                  base64: i.base64,
+                })),
+        );
       }
       const turns = [...messagesRef.current, userMessage];
       persist(conversationId, turns);
@@ -433,19 +445,19 @@ export function ChatApp() {
       setUnreachable(false);
       setStreaming(true);
 
-      if (isDataset && attachment?.file) {
+      if (isDataset && first?.file) {
         // Datasets stream to their own endpoint and are then referenced by the
         // conversation, so the chat request itself stays small.
         void (async () => {
           try {
             const form = new FormData();
-            form.append('file', attachment.file as File);
+            form.append('file', first.file as File);
             form.append('conversation_id', conversationId);
             const res = await fetch('/api/upload', { method: 'POST', body: form });
             const body = (await res.json()) as { detail?: string; files?: number };
             if (!res.ok) throw new Error(body.detail ?? 'upload failed');
             toast(
-              `Profiled ${body.files ?? 0} file${body.files === 1 ? '' : 's'} from ${attachment.name}.`,
+              `Profiled ${body.files ?? 0} file${body.files === 1 ? '' : 's'} from ${first.name}.`,
             );
           } catch (err) {
             toast(
@@ -467,9 +479,9 @@ export function ChatApp() {
         conversationId,
         turns,
         prefs: prefsRef.current,
-        image: isPdf ? null : attachment?.base64 ?? null,
-        pdf: isPdf ? attachment?.base64 ?? null : null,
-        pdfName: isPdf ? attachment?.name ?? null : null,
+        images: isPdf ? null : images.map((i) => i.base64).filter(Boolean),
+        pdf: isPdf ? first?.base64 ?? null : null,
+        pdfName: isPdf ? first?.name ?? null : null,
       });
     },
     [activeId, persist, refreshList, setUrlConversation, toast],
@@ -488,9 +500,9 @@ export function ChatApp() {
       if (userIdx < 0) return;
       const turns = msgs.slice(0, userIdx + 1);
 
-      // Re-send the SAME question, attachment included. Without this the model
-      // was re-asked "what's in this invoice?" with no invoice attached.
-      const { attachment, missing } = attachmentForResend(msgs[userIdx]);
+      // Re-send the SAME question, attachments included. Without this the
+      // model was re-asked "what's in this invoice?" with no invoice attached.
+      const { attachments, missing } = attachmentsForResend(msgs[userIdx]);
       if (missing) {
         toast(
           'Re-attach the file to regenerate this answer — its contents are no longer in memory.',
@@ -498,6 +510,10 @@ export function ChatApp() {
         );
         return;
       }
+      const resendImages = attachments
+        .filter((a) => a.kind === 'image')
+        .map((a) => a.base64);
+      const resendPdf = attachments.find((a) => a.kind === 'pdf') ?? null;
 
       // Regenerating an OLDER answer really does discard the turns after it.
       // The sync path cannot shrink a thread (that guard is what stops a
@@ -526,9 +542,9 @@ export function ChatApp() {
         conversationId: id,
         turns,
         prefs: prefsRef.current,
-        image: attachment?.kind === 'image' ? attachment.base64 : null,
-        pdf: attachment?.kind === 'pdf' ? attachment.base64 : null,
-        pdfName: attachment?.kind === 'pdf' ? attachment.name : null,
+        images: resendImages,
+        pdf: resendPdf?.base64 ?? null,
+        pdfName: resendPdf?.name ?? null,
       });
     },
     [toast],
@@ -565,7 +581,7 @@ export function ChatApp() {
       setUnreachable(false);
       return;
     }
-    const { attachment, missing } = attachmentForResend(msgs[userIdx]);
+    const { attachments, missing } = attachmentsForResend(msgs[userIdx]);
     if (missing) {
       toast(
         'Re-attach the file to retry this message — its contents are no longer in memory.',
@@ -573,15 +589,18 @@ export function ChatApp() {
       );
       return;
     }
+    const retryPdf = attachments.find((a) => a.kind === 'pdf') ?? null;
     setUnreachable(false);
     setStreaming(true);
     void startStream({
       conversationId: id,
       turns: msgs.slice(0, userIdx + 1),
       prefs: prefsRef.current,
-      image: attachment?.kind === 'image' ? attachment.base64 : null,
-      pdf: attachment?.kind === 'pdf' ? attachment.base64 : null,
-      pdfName: attachment?.kind === 'pdf' ? attachment.name : null,
+      images: attachments
+        .filter((a) => a.kind === 'image')
+        .map((a) => a.base64),
+      pdf: retryPdf?.base64 ?? null,
+      pdfName: retryPdf?.name ?? null,
     });
   }, [toast]);
 

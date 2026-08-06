@@ -29,16 +29,35 @@
   --ts-surface: #1e1e1e;
   --ts-surface-2: #2a2a2a;
   --ts-border: #262626;
-  --ts-text: #f5f5f5;
-  --ts-text-muted: #a3a3a3;
-  --ts-text-faint: #7a7a7a;
+  /* Pure white (owner request 2026-08-05) — #f5f5f5 read as dull grey. */
+  --ts-text: #ffffff;
+  --ts-text-muted: #b3b3b3;
+  --ts-text-faint: #8a8a8a;
   --ts-accent: #19bcb5; /* Signal Teal, lifted for AA on dark */
+  /* Raw RGB channels of --ts-accent, for Tailwind's <alpha-value> slot: with
+     `accent: 'var(--ts-accent)'` every `accent/NN` opacity modifier compiled
+     to NOTHING (verified: border-accent/50 emitted no CSS), so pill tints,
+     hover borders and the research progress fill silently never rendered.
+     Keep in sync with --ts-accent above. */
+  --ts-accent-rgb: 25 188 181;
   --ts-accent-strong: #0e9f9a;
   --ts-accent-soft: rgba(14, 159, 154, 0.14);
   --ts-danger: #ef5a5f;
+  --ts-danger-rgb: 239 90 95; /* channels of --ts-danger — keep in sync */
   --ts-danger-soft: rgba(229, 72, 77, 0.14);
   /* Amber "heads up" state: trimmed input now, context meter 60-84% later. */
   --ts-warn: #f0a92e;
+
+  /* Code syntax tokens (2026-08-06, ChatGPT-style highlighting) — One
+     Dark-ish palette, mapped to hljs-* classes at the end of this file. */
+  --ts-code-comment: #7f848e;
+  --ts-code-keyword: #c678dd;
+  --ts-code-string: #98c379;
+  --ts-code-number: #d19a66;
+  --ts-code-function: #61afef;
+  --ts-code-class: #e5c07b;
+  --ts-code-builtin: #56b6c2;
+  --ts-code-attr: #e06c75;
 
   /* engine identities (badges / drawer accents only) */
   --ts-engine-sql: #b7791f;
@@ -91,11 +110,23 @@ html.light {
   --ts-text-muted: #5d5d5d;
   --ts-text-faint: #8f8f8f;
   --ts-accent: #0b7c77; /* Signal Teal, deepened for AA on paper */
+  --ts-accent-rgb: 11 124 119; /* channels of --ts-accent — keep in sync */
   --ts-accent-strong: #0e9f9a;
   --ts-accent-soft: rgba(14, 159, 154, 0.12);
   --ts-danger: #c62a30;
+  --ts-danger-rgb: 198 42 48; /* channels of --ts-danger — keep in sync */
   --ts-danger-soft: rgba(198, 42, 48, 0.1);
   --ts-warn: #b26a00;
+
+  /* Code syntax tokens — One Light-ish, AA on the paper background. */
+  --ts-code-comment: #a0a1a7;
+  --ts-code-keyword: #a626a4;
+  --ts-code-string: #50a14f;
+  --ts-code-number: #986801;
+  --ts-code-function: #4078f2;
+  --ts-code-class: #c18401;
+  --ts-code-builtin: #0184bc;
+  --ts-code-attr: #e45649;
 
   --ts-engine-sql-ink: #8a5a14;
   --ts-engine-rag-ink: #0b7c77;
@@ -527,4 +558,73 @@ a {
 
 .ctx-pulse {
   animation: ctx-pulse 1.8s ease-in-out infinite;
+}
+
+/* ------------------------------------------------------------------------
+   Syntax highlighting (2026-08-06) — rehype-highlight emits hljs-* token
+   classes inside fenced code blocks; the colors live in the --ts-code-*
+   theme tokens above so dark and light both read well. */
+
+.hljs-comment,
+.hljs-quote {
+  color: var(--ts-code-comment);
+  font-style: italic;
+}
+
+.hljs-keyword,
+.hljs-selector-tag,
+.hljs-tag {
+  color: var(--ts-code-keyword);
+}
+
+.hljs-string,
+.hljs-regexp,
+.hljs-addition {
+  color: var(--ts-code-string);
+}
+
+.hljs-number,
+.hljs-literal {
+  color: var(--ts-code-number);
+}
+
+.hljs-title,
+.hljs-title.function_ {
+  color: var(--ts-code-function);
+}
+
+.hljs-title.class_,
+.hljs-type,
+.hljs-section,
+.hljs-selector-class,
+.hljs-selector-id {
+  color: var(--ts-code-class);
+}
+
+.hljs-built_in,
+.hljs-symbol,
+.hljs-meta,
+.hljs-doctag,
+.hljs-bullet {
+  color: var(--ts-code-builtin);
+}
+
+.hljs-attr,
+.hljs-attribute,
+.hljs-variable,
+.hljs-template-variable,
+.hljs-name {
+  color: var(--ts-code-attr);
+}
+
+.hljs-deletion {
+  color: var(--ts-danger);
+}
+
+.hljs-emphasis {
+  font-style: italic;
+}
+
+.hljs-strong {
+  font-weight: 600;
 }

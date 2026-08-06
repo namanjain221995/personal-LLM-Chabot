@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import tempfile
 import time
@@ -18,15 +19,17 @@ from typing import Awaitable, Callable, List, Sequence
 
 from .. import llm
 from ..config import settings
-from ..core.chart_spec import parse_chart_spec
-from ..core.charts_png import render_chart_png
+from ..core.chart_pipeline import build_chart
+from ..core.charts_png import PNG_SUPPORTED, render_chart_png
 from ..core.citations import build_citations
 from ..core.exports import slugify
 from .rag import _answer_messages as rag_answer_messages
 from .rag import select_context
-from .sql import _chart_messages, generate_and_run_sql
+from .sql import _ask_chart_model, generate_and_run_sql
 
 Emit = Callable[[str, dict], Awaitable[None]]
+
+log = logging.getLogger(__name__)
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.S | re.I)
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.S | re.I)
@@ -144,15 +147,53 @@ async def _sql_section(sec: dict, index: int, tmp_dir: Path) -> List[str]:
     parts += [prose.strip(), "", _markdown_table(columns, rows), ""]
 
     if sec.get("chart") and columns and rows:
-        spec_raw = await llm.chat_completion(
-            _chart_messages(sec["instruction"], columns), temperature=0.0, max_tokens=2500
-        )
-        spec = parse_chart_spec(spec_raw, columns=columns)
-        if spec is not None:  # invalid spec → table only (§8)
-            png_path = tmp_dir / f"chart-{index}.png"
-            render_chart_png(spec, columns, rows[:50], png_path)
-            parts += [f"![{spec.title or sec['title']}]({png_path.name})", ""]
+        parts += await _section_chart(sec, index, tmp_dir, columns, rows)
     return parts
+
+
+async def _section_chart(
+    sec: dict, index: int, tmp_dir: Path, columns: Sequence[str], rows: Sequence[Sequence]
+) -> List[str]:
+    """Render this section's chart, or return [] and keep the section.
+
+    The prose and the table are already in `parts` by the time this runs and
+    are returned by the caller regardless — a chart is an addition to a
+    report section, never a precondition for it. Previously an exception in
+    here propagated out of `_sql_section` and took the section's prose,
+    table and heading with it, so one unlucky matplotlib call silently cost
+    the reader a whole chapter of their report.
+    """
+    try:
+        result = await build_chart(
+            sec["instruction"],
+            columns,
+            rows[:50],
+            mode=settings.chart_trigger_mode,
+            ask_model=_ask_chart_model,
+            title=sec.get("title", ""),
+            # The planner already decided this section wants a chart; the
+            # section instruction is not the user's wording, so the
+            # wording check would refuse every report chart.
+            force=True,
+        )
+        if result is None:
+            return []
+        if result.spec.type not in PNG_SUPPORTED:
+            # An explicit table-only policy (today: funnel). The section
+            # keeps the ordered table above; nothing blank is embedded.
+            log.info(
+                "report chart type %s has no matplotlib rendering; table only",
+                result.spec.type,
+            )
+            return []
+        png_path = tmp_dir / f"chart-{index}.png"
+        render_chart_png(result.spec, result.columns, result.rows, png_path)
+        if not png_path.exists() or png_path.stat().st_size == 0:
+            return []
+        return [f"![{result.spec.title or sec['title']}]({png_path.name})", ""]
+    except Exception:
+        log.warning("report chart failed for section %s; table only", index, exc_info=True)
+        return []
 
 
 async def _rag_section(sec: dict) -> List[str]:

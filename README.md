@@ -24,6 +24,27 @@ from and says which source it used.
 Plus: image and PDF reading, dataset/ZIP profiling, Word/PDF report generation,
 Mermaid diagrams, charts, CSV export.
 
+### Charts
+
+Nine types — bar, horizontal bar, line, area, scatter, pie, donut, funnel,
+histogram — drawn in the browser with **Apache ECharts** and in generated
+reports with **matplotlib**. Two renderers, one contract: the model only ever
+emits a validated `ChartSpec` (`type`, `x_key`, `y_keys`, `title`, `stacked`,
+plus a bounded `bins` / two booleans). It cannot emit renderer options,
+JavaScript, formatters, HTML or colors, and `x_key`/`y_keys` must name columns
+the query actually returned.
+
+By default a chart appears only when you ask for one. Set
+`CHART_TRIGGER_MODE=hybrid` and four deterministic shapes also chart
+themselves — a time series, a single-metric category comparison, a Salesforce
+stage funnel, and a small part-to-whole. Everything else stays text and table.
+
+Two things are decided in Python, never by the model: **histogram bins**, and
+**funnel stage order**. A funnel asserts a sequence, so one is drawn only when
+every stage belongs to a trusted list (Salesforce's standard Opportunity, Lead
+and Case picklists, or your own via `CHART_FUNNEL_STAGE_ORDER`). Unrecognised
+stages fall back to a ranked horizontal bar rather than a guessed order.
+
 ### Trust rules, non-negotiable
 
 - Salesforce access is **read-only**, enforced by the integration user's permissions
@@ -119,6 +140,11 @@ SEARCH_PROVIDER=searxng
 SEARXNG_URL=http://searxng:8080
 SEARXNG_SECRET=<random 64 hex chars>
 SEARCH_MAX_RESULTS=10
+
+# --- Charts (optional) -----------------------------------------------------
+CHART_TRIGGER_MODE=explicit     # explicit | hybrid (no `automatic` mode)
+CHART_FUNNEL_STAGE_ORDER=       # JSON, for a custom sales process:
+                                # {"sales":["Discovery","Pilot","Signed"]}
 
 # --- Sync behaviour (optional) --------------------------------------------
 SYNC_AUTO_FIELDS=true           # adopt fields added in Salesforce automatically
@@ -269,8 +295,8 @@ Running a model "on CPU" saves nothing here — same pool, 10–50× slower.
 ## Testing
 
 ```bash
-cd orchestrator && python3 -m pytest tests/ -q          # 637 tests
-cd frontend && npx vitest run                            # 200 tests
+cd orchestrator && python3 -m pytest tests/ -q          # 800 tests
+cd frontend && npx vitest run                            # 237 tests
 docker compose run --rm --no-deps \
   -v "$PWD/sync-worker/tests:/app/tests:ro" sync-worker \
   sh -c "pip install -q pytest && cd /app && python3 -m pytest tests/ -q"   # 104 tests
@@ -292,6 +318,18 @@ extending this:
   with thinking on returns an empty answer, not a short one.
 - **trafilatura is not thread-safe.** Extraction runs on a dedicated
   single-worker executor; `asyncio.to_thread` can abort the interpreter.
+- **`charts_png.py` used to fail open.** An unhandled chart type fell past
+  every drawing branch and still saved a titled, completely blank PNG into
+  the report. Unsupported now raises; `PNG_SUPPORTED | PNG_TABLE_ONLY` must
+  cover every `ChartType` or the module refuses to import.
+- **A chart must never be able to break its container.** In reports, chart
+  rendering is wrapped so a failure costs the image and nothing else — the
+  prose, table and heading survive. In the browser, `ChartErrorBoundary`
+  scopes a render throw to the chart; there is no other error boundary in
+  the app, so without it a chart exception white-screened the whole page.
+- **ECharts sorts funnel data by value unless you say otherwise.**
+  `sort: 'none'` in the adapter is load-bearing: the backend ships stages in
+  a trusted order and re-sorting would assert a sequence nobody verified.
 
 ---
 
@@ -301,11 +339,13 @@ extending this:
 orchestrator/          FastAPI backend
   app/engines/         sql, rag, vision, report, chat, agent, search, live_sf, …
   app/core/            guards, schema cache, Salesforce REST, field dictionary
+  app/core/chart_*.py  spec, column profiling, decision engine, binning, PNG
   app/context.py       token budgeting against the live model window
   app/compaction.py    rolling summaries so long chats keep working
 frontend/              Next.js UI
   components/          composer, message row, research panel, context meter
   lib/                 SSE parsing, streams, history, prefs
+  lib/chartOption.ts   trusted ChartSpec → ECharts adapter (the boundary)
 sync-worker/           Salesforce → DuckDB + LanceDB
   config.yaml          which objects and fields are synced
 searxng/               self-hosted web search config
@@ -323,4 +363,15 @@ searxng/               self-hosted web search config
   bind to `127.0.0.1:3000:3000` if the network is not fully trusted.
 - **The warehouse is up to 30 minutes stale.** Ask for "live" data explicitly to
   bypass it.
-- Charts render only when you ask for one ("chart", "graph", "plot").
+- **Charts render only when you ask for one**, unless you set
+  `CHART_TRIGGER_MODE=hybrid`.
+- **Chart follow-ups are read from the message, not from the previous
+  chart.** The backend receives history as `{role, content}` pairs with no
+  `meta`, so the prior chart spec is not recoverable server-side. "Make it a
+  line chart", "make it horizontal", "use a donut", "stack the series" and
+  "show the table instead" all work, because each says what to change. A
+  follow-up always produces a new assistant response — nothing is mutated in
+  browser memory only — so what you see survives a reload.
+- **Reports draw funnels as a table.** matplotlib has no funnel primitive,
+  and a shape faked from centred bars encodes widths that do not honestly
+  reflect the values. The section keeps the stage-ordered table instead.

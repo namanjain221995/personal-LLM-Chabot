@@ -32,12 +32,37 @@ export interface AgentStep {
   detail?: string;
 }
 
+/**
+ * Mirrors app/core/chart_spec.py ChartType. The first five are the original
+ * set; every persisted conversation uses one of them.
+ */
+export type ChartType =
+  | 'bar'
+  | 'line'
+  | 'area'
+  | 'pie'
+  | 'scatter'
+  | 'horizontal_bar'
+  | 'donut'
+  | 'funnel'
+  | 'histogram';
+
+/**
+ * The `meta.chart` payload. The five required fields are unchanged and
+ * always present; the optional ones are emitted by the backend only when
+ * they differ from their defaults (see ChartSpec.wire_dump), so an old
+ * payload is a valid new payload.
+ */
 export interface ChartSpec {
-  type: 'bar' | 'line' | 'area' | 'pie' | 'scatter';
+  type: ChartType;
   x_key: string;
   y_keys: string[];
   title: string;
   stacked: boolean;
+  /** Histogram bin count, chosen by trusted backend code. */
+  bins?: number;
+  show_legend?: boolean;
+  show_values?: boolean;
 }
 
 export interface Citation {
@@ -79,6 +104,13 @@ export interface Meta {
   data?: DataRow[];
   truncated?: boolean;
   chart?: ChartSpec;
+  /**
+   * Rows the chart draws, when they are not `data` verbatim — histogram
+   * bins, or a funnel in trusted stage order. Absent (and absent from
+   * every conversation persisted before this key existed) means "draw
+   * `data`", which is what the renderer falls back to.
+   */
+  chart_data?: DataRow[];
   citations?: Citation[];
   report_files?: ReportFile[];
   /** V2 §2: request mode ("salesforce" | "assistant"). */
@@ -192,6 +224,9 @@ export interface ChatMessage {
   errorMessage?: string;
   /** data: URL preview for a user-attached image. */
   imageDataUrl?: string;
+  /** 2026-08-05: previews when SEVERAL images were attached (max 5);
+      `imageDataUrl` stays as the single-image/legacy spelling. */
+  imageDataUrls?: string[];
   /** V8: filename of a user-attached PDF (shown as a chip in the bubble). */
   pdfName?: string;
   /** Live reasoning stream (V2 §4d) — folded into meta.reasoning on finish. */

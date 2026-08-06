@@ -236,21 +236,42 @@ async def _run_step_impl(
     salesforce: bool,
     effort: str = "medium",
     emit: Optional[Emit] = None,
+    message: str = "",
 ) -> Tuple[str, str, dict]:
     """Run ONE step through the existing engines. → (output, detail, sub_meta).
 
     sql/rag only ever touch Salesforce, so they run only when the Salesforce
     toggle is on; otherwise the step is treated as an llm step. Every llm step
     receives the conversation history so it can use content the user shared in
-    this chat (web pages, documents, pasted text)."""
+    this chat (web pages, documents, pasted text).
+
+    `message` is the user's original request. A plan step's `input` is
+    written by the planner ("Count opportunities grouped by stage"), so the
+    word the user actually typed — "chart" — is usually not in it. Chart
+    intent is read from both."""
     if step.kind == "sql" and salesforce:
-        from .sql import generate_and_run_sql  # reuse the existing engine (§3b)
+        from ..config import settings
+        from ..core.exports import cap_rows
+        from .sql import attach_chart, generate_and_run_sql  # reuse (§3b)
 
         sql, columns, rows = await generate_and_run_sql(step.input, history=list(history))
         sample = json.dumps(
             {"columns": list(columns), "rows": [list(r) for r in rows[:30]]}, default=str
         )
-        return f"SQL result ({len(rows)} row(s)):\n{sample}", f"{len(rows)} row(s)", {"sql": sql}
+        preview, truncated = cap_rows(rows, settings.sql_preview_row_cap)
+        sub_meta: dict = {
+            "sql": sql,
+            "data": [dict(zip(columns, row)) for row in preview],
+            "truncated": truncated,
+        }
+        # Same pipeline, same guarantees as the direct SQL route — an
+        # agent-routed chart request now behaves identically to a direct one.
+        await attach_chart(sub_meta, f"{message}\n{step.input}", columns, preview)
+        return (
+            f"SQL result ({len(rows)} row(s)):\n{sample}",
+            f"{len(rows)} row(s)",
+            sub_meta,
+        )
 
     if step.kind == "rag" and salesforce:
         from ..config import settings
@@ -351,6 +372,7 @@ async def execute_steps(
     emit: Emit,
     salesforce: bool = True,
     effort: str = "medium",
+    message: str = "",
 ) -> List[dict]:
     """Run all steps concurrently (cap 3), emitting step events (§3b)."""
     semaphore = asyncio.Semaphore(STEP_CONCURRENCY)
@@ -360,7 +382,7 @@ async def execute_steps(
             await emit("step", {"id": step.id, "title": step.title, "status": "running"})
             try:
                 output, detail, sub_meta = await _run_step_impl(
-                    step, history, salesforce, effort, emit
+                    step, history, salesforce, effort, emit, message
                 )
             except Exception as exc:
                 detail = _shorten(str(exc) or exc.__class__.__name__, 200)
@@ -430,8 +452,24 @@ def renumber_web_sources(results: Sequence[dict]) -> None:
             )
 
 
+#: Keys that describe ONE sql step's result. They are carried across as a
+#: unit, from the single step that produced them.
+#:
+#: THE BUG this fixes: only `sql` used to survive the merge, so an
+#: agent-routed question never had `meta.data` and therefore never had a
+#: chart — the exact same question answered by the direct SQL route drew
+#: one. `data` also has to travel because the frontend renders the chart
+#: over `meta.data`; carrying `chart` alone would leave a spec pointing at
+#: rows that were dropped.
+_SQL_PAYLOAD_KEYS = ("sql", "data", "truncated", "chart", "chart_data")
+
+
 def merge_step_meta(results: Sequence[dict]) -> dict:
-    """Merged agent meta (§3b): last sql, union citations, union files."""
+    """Merged agent meta (§3b): last sql step, union citations, union files.
+
+    Exactly one meta frame is produced, here, by the caller — §10 allows one
+    per turn and the frontend replaces it wholesale.
+    """
     meta: dict = {
         "route": "agent",
         "steps": [
@@ -439,7 +477,7 @@ def merge_step_meta(results: Sequence[dict]) -> dict:
             for r in results
         ],
     }
-    sql: Optional[str] = None
+    sql_payload: dict = {}
     citations: List[dict] = []
     seen_records = set()
     report_files: List[dict] = []
@@ -449,7 +487,10 @@ def merge_step_meta(results: Sequence[dict]) -> dict:
     for r in results:
         sub = r.get("meta") or {}
         if sub.get("sql"):
-            sql = sub["sql"]  # last sql wins (plan order)
+            # Last sql step wins (plan order) — and its data/chart come with
+            # it, atomically. Taking `chart` from one step and `data` from
+            # another would render one query's spec over another's rows.
+            sql_payload = {k: sub[k] for k in _SQL_PAYLOAD_KEYS if k in sub}
         for c in sub.get("citations") or []:
             rid = c.get("record_id")
             if rid and rid not in seen_records:
@@ -467,8 +508,7 @@ def merge_step_meta(results: Sequence[dict]) -> dict:
             if url and url not in seen_urls:
                 seen_urls.add(url)
                 sources.append(dict(s))
-    if sql:
-        meta["sql"] = sql
+    meta.update(sql_payload)
     if citations:
         meta["citations"] = citations
     if sources:
@@ -535,6 +575,7 @@ async def _execute_node(state: AgentState) -> dict:
         state["emit"],
         state.get("salesforce", True),
         state.get("effort", "medium"),
+        state.get("message", ""),
     )
     return {"results": results}
 

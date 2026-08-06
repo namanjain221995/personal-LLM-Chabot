@@ -41,7 +41,8 @@ describe('composer prefs (V2 §4c per-conversation persistence)', () => {
       webSearch: 'auto',
     });
     savePrefs(storage, 'c2', {
-      salesforce: true,
+      // Forced search is only coherent with Salesforce OFF (2026-08-05).
+      salesforce: false,
       model: 'smart',
       effort: 'high',
       agent: false,
@@ -80,6 +81,22 @@ describe('composer prefs (V2 §4c per-conversation persistence)', () => {
     );
     expect(loadPrefs(storage, 'c1').agent).toBe(false);
     expect(loadPrefs(storage, 'c1').webSearch).toBe('auto');
+  });
+
+  it('normalizes a stored forced search away when salesforce is on', () => {
+    // Salesforce mode hides the web-search control (2026-08-05), so a stored
+    // "on" there would be invisible and un-undoable — and the server refuses
+    // to honour it anyway. It must come back as "auto".
+    const storage = makeStorage();
+    storage.setItem(
+      'techsara.chatprefs.v1',
+      JSON.stringify({
+        c1: { ...DEFAULT_PREFS, salesforce: true, webSearch: 'on' },
+        c2: { ...DEFAULT_PREFS, salesforce: false, webSearch: 'on' },
+      }),
+    );
+    expect(loadPrefs(storage, 'c1').webSearch).toBe('auto');
+    expect(loadPrefs(storage, 'c2').webSearch).toBe('on');
   });
 
   it('sanitizes corrupt or partial payloads back to defaults per field', () => {

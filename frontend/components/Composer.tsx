@@ -1,12 +1,14 @@
 'use client';
 
 /**
- * Pinned composer (§9 + V2 §4c): auto-growing textarea (1→10 rows),
- * paperclip image upload (png/jpg ≤10 MB) with thumbnail chip + remove, and
- * a ChatGPT-style controls row — Salesforce toggle pill (cloud icon, ON by
- * default) and the effort picker (Fast/Low/Medium/High on the one model) —
- * plus the send button that morphs to Stop while streaming. There is no Agent
- * toggle: the model decides when to plan steps or search (2026-07-28).
+ * Pinned composer (§9 + V2 §4c): auto-growing textarea (1→10 rows), a
+ * ChatGPT-style "+" menu (AttachMenu, 2026-08-05: Add photos & files · Web
+ * search · Salesforce) with upload chips + remove, and a controls row —
+ * the toggles LIVE in the "+" menu, and a dismissible pill appears here only
+ * while its tool is ON (Salesforce, which defaults on; Web search while
+ * forced) — plus the effort picker (Fast/Low/Medium/High on the one model)
+ * and the send button that morphs to Stop while streaming.
+ * There is no Agent toggle: the model decides when to plan steps (2026-07-28).
  * Enter=send / Shift+Enter=newline. The trust footer line dims when the
  * Salesforce toggle is off.
  */
@@ -27,19 +29,24 @@ import {
   shouldAttachPaste,
 } from '@/lib/pasted';
 import type { PastedText } from '@/lib/types';
+import { activateComposerMenuItem, trustLine } from '@/lib/composerMenu';
+import { AttachMenu } from './AttachMenu';
 import { ModelPicker } from './ModelPicker';
 import { PastedChip } from './PastedChip';
 import { useToast } from './Providers';
 import {
   IconCloud,
   IconFileText,
-  IconPaperclip,
+  IconGlobe,
   IconSend,
   IconStop,
   IconX,
 } from './icons';
 
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+/** Up to 5 images per message (owner request 2026-08-05); the orchestrator
+    enforces the same ceiling (MAX_IMAGES in main.py). */
+const MAX_IMAGES = 5;
 const LINE_HEIGHT = 24;
 const MAX_ROWS = 10;
 
@@ -87,7 +94,8 @@ interface ComposerProps {
   onPrefsChange: (next: ChatPrefs) => void;
   onSend: (
     text: string,
-    attachment: Attachment | null,
+    /** Up to MAX_IMAGES images, or exactly one PDF/dataset (2026-08-05). */
+    attachments: Attachment[],
     pasted: PastedText[],
   ) => void;
   onStop: () => void;
@@ -108,7 +116,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
     ref,
   ) {
     const [text, setText] = useState('');
-    const [attachment, setAttachment] = useState<Attachment | null>(null);
+    const [attachments, setAttachments] = useState<Attachment[]>([]);
     const [pastedTexts, setPastedTexts] = useState<PastedText[]>([]);
     const textareaRef = useRef<HTMLTextAreaElement>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
@@ -131,17 +139,18 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
     useEffect(autogrow, [text, autogrow]);
 
     const hasContent = Boolean(
-      text.trim() || attachment || pastedTexts.length,
+      text.trim() || attachments.length || pastedTexts.length,
     );
 
     function submit() {
       const trimmed = text.trim();
       if (streaming || disabled) return;
-      if (!trimmed && !attachment && pastedTexts.length === 0) return;
-      onSend(trimmed, attachment, pastedTexts);
+      if (!trimmed && attachments.length === 0 && pastedTexts.length === 0)
+        return;
+      onSend(trimmed, attachments, pastedTexts);
       setText('');
       onDraftChange?.(''); // the draft is gone — drop it from the meter
-      setAttachment(null);
+      setAttachments([]);
       setPastedTexts([]);
     }
 
@@ -175,14 +184,18 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
       }
       if (isDataset) {
         // Never read a 200 MB archive into memory: keep the File handle and
-        // stream it to /api/upload when the message is sent.
-        setAttachment({
-          name: file.name,
-          kind: 'dataset',
-          dataUrl: '',
-          base64: '',
-          file,
-        });
+        // stream it to /api/upload when the message is sent. A dataset (like
+        // a PDF) stands alone — it replaces whatever was attached.
+        setAttachments([
+          { name: file.name, kind: 'dataset', dataUrl: '', base64: '', file },
+        ]);
+        return;
+      }
+      if (
+        !isPdf &&
+        attachments.filter((a) => a.kind === 'image').length >= MAX_IMAGES
+      ) {
+        toast(`You can attach up to ${MAX_IMAGES} images.`, 'error');
         return;
       }
       const name =
@@ -192,11 +205,20 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
       const reader = new FileReader();
       reader.onload = () => {
         const dataUrl = String(reader.result);
-        setAttachment({
+        const att: Attachment = {
           name,
           kind: isPdf ? 'pdf' : 'image',
           dataUrl,
           base64: dataUrl.slice(dataUrl.indexOf(',') + 1),
+        };
+        setAttachments((prev) => {
+          // A PDF stands alone. Images stack up to MAX_IMAGES (2026-08-05)
+          // — but never alongside a PDF/dataset, which use different
+          // server paths; a new image replaces those instead.
+          if (att.kind === 'pdf') return [att];
+          const images = prev.filter((a) => a.kind === 'image');
+          if (images.length >= MAX_IMAGES) return prev; // raced past the cap
+          return [...images, att];
         });
       };
       reader.readAsDataURL(file);
@@ -230,10 +252,13 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
     return (
       <div className="bg-bg px-4 pb-3 pt-2">
         <div className="mx-auto w-full max-w-thread">
-          {(attachment || pastedTexts.length > 0) && (
+          {(attachments.length > 0 || pastedTexts.length > 0) && (
             <div className="mb-2 flex flex-wrap items-start gap-2">
-              {attachment && (
-                <div className="inline-flex items-center gap-2 rounded-ts border border-border bg-surface p-1.5 pr-2">
+              {attachments.map((attachment, idx) => (
+                <div
+                  key={`${attachment.name}-${idx}`}
+                  className="inline-flex items-center gap-2 rounded-ts border border-border bg-surface p-1.5 pr-2"
+                >
                   {attachment.kind === 'pdf' || attachment.kind === 'dataset' ? (
                     <span className="grid h-10 w-10 shrink-0 place-items-center rounded-md bg-danger/15 text-danger">
                       <IconFileText size={18} />
@@ -258,14 +283,16 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
                   </span>
                   <button
                     type="button"
-                    onClick={() => setAttachment(null)}
+                    onClick={() =>
+                      setAttachments((prev) => prev.filter((_, i) => i !== idx))
+                    }
                     aria-label={`Remove attachment ${attachment.name}`}
                     className="rounded-md p-1 text-faint transition-colors duration-ts hover:bg-surface-2 hover:text-ink"
                   >
                     <IconX size={13} />
                   </button>
                 </div>
-              )}
+              ))}
               {pastedTexts.map((p) => (
                 <PastedChip
                   key={p.id}
@@ -313,59 +340,104 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
               <input
                 ref={fileInputRef}
                 type="file"
+                multiple
                 accept="image/*,application/pdf,.pdf,.zip,.tar,.tar.gz,.tgz,.csv,.tsv,.parquet,.xlsx,.json,.jsonl,.ndjson"
                 className="sr-only"
                 aria-hidden
                 tabIndex={-1}
                 onChange={(e) => {
-                  const f = e.target.files?.[0];
-                  if (f) handleFile(f);
+                  // Multi-select (2026-08-05): each file goes through the
+                  // same rules — images stack to MAX_IMAGES, a PDF/dataset
+                  // stands alone, oversized files toast individually. The
+                  // image room is counted HERE, synchronously: handleFile's
+                  // own cap check reads state that does not update until
+                  // this whole batch has been dispatched.
+                  let room =
+                    MAX_IMAGES -
+                    attachments.filter((a) => a.kind === 'image').length;
+                  let dropped = 0;
+                  for (const f of Array.from(e.target.files ?? [])) {
+                    if (f.type.startsWith('image/')) {
+                      if (room <= 0) {
+                        dropped += 1;
+                        continue;
+                      }
+                      room -= 1;
+                    }
+                    handleFile(f);
+                  }
+                  if (dropped > 0) {
+                    toast(
+                      `You can attach up to ${MAX_IMAGES} images — ${dropped} ${dropped === 1 ? 'file was' : 'files were'} left out.`,
+                      'error',
+                    );
+                  }
                   e.target.value = '';
                 }}
               />
-              <button
-                type="button"
-                onClick={() => fileInputRef.current?.click()}
-                aria-label="Attach an image or PDF"
-                title="Attach image or PDF"
-                disabled={streaming}
-                className="shrink-0 rounded-lg p-1.5 text-muted transition-colors duration-ts hover:bg-surface-2 hover:text-ink disabled:opacity-40"
-              >
-                <IconPaperclip size={16} />
-              </button>
-
-              {/* Salesforce toggle (V2 §4c) — ON is the v1 behavior. */}
-              <button
-                type="button"
-                onClick={() =>
-                  onPrefsChange({ ...prefs, salesforce: !prefs.salesforce })
-                }
-                aria-pressed={prefs.salesforce}
-                title="Answers computed from synced Salesforce data"
-                className={`inline-flex shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium transition-colors duration-ts ${
-                  prefs.salesforce
-                    ? 'border-accent/50 bg-accent/10 text-accent'
-                    : 'border-border text-faint hover:bg-surface-2 hover:text-ink'
-                }`}
-              >
-                <IconCloud size={13} />
-                Salesforce
-              </button>
-
-              {/* The Web search toggle was REMOVED (2026-07-28), like the
-                  Agent toggle below it. Both are now decided by the level:
-                  Fast never searches, Low/Medium/High search when the question
-                  needs it, and Medium/High also plan multi-step work. One
-                  control instead of three, and no way to pick a combination
-                  that contradicts itself. */}
-
-              <ModelPicker
-                model={prefs.model}
-                effort={prefs.effort}
-                onChange={(model, effort) =>
-                  onPrefsChange({ ...prefs, model, effort })
-                }
+              {/* ChatGPT-style "+" menu (2026-08-05): Add photos & files ·
+                  Web search · Salesforce. It replaces the bare paperclip —
+                  the file picker now lives behind its first item. */}
+              <AttachMenu
+                prefs={prefs}
+                streaming={streaming}
+                onPrefsChange={onPrefsChange}
+                onPickFiles={() => fileInputRef.current?.click()}
               />
+
+              {/* Context meter sits by the "+", effort picker by Send
+                  (owner request 2026-08-05 — swapped sides). */}
+              {meter}
+
+              {/* Active-tool chips, ChatGPT-style (owner request 2026-08-05):
+                  the toggles LIVE in the "+" menu — a pill here appears only
+                  while its tool is ON, and clicking it turns the tool off.
+                  No pill means off; there is no second always-visible toggle.
+                  Turning off goes through activateComposerMenuItem, NOT a
+                  bare prefs spread, so the toggle rules stay in one place
+                  (lib/composerMenu.ts). */}
+              {prefs.salesforce && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    const out = activateComposerMenuItem('salesforce', prefs);
+                    if (out.kind === 'prefs') onPrefsChange(out.prefs);
+                  }}
+                  aria-pressed
+                  title="Salesforce mode is on — answers come from your synced data. Click to turn it off."
+                  className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-accent/50 bg-accent/10 px-2.5 py-1 text-xs font-medium text-accent transition-colors duration-ts"
+                >
+                  <IconCloud size={13} />
+                  Salesforce
+                  <IconX size={11} />
+                </button>
+              )}
+
+              {/* The always-visible Web search toggle was REMOVED
+                  (2026-07-28) — by default the level decides ("auto"). The
+                  "+" menu (2026-08-05) reintroduced an explicit FORCE
+                  ("on"), available only while Salesforce is OFF: Salesforce
+                  mode never searches the web, so the pill (like the menu
+                  item) exists only outside it. While forced, this pill shows
+                  the active tool, ChatGPT-style; clicking returns to auto. */}
+              {!prefs.salesforce && prefs.webSearch === 'on' && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    onPrefsChange({ ...prefs, webSearch: 'auto' });
+                    // This click unmounts the pill — without a handoff,
+                    // keyboard focus silently drops to <body>.
+                    textareaRef.current?.focus();
+                  }}
+                  aria-pressed
+                  title="Web search is forced on — click to let the model decide again"
+                  className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-accent/50 bg-accent/10 px-2.5 py-1 text-xs font-medium text-accent transition-colors duration-ts"
+                >
+                  <IconGlobe size={13} />
+                  Web search
+                  <IconX size={11} />
+                </button>
+              )}
 
               {/* The Agent toggle was REMOVED (2026-07-28). Deciding when a
                   request needs multi-step work is the model's job, not a
@@ -375,7 +447,13 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
                   status line, so it is automatic, not hidden. */}
 
               <span className="ml-auto flex items-center gap-1.5">
-                {meter}
+                <ModelPicker
+                  model={prefs.model}
+                  effort={prefs.effort}
+                  onChange={(model, effort) =>
+                    onPrefsChange({ ...prefs, model, effort })
+                  }
+                />
                 {streaming ? (
                   <button
                     type="button"
@@ -404,17 +482,20 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
 
           <p
             className={`mt-2 text-center text-xs transition-opacity duration-ts ${
-              prefs.salesforce ? 'text-faint' : 'text-faint opacity-50'
+              // Dimming marks the RELAXED state (Salesforce off, model may
+              // search). With search FORCED on this line is the strongest
+              // internet warning shown anywhere — never dim that one.
+              prefs.salesforce || prefs.webSearch === 'on'
+                ? 'text-faint'
+                : 'text-faint opacity-50'
             }`}
           >
-            {/* Salesforce ON means the web is NOT used at any level — the
-                server refuses to auto-search in that mode, and the agent's
-                web steps are downgraded. Saying "web search is on" here was
-                simply untrue, and this line is the only place the privacy
-                promise is made. */}
-            {prefs.salesforce
-              ? 'Answers come from your synced Salesforce data · no web search · nothing leaves this machine.'
-              : 'Salesforce is off — answers may use the web, and search queries are sent to the internet.'}
+            {/* This line is the only place the privacy promise is made, and
+                it must track BOTH toggles: Salesforce ON blocks AUTO search,
+                but the "+" menu can force search on, and then "nothing
+                leaves this machine" would be untrue. The wording lives in
+                lib/composerMenu.ts so it is unit-tested. */}
+            {trustLine(prefs)}
           </p>
         </div>
       </div>

@@ -20,9 +20,12 @@ services:
   # same pool as the OS and every other container).
   #   0.35 (vllm: 22 GB weights + ~10.5 GB KV at 262144 with fp8)
   # + 0.14 (vllm-router/agent: 10 GB weights + ~4.7 GB KV at 65536)
-  # + 0.04 (vllm-embed)  ≈ 0.53, leaving ~57 GB for the orchestrator's
-  # in-process reranker, DuckDB/LanceDB, the frontend and the OS.
-  # Over-reserving here took the box to 0 GB free once — keep the sum ≲ 0.6.
+  # + 0.04 (vllm-embed)
+  # + 0.09 (vllm-ocr: 6.4 GB weights + eager overhead + KV at 8192)  ≈ 0.62,
+  # leaving ~46 GB for the orchestrator's in-process reranker, DuckDB/LanceDB,
+  # the frontend and the OS.
+  # Over-reserving here took the box to 0 GB free once — keep the sum ≲ 0.6
+  # (0.62 with OCR is the accepted ceiling; do not add another resident model).
   # --------------------------------------------------------------------------
 
   vllm:
@@ -214,6 +217,54 @@ services:
               count: all
               capabilities: [gpu]
 
+  vllm-ocr:
+    # Unlimited-OCR (2026-08-06): baidu's 3.3B document-OCR VLM
+    # (hf.co/baidu/Unlimited-OCR, MIT). vLLM 0.26 nightly has NATIVE
+    # UnlimitedOCRForCausalLM support — same image as the main model, so no
+    # new runtime. The orchestrator OCRs uploaded images and rendered PDF
+    # pages here first, then hands the transcript + pixels to the main model
+    # (engines/ocr.py). If this service is down the pipeline silently falls
+    # back to pixels-only — answers degrade, nothing breaks.
+    # NOTE: this image's ENTRYPOINT is ["vllm","serve"] → ARGUMENTS ONLY.
+    image: vllm/vllm-openai:nightly
+    # Tuning (measured 2026-08-06, two crash-loops):
+    #   0.08 + CUDA graphs @16384 → "No available memory for the cache blocks";
+    #   0.08 + eager @8192 → weights+overhead left 0.04 GiB KV of the 0.47
+    #   needed. 0.09 (≈10.9 GB) gives ~1.2 GB of KV headroom. --enforce-eager
+    #   stays: OCR calls are single-image, eager latency is fine, and graph
+    #   capture memory is what broke the first attempt.
+    command: >
+      /models/unlimited-ocr
+      --served-model-name baidu/Unlimited-OCR
+      --host 0.0.0.0
+      --port 30004
+      --max-model-len 8192
+      --gpu-memory-utilization 0.09
+      --enforce-eager
+      --trust-remote-code
+    environment:
+      HF_TOKEN: ${HF_TOKEN}
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+      - ${VLLM_MODELS_DIR:-/home/techsphere/Documents/projects/vllm_models}:/models:ro
+    ports:
+      - "8004:30004"
+    shm_size: 8g
+    ipc: host
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:30004/health || exit 1"]
+      interval: 30s
+      retries: 60
+      start_period: 10m
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
   orchestrator:
     build: ./orchestrator
     environment:
@@ -240,6 +291,10 @@ services:
       VISION_MODEL: Qwen/Qwen3.6-35B-A3B-NVFP4
       EMBED_BASE_URL: http://vllm-embed:30003/v1
       EMBED_MODEL: Qwen/Qwen3-Embedding-0.6B
+      # Unlimited-OCR (2026-08-06): document transcripts for images + PDFs.
+      OCR_ENABLED: ${OCR_ENABLED:-true}
+      OCR_BASE_URL: http://vllm-ocr:30004/v1
+      OCR_MODEL: baidu/Unlimited-OCR
       RERANKER_MODEL: Qwen/Qwen3-Reranker-0.6B
       RERANK_ENABLED: "true"
       DUCKDB_PATH: /data/warehouse.duckdb

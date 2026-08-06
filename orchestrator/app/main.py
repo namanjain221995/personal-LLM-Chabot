@@ -173,6 +173,12 @@ class ChatMessage(BaseModel):
     content: str = ""
 
 
+# Composer multi-upload cap (2026-08-05): base64 images ride in the JSON chat
+# body, so five 10 MB uploads ≈ 67 MB of payload — a deliberate ceiling, not
+# an arbitrary one.
+MAX_IMAGES = 5
+
+
 class ChatRequest(BaseModel):
     """Chat request per spec §8 + V2-DESIGN §1:
     {messages, session_id, image?, conversation_id?, mode?, model?, effort?, agent?}.
@@ -186,6 +192,9 @@ class ChatRequest(BaseModel):
     session_id: str = "default"
     image: Optional[str] = None
     image_base64: Optional[str] = None
+    # 2026-08-05: up to MAX_IMAGES images in one turn (composer multi-upload).
+    # `image`/`image_base64` remain the single-image back-compat spelling.
+    images: Optional[List[str]] = None
     # --- V2 optional fields (defaults preserve v1 behavior) ---
     conversation_id: Optional[str] = None
     mode: Literal["salesforce", "assistant"] = "salesforce"
@@ -212,8 +221,20 @@ class ChatRequest(BaseModel):
         return ""
 
     @property
+    def images_data(self) -> List[str]:
+        """Every attached image, list form — `images` wins over the single
+        back-compat fields, which become a one-element list."""
+        imgs = [i for i in (self.images or []) if i and i.strip()]
+        if imgs:
+            return imgs
+        single = self.image_base64 or self.image
+        return [single] if single else []
+
+    @property
     def image_data(self) -> Optional[str]:
-        return self.image_base64 or self.image
+        """First image or None — the truthiness gate the routing checks use."""
+        data = self.images_data
+        return data[0] if data else None
 
     @property
     def history_messages(self) -> List[dict]:
@@ -232,6 +253,8 @@ class ChatRequest(BaseModel):
 
     @model_validator(mode="after")
     def _require_input(self) -> "ChatRequest":
+        if len(self.images_data) > MAX_IMAGES:
+            raise ValueError(f"at most {MAX_IMAGES} images per message")
         if not self.text and not self.image_data and not self.pdf_data:
             raise ValueError(
                 "provide a non-empty message/messages, an image, or a PDF"
@@ -427,10 +450,14 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 and not request.pdf_data
                 and not request.image_data
                 and request.text
-                # In Salesforce mode only an EXPLICIT "on" searches the web;
-                # auto-detection would quietly answer CRM questions from the
-                # internet. Turning the toggle off is how you ask the web.
-                and (auto_web_search_allowed or request.web_search == "on")
+                # Salesforce mode NEVER searches the web — at any effort
+                # level, and even if the client sends web_search="on" (owner
+                # request 2026-08-05; until then an explicit "on" was an
+                # escape hatch). The composer hides the web-search option in
+                # that mode, and this gate makes the promise hold for ANY
+                # client, not just the current UI. Turning the Salesforce
+                # toggle off is how you ask the web.
+                and auto_web_search_allowed
             ):
                 from .engines.search import rate_ok, should_search
 
@@ -562,7 +589,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 from .engines.vision import run_vision_engine
 
                 answer = await run_vision_engine(
-                    text, request.image_data, history, emit
+                    text, request.images_data, history, emit
                 )
             elif github_ref is not None or repo_followup:
                 # Phase 3: a GitHub repo URL → clone/index/overview; or a

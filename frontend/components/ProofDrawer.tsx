@@ -14,7 +14,6 @@ import { SqlBlock } from './SqlBlock';
 import { DataTable } from './DataTable';
 import { ChartView } from './ChartView';
 import { CitationChips } from './CitationChips';
-import { WebSources } from './WebSources';
 import { CodeCitations } from './CodeCitations';
 import { FileCards } from './FileCards';
 import { IconChevronDown } from './icons';
@@ -22,7 +21,6 @@ import { IconChevronDown } from './icons';
 type SectionId =
   | 'sql'
   | 'sources'
-  | 'websources'
   | 'code'
   | 'data'
   | 'chart'
@@ -39,12 +37,10 @@ export function ProofDrawer({ meta }: { meta: Meta }) {
   if (meta.citations?.length) {
     sections.push({ id: 'sources', label: `Sources (${meta.citations.length})` });
   }
-  if (meta.sources?.length) {
-    sections.push({
-      id: 'websources',
-      label: `Sources (${meta.sources.length})`,
-    });
-  }
+  // Web-search sources (meta.sources) are deliberately NOT a section here
+  // (owner request 2026-08-05): they live in the right-side ActivityPanel
+  // behind the action row's "Sources" book button, ChatGPT-style. This box
+  // is the Salesforce proof trail only.
   if (meta.code_sources?.length) {
     sections.push({ id: 'code', label: `Code (${meta.code_sources.length})` });
   }
@@ -54,7 +50,12 @@ export function ProofDrawer({ meta }: { meta: Meta }) {
       label: `Data (${meta.data.length}${meta.truncated ? '+' : ''})`,
     });
   }
-  if (meta.chart && meta.data?.length) {
+  // `chart_data` carries rows the chart draws that are not `data`
+  // verbatim (histogram bins; a funnel in trusted stage order). Old
+  // payloads have no such key and fall back to `data`, which is exactly
+  // what they always rendered.
+  const chartRows = meta.chart_data?.length ? meta.chart_data : meta.data;
+  if (meta.chart && chartRows?.length) {
     sections.push({ id: 'chart', label: 'Chart' });
   }
   if (meta.report_files?.length) {
@@ -64,7 +65,7 @@ export function ProofDrawer({ meta }: { meta: Meta }) {
   const [open, setOpen] = useState<Set<SectionId>>(
     () =>
       new Set<SectionId>(
-        meta.chart && meta.data?.length
+        meta.chart && chartRows?.length
           ? ['chart']
           : meta.report_files?.length
             ? ['files']
@@ -72,7 +73,11 @@ export function ProofDrawer({ meta }: { meta: Meta }) {
       ),
   );
 
-  if (sections.length === 0 && !meta.route) return null;
+  // No sections → no box at all (owner request 2026-08-05). A bar holding
+  // nothing but the engine badge — every plain chat answer — was an empty
+  // frame under every message; the badge is only worth a box when there is
+  // something to prove next to it.
+  if (sections.length === 0) return null;
 
   function toggle(id: SectionId) {
     setOpen((prev) => {
@@ -129,9 +134,6 @@ export function ProofDrawer({ meta }: { meta: Meta }) {
             {s.id === 'sources' && meta.citations && (
               <CitationChips citations={meta.citations} />
             )}
-            {s.id === 'websources' && meta.sources && (
-              <WebSources sources={meta.sources} />
-            )}
             {s.id === 'code' && meta.code_sources && (
               <CodeCitations sources={meta.code_sources} />
             )}
@@ -142,8 +144,8 @@ export function ProofDrawer({ meta }: { meta: Meta }) {
                 csvName="techsara-data"
               />
             )}
-            {s.id === 'chart' && meta.chart && meta.data && (
-              <ChartView spec={meta.chart} data={meta.data} />
+            {s.id === 'chart' && meta.chart && chartRows && (
+              <ChartView spec={meta.chart} data={chartRows} />
             )}
             {s.id === 'files' && meta.report_files && (
               <FileCards files={meta.report_files} />

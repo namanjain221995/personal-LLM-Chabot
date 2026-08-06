@@ -3,20 +3,46 @@
 /**
  * Message rendering (§9): quiet right-aligned user bubbles; full-width
  * assistant rows (no bubble) with markdown, streaming caret, pre-first-token
- * shimmer, "Stopped" marker, inline error rows with Retry, and hover
- * actions (Copy, Regenerate).
+ * shimmer, "Stopped" marker, inline error rows with Retry, and a
+ * ChatGPT-style icon action row (2026-08-05): copy · like · dislike · try
+ * again, plus a "Sources" book button that opens the right-side
+ * ActivityPanel (thinking + web research + time taken). Thinking and
+ * research render inline only WHILE streaming; finished answers keep them
+ * behind the Sources button instead.
  */
 
+import { useState } from 'react';
 import type { ChatMessage } from '@/lib/types';
+import {
+  loadFeedback,
+  saveFeedback,
+  toggleFeedback,
+  type MessageFeedback,
+} from '@/lib/feedback';
+import { stripCitations } from '@/lib/citations';
 import { AgentTimeline } from './AgentTimeline';
-import { ResearchPanel } from './ResearchPanel';
+import { ActivityPanel } from './ActivityPanel';
+import { countSources, ResearchPanel } from './ResearchPanel';
 import { Markdown } from './Markdown';
 import { PastedChip } from './PastedChip';
 import { ProofDrawer } from './ProofDrawer';
 import { CopyButton } from './CopyButton';
 import { ReasoningAccordion } from './ReasoningAccordion';
 import { friendlyError, trimNotice } from '@/lib/errors';
-import { IconAlert, IconFileText, IconRefresh } from './icons';
+import {
+  IconAlert,
+  IconBook,
+  IconFileText,
+  IconRefresh,
+  IconThumbDown,
+  IconThumbUp,
+} from './icons';
+
+/** "report.pdf" → "PDF", "sales.csv" → "CSV", "data.tar.gz" → "TAR.GZ". */
+function fileBadge(name: string): string {
+  const m = /\.(tar\.gz|[a-z0-9]{1,5})$/i.exec(name.trim());
+  return m ? m[1].toUpperCase() : 'FILE';
+}
 
 export function MessageRow({
   message,
@@ -32,19 +58,41 @@ export function MessageRow({
   onShowSummary?: () => void;
   onRetry: () => void;
 }) {
+  // Hooks live above the user-bubble early return (rules of hooks).
+  const [activityOpen, setActivityOpen] = useState(false);
+  const [feedback, setFeedback] = useState<MessageFeedback | null>(() =>
+    typeof window === 'undefined'
+      ? null
+      : loadFeedback(window.localStorage, message.id),
+  );
+
+  function onThumb(kind: MessageFeedback) {
+    const next = toggleFeedback(feedback, kind);
+    setFeedback(next);
+    saveFeedback(window.localStorage, message.id, next);
+  }
+
   if (message.role === 'user') {
     return (
       <div className="flex justify-end">
         <div className="max-w-[85%] sm:max-w-[70%]">
-          {message.imageDataUrl && (
-            <div className="mb-1.5 flex justify-end">
-              {/* data: URL preview of the user's upload — next/image can't optimize these */}
-              {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img
-                src={message.imageDataUrl}
-                alt="Attached image"
-                className="max-h-40 rounded-ts border border-border object-cover"
-              />
+          {(message.imageDataUrls?.length || message.imageDataUrl) && (
+            <div className="mb-1.5 flex flex-wrap justify-end gap-1.5">
+              {/* 2026-08-05: up to 5 images per turn — `imageDataUrls` when
+                  several, the legacy single `imageDataUrl` otherwise.
+                  data: URL previews — next/image can't optimize these. */}
+              {(message.imageDataUrls?.length
+                ? message.imageDataUrls
+                : [message.imageDataUrl as string]
+              ).map((url, i) => (
+                /* eslint-disable-next-line @next/next/no-img-element */
+                <img
+                  key={i}
+                  src={url}
+                  alt={`Attached image ${i + 1}`}
+                  className="max-h-40 rounded-ts border border-border object-cover"
+                />
+              ))}
             </div>
           )}
           {message.pdfName && (
@@ -57,8 +105,10 @@ export function MessageRow({
                   <span className="max-w-[220px] truncate text-xs text-ink">
                     {message.pdfName}
                   </span>
+                  {/* pdfName carries EVERY non-image attachment (datasets
+                      included) — a .csv labelled "PDF" was just wrong. */}
                   <span className="text-[10px] uppercase tracking-wide text-faint">
-                    PDF
+                    {fileBadge(message.pdfName)}
                   </span>
                 </span>
               </span>
@@ -88,6 +138,16 @@ export function MessageRow({
   const steps = message.steps ?? message.meta?.steps ?? [];
   // Live while streaming, from the stored meta once persisted.
   const research = message.research ?? message.meta?.research;
+  // The Sources book button opens the ActivityPanel; it appears only when
+  // the finished answer actually has thinking, an agent plan, web research,
+  // or numbered [n] citations (meta.sources) behind it — none of which show
+  // inline once the answer is done.
+  const webSources = message.meta?.sources;
+  const hasActivity =
+    Boolean(reasoningText) ||
+    steps.length > 0 ||
+    Boolean(research && countSources(research) > 0) ||
+    Boolean(webSources?.length);
   const showShimmer =
     streaming &&
     message.content.length === 0 &&
@@ -117,7 +177,10 @@ export function MessageRow({
         </div>
       ) : (
         <>
-          {reasoningText && (
+          {/* Inline thinking/research are LIVE progress only (2026-08-05):
+              once the answer is done they move behind the Sources button so
+              finished messages stay clean, ChatGPT-style. */}
+          {reasoningText && streaming && (
             <ReasoningAccordion
               text={reasoningText}
               seconds={reasoningSeconds}
@@ -125,13 +188,21 @@ export function MessageRow({
             />
           )}
 
-          {research && <ResearchPanel research={research} />}
+          {research && (streaming || research.active) && (
+            <ResearchPanel research={research} />
+          )}
 
-          {steps.length > 0 && <AgentTimeline steps={steps} />}
+          {/* The agent plan card is live progress too (owner request
+              2026-08-05): once the answer is done it moves into the
+              ActivityPanel behind the Sources button. */}
+          {steps.length > 0 && streaming && <AgentTimeline steps={steps} />}
 
           {message.content && (
             <div className="text-[15px]">
-              <Markdown text={message.content} />
+              {/* [n] citation markers are stripped for display (2026-08-05)
+                  — the numbered sources live in the ActivityPanel instead.
+                  The stored content keeps them, so nothing is lost. */}
+              <Markdown text={stripCitations(message.content)} />
               {streaming && <span aria-hidden className="stream-caret" />}
             </div>
           )}
@@ -206,25 +277,81 @@ export function MessageRow({
 
           {!streaming && message.content && message.status !== 'error' && (
             <div
-              className={`mt-2 flex items-center gap-1.5 transition-opacity duration-ts ${
+              className={`mt-1.5 flex items-center gap-0.5 transition-opacity duration-ts ${
                 isLast
                   ? 'opacity-100'
                   : 'opacity-0 focus-within:opacity-100 group-hover/msg:opacity-100'
               }`}
             >
-              <CopyButton text={message.content} label="Copy message" />
+              {/* ChatGPT-style icon row (2026-08-05): quiet ghost icons
+                  instead of labelled chip buttons. */}
+              <CopyButton
+                text={stripCitations(message.content)}
+                label="Copy message"
+                variant="icon"
+              />
+              <button
+                type="button"
+                onClick={() => onThumb('up')}
+                aria-label="Good response"
+                aria-pressed={feedback === 'up'}
+                title="Good response"
+                className={`rounded-lg p-1.5 transition-colors duration-ts hover:bg-surface-2 ${
+                  feedback === 'up'
+                    ? 'text-accent'
+                    : 'text-muted hover:text-ink'
+                }`}
+              >
+                <IconThumbUp size={15} />
+              </button>
+              <button
+                type="button"
+                onClick={() => onThumb('down')}
+                aria-label="Bad response"
+                aria-pressed={feedback === 'down'}
+                title="Bad response"
+                className={`rounded-lg p-1.5 transition-colors duration-ts hover:bg-surface-2 ${
+                  feedback === 'down'
+                    ? 'text-danger'
+                    : 'text-muted hover:text-ink'
+                }`}
+              >
+                <IconThumbDown size={15} />
+              </button>
               <button
                 type="button"
                 onClick={onRegenerate}
-                aria-label="Regenerate response"
-                title="Regenerate"
-                className="inline-flex items-center gap-1.5 rounded-md border border-border bg-surface px-2 py-1 text-xs text-muted transition-colors duration-ts hover:bg-surface-2 hover:text-ink"
+                aria-label="Try again"
+                title="Try again"
+                className="rounded-lg p-1.5 text-muted transition-colors duration-ts hover:bg-surface-2 hover:text-ink"
               >
-                <IconRefresh size={13} />
-                Regenerate
+                <IconRefresh size={15} />
               </button>
+              {hasActivity && (
+                <button
+                  type="button"
+                  onClick={() => setActivityOpen(true)}
+                  aria-label="Show sources and thinking"
+                  aria-expanded={activityOpen}
+                  title="Sources — searches and thinking behind this answer"
+                  className="ml-1 inline-flex items-center gap-1.5 rounded-lg px-2 py-1.5 text-xs font-medium text-muted transition-colors duration-ts hover:bg-surface-2 hover:text-ink"
+                >
+                  <IconBook size={14} />
+                  Sources
+                </button>
+              )}
             </div>
           )}
+
+          <ActivityPanel
+            open={activityOpen}
+            onClose={() => setActivityOpen(false)}
+            reasoning={reasoningText || undefined}
+            reasoningSeconds={reasoningSeconds}
+            steps={steps}
+            research={research}
+            sources={webSources}
+          />
         </>
       )}
     </div>

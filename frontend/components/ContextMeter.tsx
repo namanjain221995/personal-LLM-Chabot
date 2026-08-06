@@ -57,7 +57,13 @@ export function ContextMeter({
   useEffect(() => {
     if (!open) return;
     function onKey(e: KeyboardEvent) {
-      if (e.key === 'Escape') setOpen(false);
+      if (e.key === 'Escape') {
+        // Consume it: while streaming, ChatApp maps a bare Escape to "stop
+        // generating" — closing this popover must not also kill the answer.
+        e.preventDefault();
+        e.stopPropagation();
+        setOpen(false);
+      }
     }
     function onDown(e: PointerEvent) {
       if (!buttonRef.current?.contains(e.target as Node)) setOpen(false);
