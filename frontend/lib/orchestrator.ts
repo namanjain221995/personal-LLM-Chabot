@@ -28,6 +28,8 @@ export interface ChatRequestBody {
   pdf_filename?: string;
   /** Phase 1: web search mode. */
   web_search?: string;
+  /** 2026-08-06: Live Salesforce toggle — query the org, not the copy. */
+  sf_live?: boolean;
   /** 2026-08-05: all attached images (max 5); `image` stays the first one. */
   images?: string[];
 }
@@ -47,6 +49,7 @@ export interface OrchestratorChatRequest {
   pdf?: string;
   pdf_filename?: string;
   web_search?: string;
+  sf_live?: boolean;
   /** 2026-08-05: all attached images; image_base64 remains the first. */
   images?: string[];
 }
@@ -103,6 +106,7 @@ export function toOrchestratorChatRequest(
       ? { conversation_id: body.conversation_id }
       : {}),
     ...(body.mode !== undefined ? { mode: body.mode } : {}),
+    ...(body.sf_live !== undefined ? { sf_live: body.sf_live } : {}),
     ...(body.model !== undefined ? { model: body.model } : {}),
     ...(body.effort !== undefined ? { effort: body.effort } : {}),
     ...(body.agent !== undefined ? { agent: body.agent } : {}),

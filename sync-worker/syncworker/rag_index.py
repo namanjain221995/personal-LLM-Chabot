@@ -94,6 +94,25 @@ class RagIndexer:
             return db.open_table(TABLE_NAME)
         return None
 
+    def delete_records(self, record_ids: list[str]) -> int:
+        """Drop every chunk belonging to records deleted in Salesforce.
+
+        Ids are validated against the Salesforce Id shape before being spliced
+        into the delete predicate — same rule that keeps index_records' delete
+        safe. Returns the number of ids acted on (0 when the table is absent).
+        """
+        valid = [str(r) for r in record_ids if _SF_ID_RE.match(str(r))]
+        if not valid:
+            return 0
+        table = self._open_table_if_exists()
+        if table is None:
+            return 0
+        for start in range(0, len(valid), 100):
+            batch = valid[start : start + 100]
+            predicate = ", ".join(f"'{rid}'" for rid in batch)
+            table.delete(f"record_id IN ({predicate})")
+        return len(valid)
+
     def index_records(
         self, object_name: str, records: list[dict], rag_fields: tuple[str, ...]
     ) -> int:

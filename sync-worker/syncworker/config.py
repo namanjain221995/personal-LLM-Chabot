@@ -16,6 +16,11 @@ class Settings:
     sync_interval_minutes: int
     #: Adopt fields added in Salesforce since the config was written.
     sync_auto_fields: bool
+    #: Adopt OBJECTS that appear in Salesforce but are not configured:
+    #: custom objects (__c) and a small allowlist of wanted standard objects.
+    #: Off by default — a new object means a full extract nobody asked for —
+    #: and enabled per-deployment when the owner wants full-org coverage.
+    sync_auto_objects: bool
     #: Ceiling per object — an org with 500 fields would otherwise
     #: build a SELECT nobody wants and slow every cycle.
     sync_max_fields: int
@@ -36,6 +41,8 @@ def load_settings() -> Settings:
         sync_interval_minutes=int(os.getenv("SYNC_INTERVAL_MINUTES", "30")),
         sync_auto_fields=os.getenv("SYNC_AUTO_FIELDS", "true").lower()
         not in ("0", "false", "no"),
+        sync_auto_objects=os.getenv("SYNC_AUTO_OBJECTS", "false").lower()
+        in ("1", "true", "yes"),
         sync_max_fields=int(os.getenv("SYNC_MAX_FIELDS", "80")),
         sync_report_new_objects=os.getenv("SYNC_REPORT_NEW_OBJECTS", "true").lower()
         not in ("0", "false", "no"),
@@ -56,6 +63,11 @@ class ObjectConfig:
     name: str
     fields: tuple[str, ...]
     rag_fields: tuple[str, ...] = field(default=())
+    #: Field the incremental sync filters and orders by. SystemModstamp where
+    #: it exists; Share/History/Feed shadows only carry LastModifiedDate or
+    #: CreatedDate. None means the object has no usable timestamp at all and
+    #: every cycle runs a (reconciled) full extract.
+    watermark_field: str | None = "SystemModstamp"
 
 
 def load_object_configs(path: str) -> list[ObjectConfig]:
@@ -70,17 +82,26 @@ def load_object_configs(path: str) -> list[ObjectConfig]:
         name = entry.get("name")
         fields_ = list(entry.get("fields") or [])
         rag_fields = list(entry.get("rag_fields") or [])
+        watermark = entry.get("watermark_field", "SystemModstamp")
         if not name or not _IDENT_RE.match(name):
             raise ValueError(f"invalid object name in config.yaml: {name!r}")
         for f in fields_ + rag_fields:
             if not _IDENT_RE.match(str(f)):
                 raise ValueError(f"invalid field name for {name}: {f!r}")
-        if "Id" not in fields_ or "SystemModstamp" not in fields_:
-            raise ValueError(f"{name}: fields must include Id and SystemModstamp")
+        if watermark is not None and not _IDENT_RE.match(str(watermark)):
+            raise ValueError(f"{name}: invalid watermark_field: {watermark!r}")
+        if "Id" not in fields_:
+            raise ValueError(f"{name}: fields must include Id")
+        if watermark is not None and watermark not in fields_:
+            raise ValueError(
+                f"{name}: watermark_field {watermark} must be listed in fields"
+            )
         missing = [f for f in rag_fields if f not in fields_]
         if missing:
             raise ValueError(f"{name}: rag_fields not listed in fields: {missing}")
-        objects.append(ObjectConfig(name, tuple(fields_), tuple(rag_fields)))
+        objects.append(
+            ObjectConfig(name, tuple(fields_), tuple(rag_fields), watermark)
+        )
 
     if not objects:
         raise ValueError("config.yaml defines no objects")

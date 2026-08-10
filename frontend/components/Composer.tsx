@@ -36,6 +36,7 @@ import { PastedChip } from './PastedChip';
 import { useToast } from './Providers';
 import {
   IconCloud,
+  IconSparkles,
   IconFileText,
   IconGlobe,
   IconSend,
@@ -156,14 +157,21 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
 
     function handleFile(file: File) {
       const isImage = file.type.startsWith('image/');
+      const lower = file.name.toLowerCase();
+      // 2026-08-07: .docx/.txt/.md ride the document path too — the server
+      // sniffs the real format (PDF magic vs zip-with-word/document.xml vs
+      // plain text), so they share the `pdf` wire field and the 25 MB cap.
       const isPdf =
         file.type === 'application/pdf' ||
-        file.name.toLowerCase().endsWith('.pdf');
+        lower.endsWith('.pdf') ||
+        lower.endsWith('.docx') ||
+        lower.endsWith('.txt') ||
+        lower.endsWith('.md');
       const isDataset = !isImage && !isPdf && isDatasetName(file.name);
       if (!isImage && !isPdf && !isDataset) {
         const ext = file.name.split('.').pop()?.toUpperCase() ?? 'that type';
         toast(
-          `${file.name || 'That file'} is ${ext} — attach an image, a PDF, or a dataset (.zip, .csv, .xlsx, .parquet).`,
+          `${file.name || 'That file'} is ${ext} — attach an image, a document (.pdf, .docx, .txt), or a dataset (.zip, .csv, .xlsx, .parquet).`,
           'error',
         );
         return;
@@ -341,7 +349,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
                 ref={fileInputRef}
                 type="file"
                 multiple
-                accept="image/*,application/pdf,.pdf,.zip,.tar,.tar.gz,.tgz,.csv,.tsv,.parquet,.xlsx,.json,.jsonl,.ndjson"
+                accept="image/*,application/pdf,.pdf,.docx,.txt,.md,.zip,.tar,.tar.gz,.tgz,.csv,.tsv,.parquet,.xlsx,.json,.jsonl,.ndjson"
                 className="sr-only"
                 aria-hidden
                 tabIndex={-1}
@@ -396,7 +404,13 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
                   Turning off goes through activateComposerMenuItem, NOT a
                   bare prefs spread, so the toggle rules stay in one place
                   (lib/composerMenu.ts). */}
-              {prefs.salesforce && (
+              {/* ONE pill per mode (owner request 2026-08-06): "Salesforce"
+                  and "Live Salesforce" are the same source — the org — so
+                  showing two pills for Live read as two selections. Synced
+                  mode shows ☁ Salesforce; Live swaps it for ✨ Live
+                  Salesforce. Closing the Live pill steps DOWN to synced
+                  mode (not all the way off) — one × per level. */}
+              {prefs.salesforce && !prefs.sfLive && (
                 <button
                   type="button"
                   onClick={() => {
@@ -409,6 +423,24 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
                 >
                   <IconCloud size={13} />
                   Salesforce
+                  <IconX size={11} />
+                </button>
+              )}
+
+              {prefs.salesforce && prefs.sfLive && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    const out = activateComposerMenuItem('sf-live', prefs);
+                    if (out.kind === 'prefs') onPrefsChange(out.prefs);
+                    textareaRef.current?.focus();
+                  }}
+                  aria-pressed
+                  title="Live Salesforce is on — every answer queries your org directly. Click to use the synced copy again."
+                  className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-accent/50 bg-accent/10 px-2.5 py-1 text-xs font-medium text-accent transition-colors duration-ts"
+                >
+                  <IconSparkles size={13} />
+                  Live Salesforce
                   <IconX size={11} />
                 </button>
               )}

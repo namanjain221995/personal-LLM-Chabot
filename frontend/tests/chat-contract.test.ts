@@ -189,3 +189,17 @@ describe('toOrchestratorChatRequest (§10 ChatRequest mapping)', () => {
     ]);
   });
 });
+
+it('forwards the Live Salesforce flag to the orchestrator (2026-08-06)', () => {
+  const req = toOrchestratorChatRequest({
+    messages: [{ role: 'user', content: 'how many accounts?' }],
+    session_id: 's1',
+    sf_live: true,
+  });
+  expect(req?.sf_live).toBe(true);
+  const without = toOrchestratorChatRequest({
+    messages: [{ role: 'user', content: 'hi' }],
+    session_id: 's1',
+  });
+  expect(without && 'sf_live' in without).toBe(false);
+});

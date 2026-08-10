@@ -10,7 +10,9 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 import duckdb
@@ -22,6 +24,12 @@ log = logging.getLogger("syncworker.storage")
 
 META_TABLE = "_sync_meta"
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+#: How long a Store operation waits for the cross-process file lock. The
+#: orchestrator's read-only queries are query-length, so contention clears in
+#: well under this.
+_LOCK_RETRY_SECONDS = 10.0
+_LOCK_RETRY_STEP = 0.25
 
 
 def _safe_ident(name: str) -> str:
@@ -70,56 +78,178 @@ def write_parquet_batch(df: pd.DataFrame, object_name: str, parquet_dir: str) ->
 
 
 class Store:
-    """DuckDB-backed warehouse with per-object tables and a _sync_meta table."""
+    """DuckDB-backed warehouse with per-object tables and a _sync_meta table.
+
+    Connections are PER OPERATION (opened, used, closed), not per Store: a
+    write connection excludes every reader across processes, and the old
+    cycle-long connection locked the orchestrator's SQL engine out for the
+    whole cycle — users saw raw "Could not set lock" errors whenever a sync
+    (or the one-time column-healing backfill) was running. Now the file lock
+    is held only for the milliseconds each write actually takes, and both
+    sides retry briefly, so chat queries interleave freely with syncing.
+    """
 
     def __init__(self, db_path: str) -> None:
         parent = os.path.dirname(db_path)
         if parent:
             os.makedirs(parent, exist_ok=True)
-        self._con = duckdb.connect(db_path)
-        self._con.execute(
-            f'CREATE TABLE IF NOT EXISTS "{META_TABLE}" ('
-            "object_name VARCHAR PRIMARY KEY, "
-            "watermark VARCHAR, "
-            "updated_at TIMESTAMP)"
-        )
+        self._path = db_path
+        with self._connection() as con:
+            con.execute(
+                f'CREATE TABLE IF NOT EXISTS "{META_TABLE}" ('
+                "object_name VARCHAR PRIMARY KEY, "
+                "watermark VARCHAR, "
+                "updated_at TIMESTAMP)"
+            )
+
+    @contextmanager
+    def _connection(self):
+        deadline = time.monotonic() + _LOCK_RETRY_SECONDS
+        while True:
+            try:
+                con = duckdb.connect(self._path)
+                break
+            except duckdb.Error as exc:
+                if "lock" not in str(exc).lower() or time.monotonic() >= deadline:
+                    raise
+                time.sleep(_LOCK_RETRY_STEP)
+        try:
+            yield con
+        finally:
+            con.close()
+
+    @property
+    def _con(self):
+        """Test/debug escape hatch: a fresh connection to the same database.
+
+        In-process connections share one cached database instance, so this is
+        safe alongside the per-operation connections; production code never
+        uses it.
+        """
+        return duckdb.connect(self._path)
 
     def close(self) -> None:
-        self._con.close()
+        """Kept for call-site compatibility; connections are per-operation."""
 
     # ── watermarks ──────────────────────────────────────────────────────────
 
     def get_watermark(self, object_name: str) -> str | None:
-        row = self._con.execute(
-            f'SELECT watermark FROM "{META_TABLE}" WHERE object_name = ?',
-            [object_name],
-        ).fetchone()
+        with self._connection() as con:
+            row = con.execute(
+                f'SELECT watermark FROM "{META_TABLE}" WHERE object_name = ?',
+                [object_name],
+            ).fetchone()
         return row[0] if row else None
 
     def set_watermark(self, object_name: str, watermark: str) -> None:
-        self._con.execute(
-            f'INSERT INTO "{META_TABLE}" (object_name, watermark, updated_at) '
-            "VALUES (?, ?, now()) "
-            "ON CONFLICT (object_name) DO UPDATE SET "
-            "watermark = excluded.watermark, updated_at = excluded.updated_at",
-            [object_name, watermark],
-        )
+        with self._connection() as con:
+            con.execute(
+                f'INSERT INTO "{META_TABLE}" (object_name, watermark, updated_at) '
+                "VALUES (?, ?, now()) "
+                "ON CONFLICT (object_name) DO UPDATE SET "
+                "watermark = excluded.watermark, updated_at = excluded.updated_at",
+                [object_name, watermark],
+            )
 
     # ── upsert ──────────────────────────────────────────────────────────────
 
-    def _table_exists(self, table: str) -> bool:
-        row = self._con.execute(
+    @staticmethod
+    def _table_exists(con, table: str) -> bool:
+        row = con.execute(
             "SELECT count(*) FROM information_schema.tables "
             "WHERE table_schema = 'main' AND table_name = ?",
             [table],
         ).fetchone()
         return bool(row and row[0])
 
-    def _table_columns(self, table: str) -> list[str]:
-        rows = self._con.execute(
-            f'DESCRIBE "{_safe_ident(table)}"'
-        ).fetchall()
-        return [r[0] for r in rows]
+    @staticmethod
+    def _table_column_types(con, table: str) -> dict[str, str]:
+        rows = con.execute(f'DESCRIBE "{_safe_ident(table)}"').fetchall()
+        return {r[0]: r[1] for r in rows}
+
+    def delete_ids(self, object_name: str, ids: list[str]) -> int:
+        """Remove rows whose Id is in `ids` (records deleted in Salesforce)."""
+        table = _safe_ident(object_name)
+        if not ids:
+            return 0
+        df = pd.DataFrame({"Id": [str(i) for i in ids]})
+        with self._connection() as con:
+            if not self._table_exists(con, table):
+                return 0
+            con.register("_deleted_ids", df)
+            try:
+                before = con.execute(
+                    f'SELECT count(*) FROM "{table}" '
+                    "WHERE Id IN (SELECT Id FROM _deleted_ids)"
+                ).fetchone()[0]
+                con.execute(
+                    f'DELETE FROM "{table}" WHERE Id IN (SELECT Id FROM _deleted_ids)'
+                )
+            finally:
+                con.unregister("_deleted_ids")
+        return int(before)
+
+    def reconcile_full(self, object_name: str, keep_ids: set[str]) -> list[str]:
+        """After a FULL extract, drop rows the extract did not contain.
+
+        A full extract is a complete snapshot of the org's live records, so
+        anything local that was absent from it is a record deleted (or hidden)
+        in Salesforce. Returns the removed Ids so callers can purge the RAG
+        index too. Incremental cycles cannot do this — they only see changes.
+        """
+        table = _safe_ident(object_name)
+        df = pd.DataFrame({"Id": [str(i) for i in keep_ids]})
+        with self._connection() as con:
+            if not self._table_exists(con, table):
+                return []
+            con.register("_keep_ids", df)
+            try:
+                removed = [
+                    r[0]
+                    for r in con.execute(
+                        f'SELECT Id FROM "{table}" '
+                        "WHERE Id NOT IN (SELECT Id FROM _keep_ids)"
+                    ).fetchall()
+                ]
+                if removed:
+                    con.execute(
+                        f'DELETE FROM "{table}" '
+                        "WHERE Id NOT IN (SELECT Id FROM _keep_ids)"
+                    )
+            finally:
+                con.unregister("_keep_ids")
+        return removed
+
+    def clear_watermark(self, object_name: str) -> bool:
+        """Forget an object's watermark so its next sync is a FULL extract."""
+        with self._connection() as con:
+            cur = con.execute(
+                f'DELETE FROM "{META_TABLE}" WHERE object_name = ?', [object_name]
+            )
+            row = cur.fetchone()
+        return bool(row and row[0])
+
+    def ensure_table(self, object_name: str, fields: list[str] | tuple[str, ...]) -> None:
+        """Make sure the object's table exists and has every configured column.
+
+        An object holding zero records in Salesforce never reaches upsert, so
+        without this it never gets a table — and every SQL question about it
+        fails with "table does not exist". The honest answer to "how many X"
+        is 0, not an error. Likewise, when the config grows (say, an admin
+        widens field-level security) an object that STILL has no rows would
+        keep its old skinny schema forever — so missing configured columns
+        are added here too. Existing columns and data are never touched.
+        """
+        table = _safe_ident(object_name)
+        cols = ", ".join(f'"{_safe_ident(f)}" VARCHAR' for f in fields)
+        with self._connection() as con:
+            con.execute(f'CREATE TABLE IF NOT EXISTS "{table}" ({cols})')
+            existing = self._table_column_types(con, table)
+            for f in fields:
+                if f not in existing:
+                    con.execute(
+                        f'ALTER TABLE "{table}" ADD COLUMN "{_safe_ident(f)}" VARCHAR'
+                    )
 
     def upsert(self, object_name: str, df: pd.DataFrame) -> int:
         """Transactionally DELETE by Id then INSERT the batch. Returns row count."""
@@ -131,37 +261,72 @@ class Store:
 
         # Guard against duplicate Ids inside one batch (last write wins).
         df = df.drop_duplicates(subset=["Id"], keep="last")
+        # Every value is already string-or-None (normalize_records), but an
+        # ALL-None column arrives as pandas `object` and DuckDB resolves its
+        # NULL type to INTEGER on CREATE TABLE AS — the first real value
+        # ('Full Time' into an INT32 Employment_Type__c) then fails every
+        # cycle. Pin the staging frame to pandas string dtype so DuckDB
+        # always sees VARCHAR.
+        df = df.astype("string")
 
-        con = self._con
-        con.register("_staging_df", df)
-        try:
-            if not self._table_exists(table):
-                con.execute("BEGIN TRANSACTION")
-                con.execute(f'CREATE TABLE "{table}" AS SELECT * FROM _staging_df')
-                con.execute("COMMIT")
-                return len(df)
-
-            # Schema drift: add any new staging columns to the target table.
-            existing = set(self._table_columns(table))
-            described = con.execute("DESCRIBE SELECT * FROM _staging_df").fetchall()
-            new_cols = [(c, t) for c, t, *_ in described if c not in existing]
-
-            con.execute("BEGIN TRANSACTION")
+        mistyped: list[str] = []
+        with self._connection() as con:
+            con.register("_staging_df", df)
             try:
-                for col, col_type in new_cols:
+                if not self._table_exists(con, table):
+                    con.execute("BEGIN TRANSACTION")
                     con.execute(
-                        f'ALTER TABLE "{table}" ADD COLUMN "{_safe_ident(col)}" {col_type}'
+                        f'CREATE TABLE "{table}" AS SELECT * FROM _staging_df'
                     )
-                con.execute(
-                    f'DELETE FROM "{table}" WHERE Id IN (SELECT Id FROM _staging_df)'
-                )
-                con.execute(
-                    f'INSERT INTO "{table}" BY NAME SELECT * FROM _staging_df'
-                )
-                con.execute("COMMIT")
-            except Exception:
-                con.execute("ROLLBACK")
-                raise
-        finally:
-            con.unregister("_staging_df")
+                    con.execute("COMMIT")
+                    return len(df)
+
+                # Schema drift: add any new staging columns to the table.
+                existing_types = self._table_column_types(con, table)
+                described = con.execute(
+                    "DESCRIBE SELECT * FROM _staging_df"
+                ).fetchall()
+                new_cols = [
+                    (c, t) for c, t, *_ in described if c not in existing_types
+                ]
+                # Heal columns mistyped by the old NULL-type inference:
+                # anything non-VARCHAR in an all-strings warehouse rejects
+                # real values.
+                mistyped = [
+                    c for c, t in existing_types.items()
+                    if c in df.columns and t != "VARCHAR"
+                ]
+
+                con.execute("BEGIN TRANSACTION")
+                try:
+                    for col in mistyped:
+                        con.execute(
+                            f'ALTER TABLE "{table}" '
+                            f'ALTER COLUMN "{_safe_ident(col)}" '
+                            "SET DATA TYPE VARCHAR"
+                        )
+                    for col, col_type in new_cols:
+                        con.execute(
+                            f'ALTER TABLE "{table}" '
+                            f'ADD COLUMN "{_safe_ident(col)}" {col_type}'
+                        )
+                    con.execute(
+                        f'DELETE FROM "{table}" '
+                        "WHERE Id IN (SELECT Id FROM _staging_df)"
+                    )
+                    con.execute(
+                        f'INSERT INTO "{table}" BY NAME SELECT * FROM _staging_df'
+                    )
+                    con.execute("COMMIT")
+                except Exception:
+                    con.execute("ROLLBACK")
+                    raise
+            finally:
+                con.unregister("_staging_df")
+        if mistyped:
+            log.info(
+                "healed mistyped warehouse columns",
+                extra={"event": "columns_healed", "object": object_name,
+                       "columns": mistyped},
+            )
         return len(df)

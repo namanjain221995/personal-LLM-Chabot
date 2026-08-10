@@ -277,6 +277,9 @@ services:
       SF_LOGIN_URL: ${SF_LOGIN_URL:-}
       SF_API_VERSION: ${SF_API_VERSION:-v61.0}
       SF_LIVE_ENABLED: ${SF_LIVE_ENABLED:-true}
+      # RAG citation links open records in this Lightning org. Without it the
+      # code default (techsara's org) silently produces wrong links elsewhere.
+      SF_LIGHTNING_BASE_URL: ${SF_LIGHTNING_BASE_URL:-https://techsara.lightning.force.com}
       OPENAI_BASE_URL: http://vllm:30000/v1
       OPENAI_API_KEY: local-no-key
       MAIN_MODEL: Qwen/Qwen3.6-35B-A3B-NVFP4
@@ -326,6 +329,7 @@ services:
       - hf-cache:/root/.cache/huggingface
     ports:
       - "8080:8080"
+    restart: unless-stopped
     depends_on:
       vllm:
         condition: service_healthy
@@ -365,7 +369,19 @@ services:
       # from the host instead.
       SF_PRIVATE_KEY_FILE: ${SF_PRIVATE_KEY_HOST_FILE:+/run/secrets/sf_jwt_key.pem}
       SF_PRIVATE_KEY_B64: ${SF_PRIVATE_KEY_B64:-}
-      SYNC_INTERVAL_MINUTES: "30"
+      # Owner request (2026-08-06): retry every 5 minutes after the full
+      # migration. The sleep is BETWEEN cycles (a pass itself takes ~3 min),
+      # so changes land within ~5-8 minutes. The client warns at 80% of the
+      # org's daily API limit if this ever gets too hungry.
+      SYNC_INTERVAL_MINUTES: "5"
+      # Owner request: anything new in the org joins the warehouse by itself —
+      # new FIELDS (SYNC_AUTO_FIELDS, default on) and new OBJECTS: any custom
+      # object, plus Task/Event/EmailMessage the moment read access is granted.
+      SYNC_AUTO_OBJECTS: "true"
+      # Above the org's widest business object (Account: 275 fields) so the
+      # full org export syncs whole objects; the default (80) silently
+      # truncated Interview__c (264) and Onboarding__c (174).
+      SYNC_MAX_FIELDS: "4000"
       EMBED_VIA: http://vllm-embed:30003/v1
       EMBED_MODEL: Qwen/Qwen3-Embedding-0.6B
       DUCKDB_PATH: /data/warehouse.duckdb
@@ -381,6 +397,7 @@ services:
       # mount valid (and compose parseable) when no key file is configured —
       # the key then comes from SF_PRIVATE_KEY_B64 or AWS Secrets Manager.
       - ${SF_PRIVATE_KEY_HOST_FILE:-/dev/null}:/run/secrets/sf_jwt_key.pem:ro
+    restart: unless-stopped
     depends_on:
       vllm-embed:
         condition: service_healthy
@@ -405,6 +422,7 @@ services:
       NEXT_PUBLIC_APP_NAME: "TechSara AI"
     ports:
       - "3000:3000"
+    restart: unless-stopped
     depends_on:
       orchestrator:
         condition: service_started

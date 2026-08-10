@@ -266,9 +266,12 @@ def test_an_aggregate_count_never_gets_a_limit():
     assert "LIMIT" not in sf.guard_soql("SELECT COUNT() FROM Account LIMIT 200")
 
 
-def test_count_of_a_field_is_a_normal_query_and_keeps_its_limit():
-    """COUNT(Id) is not the aggregate form — it returns rows and can be capped."""
-    assert "LIMIT" in sf.guard_soql("SELECT COUNT(Id) FROM Account")
+def test_count_of_a_field_is_also_uncapped():
+    """This test used to assert the OPPOSITE — that COUNT(Id) 'returns rows
+    and can be capped'. The live org disagreed (2026-08-06): 'Non-grouped
+    query that uses overall aggregate functions cannot also use LIMIT'.
+    Every non-grouped aggregate must go uncapped."""
+    assert "LIMIT" not in sf.guard_soql("SELECT COUNT(Id) FROM Account")
 
 
 # ---------------------------------------------------------------------------
@@ -361,3 +364,171 @@ def test_the_sql_engine_routes_an_explicit_live_request_away_from_duckdb():
 
     src = inspect.getsource(run_sql_engine)
     assert "wants_live_lookup(message)" in src
+
+
+def test_object_hint_reads_the_real_schema_cache(monkeypatch):
+    """_object_hint called schema_cache() — an instance, not a callable — so
+    the TypeError vanished into the except and the SOQL prompt NEVER saw the
+    org's synced object names. It must read schema_cache.get(duckdb_path)."""
+    from app.engines import live_sf as mod
+
+    monkeypatch.setattr(
+        mod.schema_cache,
+        "get",
+        lambda path: {"Account": [("Id", "VARCHAR")],
+                      "Case": [("Id", "VARCHAR")],
+                      "_sync_meta": [("object_name", "VARCHAR")]},
+    )
+    hint = mod._object_hint()
+    assert "Account" in hint and "Case" in hint
+    assert "_sync_meta" not in hint
+
+
+def test_object_hint_stays_quiet_when_the_warehouse_is_missing(monkeypatch):
+    from app.engines import live_sf as mod
+
+    def boom(path):
+        raise RuntimeError("no warehouse yet")
+
+    monkeypatch.setattr(mod.schema_cache, "get", boom)
+    assert mod._object_hint() == ""
+
+
+def test_count_query_returns_totalsize_as_a_row(monkeypatch):
+    """SELECT COUNT() answers via totalSize with EMPTY records; run_soql used
+    to return [] and every live count question looked like 'no data'.
+    Found live 2026-08-06 against the production org."""
+    import asyncio
+
+    import httpx
+
+    from app.core import salesforce as sf
+
+    async def fake_auth():
+        return "tok", "https://example.my.salesforce.com"
+
+    class FakeResponse:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"totalSize": 138, "done": True, "records": []}
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, *a, **k):
+            return FakeResponse()
+
+    monkeypatch.setattr(sf, "_authenticate", fake_auth)
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+
+    soql, rows = asyncio.run(sf.run_soql("SELECT COUNT() FROM Account"))
+    assert rows == [{"count": 138}]
+
+
+def test_guard_never_adds_limit_to_a_non_grouped_aggregate():
+    """Found live 2026-08-06: the forced LIMIT broke SELECT COUNT(Id) —
+    Salesforce rejects LIMIT on ANY overall aggregate, not just COUNT()."""
+    from app.core.salesforce import guard_soql
+
+    for q in (
+        "SELECT COUNT(Id) FROM Contact",
+        "SELECT SUM(Amount) FROM Opportunity",
+        "SELECT COUNT_DISTINCT(AccountId) FROM Contact",
+    ):
+        assert "LIMIT" not in guard_soql(q)
+    # A grouped aggregate returns one row per group — the cap still applies.
+    grouped = guard_soql("SELECT StageName, COUNT(Id) FROM Opportunity GROUP BY StageName")
+    assert grouped.endswith("LIMIT 200")
+    # Plain row queries still get the cap.
+    assert guard_soql("SELECT Id FROM Account").endswith("LIMIT 200")
+
+
+# ---------------------------------------------------------------------------
+# Self-repair on a wrong field name (2026-08-06)
+# ---------------------------------------------------------------------------
+# The model guessed Status__c on Interview__c (the real field is
+# Interview_Status__c) and the user saw a raw Salesforce error. Salesforce's
+# INVALID_FIELD message names the entity, so fetch_live describes it and
+# retries ONCE with the real field list.
+
+
+def test_a_wrong_field_name_is_repaired_with_the_real_field_list(monkeypatch):
+    import asyncio
+
+    from app.engines import live_sf
+
+    soqls = iter([
+        "SELECT Id, Status__c FROM Interview__c",
+        "SELECT Id, Interview_Status__c FROM Interview__c",
+    ])
+    prompts = []
+
+    async def fake_write_soql(question, history=(), correction=""):
+        prompts.append(correction)
+        return next(soqls)
+
+    calls = []
+
+    async def fake_run_soql(soql):
+        calls.append(soql)
+        if "Status__c FROM" in soql and "Interview_Status__c" not in soql:
+            raise sf.SalesforceUnavailable(
+                "Salesforce rejected the query: No such column 'Status__c' "
+                "on entity 'Interview__c'."
+            )
+        return soql, [{"Id": "1", "Interview_Status__c": "Completed"}]
+
+    async def fake_describe(name):
+        assert name == "Interview__c"
+        return {"name": name, "fields": [
+            {"name": "Id"}, {"name": "Interview_Status__c"},
+            {"name": "Date_of_Interview__c"},
+        ]}
+
+    monkeypatch.setattr(live_sf, "write_soql", fake_write_soql)
+    monkeypatch.setattr(live_sf.salesforce, "run_soql", fake_run_soql)
+    monkeypatch.setattr(live_sf.salesforce, "describe_object", fake_describe)
+
+    _, rows = asyncio.run(live_sf.fetch_live("interviews completed on 03-07-2026"))
+    assert rows == [{"Id": "1", "Interview_Status__c": "Completed"}]
+    assert len(calls) == 2, "failed once, retried once"
+    # The retry prompt carried the REAL field list and the error.
+    assert "Interview_Status__c" in prompts[1]
+    assert "No such column" in prompts[1]
+
+
+def test_other_salesforce_failures_are_not_retried(monkeypatch):
+    import asyncio
+
+    from app.engines import live_sf
+
+    async def fake_write_soql(question, history=(), correction=""):
+        return "SELECT Id FROM Interview__c"
+
+    async def fake_run_soql(soql):
+        raise sf.SalesforceUnavailable("Salesforce returned HTTP 503")
+
+    monkeypatch.setattr(live_sf, "write_soql", fake_write_soql)
+    monkeypatch.setattr(live_sf.salesforce, "run_soql", fake_run_soql)
+
+    with pytest.raises(sf.SalesforceUnavailable, match="503"):
+        asyncio.run(live_sf.fetch_live("anything"))
+
+
+def test_both_engines_agree_dates_are_day_first():
+    """03-07-2026 answered as July 3 locally and March 7 live — same question,
+    two different dates — is the fastest way to lose trust in both answers."""
+    from app.engines import live_sf, sql
+
+    for prompt in (live_sf._SOQL_SYSTEM, sql._SQL_SYSTEM):
+        assert "DAY-MONTH-YEAR" in prompt
+        assert "NEVER March 7" in prompt

@@ -24,6 +24,13 @@ export type WebSearchMode = 'off' | 'auto' | 'on';
 export interface ChatPrefs {
   /** Salesforce mode on (v1 behavior); off → mode "assistant". */
   salesforce: boolean;
+  /**
+   * Live Salesforce (2026-08-06): answers query the org directly — any
+   * object or field the read-only integration user can see — instead of the
+   * 30-minute synced copy. Only meaningful while `salesforce` is on; the
+   * server ignores it otherwise and sanitize() keeps the pair coherent.
+   */
+  sfLive: boolean;
   model: ModelChoice;
   effort: ReasoningEffort;
   agent: boolean;
@@ -32,6 +39,7 @@ export interface ChatPrefs {
 
 export const DEFAULT_PREFS: ChatPrefs = {
   salesforce: true,
+  sfLive: false,
   model: 'smart',
   effort: 'medium',
   agent: false,
@@ -49,6 +57,9 @@ function sanitize(raw: unknown): ChatPrefs {
     typeof p.salesforce === 'boolean' ? p.salesforce : DEFAULT_PREFS.salesforce;
   return {
     salesforce,
+    // Live Salesforce is a sub-mode of Salesforce: without the parent toggle
+    // there is no menu item to undo it, so it never survives salesforce=off.
+    sfLive: p.sfLive === true && salesforce,
     model: p.model === 'fast' || p.model === 'smart' ? p.model : DEFAULT_PREFS.model,
     effort:
       p.effort === 'fast' ||

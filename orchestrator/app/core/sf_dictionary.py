@@ -30,7 +30,10 @@ DICTIONARY_PATH = os.environ.get(
 #: Objects whose fields are injected for one question. More than a handful and
 #: the prompt grows faster than the accuracy does.
 MAX_OBJECTS = 4
-MAX_FIELDS_PER_OBJECT = 60
+#: Above the org's widest business objects (Account 275, Interview__c 264):
+#: at 60 the truncation dropped the exact field the question needed —
+#: Interview_Status__c — and the model "plausibly" guessed Status__c instead.
+MAX_FIELDS_PER_OBJECT = 300
 
 _WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]+")
 #: Words that match everything and therefore rank nothing.

@@ -276,13 +276,25 @@ def test_every_imported_entry_is_valid_for_the_real_loader(sheet, tmp_path):
 
 
 def test_a_huge_object_is_trimmed_rather_than_left_unwieldy():
-    many = [f"F{i}__c" for i in range(200)]
+    many = [f"F{i}__c" for i in range(ob.MAX_FIELDS_PER_OBJECT + 100)]
     org = {"Big__c": {"queryable": True,
                       "fields": [field("Id"), field("SystemModstamp"),
                                  *[field(f) for f in many]]}}
     entries, notes = ob.plan_from_sheet({"Big__c": many}, lambda n: org.get(n))
     assert len(entries[0]["fields"]) == ob.MAX_FIELDS_PER_OBJECT + 2  # + Id/SystemModstamp
     assert any("trimmed" in n for n in notes)
+
+
+def test_a_wide_business_object_is_not_trimmed():
+    """The cap guards against runaway system objects; this org's real objects
+    reach 275 fields (Account) and must survive an import whole."""
+    many = [f"F{i}__c" for i in range(280)]
+    org = {"Interview__c": {"queryable": True,
+                            "fields": [field("Id"), field("SystemModstamp"),
+                                       *[field(f) for f in many]]}}
+    entries, notes = ob.plan_from_sheet({"Interview__c": many}, lambda n: org.get(n))
+    assert len(entries[0]["fields"]) == 282
+    assert not any("trimmed" in n for n in notes)
 
 
 def test_importing_nothing_readable_leaves_the_config_alone(config, tmp_path, capsys):
@@ -331,3 +343,123 @@ def test_a_deliberate_rag_field_is_not_lost_by_reimporting():
                  "rag_fields": ["Subject"]}]
     entries, _ = ob.plan_from_sheet({"Case": ["Notes"]}, lambda n: org.get(n), existing)
     assert "Subject" in entries[0]["rag_fields"]
+
+
+# ---------------------------------------------------------------------------
+# Importing a full org export (5-column "Object API Name, ..." format)
+# ---------------------------------------------------------------------------
+
+ORG_EXPORT = """Object API Name,Object Label,Field API Name,Field Label,Field Type
+Account,Account,Name,Account Name,string
+Account,Account,LinkedIn_Password__c,LinkedIn Password,encryptedstring
+AccountChangeEvent,Account Change Event,ReplayId,Replay ID,string
+AccountShare,Account Share,RowCause,Row Cause,picklist
+Interview__ChangeEvent,Interview Change Event,ReplayId,Replay ID,string
+Interview__Share,Interview Share,RowCause,Row Cause,picklist
+ContentVersion,Content Version,VersionData,Version Data,base64
+ContentVersion,Content Version,Title,Title,string
+AIAgentStatusEvent,AI Agent Status Event,EventUuid,Event UUID,string
+"""
+
+
+@pytest.fixture()
+def org_export(tmp_path):
+    p = tmp_path / "org_export.csv"
+    p.write_text(ORG_EXPORT)
+    return p
+
+
+EXPORT_ORG = {
+    "Account": {"queryable": True, "fields": [
+        field("Id"), field("Name"), field("SystemModstamp"),
+        field("LinkedIn_Password__c", "encryptedstring")]},
+    "ContentVersion": {"queryable": True, "fields": [
+        field("Id"), field("Title"), field("SystemModstamp"),
+        field("VersionData", "base64")]},
+    # Sharing shadow: queryable, but its only timestamp is LastModifiedDate.
+    "AccountShare": {"queryable": True, "fields": [
+        field("Id"), field("RowCause"), field("LastModifiedDate", "datetime")]},
+    # Platform event: a notification stream — Salesforce refuses to query it.
+    "AIAgentStatusEvent": {"queryable": False, "fields": [field("EventUuid")]},
+}
+
+
+def test_the_org_export_columns_are_located_by_header(org_export):
+    parsed = ob.parse_sheet(org_export)
+    assert parsed["Account"] == ["Name", "LinkedIn_Password__c"]
+    assert parsed["ContentVersion"] == ["VersionData", "Title"]
+
+
+def test_unqueryable_streams_are_skipped_but_readable_shadows_import(org_export):
+    """Owner wants ALL data: Share/History/Feed shadows import when readable.
+    ChangeEvents and platform events stay out — Salesforce refuses to query
+    them (describe: queryable=false), there is nothing stored to fetch."""
+    entries, notes = ob.plan_from_sheet(
+        ob.parse_sheet(org_export), lambda n: EXPORT_ORG.get(n))
+    names = {e["name"] for e in entries}
+    assert "AccountChangeEvent" not in names
+    assert "Interview__ChangeEvent" not in names
+    assert "AIAgentStatusEvent" not in names
+    assert "AccountShare" in names
+
+
+def test_a_shadow_without_systemmodstamp_gets_a_fallback_watermark(org_export):
+    entries, _ = ob.plan_from_sheet(
+        ob.parse_sheet(org_export), lambda n: EXPORT_ORG.get(n))
+    share = next(e for e in entries if e["name"] == "AccountShare")
+    assert share["watermark_field"] == "LastModifiedDate"
+    assert share["fields"][-1] == "LastModifiedDate"
+    assert "SystemModstamp" not in share["fields"]
+
+
+def test_an_object_with_no_timestamp_at_all_imports_as_full_extract_only():
+    org = {"UserPermissionAccess": {"queryable": True, "fields": [
+        field("Id"), field("PermissionsViewAllData", "boolean")]}}
+    entries, notes = ob.plan_from_sheet(
+        {"UserPermissionAccess": ["PermissionsViewAllData"]},
+        lambda n: org.get(n))
+    entry = entries[0]
+    assert entry["watermark_field"] is None
+    assert entry["fields"] == ["Id", "PermissionsViewAllData"]
+    assert any("no timestamp field" in n for n in notes)
+
+
+def test_encrypted_credential_fields_are_excluded_and_reported(org_export):
+    """Candidate passwords must never land in an LLM-queryable warehouse."""
+    entries, notes = ob.plan_from_sheet(
+        ob.parse_sheet(org_export), lambda n: EXPORT_ORG.get(n))
+    account = next(e for e in entries if e["name"] == "Account")
+    assert "LinkedIn_Password__c" not in account["fields"]
+    assert any("encrypted credential" in n and "LinkedIn_Password__c" in n
+               for n in notes)
+
+
+def test_plain_string_password_fields_are_excluded_by_name():
+    """The portal stores candidate passwords in a STRING field — the type
+    filter can't see it, so the name filter must."""
+    org = {"Candidate_Portal_Credential__c": {"queryable": True, "fields": [
+        field("Id"), field("SystemModstamp"), field("Username__c"),
+        field("Password__c"), field("Password_Reset_Required__c", "boolean")]}}
+    entries, notes = ob.plan_from_sheet(
+        {"Candidate_Portal_Credential__c":
+         ["Username__c", "Password__c", "Password_Reset_Required__c"]},
+        lambda n: org.get(n))
+    fields = entries[0]["fields"]
+    assert "Password__c" not in fields
+    assert "Username__c" in fields
+    assert "Password_Reset_Required__c" in fields, "narrow match: flags survive"
+    assert any("Password__c" in n and "credential" in n for n in notes)
+
+
+def test_base64_blob_fields_are_dropped(org_export):
+    entries, _ = ob.plan_from_sheet(
+        ob.parse_sheet(org_export), lambda n: EXPORT_ORG.get(n))
+    cv = next(e for e in entries if e["name"] == "ContentVersion")
+    assert "VersionData" not in cv["fields"] and "Title" in cv["fields"]
+
+
+def test_an_unqueryable_platform_event_is_skipped_with_a_reason(org_export):
+    entries, notes = ob.plan_from_sheet(
+        ob.parse_sheet(org_export), lambda n: EXPORT_ORG.get(n))
+    assert not any(e["name"] == "AIAgentStatusEvent" for e in entries)
+    assert any("AIAgentStatusEvent" in n and "not readable" in n for n in notes)

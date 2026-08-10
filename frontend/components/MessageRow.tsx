@@ -147,7 +147,8 @@ export function MessageRow({
     Boolean(reasoningText) ||
     steps.length > 0 ||
     Boolean(research && countSources(research) > 0) ||
-    Boolean(webSources?.length);
+    Boolean(webSources?.length) ||
+    Boolean(message.meta?.document);
   const showShimmer =
     streaming &&
     message.content.length === 0 &&
@@ -344,6 +345,7 @@ export function MessageRow({
           )}
 
           <ActivityPanel
+            documentRead={message.meta?.document}
             open={activityOpen}
             onClose={() => setActivityOpen(false)}
             reasoning={reasoningText || undefined}

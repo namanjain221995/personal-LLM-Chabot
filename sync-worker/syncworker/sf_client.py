@@ -88,16 +88,46 @@ def build_full_soql(object_name: str, fields: tuple[str, ...] | list[str]) -> st
     return f"SELECT {', '.join(fields)} FROM {object_name}"
 
 
+_WATERMARK_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{3})?(Z|[+-]\d{4})$"
+)
+
+
 def build_incremental_soql(
-    object_name: str, fields: tuple[str, ...] | list[str], watermark: str
+    object_name: str,
+    fields: tuple[str, ...] | list[str],
+    watermark: str,
+    watermark_field: str = "SystemModstamp",
 ) -> str:
-    """SOQL for records modified after the watermark (SF datetime literal)."""
-    _validate_identifiers(object_name, fields)
-    if not re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{3})?(Z|[+-]\d{4})$", watermark):
+    """SOQL for records modified after the watermark (SF datetime literal).
+
+    watermark_field is SystemModstamp where it exists; Share/History/Feed
+    shadows and some setup objects only carry LastModifiedDate or CreatedDate.
+    """
+    _validate_identifiers(object_name, [*fields, watermark_field])
+    if not _WATERMARK_RE.match(watermark):
         raise ValueError(f"invalid watermark datetime literal: {watermark!r}")
     return (
         f"SELECT {', '.join(fields)} FROM {object_name} "
-        f"WHERE SystemModstamp > {watermark} ORDER BY SystemModstamp ASC"
+        f"WHERE {watermark_field} > {watermark} ORDER BY {watermark_field} ASC"
+    )
+
+
+def build_deleted_soql(
+    object_name: str, watermark: str, watermark_field: str = "SystemModstamp"
+) -> str:
+    """SOQL for records soft-deleted after the watermark (queryAll only).
+
+    Deleting a record updates its SystemModstamp, so the same watermark that
+    drives the incremental sync also finds the deletes. Plain /query never
+    returns IsDeleted rows — run this through soql_query_all.
+    """
+    _validate_identifiers(object_name, ["Id", watermark_field])
+    if not _WATERMARK_RE.match(watermark):
+        raise ValueError(f"invalid watermark datetime literal: {watermark!r}")
+    return (
+        f"SELECT Id FROM {object_name} "
+        f"WHERE IsDeleted = true AND {watermark_field} > {watermark}"
     )
 
 
@@ -179,6 +209,16 @@ class SalesforceClient:
         """
         return set(self.describe_field_types(object_name))
 
+    def clear_describe_cache(self) -> None:
+        """Forget cached describes so the next cycle sees fields created since.
+
+        The cache used to live for the whole process, which meant a field
+        added in Salesforce while the worker ran was never auto-adopted until
+        the container restarted. Clearing per cycle costs one describe call
+        per object per cycle — negligible against org API limits.
+        """
+        self._describe_cache = {}
+
     def list_objects(self) -> dict:
         """{API name: label} for every queryable object this user can see."""
         resp = self._request("GET", f"/services/data/{self._v}/sobjects/")
@@ -241,8 +281,19 @@ class SalesforceClient:
 
     def soql_query(self, soql: str) -> Iterator[list[dict]]:
         """Run a REST SOQL query; yield batches, following nextRecordsUrl."""
+        yield from self._soql_query_endpoint("query", soql)
+
+    def soql_query_all(self, soql: str) -> Iterator[list[dict]]:
+        """Like soql_query but via /queryAll, which includes soft-deleted rows.
+
+        Still strictly read-only — queryAll only widens visibility to the
+        recycle bin. Used for delete detection (build_deleted_soql).
+        """
+        yield from self._soql_query_endpoint("queryAll", soql)
+
+    def _soql_query_endpoint(self, endpoint: str, soql: str) -> Iterator[list[dict]]:
         resp = self._request(
-            "GET", f"/services/data/{self._v}/query", params={"q": soql}
+            "GET", f"/services/data/{self._v}/{endpoint}", params={"q": soql}
         )
         body = resp.json()
         while True:

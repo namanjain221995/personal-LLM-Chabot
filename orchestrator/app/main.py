@@ -198,6 +198,10 @@ class ChatRequest(BaseModel):
     # --- V2 optional fields (defaults preserve v1 behavior) ---
     conversation_id: Optional[str] = None
     mode: Literal["salesforce", "assistant"] = "salesforce"
+    # The composer's "Live Salesforce" toggle: answer straight from the org
+    # (any object/field this integration user can read) instead of the synced
+    # copy. Only meaningful in salesforce mode; ignored elsewhere.
+    sf_live: bool = False
     model: Literal["smart", "fast"] = "smart"
     effort: Literal["fast", "low", "medium", "high"] = "medium"
     agent: bool = False
@@ -430,18 +434,11 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 and not request.image_data
                 and not request.agent
             ):
-                from .engines.orchestrate import decide, describe
+                from .engines.orchestrate import decide
 
                 auto_plan = await decide(request.text, history, request.effort)
-                label = describe(auto_plan)
-                if label:
-                    await emit("status", {"text": f"{label}…"})
 
             want_agent = request.agent or bool(auto_plan and auto_plan.agent)
-            if auto_plan is not None and (auto_plan.agent or auto_plan.search):
-                orchestration_state.update(
-                    {"agent": auto_plan.agent, "search": auto_plan.search}
-                )
 
             want_search = False
             if (
@@ -474,6 +471,30 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     want_search = auto_plan.search
                 else:  # "auto"
                     want_search = await should_search(request.text)
+
+            # Announce and record the auto-decision only AFTER the gates
+            # above, so the status line and meta.auto describe what will
+            # actually run. Before this reorder the label came straight from
+            # the classifier's raw wish: Salesforce mode showed "searching
+            # the web…" while the gate silently blocked the search, directly
+            # contradicting the composer's "no web search" promise (owner
+            # report 2026-08-06). Same held for SEARCH_ENABLED=false and the
+            # rate limit.
+            if auto_plan is not None:
+                from .engines.orchestrate import Plan, describe
+
+                effective = Plan(
+                    agent=auto_plan.agent,
+                    search=bool(auto_plan.search and want_search),
+                )
+                label = describe(effective)
+                if label:
+                    await emit("status", {"text": f"{label}…"})
+                if effective.agent or effective.search:
+                    orchestration_state.update(
+                        {"agent": effective.agent, "search": effective.search}
+                    )
+
             if signed_in is not None and request.text:
                 block = recall_block(
                     int(signed_in["id"]), request.text, request.conversation_id
@@ -536,6 +557,37 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                             *history,
                         ]
 
+            # 2026-08-07: documents uploaded earlier in this conversation are
+            # remembered the same way stored pages are — question-relevant
+            # excerpts ride as a pinned system block on EVERY later turn, so
+            # "what did that PDF say about X?" works ten turns later, in any
+            # mode, whatever engine answers.
+            if request.text and not request.pdf_data and not request.image_data:
+                from .core.urls import select_relevant as _doc_select
+
+                try:
+                    stored_docs = db.get_documents(conv_key)
+                except Exception:
+                    stored_docs = []  # best-effort
+                if stored_docs:
+                    doc_blocks = [
+                        f'[{i}] {d["filename"]}'
+                        + (f' ({d["total_pages"]} pages)' if d["total_pages"] else "")
+                        + "\n" + _doc_select(d["text"], request.text, 8000)
+                        for i, d in enumerate(stored_docs, start=1)
+                    ]
+                    history = [
+                        {
+                            "role": "system",
+                            "content": "Documents the user uploaded earlier in "
+                            "this chat — the full files were read and stored; "
+                            "these are the sections most relevant to the "
+                            "current question (reference them if relevant):\n"
+                            + "\n\n".join(doc_blocks),
+                        },
+                        *history,
+                    ]
+
             # Phase A/B: assemble THIS session's context — rolling summary +
             # retrieved folded chunks + recent turns — compacting first if the
             # request would otherwise overflow the window. Scoped entirely to
@@ -576,11 +628,17 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 context_state.update(info)
 
             if request.pdf_data:
-                # V8: a PDF → render pages to images + text → multimodal model.
+                # V8 → 2026-08-07: any document (PDF/DOCX/plain) — the WHOLE
+                # file is read and remembered for this conversation.
                 from .engines.document import run_pdf_engine
 
                 answer = await run_pdf_engine(
-                    text, request.pdf_data, request.pdf_filename, history, emit
+                    text,
+                    request.pdf_data,
+                    request.pdf_filename,
+                    history,
+                    emit,
+                    conversation_id=conv_key,
                 )
             elif request.image_data:
                 # An attached image ALWAYS goes to the vision engine — text-only
@@ -655,6 +713,15 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     mode="assistant",
                     model_choice=request.model,
                     effort=request.effort,
+                )
+            elif request.sf_live:
+                # "Live Salesforce" toggle: skip the router — every text
+                # answer queries the org directly (schema questions included;
+                # the engine's live branch handles both).
+                from .engines.sql import run_sql_engine
+
+                answer = await run_sql_engine(
+                    text, history, emit, force_live=True
                 )
             else:
                 state = await get_graph().ainvoke(

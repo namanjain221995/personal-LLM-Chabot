@@ -21,6 +21,7 @@ describe('composer prefs (V2 §4c per-conversation persistence)', () => {
   it('defaults to Salesforce ON, Smart, Medium, search Auto', () => {
     expect(DEFAULT_PREFS).toEqual({
       salesforce: true,
+      sfLive: false,
       model: 'smart',
       effort: 'medium',
       agent: false,
@@ -35,6 +36,7 @@ describe('composer prefs (V2 §4c per-conversation persistence)', () => {
     const storage = makeStorage();
     savePrefs(storage, 'c1', {
       salesforce: false,
+      sfLive: false,
       model: 'fast',
       effort: 'medium',
       agent: false,
@@ -43,6 +45,7 @@ describe('composer prefs (V2 §4c per-conversation persistence)', () => {
     savePrefs(storage, 'c2', {
       // Forced search is only coherent with Salesforce OFF (2026-08-05).
       salesforce: false,
+      sfLive: false,
       model: 'smart',
       effort: 'high',
       agent: false,
@@ -58,6 +61,7 @@ describe('composer prefs (V2 §4c per-conversation persistence)', () => {
     const storage = makeStorage();
     savePrefs(storage, null, {
       salesforce: false,
+      sfLive: false,
       model: 'smart',
       effort: 'low',
       agent: false,
@@ -117,5 +121,33 @@ describe('composer prefs (V2 §4c per-conversation persistence)', () => {
     savePrefs(storage, 'c1', { ...DEFAULT_PREFS, agent: true });
     removePrefs(storage, 'c1');
     expect(loadPrefs(storage, 'c1')).toEqual(DEFAULT_PREFS);
+  });
+});
+
+describe('Live Salesforce pref (2026-08-06)', () => {
+  it('sfLive never survives salesforce being off — its menu row would be gone', () => {
+    const storage = makeStorage();
+    savePrefs(storage, 'c1', {
+      salesforce: false,
+      sfLive: true,
+      model: 'smart',
+      effort: 'medium',
+      agent: false,
+      webSearch: 'auto',
+    });
+    expect(loadPrefs(storage, 'c1').sfLive).toBe(false);
+  });
+
+  it('sfLive persists while salesforce stays on', () => {
+    const storage = makeStorage();
+    savePrefs(storage, 'c1', {
+      salesforce: true,
+      sfLive: true,
+      model: 'smart',
+      effort: 'medium',
+      agent: false,
+      webSearch: 'auto',
+    });
+    expect(loadPrefs(storage, 'c1').sfLive).toBe(true);
   });
 });

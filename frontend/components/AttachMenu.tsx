@@ -23,12 +23,14 @@ import {
   IconGlobe,
   IconPaperclip,
   IconPlus,
+  IconSparkles,
 } from './icons';
 
 const ITEM_ICON: Record<ComposerMenuItemId, React.ComponentType<{ size?: number; className?: string }>> = {
   files: IconPaperclip,
   'web-search': IconGlobe,
   salesforce: IconCloud,
+  'sf-live': IconSparkles,
 };
 
 export function AttachMenu({
@@ -49,6 +51,7 @@ export function AttachMenu({
 
   const items = composerMenuItems({
     salesforce: prefs.salesforce,
+    sfLive: prefs.sfLive,
     webSearchOn: prefs.webSearch === 'on',
     streaming,
   });

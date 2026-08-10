@@ -318,3 +318,41 @@ def test_salesforce_chat_never_claims_it_cannot_see_the_data():
 
     assert "you DO have Salesforce access" in SALESFORCE_CHAT_SYSTEM
     assert "never suggest" in SALESFORCE_CHAT_SYSTEM.lower()
+
+
+# ---------------------------------------------------------------------------
+# The auto-decision status must tell the truth (owner report 2026-08-06)
+# ---------------------------------------------------------------------------
+
+
+def test_salesforce_mode_status_never_claims_web_search(spy):
+    """Live: Salesforce ON showed "Planning steps and searching the web…"
+    while the gate silently blocked the search — the composer promises
+    "no web search" in that mode, so the status directly contradicted it.
+    The label must describe the GATED decision, not the classifier's wish."""
+    resp = ask("salesforce")
+    statuses = [d for e, d in _parse_sse(resp.text) if e == "status"]
+    assert not any("web" in s.lower() for s in statuses), statuses
+    # The agent escalation itself is still announced.
+    assert any("step" in s.lower() for s in statuses), statuses
+
+
+def test_salesforce_mode_meta_auto_reports_the_gated_decision(spy):
+    """meta.auto is trust metadata: it must record what actually ran."""
+    import json
+
+    resp = ask("salesforce")
+    metas = [json.loads(d) for e, d in _parse_sse(resp.text) if e == "meta"]
+    auto = next((m["auto"] for m in metas if "auto" in m), None)
+    assert auto is not None
+    assert auto["agent"] is True
+    assert auto["search"] is False
+
+
+def test_assistant_mode_status_still_announces_web_search(spy, monkeypatch):
+    """The reorder must not silence the honest case: assistant mode with an
+    eager plan still tells the user the web is being searched."""
+    monkeypatch.setattr("app.engines.search.rate_ok", lambda key: True)
+    resp = ask("assistant", web_search="auto")
+    statuses = [d for e, d in _parse_sse(resp.text) if e == "status"]
+    assert any("web" in s.lower() for s in statuses), statuses

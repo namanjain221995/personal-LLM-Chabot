@@ -11,7 +11,7 @@
 
 import type { ChatPrefs } from './prefs';
 
-export type ComposerMenuItemId = 'files' | 'web-search' | 'salesforce';
+export type ComposerMenuItemId = 'files' | 'web-search' | 'salesforce' | 'sf-live';
 
 export interface ComposerMenuItem {
   id: ComposerMenuItemId;
@@ -26,6 +26,8 @@ export interface ComposerMenuItem {
 
 export interface ComposerMenuState {
   salesforce: boolean;
+  /** Live Salesforce sub-toggle (only shown while salesforce is on). */
+  sfLive: boolean;
   /** True when the user forced search on (prefs.webSearch === 'on'). */
   webSearchOn: boolean;
   streaming: boolean;
@@ -38,40 +40,55 @@ export interface ComposerMenuState {
  * decides) is the unlabelled default, exactly like ChatGPT's menu where an
  * unchecked "Web search" still allows the model to search on its own.
  *
- * With Salesforce ON the web-search item is HIDDEN, not just unchecked
- * (owner request 2026-08-05): Salesforce mode never touches the web at any
- * effort level — the server refuses even an explicit "on" — so showing a
- * toggle that cannot work would be a lie in a menu.
+ * ALL FOUR rows are always visible (owner request 2026-08-06, superseding
+ * the 2026-08-05 hide-what-cannot-work rule): the owner wants the menu to
+ * read as the complete capability list — upload · web · Salesforce · live —
+ * with one click switching mode. Activating a row whose mode conflicts with
+ * the current one performs the switch instead of lying: Web search while
+ * Salesforce is on turns Salesforce OFF; Live while Salesforce is off turns
+ * Salesforce ON. Each hint says so before the click.
  */
 export function composerMenuItems(
   state: ComposerMenuState,
 ): ComposerMenuItem[] {
-  const items: ComposerMenuItem[] = [
+  return [
     {
       id: 'files',
       label: 'Add photos & files',
       hint: 'Images, PDFs and datasets from this computer',
       disabled: state.streaming,
     },
-  ];
-  if (!state.salesforce) {
-    items.push({
+    {
       id: 'web-search',
       label: 'Web search',
-      hint: state.webSearchOn
-        ? // Not "every answer": the server skips search on image/PDF turns.
-          'Text answers always search the web'
-        : 'Force a web search for the next answers',
-      checked: state.webSearchOn,
-    });
-  }
-  items.push({
-    id: 'salesforce',
-    label: 'Salesforce',
-    hint: 'Answer from your synced Salesforce data · turns web search off',
-    checked: state.salesforce,
-  });
-  return items;
+      hint: state.salesforce
+        ? // Warn BEFORE the click: activating this abandons Salesforce mode.
+          'Force a web search for the next answers · turns Salesforce off'
+        : state.webSearchOn
+          ? // Not "every answer": the server skips search on image/PDF turns.
+            'Text answers always search the web'
+          : 'Force a web search for the next answers',
+      checked: state.webSearchOn && !state.salesforce,
+    },
+    {
+      id: 'salesforce',
+      label: 'Salesforce',
+      hint: 'Answer from your synced Salesforce data · turns web search off',
+      checked: state.salesforce,
+    },
+    {
+      id: 'sf-live',
+      label: 'Live Salesforce',
+      hint: state.salesforce
+        ? state.sfLive
+          ? 'Every answer queries Salesforce directly — freshest data, any object'
+          : 'Query Salesforce directly instead of the synced copy'
+        : // One click from any mode: this both enters Salesforce mode and
+          // goes live — the hint promises exactly that.
+          'Query your Salesforce org directly · turns Salesforce on',
+      checked: state.salesforce && state.sfLive,
+    },
+  ];
 }
 
 export type ComposerMenuOutcome =
@@ -96,9 +113,15 @@ export function activateComposerMenuItem(
   prefs: ChatPrefs,
 ): ComposerMenuOutcome {
   switch (id) {
-    case 'files':
-      return { kind: 'pick-files' };
     case 'web-search':
+      if (prefs.salesforce) {
+        // Mode switch, as the row's hint promised: leave Salesforce (and its
+        // live sub-toggle) and force the web on — one click, no dead ends.
+        return {
+          kind: 'prefs',
+          prefs: { ...prefs, salesforce: false, sfLive: false, webSearch: 'on' },
+        };
+      }
       return {
         kind: 'prefs',
         prefs: {
@@ -113,10 +136,34 @@ export function activateComposerMenuItem(
         prefs: {
           ...prefs,
           salesforce: next,
+          // Live Salesforce cannot outlive its parent toggle: a lingering
+          // true would silently go live the next time Salesforce turns on
+          // (the same trap sanitize() guards).
+          sfLive: next ? prefs.sfLive : false,
           webSearch: next && prefs.webSearch === 'on' ? 'auto' : prefs.webSearch,
         },
       };
     }
+    case 'sf-live':
+      if (!prefs.salesforce) {
+        // One click from any mode: enter Salesforce mode AND go live. The
+        // forced web search drops with it — Salesforce mode never searches.
+        return {
+          kind: 'prefs',
+          prefs: {
+            ...prefs,
+            salesforce: true,
+            sfLive: true,
+            webSearch: prefs.webSearch === 'on' ? 'auto' : prefs.webSearch,
+          },
+        };
+      }
+      return {
+        kind: 'prefs',
+        prefs: { ...prefs, sfLive: !prefs.sfLive },
+      };
+    case 'files':
+      return { kind: 'pick-files' };
   }
 }
 
@@ -147,6 +194,12 @@ export function nextEnabledIndex(
  * web_search=="on", so "nothing leaves this machine" always holds there.
  */
 export function trustLine(prefs: ChatPrefs): string {
+  if (prefs.salesforce && prefs.sfLive) {
+    // Live queries DO leave this machine — they go to the user's own
+    // Salesforce org over the read-only API. Say so; "nothing leaves this
+    // machine" would be a lie with this toggle on.
+    return 'Answers come straight from your live Salesforce org (read-only) · no web search.';
+  }
   if (prefs.salesforce) {
     return 'Answers come from your synced Salesforce data · no web search · nothing leaves this machine.';
   }

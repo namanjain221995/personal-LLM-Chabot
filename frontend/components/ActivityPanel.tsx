@@ -10,7 +10,7 @@
  */
 
 import { useEffect, useRef } from 'react';
-import type { AgentStep, Research, WebSource } from '@/lib/types';
+import type { AgentStep, DocumentActivity, Research, WebSource } from '@/lib/types';
 import { AgentTimeline } from './AgentTimeline';
 import {
   countSources,
@@ -19,7 +19,7 @@ import {
   QueryGroup,
 } from './ResearchPanel';
 import { WebSources } from './WebSources';
-import { IconBook, IconBulb, IconGlobe, IconX } from './icons';
+import { IconBook, IconBulb, IconFileText, IconGlobe, IconX } from './icons';
 
 export function ActivityPanel({
   open,
@@ -29,6 +29,7 @@ export function ActivityPanel({
   steps,
   research,
   sources,
+  documentRead,
 }: {
   open: boolean;
   onClose: () => void;
@@ -40,6 +41,8 @@ export function ActivityPanel({
   /** The answer's numbered [n] citations (meta.sources) — shown here, not
       in the proof drawer (owner request 2026-08-05: no box in the chat). */
   sources?: WebSource[];
+  /** 2026-08-07: the uploaded document that was read — every page shown. */
+  documentRead?: DocumentActivity;
 }) {
   const closeRef = useRef<HTMLButtonElement>(null);
 
@@ -105,6 +108,43 @@ export function ActivityPanel({
             </h3>
             <div className="mt-2 max-h-[45vh] overflow-y-auto whitespace-pre-wrap border-l-2 border-border pl-3 font-mono text-[12.5px] leading-relaxed text-muted">
               {reasoning}
+            </div>
+          </section>
+        )}
+
+        {documentRead && (
+          <section aria-label="Document read">
+            <h3 className="flex items-center gap-1.5 text-[11px] font-medium uppercase tracking-wide text-faint">
+              <IconFileText size={12} />
+              Document read
+            </h3>
+            <p className="mt-1.5 text-[12.5px] text-muted">
+              {documentRead.filename} · {documentRead.total_pages} page
+              {documentRead.total_pages !== 1 ? 's' : ''} read in full
+              {documentRead.ocr_pages
+                ? ` · ${documentRead.ocr_pages} via OCR`
+                : ''}
+            </p>
+            <div className="mt-2 max-h-[45vh] space-y-1 overflow-y-auto">
+              {documentRead.pages.map((p) => (
+                <details
+                  key={p.page}
+                  className="rounded-lg border border-border bg-surface px-2.5 py-1.5"
+                >
+                  <summary className="cursor-pointer select-none text-[12px] font-medium text-muted">
+                    Page {p.page}
+                  </summary>
+                  <div className="mt-1.5 whitespace-pre-wrap font-mono text-[11.5px] leading-relaxed text-muted">
+                    {p.text}
+                  </div>
+                </details>
+              ))}
+              {documentRead.total_pages > documentRead.pages.length && (
+                <p className="pt-1 text-[11px] text-faint">
+                  Showing the first {documentRead.pages.length} pages here — the
+                  model read all {documentRead.total_pages}.
+                </p>
+              )}
             </div>
           </section>
         )}

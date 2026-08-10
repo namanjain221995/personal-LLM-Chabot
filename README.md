@@ -228,6 +228,10 @@ docker compose exec sync-worker python3 -m syncworker.objects \
 docker compose exec sync-worker python3 -m syncworker.objects \
   import-sheet /tmp/org.csv --dry-run
 
+# force a FULL re-extract of one object next cycle — backfills newly added
+# fields for ALL records and reconciles deletes exactly
+docker compose exec sync-worker python3 -m syncworker.objects resync Case
+
 docker compose up -d --force-recreate sync-worker
 ```
 
@@ -235,6 +239,12 @@ docker compose up -d --force-recreate sync-worker
 and long-text ones join the RAG index. **New objects are reported, not adopted** —
 a new object means a full extract of something nobody asked for, so it is logged
 for you to decide.
+
+**Deletes:** records deleted in Salesforce are removed from the local copy —
+incremental cycles check the recycle bin (best effort, ~15-day window), and a
+full extract (`resync`) reconciles exactly. An object synced before continues
+incrementally after config edits, so newly added fields stay empty for
+historical records until you `resync` it.
 
 ### The field dictionary
 

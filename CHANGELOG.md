@@ -1,5 +1,313 @@
 # Changelog
 
+## Document pages shown in the Activity panel (2026-08-07)
+
+Uploading a PDF/DOCX now records WHAT was read into the answer's meta
+(`meta.document`: filename, total pages, OCR'd count, per-page text capped
+1200 chars × 80 pages) and the Activity panel gains a "Document read"
+section — filename, "N pages read in full · M via OCR", and an expandable
+entry per page. Verified live: meta.document carried all parts of the test
+DOCX. Tests: 848 / 121 / 288.
+
+## Full-document reading + document memory + DOCX support (2026-08-07)
+
+Owner report: a 36-page PRD was answered from its first 6 pages (MAX_PDF_PAGES
+truncated everything), .docx was rejected by the composer, and an uploaded
+document was forgotten the turn after it was attached.
+
+Now ChatGPT-style: (1) `extract_pdf_pages` pulls the text layer of EVERY page
+(100+ fine, 400k-char cap); pages with a thin text layer (<200 chars — scans)
+are rendered and OCR'd via Unlimited-OCR, up to 40 pages per upload
+(`render_pdf_pages` renders exactly those); the first 6 pages still go to the
+model AS IMAGES for layout. (2) The full page-marked text is stored in a new
+`documents` table keyed by conversation, and every LATER turn gets a pinned
+system block with the question-RELEVANT excerpts (select_relevant, 8k
+chars/doc) — same pattern as stored URL pages — so "what did that PDF say
+about X?" works many turns later, in any mode. The answer turn itself uses
+relevance selection (48k chars) instead of a blind prefix. (3) `.docx` is
+accepted end-to-end: the server sniffs bytes (%PDF vs zip-with-
+word/document.xml vs plain text; `core/docx.py` extracts paragraphs + tables
+with the stdlib — no new dependency), and the composer accepts
+.docx/.txt/.md on the document slot (CSV/XLSX stay on the dataset path,
+which already ships small files whole). Verified live: a 203-paragraph DOCX
+answered a deep-content question, and a follow-up turn WITHOUT the file
+recalled its codename and hardware from stored memory. Also converted two
+on-disk pytest.mark.asyncio tests to the repo's asyncio.run convention
+(plugin not installed). Tests: **848 backend / 121 sync-worker / 288
+frontend**.
+
+## Whole-org sync: 1,060 objects / 19,312 fields (owner: "I want all") (2026-08-06)
+
+The owner wants every object and field from the org export in DuckDB, not
+just the business core. Everything Salesforce permits is now synced; what
+remains out is out because Salesforce refuses it for everyone: ChangeEvent /
+platform-event streams (not queryable — nothing stored to fetch), 11
+permission-blocked objects, and phantom Setup-UI fields the API never serves.
+
+- **Fallback watermarks**: Share/History/Feed shadows and many setup objects
+  have no SystemModstamp. ObjectConfig gains `watermark_field`
+  (SystemModstamp → LastModifiedDate → CreatedDate); objects with no
+  timestamp at all run a reconciled FULL extract every cycle
+  (`watermark_field: null`). SOQL builders take the field as a parameter.
+- **Full-sheet import**: `import-sheet` no longer skips companion shadows —
+  the whole 1,932-object export went through live describe: **1,060 objects
+  / 19,312 fields usable** (872 not queryable/readable), 382 shadow tables,
+  314 on fallback watermarks, 46 full-only. MAX_FIELDS_PER_OBJECT 400 → 4000
+  (PermissionSetLicense: 652 fields).
+- **Selective SQL grounding** (orchestrator): with ~1,000 tables in the
+  warehouse, dumping the whole schema into every SQL prompt would bury the
+  ~160 business tables. `relevant_schema()` always grounds business tables
+  (org-local + packaged `__c`, standard allowlist) and adds shadow/system
+  tables only when a question word names them (token-aware matching —
+  "this" must not light up Accoun[this]tory; capped at 40 extras).
+  `references_a_known_table` still validates against the FULL schema.
+- Watch item: recurring cycles now describe+query ~1,023 objects; if the
+  org's daily API limit is tight, `sf_api_limit_warning` fires at 80% —
+  the lever is SYNC_INTERVAL_MINUTES.
+- **Migration verified complete**: 1,023/1,023 configured objects with every
+  field a column, 705,339 rows (Interview__History alone: 167k). 37
+  restricted virtual entities (EntityDefinition, ContentDocumentLink,
+  PicklistValueInfo…) failed as only they can — Salesforce forbids
+  unfiltered extraction — and were removed from the config.
+- **Live-mode fixes shipped the same day**: /data/sf_dictionary.json had
+  never been built, so live SOQL ran without field grounding (the
+  Status__c-vs-Interview_Status__c failure). Built from the org export
+  (1,932 objects / 35,900 fields), dictionary cap 60 → 300 fields,
+  fetch_live now self-repairs INVALID_FIELD once via live describe, the
+  force-live error copy no longer blames the warehouse, and BOTH SQL and
+  SOQL prompts pin dates as DAY-MONTH-YEAR (03-07-2026 = 3 July — the two
+  engines once answered the same question with July 3 and March 7).
+- **Composer**: the "+" menu always shows all four rows (files / web /
+  Salesforce / Live); activating a conflicting row switches modes in one
+  click; Live shows a single merged "Live Salesforce" pill whose ×
+  steps down to synced mode.
+
+## Full org coverage: 158 objects / 3,504 fields synced to the warehouse (2026-08-06)
+
+Owner report: the DuckDB warehouse only had ~21 tables with thin columns —
+nowhere near the org export sheet ("Org Object and field data"), so the LLM
+could not answer most business questions. Root causes: `config.yaml` was
+still the generic Phase-1 starter list (WorkOrder, Incident, SocialPost…)
+with only 8 of the org's 60 custom objects; the import trimmed every object
+to 60 fields and runtime adoption capped at 80 — silently truncating
+Interview__c (264 fields), Onboarding__c (174) and Account (275).
+
+- **`import-sheet` now reads the real org export format** — columns located
+  by header ("Object API Name" / "Field API Name"), alongside the legacy
+  2-column sheet. Companion shadows (`*ChangeEvent`, `*__Share`, `*__History`,
+  `*__Feed`, standard `<X>Share/Feed/History`) are never imported; objects
+  without `SystemModstamp` are skipped with a reason.
+- **Field caps raised above the widest business object**:
+  `MAX_FIELDS_PER_OBJECT` 60 → 400, `SYNC_MAX_FIELDS` 80 → 400 (compose).
+- **Credentials can no longer reach the warehouse**: `encryptedstring`
+  fields (candidate LinkedIn/marketing passwords) and `base64` blobs are
+  refused at import AND by runtime field adoption. The already-leaked
+  `Onboarding__c.LinkedIn_Password__c` column was dropped from DuckDB.
+- **Config rebuilt from the org export**: 158 objects / 3,504 fields /
+  138 rag fields (was ~45 objects with skinny lists). All watermarks
+  cleared → full Bulk re-extract backfills every record.
+- Known limit, needs a Salesforce-side fix: the read-only integration user
+  is blocked by field-level security from ~1,900 sheet fields (Account 198,
+  Lead 72, Session__c 71, Invoice__c 49…) and whole objects (EmailMessage,
+  Event, Task). Grant its permission set access and the next cycles adopt
+  the fields automatically. Full list: the import run's notes.
+- RESOLVED same day: owner checked "View All Fields (Global)" on the
+  Prod-Read-only permission set ("View All Data" alone does NOT bypass
+  field-level security — that tripped us up first). Config re-imported:
+  **4,997 of 5,473 sheet fields** (Session__c 83/83, Invoice__c 64/64,
+  Account 266/275 — the gap is compound/binary/credential exclusions),
+  full backfill re-extract run. Still object-blocked (owner may grant
+  later): EmailMessage, Task, Event (permission set → Object Settings →
+  Read) and the custom settings QB_Plan__c / In_App_Checklist_Settings__c
+  ("View All Custom Settings"). Also: SYNC_INTERVAL_MINUTES 30 → 1 at the
+  owner's request — an incremental pass over 158 objects takes ~165 s, so
+  effective freshness is ~3–4 min (~150–180k API calls/day; the 80% limit
+  warning will flag if the org's cap is tighter).
+- Sync robustness added along the way: entities the Bulk API refuses
+  (CaseStatus & other picklist masters → INVALIDENTITY) fall back to REST
+  SOQL for full extracts; configured objects with zero records now get
+  empty tables (ensure_table, which also widens empty tables when the
+  config grows) so SQL answers 0 instead of "table not found";
+  plain-string Password fields are excluded by NAME (the portal's
+  Candidate_Portal_Credential__c.Password__c was typed string — type
+  filters can't catch that; column + parquet scrubbed).
+- **Object auto-adoption (SYNC_AUTO_OBJECTS, owner request)**: each cycle
+  diffs Salesforce's object list against the config and adopts new custom
+  objects — plus Task/Event/EmailMessage/TaskStatus the moment read access
+  is granted — with every adoptable field (same credential/type filters).
+  Derived per cycle (config.yaml is mounted read-only); watermarks keep
+  re-syncs incremental. Proved on day one: Recurring_Break_Series__c,
+  created in the org after the export sheet, synced itself.
+- **Final state after owner-requested clean migration** (wipe warehouse +
+  parquet + LanceDB, one full pass, 52 min): 160 tables, 148,102 rows,
+  158/158 configured objects verified with ALL fields as columns
+  (Interview__c 265, Session__c 83, Lead 124, Account 267, Invoice__c 76 —
+  field adoption exceeds the sheet where the org grew since the export).
+  Interval: 5 min between cycles.
+
+## Live Salesforce toggle + the warehouse lock error fixed (2026-08-06)
+
+Owner report: a chat answer showed the raw DuckDB error `IO Error: Could not
+set lock on file "/data/warehouse.duckdb"`. Root cause: the sync-worker held
+ONE write connection for the whole cycle (by design, pre-dating this), and
+DuckDB's single-writer rule locked the orchestrator's read-only SQL engine
+out for the entire cycle — ordinarily ~1-4 minutes, but the one-time
+column-healing backfill ran 21 minutes and made it impossible to miss.
+
+Three-layer fix:
+1. **Sync-worker `Store` now opens a connection PER OPERATION** (watermark
+   read/write, upsert, delete, reconcile) with a 10 s lock-retry — the file
+   lock is held for milliseconds per write instead of minutes per cycle, so
+   chat queries interleave freely with syncing.
+2. **The SQL engine retries briefly on lock (4 s), then degrades
+   gracefully**: `WarehouseBusy` falls back to a LIVE Salesforce answer
+   ("Local copy is being refreshed — asking Salesforce live…") when live is
+   configured, or a friendly try-again message when not — never the raw IO
+   error. `schema_cache` keeps serving its last-good schema when a refresh
+   hits the lock.
+3. **New composer toggle: "Live Salesforce"** (in the "+" menu, only while
+   Salesforce is ON; sparkles pill when active). Every text answer then
+   queries the org directly — any object or field the read-only integration
+   user can see, schema questions included — instead of the 30-minute synced
+   copy. Wire: `prefs.sfLive` → `sf_live` on POST /chat → `ChatRequest.sf_live`
+   → `run_sql_engine(force_live=True)`. The trust line changes honestly:
+   live queries DO leave the machine (to the user's own org, read-only).
+   Sub-toggle coherence enforced in composerMenu/sanitize: turning
+   Salesforce off always turns Live off.
+
+Live verification then caught one more guard bug: Salesforce rejects LIMIT
+on ANY non-grouped aggregate — not just bare `COUNT()` — so the forced
+`LIMIT 200` broke `SELECT COUNT(Id) FROM Contact` ("Non-grouped query that
+uses overall aggregate functions cannot also use LIMIT"). guard_soql now
+skips the cap for all overall aggregates (grouped aggregates keep it); one
+pre-existing test asserted the wrong belief and was corrected. Verified
+end-to-end through POST /chat with sf_live: status "Asking Salesforce
+live…", model-written `SELECT COUNT() FROM Contact`, answer "1,057 contacts
+… straight from Salesforce". Tests: **833 backend / 121 sync-worker / 285
+frontend**.
+
+## Salesforce layer: seven fixes from the code deep-dive (2026-08-06)
+
+A full four-reader audit of every Salesforce-touching file surfaced seven
+defects; all are fixed, tested, and deployed.
+
+1. **SOQL generation ran blind to the org (real bug):** `live_sf._object_hint`
+   called `schema_cache()` — an instance, not a callable — and the TypeError
+   vanished into a bare `except`, so the "Objects known to be in this org"
+   line NEVER reached the SOQL prompt. Now reads
+   `schema_cache.get(duckdb_path)` (excluding `_sync_meta`); live queries are
+   grounded in the real synced object names.
+2. **`SF_LIVE_ENABLED` was bypassable and mis-parsed:** agent `salesforce`
+   steps called `fetch_live` directly without consulting the flag (only the
+   SQL engine's fallback checked it), and the bespoke parse treated `off` —
+   or any typo — as *true*. The agent step now degrades to the warehouse when
+   the flag is off, and parsing uses the shared `_bool` helper.
+3. **Deleted Salesforce records now leave the local copy** (they used to live
+   in DuckDB, Parquet and the RAG index forever — SystemModstamp sync cannot
+   see deletes): incremental cycles ask the recycle bin via `/queryAll`
+   (`build_deleted_soql`, best effort — sharing rules and the ~15-day bin
+   apply, failures never block the sync), and a FULL extract now reconciles
+   exactly — local rows absent from the snapshot are dropped
+   (`Store.reconcile_full`), with matching RAG-chunk purges
+   (`RagIndexer.delete_records`) in both paths.
+4. **New `objects resync <Name>` CLI** clears one object's watermark so the
+   next cycle runs a FULL extract — the honest answer to the old CLI lie
+   ("the next cycle does a FULL extract for changed objects" — it never did;
+   the watermark survives config edits, so added fields stayed empty for
+   historical records). The add/add-fields message now states the real
+   semantics and points at `resync`.
+5. **Describe cache cleared each cycle** — fields created in Salesforce while
+   the worker ran were invisible to auto-adoption until a container restart;
+   one describe call per object per cycle is the negligible price.
+6. **Dead code removed:** the second, unreachable
+   `if step.kind == "salesforce"` block in `agent.py`.
+7. **`SF_LIGHTNING_BASE_URL` wired through docker-compose and .env.example**
+   — RAG citation links were silently hardcoded to the TechSara org.
+
+Live verification against the production org then caught three more, all
+fixed in the same round:
+
+8. **Live COUNT queries returned "no data":** `SELECT COUNT()` answers via
+   `totalSize` with an EMPTY records list, and `run_soql` dropped it — every
+   live count question would have looked like zero rows. It now synthesizes
+   `[{"count": N}]` (verified live: 1,044 accounts; the full pipeline wrote
+   `WHERE CreatedDate = THIS_YEAR` and answered 382).
+9. **Interview__c had been failing EVERY sync cycle** (pre-existing): an
+   all-None column in the CREATE TABLE batch let DuckDB resolve the NULL
+   type to INTEGER, and the first real value ('Full Time' into
+   Employment_Type__c) failed the upsert forever after. Staging frames are
+   now pinned to string dtype, and mistyped columns heal in place
+   (`ALTER … SET DATA TYPE VARCHAR`) — the healing pass fired on Account,
+   Contact and Interview__c on its first live cycle, unblocking the
+   recruiting object's backlog.
+10. **User has no IsDeleted field** (users are deactivated, never deleted),
+    so the recycle-bin pass was a guaranteed INVALID_FIELD on it every
+    cycle — objects whose describe lacks `IsDeleted` now skip the pass.
+
+Verified live (read-only integration user, My Domain client-credentials):
+token grant, guarded COUNT query, DML refusal, and the full question →
+model-written SOQL → org → rows pipeline. Tests: **828 backend / 121
+sync-worker** / 278 frontend.
+
+## Status line no longer claims "searching the web" in Salesforce mode (2026-08-06)
+
+Owner report: with Salesforce ON — whose composer trust line promises "no web
+search · nothing leaves this machine" — a request showed "Planning steps and
+searching the web…". The search itself was correctly blocked (the
+`auto_web_search_allowed` gate held; nothing left the machine), but the
+status label and `meta.auto` were emitted from the classifier's RAW wish
+BEFORE the gate ran, so the UI contradicted the promise. Same lying-status
+applied when SEARCH_ENABLED=false or the rate limit blocked a search.
+
+Fix (main.py): the auto-decision is announced and recorded only AFTER the
+want_search gates, from the EFFECTIVE plan — Salesforce mode now shows
+"Planning the steps for this task…" and meta.auto reports `search: false`
+(trust metadata describes what actually ran). Three regression tests in
+test_salesforce_toggle.py: no "web" in any Salesforce-mode status, meta.auto
+reports the gated decision, and assistant mode still announces its searches
+honestly. Tests: **822 backend** / 278 frontend.
+
+## History cache moved to IndexedDB — "Storage is full" red-pill cascade fixed (2026-08-06)
+
+The defect: the browser mirrored ALL conversations as ONE JSON blob in a
+single localStorage key (`techsara.history.v1`). Every message carries heavy
+meta (up to 500 SQL preview rows, base64 image data-URLs, full reasoning
+text, research source lists), so at ~83 conversations the ~5 MiB Web Storage
+quota overflowed; every cache write then evicted the oldest conversation
+one-per-retry — each firing an un-rate-limited red error toast — and the
+blob was re-`JSON.stringify`ed on every streamed token. Deep research
+(104-agent adversarially-verified pass; MDN/web.dev/WebKit primary sources)
+confirmed: localStorage is hard-capped ~5 MiB in all browsers and the
+single-blob design is unfixable by pruning; IndexedDB has gigabyte-scale
+quota (Chromium 60% of disk, Firefox min(10%, 10 GiB), Safari ~60%);
+whole-state single-record writes are explicitly warned against (synchronous
+structured clone blocks the main thread); ChatGPT's production web app keeps
+NO persistent client conversation store at all — server truth, in-memory
+cache. Ours now matches: SQLite on the server stays the source of truth.
+
+The fix (`frontend/lib/idbCache.ts` + cache engine swap in
+`frontend/lib/history.ts`): the server store's cache is now a synchronous
+in-memory array (component-facing interface unchanged — zero edits in
+Sidebar/MessageRow/streams) persisted write-behind to IndexedDB, one record
+per conversation, streamed writes debounced 300 ms. Image data-URLs split
+into write-once records keyed `<convId>#<msgIdx>` (message indices only
+append or truncate from the tail), so re-persisting a streaming conversation
+never re-clones multi-MB base64 — and image previews now also survive a
+server re-pull, which used to drop them. First boot imports the legacy blob
+into IndexedDB once and deletes the key; sync bookkeeping
+(`techsara.history.sync.v1`) is untouched, so pushed/dirty state carries
+over. No usable IndexedDB (some private modes) → automatic fallback to the
+legacy blob persister with the old evict-on-quota behavior, whose toast is
+now ONE calm rate-limited notice ("your chats are safe on the server")
+instead of a red pill per evicted conversation. `ChatApp` awaits the new
+`store.ready()` before first paint of the sidebar/deep-link restore
+(single-digit ms). The v1 `createHistoryStore` and all 264 existing frontend
+tests are untouched; 14 new tests cover per-record persistence granularity,
+streaming-write coalescing, hydration merge (memory wins), legacy migration,
+multi-user clear, image strip/rejoin/write-once/truncate, and the
+broken-IndexedDB fallback (`fake-indexeddb` dev dep). Tests: 800 backend /
+**278 frontend**.
+
 ## Unlimited-OCR — dedicated document OCR in the model stack (2026-08-06)
 
 New resident model: **baidu/Unlimited-OCR** (3.3B document-OCR VLM, MIT,

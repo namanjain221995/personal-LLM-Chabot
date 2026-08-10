@@ -286,10 +286,21 @@ async def _run_step_impl(
         return answer, f"{len(hits)} record(s)", {"citations": citations}
 
     if step.kind == "salesforce" and salesforce:
+        # Straight to the org: newer than the warehouse, and works on objects
+        # the warehouse does not carry. Honors SF_LIVE_ENABLED like the SQL
+        # engine's fallback does — this path used to bypass the flag entirely.
+        from ..config import settings
         from ..core.salesforce import (SalesforceUnavailable, UnsafeSoql,
                                        merge_rows)
         from .live_sf import describe_rows, fetch_live
 
+        if not settings.sf_live_enabled:
+            return (
+                "Live Salesforce lookups are disabled (SF_LIVE_ENABLED). "
+                "Answer from the synced warehouse instead.",
+                "live lookups disabled",
+                {},
+            )
         try:
             soql, live_rows = await fetch_live(step.input, history)
         except (SalesforceUnavailable, UnsafeSoql) as exc:
@@ -298,31 +309,6 @@ async def _run_step_impl(
             return (
                 f"Live Salesforce lookup unavailable ({exc}). "
                 "Answer from the synced warehouse instead.",
-                "live lookup unavailable",
-                {},
-            )
-        rows = merge_rows([], live_rows)
-        return (
-            f"Live Salesforce query:\n{soql}\n\nRows ({len(rows)}):\n"
-            + describe_rows(rows),
-            f"{len(rows)} live record(s)",
-            {"sql": soql, "data": rows[:50]},
-        )
-
-    if step.kind == "salesforce" and salesforce:
-        # Straight to the org: newer than the warehouse, and works on objects
-        # the warehouse does not carry.
-        from ..core.salesforce import SalesforceUnavailable, UnsafeSoql, merge_rows
-        from .live_sf import describe_rows, fetch_live
-
-        try:
-            soql, live_rows = await fetch_live(step.input, history)
-        except (SalesforceUnavailable, UnsafeSoql) as exc:
-            # The warehouse is still there — degrade to it rather than failing
-            # the step and losing this part of the plan.
-            return (
-                f"Live Salesforce lookup unavailable ({exc}). Answer this step "
-                "from the synced warehouse or say the data could not be read.",
                 "live lookup unavailable",
                 {},
             )

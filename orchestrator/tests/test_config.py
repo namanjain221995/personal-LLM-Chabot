@@ -100,3 +100,18 @@ def test_an_unknown_chart_trigger_mode_falls_back_to_explicit(monkeypatch):
     for value in ("automatic", "", "  ", "yes-please"):
         monkeypatch.setenv("CHART_TRIGGER_MODE", value)
         assert Settings().chart_trigger_mode == "explicit"
+
+
+def test_sf_live_enabled_off_means_off(monkeypatch):
+    """The old bespoke parse treated 'off' (and typos) as TRUE, silently
+    enabling live org lookups. It now uses the shared _bool helper."""
+    from app.config import Settings
+
+    for raw in ("off", "false", "0", "no", "nonsense"):
+        monkeypatch.setenv("SF_LIVE_ENABLED", raw)
+        assert Settings().sf_live_enabled is False, raw
+    for raw in ("true", "1", "yes", "on"):
+        monkeypatch.setenv("SF_LIVE_ENABLED", raw)
+        assert Settings().sf_live_enabled is True, raw
+    monkeypatch.delenv("SF_LIVE_ENABLED", raising=False)
+    assert Settings().sf_live_enabled is True

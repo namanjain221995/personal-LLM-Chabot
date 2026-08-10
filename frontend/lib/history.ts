@@ -4,15 +4,24 @@
  * V1 (§9) stored conversations in localStorage. V2 (§4b) swaps the
  * implementation to the orchestrator's /history API BEHIND THE SAME
  * INTERFACE: components still call the synchronous HistoryStore methods;
- * localStorage is now an offline CACHE that mirrors the server. Every write
- * lands in the cache immediately (instant UI) and is pushed to the server in
- * the background; failed pushes mark the conversation dirty and are retried
- * on the next refresh(). A one-time migration uploads pre-auth local
- * conversations after first login (§4b).
+ * the local cache mirrors the server. Every write lands in the cache
+ * immediately (instant UI) and is pushed to the server in the background;
+ * failed pushes mark the conversation dirty and are retried on the next
+ * refresh(). A one-time migration uploads pre-auth local conversations
+ * after first login (§4b).
  *
- * Quota policy (unchanged from v1): when a cache write throws
- * QuotaExceededError, the OLDEST conversation (by updatedAt) is dropped and
- * the write retried; every eviction surfaces through onEvict for a toast.
+ * V4 cache engine: the server store's cache is now an IN-MEMORY array
+ * (synchronous, so the component-facing interface is unchanged) persisted
+ * write-behind to IndexedDB with one record per conversation (lib/idbCache).
+ * The old single-key localStorage blob hit the ~5 MiB Web Storage quota and
+ * evicted whole conversations mid-chat with a toast per eviction; IndexedDB
+ * has gigabyte-scale quota, and per-record writes avoid re-serializing every
+ * conversation on every streamed token. The first boot after this change
+ * imports the legacy blob and deletes it. Browsers without usable IndexedDB
+ * fall back to the legacy blob persister, whose quota policy is unchanged:
+ * on QuotaExceededError the OLDEST conversation (by updatedAt) is dropped
+ * and the write retried, surfacing through onEvict for a toast. The v1
+ * createHistoryStore (migration source, tests) still uses the blob directly.
  */
 
 import type {
@@ -21,6 +30,11 @@ import type {
   ConversationSummary,
   Meta,
 } from './types';
+import {
+  createIdbPersister,
+  isIdbAvailable,
+  type CachePersister,
+} from './idbCache';
 import {
   createHistoryApi,
   isConflict,
@@ -67,6 +81,12 @@ export interface HistoryStore {
 
 /** V2 additions on top of the v1 interface (all backward-compatible). */
 export interface ServerHistoryStore extends HistoryStore {
+  /**
+   * Resolves once the persistent cache (IndexedDB) has hydrated into memory
+   * — await it before the first list()/get() on boot. Immediate for
+   * synchronous engines (legacy blob, tests, SSR).
+   */
+  ready(): Promise<void>;
   /** Bind the store to the signed-in user; a USER CHANGE clears the cache. */
   setActiveUser(username: string): void;
   /** One-time upload of pre-auth local conversations (§4b). Returns count. */
@@ -132,8 +152,17 @@ function isQuotaError(err: unknown): boolean {
 /* ----------------------------------------------------------- local cache */
 
 interface Cache {
+  /** Resolves once hydration (and any legacy-blob import) finished. */
+  ready: Promise<void>;
   readAll(): Conversation[];
-  writeAll(conversations: Conversation[]): void;
+  /**
+   * Replace the cached set. `changed` names the conversation(s) this write
+   * actually touched so per-record persisters only persist those; the legacy
+   * blob cache ignores it and rewrites the whole blob.
+   */
+  writeAll(conversations: Conversation[], changed?: string | string[]): void;
+  /** Await pending write-behind persistence (tests). */
+  flushPersist(): Promise<void>;
   clear(): void;
 }
 
@@ -142,6 +171,10 @@ function createCache(
   onEvict?: (dropped: ConversationSummary) => void,
 ): Cache {
   return {
+    ready: Promise.resolve(),
+
+    flushPersist: () => Promise.resolve(),
+
     readAll() {
       try {
         const raw = storage.getItem(STORAGE_KEY);
@@ -190,6 +223,175 @@ function createCache(
 }
 
 /**
+ * The legacy single-blob localStorage cache as a CachePersister — the
+ * fallback when IndexedDB is unavailable (some private modes) and the
+ * synchronous engine under the v1 store. Keeps the old on-disk format,
+ * including the quota-evict loop.
+ */
+function createBlobPersister(
+  storage: StorageLike,
+  onEvict?: (dropped: ConversationSummary) => void,
+): CachePersister {
+  const blob = createCache(storage, onEvict);
+  return {
+    mode: 'sync',
+    loadAll: () => blob.readAll(),
+    put(conversations) {
+      const all = blob.readAll();
+      for (const conv of conversations) {
+        const idx = all.findIndex((c) => c.id === conv.id);
+        if (idx === -1) all.push(conv);
+        else all[idx] = conv;
+      }
+      blob.writeAll(all);
+    },
+    remove(ids) {
+      const drop = new Set(ids);
+      blob.writeAll(blob.readAll().filter((c) => !drop.has(c.id)));
+    },
+    clear: () => blob.clear(),
+  };
+}
+
+/** How long streamed-token writes coalesce before an async persist. */
+const PERSIST_DEBOUNCE_MS = 300;
+
+/**
+ * Synchronous in-memory cache persisted write-behind through a
+ * CachePersister. Reads/writes are instant (components keep their sync
+ * interface); async persisters (IndexedDB) get debounced per-conversation
+ * writes, sync persisters (legacy blob, tests) are written through
+ * immediately so existing call-order expectations hold.
+ */
+function createMemoryCache(
+  persister: CachePersister,
+  legacy?: { read(): Conversation[]; discard(): void },
+): Cache {
+  let conversations: Conversation[] = [];
+  const pendingPuts = new Set<string>();
+  const pendingRemoves = new Set<string>();
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let inFlight: Promise<void> = Promise.resolve();
+
+  function flushNow(): void {
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+    if (pendingPuts.size === 0 && pendingRemoves.size === 0) return;
+    const byId = new Map(conversations.map((c) => [c.id, c]));
+    const puts = [...pendingPuts]
+      .map((id) => byId.get(id))
+      .filter((c): c is Conversation => c !== undefined);
+    const removes = [...pendingRemoves];
+    pendingPuts.clear();
+    pendingRemoves.clear();
+    const work = (async () => {
+      if (puts.length > 0) await persister.put(puts);
+      if (removes.length > 0) await persister.remove(removes);
+    })().catch(() => {
+      // Persistence is best-effort; the server holds the durable copy.
+    });
+    inFlight = inFlight.then(() => work);
+  }
+
+  function schedule(): void {
+    if (persister.mode === 'sync') {
+      flushNow();
+      return;
+    }
+    if (!timer) timer = setTimeout(flushNow, PERSIST_DEBOUNCE_MS);
+  }
+
+  let ready: Promise<void>;
+  if (persister.mode === 'sync') {
+    // Synchronous engines (legacy blob, tests) hydrate before the store is
+    // handed out, so list()/get() right after construction see the data.
+    try {
+      conversations = persister.loadAll() as Conversation[];
+    } catch {
+      conversations = [];
+    }
+    ready = Promise.resolve();
+  } else {
+    ready = (async () => {
+      let loaded: Conversation[] = [];
+      try {
+        loaded = await persister.loadAll();
+      } catch {
+        // unavailable — run memory-only; the server refresh() repopulates
+      }
+      // Import the pre-IndexedDB localStorage blob exactly once.
+      if (legacy && loaded.length === 0) {
+        const old = legacy.read();
+        if (old.length > 0) {
+          loaded = old;
+          try {
+            await persister.put(old);
+            legacy.discard();
+          } catch {
+            // keep the blob so the next boot can retry the import
+          }
+        }
+      }
+      // Merge under anything created while hydration was in flight —
+      // in-memory (newer) wins on id collisions.
+      const have = new Set(conversations.map((c) => c.id));
+      conversations = [
+        ...loaded.filter((c) => !have.has(c.id)),
+        ...conversations,
+      ];
+    })();
+  }
+
+  return {
+    ready,
+
+    readAll: () => conversations,
+
+    writeAll(next, changed) {
+      const prevIds = new Set(conversations.map((c) => c.id));
+      conversations = next;
+      const nextIds = new Set(next.map((c) => c.id));
+      const touched =
+        changed === undefined
+          ? [...nextIds]
+          : Array.isArray(changed)
+            ? changed
+            : [changed];
+      for (const id of touched) {
+        if (nextIds.has(id)) {
+          pendingPuts.add(id);
+          pendingRemoves.delete(id);
+        } else if (prevIds.has(id) || pendingPuts.has(id)) {
+          pendingPuts.delete(id);
+          pendingRemoves.add(id);
+        }
+      }
+      schedule();
+    },
+
+    async flushPersist() {
+      flushNow();
+      await inFlight;
+    },
+
+    clear() {
+      conversations = [];
+      pendingPuts.clear();
+      pendingRemoves.clear();
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      void Promise.resolve(persister.clear()).catch(() => {
+        // best-effort
+      });
+    },
+  };
+}
+
+/**
  * Summaries for the conversations matching `wantArchived`, in sidebar order:
  * pinned first (V3 §2), then newest first. Same-millisecond ties break by
  * insertion order (later in the cache = created/touched later) so ordering
@@ -226,7 +428,7 @@ function storeOverCache(cache: Cache): HistoryStore {
     const target = all.find((c) => c.id === id);
     if (!target) return;
     Object.assign(target, patch);
-    cache.writeAll(all);
+    cache.writeAll(all, id);
   }
 
   return {
@@ -251,7 +453,7 @@ function storeOverCache(cache: Cache): HistoryStore {
         updatedAt: now,
         messages: [],
       };
-      cache.writeAll([...cache.readAll(), conversation]);
+      cache.writeAll([...cache.readAll(), conversation], conversation.id);
       return conversation;
     },
 
@@ -263,11 +465,14 @@ function storeOverCache(cache: Cache): HistoryStore {
       if (!target) return;
       target.title = trimmed.slice(0, TITLE_MAX);
       target.updatedAt = Date.now();
-      cache.writeAll(all);
+      cache.writeAll(all, id);
     },
 
     remove(id) {
-      cache.writeAll(cache.readAll().filter((c) => c.id !== id));
+      cache.writeAll(
+        cache.readAll().filter((c) => c.id !== id),
+        id,
+      );
     },
 
     saveMessages(id, messages) {
@@ -276,7 +481,7 @@ function storeOverCache(cache: Cache): HistoryStore {
       if (!target) return;
       target.messages = messages;
       target.updatedAt = Date.now();
-      cache.writeAll(all);
+      cache.writeAll(all, id);
     },
 
     setPinned(id, pinned) {
@@ -334,12 +539,39 @@ export interface ServerHistoryStoreOptions {
   storage: StorageLike;
   api?: HistoryApi;
   onEvict?: (dropped: ConversationSummary) => void;
+  /**
+   * Durable backing for the in-memory cache. Defaults to IndexedDB when the
+   * browser has it (with the legacy localStorage blob as fallback and
+   * one-time migration source), else the legacy blob alone — which keeps
+   * tests and non-IDB environments on the old synchronous behavior.
+   */
+  persister?: CachePersister;
 }
 
 export function createServerHistoryStore(
   options: ServerHistoryStoreOptions,
 ): ServerHistoryStore {
-  const cache = createCache(options.storage, options.onEvict);
+  const blobPersister = createBlobPersister(options.storage, options.onEvict);
+  const useIdb = options.persister === undefined && isIdbAvailable();
+  const persister =
+    options.persister ??
+    (useIdb ? createIdbPersister(blobPersister) : blobPersister);
+  // When IndexedDB is the engine, the old blob (if any) is imported once and
+  // deleted; while the blob IS the engine it must not be treated as legacy.
+  const legacy =
+    persister.mode === 'async'
+      ? {
+          read: () => createCache(options.storage).readAll(),
+          discard: () => {
+            try {
+              options.storage.removeItem(STORAGE_KEY);
+            } catch {
+              // best-effort
+            }
+          },
+        }
+      : undefined;
+  const cache = createMemoryCache(persister, legacy);
   const local = storeOverCache(cache);
   const api = options.api ?? createHistoryApi();
 
@@ -388,7 +620,7 @@ export function createServerHistoryStore(
     const idx = all.findIndex((c) => c.id === conv.id);
     if (idx === -1) all.push(conv);
     else all[idx] = conv;
-    cache.writeAll(all);
+    cache.writeAll(all, conv.id);
   }
 
   function toServerMessage(m: ChatMessage): ServerMessage {
@@ -406,7 +638,7 @@ export function createServerHistoryStore(
    */
   function mergeServerRows(rows: ServerConversationSummary[]): void {
     const all = cache.readAll();
-    let changed = false;
+    const changed: string[] = [];
     for (const sc of rows) {
       const idx = all.findIndex((c) => c.id === sc.id);
       if (idx === -1) {
@@ -423,17 +655,18 @@ export function createServerHistoryStore(
         mutateSync((s) => {
           s.pushed[sc.id] = 'unknown';
         });
-        changed = true;
+        changed.push(sc.id);
       } else if (!readSync().dirty.includes(sc.id)) {
         const conv = all[idx];
+        let touched = false;
         if (sc.title && conv.title !== sc.title) {
           conv.title = sc.title;
-          changed = true;
+          touched = true;
         }
         const serverUpdated = toEpoch(sc.updated_at, conv.updatedAt);
         if (serverUpdated > conv.updatedAt) {
           conv.updatedAt = serverUpdated;
-          changed = true;
+          touched = true;
         }
         for (const flag of ['pinned', 'archived'] as const) {
           const value = sc[flag];
@@ -441,12 +674,13 @@ export function createServerHistoryStore(
           const next = value === true || value === 1;
           if (conv[flag] !== next) {
             conv[flag] = next;
-            changed = true;
+            touched = true;
           }
         }
+        if (touched) changed.push(sc.id);
       }
     }
-    if (changed) cache.writeAll(all);
+    if (changed.length > 0) cache.writeAll(all, changed);
   }
 
   /**
@@ -601,6 +835,7 @@ export function createServerHistoryStore(
   return {
     /* -------- v1 interface: synchronous over the cache, pushed behind */
 
+    ready: () => cache.ready,
     list: () => local.list(),
     listArchived: () => local.listArchived(),
     get: (id) => local.get(id),
@@ -803,6 +1038,7 @@ export function createServerHistoryStore(
       while (inFlight.size > 0) {
         await Promise.all([...inFlight]);
       }
+      await cache.flushPersist();
     },
   };
 }

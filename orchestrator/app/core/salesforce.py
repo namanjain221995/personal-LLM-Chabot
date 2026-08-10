@@ -72,11 +72,19 @@ def guard_soql(soql: str) -> str:
     if not re.search(r"\sFROM\s", text, re.I):
         raise UnsafeSoql("query has no FROM clause")
 
-    # SOQL's aggregate COUNT() returns a single number and REJECTS a LIMIT
-    # ("COUNT() aggregate queries do not support LIMIT"). Adding one turned a
-    # working count into an error, so the row cap simply does not apply here —
-    # a count cannot return a large result set anyway.
-    if re.match(r"^SELECT\s+COUNT\(\s*\)", text, re.I):
+    # SOQL REJECTS a LIMIT on any non-grouped aggregate query — not just the
+    # bare COUNT() form ("COUNT() aggregate queries do not support LIMIT")
+    # but every overall aggregate ("Non-grouped query that uses overall
+    # aggregate functions cannot also use LIMIT", found live 2026-08-06 when
+    # the model wrote SELECT COUNT(Id) FROM Contact and the forced LIMIT
+    # broke it). An aggregate WITH a GROUP BY returns one row per group, so
+    # the row cap still applies there.
+    select_clause = re.split(r"\sFROM\s", text, maxsplit=1, flags=re.I)[0]
+    has_aggregate = re.search(
+        r"\b(COUNT|COUNT_DISTINCT|SUM|AVG|MIN|MAX)\s*\(", select_clause, re.I
+    )
+    has_group_by = re.search(r"\sGROUP\s+BY\s", text, re.I)
+    if has_aggregate and not has_group_by:
         return re.sub(r"\s+LIMIT\s+\d+\s*$", "", text, flags=re.I)
 
     # Enforce a LIMIT rather than trusting one to be present. A top-level
@@ -170,8 +178,17 @@ async def run_soql(soql: str) -> Tuple[str, List[Dict[str, Any]]]:
             pass
         raise SalesforceUnavailable(f"Salesforce rejected the query{detail}")
 
-    records = resp.json().get("records", [])
-    return safe, [_clean(r) for r in records][:MAX_ROWS]
+    body = resp.json()
+    records = body.get("records", [])
+    rows = [_clean(r) for r in records][:MAX_ROWS]
+    # `SELECT COUNT() FROM X` answers via totalSize with EMPTY records —
+    # returning [] here made every live count question look like "no data".
+    # (COUNT(Field) comes back as a normal expr0 record and is unaffected.)
+    if not rows and re.search(r"^\s*SELECT\s+COUNT\(\)", safe, re.I):
+        total = body.get("totalSize")
+        if isinstance(total, int):
+            rows = [{"count": total}]
+    return safe, rows
 
 
 async def _get(path: str, params: Optional[dict] = None) -> Any:

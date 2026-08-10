@@ -18,8 +18,9 @@ import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .. import llm
+from ..config import settings
 from ..core import salesforce
-from ..core.schema_cache import format_schema, schema_cache
+from ..core.schema_cache import schema_cache
 
 _FENCE_RE = re.compile(r"```(?:soql|sql)?\s*(.*?)```", re.S | re.I)
 _THINK_RE = re.compile(r"<think>.*?</think>", re.S | re.I)
@@ -34,7 +35,12 @@ _SOQL_SYSTEM = (
     "children (SELECT Id, (SELECT Id FROM Contacts) FROM Account).\n"
     "- Salesforce checkbox fields are real booleans over the API: write "
     "WHERE IsWon = true, with no quotes.\n"
-    "- Dates use literals like TODAY, LAST_N_DAYS:7, THIS_MONTH.\n"
+    "- Dates use literals like TODAY, LAST_N_DAYS:7, THIS_MONTH, or ISO "
+    "dates like 2026-07-03.\n"
+    # Same rule as the local SQL engine — the two answering one question
+    # with two different dates is what makes users distrust both.
+    "- The user writes dates DAY-MONTH-YEAR: 03-07-2026 or 3/7/2026 means "
+    "3 July 2026, NEVER March 7. Only ISO dates (2026-07-03) are year-first.\n"
     "- Keep it small: name only the fields the question needs.\n"
     "Respond with ONLY the query, no prose and no code fence."
 )
@@ -51,27 +57,46 @@ def extract_soql(raw: str) -> str:
 
 
 def _object_hint() -> str:
-    """The objects already synced, so the model prefers names that exist."""
+    """The objects already synced, so the model prefers names that exist.
+
+    This called `schema_cache()` — an instance, not a callable — for weeks;
+    the TypeError vanished into the except and the hint was always empty, so
+    SOQL generation ran blind to the org's real object names. Keep the
+    except: a missing warehouse file on first run is a normal state.
+    """
     try:
-        return ", ".join(sorted(schema_cache().keys()))
+        schema = schema_cache.get(settings.duckdb_path)
+        return ", ".join(sorted(name for name in schema if not name.startswith("_")))
     except Exception:
         return ""
 
 
-async def write_soql(question: str, history: Sequence[dict] = ()) -> str:
+async def write_soql(
+    question: str,
+    history: Sequence[dict] = (),
+    correction: str = "",
+) -> str:
     from ..core.sf_dictionary import hint_for
 
-    known = _object_hint()
-    context = f"Objects known to be in this org: {known}\n\n" if known else ""
     # Real API names for whatever this question is about, straight from the
-    # org export — SOQL has no forgiving fuzzy matching.
+    # org export — SOQL has no forgiving fuzzy matching. When the dictionary
+    # matches, it alone grounds the query: precise fields beat a thousand
+    # table names. The warehouse-derived object list is only the fallback
+    # for questions the dictionary cannot place (and live answers never read
+    # warehouse DATA either way — this is names, nothing more).
     dictionary = hint_for(question)
     if dictionary:
-        context = f"{dictionary}\n\n{context}"
+        context = f"{dictionary}\n\n"
+    else:
+        known = _object_hint()
+        context = f"Objects known to be in this org: {known}\n\n" if known else ""
+    user = f"{context}Question: {question}"
+    if correction:
+        user += f"\n\n{correction}"
     raw = await llm.chat_completion(
         [
             {"role": "system", "content": _SOQL_SYSTEM},
-            {"role": "user", "content": f"{context}Question: {question}"},
+            {"role": "user", "content": user},
         ],
         temperature=0.0,
         # The main model thinks before answering, and that reasoning is drawn
@@ -137,12 +162,42 @@ async def fetch_schema(question: str) -> Tuple[str, str]:
     )
 
 
+#: Salesforce's INVALID_FIELD message names both the guess and the entity:
+#: "No such column 'Status__c' on entity 'Interview__c'".
+_NO_COLUMN_RE = re.compile(r"No such column '([^']+)' on entity '([^']+)'")
+
+
 async def fetch_live(
     question: str, history: Sequence[dict] = ()
 ) -> Tuple[str, List[Dict[str, Any]]]:
-    """Question → SOQL → live rows. Raises SalesforceUnavailable/UnsafeSoql."""
+    """Question → SOQL → live rows. Raises SalesforceUnavailable/UnsafeSoql.
+
+    One self-repair pass on a wrong FIELD name: Salesforce's error names the
+    entity, so describe it and re-prompt with the REAL field list. A guessed
+    field that happens to exist elsewhere would silently return nothing —
+    this only saves the case where Salesforce itself catches the guess.
+    """
     soql = await write_soql(question, history)
-    return await salesforce.run_soql(soql)
+    try:
+        return await salesforce.run_soql(soql)
+    except salesforce.SalesforceUnavailable as exc:
+        match = _NO_COLUMN_RE.search(str(exc))
+        if not match:
+            raise
+        entity = match.group(2)
+        described = await salesforce.describe_object(entity)
+        real = ", ".join(f["name"] for f in described.get("fields", []))
+        retry = await write_soql(
+            question,
+            history,
+            correction=(
+                f"Your previous query failed.\nPrevious SOQL:\n{soql}\n"
+                f"Salesforce error:\n{exc}\n\n"
+                f"{entity} has ONLY these fields:\n{real}\n\n"
+                "Write a corrected query using exactly these field names."
+            ),
+        )
+        return await salesforce.run_soql(retry)
 
 
 def describe_rows(rows: List[Dict[str, Any]], limit: int = 30) -> str:

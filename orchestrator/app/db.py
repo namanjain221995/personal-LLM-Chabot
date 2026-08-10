@@ -110,6 +110,20 @@ CREATE TABLE IF NOT EXISTS url_documents (
 );
 CREATE INDEX IF NOT EXISTS idx_url_documents_conv
     ON url_documents(conversation_id, id);
+-- 2026-08-07: full text of uploaded documents (PDF/DOCX/plain), stored per
+-- conversation so EVERY later turn can reference them — the file itself was
+-- only ever sent on the turn it was attached, and the model forgot it after.
+CREATE TABLE IF NOT EXISTS documents (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id TEXT NOT NULL,
+    filename        TEXT NOT NULL,
+    text            TEXT NOT NULL,
+    total_pages     INTEGER NOT NULL DEFAULT 0,
+    created_at      TEXT NOT NULL,
+    UNIQUE(conversation_id, filename)
+);
+CREATE INDEX IF NOT EXISTS idx_documents_conv
+    ON documents(conversation_id, id);
 -- Phase 3: cloned+indexed GitHub repos and their code chunks (per conversation).
 CREATE TABLE IF NOT EXISTS repos (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -785,6 +799,35 @@ def get_url_document_urls(conversation_id: str) -> set:
             (conversation_id,),
         ).fetchall()
     return {r["url"] for r in rows}
+
+
+def save_document(
+    conversation_id: str, filename: str, text: str, total_pages: int = 0
+) -> None:
+    """Store (or refresh) an uploaded document's extracted text."""
+    with closing(connect()) as con, con:
+        con.execute(
+            "INSERT INTO documents (conversation_id, filename, text, total_pages, created_at) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(conversation_id, filename) DO UPDATE SET "
+            "text=excluded.text, total_pages=excluded.total_pages, "
+            "created_at=excluded.created_at",
+            (conversation_id, filename, text, total_pages, utcnow()),
+        )
+
+
+def get_documents(conversation_id: str) -> List[dict]:
+    """All documents stored for a conversation, oldest first."""
+    with closing(connect()) as con:
+        rows = con.execute(
+            "SELECT filename, text, total_pages FROM documents "
+            "WHERE conversation_id = ? ORDER BY id",
+            (conversation_id,),
+        ).fetchall()
+    return [
+        {"filename": r["filename"], "text": r["text"], "total_pages": r["total_pages"]}
+        for r in rows
+    ]
 
 
 # ---------------------------------------------------------------------------

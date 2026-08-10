@@ -322,6 +322,7 @@ export async function startStream(opts: StartStreamOptions): Promise<void> {
         session_id: conversationId,
         conversation_id: conversationId,
         mode: prefs.salesforce ? 'salesforce' : 'assistant',
+        sf_live: prefs.salesforce && prefs.sfLive,
         model: prefs.model,
         effort: prefs.effort,
         agent: prefs.agent,

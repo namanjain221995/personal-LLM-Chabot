@@ -8,16 +8,22 @@ something nobody asked for.
 """
 import pytest
 
-from syncworker.main import COMPOUND_TYPES, adopt_new_fields, report_new_objects
+from syncworker.main import (COMPOUND_TYPES, adopt_new_fields,
+                             discover_new_objects, report_new_objects)
 
 
 class FakeClient:
-    def __init__(self, types=None, objects=None, boom=False):
+    def __init__(self, types=None, objects=None, boom=False, types_by_object=None):
         self._types, self._objects, self._boom = types or {}, objects or {}, boom
+        self._types_by_object = types_by_object
 
     def describe_field_types(self, name):
         if self._boom:
             raise RuntimeError("describe down")
+        if self._types_by_object is not None:
+            if name not in self._types_by_object:
+                raise RuntimeError(f"no describe for {name}")
+            return self._types_by_object[name]
         return self._types
 
     def list_objects(self):
@@ -28,6 +34,7 @@ class FakeClient:
 
 class FakeSettings:
     sync_max_fields = 80
+    sync_auto_objects = True
 
 
 class Obj:
@@ -56,6 +63,29 @@ def test_compound_fields_are_never_adopted(ctype):
     assert "BillingAddress" not in fields
 
 
+def test_base64_blobs_are_never_adopted():
+    client = FakeClient({"Id": "id", "VersionData": "base64"})
+    fields, _ = adopt_new_fields("ContentVersion", ["Id"], [], client, FakeSettings())
+    assert "VersionData" not in fields
+
+
+def test_encrypted_credential_fields_are_never_adopted():
+    """Candidate passwords must not drift into the warehouse via adoption."""
+    client = FakeClient({"Id": "id", "LinkedIn_Password__c": "encryptedstring"})
+    fields, _ = adopt_new_fields("Account", ["Id"], [], client, FakeSettings())
+    assert "LinkedIn_Password__c" not in fields
+
+
+def test_plain_string_password_fields_are_never_adopted():
+    """Password__c on the candidate portal is typed `string`; only its NAME
+    gives it away. Removing it from the config must stick."""
+    client = FakeClient({"Id": "id", "Password__c": "string",
+                         "Username__c": "string"})
+    fields, _ = adopt_new_fields(
+        "Candidate_Portal_Credential__c", ["Id"], [], client, FakeSettings())
+    assert "Password__c" not in fields and "Username__c" in fields
+
+
 def test_already_configured_fields_are_not_duplicated():
     client = FakeClient({"Id": "id", "Name": "string"})
     fields, _ = adopt_new_fields("Account", ["Id", "Name"], [], client, FakeSettings())
@@ -76,6 +106,68 @@ def test_a_describe_failure_leaves_the_configured_fields_untouched():
     client = FakeClient(boom=True)
     fields, rag = adopt_new_fields("Account", ["Id", "Name"], ["Name"], client, FakeSettings())
     assert fields == ["Id", "Name"] and rag == ["Name"]
+
+
+BASE_FIELDS = {"Id": "id", "Name": "string", "SystemModstamp": "datetime"}
+
+
+def test_a_new_custom_object_is_adopted_with_its_fields():
+    client = FakeClient(
+        objects={"Account": "Account", "Shiny__c": "Shiny"},
+        types_by_object={"Shiny__c": {**BASE_FIELDS, "Notes__c": "textarea"}},
+    )
+    adopted = discover_new_objects([Obj("Account")], client, FakeSettings())
+    assert [o.name for o in adopted] == ["Shiny__c"]
+    assert "Notes__c" in adopted[0].fields
+    assert adopted[0].rag_fields == ("Notes__c",)
+
+
+def test_adoption_is_off_unless_enabled():
+    class Off(FakeSettings):
+        sync_auto_objects = False
+
+    client = FakeClient(objects={"Shiny__c": "Shiny"},
+                        types_by_object={"Shiny__c": BASE_FIELDS})
+    assert discover_new_objects([], client, Off()) == []
+
+
+def test_wanted_standard_objects_are_adopted_once_readable():
+    """The org admin grants Read on Tasks/Emails later — they must flow in
+    without anyone editing config.yaml."""
+    client = FakeClient(objects={"Task": "Task", "EmailMessage": "Email Message"},
+                        types_by_object={"Task": dict(BASE_FIELDS),
+                                         "EmailMessage": dict(BASE_FIELDS)})
+    adopted = discover_new_objects([], client, FakeSettings())
+    assert {o.name for o in adopted} == {"Task", "EmailMessage"}
+
+
+def test_random_standard_and_companion_objects_are_not_adopted():
+    client = FakeClient(
+        objects={"ApexClass": "Apex Class", "AccountChangeEvent": "shadow",
+                 "Interview__Share": "shadow", "Interview__History": "shadow"},
+        types_by_object={},
+    )
+    assert discover_new_objects([], client, FakeSettings()) == []
+
+
+def test_an_object_without_systemmodstamp_is_not_adopted():
+    client = FakeClient(objects={"Odd__c": "Odd"},
+                        types_by_object={"Odd__c": {"Id": "id", "Name": "string"}})
+    assert discover_new_objects([], client, FakeSettings()) == []
+
+
+def test_adopted_objects_respect_credential_and_type_filters():
+    client = FakeClient(objects={"Portal__c": "Portal"}, types_by_object={
+        "Portal__c": {**BASE_FIELDS, "Password__c": "string",
+                      "Secret__c": "encryptedstring", "Blob__c": "base64"}})
+    adopted = discover_new_objects([], client, FakeSettings())
+    assert "Password__c" not in adopted[0].fields
+    assert "Secret__c" not in adopted[0].fields
+    assert "Blob__c" not in adopted[0].fields
+
+
+def test_object_discovery_failure_is_not_fatal():
+    assert discover_new_objects([], FakeClient(boom=True), FakeSettings()) == []
 
 
 def test_new_custom_objects_are_reported():

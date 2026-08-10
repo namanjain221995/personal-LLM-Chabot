@@ -2,8 +2,8 @@
 
 /**
  * Left sidebar (§9 + V2 §4a + V3 §2 + V4 §2): 260px, collapsible (mobile:
- * slide-over drawer). Header (mark · search icon) · New chat · conversation
- * list in ChatGPT's sections — Pinned, Recents, and a collapsed Archived
+ * slide-over drawer). Header (mark · search icon · collapse icon) · New chat
+ * · conversation list in ChatGPT's sections — Pinned, Recents, and a collapsed Archived
  * disclosure that lazily pulls `?archived=true` — each row carrying the "⋯"
  * menu (rename / pin / archive / export / delete) · theme toggle.
  * No account UI at all: this app has no users to show.
@@ -26,6 +26,7 @@ import {
   IconPin,
   IconPlus,
   IconSearch,
+  IconSidebar,
   IconSun,
   IconX,
 } from './icons';
@@ -179,6 +180,19 @@ export function Sidebar({
           className="rounded-lg p-1.5 text-muted transition-colors duration-ts hover:bg-surface-2 hover:text-ink"
         >
           <IconSearch size={16} />
+        </button>
+        {/* Collapse lives HERE on desktop, ChatGPT-style — right of the search
+            icon, inside the panel it hides. The main header only re-grows a
+            toggle once the sidebar is gone (see ChatApp), so there is never
+            a second copy of this control on screen. */}
+        <button
+          type="button"
+          onClick={onClose}
+          aria-label="Hide sidebar"
+          title="Hide sidebar"
+          className="hidden rounded-lg p-1.5 text-muted transition-colors duration-ts hover:bg-surface-2 hover:text-ink md:block"
+        >
+          <IconSidebar size={16} />
         </button>
         <button
           type="button"

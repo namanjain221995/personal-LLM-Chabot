@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from typing import Awaitable, Callable, List, Optional, Sequence, Tuple
 
 from . import NO_DATA_MESSAGE, recent_turns
@@ -20,7 +21,7 @@ from ..config import settings
 from ..core import chart_decision
 from ..core.chart_pipeline import ChartResult, build_chart
 from ..core.exports import cap_rows, export_csv, export_xlsx, slugify
-from ..core.schema_cache import format_schema, schema_cache
+from ..core.schema_cache import format_schema, relevant_schema, schema_cache
 from ..core.sql_guard import guard_sql
 
 Emit = Callable[[str, dict], Awaitable[None]]
@@ -65,6 +66,11 @@ _SQL_SYSTEM = (
     "- Prefer the column the question names. For Opportunity outcomes use "
     "StageName (e.g. StageName = 'Closed Won'), which carries the wording the "
     "user sees, rather than inferring from a checkbox.\n"
+    # This org's users write dates day-first (03-07-2026 = 3 July 2026). The
+    # local and live engines answering the SAME question with DIFFERENT dates
+    # is exactly the inconsistency that erodes trust in both.
+    "- The user writes dates DAY-MONTH-YEAR: 03-07-2026 or 3/7/2026 means "
+    "3 July 2026, NEVER March 7. Only ISO dates (2026-07-03) are year-first.\n"
     "- Output ONLY the SQL, no explanation, no markdown fence."
 )
 
@@ -114,6 +120,50 @@ async def _ask_sql(
     return extract_sql(raw)
 
 
+class WarehouseBusy(RuntimeError):
+    """The warehouse file is write-locked by the sync-worker right now.
+
+    DuckDB allows one writing process OR many readers; while a sync batch is
+    being written, a read-only connect fails with "Could not set lock". The
+    worker holds the lock per-write (milliseconds) since 2026-08-06, so a
+    short retry almost always clears it — this exception is the residual
+    case, handled by falling back to LIVE Salesforce instead of showing the
+    user a raw IO error.
+    """
+
+
+def _is_lock_error(exc: Exception) -> bool:
+    return "lock" in str(exc).lower()
+
+
+#: How long a chat query waits for the sync-worker's per-write lock.
+_LOCK_WAIT_SECONDS = 4.0
+_LOCK_WAIT_STEP = 0.25
+
+
+def _connect_warehouse(duckdb):
+    deadline = time.monotonic() + _LOCK_WAIT_SECONDS
+    while True:
+        try:
+            return duckdb.connect(
+                settings.duckdb_path,
+                read_only=True,
+                config={
+                    "enable_external_access": False,
+                    "autoinstall_known_extensions": False,
+                    "autoload_known_extensions": False,
+                },
+            )
+        except duckdb.Error as exc:
+            if not _is_lock_error(exc):
+                raise
+            if time.monotonic() >= deadline:
+                raise WarehouseBusy(
+                    "the local warehouse is being refreshed by the sync worker"
+                ) from exc
+            time.sleep(_LOCK_WAIT_STEP)
+
+
 def _execute(sql: str, fetch_cap: int) -> Tuple[List[str], List[list]]:
     import duckdb  # lazy
 
@@ -121,15 +171,7 @@ def _execute(sql: str, fetch_cap: int) -> Tuple[List[str], List[list]]:
     # glob/httpfs table functions would otherwise let a guard-approved SELECT
     # read arbitrary host files or reach the network. With this config DuckDB
     # raises PermissionException for every such function.
-    con = duckdb.connect(
-        settings.duckdb_path,
-        read_only=True,
-        config={
-            "enable_external_access": False,
-            "autoinstall_known_extensions": False,
-            "autoload_known_extensions": False,
-        },
-    )
+    con = _connect_warehouse(duckdb)
     try:
         cur = con.execute(sql)
         columns = [d[0] for d in cur.description or []]
@@ -186,9 +228,20 @@ async def generate_and_run_sql(
 
     Returns (sql, columns, rows). Also reused by the report engine.
     """
-    schema_text = format_schema(schema_cache.get(settings.duckdb_path))
+    try:
+        schema = schema_cache.get(settings.duckdb_path)
+    except Exception as exc:
+        # No schema AND no stale copy — with the file locked there is nothing
+        # to ground a SQL prompt on; the caller answers from live Salesforce.
+        if _is_lock_error(exc):
+            raise WarehouseBusy(str(exc)) from exc
+        raise
+    # The warehouse mirrors the whole org (900+ tables incl. Share/History
+    # shadows and setup objects); ground the prompt on the relevant slice so
+    # the business tables stay prominent. Validation below still accepts any
+    # table that truly exists.
+    schema_text = format_schema(relevant_schema(schema, question))
     cap = fetch_cap if fetch_cap is not None else settings.sql_preview_row_cap + 1
-    schema = schema_cache.get(settings.duckdb_path)
     raw = await _ask_sql(question, schema_text, history)
     if not references_a_known_table(raw, schema):
         # No FROM against anything we hold: the model is inventing a result
@@ -200,6 +253,9 @@ async def generate_and_run_sql(
         sql = guard_sql(raw)
         columns, rows = _execute(sql, cap)
         return sql, columns, rows
+    except WarehouseBusy:
+        # A locked file is not a SQL mistake — retrying the model cannot help.
+        raise
     except Exception as exc:  # one retry on guard/execution error (§8)
         raw2 = await _ask_sql(question, schema_text, history, previous_sql=raw, error=str(exc))
         sql2 = guard_sql(raw2)
@@ -282,8 +338,14 @@ def _narrative_messages(
     ]
 
 
-async def run_sql_engine(message: str, history: Sequence[dict], emit: Emit) -> str:
-    if not os.path.exists(settings.duckdb_path):
+async def run_sql_engine(
+    message: str,
+    history: Sequence[dict],
+    emit: Emit,
+    *,
+    force_live: bool = False,
+) -> str:
+    if not force_live and not os.path.exists(settings.duckdb_path):
         await emit("token", {"text": NO_DATA_MESSAGE})
         await emit("meta", {"route": "sql"})
         return NO_DATA_MESSAGE
@@ -292,29 +354,49 @@ async def run_sql_engine(message: str, history: Sequence[dict], emit: Emit) -> s
     fetch_cap = (settings.export_row_cap + 1) if wants_export else (settings.sql_preview_row_cap + 1)
 
     try:
+        if force_live:
+            # The composer's "Live Salesforce" toggle: every answer comes
+            # straight from the org, whatever the warehouse holds.
+            raise NoSuchTable("the Live Salesforce toggle is on")
         if wants_live_lookup(message):
             # The user asked for live data by name. Skip the warehouse.
             raise NoSuchTable("the user asked for a live Salesforce lookup")
         sql, columns, rows = await generate_and_run_sql(
             message, history=history, fetch_cap=fetch_cap
         )
-    except NoSuchTable:
-        # The warehouse does not carry this object. Ask Salesforce itself
-        # rather than letting the model invent a number for it.
+    except (NoSuchTable, WarehouseBusy) as reason:
+        # Two roads to the same place: the warehouse does not carry this
+        # object (NoSuchTable — ask Salesforce rather than let the model
+        # invent a number), or the warehouse file is briefly write-locked by
+        # the sync worker (WarehouseBusy — the raw "Could not set lock" IO
+        # error used to reach the user's screen here).
         from ..core import salesforce as sf_live
 
+        busy = isinstance(reason, WarehouseBusy)
         if not (settings.sf_live_enabled and sf_live.configured()):
-            text = (
-                "That data is not in the local warehouse, and live Salesforce "
-                "lookups are not configured, so I cannot answer it rather than "
-                "guess. Add the object with "
-                "`python -m syncworker.objects add <Object> --fields ...`."
-            )
+            if busy:
+                text = (
+                    "The local Salesforce copy is being refreshed by the sync "
+                    "worker right now — please try again in a few seconds."
+                )
+            else:
+                text = (
+                    "That data is not in the local warehouse, and live Salesforce "
+                    "lookups are not configured, so I cannot answer it rather than "
+                    "guess. Add the object with "
+                    "`python -m syncworker.objects add <Object> --fields ...`."
+                )
             await emit("token", {"text": text})
             await emit("meta", {"route": "sql"})
             return text
 
-        await emit("status", {"text": "Not in the local copy — asking Salesforce…"})
+        if force_live:
+            status = "Asking Salesforce live…"
+        elif busy:
+            status = "Local copy is being refreshed — asking Salesforce live…"
+        else:
+            status = "Not in the local copy — asking Salesforce…"
+        await emit("status", {"text": status})
         from .live_sf import (describe_rows, fetch_live, fetch_schema,
                               is_schema_question)
 
@@ -350,11 +432,21 @@ async def run_sql_engine(message: str, history: Sequence[dict], emit: Emit) -> s
         try:
             soql, live_rows = await fetch_live(message, history)
         except Exception as exc:
-            text = (
-                "That data is not in the local warehouse and the live "
-                f"Salesforce lookup failed ({exc}). I would rather say so than "
-                "give you a number I did not read."
-            )
+            if force_live:
+                # With the Live toggle on, the warehouse was skipped BY
+                # CHOICE — "not in the local warehouse" would be a lie here.
+                text = (
+                    f"The live Salesforce lookup failed ({exc}). I would "
+                    "rather say so than give you a number I did not read. "
+                    "Turning off Live Salesforce will answer from the "
+                    "synced copy instead."
+                )
+            else:
+                text = (
+                    "That data is not in the local warehouse and the live "
+                    f"Salesforce lookup failed ({exc}). I would rather say so "
+                    "than give you a number I did not read."
+                )
             await emit("token", {"text": text})
             await emit("meta", {"route": "sql"})
             return text

@@ -1,7 +1,7 @@
 'use client';
 
 /**
- * The chat shell (§9 + V2 §4): sidebar + header (title + engine badge) +
+ * The chat shell (§9 + V2 §4): sidebar + bare header (engine badge only) +
  * centered 768px thread + pinned composer. Owns streaming state (token /
  * reasoning / step events), server-backed history (offline cache +
  * one-time migration), per-conversation composer prefs (Salesforce toggle,
@@ -139,24 +139,30 @@ export function ChatApp() {
   // migration → server refresh (V2 §4a/§4b); evict-toast wiring, ?c= deep
   // link, responsive sidebar default.
   useEffect(() => {
-    setEvictListener((dropped) => {
-      toast(
-        `Storage is full — the oldest conversation ("${dropped.title}") was removed to make room.`,
-        'error',
-      );
+    // Only the no-IndexedDB fallback cache can still hit the localStorage
+    // quota; when it trims, say so once — calmly — instead of the old
+    // red-pill-per-conversation cascade. Server copies are unaffected.
+    let lastEvictToast = 0;
+    setEvictListener(() => {
+      const now = Date.now();
+      if (now - lastEvictToast > 60_000) {
+        lastEvictToast = now;
+        toast(
+          'Browser cache is full — oldest cached conversations were trimmed locally. Your chats are safe on the server.',
+        );
+      }
       refreshList();
     });
     refreshList();
 
-    // Reload keeps the open chat: restore ?c= from the cache immediately;
-    // server truth (and any still-running generation) is reconciled below.
+    // Reload keeps the open chat: adopt the ?c= id immediately; its cached
+    // messages render right after the cache hydrates (below), and server
+    // truth (plus any still-running generation) is reconciled after that.
     const wanted = new URLSearchParams(window.location.search).get('c');
     if (wanted) {
       setActiveId(wanted);
       activeIdRef.current = wanted;
       setPrefs(loadPrefs(window.localStorage, wanted));
-      const cached = getHistoryStore().get(wanted);
-      if (cached) setMessages(cached.messages);
     }
 
     if (window.matchMedia('(max-width: 767px)').matches) {
@@ -166,6 +172,16 @@ export function ChatApp() {
     let cancelled = false;
     void (async () => {
       const store = getHistoryStore();
+      // IndexedDB hydration (single-digit ms; instant for the fallback).
+      await store.ready();
+      if (cancelled) return;
+      refreshList();
+      if (wanted && activeIdRef.current === wanted) {
+        const cached = store.get(wanted);
+        if (cached && cached.messages.length > 0 && !isStreaming(wanted)) {
+          setMessages(cached.messages);
+        }
+      }
       // Whatever happens with auth/refresh below, the running-generation
       // check MUST run before the composer unlocks — sending during that gap
       // cancels the detached generation and silently loses its answer.
@@ -838,20 +854,29 @@ export function ChatApp() {
       />
 
       <div className="flex min-w-0 flex-1 flex-col">
+        {/* ChatGPT-parity header: no app name, no chat title. The sidebar owns
+            its own collapse button, so this one only appears once the sidebar
+            is hidden — it is the only way back. The title stays as sr-only
+            text so screen readers still announce which chat is open. */}
         <header className="flex h-[52px] shrink-0 items-center gap-2 px-3">
-          <button
-            type="button"
-            onClick={() => setSidebarOpen((v) => !v)}
-            aria-label={sidebarOpen ? 'Hide sidebar' : 'Show sidebar'}
-            aria-expanded={sidebarOpen}
-            className="rounded-lg p-2 text-muted transition-colors duration-ts hover:bg-surface-2 hover:text-ink"
-          >
-            <IconSidebar size={17} />
-          </button>
-          <h1 className="min-w-0 flex-1 truncate text-sm font-semibold">
-            {activeId ? activeTitle : APP_NAME}
-          </h1>
-          {lastEngine && <EngineBadge engine={lastEngine} size="xs" />}
+          {!sidebarOpen && (
+            <button
+              type="button"
+              onClick={() => setSidebarOpen(true)}
+              aria-label="Show sidebar"
+              aria-expanded={false}
+              title="Show sidebar"
+              className="rounded-lg p-2 text-muted transition-colors duration-ts hover:bg-surface-2 hover:text-ink"
+            >
+              <IconSidebar size={17} />
+            </button>
+          )}
+          <h1 className="sr-only">{activeId ? activeTitle : APP_NAME}</h1>
+          {lastEngine && (
+            <span className="ml-auto">
+              <EngineBadge engine={lastEngine} size="xs" />
+            </span>
+          )}
         </header>
 
         {unreachable && (

@@ -130,9 +130,9 @@ class Settings:
         self.sf_private_key_b64: str = os.environ.get("SF_PRIVATE_KEY_B64", "")
         self.sf_api_version: str = os.environ.get("SF_API_VERSION", "v61.0")
         self.sf_live_timeout: float = float(os.environ.get("SF_LIVE_TIMEOUT", "45"))
-        self.sf_live_enabled: bool = os.environ.get(
-            "SF_LIVE_ENABLED", "true"
-        ).lower() not in ("0", "false", "no")
+        # _bool, not a bespoke not-in list: the old parse treated "off" (and
+        # any typo) as true, silently enabling live lookups.
+        self.sf_live_enabled: bool = _bool("SF_LIVE_ENABLED", True)
         self.model_max_context: int = _int("MODEL_MAX_CONTEXT", 262144)
         self.model_max_output: int = _int("MODEL_MAX_OUTPUT", 8192)
         # Headroom left free in every request (chat-template drift, the

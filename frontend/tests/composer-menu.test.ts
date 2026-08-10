@@ -12,27 +12,46 @@ function prefs(over: Partial<ChatPrefs> = {}): ChatPrefs {
 }
 
 describe('composer "+" menu items', () => {
-  it('offers files, web search and salesforce while salesforce is off', () => {
-    const ids = composerMenuItems({
-      salesforce: false,
-      webSearchOn: false,
-      streaming: false,
-    }).map((i) => i.id);
-    expect(ids).toEqual(['files', 'web-search', 'salesforce']);
+  it('always offers all four rows: files, web, salesforce, live (owner 2026-08-06)', () => {
+    for (const salesforce of [false, true]) {
+      const ids = composerMenuItems({
+        salesforce,
+        sfLive: false,
+        webSearchOn: false,
+        streaming: false,
+      }).map((i) => i.id);
+      expect(ids).toEqual(['files', 'web-search', 'salesforce', 'sf-live']);
+    }
   });
 
-  it('HIDES web search while salesforce is on — that mode never searches', () => {
-    const ids = composerMenuItems({
+  it('warns on the web-search row that activating it turns Salesforce off', () => {
+    const items = composerMenuItems({
       salesforce: true,
+      sfLive: false,
       webSearchOn: false,
       streaming: false,
-    }).map((i) => i.id);
-    expect(ids).toEqual(['files', 'salesforce']);
+    });
+    expect(items.find((i) => i.id === 'web-search')?.hint).toMatch(
+      /turns Salesforce off/,
+    );
+  });
+
+  it('promises on the Live row that it turns Salesforce on when it is off', () => {
+    const items = composerMenuItems({
+      salesforce: false,
+      sfLive: false,
+      webSearchOn: false,
+      streaming: false,
+    });
+    expect(items.find((i) => i.id === 'sf-live')?.hint).toMatch(
+      /turns Salesforce on/,
+    );
   });
 
   it('checks the toggle rows from the prefs, never the files row', () => {
     const items = composerMenuItems({
       salesforce: false,
+      sfLive: false,
       webSearchOn: true,
       streaming: false,
     });
@@ -44,6 +63,7 @@ describe('composer "+" menu items', () => {
   it('disables only the file picker while streaming', () => {
     const items = composerMenuItems({
       salesforce: false,
+      sfLive: false,
       webSearchOn: false,
       streaming: true,
     });
@@ -103,17 +123,18 @@ describe('activating an item', () => {
 });
 
 describe('roving focus skips disabled rows', () => {
-  // Streaming menu (salesforce off): [files: DISABLED, web-search, salesforce]
+  // Streaming menu: [files: DISABLED, web-search, salesforce, sf-live]
   const streaming = composerMenuItems({
     salesforce: false,
+    sfLive: false,
     webSearchOn: false,
     streaming: true,
   });
 
   it('walks past the disabled files row in the direction of travel', () => {
-    // ArrowUp from web-search (1) targets files (0) — dead — lands on 2.
-    expect(nextEnabledIndex(streaming, 0, false)).toBe(2);
-    // ArrowDown wrap from salesforce (2) targets 0 — lands on 1.
+    // ArrowUp from web-search (1) targets files (0) — dead — wraps to 3.
+    expect(nextEnabledIndex(streaming, 0, false)).toBe(3);
+    // ArrowDown wrap from sf-live (3) targets 0 — lands on 1.
     expect(nextEnabledIndex(streaming, 0, true)).toBe(1);
   });
 
@@ -146,5 +167,66 @@ describe('trust footer line', () => {
     expect(trustLine(prefs({ salesforce: false, webSearch: 'on' }))).toMatch(
       /web search is on/,
     );
+  });
+});
+
+describe('Live Salesforce (2026-08-06)', () => {
+  it('shows the Live row unchecked while Salesforce is off', () => {
+    const off = composerMenuItems({
+      salesforce: false,
+      sfLive: true, // stale stored value: must not read as active
+      webSearchOn: false,
+      streaming: false,
+    });
+    const live = off.find((i) => i.id === 'sf-live');
+    expect(live).toBeDefined();
+    expect(live?.checked).toBe(false);
+  });
+
+  it('activating sf-live toggles the pref', () => {
+    const out = activateComposerMenuItem('sf-live', prefs({ salesforce: true }));
+    expect(out.kind).toBe('prefs');
+    if (out.kind === 'prefs') expect(out.prefs.sfLive).toBe(true);
+  });
+
+  it('one click on Live from web mode enters Salesforce mode AND goes live', () => {
+    const out = activateComposerMenuItem(
+      'sf-live',
+      prefs({ salesforce: false, sfLive: false, webSearch: 'on' }),
+    );
+    expect(out).toEqual({
+      kind: 'prefs',
+      prefs: prefs({ salesforce: true, sfLive: true, webSearch: 'auto' }),
+    });
+  });
+
+  it('one click on Web search from Salesforce mode switches modes', () => {
+    const out = activateComposerMenuItem(
+      'web-search',
+      prefs({ salesforce: true, sfLive: true }),
+    );
+    expect(out).toEqual({
+      kind: 'prefs',
+      prefs: prefs({ salesforce: false, sfLive: false, webSearch: 'on' }),
+    });
+  });
+
+  it('turning Salesforce off also turns Live off — no orphaned sub-toggle', () => {
+    const out = activateComposerMenuItem(
+      'salesforce',
+      prefs({ salesforce: true, sfLive: true }),
+    );
+    if (out.kind === 'prefs') {
+      expect(out.prefs.salesforce).toBe(false);
+      expect(out.prefs.sfLive).toBe(false);
+    }
+  });
+
+  it('the trust line is honest about live queries leaving the machine', () => {
+    const live = trustLine(prefs({ salesforce: true, sfLive: true }));
+    expect(live).toContain('live Salesforce org');
+    expect(live).not.toContain('nothing leaves this machine');
+    const synced = trustLine(prefs({ salesforce: true, sfLive: false }));
+    expect(synced).toContain('nothing leaves this machine');
   });
 });

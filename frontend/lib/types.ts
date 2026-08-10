@@ -98,6 +98,13 @@ export interface PastedText {
  * the server-side history round-trip. Unknown future keys pass through JSON
  * untouched — nothing here may throw on extras.
  */
+export interface DocumentActivity {
+  filename: string;
+  total_pages: number;
+  ocr_pages?: number;
+  pages: { page: number; text: string }[];
+}
+
 export interface Meta {
   route: Engine;
   sql?: string;
@@ -127,6 +134,9 @@ export interface Meta {
   reasoning_seconds?: number;
   /** V5: long text/code the user pasted as chips on a user message. */
   pasted?: PastedText[];
+  /** 2026-08-07: what the document engine read — shown in the Activity
+      panel (filename, page count, OCR'd pages, per-page text excerpts). */
+  document?: DocumentActivity;
   /** Phase 1: web-search sources for the answer's [n] citations. */
   sources?: WebSource[];
   /** Phase 1: set when search was requested but unavailable. */

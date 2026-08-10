@@ -103,3 +103,50 @@ def test_normalize_records_makes_values_string_or_none():
     assert records == [
         {"Id": "001A", "IsClosed": "true", "Amount": "1200.5", "Note": None, "Blank": None}
     ]
+
+
+def test_all_null_first_batch_does_not_wedge_the_column(tmp_path):
+    """Live incident (Interview__c.Employment_Type__c): an all-None column in
+    the CREATE TABLE batch let DuckDB resolve the NULL type to INTEGER, and
+    the first real value ('Full Time') then failed EVERY cycle. Staging is
+    now pinned to string dtype, and mistyped columns are healed in place."""
+    store = Store(str(tmp_path / "wh.duckdb"))
+    store.upsert(
+        "Interview__c",
+        _df([{"Id": "a0A1", "Employment_Type__c": None, "SystemModstamp": "t1"}]),
+    )
+    # Would raise ConversionException before the fix:
+    store.upsert(
+        "Interview__c",
+        _df([{"Id": "a0A2", "Employment_Type__c": "Full Time", "SystemModstamp": "t2"}]),
+    )
+    rows = store._con.execute(
+        'SELECT Id, Employment_Type__c FROM "Interview__c" ORDER BY Id'
+    ).fetchall()
+    assert rows == [("a0A1", None), ("a0A2", "Full Time")]
+    store.close()
+
+
+def test_a_pre_existing_mistyped_column_is_healed(tmp_path):
+    """Tables damaged by the old NULL-type inference heal on the next batch."""
+    store = Store(str(tmp_path / "wh.duckdb"))
+    store._con.execute(
+        'CREATE TABLE "Interview__c" (Id VARCHAR, Employment_Type__c INTEGER)'
+    )
+    store._con.execute('INSERT INTO "Interview__c" VALUES (\'a0A1\', NULL)')
+
+    store.upsert(
+        "Interview__c",
+        _df([{"Id": "a0A2", "Employment_Type__c": "Full Time"}]),
+    )
+
+    types = dict(
+        (r[0], r[1])
+        for r in store._con.execute('DESCRIBE "Interview__c"').fetchall()
+    )
+    assert types["Employment_Type__c"] == "VARCHAR"
+    rows = store._con.execute(
+        'SELECT Id, Employment_Type__c FROM "Interview__c" ORDER BY Id'
+    ).fetchall()
+    assert rows == [("a0A1", None), ("a0A2", "Full Time")]
+    store.close()

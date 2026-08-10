@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import csv
 import collections
+import os
 import re
 import sys
 from pathlib import Path
@@ -77,7 +78,11 @@ def _validate(entry: dict) -> None:
     for f in fields + rag:
         if not _IDENT_RE.match(str(f)):
             raise ConfigError(f"invalid field name for {name}: {f!r}")
-    missing = [f for f in REQUIRED_FIELDS if f not in fields]
+    # Entries default to SystemModstamp; an explicit watermark_field names a
+    # fallback timestamp, and an explicit None means full-extract-only.
+    watermark = entry.get("watermark_field", "SystemModstamp")
+    required = ["Id", watermark] if watermark else ["Id"]
+    missing = [f for f in required if f not in fields]
     if missing:
         raise ConfigError(f"{name}: fields must include {', '.join(missing)}")
     orphan = [f for f in rag if f not in fields]
@@ -89,13 +94,14 @@ def _validate(entry: dict) -> None:
         )
 
 
-def _ordered(fields: List[str]) -> List[str]:
-    """Id first, SystemModstamp last, the rest in the order given.
+def _ordered(fields: List[str], watermark: str | None = "SystemModstamp") -> List[str]:
+    """Id first, the watermark field last, the rest in the order given.
 
     Purely cosmetic, but it makes the required pair obvious in a diff.
     """
-    body = [f for f in fields if f not in REQUIRED_FIELDS]
-    return ["Id", *body, "SystemModstamp"]
+    ends = {"Id", watermark} if watermark else {"Id"}
+    body = [f for f in fields if f not in ends]
+    return ["Id", *body, *( [watermark] if watermark else [] )]
 
 
 def _dedupe(items) -> List[str]:
@@ -160,29 +166,65 @@ def save(header: str, objects: List[dict], path: Path = DEFAULT_CONFIG) -> None:
 #: They are silently dropped rather than failing an entire object.
 COMPOUND_TYPES = ("address", "location")
 
+#: The Bulk API cannot return blob content in CSV results.
+BINARY_TYPES = ("base64",)
+
+#: Classic encrypted fields hold credentials (passwords, SSNs). A warehouse
+#: an LLM queries freely is exactly where those must never land, so they are
+#: refused at import rather than trusted to field-level security.
+SECRET_TYPES = ("encryptedstring",)
+
+
+def is_credential_field(name: str) -> bool:
+    """Credential fields that hide behind a plain string type.
+
+    The candidate portal stores passwords in Password__c typed `string`, so
+    no type filter can catch it. Deliberately narrow — exact 'Password' or a
+    '*Password__c' suffix — so flags like PermissionsPasswordNeverExpires and
+    meeting passcodes (shared join codes, not credentials) stay syncable.
+    """
+    lowered = name.lower()
+    return lowered == "password" or lowered.endswith("password__c")
+
 #: Long-text types worth chunking and embedding for semantic search.
 LONG_TEXT_TYPES = ("textarea", "richtextarea")
 
-#: Beyond this, a single object's SOQL SELECT gets unwieldy and the sync slows
-#: for fields nobody asked about. Ranked by usefulness, not truncated blindly.
-MAX_FIELDS_PER_OBJECT = 60
+#: Ceiling per object, as a guard against a runaway import — above even the
+#: permission objects (PermissionSetLicense: 652) so nothing real is cut.
+MAX_FIELDS_PER_OBJECT = 4000
+
+#: Incremental-sync timestamp, in preference order. SystemModstamp where it
+#: exists; Share/History/Feed shadows and some setup objects only carry
+#: LastModifiedDate or CreatedDate. Objects with none sync full every cycle.
+WATERMARK_CANDIDATES = ("SystemModstamp", "LastModifiedDate", "CreatedDate")
 
 
 def parse_sheet(path: Path) -> Dict[str, List[str]]:
-    """Read an "Objects, Fields" CSV into {object: [fields]}.
+    """Read an objects/fields CSV into {object: [fields]}.
 
-    The object name appears only on its first row and the rest are blank, so
-    the name is carried down. Blank field cells (wrapped long names) are
-    skipped rather than becoming empty entries.
+    Two layouts are accepted, told apart by the header row:
+
+    - the two-column "Objects, Fields" sheet, where the object name appears
+      only on its first row and the rest are blank, so it is carried down;
+    - a full org export ("Object API Name, Object Label, Field API Name,
+      Field Label, Field Type"), where every row repeats the object name.
+      Columns are located by header, so extra columns and order don't matter.
+
+    Blank field cells (wrapped long names) are skipped rather than becoming
+    empty entries.
     """
     out: Dict[str, List[str]] = collections.OrderedDict()
     current = None
     with open(path, newline="", encoding="utf-8-sig") as fh:
         reader = csv.reader(fh)
-        next(reader, None)  # header
+        header = [(c or "").strip().lower() for c in next(reader, [])]
+        obj_col, field_col = 0, 1
+        if "object api name" in header and "field api name" in header:
+            obj_col = header.index("object api name")
+            field_col = header.index("field api name")
         for row in reader:
-            name = (row[0] or "").strip() if row else ""
-            field = (row[1] or "").strip() if len(row) > 1 else ""
+            name = (row[obj_col] or "").strip() if len(row) > obj_col else ""
+            field = (row[field_col] or "").strip() if len(row) > field_col else ""
             if name:
                 current = name
                 out.setdefault(current, [])
@@ -228,14 +270,22 @@ def plan_from_sheet(
             notes.append(f"{name}: not readable by this user — skipped")
             continue
         by_name = {f["name"]: f for f in meta.get("fields", [])}
+        watermark = next((w for w in WATERMARK_CANDIDATES if w in by_name), None)
+        if watermark is None:
+            notes.append(
+                f"{name}: no timestamp field at all — will FULL-extract "
+                "every cycle"
+            )
 
-        keep, blocked, compound = [], [], []
+        keep, blocked, compound, secret = [], [], [], []
         for f in wanted:
             info = by_name.get(f)
             if info is None:
                 blocked.append(f)
-            elif info.get("type") in COMPOUND_TYPES:
+            elif info.get("type") in COMPOUND_TYPES + BINARY_TYPES:
                 compound.append(f)
+            elif info.get("type") in SECRET_TYPES or is_credential_field(f):
+                secret.append(f)
             else:
                 keep.append(f)
 
@@ -258,11 +308,18 @@ def plan_from_sheet(
         if blocked:
             notes.append(f"{name}: {len(blocked)} field(s) not visible to this user")
         if compound:
-            notes.append(f"{name}: {len(compound)} compound field(s) unsupported by the Bulk API")
+            notes.append(f"{name}: {len(compound)} compound/binary field(s) unsupported by the Bulk API")
+        if secret:
+            notes.append(f"{name}: {len(secret)} encrypted credential field(s) excluded: {', '.join(secret)}")
 
-        entry = {"name": name, "fields": _ordered(_dedupe([*REQUIRED_FIELDS, *keep]))}
+        required = ["Id", watermark] if watermark else ["Id"]
+        entry = {"name": name,
+                 "fields": _ordered(_dedupe([*required, *keep]), watermark)}
         if rag:
             entry["rag_fields"] = rag
+        if watermark != "SystemModstamp":
+            # Only the exceptions are written out; absence means the default.
+            entry["watermark_field"] = watermark
         _validate(entry)
         entries.append(entry)
     return entries, notes
@@ -327,6 +384,16 @@ def main(argv=None) -> int:
                           help="stop syncing an object")
     p_rm.add_argument("name")
 
+    p_resync = sub.add_parser(
+        "resync", parents=[common],
+        help="clear an object's watermark so its next cycle is a FULL "
+             "extract — backfills newly added fields for ALL records and "
+             "reconciles deletes exactly")
+    p_resync.add_argument("name")
+    p_resync.add_argument(
+        "--duckdb", default=os.environ.get("DUCKDB_PATH", "/data/warehouse.duckdb"),
+        help="warehouse path (defaults to $DUCKDB_PATH)")
+
     p_imp = sub.add_parser(
         "import-sheet", parents=[common],
         help="build the config from an 'Objects, Fields' CSV, keeping only "
@@ -338,6 +405,9 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     try:
+        if args.command == "resync":
+            return _resync_watermark(args.name, args.duckdb)
+
         header, objects = load(args.config)
 
         if args.command == "list":
@@ -382,12 +452,49 @@ def main(argv=None) -> int:
         print("  Restart the sync worker to apply:")
         print("    docker compose up -d --force-recreate sync-worker")
         if args.command != "remove":
-            print("  The next cycle does a FULL extract for changed objects, then "
-                  "returns to incremental syncs.")
+            # Honest about incremental semantics: the watermark survives config
+            # edits, so newly added fields only fill in for records modified
+            # AFTER the change. A resync forces the full backfill.
+            print("  NOTE: a brand-new object gets a FULL extract; an object that "
+                  "was synced before continues INCREMENTALLY, so newly added "
+                  "fields stay empty for historical records.")
+            print(f"  To backfill every record, force a full extract with:")
+            print(f"    docker compose exec sync-worker python -m syncworker.objects "
+                  f"resync {args.name if args.command != 'import-sheet' else '<Object>'}")
         return 0
     except ConfigError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+
+
+def _resync_watermark(object_name: str, duckdb_path: str) -> int:
+    """Clear one object's watermark so its next sync is a FULL extract.
+
+    Runs against the warehouse file, so it must run where that file lives
+    (inside the sync-worker container). DuckDB allows a single writer: while
+    a sync cycle holds the connection this fails — retry between cycles.
+    """
+    from .storage import Store
+
+    try:
+        store = Store(duckdb_path)
+    except Exception as exc:
+        print(f"error: cannot open {duckdb_path} ({exc}).\n"
+              "If a sync cycle is running, wait for it to finish and retry.",
+              file=sys.stderr)
+        return 2
+    try:
+        had = store.get_watermark(object_name) is not None
+        store.clear_watermark(object_name)
+    finally:
+        store.close()
+    if had:
+        print(f"  {object_name}: watermark cleared — the next cycle runs a "
+              "FULL extract (backfills all fields, reconciles deletes).")
+    else:
+        print(f"  {object_name}: no watermark was set — the next cycle was "
+              "already going to run a FULL extract.")
+    return 0
 
 
 if __name__ == "__main__":  # pragma: no cover
