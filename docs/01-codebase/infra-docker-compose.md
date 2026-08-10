@@ -1,5 +1,13 @@
 # Infrastructure — Docker Compose, images, build contexts
 
+> **⚠ Superseded in part (2026-08-10).** The app-state layer described below was
+> `/data/app.sqlite3` (stdlib `sqlite3`). It is now PostgreSQL — see
+> [`data-model.md`](data-model.md) and the CHANGELOG entry
+> "App state moved from SQLite to PostgreSQL". Every `sqlite3` reference,
+> `db.py` line number and finding about SQLite locking below is a snapshot of
+> the pre-migration code and has NOT been re-derived. The DuckDB warehouse and
+> LanceDB sections are unaffected and remain accurate.
+
 The entire platform is one 355-line compose file
 ([`docker-compose.yml`](../../docker-compose.yml)): 4 vLLM model servers, the FastAPI orchestrator,
 the Salesforce sync worker, SearXNG and the Next.js frontend. Project name `sf-local-ai`

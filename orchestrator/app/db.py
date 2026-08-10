@@ -1,249 +1,677 @@
-"""App-state SQLite store (V2-DESIGN §3c): users, conversations, messages.
+"""App-state PostgreSQL store (V2-DESIGN §3c): users, conversations, messages.
 
-Stdlib sqlite3 at APP_DB_PATH (/data/app.sqlite3 in compose), WAL mode. This
-is APP state only — the DuckDB/LanceDB-only rule applies to the ANALYTICS
-data plane; history/auth use SQLite per the v1 spec's planned "SQLite swap".
+PostgreSQL since 2026-08-10; this module used to be stdlib `sqlite3` against
+`/data/app.sqlite3`. This is APP state only — the DuckDB/LanceDB-only rule
+still applies to the ANALYTICS data plane, and DuckDB is deliberately NOT
+migrated: it is a columnar engine and beats PostgreSQL at the scan-and-
+aggregate queries the SQL engine writes.
 
-Connections are short-lived (one per operation) — simple and correct for a
-LAN tool; WAL keeps readers and writers from blocking each other. Nothing
-here touches the database at import time.
+WHAT THE MOVE ACTUALLY BOUGHT, measured on this box against the live database
+(378 messages) — including where it costs rather than saves, because most of
+the obvious claims do not survive a benchmark:
+
+  * WRITES: `add_message` 8.5 ms -> 2.8 ms, on the critical path of every chat
+    turn. Real, but read the baseline carefully before believing the ratio.
+    The SQLite code set `journal_mode=WAL` and never set `synchronous`, so it
+    ran at the default FULL: one fsync per commit, measured here as 3.48 ms of
+    a 3.49 ms write — literally 100% of the cost. At EQUAL durability the two
+    engines are close (SQLite FULL 3.5 ms vs PostgreSQL `synchronous_commit=on`
+    2.8 ms). Drop durability on either side and SQLite wins by a mile
+    (`synchronous=NORMAL` is 0.010 ms; `synchronous_commit=off` is ~0.4 ms).
+    So: this is a win over the code as it was, not evidence that PostgreSQL
+    writes faster.
+  * CONCURRENCY: this is the durable win. SQLite serialises writers behind a
+    5 s busy timeout, and two tabs finalising the same answer surfaced that as
+    an HTTP 500. MVCC removes the failure mode outright, and it is why the
+    write path can now be offloaded to a threadpool at all.
+  * PER-OPERATION OVERHEAD: `connect()` ran 15 `CREATE … IF NOT EXISTS`
+    statements plus the whole `migrate()` path — including an unconditional
+    full-table DELETE — on every one of its 34 call sites. That is gone. But a
+    pooled checkout is 0.07-0.27 ms against SQLite's 0.24 ms of replay, so this
+    nets out roughly even; the real gain is that an O(messages) DELETE no
+    longer runs on every single database operation.
+  * SMALL READS: 0.26 ms -> 0.37 ms, i.e. slightly SLOWER. An in-process file
+    read has no round trip to beat. Both are far below anything perceivable.
+  * SEARCH: it depends on the needle, and the honest summary is "no better at
+    this size". Measured at 200,000 messages / 10,000 conversations: a
+    selective term is 2.5 ms here versus ~19 ms for SQLite's linear scan, but a
+    term matching most rows is 80 ms here versus 19 ms — trigram indexes cannot
+    help when everything matches. At the live 378 messages SQLite is 2-6x
+    faster on every search shape. See `_SEARCH_SQL` and `recall_conversations`.
+
+In short: this migration is worth it for concurrency, real types, and a schema
+that no longer rebuilds itself on every query — not for raw single-user speed
+at the current data size.
+
+WHAT DID NOT CHANGE: every public function keeps its name, signature and
+return shape, so the ~24 call sites and the test-suite seams are untouched.
+Rows are `dict` (psycopg's `dict_row`), which supports `row["col"]` and
+`dict(row)` exactly as `sqlite3.Row` did. Timestamps are stored as
+`timestamptz` but still leave this module as the same ISO-8601 strings the
+frontend has always parsed.
+
+Nothing here touches the database at import time.
 """
 from __future__ import annotations
 
+import functools
 import json
-import sqlite3
-from contextlib import closing
+import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional, TypeVar
+
+import psycopg
+from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
+from psycopg_pool import ConnectionPool
 
 from .config import settings
 
-_SCHEMA = """
+# Driver-neutral aliases so callers never import psycopg. `history.py` and
+# `auth.py` catch db.IntegrityError; swapping drivers again would only touch
+# these three lines.
+Error = psycopg.Error
+IntegrityError = psycopg.errors.IntegrityError
+UniqueViolation = psycopg.errors.UniqueViolation
+OperationalError = psycopg.OperationalError
+
+# ---------------------------------------------------------------------------
+# Schema — versioned migrations, applied once at startup (see init_schema).
+#
+# The old policy was "additive ALTER only, evaluated on every connection".
+# The additive-only *intent* is unchanged and matters more than ever now that
+# the live database holds the owner's real conversations; what changed is that
+# a numbered, recorded migration cannot silently re-run a destructive repair
+# the way the old `migrate()` re-ran its de-duplicating DELETE forever.
+# ---------------------------------------------------------------------------
+
+_MIGRATION_V1 = """
+-- Trigram indexes are what make the history search sub-linear; without this
+-- extension every LIKE '%needle%' is a sequential scan, exactly as in SQLite.
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
 CREATE TABLE IF NOT EXISTS users (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    username      TEXT NOT NULL UNIQUE COLLATE NOCASE,
-    password_hash TEXT NOT NULL,
-    created_at    TEXT NOT NULL
+    id            integer     GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    username      text        NOT NULL,
+    password_hash text        NOT NULL,
+    created_at    timestamptz NOT NULL
 );
+-- SQLite spelled this `UNIQUE COLLATE NOCASE`. PostgreSQL's equivalent is a
+-- unique index on the folded value: `citext` is discouraged upstream (it is a
+-- deterministic-collation hack that breaks on some ICU locales) and a
+-- non-deterministic collation would disable pattern matching on the column.
+CREATE UNIQUE INDEX IF NOT EXISTS users_username_lower_key ON users (lower(username));
+
 CREATE TABLE IF NOT EXISTS conversations (
-    id         TEXT PRIMARY KEY,
-    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    title      TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    pinned     INTEGER NOT NULL DEFAULT 0,
-    archived   INTEGER NOT NULL DEFAULT 0
+    id         text        PRIMARY KEY,   -- client-supplied
+    user_id    integer     NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    title      text        NOT NULL,
+    created_at timestamptz NOT NULL,
+    updated_at timestamptz NOT NULL,
+    pinned     boolean     NOT NULL DEFAULT false,
+    archived   boolean     NOT NULL DEFAULT false,
+    -- Insertion order. SQLite got this free from `rowid`, which the sidebar
+    -- ordering used as its final tiebreak; PostgreSQL has no such column, and
+    -- without one two conversations created in the same microsecond sort
+    -- non-deterministically between page loads.
+    seq        bigint      GENERATED BY DEFAULT AS IDENTITY
 );
+CREATE INDEX IF NOT EXISTS idx_conversations_user
+    ON conversations (user_id, pinned DESC, updated_at DESC, seq DESC);
+CREATE INDEX IF NOT EXISTS idx_conversations_title_trgm
+    ON conversations USING gin (title gin_trgm_ops);
+
 CREATE TABLE IF NOT EXISTS messages (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-    role            TEXT NOT NULL,
-    content         TEXT NOT NULL,
-    meta            TEXT,
-    created_at      TEXT NOT NULL,
+    id              bigint      GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    conversation_id text        NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    role            text        NOT NULL,
+    content         text        NOT NULL,
+    -- jsonb, not text: psycopg adapts dict <-> jsonb directly, which deletes
+    -- the json.dumps/json.loads pair this column used to need.
+    meta            jsonb,
+    created_at      timestamptz NOT NULL,
     -- Idempotency key for one model generation. Several clients can be
     -- attached to the same detached generation (a second browser joining a
     -- running answer); each would otherwise persist its own copy of the same
     -- reply. Appends carrying a generation_id already present in the
     -- conversation are no-ops.
-    generation_id   TEXT
+    generation_id   text
 );
+CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages (conversation_id, id);
+-- One message per generation, enforced in the DATABASE. Two browser tabs
+-- attached to the same detached answer append at the same moment, so an
+-- application-level "select then insert" check loses the race.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_generation
+    ON messages (conversation_id, generation_id) WHERE generation_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_messages_content_trgm
+    ON messages USING gin (content gin_trgm_ops);
+
 -- Phase A: one rolling summary per conversation. Its own table, not a column
 -- on `conversations`, so writing a summary never touches the row the sidebar
 -- orders by (updated_at).
 CREATE TABLE IF NOT EXISTS conversation_summaries (
-    conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
-    summary         TEXT NOT NULL,
+    conversation_id text        PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+    summary         text        NOT NULL,
     -- COUNT of leading messages already folded in. A count (not a row id)
     -- because a request's turns arrive from the client, which has no server
     -- ids; it makes folding idempotent — only messages beyond it are ever
     -- folded, so a crash mid-compact can neither double-fold nor skip.
-    covers_through  INTEGER NOT NULL,
-    token_estimate  INTEGER NOT NULL,
-    updated_at      TEXT NOT NULL
+    covers_through  integer     NOT NULL,
+    token_estimate  integer     NOT NULL,
+    updated_at      timestamptz NOT NULL
 );
+
 -- Phase B: embedded chunks of FOLDED turns, so detail the summary dropped can
 -- still be retrieved. Scoped per conversation — the WHERE clause is what
 -- enforces session isolation.
 CREATE TABLE IF NOT EXISTS conversation_chunks (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-    ordinal         INTEGER NOT NULL,
-    role            TEXT NOT NULL,
-    text            TEXT NOT NULL,
-    embedding       BLOB NOT NULL,
-    created_at      TEXT NOT NULL,
-    UNIQUE(conversation_id, ordinal)
+    id              bigint      GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    conversation_id text        NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    ordinal         bigint      NOT NULL,
+    role            text        NOT NULL,
+    text            text        NOT NULL,
+    -- bytea, holding the same packed float32 bytes recall.py already writes.
+    -- Deliberately NOT pgvector: the only read path is a brute-force cosine
+    -- over ONE conversation's chunks, which is microseconds, so an ANN index
+    -- would add an extension dependency for nothing.
+    embedding       bytea       NOT NULL,
+    created_at      timestamptz NOT NULL,
+    UNIQUE (conversation_id, ordinal)
 );
-CREATE INDEX IF NOT EXISTS idx_conversation_chunks_conv
-    ON conversation_chunks(conversation_id, ordinal);
+
 -- Phase 4: uploaded datasets. The PROFILE lives here, not the bytes, so a
 -- conversation keeps answering questions after the workspace TTL has swept
 -- the extracted files away.
 CREATE TABLE IF NOT EXISTS uploads (
-    id              TEXT PRIMARY KEY,
-    conversation_id TEXT NOT NULL,
-    filename        TEXT NOT NULL,
-    bytes           INTEGER NOT NULL,
-    status          TEXT NOT NULL,
-    profile         TEXT,
-    notes           TEXT,
-    created_at      TEXT NOT NULL
+    id              text        PRIMARY KEY,
+    conversation_id text        NOT NULL,
+    filename        text        NOT NULL,
+    bytes           bigint      NOT NULL,
+    status          text        NOT NULL,
+    profile         jsonb,
+    notes           text,
+    created_at      timestamptz NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_uploads_conversation
-    ON uploads(conversation_id, created_at);
-CREATE INDEX IF NOT EXISTS idx_conversations_user
-    ON conversations(user_id, updated_at DESC);
-CREATE INDEX IF NOT EXISTS idx_messages_conversation
-    ON messages(conversation_id, id);
+CREATE INDEX IF NOT EXISTS idx_uploads_conversation ON uploads (conversation_id, created_at);
+
 -- Phase 2: pages fetched for a conversation, so follow-up questions about the
 -- same URL are answered from stored content without re-fetching.
 CREATE TABLE IF NOT EXISTS url_documents (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    conversation_id TEXT NOT NULL,
-    url             TEXT NOT NULL,
-    title           TEXT NOT NULL,
-    text            TEXT NOT NULL,
-    fetched_at      TEXT NOT NULL,
-    UNIQUE(conversation_id, url)
+    id              bigint      GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    conversation_id text        NOT NULL,
+    url             text        NOT NULL,
+    title           text        NOT NULL,
+    text            text        NOT NULL,
+    fetched_at      timestamptz NOT NULL,
+    UNIQUE (conversation_id, url)
 );
-CREATE INDEX IF NOT EXISTS idx_url_documents_conv
-    ON url_documents(conversation_id, id);
+CREATE INDEX IF NOT EXISTS idx_url_documents_conv ON url_documents (conversation_id, id);
+
 -- 2026-08-07: full text of uploaded documents (PDF/DOCX/plain), stored per
 -- conversation so EVERY later turn can reference them — the file itself was
 -- only ever sent on the turn it was attached, and the model forgot it after.
 CREATE TABLE IF NOT EXISTS documents (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    conversation_id TEXT NOT NULL,
-    filename        TEXT NOT NULL,
-    text            TEXT NOT NULL,
-    total_pages     INTEGER NOT NULL DEFAULT 0,
-    created_at      TEXT NOT NULL,
-    UNIQUE(conversation_id, filename)
+    id              bigint      GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    conversation_id text        NOT NULL,
+    filename        text        NOT NULL,
+    text            text        NOT NULL,
+    total_pages     integer     NOT NULL DEFAULT 0,
+    created_at      timestamptz NOT NULL,
+    UNIQUE (conversation_id, filename)
 );
-CREATE INDEX IF NOT EXISTS idx_documents_conv
-    ON documents(conversation_id, id);
+CREATE INDEX IF NOT EXISTS idx_documents_conv ON documents (conversation_id, id);
+
 -- Phase 3: cloned+indexed GitHub repos and their code chunks (per conversation).
 CREATE TABLE IF NOT EXISTS repos (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    conversation_id TEXT NOT NULL,
-    repo_key        TEXT NOT NULL,
-    url             TEXT NOT NULL,
-    sha             TEXT NOT NULL,
-    cloned_at       TEXT NOT NULL,
-    UNIQUE(conversation_id, repo_key)
+    id              bigint      GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    conversation_id text        NOT NULL,
+    repo_key        text        NOT NULL,
+    url             text        NOT NULL,
+    sha             text        NOT NULL,
+    cloned_at       timestamptz NOT NULL,
+    UNIQUE (conversation_id, repo_key)
 );
 CREATE TABLE IF NOT EXISTS repo_chunks (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    conversation_id TEXT NOT NULL,
-    repo_key        TEXT NOT NULL,
-    path            TEXT NOT NULL,
-    start_line      INTEGER NOT NULL,
-    end_line        INTEGER NOT NULL,
-    text            TEXT NOT NULL
+    id              bigint  GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    conversation_id text    NOT NULL,
+    repo_key        text    NOT NULL,
+    path            text    NOT NULL,
+    start_line      integer NOT NULL,
+    end_line        integer NOT NULL,
+    text            text    NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_repo_chunks_conv
-    ON repo_chunks(conversation_id, repo_key, id);
+CREATE INDEX IF NOT EXISTS idx_repo_chunks_conv ON repo_chunks (conversation_id, repo_key, id);
+CREATE INDEX IF NOT EXISTS idx_repo_chunks_text_trgm ON repo_chunks USING gin (text gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_repo_chunks_path_trgm ON repo_chunks USING gin (path gin_trgm_ops);
 """
 
+_MIGRATION_V2 = """
+-- Measured on the live database after a day of use (pg_stat_user_indexes):
+--
+--   idx_messages_content_trgm      798 scans   2872 kB   <- earns its keep
+--   idx_repo_chunks_text_trgm        0 scans   7608 kB
+--   idx_repo_chunks_path_trgm        0 scans   1136 kB
+--   idx_conversations_title_trgm     0 scans    112 kB
+--
+-- The three unused ones were speculative. search_repo_chunks always filters
+-- `conversation_id = ?` first, which is far more selective than any trigram
+-- match, so the planner takes idx_repo_chunks_conv and never looks at them —
+-- while a repo index writes thousands of rows through COPY in one go, and a
+-- GIN index bigger than the table it covers makes that materially slower.
+-- The title index loses to a sequential scan of a table this narrow.
+DROP INDEX IF EXISTS idx_repo_chunks_text_trgm;
+DROP INDEX IF EXISTS idx_repo_chunks_path_trgm;
+DROP INDEX IF EXISTS idx_conversations_title_trgm;
 
-# V3-DESIGN §1: columns added to `conversations` after V2 shipped. The live DB
-# holds the owner's real conversations, so the only permitted migration step is
-# ALTER TABLE ... ADD COLUMN, and only when the column is missing — never a
-# DROP, never a CREATE ... AS SELECT rewrite, never a row update.
-_ADDED_CONVERSATION_COLUMNS = (
-    ("pinned", "INTEGER NOT NULL DEFAULT 0"),
-    ("archived", "INTEGER NOT NULL DEFAULT 0"),
-)
+-- The sidebar's query is `WHERE user_id = ? AND archived = ?`, but `archived`
+-- was not in the index, so EXPLAIN showed `Index Cond: (user_id = 1)` followed
+-- by `Filter: (NOT archived)` — every one of the user's conversations read and
+-- then discarded. Putting `archived` second makes it an index condition.
+-- Only one index, deliberately: `updated_at` is bumped on every appended
+-- message, so each extra index containing it is paid for on every turn.
+DROP INDEX IF EXISTS idx_conversations_user;
+CREATE INDEX IF NOT EXISTS idx_conversations_user
+    ON conversations (user_id, archived, pinned DESC, updated_at DESC, seq DESC);
+"""
 
-_ADDED_MESSAGE_COLUMNS = (("generation_id", "TEXT"),)
+_MIGRATION_V3 = """
+-- Per-message thumbs (owner request 2026-08-11). Lives ON the message rather
+-- than in a side table: there is one user, no audit requirement, and "with the
+-- chat" is exactly what was asked for — so it cascades with the conversation,
+-- comes back in the same SELECT the thread already does, and cannot drift out
+-- of sync with the message it describes.
+--
+-- Until now this was localStorage only, which had a bug nobody had noticed:
+-- the browser keys feedback by a client-side message id, and a message
+-- rehydrated from the server is keyed positionally instead
+-- (`srv-<conversation>-<index>`), so a thumb given to a fresh reply was LOST
+-- on the next reload. Making the server the source of truth fixes that.
+--
+-- NULL means "no opinion" — the common case, and cheap: a nullable text column
+-- costs nothing per row until it is set.
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS feedback text;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS feedback_at timestamptz;
+
+-- The constraint is the point: without it a typo'd client could write "thumbs
+-- up", "1" or "" and every consumer would need to defend against it.
+ALTER TABLE messages DROP CONSTRAINT IF EXISTS messages_feedback_check;
+ALTER TABLE messages ADD CONSTRAINT messages_feedback_check
+    CHECK (feedback IS NULL OR feedback IN ('up', 'down'));
+
+-- Partial: only the handful of rated messages are indexed, so "show me
+-- everything I disliked" stays fast without taxing every INSERT.
+CREATE INDEX IF NOT EXISTS idx_messages_feedback
+    ON messages (conversation_id, id) WHERE feedback IS NOT NULL;
+"""
+
+#: (version, DDL). Append only; never edit a version that has shipped.
+#:
+#: NOTE on `uploads`, `url_documents`, `documents`, `repos` and `repo_chunks`:
+#: these keep `conversation_id` as a plain column with NO foreign key, exactly
+#: as under SQLite — deliberately. `/chat` supports a bare API call that has no
+#: `conversations` row at all (`conv_key = conversation_id or session_id`,
+#: main.py), and a foreign key would turn "this chat fetched a URL" into a
+#: failed answer for those callers. DATA-03 — the permanent orphaning of that
+#: content when a conversation is deleted — is fixed in `delete_conversation`,
+#: which now removes the side rows explicitly in the same transaction.
+_MIGRATIONS: tuple = ((1, _MIGRATION_V1), (2, _MIGRATION_V2), (3, _MIGRATION_V3))
+
+_MIGRATION_TABLE = """
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version    integer     PRIMARY KEY,
+    applied_at timestamptz NOT NULL DEFAULT now()
+);
+"""
+
+#: Any 64-bit constant; it only has to be stable and not collide with another
+#: advisory lock in this database. Two orchestrators starting together take it
+#: in turn instead of racing to CREATE the same index.
+_MIGRATION_LOCK_KEY = 0x5346_4149_4442
+
+
+# ---------------------------------------------------------------------------
+# Connection pool
+# ---------------------------------------------------------------------------
+
+_pool: Optional[ConnectionPool] = None
+_pool_lock = threading.Lock()
+_pool_dsn: Optional[str] = None
+
+
+def _server_options() -> str:
+    """libpq `options`, applied to every connection the pool opens.
+
+    - `timezone=UTC` is load-bearing, not hygiene: a `timestamptz` renders in
+      the session time zone, and every timestamp this module returns is
+      `datetime.isoformat()`. Any other zone would silently change the strings
+      the frontend and the tests have always seen.
+    - `statement_timeout` is the bound SQLite never had; an unbounded query
+      used to hold a request open indefinitely.
+    - `idle_in_transaction_session_timeout` stops a leaked transaction from
+      pinning a pooled connection (and holding back vacuum) forever.
+    """
+    return (
+        "-c timezone=UTC"
+        f" -c statement_timeout={int(settings.app_db_statement_timeout_ms)}"
+        " -c idle_in_transaction_session_timeout=60000"
+    )
+
+
+def dsn() -> str:
+    """The configured DSN, or a loud failure.
+
+    No localhost default on purpose: a silent fallback is how a deploy ends up
+    writing history into a database nobody can find.
+    """
+    configured = (settings.app_database_url or "").strip()
+    if not configured:
+        raise RuntimeError(
+            "APP_DATABASE_URL is not set — the app-state database is PostgreSQL "
+            "since 2026-08-10. Example: "
+            "postgresql://techsara:<password>@postgres:5432/techsara"
+        )
+    return configured
+
+
+def pool() -> ConnectionPool:
+    """The process-wide connection pool, opened on first use.
+
+    Rebuilt when `settings.app_database_url` changes, which is what lets the
+    test suite point each test at its own database.
+    """
+    global _pool, _pool_dsn
+    wanted = dsn()
+    if _pool is not None and _pool_dsn == wanted and not _pool.closed:
+        return _pool
+    with _pool_lock:
+        if _pool is not None and _pool_dsn == wanted and not _pool.closed:
+            return _pool
+        if _pool is not None:
+            _close_pool_locked()
+        created = ConnectionPool(
+            conninfo=wanted,
+            min_size=max(0, int(settings.app_db_pool_min)),
+            max_size=max(1, int(settings.app_db_pool_max)),
+            timeout=float(settings.app_db_pool_timeout),
+            # A pooled connection outlives the server it was opened against.
+            # Without a liveness check the first request after a `docker
+            # compose restart postgres` fails; with it, the pool quietly
+            # replaces the dead connection.
+            check=ConnectionPool.check_connection,
+            kwargs={
+                "row_factory": dict_row,
+                "autocommit": False,
+                "options": _server_options(),
+            },
+            name="app-state",
+            open=False,
+        )
+        created.open(wait=True, timeout=float(settings.app_db_pool_timeout))
+        _pool, _pool_dsn = created, wanted
+        return _pool
+
+
+def _close_pool_locked() -> None:
+    global _pool, _pool_dsn
+    if _pool is not None:
+        try:
+            _pool.close()
+        except Exception:  # noqa: BLE001 — shutdown must not raise
+            pass
+    _pool, _pool_dsn = None, None
+
+
+def close_pool() -> None:
+    """Release every pooled connection (app shutdown, and between tests)."""
+    with _pool_lock:
+        _close_pool_locked()
+
+
+@contextmanager
+def connection() -> Iterator[psycopg.Connection]:
+    """A pooled connection wrapped in one transaction.
+
+    Commits on a clean exit, rolls back on an exception, and returns the
+    connection to the pool either way — the direct replacement for the old
+    `with closing(connect()) as con, con:` idiom, minus the 0.24 ms of schema
+    replay that used to precede it.
+    """
+    with pool().connection() as con:
+        yield con
+
+
+T = TypeVar("T")
+
+
+async def run_in_thread(fn: Callable[..., T], *args: Any, **kwargs: Any) -> T:
+    """Await a blocking accessor from `async def` without stalling the loop.
+
+    Every function in this module is synchronous by design: `history.py`'s
+    routes are plain `def` and FastAPI already runs those in the threadpool,
+    and making the module async would have coloured all 39 functions plus
+    every test. The handful of genuinely async callers (`main.py`,
+    `compaction.py`, the engines) use this instead — one `await` per call site
+    rather than a rewrite, and the event loop stays free to pump the other
+    in-flight SSE streams.
+    """
+    import anyio  # local: keeps this module importable without a running loop
+
+    return await anyio.to_thread.run_sync(functools.partial(fn, *args, **kwargs))
+
+
+# ---------------------------------------------------------------------------
+# Schema application
+# ---------------------------------------------------------------------------
+
+
+def wait_for_database(timeout: Optional[float] = None) -> None:
+    """Block until PostgreSQL accepts a connection, or give up after `timeout`.
+
+    THIS EXISTS FOR REBOOTS. `depends_on: service_healthy` only orders
+    `docker compose up`; when the Docker daemon brings containers back after a
+    power cut it starts them all at once and honours no such ordering. Without
+    this, the orchestrator raced PostgreSQL, failed its lifespan, exited, and
+    was restarted by `restart: unless-stopped` — measured at 8 crash-restarts
+    in one simulated power cut. It always recovered, but Docker's restart
+    backoff grows with each failure, so on a real boot (five vLLM services
+    competing for the same disk) recovery is delayed by exactly the time the
+    machine is busiest.
+
+    Waiting instead of dying keeps ONE container start, a readable log line
+    while it waits, and recovery the moment the database is ready.
+
+    It still gives up eventually: a DSN pointing at a database that will never
+    exist is a deploy error, and it should be loud rather than a container that
+    hangs "starting" forever. Exceeding the deadline raises, the process exits,
+    and Docker restarts it — so even then it self-heals, just noisily.
+    """
+    import logging
+    import time
+
+    deadline = time.monotonic() + (
+        float(settings.app_db_startup_timeout) if timeout is None else timeout
+    )
+    log = logging.getLogger(__name__)
+    target = dsn().rsplit("@", 1)[-1]  # never log the password
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            with psycopg.connect(dsn(), connect_timeout=5) as con:
+                con.execute("SELECT 1")
+            if attempt > 1:
+                log.warning(
+                    "postgres at %s is up (after %d attempts)", target, attempt
+                )
+            return
+        except psycopg.OperationalError as exc:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(
+                    f"postgres at {target} did not accept a connection within "
+                    f"{settings.app_db_startup_timeout:.0f}s ({attempt} attempts). "
+                    f"Last error: {exc}"
+                ) from exc
+            # Back off gently, capped, so a slow boot does not spin the CPU and
+            # a fast one still gets going within a second.
+            time.sleep(min(3.0, 0.25 * attempt, max(0.1, remaining)))
+            if attempt in (1, 5) or attempt % 20 == 0:
+                log.warning(
+                    "waiting for postgres at %s (attempt %d, %.0fs left): %s",
+                    target, attempt, remaining, str(exc).strip().splitlines()[0],
+                )
+
+
+def init_schema() -> None:
+    """Apply any unapplied migrations. Idempotent; safe to call concurrently.
+
+    Called once from the FastAPI lifespan so a broken migration fails the
+    deploy rather than the first request that happens to touch the database.
+    `pg_advisory_xact_lock` serialises two instances starting together, and
+    releases automatically when the transaction ends — including on failure,
+    where PostgreSQL's transactional DDL also rolls the partial schema back.
+    """
+    with connection() as con:
+        with con.transaction():
+            con.execute("SELECT pg_advisory_xact_lock(%s)", (_MIGRATION_LOCK_KEY,))
+            con.execute(_MIGRATION_TABLE)
+            applied = {
+                int(row["version"])
+                for row in con.execute("SELECT version FROM schema_migrations").fetchall()
+            }
+            for version, ddl in _MIGRATIONS:
+                if version in applied:
+                    continue
+                con.execute(ddl)
+                con.execute(
+                    "INSERT INTO schema_migrations (version) VALUES (%s)", (version,)
+                )
+
+
+def schema_version() -> int:
+    """Highest applied migration version, or 0 on an empty database."""
+    with connection() as con:
+        row = con.execute(
+            "SELECT COALESCE(MAX(version), 0) AS v FROM schema_migrations"
+        ).fetchone()
+    return int(row["v"]) if row else 0
+
+
+# ---------------------------------------------------------------------------
+# Row helpers
+# ---------------------------------------------------------------------------
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def utcnow() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    """ISO-8601 UTC, the string shape this app has always emitted."""
+    return _now().isoformat()
 
 
-def migrate(con: sqlite3.Connection) -> None:
-    """Bring an existing database up to the current schema, additively.
+def _iso(value: Any) -> Any:
+    """`timestamptz` -> the same ISO-8601 string SQLite stored verbatim.
 
-    Idempotent by construction: every column is added only when
-    PRAGMA table_info says it is absent, so running this against an
-    already-migrated DB (or twice in a row) is a no-op. Existing rows keep
-    their data and pick up the DEFAULT 0 for the new flags.
+    The session runs in UTC (see `_server_options`), so this reproduces
+    `datetime.now(timezone.utc).isoformat()` exactly, offset included.
     """
-    columns = {row["name"] for row in con.execute("PRAGMA table_info(conversations)")}
-    if not columns:  # table absent (fresh DB before _SCHEMA ran) — nothing to alter
-        return
-    for name, declaration in _ADDED_CONVERSATION_COLUMNS:
-        if name not in columns:
-            con.execute(f"ALTER TABLE conversations ADD COLUMN {name} {declaration}")
-    message_columns = {row["name"] for row in con.execute("PRAGMA table_info(messages)")}
-    if message_columns:
-        for name, declaration in _ADDED_MESSAGE_COLUMNS:
-            if name not in message_columns:
-                con.execute(f"ALTER TABLE messages ADD COLUMN {name} {declaration}")
-
-        # Enforce one-message-per-generation in the DATABASE, not in Python.
-        # Two clients attached to the same answer append at the same moment,
-        # so an application-level "select then insert" check loses the race and
-        # stores the reply twice. A unique index makes the second insert fail,
-        # which add_message turns into a no-op.
-        #
-        # Any duplicates already written by that race have to go first, or the
-        # index cannot be built; the earliest row of each pair is kept.
-        con.execute(
-            "DELETE FROM messages WHERE generation_id IS NOT NULL AND id NOT IN ("
-            "  SELECT MIN(id) FROM messages WHERE generation_id IS NOT NULL"
-            "  GROUP BY conversation_id, generation_id"
-            ")"
-        )
-        con.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_generation "
-            "ON messages(conversation_id, generation_id) "
-            "WHERE generation_id IS NOT NULL"
-        )
-    con.commit()
+    return value.isoformat() if isinstance(value, datetime) else value
 
 
-def connect() -> sqlite3.Connection:
-    """Open the app DB (creating the file + schema on first use), WAL mode."""
-    path = Path(settings.app_db_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(str(path))
-    con.row_factory = sqlite3.Row
-    con.execute("PRAGMA journal_mode=WAL")
-    con.execute("PRAGMA foreign_keys=ON")
-    con.executescript(_SCHEMA)  # CREATE ... IF NOT EXISTS: new databases only
-    migrate(con)  # existing databases: additive ALTERs for anything missing
-    return con
+def _row(row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Row -> plain JSON-friendly dict (timestamps become ISO strings)."""
+    if row is None:
+        return None
+    return {key: _iso(value) for key, value in row.items()}
+
+
+def _text(value: Optional[str]) -> Optional[str]:
+    """Strip NUL characters, which PostgreSQL `text` cannot store.
+
+    SQLite accepted `\\x00` inside a TEXT value; PostgreSQL rejects it outright
+    ("unsupported Unicode escape sequence" / "invalid byte sequence"). Almost
+    everything written here is untrusted text — model output, extracted PDF and
+    OCR transcripts, scraped pages, source files — and any one of those can
+    carry a stray NUL. Without this, a single bad byte turns a completed answer
+    into a 500 and loses it.
+
+    The membership test keeps the common path allocation-free; documents can be
+    several MB and copying every one of them to remove nothing would be waste.
+    """
+    if value is None or "\x00" not in value:
+        return value
+    return value.replace("\x00", "")
+
+
+def _dumps_jsonb(obj: Any) -> str:
+    """`json.dumps` for jsonb: tolerant of odd types, free of NUL escapes.
+
+    `default=str` mirrors the old call — `meta` carries whatever the engines put
+    in it, and a stray datetime must not turn a stored answer into a 500.
+    `json.dumps` always escapes NUL as the six characters `\\u0000`, which jsonb
+    rejects, so the escape is removed from the serialised form.
+    """
+    text = json.dumps(obj, ensure_ascii=False, default=str)
+    return text.replace("\\u0000", "") if "\\u0000" in text else text
+
+
+def _json_param(value: Optional[Any]) -> Optional[Jsonb]:
+    """Adapt a dict — or a pre-serialised JSON string — to a jsonb parameter."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            # Not JSON after all — keep it addressable rather than dropping it.
+            value = {"raw": value}
+    return Jsonb(value, dumps=_dumps_jsonb)
 
 
 # ---------------------------------------------------------------------------
 # Users
 # ---------------------------------------------------------------------------
 
+
 def create_user(username: str, password_hash: str) -> int:
-    """Insert a user; raises sqlite3.IntegrityError on a duplicate username
-    (usernames are UNIQUE COLLATE NOCASE)."""
-    with closing(connect()) as con, con:
-        cur = con.execute(
-            "INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)",
-            (username, password_hash, utcnow()),
-        )
-        return int(cur.lastrowid)
-
-
-def get_user_by_username(username: str) -> Optional[sqlite3.Row]:
-    with closing(connect()) as con:
-        return con.execute(
-            "SELECT * FROM users WHERE username = ? COLLATE NOCASE", (username,)
+    """Insert a user; raises db.IntegrityError on a duplicate username
+    (unique on lower(username) — SQLite's COLLATE NOCASE)."""
+    with connection() as con:
+        row = con.execute(
+            "INSERT INTO users (username, password_hash, created_at) "
+            "VALUES (%s, %s, %s) RETURNING id",
+            (_text(username), password_hash, _now()),
         ).fetchone()
+    return int(row["id"])
 
 
-def get_user_by_id(user_id: int) -> Optional[sqlite3.Row]:
-    with closing(connect()) as con:
-        return con.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+def get_user_by_username(username: str) -> Optional[Dict[str, Any]]:
+    with connection() as con:
+        row = con.execute(
+            "SELECT * FROM users WHERE lower(username) = lower(%s)", (username,)
+        ).fetchone()
+    return _row(row)
+
+
+def get_user_by_id(user_id: int) -> Optional[Dict[str, Any]]:
+    with connection() as con:
+        row = con.execute("SELECT * FROM users WHERE id = %s", (user_id,)).fetchone()
+    return _row(row)
+
+
+def oldest_user() -> Optional[Dict[str, Any]]:
+    """The first account ever created — the one whose history to adopt.
+
+    Lives here rather than in `auth.py` so nothing outside this module has to
+    open a connection of its own (the old `auth._oldest_user` opened one and
+    never closed it, leaking a handle per resolution).
+    """
+    with connection() as con:
+        row = con.execute("SELECT * FROM users ORDER BY id LIMIT 1").fetchone()
+    return _row(row)
 
 
 # ---------------------------------------------------------------------------
@@ -252,9 +680,12 @@ def get_user_by_id(user_id: int) -> Optional[sqlite3.Row]:
 # one (the caller turns None/False into 404).
 # ---------------------------------------------------------------------------
 
-def _conversation_dict(row: sqlite3.Row) -> dict:
-    """Row → JSON-friendly dict; the SQLite 0/1 flags surface as booleans."""
-    out = dict(row)
+
+def _conversation_dict(row: Dict[str, Any]) -> dict:
+    """Row → JSON-friendly dict. The flags are real booleans now; the coercion
+    stays so a caller that stored 0/1 through some other path still reads back
+    `true`/`false` in the API."""
+    out = _row(row) or {}
     for flag in ("pinned", "archived"):
         if flag in out:
             out[flag] = bool(out[flag])
@@ -268,40 +699,40 @@ def list_conversations(user_id: int, archived: bool = False) -> List[dict]:
     disjoint, so the sidebar's Archived section is a separate fetch. Pinned
     conversations float to the top, then most-recent activity.
     """
-    with closing(connect()) as con:
+    with connection() as con:
         rows = con.execute(
             "SELECT id, title, updated_at, pinned, archived FROM conversations "
-            "WHERE user_id = ? AND archived = ? "
-            "ORDER BY pinned DESC, updated_at DESC, rowid DESC",
-            (user_id, 1 if archived else 0),
+            "WHERE user_id = %s AND archived = %s "
+            "ORDER BY pinned DESC, updated_at DESC, seq DESC",
+            (user_id, bool(archived)),
         ).fetchall()
     return [_conversation_dict(r) for r in rows]
 
 
 def create_conversation(user_id: int, conversation_id: str, title: str) -> dict:
-    """Insert a conversation; raises sqlite3.IntegrityError when the id exists."""
-    now = utcnow()
-    with closing(connect()) as con, con:
+    """Insert a conversation; raises db.IntegrityError when the id exists."""
+    now = _now()
+    with connection() as con:
         con.execute(
             "INSERT INTO conversations (id, user_id, title, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (conversation_id, user_id, title, now, now),
+            "VALUES (%s, %s, %s, %s, %s)",
+            (conversation_id, user_id, _text(title), now, now),
         )
     return {
         "id": conversation_id,
         "title": title,
-        "created_at": now,
-        "updated_at": now,
+        "created_at": now.isoformat(),
+        "updated_at": now.isoformat(),
         "pinned": False,
         "archived": False,
     }
 
 
 def get_conversation(user_id: int, conversation_id: str) -> Optional[dict]:
-    with closing(connect()) as con:
+    with connection() as con:
         row = con.execute(
             "SELECT id, title, created_at, updated_at, pinned, archived "
-            "FROM conversations WHERE id = ? AND user_id = ?",
+            "FROM conversations WHERE id = %s AND user_id = %s",
             (conversation_id, user_id),
         ).fetchone()
     return _conversation_dict(row) if row else None
@@ -324,48 +755,132 @@ def update_conversation(
     assignments: List[str] = []
     values: List[object] = []
     if title is not None:
-        assignments += ["title = ?", "updated_at = ?"]
-        values += [title, utcnow()]
+        assignments += ["title = %s", "updated_at = %s"]
+        values += [_text(title), _now()]
     if pinned is not None:
-        assignments.append("pinned = ?")
-        values.append(1 if pinned else 0)
+        assignments.append("pinned = %s")
+        values.append(bool(pinned))
     if archived is not None:
-        assignments.append("archived = ?")
-        values.append(1 if archived else 0)
+        assignments.append("archived = %s")
+        values.append(bool(archived))
     if not assignments:  # nothing to change — just an ownership-scoped read
         return get_conversation(user_id, conversation_id)
-    with closing(connect()) as con, con:
-        cur = con.execute(
+    with connection() as con:
+        # RETURNING makes this one round trip instead of an UPDATE followed by
+        # a SELECT, and closes the window where another tab could change the
+        # row between the two.
+        row = con.execute(
             f"UPDATE conversations SET {', '.join(assignments)} "
-            "WHERE id = ? AND user_id = ?",
+            "WHERE id = %s AND user_id = %s "
+            "RETURNING id, title, created_at, updated_at, pinned, archived",
             (*values, conversation_id, user_id),
-        )
-        if cur.rowcount == 0:
-            return None
-    return get_conversation(user_id, conversation_id)
+        ).fetchone()
+    return _conversation_dict(row) if row else None
+
+
+#: Conversation-keyed tables with no foreign key (see the note on _MIGRATIONS).
+#: Deleting a conversation has to clear these by hand.
+_SIDE_TABLES = ("uploads", "url_documents", "documents", "repos", "repo_chunks")
 
 
 def delete_conversation(user_id: int, conversation_id: str) -> bool:
-    with closing(connect()) as con, con:
+    """Delete a conversation and everything keyed to it.
+
+    Fixes DATA-03. Under SQLite this issued exactly one statement, and only
+    `messages`, `conversation_summaries` and `conversation_chunks` had a
+    cascading foreign key — so a delete permanently orphaned the conversation's
+    uploads, fetched page text, cloned-repo records and every code chunk. That
+    is the largest content in the database and nothing could ever reach it
+    again. The side tables are cleared explicitly here, in the same
+    transaction, so the delete is all-or-nothing.
+
+    Ownership is still checked in the same statement that deletes, so a
+    conversation belonging to someone else is a no-op returning False — and
+    the side-table deletes only run once that check has passed.
+    """
+    with connection() as con:
         cur = con.execute(
-            "DELETE FROM conversations WHERE id = ? AND user_id = ?",
+            "DELETE FROM conversations WHERE id = %s AND user_id = %s",
             (conversation_id, user_id),
         )
-        return cur.rowcount > 0
+        if cur.rowcount == 0:
+            return False
+        for table in _SIDE_TABLES:
+            con.execute(
+                f"DELETE FROM {table} WHERE conversation_id = %s", (conversation_id,)
+            )
+        return True
 
 
 def list_messages(conversation_id: str) -> List[dict]:
-    with closing(connect()) as con:
+    """The thread, oldest first.
+
+    `id` is included so the client has a STABLE server-side identity for each
+    message. It had none before: a live message is keyed by a browser-minted
+    uuid and a rehydrated one positionally as `srv-<conversation>-<index>`, so
+    anything attached to a message client-side (thumbs) was lost on reload.
+    """
+    with connection() as con:
         rows = con.execute(
-            "SELECT role, content, meta FROM messages "
-            "WHERE conversation_id = ? ORDER BY id",
+            "SELECT id, role, content, meta, feedback FROM messages "
+            "WHERE conversation_id = %s ORDER BY id",
             (conversation_id,),
         ).fetchall()
-    out: List[dict] = []
-    for r in rows:
-        meta = json.loads(r["meta"]) if r["meta"] else None
-        out.append({"role": r["role"], "content": r["content"], "meta": meta})
-    return out
+    # `meta` arrives already parsed — it is jsonb, not a JSON string.
+    return [
+        {
+            "id": int(r["id"]),
+            "role": r["role"],
+            "content": r["content"],
+            "meta": r["meta"],
+            "feedback": r["feedback"],
+        }
+        for r in rows
+    ]
+
+
+#: The only values `messages.feedback` accepts (mirrored by a CHECK constraint).
+FEEDBACK_VALUES = ("up", "down")
+
+
+def set_message_feedback(
+    user_id: int, conversation_id: str, message_id: int, feedback: Optional[str]
+) -> Optional[dict]:
+    """Record (or clear, with None) a thumb on one message.
+
+    Returns the updated {id, feedback, feedback_at}, or None when the message
+    does not exist, is not in that conversation, or the conversation belongs to
+    someone else — the same "missing and forbidden are indistinguishable" rule
+    every other accessor here follows, so a caller cannot probe for ids.
+
+    Ownership is enforced in the STATEMENT, not by a check-then-write: a
+    separate lookup would be a race, and this way a message in another
+    account's conversation simply matches no row.
+    """
+    if feedback is not None and feedback not in FEEDBACK_VALUES:
+        raise ValueError(f"feedback must be one of {FEEDBACK_VALUES} or None")
+    with connection() as con:
+        row = con.execute(
+            "UPDATE messages m SET feedback = %s, feedback_at = %s "
+            "  FROM conversations c "
+            " WHERE m.conversation_id = c.id "
+            "   AND m.id = %s AND m.conversation_id = %s AND c.user_id = %s "
+            "RETURNING m.id, m.feedback, m.feedback_at",
+            (
+                feedback,
+                _now() if feedback is not None else None,
+                message_id,
+                conversation_id,
+                user_id,
+            ),
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        "id": int(row["id"]),
+        "feedback": row["feedback"],
+        "feedback_at": _iso(row["feedback_at"]),
+    }
 
 
 def conversation_owner(conversation_id: str) -> Optional[int]:
@@ -374,9 +889,9 @@ def conversation_owner(conversation_id: str) -> Optional[int]:
     Used to authorize the per-conversation stores (url_documents, repo_chunks,
     live generations) that are keyed by conversation id alone.
     """
-    with closing(connect()) as con:
+    with connection() as con:
         row = con.execute(
-            "SELECT user_id FROM conversations WHERE id = ?", (conversation_id,)
+            "SELECT user_id FROM conversations WHERE id = %s", (conversation_id,)
         ).fetchone()
     return int(row["user_id"]) if row else None
 
@@ -393,9 +908,7 @@ class MessageCountWouldShrink(Exception):
     """
 
     def __init__(self, existing: int, incoming: int) -> None:
-        super().__init__(
-            f"refusing to replace {existing} messages with {incoming}"
-        )
+        super().__init__(f"refusing to replace {existing} messages with {incoming}")
         self.existing = existing
         self.incoming = incoming
 
@@ -406,10 +919,10 @@ class MessageCountWouldShrink(Exception):
 
 
 def get_summary(conversation_id: str) -> Optional[dict]:
-    with closing(connect()) as con:
+    with connection() as con:
         row = con.execute(
             "SELECT summary, covers_through, token_estimate, updated_at "
-            "FROM conversation_summaries WHERE conversation_id = ?",
+            "FROM conversation_summaries WHERE conversation_id = %s",
             (conversation_id,),
         ).fetchone()
     if row is None:
@@ -418,22 +931,22 @@ def get_summary(conversation_id: str) -> Optional[dict]:
         "summary": row["summary"],
         "covers_through": int(row["covers_through"]),
         "token_estimate": int(row["token_estimate"]),
-        "updated_at": row["updated_at"],
+        "updated_at": _iso(row["updated_at"]),
     }
 
 
 def save_summary(
     conversation_id: str, summary: str, covers_through: int, token_estimate: int
 ) -> None:
-    with closing(connect()) as con, con:
+    with connection() as con:
         con.execute(
             "INSERT INTO conversation_summaries "
             "(conversation_id, summary, covers_through, token_estimate, updated_at) "
-            "VALUES (?, ?, ?, ?, ?) "
-            "ON CONFLICT(conversation_id) DO UPDATE SET "
+            "VALUES (%s, %s, %s, %s, %s) "
+            "ON CONFLICT (conversation_id) DO UPDATE SET "
             "summary = excluded.summary, covers_through = excluded.covers_through, "
             "token_estimate = excluded.token_estimate, updated_at = excluded.updated_at",
-            (conversation_id, summary, covers_through, token_estimate, utcnow()),
+            (conversation_id, _text(summary), covers_through, token_estimate, _now()),
         )
 
 
@@ -444,13 +957,13 @@ def clear_summary(conversation_id: str) -> None:
     answer): the summary describes turns that no longer exist, so keeping it
     would let the model assert things the user deliberately removed.
     """
-    with closing(connect()) as con, con:
+    with connection() as con:
         con.execute(
-            "DELETE FROM conversation_summaries WHERE conversation_id = ?",
+            "DELETE FROM conversation_summaries WHERE conversation_id = %s",
             (conversation_id,),
         )
         con.execute(
-            "DELETE FROM conversation_chunks WHERE conversation_id = ?",
+            "DELETE FROM conversation_chunks WHERE conversation_id = %s",
             (conversation_id,),
         )
 
@@ -459,30 +972,35 @@ def add_conversation_chunks(conversation_id: str, chunks: List[dict]) -> None:
     """Store embedded chunks of folded turns (ordinal = index in the thread)."""
     if not chunks:
         return
-    now = utcnow()
-    with closing(connect()) as con, con:
-        for c in chunks:
-            con.execute(
-                "INSERT OR REPLACE INTO conversation_chunks "
-                "(conversation_id, ordinal, role, text, embedding, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+    now = _now()
+    with connection() as con:
+        con.cursor().executemany(
+            "INSERT INTO conversation_chunks "
+            "(conversation_id, ordinal, role, text, embedding, created_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s) "
+            "ON CONFLICT (conversation_id, ordinal) DO UPDATE SET "
+            "role = excluded.role, text = excluded.text, "
+            "embedding = excluded.embedding, created_at = excluded.created_at",
+            [
                 (
                     conversation_id,
                     int(c["ordinal"]),
-                    c["role"],
-                    c["text"],
+                    _text(c["role"]),
+                    _text(c["text"]),
                     c["embedding"],
                     now,
-                ),
-            )
+                )
+                for c in chunks
+            ],
+        )
 
 
 def get_conversation_chunks(conversation_id: str) -> List[dict]:
     """Every folded chunk for ONE conversation — the isolation boundary."""
-    with closing(connect()) as con:
+    with connection() as con:
         rows = con.execute(
             "SELECT ordinal, role, text, embedding FROM conversation_chunks "
-            "WHERE conversation_id = ? ORDER BY ordinal",
+            "WHERE conversation_id = %s ORDER BY ordinal",
             (conversation_id,),
         ).fetchall()
     return [
@@ -490,7 +1008,10 @@ def get_conversation_chunks(conversation_id: str) -> List[dict]:
             "ordinal": int(r["ordinal"]),
             "role": r["role"],
             "text": r["text"],
-            "embedding": r["embedding"],
+            # bytea comes back as `memoryview`; recall.unpack_vector wants
+            # something array.frombytes accepts, and callers may hold it past
+            # the cursor, so materialise it.
+            "embedding": bytes(r["embedding"]),
         }
         for r in rows
     ]
@@ -510,54 +1031,52 @@ def save_upload(
     profile: Optional[str] = None,
     notes: Optional[str] = None,
 ) -> None:
-    with closing(connect()) as con, con:
+    with connection() as con:
         con.execute(
             "INSERT INTO uploads (id, conversation_id, filename, bytes, status, "
-            "profile, notes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
-            "ON CONFLICT(id) DO UPDATE SET status = excluded.status, "
+            "profile, notes, created_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+            "ON CONFLICT (id) DO UPDATE SET status = excluded.status, "
             "profile = excluded.profile, notes = excluded.notes",
             (
                 upload_id,
                 conversation_id,
-                filename,
+                _text(filename),
                 size,
                 status,
-                profile,
-                notes,
-                utcnow(),
+                _json_param(profile),
+                _text(notes),
+                _now(),
             ),
         )
 
 
 def get_uploads(conversation_id: str) -> List[dict]:
     """Uploads for ONE conversation — the isolation boundary."""
-    with closing(connect()) as con:
+    with connection() as con:
         rows = con.execute(
             "SELECT id, filename, bytes, status, profile, notes, created_at "
-            "FROM uploads WHERE conversation_id = ? ORDER BY created_at",
+            "FROM uploads WHERE conversation_id = %s ORDER BY created_at",
             (conversation_id,),
         ).fetchall()
-    out = []
-    for r in rows:
-        out.append(
-            {
-                "id": r["id"],
-                "filename": r["filename"],
-                "bytes": int(r["bytes"]),
-                "status": r["status"],
-                "profile": json.loads(r["profile"]) if r["profile"] else None,
-                "notes": r["notes"],
-                "created_at": r["created_at"],
-            }
-        )
-    return out
+    return [
+        {
+            "id": r["id"],
+            "filename": r["filename"],
+            "bytes": int(r["bytes"]),
+            "status": r["status"],
+            "profile": r["profile"],
+            "notes": r["notes"],
+            "created_at": _iso(r["created_at"]),
+        }
+        for r in rows
+    ]
 
 
 def get_upload(upload_id: str) -> Optional[dict]:
-    with closing(connect()) as con:
+    with connection() as con:
         row = con.execute(
             "SELECT id, conversation_id, filename, bytes, status, profile, notes "
-            "FROM uploads WHERE id = ?",
+            "FROM uploads WHERE id = %s",
             (upload_id,),
         ).fetchone()
     if row is None:
@@ -568,7 +1087,7 @@ def get_upload(upload_id: str) -> Optional[dict]:
         "filename": row["filename"],
         "bytes": int(row["bytes"]),
         "status": row["status"],
-        "profile": json.loads(row["profile"]) if row["profile"] else None,
+        "profile": row["profile"],
         "notes": row["notes"],
     }
 
@@ -596,17 +1115,21 @@ def truncate_messages(
 
     `expected_total` is optimistic concurrency: if another tab appended turns
     since the caller last looked, this raises instead of destroying them.
+
+    FOR UPDATE on the owning row is new: SQLite's single-writer lock made the
+    count-then-delete atomic for free, and MVCC does not. Without it two
+    concurrent truncates can both read the same count and both pass the check.
     """
-    with closing(connect()) as con, con:
+    with connection() as con:
         owned = con.execute(
-            "SELECT 1 FROM conversations WHERE id = ? AND user_id = ?",
+            "SELECT 1 FROM conversations WHERE id = %s AND user_id = %s FOR UPDATE",
             (conversation_id, user_id),
         ).fetchone()
         if not owned:
             return None
         actual = int(
             con.execute(
-                "SELECT COUNT(*) AS n FROM messages WHERE conversation_id = ?",
+                "SELECT COUNT(*) AS n FROM messages WHERE conversation_id = %s",
                 (conversation_id,),
             ).fetchone()["n"]
         )
@@ -614,15 +1137,32 @@ def truncate_messages(
             raise ConversationChanged(expected_total, actual)
         if keep >= actual:
             return {"id": conversation_id, "count": actual}
+        # Find the id of the last message to KEEP, then range-delete past it.
+        # The SQLite original used `id NOT IN (SELECT … LIMIT keep)`, which
+        # PostgreSQL also accepts — but that re-scans every surviving row,
+        # while this does one index probe and a range delete whose cost scales
+        # with the rows actually removed. `keep == 0` has no boundary row, so
+        # it deletes the lot.
+        boundary = None
+        if keep > 0:
+            row = con.execute(
+                "SELECT id FROM messages WHERE conversation_id = %s "
+                "ORDER BY id OFFSET %s LIMIT 1",
+                (conversation_id, keep - 1),
+            ).fetchone()
+            boundary = row["id"] if row else None
+        if boundary is None:
+            con.execute(
+                "DELETE FROM messages WHERE conversation_id = %s", (conversation_id,)
+            )
+        else:
+            con.execute(
+                "DELETE FROM messages WHERE conversation_id = %s AND id > %s",
+                (conversation_id, boundary),
+            )
         con.execute(
-            "DELETE FROM messages WHERE conversation_id = ? AND id NOT IN ("
-            "  SELECT id FROM messages WHERE conversation_id = ? ORDER BY id LIMIT ?"
-            ")",
-            (conversation_id, conversation_id, keep),
-        )
-        con.execute(
-            "UPDATE conversations SET updated_at = ? WHERE id = ?",
-            (utcnow(), conversation_id),
+            "UPDATE conversations SET updated_at = %s WHERE id = %s",
+            (_now(), conversation_id),
         )
     return {"id": conversation_id, "count": keep}
 
@@ -636,28 +1176,43 @@ def replace_messages(
     and raises MessageCountWouldShrink when the incoming thread is shorter
     than what is stored. The delete+insert runs in ONE transaction, so a
     failure cannot leave the conversation empty.
+
+    FEEDBACK SURVIVES. This is a DELETE followed by an INSERT, so every row
+    gets a new id — which would silently discard the thumbs on a thread the
+    client happens to re-push (the offline sync does exactly that whenever the
+    tail diverges). Thumbs are carried across BY POSITION, which is sound here
+    precisely because of the guarantee above: this function can never reorder
+    or shrink a thread, only append to it, so index N before is index N after.
+    An explicit `feedback` on an incoming message wins over the carried value.
     """
-    now = utcnow()
-    with closing(connect()) as con, con:
+    now = _now()
+    with connection() as con:
         owned = con.execute(
-            "SELECT 1 FROM conversations WHERE id = ? AND user_id = ?",
+            "SELECT 1 FROM conversations WHERE id = %s AND user_id = %s FOR UPDATE",
             (conversation_id, user_id),
         ).fetchone()
         if not owned:
             return None
         existing = int(
             con.execute(
-                "SELECT COUNT(*) AS n FROM messages WHERE conversation_id = ?",
+                "SELECT COUNT(*) AS n FROM messages WHERE conversation_id = %s",
                 (conversation_id,),
             ).fetchone()["n"]
         )
         if len(messages) < existing:
             raise MessageCountWouldShrink(existing, len(messages))
-        con.execute(
-            "DELETE FROM messages WHERE conversation_id = ?", (conversation_id,)
-        )
+        # Snapshot the thumbs before the rows they belong to are deleted.
+        carried = [
+            r["feedback"]
+            for r in con.execute(
+                "SELECT feedback FROM messages WHERE conversation_id = %s ORDER BY id",
+                (conversation_id,),
+            ).fetchall()
+        ]
+        con.execute("DELETE FROM messages WHERE conversation_id = %s", (conversation_id,))
         seen_generations = set()
-        for m in messages:
+        rows = []
+        for index, m in enumerate(messages):
             meta = m.get("meta")
             gen_id = (meta or {}).get("generation_id")
             # The unique index would reject a repeated key; a client sending
@@ -668,22 +1223,31 @@ def replace_messages(
                     gen_id = None
                 else:
                     seen_generations.add(gen_id)
-            con.execute(
-                "INSERT INTO messages (conversation_id, role, content, meta, created_at, "
-                "generation_id) VALUES (?, ?, ?, ?, ?, ?)",
+            feedback = m.get("feedback")
+            if feedback not in FEEDBACK_VALUES:
+                # Not supplied (or junk) — keep whatever was on this position.
+                feedback = carried[index] if index < len(carried) else None
+            rows.append(
                 (
                     conversation_id,
-                    m.get("role", ""),
-                    m.get("content", ""),
-                    json.dumps(meta, ensure_ascii=False, default=str)
-                    if meta is not None
-                    else None,
+                    _text(m.get("role", "")),
+                    _text(m.get("content", "")),
+                    _json_param(meta),
                     now,
                     str(gen_id) if gen_id else None,
-                ),
+                    feedback,
+                    now if feedback else None,
+                )
+            )
+        if rows:
+            con.cursor().executemany(
+                "INSERT INTO messages (conversation_id, role, content, meta, created_at, "
+                "generation_id, feedback, feedback_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                rows,
             )
         con.execute(
-            "UPDATE conversations SET updated_at = ? WHERE id = ?",
+            "UPDATE conversations SET updated_at = %s WHERE id = %s",
             (now, conversation_id),
         )
     return {"id": conversation_id, "count": len(messages)}
@@ -706,86 +1270,96 @@ def add_message(
     second browser opening a running answer) both finalize and both push —
     without this the same reply is stored twice.
     """
-    now = utcnow()
+    now = _now()
     generation_id = (meta or {}).get("generation_id")
-    with closing(connect()) as con, con:
+    with connection() as con:
         owned = con.execute(
-            "SELECT 1 FROM conversations WHERE id = ? AND user_id = ?",
+            "SELECT 1 FROM conversations WHERE id = %s AND user_id = %s",
             (conversation_id, user_id),
         ).fetchone()
         if not owned:
             return None
-        def _existing_generation_row():
+
+        # PostgreSQL aborts the whole transaction on a constraint violation, so
+        # the SQLite shape (try INSERT / except IntegrityError / SELECT the
+        # winner on the same connection) cannot work here — the follow-up
+        # SELECT would fail with "current transaction is aborted". A SAVEPOINT
+        # scopes the rollback to the INSERT alone.
+        inserted = None
+        try:
+            with con.transaction():
+                inserted = con.execute(
+                    "INSERT INTO messages (conversation_id, role, content, meta, "
+                    "created_at, generation_id) VALUES (%s, %s, %s, %s, %s, %s) "
+                    "RETURNING id",
+                    (
+                        conversation_id,
+                        _text(role),
+                        _text(content),
+                        _json_param(meta),
+                        now,
+                        str(generation_id) if generation_id else None,
+                    ),
+                ).fetchone()
+        except UniqueViolation:
+            # The unique index rejected it: another client stored this exact
+            # generation first. Hand back the row that won — no duplicate.
+            if not generation_id:
+                raise
             row = con.execute(
                 "SELECT id, role, content, meta, created_at FROM messages "
-                "WHERE conversation_id = ? AND generation_id = ?",
+                "WHERE conversation_id = %s AND generation_id = %s",
                 (conversation_id, str(generation_id)),
             ).fetchone()
             if row is None:
-                return None
+                raise
             return {
                 "id": int(row["id"]),
                 "role": row["role"],
                 "content": row["content"],
-                "meta": json.loads(row["meta"]) if row["meta"] else None,
-                "created_at": row["created_at"],
+                "meta": row["meta"],
+                "created_at": _iso(row["created_at"]),
                 "deduplicated": True,
             }
 
-        try:
-            cur = con.execute(
-                "INSERT INTO messages (conversation_id, role, content, meta, created_at, "
-                "generation_id) VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    conversation_id,
-                    role,
-                    content,
-                    json.dumps(meta, ensure_ascii=False, default=str)
-                    if meta is not None
-                    else None,
-                    now,
-                    str(generation_id) if generation_id else None,
-                ),
-            )
-        except sqlite3.IntegrityError:
-            # The unique index rejected it: another client stored this exact
-            # generation first. Hand back the row that won — no duplicate.
-            if generation_id:
-                duplicate = _existing_generation_row()
-                if duplicate is not None:
-                    return duplicate
-            raise
         con.execute(
-            "UPDATE conversations SET updated_at = ? WHERE id = ?", (now, conversation_id)
+            "UPDATE conversations SET updated_at = %s WHERE id = %s",
+            (now, conversation_id),
         )
-        message_id = int(cur.lastrowid)
-    return {"id": message_id, "role": role, "content": content, "meta": meta, "created_at": now}
+        message_id = int(inserted["id"])
+    return {
+        "id": message_id,
+        "role": role,
+        "content": content,
+        "meta": meta,
+        "created_at": now.isoformat(),
+    }
 
 
 # ---------------------------------------------------------------------------
 # Phase 2: fetched-page storage (per conversation, so follow-ups don't refetch)
 # ---------------------------------------------------------------------------
 
-def save_url_document(
-    conversation_id: str, url: str, title: str, text: str
-) -> None:
+
+def save_url_document(conversation_id: str, url: str, title: str, text: str) -> None:
     """Store (or refresh) an extracted page for a conversation."""
-    with closing(connect()) as con, con:
+    with connection() as con:
         con.execute(
             "INSERT INTO url_documents (conversation_id, url, title, text, fetched_at) "
-            "VALUES (?, ?, ?, ?, ?) "
-            "ON CONFLICT(conversation_id, url) DO UPDATE SET "
-            "title=excluded.title, text=excluded.text, fetched_at=excluded.fetched_at",
-            (conversation_id, url, title, text, utcnow()),
+            "VALUES (%s, %s, %s, %s, %s) "
+            "ON CONFLICT (conversation_id, url) DO UPDATE SET "
+            "title = excluded.title, text = excluded.text, "
+            "fetched_at = excluded.fetched_at",
+            (conversation_id, _text(url), _text(title), _text(text), _now()),
         )
 
 
 def get_url_documents(conversation_id: str) -> List[dict]:
     """All pages stored for a conversation, oldest first."""
-    with closing(connect()) as con:
+    with connection() as con:
         rows = con.execute(
             "SELECT url, title, text FROM url_documents "
-            "WHERE conversation_id = ? ORDER BY id",
+            "WHERE conversation_id = %s ORDER BY id",
             (conversation_id,),
         ).fetchall()
     return [{"url": r["url"], "title": r["title"], "text": r["text"]} for r in rows]
@@ -793,9 +1367,9 @@ def get_url_documents(conversation_id: str) -> List[dict]:
 
 def get_url_document_urls(conversation_id: str) -> set:
     """The set of URLs already fetched for a conversation (dupe check)."""
-    with closing(connect()) as con:
+    with connection() as con:
         rows = con.execute(
-            "SELECT url FROM url_documents WHERE conversation_id = ?",
+            "SELECT url FROM url_documents WHERE conversation_id = %s",
             (conversation_id,),
         ).fetchall()
     return {r["url"] for r in rows}
@@ -805,23 +1379,23 @@ def save_document(
     conversation_id: str, filename: str, text: str, total_pages: int = 0
 ) -> None:
     """Store (or refresh) an uploaded document's extracted text."""
-    with closing(connect()) as con, con:
+    with connection() as con:
         con.execute(
-            "INSERT INTO documents (conversation_id, filename, text, total_pages, created_at) "
-            "VALUES (?, ?, ?, ?, ?) "
-            "ON CONFLICT(conversation_id, filename) DO UPDATE SET "
-            "text=excluded.text, total_pages=excluded.total_pages, "
-            "created_at=excluded.created_at",
-            (conversation_id, filename, text, total_pages, utcnow()),
+            "INSERT INTO documents (conversation_id, filename, text, total_pages, "
+            "created_at) VALUES (%s, %s, %s, %s, %s) "
+            "ON CONFLICT (conversation_id, filename) DO UPDATE SET "
+            "text = excluded.text, total_pages = excluded.total_pages, "
+            "created_at = excluded.created_at",
+            (conversation_id, _text(filename), _text(text), total_pages, _now()),
         )
 
 
 def get_documents(conversation_id: str) -> List[dict]:
     """All documents stored for a conversation, oldest first."""
-    with closing(connect()) as con:
+    with connection() as con:
         rows = con.execute(
             "SELECT filename, text, total_pages FROM documents "
-            "WHERE conversation_id = ? ORDER BY id",
+            "WHERE conversation_id = %s ORDER BY id",
             (conversation_id,),
         ).fetchall()
     return [
@@ -834,31 +1408,32 @@ def get_documents(conversation_id: str) -> List[dict]:
 # Phase 3: repo + code-chunk storage (per conversation)
 # ---------------------------------------------------------------------------
 
+
 def save_repo(conversation_id: str, repo_key: str, url: str, sha: str) -> None:
-    with closing(connect()) as con, con:
+    with connection() as con:
         con.execute(
             "INSERT INTO repos (conversation_id, repo_key, url, sha, cloned_at) "
-            "VALUES (?, ?, ?, ?, ?) "
-            "ON CONFLICT(conversation_id, repo_key) DO UPDATE SET "
-            "url=excluded.url, sha=excluded.sha, cloned_at=excluded.cloned_at",
-            (conversation_id, repo_key, url, sha, utcnow()),
+            "VALUES (%s, %s, %s, %s, %s) "
+            "ON CONFLICT (conversation_id, repo_key) DO UPDATE SET "
+            "url = excluded.url, sha = excluded.sha, cloned_at = excluded.cloned_at",
+            (conversation_id, _text(repo_key), _text(url), _text(sha), _now()),
         )
 
 
 def get_repo(conversation_id: str, repo_key: str) -> Optional[dict]:
-    with closing(connect()) as con:
-        r = con.execute(
+    with connection() as con:
+        row = con.execute(
             "SELECT repo_key, url, sha FROM repos "
-            "WHERE conversation_id = ? AND repo_key = ?",
+            "WHERE conversation_id = %s AND repo_key = %s",
             (conversation_id, repo_key),
         ).fetchone()
-    return dict(r) if r else None
+    return dict(row) if row else None
 
 
 def get_repo_keys(conversation_id: str) -> List[str]:
-    with closing(connect()) as con:
+    with connection() as con:
         rows = con.execute(
-            "SELECT repo_key FROM repos WHERE conversation_id = ? ORDER BY id",
+            "SELECT repo_key FROM repos WHERE conversation_id = %s ORDER BY id",
             (conversation_id,),
         ).fetchall()
     return [r["repo_key"] for r in rows]
@@ -868,20 +1443,31 @@ def replace_repo_chunks(
     conversation_id: str, repo_key: str, chunks: List[dict]
 ) -> None:
     """Store a repo's code chunks, replacing any previous set for that repo."""
-    with closing(connect()) as con, con:
+    with connection() as con:
         con.execute(
-            "DELETE FROM repo_chunks WHERE conversation_id = ? AND repo_key = ?",
+            "DELETE FROM repo_chunks WHERE conversation_id = %s AND repo_key = %s",
             (conversation_id, repo_key),
         )
-        con.executemany(
-            "INSERT INTO repo_chunks "
-            "(conversation_id, repo_key, path, start_line, end_line, text) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            [
-                (conversation_id, repo_key, c["path"], c["start_line"], c["end_line"], c["text"])
-                for c in chunks
-            ],
-        )
+        if not chunks:
+            return
+        # COPY, not executemany: indexing a repo writes thousands of rows in one
+        # go, and COPY streams them in a single statement instead of a round
+        # trip apiece.
+        with con.cursor().copy(
+            "COPY repo_chunks (conversation_id, repo_key, path, start_line, end_line, "
+            "text) FROM STDIN"
+        ) as copy:
+            for c in chunks:
+                copy.write_row(
+                    (
+                        conversation_id,
+                        repo_key,
+                        _text(c["path"]),
+                        c["start_line"],
+                        c["end_line"],
+                        _text(c["text"]),
+                    )
+                )
 
 
 def search_repo_chunks(
@@ -895,27 +1481,27 @@ def search_repo_chunks(
     patterns = [like_contains_pattern(k) for k in keywords]
     # score = matches in text + 2x matches in path (path names are strong signal)
     score_terms = " + ".join(
-        "(CASE WHEN text LIKE ? ESCAPE '\\' THEN 1 ELSE 0 END) + "
-        "(CASE WHEN path LIKE ? ESCAPE '\\' THEN 2 ELSE 0 END)"
+        "(CASE WHEN text ILIKE %s ESCAPE '\\' THEN 1 ELSE 0 END) + "
+        "(CASE WHEN path ILIKE %s ESCAPE '\\' THEN 2 ELSE 0 END)"
         for _ in keywords
     )
     like_any = " OR ".join(
-        "text LIKE ? ESCAPE '\\' OR path LIKE ? ESCAPE '\\'" for _ in keywords
+        "text ILIKE %s ESCAPE '\\' OR path ILIKE %s ESCAPE '\\'" for _ in keywords
     )
     # Doc files (README/HISTORY/…) often mention a term in prose; for "where is
     # X handled" the real source file should win, so penalize docs a little.
     doc_penalty = (
-        "(CASE WHEN lower(path) LIKE '%.md' OR lower(path) LIKE '%.rst' "
-        "OR lower(path) LIKE '%.txt' OR lower(path) LIKE '%.markdown' "
+        "(CASE WHEN lower(path) LIKE '%%.md' OR lower(path) LIKE '%%.rst' "
+        "OR lower(path) LIKE '%%.txt' OR lower(path) LIKE '%%.markdown' "
         "THEN 2 ELSE 0 END)"
     )
     sql = (
         f"SELECT path, start_line, end_line, text, "
         f"(({score_terms}) - {doc_penalty}) AS score "
-        "FROM repo_chunks WHERE conversation_id = ? "
-        f"AND ({like_any}) ORDER BY score DESC, id LIMIT ?"
+        "FROM repo_chunks WHERE conversation_id = %s "
+        f"AND ({like_any}) ORDER BY score DESC, id LIMIT %s"
     )
-    # Bind in the ORDER the ? placeholders appear in the SQL text:
+    # Bind in the ORDER the %s placeholders appear in the SQL text:
     # score_terms (SELECT) → conversation_id (WHERE) → like_any (AND) → limit.
     params: List[object] = []
     for p in patterns:
@@ -924,7 +1510,7 @@ def search_repo_chunks(
     for p in patterns:
         params += [p, p]  # like_any
     params.append(limit)
-    with closing(connect()) as con:
+    with connection() as con:
         rows = con.execute(sql, params).fetchall()
     return [
         {
@@ -957,8 +1543,8 @@ def like_contains_pattern(needle: str) -> str:
     itself are escaped so searching for "50%" or "q_1" matches those literal
     characters instead of turning into a wildcard. Every statement using this
     pattern MUST pair it with the matching ESCAPE clause (see _SEARCH_SQL) —
-    without one, SQLite treats the backslashes as ordinary characters and the
-    escaping silently becomes corruption.
+    without one, PostgreSQL still treats `\\` as the default escape, but being
+    explicit is what keeps the behaviour identical if that ever changes.
     """
     escaped = (
         needle.replace(_LIKE_ESCAPE, _LIKE_ESCAPE * 2)
@@ -975,7 +1561,7 @@ def snippet_window(content: str, needle: str, width: int = _SNIPPET_WIDTH) -> st
     Short messages come back whole; a trimmed end gets an ellipsis so the
     palette can show that the message continues. When the hit sits near the
     tail the window is slid back so it stays `width` wide instead of running
-    short. `needle` not being found is not an error (SQLite's LIKE and Python's
+    short. `needle` not being found is not an error (SQL's LIKE and Python's
     casefolding can disagree on exotic characters) — the head of the message is
     a reasonable snippet in that case.
     """
@@ -994,8 +1580,33 @@ def snippet_window(content: str, needle: str, width: int = _SNIPPET_WIDTH) -> st
     return snippet
 
 
-# `:pattern` is reused for the title test, the existence test and the snippet
-# lookup. ESCAPE '\' is what makes like_contains_pattern's escaping real.
+# ILIKE, not LIKE. SQLite's LIKE is case-INSENSITIVE for ASCII, so a verbatim
+# port silently stops matching anything capitalised — searching "merger" would
+# miss a chat titled "Merger". The `gin_trgm_ops` indexes on `messages.content`
+# and `conversations.title` serve ILIKE too, so this costs nothing.
+# ESCAPE '\' is what makes like_contains_pattern's escaping real.
+#
+# The QUERY SHAPE is deliberately unchanged from the SQLite original — the
+# correlated subquery that looks like it should be rewritten. It was rewritten,
+# as a single-pass `DISTINCT ON` CTE, and then reverted, because the rewrite is
+# only faster on a corpus small enough for the difference not to matter.
+# Measured on 200,000 messages / 10,000 conversations:
+#
+#                        selective needle   needle matching everything
+#   correlated (this)          2.5 ms                80 ms
+#   DISTINCT ON CTE            7.8 ms                61 ms
+#
+# The correlated form wins 3x on the SELECTIVE case — a user searching their
+# own history types a distinctive word. EXPLAIN shows why, and it is NOT
+# short-circuiting: PostgreSQL de-correlates the EXISTS into a *hashed* SubPlan
+# evaluated once against idx_messages_content_trgm. When that hash holds a
+# handful of ids the outer walk discards almost everything cheaply and the
+# per-row snippet subquery runs only for the survivors. The CTE instead has to
+# materialise every match and SORT it for `DISTINCT ON` before it can return a
+# single row, which only pays off when nearly everything matches. On the
+# 378-message live database the two are within 1 ms, so the small-scale
+# benchmark that motivated the rewrite was measuring noise.
+#
 # Archived conversations are deliberately NOT filtered out — they come back
 # flagged so the palette can label them (§2).
 _SEARCH_SQL = """
@@ -1003,18 +1614,18 @@ SELECT c.id, c.title, c.updated_at, c.pinned, c.archived,
        (SELECT m.content
           FROM messages m
          WHERE m.conversation_id = c.id
-           AND m.content LIKE :pattern ESCAPE '\\'
+           AND m.content ILIKE %(pattern)s ESCAPE '\\'
          ORDER BY m.id
          LIMIT 1) AS match_content
   FROM conversations c
- WHERE c.user_id = :user_id
-   AND (c.title LIKE :pattern ESCAPE '\\'
+ WHERE c.user_id = %(user_id)s
+   AND (c.title ILIKE %(pattern)s ESCAPE '\\'
         OR EXISTS (SELECT 1
                      FROM messages m2
                     WHERE m2.conversation_id = c.id
-                      AND m2.content LIKE :pattern ESCAPE '\\'))
- ORDER BY c.pinned DESC, c.updated_at DESC, c.rowid DESC
- LIMIT :limit
+                      AND m2.content ILIKE %(pattern)s ESCAPE '\\'))
+ ORDER BY c.pinned DESC, c.updated_at DESC, c.seq DESC
+ LIMIT %(limit)s
 """
 
 
@@ -1031,34 +1642,44 @@ def recall_conversations(
     any of `keywords`, ranked by how many messages match. Returns
     [{id, title, snippet}] — a compact recall context for the model. Scoped to
     the owner like every accessor here; the current conversation is excluded.
+
+    One statement, not the old rank-then-snippet-per-row pair: LATERAL fetches
+    each winner's snippet in the same pass, so this no longer issues N+1
+    queries (it was 1 + `limit` round trips, each paying the old connect() tax).
     """
     if not keywords:
         return []
     patterns = [like_contains_pattern(k) for k in keywords]
-    like_any = " OR ".join("m.content LIKE ? ESCAPE '\\'" for _ in keywords)
-    rank_sql = (
-        "SELECT c.id, c.title, COUNT(m.id) AS hits "
-        "FROM conversations c JOIN messages m ON m.conversation_id = c.id "
-        f"WHERE c.user_id = ? AND c.id != ? AND ({like_any}) "
-        "GROUP BY c.id ORDER BY hits DESC, c.updated_at DESC LIMIT ?"
+    like_any = " OR ".join("m.content ILIKE %s ESCAPE '\\'" for _ in keywords)
+    snippet_any = " OR ".join("s.content ILIKE %s ESCAPE '\\'" for _ in keywords)
+    sql = (
+        "WITH ranked AS ("
+        "  SELECT c.id, c.title, c.updated_at, COUNT(m.id) AS hits"
+        "    FROM conversations c JOIN messages m ON m.conversation_id = c.id"
+        f"   WHERE c.user_id = %s AND c.id <> %s AND ({like_any})"
+        "   GROUP BY c.id, c.title, c.updated_at"
+        "   ORDER BY hits DESC, c.updated_at DESC"
+        "   LIMIT %s"
+        ") "
+        "SELECT ranked.id, ranked.title, snip.content "
+        "  FROM ranked "
+        "  LEFT JOIN LATERAL ("
+        "    SELECT s.content FROM messages s"
+        f"    WHERE s.conversation_id = ranked.id AND ({snippet_any})"
+        "     ORDER BY s.id LIMIT 1"
+        "  ) AS snip ON true "
+        " ORDER BY ranked.hits DESC, ranked.updated_at DESC"
     )
-    snip_sql = (
-        "SELECT m.content FROM messages m "
-        f"WHERE m.conversation_id = ? AND ({like_any}) ORDER BY m.id LIMIT 1"
-    )
+    params: List[object] = [user_id, exclude_conversation_id or "", *patterns, limit]
+    params += patterns
+    with connection() as con:
+        rows = con.execute(sql, params).fetchall()
     out: List[dict] = []
-    with closing(connect()) as con:
-        rows = con.execute(
-            rank_sql,
-            (user_id, exclude_conversation_id or "", *patterns, limit),
-        ).fetchall()
-        for r in rows:
-            srow = con.execute(snip_sql, (r["id"], *patterns)).fetchone()
-            content = (srow["content"] if srow else "") or ""
-            snippet = content.strip().replace("\n", " ")
-            if len(snippet) > _RECALL_SNIPPET_CHARS:
-                snippet = snippet[:_RECALL_SNIPPET_CHARS] + "…"
-            out.append({"id": r["id"], "title": r["title"], "snippet": snippet})
+    for r in rows:
+        content = (r["content"] or "").strip().replace("\n", " ")
+        if len(content) > _RECALL_SNIPPET_CHARS:
+            content = content[:_RECALL_SNIPPET_CHARS] + "…"
+        out.append({"id": r["id"], "title": r["title"], "snippet": content})
     return out
 
 
@@ -1077,7 +1698,7 @@ def search_conversations(
     if not query:  # empty/whitespace query is a no-op, not an error (§2)
         return []
     limit = max(1, min(int(limit), SEARCH_LIMIT_MAX))
-    with closing(connect()) as con:
+    with connection() as con:
         rows = con.execute(
             _SEARCH_SQL,
             {
@@ -1093,7 +1714,7 @@ def search_conversations(
             {
                 "id": row["id"],
                 "title": row["title"],
-                "updated_at": row["updated_at"],
+                "updated_at": _iso(row["updated_at"]),
                 "pinned": bool(row["pinned"]),
                 "archived": bool(row["archived"]),
                 "snippet": (

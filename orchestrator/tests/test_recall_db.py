@@ -6,8 +6,7 @@ from app.config import settings
 
 
 @pytest.fixture()
-def temp_db(tmp_path, monkeypatch):
-    monkeypatch.setattr(settings, "app_db_path", str(tmp_path / "app.sqlite3"))
+def temp_db():
     uid = db.create_user("alice", "hash")
     db.create_conversation(uid, "c1", "Zephyr launch planning")
     db.add_message(uid, "c1", "user", "Zephyr launch date is September 30, budget 250000.")

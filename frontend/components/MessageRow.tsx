@@ -11,7 +11,7 @@
  * behind the Sources button instead.
  */
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { ChatMessage } from '@/lib/types';
 import {
   loadFeedback,
@@ -50,6 +50,7 @@ export function MessageRow({
   onRegenerate,
   onShowSummary,
   onRetry,
+  onFeedback,
 }: {
   message: ChatMessage;
   isLast: boolean;
@@ -57,19 +58,44 @@ export function MessageRow({
   /** Opens the read-only rolling-summary panel (compaction notice). */
   onShowSummary?: () => void;
   onRetry: () => void;
+  /** Persist a thumb server-side. Omitted in contexts with no store
+   *  (previews, tests), where the localStorage fallback still applies. */
+  onFeedback?: (feedback: MessageFeedback | null) => void;
 }) {
   // Hooks live above the user-bubble early return (rules of hooks).
   const [activityOpen, setActivityOpen] = useState(false);
-  const [feedback, setFeedback] = useState<MessageFeedback | null>(() =>
-    typeof window === 'undefined'
+  // The SERVER's value wins when the message has one: it is the copy that
+  // survives a reload. localStorage is the fallback for messages that have
+  // not been stored yet (and for anything rendering without a store), which
+  // is also the whole reason thumbs used to disappear on refresh — a
+  // rehydrated message is keyed differently from the live one it replaced.
+  const [feedback, setFeedback] = useState<MessageFeedback | null>(() => {
+    if (message.feedback === 'up' || message.feedback === 'down') {
+      return message.feedback;
+    }
+    if (message.feedback === null) return null;
+    return typeof window === 'undefined'
       ? null
-      : loadFeedback(window.localStorage, message.id),
-  );
+      : loadFeedback(window.localStorage, message.id);
+  });
+
+  // A conversation loaded after this row first rendered (or refreshed by a
+  // detached generation) brings the stored thumb with it.
+  useEffect(() => {
+    if (message.feedback === 'up' || message.feedback === 'down') {
+      setFeedback(message.feedback);
+    } else if (message.feedback === null) {
+      setFeedback(null);
+    }
+  }, [message.feedback]);
 
   function onThumb(kind: MessageFeedback) {
     const next = toggleFeedback(feedback, kind);
     setFeedback(next);
+    // Keep writing localStorage: it is what covers a message with no server
+    // row yet, and it costs nothing for one that has one.
     saveFeedback(window.localStorage, message.id, next);
+    onFeedback?.(next);
   }
 
   if (message.role === 'user') {

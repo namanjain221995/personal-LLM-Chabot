@@ -10,7 +10,7 @@ in `conversation_chunks` keyed by conversation_id and the only read path is
 `db.get_conversation_chunks(conversation_id)`. Nothing can return another
 session's text because nothing else is ever loaded.
 
-Storage note: these embeddings live in SQLite next to the chunk, NOT in the
+Storage note: these embeddings live in PostgreSQL next to the chunk, NOT in the
 LanceDB `chunks` table. That table is the SALESFORCE corpus — the RAG engine
 searches it and renders hits as sourced Salesforce citations, so putting
 conversation text there would let private chat content surface as if it came
@@ -104,7 +104,7 @@ async def index_folded(
     rows = [
         {**m, "embedding": pack_vector(v)} for m, v in zip(meta, vectors)
     ]
-    db.add_conversation_chunks(conversation_id, rows)
+    await db.run_in_thread(db.add_conversation_chunks, conversation_id, rows)
     return len(rows)
 
 
@@ -126,7 +126,7 @@ async def retrieve_block(
     if not settings.semantic_recall_enabled or not (question or "").strip():
         return None
     try:
-        chunks = db.get_conversation_chunks(conversation_id)
+        chunks = await db.run_in_thread(db.get_conversation_chunks, conversation_id)
         if not chunks:
             return None
         query = (await llm.embed_texts([question]))[0]

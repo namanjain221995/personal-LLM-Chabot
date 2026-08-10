@@ -50,7 +50,9 @@ async def fetch_and_store(
         return None
     if not ext.text.strip():
         return None
-    db.save_url_document(conversation_id, url, ext.title, ext.text)
+    await db.run_in_thread(
+        db.save_url_document, conversation_id, url, ext.title, ext.text
+    )
     return {"url": url, "title": ext.title, "text": ext.text}
 
 
@@ -85,12 +87,12 @@ async def run_url_engine(
     emit: Emit,
 ) -> str:
     """Fetch any new URLs, then answer from all pages stored for this chat."""
-    already = db.get_url_document_urls(conversation_id)
+    already = await db.run_in_thread(db.get_url_document_urls, conversation_id)
     for url in urls:
         if url not in already:
             await fetch_and_store(conversation_id, url, emit)
 
-    docs = db.get_url_documents(conversation_id)
+    docs = await db.run_in_thread(db.get_url_documents, conversation_id)
     if not docs:
         note = "I couldn't read any of those links."
         await emit("token", {"text": note})

@@ -20,6 +20,12 @@ export interface ServerMessage {
   role: string;
   content: string;
   meta?: Meta | null;
+  /** Server row id. Present on messages READ from the server; absent on ones
+   *  being pushed to it (the server assigns it). It is the only stable handle
+   *  a client has on a stored message — see MessageFeedback below. */
+  id?: number;
+  /** Thumbs, stored server-side since 2026-08-11. */
+  feedback?: 'up' | 'down' | null;
 }
 
 export interface ServerConversation {
@@ -96,6 +102,19 @@ export interface HistoryApi {
   update(id: string, patch: ConversationPatch): Promise<void>;
   remove(id: string): Promise<void>;
   appendMessage(id: string, message: ServerMessage): Promise<void>;
+  /**
+   * Thumbs up/down on one stored message, or null to clear it.
+   *
+   * Keyed by the SERVER message id, which is why `ServerMessage.id` exists:
+   * the browser's own ids are useless here — a live message carries a random
+   * uuid and a rehydrated one a positional `srv-<conversation>-<index>`, so
+   * feedback kept client-side was silently lost on reload.
+   */
+  setFeedback(
+    id: string,
+    messageId: number,
+    feedback: 'up' | 'down' | null,
+  ): Promise<void>;
   /**
    * Replace the whole thread atomically. The server REFUSES (409) when the
    * incoming thread is shorter than what it stores — the guard that stops a
@@ -178,6 +197,13 @@ export function createHistoryApi(fetchFn?: FetchLike): HistoryApi {
     },
     async appendMessage(id, message) {
       await request('POST', `/${encodeURIComponent(id)}/messages`, message);
+    },
+    async setFeedback(id, messageId, feedback) {
+      await request(
+        'PUT',
+        `/${encodeURIComponent(id)}/messages/${messageId}/feedback`,
+        { feedback },
+      );
     },
     async replaceMessages(id, messages) {
       await request('PUT', `/${encodeURIComponent(id)}/messages`, { messages });

@@ -328,8 +328,6 @@ def test_trim_notice_reaches_the_chat_meta(monkeypatch, tmp_path):
     from app.config import settings as _settings
     from app.main import app
 
-    monkeypatch.setattr(_settings, "app_db_path", str(tmp_path / "app.sqlite3"))
-
     async def fake_events(messages, **kwargs):
         # Pretend the budget module had to clip something on this request.
         context._record_trim(0, 1)

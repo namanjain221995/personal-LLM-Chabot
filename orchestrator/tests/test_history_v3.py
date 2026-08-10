@@ -1,11 +1,10 @@
 """V3-DESIGN §1: pin / archive on conversations — schema migration, the
 ?archived list filter, pinned-first ordering, and the extended PUT.
 
-All offline. The migration tests matter most: the real database holds the
-owner's conversations, so the migration must be additive and idempotent.
+All offline apart from the test PostgreSQL (see conftest). The migration tests
+matter most: the real database holds the owner's conversations, so applying the
+schema must never touch a row that is already there.
 """
-import sqlite3
-
 import pytest
 from fastapi.testclient import TestClient
 
@@ -13,37 +12,9 @@ from app import db
 from app.config import settings
 from app.main import app
 
-# The conversations table exactly as V2 shipped it — no pinned, no archived.
-V2_SCHEMA = """
-CREATE TABLE users (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    username      TEXT NOT NULL UNIQUE COLLATE NOCASE,
-    password_hash TEXT NOT NULL,
-    created_at    TEXT NOT NULL
-);
-CREATE TABLE conversations (
-    id         TEXT PRIMARY KEY,
-    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    title      TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-CREATE TABLE messages (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-    role            TEXT NOT NULL,
-    content         TEXT NOT NULL,
-    meta            TEXT,
-    created_at      TEXT NOT NULL
-);
-CREATE INDEX idx_conversations_user ON conversations(user_id, updated_at DESC);
-CREATE INDEX idx_messages_conversation ON messages(conversation_id, id);
-"""
-
 
 @pytest.fixture()
 def env(tmp_path, monkeypatch):
-    monkeypatch.setattr(settings, "app_db_path", str(tmp_path / "app.sqlite3"))
     monkeypatch.setattr(settings, "session_secret_file", str(tmp_path / ".session_secret"))
     monkeypatch.delenv("SESSION_SECRET", raising=False)
 
@@ -64,12 +35,14 @@ def bob(env, as_user):
         yield c
 
 
-def _columns(path) -> set:
-    con = sqlite3.connect(str(path))
-    try:
-        return {r[1] for r in con.execute("PRAGMA table_info(conversations)")}
-    finally:
-        con.close()
+def _columns(table: str = "conversations") -> set:
+    with db.connection() as con:
+        rows = con.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = 'public' AND table_name = %s",
+            (table,),
+        ).fetchall()
+    return {r["column_name"] for r in rows}
 
 
 def _new(client, title: str) -> str:
@@ -88,89 +61,73 @@ def _ids(client, **params) -> list:
 # Migration — against a V2-era database holding real rows
 # ---------------------------------------------------------------------------
 
-def test_migration_upgrades_an_old_database_without_touching_rows(tmp_path, monkeypatch):
-    """Simulate the live V2 database: old schema, existing user/conversation/
-    message rows. Migrating (twice) must add the columns, default them to 0,
-    and leave every existing row exactly as it was."""
-    path = tmp_path / "app.sqlite3"
-    monkeypatch.setattr(settings, "app_db_path", str(path))
+def test_applying_the_schema_never_touches_existing_rows():
+    """Simulate the live database: real user/conversation/message rows already
+    present. Re-applying the schema (twice) must be a pure no-op — no dropped
+    column, no rewritten row, no reset flag.
 
-    seed = sqlite3.connect(str(path))
-    seed.executescript(V2_SCHEMA)
-    seed.execute(
-        "INSERT INTO users (id, username, password_hash, created_at) VALUES (?,?,?,?)",
-        (1, "owner", "argon2-hash", "2026-01-01T00:00:00+00:00"),
-    )
-    seed.execute(
-        "INSERT INTO conversations (id, user_id, title, created_at, updated_at) "
-        "VALUES (?,?,?,?,?)",
-        ("real-conv", 1, "Q3 pipeline review", "2026-01-01T00:00:00+00:00",
-         "2026-01-02T00:00:00+00:00"),
-    )
-    seed.execute(
-        "INSERT INTO messages (conversation_id, role, content, meta, created_at) "
-        "VALUES (?,?,?,?,?)",
-        ("real-conv", "user", "top accounts?", None, "2026-01-02T00:00:00+00:00"),
-    )
-    seed.commit()
-    seed.close()
+    Under SQLite this guarded an ALTER-only `migrate()`. The PostgreSQL runner
+    replaces that with numbered migrations recorded in `schema_migrations`, and
+    the property being protected is identical: an already-migrated database is
+    left completely alone.
+    """
+    uid = db.create_user("owner", "argon2-hash")
+    db.create_conversation(uid, "real-conv", "Q3 pipeline review")
+    db.update_conversation(uid, "real-conv", pinned=True)
+    db.add_message(uid, "real-conv", "user", "top accounts?")
+    before = db.get_conversation(uid, "real-conv")
+    before_messages = db.list_messages("real-conv")
 
-    assert _columns(path) == {"id", "user_id", "title", "created_at", "updated_at"}
+    assert {"id", "user_id", "title", "created_at", "updated_at", "pinned",
+            "archived", "seq"} == _columns()
+    assert db.schema_version() == 3
 
-    # Run the migration twice — the second run must be a pure no-op.
     for _ in range(2):
-        con = db.connect()
-        db.migrate(con)  # explicit re-run on top of connect()'s own migration
-        con.close()
+        db.init_schema()  # explicit re-run
 
-    assert _columns(path) == {
-        "id", "user_id", "title", "created_at", "updated_at", "pinned", "archived",
-    }
+    assert db.schema_version() == 3
+    with db.connection() as con:
+        applied = con.execute("SELECT COUNT(*) AS n FROM schema_migrations").fetchone()
+    assert applied["n"] == 3, "a migration was recorded twice"
 
-    # The owner's row survived, unchanged, with the new flags defaulted to 0/0.
-    con = sqlite3.connect(str(path))
-    con.row_factory = sqlite3.Row
-    rows = con.execute("SELECT * FROM conversations").fetchall()
-    messages = con.execute("SELECT role, content FROM messages").fetchall()
-    users = con.execute("SELECT username FROM users").fetchall()
-    con.close()
+    assert db.get_conversation(uid, "real-conv") == before
+    assert db.list_messages("real-conv") == before_messages
+    assert before["title"] == "Q3 pipeline review"
+    assert before["pinned"] is True and before["archived"] is False
+    assert db.get_user_by_id(uid)["username"] == "owner"
 
-    assert len(rows) == 1
-    row = rows[0]
-    assert row["id"] == "real-conv"
-    assert row["title"] == "Q3 pipeline review"
-    assert row["created_at"] == "2026-01-01T00:00:00+00:00"
-    assert row["updated_at"] == "2026-01-02T00:00:00+00:00"
-    assert row["pinned"] == 0 and row["archived"] == 0
-    assert [tuple(m) for m in messages] == [("user", "top accounts?")]
-    assert [u["username"] for u in users] == ["owner"]
 
-    # And the migrated row is readable through the normal accessors.
-    conversation = db.get_conversation(1, "real-conv")
-    assert conversation["pinned"] is False and conversation["archived"] is False
-    assert db.list_conversations(1) == [
-        {
-            "id": "real-conv",
-            "title": "Q3 pipeline review",
-            "updated_at": "2026-01-02T00:00:00+00:00",
-            "pinned": False,
-            "archived": False,
-        }
-    ]
+def test_timestamps_keep_the_iso_8601_shape_the_frontend_parses():
+    """`timestamptz` in, the same string out.
+
+    The columns are real timestamps now, but every consumer — the sidebar's
+    ordering, the search palette, the offline sync's toEpoch() — has always
+    received `datetime.now(timezone.utc).isoformat()`. A `+00` offset or a
+    space instead of the `T` would be a silent client-side break.
+    """
+    import re
+
+    uid = db.create_user("stamp", "hash")
+    created = db.create_conversation(uid, "ts-conv", "when")
+    fetched = db.get_conversation(uid, "ts-conv")
+
+    iso = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?\+00:00$")
+    for value in (created["created_at"], created["updated_at"],
+                  fetched["created_at"], fetched["updated_at"]):
+        assert iso.match(value), value
+    # What create_conversation reported is what the database actually holds.
+    assert fetched["created_at"] == created["created_at"]
 
 
 def test_migration_is_idempotent_on_a_current_database(env):
     """Repeated migrations of an already-current DB change nothing."""
     with TestClient(app) as c:
-        c.post("/auth/register", json={"username": "carol", "password": "long-enough-3"})
         conv_id = _new(c, "keep me")
         assert c.put(f"/history/conversations/{conv_id}", json={"pinned": True}).status_code == 200
         before = c.get(f"/history/conversations/{conv_id}").json()
 
         for _ in range(3):
-            con = db.connect()
-            db.migrate(con)
-            con.close()
+            db.init_schema()
 
         assert c.get(f"/history/conversations/{conv_id}").json() == before
         assert before["pinned"] is True

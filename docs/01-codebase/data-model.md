@@ -1,191 +1,177 @@
 # Data model — the three persistence layers
 
-Everything the platform stores lives in the single `data` Docker volume, mounted **read-write into
+Almost everything the platform stores lives in the single `data` Docker volume, mounted **read-write into
 both** the orchestrator ([docker-compose.yml:269](../../docker-compose.yml#L269)) and the sync worker
 ([:320](../../docker-compose.yml#L320)), plus a separate `reports` volume
 ([:270](../../docker-compose.yml#L270)).
 
 | Layer | Path | Writer | Reader | Engine |
 |---|---|---|---|---|
-| **App state** | `/data/app.sqlite3` ([config.py:255](../../orchestrator/app/config.py#L255)) | orchestrator only | orchestrator only | stdlib `sqlite3`, WAL |
+| **App state** | PostgreSQL `postgres:5432` (`APP_DATABASE_URL`), volume `pgdata` | orchestrator only | orchestrator only | PostgreSQL 18 + `psycopg_pool` |
 | **Analytics warehouse** | `/data/warehouse.duckdb` ([:245,316](../../docker-compose.yml#L245)) | sync worker only (read-write) | orchestrator (**`read_only=True`**) | DuckDB |
 | **Vector index** | `/data/lancedb` ([:246,317](../../docker-compose.yml#L246)) | sync worker only | orchestrator | LanceDB |
 | Batch landing zone | `/data/parquet` ([:247,318](../../docker-compose.yml#L247)) | sync worker only | **nothing** | Parquet files |
 | Ephemeral workspaces | `/data/workspaces` ([config.py:214](../../orchestrator/app/config.py#L214)) | orchestrator | orchestrator | filesystem |
 | Generated reports | `/reports` ([:248](../../docker-compose.yml#L248)) | orchestrator | orchestrator | filesystem |
 
-`APP_DB_PATH`, `WORKSPACE_DIR` and `LANCEDB_TABLE` are **not** forwarded by compose, so their
-`config.py` defaults are what actually apply in the container.
+`WORKSPACE_DIR` and `LANCEDB_TABLE` are **not** forwarded by compose, so their `config.py`
+defaults are what actually apply in the container. `APP_DATABASE_URL` **is** forwarded, built
+from the same `POSTGRES_*` variables the `postgres` service uses. `APP_DB_PATH` is gone.
 
 ---
 
-## `app.sqlite3` — application state
+## PostgreSQL — application state
 
-**Purpose** — The entire app-state persistence layer: users, conversations, messages, rolling
-summaries, embedded conversation chunks, dataset uploads, fetched URLs, cloned repos and repo chunks.
-Explicitly *not* the analytics data plane ([db.py:1-9](../../orchestrator/app/db.py#L1-L9)).
+**Changed 2026-08-10.** This layer was `/data/app.sqlite3` (stdlib `sqlite3`, WAL,
+one short-lived connection per operation). It is now PostgreSQL 18, reached over the
+compose network at `postgres:5432`, through a single process-wide
+`psycopg_pool.ConnectionPool`. **The SQLite file has been deleted** from the `data`
+volume; a gzipped copy is kept at `~/sf-local-ai-backups/`. Browse the tables at
+**http://127.0.0.1:5050** (pgAdmin, loopback-only, connection pre-registered).
 
-**Public surface** — one DDL constant and one connection factory; every accessor in the 1,064-line
-module goes through them.
+**Purpose** — unchanged: users, conversations, messages, rolling summaries, embedded
+conversation chunks, dataset uploads, fetched URLs, cloned repos and repo chunks.
+Explicitly *not* the analytics data plane ([db.py:1-7](../../orchestrator/app/db.py#L1-L7)).
+DuckDB and LanceDB were **not** migrated and are unaffected — DuckDB is a columnar
+engine and is faster than PostgreSQL at the scan-and-aggregate queries the SQL engine
+writes, so moving it would have been a downgrade.
 
-| Symbol | Signature | `file:line` |
+### Public surface
+
+| Symbol | Signature | Purpose |
 |---|---|---|
-| `_SCHEMA` | DDL script, 9 tables + 6 indexes | [db.py:22-134](../../orchestrator/app/db.py#L22-L134) |
-| `_ADDED_CONVERSATION_COLUMNS` | `(("pinned", …), ("archived", …))` | [db.py:141-144](../../orchestrator/app/db.py#L141-L144) |
-| `_ADDED_MESSAGE_COLUMNS` | `(("generation_id", "TEXT"),)` | [db.py:146](../../orchestrator/app/db.py#L146) |
-| `utcnow` | `() -> str` (ISO-8601 UTC) | [db.py:149](../../orchestrator/app/db.py#L149) |
-| `migrate` | `(con: sqlite3.Connection) -> None` | [db.py:153](../../orchestrator/app/db.py#L153) |
-| `connect` | `() -> sqlite3.Connection` | [db.py:195](../../orchestrator/app/db.py#L195) |
+| `pool()` | `() -> ConnectionPool` | Lazily opened, rebuilt when the DSN changes (what lets tests point elsewhere) |
+| `connection()` | context manager | A pooled connection in one transaction; commit on clean exit, rollback on exception |
+| `init_schema()` | `() -> None` | Applies unapplied migrations under `pg_advisory_xact_lock`; called once from the FastAPI lifespan |
+| `schema_version()` | `() -> int` | Highest applied migration; what `/health` asserts |
+| `close_pool()` | `() -> None` | Shutdown, and between tests |
+| `run_in_thread(fn, *a)` | `async` | Awaits a blocking accessor from `async def` without stalling the event loop |
+| `IntegrityError` / `UniqueViolation` / `OperationalError` / `Error` | aliases | Driver-neutral, so nothing outside `db.py` imports psycopg |
 
-### Full DDL
+All 26 data accessors keep the **names, signatures and return shapes** they had under
+SQLite. Rows are plain `dict` (psycopg's `dict_row`), which supports `row["col"]` and
+`dict(row)` exactly as `sqlite3.Row` did — that is why the ~24 call sites did not change.
+Positional access (`row[0]`) is the one capability lost; no app code used it.
 
-| Table | Columns | FK to `conversations`? | `file:line` |
+### Migrations
+
+Numbered, recorded, applied once — replacing "additive `ALTER` re-evaluated on every
+connection".
+
+| Version | What | Where |
+|---|---|---|
+| 1 | The 10 tables, `pg_trgm`, indexes, the partial unique index on `(conversation_id, generation_id)` | [db.py `_MIGRATION_V1`](../../orchestrator/app/db.py) |
+| 2 | Drops three trigram indexes measured at **0 scans / 8.8 MB** on the live database; rebuilds `idx_conversations_user` to include `archived` | [db.py `_MIGRATION_V2`](../../orchestrator/app/db.py) |
+| 3 | `messages.feedback` (`up`/`down`, CHECK-constrained) + `feedback_at`, and a partial index on the rated rows | [db.py `_MIGRATION_V3`](../../orchestrator/app/db.py) |
+
+`init_schema()` runs `SELECT pg_advisory_xact_lock(...)` and the DDL in ONE transaction:
+two orchestrators starting together serialise instead of racing, PostgreSQL's
+transactional DDL rolls a failed migration back whole, and the transaction-scoped lock
+cannot leak through the pool the way a session-scoped one would.
+
+### Type mapping — every difference from the SQLite schema
+
+| SQLite | PostgreSQL | Why it matters |
+|---|---|---|
+| `INTEGER PRIMARY KEY AUTOINCREMENT` | `GENERATED BY DEFAULT AS IDENTITY` | `BY DEFAULT`, not `ALWAYS`, so the data migration can insert original ids. The sequence must then be advanced with `setval` — the classic post-migration bug |
+| `TEXT` ISO-8601 timestamps | `timestamptz` | `_iso()` renders them back to the identical strings; the session is pinned to UTC in the pool's libpq `options`, so this is not session-dependent |
+| `INTEGER` 0/1 flags | `boolean` | Real booleans; `_conversation_dict` still coerces |
+| `TEXT` holding JSON (`meta`, `profile`) | `jsonb` | psycopg adapts `dict` both ways, deleting six `json.dumps`/`loads` sites |
+| `BLOB` (`embedding`) | `bytea` | Same packed float32 bytes; read back as `bytes()`, since psycopg returns a `memoryview` |
+| `UNIQUE COLLATE NOCASE` | `UNIQUE INDEX ON (lower(username))` | `citext` is discouraged upstream; a nondeterministic ICU collation would make `ILIKE` on the column a hard error. The cluster is initdb'd `--locale=C`, under which `lower()` folds ASCII only — exactly what `NOCASE` did |
+| implicit `rowid` (ordering tiebreak) | `conversations.seq` identity column | Backfilled from the original `rowid`, so the sidebar order survived the move |
+| `LIKE` | **`ILIKE`** | **The one silent-correctness trap.** SQLite's `LIKE` is case-insensitive for ASCII; PostgreSQL's is not. Ported verbatim, the search palette stops matching anything capitalised |
+| `INSERT OR REPLACE` | `ON CONFLICT … DO UPDATE` | Keeps the row and its id instead of delete+insert |
+| (accepts embedded NUL) | rejects it | `_text()` strips `\x00` from every string bound to a `text` column, and `_dumps_jsonb()` strips the `\u0000` escape. Model output, OCR/PDF transcripts and scraped pages all flow into these columns |
+
+### Per-message feedback
+
+`messages.feedback` (`'up' | 'down' | NULL`) and `messages.feedback_at`, added
+2026-08-11. Stored on the message rather than in a side table: one user, no
+audit requirement, it cascades with the conversation, and it arrives in the
+same `SELECT` the thread already does.
+
+This replaced a localStorage-only implementation that had a **silent data-loss
+bug**. The browser keys feedback by a client-side message id, but a live
+message carries `crypto.randomUUID()` while the same message rehydrated from
+the server is keyed positionally as `srv-<conversation>-<index>` — so a thumb
+given to a fresh reply was lost on the next reload.
+
+Two consequences worth knowing:
+
+- **`list_messages` now returns `id`.** It previously returned only
+  `{role, content, meta}`, which is *why* feedback could not be stored: the
+  client had no stable handle on a stored message. `PUT
+  /history/conversations/{cid}/messages/{mid}/feedback` is keyed by that id and
+  is owner-scoped in the `UPDATE` statement itself — a message in someone
+  else's conversation is a 404, indistinguishable from a missing one.
+- **`replace_messages` carries thumbs across the rewrite.** It deletes and
+  reinserts every row, so all ids change; the offline sync does exactly that
+  whenever the tail diverges. Thumbs are carried **by position**, which is only
+  sound because that function can never reorder or shrink a thread. An explicit
+  `feedback` in the pushed payload wins, so a thumb cleared in one tab is not
+  resurrected by a sync from another.
+
+### Foreign keys — and the ones deliberately NOT added
+
+`messages`, `conversation_summaries` and `conversation_chunks` declare
+`REFERENCES conversations(id) ON DELETE CASCADE`, as under SQLite.
+
+`uploads`, `url_documents`, `documents`, `repos` and `repo_chunks` deliberately do **not**.
+They were given the key during this port and it had to be reverted: `/chat` supports a
+call with no `conversations` row at all (`conv_key = conversation_id or session_id`), and
+the foreign key turned "this chat fetched a URL" into a failed answer for those callers.
+The test suite caught it.
+
+**`DATA-03` is fixed anyway**, in `delete_conversation`: it now clears those five tables
+explicitly in the same transaction. Previously a delete orphaned a conversation's
+uploads, fetched page text, repo records and code chunks permanently.
+
+### Performance — what the move actually bought
+
+Measured on this box, live data (378 messages), old layer vs new, back to back:
+
+| | SQLite | PostgreSQL | |
 |---|---|---|---|
-| `users` | `id INTEGER PK AUTOINCREMENT`, `username TEXT NOT NULL UNIQUE COLLATE NOCASE`, `password_hash TEXT NOT NULL`, `created_at TEXT NOT NULL` | n/a | [db.py:23-28](../../orchestrator/app/db.py#L23-L28) |
-| `conversations` | `id TEXT PK` (**client-supplied**), `user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE`, `title`, `created_at`, `updated_at`, `pinned INTEGER NOT NULL DEFAULT 0`, `archived INTEGER NOT NULL DEFAULT 0` | n/a | [db.py:29-37](../../orchestrator/app/db.py#L29-L37) |
-| `messages` | `id INTEGER PK AUTOINCREMENT`, `conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE`, `role`, `content`, `meta TEXT`, `created_at`, `generation_id TEXT` | **YES — CASCADE** [:40](../../orchestrator/app/db.py#L40) | [db.py:38-51](../../orchestrator/app/db.py#L38-L51) |
-| `conversation_summaries` | `conversation_id TEXT PK REFERENCES conversations(id) ON DELETE CASCADE`, `summary`, `covers_through INTEGER`, `token_estimate INTEGER`, `updated_at` | **YES — CASCADE** [:56](../../orchestrator/app/db.py#L56) | [db.py:55-65](../../orchestrator/app/db.py#L55-L65) |
-| `conversation_chunks` | `id INTEGER PK AUTOINCREMENT`, `conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE`, `ordinal INTEGER`, `role`, `text`, `embedding BLOB NOT NULL`, `created_at`, `UNIQUE(conversation_id, ordinal)` | **YES — CASCADE** [:71](../../orchestrator/app/db.py#L71) | [db.py:69-78](../../orchestrator/app/db.py#L69-L78) |
-| `uploads` | `id TEXT PK`, `conversation_id TEXT NOT NULL`, `filename`, `bytes INTEGER`, `status`, `profile TEXT`, `notes TEXT`, `created_at` | **NO FK** | [db.py:84-93](../../orchestrator/app/db.py#L84-L93) |
-| `url_documents` | `id INTEGER PK AUTOINCREMENT`, `conversation_id TEXT NOT NULL`, `url`, `title`, `text`, `fetched_at`, `UNIQUE(conversation_id, url)` | **NO FK** | [db.py:102-110](../../orchestrator/app/db.py#L102-L110) |
-| `repos` | `id INTEGER PK AUTOINCREMENT`, `conversation_id TEXT NOT NULL`, `repo_key`, `url`, `sha`, `cloned_at`, `UNIQUE(conversation_id, repo_key)` | **NO FK** | [db.py:114-122](../../orchestrator/app/db.py#L114-L122) |
-| `repo_chunks` | `id INTEGER PK AUTOINCREMENT`, `conversation_id TEXT NOT NULL`, `repo_key`, `path`, `start_line INTEGER`, `end_line INTEGER`, `text` | **NO FK** | [db.py:123-131](../../orchestrator/app/db.py#L123-L131) |
+| `add_message` (write) | 8.49 ms | **2.78 ms** | 3.1x faster |
+| point reads (`conversation_owner`, `get_conversation`) | 0.26-0.28 ms | 0.37 ms | ~1.4x slower |
+| `search_conversations` | 0.75-1.97 ms | 4.4-5.7 ms | 3-6x slower |
+| `recall_conversations` | 1.52 ms | 9.66 ms | 6.4x slower |
 
-### Indexes
+**Read that write number carefully.** The SQLite code set `journal_mode=WAL` and never
+set `synchronous`, so it ran at the default `FULL`: measured here, the fsync was
+3.48 ms of a 3.49 ms write — 100% of the cost. At equal durability the engines are
+close; with durability relaxed SQLite wins by orders of magnitude
+(`synchronous=NORMAL` → 0.010 ms). The write win is over the code **as it was**, not
+evidence that PostgreSQL writes faster.
 
-| Index | Definition | `file:line` |
-|---|---|---|
-| `idx_conversation_chunks_conv` | `ON conversation_chunks(conversation_id, ordinal)` | [db.py:79-80](../../orchestrator/app/db.py#L79-L80) |
-| `idx_uploads_conversation` | `ON uploads(conversation_id, created_at)` | [db.py:94-95](../../orchestrator/app/db.py#L94-L95) |
-| `idx_conversations_user` | `ON conversations(user_id, updated_at DESC)` | [db.py:96-97](../../orchestrator/app/db.py#L96-L97) |
-| `idx_messages_conversation` | `ON messages(conversation_id, id)` | [db.py:98-99](../../orchestrator/app/db.py#L98-L99) |
-| `idx_url_documents_conv` | `ON url_documents(conversation_id, id)` | [db.py:111-112](../../orchestrator/app/db.py#L111-L112) |
-| `idx_repo_chunks_conv` | `ON repo_chunks(conversation_id, repo_key, id)` | [db.py:132-133](../../orchestrator/app/db.py#L132-L133) |
-| **`idx_messages_generation`** | `UNIQUE ON messages(conversation_id, generation_id) WHERE generation_id IS NOT NULL` — created in `migrate`, not `_SCHEMA` | [db.py:187-191](../../orchestrator/app/db.py#L187-L191) |
+At 200,000 messages / 10,000 conversations, search depends entirely on selectivity:
+a distinctive term is **2.5 ms** here versus ~19 ms for SQLite's linear scan, but a term
+matching most rows is **80 ms** versus 19 ms — no trigram index helps when everything
+matches.
 
-Four further indexes are implicit, created by SQLite for the `UNIQUE` constraints on
-`users.username`, `conversation_chunks(conversation_id, ordinal)`,
-`url_documents(conversation_id, url)` and `repos(conversation_id, repo_key)` — which makes
-`idx_conversation_chunks_conv` ([db.py:79-80](../../orchestrator/app/db.py#L79-L80)) redundant with the
-`UNIQUE` at [db.py:77](../../orchestrator/app/db.py#L77). **There is no index on `messages.content`**,
-so the `LIKE` scans at [db.py:963,972,995](../../orchestrator/app/db.py#L963) are full table scans.
+**So the honest case for this migration is not raw single-user latency.** It is:
+concurrent writers without a 5 s busy timeout and the HTTP 500 that followed it; real
+types; a schema that no longer rebuilds itself on every query (the old `connect()` ran
+15 DDL statements *plus an unconditional O(messages) `DELETE`* on all 34 call sites);
+and headroom for selective search as history grows.
 
-**Control flow** — `connect()` ([db.py:195-205](../../orchestrator/app/db.py#L195-L205)), executed by
-**every** accessor in the module:
-1. `Path(settings.app_db_path)` — [db.py:197](../../orchestrator/app/db.py#L197).
-2. `path.parent.mkdir(parents=True, exist_ok=True)` — [db.py:198](../../orchestrator/app/db.py#L198). A filesystem write on every call.
-3. `sqlite3.connect(str(path))` — [db.py:199](../../orchestrator/app/db.py#L199). **No `timeout=`** (stdlib default 5.0 s busy timeout) and **no `check_same_thread=False`**.
-4. `con.row_factory = sqlite3.Row` — [db.py:200](../../orchestrator/app/db.py#L200).
-5. **`PRAGMA journal_mode=WAL`** — [db.py:201](../../orchestrator/app/db.py#L201) — readers never block the writer.
-6. **`PRAGMA foreign_keys=ON`** — [db.py:202](../../orchestrator/app/db.py#L202). SQLite defaults this **off**, and it is per-connection, so setting it here on every connection is what makes the three CASCADE clauses real.
-7. `con.executescript(_SCHEMA)` — [db.py:203](../../orchestrator/app/db.py#L203) — 15 `CREATE … IF NOT EXISTS` statements, every time.
-8. `migrate(con)` — [db.py:204](../../orchestrator/app/db.py#L204).
+### Event-loop blocking
 
-`migrate` ([db.py:153-192](../../orchestrator/app/db.py#L153-L192)) — **the additive-only migration
-policy**, stated verbatim at [db.py:137-140](../../orchestrator/app/db.py#L137-L140): *"the live DB
-holds the owner's real conversations, so the only permitted migration step is `ALTER TABLE … ADD
-COLUMN`, and only when the column is missing — never a DROP, never a `CREATE … AS SELECT` rewrite,
-never a row update."*
-1. `PRAGMA table_info(conversations)`; return early if the table is absent — [db.py:161-163](../../orchestrator/app/db.py#L161-L163).
-2. Conditionally `ALTER TABLE conversations ADD COLUMN pinned|archived` — [db.py:164-166](../../orchestrator/app/db.py#L164-L166). Existing rows pick up `DEFAULT 0`.
-3. `PRAGMA table_info(messages)`; conditionally add `generation_id` — [db.py:167-171](../../orchestrator/app/db.py#L167-L171).
-4. **Unconditional** `DELETE FROM messages WHERE generation_id IS NOT NULL AND id NOT IN (SELECT MIN(id) … GROUP BY conversation_id, generation_id)` — [db.py:181-186](../../orchestrator/app/db.py#L181-L186). Written as a one-time repair for rows produced by the pre-index race, but it carries **no guard making it one-time**.
-5. `CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_generation … WHERE generation_id IS NOT NULL` — [db.py:187-191](../../orchestrator/app/db.py#L187-L191), then `commit()` — [db.py:192](../../orchestrator/app/db.py#L192).
+`db.py` is synchronous by design — `history.py`'s routes are plain `def`, which FastAPI
+already runs in the threadpool. The genuinely async callers (`main.py`, `compaction.py`,
+`recall.py`, `uploads.py`, the engines) go through `db.run_in_thread`, applied at 20+
+call sites. An AST check confirms **zero** blocking `db.*` calls remain inside
+`async def` — an improvement on the SQLite layer, where they all did.
 
-**One message per generation, enforced in the database.** The rationale is documented at
-[db.py:173-179](../../orchestrator/app/db.py#L173-L179): two browser tabs attached to the same detached
-answer append at the same moment, so an application-level "select then insert" loses the race. The
-partial unique index makes the second `INSERT` fail with `sqlite3.IntegrityError`, which `add_message`
-([db.py:736-743](../../orchestrator/app/db.py#L736-L743)) converts into a no-op returning the winning
-row with `"deduplicated": True` — and **re-raises when no `generation_id` was supplied**
-([db.py:743](../../orchestrator/app/db.py#L743)).
+### Failure modes
 
-**State & side effects** — Creates `app.sqlite3` plus its `-wal` and `-shm` sidecars. Writes on:
-`create_user` [db.py:216](../../orchestrator/app/db.py#L216), `create_conversation`
-[:271](../../orchestrator/app/db.py#L271), `update_conversation` [:324](../../orchestrator/app/db.py#L324),
-`delete_conversation` [:336](../../orchestrator/app/db.py#L336), `truncate_messages`
-[:603,609](../../orchestrator/app/db.py#L603), `replace_messages` [:642,657,671](../../orchestrator/app/db.py#L642),
-`add_message` [:722,744](../../orchestrator/app/db.py#L722), `save_summary`
-[:415](../../orchestrator/app/db.py#L415), `clear_summary` [:434,438](../../orchestrator/app/db.py#L434),
-`add_conversation_chunks` [:451](../../orchestrator/app/db.py#L451), `save_upload`
-[:500](../../orchestrator/app/db.py#L500), `save_url_document` [:760](../../orchestrator/app/db.py#L760),
-`save_repo` [:795](../../orchestrator/app/db.py#L795), `replace_repo_chunks`
-[:829,833](../../orchestrator/app/db.py#L829) — **plus the migration `DELETE` and `CREATE INDEX` on
-every single `connect()`**. No network egress, no GPU, no module-level mutable state, no import-time
-side effects.
-
-**Dependencies** — Inbound: [auth.py](../../orchestrator/app/auth.py),
-[history.py:27](../../orchestrator/app/history.py#L27) (14 route call sites),
-[uploads.py](../../orchestrator/app/uploads.py), [health.py:76-81](../../orchestrator/app/health.py#L76-L81),
-[recall.py:27](../../orchestrator/app/recall.py#L27),
-[memory_recall.py:71](../../orchestrator/app/memory_recall.py#L71),
-[main.py:16,162,339,469,487,527,758,770](../../orchestrator/app/main.py#L339),
-[engines/repo.py:13,122](../../orchestrator/app/engines/repo.py#L13),
-[engines/dataset.py:23](../../orchestrator/app/engines/dataset.py#L23),
-[engines/url.py:15](../../orchestrator/app/engines/url.py#L15). Outbound: stdlib only, plus
-[`app.config.settings`](../../orchestrator/app/config.py) at
-[db.py:20](../../orchestrator/app/db.py#L20).
-
-**Config** — `settings.app_db_path` ([db.py:197](../../orchestrator/app/db.py#L197)) is the only
-setting this module reads. Default `/data/app.sqlite3`
-([config.py:255](../../orchestrator/app/config.py#L255)); `APP_DB_PATH` is not forwarded by compose,
-so the default is what runs.
-
-**Failure modes**
-- **`DATA-03` — the orphan set.** `messages`, `conversation_summaries` and `conversation_chunks`
-  **do** declare `REFERENCES conversations(id) ON DELETE CASCADE`
-  ([db.py:40](../../orchestrator/app/db.py#L40), [:56](../../orchestrator/app/db.py#L56),
-  [:71](../../orchestrator/app/db.py#L71)) and `PRAGMA foreign_keys=ON`
-  ([db.py:202](../../orchestrator/app/db.py#L202)) makes those cascades fire. But `uploads`
-  ([:84-93](../../orchestrator/app/db.py#L84-L93)), `url_documents`
-  ([:102-110](../../orchestrator/app/db.py#L102-L110)), `repos`
-  ([:114-122](../../orchestrator/app/db.py#L114-L122)) and `repo_chunks`
-  ([:123-131](../../orchestrator/app/db.py#L123-L131)) declare **no foreign key at all** — their
-  `conversation_id` is a plain `TEXT NOT NULL`. `delete_conversation`
-  ([db.py:334-340](../../orchestrator/app/db.py#L334-L340)) issues exactly one statement,
-  `DELETE FROM conversations WHERE id = ? AND user_id = ?`, and there is no cleanup elsewhere.
-  **Deleting a conversation therefore orphans its uploads, fetched URL text, cloned-repo records and
-  every repo code chunk permanently** — including the full page text and source code held in
-  `url_documents.text` and `repo_chunks.text`, which is the largest content in the database.
-- **No busy-timeout tuning** ([db.py:199](../../orchestrator/app/db.py#L199)) → `sqlite3.OperationalError:
-  database is locked` after 5 s of write contention, surfacing as an HTTP 500.
-- **No bound** on `list_messages` ([db.py:343-354](../../orchestrator/app/db.py#L343-L354)),
-  `get_conversation_chunks` ([:466](../../orchestrator/app/db.py#L466)), `get_url_documents`
-  ([:769](../../orchestrator/app/db.py#L769)) or `get_uploads` ([:518](../../orchestrator/app/db.py#L518)) —
-  whole-table reads per conversation with unbounded row count and unbounded `text`/`embedding` size.
-- **Nothing is swallowed inside `db.py`** — there is no bare `except` in the file. Swallowing happens
-  in callers ([main.py:340,472,494,528](../../orchestrator/app/main.py#L340)).
-- `list_messages` ([db.py:343](../../orchestrator/app/db.py#L343)) is the only conversation accessor
-  with **no ownership parameter**; correctness depends entirely on the caller checking first.
-
-**Concurrency** — Every function is synchronous with a fresh short-lived connection per operation, so
-`check_same_thread=True` is safe. Routes in [history.py](../../orchestrator/app/history.py) are plain
-`def` and run in the anyio threadpool; callers in [main.py](../../orchestrator/app/main.py) are
-`async def` and call these blocking functions **on the event loop**
-([main.py:339,471,493,527,758,770](../../orchestrator/app/main.py#L339)) — each of which also re-runs
-the full schema + migrate path. Cross-process races are handled in SQL: the partial unique index is the
-documented race fix, and `truncate_messages` uses optimistic concurrency on `expected_total`
-([db.py:599-600](../../orchestrator/app/db.py#L599-L600)). Remaining window: `replace_messages`
-DELETE-then-INSERT is atomic ([db.py:642-670](../../orchestrator/app/db.py#L642-L670)) but the
-read-modify-write in the *client* that produces the payload is not, so two tabs syncing concurrently
-both pass the count check and the later write wins whole.
-
-**Complexity hotspots** — `add_message` [db.py:678](../../orchestrator/app/db.py#L678) = **71 LOC**
-(nested function inside a transaction context, plus a try/except-with-fallback-return);
-`replace_messages` [db.py:616](../../orchestrator/app/db.py#L616) = 60 LOC; `search_repo_chunks`
-[db.py:844](../../orchestrator/app/db.py#L844) = 51 LOC (three separately built SQL fragments plus a
-hand-ordered parameter list whose correctness rests on a comment at
-[db.py:875-876](../../orchestrator/app/db.py#L875-L876)); `migrate`
-[db.py:153](../../orchestrator/app/db.py#L153) = 40 LOC. `db.py` at 1,064 LOC is the largest file in
-the monorepo.
-
-**Findings** — `DATA-03` (above), `PERF-03` (`connect()` re-runs the whole schema script plus
-`migrate()` — including an unconditional full-scan `DELETE` and a `CREATE INDEX` — on every call site,
-[db.py:195-205](../../orchestrator/app/db.py#L195-L205); measured here: **15** statements in `_SCHEMA`
-(9 `CREATE TABLE` + 6 `CREATE INDEX`) and **34** call sites (31 `closing(connect())` inside `db.py`
-plus 3 external), where the report's `PERF-03` text says 13 and 32), `SEC-02` (the ownership check
-that guards these tables falls open on a DB exception, [main.py:338-344](../../orchestrator/app/main.py#L338-L344)),
-`TEST-02`.
+- **No default DSN.** `APP_DATABASE_URL` unset is a startup failure, not a silent fallback to some localhost database.
+- `statement_timeout` (15 s) and `idle_in_transaction_session_timeout` (60 s) are set in the pool's libpq `options` — bounds SQLite never had.
+- `check=ConnectionPool.check_connection` costs ~0.05 ms per checkout and buys survival across a `docker compose restart postgres`.
+- **Still unbounded**: `list_messages`, `get_conversation_chunks`, `get_url_documents`, `get_uploads` and `list_conversations` read whole per-conversation sets with no `LIMIT`.
+- **Known scaling limit**: a search string under 3 characters extracts no trigrams, so it falls back to a sequential scan. Equally true of the old SQLite layer, which always scanned.
+- **`recall_conversations` runs on every chat turn** and degrades on a non-selective keyword (seq scan + hash aggregate). ~6 ms at current size; the first thing to bound if history grows by orders of magnitude.
 
 ---
 

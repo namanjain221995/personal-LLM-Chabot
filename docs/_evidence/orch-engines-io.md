@@ -1,5 +1,13 @@
 # Evidence — `orch-engines-io`
 
+> **⚠ Superseded in part (2026-08-10).** The app-state layer described below was
+> `/data/app.sqlite3` (stdlib `sqlite3`). It is now PostgreSQL — see
+> [`data-model.md`](../01-codebase/data-model.md) and the CHANGELOG entry
+> "App state moved from SQLite to PostgreSQL". Every `sqlite3` reference,
+> `db.py` line number and finding about SQLite locking below is a snapshot of
+> the pre-migration code and has NOT been re-derived. The DuckDB warehouse and
+> LanceDB sections are unaffected and remain accurate.
+
 Scope: `orchestrator/app/engines/{repo,url,document,vision,report,live_sf}.py` (911 LOC total).
 Every claim below was read directly. Supporting modules (`core/net.py`, `core/repo.py`,
 `core/salesforce.py`, `core/extract.py`, `core/pdf.py`, `core/report_paths.py`,

@@ -1,5 +1,13 @@
 # Evidence — `orch-context` (orchestrator entrypoint, graph, context lifecycle, SSE)
 
+> **⚠ Superseded in part (2026-08-10).** The app-state layer described below was
+> `/data/app.sqlite3` (stdlib `sqlite3`). It is now PostgreSQL — see
+> [`data-model.md`](../01-codebase/data-model.md) and the CHANGELOG entry
+> "App state moved from SQLite to PostgreSQL". Every `sqlite3` reference,
+> `db.py` line number and finding about SQLite locking below is a snapshot of
+> the pre-migration code and has NOT been re-derived. The DuckDB warehouse and
+> LanceDB sections are unaffected and remain accurate.
+
 Scope: `orchestrator/app/{main,graph,context,compaction,summarize,memory,memory_recall,recall,history,sse}.py`,
 all read in full. Supporting files read in full for cross-referencing: `orchestrator/app/auth.py`,
 `orchestrator/app/config.py`, `orchestrator/app/health.py`, `orchestrator/app/uploads.py`,

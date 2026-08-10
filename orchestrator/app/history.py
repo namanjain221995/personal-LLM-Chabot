@@ -17,15 +17,14 @@ GET    /history/search?q=<query>&limit=<n>  → {results: [{id, title, updated_a
 from __future__ import annotations
 
 import re
-import sqlite3
 import uuid
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict
 
 from . import db
-from .auth import require_user
+from .auth import UserRow, require_user
 
 router = APIRouter(prefix="/history", tags=["history"])
 
@@ -60,10 +59,24 @@ class MessageIn(BaseModel):
     meta: Optional[dict] = None
 
 
+class SyncedMessageIn(MessageIn):
+    """A message in a whole-thread re-push.
+
+    Carries `feedback` where the append endpoint deliberately does not: a
+    newly appended message cannot already have a thumb, but a RE-PUSH of an
+    existing thread can, and a client that knows about the field must be
+    authoritative for it — otherwise a thumb cleared in one tab is resurrected
+    by the next sync from another. Omitting it means "I have no opinion", and
+    the stored value is carried across by position (see db.replace_messages).
+    """
+
+    feedback: Optional[Literal["up", "down"]] = None
+
+
 class MessagesReplaceIn(BaseModel):
     """Whole-thread replace used by the client's offline sync."""
 
-    messages: List[MessageIn]
+    messages: List[SyncedMessageIn]
 
 
 def _clean_title(title: str) -> str:
@@ -79,7 +92,7 @@ def _not_found() -> HTTPException:
 
 @router.get("/conversations")
 def list_conversations(
-    archived: bool = False, user: sqlite3.Row = Depends(require_user)
+    archived: bool = False, user: UserRow = Depends(require_user)
 ) -> list:
     """Active conversations by default; `?archived=true` for the archive."""
     return db.list_conversations(int(user["id"]), archived=archived)
@@ -87,7 +100,7 @@ def list_conversations(
 
 @router.post("/conversations")
 def create_conversation(
-    body: ConversationIn, user: sqlite3.Row = Depends(require_user)
+    body: ConversationIn, user: UserRow = Depends(require_user)
 ) -> dict:
     conversation_id = body.id or uuid.uuid4().hex
     if not _CONVERSATION_ID_RE.match(conversation_id):
@@ -98,13 +111,13 @@ def create_conversation(
     title = _clean_title(body.title)
     try:
         return db.create_conversation(int(user["id"]), conversation_id, title)
-    except sqlite3.IntegrityError:
+    except db.IntegrityError:
         raise HTTPException(status_code=409, detail="conversation id already exists")
 
 
 @router.get("/conversations/{conversation_id}")
 def get_conversation(
-    conversation_id: str, user: sqlite3.Row = Depends(require_user)
+    conversation_id: str, user: UserRow = Depends(require_user)
 ) -> dict:
     conversation = db.get_conversation(int(user["id"]), conversation_id)
     if conversation is None:  # missing OR someone else's → 404 (§3c)
@@ -117,7 +130,7 @@ def get_conversation(
 def update_conversation(
     conversation_id: str,
     body: ConversationUpdate,
-    user: sqlite3.Row = Depends(require_user),
+    user: UserRow = Depends(require_user),
 ) -> dict:
     conversation = db.update_conversation(
         int(user["id"]),
@@ -135,7 +148,7 @@ def update_conversation(
 def add_message(
     conversation_id: str,
     body: MessageIn,
-    user: sqlite3.Row = Depends(require_user),
+    user: UserRow = Depends(require_user),
 ) -> dict:
     role = body.role.strip()
     if not role or len(role) > 32:
@@ -152,7 +165,7 @@ def add_message(
 def replace_messages(
     conversation_id: str,
     body: MessagesReplaceIn,
-    user: sqlite3.Row = Depends(require_user),
+    user: UserRow = Depends(require_user),
 ) -> dict:
     """Replace a conversation's whole thread, atomically and never shrinking.
 
@@ -173,7 +186,12 @@ def replace_messages(
             int(user["id"]),
             conversation_id,
             [
-                {"role": m.role.strip(), "content": m.content, "meta": m.meta}
+                {
+                    "role": m.role.strip(),
+                    "content": m.content,
+                    "meta": m.meta,
+                    "feedback": m.feedback,
+                }
                 for m in body.messages
             ],
         )
@@ -201,7 +219,7 @@ class TruncateIn(BaseModel):
 def truncate_messages(
     conversation_id: str,
     body: TruncateIn,
-    user: sqlite3.Row = Depends(require_user),
+    user: UserRow = Depends(require_user),
 ) -> dict:
     """Drop every message after the first `keep` (user-confirmed regenerate).
 
@@ -236,9 +254,45 @@ def truncate_messages(
     return result
 
 
+class FeedbackIn(BaseModel):
+    """`null` clears the thumb — the UI's third state (clicking the same
+    thumb again un-rates the message), not an error."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    feedback: Optional[Literal["up", "down"]] = None
+
+
+@router.put("/conversations/{conversation_id}/messages/{message_id}/feedback")
+def set_message_feedback(
+    conversation_id: str,
+    message_id: int,
+    body: FeedbackIn,
+    user: UserRow = Depends(require_user),
+) -> dict:
+    """Thumbs up/down on one message, stored with the chat.
+
+    PUT, not POST: setting the same thumb twice is the same state, so this is
+    idempotent rather than a new submission each time.
+
+    `message_id` is the SERVER id, which `GET /conversations/{id}` now returns
+    for every message. It used to be absent, which is why this was localStorage
+    only — the browser had no stable handle on a stored message.
+
+    404 covers "no such message", "not in this conversation" and "not yours"
+    alike, so this cannot be used to discover another account's message ids.
+    """
+    result = db.set_message_feedback(
+        int(user["id"]), conversation_id, message_id, body.feedback
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="message not found")
+    return result
+
+
 @router.get("/conversations/{conversation_id}/summary")
 def get_summary(
-    conversation_id: str, user: sqlite3.Row = Depends(require_user)
+    conversation_id: str, user: UserRow = Depends(require_user)
 ) -> dict:
     """The rolling summary of compacted turns — what the assistant still
     remembers about the older part of this conversation (read-only)."""
@@ -256,7 +310,7 @@ def get_summary(
 
 @router.delete("/conversations/{conversation_id}")
 def delete_conversation(
-    conversation_id: str, user: sqlite3.Row = Depends(require_user)
+    conversation_id: str, user: UserRow = Depends(require_user)
 ) -> dict:
     if not db.delete_conversation(int(user["id"]), conversation_id):
         raise _not_found()
@@ -267,7 +321,7 @@ def delete_conversation(
 def search_history(
     q: str = "",
     limit: int = db.SEARCH_LIMIT_DEFAULT,
-    user: sqlite3.Row = Depends(require_user),
+    user: UserRow = Depends(require_user),
 ) -> dict:
     """Search the signed-in user's chat titles and message bodies (V4-DESIGN §2).
 

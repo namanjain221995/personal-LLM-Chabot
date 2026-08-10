@@ -181,7 +181,12 @@ def test_generations_are_owner_scoped(monkeypatch):
             ).json() == {"stopped": False}
 
         # The owner sees it.
-        monkeypatch.setattr(app_main, "_viewer_id", lambda _req: 42)
+        # _viewer_id is async now (resolving the local account is a database
+        # round trip, so it is offloaded off the event loop).
+        async def _fixed_viewer(_req):
+            return 42
+
+        monkeypatch.setattr(app_main, "_viewer_id", _fixed_viewer)
         with TestClient(app) as client:
             assert client.get("/chat/active").json() == {"active": ["owned"]}
     finally:

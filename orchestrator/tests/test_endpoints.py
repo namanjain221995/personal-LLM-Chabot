@@ -51,7 +51,7 @@ def test_health_ok_when_all_dependencies_up(client, monkeypatch):
     assert body["status"] == "ok"
     # §8: one check per vLLM service + DuckDB — never a static ok.
     # app_db joined the probe set so a bad migration surfaces at /health
-    # rather than on the first request that touches app.sqlite3.
+    # rather than on the first request that touches the database.
     # vllm-vision shares the main endpoint (one multimodal model), so /health
     # lists DISTINCT services rather than probing one process twice.
     assert set(body["checks"]) == {

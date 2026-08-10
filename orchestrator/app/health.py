@@ -65,30 +65,40 @@ def _check_duckdb(path: str) -> dict:
     return {"status": "ok"}
 
 
-def _check_app_db(path: str) -> dict:
-    """Open the app database and confirm the schema is migrated; never raises.
+#: Every migration in db._MIGRATIONS must have been applied before the app is
+#: healthy. Bumped alongside a new migration; a container running old code
+#: against a newer database, or new code against an un-migrated one, is exactly
+#: what this catches.
+EXPECTED_SCHEMA_VERSION = 3
 
-    /health used to probe only DuckDB, so a schema problem in app.sqlite3
-    stayed invisible until the first user request touched it — connect() runs
-    the migration lazily. Reading a migrated column makes a bad migration show
-    up here instead.
+
+def _check_app_db(_path: str = "") -> dict:
+    """Confirm PostgreSQL answers and the schema is at the expected version.
+
+    /health used to probe only DuckDB, so a schema problem stayed invisible
+    until the first user request touched it. Now that migrations run once at
+    startup rather than on every connection, this is also the only continuous
+    signal that the database is still reachable — a pooled connection can go
+    away under us when the container restarts.
+
+    `_path` is vestigial (the SQLite file path) and ignored; the parameter
+    stays so the existing call site and its tests keep working.
     """
     from . import db  # lazy: importing db must not open anything at import time
 
     try:
-        with db.closing(db.connect()) as con:
-            columns = {
-                row["name"] for row in con.execute("PRAGMA table_info(messages)")
-            }
-        missing = {"generation_id"} - columns
-        if missing:
-            return {
-                "status": "error",
-                "detail": f"messages table missing column(s): {sorted(missing)}",
-            }
-        return {"status": "ok"}
+        version = db.schema_version()
     except Exception as exc:  # noqa: BLE001 — /health reports, never raises
         return {"status": "error", "detail": f"{type(exc).__name__}: {exc}"}
+    if version < EXPECTED_SCHEMA_VERSION:
+        return {
+            "status": "error",
+            "detail": (
+                f"schema version {version} < expected {EXPECTED_SCHEMA_VERSION} "
+                "— migrations have not been applied"
+            ),
+        }
+    return {"status": "ok", "schema_version": version}
 
 
 async def check_dependencies() -> dict:
@@ -120,7 +130,7 @@ async def check_dependencies() -> dict:
         results = await asyncio.gather(
             *(_probe_vllm(client, url) for _, url in vllm_targets),
             asyncio.to_thread(_check_duckdb, settings.duckdb_path),
-            asyncio.to_thread(_check_app_db, settings.app_db_path),
+            asyncio.to_thread(_check_app_db),
         )
     checks: Dict[str, dict] = {
         name: result for (name, _), result in zip(vllm_targets, results[:-2])

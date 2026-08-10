@@ -10,8 +10,23 @@ import asyncio
 
 import pytest
 
+from app.config import settings
 from app.engines import search
 from app.search.base import SearchResult, SearchUnavailableError
+
+
+@pytest.fixture(autouse=True)
+def generous_provider_cap(monkeypatch):
+    """Pin SEARCH_MAX_RESULTS above every breadth level.
+
+    These tests are about how results from several queries are MERGED, not
+    about the per-provider cap. That cap is read from the environment, and a
+    deployment that sets it low (this repo's own .env uses 10) squeezes low /
+    medium / high to the same length and fails `lo < med < hi` — a red suite
+    that says nothing about the code. Pinning it keeps the assertions about
+    the thing under test.
+    """
+    monkeypatch.setattr(settings, "search_max_results", 100)
 
 
 def result(url, title="t", snippet="s"):

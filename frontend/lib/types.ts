@@ -226,6 +226,17 @@ export type MessageStatus = 'streaming' | 'done' | 'stopped' | 'error';
 
 export interface ChatMessage {
   id: string;
+  /**
+   * The SERVER's row id, once this message has been stored. Distinct from
+   * `id`, which is client-side and unstable: a live message gets a random
+   * uuid and the same message rehydrated from the server gets a positional
+   * `srv-<conversation>-<index>`. Anything that must outlive a reload —
+   * thumbs — has to key off this instead.
+   */
+  serverId?: number;
+  /** Thumbs, stored server-side. Undefined means "not loaded from the
+   *  server yet"; null means "explicitly no opinion". */
+  feedback?: 'up' | 'down' | null;
   role: 'user' | 'assistant';
   content: string;
   meta?: Meta;

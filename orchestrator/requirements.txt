@@ -17,6 +17,12 @@ pydantic>=2.7
 # V2 auth (V2-DESIGN §3c): argon2 password hashing + signed session cookies.
 argon2-cffi>=23.1
 itsdangerous>=2.1
+# App state (2026-08-10): PostgreSQL replaces stdlib sqlite3.
+# [binary] ships libpq in the wheel — no libpq-dev in the image, and binary
+# result mode is not optional: psycopg3 in TEXT mode is slower than the driver
+# gap it is meant to close. [pool] is psycopg_pool, which is what actually
+# deletes the old per-operation connect() cost.
+psycopg[binary,pool]>=3.2,<4
 # Reranker (Qwen3-Reranker-0.6B). Imported LAZILY inside the rag engine only —
 # the app and the test suite run without it. Disable at runtime with RERANK_ENABLED=false.
 transformers>=4.51

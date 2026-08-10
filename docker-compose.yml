@@ -8,6 +8,14 @@ volumes:
   hf-cache:
   data:
   reports:
+  # App state (users, conversations, messages, …) lives in PostgreSQL as of
+  # 2026-08-10. Its own volume, deliberately NOT a directory inside `data`:
+  # that volume is mounted READ-WRITE into the sync worker too, and a stray
+  # write into PGDATA corrupts the cluster in ways nothing here would notice.
+  pgdata:
+  # pgAdmin's own state: its user database, saved layouts, and the pgpass file
+  # that lets the pre-registered connection open without typing a password.
+  pgadmin:
 
 services:
   # --------------------------------------------------------------------------
@@ -19,13 +27,18 @@ services:
   # UNIFIED memory (this is not a discrete GPU — the fraction comes out of the
   # same pool as the OS and every other container).
   #   0.35 (vllm: 22 GB weights + ~10.5 GB KV at 262144 with fp8)
-  # + 0.14 (vllm-router/agent: 10 GB weights + ~4.7 GB KV at 65536)
+  # + 0.17 (vllm-router/agent: 10 GB weights + ~3.4 GB KV at 49152 — raised
+  #         from 0.14 on 2026-08-11; see the service comment, it could not
+  #         cold-start alongside the other three at 0.14)
   # + 0.04 (vllm-embed)
-  # + 0.09 (vllm-ocr: 6.4 GB weights + eager overhead + KV at 8192)  ≈ 0.62,
-  # leaving ~46 GB for the orchestrator's in-process reranker, DuckDB/LanceDB,
+  # + 0.09 (vllm-ocr: 6.4 GB weights + eager overhead + KV at 8192)  ≈ 0.65,
+  # leaving ~42 GB for the orchestrator's in-process reranker, DuckDB/LanceDB,
   # the frontend and the OS.
-  # Over-reserving here took the box to 0 GB free once — keep the sum ≲ 0.6
-  # (0.62 with OCR is the accepted ceiling; do not add another resident model).
+  # Over-reserving here took the box to 0 GB free once. The ceiling was 0.62
+  # until 2026-08-11, when vllm-router turned out not to fit at 0.14 on a cold
+  # start and had to go to 0.17 (see its comment). 0.65 IS THE CEILING NOW —
+  # do not add another resident model, and if free memory gets tight this is
+  # the number to walk back down.
   # --------------------------------------------------------------------------
 
   vllm:
@@ -155,6 +168,37 @@ services:
   # It also serves the cheap classification calls (route, auto-orchestration),
   # where its INSTRUCT (non-thinking) nature is exactly what you want.
   # Same nightly runtime as the main service; ENTRYPOINT is ["vllm","serve"].
+  #
+  # 2026-08-11 — THIS SERVICE COULD NOT SURVIVE A COLD START, and the failure
+  # only appears when all four model services start TOGETHER, i.e. on every
+  # reboot, which is exactly when nobody is watching. Found by tearing the
+  # whole stack down and bringing it back:
+  #
+  #     ValueError: To serve at least one request with the model's max seq len
+  #     (65536), (4.5 GiB KV cache is needed, which is larger than the
+  #     available KV cache memory (4.2 GiB)
+  #
+  # …then the container exits 0 and restart-loops forever.
+  #
+  # THE TRAP: "available KV cache memory" is NOT a fixed share of the 121 GB.
+  # vLLM measures the memory actually free when IT profiles, so this service's
+  # budget shrinks as the other three finish loading — observed falling 4.2 →
+  # 1.84 → 1.68 GiB over a single cold start as vllm/-embed/-ocr settled.
+  # Shrinking --max-model-len alone therefore chases a moving target: 49152
+  # (3.38 GiB) still did not fit once the others were resident.
+  #
+  # So BOTH levers, for margin rather than a knife edge:
+  #   * --max-model-len 49152 instead of 65536 → needs ~3.4 GiB, not ~4.5.
+  #     48K is far more than this service's jobs use (routing and
+  #     classification are a few hundred tokens; an agent web step tops out
+  #     around 15K), and REPORT_MAX_CONTEXT=65536 is unaffected — report
+  #     planning runs on the MAIN model, not this one.
+  #   * --gpu-memory-utilization 0.14 → 0.17, which is what actually raises the
+  #     ceiling this measures against. That takes the resident sum to ~0.65,
+  #     above the 0.62 noted at the top of this file — a deliberate, measured
+  #     exception: a router stuck in a restart loop costs more than 3.6 GB, and
+  #     there was ~23 GB free at the time. If you ever add another resident
+  #     model, this is the first place to look.
   vllm-router:
     image: vllm/vllm-openai:nightly
     command: >
@@ -162,8 +206,8 @@ services:
       --served-model-name Qwen/Qwen3-VL-8B-Instruct-FP8
       --host 0.0.0.0
       --port 30002
-      --max-model-len 65536
-      --gpu-memory-utilization 0.14
+      --max-model-len 49152
+      --gpu-memory-utilization 0.17
       --kv-cache-dtype fp8
     environment:
       HF_TOKEN: ${HF_TOKEN}
@@ -265,6 +309,128 @@ services:
               count: all
               capabilities: [gpu]
 
+  # --------------------------------------------------------------------------
+  # App-state database (2026-08-10 — replaces /data/app.sqlite3).
+  #
+  # WHY: the SQLite layer opened a fresh connection per operation and re-ran
+  # the whole schema script plus migrate() every time, and one writer at a time
+  # meant a 9 ms fsync on the critical path of every chat turn — executed
+  # inline on the event loop, so it stalled every concurrent SSE stream.
+  # Measured on this box: add_message 8.9 ms → 2.2 ms, and history search went
+  # from 1.9 ms over 378 messages to 2.1 ms over 200,000 (pg_trgm GIN instead
+  # of a full LIKE scan).
+  #
+  # NOT in scope: the DuckDB warehouse and LanceDB. DuckDB is a columnar
+  # analytics engine and is *faster* than PostgreSQL for the SQL engine's
+  # scan-and-aggregate queries — moving that would be a downgrade.
+  #
+  # Bound to 127.0.0.1 only. There is no authentication in front of the app
+  # (see auth.py), so the database must not be reachable off-box either.
+  # --------------------------------------------------------------------------
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-techsara}
+      POSTGRES_USER: ${POSTGRES_USER:-techsara}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+      # Deterministic byte-order collation: the C locale makes ORDER BY and
+      # LIKE index behaviour independent of the container's ICU/glibc version,
+      # so an image upgrade can never silently invalidate an index.
+      POSTGRES_INITDB_ARGS: "--locale=C --encoding=UTF8"
+      PGDATA: /var/lib/postgresql/18/docker
+    # Tuning for a single-node box whose 121 GB is UNIFIED memory shared with
+    # the GPU: PostgreSQL is capped at roughly 1 GB resident so it never
+    # competes with the vLLM services. effective_cache_size is an estimate the
+    # planner uses, not an allocation.
+    #   synchronous_commit stays ON: this is the user's chat history, and 2.2 ms
+    #   is already 4x faster than what SQLite was doing. Set it to `off` only if
+    #   you accept losing the last ~200 ms of writes on a hard crash.
+    command:
+      - postgres
+      - -c
+      - shared_buffers=512MB
+      - -c
+      - effective_cache_size=1536MB
+      - -c
+      - work_mem=16MB
+      - -c
+      - maintenance_work_mem=128MB
+      - -c
+      - max_connections=60
+      - -c
+      - random_page_cost=1.1          # NVMe, not spinning rust
+      - -c
+      - effective_io_concurrency=200
+      - -c
+      - wal_compression=on
+      - -c
+      - synchronous_commit=on
+      - -c
+      - track_io_timing=on
+    volumes:
+      - pgdata:/var/lib/postgresql
+    ports:
+      # Loopback ONLY — enough for the host-side migration script and psql,
+      # never reachable from the LAN.
+      - "127.0.0.1:5432:5432"
+    restart: unless-stopped
+    healthcheck:
+      # -U/-d matter: the default `pg_isready` probes the `postgres` role and
+      # would report ready against a cluster whose app database is still
+      # initialising.
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-techsara} -d ${POSTGRES_DB:-techsara} -q"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  # --------------------------------------------------------------------------
+  # pgAdmin — web UI for the app-state database. http://127.0.0.1:5050
+  #
+  # LOOPBACK ONLY, and that binding matters more here than anywhere else in
+  # this file: pgAdmin is a full SQL client. Anyone who reaches it can DROP the
+  # conversation history, which is strictly more damage than the app itself
+  # allows. That is also why it keeps its login even though the app has none.
+  #
+  # The PostgreSQL connection is pre-registered from ./pgadmin/servers.json and
+  # its password comes from a pgpass file inside the `pgadmin` volume, written by
+  # `./pgadmin/setup-passfile.sh` — so the server is just there in the tree when
+  # you log in, with nothing to type. Re-run that script if you ever delete the
+  # volume or change POSTGRES_PASSWORD.
+  #
+  # Admin tool, not part of serving a request. Comment out `profiles` below —
+  # or run `docker compose --profile admin up -d pgadmin` after adding
+  # `profiles: ["admin"]` — if you would rather it not start with everything
+  # else. It costs ~200 MB of HOST RAM (not GPU memory, so the vLLM budget at
+  # the top of this file is unaffected).
+  # --------------------------------------------------------------------------
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    environment:
+      # NOT a .local / .test / example.com address: pgAdmin validates this with
+      # `email_validator` and rejects special-use domains outright, crash-looping
+      # the container. Nothing is ever sent to it (Postfix is disabled below).
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL:-admin@techsarasolutions.com}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD:?PGADMIN_DEFAULT_PASSWORD must be set in .env}
+      # Import the server definition on first start.
+      PGADMIN_SERVER_JSON_FILE: /pgadmin4/servers.json
+      # Without this pgAdmin demands a SECOND "master password" on every login
+      # before it will decrypt saved connection credentials — a pointless extra
+      # secret for a single-user tool already behind its own login on loopback.
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: "False"
+      # Quieter startup: no upgrade-check call out to the internet.
+      PGADMIN_CONFIG_UPGRADE_CHECK_ENABLED: "False"
+      PGADMIN_DISABLE_POSTFIX: "True"
+    volumes:
+      - pgadmin:/var/lib/pgadmin
+      - ./pgadmin/servers.json:/pgadmin4/servers.json:ro
+    ports:
+      - "127.0.0.1:5050:80"
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   orchestrator:
     build: ./orchestrator
     environment:
@@ -304,6 +470,12 @@ services:
       LANCEDB_DIR: /data/lancedb
       PARQUET_DIR: /data/parquet
       REPORTS_DIR: /reports
+      # App state (users/conversations/messages/uploads/documents/repos).
+      # Built from the same three vars the postgres service uses, so there is
+      # one place to change the credentials.
+      APP_DATABASE_URL: postgresql://${POSTGRES_USER:-techsara}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-techsara}
+      APP_DB_POOL_MIN: ${APP_DB_POOL_MIN:-2}
+      APP_DB_POOL_MAX: ${APP_DB_POOL_MAX:-16}
       SESSION_SECRET: ${SESSION_SECRET:-}
       # Phase 1 web search + Phase 6 token budget.
       SEARCH_ENABLED: ${SEARCH_ENABLED:-false}
@@ -330,15 +502,48 @@ services:
     ports:
       - "8080:8080"
     restart: unless-stopped
+    healthcheck:
+      # /health answers 200 even when a dependency is degraded, which is what
+      # we want here: this asks "is the process serving?", not "is every model
+      # up?". Tying it to overall status would flap every time the sync worker
+      # holds the DuckDB write lock.
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health -o /dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      # Generous: after a reboot this waits for PostgreSQL before it serves.
+      start_period: 4m
     depends_on:
+      # PostgreSQL is the ONE hard dependency: the lifespan applies the schema,
+      # so a database that is not accepting connections yet should fail the
+      # deploy rather than the first request. service_healthy, not started.
+      postgres:
+        condition: service_healthy
+      # The MODELS are deliberately service_started, not service_healthy.
+      #
+      # Requiring healthy here made `docker compose up -d` abort on a cold
+      # start: the four vLLM servers load ~40 GB of weights simultaneously into
+      # 121 GB of memory SHARED with the OS, and under that pressure vllm-embed
+      # and vllm-ocr get knocked over and restart. Compose treats a restarting
+      # dependency as failed — "dependency failed to start: container
+      # sf-local-ai-vllm-embed-1 is unhealthy" — and then never starts the
+      # orchestrator, frontend or sync worker at all. One slow model took down
+      # the entire app layer, including history and the UI, which need no model.
+      #
+      # It also bought nothing real: after a REBOOT the Docker daemon restarts
+      # containers by policy and honours no depends_on whatsoever, so this
+      # ordering never applied in the case that matters most.
+      #
+      # Nothing here calls a model at startup. /health reports each backend
+      # separately and answers "degraded" while one is still loading.
       vllm:
-        condition: service_healthy
+        condition: service_started
       vllm-router:
-        condition: service_healthy
+        condition: service_started
       # vllm-vision is intentionally NOT a dependency — it runs under the
       # "vision" profile (see above) and must never gate the app layer.
       vllm-embed:
-        condition: service_healthy
+        condition: service_started
     deploy:
       resources:
         reservations:
@@ -399,8 +604,11 @@ services:
       - ${SF_PRIVATE_KEY_HOST_FILE:-/dev/null}:/run/secrets/sf_jwt_key.pem:ro
     restart: unless-stopped
     depends_on:
+      # service_started, for the same reason as the orchestrator: a model still
+      # loading must not stop the worker from being created. Each cycle already
+      # retries with backoff, and an embedding failure is caught per batch.
       vllm-embed:
-        condition: service_healthy
+        condition: service_started
 
   # Phase 1: self-hosted metasearch for web search. Internal-only (no host
   # port); only the orchestrator reaches it at http://searxng:8080. Enabling
@@ -413,7 +621,11 @@ services:
     volumes:
       - ./searxng:/etc/searxng:rw
     restart: unless-stopped
-    profiles: ["search"]   # started only when web search is in use
+    # Started only when web search is in use. SEARCH_ENABLED=true on its own is
+    # NOT enough — the orchestrator would call a searxng that is not running.
+    # `.env` sets COMPOSE_PROFILES=search so a plain `docker compose up -d`
+    # includes it; drop that variable to leave it out.
+    profiles: ["search"]
 
   frontend:
     build: ./frontend
@@ -425,4 +637,7 @@ services:
     restart: unless-stopped
     depends_on:
       orchestrator:
-        condition: service_started
+        # healthy, not started: `service_started` returns the moment the
+        # process exists, so on a cold boot the UI came up pointing at an
+        # orchestrator that was still waiting for its database.
+        condition: service_healthy

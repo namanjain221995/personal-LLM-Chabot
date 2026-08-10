@@ -1,5 +1,13 @@
 # Test map
 
+> **⚠ Superseded in part (2026-08-10).** The app-state layer described below was
+> `/data/app.sqlite3` (stdlib `sqlite3`). It is now PostgreSQL — see
+> [`data-model.md`](data-model.md) and the CHANGELOG entry
+> "App state moved from SQLite to PostgreSQL". Every `sqlite3` reference,
+> `db.py` line number and finding about SQLite locking below is a snapshot of
+> the pre-migration code and has NOT been re-derived. The DuckDB warehouse and
+> LanceDB sections are unaffected and remain accurate.
+
 Every test file in the repository, what it targets, what it actually asserts, and whether it touches a
 real socket or the GPU. Then a gap analysis against the eight critical paths, and the ten highest-value
 tests to add next.

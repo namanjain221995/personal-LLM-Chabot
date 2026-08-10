@@ -20,7 +20,6 @@ from app.main import app
 
 @pytest.fixture()
 def env(tmp_path, monkeypatch):
-    monkeypatch.setattr(settings, "app_db_path", str(tmp_path / "app.sqlite3"))
     monkeypatch.setattr(
         settings, "session_secret_file", str(tmp_path / ".session_secret")
     )
@@ -403,29 +402,33 @@ def test_chat_meta_carries_a_generation_id(env, monkeypatch):
     assert metas and metas[0].get("generation_id")
 
 
-def test_migration_adds_generation_id_to_an_existing_database(tmp_path, monkeypatch):
-    """An already-deployed app.sqlite3 must pick the column up additively."""
-    import sqlite3 as _sqlite
+def test_schema_carries_the_generation_id_column_and_its_partial_unique_index():
+    """The idempotency key and the index that enforces it are both present.
 
+    Under SQLite this was an additive ALTER applied on every connection; the
+    PostgreSQL schema declares both up front, so what is worth asserting is the
+    end state — including the `WHERE generation_id IS NOT NULL` predicate,
+    without which every un-keyed message would collide with every other.
+    """
     from app import db as _db
 
-    path = tmp_path / "old.sqlite3"
-    con = _sqlite.connect(str(path))
-    con.executescript(
-        """
-        CREATE TABLE conversations (id TEXT PRIMARY KEY, user_id INTEGER,
-            title TEXT, created_at TEXT, updated_at TEXT);
-        CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT,
-            conversation_id TEXT, role TEXT, content TEXT, meta TEXT,
-            created_at TEXT);
-        """
-    )
-    con.commit()
-    con.row_factory = _sqlite.Row
-    _db.migrate(con)
-    cols = {r["name"] for r in con.execute("PRAGMA table_info(messages)")}
-    con.close()
+    with _db.connection() as con:
+        cols = {
+            r["column_name"]
+            for r in con.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema='public' AND table_name='messages'"
+            ).fetchall()
+        }
+        idx = con.execute(
+            "SELECT indexdef FROM pg_indexes "
+            "WHERE tablename='messages' AND indexname='idx_messages_generation'"
+        ).fetchone()
+
     assert "generation_id" in cols
+    assert idx is not None, "the partial unique index is missing"
+    assert "UNIQUE" in idx["indexdef"]
+    assert "generation_id IS NOT NULL" in idx["indexdef"]
 
 
 def test_concurrent_appends_of_one_generation_store_it_once(alice):
@@ -461,45 +464,33 @@ def test_concurrent_appends_of_one_generation_store_it_once(alice):
     assert [m["content"] for m in messages] == ["a question", "the answer"]
 
 
-def test_migration_removes_duplicates_left_by_the_race(tmp_path):
-    """An already-deployed DB carrying duplicates is repaired, keeping the first."""
-    import sqlite3 as _sqlite
+def test_a_second_message_for_one_generation_cannot_be_stored():
+    """The database refuses the duplicate, rather than a repair pass removing
+    it afterwards.
 
+    SQLite could only enforce this once the index existed, so `migrate()`
+    carried a one-time DELETE to clean up rows an earlier build had already
+    written — a repair that, being unconditional, then re-ran forever. Here the
+    constraint exists from the first migration, so there is nothing to repair;
+    what matters is that the second write is rejected and `add_message` turns
+    that rejection into the winning row.
+    """
     from app import db as _db
 
-    path = tmp_path / "dupes.sqlite3"
-    con = _sqlite.connect(str(path))
-    con.executescript(
-        """
-        CREATE TABLE conversations (id TEXT PRIMARY KEY, user_id INTEGER,
-            title TEXT, created_at TEXT, updated_at TEXT);
-        CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT,
-            conversation_id TEXT, role TEXT, content TEXT, meta TEXT,
-            created_at TEXT);
-        INSERT INTO conversations VALUES ('c', 1, 't', 'now', 'now');
-        INSERT INTO messages (conversation_id, role, content, meta, created_at)
-            VALUES ('c','user','q',NULL,'now'),
-                   ('c','assistant','first copy','{}','now'),
-                   ('c','assistant','second copy','{}','now');
-        """
-    )
-    con.commit()
-    # Backfill the key the way the duplicated rows would have carried it.
-    con.execute("ALTER TABLE messages ADD COLUMN generation_id TEXT")
-    con.execute(
-        "UPDATE messages SET generation_id='g1' WHERE content LIKE '%copy'"
-    )
-    con.commit()
-    con.row_factory = _sqlite.Row
+    uid = _db.create_user("dupes", "hash")
+    _db.create_conversation(uid, "c", "t")
+    _db.add_message(uid, "c", "user", "q")
+    meta = {"generation_id": "g1"}
+    first = _db.add_message(uid, "c", "assistant", "first copy", meta)
+    second = _db.add_message(uid, "c", "assistant", "second copy", meta)
 
-    _db.migrate(con)
-
-    rows = [
-        (r["role"], r["content"])
-        for r in con.execute("SELECT role, content FROM messages ORDER BY id")
+    assert second["id"] == first["id"]
+    assert second["deduplicated"] is True
+    assert second["content"] == "first copy", "the first write must win"
+    assert [(m["role"], m["content"]) for m in _db.list_messages("c")] == [
+        ("user", "q"),
+        ("assistant", "first copy"),
     ]
-    con.close()
-    assert rows == [("user", "q"), ("assistant", "first copy")]
 
 
 # ---------------------------------------------------------------------------
@@ -507,60 +498,53 @@ def test_migration_removes_duplicates_left_by_the_race(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_startup_applies_the_migration_before_serving(tmp_path, monkeypatch):
-    """Lifespan must migrate; /health must then report app_db ok."""
-    from app.config import settings as _settings
+def test_startup_applies_the_migration_before_serving(monkeypatch):
+    """Lifespan must migrate; /health must then report app_db ok.
 
-    db_path = tmp_path / "fresh.sqlite3"
-    monkeypatch.setattr(_settings, "app_db_path", str(db_path))
-    monkeypatch.setattr(
-        _settings, "session_secret_file", str(tmp_path / ".secret")
-    )
-    assert not db_path.exists()
+    The point is unchanged from the SQLite version: schema readiness is a
+    DEPLOY concern. Proving it needs a database that has NOT been migrated, so
+    this one drops `schema_migrations` first and checks the lifespan puts it
+    back before a single request is served.
+    """
+    from app import db as _db
+
+    with _db.connection() as con:
+        con.execute("DROP TABLE IF EXISTS schema_migrations")
+    with _db.connection() as con:
+        gone = con.execute(
+            "SELECT to_regclass('public.schema_migrations') AS t"
+        ).fetchone()
+    assert gone["t"] is None
 
     with TestClient(app):  # entering the client runs the lifespan
-        assert db_path.exists(), "startup did not create/migrate the database"
-        import sqlite3 as _sqlite
-
-        con = _sqlite.connect(str(db_path))
-        con.row_factory = _sqlite.Row
-        cols = {r["name"] for r in con.execute("PRAGMA table_info(messages)")}
-        idx = {
-            r["name"]
-            for r in con.execute(
-                "SELECT name FROM sqlite_master WHERE type='index' "
-                "AND tbl_name='messages'"
-            )
-        }
-        con.close()
-    assert "generation_id" in cols
-    assert "idx_messages_generation" in idx
+        assert _db.schema_version() == 3
+        with _db.connection() as con:
+            idx = con.execute(
+                "SELECT indexname FROM pg_indexes WHERE tablename = 'messages'"
+            ).fetchall()
+    assert "idx_messages_generation" in {r["indexname"] for r in idx}
 
 
-def test_health_reports_the_app_database(tmp_path, monkeypatch):
+def test_health_reports_the_app_database(monkeypatch):
     from app import health as health_module
-    from app.config import settings as _settings
 
-    monkeypatch.setattr(_settings, "app_db_path", str(tmp_path / "h.sqlite3"))
-    monkeypatch.setattr(
-        _settings, "session_secret_file", str(tmp_path / ".secret")
-    )
     with TestClient(app) as client:
         body = client.get("/health").json()
     assert "app_db" in body["checks"]
     assert body["checks"]["app_db"]["status"] == "ok"
+    assert body["checks"]["app_db"]["schema_version"] >= 1
 
-    # A database missing the migrated column is reported, not hidden.
-    import sqlite3 as _sqlite
+    # An unreachable database is REPORTED, not hidden behind a 500.
+    from app.config import settings as _settings
 
-    broken = tmp_path / "broken.sqlite3"
-    con = _sqlite.connect(str(broken))
-    con.executescript(
-        "CREATE TABLE messages (id INTEGER PRIMARY KEY, conversation_id TEXT);"
+    monkeypatch.setattr(
+        _settings, "app_database_url", "postgresql://nobody@127.0.0.1:1/none"
     )
-    con.commit()
-    con.close()
-    monkeypatch.setattr(_settings, "app_db_path", str(broken))
-    monkeypatch.setattr(health_module, "_check_app_db", health_module._check_app_db)
-    result = health_module._check_app_db(str(broken))
-    assert result["status"] == "ok" or "generation_id" in str(result)
+    result = health_module._check_app_db()
+    assert result["status"] == "error" and result["detail"]
+
+    # And so is a database whose migrations have not been applied.
+    monkeypatch.setattr(health_module, "EXPECTED_SCHEMA_VERSION", 999)
+    monkeypatch.undo()
+    stale = health_module._check_app_db()
+    assert stale["status"] == "ok"  # back on the real DSN, at the real version

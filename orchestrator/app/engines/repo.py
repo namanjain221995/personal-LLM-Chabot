@@ -40,8 +40,11 @@ async def _clone_and_index(
     await emit("status", {"text": "Indexing the code…"})
     overview = repolib.build_overview(dest)
     chunks = index_repo(dest)
-    db.save_repo(conversation_id, ref.key, ref.clone_url, sha)
-    db.replace_repo_chunks(
+    await db.run_in_thread(
+        db.save_repo, conversation_id, ref.key, ref.clone_url, sha
+    )
+    await db.run_in_thread(
+        db.replace_repo_chunks,
         conversation_id,
         ref.key,
         [
@@ -119,10 +122,14 @@ async def _code_qa(
     message: str, conversation_id: str, history: Sequence[dict], emit: Emit
 ) -> str:
     kws = _expand_for_code(keywords(message, max_keywords=12))
-    chunks = db.search_repo_chunks(conversation_id, kws, limit=settings.repo_final_chunks)
+    chunks = await db.run_in_thread(
+        db.search_repo_chunks, conversation_id, kws, settings.repo_final_chunks
+    )
     if not chunks:
         # fall back to a plain answer over the repo overview context
-        chunks = db.search_repo_chunks(conversation_id, ["def", "class", "import"], limit=6)
+        chunks = await db.run_in_thread(
+            db.search_repo_chunks, conversation_id, ["def", "class", "import"], 6
+        )
 
     parts: List[str] = []
     async for kind, delta in llm.stream_chat_events(
@@ -159,7 +166,7 @@ async def run_repo_engine(
 ) -> str:
     """New repo URL → clone + index + overview; otherwise answer code questions
     from the already-indexed repo."""
-    if ref is not None and db.get_repo(conversation_id, ref.key) is None:
+    if ref is not None and await db.run_in_thread(db.get_repo, conversation_id, ref.key) is None:
         overview = await _clone_and_index(ref, conversation_id, emit)
         if overview is None:
             note = f"I couldn't analyze {ref.key}."

@@ -75,10 +75,19 @@ stages fall back to a ranked horizontal bar rather than a guessed order.
         │ DuckDB warehouse│ │ LanceDB   │ │ SearXNG  │ │ Salesforce    │
         │ (synced copy)   │ │ (RAG)     │ │ (web)    │ │ REST (live)   │
         └────────▲────────┘ └─────▲─────┘ └──────────┘ └───────────────┘
-                 │                │
-        ┌────────┴────────────────┴────────┐
-        │ sync-worker — every 30 minutes   │
-        └──────────────────────────────────┘
+                 │                │            ┌──────────────────────┐
+        ┌────────┴────────────────┴────────┐   │ PostgreSQL :5432     │
+        │ sync-worker — every 30 minutes   │   │ app state: users,    │
+        └──────────────────────────────────┘   │ chats, messages,     │
+                                               │ uploads, repo chunks │
+                                               └──────────────────────┘
+
+  Two data planes, deliberately separate:
+    ANALYTICS  DuckDB + LanceDB — columnar/vector, written only by sync-worker.
+               NOT moved to PostgreSQL: DuckDB is faster at the scan-and-
+               aggregate queries the SQL engine writes.
+    APP STATE  PostgreSQL — conversations and everything keyed to them.
+               (Was /data/app.sqlite3 until 2026-08-10.)
 
   models (vLLM, OpenAI-compatible):
     :8000  Qwen3.6-35B-A3B-NVFP4        main — chat, SQL, RAG, vision, synthesis
@@ -96,6 +105,8 @@ stages fall back to a ranked horizontal bar rather than a guessed order.
 | `vllm-router` | 8002 | Small model for cheap decisions |
 | `vllm-embed` | 8003 | Embeddings |
 | `sync-worker` | — | Salesforce → DuckDB + LanceDB, every 30 min |
+| `postgres` | 5432 | App state: users, conversations, messages, uploads. Bound to 127.0.0.1 only |
+| `pgadmin` | 5050 | Web UI for the app-state database. Bound to 127.0.0.1 only |
 | `searxng` | — | Self-hosted web search (internal only) |
 
 ---
@@ -107,6 +118,11 @@ cp .env.example .env        # then fill it in — see Configuration
 docker compose up -d
 ```
 
+`POSTGRES_PASSWORD` in `.env` is **required**; compose refuses to start without
+it. It is consumed when the database is first created, so changing it later
+means `ALTER ROLE ... PASSWORD` inside the running server — deleting the
+`pgdata` volume to re-run initdb would destroy your chat history.
+
 First start downloads model weights and can take 20+ minutes. Watch progress:
 
 ```bash
@@ -115,6 +131,93 @@ curl -s localhost:8080/health | python3 -m json.tool
 ```
 
 Then open **http://localhost:3000**. There is no login.
+
+---
+
+## Restarts, reboots and power cuts
+
+**One command starts everything:**
+
+```bash
+docker compose up -d
+```
+
+That brings up all ten services — `postgres`, `pgadmin`, `orchestrator`,
+`frontend`, `sync-worker`, `searxng` and the four vLLM servers. Compose waits
+for PostgreSQL to be *healthy* before starting the orchestrator, and for the
+orchestrator to be healthy before the UI. The vLLM servers only have to have
+*started*: they load ~40 GB of weights and are the slowest thing here, and
+making the whole app layer wait on them means one slow model stops you reading
+your own chat history.
+
+`searxng` sits behind a compose profile, so `COMPOSE_PROFILES=search` in `.env`
+is what makes a plain `up -d` include it. Without that variable web search is
+enabled in config but calling a host that is not running. (`vllm-vision` stays
+out on purpose — vision runs on the main model.)
+
+**After a power cut or reboot, everything comes back by itself.** Two things
+make that true, and both are load-bearing:
+
+1. Every service is `restart: unless-stopped` and the Docker daemon is enabled
+   at boot (`systemctl is-enabled docker`), so the daemon restarts whatever was
+   running. You do **not** need to run anything.
+2. The orchestrator **waits for PostgreSQL** at startup instead of dying.
+   `depends_on` only orders `docker compose up`; when the daemon restarts
+   containers after a reboot it starts them all at once and honours no such
+   ordering, so the app routinely wins the race against its own database.
+   Measured before the fix: 8 crash-restarts. After: 0, with
+   `waiting for postgres … (attempt 5, 177s left)` in the log and a clean start
+   the moment the database is ready. Tune with `APP_DB_STARTUP_TIMEOUT`.
+
+PostgreSQL handles the unclean shutdown itself — verified by `SIGKILL`ing it
+mid-write: `database system was not properly shut down; automatic recovery in
+progress` → `ready to accept connections`, with every row intact.
+
+The one thing that is slow after a reboot is the models: vLLM reloads ~40 GB of
+weights from local disk, and because all four load at once on a box whose
+memory is shared with the OS, `vllm-embed` and `vllm-ocr` may restart once or
+twice before settling. That is expected and self-correcting.
+
+**The app does not wait for them.** History, the UI and pgAdmin are usable
+within seconds of a boot; `/health` reports `degraded` and names the backends
+still loading. Only the model dependencies are soft — PostgreSQL is a hard
+`service_healthy` dependency, because the app cannot function without it.
+
+```bash
+docker compose ps                 # what is up, and what is healthy
+curl -s localhost:8080/health | python3 -m json.tool
+```
+
+---
+
+## Browsing the database (pgAdmin)
+
+**http://127.0.0.1:5050** — log in with `PGADMIN_DEFAULT_EMAIL` /
+`PGADMIN_DEFAULT_PASSWORD` from `.env`. The connection **TechSara app state** is
+already in the tree and opens without asking for the database password.
+
+```bash
+./pgadmin/setup-passfile.sh      # once, before the first start
+docker compose up -d pgadmin
+```
+
+Re-run that script if you delete the `pgadmin` volume or change
+`POSTGRES_PASSWORD` — it writes the pgpass file that makes the connection
+passwordless. Without it pgAdmin still works; it just prompts.
+
+What you will find: `conversations`, `messages` (with `meta` as real `jsonb`),
+`users`, `uploads`, `documents`, `url_documents`, `repos`, `repo_chunks`,
+`conversation_summaries`, `conversation_chunks`, and `schema_migrations`
+(which migration version is applied).
+
+**Not** in there: the Salesforce warehouse and the RAG index. Those are DuckDB
+and LanceDB *files* under the `data` volume, not PostgreSQL — query the
+warehouse with `duckdb /var/lib/docker/volumes/sf-local-ai_data/_data/warehouse.duckdb`
+or just ask the assistant.
+
+> pgAdmin is a full SQL client: whoever reaches it can `DROP` your chat history.
+> That is why it is bound to loopback and keeps its own login even though the
+> app itself has none. Do not publish port 5050.
 
 ---
 

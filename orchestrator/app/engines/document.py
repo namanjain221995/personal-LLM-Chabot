@@ -139,8 +139,8 @@ async def run_pdf_engine(
         try:
             from .. import db
 
-            db.save_document(
-                conversation_id, filename or "document", full_text, total
+            await db.run_in_thread(
+                db.save_document, conversation_id, filename or "document", full_text, total
             )
         except Exception:
             pass  # memory is an enhancement; the answer must still stream

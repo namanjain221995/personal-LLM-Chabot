@@ -1,5 +1,13 @@
 # Evidence — `orch-core-data`
 
+> **⚠ Superseded in part (2026-08-10).** The app-state layer described below was
+> `/data/app.sqlite3` (stdlib `sqlite3`). It is now PostgreSQL — see
+> [`data-model.md`](../01-codebase/data-model.md) and the CHANGELOG entry
+> "App state moved from SQLite to PostgreSQL". Every `sqlite3` reference,
+> `db.py` line number and finding about SQLite locking below is a snapshot of
+> the pre-migration code and has NOT been re-derived. The DuckDB warehouse and
+> LanceDB sections are unaffected and remain accurate.
+
 Scope: `orchestrator/app/core/{salesforce,schema_cache,sf_dictionary,repo_index,repo,extract,profile}.py`.
 All seven files read in full with the Read tool. Every line reference below was read or re-verified with `rg -n`.
 Total assigned LOC: **1249** (`wc -l`: salesforce 268, schema_cache 74, sf_dictionary 192, repo_index 54, repo 302, extract 108, profile 251).

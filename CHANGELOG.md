@@ -1,5 +1,218 @@
 # Changelog
 
+## Thumbs up/down stored with the chat (2026-08-11)
+
+Owner request. `messages.feedback` (`'up' | 'down' | NULL`, CHECK-constrained)
+plus `messages.feedback_at`, migration v3, with a partial index over just the
+rated rows. On the message, not in a side table — it cascades with the
+conversation and comes back in the same SELECT the thread already does.
+
+**It was localStorage-only before, and that had a silent data-loss bug.** The
+browser keys feedback by a client-side message id: a live message carries
+`crypto.randomUUID()`, but the same message rehydrated from the server is keyed
+positionally as `srv-<conversation>-<index>`. So a thumb given to a fresh reply
+disappeared on the next reload — the icon just came back empty and nobody
+reported it.
+
+Fixing it needed the server to hand the client a stable identity, which it
+never had: **`list_messages` now returns `id`** alongside `{role, content,
+meta}`. `PUT /history/conversations/{cid}/messages/{mid}/feedback` is keyed by
+it, owner-scoped inside the UPDATE statement (a message in another account's
+conversation is a 404, indistinguishable from missing, so ids cannot be
+probed), and takes `null` to clear — the UI's real third state.
+
+The subtle one: **`replace_messages` would have wiped every thumb.** It deletes
+and reinserts the whole thread, so all ids change, and the offline sync takes
+that path whenever the tail diverges (any regenerate). Thumbs are now carried
+across by position — sound only because that function is structurally unable to
+reorder or shrink a thread — while an explicit `feedback` in the pushed payload
+wins, so clearing a thumb in one tab is not undone by a sync from another.
+
+Frontend: `ChatMessage` gained `serverId`, hydration keeps it and the stored
+value, and the thumb is optimistic — the cache updates first so the icon fills
+on click, and a failed request is swallowed rather than raising an error pill.
+A message with no server row yet is cached and rides to the server on the next
+sync. Tests: 869 backend (20 new), 296 frontend (8 new).
+
+## Survives a reboot without help (2026-08-11)
+
+Owner question: "if any power loss, like reboot — does it bring all containers
+up again?" It did not, cleanly. Now it does, and the gaps are worth recording.
+
+**The orchestrator raced its own database.** `depends_on: service_healthy`
+orders `docker compose up` only; when the Docker daemon restarts containers
+after a reboot it starts them simultaneously and honours no ordering. Verified
+by SIGKILLing PostgreSQL and the orchestrator and restarting the orchestrator
+first: it failed its lifespan, exited, and `restart: unless-stopped` restarted
+it — **8 times** — before the database came back. It always recovered, but
+Docker's restart backoff grows with each failure, so recovery was slowest
+exactly when the machine is busiest. `db.wait_for_database()` now waits (bounded
+by `APP_DB_STARTUP_TIMEOUT`, default 180 s) with a readable log line. Same test
+after the fix: **0 restarts**, `postgres … is up (after 28 attempts)`, clean
+start.
+
+**`searxng` was not in the one-command path.** `SEARCH_ENABLED=true` in `.env`,
+but the service sits behind a `search` compose profile, so a plain
+`docker compose up -d` left web search pointing at a host that was not running.
+`.env` now sets `COMPOSE_PROFILES=search`; all ten services start from one
+command.
+
+**`vllm-router` could never survive a cold start — a latent bug that would
+have bitten on the next real power cut.** Its engine needs 4.5 GiB of KV cache
+for a 65536 window but only 4.2 GiB fits inside its `--gpu-memory-utilization
+0.14` slice:
+
+    ValueError: To serve at least one request with the model's max seq len
+    (65536), (4.5 GiB KV cache is needed, which is larger than the available
+    KV cache memory (4.2 GiB)
+
+so the container exited and restart-looped indefinitely. It went unnoticed
+because the four model services had historically come up at different times;
+it reproduces every time they cold-start TOGETHER — that is, on every reboot,
+which is exactly when nobody is watching. Found only by actually tearing the
+stack down and bringing it back.
+
+Fixed by shrinking the window to 49152 rather than raising the memory
+reservation: KV scales linearly with `max-model-len`, so this needs ~3.4 GiB
+and fits with margin at **no extra memory cost**, leaving the budget the top of
+`docker-compose.yml` warns about ("over-reserving took the box to 0 GB free
+once") untouched. 48K is far more than this service's jobs need — routing and
+classification are a few hundred tokens and an agent web step tops out around
+15K — and `REPORT_MAX_CONTEXT=65536` is unaffected because report planning runs
+on the main model (262144), not this one.
+
+**One slow model blocked the entire app layer.** The full test — `docker
+compose down` then `up -d` — aborted with "dependency failed to start:
+container sf-local-ai-vllm-embed-1 is unhealthy", and the orchestrator,
+frontend and sync worker were never started at all. Cause: the four vLLM
+servers load ~40 GB of weights simultaneously into 121 GB of memory shared with
+the OS (measured: 1 GB free at the peak), and under that pressure vllm-embed
+and vllm-ocr get knocked over and restart; compose treats a restarting
+dependency as failed. The model dependencies are now `service_started` rather
+than `service_healthy` — nothing calls a model during startup, `/health`
+reports each backend separately, and after a reboot the daemon honours no
+depends_on anyway, so requiring healthy bought nothing while costing the whole
+app layer. Verified after the change: orchestrator healthy in 6 s and the UI
+serving 108 conversations while two models were still loading.
+
+**The orchestrator had no healthcheck**, so `frontend`'s
+`depends_on: service_started` was satisfied the moment the process existed —
+on a cold boot the UI came up against an orchestrator still waiting for its
+database. It now has one (`/health`, which answers 200 even when degraded, so
+it does not flap when the sync worker holds the DuckDB write lock) and the
+frontend waits for `service_healthy`.
+
+Also verified: PostgreSQL recovers from an unclean shutdown on its own
+("database system was not properly shut down; automatic recovery in progress"
+→ "ready to accept connections") with no row loss.
+
+## SQLite removed · pgAdmin web UI (2026-08-10)
+
+Follow-up to the PostgreSQL migration, both owner-requested.
+
+**`app.sqlite3` deleted.** Parity re-verified against the live database first
+(every table >= the SQLite count; `conversations` and `messages` had already
+grown from real use since the cutover), then the file and its WAL/SHM sidecars
+were removed from the `data` volume — 13.6 MB reclaimed, and the volume now
+holds only DuckDB, LanceDB, parquet and workspaces. A gzipped,
+integrity-checked copy is kept OUTSIDE the volume at
+`~/sf-local-ai-backups/app.sqlite3.pre-postgres-2026-08-10.gz` (2.1 MB);
+delete it once you are confident. `scripts/migrate_sqlite_to_postgres.py` is
+kept deliberately — it is the only thing that can read that backup back in.
+
+**pgAdmin at http://127.0.0.1:5050.** `dpage/pgadmin4` (arm64), loopback-only,
+its own `pgadmin` volume, `depends_on: postgres healthy`. The connection is
+pre-registered from `pgadmin/servers.json` and opens with no password prompt:
+`pgadmin/setup-passfile.sh` writes a pgpass INSIDE the volume as uid 5050,
+because libpq rejects a group-readable passfile and chowning a host file to
+5050 needs root. It keeps its own login even though the app has none — it is a
+full SQL client, so reaching it means being able to DROP the history.
+
+Two things that cost a restart loop and are worth remembering: pgAdmin
+**rejects `.local` / `.test` / `example.com`** in `PGADMIN_DEFAULT_EMAIL` (its
+email validator refuses special-use domains), and pre-creating the volume as
+root leaves `/var/lib/pgadmin` unwritable by uid 5050 — the setup script now
+chowns the whole directory, not just the pgpass.
+
+## App state moved from SQLite to PostgreSQL (2026-08-10)
+
+Owner request: "migrate to PostgreSQL, I want that fast speed."
+
+`/data/app.sqlite3` is gone. Users, conversations, messages, summaries,
+conversation chunks, uploads, fetched URLs, documents, repos and repo chunks
+now live in PostgreSQL 18 (`postgres:18-alpine`, arm64), reached through one
+process-wide `psycopg_pool.ConnectionPool`. The 13.6 MB live database was
+migrated with zero loss: 1 user, 106 conversations, 378 messages, 7 uploads,
+7 documents, 1 repo, 1591 repo chunks — row counts verified, timestamps
+round-tripping to byte-identical ISO-8601 strings, sequences advanced (the
+first new message got id 447, not a primary-key collision).
+
+**NOT migrated, deliberately:** the DuckDB warehouse and the LanceDB vector
+index. DuckDB is a columnar engine and beats PostgreSQL at the scan-and-
+aggregate queries the SQL engine writes; moving it would be a downgrade.
+
+All 26 `db.py` accessors kept their names, signatures and return shapes, so
+the ~24 call sites did not change: rows are `dict` (psycopg's `dict_row`),
+which supports `row["col"]` and `dict(row)` exactly as `sqlite3.Row` did.
+
+**Honest performance ledger.** Measured back-to-back on live data:
+`add_message` 8.49 → 2.78 ms (3.1x faster, and it is on every chat turn's
+critical path); point reads 0.26 → 0.37 ms (slightly slower); search and
+cross-chat recall 3-6x SLOWER at 378 messages. And the write win needs a
+caveat: the SQLite code set `journal_mode=WAL` but never set `synchronous`,
+so it ran at `FULL` and the fsync was 3.48 ms of a 3.49 ms write — 100% of
+the cost. At equal durability the engines are close. The real case for this
+migration is concurrency (SQLite serialised writers behind a 5 s busy timeout
+that surfaced as HTTP 500), real types, a schema that no longer rebuilds
+itself on every query, and headroom for selective search as history grows
+(2.5 ms vs ~19 ms at 200k messages).
+
+Bugs found and fixed along the way, all caught by measurement or the tests:
+
+- **`LIKE` → `ILIKE`.** SQLite's `LIKE` is case-insensitive for ASCII;
+  PostgreSQL's is not. Ported verbatim, the search palette silently stopped
+  matching anything capitalised.
+- **Foreign keys reverted.** The five conversation-keyed side tables were
+  given `REFERENCES conversations(id)`; that broke the bare-API path where
+  `/chat` runs with a `session_id` and no conversation row. `DATA-03` (delete
+  orphaning uploads/pages/repo chunks forever) is fixed in
+  `delete_conversation` instead, which now clears them in the same transaction.
+- **`add_message` idempotency.** The SQLite idiom (INSERT / catch
+  IntegrityError / SELECT the winner) cannot work in PostgreSQL — a failed
+  statement aborts the transaction. Now a `SAVEPOINT` via nested
+  `con.transaction()`.
+- **NUL bytes.** PostgreSQL `text` rejects `\x00` and `jsonb` rejects the
+  `\u0000` escape; SQLite accepted both. Model output, OCR/PDF transcripts and
+  scraped pages all flow into these columns, so `_text()` and `_dumps_jsonb()`
+  strip them — otherwise one bad byte loses a completed answer.
+- **Event-loop blocking.** Every `db.*` call inside an `async def` is now
+  offloaded via `db.run_in_thread`; an AST check enforces zero remaining. The
+  9 ms write used to stall every concurrent SSE stream.
+- **`compaction._locks`.** A module-level `asyncio.Lock` cache that could not
+  survive a second event loop. Latent before (the critical section never
+  actually yielded); adding a real `await` inside it made the lock do its job
+  and exposed the bug.
+- **Silent answer loss.** `_finalize_generation` wrapped the only write of a
+  detached answer in a bare `suppress(Exception)`. Now logged.
+- **Two speculative optimisations measured and REVERTED**: a `DISTINCT ON`
+  rewrite of the search query (faster on 378 rows, 3x slower on a selective
+  term at 200k) and three trigram indexes (0 scans and 8.8 MB on the live
+  database — dropped in migration v2, which also rebuilt
+  `idx_conversations_user` to cover `archived`).
+
+Schema changes are now numbered migrations recorded in `schema_migrations`,
+applied once at startup inside a transaction holding `pg_advisory_xact_lock`
+— replacing 15 `CREATE … IF NOT EXISTS` statements plus an unconditional
+O(messages) `DELETE` that ran on every one of 34 call sites.
+
+The test suite now needs a reachable PostgreSQL (it stays offline in every
+other sense — no vLLM, no GPU, no network); each test gets `TRUNCATE …
+RESTART IDENTITY CASCADE`, reproducing the old "fresh file, ids from 1"
+isolation. Tests: 849 passing.
+
+Migration tool: `orchestrator/scripts/migrate_sqlite_to_postgres.py`
+(`--dry-run`, `--truncate`, `--init-schema`, verification pass built in).
+
 ## Document pages shown in the Activity panel (2026-08-07)
 
 Uploading a PDF/DOCX now records WHAT was read into the answer's meta

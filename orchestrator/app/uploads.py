@@ -14,14 +14,13 @@ from __future__ import annotations
 
 import os
 import shutil
-import sqlite3
 import uuid
 from typing import Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 
 from . import db
-from .auth import require_user
+from .auth import UserRow, require_user
 from .config import settings
 from .core import archive, profile as profiler
 
@@ -67,13 +66,13 @@ async def _stream_to_disk(upload: UploadFile, dest: str) -> int:
 async def create_upload(
     file: UploadFile = File(...),
     conversation_id: str = Form(...),
-    user: sqlite3.Row = Depends(require_user),
+    user: UserRow = Depends(require_user),
 ) -> dict:
     if not settings.dataset_uploads_enabled:
         raise HTTPException(status_code=404, detail="dataset uploads are disabled")
 
     # Same ownership rule as every other per-conversation store.
-    owner = db.conversation_owner(conversation_id)
+    owner = await db.run_in_thread(db.conversation_owner, conversation_id)
     if owner is not None and owner != int(user["id"]):
         raise HTTPException(status_code=404, detail="conversation not found")
 
@@ -121,13 +120,15 @@ async def create_upload(
         profiles = profiler.profile_directory(extract_dir)
     except archive.ArchiveError as exc:
         shutil.rmtree(root, ignore_errors=True)
-        db.save_upload(
-            upload_id, conversation_id, filename, size, "rejected", None, str(exc)
+        await db.run_in_thread(
+            db.save_upload,
+            upload_id, conversation_id, filename, size, "rejected", None, str(exc),
         )
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
         shutil.rmtree(root, ignore_errors=True)
-        db.save_upload(
+        await db.run_in_thread(
+            db.save_upload,
             upload_id, conversation_id, filename, size, "failed", None,
             f"{type(exc).__name__}",
         )
@@ -138,7 +139,8 @@ async def create_upload(
     # The original archive is not needed once extracted; drop it to save quota.
     shutil.rmtree(os.path.join(root, "_original"), ignore_errors=True)
 
-    db.save_upload(
+    await db.run_in_thread(
+        db.save_upload,
         upload_id,
         conversation_id,
         filename,
@@ -159,7 +161,7 @@ async def create_upload(
 
 @router.get("/{conversation_id}")
 def list_uploads(
-    conversation_id: str, user: sqlite3.Row = Depends(require_user)
+    conversation_id: str, user: UserRow = Depends(require_user)
 ) -> dict:
     owner = db.conversation_owner(conversation_id)
     if owner is not None and owner != int(user["id"]):

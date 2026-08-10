@@ -94,8 +94,10 @@ def test_clone_rejects_too_many_files(tmp_path, monkeypatch):
 
 
 @pytest.fixture()
-def temp_db(tmp_path, monkeypatch):
-    monkeypatch.setattr(settings, "app_db_path", str(tmp_path / "app.sqlite3"))
+def temp_db():
+    """Kept as a name so the tests below read unchanged; the isolated database
+    now comes from the autouse conftest fixture."""
+    return None
 
 
 def test_repo_chunk_storage_and_search(temp_db):

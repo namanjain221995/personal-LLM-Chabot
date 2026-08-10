@@ -111,6 +111,15 @@ function makeServer(): FakeServer {
       }
       c.messages = c.messages.slice(0, keep);
     },
+    async setFeedback(id, messageId, feedback) {
+      guard('setFeedback');
+      const conv = convs.get(id);
+      const target = conv?.messages?.find(
+        (m: ServerMessage) => m.id === messageId,
+      );
+      if (!target) throw new HistoryApiError(404, 'message not found');
+      target.feedback = feedback;
+    },
     async replaceMessages(id, messages) {
       guard(`replace:${id}`);
       const c = convs.get(id);

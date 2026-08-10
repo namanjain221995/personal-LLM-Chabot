@@ -101,7 +101,7 @@ async def run_dataset_engine(
     effort: str = "medium",
 ) -> str:
     """Stream an answer grounded in the stored profiles for this conversation."""
-    uploads = db.get_uploads(conversation_id)
+    uploads = await db.run_in_thread(db.get_uploads, conversation_id)
     if not uploads:
         note = "There are no uploaded datasets in this conversation yet."
         await emit("token", {"text": note})

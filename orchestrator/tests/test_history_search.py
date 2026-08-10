@@ -14,7 +14,6 @@ from app.main import app
 
 @pytest.fixture()
 def env(tmp_path, monkeypatch):
-    monkeypatch.setattr(settings, "app_db_path", str(tmp_path / "app.sqlite3"))
     monkeypatch.setattr(settings, "session_secret_file", str(tmp_path / ".session_secret"))
     monkeypatch.delenv("SESSION_SECRET", raising=False)
 

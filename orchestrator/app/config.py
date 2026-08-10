@@ -266,10 +266,33 @@ class Settings:
             if origin.strip()
         ]
 
-        # --- V2 app state (V2-DESIGN §3c): auth + server-side history live in
-        # SQLite (stdlib sqlite3, WAL). This is APP state only — the analytics
-        # data plane stays DuckDB/LanceDB/Parquet per SPEC §4.
-        self.app_db_path: str = os.environ.get("APP_DB_PATH", "/data/app.sqlite3")
+        # --- App state (V2-DESIGN §3c): auth + server-side history.
+        # PostgreSQL since 2026-08-10 (was stdlib sqlite3 at /data/app.sqlite3).
+        # This is APP state only — the analytics data plane stays
+        # DuckDB/LanceDB/Parquet per SPEC §4, and DuckDB is deliberately NOT
+        # migrated: it is a columnar engine and beats PostgreSQL at the SQL
+        # engine's scan-and-aggregate queries.
+        #
+        # No default DSN on purpose. A silent fallback to some localhost
+        # database is how a deploy ends up writing history nobody can find;
+        # missing configuration should fail loudly at startup instead.
+        self.app_database_url: str = os.environ.get("APP_DATABASE_URL", "").strip()
+        # Pool bounds. max is per orchestrator process and must stay well under
+        # the server's max_connections (60 in compose); 16 is far more than a
+        # single-user box needs and leaves room for psql and the migration tool.
+        self.app_db_pool_min: int = _int("APP_DB_POOL_MIN", 2)
+        self.app_db_pool_max: int = _int("APP_DB_POOL_MAX", 16)
+        # Seconds a caller waits for a free connection before giving up, and
+        # the server-side statement timeout. Both exist so a pathological query
+        # or an exhausted pool surfaces as an error instead of a hung request.
+        self.app_db_pool_timeout: float = _float("APP_DB_POOL_TIMEOUT", 10.0)
+        self.app_db_statement_timeout_ms: int = _int("APP_DB_STATEMENT_TIMEOUT_MS", 15_000)
+        # How long startup waits for PostgreSQL to accept a connection before
+        # giving up. This is a REBOOT concern, not a tuning knob: after a power
+        # cut the Docker daemon starts every container at once and honours no
+        # depends_on, so the orchestrator routinely wins the race against its
+        # own database.
+        self.app_db_startup_timeout: float = _float("APP_DB_STARTUP_TIMEOUT", 180.0)
         # Session-cookie signing secret: SESSION_SECRET env wins; otherwise a
         # secret is generated once and persisted here (chmod 600).
         self.session_secret_file: str = os.environ.get(

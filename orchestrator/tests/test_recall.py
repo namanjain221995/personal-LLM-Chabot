@@ -45,7 +45,7 @@ def fake_embedder(mapping):
 # ---------------------------------------------------------------------------
 
 
-def test_vectors_round_trip_through_sqlite():
+def test_vectors_round_trip_through_the_database():
     original = [0.5, -0.25, 1.0, 0.0]
     restored = recall.unpack_vector(recall.pack_vector(original))
     assert len(restored) == len(original)

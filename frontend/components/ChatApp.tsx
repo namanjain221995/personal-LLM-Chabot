@@ -917,6 +917,17 @@ export function ChatApp() {
                   onRegenerate={() => regenerate(m.id)}
                   onRetry={() => regenerate(m.id)}
                   onShowSummary={() => setSummaryOpen(true)}
+                  onFeedback={(feedback) => {
+                    if (!activeId) return;
+                    // Fire-and-forget: the store updates its cache first and
+                    // swallows a failed request, so a thumb never blocks the
+                    // UI or raises an error pill.
+                    void getHistoryStore().setMessageFeedback(
+                      activeId,
+                      m.id,
+                      feedback,
+                    );
+                  }}
                 />
               ))}
             </div>

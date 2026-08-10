@@ -66,7 +66,8 @@ def test_a_stale_session_cookie_is_ignored_not_rejected(env):
 def test_a_fresh_install_creates_one_account(env):
     with TestClient(app) as c:
         c.get("/history/conversations")
-    users = db.connect().execute("SELECT username FROM users").fetchall()
+    with db.connection() as con:
+        users = con.execute("SELECT username FROM users").fetchall()
     assert len(users) == 1
 
 
@@ -110,9 +111,8 @@ def test_the_same_user_is_returned_every_time(env):
 
 def test_a_deleted_account_is_re_resolved_rather_than_crashing(env):
     user_id = int(auth.local_user()["id"])
-    conn = db.connect()
-    conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
-    conn.commit()
+    with db.connection() as con:
+        con.execute("DELETE FROM users WHERE id = %s", (user_id,))
     assert auth.local_user() is not None
 
 

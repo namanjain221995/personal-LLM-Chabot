@@ -119,6 +119,22 @@ export interface ServerHistoryStore extends HistoryStore {
    * the server's thread is not the length the caller expects.
    */
   truncateMessages(id: string, keep: number): Promise<void>;
+  /**
+   * Record a thumb on one message, locally and on the server.
+   *
+   * Optimistic: the cache is updated first so the icon fills instantly, and a
+   * failed request is swallowed — a thumb is a convenience, and throwing here
+   * would surface a red pill for something the user does not need to retry.
+   *
+   * A message with no `serverId` (one that has not been pushed yet) is
+   * updated in the cache only; the value rides to the server with the next
+   * sync, because toServerMessage now carries it.
+   */
+  setMessageFeedback(
+    conversationId: string,
+    messageId: string,
+    feedback: 'up' | 'down' | null,
+  ): Promise<void>;
   /** Await all in-flight background pushes (used by tests). */
   flush(): Promise<void>;
 }
@@ -624,7 +640,16 @@ export function createServerHistoryStore(
   }
 
   function toServerMessage(m: ChatMessage): ServerMessage {
-    return { role: m.role, content: m.content, meta: m.meta ?? null };
+    return {
+      role: m.role,
+      content: m.content,
+      meta: m.meta ?? null,
+      // Sent so a whole-thread re-push does not resurrect a thumb this client
+      // has since cleared. The server also carries thumbs across by position,
+      // which covers older clients that omit the field; an explicit value
+      // here wins over that.
+      ...(m.feedback !== undefined ? { feedback: m.feedback } : {}),
+    };
   }
 
   function flagsOf(conv: Conversation): ConversationPatch {
@@ -799,6 +824,11 @@ export function createServerHistoryStore(
       const now = Date.now();
       const messages: ChatMessage[] = server.messages.map((m, i) => ({
         id: `srv-${id}-${i}`,
+        // The server row id, so a thumb given now survives the next reload.
+        ...(typeof m.id === 'number' ? { serverId: m.id } : {}),
+        ...(m.feedback === 'up' || m.feedback === 'down'
+          ? { feedback: m.feedback }
+          : { feedback: null }),
         role: m.role === 'user' ? 'user' : 'assistant',
         content: typeof m.content === 'string' ? m.content : '',
         ...(m.meta ? { meta: m.meta as Meta } : {}),
@@ -910,6 +940,35 @@ export function createServerHistoryStore(
       local.setArchived(id, archived);
       if (!local.get(id)) return;
       enqueue(id, () => pushPatch(id, { archived }));
+    },
+
+    async setMessageFeedback(conversationId, messageId, feedback) {
+      const conv = local.get(conversationId);
+      if (!conv) return;
+      const target = conv.messages.find((m) => m.id === messageId);
+      if (!target) return;
+
+      // Cache first: the icon must fill on click, not on a round trip.
+      local.saveMessages(
+        conversationId,
+        conv.messages.map((m) =>
+          m.id === messageId ? { ...m, feedback } : m,
+        ),
+      );
+
+      // Not stored server-side yet — the next sync carries it, because
+      // toServerMessage now includes the field.
+      if (typeof target.serverId !== 'number') {
+        markDirty(conversationId);
+        return;
+      }
+      try {
+        await api.setFeedback(conversationId, target.serverId, feedback);
+      } catch {
+        // Best-effort. The value stays in the cache and the next whole-thread
+        // push will carry it, so nothing is lost by staying quiet here.
+        markDirty(conversationId);
+      }
     },
 
     async exportMarkdown(id) {
@@ -1072,6 +1131,7 @@ export function getHistoryStore(): ServerHistoryStore {
         update: async () => undefined,
         remove: async () => undefined,
         appendMessage: async () => undefined,
+        setFeedback: async () => undefined,
         replaceMessages: async () => undefined,
         truncateMessages: async () => undefined,
       },

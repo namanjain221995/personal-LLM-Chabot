@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import mimetypes
 import uuid
 from typing import AsyncIterator, List, Literal, Optional
@@ -26,16 +27,29 @@ from .sse import sse_event
 
 @contextlib.asynccontextmanager
 async def lifespan(_app: FastAPI):
-    """Apply the database schema/migrations BEFORE serving any request.
+    """Open the connection pool and apply migrations BEFORE serving a request.
 
-    connect() migrates lazily, so a broken migration used to surface on the
-    first user request that happened to touch app.sqlite3 — long after the
-    deploy looked healthy. Doing it here makes a bad migration fail startup,
-    which is what a container healthcheck can actually catch.
+    The SQLite layer migrated lazily on every connection, so a broken migration
+    used to surface on the first user request — long after the deploy looked
+    healthy. Doing it here makes a bad migration fail startup, which is what a
+    container healthcheck can actually catch. It is also now the ONLY place the
+    schema is applied: accessors no longer replay the DDL, which is where most
+    of the old per-operation cost went.
+
+    Run in a thread: pool startup dials PostgreSQL, and blocking the loop
+    during startup would stall the readiness probe alongside it.
+
+    `wait_for_database` comes first because after a reboot the Docker daemon
+    starts every container simultaneously and ignores `depends_on` — so this
+    process can, and does, come up before its own database. Waiting turns a
+    crash-restart loop into one clean start.
     """
-    with contextlib.closing(db.connect()):
-        pass
-    yield
+    await db.run_in_thread(db.wait_for_database)
+    await db.run_in_thread(db.init_schema)
+    try:
+        yield
+    finally:
+        await db.run_in_thread(db.close_pool)
 
 
 app = FastAPI(title="TechSara Orchestrator", version="0.2.0", lifespan=lifespan)
@@ -158,14 +172,42 @@ async def _finalize_generation(conv_key: str, gen: LiveGeneration) -> None:
         and gen.conversation_id
         and gen.answer
     ):
-        with contextlib.suppress(Exception):
-            db.add_message(
+        # This is the ONLY copy of the answer: nobody was attached when it
+        # finished, so no client will persist it. A bare `suppress(Exception)`
+        # here loses the user's reply without a trace — and gives no way to
+        # tell "nothing to save" apart from "the save failed". Still
+        # best-effort (a storage failure must not take the process down), but
+        # audible.
+        try:
+            stored = await db.run_in_thread(
+                db.add_message,
                 gen.user_id,
                 gen.conversation_id,
                 "assistant",
                 gen.answer,
                 gen.final_meta,
             )
+            if stored is None:
+                logging.getLogger(__name__).warning(
+                    "detached answer for conversation %s was not stored: no such "
+                    "conversation for user %s",
+                    gen.conversation_id,
+                    gen.user_id,
+                )
+        except Exception as exc:  # noqa: BLE001 — best-effort, but never silent
+            logging.getLogger(__name__).warning(
+                "failed to persist the detached answer for conversation %s: %s: %s",
+                gen.conversation_id,
+                type(exc).__name__,
+                exc,
+            )
+    elif gen.answer and gen.conversation_id and not gen.cancelled and not gen.failed:
+        logging.getLogger(__name__).debug(
+            "not persisting %s server-side: subscribers=%s user_id=%s",
+            gen.conversation_id,
+            gen.subscribers,
+            gen.user_id,
+        )
 
 
 class ChatMessage(BaseModel):
@@ -351,7 +393,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
     from .auth import current_user
     from .memory_recall import recall_block
 
-    signed_in = current_user(http_request)
+    signed_in = await db.run_in_thread(current_user, http_request)
 
     conv_key_outer = request.conversation_id or request.session_id
 
@@ -363,7 +405,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
     # If the DB is unreachable this raises; the stores it guards are read
     # through the same connection, so they fail too and nothing can leak.
     try:
-        conv_owner = db.conversation_owner(conv_key_outer)
+        conv_owner = await db.run_in_thread(db.conversation_owner, conv_key_outer)
     except Exception:
         conv_owner = None
     viewer = int(signed_in["id"]) if signed_in is not None else None
@@ -496,8 +538,11 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     )
 
             if signed_in is not None and request.text:
-                block = recall_block(
-                    int(signed_in["id"]), request.text, request.conversation_id
+                block = await db.run_in_thread(
+                    recall_block,
+                    int(signed_in["id"]),
+                    request.text,
+                    request.conversation_id,
                 )
                 if block:
                     history = [{"role": "system", "content": block}, *history]
@@ -516,7 +561,9 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     try:
                         from . import db as _dbr
 
-                        repo_followup = bool(_dbr.get_repo_keys(conv_key))
+                        repo_followup = bool(
+                            await db.run_in_thread(_dbr.get_repo_keys, conv_key)
+                        )
                     except Exception:
                         repo_followup = False
 
@@ -538,7 +585,9 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 url_list = extract_urls(request.text, limit=settings.url_max_pages)
                 if not url_list:
                     try:
-                        stored = _db.get_url_documents(conv_key)
+                        stored = await db.run_in_thread(
+                            _db.get_url_documents, conv_key
+                        )
                     except Exception:
                         stored = []  # best-effort — never break chat on a DB hiccup
                     if stored:
@@ -566,7 +615,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 from .core.urls import select_relevant as _doc_select
 
                 try:
-                    stored_docs = db.get_documents(conv_key)
+                    stored_docs = await db.run_in_thread(db.get_documents, conv_key)
                 except Exception:
                     stored_docs = []  # best-effort
                 if stored_docs:
@@ -603,7 +652,9 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 and not url_list
             ):
                 try:
-                    dataset_ready = bool(db.get_uploads(conv_key))
+                    dataset_ready = bool(
+                        await db.run_in_thread(db.get_uploads, conv_key)
+                    )
                 except Exception:
                     dataset_ready = False
 
@@ -784,11 +835,16 @@ class StopRequest(BaseModel):
     session_id: str = "default"
 
 
-def _viewer_id(http_request: Request) -> Optional[int]:
-    """The signed-in user's id, or None for an unauthenticated caller."""
+async def _viewer_id(http_request: Request) -> Optional[int]:
+    """The signed-in user's id, or None for an unauthenticated caller.
+
+    Async because resolving the local account is a database round trip
+    (auth.local_user -> db.get_user_by_id); running it inline would block the
+    event loop on the SSE attach/stop hot paths.
+    """
     from .auth import current_user
 
-    user = current_user(http_request)
+    user = await db.run_in_thread(current_user, http_request)
     return int(user["id"]) if user is not None else None
 
 
@@ -810,7 +866,7 @@ async def chat_stop(body: StopRequest, http_request: Request) -> dict:
     gen = _live_generations.get(body.conversation_id or body.session_id)
     if gen is None or gen.done or gen.task is None:
         return {"stopped": False}
-    if not _owns(gen, _viewer_id(http_request)):
+    if not _owns(gen, await _viewer_id(http_request)):
         return {"stopped": False}  # not yours — indistinguishable from absent
     gen.task.cancel()
     return {"stopped": True}
@@ -821,7 +877,7 @@ async def chat_active(http_request: Request) -> dict:
     """Conversation keys with a generation still running — the sidebar polls
     this to show a ChatGPT-style spinner next to busy chats. Scoped to the
     caller: another account's conversation ids are never disclosed."""
-    viewer = _viewer_id(http_request)
+    viewer = await _viewer_id(http_request)
     return {
         "active": [
             k
@@ -846,10 +902,10 @@ async def chat_compact(body: CompactRequest, http_request: Request) -> dict:
     from . import compaction
     from .auth import current_user
 
-    user = current_user(http_request)
+    user = await db.run_in_thread(current_user, http_request)
     if user is None:
         raise HTTPException(status_code=401, detail="sign in required")
-    owner = db.conversation_owner(body.conversation_id)
+    owner = await db.run_in_thread(db.conversation_owner, body.conversation_id)
     if owner is None or owner != int(user["id"]):
         raise HTTPException(status_code=404, detail="conversation not found")
 
@@ -861,7 +917,7 @@ async def chat_compact(body: CompactRequest, http_request: Request) -> dict:
     if not history:
         history = [
             {"role": m["role"], "content": m["content"]}
-            for m in db.list_messages(body.conversation_id)
+            for m in await db.run_in_thread(db.list_messages, body.conversation_id)
         ]
     result = await compaction.compact(body.conversation_id, history, force=True)
     if result is None:
@@ -881,7 +937,7 @@ async def chat_attach(
     event (so the partial answer rebuilds instantly) and then streams live.
     404 once it has finished — the answer is in history at that point."""
     gen = _live_generations.get(conversation_id)
-    if gen is None or gen.done or not _owns(gen, _viewer_id(http_request)):
+    if gen is None or gen.done or not _owns(gen, await _viewer_id(http_request)):
         raise HTTPException(status_code=404, detail="no active generation")
     return StreamingResponse(
         gen.follow(),

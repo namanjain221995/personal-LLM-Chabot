@@ -45,7 +45,24 @@ def take_pending_notice(conversation_id: str) -> Optional[dict]:
     return _pending_notice.pop(conversation_id, None)
 
 
+#: Which event loop the cached locks belong to. An `asyncio.Lock` binds itself
+#: to the loop it FIRST BLOCKS on and raises `RuntimeError: bound to a
+#: different event loop` if it is ever awaited under another one. The app has a
+#: single loop for its whole lifetime, so this only ever fires once — but the
+#: cache is module state that outlives any individual loop, and a stale entry
+#: would take down compaction for every conversation, not just fail a test.
+_locks_loop: Optional[asyncio.AbstractEventLoop] = None
+
+
 def _lock_for(conversation_id: str) -> asyncio.Lock:
+    global _locks_loop
+
+    loop = asyncio.get_running_loop()
+    if _locks_loop is not loop:
+        # Locks from a previous loop can never be acquired again; keeping them
+        # would raise instead of serialising anything.
+        _locks.clear()
+        _locks_loop = loop
     lock = _locks.get(conversation_id)
     if lock is None:
         lock = asyncio.Lock()
@@ -183,8 +200,12 @@ async def _fold(
         # The summary is approaching its own cap — condense it rather than
         # letting it crowd out the turns it exists to make room for.
         summary = await summarize.condense(summary)
-    db.save_summary(
-        conversation_id, summary, new_boundary, context.estimate_tokens(summary)
+    await db.run_in_thread(
+        db.save_summary,
+        conversation_id,
+        summary,
+        new_boundary,
+        context.estimate_tokens(summary),
     )
     # Phase B indexes the same folded turns for retrieval; a failure there
     # must not undo a successful summary.
@@ -217,7 +238,7 @@ async def compact(
     async with _lock_for(conversation_id):
         try:
             _, turns = split_history(history)
-            row = db.get_summary(conversation_id)
+            row = await db.run_in_thread(db.get_summary, conversation_id)
             existing = row["summary"] if row else ""
             covers = min(row["covers_through"] if row else 0, len(turns))
             boundary = (
@@ -255,7 +276,7 @@ async def prepare(
     Returns (history, info) where info feeds the answer's meta: the context
     meter reads it, and a compaction is reported to the user.
     """
-    row = db.get_summary(conversation_id)
+    row = await db.run_in_thread(db.get_summary, conversation_id)
     summary = row["summary"] if row else None
     covers = row["covers_through"] if row else 0
 
@@ -288,7 +309,7 @@ async def prepare(
                 # there first. Re-read the stored state before judging: using
                 # the stale pre-fold measurement here would shrink `keep` and
                 # fold again for no reason.
-                fresh = db.get_summary(conversation_id)
+                fresh = await db.run_in_thread(db.get_summary, conversation_id)
                 if fresh is None:
                     break
                 summary, covers = fresh["summary"], fresh["covers_through"]
@@ -337,7 +358,7 @@ async def maybe_background_compact(
 ) -> Optional[dict]:
     """After a turn completes: compact early so the NEXT one never waits."""
     try:
-        row = db.get_summary(conversation_id)
+        row = await db.run_in_thread(db.get_summary, conversation_id)
         summary = row["summary"] if row else None
         covers = row["covers_through"] if row else 0
         candidate = assemble(history, summary, covers)

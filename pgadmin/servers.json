@@ -1,0 +1,15 @@
+{
+  "Servers": {
+    "1": {
+      "Name": "TechSara app state",
+      "Group": "Servers",
+      "Host": "postgres",
+      "Port": 5432,
+      "MaintenanceDB": "techsara",
+      "Username": "techsara",
+      "PassFile": "/pgpass",
+      "SSLMode": "prefer",
+      "Comment": "Users, conversations, messages, summaries, uploads, fetched pages, repo chunks. NOT the DuckDB warehouse or the LanceDB index -- those are files, not PostgreSQL."
+    }
+  }
+}

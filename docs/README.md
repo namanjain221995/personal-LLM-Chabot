@@ -1,5 +1,11 @@
 # Architecture Review & Technical Due Diligence
 
+> **2026-08-10 — app state moved from SQLite to PostgreSQL.** [`data-model.md`](01-codebase/data-model.md)
+> and the CHANGELOG are current. Other pages here still describe `/data/app.sqlite3`
+> and carry a banner saying so; their DuckDB, LanceDB, engine and frontend content is
+> unaffected.
+
+
 **System:** TechSara — a fully local Salesforce AI analytics + chat platform running on an NVIDIA DGX Spark
 workstation.
 **Audited:** 2026-07-31 · **251 files · 43,189 LOC**, every in-scope file read in full.
@@ -48,7 +54,7 @@ one-line change per service.** Four of the five top risks are fixable in under t
 | ├─ [`CRITICAL-PATHS.md`](01-codebase/CRITICAL-PATHS.md) | **The most useful document here.** 8 flows traced end to end with `file:line` at every hop |
 | ├─ [`frontend-api-contracts.md`](01-codebase/frontend-api-contracts.md) | Every route, every status code, and all 8 SSE events with exact payloads on both sides |
 | ├─ [`security-model.md`](01-codebase/security-model.md) | Auth, network exposure, the four guard modules assessed honestly, secret handling, STRIDE table |
-| ├─ [`data-model.md`](01-codebase/data-model.md) | app.sqlite3 · DuckDB warehouse · LanceDB — keys, indexes, retention, what is not cleaned up |
+| ├─ [`data-model.md`](01-codebase/data-model.md) | **PostgreSQL app state** (2026-08-10, was app.sqlite3) · DuckDB warehouse · LanceDB — keys, indexes, retention, what is not cleaned up |
 | ├─ [`test-map.md`](01-codebase/test-map.md) | All 83 test files, what they assert, the coverage gaps, and the 10 highest-value tests to add next |
 | └─ *(orchestrator-engines / -core / -context / -search, frontend, sync-worker, infra-docker-compose)* | |
 | [`02-diagrams/`](02-diagrams/) | 24 PlantUML diagrams — [`src/`](02-diagrams/src/) sources, [`render/`](02-diagrams/render/) SVG + PNG, [`README`](02-diagrams/README.md) with draw.io import steps, [`_STYLE.md`](02-diagrams/_STYLE.md) |

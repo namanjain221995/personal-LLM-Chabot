@@ -9,7 +9,6 @@ from app.main import app
 
 @pytest.fixture()
 def env(tmp_path, monkeypatch):
-    monkeypatch.setattr(settings, "app_db_path", str(tmp_path / "app.sqlite3"))
     monkeypatch.setattr(settings, "session_secret_file", str(tmp_path / ".session_secret"))
     monkeypatch.delenv("SESSION_SECRET", raising=False)
 
@@ -78,10 +77,14 @@ def test_messages_roundtrip_with_meta(alice):
     assert m2.status_code == 200
 
     messages = alice.get(f"/history/conversations/{conv_id}").json()["messages"]
-    assert messages == [
-        {"role": "user", "content": "top accounts?", "meta": None},
-        {"role": "assistant", "content": "Here you go.", "meta": meta},
+    # `id` and `feedback` joined the message shape on 2026-08-11 (thumbs are
+    # stored server-side now); the id is a row id, so assert on its type.
+    assert [(m["role"], m["content"], m["meta"]) for m in messages] == [
+        ("user", "top accounts?", None),
+        ("assistant", "Here you go.", meta),
     ]
+    assert all(isinstance(m["id"], int) for m in messages)
+    assert [m["feedback"] for m in messages] == [None, None]
 
 
 def test_list_orders_by_most_recent_activity(alice):

@@ -1,5 +1,13 @@
 # 00 — Repository Inventory
 
+> **⚠ Superseded in part (2026-08-10).** The app-state layer described below was
+> `/data/app.sqlite3` (stdlib `sqlite3`). It is now PostgreSQL — see
+> [`data-model.md`](01-codebase/data-model.md) and the CHANGELOG entry
+> "App state moved from SQLite to PostgreSQL". Every `sqlite3` reference,
+> `db.py` line number and finding about SQLite locking below is a snapshot of
+> the pre-migration code and has NOT been re-derived. The DuckDB warehouse and
+> LanceDB sections are unaffected and remain accurate.
+
 Permanent inventory for the technical due-diligence audit of `saleforce-LLM`: a fully local
 Salesforce AI analytics + chat platform running on one NVIDIA DGX Spark (GB10, 121 GB unified
 memory) — Next.js frontend, FastAPI orchestrator, Salesforce sync worker, four vLLM model servers,

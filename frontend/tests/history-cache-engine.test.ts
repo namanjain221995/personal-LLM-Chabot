@@ -39,6 +39,7 @@ function quietApi(): HistoryApi {
     update: async () => undefined,
     remove: async () => undefined,
     appendMessage: async () => undefined,
+  setFeedback: async () => undefined,
     replaceMessages: async () => undefined,
     truncateMessages: async () => undefined,
   };

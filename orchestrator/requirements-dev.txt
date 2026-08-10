@@ -17,4 +17,6 @@ pydantic>=2.7
 # V2 auth (V2-DESIGN §3c): argon2 password hashing + signed session cookies.
 argon2-cffi>=23.1
 itsdangerous>=2.1
+# App state: PostgreSQL (see requirements.txt for why [binary,pool]).
+psycopg[binary,pool]>=3.2,<4
 pytest>=8.0

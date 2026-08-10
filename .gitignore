@@ -19,8 +19,12 @@ secrets/
 # ---------------------------------------------------------------------------
 # Data and generated artifacts
 #
-# The DuckDB warehouse, the LanceDB vector store and app.sqlite3 are all
-# rebuildable from Salesforce; none of them belong in version control.
+# The DuckDB warehouse and the LanceDB vector store are rebuildable from
+# Salesforce; none of it belongs in version control. The old app.sqlite3
+# patterns stay: the file is gone (app state moved to PostgreSQL on
+# 2026-08-10) but a pre-migration backup is exactly the kind of thing that
+# gets left lying in the working tree, and it holds every conversation.
+# PostgreSQL itself lives in the `pgdata` Docker volume, not in the repo.
 # ---------------------------------------------------------------------------
 data/
 reports/
@@ -33,6 +37,9 @@ workspace/
 *.parquet
 lancedb/
 sf_dictionary.json
+# Quarantine file written by scripts/migrate_sqlite_to_postgres.py — it can
+# contain message bodies.
+orphaned-rows.json
 
 # Model weights and caches (see VLLM_MODELS_DIR — tens of GB)
 models/

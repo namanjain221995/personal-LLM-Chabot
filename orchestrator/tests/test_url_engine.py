@@ -10,8 +10,10 @@ from app.engines import url as url_engine
 
 
 @pytest.fixture()
-def temp_db(tmp_path, monkeypatch):
-    monkeypatch.setattr(settings, "app_db_path", str(tmp_path / "app.sqlite3"))
+def temp_db():
+    """Kept as a name so the tests below read unchanged; the isolated database
+    now comes from the autouse conftest fixture."""
+    return None
 
 
 class Rec:

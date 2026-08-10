@@ -22,12 +22,16 @@ a network you do not control — see the compose port bindings.
 from __future__ import annotations
 
 import os
-import sqlite3
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Request
 
 from . import db
+
+#: What `require_user` hands a route. A plain dict since the PostgreSQL port
+#: (psycopg's `dict_row`); it was `sqlite3.Row` before, and `row["id"]` reads
+#: the same either way.
+UserRow = Dict[str, Any]
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -43,13 +47,16 @@ def _local_username() -> str:
     return (os.environ.get("LOCAL_USERNAME") or "").strip() or DEFAULT_LOCAL_USERNAME
 
 
-def _oldest_user() -> Optional[sqlite3.Row]:
-    """The first account ever created — the one whose history to adopt."""
-    conn = db.connect()
-    return conn.execute("SELECT * FROM users ORDER BY id LIMIT 1").fetchone()
+def _oldest_user() -> Optional[UserRow]:
+    """The first account ever created — the one whose history to adopt.
+
+    Now a plain `db` accessor: the SQLite version opened its own connection
+    here and never closed it, leaking a handle on every cache miss.
+    """
+    return db.oldest_user()
 
 
-def local_user() -> sqlite3.Row:
+def local_user() -> UserRow:
     """THE user. Resolved once, then cached for the process lifetime."""
     global _cached_user_id
     if _cached_user_id is not None:
@@ -77,7 +84,7 @@ def local_user() -> sqlite3.Row:
     username = _local_username()
     try:
         user_id = db.create_user(username, "!local-no-login")
-    except sqlite3.IntegrityError:
+    except db.IntegrityError:
         pass  # raced with another worker
     row = db.get_user_by_username(username)
     if row is None:  # pragma: no cover — create + lookup both failing
@@ -86,13 +93,13 @@ def local_user() -> sqlite3.Row:
     return row
 
 
-def current_user(request: Request) -> Optional[sqlite3.Row]:
+def current_user(request: Request) -> Optional[UserRow]:
     """The local user. Signature kept so callers in main.py are unchanged."""
     del request  # no cookie is read — there is no session any more
     return local_user()
 
 
-def require_user(request: Request) -> sqlite3.Row:
+def require_user(request: Request) -> UserRow:
     """FastAPI dependency for history routes. Never 401s now."""
     return current_user(request)
 
