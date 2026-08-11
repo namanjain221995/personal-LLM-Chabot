@@ -17,6 +17,7 @@ exactly like the DuckDB path:
 """
 from __future__ import annotations
 
+import hashlib
 import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -191,6 +192,160 @@ async def run_soql(soql: str) -> Tuple[str, List[Dict[str, Any]]]:
     return safe, rows
 
 
+async def org_key() -> str:
+    """A stable identifier for the org+identity this process talks to.
+
+    Every metadata cache in Salesforce Intelligence Mode is keyed on this. A
+    describe is a function of the ORG and of what the connected identity may
+    see, so a cache keyed on the object name alone would serve one org's field
+    list — or one permission set's — to another after a credential change. That
+    is a data-leak shape, not a staleness shape, so the key is not optional.
+
+    The instance URL plus the client id covers both: a different org has a
+    different instance, and a different connected app has a different client id.
+    Neither is a secret, and neither is logged by this module.
+    """
+    _token_value, instance = await _authenticate()
+    material = f"{instance}|{settings.sf_client_id}|{settings.sf_api_version}"
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
+
+
+async def run_soql_page(soql: str) -> Dict[str, Any]:
+    """Run a guarded query and return the FULL first page envelope.
+
+    `run_soql` deliberately returns only rows, which is right for the engines
+    that summarise one page. Pagination needs `totalSize` (how many records
+    matched, not how many were returned) and `nextRecordsUrl`, and inventing
+    those from a row list is exactly how a summary claims "29 records" for a
+    314-record result.
+    """
+    safe = guard_soql(soql)
+    body = await _query(safe)
+    records = body.get("records", []) or []
+    rows = [_clean(r) for r in records]
+    if not rows and re.search(r"^\s*SELECT\s+COUNT\(\)", safe, re.I):
+        total = body.get("totalSize")
+        if isinstance(total, int):
+            rows = [{"count": total}]
+    return {
+        "soql": safe,
+        "rows": rows,
+        "total_size": body.get("totalSize"),
+        "done": bool(body.get("done", True)),
+        "next_records_url": body.get("nextRecordsUrl") or "",
+    }
+
+
+async def query_more(next_records_url: str) -> Dict[str, Any]:
+    """Fetch the next page of a query. `next_records_url` comes from Salesforce.
+
+    Validated rather than trusted: it is a value from a previous response, but
+    it becomes a URL path on an authenticated request, so anything that is not
+    the shape Salesforce actually returns is refused instead of being fetched.
+    """
+    path = (next_records_url or "").strip()
+    if not re.fullmatch(
+        r"/services/data/v\d+\.\d+/query/[A-Za-z0-9_-]+", path
+    ):
+        raise UnsafeSoql(f"not a Salesforce queryMore locator: {next_records_url!r}")
+    body = await _get(path)
+    return {
+        "rows": [_clean(r) for r in body.get("records", []) or []],
+        "total_size": body.get("totalSize"),
+        "done": bool(body.get("done", True)),
+        "next_records_url": body.get("nextRecordsUrl") or "",
+    }
+
+
+async def search_records(
+    term: str, objects: List[str], fields_by_object: Dict[str, List[str]]
+) -> Dict[str, List[Dict[str, Any]]]:
+    """SOSL search for `term` across `objects`. → {object: [record, ...]}.
+
+    The search term is ESCAPED for SOSL, which reserves a different character
+    set than SOQL string literals do; the object and field names are validated
+    as API names, never interpolated from user text.
+    """
+    if not term or not term.strip():
+        raise UnsafeSoql("empty search term")
+    for name in objects:
+        if not re.match(r"^[A-Za-z][A-Za-z0-9_]*$", name or ""):
+            raise UnsafeSoql(f"not a valid object name: {name!r}")
+    returning = []
+    for name in objects:
+        fields = [
+            f for f in fields_by_object.get(name, ["Id", "Name"])
+            if re.match(r"^[A-Za-z][A-Za-z0-9_.]*$", f or "")
+        ] or ["Id", "Name"]
+        returning.append(f"{name}({', '.join(fields[:8])} LIMIT {SEARCH_LIMIT})")
+    sosl = f"FIND {{{escape_sosl(term)}}} IN ALL FIELDS RETURNING {', '.join(returning)}"
+
+    token, instance = await _authenticate()
+    async with httpx.AsyncClient(timeout=settings.sf_live_timeout) as client:
+        resp = await client.get(
+            f"{instance}/services/data/{settings.sf_api_version}/search",
+            params={"q": sosl},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    if resp.status_code != 200:
+        raise SalesforceUnavailable(
+            f"Salesforce rejected the search (HTTP {resp.status_code})"
+        )
+    grouped: Dict[str, List[Dict[str, Any]]] = {name: [] for name in objects}
+    for record in resp.json().get("searchRecords", []) or []:
+        kind = (record.get("attributes") or {}).get("type") or ""
+        grouped.setdefault(kind, []).append(_clean(record))
+    return grouped
+
+
+#: Per-object cap on search candidates. A clarification shows at most four
+#: options, so anything beyond a handful is fetched for nothing.
+SEARCH_LIMIT = 5
+
+#: SOSL reserves these; a term containing one must have it escaped or the
+#: search errors — and an unescaped `}` would close the FIND clause.
+_SOSL_RESERVED = r'?&|!{}[]()^~*:\\"\'+-'
+
+
+def escape_sosl(term: str) -> str:
+    """Escape every SOSL metacharacter in a search term."""
+    out = []
+    for char in term:
+        if char in _SOSL_RESERVED:
+            out.append("\\")
+        out.append(char)
+    return "".join(out)
+
+
+async def _query(soql: str) -> Dict[str, Any]:
+    """GET /query with one re-authentication retry. Returns the raw envelope."""
+    token, instance = await _authenticate()
+    async with httpx.AsyncClient(timeout=settings.sf_live_timeout) as client:
+        resp = await client.get(
+            f"{instance}/services/data/{settings.sf_api_version}/query",
+            params={"q": soql},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        if resp.status_code == 401:
+            _token.value = None  # expired underneath us — one retry
+            token, instance = await _authenticate()
+            resp = await client.get(
+                f"{instance}/services/data/{settings.sf_api_version}/query",
+                params={"q": soql},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+    if resp.status_code != 200:
+        detail = ""
+        try:
+            payload = resp.json()
+            if isinstance(payload, list) and payload:
+                detail = f": {payload[0].get('message', '')[:200]}"
+        except Exception:
+            pass
+        raise SalesforceUnavailable(f"Salesforce rejected the query{detail}")
+    return resp.json()
+
+
 async def _get(path: str, params: Optional[dict] = None) -> Any:
     """Authenticated GET against the REST API."""
     token, instance = await _authenticate()
@@ -232,12 +387,27 @@ async def describe_object(name: str) -> Dict[str, Any]:
     payload = await _get(
         f"/services/data/{settings.sf_api_version}/sobjects/{name}/describe"
     )
+    # The extra keys (2026-08-11) are what the query-plan compiler validates
+    # against: `queryable`/`accessible` decide whether a plan may touch this at
+    # all, and `relationshipName`/`referenceTo` are the only honest way to check
+    # that `Account.Owner.Name` is a real traversal rather than a plausible
+    # guess. Purely additive — every existing caller reads name/type/label.
     return {
         "name": payload.get("name", name),
         "label": payload.get("label", name),
+        "queryable": payload.get("queryable", True),
         "fields": [
-            {"name": f["name"], "type": f.get("type", ""),
-             "label": f.get("label", f["name"])}
+            {
+                "name": f["name"],
+                "type": f.get("type", ""),
+                "label": f.get("label", f["name"]),
+                # No `accessible` key on purpose: a describe only RETURNS the
+                # fields this identity may read, so presence is the permission
+                # check. Inventing a flag here would state a guarantee this
+                # payload does not carry.
+                "relationshipName": f.get("relationshipName") or "",
+                "referenceTo": list(f.get("referenceTo") or ()),
+            }
             for f in payload.get("fields", [])
         ],
     }

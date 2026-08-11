@@ -79,16 +79,16 @@ def test_applying_the_schema_never_touches_existing_rows():
     before_messages = db.list_messages("real-conv")
 
     assert {"id", "user_id", "title", "created_at", "updated_at", "pinned",
-            "archived", "seq"} == _columns()
-    assert db.schema_version() == 3
+            "archived", "seq", "title_source"} == _columns()
+    assert db.schema_version() == db.LATEST_SCHEMA_VERSION
 
     for _ in range(2):
         db.init_schema()  # explicit re-run
 
-    assert db.schema_version() == 3
+    assert db.schema_version() == db.LATEST_SCHEMA_VERSION
     with db.connection() as con:
         applied = con.execute("SELECT COUNT(*) AS n FROM schema_migrations").fetchone()
-    assert applied["n"] == 3, "a migration was recorded twice"
+    assert applied["n"] == db.LATEST_SCHEMA_VERSION, "a migration was recorded twice"
 
     assert db.get_conversation(uid, "real-conv") == before
     assert db.list_messages("real-conv") == before_messages

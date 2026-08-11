@@ -330,7 +330,58 @@ const repoFixture: Fixture = {
   },
 };
 
+/**
+ * Salesforce Intelligence Mode asking one question back. Present so the card,
+ * its keyboard handling and the resume flow are demo-able in MOCK_MODE — a UI
+ * that can only be seen with a live org is a UI nobody reviews.
+ *
+ * `pickFixtureEngine` returns this for a pipeline question with no period,
+ * which is exactly the ambiguity the real planner asks about.
+ */
+const clarifyFixture: Fixture = {
+  text:
+    'Which period should I use for the pipeline?\n\n' +
+    '**1.** This month\n**2.** This quarter\n**3.** This year\n' +
+    '**4.** All currently open opportunities\n' +
+    '**5.** Something else — let me type it',
+  meta: {
+    route: 'clarify',
+    salesforce_mode: 'intelligence',
+    clarification: {
+      clarification_id: 'clr_mock0001',
+      conversation_id: 'mock',
+      run_id: 'run_mock',
+      root_user_message_id: 'msg_mock',
+      intent_id: 'int_mock',
+      source: 'salesforce',
+      header: 'Salesforce',
+      question: 'Which period should I use for the pipeline?',
+      slot: 'date_range',
+      options: [
+        { id: 'this_month', label: 'This month', value: 'THIS_MONTH' },
+        { id: 'this_quarter', label: 'This quarter', value: 'THIS_QUARTER' },
+        { id: 'this_year', label: 'This year', value: 'THIS_YEAR' },
+        {
+          id: 'all_open',
+          label: 'All currently open opportunities',
+          description: 'No date filter — everything still open.',
+          value: 'ALL_OPEN',
+        },
+      ],
+      allow_custom: true,
+      custom_placeholder: 'Enter another date range…',
+      multi_select: false,
+      round_number: 1,
+      created_at: '2026-08-11T09:00:00+00:00',
+      state: 'pending',
+      resume_token: 'mock-resume-token',
+      question_fingerprint: 'mock-fingerprint',
+    },
+  },
+};
+
 export const FIXTURES: Record<Engine, Fixture> = {
+  clarify: clarifyFixture,
   sql: sqlFixture,
   rag: ragFixture,
   vision: visionFixture,
@@ -364,6 +415,15 @@ export function pickFixtureEngine(
     /\b(who are you|what can you do)\b/.test(q)
   ) {
     return 'chat';
+  }
+  // Salesforce Intelligence Mode: a pipeline question with no period is the
+  // canonical ambiguity, and the one the real planner asks about.
+  if (
+    options?.mode !== 'assistant' &&
+    /\bpipeline\b/.test(q) &&
+    !/\b(month|quarter|year|week|today|open|all time|q[1-4]|\d{4})\b/.test(q)
+  ) {
+    return 'clarify';
   }
   if (/\b(report|word file|docx|pdf|one-page|deliverable)\b/.test(q)) {
     return 'report';

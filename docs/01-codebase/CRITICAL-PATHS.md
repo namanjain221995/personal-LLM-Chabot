@@ -1,5 +1,10 @@
 # Critical paths — end-to-end call traces
 
+> **Current launcher addendum (2026-08-11).** Flow 0 is derived from the
+> portable launcher. Flows 1–8 are the detailed 2026-07-31 application audit
+> and retain historical line links. They predate the launcher/overlays and
+> later application changes; re-check source before relying on them.
+
 > **⚠ Superseded in part (2026-08-10).** The app-state layer described below was
 > `/data/app.sqlite3` (stdlib `sqlite3`). It is now PostgreSQL — see
 > [`data-model.md`](data-model.md) and the CHANGELOG entry
@@ -8,9 +13,9 @@
 > the pre-migration code and has NOT been re-derived. The DuckDB warehouse and
 > LanceDB sections are unaffected and remain accurate.
 
-Eight flows, traced hop by hop from the user action to the rendered result. Every hop carries a
-`file:LINE` reference. Where a hop has **no timeout**, **no retry**, **no bound**, or **swallows an
-exception**, that is stated inline at the hop.
+One current bootstrap flow and eight historical application flows are traced
+from user action to runtime/result. Historical hops retain audit-date
+`file:LINE` references and risk notes.
 
 Conventions used throughout:
 
@@ -20,12 +25,178 @@ Conventions used throughout:
 - **🕳 swallowed** — the exception is caught and discarded or degraded, usually with no log line.
 - **🚧 blocking-in-async** — a synchronous call executed directly on the single event loop.
 
-Two facts apply to **every** flow and are not repeated at each hop:
+The next two facts apply to the **historical application flows**, not Flow 0:
 
 | Fact | Evidence |
 |---|---|
 | One uvicorn worker, one event loop, no `--workers` | [Dockerfile:52](../../orchestrator/Dockerfile#L52) |
 | Every LLM call is bounded only by `LLM_REQUEST_TIMEOUT` = 300 s, applied per attempt, with the OpenAI SDK's default `max_retries=2` → worst case 900 s per call | [config.py:264](../../orchestrator/app/config.py#L264), [llm.py:75-79](../../orchestrator/app/llm.py#L75-L79) |
+
+---
+
+## Flow 0 — Launcher command → selected, probed local platform
+
+This is the current operational path. Source anchors intentionally link to
+modules instead of fragile line numbers.
+
+### 0a. Platform wrapper → Python CLI
+
+1. The user runs [`techsara`](../../techsara),
+   [`techsara.ps1`](../../techsara.ps1), or
+   [`techsara.cmd`](../../techsara.cmd). CMD delegates to PowerShell; POSIX and
+   PowerShell keep equivalent bootstrap policy.
+2. The wrapper resolves the repository and
+   `${TECHSARA_HOME:-~/.techsara}`. It accepts exactly uv 0.11.32 in
+   `TECHSARA_HOME/bin`.
+3. If uv is absent and `--offline` was not passed, the wrapper downloads the
+   pinned installer to a temporary file, verifies its manifest SHA-256, and
+   installs without changing the user's PATH. POSIX needs `curl` or `wget` and
+   `sha256sum` or `shasum`; PowerShell uses its native download/hash commands.
+4. With `--offline`, missing uv or managed Python is terminal. Otherwise `uv
+   run --no-project --managed-python --python 3.12` may install Python before
+   the launcher begins. The launcher's pure dry-run guarantee therefore starts
+   after wrapper bootstrap on a clean host.
+5. The wrapper prepends `launcher/` to `PYTHONPATH` and invokes
+   [`techsara_cli.__main__`](../../launcher/techsara_cli/__main__.py) →
+   [`cli.main`](../../launcher/techsara_cli/cli.py). Subprocesses receive exact
+   argv lists, not shell-evaluated strings.
+
+### 0b. `up` → detection and selection
+
+6. Non-dry `up` creates project runtime directories and acquires
+   `.runtime/locks/launcher.lock`. A demonstrably live lock owner is not broken
+   merely because the file is old. `up --dry-run` uses only an automatically
+   removed temporary layout after bootstrap.
+7. [`hardware.detect_hardware`](../../launcher/techsara_cli/hardware.py)
+   normalizes OS/architecture, Apple/Rosetta state, CPU, total/available RAM,
+   GPU/count/per-device total/free VRAM, driver/compute capability, WSL2,
+   Docker/Compose/Linux-container readiness, cache location, and free disk.
+   NVIDIA detection may invoke a transient `docker run --rm --pull never` GPU
+   smoke command; it is non-destructive, not Docker-process-free.
+8. [`cli._require_docker`](../../launcher/techsara_cli/cli.py) blocks when the
+   CLI/daemon/Compose v2.24+/Linux-container contract is not met. Windows CUDA
+   additionally requires WSL2; every CUDA profile requires the real container
+   GPU probe.
+9. [`profiles.select_profile`](../../launcher/techsara_cli/profiles.py) reads
+   [`hardware-profiles.yaml`](../../config/hardware-profiles.yaml) and
+   [`model-manifest.yaml`](../../config/model-manifest.yaml). It applies
+   OS/Docker/app/runtime/safety reserves, model/KV estimates, context
+   candidates, and cold-start per-device/free VRAM. Generic multi-GPU capacity
+   is not aggregated because those profiles do not configure tensor
+   parallelism.
+10. Automatic selection downshifts within a backend family, then uses
+    `app-only` if no local fit is safe. `--profile` and `--model` overrides must
+    be declared, backend-compatible, revision-pinned, and memory-safe or they
+    fail. There is no automatic cloud fallback.
+11. A running project-labeled Docker `vllm` container is currently a warm-reuse
+    capacity hint. Unlike native process reuse, that quick Docker hint does not
+    itself validate model, command, health, or runtime fingerprint; later
+    startup/API probing remains the readiness gate.
+
+### 0c. Secrets, models, and native runtime
+
+12. The launcher parses `.env`, then
+    [`environment.prepare_local_secrets`](../../launcher/techsara_cli/environment.py)
+    creates/reuses local values without overwriting it. Generated DB/session/
+    search/bridge secrets live in `.runtime/secrets.env` at mode `0600`. A host
+    Salesforce PEM can be bounded/read and staged as base64 instead of mounted.
+13. [`ModelManager.ensure_all`](../../launcher/techsara_cli/model_manager.py)
+    sums missing downloads with 20% staging allowance plus 1 GiB shared
+    headroom. Models download sequentially at immutable revisions into
+    `.partial`; required files and declared hashes are checked,
+    `.complete.json` is written, and the directory is atomically promoted.
+    Failure preserves partial/invalid data; `--offline` cannot download.
+    `.env` `HF_TOKEN` is used for one authenticated retry after the anonymous
+    attempt, with an exported token taking precedence.
+14. On Mac, [`RuntimeManager.ensure`](../../launcher/techsara_cli/runtime.py)
+    validates or installs the shared vLLM-Metal runtime under
+    `TECHSARA_HOME/runtimes`. Direct source/wheel artifacts are hash-verified;
+    native arm64 imports/version are checked and a package freeze is recorded.
+    The compatibility fallback is not a fully hash-locked transitive closure.
+15. The launcher stops obsolete launcher-owned native services from a prior
+    profile. It signals only a process attributable by project, PID start
+    identity, command fingerprint, model, runtime version, port, and state.
+16. Optional Mac embedding/reranking start and probe before main. Model
+    upstreams bind `127.0.0.1`; Docker-facing bridges bind host `0.0.0.0` on
+    18103/18105/18100, require a generated bearer token, bound request bodies,
+    and strip auth/hop headers before forwarding to loopback.
+17. Optional native failure stops and disables that component. Main gets one
+    retry at `startup_retry_context` and concurrency one. A compatible healthy
+    native process can resume; starting/unhealthy, wrong-version/command/model,
+    or changed-identity records cannot. Mac vision/OCR remain disabled for the
+    pinned text-first runtime.
+
+### 0d. Generated environment → Compose topology
+
+18. [`environment.build_generated_environment`](../../launcher/techsara_cli/environment.py)
+    emits a secret-free contract: selected profile/backend, cache and verified
+    container paths, URLs/model IDs, role capabilities, contexts/concurrency,
+    search state, and bounded startup arguments. Real startup maps only
+    complete/legacy-complete models; temporary dry-run may map planned ones.
+19. [`cli._compose_files`](../../launcher/techsara_cli/cli.py) combines
+    [`compose.yaml`](../../compose.yaml) with one runtime overlay and, for
+    Windows NVIDIA, the WSL2 modifier. Embedding/OCR/search/admin profiles are
+    added only when selected/requested.
+20. Environment precedence is `.env` → private secrets → required generated
+    env. [`ComposeManager`](../../launcher/techsara_cli/compose.py) reapplies
+    that order to the child process because inherited variables otherwise
+    outrank Compose env files. Unrelated `PATH`/`DOCKER_HOST` are preserved.
+21. `compose.validate()` executes `docker compose config --quiet`. Launcher
+    dry-run stops after this validation; it performs no staged service action
+    and leaves no persistent launcher state. Wrapper bootstrap may already have
+    installed uv/Python as described in step 4.
+22. Non-dry startup reconciles project-labeled optional/legacy containers to
+    the desired set by stopping them, without removing containers, volumes, or
+    data. It then builds the application images.
+
+### 0e. Staged readiness and persisted result
+
+23. PostgreSQL starts first; optional SearXNG follows. Both use bounded Compose
+    state/health polling.
+24. NVIDIA order is embedding → separate router (DGX) → OCR (DGX) → main. Each
+    gets a role-appropriate synthetic request from a temporary orchestrator
+    container. Embedding/OCR failure disables and stops the role; router failure
+    shares main. Main gets one force-recreate at the next safer context and
+    concurrency one, then a second failure is terminal.
+25. CPU starts/probes llama.cpp. Mac and external-development main endpoints are
+    probed through the container path the orchestrator uses. Docker/external
+    startup probes are role-specific; the exhaustive capability schema matrix
+    is used for native model probing.
+26. Orchestrator starts and must return a structured `/health` document with a
+    ready app DB. Complete Salesforce credentials then start sync-worker even
+    if embeddings degraded. Frontend follows; optional pgAdmin is last.
+27. Degraded capabilities/env are republished. Hardware, selected profile,
+    capability results and `state.json` are written atomically, and the launcher
+    prints the final profile plus loopback URL.
+
+### 0f. Shutdown and recovery
+
+28. `techsara down` accepts only repository-contained saved Compose paths,
+    calls project `down --timeout 120` without `--volumes`, and stops owned
+    native records. Models, runtimes, `.runtime` config/logs, partial downloads,
+    reports, and five named volumes remain.
+29. `status` reads saved state, native ownership, Docker project containers and
+    recorded capabilities; it is not a new exhaustive endpoint probe. `doctor`
+    redetects and validates prerequisites/config (including the transient GPU
+    smoke when relevant). `redetect` writes hardware/profile only; `up`
+    regenerates runtime env.
+30. Invalid model/runtime directories are preserved, never overwritten. Move
+    one aside after inspection, then rerun. Native Mac processes are not OS boot
+    services, so run `techsara up` after host reboot.
+
+### What breaks first
+
+- Missing/stopped/old Docker or Windows/WSL/GPU misconfiguration fails before
+  model acquisition.
+- Insufficient aggregate disk fails before the first download.
+- Unsafe manual overrides fail instead of silently downshifting.
+- Optional model failures degrade capabilities; main inference,
+  PostgreSQL/orchestrator health, and app DB readiness remain terminal.
+- Clean-host `--offline` fails if uv/Python, native runtime, or any selected
+  model is missing.
+
+See [`../PORTABLE-RUNTIME.md`](../PORTABLE-RUNTIME.md) for the complete matrix
+and [`infra-docker-compose.md`](infra-docker-compose.md) for service topology.
 
 ---
 
@@ -1054,6 +1225,7 @@ one `status "Compacting conversation…"` frame at `:274`.
 
 | # | Flow | Hardest bound that exists | Bound that is missing |
 |---|---|---|---|
+| 0 | Portable bootstrap (current) | exact argv, locks/ownership, memory+disk budget, bounded waits, one main retry | live per-platform acceptance matrix; fully hash-locked native transitive closure; strict Docker warm-hint compatibility before selection |
 | 1 | Chat SSE | per-LLM-call 300 s | whole-request deadline, body size (`REL-01`), SSE heartbeat |
 | 2 | Router | `return "rag"` default | any confidence signal; a timeout of its own |
 | 3 | Agent | `MAX_STEPS = 8`, one graph pass, concurrency 3 | wall clock; per-step timeout |
@@ -1062,3 +1234,6 @@ one `status "Compacting conversation…"` frame at `:274`.
 | 6 | Sync | watermark written last | Bulk poll deadline, restart policy (`REL-02`), delete propagation |
 | 7 | Upload/report | `UPLOAD_MAX_MB`, `ARCHIVE_MAX_*`, `MAX_SECTIONS = 6` | pandoc timeout, report retention, off-loop execution |
 | 8 | Context | 0.70 / 0.80 thresholds, 4 adaptive rounds | server-side warn state, lock coverage on the measurement read |
+
+Rows 1–8 preserve the audit-date assessment and are not a current finding
+status report.

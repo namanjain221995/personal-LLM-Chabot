@@ -1,0 +1,185 @@
+# DGX Spark: the existing, measured four-service layout with immutable runtime
+# images. Model paths are produced by the launcher and resolve under /models.
+x-model-logging: &model-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-nvidia-devices: &nvidia-devices
+  resources:
+    reservations:
+      devices:
+        - driver: nvidia
+          count: all
+          capabilities: [gpu]
+
+services:
+  orchestrator:
+    image: sf-local-ai-orchestrator:cuda
+    build:
+      context: ./orchestrator
+      dockerfile: Dockerfile.cuda
+    environment:
+      HF_HUB_OFFLINE: "1"
+      RERANKER_MODEL: ${RERANKER_MODEL_CONTAINER_PATH:?RERANKER_MODEL_CONTAINER_PATH must be generated}
+    volumes:
+      - type: bind
+        source: ${TECHSARA_MODEL_CACHE:?TECHSARA_MODEL_CACHE must be generated}
+        target: /models
+        read_only: true
+    deploy: *nvidia-devices
+
+  vllm:
+    image: vllm/vllm-openai@sha256:24f2f8975d011ea7f7066a547886a08a1fd3c4bf0880463487fae4f01ce723c6
+    command: >
+      ${MAIN_MODEL_CONTAINER_PATH:?MAIN_MODEL_CONTAINER_PATH must be generated}
+      --served-model-name Qwen/Qwen3.6-35B-A3B-NVFP4
+      --host 0.0.0.0
+      --port 30000
+      --max-model-len ${MODEL_MAX_CONTEXT:-262144}
+      --gpu-memory-utilization 0.35
+      --kv-cache-dtype fp8
+      --reasoning-parser qwen3
+      --trust-remote-code
+      --quantization modelopt
+      --attention-backend flashinfer
+      --moe-backend marlin
+      --enable-chunked-prefill
+      --enable-prefix-caching
+      --tool-call-parser qwen3_xml
+      --enable-auto-tool-choice
+      --max-num-batched-tokens 8192
+    environment:
+      HF_HOME: /root/.cache/huggingface
+      HF_HUB_OFFLINE: "1"
+    volumes:
+      - type: bind
+        source: ${TECHSARA_MODEL_CACHE:?TECHSARA_MODEL_CACHE must be generated}
+        target: /models
+        read_only: true
+      - hf-cache:/root/.cache/huggingface
+    expose:
+      - "30000"
+    networks:
+      - inference
+    shm_size: 32g
+    ipc: host
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:30000/v1/models -o /dev/null || exit 1"]
+      interval: 30s
+      timeout: 15s
+      retries: 60
+      start_period: 30m
+    deploy: *nvidia-devices
+    logging: *model-logging
+
+  vllm-router:
+    image: vllm/vllm-openai@sha256:24f2f8975d011ea7f7066a547886a08a1fd3c4bf0880463487fae4f01ce723c6
+    command: >
+      ${ROUTER_MODEL_CONTAINER_PATH:?ROUTER_MODEL_CONTAINER_PATH must be generated}
+      --served-model-name Qwen/Qwen3-VL-8B-Instruct-FP8
+      --host 0.0.0.0
+      --port 30002
+      --max-model-len ${ROUTER_MAX_CONTEXT:-49152}
+      --gpu-memory-utilization ${ROUTER_GPU_MEMORY_UTILIZATION:-0.17}
+      --kv-cache-dtype fp8
+    environment:
+      HF_HOME: /root/.cache/huggingface
+      HF_HUB_OFFLINE: "1"
+    volumes:
+      - type: bind
+        source: ${TECHSARA_MODEL_CACHE:?TECHSARA_MODEL_CACHE must be generated}
+        target: /models
+        read_only: true
+      - hf-cache:/root/.cache/huggingface
+    expose:
+      - "30002"
+    networks:
+      - inference
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:30002/v1/models -o /dev/null || exit 1"]
+      interval: 30s
+      timeout: 15s
+      retries: 60
+      start_period: 15m
+    deploy: *nvidia-devices
+    logging: *model-logging
+
+  vllm-embed:
+    image: nvcr.io/nvidia/vllm@sha256:654e563e727be1968487d453de0733fb074cb59adf424c779d0f9e7cfcb2b6b6
+    profiles: [embeddings]
+    command: >
+      vllm serve ${EMBED_MODEL_CONTAINER_PATH:?EMBED_MODEL_CONTAINER_PATH must be generated}
+      --served-model-name Qwen/Qwen3-Embedding-0.6B
+      --host 0.0.0.0
+      --port 30003
+      --max-model-len 4096
+      --gpu-memory-utilization 0.04
+      --runner pooling
+    environment:
+      HF_HOME: /root/.cache/huggingface
+      HF_HUB_OFFLINE: "1"
+    volumes:
+      - type: bind
+        source: ${TECHSARA_MODEL_CACHE:?TECHSARA_MODEL_CACHE must be generated}
+        target: /models
+        read_only: true
+      - hf-cache:/root/.cache/huggingface
+    expose:
+      - "30003"
+    networks:
+      - inference
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          curl -fsS -H 'Content-Type: application/json'
+          --data '{"model":"Qwen/Qwen3-Embedding-0.6B","input":["health"]}'
+          http://127.0.0.1:30003/v1/embeddings -o /dev/null || exit 1
+      interval: 30s
+      timeout: 15s
+      retries: 60
+      start_period: 10m
+    deploy: *nvidia-devices
+    logging: *model-logging
+
+  vllm-ocr:
+    image: vllm/vllm-openai@sha256:24f2f8975d011ea7f7066a547886a08a1fd3c4bf0880463487fae4f01ce723c6
+    profiles: [ocr]
+    command: >
+      ${OCR_MODEL_CONTAINER_PATH:-/models/ocr-disabled}
+      --served-model-name baidu/Unlimited-OCR
+      --host 0.0.0.0
+      --port 30004
+      --max-model-len ${OCR_MAX_CONTEXT:-8192}
+      --gpu-memory-utilization ${OCR_GPU_MEMORY_UTILIZATION:-0.14}
+      --enforce-eager
+      --trust-remote-code
+    environment:
+      HF_HOME: /root/.cache/huggingface
+      HF_HUB_OFFLINE: "1"
+    volumes:
+      - type: bind
+        source: ${TECHSARA_MODEL_CACHE:?TECHSARA_MODEL_CACHE must be generated}
+        target: /models
+        read_only: true
+      - hf-cache:/root/.cache/huggingface
+    expose:
+      - "30004"
+    networks:
+      - inference
+    shm_size: 8g
+    ipc: host
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:30004/v1/models -o /dev/null || exit 1"]
+      interval: 30s
+      timeout: 15s
+      retries: 60
+      start_period: 10m
+    deploy: *nvidia-devices
+    logging: *model-logging

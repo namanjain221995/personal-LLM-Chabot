@@ -10,15 +10,12 @@
 import { useId, useState } from 'react';
 import type { AgentStep } from '@/lib/types';
 import { IconCheck, IconChevronDown, IconSparkles, IconX } from './icons';
+import { Loader } from './Loader';
 
 function StatusIcon({ status }: { status: AgentStep['status'] }) {
   if (status === 'running') {
     return (
-      <span
-        className="ts-spinner shrink-0"
-        role="img"
-        aria-label="Step running"
-      />
+      <Loader size={14} label="Step running" />
     );
   }
   if (status === 'done') {

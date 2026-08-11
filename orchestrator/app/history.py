@@ -23,7 +23,7 @@ from typing import List, Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict
 
-from . import db
+from . import db, titling
 from .auth import UserRow, require_user
 
 router = APIRouter(prefix="/history", tags=["history"])
@@ -288,6 +288,71 @@ def set_message_feedback(
     if result is None:
         raise HTTPException(status_code=404, detail="message not found")
     return result
+
+
+@router.post("/conversations/{conversation_id}/title")
+async def generate_conversation_title(
+    conversation_id: str, user: UserRow = Depends(require_user)
+) -> dict:
+    """Name a conversation from its first exchange, ChatGPT-style.
+
+    The client calls this once, after the first answer has finished streaming.
+    It is deliberately NOT fired from the /chat worker: nothing pulls a
+    server-side title change into the browser's cache except a full refresh,
+    so a title written behind the client's back stays invisible until reload.
+    Having the client ask for it means the new title is in the response it is
+    already waiting on.
+
+    THE EXCHANGE COMES FROM THE DATABASE, not the request body. There is
+    nothing for a caller to forge, the endpoint cannot be used as a free
+    text-generation oracle, and it works no matter what the client sends.
+
+    Returns `{title, title_source, generated}`. `generated: false` means the
+    title was left alone — already named, renamed by the user, nothing worth
+    naming, or the model was unavailable. None of those are errors: a chat
+    must never be affected by titling failing.
+    """
+    state = db.conversation_title_state(int(user["id"]), conversation_id)
+    if state is None:
+        raise _not_found()
+
+    # Already named — by the model or by the owner. Skip the call entirely;
+    # the cheapest LLM request is the one never made.
+    if state["title_source"] != "auto":
+        return {
+            "title": state["title"],
+            "title_source": state["title_source"],
+            "generated": False,
+        }
+
+    messages = await db.run_in_thread(db.list_messages, conversation_id)
+    first_user = next((m for m in messages if m["role"] == "user"), None)
+    first_assistant = next((m for m in messages if m["role"] == "assistant"), None)
+    if first_user is None and first_assistant is None:
+        return {"title": state["title"], "title_source": "auto", "generated": False}
+
+    title = await titling.generate_title(
+        (first_user or {}).get("content", ""),
+        (first_assistant or {}).get("content", ""),
+    )
+    if title is None:
+        return {"title": state["title"], "title_source": "auto", "generated": False}
+
+    # Guarded in SQL: a rename that landed while the model was thinking wins,
+    # and this simply matches no rows.
+    updated = db.set_generated_title(int(user["id"]), conversation_id, title)
+    if updated is None:
+        fresh = db.conversation_title_state(int(user["id"]), conversation_id)
+        return {
+            "title": (fresh or state)["title"],
+            "title_source": (fresh or state)["title_source"],
+            "generated": False,
+        }
+    return {
+        "title": updated["title"],
+        "title_source": updated["title_source"],
+        "generated": True,
+    }
 
 
 @router.get("/conversations/{conversation_id}/summary")

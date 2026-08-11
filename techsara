@@ -1,0 +1,77 @@
+#!/bin/sh
+set -eu
+
+TECHSARA_PROJECT_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+TECHSARA_SHARED_ROOT=${TECHSARA_HOME:-"$HOME/.techsara"}
+TECHSARA_BIN_DIR="$TECHSARA_SHARED_ROOT/bin"
+TECHSARA_UV="$TECHSARA_BIN_DIR/uv"
+TECHSARA_UV_VERSION=0.11.32
+TECHSARA_INSTALLER_URL="https://github.com/astral-sh/uv/releases/download/0.11.32/uv-installer.sh"
+TECHSARA_INSTALLER_SHA256=43aff33a967fe40e8c17949d8c85c65bc43f3b5c94742393c957f56ab5ba80f4
+
+TECHSARA_OFFLINE=0
+for TECHSARA_ARGUMENT in "$@"; do
+    if [ "$TECHSARA_ARGUMENT" = "--offline" ]; then
+        TECHSARA_OFFLINE=1
+    fi
+done
+
+verify_sha256() {
+    TECHSARA_CHECK_FILE=$1
+    if command -v sha256sum >/dev/null 2>&1; then
+        TECHSARA_ACTUAL_SHA=$(sha256sum "$TECHSARA_CHECK_FILE" | awk '{print $1}')
+    elif command -v shasum >/dev/null 2>&1; then
+        TECHSARA_ACTUAL_SHA=$(shasum -a 256 "$TECHSARA_CHECK_FILE" | awk '{print $1}')
+    else
+        echo "TechSara error: sha256sum or shasum is required to verify uv." >&2
+        exit 2
+    fi
+    if [ "$TECHSARA_ACTUAL_SHA" != "$TECHSARA_INSTALLER_SHA256" ]; then
+        echo "TechSara error: pinned uv installer checksum mismatch." >&2
+        exit 2
+    fi
+}
+
+if [ ! -x "$TECHSARA_UV" ]; then
+    if [ "$TECHSARA_OFFLINE" -eq 1 ]; then
+        echo "TechSara error: pinned uv is missing and --offline forbids downloading it." >&2
+        exit 2
+    fi
+    mkdir -p "$TECHSARA_BIN_DIR"
+    TECHSARA_TEMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/techsara-uv.XXXXXX")
+    TECHSARA_INSTALLER="$TECHSARA_TEMP_DIR/uv-installer.sh"
+    cleanup_techsara_installer() {
+        rm -f -- "$TECHSARA_INSTALLER"
+        rmdir -- "$TECHSARA_TEMP_DIR" 2>/dev/null || true
+    }
+    trap cleanup_techsara_installer EXIT HUP INT TERM
+    if command -v curl >/dev/null 2>&1; then
+        curl --fail --silent --show-error --location --retry 3 --output "$TECHSARA_INSTALLER" "$TECHSARA_INSTALLER_URL"
+    elif command -v wget >/dev/null 2>&1; then
+        wget --https-only --tries=3 --output-document="$TECHSARA_INSTALLER" "$TECHSARA_INSTALLER_URL"
+    else
+        echo "TechSara error: curl or wget is required for the verified uv bootstrap." >&2
+        exit 2
+    fi
+    verify_sha256 "$TECHSARA_INSTALLER"
+    UV_UNMANAGED_INSTALL="$TECHSARA_BIN_DIR" UV_NO_MODIFY_PATH=1 sh "$TECHSARA_INSTALLER"
+fi
+
+# `uv --version` prints "uv <version> (<target triple>)", so compare the
+# version field rather than the whole line.
+TECHSARA_UV_ACTUAL=$("$TECHSARA_UV" --version 2>/dev/null | head -n 1 | awk '{print $2}')
+if [ "$TECHSARA_UV_ACTUAL" != "$TECHSARA_UV_VERSION" ]; then
+    echo "TechSara error: $TECHSARA_UV reports '${TECHSARA_UV_ACTUAL:-unknown}', not the pinned uv $TECHSARA_UV_VERSION." >&2
+    echo "                Remove $TECHSARA_UV and rerun to reinstall the pinned version." >&2
+    exit 2
+fi
+
+export TECHSARA_HOME="$TECHSARA_SHARED_ROOT"
+export UV_PYTHON_INSTALL_DIR="$TECHSARA_SHARED_ROOT/runtimes/python"
+export UV_CACHE_DIR="$TECHSARA_SHARED_ROOT/downloads/uv-cache"
+export PYTHONPATH="$TECHSARA_PROJECT_ROOT/launcher${PYTHONPATH:+:$PYTHONPATH}"
+
+if [ "$TECHSARA_OFFLINE" -eq 1 ]; then
+    exec "$TECHSARA_UV" run --offline --no-project --managed-python --python 3.12 -- python -m techsara_cli "$@"
+fi
+exec "$TECHSARA_UV" run --no-project --managed-python --python 3.12 -- python -m techsara_cli "$@"

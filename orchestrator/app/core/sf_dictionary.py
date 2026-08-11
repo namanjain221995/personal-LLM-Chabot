@@ -146,16 +146,48 @@ def _is_shadow(api: str) -> bool:
     return api.endswith(_SHADOW_SUFFIXES)
 
 
+def _named_directly(question_words: set, api: str) -> bool:
+    """Did the question name this object, as opposed to merely sharing a word
+    with its LABEL?
+
+    The distinction is the whole point. Asked for "oot mocks taken today", the
+    label of the setup object UserProvMockTarget reads "User Prov Mock Target",
+    so "mock" matched it, it outranked Internal_Interview__c, and the model was
+    handed a table that does not exist in the warehouse — which failed over to
+    live Salesforce and asked the org for `FROM UserProvMockTarget`. Matching
+    setup objects on their API name only, and only for words long enough to be
+    deliberate, is what keeps that out. Mirrors core/schema_cache.relevant_schema.
+    """
+    tokens = {t.lower() for t in re.split(r"[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])", api) if t}
+    collapsed = re.sub(r"[^a-z0-9]", "", api.lower())
+    return any(
+        w in tokens or (len(w) >= 6 and w in collapsed) for w in question_words
+    )
+
+
 def relevant_objects(question: str, limit: int = MAX_OBJECTS) -> List[Dict[str, Any]]:
     data = load()
     tokens = _tokens(question)
     if not tokens:
         return []
+    from .schema_cache import _is_business_table  # one definition, two callers
+
     wants_shadow = bool(tokens & {_stem(w) for w in _SHADOW_WORDS})
+    # Raw words, unstemmed: this is a name test, not a vocabulary match.
+    words = {w for w in _WORD_RE.findall((question or "").lower()) if len(w) >= 4}
+
+    def eligible(api: str) -> bool:
+        if _is_shadow(api):
+            return wants_shadow
+        # Setup/system objects (PromptAction, UserProvMockTarget, FlowInterviewLog)
+        # are in the dictionary because the org export lists them. They earn a
+        # slot only when the question actually names them.
+        return _is_business_table(api) or _named_directly(words, api)
+
     scored = [
         (s, o)
         for o in data.get("objects", {}).values()
-        if (wants_shadow or not _is_shadow(o["api"])) and (s := _score(tokens, o)) > 0
+        if eligible(o["api"]) and (s := _score(tokens, o)) > 0
     ]
     scored.sort(key=lambda pair: (-pair[0], pair[1]["api"]))
     return [o for _s, o in scored[:limit]]
@@ -226,6 +258,47 @@ def hint_for(question: str) -> str:
         + "\nUse the API names exactly as written above. A field name that "
         "looks plausible but is wrong returns no rows instead of an error. "
         "The same is true of a picklist value that is not listed."
+    )
+
+
+def join_map(tables: Sequence[str]) -> str:
+    """How the given tables actually join, one edge per line.
+
+    The schema handed to the model is `table(col TYPE, ...)` and every column
+    in this warehouse is VARCHAR, so nothing in it distinguishes a lookup from
+    a text field, let alone says where the lookup points. Asked which
+    candidates completed training in slot 128, the model wrote
+
+        JOIN Cohort__c c ON ii.Session__c = c.Id
+
+    because `Session__c` looked like a key and `Cohort__c` was in the prompt.
+    That column points at Session__c. The join matches no rows, returns 0, and
+    raises nothing — the answer came back "0 candidates" with a chart.
+
+    The org export knows all 187 of these edges. This puts them in front of
+    the model for exactly the tables it was given.
+    """
+    data = load()
+    objects = data.get("objects", {})
+    wanted = list(dict.fromkeys(tables))
+    present = set(wanted)
+    lines = []
+    for name in wanted:
+        obj = objects.get(name)
+        if not obj:
+            continue
+        for field in obj["fields"]:
+            for target in field.get("ref") or ():
+                # Only edges the model can actually use: both ends present.
+                if target in present:
+                    lines.append(f"  {name}.{field['api']} = {target}.Id")
+    if not lines:
+        return ""
+    return (
+        "How these tables join. A Salesforce lookup column holds the Id of ONE "
+        "specific object — these are the only valid joins between the tables "
+        "above, and a join not listed here will silently match zero rows:\n"
+        + "\n".join(sorted(set(lines)))
     )
 
 

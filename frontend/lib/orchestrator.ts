@@ -32,6 +32,13 @@ export interface ChatRequestBody {
   sf_live?: boolean;
   /** 2026-08-05: all attached images (max 5); `image` stays the first one. */
   images?: string[];
+  /**
+   * Salesforce Intelligence Mode: the answer to a pending clarifying question.
+   * Forwarded VERBATIM — it is a server-issued contract (ids, an opaque resume
+   * token, an idempotency key), and a proxy that reshaped any of it would break
+   * the resume it exists to enable.
+   */
+  clarification?: Record<string, unknown>;
 }
 
 /** Body the orchestrator's POST /chat endpoint accepts (§10 + V2 §1 + V8). */
@@ -52,6 +59,8 @@ export interface OrchestratorChatRequest {
   sf_live?: boolean;
   /** 2026-08-05: all attached images; image_base64 remains the first. */
   images?: string[];
+  /** Salesforce Intelligence Mode: answer to a pending clarifying question. */
+  clarification?: Record<string, unknown>;
 }
 
 /**
@@ -88,7 +97,10 @@ export function toOrchestratorChatRequest(
   const pdf = body.pdf ?? null;
   const message =
     text || (image ? IMAGE_ONLY_PROMPT : pdf ? PDF_ONLY_PROMPT : '');
-  if (!message) return null;
+  // A clarification answer is itself valid input even with no text of its own
+  // (a "Skip" carries none), because the request it resumes supplies the
+  // question. Everything else with no text and no attachment would 422.
+  if (!message && !body.clarification) return null;
   return {
     message,
     // V9: forward the whole conversation so the model remembers this chat.
@@ -114,5 +126,7 @@ export function toOrchestratorChatRequest(
     ...(pdf ? { pdf, pdf_filename: body.pdf_filename } : {}),
     // Phase 1: forward web-search mode when set.
     ...(body.web_search !== undefined ? { web_search: body.web_search } : {}),
+    // Salesforce Intelligence Mode: forwarded untouched when present.
+    ...(body.clarification ? { clarification: body.clarification } : {}),
   };
 }

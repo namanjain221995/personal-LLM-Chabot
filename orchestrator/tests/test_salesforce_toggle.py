@@ -230,13 +230,28 @@ def test_stream_chat_completion_can_turn_thinking_off():
 
 def test_the_narrative_is_told_the_real_row_count():
     """THE BUG: 314 rows came back and the summary said "29 employee records"
-    — it described the 30-row sample it was shown as if that were everything."""
-    from app.engines.sql import _narrative_messages
+    — it described the 30-row sample it was shown as if that were everything.
 
-    msgs = _narrative_messages("q", ["Id"], [[i] for i in range(30)], [], total_rows=314)
+    Telling the model not to do that was the original fix, and on 2026-08-11 it
+    was shown to be insufficient: the summary reported "Total Mocks: 3,
+    Cleared: 2, Failed: 0, Pass Ratio: 0.67" — read off the sample, and not
+    even self-consistent. The instruction remains, but the figures are now
+    COMPUTED in code and the model is told to quote them, which is what this
+    test now checks."""
+    from app.engines.sql import _narrative_messages, deterministic_summary
+
+    rows = [[i] for i in range(30)]
+    msgs = _narrative_messages(
+        "q", ["Id"], rows, [], total_rows=314,
+        computed=deterministic_summary(["Id"], rows),
+    )
     system, user = msgs[0]["content"], msgs[-1]["content"]
     assert "Total rows in the result: 314" in user
-    assert "never the number of rows you can see" in system
+    # The sample is labelled as an illustration, and the computed block is the
+    # only sanctioned source of a number.
+    assert "ILLUSTRATION" in system
+    assert "MUST be taken from the 'Computed figures' block" in system
+    assert "Computed figures (AUTHORITATIVE" in user
 
 
 def test_the_agent_cannot_search_the_web_in_salesforce_mode(spy, monkeypatch):

@@ -1,0 +1,10 @@
+# Layer after compose.nvidia.yaml on validated Windows/WSL2 Docker Desktop.
+# Long-syntax bind mounts in the NVIDIA overlay preserve Windows drive paths.
+services:
+  orchestrator:
+    extra_hosts:
+      - host.docker.internal:host-gateway
+
+  sync-worker:
+    extra_hosts:
+      - host.docker.internal:host-gateway

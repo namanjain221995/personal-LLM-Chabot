@@ -31,6 +31,7 @@ class Settings:
     lancedb_dir: str
     embed_via: str
     embed_model: str
+    embed_api_key: str = field(repr=False)
     sf_api_version: str
     config_path: str
 
@@ -51,6 +52,7 @@ def load_settings() -> Settings:
         lancedb_dir=os.getenv("LANCEDB_DIR", "/data/lancedb"),
         embed_via=os.getenv("EMBED_VIA", "http://vllm-embed:30003/v1").rstrip("/"),
         embed_model=os.getenv("EMBED_MODEL", "Qwen/Qwen3-Embedding-0.6B"),
+        embed_api_key=os.getenv("EMBED_API_KEY", ""),
         sf_api_version=os.getenv("SF_API_VERSION", "v61.0"),
         config_path=os.getenv(
             "SYNC_CONFIG_PATH", os.path.join(here, "..", "config.yaml")

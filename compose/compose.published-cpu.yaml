@@ -1,0 +1,15 @@
+# OPT-IN ONLY — layered after compose.cpu.yaml when PUBLISH_MODEL_PORTS is true
+# in .env. See compose.published-dgx-spark.yaml for the exposure warning: this
+# model API is unauthenticated.
+#
+# Publishing also attaches these services to the routable `application`
+# network. Docker records a port binding for a container that is only on an
+# `internal: true` network but never actually publishes it, so without this the
+# mapping appears in `docker inspect` and is unreachable from the host.
+services:
+  llama-cpp:
+    networks:
+      - inference
+      - application
+    ports:
+      - "${TECHSARA_BIND_ADDRESS:-127.0.0.1}:${LLAMA_CPP_PORT:-8000}:30000"

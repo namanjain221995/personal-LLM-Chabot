@@ -14,6 +14,15 @@
 import { useEffect, useState } from 'react';
 import type { ChatMessage } from '@/lib/types';
 import {
+  parseClarification,
+  type ClarificationRequest,
+  type ClarificationResponse,
+} from '@/lib/clarification';
+import { ClarificationCard } from './ClarificationCard';
+import { Loader } from './Loader';
+import { ReasoningStar } from './ReasoningStar';
+import { SalesforceSourceLine } from './SalesforceSourceLine';
+import {
   loadFeedback,
   saveFeedback,
   toggleFeedback,
@@ -51,6 +60,10 @@ export function MessageRow({
   onShowSummary,
   onRetry,
   onFeedback,
+  onClarify,
+  onClarificationAnswer,
+  onClarificationCustom,
+  submittingClarificationId = null,
 }: {
   message: ChatMessage;
   isLast: boolean;
@@ -58,12 +71,35 @@ export function MessageRow({
   /** Opens the read-only rolling-summary panel (compaction notice). */
   onShowSummary?: () => void;
   onRetry: () => void;
+  /** LEGACY (`meta.clarify`): answer by sending the chosen option as the next
+   *  message. The server resolves it against the original question. */
+  onClarify?: (choice: string) => void;
+  /** Salesforce Intelligence Mode (`meta.clarification`): answer the typed
+   *  question. The server RESUMES the original request rather than treating
+   *  this as a new one. */
+  onClarificationAnswer?: (
+    response: ClarificationResponse,
+    summary: string,
+  ) => void;
+  /** "Something else" — hand over to the normal composer. */
+  onClarificationCustom?: (request: ClarificationRequest) => void;
+  /**
+   * The clarification whose answer is in flight, if any. Compared by ID rather
+   * than passed as a boolean: a shared flag latched on after the first answer
+   * and left every LATER question in the thread rendered disabled and
+   * unclickable.
+   */
+  submittingClarificationId?: string | null;
   /** Persist a thumb server-side. Omitted in contexts with no store
    *  (previews, tests), where the localStorage fallback still applies. */
   onFeedback?: (feedback: MessageFeedback | null) => void;
 }) {
   // Hooks live above the user-bubble early return (rules of hooks).
   const [activityOpen, setActivityOpen] = useState(false);
+  // "Something else" opens a box rather than sending its own label as the
+  // answer, which is what it did before — and which told the server nothing.
+  const [clarifyOther, setClarifyOther] = useState(false);
+  const [clarifyText, setClarifyText] = useState('');
   // The SERVER's value wins when the message has one: it is the copy that
   // survives a reload. localStorage is the fallback for messages that have
   // not been stored yet (and for anything rendering without a store), which
@@ -175,6 +211,11 @@ export function MessageRow({
     Boolean(research && countSources(research) > 0) ||
     Boolean(webSources?.length) ||
     Boolean(message.meta?.document);
+  // Salesforce Intelligence Mode: the live phase, or the one the finished
+  // answer ended on. Only the LIVE one animates — a reopened chat shows the
+  // final phase as history, not as work still in progress.
+  const phaseStatus = message.phaseStatus ?? null;
+  const clarification = parseClarification(message.meta?.clarification);
   const showShimmer =
     streaming &&
     message.content.length === 0 &&
@@ -183,24 +224,31 @@ export function MessageRow({
     // The research panel is itself a progress indicator — showing the
     // shimmer underneath it would read as two things loading.
     !research &&
-    !message.searchStatus;
+    !message.searchStatus &&
+    // …and so is the Reasoning Star, which carries a real phase label.
+    !phaseStatus;
 
   return (
     <div className="group/msg w-full">
+      {phaseStatus && streaming && (
+        <ReasoningStar
+          status={phaseStatus}
+          size={message.content.length === 0 ? 'lg' : 'sm'}
+          className="mb-2"
+        />
+      )}
       {message.searchStatus && message.content.length === 0 && (
-        <div className="mb-2 flex items-center gap-2 text-sm text-muted">
-          <span
-            className="inline-block h-3.5 w-3.5 animate-spin rounded-full border-2 border-muted/40 border-t-accent"
-            aria-hidden
-          />
+        <div className="mb-2 flex items-center gap-2.5 text-sm text-muted">
+          <Loader size={22} />
           {message.searchStatus}
         </div>
       )}
       {showShimmer ? (
-        <div aria-label="Waiting for the first token" className="space-y-2.5 py-1">
-          <div className="shimmer-line w-3/5" />
-          <div className="shimmer-line w-4/5" />
-          <div className="shimmer-line w-2/5" />
+        /* The ordinary "waiting for the first token" state. It used to be three
+           shimmering bars pretending to be text; it is the same event as every
+           other kind of work, so it now says so with the same artwork. */
+        <div className="py-1">
+          <Loader size={28} label="Waiting for the first token" />
         </div>
       ) : (
         <>
@@ -224,8 +272,21 @@ export function MessageRow({
               ActivityPanel behind the Sources button. */}
           {steps.length > 0 && streaming && <AgentTimeline steps={steps} />}
 
-          {message.content && (
-            <div className="text-[15px]">
+          {/* The question is streamed as TEXT as well as carried on the card,
+              so that a client with no card renderer — and the stored history a
+              future one reads back — still shows a usable question. When the
+              card IS rendering, showing both means the user reads the same
+              question and the same four options twice, one of them inert. The
+              card wins; nothing is lost, because the text is still in
+              `message.content` and still goes to the model on the next turn. */}
+          {message.content && !clarification && (
+            /* No font-size override: the body inherits --ts-fs-base (16px).
+               It used to be hardcoded to 15px, which is why assistant prose
+               read dimmer than it should — thin stems at 15px on pure black
+               lose weight to greyscale antialiasing, and #ffffff stops
+               looking white. It also left `.md h3`/`h4` (16px) rendering
+               LARGER than the body they head. */
+            <div>
               {/* [n] citation markers are stripped for display (2026-08-05)
                   — the numbered sources live in the ActivityPanel instead.
                   The stored content keeps them, so nothing is lost. */}
@@ -245,6 +306,101 @@ export function MessageRow({
               space.
               <span className="text-faint underline">See summary</span>
             </button>
+          )}
+
+          {/* Salesforce Intelligence Mode's typed card wins when present; the
+              legacy `meta.clarify` buttons below still render every
+              conversation persisted before it existed, and every answer given
+              while the feature is switched off. Never both — the `!clarification`
+              guard is what keeps one question from showing two sets of
+              controls. */}
+          {clarification && onClarificationAnswer && (
+            <ClarificationCard
+              request={clarification}
+              submitting={
+                submittingClarificationId === clarification.clarification_id
+              }
+              onSubmit={onClarificationAnswer}
+              onUseComposer={() => onClarificationCustom?.(clarification)}
+            />
+          )}
+
+          {message.meta?.salesforce_sources && (
+            <SalesforceSourceLine
+              sources={message.meta.salesforce_sources}
+              scope={message.meta.salesforce_scope}
+              assumptions={message.meta.assumptions}
+            />
+          )}
+
+          {!clarification && message.meta?.clarify && onClarify && (
+            <div className="mt-3 rounded-lg border border-border bg-surface p-3">
+              <p className="text-sm font-medium text-fg">
+                {message.meta.clarify.question}
+              </p>
+              {message.meta.clarify.reason && (
+                <p className="mt-1 text-xs text-muted">
+                  {message.meta.clarify.reason}
+                </p>
+              )}
+              <div className="mt-3 flex flex-col gap-1.5">
+                {message.meta.clarify.options.map((option) => (
+                  <button
+                    key={option.label}
+                    type="button"
+                    onClick={() => {
+                      if (option.free_text) {
+                        setClarifyOther(true);
+                        return;
+                      }
+                      // Send the RESOLVED question, not the label — the label
+                      // alone reads as a new question and gets clarified again.
+                      onClarify(option.send || option.label);
+                    }}
+                    className="rounded-md border border-border bg-bg px-3 py-2 text-left text-sm text-fg transition hover:border-accent hover:bg-surface focus:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                  >
+                    <span className="font-medium">{option.label}</span>
+                    {option.description && (
+                      <span className="mt-0.5 block text-xs text-muted">
+                        {option.description}
+                      </span>
+                    )}
+                  </button>
+                ))}
+              </div>
+
+              {clarifyOther && (
+                <form
+                  className="mt-2 flex gap-2"
+                  onSubmit={(event) => {
+                    event.preventDefault();
+                    const typed = clarifyText.trim();
+                    if (!typed) return;
+                    const original = message.meta?.clarify?.original ?? '';
+                    onClarify(
+                      original ? `${original}\n\n(Clarified: ${typed})` : typed,
+                    );
+                    setClarifyText('');
+                    setClarifyOther(false);
+                  }}
+                >
+                  <input
+                    autoFocus
+                    value={clarifyText}
+                    onChange={(event) => setClarifyText(event.target.value)}
+                    placeholder="Tell me what you meant…"
+                    className="min-w-0 flex-1 rounded-md border border-border bg-bg px-3 py-2 text-sm text-fg outline-none focus:border-accent"
+                  />
+                  <button
+                    type="submit"
+                    disabled={!clarifyText.trim()}
+                    className="rounded-md border border-border bg-surface px-3 py-2 text-sm text-fg transition hover:border-accent disabled:opacity-40"
+                  >
+                    Send
+                  </button>
+                </form>
+              )}
+            </div>
           )}
 
           {message.meta?.input_trimmed && (
@@ -323,13 +479,13 @@ export function MessageRow({
                 aria-label="Good response"
                 aria-pressed={feedback === 'up'}
                 title="Good response"
-                className={`rounded-lg p-1.5 transition-colors duration-ts hover:bg-surface-2 ${
+                className={`rounded-lg p-2 transition-colors duration-ts hover:bg-surface-2 ${
                   feedback === 'up'
                     ? 'text-accent'
-                    : 'text-muted hover:text-ink'
+                    : 'text-icon hover:text-ink'
                 }`}
               >
-                <IconThumbUp size={15} />
+                <IconThumbUp size={18} />
               </button>
               <button
                 type="button"
@@ -337,22 +493,22 @@ export function MessageRow({
                 aria-label="Bad response"
                 aria-pressed={feedback === 'down'}
                 title="Bad response"
-                className={`rounded-lg p-1.5 transition-colors duration-ts hover:bg-surface-2 ${
+                className={`rounded-lg p-2 transition-colors duration-ts hover:bg-surface-2 ${
                   feedback === 'down'
                     ? 'text-danger'
-                    : 'text-muted hover:text-ink'
+                    : 'text-icon hover:text-ink'
                 }`}
               >
-                <IconThumbDown size={15} />
+                <IconThumbDown size={18} />
               </button>
               <button
                 type="button"
                 onClick={onRegenerate}
                 aria-label="Try again"
                 title="Try again"
-                className="rounded-lg p-1.5 text-muted transition-colors duration-ts hover:bg-surface-2 hover:text-ink"
+                className="rounded-lg p-2 text-icon transition-colors duration-ts hover:bg-surface-2 hover:text-ink"
               >
-                <IconRefresh size={15} />
+                <IconRefresh size={18} />
               </button>
               {hasActivity && (
                 <button
@@ -361,9 +517,9 @@ export function MessageRow({
                   aria-label="Show sources and thinking"
                   aria-expanded={activityOpen}
                   title="Sources — searches and thinking behind this answer"
-                  className="ml-1 inline-flex items-center gap-1.5 rounded-lg px-2 py-1.5 text-xs font-medium text-muted transition-colors duration-ts hover:bg-surface-2 hover:text-ink"
+                  className="ml-0.5 inline-flex items-center gap-1.5 rounded-lg px-2.5 py-2 text-xs font-medium text-icon transition-colors duration-ts hover:bg-surface-2 hover:text-ink"
                 >
-                  <IconBook size={14} />
+                  <IconBook size={16} />
                   Sources
                 </button>
               )}

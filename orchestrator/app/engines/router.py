@@ -24,9 +24,14 @@ _SYSTEM = (
     "You are the request router for the TechSara Local AI Analysis Platform.\n"
     "Classify the user's request into exactly one route:\n"
     '- "sql": questions answered by querying structured Salesforce tables '
-    "(counts, sums, rankings, filters, trends, top-N).\n"
-    '- "rag": questions about the CONTENT of Salesforce records — notes, '
-    "emails, case comments, descriptions, discussions.\n"
+    "(counts, sums, rankings, filters, trends, top-N) — AND any request for "
+    "the RECORDS of a named person or thing: their training, interviews, "
+    "invoices, sessions, status, history, dates. If the answer is fields on "
+    "records, it is sql, however the question is worded.\n"
+    '- "rag": questions about the free TEXT inside records — what someone '
+    "said, wrote or complained about, in notes, emails, case comments and "
+    "descriptions. Choose rag only when the answer is prose a human typed, "
+    "never merely because a person is named.\n"
     '- "vision": the user attached an image (screenshot, invoice, contract, '
     "photo) to analyze.\n"
     '- "report": the user wants a multi-section document/report generated '
@@ -44,6 +49,12 @@ FEW_SHOTS = [
     ("Here is a photo of an invoice — what is the total amount due?", "vision"),
     ("Create a Q3 sales performance report with charts and email highlights", "report"),
     ("Top 10 accounts by closed-won revenue last quarter", "sql"),
+    # A named person plus "details" read as narrative and went to rag, which
+    # text-searched record bodies and answered "no training details found"
+    # about a candidate with five enrolments.
+    ("give me details for Rakshith Bodakuntla's training", "sql"),
+    ("show me everything about Priya Sharma", "sql"),
+    ("what did the client say in their feedback about Priya Sharma?", "rag"),
     ("hello my name is X", "chat"),
     ("Thanks, that was helpful! Who are you exactly?", "chat"),
 ]

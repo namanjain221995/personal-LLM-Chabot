@@ -1,0 +1,34 @@
+# CPU-only local inference. The launcher downloads the pinned GGUF and emits
+# its complete container-visible path beneath /models.
+services:
+  llama-cpp:
+    image: ghcr.io/ggml-org/llama.cpp@sha256:2a8440d3aa0be70bf1d1824d2721fc5001616d46be4348b1c1b38fa30af4fe1c
+    command: >
+      -m ${MAIN_MODEL_CONTAINER_PATH:?MAIN_MODEL_CONTAINER_PATH must be generated}
+      --alias ${MAIN_MODEL:-Qwen3-0.6B-Q8_0.gguf}
+      --host 0.0.0.0
+      --port 30000
+      -c ${MODEL_MAX_CONTEXT:-4096}
+      -np ${MODEL_CONCURRENCY:-1}
+    volumes:
+      - type: bind
+        source: ${TECHSARA_MODEL_CACHE:?TECHSARA_MODEL_CACHE must be generated}
+        target: /models
+        read_only: true
+    expose:
+      - "30000"
+    networks:
+      - inference
+    init: true
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:30000/v1/models -o /dev/null || exit 1"]
+      interval: 30s
+      timeout: 15s
+      retries: 30
+      start_period: 10m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

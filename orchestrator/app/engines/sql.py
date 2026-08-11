@@ -18,7 +18,7 @@ from typing import Awaitable, Callable, List, Optional, Sequence, Tuple
 from . import NO_DATA_MESSAGE, recent_turns
 from .. import llm
 from ..config import settings
-from ..core import chart_decision
+from ..core import chart_decision, org_brief, sf_dictionary
 from ..core.chart_pipeline import ChartResult, build_chart
 from ..core.exports import cap_rows, export_csv, export_xlsx, slugify
 from ..core.schema_cache import format_schema, relevant_schema, schema_cache
@@ -71,6 +71,10 @@ _SQL_SYSTEM = (
     # is exactly the inconsistency that erodes trust in both.
     "- The user writes dates DAY-MONTH-YEAR: 03-07-2026 or 3/7/2026 means "
     "3 July 2026, NEVER March 7. Only ISO dates (2026-07-03) are year-first.\n"
+    # Everything the warehouse stores is VARCHAR (19,519 of 19,520 columns).
+    # Without the cast rule, ORDER BY on an amount sorts lexicographically and
+    # "top 10 invoices by value" answers 999 over 27000 — no error, just wrong.
+    + org_brief.SQL_HARD_RULES + "\n"
     "- Output ONLY the SQL, no explanation, no markdown fence."
 )
 
@@ -103,20 +107,42 @@ async def _ask_sql(
     from ..core.sf_dictionary import hint_for
 
     hint = hint_for(question)
+    # The dictionary says what things are CALLED; the brief says what they
+    # MEAN. Knowing Interview__c exists does not stop a model counting the
+    # 5,566 Initial Call rows as interviews.
+    grounding = org_brief.grounding_for(question)
     user = f"Database schema:\n{schema_text}\n\nQuestion: {question}"
     if hint:
         user = f"{hint}\n\n{user}"
+    if grounding:
+        user = f"{grounding}\n\n{user}"
     if error is not None:
         user += (
             f"\n\nYour previous SQL failed.\nPrevious SQL:\n{previous_sql}\n"
             f"Error:\n{error}\n\nWrite a corrected single SELECT statement."
         )
+    # Earlier turns already carry queries that WORKED for this user, and a
+    # "(Clarified: ...)" line records a reading they explicitly chose. Reuse
+    # both rather than re-deriving the join from scratch each turn.
+    user += (
+        "\n\nThis conversation may already contain SQL that answered an "
+        "earlier question, and any line beginning '(Clarified:' is a reading "
+        "the user picked themselves. Follow those — reuse the joins and "
+        "filters that already worked here, and keep the same reading unless "
+        "this question changes it."
+    )
     messages = (
         [{"role": "system", "content": _SQL_SYSTEM}]
         + recent_turns(history, 6)
         + [{"role": "user", "content": user}]
     )
-    raw = await llm.chat_completion(messages, temperature=0.1, max_tokens=6000)
+    # No reasoning pass: writing SQL from a schema is translation, and the
+    # thinking tokens come out of the same budget as the statement. With
+    # thinking on, an 11,500-token prompt produced 121 seconds of silence and
+    # an empty reply.
+    raw = await llm.chat_completion(
+        messages, temperature=0.1, max_tokens=6000, thinking=False
+    )
     return extract_sql(raw)
 
 
@@ -197,6 +223,16 @@ def wants_live_lookup(question: str) -> bool:
     return bool(_LIVE_RE.search(question or ""))
 
 
+class EmptySql(RuntimeError):
+    """The model returned no statement at all, twice.
+
+    Distinct from NoSuchTable on purpose. "The warehouse does not hold this"
+    and "the model failed to answer" are different facts, and conflating them
+    sent the second case to live Salesforce — which cannot know the model
+    failed, and answered from the wrong object with full confidence.
+    """
+
+
 class NoSuchTable(RuntimeError):
     """The question is about an object the warehouse does not carry.
 
@@ -240,9 +276,37 @@ async def generate_and_run_sql(
     # shadows and setup objects); ground the prompt on the relevant slice so
     # the business tables stay prominent. Validation below still accepts any
     # table that truly exists.
-    schema_text = format_schema(relevant_schema(schema, question))
+    # The schema slice is capped, so pin the tables the matched metric's own
+    # definition joins — otherwise a metric can be injected while the table it
+    # names is ranked out of the prompt.
+    sliced = relevant_schema(
+        schema, question, must_include=org_brief.tables_for(question)
+    )
+    schema_text = format_schema(sliced)
+    # Column types alone cannot say which lookup points where, so the model
+    # guessed join paths that match zero rows. Spell the edges out.
+    joins = sf_dictionary.join_map(list(sliced))
+    if joins:
+        schema_text = f"{schema_text}\n\n{joins}"
     cap = fetch_cap if fetch_cap is not None else settings.sql_preview_row_cap + 1
     raw = await _ask_sql(question, schema_text, history)
+    if not raw.strip():
+        # The model spent its whole generation budget reasoning and emitted no
+        # statement. That used to read as "no FROM" -> NoSuchTable -> ask live
+        # Salesforce, which then answered off whatever object the dictionary
+        # had suggested. An empty reply is a retry, never a routing decision.
+        raw = await _ask_sql(
+            question,
+            schema_text,
+            history,
+            error=(
+                "Your previous reply contained no SQL statement. Do not "
+                "explain and do not reason in the reply — output the single "
+                "SELECT statement and nothing else."
+            ),
+        )
+    if not raw.strip():
+        raise EmptySql("the model did not produce a SQL statement")
     if not references_a_known_table(raw, schema):
         # No FROM against anything we hold: the model is inventing a result
         # rather than reading data. Refuse instead of answering.
@@ -299,12 +363,118 @@ async def attach_chart(
     return result
 
 
+#: A text column with at most this many distinct values is a CATEGORY worth
+#: counting ("Cleared"/"Failed", stage names, statuses). Above it, counting
+#: every value produces noise rather than an answer.
+_MAX_CATEGORY_VALUES = 15
+
+#: Columns considered for the breakdown. A wide Salesforce result can have
+#: dozens; the first ones are the ones the query actually selected for.
+_MAX_PROFILED_COLUMNS = 20
+
+
+def deterministic_summary(
+    columns: Sequence[str], rows: Sequence[Sequence]
+) -> dict:
+    """Exact figures over EVERY row, computed here rather than by the model.
+
+    This is the fix for a real wrong answer (owner report 2026-08-11). Asked for
+    slot 128's mocks, the summary said "Total Mocks: 3, Cleared: 2, Failed: 0,
+    Pass Ratio: 0.67" — three statements that cannot all be true, because they
+    were read off the 30 sample rows rather than computed over the 18-row (and
+    in other cases 500-row) result.
+
+    The prompt had ALWAYS told the model not to do that. It did it anyway, which
+    is the whole lesson: an instruction is not a mechanism. Counts, totals and
+    ratios now arrive pre-computed and the model is told to quote them.
+
+    Returns exact row counts, per-numeric-column totals, and value counts for
+    low-cardinality columns — which is precisely the "how many cleared, how many
+    failed, what is the ratio" shape that was being guessed at.
+    """
+    names = list(columns)[:_MAX_PROFILED_COLUMNS]
+    total = len(rows)
+    out: dict = {"total_rows": total, "counts_cover": "every row in the result"}
+    if not names or not rows:
+        return out
+
+    numeric: dict = {}
+    categorical: dict = {}
+    for index, name in enumerate(names):
+        values = [r[index] for r in rows if index < len(r)]
+        present = [v for v in values if v is not None and v != ""]
+        if not present:
+            continue
+
+        numbers = []
+        for value in present:
+            if isinstance(value, bool):
+                numbers = []
+                break
+            if isinstance(value, (int, float)):
+                numbers.append(float(value))
+            elif isinstance(value, str):
+                try:
+                    numbers.append(float(value.replace(",", "")))
+                except ValueError:
+                    numbers = []
+                    break
+            else:
+                numbers = []
+                break
+
+        if numbers and len(numbers) == len(present):
+            numeric[name] = {
+                "sum": round(sum(numbers), 4),
+                "average": round(sum(numbers) / len(numbers), 4),
+                "min": round(min(numbers), 4),
+                "max": round(max(numbers), 4),
+                "non_empty": len(numbers),
+            }
+            continue
+
+        distinct: dict = {}
+        for value in present:
+            key = str(value)
+            distinct[key] = distinct.get(key, 0) + 1
+            if len(distinct) > _MAX_CATEGORY_VALUES:
+                break
+        if len(distinct) <= _MAX_CATEGORY_VALUES:
+            denominator = sum(distinct.values())
+            categorical[name] = {
+                "denominator": denominator,
+                "values": [
+                    {
+                        "value": value,
+                        "count": count,
+                        # Stated with its denominator on purpose: a percentage
+                        # whose population is unclear is how "0.67" appeared
+                        # next to counts that did not add up to it.
+                        "percent_of_non_empty": round(
+                            100.0 * count / denominator, 2
+                        ),
+                    }
+                    for value, count in sorted(
+                        distinct.items(), key=lambda kv: -kv[1]
+                    )
+                ],
+                "empty_or_null": total - denominator,
+            }
+
+    if numeric:
+        out["numeric_totals"] = numeric
+    if categorical:
+        out["value_counts"] = categorical
+    return out
+
+
 def _narrative_messages(
     question: str,
     columns: Sequence[str],
     rows: Sequence[Sequence],
     history: Sequence[dict],
     total_rows: Optional[int] = None,
+    computed: Optional[dict] = None,
 ) -> List[dict]:
     shown = list(rows[:30])
     total = len(rows) if total_rows is None else total_rows
@@ -322,17 +492,39 @@ def _narrative_messages(
         "direct from Salesforce, or current as of this moment.\n"
         # The model sees a SAMPLE. Left unsaid, it reports the sample size as
         # the answer: 314 rows came back and the summary said "29 records".
-        "You are shown only the FIRST FEW ROWS of a larger result. The true "
-        "row count is given below — quote THAT as the total, never the number "
-        "of rows you can see, and do not present counts derived from the "
-        "sample (how many are active, which department is biggest) as if they "
-        "covered everything. Say they are from the first rows shown."
+        "You are shown only the FIRST FEW ROWS of a larger result, as an "
+        "ILLUSTRATION of the shape of the data.\n"
+        # The instruction below used to be the ONLY defence, and it failed:
+        # "Total Mocks: 3, Cleared: 2, Failed: 0, Pass Ratio: 0.67" was read
+        # off the sample and is not internally consistent. The computed block
+        # is the mechanism; this paragraph now just points at it.
+        "EVERY number you state — every count, total, average, percentage and "
+        "ratio — MUST be taken from the 'Computed figures' block below. It was "
+        "calculated in code over EVERY row of the result, not over the sample. "
+        "Do not count, add up, or work out a proportion from the sample rows "
+        "yourself. If a figure you want is not in the computed block, say you "
+        "do not have it rather than deriving it.\n"
+        "When you give a percentage or a ratio, state what it is a percentage "
+        "OF, using the denominator given in the computed block. Do not present "
+        "a ratio alongside counts that do not add up to its denominator.\n"
+        + org_brief.ANSWER_RULES
     )
     counted = (
         f"Total rows in the result: {total} (you are shown the first "
-        f"{len(shown)})\n\n"
+        f"{len(shown)} as an illustration)\n\n"
     )
-    user = f"Question: {question}\n\n{counted}Result sample (JSON): {sample}"
+    figures = ""
+    if computed:
+        figures = (
+            "Computed figures (AUTHORITATIVE — calculated in code over every "
+            "row; quote these):\n"
+            + json.dumps(computed, default=str)[:6000]
+            + "\n\n"
+        )
+    user = (
+        f"Question: {question}\n\n{counted}{figures}"
+        f"Result sample (illustration only, JSON): {sample}"
+    )
     return [{"role": "system", "content": system}] + recent_turns(history, 6) + [
         {"role": "user", "content": user}
     ]
@@ -364,6 +556,18 @@ async def run_sql_engine(
         sql, columns, rows = await generate_and_run_sql(
             message, history=history, fetch_cap=fetch_cap
         )
+    except EmptySql:
+        # Not a routing problem — the warehouse has the data and the model
+        # failed to ask for it. Say so; going live here would answer a
+        # question nobody successfully wrote a query for.
+        text = (
+            "I could not turn that into a query — the request came back empty "
+            "twice. Try asking for one thing at a time, or name the object "
+            "you mean (training, interviews, invoices)."
+        )
+        await emit("token", {"text": text})
+        await emit("meta", {"route": "sql"})
+        return text
     except (NoSuchTable, WarehouseBusy) as reason:
         # Two roads to the same place: the warehouse does not carry this
         # object (NoSuchTable — ask Salesforce rather than let the model
@@ -452,19 +656,53 @@ async def run_sql_engine(
             return text
 
         parts: List[str] = []
+        # Same mechanism as the warehouse branch: counts and ratios are
+        # computed over every returned row, and the model quotes them.
+        live_columns = (
+            [c for c in live_rows[0] if not isinstance(live_rows[0][c], (dict, list))]
+            if live_rows and isinstance(live_rows[0], dict)
+            else []
+        )
+        live_computed = deterministic_summary(
+            live_columns,
+            [[r.get(c) for c in live_columns] for r in live_rows],
+        )
         msgs = [
             {"role": "system", "content":
              "Answer from these LIVE Salesforce records. State plainly that "
              "the figures come straight from Salesforce, not the local copy. "
-             "Never invent values that are not in the rows."},
+             "Never invent values that are not in the rows.\n"
+             "Every count, total, percentage and ratio you state MUST come "
+             "from the 'Computed figures' block — it was calculated in code "
+             "over every returned row. Do not work figures out from the rows "
+             "yourself, and always say what a percentage is a percentage of."},
             {"role": "user", "content":
              f"Question: {message}\n\nSOQL run:\n{soql}\n\n"
+             "Computed figures (AUTHORITATIVE):\n"
+             f"{json.dumps(live_computed, default=str)[:6000]}\n\n"
              f"Rows ({len(live_rows)}):\n{describe_rows(live_rows)}"},
         ]
         async for kind, delta in llm.stream_chat_events(msgs, max_tokens=4000):
             await emit(kind, {"text": delta})
             if kind == "token":
                 parts.append(delta)
+        # A thinking model draws its reasoning from the SAME budget as the
+        # answer, and over a wide result set it can spend the lot and stream
+        # NOTHING — leaving a data table with an empty bubble above it. The
+        # warehouse branch below has always had this fallback; the live branch
+        # did not, and Salesforce Intelligence Mode reaches it far more often.
+        if not "".join(parts).strip():
+            fallback = (
+                f"Salesforce returned {len(live_rows)} row(s) for this question. "
+                "The records are in the table below — I could not summarize them "
+                "in words this time, but the data itself is what the org returned."
+                if live_rows
+                else "Salesforce returned no matching records for this question. "
+                "The query ran successfully — this is an empty result, not a "
+                "failed lookup."
+            )
+            parts.append(fallback)
+            await emit("token", {"text": fallback})
         live_preview = live_rows[:settings.sql_preview_row_cap]
         live_meta: dict = {
             "route": "sql", "sql": soql,
@@ -517,9 +755,22 @@ async def run_sql_engine(
     # cost the user the answer that is about to stream.
     await attach_chart(meta, message, columns, preview)
 
+    # Computed over `rows` — the FULL result — not over `preview`. That
+    # distinction is the entire point: the preview is capped at 500 and the
+    # sample the model sees is capped at 30, and both were being used as the
+    # population for counts and ratios.
+    computed = deterministic_summary(columns, rows)
+
     parts: List[str] = []
     async for token in llm.stream_chat_completion(
-        _narrative_messages(message, columns, preview, history, total_rows=len(rows)),
+        _narrative_messages(
+            message,
+            columns,
+            preview,
+            history,
+            total_rows=len(rows),
+            computed=computed,
+        ),
         temperature=0.2,
         max_tokens=6000,
         thinking=False,

@@ -18,6 +18,15 @@ import re
 import httpx
 
 from .chunking import chunk_text
+from .embedding_index import (
+    EmbeddingCompatibilityError,
+    EmbeddingIndexMetadata,
+    load_metadata,
+    safe_reindex_guidance,
+    validate_metadata,
+    vector_dimension,
+    write_metadata_once,
+)
 
 log = logging.getLogger("syncworker.rag_index")
 
@@ -30,31 +39,76 @@ class OpenAIEmbedder:
     """Embeds text batches via an OpenAI-compatible /embeddings endpoint.
 
     base_url is an OpenAI-compatible base like http://vllm-embed:30003/v1;
-    the response's data[i].embedding entries are order-preserving.
+    explicit response indices are validated and restored to input order.
     """
 
     def __init__(
-        self, base_url: str, model: str, http: httpx.Client | None = None
+        self,
+        base_url: str,
+        model: str,
+        http: httpx.Client | None = None,
+        *,
+        api_key: str = "",
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._model = model
         self._http = http or httpx.Client(timeout=300.0)
+        self._headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         vectors: list[list[float]] = []
+        dimension: int | None = None
         for i in range(0, len(texts), EMBED_BATCH_SIZE):
             batch = texts[i : i + EMBED_BATCH_SIZE]
             resp = self._http.post(
                 f"{self._base_url}/embeddings",
                 json={"model": self._model, "input": batch},
+                headers=self._headers,
             )
             resp.raise_for_status()
-            vectors.extend(item["embedding"] for item in resp.json()["data"])
+            payload = resp.json()
+            data = payload.get("data") if isinstance(payload, dict) else None
+            if not isinstance(data, list) or len(data) != len(batch):
+                returned = len(data) if isinstance(data, list) else 0
+                raise RuntimeError(
+                    f"embedder returned {returned} vectors for {len(batch)} texts"
+                )
+            indexed: dict[int, list[float]] = {}
+            for item in data:
+                if not isinstance(item, dict):
+                    raise RuntimeError("embedding response data item is not an object")
+                try:
+                    index = int(item["index"])
+                    vector = item["embedding"]
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        "embedding response item needs an index and vector"
+                    ) from exc
+                if (
+                    index < 0
+                    or index >= len(batch)
+                    or index in indexed
+                    or not isinstance(vector, list)
+                    or not vector
+                ):
+                    raise RuntimeError("embedding response indices or vectors are invalid")
+                if dimension is None:
+                    dimension = len(vector)
+                if len(vector) != dimension:
+                    raise RuntimeError("embedding response changed vector dimension")
+                indexed[index] = vector
+            if set(indexed) != set(range(len(batch))):
+                raise RuntimeError("embedding response indices are incomplete")
+            vectors.extend(indexed[index] for index in range(len(batch)))
         if len(vectors) != len(texts):
             raise RuntimeError(
                 f"embedder returned {len(vectors)} vectors for {len(texts)} texts"
             )
         return vectors
+
+    @property
+    def model_id(self) -> str:
+        return self._model
 
 
 class RagIndexer:
@@ -71,11 +125,22 @@ class RagIndexer:
         return self._db
 
     def _open_or_create_table(self, dim: int):
-        import pyarrow as pa
-
         db = self._connect()
         if TABLE_NAME in db.table_names():
-            return db.open_table(TABLE_NAME)
+            return self._validate_existing_table(db.open_table(TABLE_NAME), dim)
+
+        metadata = load_metadata(self._dir)
+        if metadata is not None:
+            validate_metadata(
+                metadata,
+                lancedb_dir=self._dir,
+                table=TABLE_NAME,
+                model_id=self._embedder.model_id,
+                dimension=dim,
+            )
+
+        import pyarrow as pa
+
         schema = pa.schema(
             [
                 pa.field("vector", pa.list_(pa.float32(), dim)),
@@ -86,12 +151,83 @@ class RagIndexer:
                 pa.field("system_modstamp", pa.string()),
             ]
         )
-        return db.create_table(TABLE_NAME, schema=schema)
+        table = db.create_table(TABLE_NAME, schema=schema)
+        if metadata is None:
+            write_metadata_once(
+                self._dir,
+                EmbeddingIndexMetadata(
+                    table=TABLE_NAME,
+                    model_id=self._embedder.model_id,
+                    dimension=dim,
+                ),
+            )
+        return table
+
+    def _compatibility_error(self, reason: str) -> EmbeddingCompatibilityError:
+        return EmbeddingCompatibilityError(
+            f"Embedding index compatibility check failed: {reason}. "
+            + safe_reindex_guidance(self._dir)
+        )
+
+    def _validate_existing_table(self, table, incoming_dim: int | None = None):
+        try:
+            table_dim = vector_dimension(table)
+        except ValueError as exc:
+            raise self._compatibility_error(str(exc)) from exc
+        metadata = load_metadata(self._dir)
+        if metadata is None:
+            # An empty legacy table contains no vector space to mislabel, so it
+            # is safe to attach metadata. A non-empty one is deliberately left
+            # untouched because its model identity cannot be inferred.
+            if table.count_rows() != 0:
+                raise self._compatibility_error(
+                    "a non-empty LanceDB table has no embedding metadata"
+                )
+            # Do not claim even an empty legacy table until the endpoint has
+            # demonstrated that its vector width matches the fixed schema.
+            if incoming_dim is None:
+                return table
+            if incoming_dim != table_dim:
+                raise self._compatibility_error(
+                    f"embedding endpoint returned dimension {incoming_dim}, existing "
+                    f"table uses {table_dim}"
+                )
+            metadata = EmbeddingIndexMetadata(
+                table=TABLE_NAME,
+                model_id=self._embedder.model_id,
+                dimension=table_dim,
+            )
+            write_metadata_once(self._dir, metadata)
+        validate_metadata(
+            metadata,
+            lancedb_dir=self._dir,
+            table=TABLE_NAME,
+            model_id=self._embedder.model_id,
+            dimension=table_dim,
+        )
+        if incoming_dim is not None and incoming_dim != table_dim:
+            raise self._compatibility_error(
+                f"embedding endpoint returned dimension {incoming_dim}, existing table "
+                f"uses {table_dim}"
+            )
+        return table
 
     def _open_table_if_exists(self):
         db = self._connect()
         if TABLE_NAME in db.table_names():
-            return db.open_table(TABLE_NAME)
+            return self._validate_existing_table(db.open_table(TABLE_NAME))
+        # A sidecar may survive a manually moved/deleted table. Its model
+        # identity is still authoritative, so reject a different configured
+        # model before sending warehouse content to the endpoint.
+        metadata = load_metadata(self._dir)
+        if metadata is not None:
+            validate_metadata(
+                metadata,
+                lancedb_dir=self._dir,
+                table=TABLE_NAME,
+                model_id=self._embedder.model_id,
+                dimension=metadata.dimension,
+            )
         return None
 
     def delete_records(self, record_ids: list[str]) -> int:
@@ -143,15 +279,22 @@ class RagIndexer:
                         }
                     )
 
+        # Validate any known model identity before sending record content to
+        # the embedding endpoint. Dimension is checked again after embedding,
+        # still before any existing chunk is deleted.
+        table = self._open_table_if_exists()
         if rows:
             vectors = self._embedder.embed([r["text"] for r in rows])
             for row, vec in zip(rows, vectors):
                 row["vector"] = [float(x) for x in vec]
-            table = self._open_or_create_table(dim=len(rows[0]["vector"]))
+            dimension = len(rows[0]["vector"])
+            if table is None:
+                table = self._open_or_create_table(dim=dimension)
+            else:
+                table = self._validate_existing_table(table, dimension)
         else:
             # Nothing to insert, but changed records may still have stale
             # chunks (long text cleared) that must be removed.
-            table = self._open_table_if_exists()
             if table is None:
                 return 0
 

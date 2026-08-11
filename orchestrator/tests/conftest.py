@@ -31,14 +31,27 @@ from __future__ import annotations
 
 import os
 
-import pytest
+# Clarification is ON by default in production: every Salesforce question gets
+# a one-click confirmation before it is answered. The routing tests assert that
+# a question REACHES its engine, so they must not be intercepted by it. Set
+# before `app.config` is imported — Settings() reads the environment once, at
+# module import. The feature has its own coverage in tests/test_clarify.py,
+# which exercises both modes explicitly.
+os.environ.setdefault("CLARIFY_MODE", "ambiguous")
 
-from app.config import settings
+from urllib.parse import unquote, urlsplit  # noqa: E402
+
+import pytest  # noqa: E402
+
+from app.config import settings  # noqa: E402
 
 #: Every table the app owns, parent-last so CASCADE has nothing to complain
 #: about. `schema_migrations` is deliberately absent — truncating it would make
 #: the next init_schema() re-run every migration.
 _APP_TABLES = (
+    "sf_clarifications",
+    "sf_intents",
+    "sf_conversation_state",
     "repo_chunks",
     "repos",
     "documents",
@@ -52,6 +65,29 @@ _APP_TABLES = (
 )
 
 _DEFAULT_TEST_DSN = "postgresql://postgres:postgres@127.0.0.1:55432/techsara_test"
+
+
+def _assert_safe_test_dsn(dsn: str) -> str:
+    """Refuse any database name that is not unmistakably test-only.
+
+    This guard is deliberately positive: merely differing from the configured
+    production DSN is not enough protection for the unconditional TRUNCATE
+    fixture below.
+    """
+    parsed = urlsplit(dsn)
+    database = unquote(parsed.path.lstrip("/")).strip().lower()
+    marked_test = (
+        database == "test"
+        or database.startswith(("test_", "test-"))
+        or database.endswith(("_test", "-test"))
+    )
+    if parsed.scheme not in {"postgres", "postgresql"} or not database or not marked_test:
+        raise pytest.UsageError(
+            "Refusing to run destructive fixtures: TEST_DATABASE_URL must use "
+            "PostgreSQL and a database named `test`, prefixed `test_`/`test-`, "
+            "or suffixed `_test`/`-test`."
+        )
+    return dsn
 
 
 def _suffixed(dsn: str) -> str:
@@ -81,24 +117,27 @@ def _test_dsn() -> str:
     """
     explicit = (os.environ.get("TEST_DATABASE_URL") or "").strip()
     if explicit:
-        return explicit
+        return _assert_safe_test_dsn(explicit)
     app_dsn = (os.environ.get("APP_DATABASE_URL") or "").strip()
     if app_dsn:
-        return _suffixed(app_dsn)
+        return _assert_safe_test_dsn(_suffixed(app_dsn))
     user = (os.environ.get("POSTGRES_USER") or "").strip()
     password = (os.environ.get("POSTGRES_PASSWORD") or "").strip()
     if user and password:
         host = (os.environ.get("POSTGRES_HOST") or "127.0.0.1").strip()
         port = (os.environ.get("POSTGRES_PORT") or "5432").strip()
         name = (os.environ.get("POSTGRES_DB") or user).strip()
-        return f"postgresql://{user}:{password}@{host}:{port}/{name}_test"
-    return _DEFAULT_TEST_DSN
+        return _assert_safe_test_dsn(
+            f"postgresql://{user}:{password}@{host}:{port}/{name}_test"
+        )
+    return _assert_safe_test_dsn(_DEFAULT_TEST_DSN)
 
 
 def _ensure_database(dsn: str) -> None:
     """CREATE DATABASE if it is missing; a clear failure if the server is not
     there at all. A skip would be worse than an error: the whole history, auth
     and upload surface would silently stop being tested."""
+    _assert_safe_test_dsn(dsn)
     import psycopg
 
     try:
@@ -163,6 +202,9 @@ def isolated_app_db(app_database, tmp_path, monkeypatch):
     Before, not after: a test that leaves rows behind then still fails is much
     easier to debug when the rows are still there to look at.
     """
+    # Defense in depth immediately adjacent to the destructive statement: even
+    # a fixture override cannot smuggle a production DSN past session setup.
+    _assert_safe_test_dsn(app_database)
     from app import db
 
     monkeypatch.setattr(settings, "app_database_url", app_database)

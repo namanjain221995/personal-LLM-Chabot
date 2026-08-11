@@ -61,7 +61,12 @@ function makeApi(
     async create() {},
     async update() {},
     async remove() {},
-    async appendMessage() {},
+    async appendMessage() {
+      return { id: 99 };
+    },
+    async generateTitle() {
+      return { title: '', generated: false };
+    },
     async setFeedback(id, messageId, feedback) {
       if (opts.failFeedback) throw new Error('offline');
       recorded.feedback.push([id, messageId, feedback]);
@@ -179,6 +184,46 @@ describe('server-stored message feedback', () => {
     // The cleared thumb travels as an explicit null, not as an omission that
     // the server would fill back in from the row it is about to delete.
     expect(pushed?.[1].feedback).toBeNull();
+  });
+
+  it('learns the server id from the append response', async () => {
+    // The case that actually broke in the browser: a conversation you are
+    // chatting in is never re-fetched (the cache is in sync), so the append
+    // response is the ONLY place its messages can pick up a server id.
+    const store = await storeWith(THREAD, recorded);
+    const conv = await store.load('c1');
+    store.saveMessages('c1', [
+      ...(conv?.messages ?? []),
+      {
+        id: 'brand-new',
+        role: 'assistant' as const,
+        content: 'a fresh reply',
+        createdAt: Date.now(),
+      },
+    ]);
+    await store.flush();
+
+    expect(store.get('c1')?.messages.at(-1)?.serverId).toBe(99);
+
+    // …and that id is what the thumb is sent with.
+    await store.setMessageFeedback('c1', 'brand-new', 'up');
+    expect(recorded.feedback).toEqual([['c1', 99, 'up']]);
+  });
+
+  it('resolves a missing server id by re-reading the server, matching by position', async () => {
+    // A cached message from before ids were tracked: no serverId, but the
+    // server does have the row. It must not silently stay client-side.
+    const store = await storeWith(THREAD, recorded);
+    await store.load('c1');
+    store.saveMessages('c1', [
+      { id: 'legacy-0', role: 'user' as const, content: 'question', createdAt: 1 },
+      { id: 'legacy-1', role: 'assistant' as const, content: 'answer', createdAt: 2 },
+    ]);
+
+    await store.setMessageFeedback('c1', 'legacy-1', 'down');
+    // Position 1 on the server is row 12.
+    expect(recorded.feedback).toEqual([['c1', 12, 'down']]);
+    expect(store.get('c1')?.messages[1].feedback).toBe('down');
   });
 
   it('is a no-op for an unknown conversation or message', async () => {

@@ -7,6 +7,7 @@
  */
 
 import { handleMockHistory } from '@/lib/mockApi';
+import { classifyHistoryPath } from '@/lib/historyRoutes';
 import { proxyToOrchestrator } from '@/lib/proxy';
 
 export const runtime = 'nodejs';
@@ -18,18 +19,15 @@ async function handle(req: Request, ctx: Ctx): Promise<Response> {
   const { path } = await ctx.params;
   const parts = path ?? [];
 
-  // V4 §2: GET /history/search is read-only, so only GET reaches it.
-  const isSearch =
-    parts.length === 1 && parts[0] === 'search' && req.method === 'GET';
-
-  // Only the documented /history/conversations… tree and /history/search are
-  // proxied.
-  if (!isSearch && (parts[0] !== 'conversations' || parts.length > 3)) {
+  const decision = classifyHistoryPath(parts, req.method);
+  if (decision.kind === 'reject') {
     return Response.json(
       { message: 'Unknown history endpoint.' },
       { status: 404 },
     );
   }
+  const isSearch = decision.kind === 'search';
+
   if (process.env.MOCK_MODE === 'true') {
     return handleMockHistory(req, parts);
   }

@@ -12,6 +12,7 @@
 
 import { useId, useState } from 'react';
 import { IconBulb, IconChevronDown } from './icons';
+import { Loader } from './Loader';
 
 function lastLine(text: string): string {
   const lines = text.split('\n');
@@ -51,12 +52,14 @@ export function ReasoningAccordion({
         aria-controls={panelId}
         className="group/reason flex max-w-full items-center gap-1.5 rounded-md px-1 py-0.5 text-xs text-muted transition-colors duration-ts hover:text-ink"
       >
-        <IconBulb size={13} className="shrink-0 text-faint" />
-        <span
-          className={`shrink-0 font-medium ${thinking ? 'thinking-shimmer' : ''}`}
-        >
-          {label}
-        </span>
+        {/* Thinking is work in progress, so it gets the same indicator as
+            every other kind; a finished thought keeps the quiet bulb. */}
+        {thinking ? (
+          <Loader size={16} className="-my-0.5" />
+        ) : (
+          <IconBulb size={13} className="shrink-0 text-faint" />
+        )}
+        <span className="shrink-0 font-medium">{label}</span>
         {preview && (
           <span
             aria-hidden

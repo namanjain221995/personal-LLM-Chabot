@@ -1,4 +1,7 @@
 # syntax=docker/dockerfile:1
+# SUPERSEDED — the launcher builds Dockerfile.cuda (NVIDIA, in-process reranker)
+# or Dockerfile.cpu (macOS/CPU/external, no CUDA). This file is the pre-launcher
+# single-target build, kept only as the rollback path for docker-compose.yml.
 # TechSara Local AI Analysis Platform — orchestrator (FastAPI + LangGraph), §4/§8/§10/§12.
 #
 # Base image: NVIDIA vLLM from NGC (arm64 CUDA + torch preinstalled) — the same

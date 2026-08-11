@@ -135,6 +135,12 @@ export interface ServerHistoryStore extends HistoryStore {
     messageId: string,
     feedback: 'up' | 'down' | null,
   ): Promise<void>;
+  /**
+   * Ask the server to name a conversation from its first exchange, and adopt
+   * the result. Safe to call after every turn: the server declines unless the
+   * title is still the auto-derived one.
+   */
+  generateTitle(conversationId: string): Promise<void>;
   /** Await all in-flight background pushes (used by tests). */
   flush(): Promise<void>;
 }
@@ -769,8 +775,29 @@ export function createServerHistoryStore(
     const pushed = readSync().pushed[id];
     if (Array.isArray(pushed) && isPrefix(pushed, conv.messages)) {
       if (pushed.length === conv.messages.length) return; // already in sync
+      // Keep the row id the server assigns: it is the ONLY handle on a stored
+      // message, and this is the only place the client sees one for a message
+      // it sent. (loadConversation short-circuits to the cache whenever it is
+      // in sync, so an actively-used conversation is never re-fetched.)
+      const assigned = new Map<string, number>();
       for (const m of conv.messages.slice(pushed.length)) {
-        await api.appendMessage(id, toServerMessage(m));
+        const created = await api.appendMessage(id, toServerMessage(m));
+        const serverId = (created as { id?: number } | undefined)?.id;
+        if (typeof serverId === 'number') assigned.set(m.id, serverId);
+      }
+      if (assigned.size > 0) {
+        const fresh = local.get(id);
+        if (fresh) {
+          // local.saveMessages, not the store's: this must not mark the
+          // conversation dirty and start the sync over again.
+          local.saveMessages(
+            id,
+            fresh.messages.map((m) => {
+              const serverId = assigned.get(m.id);
+              return serverId === undefined ? m : { ...m, serverId };
+            }),
+          );
+        }
       }
       mutateSync((s) => {
         s.pushed[id] = conv.messages.map((m) => m.id);
@@ -854,12 +881,16 @@ export function createServerHistoryStore(
     }
   }
 
-  function enqueue(id: string, task: () => Promise<void>): void {
+  /** Chain a task after whatever is already queued for this conversation.
+   *  Returns the chained promise so a caller CAN await its turn; existing
+   *  fire-and-forget callers are unaffected by the added return value. */
+  function enqueue(id: string, task: () => Promise<void>): Promise<void> {
     const prev = chains.get(id) ?? Promise.resolve();
     const next = prev.then(task).catch(() => markDirty(id));
     chains.set(id, next);
     inFlight.add(next);
     void next.finally(() => inFlight.delete(next));
+    return next;
   }
 
   return {
@@ -942,6 +973,32 @@ export function createServerHistoryStore(
       enqueue(id, () => pushPatch(id, { archived }));
     },
 
+    async generateTitle(conversationId) {
+      const conv = local.get(conversationId);
+      // Needs a real exchange to describe. One message means the answer has
+      // not landed yet, and the whole point is to title the EXCHANGE.
+      if (!conv || conv.messages.length < 2) return;
+
+      // ENQUEUED, not fired directly. `enqueue` chains onto the same
+      // per-conversation promise the create/push already uses, so this can
+      // never reach the server before the POST that creates the row — which
+      // would 404 and be swallowed, leaving the chat named "hi" forever.
+      await enqueue(conversationId, async () => {
+        try {
+          const result = await api.generateTitle(conversationId);
+          // `generated: false` is the normal "leave it alone" answer: already
+          // named, renamed by the user, or nothing worth naming.
+          if (!result?.generated || !result.title) return;
+          const current = local.get(conversationId);
+          if (!current || current.title === result.title) return;
+          local.rename(conversationId, result.title);
+        } catch {
+          // Titling is a nicety. A failure must never surface to the user or
+          // mark the conversation dirty — the first-message title stands.
+        }
+      });
+    },
+
     async setMessageFeedback(conversationId, messageId, feedback) {
       const conv = local.get(conversationId);
       if (!conv) return;
@@ -956,14 +1013,40 @@ export function createServerHistoryStore(
         ),
       );
 
-      // Not stored server-side yet — the next sync carries it, because
-      // toServerMessage now includes the field.
-      if (typeof target.serverId !== 'number') {
+      let serverId = target.serverId;
+
+      // No id yet — either a message from before ids were tracked, or one
+      // pushed by a path that does not return them. Pull server truth to learn
+      // them and re-find the message BY POSITION: the client id is rewritten
+      // by a hydrate (`srv-<conversation>-<index>`), the position is not.
+      if (typeof serverId !== 'number') {
+        const index = conv.messages.findIndex((m) => m.id === messageId);
+        const fresh = await loadConversation(conversationId, true).catch(
+          () => null,
+        );
+        if (fresh) {
+          // The force-load overwrote the cache with the server's copy, which
+          // does not carry this thumb yet. Re-apply it UNCONDITIONALLY — doing
+          // it only when an id turned up would silently discard the user's
+          // click on a message the server has never seen.
+          local.saveMessages(
+            conversationId,
+            fresh.messages.map((m, i) => (i === index ? { ...m, feedback } : m)),
+          );
+          const hydrated = fresh.messages[index];
+          if (typeof hydrated?.serverId === 'number') serverId = hydrated.serverId;
+        }
+      }
+
+      // Still nothing to address remotely (never pushed). Keep it cached; the
+      // next whole-thread push carries it, because toServerMessage includes
+      // the field.
+      if (typeof serverId !== 'number') {
         markDirty(conversationId);
         return;
       }
       try {
-        await api.setFeedback(conversationId, target.serverId, feedback);
+        await api.setFeedback(conversationId, serverId, feedback);
       } catch {
         // Best-effort. The value stays in the cache and the next whole-thread
         // push will carry it, so nothing is lost by staying quiet here.
@@ -1132,6 +1215,7 @@ export function getHistoryStore(): ServerHistoryStore {
         remove: async () => undefined,
         appendMessage: async () => undefined,
         setFeedback: async () => undefined,
+        generateTitle: async () => ({ title: '', generated: false }),
         replaceMessages: async () => undefined,
         truncateMessages: async () => undefined,
       },

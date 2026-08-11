@@ -279,3 +279,35 @@ def test_a_question_naming_a_value_surfaces_the_field_that_holds_it(tmp_path):
     hint = sd.hint_for("how many interviews were ghosted last month")
     assert "Interview_Outcome__c" in hint
     assert "Ghosted" in hint
+
+
+def test_a_setup_object_does_not_outrank_a_business_object(tmp_path):
+    """The real failure: "oot mocks taken today" scored UserProvMockTarget —
+    a setup object whose LABEL reads "User Prov Mock Target" — above
+    Internal_Interview__c. The model was handed a table the warehouse does not
+    have, fell over to live Salesforce, and asked the org for
+    `FROM UserProvMockTarget`."""
+    rows = [
+        ("Internal_Interview__c", "Internal Interview", "Scheduled_Date__c",
+         "Scheduled Date", "date"),
+        ("UserProvMockTarget", "User Prov Mock Target", "ExternalFirstName",
+         "External First Name", "string"),
+        ("PromptAction", "Prompt Action", "MasterLabel", "Master Label", "string"),
+    ]
+    sd.save(sd.build_from_rows(rows), str(tmp_path / "setup.json"))
+    picked = [o["api"] for o in sd.relevant_objects("total oot mocks taken today")]
+    assert "UserProvMockTarget" not in picked
+    assert "PromptAction" not in picked
+
+
+def test_a_setup_object_is_still_reachable_when_named(tmp_path):
+    """Filtering must not make the object unaskable — only unvolunteered."""
+    rows = [
+        ("Internal_Interview__c", "Internal Interview", "Scheduled_Date__c",
+         "Scheduled Date", "date"),
+        ("UserProvMockTarget", "User Prov Mock Target", "ExternalFirstName",
+         "External First Name", "string"),
+    ]
+    sd.save(sd.build_from_rows(rows), str(tmp_path / "setup2.json"))
+    picked = [o["api"] for o in sd.relevant_objects("fields on UserProvMockTarget")]
+    assert "UserProvMockTarget" in picked

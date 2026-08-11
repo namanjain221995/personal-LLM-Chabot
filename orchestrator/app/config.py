@@ -9,6 +9,14 @@ from __future__ import annotations
 import os
 
 from .core.exports import EXPORT_ROW_CAP, PREVIEW_ROW_CAP
+from .model_capabilities import (
+    CapabilityDefaults,
+    ModelCapabilityRegistry,
+    ModelRole,
+    ReasoningField,
+    RerankerBackend,
+    capabilities_from_env,
+)
 
 _TRUTHY = {"1", "true", "yes", "on"}
 
@@ -91,8 +99,18 @@ class Settings:
         ).rstrip("/")
         self.ocr_model: str = os.environ.get("OCR_MODEL", "baidu/Unlimited-OCR")
 
-        # --- Reranker (lazy transformers import; needs torch → base image only) ---
-        self.rerank_enabled: bool = _bool("RERANK_ENABLED", True)
+        # --- Reranker ------------------------------------------------------
+        # Backward compatibility: RERANK_ENABLED=false still disables the
+        # feature when no backend is named. New profiles select an explicit
+        # backend so CPU/Mac deployments never load the in-process torch path.
+        _legacy_rerank_enabled = _bool("RERANK_ENABLED", True)
+        _rerank_backend_raw = os.environ.get("RERANK_BACKEND", "").strip().lower()
+        if not _rerank_backend_raw:
+            _rerank_backend_raw = "inprocess" if _legacy_rerank_enabled else "disabled"
+        self.rerank_backend: RerankerBackend = RerankerBackend.parse(_rerank_backend_raw)
+        if not _legacy_rerank_enabled:
+            self.rerank_backend = RerankerBackend.DISABLED
+        self.rerank_enabled: bool = self.rerank_backend is not RerankerBackend.DISABLED
         # §6: docker-compose sets RERANKER_MODEL=Qwen/Qwen3-Reranker-0.6B.
         # RERANK_MODEL is kept as a secondary fallback for local overrides.
         self.rerank_model: str = (
@@ -100,6 +118,9 @@ class Settings:
             or os.environ.get("RERANK_MODEL")
             or "Qwen/Qwen3-Reranker-0.6B"
         )
+        self.rerank_base_url: str = os.environ.get("RERANK_BASE_URL", "").rstrip("/")
+        self.rerank_api_key: str = os.environ.get("RERANK_API_KEY", "")
+        self.rerank_timeout: float = _float("RERANK_TIMEOUT", 60.0)
 
         # --- Data stores (defaults match §6/§7 and what the sync-worker writes) ---
         self.duckdb_path: str = os.environ.get("DUCKDB_PATH", "/data/warehouse.duckdb")
@@ -133,8 +154,42 @@ class Settings:
         # _bool, not a bespoke not-in list: the old parse treated "off" (and
         # any typo) as true, silently enabling live lookups.
         self.sf_live_enabled: bool = _bool("SF_LIVE_ENABLED", True)
-        self.model_max_context: int = _int("MODEL_MAX_CONTEXT", 262144)
-        self.model_max_output: int = _int("MODEL_MAX_OUTPUT", 8192)
+        # MAIN_MODEL_MAX_LEN is the new, explicit spelling and wins when set;
+        # MODEL_MAX_CONTEXT remains the historical name so existing .env files
+        # keep working. Both describe the SAME number and neither WIDENS the
+        # window — this is the app's honest view of what vLLM serves
+        # (`--max-model-len`), and lying to it produces 400s, not more context.
+        self.model_max_context: int = _int(
+            "MAIN_MODEL_MAX_LEN", _int("MODEL_MAX_CONTEXT", 262144)
+        )
+        self.model_max_output: int = _int(
+            "MAIN_MODEL_DEFAULT_MAX_OUTPUT_TOKENS", _int("MODEL_MAX_OUTPUT", 8192)
+        )
+        # High effort is allowed a bigger answer: a multi-step comparison with
+        # its assumptions stated does not fit in the default reservation, and
+        # truncating the conclusion is the worst place to run out.
+        self.model_high_max_output: int = _int("MAIN_MODEL_HIGH_MAX_OUTPUT_TOKENS", 16384)
+        # Serving parameters, mirrored here so /health can report what the app
+        # BELIEVES it is running against and a drift from the actual vLLM flags
+        # is visible instead of mysterious.
+        self.main_model_max_num_seqs: int = _int("MAIN_MODEL_MAX_NUM_SEQS", 0)
+        self.main_model_max_batched_tokens: int = _int("MAIN_MODEL_MAX_BATCHED_TOKENS", 8192)
+        self.main_model_kv_cache_dtype: str = os.environ.get(
+            "MAIN_MODEL_KV_CACHE_DTYPE", "fp8"
+        ).strip()
+        self.main_model_enable_prefix_caching: bool = _bool(
+            "MAIN_MODEL_ENABLE_PREFIX_CACHING", True
+        )
+        self.main_model_enable_chunked_prefill: bool = _bool(
+            "MAIN_MODEL_ENABLE_CHUNKED_PREFILL", True
+        )
+        # Whether the served model was launched with --enable-auto-tool-choice
+        # and a tool-call parser. The planner tries tool calling first and
+        # downgrades to guided JSON on a 400, so this is a hint that saves a
+        # failed round trip — never a correctness gate.
+        self.main_model_enable_auto_tool_choice: bool = _bool(
+            "MAIN_MODEL_ENABLE_AUTO_TOOL_CHOICE", True
+        )
         # Headroom left free in every request (chat-template drift, the
         # tokenizer's own overhead, sampling slack).
         self.context_safety_margin: int = _int("CONTEXT_SAFETY_MARGIN", 512)
@@ -247,6 +302,72 @@ class Settings:
         _mode = os.environ.get("CHART_TRIGGER_MODE", "explicit").strip().lower()
         self.chart_trigger_mode: str = _mode if _mode in CHART_TRIGGER_MODES else "explicit"
 
+        # Confirm the reading before answering a Salesforce question.
+        #   always    — every question gets a one-click confirmation (owner's
+        #               choice: a wrong reading is far cheaper to catch before
+        #               a number exists than after)
+        #   ambiguous — only when the question has more than one honest
+        #               reading, e.g. "failed the mock" in a slot, which
+        #               returned 7, 20 and 0 on three runs of one sentence
+        #   off       — answer straight away
+        _clar = os.environ.get("CLARIFY_MODE", "ambiguous").strip().lower()
+        self.clarify_mode: str = (
+            _clar if _clar in ("always", "ambiguous", "off") else "ambiguous"
+        )
+        self.clarify_before_answering: bool = self.clarify_mode != "off"
+
+        # --- Salesforce Intelligence Mode (2026-08-11) ----------------------
+        # The Salesforce pill stops being a retrieval filter and becomes a
+        # context-aware agent: it resolves "what about EMEA?" against this
+        # conversation, asks ONE targeted question when a missing detail would
+        # change the answer, and resumes the original request afterwards.
+        #
+        # Off → the previous behaviour, exactly: the deterministic detectors in
+        # core/clarify.py and the existing router → engine chain. Every flag
+        # here is a kill switch that leaves a working product behind it.
+        self.salesforce_intelligence_enabled: bool = _bool(
+            "SALESFORCE_INTELLIGENCE_MODE_ENABLED", True
+        )
+        self.salesforce_contextual_clarification_enabled: bool = _bool(
+            "SALESFORCE_CONTEXTUAL_CLARIFICATION_ENABLED", True
+        )
+        self.salesforce_starter_card_enabled: bool = _bool(
+            "SALESFORCE_STARTER_CARD_ENABLED", True
+        )
+        # Two rounds, then answer with the safest reading and SAY so. A third
+        # round has never once been the difference between a right and a wrong
+        # answer; it is just an interrogation.
+        self.salesforce_max_clarification_rounds: int = _int(
+            "SALESFORCE_MAX_CLARIFICATION_ROUNDS", 2
+        )
+        self.salesforce_allow_custom_clarification: bool = _bool(
+            "SALESFORCE_ALLOW_CUSTOM_CLARIFICATION", True
+        )
+        # Let a clarification card take SEVERAL answers (owner request
+        # 2026-08-11). Asked which object holds payment and invoice data,
+        # "Invoice__c" and "Payment__c" is the honest answer, and a radio group
+        # forced a choice between two things the user needed together.
+        # `EXCLUSIVE_SLOTS` in core/sf_intel/state.py still pins the slots where
+        # two answers make no sense. False restores single-answer cards unless
+        # the planner explicitly asks for multi.
+        self.salesforce_multi_select_clarification: bool = _bool(
+            "SALESFORCE_MULTI_SELECT_CLARIFICATION", True
+        )
+        # The planner prefers the served model's own tool parser over guided
+        # JSON when the runtime has one; see llm.chat_with_tools.
+        self.salesforce_planner_tool_calling: bool = _bool(
+            "SALESFORCE_PLANNER_TOOL_CALLING",
+            _bool("MAIN_MODEL_ENABLE_AUTO_TOOL_CHOICE", True),
+        )
+        # Headroom reserved on a FULL-WINDOW request, distinct from the
+        # per-call `context_safety_margin` above (which is the small slack every
+        # request already leaves for chat-template drift). At 262144 the
+        # documented budget is: 262144 − 16384 reserved output − 8192 margin
+        # = 237568 tokens of constructed input.
+        self.main_model_context_safety_margin: int = _int(
+            "MAIN_MODEL_CONTEXT_SAFETY_MARGIN", 8192
+        )
+
         # --- Row caps (§8) ---
         self.sql_preview_row_cap: int = _int("SQL_PREVIEW_ROW_CAP", PREVIEW_ROW_CAP)  # 500
         self.export_row_cap: int = _int("EXPORT_ROW_CAP", EXPORT_ROW_CAP)  # 100_000
@@ -306,6 +427,112 @@ class Settings:
         # §8 /health: per-dependency probe timeout — short so /health answers
         # quickly even when every vLLM service is down.
         self.health_probe_timeout: float = _float("HEALTH_PROBE_TIMEOUT", 2.0)
+
+        # --- Typed model/runtime capabilities ------------------------------
+        # These defaults reproduce the current DGX/vLLM deployment. Platform
+        # profiles may override every capability with <ROLE>_* environment
+        # variables without teaching the request layer about runtime names.
+        _qwen_chat = dict(
+            provider="local",
+            backend="vllm",
+            supports_chat=True,
+            supports_streaming=True,
+            supports_reasoning=True,
+            reasoning_field=ReasoningField.AUTO,
+            supports_tool_calling=True,
+            supports_vision=True,
+            supports_tokenization=True,
+            output_limit=self.model_max_output,
+            concurrency=1,
+            extra_body_arguments=("chat_template_kwargs",),
+        )
+        main_capabilities = capabilities_from_env(
+            ModelRole.MAIN,
+            self.llm_model,
+            CapabilityDefaults(context_length=self.model_max_context, **_qwen_chat),
+        )
+        router_capabilities = capabilities_from_env(
+            ModelRole.ROUTER,
+            self.router_model,
+            CapabilityDefaults(context_length=49_152, **_qwen_chat),
+        )
+        agent_capabilities = capabilities_from_env(
+            ModelRole.AGENT,
+            self.agent_model,
+            CapabilityDefaults(context_length=49_152, **_qwen_chat),
+        )
+        vision_capabilities = capabilities_from_env(
+            ModelRole.VISION,
+            self.vision_model,
+            CapabilityDefaults(context_length=self.model_max_context, **_qwen_chat),
+        )
+        embed_capabilities = capabilities_from_env(
+            ModelRole.EMBED,
+            self.embed_model,
+            CapabilityDefaults(
+                provider="local",
+                backend="vllm",
+                supports_embeddings=True,
+                supports_tokenization=True,
+                context_length=4096,
+                concurrency=1,
+            ),
+        )
+        ocr_capabilities = capabilities_from_env(
+            ModelRole.OCR,
+            self.ocr_model,
+            CapabilityDefaults(
+                provider="local",
+                backend="vllm",
+                enabled=self.ocr_enabled,
+                supports_chat=True,
+                supports_vision=True,
+                supports_ocr=True,
+                supports_tokenization=True,
+                context_length=8192,
+                output_limit=6000,
+                concurrency=3,
+            ),
+            enabled_override=self.ocr_enabled,
+        )
+        reranker_capabilities = capabilities_from_env(
+            ModelRole.RERANKER,
+            self.rerank_model,
+            CapabilityDefaults(
+                provider=(
+                    "transformers"
+                    if self.rerank_backend is RerankerBackend.INPROCESS
+                    else "local"
+                ),
+                backend=self.rerank_backend.value,
+                enabled=self.rerank_enabled,
+                supports_reranking=self.rerank_enabled,
+                supports_tokenization=self.rerank_enabled,
+                context_length=8192,
+                concurrency=1,
+            ),
+            enabled_override=self.rerank_enabled,
+            backend_override=self.rerank_backend.value,
+        )
+        self.model_capabilities = ModelCapabilityRegistry(
+            main=main_capabilities,
+            router=router_capabilities,
+            agent=agent_capabilities,
+            vision=vision_capabilities,
+            embed=embed_capabilities,
+            ocr=ocr_capabilities,
+            reranker=reranker_capabilities,
+        )
+        self.capabilities = self.model_capabilities
+        # Named aliases keep call sites readable and are convenient to
+        # monkeypatch in focused tests.
+        self.main_capabilities = main_capabilities
+        self.router_capabilities = router_capabilities
+        self.agent_capabilities = agent_capabilities
+        self.vision_capabilities = vision_capabilities
+        self.embed_capabilities = embed_capabilities
+        self.ocr_capabilities = ocr_capabilities
+        self.reranker_capabilities = reranker_capabilities
 
 
 settings = Settings()

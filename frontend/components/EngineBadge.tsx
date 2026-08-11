@@ -15,6 +15,10 @@ const ENGINE_LABEL: Record<Engine, string> = {
   search: 'Web',
   url: 'Page',
   repo: 'Repo',
+  // The orchestrator has always emitted route "clarify" for a question asked
+  // back; it was simply absent from the Engine union, so this map had no entry
+  // and the badge fell through to the neutral Chat style.
+  clarify: 'Question',
 };
 
 const ENGINE_STYLE: Record<Engine, { color: string; ink: string }> = {
@@ -44,6 +48,10 @@ const ENGINE_STYLE: Record<Engine, { color: string; ink: string }> = {
   agent: {
     color: 'var(--ts-engine-agent)',
     ink: 'var(--ts-engine-agent-ink)',
+  },
+  clarify: {
+    color: 'var(--ts-engine-chat)',
+    ink: 'var(--ts-engine-chat-ink)',
   },
 };
 

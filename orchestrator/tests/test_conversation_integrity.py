@@ -517,7 +517,7 @@ def test_startup_applies_the_migration_before_serving(monkeypatch):
     assert gone["t"] is None
 
     with TestClient(app):  # entering the client runs the lifespan
-        assert _db.schema_version() == 3
+        assert _db.schema_version() == _db.LATEST_SCHEMA_VERSION
         with _db.connection() as con:
             idx = con.execute(
                 "SELECT indexname FROM pg_indexes WHERE tablename = 'messages'"

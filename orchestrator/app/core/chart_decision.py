@@ -41,6 +41,12 @@ LEGACY_CHART_RE = re.compile(
     r"\b(chart|graph|plot|visuali[sz]e|visuali[sz]ation)\b", re.I
 )
 
+#: Words that name a VISUAL VIEW rather than the word "chart". Asking for a
+#: dashboard and being handed a table of numbers is the complaint this fixes.
+_VISUAL_VIEW_RE = re.compile(
+    r"\b(dashboards?|graphical\s+view|visual\s+view|graph\s+view)\b", re.I
+)
+
 #: Natural phrasings that mean "draw this" without using the word "chart".
 _NATURAL_RE = re.compile(
     r"\b(show|showing|display|draw|render|represent|give me|make|create|turn)\b"
@@ -119,6 +125,10 @@ def explicit_chart_request(message: str) -> bool:
     """
     text = _strip_false_positives(message)
     if LEGACY_CHART_RE.search(text):
+        return True
+    # "Dashboard" is a request for a visual view — it was answered with a
+    # table of numbers because the word is not "chart".
+    if _VISUAL_VIEW_RE.search(text):
         return True
     if _NAMED_CHART_RE.search(text) or _BARE_NAMED_RE.search(text):
         return True

@@ -13,6 +13,8 @@
  * and emits complete events only.
  */
 
+import { parsePhaseStatus } from './phases';
+
 export interface SSEEvent {
   /** Event type; defaults to "message" when the `event:` field is absent. */
   event: string;
@@ -105,7 +107,17 @@ export class SSEParser {
 export type ChatStreamEvent =
   | { kind: 'token'; text: string }
   | { kind: 'reasoning'; text: string }
-  | { kind: 'status'; text: string }
+  | {
+      kind: 'status';
+      text: string;
+      /**
+       * Salesforce Intelligence Mode adds a typed phase to the SAME `status`
+       * event rather than introducing a new event name — so replay,
+       * persistence and the backend allowlist are untouched, and a client that
+       * only knows `text` keeps working unchanged.
+       */
+      phase?: import('./phases').PhaseStatus;
+    }
   | { kind: 'step'; step: import('./types').AgentStep }
   | {
       kind: 'research';
@@ -127,12 +139,17 @@ export function toChatStreamEvent(ev: SSEEvent): ChatStreamEvent | null {
   try {
     switch (ev.event) {
       case 'token':
-      case 'reasoning':
-      case 'status': {
+      case 'reasoning': {
         const parsed = JSON.parse(ev.data) as { text?: unknown };
         return typeof parsed.text === 'string'
           ? { kind: ev.event, text: parsed.text }
           : null;
+      }
+      case 'status': {
+        const parsed = JSON.parse(ev.data) as { text?: unknown };
+        if (typeof parsed.text !== 'string') return null;
+        const phase = parsePhaseStatus(parsed);
+        return { kind: 'status', text: parsed.text, ...(phase ? { phase } : {}) };
       }
       case 'step': {
         const parsed = JSON.parse(ev.data) as {
@@ -250,9 +267,14 @@ export function foldStreamState(
     reasoningSeconds?: number;
     steps?: import('./types').AgentStep[];
     research?: import('./types').Research;
+    phaseStatus?: import('./phases').PhaseStatus;
   },
 ): import('./types').Meta {
   const out = { ...meta };
+  // The last phase the backend reported, kept so a reopened chat can show how
+  // the answer was reached. The server's own final `meta.status` wins — it
+  // knows whether the run completed or failed; the client only saw the labels.
+  if (live.phaseStatus && !out.status) out.status = live.phaseStatus;
   // Research is measured entirely client-side (the server streams the
   // searches; the clock runs here), so it is carried onto the persisted meta
   // the same way reasoning is — otherwise reopening the chat loses the panel.

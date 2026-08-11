@@ -25,6 +25,7 @@ const config: Config = {
         ink: 'var(--ts-text)',
         muted: 'var(--ts-text-muted)',
         faint: 'var(--ts-text-faint)',
+        icon: 'var(--ts-text-icon)',
         // rgb()+<alpha-value> so `accent/NN` opacity modifiers actually
         // compile — as a bare var() Tailwind silently dropped them all.
         accent: 'rgb(var(--ts-accent-rgb) / <alpha-value>)',

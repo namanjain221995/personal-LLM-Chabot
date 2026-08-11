@@ -33,6 +33,12 @@
   --ts-text: #ffffff;
   --ts-text-muted: #b3b3b3;
   --ts-text-faint: #8a8a8a;
+  /* Resting colour for ACTION ICONS (message row copy/thumbs/regenerate).
+     Deliberately brighter than --ts-text-muted: an icon is a 1.5px stroke,
+     not a block of text, so at the same hex it reads dimmer than the prose
+     beside it. #cfcfcf is 13.1:1 on #000 and still clearly recedes from the
+     #ffffff it turns on hover. */
+  --ts-text-icon: #cfcfcf;
   --ts-accent: #19bcb5; /* Signal Teal, lifted for AA on dark */
   /* Raw RGB channels of --ts-accent, for Tailwind's <alpha-value> slot: with
      `accent: 'var(--ts-accent)'` every `accent/NN` opacity modifier compiled
@@ -109,6 +115,9 @@ html.light {
   --ts-text: #0d0d0d;
   --ts-text-muted: #5d5d5d;
   --ts-text-faint: #8f8f8f;
+  /* Light mode inverts the reasoning: a thin dark stroke on paper needs to be
+     DARKER than muted text to carry the same weight, not lighter. */
+  --ts-text-icon: #444444;
   --ts-accent: #0b7c77; /* Signal Teal, deepened for AA on paper */
   --ts-accent-rgb: 11 124 119; /* channels of --ts-accent — keep in sync */
   --ts-accent-strong: #0e9f9a;
@@ -201,6 +210,12 @@ a {
   animation: ts-caret-blink 0.9s steps(1) infinite;
 }
 
+/* NOTE (2026-08-11): `.shimmer-line`, `.thinking-shimmer` and `.ts-spinner`
+   are no longer used by any component — every "something is happening" state
+   now renders <Loader>. They are kept because they are generic utilities the
+   next feature may reach for, and because deleting them would silently change
+   any markup that still carries the class. If nothing claims them, they can
+   go. */
 @keyframes ts-shimmer-slide {
   from {
     background-position: -320px 0;
@@ -492,6 +507,68 @@ a {
   color: var(--ts-text-muted);
 }
 
+/* ------------------------------------------- TechSara Reasoning Star (SVG)
+
+   A radial starburst of 12 rays that rotates while the backend is working.
+   Original artwork: plain SVG paths plus two keyframes, no animation library
+   and no imported asset.
+
+   Only `transform` and `opacity` are animated — both are composited, so the
+   whole thing runs off the main thread and cannot cause a layout pass no
+   matter how long an answer takes.
+
+   The rotation lives on the GROUP and the pulse on the individual rays, so a
+   ray's own stagger is independent of where the star currently points; that is
+   what makes it read as light moving through the shape rather than as a
+   spinning object.                                                            */
+
+@keyframes ts-star-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Opacity ONLY — deliberately no transform in these keyframes.
+   Each ray's angle used to be an inline `transform: rotate()`, and a running
+   animation's transform WINS over an inline one: all twelve rays collapsed onto
+   angle 0 and stacked, so the star rendered as a single spinning sliver. The
+   angle now lives on a wrapping <g> as an SVG transform ATTRIBUTE, which CSS
+   cannot touch, and the pulse is pure opacity — a conflict that cannot recur. */
+@keyframes ts-star-pulse {
+  0%,
+  100% {
+    opacity: 0.15;
+  }
+  40% {
+    opacity: 1;
+  }
+}
+
+.reasoning-star {
+  /* currentColor throughout, so a caller recolors the whole star by setting
+     `text-*` on the wrapper and both themes work with no second palette. */
+  color: inherit;
+}
+
+.reasoning-star__rays {
+  transform-origin: 50% 50%;
+  animation: ts-star-spin var(--ts-star-duration, 2.4s) linear infinite;
+}
+
+.reasoning-star__ray {
+  animation: ts-star-pulse var(--ts-star-pulse, 1.2s) ease-in-out infinite;
+  animation-delay: var(--ts-star-delay, 0s);
+  fill: currentColor;
+}
+
+/* Entrance/exit: the star appearing mid-answer must not snap into place. */
+.reasoning-star--enter {
+  animation: ts-fade-in 160ms ease-out;
+}
+
 /* --------------------------------------------------------- reduced motion */
 
 @media (prefers-reduced-motion: reduce) {
@@ -521,6 +598,25 @@ a {
   .ts-spinner {
     animation: none;
     border-top-color: var(--ts-text-faint);
+  }
+
+  /* The star stops rotating entirely. The rays keep a single slow opacity
+     breath so the indicator still reads as "working" rather than as a static
+     icon that might be a stuck UI — a low-motion cue, not no cue.
+     `!important` is required: the blanket rule above clamps every animation
+     to 0.01ms, which would otherwise freeze this one too. */
+  .reasoning-star__rays {
+    animation: none;
+  }
+
+  .reasoning-star__ray {
+    animation: ts-star-pulse 2.4s ease-in-out infinite !important;
+    animation-duration: 2.4s !important;
+    animation-iteration-count: infinite !important;
+  }
+
+  .reasoning-star--enter {
+    animation: none;
   }
 }
 

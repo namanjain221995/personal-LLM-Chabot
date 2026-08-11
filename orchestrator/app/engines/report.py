@@ -215,10 +215,16 @@ async def run_report_engine(message: str, history: Sequence[dict], emit: Emit) -
     # Planning is the ONE call allowed the large 65536 context (§8). The
     # OpenAI-compatible vLLM server manages context server-side
     # (--max-model-len); the cap is communicated via generation length here.
+    # A report the team already reads every week should not be re-invented on
+    # each request. Where the org has a canonical section list, plan that one.
+    from ..core import org_brief
+
+    template = org_brief.report_template_for(message)
+    plan_user = f"{template}\n\n{message}" if template else message
     plan_raw = await llm.chat_completion(
         [
             {"role": "system", "content": _PLAN_SYSTEM},
-            {"role": "user", "content": message},
+            {"role": "user", "content": plan_user},
         ],
         temperature=0.2,
         max_tokens=5000,

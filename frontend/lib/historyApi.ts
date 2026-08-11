@@ -101,7 +101,17 @@ export interface HistoryApi {
   create(id: string | undefined, title: string): Promise<void>;
   update(id: string, patch: ConversationPatch): Promise<void>;
   remove(id: string): Promise<void>;
-  appendMessage(id: string, message: ServerMessage): Promise<void>;
+  /**
+   * Append one message. Returns the row the server created, whose `id` is the
+   * only way the client learns a message's server identity for the messages it
+   * sends: `loadConversation` short-circuits to the cache whenever it is
+   * already in sync, so a conversation you are actively chatting in is never
+   * re-fetched and would otherwise never gain ids at all.
+   */
+  appendMessage(
+    id: string,
+    message: ServerMessage,
+  ): Promise<{ id?: number } | void>;
   /**
    * Thumbs up/down on one stored message, or null to clear it.
    *
@@ -115,6 +125,15 @@ export interface HistoryApi {
     messageId: number,
     feedback: 'up' | 'down' | null,
   ): Promise<void>;
+  /**
+   * Ask the server to name a conversation from its first exchange.
+   *
+   * The server reads the exchange from the DATABASE, so there is nothing to
+   * send and nothing for a caller to forge. `generated: false` means the
+   * title was left alone — already named, renamed by the user, nothing worth
+   * naming, or the model was unavailable. None of those are errors.
+   */
+  generateTitle(id: string): Promise<{ title: string; generated: boolean }>;
   /**
    * Replace the whole thread atomically. The server REFUSES (409) when the
    * incoming thread is shorter than what it stores — the guard that stops a
@@ -196,7 +215,17 @@ export function createHistoryApi(fetchFn?: FetchLike): HistoryApi {
       await request('DELETE', `/${encodeURIComponent(id)}`);
     },
     async appendMessage(id, message) {
-      await request('POST', `/${encodeURIComponent(id)}/messages`, message);
+      return (await request(
+        'POST',
+        `/${encodeURIComponent(id)}/messages`,
+        message,
+      )) as { id?: number } | undefined;
+    },
+    async generateTitle(id) {
+      return (await request(
+        'POST',
+        `/${encodeURIComponent(id)}/title`,
+      )) as { title: string; generated: boolean };
     },
     async setFeedback(id, messageId, feedback) {
       await request(

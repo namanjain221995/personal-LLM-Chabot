@@ -1,6 +1,8 @@
 # Salesforce sync worker — TechSara Local AI Analysis Platform (§7).
-# Base image is multi-arch; python:3.11-slim resolves to arm64 on the DGX Spark.
-FROM python:3.11-slim
+# Base image is multi-arch (amd64/arm64); the digest is the same python:3.11-slim
+# index the orchestrator's CPU image pins, so both application containers are
+# reproducible from one immutable base rather than a moving tag.
+FROM python:3.11-slim@sha256:90744cff8f32887f075c47d747a173ff333e9e98801667af93c357fa9f5e28ff
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \

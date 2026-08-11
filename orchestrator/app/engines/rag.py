@@ -1,24 +1,29 @@
 """RAG engine (spec §8, vLLM design).
 
 Embed the query via the vLLM embeddings endpoint (OpenAI-compatible) →
-LanceDB top-30 → LAZY Qwen3-Reranker-0.6B down
-to top-8 (skipped entirely when RERANK_ENABLED=false) → answer with
+LanceDB top-30 → in-process or remote Qwen3 reranker down
+to top-8 (or vector order when disabled/unavailable) → answer with
 gpt-oss-120b citing record IDs → meta.citations =
 [{record_id, object, url: https://techsara.lightning.force.com/<record_id>}].
 
-transformers/torch and lancedb are imported ONLY inside functions, so the app
-and the offline test suite never load them.
+transformers/torch and lancedb are imported ONLY inside functions; remote and
+disabled reranking never import the in-process model framework.
 """
 from __future__ import annotations
 
 import asyncio
+import math
 import re
 from typing import Awaitable, Callable, List, Optional, Sequence
+
+import httpx
 
 from . import DIAGRAM_INSTRUCTION, NO_DATA_MESSAGE, recent_turns
 from .. import llm
 from ..config import settings
 from ..core.citations import build_citations
+from ..embedding_index import open_compatible_table, validate_query_dimension
+from ..model_capabilities import RerankerBackend
 
 Emit = Callable[[str, dict], Awaitable[None]]
 
@@ -35,13 +40,19 @@ _INSTRUCT = "Given a question about Salesforce data, judge whether the record he
 
 async def retrieve(query: str, top_k: Optional[int] = None) -> List[dict]:
     """Embed via EMBED_BASE_URL and search LanceDB. Returns hit dicts (top-30)."""
-    vectors = await llm.embed_texts([query])
-    if not vectors:
-        return []
     import lancedb  # lazy
 
     db = lancedb.connect(settings.lancedb_dir)
-    table = db.open_table(settings.lancedb_table)
+    table, metadata = open_compatible_table(
+        db,
+        settings.lancedb_dir,
+        settings.lancedb_table,
+        settings.embed_model,
+    )
+    vectors = await llm.embed_texts([query])
+    if not vectors:
+        return []
+    validate_query_dimension(metadata, vectors[0], settings.lancedb_dir)
     return (
         table.search(vectors[0])
         .limit(top_k or settings.rag_top_k)
@@ -88,16 +99,99 @@ def _rerank(query: str, hits: List[dict], top_n: int) -> List[dict]:
     return [hits[i] for i in order[:top_n]]
 
 
+def reranker_score_url(base_url: str) -> str:
+    """Return the vLLM-compatible root ``/score`` endpoint."""
+    root = base_url.rstrip("/")
+    if root.endswith("/v1"):
+        root = root[: -len("/v1")]
+    return f"{root}/score"
+
+
+def _rank_remote_response(hits: List[dict], payload: object, top_n: int) -> List[dict]:
+    """Validate a remote score response and apply it without losing hit order.
+
+    vLLM returns ``data: [{index, score}, ...]``.  Complete, unique indices are
+    required so a malformed response can never associate one record's score
+    with another record. Python's stable sort preserves vector order for ties.
+    """
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+        raise ValueError("reranker /score response has no data list")
+    data = payload["data"]
+    if len(data) != len(hits):
+        raise ValueError("reranker /score returned the wrong number of scores")
+
+    scores: dict[int, float] = {}
+    for item in data:
+        if not isinstance(item, dict):
+            raise ValueError("reranker /score data item is not an object")
+        try:
+            index = int(item["index"])
+            score = float(item["score"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("reranker /score item needs numeric index and score") from exc
+        if index < 0 or index >= len(hits) or index in scores or not math.isfinite(score):
+            raise ValueError("reranker /score returned invalid indices or scores")
+        scores[index] = score
+
+    if set(scores) != set(range(len(hits))):
+        raise ValueError("reranker /score response indices are incomplete")
+    order = sorted(range(len(hits)), key=lambda index: scores[index], reverse=True)
+    return [hits[index] for index in order[:top_n]]
+
+
+async def _remote_rerank(query: str, hits: List[dict], top_n: int) -> List[dict]:
+    """Score all query/document pairs through a remote vLLM ``/score`` API."""
+    if not settings.rerank_base_url:
+        raise ValueError("RERANK_BASE_URL is required for the remote reranker")
+    if (
+        settings.reranker_capabilities.requires_authentication
+        and not settings.rerank_api_key
+    ):
+        raise ValueError("RERANK_API_KEY is required by the configured reranker")
+    headers = {}
+    if settings.rerank_api_key:
+        headers["Authorization"] = f"Bearer {settings.rerank_api_key}"
+    body = {
+        "model": settings.rerank_model,
+        # vLLM supports the 1→N form and returns one indexed score per document.
+        "text_1": query,
+        "text_2": [str(hit.get("text", ""))[:4000] for hit in hits],
+    }
+    async with httpx.AsyncClient(timeout=settings.rerank_timeout) as client:
+        response = await client.post(
+            reranker_score_url(settings.rerank_base_url),
+            json=body,
+            headers=headers,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    return _rank_remote_response(hits, payload, top_n)
+
+
 async def select_context(query: str) -> List[dict]:
     """top-30 retrieve → rerank to top-8 (or plain cut when disabled/failed)."""
     hits = await retrieve(query, settings.rag_top_k)
     if not hits:
         return []
-    if settings.rerank_enabled:
+    try:
+        backend = RerankerBackend.parse(settings.rerank_backend)
+    except ValueError:
+        # Settings validates this at startup; retain the historical safe
+        # retrieval fallback if a test/runtime mutates it later.
+        backend = RerankerBackend.DISABLED
+    capabilities = settings.reranker_capabilities
+    if (
+        settings.rerank_enabled
+        and capabilities.enabled
+        and capabilities.supports_reranking
+        and backend is not RerankerBackend.DISABLED
+    ):
         try:
+            if backend is RerankerBackend.REMOTE:
+                return await _remote_rerank(query, hits, settings.rag_final_k)
             return await asyncio.to_thread(_rerank, query, hits, settings.rag_final_k)
         except Exception:
-            # Reranker unavailable (e.g. fallback base image) → vector order.
+            # Reranker unavailable/malformed → preserve vector-search order.
             return hits[: settings.rag_final_k]
     return hits[: settings.rag_final_k]
 

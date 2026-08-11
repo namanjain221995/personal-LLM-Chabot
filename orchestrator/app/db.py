@@ -59,7 +59,7 @@ import json
 import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Iterator, List, Optional, TypeVar
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, TypeVar
 
 import psycopg
 from psycopg.rows import dict_row
@@ -305,6 +305,96 @@ CREATE INDEX IF NOT EXISTS idx_messages_feedback
     ON messages (conversation_id, id) WHERE feedback IS NOT NULL;
 """
 
+_MIGRATION_V4 = """
+-- Where a conversation's title came from (2026-08-11, AI titles).
+--   'auto'      — derived from the first message; may be replaced by the model
+--   'generated' — the model named it; do not regenerate
+--   'user'      — the owner renamed it; NEVER touch it again
+--
+-- This column IS the rename guard. Without it, auto-titling is a
+-- read-then-write race: a rename landing between the read and the write would
+-- be silently reverted, and the user would watch their own title change back.
+-- With it the guarded UPDATE is one atomic statement and the rename wins
+-- deterministically, no lock required.
+--
+-- Existing rows default to 'auto', which is honest — every title in the
+-- database today came from `titleFromFirstMessage` — and leaves them eligible
+-- for the backfill script.
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS title_source text NOT NULL DEFAULT 'auto';
+
+ALTER TABLE conversations DROP CONSTRAINT IF EXISTS conversations_title_source_check;
+ALTER TABLE conversations ADD CONSTRAINT conversations_title_source_check
+    CHECK (title_source IN ('auto', 'generated', 'user'));
+"""
+
+_MIGRATION_V5 = """
+-- Salesforce Intelligence Mode (2026-08-11): the pending request being
+-- resolved, the one question we are asking about it, and what this
+-- conversation has established about Salesforce so far.
+--
+-- WHY IN THE DATABASE AND NOT IN MEMORY: a clarification card has to survive a
+-- browser reload, a second tab, a reconnect, and an orchestrator restart. The
+-- detached-generation buffer (LiveGeneration in main.py) is per-process and
+-- dies with the answer it was streaming, so it cannot hold a question that is
+-- waiting on a human.
+--
+-- `conversation_id` is a plain column with NO foreign key, exactly like
+-- `uploads`/`documents`/`repos` above: POST /chat supports a bare API call with
+-- no `conversations` row at all, and a foreign key would turn "this chat asked a
+-- clarifying question" into a failed request for those callers.
+-- `delete_conversation` clears these three tables explicitly, in the same
+-- transaction, so nothing is orphaned.
+
+CREATE TABLE IF NOT EXISTS sf_intents (
+    intent_id       text        PRIMARY KEY,
+    conversation_id text        NOT NULL,
+    status          text        NOT NULL,
+    -- The whole PendingIntent, validated by pydantic on the way in and out.
+    -- One jsonb column rather than a dozen typed ones: the shape belongs to
+    -- app/core/sf_intel/models.py, and mirroring it in DDL would mean a
+    -- migration every time a slot is added.
+    payload         jsonb       NOT NULL,
+    created_at      timestamptz NOT NULL,
+    updated_at      timestamptz NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sf_intents_conversation
+    ON sf_intents (conversation_id, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS sf_clarifications (
+    clarification_id text        PRIMARY KEY,
+    conversation_id  text        NOT NULL,
+    intent_id        text        NOT NULL,
+    -- pending | answered | skipped | cancelled
+    state            text        NOT NULL,
+    -- Server-generated opaque value the client must present to resume. Stored,
+    -- not derived, so rotating it is a single UPDATE and a stale card in an old
+    -- tab cannot resume an intent that has since been replaced.
+    resume_token     text        NOT NULL,
+    question_fingerprint text    NOT NULL,
+    payload          jsonb       NOT NULL,
+    response         jsonb,
+    -- The client's idempotency key for the click that answered this. A second
+    -- submission (a double-click, a retried fetch) finds the row already
+    -- resolved and gets the FIRST answer back instead of starting a second run.
+    client_message_id text,
+    created_at       timestamptz NOT NULL,
+    resolved_at      timestamptz
+);
+-- At most ONE pending clarification per conversation, enforced in the DATABASE.
+-- Two sends racing (the composer and a stale tab) would otherwise both insert,
+-- and the user would see two cards for one request.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sf_clarifications_one_pending
+    ON sf_clarifications (conversation_id) WHERE state = 'pending';
+CREATE INDEX IF NOT EXISTS idx_sf_clarifications_intent
+    ON sf_clarifications (intent_id, created_at);
+
+CREATE TABLE IF NOT EXISTS sf_conversation_state (
+    conversation_id text        PRIMARY KEY,
+    payload         jsonb       NOT NULL,
+    updated_at      timestamptz NOT NULL
+);
+"""
+
 #: (version, DDL). Append only; never edit a version that has shipped.
 #:
 #: NOTE on `uploads`, `url_documents`, `documents`, `repos` and `repo_chunks`:
@@ -315,7 +405,19 @@ CREATE INDEX IF NOT EXISTS idx_messages_feedback
 #: failed answer for those callers. DATA-03 — the permanent orphaning of that
 #: content when a conversation is deleted — is fixed in `delete_conversation`,
 #: which now removes the side rows explicitly in the same transaction.
-_MIGRATIONS: tuple = ((1, _MIGRATION_V1), (2, _MIGRATION_V2), (3, _MIGRATION_V3))
+_MIGRATIONS: tuple = (
+    (1, _MIGRATION_V1),
+    (2, _MIGRATION_V2),
+    (3, _MIGRATION_V3),
+    (4, _MIGRATION_V4),
+    (5, _MIGRATION_V5),
+)
+
+#: The version `init_schema` brings a database up to. Exported so callers (and
+#: tests) can assert "fully migrated" without hardcoding a number that has to be
+#: edited every time a migration is appended — which is exactly how a schema
+#: assertion stops being a check and becomes a chore.
+LATEST_SCHEMA_VERSION: int = max(version for version, _ddl in _MIGRATIONS)
 
 _MIGRATION_TABLE = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -755,7 +857,9 @@ def update_conversation(
     assignments: List[str] = []
     values: List[object] = []
     if title is not None:
-        assignments += ["title = %s", "updated_at = %s"]
+        # A rename is an act of ownership: mark the title 'user' so the
+        # auto-titler can never overwrite it, on this device or any other.
+        assignments += ["title = %s", "title_source = 'user'", "updated_at = %s"]
         values += [_text(title), _now()]
     if pinned is not None:
         assignments.append("pinned = %s")
@@ -780,7 +884,57 @@ def update_conversation(
 
 #: Conversation-keyed tables with no foreign key (see the note on _MIGRATIONS).
 #: Deleting a conversation has to clear these by hand.
-_SIDE_TABLES = ("uploads", "url_documents", "documents", "repos", "repo_chunks")
+_SIDE_TABLES = (
+    "uploads",
+    "url_documents",
+    "documents",
+    "repos",
+    "repo_chunks",
+    # Salesforce Intelligence Mode. A deleted conversation must not leave a
+    # pending clarification behind: the unique partial index below allows one
+    # per conversation, so an orphan would block the id from ever being reused.
+    "sf_clarifications",
+    "sf_intents",
+    "sf_conversation_state",
+)
+
+
+def set_generated_title(user_id: int, conversation_id: str, title: str) -> Optional[dict]:
+    """Write an AI-generated title, but ONLY over an auto-derived one.
+
+    `title_source = 'auto'` in the WHERE clause is the entire rename guard, and
+    it is inside the statement rather than around it on purpose: a
+    check-then-write leaves a window where a rename lands between the two and
+    is silently reverted — the user watching their own title flip back. Here a
+    rename simply makes this UPDATE match zero rows.
+
+    Returns the updated row, or None when the title is already 'user' or
+    'generated', the conversation is missing, or it belongs to someone else.
+    Callers treat None as "leave it alone", never as an error.
+    """
+    with connection() as con:
+        row = con.execute(
+            "UPDATE conversations SET title = %s, title_source = 'generated' "
+            " WHERE id = %s AND user_id = %s AND title_source = 'auto' "
+            "RETURNING id, title, title_source",
+            (_text(title), conversation_id, user_id),
+        ).fetchone()
+    return _row(row) if row else None
+
+
+def conversation_title_state(user_id: int, conversation_id: str) -> Optional[dict]:
+    """{title, title_source} for one conversation, or None when not theirs.
+
+    Lets a caller skip the model for a conversation that is already named —
+    the cheapest LLM call is the one never made.
+    """
+    with connection() as con:
+        row = con.execute(
+            "SELECT title, title_source FROM conversations "
+            "WHERE id = %s AND user_id = %s",
+            (conversation_id, user_id),
+        ).fetchone()
+    return _row(row) if row else None
 
 
 def delete_conversation(user_id: int, conversation_id: str) -> bool:
@@ -1726,3 +1880,218 @@ def search_conversations(
             }
         )
     return out
+
+
+# ---------------------------------------------------------------------------
+# Salesforce Intelligence Mode (migration 5)
+#
+# Three tables, one job: make a clarifying question survive everything that can
+# happen between asking it and getting an answer — a reload, a second tab, a
+# reconnect, an orchestrator restart. Payloads are stored whole as jsonb and
+# validated by pydantic at the edges (app/core/sf_intel/state.py); this layer
+# only moves rows and enforces the two invariants that MUST be atomic:
+# one pending clarification per conversation, and first-response-wins.
+# ---------------------------------------------------------------------------
+
+
+def save_sf_intent(
+    intent_id: str, conversation_id: str, status: str, payload: dict
+) -> None:
+    """Insert or update one pending intent."""
+    now = _now()
+    with connection() as con:
+        con.execute(
+            "INSERT INTO sf_intents "
+            "(intent_id, conversation_id, status, payload, created_at, updated_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s) "
+            "ON CONFLICT (intent_id) DO UPDATE SET "
+            "  status = EXCLUDED.status, payload = EXCLUDED.payload, "
+            "  updated_at = EXCLUDED.updated_at",
+            (intent_id, conversation_id, status, _json_param(payload), now, now),
+        )
+
+
+def get_sf_intent(intent_id: str) -> Optional[dict]:
+    with connection() as con:
+        row = con.execute(
+            "SELECT intent_id, conversation_id, status, payload FROM sf_intents "
+            "WHERE intent_id = %s",
+            (intent_id,),
+        ).fetchone()
+    return _row(row) if row else None
+
+
+def latest_open_sf_intent(conversation_id: str) -> Optional[dict]:
+    """The most recent intent for this conversation that is not finished."""
+    with connection() as con:
+        row = con.execute(
+            "SELECT intent_id, conversation_id, status, payload FROM sf_intents "
+            "WHERE conversation_id = %s AND status IN ('open', 'awaiting_clarification') "
+            "ORDER BY updated_at DESC LIMIT 1",
+            (conversation_id,),
+        ).fetchone()
+    return _row(row) if row else None
+
+
+def close_sf_intents(conversation_id: str, status: str = "cancelled") -> int:
+    """Finish every open intent for a conversation. Returns how many."""
+    with connection() as con:
+        cur = con.execute(
+            "UPDATE sf_intents SET status = %s, updated_at = %s "
+            "WHERE conversation_id = %s AND status IN ('open', 'awaiting_clarification')",
+            (status, _now(), conversation_id),
+        )
+        return cur.rowcount
+
+
+def create_sf_clarification(
+    *,
+    clarification_id: str,
+    conversation_id: str,
+    intent_id: str,
+    resume_token: str,
+    question_fingerprint: str,
+    payload: dict,
+) -> bool:
+    """Persist a pending clarification. False when one is already pending.
+
+    The conflict target is the PARTIAL unique index, so this is the database
+    enforcing "one open question per conversation" rather than a read-then-write
+    that two racing sends both win.
+    """
+    with connection() as con:
+        cur = con.execute(
+            "INSERT INTO sf_clarifications "
+            "(clarification_id, conversation_id, intent_id, state, resume_token, "
+            " question_fingerprint, payload, created_at) "
+            "VALUES (%s, %s, %s, 'pending', %s, %s, %s, %s) "
+            "ON CONFLICT (conversation_id) WHERE state = 'pending' DO NOTHING",
+            (
+                clarification_id,
+                conversation_id,
+                intent_id,
+                resume_token,
+                question_fingerprint,
+                _json_param(payload),
+                _now(),
+            ),
+        )
+        return cur.rowcount == 1
+
+
+def _clarification_dict(row: Dict[str, Any]) -> dict:
+    out = _row(row) or {}
+    return {
+        "clarification_id": out.get("clarification_id"),
+        "conversation_id": out.get("conversation_id"),
+        "intent_id": out.get("intent_id"),
+        "state": out.get("state"),
+        "resume_token": out.get("resume_token"),
+        "question_fingerprint": out.get("question_fingerprint"),
+        "payload": out.get("payload") or {},
+        "response": out.get("response"),
+        "client_message_id": out.get("client_message_id"),
+        "created_at": _iso(out.get("created_at")),
+        "resolved_at": _iso(out.get("resolved_at")),
+    }
+
+
+_CLARIFICATION_COLUMNS = (
+    "clarification_id, conversation_id, intent_id, state, resume_token, "
+    "question_fingerprint, payload, response, client_message_id, created_at, resolved_at"
+)
+
+
+def get_sf_clarification(clarification_id: str) -> Optional[dict]:
+    with connection() as con:
+        row = con.execute(
+            f"SELECT {_CLARIFICATION_COLUMNS} FROM sf_clarifications "
+            "WHERE clarification_id = %s",
+            (clarification_id,),
+        ).fetchone()
+    return _clarification_dict(row) if row else None
+
+
+def pending_sf_clarification(conversation_id: str) -> Optional[dict]:
+    """The open question for this conversation, or None."""
+    with connection() as con:
+        row = con.execute(
+            f"SELECT {_CLARIFICATION_COLUMNS} FROM sf_clarifications "
+            "WHERE conversation_id = %s AND state = 'pending' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (conversation_id,),
+        ).fetchone()
+    return _clarification_dict(row) if row else None
+
+
+def resolve_sf_clarification(
+    clarification_id: str,
+    *,
+    state: str,
+    response: dict,
+    client_message_id: Optional[str] = None,
+) -> Tuple[Optional[dict], bool]:
+    """Answer a pending clarification. → (row, was_already_resolved).
+
+    ONE statement decides the race. `WHERE state = 'pending'` inside the UPDATE
+    is what makes the first response win: a double-clicked option, or the same
+    fetch retried after a timeout, matches zero rows the second time and gets
+    the stored answer back instead of starting a second generation.
+    """
+    with connection() as con:
+        row = con.execute(
+            f"UPDATE sf_clarifications SET state = %s, response = %s, "
+            "client_message_id = %s, resolved_at = %s "
+            f"WHERE clarification_id = %s AND state = 'pending' RETURNING {_CLARIFICATION_COLUMNS}",
+            (
+                state,
+                _json_param(response),
+                client_message_id,
+                _now(),
+                clarification_id,
+            ),
+        ).fetchone()
+        if row is not None:
+            return _clarification_dict(row), False
+        existing = con.execute(
+            f"SELECT {_CLARIFICATION_COLUMNS} FROM sf_clarifications "
+            "WHERE clarification_id = %s",
+            (clarification_id,),
+        ).fetchone()
+    if existing is None:
+        return None, False
+    return _clarification_dict(existing), True
+
+
+def cancel_sf_clarifications(conversation_id: str) -> int:
+    """Cancel every pending question for a conversation (source turned off,
+    a clear new topic, the conversation deleted). Returns how many."""
+    with connection() as con:
+        cur = con.execute(
+            "UPDATE sf_clarifications SET state = 'cancelled', resolved_at = %s "
+            "WHERE conversation_id = %s AND state = 'pending'",
+            (_now(), conversation_id),
+        )
+        return cur.rowcount
+
+
+def save_sf_conversation_state(conversation_id: str, payload: dict) -> None:
+    with connection() as con:
+        con.execute(
+            "INSERT INTO sf_conversation_state (conversation_id, payload, updated_at) "
+            "VALUES (%s, %s, %s) "
+            "ON CONFLICT (conversation_id) DO UPDATE SET "
+            "  payload = EXCLUDED.payload, updated_at = EXCLUDED.updated_at",
+            (conversation_id, _json_param(payload), _now()),
+        )
+
+
+def get_sf_conversation_state(conversation_id: str) -> Optional[dict]:
+    with connection() as con:
+        row = con.execute(
+            "SELECT payload FROM sf_conversation_state WHERE conversation_id = %s",
+            (conversation_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    return (_row(row) or {}).get("payload") or {}

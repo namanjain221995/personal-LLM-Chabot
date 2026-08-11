@@ -1,0 +1,10 @@
+# Apple Silicon model servers are native host processes managed by the
+# launcher. Only the CPU application image runs in Docker.
+services:
+  orchestrator:
+    extra_hosts:
+      - host.docker.internal:host-gateway
+
+  sync-worker:
+    extra_hosts:
+      - host.docker.internal:host-gateway

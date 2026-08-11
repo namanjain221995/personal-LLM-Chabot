@@ -13,6 +13,7 @@
  */
 
 import { useMemo, useState } from 'react';
+import { Loader } from './Loader';
 import type { Research } from '@/lib/types';
 import {
   IconChevronDown,
@@ -173,7 +174,7 @@ export function ResearchPanel({ research }: { research: Research }) {
         className="flex w-full items-center gap-2 px-3 py-2.5 text-left transition-colors duration-ts hover:bg-surface-2"
       >
         {research.active ? (
-          <span className="ts-spinner shrink-0" role="img" aria-label="Researching" />
+          <Loader size={16} label="Researching" />
         ) : (
           <IconSearch size={14} className="shrink-0 text-accent" />
         )}

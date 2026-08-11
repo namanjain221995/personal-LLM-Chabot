@@ -1,0 +1,253 @@
+# TechSara's platform-neutral application and data plane. The host launcher
+# selects one runtime overlay (plus a platform modifier where needed) and
+# passes generated.env both to interpolation and to application containers.
+name: sf-local-ai
+
+x-runtime-env: &runtime-env
+  - path: .env
+    required: false
+  - path: ${TECHSARA_SECRET_ENV:-.runtime/secrets.env}
+    required: false
+  - path: ${TECHSARA_GENERATED_ENV:-.runtime/generated.env}
+    required: true
+
+x-generated-env: &generated-env
+  - path: ${TECHSARA_GENERATED_ENV:-.runtime/generated.env}
+    required: true
+
+x-default-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  postgres:
+    image: postgres@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-techsara}
+      POSTGRES_USER: ${POSTGRES_USER:-techsara}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      POSTGRES_INITDB_ARGS: "--locale=C --encoding=UTF8"
+      PGDATA: /var/lib/postgresql/18/docker
+    command:
+      - postgres
+      - -c
+      - shared_buffers=512MB
+      - -c
+      - effective_cache_size=1536MB
+      - -c
+      - work_mem=16MB
+      - -c
+      - maintenance_work_mem=128MB
+      - -c
+      - max_connections=60
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - effective_io_concurrency=200
+      - -c
+      - wal_compression=on
+      - -c
+      - synchronous_commit=on
+      - -c
+      - track_io_timing=on
+    volumes:
+      - pgdata:/var/lib/postgresql
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    networks:
+      - application
+    restart: unless-stopped
+    stop_grace_period: 1m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB} -q"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    logging: *default-logging
+
+  pgadmin:
+    image: dpage/pgadmin4@sha256:2f4ce946ddf8360680d7eff4eaba1d91859eb6b4003e6623bad5c63a322c2f4d
+    profiles: [admin]
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL:-admin@techsarasolutions.com}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD:-}
+      PGADMIN_SERVER_JSON_FILE: /pgadmin4/servers.json
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: "False"
+      PGADMIN_CONFIG_UPGRADE_CHECK_ENABLED: "False"
+      PGADMIN_DISABLE_POSTFIX: "True"
+    volumes:
+      - pgadmin:/var/lib/pgadmin
+      - ./pgadmin/servers.json:/pgadmin4/servers.json:ro
+    ports:
+      - "127.0.0.1:${PGADMIN_PORT:-5050}:80"
+    networks:
+      - application
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    logging: *default-logging
+
+  searxng:
+    image: searxng/searxng@sha256:75e3528c976a0ba311d8d870f029466e7b74636057a654bf3e09d1c0e3a11ed3
+    profiles: [search]
+    environment:
+      SEARXNG_SECRET: ${SEARXNG_SECRET:-please-change-me}
+      SEARXNG_BASE_URL: http://searxng:8080/
+    volumes:
+      - ./searxng:/etc/searxng:rw
+    networks:
+      - application
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider --proxy=off http://127.0.0.1:8080/healthz || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 1m
+    logging: *default-logging
+
+  orchestrator:
+    image: sf-local-ai-orchestrator:cpu
+    build:
+      context: ./orchestrator
+      dockerfile: Dockerfile.cpu
+    env_file: *runtime-env
+    environment:
+      SF_CLIENT_ID: ${SF_CLIENT_ID:-}
+      SF_CLIENT_SECRET: ${SF_CLIENT_SECRET:-}
+      SF_USERNAME: ${SF_USERNAME:-}
+      SF_LOGIN_URL: ${SF_LOGIN_URL:-}
+      SF_API_VERSION: ${SF_API_VERSION:-v61.0}
+      SF_LIVE_ENABLED: ${SF_LIVE_ENABLED:-true}
+      SF_LIGHTNING_BASE_URL: ${SF_LIGHTNING_BASE_URL:-https://techsara.lightning.force.com}
+      SF_PRIVATE_KEY_FILE: /data/sf_jwt_key.pem
+      SF_PRIVATE_KEY_B64: ${SF_PRIVATE_KEY_B64:-}
+      APP_DATABASE_URL: postgresql://${POSTGRES_USER:-techsara}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-techsara}
+      SESSION_SECRET: ${SESSION_SECRET:-}
+      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+      BRAVE_API_KEY: ${BRAVE_API_KEY:-}
+      DUCKDB_PATH: /data/warehouse.duckdb
+      LANCEDB_DIR: /data/lancedb
+      PARQUET_DIR: /data/parquet
+      REPORTS_DIR: /reports
+      MPLCONFIGDIR: /tmp/matplotlib
+      XDG_CACHE_HOME: /tmp/cache
+    volumes:
+      - data:/data
+      - reports:/reports
+      - hf-cache:/root/.cache/huggingface
+    ports:
+      - "${TECHSARA_BIND_ADDRESS:-127.0.0.1}:${ORCHESTRATOR_PORT:-8080}:8080"
+    networks:
+      - application
+      - inference
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 2m
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - |
+          import json, urllib.request
+          with urllib.request.urlopen("http://127.0.0.1:8080/health", timeout=8) as response:
+              payload = json.load(response)
+          if not isinstance(payload, dict) or payload.get("status") not in {"ok", "healthy", "degraded"}:
+              raise SystemExit(1)
+          checks = payload.get("checks")
+          if not isinstance(checks, dict):
+              raise SystemExit(1)
+          app_db = checks.get("app_db")
+          if not isinstance(app_db, dict) or app_db.get("status") != "ok":
+              raise SystemExit(1)
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 4m
+    depends_on:
+      postgres:
+        condition: service_healthy
+    logging: *default-logging
+
+  sync-worker:
+    image: sf-local-ai-sync-worker:portable
+    build:
+      context: ./sync-worker
+    environment:
+      SF_CLIENT_ID: ${SF_CLIENT_ID:-}
+      SF_CLIENT_SECRET: ${SF_CLIENT_SECRET:-}
+      SF_USERNAME: ${SF_USERNAME:-}
+      SF_LOGIN_URL: ${SF_LOGIN_URL:-}
+      SF_API_VERSION: ${SF_API_VERSION:-v61.0}
+      SF_PRIVATE_KEY_FILE: /data/sf_jwt_key.pem
+      SF_PRIVATE_KEY_B64: ${SF_PRIVATE_KEY_B64:-}
+      EMBED_VIA: ${EMBED_VIA:-http://disabled.invalid/v1}
+      EMBED_MODEL: ${EMBED_MODEL:-disabled}
+      EMBED_API_KEY: ${EMBED_API_KEY:-}
+      SYNC_INTERVAL_MINUTES: ${SYNC_INTERVAL_MINUTES:-5}
+      SYNC_AUTO_FIELDS: ${SYNC_AUTO_FIELDS:-true}
+      SYNC_AUTO_OBJECTS: ${SYNC_AUTO_OBJECTS:-true}
+      SYNC_MAX_FIELDS: ${SYNC_MAX_FIELDS:-4000}
+      SYNC_REPORT_NEW_OBJECTS: ${SYNC_REPORT_NEW_OBJECTS:-true}
+      DUCKDB_PATH: /data/warehouse.duckdb
+      LANCEDB_DIR: /data/lancedb
+      PARQUET_DIR: /data/parquet
+      SYNC_CONFIG_PATH: /app/config.yaml
+    volumes:
+      - data:/data
+      - ./sync-worker/config.yaml:/app/config.yaml:ro
+    networks:
+      - application
+      - inference
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 10m
+    logging: *default-logging
+
+  frontend:
+    image: sf-local-ai-frontend:portable
+    build:
+      context: ./frontend
+    env_file: *generated-env
+    environment:
+      ORCHESTRATOR_URL: http://orchestrator:8080
+      MOCK_MODE: ${MOCK_MODE:-false}
+      NEXT_PUBLIC_APP_NAME: ${NEXT_PUBLIC_APP_NAME:-TechSara AI}
+    ports:
+      - "${TECHSARA_BIND_ADDRESS:-127.0.0.1}:${FRONTEND_PORT:-3000}:3000"
+    networks:
+      - application
+    init: true
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/ >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 2m
+    depends_on:
+      orchestrator:
+        condition: service_healthy
+    logging: *default-logging
+
+networks:
+  application:
+  inference:
+    internal: true
+
+volumes:
+  data:
+    name: sf-local-ai_data
+  reports:
+    name: sf-local-ai_reports
+  pgdata:
+    name: sf-local-ai_pgdata
+  pgadmin:
+    name: sf-local-ai_pgadmin
+  hf-cache:
+    name: sf-local-ai_hf-cache

@@ -100,6 +100,17 @@ interface ComposerProps {
     pasted: PastedText[],
   ) => void;
   onStop: () => void;
+  /**
+   * Salesforce Intelligence Mode: the placeholder while a clarifying question
+   * is waiting ("Enter another date range…"). Text already typed is NEVER
+   * cleared by this — only the hint changes.
+   */
+  clarificationPlaceholder?: string;
+  /**
+   * The Salesforce starter card. Rendered above the input and only while the
+   * composer is EMPTY, so it can suggest without ever being in the way.
+   */
+  starter?: React.ReactNode;
 }
 
 export const Composer = forwardRef<ComposerHandle, ComposerProps>(
@@ -113,6 +124,8 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
       onPrefsChange,
       onSend,
       onStop,
+      clarificationPlaceholder,
+      starter,
     },
     ref,
   ) {
@@ -260,6 +273,10 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
     return (
       <div className="bg-bg px-4 pb-3 pt-2">
         <div className="mx-auto w-full max-w-thread">
+          {/* Only while the composer is genuinely empty. A suggestion strip
+              sitting above half-typed text is clutter, not help — and toggling
+              Salesforce must never disturb what someone is writing. */}
+          {starter && !hasContent && starter}
           {(attachments.length > 0 || pastedTexts.length > 0) && (
             <div className="mb-2 flex flex-wrap items-start gap-2">
               {attachments.map((attachment, idx) => (
@@ -335,9 +352,13 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
               placeholder={
                 disabled
                   ? 'Restoring this chat…'
-                  : prefs.salesforce
-                    ? 'Ask about your Salesforce data…'
-                    : 'Ask anything…'
+                  : // A waiting question changes only the HINT. The text
+                    // already in the box is untouched, so someone who was
+                    // mid-sentence when the card appeared loses nothing.
+                    (clarificationPlaceholder ??
+                    (prefs.salesforce
+                      ? 'Ask about your Salesforce data…'
+                      : 'Ask anything…'))
               }
               aria-label="Message"
               className="max-h-[240px] min-h-[24px] w-full resize-none bg-transparent px-1.5 py-1.5 text-[15px] leading-6 placeholder:text-faint focus:outline-none disabled:cursor-not-allowed"

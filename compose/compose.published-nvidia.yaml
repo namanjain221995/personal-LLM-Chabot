@@ -1,0 +1,25 @@
+# OPT-IN ONLY — layered after compose.nvidia.yaml when PUBLISH_MODEL_PORTS is
+# true in .env. See compose.published-dgx-spark.yaml for the exposure warning:
+# these model APIs are unauthenticated.
+#
+# The generic NVIDIA overlay defines only `vllm` and `vllm-embed`; its tiers
+# share the main model for routing and declare no OCR service.
+#
+# Publishing also attaches these services to the routable `application`
+# network. Docker records a port binding for a container that is only on an
+# `internal: true` network but never actually publishes it, so without this the
+# mapping appears in `docker inspect` and is unreachable from the host.
+services:
+  vllm:
+    networks:
+      - inference
+      - application
+    ports:
+      - "${TECHSARA_BIND_ADDRESS:-127.0.0.1}:${VLLM_PORT:-8000}:30000"
+
+  vllm-embed:
+    networks:
+      - inference
+      - application
+    ports:
+      - "${TECHSARA_BIND_ADDRESS:-127.0.0.1}:${VLLM_EMBED_PORT:-8003}:30003"

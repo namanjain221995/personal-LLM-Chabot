@@ -111,6 +111,9 @@ function makeServer(): FakeServer {
       }
       c.messages = c.messages.slice(0, keep);
     },
+    async generateTitle() {
+      return { title: '', generated: false };
+    },
     async setFeedback(id, messageId, feedback) {
       guard('setFeedback');
       const conv = convs.get(id);

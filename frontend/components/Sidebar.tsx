@@ -13,14 +13,13 @@
  * opens searches message content server-side too.
  */
 
-import { useEffect, useRef, useState } from 'react';
+import { useRef, useState } from 'react';
 import { conversationMenuHandlers } from '@/lib/conversationMenu';
 import type { ConversationSummary } from '@/lib/types';
 import { ConversationMenu } from './ConversationMenu';
 import { TechSaraMark } from './TechSaraMark';
 import { useTheme } from './Providers';
 import {
-  IconChevronDown,
   IconChevronRight,
   IconMoon,
   IconPin,
@@ -122,7 +121,14 @@ export function Sidebar({
               className={`flex w-full items-center gap-1.5 rounded-lg py-1.5 pl-2.5 pr-9 text-left text-sm transition-colors duration-ts ${
                 activeId === c.id
                   ? 'bg-surface-2 text-ink'
-                  : 'text-muted hover:bg-surface-2/60 hover:text-ink'
+                  // Full --ts-text, same as the active row: a conversation
+                  // title is the primary content of this list, not secondary
+                  // metadata, and --ts-text-muted (#b3b3b3) on the #0a0a0a
+                  // sidebar read as a wall of grey. The ACTIVE row is already
+                  // distinguished by its background, so brightness does not
+                  // need to carry that job as well — which is exactly how
+                  // ChatGPT's sidebar does it.
+                  : 'text-ink hover:bg-surface-2/60'
               }`}
             >
               {c.pinned && (
@@ -177,7 +183,7 @@ export function Sidebar({
           onClick={onOpenSearch}
           aria-label="Search chats"
           title="Search chats (Ctrl K)"
-          className="rounded-lg p-1.5 text-muted transition-colors duration-ts hover:bg-surface-2 hover:text-ink"
+          className="rounded-lg p-1.5 text-icon transition-colors duration-ts hover:bg-surface-2 hover:text-ink"
         >
           <IconSearch size={16} />
         </button>
@@ -190,7 +196,7 @@ export function Sidebar({
           onClick={onClose}
           aria-label="Hide sidebar"
           title="Hide sidebar"
-          className="hidden rounded-lg p-1.5 text-muted transition-colors duration-ts hover:bg-surface-2 hover:text-ink md:block"
+          className="hidden rounded-lg p-1.5 text-icon transition-colors duration-ts hover:bg-surface-2 hover:text-ink md:block"
         >
           <IconSidebar size={16} />
         </button>
@@ -198,7 +204,7 @@ export function Sidebar({
           type="button"
           onClick={onClose}
           aria-label="Close sidebar"
-          className="rounded-lg p-1.5 text-muted transition-colors duration-ts hover:bg-surface-2 hover:text-ink md:hidden"
+          className="rounded-lg p-1.5 text-icon transition-colors duration-ts hover:bg-surface-2 hover:text-ink md:hidden"
         >
           <IconX size={16} />
         </button>
@@ -264,7 +270,7 @@ export function Sidebar({
                 onClick={toggleArchived}
                 aria-expanded={archivedOpen}
                 aria-controls="sidebar-archived-list"
-                className="flex w-full items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-left text-xs text-muted transition-colors duration-ts hover:bg-surface-2/60 hover:text-ink"
+                className="flex w-full items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-left text-xs text-icon transition-colors duration-ts hover:bg-surface-2/60 hover:text-ink"
               >
                 <IconChevronRight
                   size={13}
@@ -294,7 +300,7 @@ export function Sidebar({
           aria-label={
             theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'
           }
-          className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-sm text-muted transition-colors duration-ts hover:bg-surface-2 hover:text-ink"
+          className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-sm text-icon transition-colors duration-ts hover:bg-surface-2 hover:text-ink"
         >
           {theme === 'dark' ? <IconSun size={15} /> : <IconMoon size={15} />}
           {theme === 'dark' ? 'Light theme' : 'Dark theme'}

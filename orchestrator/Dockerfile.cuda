@@ -1,0 +1,47 @@
+# syntax=docker/dockerfile:1
+# NVIDIA application image for the in-process CUDA reranker. The digest is the
+# tested NGC vLLM runtime recorded in config/model-manifest.yaml.
+FROM nvcr.io/nvidia/vllm@sha256:654e563e727be1968487d453de0733fb074cb59adf424c779d0f9e7cfcb2b6b6
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        git \
+        pandoc \
+        libpango-1.0-0 \
+        libpangoft2-1.0-0 \
+        libpangocairo-1.0-0 \
+        libcairo2 \
+        libgdk-pixbuf-2.0-0 \
+        libharfbuzz0b \
+        libffi8 \
+        shared-mime-info \
+        fonts-dejavu-core \
+        fonts-liberation \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY app ./app
+
+ENV REPORTS_DIR=/reports \
+    DUCKDB_PATH=/data/warehouse.duckdb \
+    LANCEDB_DIR=/data/lancedb \
+    PARQUET_DIR=/data/parquet
+
+# Keep the shared data-volume seed compatible with sync-worker's stable UID.
+# The orchestrator remains root for the tested CUDA/reranker runtime.
+RUN mkdir -p /reports /data/parquet /data/lancedb /tmp/matplotlib /tmp/cache \
+    && chown -R 10001:10001 /data
+
+EXPOSE 8080
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]

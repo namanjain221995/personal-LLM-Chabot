@@ -1,0 +1,41 @@
+# OPT-IN ONLY — layered after compose.dgx-spark.yaml when PUBLISH_MODEL_PORTS
+# is true in .env. Without it the model APIs stay on the internal `inference`
+# network and are reachable only by the orchestrator and sync worker.
+#
+# These endpoints have NO authentication. Publishing them on a non-loopback
+# TECHSARA_BIND_ADDRESS exposes unauthenticated model inference — and, through
+# it, whatever those models can be asked to do — to every host that can reach
+# this machine. Only do that on a network you control.
+#
+# Publishing also attaches these services to the routable `application`
+# network. Docker records a port binding for a container that is only on an
+# `internal: true` network but never actually publishes it, so without this the
+# mapping appears in `docker inspect` and is unreachable from the host.
+services:
+  vllm:
+    networks:
+      - inference
+      - application
+    ports:
+      - "${TECHSARA_BIND_ADDRESS:-127.0.0.1}:${VLLM_PORT:-8000}:30000"
+
+  vllm-router:
+    networks:
+      - inference
+      - application
+    ports:
+      - "${TECHSARA_BIND_ADDRESS:-127.0.0.1}:${VLLM_ROUTER_PORT:-8002}:30002"
+
+  vllm-embed:
+    networks:
+      - inference
+      - application
+    ports:
+      - "${TECHSARA_BIND_ADDRESS:-127.0.0.1}:${VLLM_EMBED_PORT:-8003}:30003"
+
+  vllm-ocr:
+    networks:
+      - inference
+      - application
+    ports:
+      - "${TECHSARA_BIND_ADDRESS:-127.0.0.1}:${VLLM_OCR_PORT:-8004}:30004"

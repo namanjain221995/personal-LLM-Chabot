@@ -1,109 +1,130 @@
-# Architecture Review & Technical Due Diligence
+# TechSara architecture documentation
 
-> **2026-08-10 — app state moved from SQLite to PostgreSQL.** [`data-model.md`](01-codebase/data-model.md)
-> and the CHANGELOG are current. Other pages here still describe `/data/app.sqlite3`
-> and carry a banner saying so; their DuckDB, LanceDB, engine and frontend content is
-> unaffected.
+This directory contains two layers of documentation:
 
+1. current portable-runtime and repository maps, updated 2026-08-11; and
+2. a detailed due-diligence audit captured on 2026-07-31, before the portable
+   launcher, Compose overlays, PostgreSQL migration, local-only network changes,
+   and subsequent application work.
 
-**System:** TechSara — a fully local Salesforce AI analytics + chat platform running on an NVIDIA DGX Spark
-workstation.
-**Audited:** 2026-07-31 · **251 files · 43,189 LOC**, every in-scope file read in full.
-**Result:** 38 findings — 1 P0, 7 P1, 22 P2, 8 P3 — plus complete module documentation and a 24-diagram suite.
+Start with the current layer. Historical audit pages remain useful for deep
+module traces, but their line numbers, file/test counts, deployment topology,
+and unresolved-finding status must not be treated as current without checking
+source.
 
----
+## Current reading order
 
-## The one-paragraph version
-
-This is a well-engineered codebase with **one deployment-level flaw that dominates its entire risk profile**.
-The security-sensitive modules (`archive.py`, `report_paths.py`, `net.py`) are written to a standard above what
-we normally see; there are 1,141 automated tests and **all of them pass**; there is not a single `TODO` or
-`FIXME` in 43k lines. But the application has **no authentication of any kind**, and every port — including the
-four GPU inference servers — is published on `0.0.0.0`. The code's own comment
-(`orchestrator/app/auth.py:17-20`) says this posture is *"NOT fine if the port is published to a network you do
-not control — see the compose port bindings"*. The compose port bindings are exactly that. **Fixing it is a
-one-line change per service.** Four of the five top risks are fixable in under two days combined.
-
----
-
-## Reading order
-
-**If you have 5 minutes** → [`03-report/IMPROVEMENT-REPORT.md` §1 Executive summary](03-report/IMPROVEMENT-REPORT.md)
-
-**If you have 30 minutes**
-1. [`03-report/IMPROVEMENT-REPORT.md`](03-report/IMPROVEMENT-REPORT.md) — §1 summary, §2 scorecard, §3 what's good, §7 this week
-2. [`02-diagrams/render/21-network-ports.svg`](02-diagrams/render/21-network-ports.svg) — the exposure picture in one image
-3. [`03-report/QUICK-WINS.md`](03-report/QUICK-WINS.md) — everything fixable in under a day
-
-**If you are the engineer doing the work**
-1. [`01-codebase/CRITICAL-PATHS.md`](01-codebase/CRITICAL-PATHS.md) — the 8 end-to-end flows, `file:line` at every hop
-2. [`03-report/JIRA-BACKLOG.md`](03-report/JIRA-BACKLOG.md) — import-ready tickets with Given/When/Then criteria
-3. The module doc for whatever you are touching, in [`01-codebase/`](01-codebase/)
-
-**If you are new to the codebase** → [`01-codebase/README.md`](01-codebase/README.md), then
-[`00-INVENTORY.md`](00-INVENTORY.md), then diagrams 01 → 02 → 06 → 07.
-
----
-
-## What is here
-
-| Path | What it is |
+| Need | Read |
 |---|---|
-| [`00-INVENTORY.md`](00-INVENTORY.md) | Every one of the 251 files with LOC, purpose, criticality and risk flag; dependency inventory; entrypoint map; full config surface; dead-code analysis |
-| [`01-codebase/`](01-codebase/) | Module documentation — 13 documents, each module on a fixed 10-section schema |
-| ├─ [`CRITICAL-PATHS.md`](01-codebase/CRITICAL-PATHS.md) | **The most useful document here.** 8 flows traced end to end with `file:line` at every hop |
-| ├─ [`frontend-api-contracts.md`](01-codebase/frontend-api-contracts.md) | Every route, every status code, and all 8 SSE events with exact payloads on both sides |
-| ├─ [`security-model.md`](01-codebase/security-model.md) | Auth, network exposure, the four guard modules assessed honestly, secret handling, STRIDE table |
-| ├─ [`data-model.md`](01-codebase/data-model.md) | **PostgreSQL app state** (2026-08-10, was app.sqlite3) · DuckDB warehouse · LanceDB — keys, indexes, retention, what is not cleaned up |
-| ├─ [`test-map.md`](01-codebase/test-map.md) | All 83 test files, what they assert, the coverage gaps, and the 10 highest-value tests to add next |
-| └─ *(orchestrator-engines / -core / -context / -search, frontend, sync-worker, infra-docker-compose)* | |
-| [`02-diagrams/`](02-diagrams/) | 24 PlantUML diagrams — [`src/`](02-diagrams/src/) sources, [`render/`](02-diagrams/render/) SVG + PNG, [`README`](02-diagrams/README.md) with draw.io import steps, [`_STYLE.md`](02-diagrams/_STYLE.md) |
-| [`03-report/`](03-report/) | [`IMPROVEMENT-REPORT.md`](03-report/IMPROVEMENT-REPORT.md) · [`FINDINGS.csv`](03-report/FINDINGS.csv) · [`JIRA-BACKLOG.md`](03-report/JIRA-BACKLOG.md) · [`QUICK-WINS.md`](03-report/QUICK-WINS.md) |
-| [`04-VERIFICATION.md`](04-VERIFICATION.md) | Every self-check run against this audit, with actual output |
-| [`ASSUMPTIONS.md`](ASSUMPTIONS.md) | Every judgement call, including **findings that were investigated and dropped** because the code was correct |
-| [`_evidence/`](_evidence/) | Raw per-subsystem evidence notes the documents were written from — working material, kept for traceability |
+| Install/start/stop/troubleshoot | [`../README.md`](../README.md) |
+| Hardware matrix, model policy, state, fallback and upgrades | [`PORTABLE-RUNTIME.md`](PORTABLE-RUNTIME.md) |
+| Current files and entrypoints | [`00-INVENTORY.md`](00-INVENTORY.md) |
+| Launcher plus application request flows | [`01-codebase/CRITICAL-PATHS.md`](01-codebase/CRITICAL-PATHS.md) |
+| Base Compose and runtime overlays | [`01-codebase/infra-docker-compose.md`](01-codebase/infra-docker-compose.md) |
+| Test entrypoints and current verification boundary | [`01-codebase/test-map.md`](01-codebase/test-map.md) |
+| Current application data stores | [`01-codebase/data-model.md`](01-codebase/data-model.md) |
+| Salesforce clarification, query-plan safety, context budgeting | [`06-agent-design/SALESFORCE-INTELLIGENCE-MODE.md`](06-agent-design/SALESFORCE-INTELLIGENCE-MODE.md) |
 
----
+## Current deployment boundary
 
-## Findings at a glance
+TechSara is no longer documented as a DGX-only monolith. The launcher supports
+Apple Silicon, Linux/Windows NVIDIA, CPU-minimal, application-only, and explicit
+local external-development profiles. It combines `compose.yaml` with a selected
+overlay and uses native vLLM-Metal on Apple Silicon.
 
-| Severity | Count | Headline |
-|---|---:|---|
-| **P0** | 1 | `SEC-01` No authentication + six ports published on `0.0.0.0` |
-| **P1** | 7 | `sql_guard` bypass · warehouse stored entirely as text (wrong rankings) · blocking DuckDB call on the event loop · SSRF DNS-rebinding window · fail-open ownership check · unbounded request body · no CI |
-| **P2** | 22 | Prompt injection · plaintext `.env` backup · dead AWS config · orphaned tables · no PK/index on `Id` · unpinned deps · no correlation IDs · raw exception text streamed to the browser · no router timeout |
-| **P3** | 8 | Undocumented `MOCK_MODE` · no engine `Protocol` · dead `is_safe_select` · two god-files · four tests that cannot fail |
+The supported Compose files bind frontend, orchestrator, PostgreSQL, and
+optional pgAdmin publications to loopback by default. Model containers are
+`expose`-only on an internal inference network. This mitigates the historical
+audit's broad `0.0.0.0` host-publication finding for the supported launcher
+path.
 
-Also worth knowing: the orchestrator image is the only one that runs as **root** (`SEC-11`), `requirements-dev.txt`
-omits a package needed at import time so a clean-host test run fails at collection (`DX-03`), and **18 of the 43
-documented env vars reach no container at all** because compose has no `env_file:` (`DX-04`).
+There is still no real application login/session boundary: `/auth/me` reports a
+stable single local identity. Loopback is therefore a core security assumption,
+not merely a convenient default. A reverse proxy, LAN binding, or public
+publication needs a new threat model and explicit authentication/TLS/access
+control.
 
-Machine-readable: [`03-report/FINDINGS.csv`](03-report/FINDINGS.csv).
+On Mac, native model upstreams bind `127.0.0.1`; container-facing bridge
+listeners bind `0.0.0.0` on ports 18100/18103/18105 so Docker can reach them.
+Those bridge endpoints require a generated bearer token, strip auth/hop-by-hop
+headers before forwarding, cap bodies, and do not log requests. Host firewall
+policy remains relevant.
 
-### Two findings worth reading in full
+## Current documents
 
-- **`SEC-07`** — a genuine `sql_guard` bypass. `SELECT E'\'' , 1; DROP TABLE t` passes the guard *including its
-  multi-statement check*. Confirmed by executing it against the real module. It is **not currently
-  exploitable**, because DuckDB is opened `read_only=True, enable_external_access=False` and refused every
-  payload — but the guard's documented promise is false and the whole safety argument now rests on two
-  connection flags never regressing.
-- **`DATA-04`** — every Salesforce value is stored as `VARCHAR`, so `ORDER BY Amount DESC` sorts `9000` above
-  `10000` and `MAX(Amount)` returns the wrong record. `SUM` fails loudly and self-corrects; **ranking fails
-  silently**. Verified against DuckDB 1.5.4. For a product whose purpose is answering questions about numbers,
-  this is the most consequential correctness defect found.
+### Repository and codebase
 
----
+| Path | Purpose |
+|---|---|
+| [`00-INVENTORY.md`](00-INVENTORY.md) | regenerated repository composition, entrypoints, configs, tests and generated/ignored state |
+| [`01-codebase/CRITICAL-PATHS.md`](01-codebase/CRITICAL-PATHS.md) | current launcher Flow 0 plus historical detailed application flows |
+| [`01-codebase/infra-docker-compose.md`](01-codebase/infra-docker-compose.md) | current base/overlay/service/network/volume/env topology |
+| [`01-codebase/test-map.md`](01-codebase/test-map.md) | current suite/config/command map and honest verification results |
+| [`01-codebase/data-model.md`](01-codebase/data-model.md) | PostgreSQL app state plus DuckDB/LanceDB data plane |
+| [`01-codebase/frontend-api-contracts.md`](01-codebase/frontend-api-contracts.md) | browser/orchestrator route and SSE contract snapshot |
+| [`01-codebase/frontend.md`](01-codebase/frontend.md) | frontend module analysis snapshot |
+| [`01-codebase/orchestrator-core.md`](01-codebase/orchestrator-core.md) | orchestrator core analysis snapshot |
+| [`01-codebase/orchestrator-engines.md`](01-codebase/orchestrator-engines.md) | engine analysis snapshot |
+| [`01-codebase/orchestrator-context.md`](01-codebase/orchestrator-context.md) | context/compaction analysis snapshot |
+| [`01-codebase/orchestrator-search.md`](01-codebase/orchestrator-search.md) | search/URL/repository analysis snapshot |
+| [`01-codebase/sync-worker.md`](01-codebase/sync-worker.md) | sync worker analysis snapshot |
+| [`01-codebase/security-model.md`](01-codebase/security-model.md) | historical threat assessment; re-check against current loopback/overlay/auth state |
 
-## What was verified, not assumed
+### Historical diagrams and report artifacts
 
-- **Tests were executed**, not just read: orchestrator **800 passed** (41.6 s) · sync-worker **104 passed**
-  (1.1 s) · frontend **237 passed** (16 files) — **1,141 passing, 0 failing**.
-- **The `sql_guard` bypass was executed** against the real module, and its payloads were then run against a
-  DuckDB handle configured exactly as the engine configures it, to establish that defence-in-depth holds.
-- **The `VARCHAR` consequences were measured** in DuckDB 1.5.4, not reasoned about.
-- **All 24 diagrams pass `plantuml -checkonly` and render** to SVG and PNG — no `RENDER-SKIPPED` placeholders.
-- **Five plausible findings were investigated and dropped** because the code proved correct — model-output XSS,
-  the DuckDB replacement-scan "bypass", sync watermark data loss, an unbounded generation registry, and
-  module-level dead code. See [`ASSUMPTIONS.md#a12`](ASSUMPTIONS.md).
+| Path | Purpose/status |
+|---|---|
+| [`02-diagrams/`](02-diagrams/) | 24 PlantUML sources plus rendered SVG/PNG from the 2026-07-31 topology; deployment/network diagrams predate the portable overlays |
+| [`03-report/IMPROVEMENT-REPORT.md`](03-report/IMPROVEMENT-REPORT.md) | historical audit narrative and scorecard |
+| [`03-report/FINDINGS.csv`](03-report/FINDINGS.csv) | historical finding register; remediation status is not automatically current |
+| [`03-report/JIRA-BACKLOG.md`](03-report/JIRA-BACKLOG.md) | historical import-ready backlog |
+| [`03-report/QUICK-WINS.md`](03-report/QUICK-WINS.md) | historical remediation suggestions |
+| [`04-VERIFICATION.md`](04-VERIFICATION.md) | commands and evidence from the audit date, not the current portable pass |
+| [`ASSUMPTIONS.md`](ASSUMPTIONS.md) | audit scope/judgment record |
+| [`_evidence/`](_evidence/) | raw historical subsystem notes |
 
-Nothing outside `docs/` was created, modified or deleted. No dependency was installed. No git state was changed.
+## Historical snapshot warning
+
+The 2026-07-31 audit described a fixed DGX Spark deployment, a single Compose
+file, broad host port publication, an older app-state implementation, and the
+then-current source/test inventory. Later pages may still contain statements
+such as:
+
+- fixed vLLM sidecars and model IDs for every deployment;
+- `/data/app.sqlite3` rather than PostgreSQL;
+- host ports published on every interface;
+- no Compose `env_file`, network separation, restart policy, or health checks;
+- old source/test totals and old full-suite results;
+- line links into files that have since changed.
+
+Those statements are evidence of that snapshot, not current operational
+instructions. Current source and the documents in the first table win when
+they disagree.
+
+## Verification status
+
+Every suite was run on 2026-08-11 on the DGX Spark host:
+
+| Suite | Result |
+|---|---|
+| Launcher (`PYTHONPATH=launcher python3 -m pytest launcher/tests -q`) | 264 passed, 266 subtests |
+| Orchestrator (`pytest tests -q`, needs a test PostgreSQL) | 1014 passed |
+| Sync worker (`pytest tests -q`) | 157 passed |
+| Frontend (`npm test`) | 310 passed |
+| Frontend types / lint | clean |
+
+Launcher coverage is mocked except for `test_compose_overlays.py`, which renders
+all 13 supported host fixtures through real `docker compose config`. No live
+model download, container start, or process signal is exercised. See
+[`01-codebase/test-map.md`](01-codebase/test-map.md) for the current boundary.
+
+## Maintaining these docs
+
+When changing launcher or infrastructure behavior:
+
+1. update the declarative manifest/profile or Compose overlay;
+2. add unit/contract tests and the relevant live platform validation;
+3. update `PORTABLE-RUNTIME.md`, infrastructure, critical paths, test map, and
+   inventory in the same change;
+4. add a dated changelog entry without rewriting historical entries;
+5. report each suite result separately with its command/date/environment.

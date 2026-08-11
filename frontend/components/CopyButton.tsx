@@ -40,12 +40,12 @@ export function CopyButton({
         onClick={copy}
         aria-label={copied ? 'Copied' : label}
         title={copied ? 'Copied' : label}
-        className={`rounded-lg p-1.5 text-muted transition-colors duration-ts hover:bg-surface-2 hover:text-ink ${className}`}
+        className={`rounded-lg p-2 text-icon transition-colors duration-ts hover:bg-surface-2 hover:text-ink ${className}`}
       >
         {copied ? (
-          <IconCheck size={15} className="text-accent" />
+          <IconCheck size={18} className="text-accent" />
         ) : (
-          <IconCopy size={15} />
+          <IconCopy size={18} />
         )}
       </button>
     );

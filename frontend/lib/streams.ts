@@ -18,6 +18,7 @@
  * which conversation is on screen.
  */
 
+import type { ClarificationResponse } from './clarification';
 import { getHistoryStore, newId } from './history';
 import { foldModelContent } from './pasted';
 import type { ChatPrefs } from './prefs';
@@ -191,7 +192,15 @@ async function consume(s: LiveStream, body: ReadableStream<Uint8Array>) {
         searchStatus: undefined,
       }));
     } else if (ev.kind === 'status') {
-      updateAssistant(s, (m) => ({ ...m, searchStatus: ev.text }));
+      // Two progress systems share this event. A payload with a typed `phase`
+      // is Salesforce Intelligence Mode and drives the ReasoningStar; a bare
+      // `text` is the older web-search/URL line and keeps its own row, so the
+      // two never render on top of each other.
+      updateAssistant(s, (m) =>
+        ev.phase
+          ? { ...m, phaseStatus: ev.phase, searchStatus: undefined }
+          : { ...m, searchStatus: ev.text },
+      );
     } else if (ev.kind === 'reasoning') {
       if (s.reasoningStartedAt === null) s.reasoningStartedAt = Date.now();
       updateAssistant(s, (m) => ({
@@ -241,11 +250,14 @@ async function consume(s: LiveStream, body: ReadableStream<Uint8Array>) {
       updateAssistant(s, (m) => ({
         ...m,
         research: m.research ? { ...m.research, active: false } : undefined,
+        // The star must stop when the answer arrives, not when a timer says so.
+        phaseStatus: undefined,
         meta: foldStreamState(ev.meta, {
           reasoning: m.reasoning,
           reasoningSeconds: m.reasoningSeconds ?? s.reasoningSeconds,
           steps: m.steps,
           research: m.research,
+          phaseStatus: m.phaseStatus,
         }),
       }));
     } else if (ev.kind === 'error') {
@@ -302,6 +314,35 @@ export interface StartStreamOptions {
   images?: string[] | null;
   pdf?: string | null;
   pdfName?: string | null;
+  /**
+   * Salesforce Intelligence Mode: the answer to a clarifying question this
+   * conversation is waiting on. Present → the server resumes the ORIGINAL
+   * request with this answer folded in, instead of treating the message as a
+   * new question. Carries its own idempotency key, so a double-click or a
+   * retried send resolves to the first answer rather than a second generation.
+   */
+  clarification?: ClarificationResponse | null;
+}
+
+/** Conversations whose in-flight send already carries a clarification answer. */
+const submittedClarifications = new Set<string>();
+
+/**
+ * Has this exact answer already been sent? Guards the double-click at the
+ * CLIENT edge too, so the second click never even opens a second stream — the
+ * server-side guard is the one that matters, this one just avoids the flicker.
+ */
+export function clarificationAlreadySubmitted(key: string): boolean {
+  return submittedClarifications.has(key);
+}
+
+export function markClarificationSubmitted(key: string): void {
+  submittedClarifications.add(key);
+  // Bounded: this is a within-session dedupe, not a persistent log.
+  if (submittedClarifications.size > 200) {
+    const oldest = submittedClarifications.values().next().value;
+    if (oldest !== undefined) submittedClarifications.delete(oldest);
+  }
 }
 
 /** Send a turn and stream the answer in the background. */
@@ -336,6 +377,7 @@ export async function startStream(opts: StartStreamOptions): Promise<void> {
         ...(opts.pdf
           ? { pdf: opts.pdf, pdf_filename: opts.pdfName ?? undefined }
           : {}),
+        ...(opts.clarification ? { clarification: opts.clarification } : {}),
       }),
       signal: s.controller.signal,
     });

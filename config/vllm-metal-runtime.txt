@@ -1,0 +1,5 @@
+# TechSara verifies both local artifacts against config/model-manifest.yaml before
+# invoking this lock input. Environment placeholders document the immutable
+# artifacts used by RuntimeManager; the fallback installs the same verified files.
+${TECHSARA_VLLM_SOURCE}
+${TECHSARA_VLLM_METAL_WHEEL}

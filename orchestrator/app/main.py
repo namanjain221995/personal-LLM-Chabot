@@ -252,6 +252,12 @@ class ChatRequest(BaseModel):
     pdf_filename: Optional[str] = None
     # Phase 1: web search — "off" (never), "on" (force), "auto" (model decides).
     web_search: Literal["off", "auto", "on"] = "off"
+    # Salesforce Intelligence Mode: the answer to a clarifying question this
+    # conversation is waiting on. Present → the ORIGINAL request resumes with
+    # this answer folded in, instead of `message` being treated as a new one.
+    # Absent → an ordinary send, which may still be READ as an answer when a
+    # question is pending (engines/sf_intel.py decides, not the client).
+    clarification: Optional[dict] = None
 
     @property
     def pdf_data(self) -> Optional[str]:
@@ -301,7 +307,14 @@ class ChatRequest(BaseModel):
     def _require_input(self) -> "ChatRequest":
         if len(self.images_data) > MAX_IMAGES:
             raise ValueError(f"at most {MAX_IMAGES} images per message")
-        if not self.text and not self.image_data and not self.pdf_data:
+        if (
+            not self.text
+            and not self.image_data
+            and not self.pdf_data
+            # Answering a clarification by clicking "Skip" carries no text of
+            # its own; the request it resumes is what supplies the question.
+            and not self.clarification
+        ):
             raise ValueError(
                 "provide a non-empty message/messages, an image, or a PDF"
             )
@@ -320,6 +333,11 @@ async def health() -> dict:
         "service": "orchestrator",
         "version": app.version,
         "checks": report["checks"],
+        # Additive (2026-08-11): the VERIFIED effective context length, the
+        # request budget derived from it, and the serving flags the app
+        # believes are set. `status` is untouched — a window mismatch is a
+        # configuration fact to surface, not a dependency outage.
+        "context": report.get("context", {}),
     }
 
 
@@ -429,6 +447,9 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
     context_state: dict = {}
     # What the auto-orchestration decided, surfaced on the final meta.
     orchestration_state: dict = {}
+    # Salesforce Intelligence Mode extras (assumptions, resolved scope, the
+    # final phase) merged into whichever engine's meta ends up being emitted.
+    salesforce_state: dict = {}
 
     async def emit(event: str, data: dict) -> None:
         if event == "meta":
@@ -446,10 +467,19 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 data["context"] = dict(context_state)
             if orchestration_state:
                 data["auto"] = dict(orchestration_state)
+            # Merged rather than overwritten: the engine that answered owns
+            # `route`, `data` and `chart`, and the Salesforce planner only ever
+            # ADDS provenance and assumptions on top of them.
+            for key, value in salesforce_state.items():
+                data.setdefault(key, value)
             gen.final_meta = data
         await gen.publish(event, data)
 
     async def worker() -> None:
+        # `text` is rebound when the user answers a clarifying question, so it
+        # must be declared here — a `nonlocal` further down would come after
+        # the reads above it and fail to compile.
+        nonlocal text
         # Per-request state: this task owns its own trim record.
         context.reset_trim_notice()
         try:
@@ -556,7 +586,18 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             if settings.repo_analysis_enabled and request.text and not request.pdf_data and not request.image_data:
                 from .core.repo import detect_github
 
+                from .core.urls import extract_urls as _extract, links_are_the_request
+
                 github_ref = detect_github(request.text)
+                # A GitHub link INSIDE a pasted document is a citation, not an
+                # instruction to clone and index a repository. Same test as the
+                # URL engine below, and the consequence of getting it wrong is
+                # larger here: a clone, an index, and an answer about source
+                # code nobody asked about.
+                if github_ref is not None and not links_are_the_request(
+                    request.text, _extract(request.text, limit=settings.url_max_pages)
+                ):
+                    github_ref = None
                 if github_ref is None:
                     try:
                         from . import db as _dbr
@@ -580,9 +621,25 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 and github_ref is None
             ):
                 from . import db as _db
-                from .core.urls import extract_urls, select_relevant
+                from .core.urls import (
+                    extract_urls,
+                    links_are_the_request,
+                    select_relevant,
+                )
 
                 url_list = extract_urls(request.text, limit=settings.url_max_pages)
+                # …but only when the links ARE the request. A 30,599-character
+                # paste that happens to contain URLs is a document to read, not
+                # a list of pages to fetch — and routing it here discarded the
+                # paste entirely and answered "I couldn't read any of those
+                # links" (owner report, 2026-08-11).
+                if url_list and not links_are_the_request(request.text, url_list):
+                    logging.getLogger(__name__).info(
+                        "ignoring %d incidental URL(s) in a %d-character message",
+                        len(url_list),
+                        len(request.text),
+                    )
+                    url_list = []
                 if not url_list:
                     try:
                         stored = await db.run_in_thread(
@@ -678,7 +735,152 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 )
                 context_state.update(info)
 
-            if request.pdf_data:
+            # SALESFORCE INTELLIGENCE MODE (2026-08-11).
+            #
+            # The Salesforce pill is no longer a retrieval filter. Before any
+            # engine runs, the request is resolved against this conversation
+            # ("what about EMEA?" keeps the previous object, period and owner
+            # scope), and ONE targeted question is asked only when a missing
+            # detail would materially change the answer. A question that IS
+            # asked pauses the intent; answering it resumes the SAME request
+            # rather than starting a new one.
+            #
+            # It is skipped for attachments (a document has its own engine), for
+            # the explicit Live toggle (already a scoped instruction), for the
+            # agent/URL/repo/dataset routes (each owns its own pipeline), and
+            # for text that already carries a legacy "(Clarified:" resolution.
+            #
+            # A CLARIFICATION ANSWER OWNS THE TURN. When `clarification` is
+            # present the user is finishing a request this server started, so
+            # the escalation gates below do not apply to it — auto-orchestration
+            # deciding "this deserves agent steps" must not swallow the answer
+            # and turn it back into a standalone question. Found on a live run
+            # (2026-08-11): the second half of a resumed request was routed to
+            # the agent engine and the resume was silently lost.
+            sf_outcome = None
+            answering_clarification = bool(
+                request.clarification
+                and request.mode == "salesforce"
+                and settings.salesforce_intelligence_enabled
+            )
+            # NOTE ON `want_agent`: it is deliberately NOT a gate here.
+            # Resolving a request against the conversation, and asking about a
+            # genuinely ambiguous detail, are ROUTING decisions; running the
+            # request as multi-step agent work is an EXECUTION STRATEGY. When
+            # the auto-orchestration classifier gated this block, a long
+            # analytical Salesforce question ("training details for slot 128 …
+            # how many cleared and failed and what is the ratio") skipped the
+            # planner entirely and was answered by the agent — with neither the
+            # clarification gate nor the deterministic figures. Which
+            # clarification card a user saw then depended on an unrelated
+            # classifier. Owner report, 2026-08-11.
+            #
+            # The engine still hands the turn back (`handled=False`) whenever it
+            # is not the right answerer, and the agent then runs BELOW with the
+            # RESOLVED request rather than the ambiguous one.
+            if answering_clarification or (
+                request.mode == "salesforce"
+                and settings.salesforce_intelligence_enabled
+                and request.text
+                and not (request.pdf_data or request.image_data)
+                and not request.sf_live
+                and github_ref is None
+                and not repo_followup
+                and not url_list
+                and not dataset_ready
+                and "(Clarified:" not in text
+            ):
+                from .core.sf_intel.models import ClarificationResponse
+                from .engines import sf_intel
+
+                answer_to_pending = None
+                if request.clarification:
+                    try:
+                        answer_to_pending = ClarificationResponse.model_validate(
+                            request.clarification
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        # A malformed response is the client's bug, not the
+                        # user's: say so plainly instead of silently treating
+                        # their click as a brand-new question.
+                        logging.getLogger(__name__).info(
+                            "rejecting a malformed clarification response: %s",
+                            str(exc)[:200],
+                        )
+
+                sf_outcome = await sf_intel.run(
+                    text,
+                    history,
+                    emit,
+                    conversation_id=conv_key,
+                    effort=request.effort,
+                    model_choice=request.model,
+                    clarification_response=answer_to_pending,
+                    source_enabled=True,
+                )
+                if sf_outcome.meta_extras:
+                    salesforce_state.update(sf_outcome.meta_extras)
+                if not sf_outcome.handled and sf_outcome.resolved_text:
+                    # Resumed or context-resolved: the engines below must see
+                    # the RESOLVED request, never the ambiguous original.
+                    text = sf_outcome.resolved_text
+            elif request.mode != "salesforce":
+                # The source was switched off. A question waiting on the user
+                # must not sit there invisibly: cancel it deterministically so
+                # the next Salesforce turn starts clean.
+                from .core.sf_intel import state as sf_intel_state
+
+                with contextlib.suppress(Exception):
+                    await sf_intel_state.cancel_pending(conv_key)
+
+            # Ask before answering, when the question has more than one honest
+            # reading. Salesforce mode only, and only when nothing is attached:
+            # the alternative is picking a reading silently, which is how "how
+            # many failed the mock" returned 7, 20 and 0 on three runs of the
+            # same sentence. Skipped once the user has already clarified.
+            #
+            # This deterministic path is the FALLBACK now: it runs only when
+            # Salesforce Intelligence Mode did not take the request, so the two
+            # can never both ask about the same message.
+            clarification = None
+            if (
+                request.mode == "salesforce"
+                and sf_outcome is None
+                and settings.clarify_before_answering
+                and not (request.pdf_data or request.image_data)
+                # An explicit live lookup is already a scoped instruction;
+                # interrupting it to ask a question is not help.
+                and not request.sf_live
+                and "(Clarified:" not in text
+            ):
+                from .core import clarify as clarify_mod
+
+                # Is this message the ANSWER to the question we just asked?
+                # Checked first: the option labels contain the very words the
+                # detectors match on ("mock", "slot"), so without this the
+                # same question comes back forever.
+                resolved = clarify_mod.answered(full_history, text)
+                if resolved is not None:
+                    # Rebinds the enclosing scope's `text` (declared nonlocal
+                    # at the top of worker), so the engines below receive the
+                    # RESOLVED question rather than the ambiguous one.
+                    text = resolved
+                else:
+                    clarification = clarify_mod.needs_clarification(
+                        text, always=settings.clarify_mode == "always"
+                    )
+
+            if sf_outcome is not None and sf_outcome.handled:
+                # Salesforce Intelligence Mode answered, or asked a question and
+                # is now waiting. Either way it already emitted its tokens and
+                # its single meta; there is nothing left for the chain below.
+                answer = sf_outcome.answer
+            elif clarification is not None:
+                answer = clarification.as_text()
+                await emit("token", {"text": answer})
+                await emit("meta", {"route": "clarify",
+                                    "clarify": clarification.wire(text)})
+            elif request.pdf_data:
                 # V8 → 2026-08-07: any document (PDF/DOCX/plain) — the WHOLE
                 # file is read and remembered for this conversation.
                 from .engines.document import run_pdf_engine
@@ -828,6 +1030,72 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@app.get("/chat/salesforce/{conversation_id}")
+async def salesforce_context(
+    conversation_id: str, http_request: Request
+) -> dict:
+    """Restore Salesforce Intelligence state for a conversation.
+
+    This is what makes a clarification card survive a reload: the browser asks
+    for the pending question on mount and rebuilds the card from the server's
+    copy, rather than from whatever the tab happened to have in memory. It also
+    supplies the starter card's options, filtered to what this connection can
+    actually reach.
+
+    Scoped to the conversation's owner, like /chat itself — a conversation whose
+    id someone guessed must not disclose what it is asking about.
+    """
+    viewer = await _viewer_id(http_request)
+    try:
+        owner = await db.run_in_thread(db.conversation_owner, conversation_id)
+    except Exception:
+        owner = None
+    if owner is not None and owner != viewer:
+        raise HTTPException(status_code=404, detail="conversation not found")
+
+    from .engines import sf_intel
+
+    if not settings.salesforce_intelligence_enabled:
+        return {"enabled": False, "options": [], "pending_clarification": None}
+    try:
+        return await sf_intel.starter_options(conversation_id)
+    except Exception as exc:  # noqa: BLE001 — a starter card is never fatal
+        logging.getLogger(__name__).info(
+            "salesforce context unavailable for %s: %s", conversation_id, exc
+        )
+        return {"enabled": True, "options": [], "pending_clarification": None}
+
+
+class SalesforceCancelRequest(BaseModel):
+    conversation_id: str
+
+
+@app.post("/chat/salesforce/cancel")
+async def salesforce_cancel(
+    body: SalesforceCancelRequest, http_request: Request
+) -> dict:
+    """Cancel a pending clarification.
+
+    Called when the Salesforce source is switched off with a question on screen.
+    Deterministic by design: the card disappears because the server says it is
+    cancelled, not because the client stopped drawing it — otherwise the next
+    Salesforce turn in that chat would resume a question the user had visibly
+    dismissed.
+    """
+    viewer = await _viewer_id(http_request)
+    try:
+        owner = await db.run_in_thread(db.conversation_owner, body.conversation_id)
+    except Exception:
+        owner = None
+    if owner is not None and owner != viewer:
+        raise HTTPException(status_code=404, detail="conversation not found")
+
+    from .core.sf_intel import state as sf_intel_state
+
+    cancelled = await sf_intel_state.cancel_pending(body.conversation_id)
+    return {"cancelled": cancelled}
 
 
 class StopRequest(BaseModel):

@@ -23,6 +23,7 @@ import pyarrow.parquet as pq
 log = logging.getLogger("syncworker.storage")
 
 META_TABLE = "_sync_meta"
+RAG_PENDING_TABLE = "_rag_index_pending"
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 #: How long a Store operation waits for the cross-process file lock. The
@@ -101,6 +102,15 @@ class Store:
                 "watermark VARCHAR, "
                 "updated_at TIMESTAMP)"
             )
+            con.execute(
+                f'CREATE TABLE IF NOT EXISTS "{RAG_PENDING_TABLE}" ('
+                "object_name VARCHAR NOT NULL, "
+                "record_id VARCHAR NOT NULL, "
+                "attempts INTEGER NOT NULL DEFAULT 1, "
+                "last_error VARCHAR, "
+                "updated_at TIMESTAMP NOT NULL DEFAULT now(), "
+                "PRIMARY KEY (object_name, record_id))"
+            )
 
     @contextmanager
     def _connection(self):
@@ -151,6 +161,97 @@ class Store:
                 [object_name, watermark],
             )
 
+    # ── retryable RAG indexing state ─────────────────────────────────────────
+
+    def mark_rag_pending(
+        self, object_name: str, record_ids: list[str], error: str
+    ) -> int:
+        """Persist records whose warehouse write succeeded but indexing failed."""
+        _safe_ident(object_name)
+        ids = sorted({str(record_id) for record_id in record_ids if record_id})
+        if not ids:
+            return 0
+        message = str(error)[:2000]
+        with self._connection() as con:
+            con.executemany(
+                f'INSERT INTO "{RAG_PENDING_TABLE}" '
+                "(object_name, record_id, attempts, last_error, updated_at) "
+                "VALUES (?, ?, 1, ?, now()) "
+                "ON CONFLICT (object_name, record_id) DO UPDATE SET "
+                f'attempts = "{RAG_PENDING_TABLE}".attempts + 1, '
+                "last_error = excluded.last_error, updated_at = excluded.updated_at",
+                [(object_name, record_id, message) for record_id in ids],
+            )
+        return len(ids)
+
+    def clear_rag_pending(self, object_name: str, record_ids: list[str]) -> int:
+        _safe_ident(object_name)
+        ids = sorted({str(record_id) for record_id in record_ids if record_id})
+        if not ids:
+            return 0
+        removed = 0
+        with self._connection() as con:
+            for start in range(0, len(ids), 500):
+                batch = ids[start : start + 500]
+                placeholders = ", ".join("?" for _ in batch)
+                before = con.execute(
+                    f'SELECT count(*) FROM "{RAG_PENDING_TABLE}" '
+                    f"WHERE object_name = ? AND record_id IN ({placeholders})",
+                    [object_name, *batch],
+                ).fetchone()[0]
+                con.execute(
+                    f'DELETE FROM "{RAG_PENDING_TABLE}" '
+                    f"WHERE object_name = ? AND record_id IN ({placeholders})",
+                    [object_name, *batch],
+                )
+                removed += int(before)
+        return removed
+
+    def pending_rag_ids(self, object_name: str) -> list[str]:
+        _safe_ident(object_name)
+        with self._connection() as con:
+            rows = con.execute(
+                f'SELECT record_id FROM "{RAG_PENDING_TABLE}" '
+                "WHERE object_name = ? ORDER BY updated_at, record_id",
+                [object_name],
+            ).fetchall()
+        return [str(row[0]) for row in rows]
+
+    def pending_rag_records(
+        self,
+        object_name: str,
+        rag_fields: list[str] | tuple[str, ...],
+        *,
+        limit: int = 500,
+    ) -> list[dict]:
+        """Read pending records back from the authoritative warehouse table."""
+        table = _safe_ident(object_name)
+        requested = ["Id", *rag_fields]
+        with self._connection() as con:
+            if not self._table_exists(con, table):
+                return []
+            existing = self._table_column_types(con, table)
+            if "SystemModstamp" in existing:
+                requested.append("SystemModstamp")
+            fields = []
+            for field in requested:
+                safe = _safe_ident(str(field))
+                if safe in existing and safe not in fields:
+                    fields.append(safe)
+            if "Id" not in fields:
+                return []
+            select = ", ".join(f't."{field}"' for field in fields)
+            cursor = con.execute(
+                f'SELECT {select} FROM "{table}" AS t '
+                f'JOIN "{RAG_PENDING_TABLE}" AS p '
+                "ON p.object_name = ? AND p.record_id = t.Id "
+                "ORDER BY p.updated_at, p.record_id LIMIT ?",
+                [object_name, max(1, int(limit))],
+            )
+            rows = cursor.fetchall()
+            names = [column[0] for column in cursor.description]
+        return [dict(zip(names, row)) for row in rows]
+
     # ── upsert ──────────────────────────────────────────────────────────────
 
     @staticmethod
@@ -174,16 +275,22 @@ class Store:
             return 0
         df = pd.DataFrame({"Id": [str(i) for i in ids]})
         with self._connection() as con:
-            if not self._table_exists(con, table):
-                return 0
             con.register("_deleted_ids", df)
             try:
-                before = con.execute(
-                    f'SELECT count(*) FROM "{table}" '
-                    "WHERE Id IN (SELECT Id FROM _deleted_ids)"
-                ).fetchone()[0]
+                before = 0
+                if self._table_exists(con, table):
+                    before = con.execute(
+                        f'SELECT count(*) FROM "{table}" '
+                        "WHERE Id IN (SELECT Id FROM _deleted_ids)"
+                    ).fetchone()[0]
+                    con.execute(
+                        f'DELETE FROM "{table}" WHERE Id IN '
+                        "(SELECT Id FROM _deleted_ids)"
+                    )
                 con.execute(
-                    f'DELETE FROM "{table}" WHERE Id IN (SELECT Id FROM _deleted_ids)'
+                    f'DELETE FROM "{RAG_PENDING_TABLE}" WHERE object_name = ? '
+                    "AND record_id IN (SELECT Id FROM _deleted_ids)",
+                    [object_name],
                 )
             finally:
                 con.unregister("_deleted_ids")
@@ -216,6 +323,11 @@ class Store:
                         f'DELETE FROM "{table}" '
                         "WHERE Id NOT IN (SELECT Id FROM _keep_ids)"
                     )
+                con.execute(
+                    f'DELETE FROM "{RAG_PENDING_TABLE}" WHERE object_name = ? '
+                    "AND record_id NOT IN (SELECT Id FROM _keep_ids)",
+                    [object_name],
+                )
             finally:
                 con.unregister("_keep_ids")
         return removed

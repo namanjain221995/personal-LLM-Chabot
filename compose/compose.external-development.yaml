@@ -1,0 +1,10 @@
+# App-only and external OpenAI-compatible development modes. Generated.env
+# supplies the external/native endpoints and explicit capability flags.
+services:
+  orchestrator:
+    extra_hosts:
+      - host.docker.internal:host-gateway
+
+  sync-worker:
+    extra_hosts:
+      - host.docker.internal:host-gateway

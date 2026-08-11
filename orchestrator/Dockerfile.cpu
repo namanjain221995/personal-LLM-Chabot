@@ -1,0 +1,51 @@
+# syntax=docker/dockerfile:1
+# Multi-architecture application image for CPU, macOS-hosted inference, and
+# external OpenAI-compatible endpoints. It intentionally contains no CUDA or
+# torch runtime; CPU profiles disable or remotely serve reranking.
+FROM python:3.11-slim@sha256:90744cff8f32887f075c47d747a173ff333e9e98801667af93c357fa9f5e28ff
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# git powers repository analysis. pandoc + WeasyPrint's native libraries power
+# DOCX/PDF reports. curl is used by the container readiness probe.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        git \
+        pandoc \
+        libpango-1.0-0 \
+        libpangoft2-1.0-0 \
+        libpangocairo-1.0-0 \
+        libcairo2 \
+        libgdk-pixbuf-2.0-0 \
+        libharfbuzz0b \
+        libffi8 \
+        shared-mime-info \
+        fonts-dejavu-core \
+        fonts-liberation \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY app ./app
+
+ENV REPORTS_DIR=/reports \
+    DUCKDB_PATH=/data/warehouse.duckdb \
+    LANCEDB_DIR=/data/lancedb \
+    PARQUET_DIR=/data/parquet
+
+# The launcher starts this container before the non-root sync worker. Seed the
+# empty named volume with directories writable by the worker's stable UID so a
+# clean first run cannot turn the shared warehouse paths into root-only data.
+RUN mkdir -p /reports /data/parquet /data/lancedb /tmp/matplotlib /tmp/cache \
+    && chown -R 10001:10001 /data
+
+EXPOSE 8080
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]

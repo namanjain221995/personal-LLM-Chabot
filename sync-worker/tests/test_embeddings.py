@@ -27,9 +27,11 @@ def _openai_embeddings_response(inputs: list[str]) -> dict:
     }
 
 
-def _make_embedder(handler, base_url: str = BASE_URL) -> OpenAIEmbedder:
+def _make_embedder(
+    handler, base_url: str = BASE_URL, *, api_key: str = ""
+) -> OpenAIEmbedder:
     client = httpx.Client(transport=httpx.MockTransport(handler))
-    return OpenAIEmbedder(base_url, MODEL, http=client)
+    return OpenAIEmbedder(base_url, MODEL, http=client, api_key=api_key)
 
 
 def test_posts_openai_payload_to_embeddings_endpoint():
@@ -53,13 +55,44 @@ def test_posts_openai_payload_to_embeddings_endpoint():
 def test_vectors_come_back_in_input_order():
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
-        return httpx.Response(200, json=_openai_embeddings_response(body["input"]))
+        payload = _openai_embeddings_response(body["input"])
+        payload["data"].reverse()  # servers may return results out of order
+        return httpx.Response(200, json=payload)
 
     embedder = _make_embedder(handler)
     texts = [f"text-{i}" for i in range(5)]
     vectors = embedder.embed(texts)
     # data[i].embedding maps 1:1, in order, onto input i
     assert vectors == [[float(i), float(i) + 0.5] for i in range(5)]
+
+
+def test_optional_api_key_is_sent_as_bearer_without_changing_payload():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["authorization"] = request.headers.get("authorization")
+        body = json.loads(request.content)
+        seen["body"] = body
+        return httpx.Response(200, json=_openai_embeddings_response(body["input"]))
+
+    _make_embedder(handler, api_key="ephemeral-local-key").embed(["alpha"])
+
+    assert seen == {
+        "authorization": "Bearer ephemeral-local-key",
+        "body": {"model": MODEL, "input": ["alpha"]},
+    }
+
+
+def test_empty_api_key_sends_no_authorization_header():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["authorization"] = request.headers.get("authorization")
+        body = json.loads(request.content)
+        return httpx.Response(200, json=_openai_embeddings_response(body["input"]))
+
+    _make_embedder(handler).embed(["alpha"])
+    assert seen["authorization"] is None
 
 
 def test_batches_of_32_and_concatenates_in_order():

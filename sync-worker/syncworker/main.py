@@ -32,6 +32,7 @@ log = logging.getLogger("syncworker.main")
 
 INITIAL_BACKOFF_SECONDS = 30.0
 MAX_BACKOFF_SECONDS = 30 * 60.0
+RAG_BACKFILL_RECORD_LIMIT = 500
 
 
 class _StopFlag:
@@ -176,6 +177,88 @@ def _purge_local(
     )
 
 
+def _record_ids(records: list[dict]) -> list[str]:
+    return sorted({str(record["Id"]) for record in records if record.get("Id")})
+
+
+def _index_or_defer(
+    object_name: str,
+    records: list[dict],
+    rag_fields: list[str] | tuple[str, ...],
+    indexer: RagIndexer,
+    store: Store,
+    *,
+    source: str,
+) -> bool:
+    """Index warehouse-backed records or persist them for a later backfill."""
+    record_ids = _record_ids(records)
+    if not record_ids:
+        return True
+    try:
+        chunks = indexer.index_records(object_name, records, tuple(rag_fields))
+    except Exception as exc:
+        # Persisting the retry marker is the condition for advancing the data
+        # watermark. If that write itself fails, propagate: the unchanged
+        # watermark makes Salesforce return this idempotent batch next cycle.
+        store.mark_rag_pending(
+            object_name,
+            record_ids,
+            f"{type(exc).__name__}: {exc}",
+        )
+        log.error(
+            "rag indexing deferred; records remain queued for backfill",
+            exc_info=True,
+            extra={
+                "event": "rag_index_deferred",
+                "object": object_name,
+                "records": len(record_ids),
+                "source": source,
+            },
+        )
+        return False
+    store.clear_rag_pending(object_name, record_ids)
+    if source == "backfill":
+        log.info(
+            "rag backfill completed",
+            extra={
+                "event": "rag_backfill_done",
+                "object": object_name,
+                "records": len(record_ids),
+                "chunks": chunks,
+            },
+        )
+    return True
+
+
+def _retry_pending_rag(
+    object_name: str,
+    rag_fields: list[str] | tuple[str, ...],
+    indexer: RagIndexer,
+    store: Store,
+) -> None:
+    records = store.pending_rag_records(
+        object_name, rag_fields, limit=RAG_BACKFILL_RECORD_LIMIT
+    )
+    if not records:
+        return
+    log.info(
+        "retrying deferred rag records",
+        extra={
+            "event": "rag_backfill_start",
+            "object": object_name,
+            "records": len(records),
+        },
+    )
+    _index_or_defer(
+        object_name,
+        records,
+        rag_fields,
+        indexer,
+        store,
+        source="backfill",
+    )
+
+
 def sync_object(
     obj: ObjectConfig,
     client: SalesforceClient,
@@ -229,6 +312,13 @@ def sync_object(
     # table: "how many X are there" should answer 0, not "table not found".
     store.ensure_table(obj.name, fields)
 
+    # Retry failures from PRIOR cycles before fetching changes. This runs even
+    # when the incremental query returns zero rows, closing the old hole where
+    # an embedding service that was cold on first sync left records unindexed
+    # forever after their data watermark advanced.
+    if indexer is not None and rag_fields:
+        _retry_pending_rag(obj.name, rag_fields, indexer, store)
+
     if watermark is None:
         mode = "full"
         batches = _full_extract_batches(
@@ -264,16 +354,14 @@ def sync_object(
                    "parquet": parquet_path},
         )
         if indexer is not None and rag_fields:
-            try:
-                indexer.index_records(obj.name, records, rag_fields)
-            except Exception:
-                # RAG indexing must not block the data sync; the warehouse
-                # stays authoritative and indexing retries on the next change.
-                log.error(
-                    "rag indexing failed",
-                    exc_info=True,
-                    extra={"event": "rag_index_error", "object": obj.name},
-                )
+            _index_or_defer(
+                obj.name,
+                records,
+                rag_fields,
+                indexer,
+                store,
+                source="changed_batch",
+            )
 
     # Records deleted in Salesforce used to live here forever — the
     # SystemModstamp filter cannot see them. Two complementary answers:
@@ -466,7 +554,11 @@ def main() -> None:
     client = SalesforceClient(TokenManager(creds), settings.sf_api_version)
     indexer = RagIndexer(
         settings.lancedb_dir,
-        OpenAIEmbedder(settings.embed_via, settings.embed_model),
+        OpenAIEmbedder(
+            settings.embed_via,
+            settings.embed_model,
+            api_key=settings.embed_api_key,
+        ),
     )
 
     flag = _StopFlag()

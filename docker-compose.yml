@@ -1,3 +1,20 @@
+# =============================================================================
+# SUPERSEDED — this is the pre-launcher, DGX-Spark-only Compose file.
+#
+# The supported entrypoint is now the `techsara` launcher, which composes
+# `compose.yaml` with one overlay from `compose/` and a generated environment
+# (see docs/PORTABLE-RUNTIME.md). This file is kept, unmodified apart from this
+# header, for exactly two reasons:
+#
+#   1. A stack started from it must still be stoppable with the same file
+#      (`docker compose -f docker-compose.yml down`).
+#   2. It is the rollback path if a launcher-managed start needs to be reverted.
+#
+# It is NOT portable: it hard-codes one developer's model directory as the
+# `VLLM_MODELS_DIR` default, uses floating `:nightly`/`:latest` tags, and
+# publishes model APIs on 0.0.0.0. The launcher-managed files fix all three.
+# Do not add features here; add them to compose.yaml and the overlays.
+# =============================================================================
 # TechSara Local AI Analysis Platform — docker-compose (spec §6, model serving per
 # the vLLM design: owner override of spec §4 on 2026-07-22 — all models on vLLM).
 # Secrets come ONLY from .env via ${VAR} interpolation. Never hardcode them here.
@@ -76,6 +93,29 @@ services:
     # NOTE: --max-num-seqs is deliberately left at the vLLM default (NOT set to 4
     # like serve_model.sh) — 4 would cap concurrency and throttle this shared,
     # multi-consumer server. max-num-batched-tokens does not limit concurrency.
+    #
+    # TOOL CALLING (2026-08-11, Salesforce Intelligence Mode). The request
+    # planner emits a structured decision, and control flow is decided from a
+    # SCHEMA rather than from prose. --tool-call-parser qwen3_xml is the parser
+    # vLLM 0.26 ships for this model family, and --enable-auto-tool-choice is
+    # what makes `tools` + `tool_choice` legal on /v1/chat/completions at all.
+    # Both are additive: nothing else in the app sends `tools`, and the planner
+    # itself downgrades to guided JSON on a 400, so a runtime without them
+    # still works (see app/core/sf_intel/planner.py).
+    #
+    # DELIBERATELY NOT SET, and why:
+    #   --async-scheduling      already the default in 0.26 (the flag exists to
+    #                           turn it OFF); adding it would only look like a
+    #                           change that isn't one.
+    #   --load-format fastsafetensors
+    #                           needs the `fastsafetensors` package inside the
+    #                           image. It is not in vllm-openai:nightly, and a
+    #                           faster COLD START is not worth a service that
+    #                           refuses to boot.
+    #   --language-model-only   this service also serves VISION (VISION_MODEL
+    #                           points at it), so disabling multimodal inputs
+    #                           to reclaim KV would break image answers.
+    #   --max-num-seqs 4        see the note above — measured here, not copied.
     command: >
       /models/Qwen3.6-35B-A3B-NVFP4
       --served-model-name Qwen/Qwen3.6-35B-A3B-NVFP4
@@ -91,6 +131,8 @@ services:
       --moe-backend marlin
       --enable-chunked-prefill
       --enable-prefix-caching
+      --tool-call-parser qwen3_xml
+      --enable-auto-tool-choice
       --max-num-batched-tokens 8192
     environment:
       HF_TOKEN: ${HF_TOKEN}

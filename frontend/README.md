@@ -1,85 +1,109 @@
 # TechSara frontend
 
-ChatGPT-class Next.js UI for the TechSara Local AI Analysis Platform
-(spec §9), speaking the §10 SSE contract to the orchestrator.
+Next.js 15/React 19 user interface for the TechSara local Salesforce analytics
+and chat platform. The normal full-platform entrypoint is `../techsara`; the npm
+commands on this page are for frontend development and verification.
+
+## Runtime model
+
+The frontend does not select a hard-coded model. The launcher publishes the
+selected backend/model/capability contract to the orchestrator, and the UI
+offers four effort ceilings for that serving model:
+
+- **Fast** — direct answer, no reasoning pass or tools;
+- **Low** — no reasoning pass, with web search only when needed;
+- **Medium** — reasoning plus model-driven multi-step planning/search;
+- **High** — longer reasoning with the same tool surface as Medium.
+
+There is no separate Agent toggle. At Medium/High effort the orchestrator's
+model decides whether a request needs a plan. A degraded hardware profile may
+hide or disable behavior its probed backend does not support.
 
 ## Stack
 
-- Next.js 15 (App Router, `output: 'standalone'`) + React 19 + TypeScript
-- Tailwind CSS 3 with the §9 design tokens as CSS variables
-  (dark theme primary, light theme via `html.light`)
-- Recharts 3 for the proof-drawer charts
-- react-markdown + remark-gfm for assistant messages
-- Self-hosted fonts via `@fontsource` (IBM Plex Sans, JetBrains Mono) —
-  zero runtime CDN requests
-- Vitest for the SSE parser and history-module tests
+- Next.js 15 App Router with standalone output;
+- React 19 and TypeScript;
+- Tailwind CSS 3 with dark/light TechSara tokens;
+- Apache ECharts through `echarts-for-react`;
+- `react-markdown`, GFM, syntax highlighting, and Mermaid;
+- self-hosted IBM Plex Sans and JetBrains Mono through `@fontsource`;
+- Vitest in a Node environment for pure contract/state modules.
 
-## Streaming choice (per §9 "Tech")
+## Streaming contract
 
-We use a **small hand-rolled SSE reader** (`lib/sse.ts`), not the Vercel AI
-SDK. The orchestrator's custom `meta` event (sql / data / chart / citations
-/ report_files) does not map cleanly onto the AI SDK's data-stream
-protocol; the spec-compliant parser is ~60 lines and fully unit-tested,
-including events split across network chunks.
+`lib/sse.ts` is a small streaming parser for the orchestrator's custom SSE
+events. It understands token, reasoning, status, research, step, metadata,
+done, and error frames and ignores unknown event types. `lib/streams.ts`
+maintains generation/reattachment state, persists final metadata, and handles
+abort/stop behavior.
+
+The Next.js API routes proxy the browser contract to the orchestrator. Report
+and history proxies use explicit path/method allowlists rather than open
+passthrough behavior.
+
+## Local identity and history
+
+This application has no sign-in, sign-up, session cookie, or route-gating
+flow. `/api/auth/me` returns a stable single local identity used for labeling
+and history cache scoping. This matches the supported loopback, single-user
+deployment; it is not suitable as public application authentication.
+
+Conversation history is server-backed. The browser keeps a synchronous
+in-memory mirror persisted write-behind as one IndexedDB record per
+conversation. On first boot after the cache migration, the old localStorage
+blob is imported and deleted. Browsers without usable IndexedDB fall back to
+the legacy localStorage persister with its bounded quota/eviction behavior.
+
+Writes update the cache immediately and synchronize to the orchestrator.
+Conflict/truncation rules prevent stale clients from shrinking conversation
+history; explicit regenerate is the sanctioned truncation path. Pin/archive,
+search, feedback, export, generated titles, detached-stream reattachment, and
+dirty retry all share this store.
 
 ## Environment
 
-| Variable | Meaning | Default |
-| --- | --- | --- |
-| `ORCHESTRATOR_URL` | Orchestrator base URL for `/chat` + `/reports` proxying | `http://localhost:8080` |
-| `MOCK_MODE` | `true` streams canned §10 fixtures (`lib/fixtures.ts`), one per engine, so the UI demos with no models | unset (proxy) |
-| `NEXT_PUBLIC_APP_NAME` | Header / title branding | `TechSara AI` |
+| Variable | Meaning | Default/source |
+|---|---|---|
+| `ORCHESTRATOR_URL` | server-side proxy destination | `http://orchestrator:8080` in Compose; `http://localhost:8080` in route fallback |
+| `MOCK_MODE` | `true` serves local canned chat/auth/history behavior for UI development | `false` in `.env.example` |
+| `NEXT_PUBLIC_APP_NAME` | application name shown in the document/UI | `TechSara AI` |
 
-## Commands
+In the launcher flow, Compose reads `.runtime/generated.env` for the frontend
+and sets `ORCHESTRATOR_URL` explicitly. Do not put model endpoints or model IDs
+in frontend configuration.
+
+## Development commands
 
 ```bash
-npm install
-npm run dev        # local dev (try MOCK_MODE=true npm run dev)
-npm run lint       # eslint (next/core-web-vitals + next/typescript)
-npx tsc --noEmit   # typecheck
-npm test           # vitest run (SSE parser + history)
-npm run build      # production build (standalone)
+cd frontend
+npm ci
+
+npm run dev                 # local Next.js development server
+MOCK_MODE=true npm run dev  # UI-only demo without the orchestrator/models
+npm test                    # vitest run, Node environment
+npx tsc --noEmit            # TypeScript check
+npm run lint                # package script; verify toolchain support
+npm run build               # production standalone build
 ```
+
+`package-lock.json` is committed; use `npm ci` rather than generating a new
+dependency resolution for verification.
+
+The Vitest suite matches `tests/**/*.test.ts`. It covers state and wire
+contracts, not mounted React components or browser end-to-end behavior. No
+current pass count is claimed here because the frontend suite was not rerun in
+the portable-runtime documentation pass.
 
 ## Layout
 
-- `app/api/chat/route.ts` — SSE endpoint: MOCK_MODE fixtures with realistic
-  token pacing, or a byte-for-byte pipe of the orchestrator stream
-- `app/api/reports/…` — list + sanitized download proxy
-- `lib/history.ts` — server-backed history (V2 §4b) behind the original
-  v1 interface: localStorage is the offline cache, writes push to the
-  orchestrator `/history` API in the background (dirty-retry on refresh),
-  one-time migration uploads pre-auth local conversations after first
-  login; QuotaExceeded still drops the oldest conversation and toasts
-- `components/ProofDrawer.tsx` — the signature element: engine badge +
-  View SQL / Sources / Data / Chart / Files sections
+| Area | Key files |
+|---|---|
+| App/API | `app/page.tsx`, `app/api/chat/*`, `app/api/history/[...path]`, `app/api/auth/me`, `app/api/upload` |
+| Shell/composer | `components/ChatApp.tsx`, `Sidebar.tsx`, `Composer.tsx`, `ModelPicker.tsx` |
+| Streaming/reasoning | `lib/sse.ts`, `lib/streams.ts`, `ReasoningAccordion.tsx`, `AgentTimeline.tsx` |
+| History | `lib/history.ts`, `historyApi.ts`, `historyRoutes.ts`, `idbCache.ts` |
+| Proof/data | `ProofDrawer.tsx`, `DataTable.tsx`, `EChart.tsx`, `MermaidBlock.tsx`, citations/source components |
+| Tests | `tests/*.test.ts`, configured by `vitest.config.mts` |
 
-## V2 additions (V2-DESIGN §4)
-
-- **Auth (§4a)** — `/login` (Sign in / Create account tabs, inline errors),
-  `middleware.ts` gates everything except `/login` + static assets +
-  `/api/auth/*` on the presence of the `ts_session` cookie (validity is the
-  orchestrator's job): pages redirect to `/login`, non-auth `/api/*` routes
-  get 401 JSON so unauthenticated clients cannot reach `/api/chat` or
-  `/api/reports/*`,
-  `app/api/auth/[...path]` + `app/api/history/[...path]` proxy cookies BOTH
-  directions, sidebar footer shows the user menu with Log out.
-- **Composer controls (§4c)** — Salesforce toggle pill (ON default, per-
-  conversation persistence in `lib/prefs.ts`; OFF switches the placeholder
-  to "Ask anything…" and dims the trust footer), model picker
-  (Smart · GPT-OSS 120B / Fast · Qwen3 4B with a Low/Medium/High reasoning
-  submenu under Smart) and the Agent toggle. `mode`/`model`/`effort`/`agent`
-  ride on every `/api/chat` call (V2 §1).
-- **Reasoning UI (§4d)** — `reasoning` SSE deltas render a "Thinking…"
-  shimmer accordion with a live last-line preview, collapsing to
-  "Thought for N s" (client-measured); the text persists via
-  `meta.reasoning` / `meta.reasoning_seconds`.
-- **Agent timeline (§4e)** — `step` SSE events drive a live plan card
-  (spinner / check / cross, expandable details), persisted via `meta.steps`.
-- **SSE v2 (§2)** — `lib/sse.ts` parses `reasoning` + `step`; UNKNOWN event
-  types are ignored without breaking the stream (unit-tested; the mock
-  stream even emits a `ping` event to prove it).
-- **MOCK_MODE** — also mocks `/api/auth` + `/api/history` in-memory
-  (`lib/mockApi.ts`) and adds `chat`/`agent` fixtures with reasoning and
-  step animation, so the entire v2 flow (login → migrate → chat) demos
-  with no backend.
+For platform startup, profiles, data preservation, and security boundaries,
+see [`../docs/PORTABLE-RUNTIME.md`](../docs/PORTABLE-RUNTIME.md).

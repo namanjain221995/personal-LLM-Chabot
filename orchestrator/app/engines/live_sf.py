@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .. import llm
 from ..config import settings
-from ..core import salesforce
+from ..core import org_brief, salesforce
 from ..core.schema_cache import schema_cache
 
 _FENCE_RE = re.compile(r"```(?:soql|sql)?\s*(.*?)```", re.S | re.I)
@@ -90,7 +90,12 @@ async def write_soql(
     else:
         known = _object_hint()
         context = f"Objects known to be in this org: {known}\n\n" if known else ""
-    user = f"{context}Question: {question}"
+    # This path is not the exotic one: the warehouse is write-locked by the
+    # sync worker for a large share of the day, and every one of those questions
+    # lands here. Ungrounded, it answered "0 OOT mocks today" off
+    # Program_Version__c. It needs the same org knowledge the local engine has.
+    grounding = org_brief.grounding_for(question, dialect="soql")
+    user = f"{grounding}\n\n{context}Question: {question}"
     if correction:
         user += f"\n\n{correction}"
     raw = await llm.chat_completion(

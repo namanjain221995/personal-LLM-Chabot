@@ -1,0 +1,8 @@
+# Allow-list the small build context so local credentials, caches and data can
+# never be sent to the Docker daemon accidentally.
+*
+!Dockerfile
+!requirements.txt
+!config.yaml
+!syncworker/
+!syncworker/**

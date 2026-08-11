@@ -94,10 +94,44 @@ async def run_url_engine(
 
     docs = await db.run_in_thread(db.get_url_documents, conversation_id)
     if not docs:
-        note = "I couldn't read any of those links."
-        await emit("token", {"text": note})
-        await emit("meta", {"route": "url"})
-        return note
+        # Nothing could be fetched — a paywall, a login wall, a dead host, or a
+        # page that is all JavaScript. That is a reason to say so and then still
+        # ANSWER, not to stop. Replying with one sentence used to throw away
+        # whatever else the message contained, which for a large paste was the
+        # entire point of sending it (owner report, 2026-08-11).
+        parts: List[str] = []
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "The links in the user's message could not be fetched — "
+                    "they may need a login, block automated readers, or be "
+                    "unreachable. Say that plainly in ONE short sentence, then "
+                    "answer the rest of the message from what it already "
+                    "contains and from your own knowledge. Never pretend you "
+                    "read a page you did not. If the message carries pasted "
+                    "text or a document, that content is the substance of the "
+                    "request — use it."
+                )
+                + DIAGRAM_INSTRUCTION,
+            },
+            *recent_turns(history, 4),
+            {"role": "user", "content": message},
+        ]
+        async for kind, delta in llm.stream_chat_events(messages, max_tokens=12000):
+            await emit(kind, {"text": delta})
+            if kind == "token":
+                parts.append(delta)
+        answer = "".join(parts).strip()
+        if not answer:
+            answer = (
+                "I couldn't read any of those links, and I wasn't able to draft "
+                "an answer from the rest of the message either. Paste the text "
+                "you want me to work from and I'll take it from there."
+            )
+            await emit("token", {"text": answer})
+        await emit("meta", {"route": "url", "fetch_failed": True})
+        return answer
 
     parts: List[str] = []
     async for kind, delta in llm.stream_chat_events(

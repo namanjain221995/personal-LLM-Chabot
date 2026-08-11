@@ -5,7 +5,23 @@
  * keys, reasoning + step events). Unknown future meta keys must be tolerated.
  */
 
-export type Engine = 'sql' | 'rag' | 'vision' | 'report' | 'chat' | 'agent' | 'search' | 'url' | 'repo';
+/**
+ * `clarify` was always emitted by the orchestrator (main.py) and always
+ * rendered; it was simply missing from this union, so the type quietly
+ * disagreed with the wire. Listed now that Salesforce Intelligence Mode emits
+ * it too.
+ */
+export type Engine =
+  | 'sql'
+  | 'rag'
+  | 'vision'
+  | 'report'
+  | 'chat'
+  | 'agent'
+  | 'search'
+  | 'url'
+  | 'repo'
+  | 'clarify';
 
 /**
  * Historically two models. There is now ONE (Qwen3.6-35B-A3B) and the picker
@@ -159,6 +175,71 @@ export interface Meta {
   context?: ContextUsage;
   /** The searches behind this answer, kept so history replays the panel. */
   research?: Research;
+  /**
+   * The question had more than one honest reading, so the answer is a
+   * question back. Rendered as buttons: picking one sends it as the next
+   * message, which the server resolves against the original question.
+   *
+   * LEGACY (still emitted when Salesforce Intelligence Mode is off, and still
+   * present on every conversation persisted before it existed). The typed
+   * replacement is `clarification` below; MessageRow prefers that one and
+   * falls back to this, so old threads keep rendering exactly as they did.
+   */
+  clarify?: Clarify;
+  /**
+   * Salesforce Intelligence Mode: the typed clarification this request is
+   * waiting on. Unlike `clarify`, answering it RESUMES the original request
+   * server-side rather than sending a rewritten question as a new message —
+   * see lib/clarification.ts.
+   */
+  clarification?: import('./clarification').ClarificationRequest;
+  /** Which Salesforce path answered: "intelligence" or absent (the v1 chain). */
+  salesforce_mode?: string;
+  /** Provenance for a Salesforce-derived answer, shown under the message. */
+  salesforce_sources?: SalesforceSources;
+  /** The resolved scope (period, owner, region…) the answer was computed over. */
+  salesforce_scope?: string;
+  /** Set when a lookup FAILED — distinct from an empty result. */
+  salesforce_error?: string;
+  /** Stated assumptions, when a detail was assumed rather than asked about. */
+  assumptions?: string[];
+  /** Final phase snapshot, so a reopened chat shows how the answer was reached. */
+  status?: import('./phases').PhaseStatus;
+}
+
+/** Where a Salesforce answer's numbers came from. */
+export interface SalesforceSources {
+  /** "live" (the org) or "synced" (the local copy). */
+  source: string;
+  /** Object API names / business domains read. */
+  objects: string[];
+  /** Records that MATCHED, which is not always how many were returned. */
+  record_count?: number;
+  query_timestamp?: string;
+  freshness?: string;
+  pages?: number;
+  truncated?: boolean;
+}
+
+export interface ClarifyOption {
+  label: string;
+  description?: string;
+  /**
+   * The message to send when this option is picked — the ORIGINAL question
+   * with the chosen reading folded in. Sending the label alone made the
+   * server treat it as a fresh question and clarify it again, forever.
+   */
+  send?: string;
+  /** Opens a text box instead of sending immediately. */
+  free_text?: boolean;
+}
+
+export interface Clarify {
+  question: string;
+  reason?: string;
+  /** The question being clarified, so free text can be folded into it. */
+  original?: string;
+  options: ClarifyOption[];
 }
 
 export interface ContextUsage {
@@ -258,6 +339,12 @@ export interface ChatMessage {
   steps?: AgentStep[];
   /** Phase 1: transient web-search progress line ("Reading N sources…"). */
   searchStatus?: string;
+  /**
+   * Live Salesforce phase (understanding → querying → verifying → …). Drives
+   * the ReasoningStar and is folded onto meta.status when the answer finishes,
+   * so reopening the chat shows the phase it ended on rather than a blank row.
+   */
+  phaseStatus?: import('./phases').PhaseStatus;
   /** Live research progress — folded into meta.research on finish. */
   research?: Research;
   createdAt: number;

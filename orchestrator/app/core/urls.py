@@ -29,6 +29,45 @@ def extract_urls(text: str, limit: int = 5) -> List[str]:
     return out
 
 
+#: How much OTHER text a genuine "read this link" message may carry. Enough for
+#: "Please read these three and compare them against our pricing page:", and far
+#: less than any real document.
+MAX_SURROUNDING_CHARS = 500
+
+#: …and how many lines. A share is a sentence; a pasted log is hundreds.
+MAX_SURROUNDING_LINES = 15
+
+
+def links_are_the_request(text: str, urls: List[str]) -> bool:
+    """Is the user ASKING me to read these links, or do they merely appear?
+
+    THE BUG (owner report, 2026-08-11). A 30,599-character paste — 831 lines of
+    content to analyse — happened to contain some URLs. `extract_urls` found
+    them, the request was routed to the URL engine, every fetch failed, and the
+    answer was one sentence: "I couldn't read any of those links." The paste,
+    which was the entire point of the message, was never looked at.
+
+    The distinguishing signal is not what the links are, it is how much ELSE the
+    message says. A link-sharing message is short because the links *are* the
+    message. A document that mentions a URL is a document.
+
+    Deliberately conservative in the direction that matters: when this returns
+    False the URLs are treated as ordinary text and the message is answered
+    normally, which is never catastrophic. Returning True wrongly means fetching
+    the web and discarding what the user actually sent.
+    """
+    if not urls:
+        return False
+    remainder = text or ""
+    for url in urls:
+        remainder = remainder.replace(url, " ")
+    if len(remainder.strip()) > MAX_SURROUNDING_CHARS:
+        return False
+    if remainder.count("\n") > MAX_SURROUNDING_LINES:
+        return False
+    return True
+
+
 def chunk_text(text: str, chunk_chars: int = 1600, overlap: int = 200) -> List[str]:
     """Split text into overlapping character chunks on whitespace boundaries."""
     text = text.strip()

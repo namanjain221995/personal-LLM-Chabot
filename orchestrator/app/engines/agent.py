@@ -188,10 +188,27 @@ async def make_plan(
     system = _PLAN_SYSTEM if salesforce else _PLAN_SYSTEM_NO_SF
     # The prompts are written with MAX_STEPS; ask for this level's budget.
     system = system.replace(f"at most {MAX_STEPS} ", f"at most {step_budget(effort)} ")
+    # The agent path is reached BEFORE the router, so a "report" or "dashboard"
+    # request handled here never sees engines/report.py and its canonical
+    # section list. Left to invent its own steps, it planned a day-by-day
+    # narrative off one of a candidate's five enrolments and drew nothing.
+    user_content = message
+    if salesforce:
+        from ..core import org_brief
+
+        template = org_brief.report_template_for(message)
+        if template:
+            user_content = (
+                f"{template}\n\nPlan ONE \"sql\" step per section above, using "
+                "the section title as the step title and its instruction as the "
+                "step input. Each step must return a category column and a "
+                "numeric count so the section can be drawn as a chart.\n\n"
+                f"{message}"
+            )
     messages = (
         llm.apply_reasoning_effort([{"role": "system", "content": system}], "high")
         + recent_turns(history, 6)
-        + [{"role": "user", "content": message}]
+        + [{"role": "user", "content": user_content}]
     )
     last_error: Optional[str] = None
     for _attempt in range(2):  # one retry on invalid JSON (V2-DESIGN §3b)
@@ -252,9 +269,39 @@ async def _run_step_impl(
     if step.kind == "sql" and salesforce:
         from ..config import settings
         from ..core.exports import cap_rows
-        from .sql import attach_chart, generate_and_run_sql  # reuse (§3b)
+        from .live_sf import fetch_live
+        from .sql import (  # reuse (§3b)
+            NoSuchTable,
+            WarehouseBusy,
+            attach_chart,
+            generate_and_run_sql,
+        )
 
-        sql, columns, rows = await generate_and_run_sql(step.input, history=list(history))
+        try:
+            sql, columns, rows = await generate_and_run_sql(
+                step.input, history=list(history)
+            )
+        except (WarehouseBusy, NoSuchTable) as reason:
+            # The direct SQL route answers these from live Salesforce. This
+            # one used to let the exception out, so a locked warehouse — which
+            # is most of the day — reached the user as a raw
+            # "Could not set lock on file /data/warehouse.duckdb ... PID 0".
+            soql, live_rows = await fetch_live(step.input, list(history))
+            sample = json.dumps(live_rows[:30], default=str)
+            preview, truncated = live_rows[: settings.sql_preview_row_cap], (
+                len(live_rows) > settings.sql_preview_row_cap
+            )
+            return (
+                f"Live Salesforce result ({len(live_rows)} row(s)):\n{sample}",
+                f"{len(live_rows)} row(s), live from Salesforce",
+                {
+                    "sql": soql,
+                    "live": True,
+                    "reason": str(reason),
+                    "data": preview,
+                    "truncated": truncated,
+                },
+            )
         sample = json.dumps(
             {"columns": list(columns), "rows": [list(r) for r in rows[:30]]}, default=str
         )

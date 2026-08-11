@@ -36,15 +36,29 @@ import { attachmentsForResend, rememberAttachments } from '@/lib/attachments';
 import { shortcutAction } from '@/lib/searchPalette';
 import {
   attachStream,
+  clarificationAlreadySubmitted,
   fetchServerActive,
   getLiveStream,
   isStreaming,
+  markClarificationSubmitted,
   messagesDiscardedByRegenerate,
   startStream,
   stopStream,
   streamingIds,
   subscribeStreams,
 } from '@/lib/streams';
+import {
+  buildResponse,
+  pendingClarification,
+  type ClarificationRequest,
+  type ClarificationResponse,
+} from '@/lib/clarification';
+import {
+  cancelClarification,
+  fetchSalesforceContext,
+  shouldShowStarter,
+  type StarterOption,
+} from '@/lib/salesforceApi';
 import { latestUsage, meterView } from '@/lib/contextMeter';
 import type {
   ChatMessage,
@@ -53,6 +67,7 @@ import type {
   PastedText,
 } from '@/lib/types';
 import { Composer, type Attachment, type ComposerHandle } from './Composer';
+import { SalesforceStarterCard } from './SalesforceStarterCard';
 import { ConfirmDialog } from './ConfirmDialog';
 import { ContextMeter } from './ContextMeter';
 import { SummaryPanel } from './SummaryPanel';
@@ -110,6 +125,20 @@ export function ChatApp() {
   const [compactedAt, setCompactedAt] = useState<number | null>(null);
   const [summaryOpen, setSummaryOpen] = useState(false);
   const draftTimer = useRef<number | null>(null);
+  /** Salesforce starter-card suggestions for the OPEN chat (server-filtered). */
+  const [starterOptions, setStarterOptions] = useState<StarterOption[]>([]);
+  /**
+   * The clarification whose answer is in flight, by id — NOT a boolean.
+   *
+   * A boolean was a latch: it was set on submit and only cleared when the
+   * conversation changed, so the SECOND question in a chat rendered
+   * permanently disabled and could not be clicked at all. Keying on the id
+   * makes it self-healing — a new question has a new id, so it is never
+   * covered by the previous answer's lock.
+   */
+  const [submittingClarificationId, setSubmittingClarificationId] = useState<
+    string | null
+  >(null);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<ComposerHandle>(null);
@@ -274,6 +303,18 @@ export function ChatApp() {
       if (!s) return;
       if (s.status !== 'streaming') {
         refreshList(); // finished → reorder list
+        // Name the chat from the exchange that just completed. Fired here,
+        // after the answer has fully streamed, rather than from the server:
+        // nothing pulls a server-side title change into this cache except a
+        // full refresh, so a title written behind our back would stay
+        // invisible until the next page load. The store no-ops unless the
+        // conversation still has its auto-derived title.
+        if (s.status === 'done') {
+          void getHistoryStore()
+            .generateTitle(id)
+            .then(refreshList)
+            .catch(() => undefined);
+        }
         // Clear it from the polled set NOW: waiting for the next 8s poll left
         // the sidebar spinner turning for seconds after the answer landed.
         setServerActive((prev) =>
@@ -399,13 +440,72 @@ export function ChatApp() {
     })();
   }, [compacting, toast]);
 
-  const updatePrefs = useCallback((next: ChatPrefs) => {
-    setPrefs(next);
-    savePrefs(window.localStorage, activeIdRef.current, next);
-  }, []);
+  /* --------------------------------- Salesforce Intelligence Mode */
+
+  // The question this thread is waiting on, read from the LAST assistant
+  // message. Deriving it from the thread rather than holding it in its own
+  // state is what makes it survive a reload for free: the message comes back
+  // from history with `meta.clarification` on it, and the card rebuilds.
+  const pending = pendingClarification(messages);
+  const pendingRef = useRef<ClarificationRequest | null>(null);
+  pendingRef.current = pending;
+
+  // Set by "Something else": the NEXT composer submit is the answer to this
+  // question rather than a new message.
+  const [customAnswerFor, setCustomAnswerFor] =
+    useState<ClarificationRequest | null>(null);
+  const customAnswerRef = useRef<ClarificationRequest | null>(null);
+  customAnswerRef.current = customAnswerFor;
+
+  // A pending question belongs to ONE conversation. Without this, opening
+  // another chat left the composer waiting to answer a question that is not on
+  // screen — and the next thing typed there would resume the wrong intent.
+  useEffect(() => {
+    setCustomAnswerFor(null);
+    setSubmittingClarificationId(null);
+  }, [activeId]);
+
+  // Starter card + server-side pending state. Loaded when the chat changes and
+  // when Salesforce is switched on — the options are filtered server-side to
+  // what this connection can actually query, so they cannot be computed here.
+  useEffect(() => {
+    if (!activeId || !prefs.salesforce) {
+      setStarterOptions([]);
+      return;
+    }
+    let cancelled = false;
+    void fetchSalesforceContext(activeId).then((context) => {
+      if (!cancelled) setStarterOptions(context.options);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeId, prefs.salesforce]);
+
+  const updatePrefs = useCallback(
+    (next: ChatPrefs) => {
+      const id = activeIdRef.current;
+      // Switching the source OFF with a question on screen must cancel it
+      // SERVER-side. The card disappearing is not what ends the question: the
+      // orchestrator would still be waiting, and the next Salesforce message
+      // here would be read as an answer to something the user dismissed.
+      if (prefsRef.current.salesforce && !next.salesforce && id && pendingRef.current) {
+        setCustomAnswerFor(null);
+        void cancelClarification(id);
+      }
+      setPrefs(next);
+      savePrefs(window.localStorage, id, next);
+    },
+    [],
+  );
 
   const send = useCallback(
-    (text: string, attachments: Attachment[], pasted: PastedText[]) => {
+    (
+      text: string,
+      attachments: Attachment[],
+      pasted: PastedText[],
+      clarification?: ClarificationResponse | null,
+    ) => {
       // Up to 5 images OR exactly one PDF/dataset (2026-08-05) — the
       // Composer enforces the shape; `first` covers the exclusive kinds.
       const first = attachments[0] ?? null;
@@ -498,9 +598,63 @@ export function ChatApp() {
         images: isPdf ? null : images.map((i) => i.base64).filter(Boolean),
         pdf: isPdf ? first?.base64 ?? null : null,
         pdfName: isPdf ? first?.name ?? null : null,
+        clarification: clarification ?? null,
       });
     },
     [activeId, persist, refreshList, setUrlConversation, toast],
+  );
+
+  /**
+   * Answer the pending question from the card.
+   *
+   * The chosen label is appended as a normal user turn so the transcript reads
+   * as a conversation, while the structured response rides alongside it — that
+   * is what lets the server resume the ORIGINAL request instead of treating
+   * "This quarter" as a question of its own.
+   */
+  const answerClarification = useCallback(
+    (response: ClarificationResponse, summary: string) => {
+      if (clarificationAlreadySubmitted(response.client_message_id)) return;
+      markClarificationSubmitted(response.client_message_id);
+      setSubmittingClarificationId(response.clarification_id);
+      setCustomAnswerFor(null);
+      send(summary, [], [], response);
+    },
+    [send],
+  );
+
+  /** "Something else" — arm the composer to answer, and focus it. */
+  const useComposerForClarification = useCallback(
+    (request: ClarificationRequest) => {
+      setCustomAnswerFor(request);
+      composerRef.current?.focus();
+    },
+    [],
+  );
+
+  /**
+   * A composer submit. When "Something else" armed a question, this text IS the
+   * answer and carries its clarification_id; otherwise it is an ordinary
+   * message — and the SERVER still decides whether it happens to answer a
+   * pending question, because a user who ignores the card and just types
+   * "last 90 days" means exactly that.
+   */
+  const sendFromComposer = useCallback(
+    (text: string, attachments: Attachment[], pasted: PastedText[]) => {
+      const armed = customAnswerRef.current;
+      if (armed && text.trim() && attachments.length === 0) {
+        const response = buildResponse(armed, { customText: text });
+        if (response && !clarificationAlreadySubmitted(response.client_message_id)) {
+          markClarificationSubmitted(response.client_message_id);
+          setSubmittingClarificationId(response.clarification_id);
+          setCustomAnswerFor(null);
+          send(text, [], pasted, response);
+          return;
+        }
+      }
+      send(text, attachments, pasted);
+    },
+    [send],
   );
 
   /** Re-run the turn that produced the assistant message at `messageId`. */
@@ -917,6 +1071,10 @@ export function ChatApp() {
                   onRegenerate={() => regenerate(m.id)}
                   onRetry={() => regenerate(m.id)}
                   onShowSummary={() => setSummaryOpen(true)}
+                  onClarify={(choice) => void send(choice, [], [])}
+                  onClarificationAnswer={answerClarification}
+                  onClarificationCustom={useComposerForClarification}
+                  submittingClarificationId={submittingClarificationId}
                   onFeedback={(feedback) => {
                     if (!activeId) return;
                     // Fire-and-forget: the store updates its cache first and
@@ -962,8 +1120,27 @@ export function ChatApp() {
           }
           prefs={prefs}
           onPrefsChange={updatePrefs}
-          onSend={send}
+          onSend={sendFromComposer}
           onStop={stopStreaming}
+          clarificationPlaceholder={
+            customAnswerFor?.custom_placeholder ??
+            (pending ? pending.custom_placeholder : undefined)
+          }
+          starter={
+            shouldShowStarter({
+              salesforceEnabled: prefs.salesforce,
+              messageCount: messages.length,
+              streaming,
+              hasPendingClarification: Boolean(pending),
+              optionCount: starterOptions.length,
+            }) ? (
+              <SalesforceStarterCard
+                options={starterOptions}
+                onPick={(prompt) => void send(prompt, [], [])}
+                onUseComposer={() => composerRef.current?.focus()}
+              />
+            ) : null
+          }
         />
       </div>
     </div>
