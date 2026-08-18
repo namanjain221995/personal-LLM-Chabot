@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import re
 from collections.abc import Mapping
 from typing import AsyncIterator, List, Optional, Sequence, Tuple
 
@@ -131,7 +132,46 @@ async def chat_completion(
     if extra_body is not None:
         request["extra_body"] = extra_body
     resp = await client.chat.completions.create(**request)
-    return resp.choices[0].message.content or ""
+    _, content = split_reasoning(resp.choices[0].message, settings.main_capabilities)
+    return content
+
+
+async def chat_completion_with_reasoning(
+    messages: Sequence[dict],
+    *,
+    model: Optional[str] = None,
+    temperature: float = 0.2,
+    max_tokens: Optional[int] = None,
+    effort: str = "high",
+) -> Tuple[str, str]:
+    """Non-streaming completion that KEEPS the reasoning. → (reasoning, text).
+
+    The non-streaming path historically discarded reasoning entirely; this is
+    the collector best-of-N and any future judge/offline path use. Thinking
+    follows the effort (fast/low: off), with the same budget-grown max_tokens
+    as the streaming path.
+    """
+    client = _openai_client()
+    model_id = model or settings.llm_model
+    thinking_on = wants_thinking("smart", effort)
+    budget_tokens = thinking_budget(effort) if thinking_on else None
+    requested = max_tokens
+    if budget_tokens and max_tokens is not None:
+        requested = max_tokens + budget_tokens
+    sized, budget = await context.fit_request(
+        normalize_system(messages),
+        base_url=settings.openai_base_url,
+        model=model_id,
+        requested_max_tokens=requested,
+    )
+    request = dict(
+        model=model_id, messages=sized, temperature=temperature, max_tokens=budget
+    )
+    extra_body = reasoning_extra_body(settings.main_capabilities, thinking_on)
+    if extra_body is not None:
+        request["extra_body"] = extra_body
+    resp = await client.chat.completions.create(**request)
+    return split_reasoning(resp.choices[0].message, settings.main_capabilities)
 
 
 async def stream_chat_completion(
@@ -263,6 +303,18 @@ def _delta_value(delta: object, name: str):
     return getattr(delta, name, None)
 
 
+def _reasoning_field_names(capabilities: ModelCapabilities) -> Tuple[str, ...]:
+    """The delta/message field names that may carry reasoning, or ()."""
+    if not capabilities.supports_reasoning:
+        return ()
+    field = capabilities.reasoning_field
+    if field is ReasoningField.NONE:
+        return ()
+    if field is ReasoningField.AUTO:
+        return (ReasoningField.REASONING.value, ReasoningField.REASONING_CONTENT.value)
+    return (field.value,)
+
+
 def _reasoning_delta(delta: object, capabilities: ModelCapabilities) -> Optional[str]:
     """Extract a reasoning delta without assuming a vLLM response shape.
 
@@ -270,24 +322,48 @@ def _reasoning_delta(delta: object, capabilities: ModelCapabilities) -> Optional
     simply produce no reasoning event; answer content continues through the
     unchanged ``token`` SSE path.
     """
-    if not capabilities.supports_reasoning:
-        return None
-    field = capabilities.reasoning_field
-    if field is ReasoningField.NONE:
-        return None
-    if field is ReasoningField.AUTO:
-        names = (ReasoningField.REASONING.value, ReasoningField.REASONING_CONTENT.value)
-    else:
-        names = (field.value,)
-
     model_extra = _delta_value(delta, "model_extra")
-    for name in names:
+    for name in _reasoning_field_names(capabilities):
         value = _delta_value(delta, name)
         if not value and isinstance(model_extra, Mapping):
             value = model_extra.get(name)
         if value:
             return str(value)
     return None
+
+
+#: A raw thinking block at the head of `content` — what a response looks like
+#: when a path bypasses vLLM's --reasoning-parser (a backend without the
+#: flag, or a template that emitted <think> anyway).
+_THINK_FALLBACK_RE = re.compile(r"^\s*<think>(.*?)</think>\s*", re.S | re.I)
+
+
+def split_reasoning(
+    message: object, capabilities: ModelCapabilities
+) -> Tuple[str, str]:
+    """(reasoning, content) from a NON-streaming completion message.
+
+    Reads the parser's extension field (`reasoning` / `reasoning_content`)
+    first, then falls back to a literal <think>…</think> block at the head of
+    the content — so a path that bypasses the reasoning parser still returns
+    clean answer text instead of leaking the thought into it.
+    """
+    content = str(_delta_value(message, "content") or "")
+    reasoning = ""
+    model_extra = _delta_value(message, "model_extra")
+    for name in _reasoning_field_names(capabilities):
+        value = _delta_value(message, name)
+        if not value and isinstance(model_extra, Mapping):
+            value = model_extra.get(name)
+        if value:
+            reasoning = str(value)
+            break
+    if not reasoning:
+        match = _THINK_FALLBACK_RE.match(content)
+        if match:
+            reasoning = match.group(1).strip()
+            content = content[match.end():]
+    return reasoning, content
 
 
 def apply_reasoning_effort(
@@ -537,7 +613,10 @@ async def chat_with_tools(
         request["extra_body"] = extra_body
     resp = await client.chat.completions.create(**request)
     message = resp.choices[0].message
-    return (_delta_value(message, "content") or ""), _parse_tool_calls(message)
+    # The <think> fallback matters here most: a raw thinking block leaking
+    # into `text` would be re-parsed downstream as if the model SAID it.
+    _, text = split_reasoning(message, settings.main_capabilities)
+    return text, _parse_tool_calls(message)
 
 
 async def json_completion(
