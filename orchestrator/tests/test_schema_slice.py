@@ -49,8 +49,12 @@ SLOT_Q = ("how many candidates completed the training from slot 128 "
 
 
 def test_the_prompt_is_not_the_whole_warehouse():
+    """The cap moved from 24 to 40 (2026-08-18) because 40 tables of this
+    warehouse is ~18k tokens against a 237k budget. It did NOT go away: the
+    failure it prevents — a model that cannot find the question in the prompt
+    and writes the wrong query silently — does not get cheaper with context."""
     kept = relevant_schema(SCHEMA, SLOT_Q, must_include=ob.tables_for(SLOT_Q))
-    assert len(kept) <= 24, f"{len(kept)} tables is back to burying the question"
+    assert len(kept) <= 40, f"{len(kept)} tables is back to burying the question"
     assert len(kept) < len(SCHEMA)
 
 
@@ -89,7 +93,9 @@ def test_a_very_wide_table_is_trimmed_but_keeps_its_keys():
     touches three is what made the prompt unreadable."""
     kept = relevant_schema(SCHEMA, SLOT_Q, must_include=ob.tables_for(SLOT_Q))
     account = dict.fromkeys(name for name, _ in kept["Account"])
-    assert len(account) <= 70
+    # 140 since 2026-08-18: Internal_Interview__c alone has 66 columns and at
+    # 70 a wide object lost the very field a question named.
+    assert len(account) <= 140
     for key in ("Id", "Name", "RecordTypeId"):
         assert key in account, f"{key} must survive trimming"
 

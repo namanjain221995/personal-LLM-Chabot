@@ -58,6 +58,10 @@ def _is_missing(v: object) -> bool:
     return v is None or (isinstance(v, str) and not v.strip())
 
 
+#: "1,234" / "12,345,678.90" — separators every three digits, nothing else.
+_THOUSANDS_RE = re.compile(r"-?\d{1,3}(,\d{3})+(\.\d+)?")
+
+
 def _as_number(v: object) -> Optional[float]:
     """Return v as a float, or None. Booleans and bool-ish text are NOT numbers."""
     if isinstance(v, bool):
@@ -73,6 +77,17 @@ def _as_number(v: object) -> Optional[float]:
         s = v.strip()
         if not s or s.lower() in _BOOL_TOKENS:
             return None
+        # Salesforce currency and formatted numbers arrive as TEXT — the
+        # warehouse stores every column as VARCHAR, and "$1,234.56" made an
+        # Amount column profile as CATEGORICAL, so a revenue breakdown had "no
+        # metric to plot" and never charted. Strict shape checks, not a
+        # general de-formatter: "1,23" and "12,34,56" stay non-numeric.
+        if s[:1] in "$€£₹":
+            s = s[1:].strip()
+        if _THOUSANDS_RE.fullmatch(s):
+            s = s.replace(",", "")
+        if s.endswith("%") and len(s) > 1:
+            s = s[:-1].strip()
         try:
             return float(s)
         except ValueError:

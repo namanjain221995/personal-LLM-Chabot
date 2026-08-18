@@ -122,10 +122,18 @@ async def _run_pandoc(md_path: Path, out_path: Path, resource_dir: Path) -> None
         )
 
 
-async def _sql_section(sec: dict, index: int, tmp_dir: Path) -> List[str]:
+async def _sql_section(
+    sec: dict, index: int, tmp_dir: Path, request: str = ""
+) -> List[str]:
     parts: List[str] = []
     sql, columns, rows = await generate_and_run_sql(
-        sec["instruction"], fetch_cap=settings.sql_preview_row_cap + 1
+        sec["instruction"],
+        fetch_cap=settings.sql_preview_row_cap + 1,
+        # Same reason as the agent route: a section instruction is the
+        # PLANNER's wording, so the user's own nouns and names — which is what
+        # the brain packs, the table aliases and the person lookup key on —
+        # are absent by the time this SQL is written.
+        grounding_question=request,
     )
     sample = json.dumps(
         {"columns": columns, "rows": [list(r) for r in rows[:30]]}, default=str
@@ -249,7 +257,7 @@ async def run_report_engine(message: str, history: Sequence[dict], emit: Emit) -
             md_lines += [f"## {index}. {sec['title']}", ""]
             try:
                 if sec["kind"] == "sql":
-                    md_lines += await _sql_section(sec, index, tmp_dir)
+                    md_lines += await _sql_section(sec, index, tmp_dir, message)
                 else:
                     md_lines += await _rag_section(sec)
             except Exception as exc:  # keep the report going; note the failure

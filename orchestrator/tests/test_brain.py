@@ -153,9 +153,12 @@ def test_knowledge_retrieval_prefers_title_and_keyword_hits(tmp_path):
 
 
 def test_stacked_pack_rules_are_capped_strongest_match_first(tmp_path):
-    """A multi-domain question must not stack every matched pack's rules —
-    22KB of grounding is a real latency cost and a diluted prompt."""
-    filler = "x" * 3800
+    """A multi-domain question must not stack every matched pack's rules.
+
+    The budget moved 9KB -> 24KB (2026-08-18) — the question that needs the
+    most knowledge was getting the least — but the ORDERING guarantee is what
+    this protects: strongest trigger match first, whole blocks only."""
+    filler = "x" * 4800
     write_pack(tmp_path, name="strong",
                triggers=["invoice", "emi", "payment"],
                rules="STRONG-RULES " + filler, metrics=[], field_notes={}, knowledge=[])
@@ -166,8 +169,10 @@ def test_stacked_pack_rules_are_capped_strongest_match_first(tmp_path):
     rules = brain.rules_for("emi payment on this invoice")
     assert "STRONG-RULES" in rules              # 3 trigger hits — always first
     assert len(rules) <= brain._RULES_TOTAL_CAP
-    # Only whole blocks: with ~3.8KB each and a 9KB cap, exactly two fit.
-    assert rules.count("-RULES") == 2
+    # Whole blocks only, strongest first: with ~4.8KB each (capped per pack at
+    # _RULES_CAP) and a 24KB total, all three fit and none is sliced.
+    assert rules.count("-RULES") == 3
+    assert rules.index("STRONG-RULES") == 0
 
 
 # ---------------------------------------------------------------------------

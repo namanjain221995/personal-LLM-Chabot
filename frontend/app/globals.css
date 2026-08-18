@@ -82,7 +82,9 @@
 
   /* categorical chart palette — validated for CVD + contrast on both
      surfaces (fixed assignment order, never cycled) */
-  --ts-chart-1: #0e9f9a;
+  --ts-chart-1: #0e9d9a; /* validator-proven: 3.0:1 on the light chart
+     surface where #0e9f9a sat at 2.96:1; every other check (lightness band,
+     chroma, CVD, normal-vision floor) still passes in BOTH modes. */
   --ts-chart-2: #2f6fb2;
   --ts-chart-3: #b7791f;
   --ts-chart-4: #6d5ae6;

@@ -123,7 +123,11 @@ _PLAN_SYSTEM = (
     'changed after training; "llm" reasons '
     "over the conversation context (including any web pages, documents, or text "
     "the user shared earlier in this chat) and general knowledge. Steps must not "
-    "depend on each other's outputs — they run in parallel."
+    "depend on each other's outputs — they run in parallel.\n"
+    "A request for DATA — a list, a count, records, a breakdown — MUST be a "
+    "sql or salesforce step. Never plan an llm step whose output would be a "
+    "query for the user to run: this platform executes queries itself, and "
+    "an answer telling the user to open Workbench is a failure."
 )
 
 # Salesforce OFF: NO Salesforce access. Everything is an "llm" step working from
@@ -158,6 +162,37 @@ def _coerce_no_salesforce(plan: AgentPlan) -> AgentPlan:
         # coercing here means the step never even gets planned.
         if step.kind in ("sql", "rag", "salesforce"):
             step.kind = "llm"
+    return plan
+
+
+def ensure_web_step(plan: AgentPlan, message: str) -> AgentPlan:
+    """A FORCED web search must actually search.
+
+    The composer's web pill collapses into the same boolean as the auto
+    classifier by the time it reaches this engine, so the planner stayed free
+    to plan zero web steps — and did: asked about a GPT-5.6 announcement with
+    web search forced ON, it planned one "llm" step, answered from training
+    memory that no such model exists, and the trust line under the composer
+    still said "search queries are sent to the internet". The user switched
+    the search on; honouring that is not the model's judgement call.
+
+    The first llm step is converted rather than a step appended, so the plan
+    shape (and its cost) is unchanged for the common one-step case.
+    """
+    if any(step.kind == "web" for step in plan.steps):
+        return plan
+    for step in plan.steps:
+        if step.kind == "llm":
+            step.kind = "web"
+            return plan
+    plan.steps.append(
+        PlanStep(
+            id=max((s.id for s in plan.steps), default=0) + 1,
+            title="Web research",
+            kind="web",
+            input=message,
+        )
+    )
     return plan
 
 
@@ -237,8 +272,21 @@ async def make_plan(
 # ---------------------------------------------------------------------------
 
 _STEP_LLM_SYSTEM = (
-    "You are a careful analyst working on one step of a larger plan. "
-    "Complete the instruction concisely and factually." + CODE_INSTRUCTION
+    "You are a careful analyst working on one step of a larger plan, inside a "
+    "data platform that RUNS Salesforce queries itself.\n"
+    # Asked for "a list of candidates having 150+ interviews", an llm step
+    # answered like a coding tutor: SOQL "to run in Workbench" plus a Python
+    # script — to a user who wanted rows, in a product whose entire point is
+    # that IT runs the queries. The previous turn's SOQL error in the history
+    # made it worse: the model saw broken SOQL and helpfully "fixed" it.
+    "NEVER answer a request for data (a list, a count, records, a breakdown) "
+    "with query code for the user to run — no SOQL, SQL, Apex or scripts 'for "
+    "Workbench', the 'Developer Console' or any CLI. The user cannot run "
+    "code; the platform's own query steps fetch data. If this step is really "
+    "a data request, say in ONE line that the data should come from a "
+    "Salesforce query step rather than writing the query as prose. Write code "
+    "only when the user explicitly asked for code itself."
+    + CODE_INSTRUCTION
 )
 
 
@@ -279,7 +327,16 @@ async def _run_step_impl(
 
         try:
             sql, columns, rows = await generate_and_run_sql(
-                step.input, history=list(history)
+                step.input,
+                history=list(history),
+                # Ground on what the USER asked, not only on the planner's
+                # paraphrase of it. The step input loses the names, the domain
+                # nouns the brain packs trigger on, and the words that decide
+                # which object a person lives on — so this route answered "no
+                # data available for the specific individuals" and charted a
+                # lone Human_Decision__c of 0, while the SAME question at Fast
+                # or Low (which never reach the planner) answered correctly.
+                grounding_question=message,
             )
         except (WarehouseBusy, NoSuchTable) as reason:
             # The direct SQL route answers these from live Salesforce. This
@@ -382,7 +439,28 @@ async def _run_step_impl(
                 {"sources": sources},
             )
         # Search unavailable or nothing readable — answer from model knowledge
-        # rather than failing the step and losing this part of the plan.
+        # rather than failing the step and losing this part of the plan. But
+        # SAY SO: this branch used to degrade silently, so an answer written
+        # from training memory shipped under a trust line claiming search
+        # queries were sent to the internet. The synthesis quotes step results,
+        # so the caveat lands in front of the user.
+        note = (
+            "[Web search returned no readable sources for this step — the "
+            "following is from general knowledge and may be out of date.]\n"
+        )
+        answer = await llm.chat_completion(
+            [
+                {"role": "system", "content":
+                 "Answer from the conversation context and general knowledge. "
+                 "State plainly that a web search found no readable sources "
+                 "and that your knowledge may be out of date."},
+                *recent_turns(history, 6),
+                {"role": "user", "content": step.input},
+            ],
+            temperature=0.2,
+            max_tokens=4000,
+        )
+        return (note + answer, "search returned nothing readable", {})
 
     # kind == "llm" (or sql/rag with Salesforce off, or web with no results):
     # reason over the conversation context (which includes any shared
@@ -561,7 +639,12 @@ _SYNTH_SYSTEM = (
     "numbers present in the step results — never fabricate values. Briefly "
     "note any step that failed. Where a step result cites a web source with a "
     "bracketed number like [2], keep that citation on the claim it supports; "
-    "never invent a citation number that no step produced."
+    "never invent a citation number that no step produced.\n"
+    "When the user asked for DATA, the answer is the data from the step "
+    "results — never a SOQL/SQL query, an Apex class or a script for the "
+    "user to run somewhere else. This platform runs queries itself; if the "
+    "steps returned no rows, say what was looked for and found, not how the "
+    "user could query it by hand."
 )
 
 
@@ -570,8 +653,19 @@ def _synthesis_messages(message: str, results: Sequence[dict]) -> List[dict]:
         f"### Step {r['step'].id}: {r['step'].title} [{r['status']}]\n{r['output']}"
         for r in results
     ]
+    # The steps' chart survives the meta merge (see _SQL_PAYLOAD_KEYS), so at
+    # synthesis time "a real chart will render below" is a fact the model can
+    # be told — the same mechanism as the SQL engine's narration. Without it,
+    # a synthesis asked for a "bar chat" drew the chart itself out of █
+    # characters in a code block, on top of the real one.
+    from .sql import _chart_line
+
+    chart_attached = any(
+        (r.get("meta") or {}).get("chart") for r in results
+    )
     user = f"Request: {message}\n\nStep results:\n\n" + "\n\n".join(blocks)
-    return [{"role": "system", "content": _SYNTH_SYSTEM + DIAGRAM_INSTRUCTION},
+    return [{"role": "system", "content": _SYNTH_SYSTEM + "\n"
+             + _chart_line(chart_attached) + DIAGRAM_INSTRUCTION},
             {"role": "user", "content": user}]
 
 
@@ -586,6 +680,8 @@ class AgentState(TypedDict, total=False):
     effort: str
     salesforce: bool
     web: bool
+    #: The user FORCED search on (web pill), as opposed to auto allowing it.
+    web_forced: bool
     plan: AgentPlan
     results: List[dict]
     answer: str
@@ -598,7 +694,10 @@ async def _plan_node(state: AgentState) -> dict:
         state.get("salesforce", True),
         state.get("effort", "medium"),
     )
-    return {"plan": coerce_allowed(plan, web=state.get("web", True))}
+    plan = coerce_allowed(plan, web=state.get("web", True))
+    if state.get("web", True) and state.get("web_forced", False):
+        plan = ensure_web_step(plan, state["message"])
+    return {"plan": plan}
 
 
 async def _execute_node(state: AgentState) -> dict:
@@ -669,6 +768,7 @@ async def run_agent_engine(
     effort: str = "medium",
     salesforce: bool = True,
     web: bool = True,
+    web_forced: bool = False,
 ) -> str:
     """Entry point used by /chat when agent=true.
 
@@ -686,6 +786,7 @@ async def run_agent_engine(
             "effort": effort,
             "salesforce": salesforce,
             "web": web,
+            "web_forced": web_forced,
         }
     )
     return state.get("answer") or ""

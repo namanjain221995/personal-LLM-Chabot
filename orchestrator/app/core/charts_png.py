@@ -47,6 +47,8 @@ PNG_SUPPORTED = frozenset(
 #: type without deciding its report behaviour fails the suite.
 PNG_TABLE_ONLY = frozenset({"funnel"})
 
+#: Matches MAX_SLICES in frontend/lib/chartOption.ts — the SAME data must not
+#: show six slices on screen and eight in the exported document.
 _MAX_PIE_SLICES = 8
 
 
@@ -106,6 +108,14 @@ def render_chart_png(
     xs = [str(r[xi]) for r in rows]
 
     fig, ax = plt.subplots(figsize=(8, 4.5))
+    # The app's validated categorical palette (chartTheme.ts / --ts-chart-*),
+    # in the same fixed assignment order. Without this an exported report used
+    # matplotlib's default blue/orange — a chart in the document that matched
+    # nothing on screen. Slot 1 is the light-surface variant, since reports
+    # render on white.
+    ax.set_prop_cycle(
+        color=["#0e9d9a", "#2f6fb2", "#b7791f", "#6d5ae6", "#c0566b"]
+    )
     try:
         if spec.type in ("pie", "donut"):
             _draw_part_to_whole(ax, spec, cols, rows, xs)

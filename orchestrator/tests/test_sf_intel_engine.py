@@ -529,7 +529,13 @@ def _live(monkeypatch, *, pages, total=None, fail=False):
 
     async def run_soql_page(soql):
         if fail:
-            raise salesforce.SalesforceUnavailable("Salesforce rejected the query")
+            # An OUTAGE-shaped failure. Query-REJECTION failures ("rejected
+            # the query", "invalid ID field"…) are a different class with a
+            # different contract: they fall back to the warehouse, because a
+            # query the org refuses is our bug and never the user's problem.
+            raise salesforce.SalesforceUnavailable(
+                fail if isinstance(fail, str) else "connection timed out"
+            )
         ran["soql"] = soql
         first = pages[0]
         return {
@@ -668,6 +674,29 @@ def test_a_tool_failure_is_never_reported_as_zero_matching_records(monkeypatch):
     assert "not the same as finding no matching records" in outcome.answer
     assert rec.meta().get("salesforce_error")
     assert "failed" in rec.phases()
+
+
+def test_a_query_the_org_rejects_falls_back_to_the_warehouse(monkeypatch):
+    """Live failure (2026-08-18): after TWO answered clarifications the
+    planner produced `RecordTypeId != 'Internal_Interview__c'` and the turn
+    ended with a raw SOQL error. A query the org REFUSES is our bug — the
+    warehouse engine writes its own SQL with its own grounding, so the
+    request is handed there instead, exactly like PlanRejected."""
+    _live(
+        monkeypatch, pages=[[]],
+        fail="Salesforce rejected the query: invalid ID field: Internal_Interview__c",
+    )
+    stub_schema(monkeypatch)
+    stub_planner(monkeypatch, _execute_decision())
+
+    rec = Recorder()
+    outcome = run(
+        sf_intel.run("Show my pipeline", [], rec.emit, conversation_id=CONV)
+    )
+    assert outcome.handled is False, "the turn must continue, not end in an error"
+    assert outcome.resolved_text
+    # No failure message reached the user from this engine.
+    assert "failed" not in (outcome.answer or "")
 
 
 def test_an_empty_result_says_so_plainly(monkeypatch):

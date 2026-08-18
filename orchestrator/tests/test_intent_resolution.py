@@ -746,3 +746,141 @@ class TestToolFailure:
 
 async def _sql():
     return "sql"
+
+
+class TestEffortIndependence:
+    """Effort buys more thorough WORK, not a different conversation.
+
+    `thinking` on the planner used to be `effort in ("medium", "high")`, so
+    the same ambiguous request about five named people was clarified at Fast
+    and Low and silently guessed at Medium — and nothing told the user that
+    turning the quality dial up had turned the questions off.
+    """
+
+    def test_the_planner_decision_does_not_depend_on_the_effort_dial(self, monkeypatch):
+        seen: list = []
+
+        async def capture(messages, **kwargs):
+            seen.append(kwargs.get("thinking"))
+            return '{"action": "EXECUTE_SALESFORCE"}'
+
+        monkeypatch.setattr(planner.llm, "json_completion", capture)
+        monkeypatch.setattr(settings, "salesforce_planner_tool_calling", False)
+
+        for effort in ("fast", "low", "medium", "high"):
+            asyncio.run(
+                planner.plan(
+                    user_text="how many mocks for Jay",
+                    intent=_intent(),
+                    state=sf_state.ConversationSalesforceState(conversation_id=CONV),
+                    effort=effort,
+                )
+            )
+        assert seen, "the planner was never called"
+        assert len(set(seen)) == 1, f"thinking varied with effort: {seen}"
+
+    def test_the_grounding_is_keyed_on_the_question_not_the_effort(self):
+        """The brain reaches the model identically at every level — what used
+        to differ was the ROUTE (medium/high can plan multi-step work, and the
+        agent's SQL steps were grounded on the planner's paraphrase)."""
+        from app.core import org_brief
+
+        grounding = org_brief.grounding_for(
+            "how many internal interviews has Jayesh Prajapati completed"
+        )
+        assert "Recruiter__c" in grounding
+        assert "WHO A NAMED PERSON IS" in grounding
+
+
+class TestAgentRouteGrounding:
+    def test_a_plan_step_is_grounded_on_the_users_words(self, monkeypatch):
+        """A step input is the PLANNER's wording, so the names and the domain
+        nouns the packs trigger on are gone by the time the SQL is written.
+        The agent answered "no data available for the specific individuals"
+        while the same question at Fast answered correctly."""
+        from app.engines import sql as sqleng
+
+        seen: dict = {}
+
+        async def capture(question, schema_text, history=(), **kwargs):
+            seen["question"] = question
+            seen["grounding_question"] = kwargs.get("grounding_question")
+            return "SELECT 1"
+
+        monkeypatch.setattr(sqleng, "_ask_sql", capture)
+        # No warehouse in the test environment; the slice only has to exist.
+        monkeypatch.setattr(
+            sqleng.schema_cache, "get", lambda *_a, **_k: {"Internal_Interview__c": [("Id", "VARCHAR")]}
+        )
+        monkeypatch.setattr(sqleng, "_execute", lambda *a, **k: (["x"], [[1]]))
+        monkeypatch.setattr(sqleng, "guard_sql", lambda s, *a, **k: s)
+        monkeypatch.setattr(sqleng, "references_a_known_table", lambda *a, **k: True)
+
+        asyncio.run(
+            sqleng.generate_and_run_sql(
+                "Count completed internal interviews grouped by employee",
+                grounding_question="how many interviews has Jayesh Prajapati completed",
+            )
+        )
+        # The INSTRUCTION is the step; the GROUNDING carries the user's words.
+        assert seen["question"].startswith("Count completed")
+        assert "Jayesh Prajapati" in seen["grounding_question"]
+
+
+class TestPersonResolutionForThePlanner:
+    """The planner's entity search used to run a live SOSL over only the FIRST
+    capitalised token: asked about five staff by full name it searched
+    "Jayesh", got every Jayesh in the org plus fuzzy noise, labelled them all
+    "candidates" (they are recruiters), and interrupted the user to pick — for
+    names the warehouse matches exactly.
+    """
+
+    def _people(self, monkeypatch, payload):
+        from app.engines import sql as sqleng
+
+        monkeypatch.setattr(sqleng, "resolve_people", lambda _q: payload)
+        monkeypatch.setattr(
+            sqleng, "who_these_people_are", lambda _q: "FACTS BLOCK" if payload else ""
+        )
+
+    def test_exact_matches_become_facts_not_questions(self, monkeypatch):
+        from app.engines.sf_intel import _entity_candidates
+
+        self._people(monkeypatch, [
+            {"asked": "Jayesh Prajapati", "object": "Recruiter__c",
+             "meaning": "staff (Recruiter__c) — interviews they RAN link through x",
+             "matches": ["Jayesh Prajapati"]},
+            {"asked": "Jay Soni", "object": "Recruiter__c",
+             "meaning": "staff (Recruiter__c) — interviews they RAN link through x",
+             "matches": ["Jay Soni"]},
+        ])
+        options, facts = asyncio.run(_entity_candidates("q", []))
+        assert options == []
+        assert facts == "FACTS BLOCK"
+
+    def test_a_genuinely_ambiguous_name_offers_the_real_matches(self, monkeypatch):
+        from app.engines.sf_intel import _entity_candidates
+
+        self._people(monkeypatch, [
+            {"asked": "Jayesh", "object": "Recruiter__c",
+             "meaning": "staff (Recruiter__c) — interviews they RAN link through x",
+             "matches": ["Jayesh Prajapati", "Jayesh Saini"]},
+        ])
+        options, facts = asyncio.run(_entity_candidates("q", []))
+        labels = [o["label"] for o in options]
+        assert labels == ["Jayesh Prajapati", "Jayesh Saini"]
+        # Warehouse-verified records, described by ROLE — never "candidates"
+        # for people who are staff.
+        assert all("staff" in o["description"] for o in options)
+        assert facts == ""  # ambiguity means the planner must ask, not assume
+
+    def test_the_prompt_forbids_asking_about_a_resolved_person(self):
+        from app.core.sf_intel.prompts import planner_user_message
+
+        prompt = planner_user_message(
+            user_text="q", conversation_state="", clarification_history=[],
+            resolved_slots={}, schema_summary="", today="", timezone_name="UTC",
+            effort="low", people_facts="- Jayesh Prajapati is staff",
+        )
+        assert "Jayesh Prajapati is staff" in prompt
+        assert "Do NOT ask a clarification about any person named above" in prompt

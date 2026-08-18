@@ -33,7 +33,7 @@ export interface ChartPalette {
 }
 
 export const SERIES_FALLBACK = [
-  '#0E9F9A',
+  '#0E9D9A',
   '#2F6FB2',
   '#B7791F',
   '#6D5AE6',

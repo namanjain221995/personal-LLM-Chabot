@@ -377,7 +377,8 @@ def test_agent_meta_reports_smart_model_and_applied_effort(monkeypatch):
     from app.engines import agent as agent_engine
 
     async def fake_agent_engine(
-        message, history, emit, *, effort="medium", salesforce=True, web=True
+        message, history, emit, *, effort="medium", salesforce=True, web=True,
+        web_forced=False,
     ):
         await emit("token", {"text": "done"})
         await emit("meta", {"route": "agent", "steps": []})

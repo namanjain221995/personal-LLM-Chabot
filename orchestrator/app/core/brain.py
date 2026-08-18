@@ -51,8 +51,8 @@ _METRIC_REQUIRED = ("name", "table", "definition", "sql")
 #: cut mid-word — see `_capped_rules`. Still well under `_RULES_TOTAL_CAP`, so
 #: one large pack cannot crowd every other one out of a multi-domain question.
 _RULES_CAP = 5000
-_KNOWLEDGE_CHUNK_CAP = 1400
-_GLOSSARY_CAP = 1200
+_KNOWLEDGE_CHUNK_CAP = 3200  # was 1400 (2026-08-18)
+_GLOSSARY_CAP = 3200  # was 1200 (2026-08-18)
 
 _WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]+")
 #: Same list as sf_dictionary — words that match everything rank nothing.
@@ -325,7 +325,10 @@ def matched_packs(question: str) -> List[Dict[str, Any]]:
 #: mocks") matched enough packs to stack 22KB of grounding. Whole blocks only,
 #: strongest trigger matches first — a truncated rule reads as a complete one,
 #: which is worse than a missing one.
-_RULES_TOTAL_CAP = 9000
+_RULES_TOTAL_CAP = 24000  # was 9000 (2026-08-18)
+#: A multi-domain question ("unpaid invoices for dropped candidates with failed
+#: mocks") matches several packs, and at 9000 the later ones were dropped
+#: whole — the question that needed the most knowledge got the least.
 
 
 def rules_for(question: str) -> str:

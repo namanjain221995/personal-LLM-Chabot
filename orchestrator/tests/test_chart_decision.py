@@ -446,3 +446,105 @@ def test_suppression_beats_a_forced_report_section():
     d = decide("Totals by stage, table only", STAGE_COLS, STAGE_ROWS,
                explicit_override=True)
     assert d.should_chart is False
+
+
+# ── Typo tolerance ───────────────────────────────────────────────────────────
+# "i want bar chat including move forewad, rejection, ghosted" got no chart:
+# every trigger matches the WORD "chart" and the user typed "chat". The
+# narration model then drew the bar chart itself — █ characters in a text
+# block. The users of this product type fast and not in their first language;
+# a chart request must survive its own spelling.
+
+def test_a_misspelt_chart_noun_counts_after_a_type_word():
+    assert explicit_chart_request("i want bar chat including rejections")
+    assert requested_chart_type("i want bar chat including rejections") == "bar"
+    assert explicit_chart_request("give me a pie chrat of outcomes")
+    assert requested_chart_type("give me a pie chrat of outcomes") == "pie"
+    assert explicit_chart_request("make it a donut chat")
+    assert requested_chart_type("make it a donut chat") == "donut"
+
+
+def test_a_bare_chat_is_conversation_not_a_chart():
+    """"chat" is an ordinary word in a chat application. Only the bigram after
+    a chart-TYPE word may read it as a typo."""
+    assert not explicit_chart_request("lets chat about the numbers")
+    assert not explicit_chart_request("in the chat yesterday you said 12")
+    assert not explicit_chart_request("open a chat with the recruiter")
+
+
+def test_long_chart_words_survive_typos_on_their_own():
+    """Nothing in ordinary English sits one edit from "visualize"."""
+    assert explicit_chart_request("visulize the pipeline")
+    assert explicit_chart_request("histgram of scores")
+    assert not explicit_chart_request("how many interviews today")
+
+
+def test_the_failing_message_now_gets_its_bar_chart():
+    """The exact live failure, end to end through decide()."""
+    decision = decide(
+        "give me total numbers of interview in the last month which is "
+        "compleded.\n\ni want bar chat including move forewad, rejection, ghosted",
+        ["Outcome", "Total"],
+        [["Ghosted", 643], ["Moved to Next Round", 381], ["Rejected", 313]],
+        mode="explicit",
+    )
+    assert decision.should_chart
+    assert decision.chart_type in ("bar", "horizontal_bar")
+    assert decision.x_key == "Outcome"
+    assert decision.y_keys == ["Total"]
+
+
+def test_hybrid_charts_the_same_shape_without_being_asked():
+    """Three categories, one non-negative metric — hybrid mode draws it even
+    with no chart word at all (a donut: a small part-to-whole)."""
+    decision = decide(
+        "give me total numbers of interview in the last month by outcome",
+        ["Outcome", "Total"],
+        [["Ghosted", 643], ["Moved to Next Round", 381], ["Rejected", 313]],
+        mode="hybrid",
+    )
+    assert decision.should_chart
+    assert decision.chart_type in ("donut", "bar", "horizontal_bar")
+
+
+def test_suppression_still_beats_a_fuzzy_request():
+    assert not decide(
+        "bar chat but actually just the table",
+        ["Outcome", "Total"],
+        [["A", 1], ["B", 2]],
+        mode="explicit",
+    ).should_chart
+
+
+def test_salesforce_currency_text_profiles_as_numeric():
+    """The warehouse stores every column as VARCHAR, and "$1,234.56" made an
+    Amount column profile as CATEGORICAL — so a revenue breakdown had "no
+    metric to plot" and never charted."""
+    prof = profile_column("Amount", ["$1,234.56", "$910.00", "$12,345,678.90"])
+    assert prof.kind == "numeric"
+    assert prof.maximum == 12345678.90
+
+    prof = profile_column("Rate", ["12%", "7.5%", "99%"])
+    assert prof.kind == "numeric"
+
+    # Strict shapes only: a malformed separator is NOT a number.
+    assert profile_column("X", ["1,23", "12,34,56"]).kind != "numeric"
+
+
+def test_the_narration_is_told_the_truth_about_the_chart():
+    """The mechanism that stops ASCII-art charts: the narration prompt states
+    whether a real chart is attached, both ways."""
+    from app.engines.sql import _chart_line, _narrative_messages
+
+    attached = _chart_line(True)
+    assert "already rendered" in attached
+    assert "Do not draw a chart" in attached
+
+    absent = _chart_line(False)
+    assert "NEVER draw a chart out of text characters" in absent
+    assert "█" in absent  # the exact characters it drew, named
+
+    system = _narrative_messages("q", ["A"], [["1"]], [], chart_attached=True)[0][
+        "content"
+    ]
+    assert "already rendered" in system

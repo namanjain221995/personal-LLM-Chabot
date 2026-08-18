@@ -93,9 +93,16 @@ export default function EChart({
         notMerge
         lazyUpdate
         style={{ height: '100%', width: '100%' }}
-        opts={{ renderer: 'canvas' }}
+        // width/height 'auto' makes the FIRST paint measure the wrapper, not
+        // a stale 0×0 the drawer had while it was still opening.
+        opts={{ renderer: 'canvas', width: 'auto', height: 'auto' }}
         onChartReady={(instance: ChartInstance) => {
           chart.current = instance;
+          // Belt and braces with the ResizeObserver: one resize on the next
+          // frame catches a chart mounted mid-layout (the tab expanding),
+          // which otherwise drew into yesterday's geometry until something
+          // else nudged it.
+          requestAnimationFrame(() => instance.resize());
         }}
       />
     </div>

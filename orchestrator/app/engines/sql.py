@@ -120,26 +120,44 @@ async def _ask_sql(
     history: Sequence[dict] = (),
     previous_sql: Optional[str] = None,
     error: Optional[str] = None,
+    grounding_question: Optional[str] = None,
 ) -> str:
+    """Write ONE SELECT for `question`.
+
+    `grounding_question` is what the KNOWLEDGE layers match on, and it is a
+    separate argument because the agent route asks in someone else's words.
+    A plan step's input is written by the planner ("Count internal interviews
+    grouped by decision"), so the user's own sentence — the names, the domain
+    nouns the brain packs trigger on, the words that say which object a person
+    lives on — is gone by the time the SQL is written. Asked how many internal
+    interviews five named recruiters had completed, the agent route answered
+    "no data available for the specific individuals" and charted a lone
+    Human_Decision__c of 0, while the SAME question at a lower effort level
+    (which skips the planner) answered correctly. Grounding on both texts is
+    what makes the two routes agree; `attach_chart` already did exactly this
+    for chart intent."""
     # The org dictionary maps what people SAY to what the API calls it. Left
     # to guess, the model writes a plausible-looking field name that returns
     # no rows instead of erroring — a silently wrong answer.
     from ..core.sf_dictionary import hint_for
 
-    hint = hint_for(question)
+    # Everything below keys on the user's words when they differ from the
+    # instruction — see `grounding_question`.
+    ground = grounding_question or question
+    hint = hint_for(ground)
     # The dictionary says what things are CALLED; the brief says what they
     # MEAN. Knowing Interview__c exists does not stop a model counting the
     # 5,566 Initial Call rows as interviews.
-    grounding = org_brief.grounding_for(question)
+    grounding = org_brief.grounding_for(ground)
     # Learn-from-chat: a join the user already thumbs-up'd for a similar
     # question beats one re-derived from scratch (core/learned_examples.py).
     from ..core import learned_examples
 
-    examples = learned_examples.block_for(question)
+    examples = learned_examples.block_for(ground)
     user = f"Database schema:\n{schema_text}\n\nQuestion: {question}"
     # Closest to the question, because it is the most specific thing we know:
     # not a rule about people in general, but who THESE people are.
-    people = who_these_people_are(question)
+    people = who_these_people_are(ground)
     if people:
         user = f"{people}\n\n{user}"
     if hint:
@@ -267,8 +285,58 @@ def people_in_question(question: str) -> List[str]:
     return out[:_MAX_RESOLVED_PEOPLE]
 
 
+def resolve_people(question: str) -> List[dict]:
+    """Who each named person actually is, looked up in the warehouse.
+
+    → [{"asked", "object", "meaning", "matches": [stored names]}] — one entry
+    per name that matched anything. `matches` has one element for a person the
+    data knows unambiguously, several when the name genuinely fits more than
+    one stored row. Empty list when the question names nobody or the warehouse
+    is unreachable: grounding is an optimisation, never fatal.
+
+    This is the structured half; `who_these_people_are` renders it for the SQL
+    prompt, and the Salesforce planner consumes it directly — the same facts
+    decide both what to JOIN and whether to ASK. Before it did, the planner ran
+    a live SOSL over only the FIRST capitalised token: asked about five staff
+    by full name, it searched "Jayesh", got every Jayesh in the org plus fuzzy
+    noise, labelled them all "candidates", and interrupted the user to choose —
+    for names the warehouse matches exactly.
+    """
+    names = people_in_question(question)
+    if not names:
+        return []
+    import duckdb  # lazy, same as _execute
+
+    try:
+        con = _connect_warehouse(duckdb)
+    except Exception:  # noqa: BLE001
+        return []
+    out: List[dict] = []
+    try:
+        for name in names:
+            pattern = "%" + "%".join(p.lower() for p in name.split()) + "%"
+            for table, sql, meaning in _PERSON_SOURCES:
+                try:
+                    rows = con.execute(sql, [pattern]).fetchall()
+                except Exception:  # noqa: BLE001 — a missing table is not fatal
+                    continue
+                if rows:
+                    out.append(
+                        {
+                            "asked": name,
+                            "object": table,
+                            "meaning": meaning,
+                            "matches": sorted({str(r[0]) for r in rows})[:4],
+                        }
+                    )
+                    break
+    finally:
+        con.close()
+    return out
+
+
 def who_these_people_are(question: str) -> str:
-    """Look the named people up and say which object actually holds them.
+    """`resolve_people`, rendered for a prompt.
 
     "How many internal interviews has X completed" is genuinely ambiguous —
     X may be the candidate who sat them or the employee who ran them, and the
@@ -276,43 +344,20 @@ def who_these_people_are(question: str) -> str:
     guessed candidate for five people who are staff: it reported that they had
     none when they had 84 between them, then on a later run reported four of
     five correctly and a silent 0 for the fifth, whose surname is stored
-    lower-case.
-
-    A rule in the prompt did not fix it, because a rule cannot know who these
-    particular people are. One cheap indexed lookup can, so the ambiguity is
-    RESOLVED before the model sees the question rather than left to it. Returns
-    "" when the question names nobody, so ordinary questions are unchanged.
+    lower-case. A rule in the prompt cannot know who these particular people
+    are; one indexed lookup can. Returns "" when the question names nobody.
     """
-    names = people_in_question(question)
-    if not names:
-        return ""
-    import duckdb  # lazy, same as _execute
-
-    try:
-        con = _connect_warehouse(duckdb)
-    except Exception:  # noqa: BLE001 — grounding is an optimisation, never fatal
-        return ""
-    found: List[str] = []
-    try:
-        for name in names:
-            pattern = "%" + "%".join(p.lower() for p in name.split()) + "%"
-            for _table, sql, meaning in _PERSON_SOURCES:
-                try:
-                    rows = con.execute(sql, [pattern]).fetchall()
-                except Exception:  # noqa: BLE001 — a missing table is not fatal
-                    continue
-                if rows:
-                    stored = ", ".join(sorted({str(r[0]) for r in rows})[:3])
-                    found.append(f"- {name} is {meaning}. Stored as: {stored}")
-                    break
-    finally:
-        con.close()
+    found = resolve_people(question)
     if not found:
         return ""
+    lines = []
+    for person in found:
+        stored = ", ".join(person["matches"][:3])
+        lines.append(f"- {person['asked']} is {person['meaning']}. Stored as: {stored}")
     return (
         "Who the people named in this question are, looked up in the warehouse "
         "just now — treat this as fact and join accordingly:\n"
-        + "\n".join(found)
+        + "\n".join(lines)
         + "\nMatch these names case-insensitively (ILIKE); the stored spelling "
         "above is what the data actually contains."
     )
@@ -387,10 +432,17 @@ async def generate_and_run_sql(
     *,
     history: Sequence[dict] = (),
     fetch_cap: Optional[int] = None,
+    grounding_question: Optional[str] = None,
 ) -> Tuple[str, List[str], List[list]]:
     """Generate, guard, and execute SQL with ONE retry feeding the error back.
 
-    Returns (sql, columns, rows). Also reused by the report engine.
+    Returns (sql, columns, rows). Also reused by the report and agent engines.
+
+    `grounding_question` is the USER's wording when the caller is asking in
+    someone else's — the agent's plan steps, a report section instruction. The
+    schema slice, the dictionary hint, the brain packs and the person lookup
+    all key on it, so an agent-routed question is grounded exactly as well as
+    the same question asked directly.
     """
     try:
         schema = schema_cache.get(settings.duckdb_path)
@@ -407,8 +459,12 @@ async def generate_and_run_sql(
     # The schema slice is capped, so pin the tables the matched metric's own
     # definition joins — otherwise a metric can be injected while the table it
     # names is ranked out of the prompt.
+    # The slice is chosen from BOTH: the user's words carry the domain nouns
+    # the table aliases and brain packs key on, the instruction carries what
+    # this particular step needs.
+    ground = f"{grounding_question}\n{question}" if grounding_question else question
     sliced = relevant_schema(
-        schema, question, must_include=org_brief.tables_for(question)
+        schema, ground, must_include=org_brief.tables_for(ground)
     )
     schema_text = format_schema(sliced)
     # Column types alone cannot say which lookup points where, so the model
@@ -417,7 +473,9 @@ async def generate_and_run_sql(
     if joins:
         schema_text = f"{schema_text}\n\n{joins}"
     cap = fetch_cap if fetch_cap is not None else settings.sql_preview_row_cap + 1
-    raw = await _ask_sql(question, schema_text, history)
+    raw = await _ask_sql(
+        question, schema_text, history, grounding_question=ground
+    )
     if not raw.strip():
         # The model spent its whole generation budget reasoning and emitted no
         # statement. That used to read as "no FROM" -> NoSuchTable -> ask live
@@ -449,7 +507,10 @@ async def generate_and_run_sql(
         # A locked file is not a SQL mistake — retrying the model cannot help.
         raise
     except Exception as exc:  # one retry on guard/execution error (§8)
-        raw2 = await _ask_sql(question, schema_text, history, previous_sql=raw, error=str(exc))
+        raw2 = await _ask_sql(
+            question, schema_text, history, previous_sql=raw, error=str(exc),
+            grounding_question=ground,
+        )
         sql2 = guard_sql(raw2)
         columns, rows = _execute(sql2, cap)
         return sql2, columns, rows
@@ -675,6 +736,32 @@ def deterministic_summary(
     return out
 
 
+def _chart_line(chart_attached: bool) -> str:
+    """What the narration is told about charts. A MECHANISM, not a hope.
+
+    Asked for a "bar chat" (typo), no chart was attached, and the model
+    helpfully drew the bar chart itself — █████ characters in a ```text block.
+    Both branches are stated because both failure modes are real: with a chart
+    attached, the model describes it in ASCII anyway "for clarity"; without
+    one, it improvises.
+    """
+    if chart_attached:
+        return (
+            "A REAL, interactive chart of this result is already rendered "
+            "directly beneath your answer. Do not draw a chart of any kind in "
+            "text, do not repeat the per-category numbers as a pseudo-chart, "
+            "and do not say a chart could not be shown — it is shown. One "
+            "sentence pointing at it is enough.\n"
+        )
+    return (
+        "NEVER draw a chart out of text characters — no ASCII/Unicode bars "
+        "(█ ▓ ■ #), no ```text blocks arranged as a graph, no emoji charts. "
+        "If the user asked for a chart that is not attached, give the figures "
+        "as a normal list and say the data table below can be charted on "
+        "request — do not imitate a chart in text.\n"
+    )
+
+
 def _narrative_messages(
     question: str,
     columns: Sequence[str],
@@ -682,8 +769,12 @@ def _narrative_messages(
     history: Sequence[dict],
     total_rows: Optional[int] = None,
     computed: Optional[dict] = None,
+    chart_attached: bool = False,
 ) -> List[dict]:
-    shown = list(rows[:30])
+    # 120, not 30: the computed block stays the authority for every NUMBER,
+    # but a wider sample is what lets the model describe the data honestly
+    # instead of generalising from a handful of rows.
+    shown = list(rows[:120])
     total = len(rows) if total_rows is None else total_rows
     sample = json.dumps(
         {"columns": list(columns), "rows": [list(r) for r in shown]}, default=str
@@ -692,9 +783,10 @@ def _narrative_messages(
         "You are a concise data analyst. Summarize the query result for the "
         "user in a short paragraph (plus brief bullets if helpful). Use only "
         "the numbers present in the result — never fabricate values.\n"
+        + _chart_line(chart_attached)
         # It answered "the live Salesforce check confirms…" from the synced
         # copy. Claiming a source you did not read is its own kind of wrong.
-        "These rows come from the LOCAL SYNCED COPY of Salesforce, refreshed "
+        + "These rows come from the LOCAL SYNCED COPY of Salesforce, refreshed "
         "every 30 minutes — NOT a live query. Never say the result is live, "
         "direct from Salesforce, or current as of this moment.\n"
         # The model sees a SAMPLE. Left unsaid, it reports the sample size as
@@ -874,11 +966,27 @@ async def run_sql_engine(
             live_columns,
             [[r.get(c) for c in live_columns] for r in live_rows],
         )
+        # The chart is decided BEFORE the narration streams, for the same
+        # reason the warehouse branch does it: the narration can only be told
+        # "a real chart is rendered below" if that is already a fact. This
+        # branch used to attach afterwards, which left the model free to draw
+        # ASCII bars over a result that was about to get a real chart.
+        live_preview = live_rows[:settings.sql_preview_row_cap]
+        live_meta: dict = {
+            "route": "sql", "sql": soql,
+            "data": live_preview, "truncated": False,
+        }
+        if live_preview and isinstance(live_preview[0], dict):
+            await attach_chart(
+                live_meta, message, live_columns,
+                [[r.get(c) for c in live_columns] for r in live_preview],
+            )
         msgs = [
             {"role": "system", "content":
              "Answer from these LIVE Salesforce records. State plainly that "
              "the figures come straight from Salesforce, not the local copy. "
              "Never invent values that are not in the rows.\n"
+             + _chart_line(bool(live_meta.get("chart"))) +
              "Every count, total, percentage and ratio you state MUST come "
              "from the 'Computed figures' block — it was calculated in code "
              "over every returned row. Do not work figures out from the rows "
@@ -910,24 +1018,8 @@ async def run_sql_engine(
             )
             parts.append(fallback)
             await emit("token", {"text": fallback})
-        live_preview = live_rows[:settings.sql_preview_row_cap]
-        live_meta: dict = {
-            "route": "sql", "sql": soql,
-            "data": live_preview, "truncated": False,
-        }
-        # Live SOQL results chart exactly like warehouse results — the
-        # pipeline only ever sees (columns, rows), never where they came
-        # from. Scalar columns only: a nested Salesforce sub-object is not
-        # an axis.
-        if live_preview and isinstance(live_preview[0], dict):
-            live_cols = [
-                c for c in live_preview[0]
-                if not isinstance(live_preview[0][c], (dict, list))
-            ]
-            await attach_chart(
-                live_meta, message, live_cols,
-                [[r.get(c) for c in live_cols] for r in live_preview],
-            )
+        # live_meta (chart included) was built before the narration streamed,
+        # so the model was told the truth about whether a chart exists.
         await emit("meta", live_meta)
         return "".join(parts)
 
@@ -977,6 +1069,10 @@ async def run_sql_engine(
             history,
             total_rows=len(rows),
             computed=computed,
+            # attach_chart already ran on this meta, so this is a fact, not a
+            # prediction — the mechanism that stops the model drawing ASCII
+            # bars over a result that has a real chart under it.
+            chart_attached=bool(meta.get("chart")),
         ),
         temperature=0.2,
         max_tokens=6000,

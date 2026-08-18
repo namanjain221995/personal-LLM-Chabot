@@ -107,6 +107,10 @@ _NUMERIC_TYPES = frozenset(
 )
 _BOOLEAN_TYPES = frozenset({"boolean"})
 _DATE_TYPES = frozenset({"date", "datetime"})
+_ID_TYPES = frozenset({"reference", "id"})
+
+#: A Salesforce record Id: 15 or 18 case-sensitive alphanumerics.
+_SF_ID_RE = re.compile(r"^[a-zA-Z0-9]{15}([a-zA-Z0-9]{3})?$")
 
 
 class PlanRejected(ValueError):
@@ -354,6 +358,21 @@ def _compile_filter(
             return _boolean_operand(raw)
         if ftype in _NUMERIC_TYPES:
             return _numeric_operand(raw)
+        if ftype in _ID_TYPES and not _SF_ID_RE.match((raw or "").strip()):
+            # An ID column compared to something that is not an ID. The live
+            # failure this catches: `RecordTypeId != 'Internal_Interview__c'` —
+            # an object NAME quoted into an ID comparison — compiled cleanly
+            # here and Salesforce rejected it at runtime ("invalid ID field"),
+            # ending a fully-clarified request with a raw SOQL error. Rejecting
+            # it HERE means the engine falls back to the warehouse and the
+            # question still gets answered. The message teaches the repair,
+            # because it is fed back verbatim on the planner's retry.
+            raise PlanRejected(
+                f"{path} is an ID field, and {raw!r} is not a Salesforce Id. "
+                "Filter on the parent's readable field instead — for a record "
+                "type use RecordType.Name = '…'; for a lookup use the dotted "
+                "path to the parent's Name."
+            )
         return _quote(raw)
 
     if op in ("in", "not_in"):

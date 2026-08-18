@@ -85,7 +85,9 @@ def test_a_web_step_returns_its_answer_and_sources(monkeypatch):
 
 
 def test_a_web_step_with_no_results_answers_from_knowledge(monkeypatch):
-    """Search being down must not fail the step and lose that part of the plan."""
+    """Search being down must not fail the step and lose that part of the plan
+    — but it must SAY SO. The fallback used to be silent, so a stale-memory
+    answer shipped under a trust line claiming searches go to the internet."""
     async def research(question, history=(), effort="medium", emit=None):
         return "", []
 
@@ -93,8 +95,10 @@ def test_a_web_step_with_no_results_answers_from_knowledge(monkeypatch):
         return "From my own knowledge."
 
     monkeypatch.setattr(llm, "chat_completion", fake_completion)
-    output, _detail, sub = run_web_step(monkeypatch, research)
-    assert output == "From my own knowledge."
+    output, detail, sub = run_web_step(monkeypatch, research)
+    assert "From my own knowledge." in output
+    assert "no readable sources" in output
+    assert detail == "search returned nothing readable"
     assert "sources" not in sub
 
 
@@ -225,3 +229,95 @@ def test_the_agent_receives_the_web_gate():
     from app import main
 
     assert "web=want_search" in inspect.getsource(main)
+
+
+# ── A forced search must actually search ─────────────────────────────────────
+# The composer's web pill collapses into the same boolean as the auto
+# classifier by the time it reaches the agent, so the planner stayed free to
+# plan zero web steps — and did: asked about a GPT-5.6 announcement with web
+# search forced ON, it planned one llm step and answered from training memory
+# that no such model exists, under a trust line saying searches go to the
+# internet.
+
+def test_a_forced_search_converts_the_llm_step():
+    from app.engines.agent import AgentPlan, PlanStep, ensure_web_step
+
+    plan = AgentPlan(steps=[PlanStep(id=1, title="t", kind="llm", input="q")])
+    assert ensure_web_step(plan, "msg").steps[0].kind == "web"
+
+
+def test_a_plan_that_already_searches_is_untouched():
+    from app.engines.agent import AgentPlan, PlanStep, ensure_web_step
+
+    plan = AgentPlan(
+        steps=[
+            PlanStep(id=1, title="t", kind="web", input="q"),
+            PlanStep(id=2, title="u", kind="llm", input="r"),
+        ]
+    )
+    assert [s.kind for s in ensure_web_step(plan, "m").steps] == ["web", "llm"]
+
+
+def test_a_data_only_plan_gains_a_web_step_with_the_users_words():
+    from app.engines.agent import AgentPlan, PlanStep, ensure_web_step
+
+    plan = AgentPlan(steps=[PlanStep(id=1, title="t", kind="sql", input="q")])
+    out = ensure_web_step(plan, "what changed this week")
+    assert out.steps[-1].kind == "web"
+    assert out.steps[-1].input == "what changed this week"
+
+
+def test_the_plan_node_forces_a_web_step_only_when_the_user_did(monkeypatch):
+    import asyncio
+
+    from app.engines import agent as agent_mod
+
+    async def plan_llm_only(*_a, **_k):
+        return agent_mod.AgentPlan(
+            steps=[agent_mod.PlanStep(id=1, title="t", kind="llm", input="q")]
+        )
+
+    monkeypatch.setattr(agent_mod, "make_plan", plan_llm_only)
+
+    forced = asyncio.run(
+        agent_mod._plan_node(
+            {"message": "m", "web": True, "web_forced": True}
+        )
+    )
+    assert forced["plan"].steps[0].kind == "web"
+
+    auto = asyncio.run(
+        agent_mod._plan_node(
+            {"message": "m", "web": True, "web_forced": False}
+        )
+    )
+    # Auto mode keeps the planner's judgement.
+    assert auto["plan"].steps[0].kind == "llm"
+
+
+def test_a_web_step_with_no_sources_says_so(monkeypatch):
+    """The fallback used to be silent, so a stale-memory answer shipped as if
+    it had been researched."""
+    import asyncio
+
+    from app.engines import agent as agent_mod
+
+    async def no_sources(*_a, **_k):
+        return "", []
+
+    async def canned(messages, **_k):
+        return "the model's memory"
+
+    monkeypatch.setattr(agent_mod, "llm", agent_mod.llm)
+    from app.engines import search as search_mod
+
+    monkeypatch.setattr(search_mod, "research_step", no_sources)
+    monkeypatch.setattr(agent_mod.llm, "chat_completion", canned)
+
+    step = agent_mod.PlanStep(id=1, title="t", kind="web", input="q")
+    output, detail, meta = asyncio.run(
+        agent_mod._run_step_impl(step, [], salesforce=False, message="q")
+    )
+    assert "no readable sources" in output
+    assert "general knowledge" in output
+    assert detail == "search returned nothing readable"

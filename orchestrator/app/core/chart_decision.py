@@ -115,6 +115,83 @@ def chart_suppressed(message: str) -> bool:
     return bool(_SUPPRESS_RE.search(message or ""))
 
 
+# ---------------------------------------------------------------------------
+# Typo tolerance
+# ---------------------------------------------------------------------------
+#
+# "i want bar chat including move forewad, rejection, ghosted" got no chart:
+# every trigger above matches the WORD "chart", and the user typed "chat". The
+# narration model then drew the bar chart itself, out of █ characters, in a
+# code block. The users of this product type fast and not in their first
+# language; a chart request must survive its own spelling.
+#
+# Guarded tightly, because "chat" is an ordinary word in a chat application:
+# a misspelt NOUN ("chat", "chrat", "grap") counts only immediately after a
+# chart-TYPE word ("bar", "pie", "line", …), where no other reading exists.
+# Only long words ("visulize", "histgram") may fire on their own — nothing in
+# ordinary English sits one edit from them.
+
+_NOUN_TARGETS = ("chart", "charts", "graph", "graphs", "plot", "plots")
+_STANDALONE_TARGETS = (
+    "visualize", "visualise", "visualization", "visualisation", "histogram",
+)
+_TYPE_TOKENS = {
+    "bar": "bar", "bars": "bar", "column": "bar", "columns": "bar",
+    "line": "line", "lines": "line", "pie": "pie", "donut": "donut",
+    "doughnut": "donut", "area": "area", "scatter": "scatter",
+    "funnel": "funnel", "histogram": "histogram",
+    "trend": None, "distribution": None,  # a chart ask, but no specific type
+}
+_WORD_SPLIT_RE = re.compile(r"[a-z]+", re.I)
+
+
+def _osa_within(a: str, b: str, cap: int) -> bool:
+    """Optimal-string-alignment distance <= cap. Damerau, because an adjacent
+    swap ("chrat") is one typo, not two."""
+    if abs(len(a) - len(b)) > cap:
+        return False
+    prev2: List[int] = []
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, start=1):
+        cur = [i]
+        for j, cb in enumerate(b, start=1):
+            cost = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb))
+            if i > 1 and j > 1 and ca == b[j - 2] and a[i - 2] == cb:
+                cost = min(cost, prev2[j - 2] + 1)
+            cur.append(cost)
+        if min(cur) > cap:
+            return False
+        prev2, prev = prev, cur
+    return prev[-1] <= cap
+
+
+def _noun_typo(word: str) -> bool:
+    """A misspelling of chart/graph/plot — NOT an exact hit (regexes own those)."""
+    w = word.lower()
+    if len(w) < 3 or w in _NOUN_TARGETS:
+        return False
+    return any(
+        w[0] == t[0] and _osa_within(w, t, 1) for t in _NOUN_TARGETS
+    )
+
+
+def fuzzy_chart_request(message: str) -> Optional[str]:
+    """A chart asked for through a typo. Returns the named type, "" for a
+    typed request with no specific type, or None for no request at all."""
+    words = _WORD_SPLIT_RE.findall(_strip_false_positives(message or "").lower())
+    for prev_word, word in zip(words, words[1:]):
+        if prev_word in _TYPE_TOKENS and _noun_typo(word):
+            return _TYPE_TOKENS[prev_word] or ""
+    for word in words:
+        if len(word) >= 6 and word not in _STANDALONE_TARGETS:
+            if any(
+                word[0] == t[0] and _osa_within(word, t, 2 if len(t) >= 9 else 1)
+                for t in _STANDALONE_TARGETS
+            ):
+                return ""
+    return None
+
+
 def explicit_chart_request(message: str) -> bool:
     """True when the user asked, in words, to see a chart.
 
@@ -134,7 +211,9 @@ def explicit_chart_request(message: str) -> bool:
         return True
     if _MODIFIER_RE.search(text):
         return True
-    return bool(_NATURAL_RE.search(text))
+    if _NATURAL_RE.search(text):
+        return True
+    return fuzzy_chart_request(text) is not None
 
 
 #: Longest-first: "horizontal bar" must win over "bar", "donut chart" over
@@ -167,7 +246,8 @@ def requested_chart_type(message: str) -> Optional[str]:
     for pattern, ctype in _TYPE_PHRASES:
         if pattern.search(text):
             return ctype
-    return None
+    fuzzy = fuzzy_chart_request(text)
+    return fuzzy or None
 
 
 _STACK_RE = re.compile(r"\bstack(?:ed|ing)?\b", re.I)
@@ -276,8 +356,18 @@ VERTICAL_BAR_MAX_CATEGORIES = 8
 #: Long labels ("Global Media Holdings (EMEA)") never fit a vertical tick.
 LONG_LABEL_CHARS = 16
 #: Hard ceiling for any categorical chart. Beyond this it is a table.
-MAX_CATEGORIES = 40
+#: Raised from 40 (2026-08-18): the frontend now GROWS a horizontal bar's
+#: height with its category count instead of squeezing everything into 300px,
+#: so the readable ceiling moved with it. It is not removed — past this many
+#: bars nobody reads a chart, they read a table, and pretending otherwise
+#: ships an unreadable picture instead of usable rows.
+MAX_CATEGORIES = 120
 #: Part-to-whole is only honest with few slices.
+#: Part-to-whole is only honest with few slices, so this one did NOT move
+#: with the other ceilings (2026-08-18). It gates the AUTOMATIC donut: seven
+#: wedges is already hard to compare by angle, and an auto-chart nobody asked
+#: for must be conservative. An explicitly requested pie still renders up to
+#: MAX_SLICES (8) before folding the tail into "Other".
 MAX_PART_TO_WHOLE_CATEGORIES = 6
 
 

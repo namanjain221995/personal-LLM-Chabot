@@ -199,7 +199,12 @@ ANSWER_RULES = """\
   Say the field exists and that you will not read it out.
 - If the question could mean two different objects (a client-facing interview
   or an internal assessment; a recruiter Account or a Recruiter__c employee),
-  answer the more likely one and say which you used in one short clause."""
+  answer the more likely one and say which you used in one short clause.
+- Never draw a chart out of text — no ASCII or Unicode bars (█ ▓ ■ #), no
+  code blocks arranged as a graph, no emoji charts. This interface renders
+  real interactive charts; a text imitation is unreadable on small screens
+  and to screen readers. Give figures as a list or table and, if the user
+  wanted a chart that is not attached, say the data below can be charted."""
 
 
 # ---------------------------------------------------------------------------

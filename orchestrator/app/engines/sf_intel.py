@@ -58,7 +58,7 @@ Emit = Callable[[str, dict], Awaitable[None]]
 
 #: Rows shown to the answer model. The COUNTS come from calculate_result over
 #: everything retrieved; this is an illustration, and the prompt says so.
-ANSWER_SAMPLE_ROWS = 30
+ANSWER_SAMPLE_ROWS = 120  # was 30 (2026-08-18)
 
 #: Rows put on `meta.data` for the table the user sees.
 PREVIEW_ROWS = 200
@@ -290,7 +290,7 @@ async def run(
         schema_summary, _available = await tools.get_salesforce_schema(
             grounding, objects=hinted
         )
-        candidates = await _entity_candidates(reading.text, hinted)
+        candidates, people_facts = await _entity_candidates(reading.text, hinted)
         decision = await planner.plan(
             user_text=planning_text,
             intent=intent,
@@ -303,6 +303,7 @@ async def run(
             timezone_name=org_brief.BUSINESS_TIMEZONE,
             reading=reading,
             grounding_text=grounding,
+            people_facts=people_facts,
         )
     else:
         # Schema and entity lookups exist to inform the model; with no model
@@ -497,6 +498,21 @@ def _live_available() -> bool:
     return bool(settings.sf_live_enabled and salesforce.configured())
 
 
+#: Salesforce's own words for "your query is wrong" — as opposed to "I am
+#: down" or "you may not". Matched on the error text because the REST error
+#: code arrives embedded in it.
+_QUERY_REJECTED_RE = re.compile(
+    r"rejected the query|MALFORMED_QUERY|INVALID_FIELD|INVALID_TYPE|"
+    r"invalid ID field|INVALID_QUERY_FILTER_OPERATOR|unexpected token",
+    re.I,
+)
+
+
+def _query_was_rejected(exc: Exception) -> bool:
+    """True when the org refused the QUERY itself (our bug, not an outage)."""
+    return bool(_QUERY_REJECTED_RE.search(str(exc)))
+
+
 async def _execute_live(
     plan_model: SalesforceQueryPlan,
     *,
@@ -523,6 +539,16 @@ async def _execute_live(
         log.info("query plan rejected: %s", exc)
         return None
     except tools.SalesforceToolError as exc:
+        if _query_was_rejected(exc):
+            # The ORG says our query is wrong — not that data is missing, not
+            # that the connection is down. That is OUR bug, and it must never
+            # be the user's problem: a fully-clarified request used to end
+            # here with a raw SOQL error ("invalid ID field:
+            # Internal_Interview__c") after the user had answered two
+            # questions. The warehouse engine writes its own SQL with its own
+            # grounding — the same fallback PlanRejected already takes.
+            log.info("live query rejected by the org; using the warehouse: %s", exc)
+            return None
         await phase("failed")
         message = (
             f"The Salesforce lookup failed ({exc}). I would rather tell you that "
@@ -561,8 +587,36 @@ async def _execute_live(
     await phase("drafting_answer")
     scope = _scope_line(intent)
     sample = result.rows[:ANSWER_SAMPLE_ROWS]
+
+    # The chart is decided BEFORE the answer streams, so the prompt can state
+    # a FACT about it. Attached afterwards (as it used to be), the model had
+    # no way to know a real chart was coming and would draw ASCII bars over
+    # the top of one — or, told nothing, improvise a "chart" the user asked
+    # for out of █ characters in a code block.
+    from .sql import _chart_line, attach_chart
+
+    preview = result.rows[:PREVIEW_ROWS]
+    chart_extras: Dict[str, Any] = {}
+    if preview and isinstance(preview[0], dict):
+        chart_columns = [
+            c for c in preview[0] if not isinstance(preview[0][c], (dict, list))
+        ]
+        await attach_chart(
+            chart_extras,
+            question,
+            chart_columns,
+            [[row.get(c) for c in chart_columns] for row in preview],
+        )
+
     messages = [
-        {"role": "system", "content": ANSWER_SYSTEM + "\n\n" + org_brief.ANSWER_RULES},
+        {
+            "role": "system",
+            "content": ANSWER_SYSTEM
+            + "\n\n"
+            + _chart_line(bool(chart_extras.get("chart")))
+            + "\n"
+            + org_brief.ANSWER_RULES,
+        },
         {
             "role": "user",
             "content": answer_user_message(
@@ -602,7 +656,6 @@ async def _execute_live(
         answer = _fallback_answer(result, computed)
         await emit("token", {"text": answer})
 
-    preview = result.rows[:PREVIEW_ROWS]
     meta: Dict[str, Any] = {
         "route": "sql",
         "salesforce_mode": "intelligence",
@@ -626,18 +679,8 @@ async def _execute_live(
     if _wants_query(question):
         meta["sql"] = result.soql
 
-    if preview and isinstance(preview[0], dict):
-        from .sql import attach_chart
-
-        columns = [
-            c for c in preview[0] if not isinstance(preview[0][c], (dict, list))
-        ]
-        await attach_chart(
-            meta,
-            question,
-            columns,
-            [[row.get(c) for c in columns] for row in preview],
-        )
+    # Decided before the answer streamed; merged here so meta keeps its shape.
+    meta.update(chart_extras)
 
     await emit("meta", meta)
     await phase("completed", record_count=computed.get("record_count"))
@@ -770,21 +813,58 @@ _NOT_A_NAME = frozenset(
 )
 
 
-async def _entity_candidates(text: str, objects: Sequence[str]) -> List[dict]:
-    """Search for real records when the request names one but not which one."""
+async def _entity_candidates(
+    text: str, objects: Sequence[str]
+) -> tuple[List[dict], str]:
+    """→ (candidate options for a genuinely ambiguous name, resolved-people facts).
+
+    THE WAREHOUSE IS CONSULTED FIRST, full names intact. This used to run a
+    live SOSL over only the FIRST capitalised token: asked about five staff by
+    full name, it searched "Jayesh", got every Jayesh in the org plus fuzzy
+    noise, labelled them all "candidates" (they are recruiters), and
+    interrupted the user to pick — for names the data matches exactly. Now a
+    name with ONE warehouse match is a FACT handed to the planner, a name with
+    SEVERAL is a real choice offered as options, and only a question naming
+    nobody the warehouse knows falls back to the live search.
+    """
+    from .. import db
+    from .sql import resolve_people, who_these_people_are
+
+    # duckdb is blocking; this engine is async.
+    people = await db.run_in_thread(resolve_people, text)
+    if people:
+        ambiguous = [p for p in people if len(p["matches"]) > 1]
+        facts = (
+            "" if ambiguous else await db.run_in_thread(who_these_people_are, text)
+        )
+        options: List[dict] = []
+        for person in ambiguous:
+            for stored in person["matches"][:4]:
+                options.append(
+                    {
+                        "object": person["object"],
+                        "record_id": "",
+                        "label": stored[:120],
+                        "description": f"{person['meaning'].split(' — ')[0]}"[:240],
+                        "metadata": {"asked_as": person["asked"]},
+                    }
+                )
+        return options, facts
+
+    # Nobody the warehouse knows: the live org may still hold them.
     if not _live_available():
-        return []
+        return [], ""
     names: List[str] = []
     for match in _QUOTED_OR_CAPS_RE.finditer(text or ""):
         token = (match.group(1) or match.group(2) or "").strip()
         if token and token not in _NOT_A_NAME and token not in names:
             names.append(token)
     if not names:
-        return []
+        return [], ""
     searchable = [o for o in objects if o in tools._DISPLAY_FIELDS] or ["Account"]
     found = await tools.search_salesforce_entities(names[0], objects=searchable)
     # Only worth surfacing when there is a genuine choice to make.
-    return found if len(found) > 1 else []
+    return (found if len(found) > 1 else []), ""
 
 
 def _recent(history: Sequence[dict], n: int) -> List[dict]:

@@ -655,3 +655,46 @@ def test_repeated_labels_keep_the_normal_value_counts_profile():
     )
     assert "row_breakdown" not in summary
     assert "value_counts" in summary
+
+
+# ── ID fields take Ids, not names ────────────────────────────────────────────
+# Live failure (2026-08-18): after TWO answered clarifications, the planner
+# emitted `RecordTypeId != 'Internal_Interview__c'` — an object NAME quoted
+# into an ID comparison. It compiled cleanly here and Salesforce rejected it
+# at runtime ("invalid ID field"), ending the request with a raw SOQL error.
+
+def test_an_id_field_compared_to_a_name_is_rejected_at_compile_time():
+    plan = SalesforceQueryPlan(
+        object_api_name="Opportunity",
+        select_fields=["Id"],
+        filters=[QueryFilter(field="OwnerId", operator="ne",
+                             value="Internal_Interview__c")],
+    )
+    with pytest.raises(PlanRejected) as err:
+        compile_plan(plan, OPPORTUNITY, resolve_object=_resolve)
+    # The message teaches the repair — it is fed back verbatim on the retry.
+    assert "ID field" in str(err.value)
+    assert "RecordType.Name" in str(err.value)
+
+
+def test_a_real_id_still_passes_an_id_field():
+    plan = SalesforceQueryPlan(
+        object_api_name="Opportunity",
+        select_fields=["Id"],
+        filters=[QueryFilter(field="OwnerId", operator="eq",
+                             value="005Ps000001abcdIAA")],
+    )
+    compiled = compile_plan(plan, OPPORTUNITY, resolve_object=_resolve)
+    assert "OwnerId = '005Ps000001abcdIAA'" in compiled.soql
+
+
+def test_the_record_type_idiom_compiles_through_the_relationship():
+    """What the planner is told to write instead: RecordType.Name (a dotted
+    path through the lookup) — same machinery as Account.Name below."""
+    plan = SalesforceQueryPlan(
+        object_api_name="Opportunity",
+        select_fields=["Id"],
+        filters=[QueryFilter(field="Account.Name", operator="eq", value="Acme")],
+    )
+    compiled = compile_plan(plan, OPPORTUNITY, resolve_object=_resolve)
+    assert "Account.Name = 'Acme'" in compiled.soql

@@ -440,3 +440,27 @@ describe('presentation', () => {
     expect(composerPlaceholder(null, 'Ask anything…')).toBe('Ask anything…');
   });
 });
+
+describe('the idempotency key survives a long typed answer', () => {
+  // The raw text used to be embedded in the id, and the server caps
+  // client_message_id at 80 characters — so any typed answer longer than
+  // ~37 chars was REJECTED as malformed and the user was told their answer
+  // could not be read.
+  it('stays under the server cap however much the user types', () => {
+    const id = clientMessageId('clr_' + 'a'.repeat(32), {
+      customText:
+        'as i have given the name Please check that and use exactly those five people',
+    });
+    expect(id.length).toBeLessThanOrEqual(80);
+  });
+
+  it('is still deterministic and still distinguishes answers', () => {
+    const cid = 'clr_' + 'b'.repeat(32);
+    const a1 = clientMessageId(cid, { customText: 'use the names I gave' });
+    const a2 = clientMessageId(cid, { customText: 'use the names I gave' });
+    const b = clientMessageId(cid, { customText: 'actually just Jayesh' });
+    expect(a1).toBe(a2);
+    expect(a1).not.toBe(b);
+    expect(clientMessageId(cid, { skipped: true })).not.toBe(a1);
+  });
+});

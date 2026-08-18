@@ -345,8 +345,19 @@ export function clientMessageId(
     (selection.optionIds ?? []).join('+'),
     (selection.customText ?? '').trim(),
     selection.skipped ? 'skip' : '',
-  ];
-  return `clr-${parts.join('|')}`;
+  ].join('|');
+  // HASHED, not embedded. The raw text used to ride inside the id, and the
+  // server caps client_message_id at 80 characters — so any typed answer
+  // longer than ~37 chars ("as i have given the name Please check that")
+  // failed validation and the user was told their answer could not be read.
+  // FNV-1a keeps the property the id exists for: a double-click, a retried
+  // fetch and a reconnect of the SAME answer all produce the SAME key.
+  let h = 0x811c9dc5;
+  for (let i = 0; i < parts.length; i += 1) {
+    h ^= parts.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return `clr-${clarificationId.slice(0, 40)}-${h.toString(16).padStart(8, '0')}`;
 }
 
 export interface Selection {

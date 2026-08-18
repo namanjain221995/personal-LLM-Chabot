@@ -261,6 +261,7 @@ async def plan(
     timezone_name: str = "UTC",
     reading: Optional[Reading] = None,
     grounding_text: str = "",
+    people_facts: str = "",
 ) -> AgentDecision:
     """The one decision this request runs on.
 
@@ -306,14 +307,25 @@ async def plan(
         reading_note=read.note(),
         settled_slots=settled,
         ask_bias=settings.clarify_mode == "always",
+        people_facts=people_facts,
     )
     messages = [
         {"role": "system", "content": PLANNER_SYSTEM},
         {"role": "user", "content": user_message},
     ]
-    # Fast and Low answer directly; the planner is a translation task and the
-    # reasoning pass comes out of the same token budget as the decision.
-    thinking = effort in ("medium", "high")
+    # EFFORT-INDEPENDENT, deliberately (2026-08-18). This used to be
+    # `effort in ("medium", "high")`, which made WHETHER THE USER IS ASKED A
+    # QUESTION depend on the effort dial: the same ambiguous request about
+    # five named people was clarified at Fast and Low and silently guessed at
+    # Medium. Effort is meant to buy more thorough WORK, not a different
+    # conversation — and a user cannot be expected to know that turning the
+    # quality up turns the questions off.
+    #
+    # Off rather than on: this is a schema-constrained routing decision, not
+    # an answer (the prompt calls it a translation task), the reasoning pass
+    # would come out of the same token budget as the decision itself, and
+    # `enforce_policy` is a deterministic floor under whatever comes back.
+    thinking = False
     use_tools = bool(
         settings.main_capabilities.supports_tool_calling
         and settings.salesforce_planner_tool_calling

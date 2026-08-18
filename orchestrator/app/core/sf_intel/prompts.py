@@ -150,6 +150,12 @@ SalesforceQueryPlan instead:
 - result_mode: {', '.join(RESULT_MODES)}
 Date operands must be Salesforce date literals (TODAY, THIS_QUARTER,
 LAST_N_DAYS:30) with is_date_literal=true, or ISO dates (2026-08-11).
+An ID field takes only a real Salesforce Id (15/18 alphanumerics). NEVER
+compare RecordTypeId, OwnerId or any *Id/lookup field to a name or object —
+`RecordTypeId != 'Internal_Interview__c'` is invalid and returns an error, not
+rows. Filter through the relationship instead: {{"field": "RecordType.Name",
+"operator": "eq", "value": "Interview"}}, or the lookup's dotted path to the
+parent's Name. Filters accept dotted paths.
 
 ACTIONS
 {ACTIONS[0]}  — the request is clear enough; include structured_query_plan.
@@ -245,6 +251,7 @@ def planner_user_message(
     reading_note: str = "",
     settled_slots: Sequence[str] = (),
     ask_bias: bool = False,
+    people_facts: str = "",
 ) -> str:
     """Everything the planner is allowed to see, in a fixed order.
 
@@ -297,6 +304,17 @@ def planner_user_message(
         blocks.append(f"Recent conversation turns:\n{rendered}")
     if schema_summary:
         blocks.append(f"Salesforce schema available to this connection:\n{schema_summary}")
+    if people_facts:
+        # Names the WAREHOUSE resolved unambiguously. These are facts, not
+        # options: a planner shown "Jayesh Prajapati is staff (Recruiter__c)"
+        # must never ask which Jayesh — that question interrupted a user whose
+        # five full names all matched exactly.
+        blocks.append(
+            people_facts
+            + "\nDo NOT ask a clarification about any person named above — "
+            "they are resolved. record_identity is only ever ambiguous for a "
+            "name in the candidate list below, if there is one."
+        )
     if entity_candidates:
         blocks.append(
             _json_block(

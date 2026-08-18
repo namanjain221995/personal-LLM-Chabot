@@ -933,6 +933,13 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     effort=request.effort,
                     salesforce=(request.mode != "assistant"),
                     web=want_search,
+                    # The pill and the auto classifier collapse into one
+                    # boolean by here, but they are different promises: auto
+                    # lets the planner judge, FORCED means at least one step
+                    # actually searches. Without this the agent answered a
+                    # current-events question from training memory under a
+                    # trust line saying searches go to the internet.
+                    web_forced=(request.web_search == "on"),
                 )
             elif want_search:
                 # Phase 1: web search — cited answer from fetched sources.

@@ -143,10 +143,18 @@ _MAX_MATCHED_EXTRAS = 40
 #: reads to the engine as "not in the warehouse", which sends the question to
 #: live Salesforce, which answers it off whatever object the field dictionary
 #: suggested. Every wrong answer of that shape starts here.
-_MAX_TABLES = 24
+_MAX_TABLES = 40  # was 24 (2026-08-18)
+#: Raised deliberately, not removed. The 146-table prompt that motivated the
+#: original cap was ~41k tokens; 40 tables of this warehouse is ~7k against a
+#: 237k usable input budget, so the cost is negligible — but "send everything"
+#: is still wrong: a model that cannot FIND the question in the prompt writes
+#: the wrong query, and that failure is silent.
 
 #: Columns per table before trimming kicks in (see `_column_budget`).
-_MAX_COLUMNS = 70
+_MAX_COLUMNS = 140  # was 70 (2026-08-18)
+#: Internal_Interview__c alone has 66 columns and Account 269; at 70 a wide
+#: object lost the very field a question named. Keys are never dropped either
+#: way (see _trim_columns).
 
 #: Never trimmed away — a correct query needs these whether or not the
 #: question mentions them.

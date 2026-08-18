@@ -121,7 +121,7 @@ def _mixed_plan():
 
 
 def _patch_step_engines(monkeypatch, *, sql_fails=False):
-    async def fake_sql(question, *, history=(), fetch_cap=None):
+    async def fake_sql(question, **kwargs):
         if sql_fails:
             raise RuntimeError("boom: bad column")
         return "SELECT 1 AS n", ["n"], [[1]]
@@ -258,7 +258,7 @@ def test_run_agent_engine_end_to_end_offline(monkeypatch):
             return plan_payload
         return "llm step output"
 
-    async def fake_sql(question, *, history=(), fetch_cap=None):
+    async def fake_sql(question, **kwargs):
         return "SELECT 42 AS answer", ["answer"], [[42]]
 
     async def fake_stream(messages, *, model_choice="smart", effort="medium", **kwargs):
@@ -290,3 +290,25 @@ def test_run_agent_engine_end_to_end_offline(monkeypatch):
         {"id": 1, "title": "Numbers", "status": "done"},
         {"id": 2, "title": "Write-up", "status": "done"},
     ]
+
+
+# ── The platform runs queries; it never hands the user code to run ──────────
+# Asked for "a list of candidates having 150+ interviews", an llm step
+# answered like a coding tutor: SOQL "to run in Workbench" plus a Python
+# script — to a user who wanted rows, in a product whose entire point is that
+# IT runs the queries.
+
+def test_every_agent_prompt_carries_the_identity_rule():
+    from app.engines.agent import _PLAN_SYSTEM, _STEP_LLM_SYSTEM, _SYNTH_SYSTEM
+
+    # The planner must not plan a code-writing step for a data ask…
+    assert "MUST be a sql or salesforce step" in _PLAN_SYSTEM
+    assert "executes queries itself" in _PLAN_SYSTEM
+    # …an llm step that gets one anyway must not answer with runnable code…
+    assert "NEVER answer a request for data" in _STEP_LLM_SYSTEM
+    assert "Workbench" in _STEP_LLM_SYSTEM
+    assert "The user cannot run code" in _STEP_LLM_SYSTEM
+    # …and the synthesis must deliver rows, not queries.
+    assert "never a SOQL/SQL query" in _SYNTH_SYSTEM
+    # Real code requests stay possible: the rule scopes, it does not ban.
+    assert "explicitly asked for code" in _STEP_LLM_SYSTEM

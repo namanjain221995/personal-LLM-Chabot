@@ -1,5 +1,202 @@
 # Changelog
 
+## The platform hands over rows, never homework (2026-08-18)
+
+"give you a list of candidates having 150+ interviews" ended two different
+ways, both wrong:
+
+**A raw SOQL error after two answered clarifications.** The planner emitted
+`RecordTypeId != 'Internal_Interview__c'` — an object NAME quoted into an ID
+comparison. The compiler typed dates, booleans and numbers but let a reference
+field fall through to plain string quoting, so the nonsense compiled and the
+ORG rejected it at runtime. Three layers now: (1) `plan.py` rejects a non-Id
+operand on an ID-typed field at COMPILE time, with a message that teaches the
+repair (RecordType.Name = '…' through the relationship) since it is fed back
+verbatim on the planner's retry; (2) the planner prompt states the idiom up
+front; (3) a query the org REFUSES (`invalid ID field`, MALFORMED_QUERY…) now
+falls back to the warehouse engine like PlanRejected always did — a query we
+wrote wrong is our bug, never the user's problem — while genuine outages keep
+the honest failure message. The outage-vs-rejection distinction got its own
+tests.
+
+**SOQL "to run in Workbench" plus a Python script.** On the re-ask the agent
+planned an "llm" step, and that step's prompt was a generic analyst plus
+CODE_INSTRUCTION — which coaches it to ship runnable code and "say how to run
+it". Nothing anywhere said the platform RUNS queries itself. The previous
+turn's SOQL error in the history made it worse: the model saw broken SOQL and
+helpfully "fixed" it for the user to run by hand. The identity is now stated
+at all three levels — the plan prompt (a data request MUST be a sql/salesforce
+step), the llm-step prompt (never answer a data request with query code; the
+user cannot run code), and the synthesis (the answer is the rows, not a
+query). Genuine code requests still work: the rule scopes to data asks.
+
+Verified end-to-end on the deployed stack, full pipeline at High effort:
+question → two clarifications answered through the API → **22 candidates**
+with their real names and counts, `route=sql`, 22 data rows on the table —
+matching the warehouse ground truth (22 qualifying, top 244) — and zero
+Workbench/script/Apex markers in the answer.
+
+Tests: 1,361 backend (+5).
+
+## Three ways the assistant ignored what the user actually said (2026-08-18)
+
+**1. A typed clarification answer over ~37 characters was rejected.** The user
+answered "as i have given the name Please check that" and was told "I could not
+read that answer". The frontend's idempotency key embedded the RAW TEXT
+(`clr-<id>|<options>|<custom text>|`), and the server caps `client_message_id`
+at 80 characters — so pydantic rejected exactly the answers long enough to be
+thoughtful. The key is now an FNV-1a hash of the same parts: bounded at 53
+chars, still deterministic (a double-click, a retried fetch and a reconnect of
+the SAME answer still produce the SAME key), still distinct per answer.
+
+**2. "Which Jayesh?" asked about five people the data knows exactly.** The
+planner's entity search ran a live SOSL over only the FIRST capitalised token:
+asked about five staff by full name it searched "Jayesh", got every Jayesh in
+the org plus fuzzy noise, labelled them all "candidates" (they are recruiters),
+and interrupted the user to pick. `resolve_people` (the structured half of the
+person lookup that already fixed the SQL route) now runs FIRST, full names
+intact, against the warehouse: a name with ONE match is a FACT handed to the
+planner ("Jayesh Prajapati is staff (Recruiter__c)…", with an explicit
+do-not-ask instruction); a name with SEVERAL matches becomes a real choice
+offering the actual stored names, described by role; only a question naming
+nobody the warehouse knows falls back to the live search. Verified live: all
+five names resolve as facts, zero options, no interruption — while a genuinely
+ambiguous bare "Jayesh" still asks with the real Jayeshes on the card.
+
+**3. Web search FORCED ON answered from training memory.** Asked about a
+GPT-5.6 announcement with the web pill on, the agent planned one "llm" step,
+answered that no such model exists, and the trust line still said "search
+queries are sent to the internet". Two causes: the pill and the auto classifier
+collapse into one boolean by the time they reach the agent, so the planner was
+free to plan zero web steps; and a web step whose search returns nothing
+degrades to model knowledge SILENTLY. Now `web_forced` travels separately —
+a forced search converts the first llm step to web (or appends one carrying
+the user's words) — and the no-sources fallback states plainly that search
+found nothing and the answer may be out of date. Search itself was healthy the
+whole time (SearXNG returned 38 sources for that exact headline); the planner
+just never called it. Verified on the deployed stack: the same question now
+produces 8 research events, 43 cited sources, and the correct Sol/Luna answer.
+
+Tests: 1,356 backend (+8), 445 frontend (+1).
+
+## The agent route was answering ungrounded (2026-08-18)
+
+Same question, two answers: at Fast and Low it returned the five recruiters'
+counts correctly; at Medium it said "there is no data available for the
+specific individuals" and charted a lone `Human_Decision__c` of 0.
+
+The effort dial does not change the grounding — that is keyed on the question
+and is byte-identical at every level. It changes the ROUTE: Medium and High may
+plan multi-step agent work, and `_run_step_impl` passed **`step.input`** — the
+PLANNER's paraphrase — to `generate_and_run_sql`. Every knowledge layer keys on
+that text, so the schema slice, the dictionary hint, the brain packs and the
+`who_these_people_are` lookup were all computed from "Count completed internal
+interviews grouped by employee" instead of from the user's sentence, which is
+where the names and the domain nouns live. `attach_chart` had already learned
+this lesson (it reads intent from `f"{message}\n{step.input}"`); the SQL
+generation had not.
+
+`generate_and_run_sql` / `_ask_sql` now take `grounding_question` — the
+instruction stays the step, the KNOWLEDGE keys on the user's words. Wired into
+the agent (`grounding_question=message`) and the report engine (section
+instructions are the planner's wording too). Measured on the live stack against
+the same step input: ungrounded → **0 rows**; grounded → **5/5 people, correct
+counts**, identical to the direct route.
+
+**Clarification no longer depends on the effort dial.** `thinking` on the
+planner was `effort in ("medium", "high")`, so whether the user is ASKED a
+question changed with a quality setting — the same ambiguous request was
+clarified at Fast and Low and silently guessed at Medium. It is pinned off: a
+schema-constrained routing decision, not an answer, with `enforce_policy` as a
+deterministic floor under whatever comes back.
+
+**More data and more brain reach the model**, now that the budget is understood
+(237k usable input tokens; the old prompt used ~3.5k):
+
+| | was | now |
+|---|---|---|
+| schema slice | 24 tables × 70 cols | **40 × 140** |
+| brain rules across packs | 9 KB | **24 KB** |
+| knowledge / glossary blocks | 1.4 / 1.2 KB | **3.2 / 3.2 KB** |
+| result rows shown to the model | 30 | **120** |
+| chart categories | 40 | **120** |
+
+Measured after: ~18.5k tokens of grounding on a five-name question — 8% of the
+budget, comfortable. The caps are RAISED, not removed: the 146-table prompt
+that motivated the original limit was ~41k tokens and made the model fail to
+find the question at all, which is a silent wrong answer rather than an error.
+A horizontal bar now GROWS with its categories (26px each, bounded at 1400px)
+instead of squeezing 30 recruiters into 300px. The automatic donut threshold
+deliberately stayed at 6 — part-to-whole is only honest with few slices, and an
+auto-chart nobody asked for must be conservative; an explicitly requested pie
+renders up to 8 before folding the tail into "Other".
+
+Tests: 1,348 backend (+3, including one that fails if the planner's decision
+ever varies by effort again, and one that fails if a plan step stops carrying
+the user's words).
+
+## The chart the user asked for, not an ASCII imitation of one (2026-08-18)
+
+Asked "i want bar chat including move forewad, rejection, ghosted", the answer
+had the right numbers and NO chart — instead the model drew the bar chart
+itself, 15KB of █ characters in a code block. The user hit Stop mid-draw
+(twice), which is also why those messages have meta NULL: the single meta
+event only ships after the token stream, so an interrupted answer keeps its
+partial text and loses its metadata.
+
+Root cause: every chart trigger matched the WORD "chart" — "bar chat" is a
+typo, `explicit_chart_request` said no, `CHART_TRIGGER_MODE=explicit` had no
+second chance, and nothing anywhere forbade the model imitating a chart in
+text. The agent route sometimes charted the same typo anyway because its
+planner re-writes step inputs with "chart" spelled correctly — grounding by
+laundering, non-deterministic.
+
+Fixed at four layers, all deterministic (deep-researched with a 5-agent
+workflow; every claim verified against the code and the live DB):
+
+- **Typo-tolerant trigger** (`chart_decision.py`): a misspelt chart NOUN
+  ("chat", "chrat", "grap") counts ONLY immediately after a chart-TYPE word
+  ("bar", "pie", "line"…) — "bar chat" is a bar chart; "lets chat about the
+  numbers" is conversation. Long words ("visulize", "histgram") may fire
+  alone; nothing in ordinary English sits one edit from them. Damerau
+  distance, stdlib-only, keeping the module pure.
+- **The narration is TOLD about the chart** — a mechanism, not a hope.
+  `attach_chart` now runs BEFORE the answer streams on every path (the live
+  branch and sf_intel attached it after), and `_chart_line` states either
+  "a real interactive chart is already rendered below — do not draw one in
+  text" or "NEVER draw a chart out of text characters (█ ▓ ■)". The agent
+  synthesis gets the same line (its steps' charts already survive the meta
+  merge), and `org_brief.ANSWER_RULES` carries the static ban for every
+  other route.
+- **CHART_TRIGGER_MODE=hybrid** for this deployment: four narrow
+  deterministic shapes (time series, trusted stage funnel, small
+  part-to-whole, single-dimension comparison) chart themselves without being
+  asked; "just the table" still suppresses everything.
+- **Salesforce currency text profiles as numeric**: "$1,234.56" (the
+  warehouse stores every column as VARCHAR) made an Amount column
+  categorical, so revenue breakdowns had "no metric to plot". Strict shapes
+  only — "12,34,56" stays text.
+
+Design pass under the dataviz skill, with the palette VALIDATOR run rather
+than eyeballed: dark surface — all six checks pass as-is; light surface had
+one WARN (chart-1 teal #0e9f9a at 2.96:1). Darkening it further FAILED the
+normal-vision floor (it drifts toward the blue), so the fix is one step:
+#0e9d9a, validator-proven ALL-PASS on BOTH surfaces, updated in globals.css
+and the chartTheme fallback. Report PNGs now use the same five colors in the
+same fixed order (matplotlib was drawing its default blue/orange — a chart in
+the export that matched nothing on screen) and cap pie slices at 6 to match
+the frontend. The ECharts dynamic-import placeholder was an EMPTY 300px div —
+indistinguishable from a broken chart on a dark surface; it is now a visible
+"Loading chart…" skeleton, and the first paint measures the wrapper
+(width/height auto + one rAF resize) instead of stale geometry.
+
+Verified end-to-end on the DEPLOYED stack with the exact original question:
+answer streams clean bullets + "An interactive bar chart … is rendered
+directly below", the Chart tab auto-opens, and the canvas paint was checked
+at the PIXEL level — 710×300, 2,289 non-background samples: Ghosted 640 /
+Move Forward 383 / Rejection 314 in validated teal. Tests: 1,345 backend
+(+8), 444 frontend, tsc/lint clean.
+
 ## "There are no records for these people" — there were 84 (2026-08-18)
 
 Asked how many internal interviews five named staff had each completed, the

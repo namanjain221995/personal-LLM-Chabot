@@ -33,7 +33,19 @@ import { ChartErrorBoundary } from './ChartErrorBoundary';
 // ECharts is not in the initial bundle and never renders on the server.
 const EChart = dynamic(() => import('./EChart'), {
   ssr: false,
-  loading: () => <div className="h-[300px] w-full min-w-0" aria-hidden />,
+  // A VISIBLE loading state. The placeholder used to be an empty 300px div,
+  // which on a dark surface is indistinguishable from a chart that failed to
+  // draw — screenshots of "blank charts" were mostly this while the ECharts
+  // chunk downloaded.
+  loading: () => (
+    <div
+      className="flex h-[300px] w-full min-w-0 items-center justify-center rounded-md bg-surface-2/50"
+      role="status"
+      aria-label="Loading chart"
+    >
+      <span className="text-xs text-faint">Loading chart…</span>
+    </div>
+  ),
 });
 
 function ChartUnavailable({ reason }: { reason: string }) {
@@ -75,7 +87,16 @@ function ChartCanvas({ spec, data }: { spec: ChartSpec; data: DataRow[] }) {
     return <ChartUnavailable reason="Chart could not be displayed. The figures are in the Data tab." />;
   }
 
-  return <EChart option={option} height={300} ariaLabel={spec.title || 'Chart'} />;
+  // A horizontal bar GROWS with its categories instead of squeezing them into
+  // a fixed 300px. Thirty recruiters in 300px is ten pixels a bar with the
+  // labels overlapping into a grey smear; the same thirty at 22px each is a
+  // readable ranking you scroll. Bounded so one runaway result cannot produce
+  // a page-length image.
+  const height =
+    spec.type === 'horizontal_bar'
+      ? Math.min(1400, Math.max(300, data.length * 26 + 96))
+      : 300;
+  return <EChart option={option} height={height} ariaLabel={spec.title || 'Chart'} />;
 }
 
 export function ChartView({ spec, data }: { spec: ChartSpec; data: DataRow[] }) {

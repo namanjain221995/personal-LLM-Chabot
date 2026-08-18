@@ -62,7 +62,7 @@ const TYPE_SET = new Set<string>(CHART_TYPES);
 /** Types that draw shares of a whole and need one non-negative measure. */
 const PART_TO_WHOLE = new Set<string>(['pie', 'donut']);
 
-const MAX_SLICES = 6;
+const MAX_SLICES = 8;
 const MAX_CATEGORY_TICKS = 40;
 
 export function isChartType(value: unknown): value is ChartType {
