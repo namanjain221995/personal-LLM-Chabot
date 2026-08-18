@@ -35,7 +35,7 @@ export type ModelChoice = 'smart' | 'fast';
  * the difference is what tools they may use (Low may search, Fast may not).
  * Medium and High think first and may also plan multi-step work.
  */
-export type ReasoningEffort = 'fast' | 'low' | 'medium' | 'high';
+export type ReasoningEffort = 'fast' | 'low' | 'medium' | 'high' | 'extra_high';
 
 /** Salesforce toggle (V2 §1): "salesforce" is the v1 behavior. */
 export type ChatMode = 'salesforce' | 'assistant';

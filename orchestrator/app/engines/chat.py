@@ -81,11 +81,11 @@ async def run_chat_engine(
     # High is the level for hard questions — long code, real derivations — so
     # it gets room to finish. A ceiling that cuts the answer mid-function is
     # worse than a slow answer.
-    if effort == "high" and mode == "assistant":
+    if effort in ("high", "extra_high") and mode == "assistant":
         max_tokens = 16000
     # Thinking levels are used for code and analysis, where 0.6 invents API
     # names and drifts. Fast/Low stay conversational.
-    temperature = 0.3 if effort in ("medium", "high") else 0.6
+    temperature = 0.3 if effort in ("medium", "high", "extra_high") else 0.6
     parts: List[str] = []
     async for kind, text in llm.stream_chat_events(
         _messages(message, history, mode),

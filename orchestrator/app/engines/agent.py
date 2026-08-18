@@ -39,10 +39,10 @@ STEP_CONCURRENCY = 3
 # Plan size by level — the schema cap stays MAX_STEPS; this is how many the
 # planner is ASKED for. High is the level you pick for a hard question, so it
 # is allowed to break the work down further than Medium.
-_STEP_BUDGET = {"medium": 5, "high": MAX_STEPS}
+_STEP_BUDGET = {"medium": 5, "high": MAX_STEPS, "extra_high": MAX_STEPS}
 # Room for the final answer. A long plan needs a long synthesis, or High reads
 # more and then truncates what it learned.
-_SYNTH_TOKENS = {"medium": 6000, "high": 12000}
+_SYNTH_TOKENS = {"medium": 6000, "high": 12000, "extra_high": 12000}
 
 
 def step_budget(effort: str) -> int:

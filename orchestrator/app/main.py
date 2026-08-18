@@ -245,7 +245,7 @@ class ChatRequest(BaseModel):
     # copy. Only meaningful in salesforce mode; ignored elsewhere.
     sf_live: bool = False
     model: Literal["smart", "fast"] = "smart"
-    effort: Literal["fast", "low", "medium", "high"] = "medium"
+    effort: Literal["fast", "low", "medium", "high", "extra_high"] = "medium"
     agent: bool = False
     # V8: an uploaded PDF (base64, optionally a data: URL) + its filename.
     pdf: Optional[str] = None

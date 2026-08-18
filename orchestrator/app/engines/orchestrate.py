@@ -116,6 +116,7 @@ ALLOWED = {
     "low": {"agent": False, "search": True},
     "medium": {"agent": True, "search": True},
     "high": {"agent": True, "search": True},
+    "extra_high": {"agent": True, "search": True},
 }
 
 
@@ -151,7 +152,7 @@ async def decide(message: str, history: Sequence[dict], effort: str) -> Plan:
     # below it planned. Anything worth searching for at High is worth planning,
     # so the two travel together there. A question needing no tools at all is
     # still answered directly — High does not mean "always slow".
-    if effort == "high" and search:
+    if effort in ("high", "extra_high") and search:
         agent = True
     return Plan(agent=agent, search=search)
 

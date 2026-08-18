@@ -126,7 +126,7 @@ def test_effort_reaches_the_step_runner():
 def test_thinking_levels_use_a_lower_temperature_than_chat():
     """0.6 invents API names in code; the thinking levels are used for code."""
     src = inspect.getsource(chat.run_chat_engine)
-    assert 'temperature = 0.3 if effort in ("medium", "high") else 0.6' in src
+    assert 'temperature = 0.3 if effort in ("medium", "high", "extra_high") else 0.6' in src
 
 
 def test_high_gets_a_bigger_answer_ceiling():
@@ -147,3 +147,28 @@ def test_small_talk_gets_neither_diagrams_nor_code_rules():
     """A greeting must not come back with a mermaid graph or a code fence."""
     system = chat._messages("hi", [], "salesforce")[0]["content"]
     assert "```python" not in system and "mermaid" not in system
+
+
+# ---------------------------------------------------------------------------
+# extra_high (Phase 1, 2026-08-19)
+# ---------------------------------------------------------------------------
+
+
+def test_extra_high_exists_at_every_effort_gate():
+    """extra_high must behave as at-least-High everywhere effort branches;
+    a missing dict key silently degrades it to Medium via .get fallbacks."""
+    from app import llm
+    from app.engines import agent, orchestrate, search
+
+    assert "extra_high" in llm.REASONING_EFFORTS
+    assert llm.wants_thinking("smart", "extra_high") is True
+    assert search._QUERY_BUDGET["extra_high"] >= search._QUERY_BUDGET["high"]
+    assert search._SOURCE_BUDGET["extra_high"] >= search._SOURCE_BUDGET["high"]
+    assert agent._STEP_BUDGET["extra_high"] == agent.MAX_STEPS
+    assert agent._SYNTH_TOKENS["extra_high"] >= agent._SYNTH_TOKENS["high"]
+    assert orchestrate.allowances("extra_high") == {"agent": True, "search": True}
+
+
+def test_extra_high_gets_the_high_output_ceiling():
+    src = inspect.getsource(chat.run_chat_engine)
+    assert 'effort in ("high", "extra_high") and mode == "assistant"' in src

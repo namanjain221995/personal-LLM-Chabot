@@ -20,13 +20,14 @@ import { useEffect, useRef, useState } from 'react';
 import type { ModelChoice, ReasoningEffort } from '@/lib/types';
 import { IconCheck, IconChevronDown } from './icons';
 
-const EFFORTS: ReasoningEffort[] = ['fast', 'low', 'medium', 'high'];
+const EFFORTS: ReasoningEffort[] = ['fast', 'low', 'medium', 'high', 'extra_high'];
 
 const EFFORT_LABEL: Record<ReasoningEffort, string> = {
   fast: 'Fast',
   low: 'Low',
   medium: 'Medium',
   high: 'High',
+  extra_high: 'Extra-High',
 };
 
 const EFFORT_SHORT: Record<ReasoningEffort, string> = {
@@ -34,6 +35,7 @@ const EFFORT_SHORT: Record<ReasoningEffort, string> = {
   low: 'Low',
   medium: 'Med',
   high: 'High',
+  extra_high: 'XHigh',
 };
 
 /** What each level actually does — shown so the trade-off is never a guess. */
@@ -41,7 +43,9 @@ const EFFORT_HELP: Record<ReasoningEffort, string> = {
   fast: 'Answers straight away · no thinking, no tools',
   low: 'No thinking · searches the web only if the question needs it',
   medium: 'Thinks first · plans multi-step work and searches when useful',
-  high: 'Thinks longest · same tools as Medium for the hardest tasks',
+  high: 'Thinks long · same tools as Medium for the hardest tasks',
+  extra_high:
+    'Thinks longest · drafts several answers in parallel and keeps the best',
 };
 
 export function ModelPicker({

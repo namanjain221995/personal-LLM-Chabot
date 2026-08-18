@@ -30,7 +30,7 @@ Emit = Callable[[str, dict], Awaitable[None]]
 _MAX_QUERIES = 3
 # Searches per request, by level. High is meant to be the one you reach for on
 # a hard question, so it looks from more angles than Medium.
-_QUERY_BUDGET = {"fast": 0, "low": 2, "medium": 3, "high": 6}
+_QUERY_BUDGET = {"fast": 0, "low": 2, "medium": 3, "high": 6, "extra_high": 6}
 
 # Sources actually READ, by level. This used to be one global
 # settings.search_max_results for every level, applied as a head-slice AFTER
@@ -38,12 +38,12 @@ _QUERY_BUDGET = {"fast": 0, "low": 2, "medium": 3, "high": 6}
 # everything past the first 10, which is why "high" never read more than
 # "medium". High runs several web steps inside one agent plan, so the request
 # total is a multiple of this.
-_SOURCE_BUDGET = {"fast": 0, "low": 10, "medium": 15, "high": 60}
+_SOURCE_BUDGET = {"fast": 0, "low": 10, "medium": 15, "high": 60, "extra_high": 60}
 
 # Pages allowed from any one site, by level. Without this, one SEO-heavy
 # domain can supply a third of a large result set and the extra breadth buys
 # nothing — 30 sources that are really 8 sites is not deep research.
-_MAX_PER_DOMAIN = {"fast": 0, "low": 3, "medium": 3, "high": 4}
+_MAX_PER_DOMAIN = {"fast": 0, "low": 3, "medium": 3, "high": 4, "extra_high": 4}
 # Floor below which the domain cap relaxes — a niche question where one site
 # genuinely holds the answer should not be starved down to four pages.
 _MIN_SOURCES = 8

@@ -65,7 +65,8 @@ function sanitize(raw: unknown): ChatPrefs {
       p.effort === 'fast' ||
       p.effort === 'low' ||
       p.effort === 'medium' ||
-      p.effort === 'high'
+      p.effort === 'high' ||
+      p.effort === 'extra_high'
         ? p.effort
         : DEFAULT_PREFS.effort,
     // Both of these had composer toggles that are now gone, so a value saved

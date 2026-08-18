@@ -35,7 +35,7 @@ MODEL_CHOICES = ("smart", "fast")
 # Four levels on ONE model. "fast" and "low" skip the reasoning pass; the
 # difference between them is how much work the orchestrator may do (low may
 # search the web, fast may not). See engines/orchestrate.py.
-REASONING_EFFORTS = ("fast", "low", "medium", "high")
+REASONING_EFFORTS = ("fast", "low", "medium", "high", "extra_high")
 
 
 def normalize_system(messages: Sequence[dict]) -> List[dict]:
@@ -208,8 +208,8 @@ def wants_thinking(model_choice: str = "smart", effort: str = "medium") -> bool:
     """
     if model_choice != "smart":
         return False
-    # Fast and Low answer directly; Medium and High think first.
-    return effort in ("medium", "high")
+    # Fast and Low answer directly; Medium and above think first.
+    return effort in ("medium", "high", "extra_high")
 
 
 def thinking_body(enabled: bool) -> dict:
