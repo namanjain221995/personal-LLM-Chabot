@@ -173,16 +173,19 @@ describe('pie and donut', () => {
     expect(seriesOf(pie)[0].radius).toEqual(['0%', '72%']);
   });
 
-  it('folds the tail into "Other" past six slices', () => {
-    const rows: DataRow[] = Array.from({ length: 9 }, (_, i) => ({
+  it('folds the tail into "Other" past eight slices', () => {
+    // MAX_SLICES moved 6 -> 8 in 05d2286; the assertion now tracks the
+    // constant's intent (top N-1 slices + one folded remainder), not the
+    // old literal.
+    const rows: DataRow[] = Array.from({ length: 10 }, (_, i) => ({
       stage: `s${i}`,
-      total: 9 - i,
+      total: 10 - i,
     }));
     const data = partToWholeData(spec({ type: 'donut' }), rows, 'total');
-    expect(data).toHaveLength(6);
-    expect(data[5].name).toBe('Other');
-    // 4 + 3 + 2 + 1 for the folded tail
-    expect(data[5].value).toBe(10);
+    expect(data).toHaveLength(8);
+    expect(data[7].name).toBe('Other');
+    // 3 + 2 + 1 for the folded tail
+    expect(data[7].value).toBe(6);
   });
 
   it('refuses to draw when every value is zero or negative', () => {
