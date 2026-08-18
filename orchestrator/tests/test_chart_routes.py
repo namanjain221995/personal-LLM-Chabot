@@ -93,7 +93,13 @@ def test_direct_sql_route_charts_an_explicit_request(warehouse, offline_llm):
     assert meta["data"][0]["stage"] == "Qualification"
 
 
-def test_direct_sql_route_leaves_an_ordinary_question_unCharted(warehouse, offline_llm):
+def test_direct_sql_route_leaves_an_ordinary_question_unCharted(
+    warehouse, offline_llm, monkeypatch
+):
+    # This asserts EXPLICIT-mode gating, so pin the mode: the deployed .env
+    # sets CHART_TRIGGER_MODE=hybrid, and a suite run that inherits it made
+    # this fail as a phantom regression (Phase 0 baseline, 2026-08-19).
+    monkeypatch.setattr(settings, "chart_trigger_mode", "explicit")
     _, events = collect(
         lambda emit: sql_engine.run_sql_engine("how many per stage", [], emit)
     )
@@ -170,9 +176,14 @@ def test_the_agent_and_direct_routes_agree_on_the_chart(warehouse, offline_llm):
     assert routed["data"] == direct["data"]
 
 
-def test_chart_intent_is_read_from_the_user_not_the_planner_step(warehouse, offline_llm):
+def test_chart_intent_is_read_from_the_user_not_the_planner_step(
+    warehouse, offline_llm, monkeypatch
+):
     """A plan step's input is written by the planner ("Count opportunities
     grouped by stage") and does not contain the word the user typed."""
+    # Explicit-mode assertion — pin the mode against the ambient .env
+    # (CHART_TRIGGER_MODE=hybrid would legitimately chart the plain question).
+    monkeypatch.setattr(settings, "chart_trigger_mode", "explicit")
     plan = agent_engine.AgentPlan(
         steps=[agent_engine.PlanStep(id=1, title="Pipeline", kind="sql",
                                      input="Count opportunities grouped by stage")]
