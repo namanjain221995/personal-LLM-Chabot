@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Primary_Technology__c</fullName>
+    <description>Candidate primary technical skill or technology niche. Examples: Salesforce, Java, Python, AWS. Used for quick identification and matching.</description>
+    <inlineHelpText>Enter the candidate main technical skill. Example: Salesforce, Java + Spring Boot, AWS DevOps, React + Node.js</inlineHelpText>
+    <label>Primary Technology</label>
+    <required>false</required>
+    <trackFeedHistory>false</trackFeedHistory>
+    <trackHistory>false</trackHistory>
+    <type>TextArea</type>
+</CustomField>

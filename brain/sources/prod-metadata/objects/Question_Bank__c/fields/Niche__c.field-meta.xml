@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Niche__c</fullName>
+    <deleteConstraint>SetNull</deleteConstraint>
+    <description>DEPRECATED 2026-05-17. Question Bank no longer filters by Niche; niche-specific questions come from Lambda (AI Resume Based sections). No longer used by any flow. Do not use.</description>
+    <inlineHelpText>DEPRECATED - do not use.</inlineHelpText>
+    <label>Niche (DEPRECATED - do not use)</label>
+    <referenceTo>Niche__c</referenceTo>
+    <relationshipLabel>Question Banks</relationshipLabel>
+    <relationshipName>Question_Banks</relationshipName>
+    <required>false</required>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Lookup</type>
+</CustomField>

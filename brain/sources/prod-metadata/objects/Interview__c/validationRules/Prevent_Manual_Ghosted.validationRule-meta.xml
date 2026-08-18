@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ValidationRule xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Prevent_Manual_Ghosted</fullName>
+    <active>true</active>
+    <description>Users should not be allowed to select interview outcome as ghosted manually as it is updated using flow.</description>
+    <errorConditionFormula>AND(
+    ISCHANGED( Interview_Outcome__c ),
+    ISPICKVAL( Interview_Outcome__c , &quot;Ghosted&quot;),
+    NOT(IsValidated__c)
+)</errorConditionFormula>
+    <errorDisplayField>Interview_Outcome__c</errorDisplayField>
+    <errorMessage>Interview Outcome cannot be set to Ghosted manually. This value is system-managed and is updated automatically after 14 days from the Date of Interview.</errorMessage>
+</ValidationRule>

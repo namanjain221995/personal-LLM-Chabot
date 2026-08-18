@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ValidationRule xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Submission_Required_Fields_Validation</fullName>
+    <active>true</active>
+    <description>Ensures all mandatory fields on the Submission are filled before saving. Self-service sources (Website Applicant, Candidate Portal) are exempt, as those recruiter-only fields are filled in later.</description>
+    <errorConditionFormula>AND(
+   NOT(OR(
+       ISPICKVAL(Submission_Source__c, &quot;Website Applicant&quot;),
+       ISPICKVAL(Submission_Source__c, &quot;Candidate Portal&quot;)
+   )),
+OR(
+    ISBLANK(Job_Requirement__c),
+    ISBLANK(Submitted_By__c),
+    ISBLANK(Account_Manager__c),
+    ISPICKVAL(Submission_Status__c, &apos;&apos;),
+    ISBLANK(Internal_Submission_Date_Time__c),
+    Candidate_Rate__c = NULL,
+    ISBLANK(Candidate_Summary__c),
+    ISBLANK(Unique_Submission_Key__c)
+)
+)</errorConditionFormula>
+    <errorMessage>Please fill in all required fields:
+Job Requirement, Candidate, Submitted By,  Account Manager, Submission Status,  Internal Submission Date Time, Candidate Rate, Candidate Summary and Unique Submission Key.</errorMessage>
+</ValidationRule>

@@ -1,0 +1,459 @@
+# The Training Module brain.
+# Compiled from brain/sources/training-module.txt (the Training Module
+# Handbook v1.0, 32 pages) and verified against THIS production warehouse on
+# 2026-08-17: every table and field below was checked column by column, and
+# every data claim was re-grounded with live queries. This pack deliberately
+# does NOT restate the training rules that already live in org_brief.py
+# (slots, Session purposes, module statuses, mock-kind-via-type-join) — it
+# adds the layers the handbook documents on top of them: the deliverable
+# lifecycle, Session-Window booking, the Program-Version mock governance
+# knobs, the drop cascade, and the (not-yet-live) session AI analysis.
+name: training-module
+description: >
+  How TechSara's training delivery engine works: Program Versions, Slots and
+  Session Windows, enrolments, the deliverable submission + AI grading
+  pipeline, mock governance, the drop cascade, and the candidate portal.
+
+triggers:
+  - program
+  - programs
+  - programme
+  - programmes
+  - program version
+  - deliverable
+  - deliverables
+  - submission
+  - submissions
+  - submitted
+  - window
+  - windows
+  - session window
+  - batch
+  - batches
+  - capacity
+  - booked
+  - booking
+  - book
+  - enrol
+  - enroll
+  - enrolment
+  - enrollment
+  - enrolled
+  - extension
+  - extensions
+  - locked
+  - overdue
+  - dropped
+  - drop
+  - cascade
+  - step template
+  - step templates
+  - integrity
+  - recording
+  - recordings
+  - talk time
+  - on camera
+  - availability
+  - break
+  - breaks
+  - portal
+  - cadence
+  - deadline
+  - deadlines
+  - retake
+  - ai score
+  - graded
+  - grading
+  - whatsapp
+
+tables:
+  - Program__c
+  - Program_Version__c
+  - Session_Window__c
+  - Deliverable__c
+  - Deliverable_Result__c
+  - StepTemplate__c
+
+rules: |
+  Training-module rules (deliverables / windows / program versions / drops —
+  on top of the training rules above):
+  - Deliverable Status__c semantics (6,635 rows): 'Not Active' = created with
+    the step but LOCKED until its session completes — it is not pending work;
+    'Active' / 'Inprogress' = open for the candidate; 'Submitted' = uploaded,
+    awaiting AI; 'Approved' / 'Failed' = final AI verdict rolled up;
+    'Locked' = went past due and was never finished (869 rows — this is the
+    overdue bucket); 'Dropped' = cascaded from a training drop. The data also
+    holds 'Completed' (210 rows), a value the documented picklist lacks —
+    report it, never silently merge or drop it. "Outstanding deliverables"
+    means Active + Inprogress (+ Submitted if the question includes awaiting
+    grades) — never count 'Not Active'.
+  - One Deliverable_Result__c row per submission ATTEMPT (Pass 2,648 / Fail
+    2,158 / Pending 6). The parent Deliverable__c.AI_Latest_Score__c is TEXT
+    — TRY_CAST before comparing; the per-attempt AI_Score__c on the result
+    row is the numeric source.
+  - A Session_Window__c is one daily batch inside a Slot (Cohort__c) — e.g.
+    "Slot 137 / Batch 1". Bookable = Status__c IN ('Upcoming','Active').
+    Booked_Count__c and Candidate_Capacity__c are VARCHAR numbers — cast
+    them; and Booked_Count can legitimately EXCEED capacity (portal caps at
+    5, admins override) — over-capacity is not data corruption.
+  - Never filter Program_Version__c on Status__c = 'Published'. Verified
+    again 2026-08-17: the ONLY Published version is a demo ("Advance
+    Training Demo 1 - V1") while every delivered programme's version sits in
+    Draft.
+  - Mock governance lives as columns on Program_Version__c (the Mock_*
+    fields): when booking opens (Mock_Booking_Window_Days__c), when
+    reschedule locks (Mock_Reschedule_Lock_Days__c), the trainer's result
+    deadline (Mock_Result_Deadline_Days__c) and what happens on a missed or
+    failed result (Mock_Miss_Action__c, default 'Drop Training'). So a
+    training that dropped right after a mock date most likely hit the
+    automatic miss/fail action — check the nearby mock before assuming a
+    manual drop.
+  - The session AI-analysis fields exist on Session__c (Integrity_Score__c,
+    Integrity_Tier__c, Candidate_Talk_Pct__c, Trainer_Talk_Pct__c,
+    Candidate_On_Camera_Pct__c, Session_Summary__c, Red_Flags_Summary__c,
+    Flag_Type__c, Severity__c) but Analysis_Status__c is EMPTY on all 3,101
+    rows — the pipeline is not live in production. Answer "the session
+    analysis feature is not populated yet", never a zero or an average of
+    nothing.
+  - Availability__c (candidate mock-availability slots) is synced but its
+    fields are hidden from the integration user — only Time_Zone__c came
+    through. Availability questions cannot be answered from the warehouse;
+    say so instead of querying columns that do not exist.
+  - Session_Attendee__c rows must carry the ATTENDEE's own
+    Candidate_Training__c and step, not the master's; their status/date/link
+    fields are formulas reading through to the master session.
+  - Whatsapp_No__c on Candidate_Training__c is personal contact information
+    — same handling as other personal identifiers: do not read it out.
+
+metrics:
+  - name: session window occupancy
+    aliases:
+      - window occupancy
+      - session windows
+      - open windows
+      - window capacity
+      - batch capacity
+      - seats left
+      - windows with space
+    table: Session_Window__c
+    definition: >
+      Each bookable batch (Session Window) with its slot, status, booked
+      count and capacity.
+    sql: >
+      SELECT c.Name AS slot, sw.Window_Label__c AS window, sw.Status__c,
+      TRY_CAST(sw.Booked_Count__c AS DOUBLE) AS booked,
+      TRY_CAST(sw.Candidate_Capacity__c AS DOUBLE) AS capacity
+      FROM Session_Window__c sw
+      LEFT JOIN Cohort__c c ON sw.Cohort__c = c.Id
+      WHERE sw.Status__c IN ('Upcoming', 'Active')
+      ORDER BY c.Name, sw.Window_Label__c
+    chart: bar of booked vs capacity per window
+    caveat: >
+      Booked can exceed capacity — the 5-seat cap is portal-only and admins
+      override it. Completed windows are history; exclude them unless asked.
+
+  - name: locked overdue deliverables
+    aliases:
+      - locked deliverables
+      - overdue deliverables
+      - past due deliverables
+      - deliverables not submitted in time
+    table: Deliverable__c
+    definition: >
+      Deliverables that went past their due date without being finished —
+      Status__c = 'Locked' is the overdue bucket.
+    sql: >
+      SELECT count(*) FROM Deliverable__c WHERE Status__c = 'Locked'
+    date_column: Due_Date_Sort__c
+    chart: single value, or bar by candidate via Candidate_Training__c
+    caveat: >
+      'Dropped' deliverables are from training drops, not lateness — keep the
+      two buckets apart. Use Due_Date_Sort__c for date maths, not the
+      display-string due-date fields.
+
+  - name: deliverable extension requests
+    aliases:
+      - extension requests
+      - extensions requested
+      - asked for more time
+      - deadline extensions
+    table: Deliverable__c
+    definition: Deliverables where the candidate flagged an extension request.
+    sql: >
+      SELECT count(*) FROM Deliverable__c WHERE Extension_Requested__c = 'true'
+    date_column: Extension_Requested_At__c
+    chart: single value, or bar by candidate
+    caveat: >
+      The flag stays set after handling — pair with status when asked about
+      OPEN requests, and say the caveat.
+
+glossary:
+  Session Window: >
+    A recurring daily batch inside a Slot — "Morning Batch 9-11" — with its
+    own trainer, capacity and booked count. One Slot can run several windows.
+  Program Version: >
+    The frozen, configured template of a programme (durations, session type,
+    booking mode, all mock rules). Trainings clone from it; versions are not
+    edited once live.
+  Step Template: >
+    The reusable blueprint of one training day/module, owned by a Program
+    Version and cloned into each candidate's training steps at enrolment.
+  Drop cascade: >
+    What firing Status = Dropped on a training does: steps and deliverables
+    dated on/after Drop_Date__c become Dropped, sessions are cancelled
+    (solo), the attendee row deleted, or the master seat promoted to another
+    attendee. History before the drop date keeps its status.
+  Master session: >
+    In a group window the first candidate's Session__c is the real meeting;
+    everyone else attends via Session_Attendee__c rows that read through to
+    it.
+  Booking window: >
+    The mock can only be booked from N working days before its date
+    (Program_Version.Mock_Booking_Window_Days__c, default 4) until the mock
+    date itself.
+  Miss action: >
+    Program_Version.Mock_Miss_Action__c — what a missed result deadline or
+    failed mock triggers: Drop Training (default), Warn Only, or Notify
+    Admin.
+  Locked deliverable: >
+    A deliverable that passed its due date without being finished; a
+    scheduled flow sets Status = 'Locked'.
+  Break series: >
+    Recurring_Break_Series__c — a trainer's recurring calendar block; the
+    scheduler creates one calendar Event per weekday in range and records
+    how many in Event_Count__c.
+  Integrity score: >
+    Part of the designed session AI analysis (talk time, camera presence,
+    red flags). The fields exist but the pipeline is not populated in
+    production yet.
+
+field_notes:
+  Program_Version__c:
+    Status__c: >
+      Draft | Published | Superseded — but the delivered programmes sit in
+      Draft; never use Published as a liveness filter.
+    Mock_Frequency__c: Weekly | Once | End of Program | Custom (after specific steps).
+    Mock_Cadence_Day__c: Weekday regular weekly mocks land on (default Monday).
+    Mock_Final_Week_Day__c: Weekday of the final week's mock (default Friday).
+    Mock_Duration_Min__c: Mock length in minutes.
+    Mock_Booking_Window_Days__c: Working days before the mock that booking opens (default 4).
+    Mock_Reschedule_Lock_Days__c: Reschedule locks this many working days before the mock (default 2).
+    Mock_Result_Deadline_Days__c: Trainer must record the result within this many working days (default 3).
+    Mock_Miss_Action__c: Drop Training (default) | Warn Only | Notify Admin — fires on missed or failed results.
+    Mock_Overflow_Threshold__c: Remaining supply at which the next working day opens as overflow.
+    Mock_Interviewer_Group__c: DeveloperName of the public group supplying mock interviewers.
+    Mock_Failure_Requires_Retake__c: Failed mock forces a retake instead of a drop.
+    Mock_Blocks_Progress__c: Failed mock blocks further training steps.
+  Session_Window__c:
+    Window_Label__c: Human batch name, e.g. "Batch 1".
+    Status__c: Upcoming | Active | Completed — rolled automatically from the slot's dates.
+    Booked_Count__c: Running enrolment count (VARCHAR number — cast). Can exceed capacity via admin override.
+    Candidate_Capacity__c: Max candidates; the portal enforces 5, admins can exceed it.
+    Activate_From__c: When the window becomes visible on the portal (start minus 7 days).
+    Trainer__c: Host trainer for this window.
+    Cohort__c: The Slot this window belongs to.
+  Deliverable__c:
+    Status__c: >
+      Not Active (waiting for its session) | Active | Inprogress | Submitted
+      | Approved | Failed | Locked (overdue) | Dropped; data also holds
+      'Completed'.
+    AI_Latest_Score__c: Latest AI score rolled up from results — stored as TEXT, cast it.
+    Attempt_Count__c: Number of submission attempts.
+    Extension_Requested__c: Candidate asked for more time ('true'/'false').
+    Due_Date_Sort__c: THE sortable due date; the other due-date fields are display strings.
+    Linked_Session__c: The session whose completion unlocked this deliverable.
+    Approval_Required__c: Whether trainer approval is part of the flow.
+  Deliverable_Result__c:
+    AI_Score__c: The AWS AI score for this attempt (numeric source of truth).
+    Result_Status__c: Pass | Fail | Pending (awaiting the AI callback).
+  Session__c:
+    Analysis_Status__c: Session AI-analysis state — empty on every production row so far.
+    Integrity_Score__c: Designed AI integrity score; not populated yet.
+    Integrity_Tier__c: Integrity banding; not populated yet.
+    Candidate_Talk_Pct__c: Share of the session the candidate spoke; not populated yet.
+    Trainer_Talk_Pct__c: Share of the session the trainer spoke; not populated yet.
+    Candidate_On_Camera_Pct__c: Camera-on share; not populated yet.
+    Session_Summary__c: AI-written session summary; not populated yet.
+    Red_Flags_Summary__c: AI-flagged concerns; not populated yet.
+    Recording_URL__c: Post-session recording link.
+    Create_Meeting_Error__c: Populated when the Zoom callout failed — the diagnostic for missing links.
+  Candidate_Training__c:
+    Drop_Date__c: The cascade cutoff — records dated before it keep their status.
+    Session_Window__c: The batch the candidate booked into.
+    Whatsapp_No__c: Personal contact number — never read out.
+  StepTemplate__c:
+    Triggers_Mock__c: Custom-cadence marker — completing a step cloned from this template spawns a mock.
+    Expected_Duration_Min__c: Planned minutes for the module.
+    Is_Required__c: Whether the module can be skipped.
+  Recurring_Break_Series__c:
+    Event_Count__c: How many calendar Events the break series created.
+    Subject__c: The break's subject shown on the calendar.
+
+knowledge:
+  - title: The training delivery hierarchy (mental model)
+    keywords: [hierarchy, model, program, version, slot, window, structure]
+    text: |
+      Program -> Program Version -> Slot (Cohort__c) hosting N Session
+      Windows -> each window has candidates' Trainings enrolled -> each
+      Training has day-by-day Steps (cloned from the version's Step
+      Templates) -> each Step gets one Session per day and 0..K
+      Deliverables. Mock interviews attach at the TRAINING level, not the
+      step level. The Program Version is the frozen template carrying all
+      operational parameters: session type (single vs group), booking mode,
+      session duration, and every mock rule. "Slot" is the spoken word,
+      Cohort__c the object; a "Window" is one daily batch inside a slot
+      ("Slot 137 / Batch 1"), with its own trainer, time range, timezone and
+      capacity.
+  - title: What enrolment creates
+    keywords: [enrolment, enrollment, create, wizard, planned, setup]
+    text: |
+      An admin enrols a candidate through the Candidate_Training_Creation
+      wizard: candidate + programme version + slot/window + trainer + dates
+      + timezone. The flow inserts the Candidate_Training__c with Status
+      'Planned' (the portal shows a "training is being set up" banner until
+      it goes Active), clones every Step Template of the version into
+      CandidateTrainingStep__c rows, pre-creates the Deliverables in 'Not
+      Active' state, and — when the programme auto-creates sessions —
+      inserts one Unscheduled Session per training day. Everything the
+      candidate later sees on the portal keys off this one training record.
+  - title: Booking a window, masters and attendees
+    keywords: [booking, window, group, master, attendee, capacity, promote]
+    text: |
+      When a candidate books into a Session Window from the portal, one of
+      two things happens. If the window has no live sessions yet, fresh
+      Session__c rows are created under this candidate — they become the
+      MASTER of each meeting. If live sessions already exist, the candidate
+      is added as Session_Attendee__c rows riding on the existing masters
+      (group sessions). A window is bookable while Upcoming/Active with
+      seats free — the portal caps at 5, but admins can assign beyond
+      capacity, so booked > capacity is legitimate. A fixed bug (Aug 2026)
+      matters for history: the "live sessions" check once included Cancelled
+      masters, so candidates could be stapled to dead sessions with no Zoom
+      link. Attendee rows must carry the attendee's OWN training and step;
+      their status/date/link fields are formulas reading the master.
+  - title: The deliverable pipeline (submit, AI grade, roll up)
+    keywords: [deliverable, submit, s3, ai, grade, score, approve, roll up]
+    text: |
+      Deliverables are created 'Not Active' with the step and unlock when
+      that step's session completes (a flow flips them Active and emails the
+      candidate a digest with a portal link). The candidate uploads through
+      the portal's S3 flow (pending result -> pre-signed URL -> upload ->
+      finalize): each attempt is one Deliverable_Result__c row, Result_
+      Status 'Pending'. The AWS AI pipeline grades the file and calls back
+      with a score and feedback; Pass rolls the parent Deliverable to
+      'Approved', Fail to 'Failed', Pending leaves it alone. A scheduled
+      flow sets 'Locked' on past-due deliverables still open, and candidates
+      can flag Extension_Requested__c, which emails the trainer. Production
+      volume: 6,635 deliverables, 4,812 graded attempts (2,648 Pass / 2,158
+      Fail).
+  - title: The drop cascade — what happens when a training is dropped
+    keywords: [drop, dropped, cascade, cutoff, cancel, promotion]
+    text: |
+      Dropping a training fires a cascade anchored on Drop_Date__c (stamped
+      automatically as today when left blank): deliverables due on/after the
+      date become Dropped (unless already Approved/Failed/Dropped), steps
+      started on/after the date become Dropped unless Completed, and
+      sessions are handled per shape — a solo candidate's sessions are
+      cancelled, an attendee's rows are deleted, and when the MASTER of a
+      group session drops, the seat is promoted to the earliest remaining
+      attendee so the group keeps its meeting. Everything dated before the
+      drop date keeps its prior status, so a dropped training legitimately
+      still shows completed work — that is audit preservation, not a data
+      error.
+  - title: Mock governance — the Program Version decides everything
+    keywords: [mock, governance, booking, deadline, reminder, miss, drop, retake]
+    text: |
+      Every mock rule is a column on the Program Version. Cadence:
+      Mock_Frequency (Weekly / Once / End of Program / Custom-after-steps),
+      with weekly mocks landing on Mock_Cadence_Day and the final week on
+      Mock_Final_Week_Day. Booking: opens Mock_Booking_Window_Days working
+      days before the mock (default 4); reschedule locks Mock_Reschedule_
+      Lock_Days before (default 2); guardrails also require the training to
+      be Active/Planned and block duplicate bookings for the same week. The
+      trainer must record the result within Mock_Result_Deadline_Days
+      (default 3 working days); the enforcer reminds the interviewer at +4h,
+      interviewer + trainer at +7h (capped at 2 emails), then applies
+      Mock_Miss_Action — by default DROP TRAINING, the same action a Fail
+      verdict triggers unless the version sets retake-instead
+      (Mock_Failure_Requires_Retake) or blocks progress instead.
+  - title: How mocks get their Interview Type name
+    keywords: [interview type, naming, week, final, convention]
+    text: |
+      The mock's Interview_Type__c lookup auto-links by a naming convention
+      on the version: weekly mocks link to "<PV Name> - Week N" and the last
+      week to "<PV Name> - Final Mock"; single-mock programmes use "- Final
+      Mock"; custom-cadence mocks use "- Mock N"; and anything on a "Resume
+      Based Training" programme links to plain "OOT". Admin creates one
+      Interview_Type record per combination as one-time setup — when the
+      record is missing the booking still succeeds with a NULL type lookup,
+      which is why a few mocks have no type name.
+  - title: The Admin Training Dashboard
+    keywords: [dashboard, admin, chart, drill, drawer, kpi]
+    text: |
+      One LWC with two views. LIST: filter by slot (typeahead), week,
+      programme, status and name; KPI tiles (total/active/dropped/
+      completed); grouped tables showing candidate, niche, trainer, status,
+      and "sessions held X/Y" for IRT programmes or "deliverables cleared
+      X/Y" for the rest. Clicking a row opens a detail drawer: hero tiles
+      for modules/deliverables/sessions/mocks progress plus mini tables of
+      each and the feedback blocks. CHART: nine visualizations — training
+      status mix, retention vs rejection, retraining ratio, programme mix,
+      niche mix, deliverable status, cohort trend (last 10 slots), mock
+      outcomes, trainer workload — each slice clickable to a drill-down
+      list. The platform's canonical training metrics mirror these nine
+      charts on purpose.
+  - title: The candidate portal (what candidates see and do)
+    keywords: [portal, guest, token, tabs, today, planner]
+    text: |
+      The portal runs as an unlicensed Guest User; every call resolves the
+      candidate from a session token (the token field itself is not synced
+      to the warehouse and must never be displayed). Surfaces: an Overview
+      dashboard with tiles, "Today at a glance" (today's session, due
+      deliverables, mocks), a weekly Planner, the Training tab (drill from
+      training -> modules -> module detail with its sessions and
+      deliverables), the Deliverables tab (submit to S3, request extension,
+      history, code-editor submissions), the Mock Interview tab (slot
+      picker, book/reschedule/cancel within the governance rules), session
+      lists with join links, availability calendar, and profile. A status
+      banner driven by the training's status tells the candidate what state
+      they are in.
+  - title: Session AI analysis — designed but not live
+    keywords: [integrity, analysis, talk, camera, red flags, recording]
+    text: |
+      The schema carries a full post-session AI analysis suite: integrity
+      score and tier, candidate/trainer talk percentages, camera-on
+      percentages, coverage, session summary, red-flag summaries, flag
+      type/severity/evidence, and links to the recording and result files.
+      Verified 2026-08-17: Analysis_Status__c is empty on ALL 3,101 session
+      rows — the pipeline has not run in production. Questions about talk
+      time, integrity or red flags should be answered as "the session
+      analysis feature is not populated yet", never as zeros or averages
+      over missing data. Recording_URL__c and Create_Meeting_Error__c are
+      ordinary operational fields and can be populated independently.
+  - title: Trainer breaks and candidate availability
+    keywords: [break, series, event, calendar, availability, slots]
+    text: |
+      Trainers block recurring time with the Recruiter Break Scheduler: it
+      creates a Recurring_Break_Series__c and one calendar Event per weekday
+      in the range (weekends skipped, and days where an existing event
+      overlaps the break time are skipped too — Aug 2026 fix), recording
+      how many in Event_Count__c; deleting the series removes its events.
+      These breaks are what makes an interviewer "unavailable" to the mock
+      slot picker. Candidate availability for mock matching lives on
+      Availability__c — synced to the warehouse with its fields hidden from
+      the integration user, so availability questions need the live org or
+      the portal, not warehouse SQL.
+  - title: Production data reality for the training module (2026-08-17)
+    keywords: [production, counts, reality, published, draft]
+    text: |
+      Verified in the production warehouse: 12 programmes and 12 programme
+      versions — the ONLY Published version is "Advance Training Demo 1 -
+      V1" (a demo) while every delivered programme's version sits in Draft,
+      so Published is not a liveness filter. Mock cadence is configured
+      (Weekly) only on the Advanced AI/ML versions. 18 session windows
+      (6 Active, 3 Upcoming, 9 Completed) named "Batch 1/2" under slots,
+      several legitimately over their capacity of 5. 6,635 deliverables
+      (2,649 Approved, 1,054 Not Active, 951 Dropped, 869 Locked, 787
+      Inprogress, 210 'Completed' — a value off the documented picklist),
+      4,812 graded attempts, 77 extension requests, 484 group-session
+      attendee rows, 52 step templates, 28 break series.

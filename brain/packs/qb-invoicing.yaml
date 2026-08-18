@@ -1,0 +1,412 @@
+# The Invoice / Payment / QuickBooks billing brain.
+# Compiled from brain/sources/invoice-payment-quickbooks.txt (written by the
+# Salesforce developer, 2026-08-11, Dev11 sandbox) and verified against the
+# PRODUCTION warehouse on 2026-08-12: field lists checked column by column,
+# value distributions sampled. Facts that hold only in the sandbox are marked
+# as such below — teaching the model a field production lacks produces
+# silently-wrong SQL, which is exactly what this file exists to prevent.
+name: qb-invoicing
+description: >
+  How TechSara bills candidates: one-time invoices and recurring EMI plans in
+  Salesforce (Invoice__c / Payment__c), integrated with QuickBooks Online.
+
+triggers:
+  - invoice
+  - invoices
+  - invoiced
+  - payment
+  - payments
+  - billing
+  - billed
+  - emi
+  - emis
+  - installment
+  - installments
+  - instalment
+  - recurring
+  - quickbooks
+  - qb
+  - surcharge
+  - dispute
+  - disputes
+  - disputed
+  - chargeback
+  - chargebacks
+  - ach
+  - refund
+  - refunds
+  - refunded
+  - deposit
+  - deposits
+  - deposited
+  - settlement
+  - settle
+  - settled
+  - lump sum
+  - lumpsum
+  - pre-emi
+  - prepaid
+  - void
+  - voided
+  - cycle
+  - cycles
+  - owed
+  - arrears
+  - outstanding
+  - collections
+  - collected
+
+tables:
+  - Invoice__c
+  - Payment__c
+
+rules: |
+  Billing rules (this question is about invoices / payments / EMI plans):
+  - Invoice__c.Type__c is 'One-Time' or 'Recurring' — but PRODUCTION data also
+    holds legacy rows where Type__c is NULL (71 of 117 at last check), created
+    before the QuickBooks billing system. Never silently drop or include them:
+    state which population you counted.
+  - The recurring (EMI) side is NOT live in production yet — it runs in the
+    sandbox. Zero recurring invoices is "the process has not been rolled out",
+    never a business result of zero. Say so.
+  - These fields exist ONLY in the sandbox so far and are NOT in the synced
+    warehouse: Amount_To_Recover__c, Base_Amount__c, Card_Surcharge_Amount__c,
+    Card_Surcharge_Applied__c, Total_Prepaid_Amount__c, Total_Lumpsum_Amount__c,
+    Settlement_Amount__c, Settlement_Discount__c, Linked_Recurring_Plan__c,
+    Linked_Payment_Type__c, Last_EMI_Amount__c, Committed_Interest__c,
+    Agreed_Plan_Total__c, Dispute_Status__c, Collected_So_Far__c,
+    Collected_Percent__c, Total_To_Collect__c. NEVER write SQL against them;
+    if the question needs one, explain the concept and say that field is not
+    in the synced production data yet.
+  - Invoice_Status__c is CUMULATIVE over payments: Not Paid (0 paid),
+    Partially Paid (0 < paid < Invoice_Amount), Paid (paid >= Invoice_Amount).
+    Several partials that add up flip it to Paid on the completing payment.
+  - Amount_Paid__c (invoice) excludes voided payments; Total_Amount_Collected__c
+    includes EVERYTHING (even voided). Outstanding for a one-time invoice is
+    Invoice_Amount - Amount_Paid; for a recurring plan it is based on
+    Total_Amount_Collected. Do not mix them.
+  - An EMI CYCLE is a Payment__c row whose QB_Sales_Receipt_ID__c is NOT NULL
+    (Payment_Source__c = 'Sales Receipt'). A one-time invoice paid in N
+    partial payments has 0 cycles — Total_Cycles_Completed__c counts only real
+    recurring charges.
+  - Payment_Source__c: 'Sales Receipt' = recurring EMI charge, 'Invoice
+    Payment' = payment on a one-time invoice, NULL = legacy rows from before
+    the integration (171 of 201 in production).
+  - Payment_Status__c in the real data holds 'Paid' AND 'Scheduled' (the
+    documented picklist says Paid|Voided — trust the data). Money actually
+    received means Payment_Status__c = 'Paid'; 'Scheduled' is a future charge,
+    never count it as collected.
+  - Interest applies to RECURRING plans only. Interest_Rate_Per_Cycle__c
+    defaults to 2 (percent) and is meaningless on a one-time invoice.
+  - Paid is not banked: Deposit_Status__c tracks the money after the charge —
+    'Pending' = charged but not yet in the bank, 'Deposited' = funds arrived,
+    'Reversed' = pulled back (NSF / chargeback). NULL = deposit tracking not
+    populated for that row. "How much is in the bank" means Deposited only.
+  - Payment_Issue_* fields are populated ONLY when something went wrong
+    (Dispute, ACH Return, Bank Transfer Canceled, Retrieval Request). Empty in
+    production so far — the dispute workflow is new. Chargeback deadlines
+    live in Payment_Issue_Respond_By__c; order open issues by it.
+  - Invoice_Id__c is a LEGACY column and empty — the QuickBooks reference is
+    QB_Invoice_Id__c (links: Invoice_Link__c / Payment_Link__c are built from
+    it). An EMI plan's QuickBooks id is QB_Recurring_ID__c.
+  - An invoice belongs to a candidate via Candidate__c (an Account) OR to a
+    lead via Lead__c — one of the two, depending on where it was created.
+    Show the person by joining and selecting their Name, never the raw Id.
+
+metrics:
+  - name: recurring plans by status
+    aliases:
+      - recurring plan
+      - recurring plans
+      - emi plan
+      - emi plans
+      - payment plan
+      - payment plans
+      - installment plan
+      - installment plans
+      - active plans
+      - plans by status
+    table: Invoice__c
+    definition: >
+      Recurring (EMI) plans grouped by lifecycle status. Statuses are Active,
+      Awaiting Payment Method, Payment Method Not Added, Paused, Cancelled,
+      Completed, Settled, Failed.
+    sql: >
+      SELECT Recurring_Status__c, count(*) FROM Invoice__c
+      WHERE Type__c = 'Recurring' GROUP BY 1 ORDER BY 2 DESC
+    date_column: Recurring_Start_Date__c
+    chart: bar
+    caveat: >
+      Production has no Recurring rows yet — the EMI system is still rolling
+      out from the sandbox. Report "not live in production data yet" rather
+      than a zero.
+
+  - name: emi cycles completed
+    aliases:
+      - cycles
+      - emi cycles
+      - cycles completed
+      - installments paid
+      - emis paid
+      - emis collected
+      - recurring charges
+    table: Payment__c
+    definition: >
+      Real recurring charges billed: Payment__c rows carrying a QuickBooks
+      Sales Receipt id. This is the same definition the roll-up
+      Invoice__c.Total_Cycles_Completed__c uses.
+    sql: >
+      SELECT count(*) FROM Payment__c WHERE QB_Sales_Receipt_ID__c IS NOT NULL
+    date_column: Payment_Date__c
+    chart: line over month
+    caveat: >
+      Partial payments on one-time invoices are NOT cycles and must not be
+      counted here. Zero in production until the recurring rollout completes.
+
+  - name: deposit status of collected money
+    aliases:
+      - deposit status
+      - deposited
+      - not deposited yet
+      - funds in bank
+      - reached the bank
+      - deposit reversed
+    table: Payment__c
+    definition: >
+      Where collected money physically is: Pending = charged but not yet in
+      the bank, Deposited = funds arrived, Reversed = deposit pulled back
+      (NSF / chargeback).
+    sql: >
+      SELECT Deposit_Status__c, count(*),
+      round(sum(TRY_CAST(Payment_Amount__c AS DOUBLE)), 2) AS amount
+      FROM Payment__c WHERE Deposit_Status__c IS NOT NULL GROUP BY 1
+    date_column: Deposit_Date__c
+    chart: bar
+    caveat: >
+      Most rows have no deposit status (tracking is new) — state that the
+      breakdown covers only rows where it is populated.
+
+glossary:
+  EMI: >
+    One installment of a recurring payment plan — one automatic charge, also
+    called a cycle. "10 EMIs of $500" = ten monthly charges of $500.
+  Pre-EMI: >
+    A separate one-time invoice the candidate paid to prepay one or more EMIs;
+    it reduces the plan's remaining balance.
+  Lump sum: >
+    A large one-off payment applied to a recurring plan to shrink its balance;
+    the EMI stays fixed and the number of remaining cycles drops.
+  Recovery: >
+    An invoice raised to re-collect money lost to a void, dispute or ACH
+    return. Recovery invoices are excluded from "collected" totals to avoid
+    double counting.
+  Settlement: >
+    Early payoff that closes a plan: remaining balance plus any recoverable
+    amount, minus an optional discount. Sets the plan's status to Settled.
+  Last EMI: >
+    The smaller final remainder charged on a plan's last cycle when the fixed
+    EMI does not divide the balance evenly.
+  Upfront amount: >
+    The one-time amount billed from a Lead or Account via the "Send Invoice"
+    flow — the line description on the QuickBooks invoice literally says
+    "Upfront Amount".
+  Card surcharge: >
+    Paying by credit card adds 4% on top of the base amount (sandbox feature;
+    the surcharge fields are not in production data yet).
+  ACH: >
+    Bank transfer / eCheck. Recurring plans normally bill by ACH; an "ACH
+    return" is the bank bouncing a charge after it seemed to succeed.
+  Recurring sales receipt: >
+    The QuickBooks object that bills a plan automatically; each charge posts a
+    webhook that becomes one Payment__c cycle in Salesforce.
+
+field_notes:
+  Invoice__c:
+    Type__c: >
+      'One-Time' or 'Recurring'; drives most logic. NULL on legacy rows that
+      predate the QuickBooks system.
+    Invoice_Status__c: >
+      Cumulative payment status: Not Paid | Partially Paid | Paid | Dispute.
+      Recomputed on each payment webhook.
+    Recurring_Status__c: >
+      EMI plan lifecycle: Active | Awaiting Payment Method | Payment Method
+      Not Added | Paused | Cancelled | Completed | Settled | Failed.
+    Recurring_Amount__c: The FIXED EMI charged each cycle.
+    Number_of_Months__c: Total cycles in the plan; blank = unlimited.
+    Total_Cycles_Completed__c: >
+      Roll-up counting child Payments with a QB Sales Receipt id — real
+      recurring charges only; one-time partials never count.
+    Outstanding_Cycles__c: Number_of_Months minus cycles completed.
+    Outstanding_Amount__c: >
+      Money still owed. One-time = Invoice_Amount - Amount_Paid; recurring =
+      plan value - Total_Amount_Collected; 0 once settled.
+    Amount_Paid__c: Sum of child payments with status Paid — EXCLUDES voided.
+    Total_Amount_Collected__c: Sum of ALL child payment amounts, voided included.
+    Total_Plan_Value__c: Whole-plan value (principal + interest) for recurring.
+    ACH_Amount__c: Plan principal = Total_Salary x Agreement_Percent.
+    Agreement_Percent__c: Percent of salary that becomes the plan principal.
+    Total_Salary__c: Annual_Salary + Bonus_Amount (formula).
+    Charge_Interest__c: TRUE = plan carries interest (recurring only).
+    Interest_Rate_Per_Cycle__c: Rate per cycle, default 2%. No effect on one-time.
+    Interest_Amount__c: Total plan interest; 0 unless recurring and charging.
+    Next_Billing_Date__c: Next automatic charge date.
+    Frequency__c: Daily | Weekly | Monthly billing cadence.
+    Interval__c: Every Nth cycle (1 = each, 2 = every other, up to 99).
+    QB_Invoice_Id__c: QuickBooks invoice id — the one links are built from.
+    QB_Recurring_ID__c: QuickBooks recurring transaction id for EMI plans.
+    Invoice_Id__c: LEGACY, now empty — never use for links or joins.
+    QB_Created_From__c: Lead | Account | Manual | Recurring | Custom Invoice | Settlement.
+    Candidate__c: The candidate (Account) this invoice bills, when account-side.
+    Lead__c: The lead this invoice bills, when created from a lead.
+    Recurring_Template_Name__c: QuickBooks template, e.g. "1-10 EMI + <name>".
+    Recurring_Plan__c: Plan name mapping to the QuickBooks item number.
+  Payment__c:
+    Payment_Source__c: >
+      'Sales Receipt' = recurring EMI cycle; 'Invoice Payment' = one-time
+      invoice payment; NULL = legacy row.
+    Payment_Type__c: Full = the payment that completed the invoice; else Partial.
+    Payment_Status__c: >
+      Paid | Voided per the picklist, but real data also holds Scheduled —
+      count money as received only when 'Paid'.
+    Transaction_Status__c: >
+      The charge attempt: Scheduled | Pending | Successful | Failed |
+      Cancelled | Disputed. Distinct from Payment_Status.
+    Payment_Amount__c: Amount charged (QuickBooks TotalAmt).
+    Amount_Paid__c: Applied amount (TotalAmt - unapplied); zeroed on void.
+    Payment_Date__c: When the payment happened.
+    Scheduled_Date__c: When a recurring charge was scheduled to run.
+    QB_Sales_Receipt_ID__c: >
+      QuickBooks sales receipt id — its presence is what makes a payment
+      count as an EMI cycle.
+    QB_Payment_Id__c: QuickBooks payment id for one-time invoice payments.
+    Deposit_Status__c: >
+      Pending = charged, not in bank yet; Deposited = funds arrived;
+      Reversed = deposit pulled back (NSF / chargeback).
+    Deposit_Amount__c: Amount the bank deposit moved.
+    Deposit_Date__c: Date the funds reached the bank.
+    Card_Type__c: Visa | Mastercard | Amex | Discover | ACH | Other.
+    Payment_Issue_Type__c: >
+      Dispute | ACH Return | Bank Transfer Canceled | Retrieval Request —
+      set only when something went wrong.
+    Payment_Issue_Status__c: Open | In Progress | Pending Finance | Submitted to Bank | Resolved.
+    Payment_Issue_Outcome__c: Won | Lost | Refunded | Re-collected | Written Off.
+    Payment_Issue_Respond_By__c: Chargeback response deadline — prioritise by this.
+    Payment_Issue_Amount__c: Amount disputed or returned.
+
+knowledge:
+  - title: How TechSara bills candidates (the two invoice shapes)
+    keywords: [billing, invoice, one-time, recurring, plan, upfront]
+    text: |
+      The company enrols candidates into paid programs, bills them in
+      Salesforce and collects through QuickBooks. Every bill is an Invoice__c
+      of one of two shapes. (A) ONE-TIME (Type__c='One-Time'): a single
+      "upfront amount" invoice created from a Lead or Account via the Send
+      Invoice flow; the customer pays all at once or in several partial
+      payments until it is fully paid. (B) RECURRING (Type__c='Recurring'):
+      an installment plan billed automatically by a QuickBooks Recurring
+      Sales Receipt — e.g. 10 monthly EMIs of a fixed amount — sized by an
+      ACH/salary calculator (Total Salary x Agreement %), optionally with
+      interest. Every customer payment flows back into Salesforce as a child
+      Payment__c record, and the invoice keeps running totals and status. A
+      one-time invoice can also be LINKED to a plan as 'Pre EMI' (prepaid
+      EMIs), 'Lump Sum' (large one-off that reduces the balance) or
+      'Recovery' (re-collecting money lost to a void or dispute).
+  - title: The recurring fixed-EMI model (how plans re-amortize)
+    keywords: [emi, amortization, reschedule, lump sum, cycles, last emi, reduce]
+    text: |
+      A plan keeps a FIXED EMI (Recurring_Amount__c). When the plan changes —
+      a prepayment, a lump sum, an interest change — the NUMBER OF CYCLES is
+      recomputed, not the EMI: remaining balance = (principal + committed
+      interest) - everything collected/prepaid/lump-summed; full cycles =
+      floor(remaining / EMI); any remainder becomes a smaller final "Last
+      EMI". The one exception is Reschedule, which re-amortizes the remaining
+      balance over a chosen new number of months, so the EMI itself changes.
+      Every update to QuickBooks first re-reads the recurring transaction for
+      a fresh SyncToken, then pushes the new schedule and remaining-charge
+      count (MaxOccurrences).
+  - title: How money flows back from QuickBooks (webhooks and status)
+    keywords: [webhook, paid, partially paid, status, sales receipt, void]
+    text: |
+      QuickBooks posts webhooks into Salesforce flows. A Payment webhook (one-
+      time invoices) computes the amount applied (TotalAmt - UnappliedAmt) and
+      sets Invoice_Status__c from the CUMULATIVE total paid: 0 = Not Paid,
+      below the invoice amount = Partially Paid, at or above = Paid — so
+      several partial payments flip the invoice to Paid on the completing one.
+      A SalesReceipt webhook (recurring plans) creates a Payment with
+      Payment_Source='Sales Receipt' and a QB_Sales_Receipt_ID — this is what
+      advances Total_Cycles_Completed — and marks the plan Completed when the
+      last cycle bills. A void sets Payment_Status='Voided', zeroes the
+      applied amount and cancels the transaction.
+  - title: Disputes, ACH returns and recovery
+    keywords: [dispute, chargeback, ach return, recovery, intuit, email, lost]
+    text: |
+      QuickBooks does NOT send a webhook for a dispute, an ACH return or a
+      chargeback — the transaction record is not even modified. They are
+      detected from Intuit notification EMAILS (matched to a payment by its
+      QuickBooks document number) or logged manually by Finance. The issue
+      lives on the Payment__c row: Payment_Issue_Type (Dispute | ACH Return |
+      Bank Transfer Canceled | Retrieval Request), a workflow status, and an
+      outcome (Won | Lost | Refunded | Re-collected | Written Off). Lost or
+      refunded money becomes recoverable and a 'Recovery' invoice is raised to
+      re-collect it; recovery invoices are excluded from collected totals so
+      nothing is double counted. Chargebacks carry a response deadline
+      (Payment_Issue_Respond_By) — open issues are worked in that order.
+  - title: Card surcharge, settlement and early payoff
+    keywords: [surcharge, credit card, 4%, settlement, payoff, discount, settled]
+    text: |
+      Paying by credit card adds a 4% surcharge: the invoice total becomes
+      base x 1.04 and the surcharge portion is tracked separately. Settlement
+      (early payoff) closes a recurring plan now: the customer pays the
+      remaining balance plus anything still recoverable, minus an optional
+      discount; the plan's status becomes Settled, its outstanding goes to
+      zero and the QuickBooks recurring transaction is cancelled. A 4% card
+      surcharge can be added to a settlement too. NOTE: the surcharge and
+      settlement FIELDS exist only in the sandbox so far — in production
+      data, answer these conceptually and say the fields are not synced yet.
+  - title: Managing a recurring plan (what CS can do)
+    keywords: [manage, skip, pause, resume, reschedule, extend, billing date, frequency]
+    text: |
+      The Manage Recurring Plan flow offers: Skip Next Charge (push one cycle
+      out), Reduce Cycles (candidate prepaid an EMI), Reschedule Length
+      (re-amortize over new months — the one action that changes the EMI),
+      Change Amount (re-derive from new salary/agreement), Change Interest,
+      Change Frequency (daily/weekly/monthly + interval), Change Billing
+      Date, Apply Lump Sum, Extend, Change Plan/Item, Change Billing Email,
+      Pause/Resume, Settle/Early Payoff, and Manage Linked Invoices. Every
+      action stamps Last_Recurring_Action__c on the invoice and syncs the new
+      schedule to QuickBooks.
+  - title: How invoices are sized from salary (the ACH calculator)
+    keywords: [salary, agreement, percent, principal, interest, sizing]
+    text: |
+      A recurring plan's principal is calculated from the candidate's pay:
+      Total_Salary (annual salary + bonus) x Agreement_Percent = ACH_Amount,
+      the plan principal. If interest is charged, plan interest is roughly
+      principal x rate-per-cycle x months, locked in ("committed") at the
+      first payment so later re-amortizations never compound it. The full
+      amount to collect = principal + committed interest.
+  - title: Rollout status — what is live in production data
+    keywords: [rollout, production, sandbox, missing, legacy, null, not live]
+    text: |
+      The QuickBooks billing system is being rolled out. As of 2026-08-12 the
+      production warehouse holds ~117 invoices: 46 One-Time, 0 Recurring, and
+      71 legacy rows with no Type at all (created before the integration).
+      Most Payment__c rows are legacy too (no Payment_Source). The EMI/
+      recurring machinery, disputes workflow, surcharge, settlement and
+      linked-invoice fields are documented from the sandbox and several of
+      those FIELDS do not exist in production yet. When a question touches
+      them, answer from this documentation, say the process is not live in
+      the production data, and never invent SQL against fields the schema
+      does not show.
+  - title: QuickBooks integration (how the two systems connect)
+    keywords: [integration, named credential, endpoint, sync, link, customer]
+    text: |
+      Salesforce talks to QuickBooks Online through a Named Credential and
+      External Service endpoints: create/update customer, create/update
+      invoice, create recurring sales receipt, send invoice email, and reads
+      for invoices/receipts/deposits/bank accounts. Inbound, QuickBooks posts
+      Payment, SalesReceipt and Deposit webhooks that Salesforce flows turn
+      into Payment__c records and deposit updates. The QuickBooks references
+      on an invoice are QB_Invoice_Id__c (links are built from it — the old
+      Invoice_Id__c is legacy and empty), QB_Recurring_ID__c for plans, and
+      QB_Customer_Id__c for the payer. Each candidate/lead maps to a
+      QuickBooks customer.

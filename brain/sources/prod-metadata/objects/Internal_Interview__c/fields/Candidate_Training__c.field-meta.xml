@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Candidate_Training__c</fullName>
+    <deleteConstraint>SetNull</deleteConstraint>
+    <description>The Candidate_Training this interview belongs to. Populated ONLY for Mock Interviews spawned from a candidate&apos;s training. Real (hire-flow) interviews leave this blank -- so this field is the discriminator: NOT NULL = Mock, NULL = real interview.</description>
+    <label>Candidate Training</label>
+    <referenceTo>Candidate_Training__c</referenceTo>
+    <relationshipLabel>Mock Interviews</relationshipLabel>
+    <relationshipName>Mock_Interviews</relationshipName>
+    <required>false</required>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Lookup</type>
+</CustomField>

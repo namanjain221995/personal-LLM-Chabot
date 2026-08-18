@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Requires_Hired_Niche__c</fullName>
+    <defaultValue>false</defaultValue>
+    <description>Conduct summary shows the Hired Niche picker for this type (config-not-code, replaces the Intake-by-name hardcode).</description>
+    <label>Requires Hired Niche</label>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Checkbox</type>
+</CustomField>

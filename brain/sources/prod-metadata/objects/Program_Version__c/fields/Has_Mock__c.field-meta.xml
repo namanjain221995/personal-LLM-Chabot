@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Has_Mock__c</fullName>
+    <defaultValue>false</defaultValue>
+    <description>True when this program version includes a mock interview. Unlocks the other Mock_* configuration fields.</description>
+    <label>Include Mock Interview</label>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Checkbox</type>
+</CustomField>

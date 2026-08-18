@@ -71,6 +71,26 @@ _SQL_SYSTEM = (
     # is exactly the inconsistency that erodes trust in both.
     "- The user writes dates DAY-MONTH-YEAR: 03-07-2026 or 3/7/2026 means "
     "3 July 2026, NEVER March 7. Only ISO dates (2026-07-03) are year-first.\n"
+    # That rule says how to READ the user's date. This one says how to WRITE
+    # it, and it is a separate mistake: asked about "17 Aug 2026" the model
+    # understood the date correctly and then emitted
+    # TRY_CAST('17-08-2026' AS DATE), which DuckDB evaluates to NULL. The
+    # predicate could not match anything, the query returned no rows, and the
+    # answer reported that the people asked about had no interviews at all.
+    # Names in this org are free text typed by many people: the warehouse holds
+    # 'Khushi ghorawath' with a lower-case surname. An exact match on one name
+    # in a five-name question returns 0 for that person and correct figures for
+    # the rest, so the answer looks authoritative and is wrong about someone.
+    "- Match a PERSON or RECORD NAME case-insensitively and loosely, never with "
+    "= or IN: use ILIKE with wildcards, e.g. Name ILIKE '%khushi%ghorawath%', "
+    "or compare lower(Name). Casing, spacing and middle names vary row to row, "
+    "and an exact match silently yields 0 for that one person while everybody "
+    "else's figures look right.\n"
+    "- WRITE every date literal in the SQL as ISO, e.g. DATE '2026-08-17' or "
+    "TRY_CAST(col AS DATE) = DATE '2026-08-17'. A day-first literal like "
+    "'17-08-2026' is NOT parseable: TRY_CAST returns NULL, the comparison is "
+    "never true, and you get an empty result instead of an error. Translate "
+    "the user's day-first date into ISO yourself before writing it.\n"
     # Everything the warehouse stores is VARCHAR (19,519 of 19,520 columns).
     # Without the cast rule, ORDER BY on an amount sorts lexicographically and
     # "top 10 invoices by value" answers 999 over 27000 — no error, just wrong.
@@ -111,9 +131,21 @@ async def _ask_sql(
     # MEAN. Knowing Interview__c exists does not stop a model counting the
     # 5,566 Initial Call rows as interviews.
     grounding = org_brief.grounding_for(question)
+    # Learn-from-chat: a join the user already thumbs-up'd for a similar
+    # question beats one re-derived from scratch (core/learned_examples.py).
+    from ..core import learned_examples
+
+    examples = learned_examples.block_for(question)
     user = f"Database schema:\n{schema_text}\n\nQuestion: {question}"
+    # Closest to the question, because it is the most specific thing we know:
+    # not a rule about people in general, but who THESE people are.
+    people = who_these_people_are(question)
+    if people:
+        user = f"{people}\n\n{user}"
     if hint:
         user = f"{hint}\n\n{user}"
+    if examples:
+        user = f"{examples}\n\n{user}"
     if grounding:
         user = f"{grounding}\n\n{user}"
     if error is not None:
@@ -188,6 +220,102 @@ def _connect_warehouse(duckdb):
                     "the local warehouse is being refreshed by the sync worker"
                 ) from exc
             time.sleep(_LOCK_WAIT_STEP)
+
+
+#: Where a person can be recorded in this org, and what that means for a
+#: question about them. Ordered: the first hit is what the block leads with.
+#: `Account` needs its record type because the SAME human is often BOTH — a
+#: recruiter has an Account row of record type 'Recruiter' as well as a
+#: Recruiter__c row, and only the latter is what an interview points at.
+_PERSON_SOURCES = (
+    (
+        "Recruiter__c",
+        "SELECT Name FROM Recruiter__c WHERE lower(Name) LIKE ?",
+        "staff (Recruiter__c) — interviews they RAN link through "
+        "Internal_Interview__c.Interviewer__c",
+    ),
+    (
+        "Account",
+        "SELECT a.Name FROM Account a JOIN RecordType rt ON a.RecordTypeId = rt.Id "
+        "WHERE rt.Name = 'Person Account' AND lower(a.Name) LIKE ?",
+        "a candidate (Account, record type 'Person Account') — interviews they "
+        "SAT link through Internal_Interview__c.Candidate__c",
+    ),
+)
+
+#: A question naming more people than this is a report, not a lookup; resolving
+#: each one is not worth the round trips.
+_MAX_RESOLVED_PEOPLE = 8
+
+
+def people_in_question(question: str) -> List[str]:
+    """Capitalised multi-word names the question appears to be about.
+
+    Deliberately conservative: two adjacent capitalised words. A single one is
+    far more often a product, an object or the first word of a sentence.
+    """
+    from ..core import org_brief
+
+    out: List[str] = []
+    for match in re.finditer(r"\b([A-Z][a-z]{2,})\s+([A-Z][a-z]{2,})\b", question or ""):
+        first, last = match.group(1), match.group(2)
+        if first.lower() in org_brief._NOT_A_NAME or last.lower() in org_brief._NOT_A_NAME:
+            continue
+        name = f"{first} {last}"
+        if name not in out:
+            out.append(name)
+    return out[:_MAX_RESOLVED_PEOPLE]
+
+
+def who_these_people_are(question: str) -> str:
+    """Look the named people up and say which object actually holds them.
+
+    "How many internal interviews has X completed" is genuinely ambiguous —
+    X may be the candidate who sat them or the employee who ran them, and the
+    two live on different objects. The model resolved it by guessing, and
+    guessed candidate for five people who are staff: it reported that they had
+    none when they had 84 between them, then on a later run reported four of
+    five correctly and a silent 0 for the fifth, whose surname is stored
+    lower-case.
+
+    A rule in the prompt did not fix it, because a rule cannot know who these
+    particular people are. One cheap indexed lookup can, so the ambiguity is
+    RESOLVED before the model sees the question rather than left to it. Returns
+    "" when the question names nobody, so ordinary questions are unchanged.
+    """
+    names = people_in_question(question)
+    if not names:
+        return ""
+    import duckdb  # lazy, same as _execute
+
+    try:
+        con = _connect_warehouse(duckdb)
+    except Exception:  # noqa: BLE001 — grounding is an optimisation, never fatal
+        return ""
+    found: List[str] = []
+    try:
+        for name in names:
+            pattern = "%" + "%".join(p.lower() for p in name.split()) + "%"
+            for _table, sql, meaning in _PERSON_SOURCES:
+                try:
+                    rows = con.execute(sql, [pattern]).fetchall()
+                except Exception:  # noqa: BLE001 — a missing table is not fatal
+                    continue
+                if rows:
+                    stored = ", ".join(sorted({str(r[0]) for r in rows})[:3])
+                    found.append(f"- {name} is {meaning}. Stored as: {stored}")
+                    break
+    finally:
+        con.close()
+    if not found:
+        return ""
+    return (
+        "Who the people named in this question are, looked up in the warehouse "
+        "just now — treat this as fact and join accordingly:\n"
+        + "\n".join(found)
+        + "\nMatch these names case-insensitively (ILIKE); the stored spelling "
+        "above is what the data actually contains."
+    )
 
 
 def _execute(sql: str, fetch_cap: int) -> Tuple[List[str], List[list]]:
@@ -395,6 +523,30 @@ def deterministic_summary(
     names = list(columns)[:_MAX_PROFILED_COLUMNS]
     total = len(rows)
     out: dict = {"total_rows": total, "counts_cover": "every row in the result"}
+    if not rows:
+        # An EMPTY result is the most dangerous shape this function handles,
+        # because it reads as an answer. Asked how many internal interviews
+        # five named people had completed, a query that joined the interviewer
+        # to the wrong object returned nothing, and the reply was "there are no
+        # internal interview records in the synced data for [them]" — a claim
+        # about the org, made from the silence of a query the model wrote
+        # itself. They had 84 between them.
+        #
+        # Nothing about zero rows distinguishes "these records do not exist"
+        # from "this query did not find them", so the model is not asked to
+        # tell them apart — it is told, in the authoritative block it is
+        # required to quote from, that it cannot.
+        out["empty_result"] = True
+        out["what_zero_rows_means"] = (
+            "The query matched no rows. This is NOT evidence that the records "
+            "do not exist: a wrong join, a name spelled differently in the "
+            "data, an unparseable date literal or a too-narrow filter all "
+            "return an empty result rather than an error. Say the query found "
+            "nothing and say what it looked for, and where a person or record "
+            "was named, say that the name may be stored differently or the "
+            "link may run through another object. Never state that the "
+            "business has no such records."
+        )
     if not names or not rows:
         return out
 
@@ -465,6 +617,61 @@ def deterministic_summary(
         out["numeric_totals"] = numeric
     if categorical:
         out["value_counts"] = categorical
+
+    # A GROUPED aggregate ("status, count" rows) profiled as if rows were
+    # records reads as nonsense: asked how many envelopes were completed vs
+    # voided (rows: Completed 72, Voided 33), value_counts said "Completed: 1
+    # (50%)" and the narrative answered "2 envelopes". When every label is
+    # unique and there is exactly one numeric column, pair each label with
+    # its value and drop the meaningless occurrence counts.
+    if (
+        total > 1
+        and len(numeric) == 1
+        and len(categorical) == 1
+        and all(
+            profile["denominator"] == len(profile["values"])
+            for profile in categorical.values()
+        )
+    ):
+        [(value_name, value_stats)] = list(numeric.items())
+        [label_name] = list(categorical.keys())
+        label_index = names.index(label_name)
+        value_index = names.index(value_name)
+        breakdown = {}
+        for row in rows[:40]:
+            if label_index < len(row) and value_index < len(row):
+                breakdown[str(row[label_index])] = row[value_index]
+        out["row_breakdown"] = breakdown
+        if total > 40:
+            out["row_breakdown_truncated"] = f"first 40 of {total} rows"
+        out["counts_cover"] = (
+            f"each result ROW pairs one {label_name} with its {value_name} "
+            f"value (see row_breakdown); the sum across rows is "
+            f"{value_stats['sum']}. total_rows is the number of rows, not a "
+            "count of records."
+        )
+        del out["value_counts"]
+
+    # A ONE-ROW, all-numeric result is an AGGREGATE — its values are the
+    # answer. Left as-is, the summary said "total_rows: 1" next to
+    # "sum: 866.0" for `SELECT count(*) ... WHERE Status = 'Locked'`, and the
+    # narrative model either answered `1` (the sf_intel path did exactly that,
+    # 2026-08-17) or reasoned aloud about the contradiction on the way to 866.
+    # State the aggregate meaning explicitly and promote a count-shaped column
+    # to the record count.
+    if total == 1 and numeric and not categorical:
+        out["aggregate_result"] = {
+            name: stats["sum"] for name, stats in numeric.items()
+        }
+        out["counts_cover"] = (
+            "a single AGGREGATE result row — aggregate_result holds the "
+            "answer; total_rows is the number of result rows, not of records"
+        )
+        # \btotal\b: a bare `AS total` on a count is common; total_amount is a
+        # SUM and must not be promoted to a record count.
+        count_like = [n for n in numeric if re.search(r"count|\bcnt\b|how_many|\btotal\b", n, re.I)]
+        if count_like:
+            out["record_count"] = int(numeric[count_like[0]]["sum"])
     return out
 
 

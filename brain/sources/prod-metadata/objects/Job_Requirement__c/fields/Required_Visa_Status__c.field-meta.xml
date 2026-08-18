@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Required_Visa_Status__c</fullName>
+    <description>Work authorization types the client will accept for this role. Used to filter candidates by visa status during matching.</description>
+    <inlineHelpText>Select all visa types the client accepts. Leave blank or select Any if client accepts all work authorizations. This filters candidates in the submission flow.</inlineHelpText>
+    <label>Required Visa Status</label>
+    <required>false</required>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>MultiselectPicklist</type>
+    <valueSet>
+        <restricted>true</restricted>
+        <valueSetDefinition>
+            <sorted>false</sorted>
+            <value>
+                <fullName>USC</fullName>
+                <default>false</default>
+                <label>USC</label>
+            </value>
+            <value>
+                <fullName>GC</fullName>
+                <default>false</default>
+                <label>GC</label>
+            </value>
+            <value>
+                <fullName>H1B</fullName>
+                <default>false</default>
+                <label>H1B</label>
+            </value>
+            <value>
+                <fullName>H4 EAD</fullName>
+                <default>false</default>
+                <label>H4 EAD</label>
+            </value>
+            <value>
+                <fullName>OPT</fullName>
+                <default>false</default>
+                <label>OPT</label>
+            </value>
+            <value>
+                <fullName>CPT</fullName>
+                <default>false</default>
+                <label>CPT</label>
+            </value>
+            <value>
+                <fullName>TN</fullName>
+                <default>false</default>
+                <label>TN</label>
+            </value>
+            <value>
+                <fullName>Any</fullName>
+                <default>false</default>
+                <label>Any</label>
+            </value>
+        </valueSetDefinition>
+    </valueSet>
+    <visibleLines>4</visibleLines>
+</CustomField>

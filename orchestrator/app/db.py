@@ -1037,6 +1037,55 @@ def set_message_feedback(
     }
 
 
+def list_confirmed_sql_examples(limit: int = 200) -> List[dict]:
+    """(question, sql) pairs a user confirmed with a thumbs-up, newest first.
+
+    The learning loop (core/learned_examples.py) replays these as few-shot
+    examples when a similar question arrives. Two safety rules live in the
+    query itself:
+      * only assistant messages whose meta actually carries the executed SQL
+        count — a thumb on a prose answer teaches nothing about SQL;
+      * any SQL text that ALSO received a thumbs-down anywhere is excluded
+        outright. A query one user liked and another flagged is contested,
+        and a contested example is worse than none.
+    The question is the nearest earlier user turn in the same conversation —
+    messages are keyed by position because offline sync rewrites their ids
+    (see replace_messages).
+    """
+    with connection() as con:
+        rows = con.execute(
+            """
+            WITH rated AS (
+                SELECT m.id, m.conversation_id, m.meta->>'sql' AS sql
+                  FROM messages m
+                 WHERE m.feedback = 'up' AND m.role = 'assistant'
+                   AND m.meta->>'sql' IS NOT NULL
+                 ORDER BY m.feedback_at DESC NULLS LAST
+                 LIMIT %s
+            )
+            SELECT r.sql,
+                   (SELECT q.content FROM messages q
+                     WHERE q.conversation_id = r.conversation_id
+                       AND q.id < r.id AND q.role = 'user'
+                     ORDER BY q.id DESC LIMIT 1) AS question
+              FROM rated r
+             WHERE NOT EXISTS (
+                    SELECT 1 FROM messages b
+                     WHERE b.feedback = 'down'
+                       AND b.meta->>'sql' = r.sql
+                   )
+            """,
+            (limit,),
+        ).fetchall()
+    examples = []
+    for row in rows:
+        question = (row["question"] or "").strip()
+        sql = (row["sql"] or "").strip()
+        if question and sql:
+            examples.append({"question": question, "sql": sql})
+    return examples
+
+
 def conversation_owner(conversation_id: str) -> Optional[int]:
     """user_id owning this conversation, or None when no such row exists.
 

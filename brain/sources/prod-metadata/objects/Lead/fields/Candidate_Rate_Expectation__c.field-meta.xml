@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Candidate_Rate_Expectation__c</fullName>
+    <description>Candidate expected hourly or salary rate. Captured during initial lead creation or website application. Used for job matching and submission planning.</description>
+    <inlineHelpText>Enter the candidate expected rate. For hourly contractors enter hourly rate (e.g. 65.00). For full-time roles enter annual salary (e.g. 120000.00).</inlineHelpText>
+    <label>Candidate Rate Expectation</label>
+    <precision>18</precision>
+    <required>false</required>
+    <scale>0</scale>
+    <trackFeedHistory>false</trackFeedHistory>
+    <trackHistory>false</trackHistory>
+    <type>Currency</type>
+</CustomField>

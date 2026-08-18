@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Complete_Address__c</fullName>
+    <externalId>false</externalId>
+    <formula>TRIM(
+    BLANKVALUE(Current_Address__Street__s, &quot;&quot;) &amp;
+    IF(ISBLANK(Current_Address__Street__s), &quot;&quot;, &quot;, &quot;) &amp;
+
+    BLANKVALUE(Current_Address__City__s, &quot;&quot;) &amp;
+    IF(ISBLANK(Current_Address__City__s), &quot;&quot;, &quot;, &quot;) &amp;
+
+    TEXT(Current_Address__StateCode__s) &amp;
+    IF(
+        AND(
+            NOT(ISBLANK(TEXT(Current_Address__StateCode__s))),
+            NOT(ISBLANK(Current_Address__PostalCode__s))
+        ),
+        &quot; &quot;,
+        &quot;&quot;
+    ) &amp;
+
+    BLANKVALUE(Current_Address__PostalCode__s, &quot;&quot;)
+)</formula>
+    <label>Complete Address</label>
+    <required>false</required>
+    <trackHistory>false</trackHistory>
+    <type>Text</type>
+    <unique>false</unique>
+</CustomField>

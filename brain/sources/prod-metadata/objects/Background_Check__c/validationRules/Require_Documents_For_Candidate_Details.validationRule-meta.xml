@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ValidationRule xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Require_Documents_For_Candidate_Details</fullName>
+    <active>true</active>
+    <errorConditionFormula>AND(
+    NOT( Before_Background_Check__c ),
+    NOT( C2C_Submission__c ),
+    ISCHANGED( Background_Check_Status__c ),
+    ISPICKVAL( Background_Check_Status__c , &quot;Candidate Details Pending&quot;),
+    OR(
+        NOT(ISPICKVAL( ACH_Authorization_Status__c , &quot;Signed&quot;)),
+        NOT(ISPICKVAL( Promissory_Note_Status__c , &quot;Signed&quot;))
+    )
+)</errorConditionFormula>
+    <errorDisplayField>Background_Check_Status__c</errorDisplayField>
+    <errorMessage>ACH Authorization and Promissory Note must both be Signed before moving to Candidate Details Pending.</errorMessage>
+</ValidationRule>

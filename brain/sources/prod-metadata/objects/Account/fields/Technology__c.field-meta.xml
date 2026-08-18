@@ -1,0 +1,269 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Technology__c</fullName>
+    <label>Technology</label>
+    <required>false</required>
+    <trackFeedHistory>false</trackFeedHistory>
+    <trackHistory>true</trackHistory>
+    <type>Picklist</type>
+    <valueSet>
+        <valueSetDefinition>
+            <sorted>false</sorted>
+            <value>
+                <fullName>Account Manager</fullName>
+                <default>false</default>
+                <label>Account Manager</label>
+            </value>
+            <value>
+                <fullName>AI/ML Engineer</fullName>
+                <default>false</default>
+                <label>AI/ML Engineer</label>
+            </value>
+            <value>
+                <fullName>Automation Engineer</fullName>
+                <default>false</default>
+                <label>Automation Engineer</label>
+            </value>
+            <value>
+                <fullName>AWS DevOps Engineer</fullName>
+                <default>false</default>
+                <label>AWS Devops Engineer</label>
+            </value>
+            <value>
+                <fullName>AWS Solutions Architect</fullName>
+                <default>false</default>
+                <label>AWS Solutions Architect</label>
+            </value>
+            <value>
+                <fullName>Azure DevOps Engineer</fullName>
+                <default>false</default>
+                <label>Azure Devops Engineer</label>
+            </value>
+            <value>
+                <fullName>Business &amp; Strategy Consultant</fullName>
+                <default>false</default>
+                <label>Business &amp; Strategy Consultant</label>
+            </value>
+            <value>
+                <fullName>Business Analyst</fullName>
+                <default>false</default>
+                <label>Business Analyst</label>
+            </value>
+            <value>
+                <fullName>Cloud Engineer</fullName>
+                <default>false</default>
+                <label>Cloud Engineer</label>
+            </value>
+            <value>
+                <fullName>Computer Support Associate</fullName>
+                <default>false</default>
+                <label>Computer Support Associate</label>
+            </value>
+            <value>
+                <fullName>Customer Success</fullName>
+                <default>false</default>
+                <label>Customer Success</label>
+            </value>
+            <value>
+                <fullName>Cybersecurity Engineer</fullName>
+                <default>false</default>
+                <label>Cybersecurity Engineer</label>
+            </value>
+            <value>
+                <fullName>Data Engineer</fullName>
+                <default>false</default>
+                <label>Data Engineer</label>
+            </value>
+            <value>
+                <fullName>DevOps Engineer</fullName>
+                <default>false</default>
+                <label>DevOps Engineer</label>
+            </value>
+            <value>
+                <fullName>Director of Engineering</fullName>
+                <default>false</default>
+                <label>Director of Engineering</label>
+            </value>
+            <value>
+                <fullName>Electrical Engineer</fullName>
+                <default>false</default>
+                <label>Electrical Engineer</label>
+            </value>
+            <value>
+                <fullName>Engineering Manager</fullName>
+                <default>false</default>
+                <label>Engineering Manager</label>
+            </value>
+            <value>
+                <fullName>Financial Analyst</fullName>
+                <default>false</default>
+                <label>Financial Analyst</label>
+            </value>
+            <value>
+                <fullName>Frontend UI Developer</fullName>
+                <default>false</default>
+                <label>Frontend UI Developer</label>
+            </value>
+            <value>
+                <fullName>Full Stack Developer</fullName>
+                <default>false</default>
+                <label>Full Stack Developer</label>
+            </value>
+            <value>
+                <fullName>Healthcare Informatics</fullName>
+                <default>false</default>
+                <label>Healthcare Informatics</label>
+            </value>
+            <value>
+                <fullName>Human Resources</fullName>
+                <default>false</default>
+                <label>Human Resources</label>
+            </value>
+            <value>
+                <fullName>Industrial Engineer</fullName>
+                <default>false</default>
+                <label>Industrial Engineer</label>
+            </value>
+            <value>
+                <fullName>IT Project Manager</fullName>
+                <default>false</default>
+                <label>IT Project Manager</label>
+            </value>
+            <value>
+                <fullName>Java Developer</fullName>
+                <default>false</default>
+                <label>Java Developer</label>
+            </value>
+            <value>
+                <fullName>Layout Engineer</fullName>
+                <default>false</default>
+                <label>Layout Engineer</label>
+            </value>
+            <value>
+                <fullName>Lead Software Engineer</fullName>
+                <default>false</default>
+                <label>Lead Software Engineer</label>
+            </value>
+            <value>
+                <fullName>Management Consultant</fullName>
+                <default>false</default>
+                <label>Management Consultant</label>
+            </value>
+            <value>
+                <fullName>Manufacturing Engineer</fullName>
+                <default>false</default>
+                <label>Manufacturing engineer</label>
+            </value>
+            <value>
+                <fullName>Mechanical Engineer</fullName>
+                <default>false</default>
+                <label>Mechanical Engineer</label>
+            </value>
+            <value>
+                <fullName>Microsoft Dynamics Consultant</fullName>
+                <default>false</default>
+                <label>Microsoft Dynamics Consultant</label>
+            </value>
+            <value>
+                <fullName>Network Security Engineer</fullName>
+                <default>false</default>
+                <label>Network Security Engineer</label>
+            </value>
+            <value>
+                <fullName>Oracle/SQL Developer</fullName>
+                <default>false</default>
+                <label>Oracle/SQL Developer</label>
+            </value>
+            <value>
+                <fullName>Product Manager</fullName>
+                <default>false</default>
+                <label>Product Manager</label>
+            </value>
+            <value>
+                <fullName>Product Owner &amp; Scrum Master</fullName>
+                <default>false</default>
+                <label>Product Owner &amp; Scrum Master</label>
+            </value>
+            <value>
+                <fullName>QA Automation Lead</fullName>
+                <default>false</default>
+                <label>QA Automation Lead</label>
+            </value>
+            <value>
+                <fullName>Remote IT Technician</fullName>
+                <default>false</default>
+                <label>Remote IT Technician</label>
+            </value>
+            <value>
+                <fullName>Risk Analyst</fullName>
+                <default>false</default>
+                <label>Risk Analyst</label>
+            </value>
+            <value>
+                <fullName>Sales</fullName>
+                <default>false</default>
+                <label>Sales</label>
+            </value>
+            <value>
+                <fullName>Salesforce Administrator</fullName>
+                <default>false</default>
+                <label>Salesforce Administrator</label>
+            </value>
+            <value>
+                <fullName>Salesforce Developer</fullName>
+                <default>false</default>
+                <label>Salesforce Developer</label>
+            </value>
+            <value>
+                <fullName>SDET / Automation Tester</fullName>
+                <default>false</default>
+                <label>SDET / Automation Tester</label>
+            </value>
+            <value>
+                <fullName>Senior Front-End Developer</fullName>
+                <default>false</default>
+                <label>Senior Front-End Developer</label>
+            </value>
+            <value>
+                <fullName>Software Engineer</fullName>
+                <default>false</default>
+                <label>Software Engineer</label>
+            </value>
+            <value>
+                <fullName>System Administrator</fullName>
+                <default>false</default>
+                <label>System Administrator</label>
+            </value>
+            <value>
+                <fullName>Technical Project Manager</fullName>
+                <default>false</default>
+                <label>Technical Project Manager</label>
+            </value>
+            <value>
+                <fullName>VP of Engineering</fullName>
+                <default>false</default>
+                <label>VP of Engineering</label>
+            </value>
+            <value>
+                <fullName>Python Developer</fullName>
+                <default>false</default>
+                <label>Python Developer</label>
+            </value>
+            <value>
+                <fullName>UI/UX Designer</fullName>
+                <default>false</default>
+                <label>UI/UX Designer</label>
+            </value>
+            <value>
+                <fullName>QA Engineer</fullName>
+                <default>false</default>
+                <label>QA Engineer</label>
+            </value>
+            <value>
+                <fullName>Supply Chain Management</fullName>
+                <default>false</default>
+                <label>Supply Chain Management</label>
+            </value>
+        </valueSetDefinition>
+    </valueSet>
+</CustomField>

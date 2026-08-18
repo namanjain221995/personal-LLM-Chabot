@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ValidationRule xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Requires_Status_Reason</fullName>
+    <active>true</active>
+    <errorConditionFormula>AND(
+  OR(
+    ISPICKVAL(Interview_Status__c, &quot;Rescheduled&quot;),
+    ISPICKVAL(Interview_Status__c, &quot;Cancelled&quot;),
+    ISPICKVAL(Interview_Status__c, &quot;No Show&quot;)
+  ),
+  ISPICKVAL(Status_New_Reason__c, &quot;&quot;)
+)</errorConditionFormula>
+    <errorDisplayField>Status_New_Reason__c</errorDisplayField>
+    <errorMessage>Status  Reason is required when Interview Status is Rescheduled, Cancelled, or No Show</errorMessage>
+</ValidationRule>

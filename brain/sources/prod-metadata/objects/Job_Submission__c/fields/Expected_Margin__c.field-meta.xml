@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Expected_Margin__c</fullName>
+    <description>SENSITIVE. Auto-calculated difference between Submitted Bill Rate and Candidate Rate. Represents actual margin on this submission. Visible only to AM and Leadership.</description>
+    <formula>Submitted_Bill_Rate__c - Candidate_Rate__c</formula>
+    <formulaTreatBlanksAs>BlankAsZero</formulaTreatBlanksAs>
+    <inlineHelpText>Auto-calculated. Shows expected profit margin for this specific submission. Visible only to Account Managers and Leadership.</inlineHelpText>
+    <label>Expected Margin</label>
+    <precision>18</precision>
+    <required>false</required>
+    <scale>2</scale>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Currency</type>
+</CustomField>

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ValidationRule xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Candidate_OR_Lead_Required</fullName>
+    <active>true</active>
+    <errorConditionFormula>AND(
+  ISBLANK(Candidate__c),
+  ISBLANK(Lead__c)
+)</errorConditionFormula>
+    <errorMessage>Either Candidate or Lead must be linked to this Job Submission.</errorMessage>
+</ValidationRule>

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Client_Company__c</fullName>
+    <deleteConstraint>Restrict</deleteConstraint>
+    <description>This field is used to store the client company instead of client account until we don&apos;t have b2b client converted into b2b client account.</description>
+    <inlineHelpText>This field indicates the client company instead of client account until we don&apos;t have b2b client converted into b2b client account.</inlineHelpText>
+    <label>Client Company</label>
+    <referenceTo>Company__c</referenceTo>
+    <relationshipLabel>Job Requirements</relationshipLabel>
+    <relationshipName>Job_Requirements</relationshipName>
+    <required>false</required>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Lookup</type>
+</CustomField>

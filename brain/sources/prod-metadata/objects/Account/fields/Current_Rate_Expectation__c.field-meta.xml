@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Current_Rate_Expectation__c</fullName>
+    <description>Candidate current expected hourly or salary rate. Updated regularly as candidate expectations change. Used as default in submissions.</description>
+    <inlineHelpText>Enter the candidate current rate expectation. For contractors enter hourly rate. For full-time enter annual salary. Update whenever expectations change.</inlineHelpText>
+    <label>Current Rate Expectation</label>
+    <precision>18</precision>
+    <required>false</required>
+    <scale>0</scale>
+    <trackFeedHistory>false</trackFeedHistory>
+    <trackHistory>false</trackHistory>
+    <type>Currency</type>
+</CustomField>

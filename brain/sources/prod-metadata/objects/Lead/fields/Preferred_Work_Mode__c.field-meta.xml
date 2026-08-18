@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Preferred_Work_Mode__c</fullName>
+    <description>Candidate preferred working arrangement. Used to match candidates with job requirements that specify work mode.</description>
+    <inlineHelpText>Select the candidate preferred work arrangement. Remote = fully remote. Hybrid = mix of remote and office. Onsite = full time at client location.</inlineHelpText>
+    <label>Preferred Work Mode</label>
+    <required>false</required>
+    <trackFeedHistory>false</trackFeedHistory>
+    <trackHistory>false</trackHistory>
+    <type>Picklist</type>
+    <valueSet>
+        <restricted>true</restricted>
+        <valueSetDefinition>
+            <sorted>false</sorted>
+            <value>
+                <fullName>Remote</fullName>
+                <default>false</default>
+                <label>Remote</label>
+            </value>
+            <value>
+                <fullName>Hybrid</fullName>
+                <default>false</default>
+                <label>Hybrid</label>
+            </value>
+            <value>
+                <fullName>Onsite</fullName>
+                <default>false</default>
+                <label>Onsite</label>
+            </value>
+        </valueSetDefinition>
+    </valueSet>
+</CustomField>

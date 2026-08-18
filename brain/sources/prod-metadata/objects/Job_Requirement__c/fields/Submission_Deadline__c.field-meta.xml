@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Submission_Deadline__c</fullName>
+    <description>The deadline by which candidate profiles must be submitted to the client. Required when Job Status = Open. Used for SLA tracking and urgency alerts.</description>
+    <inlineHelpText>Enter the date and time by which profiles must be submitted to the client. Required when job is Open. Drives SLA Status calculation and 24-hour alert automation.</inlineHelpText>
+    <label>Submission Deadline</label>
+    <required>true</required>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>DateTime</type>
+</CustomField>

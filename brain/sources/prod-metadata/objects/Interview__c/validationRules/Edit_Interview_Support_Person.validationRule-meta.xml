@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ValidationRule xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Edit_Interview_Support_Person</fullName>
+    <active>true</active>
+    <errorConditionFormula>AND(
+
+    ISCHANGED(Interview_Support_Person__c),
+
+    NOT($Permission.Edit_Interview_Support_Person),
+
+    /* Apply only for Scheduled / Completed */
+    OR(
+        ISPICKVAL(Interview_Status__c, &quot;Scheduled&quot;),
+        ISPICKVAL(Interview_Status__c, &quot;Completed&quot;)
+    )
+
+)</errorConditionFormula>
+    <errorDisplayField>Interview_Support_Person__c</errorDisplayField>
+    <errorMessage>You are not authorized to change the Interview Support Person</errorMessage>
+</ValidationRule>

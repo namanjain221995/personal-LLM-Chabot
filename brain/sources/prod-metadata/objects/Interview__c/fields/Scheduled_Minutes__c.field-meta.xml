@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Scheduled_Minutes__c</fullName>
+    <externalId>false</externalId>
+    <formula>(
+  /* END in minutes */
+  (MOD(VALUE(LEFT(TEXT(EndTime__c), 2)), 12) * 60)
+  +
+  VALUE(MID(TEXT(EndTime__c), 4, 2))
+  +
+  IF(RIGHT(TEXT(EndTime__c), 2) = &quot;PM&quot;, 720, 0)
+)
+-
+(
+  /* START in minutes */
+  (MOD(VALUE(LEFT(TEXT(StartTime__c), 2)), 12) * 60)
+  +
+  VALUE(MID(TEXT(StartTime__c), 4, 2))
+  +
+  IF(RIGHT(TEXT(StartTime__c), 2) = &quot;PM&quot;, 720, 0)
+)</formula>
+    <formulaTreatBlanksAs>BlankAsZero</formulaTreatBlanksAs>
+    <label>Scheduled Minutes</label>
+    <precision>18</precision>
+    <required>false</required>
+    <scale>0</scale>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Number</type>
+    <unique>false</unique>
+</CustomField>

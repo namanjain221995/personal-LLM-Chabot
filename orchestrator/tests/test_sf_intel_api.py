@@ -370,9 +370,15 @@ def test_turning_the_source_off_cancels_a_question_that_was_waiting(monkeypatch)
     assert asyncio.run(sf_state.get_pending(CONV)) is None
 
 
-def test_the_feature_flag_restores_the_previous_behaviour_exactly(monkeypatch):
-    """With intelligence mode off the deterministic detector answers instead,
-    and its legacy `meta.clarify` payload is what ships."""
+def test_the_kill_switch_swaps_the_planner_not_the_clarification_system(monkeypatch):
+    """Intelligence mode off → the deterministic detectors decide, through the
+    SAME typed card.
+
+    This used to ship a second payload shape (`meta.clarify`) rendered by a
+    second component, with no persistence, no resume token and no round budget —
+    so the kill switch did not disable a model call, it downgraded the user to a
+    clarification system that could not resume the request it interrupted.
+    """
     monkeypatch.setattr(settings, "salesforce_intelligence_enabled", False)
     monkeypatch.setattr(settings, "clarify_mode", "ambiguous")
     monkeypatch.setattr(settings, "clarify_before_answering", True)
@@ -393,7 +399,49 @@ def test_the_feature_flag_restores_the_previous_behaviour_exactly(monkeypatch):
         )
     meta = _meta(_parse_sse(resp.text))
     assert meta["route"] == "clarify"
-    assert "clarify" in meta and "clarification" not in meta
+    # One payload shape, whichever planner decided.
+    assert "clarify" not in meta
+    card = meta["clarification"]
+    assert card["resume_token"] and card["clarification_id"]
+    assert 2 <= len(card["options"]) <= 4
+    # …and `meta` says which planner it was, because that is the flag that
+    # changes the answer.
+    assert meta["salesforce_mode"] == "deterministic"
+
+    # The question is persisted and resumable, exactly as under the planner.
+    pending = asyncio.run(sf_state.get_pending(CONV))
+    assert pending is not None
+    assert pending.clarification_id == card["clarification_id"]
+
+
+def test_the_deterministic_card_never_shows_a_salesforce_api_name(monkeypatch):
+    """Labels are read by recruiters; `value` is read by the query planner.
+
+    The detectors resolve to precise object names on purpose — that is what
+    makes the follow-up query correct — but those names used to be rendered
+    straight into the option a user clicked.
+    """
+    monkeypatch.setattr(settings, "salesforce_intelligence_enabled", False)
+    monkeypatch.setattr(settings, "clarify_before_answering", True)
+
+    with TestClient(app) as client:
+        resp = client.post(
+            "/chat",
+            json={
+                "message": "how many candidates failed the mock from slot 128",
+                "conversation_id": CONV,
+                "mode": "salesforce",
+            },
+        )
+    card = _meta(_parse_sse(resp.text))["clarification"]
+    visible = " ".join(
+        [card["question"], card["header"]]
+        + [o["label"] for o in card["options"]]
+        + [o.get("description", "") for o in card["options"]]
+    )
+    assert "__c" not in visible and "__r" not in visible
+    # The machine-facing half kept the precision.
+    assert any("__c" in o["value"] for o in card["options"])
 
 
 # ── Restore + cancel endpoints ───────────────────────────────────────────────

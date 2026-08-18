@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Number_of_Openings__c</fullName>
+    <defaultValue>1</defaultValue>
+    <description>How many positions the client needs to fill for this requirement. Used to determine when Job Requirement should be marked as Filled.</description>
+    <externalId>false</externalId>
+    <inlineHelpText>Enter the number of positions to fill. Default is 1. When this many candidates are placed, Job Requirement can be marked Filled.</inlineHelpText>
+    <label>Number of Openings</label>
+    <precision>18</precision>
+    <required>false</required>
+    <scale>0</scale>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Number</type>
+    <unique>false</unique>
+</CustomField>

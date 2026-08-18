@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Designation__c</fullName>
+    <description>This field is used to store the lead&apos;s designation.</description>
+    <externalId>false</externalId>
+    <inlineHelpText>Enter above contact person&apos;s designation associated with company.</inlineHelpText>
+    <label>Designation</label>
+    <length>100</length>
+    <required>false</required>
+    <trackFeedHistory>false</trackFeedHistory>
+    <trackHistory>false</trackHistory>
+    <type>Text</type>
+    <unique>false</unique>
+</CustomField>

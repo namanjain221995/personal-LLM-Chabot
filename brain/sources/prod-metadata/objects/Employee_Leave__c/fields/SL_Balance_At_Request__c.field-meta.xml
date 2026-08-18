@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>SL_Balance_At_Request__c</fullName>
+    <defaultValue>0</defaultValue>
+    <description>Audit snapshot of SL balance at time of request</description>
+    <externalId>false</externalId>
+    <label>Balance Snapshot (SL)</label>
+    <precision>5</precision>
+    <required>false</required>
+    <scale>2</scale>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Number</type>
+    <unique>false</unique>
+</CustomField>

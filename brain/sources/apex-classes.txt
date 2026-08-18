@@ -1,0 +1,78 @@
+Apex Classes — Full Detailed Documentation (Techsara Solutions)
+This document explains each Apex class in depth: what it is, why it exists (purpose/rationale), the exact object / metadata API names and field API names it uses (with inferred data types and meaning), every method, the design patterns it applies, and where it fits in the wider system.
+This is Batch 1 (2 classes). More Apex classes will be appended to this same document as they are provided.
+
+1. ZoomRecordingPortalConfig
+1.1 What it is
+
+Type: Apex class.
+Sharing:public with sharing (executes with the running user's record sharing enforced — good hygiene, even though Custom Metadata itself is not sharing-controlled).
+Category: Configuration accessor / provider (a "facade" over a Custom Metadata Type).
+1.2 Purpose — what it does and why it exists
+This class is the single source of truth for all Zoom Recording Portal settings. The portal serves Zoom meeting recordings that are stored in AWS S3, and this class centralizes everything needed to do that:
+
+AWS connection details — bucket name, region, access key, secret key (used to build pre-signed S3 URLs so a browser can stream/download a recording directly from S3).
+Link security — how many minutes a generated pre-signed URL stays valid.
+File-type allow-list — which file extensions the portal is allowed to serve.
+Branding / UI text — the portal title and a top-of-page notice banner.
+Why a dedicated config class (rationale):
+
+One source of truth — no other class hard-codes bucket/region/keys; they all call these getters.
+Governor-limit efficiency — it caches the config in a static variable, so the metadata is queried at most once per transaction no matter how many getters are called.
+Fail-fast validation — if there is no active config record, or if the AWS keys are blank, it throws a clear ConfigurationException instead of failing later with a cryptic AWS/signing error.
+Safe defaults — optional settings (title, URL expiry, allowed extensions) fall back to sensible defaults, so the portal keeps working even if an admin leaves those blank.
+Testability — @TestVisible seams let unit tests inject a fake config (Custom Metadata rows can't be inserted with normal DML), including a way to test the "no config found" path.
+1.3 Data source — Custom Metadata Type
+Object / metadata API name: Zoom_Portal_Config__mdt (a Custom Metadata Type — configured in Setup → Custom Metadata Types → Zoom Portal Configs).
+The class queries the single active record (WHERE Is_Active__c = true LIMIT 1).
+Fields used (API name, inferred type, meaning)
+   Field API name Inferred type Meaning / purpose     Id Id Standard record Id   DeveloperName Text (standard for CMDT) Metadata record's developer name   MasterLabel Text (standard for CMDT) Metadata record's label   S3_Bucket_Name__c Text Name of the AWS S3 bucket holding the Zoom recordings   AWS_Region__c Text AWS region of the bucket (e.g. us-east-1); needed for request signing   Site_Title__c Text Portal heading / branding text (defaults to Zoom Recording Portal)   Top_Notice__c Text / Long Text Area Optional banner/notice shown at the top of the portal   Signed_URL_Expiry_Minutes__c Number Lifetime (minutes) of a generated pre-signed S3 URL (defaults to 480 = 8 hours)   Allowed_File_Extensions__c Text Comma-separated list of permitted file extensions (defaults to mp4,webm,mov,mkv)   AWS_Access_Key__c Text AWS Access Key ID used to sign S3 requests   AWS_Secret_Key__c Text AWS Secret Access Key used to sign S3 requests   Is_Active__c Checkbox (Boolean) Flags which config record is currently in effect   1.4 Class state (variables)
+
+private static Zoom_Portal_Config__mdt cachedConfig;
+A transaction-scoped cache of the active config record. Populated on the first access and reused for the rest of the transaction. Because it's static, it lives only for the current execution context.
+
+1.5 Methods — one by one
+   Method Visibility Returns What it does     setCachedConfigForTest(Zoom_Portal_Config__mdt cfg) @TestVisible private static void Test seam. Injects a fake config into the cache so tests don't depend on a real active metadata row.   clearCachedConfigForTest() @TestVisible private static void Test seam. Sets cachedConfig = null so tests can exercise the "no config found" branch.   getConfig() private static Zoom_Portal_Config__mdt Core accessor. Returns the cache if set; otherwise runs one SOQL for the active record. If none exists, throws ConfigurationException with a setup hint. Caches and returns the record. Every public getter routes through this.   getBucketName() public static String Returns S3_Bucket_Name__c.   getAwsRegion() public static String Returns AWS_Region__c.   getSiteTitle() public static String Returns Site_Title__c, or the default 'Zoom Recording Portal' when blank (String.isBlank).   getTopNotice() public static String Returns Top_Notice__c (may be null/blank — optional banner).   getSignedUrlExpiryMinutes() public static Integer Converts the Decimal Signed_URL_Expiry_Minutes__c to Integer; returns 480 when null.   getAllowedExtensions() public static Set<String> Parses Allowed_File_Extensions__c CSV → trims, lowercases, strips a leading . from each; returns the default set {mp4, webm, mov, mkv} when the field is blank.   getAwsAccessKey() public static String Returns AWS_Access_Key__c; throws ConfigurationException if blank (credential is mandatory).   getAwsSecretKey() public static String Returns AWS_Secret_Key__c; throws ConfigurationException if blank.   isExtensionAllowed(String fileName) public static Boolean Returns false if the name is blank or has no .; otherwise takes the substring after the last dot, lowercases it, and checks membership in getAllowedExtensions().   ConfigurationException public inner class — Custom exception type (extends Exception) used for all config/credential failures.   1.6 Design patterns applied
+
+Facade / accessor over Custom Metadata — callers never query the CMDT directly.
+Static caching (memoization) — at most one SOQL per transaction for the config.
+Defensive defaults — title, URL expiry, and allowed extensions all have fallbacks.
+Fail-fast — missing config or blank AWS keys throw immediately with actionable messages.
+Test seams (@TestVisible) — enable unit testing without real metadata rows.
+1.7 Where it fits (usage)
+Any controller or service that (a) generates AWS S3 pre-signed URLs for a recording, (b) validates a file type before serving it, or (c) renders the portal UI (title/notice) will call these getters. It pairs with ZoomRecordingRequestContext (below), which captures who is making the request for logging/auditing.
+1.8 Design note worth flagging
+Storing the AWS Secret Key in a Custom Metadata Type means the value is readable by anyone who can read the metadata type or run code that reads it. Many teams instead use Named Credentials (or Protected Custom Metadata/Custom Settings) for secrets. This is purely a design consideration for the model to be aware of — the class functionally works as written.
+
+2. ZoomRecordingRequestContext
+2.1 What it is
+
+Type: Apex class.
+Sharing:public with sharing.
+Category: Per-transaction (static) context holder for the current web request's client metadata.
+2.2 Purpose — what it does and why it exists
+This class holds the client IP address and User-Agent for the current request in static variables, so any downstream code can read them without passing them through every method call.
+Why it exists (rationale):
+
+In a Salesforce Site / Experience Cloud (guest) context, the request's IP and User-Agent are available only at the entry point (e.g. a @RestResource method or a page controller that can read the incoming request headers).
+Capturing them once into this holder lets later code — access logging, audit trails, basic security checks, or rate limiting — read them cleanly.
+Because the values are static, they exist only for the current execution/transaction and are naturally discarded afterward.
+2.3 Data source
+None — this class is pure in-memory static state. It touches no sObject.
+2.4 Class state (variables)
+   Variable Type Cap Meaning     currentIpAddress private static String truncated to 45 chars via .left(45) The client's IP address (45 = maximum textual length of an IPv6 address, including IPv4-mapped forms)   currentUserAgent private static String truncated to 255 chars via .left(255) The client's browser/app User-Agent string (255 = a typical text field length)   2.5 Methods — one by one
+   Method Visibility Returns What it does     setIpAddress(String ip) public static void Stores the IP only if not blank, truncated to 45 chars.   setUserAgent(String ua) public static void Stores the User-Agent only if not blank, truncated to 255 chars.   getIpAddress() public static String Returns the stored IP, or 'Unknown' if it was never set.   getUserAgent() public static String Returns the stored User-Agent, or 'Unknown' if it was never set.   reset() @TestVisible private static void Clears both values — used to isolate tests that simulate multiple requests.   2.6 Design patterns applied
+
+Static context holder (transaction-scoped) — values live only for the current execution.
+Length-safe setters — truncation guards against overflow if the values are later saved into audit fields.
+Null-safe getters — always return a usable string ('Unknown' fallback).
+Test seam (@TestVisible reset) — clean state between simulated requests in unit tests.
+2.7 Where it fits (usage)
+It is populated at the request entry point (the REST resource or controller that has access to the incoming request's headers) and consumed later — most likely when writing an access-log / audit record for a recording view or download. It complements ZoomRecordingPortalConfig: the config class knows what to serve and how, this class knows who is asking.
+
+Appendix — how these two classes relate
+Together they form the backbone of the Zoom Recording Portal:
+
+ZoomRecordingPortalConfig → configuration & connectivity (AWS bucket/region/keys, signed-URL expiry, allowed file types, branding).
+ZoomRecordingRequestContext → request identity (client IP + User-Agent) for logging/auditing each access.
+A typical request flow would be: the entry point captures IP/UA into ZoomRecordingRequestContext → the service reads AWS settings from ZoomRecordingPortalConfig, validates the file extension with isExtensionAllowed(...), and builds a pre-signed S3 URL that expires after getSignedUrlExpiryMinutes() → an audit record is written using the values from ZoomRecordingRequestContext.

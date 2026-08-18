@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Attendance_status__c</fullName>
+    <label>Attendance status</label>
+    <required>false</required>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>MultiselectPicklist</type>
+    <valueSet>
+        <restricted>true</restricted>
+        <valueSetDefinition>
+            <sorted>false</sorted>
+            <value>
+                <fullName>Host Skipped</fullName>
+                <default>false</default>
+                <label>Host Skipped</label>
+            </value>
+            <value>
+                <fullName>Attendee Skipped</fullName>
+                <default>false</default>
+                <label>Attendee Skipped</label>
+            </value>
+            <value>
+                <fullName>Attendee 1 Skipped</fullName>
+                <default>false</default>
+                <label>Attendee 1 Skipped</label>
+            </value>
+            <value>
+                <fullName>Attendee 2 Skippped</fullName>
+                <default>false</default>
+                <label>Attendee 2 Skippped</label>
+            </value>
+        </valueSetDefinition>
+    </valueSet>
+    <visibleLines>3</visibleLines>
+</CustomField>

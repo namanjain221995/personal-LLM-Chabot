@@ -1,0 +1,448 @@
+# The Internal Interview platform brain.
+# Compiled from brain/sources/internal-interview-platform.md (the Salesforce
+# team's production knowledge base, verified snapshot 2026-08-12) and
+# re-verified against THIS production warehouse on 2026-08-12: every table,
+# discriminator and picklist below was checked with live queries. The source
+# document's reference counts came from a development org (e.g. it records 113
+# question-bank rows where production has 805, 11 templates where production
+# has 1) — so structural knowledge is taken from the document and every
+# data-shaped claim below is taken from the production warehouse instead.
+name: internal-interview
+description: >
+  How TechSara's internal assessment platform works: Internal_Interview__c +
+  Session__c lifecycle, the question-bank "tick model", templates vs Magic
+  mode, mocks from the training portal, resumes, evaluations and Zoom.
+
+triggers:
+  - internal interview
+  - internal interviews
+  - mock
+  - mocks
+  - oot
+  - intake
+  - question
+  - questions
+  - question bank
+  - niche
+  - niches
+  - template
+  - templates
+  - resume
+  - resumes
+  - evaluation
+  - evaluations
+  - evaluated
+  - zoom
+  - meeting link
+  - reschedule
+  - rescheduled
+  - rescheduling
+  - conduct
+  - conducted
+  - launch mode
+  - magic
+  - section
+  - sections
+  - follow-up questions
+
+tables:
+  - Internal_Interview__c
+  - Recruiter__c
+  - Interview_Type__c
+  - Niche__c
+  - Section__c
+  - Question_Bank__c
+  - Resume__c
+
+rules: |
+  Internal-interview rules (this question touches the internal assessment
+  platform — Internal_Interview__c and its satellites, NOT the client-facing
+  Interview__c):
+  - RESCHEDULE DOUBLE-COUNT TRAP: rescheduling creates a NEW
+    Internal_Interview__c + Session__c pair and leaves the old row behind with
+    Status__c = 'Rescheduled' (67 of 300 rows at last check; 'Cancelled' adds
+    17 more). Old rows chain to the replacement via
+    Previous_internal_interview__c. Counting internal interviews or mocks
+    without excluding 'Rescheduled' rows overstates the number — count
+    Status__c = 'Completed' for "taken/conducted", exclude
+    Rescheduled/Cancelled for "booked/planned", and state the population.
+  - Status__c lifecycle: Unscheduled -> Scheduled -> Completed, with
+    Rescheduled and Cancelled as historical exits. Status arrives on the
+    interview by MIRROR from its Session__c (Purpose__c = 'Internal
+    Interview'), so the two can briefly disagree; trust the interview row for
+    interview questions.
+  - The KIND of assessment (OOT, Intake, Mock, week mocks) is the
+    Interview_Type__c LOOKUP join — unchanged rule. Candidate_Training__c IS
+    NOT NULL additionally marks interviews created by the TRAINING portal: in
+    this org that is the 'Advanced AI/ML Training - Week N' and 'Final Mock'
+    types (55 rows). OOT and Intake rows NEVER carry Candidate_Training__c —
+    do not filter them by it.
+  - Question eligibility lives in JUNCTION tables, never on Question_Bank__c
+    itself: Niche_Question__c (Question__c + Niche__c) says which niches a
+    question serves, Question_Section__c (Question__c + Section__c) which
+    sections, Question_Interview_Type__c (Question__c + Interview_Type__c)
+    optionally restricts types — a question with ZERO type rows is shared
+    across all types. Section order per type is
+    Section_Interview_Type__c.Sequence__c. The direct Question_Bank__c
+    .Niche__c and .Interview_Type__c columns are DEPRECATED and empty on all
+    805 rows — a join through them silently returns nothing.
+  - "What questions were asked in an interview" means the SNAPSHOT logs:
+    Internal_Interview_Question_Log__c (Question_Text__c, one row per asked
+    question) under Internal_Interview_Section_Log__c — not the current
+    Question_Bank__c content, which changes over time.
+  - Scores and verdicts: Interview_Evaluation__c (Evaluation_Type__c
+    'Human' | 'AI', so far human-only in production) with per-section
+    Section_Evaluation__c children; the header decision also lands on
+    Internal_Interview__c.Human_Decision__c — in the data: Pass, Fail, Needs
+    Improvement, unset on half the rows. The FINAL decision column is the
+    schema-locked typo Final_Descion__c — never "correct" its spelling, the
+    correctly-spelt name does not exist.
+  - More schema-locked typos that are the REAL columns:
+    Selected_Time_Zone_Start_Tim__c (interview), Selected_Time_Zone_ETim__c
+    (session), Evalation_Criteria_log__c (question log).
+  - Domain gating: Niche__c.Domain_Type__c uses 'Tech' / 'Non Tech' (no
+    hyphen) while Section__c.Domain_Type__c can use 'Non-Tech' (hyphen) and
+    'Both'. Normalize the hyphen before comparing or grouping across the two.
+  - Resume__c is metadata; the actual file is a Salesforce Files attachment.
+    The current resume is Is_Active__c = 'true' — a candidate can have
+    several rows, so count active ones or state that you counted all.
+  - Session__c has NO end-date column — Scheduled_Date__c plus start/end time
+    picklists; an interview cannot cross midnight by design. A Completed
+    session always carries Host_Feedback__c (validation rule requires it).
+  - Launch_mode__c: "Techsara's Magic" = dynamic question selection through
+    the junction tick model (172 rows, the dominant mode); 'Template' = fixed
+    question list from Template_Section_Question__c (2 rows in production —
+    production has a single template, so template analytics are near-empty).
+  - WHO A NAMED PERSON IS: a name is a CANDIDATE or an INTERVIEWER and they
+    sit on DIFFERENT objects. Candidate__c -> Account (who sat it, 227/344);
+    Interviewer__c -> Recruiter__c (who ran it, 342/344) — NOT Account, whose
+    own 'Recruiter' record type holds the same names and makes that join look
+    right. It matches nothing and returns 0 with no error (five named staff
+    were reported as having none; they had 84). Staff question -> join
+    Interviewer__c to Recruiter__c, filter Name or First_Name__c/Last_Name__c;
+    candidate question -> Candidate__c to Account. If unsure which, check
+    which object holds the name and say which reading you used.
+
+metrics:
+  - name: question bank coverage by niche
+    aliases:
+      - questions per niche
+      - question bank by niche
+      - question coverage
+      - questions by niche
+      - how many questions
+      - question bank size
+    table: Question_Bank__c
+    definition: >
+      Active question-bank questions available to each niche, counted through
+      the Niche_Question__c junction (the only real niche link).
+    sql: >
+      SELECT n.Name, count(DISTINCT nq.Question__c) AS questions
+      FROM Niche_Question__c nq
+      JOIN Niche__c n ON nq.Niche__c = n.Id
+      JOIN Question_Bank__c q ON nq.Question__c = q.Id
+      WHERE q.Is_Active__c = 'true'
+      GROUP BY 1 ORDER BY 2 DESC
+    chart: horizontal_bar
+    caveat: >
+      Never count via Question_Bank__c.Niche__c — it is deprecated and empty
+      on every row. A question also needs a Question_Section__c tick to
+      actually appear in an interview section.
+
+  - name: internal interview reschedule rate
+    aliases:
+      - reschedule rate
+      - rescheduled interviews
+      - how many rescheduled
+      - reschedules
+      - cancelled internal interviews
+    table: Internal_Interview__c
+    definition: >
+      Share of internal-interview records that are historical Rescheduled
+      shells — each reschedule leaves the old row behind with
+      Status__c = 'Rescheduled'.
+    sql: >
+      SELECT Status__c, count(*) FROM Internal_Interview__c
+      GROUP BY 1 ORDER BY 2 DESC
+    date_column: Scheduled_Date__c
+    chart: bar
+    caveat: >
+      Rescheduled rows are NOT extra interviews — they chain to their
+      replacement via Previous_internal_interview__c. State that the count is
+      of records, and exclude Rescheduled/Cancelled when the question means
+      real interviews.
+
+  - name: resumes on file
+    aliases:
+      - resumes
+      - resume status
+      - active resumes
+      - resumes uploaded
+      - who has a resume
+    table: Resume__c
+    definition: Resume records by status; the live one per candidate is Is_Active__c = 'true'.
+    sql: >
+      SELECT Resume_Status__c, Is_Active__c, count(*) FROM Resume__c
+      GROUP BY 1, 2 ORDER BY 3 DESC
+    chart: bar
+    caveat: >
+      A candidate can hold several resume rows (old ones deactivated). The
+      file itself is a Salesforce Files attachment, not a column.
+
+glossary:
+  Magic: >
+    "Techsara's Magic" — the dynamic launch mode that builds an interview
+    from junction config: sections for the type (in sequence), domain-gated
+    by niche, questions drawn from the eligible pool and shuffled.
+  Template mode: >
+    The fixed launch mode: Template__c -> Template_Section__c ->
+    Template_Section_Question__c, exact questions in exact order. Production
+    currently has one template; Magic dominates.
+  Tick model: >
+    Question eligibility as junction rows ("ticks"): a section tick
+    (Question_Section__c) + a niche tick (Niche_Question__c) + optional
+    interview-type ticks (Question_Interview_Type__c; none = shared).
+  Question log: >
+    Internal_Interview_Question_Log__c — the snapshot of exactly what was
+    asked in one interview, kept even if the question bank changes later.
+  Section log: >
+    Internal_Interview_Section_Log__c — per-section execution record: order,
+    score, comment, whether questions came from Standard pool or AI.
+  Pregen: >
+    AI resume-based questions generated ahead of the interview (stored on the
+    interview record) so the conduct screen does not wait on the AI service.
+  Conduct: >
+    The screen flow an interviewer runs during the interview: shows sections
+    and questions, captures scores out of 10 and remarks, then writes the
+    evaluation and marks everything Completed.
+  Mock: >
+    A training-origin internal interview, booked from the candidate portal;
+    carries Candidate_Training__c and a week number, and is assigned to the
+    least-loaded interviewer.
+  II: Internal_Interview__c — the interview business record (Session__c is its meeting).
+
+field_notes:
+  Internal_Interview__c:
+    Status__c: >
+      Unscheduled | Scheduled | Rescheduled | Cancelled | Completed. Mirrored
+      from the Session. Rescheduled/Cancelled rows are historical shells.
+    Human_Decision__c: >
+      Interviewer verdict; in the data Pass | Fail | Needs Improvement,
+      unset on ~half the rows.
+    AI_Decision__c: AI verdict on the assessment; sparsely populated so far.
+    Final_Descion__c: >
+      The final decision — schema-locked TYPO, this spelling is the real
+      column.
+    Launch_mode__c: "Techsara's Magic (dynamic questions) or Template (fixed list)."
+    Candidate_Training__c: >
+      Set only on interviews created by the training portal (week mocks /
+      final mock). OOT and Intake rows never carry it.
+    Previous_internal_interview__c: >
+      Reschedule lineage — points at the interview this one replaced.
+    Session__c: The paired meeting record (mutual lookup, not master-detail).
+    Has_Resume__c: >
+      Whether a resume is attached; can be stale after a reschedule (known
+      gap — the flow only checks the old interview's resume).
+    Mock_Status__c: Null on almost every row — NOT the mock filter.
+    Week_Number__c: Training week of a mock (portal-created interviews only).
+    Is_Final_Week_Mock__c: Marks the final-week training mock.
+    Hired_Niche__c: The niche the candidate was hired into (lookup to Niche__c).
+    AI_Pregen_Status__c: State of the AI question pre-generation for this interview.
+    Selected_Time_Zone_Start_Tim__c: >
+      Start-time slot picklist — schema-locked typo, distinct from the
+      similarly named datetime fields.
+  Session__c:
+    Purpose__c: >
+      Training | Internal Interview | Resume Understanding Session — filter
+      by it; the object serves several subsystems.
+    Host_Feedback__c: >
+      Required before a session can be Completed (validation rule), so it is
+      populated on every completed session.
+    Meeting_Link__c: Zoom join link written back after the meeting is created.
+    External_Meeting_ID__c: Zoom meeting id; presence means the meeting exists externally.
+    Actual_Start__c: Stamped when the conduct flow starts the interview.
+    Actual_End__c: Stamped at completion.
+    Scheduled_Date__c: THE session date — there is no end-date column.
+    Selected_Time_Zone_ETim__c: End-time slot picklist — schema-locked typo.
+  Resume__c:
+    Is_Active__c: "'true' = the candidate's current resume; old ones are deactivated."
+    Resume_Status__c: Draft | Under Review | Approved | Rejected | Uploaded.
+    Internal_Interview__c: The interview this resume was attached for.
+    Uploaded_By__c: Recruiter__c who uploaded it.
+  Question_Bank__c:
+    Question_Hash__c: Dedupe key — bulk loads skip questions whose hash exists.
+    Section_Name__c: FORMULA from the Section lookup — read-only.
+    Difficulty_Level__c: Easy | Medium | Hard.
+    Scenario__c: Scenario text shown with the question.
+    Evaluation_Criteria__c: What a good answer contains; shown to the interviewer.
+    Niche__c: DEPRECATED and empty — use the Niche_Question__c junction.
+    Interview_Type__c: DEPRECATED and empty — use Question_Interview_Type__c.
+  Section__c:
+    Domain_Type__c: >
+      Tech | Non-Tech | Both (hyphenated, unlike Niche's 'Non Tech') — gates
+      which sections a niche sees.
+    Question_Source_Type__c: Standard (pool) | AI Resume Based (generated).
+    Total_Questions__c: How many questions the section draws from its pool.
+    ESTIMATED_TIME_IN_MINUTES__c: Stored as TEXT — cast before arithmetic.
+    Source_Interview_Type__c: >
+      Review sections only — pull questions from another type's sections.
+  Niche__c:
+    Domain_Type__c: "Tech or 'Non Tech' (no hyphen) — normalize when comparing to Section."
+    Is_Active__c: Whether the niche is currently offered.
+  Section_Interview_Type__c:
+    Sequence__c: The section order within one interview type.
+
+knowledge:
+  - title: The internal-interview platform (big picture)
+    keywords: [internal, interview, platform, subsystem, session, overview]
+    text: |
+      Three subsystems share the org: the internal-interview platform
+      (schedule -> Zoom -> conduct -> evaluate internal assessments), the
+      training platform (programs, steps, deliverables, AI grading) whose
+      MOCK interviews reuse the internal-interview objects, and the separate
+      recruiting pipeline whose client-facing interviews live on
+      Interview__c. The internal platform is a dual-record design:
+      Internal_Interview__c is the business record (who, what type, which
+      niche, what was decided) and Session__c is the meeting record (when,
+      Zoom link, host, actual start/end). They are coupled by mutual
+      lookups and a status mirror, not master-detail. People are
+      Recruiter__c records (interviewers, hosts), candidates are Accounts
+      (Leads before conversion).
+  - title: Interview lifecycle — how a record moves
+    keywords: [lifecycle, scheduled, unscheduled, completed, status, zoom, mirror]
+    text: |
+      Create: the flow makes an Internal_Interview__c + Session__c pair, both
+      Unscheduled. An async flow then calls the Zoom/Calendar service; on
+      success the Session receives the meeting link/ids and becomes
+      Scheduled, and a mirror flow copies that status (and IST times) onto
+      the interview. Conduct requires the interview to be Scheduled: the
+      interviewer walks section screens, scores out of 10, and finishing
+      marks the Session Completed (host feedback is mandatory), writes
+      Human_Decision__c and the score, and creates Interview_Evaluation__c
+      with per-section Section_Evaluation__c children. If the interview is
+      never scheduled, look at the Session first: the external meeting call
+      may have failed silently — the reference flow has no fault handling.
+  - title: Rescheduling and cancelling — why old rows linger
+    keywords: [reschedule, rescheduled, cancel, cancelled, chain, duplicate, double count]
+    text: |
+      A reschedule does NOT edit the interview in place. It marks the old
+      interview + session pair 'Rescheduled' (which also cancels the old
+      Zoom meeting), creates a brand-new pair, and links the new interview
+      back via Previous_internal_interview__c. The old records are locked by
+      validation rules and kept as history. Consequences for reporting: one
+      real-world interview that was rescheduled twice exists as THREE
+      Internal_Interview__c rows (two Rescheduled shells + the live one), so
+      any count that does not exclude Status 'Rescheduled' (and usually
+      'Cancelled') overstates activity. In production about 67 of 300 rows
+      are Rescheduled shells. The resume attached to the old interview is
+      moved to the new one — with a known gap: the flow only looks at the
+      old interview's resume, not the candidate's active resume, so
+      Has_Resume__c can be wrong after a reschedule.
+  - title: How Magic mode picks questions (the tick model)
+    keywords: [magic, tick, selection, pool, junction, eligible, random, shuffle]
+    text: |
+      In "Techsara's Magic" mode the interview is assembled from config:
+      sections for the interview's type come from Section_Interview_Type__c
+      in its per-type Sequence__c order, gated so the section's
+      Domain_Type__c matches the candidate niche's domain ('Both' always
+      passes; note 'Non Tech' vs 'Non-Tech' hyphen mismatch is normalized in
+      code). For each Standard section the eligible pool is: active
+      Question_Bank__c rows having a Question_Section__c tick for that
+      section AND a Niche_Question__c tick for the candidate's niche AND
+      either zero Question_Interview_Type__c ticks (shared) or a tick for
+      this type. The pool is shuffled and the section takes
+      Total_Questions__c of them — so two runs of the same configuration
+      can ask different questions, and an empty section means a
+      configuration gap (missing ticks, inactive rows, or domain mismatch),
+      not missing data. Review sections pull from another type's sections
+      via Source_Interview_Type__c.
+  - title: Template mode
+    keywords: [template, fixed, structure, deterministic]
+    text: |
+      Template mode bypasses the pool: Template__c -> Template_Section__c
+      (ordered, and its Section lookup can legitimately be null) ->
+      Template_Section_Question__c gives the exact questions in the exact
+      order. Deterministic by design. Production currently holds a single
+      template with a handful of questions — Magic is the dominant mode
+      (172 of 174 launch-mode-set interviews) — so template-based analytics
+      are near-empty and should be reported as "barely used", not as zero
+      activity.
+  - title: AI resume-based questions and pregeneration
+    keywords: [ai, resume based, pregen, lambda, generated, error log]
+    text: |
+      Sections with Question_Source_Type__c = 'AI Resume Based' do not use
+      the question pool: questions are generated from the candidate's
+      resume by an AI service (a Lambda taking ~10-17 seconds), usually
+      PRE-generated when the interview is created and stored on the
+      interview record (AI_Pregen_Status__c tracks this), then read at
+      conduct time. Generation errors are captured on the section log's
+      error field. If an AI section came up empty, the chain to check is:
+      resume present -> pregen status -> stored questions -> live
+      generation fallback.
+  - title: Mocks — how training candidates reach this platform
+    keywords: [mock, training, portal, booking, week, deadline, reminder, interviewer]
+    text: |
+      Training candidates book mocks from the guest portal. Booking creates
+      an Internal_Interview__c with Candidate_Training__c set (THE marker of
+      a training-origin interview), Week_Number__c for the training week,
+      and an interviewer chosen as the least-loaded member of the
+      Mock_Interviewers group. A flow auto-creates the paired Session and
+      the normal Zoom pipeline schedules it; the candidate joins via the
+      session's meeting link. Hourly automation enforces deadlines (a
+      missed booking can drop the training) and reminds interviewers to
+      submit results. In this org the training-origin types are the
+      'Advanced AI/ML Training - Week N' and 'Final Mock' types; OOT and
+      Intake are NOT portal mocks and never carry Candidate_Training__c.
+  - title: Resumes — metadata vs the actual file
+    keywords: [resume, file, active, upload, attachment]
+    text: |
+      Resume__c is the metadata row (status, who uploaded, which interview,
+      which niche); the document itself is a Salesforce Files attachment on
+      that row. The candidate's current resume is Is_Active__c = 'true';
+      uploading a new one deactivates the old rows. Statuses run Draft ->
+      Under Review -> Approved/Rejected, with 'Uploaded' the common state in
+      production (145 of 150 rows active+uploaded). A resume row can exist
+      whose file was moved or deleted, so "has a resume" from metadata is an
+      approximation — and after a reschedule the interview's Has_Resume__c
+      flag has a known false-negative gap.
+  - title: Evaluations vs logs — scores vs what actually happened
+    keywords: [evaluation, score, decision, log, snapshot, asked]
+    text: |
+      Two record families capture an interview's outcome. EVALUATIONS carry
+      judgment: Interview_Evaluation__c (type Human or AI, decision, total
+      score) with one Section_Evaluation__c per section (score out of 10,
+      comment). LOGS carry execution: Internal_Interview_Section_Log__c
+      (order, per-section score/comment, whether questions came from the
+      Standard pool or AI) and Internal_Interview_Question_Log__c — the
+      question-by-question snapshot including the question text as asked.
+      Logs are the answer to "what was asked"; the question bank only says
+      what could be asked today. Both hang off the interview by
+      master-detail, so deleting an interview cascades its history away.
+  - title: Zoom / Calendar integration and its rough edges
+    keywords: [zoom, calendar, callout, meeting, cancel, midnight, robustness]
+    text: |
+      One external service creates and cancels Zoom meetings + Google
+      Calendar events. The async flow fires when a Session is Unscheduled
+      (create) or moves to Rescheduled/Cancelled with a meeting id (cancel).
+      Known rough edges, verified in the flow XML: the cancel response is
+      never checked and there are no fault connectors, so Salesforce state
+      and Zoom can diverge silently (a failed create just leaves the
+      Session Unscheduled); and the model has no end-DATE, only a date plus
+      start/end times, so a session crossing midnight (11:30 PM-12:00 AM)
+      is rejected by validation. If a meeting link is missing, check the
+      Session's status, meeting id, and attendee email resolution before
+      suspecting the interview record.
+  - title: Production data reality for this platform (2026-08-12)
+    keywords: [production, counts, reality, snapshot, junk, template]
+    text: |
+      Verified in the production warehouse on 2026-08-12: 300 internal
+      interviews (150 Completed, 67 Rescheduled shells, 59 Scheduled, 17
+      Cancelled, 5 Unscheduled), 55 of them training-origin mocks; 2,874
+      sessions (2,498 Training, 371 Internal Interview); 805 question-bank
+      rows, all active, with 5,002 niche ticks, 759 section ticks and 510
+      type ticks; 11 niches (8 Tech, 3 Non Tech); 9 interview types; 150
+      resumes; 150 evaluations, human-only so far. The source knowledge
+      document was verified against a DEVELOPMENT org whose counts differ
+      widely (113 questions, 11 templates, 18 niches with test junk) —
+      treat structural rules from the document as truth, but never quote
+      its counts as production facts.

@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Declaration__c</fullName>
+    <defaultValue>false</defaultValue>
+    <description>I confirm that all the above information provided is accurate. Any information which is wrong may result in termination of my services.</description>
+    <inlineHelpText>I confirm that all the above information provided is accurate. Any information which is wrong may result in termination of my services.</inlineHelpText>
+    <label>I confirm that all the above information</label>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Checkbox</type>
+</CustomField>

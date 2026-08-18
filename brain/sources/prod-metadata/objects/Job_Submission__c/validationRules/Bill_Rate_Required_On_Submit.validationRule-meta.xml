@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ValidationRule xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Bill_Rate_Required_On_Submit</fullName>
+    <active>true</active>
+    <description>Submitted Bill Rate is required when submitting profile to client.</description>
+    <errorConditionFormula>ISPICKVAL(Submission_Status__c,&apos;Submitted to Client&apos;) &amp;&amp; ISBLANK(Submitted_Bill_Rate__c)</errorConditionFormula>
+    <errorDisplayField>Submitted_Bill_Rate__c</errorDisplayField>
+    <errorMessage>Submitted Bill Rate is required when submitting profile to client.</errorMessage>
+</ValidationRule>

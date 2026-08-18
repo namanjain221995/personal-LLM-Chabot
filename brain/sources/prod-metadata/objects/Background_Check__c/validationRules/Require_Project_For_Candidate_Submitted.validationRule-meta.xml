@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ValidationRule xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Require_Project_For_Candidate_Submitted</fullName>
+    <active>true</active>
+    <errorConditionFormula>AND(
+    NOT( Before_Background_Check__c ),
+    NOT( C2C_Submission__c ),
+    ISCHANGED( Background_Check_Status__c ),
+    ISPICKVAL( Background_Check_Status__c , &quot;Completed&quot;),
+    OR(
+        NOT(ISPICKVAL(Verification_Status__c, &quot;Completed&quot;)),
+        Final_Employer_Confirmation_Received__c = FALSE
+    )
+)</errorConditionFormula>
+    <errorDisplayField>Candidate_Details_Status__c</errorDisplayField>
+    <errorMessage>At least one related Background Check Employment must exist before submitting Candidate Details.</errorMessage>
+</ValidationRule>

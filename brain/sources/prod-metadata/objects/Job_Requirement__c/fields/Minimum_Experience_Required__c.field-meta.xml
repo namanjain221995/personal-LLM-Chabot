@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Minimum_Experience_Required__c</fullName>
+    <description>this field is to show minimum required experience to our website.</description>
+    <externalId>false</externalId>
+    <inlineHelpText>this field is used to show required experience to website.</inlineHelpText>
+    <label>Experience Required</label>
+    <length>50</length>
+    <required>false</required>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Text</type>
+    <unique>false</unique>
+</CustomField>

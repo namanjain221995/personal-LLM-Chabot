@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Website_Job_External_ID__c</fullName>
+    <description>The external job reference ID from the Techsara website. Populated automatically when a candidate applies through the website job listing.</description>
+    <inlineHelpText>This field is auto-populated from the website application form. Do not edit manually unless correcting a data error.</inlineHelpText>
+    <label>Website Job External ID</label>
+    <required>false</required>
+    <trackFeedHistory>false</trackFeedHistory>
+    <trackHistory>false</trackHistory>
+    <type>TextArea</type>
+</CustomField>

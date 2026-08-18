@@ -1,0 +1,57 @@
+# The Apex class reference brain — knowledge-only.
+# Compiled from brain/sources/apex-classes.txt ("Apex Classes — Full Detailed
+# Documentation", Batch 1: 2 classes, 2026-08-18). The source document grows
+# in batches — when the team appends more classes, add chunks here.
+# Knowledge-only on purpose: Apex internals answer "how does X work under the
+# hood" questions via retrieval and must never ride along on ordinary
+# analytics prompts. Verified 2026-08-18: Zoom_Portal_Config__mdt is custom
+# metadata and is NOT synced to the warehouse — its AWS credentials can never
+# surface through a query, and no SQL claims are made here.
+name: apex-reference
+description: >
+  How TechSara's custom Apex classes work — currently the Zoom Recording
+  Portal pair (configuration + request context). Grows as the team documents
+  more classes.
+
+knowledge:
+  - title: ZoomRecordingPortalConfig — the recording portal's settings hub
+    keywords: [zoom, recording, portal, config, s3, bucket, aws, expiry, extensions, apex]
+    text: |
+      The Zoom Recording Portal serves meeting recordings stored in AWS S3,
+      and this Apex class is the single source of truth for its settings. It
+      reads the one active row of the Zoom_Portal_Config__mdt custom
+      metadata type (cached per transaction) and exposes getters for: the S3
+      bucket and AWS region, the AWS access/secret keys used to sign
+      pre-signed URLs, how long a generated link stays valid
+      (Signed_URL_Expiry_Minutes__c, default 480 minutes = 8 hours), the
+      allowed file extensions (default mp4, webm, mov, mkv), and the
+      portal's title and notice banner. It fails fast with a clear
+      configuration error when no active config exists or the AWS keys are
+      blank, and isExtensionAllowed() gates every file served. Custom
+      metadata is not synced to the warehouse, so none of this — including
+      the credentials — is queryable, and credential values must never be
+      displayed regardless.
+  - title: ZoomRecordingRequestContext — who is asking for a recording
+    keywords: [zoom, recording, request, context, audit, user agent, logging, apex]
+    text: |
+      A small transaction-scoped holder for the requesting client's IP
+      address (truncated to 45 chars — the IPv6 maximum) and User-Agent
+      (truncated to 255). The portal's entry point (the guest-site REST
+      resource or page controller, the only place request headers are
+      visible) captures them once; downstream code — access logs, audit
+      trails, rate limiting — reads them via null-safe getters that fall
+      back to 'Unknown'. Being static, the values live only for the current
+      request and vanish afterwards.
+  - title: How the Zoom recording portal request flows
+    keywords: [zoom, recording, flow, presigned, url, download, stream, security]
+    text: |
+      A typical portal request: the entry point captures the caller's
+      IP/User-Agent into the request context; the service reads the AWS
+      settings from the config class, validates the requested file's
+      extension against the allow-list, builds a pre-signed S3 URL that
+      expires after the configured minutes (default 8 hours), and writes an
+      access-log record stamped with the captured IP and User-Agent. One
+      design note the team has flagged: the AWS secret key lives in custom
+      metadata, which anyone who can read metadata or run code could see —
+      named credentials would be the more conventional home. That is a
+      design consideration, not a defect in behaviour.

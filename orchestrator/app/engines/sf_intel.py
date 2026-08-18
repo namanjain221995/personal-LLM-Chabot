@@ -32,7 +32,14 @@ from .. import llm
 from ..config import settings
 from ..core import org_brief
 from ..core.sf_intel import budget as ctx_budget
-from ..core.sf_intel import phases, planner, resume, state as sf_state, tools
+from ..core.sf_intel import (
+    interpret,
+    phases,
+    planner,
+    resume,
+    state as sf_state,
+    tools,
+)
 from ..core.sf_intel.models import (
     AgentDecision,
     ClarificationRequest,
@@ -146,17 +153,33 @@ async def run(
     model_choice: str = "smart",
     clarification_response: Optional[ClarificationResponse] = None,
     source_enabled: bool = True,
+    use_planner: bool = True,
 ) -> Outcome:
     """Plan and, where possible, answer a Salesforce request.
 
     Returns `handled=False` when the request is not this engine's to answer
     (general chat, an unusable planner, the feature switched off) — main.py then
     runs its normal chain with `resolved_text`, so nothing is lost either way.
+
+    `use_planner=False` runs the same pipeline with the deterministic detectors
+    in `core/clarify.py` in place of the model call. That is what Salesforce
+    Intelligence Mode's kill switch selects, and it is why there is exactly ONE
+    clarification implementation now: with the planner off, a question is still
+    a persisted `ClarificationRequest` with a resume token, a round budget, a
+    repetition fingerprint and an idempotent answer. The previous fallback was a
+    second, parallel implementation that rendered a different card, could not
+    resume, could not survive a reload, and re-asked its own question forever
+    when `CLARIFY_MODE=always` was set.
     """
     run_id = uuid.uuid4().hex[:12]
     phase = _Phases(emit, run_id)
     state = await sf_state.load_state(conversation_id)
     state.source_enabled = source_enabled
+    # `meta` is trust metadata: it must say which planner actually decided this
+    # turn. Reporting "intelligence" while the kill switch had the model off
+    # would make the one flag that changes the answer invisible in the record
+    # of how the answer was produced.
+    mode_label = "intelligence" if use_planner else "deterministic"
 
     # ---- 0. is this even a request for data? --------------------------------
     # Checked BEFORE the first status event, and deliberately without a model
@@ -202,7 +225,7 @@ async def run(
         )
         if resumed.get("rejected"):
             await emit("token", {"text": resumed["message"]})
-            await emit("meta", {"route": "clarify", "salesforce_mode": "intelligence"})
+            await emit("meta", {"route": "clarify", "salesforce_mode": mode_label})
             return Outcome(handled=True, answer=resumed["message"])
         intent = resumed.get("intent")
         # A duplicate submission is not a new turn. Re-planning it can decide a
@@ -227,33 +250,72 @@ async def run(
 
     resolved_text = intent.resolved_text()
 
-    if not settings.salesforce_contextual_clarification_enabled:
-        # Clarification is off but intelligence mode is on: skip the planner's
-        # question path entirely and hand the resolved request straight on.
+    if not (
+        settings.salesforce_contextual_clarification_enabled
+        and settings.clarify_before_answering
+    ):
+        # Asking is switched off — by either flag. Resolving the request against
+        # the conversation is NOT switched off, so the resolved text still goes
+        # on: "what about tomorrow?" keeps working when questions are disabled,
+        # which is the point of having two settings rather than one.
         await sf_state.save_state(state)
         return Outcome(handled=False, resolved_text=resolved_text)
 
-    # ---- 3. schema + entity resolution --------------------------------------
-    await phase("checking_schema")
-    hinted = _objects_hinted_by(text, state)
-    schema_summary, _available = await tools.get_salesforce_schema(
-        text, objects=hinted
+    # ---- 3. read the request, then schema + entity resolution ----------------
+    # WHAT THE PLANNER PLANS FOR is the resolved request, not the newest
+    # message. On a resume the newest message is "Count of interviews" — an
+    # answer, not a request — and planning for it on its own produced a decision
+    # about a fragment: the original question survived only in whatever recent
+    # turns happened to be included. `resolved_text` is the original WITH the
+    # answers folded in, which is what every engine downstream already receives.
+    planning_text = resolved_text if intent.clarification_history else text
+    reading = interpret.read(planning_text)
+
+    # The knowledge layers match on words. A three-word follow-up has none of
+    # its subject's words in it, so grounding it on this turn alone hands the
+    # planner an empty brief for a question the conversation has already
+    # established the subject of.
+    grounding = interpret.grounding_text(
+        reading,
+        original_request=intent.original_user_text,
+        carried_slots=intent.resolved_slots,
+        conversation_summary=state.last_query_summary,
+        recent_turns=_recent(history, 6),
     )
-    candidates = await _entity_candidates(text, hinted)
 
     # ---- 4. the decision -----------------------------------------------------
-    decision = await planner.plan(
-        user_text=text,
-        intent=intent,
-        state=state,
-        schema_summary=schema_summary,
+    if use_planner:
+        await phase("checking_schema")
+        hinted = _objects_hinted_by(reading.text, state)
+        schema_summary, _available = await tools.get_salesforce_schema(
+            grounding, objects=hinted
+        )
+        candidates = await _entity_candidates(reading.text, hinted)
+        decision = await planner.plan(
+            user_text=planning_text,
+            intent=intent,
+            state=state,
+            schema_summary=schema_summary,
+            entity_candidates=candidates,
+            recent_turns=_recent(history, 6),
+            effort=effort,
+            today=org_brief.business_today(),
+            timezone_name=org_brief.BUSINESS_TIMEZONE,
+            reading=reading,
+            grounding_text=grounding,
+        )
+    else:
+        # Schema and entity lookups exist to inform the model; with no model
+        # call there is nothing to inform, and both are network round trips.
+        candidates = []
+        decision = planner.deterministic_decision(reading.text)
+    decision = planner.enforce_policy(
+        decision,
+        intent,
+        duplicate=duplicate,
+        reading=reading,
         entity_candidates=candidates,
-        recent_turns=_recent(history, 6),
-        effort=effort,
-        today=org_brief.business_today(),
-        timezone_name=org_brief.BUSINESS_TIMEZONE,
     )
-    decision = planner.enforce_policy(decision, intent, duplicate=duplicate)
     sf_state.decision_slots(decision, intent)
     assumptions.extend(decision.assumptions)
     await sf_state.save_intent(intent)
@@ -269,7 +331,7 @@ async def run(
         message = _refusal(decision)
         await phase("failed")
         await emit("token", {"text": message})
-        await emit("meta", {"route": "chat", "salesforce_mode": "intelligence"})
+        await emit("meta", {"route": "chat", "salesforce_mode": mode_label})
         await sf_state.complete_intent(intent, state, query_summary=text[:200])
         return Outcome(handled=True, answer=message)
 
@@ -294,7 +356,7 @@ async def run(
                 "meta",
                 {
                     "route": "clarify",
-                    "salesforce_mode": "intelligence",
+                    "salesforce_mode": mode_label,
                     "clarification": request.wire(),
                     "status": phase.last,
                 },
@@ -333,7 +395,24 @@ async def run(
 
     # No usable plan, or no live connection: the warehouse engine answers, with
     # the RESOLVED request. Its own live fallback still applies.
-    await sf_state.save_state(state)
+    #
+    # The intent is COMPLETED here, not merely saved. Handing the request on is
+    # still finishing it as far as this engine is concerned, and `complete_intent`
+    # is what rolls the object, metric, period and owner scope into the
+    # conversation state. Without it, every deployment answering from the
+    # warehouse — which is the common one — left `carried_slots()` empty
+    # forever, so "what about tomorrow?" inherited nothing and arrived at the
+    # planner as a bare question about a date. The follow-up behaviour this
+    # engine exists for was live only when a live SOQL query happened to run.
+    await sf_state.complete_intent(
+        intent,
+        state,
+        # The plan names the object even when there was no live connection to
+        # run it against, and that is the single most useful thing a follow-up
+        # inherits. `complete_intent` falls back to the resolved `object` slot.
+        objects=[plan_model.object_api_name] if plan_model is not None else (),
+        query_summary=intent.original_user_text[:200],
+    )
     return Outcome(
         handled=False,
         resolved_text=resolved_text,
@@ -466,6 +545,13 @@ async def _execute_live(
     await phase("calculating")
     group_by = plan_model.group_by[0] if plan_model.group_by else ""
     computed = tools.calculate_result(result, group_by=group_by)
+    # The SOQL itself is withheld from the answer prompt, so WITHOUT this the
+    # model cannot know the figures were already filtered — asked for locked
+    # deliverables it answered "866 total records, but the data does not break
+    # down by locked status" about a count that WAS the locked breakdown.
+    population = _population_line(plan_model)
+    if population:
+        computed["population"] = population
 
     await phase("verifying")
     verification = _verify(result, computed)
@@ -711,6 +797,21 @@ def _summarize(history: Sequence[dict]) -> str:
         f"{t.get('role')}: {str(t.get('content') or '')[:200]}"
         for t in _recent(history, 4)
     )
+
+
+def _population_line(plan) -> str:
+    """The filters the query already applied, in plain words.
+
+    This is what lets the answer say "866 deliverables WITH STATUS 'Locked'"
+    instead of doubting whether the count was filtered at all.
+    """
+    parts = []
+    for f in getattr(plan, "filters", None) or []:
+        value = f.value if f.value is not None else ", ".join(f.values or [])
+        parts.append(f"{f.field} {f.operator} {value!r}" if value != "" else f.field)
+    if not parts:
+        return ""
+    return "these figures already apply the filters: " + "; ".join(parts)
 
 
 def _scope_line(intent: PendingIntent) -> str:

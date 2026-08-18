@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Receives_Submission_Emails__c</fullName>
+    <defaultValue>false</defaultValue>
+    <description>Indicates this contact should be included in candidate submission email communications. Multiple contacts can be marked. Used for CC recipients.</description>
+    <inlineHelpText>Check if this contact should receive emails when candidate profiles are submitted. Used for CC recipients in addition to Primary Submission Contact.</inlineHelpText>
+    <label>Receives Submission Emails</label>
+    <trackFeedHistory>false</trackFeedHistory>
+    <type>Checkbox</type>
+</CustomField>

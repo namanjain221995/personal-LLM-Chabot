@@ -1,0 +1,392 @@
+# The Background Check module brain.
+# Compiled from brain/sources/background-check-module.txt (documented from the
+# PRODUCTION org, 2026-08-17) and re-verified against the production warehouse
+# the same day: objects, columns, picklist values, record types and row
+# distributions all checked with live queries. Data reality worth knowing:
+# the module is young — 68 records, of which 28 predate record types and 20
+# predate the Stage field; only 8 employment rows exist so far.
+name: background-check
+description: >
+  How TechSara vets candidates after an interview outcome: the automatic
+  Background_Check__c pipeline (payment -> DocuSign documents -> employment
+  history -> verification), the lighter Reference Check track, the 4-hourly
+  reminder loop, and the validation gates.
+
+triggers:
+  - background check
+  - background checks
+  - bg check
+  - bg checks
+  - reference check
+  - reference checks
+  - referee
+  - referees
+  - reference contacts
+  - verification
+  - verified
+  - verify
+  - promissory
+  - ach authorization
+  - docusign
+  - offer letter
+  - offer received
+  - employment history
+  - employer confirmation
+  - c2c
+  - vetting
+  - vetted
+
+tables:
+  - Background_Check__c
+  - Background_Check_Employment__c
+  - RecordType
+
+rules: |
+  Background-check rules (this question touches candidate vetting):
+  - A Background_Check__c is created AUTOMATICALLY by a flow when
+    Interview__c.Interview_Outcome__c becomes 'Offer Received' or 'Reference
+    Check' — nobody creates them by hand, and the link back is
+    Background_Check__c.Interview__c. Outcomes and checks are NOT 1:1 in the
+    data (131 Offer Received outcomes vs 68 checks): the module is newer than
+    many outcomes, and a duplicate guard keeps re-saves from creating more.
+  - TWO TRACKS on one object, split by record type. The API name of the offer
+    track's record type is the MISSPELLED 'Offer_Recived' (label "Offer
+    Recived") — any filter must use the misspelling. 'Reference_Check' is the
+    light track. In production: 38 Offer_Recived, 2 Reference_Check, and 28
+    records with NO record type from before the split — state which
+    population you counted. Stage__c ('Offer Received' | 'Reference Check')
+    is NULL on 20 early rows for the same reason.
+  - The pipeline is Background_Check_Status__c, in order: Payment
+    Verification Pending -> Documents Pending -> Candidate Details Pending ->
+    Verification In Progress -> Completed. Production today: 36 / 26 / 0 / 1
+    / 5. Stage movement is MANUAL, gated by validation rules.
+  - The four "date" fields (Offer_Letter_Payment_Received_Date__c,
+    ACH_Authorization_Signed_Date__c, Promissory_Note_Signed_Date__c,
+    Final_Employer_Confirmation_Date__c) are FORMULAS returning TODAY() while
+    their status holds — they change every day and are NOT the real event
+    dates. For real dates use the field history (the status fields are
+    history-tracked), and say so if asked "when was it signed".
+  - TWO verification-status fields exist: the HEADER
+    Background_Check__c.Verification_Status__c (Not Started | In Progress |
+    Completed, set by hand, no roll-up) and the PER-EMPLOYER
+    Background_Check_Employment__c.Verification_Status__c (Not Started | In
+    Progress | Verified | Unable to Verify). Never mix them.
+  - TWO reference-contact models exist: Interview__c carries Ref_1..Ref_4
+    (with Ref_N_Notified__c flags — used only for the "you are a reference"
+    emails), while Background_Check_Employment__c carries Ref_1..Ref_3 (used
+    for actual verification). Separate field sets on separate objects.
+  - Background_Check_Project_Count__c is a roll-up COUNT of
+    Background_Check_Employment__c children ("Employment" and "Project" are
+    the same thing — the UI says Project, the API says Employment).
+  - Bypass checkboxes: Before_Background_Check__c or C2C_Submission__c =
+    'true' skips ALL five validation gates (pre-vetted candidates and
+    corp-to-corp submissions).
+  - A reference-track record is chased by two DAILY reminder emails until
+    Reference_Check_Completed__c = 'true'; offer-track records with pending
+    items are nagged every 4 HOURS (email + Slack) while
+    Notification_Active__c = 'true' AND the opt-in
+    Send_Pending_Notifications__c is ticked. 40 of 68 records currently have
+    the nag flag active.
+  - KNOWN DEFECT users will ask about: 4 of the 5 validation rules show the
+    WRONG error message (messages were shuffled against the logic). The REAL
+    gates: Documents Pending needs payment 'Received'; Candidate Details
+    Pending needs both documents 'Signed'; Candidate_Details_Status
+    'Submitted' needs >= 1 employment child; Verification In Progress needs
+    details 'Submitted'; Completed needs header verification 'Completed' AND
+    Final_Employer_Confirmation_Received__c. When someone quotes a confusing
+    save error, answer with the real gate for the transition they attempted,
+    not the message text.
+  - DocuSign never writes back. ACH_Authorization_Status__c and
+    Promissory_Note_Status__c move Pending -> Signed only when a QA user sets
+    them by hand after the signed envelope returns.
+
+metrics:
+  - name: background checks by status
+    aliases:
+      - background check status
+      - background checks pending
+      - checks in progress
+      - vetting pipeline
+      - background check pipeline
+    table: Background_Check__c
+    definition: >
+      The vetting pipeline: every Background_Check__c by its master status,
+      in process order.
+    sql: >
+      SELECT Background_Check_Status__c, count(*) FROM Background_Check__c
+      GROUP BY 1 ORDER BY 2 DESC
+    date_column: CreatedDate
+    chart: bar
+    caveat: >
+      The order is Payment Verification Pending -> Documents Pending ->
+      Candidate Details Pending -> Verification In Progress -> Completed;
+      present it as a funnel in that order, not by count.
+
+  - name: background checks by track
+    aliases:
+      - offer received checks
+      - reference check records
+      - background check tracks
+      - checks by record type
+    table: Background_Check__c
+    definition: >
+      Offer-Received (full vetting) vs Reference-Check (light) records, via
+      the record type.
+    sql: >
+      SELECT coalesce(rt.Name, 'No record type (legacy)') AS track, count(*)
+      FROM Background_Check__c b
+      LEFT JOIN RecordType rt ON b.RecordTypeId = rt.Id
+      GROUP BY 1 ORDER BY 2 DESC
+    date_column: CreatedDate
+    chart: bar
+    caveat: >
+      The offer track's API name is the misspelled 'Offer_Recived'. 28
+      records predate record types — never drop them silently.
+
+  - name: reference checks still open
+    aliases:
+      - open reference checks
+      - reference checks outstanding
+      - referees not confirmed
+      - pending reference checks
+    table: Background_Check__c
+    definition: >
+      Reference-track records the daily reminders are still chasing.
+    sql: >
+      SELECT count(*) FROM Background_Check__c
+      WHERE Stage__c = 'Reference Check'
+      AND Reference_Check_Completed__c = 'false'
+    date_column: CreatedDate
+    chart: single value
+    caveat: >
+      Two daily scheduled emails chase each of these until
+      Reference_Check_Completed__c is ticked by hand.
+
+glossary:
+  Offer Received track: >
+    The full vetting pipeline created when an interview outcome is "Offer
+    Received": collect the offer-letter payment, send ACH + promissory note
+    via DocuSign, gather employment history, verify employers, complete.
+  Reference Check track: >
+    The light track created when the outcome is "Reference Check": the
+    referees named on the interview are emailed automatically, and the record
+    is chased daily until marked complete.
+  Promissory note: >
+    One of the two documents DocuSign sends for signature (with the ACH
+    authorization). Its status moves to Signed by hand — DocuSign never
+    writes back.
+  ACH authorization: >
+    The candidate's signed permission for automatic bank debits, sent
+    together with the promissory note through DocuSign.
+  Accept Record: >
+    The quick action a QA user clicks to claim a queued background check —
+    it ticks a checkbox and a flow makes them the owner.
+  Pending items nag: >
+    While payment or either document is Pending, the record emails and
+    Slack-messages its owners every 4 hours (opt-in per record) until
+    resolved.
+  Pre-vetted bypass: >
+    Before_Background_Check__c — ticking it skips every validation gate,
+    for candidates already vetted before joining. C2C_Submission__c does the
+    same for corp-to-corp placements.
+  Employment record: >
+    One past employer/project to verify (the UI calls it a "Project"), with
+    up to three reference contacts and its own per-employer verification
+    outcome.
+
+field_notes:
+  Background_Check__c:
+    Background_Check_Status__c: >
+      The master pipeline status: Payment Verification Pending -> Documents
+      Pending -> Candidate Details Pending -> Verification In Progress ->
+      Completed. Moved by hand, gated by validation rules.
+    Stage__c: >
+      Which track: 'Offer Received' (default) or 'Reference Check'. NULL on
+      20 early records that predate the field.
+    Offer_Letter_Payment_Status__c: Pending | Received — the gate into Documents Pending.
+    ACH_Authorization_Status__c: >
+      Pending | Signed — set BY HAND after the DocuSign envelope returns;
+      nothing writes it automatically.
+    Promissory_Note_Status__c: Pending | Signed — manual, same as the ACH status.
+    Candidate_Details_Status__c: >
+      Pending | In Progress | Submitted — employment history handover;
+      cannot be Submitted with zero employment children.
+    Verification_Status__c: >
+      HEADER progress: Not Started | In Progress | Completed. Manual — does
+      NOT roll up from the per-employer statuses.
+    Final_Employer_Confirmation_Received__c: >
+      Ticked when the last employer confirms — the gate into Completed.
+    Background_Check_Project_Count__c: Roll-up COUNT of employment (project) children.
+    Offer_Letter_Payment_Received_Date__c: >
+      FORMULA showing TODAY() while status is Received — not the real payment
+      date; use field history for that.
+    Reference_Check_Completed__c: >
+      'true' stops the daily reference-check reminder emails.
+    Notification_Active__c: >
+      Maintained by flow: 'true' while any payment/document item is Pending —
+      the record is in the 4-hourly nag loop.
+    Send_Pending_Notifications__c: >
+      The per-record OPT-IN for the 4-hourly email/Slack reminders (org label
+      "Received Background Notifications").
+    Pending_Items_Summary__c: >
+      Flow-maintained comma list of what is still Pending; quoted in the
+      reminder emails.
+    Assigned_to_QA__c: >
+      "Accept this record from Queue" — ticking it makes the current user the
+      owner via a flow.
+    Before_Background_Check__c: Bypass — skips all five validation gates (pre-vetted candidate).
+    C2C_Submission__c: Bypass — skips all five gates (corp-to-corp submission).
+    Interview_Round__c: Copied from the interview's Round, Reference-Check track only.
+    Background_Check_Type__c: >
+      Multi-select (org label "Verification Type"): Background Verification |
+      I9 Verification | Visa Assessment. Set manually.
+    Summary__c: 'FORMULA label: "FirstName LastName - Stage - Company".'
+    Company_Name__c: FORMULA — the client company from the source interview.
+  Background_Check_Employment__c:
+    Background_Check__c: The parent background check.
+    Employer_Name__c: The past employer being verified.
+    Project_Name__c: The project worked there (UI calls the whole record a "Project").
+    Present__c: '"Current Employer" — ticked instead of an end date.'
+    Verification_Status__c: >
+      PER-EMPLOYER outcome: Not Started | In Progress | Verified | Unable to
+      Verify — four values, distinct from the header's three-value field.
+    Employer_Confirmed__c: This specific employer confirmed the record.
+    Ref_1_Name__c: >
+      First of up to three reference contacts (name/designation/email/phone
+      each) used for actual verification — distinct from the interview's
+      Ref_1..4 notification set.
+  Interview__c:
+    Ref_1_Notified__c: >
+      Set when referee 1 was emailed "you have been listed as a reference";
+      cleared automatically if their email address changes. Same for Ref_2..4.
+
+knowledge:
+  - title: How a background check gets created (not DocuSign)
+    keywords: [created, creation, automatic, docusign, trigger, flow, queue]
+    text: |
+      DocuSign does NOT create background checks. When a recruiter sets an
+      interview's outcome to "Offer Received" or "Reference Check", a
+      record-triggered flow on Interview__c inserts the Background_Check__c
+      automatically: status "Payment Verification Pending", every
+      payment/document status "Pending", the candidate and interview linked,
+      owned by the matching QA queue (QA_Background_Check_Queue or
+      QA_Reference_Check_Queue), and an email announces it to the queue. A
+      duplicate guard stops re-saves of the interview from creating a second
+      check for the same stage. DocuSign appears only later, when a user
+      clicks "Send ACH and Promissory" on the already-existing record. A QA
+      user claims the record with the "Accept Record" quick action — one
+      click ticks a checkbox and a flow transfers ownership from the queue
+      to them.
+  - title: The offer-received pipeline, step by step
+    keywords: [pipeline, payment, documents, signed, details, completed, gates]
+    text: |
+      The full track runs: (1) collect the offer-letter payment — status
+      'Received' unlocks "Documents Pending"; (2) send the ACH authorization
+      and promissory note for e-signature via the "Send ACH and Promissory"
+      screen flow, which collects seven payment-plan values (debit amount,
+      principal, months, debit date, commencement and due dates) and calls
+      the DocuSign action; (3) when the signed envelope returns a QA user
+      sets both document statuses to 'Signed' BY HAND — DocuSign never
+      writes back, and until someone does this the record stalls and the
+      4-hourly reminders keep firing; (4) build the employment history (at
+      least one employment child before candidate details count as
+      Submitted); (5) verify each employer; (6) Completed requires header
+      verification 'Completed' plus the final-employer-confirmation tick.
+  - title: The reference-check track and referee emails
+    keywords: [reference, referee, emails, notified, daily, reminders]
+    text: |
+      When the outcome is "Reference Check", two things happen in parallel:
+      a light Background_Check__c (record type Reference_Check) lands in the
+      reference-check queue, and — once the interview is Completed — a flow
+      emails the up-to-four referees listed on the INTERVIEW (Ref_1..Ref_4),
+      subject "You have been listed as a reference", marking each
+      Ref_N_Notified__c so nobody is emailed twice; changing a referee's
+      email clears the flag so the corrected address gets notified. The
+      record is then chased by two daily scheduled reminder emails (morning
+      and evening IST) until someone ticks Reference_Check_Completed__c.
+      The three reference contacts on each employment record are a separate
+      set used for the actual verification calls.
+  - title: The 4-hourly reminder loop
+    keywords: [reminder, nag, slack, email, pending, four hours, loop]
+    text: |
+      A flow maintains the nagging state on every save: while the payment or
+      either document status is 'Pending', it rebuilds
+      Pending_Items_Summary__c (a comma list like "Offer Letter Payment
+      Pending, ACH Authorization Pending") and keeps Notification_Active__c
+      true. A scheduled path then fires 4 hours after the last notification:
+      if items are still pending AND the record's opt-in checkbox
+      (Send_Pending_Notifications__c) is ticked, it emails the candidate
+      owner and record owner, Slack-DMs both (or posts to the QA Slack
+      channel while the record is still queue-owned), re-stamps the clock,
+      and the cycle repeats until resolved. Reference-track records are
+      excluded — they use the daily reminders instead. 40 of the 68
+      production records currently have the nag flag active.
+  - title: The validation gates — and the swapped error messages
+    keywords: [validation, error, errors, blocked, save, gate, gates, wrong,
+               message, messages, swapped, misleading, background, check, defect]
+    text: |
+      Five active validation rules enforce the pipeline order, all skipped
+      when either bypass checkbox (Before_Background_Check__c,
+      C2C_Submission__c) is ticked. The REAL gates: Documents Pending needs
+      payment 'Received'; Candidate Details Pending needs both documents
+      'Signed'; setting candidate details 'Submitted' needs at least one
+      employment record; Verification In Progress needs details 'Submitted';
+      Completed needs verification 'Completed' plus the final employer
+      confirmation. KNOWN DEFECT: four of the five rules display the WRONG
+      error message (the texts were shuffled against the logic, and some
+      error highlights point at the wrong field), so users are told to fix
+      the wrong thing. When someone quotes one of these errors, answer with
+      the real gate for the transition they attempted — the message text is
+      unreliable. Only Require_Documents_For_Candidate_Details has matching
+      name, message and logic.
+  - title: Why the signed/received dates cannot be trusted
+    keywords: [date, signed date, received date, formula, history, audit]
+    text: |
+      The four date fields (payment received, ACH signed, promissory signed,
+      final employer confirmation) are FORMULAS that return TODAY() while
+      their status holds — they show the current date every day, not the day
+      the event happened. They are not an audit trail. The real dates live
+      in field history: the underlying status fields are history-tracked.
+      When asked "when was it signed/paid", say the formula fields cannot
+      answer that and the field history is the honest source.
+  - title: Employment records and the two verification levels
+    keywords: [employment, project, employer, verification, references]
+    text: |
+      Employment history is built manually: one
+      Background_Check_Employment__c child per past employer/project (the UI
+      labels these "Projects"), each with employer, project, dates, a
+      current-employer flag, and up to three reference contacts. Each row
+      carries its own four-value verification status (Not Started / In
+      Progress / Verified / Unable to Verify), notes, and an
+      employer-confirmed tick. The HEADER's three-value verification status
+      is set by hand and does not roll up from the children — the only
+      roll-up is the child COUNT, which powers the at-least-one-employment
+      gate. Production is early days here: 8 employment rows across 68
+      checks.
+  - title: Sessions, quick actions and who does what
+    keywords: [session, quick action, queue, qa, accept, create session]
+    text: |
+      Three quick actions live on the record: "Accept Record" (claim from
+      queue), "Send ACH and Promissory" (the DocuSign step) and "Create
+      Session", which books a Session__c with Purpose 'Background Check'
+      linked to the check and candidate — hosted by the Recruiter__c whose
+      email matches the running user, with the candidate's owner added as an
+      attendee. New records are owned by one of two queues
+      (QA_Background_Check_Queue for offers, QA_Reference_Check_Queue for
+      references) until a QA user accepts them. If a user reports a quick
+      action "missing", it is usually flow access: a flow-type action
+      disappears for any profile that cannot run the underlying flow.
+  - title: Module quirks worth knowing
+    keywords: [quirk, misspelled, offer recived, hard-coded, cross-org, stale]
+    text: |
+      The offer track's record type API name is the misspelled
+      'Offer_Recived' — every filter, formula and flow must use the
+      misspelling. Two org-specific values are hard-coded (the DocuSign
+      template id in a custom label and a Slack channel id inside the
+      reminder flow) and fail silently if deployed to another org. The page
+      layout still references TIME__c, a field created and deleted in July
+      2026. Before_Background_Check__c exists in the org but not in the
+      team's local source repo, so a deploy from that repo would break the
+      validation rules that reference it. In production data the module is
+      young: 68 checks, 28 without a record type and 20 without a Stage from
+      the early weeks — counts should state their population.

@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>End_Time_Text__c</fullName>
+    <externalId>false</externalId>
+    <formula>IF(
+VALUE(LEFT(TEXT(End_Time__c), 2)) &gt;= 12,
+TEXT(VALUE(LEFT(TEXT(End_Time__c), 2)) - 12) &amp; &quot;:&quot; &amp; MID(TEXT(End_Time__c), 4, 2) &amp; &quot; PM&quot;,
+IF(
+VALUE(LEFT(TEXT(End_Time__c), 2)) = 0,
+&quot;12:&quot; &amp; MID(TEXT(End_Time__c), 4, 2) &amp; &quot; AM&quot;,
+LEFT(TEXT(End_Time__c), 5) &amp; &quot; AM&quot;
+)
+)</formula>
+    <label>End Time Text</label>
+    <required>false</required>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Text</type>
+    <unique>false</unique>
+</CustomField>

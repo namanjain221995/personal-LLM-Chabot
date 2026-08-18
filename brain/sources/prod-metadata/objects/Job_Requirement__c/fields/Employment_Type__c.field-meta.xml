@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Employment_Type__c</fullName>
+    <description>Type of employment arrangement for this role. Determines tax and payment structure for the candidate.</description>
+    <inlineHelpText>Select the employment type. Contract = direct contractor. C2C = corp-to-corp. W2 = W2 employee. Full-Time = permanent employee. Contract-to-Hire = starts contract, may convert.</inlineHelpText>
+    <label>Employment Type</label>
+    <required>false</required>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Picklist</type>
+    <valueSet>
+        <restricted>true</restricted>
+        <valueSetDefinition>
+            <sorted>false</sorted>
+            <value>
+                <fullName>C2C</fullName>
+                <default>false</default>
+                <label>C2C</label>
+            </value>
+            <value>
+                <fullName>W2 Contract</fullName>
+                <default>false</default>
+                <label>W2 Contract</label>
+            </value>
+            <value>
+                <fullName>Full Time</fullName>
+                <default>false</default>
+                <label>Full Time</label>
+            </value>
+            <value>
+                <fullName>Contract-to-Hire</fullName>
+                <default>false</default>
+                <label>Contract-to-Hire</label>
+            </value>
+        </valueSetDefinition>
+    </valueSet>
+</CustomField>

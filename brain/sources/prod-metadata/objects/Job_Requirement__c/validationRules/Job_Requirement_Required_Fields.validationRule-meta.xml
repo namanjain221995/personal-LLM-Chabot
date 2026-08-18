@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ValidationRule xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Job_Requirement_Required_Fields</fullName>
+    <active>false</active>
+    <description>This validation rule ensures that all mandatory fields on the Job Requirement record are filled before saving. If any required field is left blank, the system will block the save and display an error message prompting the recruiter to complete all require</description>
+    <errorConditionFormula>OR(
+    ISBLANK(Job_Title__c),
+    ISBLANK(Account_Manager__c),
+    ISPICKVAL(Job_Status__c, &apos;&apos;),
+    ISPICKVAL(Priority__c, &apos;&apos;),
+    ISBLANK(Requirement_Received_Date_Time__c),
+    ISBLANK(Location__c),
+    ISPICKVAL(Work_Mode__c, &apos;&apos;),
+    ISPICKVAL(Employment_Type__c, &apos;&apos;),
+    ISBLANK(Primary_Skills__c),
+    ISBLANK(Job_Description__c)
+)</errorConditionFormula>
+    <errorMessage>Please fill in all required fields: Job Title, Client Account, Account Manager,
+Job Status, Priority, Requirement Received DateTime, Location, Work Mode, Employment Type, Primary Skills, Job Description, External Job ID.</errorMessage>
+</ValidationRule>

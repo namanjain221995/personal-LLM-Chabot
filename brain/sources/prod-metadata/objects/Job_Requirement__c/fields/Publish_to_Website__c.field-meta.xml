@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Publish_to_Website__c</fullName>
+    <defaultValue>false</defaultValue>
+    <description>Controls whether this job is eligible for website listing. Must be true along with Website Status = Published for job to appear on website.</description>
+    <inlineHelpText>Check to make this job eligible for website posting. Also requires Website Status = Published and Public Description to be filled.</inlineHelpText>
+    <label>Job Post on Website</label>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Checkbox</type>
+</CustomField>

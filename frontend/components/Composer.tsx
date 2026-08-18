@@ -53,6 +53,8 @@ const MAX_ROWS = 10;
 
 export interface ComposerHandle {
   focus: () => void;
+  /** Focus, and append `seed` to whatever is already typed. */
+  insert: (seed?: string) => void;
 }
 
 export interface Attachment {
@@ -111,6 +113,16 @@ interface ComposerProps {
    * composer is EMPTY, so it can suggest without ever being in the way.
    */
   starter?: React.ReactNode;
+  /**
+   * The live clarification panel, rendered INSIDE the composer's own container
+   * so the question and the input read as one control.
+   *
+   * It belongs here rather than in the message list because it is not a
+   * message: it is a temporary control that must stay reachable at the bottom
+   * of a conversation of any length, must not scroll away mid-answer, and must
+   * leave nothing clickable behind once it is answered.
+   */
+  clarification?: React.ReactNode;
 }
 
 export const Composer = forwardRef<ComposerHandle, ComposerProps>(
@@ -126,6 +138,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
       onStop,
       clarificationPlaceholder,
       starter,
+      clarification,
     },
     ref,
   ) {
@@ -139,6 +152,24 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
 
     useImperativeHandle(ref, () => ({
       focus: () => textareaRef.current?.focus(),
+      /**
+       * Focus the input and append `seed`.
+       *
+       * The clarification panel takes focus when a question appears, so the
+       * number keys work immediately. `seed` is what makes that safe: the
+       * first letter of a typed answer arrives here instead of being swallowed
+       * by a button that only understands digits.
+       */
+      insert: (seed = '') => {
+        const ta = textareaRef.current;
+        ta?.focus();
+        if (!seed) return;
+        setText((prev) => {
+          const next = prev + seed;
+          onDraftChange?.(next);
+          return next;
+        });
+      },
     }));
 
     const autogrow = useCallback(() => {
@@ -270,13 +301,16 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
       }
     }
 
+    // The bottom padding clears the home indicator on a phone. `max()` rather
+    // than an add: on every other device the inset is 0, and the spacing must
+    // stay exactly what it was.
     return (
-      <div className="bg-bg px-4 pb-3 pt-2">
+      <div className="bg-bg px-4 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-2">
         <div className="mx-auto w-full max-w-thread">
           {/* Only while the composer is genuinely empty. A suggestion strip
               sitting above half-typed text is clutter, not help — and toggling
               Salesforce must never disturb what someone is writing. */}
-          {starter && !hasContent && starter}
+          {!clarification && starter && !hasContent && starter}
           {(attachments.length > 0 || pastedTexts.length > 0) && (
             <div className="mb-2 flex flex-wrap items-start gap-2">
               {attachments.map((attachment, idx) => (
@@ -331,8 +365,22 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
           )}
 
           {/* One clean rounded container — no inner box, no divider line
-              (ChatGPT-style composer, owner request 2026-07-23). */}
-          <div className="rounded-[26px] bg-surface px-4 py-3">
+              (ChatGPT-style composer, owner request 2026-07-23). A live
+              clarification joins it ABOVE the input, inside the same surface
+              and behind the same corners, so the question and the answer field
+              read as one control rather than a card that happens to be nearby.
+
+              NEVER put `overflow-hidden` on this element. Both popups anchored
+              inside it — the effort picker and the "+" menu — open UPWARD with
+              `absolute bottom-full`, so clipping the box decapitates them: the
+              effort list rendered with "Fast" and "Low" sheared off. Nothing
+              here needs clipping anyway. The clarification panel has no
+              background and no corners of its own (it inherits this surface),
+              and its divider is a horizontal rule in the MIDDLE of the box,
+              nowhere near the rounded corners. */}
+          <div className="rounded-[26px] bg-surface">
+            {clarification}
+            <div className="px-4 py-3">
             <textarea
               ref={textareaRef}
               value={text}
@@ -530,6 +578,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
                   </button>
                 )}
               </span>
+            </div>
             </div>
           </div>
 

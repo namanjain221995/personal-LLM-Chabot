@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Session_Duration_Min__c</fullName>
+    <description>DEPRECATED — replaced by Session_Duration__c (Picklist). Kept only because obsolete flow versions still reference it. Do not use in new automation.</description>
+    <externalId>false</externalId>
+    <label>Session Duration (Min) [Deprecated]</label>
+    <precision>3</precision>
+    <required>false</required>
+    <scale>0</scale>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Number</type>
+    <unique>false</unique>
+</CustomField>

@@ -1,0 +1,709 @@
+# Compiled 2026-08-16 from brain/sources/techsara-org-knowledge-base.txt (preprod org documentation, 71 objects) by the brain ingestion pipeline: deterministic section/field parsing, every field name validated against the production dictionary + warehouse table list, rules distilled and adversarially verified. Fields the production warehouse lacks are only ever mentioned as explicit not-synced caveats.
+# Domain: PART 8 — verifier verdict: ship_with_fixes.
+name: kb-portal-auth
+description: How candidates authenticate on TechSara's custom candidate portal (Candidate_Portal_Credential__c
+  logins + Candidate_Portal_Session__c bearer-token sessions, custom Apex — not
+  Salesforce users) and how one-time, expiring no-login onboarding form links (Onboarding_Token__c)
+  are issued, opened and consumed.
+triggers:
+- portal
+- candidate portal
+- portal login
+- portal logins
+- portal account
+- portal access
+- portal session
+- portal sessions
+- credential
+- credentials
+- login
+- logins
+- log in
+- sign in
+- session token
+- lockout
+- locked out
+- password
+- passwords
+- username
+- usernames
+- last login
+- forgot login
+- forgot password
+- onboarding link
+- onboarding form
+- onboarding token
+- one-time link
+- expired link
+- token
+tables:
+- Candidate_Portal_Credential__c
+- Candidate_Portal_Session__c
+- Onboarding_Token__c
+rules: 'Candidate-portal auth rules:
+
+  - Portal logins are NOT Salesforce users: Candidate_Portal_Credential__c is the
+  login table (one row per candidate); never query User.
+
+  - Candidate_Portal_Credential__c.Candidate__c -> Account (Person Account); sessions
+  hold no candidate id — walk Candidate_Portal_Session__c.Candidate_Credential__c
+  -> credential -> Candidate__c.
+
+  - Live session = Is_Active__c true AND Expires_At__c > now AND parent credential
+  active; no cleanup job — expired rows may stay flagged active, never trust Is_Active__c
+  alone.
+
+  - Session start = CreatedDate (Created_At__c never written); usage = Last_Activity_At__c
+  heartbeat (never extends Expires_At__c = login+7d); last login = credential Last_Login_At__c.
+
+  - Locked_Until__c future = temp lockout (Failed_Login_Count__c hit 5); credential
+  Is_Active__c false = staff-disabled.
+
+  - Portal adoption = DISTINCT Candidate__c via credentials; session counts measure
+  logins, not people.
+
+  - Onboarding_Token__c.Onboarding__c -> Onboarding__c; one row = one issued no-login
+  link. A re-send expires the old token: distinct Onboarding__c = onboarding cases
+  contacted, rows = links issued.
+
+  - Onboarding_Form_Status__c: Sent -> Opened -> Submitted (terminal); Expired =
+  superseded or past 2-day life; Cancelled = manual void; Draft never set.
+
+  - Usable link = status IN (''Sent'',''Opened'') AND Expires_At__c > now (nothing
+  sweeps expired). Submitted = Used__c true + Used_At__c.
+
+  - Pre-enrolment links store their token on Pre_Enrolment_Request__c, NOT here.
+
+  - Aug-2026 preprod pilot; zero/tiny production rows = not rolled out, never zero
+  adoption — say so.
+
+  - Token_Secret__mdt / In_App_Checklist_Settings__c are not synced to the warehouse
+  — answer conceptually and say so. Never output Password__c (plain text in preprod),
+  Session_Id__c or Token__c — secrets.'
+glossary:
+  portal login: A candidate's username/password on the custom candidate portal,
+    stored as a Candidate_Portal_Credential__c record — not a Salesforce user or
+    license.
+  portal session: One signed-in stint on the candidate portal (Candidate_Portal_Session__c),
+    minted at login with a fixed 7-day expiry.
+  session token: The secret bearer string (Session_Id__c) the browser presents on
+    every portal call; whoever holds it IS the candidate, so never display it.
+  lockout: The 15-minute login freeze after 5 consecutive wrong passwords — active
+    while Locked_Until__c is in the future; staff can clear it early.
+  kill switch: 'Is_Active__c on the credential: unticking it refuses login and instantly
+    invalidates every existing session for that candidate.'
+  heartbeat: The session's Last_Activity_At__c, refreshed on every successful portal
+    call — shows real usage but never extends the session's expiry.
+  onboarding link: A one-time, 2-day-expiring URL emailed to a candidate to fill
+    the onboarding intake form without logging in; each issued link is one Onboarding_Token__c
+    row.
+  send onboarding form: The quick action on an Onboarding record that expires any
+    older open link and emails a fresh tokenized link to the candidate.
+  forgot login: Portal recovery emails the username AND password to the candidate's
+    Account owner (their recruiter), deliberately not to the candidate directly.
+  candidate hub: The Experience site hosting the guest onboarding form page; the
+    emailed link is built from its base URL plus the token.
+  signing secret: A Token_Secret__mdt row whose value keys the HMAC used to mint
+    one-time form tokens — rotatable in Setup; not synced to the warehouse, so answer
+    about it conceptually.
+  one-time link: A guest form URL carrying an expiring single-use token — the onboarding
+    form variant lives on Onboarding_Token__c, the pre-enrolment variant on Pre_Enrolment_Request__c.
+field_notes:
+  Candidate_Portal_Credential__c:
+    Candidate__c: 'Which candidate (Person Account) this login belongs to. Set by
+      the staff member who provisions the credential. This is the field the entire
+      portal security model resolves to: every session check follows credential
+      ->'
+    Username__c: The login name the candidate types on the portal sign-in page.
+      Must be unique org-wide (database-enforced). Chosen by the provisioning staff
+      member; also included in the recovery email to the Account Owner.
+    Password__c: The candidate's portal password - currently stored as PLAIN TEXT
+      (sandbox-only decision, documented in AuthService; to be replaced with a SHA-256
+      hash before production). Compared with a constant-time equals in Apex.
+    Is_Active__c: The kill switch. Staff untick it to disable the candidate's portal
+      access; login is refused ("Account is disabled") and every existing session
+      immediately fails validation. Both current records are active.
+    Failed_Login_Count__c: Consecutive wrong-password attempts, incremented by AuthService
+      on each failure and reset to 0 on a successful login. Reaching 5 triggers
+      the temporary lockout below. Currently 0 on both records.
+    Locked_Until__c: End of the temporary lockout window - set to now + 15 minutes
+      when the failure counter hits 5. While this is in the future, login attempts
+      are refused even with the right password. Cleared on successful login.
+    Last_Login_At__c: When this candidate last signed in successfully, stamped by
+      AuthService.login(). Useful for "is the candidate actually using the portal"
+      adoption checks. Populated on both records (latest 2026-08-06).
+  Candidate_Portal_Session__c:
+    Session_Id__c: 'The bearer token itself: a base64url encoding of a 256-bit random
+      value, generated by AuthService at login. Unique (database-enforced) and marked
+      external id so the per-call lookup is indexed.'
+    Candidate_Credential__c: The login account this session belongs to. Set once
+      by AuthService at creation, 100% populated. Every session validation walks
+      this lookup to confirm the credential is still active and to resolve the candidate.
+    Is_Active__c: Whether the session is currently usable. Set true at login; set
+      false by logout or by the lazy expiry cleanup in CandidateContext. In current
+      data 3 of 5 sessions are active, 2 ended.
+    Expires_At__c: 'Hard end-of-life: login time + 7 days (constant in AuthService).
+      After this moment every validation fails with "Session expired" and the row
+      is deactivated when next seen. 100% populated.'
+    Created_At__c: Intended "session started" stamp, but AuthService never fills
+      it - 0 of 5 records have a value. The standard CreatedDate system field carries
+      this information instead.
+    Last_Activity_At__c: 'The sliding heartbeat: refreshed to "now" on every successful
+      portal call (or right after a callout completes). Answers "when was this candidate
+      last actually using the portal" - useful for engagement monitoring.'
+    IP_Address__c: 'The IP address the candidate signed in from (help text: "Populated
+      automatically"). Supplied by the login LWC (guest Apex cannot resolve the
+      caller IP), truncated defensively to 45 chars (fits IPv6).'
+  Onboarding_Token__c:
+    Token__c: The 12-character one-time code (6 HMAC-SHA256 hex chars signed with
+      the Onboarding_Flow_Secret + 6 random hex chars, uppercased), minted by the
+      CreateToken Apex action.
+    Onboarding_Form_Link__c: 'The complete clickable URL sent to the candidate:
+      {Candidate_Hub_URL}/s/onboarding-form?token={Token__c}. Built and stored by
+      the send flow so staff can see/copy the exact link that went out. 100% populated.'
+    Onboarding__c: The onboarding case this link belongs to - set by the send flow
+      from the record the quick action was clicked on. 100% populated. Also the
+      key the send flow uses to find-and-expire older open links for the same case.
+    Recipient_Email__c: Where the link was sent - copied by the send flow from the
+      Onboarding record's candidate email at send time (a snapshot, so later email
+      changes don't obscure where THIS link actually went). 100% populated.
+    Onboarding_Form_Status__c: 'The link''s lifecycle state: - Sent: created and
+      emailed, not yet opened (set by the send flow). - Opened: the candidate has
+      opened the form page at least once (set by the intake flow on first valid
+      visit).'
+    Expires_At__c: 'Hard deadline for using the link: send time + 2 days (formula
+      in the send flow, returned by CreateToken). The intake flow rejects any visit
+      after this moment. 100% populated.'
+    Used__c: TRUE once the form has been submitted with this token - the single-use
+      guarantee. Set by the intake flow at submission, never by users. FALSE on
+      both current records (no candidate has completed the form in preprod yet).
+    Used_At__c: Exact moment of submission, stamped by the intake flow alongside
+      Used__c. Empty on all current records.
+  In_App_Checklist_Settings__c:
+    ProfileKey__c: An encrypted/opaque key written by Salesforce's checklist feature
+      to identify the org/profile context to the hosted checklist service.
+    Sales_Cloud_In_App_Page__c: 'The Salesforce-hosted page the in-app checklist
+      iframe loads. All 3 rows point at the same endpoint: https://cloud.mail.salesforce.com/SalesCloudInAppChecklistV2?
+      Not set or read by any Techsara automation.'
+  Token_Secret__mdt:
+    Value__c: The signing secret itself - the HMAC-SHA256 key CreateToken uses when
+      generating tokens under this row's name. Entered/rotated manually by an admin
+      in Setup.
+    DeveloperName: 'The row''s API name and label. The developer name is the key
+      flows pass to CreateToken. Rows in preprod: Onboarding_Flow_Secret ("Onboarding
+      Flow Secret"), Pre_Enrollment_Flow_Secret ("Pre Enrollment Flow Secret")'
+    MasterLabel: 'The row''s API name and label. The developer name is the key flows
+      pass to CreateToken. Rows in preprod: Onboarding_Flow_Secret ("Onboarding
+      Flow Secret"), Pre_Enrollment_Flow_Secret ("Pre Enrollment Flow Secret")'
+knowledge:
+- title: Candidate_Portal_Credential__c — What This Object Is
+  keywords:
+  - candidate
+  - portal
+  - credential
+  text: 'Candidate_Portal_Credential__c is the LOGIN ACCOUNT of one candidate on
+    the
+
+    custom candidate portal. One record = one username/password pair, linked to
+
+    the candidate''s Person Account. This is NOT standard Salesforce
+
+    authentication: candidates are not Salesforce users and hold no license.
+
+    Instead, the portal pages run as the site''s Guest User, and Techsara''s own
+
+    Apex (AuthService) checks the username/password against this object, creates
+
+    a Candidate_Portal_Session__c, and hands the browser a session token. The
+
+    credential record also carries the account-security state: active/disabled
+
+    switch, failed-login counter, temporary lockout timestamp and last login.
+
+
+    Think of it as the "users table" of a custom web application that happens to
+
+    live inside Salesforce.'
+- title: Candidate_Portal_Credential__c — Kind Of Object
+  keywords:
+  - candidate
+  - portal
+  - credential
+  text: "- Custom object, part of the candidate-portal custom-auth cluster (with\n\
+    \  Candidate_Portal_Session__c).\n- LOOKUP to Account via Candidate__c (the\
+    \ candidate this login belongs to).\n  Not master-detail; the credential is\
+    \ its own record.\n- Sharing model Public Read/Write - but sharing is effectively\
+    \ irrelevant:\n  the Guest User has no record access, and all reads/writes go\
+    \ through\n  \"without sharing\" Apex (AuthService / CandidateContext) using\
+    \ SYSTEM_MODE\n  DML. Security is enforced in code, not by the sharing model.\n\
+    - 7 custom fields, 0 record types, 0 validation rules, 0 list views.\n- Auto-number\
+    \ Name \"Candidate Credentials Number\" in format CCN-{00000}.\n- Scale: 2 records\
+    \ in preprod (the feature is brand new - Aug 2026)."
+- title: Candidate_Portal_Credential__c — How It Is Used — The Business Process
+  keywords:
+  - candidate
+  - portal
+  - credential
+  text: "STEP 1 - PROVISIONING. A staff member creates the credential record manually\n\
+    \  (there is no flow or Apex that creates credentials today): pick the\n  candidate\
+    \ Account, type a Username and Password, tick Is Active. The\n  classic \"Candidate\
+    \ Portal Credential Layout\" is the entry screen.\n\nSTEP 2 - LOGIN. The candidate\
+    \ opens the portal login page (the candidateLogin\n  LWC on the candidate Experience\
+    \ site) and enters username + password. The\n  page calls AuthService.login()\
+    \ which:\n  - finds the credential by Username__c;\n  - rejects disabled accounts\
+    \ (\"Account is disabled...\") and accounts still\n    inside a lockout window\
+    \ (\"Account temporarily locked...\");\n  - compares the password using a constant-time\
+    \ compare (so response timing\n    leaks nothing). A wrong password increments\
+    \ Failed_Login_Count__c; at 5\n    failures the account locks for 15 minutes\
+    \ (Locked_Until__c);\n  - on success creates a Candidate_Portal_Session__c valid\
+    \ for 7 days,\n    resets the failure counter, clears the lockout and stamps\n\
+    \    Last_Login_At__c, then returns the session token to the browser.\n  All\
+    \ wrong-username / wrong-password paths return the same generic\n  \"Invalid\
+    \ username or password\" so attackers cannot probe for usernames."
+- title: Candidate_Portal_Credential__c — How It Is Used — The Business Process
+    (2)
+  keywords:
+  - candidate
+  - portal
+  - credential
+  text: "STEP 3 - EVERY LATER PORTAL CALL. The browser sends the session token;\
+    \ the\n  CandidateContext class re-validates it and follows\n  Candidate_Credential__r.Candidate__c\
+    \ to know WHICH candidate is calling.\n  Every portal query then filters by\
+    \ that candidate id - the credential is\n  the anchor of the whole portal security\
+    \ model.\n\nSTEP 4 - FORGOT LOGIN. The candidate enters their email on the login\
+    \ page;\n  AuthService.recoverLogin() finds the Account by Email_replica__c,\
+    \ finds\n  this credential, and emails the username AND password to the ACCOUNT\n\
+    \  OWNER (the candidate's recruiter/point of contact) - deliberately not to\n\
+    \  the candidate-typed email - who then shares it with the candidate.\n\nSECURITY\
+    \ CAVEAT (stated in the code itself): Password__c is stored in PLAIN\nTEXT -\
+    \ acceptable only while this is sandbox data. The class header commits\nto swapping\
+    \ in SHA-256 hashing (and rewriting recovery as a one-time reset\nlink) before\
+    \ production data lands."
+- title: Candidate_Portal_Credential__c — Connected Objects
+  keywords:
+  - candidate
+  - portal
+  - credential
+  - each
+  - relationship
+  - means
+  text: "PARENT:\n- Account (via Candidate__c, Lookup): the candidate (Person Account)\
+    \ this\n  login belongs to. Child relationship name: Candidate_Portal_Credentials.\n\
+    \  100% populated (2 of 2). The recoverLogin path also uses the Account's\n\
+    \  Email_replica__c and Owner to route the recovery email.\n\nCHILDREN / REFERENCES:\n\
+    - Candidate_Portal_Session__c (via Candidate_Credential__c, Lookup): the\n \
+    \ active and past login sessions minted from this credential. Deactivating\n\
+    \  the credential (Is_Active__c = false) instantly kills all its sessions,\n\
+    \  because every session check also verifies the credential is active."
+- title: Candidate_Portal_Credential__c — Business Rules
+  keywords:
+  - candidate
+  - portal
+  - credential
+  - validation
+  text: 'None. All rules (lockout, active check, generic error messages) are enforced
+
+    in the AuthService Apex class instead of validation rules.'
+- title: Candidate_Portal_Credential__c — Automation
+  keywords:
+  - candidate
+  - portal
+  - credential
+  - runs
+  text: "No flows, no triggers, no scheduled jobs touch this object. All writes\
+    \ come\nfrom Apex:\n- AuthService.login(): increments Failed_Login_Count__c\
+    \ on bad passwords,\n  sets/clears Locked_Until__c, stamps Last_Login_At__c,\
+    \ resets the counter\n  on success (all via SYSTEM_MODE DML as the Guest User).\n\
+    - AuthService.recoverLogin(): reads the record to email the credentials to\n\
+    \  the Account Owner.\n- CandidateContext: reads Candidate_Credential__r.Is_Active__c\
+    \ and\n  .Candidate__c on every portal call to validate the session.\nGuest-user\
+    \ access comes from the \"Candidate_Portal_Guest_Access\" permission\nset (read-only\
+    \ object access + the portal Apex classes); record creation is\nmanual by internal\
+    \ staff."
+- title: Candidate_Portal_Session__c — What This Object Is
+  keywords:
+  - candidate
+  - portal
+  - session
+  text: 'Candidate_Portal_Session__c is ONE login session of a candidate on the
+    custom
+
+    candidate portal - the equivalent of a web app''s "sessions table". When a
+
+    candidate signs in successfully (AuthService.login), one record is created
+
+    holding a cryptographically random session token, a 7-day expiry, the
+
+    originating IP address and an activity heartbeat. The browser keeps the
+
+    token and sends it with every portal request; the CandidateContext Apex
+
+    class looks the session up, checks it is active/unexpired and resolves the
+
+    calling candidate from it. Logging out (or expiry, or disabling the parent
+
+    credential) deactivates the session.'
+- title: Candidate_Portal_Session__c — Kind Of Object
+  keywords:
+  - candidate
+  - portal
+  - session
+  text: "- Custom object, the runtime half of the candidate-portal custom-auth\n\
+    \  cluster (Candidate_Portal_Credential__c is the account half).\n- LOOKUP to\
+    \ Candidate_Portal_Credential__c via Candidate_Credential__c.\n- Sharing model\
+    \ Public Read/Write - moot in practice: only \"without sharing\"\n  Apex touches\
+    \ it (the Guest User permission set does grant Create on this\n  object, needed\
+    \ so the login transaction can insert the session).\n- 7 custom fields, 0 record\
+    \ types, 0 validation rules, 0 list views.\n- Auto-number Name \"Candidate Session\
+    \ Number\" in format CSN-{00000}.\n- Scale: 5 records in preprod (Aug 2026 pilot)."
+- title: Candidate_Portal_Session__c — How It Is Used — The Business Process
+  keywords:
+  - candidate
+  - portal
+  - session
+  text: "STEP 1 - CREATED AT LOGIN. AuthService.login() inserts the session with\
+    \ a\n  fresh random token (256-bit AES key, base64url-encoded), Expires_At__c\
+    \ =\n  now + 7 days, Is_Active__c = true, Last_Activity_At__c = now, and the\n\
+    \  client IP (passed in from the login LWC, which resolves it via an external\n\
+    \  who-am-i endpoint because guest Apex cannot read the caller IP itself).\n\
+    \nSTEP 2 - VALIDATED ON EVERY PORTAL CALL. Every @AuraEnabled method in\n  CandidatePortalController\
+    \ starts with CandidateContext.fromSession(token):\n  - token not found, Is_Active__c\
+    \ false, expiry passed, parent credential\n    inactive or unlinked -> the user\
+    \ gets a uniform \"Session expired\" error;\n  - an expired-but-still-active\
+    \ record is flipped to Is_Active__c = false on\n    the spot (lazy cleanup -\
+    \ there is no scheduled purge job);\n  - on success the \"sliding heartbeat\"\
+    \ stamps Last_Activity_At__c = now.\n  Methods that make HTTP callouts (e.g.\
+    \ the S3 upload URL request) use a\n  read-only variant that skips the heartbeat\
+    \ write until after the callout,\n  because Salesforce forbids callouts after\
+    \ DML in one transaction.\n\nSTEP 3 - ENDED. Logout (AuthService.logout) sets\
+    \ Is_Active__c = false; or\n  the session silently dies at Expires_At__c; or\
+    \ it dies with its parent\n  credential when staff deactivate the candidate's\
+    \ login. Old rows stay in\n  the database as an audit trail of who signed in\
+    \ from where and when."
+- title: Candidate_Portal_Session__c — Connected Objects
+  keywords:
+  - candidate
+  - portal
+  - session
+  - each
+  - relationship
+  - means
+  text: "PARENT:\n- Candidate_Portal_Credential__c (via Candidate_Credential__c,\
+    \ Lookup): the\n  login account this session was minted from. Child relationship\
+    \ name:\n  Candidate_Portal_Sessions. 100% populated. The session inherits its\n\
+    \  candidate identity through this link (credential -> Candidate__c ->\n  Account)\
+    \ - the session itself never stores the candidate id.\n\nCHILDREN / REFERENCES:\n\
+    - Nothing points at this object. It is a leaf: pure runtime/audit state."
+- title: Candidate_Portal_Session__c — Business Rules
+  keywords:
+  - candidate
+  - portal
+  - session
+  - validation
+  text: 'None. Session integrity (expiry, active checks, uniform error messages)
+    is
+
+    enforced entirely in the CandidateContext / AuthService Apex classes.'
+- title: Candidate_Portal_Session__c — Automation
+  keywords:
+  - candidate
+  - portal
+  - session
+  - runs
+  text: "No flows, no triggers, no scheduled jobs. All lifecycle is Apex:\n- AuthService.login()\
+    \ creates the record; AuthService.logout() deactivates\n  it (both SYSTEM_MODE\
+    \ DML as the Guest User).\n- CandidateContext.resolveSession() validates it\
+    \ on every portal call,\n  writes the Last_Activity_At__c heartbeat, and lazily\
+    \ deactivates expired\n  sessions when they are next presented.\n- CandidateContext.touchHeartbeat()\
+    \ writes the heartbeat separately after\n  callout-bearing methods finish.\n\
+    Note there is NO scheduled cleanup: expired sessions that are never\npresented\
+    \ again simply remain active-flagged rows until touched."
+- title: Onboarding_Token__c — What This Object Is
+  keywords:
+  - onboarding
+  - token
+  text: 'Onboarding_Token__c is a ONE-TIME, EXPIRING LINK sent to a candidate so
+    they
+
+    can fill in their onboarding intake form WITHOUT logging in anywhere. When
+
+    staff click "Send Onboarding Form" on an Onboarding record, a short signed
+
+    token is generated, stored here, embedded in a public URL
+
+    (<candidate hub site>/s/onboarding-form?token=XXXX) and emailed to the
+
+    candidate. The candidate opens the link as a guest; a screen flow looks the
+
+    token up, checks it is not expired/used, walks them through the intake
+
+    screens, and on submit stamps the token used. One record = one issued link,
+
+    with its full lifecycle (Sent -> Opened -> Submitted, or Expired/Cancelled).
+
+
+    This is the third leg of the org''s custom token machinery: portal
+
+    credentials/sessions cover the logged-in candidate portal, while
+
+    Onboarding_Token__c (and its sibling pattern on Pre_Enrolment_Request__c)
+
+    covers no-login guest form links.'
+- title: Onboarding_Token__c — Kind Of Object
+  keywords:
+  - onboarding
+  - token
+  text: "- Custom object in the Onboarding domain (child of Onboarding__c).\n- LOOKUP\
+    \ to Onboarding__c via Onboarding__c (which onboarding case the link\n  belongs\
+    \ to).\n- Sharing model Public Read/Write; the guest form flow runs in system\
+    \ mode\n  without sharing, so record access is handled by the flow, not sharing.\n\
+    - 8 custom fields, 0 record types, 0 validation rules, 1 list view.\n- Auto-number\
+    \ Name \"Onboarding Token Number\" in format OTN-{0000}.\n- Scale: 2 records\
+    \ in preprod (feature is new - both from 2026-07-29)."
+- title: Onboarding_Token__c — How It Is Used — The Business Process
+  keywords:
+  - onboarding
+  - token
+  text: "STEP 1 - STAFF SEND THE FORM. On an Onboarding record, a user clicks the\n\
+    \  \"Send Onboarding Form\" quick action (on the Onboarding Lightning record\n\
+    \  page and classic layout), launching the screen flow\n  Onboarding_Send_Candidate_Onboarding_form.\
+    \ The flow:\n  - EXPIRES any still-open token for the same onboarding (status\
+    \ Sent /\n    Opened / Draft becomes \"Expired\") so only one live link exists\
+    \ at a\n    time;\n  - calls the CreateToken Apex action with the metadata secret\n\
+    \    \"Onboarding_Flow_Secret\" to mint a 12-character token (6 hex chars of\n\
+    \    an HMAC-SHA256 signature over the record id + expiry, plus 6 random hex\n\
+    \    chars, uppercased) valid for 2 days;\n  - creates the Onboarding_Token__c\
+    \ record (status \"Sent\") with the token,\n    expiry, recipient email and\
+    \ the full public link built as\n    {Candidate_Hub_URL custom label} + \"/s/onboarding-form?token=\"\
+    \ + token\n    (the label currently points at the /talent Experience site in\
+    \ preprod);\n  - emails the link to the candidate's PersonEmail (cc the Account\
+    \ owner)\n    from noreply@techsarasolutions.com using the \"Onboarding Request\
+    \ Form\"\n    email template, and sets Candidate_form_sent__c on the Onboarding."
+- title: Onboarding_Token__c — How It Is Used — The Business Process (2)
+  keywords:
+  - onboarding
+  - token
+  text: "STEP 2 - CANDIDATE OPENS THE LINK. The guest-accessible onboarding-form\
+    \ page\n  runs the screen flow Onboarding_Candidate_Intake_1 (active; an older\n\
+    \  draft, Onboarding_Candidate_Intake, is superseded). The flow looks the\n\
+    \  token up by Token__c and rejects the visit if Expires_At__c has passed or\n\
+    \  the status is already Expired / Submitted / Cancelled (\"link used\").\n\
+    \  Otherwise it marks the token \"Opened\" and shows the intake screens\n  (personal\
+    \ details, education history, course selection etc., prefilled\n  from the candidate's\
+    \ existing data).\n\nSTEP 3 - CANDIDATE SUBMITS. On the final screen the flow\
+    \ sets Used__c =\n  true, Used_At__c = now, status = \"Submitted\", writes the\
+    \ collected data to\n  the Account / Education_History__c etc., and updates\
+    \ the parent\n  Onboarding record's Latest_Onboarding_Status__c. The link is\
+    \ now dead -\n  reopening it hits the \"link used\" branch.\n\nSTEP 4 - IF THE\
+    \ LINK DIES UNUSED. Tokens past their 2-day expiry are treated\n  as dead on\
+    \ open; re-sending the form from the quick action expires the old\n  token and\
+    \ issues a fresh one."
+- title: Onboarding_Token__c — Connected Objects
+  keywords:
+  - onboarding
+  - token
+  - each
+  - relationship
+  - means
+  text: "PARENT:\n- Onboarding__c (via Onboarding__c, Lookup): the candidate-onboarding\
+    \ case\n  this link was issued for. Child relationship name: Onboarding_Tokens\n\
+    \  (visible as a related list on the Onboarding layout). 100% populated. The\n\
+    \  send flow flips Onboarding__c.Candidate_form_sent__c and the intake flow\n\
+    \  updates Onboarding__c.Latest_Onboarding_Status__c through this link.\n\n\
+    CHILDREN / REFERENCES:\n- Nothing points at this object.\n\nRELATED PATTERN\
+    \ (not a relationship): the pre-enrolment form uses the SAME\nCreateToken Apex\
+    \ action but stores its token directly on\nPre_Enrolment_Request__c (Public_Token__c)\
+    \ - do not confuse the two."
+- title: Onboarding_Token__c — Business Rules
+  keywords:
+  - onboarding
+  - token
+  - validation
+  text: 'None. Expiry, single-use and duplicate-link rules are enforced by the two
+
+    flows (send + intake), not by validation rules.'
+- title: Onboarding_Token__c — Automation
+  keywords:
+  - onboarding
+  - token
+  - runs
+  text: "SCREEN FLOWS (both run in system mode without sharing):\n- Onboarding_Send_Candidate_Onboarding_form\
+    \ (active; launched by the\n  \"Send Onboarding Form\" quick action on Onboarding__c):\
+    \ expires prior open\n  tokens, creates the new token record, sends the email.\
+    \ Uses the Apex\n  action CreateToken with Token_Secret__mdt \"Onboarding_Flow_Secret\"\
+    .\n- Onboarding_Candidate_Intake_1 (active; the guest onboarding-form page):\n\
+    \  looks the token up, sets status Opened on first view, and on submit sets\n\
+    \  Used__c / Used_At__c / status Submitted.\n- Onboarding_Candidate_Intake (DRAFT\
+    \ - an earlier version of the intake\n  flow; inactive, superseded by _1).\n\
+    APEX:\n- CreateToken (invocable, \"Generate Pre Enrollment Token\"): generates\
+    \ the\n  token string; it does not itself write Onboarding_Token__c records.\n\
+    No triggers, record-triggered flows or scheduled jobs exist on this object;\n\
+    in particular nothing sweeps expired tokens - they are only marked Expired\n\
+    when re-sent over or when the candidate tries to open them."
+- title: In_App_Checklist_Settings__c — What This Object Is
+  keywords:
+  - app
+  - checklist
+  - settings
+  text: 'In_App_Checklist_Settings__c is a HIERARCHY CUSTOM SETTING (not a normal
+
+    object - no tabs, no records users browse) that stores configuration for
+
+    Salesforce''s own "Sales Cloud In-App Checklist" - the guided setup checklist
+
+    Salesforce shows inside new Sales Cloud orgs. Its description reads: "This
+
+    custom settings contains all attributes used in In App Checklist." It holds
+
+    an encrypted profile key and the URL of the Salesforce-hosted checklist
+
+    page. This is SALESFORCE-MANAGED PLUMBING, not something Techsara built:
+
+    no Techsara Apex, flow, LWC or report references it anywhere in the org.
+
+    It sits in this documentation cluster only because it is a settings-style
+
+    object; it has nothing to do with the candidate portal or its token auth.'
+- title: In_App_Checklist_Settings__c — Kind Of Object
+  keywords:
+  - app
+  - checklist
+  - settings
+  text: "- Custom setting, type HIERARCHY (values can be set org-wide and overridden\n\
+    \  per profile or per user), visibility PROTECTED.\n- No sharing model, no owner,\
+    \ no tab - custom settings live outside the\n  normal record security model\
+    \ and are read via the setup hierarchy.\n- 2 custom fields, 0 record types,\
+    \ 0 validation rules, 0 list views.\n- Scale: 3 rows in preprod - 1 org-wide\
+    \ default + 2 profile-level overrides."
+- title: In_App_Checklist_Settings__c — How It Is Used — The Business Process
+  keywords:
+  - app
+  - checklist
+  - settings
+  text: 'There is no Techsara business process on this object. Salesforce''s Sales
+
+    Cloud onboarding feature wrote these rows (an org default plus two profile
+
+    overrides) so that its in-app checklist component can identify the org/
+
+    profile (ProfileKey__c) and load the checklist content from a
+
+    Salesforce-hosted page (Sales_Cloud_In_App_Page__c). Nothing in the org''s
+
+    custom code, flows or pages reads or writes it. For the role-hierarchy /
+
+    security redesign it can be safely ignored; it is also a candidate for
+
+    cleanup if the org ever prunes unused metadata (verify with team before
+
+    deleting - Salesforce features may still read it at runtime).'
+- title: In_App_Checklist_Settings__c — Connected Objects
+  keywords:
+  - app
+  - checklist
+  - settings
+  - each
+  - relationship
+  - means
+  text: 'None. Custom settings cannot have lookups to or from other objects. The
+
+    only linkage is the implicit SetupOwnerId of each row (the org for the
+
+    default row, a Profile for the two override rows).'
+- title: In_App_Checklist_Settings__c — Automation
+  keywords:
+  - app
+  - checklist
+  - settings
+  - runs
+  text: 'None in the org. No Apex class, trigger, flow or component in force-app
+
+    references this setting; only Salesforce''s own in-app checklist feature
+
+    reads it (from outside the org''s metadata).'
+- title: Token_Secret__mdt — What This Object Is
+  keywords:
+  - token
+  - secret
+  - mdt
+  text: 'Token_Secret__mdt is a CUSTOM METADATA TYPE that stores the SIGNING SECRETS
+
+    used to mint the org''s one-time form tokens. Each row is a named secret
+
+    (e.g. "Onboarding Flow Secret"); the CreateToken Apex action looks a row up
+
+    by its developer name and uses its Value__c as the HMAC-SHA256 key when
+
+    generating a token for an onboarding or pre-enrolment link. Keeping the
+
+    secrets in custom metadata means admins can rotate them from Setup without
+
+    touching code, different features get different keys, and the values deploy
+
+    with the org (note: custom metadata is NOT encrypted at rest and is visible
+
+    to anyone with Setup access - a known trade-off).
+
+
+    SECURITY: the actual secret values are deliberately NOT reproduced in this
+
+    document. Only row names and counts are recorded.'
+- title: Token_Secret__mdt — Kind Of Object
+  keywords:
+  - token
+  - secret
+  - mdt
+  text: "- Custom METADATA TYPE (__mdt) - rows are configuration deployed/edited\
+    \ via\n  Setup, not data records; they have no owner and no sharing.\n- 1 custom\
+    \ field (Value__c) plus the standard DeveloperName / MasterLabel\n  every metadata\
+    \ type has.\n- 0 record types, 0 validation rules, 0 list views.\n- Scale: 3\
+    \ rows in preprod. The rows are NOT in the force-app source\n  (no customMetadata/\
+    \ folder) - they exist only in the org."
+- title: Token_Secret__mdt — How It Is Used — The Business Process
+  keywords:
+  - token
+  - secret
+  - mdt
+  text: "When a staff member sends a candidate a one-time form link, the launching\n\
+    flow passes a secret's developer name into the CreateToken Apex action:\n- Onboarding_Send_Candidate_Onboarding_form\
+    \ passes \"Onboarding_Flow_Secret\"\n  when minting an Onboarding_Token__c link;\n\
+    - send_pre_enrollment_form passes its secret name (row\n  \"Pre_Enrollment_Flow_Secret\"\
+    ) when minting the pre-enrolment link stored\n  on Pre_Enrolment_Request__c.Public_Token__c;\n\
+    - the third row, \"Test_Secret\", exists for the CreateTokenTest unit tests.\n\
+    CreateToken queries SELECT Value__c FROM Token_Secret__mdt WHERE\nDeveloperName\
+    \ = :name, computes HMAC-SHA256 over (record id + expiry\ntimestamp) with that\
+    \ value as the key, and folds 6 hex chars of the\nsignature plus 6 random hex\
+    \ chars into the 12-character token. Because each\nfeature has its own named\
+    \ secret, rotating one (paste a new value in Setup)\ninvalidates nothing else.\
+    \ Rotation does, however, orphan any not-yet-used\ntokens minted under the old\
+    \ secret only if the token were ever re-verified\nagainst the HMAC - today the\
+    \ flows match tokens by exact string lookup, so\nthe HMAC is tamper-evidence\
+    \ in the token itself rather than a re-checked\nsignature."
+- title: Token_Secret__mdt — Connected Objects
+  keywords:
+  - token
+  - secret
+  - mdt
+  - each
+  - relationship
+  - means
+  text: 'None. Custom metadata types have no lookups in this org. Functionally it
+
+    feeds (via CreateToken) the token fields on Onboarding_Token__c and
+
+    Pre_Enrolment_Request__c, but there is no database relationship.'
+- title: Token_Secret__mdt — Automation
+  keywords:
+  - token
+  - secret
+  - mdt
+  - runs
+  text: 'Read-only consumer: the CreateToken invocable Apex class (label "Generate
+
+    Pre Enrollment Token") is the ONLY code that queries this type. It is
+
+    invoked by two active screen flows - Onboarding_Send_Candidate_Onboarding_
+
+    form and send_pre_enrollment_form. Nothing writes rows at runtime (custom
+
+    metadata cannot be written by flows or normal Apex anyway).'

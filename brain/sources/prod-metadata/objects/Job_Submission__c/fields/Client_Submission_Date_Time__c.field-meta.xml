@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Client_Submission_Date_Time__c</fullName>
+    <description>Date and time when AM submitted this profile to the client. Auto-set by Approve and Submit to Client flow. Required by validation rule when status = Submitted to Client.</description>
+    <inlineHelpText>Auto-set when AM runs Approve and Submit to Client flow. Used to measure time from internal submission to client submission.</inlineHelpText>
+    <label>Client Submission Date/Time</label>
+    <required>false</required>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>DateTime</type>
+</CustomField>

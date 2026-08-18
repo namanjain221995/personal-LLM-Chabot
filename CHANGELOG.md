@@ -1,5 +1,434 @@
 # Changelog
 
+## "There are no records for these people" — there were 84 (2026-08-18)
+
+Asked how many internal interviews five named staff had each completed, the
+engine answered that no such records existed. Jay Soni had 24, Javan Tanna 20,
+Heet Dedakiya 15, Khushi ghorawath 13, Jayesh Prajapati 13.
+
+`Internal_Interview__c.Interviewer__c` is a lookup to **Recruiter__c**, a
+separate 302-row object. The dictionary knew that — `hint_for` even renders
+`→Recruiter__c` — but `join_map` then contradicted it. That block emits only
+edges whose BOTH ends are in the 24-table schema slice, and it introduces
+itself as "these are the ONLY valid joins". Recruiter__c was not in the slice
+(no alias mapped the word "interviewer", so it scored zero while the slice
+spent five slots on Asset, Profile, Opportunity, DataSpaceInternalOrg and a
+Zoom object), so the one edge that answers the question was withheld under an
+explicit closed-world claim. The model joined the interviewer to Account —
+which Account's own 'Recruiter' record type makes look right — matched nothing,
+and said so with confidence.
+
+Five defects, fixed at the layer each belongs to:
+
+- **`join_map` no longer hides an edge or claims to be exhaustive.** Edges
+  leaving the slice are listed, flagged as such, with a legend of the columns
+  you would filter each target by — because naming a table without saying how
+  to recognise a row of it invites the same bug one step later. Compacting the
+  legend kept the block smaller than repeating it per edge (4.2KB, was 5.6KB
+  when spelled out).
+- **`interviewer` / `interviewers` / `conducted` now map to Recruiter__c.**
+  Every other way of saying "a member of staff" was aliased — trainer, host,
+  employee, recruiter, supporter — except the word on the field itself.
+- **Dates are WRITTEN ISO.** The prompt said how to READ the user's day-first
+  date; the model then emitted `TRY_CAST('17-08-2026' AS DATE)`, which DuckDB
+  evaluates to NULL, so that predicate could never match.
+- **Names are matched loosely.** An exact `IN (...)` returned a silent 0 for
+  Khushi ghorawath — stored with a lower-case surname — beside four correct
+  figures, which is worse than an empty result because it looks authoritative.
+- **An empty result is no longer a finding.** `deterministic_summary` now marks
+  it in the authoritative block the answer prompt must quote from, saying that
+  zero rows do not distinguish "these records do not exist" from "this query
+  did not find them". Reporting absence from the silence of a self-written
+  query is the most damaging thing this engine can do.
+
+None of that was enough on its own. Measured over six runs, the model still
+resolved "how many interviews has X completed" to the CANDIDATE reading and
+returned 0/6 correct: a prompt rule cannot know who these particular people
+are. So it no longer has to guess — `who_these_people_are` looks the named
+people up in the warehouse before the prompt is built and states which object
+holds each of them, which join that implies, and the exact stored spelling.
+One indexed lookup, skipped entirely when a question names nobody, and never
+fatal. **0/6 → 6/6, verified again on the deployed image.**
+
+Also fixed while in there: `brain._normalise` truncated a pack's rules with
+`rules[:4000]`, which is precisely what this module's own comment forbids —
+"a truncated rule reads as a complete one, which is worse than a missing one".
+The internal-interview pack had grown past the cap and its new rule ended
+mid-word at "a CANDIDATE or an INTERVIEW". The cut now lands on a rule
+boundary and logs what it dropped; the per-pack budget went to 5000. And
+`test_schema_slice.py` gained a fixture restoring `sf_dictionary._cache`,
+which a test had been leaving pointed at a two-object fake — eight unrelated
+Salesforce tests failed in the full suite while passing alone.
+
+Tests: 1,337 backend (+16).
+
+## Field-reference companion + the Apex batch pack (2026-08-18)
+
+Three files arrived; one was a byte-identical re-drop of the DocuSign
+knowledge file (removed, md5-checked). The real additions:
+
+**`DocuSign_Salesforce_Field_Reference.docx`** — converted with pandoc
+(source kept as both .docx and .txt in brain/sources/) and folded into the
+existing docusign-integration pack rather than becoming a pack of its own:
+two new knowledge chunks (the six field-usage rules — PersonEmail vs Email,
+Owner traversal, formula fields can never receive writeback, Field Value
+Updates fire per-event while merge-field writeback waits for completion; and
+the signer-validation regex table — routing = exactly 9 digits, account =
+6-17, SSN last-4/full), plus User.Email and Account.OwnerId field notes.
+Verified: the doc's `DS_Testing_Field__c` and `DS_Date_Display__c` are NOT
+in the production warehouse — caveated, not taught.
+
+**`saleforce-other.txt`** — renamed to brain/sources/apex-classes.txt: the
+team's new "Apex Classes — Full Detailed Documentation" (Batch 1: the Zoom
+Recording Portal pair). Became the 18th pack, `apex-reference.yaml`,
+knowledge-only by design — Apex internals answer "how does it work under the
+hood" via retrieval and never ride on analytics prompts. Covers the portal's
+config hub (S3, pre-signed URLs defaulting to 8-hour expiry, extension
+allow-list) and the request-context audit holder; notes that
+Zoom_Portal_Config__mdt is custom metadata, unsynced, so its AWS credentials
+cannot surface through any query. The source doc grows in batches — future
+Apex batches append chunks to this pack. Tests: 1,321 passing.
+
+## The clarification is a control, not a message (2026-08-18)
+
+It rendered as an assistant card in the transcript. That put an interactive
+control inside the scrolling history it did not belong to: on a long
+conversation the question you were being asked scrolled out of view while you
+looked for it, and every question ever asked stayed in the thread as a card.
+
+It now renders inside the COMPOSER — above the input, behind the same corners,
+on the same surface, separated by one divider — so the question and the field
+you answer it in are one control. Structurally verified in a browser: the panel
+is not inside the scroll container, matches the composer's width to 0.0px,
+never overlaps the input, and moved 0px when a 362px-overflowing history was
+scrolled to the top.
+
+`ClarificationCard` is now that panel and nothing else; `ClarificationRecord` is
+what the transcript keeps afterwards — one quiet line, no roles, no controls,
+saying what was asked and what was chosen, so the user turn that follows it
+("This quarter") reads as an answer rather than a non sequitur. A turn whose
+only content is a live question renders nothing at all: it used to leave an
+empty assistant row under the request with copy / thumbs / retry buttons
+attached to it, which reads as an answer that failed.
+
+The panel has no text field. It sits forty pixels above the composer's own, and
+two inputs for one question is two places to wonder which is listening.
+"Something else", Escape, and simply starting to type all hand over to the
+composer instead — and the keystroke goes with them. That last part is what
+makes the rest safe: the panel takes focus when a question appears so `1`/`2`/`3`
+work immediately, which would otherwise swallow the first letter of "actually I
+mean the scheduled interview for Dileep" and turn any digit in it into a
+submitted answer. Escape no longer answers on the user's behalf either — wanting
+to type your own answer is the commonest reason to press it, and "no preference"
+is not what that means. Skipping is still available on the × , and is still a
+submitted answer rather than a disappearance, because the question lives on the
+server and only one may be pending per conversation.
+
+Nothing changed about WHEN it asks, the resume, or the wire format: the answer
+was already posted as an ordinary user turn carrying the structured response
+alongside it, so the visible history was already `request → "This quarter" →
+answer` with no metadata on screen. Also: the composer now clears the home
+indicator on a phone (`max()` of the existing padding and the safe-area inset,
+so nothing moves on any other device).
+
+Verified end to end in a real browser (23 checks): option selection, typed
+answers, "Something else", three rapid clicks producing exactly one POST, a
+scrolled long conversation, 390px mobile, survival across a reload, and the
+keyboard paths. Tests: 1,319 backend, 444 frontend, typecheck / lint / build
+clean.
+
+## One clarification system, and a request read the way a colleague would read it (2026-08-17)
+
+The chatbot had TWO clarification implementations. The typed one
+(`core/sf_intel/`) persists a question, mints a resume token, budgets rounds,
+fingerprints what it has already asked and resumes the original request. The
+other (`core/clarify.py`) rendered a second card from markdown, matched answers
+by sniffing the previous assistant turn out of history, and — because option
+labels contain the very words its detectors match on — re-asked its own
+question forever under `CLARIFY_MODE=always`. The kill switch
+`SALESFORCE_INTELLIGENCE_MODE_ENABLED=false` did not disable a model call; it
+downgraded the user to the implementation that could not resume. The second one
+is gone. `sf_intel.run(use_planner=False)` now runs the SAME pipeline with the
+deterministic detectors in place of the planner, so a question is persisted,
+resumable and loop-guarded whichever component decided to ask it, and `meta`
+reports which (`salesforce_mode: "intelligence" | "deterministic"`).
+
+The detectors themselves were leaking the schema: `Use Interview__c with record
+type 'Interview'` was shipped as the thing a user clicked on. Labels and
+descriptions are now plain English and the API names live only in the
+machine-facing `value` the query planner reads — enforced by a validator on
+`ClarificationOption`, not by hoping the model complies.
+
+`core/sf_intel/interpret.py` is new, and is the reason the thing stops asking
+pointless questions. Two deterministic passes before the planner:
+
+  * SPELLING, repaired against the org's OWN vocabulary — pack triggers,
+    glossary terms, table names, metric aliases — with Damerau distance,
+    a first-letter guard, a uniqueness guard and a skip for capitalised names.
+    Every grounding layer in this codebase matches words exactly, so "how many
+    advance mock scheddule todau" reached the planner with no internal-interview
+    rules, no metric definition and no detected period, and a planner handed
+    nothing asks about everything. Nobody maintains a misspelling list: a new
+    pack teaches new spellings for free.
+  * WHAT THE SENTENCE ALREADY SETTLES. "How many mocks today?" names its period.
+    `enforce_policy` now refuses to ask about a slot the request states or the
+    user already answered, so the most common way this feature annoyed people —
+    "over what period?" about a request whose second word is "today" — is
+    impossible rather than merely discouraged. `metric` and `object` are
+    deliberately never auto-settled: "how many advanced mocks" genuinely does
+    not say whether it means the interviews or the candidates who sit them.
+
+The planner was the one component with no vocabulary — the org brief and the
+canonical measures reached the SQL engine and the live engine but never the
+thing that DECIDES whether to ask. It gets them now, keyed on the request plus
+what the conversation established, so a three-word follow-up is grounded as well
+as the request it follows. `PLANNER_SYSTEM` gained an answer-first bias with
+worked examples both ways, explicit typo tolerance, follow-up resolution
+("tomorrow?" is the same question with a new date), a ban on implementation
+vocabulary in labels, and a topic `header` so the card reads "Clarification ·
+Mock count" instead of "SALESFORCE". `CLARIFY_MODE=always` survives as a BIAS on
+that prompt rather than a content-free confirmation card.
+
+Two silent losses fixed. On resume the planner was handed the ANSWER ("Count of
+interviews") as the current request instead of the original with the answer
+folded in — the original survived only in whatever recent turns happened to be
+included. And `complete_intent` ran only after a live SOQL query, so on a
+warehouse deployment — the common one — `carried_slots()` was empty forever and
+"what about tomorrow?" inherited nothing.
+
+Frontend: every card in the transcript was a live control. The in-flight lock is
+keyed by id and clears when the run ends, so answering one question re-armed
+every older one and clicking a different option on a question from ten turns ago
+started a fresh run against a dead intent. `cardState` marks exactly one card
+live; the rest collapse to a record of the decision. Also: the lock was never
+cleared on completion or failure (a stopped continuation left "Continuing your
+request…" and every control disabled, permanently); `bg-accent/12` is not on
+Tailwind's opacity scale and compiled to nothing, so a ticked option had no
+tint; `focus:outline-none` suppressed the global ring with no replacement;
+`aria-checked` reported focus rather than selection, so arrowing down a radio
+list announced four different answers as selected; "Use composer" was a
+role="button" span nested inside a button; ⌘↵ with text in the box was a silent
+no-op on a single-answer card; and skip/Escape was unreachable in production —
+it now submits a `skipped` answer, because a card that merely vanished leaves
+the question pending, and only one may be pending per conversation.
+
+Three state leaks around that index: truncating a thread left an unanswerable
+question open (blocking every later question in the chat), a Salesforce-mode
+turn routed to the URL/repo/dataset pipelines neither answered nor cancelled
+one, and `health.EXPECTED_SCHEMA_VERSION` was still the literal 4 while
+migration v5 shipped the entire clarification schema — so a database with none
+of those tables reported healthy. It derives from `db.LATEST_SCHEMA_VERSION`
+now. `apply_response` also checked the resume token and conversation id only
+when the client bothered to send them, which is the one shape an attacker would
+choose; both are unconditional.
+
+Two defects the stubbed tests could not see, found by running the new prompt
+against the live 35B. Asked "show mocks for John" with no org connection the
+planner offered "John D.", "John S." and "John M." at 0.95 confidence — three
+people who do not exist, rendered as a list to click. Every other slot's options
+are READINGS of the request and cost nothing if one is invented; `record_identity`
+options are RECORDS, and a fabricated record is indistinguishable from a real one
+to the person clicking it, so that slot is now refused in code unless a real
+search returned candidates. And "How many candidates today?" was met with "or the
+number of their interviews?" — a different question, not another reading of that
+one. `PLANNER_SYSTEM` now draws the line explicitly: ask what a count means only
+when the counted noun is an EVENT one person can have several of, so the event
+count and the distinct-person count are genuinely different numbers. Re-verified
+live: "How many candidates today?" and "Show mocks for John" execute with a
+stated assumption; "How many advanced mock interviews are scheduled today?" asks
+"Mock count — the scheduled mock sessions, or the unique candidates sitting
+them?".
+
+No new model call anywhere: the deterministic pass is ~0.2 ms, and the
+kill-switch path now skips a schema fetch and an entity search it never used.
+Tests: 1,319 backend (48 new, covering clear requests, genuine ambiguity, typos,
+follow-up context, continuation, custom answers, duplicate submission, loops,
+fabricated record options, tool failure and malformed answers), 445 frontend.
+
+## DocuSign pack — the 17th, and the grouped-count presentation bug (2026-08-17)
+
+`brain/packs/docusign-integration.yaml`, compiled from the Dev9 DocuSign Apps
+Launcher implementation reference (`brain/sources/docusign-integration.txt`)
+with every claim re-grounded in production. The environment split is the
+pack's spine: production still sends via the old flow path with NO automatic
+writeback (statuses set by hand), while the new Gen-Template implementation
+with auto Field Value Updates lives in the sandbox, deployment not executed.
+Verified production facts the doc could not know: envelope tracking IS
+queryable (dfsle__EnvelopeStatus__c, 107 rows — 72 Completed / 33 Voided / 2
+Sent — with dfsle__SourceId__c linking to the source record); Onboarding__c
+holds 798 rows whose completed value is 'Onboarding Completed' (not the
+documented 'Onboarding Complete') plus an undocumented 'Inactive' exit; and
+the DS_* merge fields drift in spelling — three use '_Formate__c', two
+'_Formatted__c'. Three new metrics (envelopes by status, onboardings by
+status, service agreements signed — judged by the Signed flag alone because
+6 legacy rows are signed-but-never-marked-sent).
+
+The smoke test caught the GROUPED cousin of the aggregate bug: "completed vs
+voided?" ran a two-row grouped count and the summary profiled the rows as
+records — "Completed: 1 (50%)" — so the answer claimed 2 envelopes.
+`deterministic_summary` now detects the one-numeric + one-unique-label shape,
+pairs each label with its value (`row_breakdown`), drops the meaningless
+occurrence counts, and states the sum. Re-verified: the same question now
+answers 72 / 33. Also re-dropped `Background_Check_Module_PROD.txt` was
+byte-identical to the ingested copy — removed, nothing to redo.
+Tests: 1,284 passing.
+
+## Background Check pack — the 16th, and the swapped-error-message defect (2026-08-17)
+
+`brain/packs/background-check.yaml`, compiled from the production-verified
+module doc (`brain/sources/background-check-module.txt`) and re-checked
+against the warehouse the same day. The SQL traps it teaches: the offer
+track's record type API name is the MISSPELLED `Offer_Recived`; 28 of 68
+records predate record types and 20 predate `Stage__c` (state the
+population); the four signed/received "date" fields are TODAY()-formulas,
+not history (real dates live in field tracking); two distinct
+verification-status fields (3-value header, 4-value per-employer, no
+roll-up) and two distinct reference-contact models (Interview Ref_1..4 for
+notification, Employment Ref_1..3 for verification). The knowledge chunks
+carry the process end-to-end — automatic creation from interview outcomes
+(NOT DocuSign), the 4-hourly nag loop, the daily reference reminders, and
+the module's documented defect: 4 of 5 validation rules display the WRONG
+error message, so the pack teaches the REAL gates and tells the model to
+answer with the gate, not the misleading text. Verified end-to-end: "how
+many background checks are still pending payment verification?" → 36, with
+the population stated. Tests: 1,281 passing.
+
+## Production metadata in the brain: formulas, roll-ups, and save rules (2026-08-17)
+
+A production metadata retrieve (82 objects, 1,884 fields, 46 validation rules)
+landed in `brain/sources/prod-metadata/objects/`. New ingester
+`scripts/build_dictionary_from_metadata.py` parses it into the dictionary's
+own shape and — the part no export could provide — distills each formula into
+a compact read-only gist and each roll-up into its REAL definition including
+filter items (`Interviews_Ghosted__c` = "COUNT(Interview__c rows) where
+RecordTypeId equals Interview and Interview_Status__c equals Ghosted" — the
+class of fact behind most silently-wrong numbers). Deployed with the same
+two-pass safety as before: enrich-only, then add-new gated on real warehouse
+columns; 676 fields now carry production detail, 103 formula/roll-up gists,
+47 FLS-hidden fields correctly excluded. Backup at
+`/data/sf_dictionary.json.bak-20260817`.
+
+Layering note, verified live: hand-curated pack field notes still outrank the
+raw metadata (they carry production caveats the schema cannot know), and the
+gists fill the ~600 fields no pack covers. The check also caught a wrong
+auto-compiled note — `kb-billing-kb` claimed the QuickBooks links are built
+from the LEGACY empty `Invoice_Id__c`; the production formula proves it is
+`QB_Invoice_Id__c`. Fixed.
+
+The 38 ACTIVE validation rules became `brain/packs/prod-validation-rules.yaml`
+(15th pack, knowledge-only): "why did the save fail" questions now retrieve
+the actual rule and its error message. Production disagreed with the sandbox
+doc here too — e.g. `Recurring_Required_Fields` on Invoice__c is INACTIVE in
+production. Tests: 1,280 passing (7 new, `tests/test_metadata_dictionary.py`).
+
+## Training-module pack, and the aggregate that answered 1 instead of 866 (2026-08-17)
+
+**`brain/packs/training-module.yaml`** — compiled from the 32-page Training
+Module Handbook (`brain/sources/training-module.txt`), verified against the
+production warehouse field by field. What it adds on top of the existing
+training rules: the deliverable lifecycle ('Not Active' means waiting for its
+session, not pending work; 'Locked' is the overdue bucket — 869 rows; the data
+also holds 'Completed' off the documented picklist), Session-Window booking
+(booked > capacity is a legitimate admin override, not corruption), the
+Program-Version mock-governance knobs (a missed/failed mock result auto-drops
+the training by default — the likely answer to "why was X dropped"), the drop
+cascade, and the session AI-integrity suite (fields exist, `Analysis_Status__c`
+empty on all 3,101 rows — answer "not populated yet", never zeros). Fresh
+evidence for the Published trap: the ONLY Published Program Version is a demo.
+
+**Verifying the pack surfaced a real wrong-answer bug and its family.** "How
+many deliverables are locked?" was answered `1` (live path) while the org held
+866: an ungrouped `COUNT()` returns ONE synthetic row, and both figure
+pipelines published that row count as an authoritative `record_count`/
+`total_rows` next to the real value. Fixed in both: `sf_intel/tools.py`
+`calculate_result` now labels aggregate exprN columns from the compiled
+query's own expressions and promotes a COUNT to the record count
+(`QueryResult` gained `columns`); `engines/sql.py` `deterministic_summary`
+does the same for one-row all-numeric results. Third fix in the family:
+the sf_intel answer prompt withholds the SOQL, so the model doubted whether
+866 was filtered — `_population_line` now states the applied filters in the
+computed block. Verified end-to-end: the same question now answers "866 …
+where Status__c is 'Locked'".
+
+**Pack-rule stacking capped.** With 14 packs loaded (the 11 kb-* packs
+compiled 2026-08-16 from the org knowledge base, plus 3 curated ones), a
+multi-domain question stacked 22KB of grounding. `brain.rules_for` now takes
+whole rule blocks strongest-trigger-match-first under a 9KB budget.
+
+Tests: 1,273 passing (12 new). Image rebuilt and redeployed twice during the
+work; final state verified live.
+
+## Second brain pack: the Internal Interview platform (2026-08-12)
+
+`brain/packs/internal-interview.yaml`, compiled from the Salesforce team's
+production knowledge base (`brain/sources/internal-interview-platform.md`) and
+re-verified table-by-table against THIS production warehouse — which mattered
+twice. First, the document's reference counts came from a development org (113
+question-bank rows vs production's 805; 11 templates vs 1), so every
+data-shaped claim in the pack was re-grounded with live queries. Second, the
+verification surfaced the platform's biggest overstatement trap as a live
+number: 67 of 300 `Internal_Interview__c` rows are historical 'Rescheduled'
+shells (a reschedule creates a NEW interview+session pair and leaves the old
+one behind, chained by `Previous_internal_interview__c`) — the pack's first
+rule teaches the model to exclude them and say so. Also in: the question
+engine's junction "tick model" (`Niche_Question__c`/`Question_Section__c`/
+`Question_Interview_Type__c`; the direct `Question_Bank__c.Niche__c` columns
+are deprecated and empty on all 805 rows), Magic vs Template launch modes,
+mock-vs-OOT discrimination reconciled with the existing training rules
+(`Candidate_Training__c` marks portal mocks; kind is still the
+`Interview_Type__c` join), resume lifecycle, evaluations vs snapshot logs,
+schema-locked typos (`Final_Descion__c`), and Zoom-integration gotchas.
+Verified end-to-end: "how many questions per niche" now generates the
+canonical junction SQL. The pack went live through the bind mount with no
+restart — the mechanism working exactly as designed.
+
+## The Salesforce brain: knowledge as files, and learning from thumbs (2026-08-12)
+
+**Salesforce knowledge is now DATA the Salesforce team ships, not Python an
+engineer edits.** A new `brain/` folder holds raw developer knowledge files
+(`brain/sources/` — the first is the Invoice/Payment/QuickBooks reference that
+arrived as `informaton.txt`) and compiled packs (`brain/packs/*.yaml`) that
+`app/core/brain.py` loads from `/data/brain`, re-reading on file change so a
+dropped-in pack is live on the next question. A pack's five shapes land in the
+five places that already proved the pattern: `rules` join
+`org_brief.domain_rules_for`, `metrics` join the semantic layer, `tables` pin
+into the schema slice, `glossary`+`knowledge` ride the grounding (and RAG
+answers, and the sf_intel planner's schema summary), `field_notes` enrich the
+dictionary hints. Everything capped and best-effort: a malformed pack means
+less knowledge, never a broken request.
+
+**The first pack was verified against production before it was allowed to
+teach anything.** The source file documents the Dev11 sandbox, which runs
+ahead of production — `Amount_To_Recover__c`, the surcharge/settlement fields
+and `Linked_Recurring_Plan__c` do not exist in the warehouse, production still
+holds 71 pre-integration invoices with a NULL `Type__c`, and the data carries
+a `Payment_Status__c` value ('Scheduled') the documented picklist lacks. The
+pack teaches SQL only against verified columns, names the sandbox-only fields
+as not-synced-yet, and keeps the full process documentation as retrievable
+prose so "how does the recurring EMI plan work?" is answered from the
+Salesforce team's own words instead of "no data found".
+`scripts/compile_brain_source.py` bakes that discipline in for every future
+file: it drafts a pack from raw text and WARNS on any `__c` name the org
+dictionary cannot vouch for.
+
+**Thumbs now teach the SQL writer.** `messages.feedback` already sat next to
+`meta->>'sql'`; `core/learned_examples.py` + `db.list_confirmed_sql_examples`
+turn every 👍-rated answer into a few-shot example retrieved for similar
+questions (two per prompt, five-minute cache), and a 👎 on the same SQL text
+anywhere disqualifies it globally — contested examples are worse than none.
+
+**The stale dictionary was the quiet bug this surfaced.** The deployed
+`/data/sf_dictionary.json` predated the org: `Invoice__c` knew 64 of 76 real
+columns and the entire `Payment_Issue_*` suite was missing, so live SOQL had
+no vocabulary for disputes at all. Rebuilt as enrich-only from the AI-friendly
+export plus additions filtered to columns the warehouse demonstrably has
+(529 fields enriched, 113 added, backup kept in the volume).
+
+New knobs: `BRAIN_ENABLED`, `BRAIN_MAX_CHARS`, `LEARNED_EXAMPLES_ENABLED`,
+`LEARNED_EXAMPLES_K`; new mount `./brain/packs:/data/brain:ro` in both compose
+files. Tests: `orchestrator/tests/test_brain.py` (18, including the shipped
+pack). Design + research record: `docs/06-agent-design/SF-BRAIN.md`.
+
 ## A better loader, and questions that take several answers (2026-08-11)
 
 **One loading indicator, everywhere.** `components/Loader.tsx` replaced four

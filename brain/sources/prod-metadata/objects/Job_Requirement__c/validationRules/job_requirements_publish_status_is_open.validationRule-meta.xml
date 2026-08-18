@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ValidationRule xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>job_requirements_publish_status_is_open</fullName>
+    <active>true</active>
+    <errorConditionFormula>AND(
+ISPICKVAL(Website_Status__c, &quot;Published&quot;),
+NOT(ISPICKVAL(Job_Status__c, &quot;Open&quot;))
+)</errorConditionFormula>
+    <errorDisplayField>Website_Status__c</errorDisplayField>
+    <errorMessage>A job can only be published  when Job Status is Open.</errorMessage>
+</ValidationRule>

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -149,6 +150,26 @@ def _warehouse_summary(question: str) -> str:
         return ""
 
 
+def _brain_notes(question: str) -> str:
+    """Pack rules/glossary/knowledge for the planner's schema summary.
+
+    The planner writes filters, and the packs carry exactly the facts a
+    describe cannot: which column is the real cycle counter, which status
+    means what, which lookup a spoken phrase refers to. Best-effort.
+    """
+    try:
+        from .. import brain
+
+        parts = [
+            part
+            for part in (brain.rules_for(question), brain.grounding_extras(question))
+            if part
+        ]
+        return "\n\n".join(parts)
+    except Exception:  # noqa: BLE001 — knowledge is optional
+        return ""
+
+
 async def get_salesforce_schema(
     question: str, *, objects: Sequence[str] = ()
 ) -> Tuple[str, List[str]]:
@@ -184,11 +205,18 @@ async def get_salesforce_schema(
                     f"Standard: {', '.join(standard)}. "
                     f"Custom: {', '.join(custom)}."
                 )
-            return "\n\n".join(blocks), [o["name"] for o in available]
+            summary = "\n\n".join(blocks)
+            notes = _brain_notes(question)
+            if notes:
+                summary = f"{summary}\n\n{notes}" if summary else notes
+            return summary, [o["name"] for o in available]
         except Exception as exc:  # noqa: BLE001
             log.info("live schema summary unavailable: %s", str(exc)[:160])
 
     offline = _dictionary_summary(question) or _warehouse_summary(question)
+    notes = _brain_notes(question)
+    if notes:
+        offline = f"{offline}\n\n{notes}" if offline else notes
     return offline, []
 
 
@@ -267,6 +295,9 @@ class QueryResult:
     truncated: bool
     result_mode: str
     queried_at: str
+    #: The expressions the compiled query selected, in order. For aggregates
+    #: this is what lets calculate_result label the synthetic exprN columns.
+    columns: Tuple[str, ...] = ()
 
 
 async def compile_and_validate(plan: SalesforceQueryPlan) -> CompiledQuery:
@@ -369,6 +400,7 @@ async def execute_salesforce_query_plan(
         truncated=truncated or len(rows) > MAX_TOTAL_RECORDS,
         result_mode=compiled.result_mode,
         queried_at=queried_at,
+        columns=compiled.columns,
     )
 
 
@@ -437,4 +469,38 @@ def calculate_result(result: QueryResult, *, group_by: str = "") -> Dict[str, An
         computed["counts_cover"] = (
             "the records retrieved, not necessarily every matching record"
         )
+
+    # An UNGROUPED aggregate returns ONE synthetic row (totalSize 1) whose
+    # values ARE the answer. Publishing record_count=1 next to it is how "how
+    # many deliverables are locked?" was answered `1` while the org held 866 —
+    # the model quoted the figure it was told is authoritative. Label each
+    # exprN with the expression that produced it, and promote a COUNT to the
+    # real record_count.
+    aggregate_columns = [
+        c for c in result.columns
+        if re.match(r"(COUNT|COUNT_DISTINCT|SUM|AVG|MIN|MAX)\s*\(", c, re.I)
+    ]
+    if aggregate_columns and not group_by and len(result.rows) == 1:
+        row = result.rows[0]
+        labeled: Dict[str, Any] = {}
+        for index, expression in enumerate(aggregate_columns):
+            value = row.get(f"expr{index}")
+            if value is None and len(aggregate_columns) == 1 and len(row) == 1:
+                value = next(iter(row.values()))  # single aliased aggregate
+            if value is not None:
+                labeled[expression] = value
+        if labeled:
+            computed["aggregate_values"] = labeled
+            computed.pop("rows_examined", None)
+            counts = [v for e, v in labeled.items() if e.upper().startswith("COUNT")]
+            if counts:
+                try:
+                    computed["record_count"] = int(float(str(counts[0]).replace(",", "")))
+                except (TypeError, ValueError):
+                    pass
+            else:
+                computed.pop("record_count", None)
+                computed["matching_record_count"] = (
+                    "not queried — the aggregate values above are the answer"
+                )
     return computed

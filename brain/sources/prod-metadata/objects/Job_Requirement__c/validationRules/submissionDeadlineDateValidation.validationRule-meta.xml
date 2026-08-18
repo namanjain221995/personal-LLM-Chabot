@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ValidationRule xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>submissionDeadlineDateValidation</fullName>
+    <active>false</active>
+    <description>This validation rule is triggered when Submission_Deadline__c is equal to or earlier than the Job Requirement record&apos;s Created Date.</description>
+    <errorConditionFormula>Submission_Deadline__c  &lt;=  DATETIMEVALUE( CreatedDate )</errorConditionFormula>
+    <errorDisplayField>Submission_Deadline__c</errorDisplayField>
+    <errorMessage>Submission Deadline should be in future (at least later than today)</errorMessage>
+</ValidationRule>

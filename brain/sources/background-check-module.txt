@@ -1,0 +1,791 @@
+================================================================================
+BACKGROUND CHECK MODULE - HOW IT WORKS
+Techsara Solutions Salesforce org
+Documented from org "prod" (jay.thakkar@techsarasolutions.com) + local source
+Date: 2026-08-17
+
+FIELD SECTIONS (7, 8, 9) EXCLUDE THE 12 DOCUSIGN MERGE FIELDS CREATED BY
+JENISH GANGANI. Every other field is documented, with its creator and date.
+================================================================================
+
+--------------------------------------------------------------------------------
+0. QUICK ANSWER TO "HOW IS IT CREATED - IS IT DOCUSIGN?"
+--------------------------------------------------------------------------------
+
+NO. DocuSign does not create the Background Check record.
+
+The Background Check record is created AUTOMATICALLY BY A FLOW, triggered off the
+Interview__c record. Nobody clicks "New Background Check" in normal operation.
+
+    Recruiter sets Interview__c.Interview_Outcome__c
+      = "Offer Received"  OR  = "Reference Check"
+                |
+                v
+    Flow "Background Check: Creation, Queue Routing, and Stage Progression"
+    (record-triggered, after-save, on Interview__c)
+                |
+                v
+    Background_Check__c record is INSERTED, owned by a QA queue,
+    and an email goes to that queue.
+
+DocuSign is used at ONE point only, and it is much later in the process:
+sending the ACH Authorization form and the Promissory Note to the candidate
+for e-signature. That is the flow "Send ACH and Promissory", which is a
+BUTTON a user clicks on an already-existing Background Check record.
+
+So the order is:  Interview outcome -> Flow creates BG Check -> ... -> DocuSign.
+Not:              DocuSign -> BG Check.
+
+Important detail: DocuSign does NOT write the signature result back.
+Nothing in this org flips ACH_Authorization_Status__c or Promissory_Note_Status__c
+from "Pending" to "Signed". A QA user sets those picklists by hand once the
+signed envelope comes back. (Verified: the only metadata with a dependency on
+Background_Check__c is 8 flows, 1 quick action, 1 flexipage and 1 email
+template - no Apex, no trigger, no DocuSign write-back component.)
+
+
+--------------------------------------------------------------------------------
+1. THE OBJECTS INVOLVED
+--------------------------------------------------------------------------------
+
+Background_Check__c            "Background Check"     Name format: BCN-{00000}
+  The header record. One per interview outcome that needs vetting.
+  Sharing: Private externally / Read-Write internally. History tracking ON.
+
+Background_Check_Employment__c "Background Check Employment"  (key prefix a1O)
+  Child of Background_Check__c. One row per past employer/project that has to
+  be verified, each carrying up to 3 reference contacts.
+  Its page layout is called "Background Check Project Layout" and its record
+  pages are named "Background Check Project ..." - so in the UI you will see
+  the word "Project" for what the API calls "Employment". Same thing.
+  Records are created MANUALLY from the related list on the Background Check
+  record. There is no automation that creates them.
+
+Related lookups FROM Background_Check__c:
+  Candidate__c   -> Account   (the candidate; org uses Person Accounts)
+  Interview__c   -> Interview__c  (the interview that produced this outcome)
+  Session__c     -> Session__c    (a scheduled call about this BG check)
+
+Related lookups TO Background_Check__c:
+  Background_Check_Employment__c.Background_Check__c  (master list of employers)
+  Session__c.Background_Check__c                      (sessions booked for it)
+
+
+--------------------------------------------------------------------------------
+2. TWO TRACKS: RECORD TYPES
+--------------------------------------------------------------------------------
+
+The module runs two parallel tracks off the same object. Which one you get
+depends on the interview outcome.
+
+  RECORD TYPE "Offer_Recived"   (label: Offer Recived - yes, misspelled in the org)
+    Created when Interview_Outcome__c = "Offer Received"
+    Stage__c = "Offer Received" (the field default)
+    Owner: queue QA_Background_Check_Queue
+    This is the FULL track: payment -> documents -> candidate details ->
+    verification -> completed.
+    Compact layout: "Offer Recived"
+    Path assistant: "Background Check Offer"
+
+  RECORD TYPE "Reference_Check"
+    Created when Interview_Outcome__c = "Reference Check"
+    Stage__c = "Reference Check"
+    Interview_Round__c is copied from Interview__c.Round__c
+    Owner: queue QA_Reference_Check_Queue
+    This is the LIGHT track: just chase the referees. It is deliberately
+    excluded from the 4-hourly pending-items nagging (see flow 4) and is
+    instead driven by two daily scheduled reminders (flows 7 and 8).
+    Compact layout: "Reference Check Compact"
+    Path assistant: "Background Check Reference"
+
+A third path assistant, "Background Check" (__MASTER__), covers records with
+no record type. All three paths drive off Background_Check_Status__c.
+
+
+--------------------------------------------------------------------------------
+3. END-TO-END PROCESS
+--------------------------------------------------------------------------------
+
+STEP 1 - CREATION (automatic)
+  Trigger: Interview__c is UPDATED and Interview_Outcome__c becomes
+           "Offer Received" or "Reference Check".
+  The flow first checks whether a Background Check already exists for that
+  interview at that stage. If one exists, it stops - so re-saving the
+  interview will not create duplicates.
+  New record is stamped with:
+      Background_Check_Status__c   = "Payment Verification Pending"
+      Offer_Letter_Payment_Status__c = "Pending"
+      ACH_Authorization_Status__c    = "Pending"
+      Promissory_Note_Status__c      = "Pending"
+      Candidate_Details_Status__c    = "Pending"
+      Verification_Status__c         = "Not Started"
+      Notification_Active__c         = TRUE
+      Candidate__c                   = Interview's candidate
+      Interview__c                   = the interview
+      OwnerId                        = the matching QA queue
+      RecordTypeId                   = Offer_Recived or Reference_Check
+  An email is sent to the queue address announcing the new record.
+
+STEP 2 - A QA USER TAKES OWNERSHIP
+  The record sits in a queue. On the record page there is a quick action
+  "Accept Record" which simply ticks Assigned_to_QA__c = TRUE.
+  That tick fires the before-save flow "Background Change: Queue to QA
+  Assignment", which sets OwnerId = the current user.
+  Net effect: one click moves the record out of the queue and onto the person.
+
+STEP 3 - COLLECT THE MONEY (Offer Received track)
+  QA chases the offer-letter payment. When it lands they set
+  Offer_Letter_Payment_Status__c = "Received".
+  Offer_Letter_Payment_Received_Date__c fills in by formula.
+  Only then may Background_Check_Status__c move to "Documents Pending".
+
+STEP 4 - SEND THE DOCUMENTS VIA DOCUSIGN
+  On the Background Check record, quick action "Send ACH and Promissory"
+  launches the screen flow of the same name.
+  Screen 1 "Review ACH and Promissory Details" asks the user for 7 required
+  payment-plan values:
+      Debit Amount / Monthly Installment Amount
+      Total Amount to be Paid / Principal Sum
+      Payment Period (Months) / Number of Monthly Installments
+      ACH Debit Date (Each Month)
+      Payment Commencement Date
+      First Installment Due Date
+      Final Payment Due Date
+  These write to the DS_* merge fields on Background_Check__c - the DocuSign
+  field set, excluded from section 7 by request.
+  The same screen shows, READ-ONLY, the candidate's identity, address and
+  banking details pulled from the Account, so the sender can eyeball them
+  before sending. Those live on Account, not on Background Check.
+  Button label is "Send Agreement".
+  The flow then saves the 7 values onto the Background Check and calls the
+  DocuSign managed-package action:
+      dfsle__EnvelopeConfigurationBulkRequest
+      envelopeConfigurationId = Custom Label ACH_and_Promissory_Template_ID
+                                (current value: a1mO1000002KBcTIAW)
+      sourceId                = this Background Check record Id
+  A success screen confirms the envelope went out.
+
+  ** CROSS-ORG WARNING ** The DocuSign template Id is a hard-coded Custom Label
+  value. It is org-specific. Deploying this label to preprod/dev10 without
+  changing the value will point at a template that does not exist there.
+
+STEP 5 - MARK THE DOCUMENTS SIGNED (manual)
+  When the signed envelope comes back, QA sets
+      ACH_Authorization_Status__c = "Signed"
+      Promissory_Note_Status__c   = "Signed"
+  The two "Signed Date" fields fill in by formula.
+  Only then may Background_Check_Status__c move to "Candidate Details Pending".
+
+STEP 6 - BUILD THE EMPLOYMENT HISTORY
+  QA adds Background_Check_Employment__c child records - one per past
+  employer/project - each with employer name, project name, start/end dates,
+  a "Current Employer" flag, and up to 3 reference contacts
+  (name / phone / email / designation).
+  At least ONE child record must exist before Candidate_Details_Status__c can
+  be set to "Submitted" (enforced by the roll-up Background_Check_Project_Count__c).
+
+STEP 7 - VERIFY
+  Each Background_Check_Employment__c has its own Verification_Status__c
+  (Not Started / In Progress / Verified / Unable to Verify), Verification_Notes__c
+  and an Employer_Confirmed__c checkbox.
+  On the header, Verification_Status__c (Not Started / In Progress / Completed)
+  tracks the overall effort and Final_Employer_Confirmation_Received__c is
+  ticked when the last employer confirms. Both are set by hand - there is no
+  roll-up from the children to the header status.
+
+STEP 8 - COMPLETE
+  Background_Check_Status__c = "Completed" is allowed only when
+  Verification_Status__c = "Completed" AND Final_Employer_Confirmation_Received__c
+  is ticked.
+
+STEP 9 - SESSIONS (optional, any time)
+  Quick action "Create Session" launches the "Background Check Session Creation"
+  screen flow, which books a Session__c with Purpose__c = "Background Check",
+  Status__c = "Unscheduled", linked back to this Background Check and candidate.
+  Host = the Recruiter__c whose Email__c matches the running user.
+  Additional Attendee 1 = the Recruiter__c matching the CANDIDATE'S owner.
+  Note this flow strips a trailing ".invalid" off the owner's email before
+  matching - a sandbox-specific fix, because sandbox User.Email carries the
+  ".invalid" suffix but Recruiter__c.Email__c does not.
+
+
+--------------------------------------------------------------------------------
+4. THE REFERENCE CHECK TRACK (the lighter second track)
+--------------------------------------------------------------------------------
+
+When an interview outcome is "Reference Check", two things happen in parallel:
+
+  a) A Background_Check__c with record type Reference_Check is created in
+     the QA_Reference_Check_Queue (as described above).
+
+  b) On the INTERVIEW record itself, flow "Interview Notify Reference Contacts"
+     emails the referees. That flow fires when
+        Interview_Status__c  = "Completed"  AND
+        Interview_Outcome__c = "Reference Check"
+     and walks Ref 1 -> Ref 2 -> Ref 3 -> Ref 4, emailing each one that has an
+     email address and has not already been notified, then ticking
+     Ref_N_Notified__c so it never emails the same person twice.
+     Subject: "You have been listed as a reference - Techsara Solutions"
+     Sent from noreply@techsarasolutions.com.
+     Each send has a fault path so one bad address does not stop the rest.
+
+     NOTE: the four reference blocks (Ref_1..Ref_4) used by this notification
+     live on Interview__c. The three reference blocks (Ref_1..Ref_3) used for
+     actual verification live on Background_Check_Employment__c. They are
+     separate sets of fields on separate objects - do not confuse them.
+
+  c) Flow "Interview Reset Reference Notified On Email Change" watches
+     Interview__c on every update. If any Ref_N_Email__c changes, it clears
+     that referee's Ref_N_Notified__c flag - so the new address gets emailed
+     on the next qualifying save.
+
+Then the record is chased daily by the two scheduled reminders until
+Reference_Check_Completed__c is ticked.
+
+
+--------------------------------------------------------------------------------
+5. FLOW INVENTORY - HOW MANY AND WHAT THEY DO
+--------------------------------------------------------------------------------
+
+There are 8 flows that operate directly on Background_Check__c,
+plus 2 supporting flows on Interview__c that drive the reference-check side.
+10 in total. All are ACTIVE. There is NO Apex and NO trigger in this module.
+
+--- CORE 8 (touch Background_Check__c) ---
+
+1. Background_Check_Creation_Queue_Routing_and_Stage_Progression
+   Label   : "Background Check: Creation, Queue Routing, and Stage Progression"
+   Type    : Auto-launched, record-triggered AFTER SAVE on Interview__c, on UPDATE
+   Version : 21 (active)
+   Entry   : Interview_Outcome__c = "Offer Received" OR "Reference Check"
+   Purpose : THE CREATOR. Branches on outcome, checks for an existing BG check
+             at that stage, looks up the right queue + record type, inserts the
+             Background_Check__c with all the "Pending" defaults, and emails
+             the queue with a deep link to the new record.
+   Note    : Despite "Stage Progression" in the name, this flow does not move
+             stages after creation. Stage movement is manual, gated by the
+             validation rules in section 6.
+
+2. Background_Change_Queue_to_QA_Assignment
+   Label   : "Background Change: Queue to QA Assignment"
+   Type    : Auto-launched, record-triggered BEFORE SAVE on Background_Check__c,
+             on UPDATE
+   Version : 1 (active)
+   Entry   : Assigned_to_QA__c = TRUE (and only when the record just changed
+             to meet that criterion)
+   Purpose : Sets OwnerId = $User.Id. This is the "claim from queue" mechanism.
+             Before-save, so it costs no extra DML.
+
+3. Send_ACH_and_Promissory
+   Label   : "Send ACH and Promissory"
+   Type    : SCREEN flow, launched from a quick action on the record
+   Version : 22 (active)
+   Purpose : THE DOCUSIGN STEP. Collects the 7 payment-plan values, writes them
+             to the record, then calls dfsle__EnvelopeConfigurationBulkRequest
+             with the template Id from Custom Label ACH_and_Promissory_Template_ID.
+             See section 3 step 4 for full detail.
+
+4. BG_Check_Pending_Notifications
+   Label   : "BG Check Pending Notifications"
+   Type    : Auto-launched, record-triggered AFTER SAVE on Background_Check__c,
+             on CREATE AND UPDATE, plus a SCHEDULED PATH
+   Version : 30 (active)
+   Entry   : Offer_Letter_Payment_Status__c = Pending
+             OR ACH_Authorization_Status__c = Pending
+             OR Promissory_Note_Status__c   = Pending
+             OR Notification_Active__c      = TRUE
+   Purpose : THE NAGGER. Two jobs:
+             (a) On every save it rebuilds Pending_Items_Summary__c as a
+                 comma-separated list from whichever of the three statuses are
+                 still "Pending", and sets Notification_Active__c accordingly.
+                 If nothing is pending any more it clears the summary and
+                 switches Notification_Active__c off.
+             (b) A scheduled path runs 4 HOURS AFTER Last_Notification_Sent__c.
+                 If items are still pending AND Send_Pending_Notifications__c is
+                 ticked AND Stage__c is NOT "Reference Check", it sends:
+                   - an email to the candidate owner and the BG check owner
+                   - a Slack DM to the BG check owner (or, if the owner is
+                     still a queue rather than a user, a message to Slack
+                     channel C0B6G9B9UJ1)
+                   - a Slack DM to the candidate owner
+                 then re-stamps Last_Notification_Sent__c, which re-arms the
+                 4-hour path. That is the loop: every 4 hours until resolved.
+   Note    : Slack app/workspace come from Custom Labels Slack_APP_ID and
+             Slack_WorkSpace_ID. The channel id C0B6G9B9UJ1 is hard-coded in
+             the flow - same cross-org hazard as the DocuSign template.
+   Note    : Reference Check records are explicitly excluded here (they use
+             flows 6/7/8 instead).
+
+5. Background_Check_Session_Creation
+   Label   : "Background Check Session Creation"
+   Type    : SCREEN flow, launched from the "Create Session" quick action
+   Version : 20 (active) - most recently changed flow in the module (2026-08-14)
+   Purpose : Books a Session__c against the Background Check. Asks for date,
+             time zone, start time, end time and an optional second attendee.
+             See section 3 step 9.
+
+6. Send_Reference_Check_Reminder
+   Label   : "Send Reference Check Reminder"
+   Type    : Auto-launched SUBFLOW (takes recordId as input)
+   Version : 4 (active)
+   Purpose : Sends one "Reference Check pending - action needed" email for one
+             Background Check. Works out whether the owner is a real user
+             (Id starts with 005) or the queue, and addresses the mail to the
+             QA_Reference_Check_Queue plus that owner.
+             Called by flows 7 and 8. Not scheduled itself.
+
+7. Reference_Check_Reminder_3_30_AM_IST
+   Type    : Auto-launched, SCHEDULED, daily, from 2026-07-09
+   Version : 1 (active)
+   Entry   : Stage__c = "Reference Check" AND Reference_Check_Completed__c = FALSE
+   Purpose : Calls subflow 6 for every matching record.
+   Timing  : stored start time 18:00 - this is ORG LOCAL (Eastern) time, i.e.
+             6:00 PM ET, which is 3:30 AM IST during EDT. In EST (winter) the
+             same 6:00 PM ET reads as 4:30 AM IST. The flow NAME is the IST
+             reading of a fixed Eastern time; nothing needs changing at DST.
+
+8. Reference_Check_Reminder_6_30_PM_IST
+   Type    : Auto-launched, SCHEDULED, daily, from 2026-07-09
+   Version : 1 (active)
+   Entry   : same as 7
+   Purpose : same as 7 - second daily pass.
+   Timing  : stored start time 09:00 = 9:00 AM ET = 6:30 PM IST in EDT.
+
+--- SUPPORTING 2 (on Interview__c, drive the reference-check side) ---
+
+9. Interview_Notify_Reference_Contacts
+   Type    : Auto-launched, record-triggered AFTER SAVE on Interview__c,
+             CREATE AND UPDATE
+   Version : 7 (active)
+   Entry   : Interview_Status__c = "Completed"
+             AND Interview_Outcome__c = "Reference Check"
+   Purpose : Emails Ref 1-4 on the interview, marks each Ref_N_Notified__c.
+             See section 4(b).
+
+10. Interview_Reset_Reference_Notified_On_Email_Change
+   Type    : Auto-launched, record-triggered BEFORE SAVE on Interview__c, UPDATE
+   Version : 1 (active)
+   Entry   : none (runs on every update, decides internally)
+   Purpose : Clears Ref_N_Notified__c whenever Ref_N_Email__c changes, so a
+             corrected address gets re-notified. See section 4(c).
+
+--- NOT PART OF THE LIVE PROCESS ---
+
+   Interview_Offer_Received  - exists in the org but is INACTIVE (version 1,
+   IsActive = false). An older approach, superseded by flow 1. Ignore it.
+
+
+--------------------------------------------------------------------------------
+6. VALIDATION RULES - THE STAGE GATES
+--------------------------------------------------------------------------------
+
+Five active validation rules on Background_Check__c enforce the order of the
+process. Every one of them is skipped entirely when EITHER
+Before_Background_Check__c OR C2C_Submission__c is ticked - those two
+checkboxes are the escape hatch (candidate already vetted before joining, or a
+corp-to-corp submission where the payment/document steps do not apply).
+
+The gates, in the order the process actually runs:
+
+  To set Background_Check_Status__c = "Documents Pending"
+      requires Offer_Letter_Payment_Status__c = "Received"
+      (rule Require_CandidateDetail_For_Verification)
+
+  To set Background_Check_Status__c = "Candidate Details Pending"
+      requires ACH_Authorization_Status__c = "Signed"
+           AND Promissory_Note_Status__c   = "Signed"
+      (rule Require_Documents_For_Candidate_Details)
+
+  To set Candidate_Details_Status__c = "Submitted"
+      requires at least one Background_Check_Employment__c child record
+      (Background_Check_Project_Count__c > 0)
+      (rule Require_Verification_For_Completed)
+
+  To set Background_Check_Status__c = "Verification In Progress"
+      requires Candidate_Details_Status__c = "Submitted"
+      (rule Require_Payment_For_Documents_Pending)
+
+  To set Background_Check_Status__c = "Completed"
+      requires Verification_Status__c = "Completed"
+           AND Final_Employer_Confirmation_Received__c = TRUE
+      (rule Require_Project_For_Candidate_Submitted)
+
+  All five also require ISCHANGED on the status field, so they only bite on
+  the transition, not on unrelated edits.
+
+  *** KNOWN DEFECT - READ THIS ***
+  Four of the five rules carry the WRONG error message. The LOGIC is correct
+  (the gates above are what actually happens), but the names and the messages
+  were shuffled relative to the logic. Users hitting a gate will be told to fix
+  the wrong thing. Specifically:
+
+    Require_CandidateDetail_For_Verification
+      really gates : Documents Pending needs payment Received
+      but says     : "Candidate Details Status must be Submitted before moving
+                      to Verification In Progress."
+
+    Require_Payment_For_Documents_Pending
+      really gates : Verification In Progress needs Candidate Details Submitted
+      but says     : "Offer Letter Payment Status must be Received before
+                      moving to Documents Pending."
+      (these first two have each other's messages)
+
+    Require_Project_For_Candidate_Submitted
+      really gates : Completed needs Verification Completed + employer confirmation
+      but says     : "At least one related Background Check Employment must
+                      exist before submitting Candidate Details."
+
+    Require_Verification_For_Completed
+      really gates : Candidate Details Submitted needs >=1 Employment record
+      but says     : "Verification Status must be Completed and Final Employer
+                      Confirmation must be received before completing the
+                      Background Check."
+      (these two also have each other's messages)
+
+    Require_Documents_For_Candidate_Details is the only one whose name,
+    message and logic agree.
+
+  Some errorDisplayField settings are also pointed at the wrong field, so the
+  red error text can appear next to a field that is not the problem.
+  Fixing this is a text-only change to the five rules - no logic change needed.
+
+
+--------------------------------------------------------------------------------
+7. FIELD REFERENCE - Background_Check__c (30 fields)
+--------------------------------------------------------------------------------
+
+The object carries 42 live custom fields. The 12 DocuSign merge fields (DS_*)
+created by Jenish Gangani are excluded by request. The remaining 30 are below.
+
+Creators:  Jay Thakkar 28   |   Jayesh Prajapati 2
+
+IDENTITY AND LINKS
+  Name                              AutoNumber BCN-{00000}.
+        Label "Background Check  ID" (note the double space).
+  Candidate__c                      Jay Thakkar, 2026-04-27
+        Lookup -> Account. The candidate. Set by flow 1 at creation.
+  Interview__c                      Jay Thakkar, 2026-04-27
+        Lookup -> Interview__c. The source interview. Set by flow 1.
+  Session__c                        Jay Thakkar, 2026-05-12
+        Lookup -> Session__c. A session booked about this check.
+  Summary__c                        Jay Thakkar, 2026-07-07
+        FORMULA text: "FirstName LastName - Stage - Company".
+        A human-readable label for the record.
+  Company_Name__c                   Jay Thakkar, 2026-07-07
+        FORMULA text = Interview__r.company_new__r.Name.
+        The client company the candidate interviewed with.
+  Interview_Round__c                Jay Thakkar, 2026-07-04
+        Text(100). Copied from Interview__c.Round__c at creation, but only on
+        the Reference Check track.
+  Stage__c                          Jay Thakkar, 2026-07-04
+        Picklist, restricted: "Reference Check" | "Offer Received" (default).
+        Which of the two tracks the record is on.
+  Stage_Detail__c                   Jay Thakkar, 2026-07-06
+        FORMULA text. On Reference Check shows "Round: <round>"; otherwise
+        "Offer Letter: <payment status>". Display-only, used in compact layouts.
+
+MAIN STATUS
+  Background_Check_Status__c        Jay Thakkar, 2026-04-27
+        Picklist, restricted, history-tracked. The master status, and the field
+        all three Path assistants drive off:
+            Payment Verification Pending  (initial)
+            Documents Pending
+            Candidate Details Pending
+            Verification In Progress
+            Completed
+  Background_Check_Type__c          Jay Thakkar, 2026-07-01
+        Multi-select picklist, restricted. Org label is "Verification Type"
+        (the local source file still says "Background Check Type").
+        Values: Background Verification | I9 Verification | Visa Assessment.
+        Set manually - nothing populates it automatically.
+
+PAYMENT AND DOCUMENTS
+  Offer_Letter_Payment_Status__c    Jay Thakkar, 2026-04-27
+        Picklist, history-tracked: Pending | Received. Set to Pending at
+        creation. The gate for moving to "Documents Pending".
+  Offer_Letter_Payment_Received_Date__c   Jay Thakkar, 2026-05-28
+        FORMULA date. TODAY() while status = Received, else blank.
+        NOTE: being a formula, it always shows TODAY - not the date the payment
+        actually landed. It is not a historical record. (Replaced an earlier
+        plain date field of the same name, now soft-deleted as *_del.)
+  ACH_Authorization_Status__c       Jay Thakkar, 2026-04-27
+        Picklist, history-tracked: Pending | Signed.
+        Set by hand after the DocuSign envelope returns.
+  ACH_Authorization_Signed_Date__c  Jay Thakkar, 2026-05-28
+        FORMULA date, same TODAY() caveat as above.
+  Promissory_Note_Status__c         Jay Thakkar, 2026-04-27
+        Picklist, history-tracked: Pending | Signed.
+  Promissory_Note_Signed_Date__c    Jay Thakkar, 2026-05-28
+        FORMULA date, same TODAY() caveat.
+
+EMPLOYMENT / VERIFICATION
+  Candidate_Details_Status__c       Jay Thakkar, 2026-04-27
+        Picklist, history-tracked: Pending | In Progress | Submitted.
+        Tracks whether the candidate has handed over their employment history.
+        Cannot reach Submitted with zero child records.
+  Background_Check_Project_Count__c Jayesh Prajapati, 2026-04-28
+        ROLL-UP SUMMARY. COUNT of Background_Check_Employment__c children.
+        Exists purely to power the "at least one employment row" gate.
+  Verification_Status__c            Jay Thakkar, 2026-04-27
+        Picklist, history-tracked: Not Started | In Progress | Completed.
+        Overall verification progress. Set manually - it does NOT roll up from
+        the per-employment Verification_Status__c.
+  Final_Employer_Confirmation_Received__c   Jay Thakkar, 2026-04-27
+        Checkbox, history-tracked. Ticked when the last employer confirms.
+        The gate for moving to "Completed".
+  Final_Employer_Confirmation_Date__c       Jay Thakkar, 2026-05-28
+        FORMULA date, TODAY() while the box is ticked. Same caveat as the
+        other formula dates.
+  QA_Notes__c                       Jay Thakkar, 2026-04-27
+        Long text (32,768). Free-form QA working notes.
+
+QUEUE / OWNERSHIP
+  Assigned_to_QA__c                 Jayesh Prajapati, 2026-05-04
+        Checkbox. On-screen label is "Accept this record from Queue".
+        Ticking it fires flow 2, which makes you the owner. Set via the
+        "Accept Record" quick action, which force-sets it to True.
+
+NOTIFICATIONS
+  Notification_Active__c            Jay Thakkar, 2026-05-26
+        Checkbox. Maintained by flow 4. TRUE while at least one of the three
+        statuses is Pending. Also part of that flow's entry criteria.
+  Send_Pending_Notifications__c     Jay Thakkar, 2026-06-30
+        Checkbox. Org label is "Received Background Notifications" (the local
+        source file still says "Send Pending Notifications"). This is the
+        OPT-IN SWITCH: flow 4 only sends the 4-hourly email/Slack burst when
+        this is ticked.
+  Last_Notification_Sent__c         Jay Thakkar, 2026-05-26
+        DateTime. The clock the 4-hour scheduled path counts from. Re-stamped
+        after each send, which is what makes the reminder repeat.
+  Pending_Items_Summary__c          Jay Thakkar, 2026-05-26
+        Text area. Rebuilt on every save by flow 4 - a comma-separated list
+        such as "Offer Letter Payment Pending, ACH Authorization Pending,
+        Promissory Note Pending". Cleared when everything is resolved. Quoted
+        in the emails and Slack messages.
+
+REFERENCE CHECK TRACK
+  Reference_Check_Completed__c      Jay Thakkar, 2026-07-08
+        Checkbox. While FALSE, the two daily scheduled reminders (flows 7 and
+        8) keep chasing this record. Tick it to stop them.
+
+VALIDATION BYPASSES
+  Before_Background_Check__c        Jay Thakkar, 2026-07-02
+        Checkbox. Ticking it disables ALL FIVE validation rules on the record.
+        For candidates already vetted before joining.
+        ** This field exists in the org but is MISSING from local source under
+        force-app/main/default/objects/Background_Check__c/fields/.
+        A deploy from this repo will not create it. **
+  C2C_Submission__c                 Jay Thakkar, 2026-07-07
+        Checkbox. Same effect - disables all five rules. For corp-to-corp
+        submissions where the payment and document steps do not apply.
+
+
+--------------------------------------------------------------------------------
+8. FIELD REFERENCE - Background_Check_Employment__c (21 fields)
+--------------------------------------------------------------------------------
+
+Jay Thakkar built this entire object - all 21 custom fields. None excluded.
+
+  Name                     AutoNumber.
+  Background_Check__c      2026-04-27  Lookup -> Background_Check__c. The parent.
+  Employer_Name__c         2026-04-27  Text. The past employer.
+  Project_Name__c          2026-04-27  Text. The project worked on there.
+  Start_Date__c            2026-04-27  Date.
+  End_Date__c              2026-04-27  Date.
+  Present__c               2026-07-01  Checkbox, label "Current Employer".
+                                       Tick instead of filling End Date.
+  Verification_Status__c   2026-04-27  Picklist: Not Started | In Progress |
+                                       Verified | Unable to Verify.
+                                       Per-employer outcome. Note this picklist
+                                       has FOUR values and is a different field
+                                       from the header's three-value
+                                       Verification_Status__c.
+  Verification_Notes__c    2026-04-27  Text area. What the verifier found.
+  Employer_Confirmed__c    2026-04-27  Checkbox. This specific employer
+                                       confirmed the record.
+
+  Reference 1 / 2 / 3 - identical shape each, all created 2026-07-01:
+      Ref_1_Name__c          Ref_2_Name__c          Ref_3_Name__c          Text
+      Ref_1_Designation__c   Ref_2_Designation__c   Ref_3_Designation__c   Text
+      Ref_1_Email__c         Ref_2_Email__c         Ref_3_Email__c         Email
+      Ref_1_Phone__c         Ref_2_Phone__c         Ref_3_Phone__c         Phone
+
+  Layout sections: "Employment Information", "Reference 1 Details",
+  "Reference 2 Details", "Ref 3 Details", "System Information".
+
+
+--------------------------------------------------------------------------------
+9. FIELD REFERENCE - Interview__c fields this module depends on (24)
+--------------------------------------------------------------------------------
+
+THE TRIGGER AND ITS CONTEXT
+  Interview_Outcome__c     Mitesh Prajapati, 2026-03-13
+        Picklist: Moved to Next Round | Rejected | Ghosted | Reference Check |
+        Offer Received | NA.
+        THE TRIGGER. "Reference Check" and "Offer Received" are the two values
+        that cause a Background Check to be created.
+  Interview_Status__c      Sahil Patel, 2024-08-21
+        Picklist: Scheduled | Completed | Rescheduled | Cancelled | No Show.
+        Must be "Completed" for the referee emails to go out.
+  Round__c                 Sahil Patel, 2024-08-20
+        Picklist: Initial | First | Second ... Final.
+        Copied into Background_Check__c.Interview_Round__c on the Reference
+        Check track.
+  Company_Name__c          Khushi Ghorawath, 2026-04-29
+        Text. Quoted in the queue emails and the referee emails.
+
+THE FOUR REFEREE BLOCKS - all Jay Thakkar, 2026-07-09 (16 fields)
+      Ref_1_Name__c   Ref_1_Designation__c   Ref_1_Email__c   Ref_1_Phone__c
+      Ref_2_Name__c   Ref_2_Designation__c   Ref_2_Email__c   Ref_2_Phone__c
+      Ref_3_Name__c   Ref_3_Designation__c   Ref_3_Email__c   Ref_3_Phone__c
+      Ref_4_Name__c   Ref_4_Designation__c   Ref_4_Email__c   Ref_4_Phone__c
+        The referee contact details emailed by flow 9. Each block's four
+        values are quoted back to the referee in the email body.
+
+THE IDEMPOTENCY GUARDS - all Jay Thakkar, 2026-07-23 (4 fields)
+      Ref_1_Notified__c   Ref_2_Notified__c
+      Ref_3_Notified__c   Ref_4_Notified__c
+        Checkboxes. Set by flow 9 after a referee is emailed, so nobody is
+        emailed twice. Cleared by flow 10 when that referee's email address
+        changes. Added two weeks after the referee blocks themselves - the
+        original flow had no duplicate protection.
+
+
+--------------------------------------------------------------------------------
+10. SUPPORTING METADATA
+--------------------------------------------------------------------------------
+
+QUEUES
+  QA_Background_Check_Queue    Owner of new Offer Received records.
+  QA_Reference_Check_Queue     Owner of new Reference Check records.
+                               Name in metadata: "QA Reference  Check Queue"
+                               (double space). Email:
+                               jayesh.prajapati@techsarasolutions.com.
+                               Sends email to members. One member.
+  ** Per existing org notes: do NOT deploy the reference-check queue across orgs. **
+
+QUICK ACTIONS on Background_Check__c (3)
+  Create_Session               Flow action -> Background_Check_Session_Creation
+  Send_ACH_and_Promissory      Flow action -> Send_ACH_and_Promissory
+  Accept_Record                Update action, force-sets Assigned_to_QA__c = True,
+                               success message "You are now the owner of this record."
+  Reminder: a Flow-type quick action disappears entirely for any profile that
+  cannot run the underlying flow. If a user says the button is missing, check
+  flow access before checking the layout.
+
+RECORD PAGES (FlexiPages)
+  Background_Check_Record_Page1     the ACTIVE one (set as the View override for
+                                    both Large and Small form factors)
+  Background_Check_Record_Page      older
+  Background_Check_Employment_Record_Page / _Page1 / _Page2
+  Background_Check_Project_Record_Page
+
+PAGE LAYOUTS
+  "Background Check Layout"          sections: Background Check / Payment &
+                                     Authorization / Employer Confirmation /
+                                     Notifications (x2) / ACH Authorization Form /
+                                     Promissory Note / Information / System Information.
+                                     Related lists: Background Check Employment,
+                                     Sessions, Activities, History, Notes.
+  "Background Check Project Layout"  for Background_Check_Employment__c.
+
+  ** DEFECT: the Background Check Layout still references TIME__c. That field
+     was created by Jay Thakkar on 2026-07-24 and has since been DELETED - it
+     is absent from the object describe, SOQL rejects it, and it survives only
+     as a soft-deleted row in the Tooling API. The layout reference is stale
+     and should be removed. **
+
+COMPACT LAYOUTS
+  Background_Check_Compact     Name, Stage, Stage Detail, Status, Candidate, Owner
+  Offer_Recived                Name, Interview, Offer Letter Payment Status,
+                               Status, Candidate, Company, Stage
+  Reference_Check_Compact      Name, Stage, Interview, Interview Round,
+                               Candidate, Company
+
+LIST VIEWS
+  All                                  everything
+  QA_Background_Check_Queue_Background_Check   filterScope = Queue, bound to
+                                       QA_Background_Check_Queue, shared to all
+                                       internal users
+
+PATH ASSISTANTS (3, all active, all on Background_Check_Status__c)
+  Background_Check            __MASTER__
+  Background_Check_Offer      record type Offer_Recived
+  Background_Check_Reference  record type Reference_Check
+
+PERMISSION SET
+  BG_Check_Company_Field  ("BG Check Company Field")
+      Company_Name__c            read only
+      Summary__c                 read only
+      C2C_Submission__c          read/edit
+      Reference_Check_Completed__c  read/edit
+  Note the two formula fields are read-only by definition; the two checkboxes
+  are the ones this set actually grants. Anyone who has to tick
+  Reference_Check_Completed__c to stop the daily reminders needs this set.
+
+CUSTOM LABELS USED
+  ACH_and_Promissory_Template_ID   = a1mO1000002KBcTIAW  (DocuSign template, org-specific)
+  Slack_APP_ID                     (used by flow 4)
+  Slack_WorkSpace_ID               (used by flow 4)
+
+EMAIL TEMPLATE
+  BG_Check_Pending_Reminder        references Background_Check__c
+
+MANAGED PACKAGE
+  DocuSign eSignature, namespace "dfsle". Only one action is used:
+  dfsle__EnvelopeConfigurationBulkRequest.
+
+
+--------------------------------------------------------------------------------
+11. THINGS TO WATCH OUT FOR
+--------------------------------------------------------------------------------
+
+1. Validation-rule messages are wrong on 4 of 5 rules (section 6). The gates
+   work; the error text misleads. Text-only fix.
+
+2. The Background Check Layout points at TIME__c, a field created 2026-07-24
+   and since deleted.
+
+3. Before_Background_Check__c exists in the org but NOT in local source.
+   A deploy from this repo will not create it, and the five validation rules
+   reference it - so deploying those rules to an org without the field will
+   fail to compile.
+
+4. Two hard-coded, org-specific values sit inside this module:
+     - DocuSign template Id in Custom Label ACH_and_Promissory_Template_ID
+     - Slack channel C0B6G9B9UJ1 inside BG_Check_Pending_Notifications
+   Both must be re-pointed before deploying to preprod or dev10, and both fail
+   SILENTLY (the alert just goes nowhere).
+
+5. The four "Signed/Received Date" fields are FORMULAS returning TODAY() while
+   the corresponding status holds. They are not an audit trail - they change
+   every day. If you need the real date, use the field history (all four status
+   fields are history-tracked) rather than these formulas.
+   All four are a 2026-05-28 rebuild of earlier plain date fields, which still
+   sit soft-deleted in the org as *_del.
+
+6. Nothing writes back from DocuSign. Somebody has to look at the signed
+   envelope and set the two picklists by hand, or the record stalls and the
+   4-hourly reminder loop keeps firing.
+
+7. Two different reference-contact models exist. Interview__c has FOUR
+   (Ref_1..Ref_4, with _Notified__c flags, used for the "you are a reference"
+   emails). Background_Check_Employment__c has THREE (Ref_1..Ref_3, no
+   notified flags, used for actual verification). Unrelated field sets.
+
+8. Background_Check_Employment__c is labelled "Background Check Employment" on
+   the object but "Background Check Project" on its layout and record pages,
+   and the roll-up on the parent is Background_Check_Project_Count__c.
+   Employment == Project throughout.
+
+9. The record-type API name is "Offer_Recived" (missing the 'e'). Any flow,
+   formula or query that references it must use the misspelling.
+
+10. Per existing org notes on Background Check cross-org deploys: record types
+    deploy invisible, fields deploy without FLS, and the reference-check queue
+    should not be deployed. Budget a manual profile/permission-set pass after
+    any cross-org deploy of this module.
+
+================================================================================
+END
+================================================================================

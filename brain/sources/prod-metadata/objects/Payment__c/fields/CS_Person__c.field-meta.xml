@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>CS_Person__c</fullName>
+    <deleteConstraint>SetNull</deleteConstraint>
+    <inlineHelpText>The CS team member who worked this payment issue (stamped by the Manage Payment Issue flow).</inlineHelpText>
+    <label>CS Person</label>
+    <referenceTo>User</referenceTo>
+    <relationshipLabel>Payments (CS Person)</relationshipLabel>
+    <relationshipName>Payments_CS_Person</relationshipName>
+    <required>false</required>
+    <trackFeedHistory>false</trackFeedHistory>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Lookup</type>
+</CustomField>

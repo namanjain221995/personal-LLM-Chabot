@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Bank_Account_Last4__c</fullName>
+    <description>Masked last 4 digits of the customer&apos;s bank account as returned by QuickBooks Payments. Full account/routing numbers are NEVER stored in Salesforce.</description>
+    <externalId>false</externalId>
+    <inlineHelpText>Masked last 4 digits returned by QuickBooks after the bank account is created. No full bank numbers are stored here.</inlineHelpText>
+    <label>Bank Account (Last 4)</label>
+    <length>12</length>
+    <required>false</required>
+    <trackFeedHistory>false</trackFeedHistory>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Text</type>
+    <unique>false</unique>
+</CustomField>

@@ -990,3 +990,91 @@ def test_an_empty_block_is_skipped_rather_than_sent_as_whitespace():
     ]
     built = run(budget.build(blocks, budget=budget.ContextBudget(100_000, 1024, 256)))
     assert len(built.messages) == 1
+
+
+# ── Ungrouped aggregates: the value IS the answer ────────────────────────────
+# "how many deliverables are locked?" ran SELECT COUNT(Id) ... and was answered
+# `1` while the org held 866: Salesforce returns ONE synthetic row for an
+# ungrouped aggregate, calculate_result published record_count=1 as an
+# authoritative figure, and the answer model quoted it. These pin the fix.
+
+
+def _aggregate_result(rows, columns, result_mode="count", total_size=1):
+    return tools.QueryResult(
+        soql="SELECT COUNT(Id) FROM Deliverable__c",
+        object_api_name="Deliverable__c",
+        rows=rows,
+        total_size=total_size,
+        pages=1,
+        truncated=False,
+        result_mode=result_mode,
+        queried_at="2026-08-17T00:00:00+00:00",
+        columns=columns,
+    )
+
+
+def test_an_ungrouped_count_reports_the_count_value_not_the_row_count():
+    result = _aggregate_result([{"expr0": 866}], ("COUNT(Id)",))
+    computed = tools.calculate_result(result)
+    assert computed["record_count"] == 866
+    assert computed["aggregate_values"] == {"COUNT(Id)": 866}
+    # rows_examined=1 was the misleading co-figure; it must not survive.
+    assert "rows_examined" not in computed
+
+
+def test_a_single_aliased_aggregate_still_finds_its_value():
+    result = _aggregate_result([{"total": 866}], ("COUNT(Id)",))
+    computed = tools.calculate_result(result)
+    assert computed["record_count"] == 866
+
+
+def test_an_ungrouped_sum_never_claims_a_record_count():
+    result = _aggregate_result(
+        [{"expr0": 123456.78}], ("SUM(Payment_Amount__c)",), result_mode="aggregate"
+    )
+    computed = tools.calculate_result(result)
+    assert "record_count" not in computed
+    assert computed["aggregate_values"] == {"SUM(Payment_Amount__c)": 123456.78}
+    assert "not queried" in computed["matching_record_count"]
+
+
+def test_grouped_aggregates_keep_the_group_row_semantics():
+    result = _aggregate_result(
+        [{"Status__c": "Locked", "expr0": 866}, {"Status__c": "Active", "expr0": 107}],
+        ("Status__c", "COUNT(Id)"),
+        result_mode="aggregate",
+        total_size=2,
+    )
+    computed = tools.calculate_result(result, group_by="Status__c")
+    # Two GROUPS returned; the per-group counts live in the groups breakdown.
+    assert computed["record_count"] == 2
+    assert "aggregate_values" not in computed
+
+
+def test_a_records_mode_result_is_untouched_by_the_aggregate_path():
+    result = _aggregate_result(
+        [{"Id": "a1", "Name": "x"}], ("Id", "Name"), result_mode="records"
+    )
+    computed = tools.calculate_result(result)
+    assert computed["record_count"] == 1
+    assert "aggregate_values" not in computed
+
+
+def test_the_population_line_states_the_filters_already_applied():
+    from app.core.sf_intel.models import QueryFilter, SalesforceQueryPlan
+
+    plan = SalesforceQueryPlan(
+        object_api_name="Deliverable__c",
+        result_mode="count",
+        filters=[QueryFilter(field="Status__c", operator="eq", value="Locked")],
+    )
+    line = sf_intel._population_line(plan)
+    assert "Status__c" in line and "Locked" in line
+    assert "already apply" in line
+
+
+def test_a_plan_without_filters_adds_no_population_noise():
+    from app.core.sf_intel.models import SalesforceQueryPlan
+
+    plan = SalesforceQueryPlan(object_api_name="Deliverable__c", result_mode="count")
+    assert sf_intel._population_line(plan) == ""

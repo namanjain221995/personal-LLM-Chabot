@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ValidationRule xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Lead_Conversion_Validation</fullName>
+    <active>true</active>
+    <errorConditionFormula>AND(
+ISPICKVAL(Status, &quot;Converted&quot;),
+ISCHANGED(Status),
+NOT(Flow_Only_Field__c)
+)</errorConditionFormula>
+    <errorMessage>Avoid converting lead from here. Use the &apos;Convert Lead&apos; button.</errorMessage>
+</ValidationRule>

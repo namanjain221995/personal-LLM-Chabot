@@ -1,0 +1,2139 @@
+# Compiled 2026-08-16 from brain/sources/techsara-org-knowledge-base.txt (preprod org documentation, 71 objects) by the brain ingestion pipeline: deterministic section/field parsing, every field name validated against the production dictionary + warehouse table list, rules distilled and adversarially verified. Fields the production warehouse lacks are only ever mentioned as explicit not-synced caveats.
+# Domain: PART 1 — verifier verdict: ship_with_fixes.
+name: kb-core-people
+description: 'Teaches the people-and-companies core: the three-flavor Account hub
+  (candidates vs employee portal identities vs B2B client companies), Lead intake
+  and governed conversion, the Recruiter__c "Employee" staff registry and org chart,
+  and why Contact and User are only platform plumbing.'
+triggers:
+- lead
+- leads
+- lead conversion
+- convert lead
+- prospect
+- prospects
+- lead source
+- person account
+- person accounts
+- employee
+- employees
+- recruiter
+- recruiters
+- org chart
+- reporting line
+- headcount
+- work authorization
+- visa
+- opt
+- cpt
+- h1b
+- green card
+- placed
+- referral
+- referrals
+- portal user
+- portal login
+- candidate status
+- assigned recruiter
+- former employee
+tables:
+- Account
+- Lead
+- Recruiter__c
+- User
+- Contact
+- AccountContactRelation
+rules: 'A candidate = Account with IsPersonAccount and RecordType DeveloperName
+  ''PersonAccount''; ''Recruiter''-type person accounts are employee portal logins,
+  never candidates; B2B Client/Vendor types = client companies.
+
+  Candidate_Status__c: In Progress|Active|Hold|Paused|Placed|Terminate|Closed|Resigned;
+  employee ''Recruiter'' accounts are also ''Active'' - filter record type first.
+
+  Interview counts: rollups Total_Number_of_Interview__c, Total_Number_of_Initial_Calls__c,
+  Interviews_Ghosted__c, Interviews_Rejected__c; Total_Interviews__c, Total_Number_of_Interviews__c,
+  Total_Number_of_Applications__c, Total_Training_Sessions__c are unmaintained -
+  never use.
+
+  On Account: Work_Authorization__c is the maintained work-auth column (OPT dominates);
+  Current_Visa_Status__c is sparse legacy; candidate track = Technology__c (near-dupes
+  like ''Ai/ML'').
+
+  Lookups: Account.Assigned_Recruiter__c -> Recruiter__c (Employee, NOT User); Account.Candidate_Referral__c
+  -> Account; Recruiter__c.Assigned_Sr_Recruiter__c -> Recruiter__c (org chart);
+  Recruiter__c.Recruiter_Contact__c -> Account (their own person account).
+
+  Recruiter__c (label ''Employee'') is the staff registry; current staff = Employment_Status__c
+  ''Active Employee''. User is only the login (ManagerId empty on all).
+
+  Candidate questions use Account, never Contact: Contacts are ~98% hidden person-account
+  shadows for portal logins.
+
+  Lead converted = Status ''Converted''; custom shadows Email__c, Lead_Status__c,
+  Rating__c, Lead_Category__c are unused - use standard Email/Status/Rating; Company
+  is trigger-blanked.
+
+  ''Create Interview'' on Account/Lead creates Internal_Interview__c, not Interview__c.
+
+  Current_State_in_USA__c (Account+Lead) is not synced to production - answer conceptually
+  and say so.
+
+  Never state preprod counts/percentages as production facts.'
+glossary:
+  person account: A person-shaped Account record; in this org it is either a candidate
+    ('PersonAccount' record type) or an employee's portal identity ('Recruiter'
+    record type), never a company.
+  employee: The Recruiter__c object (label 'Employee') - Techsara's internal staff
+    registry that all work assignment points at; distinct from the Salesforce User
+    login.
+  recruiter: Either a Techsara staff member working candidates (a Recruiter__c row)
+    or the 'Recruiter' Account record type marking an employee's portal person account
+    - never a job-seeking candidate.
+  assigned recruiter: 'The employee working a candidate: Account.Assigned_Recruiter__c
+    pointing at Recruiter__c, auto-synced from the candidate''s Marketing engagement.'
+  placed: The success endpoint of Candidate_Status__c - the candidate landed a job;
+    rare in preprod data so far.
+  prospect: The legacy Lead record type holding nearly the whole historical B2C
+    candidate-sales book; treat it as the same flavor as 'B2C Prospective Candidate'.
+  conversion: Turning a Lead into a candidate Person Account via the governed Convert
+    flow, which dedupes on email or phone; B2B client leads convert to business
+    Accounts instead.
+  org chart: The company reporting tree encoded by chaining Recruiter__c.Assigned_Sr_Recruiter__c
+    ('Reporting to') self-lookups; active employees only.
+  former employee: Employment_Status__c value for departed staff, who are kept in
+    the database for history and excluded from the org chart.
+  AIC portal: The Experience Cloud community most staff actually log in through;
+    each portal User is enabled on the employee's own person account contact.
+  marketing email: The dedicated inbox Techsara creates to apply to jobs on a candidate's
+    behalf (Marketing_Email_Id__c), separate from the candidate's personal email.
+  shadow contact: The hidden Contact automatically owned by every Person Account,
+    existing only so portal logins can attach to it - never queried for candidate
+    questions.
+field_notes:
+  Account:
+    Name: For Person Accounts the name splits into FirstName/LastName (plus Salutation);
+      for business accounts it is the company name. Required.
+    FirstName: For Person Accounts the name splits into FirstName/LastName (plus
+      Salutation); for business accounts it is the company name. Required.
+    LastName: For Person Accounts the name splits into FirstName/LastName (plus
+      Salutation); for business accounts it is the company name. Required.
+    PersonEmail: THE candidate email (98% populated) - the identity key the lead-convert
+      dedupe and the portals match on.
+    Phone: Standard phone fields; Phone is the working number (75% populated).
+    PersonMobilePhone: Standard phone fields; Phone is the working number (75% populated).
+    PersonHomePhone: Standard phone fields; Phone is the working number (75% populated).
+    PersonOtherPhone: Standard phone fields; Phone is the working number (75% populated).
+    OwnerId: Record owner. Shown read-only on the candidate page. 378 records are
+      owned by inactive users - a pending cleanup in the security redesign.
+    RecordTypeId: Which of the six flavors this record is (read-only on the page).
+    IsPersonAccount: TRUE for candidate/employee person records (1,002 of 1,013).
+    ParentId: Standard account hierarchy - used with the "Child Account" action
+      for business accounts.
+    Industry: The candidate's target industry (read-only on the candidate page;
+      copied to/from Onboarding). Standard values.
+    AccountSource: Standard classification fields, lightly used; AccountSource carries
+      the marketing channel values (LinkedIn, Website, Referral types...).
+    PersonLeadSource: Standard classification fields, lightly used; AccountSource
+      carries the marketing channel values (LinkedIn, Website, Referral types...).
+    Rating: Standard classification fields, lightly used; AccountSource carries
+      the marketing channel values (LinkedIn, Website, Referral types...).
+    Type: Standard classification fields, lightly used; AccountSource carries the
+      marketing channel values (LinkedIn, Website, Referral types...).
+    Ownership: Standard classification fields, lightly used; AccountSource carries
+      the marketing channel values (LinkedIn, Website, Referral types...).
+    BillingAddress: Standard compound addresses; BillingAddress is copied onto Onboarding.
+    ShippingAddress: Standard compound addresses; BillingAddress is copied onto
+      Onboarding.
+    PersonMailingAddress: Standard compound addresses; BillingAddress is copied
+      onto Onboarding.
+    PersonOtherAddress: Standard compound addresses; BillingAddress is copied onto
+      Onboarding.
+    Description: Present but not meaningfully used by Techsara processes; the custom
+      fields below carry the real data (e.g. Date_of_Birth__c is used instead of
+      PersonBirthdate).
+    PersonBirthdate: Present but not meaningfully used by Techsara processes; the
+      custom fields below carry the real data (e.g. Date_of_Birth__c is used instead
+      of PersonBirthdate).
+    PersonTitle: Present but not meaningfully used by Techsara processes; the custom
+      fields below carry the real data (e.g. Date_of_Birth__c is used instead of
+      PersonBirthdate).
+    PersonDepartment: Present but not meaningfully used by Techsara processes; the
+      custom fields below carry the real data (e.g. Date_of_Birth__c is used instead
+      of PersonBirthdate).
+    Website: Present but not meaningfully used by Techsara processes; the custom
+      fields below carry the real data (e.g. Date_of_Birth__c is used instead of
+      PersonBirthdate).
+    NumberOfEmployees: Present but not meaningfully used by Techsara processes;
+      the custom fields below carry the real data (e.g. Date_of_Birth__c is used
+      instead of PersonBirthdate).
+    AnnualRevenue: Present but not meaningfully used by Techsara processes; the
+      custom fields below carry the real data (e.g. Date_of_Birth__c is used instead
+      of PersonBirthdate).
+    Fax: Present but not meaningfully used by Techsara processes; the custom fields
+      below carry the real data (e.g. Date_of_Birth__c is used instead of PersonBirthdate).
+    Sic: Present but not meaningfully used by Techsara processes; the custom fields
+      below carry the real data (e.g. Date_of_Birth__c is used instead of PersonBirthdate).
+    SicDesc: Present but not meaningfully used by Techsara processes; the custom
+      fields below carry the real data (e.g. Date_of_Birth__c is used instead of
+      PersonBirthdate).
+    Site: Present but not meaningfully used by Techsara processes; the custom fields
+      below carry the real data (e.g. Date_of_Birth__c is used instead of PersonBirthdate).
+    TickerSymbol: Present but not meaningfully used by Techsara processes; the custom
+      fields below carry the real data (e.g. Date_of_Birth__c is used instead of
+      PersonBirthdate).
+    Jigsaw: Present but not meaningfully used by Techsara processes; the custom
+      fields below carry the real data (e.g. Date_of_Birth__c is used instead of
+      PersonBirthdate).
+    AccountNumber: Present but not meaningfully used by Techsara processes; the
+      custom fields below carry the real data (e.g. Date_of_Birth__c is used instead
+      of PersonBirthdate).
+    PersonAssistantName: Present but not meaningfully used by Techsara processes;
+      the custom fields below carry the real data (e.g. Date_of_Birth__c is used
+      instead of PersonBirthdate).
+    PersonAssistantPhone: Present but not meaningfully used by Techsara processes;
+      the custom fields below carry the real data (e.g. Date_of_Birth__c is used
+      instead of PersonBirthdate).
+    PersonDoNotCall: Present but not meaningfully used by Techsara processes; the
+      custom fields below carry the real data (e.g. Date_of_Birth__c is used instead
+      of PersonBirthdate).
+    PersonHasOptedOutOfEmail: Present but not meaningfully used by Techsara processes;
+      the custom fields below carry the real data (e.g. Date_of_Birth__c is used
+      instead of PersonBirthdate).
+    PersonHasOptedOutOfFax: Present but not meaningfully used by Techsara processes;
+      the custom fields below carry the real data (e.g. Date_of_Birth__c is used
+      instead of PersonBirthdate).
+    PersonGenderIdentity: Present but not meaningfully used by Techsara processes;
+      the custom fields below carry the real data (e.g. Date_of_Birth__c is used
+      instead of PersonBirthdate).
+    PersonPronouns: Present but not meaningfully used by Techsara processes; the
+      custom fields below carry the real data (e.g. Date_of_Birth__c is used instead
+      of PersonBirthdate).
+    PersonLastCURequestDate: Present but not meaningfully used by Techsara processes;
+      the custom fields below carry the real data (e.g. Date_of_Birth__c is used
+      instead of PersonBirthdate).
+    PersonLastCUUpdateDate: Present but not meaningfully used by Techsara processes;
+      the custom fields below carry the real data (e.g. Date_of_Birth__c is used
+      instead of PersonBirthdate).
+    IsCustomerPortal: Present but not meaningfully used by Techsara processes; the
+      custom fields below carry the real data (e.g. Date_of_Birth__c is used instead
+      of PersonBirthdate).
+    SourceSystemIdentifier: Present but not meaningfully used by Techsara processes;
+      the custom fields below carry the real data (e.g. Date_of_Birth__c is used
+      instead of PersonBirthdate).
+    Candidate_Status__c: 'THE candidate lifecycle field: In Progress | Active |
+      Hold | Paused | Placed | Terminate | Closed | Resigned. Set by users and by
+      the marketing-sync flow (Marketing status changes mirror here) and the Pause/Stop
+      and'
+    Candidate_Status_Change_Reason__c: WHY the status changed - typed by the user,
+      enforced >=50 chars for any non-Active change, then chattered by Candidate_Status_Change_Log.
+    Reason_for_Hold__c: Reason the candidate is on Hold/Paused - written by the
+      marketing-status sync flow (copying the Marketing record's hold/pause reasons)
+      and by the Onboarding_record_Inactive screen flow.
+    Assigned_Recruiter__c: The Techsara recruiter (Employee record, NOT a User)
+      working this candidate. Auto-synced from the Marketing engagement by Marketing_Update_Assigned_Recruiter_on_Candidate.
+    Candidate_Owner_Name__c: Owner.FirstName + Owner.LastName - a plain-text owner
+      name for reports and for copying onto Onboarding at creation.
+    Candidate_Referral__c: Self-lookup to the candidate who REFERRED this one. Set
+      during lead conversion when the intake says "referred by an existing candidate".
+      21% populated - referrals are a significant channel.
+    Employee_Referral__c: Free-text name of the Techsara employee who referred the
+      candidate (intake answer copied by the lead-conversion flow).
+    Acquaintances_Using_Our_Services__c: 'Intake answer: names of friends/acquaintances
+      already using Techsara - a referral-mining question from the lead form.'
+    Application_Start_Date__c: The day active marketing (daily job applications)
+      STARTED for this candidate - stamped by Marketing_Update_Application_Start_Date_on_
+      Candidate when the Marketing status goes active.
+    Days_since_application_started__c: TODAY() - Application_Start_Date__c. How
+      long the candidate has been in active marketing.
+    Expected_No_of_Interviews__c: 'The pacing target: 5 interviews within the first
+      15 days of marketing, then +10 for every further 30 days. Compared against
+      the interview rollups in reports to spot under-performing engagements.'
+    Last_Alert_Sent__c: When the nightly AccountSchedulerJob last sent the "no interview
+      scheduled" Slack/email alert for this candidate - the job uses it as a 15-day
+      throttle so the same alert is not repeated daily.
+    Internal_Interview__c: Pointer to a candidate's internal screening interview.
+      Never populated in practice (0 records) - the reverse lookup from Internal_Interview__c.Candidate__c
+      is what is actually used.
+    Middle_Name__c: Candidate's middle name (standard person name has no middle-name
+      slot the org uses; also feeds the DocuSign DS_ block).
+    Date_of_Birth__c: Candidate DOB - synced from the Onboarding form; read-only
+      on the candidate page for everyone. Sensitive - FLS-restricted. 42% populated.
+      (Used instead of the standard PersonBirthdate.)
+    Date_of_Arrival__c: When the candidate arrived in the US (most candidates are
+      international students on OPT). Synced from the Onboarding form.
+    Last_4_digits_of_SSN__c: Last four SSN digits for background-check / I-9 style
+      verification. Synced from the Onboarding form. Sensitive - check FLS before
+      exposing.
+    Passport_Number__c: Passport number, again for verification paperwork. Synced
+      from the Onboarding form; copied onto Onboarding at creation. Sensitive.
+    Secondary_Email__c: Backup personal email (PersonEmail is primary). Copied to
+      Onboarding.
+    Secondary_Phone__c: Backup phone number. Copied to Onboarding.
+    Email_replica__c: Formula copy of PersonEmail - exists so automation/reports
+      that cannot read PersonEmail directly (or need a text type) can use it.
+    Slack_User_Id__c: The person's Slack member ID. Populated on EMPLOYEE Person
+      Accounts (the "Recruiter" record type flavor) by Create_Recruiter_Contact
+      / Provision_Employee_Portal_User so Slack automations can @-mention them.
+    Current_Address__c: The candidate's current US address - the primary address
+      field, written at lead conversion, edited on the page, and pushed to QuickBooks
+      as the customer billing address by the Send Invoice flow.
+    Home_Address__c: Home-country / permanent address (distinct from the current
+      US one).
+    Address_Line_1__c: Legacy flat address parts predating the compound Current_Address__c.
+      Kept for old records and form mappings.
+    Complete_Address__c: Concatenates the Current_Address__c parts (street, city,
+      state, zip) into one display line for reports/emails.
+    Race_Ethnicity__c: 'Standard US EEO self-identification: American Indian or
+      Alaska Native | Asian | Black or African American | Hispanic or Latino | Native
+      Hawaiian or Other Pacific Islander | White | Two or More Races | Other (please'
+    Military_Status__c: 'EEO question: Active Duty | Reserve or National Guard |
+      Veteran | Retired Military | Military Spouse | No Military Service | Prefer
+      not to say. Synced from Onboarding.'
+    Disability_Status__c: 'EEO question: Yes, I have a disability or previously
+      had a disability | No, I do not have a disability | Prefer not to say. Synced
+      from Onboarding.'
+    Criminal_Record_Declaration__c: 'Self-declaration from the intake form: "I do
+      NOT have any criminal record" | "I have a criminal record". Captured at lead
+      conversion.'
+    Acknowledgement_Declaration__c: Candidate acknowledged the terms/declaration
+      on the intake form. Currently 0 records checked - effectively unused (verify
+      with team).
+    Work_Authorization__c: 'THE operative work-auth field: CPT | OPT | H1B | H4
+      | Green Card | USC | Other | OPT - Initial | OPT - STEM. Synced from the Onboarding
+      form; read-only on the candidate page.'
+    Work_Authorization_Expiry_Date__c: When the authorization expires (critical
+      for OPT/CPT candidates whose placement clock is ticking). Synced from Onboarding;
+      read-only on page.
+    Current_Visa_Status__c: 'Older/parallel visa field from the lead intake: CPT
+      | OPT | STEM OPT Extension | H1B | B2 | Green Card EAD | Green Card / Permanent
+      Resident | US Citizen.'
+    Authorized_To_Work_In_US__c: Simple yes/no work-auth flag from the intake form.
+      Barely used (8 checked).
+    Sponsorship_Required_For_VISA__c: Whether the candidate will need visa sponsorship
+      from an employer. Barely used (3 checked).
+    Active_CPT__c: Candidate currently holds active CPT work authorization (relevant
+      for B2B submission screening). 3 checked.
+    Technology__c: The candidate's professional track/role - a long picklist (Account
+      Manager, AI/ML Engineer, Business Analyst, Data Engineer, DevOps, Financial
+      Analyst, Full Stack Developer, Java Developer, and ~15 more).
+    Niche__c: 'Newer, coarser niche classification: AI ML Engineer | Python Developer/Engineer
+      | Java Fullstack Developer/Engineer | Product/ Project Manager | Marketing
+      Manager | Finance Analyst | Other.'
+    Niche_Other__c: Free-text niche when Niche__c = "Other".
+    Targeted_Experience_Level__c: 'Seniority the marketing targets for this candidate:
+      Entry Level | Associate | Mid-Senior level | Director | Executive (mirrors
+      LinkedIn''s experience-level filter).'
+    Total_Years_of_Experience__c: Years of professional experience (24% populated).
+      Copied to Onboarding.
+    Current_Job_Position__c: The candidate's current/most recent job title.
+    Currently_Employed__c: Whether the candidate is employed right now (intake answer;
+      3 checked - most candidates are job-seeking students).
+    List_of_Certifications__c: Certifications the candidate holds (AWS, PMP, etc.)
+      - resume material.
+    Preferred_Job_Type__c: Remote | Hybrid | On-site (the candidate page's work-mode
+      field).
+    Preferred_Work_Mode__c: 'Near-duplicate of the above ("Remote | Hybrid | Onsite"
+      - the value set even carries stray quote characters). Help text: Remote =
+      fully remote, Hybrid = mix, Onsite = full time at client.'
+    Preferred_Locations__c: Comma-separated preferred work locations ("New Jersey,
+      New York, Texas" or "Remote Only" or "Open to Relocation") - help text gives
+      exactly that example. Yet another generation of the location preference.
+    Open_to_relocate__c: Willing to relocate for a job - synced from Onboarding.
+      42% checked.
+    Relocation_Readiness__c: 'Richer intake version: Yes, I am willing to relocate
+      anywhere in the USA | Yes, but only within specific states (mention in comments)
+      | No, I prefer remote / local positions only | Other. Set at lead conversion.'
+    Relocation_Other__c: Free-text detail when Relocation Readiness = "Other".
+    Notice_Period__c: 'How soon the candidate can start: Immediate | 1 Week | 2
+      Weeks | 30 Days | 60 Days. Help text tells recruiters to keep it current.'
+    Day_to_day_availability_for_interviews__c: Free-text availability windows the
+      scheduling team uses when booking interviews (e.g. "after 2pm ET weekdays").
+    Job_Seeking_Intensity__c: 1-digit score of how actively the candidate is job
+      hunting - captured at lead conversion (screening call assessment).
+    Communication_Skills_Rating__c: 1-digit communication rating from the screening
+      call - set during lead conversion. ~10% populated.
+    Salary_Expectations__c: Free-text salary expectation ("120k", "60/hr C2C") -
+      synced from Onboarding.
+    Current_Rate_Expectation__c: 'Numeric rate expectation: hourly for contractors,
+      annual for full-time (per help text). The B2B submission flows read it when
+      proposing rates.'
+    No_of_Degrees__c: How many degrees the candidate holds - drives how many of
+      the slots below get filled. Read-only on the candidate page (synced from Onboarding).
+    College_Name__c: Institution names for degree slots 1-5 (slot 1 = most recent/primary).
+    College_Name_2__c: Institution names for degree slots 1-5 (slot 1 = most recent/primary).
+    College_Name_3__c: Institution names for degree slots 1-5 (slot 1 = most recent/primary).
+    College_Name_4__c: Institution names for degree slots 1-5 (slot 1 = most recent/primary).
+    College_Name_5__c: Institution names for degree slots 1-5 (slot 1 = most recent/primary).
+    Degree_Start_Date__c: Start/end dates for each degree slot - education-verification
+      data for background checks and resume building.
+    Degree_Start_Date_2__c: Start/end dates for each degree slot - education-verification
+      data for background checks and resume building.
+    Degree_Start_Date_3__c: Start/end dates for each degree slot - education-verification
+      data for background checks and resume building.
+    Degree_Start_Date_4__c: Start/end dates for each degree slot - education-verification
+      data for background checks and resume building.
+    Degree_End_Date_2__c: Start/end dates for each degree slot - education-verification
+      data for background checks and resume building.
+    Degree_End_Date_3__c: Start/end dates for each degree slot - education-verification
+      data for background checks and resume building.
+    Degree_End_Date_4__c: Start/end dates for each degree slot - education-verification
+      data for background checks and resume building.
+    Degree_End_Date_5__c: Start/end dates for each degree slot - education-verification
+      data for background checks and resume building.
+    Marketing_Email_Id__c: The dedicated email inbox Techsara creates/uses to apply
+      to jobs ON BEHALF OF the candidate (separate from the candidate's personal
+      PersonEmail). Synced from Onboarding; 51% populated.
+    Marketing_Email_Password__c: Password for that marketing inbox - encrypted at
+      rest, visible only to users with view-encrypted-data rights. Deliberately
+      NOT synced by the onboarding flow (encrypted fields cannot be flow-mapped).
+    LinkedIn_Profile_URL__c: Public LinkedIn profile link (18% populated). Copied
+      to Onboarding.
+    Project_Understanding_Document__c: Link/notes of the candidate's "project understanding"
+      doc - their project story used in interviews. Auto-COPIED ONTO every new Interview__c
+      by the Copy_Project_Understanding_Document_from_Candidate flow so support
+    Resume_Ready__c: 'Gate for B2B: checked only after the resume is verified current,
+      formatted, and approved for client submission (help text). Read by the B2B
+      submission flows. 3 checked so far - the B2B pipeline is new.'
+    Active_for_B2B_Submission__c: The candidate is actively looking and may be submitted
+      to B2B job requirements; unchecked when placed/unavailable (help text). The
+      B2B candidate-search screens filter on it. 3 checked so far.
+    Default_Vendor__c: Default proxy-support vendor for this candidate's interviews.
+      Populated on exactly 1 record - effectively unused.
+    Interview_Support__c: Flags that the candidate generally receives interview
+      support (5 checked). Not referenced by any flow/Apex in the snapshot (not
+      fully documented - verify with team).
+    Previously_Engaged_with_Other_Consultanc__c: 'Intake: has the candidate worked
+      with another consultancy before? (API name truncated at 40 chars.) 1 checked.'
+    Other_Consultancies_Name__c: Which consultancies, when the above is checked.
+    Upfront_Amount__c: The upfront fee paid at enrollment (67% populated). Copied
+      to/from Onboarding; input to the payment-plan flow.
+    Offer_letter_amount__c: The fee due when the candidate receives an offer letter
+      (the success fee). 67% populated; the Record Offer Letter Payment action invoices
+      it.
+    Salary__c: Percentage-of-salary component of the agreement (e.g. X% of first-year
+      salary). 70% populated. Copied to/from Onboarding.
+    January_Kicker_Rate__c: An additional "kicker" percentage applied from January
+      (a promotional / seasonal pricing term). Rarely used (not fully documented
+      - verify with team).
+    Joining_Date__c: Date the candidate joined the program (or their placement start
+      date - usage varies; verify with team).
+    Preferred_Training_Schedule_EST__c: 'Which daily training slot the candidate
+      wants, quoted in EST: 9:30-11:30 AM | 11:30 AM-1:30 PM | 2:30-4:30 PM | 4:30-6:30
+      PM. Captured at lead conversion; read when assigning training cohorts.'
+    Service_Agreement_Sent__c: The service agreement went out (DocuSign). 49 checked.
+      Set by the agreement-sending process on the Onboarding side.
+    QB_Customer_ID__c: The QuickBooks customer id for this account - stamped by
+      the Send Invoice flow the first time an invoice is pushed (it searches QB,
+      creates the customer if needed, saves the id for reuse). 21 populated.
+    DS_Middle_Name__c: Legal name exactly as it must appear on the agreement.
+    DS_Last_Name__c: Legal name exactly as it must appear on the agreement.
+    DS_Date_Of_Birth__c: DOB as on the legal ID.
+    DS_Address_Line_1__c: Legal address for the agreement.
+    DS_Address_Line_2__c: Legal address for the agreement.
+    DS_City__c: Legal address for the agreement.
+    DS_State_Province__c: Legal address for the agreement.
+    DS_ZIP_Postal_Code__c: Legal address for the agreement.
+    DS_Today_Date__c: Today's date formatted MM/DD/YYYY - merged into the generated
+      document as the signing date.
+    Client_Type__c: 'What kind of company: Direct Client (hiring directly) | Vendor
+      (staffing vendor) | Implementation Partner (tech implementation company) |
+      MSP (Managed Service Provider) | Other.'
+    Payment_Terms__c: 'Agreed invoice terms with the client: Net 15 | Net 30 | Net
+      45 | Net 60. Help text: Net 30 is standard, confirm with Finance before changing.'
+    Default_Submission_Email__c: Where candidate submissions are emailed for this
+      client (hiring manager or vendor coordinator, per help text). Read by the
+      B2B submission flow.
+    Confidential_Client__c: 'Client asked for confidentiality: when checked, the
+      client name must NOT appear on website job postings regardless of other settings
+      (help text). Read by the job-posting/website process.'
+    Account_Manager__c: The internal AM who owns this CLIENT relationship - defaulted
+      onto every Job Requirement created for the client (help text), from where
+      it cascades to submissions and interviews. 1 populated so far.
+    Total_Number_of_Interview__c: Count of child interviews with record type "Interview"
+      only (real interviews, excluding initial calls). This is the live counter
+      shown in the page's Interviews Summary section and compared against
+    Total_Number_of_Initial_Calls__c: Count of child interviews with record type
+      "Initial Call".
+    Interviews_Ghosted__c: Count of "Interview"-type children whose STATUS is Ghosted
+      - how often companies went silent on this candidate.
+    Interviews_Rejected__c: Count of "Interview"-type children whose STATUS is Rejected.
+    Total_Interviews__c: Plain number meant to be maintained by the Update_Total_Interviews_on_Candidate
+      flow - but that flow is DRAFT, so the field is empty on every record. Use
+      the rollups instead.
+    Total_Number_of_Interviews__c: Older manual counter with the same label as the
+      rollup above; empty on every record. Legacy - ignore.
+    Total_Number_of_Applications__c: Intended count of job applications made for
+      the candidate; only 6 records have a value. The real application counts live
+      on Application__c / Marketing__c.
+    Total_Training_Sessions__c: Intended training-session counter; empty on all
+      records (session attendance is tracked on Session_Attendee__c instead).
+    Total_Internal_Interviews_Excl_Intake__c: Intended count of internal screening
+      interviews excluding the intake call; empty on all records.
+    Latest_Internal_Interview_Date__c: Intended stamp of the most recent internal
+      interview; empty on all records.
+    Description__c: Custom general-notes field (separate from the standard Description).
+    Notes__c: Short working notes.
+    Profile_Notes__c: Rich-text profile dossier - the long-form write-up of the
+      candidate (background, story, marketing angle).
+    Additional_Information__c: Extra intake information - copied from the Lead at
+      conversion.
+    Additional_Comments_or_Questions__c: The candidate's own comments/questions
+      from the intake form - copied from the Lead at conversion.
+  Contact:
+    Name: 'The person''s name. Salutation values: Dr. | Mr. | Mrs. | Ms. | Mx. |
+      Prof. For shadow contacts it mirrors the Person Account''s name; for B2B contacts
+      it is entered manually or copied from the converted lead.'
+    Title: Job title at the client company (e.g. "VP Engineering"). Copied from
+      the lead at conversion or typed by the user. Populated on only 2 of 24 business
+      contacts.
+    TitleType: Standard Salesforce-added classification of the title into a seniority
+      band (CEO, VP, Director...). Never used in this org.
+    Department: Free-text department of the person at their company. Unused in practice.
+    DepartmentGroup: Standard Salesforce-added normalized department category (companion
+      to TitleType). Never used in this org.
+    Birthdate: Standard birthday field. Not part of any Techsara process; the Zoom
+      package ships a "Birthdays This Month" list view over it, unused.
+    GenderIdentity: 'Standard optional self-identification: Female | Male | Nonbinary
+      | Not Listed | I choose not to disclose. Not used in this org.'
+    Pronouns: 'Standard optional pronouns: He/Him | He/They | She/Her | She/They
+      | They/Them | Not Listed. Not used in this org.'
+    Description: Free-form notes about the person. Manual entry; rarely used.
+    AccountId: The company this person belongs to - or, for shadow contacts, the
+      Person Account itself (system-managed, do not touch).
+    OwnerId: The internal user who owns the contact record. Defaults to the creator.
+      Matters mainly for the 15 account-less contacts (owner-only visibility).
+    ReportsToId: Optional link to the contact's manager, for mapping the client's
+      org chart. Never populated in this org.
+    Email: 'The person''s email - the key dedupe field: lead conversion only creates
+      a new contact if no contact with this email exists on the target account,
+      and the planned submission-email routing sends to it.'
+    Phone: Main phone number (17 of 24 populated).
+    MobilePhone: Mobile number. The lead-conversion Apex writes the LEAD's Phone
+      into MobilePhone (not into Phone) when it creates the contact. 3 of 24.
+    MailingAddress: Standard mailing address (street/city/state/zip/country). Manual
+      entry; essentially unused - addresses live on the Account side in this org.
+    LeadSource: 'Where this person came from: Advertisement | Customer Event | Customer
+      Referral | Employee Referral | External Referral | Facebook | Google AdWords
+      | Instagram | LinkedIn | Other | Partner | Purchased List | Trade Show'
+    ContactSource: Standard Salesforce-added "how was this contact captured" system
+      picklist. Never used here.
+    BuyerAttributes: 'Standard buying-role tags: BusinessUser | Buyer | Champion
+      | DecisionMaker | Detractor | Evaluator | ExecutiveSponsor | TechnicalExpert.'
+    Primary_Submission_Contact__c: 'Marks THE main recipient of candidate-profile
+      submission emails for this client. Business rule (from help text, not enforced
+      by code): only ONE contact per client account should be checked. 0% populated.'
+    Receives_Submission_Emails__c: Marks additional CC recipients of submission
+      emails - multiple contacts per client may be checked, in addition to the primary
+      above. 0% populated.
+    Submission_Notes__c: Client-specific instructions for submitting candidates
+      to THIS person - e.g. "always send the application as PDF", "include LinkedIn
+      URL", "do not mention rate". Manual entry; read by the (future) submission
+      process.
+  AccountContactRelation:
+    AccountId: The account side of the relationship. Set by the platform for direct
+      rows; would be picked manually for indirect ones. Immutable after creation.
+    ContactId: The contact side of the relationship. Same creation rules as above.
+    IsDirect: TRUE when this row mirrors the contact's own AccountId (the "home"
+      relationship Salesforce created automatically). All 9 rows in preprod are
+      direct.
+    IsActive: Whether the relationship is currently in force. Deactivating (instead
+      of deleting) keeps history when a person leaves a company. All 9 rows are
+      active.
+    Roles: Standard field for the person's role(s) at that specific account (business
+      user, decision maker, etc.). Never populated in this org - the team's role
+      field is Contact.Contact_Role__c instead.
+    Relationship_Strength__c: 'The one custom field: how strong Techsara''s relationship
+      with this contact at this account is - Strong | Neutral | Weak. Intended for
+      client-relationship management on the B2B side (who do we have a warm line
+      to?).'
+  User:
+    Username: The login name (email format, globally unique across Salesforce).
+      For portal staff it is typically the work email with an org suffix. Set at
+      provisioning (HR flow / admin).
+    Name: The person's display name, shown in audit stamps, owner fields, and Slack/email
+      templates.
+    Alias: Short code shown in classic list views and reports. Auto-derived at creation;
+      nobody manages it deliberately.
+    Email: Where Salesforce sends this user's notifications (approvals, flow errors,
+      password resets). Set at provisioning.
+    IsActive: Whether the login works. Deactivation (never deletion) is how offboarding
+      ends access - the Employee_Offboarding flow / PortalUserAdminRest "deactivate"
+      action flips this. 168 of 302 are active.
+    CommunityNickname: The name shown in Experience Cloud (portal) communities instead
+      of the real name. Auto-generated at user creation.
+    FederationIdentifier: SSO subject identifier. Empty on ALL users - the org does
+      not use federated single sign-on; everyone logs in with password.
+    ProfileId: 'THE access anchor: sets the license and baseline permissions. In
+      active use: "AIC Portal" (Customer Community Plus - external portal staff,
+      128 active) and "Bench Marketing" (internal, IP-locked, 20 active)'
+    UserRoleId: Position in the role hierarchy for record sharing - the physical
+      lever of the role-hierarchy redesign. Internal users sit in the 14-role tree;
+      portal users get auto-created per-account community roles.
+    ManagerId: Standard manager link (used by approvals/Work.com). Empty on ALL
+      302 users - the real reporting chain is modeled on Recruiter__c, not here.
+    DelegatedApproverId: Who receives this user's approval requests when delegated.
+      Unused.
+    ContactId: 'For community users only: the contact the login is enabled on. 233
+      populated - every one a Person Account contact (the employee''s own person
+      account).'
+    PortalRole: The community user's role level within its account (values not tracked
+      in source - typically Executive / Manager / Worker / Person Account; verify
+      with team).
+    CallCenterId: Softphone/CTI assignment. No call center is configured; empty.
+    ForecastEnabled: Standard sales-forecasting toggle. Not part of any Techsara
+      process.
+    Address: The user's address (street/city/state/zip/country). Optional; the PersonalInfo_EPIM
+      field set masks parts of it (State etc.) for privacy tooling.
+    TimeZoneSidKey: The user's timezone - affects every date/time they see. Important
+      here because staff span India (IST) and the US; interview flows convert times
+      to IST separately rather than relying on this.
+    AboutMe: Chatter profile blurb. Unused.
+    Signature: Appended to emails the user sends from Salesforce. Manual entry.
+    Slack_User_Id__c: The user's Slack member id (e.g. "U0123ABC..."), entered by
+      an admin so Slack messages can @-mention the person. Read by SlackCalloutHelper
+      to build the CC-mention list on interview-support Slack posts.
+    dfsle__Provisioned__c: When the user was provisioned in DocuSign (set by the
+      package).
+    dfsle__Status__c: 'DocuSign membership status: Inactive | Pending | Active.
+      "Active" on 3 users; null for everyone else.'
+    dfsle__Username__c: The user's id in the DocuSign account (set by the package;
+      3 populated).
+  Lead:
+    Name: 'The person''s name (or the contact person''s name on a B2B client lead).
+      Required. Salutations: Dr. | Mr. | Mrs. | Ms. | Mx. | Prof.'
+    Email: 'The person''s email - the PRIMARY identity key: duplicate detection
+      at conversion and the website intake dedupe both key on it. 97% populated.
+      One of Email / Phone / LinkedIn is required at status "Contacted".'
+    Email__c: Custom duplicate of Email. Never used (0 records) - use standard Email.
+    Phone: Main phone number; the second identity key for duplicate detection at
+      conversion. 62% populated.
+    MobilePhone: Mobile number (54% populated). Shown in the hover mini-layout.
+    Contact_Number_WhatsApp__c: The number the candidate uses on WhatsApp - the
+      sales team often works candidates over WhatsApp. Copied to the candidate Account
+      at conversion. ~6% populated (newer intake field).
+    LinkedIn_URL__c: Link to the person's LinkedIn profile (23% populated). Accepted
+      as the third alternative contact detail by the "Contacted" validation rule.
+    Address: The person's mailing address (street/city/state/zip). The GoogleMaps
+      custom link on the layout maps it.
+    State__c: US state chosen from the shared 51-value State list (all US states
+      + DC). Never populated in live data (0 records) - address state is used instead.
+    Zip_Code__c: Zip code as plain text. Never populated in live data (0 records).
+    Title: 'Job title of the person (for B2B contacts: their role at the company).'
+    GenderIdentity: 'Optional self-identification: Male | Female | Nonbinary | Not
+      Listed | I choose not to disclose. Not used in practice.'
+    Pronouns: 'Optional pronouns: He/Him | He/They | She/Her | She/They | They/Them
+      | Not Listed. Not used in practice.'
+    Status: 'THE lifecycle field, driven manually by the employee working the lead.
+      Values differ by record type (business process): - B2C/Prospect path: New
+      (default) -> Contacted -> Negotiation -> Payment -> Converted'
+    Lead_Status__c: 'A CUSTOM shadow status: New | Contacted | Negotiation | Agreement
+      | Converted | Lost | Junk | Convert To Candidate Lead. Effectively unused
+      (13 records, all "New") - the standard Status is the real field.'
+    LeadSource: 'Where the lead came from: Advertisement | Customer Event | Customer
+      Referral | Employee Referral | External Referral | Facebook | Google AdWords
+      | Instagram | LinkedIn | Other | Partner | Purchased List | Trade Show |'
+    Rating: 'Sales temperature: Hot | Warm | Cold. The org''s help text redefines
+      it around the PRICING call: Hot = call done, pricing explained, agreed or
+      open to consider; Warm/Cold = colder responses.'
+    Rating__c: A numeric 1-5 rating that duplicates the standard Rating. Never used
+      (0 records).
+    Lead_Category__c: 'Help text: select "Candidate" for job seekers and placement
+      prospects, "B2B Client" for companies sending requirements. Redundant with
+      the record type and never populated in live data (0 records).'
+    OwnerId: The employee working the lead. LeadConversionHandler reassigns ownership
+      to the converting user just before conversion so record-type defaults apply.
+    Header_Display__c: 'Display string for compact layouts: "First Last - CompanyName
+      (RecordTypeName)". Lets list views show who + which flavor at a glance.'
+    Conversion_Status__c: (source only - not in live org yet) "Converted" / "Not
+      Converted" from the standard IsConverted flag - a report-friendly text version.
+    Years_of_Experience__c: The candidate's total professional experience in years
+      (one decimal allowed). Entered by the recruiter/sales person; 75% populated
+      - the best-filled profile field.
+    Technology__c: Free-text list of the candidate's technologies/skills, typed
+      during the sales call. The main skill field on the classic layout.
+    Primary_Technology__c: 'The candidate''s MAIN technical skill. Help text example:
+      "Salesforce, Java + Spring Boot, AWS DevOps, React". Newer, more structured
+      intake companion to Technology__c.'
+    Niche__c: 'Which career track Techsara would place/train the candidate in: AI
+      ML Engineer | Finance Analyst | Java Fullstack Developer/Engineer | Marketing
+      Manager | Product/Project Manager | Python Developer/Engineer | Other.'
+    Niche_Other__c: Free-text niche when Niche = "Other". Copied to the Account
+      at conversion.
+    Visa_Status__c: 'The candidate''s US immigration status: B2 | CPT | Green Card
+      / Permanent Resident | Green Card EAD | H1B | OPT | STEM OPT Extension | US
+      Citizen. Critical for placement eligibility.'
+    Current_Visa_Status__c: (source only - not in live org yet) Newer duplicate
+      of Visa_Status__c used by the pre-enrolment form and mapped to the Account
+      by Lead_Conversion_Flow. Same value set as above.
+    Work_Authorization__c: 'Work-authorization category: CPT | Green Card | H1B
+      | H4 | OPT | USC | Other. Overlaps with Visa Status but is the OLDER field
+      the team filled (32% populated vs 7%).'
+    Preferred_Work_Mode__c: 'Remote | Hybrid | Onsite - the candidate''s preferred
+      arrangement (help text: Remote = fully remote, Hybrid = mix, Onsite = at office).
+      Newer intake field, 0 records so far.'
+    Relocation_Readiness__c: 'Will the candidate move for a job? Values: "Yes, I
+      am willing to relocate anywhere in the USA" | "Yes, but only within specific
+      states (mention in comments)" | "No, I prefer remote / local positions only"
+      | Other.'
+    Relocation_Other__c: Free-text detail for the relocation answer (which states,
+      conditions).
+    Criminal_Record_Declaration__c: 'Self-declaration from the pre-enrolment form:
+      "I do NOT have any criminal record" | "I have a criminal record". ~5% populated;
+      copied to the Account at conversion.'
+    Acknowledgement_Declaration__c: The candidate's acknowledgement tick from the
+      intake/pre-enrolment form (terms/accuracy declaration). Never true in live
+      data (0 records).
+    Training_Schedule__c: 'Which daily training slot the candidate prefers: 9:30-11:30
+      AM | 11:30 AM-1:30 PM | 2:30-4:30 PM | 4:30-6:30 PM (all EST). Feeds the Account''s
+      preferred-training-schedule at conversion. ~5% populated.'
+    Additional_Comments_or_Questions__c: Free-text catch-all from the candidate/form
+      (questions, notes). Copied to the Account at conversion; the one field in
+      the layout's Description section.
+    Candidate_Rate_Expectation__c: 'The candidate''s expected pay. Help text: hourly
+      rate for contractors (e.g. 65.00), annual for full-time. Newer field, 0 records
+      so far.'
+    Resume_Attached__c: Has a resume file been attached to this lead? Set by the
+      Attached_Resume_To_Lead flow (manual upload) or the website intake flow.
+    Resume_Link__c: Direct URL to the resume when it lives in Google Drive/Dropbox
+      instead of Salesforce Files (per help text). Never used in practice (0 records).
+    Applied_Job_Requirement__c: 'The posted job the candidate applied to on the
+      website. Help text: auto- populates when a candidate applies from the website
+      - the system matches the Website Job External ID to the Job Requirement.'
+    Website_Job_External_ID__c: 'The job id from the website application form, used
+      to match the application to the right Job_Requirement__c. Help text: auto-populated
+      - do not edit manually unless correcting a mismatch.'
+    Processed_for_JS__c: '"A Job Submission has been created from this Lead" (help
+      text). Stamped by the website intake flow when it auto-creates the submission;
+      stops re-processing. 6 records true - matches the website-candidate count.'
+    Company_Name__c: The company the person is associated with, from the Company__c
+      master list (the website intake flow can set it; also feeds Header_Display__c).
+      11 records populated.
+    Plan__c: 'Which career-program package the candidate is buying: Career Accelerator
+      | Ultimate Career Architect. Required (with the three money fields) from Negotiation
+      onward on B2C leads.'
+    Offer_letter_amount__c: The expected/target salary on the future offer letter
+      - the base the success-fee percentage applies to. Required from Negotiation
+      (B2C). 32% populated.
+    Salary__c: The percentage of salary the candidate agrees to pay Techsara as
+      the placement/success fee. Required from Negotiation (B2C). 32% populated.
+    Upfront_amount__c: The upfront payment (deposit) the candidate pays to start
+      the program. Required from Negotiation (B2C). 32% populated. Invoiced via
+      the Create Invoice / Send Invoice buttons.
+    Payment_Completed__c: Ticked when the candidate's (upfront) payment has been
+      received - the money gate before conversion in practice. True on 582 records
+      (21%), close to the converted count.
+    QB_Customer_ID__c: The QuickBooks customer id created/found for this person
+      by the QB_Send_Invoice_To_QuickBooks flow. External-ID field so QB webhooks
+      and flows can match the record. Copied to the Account at conversion.
+    Latest_Pre_Enrolment_Status__c: Where the latest form stands (Sent / Opened
+      / Submitted...), mirrored from the request record so employees see progress
+      on the lead itself.
+    Latest_Pre_Enrolment_Sent_On__c: When the latest form email was sent.
+    Latest_Pre_Enrolment_Opened_On__c: When the candidate first opened the form
+      link (stamped by the guest form flow).
+    Latest_Pre_Enrolment_Submitted_On__c: When the candidate submitted the completed
+      form.
+    Latest_Pre_Enrolment_Form_Link__c: The tokenized public link of the latest form
+      (for resending/support).
+    Company: The standard company field - DELIBERATELY BLANKED by the LeadConversionTrigger
+      on every insert/update so standard conversion cannot create a business Account
+      from it. Read-only on the layout.
+    Company_Email__c: The company's (or company contact's) email on a B2B client
+      lead. Also referenced by the website intake flow.
+    B2B_Company_Type__c: 'What kind of B2B partner the company would be: Direct
+      Client (hires directly) | Vendor | Implementation Partner | Consulting Partner
+      (per help text, vendor/partner types resell or partner on placements).'
+    Company_Type__c: 'Report-friendly version of B2B_Company_Type__c: shows "Not
+      Specified" when blank.'
+    Department__c: The department of the contact person at the client company ("Enter
+      lead's department" - help text). 6 records.
+    Designation__c: The contact person's job designation at the company (help text).
+      6 records.
+    Industry: 'The client company''s industry (standard 32-value list: Agriculture
+      ... Utilities). B2B only.'
+    Requirement_Summary__c: Summary of any job requirement the client shared during
+      first contact - help text asks for role, skills, location etc. Pre-Job_Requirement__c
+      scratchpad.
+    Target_Role__c: 'The role the client needs to fill (help text examples: "Salesforce
+      Developer", "Java Backend Engineer"). 0 records so far.'
+    Target_Role_n__c: (source only - not in live org yet) Shows Target_Role__c or
+      "Not Specified" when blank.
+    Estimated_Bill_Rate__c: The rough hourly/salary rate the client mentioned in
+      early talks - explicitly non-binding per help text. 0 records so far.
+    Submission_Deadline__c: The client's stated deadline for receiving candidate
+      profiles; leave blank if not confirmed (help text). 0 records so far.
+    Converted_to_Job_Requirement__c: 'Manual tracking tick: "check after you have
+      created the Job Requirement record for this client" (help text) - which client
+      leads have been actioned. Never true yet.'
+    Total_Job_Requirements__c: 'COUNTER maintained by flows only (help text: "Maintained
+      by system Flow only. Read Only."): how many Job_Requirement__c records name
+      this lead as Client Lead. Kept current by Update_Lead_JR_Count_On_Create /
+      _On_Delete.'
+    Total_Job_Applications__c: 'COUNTER maintained by flows only: total Job Submissions
+      across this client lead''s requirements (Update_Lead_JA_Count_On_Create and
+      B2B_Jr_update_submission_counts recount it'
+    Flow_Only_Field__c: 'The conversion HANDSHAKE: LeadConversionHandler sets it
+      to true immediately before converting, and the Lead_Conversion_Validation
+      rule rejects any Status change to "Converted" without it.'
+    Description: General free-form notes about the lead.
+    Jigsaw: Legacy Data.com field - dead weight, ignore.
+    LastTransferDate: 'Standard audit stamp: when the lead last changed owner.'
+    ZVC__IsCreatedByZoomApp__c: Flag from the Zoom managed package marking leads
+      created by the Zoom app. Never true - Zoom does not create leads in this org.
+  Recruiter__c:
+    Name: 'The employee''s full name. NOT typed by users: the Employee_Populate_
+      FullName flow stamps it from First + Last Name at creation. Every lookup to
+      this object displays this value.'
+    First_Name__c: Given name, entered by HR at creation (100% populated). Source
+      for the Name stamp and for the org-chart node labels built by RecruiterHierarchyService.
+    Last_Name__c: Family name, entered by HR (99% populated - a few single-name
+      records). Second half of the Name stamp.
+    Email__c: The employee's work email, entered manually (88% populated). Used
+      when the employee needs to be reached/invited outside Slack.
+    Phone_No__c: Contact phone number. Barely used in practice (10 of 280 records).
+    Date_of_Birth__c: HR birthday field. Effectively unused (1 record).
+    Description__c: Free-form notes about the employee (background, remarks). Manual.
+    Slack_User_Id__c: The employee's Slack member id (e.g. "U0123ABC") - THE key
+      integration field, required on the record page and 94% populated.
+    Recruiter_User__c: The employee's real Salesforce/portal User login, when they
+      have one (44 of 280 - the portal-user population). Read by the Manager_Decision
+      leave-approval flow to route to the right approver and by
+    Recruiter_Contact__c: The employee's own Person Account, created and linked
+      by the "Create Contact" button (Create_Recruiter_Contact flow). Read-only
+      on the record page - the flow owns it. 76% populated.
+    PersonAccount__c: Text companion to Recruiter_Contact__c, written by the same
+      Create Contact flow when it links the Person Account (77% populated). Kept
+      as text for lists/automation; not maintained by hand.
+    Assigned_Sr_Recruiter__c: 'THE most important field on the object: who this
+      employee reports to. Help text: "Enter the name of the Sr Recruiter under
+      whom the application recruiter will be working on." Set by HR at creation/re-org.'
+    Employment_Status__c: 'Lifecycle state, maintained by HR: Active Employee (148
+      records) | Former Employee (131) | Leave of Absense (1 - note the org''s spelling).'
+    Date_of_Joining__c: Hire date, entered by HR (94% populated). Tenure reporting.
+    Last_Working_Date__c: Final employment date, set at offboarding. Only 6 records
+      have it - most offboardings just flip the status without recording the date.
+    Experience_Level__c: 'Overall professional maturity: Fresher level (118) | Beginner
+      Level (88) | Mid Level (40) | Senior Level (27). Entered by HR; exposed per
+      node in the RecruiterHierarchyController org chart.'
+    Seniority_Level__c: Junior | Mid | Senior | Lead. NEVER USED in practice (0
+      populated) - Experience_Level__c is the field the team actually fills. Likely
+      added for the support/assignment model and not adopted.
+    On_Leave_Today__c: Half Day | Full Day - a quick "out today" marker on the employee
+      (3 records). Set manually; the authoritative leave system is the Employee_Leave__c
+      child object created via the Create Leave Request button
+    Tomorrow_Availability__c: Declares "I am available tomorrow" for interview-support
+      shift planning. The object's one validation rule forces Start/End Time IST
+      to be filled when this is checked.
+    Daily_Max_Interview_Hours__c: Cap on how many hours of interviews the engine
+      may load onto this person per day (workload protection). 0 populated - engine
+      default caps apply.
+    COMPASS_State_JSON__c: 'The engine''s FULL serialized per-employee state: Kalman
+      filter values, momentum, histories, velocity EMAs, etc. Help text: written
+      by the COMPASS Lambda after each run and read back on the next run to resume
+      state -'
+    COMPASS_State_Schema_Version__c: Version tag of the JSON blob format, so future
+      Lambda releases can evolve the state structure safely (read old versions,
+      write new).
+    No_of_Assigned_Candidates__c: How many candidates this recruiter currently carries.
+      54% populated. No flow or Apex in the org maintains it, so it is kept manually
+      or by an external/reporting process (not fully documented - verify with team).
+    Target_Per_Candidate__c: The recruiter's daily job-application quota PER candidate
+      (the marketing pipeline logs daily Application__c batches against such targets).
+      Entered by managers; 19% populated.
+    Total_Target__c: The recruiter's overall daily application target across all
+      their candidates (roughly candidates x per-candidate target). Entered by managers;
+      21% populated.
+knowledge:
+- title: Techsara org overview — the concepts every answer depends on
+  keywords:
+  - org
+  - overview
+  - pipeline
+  - candidate
+  - person
+  - account
+  - recruiter
+  - techsara
+  text: "Techsara Solutions runs a RECRUITMENT + CANDIDATE-TRAINING/ONBOARDING platform\n\
+    on Salesforce. The key concepts every answer depends on:\n\n- A CANDIDATE IS\
+    \ A PERSON ACCOUNT. The standard Account object (with Person\n  Accounts enabled)\
+    \ is the spine of the whole org. Candidate = Person Account;\n  client/vendor\
+    \ companies = business Accounts. Almost every custom object hangs\n  off Account\
+    \ through a Candidate__c / Client_Account__c / Account__c lookup.\n\n- EMPLOYEES\
+    \ HAVE THEIR OWN OBJECT. Recruiter__c (label \"Employee\") is a custom\n  object\
+    \ representing Techsara's internal staff (recruiters, support persons,\n  trainers,\
+    \ managers). It is separate from the Salesforce User object. Most\n  \"who works\
+    \ on this\" lookups point to Recruiter__c, not User."
+- title: Techsara org overview — the concepts every answer depends on (2)
+  keywords:
+  - org
+  - overview
+  - pipeline
+  - candidate
+  - person
+  - account
+  - recruiter
+  - techsara
+  text: "- TWO RECRUITING PIPELINES EXIST SIDE BY SIDE:\n  1) B2B STAFFING: a client/vendor\
+    \ sends an open job requirement\n     (Job_Requirement__c) -> recruiters submit\
+    \ candidates against it\n     (Job_Submission__c) -> interviews are scheduled\
+    \ (Interview__c) -> offer /\n     placement -> Onboarding__c.\n  2) CANDIDATE\
+    \ MARKETING (\"bench marketing\"): Techsara markets a candidate into\n     the\
+    \ open job market. A Marketing__c record tracks the engagement, daily\n    \
+    \ Application__c records log the job applications made for the candidate,\n\
+    \     and when an outside company responds, an Interview__c is scheduled.\n\
+    \  The same Interview__c object serves both pipelines (see its record types).\n\
+    \n- INTERNAL vs EXTERNAL INTERVIEWS ARE DIFFERENT OBJECTS. Interview__c is the\n\
+    \  candidate interviewing with an OUTSIDE company (a client or a market\n  employer).\
+    \ Internal_Interview__c is Techsara internally screening/assessing\n  a candidate\
+    \ (template-driven, AI question generation, Hire/NoHire decision).\n  Do not\
+    \ confuse them - and note that Interview_Evaluation__c belongs to\n  Internal_Interview__c,\
+    \ NOT to Interview__c, despite its name."
+- title: Techsara org overview — the concepts every answer depends on (3)
+  keywords:
+  - org
+  - overview
+  - pipeline
+  - candidate
+  - person
+  - account
+  - recruiter
+  - techsara
+  text: "- TRAINING/LMS LAYER: Program__c -> Program_Version__c -> Cohort__c curriculum;\n\
+    \  Candidate_Training__c enrolls a candidate; Session__c is the generic\n  scheduled-meeting\
+    \ object (Zoom/Google Calendar backed) used for training and\n  many other meeting\
+    \ types; Deliverable__c tracks candidate work products.\n\n- INTEGRATIONS: Google\
+    \ Calendar (interview/session invites), Zoom (meetings +\n  recording management\
+    \ in S3), Slack (team notifications for almost every\n  important event), AWS\
+    \ API Gateway/Lambda (the external AI assignment/scoring\n  engine called \"\
+    COMPASS\"), OpenAI, QuickBooks (billing).\n\n- PORTALS: employees work mainly\
+    \ through the \"AIC Portal\" (an Experience Cloud\n  community), candidates\
+    \ through candidate portals with custom token auth."
+- title: Account — What This Object Is
+  keywords:
+  - account
+  - candidate
+  - person
+  text: "Account is THE HUB of the entire org. Person Accounts are enabled, and\
+    \ the\nobject carries three completely different kinds of records at once:\n\
+    \n  a) A CANDIDATE - a Person Account. This is what ~75% of all Account records\n\
+    \     are. A candidate is created by converting a website Lead (the Convert\n\
+    \     button runs Lead_Conversion_Flow -> Apex LeadConversionHandler ->\n  \
+    \   Database.convertLead) and from then on the Person Account is the\n     candidate's\
+    \ master profile: identity, visa/work authorization, skills,\n     education,\
+    \ job preferences, marketing credentials, training plan and\n     payment terms,\
+    \ DocuSign agreement data, and interview statistics.\n     Almost every custom\
+    \ object in the org hangs off it through a\n     Candidate__c lookup (Marketing,\
+    \ Applications, Interviews, Onboarding,\n     Training, Invoices, Background\
+    \ Checks, Resumes, Sessions...).\n\n  b) An INTERNAL EMPLOYEE's portal identity\
+    \ - a Person Account with the\n     \"Recruiter\" person record type (~23% of\
+    \ records). Techsara employees\n     are modeled on the custom Recruiter__c\
+    \ (\"Employee\") object, but to give\n     an employee a Customer Community\
+    \ Plus login on the AIC Portal they also\n     need a Person Account + Contact.\
+    \ These employee Person Accounts are\n     created by the Create_Recruiter_Contact\
+    \ / Provision_Employee_Portal_User\n     flows and linked back via Recruiter__c.Recruiter_Contact__c."
+- title: Account — What This Object Is (2)
+  keywords:
+  - account
+  - candidate
+  - person
+  text: "c) A BUSINESS ACCOUNT - a client, vendor, or implementation partner\n \
+    \    company (B2B Client / Vendor record types, ~1% of records). These carry\n\
+    \     the client-relationship fields (Client Status, Client Type, Payment\n\
+    \     Terms, Default Submission Email, Account Manager) used by the B2B\n  \
+    \   staffing pipeline (Job_Requirement__c / Job_Submission__c).\n\nBecause one\
+    \ object serves three personas, most fields only make sense for one\nflavor\
+    \ - the field groups in part 8 say which flavor each group belongs to."
+- title: Account — Kind Of Object
+  keywords:
+  - account
+  - candidate
+  - person
+  text: "- STANDARD object with Person Accounts enabled, heavily customized:\n \
+    \ 192 fields total, of which 148 are custom - the second-largest field count\n\
+    \  in the org after Interview__c.\n- Org-Wide Default sharing: Public Read/Write\
+    \ (the role-hierarchy redesign\n  plans to tighten this; the client has also\
+    \ ruled that no one may edit the\n  candidate Account going forward - see the\
+    \ security design docs).\n- Owned records: normal ownership model (OwnerId).\
+    \ NOTE: 378 of 1,013\n  accounts are owned by INACTIVE users - a known cleanup\
+    \ item in the\n  role-hierarchy project (\"375 inactive-owned Accounts to reassign\"\
+    ).\n- 1 validation rule, 15 list views, 5 Lightning record pages (which page\
+    \ a\n  user sees depends on record type + app + profile):\n  Candidate_Record_Page1\
+    \ (Person Account = candidate; the main page),\n  B2B_Client_Account_Record_Page,\
+    \ Vendor_Account_Record_Page,\n  RecruiterRecord_Page, Account_Record_Page_Three_Column.\n\
+    - Scale: 1,013 records in preprod (Aug 2024 - Aug 2026)."
+- title: Account — Record Types
+  keywords:
+  - account
+  - candidate
+  - person
+  - source
+  - snapshot
+  - active
+  - live
+  - org
+  text: 'The metadata snapshot holds 4 business-account record types; the live org
+
+    additionally reports 2 person-type record types (person record types were not
+
+    retrieved into the source folder):'
+- title: Account — Record Types (2)
+  keywords:
+  - account
+  - candidate
+  - person
+  - source
+  - snapshot
+  - active
+  - live
+  - org
+  text: "- \"Person Account\" (developer name: PersonAccount, person type) - THE\n\
+    \  CANDIDATE record type. 765 records (75.5%). Every converted Lead becomes\n\
+    \  one of these; the Candidate Record Page's candidate-only components are\n\
+    \  gated on RecordType.DeveloperName = PersonAccount.\n- \"Recruiter\" (Recruiter,\
+    \ person type) - an internal EMPLOYEE's Person\n  Account, used only to give\
+    \ the employee a portal login (Contact + user).\n  237 records (23.4%). Created\
+    \ by Create_Recruiter_Contact /\n  Provision_Employee_Portal_User; do not confuse\
+    \ with the candidate type.\n- \"B2B Client\" (B2B_Client) - \"Select this option\
+    \ to create an account for\n  B2B client company.\" 7 records; all currently\
+    \ Client_Type = Direct Client.\n- \"Vendor / Implementation Partner\" (Vendor_Implementation_Partner)\
+    \ -\n  \"Select this option for vendor, implementation partner, or middle-layer\n\
+    \  partner relationships.\" 0 records so far (Vendor__c is the object actually\n\
+    \  used for proxy-support vendors; this RT is for B2B-supply-chain companies).\n\
+    - \"Recruiters(Do Not Use)\" (Recruiters_Do_Not_Use) - description literally\n\
+    \  says \"Do not use this option to create an account.\" A deprecated business\n\
+    \  record type kept active but empty (0 records). The person-type \"Recruiter\"\
+    \n  RT replaced it.\n- \"Master\" - 4 legacy business records carry no record\
+    \ type."
+- title: Account — How It Is Used — The Business Process
+  keywords:
+  - account
+  - candidate
+  - person
+  text: "STEP 1 - A CANDIDATE IS BORN FROM A LEAD. A website/marketing Lead is worked\n\
+    \  on the Lead page; clicking Convert runs Lead_Conversion_Flow. The flow\n\
+    \  first calls Apex LeadConversionHandler in check-duplicate mode (same email\n\
+    \  OR phone against existing Person Accounts), lets the user pick/merge, then\n\
+    \  converts. The new Person Account lands on the Candidate Record Page. The\n\
+    \  flow copies the intake answers onto the account (visa status, niche,\n  relocation\
+    \ readiness, referrals, communication rating, training schedule,\n  contact\
+    \ numbers, address, declarations...).\n\nSTEP 2 - ONBOARDING KICKS OFF AUTOMATICALLY.\
+    \ On creation of a candidate\n  account, Create_Onboarding_from_Account_1 creates\
+    \ the child Onboarding__c\n  record (copying ~20 profile fields), emails the\
+    \ candidate, and posts to\n  Slack. As the candidate fills the onboarding form,\
+    \ the reverse flow\n  Update_Candidate_Information_from_Onboarding writes ~30\
+    \ profile fields\n  BACK onto the Account (DOB, SSN last 4, work authorization,\
+    \ preferences,\n  marketing email, passport, plan/amounts...). The DS_* DocuSign\
+    \ block is\n  maintained for the service-agreement / ACH paperwork sent via\
+    \ DocuSign."
+- title: Account — How It Is Used — The Business Process (2)
+  keywords:
+  - account
+  - candidate
+  - person
+  text: "STEP 3 - TRAINING & PLAN. The candidate buys a Plan (Career Accelerator\
+    \ for\n  ~95% of those with a plan), pays an Upfront Amount, and goes through\
+    \ the\n  training layer (Candidate_Training__c, Session__c). Invoices are raised\n\
+    \  straight from the account via the Send Invoice button (QuickBooks\n  integration\
+    \ stamps QB_Customer_ID__c on first use).\n\nSTEP 4 - MARKETING & INTERVIEWS.\
+    \ A Marketing__c engagement is opened (Create\n  Marketing button). Marketing\
+    \ flows keep the account in sync: the assigned\n  recruiter, the Application\
+    \ Start Date (when active marketing began), and\n  Candidate_Status__c itself\
+    \ all mirror the Marketing record. Daily\n  Application__c records log job applications;\
+    \ Interview__c records (master-\n  detail children) accumulate under the account,\
+    \ feeding the rollup counters\n  and the Expected_No_of_Interviews__c pacing\
+    \ formula. The nightly\n  AccountSchedulerJob Slack-alerts recruiters about\
+    \ Active candidates with\n  no interview for 30/45/60 days (stamping Last_Alert_Sent__c)."
+- title: Account — How It Is Used — The Business Process (3)
+  keywords:
+  - account
+  - candidate
+  - person
+  text: "STEP 5 - STATUS LIFECYCLE. Candidate_Status__c walks In Progress -> Active\n\
+    \  -> (Hold / Paused) -> Placed / Closed / Terminate / Resigned. Any change\n\
+    \  away from Active requires a >=50-character reason (the one validation\n \
+    \ rule); every change is chattered on the record by\n  Candidate_Status_Change_Log.\
+    \ Pause_or_Stop_Marketing and\n  Onboarding_record_Inactive are the screen flows\
+    \ that move the status with\n  proper notifications. A non-Active status also\
+    \ shows a warning banner on\n  the record page.\n\nSTEP 6 - PLACEMENT / B2B.\
+    \ When B2B submissions happen, the candidate must\n  have Resume_Ready__c and\
+    \ Active_for_B2B_Submission__c checked. Client\n  companies live as B2B Client\
+    \ business accounts, carrying the Account\n  Manager, payment terms, and submission\
+    \ email defaults that flow onto\n  Job_Requirement__c records.\n\nPARALLEL TRACK\
+    \ - EMPLOYEE PORTAL IDENTITY. HR runs the\n  Provision_Employee_Portal_User\
+    \ flow (or Create_Recruiter_Contact) from an\n  Employee (Recruiter__c) record:\
+    \ it creates a \"Recruiter\"-record-type\n  Person Account (name, email, Slack\
+    \ user id), links it via\n  Recruiter_Contact__c, and enables a portal user\
+    \ on it. Offboarding\n  deactivates it (Employee_Offboarding flow)."
+- title: Account — Connected Objects
+  keywords:
+  - account
+  - candidate
+  - person
+  - each
+  - relationship
+  - means
+  text: "LOOKUPS FROM ACCOUNT TO OTHER OBJECTS:\n- User (Account_Manager__c): the\
+    \ AM owning a CLIENT relationship (business\n  accounts only) - defaulted onto\
+    \ Job Requirements created for the client.\n- Recruiter__c (Assigned_Recruiter__c):\
+    \ the Techsara recruiter working this\n  candidate - kept in sync from the Marketing\
+    \ record. 65% populated.\n- Account (Candidate_Referral__c, self-lookup): the\
+    \ existing candidate who\n  referred this one (21% populated - referrals are\
+    \ a real channel).\n- Vendor__c (Default_Vendor__c): default proxy-support vendor\
+    \ for the\n  candidate (1 record - effectively unused).\n- Internal_Interview__c\
+    \ (Internal_Interview__c): pointer to a candidate's\n  internal screening interview\
+    \ (0 populated - unused in practice)."
+- title: Account — Connected Objects (2)
+  keywords:
+  - account
+  - candidate
+  - person
+  - each
+  - relationship
+  - means
+  text: "OBJECTS THAT POINT AT ACCOUNT (children):\n- Interview__c.Candidate__c\
+    \ (MASTER-DETAIL) - all external interviews of the\n  candidate. The only master-detail\
+    \ child; interviews inherit the account's\n  sharing. Also Interview__c.Client_Account__c\
+    \ (lookup) for B2B interviews.\n- Marketing__c.Candidate__c - marketing engagements\
+    \ (bench marketing).\n- Application__c.Candidate__c - daily job-application\
+    \ logs.\n- Job_Submission__c.Candidate__c - B2B submissions of this candidate.\n\
+    - Job_Requirement__c.Client_Account__c - the CLIENT side: job reqs raised by\n\
+    \  a business account.\n- Onboarding__c.Account__c - the onboarding record(s),\
+    \ auto-created at\n  candidate creation.\n- Candidate_Training__c.Candidate__c\
+    \ - training enrollments.\n- Session__c.Candidate__c and Session_Attendee__c.Candidate__c\
+    \ - meetings\n  and attendance.\n- Internal_Interview__c.Candidate__c - internal\
+    \ screening interviews.\n- Education_History__c.Candidate__c - structured education\
+    \ rows (the\n  College_Name_1-5 flat fields on Account are the legacy version\
+    \ of this).\n- Resume__c.Candidate__c - resume versions.\n- Background_Check__c.Candidate__c\
+    \ - post-offer verification.\n- Invoice__c.Candidate__c - QuickBooks-integrated\
+    \ invoices.\n- Pre_Enrolment_Request__c.Candidate__c - pre-enrollment requests.\n\
+    - Candidate_Portal_Credential__c.Candidate__c - the custom candidate-portal\n\
+    \  login credentials (token auth, not standard users)."
+- title: Account — Connected Objects (3)
+  keywords:
+  - account
+  - candidate
+  - person
+  - each
+  - relationship
+  - means
+  text: "- Recruiter__c.Recruiter_Contact__c - the Employee record pointing at its\n\
+    \  portal Person Account (the \"Recruiter\" record type flavor).\n- AI_Assignment_Logs__c.Candidate_Interview_Change__c\
+    \ - AI assignment audit\n  rows referencing the candidate.\n- Account.Candidate_Referral__c\
+    \ - other candidates referred by this one.\n- Case - standard cases via AccountId/PersonContact\
+    \ (support tickets).\n- Contact - every business account has Contacts; a Person\
+    \ Account owns its\n  hidden PersonContact."
+- title: Account — Business Rules
+  keywords:
+  - account
+  - candidate
+  - person
+  - validation
+  text: "- Candidate_Status_Change_Reason_Required (active): when Candidate_Status__c\n\
+    \  CHANGES to anything other than \"Active\", the user must type a genuinely\n\
+    \  NEW Candidate_Status_Change_Reason__c of at least 50 characters. Changing\n\
+    \  to Active is exempt, and the rule does not fire on record creation. Error\n\
+    \  shown on the reason field: \"Please enter a status change reason of at\n\
+    \  least 50 characters.\" This is the audit backbone of the status lifecycle\
+    \ -\n  the reason is then posted to Chatter by the status-change-log flow."
+- title: Account — Automation
+  keywords:
+  - account
+  - candidate
+  - person
+  - runs
+  text: "RECORD-TRIGGERED FLOWS ON ACCOUNT (active):\n- Create_Onboarding_from_Account_1\
+    \ (after save, create, record-type gated):\n  creates the child Onboarding__c\
+    \ copying ~20 profile fields, sends the new-\n  candidate email, posts Slack\
+    \ (via HttpCalloutGeneric).\n- Candidate_Status_Change_Log (after save, when\
+    \ Candidate_Status__c changes):\n  posts a rich-text Chatter entry - with the\
+    \ reason section when the new\n  status is not Active. (Its doc references a\
+    \ companion before-save flow\n  Candidate_Status_Reason_Clear_On_Status_Change\
+    \ to clear the old reason,\n  but that flow is not present in this org snapshot\
+    \ - verify with team.)"
+- title: Account — Automation (2)
+  keywords:
+  - account
+  - candidate
+  - person
+  - runs
+  text: "FLOWS ON OTHER OBJECTS THAT WRITE ACCOUNT (active):\n- Lead_Conversion_Flow\
+    \ (screen, Lead Convert button): creates/updates the\n  Person Account through\
+    \ Apex LeadConversionHandler, mapping ~30 intake\n  fields; de-dupes on email\
+    \ OR phone against existing Person Accounts.\n- Candidate_Status_Update_when_marketing_status_Updated\
+    \ (Marketing__c\n  update): mirrors the Marketing status onto Candidate_Status__c\
+    \ and copies\n  hold/pause reasons into Reason_for_Hold__c.\n- Marketing_Update_Application_Start_Date_on_Candidate\
+    \ (Marketing__c\n  update): stamps Application_Start_Date__c when marketing\
+    \ goes active.\n- Marketing_Update_Assigned_Recruiter_on_Candidate (Marketing__c\
+    \ update):\n  syncs Assigned_Recruiter__c from the Marketing record.\n- Update_Candidate_Information_from_Onboarding\
+    \ (Onboarding__c update):\n  writes ~30 candidate profile fields from the onboarding\
+    \ form back onto\n  the Account (everything except the two encrypted password\
+    \ fields).\n- Onboarding_record_Inactive (screen, Onboarding \"Pause\" button):\
+    \ sets\n  Candidate_Status__c + Reason_for_Hold__c.\n- Pause_or_Stop_Marketing\
+    \ (screen): sets Candidate_Status__c and sends\n  pause/stop emails + Slack\
+    \ alerts.\n- QB_Send_Invoice_To_QuickBooks_For_Account (screen, \"Send Invoice\"\
+    \n  button): creates/finds the QuickBooks customer (stamping\n  QB_Customer_ID__c\
+    \ and address parts), creates the Invoice__c, emails it."
+- title: Account — Automation (3)
+  keywords:
+  - account
+  - candidate
+  - person
+  - runs
+  text: "- Create_Recruiter_Contact / Provision_Employee_Portal_User /\n  Employee_Offboarding\
+    \ (screen flows, HR feature): create / disable the\n  employee \"Recruiter\"\
+    -record-type Person Account for portal login.\n- Draft (NOT live): Update_Total_Interviews_on_Candidate\
+    \ - would maintain\n  Total_Interviews__c from interviews; it has never run\
+    \ (field is empty).\n\nSCHEDULED APEX:\n- AccountSchedulerJob (Schedulable):\
+    \ nightly. (1) For every Active\n  candidate, checks days since the last interview\
+    \ (or since Application\n  Start Date if no interview): at 30/45/60 days with\
+    \ a 15-day repeat\n  throttle it Slack-alerts the assigned recruiter (+ senior\
+    \ recruiter) and\n  emails the team, stamping Last_Alert_Sent__c. (2) Posts\
+    \ a daily Slack\n  table of today's supported interviews."
+- title: Account — Automation (4)
+  keywords:
+  - account
+  - candidate
+  - person
+  - runs
+  text: "APEX THAT READS/WRITES ACCOUNT (main classes):\n- LeadConversionHandler\
+    \ - the @InvocableMethod convert/dedupe utility (see\n  above); also creates\
+    \ Contacts on business accounts for B2B leads.\n- AuthService / CandidatePortalController\
+    \ / PortalUserAdminRest - candidate\n  and employee portal auth resolve the\
+    \ Person Account.\n- CandidateContext / DashboardService / AWSTrainingIntegration\
+    \ - read\n  candidate data for the portal dashboard and the AWS training/AI\
+    \ engine.\n- SlackCalloutHelper - Slack messaging used by the account alerts.\n\
+    - MicrobatchSelfRegController / self-registration classes - can create\n  Person\
+    \ Accounts from community self-signup."
+- title: Account — Automation (5)
+  keywords:
+  - account
+  - candidate
+  - person
+  - runs
+  text: "QUICK ACTIONS / BUTTONS ON THE RECORD PAGES:\n- Create Interview -> Interview_Create_Reschedule_Flow.\
+    \ NOTE: despite the\n  name this creates an INTERNAL_INTERVIEW__c (internal\
+    \ screening), not an\n  Interview__c.\n- Create Marketing -> Create_Marketing_from_Candidate\
+    \ (guards against a\n  duplicate open engagement).\n- Send Invoice -> QB_Send_Invoice_To_QuickBooks_For_Account\
+    \ (candidate\n  page).\n- Initiate Payment Plan -> Initiate_Payment_Plan; Record\
+    \ Offer Letter\n  Payment -> Create_Invoice_Payment (B2B/vendor pages).\n- Child\
+    \ Account (create related account), Close Case / New Child Case /\n  New Case,\
+    \ Login to Portal as User, Enable Portal/Customer User (grant the\n  Person\
+    \ Account an Experience Cloud login), Mass Change Owner, Call.\n- Embedded on\
+    \ the candidate page: Candidate_Status_Banner_Flow (warning\n  banner when status\
+    \ is not Active; flow version currently marked Obsolete\n  in the snapshot)\
+    \ and Attached_Resume_To_Lead (Resume tab)."
+- title: Contact — What This Object Is
+  keywords:
+  - contact
+  text: "The standard Salesforce Contact object - a person attached to an Account.\
+    \ In\nTHIS org it plays two very different roles, and knowing which one you\
+    \ are\nlooking at matters for almost every question:\n\n  a) PERSON-ACCOUNT\
+    \ SHADOW CONTACTS (98% of records). Because candidates and\n     employees are\
+    \ Person Accounts, every Person Account automatically owns a\n     hidden Contact\
+    \ record behind the scenes. Users never open these directly -\n     they work\
+    \ on the Account - but the platform NEEDS them: a portal login\n     (User record)\
+    \ must point at a Contact, so every one of the 233 community\n     users in\
+    \ the org hangs off one of these person contacts.\n  b) B2B CLIENT/VENDOR CONTACTS\
+    \ (24 records). Real business contacts - the\n     people at a Techsara B2B\
+    \ client or vendor company (hiring managers, HR\n     coordinators, vendor managers).\
+    \ This flavor is brand new, built for the\n     B2B staffing pipeline: 4 custom\
+    \ fields decide who at the client receives\n     candidate-submission emails.\
+    \ Like the rest of the B2B path, it is\n     designed-but-barely-used so far."
+- title: Contact — Kind Of Object
+  keywords:
+  - contact
+  text: "- STANDARD object with 4 custom fields (35 fields tracked in source overall).\n\
+    - Sharing is \"Controlled By Parent\": whoever can see the Account can see its\n\
+    \  contacts. Contacts still carry their own OwnerId for contacts saved without\n\
+    \  an account (\"private\" contacts).\n- 1 record type, 0 validation rules,\
+    \ 8 list views (5 of them from the Zoom\n  \"ZVC\" managed package), 3 web links\
+    \ (Google Maps / Google Search standard\n  buttons + the Zoom package's \"Add\
+    \ To Webinar\").\n- Scale: 1,026 records in preprod - but only 24 are real business\
+    \ contacts;\n  1,002 are the automatic shadow contacts of Person Accounts."
+- title: Contact — Record Types
+  keywords:
+  - contact
+  text: "- \"B2B Client/Vendor Contacts\" (developer name: B2B_Client_Vendor_Contacts),\n\
+    \  active. Intended for people at B2B client and vendor companies; it scopes\n\
+    \  the picklists (Contact_Role__c, LeadSource, salutations, etc.) for that use.\n\
+    \  IN PRACTICE NO RECORD USES IT YET - all 24 business contacts were created\n\
+    \  with no record type, and person-account shadow contacts never get a Contact\n\
+    \  record type (their record type lives on the Account). Treat it as part of\n\
+    \  the newly built B2B layer."
+- title: Contact — How It Is Used — The Business Process
+  keywords:
+  - contact
+  text: "PERSON-ACCOUNT SIDE (automatic, invisible):\n  - Creating a candidate or\
+    \ employee Person Account auto-creates the shadow\n    Contact. Nobody edits\
+    \ it; it exists so the platform can hang things off\n    it - most importantly\
+    \ PORTAL LOGINS: an AIC Portal (Customer Community\n    Plus) User record is\
+    \ \"enabled\" on this contact. All 233 portal users in\n    preprod point at\
+    \ a person contact.\n  - The interview-creation screen flows (Interview_Creation,\
+    \ _V2,\n    B2B_Create_Interview_from_Submission) use this chain in reverse:\
+    \ they take\n    the running portal User, read User.ContactId, and resolve through\
+    \ the\n    Contact/Person Account to the Recruiter__c (\"Employee\") record\
+    \ - that is\n    how a flow knows WHICH EMPLOYEE is the person currently logged\
+    \ in.\n  - The \"Create Contact\" quick action on Recruiter__c (screen flow\n\
+    \    Create_Recruiter_Contact) is part of this wiring: despite the name it\n\
+    \    creates a PERSON ACCOUNT for the employee (which brings the shadow contact\n\
+    \    with it) and links it back to the Recruiter record - the precondition for\n\
+    \    giving that employee a portal login."
+- title: Contact — How It Is Used — The Business Process (2)
+  keywords:
+  - contact
+  text: "B2B SIDE (manual + lead conversion):\n  - When a B2B lead (a client company\
+    \ inquiry) is converted, the\n    Lead_Conversion_Flow decides whether a contact\
+    \ with that email already\n    exists on the client Account (\"Check_Existing_Contact\"\
+    ); if not, it calls\n    the Apex LeadConversionHandler action, which creates\
+    \ the Contact on the\n    (existing or newly created) business Account, copying\
+    \ FirstName, LastName,\n    Email, Phone (into MobilePhone) and Title from the\
+    \ lead, with a\n    duplicate-safe insert.\n  - Client contacts are then meant\
+    \ to be referenced from\n    Job_Requirement__c.Client_Contact__c (\"who at\
+    \ the client owns this job\n    req\" - 3 records linked so far) and to drive\
+    \ submission-email routing via\n    the custom fields (Contact_Role__c, Primary_Submission_Contact__c,\n\
+    \    Receives_Submission_Emails__c, Submission_Notes__c). None of those four\n\
+    \    fields is populated on any record yet - the email-routing process is\n\
+    \    designed but not live."
+- title: Contact — Connected Objects
+  keywords:
+  - contact
+  - each
+  - relationship
+  - means
+  text: "PARENT:\n- Account (via AccountId): the company (business contact) or the\
+    \ Person\n  Account (shadow contact). Sharing is inherited from here. Only 9\
+    \ of the 24\n  business contacts are attached to an Account - the other 15 are\
+    \ unattached\n  \"private\" contacts visible only to their owner.\n\nOBJECTS\
+    \ THAT POINT AT CONTACT:\n- User (ContactId): the portal login enabled on this\
+    \ contact. Every community\n  user (233 in preprod) points at a person contact.\
+    \ This is THE reason the\n  shadow contacts matter.\n- Job_Requirement__c (Client_Contact__c,\
+    \ Lookup): the client-side contact\n  person for a B2B job requirement (3 records\
+    \ populated).\n- AccountContactRelation (ContactId): the standard junction letting\
+    \ one\n  contact relate to several accounts (see its own section - only auto-created\n\
+    \  rows exist).\n- Contact itself (ReportsToId): optional manager-of-this-contact\
+    \ link inside\n  the client org chart (unused in data).\n\nEXPLICIT NON-RELATIONSHIPS\
+    \ (common confusions):\n- Candidate-facing objects (Interview__c, Marketing__c,\
+    \ Onboarding__c ...) do\n  NOT look up Contact - they look up Account (the Person\
+    \ Account). If you are\n  hunting for \"the candidate\", go to Account, not\
+    \ Contact.\n- Recruiter__c links to the employee's Person ACCOUNT\n  (Recruiter_Contact__c\
+    \ -> Account), not to the Contact record, despite that\n  field's \"Employee\
+    \ Contact\" label."
+- title: Contact — Business Rules
+  keywords:
+  - contact
+  - validation
+  text: 'None. Contact has no validation rules in this org - data quality on the
+    B2B
+
+    contacts relies on the (still unused) record type and on duplicate rules
+
+    handled during lead conversion.'
+- title: Contact — Automation
+  keywords:
+  - contact
+  - runs
+  text: "- NO record-triggered flows and no Apex trigger run ON Contact.\n- Flows\
+    \ that TOUCH it as a lookup:\n    * Lead_Conversion_Flow: dedupe check (\"is\
+    \ there already a contact with\n      this email on that account?\") + the two\
+    \ LeadConversionHandler Apex\n      actions that CREATE the contact on an existing\
+    \ / new client account.\n    * Interview_Creation / Interview_Creation_V2 /\n\
+    \      B2B_Create_Interview_from_Submission: read the running portal user's\n\
+    \      ContactId to resolve the logged-in employee (no writes).\n- Apex: LeadConversionHandler.createContactForAccount\
+    \ is the only code that\n  inserts Contacts (B2B lead conversion, duplicate-safe\
+    \ insert).\n- Quick actions / buttons: the standard \"NewContact\" create action\
+    \ appears on\n  many objects' related lists (Job Submission, Onboarding, Invoice,\
+    \ Session,\n  etc. layouts); Recruiter__c's \"Create Contact\" button launches\
+    \ the\n  Create_Recruiter_Contact flow (which actually creates a Person Account\
+    \ -\n  see part 4). Web links: Google Maps / Google Search (standard), ZVC \"\
+    Add To\n  Webinar\" (Zoom managed package - not part of the recruiting process)."
+- title: AccountContactRelation — What This Object Is
+  keywords:
+  - accountcontactrelation
+  - account
+  - contact
+  - relationship
+  text: 'The standard Salesforce junction object that lets ONE Contact be related
+    to
+
+    MANY Accounts (beyond the single AccountId on the contact itself). Salesforce
+
+    auto-creates a "direct" row whenever a contact is attached to an account;
+
+    extra "indirect" rows can be added by hand to say "this person also works
+
+    with that other company".
+
+
+    In THIS org it is essentially dormant plumbing: only the 9 auto-created
+
+    direct rows exist (one per business contact that has an account), nobody has
+
+    ever created an indirect relationship, and the single custom field added to
+
+    it (Relationship_Strength__c - grading how strong the relationship with a
+
+    client contact is) has never been filled in. It exists because the platform
+
+    creates it, plus one custom field someone prepared for future client
+
+    relationship management.'
+- title: AccountContactRelation — Kind Of Object
+  keywords:
+  - accountcontactrelation
+  - account
+  - contact
+  - relationship
+  text: "- STANDARD junction object between Account and Contact; 8 fields tracked\
+    \ in\n  source, 1 custom.\n- No record types, no validation rules, no list views,\
+    \ no page-layout\n  customization worth noting.\n- Access follows the related\
+    \ Account and Contact (a junction has no own\n  sharing model).\n- Scale: 9\
+    \ records in preprod - all auto-created direct relations."
+- title: AccountContactRelation — How It Is Used — The Business Process
+  keywords:
+  - accountcontactrelation
+  - account
+  - contact
+  - relationship
+  text: "STEP 1 - AUTOMATIC CREATION. The moment a Contact gets an AccountId (e.g.\
+    \ the\n  lead-conversion Apex creates a client contact on a client account),\n\
+    \  Salesforce silently inserts a direct AccountContactRelation row for that\n\
+    \  pair. That is where all 9 existing rows came from - no user created any of\n\
+    \  them deliberately.\n\nSTEP 2 - (NOT HAPPENING YET) MULTI-COMPANY RELATIONSHIPS.\
+    \ The intended future\n  use: when the same hiring manager or vendor coordinator\
+    \ works with several\n  client companies, add indirect rows so one contact shows\
+    \ under multiple\n  accounts, and grade each relationship via Relationship_Strength__c\n\
+    \  (Strong / Neutral / Weak) to know which client relationships are solid.\n\
+    \  No indirect row and no strength value exists yet."
+- title: AccountContactRelation — Connected Objects
+  keywords:
+  - accountcontactrelation
+  - account
+  - contact
+  - relationship
+  - each
+  - means
+  text: "- Account (via AccountId): the company side of the pair. In practice a\
+    \ B2B\n  client/vendor business account.\n- Contact (via ContactId): the person\
+    \ side. In practice one of the 24 B2B\n  business contacts (person-account shadow\
+    \ contacts do NOT get relation rows;\n  only 9 rows exist - matching the 9 account-attached\
+    \ business contacts).\n- Nothing else in the org references AccountContactRelation\
+    \ - no custom\n  object, flow, Apex class, report the team relies on, or quick\
+    \ action."
+- title: AccountContactRelation — Automation
+  keywords:
+  - accountcontactrelation
+  - account
+  - contact
+  - relationship
+  - runs
+  text: 'None. No flow, Apex trigger, quick action, or scheduled job touches
+
+    AccountContactRelation in this org. The only "automation" is the platform
+
+    itself auto-creating the direct row when a contact is linked to an account.'
+- title: User — What This Object Is
+  keywords:
+  - user
+  text: 'The standard Salesforce User object - a LOGIN IDENTITY: username, password,
+
+    profile (license + baseline permissions), role (sharing position) and locale.
+
+    Everyone and everything that authenticates to the org is a User: internal
+
+    staff, the ~130 employees who log in through the AIC Portal community,
+
+    Experience-site guest users, and system/integration users.
+
+
+    THE DISTINCTION THAT MATTERS MOST IN THIS ORG: User is NOT the employee
+
+    record. Recruiter__c (label "Employee") is the HR/staffing profile of a
+
+    Techsara staff member - department, manager chain, skills, Slack id,
+
+    incentives. User is only "the account that logs in". Most "who works on
+
+    this?" lookups across the org point at Recruiter__c; User appears mainly in
+
+    audit fields ("who clicked this button"), owner fields, and platform wiring.
+
+    An employee typically has BOTH: a Recruiter__c record (the profile) and a
+
+    User record (the login), joined via Recruiter__c.Recruiter_User__c and via
+
+    the employee''s Person Account.'
+- title: User — Kind Of Object
+  keywords:
+  - user
+  text: "- STANDARD object; 50 fields tracked in source, 5 custom: 1 hand-built\n\
+    \  (Slack_User_Id__c) and 4 from the DocuSign eSignature managed package\n \
+    \ (dfsle__ namespace).\n- Org-wide default for User sharing is Read (users can\
+    \ see each other).\n- No record types, no validation rules. 4 list views (incl.\
+    \ \"AIC Portal\n  Users\" - all users on the AIC Portal profile), 1 field set\n\
+    \  (PersonalInfo_EPIM - a field-masking set for Einstein privacy tooling),\n\
+    \  1 compact layout.\n- Scale: 302 user records in preprod (Aug 2024 - Jul 2026);\
+    \ 168 active,\n  134 deactivated (users are never deleted in Salesforce, only\
+    \ deactivated)."
+- title: User — Record Types
+  keywords:
+  - user
+  text: 'None. User does not support record types; the "flavors" of user are carried
+
+    by UserType/license and Profile instead (see part 4).'
+- title: User — How It Is Used — The Business Process
+  keywords:
+  - user
+  text: "THE USER POPULATIONS (by license/UserType, live data):\n  - EXTERNAL PORTAL\
+    \ STAFF - 233 records (128 active), UserType\n    \"PowerCustomerSuccess\" =\
+    \ CUSTOMER COMMUNITY PLUS license, profile\n    \"AIC Portal\". This is how\
+    \ MOST staff work: they log into the AIC Portal\n    Experience site, not the\
+    \ internal Salesforce app. Each of these logins is\n    enabled on the employee's\
+    \ own PERSON ACCOUNT - every portal user's\n    ContactId points at a person\
+    \ contact (see the Contact section). Their\n    record access is held down by\
+    \ sharing/OWD, not the profile.\n  - INTERNAL USERS - 57 records (30 active),\
+    \ UserType \"Standard\" = full\n    Salesforce license: the Bench Marketing\
+    \ team (20 active, IP-restricted\n    profile), 5 System Administrators, and\
+    \ a handful of integration/legacy\n    logins (API-only integration profiles,\
+    \ Read Only, etc.).\n  - GUEST USERS - 6 (5 active): the unauthenticated visitor\
+    \ identity of each\n    Experience site (Candidate Portal, Talent Hub, AIC Portal\
+    \ site,\n    Techsara Candidate Hub, QuickBooks webhook site).\n  - SYSTEM USERS\
+    \ - 4 Automated Process users + 1 Cloud Integration user +\n    1 inactive Chatter-only\
+    \ user. Platform-owned; ignore for business\n    questions."
+- title: User — How It Is Used — The Business Process (2)
+  keywords:
+  - user
+  text: "PROVISIONING A NEW EMPLOYEE LOGIN (the HR portal-user lifecycle):\n  -\
+    \ HR runs the \"Provision Employee Portal User\" screen flow (with\n    Reset_Employee_Portal_Password\
+    \ and Employee_Offboarding as siblings; all\n    three Active in this snapshot).\
+    \ Because HR themselves are external\n    Customer Community Plus users who\
+    \ cannot Manage Users, the flows call the\n    PortalUserAdminAction Apex, which\
+    \ calls the PortalUserAdminRest\n    @RestResource over the \"Admin_Identity\"\
+    \ named credential - the code then\n    runs AS a System Administrator (the\
+    \ connected app's run-as user) to:\n    reassign the person account to an internal\
+    \ owner, create the Customer\n    Community Plus login on the person contact,\
+    \ reset a password, or\n    deactivate a login when someone leaves.\n  - (Older/standard\
+    \ path: the Communities*/Lightning* self-register\n    controllers exist for\
+    \ community self-registration but the HR-driven flow\n    above is the built\
+    \ process for employees.)"
+- title: User — How It Is Used — The Business Process (3)
+  keywords:
+  - user
+  text: "ROLES & THE SECURITY REDESIGN: 273 of 302 users have a UserRoleId - portal\n\
+    \  users automatically get a per-account community role, internal users sit\
+    \ in\n  the 14-role internal hierarchy. The org's ACTIVE PROJECT is the\n  role-hierarchy/security\
+    \ redesign: segmenting data department/team-wise via\n  role hierarchy + record\
+    \ ownership, with all portal users on Customer\n  Community Plus (see docs/security\
+    \ intake and the Role Hierarchy Blueprint).\n  User.UserRoleId is where that\
+    \ design lands physically.\n\nDAY-TO-DAY: users appear as record owners (OwnerId\
+    \ on every ownable object),\n  in CreatedById/LastModifiedById audit stamps,\
+    \ in \"who initiated this AI\n  run\" audit lookups on Interview__c / AI_Assignment_Logs__c,\
+    \ and as the\n  Account_Manager__c on the B2B objects. Slack notifications @-mention\n\
+    \  people via Slack_User_Id__c."
+- title: User — Connected Objects
+  keywords:
+  - user
+  - each
+  - relationship
+  - means
+  text: "LINKS FROM USER:\n- Contact (ContactId): the contact the portal login is\
+    \ enabled on - in this\n  org ALWAYS a Person Account contact (233 of 233).\
+    \ Empty for internal users.\n- Profile (ProfileId): license + baseline permissions.\
+    \ Active users: AIC\n  Portal 128, Bench Marketing 20, System Administrator\
+    \ 5, the rest are\n  guest/integration profiles (1-2 each).\n- UserRole (UserRoleId):\
+    \ position in the sharing hierarchy (internal role or\n  auto-created portal\
+    \ account role). 273 of 302 populated.\n- User (ManagerId, DelegatedApproverId):\
+    \ standard manager / approval-delegate\n  links. ManagerId is empty on ALL users\
+    \ - the real manager chain lives on\n  Recruiter__c (Assigned_Sr_Recruiter__c\
+    \ etc.), not here."
+- title: User — Connected Objects (2)
+  keywords:
+  - user
+  - each
+  - relationship
+  - means
+  text: "KEY OBJECTS THAT POINT AT USER (beyond OwnerId/CreatedById everywhere):\n\
+    - Recruiter__c (Recruiter_User__c): THE bridge from the Employee profile to\n\
+    \  its login (44 employees linked so far). RecruiterHierarchyService walks\n\
+    \  Recruiter__c, not the User table, to compute the staff hierarchy.\n- Account\
+    \ (Account_Manager__c), Job_Requirement__c / Job_Submission__c\n  (Account_Manager__c,\
+    \ Submitted_By__c): the B2B account-manager fields.\n- Interview__c (Account_Manager__c,\
+    \ User_Initiated_By__c,\n  Reassignment_Initiated_By__c) and AI_Assignment_Logs__c\
+    \ (7 audit lookups:\n  who ran the nightly scheduler, manual runs, reassignment\
+    \ / reshuffle /\n  rollback / preferred-support-person actions, last support\
+    \ person): the AI\n  (COMPASS) assignment audit trail.\n- Training: Candidate_Training__c\
+    \ (Assigned_Trainer_User__c,\n  Candidate_Owner__c), CandidateTrainingStep__c\
+    \ (Assigned_Trainer_User__c),\n  Cohort__c (Lead_Trainer__c), Deliverable__c\
+    \ (Approved_By__c,\n  Submitted_By__c).\n- Interview_Participant__c (User__c):\
+    \ internal attendee identity on an\n  interview roster.\n- Zoom recording compliance:\
+    \ Zoom_Recording_Access_Log__c (User__c,\n  Opened_By__c), Zoom_Recording_User_Folder_Map__c\
+    \ (User__c, Granted_By__c) -\n  who may see / did open which recording folder."
+- title: User — Business Rules
+  keywords:
+  - user
+  - validation
+  text: 'None. No validation rules exist on User; integrity is enforced by the
+
+    platform (unique Username, license limits) and the provisioning Apex.'
+- title: User — Automation
+  keywords:
+  - user
+  - runs
+  text: "- NO record-triggered flow or trigger runs ON User in this org.\n- FLOWS\
+    \ READ IT (8 per the reverse map, all lookups, no writes): the\n  interview-creation\
+    \ flows (Interview_Creation / _V2 /\n  B2B_Create_Interview_from_Submission)\
+    \ fetch the running user's ContactId /\n  IsPortalEnabled to resolve which Employee\
+    \ is logged in;\n  Interview_support_person_Assign, Interview_Send_for_Approval,\n\
+    \  Job_Requirement_Set_Defaults_On_Create,\n  B2b_job_requirement_updated_notification_flow\
+    \ and\n  Onboarding_Alert_after_Service_Agreement_signed look up users for\n\
+    \  defaults/notification addressing.\n- APEX THAT WRITES USER: PortalUserAdminRest\
+    \ (called via PortalUserAdminAction\n  from the HR flows over the Admin_Identity\
+    \ named credential) creates the\n  Customer Community Plus login, resets passwords,\
+    \ and deactivates users -\n  running as an admin because HR are external users.\
+    \ The standard\n  self-registration controllers (CommunitiesSelfRegController,\n\
+    \  LightningSelfRegisterController, MicrobatchSelfRegController,\n  SiteRegisterController)\
+    \ can also create community users.\n- APEX THAT READS USER: SlackCalloutHelper\
+    \ queries User.Slack_User_Id__c to\n  @-mention support people in the CC list\
+    \ of Slack messages;\n  ZoomRecording* classes check the running user for recording\
+    \ access.\n- The planned permission-set auto-assign flow for new employees (specced\
+    \ in"
+- title: User — Automation (2)
+  keywords:
+  - user
+  - runs
+  text: "Components_needs/create_list.docs) will act on the User/permission-set\n\
+    \  layer when built."
+- title: Lead — What This Object Is
+  keywords:
+  - lead
+  text: "Lead is THE intake object of the whole platform - the standard Salesforce\
+    \ Lead\nheavily customized (65 custom fields) to capture three different kinds\
+    \ of\nnewcomers before they become \"real\" records:\n\n  a) B2C PROSPECTIVE\
+    \ CANDIDATES - job seekers Techsara wants to sign up for its\n     paid career-placement\
+    \ program. This is ~99% of all Lead data. The lead\n     carries the sales conversation\
+    \ (rating, plan, pricing, upfront amount)\n     until the person pays and is\
+    \ CONVERTED into a candidate Person Account.\n  b) B2B WEBSITE CANDIDATES -\
+    \ external candidates who applied to a posted job\n     on the Techsara website.\
+    \ A REST endpoint + flow auto-creates these leads\n     and immediately auto-creates\
+    \ a Job Submission against the applied Job\n     Requirement.\n  c) B2B CLIENT\
+    \ LEADS - prospective client/vendor COMPANIES that might send\n     Techsara\
+    \ job requirements. The \"person\" on the lead is the company\n     contact;\
+    \ conversion creates a business Account instead of a candidate.\n\nConversion\
+    \ is the object's whole purpose: the Convert button runs\nLead_Conversion_Flow,\
+    \ which calls the LeadConversionHandler Apex\n(@InvocableMethod \"Convert Lead\"\
+    ) to duplicate-check by email/phone and turn\nthe lead into a Person Account\
+    \ (candidate) plus Contact and optional\nOpportunity. Users are blocked from\
+    \ converting any other way (validation rule)."
+- title: Lead — Kind Of Object
+  keywords:
+  - lead
+  text: "- STANDARD object with 65 custom fields (90 fields total).\n- Has its own\
+    \ owner; org-wide sharing is Public Read/Write/Transfer, so any\n  internal\
+    \ user can see and take leads (this is in scope for the role-\n  hierarchy/security\
+    \ redesign).\n- 3 record types in the source metadata, 5 validation rules, 8\
+    \ list views,\n  4 page layouts (Lead Layout, Lead Layout 2, B2B Client Lead\
+    \ Layout,\n  B2B Website Candidate Layout) and 3 Lightning record pages.\n-\
+    \ Scale: ~2,823 records in preprod (Aug 2024 - Aug 2026), ~25% converted.\n\
+    - NOTE ON DRIFT: the live preprod org has a FOURTH active record type\n  (\"\
+    Prospect\" - the legacy default holding ~99.6% of records) and is missing\n\
+    \  5 fields that exist in the source metadata (see part 8). The local source\n\
+    \  contains a not-yet-deployed intake redesign - verify with team before\n \
+    \ relying on those pieces in the live org."
+- title: Lead — Record Types
+  keywords:
+  - lead
+  - source
+  - live
+  text: "- \"B2C Prospective Candidate\" (developer name: B2C_Prospective_Candidate)\
+    \ -\n  \"Used for internally created leads to track potential candidate details.\"\
+    \n  The B2C sales path: an internally sourced job seeker being sold the career\n\
+    \  program. Uses the \"Prospect\" status process (New -> Contacted -> Negotiation\n\
+    \  -> Payment -> Converted, or Junk/Lost). Its validation rule forces the\n\
+    \  Plan / Offer letter amount / Salary % / Upfront amount fields to be filled\n\
+    \  before the status can reach Negotiation, Payment or Converted.\n- \"B2B Website\
+    \ Candidate Lead\" (B2B_Website_Candidate_Lead) - \"Create lead for\n  external\
+    \ candidate applied from our website.\" Created automatically by the\n  website\
+    \ job-application REST endpoint (only 6 records so far - the pipeline\n  is\
+    \ new). Uses the B2B status process (New -> Contacted -> Negotiation ->\n  Agreement\
+    \ -> Converted, or Junk/Lost).\n- \"B2B Client Lead\" (B2B_Client_Lead) - \"\
+    Create direct client company lead or\n  vendor partnered lead.\" A prospective\
+    \ CLIENT COMPANY, not a person seeking a\n  job (6 records so far). Exempt from\
+    \ the resume-before-conversion rule, but\n  cannot convert until it has at least\
+    \ one Job Requirement AND one Job\n  Submission (validation rule).\n- LIVE-ORG\
+    \ EXTRA: \"Prospect\" - an older, still-active record type not present\n  in\
+    \ the source snapshot. It holds 2,811 of 2,823 live records (~99.6%) - the"
+- title: Lead — Record Types (2)
+  keywords:
+  - lead
+  - source
+  - live
+  text: "entire historical B2C book. B2C_Prospective_Candidate (0 records yet)\n\
+    \  appears to be its designed replacement. Treat \"Prospect\" and \"B2C\n  Prospective\
+    \ Candidate\" as the same business flavor when answering questions."
+- title: Lead — How It Is Used — The Business Process
+  keywords:
+  - lead
+  text: "STEP 1 - A LEAD ARRIVES. Three entry paths:\n  - B2C: a sales/marketing\
+    \ employee creates the lead manually (sourced from\n    purchased lists, referrals,\
+    \ LinkedIn - the top three LeadSource values).\n  - Website: a candidate applies\
+    \ on the Techsara website; the\n    JobRequirementRestService REST endpoint\
+    \ launches the\n    Create_Lead_From_Application flow. It dedupes by email +\
+    \ job (the same\n    email applying to the same job is rejected with a 409),\
+    \ creates or reuses\n    the Lead, stamps Website_Job_External_ID__c and\n \
+    \   Applied_Job_Requirement__c, attaches the resume file, AUTO-CREATES a Job\n\
+    \    Submission (source \"Website Applicant\"), starts a Slack thread in\n \
+    \   #b2b-submissions, and emails the Account Manager and the candidate.\n  -\
+    \ B2B: a sales employee logs a prospective client company as a B2B Client\n\
+    \    Lead and records the contact person, company details and any requirement\n\
+    \    the client mentioned."
+- title: Lead — How It Is Used — The Business Process (2)
+  keywords:
+  - lead
+  text: "STEP 2 - WORKING THE LEAD (B2C sales conversation). The employee drives\
+    \ the\n  standard Status field: New -> Contacted (requires at least one of Email\
+    \ /\n  Phone / LinkedIn URL - validation rule) -> Negotiation -> Payment ->\n\
+    \  Converted. During the calls they fill the candidate profile (experience,\n\
+    \  technology, visa, relocation) and the commercial terms (Plan, Offer letter\n\
+    \  amount, Salary %, Upfront amount - all four required before Negotiation).\n\
+    \  Rating (Hot/Warm/Cold) captures how the pricing call went; its help text\n\
+    \  defines Hot as \"Call Done, Pricing explained - agreed or open to consider\"\
+    .\n\nSTEP 3 - PRE-ENROLMENT FORM (optional, B2C). The \"Send Pre-Enrolment Request\"\
+    \n  button (flow send_pre_enrollment_form) generates a tokenized public form\n\
+    \  link (CreateToken Apex), emails it to the candidate, and creates a\n  Pre_Enrolment_Request__c\
+    \ child record. The candidate fills the form as a\n  guest (Guest_Pre_Enrolment\
+    \ flow - education history, visa, address,\n  declarations). The Pre_Enrolment_Requests\
+    \ record-triggered flow then stamps\n  the six \"Latest Pre-Enrolment\" fields\
+    \ on the Lead so the employee can see\n  sent/opened/submitted progress without\
+    \ opening the child record."
+- title: Lead — How It Is Used — The Business Process (3)
+  keywords:
+  - lead
+  text: "STEP 4 - RESUME AND INVOICING. The resume must be attached before conversion\n\
+    \  (validation rule, non-B2B-client only); the Attached_Resume_To_Lead screen\n\
+    \  flow sets the Resume_Attached__c flag when a file is uploaded. Billing can\n\
+    \  start at the Lead stage: \"Create Invoice\" (Create_Invoice_Payment flow)\n\
+    \  creates an Invoice__c under the lead, and \"Send Invoice\"\n  (QB_Send_Invoice_To_QuickBooks\
+    \ flow) pushes it to QuickBooks (creates or\n  finds the QB customer, creates\
+    \ the QB invoice, emails it) and stores the QB\n  customer id on the lead. Payment_Completed__c\
+    \ records that the candidate\n  paid."
+- title: Lead — How It Is Used — The Business Process (4)
+  keywords:
+  - lead
+  text: "STEP 5 - CONVERT. The user clicks Convert / \"Convert Lead\", which runs\n\
+    \  Lead_Conversion_Flow. The flow calls LeadConversionHandler to:\n  - CHECK\
+    \ DUPLICATES: a true duplicate is an existing Person Account with the\n    SAME\
+    \ EMAIL OR SAME PHONE (name alone never counts). The user resolves\n    matches\
+    \ on screen.\n  - CONVERT: the handler sets Flow_Only_Field__c = true (which\
+    \ is what the\n    Lead_Conversion_Validation rule checks - any other path to\
+    \ Status\n    \"Converted\" is blocked), reassigns the record to the running\
+    \ user, and\n    runs Database.convertLead. Result: a candidate PERSON ACCOUNT\
+    \ (the flow\n    copies ~30 fields onto it - contact numbers, visa, niche, relocation,\n\
+    \    declarations, QB customer id...), a Contact, and optionally an\n    Opportunity.\
+    \ Education_History__c children are re-parented from the Lead\n    to the new\
+    \ candidate. B2B client leads instead produce a business Account\n    (or a\
+    \ Contact on an existing client Account - \"Create Contact\" handler\n    modes\
+    \ with duplicate-rule override).\n  - The LeadConversionTrigger (before insert/update)\
+    \ always BLANKS the\n    standard Company field, so standard conversion cannot\
+    \ silently create a\n    business Account named after the company - candidate\
+    \ conversion must\n    produce a Person Account."
+- title: Lead — How It Is Used — The Business Process (5)
+  keywords:
+  - lead
+  text: "STEP 6 - AFTER CONVERSION. The candidate life continues on Account\n  (onboarding,\
+    \ training, marketing, interviews). Two things still reference\n  the old lead:\
+    \ Invoice__c records created at lead stage (the\n  Update_Invoice_Records_with_Candidate_Details\
+    \ flow fires when the lead\n  converts and relinks its invoices to the new Account),\
+    \ and lookups on\n  downstream objects (Interview__c.Lead__c, Job_Submission__c.Lead__c,\n\
+    \  Internal_Interview__c.Lead__c...) that let B2B records be created before\
+    \ a\n  lead is converted."
+- title: Lead — Connected Objects
+  keywords:
+  - lead
+  - each
+  - relationship
+  - means
+  text: "LOOKUPS FROM LEAD TO OTHER OBJECTS:\n- Job_Requirement__c (Applied_Job_Requirement__c):\
+    \ the posted job the website\n  candidate applied to. Auto-populated by the\
+    \ website intake flow, which\n  matches the Website Job External ID to the requirement.\n\
+    - Company__c (Company_Name__c): the company the person is associated with,\n\
+    \  from the Company__c master list (rarely used - 11 records).\n- Pre_Enrolment_Request__c\
+    \ (Pre_Enrolment_Request__c, label \"Current Pre\n  Enrolment Request\"): the\
+    \ most recent pre-enrolment form request sent to\n  this lead. The Latest_Pre_Enrolment_*\
+    \ fields mirror its status.\n- Campaign (CampaignId): standard campaign attribution\
+    \ (shown read-only on\n  the page; barely used).\n- User/Queue (OwnerId): the\
+    \ employee working the lead. Reassigned to the\n  converting user by LeadConversionHandler\
+    \ at conversion."
+- title: Lead — Connected Objects (2)
+  keywords:
+  - lead
+  - each
+  - relationship
+  - means
+  text: "OBJECTS THAT POINT AT LEAD (children / references):\n- Pre_Enrolment_Request__c\
+    \ (Lead__c): every pre-enrolment form request sent\n  to this lead (related\
+    \ list on the page).\n- Education_History__c (Lead__c): education rows captured\
+    \ via the guest\n  pre-enrolment form; re-parented to the candidate Account\
+    \ at conversion.\n- Invoice__c (Lead__c): invoices raised while still a lead\
+    \ (program fees);\n  relinked to the Account after conversion by flow.\n- Job_Submission__c\
+    \ (Lead__c): B2B submissions made for a not-yet-converted\n  website candidate\
+    \ (the website intake flow creates these).\n- Job_Requirement__c (Client_Lead__c):\
+    \ job requirements sent in by a B2B\n  CLIENT lead before that client company\
+    \ is converted - the basis of the\n  Total_Job_Requirements__c counter and the\
+    \ B2B conversion gate.\n- Interview__c (Lead__c): external interviews scheduled\
+    \ before conversion\n  (either Candidate or Lead is required on an interview).\n\
+    - Internal_Interview__c (Lead__c): internal screening interviews run against\n\
+    \  the lead (the \"Create Interview\" button on the Lead page creates THESE,\
+    \ not\n  Interview__c records).\n- Resume__c (Lead__c): resume records tied\
+    \ to the lead (used by the internal\n  interview / resume tooling).\n- Session__c\
+    \ (Lead__c): scheduled meetings (Zoom/Calendar) booked with the\n  lead.\nCONVERSION\
+    \ TARGETS (standard): Account - a Person Account for candidates or a"
+- title: Lead — Business Rules
+  keywords:
+  - lead
+  - validation
+  - all
+  - active
+  text: "- Attach_Resume_Before_Conversion: \"Please attach the resume before\n\
+    \  converting this Lead.\" - Status cannot be Converted while Resume_Attached__c\n\
+    \  is false (B2B Client leads are exempt - companies have no resume).\n- Background_Required_In_Negotiation:\
+    \ \"Fill Out the Background Information\n  before moving the status to Negotiation.\"\
+    \ - on B2C Prospective Candidate\n  leads, Plan, Offer letter amount, Salary\
+    \ % and Upfront amount must ALL be\n  filled before Status can be Negotiation,\
+    \ Payment or Converted.\n- Contact_Details_Requried (note the typo in the API\
+    \ name): \"Provide either\n  Email or Phone or LinkedIn URL before moving this\
+    \ Lead to Contacted.\"\n- Lead_Conversion_Validation: \"Avoid converting lead\
+    \ from here. Use the\n  'Convert Lead' button.\" - Status can only change to\
+    \ Converted when\n  Flow_Only_Field__c is true, which only the LeadConversionHandler\
+    \ sets. This\n  forces every conversion through the governed flow.\n- Prevent_Lead_Conversion:\
+    \ \"You can't convert this lead because it doesn't\n  have a job requirement\
+    \ or a job submission.\" - a B2B Client Lead may only\n  convert once it has\
+    \ at least one Job Requirement AND one Job Submission\n  (checked via the two\
+    \ Flow-maintained counter fields)."
+- title: Lead — Automation
+  keywords:
+  - lead
+  - runs
+  text: "APEX TRIGGER (LeadConversionTrigger, before insert + before update):\n\
+    - Blanks the standard Company field on every save (except in tests) so the\n\
+    \  standard convert path can never auto-create a business Account named after\n\
+    \  the company. Candidate conversion must yield a Person Account.\n\nAPEX INVOCABLE\
+    \ (LeadConversionHandler, called by Lead_Conversion_Flow):\n- One @InvocableMethod\
+    \ (\"Convert Lead\") with modes used by the flow's five\n  action calls: Check_Dupe\
+    \ (Person-Account duplicate detection by email OR\n  phone), Convert_Lead /\
+    \ Convert_Website_Lead (sets Flow_Only_Field__c,\n  reassigns owner, Database.convertLead\
+    \ with duplicate-allow), and\n  Create_Contact_Existing_Account / Create_Contact_New_Account\
+    \ (B2B: insert a\n  Contact on a client Account with the duplicate-rule \"Save\
+    \ Anyway\" header).\n  Test classes: LeadConversionHandlerTest, LeadConversionTriggerTest.\n\
+    \nINBOUND REST (JobRequirementRestService): the website job-application\nendpoint\
+    \ creates the resume file and launches Create_Lead_From_Application.\n\nRECORD-TRIGGERED\
+    \ FLOW ON LEAD (active):\n- Update_Invoice_Records_with_Candidate_Details (after\
+    \ update; entry on\n  Status + ConvertedAccountId): when the lead converts,\
+    \ finds its Invoice__c\n  children and relinks/updates them with the new candidate\
+    \ Account."
+- title: Lead — Automation (2)
+  keywords:
+  - lead
+  - runs
+  text: "FLOWS ELSEWHERE THAT WRITE LEAD FIELDS:\n- Create_Lead_From_Application\
+    \ (autolaunched, website intake): creates or\n  reuses the Lead; writes Applied_Job_Requirement__c,\n\
+    \  Website_Job_External_ID__c, Resume_Attached__c, Processed_for_JS__c,\n  Company_Name__c\
+    \ / Company_Email__c; creates the Job Submission; Slack +\n  email notifications.\n\
+    - Pre_Enrolment_Requests (record-triggered on Pre_Enrolment_Request__c\n  status\
+    \ change): stamps the six Latest_Pre_Enrolment_* fields on the Lead.\n- Update_Lead_JA_Count_On_Create\
+    \ (on Job Submission create) and\n  B2B_Jr_update_submission_counts (on Job\
+    \ Submission create/update): recount\n  and write Total_Job_Applications__c\
+    \ on the (client) lead.\n- Update_Lead_JR_Count_On_Create / Update_Lead_JR_Count_On_Delete\
+    \ (on Job\n  Requirement create/update/delete): recount Total_Job_Requirements__c\
+    \ on the\n  requirement's Client Lead.\n- Attached_Resume_To_Lead (screen flow):\
+    \ sets Resume_Attached__c = true when\n  a resume file is uploaded against the\
+    \ lead.\n- Lead_Conversion_Flow: updates Status / Flow_Only_Field__c during\
+    \ convert."
+- title: Lead — Automation (3)
+  keywords:
+  - lead
+  - runs
+  text: "SCREEN-FLOW BUTTONS ON THE LEAD PAGES:\n- Convert / \"Convert Lead\": Lead_Conversion_Flow\
+    \ (see above). On all three\n  Lightning record pages.\n- \"Create Interview\"\
+    : Interview_Create_Reschedule_Flow - creates an\n  INTERNAL_INTERVIEW__c screening\
+    \ record for the lead (NOT an Interview__c).\n- \"Create Invoice\": Create_Invoice_Payment\
+    \ - creates an Invoice__c under the\n  lead.\n- \"Send Invoice\": QB_Send_Invoice_To_QuickBooks\
+    \ - pushes the invoice to\n  QuickBooks (create/find customer, create invoice,\
+    \ email it).\n- \"Send Pre-Enrolment Request\": send_pre_enrollment_form - tokenized\
+    \ public\n  form link emailed to the candidate + Pre_Enrolment_Request__c created.\n\
+    - Plus standard quick actions: Send Email, Log a Call, Zoom Phone dialer,\n\
+    \  Chatter posts; a GoogleMaps custom link maps the address.\n\nGUEST-FACING\
+    \ FLOWS: Guest_Pre_Enrolment (the public pre-enrolment form the\ncandidate fills\
+    \ via the token link) reads the Lead and writes the\nPre_Enrolment_Request__c\
+    \ + Education_History__c records."
+- title: Recruiter__c — What This Object Is
+  keywords:
+  - recruiter
+  - employee
+  text: 'Recruiter__c is Techsara''s INTERNAL STAFF REGISTRY. Despite the API name
+
+    "Recruiter", its label is "Employee" and it holds EVERY kind of internal
+
+    person - recruiters, interview support persons, trainers, senior recruiters,
+
+    managers, HR staff. One record = one Techsara employee (current or former).
+
+
+    It exists as a PARALLEL object to the standard Salesforce User because most
+
+    staff historically did not have Salesforce logins - work assignment across the
+
+    whole org ("who is this candidate''s recruiter?", "who supports this
+
+    interview?", "who trains this cohort?") points at Recruiter__c records, not
+    at
+
+    User. A minority of employee records additionally link to a real User via
+
+    Recruiter_User__c (the portal-login population).'
+- title: Recruiter__c — What This Object Is (2)
+  keywords:
+  - recruiter
+  - employee
+  text: "The record carries four jobs at once:\n  a) Basic HR data: name, email,\
+    \ Slack id, joining/leaving dates, employment\n     status, experience level.\n\
+    \  b) The REPORTING LINE: Assigned_Sr_Recruiter__c is a self-lookup to the\n\
+    \     employee's senior. Chained together, these links form the whole company\n\
+    \     org chart - rendered as a tree by the RecruiterHierarchyService /\n  \
+    \   RecruiterHierarchyController Apex + LWC, used for Slack escalations, and\n\
+    \     the load-bearing input to the current role-hierarchy security redesign.\n\
+    \  c) The INTERVIEW-SUPPORT CAPABILITY PROFILE read by the external COMPASS\
+    \ AI\n     engine: an \"active for support\" flag, per-skill-track confidence\
+    \ scores,\n     daily max hours, buffer minutes, IST workday window and lunch\
+    \ time.\n  d) The COMPASS ENGINE'S PER-EMPLOYEE STATE: the engine persists its\
+    \ full\n     mathematical state (Kalman filter, momentum, velocity EMAs) per\
+    \ employee\n     in COMPASS_State_JSON__c between runs."
+- title: Recruiter__c — Kind Of Object
+  keywords:
+  - recruiter
+  - employee
+  text: "- Custom object, the People/staffing domain's anchor.\n- TOP-LEVEL object\
+    \ (no master-detail parent). Records have their own Owner.\n- Org-wide default\
+    \ is PUBLIC READ/WRITE - internally AND for external (portal)\n  users. Every\
+    \ employee record is editable by anyone with object permissions;\n  tightening\
+    \ this is part of the role-hierarchy security redesign.\n- Name field is plain\
+    \ TEXT labeled \"Employee Name\" (not an auto-number). It is\n  auto-stamped\
+    \ from First Name + Last Name by a flow at creation.\n- 44 custom fields in\
+    \ preprod (47 in source - 3 portal-login \"Provisioning\"\n  fields are built\
+    \ in this repo / piloted in the dev10 sandbox but NOT yet\n  deployed to preprod),\
+    \ 0 record types, 1 validation rule, 2 list views\n  (\"All\", \"All Active\
+    \ Recruiters\"). Field history tracking is enabled.\n- Scale: 280 records in\
+    \ preprod (created Aug 2024 to Aug 2026); roughly half\n  are former employees\
+    \ kept for history."
+- title: Recruiter__c — Record Types
+  keywords:
+  - recruiter
+  - employee
+  text: 'None. All employees share one record type; role distinctions are carried
+    by
+
+    fields (Experience_Level__c, Active_For_Interview_Support__c, the reporting
+
+    line) rather than record types.'
+- title: Recruiter__c — How It Is Used — The Business Process
+  keywords:
+  - recruiter
+  - employee
+  text: "STEP 1 - ONBOARDING A NEW EMPLOYEE. HR/admin creates the record manually\
+    \ (the\n  standard New button on the Employee tab/page). They enter First/Last\
+    \ Name,\n  Email, Slack User Id, Date of Joining, Experience Level, and - critically\
+    \ -\n  \"Reporting to\" (Assigned_Sr_Recruiter__c), which slots the person into\
+    \ the\n  org chart. On save, the Employee_Populate_FullName flow stamps the\
+    \ record\n  Name as \"First Last\".\n\nSTEP 2 - OPTIONAL PERSON-ACCOUNT LINK.\
+    \ The \"Create Contact\" button runs the\n  Create_Recruiter_Contact screen\
+    \ flow: it creates a Person Account for the\n  employee (copying name, email,\
+    \ Slack id) and writes it back to\n  Recruiter_Contact__c (+ the PersonAccount__c\
+    \ text field). This gives the\n  employee a presence in the Account-centric\
+    \ side of the org.\n\nSTEP 3 - WORK HANGS OFF THE RECORD. Once created, the\
+    \ employee record is what\n  everything else assigns work to: candidates get\
+    \ Assigned_Recruiter__c (kept\n  in sync from Marketing__c by flow), Marketing\
+    \ engagements and daily\n  Application__c logs carry Recruiter__c, interviews\
+    \ carry Recruiter__c and\n  Interview_Support_Person__c, internal interviews\
+    \ carry Interviewer__c,\n  trainings carry Assigned_Trainer__c, sessions reference\
+    \ Host_User__c and\n  additional attendees, resumes record Uploaded_By__c /\
+    \ Approved_By__c."
+- title: Recruiter__c — How It Is Used — The Business Process (2)
+  keywords:
+  - recruiter
+  - employee
+  text: "STEP 4 - THE ORG CHART. The Assigned_Sr_Recruiter__c chain is read by two\n\
+    \  Apex classes behind org-chart LWCs: RecruiterHierarchyService (returns the\n\
+    \  tree of ACTIVE employees only, with cycle/depth guards) and the older\n \
+    \ RecruiterHierarchyController (excludes Former Employees; also exposes\n  Experience_Level__c\
+    \ per node). The same chain drives Slack escalation: the\n  scheduled AccountSchedulerJob\
+    \ pings a recruiter AND their senior (via both\n  employees' Slack ids) when\
+    \ an active candidate has no interviews scheduled.\n  The departments/ org-chart\
+    \ diagrams and the role-hierarchy redesign\n  (Role_Hierarchy_Blueprint) are\
+    \ built directly from this field.\n\nSTEP 5 - INTERVIEW-SUPPORT POOL & COMPASS.\
+    \ Employees who help candidates\n  through interviews are flagged Active_For_Interview_Support__c\
+    \ (17 people\n  today). The external COMPASS AI engine (AWS Lambda, named-credential\n\
+    \  callouts) picks a support person for each Interview__c from this pool. The\n\
+    \  capability fields (daily max hours, buffer, workday window, lunch) exist\
+    \ as\n  engine inputs; after each supported interview the engine updates the\n\
+    \  employee's per-track Confidence_Score_* ratings and re-saves its full state\n\
+    \  into COMPASS_State_JSON__c. (The per-interview before/after audit of those\n\
+    \  updates lives on Interview__c, section 8 group L of that object.)"
+- title: Recruiter__c — How It Is Used — The Business Process (3)
+  keywords:
+  - recruiter
+  - employee
+  text: "STEP 6 - LEAVE. The \"Create Leave Request\" button runs the Request_Leave\n\
+    \  screen flow, which creates an Employee_Leave__c record (full/partial day,\n\
+    \  reason, dates) linked to this employee. A manager approves it via the\n \
+    \ Manager_Decision flow (which resolves the approver through Recruiter_User__c);\n\
+    \  the Tentative_calendar_Event flow auto-creates a tentative calendar Event\n\
+    \  as soon as the leave is logged, and the Leave_Event_Sync flow keeps that\n\
+    \  Event in step with later changes. The leave fields ON the employee record\n\
+    \  itself (On Leave Today, Leave Start/End) predate this and are barely used\
+    \ -\n  Employee_Leave__c is the real leave system.\n\nSTEP 7 - OFFBOARDING.\
+    \ Employment_Status__c is set to \"Former Employee\" and\n  Last_Working_Date__c\
+    \ recorded. Former employees stay in the database (131\n  of 280 records) so\
+    \ historic interviews/candidates keep their references,\n  and the hierarchy\
+    \ code simply filters them out."
+- title: Recruiter__c — How It Is Used — The Business Process (4)
+  keywords:
+  - recruiter
+  - employee
+  text: "PLANNED (built in source, not yet in preprod; piloted in the dev10 sandbox):\n\
+    \  an HR portal-login toolkit on this record. \"Provision Portal User\" and\n\
+    \  \"Reset Portal Password\" quick actions run the Provision_Employee_Portal_User\n\
+    \  and Reset_Employee_Portal_Password screen flows, and the Employee_Offboarding\n\
+    \  record-triggered flow deactivates the login when Employment_Status__c flips\n\
+    \  to \"Former Employee\". All three call the PortalUserAdminAction invocable\n\
+    \  Apex, which calls the org's own PortalUserAdminRest endpoint through the\n\
+    \  Admin_Identity named credential so the User create/reset/deactivate runs\n\
+    \  under an admin identity. Outcomes are tracked by the three Provisioning_*\n\
+    \  fields, which the HR_Department permission set grants. Separately, the\n\
+    \  role-hierarchy project plans a flow that auto-assigns permission sets when\n\
+    \  a new Employee record is created (Components_needs/create_list.docs)."
+- title: Recruiter__c — Connected Objects
+  keywords:
+  - recruiter
+  - employee
+  - each
+  - relationship
+  - means
+  text: "PARENT: none - standalone object with its own owner and sharing.\n\nSELF-RELATIONSHIP:\n\
+    - Recruiter__c (via Assigned_Sr_Recruiter__c, \"Reporting to\"): the employee's\n\
+    \  senior/manager. This single self-lookup encodes the entire company\n  hierarchy\
+    \ (94% populated; the ~17 blanks are the top-level leaders).\n\nLOOKUPS FROM\
+    \ EMPLOYEE TO OTHER OBJECTS:\n- User (Recruiter_User__c): the employee's actual\
+    \ Salesforce/portal login,\n  when they have one (44 of 280). Used to route\
+    \ approvals and to host\n  calendar events/sessions as a real User.\n- Account\
+    \ (Recruiter_Contact__c, label \"Employee Contact\"): the employee's\n  own\
+    \ Person Account, created by the Create Contact flow (76% populated)."
+- title: Recruiter__c — Connected Objects (2)
+  keywords:
+  - recruiter
+  - employee
+  - each
+  - relationship
+  - means
+  text: "OBJECTS THAT POINT AT EMPLOYEE (who assigns work to whom):\n- Account (Assigned_Recruiter__c):\
+    \ the recruiter responsible for a candidate;\n  synced from the Marketing engagement\
+    \ by flow. Basis of candidate ownership\n  reporting and the no-interview Slack\
+    \ escalations.\n- Marketing__c (Recruiter__c): recruiter running the candidate-marketing\n\
+    \  engagement.\n- Application__c (Recruiter__c): recruiter credited with each\
+    \ daily\n  application batch (copied from Marketing by the ApplicationRecordCreator\n\
+    \  Apex job).\n- Interview__c - THREE lookups: Recruiter__c (handling recruiter),\n\
+    \  Interview_Support_Person__c (the AI-assigned support person),\n  Interviewer_Assignment_Constraint__c\
+    \ (a pinned \"must use\" support person).\n  (Quirk: Interview__c's Preferred/Previous\
+    \ Support Person fields point at\n  the STANDARD Salesforce \"Employee\" object,\
+    \ not this custom one - a\n  metadata subtlety to remember when reporting.)\n\
+    - Interview_Participant__c (Employee__c): roster row when an employee joins\n\
+    \  an interview call.\n- Internal_Interview__c (Interviewer__c): the employee\
+    \ conducting an internal\n  screening interview.\n- Candidate_Training__c /\
+    \ CandidateTrainingStep__c (Assigned_Trainer__c): the\n  trainer running a candidate's\
+    \ training and its steps.\n- Session_Window__c (Trainer__c): a trainer's recurring\
+    \ availability window\n  for session scheduling."
+- title: Recruiter__c — Connected Objects (3)
+  keywords:
+  - recruiter
+  - employee
+  - each
+  - relationship
+  - means
+  text: "- Session__c (Host_User__c, Additional_Attendee_1__c/_2__c): who hosts\
+    \ /\n  additionally attends a scheduled meeting.\n- Employee_Leave__c (Employee__c,\
+    \ HR_Approver__c): leave requests by, and\n  approved by, employees.\n- Resume__c\
+    \ (Uploaded_By__c, Approved_By__c): who uploaded/approved a\n  candidate resume\
+    \ version.\n- AI_Assignment_Logs__c - FIVE lookups (Compass_R_scheduler_run_by__c,\n\
+    \  Manual_Main_AI_Assignment_run_by__c, Main_AI_Assignment_scheduler_run_by_\n\
+    \  old__c, Reassignment_by__c, Last_Support_Person1__c): audit of which\n  employee\
+    \ ran/was affected by each COMPASS assignment run."
+- title: Recruiter__c — Business Rules
+  keywords:
+  - recruiter
+  - employee
+  - validation
+  text: "One active rule:\n- Start_End_Time_Required_If_Tomorrow_Avai: \"Start Time\
+    \ IST and End Time IST\n  are required when Tomorrow Availability is checked.\"\
+    \ An employee cannot\n  declare themselves available tomorrow without saying\
+    \ which IST hours they\n  will cover."
+- title: Recruiter__c — Automation
+  keywords:
+  - recruiter
+  - employee
+  - runs
+  text: "RECORD-TRIGGERED FLOW (active):\n- Employee_Populate_FullName (before save,\
+    \ create): stamps the record Name\n  as First_Name__c + \" \" + Last_Name__c.\
+    \ This is why Name is a text field.\n\nSCREEN FLOWS / BUTTONS ON THE PAGE (quick\
+    \ actions on the Recruiter Layout):\n- Create Contact -> Create_Recruiter_Contact\
+    \ flow: creates the employee's\n  Person Account and updates Recruiter_Contact__c\
+    \ / PersonAccount__c.\n- Create Leave Request -> Request_Leave flow: creates\
+    \ an Employee_Leave__c\n  (leave type, full/partial day, dates, reason) for\
+    \ this employee.\n- (Pilot, not in preprod) Provision Portal User -> Provision_Employee_Portal_\n\
+    \  User flow: HR requests an AIC Portal login; the flow calls the\n  PortalUserAdminAction\
+    \ invocable Apex, which calls the org's own\n  PortalUserAdminRest endpoint\
+    \ through the Admin_Identity named credential\n  (so the User is created under\
+    \ an admin identity), then stamps\n  Provisioning_Status__c = \"Provisioned\"\
+    . Companions in the same pilot:\n  Reset Portal Password quick action -> Reset_Employee_Portal_Password\
+    \ flow,\n  and the Employee_Offboarding record-triggered flow on this object,\
+    \ which\n  deactivates the login when Employment_Status__c becomes \"Former\
+    \ Employee\"."
+- title: Recruiter__c — Automation (2)
+  keywords:
+  - recruiter
+  - employee
+  - runs
+  text: "FLOWS THAT READ EMPLOYEE RECORDS (lookups, no writes): the interview-creation\n\
+    flows (Interview_Creation, Interview_Creation_V2, B2B_Create_Interview_from_\n\
+    Submission, Interview_Record_Initial_Call_Flow), Interview_Preferred_Support_\n\
+    Person, Slack_Notification_When_There_is_an_interview (reads Slack_User_Id__c\n\
+    to @-mention the recruiter), Marketing_Update_Assigned_Recruiter_on_Candidate\n\
+    (copies the Marketing recruiter onto the candidate Account),\nBackground_Check_Session_Creation,\
+    \ Extension_Requested_Notify_Trainer,\nManager_Decision and Tentative_calendar_Event\
+    \ (leave approval/calendar),\nView_Interview_Log_Flow.\n\nAPEX:\n- RecruiterHierarchyService\
+    \ / RecruiterHierarchyController: build the org-\n  chart tree from Assigned_Sr_Recruiter__c\
+    \ for the hierarchy LWCs (active\n  employees only; cycle and depth guarded).\n\
+    - AccountSchedulerJob (scheduled): Slack-escalates inactive marketing\n  candidates\
+    \ to the assigned recruiter AND their senior via the two\n  employees' Slack\
+    \ ids.\n- ApplicationRecordCreator: copies Marketing__c.Recruiter__c onto each\
+    \ daily\n  Application__c record it creates.\n- SessionSchedulerController:\
+    \ resolves a training session's host User through\n  the trainer's Recruiter_User__c\
+    \ field."
+- title: Recruiter__c — Automation (3)
+  keywords:
+  - recruiter
+  - employee
+  - runs
+  text: 'EXTERNAL WRITER: the COMPASS AI engine (AWS Lambda) writes the six
+
+    Confidence_Score_* fields, COMPASS_State_JSON__c, COMPASS_State_Last_Saved_
+
+    UTC__c and COMPASS_State_Schema_Version__c after each run. No Salesforce code
+
+    computes these.
+
+
+    RECORD PAGE: Lightning page "Recruiter Record page" (fields + related lists:
+
+    Interviews, Applications, Candidates, Employee Leaves, Internal Interviews).
+
+    Note the record page marks Slack_User_Id__c required and Recruiter_Contact__c
+
+    read-only.'

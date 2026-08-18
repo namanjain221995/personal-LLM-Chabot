@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Max_Submissions_Allowed__c</fullName>
+    <description>Optional maximum number of candidate profiles the client will accept. Prevents over-submitting when client has a strict profile limit.</description>
+    <externalId>false</externalId>
+    <inlineHelpText>Enter the maximum profiles the client will review. Leave blank if client has no limit. System will warn when this limit is approached.</inlineHelpText>
+    <label>Max Submissions Allowed</label>
+    <precision>18</precision>
+    <required>false</required>
+    <scale>0</scale>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Number</type>
+    <unique>false</unique>
+</CustomField>

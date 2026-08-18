@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ValidationRule xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Recruiter_required_before_applications</fullName>
+    <active>true</active>
+    <errorConditionFormula>AND(
+ ISBLANK(Recruiter__c),
+ ISPICKVAL(Status__c,&apos;Applications&apos;),
+ ISCHANGED(Status__c)
+)</errorConditionFormula>
+    <errorDisplayField>Recruiter__c</errorDisplayField>
+    <errorMessage>Assign a Recruiter before starting the applications</errorMessage>
+</ValidationRule>

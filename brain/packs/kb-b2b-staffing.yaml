@@ -1,0 +1,1273 @@
+# Compiled 2026-08-16 from brain/sources/techsara-org-knowledge-base.txt (preprod org documentation, 71 objects) by the brain ingestion pipeline: deterministic section/field parsing, every field name validated against the production dictionary + warehouse table list, rules distilled and adversarially verified. Fields the production warehouse lacks are only ever mentioned as explicit not-synced caveats.
+# Domain: PART 2 — verifier verdict: ship_with_fixes.
+name: kb-b2b-staffing
+description: How TechSara's B2B staffing pipeline works — Job_Requirement__c requisitions
+  and Job_Submission__c candidate submissions through to placement, rates and margins,
+  website job publishing, plus the Company__c market-employer master, the Vendor__c
+  proxy-support directory, and niche question pools.
+triggers:
+- job requirement
+- job requirements
+- job submission
+- job submissions
+- submission
+- submissions
+- requisition
+- requisitions
+- staffing
+- b2b
+- placement
+- placements
+- placed
+- bill rate
+- pay rate
+- margin
+- proxy
+- proxies
+- proxy support
+- vendor
+- vendors
+- website applicant
+- openings
+- submission deadline
+- sla
+- shortlisted
+- niche question
+- niche questions
+- company tier
+- interview difficulty
+tables:
+- Job_Requirement__c
+- Job_Submission__c
+- Company__c
+- Vendor__c
+- Niche__c
+- Niche_Question__c
+rules: 'B2B staffing rules:
+
+  - Requirement client is ONE pair: prospect Client_Company__c + Client_Lead__c,
+  or converted Client_Account__c + Client_Contact__c (business Account, never a
+  Person Account).
+
+  - Job_Status__c values: New | Open | On Hold | Closed; no ''Filled'' — filled
+  ~= Closed + Reason_for_JR_Closure__c ''Completed'' (unverified — say so).
+
+  - Job_Submission__c.Job_Requirement__c (lookup) -> the requirement; Candidate__c
+  (Person Account) OR Lead__c; Submission_Source__c ''Website Applicant'' rows start
+  Lead-only until conversion — Applicant_Name__c/Applicant_Email__c always flow-filled.
+
+  - Outcome = Submission_Status__c, never Placement_Status__c (empty even on Placed
+  rows). Placed = ''Placed''; API ''Client Shortlisted'' = label ''Shortlisted for
+  Interview''.
+
+  - Sent-to-client = Client_Submission_Date_Time__c IS NOT NULL (= Client_Submission_Count__c).
+
+  - Submission money: Submitted_Bill_Rate__c/Candidate_Rate__c/Expected_Margin__c;
+  requirement''s Client_Bill_Rate__c/Target_Candidate_Rate__c/Estimated_Margin__c
+  = intake targets. AM/leadership only.
+
+  - Requirement counters = flow rollups; Interview_Count__c drifts — count child
+  rows.
+
+  - SUM Number_of_Openings__c for seats (a req can hold 40+); a submission may have
+  several interviews.
+
+  - Website-visible = Website_Status__c ''Published''; Publish_to_Website__c not
+  enforced.
+
+  - Employment_Type__c holds legacy ''Full Time'' beside ''Full-Time'' — match both.
+
+  - Company__c = market employers, NOT B2B clients (those are Accounts); Name UPPERCASE,
+  suffixes stripped — match normalized. Tier__c bulk-defaulted — uncurated.
+
+  - Vendor__c = interview proxy-support directory (In_House_Proxy__c = in-house),
+  NOT B2B vendor clients; sandbox-empty, dangling lookups — caveat answers.
+
+  - B2B pipeline is brand new: tiny/zero counts = not rolled out yet, not a business
+  result — say so.'
+glossary:
+  job requirement: One open B2B job requisition from a client or vendor (Job_Requirement__c,
+    auto-numbered JR-XXXXX) — e.g. 'Client X needs 2 Salesforce Developers, remote,
+    submit profiles by Friday'.
+  submission: One candidate proposed for one job requirement (Job_Submission__c,
+    JS-XXXXX) — the junction record the whole B2B pipeline runs on.
+  placement: 'A submission whose candidate actually started at the client: Submission_Status__c
+    = ''Placed''. Ignore Placement_Status__c — it exists but has stayed empty in
+    practice, even on Placed rows.'
+  bill rate: 'What Techsara charges the client: Submitted_Bill_Rate__c on the submission
+    is the negotiated per-deal rate; Client_Bill_Rate__c on the requirement is only
+    the intake target.'
+  candidate rate: What the candidate expects to be paid (Candidate_Rate__c) — per
+    hour for contract or annual for salary, per Rate_Type__c.
+  margin: 'Bill rate minus candidate pay: Expected_Margin__c per submission, Estimated_Margin__c
+    per requirement — sensitive, meant for AM/leadership only.'
+  proxy: An interview-support person or agency from the Vendor__c directory who
+    joins a candidate's interview call ('Proxy Support'); Techsara-internal ones
+    carry In_House_Proxy__c = true.
+  submission deadline: The client's cutoff for receiving candidate profiles (Submission_Deadline__c)
+    — drives the SLA status and the 24-hour zero-submission urgent alerts.
+  website applicant: Someone who applied on the public careers site — becomes a
+    Lead plus an auto-created Job Submission with Submission_Source__c 'Website
+    Applicant' (Lead-only, no Candidate yet).
+  account manager: The Techsara owner of the client relationship (Account_Manager__c
+    on both requirement and submission) who reviews submissions, runs Submit to
+    Client, and receives every alert.
+  openings: How many seats one requirement fills (Number_of_Openings__c) — can be
+    a large batch requisition, so sum it for headcount questions.
+  niche question: One Niche_Question__c row mapping a question-bank question into
+    a niche's question pool; a question can serve several niches.
+field_notes:
+  Job_Requirement__c:
+    Client_Account__c: The B2B client or vendor company that sent this requirement
+      - must be a business Account, never a candidate Person Account (validation
+      rule blocks it, and the delete of a referenced Account is restricted).
+    Client_Contact__c: The hiring manager or vendor contact who sent the requirement
+      and should receive candidate profiles - used for submission emails and interview
+      scheduling.
+    Client_Company__c: 'PROSPECT stand-in for Client Account: the client company
+      from the Company__c master list, used while the B2B client has not yet been
+      converted into a real client Account (help text says exactly this). Delete-restricted.'
+    Client_Lead__c: 'PROSPECT stand-in for Client Contact: the client-side Lead
+      (record type "B2B Client Lead") until conversion. A lookup filter requires
+      the Lead''s company to match the chosen Client Company.'
+    Has_Client_Side__c: TRUE when Client Account OR Client Contact is filled - a
+      helper flag for reports/automation to spot the "converted client" side without
+      null checks.
+    Has_Prospect_Side__c: TRUE when Client Company OR Client Lead is filled - the
+      matching helper for the prospect side. Together with Has_Client_Side__c it
+      makes the pair rule auditable in list views.
+    Account_Manager__c: The Techsara Account Manager who owns this requirement and
+      the client relationship. Auto-populated from the client account's AM at creation
+      (help text), changeable by hand.
+    Job_Title__c: The open position's title exactly as the client provided it (e.g.
+      "Salesforce Developer", "Java Backend Engineer"). Manual entry.
+    Job_Description__c: The FULL INTERNAL job description - client details, technical
+      requirements, interview process, anything the team needs. Explicitly NEVER
+      shown on the website (that is what Public_Website_Description__c is for).
+    Primary_Skills__c: The required skill list (e.g. "Salesforce Apex, LWC, REST
+      integration"). Manual entry; used by recruiters for candidate matching and
+      displayed on website listings via the API.
+    Location__c: Free-text job location ("Austin TX", "New York City", "Hybrid -
+      Chicago"). Manual entry; shown on the website and matchable via the REST API's
+      contains-filter. 3/3 populated.
+    Work_Mode__c: 'The work arrangement: Remote (fully remote) | Hybrid (mix of
+      remote and office) | Onsite (full time at the client location). Manual entry;
+      website-visible and an API filter. Data: Remote 2, Hybrid 1.'
+    Employment_Type__c: 'The engagement/tax structure of the role: C2C (corp-to-corp)
+      | W2 Contract (W2 employee of the staffing entity) | Full-Time (permanent
+      employee) | Contract-to-Hire (starts contract, may convert).'
+    Duration__c: Expected engagement length as free text ("6 months", "Long-term",
+      "3 months with extension"). Manual entry; used for matching and website display.
+      3/3 populated.
+    Number_of_Openings__c: How many seats the client needs to fill (default 1).
+      When this many candidates are placed the requirement can be marked filled.
+      Also feeds the Max Submissions validation (the cap must exceed the openings).
+    Required_Visa_Status__c: 'Which work authorizations the client accepts: USC
+      | GC | H1B | H4 EAD | OPT | CPT | TN | Any. Blank or "Any" = all accepted.'
+    Minimum_Experience_Required__c: 'Short free-text minimum-experience statement
+      written specifically for the website listing (help text: "used to show required
+      experience to website"). Manual entry; returned by the REST API. 3/3 populated.'
+    Client_Bill_Rate__c: SENSITIVE. The agreed rate Techsara CHARGES the client
+      (per the Rate Type). Field description says visible only to the Account Manager
+      and Leadership - never to recruiters or the website. Manual entry at intake.
+    Target_Candidate_Rate__c: SENSITIVE. The target PAY rate for the candidate.
+      Combined with the bill rate to plan margin. Manual entry; same confidentiality
+      rules. 3/3 populated.
+    Estimated_Margin__c: 'Client_Bill_Rate__c - Target_Candidate_Rate__c: the estimated
+      per-unit profit on this requirement, auto-calculated. Same AM/Leadership-only
+      intent.'
+    Rate_Type__c: 'What unit the rates are in: Hourly (contract/C2C/W2) | Salary
+      (full-time permanent) | Daily (some consulting arrangements). Manual entry;
+      copied onto Job Submissions by the submit flows. Data: Hourly 2, Salary 1.'
+    Job_Status__c: 'The requirement''s lifecycle state: New (default - just recorded)
+      | Open (actively sourcing; requires a Submission Deadline) | On Hold (client
+      paused it) | Closed (done).'
+    Priority__c: 'Urgency of the requirement: Urgent | High | Medium. Manual entry;
+      changing it re-notifies the AM, and it is returned/filterable via the API.'
+    Reason_for_JR_Closure__c: 'Why the requirement was closed: Completed (filled)
+      | Cancelled (client pulled it) | No Response (client went quiet) | Expired
+      (deadline passed unfilled) | Other | Client Hold (inactive value, no longer
+      selectable).'
+    Other_Closure_Reason__c: Free-text closure detail, meant to be filled when the
+      reason chosen is "Other". (No validation rule enforces the pairing today.)
+      0/3 populated.
+    Submission_Deadline__c: 'THE clock of the whole object: the date/time by which
+      candidate profiles must reach the client. Required at the field level and
+      doubly enforced when the job is Open (two active validation rules)'
+    Requirement_Received_Date_Time__c: When the requirement arrived from the client.
+      Defaults to NOW() and is stamped by the Job_Requirement_Set_Defaults_On_Create
+      flow - help text says do not edit manually.
+    SLA_Status__c: 'Live traffic light for list views and dashboards: "Closed" when
+      the job status is Closed (or the legacy Filled/Cancelled/Expired values),
+      blank when no deadline is set, otherwise "Overdue" (deadline passed)'
+    Last_Notification_Sent__c: 'Throttle timestamp for the recurring urgent-reminder
+      loop: when the last urgent reminder went out (help text calls it the 4-hour
+      loop'
+    Submission_Count__c: How many Job Submissions exist against this requirement
+      - a flow- maintained rollup (B2B_Jr_update_submission_counts recounts on every
+      submission change
+    Client_Submission_Count__c: 'Of those submissions, how many were actually SENT
+      TO THE CLIENT (the subset with a client-submission timestamp) - same flow
+      maintains it. Internal-vs-client funnel metric. Data: 2 in total.'
+    Max_Submissions_Allowed__c: The client's cap on how many profiles they will
+      review; blank = no limit. Must be greater than the Number of Openings (validation
+      rule)
+    Interview_Count__c: How many B2B interviews this requirement has generated -
+      incremented by the B2B_Create_Interview_from_Submission flow when an interview
+      is created.
+    Publish_to_Website__c: 'Eligibility switch for the careers site: help text says
+      the job appears only when this is checked AND Website Status = Published AND
+      the public description is filled. Manual.'
+    Website_Status__c: 'The actual publication state the REST API filters on: Draft
+      (default - not public) | Published (shows on the website while the job is
+      Open and the deadline is future) | Unpublished (removed from the website but
+      the job'
+    Public_Website_Description__c: The CLEANED, public-safe job description shown
+      to website visitors - explicitly must not contain a confidential client's
+      name, internal rates, or internal notes (contrast with the internal Job_Description__c).
+    Show_Client_Name_on_Website__c: Whether the client's name may appear on the
+      public listing. Overridden by the "Confidential Client" flag on the Account
+      - a confidential client's name NEVER shows regardless of this checkbox.
+    External_Job_ID__c: The public reference ID of this job - auto-generated by
+      the Job_Requirement_Set_Defaults_On_Create flow, unique
+  Job_Submission__c:
+    Candidate__c: 'The candidate Person Account being submitted. Help text: only
+      Candidate Person Accounts are valid; the Submit Candidate Profile flow filters
+      to Person Accounts. Set by the recruiter in the submit flow.'
+    Lead__c: 'The website applicant Lead behind this submission. Help text: "Auto-set
+      by Flow 7 (Website Lead to JS) when creating JS from a website applicant Lead"
+      - that flow is Create_Lead_From_Application in the org.'
+    Applicant_Name__c: The applicant's name as plain text - filled on every record
+      (7/7) by the creating flow, so the submission is readable/emailable even before
+      a Candidate Person Account exists.
+    Applicant_Email__c: The applicant's email address, stamped by the creating flow
+      (7/7 populated). This is the address the outcome-sync flow prefers when emailing
+      the candidate (falling back to the Person Account or Lead email)
+    Availability__c: 'When the candidate can start, in free text. Help text examples:
+      "Immediate", "2 weeks notice", "Available from June 15", "Currently on project
+      until July".'
+    Visa_Confirmation__c: 'The candidate''s work-authorization status, confirmed
+      before entry. Help text examples: "US Citizen", "Green Card Holder", "H1B
+      (valid through 2027)".'
+    Job_Requirement__c: The client's open job this candidate is submitted for. Required
+      in practice (validation rule for non-self-service sources; 7/7 populated)
+      and, per help text, should never be changed after creation.
+    Account_Manager__c: The Account Manager who must review and approve this submission
+      - auto-copied from the Job Requirement by the creating flow (7/7 populated).
+    Submitted_By__c: The user who ran the Submit Candidate Profile flow - auto-populated
+      by the flow (7/7). Used for recruiter performance reporting ("who sourced
+      this placement").
+    Submission_Source__c: 'Where the submission came from: Internal Recruiter (a
+      recruiter submitted the candidate from the Job Requirement page) | Website
+      Applicant (auto-created by "Flow 7" from a public website application) | Candidate
+      Portal'
+    Submission_Status__c: 'THE lifecycle field, driven via the Path on the record
+      page and by flows. Values in pipeline order: - Suggested by Team: internal
+      suggestion, pre-review (help text).'
+    Placement_Status__c: 'Intended final-outcome rollup: Not Placed (default) |
+      Offered (offer received) | Placed (candidate started) | Lost (offer declined
+      or fell through). Manual entry.'
+    Rejection_Reason__c: 'Why a rejected submission failed: Rate High | Skill Mismatch
+      | Visa | Location | Availability | No Response | Duplicate | Other.'
+    Interview_Requested__c: 'System flag: auto-checked by the Create B2B Interview
+      flow when an interview is created from this submission. Help text says "Do
+      not manually edit". Drives the "Interview Requested/Scheduled" list view.'
+    Offer_Received__c: 'System flag: auto-checked by the Interview Outcome Sync
+      flow when the client makes an offer. Used for offer tracking and submission-to-offer
+      conversion-ratio reporting. TRUE on 2 of 7 records (the two Placed ones).'
+    Client_Feedback__c: 'What the client said about this candidate, updated after
+      each client response. Help text examples: "Rate too high", "Strong technical
+      fit but location concern", "Interested - scheduling interview".'
+    Candidate_Rate__c: What the CANDIDATE expects to be paid - per-hour rate for
+      hourly, annual amount for salary (help text). Entered by the recruiter in
+      the submit flow
+    Submitted_Bill_Rate__c: What Techsara bills the CLIENT for this candidate. May
+      differ from the Job Requirement's Client Bill Rate if the AM negotiated differently
+      (help text).
+    Rate_Type__c: 'How both rates are quoted: Hourly (contract positions) | Salary
+      (full-time) | Daily (daily consulting rates). Defaults from the Job Requirement;
+      confirmed in the submit / submit-to-client flows. Data: 6 Hourly, 1 Salary.'
+    Expected_Margin__c: 'Submitted_Bill_Rate__c - Candidate_Rate__c: the expected
+      profit per hour (or per year) on this specific submission.'
+    Candidate_Summary__c: 'The 3-5 sentence sales pitch: why this candidate fits
+      - years of experience, key skills, availability (help text). Written by the
+      recruiter in the submit flow; the AM reviews it before sending to the client.'
+    Skills_Match_Notes__c: 'Point-by-point mapping of the candidate''s skills to
+      the job''s requirements. Help text example: "Job requires Apex - Candidate
+      has 5 years Apex experience." Written by the recruiter in the submit flow'
+    Internal_Submission_Date_Time__c: When the candidate was submitted INTERNALLY
+      (recruiter -> AM). Auto-populated by the creating flow (7/7). Used to measure
+      the time from requirement received to first internal submission - a recruiting
+      speed KPI.
+    Client_Submission_Date_Time__c: When the AM actually sent the candidate to the
+      CLIENT. Auto-set by the Approve and Submit to Client flow; required whenever
+      the status says "Submitted to Client" (validation rule).
+    Unique_Submission_Key__c: 'Duplicate blocker: auto-generated by the creating
+      flows as Job Requirement ID + Candidate ID (or Lead-based on the website path).'
+    Slack_Thread_ID__c: The Slack thread timestamp/ID of this submission's thread
+      in the b2b-submissions channel, saved by the creating flow (7/7 populated).
+  Vendor__c:
+    Name: The vendor's or proxy person's display name. For agency records this is
+      the agency name; for individual proxies it is the person's name.
+    Email__c: 'The vendor''s email address (field description: "Vendor''s Email").
+      Manual entry; used by the team for contacting the provider - no automation
+      or template reads it. Population unknown (no records in preprod).'
+    Phone__c: 'The vendor''s phone number (description: "Vendor''s Phone Number").
+      Manual entry, contact-info only; nothing automated reads it.'
+    In_House_Proxy__c: TRUE = this proxy is a Techsara-internal person acting as
+      interview support, not an outside vendor. Set manually when the record is
+      created.
+    Slack_User_Id_c__c: The proxy's Slack member id (e.g. "U0123ABCD"), used to
+      build the "<@id>" mention in the support-approval Slack message for IN-HOUSE
+      proxies. Entered manually by an admin who copies it from Slack.
+  Company__c:
+    Name: 'The canonical company name. Entered by the recruiter (or the interview
+      wizard) but then rewritten by Normalize_Company_Name_on_Save: stored UPPERCASE
+      with corporate suffixes and filler words stripped'
+    Company_Website__c: 'The company''s official website URL. Field description:
+      "used as a unique identifier to distinguish company records" - i.e. the intended
+      tiebreaker when two different companies normalize to a similar name.'
+    Tier__c: 'Classifies the employer by type/size (description: "Categorizes the
+      company by type/size"). Values and their meaning: FAANG / Top Product - top-tier
+      product companies (Google'
+    Interview_Difficulty__c: 'Derived difficulty rating of this company''s interviews,
+      computed purely from Tier__c (description: "Calculated difficulty rating based
+      on company Tier"): FAANG / Top Product -> "Very Hard"; Product Company ->
+      "Hard"'
+    Typical_Rounds__c: 'Average number of interview rounds this company''s process
+      runs (help text: "Average number of interview rounds for this company"). Manual
+      knowledge capture so schedulers can tell a candidate "expect ~4 rounds".'
+  Niche__c:
+    Name: The niche's name - a skill/role track like "Java Full Stack" or "Product
+      Analyst". Entered via the Add Niche flow. Displayed everywhere a niche is
+      referenced (internal interviews, resumes, question pools).
+  Niche_Question__c:
+    Name: System-generated id of the mapping row (e.g. NQ-00042). No business meaning
+      - just a handle for related lists.
+    Niche__c: Which niche's question pool this row belongs to. Required; set by
+      the Bulk_Add_Questions_Flow at creation and never changed (the master- detail
+      is not reparentable). Deleting the niche deletes the row.
+    Question__c: Which question from the question bank is being mapped. Required;
+      set by the bulk flow at creation; not reparentable. This is the PRIMARY master
+      - the junction inherits sharing and ownership from the question record.
+knowledge:
+- title: Job_Requirement__c — What This Object Is
+  keywords:
+  - job
+  - requirement
+  text: "Job_Requirement__c is ONE open job requisition received from a B2B client\
+    \ or\nvendor - \"Client X needs 2 Salesforce Developers, remote, W2, submit\
+    \ profiles\nby Friday 5 PM\". It is the anchor record of the B2B STAFFING pipeline:\
+    \ every\ncandidate submission (Job_Submission__c) and every B2B interview\n\
+    (Interview__c, record type \"B2B Interviews\") hangs off a Job Requirement.\n\
+    \nIt carries four jobs at once:\n  a) The requisition itself - title, skills,\
+    \ location, work mode, employment\n     type, duration, openings, accepted visa\
+    \ types.\n  b) The commercial side - client bill rate, target candidate pay\
+    \ rate and\n     the auto-computed margin (marked SENSITIVE; meant for the Account\n\
+    \     Manager and Leadership only, never for recruiters or the website).\n \
+    \ c) The SLA machine - a required submission deadline, an auto-stamped\n   \
+    \  \"requirement received\" timestamp, a live SLA status formula, and a\n  \
+    \   recurring urgent-alert loop that nags the Account Manager 24 hours\n   \
+    \  before (and again after) a deadline with zero submissions.\n  d) The public\
+    \ website posting - a separate cleaned-up public description,\n     publish\
+    \ flags, and a unique External Job ID; the company careers site\n     reads\
+    \ published requirements through the JobRequirementRestService REST\n     API\
+    \ (GET /jobRequirements/) and posts applicants back (POST), which\n     auto-creates\
+    \ a Lead plus a Job Submission."
+- title: Job_Requirement__c — Kind Of Object
+  keywords:
+  - job
+  - requirement
+  text: "- Custom object, part of the B2B staffing domain.\n- TOP-LEVEL object (no\
+    \ master-detail parent): it has its own Owner and a\n  Public Read/Write org-wide\
+    \ sharing model - anyone who can use the object\n  can see and edit every requirement.\n\
+    - 38 custom fields, 0 record types, 11 validation rules (7 active, 4\n  inactive\
+    \ - the most validation rules of any object in the org), 6 list\n  views (All,\
+    \ My Client Requirements, Open Jobs - Need Profiles, Open Jobs\n  With Zero\
+    \ Submissions, Urgent Jobs Due in 24 Hours, Website Published\n  Jobs).\n- Auto-number\
+    \ Name in the format JR-XXXXX (e.g. JR-00012).\n- Field history tracking is\
+    \ switched on at the object level, but no\n  individual field is flagged for\
+    \ tracking yet.\n- Scale: only 3 records in preprod (all created 2026-08-07).\
+    \ Like the rest\n  of the B2B flavor, this object is newly built and barely\
+    \ has data yet."
+- title: Job_Requirement__c — Record Types
+  keywords:
+  - job
+  - requirement
+  text: 'None. Every Job Requirement is the same flavor; the one real variation
+    -
+
+    whether the client is still a PROSPECT (Client Company + Client Lead) or a
+
+    CONVERTED B2B client (Client Account + Client Contact) - is carried by the
+
+    two lookup pairs and their validation rule, not by record types.'
+- title: Job_Requirement__c — How It Is Used — The Business Process
+  keywords:
+  - job
+  - requirement
+  text: "STEP 1 - INTAKE. A client or vendor sends an open position (email/call).\
+    \ The\n  Account Manager (or sales) creates the Job Requirement and links exactly\n\
+    \  one complete \"who is the client\" pair (validation rule):\n  - Prospect\
+    \ path: Client Company (Company__c master list) + Client Lead\n    (a \"B2B\
+    \ Client Lead\" record-type Lead) - used until the prospect is\n    converted\
+    \ into a real client Account/Contact.\n  - Converted path: Client Account (business\
+    \ Account, never a candidate\n    Person Account) + Client Contact (a contact\
+    \ of that account).\n  Job Status starts at \"New\" (default).\n\nSTEP 2 - AUTO-SETUP\
+    \ ON SAVE. The Job_Requirement_Set_Defaults_On_Create flow\n  stamps Requirement_Received_Date_Time__c\
+    \ and generates the unique\n  External_Job_ID__c, then notifies the Account\
+    \ Manager by email, bell\n  notification and a Slack channel post. The JR_Notification_Anchor_Bootstrap\n\
+    \  flow (before save) stamps Last_Notification_Sent__c and normalizes a null\n\
+    \  Submission Count to 0 so the deadline-alert loop can register. Editing any\n\
+    \  key field later (title, priority, status, deadline, location, work mode,\n\
+    \  employment type, openings, AM) re-notifies the AM via the\n  B2b_job_requirement_updated_notification_flow."
+- title: Job_Requirement__c — How It Is Used — The Business Process (2)
+  keywords:
+  - job
+  - requirement
+  text: "STEP 3 - OPENING THE JOB. The AM moves Job Status New -> Open. Opening\n\
+    \  requires a Submission Deadline (two validation rules enforce it) and the\n\
+    \  deadline must be later than the received timestamp. Status transitions are\n\
+    \  locked down: New -> Open, Open -> On Hold/Closed, On Hold -> Open/Closed;\n\
+    \  only a System Administrator can reopen a Closed requirement."
+- title: Job_Requirement__c — How It Is Used — The Business Process (3)
+  keywords:
+  - job
+  - requirement
+  text: "STEP 4 - SOURCING CANDIDATES. Two channels feed submissions:\n  - Internal:\
+    \ a recruiter opens the requirement and clicks the \"Submit\n    Candidate Profile\"\
+    \ button (screen flow B2B_Submit_Candidate_Profile).\n    The flow validates\
+    \ the job is Open, checks duplicates, captures rate/\n    availability/visa\
+    \ answers, creates the Job_Submission__c, attaches the\n    resume, starts a\
+    \ Slack thread and emails the AM.\n  - Website: publishing the job (Website\
+    \ Status = Published + the publish\n    checkbox + public description) makes\
+    \ it visible to the careers site,\n    which reads jobs via GET /jobRequirements/\
+    \ (only Published records are\n    ever returned). A website applicant POSTs\
+    \ to the same service, which\n    runs the Create_Lead_From_Application flow:\
+    \ dedupes by email+job,\n    creates/reuses a Lead, links the requirement via\
+    \ the Lead's\n    Applied_Job_Requirement__c, attaches the resume, auto-creates\
+    \ a Job\n    Submission (source \"Website Applicant\"), starts the Slack thread\
+    \ and\n    emails both the AM and the applicant.\n  Every submission create/update\
+    \ re-counts Submission_Count__c and\n  Client_Submission_Count__c on the requirement\
+    \ (flow-based rollup, because\n  the relationship is a lookup, not master-detail)\
+    \ and rolls totals up to\n  the Client Lead."
+- title: Job_Requirement__c — How It Is Used — The Business Process (4)
+  keywords:
+  - job
+  - requirement
+  text: "STEP 5 - THE DEADLINE RACE. The B2B_Deadline_Alert flow watches every Open\n\
+    \  requirement with a deadline: 24 hours out with ZERO submissions it fires\n\
+    \  an urgent email + Slack + bell alert to the Account Manager; once overdue\n\
+    \  it fires overdue alerts; leadership gets a daily summary instead of\n  per-job\
+    \ noise. The SLA_Status__c formula (On Track / Due Today / Overdue /\n  Closed)\
+    \ drives the \"Urgent Jobs Due in 24 Hours\" and \"Open Jobs With Zero\n  Submissions\"\
+    \ list views. The flow alerts but never changes the job status\n  itself - extending\
+    \ or closing stays a human (AM) decision.\n\nSTEP 6 - INTERVIEWS AND FILLING.\
+    \ From a Job Submission the \"Create B2B\n  Interview\" flow creates Interview__c\
+    \ records that link back here and bump\n  Interview_Count__c. When interview\
+    \ outcomes come in, the\n  B2B_Interview_Outcome_Sync_With_Job_Submission_Flow\
+    \ updates the\n  submission and, when all openings are placed, marks the Job\
+    \ Requirement\n  filled (note: the current Job Status picklist has no \"Filled\"\
+    \ value -\n  only the SLA formula still references one; verify the final wiring\
+    \ with\n  the team)."
+- title: Job_Requirement__c — How It Is Used — The Business Process (5)
+  keywords:
+  - job
+  - requirement
+  text: "STEP 7 - CLOSURE. The AM sets Job Status = Closed with a Reason for JR\n\
+    \  Closure (Completed / Cancelled / No Response / Expired / Other) and a\n \
+    \ free-text reason when \"Other\". Creating or deleting a requirement also\n\
+    \  keeps the linked Client Lead's Total_Job_Requirements__c counter honest\n\
+    \  (paired count flows on create and delete)."
+- title: Job_Requirement__c — Connected Objects
+  keywords:
+  - job
+  - requirement
+  - each
+  - relationship
+  - means
+  text: "LOOKUPS FROM JOB REQUIREMENT TO OTHER OBJECTS:\n- Account (Client_Account__c):\
+    \ the paying B2B client or vendor company\n  (business Account). Delete-restricted;\
+    \ a validation rule blocks Person\n  Accounts (candidates). Half of the \"converted\
+    \ client\" pair.\n- Contact (Client_Contact__c): the hiring manager / vendor\
+    \ contact who sent\n  the requirement and receives candidate profiles. A lookup\
+    \ filter limits\n  choices to contacts OF the selected Client Account whose\
+    \ account record\n  type is \"B2B Client\" or \"Vendor / Implementation Partner\"\
+    .\n- Company__c (Client_Company__c): the client company from the market-company\n\
+    \  master list - the PROSPECT stand-in for Client Account until the client is\n\
+    \  converted into a real Account. Delete-restricted.\n- Lead (Client_Lead__c):\
+    \ the client-side Lead (record type \"B2B Client\n  Lead\") - the prospect stand-in\
+    \ for Client Contact. A lookup filter requires\n  the Lead's company to match\
+    \ the selected Client Company.\n- User (Account_Manager__c): the Techsara AM\
+    \ who owns this requirement -\n  auto-populated from the client account, changeable.\
+    \ Receives every alert\n  the automation sends."
+- title: Job_Requirement__c — Connected Objects (2)
+  keywords:
+  - job
+  - requirement
+  - each
+  - relationship
+  - means
+  text: "OBJECTS THAT POINT AT JOB REQUIREMENT:\n- Job_Submission__c (lookup Job_Submission__c.Job_Requirement__c):\
+    \ one row\n  per candidate submitted against this requirement. Because this\
+    \ is a lookup\n  (not master-detail), the submission counters are maintained\
+    \ by flow, not\n  native roll-up summaries. 7 submissions exist in preprod.\n\
+    - Interview__c (lookup Interview__c.Job_Requirement__c): B2B interviews for\n\
+    \  this requirement, created from submissions (\"B2B Interviews\" record type).\n\
+    \  8 interviews link to a requirement so far.\n- Lead (lookup Lead.Applied_Job_Requirement__c):\
+    \ website applicants - the\n  job the person applied to on the careers site,\
+    \ stamped by the\n  Create_Lead_From_Application flow (5 leads so far)."
+- title: Job_Requirement__c — Business Rules
+  keywords:
+  - job
+  - requirement
+  - validation
+  - most
+  - org
+  text: "ACTIVE (7):\n- Client_Account_Cannot_Be_Candidate: \"Client Account must\
+    \ be a B2B Client\n  or Vendor Business Account, not a Candidate Person Account.\"\
+    \n- Invalid_Status_Transition: \"Invalid Job Status transition. Allowed\n  transitions\
+    \ are: New -> Open, Open -> On Hold or Closed, and On Hold ->\n  Open or Closed.\
+    \ Only System Administrators can reopen a Closed Job\n  Requirement.\" (Checked\
+    \ by profile name \"System Administrator\".)\n- Max_Submissions_Allowed: \"\
+    Max Submissions Allowed must be greater than the\n  Number of Openings\" - blocks\
+    \ a submissions cap at or below the openings\n  count (you must be allowed to\
+    \ show more profiles than seats).\n- Open_Job_Needs_Deadline: \"Submission Deadline\
+    \ is required when Job Status\n  is Open.\"\n- Submission_Deadline: \"Submission\
+    \ Deadline is required when Job Status is\n  Open. Please enter the date and\
+    \ time by which candidate profiles must be\n  submitted to the client.\" (A\
+    \ duplicate of Open_Job_Needs_Deadline - both\n  are active, so users would\
+    \ see this pair as one blocked save.)\n- Require_One_Complete_Client_Pair: \"\
+    Enter either Client Company + Client\n  Lead (prospect) or Client Account +\
+    \ Client Contact (converted client) -\n  not a mix, and not just one of the\
+    \ pair.\"\n- Submission_After_Req_Received: \"Submission Deadline must be later\
+    \ than the\n  Requirement Received Date/Time.\""
+- title: Job_Requirement__c — Business Rules (2)
+  keywords:
+  - job
+  - requirement
+  - validation
+  - most
+  - org
+  text: "INACTIVE (4) - built but currently switched off:\n- Job_Requirement_Required_Fields:\
+    \ \"Please fill in all required fields: Job\n  Title, Client Account, Account\
+    \ Manager, Job Status, Priority, Requirement\n  Received DateTime, Location,\
+    \ Work Mode, Employment Type, Primary Skills,\n  Job Description, External Job\
+    \ ID.\" (An all-in-one completeness gate.)\n- Published_Job_Needs_Description:\
+    \ \"Public Website Description and External\n  Job ID are required when Website\
+    \ Status is Published.\" (Off - so today a\n  job CAN be flagged Published without\
+    \ a public description.)\n- Req_Received_Before_Submission: \"Requirement Received\
+    \ Date/Time must be\n  earlier than the Submission Deadline.\" (Inactive twin\
+    \ of the active\n  Submission_After_Req_Received rule.)\n- submissionDeadlineDateValidation:\
+    \ \"Submission Deadline should be in future\n  (at least later than today).\""
+- title: Job_Requirement__c — Automation
+  keywords:
+  - job
+  - requirement
+  - runs
+  text: "RECORD-TRIGGERED FLOWS (active):\n- Job_Requirement_Set_Defaults_On_Create\
+    \ (after save, create): stamps\n  Requirement Received Date/Time + External\
+    \ Job ID, then emails, bell-\n  notifies and Slacks the Account Manager about\
+    \ the new requirement.\n- JR_Notification_Anchor_Bootstrap (before save, create+update):\
+    \ the loop\n  starter - stamps Last_Notification_Sent__c and normalizes a null\n\
+    \  Submission Count to 0 the moment a job is Open with a deadline, so the\n\
+    \  deadline-alert scheduled paths register from day one.\n- B2B_Deadline_Alert\
+    \ (after save, create+update, 3 scheduled paths): the\n  urgency engine - 24-hours-out\
+    \ alert (email + Slack + bell) to the AM when\n  an Open job still has zero\
+    \ submissions, overdue alerts once the deadline\n  passes, and a daily leadership\
+    \ summary. Updates Last_Notification_Sent__c\n  to throttle the recurring reminder\
+    \ loop. Never changes Job Status.\n- B2b_job_requirement_updated_notification_flow\
+    \ (after save, update): when a\n  key field changes (title, priority, status,\
+    \ deadline, location, work mode,\n  employment type, openings, AM), notifies\
+    \ the AM by email + bell + Slack.\n- Update_Lead_JR_Count_On_Create (after save,\
+    \ create+update): recounts all\n  requirements of the linked Client Lead into\
+    \ Lead.Total_Job_Requirements__c.\n- Update_Lead_JR_Count_On_Delete (before\
+    \ delete): same recount excluding the"
+- title: Job_Requirement__c — Automation (2)
+  keywords:
+  - job
+  - requirement
+  - runs
+  text: "record being deleted, so the Lead counter survives deletes.\n\nFLOWS ON\
+    \ OTHER OBJECTS THAT WRITE THIS ONE:\n- B2B_Jr_update_submission_counts (on\
+    \ Job_Submission__c): recounts\n  Submission_Count__c and Client_Submission_Count__c\
+    \ whenever submissions\n  change, then rolls totals up to the Client Lead.\n\
+    - B2B_Create_Interview_from_Submission (screen flow on Job Submission):\n  bumps\
+    \ Interview_Count__c when a B2B interview is created.\n- B2B_Interview_Outcome_Sync_With_Job_Submission_Flow\
+    \ (on Interview__c):\n  designed to mark the requirement filled once all openings\
+    \ are placed.\n\nSCREEN FLOW / BUTTON ON THE PAGE:\n- Submit Candidate Profile\
+    \ (quick action on the Job Requirement Lightning\n  record page) -> B2B_Submit_Candidate_Profile:\
+    \ the recruiter-facing wizard\n  that validates the job, dedupes, and creates\
+    \ the Job Submission with\n  Slack/email notifications."
+- title: Job_Requirement__c — Automation (3)
+  keywords:
+  - job
+  - requirement
+  - runs
+  text: "APEX / REST (JobRequirementRestService, endpoint /jobRequirements/*):\n\
+    - GET: the public careers-website feed. Returns ONLY Website Status =\n  \"\
+    Published\" requirements, paginated (default 20, max 200 per page), with\n \
+    \ optional filters jobStatus, employmentType, priority, workMode, location\n\
+    \  (contains), searchTerm (title contains). Runs in USER_MODE (the calling\n\
+    \  user's field access applies); the Client Company name is fetched\n  separately\
+    \ in system context as the display fallback for unconverted\n  clients, and\
+    \ the client name honors Show_Client_Name_on_Website__c /\n  the account's Confidential\
+    \ Client flag. NOTE: the response wrapper also\n  carries Client Bill Rate /\
+    \ Target Candidate Rate / Estimated Margin, so\n  the site guest user must never\
+    \ be granted those fields or they leak.\n- POST: the website application intake.\
+    \ Parses the applicant JSON, hands it\n  to the Create_Lead_From_Application\
+    \ flow (dedupe by email+job -> 409;\n  create/reuse Lead; auto Job Submission;\
+    \ Slack thread; AM + candidate\n  emails) and returns the flow's status. The\
+    \ class also exposes the\n  \"Attach Resume To Lead\" invocable that base64-decodes\
+    \ the uploaded\n  PDF/DOC/DOCX into a Salesforce File on the Lead. Unexpected\
+    \ errors are\n  emailed to a hard-coded admin address.\n- There is NO Apex trigger\
+    \ on Job_Requirement__c."
+- title: Job_Submission__c — What This Object Is
+  keywords:
+  - job
+  - submission
+  text: 'Job_Submission__c is the JUNCTION between a candidate and a client''s open
+    job:
+
+    one record = one candidate proposed for one Job Requirement. It is the heart
+    of
+
+    the B2B staffing pipeline - it carries the candidate''s pitch (summary, skills
+
+    match, rate, visa status, availability), tracks the submission through its
+
+    whole lifecycle (Suggested by Team -> Pending AM Review -> Submitted to Client
+
+    -> Interview Scheduled -> ... -> Placed), and records the money terms: the
+
+    candidate''s pay rate, the bill rate submitted to the client, and the expected
+
+    margin between them.
+
+
+    It is also the LAUNCH PAD for B2B interviews: the "Create B2B Interview"
+
+    button lives on this record''s page, and the rate snapshots on Interview__c
+
+    (Candidate_Rate__c / Submission_Rate__c) are copied FROM this object at
+
+    interview-creation time. Submissions can be created by a recruiter (from the
+
+    Job Requirement page), auto-created from a website job application ("Flow 7"
+    -
+
+    a web applicant Lead instantly becomes a Job Submission), or - by design,
+
+    though not yet in use - from the Candidate Portal.'
+- title: Job_Submission__c — Kind Of Object
+  keywords:
+  - job
+  - submission
+  text: "- Custom object, part of the B2B staffing domain.\n- A LOOKUP-BASED junction\
+    \ (NOT master-detail): it has lookups to Account\n  (candidate), Job_Requirement__c,\
+    \ Lead, and two Users - but it has its own\n  OwnerId. Because Job_Requirement__c\
+    \ is a lookup, native roll-up summaries\n  are impossible; flows recount submissions\
+    \ onto the requirement instead.\n- Sharing model: Public Read/Write - any internal\
+    \ user who can log in can see\n  and edit submissions.\n- 26 custom fields,\
+    \ 0 record types, 4 validation rules, 4 list views\n  (All | Pending AM Review\
+    \ | Submitted to Client | Interview Requested/\n  Scheduled - the list views\
+    \ mirror the AM's work queues).\n- Auto-number Name in the format JS-XXXXX (e.g.\
+    \ JS-00007).\n- Scale: only 7 records in preprod, all created on 2026-08-07\
+    \ - the B2B\n  submission pipeline is brand new and this is essentially test/build\
+    \ data."
+- title: Job_Submission__c — Record Types
+  keywords:
+  - job
+  - submission
+  text: 'None. Every Job Submission is the same shape; the Submission_Source__c
+
+    picklist (Internal Recruiter | Website Applicant | Candidate Portal) carries
+
+    the "flavor" instead of record types.'
+- title: Job_Submission__c — How It Is Used — The Business Process
+  keywords:
+  - job
+  - submission
+  text: "STEP 1 - CREATION. Three entry points:\n  - RECRUITER PATH: on a Job Requirement\
+    \ record, a recruiter runs the \"Submit\n    Candidate Profile\" screen flow\
+    \ (B2B_Submit_Candidate_Profile). It checks\n    the job is still open, blocks\
+    \ duplicates (same candidate + same job),\n    collects the pitch (candidate,\
+    \ rate, summary, skills match, visa,\n    availability), attaches the resume\
+    \ file, then creates the Job Submission\n    with status \"Pending AM Review\"\
+    \ and source \"Internal Recruiter\". It also\n    stamps Submitted_By, Internal\
+    \ Submission Date/Time and the Unique\n    Submission Key, starts a Slack thread\
+    \ in the b2b-submissions channel\n    (saving the Thread ID), and emails + Slack-DMs\
+    \ the Account Manager.\n  - WEBSITE PATH (\"Flow 7\"): when someone applies\
+    \ on the public website, the\n    REST endpoint (JobRequirementRestService.createLead)\
+    \ runs the\n    Create_Lead_From_Application flow - the org's internal nickname\
+    \ for it is\n    \"Flow 7 (Website Lead to JS)\". It dedupes by email + job\
+    \ (the same email\n    applying to the same job is rejected), creates or reuses\
+    \ a Lead, and\n    auto-creates a Job Submission with source \"Website Applicant\"\
+    , status\n    \"Pending AM Review\", the Lead linked (no Candidate yet), the\
+    \ website visa\n    answer in Visa_Confirmation__c, and the resume file attached.\
+    \ It starts\n    the Slack thread and emails the AM and the applicant. This\
+    \ replaced an"
+- title: Job_Submission__c — How It Is Used — The Business Process (2)
+  keywords:
+  - job
+  - submission
+  text: "older manual \"Convert to Job Submission\" button.\n  - CANDIDATE PORTAL:\
+    \ a Submission_Source__c value exists for portal\n    self-submission, and the\
+    \ required-fields validation rule already exempts\n    it, but no live automation\
+    \ creates portal submissions yet.\n\nSTEP 2 - AM REVIEW AND SUBMIT TO CLIENT.\
+    \ The Account Manager (auto-copied\n  from the Job Requirement) reviews the\
+    \ submission from the \"Pending AM\n  Review\" list view. On the record page\
+    \ they click \"Submit to Client\"\n  (screen flow Approve_and_Submit_to_Client):\
+    \ it confirms/edits the\n  Submitted Bill Rate and Rate Type, sets the status\
+    \ to \"Submitted to\n  Client\", stamps Client Submission Date/Time, then emails\
+    \ the client, the\n  recruiter, the candidate and leadership, and replies into\
+    \ the submission's\n  Slack thread. Two validation rules enforce that the bill\
+    \ rate and the\n  client date/time are present whenever the status says \"Submitted\
+    \ to\n  Client\"."
+- title: Job_Submission__c — How It Is Used — The Business Process (3)
+  keywords:
+  - job
+  - submission
+  text: "STEP 3 - COUNTERS ROLL UP. Every create/update fires\n  B2B_Jr_update_submission_counts,\
+    \ which recounts the parent Job\n  Requirement's Submission Count (all submissions)\
+    \ and Client Submission\n  Count (only those actually sent to the client, i.e.\
+    \ with a Client\n  Submission Date/Time), and rolls the total up to the client\
+    \ Lead's\n  Total_Job_Applications__c. Update_Lead_JA_Count_On_Create does the\
+    \ same\n  Lead recount on create. (Flows, because lookup junctions cannot use\n\
+    \  roll-up summary fields.)\n\nSTEP 4 - INTERVIEW. When the client shortlists\
+    \ the candidate (status\n  \"Client Shortlisted\", shown to users as \"Shortlisted\
+    \ for Interview\"), the\n  user clicks \"Create B2B Interview\" on the submission\
+    \ page (screen flow\n  B2B_Create_Interview_from_Submission). The flow creates\
+    \ the Interview__c\n  (record type \"B2B Interviews\"), copying candidate, Lead,\
+    \ Job Requirement,\n  Job Submission, client account, AM, recruiter and applicant\
+    \ email, and\n  SNAPSHOTS the money: Candidate_Rate__c and Submitted_Bill_Rate__c\
+    \ are\n  frozen onto the interview. It then ticks Interview_Requested__c on\
+    \ this\n  submission, moves the status to \"Interview Scheduled\", bumps the\
+    \ Job\n  Requirement's Interview Count, and sends confirmation emails plus Slack\n\
+    \  messages. One submission can spawn several interviews (one per round)."
+- title: Job_Submission__c — How It Is Used — The Business Process (4)
+  keywords:
+  - job
+  - submission
+  text: "STEP 5 - OUTCOME SYNC (AUTOMATIC). As each linked B2B interview progresses,\n\
+    \  the B2B_Interview_Outcome_Sync_With_Job_Submission_Flow (running on\n  Interview__c)\
+    \ writes the result back here: interview status Scheduled ->\n  submission \"\
+    Interview Scheduled\"; Completed -> \"Interview Completed\";\n  outcome Moved\
+    \ to Next Round -> \"Shortlisted for Next Round\"; Rejected ->\n  \"Rejected\"\
+    ; Offer Received -> \"Offer Received\" plus the Offer_Received__c\n  checkbox.\
+    \ It also emails the candidate the matching template (next round /\n  offer\
+    \ / rejection) and marks the Job Requirement \"Filled\" when all its\n  openings\
+    \ are placed.\n\nSTEP 6 - CLOSE-OUT. The team records the final result: status\
+    \ \"Placed\" when\n  the candidate starts, \"Withdrawn\" if the candidate pulls\
+    \ out, \"Rejected\"\n  with a Rejection_Reason__c otherwise. Placement_Status__c\
+    \ exists as a\n  separate final-outcome field (Not Placed / Offered / Placed\
+    \ / Lost) but has\n  never been filled in practice - Submission_Status__c is\
+    \ what the team\n  actually drives (via the Path on the record page). Placement\
+    \ leads to\n  Onboarding downstream."
+- title: Job_Submission__c — How It Is Used — The Business Process (5)
+  keywords:
+  - job
+  - submission
+  text: 'LEAD CONVERSION LINK: when a website Lead is later converted into a candidate
+
+    Person Account, the Lead_Conversion_Flow looks up the lead''s Job Submissions
+
+    by applicant email as part of wiring the new candidate up (read-only lookup
+
+    in the flow definition - exact relinking behavior not fully documented -
+
+    verify with team).'
+- title: Job_Submission__c — Connected Objects
+  keywords:
+  - job
+  - submission
+  - each
+  - relationship
+  - means
+  text: "LOOKUPS FROM JOB SUBMISSION TO OTHER OBJECTS:\n- Account (Candidate__c):\
+    \ the candidate Person Account being submitted.\n  Filled on recruiter-path\
+    \ submissions; website-path submissions start with\n  only a Lead. Either Candidate\
+    \ or Lead must be present (validation rule).\n- Lead (Lead__c): the website\
+    \ applicant Lead, for submissions created by\n  \"Flow 7\" before the person\
+    \ exists as a candidate.\n- Job_Requirement__c (Job_Requirement__c): the client's\
+    \ open job this\n  candidate is submitted against. Required (validation rule)\
+    \ and treated as\n  immutable after creation (help text; not system-enforced).\
+    \ The requirement\n  counts its submissions via flow (Submission_Count__c /\n\
+    \  Client_Submission_Count__c / Interview_Count__c).\n- User (Account_Manager__c):\
+    \ the AM who must review/approve, auto-copied\n  from the Job Requirement.\n\
+    - User (Submitted_By__c): the user who ran the submit flow - recruiter\n  performance\
+    \ reporting.\n\nOBJECTS THAT POINT AT JOB SUBMISSION:\n- Interview__c (lookup\
+    \ Interview__c.Job_Submission__c): the B2B interviews\n  created from this submission\
+    \ - one per round. The interview snapshots this\n  record's rates at creation\
+    \ and its outcomes sync back to this record's\n  status. (8 interviews link\
+    \ to the 7 submissions so far.)"
+- title: Job_Submission__c — Connected Objects (2)
+  keywords:
+  - job
+  - submission
+  - each
+  - relationship
+  - means
+  text: 'INDIRECT/UPSTREAM: the client Lead behind the Job Requirement receives
+    a
+
+    rolled-up Total_Job_Applications__c count from this object''s flows; the
+
+    resume travels with the submission as an attached File (ContentDocumentLink),
+
+    not a field.'
+- title: Job_Submission__c — Business Rules
+  keywords:
+  - job
+  - submission
+  - validation
+  - all
+  - active
+  text: "- Candidate_OR_Lead_Required: \"Either Candidate or Lead must be linked\
+    \ to\n  this Job Submission.\" (Website submissions have only a Lead; recruiter\n\
+    \  submissions have the Candidate.)\n- Bill_Rate_Required_On_Submit: \"Submitted\
+    \ Bill Rate is required when\n  submitting profile to client.\" (status = Submitted\
+    \ to Client and the bill\n  rate is blank).\n- Client_Date_Required_On_Submit:\
+    \ \"Client Submission Date/Time is required\n  when status is Submitted to Client.\"\
+    \n- Submission_Required_Fields_Validation: on save, Job Requirement, Submitted\n\
+    \  By, Account Manager, Submission Status, Internal Submission Date/Time,\n\
+    \  Candidate Rate, Candidate Summary and Unique Submission Key must all be\n\
+    \  filled - EXCEPT for self-service sources (Website Applicant, Candidate\n\
+    \  Portal), which are exempt because those recruiter-only fields are filled\n\
+    \  in later. (The error message also lists \"Candidate\", but the formula\n\
+    \  itself does not check it - the Candidate-or-Lead rule covers that.)"
+- title: Job_Submission__c — Automation
+  keywords:
+  - job
+  - submission
+  - runs
+  text: "RECORD-TRIGGERED FLOWS (active, on this object):\n- B2B_Jr_update_submission_counts\
+    \ (after save, create+update): recounts the\n  parent Job Requirement's Submission\
+    \ Count and Client Submission Count and\n  rolls total submissions up to the\
+    \ client Lead's Total_Job_Applications__c.\n- Update_Lead_JA_Count_On_Create\
+    \ (after save, create): same Lead\n  job-application recount when a submission\
+    \ is created.\n\nSCREEN FLOWS / BUTTONS:\n- \"Submit to Client\" button on the\
+    \ record page -> Approve_and_Submit_to_Client\n  (AM approval: sets status,\
+    \ stamps client date/time and bill rate, emails\n  client/recruiter/candidate/leadership,\
+    \ replies in the Slack thread).\n- \"Create B2B Interview\" button on the record\
+    \ page ->\n  B2B_Create_Interview_from_Submission (creates the B2B Interview__c,\
+    \ ticks\n  Interview_Requested__c, sets status \"Interview Scheduled\", bumps\
+    \ the\n  requirement's interview count, emails + Slack).\n- B2B_Submit_Candidate_Profile\
+    \ (launched from the Job Requirement page):\n  CREATES submissions on the recruiter\
+    \ path."
+- title: Job_Submission__c — Automation (2)
+  keywords:
+  - job
+  - submission
+  - runs
+  text: "FLOWS ON OTHER OBJECTS THAT WRITE HERE:\n- Create_Lead_From_Application\
+    \ (\"Flow 7\", autolaunched from the website REST\n  endpoint JobRequirementRestService.createLead):\
+    \ auto-creates website\n  submissions with the Lead linked.\n- B2B_Interview_Outcome_Sync_With_Job_Submission_Flow\
+    \ (record-triggered on\n  Interview__c): writes interview progress back to Submission_Status__c\
+    \ and\n  Offer_Received__c and emails the candidate.\n- Lead_Conversion_Flow:\
+    \ looks up submissions by applicant email during lead\n  conversion.\n\nAPEX\
+    \ / TRIGGERS: none. No Apex class references Job_Submission__c - this\nobject\
+    \ is 100% flow-driven. The record page also has a Path component\n(driving Submission_Status__c)\
+    \ and the standard activity/files panels."
+- title: Vendor__c — What This Object Is
+  keywords:
+  - vendor
+  text: "Vendor__c is the DIRECTORY OF INTERVIEW-SUPPORT (\"PROXY\") PROVIDERS -\
+    \ the\npeople and agencies who join a candidate's interview call to help the\n\
+    candidate through it. On the Interview record the lookup to this object is\n\
+    labeled \"Proxy Support\", so users mostly know these records as \"proxies\"\
+    ,\nnot \"vendors\". Two flavors live in the same object:\n  a) EXTERNAL vendors:\
+    \ outside agencies and the individual proxy persons who\n     work under them\
+    \ (the person record points at the agency record through\n     Vendor_Parent__c).\n\
+    \  b) IN-HOUSE proxies: Techsara's own people acting as proxy support,\n   \
+    \  flagged with In_House_Proxy__c and addressed on Slack through their\n   \
+    \  Slack user id.\nIt is a tiny reference master (5 custom fields) with no automation\
+    \ of its\nown - all the action happens on Interview__c, which reads this directory\n\
+    when a proxy is assigned to an interview."
+- title: Vendor__c — Kind Of Object
+  keywords:
+  - vendor
+  text: "- Custom object, part of the Interviewing / interview-support domain.\n\
+    - Standalone object with its own owner. Org-wide sharing is Public\n  Read/Write\
+    \ internally; external (portal) sharing default is Read.\n- Self-referencing:\
+    \ Vendor_Parent__c builds a two-level agency -> person\n  hierarchy inside the\
+    \ same object.\n- 5 custom fields, 0 record types, 0 validation rules, 1 list\
+    \ view.\n- Name is a plain text field labeled \"Vendor Name\".\n- Record page:\
+    \ Vendor_Record_Page FlexiPage (no custom buttons on it).\n- Scale: 0 records\
+    \ in preprod - the directory is EMPTY in this sandbox\n  (see part 9). The object\
+    \ is real and load-bearing in the process, but its\n  rows did not survive into\
+    \ this environment."
+- title: Vendor__c — Record Types
+  keywords:
+  - vendor
+  text: 'None. Every vendor/proxy record has the same shape; the In_House_Proxy__c
+
+    checkbox (not a record type) separates the two business flavors.'
+- title: Vendor__c — How It Is Used — The Business Process
+  keywords:
+  - vendor
+  text: "STEP 1 - MAINTAINING THE DIRECTORY. Vendor records are created and edited\
+    \ by\n  hand (standard New button). No flow, quick action, or integration creates\n\
+    \  or updates them. An agency gets one record; each individual proxy person\n\
+    \  under it gets a child record pointing at the agency via Vendor (Parent).\n\
+    \  In-house proxies get In_House_Proxy__c checked plus their Slack user id.\n\
+    \nSTEP 2 - ASSIGNMENT TO AN INTERVIEW. When an employee has raised an\n  interview\
+    \ support request (Interview__c.Request_Raised__c) and the support\n  team decides\
+    \ a proxy will help, they set the interview's \"Proxy Support\"\n  lookup (Interview__c.Vendor__c)\
+    \ to a record from this directory. The Apex\n  InterviewTriggerHandler reacts:\
+    \ it auto-advances the interview's Approve\n  Stage to \"Assigned\", and SlackCalloutHelper\
+    \ posts a \"Request has been\n  approved\" message to the support Slack channel.\
+    \ In that message the \"Proxy\n  Name\" line is built from this object: an in-house\
+    \ proxy is @-mentioned via\n  Slack_User_Id_c__c; an external one appears as\
+    \ plain text; when the proxy\n  has a parent vendor, the parent agency's name\
+    \ is appended in parentheses.\n\nSTEP 3 - DAILY DIGEST. The scheduled Apex job\
+    \ AccountSchedulerJob posts an\n  \"Interview Schedule Summary\" table to Slack\
+    \ every day listing today's\n  interviews where support is being provided, with\
+    \ \"Parent Vendor\" and\n  \"Vendor Name\" columns read from this object."
+- title: Vendor__c — How It Is Used — The Business Process (2)
+  keywords:
+  - vendor
+  text: "STEP 4 - CANDIDATE DEFAULT (DESIGNED, NOT LIVE). Account.Default_Vendor__c\n\
+    \  can store a candidate's usual proxy; the Draft screen flow \"Interview:\n\
+    \  Approval of Support Request\" was built to use it when approving a support\n\
+    \  request, but that flow is not active and its button is not on any page.\n\
+    \nAFTERWARDS: whether the supported interview succeeded is tracked back on the\n\
+    Interview record (Advanced to Next Round?, Vendor Feedback, Interview\nSupport\
+    \ provided?), not on the Vendor record - this object stays a static\ndirectory."
+- title: Vendor__c — Connected Objects
+  keywords:
+  - vendor
+  - each
+  - relationship
+  - means
+  text: "SELF:\n- Vendor__c (via Vendor_Parent__c, lookup): the parent vendor agency\
+    \ of an\n  individual proxy person. Deleting the parent blanks the child's link\n\
+    \  (no cascade).\n\nOBJECTS THAT POINT AT VENDOR:\n- Interview__c.Vendor__c\
+    \ (lookup, label \"Proxy Support\"): which proxy\n  supports that interview.\
+    \ Setting it fires the Approve-Stage/Slack Apex\n  described above. 38 interviews\
+    \ carry a value in preprod (but the ids no\n  longer resolve - see part 9).\n\
+    - Account.Default_Vendor__c (lookup, label \"Default Vendor\", relationship\n\
+    \  \"CandidateVendor\"): the candidate's usual proxy. 1 record populated;\n\
+    \  only the Draft approval flow was designed to read it.\n\nNo other object\
+    \ references Vendor__c, and it has no child objects besides\nits own self-hierarchy."
+- title: Vendor__c — Business Rules
+  keywords:
+  - vendor
+  - validation
+  text: 'None. There are no validation rules on Vendor__c - any combination of
+
+    fields saves.'
+- title: Vendor__c — Automation
+  keywords:
+  - vendor
+  - runs
+  text: "Nothing runs ON Vendor__c itself - no record-triggered flows, no triggers,\n\
+    no quick actions. It is a hand-maintained directory. The automation that\nREADS\
+    \ it lives elsewhere:\n- InterviewTriggerHandler (Apex, on Interview__c): before\
+    \ update, when the\n  interview's Vendor lookup is newly set, auto-sets Approve_Stage__c\
+    \ to\n  \"Assigned\"; after update it calls SlackCalloutHelper.\n- SlackCalloutHelper\
+    \ (Apex): builds the support-approval Slack message using\n  Vendor name, In_House_Proxy__c,\
+    \ Slack_User_Id_c__c and the parent\n  vendor's name.\n- AccountSchedulerJob\
+    \ (scheduled Apex): daily Slack summary table of\n  today's supported interviews\
+    \ with Parent Vendor / Vendor Name columns.\n- Interview_Approval_of_Support_Request\
+    \ (screen flow, DRAFT - not live):\n  would set the interview's proxy from the\
+    \ candidate's Default Vendor."
+- title: Company__c — What This Object Is
+  keywords:
+  - company
+  text: "Company__c is the MASTER LIST OF OUTSIDE COMPANIES candidates interview\n\
+    with (the object description says exactly that: \"Master list of companies\n\
+    used in Interview records\"). One record = one employer in the open job\nmarket\
+    \ (\"Google\", \"Walmart\", a startup...). It exists to replace the old\nfree-text\
+    \ company name on Interview__c with a real record, so that:\n  a) every interview\
+    \ at the same employer links to the SAME company record\n     (dedupe, per-company\
+    \ reporting, \"how many interviews at X this month\");\n  b) market intelligence\
+    \ can be stored once per company - its Tier, the\n     derived Interview Difficulty,\
+    \ and how many rounds it typically runs.\nDo not confuse it with: Account (Techsara's\
+    \ own B2B clients/vendors are\nbusiness Accounts), or the legacy Interview__c.Company__c\
+    \ TEXT field (the\nold free-text name this object replaced - the current link\
+    \ field on\nInterview is company_new__c)."
+- title: Company__c — Kind Of Object
+  keywords:
+  - company
+  text: "- Custom object, part of the Interviewing / market-intelligence domain.\n\
+    - Standalone object with its own owner; org-wide sharing Public Read/Write\n\
+    \  (internal and external). Field history tracking is enabled on the object.\n\
+    - 4 custom fields, 0 record types, 0 validation rules, 1 list view.\n- Name\
+    \ is plain text labeled \"Company Name\" - and it is actively rewritten\n  by\
+    \ a normalization flow on every save (see part 7).\n- Record pages: two FlexiPages\
+    \ exist (Company_Record_Page and\n  Company_Record_Page1); Company_Record_Page1\
+    \ is the active View override.\n- Scale: 8,101 records in preprod, all created\
+    \ between Apr 2026 and Aug\n  2026 - the master list is a recent build, largely\
+    \ backfilled from\n  historical interview company names."
+- title: Company__c — How It Is Used — The Business Process
+  keywords:
+  - company
+  text: "STEP 1 - CREATION. Two paths:\n  - On the fly during interview scheduling:\
+    \ the Interview_Creation_V2 screen\n    flow (the marketing-path \"create interview\"\
+    \ wizard) looks the company up\n    by name and, if it does not exist yet, CREATES\
+    \ the Company__c record\n    right there (name + website) before linking the\
+    \ new interview to it.\n    (The older Interview_Creation flow did the same\
+    \ but is Obsolete.)\n  - Bulk backfill: the record creation dates (Apr-Aug 2026)\
+    \ show the list\n    was mass-built recently, most likely from the historical\
+    \ free-text\n    company names on ~10k interviews.\n\nSTEP 2 - NAME NORMALIZATION\
+    \ ON EVERY SAVE. The active record-triggered flow\n  Normalize_Company_Name_on_Save\
+    \ rewrites the Name before any create or\n  update: it uppercases the name,\
+    \ trims it, and strips corporate suffixes\n  and filler words in four passes\
+    \ - US forms (INC, LLC, CORP, LTD, LP...),\n  India forms (PVT LTD, PRIVATE\
+    \ LIMITED, OPC, HUF, \"(INDIA)\"...), Europe\n  forms (GMBH, SARL, BV, AG, OY,\
+    \ SPA...), and generic words (TECHNOLOGIES,\n  SOLUTIONS, SERVICES, GROUP, LABS,\
+    \ CONSULTING...). \"Acme Solutions Pvt.\n  Ltd.\" and \"ACME INC\" both save\
+    \ as \"ACME\", so duplicate spellings converge\n  on one canonical record. Side\
+    \ effect to know: company names in this org\n  are stored UPPERCASED and shortened."
+- title: Company__c — How It Is Used — The Business Process (2)
+  keywords:
+  - company
+  text: "STEP 3 - ENRICHMENT (MOSTLY STILL TO DO). Users can classify the company\n\
+    \  with Tier__c; the Interview_Difficulty__c formula instantly derives how\n\
+    \  hard its interviews are expected to be, and Typical_Rounds__c records how\n\
+    \  many rounds its process usually has. In practice this intelligence layer\n\
+    \  is barely curated yet (see part 9) - a bulk default put ~86% of companies\n\
+    \  in the top tier, and Typical Rounds is filled on only 8 records.\n\nSTEP\
+    \ 4 - CONSUMPTION. Interview__c.company_new__c (label \"Company\") points\n\
+    \  here on 98% of all interviews - this is the normal \"which company is the\n\
+    \  candidate interviewing with\" field for the marketing pipeline. The\n  interview's\
+    \ Company_Name__c formula displays this record's name, and the\n  interview\
+    \ dedupe keys (candidate + company + month) rely on everyone\n  linking to the\
+    \ same company record. Two more references exist but are\n  essentially unused\
+    \ so far: Job_Requirement__c.Client_Company__c (B2B\n  requirement's client\
+    \ as a market company - 1 record) and\n  Lead.Company_Name__c (11 records)."
+- title: Company__c — Connected Objects
+  keywords:
+  - company
+  - each
+  - relationship
+  - means
+  text: "OBJECTS THAT POINT AT COMPANY (it has no outbound links of its own):\n\
+    - Interview__c.company_new__c (lookup, label \"Company\"): the main consumer\
+    \ -\n  which market employer the candidate interviews with. Populated on 9,818\n\
+    \  of 9,991 interviews (98%).\n- Job_Requirement__c.Client_Company__c (lookup):\
+    \ ties a B2B job requirement\n  to a company from this master list. Only 1 record\
+    \ so far - the B2B path\n  normally uses the Account object for its clients\
+    \ instead.\n- Lead.Company_Name__c (lookup): links a website lead to a company\
+    \ record\n  (e.g. current employer / target company). 11 leads populated - marginal.\n\
+    \nNON-RELATIONSHIP to keep straight: Interview__c.Company__c is a legacy TEXT\n\
+    field (a name string), not a lookup to this object, and the Apex classes\nthat\
+    \ mention \"Company__c\" (GoogleCalendarAPI, SlackCalloutHelper,\nInterviewRoundNumberBackfill)\
+    \ all read that text field - NO Apex touches\nthis Company__c object; it is\
+    \ flow-managed only."
+- title: Company__c — Business Rules
+  keywords:
+  - company
+  - validation
+  text: 'None. Nothing blocks saving a company; even Name duplicates are prevented
+
+    only softly, by the normalization flow making variants converge.'
+- title: Company__c — Automation
+  keywords:
+  - company
+  - runs
+  text: "RECORD-TRIGGERED FLOW (active):\n- Normalize_Company_Name_on_Save (before\
+    \ save, create + update): the name\n  cleaner described in part 4 - uppercase,\
+    \ trim, strip US/India/Europe\n  corporate suffixes and generic filler words.\
+    \ Runs on EVERY save, so even\n  a manual rename gets re-normalized.\n\nCREATED\
+    \ BY (flows on other objects):\n- Interview_Creation_V2 (active screen flow,\
+    \ marketing interview wizard):\n  looks up the company by name and creates the\
+    \ Company__c record (Name +\n  Company Website) when no match exists.\n- Interview_Creation\
+    \ (screen flow, OBSOLETE): the older version of the\n  same wizard, also able\
+    \ to create companies. Superseded by V2.\n\nNo Apex, no triggers, no quick actions,\
+    \ no scheduled jobs touch this\nobject."
+- title: Niche__c — What This Object Is
+  keywords:
+  - niche
+  text: 'Niche__c is the master list of SKILL/ROLE TRACKS ("niches") Techsara works
+
+    candidates in - e.g. "Java Full Stack", "AI ML Engineer", "Product
+
+    Manager". A niche is the unit the INTERNAL screening machinery is organized
+
+    around: internal interviews assess a candidate FOR a niche, the question
+
+    bank is mapped to niches (via the Niche_Question__c junction), resumes are
+
+    tagged with the niche they target, and the hire decision records which
+
+    niche the candidate was hired into. It is a tiny two-field reference master
+
+    (plus the name) maintained by the training/interviewing admins.'
+- title: Niche__c — Kind Of Object
+  keywords:
+  - niche
+  text: "- Custom object, part of the INTERNAL interviewing / assessment domain\n\
+    \  (the Internal_Interview__c cluster - NOT the external Interview__c side).\n\
+    - Standalone object with its own owner; org-wide sharing Public Read/Write\n\
+    \  (internal and external). Field history tracking enabled.\n- 2 custom fields,\
+    \ 0 record types, 0 validation rules, 1 list view.\n- Name is plain text (label\
+    \ \"Niche  Name\" - with a stray double space).\n- The list view carries a custom\
+    \ \"New Niche\" button that launches the\n  Add_Niche_Flow screen flow (the\
+    \ guided way to add a niche).\n- Scale: 10 records in preprod - a deliberately\
+    \ short, curated list."
+- title: Niche__c — Record Types
+  keywords:
+  - niche
+  text: 'None. All niches are one flavor; Domain_Type__c (Tech / Non Tech) is the
+
+    only classification.'
+- title: Niche__c — How It Is Used — The Business Process
+  keywords:
+  - niche
+  text: "STEP 1 - AN ADMIN ADDS A NICHE. Via the \"New Niche\" list-view button\
+    \ ->\n  Add_Niche_Flow (a 2-screen flow that captures Name, Domain Type and\
+    \ the\n  Is Active flag and creates the record). All 10 existing niches were\n\
+    \  created in one batch on 2026-05-27 - the catalog was seeded once.\n\nSTEP\
+    \ 2 - THE QUESTION POOL IS BUILT. The Bulk_Add_Questions_Flow screen\n  flow\
+    \ lets an admin pick a niche and mass-create interview questions\n  (Question_Bank__c\
+    \ rows) together with the Niche_Question__c junction rows\n  that map each question\
+    \ to the niche. Result: every niche owns a pool of\n  questions (currently 105-215\
+    \ per niche).\n\nSTEP 3 - INTERNAL SCREENING RUNS PER NICHE. When Techsara internally\n\
+    \  screens a candidate, the Internal_Interview__c record carries a Niche__c\n\
+    \  lookup (\"which track are we assessing this candidate for\"). The\n  Internal_Interview_Conduct_Interview\
+    \ screen flow reads the niche (and its\n  Domain_Type__c) to drive section/question\
+    \ selection - pulling from the\n  niche's question pool and/or generating AI\
+    \ questions from the resume -\n  and at the end the Hired_Niche__c lookup on\
+    \ the internal interview\n  records which niche the Hire decision applies to.\
+    \ The View Interview Log\n  flow shows the niche when reviewing past internal\
+    \ interviews."
+- title: Niche__c — How It Is Used — The Business Process (2)
+  keywords:
+  - niche
+  text: "STEP 4 - RESUMES AND TEMPLATES ARE TAGGED. Resume__c.Niche__c tags which\n\
+    \  track a resume version targets, and Template__c.Niche__c ties an internal-\n\
+    \  interview template to its niche (template-driven interviews)."
+- title: Niche__c — Connected Objects
+  keywords:
+  - niche
+  - each
+  - relationship
+  - means
+  text: "CHILD:\n- Niche_Question__c (MASTER-DETAIL child, junction to Question_Bank__c):\n\
+    \  the niche's question pool - one row per question mapped to this niche.\n\
+    \  1,160 mappings across the 10 niches (see that object's section).\n\nOBJECTS\
+    \ THAT POINT AT NICHE (lookups):\n- Internal_Interview__c.Niche__c: the track\
+    \ the candidate is being assessed\n  for (86 of 302 internal interviews populated).\n\
+    - Internal_Interview__c.Hired_Niche__c: the track the candidate was\n  actually\
+    \ hired into when the decision was Hire (12 populated).\n- Resume__c.Niche__c:\
+    \ the track this resume version targets (8 of 17).\n- Template__c.Niche__c:\
+    \ the niche an internal-interview template belongs to\n  (1 of 1).\n- Question_Bank__c.Niche__c\
+    \ and Section__c.Niche__c: single-niche lookups\n  that exist in the metadata\
+    \ source but were NOT queryable in the live\n  preprod org at snapshot time\
+    \ - likely superseded by the Niche_Question__c\n  junction (a question can serve\
+    \ many niches) or awaiting deploy/field-\n  level security (not fully documented\
+    \ - verify with team)."
+- title: Niche__c — Business Rules
+  keywords:
+  - niche
+  - validation
+  text: 'None. Nothing prevents duplicate or inactive-but-referenced niches; the
+
+    short curated list is managed by convention.'
+- title: Niche__c — Automation
+  keywords:
+  - niche
+  - runs
+  text: "No record-triggered flows, triggers, or scheduled jobs run ON Niche__c.\n\
+    The flows that CREATE or READ it:\n- Add_Niche_Flow (active screen flow, launched\
+    \ by the \"New Niche\" list-view\n  button): creates a niche with Name, Domain_Type__c,\
+    \ Is_Active__c.\n- Bulk_Add_Questions_Flow (active screen flow): looks a niche\
+    \ up, then\n  mass-creates Question_Bank__c questions and their Niche_Question__c\n\
+    \  mappings under it.\n- Internal_Interview_Conduct_Interview (active screen\
+    \ flow): reads the\n  niche and its Domain_Type__c while conducting an internal\
+    \ interview\n  (question selection, AI question generation path).\n- View_Interview_Log_Flow\
+    \ (active screen flow): reads the niche when\n  displaying a candidate's internal-interview\
+    \ history.\nNo Apex touches the Niche__c object (DashboardService's \"Niche__c\"\
+    \nreferences are a same-named field on the training-requirement side, not\n\
+    this object)."
+- title: Niche_Question__c — What This Object Is
+  keywords:
+  - niche
+  - question
+  - nichequestion
+  text: 'Niche_Question__c is a pure JUNCTION (many-to-many mapping) between the
+
+    question bank and the niche catalog: one record = "this interview question
+
+    belongs to this niche''s question pool". It exists because one question can
+
+    serve several niches (e.g. a generic coding question fits both "Java Full
+
+    Stack" and "Software Engineer") and each niche needs its own curated pool
+
+    for internal interviews. The record carries NO data of its own beyond the
+
+    two parent links and an auto-number id.'
+- title: Niche_Question__c — Kind Of Object
+  keywords:
+  - niche
+  - question
+  - nichequestion
+  text: "- Custom object, part of the INTERNAL interviewing / question-bank domain.\n\
+    - JUNCTION OBJECT with TWO MASTER-DETAIL parents: Question__c ->\n  Question_Bank__c\
+    \ (the primary master - it controls sharing and owner\n  inheritance) and Niche__c\
+    \ -> Niche__c. Sharing is \"Controlled By Parent\";\n  deleting EITHER the question\
+    \ or the niche cascade-deletes the mapping.\n- 2 custom fields (the two master-details),\
+    \ 0 record types, 0 validation\n  rules, 1 list view.\n- Auto-number Name in\
+    \ the format NQ-{00000} (label \"Niche  Question  ID\").\n- Scale: 1,160 records\
+    \ in preprod mapping 620 questions to 10 niches\n  (~1.9 niches per question\
+    \ on average)."
+- title: Niche_Question__c — How It Is Used — The Business Process
+  keywords:
+  - niche
+  - question
+  - nichequestion
+  text: "STEP 1 - POOLS ARE BUILT IN BULK. An admin runs the Bulk_Add_Questions_Flow\n\
+    \  screen flow: they pick a niche, paste/enter a batch of questions, and the\n\
+    \  flow creates the Question_Bank__c rows AND one Niche_Question__c row per\n\
+    \  question linking it to that niche. The data shows this was done as a\n  seeding\
+    \ exercise: every niche got a standard pool of 105 mappings (AI ML\n  Engineer\
+    \ got 215), created between 2026-05-27 and 2026-07-27.\n\nSTEP 2 - POOLS ARE\
+    \ READ DURING INTERNAL INTERVIEWS. When the\n  Internal_Interview_Conduct_Interview\
+    \ flow runs a NICHE-driven internal\n  interview, it queries Niche_Question__c\
+    \ for the interview's niche to pull\n  the mapped Question_Bank__c questions\
+    \ (then filters by section/difficulty\n  and can shuffle them via the RandomizeQuestions\
+    \ Apex action). Template-\n  driven and AI-generated question paths bypass this\
+    \ junction.\n\nSTEP 3 - MAINTENANCE. Adding a question to another niche = creating\
+    \ one\n  more mapping row; retiring a question from a niche = deleting its row.\n\
+    \  There is no UI button for one-off edits - admins use the flow or standard\n\
+    \  related lists on the Niche / Question Bank record pages."
+- title: Niche_Question__c — Connected Objects
+  keywords:
+  - niche
+  - question
+  - nichequestion
+  - each
+  - relationship
+  - means
+  text: "PARENTS (both master-detail, both required):\n- Question_Bank__c (via Question__c,\
+    \ PRIMARY master): the interview\n  question being mapped. Controls the junction's\
+    \ sharing/ownership.\n  Deleting a question deletes its mappings.\n- Niche__c\
+    \ (via Niche__c, secondary master): the niche whose pool the\n  question joins.\
+    \ Deleting a niche deletes its whole pool of mappings.\n\nBoth parents use the\
+    \ same child relationship name (\"Niche_Questions\"), so\neach Niche record\
+    \ page and each Question Bank record page shows a \"Niche\nQuestions\" related\
+    \ list of these rows. Nothing else references this object."
+- title: Niche_Question__c — Business Rules
+  keywords:
+  - niche
+  - question
+  - nichequestion
+  - validation
+  text: 'None. Notably there is no duplicate guard - the same question could be
+
+    mapped to the same niche twice; the bulk flow is trusted not to do that.'
+- title: Niche_Question__c — Automation
+  keywords:
+  - niche
+  - question
+  - nichequestion
+  - runs
+  text: "No record-triggered flows, triggers, or scheduled jobs run ON it. It is\n\
+    written and read only by two screen flows:\n- Bulk_Add_Questions_Flow (active):\
+    \ creates the mappings in bulk while\n  creating questions for a chosen niche.\n\
+    - Internal_Interview_Conduct_Interview (active): reads the mappings (Id,\n \
+    \ Niche__c, Question__c) to assemble the niche's question pool during an\n \
+    \ internal interview.\nNo Apex references Niche_Question__c."

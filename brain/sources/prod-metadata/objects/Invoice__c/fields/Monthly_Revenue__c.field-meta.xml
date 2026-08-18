@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Monthly_Revenue__c</fullName>
+    <formula>CASE(
+    TEXT(Frequency__c),
+    &quot;Daily&quot;, Recurring_Amount__c * 30 / Interval__c,
+    &quot;Weekly&quot;, Recurring_Amount__c * 4 / Interval__c,
+    &quot;Monthly&quot;, Recurring_Amount__c / Interval__c,
+    &quot;Yearly&quot;, Recurring_Amount__c / (12 * Interval__c),
+    0
+)</formula>
+    <formulaTreatBlanksAs>BlankAsZero</formulaTreatBlanksAs>
+    <label>Monthly Revenue</label>
+    <precision>18</precision>
+    <required>false</required>
+    <scale>2</scale>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Currency</type>
+</CustomField>

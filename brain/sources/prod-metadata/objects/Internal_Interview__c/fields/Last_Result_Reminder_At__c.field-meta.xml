@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Last_Result_Reminder_At__c</fullName>
+    <description>Timestamp of the most recent result-reminder email sent for this mock. Used with Result_Reminder_Count__c to prevent duplicate sends and for auditing/debugging. Populated by MockDeadlineEnforcer.sendResultReminders.</description>
+    <inlineHelpText>When the most recent reminder email was sent. Auto-managed by MockDeadlineEnforcer.</inlineHelpText>
+    <label>Last Result Reminder At</label>
+    <required>false</required>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>DateTime</type>
+</CustomField>

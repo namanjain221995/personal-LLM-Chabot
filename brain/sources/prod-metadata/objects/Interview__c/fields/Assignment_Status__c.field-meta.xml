@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Assignment_Status__c</fullName>
+    <label>Assignment Status</label>
+    <required>false</required>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Picklist</type>
+    <valueSet>
+        <restricted>true</restricted>
+        <valueSetDefinition>
+            <sorted>false</sorted>
+            <value>
+                <fullName>Not Assigned</fullName>
+                <default>false</default>
+                <label>Not Assigned</label>
+            </value>
+            <value>
+                <fullName>Assigned</fullName>
+                <default>false</default>
+                <label>Assigned</label>
+            </value>
+            <value>
+                <fullName>No Bandwidth</fullName>
+                <default>false</default>
+                <label>No Bandwidth</label>
+            </value>
+            <value>
+                <fullName>Needs Manual Review</fullName>
+                <default>false</default>
+                <label>Needs Manual Review</label>
+            </value>
+            <value>
+                <fullName>Assignment Failed</fullName>
+                <default>false</default>
+                <label>Assignment Failed</label>
+            </value>
+            <value>
+                <fullName>Reassigned Due To Extension</fullName>
+                <default>false</default>
+                <label>Reassigned Due To Extension</label>
+            </value>
+        </valueSetDefinition>
+    </valueSet>
+</CustomField>

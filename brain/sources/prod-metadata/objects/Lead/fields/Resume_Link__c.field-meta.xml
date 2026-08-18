@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Resume_Link__c</fullName>
+    <description>URL link to candidate resume if stored outside Salesforce. Used when file attachment is not available at lead creation time.</description>
+    <inlineHelpText>Paste the direct URL to the candidate resume. Use when resume is stored in Google Drive or Dropbox. Make sure the link is accessible.</inlineHelpText>
+    <label>Resume Link</label>
+    <required>false</required>
+    <trackFeedHistory>false</trackFeedHistory>
+    <trackHistory>false</trackHistory>
+    <type>Url</type>
+</CustomField>

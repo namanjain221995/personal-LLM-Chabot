@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>COMPASS_State_JSON__c</fullName>
+    <inlineHelpText>zed COMPASS-R  
+engine state for this  
+employee (Kalman filter,  
+momentum, histories,  
+velocity EMAs, etc.).  
+Written by the  
+COMPASS Lambda after  
+each run; read on the  
+next run to resume state.  
+Opaque JSON — do not  
+hand-edit.</inlineHelpText>
+    <label>COMPASS State JSON</label>
+    <length>131072</length>
+    <trackHistory>true</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>LongTextArea</type>
+    <visibleLines>10</visibleLines>
+</CustomField>

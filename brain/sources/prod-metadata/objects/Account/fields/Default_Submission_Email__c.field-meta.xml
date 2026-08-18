@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Default_Submission_Email__c</fullName>
+    <description>The default email address used by the Account Manager when submitting candidate profiles to this client.</description>
+    <externalId>false</externalId>
+    <inlineHelpText>Enter the primary email for sending candidate submissions to this client. Typically the hiring manager or vendor coordinator email.</inlineHelpText>
+    <label>Default Submission Email</label>
+    <required>false</required>
+    <trackFeedHistory>false</trackFeedHistory>
+    <trackHistory>false</trackHistory>
+    <type>Email</type>
+    <unique>false</unique>
+</CustomField>

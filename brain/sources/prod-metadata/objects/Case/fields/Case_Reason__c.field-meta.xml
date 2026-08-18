@@ -1,0 +1,269 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Case_Reason__c</fullName>
+    <label>Case Reason</label>
+    <required>false</required>
+    <trackFeedHistory>false</trackFeedHistory>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Picklist</type>
+    <valueSet>
+        <controllingField>Type</controllingField>
+        <restricted>true</restricted>
+        <valueSetDefinition>
+            <sorted>false</sorted>
+            <value>
+                <fullName>Resume Edit</fullName>
+                <default>false</default>
+                <label>Resume Edit</label>
+            </value>
+            <value>
+                <fullName>LinkedIn Edit</fullName>
+                <default>false</default>
+                <label>LinkedIn Edit</label>
+            </value>
+            <value>
+                <fullName>Experience Adjustment</fullName>
+                <default>false</default>
+                <label>Experience Adjustment</label>
+            </value>
+            <value>
+                <fullName>Start</fullName>
+                <default>false</default>
+                <label>Start</label>
+            </value>
+            <value>
+                <fullName>Pause</fullName>
+                <default>false</default>
+                <label>Pause</label>
+            </value>
+            <value>
+                <fullName>Resume</fullName>
+                <default>false</default>
+                <label>Resume</label>
+            </value>
+            <value>
+                <fullName>Priority Change</fullName>
+                <default>false</default>
+                <label>Priority Change</label>
+            </value>
+            <value>
+                <fullName>Warning (Responsiveness)</fullName>
+                <default>false</default>
+                <label>Warning (Responsiveness)</label>
+            </value>
+            <value>
+                <fullName>Availability</fullName>
+                <default>false</default>
+                <label>Availability</label>
+            </value>
+            <value>
+                <fullName>Missed Session</fullName>
+                <default>false</default>
+                <label>Missed Session</label>
+            </value>
+            <value>
+                <fullName>Skill Gap</fullName>
+                <default>false</default>
+                <label>Skill Gap</label>
+            </value>
+            <value>
+                <fullName>Track Change</fullName>
+                <default>false</default>
+                <label>Track Change</label>
+            </value>
+            <value>
+                <fullName>Inactive / No Response</fullName>
+                <default>false</default>
+                <label>Inactive / No Response</label>
+            </value>
+            <value>
+                <fullName>Seriousness / Commitment</fullName>
+                <default>false</default>
+                <label>Seriousness / Commitment</label>
+            </value>
+            <value>
+                <fullName>Direct Bypass (Text/Email)</fullName>
+                <default>false</default>
+                <label>Direct Bypass (Text/Email)</label>
+            </value>
+            <value>
+                <fullName>Recording Request</fullName>
+                <default>false</default>
+                <label>Recording Request</label>
+            </value>
+            <value>
+                <fullName>Support Mandatory</fullName>
+                <default>false</default>
+                <label>Support Mandatory</label>
+            </value>
+            <value>
+                <fullName>Scheduling</fullName>
+                <default>false</default>
+                <label>Scheduling</label>
+            </value>
+            <value>
+                <fullName>Proxy Exception (One-off)</fullName>
+                <default>false</default>
+                <label>Proxy Exception (One-off)</label>
+            </value>
+            <value>
+                <fullName>Signature Pending</fullName>
+                <default>false</default>
+                <label>Signature Pending</label>
+            </value>
+            <value>
+                <fullName>Payment Pending</fullName>
+                <default>false</default>
+                <label>Payment Pending</label>
+            </value>
+            <value>
+                <fullName>Plan Upgrade</fullName>
+                <default>false</default>
+                <label>Plan Upgrade</label>
+            </value>
+            <value>
+                <fullName>Policy Clarification</fullName>
+                <default>false</default>
+                <label>Policy Clarification</label>
+            </value>
+            <value>
+                <fullName>Legal Warning</fullName>
+                <default>false</default>
+                <label>Legal Warning</label>
+            </value>
+            <value>
+                <fullName>Policy Breach</fullName>
+                <default>false</default>
+                <label>Policy Breach</label>
+            </value>
+            <value>
+                <fullName>Escalation</fullName>
+                <default>false</default>
+                <label>Escalation</label>
+            </value>
+            <value>
+                <fullName>Evidence Request</fullName>
+                <default>false</default>
+                <label>Evidence Request</label>
+            </value>
+            <value>
+                <fullName>New Referral</fullName>
+                <default>false</default>
+                <label>New Referral</label>
+            </value>
+        </valueSetDefinition>
+        <valueSettings>
+            <controllingFieldValue>Agreement/Policy</controllingFieldValue>
+            <valueName>Signature Pending</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>Agreement/Policy</controllingFieldValue>
+            <valueName>Payment Pending</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>Agreement/Policy</controllingFieldValue>
+            <valueName>Plan Upgrade</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>Agreement/Policy</controllingFieldValue>
+            <valueName>Policy Clarification</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>Legal/Compliance</controllingFieldValue>
+            <valueName>Legal Warning</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>Legal/Compliance</controllingFieldValue>
+            <valueName>Policy Breach</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>Legal/Compliance</controllingFieldValue>
+            <valueName>Escalation</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>Legal/Compliance</controllingFieldValue>
+            <valueName>Evidence Request</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>Referral</controllingFieldValue>
+            <valueName>New Referral</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>Resume/LinkedIn</controllingFieldValue>
+            <valueName>Resume Edit</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>Resume/LinkedIn</controllingFieldValue>
+            <valueName>LinkedIn Edit</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>Resume/LinkedIn</controllingFieldValue>
+            <valueName>Experience Adjustment</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>Marketing</controllingFieldValue>
+            <valueName>Start</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>Marketing</controllingFieldValue>
+            <valueName>Pause</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>Marketing</controllingFieldValue>
+            <valueName>Resume</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>Marketing</controllingFieldValue>
+            <valueName>Priority Change</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>Marketing</controllingFieldValue>
+            <valueName>Warning (Responsiveness)</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>Training</controllingFieldValue>
+            <valueName>Availability</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>Training</controllingFieldValue>
+            <valueName>Missed Session</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>Training</controllingFieldValue>
+            <valueName>Skill Gap</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>Training</controllingFieldValue>
+            <valueName>Track Change</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>Engagement</controllingFieldValue>
+            <valueName>Inactive / No Response</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>Engagement</controllingFieldValue>
+            <valueName>Seriousness / Commitment</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>Engagement</controllingFieldValue>
+            <valueName>Direct Bypass (Text/Email)</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>Interview Support</controllingFieldValue>
+            <valueName>Recording Request</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>Interview Support</controllingFieldValue>
+            <valueName>Support Mandatory</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>Interview Support</controllingFieldValue>
+            <valueName>Scheduling</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>Interview Support</controllingFieldValue>
+            <valueName>Proxy Exception (One-off)</valueName>
+        </valueSettings>
+    </valueSet>
+</CustomField>

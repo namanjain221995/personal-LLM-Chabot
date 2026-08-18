@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>DS_Service_Identification_Type__c</fullName>
+    <label>DS Service Identification Type</label>
+    <required>false</required>
+    <trackFeedHistory>false</trackFeedHistory>
+    <trackHistory>false</trackHistory>
+    <type>Picklist</type>
+    <valueSet>
+        <restricted>true</restricted>
+        <valueSetDefinition>
+            <sorted>false</sorted>
+            <value>
+                <fullName>Passport</fullName>
+                <default>false</default>
+                <label>Passport</label>
+            </value>
+            <value>
+                <fullName>Driver&apos;s License</fullName>
+                <default>false</default>
+                <label>Driver&apos;s License</label>
+            </value>
+            <value>
+                <fullName>State Id</fullName>
+                <default>false</default>
+                <label>State Id</label>
+            </value>
+        </valueSetDefinition>
+    </valueSet>
+</CustomField>

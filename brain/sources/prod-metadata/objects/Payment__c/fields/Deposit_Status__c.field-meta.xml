@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Deposit_Status__c</fullName>
+    <inlineHelpText>Where this payment is in the deposit lifecycle. Pending = charged but not yet deposited; Deposited = funds in the bank; Reversed = deposit was reversed (NSF/chargeback).</inlineHelpText>
+    <label>Deposit Status</label>
+    <required>false</required>
+    <trackFeedHistory>false</trackFeedHistory>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Picklist</type>
+    <valueSet>
+        <valueSetDefinition>
+            <sorted>false</sorted>
+            <value>
+                <fullName>Pending</fullName>
+                <default>true</default>
+                <label>Pending</label>
+            </value>
+            <value>
+                <fullName>Deposited</fullName>
+                <default>false</default>
+                <label>Deposited</label>
+            </value>
+            <value>
+                <fullName>Reversed</fullName>
+                <default>false</default>
+                <label>Reversed</label>
+            </value>
+        </valueSetDefinition>
+    </valueSet>
+</CustomField>

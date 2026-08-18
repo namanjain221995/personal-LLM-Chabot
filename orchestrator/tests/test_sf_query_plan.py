@@ -600,3 +600,58 @@ def test_the_prompt_still_refuses_to_call_the_synced_copy_live():
     system = _narrative_messages("q", ["a"], [["b"]], [])[0]["content"]
     assert "LOCAL SYNCED COPY" in system
     assert "Never say the result is live" in system
+
+
+# ── One-row aggregates: the value is the answer, not the row count ───────────
+# `SELECT count(*) ... WHERE Status__c = 'Locked'` returned [[866]] and the
+# summary published "total_rows: 1" as an authoritative figure next to
+# "sum: 866" — the narrative model quoted the 1 (sf_intel did, 2026-08-17) or
+# reasoned aloud about the contradiction. The summary now states the aggregate
+# meaning itself.
+
+
+def test_a_one_row_count_promotes_the_value_to_record_count():
+    summary = deterministic_summary(["count(*)"], [[866]])
+    assert summary["record_count"] == 866
+    assert summary["aggregate_result"] == {"count(*)": 866.0}
+    assert "not of records" in summary["counts_cover"]
+
+
+def test_a_one_row_sum_states_the_aggregate_without_inventing_a_count():
+    summary = deterministic_summary(["total_amount"], [[123456.78]])
+    assert summary["aggregate_result"] == {"total_amount": 123456.78}
+    assert "record_count" not in summary
+
+
+def test_a_single_data_row_with_text_is_not_mistaken_for_an_aggregate():
+    summary = deterministic_summary(["Name", "Amount"], [["Acme", 500]])
+    assert "aggregate_result" not in summary
+    assert summary["total_rows"] == 1
+
+
+def test_grouped_results_keep_their_row_semantics():
+    summary = deterministic_summary(
+        ["Status__c", "n"], [["Locked", 866], ["Active", 107]]
+    )
+    assert "aggregate_result" not in summary
+    assert summary["total_rows"] == 2
+
+
+def test_a_grouped_count_result_pairs_each_label_with_its_value():
+    """"Completed 72 / Voided 33" was summarized as "Completed: 1 (50%)" —
+    occurrence counts of unique labels quoted as real counts."""
+    summary = deterministic_summary(
+        ["dfsle__Status__c", "count"], [["Completed", 72], ["Voided", 33]]
+    )
+    assert summary["row_breakdown"] == {"Completed": 72, "Voided": 33}
+    assert "value_counts" not in summary
+    assert "sum across rows is 105" in summary["counts_cover"]
+
+
+def test_repeated_labels_keep_the_normal_value_counts_profile():
+    """Real record rows (statuses repeat) are NOT a grouped result."""
+    summary = deterministic_summary(
+        ["Status__c", "Amount"], [["Open", 10], ["Open", 20], ["Closed", 5]]
+    )
+    assert "row_breakdown" not in summary
+    assert "value_counts" in summary

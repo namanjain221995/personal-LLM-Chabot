@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Skills_Match_Notes__c</fullName>
+    <description>Detailed notes explaining why this candidate matches the job requirements. Written by recruiter. Reviewed by AM before client submission.</description>
+    <inlineHelpText>Explain how the candidate skills match the job requirements point by point. Example: Job requires Apex - Candidate has 5 years Apex experience.</inlineHelpText>
+    <label>Skills Match Notes</label>
+    <length>32768</length>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>LongTextArea</type>
+    <visibleLines>3</visibleLines>
+</CustomField>

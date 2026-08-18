@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Job_Requirement__c</fullName>
+    <deleteConstraint>Restrict</deleteConstraint>
+    <description>Parent Job Requirement record for this submission. Links this candidate submission to the specific open job.</description>
+    <inlineHelpText>Select the Job Requirement this candidate is being submitted for. Required field. Cannot be changed after creation.</inlineHelpText>
+    <label>Job Requirement</label>
+    <referenceTo>Job_Requirement__c</referenceTo>
+    <relationshipLabel>Job Submissions</relationshipLabel>
+    <relationshipName>Job_Submissions</relationshipName>
+    <required>false</required>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Lookup</type>
+</CustomField>

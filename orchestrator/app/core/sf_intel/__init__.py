@@ -8,6 +8,10 @@ resumes the ORIGINAL request once that question is answered.
 
 The pieces, in the order a request meets them:
 
+    interpret.py  the deterministic reading of the request: domain words spelled
+                  the way this org spells them, and the slots the sentence
+                  already settles — so a question the user answered in their own
+                  first line is never asked back at them
     resume.py   is this message an answer to the question we just asked, or a
                 new topic? (deterministic signals first, model second)
     planner.py  execute / ask / answer-generally / unsupported — one validated

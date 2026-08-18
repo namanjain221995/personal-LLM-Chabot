@@ -12,6 +12,7 @@ import {
   answerSummary,
   buildResponse,
   cardKeyAction,
+  cardState,
   clientMessageId,
   composerPlaceholder,
   optionShortcut,
@@ -162,13 +163,73 @@ describe('finding the pending question in a thread', () => {
       pendingClarification([message({ content: 'Here you go.', meta: { route: 'sql' } })]),
     ).toBeNull();
   });
+
+  // Which card is LIVE. The transcript used to be full of working controls:
+  // every message carrying a clarification rendered an interactive card, and
+  // the parent's in-flight lock is keyed by id and clears when the run ends —
+  // so answering one question re-armed every older one, and clicking a
+  // different option on any of them started a fresh run against an intent the
+  // conversation had long moved past.
+  describe('which card is still live', () => {
+    const asked = message({
+      id: 'a1',
+      meta: { route: 'clarify', clarification: WIRE } as never,
+    });
+
+    it('marks the question the thread is waiting on as pending', () => {
+      const thread = [message({ role: 'user', content: 'show my pipeline' }), asked];
+      expect(cardState(thread, 1)).toEqual({ pending: true, answeredWith: '' });
+    });
+
+    it('marks an answered question as history, quoting the answer', () => {
+      const thread = [
+        asked,
+        message({ role: 'user', content: 'This quarter' }),
+        message({ content: 'Here is your pipeline.', meta: { route: 'sql' } }),
+      ];
+      expect(cardState(thread, 0)).toEqual({
+        pending: false,
+        answeredWith: 'This quarter',
+      });
+    });
+
+    it('marks EVERY older card as history when a newer one is live', () => {
+      const older = message({
+        id: 'a0',
+        meta: {
+          route: 'clarify',
+          clarification: { ...WIRE, clarification_id: 'clr_0' },
+        } as never,
+      });
+      const thread = [
+        older,
+        message({ role: 'user', content: 'This quarter' }),
+        asked,
+      ];
+      expect(cardState(thread, 0).pending).toBe(false);
+      expect(cardState(thread, 2).pending).toBe(true);
+    });
+
+    it('has nothing to say about a message with no card', () => {
+      expect(cardState([message({ content: 'hi' })], 0)).toEqual({
+        pending: false,
+        answeredWith: '',
+      });
+      expect(cardState([], 5)).toEqual({ pending: false, answeredWith: '' });
+    });
+
+    it('reports a skipped question as answered with nothing quoted', () => {
+      // A skip carries no text of its own; the parent supplies the wording.
+      const thread = [asked, message({ role: 'user', content: '' })];
+      expect(cardState(thread, 0)).toEqual({ pending: false, answeredWith: '' });
+    });
+  });
 });
 
 describe('keyboard', () => {
   const context = {
     optionCount: 3,
     allowCustom: true,
-    dismissible: true,
     typingCustom: false,
   };
 
@@ -185,10 +246,6 @@ describe('keyboard', () => {
 
   it('maps the next number to "Something else"', () => {
     expect(cardKeyAction({ key: '4' }, context)).toEqual({ kind: 'custom' });
-  });
-
-  it('ignores a number past the end of the card', () => {
-    expect(cardKeyAction({ key: '9' }, context)).toBeNull();
   });
 
   it('does not steal digits while the custom box has focus', () => {
@@ -213,19 +270,58 @@ describe('keyboard', () => {
     });
   });
 
-  it('confirms on Enter and dismisses on Escape only when dismissing is safe', () => {
+  it('confirms on Enter', () => {
     expect(cardKeyAction({ key: 'Enter' }, context)).toEqual({ kind: 'confirm' });
-    expect(cardKeyAction({ key: 'Escape' }, context)).toEqual({ kind: 'dismiss' });
-    expect(
-      cardKeyAction({ key: 'Escape' }, { ...context, dismissible: false }),
-    ).toBeNull();
   });
 
-  it('opens the text field when Enter lands on the "Something else" row', () => {
+  it('LEAVES for the composer on Escape rather than answering', () => {
+    // Wanting to type your own answer is the commonest reason to press it.
+    // Submitting "no preference" there would answer on the user's behalf with
+    // something they never chose.
+    expect(cardKeyAction({ key: 'Escape' }, context)).toEqual({ kind: 'leave' });
+  });
+
+  it('hands over to the composer when Enter lands on the "Something else" row', () => {
     // Otherwise Enter there would send an empty answer.
     expect(
       cardKeyAction({ key: 'Enter' }, { ...context, activeIndex: 3 }),
     ).toEqual({ kind: 'custom' });
+  });
+
+  // The panel takes focus when a question appears so the number keys work
+  // immediately. That is only safe because TYPING still goes where typing
+  // goes: without this, answering "the scheduled interview for Dileep" in your
+  // own words would lose its first letter, and any digit in what you typed
+  // would have picked an option and sent it.
+  it('forwards an ordinary keystroke to the composer, carrying the character', () => {
+    expect(cardKeyAction({ key: 'a' }, context)).toEqual({
+      kind: 'leave',
+      text: 'a',
+    });
+    expect(cardKeyAction({ key: 'D' }, context)).toEqual({
+      kind: 'leave',
+      text: 'D',
+    });
+  });
+
+  it('forwards a digit PAST the end of the card instead of eating it', () => {
+    // "90 days" starts with a 9. On a three-option card that is text, not a
+    // shortcut.
+    expect(cardKeyAction({ key: '9' }, context)).toEqual({
+      kind: 'leave',
+      text: '9',
+    });
+  });
+
+  it('leaves Space alone, so it still activates the focused option', () => {
+    expect(cardKeyAction({ key: ' ' }, context)).toBeNull();
+  });
+
+  it('never forwards a navigation or modifier key as text', () => {
+    for (const key of ['Tab', 'Shift', 'ArrowUp', 'Backspace', 'F5']) {
+      const action = cardKeyAction({ key }, context);
+      expect(action?.kind).not.toBe('leave');
+    }
   });
 
   it('TOGGLES rather than submits when several answers are allowed', () => {

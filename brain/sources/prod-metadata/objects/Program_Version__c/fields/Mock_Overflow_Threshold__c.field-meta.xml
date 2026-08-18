@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Mock_Overflow_Threshold__c</fullName>
+    <defaultValue>3</defaultValue>
+    <description>Overflow threshold for mock booking. When a mock day&apos;s total remaining availability is at or below this number, MockAvailabilityService opens the next working day (skipping weekends and holidays) and cascades forward until pending mocks can be scheduled. Read by MockAvailabilityService; defaults to 3 if blank.</description>
+    <externalId>false</externalId>
+    <inlineHelpText>When a mock day&apos;s remaining interviewer openings (summed across its time slots) drop to this number or below, the next working day is also opened for mock booking. Leave blank to use the default of 3.</inlineHelpText>
+    <label>Mock Overflow Threshold</label>
+    <precision>3</precision>
+    <required>false</required>
+    <scale>0</scale>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Number</type>
+    <unique>false</unique>
+</CustomField>

@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Submitted_Bill_Rate__c</fullName>
+    <description>SENSITIVE. The rate AM submitted to the client for this candidate. Entered during Approve and Submit to Client flow. Required when status = Submitted to Client.</description>
+    <inlineHelpText>Enter the hourly or salary rate being submitted to the client. This may differ from Client Bill Rate on Job Requirement if AM negotiated differently.</inlineHelpText>
+    <label>Submitted Bill Rate</label>
+    <precision>18</precision>
+    <required>false</required>
+    <scale>0</scale>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Currency</type>
+</CustomField>

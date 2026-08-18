@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Website_Status__c</fullName>
+    <description>Controls website listing visibility. Draft = not public. Published = eligible to show if all conditions met. Unpublished = removed from website but job stays open.</description>
+    <inlineHelpText>Draft = not visible on website. 
+Published = will show on website if job is Open and deadline is future. 
+Unpublished = removed from website, job can stay Open internally.</inlineHelpText>
+    <label>Job Posting Status</label>
+    <required>false</required>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Picklist</type>
+    <valueSet>
+        <restricted>true</restricted>
+        <valueSetDefinition>
+            <sorted>false</sorted>
+            <value>
+                <fullName>Draft</fullName>
+                <default>true</default>
+                <label>Draft</label>
+            </value>
+            <value>
+                <fullName>Published</fullName>
+                <default>false</default>
+                <label>Published</label>
+            </value>
+            <value>
+                <fullName>Unpublished</fullName>
+                <default>false</default>
+                <label>Unpublished</label>
+            </value>
+        </valueSetDefinition>
+    </valueSet>
+</CustomField>

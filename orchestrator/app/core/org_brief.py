@@ -185,6 +185,15 @@ ANSWER_RULES = """\
 - Zero rows and no process are different answers. If a table is essentially
   unpopulated, say the process is not in use yet rather than reporting 0 as a
   business result.
+- An EMPTY result is not a finding about the business. A query returns nothing
+  when the records are absent, but equally when the join ran through the wrong
+  object, the name is stored differently (a middle name, a different case, a
+  Recruiter__c row rather than an Account), the date literal did not parse, or
+  a filter was too narrow — none of which raise an error. So report what the
+  query looked for and that it found nothing; never write that a person has no
+  records, that a process never happened, or that the data is not in the
+  system. When a person was named, say plainly that they may be recorded under
+  a different object or spelling, and offer to look again.
 - Never repeat credentials or personal identifiers even when a row contains
   them — passwords, portal credentials, SSN digits, passport or bank numbers.
   Say the field exists and that you will not read it out.
@@ -725,6 +734,13 @@ def domain_rules_for(question: str) -> str:
             for word in domain["triggers"]
         ):
             blocks.append(domain["rules"])
+    # Brain packs are the same shape as DOMAIN_RULES, loaded from files the
+    # Salesforce team drops in rather than authored here (core/brain.py).
+    from . import brain
+
+    pack_rules = brain.rules_for(question)
+    if pack_rules:
+        blocks.append(pack_rules)
     return "\n\n".join(blocks)
 
 
@@ -742,9 +758,11 @@ def match_metrics(question: str, limit: int = 2) -> List[Dict[str, Any]]:
     question as a phrase, so "ghosting rate" pulls the ghosting definition
     while "rate" on its own pulls nothing.
     """
+    from . import brain
+
     text = " " + (question or "").lower() + " "
     scored = []
-    for metric in METRICS:
+    for metric in [*METRICS, *brain.extra_metrics()]:
         best = 0
         for phrase in _phrases(metric):
             if re.search(r"\b" + re.escape(phrase.lower()) + r"\b", text):
@@ -1000,6 +1018,16 @@ TABLE_ALIASES: Dict[str, Sequence[str]] = {
     "employee": ("Recruiter__c",),
     "recruiter": ("Recruiter__c",),
     "supporter": ("Recruiter__c",),
+    # The word the questions actually use. Every OTHER way of saying "a member
+    # of staff" was mapped — trainer, host, employee, recruiter, supporter —
+    # but not the one on the field itself, so Recruiter__c scored zero on
+    # "how many internal interviews has <name> conducted" and never entered the
+    # slice. `interviewer` also has to pull Internal_Interview__c: the question
+    # is about the interviews, and the person is only how they are filtered.
+    "interviewer": ("Recruiter__c", "Internal_Interview__c"),
+    "interviewers": ("Recruiter__c", "Internal_Interview__c"),
+    "conducted": ("Recruiter__c", "Internal_Interview__c"),
+    "taken by": ("Recruiter__c", "Internal_Interview__c"),
     "candidate": ("Account", "RecordType"),
     "client": ("Account", "RecordType"),
     "interview": ("Interview__c", "RecordType"),
@@ -1041,6 +1069,10 @@ def tables_for(question: str) -> List[str]:
         if _stem(word) in words:
             for name in tables:
                 add(name)
+    from . import brain
+
+    for name in brain.tables_for(question):
+        add(name)
     return seen
 
 
@@ -1060,6 +1092,13 @@ def grounding_for(question: str, dialect: str = "sql") -> str:
     hint = metric_hint(question)
     if hint:
         parts.append(hint)
+    # Brain glossary + retrieved knowledge (rules and metrics already arrived
+    # through domain_rules_for and metric_hint above).
+    from . import brain
+
+    extras = brain.grounding_extras(question)
+    if extras:
+        parts.append(extras)
     if dialect == "soql":
         parts.append(
             SOQL_TRANSLATION

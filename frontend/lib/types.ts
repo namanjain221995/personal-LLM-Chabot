@@ -176,24 +176,18 @@ export interface Meta {
   /** The searches behind this answer, kept so history replays the panel. */
   research?: Research;
   /**
-   * The question had more than one honest reading, so the answer is a
-   * question back. Rendered as buttons: picking one sends it as the next
-   * message, which the server resolves against the original question.
+   * The question had more than one honest reading, so the answer is a question
+   * back. Answering it RESUMES the original request server-side rather than
+   * sending a rewritten question as a new message — see lib/clarification.ts.
    *
-   * LEGACY (still emitted when Salesforce Intelligence Mode is off, and still
-   * present on every conversation persisted before it existed). The typed
-   * replacement is `clarification` below; MessageRow prefers that one and
-   * falls back to this, so old threads keep rendering exactly as they did.
-   */
-  clarify?: Clarify;
-  /**
-   * Salesforce Intelligence Mode: the typed clarification this request is
-   * waiting on. Unlike `clarify`, answering it RESUMES the original request
-   * server-side rather than sending a rewritten question as a new message —
-   * see lib/clarification.ts.
+   * This is the ONLY clarification payload. A second, untyped `clarify` shape
+   * used to ride alongside it, rendered by a different component, with no
+   * resume token and no server-side state; a conversation persisted while that
+   * was live shows its question as ordinary assistant prose, which is what it
+   * always was underneath.
    */
   clarification?: import('./clarification').ClarificationRequest;
-  /** Which Salesforce path answered: "intelligence" or absent (the v1 chain). */
+  /** Which planner decided: "intelligence" (the model) or "deterministic". */
   salesforce_mode?: string;
   /** Provenance for a Salesforce-derived answer, shown under the message. */
   salesforce_sources?: SalesforceSources;
@@ -219,27 +213,6 @@ export interface SalesforceSources {
   freshness?: string;
   pages?: number;
   truncated?: boolean;
-}
-
-export interface ClarifyOption {
-  label: string;
-  description?: string;
-  /**
-   * The message to send when this option is picked — the ORIGINAL question
-   * with the chosen reading folded in. Sending the label alone made the
-   * server treat it as a fresh question and clarify it again, forever.
-   */
-  send?: string;
-  /** Opens a text box instead of sending immediately. */
-  free_text?: boolean;
-}
-
-export interface Clarify {
-  question: string;
-  reason?: string;
-  /** The question being clarified, so free text can be folded into it. */
-  original?: string;
-  options: ClarifyOption[];
 }
 
 export interface ContextUsage {

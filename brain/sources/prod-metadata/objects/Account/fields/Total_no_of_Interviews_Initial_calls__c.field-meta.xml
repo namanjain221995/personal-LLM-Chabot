@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Total_no_of_Interviews_Initial_calls__c</fullName>
+    <label>Total no. of Interviews &amp; Initial calls</label>
+    <summaryForeignKey>Interview__c.Candidate__c</summaryForeignKey>
+    <summaryOperation>count</summaryOperation>
+    <trackHistory>false</trackHistory>
+    <type>Summary</type>
+</CustomField>

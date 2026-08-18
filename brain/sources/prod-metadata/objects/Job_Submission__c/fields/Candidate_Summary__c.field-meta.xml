@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Candidate_Summary__c</fullName>
+    <description>Short pitch written by the recruiter about why this candidate fits the role. Reviewed by AM before client submission. Can be included in client submission email.</description>
+    <inlineHelpText>Write a compelling 3-5 sentence summary of why this candidate is a good fit. Include years of experience, key skills, and availability. AM reviews before sending to client.</inlineHelpText>
+    <label>Candidate Summary</label>
+    <length>32768</length>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>LongTextArea</type>
+    <visibleLines>3</visibleLines>
+</CustomField>

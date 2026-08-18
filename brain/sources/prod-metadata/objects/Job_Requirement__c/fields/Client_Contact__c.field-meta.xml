@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Client_Contact__c</fullName>
+    <deleteConstraint>SetNull</deleteConstraint>
+    <description>Optional hiring manager or vendor contact for this requirement. Used for interview scheduling and submission emails.</description>
+    <inlineHelpText>Select the client contact who sent this requirement or who should receive candidate profiles. Leave blank if not known yet.</inlineHelpText>
+    <label>Client Contact</label>
+    <lookupFilter>
+        <active>true</active>
+        <filterItems>
+            <field>Contact.AccountId</field>
+            <operation>equals</operation>
+            <valueField>$Source.Client_Account__c</valueField>
+        </filterItems>
+        <filterItems>
+            <field>Contact.Account.RecordTypeId</field>
+            <operation>equals</operation>
+            <value>B2B Client, Vendor / Implementation Partner</value>
+        </filterItems>
+        <isOptional>true</isOptional>
+    </lookupFilter>
+    <referenceTo>Contact</referenceTo>
+    <relationshipLabel>Job Requirements</relationshipLabel>
+    <relationshipName>Job_Requirements</relationshipName>
+    <required>false</required>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Lookup</type>
+</CustomField>

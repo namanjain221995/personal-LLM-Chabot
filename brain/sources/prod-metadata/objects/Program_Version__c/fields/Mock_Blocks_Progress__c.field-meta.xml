@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Mock_Blocks_Progress__c</fullName>
+    <defaultValue>true</defaultValue>
+    <description>When true, a candidate cannot proceed to the next mock cycle (e.g. next week) until the current mock is booked and attended. Runtime enforcement lives in the candidate portal.</description>
+    <label>Mock Blocks Progress</label>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Checkbox</type>
+</CustomField>

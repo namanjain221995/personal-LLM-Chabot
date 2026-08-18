@@ -22,6 +22,8 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from ... import llm
 from ...config import settings
+from . import interpret
+from .interpret import Reading
 from .models import (
     AgentDecision,
     ClarificationDraft,
@@ -123,14 +125,13 @@ def decision_tool() -> dict:
 # The deterministic floor
 # ---------------------------------------------------------------------------
 
-#: Which normalized slot the existing detectors in core/clarify.py are asking
-#: about. Those detectors were written for this org before slots existed, so the
+#: Which normalized slot each detector in core/clarify.py is asking about.
+#: Those detectors were written for this org before slots existed, so the
 #: mapping lives here rather than being retrofitted into their module.
 _LEGACY_SLOT_BY_QUESTION = (
     ("which mocks", "object"),
     ("which interviews", "object"),
     ("over what period", "date_range"),
-    ("read it right", "result_format"),
 )
 
 
@@ -149,6 +150,10 @@ def deterministic_decision(user_text: str) -> AgentDecision:
     this org's data ("failed the mock" in a slot returned 7, 20 and 0 on three
     runs of one sentence). Falling back to detectors that were tuned on real
     wrong answers is a much better floor than falling back to "just run it".
+
+    A detector that finds nothing means EXECUTE, not "ask something generic".
+    There is no worse moment to invent a question than the one where the
+    component that decides what to ask has just failed.
     """
     from .. import clarify as legacy
 
@@ -170,16 +175,15 @@ def deterministic_decision(user_text: str) -> AgentDecision:
         )
         for index, option in enumerate(found.options[:4])
     ]
-    while len(options) < 2:
+    if len(options) < 2:
         # A one-option question is not a question. The detectors always produce
-        # at least two, but a future one that does not must not crash the model.
-        options.append(
-            ClarificationOption(
-                id=f"opt{len(options) + 1}",
-                label="Answer it as I asked",
-                description="Do not narrow the scope.",
-                value="Answer exactly as asked; do not narrow the scope.",
-            )
+        # at least two; one that stops doing so must degrade to answering, not
+        # to a card with a single button.
+        return AgentDecision(
+            action="EXECUTE_SALESFORCE",
+            normalized_intent=(user_text or "").strip()[:600],
+            confidence=0.3,
+            internal_reason_code="insufficient_options",
         )
     return AgentDecision(
         action="ASK_CLARIFICATION",
@@ -188,10 +192,14 @@ def deterministic_decision(user_text: str) -> AgentDecision:
         missing_critical_slots=[slot],
         clarification_draft=ClarificationDraft(
             slot=slot,
-            header="Salesforce",
+            header=found.header or "Salesforce",
             question=found.question[:280],
             options=options,
             allow_custom=True,
+            # These are alternative readings of ONE number. Ticking two of them
+            # is incoherent, and the detectors know that about their own
+            # questions in a way a general default cannot.
+            multi_select=False,
         ),
         internal_reason_code="deterministic_detector",
     )
@@ -251,14 +259,23 @@ async def plan(
     effort: str = "medium",
     today: str = "",
     timezone_name: str = "UTC",
+    reading: Optional[Reading] = None,
+    grounding_text: str = "",
 ) -> AgentDecision:
     """The one decision this request runs on.
 
     Never raises: a planner failure degrades to `deterministic_decision`, which
     is why the caller can treat the return value as always usable.
+
+    `reading` carries the deterministic pass over the request — the spelling
+    repairs and the slots the sentence already settles. `grounding_text` is what
+    the knowledge layers match on, which is the request PLUS what this
+    conversation established, so a follow-up of three words is grounded as well
+    as the request it follows.
     """
     from .. import org_brief
 
+    read = reading if reading is not None else interpret.read(user_text)
     history = [
         {
             "slot": round_.slot,
@@ -268,6 +285,11 @@ async def plan(
         }
         for round_ in intent.clarification_history
     ]
+    # Slots the SENTENCE settles, plus the ones already answered, are closed.
+    # Telling the planner which they are is cheaper and far more reliable than
+    # hoping it re-derives the same list from the prose.
+    settled = sorted(set(read.satisfied) | set(intent.resolved_slots))
+    original = intent.original_user_text.strip()
     user_message = planner_user_message(
         user_text=user_text,
         conversation_state=state.brief(),
@@ -279,6 +301,11 @@ async def plan(
         effort=effort,
         recent_turns=recent_turns,
         entity_candidates=entity_candidates,
+        original_request=original if original != (user_text or "").strip() else "",
+        domain_knowledge=interpret.domain_knowledge(grounding_text or read.text),
+        reading_note=read.note(),
+        settled_slots=settled,
+        ask_bias=settings.clarify_mode == "always",
     )
     messages = [
         {"role": "system", "content": PLANNER_SYSTEM},
@@ -361,21 +388,63 @@ async def _repair(
 # Post-decision policy
 # ---------------------------------------------------------------------------
 
+def _answer_instead(
+    decision: AgentDecision, draft: ClarificationDraft, reason: str
+) -> AgentDecision:
+    """Turn a question we must not ask into an answer that says what it assumed."""
+    return decision.model_copy(
+        update={
+            "action": "EXECUTE_SALESFORCE",
+            "clarification_draft": None,
+            "assumptions": [
+                *decision.assumptions,
+                _assumption_for(draft.slot, draft.options),
+            ],
+            "internal_reason_code": reason,
+        }
+    )
+
+
+def _distinct_options(draft: ClarificationDraft) -> bool:
+    """At least two options a user could tell apart.
+
+    A planner under pressure produces "Scheduled interviews" and "Interviews
+    scheduled" — two rows, one choice. Comparing on the normalized label is
+    enough to catch it, and the alternative is a card that cannot be answered
+    correctly because both answers mean the same thing.
+    """
+    def key(label: str) -> str:
+        return " ".join(sorted(re.sub(r"[^a-z0-9 ]+", " ", label.lower()).split()))
+
+    return len({key(o.label) for o in draft.options}) >= 2
+
+
 def enforce_policy(
-    decision: AgentDecision, intent: PendingIntent, *, duplicate: bool = False
+    decision: AgentDecision,
+    intent: PendingIntent,
+    *,
+    duplicate: bool = False,
+    reading: Optional[Reading] = None,
+    entity_candidates: Optional[Sequence[dict]] = None,
 ) -> AgentDecision:
     """Downgrade a decision the clarification policy will not allow.
 
     The planner is told the rules, and mostly follows them. This is what makes
-    them true: a request that has already spent its clarification budget, or
-    whose question repeats one already asked, is answered with the safest
-    reasonable interpretation and a stated assumption — never asked again.
+    them true: a request that has already spent its clarification budget, whose
+    question repeats one already asked, or whose answer is sitting in the
+    sentence the user typed, is answered with the safest reasonable
+    interpretation and a stated assumption — never asked again.
 
     `duplicate` marks a repeated submission of an answer we have already
     resolved (a double-click, a retried fetch). It is not a new turn, so it must
     not be able to produce a new question: seen live on 2026-08-11, the repeat
     of "Tasks" was met with "what status counts as pending?", which reads as an
     interrogation for doing nothing but clicking twice.
+
+    `reading` is the deterministic pass over the request. It is what closes the
+    single most damaging failure this feature has: asking "over what period?"
+    about a request whose second word is "today". A model can be told not to do
+    that, and mostly will not; a regex over the sentence means it CANNOT.
     """
     if decision.action != "ASK_CLARIFICATION":
         return decision
@@ -385,62 +454,41 @@ def enforce_policy(
         return decision.model_copy(update={"action": "EXECUTE_SALESFORCE"})
 
     if duplicate:
-        return decision.model_copy(
-            update={
-                "action": "EXECUTE_SALESFORCE",
-                "clarification_draft": None,
-                "assumptions": [
-                    *decision.assumptions,
-                    _assumption_for(draft.slot, draft.options),
-                ],
-                "internal_reason_code": "duplicate_submission",
-            }
-        )
+        return _answer_instead(decision, draft, "duplicate_submission")
 
     if intent.rounds_used >= settings.salesforce_max_clarification_rounds:
-        return decision.model_copy(
-            update={
-                "action": "EXECUTE_SALESFORCE",
-                "clarification_draft": None,
-                "assumptions": [
-                    *decision.assumptions,
-                    _assumption_for(draft.slot, draft.options),
-                ],
-                "internal_reason_code": "clarification_budget_spent",
-            }
-        )
+        return _answer_instead(decision, draft, "clarification_budget_spent")
 
     from .models import fingerprint
 
     if intent.already_asked(fingerprint(draft.slot, draft.question)) or (
         draft.slot in intent.asked_slots()
     ):
-        return decision.model_copy(
-            update={
-                "action": "EXECUTE_SALESFORCE",
-                "clarification_draft": None,
-                "assumptions": [
-                    *decision.assumptions,
-                    _assumption_for(draft.slot, draft.options),
-                ],
-                "internal_reason_code": "question_already_asked",
-            }
-        )
+        return _answer_instead(decision, draft, "question_already_asked")
 
-    if len(draft.options) < 2:
-        # Fewer than two options is not a choice. Rather than showing a card
-        # with one button, answer and say what was assumed.
-        return decision.model_copy(
-            update={
-                "action": "EXECUTE_SALESFORCE",
-                "clarification_draft": None,
-                "assumptions": [
-                    *decision.assumptions,
-                    _assumption_for(draft.slot, draft.options),
-                ],
-                "internal_reason_code": "insufficient_options",
-            }
-        )
+    # The user already told us. Answering their own words back at them is the
+    # behaviour that makes a clarifying assistant feel like a form to fill in.
+    if intent.resolved_slots.get(draft.slot):
+        return _answer_instead(decision, draft, "slot_already_resolved")
+    if reading is not None and draft.slot in reading.satisfied:
+        return _answer_instead(decision, draft, "answered_by_the_request")
+
+    # "Which record did you mean?" is the ONE question whose options are claims
+    # about data. Asked "show mocks for John" with no live connection, the
+    # planner offered "John D.", "John S." and "John M." — three people who do
+    # not exist, presented as a list to pick from, on a 0.95 confidence. Every
+    # other slot's options are readings of the request and cost nothing if the
+    # model invents one; this slot's options are records, and a fabricated
+    # record is indistinguishable from a real one to the person clicking it.
+    # So it is allowed only when a real search actually returned candidates.
+    if draft.slot == "record_identity" and not entity_candidates:
+        return _answer_instead(decision, draft, "unverified_record_options")
+
+    if len(draft.options) < 2 or not _distinct_options(draft):
+        # Fewer than two DISTINGUISHABLE options is not a choice. Rather than
+        # showing a card that cannot be answered, answer and say what was
+        # assumed.
+        return _answer_instead(decision, draft, "insufficient_options")
     return decision
 
 

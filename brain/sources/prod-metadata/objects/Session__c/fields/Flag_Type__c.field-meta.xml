@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Flag_Type__c</fullName>
+    <label>Flag Type</label>
+    <required>false</required>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Picklist</type>
+    <valueSet>
+        <restricted>true</restricted>
+        <valueSetDefinition>
+            <sorted>false</sorted>
+            <value>
+                <fullName>person change midsession</fullName>
+                <default>false</default>
+                <label>person change midsession</label>
+            </value>
+            <value>
+                <fullName>fabricated experience</fullName>
+                <default>false</default>
+                <label>fabricated experience</label>
+            </value>
+            <value>
+                <fullName>scripted deception</fullName>
+                <default>false</default>
+                <label>scripted deception</label>
+            </value>
+            <value>
+                <fullName>proxy interview coaching</fullName>
+                <default>false</default>
+                <label>proxy interview coaching</label>
+            </value>
+            <value>
+                <fullName>candidate camera off</fullName>
+                <default>false</default>
+                <label>candidate camera off</label>
+            </value>
+            <value>
+                <fullName>gaze fixed offscreen</fullName>
+                <default>false</default>
+                <label>gaze fixed offscreen</label>
+            </value>
+            <value>
+                <fullName>session too short</fullName>
+                <default>false</default>
+                <label>session too short</label>
+            </value>
+            <value>
+                <fullName>key section rushed</fullName>
+                <default>false</default>
+                <label>key section rushed</label>
+            </value>
+            <value>
+                <fullName>non english heavy</fullName>
+                <default>false</default>
+                <label>non english heavy</label>
+            </value>
+        </valueSetDefinition>
+    </valueSet>
+</CustomField>

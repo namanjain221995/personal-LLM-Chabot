@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ValidationRule xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Candidate_Approval_Required</fullName>
+    <active>true</active>
+    <errorConditionFormula>AND(
+ ISPICKVAL(Status__c  , &apos;Onboarding Completed&apos;) ,
+NOT(  Candidate_Approval__c )
+)</errorConditionFormula>
+    <errorDisplayField>Candidate_Approval__c</errorDisplayField>
+    <errorMessage>Get the candidate approval of the resume before completion of the onboarding</errorMessage>
+</ValidationRule>

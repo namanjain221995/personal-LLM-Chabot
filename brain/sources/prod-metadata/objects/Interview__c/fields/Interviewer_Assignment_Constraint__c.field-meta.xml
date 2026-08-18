@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Interviewer_Assignment_Constraint__c</fullName>
+    <deleteConstraint>SetNull</deleteConstraint>
+    <inlineHelpText>ference to  
+the Employee  
+who acts as  
+the assignment  
+constraint for  
+this interview  
+(e.g.  
+must-intervie  
+w / avoid /  
+panel  
+anchor). Used  
+by the  
+interviewer-as  
+signment  
+logic to  
+constrain  
+which  
+interviewers  
+can be  
+scheduled on  
+this Interview  
+record.</inlineHelpText>
+    <label>Interviewer  Assignment Constraint</label>
+    <referenceTo>Recruiter__c</referenceTo>
+    <relationshipLabel>Interviews (Interviewer  Assignment Constraint)</relationshipLabel>
+    <relationshipName>Interviews2</relationshipName>
+    <required>false</required>
+    <trackHistory>true</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Lookup</type>
+</CustomField>

@@ -49,6 +49,7 @@ import {
 } from '@/lib/streams';
 import {
   buildResponse,
+  cardState,
   pendingClarification,
   type ClarificationRequest,
   type ClarificationResponse,
@@ -74,6 +75,7 @@ import { SummaryPanel } from './SummaryPanel';
 import { EmptyState } from './EmptyState';
 import { EngineBadge } from './EngineBadge';
 import { MessageRow } from './MessageRow';
+import { ClarificationCard } from './ClarificationCard';
 import { SearchPalette } from './SearchPalette';
 import { Sidebar } from './Sidebar';
 import { useToast } from './Providers';
@@ -322,7 +324,15 @@ export function ChatApp() {
         );
       }
       if (id !== activeIdRef.current) return;
-      if (s.status !== 'streaming') setCompactedAt(null);
+      if (s.status !== 'streaming') {
+        setCompactedAt(null);
+        // The continuation this answer belongs to is over — however it ended.
+        // The lock was only ever cleared when the CONVERSATION changed, so a
+        // card whose run failed, was stopped, or lost its connection sat with
+        // "Continuing your request…" under it and every control disabled,
+        // permanently, with no way back except switching chats.
+        setSubmittingClarificationId(null);
+      }
       setMessages([...s.messages]);
       setStreaming(s.status === 'streaming');
       if (s.status === 'unreachable') setUnreachable(true);
@@ -623,13 +633,37 @@ export function ChatApp() {
     [send],
   );
 
-  /** "Something else" — arm the composer to answer, and focus it. */
-  const useComposerForClarification = useCallback(
-    (request: ClarificationRequest) => {
+  /**
+   * Answer in your own words instead: arm the composer and focus it.
+   *
+   * `seed` is the character that triggered the hand-over when the user simply
+   * started typing over the panel. The panel takes focus so the number keys
+   * work the moment a question appears; carrying the keystroke here is what
+   * stops that from eating the first letter of a typed answer.
+   */
+  const answerInComposer = useCallback(
+    (request: ClarificationRequest, seed?: string) => {
       setCustomAnswerFor(request);
-      composerRef.current?.focus();
+      composerRef.current?.insert(seed);
     },
     [],
+  );
+
+  /**
+   * Skip: answer with "no preference" so the server states its assumption.
+   *
+   * Not a dismissal. The question lives on the server and only one may be
+   * pending per conversation, so a panel that merely disappeared would leave it
+   * open and block every later question in this chat.
+   */
+  const skipClarification = useCallback(
+    (request: ClarificationRequest) => {
+      const response = buildResponse(request, { skipped: true });
+      if (response) {
+        answerClarification(response, 'No preference — use your best judgement.');
+      }
+    },
+    [answerClarification],
   );
 
   /**
@@ -1063,7 +1097,11 @@ export function ChatApp() {
             <EmptyState />
           ) : (
             <div className="mx-auto w-full max-w-thread space-y-6 px-4 py-6">
-              {messages.map((m, i) => (
+              {messages.map((m, i) => {
+                // Only the question the thread is WAITING on is a live control;
+                // every earlier card is a record of a decision already made.
+                const card = cardState(messages, i);
+                return (
                 <MessageRow
                   key={m.id}
                   message={m}
@@ -1071,10 +1109,8 @@ export function ChatApp() {
                   onRegenerate={() => regenerate(m.id)}
                   onRetry={() => regenerate(m.id)}
                   onShowSummary={() => setSummaryOpen(true)}
-                  onClarify={(choice) => void send(choice, [], [])}
-                  onClarificationAnswer={answerClarification}
-                  onClarificationCustom={useComposerForClarification}
-                  submittingClarificationId={submittingClarificationId}
+                  clarificationPending={card.pending}
+                  clarificationAnswer={card.answeredWith}
                   onFeedback={(feedback) => {
                     if (!activeId) return;
                     // Fire-and-forget: the store updates its cache first and
@@ -1087,7 +1123,8 @@ export function ChatApp() {
                     );
                   }}
                 />
-              ))}
+                );
+              })}
             </div>
           )}
         </div>
@@ -1125,6 +1162,24 @@ export function ChatApp() {
           clarificationPlaceholder={
             customAnswerFor?.custom_placeholder ??
             (pending ? pending.custom_placeholder : undefined)
+          }
+          clarification={
+            // The LIVE question, and only while it is live. It renders inside
+            // the composer's own container rather than in the transcript: it
+            // is a temporary control, not a message, so it must stay at the
+            // bottom of a conversation of any length, must not scroll away
+            // while it is being answered, and must leave nothing behind.
+            pending ? (
+              <ClarificationCard
+                request={pending}
+                submitting={
+                  submittingClarificationId === pending.clarification_id
+                }
+                onSubmit={answerClarification}
+                onUseComposer={(seed) => answerInComposer(pending, seed)}
+                onSkip={() => skipClarification(pending)}
+              />
+            ) : null
           }
           starter={
             shouldShowStarter({

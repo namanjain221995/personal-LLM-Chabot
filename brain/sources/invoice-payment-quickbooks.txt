@@ -1,0 +1,725 @@
+================================================================================
+SALESFORCE <-> QUICKBOOKS  INVOICE & PAYMENT SYSTEM
+COMPLETE KNOWLEDGE BASE  (full detail, for AI training / reference)
+Generated: 2026-08-11
+Org: Dev11 (Salesforce sandbox). The QuickBooks Named Credential points at the
+PRODUCTION QuickBooks Online company.
+================================================================================
+
+TABLE OF CONTENTS
+  1.  Purpose & how to read this
+  2.  System overview (the business)
+  3.  Integration architecture (SF <-> QuickBooks)
+  4.  Configuration values (custom labels / settings)
+  5.  Data model & object relationship
+  6.  Invoice__c - complete field dictionary
+  7.  Invoice__c - exact formulas & roll-ups
+  8.  Invoice__c - validation rules
+  9.  Payment__c - complete field dictionary
+  10. All picklist values (both objects)
+  11. Core business rules & logic
+  12. The recurring fixed-EMI amortization model (deep dive)
+  13. Manage Recurring Plan - every action
+  14. Payment webhook logic (status & cycles)
+  15. Disputes, voids, recovery & settlement
+  16. Card surcharge (4%) rules
+  17. QuickBooks invoice line structure
+  18. Automation (every Flow) - purpose & behavior
+  19. QuickBooks External Service endpoints
+  20. Worked examples (end to end)
+  21. Known gotchas & production-migration notes
+  22. Glossary
+
+
+================================================================================
+1. PURPOSE & HOW TO READ THIS
+================================================================================
+This file is a single, self-contained reference describing the Salesforce
+Invoice/Payment system and its QuickBooks Online (QB) integration in full detail:
+every field on the two custom objects (Invoice__c, Payment__c), the exact formula
+and roll-up logic, all picklist values, validation rules, configuration, the
+automation (Flows), the QB endpoints, and all business rules.
+
+Conventions used below:
+  [F]  = a formula field (read-only, computed).
+  [R]  = a roll-up summary field (aggregates child Payment records).
+  otherwise the field is a normal stored/editable field.
+  "EMI" = an installment payment.  "cycle" = one recurring charge.
+  "SF" = Salesforce.  "QB" = QuickBooks Online.
+
+
+================================================================================
+2. SYSTEM OVERVIEW (THE BUSINESS)
+================================================================================
+The company enrolls people (Leads/Candidates) into paid programs. It bills them in
+Salesforce, pushes the invoice to QuickBooks, and collects money either as a single
+one-time payment (possibly in several partials) or as an automatic recurring
+installment plan (EMIs). Everything the customer pays in QuickBooks flows back into
+Salesforce as Payment records, and the Invoice keeps running totals and status.
+
+Two fundamental invoice shapes (Invoice__c.Type__c):
+
+  A) ONE-TIME INVOICE  (Type__c = "One-Time")
+     - A single "upfront amount" invoice created from a LEAD or an ACCOUNT via a
+       screen flow ("Send Invoice" button).
+     - The customer can pay it all at once, or in several partial payments until it
+       is fully paid.
+
+  B) RECURRING PLAN  (Type__c = "Recurring")
+     - An installment/subscription plan billed automatically by a QuickBooks
+       "Recurring Sales Receipt" (e.g. 10 monthly EMIs of a fixed amount).
+     - Each automatic charge creates a Payment record = one "cycle".
+     - Sized by an ACH/salary calculator (Total Salary x Agreement %), optionally
+       with interest, and managed by the "Manage Recurring Plan" flow.
+
+  LINKED ONE-TIME INVOICES (a one-time invoice attached to a recurring plan):
+     A One-Time invoice can be linked to a plan (Linked_Recurring_Plan__c) as:
+       * "Pre EMI"  - candidate prepaid one or more EMIs through a separate invoice.
+       * "Lump Sum" - candidate paid a large one-off amount to reduce the balance.
+       * "Recovery" - an invoice raised to re-collect money lost to a void/dispute.
+     Pre-EMI and Lump-Sum both reduce the plan's remaining balance; Recovery re-collects
+     money already lost.
+
+
+================================================================================
+3. INTEGRATION ARCHITECTURE (SF <-> QUICKBOOKS)
+================================================================================
+- NAMED CREDENTIAL: "QuickBooks" (OAuth 2.0 to QuickBooks Online, production company).
+- COMPANY ID: Custom Label QB_Company_ID (passed as {CompanyID} in every endpoint).
+- EXTERNAL SERVICES: QuickBooks REST endpoints are registered as OpenAPI schemas
+  ("External Service Registrations"). Salesforce generates strongly-typed Apex request/
+  response classes from each schema, and Flows call them as "Actions". Changing an
+  endpoint's fields means editing the registration's schema and redeploying (which
+  regenerates the Apex types). See section 19 for the endpoint list.
+- OUTBOUND (SF -> QB): create/update customer, create/update invoice, create recurring
+  sales receipt, update recurring transaction, send invoice email, manage bank account,
+  get invoice / recurring / sales receipt / deposit / cards / bank accounts.
+- INBOUND WEBHOOKS (QB -> SF): QuickBooks posts entity events; record-triggered/
+  autolaunched Flows process them:
+      Payment      (Create/Update/Void) -> QB_Process_Payment_Webhook       (one-time payments)
+      SalesReceipt (Create/Update/Void) -> QB_Process_SalesReceipt_Webhook   (recurring cycles)
+      Deposit      (Create/Update)      -> updates Payment deposit fields
+- CRITICAL QB LIMITATION: QuickBooks does NOT send a webhook for an ACH return, a
+  dispute, or a chargeback. The SalesReceipt/Payment entity is not modified when a
+  dispute happens. These are detected via Intuit notification EMAILS and/or by polling,
+  and can also be logged manually by Finance.
+
+
+================================================================================
+4. CONFIGURATION VALUES (Custom Labels / Settings)
+================================================================================
+Custom Labels currently in the sandbox (some must change for production - see sec. 21):
+  QB_Company_ID                       QuickBooks company/realm id (in endpoint path).
+  QB_Admin_Base_URL                   Base URL for the invoice admin link (Invoice_Link__c).
+  QB_Payment_Base_URL                 Base URL for the online payment link (Payment_Link__c).
+  QB_Accounting_Email                 Accounting mailbox CC'd on invoice emails.
+  QB_Undeposited_Funds_Account_ID     = 4     (SANDBOX; production value differs)
+  QB_Undeposited_Funds_Account_Name   = Undeposited Funds
+  QB_ACH_Payment_Method_ID            = 8     (SANDBOX; production value differs)
+  QB_Test_Active_Plan                 = true  (TEST FLAG; set false at go-live)
+  QB_Finance_Slack_Conversation_ID    = C0BHK5AFV3Q   (Finance Slack channel)
+  QB_Finance_Slack_Channel_Email      = jenish.gangani@techsarasolutions.com
+  QB_Finance_Team_Email_Recipients    = jenish.gangani@techsarasolutions.com
+  QB_Dispute_Notify_Group_Id          = 005bf00000KXaEFAA1
+- The QB_Plan custom setting maps a plan name to its QuickBooks Item Number (used to
+  set the invoice/receipt line's ItemRef).
+
+
+================================================================================
+5. DATA MODEL & OBJECT RELATIONSHIP
+================================================================================
+        Invoice__c  (1) -------< Payment__c  (many)
+                     ^ lookup: Payment__c.Invoice__c
+
+- One Invoice has many Payments. Roll-up summary fields on Invoice__c aggregate the
+  child Payments (Amount_Paid, Total_Amount_Collected, Total_Cycles_Completed,
+  Voided_Amount, Voided_Payment_Count).
+- A RECURRING plan's Payments are its EMI cycles: Payment_Source = "Sales Receipt",
+  and each carries a QB_Sales_Receipt_ID__c.
+- A ONE-TIME invoice's Payments are direct invoice payments: Payment_Source =
+  "Invoice Payment", no QB_Sales_Receipt_ID.
+- Invoice__c also self-references via Linked_Recurring_Plan__c (a linked one-time
+  invoice points to the recurring-plan invoice it reduces) and Settlement_Invoice__c.
+
+
+================================================================================
+6. INVOICE__C - COMPLETE FIELD DICTIONARY
+================================================================================
+(Grouped by purpose. Type in parentheses. [F]=formula, [R]=roll-up.)
+
+--- IDENTITY / CLASSIFICATION ---
+Name                      (Auto Number, INV-{0000})  Record name, e.g. INV-0199.
+Type__c                   (Picklist)  "One-Time" or "Recurring". Drives most logic.
+Is_Recurring__c      [F]  (Checkbox)  = ISPICKVAL(Type__c,"Recurring").
+Invoice_Status__c         (Picklist)  Not Paid | Partially Paid | Paid | Dispute.
+Candidate__c              (Lookup)    The candidate (Account-side invoices).
+Lead__c                   (Lookup)    The lead (Lead-side invoices).
+OwnerId                   (Lookup)    Record owner (sales rep); CC'd on emails/Slack.
+Invoice_Date__c           (Date)      Invoice date (QB TxnDate).
+Due_Date__c               (Date)      Due date (QB DueDate).
+QB_Created_From__c        (Picklist)  Lead|Account|Manual|Recurring|Custom Invoice|Settlement.
+
+--- CORE AMOUNTS ---
+Base_Amount__c       [F]  (Currency)  Invoice_Amount minus the card surcharge. Used to
+                                      match a prepaid invoice to a plan's EMI.
+Invoice_Amount__c         (Currency)  The billed total (base + 4% surcharge if applied).
+Card_Surcharge_Applied__c (Checkbox)  TRUE when the 4% card surcharge was added.
+Card_Surcharge_Amount__c  (Currency)  The 4% surcharge portion (= Base_Amount x 0.04).
+Amount_Paid__c       [R]  (Currency)  SUM of child Payment.Amount_Paid where Status=Paid.
+Total_Amount_Collected__c [R] (Currency) SUM of ALL child Payment.Payment_Amount (unfiltered).
+Outstanding_Amount__c [F] (Currency)  Remaining owed (recurring vs one-time formula; sec.7).
+Total_To_Collect__c  [F]  (Currency)  Full amount to collect over the plan (principal+interest).
+Collected_So_Far__c  [F]  (Currency)  Total collected across every method.
+Collected_Percent__c [F]  (Percent)   Progress % (nets out Amount_To_Recover).
+
+--- QUICKBOOKS REFERENCES / LINKS ---
+QB_Invoice_Id__c          (Text)      QB Invoice internal Id (used for links & GET).
+QB_Customer_Id__c    [F]  (Text)      QB Customer Id (from Lead or Candidate).
+QB_Recurring_ID__c        (Text)      QB Recurring Transaction Id (recurring plans).
+QB_Recur_Data_Ref__c      (Text)      Reference to recurring data payload.
+QB_Doc_Number__c          (Text)      QB invoice document number (QB auto-generated).
+QB_Email_Status__c        (Picklist)  NotSet | EmailSent | NeedToSend.
+Email_Sent_Date__c        (DateTime)  When the invoice email was sent.
+Last_Sync_Date__c         (DateTime)  Last sync timestamp.
+Invoice_Id__c             (Text)      LEGACY id - now empty; do NOT use for links.
+Invoice_Link__c      [F]  (Text)      Clickable QB invoice URL (keyed on QB_Invoice_Id).
+Payment_Link__c      [F]  (Text)      Clickable QB online-payment URL (keyed on QB_Invoice_Id).
+
+--- ACH / SALARY CALCULATOR (recurring sizing) ---
+Annual_Salary__c          (Currency)  Candidate annual salary.
+Bonus_Amount__c           (Currency)  Candidate bonus (optional).
+Total_Salary__c      [F]  (Currency)  = Annual_Salary + Bonus.
+Agreement_Percent__c      (Percent)   % of salary that becomes plan principal (e.g. 20).
+ACH_Amount__c        [F]  (Currency)  = Total_Salary x Agreement% . The plan principal.
+
+--- INTEREST (recurring only) ---
+Charge_Interest__c        (Checkbox)  TRUE = add interest to the plan.
+Interest_Rate_Per_Cycle__c (Percent)  Rate per cycle, default 2%. NO effect on one-time.
+Interest_Amount__c   [F]  (Currency)  Interest total (0 unless recurring & charging).
+Interest_Per_Cycle_Base__c [F] (Currency) Interest to collect per REMAINING cycle.
+Committed_Interest__c     (Currency)  Plan interest LOCKED at first payment (no compounding).
+Plan_Interest_Amount__c   (Currency)  Interest for plans > 3 cycles (principal x rate x months),
+                                      kept separate from Agreed_Plan_Total.
+Interest_Collected__c     (Currency)  Interest collected so far.
+
+--- RECURRING SCHEDULE ---
+Recurring_Status__c       (Picklist)  Active|Awaiting Payment Method|Payment Method Not Added|
+                                      Paused|Cancelled|Completed|Settled|Failed.
+Recurring_Amount__c       (Currency)  The FIXED EMI charged each cycle.
+Number_of_Months__c       (Number)    Total cycles (blank = unlimited).
+Total_Cycles_Completed__c [R] (Number) COUNT of Payments WHERE QB_Sales_Receipt_ID is NOT blank
+                                      (only real recurring cycles; one-time payments excluded).
+Outstanding_Cycles__c [F] (Number)    Number_of_Months - Total_Cycles_Completed.
+Total_Plan_Value__c  [F]  (Currency)  Whole-plan value (principal + interest).
+Agreed_Plan_Total__c      (Currency)  Original agreed PRINCIPAL, fixed across reschedules.
+Recurring_Start_Date__c   (Date)      Plan start date.
+Next_Billing_Date__c      (Date)      Next charge date.
+Previous_Billing_Date__c  (Date)      Prior charge date.
+Frequency__c              (Picklist)  Daily | Weekly | Monthly.
+Interval__c               (Number)    1=each cycle, 2=every other, ... (1..99).
+Day_Of_Month__c           (Number)    Day of month (monthly), 1..31.
+Day_Of_Week__c            (Picklist)  Sunday..Saturday (weekly).
+Week_Of_Month__c          (Picklist)  Week-of-month.
+Days_In_Advance__c        (Number)    Create-days-in-advance.
+Recurring_Template_Name__c (Text)     e.g. "1-10 EMI + <Candidate>". Auto-generated.
+Recurring_Description__c  (TextArea)  QB line description, e.g. "20% of 308K_10 EMI + 20% Int_7401.6".
+Recurring_Plan__c         (Text)      Plan name from the QB_Plan custom setting (-> QB Item#).
+Recurring_Deposit_Account__c (Text)   QB deposit account.
+Recurring_Payment_Method__c (Picklist) Payment method for the receipt.
+Schedule_Description__c [F] (Text)    Human-readable schedule (e.g. "Every month").
+Last_Recurring_Action__c  (Text)      Last Manage-Recurring-Plan action taken.
+Manage_Change_Count__c    (Number)    +1 on each Manage action so Slack always fires.
+
+--- FIXED-EMI "LAST EMI" (smaller final payment) ---
+Last_EMI_Amount__c        (Currency)  Smaller final remainder on the last cycle (EMI stays fixed).
+Last_EMI_Date__c          (Date)      Expected date of that final payment.
+Last_EMI_Applied__c       (Checkbox)  TRUE once the scheduled flow pushed it to QB.
+
+--- PREPAID / LUMP-SUM / LINKING ---
+Linked_Recurring_Plan__c  (Lookup)    For a linked one-time invoice: the plan it reduces.
+Linked_Payment_Type__c    (Picklist)  Pre EMI | Lump Sum | Recovery.
+Total_Prepaid_Amount__c   (Currency)  Cumulative prepaid via separate invoices (Pre-EMI).
+Total_Lumpsum_Amount__c   (Currency)  Total lump-sum amounts applied to the plan.
+
+--- SETTLEMENT ---
+Settlement_Amount__c      (Currency)  Paid to close the plan early (base - discount).
+Settlement_Discount__c    (Currency)  Discount forgiven at settlement.
+Settlement_Invoice__c     (Lookup)    The settlement invoice created for the payoff.
+
+--- DISPUTE / RECOVERY ---
+Dispute_Status__c         (Picklist)  None | Disputed | Partial Dispute | Recovered.
+Amount_To_Recover__c      (Currency)  Money lost to voids/disputes still to re-collect.
+Voided_Payment_Count__c [R] (Number)  COUNT of child Payments WHERE Payment_Status = Voided.
+Voided_Amount__c     [R]  (Currency)  SUM of child Payment.Payment_Amount WHERE Status = Voided.
+
+--- BANK (recurring ACH setup; masked only) ---
+Bank_Account_Last4__c     (Text)      Masked last-4 from QB. No full numbers stored.
+Bank_Setup_Summary__c     (Text)      Masked summary of the bank action.
+QB_Bank_Account_Id__c     (Text)      QB bank account Id.
+
+--- SLACK ---
+Slack_Thread_Ts__c        (Text)      First Slack message ts for this plan (threading root).
+Slack_Owner_Thread_Ts__c  (Text)      Owner-DM thread root ts.
+
+--- MISC / SYSTEM ---
+Auto_Send_Email__c        (Checkbox)  Whether to auto-send the invoice email.
+CreatedById/Date, LastModifiedById/Date, SystemModstamp, IsDeleted, Owner, etc. (standard).
+
+
+================================================================================
+7. INVOICE__C - EXACT FORMULAS & ROLL-UPS  (verbatim logic)
+================================================================================
+FORMULA FIELDS:
+  ACH_Amount__c        = Total_Salary__c * BLANKVALUE(Agreement_Percent__c, 0)
+  Base_Amount__c       = Invoice_Amount__c - BLANKVALUE(Card_Surcharge_Amount__c, 0)
+  Is_Recurring__c      = ISPICKVAL(Type__c, "Recurring")
+  Total_Salary__c      = BLANKVALUE(Annual_Salary__c, 0) + BLANKVALUE(Bonus_Amount__c, 0)
+
+  Collected_So_Far__c  = BLANKVALUE(Total_Amount_Collected__c,0) + BLANKVALUE(Total_Lumpsum_Amount__c,0)
+                         + BLANKVALUE(Total_Prepaid_Amount__c,0) + BLANKVALUE(Settlement_Amount__c,0)
+
+  Collected_Percent__c = IF(Total_To_Collect__c > 0,
+                             (Collected_So_Far__c - BLANKVALUE(Amount_To_Recover__c,0)) / Total_To_Collect__c,
+                             0)
+
+  Outstanding_Cycles__c = IF(ISBLANK(Number_of_Months__c), null,
+                             Number_of_Months__c - Total_Cycles_Completed__c)
+
+  Outstanding_Amount__c =
+     IF( ISPICKVAL(Recurring_Status__c,"Settled"), 0,
+       IF( ISPICKVAL(Type__c,"Recurring"),
+           IF( Agreed_Plan_Total__c > 0,
+               (Agreed_Plan_Total__c + BLANKVALUE(Plan_Interest_Amount__c,0)) - Total_Amount_Collected__c,
+               IF( ISBLANK(Number_of_Months__c), null,
+                   ((Recurring_Amount__c * Number_of_Months__c) + BLANKVALUE(Plan_Interest_Amount__c,0))
+                    - Total_Amount_Collected__c ) ),
+           Invoice_Amount__c - Amount_Paid__c ) )
+
+  Total_Plan_Value__c =
+     IF( ISPICKVAL(Type__c,"Recurring"),
+         IF( Agreed_Plan_Total__c > 0,
+             Agreed_Plan_Total__c + BLANKVALUE(Plan_Interest_Amount__c,0),
+             IF( ISBLANK(Number_of_Months__c), null,
+                 (Recurring_Amount__c * Number_of_Months__c) + BLANKVALUE(Plan_Interest_Amount__c,0) ) ),
+         Invoice_Amount__c )
+
+  Total_To_Collect__c =
+     IF( ACH_Amount__c > 0,
+         ACH_Amount__c + IF(Charge_Interest__c,
+             IF(Committed_Interest__c > 0, Committed_Interest__c, BLANKVALUE(Plan_Interest_Amount__c,0)), 0),
+         BLANKVALUE(Total_Plan_Value__c, BLANKVALUE(Invoice_Amount__c,0)) )
+
+  Interest_Amount__c =
+     IF( OR(NOT(Is_Recurring__c), NOT(Charge_Interest__c)), 0,
+         IF( Committed_Interest__c > 0, Committed_Interest__c,
+             BLANKVALUE(ACH_Amount__c,0) * BLANKVALUE(Interest_Rate_Per_Cycle__c,0) * BLANKVALUE(Number_of_Months__c,0) ) )
+
+  Interest_Per_Cycle_Base__c =
+     IF( AND(Is_Recurring__c, Charge_Interest__c, Outstanding_Cycles__c > 0),
+         MAX( 0,
+              IF( Committed_Interest__c > 0, Committed_Interest__c,
+                  IF( Plan_Interest_Amount__c > 0, Plan_Interest_Amount__c,
+                      BLANKVALUE(ACH_Amount__c,0) * BLANKVALUE(Interest_Rate_Per_Cycle__c,0) * BLANKVALUE(Number_of_Months__c,0) ) )
+              - BLANKVALUE(Interest_Collected__c,0) ) / Outstanding_Cycles__c,
+         0 )
+
+  QB_Customer_Id__c =
+     IF( NOT(ISBLANK(Lead__r.QB_Customer_ID__c)), Lead__r.QB_Customer_ID__c,
+         IF( NOT(ISBLANK(Candidate__r.QB_Customer_ID__c)), Candidate__r.QB_Customer_ID__c, "" ) )
+
+  Schedule_Description__c =
+     "Every " & IF(Interval__c=1, "", TEXT(Interval__c) & " ") &
+     CASE( TEXT(Frequency__c), "Daily", IF(Interval__c=1,"day","days"),
+           "Weekly", IF(Interval__c=1,"week","weeks"),
+           "Monthly", IF(Interval__c=1,"month","months"),
+           "Yearly", IF(Interval__c=1,"year","years"), "" )
+
+  Invoice_Link__c  = HYPERLINK($Label.QB_Admin_Base_URL & QB_Invoice_Id__c,
+                               $Label.QB_Admin_Base_URL & QB_Invoice_Id__c, "_blank")
+  Payment_Link__c  = HYPERLINK($Label.QB_Payment_Base_URL & QB_Invoice_Id__c,
+                               $Label.QB_Payment_Base_URL & QB_Invoice_Id__c, "_blank")
+
+ROLL-UP SUMMARY FIELDS (child = Payment__c, key = Payment__c.Invoice__c):
+  Amount_Paid__c            = SUM(Payment.Amount_Paid)    WHERE Payment.Payment_Status = "Paid"
+  Total_Amount_Collected__c = SUM(Payment.Payment_Amount) (no filter - includes voided)
+  Total_Cycles_Completed__c = COUNT(Payment)              WHERE Payment.QB_Sales_Receipt_ID <> blank
+  Voided_Amount__c          = SUM(Payment.Payment_Amount) WHERE Payment.Payment_Status = "Voided"
+  Voided_Payment_Count__c   = COUNT(Payment)              WHERE Payment.Payment_Status = "Voided"
+
+
+================================================================================
+8. INVOICE__C - VALIDATION RULES (block save when TRUE)
+================================================================================
+  OneTime_Required_Fields   : Type="One-Time" AND (Invoice_Amount is blank OR Due_Date is blank)
+  Recurring_Required_Fields : Type="Recurring" AND (Recurring_Template_Name blank OR Recurring_Amount
+                              blank OR Frequency blank OR Recurring_Start_Date blank)
+  Valid_Day_Of_Month        : Frequency="Monthly" AND Day_Of_Month set AND (Day_Of_Month<1 OR >31)
+  Valid_Interval            : Type="Recurring" AND (Interval<1 OR Interval>99)
+(Payment__c has no validation rules.)
+
+
+================================================================================
+9. PAYMENT__C - COMPLETE FIELD DICTIONARY
+================================================================================
+--- IDENTITY / LINK ---
+Name                      (Auto Name)  e.g. Payment-369.
+Invoice__c                (Lookup)     Parent Invoice__c.
+Payment_Source__c         (Picklist)   Invoice Payment | Sales Receipt | Manual.
+                                       "Sales Receipt" = recurring EMI cycle (has QB_Sales_Receipt_ID).
+                                       "Invoice Payment" = one-time invoice payment.
+Payment_Type__c           (Picklist)   Full | Partial. "Full"=the payment that COMPLETED the
+                                       invoice (derived from resulting status); else "Partial".
+QB_Operation__c           (Text)       Create | Update | Void (what the webhook did).
+
+--- AMOUNTS / DATES ---
+Payment_Amount__c         (Currency)   Payment amount from QB (Payment.TotalAmt).
+Amount_Paid__c            (Currency)   Applied amount (TotalAmt - UnappliedAmt). Rolled up to
+                                       Invoice.Amount_Paid when Status=Paid; set to 0 on void.
+Payment_Date__c           (Date)       Payment date.
+Scheduled_Date__c         (Date)       Scheduled date (recurring).
+
+--- STATUS ---
+Payment_Status__c         (Picklist)   Paid | Voided.
+Transaction_Status__c     (Picklist)   Scheduled|Pending|Successful|Failed|Cancelled|Disputed.
+                                       (Tracks the charge attempt/retries; distinct from Payment_Status.)
+Card_Type__c              (Picklist)   Visa|Mastercard|Amex|Discover|ACH|Other.
+
+--- QUICKBOOKS REFERENCES ---
+QB_Payment_Id__c          (Text)       QB Payment Id (one-time invoice payments).
+QB_Sales_Receipt_ID__c    (Text)       QB Sales Receipt internal Id (recurring). Its presence
+                                       makes a Payment count as a recurring cycle.
+QB_Doc_Number__c          (Text)       QB sales receipt document number.
+Transaction_Id__c         (Text)       QB transaction id.
+
+--- DEPOSIT LIFECYCLE ---
+Deposit_Status__c         (Picklist)   Pending|Deposited|Reversed. Pending=charged not yet deposited;
+                                       Deposited=funds in bank; Reversed=deposit reversed (NSF/chargeback).
+Deposit_Amount__c         (Currency)   Amount deposited (QB Deposit line amount).
+Deposit_Date__c           (Date)       Date funds reached the bank (QB Deposit TxnDate).
+Deposit_To_Account__c     (Text)       Deposit account name.
+Deposit_Account_ID__c     (Text)       QB internal account Id.
+QB_Deposit_ID__c          (Text)       QB Deposit Id that moved the funds.
+Last_Deposit_Check_Date__c (DateTime)  When deposit info was last refreshed from QB.
+
+--- DISPUTE / RETURN (populated only when there is a problem) ---
+Payment_Issue_Type__c     (Picklist)   Dispute|ACH Return|Bank Transfer Canceled|Retrieval Request.
+Payment_Issue_Status__c   (Picklist)   Open|In Progress|Pending Finance|Submitted to Bank|Resolved.
+Payment_Issue_Outcome__c  (Picklist)   Won|Lost|Refunded|Re-collected|Written Off.
+Payment_Issue_Amount__c   (Currency)   Amount disputed/returned (from the email).
+Payment_Issue_Case_Number__c (Text)    Intuit case number.
+Payment_Issue_Reason__c   (Text)       Reason from the QB notification (e.g. ACH return reason).
+Payment_Issue_Received_Date__c (Date)  Date the notification was received in SF.
+Payment_Issue_Respond_By__c (Date)     Deadline to respond (chargebacks only) - prioritize by this.
+Payment_Issue_Resolved_Date__c (Date)  Date marked resolved.
+Refund_Receipt_Created__c (Checkbox)   TRUE once the QB Refund Receipt is created (canceled bank xfers).
+CS_Notes__c / CS_Person__c            What CS did + who worked it.
+Finance_Notes__c / Finance_Person__c  What Finance did (refund #, method, JE) + who worked it.
+
+
+================================================================================
+10. ALL PICKLIST VALUES
+================================================================================
+INVOICE__C:
+  Invoice_Status__c   : Not Paid | Partially Paid | Paid | Dispute
+  Type__c             : One-Time | Recurring
+  Recurring_Status__c : Active | Awaiting Payment Method | Payment Method Not Added | Paused
+                        | Cancelled | Completed | Settled | Failed
+  Dispute_Status__c   : None | Disputed | Partial Dispute | Recovered
+  Linked_Payment_Type__c : Pre EMI | Lump Sum | Recovery
+  QB_Created_From__c  : Lead | Account | Manual | Recurring | Custom Invoice | Settlement
+  QB_Email_Status__c  : NotSet | EmailSent | NeedToSend
+  Frequency__c        : Daily | Weekly | Monthly
+  Day_Of_Week__c      : Sunday | Monday | Tuesday | Wednesday | Thursday | Friday | Saturday
+
+PAYMENT__C:
+  Payment_Status__c        : Paid | Voided
+  Payment_Type__c          : Full | Partial
+  Payment_Source__c        : Invoice Payment | Sales Receipt | Manual
+  Transaction_Status__c    : Scheduled | Pending | Successful | Failed | Cancelled | Disputed
+  Deposit_Status__c        : Pending | Deposited | Reversed
+  Payment_Issue_Type__c    : Dispute | ACH Return | Bank Transfer Canceled | Retrieval Request
+  Payment_Issue_Status__c  : Open | In Progress | Pending Finance | Submitted to Bank | Resolved
+  Payment_Issue_Outcome__c : Won | Lost | Refunded | Re-collected | Written Off
+  Card_Type__c             : Visa | Mastercard | Amex | Discover | ACH | Other
+
+
+================================================================================
+11. CORE BUSINESS RULES & LOGIC
+================================================================================
+11.1 INVOICE STATUS (one-time invoices) is CUMULATIVE
+     cumulative_paid = 0                     -> "Not Paid"
+     0 < cumulative_paid < Invoice_Amount     -> "Partially Paid"
+     cumulative_paid >= Invoice_Amount        -> "Paid"
+     Several partial payments that add up to the total MUST flip the invoice to "Paid"
+     on the completing payment. (See section 14 for the exact webhook calculation.)
+
+11.2 INTEREST is RECURRING-ONLY
+     Interest_Amount and Interest_Per_Cycle_Base are 0 unless Is_Recurring AND Charge_Interest.
+     On a one-time invoice, Interest_Rate_Per_Cycle (default 2%) has no effect.
+
+11.3 TOTAL_CYCLES_COMPLETED counts ONLY recurring cycles
+     Roll-up COUNT of Payments filtered to QB_Sales_Receipt_ID <> blank. A one-time invoice
+     paid in N partials shows 0 cycles.
+
+11.4 COLLECTED % nets out recoverable money
+     Collected_Percent = (Collected_So_Far - Amount_To_Recover) / Total_To_Collect.
+
+11.5 AMOUNT PAID vs TOTAL AMOUNT COLLECTED
+     Amount_Paid excludes voided payments (Status=Paid filter); Total_Amount_Collected
+     includes everything. Outstanding (one-time) uses Amount_Paid; Outstanding (recurring)
+     uses Total_Amount_Collected.
+
+11.6 OUTSTANDING differs by type (see exact formula in section 7):
+     One-Time : Invoice_Amount - Amount_Paid.
+     Recurring: (principal + plan interest) - Total_Amount_Collected; 0 if Settled.
+
+
+================================================================================
+12. THE RECURRING FIXED-EMI AMORTIZATION MODEL (DEEP DIVE)
+================================================================================
+The plan keeps a FIXED EMI (Recurring_Amount). When the plan changes (reduce, lump sum,
+change interest, add/remove linked invoices), the NUMBER OF CYCLES is recomputed, not the EMI.
+
+  committed_interest = IF Charge_Interest: (Committed_Interest, else Plan_Interest_Amount) else 0
+  remaining = (ACH_Amount + committed_interest)
+              - Total_Amount_Collected - Total_Prepaid_Amount - Total_Lumpsum_Amount
+  full_cycles = FLOOR( ROUND(remaining,2) / EMI )
+  remainder   = ROUND(remaining,2) - full_cycles*EMI
+  total_remaining_cycles = full_cycles + (1 if remainder > 0.005 else 0)
+  Last_EMI_Amount = (remainder > 0.005) ? remainder : 0     <- smaller final payment
+  Number_of_Months = Total_Cycles_Completed + total_remaining_cycles
+  QB MaxOccurrences pushed = Number_of_Months - Total_Cycles_Completed  (remaining charges only)
+
+- Pre-EMI and Lump-Sum both subtract their Base_Amount from "remaining" (same schedule effect);
+  the difference is only which bucket they report in (Total_Prepaid vs Total_Lumpsum).
+- Reschedule is the exception: it RE-AMORTIZES the remaining balance over a chosen new number
+  of months, so the EMI changes: new EMI = (total_with_interest - collected) / remaining_cycles.
+- Every QB recurring update first GETs the recurring transaction (fresh SyncToken) before POSTing.
+
+
+================================================================================
+13. MANAGE RECURRING PLAN - EVERY ACTION
+================================================================================
+The QB_Manage_Recurring_Plan screen flow offers (menu adapts to plan state):
+  Skip Next Charge      Push the next charge by one cycle (schedule start moves), same total count.
+  Reduce Cycles         Candidate prepaid an EMI: reduce remaining count by 1, EMI unchanged.
+  Reschedule Length     Change total months; EMI re-amortized over the remaining balance.
+  Change Amount         Re-derive the plan from a new salary/agreement (recompute EMI/total).
+  Change Interest       Adjust interest; EMI fixed, cycle count recomputes.
+  Change Frequency      Daily/Weekly/Monthly + interval; billing day derived from a start date.
+  Change Billing Date   Pick a date; billing day is derived automatically.
+  Apply Lump Sum        Apply a large one-off (from a paid one-time invoice); reduce balance.
+  Extend                Change the total number of payments (re-amortize over new term).
+  Change Plan / Item    Switch the QuickBooks product/item; charge amount stays the same.
+  Change Billing Email  Update the QB receipt email.
+  Pause / Resume        Temporarily stop / restart billing.
+  Settle / Early Payoff Close the plan now (remaining + Amount_To_Recover, minus discount).
+  Manage Linked Invoices View / Add / Remove linked invoices; Change type (Pre-EMI <-> Lump Sum).
+  View in QuickBooks    Just shows where the template lives (no change).
+- Every action increments Manage_Change_Count (so the Slack notify flow always fires),
+  stamps Last_Recurring_Action, updates the SF Invoice, and syncs the new schedule/
+  MaxOccurrences to QuickBooks (with a fresh SyncToken).
+- The menu is gated: brand-new plans (0 cycles) show setup-style options; mid-plan plans
+  (>0 cycles) show Skip/Reduce/Lump/Change Interest/Manage Links/Settle; paused plans show
+  Resume/View only.
+
+
+================================================================================
+14. PAYMENT WEBHOOK LOGIC (status & cycles)
+================================================================================
+QB_Process_Payment_Webhook handles QB Payment Create / Update / Void for ONE-TIME invoices.
+  Amountpaid (this payment) = QB Payment.TotalAmt - Payment.UnappliedAmt
+  Invoice status is set from the CUMULATIVE paid amount:
+    - CREATE (new payment): cumulative = Invoice.Amount_Paid (read before the new payment
+      commits, so = prior payments) + Amountpaid.
+    - UPDATE (existing payment changed): cumulative = Invoice.Amount_Paid - this payment's
+      OLD Amount_Paid + Amountpaid.
+    status = (cumulative=0)?"Not Paid" : (cumulative < Invoice_Amount)?"Partially Paid":"Paid"
+  Payment_Type = (status="Paid")?"Full":"Partial".
+  VOID: Payment_Status="Voided", Transaction_Status="Cancelled", Amount_Paid=0, Invoice status "Void".
+
+QB_Process_SalesReceipt_Webhook handles recurring EMI charges:
+  - Creates a Payment with Payment_Source="Sales Receipt" and QB_Sales_Receipt_ID set
+    (this is what advances Total_Cycles_Completed).
+  - Marks the plan Completed once the last cycle is billed
+    ( (Total_Cycles_Completed + 1) >= Number_of_Months ).
+
+
+================================================================================
+15. DISPUTES, VOIDS, RECOVERY & SETTLEMENT
+================================================================================
+DETECTION: QuickBooks does NOT webhook disputes/ACH-returns/chargebacks. They are found via
+Intuit notification emails (3 types: Dispute / ACH Return / Bank Transfer Canceled) matched to
+a Payment by QB_Doc_Number, and/or logged manually by Finance (QB_Log_Dispute_Manually, which
+sets Dispute_Source = "Manual - Finance"; automatic detection sets "Auto"). CC-card chargebacks
+are invisible in the API and are email-only.
+
+WHERE THE RECOVERABLE AMOUNT LANDS (Amount_To_Recover):
+  - Recurring sales-receipt dispute    -> add to the PLAN's Amount_To_Recover.
+  - Linked one-time (Pre-EMI/Lump)     -> recover to the PLAN.
+  - Standalone one-time                -> recover to ITSELF.
+  - One-time invoice with several payments where one is disputed -> Invoice status
+    "Partial Dispute"; recover the disputed payment's amount.
+
+DISPUTE OUTCOMES (Payment_Issue_Outcome):
+  Won         -> no recovery needed.
+  Lost        -> money lost; recover it.
+  Refunded    -> refunded; recover it.
+  Re-collected-> already re-collected.
+  Written Off -> written off (still counts as needing recovery per business rule).
+  A "Recovery" linked invoice (Linked_Payment_Type="Recovery") is raised to re-collect;
+  when it is paid, Amount_To_Recover goes down. Recovery invoices are EXCLUDED from the
+  candidate's "collected" totals to avoid double counting.
+
+SETTLEMENT / EARLY PAYOFF:
+  Creates a settlement invoice for (remaining balance + Amount_To_Recover), optionally with a
+  discount and/or 4% card surcharge; sets Recurring_Status=Settled, zeroes the recurring
+  amount and Amount_To_Recover, and cancels the QuickBooks recurring transaction.
+
+
+================================================================================
+16. CARD SURCHARGE (4%) RULES
+================================================================================
+- If the customer pays by credit card, a 4% surcharge is added:
+    Invoice_Amount = Base_Amount x 1.04 ;  Card_Surcharge_Amount = Base_Amount x 0.04 ;
+    Card_Surcharge_Applied = TRUE.
+- The single QB invoice line's Amount is the surcharged total (Qty 1 x UnitPrice).
+- Editing an invoice can toggle the surcharge off, dropping Invoice_Amount back to Base_Amount.
+- On a settlement, a 4% surcharge can likewise be added if the payoff is by card.
+
+
+================================================================================
+17. QUICKBOOKS INVOICE LINE STRUCTURE
+================================================================================
+Each invoice/sales-receipt line SF builds contains:
+  DetailType = "SalesItemLineDetail"
+  Amount     = line amount (upfront amount, or EMI)
+  Description= human label, e.g. "Upfront Amount"     <- set on BOTH create AND edit
+  SalesItemLineDetail.ItemRef.name  = the Plan name
+  SalesItemLineDetail.ItemRef.value = the QuickBooks Item Number (from QB_Plan setting)
+  SalesItemLineDetail.Qty           = 1
+  SalesItemLineDetail.UnitPrice     = the rate (= Amount for Qty 1)
+Note: a QuickBooks SPARSE update only sends provided fields, so the edit flow must resend
+Description + Qty + Rate or they get wiped. (The SaveInvoice External Service schema was
+extended to include Qty and UnitPrice so editing preserves them.)
+
+
+================================================================================
+18. AUTOMATION (EVERY FLOW) - PURPOSE & BEHAVIOR
+================================================================================
+CREATION / EDIT (screen flows, user-run):
+  QB_Send_Invoice_To_QuickBooks    "Send Invoice" from a LEAD: create/update QB customer,
+                                   build the line (Item=Plan, Amount/Qty/Rate, Description=
+                                   "Upfront Amount"), create the QB invoice, email it, and
+                                   create the SF Invoice__c. Limits a lead to 2 sends.
+  QB_Create_Custom_Invoice_For_Account  Create a custom invoice for an Account/candidate.
+  QB_Edit_Invoice                  Edit an invoice (amount, surcharge on/off, email...) and push
+                                   a sparse QB update. Rebuilds the line keeping Description+Qty+Rate.
+  QB_Send_Invoice_Reminder         Send a reminder for an unpaid invoice.
+
+RECURRING PLANS (screen flows):
+  QB_Setup_Recurring_Sales_Receipt Create a plan: ACH/EMI calculator, auto Template Name &
+                                   Description, billing day from start date, bank/finance email+Slack.
+  QB_Manage_Recurring_Plan         The big management flow (see section 13).
+  QB_Activate_Recurring_Now        Activate a recurring plan immediately.
+  QB_Apply_Last_EMI                Push the smaller final (Last EMI) charge.
+  QB_Send_Bank_Details             Push a customer's bank account into QuickBooks (masked-only in SF).
+
+WEBHOOK / BACKGROUND (autolaunched / record-triggered):
+  QB_Process_Payment_Webhook       QB Payment Create/Update/Void for one-time invoices; sets status
+                                   from cumulative paid; creates the Payment (see section 14).
+  QB_Process_SalesReceipt_Webhook  Recurring EMI charges (Sales Receipts); advances cycles; marks
+                                   plan Completed when done.
+  QB_Resolve_Payment_Dispute       Routes dispute outcomes to recovery (plan vs self; partial/full).
+  QB_Dispute_Update_And_Notify     Stamps Dispute_Source="Auto" and notifies.
+  QB_Log_Dispute_Manually          Finance logs a dispute the automation missed (Slack before DML).
+
+SLACK NOTIFICATIONS:
+  QB_Invoice_Creation_Update_Slack_Notifications   Invoice create/update (threads linked invoices).
+  QB_Payment_Creation_Slack_Notifications          Payment created (threads under plan/owner).
+  QB_Payment_Update_Slack_Notifications            Payment updated.
+  QB_Recurring_Activated_Slack_Notification        Fires on Manage_Change_Count change; threads.
+
+
+================================================================================
+19. QUICKBOOKS EXTERNAL SERVICE ENDPOINTS
+================================================================================
+(All under /v3/company/{CompanyID}. Named Credential "QuickBooks".)
+  QuickBookCreateInvoice                 POST   /invoice
+  QuickBooksSaveInvoice                  POST   /invoice                 (sparse update)
+  QuickBooksGetInvoice                   GET    /invoice/{invoiceId}
+  QuickBooksGetCustomer                  GET    /customer/{customerId}
+  QuickBooksSaveCustomer                 POST   /customer
+  (Search Customer / Create Customer)    POST/GET query customer
+  QuickBooksCreateRecurringSalesReceipt  POST   /recurringtransaction
+  QuickBooksCreateRecurringSalesReceiptV2 POST  /recurringtransaction
+  QuickBooksGetRecurringTransaction      GET    /recurringtransaction/{recurringId}
+  QuickBooksUpdateRecurringTransaction   POST   /recurringtransaction
+  QuickBooksGetSalesReceipt              GET    /salesreceipt/{salesReceiptId}
+  QuickBooksGetDeposit                   GET    /deposit/{depositId}
+  QuickBooksGetBankAccounts / GetCards   GET    query accounts/cards
+  QuickBooksManageBankAccount            POST/DELETE  bank account
+  QuickBookSendInvoiceEmail              POST   send invoice email
+
+
+================================================================================
+20. WORKED EXAMPLES (END TO END)
+================================================================================
+EXAMPLE A - one-time invoice paid in partials (real: INV-0199 from a Lead):
+  Base 2,000, surcharge OFF -> Invoice_Amount 2,000, Outstanding 2,000, "Not Paid".
+  Payment 1 = 800  (Partial) -> Amount_Paid 800,  Outstanding 1,200, Collected% 40%, "Partially Paid".
+  Payment 2 = 1,200 (Full)   -> Amount_Paid 2,000, Outstanding 0,     Collected% 100%, "Paid".
+  Total_Cycles_Completed stays 0 (Invoice Payments, no Sales Receipt Id).
+  Invoice_Link/Payment_Link resolve to the QB invoice via QB_Invoice_Id.
+
+EXAMPLE B - a recurring plan cycle:
+  A monthly Recurring Sales Receipt fires in QB -> SalesReceipt webhook -> creates a Payment
+  (Payment_Source "Sales Receipt", QB_Sales_Receipt_ID set) -> Total_Cycles_Completed +1,
+  Total_Amount_Collected +EMI, Outstanding recomputes; when the last cycle bills,
+  Recurring_Status -> Completed.
+
+EXAMPLE C - lump sum on a plan:
+  CS runs Manage Recurring Plan -> Apply Lump Sum, selecting a paid one-time invoice; that
+  invoice is linked (Linked_Payment_Type "Lump Sum", Linked_Recurring_Plan = the plan);
+  Total_Lumpsum_Amount += its Base_Amount; the plan re-amortizes (fewer cycles, same EMI,
+  smaller Last_EMI), and QB MaxOccurrences is updated.
+
+
+================================================================================
+21. KNOWN GOTCHAS & PRODUCTION-MIGRATION NOTES
+================================================================================
+- SANDBOX vs PROD config to swap at go-live: QB_Undeposited_Funds_Account_ID (4 -> prod value),
+  QB_ACH_Payment_Method_ID, QuickBooks Item Numbers in the QB_Plan setting, and
+  QB_Test_Active_Plan = true -> false.
+- Interest_Rate_Per_Cycle is a Percent input that defaults to 2; a stray value on a one-time
+  invoice is cosmetic only (interest formulas are gated to recurring).
+- A QuickBooks SPARSE update wipes any line field you don't resend - always resend
+  Description + Qty + UnitPrice on edit.
+- Every recurring update must GET the recurring transaction first for a fresh SyncToken,
+  or the POST fails.
+- Roll-up filter changes (e.g. Total_Cycles_Completed) recalculate asynchronously across
+  all records after deploy.
+- Invoice status only re-evaluates on a payment webhook; an already-fully-paid invoice that
+  predates a logic fix will not self-correct until the next payment event (fix manually).
+
+
+================================================================================
+22. GLOSSARY
+================================================================================
+ACH             Bank transfer / eCheck. Recurring plans usually bill by ACH.
+EMI / cycle     One installment / one recurring charge.
+Upfront Amount  The one-time amount billed on a Lead/Account invoice.
+Pre-EMI         A separate invoice where the candidate prepaid one or more EMIs.
+Lump Sum        A large one-off payment that reduces a plan's balance.
+Recovery        An invoice raised to re-collect money lost to a void/dispute.
+Settlement      Early payoff that closes a plan (remaining + recovery, minus discount).
+Sparse update   A QB update that sends only changed fields (sparse=true).
+SyncToken       QB optimistic-lock token; must be current on every update.
+Committed Interest  Plan interest locked at first payment so it never compounds on re-amortization.
+Last EMI        The smaller final remainder charged on the last cycle (EMI stays fixed).
+Amount To Recover   Money lost to voids/disputes that still needs to be re-collected.
+Collected %     (Collected_So_Far - Amount_To_Recover) / Total_To_Collect.
+
+================================================================================
+END OF DOCUMENT
+================================================================================

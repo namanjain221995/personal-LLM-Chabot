@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Estimated_Margin__c</fullName>
+    <description>SENSITIVE. Auto-calculated difference between Client Bill Rate and Target Candidate Rate. Visible only to Account Manager and Leadership.</description>
+    <formula>Client_Bill_Rate__c - Target_Candidate_Rate__c</formula>
+    <formulaTreatBlanksAs>BlankAsZero</formulaTreatBlanksAs>
+    <inlineHelpText>Auto-calculated from Client Bill Rate minus Target Candidate Rate. Represents estimated profit margin. Visible only to authorized users.</inlineHelpText>
+    <label>Estimated Margin</label>
+    <precision>18</precision>
+    <required>false</required>
+    <scale>2</scale>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Currency</type>
+</CustomField>

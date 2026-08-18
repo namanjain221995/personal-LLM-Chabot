@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Session_Window__c</fullName>
+    <deleteConstraint>SetNull</deleteConstraint>
+    <description>Session Window this Session belongs to. Keys the createOrAttachSessions lookup.</description>
+    <label>Session Window</label>
+    <referenceTo>Session_Window__c</referenceTo>
+    <relationshipLabel>Sessions</relationshipLabel>
+    <relationshipName>Sessions</relationshipName>
+    <required>false</required>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Lookup</type>
+</CustomField>

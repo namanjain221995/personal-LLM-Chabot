@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Interviews_Rejected__c</fullName>
+    <label>Interviews Rejected</label>
+    <summaryFilterItems>
+        <field>Interview__c.RecordTypeId</field>
+        <operation>equals</operation>
+        <value>Interview</value>
+    </summaryFilterItems>
+    <summaryFilterItems>
+        <field>Interview__c.Interview_Status__c</field>
+        <operation>equals</operation>
+        <value>Rejected</value>
+    </summaryFilterItems>
+    <summaryForeignKey>Interview__c.Candidate__c</summaryForeignKey>
+    <summaryOperation>count</summaryOperation>
+    <trackHistory>false</trackHistory>
+    <type>Summary</type>
+</CustomField>

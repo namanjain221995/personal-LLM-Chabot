@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>HR_Requirement_Reason__c</fullName>
+    <description>Reason HR approval is required</description>
+    <label>HR Requirement Reason</label>
+    <required>false</required>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Picklist</type>
+    <valueSet>
+        <valueSetDefinition>
+            <sorted>false</sorted>
+            <value>
+                <fullName>Late Request</fullName>
+                <default>false</default>
+                <label>Late Request</label>
+            </value>
+            <value>
+                <fullName>Insufficient Balance</fullName>
+                <default>false</default>
+                <label>Insufficient Balance</label>
+            </value>
+            <value>
+                <fullName>Special Leave</fullName>
+                <default>false</default>
+                <label>Special Leave</label>
+            </value>
+            <value>
+                <fullName>Comp-Off</fullName>
+                <default>false</default>
+                <label>Comp-Off</label>
+            </value>
+            <value>
+                <fullName>Other</fullName>
+                <default>false</default>
+                <label>Other</label>
+            </value>
+        </valueSetDefinition>
+    </valueSet>
+</CustomField>

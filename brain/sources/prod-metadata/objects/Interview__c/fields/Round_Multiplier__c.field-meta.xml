@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Round_Multiplier__c</fullName>
+    <externalId>false</externalId>
+    <formula>CASE(
+    TEXT(Round__c),
+    &quot;Initial&quot;, 0,
+    &quot;First&quot;, 1,
+    &quot;Second&quot;, 1.2,
+    &quot;Third&quot;, 1.5,
+    &quot;Fourth&quot;, 2,
+    &quot;Fifth&quot;, 2.5,
+    &quot;Sixth&quot;, 2.5,
+    &quot;Seventh&quot;, 2.5,
+    &quot;Eighth&quot;, 2.5,
+    &quot;Ninth&quot;, 2.5,
+    &quot;Tenth&quot;, 2.5,
+    &quot;Eleventh&quot;, 2.5,
+    &quot;Twelfth&quot;, 2.5,
+    &quot;Thirteenth&quot;, 2.5,
+    &quot;Fourteenth&quot;, 2.5,
+    &quot;Fifteenth&quot;, 2.5,
+    &quot;Final&quot;, 2.5,
+    0
+)</formula>
+    <formulaTreatBlanksAs>BlankAsZero</formulaTreatBlanksAs>
+    <label>Round Multiplier</label>
+    <precision>18</precision>
+    <required>false</required>
+    <scale>2</scale>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Number</type>
+    <unique>false</unique>
+</CustomField>

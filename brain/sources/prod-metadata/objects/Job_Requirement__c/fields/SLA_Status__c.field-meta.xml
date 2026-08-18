@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>SLA_Status__c</fullName>
+    <description>Auto-calculated SLA status based on Submission Deadline and Job Status. Used in list views and dashboards to highlight urgent jobs.</description>
+    <externalId>false</externalId>
+    <formula>IF(
+    OR(
+        ISPICKVAL(Job_Status__c, &quot;Filled&quot;),
+        ISPICKVAL(Job_Status__c, &quot;Closed&quot;),
+        ISPICKVAL(Job_Status__c, &quot;Cancelled&quot;),
+        ISPICKVAL(Job_Status__c, &quot;Expired&quot;)
+    ),
+    &quot;Closed&quot;,
+    IF(
+        ISBLANK(Submission_Deadline__c),
+        &quot;&quot;,
+        IF(
+            DATEVALUE(Submission_Deadline__c) &lt; TODAY(),
+            &quot;Overdue&quot;,
+            IF(
+                DATEVALUE(Submission_Deadline__c) = TODAY(),
+                &quot;Due Today&quot;,
+                &quot;On Track&quot;
+            )
+        )
+    )
+)</formula>
+    <formulaTreatBlanksAs>BlankAsZero</formulaTreatBlanksAs>
+    <inlineHelpText>Auto-calculated. On Track = deadline is future. Due Today = deadline is today. Overdue = deadline has passed but job still Open. Closed = job is Filled/Closed/Cancelled.</inlineHelpText>
+    <label>SLA Status</label>
+    <required>false</required>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Text</type>
+    <unique>false</unique>
+</CustomField>

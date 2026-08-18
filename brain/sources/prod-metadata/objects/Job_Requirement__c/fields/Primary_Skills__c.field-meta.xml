@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Primary_Skills__c</fullName>
+    <description>Main technical and functional skills required for this role. Used for candidate matching and displayed on website listings.</description>
+    <inlineHelpText>List the required skills. Example: Salesforce Apex, LWC, Integration (REST/SOAP), Admin certified. Be specific to help recruiters match candidates accurately.</inlineHelpText>
+    <label>Primary Skills</label>
+    <length>32768</length>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>LongTextArea</type>
+    <visibleLines>3</visibleLines>
+</CustomField>

@@ -1,0 +1,1364 @@
+# Compiled 2026-08-16 from brain/sources/techsara-org-knowledge-base.txt (preprod org documentation, 71 objects) by the brain ingestion pipeline: deterministic section/field parsing, every field name validated against the production dictionary + warehouse table list, rules distilled and adversarially verified. Fields the production warehouse lacks are only ever mentioned as explicit not-synced caveats.
+# Domain: PART 7 — verifier verdict: ship_with_fixes.
+name: kb-onboarding-hr
+description: How TechSara intakes enrolled candidates into its own service (Onboarding__c),
+  runs post-offer verification and payment agreements (Background_Check__c + employment
+  children), and tracks internal staff leave (Employee_Leave__c).
+triggers:
+- onboarding
+- onboardings
+- onboarded
+- welcome call
+- service agreement
+- intake form
+- onboarding form
+- background check
+- background checks
+- employment verification
+- reference check
+- promissory note
+- offer letter payment
+- work authorization
+- visa
+- immigration
+- opt
+- cpt
+- h1b
+- green card
+- passport
+- ats score
+- employee leave
+- leave request
+- on leave
+- pto
+- sick leave
+- time off
+- comp-off
+- vacation
+tables:
+- Onboarding__c
+- Background_Check__c
+- Background_Check_Employment__c
+- Employee_Leave__c
+rules: 'Onboarding & HR rules:
+
+  - Onboarding__c = intake into TechSara''s OWN service at the very START (auto-created
+  per candidate Person Account); NOT employer onboarding — post-offer = Background_Check__c.
+
+  - Onboarding__c.Account__c -> Account. Status__c: Welcome Call -> Service Agreement
+  -> Resume Creation -> Onboarding Completed; Inactive = paused; NULL record type
+  = legacy Active.
+
+  - Salary__c is a PERCENT fee, not pay; Offer_letter_amount__c = salary basis;
+  Upfront_Amount__c = upfront fee.
+
+  - Visa filters: Visa_Status__c is the OLDER field, blank on most newer candidates
+  — say so; the current Work Authorization field is unverified in the warehouse.
+
+  - Use Declaration__c; I_confirm_that_all_the_above_information__c not synced to
+  production.
+
+  - ''Handed to marketing'': use Status__c=''Onboarding Completed''; Assigned_to_Marketing__c
+  undercounts.
+
+  - Background_Check__c = POST-OFFER verification + payment plan; Candidate__c ->
+  Account, Interview__c -> Interview__c; new, low volume.
+
+  - Background_Check_Status__c: Payment Verification Pending -> Documents Pending
+  -> Candidate Details Pending -> Verification In Progress -> Completed. Its *_Date
+  FORMULAS (Promissory_Note_Signed_Date__c etc.) show TODAY(), never real dates;
+  Final_Confirmation_Date__c not in production.
+
+  - Background_Check_Employment__c.Background_Check__c -> parent (master-detail);
+  count via rollup Background_Check_Project_Count__c.
+
+  - Send_Pending_Notifications__c label reads backwards: it means ''send reminders''.
+
+  - Employee_Leave__c.Employee__c -> Recruiter__c: internal staff, never candidates;
+  rows are hand-loaded test data so far.
+
+  - Employee_Leave__c.Status__c wired: Submitted|Approved|Rejected|Cancelled; HR
+  fields empty. Manager_Approver__c/Requested_By__c not synced — requester = Employee__c
+  + CreatedById; approver via LastModifiedById.'
+glossary:
+  Onboarding: Intake into TechSara's own career service at the very start of the
+    candidate lifecycle (welcome call, service agreement, data collection, resume)
+    — not onboarding into an employer; tracked on Onboarding__c.
+  Onboarding form: The token-secured web intake form emailed to the candidate that
+    collects personal, immigration, EEO, education and work-history details onto
+    the Onboarding record.
+  Service agreement: The contract the candidate e-signs (DocuSign/PandaDoc) during
+    onboarding; it must be signed before the onboarding status can reach Resume
+    Creation.
+  Background check: TechSara's post-offer process combining employment verification
+    with the money gate (offer-letter payment, ACH authorization, promissory note),
+    tracked on Background_Check__c with one employment child per past employer.
+  Promissory note: The payment-plan agreement a candidate e-signs via DocuSign after
+    an offer, committing to installments of the remaining fees; its terms live in
+    the DS_* fields on the background check — those DS dates are real entered dates,
+    unlike the TODAY()-formula status dates.
+  Offer letter payment: 'The fee TechSara collects from the candidate once a job
+    offer arrives — the first gate of the background-check pipeline (Offer_Letter_Payment_Status__c:
+    Pending or Received).'
+  OPT: Optional Practical Training — US work authorization for recent international
+    graduates, the dominant status in the candidate base (legacy Visa_Status__c
+    value 'OPT-EAD').
+  CPT: Curricular Practical Training — work authorization for candidates still enrolled
+    at a university; flagged by Active_CPT__c on the onboarding record.
+  Work authorization: Which US jobs a candidate may legally take (OPT, CPT, H1B,
+    Green Card...). In the warehouse, filter on the legacy Visa_Status__c (F1 |
+    H1-B | CPT | OPT-EAD | H4-EAD | Green_Card | US_Citizen | Other) and match values
+    loosely — data loads left off-list variants like 'Green Card' and 'US Citizen'
+    — and note it is blank on most newer candidates; the current 'Work Authorization'
+    picklist field is not verified in production.
+  Bench marketing: The candidate-marketing team that applies to jobs on the candidate's
+    behalf after onboarding completes; the Complete Onboarding flow creates the
+    Marketing__c engagement hand-off.
+  ATS score: Score of the candidate's created resume from an applicant-tracking-system
+    checker (ATS_Score__c); a minimum-75 completion rule existed but is now deactivated.
+  Leave request: An internal employee's absence request on Employee_Leave__c (PTO,
+    sick, comp-off, marriage...), manager-approved and shown as an out-of-office
+    calendar event; current warehouse rows are hand-loaded test data.
+field_notes:
+  Onboarding__c:
+    Account__c: The candidate (Person Account) being onboarded. Set automatically
+      by the creation flow; 99% populated (765/771). The data-sync flow uses this
+      link to push onboarding answers back onto the Account.
+    Status__c: 'THE lifecycle field, driven by the Path on the record page: Welcome
+      Call | Service Agreement | Resume Creation | Onboarding Completed | Inactive.'
+    Inactive_Reason__c: Why the onboarding was paused/made inactive - filled by
+      the Pause Onboarding flow or manually. 24 records have one.
+    Flow_Only_Field__c: 'Hidden technical switch: the Onboarding_Completion_Validation
+      rule only allows Status = "Onboarding Completed" when this field changed in
+      the same save, and only the Complete Onboarding flow flips it.'
+    OwnerId: Standard owner - the Customer Success / onboarding employee working
+      this candidate. On the layout; ownership matters because sharing is Read/Write
+      org-wide, so the owner is a work-queue marker more than a security gate.
+    Owner_Name_Formula__c: The owner's first + last name as plain text, for reports/list
+      views that cannot show the Owner relationship nicely.
+    Description__c: General free-form notes about this onboarding.
+    Notes__c: Additional working notes (the layout shows it under "Other information").
+    Candidate_form_filled__c: The candidate returned/completed the intake form.
+      True on 719 (93%).
+    Service_Agreement_Sent__c: The service agreement went out (email/DocuSign/PandaDoc).
+      True on 717. Read by the service-agreement notification flow.
+    Service_Agreement_Signed__c: The candidate signed the service agreement. True
+      on 719 (93%). Checking it fires the Slack alert flow; required before Status
+      can reach "Resume Creation" (validation rule).
+    Resume_Created__c: The ATS-optimized resume has been produced. True on 682 (88%).
+    Internal_Approval__c: Techsara's internal sign-off on the resume/profile. True
+      on 682.
+    Candidate_Approval__c: The CANDIDATE approved the resume. True on 681. Required
+      before the onboarding can be completed (validation rule).
+    LinkedIn_Optimization__c: The candidate's LinkedIn profile was optimized by
+      the team. True on only 59 records (8%) - either rarely done or rarely recorded.
+    Assigned_to_Marketing__c: The candidate has been handed off to the bench-marketing
+      team (a Marketing__c engagement exists). True on 241 (31%). The Complete Onboarding
+      flow handles the actual Marketing record creation.
+    Account_information_collected__c: Candidate's account/billing information has
+      been collected. (Exact operational meaning not fully documented - verify with
+      team.)
+    Welcome_Script__c: The welcome-call script/notes used for this candidate's kickoff
+      call.
+    Onboarding_Form_Status__c: 'Older form-status field: Sent | Opened | Draft |
+      Submitted | Expired | Cancelled. Populated on exactly 1 record (Cancelled);
+      effectively unused - the token''s own status field superseded it.'
+    Latest_Onboarding_Form_Link__c: Link of the most recently sent form. Empty on
+      all records so far.
+    Latest_Onboarding_Status__c: Short text status of the newest form send, updated
+      by the candidate intake flow (Onboarding_Candidate_Intake_1). Populated on
+      98 records - the only "Latest" field actually in use.
+    Candidate_Form_Additional_Details__c: Free-text catch-all the candidate can
+      leave on the intake form ("anything else we should know").
+    Declaration__c: 'The candidate''s accuracy declaration on the intake form. Help
+      text: "I confirm that all the above information provided is accurate.'
+    Upfront_Amount__c: The upfront payment amount for the plan. Populated on 678
+      records (88%).
+    Offer_letter_amount__c: Amount tied to the candidate's (future) offer letter
+      - the salary basis the success-fee part of the agreement is calculated on.
+      Populated on 678 records. (Exact contractual meaning - verify with team.)
+    Salary__c: A PERCENT field despite the plain "Salary" label - the percentage-of-
+      salary component of the candidate's fee agreement (income-share style). Populated
+      on 678 records, copied from the Account at creation.
+    Salary_Expectations_Picklist__c: 'The candidate''s target salary band: $60,000
+      - $80,000 | $80,000 - $120,000 | $120,000 - $160,000 | $160,000 - $200,000
+      | $200,000 +. Captured on the intake form; guides which roles marketing targets.'
+    Secondary_Email__c: Backup email. 51 records.
+    Phone__c: Primary phone. 95% populated (736).
+    Secondary_Phone__c: Backup phone number.
+    WhatsApp_Number__c: The candidate's WhatsApp contact (much of the candidate
+      base communicates on WhatsApp). 92 records.
+    Date_of_Birth__c: Candidate's date of birth (62% populated) - needed for background
+      checks and some employer forms later in the journey.
+    Last_4_digits_of_SSN__c: Last four digits of the candidate's US Social Security
+      Number - collected for job applications that require it. Only 30 records (sensitive;
+      rarely captured).
+    Passport_Number__c: Passport number - identity anchor for international candidates;
+      marked REQUIRED on the page layout. Populated on 432 records (56%).
+    Current_Address__c: The candidate's current home address (full compound address
+      field).
+    Billing_Address__c: Billing address as plain text, copied from the Account's
+      billing address by the creation flow.
+    Shipping_Address__c: Shipping/mailing address as plain text (rarely relevant;
+      legacy).
+    Candidate_Time_Zone__c: 'Which timezone the candidate lives in: ET | PT | CT
+      | MT | HT | AT | UTC (record-type default) | IST. Drives when the team schedules
+      calls.'
+    Race_Ethnicity__c: American Indian or Alaska Native | Asian | Black or African
+      American | Hispanic or Latino | Native Hawaiian or Other Pacific Islander
+      | Two or More Races | Other (please specify) | I choose not to disclose.
+    Disability_Status__c: Yes, I have a disability or previously had a disability
+      | No, I do not have a disability | Prefer not to say.
+    Military_Status__c: Active Duty | Reserve or National Guard | Veteran | Retired
+      Military | Military Spouse | No Military Service | Prefer not to say.
+    Work_Authorization_Expiry_Date__c: 'When the authorization (e.g. the OPT EAD
+      card) expires - drives urgency: the candidate must be placed before this date.'
+    Visa_Status__c: 'OLDER visa-status field: F1 | H1-B | CPT | OPT-EAD | H4-EAD
+      | Green_Card | US_Citizen | Other. Populated on 413 records, mostly legacy
+      (OPT-EAD 275, F1 108)'
+    Active_CPT__c: The candidate is currently on CPT (Curricular Practical Training
+      - i.e. still enrolled at a university). True on 71 records.
+    Authorized_To_Work_In_US__c: Blanket "can legally work in the US" flag from
+      the intake form.
+    Sponsorship_Required_For_VISA__c: The candidate will need employer visa sponsorship
+      (e.g. an H1B transfer) - limits which employers marketing can target.
+    Mention_your_Visa_dates_if_applicable__c: Free-text visa validity dates as the
+      candidate wrote them on the form.
+    Date_of_Arrival__c: Date the candidate arrived in the US. Never populated (0
+      records) - the free-text field below is what actually gets filled.
+    When_did_you_move_to_USA__c: Free-text answer to "when did you move to the USA".
+      442 records (57%).
+    Linkedin_URL__c: Second LinkedIn URL field (the one the creation and sync flows
+      map to the Account). 114 records. Two URL fields exist for historic reasons
+      - check both when looking for the profile.
+    LinkedIn_Email_Id__c: The email address the candidate's LinkedIn account is
+      registered under.
+    LinkedIn_Username__c: LinkedIn login username.
+    LinkedIn_Password__c: LinkedIn login password, stored ENCRYPTED (masked from
+      most users). Deliberately excluded from the Account sync flow because encrypted
+      fields cannot be flow-copied.
+    LinkedIn_Password_Updated__c: Free-text note of when/whether the password was
+      changed (e.g. after the engagement ends).
+    Marketing_Email_Id__c: The dedicated email address created/used for marketing
+      this candidate (job applications are sent from it). 432 records (56%).
+    Marketing_Email_Password__c: Password for that marketing mailbox - stored as
+      PLAIN text (unlike the LinkedIn password; a known data-hygiene risk). Excluded
+      from Account sync.
+    Professional_Profiles__c: Other professional links (GitHub, portfolio, Indeed,
+      etc.) as free text.
+    Years_of_Experience__c: Duplicate/legacy years-of-experience field on the "Information"
+      section. Prefer Total_Years_of_Experience__c.
+    Which_Experience_Level__c: 'Seniority band: Entry_Level | Associate | Mid-Senior_level
+      | Director | Executive. 436 records (57%).'
+    Industry__c: Target industry from the org-wide industry list (Agriculture, Banking,
+      Consulting, Finance, Healthcare, Technology, ... 32 values). Copied from/synced
+      to the Account.
+    Niche__c: 'The candidate''s placement niche: AI ML Engineer | Python Developer/
+      Engineer | Java Fullstack Developer/Engineer | Product/Project Manager | Marketing
+      Manager | Finance Analyst | Other.'
+    Niche_Other__c: Free-text niche when Niche = "Other".
+    Technology__c: Primary technology/stack keywords (e.g. "Java, Spring, AWS").
+      206 records; synced to the Account.
+    Current_Domain__c: The candidate's current working domain. Never populated (0
+      records).
+    Preferred_Job_Positions__c: Job titles the candidate wants (targeting input
+      for applications).
+    Preferred_Job_Locations__c: Cities/states the candidate wants to work in.
+    Open_to_relocate__c: Whether the candidate will relocate for a role. True on
+      476 records (62%) - most candidates are open to relocation.
+    Job_Type__c: 'Preferred work mode: Remote | Hybrid | On-site | All of the above.'
+    Daily_Interview_Availability__c: Free-text daily time window when the candidate
+      can take interviews (feeds interview scheduling later).
+    Education_Details__c: Free-text education summary (older, pre-repeat-fields
+      capture).
+    Degree_Type__c: 'Highest degree type: Diploma | Bachelor''s | Master''s | PhD.'
+    No_of_Degrees__c: How many degrees the candidate has (tells the form how many
+      of the repeat blocks below to fill). 50 records.
+    Types_of_degree__c: Free-text degree summary copied from the Account's Degree__c
+      field by the creation flow.
+    CGPA_Score__c: Grade-point average of the (primary) degree.
+    College_Name__c: School/university name for education entries 1-5.
+    College_Name_2__c: School/university name for education entries 1-5.
+    College_Name_3__c: School/university name for education entries 1-5.
+    College_Name_4__c: School/university name for education entries 1-5.
+    College_Name_5__c: School/university name for education entries 1-5.
+    Degree__c: 'Degree for each entry: Bachelors | Masters | Diploma | PhD | Undergraduates
+      | Graduates (the Active record type limits some slots to Bachelors/Masters).'
+    Degree_2__c: 'Degree for each entry: Bachelors | Masters | Diploma | PhD | Undergraduates
+      | Graduates (the Active record type limits some slots to Bachelors/Masters).'
+    Degree_3__c: 'Degree for each entry: Bachelors | Masters | Diploma | PhD | Undergraduates
+      | Graduates (the Active record type limits some slots to Bachelors/Masters).'
+    Degree_4__c: 'Degree for each entry: Bachelors | Masters | Diploma | PhD | Undergraduates
+      | Graduates (the Active record type limits some slots to Bachelors/Masters).'
+    Degree_5__c: 'Degree for each entry: Bachelors | Masters | Diploma | PhD | Undergraduates
+      | Graduates (the Active record type limits some slots to Bachelors/Masters).'
+    Degree_Start_Date__c: Start and end dates of each degree (end date also proves
+      OPT/CPT eligibility timing for recent graduates).
+    Degree_Start_Date_2__c: Start and end dates of each degree (end date also proves
+      OPT/CPT eligibility timing for recent graduates).
+    Degree_Start_Date_3__c: Start and end dates of each degree (end date also proves
+      OPT/CPT eligibility timing for recent graduates).
+    Degree_Start_Date_4__c: Start and end dates of each degree (end date also proves
+      OPT/CPT eligibility timing for recent graduates).
+    Degree_End_Date_2__c: Start and end dates of each degree (end date also proves
+      OPT/CPT eligibility timing for recent graduates).
+    Degree_End_Date_3__c: Start and end dates of each degree (end date also proves
+      OPT/CPT eligibility timing for recent graduates).
+    Degree_End_Date_4__c: Start and end dates of each degree (end date also proves
+      OPT/CPT eligibility timing for recent graduates).
+    Degree_End_Date_5__c: Start and end dates of each degree (end date also proves
+      OPT/CPT eligibility timing for recent graduates).
+    Company_name_1__c: Employer name for jobs 1-5 (note the inconsistent capitalization
+      of the API names - they are hand-built fields).
+    company_name_2__c: Employer name for jobs 1-5 (note the inconsistent capitalization
+      of the API names - they are hand-built fields).
+    company_name_3__c: Employer name for jobs 1-5 (note the inconsistent capitalization
+      of the API names - they are hand-built fields).
+    Company_Name_4__c: Employer name for jobs 1-5 (note the inconsistent capitalization
+      of the API names - they are hand-built fields).
+    Company_Name_5__c: Employer name for jobs 1-5 (note the inconsistent capitalization
+      of the API names - they are hand-built fields).
+    Position_role_1__c: Job title held at each employer.
+    Position_role_2__c: Job title held at each employer.
+    Position_role_3__c: Job title held at each employer.
+    Position_role_4__c: Job title held at each employer.
+    Position_role_5__c: Job title held at each employer.
+    Job_Location__c: Where each job was located (only four of these exist).
+    Job_Location_2__c: Where each job was located (only four of these exist).
+    Job_Location_3__c: Where each job was located (only four of these exist).
+    Job_Location_4__c: Where each job was located (only four of these exist).
+    Location_1__c: A SECOND set of per-job location fields from an older form version
+      (the layout shows Location_5 with the slot-5 fields). Redundant with Job_Location
+      - check both on old records.
+    Location_2__c: A SECOND set of per-job location fields from an older form version
+      (the layout shows Location_5 with the slot-5 fields). Redundant with Job_Location
+      - check both on old records.
+    Location_3__c: A SECOND set of per-job location fields from an older form version
+      (the layout shows Location_5 with the slot-5 fields). Redundant with Job_Location
+      - check both on old records.
+    Location_4__c: A SECOND set of per-job location fields from an older form version
+      (the layout shows Location_5 with the slot-5 fields). Redundant with Job_Location
+      - check both on old records.
+    Location_5__c: A SECOND set of per-job location fields from an older form version
+      (the layout shows Location_5 with the slot-5 fields). Redundant with Job_Location
+      - check both on old records.
+    Joining_Date__c: Start (joining) and end dates of each job.
+    Joining_Date_2__c: Start (joining) and end dates of each job.
+    Joining_Date_3__c: Start (joining) and end dates of each job.
+    Joining_Date_4__c: Start (joining) and end dates of each job.
+    End_Date_2__c: Start (joining) and end dates of each job.
+    End_Date_3__c: Start (joining) and end dates of each job.
+    End_Date_4__c: Start (joining) and end dates of each job.
+    End_Date_5__c: Start (joining) and end dates of each job.
+    Duration_1__c: Free-text duration of each job (e.g. "2 years 3 months") - an
+      alternative to the date pairs, from an older form version.
+    Duration_2__c: Free-text duration of each job (e.g. "2 years 3 months") - an
+      alternative to the date pairs, from an older form version.
+    Duration_3__c: Free-text duration of each job (e.g. "2 years 3 months") - an
+      alternative to the date pairs, from an older form version.
+    Duration_4__c: Free-text duration of each job (e.g. "2 years 3 months") - an
+      alternative to the date pairs, from an older form version.
+    Duration_5__c: Free-text duration of each job (e.g. "2 years 3 months") - an
+      alternative to the date pairs, from an older form version.
+    ATS_Score__c: Score of the created resume from an ATS (applicant-tracking-system)
+      checker tool. A validation rule used to demand at least 75 before completion
+      but is now DEACTIVATED. Populated on 337 records (44%).
+    Resume_Creation_Notes__c: Working notes for/from the resume writer.
+    Technology_For_Resume__c: Which technologies/keywords the resume should be built
+      around (may differ from the candidate's raw history - it targets the niche
+      being marketed).
+  Background_Check__c:
+    Candidate__c: The candidate (Person Account) this background check is for. 100%
+      populated; set by the (now obsolete) creation flow or manually.
+    Interview__c: The interview whose "Offer Received" outcome opened this background
+      check. Auto-stamped by the creation flow; 30 of 31 records have it. Also a
+      column in the QA queue list view so QA can see the source offer.
+    Session__c: A session (call/meeting) related to this background check - intended
+      for the details-collection or paperwork-walkthrough call.
+    Background_Check_Status__c: 'THE main stage of the process, moved manually by
+      the QA owner and gated by the five validation rules: Payment Verification
+      Pending (start'
+    Background_Check_Type__c: 'WHICH kinds of verification this record covers: Background
+      Verification | I9 Verification | Visa Assessment. Manual entry. NEVER USED
+      in practice - empty on all 31 records at snapshot time.'
+    Before_Background_Check__c: 'Per-record bypass switch: when checked, ALL five
+      stage-gate validation rules are skipped, letting a user move the status freely.
+      Meant for records that predate the process or need admin correction.'
+    Assigned_to_QA__c: 'The queue-claim button''s field: the Accept Record quick
+      action checks it, and the Background_Change_Queue_to_QA_Assignment flow immediately
+      makes the clicking user the record owner.'
+    QA_Notes__c: Free-text working notes for the QA member handling the record (what
+      was checked, follow-ups, anomalies). Manual entry; nothing reads it downstream.
+    Offer_Letter_Payment_Status__c: Has the candidate paid the offer-letter fee?
+      Pending | Received. Initialized to Pending by the creation flow, flipped to
+      Received manually when payment lands.
+    Offer_Letter_Payment_Received_Date__c: 'Shows TODAY''s date whenever the payment
+      status is "Received", blank otherwise. CAUTION: because it is a live formula
+      on TODAY()'
+    ACH_Authorization_Status__c: Has the candidate signed the ACH direct-debit authorization?
+      Pending | Signed. Initialized to Pending; set to Signed manually when the
+      signed DocuSign envelope returns.
+    ACH_Authorization_Signed_Date__c: 'TODAY''s date while the ACH status is "Signed",
+      blank otherwise - same live-formula caveat as above: it does not preserve
+      the real signing date.'
+    Promissory_Note_Status__c: Has the candidate signed the promissory note (the
+      payment-plan agreement)? Pending | Signed. Same lifecycle and gating as the
+      ACH status; both must be Signed together to advance.
+    Promissory_Note_Signed_Date__c: TODAY's date while the promissory note status
+      is "Signed", blank otherwise - same live-formula caveat.
+    DS_Debit_Amount_Formate__c: The debit amount rendered as "$x,xxx.xx" text (with
+      thousands commas) for merging into the DocuSign documents.
+    DS_Total_Amount_to_be_Paid__c: The TOTAL the candidate will pay under the promissory
+      note across all installments. Entered in the send flow.
+    DS_Total_Amount_to_be_Paid_Formate__c: The total amount as formatted "$x,xxx.xx"
+      merge text.
+    DS_Payment_Commencement_Date__c: The date the payment plan starts. Entered in
+      the send flow.
+    DS_Payment_Commencement_Date_Formatted__c: The commencement date as "MM/DD/YYYY"
+      merge text.
+    DS_First_Installment_Due_Date__c: When the first installment is due. Entered
+      in the send flow.
+    DS_First_Installment_Due_Date_Formatted__c: The first-installment date as "MM/DD/YYYY"
+      merge text.
+    DS_Final_Payment_Due_Date__c: When the last installment is due (end of the plan).
+      Entered in the send flow.
+    DS_Final_Payment_Due_Date_Formate__c: The final-payment date as "MM/DD/YYYY"
+      merge text.
+    DS_ACH_Debit_Date_Each_Month__c: Day of the month (1 through 30) the recurring
+      ACH debit is drawn. Entered in the send flow.
+    Candidate_Details_Status__c: 'Where the candidate stands on submitting their
+      employment-history details: Pending | In Progress | Submitted. Initialized
+      to Pending; updated manually.'
+    Verification_Status__c: 'The OVERALL verification work status across all employment
+      children: Not Started | In Progress | Completed. Manual rollup-by-human (each
+      child has its own per-employer status).'
+    Background_Check_Project_Count__c: System-computed COUNT of Background_Check_Employment__c
+      children. Feeds the Require_Verification_For_Completed validation (candidate
+      details cannot be Submitted at 0).
+    Final_Employer_Confirmation_Received__c: 'The last box to tick: the (new) employer''s
+      final confirmation for the candidate has been received. Manual. Required (with
+      Verification Completed) before status "Completed". Checked on 5 of 31 records.'
+    Final_Employer_Confirmation_Date__c: 'TODAY''s date while the confirmation checkbox
+      is checked, blank otherwise - same live-formula caveat as the other status-date
+      fields: it does not preserve the actual confirmation date.'
+    Send_Pending_Notifications__c: The ON/OFF switch for actually SENDING the 4-hourly
+      reminders (email + Slack). A human checks it to start the nagging for a record.
+    Pending_Items_Summary__c: Auto-written, human-readable list of what is still
+      outstanding, e.g. "Offer Letter Payment Pending, ACH Authorization Pending,
+      Promissory Note Pending".
+    Last_Notification_Sent__c: 'Timestamp anchor for the 4-hour reminder cycle:
+      the scheduled path fires 4 hours after this value, and the flow re-stamps
+      it each time it sends (or first arms) notifications.'
+  Background_Check_Employment__c:
+    Background_Check__c: 'THE required parent link: which background check this
+      employment row is verified under. 100% populated; controls sharing and cascade
+      delete.'
+    Employer_Name__c: The employer/company name for this employment entry, as given
+      by the candidate. Manual entry; 100% populated in current data.
+    Project_Name__c: The project or engagement the candidate worked on at that employer
+      (consulting/staffing history is usually project-shaped, hence the "Project"
+      naming across this object). Manual; 100% populated.
+    Start_Date__c: When the candidate started at this employer/project. Manual;
+      100% populated.
+    End_Date__c: When the candidate left this employer/project. Manual; 100% populated
+      (current data has no open-ended rows).
+    Present__c: 'Marks this row as the candidate''s CURRENT employer (still working
+      there). NOTE: the field exists in this metadata snapshot but is NOT present/queryable
+      in the live preprod org (deleted in the org or never deployed) -'
+    Verification_Status__c: 'The per-employer verification result: Not Started |
+      In Progress | Verified | Unable to Verify. Set manually by the verifier as
+      they work the row.'
+    Employer_Confirmed__c: Ticked when the employer itself confirmed the employment
+      (as opposed to only references responding). Manual; checked on 3 of 8 records.
+    Verification_Notes__c: 'Free-text log of the verification work on this employer:
+      who was contacted, when, what they said, discrepancies found. Manual; nothing
+      reads it downstream - it is the human audit trail.'
+  Employee_Leave__c:
+    Employee__c: THE person taking the leave - a Techsara internal employee (Recruiter__c,
+      label "Employee"), never a candidate. Set automatically by the Request_Leave
+      flow from the Employee record where the "Create Leave Request"
+    Start_Date__c: First day of the leave. For a full-day request the employee picks
+      it directly; for a partial-day request the flow copies the single "Leave Date"
+      into both Start and End Date. 100% populated in data.
+    End_Date__c: Last day of the leave (same as Start_Date for partial-day requests).
+      The request screen shows a live "No. Of Leave Days" = End - Start + 1 counter.
+      Current data spans leaves from Jul 2026 out to Mar 2027.
+    Is_Full_Day__c: 'TRUE = whole-day(s) leave; FALSE = partial day. This is the
+      switch that changes the request screen: full day asks for a date range, partial
+      day asks for one date plus times.'
+    Is_Half_Day__c: Flag for a half-day absence. NOT set by the request flow (which
+      uses Is_Full_Day + Partial_Day_Type instead) and FALSE on every record - appears
+      redundant/legacy against Partial_Day_Type__c.
+    Partial_Day_Type__c: 'Which part of the day a partial leave covers: First Half
+      | Second Half | Time Range. Chosen on the request screen when Full Day is
+      unchecked. Only 2 of 18 records have it (one First Half, one Second Half).'
+    StartTime__c: Start of a partial-day leave, chosen from a restricted list of
+      96 15-minute slots covering the whole day (12:00 AM ... 11:45 PM). Entered
+      on the request screen (partial day only).
+    EndTime__c: End of a partial-day leave, same 96-slot list. The request flow
+      blocks saving when End Time is not after Start Time. Populated on all 18.
+    Start_Time__c: OLDER native-Time version of the start time, superseded by the
+      StartTime picklist above (same pattern as Interview__c's deprecated time fields).
+      Still sits on the page layout, but no flow writes it.
+    Total_Days__c: How many days this request covers (supports half values like
+      0.5). Defaults to 0; NO current automation computes it - the layout doesn't
+      even show it, yet 17 of 18 records have a value (sum 24 days)
+    Leave_Year__c: The leave-policy year the request counts against (e.g. 2026)
+      - the bucket a PTO balance would be tracked per. No automation sets it, yet
+      it is filled on all 18 records (values 2026-2027) - loaded with the test data.
+    Leave_Type__c: 'The category of absence, picked by the employee on the request
+      screen: PTO (planned paid time off) | Sick | Unpaid (LOP/LWP) (loss of pay
+      / leave without pay) | Comp-Off Availed (using earned compensatory time off)
+      |'
+    Leave_Reason__c: Free-text explanation of the leave, required on the request
+      screen. It is copied into the calendar event's description, so anyone viewing
+      the OOO event sees the reason - do not put sensitive detail here.
+    Status__c: 'The workflow state. Values: Planned | Approved | Cancelled | Completed
+      | Draft | Submitted | Manager Approved | HR Review Required | Rejected.'
+    Requested_On__c: When the request was submitted - stamped with the current date/time
+      by the Request_Leave flow. 100% populated. The raw material for the notice-period
+      math (days between request and leave start) in the future HR phase.
+    Manager_Approved_On__c: Timestamp of the manager's approval, stamped by the
+      Manager_Decision flow on Approve and cleared on Reject. Empty on all current
+      records (even the 9 "Approved" ones) - more evidence the test data skipped
+      the flow.
+    Rejection_Reason__c: Why the manager rejected the request - collected on the
+      Manager_Decision rejection screen, cleared again if the leave is later approved.
+      Shown on the layout so the employee can read the reason.
+    Cancel_Reason__c: Why a leave was cancelled (by the employee or ops) after submission.
+      Manual entry on the layout; no flow writes it. Setting Status to "Cancelled"
+      is what actually deletes the calendar event.
+    HR_Requirement_Reason__c: 'WHY HR must review: Late Request (notice period not
+      met) | Insufficient Balance (not enough PTO/SL left) | Special Leave (marriage/maternity
+      etc.) | Comp-Off (comp-off usage needs verification) | Other. Never populated.'
+    HR_Approver__c: The HR employee who approved/reviewed - correctly points at
+      Recruiter__c (unlike the broken Manager_Approver__c). Never populated.
+    HR_Approved_On__c: When HR approved. Never populated.
+    Attachment_Required__c: Whether proof is needed (e.g. a medical certificate
+      for sick leave). Default FALSE, never set.
+    Supporting_Document_Link__c: Link to the uploaded proof document the flag above
+      asks for. Never populated.
+    Notice_Compliance__c: 'The verdict of given-vs-required: On Time | Late | Not
+      Applicable. Never populated. "Late" is what would trip HR review via the Late
+      Request reason.'
+    Is_Unpaid__c: Marks the leave (or its overflow) as unpaid / loss-of-pay. Default
+      FALSE, never set; today the "Unpaid (LOP/LWP)" Leave Type value carries this
+      meaning descriptively.
+    Leave_Event_Id__c: The Salesforce record Id of the calendar Event created for
+      this leave - written by the Tentative_calendar_Event flow right after creation
+knowledge:
+- title: Onboarding__c — What This Object Is
+  keywords:
+  - onboarding
+  text: 'Onboarding__c is the checklist-and-data-capture record for bringing a NEWLY
+
+    ENROLLED CANDIDATE into Techsara''s career service. One record = one candidate''s
+
+    onboarding journey: welcome call -> service agreement signed -> full personal
+    /
+
+    immigration / education / work-history data collected (via an emailed,
+
+    token-secured web form) -> ATS-optimized resume created and approved -> hand-off
+
+    to the candidate-marketing (bench marketing) team.
+
+
+    Important nuance: despite the word "onboarding", this is NOT onboarding into
+    an
+
+    employer after a job offer - it is onboarding into TECHSARA''S OWN SERVICE,
+    and
+
+    it happens at the very START of the candidate lifecycle. A record is created
+
+    automatically the moment a candidate Person Account is created. The record
+
+    doubles as the candidate''s master intake questionnaire, which is why it is
+    so
+
+    wide (155 fields): it stores everything the candidate tells us about
+
+    themselves, including up to five education entries and five past jobs used as
+
+    raw material for resume creation. The Customer Success / onboarding team works
+
+    these records (see the "Customer Success Onboarding" list view).'
+- title: Onboarding__c — Kind Of Object
+  keywords:
+  - onboarding
+  text: "- Custom object, part of the candidate-intake / training domain.\n- Standalone\
+    \ object with its own Owner. Lookup (NOT master-detail) to Account\n  via Account__c\
+    \ \"Candidate Name\" - 99% populated but technically optional.\n- Sharing model:\
+    \ Public Read/Write (everyone can see and edit onboardings).\n- Field history\
+    \ tracking is enabled on the object.\n- 155 custom fields, 2 record types, 5\
+    \ validation rules (4 active), 4 list\n  views (All, Customer Success Onboarding,\
+    \ Initial Stage, Onboarding Not\n  Completed).\n- Auto-number Name \"OnBoarding\
+    \ Name\" in the format OB-XXXX (e.g. OB-1032).\n- Scale: 771 records in preprod\
+    \ (Aug 2024 to today); roughly one per enrolled\n  candidate."
+- title: Onboarding__c — Record Types
+  keywords:
+  - onboarding
+  text: "- \"Active\" (developer name: Active) - the working type for candidates\
+    \ currently\n  in or through onboarding; 658 records (85%). Sets picklist defaults\
+    \ (e.g.\n  Candidate Time Zone defaults to UTC) and restricts some of the education\n\
+    \  Degree picklists to Bachelors/Masters. No description in metadata.\n- \"\
+    Inactive\" (Inactive) - candidates whose onboarding was paused / who went\n\
+    \  inactive; only 12 records. The \"Change Record Type\" button is on the layout,\n\
+    \  and the Pause Onboarding flow drives the inactive path.\n- NOTE: 101 older\
+    \ records (13%) have NO record type at all - they were created\n  before record\
+    \ types were added to the object. Treat \"no record type\" as\n  legacy-Active\
+    \ when reporting."
+- title: Onboarding__c — How It Is Used — The Business Process
+  keywords:
+  - onboarding
+  text: "STEP 1 - AUTO-CREATION AT ENROLLMENT. When a candidate Person Account is\n\
+    \  created (usually by Lead conversion), the record-triggered flow\n  Create_Onboarding_from_Account_1\
+    \ automatically creates the Onboarding record.\n  It copies ~20 enrollment fields\
+    \ from the Account onto it (plan, upfront\n  amount, salary percentage, offer\
+    \ letter amount, work authorization + expiry,\n  passport number, phone/email/secondary\
+    \ contacts, WhatsApp, LinkedIn URL,\n  niche, industry, billing address, years\
+    \ of experience, degree info), sets the\n  initial Status, emails a \"new candidate\"\
+    \ welcome message and posts a Slack\n  notification. Users almost never create\
+    \ Onboarding records by hand.\n\nSTEP 2 - WELCOME CALL. The onboarding owner\
+    \ runs the welcome call (the\n  Welcome_Script__c field holds the script/notes).\
+    \ Sessions booked for the\n  candidate can link back via Session__c.Onboarding__c."
+- title: Onboarding__c — How It Is Used — The Business Process (2)
+  keywords:
+  - onboarding
+  text: "STEP 3 - SERVICE AGREEMENT. On creation, the flow Onboarding_Service_Agreement_\n\
+    \  Email_Slack_Notification emails the service agreement to the candidate and\n\
+    \  notifies Slack. The \"Send Services Agreement\" button on the record page\
+    \ runs\n  a DocuSign envelope send (dfsle managed package); a PandaDoc panel\
+    \ is also\n  embedded on the record page for document generation/e-sign. When\n\
+    \  Service_Agreement_Signed__c is checked, the flow Onboarding_Alert_after_\n\
+    \  Service_Agreement_signed posts a Slack alert. A validation rule blocks moving\n\
+    \  the Status to \"Resume Creation\" until the agreement is signed."
+- title: Onboarding__c — How It Is Used — The Business Process (3)
+  keywords:
+  - onboarding
+  text: "STEP 4 - CANDIDATE DATA COLLECTION (THE ONBOARDING FORM). The \"Send Onboarding\n\
+    \  Form\" button runs Onboarding_Send_Candidate_Onboarding_form: the generic\n\
+    \  CreateToken Apex action generates a secure token, an Onboarding_Token__c\n\
+    \  record is created (link, recipient email, expiry, form status - see the\n\
+    \  Onboarding_Token__c section), and the candidate is emailed the link. The\n\
+    \  candidate opens the token link and fills the guest-facing screen flow\n \
+    \ Onboarding:Candidate Intake-1 (Onboarding_Candidate_Intake_1) - a ~10-screen\n\
+    \  form capturing personal details, immigration/work-authorization data, EEO\n\
+    \  self-identification, education history (also written to Education_History__c\n\
+    \  child records), and past work experience. The form updates the token's\n\
+    \  status and the record's Latest_Onboarding_Status__c. Whenever key candidate\n\
+    \  fields change on the Onboarding record, the flow Update_Candidate_\n  Information_from_Onboarding\
+    \ syncs them back to the candidate Account (every\n  mapped field except the\
+    \ two password fields, which are encrypted)."
+- title: Onboarding__c — How It Is Used — The Business Process (4)
+  keywords:
+  - onboarding
+  text: "STEP 5 - RESUME CREATION. The resume team builds an ATS-optimized resume\
+    \ from\n  the collected education/work-history data. Supporting fields: Technology_For_\n\
+    \  Resume__c, Resume_Creation_Notes__c, ATS_Score__c (a now-DEACTIVATED rule\n\
+    \  used to require a score of at least 75 before completion). The \"Create\n\
+    \  Resume Request\" button emails the resume request to the team. Both\n  Internal_Approval__c\
+    \ and Candidate_Approval__c must be obtained - candidate\n  approval is enforced\
+    \ by an active validation rule. LinkedIn profile\n  optimization is tracked\
+    \ with LinkedIn_Optimization__c.\n\nSTEP 6 - COMPLETION AND HAND-OFF TO MARKETING.\
+    \ Status cannot be typed to\n  \"Onboarding Completed\" directly - a validation\
+    \ rule forces users through the\n  \"Complete Onboarding\" button (screen flow\
+    \ Onboarding_Complete_Onboarding).\n  The flow checks/creates the candidate's\
+    \ Marketing__c engagement record (the\n  hand-off to the bench-marketing team),\
+    \ flips the hidden Flow_Only_Field__c\n  to satisfy the validation rule, and\
+    \ posts a Slack notification. 90% of all\n  records have reached \"Onboarding\
+    \ Completed\".\n\nPAUSE PATH: the \"Pause Onboarding\" button (flow Onboarding_record_Inactive)\n\
+    \  marks the record Inactive with a reason and simultaneously puts the\n  candidate\
+    \ Account on hold (Candidate_Status__c + Reason_for_Hold__c)."
+- title: Onboarding__c — Connected Objects
+  keywords:
+  - onboarding
+  - each
+  - relationship
+  - means
+  text: "LOOKUPS FROM ONBOARDING TO OTHER OBJECTS:\n- Account (Account__c, label\
+    \ \"Candidate Name\"): the candidate (Person Account)\n  being onboarded. 99%\
+    \ populated. Data flows BOTH ways: the creation flow\n  copies Account fields\
+    \ onto the onboarding, and the update-sync flow pushes\n  onboarding edits back\
+    \ to the Account.\n- Course__c (Course_Name__c): which training course the candidate\
+    \ is tied to.\n  Referenced by the intake form flow but NEVER populated in data\
+    \ (0 records).\n- Institute__c (Institutes__c, label \"Institute\"): the institute\
+    \ master record\n  for the candidate's school. Never populated (0 records).\n\
+    - Education_History__c (Institute__c, label \"Institute\" AND\n  Institute_Country__c,\
+    \ label \"Institute Country\"): two confusingly named\n  lookups to the education-history\
+    \ object. Both never populated (0 records) -\n  the real education link runs\
+    \ the OTHER way (see below)."
+- title: Onboarding__c — Connected Objects (2)
+  keywords:
+  - onboarding
+  - each
+  - relationship
+  - means
+  text: "OBJECTS THAT POINT AT ONBOARDING (children / references):\n- Education_History__c\
+    \ (lookup Education_History__c.Onboarding__c): the\n  candidate's education\
+    \ entries created by the intake form - the proper,\n  normalized version of\
+    \ the College_Name/Degree 1-5 flat fields.\n- Onboarding_Token__c (lookup Onboarding_Token__c.Onboarding__c):\
+    \ the secure\n  form-link tokens sent to the candidate (link, expiry, sent/opened/submitted\n\
+    \  status). Documented in its own section - the \"Send Onboarding Form\" button\n\
+    \  creates these.\n- Session__c (lookup Session__c.Onboarding__c): scheduled\
+    \ meetings (welcome\n  call, onboarding sessions) booked against this onboarding.\n\
+    - Case (lookup Case.Onboarding__c): internal ops tickets raised about this\n\
+    \  onboarding.\n\nNOT RELATED (common confusion): Onboarding__c has no link\
+    \ to Job_Requirement,\nJob_Submission, Interview, or Background_Check - it is\
+    \ a service-intake\nrecord, not an employer-placement record."
+- title: Onboarding__c — Business Rules
+  keywords:
+  - onboarding
+  - validation
+  text: "- Candidate_Approval_Required (active): status cannot be set to \"Onboarding\n\
+    \  Completed\" unless Candidate_Approval__c is checked. Error (shown on the\n\
+    \  Candidate Approval field): \"Get the candidate approval of the resume before\n\
+    \  completion of the onboarding\".\n- Work_Authorization_Required (active):\
+    \ status cannot be set to \"Onboarding\n  Completed\" while Work_Authorization__c\
+    \ is blank. Error (shown on the Work\n  Authorization field): \"Get the candidate\
+    \ approval of the resume before\n  completion of the onboarding\" - NOTE: this\
+    \ message is a copy-paste of the\n  previous rule's text; the rule actually\
+    \ requires Work Authorization.\n- Onboarding_Completion_Validation (active):\
+    \ users may not type the status to\n  \"Onboarding Completed\" directly; the\
+    \ change is only allowed when the hidden\n  Flow_Only_Field__c changed in the\
+    \ same save (which only the Complete\n  Onboarding flow does). Error: \"The\
+    \ 'Status' field cannot be set to 'Onboard\n  Completion' directly. Please use\
+    \ Complete Onboarding button.\"\n- Service_Agreement_Required_Before_Resume\
+    \ (active): status cannot be set to\n  \"Resume Creation\" unless Service_Agreement_Signed__c\
+    \ is checked. Error:\n  \"Get the Service Agreement signed before starting on\
+    \ the Resume.\"\n- ATS_Score_below_75 (INACTIVE): used to block completion when\
+    \ ATS_Score__c\n  was below 75 or empty. Error: \"ATS Score needs to be at least\
+    \ 75\". The rule"
+- title: Onboarding__c — Automation
+  keywords:
+  - onboarding
+  - runs
+  text: "RECORD-TRIGGERED FLOWS (active):\n- Create_Onboarding_from_Account_1 (on\
+    \ Account, after create, candidate record\n  type only): THE creation path -\
+    \ auto-creates the Onboarding record for every\n  new candidate Person Account,\
+    \ copies ~20 enrollment fields from the Account,\n  sends the new-candidate\
+    \ email and a Slack notification (HttpCalloutGeneric).\n- Onboarding_Service_Agreement_Email_Slack_Notification\
+    \ (after create, with a\n  scheduled path): emails the service agreement to\
+    \ the candidate and posts a\n  Slack notification; reads Service_Agreement_Sent__c.\n\
+    - Onboarding_Alert_after_Service_Agreement_signed (after create/update when\n\
+    \  Service_Agreement_Signed__c is checked, with a scheduled path): Slack alert\n\
+    \  that the agreement came back signed.\n- Update_Candidate_Information_from_Onboarding\
+    \ (after update; fires when any\n  of ~21 candidate-data fields change): syncs\
+    \ the onboarding data back to the\n  candidate Account. Per its own description,\
+    \ every mapped field is synced\n  EXCEPT LinkedIn Password and Marketing Email\
+    \ Password (encrypted fields)."
+- title: Onboarding__c — Automation (2)
+  keywords:
+  - onboarding
+  - runs
+  text: "SCREEN FLOWS / BUTTONS ON THE RECORD PAGE (Onboarding_Record_Page1):\n\
+    - Send Onboarding Form -> Onboarding_Send_Candidate_Onboarding_form: generates\n\
+    \  a token (CreateToken Apex), creates the Onboarding_Token__c with link/expiry/\n\
+    \  recipient, emails the candidate the form link.\n- Send Services Agreement\
+    \ -> Send_Services_Agreement: sends the DocuSign\n  envelope (dfsle managed-package\
+    \ bulk envelope action).\n- Create Resume Request -> Onboarding_Send_Email_for_Resume:\
+    \ emails the resume\n  request and stamps the record.\n- Pause Onboarding ->\
+    \ Onboarding_record_Inactive: marks the onboarding\n  Inactive with a reason\
+    \ and puts the candidate Account on hold\n  (Candidate_Status__c, Reason_for_Hold__c).\n\
+    - Complete Onboarding -> Onboarding_Complete_Onboarding: the only allowed way\n\
+    \  to complete; checks for / creates the Marketing__c engagement (hand-off to\n\
+    \  bench marketing), flips Flow_Only_Field__c past the validation rule, Slack\n\
+    \  notification.\n- Candidate_Onboarding_Form (quick action -> flow Candidate_Onboarding_Form):\n\
+    \  defined and active but NOT placed on any page - currently unreachable.\n\
+    - Guest side: Onboarding_Candidate_Intake_1 (\"Onboarding:Candidate Intake-1\"\
+    )\n  is the candidate-facing intake form behind the token link - it writes the\n\
+    \  candidate's answers onto the record, creates Education_History__c rows, and\n\
+    \  updates the token status and Latest_Onboarding_Status__c."
+- title: Onboarding__c — Automation (3)
+  keywords:
+  - onboarding
+  - runs
+  text: 'ALSO ON THE RECORD PAGE: an embedded PandaDoc managed-package panel (document
+
+    generation/e-sign), an inline run of the Attached_Resume_To_Lead flow, and a
+
+    Path component driving Status__c.
+
+
+    OBSOLETE / DRAFT (exist in metadata, do NOT run): Create_Marketing_record_
+
+    from_Onboarding_status_update (obsolete - replaced by the Complete Onboarding
+
+    button), Onboarding_Creation_Candidate_Form (obsolete), Onboarding_Reaches_
+
+    Resume_Creation_Send_Email_Notifications (obsolete), Onboarding_Candidate_
+
+    Intake (draft, superseded by Intake-1), Onboarding_Send_Email_Notifications
+
+    (invalid draft).
+
+
+    APEX: no trigger on Onboarding__c and no Apex class references it directly;
+
+    the only Apex involved is the generic CreateToken invocable (token generation)
+
+    and HttpCalloutGeneric (Slack callouts) called from the flows above.'
+- title: Background_Check__c — What This Object Is
+  keywords:
+  - background
+  - check
+  text: "Background_Check__c is the POST-OFFER verification and payment-agreement\
+    \ record\nfor a candidate. When a candidate finally wins a job offer (Interview\
+    \ outcome\n\"Offer Received\"), one Background Check record is opened to walk\
+    \ the candidate\nthrough everything that must happen between \"offer\" and \"\
+    cleared to start\":\n\n  a) The MONEY GATE - Techsara collects its offer-letter\
+    \ payment from the\n     candidate, then has the candidate e-sign an ACH debit\
+    \ authorization and a\n     promissory note (a payment plan for the remaining\
+    \ fees) via DocuSign. The\n     DS_* fields on this record hold the payment-plan\
+    \ terms that get merged\n     into those DocuSign documents.\n  b) The VERIFICATION\
+    \ work - the candidate submits their details, each past\n     employer/project\
+    \ is verified one by one (child object\n     Background_Check_Employment__c),\
+    \ and a final confirmation is obtained\n     from the employer.\n  c) The QA\
+    \ TEAM WORKFLOW - new records land in a \"QA Background Check Queue\";\n   \
+    \  a QA member accepts a record to take ownership, works the pipeline, and\n\
+    \     an automated reminder engine nags the owners (email + Slack) while\n \
+    \    payment/signature items stay pending.\n\nOne record = one candidate's background-check\
+    \ + payment-agreement process,\nnormally tied to the specific interview that\
+    \ produced the offer."
+- title: Background_Check__c — Kind Of Object
+  keywords:
+  - background
+  - check
+  text: "- Custom object, part of the post-offer / onboarding-preparation domain.\n\
+    - Standalone object with its OWN owner (not a master-detail child): lookups\
+    \ to\n  Account (Candidate__c), Interview__c and Session__c. Internal sharing\
+    \ model\n  is Public Read/Write; external (portal) sharing is Private.\n- Records\
+    \ are typically owned by the QA_Background_Check_Queue queue until a\n  QA member\
+    \ accepts them (84% still queue-owned in current data).\n- Auto-number Name\
+    \ \"BCN-{00000}\" (field label \"Background Check  ID\").\n- 36 custom fields,\
+    \ 0 record types, 5 validation rules, 1 list view\n  (\"QA Background Check\
+    \ Queue\" - the queue's work list showing Name,\n  Interview, Candidate and\
+    \ Status).\n- PARENT of Background_Check_Employment__c (master-detail children,\
+    \ one per\n  employer/project to verify, counted by a rollup field).\n- Scale:\
+    \ only 31 records in preprod (created 2026-06-01 to 2026-08-10) - this\n  is\
+    \ a NEW process, live for about two months at snapshot time."
+- title: Background_Check__c — Record Types
+  keywords:
+  - background
+  - check
+  text: 'None. Every Background Check record is the same flavor; the multi-select
+
+    "Verification Type" field (Background Verification | I9 Verification | Visa
+
+    Assessment) was designed to carry the variation instead, but is unused so far.'
+- title: Background_Check__c — How It Is Used — The Business Process
+  keywords:
+  - background
+  - check
+  text: "STEP 1 - CREATION. The record-triggered flow \"Background Check: Creation,\n\
+    \  Queue Routing, and Stage Progression\" auto-created a Background Check when\n\
+    \  an Interview__c was updated to outcome \"Offer Received\" (one per interview\
+    \ -\n  it checks for an existing record first). It stamped Candidate + Interview,\n\
+    \  set owner = QA_Background_Check_Queue, and initialized every status:\n  Background\
+    \ Check Status = \"Payment Verification Pending\", Offer Letter\n  Payment /\
+    \ ACH / Promissory Note = \"Pending\", Candidate Details = \"Pending\",\n  Verification\
+    \ = \"Not Started\", Notification Active = true. NOTE: this flow is\n  now marked\
+    \ OBSOLETE (deactivated) in the org, so at snapshot time new\n  records have\
+    \ to be created manually while a replacement is decided -\n  verify with team.\
+    \ 30 of the 31 existing records are linked to an interview.\n\nSTEP 2 - QA ACCEPTS\
+    \ FROM THE QUEUE. The record sits in the QA Background\n  Check Queue list view.\
+    \ A QA member clicks the \"Accept Record\" button (a\n  quick action that simply\
+    \ checks the \"Accept this record from Queue\"\n  checkbox). The before-save\
+    \ flow \"Background Change: Queue to QA Assignment\"\n  then reassigns the record's\
+    \ owner to the clicking user. From that point the\n  record is that QA member's\
+    \ personal work item."
+- title: Background_Check__c — How It Is Used — The Business Process (2)
+  keywords:
+  - background
+  - check
+  text: "STEP 3 - THE STATUS PIPELINE. Background_Check_Status__c is driven manually\n\
+    \  through five stages, and validation rules gate each move (see part 6):\n\
+    \    Payment Verification Pending  ->  candidate pays the offer-letter fee\n\
+    \    Documents Pending             ->  ACH authorization + promissory note\n\
+    \                                      are sent and must come back signed\n\
+    \    Candidate Details Pending     ->  candidate submits their employment\n\
+    \                                      history details\n    Verification In\
+    \ Progress      ->  each employer/project is verified\n                    \
+    \                  (child records)\n    Completed                     ->  verification\
+    \ done + final employer\n                                      confirmation\
+    \ received.\n  The \"Before Background Check\" checkbox is a per-record bypass\
+    \ that turns\n  ALL of these stage gates off (used for records opened before\
+    \ the process\n  existed, or to force a correction)."
+- title: Background_Check__c — How It Is Used — The Business Process (3)
+  keywords:
+  - background
+  - check
+  text: "STEP 4 - SEND THE ACH + PROMISSORY NOTE (DOCUSIGN). On the record page\
+    \ the\n  user clicks \"Send ACH and Promissory\". The screen flow asks for the\
+    \ payment\n  plan: debit amount per installment, total amount to be paid, payment\n\
+    \  commencement date, first-installment due date, final-payment due date,\n\
+    \  payment period in months, and the day of the month the ACH debit runs. It\n\
+    \  saves those into the DS_* fields and then calls the DocuSign managed\n  package\
+    \ (apex action dfsle__EnvelopeConfigurationBulkRequest) with the\n  envelope\
+    \ template from custom label ACH_and_Promissory_Template_ID, using\n  this Background\
+    \ Check as the source record - the DS_* \"Formatted\" formula\n  fields exist\
+    \ so the dates/amounts merge into the documents as clean\n  MM/DD/YYYY and $x,xxx.xx\
+    \ text. When the signed envelope comes back, a user\n  flips ACH Authorization\
+    \ Status and Promissory Note Status to \"Signed\"\n  (no flow in the org writes\
+    \ these statuses - the DocuSign writeback, if\n  any, is configured inside the\
+    \ managed package; verify with team)."
+- title: Background_Check__c — How It Is Used — The Business Process (4)
+  keywords:
+  - background
+  - check
+  text: "STEP 5 - AUTOMATED PENDING-ITEM REMINDERS. The flow \"BG Check Pending\n\
+    \  Notifications\" watches the three money/paperwork statuses. While any of\n\
+    \  Offer Letter Payment / ACH / Promissory Note is \"Pending\" it keeps\n  Notification\
+    \ Active = true and writes a human-readable Pending Items\n  Summary (e.g. \"\
+    Offer Letter Payment Pending, ACH Authorization Pending\").\n  A scheduled path\
+    \ re-runs 4 hours after Last Notification Sent and - IF the\n  \"Send Pending\
+    \ Notifications\" switch is checked - emails the candidate's\n  owner and the\
+    \ record owner (from noreply@techsarasolutions.com), Slack-DMs\n  both owners,\
+    \ and posts to a fixed Slack channel when the record still\n  belongs to the\
+    \ queue. When everything is resolved it un-flags Notification\n  Active and\
+    \ clears the summary. IN PRACTICE the send switch is unchecked on\n  every record\
+    \ today, so the reminder machinery is armed but silent."
+- title: Background_Check__c — How It Is Used — The Business Process (5)
+  keywords:
+  - background
+  - check
+  text: "STEP 6 - VERIFY EMPLOYMENTS AND COMPLETE. The candidate's work history\
+    \ is\n  entered as Background_Check_Employment__c children (the \"Background\
+    \ Check\n  Projects\" related list); each is verified individually. A rollup\
+    \ counts the\n  children, and validation prevents marking Candidate Details\
+    \ \"Submitted\"\n  with zero children. Once overall Verification Status = \"\
+    Completed\" and the\n  Final Employer Confirmation checkbox is ticked, the record\
+    \ can be moved to\n  \"Completed\". A successful background check leads on to\
+    \ Onboarding__c in\n  the broader placement journey.\n\nOPTIONAL - \"Create\
+    \ Session\" on the record page launches the Background Check\n  Session Creation\
+    \ screen flow: it books a Session__c (Purpose = \"Background\n  Check\", Status\
+    \ = \"Unscheduled\") with the candidate, a chosen host employee\n  and an optional\
+    \ extra attendee, linked back to this Background Check - a\n  call to collect\
+    \ details or walk the candidate through the paperwork. It has\n  not been used\
+    \ yet (0 such sessions in data)."
+- title: Background_Check__c — Connected Objects
+  keywords:
+  - background
+  - check
+  - each
+  - relationship
+  - means
+  text: "LOOKUPS FROM BACKGROUND CHECK:\n- Account (Candidate__c): the candidate\
+    \ (Person Account) being verified.\n  100% populated - the anchor of the record.\
+    \ The reminder flow reads the\n  candidate's OWNER (email + Slack id) to know\
+    \ who to nag.\n- Interview__c (Interview__c): the interview that produced the\
+    \ offer this\n  background check follows (97% populated; stamped by the creation\
+    \ flow).\n- Session__c (Session__c): a session related to this background check\
+    \ (a\n  details-collection or walkthrough call). Currently never populated.\n\
+    \nOBJECTS THAT POINT AT BACKGROUND CHECK:\n- Background_Check_Employment__c\
+    \ (MASTER-DETAIL child, relationship name\n  \"Background_Check_Projects\"):\
+    \ one row per past employer/project to verify.\n  Counted by the Background\
+    \ Check Project Count rollup. 8 children across 6\n  parents so far.\n- Session__c.Background_Check__c\
+    \ (lookup): sessions booked FROM this record\n  by the Create Session button\
+    \ link back through this field (none yet).\n\nOWNERSHIP: the QA_Background_Check_Queue\
+    \ queue owns new records until a QA\nmember clicks Accept Record; 26 of 31 records\
+    \ are still queue-owned."
+- title: Background_Check__c — Business Rules
+  keywords:
+  - background
+  - check
+  - validation
+  - all
+  - active
+  text: 'Together the five rules enforce the stage-gate pipeline, and ALL of them
+    are
+
+    skipped when "Before Background Check" is checked. IMPORTANT WARNING: the
+
+    rule NAMES and their ERROR MESSAGES are rotated/mismatched relative to what
+
+    each rule actually checks - users frequently see a message describing a
+
+    DIFFERENT gate than the one that blocked them. The actual behavior:'
+- title: Background_Check__c — Business Rules (2)
+  keywords:
+  - background
+  - check
+  - validation
+  - all
+  - active
+  text: "- Require_CandidateDetail_For_Verification: BLOCKS moving status to\n \
+    \ \"Documents Pending\" unless Offer Letter Payment Status = \"Received\".\n\
+    \  Message shown: \"Candidate Details Status must be Submitted before moving\n\
+    \  to Verification In Progress.\" (wrong text for this gate).\n- Require_Documents_For_Candidate_Details:\
+    \ BLOCKS moving status to\n  \"Candidate Details Pending\" unless BOTH ACH Authorization\
+    \ Status and\n  Promissory Note Status = \"Signed\". Message shown: \"ACH Authorization\
+    \ and\n  Promissory Note must both be Signed before moving to Candidate Details\n\
+    \  Pending.\" (this one matches).\n- Require_Payment_For_Documents_Pending:\
+    \ BLOCKS moving status to\n  \"Verification In Progress\" unless Candidate Details\
+    \ Status = \"Submitted\".\n  Message shown: \"Offer Letter Payment Status must\
+    \ be Received before moving\n  to Documents Pending.\" (wrong text for this\
+    \ gate).\n- Require_Project_For_Candidate_Submitted: BLOCKS moving status to\n\
+    \  \"Completed\" unless Verification Status = \"Completed\" AND Final Employer\n\
+    \  Confirmation Received is checked. Message shown: \"At least one related\n\
+    \  Background Check Employment must exist before submitting Candidate\n  Details.\"\
+    \ (wrong text for this gate).\n- Require_Verification_For_Completed: BLOCKS\
+    \ setting Candidate Details\n  Status to \"Submitted\" while the Background\
+    \ Check Project Count rollup is"
+- title: Background_Check__c — Business Rules (3)
+  keywords:
+  - background
+  - check
+  - validation
+  - all
+  - active
+  text: "0 (i.e. no employment children entered). Message shown: \"Verification\n\
+    \  Status must be Completed and Final Employer Confirmation must be received\n\
+    \  before completing the Background Check.\" (wrong text for this gate)."
+- title: Background_Check__c — Automation
+  keywords:
+  - background
+  - check
+  - runs
+  text: "RECORD-TRIGGERED FLOWS:\n- Background_Change_Queue_to_QA_Assignment (before\
+    \ save, update; ACTIVE):\n  when \"Accept this record from Queue\" becomes checked,\
+    \ sets the record\n  owner to the current user - the queue-claim mechanic behind\
+    \ Accept Record.\n- BG_Check_Pending_Notifications (after save, create+update;\
+    \ ACTIVE): keeps\n  Notification Active / Pending Items Summary in sync with\
+    \ the three\n  Pending statuses, and via a scheduled path (4 hours after Last\n\
+    \  Notification Sent, repeating while items stay pending AND Send Pending\n\
+    \  Notifications is checked) sends the reminder email, Slack DMs to the\n  record\
+    \ owner and candidate owner, and a Slack post to the queue channel\n  when the\
+    \ record is still queue-owned. Also stamps Last Notification Sent.\n- Background_Check_Creation_Queue_Routing_and_Stage_Progression\
+    \ (on\n  Interview__c, after save; OBSOLETE/deactivated): the original creator\
+    \ -\n  made the Background Check with all defaults and queue ownership when\
+    \ an\n  interview's outcome became \"Offer Received\". Its deactivation means\n\
+    \  auto-creation is currently OFF."
+- title: Background_Check__c — Automation (2)
+  keywords:
+  - background
+  - check
+  - runs
+  text: "SCREEN FLOWS / BUTTONS ON THE PAGE (Background_Check_Record_Page1):\n-\
+    \ Accept Record: field-update quick action exposing only the Assigned to QA\n\
+    \  checkbox (see flow above).\n- Send ACH and Promissory: collects the DS_*\
+    \ payment-plan terms, updates the\n  record, then sends the DocuSign envelope\
+    \ (managed package \"dfsle\" apex\n  action; template id from custom label ACH_and_Promissory_Template_ID).\n\
+    - Create Session: books a \"Background Check\" purpose Session__c linked to\n\
+    \  this record and the candidate.\n\nAPEX / TRIGGERS: none - no Apex class in\
+    \ the org references this object.\nThe only external touchpoint is the DocuSign\
+    \ eSignature managed package."
+- title: Background_Check_Employment__c — What This Object Is
+  keywords:
+  - background
+  - check
+  - employment
+  text: 'Background_Check_Employment__c is ONE past employer/project of a candidate
+
+    that must be verified as part of a Background Check. When the candidate
+
+    submits their employment history, each employer (or client project) becomes
+
+    one child record under the parent Background_Check__c: the employer and
+
+    project names, the employment dates, up to three named references with
+
+    contact details, and the per-employer verification outcome. The team calls
+
+    these rows "projects" - the auto-number label is "Background Check Project
+
+    ID", the child relationship is "Background_Check_Projects", and the parent''s
+
+    rollup is "Background Check Project Count".'
+- title: Background_Check_Employment__c — Kind Of Object
+  keywords:
+  - background
+  - check
+  - employment
+  text: "- Custom object, part of the post-offer / verification domain.\n- MASTER-DETAIL\
+    \ CHILD OF Background_Check__c: every row MUST belong to a\n  background check;\
+    \ sharing is Controlled By Parent (whoever can see the\n  background check sees\
+    \ its employments); no owner of its own.\n- Auto-number Name \"BGC-{00000}\"\
+    \ (label \"Background Check Project ID\");\n  field history tracking is enabled.\n\
+    - 21 custom fields, 0 record types, 0 validation rules, 0 list views.\n- Scale:\
+    \ only 8 records in preprod (created 2026-06-08 to 2026-07-01),\n  spread across\
+    \ 6 parent background checks."
+- title: Background_Check_Employment__c — Record Types
+  keywords:
+  - background
+  - check
+  - employment
+  text: 'None. Every employment/project row is the same shape regardless of employer
+
+    type or verification method.'
+- title: Background_Check_Employment__c — How It Is Used — The Business Process
+  keywords:
+  - background
+  - check
+  - employment
+  text: "STEP 1 - ENTRY. When the parent Background Check reaches \"Candidate Details\n\
+    \  Pending\", the candidate's employment history is captured: the QA member\n\
+    \  (or whoever collects the details) creates one record per employer/project\n\
+    \  from the \"Background Check Projects\" related list on the parent record\n\
+    \  page, filling employer name, project name and start/end dates. There is\n\
+    \  no flow or form automation - this is plain manual data entry.\n\nSTEP 2 -\
+    \ THE PARENT GATE. The parent's rollup (Background Check Project\n  Count) counts\
+    \ these rows; the parent validation prevents setting Candidate\n  Details Status\
+    \ to \"Submitted\" while the count is 0 - i.e. a background\n  check cannot\
+    \ claim \"details submitted\" with no employment history entered.\n\nSTEP 3\
+    \ - VERIFICATION. During \"Verification In Progress\" the verifier works\n \
+    \ each row: contacts the employer and/or the listed references, records what\n\
+    \  happened in Verification Notes, ticks Employer Confirmed when the employer\n\
+    \  vouches for the employment, and sets the row's Verification Status to\n \
+    \ Verified or Unable to Verify. Reference fields (3 slots of name /\n  designation\
+    \ / email / phone) hold who was contacted - though in practice\n  they have\
+    \ not been filled in yet on any record."
+- title: Background_Check_Employment__c — How It Is Used — The Business Process
+    (2)
+  keywords:
+  - background
+  - check
+  - employment
+  text: "STEP 4 - ROLLING UP TO THE PARENT. There is NO automation that aggregates\n\
+    \  the child outcomes - the QA member manually sets the parent's overall\n \
+    \ Verification Status to \"Completed\" once every row is resolved, then\n  obtains\
+    \ the final employer confirmation and completes the background\n  check."
+- title: Background_Check_Employment__c — Connected Objects
+  keywords:
+  - background
+  - check
+  - employment
+  - each
+  - relationship
+  - means
+  text: "PARENT:\n- Background_Check__c (via Background_Check__c, MASTER-DETAIL,\
+    \ required,\n  100% populated; relationship name \"Background_Check_Projects\"\
+    ). The\n  background check this employment row belongs to. The parent's Background\n\
+    \  Check Project Count rollup counts these rows and feeds the parent's\n  stage-gate\
+    \ validation. Sharing and deletion cascade from the parent.\n\nNo other object\
+    \ looks up to Background_Check_Employment__c, and it has no\nother outbound\
+    \ relationships - it is a pure detail table."
+- title: Background_Check_Employment__c — Business Rules
+  keywords:
+  - background
+  - check
+  - employment
+  - validation
+  text: 'None. There are no validation rules on this object itself - the only rule
+
+    involving it lives on the PARENT (a Background Check''s Candidate Details
+
+    cannot be marked "Submitted" while this object''s rollup count is zero).'
+- title: Background_Check_Employment__c — Automation
+  keywords:
+  - background
+  - check
+  - employment
+  - runs
+  text: 'None. No flow, Apex trigger, Apex class or quick action in the org creates,
+
+    updates or reads Background_Check_Employment__c - everything on it is manual
+
+    data entry through the parent''s related list. Its only automated footprint
+
+    is the parent''s rollup count (a platform rollup, not a flow) and field
+
+    history tracking.'
+- title: Employee_Leave__c — What This Object Is
+  keywords:
+  - employee
+  - leave
+  text: 'Employee_Leave__c records ONE leave/absence request by a Techsara internal
+
+    employee (a Recruiter__c / "Employee" record - NOT a candidate). One record
+    =
+
+    one leave request: a full-day range (e.g. Aug 10-12) or a partial day (first
+
+    half, second half, or a custom time range on a single date). The record moves
+
+    through a request -> manager approval workflow, and an approved leave shows
+    up
+
+    as an "Out of Office" event on the Salesforce calendar so the rest of the team
+
+    can see the person is unavailable.
+
+
+    Why the org cares: internal-staff availability is load-bearing here - support
+
+    persons are assigned to candidate interviews (by the COMPASS AI engine) and
+
+    trainers run sessions. A leave record is the formal trail of "this employee
+    is
+
+    not available on these days". Today the visible availability signal is the
+
+    calendar event the leave creates; a direct feed from this object into the
+
+    COMPASS availability logic is not confirmed in metadata (verify with team).
+
+
+    The object is clearly built in two phases: the REQUEST + MANAGER APPROVAL
+
+    part is live (flows, quick actions, portal navigation), while a larger HR
+
+    POLICY layer (HR approver, notice-period compliance, PTO/sick-leave balance
+
+    snapshots, paid/unpaid day splits, supporting documents) exists as fields
+
+    only - no automation fills them and they are hidden from the main profile.
+
+    Treat those as "designed for a future HR phase, not yet wired".'
+- title: Employee_Leave__c — Kind Of Object
+  keywords:
+  - employee
+  - leave
+  text: "- Custom object, part of the internal-staff (HR/operations) domain.\n-\
+    \ STANDALONE object with its own Owner - not a child of anything. Sharing is\n\
+    \  Public Read/Write for both internal and external (portal) users, so any\n\
+    \  employee who can use the object can see everyone's leave records. (Worth\n\
+    \  revisiting in the role-hierarchy/security redesign.)\n- 37 custom fields,\
+    \ 0 record types, 0 validation rules, 1 list view (\"All\").\n- Auto-number\
+    \ Name in the format A-XXXX (e.g. A-0147).\n- Field history tracking is ON;\
+    \ reports are DISABLED for this object (it\n  cannot be used as a report primary\
+    \ object); Chatter feeds off.\n- Surfaced in three places: an \"Employee Leave\"\
+    \ tab in the Techsara Solutions\n  app, an \"Employee Leave\" item (position\
+    \ 6) in the AIC Portal site\n  navigation, and an \"Employee Leaves\" related\
+    \ list on the Employee\n  (Recruiter__c) record page.\n- Access is granted by\
+    \ PROFILES (e.g. the AIC Portal profile has Create/Read/\n  Edit, no Delete),\
+    \ not by the department permission sets - none of them\n  mention this object.\n\
+    - Scale: only 18 records in preprod, all created in early Aug 2026 - this is\n\
+    \  a feature under active build/test, not yet in production-scale use."
+- title: Employee_Leave__c — Record Types
+  keywords:
+  - employee
+  - leave
+  text: 'None. Every leave request uses the same single flavor; the Leave_Type__c
+
+    picklist (PTO, Sick, Marriage...) carries the classification instead.'
+- title: Employee_Leave__c — How It Is Used — The Business Process
+  keywords:
+  - employee
+  - leave
+  text: "STEP 1 - EMPLOYEE REQUESTS LEAVE. On the employee's own Recruiter__c\n\
+    \  (\"Employee\") record, the \"Create Leave Request\" button launches the\n\
+    \  Request_Leave screen flow. One screen collects: Leave Type, a Full Day\n\
+    \  checkbox, then either Start Date + End Date (full day - with a read-only\n\
+    \  \"No. Of Leave Days\" counter) or a single Leave Date + Partial Day Type\
+    \ +\n  Start Time + End Time (partial day), plus a required free-text Leave\n\
+    \  Reason. The flow validates that End Time is after Start Time (on-screen\n\
+    \  error, not a validation rule), computes Start/End DateTime values, stamps\n\
+    \  Requested_On with the current date/time, links Employee__c to the record\n\
+    \  the button was clicked on, and saves the leave with Status = \"Submitted\"\
+    .\n\nSTEP 2 - TENTATIVE CALENDAR EVENT. The moment a leave is created with Status\n\
+    \  \"Submitted\" (and no event yet), the Tentative_calendar_Event flow creates\
+    \ a\n  Salesforce Event: subject \"LV-\" + the leave's auto-number name, description\n\
+    \  = reason + status + employee name, start/end from the leave's DateTime\n\
+    \  fields, all-day if Is_Full_Day, Show-As = \"Tentative\". The Event carries\
+    \ an\n  Employee_Leave__c lookup back to the leave, and the Event's id is written\n\
+    \  into Leave_Event_Id__c. The pending leave is now visible on the calendar\
+    \ as\n  tentative time off."
+- title: Employee_Leave__c — How It Is Used — The Business Process (2)
+  keywords:
+  - employee
+  - leave
+  text: "STEP 3 - MANAGER DECISION. On the leave record, the \"Manager Decision\"\
+    \ button\n  launches the Manager_Decision screen flow. The flow is gated: it\
+    \ looks up\n  the employee's Assigned Sr Recruiter (the manager on the Recruiter__c\n\
+    \  record) and compares that manager's linked User to the logged-in user. Any\n\
+    \  other user gets a stop screen (\"Only the manager approved the leave\n  request.\"\
+    ). The manager picks the decision on a Status screen:\n  - Approved: Status\
+    \ -> \"Approved\", Manager_Approved_On stamped with now,\n    any old Rejection_Reason\
+    \ cleared.\n  - Rejected: a second screen collects the Rejection Reason; Status\
+    \ ->\n    \"Rejected\", Manager_Approved_On and Leave_Event_Id cleared.\n\n\
+    STEP 4 - CALENDAR SYNC ON THE DECISION. The Leave_Event_Sync flow fires when\n\
+    \  Status becomes Approved, Rejected or Cancelled: Approved flips the linked\n\
+    \  calendar Event's Show-As from \"Tentative\" to \"Out of Office\" (the firm\n\
+    \  unavailability signal); Rejected or Cancelled DELETES the calendar Event\
+    \ so\n  the time frees up. The leave record itself stays as the audit trail."
+- title: Employee_Leave__c — How It Is Used — The Business Process (3)
+  keywords:
+  - employee
+  - leave
+  text: "STEP 5 (DESIGNED, NOT WIRED) - HR REVIEW AND PAYROLL MATH. The field model\n\
+    \  anticipates a second approval lane: flags for \"HR approval required\" and\n\
+    \  why (late request, insufficient balance, special leave, comp-off), an HR\n\
+    \  approver + timestamp, notice-period given-vs-required with an On Time/Late\n\
+    \  verdict, PTO and sick-leave balance snapshots at request time, and a paid/\n\
+    \  unpaid day split for payroll. The Status picklist even has \"Manager\n  Approved\"\
+    , \"HR Review Required\", \"Planned\", \"Draft\" and \"Completed\" values.\n\
+    \  NONE of this is populated by any current flow or Apex, the fields are not\n\
+    \  on the page layout, and the AIC Portal profile hides them (verify roadmap\n\
+    \  with team before relying on them).\n\nNOTE ON THE DATA: the 18 records currently\
+    \ in preprod do NOT look like they\ncame through the Request_Leave flow - Start/End\
+    \ DateTime, Leave_Event_Id and\nManager_Approved_On are empty on all of them,\
+    \ while fields no flow sets\n(Leave_Year, Total_Days) are filled. They appear\
+    \ to be hand-loaded test data.\nEarlier test cycles (Jan-Jun 2026) created ~130\
+    \ leave records that were later\ndeleted, leaving 115 orphaned \"LV-...\" calendar\
+    \ events behind."
+- title: Employee_Leave__c — Connected Objects
+  keywords:
+  - employee
+  - leave
+  - each
+  - relationship
+  - means
+  text: "LOOKUPS FROM EMPLOYEE LEAVE TO OTHER OBJECTS:\n- Recruiter__c / \"Employee\"\
+    \ (Employee__c): THE employee taking the leave.\n  Required in practice (100%\
+    \ populated), set by the Request_Leave flow from\n  the Employee record the\
+    \ button was clicked on. The Employee record page\n  shows all of a person's\
+    \ leaves in the \"Employee Leaves\" related list.\n- Recruiter__c / \"Employee\"\
+    \ (HR_Approver__c): the HR person who signed off -\n  part of the unwired HR\
+    \ phase, never populated.\n- Employee standard object (Manager_Approver__c):\
+    \ the approving manager.\n  CAUTION: this lookup points at Salesforce's STANDARD\
+    \ \"Employee\" object (a\n  Work.com-era object), NOT Recruiter__c, and it is\
+    \ not even queryable via\n  SOQL in this org (\"Invalid field\" error) - effectively\
+    \ broken/unusable.\n  The real manager gate in the Manager_Decision flow uses\
+    \ the employee's\n  Assigned_Sr_Recruiter__c from the Recruiter__c record instead.\n\
+    - Employee standard object (Requested_By__c): same problem - points at the\n\
+    \  standard Employee object, not queryable, unused. The real \"who asked\" info\n\
+    \  lives in Employee__c + Requested_On__c + CreatedById."
+- title: Employee_Leave__c — Connected Objects (2)
+  keywords:
+  - employee
+  - leave
+  - each
+  - relationship
+  - means
+  text: "OBJECTS THAT POINT AT EMPLOYEE LEAVE:\n- Event / Activity (Activity.Employee_Leave__c\
+    \ lookup): the calendar event\n  representing this leave (\"LV-<name>\", Tentative\
+    \ or Out of Office). Created\n  by the Tentative_calendar_Event flow, retargeted/deleted\
+    \ by\n  Leave_Event_Sync. The layout shows an Activities related list. In data\n\
+    \  there are 115 such events - all orphans from deleted test leaves.\n\nNON-RELATIONSHIPS\
+    \ WORTH KNOWING:\n- No link to Interview__c, Session__c or Case: leave does\
+    \ not automatically\n  block or reshuffle a support person's interviews - any\
+    \ such coordination is\n  manual or inside the external COMPASS engine (not\
+    \ confirmed).\n- Recruiter__c's own On_Leave_Today__c / Leave_Start_Date_Time__c\
+    \ /\n  Leave_End_Date_Time__c fields are NOT written by the leave flows - nothing\n\
+    \  in the org connects them to this object today."
+- title: Employee_Leave__c — Business Rules
+  keywords:
+  - employee
+  - leave
+  - validation
+  text: 'None. The object has no validation rules; the guardrails live inside the
+
+    screen flows instead (End Time must be after Start Time; only the employee''s
+
+    manager may run the Manager Decision flow).'
+- title: Employee_Leave__c — Automation
+  keywords:
+  - employee
+  - leave
+  - runs
+  text: "SCREEN FLOWS / BUTTONS:\n- Request_Leave (\"Create Leave Request\" button\
+    \ on the Recruiter__c /\n  Employee page layout): the entry point - collects\
+    \ the request and creates\n  the leave with Status \"Submitted\" (see step 1).\
+    \ Marked as requiring\n  explicit flow access to run.\n- Manager_Decision (\"\
+    Manager Decision\" button on the Employee Leave page\n  layout): manager-only\
+    \ approve/reject with the identity gate described in\n  step 3. Also requires\
+    \ explicit flow access.\n\nRECORD-TRIGGERED FLOWS (both active):\n- Tentative_calendar_Event\
+    \ (after save, on create; only when Status =\n  \"Submitted\" and Leave_Event_Id\
+    \ is empty): creates the Tentative calendar\n  Event and writes its id back\
+    \ to Leave_Event_Id__c.\n- Leave_Event_Sync (after save, create + update; only\
+    \ when Status = Approved,\n  Rejected or Cancelled): Approved -> linked Event\
+    \ Show-As becomes \"Out of\n  Office\"; Rejected/Cancelled -> linked Event deleted.\n\
+    \nAPEX / SCHEDULED JOBS / EXTERNAL WRITERS: none. No Apex class references this\n\
+    object, and no integration writes to it (unlike most of the org's objects)."

@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Result_Reminder_Count__c</fullName>
+    <defaultValue>0</defaultValue>
+    <description>How many reminder emails have been sent to the interviewer to record the mock&apos;s Human_Decision. 0 = none, 1 = first sent (interviewer only, at mock end + 4 hours), 2 = second sent (interviewer + assigned trainer, at mock end + 7 hours). Cap at 2. Populated by MockDeadlineEnforcer.sendResultReminders.</description>
+    <externalId>false</externalId>
+    <inlineHelpText>Number of result-reminder emails sent (0, 1, or 2). Auto-managed by MockDeadlineEnforcer.</inlineHelpText>
+    <label>Result Reminder Count</label>
+    <precision>1</precision>
+    <required>false</required>
+    <scale>0</scale>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Number</type>
+    <unique>false</unique>
+</CustomField>

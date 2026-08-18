@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ValidationRule xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Require_Host_Feedback_On_Complete</fullName>
+    <active>true</active>
+    <description>Blocks saving Status = Completed unless Host_Feedback__c is populated. Trainer must record outcome before closing the session.</description>
+    <errorConditionFormula>AND(
+    ISPICKVAL(Status__c, &quot;Completed&quot;),
+    ISBLANK(Host_Feedback__c)
+)</errorConditionFormula>
+    <errorDisplayField>Host_Feedback__c</errorDisplayField>
+    <errorMessage>Host Feedback is required before marking the session Completed.</errorMessage>
+</ValidationRule>

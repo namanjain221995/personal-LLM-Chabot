@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Status_Reason__c</fullName>
+    <label>Outcome Reason</label>
+    <required>false</required>
+    <trackHistory>true</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Picklist</type>
+    <valueSet>
+        <controllingField>Interview_Outcome__c</controllingField>
+        <valueSetDefinition>
+            <sorted>false</sorted>
+            <value>
+                <fullName>Candidate Issue</fullName>
+                <default>false</default>
+                <label>Candidate Issue</label>
+            </value>
+            <value>
+                <fullName>Support Issue</fullName>
+                <default>false</default>
+                <label>Support Issue</label>
+            </value>
+            <value>
+                <fullName>Network Issue</fullName>
+                <default>false</default>
+                <label>Network Issue</label>
+            </value>
+            <value>
+                <fullName>AI Issue</fullName>
+                <default>false</default>
+                <label>AI Issue</label>
+            </value>
+            <value>
+                <fullName>Company Issue</fullName>
+                <default>false</default>
+                <label>Company Issue</label>
+            </value>
+            <value>
+                <fullName>Work Auth/Visa Mismatch</fullName>
+                <default>false</default>
+                <label>Work Auth/Visa Mismatch</label>
+            </value>
+            <value>
+                <fullName>NA</fullName>
+                <default>false</default>
+                <label>NA</label>
+            </value>
+        </valueSetDefinition>
+        <valueSettings>
+            <controllingFieldValue>Rejected</controllingFieldValue>
+            <controllingFieldValue>Ghosted</controllingFieldValue>
+            <controllingFieldValue>Reference Check</controllingFieldValue>
+            <valueName>Candidate Issue</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>Rejected</controllingFieldValue>
+            <controllingFieldValue>Ghosted</controllingFieldValue>
+            <controllingFieldValue>Reference Check</controllingFieldValue>
+            <valueName>Support Issue</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>Rejected</controllingFieldValue>
+            <controllingFieldValue>Ghosted</controllingFieldValue>
+            <controllingFieldValue>Reference Check</controllingFieldValue>
+            <valueName>Network Issue</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>Rejected</controllingFieldValue>
+            <controllingFieldValue>Reference Check</controllingFieldValue>
+            <valueName>AI Issue</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>Rejected</controllingFieldValue>
+            <controllingFieldValue>Ghosted</controllingFieldValue>
+            <controllingFieldValue>Reference Check</controllingFieldValue>
+            <valueName>Company Issue</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>Rejected</controllingFieldValue>
+            <valueName>Work Auth/Visa Mismatch</valueName>
+        </valueSettings>
+    </valueSet>
+</CustomField>

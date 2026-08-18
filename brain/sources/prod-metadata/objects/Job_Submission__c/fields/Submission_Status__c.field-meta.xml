@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Submission_Status__c</fullName>
+    <description>Current status of this candidate submission in the pipeline. Updated manually by AM and automatically by Interview Outcome Sync flow.</description>
+    <inlineHelpText>Suggested by Team = internal suggestion. Pending AM Review = waiting for AM. Submitted to Client = AM approved and sent. Placed = candidate started.</inlineHelpText>
+    <label>Submission Status</label>
+    <required>false</required>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Picklist</type>
+    <valueSet>
+        <restricted>true</restricted>
+        <valueSetDefinition>
+            <sorted>false</sorted>
+            <value>
+                <fullName>Pending AM Review</fullName>
+                <default>true</default>
+                <label>Pending AM Review</label>
+            </value>
+            <value>
+                <fullName>Approved</fullName>
+                <default>false</default>
+                <label>Approved</label>
+            </value>
+            <value>
+                <fullName>Submitted to Client</fullName>
+                <default>false</default>
+                <label>Submitted to Client</label>
+            </value>
+            <value>
+                <fullName>Client Shortlisted</fullName>
+                <default>false</default>
+                <label>Shortlisted for Interview</label>
+            </value>
+            <value>
+                <fullName>Interview Scheduled</fullName>
+                <default>false</default>
+                <label>Interview Scheduled</label>
+            </value>
+            <value>
+                <fullName>Interview Completed</fullName>
+                <default>false</default>
+                <label>Interview Completed</label>
+            </value>
+            <value>
+                <fullName>Shortlisted for Next Round</fullName>
+                <default>false</default>
+                <label>Shortlisted for Next Round</label>
+            </value>
+            <value>
+                <fullName>Rejected</fullName>
+                <default>false</default>
+                <label>Rejected</label>
+            </value>
+            <value>
+                <fullName>Offer Received</fullName>
+                <default>false</default>
+                <label>Offer Received</label>
+            </value>
+            <value>
+                <fullName>Placed</fullName>
+                <default>false</default>
+                <label>Placed</label>
+            </value>
+            <value>
+                <fullName>Withdrawn</fullName>
+                <default>false</default>
+                <label>Withdrawn</label>
+            </value>
+            <value>
+                <fullName>Suggested by Team</fullName>
+                <default>false</default>
+                <isActive>false</isActive>
+                <label>Suggested by Team</label>
+            </value>
+        </valueSetDefinition>
+    </valueSet>
+</CustomField>

@@ -129,6 +129,23 @@ class Settings:
         self.parquet_dir: str = os.environ.get("PARQUET_DIR", "/data/parquet")
         self.reports_dir: str = os.environ.get("REPORTS_DIR", "/reports")
 
+        # --- The Salesforce brain: knowledge packs the SF team drops in as
+        # files (repo brain/packs, mounted read-only in the container). Rules,
+        # metrics, glossary and prose knowledge flow into every Salesforce-mode
+        # prompt via org_brief; see core/brain.py.
+        self.brain_enabled: bool = _bool("BRAIN_ENABLED", True)
+        self.brain_dir: str = os.environ.get("BRAIN_DIR", "/data/brain")
+        #: Ceiling for the retrieved-knowledge block in one prompt. Prefill on
+        #: the 35B model is ~linear in prompt size; knowledge must stay a
+        #: garnish, not the meal.
+        self.brain_max_chars: int = _int("BRAIN_MAX_CHARS", 4000)
+
+        # --- Learn-from-chat: thumbs-up answers become few-shot SQL examples
+        # for similar future questions (core/learned_examples.py).
+        self.learned_examples_enabled: bool = _bool("LEARNED_EXAMPLES_ENABLED", True)
+        #: How many confirmed examples one prompt may carry.
+        self.learned_examples_k: int = _int("LEARNED_EXAMPLES_K", 2)
+
         # --- Salesforce Lightning links for citations ---
         self.sf_lightning_base_url: str = os.environ.get(
             "SF_LIGHTNING_BASE_URL", "https://techsara.lightning.force.com"
@@ -302,14 +319,22 @@ class Settings:
         _mode = os.environ.get("CHART_TRIGGER_MODE", "explicit").strip().lower()
         self.chart_trigger_mode: str = _mode if _mode in CHART_TRIGGER_MODES else "explicit"
 
-        # Confirm the reading before answering a Salesforce question.
-        #   always    — every question gets a one-click confirmation (owner's
-        #               choice: a wrong reading is far cheaper to catch before
-        #               a number exists than after)
-        #   ambiguous — only when the question has more than one honest
-        #               reading, e.g. "failed the mock" in a slot, which
+        # When to ask before answering a Salesforce question.
+        #   ambiguous — the default: only when the question has more than one
+        #               honest reading, e.g. "failed the mock" in a slot, which
         #               returned 7, 20 and 0 on three runs of one sentence
-        #   off       — answer straight away
+        #   always    — LOWER THE BAR, as a bias on the planner. It used to bolt
+        #               a content-free "have I read this right?" card onto every
+        #               Salesforce question; that card could not be answered
+        #               without re-reading your own sentence, and because its
+        #               own option labels contained the words its detectors
+        #               matched on, answering it asked it again. Expressed as a
+        #               bias it says the same thing where it can act on it, and
+        #               the planner still needs two genuinely different readings
+        #               to offer — so the mode can no longer produce a question
+        #               with nothing in it.
+        #   off       — never ask. Context resolution still runs, so follow-ups
+        #               keep working; the assistant states its assumptions.
         _clar = os.environ.get("CLARIFY_MODE", "ambiguous").strip().lower()
         self.clarify_mode: str = (
             _clar if _clar in ("always", "ambiguous", "off") else "ambiguous"

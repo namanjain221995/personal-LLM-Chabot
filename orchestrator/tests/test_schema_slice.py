@@ -8,8 +8,22 @@ intermittently spent the whole budget reasoning and returned NOTHING, which the
 engine read as "not in the warehouse" and sent to live Salesforce, which
 answered off the wrong object. Every wrong answer of that shape starts here.
 """
+import pytest
+
 from app.core import org_brief as ob
+from app.core import sf_dictionary as _sd
 from app.core.schema_cache import format_schema, relevant_schema
+
+
+@pytest.fixture(autouse=True)
+def _restore_dictionary_cache():
+    """`sf_dictionary.save()` sets a MODULE-LEVEL cache, so a test that swaps in
+    a two-object fake dictionary leaves it there for every test that runs
+    afterwards — which is how eight unrelated Salesforce tests started failing
+    in the full suite while passing on their own."""
+    before = _sd._cache
+    yield
+    _sd._cache = before
 
 # A miniature warehouse with the shapes that matter: a wide standard object,
 # the tables a training question needs, a shadow, and unrelated noise.
@@ -130,10 +144,81 @@ def test_the_model_is_told_how_the_tables_join():
     assert "silently match zero rows" in m
 
 
-def test_the_join_map_only_lists_edges_between_tables_actually_sent():
+def _joinmap_dictionary():
+    """A dictionary with one edge INSIDE the given slice and one leaving it."""
     from app.core import sf_dictionary as sd
 
-    assert "Cohort__c" not in sd.join_map(["Internal_Interview__c", "Session__c"])
+    sd.save({"objects": {
+        "Internal_Interview__c": {"api": "Internal_Interview__c", "label": "Mock",
+            "fields": [
+                {"api": "Session__c", "label": "Session", "type": "reference",
+                 "ref": ["Session__c"]},
+                {"api": "Candidate_Training__c", "label": "Training",
+                 "type": "reference", "ref": ["Candidate_Training__c"]},
+            ]},
+        "Session__c": {"api": "Session__c", "label": "Session", "fields": []},
+        "Candidate_Training__c": {"api": "Candidate_Training__c", "label": "Training",
+            "fields": [{"api": "Name", "label": "Name", "type": "string"}]},
+    }}, "/tmp/joinmap-slice.json")
+    return sd
+
+
+def test_an_edge_to_a_table_outside_the_slice_is_still_offered():
+    """Withholding an edge is not a neutral omission — it reads as "that join
+    does not exist", because this block also says a join not listed here
+    matches zero rows.
+
+    The real failure: asked how many internal interviews five named staff had
+    completed, the slice held Internal_Interview__c but not Recruiter__c, so
+    `Internal_Interview__c.Interviewer__c = Recruiter__c.Id` was suppressed.
+    The model joined the interviewer to Account instead — which Account's own
+    'Recruiter' record type makes look right — matched nothing, and reported
+    that those people had no interviews. They had 84.
+    """
+    sd = _joinmap_dictionary()
+
+    m = sd.join_map(["Internal_Interview__c", "Session__c"])
+    # The target is outside the slice, and is offered anyway...
+    assert "Internal_Interview__c.Candidate_Training__c = Candidate_Training__c.Id" in m
+    # ...flagged as such, so the model knows its columns are not shown...
+    assert "NOT listed above" in m
+    # ...with the columns you would actually filter it by.
+    assert "legend" in m
+    # An edge that does not exist is still never offered.
+    assert "Internal_Interview__c.Session__c = Cohort__c.Id" not in m
+
+
+def test_the_identifying_columns_of_an_outside_table_are_named():
+    """Naming a table without saying how to recognise a row of it invites the
+    same class of bug: the model knows the join exists, guesses
+    `Recruiter_Name__c` for the filter, and matches nothing."""
+    from app.core import sf_dictionary as sd
+
+    sd.save({"objects": {
+        "Internal_Interview__c": {"api": "Internal_Interview__c", "label": "Mock",
+            "fields": [{"api": "Interviewer__c", "label": "Interviewer",
+                        "type": "reference", "ref": ["Recruiter__c"]}]},
+        "Recruiter__c": {"api": "Recruiter__c", "label": "Employee", "fields": [
+            {"api": "Name", "label": "Name", "type": "string"},
+            {"api": "First_Name__c", "label": "First", "type": "string"},
+            {"api": "Last_Name__c", "label": "Last", "type": "string"},
+        ]},
+    }}, "/tmp/joinmap-outside.json")
+
+    m = sd.join_map(["Internal_Interview__c"])
+    assert "Internal_Interview__c.Interviewer__c = Recruiter__c.Id" in m
+    assert "Recruiter__c (Name, First_Name__c, Last_Name__c)" in m
+
+
+def test_the_join_map_no_longer_claims_to_be_exhaustive():
+    """It used to say "these are the ONLY valid joins between the tables
+    above" while silently dropping every edge that left the slice — a false
+    statement that licensed the model to invent the missing one."""
+    sd = _joinmap_dictionary()
+
+    m = sd.join_map(["Internal_Interview__c", "Session__c"])
+    assert "only valid joins" not in m
+    assert "silently match zero rows" in m
 
 
 def test_sql_generation_does_not_run_the_reasoning_pass():

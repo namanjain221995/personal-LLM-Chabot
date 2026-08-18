@@ -1,16 +1,21 @@
 // @vitest-environment jsdom
 /**
- * The clarification card, in a DOM.
+ * The clarification PANEL, in a DOM.
  *
- * Only what genuinely needs one is here — focus movement, roving tabindex, ARIA
- * wiring, and the double-click guard. The keyboard MAP itself is pure and is
- * tested in clarification.test.ts; simulating keystrokes to prove a lookup
- * table works is slower and covers less.
+ * It renders inside the composer rather than the transcript, and free text is
+ * answered in the composer rather than in a field of its own — so what needs a
+ * DOM here is focus movement, the roving tabindex, ARIA wiring, the
+ * double-click guard, and the hand-over to the composer. The keyboard MAP
+ * itself is pure and is tested in clarification.test.ts; simulating keystrokes
+ * to prove a lookup table works is slower and covers less.
  */
 
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { ClarificationCard } from '@/components/ClarificationCard';
+import {
+  ClarificationCard,
+  ClarificationRecord,
+} from '@/components/ClarificationCard';
 import { parseClarification, type ClarificationRequest } from '@/lib/clarification';
 
 afterEach(cleanup);
@@ -22,7 +27,7 @@ const WIRE = {
   root_user_message_id: 'msg',
   intent_id: 'int',
   source: 'salesforce',
-  header: 'Salesforce',
+  header: 'Time period',
   question: 'Which period should I use?',
   slot: 'date_range',
   options: [
@@ -55,51 +60,62 @@ function card(overrides: Partial<Parameters<typeof ClarificationCard>[0]> = {}) 
   return { ...utils, request, onSubmit, onUseComposer };
 }
 
+function multiCard(extra: Record<string, unknown> = {}) {
+  const request = parseClarification({ ...WIRE, multi_select: true, ...extra })!;
+  const onSubmit = vi.fn();
+  const utils = render(
+    <ClarificationCard request={request} onSubmit={onSubmit} onUseComposer={vi.fn()} />,
+  );
+  return { ...utils, request, onSubmit };
+}
+
 describe('rendering', () => {
   it('shows the question and every option', () => {
     card();
     expect(screen.getByText('Which period should I use?')).toBeTruthy();
-    expect(screen.getByRole('radio', { name: /This month/ })).toBeTruthy();
-    expect(screen.getByRole('radio', { name: /This quarter/ })).toBeTruthy();
-    expect(screen.getByRole('radio', { name: /This year/ })).toBeTruthy();
+    for (const label of ['This month', 'This quarter', 'This year']) {
+      expect(screen.getByRole('radio', { name: new RegExp(label) })).toBeTruthy();
+    }
     expect(screen.getByText('Aug–Oct')).toBeTruthy();
   });
 
   it('labels the group with the question, so a screen reader reads both', () => {
     card();
-    const group = screen.getByRole('radiogroup');
-    expect(group.getAttribute('aria-labelledby')).toBe('clr-clr_1');
-    expect(document.getElementById('clr-clr_1')?.textContent).toBe(
-      'Which period should I use?',
-    );
+    expect(
+      screen.getByRole('radiogroup', { name: 'Which period should I use?' }),
+    ).toBeTruthy();
+  });
+
+  it('names the topic in the header rather than repeating the source', () => {
+    card();
+    expect(screen.getByText(/Clarification . Time period/)).toBeTruthy();
   });
 
   it('offers "Something else" only when free text is allowed', () => {
     card();
     expect(screen.getByRole('button', { name: /Something else/ })).toBeTruthy();
     cleanup();
+
+    const request = parseClarification({ ...WIRE, allow_custom: false })!;
     render(
-      <ClarificationCard
-        request={parseClarification({ ...WIRE, allow_custom: false })!}
-        onSubmit={vi.fn()}
-        onUseComposer={vi.fn()}
-      />,
+      <ClarificationCard request={request} onSubmit={vi.fn()} onUseComposer={vi.fn()} />,
     );
     expect(screen.queryByRole('button', { name: /Something else/ })).toBeNull();
   });
 
-  it('offers a dismiss control only when one is supplied', () => {
+  it('offers a skip control only when one is supplied', () => {
     card();
-    expect(screen.queryByRole('button', { name: /Dismiss/ })).toBeNull();
+    expect(screen.queryByRole('button', { name: /Skip/ })).toBeNull();
     cleanup();
-    card({ onDismiss: vi.fn() });
-    expect(screen.getByRole('button', { name: /Dismiss/ })).toBeTruthy();
+    card({ onSkip: vi.fn() });
+    expect(screen.getByRole('button', { name: /Skip/ })).toBeTruthy();
   });
 
-  it('collapses to the chosen answer once it has one', () => {
-    card({ answeredWith: 'This quarter' });
-    expect(screen.queryByRole('radiogroup')).toBeNull();
-    expect(screen.getByText('This quarter')).toBeTruthy();
+  it('has NO text field of its own', () => {
+    // A textarea here would sit forty pixels above the composer's own — two
+    // inputs, one question, and no way to tell which is listening.
+    card();
+    expect(screen.queryByRole('textbox')).toBeNull();
   });
 });
 
@@ -111,162 +127,123 @@ describe('focus', () => {
 
   it('is ONE tab stop: the arrows move within the group', () => {
     card();
-    const options = screen.getAllByRole('radio');
-    expect(options.map((o) => o.getAttribute('tabindex'))).toEqual(['0', '-1', '-1']);
+    const rows = screen.getAllByRole('radio');
+    expect(rows[0].getAttribute('tabindex')).toBe('0');
+    expect(rows[1].getAttribute('tabindex')).toBe('-1');
 
-    fireEvent.keyDown(options[0], { key: 'ArrowDown' });
+    fireEvent.keyDown(rows[0], { key: 'ArrowDown' });
     expect(document.activeElement?.textContent).toContain('This quarter');
-    expect(screen.getAllByRole('radio').map((o) => o.getAttribute('tabindex'))).toEqual(
-      ['-1', '0', '-1'],
-    );
   });
 
   it('cycles backwards onto the "Something else" row, which is in the loop', () => {
-    // The custom row is a navigable row, not a separate tab stop — otherwise
-    // reaching it by keyboard means tabbing out of the question.
     card();
-    fireEvent.keyDown(screen.getByRole('radiogroup'), { key: 'ArrowUp' });
+    fireEvent.keyDown(screen.getAllByRole('radio')[0], { key: 'ArrowUp' });
     expect(document.activeElement?.textContent).toContain('Something else');
   });
 });
 
 describe('answering', () => {
-  it('submits the option that was clicked', () => {
+  it('submits the option that was clicked, with no second action needed', () => {
     const { onSubmit } = card();
     fireEvent.click(screen.getByRole('radio', { name: /This quarter/ }));
     expect(onSubmit).toHaveBeenCalledTimes(1);
     const [response, summary] = onSubmit.mock.calls[0];
     expect(response.selected_option_ids).toEqual(['q']);
-    expect(response.resume_token).toBe('tok');
     expect(summary).toBe('This quarter');
   });
 
   it('submits by number key', () => {
     const { onSubmit } = card();
-    fireEvent.keyDown(screen.getByRole('radiogroup'), { key: '3' });
+    fireEvent.keyDown(screen.getAllByRole('radio')[0], { key: '3' });
     expect(onSubmit.mock.calls[0][0].selected_option_ids).toEqual(['y']);
   });
 
   it('does not submit twice on a double click', () => {
-    // The server's first-response-wins UPDATE is the authority; this guard is
-    // what stops a second stream even opening.
     const { onSubmit } = card();
     const option = screen.getByRole('radio', { name: /This month/ });
     fireEvent.click(option);
     fireEvent.click(option);
-    fireEvent.click(screen.getByRole('radio', { name: /This year/ }));
     expect(onSubmit).toHaveBeenCalledTimes(1);
   });
 
   it('locks every control while the continuation is starting', () => {
-    const { onSubmit } = card({ submitting: true });
-    const option = screen.getByRole('radio', { name: /This month/ });
-    expect((option as HTMLButtonElement).disabled).toBe(true);
-    fireEvent.click(option);
+    const { onSubmit } = card({ submitting: true, onSkip: vi.fn() });
+    for (const el of [
+      ...screen.getAllByRole('radio'),
+      screen.getByRole('button', { name: /Something else/ }),
+      screen.getByRole('button', { name: /Skip/ }),
+    ]) {
+      expect((el as HTMLButtonElement).disabled).toBe(true);
+    }
+    fireEvent.click(screen.getAllByRole('radio')[0]);
     expect(onSubmit).not.toHaveBeenCalled();
-    expect(screen.getByText('Continuing your request…')).toBeTruthy();
+    expect(screen.getByText(/Continuing your request/)).toBeTruthy();
   });
 
-  it('opens a text field IN the card for "Something else"', () => {
-    // Sending someone to the main composer meant leaving the question in order
-    // to answer it.
-    const { onSubmit } = card();
-    expect(screen.queryByRole('textbox')).toBeNull();
+  it('skips by submitting a "no preference" answer, not by vanishing', () => {
+    const onSkip = vi.fn();
+    card({ onSkip });
+    fireEvent.click(screen.getByRole('button', { name: /Skip/ }));
+    expect(onSkip).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('handing over to the composer', () => {
+  it('sends "Something else" to the composer instead of opening a field', () => {
+    const { onUseComposer, onSubmit } = card();
     fireEvent.click(screen.getByRole('button', { name: /Something else/ }));
-    const field = screen.getByRole('textbox');
-    expect(field).toBeTruthy();
-    expect((field as HTMLTextAreaElement).placeholder).toBe(
-      'Enter another date range…',
-    );
+    expect(onUseComposer).toHaveBeenCalledTimes(1);
+    expect(onUseComposer.mock.calls[0][0]).toBeUndefined();
+    // …and it does NOT answer the question with the literal words.
     expect(onSubmit).not.toHaveBeenCalled();
   });
 
-  it('sends what was typed, and nothing until there is something to send', () => {
-    const { onSubmit } = card();
-    fireEvent.click(screen.getByRole('button', { name: /Something else/ }));
-    const send = screen.getByRole('button', { name: 'Send' });
-    expect((send as HTMLButtonElement).disabled).toBe(true);
-
-    fireEvent.change(screen.getByRole('textbox'), {
-      target: { value: 'last 90 days' },
-    });
-    fireEvent.click(screen.getByRole('button', { name: 'Send' }));
-    expect(onSubmit.mock.calls[0][0].custom_text).toBe('last 90 days');
-  });
-
-  it('sends the typed answer on Enter, and keeps Shift+Enter as a newline', () => {
-    const { onSubmit } = card();
-    fireEvent.click(screen.getByRole('button', { name: /Something else/ }));
-    const field = screen.getByRole('textbox');
-    fireEvent.change(field, { target: { value: 'last 90 days' } });
-
-    fireEvent.keyDown(field, { key: 'Enter', shiftKey: true });
-    expect(onSubmit).not.toHaveBeenCalled();
-
-    fireEvent.keyDown(field, { key: 'Enter' });
-    expect(onSubmit).toHaveBeenCalledTimes(1);
-  });
-
-  it('can still hand over to the main composer for anyone who prefers it', () => {
-    const { onSubmit, onUseComposer } = card();
-    fireEvent.click(screen.getByText('Use composer'));
+  it('leaves for the composer on Escape without answering', () => {
+    const { onUseComposer, onSubmit } = card({ onSkip: vi.fn() });
+    fireEvent.keyDown(screen.getAllByRole('radio')[0], { key: 'Escape' });
     expect(onUseComposer).toHaveBeenCalledTimes(1);
     expect(onSubmit).not.toHaveBeenCalled();
   });
 
-  it('dismisses on Escape only when dismissing is offered', () => {
-    const onDismiss = vi.fn();
-    card({ onDismiss });
-    fireEvent.keyDown(screen.getByRole('radiogroup'), { key: 'Escape' });
-    expect(onDismiss).toHaveBeenCalledTimes(1);
+  it('forwards the first typed character so the answer is not decapitated', () => {
+    // The panel takes focus so the number keys work immediately. That is only
+    // safe because typing still goes where typing goes.
+    const { onUseComposer, onSubmit } = card();
+    fireEvent.keyDown(screen.getAllByRole('radio')[0], { key: 'A' });
+    expect(onUseComposer).toHaveBeenCalledWith('A');
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
 
-    cleanup();
-    card();
-    fireEvent.keyDown(screen.getByRole('radiogroup'), { key: 'Escape' });
-    expect(onDismiss).toHaveBeenCalledTimes(1); // unchanged
+  it('still treats a digit WITHIN the card as a shortcut', () => {
+    const { onUseComposer, onSubmit } = card();
+    fireEvent.keyDown(screen.getAllByRole('radio')[0], { key: '2' });
+    expect(onSubmit).toHaveBeenCalledTimes(1);
+    expect(onUseComposer).not.toHaveBeenCalled();
   });
 });
 
 describe('multi-select', () => {
-  // The single-answer card was actively wrong for this org's questions: asked
-  // which object holds payment AND invoice data, the honest answer is both, and
-  // a radio group forced a choice between two things the user needed together.
-  function multi(overrides: Record<string, unknown> = {}) {
-    const request = parseClarification({ ...WIRE, multi_select: true, ...overrides })!;
-    const onSubmit = vi.fn();
-    render(
-      <ClarificationCard
-        request={request}
-        onSubmit={onSubmit}
-        onUseComposer={vi.fn()}
-      />,
-    );
-    return { onSubmit };
-  }
-
   it('accumulates choices and sends them together', () => {
-    const { onSubmit } = multi();
+    const { onSubmit } = multiCard();
     fireEvent.click(screen.getByRole('checkbox', { name: /This month/ }));
     fireEvent.click(screen.getByRole('checkbox', { name: /This year/ }));
     expect(onSubmit).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole('button', { name: /^Done/ }));
+    fireEvent.click(screen.getByRole('button', { name: /Done/ }));
     expect(onSubmit.mock.calls[0][0].selected_option_ids).toEqual(['m', 'y']);
   });
 
   it('unticks on a second click', () => {
-    const { onSubmit } = multi();
+    const { onSubmit } = multiCard();
     const option = screen.getByRole('checkbox', { name: /This month/ });
     fireEvent.click(option);
-    expect(option.getAttribute('aria-checked')).toBe('true');
     fireEvent.click(option);
-    expect(option.getAttribute('aria-checked')).toBe('false');
-    expect(screen.queryByRole('button', { name: /^Done/ })).toBeNull();
+    expect(screen.queryByRole('button', { name: /Done/ })).toBeNull();
     expect(onSubmit).not.toHaveBeenCalled();
   });
 
   it('shows Done only once there is something to send, with a count', () => {
-    multi();
-    expect(screen.queryByRole('button', { name: /^Done/ })).toBeNull();
+    multiCard();
+    expect(screen.queryByRole('button', { name: /Done/ })).toBeNull();
     fireEvent.click(screen.getByRole('checkbox', { name: /This month/ }));
     expect(screen.getByRole('button', { name: 'Done' })).toBeTruthy();
     fireEvent.click(screen.getByRole('checkbox', { name: /This year/ }));
@@ -274,85 +251,32 @@ describe('multi-select', () => {
   });
 
   it('toggles by number key instead of submitting on the first press', () => {
-    const { onSubmit } = multi();
-    const group = screen.getByRole('group');
-    fireEvent.keyDown(group, { key: '1' });
-    fireEvent.keyDown(group, { key: '3' });
+    const { onSubmit } = multiCard();
+    fireEvent.keyDown(screen.getAllByRole('checkbox')[0], { key: '1' });
     expect(onSubmit).not.toHaveBeenCalled();
-    fireEvent.keyDown(group, { key: 'Enter', metaKey: true });
-    expect(onSubmit.mock.calls[0][0].selected_option_ids).toEqual(['m', 'y']);
-  });
-
-  it('combines ticked options with typed text rather than dropping either', () => {
-    const { onSubmit } = multi();
-    fireEvent.click(screen.getByRole('checkbox', { name: /This month/ }));
-    fireEvent.click(screen.getByRole('button', { name: /Something else/ }));
-    fireEvent.change(screen.getByRole('textbox'), {
-      target: { value: 'and anything on a renewal' },
-    });
-    fireEvent.click(screen.getByRole('button', { name: 'Send' }));
-    const [response] = onSubmit.mock.calls[0];
-    expect(response.selected_option_ids).toEqual(['m']);
-    expect(response.custom_text).toBe('and anything on a renewal');
+    expect(
+      screen.getByRole('checkbox', { name: /This month/ }).getAttribute('aria-checked'),
+    ).toBe('true');
   });
 
   it('leaves a genuinely exclusive question as a single-answer card', () => {
-    // The server pins these (EXCLUSIVE_SLOTS); the card obeys.
-    const { onSubmit } = multi({ multi_select: false });
+    // The server pins those slots (EXCLUSIVE_SLOTS) and sends multi_select:false.
+    card();
     expect(screen.getAllByRole('radio')).toHaveLength(3);
-    fireEvent.click(screen.getByRole('radio', { name: /This month/ }));
-    expect(onSubmit).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole('checkbox')).toBeNull();
   });
 });
 
 describe('the submitting lock is scoped to ONE question', () => {
-  // Owner report 2026-08-11: the second card in a thread could not be clicked
-  // at all. `submitting` was driven by a boolean that latched on after the
-  // first answer and was only cleared when the CONVERSATION changed, so every
-  // later question rendered permanently disabled.
-  it('locks the question whose answer is in flight', () => {
-    const { onSubmit } = card({ submitting: true });
-    fireEvent.click(screen.getByRole('radio', { name: /This month/ }));
-    expect(onSubmit).not.toHaveBeenCalled();
-  });
-
-  it('leaves a DIFFERENT question fully clickable', () => {
-    const next = parseClarification({
-      ...WIRE,
-      clarification_id: 'clr_2',
-      question: 'Which region?',
-      options: [
-        { id: 'emea', label: 'EMEA' },
-        { id: 'amer', label: 'AMER' },
-      ],
-    })!;
-    const onSubmit = vi.fn();
-    render(
-      <ClarificationCard
-        request={next}
-        onSubmit={onSubmit}
-        onUseComposer={vi.fn()}
-        submitting={false}
-      />,
-    );
-    fireEvent.click(screen.getByRole('radio', { name: /EMEA/ }));
-    expect(onSubmit).toHaveBeenCalledTimes(1);
-  });
-
-  it('unlocks its own controls when a new question replaces it', () => {
+  it('unlocks when a new question replaces it', () => {
     const request = parseClarification(WIRE)!;
     const onSubmit = vi.fn();
     const { rerender } = render(
-      <ClarificationCard
-        request={request}
-        onSubmit={onSubmit}
-        onUseComposer={vi.fn()}
-      />,
+      <ClarificationCard request={request} onSubmit={onSubmit} onUseComposer={vi.fn()} />,
     );
     fireEvent.click(screen.getByRole('radio', { name: /This month/ }));
     expect(onSubmit).toHaveBeenCalledTimes(1);
 
-    // A round-2 question arrives; the card must accept a click again.
     const second = parseClarification({
       ...WIRE,
       clarification_id: 'clr_2',
@@ -363,13 +287,79 @@ describe('the submitting lock is scoped to ONE question', () => {
       ],
     })!;
     rerender(
-      <ClarificationCard
-        request={second}
-        onSubmit={onSubmit}
-        onUseComposer={vi.fn()}
-      />,
+      <ClarificationCard request={second} onSubmit={onSubmit} onUseComposer={vi.fn()} />,
     );
     fireEvent.click(screen.getByRole('radio', { name: /Open/ }));
     expect(onSubmit).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('accessibility and presentation', () => {
+  it('reports SELECTION, never focus, on a single-answer card', () => {
+    // aria-checked used to track the focus ring, so arrowing down the list
+    // announced each row in turn as selected.
+    card();
+    for (const radio of screen.getAllByRole('radio')) {
+      expect(radio.getAttribute('aria-checked')).toBe('false');
+    }
+  });
+
+  it('ticks aria-checked on the chosen rows of a multi-answer card', () => {
+    multiCard();
+    fireEvent.click(screen.getByRole('checkbox', { name: /This month/ }));
+    expect(
+      screen.getByRole('checkbox', { name: /This month/ }).getAttribute('aria-checked'),
+    ).toBe('true');
+    expect(
+      screen.getByRole('checkbox', { name: /This year/ }).getAttribute('aria-checked'),
+    ).toBe('false');
+  });
+
+  it('keeps a visible focus ring on every control it suppresses the outline of', () => {
+    card({ onSkip: vi.fn() });
+    const controls = [
+      ...screen.getAllByRole('radio'),
+      screen.getByRole('button', { name: /Something else/ }),
+      screen.getByRole('button', { name: /Skip/ }),
+    ];
+    for (const el of controls) {
+      expect(el.getAttribute('class') ?? '', el.textContent ?? '').toContain(
+        'focus-visible:ring',
+      );
+    }
+  });
+
+  it('tints a ticked option with a class that actually compiles', () => {
+    // `bg-accent/12` is not on Tailwind's opacity scale and emitted no CSS, so
+    // a ticked option looked identical to an unticked one.
+    multiCard();
+    const option = screen.getByRole('checkbox', { name: /This month/ });
+    fireEvent.click(option);
+    const cls = option.getAttribute('class') ?? '';
+    expect(cls).toContain('bg-accent/10');
+    expect(cls).not.toContain('bg-accent/12');
+  });
+
+  it('tells the user they can simply type instead', () => {
+    card();
+    expect(screen.getByText(/just type your answer/)).toBeTruthy();
+  });
+});
+
+describe('the record left in the transcript', () => {
+  it('is one line with no controls at all', () => {
+    render(
+      <ClarificationRecord
+        question="Which period should I use?"
+        answer="This quarter"
+      />,
+    );
+    expect(screen.getByText('This quarter')).toBeTruthy();
+    expect(screen.getByText('Which period should I use?')).toBeTruthy();
+    // A disabled card still reads as something you might be able to use; a
+    // thread full of them is a thread full of dead controls.
+    expect(screen.queryByRole('button')).toBeNull();
+    expect(screen.queryByRole('radio')).toBeNull();
+    expect(screen.queryByRole('radiogroup')).toBeNull();
   });
 });

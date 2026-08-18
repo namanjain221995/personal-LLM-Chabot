@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Refund_Receipt_Created__c</fullName>
+    <defaultValue>false</defaultValue>
+    <inlineHelpText>Check when the Refund Receipt has been created in QuickBooks (required for canceled bank transfers).</inlineHelpText>
+    <label>Refund Receipt Created</label>
+    <trackFeedHistory>false</trackFeedHistory>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Checkbox</type>
+</CustomField>

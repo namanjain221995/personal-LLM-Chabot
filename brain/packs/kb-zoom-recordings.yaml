@@ -1,0 +1,884 @@
+# Compiled 2026-08-16 from brain/sources/techsara-org-knowledge-base.txt (preprod org documentation, 71 objects) by the brain ingestion pipeline: deterministic section/field parsing, every field name validated against the production dictionary + warehouse table list, rules distilled and adversarially verified. Fields the production warehouse lacks are only ever mentioned as explicit not-synced caveats.
+# Domain: PART 10 — verifier verdict: ship_with_fixes.
+name: kb-zoom-recordings
+description: 'Teaches the in-house S3 Zoom Recording Portal: who watched which recording
+  (access logs), folder grants and recording departments, plus the separate vendor
+  Zoom Phone call-log object.'
+triggers:
+- zoom recording
+- zoom recordings
+- recording portal
+- zoom recording portal
+- recording access
+- recording access log
+- viewer log
+- viewer logs
+- folder grant
+- folder grants
+- folder access
+- recording department
+- recording departments
+- screen recording
+- screen recording attempt
+- signed url
+- signed urls
+- who watched
+- watched recording
+- view recording
+- recording link
+- call log
+- call logs
+- zoom call
+- zoom calls
+- zoom phone
+- granted access
+- revoked access
+tables:
+- Zoom_Recording_Access_Log__c
+- Zoom_Recording_User_Folder_Map__c
+- Zoom_Recording_Department__c
+- ZVC__Zoom_Call_Log__c
+rules: 'Zoom recording portal (in-house S3 portal, NOT Zoom Phone):
+
+  - "Watched a recording" = Event_Type__c IN (''File_Access'',''Signed_URL''); Portal_Access
+  = portal opened only. File_Access is REUSED for admin grant audits and silent
+  [SILENT] DevTools rows - not every row is a real viewing.
+
+  - Event_Type__c View/Download/Share/Video_Shared/Shared_Link_Accessed/Transcript_Copy/Sync_*
+  are reserved and never written.
+
+  - Who = User__c; when = Event_Timestamp__c (~CreatedDate). Opened_By__c/Opened_At__c
+  only on ''View Recording'' button rows; those leave Event_Type__c/Status__c blank
+  - include blanks in view counts.
+
+  - Viewed interview/session id is TEXT in Record_Id__c (+Record_Name__c, Source_Object__c)
+  - join on it; Interview__c/Session__c lookups are unwritten by code.
+
+  - Error_Message__c = general event detail, not just errors; Access_Denied includes
+  admin revokes (''Revoked...'').
+
+  - Status__c: Success | Failed | Blocked; Screen_Recording_Attempt is always Blocked.
+
+  - Grants: Zoom_Recording_User_Folder_Map__c: User__c -> User, Department__c ->
+  Zoom_Recording_Department__c, Granted_By__c -> User (grant issued BY an admin
+  marks a team lead).
+
+  - Revoking DELETES grant rows (revoke events live in the access log; Is_Active__c
+  stays true). S3_Folder_Path__c ending ''/'' = whole tree; full key = one file.
+
+  - Zoom_Recording_Department__c mirrors S3 root folders, NOT HR departments; filter
+  Is_Active__c=''true''. Log Department__c is empty for admins - per-department
+  slices miss admin activity.
+
+  - ZVC__Zoom_Call_Log__c = vendor Zoom Phone package (calls, not recordings); sandbox
+  rows were purged though Tasks reference them - verify rows exist first.
+
+  - Zoom_Portal_Config__mdt is not synced - answer config questions conceptually
+  and say so.
+
+  - Never quote sandbox counts as facts; portal runtime data lives in production.'
+glossary:
+  zoom recording portal: TechSara's in-house S3-backed video library where employees
+    stream Zoom recordings of interviews and training sessions; every access is
+    audited and gated by folder grants.
+  recording access log: One Zoom_Recording_Access_Log__c row per portal security
+    event (open, login, file stream, denial, screen-record attempt), also mirrored
+    to S3 as JSON.
+  folder grant: A Zoom_Recording_User_Folder_Map__c row saying one user may see
+    one S3 folder (and everything beneath it) or one single file, inside a recording
+    department.
+  recording department: An auto-synced record mirroring one root folder of the recordings
+    S3 bucket - not an HR or role-hierarchy department.
+  portal admin: 'A holder of the Zoom_Recording_Admin_Access permission set: sees
+    all departments, bypasses folder grants, and receives screen-recording security
+    alerts.'
+  team lead (portal): A user whose own folder grant came directly from an admin;
+    grants they issue hang their employees beneath them in the access hierarchy
+    chart.
+  screen recording attempt: A capture attempt the video player detected and blocked
+    - it blanks/pauses the video and emails a security alert to every portal admin.
+  signed url: A time-limited S3 streaming link issued when someone watches a file;
+    issuing one writes a File_Access log event.
+  view recording button: The quick action on Interview and Session record pages
+    that opens the recording link and writes a button-path access-log row.
+  silent log: A File_Access row tagged [SILENT], written when suspicious player
+    inspection (e.g. DevTools) is detected, logged without an alert email.
+  viewer-logs backup: The S3 copy of every access-log row as date-partitioned JSON,
+    so the audit trail survives outside Salesforce.
+  zoom call log: A vendor Zoom Phone call record (ZVC managed package) holding call
+    detail; separate from the recording portal, and each call also appears as a
+    Task.
+field_notes:
+  Zoom_Recording_Access_Log__c:
+    User__c: The user the event is about - who opened the portal, streamed the file,
+      or was blocked. Set by every Apex logging path from the running user's session
+      (UserInfo). 100% populated; the field every log report pivots on.
+    Opened_By__c: Who clicked the "View Recording" button on an Interview or Session
+      record page. Set only by Recording_Link_Logs_Flow (the button path); the Apex
+      paths use User__c instead.
+    Opened_At__c: When the "View Recording" button was clicked. Flow-path companion
+      of Event_Timestamp__c; only filled on button-created rows.
+    Event_Timestamp__c: When the event happened, stamped by the Apex loggers at
+      insert (16 of 17 rows). Effectively duplicates CreatedDate but is carried
+      into the S3 JSON backup explicitly.
+    Department__c: The recording department (S3 root folder) this event belongs
+      to. Apex derives it from the user's Zoom_Recording_* permission set via Zoom_Recording_Department__c.Permission_Set_API_Name__c
+    Event_Type__c: 'The kind of event. Values and meanings: - Portal_Access: user
+      opened the recording portal (most common event). - Portal_Exit: user left
+      the portal page.'
+    Status__c: 'Outcome of the event: Success (it happened normally) | Failed (an
+      error occurred) | Blocked (the security layer stopped it - access denied or
+      screen-recording attempt).'
+    Error_Message__c: 'Free-form detail field. Despite the name it is used for far
+      more than errors: the loggers pack context here ("is_admin:True/False", the
+      latest login application, "[SILENT]" markers'
+    File_Key__c: Full S3 object key of the file involved (e.g. "<department>/<meeting>/video.mp4"),
+      truncated to 255 chars. Set on file-access, signed-URL, access-denied and
+      screen-recording events.
+    File_Name__c: Just the file's name (the code truncates it to 100 chars even
+      though the field allows 255). Human-friendly companion to File_Key__c.
+    Recording_Link__c: The recording URL that was opened - written by the Recording_Link_Logs_Flow
+      button path (the Apex paths log S3 keys instead).
+    Record_Id__c: 18-char id of the Salesforce record (Interview or Session) whose
+      recording was viewed - stamped as TEXT by the flow. This, not the Interview__c
+      / Session__c lookups, is what actually carries the link in practice.
+    Record_Name__c: Name of that source record (e.g. the interview auto-number "I-031360"),
+      stamped by the flow so log readers do not need to resolve the id.
+    Interview__c: Proper lookup to the interview whose recording was accessed. Defined
+      for the compliance model but never populated by the current flow/Apex (0%)
+      - the flow uses Record_Id__c instead.
+    Session__c: Same as Interview__c but for training/meeting Session recordings;
+      also 0% populated today.
+    Source_Object__c: 'Which kind of record the "View Recording" click came from:
+      interview | session. Set by the flow; empty on Apex-created rows.'
+    Source__c: 'Where the user was when the event fired: App (internal Lightning
+      app) | Experience Cloud (the AIC Portal community). Set by the flow path;
+      Apex-created rows leave it blank.'
+    IP_Address__c: The user's source IP, copied from their most recent LoginHistory
+      entry on Login_Success events (2 of 17 rows). Security teams use it to spot
+      odd locations.
+    User_Agent__c: Browser/client string, also from LoginHistory on login events
+      (e.g. "Chrome 126"). Complements the IP for device-level auditing.
+  Zoom_Recording_Department__c:
+    Department_Code__c: A short code for the department. Present in the schema but
+      not set by the auto-sync and not read by any portal code - effectively unused
+      (available for manual/admin classification if ever needed).
+    Description__c: Free-text description of what recordings the department folder
+      holds. Manual admin entry; nothing in code writes or reads it.
+    Is_Active__c: Whether the department currently exists in S3 and should show
+      in the portal. The auto-sync flips it false when the folder disappears from
+      S3 (a soft delete), true again if the folder returns
+    Display_Order__c: Sort position of the department in the portal UI. The auto-sync
+      assigns the next number as folders are discovered (existing count + 1); admins
+      can renumber manually.
+    Permission_Set_API_Name__c: API name of the permission set associated with this
+      department - defaulted to "Zoom_Recording_User_Access" by the auto-sync.
+  Zoom_Recording_User_Folder_Map__c:
+    User__c: The Salesforce user receiving access. All enforcement queries filter
+      on this + Is_Active__c. (Not formally required in the schema, but the granting
+      code always sets it.)
+    Department__c: The recording department the granted folder/file sits under.
+      Required on every grant; used to group the admin screens and to revoke a user's
+      whole department at once.
+    S3_Folder_Path__c: 'THE payload of the grant: the S3 path the user may access.
+      Ends with "/" for a folder grant (which implicitly covers everything beneath
+      it) or is a full object key for a single-file grant.'
+    Folder_Name__c: Human-friendly display name of the granted item - the last segment
+      of the path (folder name or file name), extracted automatically by the granting
+      code for the admin dashboards.
+    Is_Active__c: 'Whether the grant currently counts. Set true at creation and
+      filtered on by every access check. Note: revoking DELETES the row rather than
+      unchecking this'
+    Granted_By__c: Who issued the grant (the acting admin/team lead, stamped automatically).
+      Drives the "who granted what" summary and defines the Team Lead -> Employee
+      layers of the hierarchy chart (grants issued BY an admin mark the
+    Granted_Date__c: When the grant was issued (stamped automatically at creation;
+      also the sort order of a user's grants in the admin view).
+    Notes__c: Optional free-text note about why the access was granted. Manual entry
+      only - the granting UI/code does not populate it (and nothing reads it programmatically).
+    User_Email__c: Live formula showing the granted user's email (User__r.Email)
+      so admin list views and exports identify the person without opening the User
+      record.
+  Zoom_Portal_Config__mdt:
+    S3_Bucket_Name__c: 'The S3 bucket holding all Zoom recordings and the viewer-logs
+      backup. Configured: "zoom-automation-bucket". Every folder listing, file list
+      and streaming URL is built against this bucket.'
+    AWS_Region__c: 'AWS region of the bucket, used in endpoint construction and
+      request signing. Configured: "us-east-1".'
+    Is_Active__c: 'Marks THE record the portal uses (the code picks the first active
+      row). Keep exactly one active; flipping it off takes the whole portal down
+      with "No active Zoom Portal Config found". Configured: checked.'
+    Signed_URL_Expiry_Minutes__c: 'How long a generated streaming/download link
+      stays valid before it expires. Configured: 480 (8 hours - also the code default
+      when blank). Shorter = safer against link sharing; longer = fewer playback
+      interruptions.'
+    Allowed_File_Extensions__c: 'Comma-separated list of file extensions the portal
+      will serve. Configured: "mp4,webm,mov,mkv" (video only at the config level;
+      per-user Apex rules separately allow transcript/audio types for non-admins).'
+    Site_Title__c: 'The heading shown at the top of the portal UI. Configured: "Techsara
+      Zoom Recording Portal" (falls back to "Zoom Recording Portal" if blank).'
+    Top_Notice__c: 'A banner/notice message shown to users on the portal home. Configured:
+      "Welcome! Access your department recordings below."'
+knowledge:
+- title: Zoom_Recording_Access_Log__c — What This Object Is
+  keywords:
+  - zoom
+  - recording
+  - access
+  - log
+  text: 'Zoom_Recording_Access_Log__c is the AUDIT TRAIL of the Zoom Recording Portal
+    -
+
+    Techsara''s in-house, S3-backed video library where employees watch the Zoom
+
+    recordings of interviews, training sessions and other meetings. One record =
+
+    one security-relevant event: someone opened the portal, logged in, streamed
+    a
+
+    file, was denied access, tried to screen-record the video, an admin granted
+    or
+
+    revoked folder access, and so on.
+
+
+    It exists for compliance and leak prevention: interview recordings are
+
+    sensitive (candidate voices, client names, proxy-support activity), so the
+
+    business wants to know exactly WHO watched WHAT recording, WHEN, from WHERE.
+
+    Every log row is also backed up as JSON to the S3 bucket itself (folder
+
+    "viewer-logs/", partitioned by event category and date), so the audit trail
+
+    survives even outside Salesforce. Screen-recording attempts additionally
+
+    trigger an immediate security-alert email to every holder of the
+
+    Zoom_Recording_Admin_Access permission set.'
+- title: Zoom_Recording_Access_Log__c — Kind Of Object
+  keywords:
+  - zoom
+  - recording
+  - access
+  - log
+  text: "- Custom object, part of the Zoom recording management subsystem (~10 Apex\n\
+    \  classes; see part 7).\n- Standalone object (no master-detail parent). Org-wide\
+    \ sharing is Public\n  Read/Write - it is a system log written mostly by \"\
+    without sharing\" Apex.\n- 19 custom fields, 0 record types, 0 validation rules,\
+    \ 1 list view.\n- Auto-number Name \"Log Number\" in the format LOG-XXXXXXX.\n\
+    - Scale: only 17 records in preprod (Jul 20 - Aug 6, 2026) - the portal was\n\
+    \  exercised only briefly in this sandbox; the real usage history lives in\n\
+    \  production and in the S3 \"viewer-logs/\" backup."
+- title: Zoom_Recording_Access_Log__c — Record Types
+  keywords:
+  - zoom
+  - recording
+  - access
+  - log
+  text: 'None. Every access-log record has the same shape; the Event_Type__c picklist
+
+    is what distinguishes the different kinds of events.'
+- title: Zoom_Recording_Access_Log__c — How It Is Used — The Business Process
+  keywords:
+  - zoom
+  - recording
+  - access
+  - log
+  text: 'BACKGROUND - THE ZOOM RECORDING PORTAL. Zoom meeting recordings are copied
+    to
+
+    the AWS S3 bucket configured in Zoom_Portal_Config__mdt (currently
+
+    "zoom-automation-bucket"), organized in department root folders. Employees
+
+    browse and stream them through a set of custom LWCs (zoomRecordingPortal,
+
+    zoomRecordingFileBrowser, zoomRecordingVideoPlayer, zoomRecordingDashboard,
+
+    zoomRecordingAccessManager/Modal, zoomRecordingLogs, and
+
+    zoomRecordingHierarchyChart) exposed two ways: an internal app tab
+
+    ("Zoom Recording Portal") and a page inside the AIC Portal Experience Cloud
+
+    site. What a non-admin can see is controlled by
+
+    Zoom_Recording_User_Folder_Map__c grants; admins (permission set
+
+    Zoom_Recording_Admin_Access) see everything.'
+- title: Zoom_Recording_Access_Log__c — How It Is Used — The Business Process (2)
+  keywords:
+  - zoom
+  - recording
+  - access
+  - log
+  text: "EVENTS THAT CREATE A LOG ROW:\n  1. PORTAL LIFECYCLE. Opening the portal\
+    \ logs \"Portal_Access\"; if there was\n     no portal access in the last 30\
+    \ minutes it also logs a \"Login_Success\"\n     row enriched with the user's\
+    \ latest LoginHistory (IP address, browser,\n     application). Leaving logs\
+    \ \"Portal_Exit\"; explicit logout logs \"Logout\".\n     (Apex ZoomRecordingLogService,\
+    \ called from the portal LWCs.)\n  2. WATCHING A FILE. When a signed S3 URL\
+    \ is issued for a video, a\n     \"File_Access\"/success row is written with\
+    \ the S3 key and file name.\n     Suspicious inspection of the player (e.g.\
+    \ opening DevTools) writes a\n     silent \"File_Access\" row tagged \"[SILENT]\"\
+    \ - logged, no email.\n  3. BLOCKED ACTIONS. A failed folder/file permission\
+    \ check logs\n     \"Access_Denied\"/Blocked. A detected screen-recording attempt\
+    \ logs\n     \"Screen_Recording_Attempt\"/Blocked AND emails a red security-alert\n\
+    \     (user, profile, IP, file, timestamp in IST+UTC) to every\n     Zoom_Recording_Admin_Access\
+    \ holder; the player also blanks the screen,\n     pauses the video and mutes\
+    \ audio.\n  4. ADMIN ACTIONS. The Access Manager logs grants (\"File_Access\"\
+    ), revokes\n     (\"Access_Denied\" with a \"Revoked...\" message) and permission-set\
+    \ changes\n     (\"Portal_Access\" with \"+n/-n\" detail) - the event type is\
+    \ reused as a\n     rough category and the human-readable detail goes in Error_Message__c."
+- title: Zoom_Recording_Access_Log__c — How It Is Used — The Business Process (3)
+  keywords:
+  - zoom
+  - recording
+  - access
+  - log
+  text: "5. RECORD-PAGE BUTTON. The \"View Recording\" quick action on Interview__c\n\
+    \     and Session__c record pages launches the screen flow\n     Recording_Link_Logs_Flow:\
+    \ it opens the recording link and writes a log\n     row stamped with who opened\
+    \ it, when, from which record (Record_Id__c /\n     Record_Name__c / Source_Object__c),\
+    \ and whether the click came from the\n     internal app or Experience Cloud\
+    \ (Source__c).\n\nAFTER EVERY INSERT the Apex writers enqueue ZoomRecordingLogS3Backup\n\
+    (Queueable with callouts) which appends the row as JSON to\n\"viewer-logs/<category>/<yyyy-mm-dd>.json\"\
+    \ and \"viewer-logs/all-events/...\"\nin S3 through the AWS_S3_Named_Credential\
+    \ named credential.\n\nWHO READS THE LOGS. The \"View Logs\" admin screen (LWC\
+    \ zoomRecordingLogs +\nApex ZoomRecordingLogController) lets System Administrators\
+    \ and\nZoom_Recording_Admin_Access holders filter/search the logs (multi-word,\n\
+    order-independent user search that also finds inactive users' history)."
+- title: Zoom_Recording_Access_Log__c — Connected Objects
+  keywords:
+  - zoom
+  - recording
+  - access
+  - log
+  - each
+  - relationship
+  - means
+  text: "LOOKUPS FROM THE LOG:\n- User (User__c): the person the event is about\
+    \ - the one who opened the\n  portal / watched the file. Set by the Apex loggers\
+    \ on every row (100%\n  populated in data). This is the primary \"who\" field.\n\
+    - User (Opened_By__c): who clicked \"View Recording\" on a record page - set\n\
+    \  only by the Recording_Link_Logs_Flow path (the flow's own \"who\" field,\n\
+    \  parallel to User__c).\n- Zoom_Recording_Department__c (Department__c): which\
+    \ recording department\n  (S3 root folder) the event belongs to. Apex derives\
+    \ it from the user's\n  Zoom_Recording_* permission set; empty for admins and\
+    \ for every current\n  preprod row (no department records exist in this sandbox\
+    \ yet).\n- Interview__c (Interview__c): intended link to the interview whose\
+    \ recording\n  was accessed. Defined, but nothing currently populates it - the\
+    \ flow stores\n  the record id as text in Record_Id__c instead (0% populated).\n\
+    - Session__c (Session__c): same idea for training-session recordings; also\n\
+    \  never populated in practice (0%).\n\nNO CHILDREN: nothing looks up to the\
+    \ access log; it is a leaf/audit object."
+- title: Zoom_Recording_Access_Log__c — Business Rules
+  keywords:
+  - zoom
+  - recording
+  - access
+  - log
+  - validation
+  text: 'None. The object is written by system code, not typed in by users, so there
+
+    are no save-time rules to enforce.'
+- title: Zoom_Recording_Access_Log__c — Automation
+  keywords:
+  - zoom
+  - recording
+  - access
+  - log
+  - runs
+  text: "No record-triggered flows or Apex triggers run ON this object. It is purely\
+    \ a\nWRITE TARGET of the subsystem:\n\nAPEX WRITERS:\n- ZoomRecordingLogService\
+    \ - the central logger: portal access/exit, login\n  success (with LoginHistory\
+    \ IP/browser), logout, signed-URL issuance, silent\n  file-access, access-denied,\
+    \ screen-recording attempts (+ the admin alert\n  email), and a generic logEvent()\
+    \ used by other classes.\n- ZoomRecordingAccessManagerController - logs grant/revoke/permission-set\n\
+    \  admin actions through logEvent().\n- ZoomRecordingFileController - the file-browser\
+    \ backend calls the log\n  service when issuing signed URLs and on DevTools/inspect\
+    \ detection.\n- ZoomRecordingLogS3Backup - Queueable that mirrors every new\
+    \ log row to\n  S3 \"viewer-logs/\" as date-partitioned JSON (async; a sync\
+    \ variant exists).\n\nSCREEN FLOW:\n- Recording_Link_Logs_Flow (active) - behind\
+    \ the \"View Recording\" quick\n  action on Interview__c and Session__c; looks\
+    \ up the source record and\n  creates a log row (Opened_By/Opened_At/Record_Id/Record_Name/\n\
+    \  Recording_Link/Source/Source_Object/User).\n\nREADER:\n- ZoomRecordingLogController\
+    \ + LWC zoomRecordingLogs - the admin \"View Logs\"\n  screen (gated to System\
+    \ Administrator profile or\n  Zoom_Recording_Admin_Access permission set)."
+- title: Zoom_Recording_Department__c — What This Object Is
+  keywords:
+  - zoom
+  - recording
+  - department
+  text: 'Zoom_Recording_Department__c is the DEPARTMENT CATALOG of the Zoom Recording
+
+    Portal. One record = one top-level folder in the recordings S3 bucket (e.g.
+    a
+
+    department or team''s recordings folder). It is the bridge between three
+
+    worlds: the S3 folder structure (Folder_Path_S3__c), the Salesforce
+
+    permission-set model (Permission_Set_API_Name__c), and the portal UI (the
+
+    department tiles/sections users see when they open the portal).
+
+
+    Important: these records are NOT hand-made. An auto-sync Apex class mirrors
+
+    the S3 bucket''s root folders into this object - create a folder in S3 and a
+
+    department record appears; delete the folder and the record is deactivated,
+
+    then physically deleted after 30 days. Do not confuse this object with the
+
+    org''s HR notion of departments (Recruiter__c.Department or the role-hierarchy
+
+    project) - this one only organizes recording folders.'
+- title: Zoom_Recording_Department__c — Kind Of Object
+  keywords:
+  - zoom
+  - recording
+  - department
+  text: "- Custom object, part of the Zoom recording management subsystem.\n- Standalone\
+    \ object (no parent); org-wide sharing Public Read/Write - it is\n  maintained\
+    \ by \"without sharing\" system code.\n- 6 custom fields, 0 record types, 0\
+    \ validation rules, 1 list view.\n- Text Name field (\"Department Name\") -\
+    \ set by the auto-sync to the S3 folder\n  name (folder path minus the slash).\n\
+    - Has its own Lightning record page (FlexiPage \"Department_Record_Page\").\n\
+    - Scale: 0 records in preprod - the auto-sync has not been run against S3\n\
+    \  from this sandbox; departments exist where the portal actually runs."
+- title: Zoom_Recording_Department__c — How It Is Used — The Business Process
+  keywords:
+  - zoom
+  - recording
+  - department
+  text: "STEP 1 - AUTO-CREATION FROM S3. When the portal loads,\n  ZoomRecordingDeptAutoSync.ensureDepartmentsExist()\
+    \ lists the S3 bucket's\n  root folders (via ZoomRecordingS3Service) and reconciles\
+    \ them with this\n  object: new folder -> new department record (Name = folder\
+    \ name, active,\n  next Display_Order, default Permission_Set_API_Name =\n \
+    \ \"Zoom_Recording_User_Access\"); folder re-appeared -> record re-activated;\n\
+    \  folder gone from S3 -> record deactivated; deactivated for 30+ days ->\n\
+    \  record permanently deleted. Safe to call repeatedly.\n\nSTEP 2 - DRIVING\
+    \ WHAT USERS SEE. When a user opens the portal,\n  ZoomRecordingAccessService.getUserAccessibleDepartments()\
+    \ returns:\n  - for admins (Zoom_Recording_Admin_Access permission set): ALL\
+    \ active\n    departments;\n  - for everyone else: only the departments referenced\
+    \ by their active\n    Zoom_Recording_User_Folder_Map__c grants. No grants =\
+    \ empty portal.\n  The Access Manager admin screen also lists active departments\
+    \ as the\n  containers admins pick when granting folder access.\n\nSTEP 3 -\
+    \ TAGGING THE AUDIT TRAIL. ZoomRecordingLogService looks up the\n  department\
+    \ whose Permission_Set_API_Name__c matches one of the user's\n  Zoom_Recording_*\
+    \ permission sets and stamps it on each access-log row\n  (Zoom_Recording_Access_Log__c.Department__c),\
+    \ so log reports can be\n  sliced per department."
+- title: Zoom_Recording_Department__c — Connected Objects
+  keywords:
+  - zoom
+  - recording
+  - department
+  - each
+  - relationship
+  - means
+  text: "PARENT: none - departments are the top of the recording-access model.\n\
+    \nOBJECTS THAT POINT AT IT:\n- Zoom_Recording_User_Folder_Map__c (Department__c,\
+    \ required on every grant):\n  each user-folder access grant belongs to one\
+    \ department - \"user X may see\n  folder Y inside department Z\".\n- Zoom_Recording_Access_Log__c\
+    \ (Department__c): access-log rows are tagged\n  with the department they concern,\
+    \ for per-department audit reporting.\n\nINDIRECT: Permission_Set_API_Name__c\
+    \ references a PermissionSet by API name\n(text, not a real lookup) - the org\
+    \ ships Zoom_Recording_Admin_Access,\nZoom_Recording_User_Access and Zoom_Recording_TL_Marker\
+    \ permission sets."
+- title: Zoom_Recording_Department__c — Business Rules
+  keywords:
+  - zoom
+  - recording
+  - department
+  - validation
+  text: 'None. The auto-sync code is the only intended writer, so integrity is
+
+    enforced in Apex rather than validation rules.'
+- title: Zoom_Recording_Department__c — Automation
+  keywords:
+  - zoom
+  - recording
+  - department
+  - runs
+  text: "No flows or triggers. All lifecycle logic is Apex:\n- ZoomRecordingDeptAutoSync\
+    \ (writer) - creates / reactivates / deactivates /\n  hard-deletes department\
+    \ records to mirror the S3 root folders (see part 4).\n- ZoomRecordingAccessService\
+    \ (reader) - builds the department list each user\n  may see (admin = all active;\
+    \ others = from their folder grants).\n- ZoomRecordingAccessManagerController\
+    \ (reader) - lists active departments\n  in the admin Access Manager and in\
+    \ its hierarchy/summary charts.\n- ZoomRecordingLogService (reader) - resolves\
+    \ a user's primary department\n  from their permission sets to tag access-log\
+    \ rows."
+- title: Zoom_Recording_User_Folder_Map__c — What This Object Is
+  keywords:
+  - zoom
+  - recording
+  - user
+  - folder
+  - map
+  text: 'Zoom_Recording_User_Folder_Map__c is the ACCESS-GRANT table of the Zoom
+
+    Recording Portal. One record = one grant: "this Salesforce User may see this
+
+    S3 folder (or this single file) inside this recording department". It is the
+
+    portal''s own row-level security model, deliberately independent of Salesforce
+
+    record sharing - the recordings live in S3, not in Salesforce, so access is
+
+    enforced in Apex by checking these mappings before listing folders or issuing
+
+    signed streaming URLs.
+
+
+    The grant model is hierarchical in practice: portal admins (permission set
+
+    Zoom_Recording_Admin_Access) grant folders to team leads (marked by the
+
+    Zoom_Recording_TL_Marker permission set concept and by WHO granted them), and
+
+    team leads'' grants to their employees are visualized as a Department -> Team
+
+    Lead -> Employee -> Folders tree in the admin hierarchy chart. Because
+
+    Granted_By__c records who issued each grant, the object doubles as its own
+
+    audit trail of the delegation chain.'
+- title: Zoom_Recording_User_Folder_Map__c — Kind Of Object
+  keywords:
+  - zoom
+  - recording
+  - user
+  - folder
+  - map
+  text: "- Custom object, part of the Zoom recording management subsystem.\n- Standalone\
+    \ object (lookups, no master-detail); org-wide sharing Public\n  Read/Write\
+    \ - all enforcement is in \"without sharing\" Apex, which gates\n  every admin\
+    \ operation on the Zoom_Recording_Admin_Access permission set.\n- 9 custom fields,\
+    \ 0 record types, 0 validation rules, 0 list views.\n- Auto-number Name in the\
+    \ format ZUM-XXXX.\n- S3_Folder_Path__c is an EXTERNAL ID - the S3 path is the\
+    \ logical key.\n- Scale: 0 records in preprod (grants exist only where the portal\
+    \ runs)."
+- title: Zoom_Recording_User_Folder_Map__c — Record Types
+  keywords:
+  - zoom
+  - recording
+  - user
+  - folder
+  - map
+  text: 'None. A grant is a grant; folder-vs-file grants are distinguished only
+    by
+
+    whether the S3 path ends with "/".'
+- title: Zoom_Recording_User_Folder_Map__c — How It Is Used — The Business Process
+  keywords:
+  - zoom
+  - recording
+  - user
+  - folder
+  - map
+  text: "STEP 1 - GRANTING. An admin opens the Access Manager (LWC\n  zoomRecordingAccessManager\
+    \ + zoomRecordingAccessModal, backend\n  ZoomRecordingAccessManagerController),\
+    \ picks a user, a department, and\n  ticks folders and/or individual files browsed\
+    \ live from S3. Apex creates\n  one mapping row per new item (skipping paths\
+    \ the user already has),\n  stamping Granted_By = the acting admin and Granted_Date\
+    \ = now, Is_Active =\n  true. Folder grants are normalized to end with \"/\"\
+    ; file grants store the\n  full S3 object key. Each grant batch is also written\
+    \ to the access log.\n  The same modal manages the user's permission sets (any\
+    \ non-profile-owned\n  permission set can be assigned/removed; an admin cannot\
+    \ remove their own\n  Zoom_Recording_Admin_Access).\n\nSTEP 2 - ENFORCEMENT.\
+    \ Whenever a non-admin browses the portal or requests a\n  video, ZoomRecordingAccessService\
+    \ loads their active mappings and allows a\n  path if it starts with (or is\
+    \ a parent of) a granted path - i.e. granting\n  a folder grants everything\
+    \ beneath it. ZoomRecordingFileController applies\n  this to every folder listing\
+    \ and signed-URL request, on top of blanket\n  rules (blocked folders like \"\
+    docs\"/\"llm\", allowed file extensions).\n  Admins bypass mappings entirely.\
+    \ Users with no active mappings see an\n  empty portal (\"No Access\")."
+- title: Zoom_Recording_User_Folder_Map__c — How It Is Used — The Business Process
+    (2)
+  keywords:
+  - zoom
+  - recording
+  - user
+  - folder
+  - map
+  text: "STEP 3 - REVOKING. Admins revoke one mapping, a selection, a department's\n\
+    \  worth, or ALL of a user's access - in every case the rows are physically\n\
+    \  DELETED (not deactivated), and a revoke entry is written to the access\n\
+    \  log. Is_Active__c therefore stays true on live rows; it exists as a\n  kill-switch/filter,\
+    \ not as the normal revoke mechanism.\n\nSTEP 4 - OVERSIGHT. The admin dashboards\
+    \ read the mappings to show per-user\n  folder counts, an access summary grouped\
+    \ by who-granted-what, and the\n  Department -> Team Lead -> Employee -> Folders\
+    \ hierarchy chart (a user is\n  treated as a Team Lead when their own grant\
+    \ came directly from an admin)."
+- title: Zoom_Recording_User_Folder_Map__c — Connected Objects
+  keywords:
+  - zoom
+  - recording
+  - user
+  - folder
+  - map
+  - each
+  - relationship
+  - means
+  text: "LOOKUPS FROM THE MAPPING:\n- User (User__c): the user being granted access\
+    \ - the subject of the grant.\n- Zoom_Recording_Department__c (Department__c,\
+    \ REQUIRED): the recording\n  department (S3 root folder) the granted item belongs\
+    \ to. Groups grants\n  for the admin screens and department-level revokes.\n\
+    - User (Granted_By__c): the admin or team lead who issued the grant - the\n\
+    \  backbone of the delegation hierarchy chart and the access-summary audit.\n\
+    \nNO CHILDREN: nothing looks up to a mapping row."
+- title: Zoom_Recording_User_Folder_Map__c — Business Rules
+  keywords:
+  - zoom
+  - recording
+  - user
+  - folder
+  - map
+  - validation
+  text: 'None. Only the Access Manager Apex (admin-gated) writes these rows, and
+    it
+
+    enforces the rules itself (no duplicate paths per user, required user/
+
+    department/paths).'
+- title: Zoom_Recording_User_Folder_Map__c — Automation
+  keywords:
+  - zoom
+  - recording
+  - user
+  - folder
+  - map
+  - runs
+  text: "No flows or triggers. All behavior is Apex:\n- ZoomRecordingAccessManagerController\
+    \ (writer) - creates grants\n  (grantFolderAccess / grantItemAccess), deletes\
+    \ them on revoke (single,\n  bulk, per-department, revoke-all), and builds the\
+    \ summary/hierarchy\n  dashboards from them; every change is echoed to the access\
+    \ log.\n- ZoomRecordingAccessService (reader) - caches the current user's active\n\
+    \  mappings per request and answers \"may this user see this path?\" and\n \
+    \ \"which departments may they open?\".\n- ZoomRecordingFileController (reader)\
+    \ - applies those answers to folder\n  browsing and signed-URL issuance for\
+    \ non-admin users."
+- title: Zoom_Portal_Config__mdt — What This Object Is
+  keywords:
+  - zoom
+  - portal
+  - config
+  - mdt
+  text: 'Zoom_Portal_Config__mdt is the SETTINGS PANEL of the Zoom Recording Portal,
+
+    implemented as a custom metadata type. One active record tells the whole
+
+    subsystem which AWS S3 bucket and region to talk to, which AWS credentials
+
+    to sign requests with, how long streaming links stay valid, which file types
+
+    may be played, and what title/notice the portal UI shows. Admins change the
+
+    portal''s behavior by editing this record in Setup (Custom Metadata Types >
+
+    Zoom Portal Config) - no code change or deployment needed.
+
+
+    Being custom metadata (not a custom object), records deploy with metadata,
+
+    are visible to Apex without SOQL limits concerns, and are read through the
+
+    dedicated wrapper class ZoomRecordingPortalConfig, which caches the first
+
+    ACTIVE record per transaction and supplies safe defaults when optional
+
+    fields are blank.'
+- title: Zoom_Portal_Config__mdt — Kind Of Object
+  keywords:
+  - zoom
+  - portal
+  - config
+  - mdt
+  text: "- Custom METADATA TYPE (API suffix __mdt) - configuration, not data. No\n\
+    \  sharing model, no owner, not writable by flows or normal DML.\n- 9 custom\
+    \ fields, 0 record types, 0 validation rules.\n- Exactly 1 record exists: \"\
+    Default_Config\" (Is_Active = true). The wrapper\n  class takes the FIRST active\
+    \ record it finds (LIMIT 1), so only one row\n  should ever be active at a time.\n\
+    - Consumers: ZoomRecordingPortalConfig (the only direct reader), and through\n\
+    \  it ZoomRecordingS3Service (S3 REST calls + pre-signed URL generation)."
+- title: Zoom_Portal_Config__mdt — How It Is Used — The Business Process
+  keywords:
+  - zoom
+  - portal
+  - config
+  - mdt
+  text: "- On any portal operation that touches S3 (listing folders, listing files,\n\
+    \  generating a streaming URL), ZoomRecordingS3Service asks\n  ZoomRecordingPortalConfig\
+    \ for the bucket, region, credentials and URL\n  expiry, and signs the AWS request\
+    \ with them (AWS Signature V4 pre-signed\n  URLs - this is why raw keys sit\
+    \ in metadata rather than a named\n  credential: pre-signing needs the secret\
+    \ directly). The department\n  auto-sync and every file browse therefore depend\
+    \ on this record.\n- The portal UI reads the cosmetic fields: Site_Title__c\
+    \ as the header and\n  Top_Notice__c as the banner text users see on the portal\
+    \ home.\n- File-type policing: isExtensionAllowed() checks a file's extension\
+    \ against\n  Allowed_File_Extensions__c before it is offered/streamed (with\
+    \ a built-in\n  fallback list of mp4/webm/mov/mkv when the field is blank).\
+    \ Note that\n  ZoomRecordingFileController layers additional hard-coded per-user\
+    \ rules on\n  top (non-admins: vtt/mp4/m4a/cc/chat/transcript/txt only, \"docs\"\
+    /\"llm\"\n  folders blocked).\n- If NO active record exists, every S3 operation\
+    \ fails fast with a clear\n  ConfigurationException telling the admin to create\
+    \ the record - the portal\n  cannot run unconfigured.\n- Note: the access-LOG\
+    \ backup path is different - ZoomRecordingLogS3Backup\n  uses the AWS_S3_Named_Credential\
+    \ named credential, not these keys."
+- title: Zoom_Portal_Config__mdt — Connected Objects
+  keywords:
+  - zoom
+  - portal
+  - config
+  - mdt
+  text: 'None. Custom metadata records stand alone; the link to the rest of the
+
+    subsystem is purely through the Apex classes that read them
+
+    (ZoomRecordingPortalConfig -> ZoomRecordingS3Service -> the portal
+
+    controllers).'
+- title: Zoom_Portal_Config__mdt — Business Rules
+  keywords:
+  - zoom
+  - portal
+  - config
+  - mdt
+  - validation
+  text: 'None. Correctness is enforced by the wrapper class at read time (missing
+
+    active record or missing AWS keys throw a ConfigurationException with a
+
+    fix-it message).'
+- title: Zoom_Portal_Config__mdt — Automation
+  keywords:
+  - zoom
+  - portal
+  - config
+  - mdt
+  - runs
+  text: "Nothing runs ON custom metadata. Readers:\n- ZoomRecordingPortalConfig\
+    \ - caching accessor with defaults (title falls\n  back to \"Zoom Recording\
+    \ Portal\", URL expiry to 480 minutes, extensions to\n  mp4/webm/mov/mkv).\n\
+    - ZoomRecordingS3Service - consumes bucket/region/keys/expiry for every S3\n\
+    \  callout and pre-signed streaming URL."
+- title: ZVC__Zoom_Call_Log__c — What This Object Is
+  keywords:
+  - zvc
+  - zoom
+  - call
+  - log
+  text: 'ZVC__Zoom_Call_Log__c is a THIRD-PARTY MANAGED-PACKAGE object, installed
+    by
+
+    the official "Zoom for Salesforce" app from Zoom Video Communications
+
+    (namespace prefix ZVC). It stores one record per Zoom Phone call: caller and
+
+    callee numbers/extensions, ring/answer/end timestamps, duration, call type
+
+    and result, disposition, links to the call recording and voicemail, and an
+
+    AI-generated call summary. The package links each call log to the Task it
+
+    auto-creates, so phone activity shows up in standard activity timelines.
+
+
+    It is NOT part of Techsara''s custom Zoom RECORDING portal subsystem
+
+    (Zoom_Recording_* objects above) - that is in-house code for meeting/
+
+    interview video recordings in S3. This object is purely the vendor''s
+
+    call-logging feature. Techsara has no custom code, flows or fields on it.'
+- title: ZVC__Zoom_Call_Log__c — Kind Of Object
+  keywords:
+  - zvc
+  - zoom
+  - call
+  - log
+  text: "- Custom object owned by the ZVC managed package - Techsara cannot change\n\
+    \  its fields, and the org snapshot shows 0 local custom fields on it (the\n\
+    \  package's own ~26 fields exist in the org but are not part of retrieved\n\
+    \  local metadata; the field list below comes from a live describe).\n- 0 record\
+    \ types, 0 validation rules, 1 list view (\"All Zoom Call Logs\").\n- Has an\
+    \ Owner (standard ownership model applies).\n- Scale: 0 records in preprod -\
+    \ but ~9,857 Task records still carry\n  ZVC__Zoom_Call_Log__c ids (created\
+    \ Oct 2025 - Jul 2026), meaning calls\n  WERE logged in that period and the\
+    \ log records were later deleted/purged\n  or not copied to this sandbox. The\
+    \ Task-side ids now point at nothing."
+- title: ZVC__Zoom_Call_Log__c — How It Is Used — The Business Process
+  keywords:
+  - zvc
+  - zoom
+  - call
+  - log
+  text: 'When an employee makes or receives a Zoom Phone call through the Zoom for
+
+    Salesforce integration, the package writes a Zoom Call Log record with the
+
+    call''s technical details and creates/links a Task so the call appears in the
+
+    activity timeline of the related Lead/Contact/Account. The Activity field
+
+    ZVC__Zoom_Call_Log__c is the link from that Task back to the call log.
+
+    Salesforce-side users mainly experience this as "calls appear as completed
+
+    Tasks"; the call-log record holds the extra telephony detail (numbers,
+
+    timings, recording/voicemail links, AI summary).
+
+
+    Data reality at Techsara: call logging clearly ran from about Oct 2025 to
+
+    Jul 2026 (the ~9,857 linked Tasks), but the call-log records themselves are
+
+    gone from preprod, so only the Task shells remain. Treat historical
+
+    "call detail" questions as unanswerable from this sandbox.
+
+
+    The wider ZVC package footprint in the org (for orientation): "Add To
+
+    Webinar" buttons on Lead and Contact, ZVC__IsCreatedByZoomApp__c on Lead,
+
+    ZVC__Registrant_Id__c on CampaignMember, and several ZVC list views on
+
+    Contact - i.e. the package also covers Zoom Webinar registration, separate
+
+    from call logging.'
+- title: ZVC__Zoom_Call_Log__c — Connected Objects
+  keywords:
+  - zvc
+  - zoom
+  - call
+  - log
+  - each
+  - relationship
+  - means
+  text: "- Activity / Task (ZVC__Zoom_Call_Log__c field on Activity): each package-\n\
+    \  created call Task points at its call log. This is the only relationship\n\
+    \  the org snapshot shows. (~9,857 Tasks carry a value, all currently\n  dangling\
+    \ because the log records are absent.)\n- The package also stores the reverse\
+    \ pointer as text (ZVC__Task_Id__c on\n  the call log).\n- No Techsara custom\
+    \ object references ZVC__Zoom_Call_Log__c."
+- title: ZVC__Zoom_Call_Log__c — Automation
+  keywords:
+  - zvc
+  - zoom
+  - call
+  - log
+  - runs
+  text: 'None in Techsara''s org - no local flows, triggers or Apex touch it. All
+
+    writes come from the Zoom for Salesforce managed package / Zoom''s
+
+    integration user. (Any package-internal automation is invisible to and not
+
+    modifiable by the org.)'

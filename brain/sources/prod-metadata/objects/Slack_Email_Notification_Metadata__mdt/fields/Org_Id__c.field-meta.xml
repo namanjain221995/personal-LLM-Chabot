@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Org_Id__c</fullName>
+    <description>The 15 or 18 character Salesforce Organization Id of the environment this record belongs to. The flow matches on this instead of DeveloperName, so environment detection is automatic and works in async context.</description>
+    <externalId>false</externalId>
+    <fieldManageability>DeveloperControlled</fieldManageability>
+    <inlineHelpText>Paste this org&apos;s Organization Id (Setup - Company Information). Used to auto-detect the environment.</inlineHelpText>
+    <label>Org Id</label>
+    <length>18</length>
+    <required>true</required>
+    <type>Text</type>
+    <unique>false</unique>
+</CustomField>

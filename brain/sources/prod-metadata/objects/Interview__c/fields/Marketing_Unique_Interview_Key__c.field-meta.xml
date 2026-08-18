@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Marketing_Unique_Interview_Key__c</fullName>
+    <externalId>false</externalId>
+    <formula>IF(
+    AND(
+        NOT(ISBLANK(Candidate__c)),
+        OR(
+            NOT(ISBLANK(Company__c)),
+            NOT(ISBLANK(company_new__c))
+        ),
+        OR(
+            ISPICKVAL(Round__c, &quot;Initial&quot;),
+            ISPICKVAL(Round__c, &quot;First&quot;)
+        ),
+        OR(
+            ISPICKVAL(Interview_Status__c, &quot;Scheduled&quot;),
+            ISPICKVAL(Interview_Status__c, &quot;Completed&quot;),
+            ISPICKVAL(Interview_Status__c, &quot;Moved to Next Round&quot;),
+            ISPICKVAL(Interview_Status__c, &quot;Loop Round&quot;),
+            ISPICKVAL(Interview_Status__c, &quot;Ghosted&quot;),
+            ISPICKVAL(Interview_Status__c, &quot;Rejected&quot;),
+            ISPICKVAL(Interview_Status__c, &quot;Offer Received&quot;)
+        ),
+        NOT(ISBLANK(Date_of_Interview__c))
+    ),
+    Candidate__c &amp; &quot;-&quot; &amp;
+    IF(
+        NOT(ISBLANK(Company__c)),
+        Company__c,
+        company_new__r.Name
+    ) &amp; &quot;-&quot; &amp;
+    TEXT(YEAR(Date_of_Interview__c)) &amp; &quot;-&quot; &amp;
+    RIGHT(&quot;00&quot; &amp; TEXT(MONTH(Date_of_Interview__c)), 2),
+    NULL
+)</formula>
+    <formulaTreatBlanksAs>BlankAsZero</formulaTreatBlanksAs>
+    <label>Marketing Unique Interview Key</label>
+    <required>false</required>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Text</type>
+    <unique>false</unique>
+</CustomField>

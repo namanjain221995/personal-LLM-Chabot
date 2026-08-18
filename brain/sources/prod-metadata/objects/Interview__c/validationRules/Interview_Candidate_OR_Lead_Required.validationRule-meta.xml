@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ValidationRule xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Interview_Candidate_OR_Lead_Required</fullName>
+    <active>true</active>
+    <errorConditionFormula>ISPICKVAL(Interview_Source__c,&apos;B2B Requirement&apos;) &amp;&amp; ISBLANK(Candidate__c) &amp;&amp; ISBLANK(Lead__c)</errorConditionFormula>
+    <errorMessage>Either Candidate or Lead must be linked for B2B Interview.</errorMessage>
+</ValidationRule>

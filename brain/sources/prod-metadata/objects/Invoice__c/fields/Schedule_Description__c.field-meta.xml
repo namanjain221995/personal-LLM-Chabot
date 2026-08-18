@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Schedule_Description__c</fullName>
+    <externalId>false</externalId>
+    <formula>&quot;Every &quot; &amp;
+IF(Interval__c = 1, &quot;&quot;, TEXT(Interval__c) &amp; &quot; &quot;) &amp;
+CASE(
+    TEXT(Frequency__c),
+    &quot;Daily&quot;, IF(Interval__c = 1, &quot;day&quot;, &quot;days&quot;),
+    &quot;Weekly&quot;, IF(Interval__c = 1, &quot;week&quot;, &quot;weeks&quot;),
+    &quot;Monthly&quot;, IF(Interval__c = 1, &quot;month&quot;, &quot;months&quot;),
+    &quot;Yearly&quot;, IF(Interval__c = 1, &quot;year&quot;, &quot;years&quot;),
+    &quot;&quot;
+)</formula>
+    <formulaTreatBlanksAs>BlankAsZero</formulaTreatBlanksAs>
+    <label>Schedule Description</label>
+    <required>false</required>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Text</type>
+    <unique>false</unique>
+</CustomField>

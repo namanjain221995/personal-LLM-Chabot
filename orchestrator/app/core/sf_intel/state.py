@@ -269,16 +269,23 @@ def _allows_multiple(slot: str, draft: ClarificationDraft) -> bool:
     answer, and a radio group forced a choice between two things the user needed
     together.
 
-    The planner can still force a single answer by setting multi_select=false
-    on a slot that is not exclusive — but it cannot force MULTI on one that is.
+    But the default is not a mandate. Some questions are alternative readings of
+    ONE number — "do you mean the interviews or the candidates who sit them?" —
+    and there ticking both is not a richer answer, it is a contradiction. The
+    planner is told to set multi_select=false for those and is now believed:
+    before this, the flag overrode its judgement globally and every such card
+    shipped as a checkbox group whose second tick made the question unanswerable.
+
+    Precedence: an exclusive SLOT always wins (the planner cannot force multi on
+    one), then the planner's explicit choice, then the deployment default.
     """
     from ...config import settings
 
     if slot in EXCLUSIVE_SLOTS:
         return False
-    if not settings.salesforce_multi_select_clarification:
+    if draft.multi_select is not None:
         return bool(draft.multi_select)
-    return True
+    return bool(settings.salesforce_multi_select_clarification)
 
 
 _PLACEHOLDERS = {
@@ -374,9 +381,14 @@ async def apply_response(
     except Exception as exc:  # noqa: BLE001
         raise ClarificationRejected("this clarification can no longer be read") from exc
 
-    if response.conversation_id and response.conversation_id != request.conversation_id:
+    # Both checks are unconditional. Guarding them behind "if the client sent
+    # one" made them opt-in: a response with the fields simply omitted skipped
+    # straight past both, which is the one shape an attacker would choose. The
+    # server minted the token and the conversation id; a client resuming a
+    # question it was actually shown always has them.
+    if response.conversation_id != request.conversation_id:
         raise ClarificationRejected("this clarification belongs to another conversation")
-    if response.resume_token and response.resume_token != row["resume_token"]:
+    if response.resume_token != row["resume_token"]:
         raise ClarificationRejected("stale clarification — it has been replaced")
     if row["state"] == "cancelled":
         raise ClarificationRejected("this question was cancelled")

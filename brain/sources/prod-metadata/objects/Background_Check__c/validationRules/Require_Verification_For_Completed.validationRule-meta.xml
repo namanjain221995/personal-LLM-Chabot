@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ValidationRule xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Require_Verification_For_Completed</fullName>
+    <active>true</active>
+    <errorConditionFormula>AND(
+    NOT( Before_Background_Check__c ),
+    NOT( C2C_Submission__c ),
+    ISCHANGED(Candidate_Details_Status__c),
+    ISPICKVAL(Candidate_Details_Status__c, &quot;Submitted&quot;),
+    Background_Check_Project_Count__c = 0
+)</errorConditionFormula>
+    <errorDisplayField>Background_Check_Status__c</errorDisplayField>
+    <errorMessage>Verification Status must be Completed and Final Employer Confirmation must be received before completing the Background Check.</errorMessage>
+</ValidationRule>

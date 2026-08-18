@@ -1,0 +1,424 @@
+# Compiled 2026-08-16 from brain/sources/techsara-org-knowledge-base.txt (preprod org documentation, 71 objects) by the brain ingestion pipeline: deterministic section/field parsing, every field name validated against the production dictionary + warehouse table list, rules distilled and adversarially verified. Fields the production warehouse lacks are only ever mentioned as explicit not-synced caveats.
+# Knowledge-only companion to qb-invoicing.yaml; field notes that pack already carries are excluded here.
+name: kb-billing-kb
+description: 'Invoice / Payment / QB Plan documentation from the org knowledge base.
+  Knowledge + field notes only: rules/triggers for billing live in qb-invoicing.yaml.'
+triggers: []
+tables: []
+rules: ''
+glossary: {}
+field_notes:
+  Invoice__c:
+    QB_Customer_Id__c: 'The QuickBooks CUSTOMER id for whoever is billed: takes
+      the Lead''s QB_Customer_ID__c if present, else the Candidate account''s.'
+    Invoice_Amount__c: The total amount billed on this invoice. Entered by the user
+      in whichever creation flow ran. The payment webhook compares the amount actually
+      paid against this to decide Not Paid / Partially Paid / Paid.
+    Invoice_Date__c: The date the invoice was issued. Written by the send/edit flows
+      (mirrors the QuickBooks transaction date). Only 36% populated - blank on manual
+      and payment-plan invoices.
+    Due_Date__c: When payment is due. Required on the page layout and 100% populated.
+      Entered by the user in the send flows; the payment-plan flow computes it as
+      the last installment's month.
+    Invoice_Link__c: 'HYPERLINK of QB_Admin_Base_URL + QB_Invoice_Id__c (NOT the legacy empty Invoice_Id__c): opens this
+      invoice in the QuickBooks Online admin UI (currently the QuickBooks sandbox
+      URL). For internal staff.'
+    Payment_Link__c: 'HYPERLINK of QB_Payment_Base_URL + QB_Invoice_Id__c (NOT the legacy empty Invoice_Id__c): the customer-facing
+      Intuit payment-portal link where the customer can pay the invoice online.
+      Shareable with the customer.'
+    QB_Email_Status__c: 'Whether QuickBooks has emailed the invoice to the customer:
+      NotSet | EmailSent | NeedToSend. Written by the send/edit flows after the
+      Send Invoice Email callout.'
+    Email_Sent_Date__c: When the invoice email went out. On the page layout but
+      populated on 0 records - no automation writes it (not fully documented - verify
+      with team whether it should be retired or wired up).
+    Is_Recurring__c: TRUE when Type__c = "Recurring" - a filterable flag for reports
+      and the Slack flow's decision. Currently always false.
+    Recurring_Start_Date__c: When the subscription billing starts. Never populated.
+    Monthly_Revenue__c: Normalizes the recurring amount to a per-month figure from
+      Frequency and Interval (Daily x30, Weekly x4, Monthly /interval, ...). Blank
+      while the recurring fields are unused.
+    Annual_Revenue__c: Monthly_Revenue__c * 12 - the annualized subscription value,
+      read by the Slack creation message for recurring invoices.
+  Payment__c:
+    Invoice__c: 'THE required parent link: which invoice this money applies to.
+      100% populated; controls sharing; the rollup path for Amount_Paid__c.'
+    Candidate_Name__c: Convenience formula showing the paying candidate's name pulled
+      through the parent invoice (Invoice -> Candidate first + last name). Blank
+      when the invoice is linked to a Lead only or to no person.
+    Name_Hyperlink__c: A clickable HYPERLINK of the record's own auto-number name
+      - used in list views / flow data tables where the standard Name link is not
+      available.
+    QB_Operation__c: 'The last QuickBooks operation applied to this record: "Create",
+      "Update" or "Void", written by the webhook flow. A change to this field is
+      the entry condition for the update/void Slack alert.'
+    Transaction_Id__c: The card-processor transaction id (from the QuickBooks credit-card
+      charge response) - the reference for reconciling card payments with the processor.
+      Present on 12 records (card payments only).
+  QB_Plan__c:
+    Name: The plan's display name and the lookup key the invoice flows match on
+      (e.g. "Career Accelerator"). Entered by an admin.
+    Item_Number__c: The QuickBooks Online item (product/service) number for this
+      plan - what the invoice line item in QuickBooks is created against. Entered
+      by an admin; must match QuickBooks exactly.
+knowledge:
+- title: Invoice__c — What This Object Is
+  keywords:
+  - invoice
+  text: 'Invoice__c is one bill Techsara issues to a PERSON it is charging - in
+    practice
+
+    a candidate (Person Account) or a not-yet-converted website Lead who is buying
+
+    a paid career-coaching service package (the packages sold are the QB Plans:
+
+    "Career Accelerator" and "Ultimate Career Architect"). It is NOT client/B2B
+
+    placement billing - no invoice links to a Job Requirement, Onboarding or
+
+    client company today.
+
+
+    The record is the Salesforce mirror of a real invoice living in QUICKBOOKS
+
+    ONLINE. The QuickBooks integration creates the invoice inside QuickBooks,
+
+    emails it to the customer from QuickBooks, and stores the QuickBooks ids and
+
+    links on this record. When the customer pays (online card payment or a
+
+    recorded payment in QuickBooks), a webhook pushes the payment back into
+
+    Salesforce as a child Payment__c record and recomputes this invoice''s status.
+
+    The object also supports a Salesforce-only INSTALLMENT PAYMENT PLAN: a screen
+
+    flow splits the invoice amount into N monthly "Scheduled" Payment__c children.'
+- title: Invoice__c — Kind Of Object
+  keywords:
+  - invoice
+  text: "- Custom object, the head of the small QuickBooks billing domain (Invoice__c\n\
+    \  -> Payment__c children, QB_Plan__c custom setting as the price list).\n-\
+    \ Standalone parent: OWD sharing is PRIVATE and the record has its own owner\n\
+    \  (unlike most billing-adjacent objects it is NOT a child of Account - the\n\
+    \  Candidate__c link is a plain lookup, not master-detail).\n- MASTER of Payment__c:\
+    \ Payment records are master-detail children and roll\n  their paid amounts\
+    \ up into Amount_Paid__c.\n- 25 custom fields, 0 record types, 0 validation\
+    \ rules, 1 list view.\n- Auto-number Name in the format INV-{0000}.\n- Scale:\
+    \ 87 records in preprod (Dec 2024 to Jul 2026) - a small, lightly used\n  object\
+    \ compared to the recruiting core."
+- title: Invoice__c — Record Types
+  keywords:
+  - invoice
+  text: 'None. Every invoice is the same shape; the QB_Created_From__c picklist
+    (Lead /
+
+    Account / Manual) carries the "where did this come from" signal instead.'
+- title: Invoice__c — How It Is Used — The Business Process
+  keywords:
+  - invoice
+  text: "STEP 1 - CREATION. Four entry points, all buttons:\n  - \"Send Invoice\"\
+    \ on a LEAD page (screen flow QB_Send_Invoice_To_QuickBooks,\n    on the B2B\
+    \ Client Lead / B2B Website Candidate / three-column Lead record\n    pages):\
+    \ the sales user picks a QB Plan and amount; the flow searches\n    QuickBooks\
+    \ for the customer (creating one if needed via the QuickBooks\n    external\
+    \ services), creates the invoice inside QuickBooks, emails it to\n    the customer\
+    \ from QuickBooks, and then saves the Invoice__c record with\n    Lead__c, amounts/dates,\
+    \ QB_Created_From = \"Lead\", the QuickBooks invoice\n    id and the email status.\n\
+    \  - \"Send Invoice\" on a CANDIDATE (Person Account) page (screen flow\n  \
+    \  QB_Send_Invoice_To_QuickBooks_For_Account, on Candidate_Record_Page1):\n\
+    \    same QuickBooks choreography for a converted candidate; it also writes\n\
+    \    the QuickBooks customer id and address/contact data back onto the\n   \
+    \ candidate Account (Account.QB_Customer_ID__c).\n  - \"Initiate Payment Plan\"\
+    \ on ACCOUNT pages (screen flow\n    Initiate_Payment_Plan, placed on the B2B\
+    \ Client Account and Vendor\n    Account record pages + classic Account layout):\
+    \ a SALESFORCE-ONLY path\n    with no QuickBooks callout. The user enters invoice\
+    \ number, total amount,\n    plan duration in months (1-24, capped by the Maximum_Payment_Plan_\n\
+    \    Duration custom label) and a future first-payment date; the flow shows"
+- title: Invoice__c — How It Is Used — The Business Process (2)
+  keywords:
+  - invoice
+  text: "the computed schedule, requires an \"I have reviewed the payment plan\"\
+    \n    confirmation, then creates the Invoice__c (Candidate__c = the account)\n\
+    \    plus one \"Scheduled\"/\"Partial\" Payment__c per month, each for an equal\n\
+    \    share of the amount. Runs in system mode without sharing.\n  - LEGACY:\
+    \ the \"Create Invoice\" button on Lead pages and \"Record Offer\n    Letter\
+    \ Payment\" on Account pages still point at the OBSOLETE flow\n    Create_Invoice_Payment\
+    \ - these buttons are effectively dead and error if\n    clicked (the flow has\
+    \ no active version).\nSTEP 2 - SLACK ANNOUNCEMENT. On creation, the record-triggered\
+    \ flow\n  QB_Invoice_Creation_Update_Slack_Notifications posts the new invoice\
+    \ to\n  Slack (a different message variant for recurring/subscription invoices),\n\
+    \  with one scheduled follow-up path.\nSTEP 3 - THE CUSTOMER PAYS IN QUICKBOOKS.\
+    \ QuickBooks calls the public site\n  \"QuickBooks_Webhook\" -> Apex QB_QuickBooksWebhookListener\
+    \ (REST endpoint\n  /quickbooks/webhook/*) -> autolaunched flow QB_Process_Payment_Webhook.\n\
+    \  The flow fetches the payment details from QuickBooks and, per operation:\n\
+    \  - Create: dedupe-checks by QuickBooks payment id, finds the invoice by\n\
+    \    QB_Invoice_Id__c, creates a \"Paid\" Payment__c child (Full or Partial\
+    \ by\n    amount), and sets Invoice_Status__c to Not Paid / Partially Paid /\
+    \ Paid\n    by comparing the applied amount to Invoice_Amount__c."
+- title: Invoice__c — How It Is Used — The Business Process (3)
+  keywords:
+  - invoice
+  text: "- Update: refreshes the payment's amounts and recomputes the status.\n\
+    \  - Void: zeroes the payment, marks it \"Void\", and sets the invoice's\n \
+    \   status to \"Dispute\".\nSTEP 4 - EDITS AND REMINDERS. The \"Edit Invoice\"\
+    \ quick action (screen flow\n  QB_Edit_Invoice) changes amount/dates on BOTH\
+    \ the QuickBooks invoice and\n  the Salesforce record and can re-send the invoice\
+    \ email; the \"Invoice\n  Reminder\" button on the invoice page (flow QB_Send_Invoice_Reminder)\
+    \ just\n  re-emails the invoice through QuickBooks.\nSTEP 5 - LEAD CONVERSION\
+    \ RELINK. When a Lead with invoices converts, the\n  record-triggered flow Update_Invoice_Records_with_Candidate_Details\
+    \ finds\n  all invoices pointing at that Lead and stamps Candidate__c with the\
+    \ new\n  Person Account, so billing history follows the candidate.\nSTEP 6 -\
+    \ COLLECTION TRACKING. Payment children roll up into Amount_Paid__c;\n  Outstanding_Amount__c\
+    \ shows what is still owed; finance works the \"Not\n  Paid\" / \"Partially\
+    \ Paid\" invoices."
+- title: Invoice__c — Connected Objects
+  keywords:
+  - invoice
+  - each
+  - relationship
+  - means
+  text: "LOOKUPS FROM INVOICE TO OTHER OBJECTS:\n- Account (Candidate__c, lookup,\
+    \ rel name \"Invoices\"): the candidate (Person\n  Account) being billed. 51%\
+    \ populated; auto-set by the Account send flow and\n  the payment-plan flow,\
+    \ and backfilled on lead conversion.\n- Lead (Lead__c, lookup, rel name \"Invoices\"\
+    ): the pre-conversion website\n  lead being billed (the sales team often invoices\
+    \ before conversion). 38%\n  populated. 26 records carry BOTH lead and candidate\
+    \ (invoiced as a lead,\n  then converted); 36 records (41%) carry NEITHER -\
+    \ mostly older/manual or\n  payment-plan test records, so do not assume every\
+    \ invoice reaches a person\n  record.\n\nOBJECTS THAT POINT AT INVOICE:\n- Payment__c\
+    \ (MASTER-DETAIL child, rel name \"Payments\"): one row per money\n  event -\
+    \ a webhook-recorded QuickBooks payment or a planned installment.\n  Shown as\
+    \ the only related list on the invoice record page.\n\nEXTERNAL COUNTERPARTS\
+    \ (not Salesforce records):\n- The QuickBooks Online invoice (QB_Invoice_Id__c\
+    \ / Invoice_Id__c) and the\n  QuickBooks customer (QB_Customer_Id__c via the\
+    \ Lead/Account).\n\nEXPLICIT NON-RELATIONSHIPS: no link to Job_Requirement__c,\
+    \ Job_Submission__c,\nOnboarding__c, Vendor__c or any client company - as built,\
+    \ this object bills\nINDIVIDUALS for coaching services, not B2B clients for\
+    \ placements."
+- title: Invoice__c — Business Rules
+  keywords:
+  - invoice
+  - validation
+  text: 'None. There are no validation rules on Invoice__c; the guardrails live
+    inside
+
+    the Initiate_Payment_Plan flow instead (first payment date must be in the
+
+    future, duration 1-24 months, duplicate-invoice-number fault handling).'
+- title: Invoice__c — Automation
+  keywords:
+  - invoice
+  - runs
+  text: "RECORD-TRIGGERED FLOWS (active):\n- QB_Invoice_Creation_Update_Slack_Notifications\
+    \ (after save, create, +1\n  scheduled path): Slack post announcing the new\
+    \ invoice; separate message\n  for recurring invoices.\n- Update_Invoice_Records_with_Candidate_Details\
+    \ (on Lead, after save, when\n  Status changes to Converted): re-links this\
+    \ lead's invoices to the newly\n  created candidate Account (sets Candidate__c).\n\
+    \nAUTOLAUNCHED FLOW (called by Apex, not by record changes):\n- QB_Process_Payment_Webhook:\
+    \ invoked by QB_QuickBooksWebhookListener for\n  each QuickBooks Payment event;\
+    \ creates/updates/voids Payment__c children\n  and recomputes Invoice_Status__c\
+    \ (Void -> \"Dispute\")."
+- title: Invoice__c — Automation (2)
+  keywords:
+  - invoice
+  - runs
+  text: "SCREEN FLOWS / BUTTONS:\n- QB_Send_Invoice_To_QuickBooks (\"Send Invoice\"\
+    \ on Lead) and\n  QB_Send_Invoice_To_QuickBooks_For_Account (\"Send Invoice\"\
+    \ on the candidate\n  Account page): create the invoice in QuickBooks + Salesforce\
+    \ and email it.\n- QB_Edit_Invoice (\"Edit Invoice\" quick action): sync edits\
+    \ to QuickBooks.\n- QB_Send_Invoice_Reminder (\"Invoice Reminder\" on the invoice\
+    \ page): re-send\n  the invoice email through QuickBooks.\n- Initiate_Payment_Plan\
+    \ (\"Initiate Payment Plan\" on Account pages): create\n  invoice + monthly\
+    \ scheduled Payment__c installments (no QuickBooks call).\n- Create_Invoice_Payment\
+    \ (OBSOLETE - no active version) is still wired to\n  the \"Create Invoice\"\
+    \ (Lead) and \"Record Offer Letter Payment\" (Account)\n  buttons; those buttons\
+    \ are currently dead.\n\nAPEX:\n- QB_QuickBooksWebhookListener (@RestResource\
+    \ /quickbooks/webhook/*, exposed\n  through the public \"QuickBooks_Webhook\"\
+    \ site): parses QuickBooks event\n  notifications, forwards only Payment entities\
+    \ (payment id + operation)\n  into QB_Process_Payment_Webhook. Returns 400 on\
+    \ bad payloads.\n- InvoiceController (invocable \"Create Payment Records\"):\
+    \ splits an invoice\n  amount into N monthly Scheduled payments. No flow in\
+    \ the org calls it\n  today - a legacy helper superseded by Initiate_Payment_Plan's\
+    \ own logic.\n- No Apex trigger on Invoice__c."
+- title: Invoice__c — Automation (3)
+  keywords:
+  - invoice
+  - runs
+  text: 'INTEGRATION PLUMBING: named credential "QuickBooks" + ~10 external service
+
+    registrations (QuickBookCreateInvoice, QuickBooksAPI/APIs, QuickBooksAPIGet-
+
+    Payment, QuickBookSendInvoiceEmail, QuickBooksGet/SaveCustomer, QuickBooks-
+
+    Get/SaveInvoice, QuickBookFindInvoice). The QB_Admin_Base_URL custom label
+
+    points at app.sandbox.qbo.intuit.com - preprod talks to a QuickBooks SANDBOX
+
+    company, not production books.'
+- title: Payment__c — What This Object Is
+  keywords:
+  - payment
+  text: "Payment__c is one MONEY EVENT against an invoice. It plays two roles:\n\
+    \  a) An ACTUAL PAYMENT received - normally created automatically by the\n \
+    \    QuickBooks webhook when the customer pays (status \"Paid\", with the\n\
+    \     QuickBooks payment id and card transaction id), or recorded manually.\n\
+    \  b) A PLANNED INSTALLMENT - created in bulk by the \"Initiate Payment Plan\"\
+    \n     flow (status \"Scheduled\" with a future Scheduled_Date__c), representing\n\
+    \     one month's share of a payment plan that has not been collected yet.\n\
+    Its paid amounts roll up to the parent invoice, which is how an invoice knows\n\
+    it is Partially Paid or Paid."
+- title: Payment__c — Kind Of Object
+  keywords:
+  - payment
+  text: "- Custom object, the child half of the billing pair.\n- MASTER-DETAIL CHILD\
+    \ OF Invoice__c: every payment belongs to exactly one\n  invoice; sharing is\
+    \ \"Controlled By Parent\" (whoever sees the invoice sees\n  its payments);\
+    \ no owner of its own.\n- 12 custom fields, 0 record types, 0 validation rules,\
+    \ 2 list views.\n- Auto-number Name in the format Payment-{000}.\n- Scale: 163\
+    \ records in preprod (Dec 2024 to Jul 2026); ~62% of them are\n  future \"Scheduled\"\
+    \ installments rather than money actually received."
+- title: Payment__c — Record Types
+  keywords:
+  - payment
+  text: 'None. The Payment_Status__c ("Scheduled" vs "Paid") carries the planned-vs-
+
+    actual distinction that record types would otherwise encode.'
+- title: Payment__c — How It Is Used — The Business Process
+  keywords:
+  - payment
+  text: "STEP 1 - CREATION. Three live paths:\n  - WEBHOOK (the main automated path):\
+    \ QuickBooks notifies the public\n    QuickBooks_Webhook site; Apex QB_QuickBooksWebhookListener\
+    \ forwards each\n    Payment event into flow QB_Process_Payment_Webhook, which\
+    \ fetches the\n    payment from QuickBooks, dedupe-checks by QuickBooks payment\
+    \ id, locates\n    the invoice by its QB invoice id, and creates the Payment__c:\
+    \ status\n    \"Paid\", Payment_Amount = the QuickBooks total, Amount_Paid =\
+    \ total minus\n    unapplied amount, Payment_Date = the QuickBooks transaction\
+    \ date,\n    Payment_Type Full/Partial (did it settle the invoice or not),\n\
+    \    QB_Operation = \"Create\", plus the QuickBooks payment id and the card\n\
+    \    transaction id.\n  - PAYMENT PLAN: Initiate_Payment_Plan creates one \"\
+    Scheduled\"/\"Partial\"\n    payment per month of the plan, each with an equal\
+    \ share of the invoice\n    amount in Payment_Amount__c and a future Scheduled_Date__c.\
+    \ Amount_Paid\n    stays empty until money really arrives.\n  - MANUAL: finance\
+    \ can key a payment in by hand (the older, obsolete\n    Create_Invoice_Payment\
+    \ flow did this too; many 2024-25 \"Paid\" records\n    without QuickBooks ids\
+    \ came from these paths).\nSTEP 2 - ROLLUP. Amount_Paid__c sums up to Invoice__c.Amount_Paid__c,\
+    \ which\n  drives the invoice's Outstanding_Amount__c and (via the webhook flow)\
+    \ its\n  Not Paid / Partially Paid / Paid status."
+- title: Payment__c — How It Is Used — The Business Process (2)
+  keywords:
+  - payment
+  text: "STEP 3 - SLACK. On creation, QB_Payment_Creation_Slack_Notifications posts\n\
+    \  the payment to Slack (with a scheduled follow-up path), so finance sees\n\
+    \  money arrive in real time.\nSTEP 4 - LATER QUICKBOOKS CHANGES. If the payment\
+    \ is edited in QuickBooks,\n  the webhook flow updates the record (QB_Operation\
+    \ = \"Update\", amounts\n  refreshed, invoice status recomputed). If it is VOIDED,\
+    \ the flow blanks\n  the paid amount, clears status/type, sets QB_Operation\
+    \ = \"Void\" and flips\n  the parent invoice to \"Dispute\". The QB_Payment_Update_Slack_Notifications\n\
+    \  flow (fires when QB_Operation changes) announces the void/update in Slack."
+- title: Payment__c — Connected Objects
+  keywords:
+  - payment
+  - each
+  - relationship
+  - means
+  text: "PARENT:\n- Invoice__c (via Invoice__c, MASTER-DETAIL, required, 100% populated,\
+    \ rel\n  name \"Payments\"): the invoice this money applies to. The payment\
+    \ inherits\n  the invoice's sharing and appears in the invoice page's only related\
+    \ list.\n  Amount_Paid__c rolls up to the invoice.\n\nINDIRECT (via the parent):\n\
+    - Account / Lead: the person who paid, reachable through Invoice__c ->\n  Candidate__c\
+    \ / Lead__c (surfaced on the payment by the Candidate_Name__c\n  formula).\n\
+    \nEXTERNAL COUNTERPARTS: the QuickBooks Payment (QB_Payment_Id__c) and the\n\
+    card-processor transaction (Transaction_Id__c).\n\nNo other object looks up\
+    \ to Payment__c."
+- title: Payment__c — Business Rules
+  keywords:
+  - payment
+  - validation
+  text: 'None. There are no validation rules on Payment__c; data quality relies
+    on the
+
+    webhook flow''s dedupe/decision logic and the payment-plan flow''s input checks.'
+- title: Payment__c — Automation
+  keywords:
+  - payment
+  - runs
+  text: "RECORD-TRIGGERED FLOWS (active):\n- QB_Payment_Creation_Slack_Notifications\
+    \ (after save, create, +1 scheduled\n  path): Slack post announcing the payment\
+    \ (name, amounts, dates, status,\n  type, QB ids, parent invoice).\n- QB_Payment_Update_Slack_Notifications\
+    \ (after save, update, entry condition\n  on QB_Operation__c changing): Slack\
+    \ post when QuickBooks updates or VOIDS\n  a payment.\n\nCREATED / UPDATED BY\
+    \ (no trigger of its own):\n- QB_Process_Payment_Webhook (autolaunched, invoked\
+    \ by Apex\n  QB_QuickBooksWebhookListener from the /quickbooks/webhook/* endpoint):\n\
+    \  creates \"Paid\" payments and applies Update/Void changes from QuickBooks.\n\
+    - Initiate_Payment_Plan (screen flow): bulk-creates the monthly \"Scheduled\"\
+    \n  installment payments.\n- InvoiceController (Apex invocable \"Create Payment\
+    \ Records\"): the same\n  monthly split in code - not called by any current\
+    \ flow (legacy).\n- Create_Invoice_Payment (screen flow, OBSOLETE): the old\
+    \ manual\n  invoice+payment entry path; its buttons still exist on Lead/Account\
+    \ pages\n  but the flow is inactive."
+- title: QB_Plan__c — What This Object Is
+  keywords:
+  - plan
+  text: 'QB_Plan__c is the tiny PRICE LIST behind the invoice flows: one row per
+
+    sellable career-coaching service package, mapping the plan''s display name to
+
+    its ITEM NUMBER inside QuickBooks Online. When a sales user runs "Send
+
+    Invoice", the flow reads these rows so the invoice line item created in
+
+    QuickBooks references the right QuickBooks product/service item. It holds
+
+    configuration, not transactions - two rows exist and they change only when
+
+    the service catalog changes.'
+- title: QB_Plan__c — Kind Of Object
+  keywords:
+  - plan
+  text: "- NOT a normal custom object: it is a LIST CUSTOM SETTING (public\n  visibility).\
+    \ It has no tab, no page layouts, no sharing model, no owner\n  semantics -\
+    \ it is admin-managed reference data available to all code and\n  flows without\
+    \ extra object permissions. (The generated object catalog\n  labels it \"custom\
+    \ object\"; the metadata's customSettingsType=List is the\n  truth.)\n- 1 custom\
+    \ field (Item_Number__c) plus the standard Name.\n- 0 record types, 0 validation\
+    \ rules, 0 list views (custom settings support\n  none of these).\n- Scale:\
+    \ 2 configured rows in preprod."
+- title: QB_Plan__c — How It Is Used — The Business Process
+  keywords:
+  - plan
+  text: "STEP 1 - SETUP. An admin adds one row per sellable plan in Setup > Custom\n\
+    \  Settings (Name = the plan as shown to the sales user, Item_Number__c = the\n\
+    \  matching QuickBooks item/product code). This must stay in lockstep with\n\
+    \  the product list inside QuickBooks - a wrong item number breaks invoice\n\
+    \  creation.\nSTEP 2 - INVOICE CREATION. The screen flows QB_Send_Invoice_To_QuickBooks\n\
+    \  (Lead), QB_Send_Invoice_To_QuickBooks_For_Account (candidate Account) and\n\
+    \  QB_Edit_Invoice each look these rows up by Name to present the plan choice\n\
+    \  and build the QuickBooks invoice line item from the item number.\nSTEP 3\
+    \ - There is no step 3: nothing writes to it at runtime and nothing\n  else\
+    \ reads it."
+- title: QB_Plan__c — Connected Objects
+  keywords:
+  - plan
+  text: 'None. As a custom setting it has no relationships in either direction -
+    the
+
+    invoice flows read it by Name matching only. Its real "relationship" is to
+
+    the product/service item list inside QuickBooks Online.'
+- title: QB_Plan__c — Business Rules
+  keywords:
+  - plan
+  - validation
+  text: 'None. Custom settings do not support validation rules; correctness of the
+
+    item numbers is maintained by hand.'
+- title: QB_Plan__c — Automation
+  keywords:
+  - plan
+  - runs
+  text: 'Nothing runs ON it (custom settings cannot have triggers or record-triggered
+
+    flows). It is READ by three screen flows: QB_Send_Invoice_To_QuickBooks,
+
+    QB_Send_Invoice_To_QuickBooks_For_Account and QB_Edit_Invoice.'

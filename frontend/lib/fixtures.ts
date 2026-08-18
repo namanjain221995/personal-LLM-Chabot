@@ -354,7 +354,8 @@ const clarifyFixture: Fixture = {
       root_user_message_id: 'msg_mock',
       intent_id: 'int_mock',
       source: 'salesforce',
-      header: 'Salesforce',
+      // A TOPIC, not a source — the card reads "Clarification · Time period".
+      header: 'Time period',
       question: 'Which period should I use for the pipeline?',
       slot: 'date_range',
       options: [

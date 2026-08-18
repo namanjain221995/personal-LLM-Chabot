@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Total_Plan_Value__c</fullName>
+    <description>Total contract value. For recurring plans = Recurring Amount x Number of Months (cycles); blank when the plan is open-ended (no cycle count). For one-time invoices = Invoice Amount.</description>
+    <formula>IF(
+    ISPICKVAL(Type__c, &quot;Recurring&quot;),
+    IF(
+        ISBLANK(Number_of_Months__c),
+        null,
+        Recurring_Amount__c * Number_of_Months__c
+    ),
+    Invoice_Amount__c
+)</formula>
+    <formulaTreatBlanksAs>BlankAsZero</formulaTreatBlanksAs>
+    <inlineHelpText>Total value of the plan across all cycles (per-cycle amount x number of cycles). Blank for open-ended plans.</inlineHelpText>
+    <label>Total Plan Value</label>
+    <precision>18</precision>
+    <required>false</required>
+    <scale>2</scale>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Currency</type>
+</CustomField>

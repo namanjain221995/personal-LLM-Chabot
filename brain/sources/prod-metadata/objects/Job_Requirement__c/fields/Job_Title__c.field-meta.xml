@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Job_Title__c</fullName>
+    <description>The title of the open position the client needs to fill. Displayed on website listings and used for candidate matching.</description>
+    <externalId>false</externalId>
+    <inlineHelpText>Enter the job title exactly as the client provided. Example: Salesforce Developer, Java Backend Engineer, AI/ML Engineer, DevOps Consultant.</inlineHelpText>
+    <label>Job Title</label>
+    <length>255</length>
+    <required>false</required>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Text</type>
+    <unique>false</unique>
+</CustomField>

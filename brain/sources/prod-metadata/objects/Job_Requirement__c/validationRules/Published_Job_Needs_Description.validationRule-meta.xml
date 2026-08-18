@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ValidationRule xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Published_Job_Needs_Description</fullName>
+    <active>false</active>
+    <description>Public Website Description and External Job ID are required when Website Status is Published.</description>
+    <errorConditionFormula>ISPICKVAL(Website_Status__c,&apos;Published&apos;) &amp;&amp; (ISBLANK(Public_Website_Description__c))</errorConditionFormula>
+    <errorDisplayField>Website_Status__c</errorDisplayField>
+    <errorMessage>Public Website Description and External Job ID are required when Website Status is Published.</errorMessage>
+</ValidationRule>

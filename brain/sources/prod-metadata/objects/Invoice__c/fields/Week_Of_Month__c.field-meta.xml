@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Week_Of_Month__c</fullName>
+    <label>Week of Month</label>
+    <required>false</required>
+    <trackFeedHistory>false</trackFeedHistory>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Picklist</type>
+    <valueSet>
+        <valueSetDefinition>
+            <sorted>false</sorted>
+            <value>
+                <fullName>First</fullName>
+                <default>false</default>
+                <label>First</label>
+            </value>
+            <value>
+                <fullName>Second</fullName>
+                <default>false</default>
+                <label>Second</label>
+            </value>
+            <value>
+                <fullName>Third</fullName>
+                <default>false</default>
+                <label>Third</label>
+            </value>
+            <value>
+                <fullName>Fourth</fullName>
+                <default>false</default>
+                <label>Fourth</label>
+            </value>
+            <value>
+                <fullName>Last</fullName>
+                <default>false</default>
+                <label>Last</label>
+            </value>
+        </valueSetDefinition>
+    </valueSet>
+</CustomField>

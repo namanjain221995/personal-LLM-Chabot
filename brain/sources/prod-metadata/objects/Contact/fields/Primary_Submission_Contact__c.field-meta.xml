@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Primary_Submission_Contact__c</fullName>
+    <defaultValue>false</defaultValue>
+    <description>Marks this contact as the primary recipient for candidate profile submissions. Only one contact per account should be marked as primary.</description>
+    <inlineHelpText>Check for the main contact who should receive candidate submission emails. Only one contact per client should have this checked.</inlineHelpText>
+    <label>Primary Submission Contact</label>
+    <trackFeedHistory>false</trackFeedHistory>
+    <type>Checkbox</type>
+</CustomField>

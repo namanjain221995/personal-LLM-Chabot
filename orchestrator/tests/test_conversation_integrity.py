@@ -543,8 +543,20 @@ def test_health_reports_the_app_database(monkeypatch):
     result = health_module._check_app_db()
     assert result["status"] == "error" and result["detail"]
 
-    # And so is a database whose migrations have not been applied.
-    monkeypatch.setattr(health_module, "EXPECTED_SCHEMA_VERSION", 999)
     monkeypatch.undo()
+
+    # And so is a database whose migrations have not been applied. The expected
+    # version is DERIVED from db._MIGRATIONS rather than written down, so this
+    # patches the derivation: as a literal the constant said 4 while migration
+    # v5 shipped the entire clarification schema, and a database with none of
+    # those tables reported healthy.
+    monkeypatch.setattr(health_module, "_expected_schema_version", lambda: 999)
     stale = health_module._check_app_db()
-    assert stale["status"] == "ok"  # back on the real DSN, at the real version
+    assert stale["status"] == "error"
+    assert "migrations have not been applied" in stale["detail"]
+
+    monkeypatch.undo()
+    assert health_module._check_app_db()["status"] == "ok"
+    from app import db as _db
+
+    assert health_module._expected_schema_version() == _db.LATEST_SCHEMA_VERSION

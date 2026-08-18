@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Client_Type__c</fullName>
+    <description>Categorizes the type of B2B relationship. Direct Client hires directly. Vendor and MSP are middle-layer staffing companies.</description>
+    <inlineHelpText>Direct Client = Company hiring directly
+Vendor = Staffing vendor
+Implementation Partner = Tech implementation company
+MSP = Managed Service Provider.</inlineHelpText>
+    <label>Client Type</label>
+    <required>false</required>
+    <trackFeedHistory>false</trackFeedHistory>
+    <trackHistory>false</trackHistory>
+    <type>Picklist</type>
+    <valueSet>
+        <valueSetDefinition>
+            <sorted>false</sorted>
+            <value>
+                <fullName>Direct Client</fullName>
+                <default>false</default>
+                <label>Direct Client</label>
+            </value>
+            <value>
+                <fullName>Vendor</fullName>
+                <default>false</default>
+                <label>Vendor</label>
+            </value>
+            <value>
+                <fullName>Implementation Partner</fullName>
+                <default>false</default>
+                <label>Implementation Partner</label>
+            </value>
+            <value>
+                <fullName>MSP</fullName>
+                <default>false</default>
+                <label>MSP</label>
+            </value>
+            <value>
+                <fullName>Other</fullName>
+                <default>false</default>
+                <label>Other</label>
+            </value>
+        </valueSetDefinition>
+    </valueSet>
+</CustomField>

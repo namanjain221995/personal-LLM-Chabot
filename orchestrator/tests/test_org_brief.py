@@ -243,7 +243,17 @@ def test_the_live_path_is_given_the_business_date_explicitly():
 def test_training_rules_only_load_for_training_questions():
     """ORG_RULES is on every question; domain rules must not be."""
     assert "Slot" in ob.domain_rules_for("how many candidates in slot 128")
-    assert ob.domain_rules_for("how much have we invoiced this month") == ""
+    # "invoiced" grew its own domain in 2026-08 (qb-invoicing pack), and the
+    # 2026-08-16 org knowledge base gave interviews, marketing, onboarding,
+    # portals, tickets etc. their own packs too — the no-domain probe must
+    # name nothing any domain owns. Platform plumbing still qualifies.
+    assert ob.domain_rules_for("how many chatter posts were made yesterday") == ""
+
+
+def test_billing_rules_load_from_the_brain_pack():
+    """Knowledge packs are domain rules too (core/brain.py)."""
+    rules = ob.domain_rules_for("how much have we invoiced this month")
+    assert "Billing rules" in rules
 
 
 def test_slot_is_the_word_for_cohort():

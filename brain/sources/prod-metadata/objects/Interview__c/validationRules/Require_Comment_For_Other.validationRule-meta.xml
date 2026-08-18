@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ValidationRule xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Require_Comment_For_Other</fullName>
+    <active>true</active>
+    <errorConditionFormula>AND(
+  ISPICKVAL(Status_New_Reason__c, &quot;Other&quot;),
+  ISBLANK(Status_Reason_Comment__c)
+)</errorConditionFormula>
+    <errorDisplayField>Status_Reason_Comment__c</errorDisplayField>
+    <errorMessage>Status Reason Comment is required  when Status Reason is Other.</errorMessage>
+</ValidationRule>

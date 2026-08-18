@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomObject xmlns="http://soap.sforce.com/2006/04/metadata">
+    <description>Stores environment-specific Slack channel IDs and email sender or recipient addresses used by Salesforce Flows and other custom implementations.
+
+It is mandatory to use meaningful Labels, API Names, Descriptions, and Help Text for each field to ensure administrators and developers can easily understand the purpose and context of the Slack channel IDs and email addresses maintained in this metadata.</description>
+    <label>Slack &amp; Email Notification Metadata</label>
+    <pluralLabel>Slack_Email_Notification_Metadata</pluralLabel>
+    <visibility>Public</visibility>
+</CustomObject>

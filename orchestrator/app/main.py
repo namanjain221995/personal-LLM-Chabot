@@ -377,7 +377,12 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
     to re-join it, and GET /chat/active to see what is still running.
     """
     # Image-only sends still need a text instruction for the vision engine.
-    text = request.text or "Analyze the attached image."
+    # Gated on there actually BEING an image: a Skip click carries no text of
+    # its own (`_require_input` permits that), and without the gate the
+    # placeholder became the request — so answering a clarifying question by
+    # skipping it sent "Analyze the attached image." to the Salesforce planner
+    # as the thing the user wanted to know.
+    text = request.text or ("Analyze the attached image." if request.image_data else "")
 
     def meta_extras(route: Optional[str]) -> dict:
         """V2 §2: meta gains mode / model (served model id) / effort — merged
@@ -758,10 +763,20 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             # (2026-08-11): the second half of a resumed request was routed to
             # the agent engine and the resume was silently lost.
             sf_outcome = None
+            # ONE clarification implementation, two planners. Intelligence Mode
+            # on → the model plans and may ask; off → the deterministic
+            # detectors in core/clarify.py ask, through the SAME persisted,
+            # resumable, loop-guarded card. The previous arrangement ran a
+            # second implementation here whose card could not be resumed, did
+            # not survive a reload, and re-asked its own question forever.
+            clarification_available = (
+                settings.salesforce_intelligence_enabled
+                or settings.clarify_before_answering
+            )
             answering_clarification = bool(
                 request.clarification
                 and request.mode == "salesforce"
-                and settings.salesforce_intelligence_enabled
+                and clarification_available
             )
             # NOTE ON `want_agent`: it is deliberately NOT a gate here.
             # Resolving a request against the conversation, and asking about a
@@ -780,7 +795,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             # RESOLVED request rather than the ambiguous one.
             if answering_clarification or (
                 request.mode == "salesforce"
-                and settings.salesforce_intelligence_enabled
+                and clarification_available
                 and request.text
                 and not (request.pdf_data or request.image_data)
                 and not request.sf_live
@@ -794,6 +809,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 from .engines import sf_intel
 
                 answer_to_pending = None
+                malformed = False
                 if request.clarification:
                     try:
                         answer_to_pending = ClarificationResponse.model_validate(
@@ -801,85 +817,66 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                         )
                     except Exception as exc:  # noqa: BLE001
                         # A malformed response is the client's bug, not the
-                        # user's: say so plainly instead of silently treating
-                        # their click as a brand-new question.
+                        # user's. Saying so is better than silently re-reading
+                        # their click as a brand-new question, which is what
+                        # happened before: the engine fell through to the topic
+                        # classifier, an option label on its own read as a
+                        # change of subject, and the pending question — and the
+                        # request behind it — were cancelled.
                         logging.getLogger(__name__).info(
                             "rejecting a malformed clarification response: %s",
                             str(exc)[:200],
                         )
+                        malformed = True
 
-                sf_outcome = await sf_intel.run(
-                    text,
-                    history,
-                    emit,
-                    conversation_id=conv_key,
-                    effort=request.effort,
-                    model_choice=request.model,
-                    clarification_response=answer_to_pending,
-                    source_enabled=True,
-                )
-                if sf_outcome.meta_extras:
-                    salesforce_state.update(sf_outcome.meta_extras)
-                if not sf_outcome.handled and sf_outcome.resolved_text:
-                    # Resumed or context-resolved: the engines below must see
-                    # the RESOLVED request, never the ambiguous original.
-                    text = sf_outcome.resolved_text
-            elif request.mode != "salesforce":
-                # The source was switched off. A question waiting on the user
-                # must not sit there invisibly: cancel it deterministically so
-                # the next Salesforce turn starts clean.
+                if malformed:
+                    answer = (
+                        "I could not read that answer, so nothing has changed "
+                        "and your question is still open — pick an option "
+                        "again, or just tell me what you meant."
+                    )
+                    await emit("token", {"text": answer})
+                    await emit(
+                        "meta", {"route": "clarify", "salesforce_mode": "intelligence"}
+                    )
+                    sf_outcome = sf_intel.Outcome(handled=True, answer=answer)
+                else:
+                    sf_outcome = await sf_intel.run(
+                        text,
+                        history,
+                        emit,
+                        conversation_id=conv_key,
+                        effort=request.effort,
+                        model_choice=request.model,
+                        clarification_response=answer_to_pending,
+                        source_enabled=True,
+                        use_planner=settings.salesforce_intelligence_enabled,
+                    )
+                    if sf_outcome.meta_extras:
+                        salesforce_state.update(sf_outcome.meta_extras)
+                    if not sf_outcome.handled and sf_outcome.resolved_text:
+                        # Resumed or context-resolved: the engines below must
+                        # see the RESOLVED request, never the ambiguous one.
+                        text = sf_outcome.resolved_text
+            else:
+                # NOTHING in this turn can answer or re-ask a question this
+                # conversation is waiting on: the source was switched off, or
+                # the turn belongs to the document, vision, repo, URL or
+                # dataset pipeline, or it is an explicit live lookup. A
+                # question left open here is not merely stale — the partial
+                # unique index allows one pending clarification per
+                # conversation, so it silently blocks every future question
+                # until something cancels it.
                 from .core.sf_intel import state as sf_intel_state
 
                 with contextlib.suppress(Exception):
                     await sf_intel_state.cancel_pending(conv_key)
-
-            # Ask before answering, when the question has more than one honest
-            # reading. Salesforce mode only, and only when nothing is attached:
-            # the alternative is picking a reading silently, which is how "how
-            # many failed the mock" returned 7, 20 and 0 on three runs of the
-            # same sentence. Skipped once the user has already clarified.
-            #
-            # This deterministic path is the FALLBACK now: it runs only when
-            # Salesforce Intelligence Mode did not take the request, so the two
-            # can never both ask about the same message.
-            clarification = None
-            if (
-                request.mode == "salesforce"
-                and sf_outcome is None
-                and settings.clarify_before_answering
-                and not (request.pdf_data or request.image_data)
-                # An explicit live lookup is already a scoped instruction;
-                # interrupting it to ask a question is not help.
-                and not request.sf_live
-                and "(Clarified:" not in text
-            ):
-                from .core import clarify as clarify_mod
-
-                # Is this message the ANSWER to the question we just asked?
-                # Checked first: the option labels contain the very words the
-                # detectors match on ("mock", "slot"), so without this the
-                # same question comes back forever.
-                resolved = clarify_mod.answered(full_history, text)
-                if resolved is not None:
-                    # Rebinds the enclosing scope's `text` (declared nonlocal
-                    # at the top of worker), so the engines below receive the
-                    # RESOLVED question rather than the ambiguous one.
-                    text = resolved
-                else:
-                    clarification = clarify_mod.needs_clarification(
-                        text, always=settings.clarify_mode == "always"
-                    )
 
             if sf_outcome is not None and sf_outcome.handled:
                 # Salesforce Intelligence Mode answered, or asked a question and
                 # is now waiting. Either way it already emitted its tokens and
                 # its single meta; there is nothing left for the chain below.
                 answer = sf_outcome.answer
-            elif clarification is not None:
-                answer = clarification.as_text()
-                await emit("token", {"text": answer})
-                await emit("meta", {"route": "clarify",
-                                    "clarify": clarification.wire(text)})
             elif request.pdf_data:
                 # V8 → 2026-08-07: any document (PDF/DOCX/plain) — the WHOLE
                 # file is read and remembered for this conversation.

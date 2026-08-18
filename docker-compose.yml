@@ -537,8 +537,17 @@ services:
       REPO_MAX_FILES: ${REPO_MAX_FILES:-20000}
       WORKSPACE_TTL_HOURS: ${WORKSPACE_TTL_HOURS:-24}
       WORKSPACE_QUOTA_GB: ${WORKSPACE_QUOTA_GB:-20}
+      # Salesforce brain (knowledge packs) + learn-from-chat few-shots.
+      BRAIN_ENABLED: ${BRAIN_ENABLED:-true}
+      BRAIN_MAX_CHARS: ${BRAIN_MAX_CHARS:-4000}
+      LEARNED_EXAMPLES_ENABLED: ${LEARNED_EXAMPLES_ENABLED:-true}
+      LEARNED_EXAMPLES_K: ${LEARNED_EXAMPLES_K:-2}
     volumes:
       - data:/data
+      # The Salesforce brain packs, read-only and LIVE: core/brain.py re-reads
+      # on file change, so dropping a new pack into brain/packs/ takes effect
+      # on the next question — no rebuild, no restart.
+      - ./brain/packs:/data/brain:ro
       - reports:/reports
       - hf-cache:/root/.cache/huggingface
     ports:

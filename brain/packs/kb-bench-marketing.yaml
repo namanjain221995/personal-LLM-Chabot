@@ -1,0 +1,1095 @@
+# Compiled 2026-08-16 from brain/sources/techsara-org-knowledge-base.txt (preprod org documentation, 71 objects) by the brain ingestion pipeline: deterministic section/field parsing, every field name validated against the production dictionary + warehouse table list, rules distilled and adversarially verified. Fields the production warehouse lacks are only ever mentioned as explicit not-synced caveats.
+# Domain: PART 3 — verifier verdict: ship_with_fixes.
+name: kb-bench-marketing
+description: 'How TechSara markets bench candidates into jobs: the Marketing__c
+  engagement lifecycle, daily Application__c tally rows, the Resume Creation register,
+  and why Campaign, CampaignMember and Opportunity are dead ends in this org.'
+triggers:
+- marketing
+- bench
+- bench marketing
+- candidate marketing
+- marketing engagement
+- marketing engagements
+- marketing type
+- c2c
+- corp to corp
+- applications
+- job application
+- job applications
+- daily applications
+- application target
+- long applications
+- short applications
+- easy apply
+- offer letter
+- joining date
+- placement
+- placements
+- pause marketing
+- stop marketing
+- marketing paused
+- resume creation
+- resume version
+- campaign
+- campaigns
+- opportunity
+- opportunities
+tables:
+- Marketing__c
+- Application__c
+- Resume__c
+- Opportunity
+- Candidate_Email__c
+- Campaign
+- CampaignMember
+rules: '- "Marketing" = Marketing__c (bench marketing), never Campaign — Campaign/CampaignMember
+  are unused (empty, no automation): report unused, not zero.
+
+  - A candidate can have several engagements — candidate headcounts need COUNT(DISTINCT
+  Candidate__c).
+
+  - Status__c: New Candidate -> Initial Call (unused) -> Applications -> Offer Letter
+  -> Closed; Paused = temporary (Reason_for_paused__c), Stopped = permanent (Reason_for_Stop__c).
+
+  - Filter by Status__c, not record type (many Paused/Closed rows still on ''Active''
+  type); actively marketed = Status__c IN (''Applications'',''Offer Letter'').
+
+  - Application__c is a daily tally (candidate x day), NOT one job application;
+  blank rows auto-create each weekday, most stay empty — volume = SUM(Long_Applications__c)
+  + SUM(Short_Applications__c), cast numeric, as SEPARATE SUMs (row-wise Long+Short
+  NULLs half-filled rows); never COUNT(rows).
+
+  - Marketing__c.Candidate__c -> Account (required), Marketing__c.Recruiter__c ->
+  Recruiter__c (Employee); Application__c.Marketing__c -> Marketing__c, Application__c.Candidate__c
+  -> Account.
+
+  - Application__c.Recruiter__c = creation-time snapshot (Marketing__c.Recruiter__c
+  is current); Senior_Recruiter_Name__c / TL_Recruiter_Name__c are live formulas,
+  not history.
+
+  - "Placed" = Actual_Joining_Date__c IS NOT NULL; Status ''Closed'' alone does
+  not prove placement.
+
+  - Marketing_Type__c (''Full time'' | ''C2C'') is blank on many legacy rows — state
+  the blank share when grouping.
+
+  - Interview links to Marketing__c/Application__c are barely used — join interviews
+  via the candidate.
+
+  - Candidate_Email__c never went live (capture flow never activated; candidate
+  only as Candidate_Email_Id__c text) — say "not rolled out".
+
+  - Opportunity is not a real pipeline (lead-conversion ghosts named after candidates:
+  parked at ''Qualification'', no Amount) — exclude from deal/revenue answers; real
+  revenue: Invoice__c/Payment__c, Job_Submission__c.'
+glossary:
+  bench marketing: TechSara actively marketing one of its candidates into the open
+    job market; each run is one Marketing__c engagement record.
+  marketing engagement: One Marketing__c record — one run of marketing one candidate;
+    a candidate can have several over time (e.g. Full time then C2C, or stopped
+    then restarted).
+  C2C: Corp-to-corp contract marketing, one of the two Marketing_Type__c values
+    (the other is 'Full time').
+  long applications: Full-form job applications tallied per day in Application__c.Long_Applications__c
+    — the primary volume metric.
+  short applications: Quick/easy-apply style submissions tallied in Short_Applications__c
+    — a minor channel next to long applications.
+  daily applications: The blank Application__c tally rows auto-created every weekday
+    for each engagement in 'Applications' or 'Offer Letter' status, filled in by
+    the recruiter afterwards.
+  application target: The daily application quota per candidate; a missed day's
+    excuse goes in Application__c.Reason_why_target_not_completed__c.
+  placement: 'The candidate actually started a job: Actual_Joining_Date__c is filled,
+    and the engagement is then normally moved to Closed.'
+  paused marketing: Engagement temporarily on hold (Status 'Paused', reason required
+    in Reason_for_paused__c); the candidate's account is set to Hold by flow.
+  stopped marketing: Marketing permanently ended before success (Status 'Stopped'
+    via the Pause or Stop button); a formal stop notice is emailed and the candidate's
+    account is Closed.
+  joining date: Tentative_Joining_Date__c is the agreed start date, Actual_Joining_Date__c
+    the real one — joining can slip, hence both exist.
+  recruiter chain: Senior_Recruiter_Name__c / TL_Recruiter_Name__c formulas that
+    roll an engagement up to its senior recruiter and team lead — always showing
+    the CURRENT hierarchy, not a snapshot.
+field_notes:
+  Marketing__c:
+    Candidate__c: The candidate (Person Account) being marketed. Required and 100%
+      populated. Set by the creation flow from the Account the user launched it
+      on.
+    Recruiter__c: The Techsara recruiter running this engagement - assigned manually
+      (typically from the Candidate Reassignment / setup step). Changing it emails
+      the new recruiter and re-stamps Account.Assigned_Recruiter__c via flow.
+    Status__c: 'THE pipeline field. Values in process order: New Candidate - just
+      created, setup not started (default on the Active record type).'
+    Marketing_Type__c: 'The engagement''s employment model: "Full time" (marketing
+      the candidate into full-time roles) or "C2C" (corp-to-corp contract marketing).'
+    Introduction_script_created__c: The candidate's introduction/elevator-pitch
+      script has been written. Rarely used in practice - true on only 9 records
+      (1%).
+    Job_boards_created__c: Job-board accounts/profiles (LinkedIn, Dice, etc.) have
+      been set up for the candidate. True on 207 records (23%).
+    Resume_Understanding_Session__c: The session where the candidate walks the team
+      through their resume has been held. Rarely used - true on 13 records (1%).
+    Assign_to_Lead__c: Flag shown on the record page and on the "Application Not
+      Started" list view - reads as "this engagement should be assigned to / reviewed
+      by a team lead". No flow or Apex reads it; true on 218 records (24%).
+    Offer_Letter_Date__c: When the candidate received the offer letter from the
+      hiring company. Entered manually at the Offer Letter stage. 69 records (8%)
+      have one - roughly the engagements that reached an offer.
+    Tentative_Joining_Date__c: The expected start date agreed with the hiring company
+      (tracked between offer and joining; joining can slip, hence tentative vs actual).
+      Populated on 48 records (5%).
+    Actual_Joining_Date__c: The date the candidate actually started the job - the
+      "placement done" milestone that typically precedes closing the engagement.
+      Populated on 84 records (9%).
+    Reason_for_paused__c: Free-text explanation of why marketing was paused - required
+      whenever Status = Paused (validation rule). Written by the Pause or Stop button
+      flow (or typed directly).
+    Reason_for_Stop__c: Free-text explanation of why marketing was permanently stopped.
+      Written by the Pause or Stop button flow; quoted in the formal stop-notice
+      email sent to the candidate from legal@techsarasolutions.com.
+    Senior_Recruiter_Name__c: The recruiter's Assigned Sr. Recruiter's name; falls
+      back to the recruiter's own name when they have no senior above them.
+    TL_Recruiter_Name__c: Two levels up the chain (the Sr. Recruiter's Sr. Recruiter)
+      - in practice the Team Lead's name. Blank when the chain is shorter.
+    No_of_Interviews_rescheduled_by_candidat__c: Counter of interviews the CANDIDATE
+      caused to be rescheduled - help text scopes it to "Number of Interviews Rescheduled
+      after 10/04/2025" (candidate-caused reschedules are a known problem the team
+      decided to track from
+  Application__c:
+    Candidate__c: The candidate the applications were made for. Auto-copied from
+      the Marketing engagement by the daily creation flow / Apex. 99% populated
+      (a handful of legacy rows lack it).
+    Marketing__c: The marketing engagement this daily row belongs to - the row's
+      reason for existing. Auto-set at creation. 95% populated (older/manual rows
+      predate the link).
+    Recruiter__c: The recruiter responsible for the day's applications, snapshotted
+      from the engagement's Recruiter at creation time. 84% populated - rows created
+      while the engagement had no recruiter stay blank.
+    Recruiter_s_Lead__c: The full name of the USER who owns the linked Recruiter
+      (Employee) record - in this org the employee-record owner acts as the recruiter's
+      team lead, so reports can group daily activity by lead.
+    Date_of_Application__c: The calendar day this tally row covers. Set to the run
+      date by the daily creation flow (or the date passed to the Apex backfill).
+      One row per engagement per day is the intended grain.
+    Day_of_Application__c: The weekday name ("Monday"..."Sunday") computed from
+      the date - lets reports/views group by day of week (e.g. spotting low-activity
+      days) without date functions.
+    Long_Applications__c: How many LONG-FORM job applications were submitted that
+      day - the full-effort kind (complete application forms/portals). Manual entry
+      by the recruiter at end of day.
+    Short_Applications__c: How many SHORT/QUICK applications were submitted that
+      day (one-click / easy-apply style). Manual entry. Filled on only 100 rows
+      (1%), 1,112 total, average ~11, max 72 - a minor channel compared to long
+      applications.
+    Total_Applications__c: Long + Short - the day's total, used by target-tracking
+      reports. Only 683 rows compute to a value above zero (blank counts make the
+      formula blank/zero).
+    Reason_why_target_not_completed__c: Free-text excuse/explanation captured when
+      the recruiter missed the day's application target for this candidate (e.g.
+      candidate unavailable, job boards down, holiday).
+  Resume__c:
+    Candidate__c: The candidate (Person Account) the resume was written for. Filled
+      once the person exists as a candidate; earlier in the funnel the Lead lookup
+      below is used instead.
+    Lead__c: The pre-conversion prospect the resume was written for. Resumes are
+      often prepared during the sales/enrolment phase, before the Lead converts
+      to a Person Account.
+    Niche__c: The skill niche/track this resume targets (the same niche master used
+      by internal interviews and templates). A candidate marketing into two tracks
+      would get two Resume records, one per niche.
+    Approved_By__c: The senior employee who approved the resume for use.
+    Approval_Date__c: When the approval happened. Filled manually together with
+      Approved_By.
+  Candidate_Email__c:
+    Candidate_Email_Id__c: The candidate-side email address this message belongs
+      to (the mailbox Techsara manages for the candidate). This is the only link
+      to a candidate - a plain text address, not a lookup.
+    Sender_Email_Id__c: The external sender's address (the company recruiter / ATS
+      that wrote to the candidate).
+    Subject__c: The email's subject line.
+    Body__c: The full HTML body of the received email.
+    Email_Classification__c: The classification the OpenAI integration was meant
+      to write (e.g. interview invitation / rejection / info request). Text, not
+      a picklist - the AI's label would land here. Never populated so far.
+    Description__c: Free-text notes about the email (manual annotation space).
+  Campaign:
+    Name: The campaign's title (e.g. "Q3 Referral Drive"). Required. Manual entry.
+    IsActive: Whether the campaign is currently running. Drives the stock "All/My
+      Active Campaigns" list views and which campaigns pickers offer.
+    Status: 'Lifecycle of the initiative: Planned (default) | In Progress | Completed
+      | Aborted. Manual entry.'
+    Description: Free-text summary of what the campaign is.
+    OwnerId: The internal user responsible for the campaign. Defaults to the creator.
+    Type: 'What kind of initiative: Event (default) | Demo Signup / Trial | Email
+      | Referral Program | Search | Social Media | Thought Leadership | Website
+      Direct | Other.'
+    ParentId: Optional parent for building a campaign hierarchy (e.g. one umbrella
+      program with per-channel child campaigns). Statistics roll up the tree into
+      the Hierarchy* fields (Group E).
+    CampaignMemberRecordTypeId: Standard field choosing which CampaignMember record
+      type this campaign's members get. Irrelevant here - CampaignMember has no
+      record types.
+    BudgetedCost: What the team planned to spend on the campaign. Manual entry.
+    ActualCost: What was actually spent. Manual entry.
+    ExpectedRevenue: Revenue the campaign is expected to generate. Manual entry.
+    NumberSent: How many people the campaign was sent/shown to (e.g. emails sent)
+      - the denominator for response-rate math. Manual entry.
+    NumberOfConvertedLeads: How many of those leads have since been converted.
+    NumberOfContacts: Count of Contact members.
+    NumberOfResponses: Members whose status counts as "Responded".
+    NumberOfOpportunities: Opportunities whose Primary Campaign Source is this campaign.
+    NumberOfWonOpportunities: The subset of those opportunities that were Closed
+      Won.
+    AmountAllOpportunities: Total Amount of all sourced opportunities.
+    AmountWonOpportunities: Total Amount of the won ones.
+    ZVC__Zoom_Event__c: Set by the Zoom integration package when a campaign is generated
+      from a Zoom Event - links the campaign to the package's event record. Never
+      populated (the feature is not in use).
+    ZVC__Zoom_Webinar__c: 'Same idea for Zoom Webinars: the source webinar this
+      campaign represents. Never populated. NOTE: Techsara''s real Zoom meeting/recording
+      pipeline uses its own Session__c / Zoom_Recording_* objects, not this package.'
+  CampaignMember:
+    CampaignId: Which campaign this membership belongs to. Set when the member is
+      added; controls sharing.
+    LeadId: The Lead who is the member. Filled for unconverted people; after lead
+      conversion Salesforce re-points the membership to the new Contact.
+    ContactId: The Contact who is the member. Exactly one of LeadId/ContactId is
+      effectively the person link at any time.
+    Status: 'The member''s per-campaign status. Org-wide stock values: Sent | Responded.
+      Each campaign can define its own status list via the standard CampaignMemberStatus
+      setup object (never customized here).'
+    HasResponded: TRUE when the current status counts as a response. System-maintained;
+      feeds Campaign.NumberOfResponses.
+    FirstRespondedDate: Stamped by the platform the first time the member reaches
+      a responded status.
+    Description: '- the person''s description text.'
+    HasOptedOutOfFax: '- person''s fax opt-out preference.'
+    ZVC__Is_Panelist__c: Member was a panelist (speaker) rather than an attendee.
+    ZVC__Zoom_Webinar_Registrant__c: '[Lookup -> ZVC__Zoom_Webinar_Registrant__c]'
+    ZVC__Zoom_Event_Registrant__c: '[Lookup -> ZVC__Zoom_Event_Registrant__c] Links
+      to the package''s full registrant records for webinar and event respectively.'
+  Opportunity:
+    Name: 'The deal''s title. On the 608 conversion byproducts this is simply THE
+      CANDIDATE''S NAME (standard lead convert names the opportunity from the converted
+      person when no name is supplied) - so beware: this field contains'
+    AccountId: The account the deal is on - 92% candidate Person Accounts (see part
+      5). Set automatically by lead conversion; manual on hand-made records.
+    OwnerId: Owning user; with Private OWD this controls who can see the record.
+      Defaults to the converting/creating user.
+    IsPrivate: Standard "extra private" flag hiding the deal even from the owner's
+      reports-to chain. Never used (no reason to - the OWD is already Private).
+    Description: Free-text notes about the deal. (Long text - population not queryable
+      via aggregate; no evidence of use.)
+    StageName: 'The pipeline stage. This org''s configured stages (with probability
+      and forecast category): Qualification 10% (Pipeline) | Needs Analysis 35%
+      (Pipeline) | Proposal 75% (Best Case) | Negotiation 90% (Forecast) | Closed'
+    Amount: Deal value. Populated on only 50 of 658 records (8%) - exactly the business-account
+      sample/test records; every conversion byproduct has no amount.
+    ExpectedRevenue: Amount x Probability, computed by the platform for forecasting.
+      Empty wherever Amount is empty.
+    CloseDate: Expected/actual close date. 100% populated because it is required
+      - lead conversion fills it automatically on the byproduct records.
+    NextStep: Short "what happens next" note. Populated on 7 records only.
+    Type: 'Deal flavor: Existing Business | New Business. Populated on just 50 records
+      (37 Existing / 13 New - the sample data); conversion byproducts leave it blank.'
+    LeadSource: Where the deal ultimately came from, inherited from the converted
+      Lead. Distribution mirrors the candidate-lead funnel
+    CampaignId: Which campaign sourced this deal - never populated (0 records),
+      matching the empty Campaign object.
+    Discovery_Completed__c: Meant to be ticked after the discovery call. 0 records
+      true.
+    ROI_Analysis_Completed__c: Meant to be ticked once an ROI analysis was done.
+      0 records true.
+    Loss_Reason__c: 'Why a deal was lost: Lost to Competitor | No Budget / Lost
+      Funding | No Decision / Non-Responsive | Price | Other.'
+    Pricebook2Id: Which price book the deal's products come from. Set on 12 records
+      (sample data with line items); irrelevant otherwise.
+    SyncedQuoteId: The quote currently syncing its totals to this deal. Never populated
+      (0).
+    ContractId: Related contract. Never populated (0).
+    TotalOpportunityQuantity: Standard total-product-quantity field. NOT QUERYABLE
+      via the API in this org (the field is not enabled/visible to the integration
+      user); appears only in the metadata snapshot. Treat as unavailable.
+    pandadoc__TrackingNumber__c: Correlation id the installed PandaDoc e-signature
+      package would stamp to link a generated document to this deal. Never populated
+      (0) - PandaDoc is not used on opportunities here.
+knowledge:
+- title: Marketing__c — What This Object Is
+  keywords:
+  - marketing
+  text: "Marketing__c is the CANDIDATE-MARKETING (\"bench marketing\") ENGAGEMENT\
+    \ record:\none record = one run of Techsara actively marketing one candidate\
+    \ into the open\njob market. It is the operational headquarters of pipeline\
+    \ #2 (candidate\nmarketing): it says whether marketing for this candidate is\
+    \ being set up, is\nactively applying to jobs, has produced an offer, or has\
+    \ been paused/stopped,\nand who (which recruiter) is running it.\n\nEverything\
+    \ in the marketing pipeline hangs off this record:\n  - Daily Application__c\
+    \ records (how many job applications were made each\n    day) are auto-created\
+    \ for every engagement whose status is \"Applications\"\n    or \"Offer Letter\"\
+    .\n  - Interviews that come back from those applications are (optionally) linked\n\
+    \    to it via Interview__c.Marketing__c.\n  - The candidate's own lifecycle\
+    \ status on the Account (Active / Hold /\n    Closed) is driven from this record's\
+    \ Status changes by flows.\nA candidate can have more than one Marketing record\
+    \ over time (e.g. a Full\ntime engagement and a later C2C one, or a stopped\
+    \ engagement followed by a new\none) - in preprod there are 898 records across\
+    \ 701 distinct candidates."
+- title: Marketing__c — Kind Of Object
+  keywords:
+  - marketing
+  text: "- Custom object, the anchor of the candidate-marketing domain.\n- Standalone\
+    \ object with its own Owner; sharing is Public Read/Write (internal\n  and external)\
+    \ - the role-hierarchy redesign will tighten this.\n- Candidate__c (lookup ->\
+    \ Account) is REQUIRED: every engagement belongs to a\n  candidate Person Account,\
+    \ but it is a lookup, not master-detail.\n- 18 custom fields, 2 record types,\
+    \ 2 validation rules, 7 list views.\n- Name is a free-text \"Marketing Name\"\
+    \ (usually the candidate's name plus the\n  engagement type, set by the creation\
+    \ flow), with field history tracking on.\n- Scale: 898 records in preprod (created\
+    \ Aug 2024 through Jul 2026 - the\n  object is in active daily use)."
+- title: Marketing__c — Record Types
+  keywords:
+  - marketing
+  text: "- \"Active\" (developer name: Active) - the default and majority type (612\n\
+    \  records, 68%). Represents a live engagement. Its Status picklist offers the\n\
+    \  working values: New Candidate (default), Initial Call, Applications, Offer\n\
+    \  Letter, Closed.\n- \"InActive Marketing\" (InActive_Marketing) - the parked\
+    \ flavor (286 records,\n  32%). Its Status picklist offers only the terminal\
+    \ values: Closed, Paused,\n  Stopped. The \"Pause or Stop Marketing\" button\
+    \ flips a record to this type.\n- Data reality: the flip is not retroactive\
+    \ - 157 Paused and 190 Closed\n  records still sit on the Active record type\
+    \ (they were paused/closed by\n  direct edits before or outside the button flow).\
+    \ All 149 Stopped records\n  are on InActive Marketing."
+- title: Marketing__c — How It Is Used — The Business Process
+  keywords:
+  - marketing
+  text: "STEP 1 - CREATION. Two entry points:\n  - The \"Create Marketing\" quick\
+    \ action on the Account page runs the screen\n    flow Create_Marketing_from_Candidate:\
+    \ the user picks the Marketing Owner\n    and the Marketing Type (Full Time\
+    \ / C2C). The flow blocks duplicates (if\n    the candidate already has an Active-record-type\
+    \ engagement of that type\n    it shows \"Duplicate Marketing Record Found\"\
+    ), then creates the record\n    with Status \"New Candidate\" on the Active\
+    \ record type and updates the\n    candidate's status. (Per metadata this button\
+    \ currently sits on the B2B\n    Client and Vendor Account record pages, not\
+    \ the Candidate page - an odd\n    placement worth verifying.)\n  - The Onboarding_Complete_Onboarding\
+    \ screen flow (the \"complete onboarding\"\n    step on Onboarding__c) creates\
+    \ the Marketing record when a candidate\n    finishes onboarding - marketing\
+    \ is the natural next stage after\n    onboarding/training. (An older record-triggered\
+    \ version,\n    Create_Marketing_record_from_Onboarding_status_update, is Obsolete.)"
+- title: Marketing__c — How It Is Used — The Business Process (2)
+  keywords:
+  - marketing
+  text: "STEP 2 - SETUP (\"New Candidate\" / \"Initial Call\"). The recruiter team\n\
+    \  prepares the candidate for the market and ticks the checklist checkboxes\
+    \ as\n  they go: initial call completed, introduction script created, job boards\n\
+    \  (accounts/profiles) created, resume understanding session held. A Recruiter\n\
+    \  (Employee) must be assigned before applications can start (validation\n \
+    \ rule). Assigning the recruiter emails them (Send_Email_notification_to_\n\
+    \  Recruiter flow) and stamps them onto the candidate Account as the Assigned\n\
+    \  Recruiter (Marketing_Update_Assigned_Recruiter_on_Candidate flow).\n\nSTEP\
+    \ 3 - \"Applications\". When Status moves to Applications, a flow stamps\n \
+    \ today's date on the candidate Account as Application_Start_Date__c - the\n\
+    \  clock that the pacing alerts (AccountSchedulerJob) and the interview\n  data-quality\
+    \ checks measure against. From now on the nightly\n  Create_Daily_Applications\
+    \ flow creates one blank Application__c row per\n  weekday for this engagement;\
+    \ the recruiter fills in how many long/short\n  applications were made. Interviews\
+    \ that result are created via\n  Interview_Creation_V2 and can link back through\
+    \ Interview__c.Marketing__c\n  and Interview__c.Application__c."
+- title: Marketing__c — How It Is Used — The Business Process (3)
+  keywords:
+  - marketing
+  text: "STEP 4 - \"Offer Letter\" and closure. When a company makes an offer, Status\n\
+    \  moves to Offer Letter and the offer/joining dates are captured (Offer\n \
+    \ Letter Date, Tentative and Actual Joining Date). Daily Application rows\n\
+    \  keep being created in this status (activity continues until joining).\n \
+    \ \"Closed\" ends the engagement (typically after placement) and sets the\n\
+    \  candidate's Account status to Closed.\n\nSTEP 5 - PAUSE / STOP (the exception\
+    \ path). The \"Pause or Stop Marketing\"\n  button on the Marketing record page\
+    \ runs the Pause_or_Stop_Marketing\n  screen flow. The user chooses Pause or\
+    \ Stop and types the reason. The flow:\n  sets Status to Paused/Stopped, writes\
+    \ the reason into Reason for pause /\n  Reason for Stop, flips the record type\
+    \ to InActive Marketing, sets the\n  candidate Account's status (Paused -> Hold,\
+    \ Stopped -> Closed), emails the\n  candidate a formal \"Techsara Services Pause\
+    \ Notice\" / \"Techsara Services\n  Stop Notice\" from legal@techsarasolutions.com,\
+    \ and posts a Slack alert to\n  the marketing-alert channel tagging the recruiter\
+    \ and senior recruiter.\n  Resuming (Status back to Applications from Paused)\
+    \ re-activates the\n  candidate's Account status automatically. Pausing requires\
+    \ a reason\n  (validation rule). Paused is the single most common status in\
+    \ data (32%) -\n  parking engagements is a normal part of the business."
+- title: Marketing__c — Connected Objects
+  keywords:
+  - marketing
+  - each
+  - relationship
+  - means
+  text: "LOOKUPS FROM MARKETING TO OTHER OBJECTS:\n- Account (Candidate__c, REQUIRED,\
+    \ 100% populated): the candidate being\n  marketed. Flows on Marketing write\
+    \ back to this Account: its\n  Candidate_Status__c, Assigned_Recruiter__c, Application_Start_Date__c\
+    \ and\n  Reason_for_Hold__c are all driven from Marketing status/recruiter changes.\n\
+    - Recruiter__c (Recruiter__c, label \"Employee\", 90% populated): the Techsara\n\
+    \  recruiter running the engagement. The recruiter chain formulas (Senior /\n\
+    \  TL / Effective recruiter name) climb this record's Assigned_Sr_Recruiter__c\n\
+    \  hierarchy.\n\nOBJECTS THAT POINT AT MARKETING:\n- Application__c (Marketing__c\
+    \ lookup): the daily application-count log rows\n  - the main child (9,545 of\
+    \ 10,000 Application rows link to a Marketing\n  record; 214 distinct engagements\
+    \ have rows).\n- Interview__c (Marketing__c lookup): marketing-sourced interviews\
+    \ CAN link\n  back to the engagement, but in practice almost never do (2 records)\
+    \ - the\n  interview's own Candidate link is what the team relies on.\n- Case\
+    \ (Marketing__c lookup): internal ops tickets raised about the\n  engagement\
+    \ (20 records)."
+- title: Marketing__c — Business Rules
+  keywords:
+  - marketing
+  - validation
+  - all
+  - active
+  text: "- Recruiter_required_before_applications: when Status is changed to\n \
+    \ \"Applications\" the Recruiter field must be filled. Error (shown on the\n\
+    \  Recruiter field): \"Assign a Recruiter before starting the applications\"\
+    .\n- Update_Reason_for_Hold: a record cannot sit in Status \"Paused\" with an\n\
+    \  empty Reason for pause. Error: \"Please fill in the details. Reason for\n\
+    \  pausing\"."
+- title: Marketing__c — Automation
+  keywords:
+  - marketing
+  - runs
+  text: "RECORD-TRIGGERED FLOWS (active, all after-save on update):\n- Candidate_Status_Update_when_marketing_status_Updated\
+    \ (on Status change):\n  syncs the candidate Account's lifecycle status - Paused\
+    \ -> Account status\n  \"Hold\" (and copies the pause reason into Account.Reason_for_Hold__c);\n\
+    \  Closed -> \"Closed\"; Applications coming FROM Paused -> back to \"Active\"\
+    .\n- Marketing_Update_Application_Start_Date_on_Candidate (Status changes to\n\
+    \  \"Applications\"): stamps today's date on Account.Application_Start_Date__c.\n\
+    \  Downstream, AccountSchedulerJob measures \"days with no interview\" from\n\
+    \  this date and the Interview formula Interview_After_Application_Start_\n\
+    \  Date__c checks interviews against it.\n- Marketing_Update_Assigned_Recruiter_on_Candidate\
+    \ (Recruiter changes):\n  copies the Recruiter onto Account.Assigned_Recruiter__c\
+    \ and adjusts the\n  assigned-candidate tallies on the old and new Recruiter\
+    \ (Employee) records.\n- Send_Email_notification_to_Recruiter (create + update,\
+    \ when Recruiter is\n  set): emails the recruiter that this marketing profile\
+    \ is now theirs.\n- Marketing_Paused_Email_Alert: OBSOLETE - its pause/stop\
+    \ emails and Slack\n  alert now live inside the Pause_or_Stop_Marketing screen\
+    \ flow."
+- title: Marketing__c — Automation (2)
+  keywords:
+  - marketing
+  - runs
+  text: "SCHEDULED FLOW (reads Marketing, writes Application):\n- Create_Daily_Applications\
+    \ (daily, since Aug 2024, skips Saturday/Sunday):\n  finds every Marketing record\
+    \ with Status \"Applications\" or \"Offer Letter\"\n  and creates one blank\
+    \ Application__c row per engagement dated today\n  (candidate, marketing, recruiter\
+    \ and owner copied from the engagement).\n\nSCREEN FLOWS / BUTTONS:\n- \"Create\
+    \ Marketing\" (Account quick action) -> Create_Marketing_from_\n  Candidate:\
+    \ guided creation with duplicate check (see Step 1).\n- \"Pause or Stop Marketing\"\
+    \ (Marketing quick action, on the Marketing record\n  page) -> Pause_or_Stop_Marketing:\
+    \ the pause/stop path incl. record-type\n  flip, candidate-status sync, legal-notice\
+    \ email and Slack alert (Step 5).\n- Onboarding_Complete_Onboarding (on Onboarding__c)\
+    \ creates the Marketing\n  record when onboarding completes.\n\nAPEX:\n- ApplicationRecordCreator.createApplications(Date):\
+    \ utility that does the\n  same as the scheduled flow for a chosen date (used\
+    \ to backfill missed\n  days). No trigger exists on Marketing__c itself.\n-\
+    \ AccountSchedulerJob (scheduled): the \"Marketing Profile Alert: No\n  Interview\
+    \ Scheduled\" watchdog - for Active candidates it compares the last\n  interview\
+    \ date (or the Application Start Date set from Marketing) with\n  today and\
+    \ Slacks/emails the recruiter chain when too many days pass."
+- title: Marketing__c — Automation (3)
+  keywords:
+  - marketing
+  - runs
+  text: 'LIST VIEWS worth knowing (they mirror the process): "Application Not
+
+    Started" (Status = New Candidate), "My Candidates - Marketing Not Started",
+
+    "Ongoing Applications", "Marketing Paused", "Marketing Completed - Placed",
+
+    "Candidate Reassignment".'
+- title: Application__c — What This Object Is
+  keywords:
+  - application
+  text: 'Application__c is the DAILY JOB-APPLICATION ACTIVITY LOG of the candidate-
+
+    marketing pipeline. One record = one candidate x one calendar day of applying
+
+    to jobs under a marketing engagement. It does NOT represent a single job
+
+    application to a single company - it is a tally sheet: "on this date, for
+
+    this candidate, the recruiter made N long applications and M short
+
+    applications".
+
+
+    The rows themselves are mass-produced by automation: every weekday a
+
+    scheduled flow creates one blank record for every Marketing engagement in
+
+    Status "Applications" or "Offer Letter", and the recruiting team is expected
+
+    to fill in the day''s counts afterwards. Managers use the per-team list views
+
+    and reports to check daily application volume against targets, and a text
+
+    field captures the excuse when a day''s target was missed. When an interview
+
+    comes back from those applications, the Interview record can link to the
+
+    matching Application row (Interview__c.Application__c).'
+- title: Application__c — Kind Of Object
+  keywords:
+  - application
+  text: "- Custom object in the candidate-marketing domain; child-style log table.\n\
+    - Standalone object with its own Owner (copied from the Marketing record's\n\
+    \  owner at creation); sharing is Public Read/Write.\n- All three relationships\
+    \ are plain lookups (no master-detail): Candidate\n  (Account), Marketing engagement,\
+    \ Recruiter (Employee).\n- 10 custom fields, no record types, no validation\
+    \ rules, 3 list views\n  (\"All\", \"Ashley's Team\", \"Shubham's Team\" - the\
+    \ team views filter on the\n  record owner's first name).\n- Auto-number Name\
+    \ in the format A-XXXXX.\n- Scale: 10,000 records in preprod covering application\
+    \ dates 2024-07-01 to\n  2025-05-06. The count is exactly 10,000 and the data\
+    \ stops in May 2025,\n  which looks like a sandbox data-copy cap rather than\
+    \ the real production\n  volume (verify with team before quoting totals)."
+- title: Application__c — How It Is Used — The Business Process
+  keywords:
+  - application
+  text: "STEP 1 - AUTO-CREATION EVERY WEEKDAY. The scheduled flow\n  Create_Daily_Applications\
+    \ runs daily (it exits on Saturdays and Sundays),\n  reads every Marketing__c\
+    \ record in Status \"Applications\" or \"Offer\n  Letter\", and inserts one\
+    \ blank Application row per engagement with:\n  today's date, the engagement's\
+    \ candidate, the Marketing record itself, its\n  recruiter, and its owner. The\
+    \ Apex utility\n  ApplicationRecordCreator.createApplications(Date) does exactly\
+    \ the same\n  for an arbitrary date (used to backfill a missed day by an admin).\n\
+    \nSTEP 2 - THE RECRUITER FILLS IN THE COUNTS. During/after the day the\n  recruiter\
+    \ records how many \"long\" and how many \"short\" applications were\n  submitted\
+    \ for the candidate (long = full-form applications, short = quick/\n  easy-apply\
+    \ style submissions; the exact internal definitions are not\n  documented in\
+    \ metadata - verify with team). Total Applications is a\n  formula summing the\
+    \ two. If the daily target was not met, the reason goes\n  into \"Reason why\
+    \ target not completed\".\n\nSTEP 3 - MANAGEMENT REVIEW. Team list views (filtered\
+    \ by record owner) and\n  reports read the counts to track daily activity per\
+    \ recruiter/candidate\n  against targets. The weekday formula field lets reports\
+    \ group by day of\n  week without date math."
+- title: Application__c — How It Is Used — The Business Process (2)
+  keywords:
+  - application
+  text: "STEP 4 - LINKING RESULTING INTERVIEWS. When an interview is created for\
+    \ a\n  marketing candidate, the before-save flow Interview_Record_Initial_Call_\n\
+    \  Flow finds the matching Application row for that candidate + recruiter and\n\
+    \  writes it into Interview__c.Application__c (\"this interview came from the\n\
+    \  applications made for the candidate that day\"). In practice this link is\n\
+    \  barely populated (8 interviews) - reporting relies on the candidate link\n\
+    \  instead.\n\nDATA REALITY: because rows are auto-created whether or not anyone\
+    \ applies\nthat day, 92% of rows have NO counts filled in at all - the filled-in\
+    \ rows\n(just over 800) carry all the real activity (~26.4k long applications\
+    \ and\n~1.1k short applications logged in total, averaging ~32 long applications\n\
+    on a filled day, peaking at 160)."
+- title: Application__c — Connected Objects
+  keywords:
+  - application
+  - each
+  - relationship
+  - means
+  text: "LOOKUPS FROM APPLICATION TO OTHER OBJECTS:\n- Account (Candidate__c, 99%\
+    \ populated): the candidate the day's\n  applications were made for. Copied\
+    \ from the Marketing engagement by the\n  creation flow.\n- Marketing__c (Marketing__c,\
+    \ 95% populated): the marketing engagement this\n  daily row belongs to - the\
+    \ row exists BECAUSE this engagement was in an\n  applying status that day.\
+    \ 214 distinct engagements have rows.\n- Recruiter__c (Recruiter__c, label \"\
+    Employee\", 84% populated): the\n  recruiter who made the applications, copied\
+    \ from the engagement at\n  creation time (so it reflects who held the engagement\
+    \ that day, even if\n  the engagement's recruiter changes later).\n\nOBJECTS\
+    \ THAT POINT AT APPLICATION:\n- Interview__c (Application__c lookup): the interview\
+    \ that resulted from\n  this day's applications - auto-linked by Interview_Record_Initial_Call_\n\
+    \  Flow at interview creation, but only 8 interviews carry the link so far."
+- title: Application__c — Business Rules
+  keywords:
+  - application
+  - validation
+  text: 'None. The object has no validation rules - blank auto-created rows are
+    by
+
+    design, so nothing forces the counts or reason fields to be filled.'
+- title: Application__c — Automation
+  keywords:
+  - application
+  - runs
+  text: "- Create_Daily_Applications (SCHEDULED FLOW, daily since 2024-08-18, active):\n\
+    \  the factory that creates the blank daily rows for every Marketing\n  engagement\
+    \ in Status \"Applications\" or \"Offer Letter\"; skips weekends\n  (Saturday/Sunday\
+    \ check on the current date). In the preprod copy the last\n  created row is\
+    \ dated 2025-05-06 - the job has not produced rows in this\n  sandbox since\
+    \ (likely paused/staled by the sandbox copy - verify).\n- ApplicationRecordCreator\
+    \ (APEX, no trigger): admin-run utility with the\n  identical creation logic\
+    \ for a specific date (backfill tool). Its test\n  class is ApplicationRecordCreatorTest.\n\
+    - Interview_Record_Initial_Call_Flow (flow on Interview__c): LOOKS UP the\n\
+    \  matching Application row (by candidate + recruiter) when an interview is\n\
+    \  created and stamps it on the interview - Application is read, not written.\n\
+    - No record-triggered flows, no triggers, no quick actions exist on\n  Application__c\
+    \ itself, and nothing updates the rows automatically after\n  creation - the\
+    \ counts are pure manual entry."
+- title: Resume__c — What This Object Is
+  keywords:
+  - resume
+  - creation
+  text: 'Resume__c tracks ONE resume version created for a candidate (or a not-yet-
+
+    converted Lead). Techsara''s marketing team builds and maintains tailored
+
+    resumes for the candidates it markets; this object is the register of those
+
+    resume documents: who they belong to, which skill niche they target, who
+
+    uploaded and approved them, and where they stand in the review pipeline
+
+    (Draft -> Under Review -> Approved / Rejected / Uploaded). The actual resume
+
+    file itself is stored as a Salesforce File (ContentVersion) or an external
+
+    link on related records - this object is the process/metadata record around
+
+    the resume, not the file body.'
+- title: Resume__c — Kind Of Object
+  keywords:
+  - resume
+  - creation
+  text: "- Custom object, part of the candidate-marketing domain.\n- Standalone\
+    \ object with lookups (no master-detail parent); org-wide sharing\n  is ReadWrite.\n\
+    - 9 custom fields, no record types, no validation rules, 1 list view.\n- Scale:\
+    \ only 17 records in preprod - a lightly-used register (most resume\n  handling\
+    \ happens as plain file uploads / links on Lead, Account and\n  Job_Submission__c;\
+    \ see Resume_Link__c fields on those objects)."
+- title: Resume__c — How It Is Used — The Business Process
+  keywords:
+  - resume
+  - creation
+  text: 'A recruiter/marketing employee creates a Resume record when a tailored
+    resume
+
+    is being prepared for a candidate - typically targeting a specific skill
+
+    niche (linked Niche__c). The record moves through Resume_Status__c: it starts
+
+    as Draft while being written, goes Under Review for a senior''s check, and is
+
+    then Approved (Approved_By + Approval_Date get stamped) or Rejected. The
+
+    "Uploaded" status marks that the finished resume has been uploaded/attached
+
+    (in practice 15 of the 17 records sit at Uploaded - the register is mostly
+
+    used to log finished resumes rather than to run the full review pipeline).
+
+
+    The internal-interview subsystem also touches it: the
+
+    Internal_Interview_Conduct_Interview flow looks up the candidate''s resume
+
+    during an internal screening, and the Interview_Create_Reschedule_Flow (the
+
+    "Create Interview" button on Account/Lead pages that creates INTERNAL
+
+    interviews) looks up - and can delete/replace - the resume tied to the
+
+    screening being (re)scheduled.'
+- title: Resume__c — Connected Objects
+  keywords:
+  - resume
+  - creation
+  - each
+  - relationship
+  - means
+  text: "- Account (Candidate__c, Lookup): the candidate (Person Account) this resume\n\
+    \  belongs to - used once the person exists as a candidate.\n- Lead (Lead__c,\
+    \ Lookup): the pre-conversion prospect this resume belongs to\n  - resumes are\
+    \ often prepared while the person is still a Lead; after\n  conversion the Candidate\
+    \ lookup is the one that matters.\n- Niche__c (Niche__c, Lookup): the skill\
+    \ niche (e.g. a technology/track) the\n  resume is tailored for. One candidate\
+    \ can have different resumes per niche.\n- Internal_Interview__c (Internal_Interview__c,\
+    \ Lookup): the internal\n  screening this resume was prepared for / used in\
+    \ (the internal interview\n  evaluates the candidate against the niche the resume\
+    \ targets).\n- Recruiter__c \"Employee\" (Uploaded_By__c, Lookup): the employee\
+    \ who created/\n  uploaded this resume version.\n- Recruiter__c \"Employee\"\
+    \ (Approved_By__c, Lookup): the senior employee who\n  approved it."
+- title: Resume__c — Automation
+  keywords:
+  - resume
+  - creation
+  text: "- No record-triggered flows or Apex trigger of its own.\n- Read (and sometimes\
+    \ deleted/replaced) by two screen flows of the internal-\n  interview subsystem:\
+    \ Internal_Interview_Conduct_Interview (looks up the\n  resume during a screening)\
+    \ and Interview_Create_Reschedule_Flow (looks up /\n  deletes the resume tied\
+    \ to an internal screening being rescheduled).\n- The Attached_Resume_To_Lead\
+    \ flow works with resume FILES (ContentVersion)\n  on Leads, not with this object\
+    \ - do not confuse the two."
+- title: Candidate_Email__c — What This Object Is
+  keywords:
+  - candidate
+  - email
+  text: 'Candidate_Email__c is a staging/archive object for EMAILS received on behalf
+
+    of marketed candidates. The idea: when Techsara manages a candidate''s job-
+
+    search mailbox (applications go out under the candidate''s identity),
+
+    interesting inbound emails (recruiter responses, interview invitations,
+
+    rejections) are captured here as records - subject, body, sender - so they
+
+    can be classified (Email_Classification__c) and acted on inside Salesforce.
+
+    It was designed to feed an OpenAI-based classification flow.'
+- title: Candidate_Email__c — Kind Of Object
+  keywords:
+  - candidate
+  - email
+  text: "- Custom object; standalone (NO relationships to any other object - not\
+    \ even\n  to the candidate; the candidate is identified only by the email address\n\
+    \  text fields). Org-wide sharing ReadWrite.\n- 6 custom fields, no record types,\
+    \ no validation rules, 1 list view.\n- Scale: 0 records in preprod - the feature\
+    \ is BUILT BUT NOT LIVE."
+- title: Candidate_Email__c — How It Is Used — The Business Process
+  keywords:
+  - candidate
+  - email
+  text: 'Currently: not used. The object has zero records, and the one automation
+
+    built for it - the OpenAI_Email_Integration record-triggered flow (meant to
+
+    fire on create and send the email to OpenAI for classification) - is in
+
+    "InvalidDraft" state, i.e. parked/broken, never activated. Treat this whole
+
+    object as an in-progress feature: the intended flow was (1) an inbound email
+
+    lands as a Candidate_Email__c record (via some capture mechanism that was
+
+    never finished), (2) the flow calls OpenAI to classify it (interview invite?
+
+    rejection? recruiter question?), (3) the team works the classified queue.
+
+    (not fully documented - verify with team whether this feature is still
+
+    planned or abandoned.)'
+- title: Candidate_Email__c — Connected Objects
+  keywords:
+  - candidate
+  - email
+  text: 'None. The object is deliberately flat - candidate identity is carried only
+
+    as the email-address text in Candidate_Email_Id__c. If the feature goes
+
+    live, answering "which candidate does this email belong to" requires matching
+
+    that address against Account/candidate email fields.'
+- title: Candidate_Email__c — Automation
+  keywords:
+  - candidate
+  - email
+  text: "- OpenAI_Email_Integration (record-triggered, After Save on Create) -\n\
+    \  status \"InvalidDraft\" (NOT active): was meant to send the new email record\n\
+    \  to OpenAI (openAIIntegrationService Apex handles the org's OpenAI callouts)\n\
+    \  for classification. Never went live.\n- No triggers, no other flows."
+- title: Campaign — What This Object Is
+  keywords:
+  - campaign
+  text: "Campaign is the STANDARD Salesforce marketing-campaign object: one record\
+    \ per\nmarketing initiative (an event, an email blast, a referral program) with\n\
+    budget/cost tracking and automatic statistics on how many leads, contacts and\n\
+    opportunities the initiative produced.\n\nIN THIS ORG IT IS NOT USED. The preprod\
+    \ org contains ZERO Campaign records,\nno flow touches the object, no Apex class\
+    \ references it, and it has no\nvalidation rules or record types. It exists\
+    \ in the org for two reasons only:\n  a) It is a standard object every Salesforce\
+    \ org ships with (its layout and\n     list views are the stock ones).\n  b)\
+    \ The installed \"Salesforce integration\" package from Zoom (namespace ZVC)\n\
+    \     added two lookup fields so Zoom webinars/events can auto-generate\n  \
+    \   campaigns and sync their registrants - a capability that is installed\n\
+    \     but has never been exercised here.\nTechsara's actual \"marketing\" concept\
+    \ is candidate marketing (Marketing__c /\nApplication__c), which has nothing\
+    \ to do with this object. If a question is\nabout \"marketing\" in this org,\
+    \ it almost certainly means Marketing__c, NOT\nCampaign."
+- title: Campaign — Kind Of Object
+  keywords:
+  - campaign
+  text: "- Standard object with 39 fields, of which only 2 are custom - both from\
+    \ the\n  Zoom (ZVC) managed package. Techsara itself added no fields.\n- Sharing:\
+    \ \"Public Full Access\" internally (any user who can see campaigns can\n  edit\
+    \ them - the Salesforce default for campaigns); Private for external\n  (portal)\
+    \ users. Has an Owner.\n- Supports a parent/child campaign hierarchy via ParentId\
+    \ (self-lookup).\n- 0 record types, 0 validation rules, 3 list views (All Active\
+    \ Campaigns,\n  My Active Campaigns, Org_Campaign_Hierarchy - all stock).\n\
+    - Scale: 0 records in preprod. Empty object."
+- title: Campaign — Record Types
+  keywords:
+  - campaign
+  text: 'None. Every campaign (if any were ever created) would be a plain Campaign
+
+    record; the org never needed to split campaign flavors.'
+- title: Campaign — How It Is Used — The Business Process
+  keywords:
+  - campaign
+  text: "It is not used. There is no business process on Campaign in this org today.\n\
+    \nFor completeness, what the plumbing WOULD do if the team started using it:\n\
+    \  - A user (or the Zoom package) creates a Campaign for an initiative, sets\n\
+    \    Type/Status/dates and budget numbers.\n  - Leads and Contacts are attached\
+    \ as CampaignMember rows; Salesforce then\n    auto-counts members, responses,\
+    \ converted leads and influenced\n    opportunities into the read-only statistics\
+    \ fields.\n  - The Zoom package can create a Campaign per Zoom webinar/event\
+    \ and push\n    each registrant in as a CampaignMember with join/leave times.\n\
+    \  - The classic layout carries two stock custom links: \"View All Campaign\n\
+    \    Members\" and \"View Campaign Influence Report\".\nNone of this has ever\
+    \ produced a record in preprod (count = 0)."
+- title: Campaign — Connected Objects
+  keywords:
+  - campaign
+  - each
+  - relationship
+  - means
+  text: "- Campaign (ParentId, self-lookup): standard campaign hierarchy - a child\n\
+    \  campaign rolls its statistics up into the Hierarchy* fields of its parent.\n\
+    - CampaignMember (child): the join object listing which Leads/Contacts are in\n\
+    \  the campaign (0 records).\n- Opportunity (Opportunity.CampaignId): opportunities\
+    \ can name a campaign as\n  their \"Primary Campaign Source\"; never populated\
+    \ in this org (0 of 658\n  opportunities).\n- ZVC__Zoom_Event__c / ZVC__Zoom_Webinar__c\
+    \ (lookups from Campaign): the Zoom\n  package's event/webinar records this\
+    \ campaign would represent. Both unused.\n- CampaignInfluence / CampaignInfluenceModel:\
+    \ standard campaign-influence\n  machinery exists in the metadata snapshot but,\
+    \ with no campaigns, holds\n  nothing."
+- title: Campaign — Automation
+  keywords:
+  - campaign
+  - runs
+  text: "None in the org's own code or flows: no record-triggered flows, no triggers,\n\
+    no scheduled jobs, no quick-action flows reference Campaign.\n- The only Campaign-specific\
+    \ button is the stock \"Child Campaign\" create\n  action on the classic Campaign\
+    \ Layout (creates a child campaign) plus the\n  generic LogACall / SendEmail\
+    \ / NewTask / NewEvent actions.\n- Potential external writer: the installed\
+    \ Zoom (ZVC) package can create/\n  update campaigns from Zoom webinars and\
+    \ events - installed, never used."
+- title: CampaignMember — What This Object Is
+  keywords:
+  - campaignmember
+  - campaign
+  - member
+  text: 'CampaignMember is the STANDARD Salesforce junction object between a Campaign
+
+    and the people in it: one row = one Lead OR one Contact participating in one
+
+    campaign, with a per-campaign status (Sent / Responded) and a read-only mirror
+
+    of the person''s details for easy list building.
+
+
+    IN THIS ORG IT IS NOT USED: 0 records, matching the 0 campaigns. Its only
+
+    customization is 8 fields from the installed Zoom ("ZVC") managed package,
+
+    which - if the feature were used - would record each member''s Zoom webinar/
+
+    event registration and actual join/leave times. It never has been.'
+- title: CampaignMember — Kind Of Object
+  keywords:
+  - campaignmember
+  - campaign
+  - member
+  text: "- Standard junction object: 33 fields, 8 custom (all from the ZVC package).\n\
+    - Sharing: \"Controlled By Campaign\" - visibility of a member row follows the\n\
+    \  parent campaign; the row has no owner of its own.\n- A member must reference\
+    \ a Campaign plus EITHER a Lead or a Contact; the\n  same person can appear\
+    \ once per campaign.\n- 0 record types, 0 validation rules, 0 list views.\n\
+    - Scale: 0 records in preprod. Empty object."
+- title: CampaignMember — Record Types
+  keywords:
+  - campaignmember
+  - campaign
+  - member
+  text: 'None. All members would be plain rows; the org never configured member
+
+    record types (Campaign.CampaignMemberRecordTypeId is therefore moot).'
+- title: CampaignMember — How It Is Used — The Business Process
+  keywords:
+  - campaignmember
+  - campaign
+  - member
+  text: "It is not used - no rows have ever existed. The intended standard mechanics,\n\
+    for context:\n  - Adding a Lead/Contact to a campaign creates a member row with\
+    \ a status\n    from the campaign's configured status list (stock: \"Sent\"\
+    , \"Responded\").\n  - When the person responds, the status changes, HasResponded\
+    \ flips true and\n    FirstRespondedDate stamps - feeding the campaign's response\
+    \ statistics.\n  - The classic member layout carries stock \"Convert Lead\"\
+    \ and \"Create\n    Opportunity\" buttons to push a responding member down the\
+    \ funnel.\n  - The Zoom package would auto-create members for webinar/event\
+    \ registrants\n    and stamp their actual attendance times.\nNothing in Techsara's\
+    \ recruiting or training funnels touches this object."
+- title: CampaignMember — Connected Objects
+  keywords:
+  - campaignmember
+  - campaign
+  - member
+  - each
+  - relationship
+  - means
+  text: "- Campaign (CampaignId, required): the campaign this membership belongs\
+    \ to.\n  Sharing is inherited from it.\n- Lead (LeadId): the lead who is the\
+    \ member (for not-yet-converted people).\n- Contact (ContactId): the contact\
+    \ who is the member. Note: in this org a\n  candidate is a Person Account, so\
+    \ a candidate COULD technically be a member\n  through their person-account\
+    \ contact - it has never happened.\n- ZVC__Zoom_Event_Registrant__c / ZVC__Zoom_Webinar_Registrant__c\
+    \ (lookups):\n  the Zoom package's registrant records this membership mirrors.\
+    \ Unused."
+- title: CampaignMember — Automation
+  keywords:
+  - campaignmember
+  - campaign
+  - member
+  - runs
+  text: 'None in the org''s own automation: no flows, triggers, scheduled jobs or
+
+    quick actions reference CampaignMember. The only potential writer is the
+
+    installed Zoom (ZVC) package syncing webinar/event registrants - never used.
+
+    Standard platform behavior (status statistics rolling up to the Campaign)
+
+    would apply automatically if rows existed.'
+- title: Opportunity — What This Object Is
+  keywords:
+  - opportunity
+  text: 'Opportunity is the STANDARD Salesforce sales-deal object: one record per
+
+    potential sale, moved through pipeline stages to Closed Won/Lost, with an
+
+    amount, probability and forecast rollups.
+
+
+    IN THIS ORG IT IS NOT A WORKED PIPELINE - IT IS MOSTLY AN ACCIDENTAL
+
+    BYPRODUCT OF LEAD CONVERSION. There are 658 records, but 608 of them (92%)
+
+    sit on candidate Person Accounts, were created automatically when a candidate
+
+    Lead was converted, are named after the candidate, sit untouched at the
+
+    default first stage "Qualification" with no Amount, and nobody ever works
+
+    them. The remaining 50 sit on business Accounts and are largely Salesforce
+
+    sample/demo data (names like "Acme - 300 Widgets (Sample)") plus a few test
+
+    records. Techsara''s real "deal" objects are Job_Requirement__c /
+
+    Job_Submission__c (B2B staffing) and Invoice__c / Payment__c (billing) -
+
+    questions about revenue pipeline belong there, not here.
+
+
+    WHY THE BYPRODUCT HAPPENS: the Convert Lead button runs Lead_Conversion_Flow,
+
+    which calls the LeadConversionHandler Apex action. That handler defaults
+
+    createOpportunity = true when the flag is not supplied - and the flow does
+
+    not supply it - so every candidate conversion silently spawns an Opportunity
+
+    alongside the Person Account. This is worth knowing because these 600+ ghost
+
+    records inflate any naive "open pipeline" report and each carries the
+
+    candidate''s name as the record Name.'
+- title: Opportunity — Kind Of Object
+  keywords:
+  - opportunity
+  text: "- Standard object: 24 fields visible in the metadata snapshot, 5 custom\n\
+    \  (4 org-local checklist fields + 1 from the PandaDoc package).\n- Sharing:\
+    \ PRIVATE org-wide default (internal and external) - one of the few\n  Private-OWD\
+    \ standard objects in this org; only the owner, users above them\n  in the role\
+    \ hierarchy, and admins see a given opportunity. Owned records:\n  owner defaults\
+    \ to whoever converted the lead or created the record.\n- 0 record types, 0\
+    \ validation rules, 7 list views (stock: All/My\n  Opportunities, Closing This/Next\
+    \ Month, New This Week, Won, Default\n  Opportunity Pipeline).\n- Record pages:\
+    \ classic \"Opportunity Layout\" (stock sections; the four custom\n  checklist\
+    \ fields ARE placed on it) and a plain three-column Lightning page\n  (Opportunity_Record_Page_Three_Column)\
+    \ with no custom components or\n  embedded flows. Compact layout \"New Awesome\
+    \ Compact Layout\" shows Name,\n  Account, Close Date, Amount, Owner.\n- Scale:\
+    \ 658 records in preprod, created 2024-08-06 through 2026-08-07."
+- title: Opportunity — Record Types
+  keywords:
+  - opportunity
+  text: 'None. All opportunities are one flavor; the org never invested in splitting
+
+    them (consistent with the object not really being used).'
+- title: Opportunity — How It Is Used — The Business Process
+  keywords:
+  - opportunity
+  text: "THE REAL PROCESS (what actually happens today):\n  STEP 1 - A recruiter\
+    \ converts a candidate Lead (Convert Lead button ->\n    Lead_Conversion_Flow\
+    \ -> LeadConversionHandler Apex). Because the flow\n    never sets the createOpportunity\
+    \ flag, the handler's default (true) makes\n    the standard lead-convert also\
+    \ create an Opportunity on the new Person\n    Account, named after the candidate.\n\
+    \  STEP 2 - Nothing. The record stays at stage \"Qualification\" (the org's\n\
+    \    first stage), Amount empty, Type empty, forever. 614 of 658 records\n \
+    \   (93%) are in exactly this state. LeadSource is carried over from the\n \
+    \   Lead - which is why \"Customer Referral\" (the dominant candidate lead\n\
+    \    source) covers 74% of opportunities.\n  STEP 3 (rare/manual) - A handful\
+    \ of records were worked by hand, mostly on\n    the business-account side:\
+    \ 18 Closed Won, 16 Closed Lost (each of the 16\n    has a Loss Reason filled),\
+    \ 7 Negotiation, 3 Needs Analysis. Much of that\n    is recognizable Salesforce\
+    \ sample data, not real Techsara deals.\n\nWHAT DOES NOT HAPPEN: no quotes are\
+    \ synced, no products/line items are used\nin earnest (12 records have a price\
+    \ book - the sample data), no campaigns are\nlinked, no contracts, no PandaDoc\
+    \ documents. The global \"New\" opportunity\nquick action exists on several\
+    \ page layouts' publishers (Job Submission,\nOnboarding, Invoice, etc.) but\
+    \ users effectively never click it."
+- title: Opportunity — How It Is Used — The Business Process (2)
+  keywords:
+  - opportunity
+  text: 'ROLE-HIERARCHY NOTE: because the OWD is Private, opportunity visibility
+
+    follows record ownership + role hierarchy. With 600+ conversion byproducts
+
+    owned by whichever recruiter converted each lead, any future cleanup or
+
+    ownership reshuffle (see the role-hierarchy redesign docs) touches this
+
+    object mainly as data hygiene, not as a business pipeline.'
+- title: Opportunity — Connected Objects
+  keywords:
+  - opportunity
+  - each
+  - relationship
+  - means
+  text: "- Account (AccountId): the account the deal belongs to. In practice: 608\n\
+    \  candidate Person Accounts (conversion byproducts) vs 50 business Accounts\n\
+    \  (sample/test data). This is the reverse of a normal sales org.\n- User (OwnerId):\
+    \ the owning user - the converter/creator. Private sharing\n  makes this the\
+    \ visibility key.\n- Campaign (CampaignId, \"Primary Campaign Source\"): never\
+    \ populated (0).\n- Contract (ContractId): never populated (0).\n- Pricebook2\
+    \ (Pricebook2Id) + OpportunityLineItem children: price book set on\n  12 records\
+    \ (sample data); real product line items are not used.\n- Quote (SyncedQuoteId):\
+    \ no quote has ever been synced (0). The Quote object\n  exists in the org with\
+    \ a stock layout but is similarly idle.\n- OpportunityContactRole / OpportunityCompetitor\
+    \ / OpportunityHistory:\n  standard children present in the snapshot; nothing\
+    \ meaningful in them.\n- Lead: not a lookup, but the origin - each converted\
+    \ lead points at its\n  created opportunity via the standard ConvertedOpportunityId\
+    \ on Lead."
+- title: Opportunity — Business Rules
+  keywords:
+  - opportunity
+  - validation
+  text: 'None. No validation rules exist on Opportunity - nothing forces Amount,
+
+    Loss Reason, or stage discipline. (Consistent with nobody working the
+
+    records.)'
+- title: Opportunity — Automation
+  keywords:
+  - opportunity
+  - runs
+  text: "- NO flows touch Opportunity (checked across all 135 flows), no Apex trigger\n\
+    \  exists for it, no scheduled job writes it.\n- The ONLY code that creates\
+    \ Opportunity records is LeadConversionHandler\n  (the @InvocableMethod behind\
+    \ Lead_Conversion_Flow's convert actions): its\n  createOpportunity parameter\
+    \ defaults to true, and the flow does not pass\n  it, so standard lead conversion\
+    \ auto-creates one opportunity per converted\n  candidate. If the team ever\
+    \ wants to stop the ghost records, the fix is a\n  one-line flow change (pass\
+    \ createOpportunity = false).\n- Buttons: only generic quick actions (SendEmail,\
+    \ LogACall, NewTask,\n  NewEvent, Chatter posts) on the layout; the global \"\
+    New\" opportunity create\n  action appears in several other objects' publishers\
+    \ but is unused.\n- Standard platform behavior still applies: StageName drives\
+    \ Probability and\n  forecast category; ExpectedRevenue = Amount x Probability."

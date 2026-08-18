@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Candidate_Training__c</fullName>
+    <deleteConstraint>Restrict</deleteConstraint>
+    <description>The attending candidate&apos;s training. Session_Attendee links a shared Session to this training so the candidate&apos;s portal can surface it.</description>
+    <label>Candidate Training</label>
+    <referenceTo>Candidate_Training__c</referenceTo>
+    <relationshipLabel>Group Session Enrollments</relationshipLabel>
+    <relationshipName>Attended_Sessions</relationshipName>
+    <required>true</required>
+    <trackTrending>false</trackTrending>
+    <type>Lookup</type>
+</CustomField>

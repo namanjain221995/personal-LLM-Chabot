@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Support_Block_Start__c</fullName>
+    <description>Backend-only. Absolute (UTC) start instant of this internal interview, auto-derived from Start Time IST by the Internal_Interview_Set_Support_Block_Times flow. Used as the time source for the support-availability scheduled path. Do not edit manually.</description>
+    <label>Support Block Start</label>
+    <required>false</required>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>DateTime</type>
+</CustomField>

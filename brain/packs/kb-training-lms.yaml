@@ -1,0 +1,2833 @@
+# Compiled 2026-08-16 from brain/sources/techsara-org-knowledge-base.txt (preprod org documentation, 71 objects) by the brain ingestion pipeline: deterministic section/field parsing, every field name validated against the production dictionary + warehouse table list, rules distilled and adversarially verified. Fields the production warehouse lacks are only ever mentioned as explicit not-synced caveats.
+# Domain: PART 6 — verifier verdict: ship_with_fixes.
+name: kb-training-lms
+description: Teaches the training/LMS object model — Program/Program_Version blueprints,
+  Candidate_Training enrollments, steps, deliverables with AWS AI grading, session-window/cohort
+  booking, and the pre-enrolment intake funnel — adding population filters, real-vs-dead
+  columns and lookup directions the built-in training rules lack.
+triggers:
+- program version
+- program versions
+- enrollment
+- enrollments
+- enrolment
+- enrolments
+- enrolled
+- session window
+- session windows
+- step template
+- step templates
+- batch
+- batches
+- booking
+- attempt
+- attempts
+- submission
+- submissions
+- ai score
+- ai feedback
+- locked
+- overdue
+- extension
+- extensions
+- pre-enrolment
+- pre-enrollment
+- education history
+- institute
+- institutes
+- course
+- courses
+- lms
+tables:
+- Candidate_Training__c
+- Deliverable__c
+- Session__c
+- CandidateTrainingStep__c
+- Program__c
+- Program_Version__c
+- Deliverable_Result__c
+- Cohort__c
+rules: 'Training/LMS rules (beyond the built-in block):
+
+  - One enrollment = one Candidate_Training__c; Program_Version__c (required) drives
+  it, Program__c is a copy. Status__c: Planned|Active|Paused|Completed|Dropped.
+
+  - Cohort programs (esp. Interview Readiness Training) have no step templates —
+  zero steps/deliverables is by design, not missing data.
+
+  - Program__c.Lifecycle_Status__c is unenforced — Draft programs hold live enrollments;
+  don''t filter to Published.
+
+  - Deliverable__c.Status__c: ''Active''+''Inprogress'' = open, ''Approved''+legacy
+  ''Completed'' = passed — sum each pair; ''Not Active'' = session not held; Locked
+  = past due.
+
+  - AI grades: Deliverable_Result__c.AI_Score__c (0-100), Result_Status__c Pass|Fail|Pending,
+  one row per ATTEMPT; deliverables ever submitted = parent Submitted_At__c not
+  null; AI_Latest_Score__c is TEXT.
+
+  - Deadlines: use Due_Date_Sort__c (DateTime); IST/candidate-TZ due fields are
+  display TEXT.
+
+  - Never populated: step Completed__c/Due_At__c/Duration__c, Submitted_By__c, Approved_By__c
+  (Approved_At__c sparse) — judge by Status__c.
+
+  - Trainer lookups -> Recruiter__c (Assigned_Trainer__c, Session_Window__c.Trainer__c);
+  *_User__c twins unused; Cohort__c.Lead_Trainer__c rarely set.
+
+  - Cohort__c has NO program lookup — get a slot''s program via Candidate_Training__c
+  or Session_Window__c (seats = Candidate_Capacity__c - Booked_Count__c); blank
+  Cohort__c = unbooked (group programmes — 1-1s never have one).
+
+  - Extension_Requested__c = open request only; Extension_Requested_At__c never
+  cleared (''ever asked'').
+
+  - Course__c/Institute__c are academic intake lists; a training "course" = Program__c,
+  never Course__c.
+
+  - Pre_Enrolment_Request__c: single-use tokenized intake form to a Lead; Status__c
+  Sent|Opened|Submitted|Expired|Cancelled; its Candidate__c is metadata-only, not
+  in production — join via Lead__c.'
+glossary:
+  program version: The versioned configuration of a training program (session type,
+    booking mode, durations, mock policy) that every enrollment pins; step templates
+    and booking windows hang off the version, not the program.
+  enrollment: 'One Candidate_Training__c record: one candidate taking one program
+    version, with its own steps, deliverables and sessions.'
+  batch: A Cohort__c — candidates going through group training together, sharing
+    one recurring set of session slots (also called a slot).
+  session window: 'A Session_Window__c: the recurring daily time-slot template under
+    a program version that candidates book into; booking assigns the window''s cohort
+    to their training.'
+  booking: Reserving a session-window slot, which stamps the training's cohort and
+    start date and schedules each step on consecutive business days — a group-programme
+    enrollment with no cohort is unbooked (1-1 trainings never have a cohort).
+  group session: The cohort flavor of a program where one shared meeting per step
+    serves the batch (extra candidates ride along as attendee rows); the opposite
+    is Single Session, one-on-one with a trainer.
+  attempt: One submission of a deliverable — one Deliverable_Result__c row with
+    its own AI verdict; failed attempts are commonly resubmitted, so one deliverable
+    accumulates many rows.
+  ai score: The AWS grading engine's 0-100 quality score for one attempt (Deliverable_Result__c.AI_Score__c);
+    the pass mark lives in the AWS engine, not in Salesforce.
+  locked: A deliverable whose due date passed without an accepted submission — the
+    candidate can no longer submit and can only request an extension.
+  extension: A candidate's request to reopen a locked or past-due deliverable; trainer
+    approval writes a new due date and reopens it.
+  pre-enrolment form: The single-use, tokenized public intake form emailed to a
+    Lead before training (Pre_Enrolment_Request__c); submitted answers are copied
+    onto the Lead.
+  education history: A candidate's degree entries (institute, course, dates, CGPA)
+    captured on the pre-enrolment form against the Lead and re-parented to the candidate
+    Account at conversion.
+field_notes:
+  Program__c:
+    Name: The human name of the training offering (e.g. "Interview Readiness Training").
+      Entered in the Program_Creation wizard.
+    Description__c: Free-text description of what the program covers, entered in
+      the creation wizard. Purely informational (long text - population not queryable
+      via SOQL aggregates).
+    Lifecycle_Status__c: 'Where the program is in its catalog life: Draft (default
+      - being built, not yet offered) | Published (live, can be enrolled into) |
+      Archived (retired). Set manually / by the creation wizard.'
+    Auto_Create_Sessions__c: Master switch for automatic session generation. When
+      TRUE, the Candidate_Training_Creation enrollment flow auto-creates the training
+      Session__c records (per the Program Version's duration/sessions-per-day settings)
+    Session_Type__c: Whether this program's sessions are one-on-one ("Single Session")
+      or batch-based ("Group Session"). Per the field's own description it is left
+      blank when Auto-Create Sessions is off.
+  Program_Version__c:
+    Name: Version display name, written by the creation wizard as "<Program name>
+      - V<number>" (e.g. "Retraining Program - V1"). One stray row named just "Coding"
+      (no version number) looks like a test record.
+    Program__c: 'The catalog Program this version configures. Set by the wizard;
+      100% populated. Child relationship name: Program_Versions.'
+    Version_Number__c: Sequential version number (1, 2, ...; one decimal place allows
+      sub- versions like 1.5). Written by the creation/update wizards.
+    Status__c: 'Version lifecycle: Draft (being built) | Published (the live version
+      candidates should be enrolled against) | Superseded (replaced by a newer version).
+      Set by the wizards / manually.'
+    Effective_From__c: When this version takes effect - the from-date of the version's
+      validity. Written by the creation wizard (10 of 11 populated). Becomes meaningful
+      once multiple versions of one program exist.
+    Notes__c: Free-text change notes for the version (what changed vs the previous
+      one). Entered in the wizards; informational only.
+    Session_Type__c: '"Single Session" (one-on-one with a trainer) or "Group Session"
+      (batch/ cohort-based). Copied from Program.Session_Type__c at version creation
+      and overridable per version (per the field description).'
+    Booking_Mode__c: 'How candidate-side booking works (field description): "Anytime"
+      = the candidate picks any time within trainer availability; "Fixed Schedule"
+      = the candidate must pick one of the pre-defined Session_Window__c slots.'
+    Booking_Owner__c: 'Who books each session: "Trainer Books" (manual scheduling
+      by staff) | "Candidate Books" (self-service through the candidate portal).'
+    Session_Duration__c: 'Duration of each session window in MINUTES, as a restricted
+      picklist of 15-minute steps: 15 | 30 | 45 | 60 | 75 | 90 | 105 | 120 | 135
+      | 150 | 165 | 180. The value is the numeric minute count stored as a string
+      (e.g.'
+    Sessions_Per_Day__c: Number of session windows per day when Booking Mode is
+      Fixed Schedule. Used by the Program Creation wizard to generate the correct
+      number of Session_Window__c template rows (per the field description).
+    Total_Expected_Duration__c: System-computed SUM of the child StepTemplate__c.Expected_Duration_Min__c
+      values - the total planned curriculum minutes for this version. Nobody types
+      this; Salesforce maintains it.
+    Mock_Frequency__c: 'How often the mock interview recurs during the program:
+      Weekly | Once | End of Program. Both mock-enabled versions use "Weekly".'
+    Mock_Booking_Owner__c: 'Who schedules the mock-interview session: "Trainer Books"
+      (manual) | "Candidate Books" (self-service) - the mock counterpart of Booking_Owner__c.
+      One mock-enabled version uses each value.'
+    Mock_Blocks_Progress__c: When TRUE, a candidate cannot proceed to the next mock
+      cycle (e.g. next week) until the current mock is booked and attended; runtime
+      enforcement lives in the candidate portal (per the field description).
+    Mock_Failure_Requires_Retake__c: When TRUE, a candidate who fails a mock interview
+      must retake the corresponding training cycle - falling back to earlier weeks
+      if the current week has no capacity (per the field description).
+  Cohort__c:
+    Name: The batch's display name, entered manually (e.g. a batch/date label).
+      Shown on the candidate's training tile and on session rosters.
+    Start_Date__c: First day of the batch. Entered manually; 100% populated. Read
+      by the session-window generator to anchor the recurring slot dates.
+    End_Date__c: Last day of the batch. Entered manually; 100% populated. Existing
+      cohorts span 2026-05-11 through 2026-08-28.
+    Lead_Trainer__c: The trainer responsible for the batch. Points at the standard
+      User object (unusual for this org, where staff lookups normally target Recruiter__c).
+  Course__c:
+    Name: The course/degree name a candidate could pick on the intake forms (e.g.
+      "Computer Science"). Would be loaded by an admin as reference data; no records
+      exist yet.
+    Active__c: Whether this course appears in the intake-form choice lists - both
+      consuming flows filter on Active__c = true, so unchecking retires a course
+      without deleting it. No records exist to flag yet.
+  Institute__c:
+    Name: The university/college name (e.g. a US or Indian university). Bulk- loaded
+      reference data; not user-entered day to day.
+    Active__c: 'Whether the institute is offered on the intake forms - the pre-enrolment
+      flow filters on it, so unchecking retires a school without deleting the row.
+      Real data: all 3,470 rows are Active = true.'
+    Country__c: The institute's country, from the org-wide shared "Country" value
+      set. Used by the pre-enrolment form to narrow the school list by country before
+      the candidate picks.
+  Candidate_Training__c:
+    Candidate__c: The candidate (Person Account) this training belongs to. 100%
+      populated. Set once in the creation flow's candidate picker and never changed.
+    Candidate_Email__c: The candidate's email, auto-copied from the Person Account's
+      PersonEmail by the creation flow (99% populated). Used for session/training
+      emails without having to traverse the Account relationship.
+    Whatsapp_No__c: The candidate's WhatsApp number for training coordination. Manual
+      entry; barely used in practice (3 of 423 records).
+    Candidate_Owner__c: The OWNER of the candidate Account at enrollment time, stamped
+      by the creation flow (~100% populated). Lets training reports slice by the
+      owning employee without joining through Account.
+    Program__c: The course itself (e.g. "Interview Readiness Training", "Technical
+      1-1 Training"). Set by the creation flow; ~100% populated. Mostly a convenience
+      copy - the version below is what drives behavior.
+    Program_Version__c: WHICH versioned configuration of the program this enrollment
+      follows (100% populated). The creation flow reads this version's StepTemplates
+      to build the candidate's steps
+    Cohort__c: The batch/group this training was booked into. NOT set at enrollment
+      - written by the slot-booking logic (portal bookSessionWindow or the admin
+      "Book Session Slot" action) from the chosen Session Window's cohort.
+    Niche__c: 'The candidate''s target job niche, picked at enrollment: AI ML Engineer
+      | Python Developer/Engineer | Java Fullstack Developer/Engineer | Product/Project
+      Manager | Marketing Manager | Finance Analyst | Other.'
+    Assigned_Trainer__c: The internal trainer responsible for this candidate (62%
+      populated). Picked in the creation flow's trainer lookup; copied onto every
+      child step at creation.
+    Assigned_Trainer_User__c: The trainer's Salesforce User record. Effectively
+      unused (2 of 423) - the org's convention is Recruiter__c ("Employee") lookups,
+      not User.
+    Status__c: 'The enrollment lifecycle: Planned | Active | Paused | Completed
+      | Dropped. Users drive it manually; "Dropped" triggers the cascade flow (see
+      part 7).'
+    Start_Date__c: The date training starts. Written by the slot-booking logic from
+      the Session Window's start date (38% populated - matches the booked subset).
+      Can also be entered manually for non-cohort trainings.
+    End_Date__c: The planned end of training. The booking logic sets it to the date
+      of the LAST scheduled step (each step lands on the next business day). Only
+      6% populated so far.
+    Drop_Date__c: 'Help text: "Set before changing Status to Dropped. Drives the
+      cutoff date for cascading updates on the training''s deliverables, steps,
+      and sessions.'
+    Time_Zone__c: 'The candidate''s home time zone: ET | PT | CT | MT | HT | UTC
+      | AT | IST (each labeled with its full name, e.g. "ET (Eastern Time)"). Chosen
+      at enrollment or defaulted from the Session Window at booking.'
+    Candidate_Feedback__c: Free-text feedback FROM the candidate about the training
+      (collected at or after completion). Manual entry; population not measurable
+      via SOQL (long text), but the object is young and Completed count is low.
+    Trainer_Feedback__c: Free-text assessment BY the trainer about the candidate's
+      performance during the training. Manual entry by the trainer.
+  CandidateTrainingStep__c:
+    Candidate_Training__c: 'THE required parent: which enrollment this step belongs
+      to. 100% populated; sharing and deletes cascade from it.'
+    Step_Template__c: The blueprint this step was instantiated from, linked by the
+      creation flow. 100% populated with zero orphans - every step still resolves
+      to a live template.
+    Sequence__c: The step's order within the training (copied from the template;
+      100% populated). Booking walks steps in this order when assigning one business
+      day per step; the portal shows steps sorted by it.
+    Learning_Goal__c: What the candidate should achieve in this step - copied from
+      the template at creation so later template edits don't rewrite history.
+    Training_Step__c: The step's instructional content/outline, copied from the
+      template.
+    Training_Method__c: 'How the step is delivered (method/notes), copied from the
+      template. Note the label mismatch: API "Training_Method__c", label "Training
+      Notes" - same situation as on the template object.'
+    Expected_Duration__c: Planned minutes for this step, copied from the template's
+      Expected_Duration_Min__c (75% populated - blank where the template had no
+      duration).
+    Duration__c: Intended to hold the ACTUAL minutes spent on the step. Never populated
+      in practice (0 of 1,372) - actual-time tracking is not used.
+    Status__c: 'The step''s progress state: Not Started | In Progress | Blocked
+      | Skipped | Completed | Absent | Dropped. Set to "Not Started" at creation,
+      then updated manually by the trainer.'
+    Started_At__c: When this step is SCHEDULED to run - stamped by the slot-booking
+      Apex, which places step 1 on the window's start date and each further step
+      on the next business day, at the window's slot time.
+    Completed__c: Intended completion timestamp. NEVER populated in practice (0
+      records, even though 481 steps have Status "Completed") - teams only flip
+      the status. Treat status, not this field, as the source of truth.
+    Due_At__c: Intended per-step deadline. Never populated (0 records) - deadlines
+      actually live on the child Deliverable__c due-date fields.
+    Assigned_Trainer__c: The trainer running this step, inherited from the parent
+      training at creation (71% populated). Can be reassigned per step if a different
+      trainer covers it.
+    Assigned_Trainer_User__c: User-flavored trainer link. Never populated (0 records).
+    Assigned_Trainer_Name__c: Formula concatenating Assigned_Trainer_User__r First/Middle/Last
+      name. Because Assigned_Trainer_User__c is never filled, this formula is always
+      blank in practice - a dead display helper.
+    Notes__c: Free-text working notes the trainer keeps on this step (what was covered,
+      how the candidate did). Manual entry.
+  StepTemplate__c:
+    Program_Version__c: 'THE required parent: which course version this step is
+      part of. 100% populated; the version''s step list IS the curriculum.'
+    Program__c: Denormalized link to the top-level program (100% populated), set
+      by the authoring flows for easier reporting/filtering.
+    Title__c: The step's human-readable name (e.g. "Mock Interview - Round 1").
+      The only required field besides the parent; copied into the runtime step's
+      Name at enrollment.
+    Sequence__c: The step's position in the curriculum (1, 2, 3...). 100% populated;
+      copied to the runtime step and used by booking to lay steps onto consecutive
+      business days in order.
+    Expected_Duration_Min__c: Planned length of the step in minutes. 69% populated
+      (36 of 52). Copied to the runtime step's Expected_Duration__c and rolled up
+      into the version's Total_Expected_Duration.
+    Is_Required__c: Whether the step is mandatory for the program. In practice ALL
+      52 templates are checked TRUE - optional steps are not used yet, so nothing
+      downstream branches on it today.
+    Description__c: Plain-text description of the step for admins/trainers.
+    Step_Description__c: Rich-text (formatted) version of the step description -
+      the prettier of the two description fields, used for display.
+    Learning_Goal__c: What the candidate should be able to do after this step. Copied
+      verbatim onto every runtime step at enrollment.
+    Training_Step__c: The instructional content/outline of the step itself. Copied
+      to the runtime step at enrollment.
+    Training_Method__c: Delivery method / trainer notes for the step. Copied to
+      the runtime step. Same API-name-vs-label mismatch as on the runtime object
+      (API says "Method", label says "Notes").
+    Lookup_Key__c: A technical matching key written by the authoring wizards so
+      that Update_Program_Version can pair each step with its deliverable definitions
+      (and with its clone in the new version) while looping in the flow.
+    Tags__c: Free-text tags for categorizing steps. Never used (0 of 52 populated).
+  Step_Deliverable_Definition__c:
+    Step_Template__c: The step template this deliverable requirement is attached
+      to. Set by the authoring wizards; the enrollment flow uses it to find "all
+      definitions of this step" when generating deliverables.
+    Label__c: The human name of the required artifact (e.g. "Recorded self-intro
+      video"). Copied into the runtime Deliverable__c's Name at enrollment, so this
+      is the text candidates see in their portal task list.
+    Type__c: 'The KIND of artifact expected: Video_URL | File | URL | Text | Checkbox
+      | Image. Drives which input widget the candidate portal renders for the deliverable
+      (a link box, a file upload, free text'
+    Schema_JSON__c: A JSON configuration blob refining the deliverable's expected
+      input/validation beyond the simple Type (field structure, constraints, evaluation
+      hints for the AI engine). Written by the authoring wizard.
+    Days_To_Complete__c: How many days AFTER the step runs the candidate has to
+      submit this deliverable. Copied onto the runtime Deliverable__c
+    Is_Required__c: Whether the deliverable is mandatory for completing the step.
+      Copied to the runtime Deliverable__c's own Is_Required flag at enrollment.
+    Key__c: A second auto-number (besides the record Name) giving each definition
+      a stable short identifier. (Why both exist is not fully documented - verify
+      with team; likely an external-reference key for the AWS package.)
+    Lookup_Key__c: Technical matching key written by the authoring wizards, pairing
+      the definition with its step template while the Update_Program_Version flow
+      loops/clones records. Not meant for human use.
+  Deliverable__c:
+    Name: The deliverable's title, copied from the template's Label at enrollment
+      (e.g. "Niche Fundamentals Recording"). Plain text, not auto-number. Also used
+      to build the trainer-friendly S3 filename of every submission.
+    Candidate_Training_Step__c: 'THE required parent link: which training step/module
+      this work item is part of. Set once by the Candidate_Training_Creation flow
+      and never changed.'
+    Candidate_Training__c: Shortcut to the candidate's enrollment (populated on
+      ~100% of records; 1 legacy record is missing it). Every portal query filters
+      on Candidate_Training__r.Candidate__c to enforce "you only see your own work".
+    Definitions__c: The program-template row this deliverable was generated from
+      (~100% populated). The template supplies the Name, Days_To_Complete, whether
+      it is required
+    Linked_Session__c: The completed training session that opened this deliverable
+      - stamped by the Session_Complete_Activate_Deliverables flow at activation
+      time (41% populated
+    Is_Required__c: Whether the candidate must complete this deliverable to progress.
+      The creation flow currently hard-codes it TRUE for every record (true on 3,251
+      of 3,252), so in practice all deliverables are mandatory
+    Approval_Required__c: Whether the submission needs a pass verdict before the
+      deliverable can complete. Also hard-coded TRUE at creation on every record.
+    Days_To_Complete__c: How many days after the step starts the candidate has to
+      finish, copied from the template at enrollment (69% populated).
+    Notes__c: Free-form notes about this deliverable (instructions, trainer remarks).
+      Manual entry; no automation writes or reads it.
+    Status__c: 'THE state machine of the deliverable. Values and meaning: - "Not
+      Active" (27% of records): created but the step''s session has not completed
+      yet - hidden as "upcoming" in the portal.'
+    Due_Date_IST__c: The deadline as an IST wall-clock string, e.g. "7/21/2026 04:30
+      PM" - what the India-based trainers read. Computed at enrollment and recomputed
+      when the candidate books a session window (step start + Days_To_Complete +
+    Due_Date_Candidate_Time_Zone__c: The same deadline in the CANDIDATE'S own timezone
+      (e.g. "7/21/2026 06:00 AM" for a US-Pacific candidate) - what the candidate
+      portal shows. Written by the same three writers as Due_Date_IST__c. 69% populated.
+    Due_Date_Sort__c: 'The machine-usable deadline: the due date at 18:30 GMT (=
+      midnight IST). Used for sorting lists, the portal''s "past due -> show as
+      locked" check, and as the query window / legacy fallback of the hourly locking
+      job.'
+    Submitted_At__c: When the candidate last submitted (stamped by DeliverableActionService
+      at each successful submit/finalize). 39% of deliverables have ever been submitted.
+    Submitted_By__c: Intended submitter audit field - NEVER POPULATED in practice
+      (0 records). Candidates use the custom token portal and are not Salesforce
+      users, so the code stamps only Submitted_At__c.
+    Attempt_Count__c: How many times the candidate has submitted this deliverable,
+      incremented by the portal Apex on every finalized submission (and self-healed
+      downward if an upload is cancelled).
+    AI_Latest_Score__c: The AI score of the NEWEST submission, copied up from the
+      child Deliverable_Result__c by the Deliverable_result_roll_up_status flow
+      (32% populated).
+    Latest_AI_Feedback__c: The AI's written feedback for the newest submission (reasoning
+      + "Positives:"/"Negatives:" bullet lists composed by the AWS callback)
+    Approved_At__c: When the deliverable reached Approved - stamped automatically
+      by the Update_Deliverable_Approverd_At flow when the status becomes Approved
+      (6.5% populated
+    Approved_By__c: The approving trainer. The enrollment flow tries to prefill
+      it with the training's assigned trainer user, but it is EMPTY on all records
+      today - the source field on the training is not populated.
+    Extension_Requested__c: TRUE while the candidate has an OPEN extension request
+      (only one at a time is allowed). Set by the portal (DeliverableActionService)
+      for locked or past-due deliverables; firing it triggers the trainer email
+      flow.
+    Extension_Requested_At__c: 'When the candidate asked for the extension - stamped
+      together with the flag, but NOT cleared on resolution, so it doubles as a
+      "has ever asked" audit: 272 deliverables (8.4%) have had an extension requested
+      at some'
+  Deliverable_Result__c:
+    Name: System-generated attempt number, e.g. DR-001234. Shown in the portal's
+      attempt history and embedded (as the record Id, not this number) in the S3
+      filename.
+    Deliverable__c: 'THE required parent link: which deliverable this attempt belongs
+      to. 100% populated; set once at creation by the portal Apex and never changed.
+      Sharing and deletes cascade from the deliverable.'
+    Submitted_At__c: When the candidate made (or retried) this submission - stamped
+      by the portal Apex at creation and refreshed if an orphaned Pending row is
+      reused for a retry, so trainers see the real latest attempt time. 100% populated.
+    Result_Status__c: The attempt's verdict. Created as "Pending" (submitted, awaiting
+      the AI); the AWS callback flips it to "Pass" or "Fail".
+    AI_Score__c: The AI engine's 0-100 quality score for this attempt, written by
+      the AWS callback (99.7% populated; average 75.8, observed range 0-97). The
+      newest score is rolled up to the parent's AI_Latest_Score__c.
+    AI_Feedback__c: 'The AI''s written critique of this attempt: overall reasoning
+      followed by "Positives:" and "Negatives:" bullet lists'
+    Threshold_Score__c: Intended to record the pass-mark the score was judged against
+      - NEVER POPULATED in practice (0 of 2,532 records; the REST endpoint does
+      not write it). The threshold lives only in the AWS engine today.
+  Session__c:
+    Candidate__c: The candidate (Person Account) the meeting is for. Set by every
+      creation path (screen flows and portal booking). 100% populated - the anchor
+      field used by the portal to find "my sessions".
+    Candidate_Name__c: 'Display name resolved across the polymorphic links: the
+      Candidate''s First+Last name, else the Lead''s name, else the Onboarding''s
+      account name. Feeds the MeetingTopic formula and the portal session cards.'
+    Candidate_Email__c: Same cascade for the email address (Candidate's email replica
+      -> Lead email -> Onboarding account email). Read by the scheduling callout
+      flow so the meeting invite reaches the candidate.
+    Candidate_Training__c: The training enrollment this session belongs to (Training
+      purpose). Set by the Schedule Session flows and the portal booking code. 38/47
+      populated - all Training-purpose records.
+    Candidate_Training_Step__c: The specific curriculum step this session covers
+      - one session per step in the portal booking model. Completion of the session
+      activates this step's deliverables. 38/47 populated.
+    Program_Version__c: The program version the training session belongs to - copied
+      from the training at creation. 38/47 populated.
+    Internal_Interview__c: The internal screening interview this session is the
+      scheduled call for. Scheduling the session auto-updates that interview's status
+      (flow). 9/47 populated.
+    Interview__c: The external Interview__c a prep session was booked around - set
+      by the "Schedule Session" button on the Interview page. 0 records so far.
+    Onboarding__c: The onboarding record for onboarding-stage calls (e.g. welcome
+      calls). Also a leg of the Candidate_Email/Name formulas. 0 records so far.
+    Background_Check__c: The background-check engagement this call belongs to -
+      set by the "Create Session" button on Background Check. 0 records so far,
+      but the "QA Background Check Queue" list view is built around this purpose.
+    Lead__c: Lets a session be booked for a website Lead before conversion to a
+      candidate. 0 records so far.
+    Host_User__c: 'The employee who runs the meeting: the trainer for training sessions,
+      the interviewer for internal interviews, the caller for check calls. Set at
+      creation (scheduler pick or the Session Window''s trainer).'
+    Additional_Attendee_1__c: An optional second internal attendee - passed to the
+      scheduling callout so they are invited to the meeting. The Background Check
+      creation flow uses it to add the QA/second person. 5/47 populated.
+    Additional_Attendee_2__c: An optional third internal attendee, same mechanics.
+      5/47 populated.
+    Attendance_status__c: 'Who skipped the meeting: Host Skipped | Attendee Skipped
+      | Attendee 1 Skipped | Attendee 2 Skippped (typo is in the org).'
+    Selected_Time_Zone_Start_Time__c: Meeting start time as a time-slot label (e.g.
+      "10:00 AM") in the chosen Time_Zone__c - same shared "Times" value set the
+      Interview object uses.
+    Time_Zone__c: 'The timezone the selected times are quoted in (candidate-facing
+      US zones: ET/CT/MT/PT/AT/HT). 100% populated. Data note: "AT (Alaska Time)"
+      is the most common value (29 of 47) followed by ET (14) - likely test-data
+      skew'
+    External_Meeting_Passcode__c: The Zoom meeting passcode returned by the scheduling
+      service. 45/47.
+    calendar_event_id__c: Google Calendar event id returned by the scheduling service
+      - the handle used to update/cancel the calendar entry. 45/47 populated.
+    calendar_link__c: Direct link to the Google Calendar event. 45/47 populated.
+    Create_Meeting_Error__c: Error capture slot for a failed meeting-creation callout.
+      No flow or Apex in the current metadata writes it and it is 0% populated -
+      (not fully documented - verify with team whether the external service writes
+      it
+    MeetingTopic__c: 'The meeting title: for training sessions "Program name - Step
+      name" (e.g. "GenAI Bootcamp - Week 1 Kickoff"), otherwise "Candidate name
+      - Purpose" (e.g. "J. Doe - Internal Interview").'
+    Recording_URL__c: Where the meeting recording lives. Read by the "View Recording"
+      button flow (which also logs the access), but nothing populates it yet - 0%
+      in data.
+    URL__c: Generic long-text URL field. No automation reads or writes it and its
+      business meaning is unclear (not fully documented - verify with team).
+    Status__c: 'The session lifecycle: Unscheduled (created but not confirmed -
+      the portal-created master sessions start here) | Scheduled | Completed | Rescheduled
+      | Cancelled | Canceled (duplicate legacy US spelling - the team uses'
+    Description__c: Free-form notes about the session, entered on the scheduling
+      screen (the Schedule Session flows include a description box). Also copied
+      into the calendar Event body.
+  Session_Window__c:
+    Program_Version__c: 'THE required parent: the program version whose daily schedule
+      this window defines. The portal matches a training''s program version against
+      this to decide which windows are offered.'
+    Cohort__c: The batch this time slot belongs to. Booking into the window puts
+      the candidate's training into this cohort; only one window may exist per cohort
+      (flow guard). 100% populated in data.
+    Trainer__c: The default trainer for the slot - copied to each generated Session's
+      Host_User__c when the first candidate books. 100% populated in data.
+    Window_Label__c: Human-readable name of the slot (e.g. "Morning Batch 10-11
+      ET"). Used as the portal slot label when the cohort has no name.
+    Sequence__c: Ordering number of the window within its program version/cohort
+      - the portal lists windows by Sequence. SessionWindowCreationController hands
+      out the next number automatically.
+    Start_Time__c: Daily start time-of-day of the slot (native Time type). Interpreted
+      in Time_Zone__c and converted to each candidate's timezone by the portal and
+      booking code; also used to timestamp every training step.
+    End_Time__c: Daily end time-of-day of the slot. Same conversion mechanics; the
+      training's candidate-timezone end time and deliverable due-times derive from
+      it.
+    Time_Zone__c: The timezone the Start/End times are defined in (ET/CT/MT/PT/AT/HT).
+      The booking code maps it to a real IANA zone for conversion. 100% populated.
+    Start_Date__c: The date the cohort's daily rhythm begins. Copied onto the training
+      as its Start Date at booking; training steps are then laid out on consecutive
+      business days from here. 100% populated.
+    Activate_From__c: From when the slot becomes VISIBLE in the candidate portal
+      - a "go on sale" date. The portal only offers windows whose Activate_From
+      is today or earlier (or blank). 100% populated.
+    Candidate_Capacity__c: Maximum number of candidates the slot can hold. Both
+      current records hold 5. The portal computes seats remaining from this minus
+      the booked count and shows "full" when none remain.
+    Booked_Count__c: How many candidates have booked the slot so far - incremented
+      by +1 by the portal and admin booking Apex under a row lock (FOR UPDATE) to
+      prevent double-booking races. Both current records show 1.
+    Status__c: 'Lifecycle of the slot: Upcoming (bookable - the ONLY status the
+      portal offers) | Active (cohort is running) | Completed (cohort finished).'
+  Session_Attendee__c:
+    Session__c: 'THE required parent: the shared master session being attended.
+      Set by the booking Apex after matching the candidate''s step sequence to the
+      master session''s step sequence.'
+    Candidate__c: The attending candidate (Person Account). DashboardService filters
+      on this to find "sessions I attend but do not own".
+    Candidate_Training__c: The attending candidate's own training enrollment - the
+      record whose progress this shared session advances.
+    Candidate_Training_Step__c: The attending candidate's own curriculum step covered
+      by the shared session. The completion trigger activates the deliverables that
+      belong to this step.
+    Meeting_Topic__c: The master session's computed topic (Session__r.MeetingTopic__c),
+      e.g. "Program - Step name".
+    Scheduled_Date__c: The master session's date (Session__r.Scheduled_Date__c).
+    Session_Status__c: The master session's current status as text (TEXT(Session__r.Status__c))
+      - lets the portal show Scheduled/Completed on the attendee's card.
+    Candidate_TZ_End_Time__c: The daily end time in the attending candidate's own
+      timezone (TEXT(Candidate_Training__r.Candidate_Time_Zone_End_Time__c)).
+    Time_Zone__c: The attending candidate's timezone label (TEXT(Candidate_Training__r.Time_Zone__c))
+      that the two times above are quoted in.
+  Pre_Enrolment_Request__c:
+    Lead__c: The prospective candidate the form was sent to. Set by the send flow
+      from the Lead the quick action was clicked on. Populated on 324 of 333 records
+      (97%); the handful without a lead are anomalies/tests.
+    Candidate_Name_Snapshot__c: The lead's name frozen at the moment the form was
+      sent, stamped by the send flow. Kept as text so the request still reads correctly
+      if the Lead is renamed, converted or deleted. 100% populated.
+    Candidate_Email_Snapshot__c: The lead's email frozen at send time by the send
+      flow - the address the form link was actually mailed to. 100% populated. Compare
+      with Email_Address__c below, which is what the candidate typed on the form.
+    Status__c: 'The lifecycle of the form link. Values: Draft - defined in the picklist
+      but never used in practice (the send flow creates records directly as "Sent";
+      0 in data).'
+    Public_Token__c: The 12-character single-use access token embedded in the form
+      URL, generated by the CreateToken Apex invocable (6 HMAC-SHA256 hex chars
+      signed with the Token_Secret__mdt secret + 6 random hex chars).
+    Public_Form_Link__c: 'The full public URL emailed to the candidate: Candidate_Hub_URL
+      custom label + "/s/pre-enrolment-form?flowtoken=<token>".'
+    Expiration_Datetime__c: When the link stops working - always send time + 2 days
+      (formula NOW()+2 in the send flow). The guest flow shows the "Expired" page
+      after this moment; the send flow also stamps it when force-expiring an old
+      request.
+    Sent_On__c: When the form email went out (stamped by the send flow at creation).
+      100% populated. Mirrored to Lead.Latest_Pre_Enrolment_Sent_On__c.
+    Opened_On__c: When the candidate opened the link - the guest flow stamps it
+      (by token) every time the link is visited, before validation.
+    Submitted_On__c: When the candidate clicked the final submit (stamped by the
+      guest flow just before the thank-you page). Populated on 127 records - fewer
+      than the 204 Submitted records
+    Middle_Name__c: Candidate's middle name - optional on the form (only 10 records
+      have one). NOT copied to the Lead (the Lead has no middle-name field).
+    Last_Name__c: Candidate's last name as typed. Copied to Lead.LastName.
+    Email_Address__c: The email the candidate confirmed/typed on the form (pre-filled
+      from the lead's email). Copied to Lead.Email - so a candidate can correct
+      their email here and the Lead gets the corrected one.
+    screen_calling__c: The candidate's calling number. Note the odd API name ("screen_calling")
+      versus its label - do not confuse it with the WhatsApp number. Copied to Lead.Phone.
+    Contact_Number_Whatsapp__c: The candidate's WhatsApp number - Techsara coordinates
+      training and marketing with candidates over WhatsApp, hence a separate field.
+      Copied to Lead.Contact_Number_WhatsApp__c.
+    Home_Address__c: Compound address field (street, city, state code, postal code,
+      country code) captured with the address screen component. The sync flow copies
+      the parts onto the Lead's standard address.
+    Current_State_in_USA__c: 'Which US state the candidate currently lives in (51
+      values). EFFECTIVELY UNUSED: the guest form does not show it and no flow writes
+      it - 0 of 333 records have a value.'
+    Niche__c: 'The technology/career track the candidate wants to train and be marketed
+      in: AI ML Engineer | Python Developer/Engineer | Java Fullstack Developer/Engineer
+      | Product/Project Manager | Marketing Manager | Finance Analyst'
+    Niche_Other__c: Free-text niche when the candidate picks "Other" (21 records).
+      Copied to Lead.Niche_Other__c.
+    Current_Visa_Status__c: 'The candidate''s US work-authorization status: CPT
+      | OPT | STEM OPT Extension | H1B | B2 | Green Card EAD | Green Card / Permanent
+      Resident | US Citizen. Critical for placement eligibility. Copied to Lead.Visa_Status__c.'
+    Relocation_Readiness__c: 'Whether the candidate will move for a job: "Yes, I
+      am willing to relocate anywhere in the USA" (151 - the dominant answer) |
+      "Yes, but only within specific states (mention in comments)" (5) | "No'
+    Relocation_Other__c: Free-text detail when relocation readiness is "Other" (2
+      records). Copied to Lead.Relocation_Other__c.
+    Preferred_Training_Schedule_EST__c: 'Which daily EST time slot the candidate
+      prefers for training sessions: 9:30 AM - 11:30 AM EST | 11:30 AM - 1:30 PM
+      EST | 2:30 PM - 4:30 PM EST | 4:30 PM - 6:30 PM EST. Optional on the form
+      (158 filled).'
+    Position_Type_Full_Time_CTH__c: Candidate is open to Full-Time / Contract-to-Hire
+      positions. One of two position-type checkboxes on the form (both may be true).
+      True on 196 records - nearly every submitter ticks it. Copied to the Lead.
+    Position_Type_C2C__c: Candidate is open to Corp-to-Corp (C2C) contract positions.
+      True on 56 records. Copied to the Lead.
+    Criminal_Record_Declaration__c: 'Self-declaration required on the form: "I do
+      Not have any criminal record" | "I have a criminal record". Matters for background
+      checks and client placements later.'
+    Acknowledgement_Declaration__c: The "I confirm the information is accurate /
+      I agree" tick at the end of the form - the candidate cannot submit without
+      it, so it is true on exactly the 204 submitted records. Set by the guest flow.
+    Additional_Comments_or_Questions__c: 'Free-text box for anything else the candidate
+      wants to say. KNOWN GAP: the public form displays an "Additional Comments"
+      box but the guest flow never saves it into this field'
+  Education_History__c:
+    Candidate__c: The candidate (Person Account) this education entry belongs to
+      - empty at creation and stamped by Lead_Conversion_Flow when the lead converts.
+      The field reports use once the candidate exists.
+    Lead__c: The original Lead who submitted the entry on the public pre-enrolment
+      form - set at creation by the Guest_Pre_Enrolment flow, and the key the conversion
+      flow uses to find records to re-parent.
+    Onboarding__c: Optional link to the onboarding case this education entry supports
+      (e.g. the degree being verified during background check). No automation sets
+      it today (not fully documented - verify with team).
+    Institute__c: The school/university, chosen on the form from the Institute__c
+      master list - the form only offers institutes that are Active and match the
+      chosen Institute Country.
+    Institute_Name__c: 'Convenience formula showing the linked institute''s name
+      (blank when no institute is linked): IF(ISBLANK(Institute__c), "", Institute__r.Name).'
+    Institute_Country__c: 'Which country the institute is in: India | USA (the global
+      value set has only these two - the business cares mainly about "US degree
+      vs Indian degree"). Chosen by the candidate first; it filters the institute
+      list.'
+    Course__c: The course/program studied, picked from the active rows of the Course__c
+      master list. (Course__c is shared with the training/LMS domain, so the same
+      object holds both Techsara training courses and academic courses.)
+    Degree_Type__c: 'The level of study: Diploma | Bachelor''s | Master''s | PhD.
+      This is the field the guest form actually asks for and is the CURRENT degree-level
+      field.'
+    Degree__c: 'An older/parallel degree-level picklist: Bachelors | Masters | Diploma
+      | PhD | Undergraduates | Graduates. NOT used by the guest form and not referenced
+      by any flow - appears to be a legacy duplicate of Degree_Type__c'
+    Start_Date__c: When the candidate started this program - entered on the guest
+      form.
+    End_Date__c: When the program ended / graduation date - entered on the guest
+      form. For US degrees this matters for OPT timing.
+    CGPA_Score__c: The grade the candidate reported for this program (CGPA, GPA
+      or percentage - the field accepts up to 9999.99 so any scale fits). Self-reported
+      on the guest form; verified later during background checks.
+knowledge:
+- title: Program__c — What This Object Is
+  keywords:
+  - program
+  text: 'Program__c is the CATALOG ENTRY for one training offering in Techsara''s
+
+    training/LMS layer - e.g. "Interview Readiness Training", "Technical 1-1
+
+    Training", "Advanced AI/ML Training". It is the top of the curriculum
+
+    BLUEPRINT chain: Program -> Program_Version__c (the versioned configuration)
+
+    -> StepTemplate__c (the ordered steps) -> Step_Deliverable_Definition__c (the
+
+    work products each step requires).
+
+
+    A Program is NOT an enrollment. When a candidate actually takes the program,
+
+    a Candidate_Training__c record is created that points at the Program and at
+
+    one specific Program Version. Keeping the Program deliberately thin (only 4
+
+    fields) and pushing all real configuration down to Program_Version__c lets
+
+    the team re-version a curriculum without touching in-flight enrollments.'
+- title: Program__c — Kind Of Object
+  keywords:
+  - program
+  text: "- Custom object, Training/LMS domain; a tab in the \"Training Module\"\
+    \ app.\n- Standalone top-level object: no parents, OWD sharing ReadWrite (internal\n\
+    \  and external) - anyone who can use the app can see and edit programs.\n-\
+    \ 4 custom fields + a plain Text Name (\"Program Name\"). Field history\n  tracking\
+    \ is enabled on the object. 0 record types, 0 validation rules,\n  2 list views.\n\
+    - Record ID prefix a0q. Scale: tiny reference data - 11 records in preprod."
+- title: Program__c — Record Types
+  keywords:
+  - program
+  text: 'None. Every Program record has the same shape; the Single-vs-Group flavor
+    is
+
+    carried by the Session_Type__c picklist instead of record types.'
+- title: Program__c — How It Is Used — The Business Process
+  keywords:
+  - program
+  text: "STEP 1 - CREATE THE PROGRAM. A trainer/admin clicks the \"Create Program\"\
+    \n  button on the Programs list view, which launches the Program_Creation\n\
+    \  screen flow (a multi-screen wizard). In one pass the wizard creates the\n\
+    \  Program, its first Program_Version__c, the ordered StepTemplate__c rows and\n\
+    \  their Step_Deliverable_Definition__c rows, then navigates to the new\n  Program\
+    \ page. Programs start in Lifecycle Status \"Draft\".\n\nSTEP 2 - PUBLISH /\
+    \ RE-VERSION. When the curriculum is ready the status is\n  moved to \"Published\"\
+    \ (and eventually \"Archived\" when retired). The \"Update\n  Program\" button\
+    \ on the Program page launches the Update_Program_Version\n  screen flow, which\
+    \ clones the current version's steps into a NEW\n  Program_Version__c so history\
+    \ is preserved (see that object's section).\n\nSTEP 3 - ENROLLMENT READS THE\
+    \ PROGRAM. The Candidate_Training_Creation\n  screen flow (run when enrolling\
+    \ a candidate) looks up the chosen Program\n  and branches on Auto_Create_Sessions__c\
+    \ + Session_Type__c: when\n  Auto-Create Sessions is on and the program is Group\
+    \ Session, the flow\n  skips the per-session detail screens and generates Session\
+    \ records\n  automatically; when off, sessions are booked later by hand or by\
+    \ the\n  candidate/trainer through session windows."
+- title: Program__c — How It Is Used — The Business Process (2)
+  keywords:
+  - program
+  text: "STEP 4 - RUNTIME DISPLAY. The candidate portal dashboard (DashboardService\n\
+    \  Apex) and trainer views show the Program name on every training tile,\n \
+    \ deliverable and session (\"which course is this work for\")."
+- title: Program__c — Connected Objects
+  keywords:
+  - program
+  - each
+  - relationship
+  - means
+  text: "Program__c has NO lookups pointing out - it is a pure parent.\n\nOBJECTS\
+    \ THAT POINT AT PROGRAM:\n- Program_Version__c.Program__c (Lookup, required):\
+    \ the versioned\n  configurations of this program. In practice exactly one \"\
+    V1\" version per\n  program so far.\n- Candidate_Training__c.Program__c (Lookup):\
+    \ every enrollment of a candidate\n  in this program (421 of 423 enrollments\
+    \ carry the link). This is the main\n  consumer of the object.\n- StepTemplate__c.Program__c\
+    \ (Lookup): a convenience back-link from step\n  blueprints to the program (their\
+    \ controlling parent is the Program\n  Version, via master-detail).\n\nNOT CONNECTED\
+    \ (common confusions):\n- Course__c is a completely separate object used by\
+    \ the ONBOARDING/education\n  intake, not by training - a \"Program\" is what\
+    \ Techsara teaches, a \"Course\"\n  is what the candidate studied at university.\n\
+    - Cohort__c does not reference Program; batches are tied to a Program\n  VERSION\
+    \ through Session_Window__c and to enrollments directly."
+- title: Program__c — Business Rules
+  keywords:
+  - program
+  - validation
+  text: 'None. Data quality is enforced by the creation wizard (required screens)
+    and
+
+    by the restricted picklists, not by validation rules.'
+- title: Program__c — Automation
+  keywords:
+  - program
+  - runs
+  text: "- No record-triggered flows, no Apex trigger, no scheduled jobs on Program.\n\
+    - SCREEN FLOWS / BUTTONS:\n  * \"Create Program\" (list-view button) -> Program_Creation\
+    \ flow: builds\n    Program + first Version + StepTemplates + Deliverable Definitions.\n\
+    \  * \"Update Program\" (detail-page button) -> Update_Program_Version flow:\n\
+    \    creates a new version of this program's curriculum.\n- READ BY OTHER AUTOMATION:\
+    \ Candidate_Training_Creation (enrollment wizard -\n  reads Auto_Create_Sessions__c\
+    \ / Session_Type__c to decide session\n  generation) and Extension_Requested_Notify_Trainer\
+    \ (deliverable-extension\n  notification - looks up program context) reference\
+    \ Program records.\n- APEX READERS: DashboardService (candidate portal dashboard)\
+    \ and\n  SessionSchedulerController display Program names on trainings/sessions.\n\
+    - UI: Lightning record page Program_Record_Page (the View override installed\n\
+    \  by the Training Module app)."
+- title: Program_Version__c — What This Object Is
+  keywords:
+  - program
+  - version
+  text: 'Program_Version__c is the VERSIONED CONFIGURATION of a Program - the record
+
+    that actually says how the training runs: how long sessions are, who books
+
+    them (trainer or candidate), whether the schedule is fixed or free, how many
+
+    sessions per day, and the full mock-interview policy. The step-by-step
+
+    curriculum (StepTemplate__c) and the recurring booking slots
+
+    (Session_Window__c) are master-detail CHILDREN of the version, not of the
+
+    Program.
+
+
+    The versioning idea: when the curriculum changes, a NEW version is created
+
+    (via the "Update Program" button) and the old one is marked Superseded, so
+
+    candidates already enrolled against the old version are untouched. Every
+
+    enrollment (Candidate_Training__c) points at exactly one version - it is the
+
+    version, not the program, that drives the candidate''s runtime experience.
+
+    This object carries the auto-create-session settings the enrollment flow and
+
+    the scheduling Apex read.'
+- title: Program_Version__c — Kind Of Object
+  keywords:
+  - program
+  - version
+  text: "- Custom object, Training/LMS domain; a tab in the \"Training Module\"\
+    \ app.\n- OWD sharing ReadWrite (internal and external). Looks up (not master-\n\
+    \  detail) to Program__c, but the Program lookup is required.\n- Master (parent)\
+    \ of two master-detail children: StepTemplate__c and\n  Session_Window__c. Also\
+    \ referenced by Candidate_Training__c and\n  Session__c lookups.\n- 18 custom\
+    \ fields + a Text Name (\"Program Version Name\"). Field history\n  tracking\
+    \ enabled. 0 record types, 0 validation rules, 1 list view.\n- Record ID prefix\
+    \ a11. Scale: 11 records in preprod (1 per Program)."
+- title: Program_Version__c — Record Types
+  keywords:
+  - program
+  - version
+  text: 'None. All versions have the same shape; Single-vs-Group behavior comes
+    from
+
+    the Session_Type__c picklist.'
+- title: Program_Version__c — How It Is Used — The Business Process
+  keywords:
+  - program
+  - version
+  text: "STEP 1 - CREATED WITH THE PROGRAM. The Program_Creation wizard creates\
+    \ the\n  first version (named \"<Program> - V1\", Version Number 1) together\
+    \ with its\n  StepTemplates and Step Deliverable Definitions, copying Session_Type__c\n\
+    \  down from the Program.\n\nSTEP 2 - RE-VERSIONING. The \"Update Program\"\
+    \ button on the Program page runs\n  the Update_Program_Version screen flow:\
+    \ it reads the current version's\n  steps and deliverable definitions, lets\
+    \ the user edit them, and creates a\n  NEW Program_Version__c (with new Version_Number__c\
+    \ / Effective_From__c)\n  plus fresh child steps. The Status__c picklist includes\
+    \ \"Superseded\" for\n  the replaced version. (In practice versioning has not\
+    \ been exercised yet -\n  all 11 versions are still V1.)\n\nSTEP 3 - SESSION\
+    \ WINDOWS ARE HUNG OFF THE VERSION. For Fixed Schedule /\n  Group Session programs,\
+    \ admins generate recurring daily booking slots\n  (Session_Window__c) under\
+    \ the version using the \"New Session Window\" LWC,\n  backed by SessionWindowCreationController\
+    \ + SessionWindowService Apex\n  (the invocable takes a \"Program Version Id\"\
+    ). Sessions_Per_Day__c tells\n  the wizard how many slot rows per day to generate."
+- title: Program_Version__c — How It Is Used — The Business Process (2)
+  keywords:
+  - program
+  - version
+  text: "STEP 4 - ENROLLMENT SNAPSHOTS THE VERSION. Candidate_Training_Creation\n\
+    \  requires a Program Version on every enrollment (100% populated) and, when\n\
+    \  the parent Program has Auto-Create Sessions on, validates that the version\n\
+    \  has the required generation settings (duration, type, booking fields)\n \
+    \ before auto-creating Session__c records; it also sends the training setup\n\
+    \  to AWS (AWSTrainingIntegration).\n\nSTEP 5 - RUNTIME READS. The candidate\
+    \ portal (CandidatePortalController,\n  DashboardService) reads the version's\
+    \ Session_Type__c / Booking_Owner__c\n  to decide whether the candidate must\
+    \ self-book a slot (\"needs booking\"\n  tile when Group Session + Candidate\
+    \ Books and no Cohort yet); the session\n  scheduler (SessionSchedulerController,\
+    \ AdminSessionAssignmentController)\n  matches candidates to Session_Window__c\
+    \ slots of THEIR version only, and\n  stamps Program_Version__c onto created\
+    \ Session__c records. The mock-\n  interview policy fields are enforced by the\
+    \ candidate portal runtime."
+- title: Program_Version__c — Connected Objects
+  keywords:
+  - program
+  - version
+  - each
+  - relationship
+  - means
+  text: "PARENT:\n- Program__c (via Program__c lookup, required, 100% populated):\
+    \ the catalog\n  entry this version configures.\n\nOBJECTS THAT POINT AT PROGRAM\
+    \ VERSION:\n- StepTemplate__c (MASTER-DETAIL child): the ordered step blueprint\
+    \ of this\n  version (52 step rows exist across the 11 versions). Their\n  Expected_Duration_Min__c\
+    \ rolls up into Total_Expected_Duration__c.\n- Session_Window__c (MASTER-DETAIL\
+    \ child): recurring daily time-slot\n  templates for candidate self-booking\
+    \ (capacity, trainer, cohort). Only 2\n  exist so far - the fixed-schedule machinery\
+    \ is barely used yet.\n- Candidate_Training__c.Program_Version__c (Lookup, required\
+    \ on enrollment):\n  every enrollment pins the exact version the candidate follows\
+    \ (423 of\n  423 populated).\n- Session__c.Program_Version__c (Lookup): concrete\
+    \ scheduled sessions carry\n  the version they belong to (38 of 47 sessions)."
+- title: Program_Version__c — Business Rules
+  keywords:
+  - program
+  - version
+  - validation
+  text: 'None on the object itself. The Candidate_Training_Creation flow performs
+    the
+
+    real guarding: it blocks auto-session enrollment when a version is missing
+
+    required generation settings (duration, session type, booking owner etc.).'
+- title: Program_Version__c — Automation
+  keywords:
+  - program
+  - version
+  - runs
+  text: "- No record-triggered flows, no Apex trigger, no scheduled jobs.\n- CREATED/UPDATED\
+    \ BY: Program_Creation (first version) and\n  Update_Program_Version (subsequent\
+    \ versions) screen flows.\n- READ BY FLOWS: Candidate_Training_Creation (enrollment\
+    \ - lookup +\n  generation-settings validation).\n- APEX: SessionWindowService\
+    \ / SessionWindowCreationController create\n  Session_Window__c children under\
+    \ a version (invocable action \"Program\n  Version Id\"); SessionSchedulerController,\
+    \ AdminSessionAssignmentController,\n  CandidatePortalController and DashboardService\
+    \ all query version config\n  (Session_Type__c, Booking_Owner__c) to drive booking\
+    \ behavior;\n  AWSTrainingIntegration ships enrollment/training data to the\
+    \ AWS AI\n  engine at enrollment time.\n- UI: Lightning record page Program_Version_Record_Page\
+    \ (Training Module\n  app)."
+- title: Cohort__c — What This Object Is
+  keywords:
+  - cohort
+  text: 'Cohort__c is a BATCH of candidates going through group training together
+    -
+
+    "the batch that starts May 11 with trainer X". It is a tiny grouping object
+
+    (3 fields: start date, end date, lead trainer) that group-session
+
+    enrollments and session-window booking slots hang off, so that all
+
+    candidates of one batch share the same recurring session slots and one
+
+    Session__c per slot serves the whole batch (extra batch members ride along
+
+    as Session_Attendee__c records).'
+- title: Cohort__c — Kind Of Object
+  keywords:
+  - cohort
+  text: "- Custom object, Training/LMS domain; a tab in the \"Training Module\"\
+    \ app.\n- Standalone object: no required parents. OWD sharing ReadWrite internally,\n\
+    \  Read for external (portal) users - candidates can see but not change\n  their\
+    \ batch.\n- 3 custom fields + a Text Name (\"Cohort Name\"). Field history tracking\n\
+    \  enabled. 0 record types, 0 validation rules, 1 list view.\n- Scale: 18 records\
+    \ in preprod."
+- title: Cohort__c — How It Is Used — The Business Process
+  keywords:
+  - cohort
+  text: "STEP 1 - CREATE THE COHORT. Cohorts are created MANUALLY (standard New\n\
+    \  button) - no flow or Apex creates them. The trainer/admin names the batch\n\
+    \  and sets its start/end dates.\n\nSTEP 2 - ATTACH SESSION WINDOWS. Session_Window__c\
+    \ booking slots created\n  under a Program Version can be tied to a Cohort (window\
+    \ -> cohort\n  lookup). A before-save flow on Session Window\n  (Session_Window_Enforce_Unique_Cohort)\
+    \ blocks creating a second batch of\n  windows for the same cohort - one cohort,\
+    \ one set of slots. The window-\n  creation Apex (SessionWindowCreationController.getCohortStartDate)\
+    \ reads\n  the cohort's Start Date to anchor the recurring slot dates.\n\nSTEP\
+    \ 3 - CANDIDATES JOIN THE COHORT BY BOOKING. When a candidate (or an\n  admin\
+    \ on their behalf) books a session-window slot, the scheduler Apex\n  (SessionSchedulerController\
+    \ / AdminSessionAssignmentController) copies the\n  window's Cohort onto the\
+    \ candidate's Candidate_Training__c - booking a\n  slot IS joining the batch.\
+    \ The same Apex then finds all trainings of that\n  cohort to fill group sessions\
+    \ with attendees.\n\nSTEP 4 - PORTAL BEHAVIOR. The candidate dashboard (DashboardService)\
+    \ flags\n  a training as \"needs booking\" when it is Group Session + Candidate\
+    \ Books\n  and has NO cohort yet - i.e. the empty Cohort lookup is the signal\
+    \ that\n  the candidate still has to pick a slot."
+- title: Cohort__c — Connected Objects
+  keywords:
+  - cohort
+  - each
+  - relationship
+  - means
+  text: "LOOKUPS FROM COHORT:\n- User (Lead_Trainer__c): the internal user leading\
+    \ the batch. NOTE: this\n  points to the standard User object, NOT to Recruiter__c/\"\
+    Employee\" like\n  most staff lookups in the org.\n\nOBJECTS THAT POINT AT COHORT:\n\
+    - Candidate_Training__c.Cohort__c (Lookup): which batch this enrollment\n  belongs\
+    \ to - stamped by the booking Apex when a slot is booked (157 of\n  423 enrollments\
+    \ have one).\n- Session_Window__c.Cohort__c (Lookup): the recurring booking\
+    \ slots reserved\n  for this batch (both existing windows are cohort-linked;\
+    \ uniqueness\n  enforced by flow).\n\nNOT CONNECTED: Cohort has no link to Program__c/Program_Version__c\
+    \ directly;\nthe program association comes indirectly through the windows and\
+    \ the\nenrollments that reference it."
+- title: Cohort__c — Business Rules
+  keywords:
+  - cohort
+  - validation
+  text: 'None on Cohort itself. The related rule lives on Session_Window__c: the
+
+    Session_Window_Enforce_Unique_Cohort flow raises a custom error when a
+
+    second set of session windows is created for the same cohort.'
+- title: Cohort__c — Automation
+  keywords:
+  - cohort
+  - runs
+  text: "- Nothing runs ON Cohort: no record-triggered flows, no triggers, no\n\
+    \  scheduled jobs, no quick actions (records are made and edited by hand).\n\
+    - AUTOMATION THAT READS/WRITES THE COHORT LINK ELSEWHERE:\n  * SessionWindowCreationController\
+    \ / SessionWindowService (Apex): read\n    cohort Start_Date__c when generating\
+    \ windows; check a cohort has no\n    windows yet.\n  * SessionSchedulerController\
+    \ / AdminSessionAssignmentController (Apex):\n    copy Cohort from the booked\
+    \ window onto Candidate_Training__c and\n    roster group sessions by cohort.\n\
+    \  * DashboardService (Apex): empty cohort on a group/candidate-books\n    training\
+    \ = \"needs booking\" prompt in the portal.\n- UI: Lightning record page Cohort_Record_Page\
+    \ (Training Module app)."
+- title: Course__c — What This Object Is
+  keywords:
+  - course
+  text: 'Course__c is a REFERENCE/MASTER-LIST object for academic courses (fields
+    of
+
+    study - what a candidate studied at university), used by the ONBOARDING and
+
+    pre-enrolment intake forms, NOT by the training/LMS layer. When a candidate
+
+    fills in their education history, the course they name is meant to be picked
+
+    from this list. Do not confuse it with Program__c: a Program is a training
+
+    product Techsara sells/delivers; a Course is a line on the candidate''s
+
+    resume/education record.'
+- title: Course__c — Kind Of Object
+  keywords:
+  - course
+  text: "- Custom object, Onboarding/intake domain (not in the Training Module app).\n\
+    - Standalone reference object: no parents. OWD sharing ReadWrite internally,\n\
+    \  Private for external users. Field history tracking enabled.\n- Only 1 custom\
+    \ field (Active__c) + a Text Name (\"Course Name\"). 0 record\n  types, 0 validation\
+    \ rules, 1 list view.\n- Scale: 0 records in preprod - the master list has never\
+    \ been loaded."
+- title: Course__c — How It Is Used — The Business Process
+  keywords:
+  - course
+  text: "INTENDED USE (as designed): during candidate intake, two guest/candidate-\n\
+    facing screen flows offer course choices filtered to Active__c = true:\n- Guest_Pre_Enrolment\
+    \ (\"Lead : Guest Pre-Enrolment\") - the public pre-\n  enrolment form a lead\
+    \ fills before becoming a candidate; it records\n  education history rows that\
+    \ reference Course and Institute.\n- Onboarding_Candidate_Intake_1 (\"Onboarding:Candidate\
+    \ Intake-1\") - the\n  token-authenticated onboarding intake form; Education_History__c\
+    \ rows and\n  the Onboarding__c record can reference the course.\n\nCURRENT\
+    \ REALITY: the object is EMPTY (0 rows), Education_History__c has 0\nrecords,\
+    \ and Onboarding__c.Course_Name__c is populated on 0 of 771\nonboardings - so\
+    \ the course pick-lists in those intake flows currently have\nnothing to offer\
+    \ and the feature is dormant until the master list is loaded."
+- title: Course__c — Connected Objects
+  keywords:
+  - course
+  - each
+  - relationship
+  - means
+  text: "Course__c has no lookups out.\n\nOBJECTS THAT POINT AT COURSE:\n- Education_History__c.Course__c\
+    \ (Lookup): one education entry of a\n  candidate (\"BSc Computer Science at\
+    \ X university\") referencing the course\n  studied. (Education_History__c itself\
+    \ has 0 records so far.)\n- Onboarding__c.Course_Name__c (Lookup, child relationship\
+    \ \"Onboardings\"):\n  the course captured on the onboarding record. 0 of 771\
+    \ onboardings use it."
+- title: Course__c — Automation
+  keywords:
+  - course
+  - runs
+  text: "- Nothing runs on Course__c itself - no flows, triggers, scheduled jobs\
+    \ or\n  quick actions target it.\n- READ-ONLY CONSUMERS: the Guest_Pre_Enrolment\
+    \ and\n  Onboarding_Candidate_Intake_1 screen flows look up Course rows (filtered\n\
+    \  by Active__c) to populate their course-choice screens.\n- No Apex class references\
+    \ Course__c."
+- title: Institute__c — What This Object Is
+  keywords:
+  - institute
+  text: 'Institute__c is the REFERENCE/MASTER LIST of universities and colleges
+
+    (3,470 of them, US and India) used by the candidate intake forms: when a
+
+    candidate records where they studied, the school is picked from this list
+
+    rather than typed free-text. It is the companion of Course__c in the
+
+    onboarding/education-history intake, and like Course it has nothing to do
+
+    with the training/LMS layer.'
+- title: Institute__c — Kind Of Object
+  keywords:
+  - institute
+  text: "- Custom object, Onboarding/intake domain (not in the Training Module app).\n\
+    - Standalone reference object: no parents. OWD sharing ReadWrite internally,\n\
+    \  Private for external users. Field history tracking enabled.\n- 2 custom fields\
+    \ (Active__c, Country__c) + a Text Name (\"Institute Name\").\n  0 record types,\
+    \ 0 validation rules, 1 list view.\n- Scale: 3,470 records in preprod - a bulk-loaded\
+    \ master list (created\n  2026-04-23 to 2026-06-15)."
+- title: Institute__c — How It Is Used — The Business Process
+  keywords:
+  - institute
+  text: "STEP 1 - SEEDED AS REFERENCE DATA. The list was bulk-loaded (2,075 USA\
+    \ +\n  1,395 India institutes) in Apr-Jun 2026; all rows are Active.\n\nSTEP\
+    \ 2 - PICKED ON INTAKE FORMS. Two candidate-facing screen flows read the\n \
+    \ list to build their \"where did you study\" screens:\n  - Guest_Pre_Enrolment\
+    \ (public pre-enrolment form on a guest site): looks\n    up institutes by Active__c,\
+    \ Country__c and Name - the country picklist\n    narrows the list before the\
+    \ candidate picks the school.\n  - Onboarding_Candidate_Intake_1 (token-authenticated\
+    \ onboarding form):\n    looks up institutes by Name for the education-history\
+    \ section.\n\nSTEP 3 - STORED ON EDUCATION RECORDS. The selection is designed\
+    \ to land on\n  Education_History__c.Institute__c rows (one per degree) and\
+    \ on\n  Onboarding__c.Institutes__c. In practice neither target has data yet\n\
+    \  (0 education-history rows; 0 of 771 onboardings reference an institute),\n\
+    \  so the list is live on the forms but selections are not yet reaching\n  stored\
+    \ records in preprod."
+- title: Institute__c — Connected Objects
+  keywords:
+  - institute
+  - each
+  - relationship
+  - means
+  text: "Institute__c has no lookups out.\n\nOBJECTS THAT POINT AT INSTITUTE:\n\
+    - Education_History__c.Institute__c (Lookup): a candidate's education entry\n\
+    \  referencing the school attended. (Education_History__c has 0 records so\n\
+    \  far.)\n- Onboarding__c.Institutes__c (Lookup, label \"Institute\", child\
+    \ relationship\n  \"Onboardings\"): the institute captured on the onboarding\
+    \ record. 0 of 771\n  onboardings use it."
+- title: Institute__c — Automation
+  keywords:
+  - institute
+  - runs
+  text: "- Nothing runs on Institute__c itself - no flows, triggers, scheduled jobs\n\
+    \  or quick actions target it.\n- READ-ONLY CONSUMERS: Guest_Pre_Enrolment (reads\
+    \ Active__c, Country__c,\n  Name) and Onboarding_Candidate_Intake_1 (reads Name)\
+    \ use it to populate\n  their institute-selection screens.\n- No Apex class\
+    \ references Institute__c."
+- title: Candidate_Training__c — What This Object Is
+  keywords:
+  - candidate
+  - training
+  text: "Candidate_Training__c is the ENROLLMENT record of the training/LMS layer:\
+    \ one\nrecord = one candidate enrolled into one training program version. It\
+    \ is the\nruntime anchor of the whole training subsystem - the per-candidate\
+    \ steps\n(CandidateTrainingStep__c), the work products (Deliverable__c), and\
+    \ the\nscheduled meetings (Session__c) all hang off it. Where StepTemplate__c\
+    \ and\nStep_Deliverable_Definition__c are the course BLUEPRINT, Candidate_Training__c\n\
+    is where that blueprint becomes a live, per-candidate copy with its own status,\n\
+    trainer, cohort, dates and time-zone handling.\n\nTwo usage styles coexist in\
+    \ the data:\n  a) STEP-BASED 1-1 TRAINING (Technical 1-1, Advanced AI/ML, Retraining,\n\
+    \     Resume Based...): enrollment instantiates the version's step templates\n\
+    \     into per-candidate steps and deliverables, and the training is tracked\n\
+    \     step by step.\n  b) COHORT/GROUP TRAINING (\"Interview Readiness Training\"\
+    \ - 61% of all\n     enrollments): the enrollment is a lightweight membership\
+    \ record with no\n     steps (the program version has no step templates); scheduling\
+    \ happens\n     through Session Windows / Cohorts instead."
+- title: Candidate_Training__c — Kind Of Object
+  keywords:
+  - candidate
+  - training
+  text: "- Custom object, heart of the Training / LMS domain (Training Module app).\n\
+    - Standalone object with its own owner; org-wide default is Public Read/Write\n\
+    \  (the redesign project may tighten this - see the role-hierarchy docs).\n\
+    - LOOKUP (not master-detail) to Account via Candidate__c, but the field is\n\
+    \  required, so every training always belongs to a candidate (Person Account).\n\
+    - 21 custom fields, 0 record types, 0 validation rules, 1 list view.\n- Name\
+    \ is plain Text (the creation flow writes a descriptive name).\n- Scale: 423\
+    \ records in preprod, all created 2026-05-08 to 2026-08-06 - the\n  training\
+    \ subsystem is only a few months old."
+- title: Candidate_Training__c — Record Types
+  keywords:
+  - candidate
+  - training
+  text: 'None. Every Candidate Training uses the single default layout/page; the
+
+    program (and whether its version has step templates) is what differentiates
+
+    the step-based and cohort flavors, not a record type.'
+- title: Candidate_Training__c — How It Is Used — The Business Process
+  keywords:
+  - candidate
+  - training
+  text: "STEP 1 - ENROLLMENT. A user runs the Candidate_Training_Creation screen\
+    \ flow,\n  reachable from the \"Create Training\" list button (opens the flow\
+    \ directly)\n  or the \"Create Training AIC\" button (opens the create-training\
+    \ page inside\n  the AIC Portal - the normal path for portal employees). The\
+    \ user picks the\n  candidate, program, program version, niche, assigned trainer,\
+    \ times and\n  time zone. The flow then:\n  - creates the Candidate_Training__c\
+    \ record (stamping Candidate_Email__c\n    from the candidate's Person Account\
+    \ email and Candidate_Owner__c from the\n    candidate's Account owner);\n \
+    \ - loops the version's StepTemplate__c records and creates one\n    CandidateTrainingStep__c\
+    \ per template (status \"Not Started\");\n  - loops the Step_Deliverable_Definition__c\
+    \ records of those templates and\n    creates one Deliverable__c per definition\
+    \ per step;\n  - optionally creates Session__c records (\"Should Create Sessions\"\
+    \ branch,\n    driven by the program's auto-create-sessions setting);\n  - moves\
+    \ the candidate's resume file onto the training record\n    (ReparentContentDocLink\
+    \ Apex action);\n  - sends the whole training + steps + deliverables package\
+    \ to the external\n    AWS AI engine (AWSTrainingIntegration Apex, queueable\
+    \ callout to AWS API\n    Gateway) so the AI can later evaluate deliverable\
+    \ submissions;\n  - navigates the user to the new record."
+- title: Candidate_Training__c — How It Is Used — The Business Process (2)
+  keywords:
+  - candidate
+  - training
+  text: "STEP 2 - BOOKING A SLOT (cohort path). The candidate (from the candidate\n\
+    \  portal, CandidatePortalController.bookSessionWindow) or an admin (via the\n\
+    \  \"Book Session Slot\" quick action -> assignSessionWindowToTraining LWC ->\n\
+    \  AdminSessionAssignmentController) books the training into a Session_Window.\n\
+    \  Booking: sets Cohort__c and Start_Date__c from the window, fills\n  Time_Zone__c\
+    \ if blank, converts the window's slot times into the\n  candidate's time zone\
+    \ (Candidate_Time_Zone_Start/End_Time__c), schedules\n  each step on consecutive\
+    \ business days (stamping the step's Started_At__c),\n  sets End_Date__c to\
+    \ the last step's date, creates/attaches the Session__c\n  and Session_Attendee__c\
+    \ records, recomputes every Deliverable due date\n  (step date + Days_To_Complete),\
+    \ and increments the window's booked count.\n  The admin path bypasses the portal's\
+    \ status/capacity filters but still\n  requires a matching program version and\
+    \ an un-booked training."
+- title: Candidate_Training__c — How It Is Used — The Business Process (3)
+  keywords:
+  - candidate
+  - training
+  text: "STEP 3 - RUNNING THE TRAINING. Status__c moves Planned -> Active ->\n \
+    \ Completed (or Paused / Dropped). Trainers work through the child steps and\n\
+    \  review deliverable submissions; the candidate sees everything through the\n\
+    \  candidate portal Overview tab, which DashboardService builds entirely from\n\
+    \  the candidate's ACTIVE training, its steps and its deliverables. One-off\n\
+    \  extra meetings can be booked with the \"Schedule Session\" quick action\n\
+    \  (Schedule_Session_From_Training flow, sessionScheduler LWC).\n\nSTEP 4 -\
+    \ DROPPING OUT. To drop a candidate the user sets Drop_Date__c (blank\n  = today;\
+    \ a before-save flow defaults it) and flips Status__c to \"Dropped\".\n  The\
+    \ Candidate_Training_Dropped_Cascade flow then cascades: unfinished steps,\n\
+    \  open deliverables and future sessions from the drop date onward are all\n\
+    \  marked Dropped/cancelled so nothing keeps chasing the candidate.\n\nSTEP\
+    \ 5 - DOWNSTREAM USES. The nightly LockOverdueDeliverables Apex job reads\n\
+    \  the training's Time_Zone__c + Candidate_Time_Zone_End_Time__c to know when\n\
+    \  \"end of day\" happens in the candidate's local time before locking overdue\n\
+    \  deliverables. TrainerEmailService emails the Assigned Trainer when the\n\
+    \  candidate requests a deliverable extension. Trainer/candidate feedback is\n\
+    \  captured in the two long-text feedback fields at the end."
+- title: Candidate_Training__c — Connected Objects
+  keywords:
+  - candidate
+  - training
+  - each
+  - relationship
+  - means
+  text: "LOOKUPS FROM CANDIDATE TRAINING:\n- Account (Candidate__c, required, 100%):\
+    \ the candidate (Person Account)\n  being trained. Required even though it is\
+    \ a lookup, so sharing does NOT\n  flow from the Account (unlike Interview__c).\n\
+    - Program__c (Program__c, ~100%): the course being taken (denormalized\n  convenience\
+    \ copy - the version below is the operative link).\n- Program_Version__c (Program_Version__c,\
+    \ required, 100%): WHICH version of\n  the course this enrollment follows. Its\
+    \ StepTemplates define the steps.\n- Cohort__c (Cohort__c, 37%): the batch/group\
+    \ the training was booked into\n  (set by the session-window booking logic,\
+    \ not at enrollment).\n- Recruiter__c (Assigned_Trainer__c, 62%): the internal\
+    \ trainer (an\n  \"Employee\" record) responsible for this candidate's training.\n\
+    - User (Assigned_Trainer_User__c, ~0%): the trainer's Salesforce User -\n  effectively\
+    \ unused (2 records).\n- User (Candidate_Owner__c, ~100%): the owner of the\
+    \ candidate Account,\n  stamped at creation for reporting/routing."
+- title: Candidate_Training__c — Connected Objects (2)
+  keywords:
+  - candidate
+  - training
+  - each
+  - relationship
+  - means
+  text: "OBJECTS THAT POINT AT CANDIDATE TRAINING:\n- CandidateTrainingStep__c (MASTER-DETAIL\
+    \ child): the per-candidate steps\n  instantiated from the version's step templates.\n\
+    - Deliverable__c (lookup): the candidate work products. (Deliverable's\n  master-detail\
+    \ parent is the STEP; this direct lookup is a denormalized\n  shortcut used\
+    \ by the cascade flow, portal queries and the lock job.)\n- Session__c (lookup):\
+    \ scheduled Zoom/calendar meetings for this training.\n- Session_Attendee__c\
+    \ (lookup): extra candidates sharing a cohort session\n  slot (the junction\
+    \ also points back at the training)."
+- title: Candidate_Training__c — Business Rules
+  keywords:
+  - candidate
+  - training
+  - validation
+  text: 'None. Data quality is enforced by required fields (Candidate, Program
+
+    Version, Status, Time Zone) and by the creation flow/booking Apex, which
+
+    validate cohort/version matching and capacity in code instead.'
+- title: Candidate_Training__c — Automation
+  keywords:
+  - candidate
+  - training
+  - runs
+  text: "RECORD-TRIGGERED FLOWS (all active):\n- Candidate_Training_Auto_Set_Drop_Date\
+    \ (before save, update): when Status\n  changes to \"Dropped\" with Drop_Date__c\
+    \ blank, defaults it to today.\n- Candidate_Training_Dropped_Cascade (after\
+    \ save, update): on Status =\n  \"Dropped\", marks unfinished child steps, open\
+    \ deliverables and future\n  sessions (from Drop_Date__c onward) as Dropped/cancelled.\n\
+    - Candidate_Training_IST_Time_Population (before save, create+update): when\n\
+    \  the candidate-time-zone slot times or time zone change, computes the\n  IST-converted\
+    \ Start_Tme_IST__c / End_Time_IST__c text fields for the\n  India-based training\
+    \ team.\n\nSCREEN FLOWS / BUTTONS:\n- Candidate_Training_Creation (screen flow):\
+    \ THE creation wizard (see part\n  4) - creates the training, steps, deliverables,\
+    \ optional sessions, calls\n  ReparentContentDocLink + AWSTrainingIntegration.\
+    \ Launched from the\n  \"Create Training\" list button or the AIC Portal create-training\
+    \ page\n  (\"Create Training AIC\" button).\n- Schedule Session (quick action\
+    \ -> Schedule_Session_From_Training flow):\n  books an ad-hoc Session__c linked\
+    \ to this training via the\n  sessionScheduler LWC.\n- Book Session Slot (quick\
+    \ action -> assignSessionWindowToTraining LWC ->\n  AdminSessionAssignmentController\
+    \ Apex): admin-side booking of the training\n  into any Session Window, bypassing\
+    \ portal filters."
+- title: Candidate_Training__c — Automation (2)
+  keywords:
+  - candidate
+  - training
+  - runs
+  text: "APEX (no trigger on the object itself):\n- CandidatePortalController.bookSessionWindow:\
+    \ candidate-side slot booking\n  (writes Cohort, Start/End dates, TZ slot times;\
+    \ schedules steps; updates\n  deliverable due dates; increments the window's\
+    \ booked count).\n- AdminSessionAssignmentController: the admin equivalent (same\
+    \ writes).\n- DashboardService (without sharing): builds the candidate portal\
+    \ Overview\n  from the candidate's active training + steps + deliverables (read-only).\n\
+    - AWSTrainingIntegration (queueable, invocable \"Send Training to AWS\"):\n\
+    \  pushes the full training package to AWS API Gateway at enrollment; the\n\
+    \  external AI later returns deliverable scores through the\n  DeliverableResultRest\
+    \ endpoint.\n- LockOverdueDeliverables (scheduled): reads Time_Zone__c +\n \
+    \ Candidate_Time_Zone_End_Time__c to lock overdue deliverables at the\n  candidate's\
+    \ local end of day.\n- TrainerEmailService: emails Assigned_Trainer__r.Email__c\
+    \ on deliverable\n  extension requests (used by Extension_Requested_Notify_Trainer\
+    \ /\n  Review_Extension_Request, which look up the training to find the trainer)."
+- title: CandidateTrainingStep__c — What This Object Is
+  keywords:
+  - candidatetrainingstep
+  - candidate
+  - training
+  - step
+  text: 'CandidateTrainingStep__c is one candidate''s progress through ONE step
+    of
+
+    their training - the runtime copy of a StepTemplate__c. When a candidate is
+
+    enrolled (Candidate_Training_Creation flow), each step template of the chosen
+
+    program version is instantiated into one of these records with the content
+
+    copied over (title, sequence, learning goal, notes, expected duration) and
+
+    status "Not Started". Trainers then drive each step''s status as the training
+
+    progresses; deliverables (the candidate''s actual work products) are
+
+    master-detail children of the step; training sessions link back to the step
+
+    they cover.'
+- title: CandidateTrainingStep__c — Kind Of Object
+  keywords:
+  - candidatetrainingstep
+  - candidate
+  - training
+  - step
+  text: "- Custom object, Training / LMS domain (Training Module app).\n- MASTER-DETAIL\
+    \ CHILD of Candidate_Training__c: sharing is Controlled By\n  Parent - whoever\
+    \ sees the training sees its steps. No owner of its own.\n- 16 custom fields,\
+    \ 0 record types, 0 validation rules, 1 list view.\n- Name is plain Text - the\
+    \ creation flow writes the step template's Title\n  into it, so the record reads\
+    \ like \"Resume Deep-Dive\" rather than a number.\n- Scale: 1,372 records (May\
+    \ 8 - Aug 6, 2026); they belong to the 160\n  step-based trainings (~8.6 steps\
+    \ per stepped training on average)."
+- title: CandidateTrainingStep__c — Record Types
+  keywords:
+  - candidatetrainingstep
+  - candidate
+  - training
+  - step
+  text: 'None. All steps share one layout ("Candidate Training Step Layout") and
+    one
+
+    Lightning record page (Candidate_Training_Step_Record_Page).'
+- title: CandidateTrainingStep__c — How It Is Used — The Business Process
+  keywords:
+  - candidatetrainingstep
+  - candidate
+  - training
+  - step
+  text: "STEP 1 - INSTANTIATION. Steps are created ONLY by the\n  Candidate_Training_Creation\
+    \ flow at enrollment: one record per\n  StepTemplate__c of the chosen program\
+    \ version, copying Name (= template\n  Title), Sequence, Learning Goal, Training\
+    \ Notes, Training Step content and\n  Expected Duration, linking Step_Template__c,\
+    \ inheriting the training's\n  Assigned Trainer, and setting Status = \"Not\
+    \ Started\". Users never create\n  steps by hand in the normal process.\n\n\
+    STEP 2 - SCHEDULING. When the training is booked into a Session Window\n  (candidate\
+    \ portal or admin \"Book Session Slot\"), the booking Apex walks\n  the steps\
+    \ in Sequence order and stamps each one's Started_At__c on\n  consecutive BUSINESS\
+    \ days starting at the window's start date/time (in\n  the window's time zone).\
+    \ It also creates/attaches a Session__c per step\n  (Session__c.Candidate_Training_Step__c)\
+    \ and, for candidates sharing a\n  cohort slot, Session_Attendee__c rows pointing\
+    \ at the step."
+- title: CandidateTrainingStep__c — How It Is Used — The Business Process (2)
+  keywords:
+  - candidatetrainingstep
+  - candidate
+  - training
+  - step
+  text: "STEP 3 - EXECUTION. The trainer runs the session for the step and updates\n\
+    \  Status__c. The field's help text encodes the team's conventions: candidate\n\
+    \  did not show up -> \"Absent\"; trainer was not available -> \"Skipped\";\n\
+    \  candidate removed from the training -> \"Blocked\". Completing the linked\n\
+    \  Session (Session_Complete_Activate_Deliverables flow, plus the\n  SessionCompletionAttendeeTrigger\
+    \ for cohort attendees) activates the\n  step's deliverables so the candidate\
+    \ can submit work.\n\nSTEP 4 - COMPLETION / DROP. The trainer marks the step\
+    \ \"Completed\" as the\n  candidate progresses (in practice only the status\
+    \ is set - the\n  Completed__c timestamp is never filled, see part 8). If the\
+    \ whole\n  training is dropped, the Candidate_Training_Dropped_Cascade flow\
+    \ marks\n  the unfinished steps \"Dropped\". The candidate portal Overview\n\
+    \  (DashboardService + PortalHelpers) buckets the steps by status to show a\n\
+    \  progress tracker."
+- title: CandidateTrainingStep__c — Connected Objects
+  keywords:
+  - candidatetrainingstep
+  - candidate
+  - training
+  - step
+  - each
+  - relationship
+  - means
+  text: "PARENT:\n- Candidate_Training__c (Candidate_Training__c, MASTER-DETAIL,\
+    \ 100%): the\n  enrollment this step belongs to. Sharing and cascade-delete\
+    \ flow from it.\n\nLOOKUPS FROM THE STEP:\n- StepTemplate__c (Step_Template__c,\
+    \ 100%): the blueprint this step was\n  instantiated from - the link back to\
+    \ the curriculum definition.\n- Recruiter__c (Assigned_Trainer__c, 71%): the\
+    \ trainer running this step,\n  inherited from the training at creation.\n-\
+    \ User (Assigned_Trainer_User__c, 0%): unused User-flavored twin of the\n  trainer\
+    \ lookup.\n\nOBJECTS THAT POINT AT THE STEP:\n- Deliverable__c (MASTER-DETAIL\
+    \ child via Candidate_Training_Step__c): the\n  work products the candidate\
+    \ must submit for this step.\n- Session__c (lookup Session__c.Candidate_Training_Step__c):\
+    \ the scheduled\n  meeting(s) covering this step.\n- Session_Attendee__c (lookup):\
+    \ cohort co-attendees mapped to their own\n  step for a shared session slot."
+- title: CandidateTrainingStep__c — Business Rules
+  keywords:
+  - candidatetrainingstep
+  - candidate
+  - training
+  - step
+  - validation
+  text: 'None. Steps are system-generated and conventions (Absent vs Skipped vs
+
+    Blocked) are documented in help text rather than enforced.'
+- title: CandidateTrainingStep__c — Automation
+  keywords:
+  - candidatetrainingstep
+  - candidate
+  - training
+  - step
+  - runs
+  text: "No record-triggered flow or Apex trigger runs ON this object. It is written\n\
+    by automation living elsewhere:\n- Candidate_Training_Creation flow: creates\
+    \ the steps at enrollment (the\n  only creation path).\n- CandidatePortalController.bookSessionWindow\
+    \ /\n  AdminSessionAssignmentController: stamp Started_At__c per business day\n\
+    \  and wire sessions/attendees to the steps at slot booking.\n- Candidate_Training_Dropped_Cascade\
+    \ flow: sets Status = \"Dropped\" on\n  unfinished steps when the parent training\
+    \ is dropped.\n- Session_Complete_Activate_Deliverables flow (on Session__c)\
+    \ and\n  SessionCompletionAttendeeTrigger (on Session_Attendee__c): when the\n\
+    \  step's session completes, activate the step's deliverables.\n- Extension_Requested_Notify_Trainer\
+    \ / Review_Extension_Request flows and\n  DashboardService/PortalHelpers (candidate\
+    \ portal) READ the step for\n  context, trainer routing and portal progress\
+    \ buckets.\nLayout quick actions are only the standard New Task / New Event\
+    \ / Log a\nCall / Send Email plus global creates - no custom buttons."
+- title: StepTemplate__c — What This Object Is
+  keywords:
+  - steptemplate
+  - step
+  - template
+  text: 'StepTemplate__c is the curriculum BLUEPRINT: one ordered step of a training
+
+    program version (e.g. "Day 1 - Resume Deep-Dive", "System Design Basics").
+
+    It defines what the step covers (title, description, learning goal,
+
+    training content), how long it should take, and in what order it comes.
+
+    It holds NO candidate data - when a candidate enrolls, each template is
+
+    copied into a CandidateTrainingStep__c, and the template''s
+
+    Step_Deliverable_Definition__c children define which work products that
+
+    step demands. Editing a template changes future enrollments only; existing
+
+    candidate steps keep their copied content.'
+- title: StepTemplate__c — Kind Of Object
+  keywords:
+  - steptemplate
+  - step
+  - template
+  text: "- Custom object, blueprint tier of the Training / LMS domain.\n- MASTER-DETAIL\
+    \ CHILD of Program_Version__c: sharing Controlled By Parent;\n  deleting a version\
+    \ deletes its templates.\n- 13 custom fields, 0 record types, 0 validation rules,\
+    \ 1 list view.\n- Auto-number Name in the format ST-{0000} (the human-readable\
+    \ name lives\n  in Title__c).\n- Scale: tiny and admin-curated - 52 records\
+    \ across 8 program versions,\n  created 2026-05-07 to 2026-07-09."
+- title: StepTemplate__c — Record Types
+  keywords:
+  - steptemplate
+  - step
+  - template
+  text: 'None. One layout ("Step Template Layout") and one Lightning page
+
+    (Step_Template_Record_Page) serve all templates.'
+- title: StepTemplate__c — How It Is Used — The Business Process
+  keywords:
+  - steptemplate
+  - step
+  - template
+  text: "STEP 1 - AUTHORING. An admin/training designer runs the Program_Creation\n\
+    \  screen flow, which builds the Program, its first Program_Version, and the\n\
+    \  ordered StepTemplates with their Step_Deliverable_Definitions in one\n  wizard.\
+    \ Later edits go through the Update_Program_Version screen flow,\n  which reads\
+    \ the current version's templates (and their deliverable\n  definitions) and\
+    \ clones/adjusts them into a NEW version - versions are\n  treated as immutable\
+    \ once candidates are enrolled.\n\nSTEP 2 - CONSUMPTION AT ENROLLMENT. The Candidate_Training_Creation\
+    \ flow\n  queries the chosen version's templates and instantiates one\n  CandidateTrainingStep__c\
+    \ per template, copying Title -> step Name,\n  Sequence, Learning Goal, Training\
+    \ Notes, Training Step content and\n  Expected Duration Min -> Expected Duration.\n\
+    \nSTEP 3 - ROLLUP. Expected_Duration_Min__c feeds the version's\n  Total_Expected_Duration\
+    \ rollup, giving each program version a total\n  planned length.\n\nNOTE ON\
+    \ REAL USAGE: the org's highest-volume program (\"Interview Readiness\nTraining\"\
+    , 61% of enrollments) has NO step templates - it runs as\ncohort/session-window\
+    \ group training. Templates are really the backbone of\nthe 1-1 technical programs\
+    \ (Technical 1-1: 10 steps, Advanced AI/ML: 14\nsteps, etc.)."
+- title: StepTemplate__c — Connected Objects
+  keywords:
+  - steptemplate
+  - step
+  - template
+  - each
+  - relationship
+  - means
+  text: "PARENT:\n- Program_Version__c (Program_Version__c, MASTER-DETAIL, required):\
+    \ the\n  versioned course configuration this step belongs to. Sharing and deletes\n\
+    \  cascade from it; the step count/duration roll up to it.\n\nLOOKUPS FROM THE\
+    \ TEMPLATE:\n- Program__c (Program__c, 100%): denormalized link to the top-level\n\
+    \  program, so templates can be reported per program without joining\n  through\
+    \ the version.\n\nOBJECTS THAT POINT AT THE TEMPLATE:\n- CandidateTrainingStep__c\
+    \ (lookup Step_Template__c): every runtime step\n  instantiated from this blueprint\
+    \ (the \"which candidates ran this step\"\n  view).\n- Step_Deliverable_Definition__c\
+    \ (lookup Step_Template__c): the work\n  products this step requires from the\
+    \ candidate."
+- title: StepTemplate__c — Business Rules
+  keywords:
+  - steptemplate
+  - step
+  - template
+  - validation
+  text: 'None. Templates are only created/edited through the two admin wizard flows,
+
+    which control the data shape themselves.'
+- title: StepTemplate__c — Automation
+  keywords:
+  - steptemplate
+  - step
+  - template
+  - runs
+  text: "No record-triggered flows, no Apex triggers, no quick actions. All activity\n\
+    comes from screen flows that write or read it:\n- Program_Creation (screen flow):\
+    \ creates templates (with their deliverable\n  definitions) while building a\
+    \ new program + version.\n- Update_Program_Version (screen flow): reads the\
+    \ old version's templates,\n  lets the admin adjust them, and creates the copies\
+    \ under the new version\n  (Lookup_Key__c is used to match steps and their definitions\
+    \ across the\n  clone).\n- Candidate_Training_Creation (screen flow): reads\
+    \ the templates of the\n  selected version to instantiate the candidate's steps\
+    \ at enrollment."
+- title: Step_Deliverable_Definition__c — What This Object Is
+  keywords:
+  - step
+  - deliverable
+  - definition
+  text: 'Step_Deliverable_Definition__c is the blueprint of a WORK PRODUCT a training
+
+    step demands from the candidate: "submit a recorded video", "upload your
+
+    resume file", "paste a GitHub URL", "tick the confirmation box". Each
+
+    StepTemplate__c can have several definitions; at enrollment each definition
+
+    becomes one Deliverable__c under the candidate''s step, carrying the
+
+    definition''s label, type, requiredness and deadline offset. The definition
+
+    also carries a Schema_JSON__c config consumed by the candidate portal /
+
+    AWS AI evaluation pipeline.
+
+
+    IMPORTANT DATA REALITY: as of this snapshot the table is EMPTY in preprod
+
+    (0 rows), yet 3,251 of 3,252 Deliverable__c records still hold Definition
+
+    IDs that no longer resolve, and deliverables created as late as 2026-08-03
+
+    had live links. The definition records were evidently deleted (and purged)
+
+    shortly before this snapshot. Until they are recreated, new enrollments
+
+    will produce steps but NO deliverables, and Update_Program_Version has no
+
+    definitions to clone. (Not fully documented - verify with team whether this
+
+    deletion was intentional, e.g. a planned re-import.)'
+- title: Step_Deliverable_Definition__c — Kind Of Object
+  keywords:
+  - step
+  - deliverable
+  - definition
+  text: "- Custom object, blueprint tier of the Training / LMS domain.\n- Standalone\
+    \ object (plain LOOKUP to StepTemplate__c, not master-detail);\n  org-wide default\
+    \ Public Read/Write.\n- 8 custom fields, 0 record types, 0 validation rules,\
+    \ 1 list view.\n- Auto-number Name in the format SDD-{0000}; it ALSO has a second\n\
+    \  auto-number field (Key__c) - see part 8.\n- Scale: currently 0 records (see\
+    \ the data-reality note above)."
+- title: Step_Deliverable_Definition__c — Record Types
+  keywords:
+  - step
+  - deliverable
+  - definition
+  text: 'None. One layout and one Lightning page
+
+    (Step_Deliverable_Definition_Record_Page) serve all definitions.'
+- title: Step_Deliverable_Definition__c — How It Is Used — The Business Process
+  keywords:
+  - step
+  - deliverable
+  - definition
+  text: "STEP 1 - AUTHORING. Definitions are created together with their step\n\
+    \  templates inside the Program_Creation wizard (and adjusted/cloned by\n  Update_Program_Version\
+    \ when a new version is cut). The author decides,\n  per step: what artifact\
+    \ the candidate must produce (Type__c), what it is\n  called (Label__c), whether\
+    \ it is mandatory (Is_Required__c), and how many\n  days after the step the\
+    \ candidate gets to finish it\n  (Days_To_Complete__c).\n\nSTEP 2 - INSTANTIATION.\
+    \ At enrollment, Candidate_Training_Creation loops\n  the definitions of every\
+    \ step template in the version and creates one\n  Deliverable__c per definition\
+    \ per candidate step, copying the label into\n  the deliverable Name, the requiredness,\
+    \ the days-to-complete, and\n  linking back via Deliverable__c.Definitions__c.\n\
+    \nSTEP 3 - DEADLINES. When the training is booked into a session window, the\n\
+    \  booking Apex recomputes each deliverable's due dates as: its step's\n  scheduled\
+    \ date + the definition's Days_To_Complete (carried on the\n  deliverable),\
+    \ expressed in both IST and the candidate's time zone."
+- title: Step_Deliverable_Definition__c — How It Is Used — The Business Process
+    (2)
+  keywords:
+  - step
+  - deliverable
+  - definition
+  text: "STEP 4 - EVALUATION. The definition's Type__c/Schema_JSON__c shape what\n\
+    \  the candidate portal collects and what the AWS AI evaluation engine\n  receives\
+    \ (the whole training package, definitions included, is pushed to\n  AWS at\
+    \ enrollment by AWSTrainingIntegration; scores come back through\n  the DeliverableResultRest\
+    \ REST endpoint onto Deliverable_Result__c)."
+- title: Step_Deliverable_Definition__c — Connected Objects
+  keywords:
+  - step
+  - deliverable
+  - definition
+  - each
+  - relationship
+  - means
+  text: "LOOKUPS FROM THE DEFINITION:\n- StepTemplate__c (Step_Template__c): the\
+    \ step this deliverable\n  requirement belongs to. A definition without a step\
+    \ template is\n  meaningless, but the lookup is technically optional.\n\nOBJECTS\
+    \ THAT POINT AT THE DEFINITION:\n- Deliverable__c (lookup Definitions__c, label\
+    \ \"Definition\", delete\n  constraint SetNull): every runtime deliverable instantiated\
+    \ from this\n  definition. NOTE: in current preprod data these lookups are orphaned\
+    \ -\n  they hold IDs of definition records that were deleted (the SetNull\n\
+    \  cleanup evidently did not run/complete), so Definitions__r traversals\n \
+    \ return null even though COUNT(Definitions__c) is ~100%."
+- title: Step_Deliverable_Definition__c — Automation
+  keywords:
+  - step
+  - deliverable
+  - definition
+  - runs
+  text: "No record-triggered flows, no Apex triggers, no quick actions. Touched\
+    \ only\nby screen flows and integrations elsewhere:\n- Program_Creation (screen\
+    \ flow): creates definitions while authoring a\n  program version.\n- Update_Program_Version\
+    \ (screen flow): reads all definition fields\n  (Label, Type, Is_Required, Days_To_Complete,\
+    \ Lookup_Key, Step_Template)\n  to clone them under the new version's steps.\n\
+    - Candidate_Training_Creation (screen flow): reads definitions at\n  enrollment\
+    \ to generate the candidate's Deliverable__c records.\n- AWSTrainingIntegration\
+    \ (Apex): includes the definitions in the training\n  package sent to the AWS\
+    \ AI engine at enrollment."
+- title: Deliverable__c — What This Object Is
+  keywords:
+  - deliverable
+  text: 'Deliverable__c is ONE piece of work a candidate must produce during a training
+
+    program - a recording, a file upload, a document, an exercise. It belongs to
+    a
+
+    training step (module) of a candidate''s enrollment, e.g. "Niche Fundamentals
+
+    Recording" on the "Niche Fundamentals" step of the candidate''s Java program.
+
+    One candidate enrollment generates its own copy of every deliverable defined
+
+    in the program''s step templates, so two candidates in the same program have
+
+    separate Deliverable__c records.
+
+
+    The record is the workflow backbone of candidate homework: it opens (Active)
+
+    when the related training session completes, carries a due date in both IST
+
+    and the candidate''s own timezone, gets Locked by an hourly job when the due
+
+    date passes, supports an extension request/approval loop between candidate and
+
+    trainer, tracks every submission attempt (child Deliverable_Result__c rows),
+
+    and stores the latest AI grade/feedback that the external AWS grading engine
+
+    computed for the most recent submission.'
+- title: Deliverable__c — Kind Of Object
+  keywords:
+  - deliverable
+  text: "- Custom object, part of the Training/LMS domain.\n- MASTER-DETAIL CHILD\
+    \ OF CandidateTrainingStep__c via Candidate_Training_Step__c:\n  every deliverable\
+    \ MUST belong to a training step. Sharing is \"Controlled By\n  Parent\" (internal\
+    \ and external) - visibility follows the step, which follows\n  the training,\
+    \ which follows the candidate (Person Account).\n- 21 custom fields, 0 record\
+    \ types, 1 validation rule, 1 list view.\n- Name is plain TEXT (\"Deliverable\
+    \ Name\"), not auto-number - it carries the\n  template's label, e.g. \"Niche\
+    \ Fundamentals Recording\".\n- Field history tracking is enabled on the object.\n\
+    - Scale: ~3,252 records in preprod, all created between May and Aug 2026 -\n\
+    \  the training/LMS module is new."
+- title: Deliverable__c — Record Types
+  keywords:
+  - deliverable
+  text: 'None. All deliverables are the same shape; the Definitions__c template
+    link
+
+    and its Type__c (Video_URL / File / URL / Text / Checkbox / Image) carry the
+
+    "what kind of deliverable" signal instead.'
+- title: Deliverable__c — How It Is Used — The Business Process
+  keywords:
+  - deliverable
+  text: "STEP 1 - GENERATED AT ENROLLMENT. When a coordinator runs the\n  Candidate_Training_Creation\
+    \ screen flow to enroll a candidate, the flow\n  builds the whole training skeleton:\
+    \ the Candidate_Training__c record, one\n  CandidateTrainingStep__c per step\
+    \ template, sessions, and ONE Deliverable__c\n  per Step_Deliverable_Definition__c\
+    \ template on each step. Each deliverable\n  is created with Status \"Not Active\"\
+    , Name = the template's label,\n  Is_Required and Approval_Required = true,\
+    \ Days_To_Complete copied from the\n  template, and links to the step, the training\
+    \ and the template. The flow\n  then sends the whole structure (steps + deliverable\
+    \ ids/names) to AWS via\n  the AWSTrainingIntegration Apex action so the external\
+    \ side (S3 folders,\n  AI grading assistant) is provisioned with matching ids.\n\
+    \nSTEP 2 - DUE DATES ARE COMPUTED. When the candidate books a session window\
+    \ in\n  the candidate portal, CandidatePortalController sets each step's start\
+    \ date\n  and recomputes each deliverable's due date = step start date +\n \
+    \ Days_To_Complete. It writes the same deadline three ways: Due_Date_IST__c\n\
+    \  (text, IST wall time), Due_Date_Candidate_Time_Zone__c (text, the\n  candidate's\
+    \ local wall time) and Due_Date_Sort__c (a real DateTime at\n  18:30 GMT = midnight\
+    \ IST, used for sorting and the overdue sweep)."
+- title: Deliverable__c — How It Is Used — The Business Process (2)
+  keywords:
+  - deliverable
+  text: "STEP 3 - ACTIVATION ON SESSION COMPLETION. Deliverables stay \"Not Active\"\
+    \n  until the training session for their step is actually held. When a\n  Session__c\
+    \ is marked Completed, the Session_Complete_Activate_Deliverables\n  flow flips\
+    \ that step's Not Active deliverables to Active, stamps the\n  completed session\
+    \ into Linked_Session__c, and emails the candidate that\n  their assignment\
+    \ is open. The SessionCompletionAttendeeTrigger closes a gap\n  for GROUP sessions:\
+    \ the flow only handles the step of the candidate who\n  booked the session,\
+    \ so the trigger walks the Session_Attendee__c roster and\n  activates every\
+    \ other attendee's step deliverables too."
+- title: Deliverable__c — How It Is Used — The Business Process (3)
+  keywords:
+  - deliverable
+  text: "STEP 4 - THE CANDIDATE SUBMITS (PORTAL + S3). In the candidate portal (custom\n\
+    \  token auth, not standard users), the candidate uploads their work. The LWC\n\
+    \  calls CandidatePortalController -> DeliverableActionService, which:\n  (a)\
+    \ creates a child Deliverable_Result__c with Result Status \"Pending\",\n  (b)\
+    \ asks AWS for a pre-signed S3 upload URL (Named Credential\n      AWS_Candidate_API),\
+    \ renaming the file to\n      \"<Deliverable Name>-(<Result Id>).<ext>\" so\
+    \ every S3 object is traceable\n      to one attempt, (c) after the browser\
+    \ uploads to S3, flips the\n      deliverable to Submitted, stamps Submitted_At__c\
+    \ and increments\n      Attempt_Count__c. Cancelled/failed uploads leave a reusable\
+    \ Pending\n      result row; a cleanup method deletes it and heals the attempt\
+    \ count."
+- title: Deliverable__c — How It Is Used — The Business Process (4)
+  keywords:
+  - deliverable
+  text: "STEP 5 - AI GRADING COMES BACK. The AWS Lambda grades the submission and\n\
+    \  calls back into Salesforce via the REST endpoint\n  /services/apexrest/v1/deliverable-result/\
+    \ (DeliverableResultRest): it writes\n  Pass/Fail + score + composed feedback\
+    \ on the result row and cascades the\n  parent deliverable's Status (Pass ->\
+    \ Approved, Fail -> Failed). The\n  Deliverable_result_roll_up_status flow then\
+    \ copies the newest result's\n  score/feedback up into AI_Latest_Score__c /\
+    \ Latest_AI_Feedback__c so the\n  parent record always shows the latest grade.\
+    \ A Failed deliverable is open\n  for resubmission until the due date passes\
+    \ (max seen: 43 attempts).\n\nSTEP 6 - OVERDUE LOCKING. The scheduled Apex job\
+    \ LockOverdueDeliverables runs\n  HOURLY and flips past-due Active / Failed\
+    \ (and defensively \"Rejected\")\n  deliverables to Locked. Since June 2026\
+    \ it computes the real deadline in\n  the CANDIDATE'S timezone (training's Time_Zone__c\
+    \ + end-time picklists,\n  DST-aware) instead of the legacy 18:30-GMT Due_Date_Sort__c,\
+    \ which used to\n  lock US candidates 4-5 hours early. Submitted/Approved records\
+    \ are never\n  auto-locked. A Locked deliverable can no longer be submitted\
+    \ - the portal\n  shows the \"Request extension\" path instead."
+- title: Deliverable__c — How It Is Used — The Business Process (5)
+  keywords:
+  - deliverable
+  text: "STEP 7 - EXTENSION REQUEST LOOP. A candidate with a locked or past-due\n\
+    \  deliverable clicks Request Extension in the portal: DeliverableActionService\n\
+    \  sets Extension_Requested__c + Extension_Requested_At__c (one open request\
+    \ at\n  a time). The Extension_Requested_Notify_Trainer flow emails the training's\n\
+    \  assigned trainer with the candidate/program/step/due-date details and an\n\
+    \  \"open in AIC Portal\" pointer. The trainer opens the deliverable record\
+    \ and\n  clicks the \"Review Extension Request\" quick action (screen flow\n\
+    \  Review_Extension_Request) to APPROVE - which writes a new due date into the\n\
+    \  three due-date fields, clears the flag and reopens the deliverable - or\n\
+    \  REJECT.\n\nSTEP 8 - DROP-OUT. If the parent Candidate_Training__c is set\
+    \ to Dropped, the\n  Candidate_Training_Dropped_Cascade flow marks the candidate's\
+    \ not-yet-done\n  deliverables Dropped. All portal actions (submit, resubmit,\
+    \ extension) are\n  hard-blocked for dropped deliverables/trainings by Apex\
+    \ checks."
+- title: Deliverable__c — Connected Objects
+  keywords:
+  - deliverable
+  - each
+  - relationship
+  - means
+  text: "PARENT:\n- CandidateTrainingStep__c (via Candidate_Training_Step__c, MASTER-DETAIL,\n\
+    \  required). The training step/module this work item belongs to. Sharing and\n\
+    \  deletion cascade from the step. The candidate portal groups deliverables\n\
+    \  under their step, and the step's start date drives the due date."
+- title: Deliverable__c — Connected Objects (2)
+  keywords:
+  - deliverable
+  - each
+  - relationship
+  - means
+  text: "LOOKUPS FROM DELIVERABLE TO OTHER OBJECTS:\n- Candidate_Training__c (Candidate_Training__c):\
+    \ the candidate's enrollment -\n  a denormalized shortcut past the step so code/flows\
+    \ can filter one\n  candidate's deliverables in one hop (populated on ~100%\
+    \ of records). Its\n  Time_Zone__c / end-time fields drive the locking job,\
+    \ and its Status =\n  Dropped blocks all candidate actions.\n- Step_Deliverable_Definition__c\
+    \ (Definitions__c, label \"Definition\"): the\n  program template this deliverable\
+    \ was stamped from (~100% populated).\n  Source of the Name, Days_To_Complete\
+    \ and the Type (File/Video_URL/...).\n- Session__c (Linked_Session__c): the\
+    \ completed training session that\n  activated this deliverable - stamped by\
+    \ the\n  Session_Complete_Activate_Deliverables flow (41% populated; empty for\n\
+    \  deliverables not yet activated).\n- User (Submitted_By__c): intended \"who\
+    \ submitted\" audit - in practice ALWAYS\n  EMPTY (candidates are not Salesforce\
+    \ users; the portal's custom-token auth\n  writes Submitted_At but never this\
+    \ field).\n- User (Approved_By__c): intended approving trainer. The creation\
+    \ flow tries\n  to pre-fill it with the training's assigned trainer user, but\
+    \ in practice\n  it is EMPTY on all records (the source field is not populated)."
+- title: Deliverable__c — Connected Objects (3)
+  keywords:
+  - deliverable
+  - each
+  - relationship
+  - means
+  text: "OBJECTS THAT POINT AT DELIVERABLE (children):\n- Deliverable_Result__c\
+    \ (MASTER-DETAIL child): one row per submission\n  attempt, with the AI verdict/score/feedback.\
+    \ See its own section below.\n\nREPORTING: the custom report type \"Trainings\
+    \ with Deliverables\" joins\nCandidate_Training__c -> Deliverable__c for trainer/ops\
+    \ reporting."
+- title: Deliverable__c — Business Rules
+  keywords:
+  - deliverable
+  - validation
+  - all
+  - active
+  text: "- Prevent_Past_Approval_Date: \"The Approved At date and time cannot be\
+    \ in the\n  past.\" Fires when Approved_At__c is filled or changed (on create\
+    \ or edit) to\n  a date before today - it stops backdated approvals, so the\
+    \ approval\n  timestamp always reflects when the approval really happened."
+- title: Deliverable__c — Automation
+  keywords:
+  - deliverable
+  - runs
+  text: "RECORD-TRIGGERED FLOWS (active, on Deliverable__c):\n- Update_Deliverable_Approverd_At\
+    \ (before save, create+update, entry on\n  Status__c): stamps Approved_At__c\
+    \ when the status becomes Approved (note\n  the typo \"Approverd\" in the flow\
+    \ name).\n- Extension_Requested_Notify_Trainer (after save, create+update):\
+    \ when\n  Extension_Requested__c flips true, looks up the training/step/program/\n\
+    \  trainer and emails the assigned trainer the extension request details.\n\n\
+    FLOWS ON OTHER OBJECTS THAT WRITE DELIVERABLES:\n- Candidate_Training_Creation\
+    \ (screen flow): creates the deliverables at\n  enrollment (see process step\
+    \ 1).\n- Session_Complete_Activate_Deliverables (on Session__c update): activates\
+    \ a\n  completed session's step deliverables, sets Linked_Session__c, emails\
+    \ the\n  candidate.\n- Deliverable_result_roll_up_status (on Deliverable_Result__c):\
+    \ rolls the\n  latest AI score/feedback/status up onto the parent deliverable.\n\
+    - Candidate_Training_Dropped_Cascade (on Candidate_Training__c): marks the\n\
+    \  deliverables Dropped when the training is dropped.\n- Review_Extension_Request\
+    \ (screen flow behind the quick action): trainer\n  approves (new due date,\
+    \ reopen) or rejects an extension request.\n- Display_Deliverable (screen flow):\
+    \ read-only helper that lists a\n  training's deliverables."
+- title: Deliverable__c — Automation (2)
+  keywords:
+  - deliverable
+  - runs
+  text: "APEX TRIGGER (on Session__c, not on Deliverable itself):\n- SessionCompletionAttendeeTrigger:\
+    \ on session completion, activates the\n  \"Not Active\" deliverables of every\
+    \ group-session attendee's step (the flow\n  above only covers the booking candidate's\
+    \ step).\n\nSCHEDULED APEX:\n- LockOverdueDeliverables (hourly, \"Lock Overdue\
+    \ Deliverables Hourly\"): flips\n  past-due Active/Failed/(Rejected) deliverables\
+    \ to Locked, computing the\n  deadline in the candidate's own timezone with\
+    \ a legacy Due_Date_Sort__c\n  fallback. Deliberately never touches Submitted/Approved/Locked/Not\
+    \ Active."
+- title: Deliverable__c — Automation (3)
+  keywords:
+  - deliverable
+  - runs
+  text: "APEX SERVICES (candidate portal, custom token auth):\n- DeliverableActionService:\
+    \ submit / S3 upload URL / finalize / discard /\n  request extension / attempt\
+    \ history - the only writer of Submitted_At__c,\n  Attempt_Count__c, Extension_Requested__c/_At__c\
+    \ and the Submitted status.\n- CandidatePortalController: thin auth wrapper\
+    \ over the service; also\n  recomputes the three due-date fields when the candidate\
+    \ books a session\n  window.\n- DashboardService + PortalHelpers: read-only;\
+    \ build the portal Overview tab\n  and map raw Status__c values to the portal\
+    \ buckets (Inprogress->active,\n  Pending->submitted, Completed->approved, Not\
+    \ Active->upcoming, plus an\n  automatic \"locked\" for past-due submittable\
+    \ rows).\n- TrainerEmailService: legacy extension email path, superseded by\
+    \ the\n  Extension_Requested_Notify_Trainer flow (kept but no longer called\
+    \ for\n  extensions to avoid double emails).\n- AWSTrainingIntegration: sends\
+    \ the training structure incl. deliverable ids\n  and names to AWS at enrollment.\n\
+    \nEXTERNAL WRITER: the AWS grading Lambda updates the parent Status__c\n(Approved/Failed)\
+    \ through the DeliverableResultRest endpoint - see the\nDeliverable_Result__c\
+    \ section.\n\nBUTTON ON THE PAGE: \"Review Extension Request\" quick action\
+    \ (Flow type) on\nthe Deliverable_Record_Page Lightning page and the classic\
+    \ Deliverable\nLayout."
+- title: Deliverable_Result__c — What This Object Is
+  keywords:
+  - deliverable
+  - result
+  text: 'Deliverable_Result__c is ONE SUBMISSION ATTEMPT of a training deliverable
+    and
+
+    its grade. Every time a candidate uploads work for a Deliverable__c, a new
+
+    result row is created (auto-number DR-XXXXXX); the external AWS AI grading
+
+    engine then writes its verdict (Pass/Fail), a 0-100 score, and written
+
+    feedback back onto that same row. A deliverable with 5 attempts has 5 result
+
+    rows - together they are the candidate''s full submission history, which the
+
+    candidate portal shows as "previous attempts" and trainers read as the audit
+
+    trail behind the parent''s latest score.'
+- title: Deliverable_Result__c — Kind Of Object
+  keywords:
+  - deliverable
+  - result
+  text: "- Custom object, part of the Training/LMS domain.\n- MASTER-DETAIL CHILD\
+    \ OF Deliverable__c via Deliverable__c: every result MUST\n  belong to a deliverable.\
+    \ Sharing is \"Controlled By Parent\" - visibility\n  cascades Deliverable ->\
+    \ Step -> Training -> Candidate.\n- 6 custom fields, 0 record types, 0 validation\
+    \ rules, 1 list view.\n- Auto-number Name in the format DR-XXXXXX.\n- Scale:\
+    \ ~2,532 records in preprod (Jun-Jul 2026 data window)."
+- title: Deliverable_Result__c — How It Is Used — The Business Process
+  keywords:
+  - deliverable
+  - result
+  text: "STEP 1 - CREATED AT SUBMISSION TIME (BY APEX, NOT BY USERS). When the\n\
+    \  candidate submits work in the candidate portal, DeliverableActionService\n\
+    \  creates the result row FIRST, with Result_Status__c = \"Pending\" and\n \
+    \ Submitted_At__c = now, BEFORE the file goes anywhere. The new row's Id is\n\
+    \  baked into the S3 filename (\"<Deliverable Name>-(<Result Id>).<ext>\"),\
+    \ so\n  every file in the S3 bucket is traceable to exactly one attempt. If\
+    \ an\n  upload is cancelled or dies mid-flight, the Pending row is either deleted\n\
+    \  (discardPendingResult) or REUSED on the next try - a lingering Pending row\n\
+    \  under a still-open deliverable means \"candidate started a submission but\n\
+    \  never completed it\"."
+- title: Deliverable_Result__c — How It Is Used — The Business Process (2)
+  keywords:
+  - deliverable
+  - result
+  text: "STEP 2 - AWS GRADES AND CALLS BACK. The AWS Lambda analyses the uploaded\
+    \ file\n  and POSTs its verdict to the inbound REST endpoint\n  /services/apexrest/v1/deliverable-result/\
+    \ (Apex class DeliverableResultRest,\n  runs without sharing). The payload carries\
+    \ the result Id, a PASS/FAIL/\n  PENDING verdict, an optional 0-100 score, and\
+    \ reasoning plus positives/\n  negatives bullet lists. The endpoint normalises\
+    \ the verdict to Pass/Fail/\n  Pending, writes AI_Score__c, and composes AI_Feedback__c\
+    \ from the reasoning\n  and bullet lists (or takes a pre-built \"feedback\"\
+    \ string verbatim). Auth:\n  OAuth client-credentials via the \"AWS Result Callback\"\
+    \ external client app,\n  running as the \"Salesforce API Only System Integrations\"\
+    \ user.\n\nSTEP 3 - THE VERDICT CASCADES TO THE PARENT. Two mechanisms keep\
+    \ the parent\n  deliverable in sync (belt and braces):\n  - DeliverableResultRest\
+    \ itself updates the parent Status (Pass -> Approved,\n    Fail -> Failed, Pending\
+    \ -> unchanged).\n  - The record-triggered flow Deliverable_result_roll_up_status\
+    \ also copies\n    the newest result's AI_Score__c / AI_Feedback__c into the\
+    \ parent's\n    AI_Latest_Score__c / Latest_AI_Feedback__c and maintains parent\
+    \ status /\n    Approved_At.\n  A Fail sends the candidate back to resubmit\
+    \ (a NEW result row); a Pass ends\n  the loop."
+- title: Deliverable_Result__c — How It Is Used — The Business Process (3)
+  keywords:
+  - deliverable
+  - result
+  text: "STEP 4 - READ BACK AS HISTORY. The portal's attempt-history panel\n  (DeliverableActionService.getDeliverableHistory)\
+    \ lists all result rows for\n  a deliverable, newest first, with status, score,\
+    \ feedback and submitted\n  time. DashboardService also counts Pending rows\
+    \ so a candidate whose\n  finalize step failed still sees the item as \"submitted\"\
+    ."
+- title: Deliverable_Result__c — Connected Objects
+  keywords:
+  - deliverable
+  - result
+  - each
+  - relationship
+  - means
+  text: "PARENT:\n- Deliverable__c (via Deliverable__c, MASTER-DETAIL, required,\
+    \ 100%\n  populated). The work item this attempt was submitted against. The\
+    \ parent\n  aggregates this object: latest score/feedback roll up onto it, and\
+    \ its\n  Attempt_Count__c mirrors how many real attempts exist here.\n\nNo other\
+    \ objects point at Deliverable_Result__c, and it has no other lookups.\nThe\
+    \ uploaded file itself lives in AWS S3 (named after this record's Id), NOT\n\
+    in Salesforce Files - there is no ContentDocument link."
+- title: Deliverable_Result__c — Business Rules
+  keywords:
+  - deliverable
+  - result
+  - validation
+  text: 'None. Integrity is enforced in Apex instead: the portal only creates results
+
+    for the candidate''s own open deliverables, blocks a second submission while
+
+    one is Pending review, and never deletes a graded (Pass/Fail) row.'
+- title: Deliverable_Result__c — Automation
+  keywords:
+  - deliverable
+  - result
+  - runs
+  text: "RECORD-TRIGGERED FLOW (active):\n- Deliverable_result_roll_up_status (after\
+    \ save, create+update): when a\n  result is created or its verdict changes,\
+    \ updates the parent Deliverable's\n  Status / AI_Latest_Score__c / Latest_AI_Feedback__c\
+    \ / Approved_At__c from\n  the newest result.\n\nAPEX WRITERS:\n- DeliverableActionService\
+    \ (candidate portal): creates the Pending row at\n  submission (createPendingResult\
+    \ / legacy submitDeliverable), reuses or\n  deletes orphaned Pending rows (discardPendingResult),\
+    \ and reads the\n  attempt history. All DML in SYSTEM_MODE because portal candidates\
+    \ are not\n  standard users.\n- DeliverableResultRest (@RestResource /v1/deliverable-result/*):\
+    \ the AWS\n  grading callback - writes Result_Status__c, AI_Score__c, AI_Feedback__c\
+    \ and\n  cascades the parent status. This is the ONLY writer of the grade fields;\n\
+    \  no flow or user edits them.\n\nThere are no scheduled jobs, quick actions,\
+    \ or screen flows on this object."
+- title: Session__c — What This Object Is
+  keywords:
+  - session
+  text: 'Session__c is the GENERIC SCHEDULED-MEETING object of the org - one record
+    =
+
+    one real meeting on a calendar, backed by a Zoom meeting and a Google Calendar
+
+    event created through an external scheduling service. It is deliberately
+
+    multi-purpose: the same object books a training class, an internal screening
+
+    interview call, a welcome call, a resume-understanding session, a marketing
+
+    initial call, or a background-check call. The Purpose__c picklist says what
+
+    kind of meeting it is, and a set of polymorphic lookups (Candidate Training,
+
+    Internal Interview, Interview, Onboarding, Background Check, Lead) points at
+
+    WHATEVER the meeting is about. The host and extra attendees are always
+
+    Techsara employees (Recruiter__c records); the candidate side is the linked
+
+    Person Account.
+
+
+    Do not confuse Session__c with Interview__c (the candidate''s interview with
+    an
+
+    outside company) or Internal_Interview__c (the screening assessment record)
+    -
+
+    a Session is just the MEETING wrapper: date, time slot, timezone, Zoom link,
+
+    calendar event, and completion status. Internal interviews and training steps
+
+    each get a Session as their concrete calendar booking.'
+- title: Session__c — Kind Of Object
+  keywords:
+  - session
+  text: "- Custom object, shared by the Training/LMS layer and the internal-interview\n\
+    \  layer (it sits in both the Techsara Solutions and Training Module apps).\n\
+    - Standalone object with its own owner. Org-wide sharing is Public Read/Write\n\
+    \  (\"ReadWrite\") - anyone who can see the object can see and edit all sessions.\n\
+    - 38 custom fields, 0 record types, 1 validation rule, 2 list views\n  (\"All\"\
+    \ and \"QA Background Check Queue\").\n- Auto-number Name in the format SES-XXXXXX\
+    \ (label \"Session id\").\n- Scale: only 47 records in preprod (created 2026-07-27\
+    \ to 2026-08-06;\n  session dates run 2026-07-26 to 2026-08-28). The subsystem\
+    \ is newly live."
+- title: Session__c — Record Types
+  keywords:
+  - session
+  text: 'None. The object has no record types - the Purpose__c picklist is what
+
+    differentiates the meeting flavors instead.'
+- title: Session__c — How It Is Used — The Business Process
+  keywords:
+  - session
+  text: "STEP 1 - CREATION. Sessions are created from several entry points, almost\n\
+    \  never from the raw \"New\" button:\n  - \"Schedule Session\" button on an\
+    \ Interview__c record (screen flow\n    Schedule_Session_From_Interview): the\
+    \ employee picks one of the\n    candidate's active trainings, then books host,\
+    \ date, slot, timezone,\n    duration and purpose in the Calendly-style sessionScheduler\
+    \ LWC.\n  - \"Schedule Session\" button on a Candidate_Training__c record (screen\
+    \ flow\n    Schedule_Session_From_Training): same scheduler, training already\
+    \ known.\n  - \"Create Session\" button on a Background_Check__c record (screen\
+    \ flow\n    Background_Check_Session_Creation): books the background-check call\
+    \ and\n    links the session to the Background Check record.\n  - CANDIDATE\
+    \ PORTAL SLOT BOOKING (Apex CandidatePortalController\n    .bookSessionWindow):\
+    \ when the FIRST candidate of a cohort books a\n    Session_Window__c slot,\
+    \ the code auto-creates one Session per training\n    step (Status \"Unscheduled\"\
+    , Purpose \"Training\", host = the window's\n    trainer). Later candidates\
+    \ who book the same cohort do NOT get new\n    Sessions - they get Session_Attendee__c\
+    \ rows on the existing \"master\"\n    sessions (see that object).\n  - The\
+    \ admin-side \"Book Session Slot\" action on Candidate Training\n    (AdminSessionAssignmentController)\
+    \ does the same booking on behalf of a"
+- title: Session__c — How It Is Used — The Business Process (2)
+  keywords:
+  - session
+  text: "candidate, bypassing the portal's status/capacity filters.\n  - The Internal\
+    \ Interview \"Conduct Interview\" flow also creates/updates the\n    session\
+    \ that carries an internal screening call.\n\nSTEP 2 - MEETING CREATION CALLOUT.\
+    \ When a session reaches the right status,\n  the record-triggered Session_Scheduling_Callout_Flow\
+    \ calls the external\n  scheduling service (external service \"CreateInterview\"\
+    \ through the\n  Zoom_Scheduler named credential - an AWS endpoint that creates\
+    \ the Zoom\n  meeting and calendar entry). The callout response is written back\
+    \ onto the\n  session: Meeting_Link__c, External_Meeting_ID__c,\n  External_Meeting_Passcode__c,\
+    \ calendar_event_id__c, calendar_link__c, and\n  the IST-converted start/end\
+    \ times. 45 of 47 records carry a meeting link,\n  so this integration runs\
+    \ on virtually every session.\n\nSTEP 3 - SALESFORCE CALENDAR EVENT. The Session_To_Calendar_Event\
+    \ flow owns a\n  native Salesforce Event for each session: on create or whenever\
+    \ status,\n  date, times, timezone or host change, it deletes the old Event\
+    \ and, if the\n  session is Scheduled with all fields present, creates a fresh\
+    \ Event for the\n  host. Times are converted from the candidate-chosen timezone\
+    \ to UTC (US\n  DST approximated by a March-October month check); IST times\
+    \ are put in the\n  Event description for the India-based team."
+- title: Session__c — How It Is Used — The Business Process (3)
+  keywords:
+  - session
+  text: "STEP 4 - STATUS LIFECYCLE. Status__c runs Unscheduled -> Scheduled ->\n\
+    \  Completed (or Rescheduled / Cancelled). For internal-interview sessions,\n\
+    \  scheduling the session auto-moves the linked Internal_Interview__c from\n\
+    \  Unscheduled to Scheduled (internal_interview_Status_Update flow) and copies\n\
+    \  the IST times onto it.\n\nSTEP 5 - COMPLETION SIDE EFFECTS. Marking a session\
+    \ Completed requires Host\n  Feedback (validation rule). Completion then:\n\
+    \  - activates the deliverables of the session's training step and emails the\n\
+    \    candidate (Session_Complete_Activate_Deliverables flow), and\n  - activates\
+    \ the deliverables of every OTHER candidate attending via\n    Session_Attendee__c\
+    \ rows (Apex SessionCompletionAttendeeTrigger - the\n    flow only covers the\
+    \ first/master candidate).\n  If the whole training is dropped, the Candidate_Training_Dropped_Cascade\n\
+    \  flow sweeps the training's remaining sessions along with its steps and\n\
+    \  deliverables.\n\nSTEP 6 - CONSUMPTION. The candidate portal's \"Sessions\"\
+    \ tab (sessions /\n  sessionCard LWCs fed by DashboardService) shows the candidate\
+    \ their own\n  sessions plus any shared cohort sessions they attend, with the\
+    \ meeting\n  link and times in their own timezone. Internally, the Session record\
+    \ page\n  has a \"View Recording\" button (Recording_Link_Logs_Flow) that opens\n\
+    \  Recording_URL__c and writes a Zoom_Recording_Access_Log__c compliance row."
+- title: Session__c — Connected Objects
+  keywords:
+  - session
+  - each
+  - relationship
+  - means
+  text: "\"WHAT IS THIS MEETING ABOUT\" LOOKUPS (polymorphic by Purpose):\n- Account\
+    \ (Candidate__c): the candidate the meeting is for. 100% populated -\n  every\
+    \ session so far belongs to a candidate Person Account.\n- Candidate_Training__c\
+    \ (Candidate_Training__c): the training enrollment a\n  Training-purpose session\
+    \ belongs to (38/47 records).\n- CandidateTrainingStep__c (Candidate_Training_Step__c):\
+    \ the exact step of\n  the training curriculum this session teaches (38/47).\
+    \ Completion of the\n  session activates this step's deliverables.\n- Internal_Interview__c\
+    \ (Internal_Interview__c): the internal screening\n  interview this session\
+    \ is the call for (9/47). Bidirectional pair -\n  Internal_Interview__c also\
+    \ has its own Session__c lookup back.\n- Interview__c (Interview__c): the external\
+    \ interview a prep session was\n  booked around, set by the Schedule Session\
+    \ button on Interview (0 records\n  so far).\n- Onboarding__c (Onboarding__c):\
+    \ onboarding-related sessions such as welcome\n  calls (0 records so far).\n\
+    - Background_Check__c (Background_Check__c): the background-check engagement\n\
+    \  this call belongs to (0 records so far; the Create Session button sets it).\n\
+    \  Background_Check__c also has its own Session__c lookup back.\n- Lead (Lead__c):\
+    \ lets a session be booked for a not-yet-converted lead\n  (0 records so far).\n\
+    - Program_Version__c (Program_Version__c): which program version curriculum"
+- title: Session__c — Connected Objects (2)
+  keywords:
+  - session
+  - each
+  - relationship
+  - means
+  text: "the training session belongs to (38/47).\n\nTECHSARA-SIDE PEOPLE (all Recruiter__c\
+    \ / \"Employee\"):\n- Host_User__c: the employee running the meeting (trainer\
+    \ / interviewer /\n  caller). 100% populated. The calendar Event is created\
+    \ for this person.\n- Additional_Attendee_1__c / Additional_Attendee_2__c: up\
+    \ to two extra\n  employees invited to the meeting (5/47 each) - included in\
+    \ the scheduling\n  callout so they get the invite.\n\nOBJECTS THAT POINT AT\
+    \ SESSION (children / references):\n- Session_Attendee__c (MASTER-DETAIL child,\
+    \ relationship \"Attendees\"): the\n  extra candidates sharing this session\
+    \ in a group/cohort setting.\n- Deliverable__c (lookup Linked_Session__c): a\
+    \ deliverable tied to the\n  session where it was assigned/discussed.\n- Internal_Interview__c\
+    \ (lookup Session__c): the internal interview's link\n  back to its scheduled\
+    \ call.\n- Background_Check__c (lookup Session__c): the background check's link\
+    \ back\n  to its scheduled call.\n- Zoom_Recording_Access_Log__c (lookup Session__c):\
+    \ who viewed this\n  session's recording, when (written by the View Recording\
+    \ button flow)."
+- title: Session__c — Business Rules
+  keywords:
+  - session
+  - validation
+  - all
+  - active
+  text: "- Require_Host_Feedback_On_Complete: a session cannot be saved with Status\n\
+    \  \"Completed\" unless Host Feedback is filled in - the trainer/host must\n\
+    \  record the outcome before closing the session. Error shown on the Host\n\
+    \  Feedback field: \"Host Feedback is required before marking the session\n\
+    \  Completed.\""
+- title: Session__c — Automation
+  keywords:
+  - session
+  - runs
+  text: "RECORD-TRIGGERED FLOWS (active):\n- Session_Scheduling_Callout_Flow (after\
+    \ save, create+update, status-gated,\n  one scheduled path): calls the external\
+    \ \"CreateInterview\" scheduling\n  service (Zoom_Scheduler named credential\
+    \ -> AWS) to create the Zoom meeting\n  and calendar entry, then writes the\
+    \ meeting link, external meeting id,\n  passcode, calendar event id/link and\
+    \ IST times back onto the session.\n- Session_To_Calendar_Event (after save,\
+    \ create+update): owns the native\n  Salesforce Event for the session - deletes\
+    \ any existing linked Event and\n  recreates it when the session is Scheduled\
+    \ with all required fields;\n  handles timezone conversion and US DST.\n- internal_interview_Status_Update\
+    \ (after save, create+update): when an\n  Internal-Interview-purpose session\
+    \ gets scheduled, flips the linked\n  Internal_Interview__c to \"Scheduled\"\
+    \ and copies Start/End IST times to it.\n- Session_Complete_Activate_Deliverables\
+    \ (after save, update to Completed):\n  activates the Deliverable__c records\
+    \ of the session's training step and\n  sends the candidate an email."
+- title: Session__c — Automation (2)
+  keywords:
+  - session
+  - runs
+  text: "APEX TRIGGER:\n- SessionCompletionAttendeeTrigger (after update): when\
+    \ a session flips to\n  Completed, finds all Session_Attendee__c rows and activates\
+    \ each\n  attendee's own per-candidate deliverables (\"Not Active\" -> \"Active\"\
+    ) -\n  the flow above only covers the first candidate who booked; this trigger\n\
+    \  covers the rest of the group."
+- title: Session__c — Automation (3)
+  keywords:
+  - session
+  - runs
+  text: "SCREEN FLOWS / BUTTONS THAT CREATE OR TOUCH SESSIONS:\n- Schedule_Session_From_Interview\
+    \ (button on Interview__c) and\n  Schedule_Session_From_Training (button on\
+    \ Candidate_Training__c): both use\n  the sessionScheduler LWC (a Calendly-style\
+    \ slot picker driven by\n  SessionSchedulerController Apex: free-slot computation\
+    \ from the host's\n  events, business hours, holidays, durations) and create\
+    \ the Session.\n- Background_Check_Session_Creation (button \"Create Session\"\
+    \ on\n  Background_Check__c): creates a Background-Check-purpose session.\n\
+    - Internal_Interview_Conduct_Interview (screen flow): stamps Actual_Start__c\n\
+    \  / Actual_End__c, Host_Feedback__c and Status on the session while the\n \
+    \ internal interview is being conducted.\n- Recording_Link_Logs_Flow (\"View\
+    \ Recording\" button on the Session record\n  page and layout): opens the recording\
+    \ and logs the access to\n  Zoom_Recording_Access_Log__c.\n- Candidate_Training_Dropped_Cascade\
+    \ (flow on Candidate_Training__c): when a\n  training is dropped, updates the\
+    \ training's open sessions along with steps\n  and deliverables."
+- title: Session__c — Automation (4)
+  keywords:
+  - session
+  - runs
+  text: "APEX WRITERS OUTSIDE FLOWS:\n- CandidatePortalController.bookSessionWindow\
+    \ (candidate portal): creates the\n  per-step \"master\" sessions for the first\
+    \ candidate who books a cohort slot\n  (Status \"Unscheduled\", Purpose \"Training\"\
+    , host = window trainer).\n- AdminSessionAssignmentController (admin \"Book\
+    \ Session Slot\" quick action):\n  same booking path run internally on behalf\
+    \ of a candidate.\n- DashboardService (candidate portal): read-only - assembles\
+    \ the portal's\n  Sessions tab from the candidate's own sessions plus attendee\
+    \ sessions."
+- title: Session_Window__c — What This Object Is
+  keywords:
+  - session
+  - window
+  text: 'Session_Window__c is a RECURRING DAILY TIME-SLOT TEMPLATE for a training
+
+    program - think "the 10:00-11:00 AM ET batch of Program version X". It
+
+    defines a start/end time-of-day that repeats every day of the program, plus
+
+    a capacity, and represents one bookable cohort slot in the candidate portal.
+
+    Candidates (or admins on their behalf) book a training INTO a window; the
+
+    booking assigns the training to the window''s Cohort, timestamps every
+
+    training step at the window''s daily time, and counts the seat against the
+
+    window''s capacity. The window itself is a template - the concrete meetings
+    it
+
+    produces are Session__c records.'
+- title: Session_Window__c — Kind Of Object
+  keywords:
+  - session
+  - window
+  text: "- Custom object in the Training/LMS layer.\n- MASTER-DETAIL CHILD OF Program_Version__c:\
+    \ every window belongs to one\n  program version, and sharing is \"Controlled\
+    \ By Parent\". No owner of its\n  own.\n- 13 custom fields, 0 record types,\
+    \ 0 validation rules, 0 list views.\n- Auto-number Name in the format SW-XXXX.\n\
+    - Scale: only 2 records in preprod (created 2026-08-03 to 2026-08-06), both\n\
+    \  with capacity 5 and one seat booked."
+- title: Session_Window__c — How It Is Used — The Business Process
+  keywords:
+  - session
+  - window
+  text: "STEP 1 - CREATION. An admin creates windows for a cohort/program version\
+    \ via\n  the sessionWindowCreator LWC (a \"New Session Window\" quick action\
+    \ is\n  defined for it, and the component can also sit on app/home/record pages\
+    \ -\n  the quick action is not currently placed on any page). The component\
+    \ uses\n  a native record form; SessionWindowCreationController supplies helpers:\n\
+    \  the program version's standard session duration (to pre-compute the end\n\
+    \  time), the cohort's start date, the next Sequence number, and whether the\n\
+    \  cohort already has a window. There is also an invocable Apex utility,\n \
+    \ SessionWindowService.createFromJson, which bulk-inserts windows from a\n \
+    \ JSON payload under a program version - its comments say it is called from\n\
+    \  the Program_Creation flow, but no flow currently references it (dormant).\n\
+    \nSTEP 2 - GUARD RULE. On create, the Session_Window_Enforce_Unique_Cohort\n\
+    \  flow (before save) blocks a second window for the same Cohort with a\n  custom\
+    \ error - one cohort = one time-slot template.\n\nSTEP 3 - PORTAL EXPOSURE.\
+    \ The candidate portal (CandidatePortalController)\n  lists a program version's\
+    \ windows as bookable slots when Status__c =\n  \"Upcoming\" and Activate_From__c\
+    \ is today or earlier (or blank), showing\n  the slot times converted into the\
+    \ candidate's timezone, the capacity, and\n  seats remaining (Candidate_Capacity__c\
+    \ minus Booked_Count__c)."
+- title: Session_Window__c — How It Is Used — The Business Process (2)
+  keywords:
+  - session
+  - window
+  text: "STEP 4 - BOOKING. When a candidate books a slot (bookSessionWindow) the\
+    \ code\n  locks the window row, rejects the booking if full, then: assigns the\n\
+    \  training to the window's Cohort, stamps Start_Date, converts the window's\n\
+    \  daily times into the candidate's timezone onto the training, timestamps\n\
+    \  every training step on consecutive business days at the window's time,\n\
+    \  creates the Session records (first booker) or Session_Attendee rows\n  (later\
+    \ bookers), and increments Booked_Count__c by one. The admin-side\n  AdminSessionAssignmentController\
+    \ does the identical booking without the\n  Upcoming/Activate-From/capacity\
+    \ filters (but still enforces matching\n  program version and not-already-booked\
+    \ training)."
+- title: Session_Window__c — Connected Objects
+  keywords:
+  - session
+  - window
+  - each
+  - relationship
+  - means
+  text: "PARENT:\n- Program_Version__c (via Program_Version__c, MASTER-DETAIL, required):\
+    \ the\n  program version this window schedules. Sharing and deletion cascade\
+    \ from\n  it. The portal only offers windows of the training's own program version.\n\
+    \nLOOKUPS:\n- Cohort__c (Cohort__c): the cohort (batch) this window is the time\
+    \ slot\n  for. Booking a training into the window assigns the training to this\n\
+    \  cohort. Only ONE window per cohort is allowed (flow guard). 2/2 populated.\n\
+    - Recruiter__c (Trainer__c): the trainer who will host the sessions the\n  window\
+    \ generates - copied onto each Session as Host_User__c at booking\n  time. 2/2\
+    \ populated. (The object description notes the trainer is\n  conceptually assigned\
+    \ per-session, not on the template - but in practice\n  the field is filled\
+    \ and used as the default host.)\n\nNO CHILD OBJECTS point at Session_Window__c\
+    \ - the window leaves its trace\nthrough the Cohort assignment and the Sessions\
+    \ it spawns, not a direct link."
+- title: Session_Window__c — Business Rules
+  keywords:
+  - session
+  - window
+  - validation
+  text: 'None on the object itself. The one-window-per-cohort rule is enforced by
+    the
+
+    Session_Window_Enforce_Unique_Cohort flow (a before-save custom error), and
+
+    capacity/status checks are enforced in the booking Apex, not by validation
+
+    rules.'
+- title: Session_Window__c — Automation
+  keywords:
+  - session
+  - window
+  - runs
+  text: "RECORD-TRIGGERED FLOW (active):\n- Session_Window_Enforce_Unique_Cohort\
+    \ (before save, create): if another\n  window already exists for the same Cohort,\
+    \ blocks the save with a custom\n  error. The only flow touching this object.\n\
+    \nAPEX:\n- SessionWindowCreationController: read-only helpers for the\n  sessionWindowCreator\
+    \ LWC (program-version duration, cohort start date,\n  next sequence, has-window\
+    \ check). Record creation itself is done by the\n  LWC's native record form.\n\
+    - SessionWindowService.createFromJson (invocable): bulk-creates windows\n  under\
+    \ a program version from a JSON payload emitted by a builder LWC.\n  Currently\
+    \ NOT referenced by any flow - dormant utility.\n- CandidatePortalController:\
+    \ reads windows for the portal slot list\n  (Status = Upcoming, Activate_From\
+    \ reached, capacity left) and increments\n  Booked_Count__c on booking.\n- AdminSessionAssignmentController\
+    \ (\"Book Session Slot\" quick action on\n  Candidate Training): the admin-side\
+    \ booking; also increments\n  Booked_Count__c.\n\nQUICK ACTION:\n- New_Session_Window\
+    \ (LightningWebComponent action -> sessionWindowCreator):\n  defined but not\
+    \ placed on any page or layout at this snapshot."
+- title: Session_Attendee__c — What This Object Is
+  keywords:
+  - session
+  - attendee
+  text: 'Session_Attendee__c is the JUNCTION that lets several candidates share
+    one
+
+    group training session. When the FIRST candidate of a cohort books a
+
+    Session_Window slot, real Session__c records are created for their training
+
+    steps (those sessions own the Zoom meeting). When a SECOND or later candidate
+
+    books the same cohort, no new meetings are created - instead one
+
+    Session_Attendee__c row per training step links that candidate''s training/
+
+    step to the existing "master" session. The row is how the extra candidate''s
+
+    portal surfaces the shared meeting (topic, link, date, times) and how the
+
+    system knows to complete THEIR steps and activate THEIR deliverables when
+
+    the shared session finishes. Almost every non-lookup field is a formula
+
+    mirroring either the master session or the candidate''s own training times.'
+- title: Session_Attendee__c — Kind Of Object
+  keywords:
+  - session
+  - attendee
+  text: "- Custom object in the Training/LMS layer.\n- MASTER-DETAIL CHILD OF Session__c:\
+    \ an attendee row cannot exist without\n  its session; sharing is \"Controlled\
+    \ By Parent\" and deleting the session\n  deletes its attendee rows. No owner\
+    \ of its own.\n- 11 custom fields (4 lookups incl. the master-detail + 7 formulas),\n\
+    \  0 record types, 0 validation rules, 0 list views.\n- Auto-number Name in\
+    \ the format SA-XXXX.\n- Scale: 0 records in preprod - the object is deployed\
+    \ and fully wired into\n  code, but no second candidate has booked a shared\
+    \ cohort slot yet."
+- title: Session_Attendee__c — How It Is Used — The Business Process
+  keywords:
+  - session
+  - attendee
+  text: "STEP 1 - CREATION (CODE ONLY, NEVER MANUAL). Two Apex paths create rows,\n\
+    \  both inside the Session Window booking logic:\n  - CandidatePortalController.bookSessionWindow:\
+    \ after the capacity check,\n    if the cohort already has master sessions,\
+    \ the code matches the new\n    candidate's training steps to the master sessions\
+    \ BY STEP SEQUENCE\n    NUMBER and inserts one attendee row per matched step\
+    \ (session +\n    candidate + training + step).\n  - AdminSessionAssignmentController:\
+    \ the internal \"Book Session Slot\"\n    action performs the same match-and-insert\
+    \ on behalf of a candidate.\n\nSTEP 2 - PORTAL DISPLAY. The candidate portal's\
+    \ dashboard/Sessions tab\n  (DashboardService.queryLiveSessions) collects the\
+    \ candidate's attendee\n  rows, pulls in the linked master sessions alongside\
+    \ the candidate's own\n  sessions, and re-points each shared session at THIS\
+    \ candidate's training\n  and step so the portal shows it as theirs - with the\
+    \ shared meeting link,\n  topic and times coming through the formula fields."
+- title: Session_Attendee__c — How It Is Used — The Business Process (2)
+  keywords:
+  - session
+  - attendee
+  text: "STEP 3 - COMPLETION FAN-OUT. When the master session is marked Completed,\n\
+    \  the flow on Session__c only activates deliverables for the first (owner)\n\
+    \  candidate's step. The Apex SessionCompletionAttendeeTrigger then reads all\n\
+    \  Session_Attendee__c rows of the completed session and activates each\n  attendee's\
+    \ own \"Not Active\" deliverables, so every candidate in the group\n  progresses,\
+    \ not just the first booker."
+- title: Session_Attendee__c — Connected Objects
+  keywords:
+  - session
+  - attendee
+  - each
+  - relationship
+  - means
+  text: "PARENT:\n- Session__c (via Session__c, MASTER-DETAIL, relationship \"Attendees\"\
+    ): the\n  shared master session being attended. Sharing/deletion cascade from\
+    \ it;\n  five of the formula fields read through this relationship.\n\nLOOKUPS:\n\
+    - Account (Candidate__c, required): the attending candidate (Person\n  Account)\
+    \ - the extra participant, not the session's own candidate.\n- Candidate_Training__c\
+    \ (Candidate_Training__c, required): the attending\n  candidate's OWN training\
+    \ enrollment - so their progress is tracked on\n  their record even though the\
+    \ meeting belongs to another training.\n- CandidateTrainingStep__c (Candidate_Training_Step__c,\
+    \ required): the\n  attending candidate's OWN step that this shared session\
+    \ fulfills - the\n  step whose deliverables are activated when the session completes.\n\
+    \nNOTHING points at Session_Attendee__c - it is a pure leaf junction."
+- title: Session_Attendee__c — Business Rules
+  keywords:
+  - session
+  - attendee
+  - validation
+  text: 'None. Integrity is guaranteed by the creating Apex (all three lookups are
+
+    required at the field level and are always set together by code).'
+- title: Session_Attendee__c — Automation
+  keywords:
+  - session
+  - attendee
+  - runs
+  text: "No flows, no triggers, and no quick actions run ON this object. It is purely\n\
+    written and read by Apex:\n- WRITERS: CandidatePortalController.createOrAttachSessions\
+    \ (portal booking)\n  and AdminSessionAssignmentController (admin booking) -\
+    \ insert only.\n- READERS: SessionCompletionAttendeeTrigger (on Session__c -\
+    \ fans session\n  completion out to attendee deliverables) and DashboardService\
+    \ (builds the\n  candidate portal's session list from attendee rows)."
+- title: Pre_Enrolment_Request__c — What This Object Is
+  keywords:
+  - pre
+  - enrolment
+  - request
+  text: 'Pre_Enrolment_Request__c tracks ONE "pre-enrolment form" sent to a prospective
+
+    candidate (a Lead) BEFORE they are enrolled into Techsara''s training program.
+
+    It is the intake questionnaire of the training funnel: an employee clicks a
+
+    button on the Lead, the system generates a secure single-use link and emails
+    it
+
+    to the candidate, and the candidate fills the form on a PUBLIC page of the
+
+    Techsara Candidate Hub Experience site - no login needed. The record is both
+
+    the delivery envelope (token, link, sent/opened/submitted timestamps, expiry)
+
+    and the container for everything the candidate typed: name, contact numbers,
+
+    home address, visa status, tech niche, relocation readiness, preferred
+
+    training time slot, position-type preferences, criminal-record declaration and
+
+    acknowledgement. When the form is submitted, a flow copies all the answers
+
+    onto the Lead, so the Lead record (and later the converted candidate Person
+
+    Account, via the Lead Conversion Flow) carries the same profile data. The
+
+    form''s education step also creates Education_History__c records for the lead
+
+    (see that object''s section).'
+- title: Pre_Enrolment_Request__c — Kind Of Object
+  keywords:
+  - pre
+  - enrolment
+  - request
+  text: "- Custom object, part of the training/enrolment intake domain.\n- Standalone\
+    \ object with LOOKUPS to Lead (the usual parent in practice - 97%\n  populated)\
+    \ and to Account (Candidate__c - intended post-conversion link;\n  NOTE: this\
+    \ field exists in the source metadata but is NOT yet deployed to\n  the preprod\
+    \ org, so it cannot be queried there).\n- Sharing model Public Read/Write internally,\
+    \ Private for external users.\n- 30 custom fields, 0 record types, 0 validation\
+    \ rules, 0 list views.\n- Auto-number Name in the format PRENR-XXXX.\n- Field\
+    \ history tracking is enabled; has its own Lightning record page\n  (Pre_Enrolment_Request_Record_Page).\n\
+    - Access is granted through the Sales, Sales User, Bench Marketing and\n  Customer\
+    \ Success permission sets; the public form itself runs as the guest\n  user\
+    \ in system mode.\n- Scale: 333 records in preprod (Apr 2026 - Aug 2026) - a\
+    \ recent feature."
+- title: Pre_Enrolment_Request__c — Record Types
+  keywords:
+  - pre
+  - enrolment
+  - request
+  text: 'None. Every pre-enrolment request is the same flavor; the Status__c picklist
+
+    carries the lifecycle instead.'
+- title: Pre_Enrolment_Request__c — How It Is Used — The Business Process
+  keywords:
+  - pre
+  - enrolment
+  - request
+  text: "STEP 1 - SEND. On a Lead record page, an employee clicks the \"Send Pre\n\
+    \  Enrolment Request\" quick action (present on the Lead record page and on\
+    \ the\n  B2B Website Candidate / Lead layouts). This launches the screen flow\n\
+    \  send_pre_enrollment_form, which:\n  - refuses to run if the Lead has no email\
+    \ (error screen);\n  - EXPIRES any still-active request for the same Lead (status\
+    \ Draft, Sent or\n    Opened is flipped to Expired) so only one link is live\
+    \ per lead;\n  - calls the Apex action CreateToken (invocable \"Generate Pre\
+    \ Enrollment\n    Token\") to mint a 12-character single-use token: 6 hex chars\
+    \ of an\n    HMAC-SHA256 signature (secret from the Token_Secret__mdt custom\
+    \ metadata\n    row \"Pre_Enrollment_Flow_Secret\") + 6 random hex chars;\n\
+    \  - creates the Pre_Enrolment_Request__c record with Status \"Sent\", the\n\
+    \    token, a 2-day expiry (NOW() + 2), Sent_On, the lead link, and name/email\n\
+    \    snapshots taken from the Lead at that moment;\n  - builds the public link\
+    \ from the Candidate_Hub_URL custom label +\n    \"/s/pre-enrolment-form?flowtoken=<token>\"\
+    \ and emails it to the candidate\n    from noreply@techsarasolutions.com using\
+    \ an email template."
+- title: Pre_Enrolment_Request__c — How It Is Used — The Business Process (2)
+  keywords:
+  - pre
+  - enrolment
+  - request
+  text: "STEP 2 - CANDIDATE OPENS THE LINK. The link lands on the public\n  \"pre-enrolment-form\"\
+    \ page of the Techsara Candidate Hub Experience site,\n  which runs the screen\
+    \ flow Guest_Pre_Enrolment (\"Lead : Guest\n  Pre-Enrolment\") as the site guest\
+    \ user in system mode without sharing. The\n  flow looks the request up BY TOKEN,\
+    \ stamps Opened_On, then validates:\n  - no matching token          -> \"Invalid\"\
+    \ page;\n  - Expiration_Datetime passed -> \"Expired link\" page;\n  - Status\
+    \ already Opened, Submitted, Expired or Cancelled -> \"Link used\"\n    page.\
+    \ The link is genuinely SINGLE-USE: even a candidate who opened the\n    form\
+    \ once without submitting cannot open it again - staff must send a\n    fresh\
+    \ form (which is why 27 records sit at \"Opened\" forever).\n  - otherwise Status\
+    \ flips Sent -> Opened and the form is shown."
+- title: Pre_Enrolment_Request__c — How It Is Used — The Business Process (3)
+  keywords:
+  - pre
+  - enrolment
+  - request
+  text: "STEP 3 - CANDIDATE FILLS AND SUBMITS. The form collects personal details\n\
+    \  (first/middle/last name, calling + WhatsApp numbers, email, home address),\n\
+    \  profile preferences (niche, visa status, relocation readiness, preferred\n\
+    \  EST training slot, position types), the criminal-record declaration and the\n\
+    \  acknowledgement checkbox. An education step then loops \"Add another?\" to\n\
+    \  capture one or more education entries (degree type, institute country,\n\
+    \  institute, course, dates, CGPA) which are inserted as Education_History__c\n\
+    \  records linked to the same Lead. On submit the flow writes all answers back\n\
+    \  to this request, sets Status \"Submitted\", stamps Submitted_On and shows\
+    \ a\n  thank-you page. KNOWN GAP: the form shows an \"Additional Comments\"\
+    \ box but\n  the flow never saves it to Additional_Comments_or_Questions__c\
+    \ - whatever\n  the candidate types there is discarded."
+- title: Pre_Enrolment_Request__c — How It Is Used — The Business Process (4)
+  keywords:
+  - pre
+  - enrolment
+  - request
+  text: "STEP 4 - SYNC TO LEAD. The record-triggered flow Pre_Enrolment_Requests\
+    \ fires\n  when Status becomes \"Submitted\" and copies everything onto the\
+    \ parent Lead:\n  standard fields (First/Last Name, Email, Phone, street/city/state/postal/\n\
+    \  country) and the Lead's mirror custom fields (Niche, Niche Other, Visa\n\
+    \  Status, Relocation Readiness/Other, Training Schedule, WhatsApp number,\n\
+    \  Criminal Record Declaration, Position Type checkboxes, Additional\n  Comments),\
+    \ plus the Lead's \"Latest Pre Enrolment\" tracking fields (Status,\n  Form\
+    \ Link, Sent/Opened/Submitted On) and Lead.Pre_Enrolment_Request__c\n  pointing\
+    \ back at this record. From then on the Lead is the working copy.\n\nSTEP 5\
+    \ - LEAD CONVERSION. When the Lead is converted via Lead_Conversion_Flow,\n\
+    \  the flow fetches this request (\"Pre Enrollment data Fetch\") to show the\n\
+    \  profile information during conversion, carries the same answers onto the\n\
+    \  new candidate Person Account, and re-parents the lead's\n  Education_History__c\
+    \ records to the new Account. The request's own\n  Candidate__c field is INTENDED\
+    \ to hold that converted candidate (per its\n  field description) but no active\
+    \ automation sets it and the field is not\n  yet deployed to preprod - verify\
+    \ with team."
+- title: Pre_Enrolment_Request__c — Connected Objects
+  keywords:
+  - pre
+  - enrolment
+  - request
+  - each
+  - relationship
+  - means
+  text: "LOOKUPS FROM THIS OBJECT:\n- Lead (Lead__c): the prospective candidate\
+    \ this form was sent to - the real\n  parent in practice (324 of 333 records).\
+    \ Created by the send flow from the\n  Lead the button was clicked on.\n- Account\
+    \ (Candidate__c): the candidate Person Account after lead conversion\n  (field\
+    \ description: \"Linked candidate record after lead conversion\").\n  Exists\
+    \ in source metadata only - NOT deployed to preprod yet, and no flow\n  currently\
+    \ populates it.\n\nOBJECTS THAT POINT AT THIS OBJECT:\n- Lead (Lead.Pre_Enrolment_Request__c):\
+    \ reverse pointer stamped by the\n  Pre_Enrolment_Requests flow on submission\
+    \ - \"the latest submitted form for\n  this lead\" (163 leads carry it; fewer\
+    \ than the 204 submitted forms because\n  some leads submitted more than once\
+    \ and the pointer keeps the latest).\n\nRELATED BY PROCESS (no direct field\
+    \ on this object):\n- Education_History__c: the guest form's education step\
+    \ creates these against\n  the same Lead; they travel to the Account at conversion.\n\
+    - Lead \"Latest Pre Enrolment\" fields (Latest_Pre_Enrolment_Status__c /\n \
+    \ _Form_Link__c / _Sent_On__c / _Opened_On__c / _Submitted_On__c): mirror of\n\
+    \  this record's lifecycle on the Lead for list views and reports.\n- Token_Secret__mdt:\
+    \ custom metadata holding the HMAC secret used to mint\n  Public_Token__c (row\
+    \ \"Pre_Enrollment_Flow_Secret\")."
+- title: Pre_Enrolment_Request__c — Business Rules
+  keywords:
+  - pre
+  - enrolment
+  - request
+  - validation
+  text: 'None. Integrity is enforced by the flows instead (email required before
+
+    sending, token validation, single-active-request-per-lead, link expiry).'
+- title: Pre_Enrolment_Request__c — Automation
+  keywords:
+  - pre
+  - enrolment
+  - request
+  - runs
+  text: "RECORD-TRIGGERED FLOW (active):\n- Pre_Enrolment_Requests (after save,\
+    \ update, when Status__c becomes\n  \"Submitted\"): copies all form answers\
+    \ to the parent Lead (standard fields +\n  the Lead's mirror custom fields +\
+    \ the Latest Pre Enrolment tracking fields)\n  and stamps Lead.Pre_Enrolment_Request__c\
+    \ with this record's Id.\n\nSCREEN FLOWS:\n- send_pre_enrollment_form (launched\
+    \ by the \"Send Pre Enrolment Request\"\n  quick action on Lead): expires older\
+    \ active requests, CREATES this record\n  (Status \"Sent\", token, 2-day expiry,\
+    \ snapshots, public link) and emails the\n  link to the candidate. Calls the\
+    \ Apex invocable CreateToken.\n- Guest_Pre_Enrolment (\"Lead : Guest Pre-Enrolment\"\
+    , public, system mode\n  without sharing, hosted on the Techsara Candidate Hub\
+    \ site page\n  /pre-enrolment-form): validates the token, flips Status Sent\
+    \ -> Opened ->\n  Submitted, stamps Opened_On / Submitted_On, saves the candidate's\
+    \ answers\n  onto this record and creates the Education_History__c records.\n\
+    \nAPEX:\n- CreateToken.cls (invocable, called from the send flow): generates\
+    \ the\n  12-char tamper-evident public token from Token_Secret__mdt + a random\
+    \ AES\n  key. No trigger exists on this object."
+- title: Pre_Enrolment_Request__c — Automation (2)
+  keywords:
+  - pre
+  - enrolment
+  - request
+  - runs
+  text: "QUICK ACTIONS / BUTTONS:\n- Lead.Send_Pre_Enrolment_Request (\"Send Pre\
+    \ Enrolment Request\") - the only\n  button; lives on the Lead record page (Lead_Record_Page_Three_Column)\
+    \ and\n  three Lead layouts, launches send_pre_enrollment_form.\n\nNOTHING marks\
+    \ links Expired on a schedule: \"Expired\" is set either by the\nsend flow superseding\
+    \ an old request, or the guest flow simply refuses entry\nafter Expiration_Datetime\
+    \ - the stored status can stay \"Sent\"/\"Opened\" until\na new form is sent.\
+    \ \"Cancelled\" has no automation; it is set manually."
+- title: Education_History__c — What This Object Is
+  keywords:
+  - education
+  - history
+  text: 'Education_History__c records ONE education entry of a candidate - one degree
+
+    at one institute (e.g. "Master''s, ABC University, USA, 2023-2025, CGPA 3.6").
+
+    A candidate with a bachelor''s from India and a master''s from the USA has two
+
+    records. The records are captured from the candidate themselves on the public
+
+    pre-enrolment form (see Pre_Enrolment_Request__c): the form''s education step
+
+    loops "Add another?" so the candidate can enter any number of entries, each
+
+    picking a degree type, institute country, institute and course from curated
+
+    master lists plus dates and CGPA. The data exists to (a) profile the
+
+    candidate for training/marketing and (b) feed onboarding and background
+
+    verification later - the Onboarding__c object points back at these records to
+
+    say which institute is being verified.'
+- title: Education_History__c — Kind Of Object
+  keywords:
+  - education
+  - history
+  text: "- Custom object, part of the candidate-profile / onboarding domain.\n-\
+    \ Standalone object (no master-detail); lookups to Lead, Account (candidate),\n\
+    \  Institute__c, Course__c and Onboarding__c. Records start life attached to\
+    \ a\n  Lead and are re-parented to the candidate Person Account at conversion.\n\
+    - Sharing model Public Read/Write internally, Private for external users.\n\
+    - 12 custom fields, 0 record types, 0 validation rules, 0 list views.\n- Auto-number\
+    \ Name in the format EDU-XXXX.\n- Field history tracking enabled; two Lightning\
+    \ record pages exist\n  (Education_History_Record_Page and Education_History_Record_Page5\
+    \ - the\n  \"5\" version is the active view override).\n- Access via the Sales,\
+    \ Bench Marketing and Customer Success permission sets;\n  the guest form writes\
+    \ records in system mode.\n- Scale: 0 records in preprod as of this snapshot\
+    \ (see part 9)."
+- title: Education_History__c — Record Types
+  keywords:
+  - education
+  - history
+  text: 'None. All education entries are the same shape; Degree_Type__c distinguishes
+
+    the level of study.'
+- title: Education_History__c — How It Is Used — The Business Process
+  keywords:
+  - education
+  - history
+  text: "STEP 1 - CREATION FROM THE PRE-ENROLMENT FORM. On the public Guest_Pre_\n\
+    \  Enrolment screen flow (Techsara Candidate Hub site, guest user, system\n\
+    \  mode), after the personal-details page the candidate reaches \"Enter\n  Education\
+    \ Details\". For each entry they pick Degree Type and Institute\n  Country;\
+    \ the flow then offers only ACTIVE Institute__c records of that\n  country and\
+    \ ACTIVE Course__c records; the candidate adds start/end dates\n  and CGPA/score.\
+    \ An \"Add Another?\" decision loops back for more entries.\n  On final submit\
+    \ the flow bulk-creates all entries with Lead__c set to the\n  lead behind the\
+    \ pre-enrolment request. The candidate never logs in - this\n  is the same tokenized\
+    \ single-use link as the pre-enrolment form.\n\nSTEP 2 - RE-PARENTING AT LEAD\
+    \ CONVERSION. When the lead becomes a candidate,\n  Lead_Conversion_Flow's \"\
+    Update Education History\" element finds every\n  Education_History__c with\
+    \ Lead__c = the converting lead and stamps\n  Candidate__c with the new Person\
+    \ Account Id. From then on the education\n  records hang off the candidate and\
+    \ appear on the candidate's record page\n  related lists."
+- title: Education_History__c — How It Is Used — The Business Process (2)
+  keywords:
+  - education
+  - history
+  text: "STEP 3 - ONBOARDING / BACKGROUND VERIFICATION. The onboarding intake flow\n\
+    \  (Onboarding_Candidate_Intake_1, the candidate-facing onboarding form) looks\n\
+    \  up the candidate's existing education records, and the Onboarding__c object\n\
+    \  carries two lookups BACK to this object - Institute__c (\"Onboardings\n \
+    \ (Institute)\") and Institute_Country__c - so an onboarding record can point\n\
+    \  at the specific education entry whose institute is being used/verified\n\
+    \  (e.g. for the background check / I-20 / degree verification). In preprod\n\
+    \  data neither lookup is populated yet (0 of 771 onboardings) - the wiring\n\
+    \  exists but is not yet in live use."
+- title: Education_History__c — Connected Objects
+  keywords:
+  - education
+  - history
+  - each
+  - relationship
+  - means
+  text: "LOOKUPS FROM THIS OBJECT:\n- Lead (Lead__c): the pre-conversion prospect\
+    \ who submitted the education\n  entry on the public form. Set at creation by\
+    \ the guest flow.\n- Account (Candidate__c): the candidate Person Account -\
+    \ stamped by\n  Lead_Conversion_Flow at conversion (re-parenting from Lead to\
+    \ Account).\n- Institute__c (Institute__c): which school/university, from the\
+    \ org's\n  curated institute master list (institutes carry a Country and an\
+    \ Active\n  flag; the form only offers active ones matching the chosen country).\n\
+    - Course__c (Course__c): the course/program studied, chosen from the org's\n\
+    \  Course__c master list (only Active__c = true courses are offered). NOTE:\n\
+    \  Course__c is the same object the training/LMS layer uses for Techsara's\n\
+    \  own courses - it does double duty as the education-course master here.\n\
+    - Onboarding__c (Onboarding__c): optional link tying this education entry to\n\
+    \  a specific onboarding case. No active flow populates it (the onboarding\n\
+    \  intake only reads education records) - manual/future use, verify with\n \
+    \ team."
+- title: Education_History__c — Connected Objects (2)
+  keywords:
+  - education
+  - history
+  - each
+  - relationship
+  - means
+  text: "OBJECTS THAT POINT AT THIS OBJECT:\n- Onboarding__c.Institute__c (lookup,\
+    \ relationship \"Onboardings (Institute)\"):\n  the onboarding's chosen institute-of-record\
+    \ - points at ONE education\n  entry, not at Institute__c directly.\n- Onboarding__c.Institute_Country__c\
+    \ (lookup, relationship \"Onboardings\"):\n  second onboarding pointer, named\
+    \ after the country but actually a lookup\n  to an education entry. Both are\
+    \ 0% populated in preprod so far."
+- title: Education_History__c — Business Rules
+  keywords:
+  - education
+  - history
+  - validation
+  text: 'None. Data quality relies on the guest form''s required inputs and its
+
+    filtered picklists (active institutes of the chosen country, active courses).'
+- title: Education_History__c — Automation
+  keywords:
+  - education
+  - history
+  - runs
+  text: "No record-triggered flows, no Apex triggers, no quick actions and no\n\
+    scheduled jobs run ON this object. It is written by two screen flows that\n\
+    belong to other processes:\n- Guest_Pre_Enrolment (public pre-enrolment form):\
+    \ CREATES the records - one\n  per education entry the candidate adds - with\
+    \ Lead__c, Degree_Type__c,\n  Institute_Country__c, Institute__c, Course__c,\
+    \ Start/End dates and CGPA.\n- Lead_Conversion_Flow (the Lead \"Convert\" path):\
+    \ UPDATES Candidate__c on all\n  of a lead's education records when the lead\
+    \ is converted.\n- Onboarding_Candidate_Intake_1 (candidate onboarding form):\
+    \ READS the\n  candidate's education records (lookup only; creates/updates nothing\
+    \ here)."

@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ValidationRule xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>B2B_Interview_Needs_Submission</fullName>
+    <active>true</active>
+    <description>Job Submission and Job Requirement are required for B2B Requirement interviews.</description>
+    <errorConditionFormula>ISPICKVAL(Interview_Source__c,&apos;B2B Requirement&apos;) &amp;&amp; (ISBLANK(Job_Submission__c) || ISBLANK(Job_Requirement__c))</errorConditionFormula>
+    <errorDisplayField>Interview_Source__c</errorDisplayField>
+    <errorMessage>Job Submission and Job Requirement are required for B2B Requirement interviews.</errorMessage>
+</ValidationRule>

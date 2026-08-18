@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Interview_Source__c</fullName>
+    <description>Identifies how this interview was generated. B2B Requirement = from job submission flow. Used to separate B2B interviews from other candidate marketing interviews.</description>
+    <inlineHelpText>Auto-set to B2B Requirement when created via Create Interview flow. Allows filtering B2B interviews from other interview types in reports.</inlineHelpText>
+    <label>Interview Source</label>
+    <required>false</required>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Picklist</type>
+    <valueSet>
+        <restricted>true</restricted>
+        <valueSetDefinition>
+            <sorted>false</sorted>
+            <value>
+                <fullName>B2B Requirement</fullName>
+                <default>false</default>
+                <label>B2B Requirement</label>
+            </value>
+            <value>
+                <fullName>Candidate Marketing</fullName>
+                <default>false</default>
+                <label>Candidate Marketing</label>
+            </value>
+            <value>
+                <fullName>Other</fullName>
+                <default>false</default>
+                <label>Other</label>
+            </value>
+        </valueSetDefinition>
+    </valueSet>
+</CustomField>

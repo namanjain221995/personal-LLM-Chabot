@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Outstanding_Cycles__c</fullName>
+    <externalId>false</externalId>
+    <formula>IF(
+    ISBLANK(Number_of_Months__c),
+    null,
+    Number_of_Months__c - Total_Cycles_Completed__c
+)</formula>
+    <label>Outstanding Cycles</label>
+    <precision>18</precision>
+    <required>false</required>
+    <scale>0</scale>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Number</type>
+    <unique>false</unique>
+</CustomField>

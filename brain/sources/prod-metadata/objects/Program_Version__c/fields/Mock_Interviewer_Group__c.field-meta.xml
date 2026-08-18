@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Mock_Interviewer_Group__c</fullName>
+    <description>DeveloperName (API name) of the Salesforce Public Group whose members can conduct mock interviews for this program. Populated via a dropdown in the Program Creation flow (queries all Regular Public Groups at runtime). If blank, the portal falls back to a default group name. Enables different programs to use different interviewer pools -- e.g. AI_ML_Mock_Interviewers, Resume_Mock_Interviewers.</description>
+    <externalId>false</externalId>
+    <label>Mock Interviewer Public Group</label>
+    <length>80</length>
+    <required>false</required>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Text</type>
+    <unique>false</unique>
+</CustomField>

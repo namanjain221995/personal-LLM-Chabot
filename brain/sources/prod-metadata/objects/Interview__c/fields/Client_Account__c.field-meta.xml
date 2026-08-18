@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Client_Account__c</fullName>
+    <deleteConstraint>SetNull</deleteConstraint>
+    <description>Links this interview to the client company. Auto-filled from Job Requirement Client Account when created via Create Interview flow.</description>
+    <inlineHelpText>Auto-populated from Job Requirement when using Create Interview flow. Shows which client company is interviewing this candidate.</inlineHelpText>
+    <label>Client Account</label>
+    <referenceTo>Account</referenceTo>
+    <relationshipLabel>Interviews (Client Account)</relationshipLabel>
+    <relationshipName>B2B_Interviews</relationshipName>
+    <required>false</required>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Lookup</type>
+</CustomField>

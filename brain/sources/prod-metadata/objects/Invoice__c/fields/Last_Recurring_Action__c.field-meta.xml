@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Last_Recurring_Action__c</fullName>
+    <description>The most recent action performed on this recurring plan via the Manage Recurring Plan flow (e.g. Change Amount, Pause, Resume). Used to trigger the recurring-plan change Slack notification.</description>
+    <externalId>false</externalId>
+    <label>Last Recurring Action</label>
+    <length>100</length>
+    <required>false</required>
+    <trackFeedHistory>false</trackFeedHistory>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Text</type>
+    <unique>false</unique>
+</CustomField>

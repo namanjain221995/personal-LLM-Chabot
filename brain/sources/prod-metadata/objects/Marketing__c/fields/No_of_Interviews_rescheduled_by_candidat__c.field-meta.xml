@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>No_of_Interviews_rescheduled_by_candidat__c</fullName>
+    <externalId>false</externalId>
+    <inlineHelpText>Number of Interviews Rescheduled after 10/04/2025</inlineHelpText>
+    <label>No of Interviews rescheduled by candidat</label>
+    <precision>18</precision>
+    <required>false</required>
+    <scale>0</scale>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Number</type>
+    <unique>false</unique>
+</CustomField>

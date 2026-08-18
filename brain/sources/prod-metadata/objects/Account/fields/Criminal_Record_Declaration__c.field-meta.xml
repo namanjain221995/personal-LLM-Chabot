@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Criminal_Record_Declaration__c</fullName>
+    <label>Criminal Record Declaration</label>
+    <required>false</required>
+    <trackFeedHistory>false</trackFeedHistory>
+    <trackHistory>false</trackHistory>
+    <type>Picklist</type>
+    <valueSet>
+        <restricted>true</restricted>
+        <valueSetDefinition>
+            <sorted>false</sorted>
+            <value>
+                <fullName>I do NOT have any criminal record</fullName>
+                <default>false</default>
+                <label>I do NOT have any criminal record</label>
+            </value>
+            <value>
+                <fullName>I have a criminal record</fullName>
+                <default>false</default>
+                <label>I have a criminal record</label>
+            </value>
+        </valueSetDefinition>
+    </valueSet>
+</CustomField>

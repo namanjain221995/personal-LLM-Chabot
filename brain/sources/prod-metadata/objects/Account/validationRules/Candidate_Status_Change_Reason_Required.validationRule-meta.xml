@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ValidationRule xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Candidate_Status_Change_Reason_Required</fullName>
+    <active>true</active>
+    <description>Blocks save when Candidate Status changes to non-Active unless user types a genuinely changed reason of at least 50 chars. Active is exempt. Does not fire on new record creation.</description>
+    <errorConditionFormula>AND(
+  ISCHANGED( Candidate_Status__c ),
+  NOT( ISPICKVAL( Candidate_Status__c, &quot;Active&quot; ) ),
+  OR(
+    NOT( ISCHANGED( Candidate_Status_Change_Reason__c ) ),
+    LEN( TRIM( Candidate_Status_Change_Reason__c ) ) &lt; 50
+  )
+)</errorConditionFormula>
+    <errorDisplayField>Candidate_Status_Change_Reason__c</errorDisplayField>
+    <errorMessage>Please enter a status change reason of at least 50 characters.</errorMessage>
+</ValidationRule>

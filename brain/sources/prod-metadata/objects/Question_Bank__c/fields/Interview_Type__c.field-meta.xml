@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Interview_Type__c</fullName>
+    <deleteConstraint>SetNull</deleteConstraint>
+    <description>DEPRECATED 2026-05-17. Interview type context comes from the linked Section. No longer used by any flow. Do not use.</description>
+    <inlineHelpText>DEPRECATED - do not use.</inlineHelpText>
+    <label>Interview Type (DEPRECATED - do not use)</label>
+    <referenceTo>Interview_Type__c</referenceTo>
+    <relationshipLabel>Question Banks</relationshipLabel>
+    <relationshipName>Question_Banks</relationshipName>
+    <required>false</required>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Lookup</type>
+</CustomField>

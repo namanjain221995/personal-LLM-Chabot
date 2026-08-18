@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Preferred_Locations__c</fullName>
+    <description>Cities or states where candidate prefers to work for onsite or hybrid roles. Used for matching with location-specific job requirements.</description>
+    <inlineHelpText>Enter preferred work locations separated by commas. Example: New Jersey, New York, Texas or Remote Only or Open to Relocation.</inlineHelpText>
+    <label>Preferred Locations</label>
+    <required>false</required>
+    <trackFeedHistory>false</trackFeedHistory>
+    <trackHistory>false</trackHistory>
+    <type>TextArea</type>
+</CustomField>

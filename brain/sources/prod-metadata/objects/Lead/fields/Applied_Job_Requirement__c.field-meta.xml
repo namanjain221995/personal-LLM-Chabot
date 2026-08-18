@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Applied_Job_Requirement__c</fullName>
+    <deleteConstraint>SetNull</deleteConstraint>
+    <description>Links website applicant lead to the specific Job Requirement they applied for. Populated automatically via website External Job ID matching.</description>
+    <inlineHelpText>This field auto-populates when a candidate applies from the website. The system matches Website Job External ID to External Job ID on Job Requirement.</inlineHelpText>
+    <label>Applied Job Requirement</label>
+    <referenceTo>Job_Requirement__c</referenceTo>
+    <relationshipLabel>Leads</relationshipLabel>
+    <relationshipName>Leads</relationshipName>
+    <required>false</required>
+    <trackFeedHistory>false</trackFeedHistory>
+    <trackHistory>false</trackHistory>
+    <type>Lookup</type>
+</CustomField>

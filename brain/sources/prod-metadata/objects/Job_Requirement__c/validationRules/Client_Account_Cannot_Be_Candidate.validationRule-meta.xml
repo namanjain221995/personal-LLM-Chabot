@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ValidationRule xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Client_Account_Cannot_Be_Candidate</fullName>
+    <active>true</active>
+    <description>This validation rule ensures that the Client  Account selected on the Job Requirement must be a B2B Client or Vendor Business Account. Person Accounts linked to Candidates are not allowed.</description>
+    <errorConditionFormula>Client_Account__r.IsPersonAccount = true</errorConditionFormula>
+    <errorDisplayField>Client_Account__c</errorDisplayField>
+    <errorMessage>Client Account must be a B2B Client or Vendor Business Account, not a Candidate Person Account.</errorMessage>
+</ValidationRule>

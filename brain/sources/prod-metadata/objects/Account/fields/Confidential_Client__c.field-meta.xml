@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Confidential_Client__c</fullName>
+    <defaultValue>false</defaultValue>
+    <description>When checked, client name will be hidden from Techsara website job listings and from users without authorized access.</description>
+    <inlineHelpText>Check if the client has requested confidentiality. When checked, client name will NOT appear on website job postings regardless of other settings.</inlineHelpText>
+    <label>Confidential Client</label>
+    <trackFeedHistory>false</trackFeedHistory>
+    <trackHistory>false</trackHistory>
+    <type>Checkbox</type>
+</CustomField>

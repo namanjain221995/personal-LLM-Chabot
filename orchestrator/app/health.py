@@ -189,11 +189,20 @@ def _check_embedding_index() -> dict:
     )
 
 
-#: Every migration in db._MIGRATIONS must have been applied before the app is
-#: healthy. Bumped alongside a new migration; a container running old code
-#: against a newer database, or new code against an un-migrated one, is exactly
-#: what this catches.
-EXPECTED_SCHEMA_VERSION = 4
+def _expected_schema_version() -> int:
+    """Every migration in `db._MIGRATIONS` must be applied before we are healthy.
+
+    Derived rather than hardcoded. As a literal it went stale the moment
+    migration v5 — the entire clarification schema: `sf_intents`,
+    `sf_clarifications`, `sf_conversation_state`, and the two indexes that
+    enforce one-pending-question-per-conversation and first-response-wins —
+    was appended: the constant still said 4, so a database missing every one of
+    those tables reported healthy, and the first clarification would have failed
+    at runtime instead of at startup.
+    """
+    from . import db
+
+    return db.LATEST_SCHEMA_VERSION
 
 
 def _check_app_db(_path: str = "") -> dict:
@@ -214,11 +223,12 @@ def _check_app_db(_path: str = "") -> dict:
         version = db.schema_version()
     except Exception as exc:  # noqa: BLE001 — /health reports, never raises
         return {"status": "error", "detail": f"{type(exc).__name__}: {exc}"}
-    if version < EXPECTED_SCHEMA_VERSION:
+    expected = _expected_schema_version()
+    if version < expected:
         return {
             "status": "error",
             "detail": (
-                f"schema version {version} < expected {EXPECTED_SCHEMA_VERSION} "
+                f"schema version {version} < expected {expected} "
                 "— migrations have not been applied"
             ),
         }

@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Background_Check_Status__c</fullName>
+    <label>Background Check Status</label>
+    <required>false</required>
+    <trackFeedHistory>true</trackFeedHistory>
+    <trackHistory>true</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Picklist</type>
+    <valueSet>
+        <restricted>true</restricted>
+        <valueSetDefinition>
+            <sorted>false</sorted>
+            <value>
+                <fullName>Payment Verification Pending</fullName>
+                <default>false</default>
+                <label>Payment Verification Pending</label>
+            </value>
+            <value>
+                <fullName>Documents Pending</fullName>
+                <default>false</default>
+                <label>Documents Pending</label>
+            </value>
+            <value>
+                <fullName>Candidate Details Pending</fullName>
+                <default>false</default>
+                <label>Candidate Details Pending</label>
+            </value>
+            <value>
+                <fullName>Verification In Progress</fullName>
+                <default>false</default>
+                <label>Verification In Progress</label>
+            </value>
+            <value>
+                <fullName>Completed</fullName>
+                <default>false</default>
+                <label>Completed</label>
+            </value>
+        </valueSetDefinition>
+    </valueSet>
+</CustomField>

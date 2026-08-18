@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Sessions_Per_Day__c</fullName>
+    <description>Number of session windows per day when Booking Mode is Fixed Schedule. Used by the Program Creation wizard to generate the correct number of Session Window template rows.</description>
+    <externalId>false</externalId>
+    <label>Sessions Per Day</label>
+    <precision>2</precision>
+    <required>false</required>
+    <scale>0</scale>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Number</type>
+    <unique>false</unique>
+</CustomField>

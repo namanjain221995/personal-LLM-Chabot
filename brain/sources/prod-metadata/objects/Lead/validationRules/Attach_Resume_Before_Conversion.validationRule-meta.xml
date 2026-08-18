@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ValidationRule xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Attach_Resume_Before_Conversion</fullName>
+    <active>true</active>
+    <description>Resume needs to be attached before converting a lead.</description>
+    <errorConditionFormula>AND(
+  ISPICKVAL(Status , &apos;Converted&apos;),
+  NOT(Resume_Attached__c),
+  RecordType.DeveloperName &lt;&gt; &quot;B2B_Client_Lead&quot;
+)</errorConditionFormula>
+    <errorDisplayField>Resume_Attached__c</errorDisplayField>
+    <errorMessage>Please attach the resume before converting this Lead.</errorMessage>
+</ValidationRule>

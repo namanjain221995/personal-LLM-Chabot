@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ValidationRule xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Require_CandidateDetail_For_Verification</fullName>
+    <active>true</active>
+    <errorConditionFormula>AND(
+    NOT( Before_Background_Check__c ),
+    NOT( C2C_Submission__c ),
+    ISCHANGED( Background_Check_Status__c ),
+    ISPICKVAL( Background_Check_Status__c , &quot;Documents Pending&quot;),
+    NOT(ISPICKVAL( Offer_Letter_Payment_Status__c , &quot;Received&quot;))
+)</errorConditionFormula>
+    <errorDisplayField>Background_Check_Status__c</errorDisplayField>
+    <errorMessage>Candidate Details Status must be Submitted before moving to Verification In Progress.</errorMessage>
+</ValidationRule>

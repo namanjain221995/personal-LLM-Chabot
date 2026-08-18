@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>B2B_Company_Type__c</fullName>
+    <description>Identifies the type of B2B company relationship. Direct Client hires directly. Vendor and Implementation Partners are middle-layer companies.</description>
+    <inlineHelpText>Identifies the type of B2B company relationship. Direct Client hires directly. Vendor and Implementation Partners are middle-layer companies.</inlineHelpText>
+    <label>B2B Company Type</label>
+    <required>false</required>
+    <trackFeedHistory>false</trackFeedHistory>
+    <trackHistory>false</trackHistory>
+    <type>Picklist</type>
+    <valueSet>
+        <restricted>true</restricted>
+        <valueSetDefinition>
+            <sorted>false</sorted>
+            <value>
+                <fullName>Direct Client</fullName>
+                <default>false</default>
+                <label>Direct Client</label>
+            </value>
+            <value>
+                <fullName>Vendor</fullName>
+                <default>false</default>
+                <label>Vendor</label>
+            </value>
+            <value>
+                <fullName>Implementation Partner</fullName>
+                <default>false</default>
+                <label>Implementation Partner</label>
+            </value>
+            <value>
+                <fullName>Consulting Partner</fullName>
+                <default>false</default>
+                <label>Consulting Partner</label>
+            </value>
+        </valueSetDefinition>
+    </valueSet>
+</CustomField>

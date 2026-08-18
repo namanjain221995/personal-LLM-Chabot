@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ValidationRule xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Max_Submissions_Allowed</fullName>
+    <active>true</active>
+    <errorConditionFormula>Max_Submissions_Allowed__c &lt;= Number_of_Openings__c</errorConditionFormula>
+    <errorDisplayField>Max_Submissions_Allowed__c</errorDisplayField>
+    <errorMessage>Max Submissions Allowed must be greater than the Number of Openings</errorMessage>
+</ValidationRule>

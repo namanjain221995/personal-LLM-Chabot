@@ -1,17 +1,27 @@
-"""Asking before answering.
+"""The deterministic floor: which ambiguities are worth a question, and which
+questions must never be asked.
 
 The engine's failure mode was never refusal — it was picking one reading of an
 ambiguous question and reporting the number with full confidence. "How many
 candidates completed the training from slot 128 and how many failed the mock"
 scoped the mock three different ways on three runs and returned 7, 20 and 0.
 All three are defensible readings; only one was meant.
+
+This module used to own a whole parallel clarification system as well — a
+markdown card, a history-sniffing answer matcher, and an always-on confirmation
+prompt. That is gone: `core/sf_intel/` owns persistence, resume, loop guards and
+the UI contract, and these detectors feed it (`planner.deterministic_decision`).
+What is tested here is therefore the JUDGEMENT — when to ask — not a transport.
 """
 from app.core import clarify
+from app.core.sf_intel import planner
 
 
 SLOT_Q = ("how may candite compelted the traingi from slot 128 "
           "and how many failed the mock")
 
+
+# ── When there is a real ambiguity ───────────────────────────────────────────
 
 def test_a_mock_scoped_to_a_slot_is_asked_about():
     c = clarify.needs_clarification(SLOT_Q)
@@ -28,16 +38,28 @@ def test_the_options_carry_how_to_resolve_them():
     assert "Candidate_Training__c" in c.options[0].resolves_to
 
 
-def test_there_is_always_a_free_text_escape():
-    c = clarify.needs_clarification(SLOT_Q)
-    assert c.wire()["options"][-1]["label"] == clarify.OTHER
-
-
 def test_interview_is_asked_about_because_it_names_two_objects():
     c = clarify.needs_clarification("how many interviews last month")
     assert c is not None
     assert "Internal_Interview__c" in " ".join(o.resolves_to for o in c.options)
 
+
+def test_a_genuine_interview_question_is_still_asked_about():
+    c = clarify.needs_clarification("how many interviews were ghosted")
+    assert c is not None and "Which interviews" in c.question
+
+
+def test_every_question_carries_a_topic_header():
+    """The card reads "Clarification · <header>", so a header of "Salesforce"
+    tells the user nothing they did not already know."""
+    for question in (SLOT_Q, "how many interviews last month", "how many accounts"):
+        found = clarify.needs_clarification(question)
+        assert found is not None
+        assert found.header and found.header != "Salesforce"
+        assert len(found.header.split()) <= 4
+
+
+# ── What must never be asked ─────────────────────────────────────────────────
 
 def test_an_already_disambiguated_question_is_not_second_guessed():
     """Naming the object settles WHICH object. It may still be asked about a
@@ -58,28 +80,6 @@ def test_a_countless_question_is_left_alone():
     assert clarify.needs_clarification("hello") is None
 
 
-def test_the_text_form_works_without_any_ui():
-    text = clarify.needs_clarification(SLOT_Q).as_text()
-    assert "**1.**" in text and "**2.**" in text
-    assert clarify.OTHER in text
-
-
-def test_a_clarified_question_is_not_asked_again():
-    """The follow-up turn must reach the engine, not loop."""
-    resolved = clarify.resolve(SLOT_Q, "Only mocks from this slot's training")
-    assert "(Clarified:" in resolved
-
-
-def test_the_engine_skips_clarification_once_answered():
-    import inspect
-
-    from app import main
-
-    source = inspect.getsource(main)
-    assert '"(Clarified:" not in text' in source
-    assert "clarify_before_answering" in source
-
-
 def test_a_word_containing_count_is_not_a_counting_question():
     """`\\bhow many|count|...\\b` alternates across the whole pattern, so the
     bare `count` branch matched the middle of "ac(count)s" and asked "over
@@ -89,148 +89,35 @@ def test_a_word_containing_count_is_not_a_counting_question():
     assert clarify.needs_clarification("how many accounts") is not None
 
 
-# ── The loop ─────────────────────────────────────────────────────────────────
-# Picking "Only mocks from this slot's training" sent that sentence back as the
-# next message. It contains "mock" and "slot", so the detector fired again and
-# asked the identical question — three times in a row, forever.
+def test_a_typo_in_the_period_is_not_an_absent_period():
+    """The detectors run on the spelling-repaired reading, so a question that
+    plainly states its period is not asked for one because it was mistyped.
 
-def _asked_history(question=SLOT_Q):
-    return [
-        {"role": "user", "content": question},
-        {"role": "assistant", "content": clarify.needs_clarification(question).as_text()},
-    ]
-
-
-def test_choosing_an_option_by_label_does_not_ask_again():
-    label = "Only mocks from this slot's training"
-    resolved = clarify.answered(_asked_history(), label)
-    assert resolved is not None
-    assert "(Clarified:" in resolved
-    assert "Candidate_Training__c" in resolved
-    # And the resolved text is exempt from being asked about again.
-    assert "(Clarified:" in resolved
+    This was the most common way the feature annoyed people: "how many advance
+    mock scheddule todau" says today, and the matcher's answer was "over what
+    period?"."""
+    assert clarify.needs_clarification("how many advance mock scheddule todau") is None
+    assert clarify.needs_clarification("how many invoices todya") is None
+    assert clarify.needs_clarification("how many mocks tomorow") is None
 
 
-def test_choosing_an_option_by_number_works():
-    resolved = clarify.answered(_asked_history(), "2")
-    assert "across all their trainings" in resolved
+def test_a_conceptual_question_is_not_offered_a_choice_of_object():
+    """"How does the interview process work" wants an explanation. A card
+    offering two Salesforce objects is a non-sequitur — there are no records
+    behind the question at all."""
+    assert clarify.needs_clarification("how does the interview process work") is None
+    assert clarify.needs_clarification("what is an interview evaluation") is None
+    assert clarify.needs_clarification("explain the interview stages") is None
 
 
-def test_the_label_with_its_description_appended_still_matches():
-    """The UI sends "label — description" as one string."""
-    reply = ("Only mocks from this slot's training — The mock attached to the "
-             "training they took in this slot.")
-    resolved = clarify.answered(_asked_history(), reply)
-    assert "Candidate_Training__c" in resolved
-
-
-def test_free_text_is_carried_through_verbatim():
-    resolved = clarify.answered(_asked_history(), "only the final week mocks")
-    assert "only the final week mocks" in resolved
-
-
-def test_the_original_question_survives_into_the_resolution():
-    resolved = clarify.answered(_asked_history(), "1")
-    assert "slot 128" in resolved
-
-
-def test_an_ordinary_follow_up_is_not_treated_as_an_answer():
-    history = [
-        {"role": "user", "content": "how many invoices"},
-        {"role": "assistant", "content": "There are 116 invoices."},
-    ]
-    assert clarify.answered(history, "and how many are unpaid") is None
-
-
-def test_no_history_means_nothing_to_resolve():
-    assert clarify.answered([], "1") is None
-
-
-def test_the_dispatch_checks_for_an_answer_before_asking_again():
-    import inspect
-
-    from app import main
-
-    source = inspect.getsource(main)
-    assert "clarify_mod.answered(full_history, text)" in source
-
-
-# ── Always-ask mode ──────────────────────────────────────────────────────────
-
-def test_always_mode_confirms_even_an_unambiguous_question():
-    c = clarify.needs_clarification("how many invoices last month", always=True)
-    assert c is not None
-    assert "read it right" in c.question
-    assert c.options[0].label == "Yes, run it"
-
-
-def test_ambiguous_mode_stays_quiet_on_a_clear_question():
-    assert clarify.needs_clarification("how many invoices last month") is None
-
-
-def test_a_real_ambiguity_still_wins_over_the_generic_confirmation():
-    c = clarify.needs_clarification(SLOT_Q, always=True)
-    assert "Which mocks" in c.question
-
-
-def test_the_confirmation_states_the_actual_reading():
-    """It describes what will run, from the same matchers the query uses —
-    not a second, prettier guess at it."""
-    c = clarify.confirmation("how many training sessions last month")
-    assert "period: last month" in c.reason
-    assert "from:" in c.reason
-
-
-def test_a_question_with_no_period_says_all_time():
-    assert "period: all time" in clarify.confirmation("how many invoices").reason
-
-
-def test_the_mode_defaults_to_asking_only_when_it_matters(monkeypatch):
-    """Owner feedback: "it should ask only relevant questions, not the same
-    one again and again". `always` remains available for a deployment that
-    wants a checkpoint on every question."""
-    from app.config import Settings
-
-    monkeypatch.delenv("CLARIFY_MODE", raising=False)
-    assert Settings().clarify_mode == "ambiguous"
-    monkeypatch.setenv("CLARIFY_MODE", "always")
-    assert Settings().clarify_mode == "always"
-    monkeypatch.setenv("CLARIFY_MODE", "off")
-    assert Settings().clarify_before_answering is False
-
-
-# ── The second loop: "Yes, run it" was clarified again, and again ────────────
-# The options sent back their LABEL. With the assistant turn not always present
-# in the history the client posts, the server saw a bare new question.
-
-def test_each_option_sends_the_whole_resolved_question():
-    wire = clarify.needs_clarification(SLOT_Q).wire(SLOT_Q)
-    assert wire["original"] == SLOT_Q
-    for option in wire["options"]:
-        if option.get("free_text"):
-            continue
-        assert option["send"].startswith(SLOT_Q)
-        assert "(Clarified:" in option["send"]
-
-
-def test_what_the_options_send_is_never_clarified_again():
-    """The server skips any message already carrying a resolution."""
-    for option in clarify.needs_clarification(SLOT_Q).wire(SLOT_Q)["options"]:
-        if option.get("free_text"):
-            continue
-        assert "(Clarified:" in option["send"]
-
-
-def test_something_else_asks_for_text_instead_of_sending_its_own_label():
-    other = clarify.confirmation("how many invoices").wire("how many invoices")["options"][-1]
-    assert other["label"] == clarify.OTHER
-    assert other["free_text"] is True
-    assert other["send"] == ""
-
-
-def test_the_confirmation_carries_the_original_question_for_free_text():
-    wire = clarify.confirmation("how many invoices").wire("how many invoices")
-    assert wire["original"] == "how many invoices"
+def test_for_the_and_for_each_do_not_read_as_a_named_person():
+    """The person hint is a CAPITAL letter after "for". Case-insensitively it
+    matched "for the", "for each" and "for all", so any question containing
+    those words was treated as already scoped to someone."""
+    assert clarify.needs_clarification("how many mocks for the team") is not None
+    assert clarify.needs_clarification("how many mocks for each niche") is not None
+    # A real name still settles the scope.
+    assert clarify.needs_clarification("how many mocks for Divya") is None
 
 
 # ── Irrelevant questions ─────────────────────────────────────────────────────
@@ -251,22 +138,82 @@ def test_asking_about_sessions_is_not_asking_about_interviews():
     assert clarify.needs_clarification("show me the sessions for yesterday") is None
 
 
-def test_a_genuine_interview_question_is_still_asked_about():
-    c = clarify.needs_clarification("how many interviews were ghosted")
-    assert c is not None and "Which interviews" in c.question
+# ── What the floor hands to the clarification system ─────────────────────────
+
+def test_the_floor_produces_a_validated_decision():
+    """`deterministic_decision` is the ONLY route from these detectors into the
+    product. Whatever it returns is promoted to a persisted, resumable card, so
+    it has to satisfy the same schema the planner's output does."""
+    decision = planner.deterministic_decision(SLOT_Q)
+    assert decision.action == "ASK_CLARIFICATION"
+    draft = decision.clarification_draft
+    assert draft is not None
+    assert 2 <= len(draft.options) <= 4
+    assert draft.slot in ("object", "date_range", "filter")
+    # Alternative readings of ONE number: ticking two is incoherent.
+    assert draft.multi_select is False
 
 
-def test_every_question_offers_a_way_straight_past_it():
-    """Owner request: a one-click "just answer it" on every question."""
-    wire = clarify.needs_clarification(SLOT_Q).wire(SLOT_Q)
-    labels = [o["label"] for o in wire["options"]]
-    assert clarify.PROCEED in labels
-    assert clarify.OTHER in labels
-    proceed = next(o for o in wire["options"] if o["label"] == clarify.PROCEED)
-    assert proceed["send"].startswith(SLOT_Q)
-    assert "do not narrow" in proceed["send"]
+def test_no_detected_ambiguity_means_answer_not_ask_something_generic():
+    """There is no worse moment to invent a question than the one where the
+    component that decides what to ask has just failed."""
+    decision = planner.deterministic_decision("how many oot mocks today")
+    assert decision.action == "EXECUTE_SALESFORCE"
+    assert decision.clarification_draft is None
 
 
-def test_the_text_form_lists_both_escapes():
-    text = clarify.needs_clarification(SLOT_Q).as_text()
-    assert clarify.PROCEED in text and clarify.OTHER in text
+def test_the_user_facing_half_of_an_option_names_no_salesforce_object():
+    """`label`/`description` are read by a recruiter; `value` is read by the
+    query planner. "Use Interview__c with record type 'Interview'" was shipped
+    as the thing a user clicked on."""
+    decision = planner.deterministic_decision("how many interviews last month")
+    draft = decision.clarification_draft
+    visible = " ".join(
+        [draft.question, draft.header]
+        + [o.label for o in draft.options]
+        + [o.description for o in draft.options]
+    )
+    assert "__c" not in visible and "__r" not in visible
+    # …and the precision survived where it is actually used.
+    assert any("__c" in o.value for o in draft.options)
+
+
+# ── Configuration ────────────────────────────────────────────────────────────
+
+def test_the_mode_defaults_to_asking_only_when_it_matters(monkeypatch):
+    """Owner feedback: "it should ask only relevant questions, not the same
+    one again and again". `always` remains available for a deployment that
+    wants a lower bar — as a BIAS on the planner, not as a card with no
+    content, which is what it used to bolt onto every question."""
+    from app.config import Settings
+
+    monkeypatch.delenv("CLARIFY_MODE", raising=False)
+    assert Settings().clarify_mode == "ambiguous"
+    monkeypatch.setenv("CLARIFY_MODE", "always")
+    assert Settings().clarify_mode == "always"
+    monkeypatch.setenv("CLARIFY_MODE", "off")
+    assert Settings().clarify_before_answering is False
+
+
+def test_a_resolved_request_is_never_clarified_again():
+    """The `"(Clarified:" ` sentinel is what stops a resumed request being read
+    as a fresh, ambiguous one. It is load-bearing in the dispatch."""
+    import inspect
+
+    from app import main
+
+    source = inspect.getsource(main)
+    assert '"(Clarified:" not in text' in source
+
+
+def test_there_is_exactly_one_clarification_payload_shape():
+    """The legacy `meta.clarify` card is gone. Two payloads meant two renderers,
+    two loop-prevention schemes, and a kill switch that quietly downgraded the
+    user to the one that could not resume."""
+    import inspect
+
+    from app import main
+
+    source = inspect.getsource(main)
+    assert '"clarify": ' not in source
+    assert "clarify_mod" not in source

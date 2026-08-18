@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>COMPASS_State_Last_Saved_UTC__c</fullName>
+    <inlineHelpText>UTC timestamp of the  
+most recent COMPASS  
+run that wrote to  
+COMPASS_State_JSON  
+__c. Use this to spot  
+stale/skipped employees.</inlineHelpText>
+    <label>COMPASS State Last Saved (UTC)</label>
+    <required>false</required>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>DateTime</type>
+</CustomField>

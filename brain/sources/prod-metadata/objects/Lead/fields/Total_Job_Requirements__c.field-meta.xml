@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Total_Job_Requirements__c</fullName>
+    <description>Auto-populated by Flow. Do not edit manually</description>
+    <externalId>false</externalId>
+    <inlineHelpText>Maintained by system Flow only. Read Only.</inlineHelpText>
+    <label>Total Job Requirements</label>
+    <precision>18</precision>
+    <required>false</required>
+    <scale>0</scale>
+    <trackFeedHistory>false</trackFeedHistory>
+    <trackHistory>false</trackHistory>
+    <type>Number</type>
+    <unique>false</unique>
+</CustomField>

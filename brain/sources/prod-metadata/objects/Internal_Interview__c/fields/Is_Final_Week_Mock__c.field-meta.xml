@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Is_Final_Week_Mock__c</fullName>
+    <defaultValue>false</defaultValue>
+    <description>True when this Mock Interview is the FINAL-week mock (scheduled on Program_Version.Mock_Final_Day inside the last training week itself, not on the following Regular Day). Used for portal display badge and any final-mock-specific logic.</description>
+    <label>Is Final Week Mock</label>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Checkbox</type>
+</CustomField>

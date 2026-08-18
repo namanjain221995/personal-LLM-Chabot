@@ -108,9 +108,24 @@ def load(path: str = DICTIONARY_PATH) -> Dict[str, Any]:
     if _cache is not None:
         return _cache
     try:
-        _cache = json.loads(Path(path).read_text(encoding="utf-8"))
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
     except Exception:
-        _cache = {"objects": {}}
+        data = {"objects": {}}
+    # Brain packs may annotate fields (field_notes) — semantics the org export
+    # cannot know, like "Amount_Paid excludes voided payments". Enrich-only:
+    # a note for a field this org lacks is dropped, never added, so knowledge
+    # written against a sandbox cannot teach the model a field production
+    # does not have. Applied at cache fill; a pack edit that changes notes is
+    # picked up on the next process start (the hint path caches forever).
+    try:
+        from . import brain
+
+        overlay = brain.field_overlay()
+        if overlay and data.get("objects"):
+            data, _stats = merge(data, overlay, add_new=False)
+    except Exception:  # noqa: BLE001 — notes are a bonus, never a blocker
+        pass
+    _cache = data
     return _cache
 
 
@@ -277,29 +292,86 @@ def join_map(tables: Sequence[str]) -> str:
 
     The org export knows all 187 of these edges. This puts them in front of
     the model for exactly the tables it was given.
+
+    EDGES TO TABLES OUTSIDE THE SLICE ARE INCLUDED, and that is the whole point
+    of the second half of this function. Suppressing them was not a neutral
+    omission: this block also tells the model these are the ONLY valid joins,
+    so an omitted edge reads as "that join does not exist" and the model
+    invents one that does not either. Asked how many internal interviews five
+    named people had completed, the slice held Internal_Interview__c but not
+    Recruiter__c — so the one edge that answers it,
+    `Internal_Interview__c.Interviewer__c = Recruiter__c.Id`, was withheld. The
+    model joined the interviewer to Account instead (which Account's own
+    'Recruiter' record type makes look right), matched nothing, and reported
+    that those people had no interviews at all. They had 84.
+
+    The schema slice is capped at 24 tables and cannot simply absorb every
+    lookup target — one hop off a ten-table slice is another fifteen. So an
+    outside target is named, not inlined: the edge plus the columns you would
+    filter it by, which is what a join actually needs.
     """
     data = load()
     objects = data.get("objects", {})
     wanted = list(dict.fromkeys(tables))
     present = set(wanted)
-    lines = []
+    inside: List[str] = []
+    outside: List[str] = []
+    targets: Dict[str, str] = {}
     for name in wanted:
         obj = objects.get(name)
         if not obj:
             continue
         for field in obj["fields"]:
             for target in field.get("ref") or ():
-                # Only edges the model can actually use: both ends present.
+                edge = f"  {name}.{field['api']} = {target}.Id"
                 if target in present:
-                    lines.append(f"  {name}.{field['api']} = {target}.Id")
-    if not lines:
+                    inside.append(edge)
+                elif target in objects:
+                    outside.append(edge)
+                    targets.setdefault(target, _identifying_columns(objects[target]))
+    if not (inside or outside):
         return ""
-    return (
+    blocks = [
         "How these tables join. A Salesforce lookup column holds the Id of ONE "
-        "specific object — these are the only valid joins between the tables "
-        "above, and a join not listed here will silently match zero rows:\n"
-        + "\n".join(sorted(set(lines)))
-    )
+        "specific object; a join not listed here will silently match zero rows "
+        "rather than raise an error."
+    ]
+    if inside:
+        blocks.append("\n".join(sorted(set(inside))))
+    if outside:
+        # The identifying columns go in a LEGEND, once per target, rather than
+        # on every edge: a ten-table slice reaches forty-odd outside edges, and
+        # repeating "(Recruiter__c has Name, First_Name__c, …)" on each of them
+        # tripled this block for no extra information.
+        legend = "; ".join(
+            f"{t} ({c})" if c else t for t, c in sorted(targets.items())
+        )
+        blocks.append(
+            "These lookups point at tables NOT listed above. They are real "
+            "tables you may join to; only their column lists are omitted, so "
+            "filter them by the identifying columns in the legend:\n"
+            + "\n".join(sorted(set(outside)))
+            + f"\n  legend — {legend}"
+        )
+    return "\n".join(blocks)
+
+
+#: Columns worth filtering a lookup target by, in preference order. `Name` is
+#: on almost every Salesforce object; the split parts matter for the people
+#: directories, where a full name may be stored in pieces.
+_IDENTIFYING = ("Name", "First_Name__c", "Last_Name__c", "Email__c", "Full_Name__c")
+
+
+def _identifying_columns(obj: Dict[str, Any]) -> str:
+    """How you would recognise a row of `obj` in a WHERE clause.
+
+    Naming an out-of-slice table without this invites the same class of bug it
+    is meant to fix: the model knows the join exists, guesses `Recruiter_Name__c`
+    for the filter, and matches nothing.
+    """
+    have = {f["api"] for f in obj.get("fields", ())}
+    found = [c for c in _IDENTIFYING if c in have]
+    return ", ".join(found)
 
 
 def build_from_xlsx(path: str) -> Dict[str, Any]:

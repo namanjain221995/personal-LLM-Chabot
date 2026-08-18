@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Experience_Level__c</fullName>
+    <label>Experience Level</label>
+    <required>false</required>
+    <trackHistory>true</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Picklist</type>
+    <valueSet>
+        <restricted>true</restricted>
+        <valueSetDefinition>
+            <sorted>false</sorted>
+            <value>
+                <fullName>Fresher level</fullName>
+                <default>false</default>
+                <label>Fresher level</label>
+            </value>
+            <value>
+                <fullName>Beginner Level</fullName>
+                <default>false</default>
+                <label>Beginner Level</label>
+            </value>
+            <value>
+                <fullName>Mid Level</fullName>
+                <default>false</default>
+                <label>Mid Level</label>
+            </value>
+            <value>
+                <fullName>Senior Level</fullName>
+                <default>false</default>
+                <label>Senior Level</label>
+            </value>
+        </valueSetDefinition>
+    </valueSet>
+</CustomField>

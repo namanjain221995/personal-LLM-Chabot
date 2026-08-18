@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Interview_Requested__c</fullName>
+    <defaultValue>false</defaultValue>
+    <description>Checked automatically when an Interview record is created from this submission via the Create Interview flow. Used in Interview Requested list view.</description>
+    <inlineHelpText>Auto-checked by Create Interview flow. Do not manually edit. Used to filter submissions that have interviews in the Interview Requested/Scheduled list view.</inlineHelpText>
+    <label>Interview Requested</label>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Checkbox</type>
+</CustomField>

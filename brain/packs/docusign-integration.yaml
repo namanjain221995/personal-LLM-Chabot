@@ -1,0 +1,417 @@
+# The DocuSign integration brain.
+# Compiled from brain/sources/docusign-integration.txt (the DocuSign Apps
+# Launcher implementation reference, Dev9 SANDBOX, June-August 2026) plus
+# brain/sources/docusign-field-reference.txt (the field-reference companion,
+# converted from DocuSign_Salesforce_Field_Reference.docx, added 2026-08-18)
+# and verified against the PRODUCTION warehouse on 2026-08-17. The environment
+# split matters everywhere in this pack: the doc describes the NEW sandbox
+# implementation (Gen Templates + auto-writeback), while production today
+# runs the older flow-based sending — and production's own data was used for
+# every field name and count below (including the DS_* spelling drift the
+# doc does not know about).
+name: docusign-integration
+description: >
+  How TechSara sends documents for e-signature: the DocuSign envelope
+  pipeline (services agreement on Onboarding, ACH + promissory note on
+  Background Check), what is queryable, and what the new sandbox
+  implementation changes.
+
+triggers:
+  - docusign
+  - envelope
+  - envelopes
+  - e-signature
+  - esignature
+  - e-sign
+  - esign
+  - signature
+  - signatures
+  - signing
+  - gen template
+  - envelope template
+  - service agreement
+  - services agreement
+  - agreement signed
+  - id verification
+  - liveness
+  - writeback
+  - custody transfer
+  - anchor text
+  - merge field
+  - onboarding
+  - onboardings
+  - welcome call
+  - resume creation
+  - certificate of completion
+  - voided
+
+tables:
+  - Onboarding__c
+  - dfsle__EnvelopeStatus__c
+  - dfsle__RecipientStatus__c
+  - Background_Check__c
+
+rules: |
+  DocuSign / e-signature rules (this question touches envelopes, agreements
+  or onboarding):
+  - TWO IMPLEMENTATIONS EXIST. Production today sends via the older
+    flow-based path (the "Send ACH and Promissory" quick action) and NOTHING
+    writes signature results back — a QA user flips the statuses by hand.
+    The NEW DocuSign Apps Launcher implementation (Gen Templates, automatic
+    Field Value Updates that set Signed on completion and Pending on void)
+    lives in the Dev9 SANDBOX and its production deployment has NOT been
+    executed. Answer writeback questions per environment.
+  - Envelope tracking IS queryable in production: dfsle__EnvelopeStatus__c
+    (107 rows; dfsle__Status__c = 'Completed' 72 | 'Voided' 33 | 'Sent' 2,
+    with dfsle__Sent__c / dfsle__Completed__c timestamps and
+    dfsle__SourceId__c holding the Id of the record it was sent from — join
+    it to Background_Check__c / Onboarding__c ids). Per-signer detail is
+    dfsle__RecipientStatus__c (322 rows). A high Voided count is normal:
+    voids are mostly re-sends, not failures.
+  - Onboarding__c (798 rows) pipeline in the REAL data: Welcome Call ->
+    Service Agreement -> Resume Creation -> 'Onboarding Completed' (the data
+    value — NOT 'Onboarding Complete' as documentation says), plus an
+    'Inactive' exit status (22 rows) the pipeline docs omit. A validation
+    rule blocks Resume Creation until Service_Agreement_Signed__c is true.
+    Flag reality: 746 of 798 are sent+signed, 42 neither, and 6 rows are
+    signed-but-never-marked-sent (legacy data entry) — count signed
+    agreements by Service_Agreement_Signed__c = 'true' alone.
+  - The DS_* fields on Background_Check__c are DocuSign merge plumbing, and
+    their PRODUCTION names drift in spelling: DS_Debit_Amount_Formate__c,
+    DS_Final_Payment_Due_Date_Formate__c and
+    DS_Total_Amount_to_be_Paid_Formate__c use 'Formate', while
+    DS_First_Installment_Due_Date_Formatted__c and
+    DS_Payment_Commencement_Date_Formatted__c use 'Formatted'. Copy the
+    exact name. For any calculation use the RAW twin (DS_Debit_Amount__c,
+    DS_Final_Payment_Due_Date__c, ...) — the text twins exist only because
+    DocuSign rejects YYYY-MM-DD dates and needs MM/DD/YYYY strings.
+  - What signers type into DocuSign (bank name, account and routing numbers,
+    SSN, ID numbers) lives ONLY in the signed PDF attached to the record's
+    Files — it is never written to queryable Salesforce fields. Never
+    promise those values from a query, and never read them out if found.
+  - Account.Current_Address__c is used by the templates but is NOT in the
+    synced warehouse (hidden from the integration user) — address questions
+    cannot be answered from it.
+  - Envelope status 'Authentication Failed' means the signer failed ID
+    verification (expired ID, blurry photo, failed liveness selfie) — the
+    fix is resending the envelope, not editing the record.
+  - The five Background_Check__c validation rules are ALIGNED
+    (name/message/logic agree) in the Dev9 sandbox design; in PRODUCTION
+    four of five still show swapped messages — production truth is what the
+    background-check rules above describe.
+
+metrics:
+  - name: docusign envelopes by status
+    aliases:
+      - envelopes sent
+      - envelope status
+      - docusign envelopes
+      - envelopes completed
+      - envelopes voided
+      - documents sent for signature
+    table: dfsle__EnvelopeStatus__c
+    definition: >
+      Every DocuSign envelope tracked in Salesforce, by lifecycle status
+      (Sent, Completed, Voided, Declined, Authentication Failed).
+    sql: >
+      SELECT dfsle__Status__c, count(*) FROM dfsle__EnvelopeStatus__c
+      GROUP BY 1 ORDER BY 2 DESC
+    date_column: dfsle__Sent__c
+    chart: bar
+    caveat: >
+      Voided envelopes are mostly re-sends, not failures — say so rather
+      than reporting a "33% failure rate". dfsle__SourceId__c links each
+      envelope to the record it was sent from.
+
+  - name: onboardings by status
+    aliases:
+      - onboarding status
+      - onboarding pipeline
+      - candidates in onboarding
+      - welcome calls pending
+    table: Onboarding__c
+    definition: >
+      The onboarding pipeline: Welcome Call -> Service Agreement -> Resume
+      Creation -> Onboarding Completed, with Inactive as the exit.
+    sql: >
+      SELECT Status__c, count(*) FROM Onboarding__c
+      GROUP BY 1 ORDER BY 2 DESC
+    date_column: CreatedDate
+    chart: bar in pipeline order
+    caveat: >
+      The completed value in the data is 'Onboarding Completed'. 'Inactive'
+      is an exit, not a pipeline stage.
+
+  - name: service agreements signed
+    aliases:
+      - agreements signed
+      - signed service agreements
+      - service agreement pending
+      - unsigned agreements
+    table: Onboarding__c
+    definition: Onboardings whose placement services agreement is signed.
+    sql: >
+      SELECT count(*) FROM Onboarding__c
+      WHERE Service_Agreement_Signed__c = 'true'
+    date_column: CreatedDate
+    chart: single value, or donut signed vs not
+    caveat: >
+      Judge by the Signed flag alone — 6 legacy rows are signed but never
+      marked sent, so pairing the flags undercounts.
+
+glossary:
+  Envelope: >
+    One DocuSign send — a container of documents, recipients and status.
+    Tracked in Salesforce as dfsle__EnvelopeStatus__c rows.
+  Gen template: >
+    The Salesforce-side config that fills a Word document with record data
+    (via anchor text tags) and generates the PDF when a user clicks the send
+    button. Cannot be migrated between orgs — recreated by hand.
+  Envelope template: >
+    The DocuSign-side config: recipients, signing order, emails, field
+    placements, ID verification, writeback rules. Exportable between
+    DocuSign accounts.
+  Anchor text: >
+    An invisible XML tag inside the Word document telling DocuSign Gen where
+    to inject a Salesforce field value.
+  Merge field: >
+    A DocuSign field pre-populated from Salesforce, optionally writing the
+    signer's value back on completion.
+  Field value update: >
+    An envelope-template rule that updates a Salesforce field when an
+    envelope event fires (Sent, Completed, Voided) — the auto-writeback
+    mechanism of the NEW sandbox implementation.
+  ID verification: >
+    The signer must prove identity before opening the document; the ACH +
+    promissory adds Liveness (a live selfie — a photo of a photo fails).
+    Failure shows as envelope status 'Authentication Failed'.
+  Collaborative fields: >
+    Lets the CS Person clear a wrong value the candidate typed and route the
+    envelope back for re-entry with initials — without voiding and starting
+    over.
+  Certificate of completion: >
+    DocuSign's audit document (who signed, when, from where) saved to the
+    record's Files next to the signed PDF.
+  Send Now: >
+    The sending mode both templates use: zero sender screens, which also
+    prevents the duplicate-document glitch of the default experience.
+  Custody transfer: >
+    The planned DocuSign rule that will make envelopes appear from
+    legal@techsarasolutions.com instead of the connected user — not yet
+    implemented; irreversible once created.
+  DAL: >
+    DocuSign Apps Launcher, the managed package (namespace dfsle) behind
+    both the old and new implementations.
+
+field_notes:
+  Onboarding__c:
+    Status__c: >
+      Welcome Call -> Service Agreement -> Resume Creation -> 'Onboarding
+      Completed' (data value), plus 'Inactive' as an exit (22 rows).
+    Service_Agreement_Sent__c: >
+      Set when the services agreement goes out; 6 legacy rows are signed
+      without this flag — do not pair the flags when counting.
+    Service_Agreement_Signed__c: >
+      The gate: a validation rule blocks Resume Creation until this is true.
+      746 of 798 rows are signed.
+    Account__c: The candidate (Person Account) being onboarded.
+  Background_Check__c:
+    DS_Debit_Amount__c: Raw monthly debit amount — use THIS for maths, not the text twin.
+    DS_Debit_Amount_Formate__c: >
+      Display twin, misspelled 'Formate' in production — a $-formatted
+      string for DocuSign, never for arithmetic.
+    DS_Total_Amount_to_be_Paid__c: Raw total to be paid (currency).
+    DS_Total_Amount_to_be_Paid_Formate__c: Display twin, misspelled 'Formate'.
+    DS_Final_Payment_Due_Date__c: Raw date — the queryable one.
+    DS_Final_Payment_Due_Date_Formate__c: MM/DD/YYYY text twin, misspelled 'Formate'.
+    DS_First_Installment_Due_Date__c: Raw date.
+    DS_First_Installment_Due_Date_Formatted__c: MM/DD/YYYY text twin ('Formatted' here).
+    DS_Payment_Commencement_Date__c: Raw date.
+    DS_Payment_Commencement_Date_Formatted__c: MM/DD/YYYY text twin ('Formatted' here).
+    DS_ACH_Debit_Date_Each_Month__c: Day of month the ACH debit runs.
+    DS_Payment_Period_Month__c: Payment period in months.
+  Account:
+    DS_Today_Date__c: >
+      Formula returning today as MM/DD/YYYY text — DocuSign plumbing, not a
+      data date.
+    PersonEmail: >
+      The candidate's email on a Person Account (there is no plain Email
+      field on person accounts).
+    OwnerId: >
+      The candidate's CS Person (a User). In relationship syntax the lookup
+      becomes 'Owner' — Candidate__r.Owner.Name / .Owner.Email.
+  User:
+    Email: >
+      The user's actual email address — the field DocuSign recipients are
+      built from. Not SenderEmail (outbound config), not EmailEncodingKey.
+  dfsle__EnvelopeStatus__c:
+    dfsle__Status__c: Sent | Completed | Voided | Declined | Authentication Failed.
+    dfsle__SourceId__c: >
+      The Salesforce record this envelope was sent from — join it to
+      Background_Check__c or Onboarding__c Ids.
+    dfsle__Sent__c: When the envelope went out.
+    dfsle__Completed__c: When the last signer finished.
+
+knowledge:
+  - title: How the DocuSign integration works (architecture)
+    keywords: [docusign, architecture, gen, envelope, connect, writeback, flow]
+    text: |
+      Two document types ride the pipeline: the Employment Placement
+      Services Agreement (from Onboarding__c) and the combined ACH
+      Authorization + Promissory Note (from Background_Check__c). In the new
+      implementation a Gen Template fills a Word document with record data
+      via anchor tags and generates a PDF; a linked Envelope Template then
+      sends it automatically (Send Now — no sender screens) to the recipient
+      chain with per-recipient emails and ID verification; DocuSign Connect
+      (a webhook) streams status changes back into the dfsle envelope/
+      recipient status records; on completion the signed PDF plus the
+      Certificate of Completion are saved to the record's Files, and Field
+      Value Updates flip the Salesforce status fields. Buttons appear only
+      at the right process stage via Lightning Dynamic Actions.
+  - title: The services agreement flow (Onboarding)
+    keywords: [services, agreement, onboarding, candidate, counter, resume, signed]
+    text: |
+      The "Send Services Agreement" button shows only while the onboarding
+      sits at Status 'Service Agreement' with both agreement flags false.
+      One click generates the populated agreement and sends it: the
+      candidate signs first (with ID verification, plus an ID-type dropdown
+      and ID number field), then it routes to the company signer for
+      counter-signature. Sending sets Service_Agreement_Sent__c, completion
+      sets Service_Agreement_Signed__c, and the signed PDF lands in Files.
+      A validation rule keeps the record from advancing to Resume Creation
+      until the agreement is signed — the legal gate before resume work
+      begins. Production data: 798 onboardings, 746 with signed agreements.
+  - title: The ACH + promissory three-signer flow
+    keywords: [ach, promissory, cs person, candidate, routing, financial]
+    text: |
+      Three recipients in strict order. (1) The CS Person — the candidate's
+      owner — goes first and fills every financial figure (monthly debit,
+      commencement date, period, total, principal, installment, months,
+      first payment date); they have no signature field, "Needs to Sign"
+      without one being the supported stand-in for a prefill role. (2) The
+      candidate passes ID Verification WITH LIVENESS, fills personal and
+      bank details (bank name, account and routing numbers, account type,
+      address, document type/number, SSN or last 4) and signs. (3) The
+      company signer counter-signs. Completion flips both document statuses
+      to Signed; voiding resets them to Pending. In production TODAY this
+      flow's statuses are still set by hand — the auto-updates are the
+      sandbox implementation awaiting deployment.
+  - title: Collaborative correction — fixing a wrong value without voiding
+    keywords: [collaborative, correction, initials, wrong, value, clear, reroute, fix, mistake, bank, cs, typed]
+    text: |
+      If the candidate types a wrong value (say a bad account number), the
+      CS Person does not void the envelope: the candidate-filled fields are
+      collaborative, so the CS Person clears the bad value and finishes
+      ("Required for Selected Signers" is off for them, so no validation
+      error), and because "Changes Require Initials" is on, DocuSign
+      automatically routes the envelope back to the candidate to re-enter
+      and initial the corrected field. Everyone's other data is preserved.
+      Voiding would have thrown away the CS Person's eight financial fields
+      and restarted the whole chain.
+  - title: ID verification and the Authentication Failed status
+    keywords: [verification, liveness, authentication, failed, resend, selfie, identity]
+    text: |
+      The services agreement uses standard DocuSign ID Verification; the
+      ACH + promissory upgrades to ID Verification with Liveness — the
+      candidate must complete a live selfie, so a photo of an ID photo
+      fails. When a signer fails (expired ID, blurry photo, name mismatch,
+      failed liveness), the envelope shows 'Authentication Failed': the fix
+      is clicking Resend so the candidate gets a fresh link and retries
+      with a valid government ID in good lighting — nothing on the
+      Salesforce record needs editing.
+  - title: Date and currency formatting — the recurring DocuSign trap
+    keywords: [date, format, writeback, illegal, assignment, currency, formatted]
+    text: |
+      Salesforce serializes dates as YYYY-MM-DD; DocuSign's date validation
+      only accepts MM/DD/YYYY — so every date that pre-populates a DocuSign
+      tab needs a TEXT formula twin formatted MM/DD/YYYY, and the raw Date
+      field serves only as the writeback target. That is why the DS_*
+      fields come in raw + formatted pairs (with drifting spellings —
+      'Formate' on three, 'Formatted' on two — in production). Currency
+      shown in DocuSign needs a $-formatted text twin for the same reason.
+      Writeback failures have five classic causes: writeback not enabled on
+      the merge field, the field marked read-only for the signer, MFA for
+      API logins enabled on the integration user, a formula field as the
+      target, or missing edit FLS.
+  - title: Duplicate unsigned PDFs in Files
+    keywords: [duplicate, unsigned, pdf, files, completed, cleanup]
+    text: |
+      Every click of a Gen Template send button saves a copy of the
+      generated UNSIGNED PDF to the record's Files — a DocuSign Apps
+      Launcher limitation with no toggle. The signed final document is the
+      one with "_completed" in its filename (the Certificate of Completion
+      sits alongside it). When counting or fetching agreement documents,
+      prefer the _completed file; the unsigned copies are send-time
+      artifacts. A cleanup flow (delete unsigned copies when the completed
+      file arrives) is designed but not implemented.
+  - title: Why the design looks the way it does
+    keywords: [design, send now, prefill, editor, trade-off, decisions]
+    text: |
+      Send Now on both envelope templates exists because the default
+      sending experience showed the document twice and let senders alter
+      recipients; Gen Templates merge data INTO the document text because
+      overlay tabs misalign when values change length; the CS Person is
+      "Needs to Sign" without a signature field because Apps Launcher has
+      no native prefill role, and the Editor recipient type is not licensed
+      on this account; the ACH form and promissory note were merged into
+      one document so the CS Person fills the financial fields once; the
+      old Lead-based templates were deleted when the process was rebuilt
+      around Onboarding and Background Check records.
+  - title: Deployment status and open items
+    keywords: [deployment, production, custody, sender, offer letter, pending]
+    text: |
+      The new implementation runs in the Dev9 sandbox against the DocuSign
+      demo account; PRODUCTION DEPLOYMENT HAS NOT BEEN EXECUTED. The
+      migration plan: install/connect the package in production, export/
+      import envelope templates (Gen Templates must be rebuilt by hand —
+      they are not portable), create the Custody Transfer Rule so envelopes
+      appear from legal@techsarasolutions.com (irreversible once created),
+      and re-verify ID-verification plan features. Open items: sender email
+      still shows the connected user; the duplicate-PDF cleanup flow is
+      unbuilt; the Offer Letter template with a DocuSign Signing Group (a
+      delegate can sign for the CEO) is in planning; the MM/DD/YYYY-to-Date
+      writeback flow is designed but unverified.
+  - title: The six field-usage rules of the integration
+    keywords: [rules, personemail, owner, traversal, writeback, formula, currency, email, candidate, recipient, docusign, envelope]
+    text: |
+      Six rules keep the field plumbing correct. (1) Never pre-populate a
+      DocuSign date tab from a raw Date field — Salesforce sends YYYY-MM-DD,
+      DocuSign rejects it; always use the MM/DD/YYYY text formula twin.
+      (2) Writeback targets must be plain writable fields — a formula field
+      can never receive writeback. (3) On a Person Account the email is
+      PersonEmail (a plain Email field does not exist there); on User it is
+      Email (not SenderEmail or EmailEncodingKey). (4) The OwnerId lookup
+      becomes 'Owner' in relationship syntax: the CS Person is
+      Candidate__r.Owner.Name / .Owner.Email. (5) Field Value Updates fire
+      per event (Sent, Completed, Voided) and are the right tool for
+      intermediate status flips; merge-field writeback fires only when the
+      whole envelope completes. (6) Currency shown in DocuSign needs a
+      $-formatted text formula twin — raw Currency fields pass as bare
+      numbers. Two designed helper fields (DS_Date_Display__c, and the test
+      field DS_Testing_Field__c) are NOT in the production warehouse.
+  - title: What DocuSign accepts in each signer field (validation)
+    keywords: [regex, accepts, invalid, routing, ssn, phone, format, rejected]
+    text: |
+      The signer cannot finish until each field passes its validation, so
+      "DocuSign won't accept my value" questions resolve to these rules:
+      bank account number = 6-17 digits only; bank routing number = exactly
+      9 digits; dollar amounts must include the $ sign ($12,000.15 style);
+      US phone accepts (123) 456-7890, 123-456-7890, +1 variants or ten
+      bare digits; day-of-month accepts 1-31 only; SSN accepts the last 4
+      digits, the full 9, or the dashed 123-45-6789 form (a variant
+      requires exactly the last 4). Each shows a plain-language message on
+      failure. These values live only inside the signed PDF afterwards —
+      they are never queryable fields.
+  - title: DocuSign in production data (verified 2026-08-17)
+    keywords: [production, envelopes, counts, voided, reality]
+    text: |
+      The DocuSign package tables are synced and queryable in the
+      production warehouse: 107 envelope status rows — 72 Completed, 33
+      Voided, 2 Sent — with sent/completed timestamps, per-signer detail in
+      322 recipient-status rows, and dfsle__SourceId__c linking each
+      envelope to the record it was sent from. The high void count is
+      normal operational churn (re-sends after corrections or failed ID
+      checks). Production sending still goes through the older flow-based
+      path; the envelope volume covers both the ACH/promissory documents
+      and earlier sends. Onboarding__c holds 798 rows with 746 signed
+      service agreements.

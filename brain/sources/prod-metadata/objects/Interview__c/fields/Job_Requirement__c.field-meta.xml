@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Job_Requirement__c</fullName>
+    <deleteConstraint>SetNull</deleteConstraint>
+    <description>Links this interview to the Job Requirement it came from. Auto-filled from Job Submission when interview is created via Create Interview flow.</description>
+    <inlineHelpText>Auto-populated from Job Submission when using Create Interview flow. Required for B2B Requirement interviews per validation rule.</inlineHelpText>
+    <label>Job Requirement</label>
+    <referenceTo>Job_Requirement__c</referenceTo>
+    <relationshipLabel>Interviews</relationshipLabel>
+    <relationshipName>Interviews</relationshipName>
+    <required>false</required>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Lookup</type>
+</CustomField>

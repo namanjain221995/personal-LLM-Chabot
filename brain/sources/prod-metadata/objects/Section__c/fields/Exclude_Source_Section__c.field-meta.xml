@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Exclude_Source_Section__c</fullName>
+    <deleteConstraint>SetNull</deleteConstraint>
+    <description>Review section: all source sections except this one (e.g. except Coding).</description>
+    <label>Exclude Source Section</label>
+    <referenceTo>Section__c</referenceTo>
+    <relationshipLabel>Review Except Sections</relationshipLabel>
+    <relationshipName>Review_Except_Sections</relationshipName>
+    <required>false</required>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Lookup</type>
+</CustomField>

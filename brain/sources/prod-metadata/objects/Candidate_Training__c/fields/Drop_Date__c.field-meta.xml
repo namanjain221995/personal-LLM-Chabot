@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Drop_Date__c</fullName>
+    <description>The date the candidate was removed from this training. Set this BEFORE flipping Status to Dropped; the Candidate_Training_Dropped_Cascade flow uses it as the cutoff for cascading status updates on Deliverables/Steps/Sessions. Records dated before this day keep their prior status; on/after this day they roll to Dropped (Steps and Deliverables) or Cancelled (Sessions). Leave blank to default to today.</description>
+    <inlineHelpText>Set before changing Status to Dropped. Drives the cutoff date for cascading updates on the training&apos;s deliverables, steps, and sessions. Blank = today.</inlineHelpText>
+    <label>Drop Date</label>
+    <required>false</required>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Date</type>
+</CustomField>

@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Target_Candidate_Rate__c</fullName>
+    <description>SENSITIVE. Expected pay rate for the candidate. Used with Client Bill Rate to plan margin. Visible only to Account Manager and Leadership.</description>
+    <inlineHelpText>Enter the target pay rate for candidates. Combined with Client Bill Rate to calculate Estimated Margin. Keep confidential.</inlineHelpText>
+    <label>Target Candidate Rate</label>
+    <precision>18</precision>
+    <required>false</required>
+    <scale>0</scale>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Currency</type>
+</CustomField>

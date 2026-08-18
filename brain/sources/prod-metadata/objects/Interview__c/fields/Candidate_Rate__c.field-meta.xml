@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Candidate_Rate__c</fullName>
+    <description>Snapshot of the Candidate Rate at the time of interview creation. Preserved even if rates change later. Used for historical margin reporting.</description>
+    <inlineHelpText>Auto-populated from Job Submission Candidate Rate when interview is created. Snapshot preserved for historical reporting accuracy.</inlineHelpText>
+    <label>Candidate Rate</label>
+    <precision>18</precision>
+    <required>false</required>
+    <scale>2</scale>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Currency</type>
+</CustomField>

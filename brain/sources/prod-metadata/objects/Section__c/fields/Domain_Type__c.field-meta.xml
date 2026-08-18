@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Domain_Type__c</fullName>
+    <description>Whether this section applies to technical roles, non-technical roles, or both. Used by Techsara&apos;s Magic mode to fetch sections matching the Niche Domain Type.</description>
+    <inlineHelpText>Tech = technical roles only, Non-Tech = non-technical roles only, Both = applies to all.</inlineHelpText>
+    <label>Domain Type</label>
+    <required>false</required>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Picklist</type>
+    <valueSet>
+        <restricted>true</restricted>
+        <valueSetDefinition>
+            <sorted>false</sorted>
+            <value>
+                <fullName>Tech</fullName>
+                <default>false</default>
+                <label>Tech</label>
+            </value>
+            <value>
+                <fullName>Non-Tech</fullName>
+                <default>false</default>
+                <label>Non-Tech</label>
+            </value>
+            <value>
+                <fullName>Both</fullName>
+                <default>true</default>
+                <label>Both</label>
+            </value>
+        </valueSetDefinition>
+    </valueSet>
+</CustomField>

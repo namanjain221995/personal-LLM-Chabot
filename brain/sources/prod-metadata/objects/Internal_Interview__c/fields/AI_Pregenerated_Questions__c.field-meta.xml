@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>AI_Pregenerated_Questions__c</fullName>
+    <description>JSON blob of AI questions generated at scheduling time, per AI section. Written by AiQuestionPregenService, read by the Conduct Interview flow (AiPregenReader). Not for hand-editing.</description>
+    <label>AI Pregenerated Questions</label>
+    <length>131072</length>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>LongTextArea</type>
+    <visibleLines>10</visibleLines>
+</CustomField>

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Account_Manager__c</fullName>
+    <deleteConstraint>SetNull</deleteConstraint>
+    <description>The Techsara Account Manager responsible for managing this client relationship. Auto-populates on Job Requirements created under this account.</description>
+    <inlineHelpText>Select the Account Manager who owns this client relationship. This person will be defaulted on all Job Requirements created for this client.</inlineHelpText>
+    <label>Account Manager</label>
+    <referenceTo>User</referenceTo>
+    <relationshipName>Accounts</relationshipName>
+    <required>false</required>
+    <trackFeedHistory>false</trackFeedHistory>
+    <trackHistory>false</trackHistory>
+    <type>Lookup</type>
+</CustomField>

@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Hired_Niche__c</fullName>
+    <deleteConstraint>SetNull</deleteConstraint>
+    <label>Hired Niche</label>
+    <referenceTo>Niche__c</referenceTo>
+    <relationshipLabel>Internal Interviews (Hiring Niche)</relationshipLabel>
+    <relationshipName>Internal_Interviews1</relationshipName>
+    <required>false</required>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Lookup</type>
+</CustomField>

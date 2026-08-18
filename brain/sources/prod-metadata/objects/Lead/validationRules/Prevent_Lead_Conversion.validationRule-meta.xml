@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ValidationRule xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Prevent_Lead_Conversion</fullName>
+    <active>true</active>
+    <description>No one can convert the lead until there is no job requirement and job submission.</description>
+    <errorConditionFormula>AND(
+ISPICKVAL(Status, &quot;Converted&quot;),
+RecordType.DeveloperName = &quot;B2B_Client_Lead&quot;,
+NOT( Flow_Only_Field__c ),
+OR(
+Total_Job_Requirements__c = 0,
+ISBLANK(Total_Job_Requirements__c),
+Total_Job_Applications__c = 0,
+ISBLANK(Total_Job_Applications__c)
+)
+)</errorConditionFormula>
+    <errorMessage>You can&apos;t convert this lead because it doesn&apos;t have a job requirement or a job submission.</errorMessage>
+</ValidationRule>

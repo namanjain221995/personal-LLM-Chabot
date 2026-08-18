@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Activate_From__c</fullName>
+    <description>Date from which this session window becomes visible to candidates on the portal. Auto-populated by the sessionWindowCreator LWC to Start Date - 7 days at creation. Admin can override to open the booking window earlier or later.</description>
+    <label>Activate From</label>
+    <required>false</required>
+    <trackTrending>false</trackTrending>
+    <type>Date</type>
+</CustomField>

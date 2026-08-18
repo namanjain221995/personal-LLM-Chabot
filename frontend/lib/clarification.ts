@@ -182,6 +182,37 @@ export function pendingClarification(
   return null;
 }
 
+/**
+ * How a card at `index` in the thread should render.
+ *
+ * A card is LIVE only while it is the question the thread is waiting on. Every
+ * older one is history: it has already been answered, and the answer is the
+ * turn after it.
+ *
+ * Without this the transcript was full of live controls. `MessageRow` rendered
+ * a card for any message carrying `meta.clarification`, and the parent's
+ * "answer in flight" lock is keyed by id and clears when the run finishes — so
+ * once an answer came back, every card in the conversation was clickable
+ * again, and clicking a different option on a question from ten turns ago
+ * started a whole new run against an intent the chat had long moved past.
+ */
+export function cardState(
+  messages: readonly ChatMessage[],
+  index: number,
+): { pending: boolean; answeredWith: string } {
+  const request = parseClarification(messages[index]?.meta?.clarification);
+  if (!request) return { pending: false, answeredWith: '' };
+  // Defined in terms of `pendingClarification` rather than re-deriving
+  // "is this the last one": two answers to that question that could disagree
+  // is how a card ends up locked in one place and live in another.
+  const active = pendingClarification(messages);
+  if (active?.clarification_id === request.clarification_id) {
+    return { pending: true, answeredWith: '' };
+  }
+  const reply = messages.slice(index + 1).find((m) => m.role === 'user');
+  return { pending: false, answeredWith: (reply?.content ?? '').trim() };
+}
+
 /** Keyboard hints: 1..N for the options, then N+1 for "Something else". */
 export function optionShortcut(index: number): string | null {
   return index < 9 ? String(index + 1) : null;
@@ -193,19 +224,28 @@ export type CardAction =
   /** Multi-select: tick or untick, without submitting. */
   | { kind: 'toggle'; optionId: string }
   | { kind: 'move'; delta: number }
-  /** Open the inline "Something else" text field. */
+  /** Hand free-text answering to the main composer. */
   | { kind: 'custom' }
   /** Send what is currently ticked (the Done button, or Enter/⌘Enter). */
   | { kind: 'confirm' }
-  | { kind: 'dismiss' }
+  /**
+   * Leave the panel for the composer, optionally carrying the character that
+   * triggered it.
+   *
+   * The panel sits directly above the composer and takes focus when a question
+   * appears, so the number keys work the moment it does. That is only safe if
+   * TYPING still goes where typing goes: without this, someone answering "the
+   * scheduled interview for Dileep" in their own words would have their first
+   * letter swallowed, and any digit in what they typed would have picked an
+   * option and sent it.
+   */
+  | { kind: 'leave'; text?: string }
   | null;
 
 export interface KeyContext {
   optionCount: number;
   allowCustom: boolean;
-  /** Dismiss is offered only when a safe fallback exists (a skip is allowed). */
-  dismissible: boolean;
-  /** True while the custom text box has focus — digits are then literal text. */
+  /** True while a text box has focus — digits are then literal text. */
   typingCustom: boolean;
   /** Several answers allowed: keys TOGGLE, and Done/⌘Enter sends. */
   multiSelect?: boolean;
@@ -240,14 +280,16 @@ export function cardKeyAction(
   if (accel && key === 'Enter') return { kind: 'confirm' };
   if (event.metaKey || event.ctrlKey || event.altKey) return null;
 
-  if (key === 'Escape') {
-    return context.dismissible ? { kind: 'dismiss' } : null;
-  }
+  // Escape always returns to the composer. It does NOT answer the question:
+  // wanting to type your own answer is the commonest reason to press it, and
+  // silently submitting "no preference" for that would answer on the user's
+  // behalf with something they never chose.
+  if (key === 'Escape') return { kind: 'leave' };
   if (key === 'ArrowDown' || key === 'ArrowRight') return { kind: 'move', delta: 1 };
   if (key === 'ArrowUp' || key === 'ArrowLeft') return { kind: 'move', delta: -1 };
 
   if (key === 'Enter') {
-    // Enter on the "Something else" row opens the text field rather than
+    // Enter on the "Something else" row hands over to the composer rather than
     // sending an empty answer.
     if (
       context.allowCustom &&
@@ -271,7 +313,12 @@ export function cardKeyAction(
     if (context.allowCustom && index === context.optionCount) {
       return { kind: 'custom' };
     }
+    // A digit past the end of the card is not a shortcut, it is the start of
+    // something being typed ("90 days"). Fall through.
   }
+
+  // Any other single printable character belongs to the composer.
+  if (key.length === 1 && key !== ' ') return { kind: 'leave', text: key };
   return null;
 }
 

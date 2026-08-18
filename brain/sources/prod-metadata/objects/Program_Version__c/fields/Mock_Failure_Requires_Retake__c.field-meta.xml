@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Mock_Failure_Requires_Retake__c</fullName>
+    <defaultValue>true</defaultValue>
+    <description>When true, a candidate who fails a mock interview must retake the corresponding training cycle (per the retake logic — fall back to earlier weeks if the current week has no capacity).</description>
+    <label>Mock Failure Requires Retake</label>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Checkbox</type>
+</CustomField>

@@ -1,0 +1,279 @@
+# Generated 2026-08-17 from brain/sources/prod-metadata/objects (PRODUCTION
+# metadata retrieve) by orchestrator/scripts/build_dictionary_from_metadata.py.
+# Knowledge-only on purpose: save-time rules answer "why can't X be saved /
+# why did the update fail", which is retrieval territory — they never need
+# to ride along on ordinary analytics questions. Regenerate after the next
+# metadata retrieve rather than editing by hand.
+name: prod-validation-rules
+description: 'What production actually enforces at save time — the 38 active validation rules,
+  extracted from the 2026-08-17 metadata retrieve. Knowledge-only: retrieved for why-did-this-fail
+  questions.'
+knowledge:
+- title: Save rules on Account (validation rules, production)
+  keywords:
+  - account
+  - validation
+  - save
+  - error
+  - required
+  - blocked
+  text: 'Active validation rules on Account — the reasons a save fails:
+
+    - Candidate_Status_Change_Reason_Required: blocks the save with "Please enter a status
+    change reason of at least 50 characters." (Blocks save when Candidate Status changes to
+    non-Active unless user types a genuinely changed reason of at least 50 chars. Active is
+    exempt. Does not fire on new record creation.)'
+- title: Save rules on Background_Check__c (validation rules, production)
+  keywords:
+  - background
+  - check
+  - validation
+  - save
+  - error
+  - required
+  - blocked
+  text: 'Active validation rules on Background_Check__c — the reasons a save fails:
+
+    - Require_CandidateDetail_For_Verification: blocks the save with "Candidate Details Status
+    must be Submitted before moving to Verification In Progress."
+
+    - Require_Documents_For_Candidate_Details: blocks the save with "ACH Authorization and
+    Promissory Note must both be Signed before moving to Candidate Details Pending."
+
+    - Require_Payment_For_Documents_Pending: blocks the save with "Offer Letter Payment Status
+    must be Received before moving to Documents Pending."
+
+    - Require_Project_For_Candidate_Submitted: blocks the save with "At least one related
+    Background Check Employment must exist before submitting Candidate Details."
+
+    - Require_Verification_For_Completed: blocks the save with "Verification Status must be
+    Completed and Final Employer Confirmation must be received before completing the Background
+    Check."'
+- title: Save rules on Deliverable__c (validation rules, production)
+  keywords:
+  - deliverable
+  - validation
+  - save
+  - error
+  - required
+  - blocked
+  text: 'Active validation rules on Deliverable__c — the reasons a save fails:
+
+    - Prevent_Past_Approval_Date: blocks the save with "The Approved At date and time cannot
+    be in the past."'
+- title: Save rules on Internal_Interview__c (validation rules, production)
+  keywords:
+  - internal
+  - interview
+  - validation
+  - save
+  - error
+  - required
+  - blocked
+  text: 'Active validation rules on Internal_Interview__c — the reasons a save fails:
+
+    - Lock_Rescheduled_Session: blocks the save with "This record is locked because the session
+    status is already Rescheduled."'
+- title: Save rules on Interview__c (validation rules, production)
+  keywords:
+  - interview
+  - validation
+  - save
+  - error
+  - required
+  - blocked
+  text: 'Active validation rules on Interview__c — the reasons a save fails:
+
+    - B2B_Interview_Needs_Submission: blocks the save with "Job Submission and Job Requirement
+    are required for B2B Requirement interviews." (Job Submission and Job Requirement are
+    required for B2B Requirement interviews.)
+
+    - Edit_Interview_Support_Person: blocks the save with "You are not authorized to change
+    the Interview Support Person"
+
+    - Interview_Candidate_OR_Lead_Required: blocks the save with "Either Candidate or Lead
+    must be linked for B2B Interview."
+
+    - Prevent_Manual_Ghosted: blocks the save with "Interview Outcome cannot be set to Ghosted
+    manually. This value is system-managed and is updated automatically after 14 days from
+    the Date of Interview." (Users should not be allowed to select interview outcome as ghosted
+    manually as it is updated using flow.)
+
+    - Require_Comment_For_Other: blocks the save with "Status Reason Comment is required when
+    Status Reason is Other."
+
+    - Requires_Status_Reason: blocks the save with "Status Reason is required when Interview
+    Status is Rescheduled, Cancelled, or No Show"
+
+    - Inactive (defined but NOT enforced): Offer_Requires_OfferLetterDate'
+- title: Save rules on Invoice__c (validation rules, production)
+  keywords:
+  - invoice
+  - validation
+  - save
+  - error
+  - required
+  - blocked
+  text: 'Active validation rules on Invoice__c — the reasons a save fails:
+
+    - Inactive (defined but NOT enforced): Recurring_Required_Fields'
+- title: Save rules on Job_Requirement__c (validation rules, production)
+  keywords:
+  - job
+  - requirement
+  - validation
+  - save
+  - error
+  - required
+  - blocked
+  text: 'Active validation rules on Job_Requirement__c — the reasons a save fails:
+
+    - Client_Account_Cannot_Be_Candidate: blocks the save with "Client Account must be a B2B
+    Client or Vendor Business Account, not a Candidate Person Account." (This validation rule
+    ensures that the Client Account selected on the Job Requirement must be a B2B Client or
+    Vendor Business Account. Person Accounts linked to Candidates are not allowed.)
+
+    - Invalid_Status_Transition: blocks the save with "Invalid Job Status transition. Allowed
+    transitions are: New → Open, Open → On Hold or Closed, and On Hold → Open or Closed. Only
+    System Administrators can reopen a Closed Job Requirement." (Restricts invalid Job Status
+    transitions by enforcing the approved Job Requirement lifecycle. Valid transitions are:
+    New → Open, Open → On Hold/Closed, On Hold → Open/Closed. Reopening a Closed Job Requirement
+    (Closed → Open) is permitted only for admins)
+
+    - Max_Submissions_Allowed: blocks the save with "Max Submissions Allowed must be greater
+    than the Number of Openings"
+
+    - Open_Job_Needs_Deadline: blocks the save with "Submission Deadline is required when
+    Job Status is Open." (Submission Deadline is required when Job Status is Open.)
+
+    - Submission_After_Req_Received: blocks the save with "Submission Deadline must be later
+    than the Requirement Received Date/Time." (Ensures Submission Deadline is later than Requirement
+    Received Date/Time)
+
+    - Submission_Deadline: blocks the save with "Submission Deadline is required when Job
+    Status is Open. Please enter the date and time by which candidate profiles must be submitted
+    to the client." (This validation rule ensures that Submission Deadline is mandatory when
+    Job Status is set to Open. If the Submission Deadline is left blank, the system will block
+    the save and display an error message.)
+
+    - job_requirements_publish_status_is_open: blocks the save with "A job can only be published
+    when Job Status is Open."
+
+    - Inactive (defined but NOT enforced): Job_Requirement_Required_Fields, Published_Job_Needs_Description,
+    Req_Received_Before_Submission, Require_One_Complete_Client_Pair, submissionDeadlineDateValidation'
+- title: Save rules on Job_Submission__c (validation rules, production)
+  keywords:
+  - job
+  - submission
+  - validation
+  - save
+  - error
+  - required
+  - blocked
+  text: 'Active validation rules on Job_Submission__c — the reasons a save fails:
+
+    - Bill_Rate_Required_On_Submit: blocks the save with "Submitted Bill Rate is required
+    when submitting profile to client." (Submitted Bill Rate is required when submitting profile
+    to client.)
+
+    - Candidate_OR_Lead_Required: blocks the save with "Either Candidate or Lead must be linked
+    to this Job Submission."
+
+    - Client_Date_Required_On_Submit: blocks the save with "Client Submission Date/Time is
+    required when status is Submitted to Client." (Client Submission Date/Time is required
+    when status is Submitted to Client.)
+
+    - Submission_Required_Fields_Validation: blocks the save with "Please fill in all required
+    fields: Job Requirement, Candidate, Submitted By, Account Manager, Submission Status,
+    Internal Submission Date Time, Candidate Rate, Candidate Summary and Unique Submission
+    Key." (Ensures all mandatory fields on the Submission are filled before saving. Self-service
+    sources (Website Applicant, Candidate Portal) are exempt, as those recruiter-only fields
+    are filled in later.)'
+- title: Save rules on Lead (validation rules, production)
+  keywords:
+  - lead
+  - validation
+  - save
+  - error
+  - required
+  - blocked
+  text: 'Active validation rules on Lead — the reasons a save fails:
+
+    - Attach_Resume_Before_Conversion: blocks the save with "Please attach the resume before
+    converting this Lead." (Resume needs to be attached before converting a lead.)
+
+    - Background_Required_In_Negotiation: blocks the save with "Fill Out the Background Information
+    before moving the status to Negotiation."
+
+    - Contact_Details_Requried: blocks the save with "Provide either Email or Phone or LinkedIn
+    URL before moving this Lead to Contacted."
+
+    - Lead_Conversion_Validation: blocks the save with "Avoid converting lead from here. Use
+    the ''Convert Lead'' button."
+
+    - Prevent_Lead_Conversion: blocks the save with "You can''t convert this lead because
+    it doesn''t have a job requirement or a job submission." (No one can convert the lead
+    until there is no job requirement and job submission.)'
+- title: Save rules on Marketing__c (validation rules, production)
+  keywords:
+  - marketing
+  - validation
+  - save
+  - error
+  - required
+  - blocked
+  text: 'Active validation rules on Marketing__c — the reasons a save fails:
+
+    - Recruiter_required_before_applications: blocks the save with "Assign a Recruiter before
+    starting the applications"
+
+    - Update_Reason_for_Hold: blocks the save with "Please fill in the details. Reason for
+    pausing"'
+- title: Save rules on Onboarding__c (validation rules, production)
+  keywords:
+  - onboarding
+  - validation
+  - save
+  - error
+  - required
+  - blocked
+  text: 'Active validation rules on Onboarding__c — the reasons a save fails:
+
+    - Candidate_Approval_Required: blocks the save with "Get the candidate approval of the
+    resume before completion of the onboarding"
+
+    - Onboarding_Completion_Validation: blocks the save with "The ''Status'' field cannot
+    be set to ''Onboard Completion'' directly. Please use Complete Onboarding button."
+
+    - Service_Agreement_Required_Before_Resume: blocks the save with "Get the Service Agreement
+    signed before starting on the Resume."
+
+    - Work_Authorization_Required: blocks the save with "Get the candidate approval of the
+    resume before completion of the onboarding"
+
+    - Inactive (defined but NOT enforced): ATS_Score_below_75'
+- title: Save rules on Recruiter__c (validation rules, production)
+  keywords:
+  - recruiter
+  - validation
+  - save
+  - error
+  - required
+  - blocked
+  text: 'Active validation rules on Recruiter__c — the reasons a save fails:
+
+    - Start_End_Time_Required_If_Tomorrow_Avai: blocks the save with "Start Time IST and End
+    Time IST are required when Tomorrow Availability is checked."'
+- title: Save rules on Session__c (validation rules, production)
+  keywords:
+  - session
+  - validation
+  - save
+  - error
+  - required
+  - blocked
+  text: 'Active validation rules on Session__c — the reasons a save fails:
+
+    - Require_Host_Feedback_On_Complete: blocks the save with "Host Feedback is required before
+    marking the session Completed." (Blocks saving Status = Completed unless Host_Feedback__c
+    is populated. Trainer must record outcome before closing the session.)'

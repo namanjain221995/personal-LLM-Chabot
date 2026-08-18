@@ -13,12 +13,8 @@
 
 import { useEffect, useState } from 'react';
 import type { ChatMessage } from '@/lib/types';
-import {
-  parseClarification,
-  type ClarificationRequest,
-  type ClarificationResponse,
-} from '@/lib/clarification';
-import { ClarificationCard } from './ClarificationCard';
+import { parseClarification } from '@/lib/clarification';
+import { ClarificationRecord } from './ClarificationCard';
 import { Loader } from './Loader';
 import { ReasoningStar } from './ReasoningStar';
 import { SalesforceSourceLine } from './SalesforceSourceLine';
@@ -60,10 +56,8 @@ export function MessageRow({
   onShowSummary,
   onRetry,
   onFeedback,
-  onClarify,
-  onClarificationAnswer,
-  onClarificationCustom,
-  submittingClarificationId = null,
+  clarificationPending = false,
+  clarificationAnswer = '',
 }: {
   message: ChatMessage;
   isLast: boolean;
@@ -71,35 +65,23 @@ export function MessageRow({
   /** Opens the read-only rolling-summary panel (compaction notice). */
   onShowSummary?: () => void;
   onRetry: () => void;
-  /** LEGACY (`meta.clarify`): answer by sending the chosen option as the next
-   *  message. The server resolves it against the original question. */
-  onClarify?: (choice: string) => void;
-  /** Salesforce Intelligence Mode (`meta.clarification`): answer the typed
-   *  question. The server RESUMES the original request rather than treating
-   *  this as a new one. */
-  onClarificationAnswer?: (
-    response: ClarificationResponse,
-    summary: string,
-  ) => void;
-  /** "Something else" — hand over to the normal composer. */
-  onClarificationCustom?: (request: ClarificationRequest) => void;
   /**
-   * The clarification whose answer is in flight, if any. Compared by ID rather
-   * than passed as a boolean: a shared flag latched on after the first answer
-   * and left every LATER question in the thread rendered disabled and
-   * unclickable.
+   * Is THIS message's question the one the thread is waiting on?
+   *
+   * Computed by the parent from the whole thread (`cardState`), because a
+   * message cannot know what came after it. A live question renders NOTHING
+   * here: it is a temporary control and it belongs to the composer. Only an
+   * answered one leaves a record behind.
    */
-  submittingClarificationId?: string | null;
+  clarificationPending?: boolean;
+  /** What was chosen, for the record of an answered question. */
+  clarificationAnswer?: string;
   /** Persist a thumb server-side. Omitted in contexts with no store
    *  (previews, tests), where the localStorage fallback still applies. */
   onFeedback?: (feedback: MessageFeedback | null) => void;
 }) {
   // Hooks live above the user-bubble early return (rules of hooks).
   const [activityOpen, setActivityOpen] = useState(false);
-  // "Something else" opens a box rather than sending its own label as the
-  // answer, which is what it did before — and which told the server nothing.
-  const [clarifyOther, setClarifyOther] = useState(false);
-  const [clarifyText, setClarifyText] = useState('');
   // The SERVER's value wins when the message has one: it is the copy that
   // survives a reload. localStorage is the fallback for messages that have
   // not been stored yet (and for anything rendering without a store), which
@@ -216,6 +198,14 @@ export function MessageRow({
   // final phase as history, not as work still in progress.
   const phaseStatus = message.phaseStatus ?? null;
   const clarification = parseClarification(message.meta?.clarification);
+  // A turn whose ONLY content is a live question renders nothing at all: the
+  // question itself is a temporary control and the composer is showing it.
+  // Without this the transcript kept an empty assistant row under the request,
+  // complete with copy / thumbs / retry buttons for a message with no text —
+  // which reads as an answer that failed rather than a question being asked.
+  if (clarification && clarificationPending && !hasActivity && !message.meta?.data) {
+    return null;
+  }
   const showShimmer =
     streaming &&
     message.content.length === 0 &&
@@ -308,20 +298,14 @@ export function MessageRow({
             </button>
           )}
 
-          {/* Salesforce Intelligence Mode's typed card wins when present; the
-              legacy `meta.clarify` buttons below still render every
-              conversation persisted before it existed, and every answer given
-              while the feature is switched off. Never both — the `!clarification`
-              guard is what keeps one question from showing two sets of
-              controls. */}
-          {clarification && onClarificationAnswer && (
-            <ClarificationCard
-              request={clarification}
-              submitting={
-                submittingClarificationId === clarification.clarification_id
-              }
-              onSubmit={onClarificationAnswer}
-              onUseComposer={() => onClarificationCustom?.(clarification)}
+          {/* A LIVE question is not rendered here at all — the composer owns
+              it (see ClarificationCard). What the transcript keeps is the
+              record of one already answered, so the user turn after it
+              ("Interview") reads as an answer rather than a non sequitur. */}
+          {clarification && !clarificationPending && (
+            <ClarificationRecord
+              question={clarification.question}
+              answer={clarificationAnswer || 'Answered'}
             />
           )}
 
@@ -333,75 +317,6 @@ export function MessageRow({
             />
           )}
 
-          {!clarification && message.meta?.clarify && onClarify && (
-            <div className="mt-3 rounded-lg border border-border bg-surface p-3">
-              <p className="text-sm font-medium text-fg">
-                {message.meta.clarify.question}
-              </p>
-              {message.meta.clarify.reason && (
-                <p className="mt-1 text-xs text-muted">
-                  {message.meta.clarify.reason}
-                </p>
-              )}
-              <div className="mt-3 flex flex-col gap-1.5">
-                {message.meta.clarify.options.map((option) => (
-                  <button
-                    key={option.label}
-                    type="button"
-                    onClick={() => {
-                      if (option.free_text) {
-                        setClarifyOther(true);
-                        return;
-                      }
-                      // Send the RESOLVED question, not the label — the label
-                      // alone reads as a new question and gets clarified again.
-                      onClarify(option.send || option.label);
-                    }}
-                    className="rounded-md border border-border bg-bg px-3 py-2 text-left text-sm text-fg transition hover:border-accent hover:bg-surface focus:outline-none focus-visible:ring-2 focus-visible:ring-accent"
-                  >
-                    <span className="font-medium">{option.label}</span>
-                    {option.description && (
-                      <span className="mt-0.5 block text-xs text-muted">
-                        {option.description}
-                      </span>
-                    )}
-                  </button>
-                ))}
-              </div>
-
-              {clarifyOther && (
-                <form
-                  className="mt-2 flex gap-2"
-                  onSubmit={(event) => {
-                    event.preventDefault();
-                    const typed = clarifyText.trim();
-                    if (!typed) return;
-                    const original = message.meta?.clarify?.original ?? '';
-                    onClarify(
-                      original ? `${original}\n\n(Clarified: ${typed})` : typed,
-                    );
-                    setClarifyText('');
-                    setClarifyOther(false);
-                  }}
-                >
-                  <input
-                    autoFocus
-                    value={clarifyText}
-                    onChange={(event) => setClarifyText(event.target.value)}
-                    placeholder="Tell me what you meant…"
-                    className="min-w-0 flex-1 rounded-md border border-border bg-bg px-3 py-2 text-sm text-fg outline-none focus:border-accent"
-                  />
-                  <button
-                    type="submit"
-                    disabled={!clarifyText.trim()}
-                    className="rounded-md border border-border bg-surface px-3 py-2 text-sm text-fg transition hover:border-accent disabled:opacity-40"
-                  >
-                    Send
-                  </button>
-                </form>
-              )}
-            </div>
-          )}
 
           {message.meta?.input_trimmed && (
             <p className="mt-2 inline-flex items-center gap-1.5 rounded-md border border-border bg-surface px-2 py-1 text-xs text-muted">

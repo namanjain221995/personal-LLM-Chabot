@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Client_Bill_Rate__c</fullName>
+    <description>SENSITIVE. The rate Techsara charges the client per hour/day/salary. Visible only to Account Manager and Leadership. Never shown to Recruiters or on website.</description>
+    <inlineHelpText>Enter the agreed bill rate with the client. This is the rate Techsara charges. Keep confidential. Not visible to Recruiters or on website.</inlineHelpText>
+    <label>Client Bill Rate</label>
+    <precision>18</precision>
+    <required>false</required>
+    <scale>0</scale>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Currency</type>
+</CustomField>

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Mock_Booking_Window_Days__c</fullName>
+    <defaultValue>4</defaultValue>
+    <description>How many working days BEFORE the mock date the candidate portal opens the slot picker. Default 4. Change per-program if this cohort needs a wider/tighter booking window.</description>
+    <externalId>false</externalId>
+    <label>Mock Booking Window (working days)</label>
+    <precision>2</precision>
+    <required>false</required>
+    <scale>0</scale>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Number</type>
+    <unique>false</unique>
+</CustomField>

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Interest_Rate_Per_Cycle__c</fullName>
+    <defaultValue>2</defaultValue>
+    <inlineHelpText>Interest rate charged per cycle/EMI (default 2%). Total interest = ACH Amount x this rate x Number of Cycles.</inlineHelpText>
+    <label>Interest Rate / Cycle</label>
+    <precision>5</precision>
+    <required>false</required>
+    <scale>2</scale>
+    <trackFeedHistory>false</trackFeedHistory>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Percent</type>
+</CustomField>

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Target_Role__c</fullName>
+    <description>The specific role the B2B client is looking to hire for. Captured during initial client inquiry before formal Job Requirement is created.</description>
+    <externalId>false</externalId>
+    <inlineHelpText>Enter the role the client needs to fill. Example: Salesforce Developer, Java Backend Engineer. This will be used as Job Title when creating Job Requirement.</inlineHelpText>
+    <label>Target Role</label>
+    <length>255</length>
+    <required>false</required>
+    <trackFeedHistory>false</trackFeedHistory>
+    <trackHistory>false</trackHistory>
+    <type>Text</type>
+    <unique>false</unique>
+</CustomField>

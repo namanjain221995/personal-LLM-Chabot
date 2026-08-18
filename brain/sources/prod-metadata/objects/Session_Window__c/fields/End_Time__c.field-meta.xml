@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>End_Time__c</fullName>
+    <description>End time of the session window. Computed by the Program Creation LWC as Start_Time + Program_Version.Session_Duration_Min, then written on save. Values &lt; Start_Time indicate the window crosses midnight; runtime code interprets that as a next-day rollover.</description>
+    <label>End Time</label>
+    <required>true</required>
+    <trackTrending>false</trackTrending>
+    <type>Time</type>
+</CustomField>

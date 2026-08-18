@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ValidationRule xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Open_Job_Needs_Deadline</fullName>
+    <active>true</active>
+    <description>Submission Deadline is required when Job Status is Open.</description>
+    <errorConditionFormula>ISPICKVAL(Job_Status__c,&apos;Open&apos;) &amp;&amp; ISBLANK(Submission_Deadline__c)</errorConditionFormula>
+    <errorDisplayField>Submission_Deadline__c</errorDisplayField>
+    <errorMessage>Submission Deadline is required when Job Status is Open.</errorMessage>
+</ValidationRule>

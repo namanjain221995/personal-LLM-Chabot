@@ -1,0 +1,2965 @@
+================================================================================
+NAMAN CHATBOT PROJECT - COMPLETE DOCUMENTATION
+Salesforce App with Zoom Recording Portal & Job Requirement Management
+================================================================================
+
+PROJECT OVERVIEW:
+This is a Salesforce application that manages:
+1. Zoom Recording Portal - Secure access to Zoom recordings stored in AWS S3
+2. Job Requirement Management - REST API to fetch job listings
+3. Access Control & Logging - Track user access to recordings and portal activity
+4. Department Management - Organize recordings by department with permission sets
+
+Technology Stack:
+- Salesforce Apex (Backend)
+- Lightning Web Components (LWC) (Frontend UI)
+- AWS S3 (File Storage)
+- Salesforce Flows (Automation)
+
+================================================================================
+SECTION 1: CUSTOM OBJECTS & THEIR FIELDS
+================================================================================
+
+CUSTOM OBJECT 1: Zoom_Recording_Access_Log__c
+Description: Audit log for tracking all user access to the Zoom Recording Portal
+Purpose: Security and compliance tracking - logs every login, file access, and portal activity
+
+Fields:
+  - User__c (Lookup to User)
+    Type: Lookup
+    Purpose: References the user who performed the action
+    
+  - Department__c (Lookup to Zoom_Recording_Department__c)
+    Type: Lookup
+    Purpose: Department associated with the accessed recording/folder
+    
+  - Event_Type__c (Picklist)
+    Type: Picklist
+    Allowed Values:
+      * View - User viewed a recording
+      * Download - User downloaded a file
+      * Access_Denied - User attempted unauthorized access
+      * Login - User logged into portal
+      * Portal_Access - User accessed portal interface
+      * File_Access - User accessed a specific file
+      * Login_Success - Successful login event
+      * Login_Failed - Failed login attempt
+      * Logout - User logout event
+      * Screen_Recording_Attempt - DevTools/inspect attempt detected
+    Purpose: Categorizes the type of action performed
+    
+  - Event_Timestamp__c (DateTime)
+    Type: DateTime
+    Purpose: When the event occurred
+    
+  - Status__c (Picklist)
+    Type: Picklist
+    Allowed Values:
+      * Success - Operation successful
+      * Failed - Operation failed
+      * Blocked - Access blocked/denied
+    Purpose: Result status of the access attempt
+    
+  - Error_Message__c (Text)
+    Type: Long Text Area
+    Purpose: Stores error details or additional context
+    
+  - File_Key__c (Text)
+    Type: Text (255 chars)
+    Purpose: S3 file path/key of accessed file
+    
+  - File_Name__c (Text)
+    Type: Text (255 chars)
+    Purpose: Human-readable name of accessed file
+    
+  - IP_Address__c (Text)
+    Type: Text (45 chars)
+    Purpose: IP address of the user making the request
+    
+  - User_Agent__c (Text)
+    Type: Text (255 chars)
+    Purpose: Browser/client user agent string
+    
+  - Opened_At__c (DateTime)
+    Type: DateTime
+    Purpose: When file was opened (if applicable)
+    
+  - Opened_By__c (Lookup to User)
+    Type: Lookup
+    Purpose: User who opened the file
+    
+  - Recording_Link__c (URL)
+    Type: URL
+    Purpose: Link to the recording
+    
+  - Record_Id__c (Text)
+    Type: Text (18 chars)
+    Purpose: Related Salesforce record ID
+    
+  - Record_Name__c (Text)
+    Type: Text (255 chars)
+    Purpose: Related record name
+    
+  - Source_Object__c (Text)
+    Type: Picklist
+    Purpose: Type of source object (Interview, Job Requirement, etc.)
+    
+  - Source__c (Text)
+    Type: Text
+    Purpose: Source/origin of the access request
+    
+  - Interview__c (Lookup to Interview__c)
+    Type: Lookup
+    Purpose: Related interview if any
+    
+  - Session__c (Text)
+    Type: Text
+    Purpose: Session identifier for grouping related events
+
+---
+
+CUSTOM OBJECT 2: Zoom_Recording_Department__c
+Description: Represents departments that have Zoom recordings
+Purpose: Organize portal into departments, manage permissions at department level
+
+Fields:
+  - Name (Standard)
+    Type: Text
+    Purpose: Department name (e.g., "Sales", "Engineering")
+    
+  - Folder_Path_S3__c (Text)
+    Type: Text (255 chars)
+    Purpose: Path to department folder in S3 (e.g., "sales/", "engineering/")
+    
+  - Department_Code__c (Text)
+    Type: Text
+    Purpose: Short code for department (e.g., "SALES", "ENG")
+    
+  - Description__c (Text)
+    Type: Long Text Area
+    Purpose: Description of what this department manages
+    
+  - Is_Active__c (Checkbox)
+    Type: Checkbox (Boolean)
+    Default: false
+    Purpose: Controls if department is visible in portal
+    
+  - Display_Order__c (Number)
+    Type: Number
+    Purpose: Sort order for displaying departments in UI
+    
+  - Permission_Set_API_Name__c (Text)
+    Type: Text (255 chars)
+    Purpose: Salesforce permission set API name controlling access
+    Example: "Zoom_Recording_User_Access"
+
+---
+
+CUSTOM OBJECT 3: Zoom_Recording_User_Folder_Map__c
+Description: Maps users to specific S3 folders they can access
+Purpose: Fine-grained access control - allows assigning users to specific folders
+
+Fields:
+  - User__c (Lookup to User)
+    Type: Lookup
+    Required: Yes
+    Purpose: User being granted access
+    
+  - S3_Folder_Path__c (Text)
+    Type: Text (255 chars)
+    Required: Yes
+    External ID: Yes
+    Purpose: S3 folder path user can access (e.g., "sales/2024-recordings/")
+    
+  - Folder_Name__c (Text)
+    Type: Text (255 chars)
+    Purpose: Human-readable name of the folder
+    
+  - Department__c (Lookup to Zoom_Recording_Department__c)
+    Type: Lookup
+    Purpose: Department this folder belongs to
+    
+  - Is_Active__c (Checkbox)
+    Type: Checkbox (Boolean)
+    Default: false
+    Purpose: If unchecked, user loses access to this folder
+    
+  - Granted_Date__c (Date)
+    Type: Date
+    Purpose: When access was granted
+    
+  - Granted_By__c (Lookup to User)
+    Type: Lookup
+    Purpose: Admin who granted this access
+    
+  - User_Email__c (Text)
+    Type: Email
+    Purpose: Email of user (denormalized for easy reference)
+    
+  - Notes__c (Text)
+    Type: Long Text Area
+    Purpose: Admin notes about why this access was granted
+
+---
+
+CUSTOM METADATA TYPE: Zoom_Portal_Config__mdt
+Description: Global configuration for the Zoom Recording Portal
+Purpose: Centralized settings without hardcoding
+
+Fields:
+  - S3_Bucket_Name__c - AWS S3 bucket name
+  - AWS_Region__c - AWS region (e.g., "us-east-1")
+  - AWS_Access_Key__c - AWS access key for S3 operations
+  - AWS_Secret_Key__c - AWS secret key for signing URLs
+  - Site_Title__c - Portal title shown in UI
+  - Top_Notice__c - Banner notice to display to all users
+  - Signed_URL_Expiry_Minutes__c - How long S3 signed URLs valid (default 480 = 8 hours)
+  - Allowed_File_Extensions__c - Comma-separated list of allowed file types
+  - Is_Active__c - Enable/disable the entire portal
+
+================================================================================
+SECTION 2: APEX CLASSES - BACKEND LOGIC (DETAILED)
+================================================================================
+
+CLASS 1: ZoomRecordingS3Service
+File: force-app/main/default/classes/ZoomRecordingS3Service.cls
+Purpose: Core AWS S3 integration for managing files and generating signed URLs
+Sharing: public with sharing
+Dependencies: ZoomRecordingPortalConfig
+
+CONSTANTS:
+  - NAMED_CREDENTIAL = 'callout:AWS_S3_Named_Credential' (Named Credential for AWS auth)
+  - AWS_REGION = 'us-east-1' (Default AWS region)
+  - S3_SERVICE = 's3' (AWS service identifier)
+
+Key Methods:
+  
+  1. listFiles(String folderPath, Integer maxKeys) → List<S3FileInfo>
+     Purpose: List all files in an S3 folder
+     Parameters:
+       - folderPath: S3 folder path (e.g., "sales/2024/")
+       - maxKeys: Max results per page (default 100, max 1000)
+     Returns: List of S3FileInfo objects with file metadata
+     Used by: Portal UI to display file list
+  
+  2. listFilesPage(String folderPath, String continuationToken) → S3PageResult
+     Purpose: Paginated file listing with continuation tokens
+     Parameters:
+       - folderPath: S3 folder path
+       - continuationToken: Token for fetching next page
+     Returns: S3PageResult with files list and nextToken
+     Used by: Portal for handling large folders
+  
+  3. listFolders(String prefix) → List<String>
+     Purpose: List direct subfolders using S3 delimiter
+     Parameters:
+       - prefix: Parent folder path
+     Returns: List of folder paths
+     Used by: Navigation tree, folder browser
+  
+  4. generateSignedUrl(String s3Key) → String
+     Purpose: Generate AWS Signature V4 pre-signed URL for playback
+     Parameters:
+       - s3Key: Full path to S3 file (e.g., "sales/video.mp4")
+     Returns: HTTPS URL valid for configured expiry time
+     Used by: Video player to access files without AWS credentials
+  
+  5. buildSignedUrl(...) → String [PRIVATE]
+     Purpose: Internal implementation of AWS V4 signature generation
+     Details:
+       - Creates canonical request following AWS V4 spec
+       - Signs with HMAC-SHA256 using secret key
+       - Includes X-Amz-* headers in URL parameters
+  
+  6. getFileInfo(String s3Key) → S3FileInfo
+     Purpose: Get metadata about specific file via HEAD request
+     Parameters:
+       - s3Key: File path
+     Returns: S3FileInfo with size, content type, last modified, ETag
+     Used by: File details, size validation
+  
+  7. parseListResponse(String xmlBody) → List<S3FileInfo> [PRIVATE]
+     Purpose: Parse XML from S3 ListObjectsV2 API response
+  
+  8. parseFolderResponse(String xmlBody) → List<String> [PRIVATE]
+     Purpose: Parse CommonPrefixes from S3 for folder listing
+  
+  9. parseNextContinuationToken(String xmlBody) → String [PRIVATE]
+     Purpose: Extract continuation token for pagination
+
+Inner Classes/DTOs:
+  - S3FileInfo: Contains file metadata
+    * s3Key: Full S3 path
+    * fileName: Just the filename
+    * size: File size in bytes
+    * contentType: MIME type
+    * lastModified: ISO timestamp
+    * etag: S3 ETag hash
+    
+  - S3PageResult: Pagination wrapper
+    * files: List<S3FileInfo>
+    * nextToken: Continuation token for next page
+    
+  - S3Exception: Custom exception for S3 errors
+
+---
+
+CLASS 2: ZoomRecordingPortalConfig
+File: force-app/main/default/classes/ZoomRecordingPortalConfig.cls
+Purpose: Singleton pattern for reading global portal configuration
+Usage: All components that need config call static getters from this class
+
+Key Methods:
+  
+  1. getBucketName() → String
+     Returns: S3 bucket name from config
+  
+  2. getAwsRegion() → String
+     Returns: AWS region (e.g., "us-east-1")
+  
+  3. getSiteTitle() → String
+     Returns: Portal title for display
+  
+  4. getTopNotice() → String
+     Returns: Banner notice to show users
+  
+  5. getSignedUrlExpiryMinutes() → Integer
+     Returns: How many minutes S3 URLs are valid
+  
+  6. getAllowedExtensions() → Set<String>
+     Returns: Set of allowed file extensions (mp4, webm, mov, mkv, etc.)
+  
+  7. getAwsAccessKey() → String
+     Returns: AWS access key for signing URLs
+  
+  8. getAwsSecretKey() → String
+     Returns: AWS secret key for signing URLs
+  
+  9. isExtensionAllowed(String fileName) → Boolean
+     Returns: True if file extension is in allowed list
+
+Internal:
+  - Caches config in static variable to avoid repeated queries
+  - Throws ConfigurationException if required config is missing
+  - Used by @TestVisible methods for unit testing
+
+---
+
+CLASS 3: ZoomRecordingAccessService
+File: force-app/main/default/classes/ZoomRecordingAccessService.cls
+Purpose: Permission/access checking - determines what user can see
+Usage: Called before allowing access to files or folders
+
+Key Methods:
+  
+  1. getCurrentUserPermissionSets() → Set<String>
+     Purpose: Get all Zoom_Recording_* permission sets assigned to current user
+     Returns: Set of permission set API names
+     Caching: Cached for request
+  
+  2. isCurrentUserAdmin() → Boolean
+     Purpose: Check if user has Zoom_Recording_Admin_Access perm set
+     Returns: True if admin, false otherwise
+  
+  3. getCurrentUserFolderMappings() → Set<String>
+     Purpose: Get all S3 folder paths user can access
+     Returns: Set of folder paths from Zoom_Recording_User_Folder_Map__c
+     Caching: Cached for request
+  
+  4. hasFolderMappings() → Boolean
+     Purpose: Quick check if user has any folder mappings
+     Returns: True if user has at least one folder mapping
+  
+  5. getUserAccessibleDepartments() → List<DepartmentDTO>
+     Purpose: Get list of departments user can browse (AuraEnabled)
+     Logic:
+       - Admins: see all departments
+       - Non-admins: see departments matching their permission sets
+     Returns: List of DepartmentDTO with folder paths
+
+Inner Class:
+  - DepartmentDTO: Lightweight DTO
+    * id: Department record ID
+    * name: Department name
+    * folderPath: S3 folder path
+    * permissionSetName: Associated permission set
+
+---
+
+CLASS 4: ZoomRecordingRequestContext
+File: force-app/main/default/classes/ZoomRecordingRequestContext.cls
+Purpose: Capture request-level context (IP, user agent) for logging
+Usage: Static variables to store request metadata during execution
+
+Key Methods:
+  
+  1. setIpAddress(String ip)
+     Purpose: Store client IP for current request
+  
+  2. setUserAgent(String ua)
+     Purpose: Store browser user agent for current request
+  
+  3. getIpAddress() → String
+     Returns: Stored IP or "Unknown"
+  
+  4. getUserAgent() → String
+     Returns: Stored user agent or "Unknown"
+  
+  5. reset() [TestVisible]
+     Purpose: Clear context between test requests
+
+---
+
+CLASS 5: ZoomRecordingLogService
+File: force-app/main/default/classes/ZoomRecordingLogService.cls
+Purpose: Handle access logging - record all portal and file access events
+Usage: Called whenever user accesses portal or files
+
+Event Type Constants (used to categorize log entries):
+  - EVENT_LOGIN_SUCCESS = "Login_Success"
+  - EVENT_LOGIN_FAILED = "Login_Failed"
+  - EVENT_LOGOUT = "Logout"
+  - EVENT_PORTAL_ACCESS = "Portal_Access"
+  - EVENT_PORTAL_EXIT = "Portal_Exit"
+  - EVENT_FILE_ACCESS = "File_Access"
+  - EVENT_ACCESS_DENIED = "Access_Denied"
+  - EVENT_SCREEN_RECORDING = "Screen_Recording_Attempt"
+
+Status Constants:
+  - STATUS_SUCCESS = "Success"
+  - STATUS_FAILED = "Failed"
+  - STATUS_BLOCKED = "Blocked"
+
+Key Methods:
+  
+  1. logPortalAccess() [AuraEnabled]
+     Purpose: Log when user enters portal (creates session)
+     Logic:
+       - Creates Zoom_Recording_Access_Log__c record
+       - Marks as SESSION START if 30+ minutes since last portal access
+       - Logs user's admin status
+       - Backs up to S3 asynchronously
+       - Sends email to admin permission set holders
+  
+  2. logLoginSuccess(...)
+     Purpose: Log successful login
+  
+  3. logLoginFailed(...)
+     Purpose: Log failed login attempt
+  
+  4. logFileAccess(...) [AuraEnabled]
+     Purpose: Log when user views/downloads file
+  
+  5. logAccessDenied(...) [AuraEnabled]
+     Purpose: Log failed access attempt
+  
+  6. logFileAccessAttempt(...) [AuraEnabled]
+     Purpose: Silent logging for DevTools inspection (no email)
+
+Helper Methods:
+  - isSystemAdminProfile() → Boolean
+  - isUserAdmin() → Boolean
+  - getUserPrimaryDepartmentId() → Id
+
+---
+
+CLASS 6: ZoomRecordingAccessManagerController
+File: force-app/main/default/classes/ZoomRecordingAccessManagerController.cls
+Purpose: Backend for Access Manager LWC - grant/revoke user permissions
+Usage: Admin panel to manage who can access what
+
+Key Methods:
+  
+  1. getAllUsersWithAccess() → List<UserAccessDTO> [AuraEnabled]
+     Purpose: Get all users with any Zoom Recording permissions
+     Returns: List with user details and permission count
+     Admin-only: Throws exception if not admin
+  
+  2. getAllAvailablePermissionSets() → List<PermSetDTO> [AuraEnabled]
+     Purpose: Get all non-profile permission sets for modal
+     Returns: List of available permission sets to assign
+  
+  3. grantUserPermissionSet(...) [AuraEnabled]
+     Purpose: Assign permission set to user
+     Parameters: userId, permissionSetId
+  
+  4. revokeUserPermissionSet(...) [AuraEnabled]
+     Purpose: Remove permission set from user
+  
+  5. addFolderMapping(...) [AuraEnabled]
+     Purpose: Grant user access to specific S3 folder
+     Creates: Zoom_Recording_User_Folder_Map__c record
+  
+  6. revokeFolderMapping(...) [AuraEnabled]
+     Purpose: Revoke access to specific folder
+
+Inner Classes:
+  - UserAccessDTO: User with permissions/mappings
+    * id: User ID
+    * name: Name
+    * email: Email
+    * isActive: Active status
+    * permissionSets: List of assigned perm sets
+    * folderMappingCount: Number of folder grants
+    
+  - PermSetDTO: Permission set details
+    * id: Permission set ID
+    * name: Display name
+
+---
+
+CLASS 7: ZoomRecordingFileController
+File: force-app/main/default/classes/ZoomRecordingFileController.cls
+Purpose: Handle file browsing UI backend - list files/folders with access control
+Usage: Called by file browser LWC
+
+Blocked Content:
+  - Files: Only certain extensions allowed (.vtt, .mp4, .m4a, .cc, .chat, .transcript, .txt)
+  - Folders: Certain folders blocked for non-admins (docs, doc, llm)
+  - JSON files: Only allowed from specific departments (ec2-jobs, temp, viewer-logs, zoom-fail)
+
+Key Methods:
+  
+  1. browseFolder(String folderPath) → BrowseResult [AuraEnabled]
+     Purpose: Get subfolders and files in given path
+     Parameters:
+       - folderPath: S3 folder to browse
+     Returns: BrowseResult with subfolders and files
+     Access Control:
+       - Checks user has permission for folder
+       - Filters blocked folders
+       - Filters blocked file types
+  
+  2. getSignedUrl(String s3Key) → String [AuraEnabled]
+     Purpose: Get playable URL for file
+     Parameters:
+       - s3Key: File S3 path
+     Returns: HTTPS signed URL
+     Validation:
+       - Checks file is allowed type
+       - Checks user has access to file
+  
+  3. getFileInfo(String s3Key) → FileDTO [AuraEnabled]
+     Purpose: Get metadata about file
+  
+  4. listFoldersWithDelimiter(String folderPath) → List<String> [PRIVATE]
+     Purpose: Get direct subfolders only (not recursive)
+  
+  5. listFilesAtLevel(String folderPath) → List<S3FileInfo> [PRIVATE]
+     Purpose: Get all files in specific folder (not subfolders)
+  
+  6. logFileAccessAttempt(String s3Key) [AuraEnabled]
+     Purpose: Silent logging when DevTools detect inspection
+
+Helper Methods:
+  - isBlockedFolder(String folderName) → Boolean
+  - isFolderVisibleToUser(String folderPath, Set<String> userGrants) → Boolean
+  - isFileAllowedInDept(String fileName, String folderPath) → Boolean
+  - isFileVisibleToUser(String s3Key, Set<String> userGrants) → Boolean
+  - getFileType(String fileName) → String
+  - getMimeType(String fileName) → String
+
+Inner Classes:
+  - BrowseResult: Folder contents
+    * currentPath: Path being browsed
+    * subfolders: List<FolderDTO>
+    * files: List<FileDTO>
+    
+  - FolderDTO
+    * path: Folder path
+    * name: Folder name
+    
+  - FileDTO
+    * s3Key: Full S3 path
+    * fileName: Just filename
+    * size: Bytes
+    * sizeMB: Megabytes (rounded)
+    * lastModified: ISO timestamp
+    * fileType: Extension
+    * mimeType: MIME type
+
+---
+
+CLASS 8: ZoomRecordingLogController
+File: force-app/main/default/classes/ZoomRecordingLogController.cls
+Purpose: Backend for viewing access logs - search and filter log entries
+Usage: Admin dashboard to audit portal usage
+
+Key Methods:
+  
+  1. isAdminUser() → Boolean [AuraEnabled(cacheable=false)]
+     Purpose: Check if current user is admin
+  
+  2. getCurrentUserEmail() → String [AuraEnabled]
+     Purpose: Get current user's email
+  
+  3. getAccessLogs(...) → LogQueryResult [AuraEnabled(cacheable=false)]
+     Purpose: Get filtered access logs with pagination
+     Parameters:
+       - pageNumber: Which page (1-based)
+       - pageSize: Results per page
+       - eventType: Filter by event type (null = all)
+       - startDate: Date range start
+       - endDate: Date range end
+       - searchTerm: Multi-word user search
+     Returns: LogQueryResult with logs + metadata
+     Pagination: Handles offset/limit, total count
+  
+  4. resolveSearchUserIds(String searchTerm) → Set<Id> [PRIVATE]
+     Purpose: Multi-word search for users
+     Logic:
+       - Splits search term by spaces
+       - Each word searched in Name, Email, Username
+       - Returns intersection (ALL words must match)
+       - Includes inactive users (historical logs)
+     Example: "ashish patel" finds user named Ashish with patel in email
+  
+  5. exportLogsToCSV(...) → String [AuraEnabled]
+     Purpose: Generate CSV export of logs
+
+Filtering:
+  - By event type (Login, File_Access, etc.)
+  - By date range
+  - By user (multi-word search)
+  - By department
+  - By status (Success, Failed, Blocked)
+
+Inner Class:
+  - LogQueryResult
+    * logs: List<LogDTO>
+    * totalCount: Total matching records
+    * pageNumber: Current page
+    * pageSize: Results per page
+
+---
+
+CLASS 9: ZoomRecordingDeptAutoSync
+File: force-app/main/default/classes/ZoomRecordingDeptAutoSync.cls
+Purpose: Automatically create Department records from S3 root folders
+Usage: Called once when portal loads if no departments exist
+
+Key Methods:
+  
+  1. ensureDepartmentsExist() [AuraEnabled]
+     Purpose: Sync S3 folders with Salesforce Department records
+     Logic:
+       - Query existing Zoom_Recording_Department__c records
+       - List root folders from S3
+       - New folders → insert as departments
+       - Deleted folders → deactivate
+       - Reappearing folders → reactivate
+     Called Once: Subsequent calls do nothing (departments already exist)
+
+---
+
+CLASS 10: ZoomRecordingLogS3Backup
+File: force-app/main/default/classes/ZoomRecordingLogS3Backup.cls
+Purpose: Backup access logs to S3 as JSON files (for analytics/archival)
+Usage: Async via Queueable or sync via method call
+
+S3 Folder Structure Created:
+  viewer-logs/
+    ├── all-events/2026-04-27.json
+    ├── login-success/2026-04-27.json
+    ├── login-failed/2026-04-27.json
+    ├── logout/2026-04-27.json
+    ├── portal-access/2026-04-27.json
+    ├── file-access/2026-04-27.json
+    ├── access-denied/2026-04-27.json
+    └── screen-recording/2026-04-27.json
+
+Key Methods:
+  
+  1. execute(QueueableContext context)
+     Purpose: Async execute method (Queueable interface)
+     Allows: 30+ sec processing time, multiple callouts
+  
+  2. backupLog(Id logId) [Static]
+     Purpose: Queue log backup asynchronously
+     Parameters:
+       - logId: Single Zoom_Recording_Access_Log__c ID
+     Execution: 5-30 seconds delay
+  
+  3. backupLogSync(Id logId) [Static]
+     Purpose: Backup log synchronously (immediate)
+     Execution: 1-2 seconds delay
+
+Internal:
+  - Fetches log records with related department/user info
+  - Groups by event type and date
+  - Converts to JSON
+  - Uploads to S3 via HTTP PUT requests
+
+---
+
+CLASS 11: JobRequirementRestService
+File: force-app/main/default/classes/JobRequirementRestService.cls
+Purpose: REST API endpoint for fetching Job Requirement records
+Endpoint: /services/apexrest/jobRequirements/
+Method: GET (HTTP GET)
+
+Query Parameters (all optional):
+  - pageNumber: 1-based page index (default 1)
+  - pageSize: Records per page (default 20, max 200)
+  - jobStatus: Filter by Job_Status__c
+  - employmentType: Filter by Employment_Type__c
+  - priority: Filter by Priority__c
+  - workMode: Filter by Work_Mode__c
+  - location: LIKE filter on Location__c
+  - searchTerm: LIKE filter on Job_Title__c
+  - clientAccountId: Filter by Client_Account__c
+
+Filtering Rules:
+  - Only returns records where Website_Status__c = "Published"
+  - Excludes overdue jobs (SLA_Status__c != "Overdue")
+  - Forced Job_Status__c to "Open" (website policy)
+  - Results ordered by CreatedDate DESC
+
+Response:
+  - Returns JSON wrapped in JobResponse DTO
+  - Includes pagination metadata
+  - Includes total record count for frontend pagination
+
+Key Methods:
+  
+  1. getJobRequirements() [HttpGet, Global]
+     Purpose: Handle GET requests to endpoint
+     Returns: JobResponse with jobs list + metadata
+
+Helper Methods:
+  - getSingleJob(String recordKey, RestResponse res) → JobResponse
+    Purpose: Fetch single job by ID or JR number
+    
+  - getFieldList() → String
+    Returns: Comma-separated list of fields to query
+    
+  - addEqualsFilter(...) [PRIVATE]
+    Purpose: Add exact-match WHERE condition
+    
+  - addLikeFilter(...) [PRIVATE]
+    Purpose: Add LIKE WHERE condition
+    
+  - parsePositiveInt(...) → Integer
+    Purpose: Parse integer with default/min value
+    
+  - extractRecordKey(RestRequest req) → String
+    Purpose: Get ID from URL path (/jobRequirements/a03xx)
+
+Inner Classes:
+  - JobResponse: API response wrapper
+    * jobs: List<JobDTO>
+    * totalRecords: Total count for pagination
+    * pageSize: Results per page
+    * pageNumber: Current page
+    * totalPages: Calculated from count/pageSize
+    
+  - JobDTO: Single job record
+    * id: Salesforce ID
+    * jrNumber: Custom JR number field
+    * jobTitle: Job title
+    * location: Work location
+    * salary: Salary if provided
+    * employmentType: Full-time, Contract, etc.
+    * workMode: Remote, On-site, Hybrid
+    * jobDescription: Full job description
+    * requirements: Required skills/experience
+    * applicationDeadline: Submission deadline
+    * createdDate: When posted
+    * lastModifiedDate: Last update
+
+---
+
+CLASS 12: JobRequirementRestServiceTest
+File: force-app/main/default/classes/JobRequirementRestServiceTest.cls
+Purpose: Unit tests for JobRequirementRestService REST API
+Testing Strategy:
+  - Field-level security aware (skips FLS failures)
+  - Covers all filter combinations
+  - Tests pagination logic
+  - Tests single job fetch
+  - Tests error cases
+
+Key Test Methods:
+  - testGetPublishedJobsDefaultPagination()
+  - testGetJobsWithFilters()
+  - testGetSingleJobById()
+  - testPaginationBoundary()
+  - testSearchTermFilter()
+
+Helper Methods:
+  - buildPublishedJR() → Job_Requirement__c
+  - tryInsertJR() → Job_Requirement__c
+  - firstActivePicklist(field) → String
+
+================================================================================
+SECTION 3: LIGHTNING WEB COMPONENTS (UI Layer) - DETAILED
+================================================================================
+
+LWC COMPONENT 1: zoomRecordingPortal
+File: force-app/main/default/lwc/zoomRecordingPortal/
+Purpose: Main portal entry point and router - manages navigation between all views
+Sharing: Global (accessible from Lightning Communities/Sites)
+
+Tracked Properties (@track):
+  - currentView (String): Current view being displayed (dashboard|fileBrowser|videoPlayer|adminPanel|adminLogs|accessManager|hierarchy)
+  - selectedDepartmentId (String): Currently selected department ID
+  - selectedDepartmentName (String): Display name of selected department
+  - selectedFolderPath (String): Current S3 folder path
+  - restoreBrowsePath (String): Path to restore when returning from video player
+  - selectedFile (Object): Selected file object {s3Key, fileName, size, mimeType}
+  - browserKey (Number): React key for forcing re-render of file browser
+
+Constants:
+  - VIEW.DASHBOARD = 'dashboard'
+  - VIEW.FILE_BROWSER = 'fileBrowser'
+  - VIEW.VIDEO_PLAYER = 'videoPlayer'
+  - VIEW.ADMIN_PANEL = 'adminPanel' (v37 new)
+  - VIEW.ADMIN_LOGS = 'adminLogs'
+  - VIEW.ACCESS_MANAGER = 'accessManager'
+  - VIEW.HIERARCHY = 'hierarchy'
+  - STATE_KEY = 'zoomPortalState' (sessionStorage key)
+  - VIOLATION_KEY = 'zoom_violation_state' (for DevTools block bypass)
+  - EXIT_DEBOUNCE_MS = 3000 (debounce timer)
+  - ACCESS_DEBOUNCE_MS = 3000 (debounce timer)
+
+Key Methods:
+  
+  1. connectedCallback()
+     Lifecycle: Runs when component loads
+     Actions:
+       - Restores state from sessionStorage
+       - Logs portal access (logPortalAccess)
+       - Attaches visibility change listener
+       - Logs portal_exit when tab hidden
+       - Logs portal_access when tab becomes visible
+  
+  2. disconnectedCallback()
+     Lifecycle: Runs when component unloads
+     Actions:
+       - Removes event listeners
+       - Logs logout event
+       - Calls logLogout() apex method
+  
+  3. saveState()
+     Purpose: Persist navigation state to sessionStorage
+     Stores:
+       - currentView
+       - selectedDepartmentId/Name
+       - selectedFolderPath
+       - selectedFile object
+     Used By: Browser history/back navigation
+  
+  4. restoreState()
+     Purpose: Restore navigation from sessionStorage
+     Logic:
+       - VIDEO_PLAYER + active violation → restore blocked player
+       - VIDEO_PLAYER without violation → go to file browser
+       - Other views → restore as-is
+     Prevents: Users bypassing screen recording block by reloading
+  
+  5. handleDepartmentSelected(event)
+     Triggered By: Dashboard component
+     Event Data: {departmentId, departmentName, folderPath}
+     Actions:
+       - Sets selected department
+       - Switches to FILE_BROWSER view
+       - Saves state
+  
+  6. handlePlayFile(event)
+     Triggered By: File browser component
+     Event Data: {file object with s3Key, fileName, size}
+     Actions:
+       - Sets selectedFile
+       - Saves restoreBrowsePath
+       - Switches to VIDEO_PLAYER
+       - Saves state
+  
+  7. handleBackToBrowser()
+     Triggered By: Video player component
+     Actions:
+       - Returns to FILE_BROWSER
+       - Restores folder path
+       - Clears selected file
+  
+  8. handleBackToDashboard()
+     Triggered By: Any child component
+     Actions:
+       - Returns to DASHBOARD
+       - Clears selected department/file
+       - Refreshes dashboard data
+  
+  9. handleAdminPanel(event)
+     Triggered By: Dashboard (v37 new)
+     Actions:
+       - Switches to ADMIN_PANEL view
+  
+  10. handleBackToAdminPanel()
+      Triggered By: Logs/Access/Hierarchy
+      Actions:
+        - Returns to ADMIN_PANEL
+        - Stays in admin flow
+
+Violation Handling (DevTools Block):
+  - Detects when user tried screen recording
+  - Stores violation in sessionStorage with TTL
+  - If violation active and page reloaded → restore VIDEO_PLAYER in BLOCKED state
+  - After 30 minutes → violation expires, can leave player
+
+Event Listeners:
+  - visibilitychange: Logs portal_exit when tab hidden, portal_access when visible
+  - Debounced to prevent spam (3 second minimum between logs)
+
+Data Persistence:
+  - SessionStorage used (cleared on browser close)
+  - Survives F5 refresh (unless DEV_TOOLS violation active)
+  - Lost on tab close
+
+---
+
+LWC COMPONENT 2: zoomRecordingDashboard
+File: force-app/main/default/lwc/zoomRecordingDashboard/
+Purpose: Main dashboard - shows departments, search index building, admin button
+Sharing: Global
+
+Tracked Properties (@track):
+  - departments (Array): List of accessible departments {id, name, folderPath}
+  - userContext (Object): Current user context {isAdmin, departments, email}
+  - isLoading (Boolean): Loading departments
+  - errorMessage (String): Error display
+  - topNotice (String): Global notice from config
+  - globalSearchText (String): Search input text
+  - globalSearchResults (Array): Search results from all departments
+  - isGlobalSearching (Boolean): Search in progress
+  - showGlobalDropdown (Boolean): Show search results dropdown
+  - indexLoading (Boolean): Building search index
+  - indexLoadedDepts (Number): Departments indexed so far
+  - indexTotalDepts (Number): Total departments
+  - indexPathsCount (Number): Total file paths indexed
+  - indexFilesScanned (Number): Total files scanned
+  - indexFromCache (Boolean): Index loaded from browser cache
+
+Constants:
+  - MAX_CHUNKS_PER_DEPT = 50 (pagination limit per department)
+  - PARALLEL_DEPTS = 5 (concurrent department processing)
+  - CACHE_DB_NAME = 'ZoomPortalCache' (IndexedDB name)
+  - CACHE_STORE_NAME = 'folder_paths'
+  - CACHE_DB_VERSION = 1
+  - CACHE_KEY_ALL = 'all_paths_v1'
+  - CACHE_TTL_MS = 60 * 60 * 1000 (1 hour expiry)
+
+Key Methods:
+  
+  1. loadData()
+     Purpose: Initialize dashboard
+     Steps:
+       - Call ensureDepartmentsExist() (auto-create from S3 first load)
+       - Get user context
+       - Get accessible departments
+       - Load search index from cache or build new
+  
+  2. _loadFromCacheThenRefresh()
+     Purpose: Fast load pattern - cache first, then refresh
+     Logic:
+       - Try to load index from IndexedDB
+       - If cache exists and not expired → show immediately
+       - Then refresh in background (non-blocking)
+       - Update UI when refresh completes
+     Performance: First load ~200ms, subsequent loads instant
+  
+  3. buildSearchIndex()
+     Purpose: Index all folders/files across departments
+     Process:
+       - Fetches folder paths from S3 (chunked)
+       - Groups by department
+       - Builds searchable index in memory
+       - Caches to IndexedDB for next session
+     Performance:
+       - First build: 30-60 seconds
+       - Background refresh: 15-30 seconds
+       - Cached load: <200ms
+  
+  4. handleDepartmentSelected(dept)
+     Triggered By: Click on department card
+     Event Dispatch: 'departmentselected' event
+     Passes: {departmentId, departmentName, folderPath}
+  
+  5. handleAdminPanel()
+     Triggered By: Admin button click (v37 new)
+     Event Dispatch: 'adminpanel' event
+     Notifies Parent: Portal component to switch to admin panel
+  
+  6. handleGlobalSearch()
+     Purpose: Cross-department search (filtered from index)
+     Debounced: 300ms (SEARCH_DEBOUNCE_MS)
+     Results: Show up to 20 matches in dropdown
+     Clicking: Navigates to file browser at that path
+
+Performance Optimizations:
+  - IndexedDB caching (1 hour TTL)
+  - Parallel department loading (5 at a time)
+  - Lazy loading - index builds in background
+  - Shared cache with FileBrowser component
+
+---
+
+LWC COMPONENT 3: zoomRecordingFileBrowser
+File: force-app/main/default/lwc/zoomRecordingFileBrowser/
+Purpose: Browse and display files/folders in selected department
+Sharing: Nested under Portal component
+
+API Properties (@api):
+  - departmentId (String): Department ID being browsed
+  - departmentName (String): Department display name
+  - folderPath (String): S3 folder path
+  - restorePath (String): Path to restore on mount
+
+Tracked Properties (@track):
+  - currentPath (String): Currently viewing folder path
+  - breadcrumbs (Array): Breadcrumb navigation trail
+  - isLoading (Boolean): Loading folder contents
+  - errorMessage (String): Error display
+  - localFolders (Array): Subfolders in current path
+  - localFiles (Array): Files in current path
+  - searchText (String): Search filter text
+  - searchResults (Array): Filtered results
+  - isSearching (Boolean): Search in progress
+  - dateFilter (String): Date range filter (all|today|last7|last30|custom)
+  - showDatePicker (Boolean): Custom date picker visibility
+
+Constants:
+  - ALLOWED_EXTENSIONS_FOR_USERS = {vtt, mp4, m4a, cc, chat, transcript, txt}
+  - BLOCKED_FOLDERS_FOR_USERS = {docs, doc, llm}
+  - JSON_ALLOWED_DEPARTMENTS = {ec2-jobs, temp, viewer-logs, zoom-fail}
+  - MAX_CALLOUTS_PER_CHUNK = 10
+
+Key Methods:
+  
+  1. browseFolder(path)
+     Purpose: Load and display folder contents
+     Apex Call: browseFolder(@AuraEnabled)
+     Returns: BrowseResult {currentPath, subfolders[], files[]}
+     Displays:
+       - List of subfolders (clickable)
+       - List of files (playable if allowed)
+  
+  2. makeBreadcrumbs()
+     Purpose: Build navigation trail
+     Example: "Sales / 2024 / Q1"
+     Clickable: Each breadcrumb navigates to that folder
+  
+  3. handleFileClick(fileDTO)
+     Purpose: File selected
+     Validation:
+       - Check file type allowed
+       - Check access granted
+       - Check user permissions
+     Event Dispatch: 'play' event
+     Passes: {s3Key, fileName, size, mimeType, lastModified}
+  
+  4. handleDateFilterChange(event)
+     Purpose: Apply date range filter to files
+     Options:
+       - all: No filter
+       - today: Last 24 hours
+       - last7: Last 7 days
+       - last30: Last 30 days
+       - custom: User-selected date
+  
+  5. handleFolderClick(path)
+     Purpose: Navigate into subfolder
+     Updates: currentPath, breadcrumbs, localFolders, localFiles
+     Logs: (implicitly via browseFolder)
+  
+  6. handleBackClick()
+     Purpose: Go back to previous folder
+     Event Dispatch: 'back' event
+     Parent Response: Portal switches to dashboard
+
+Validation Rules:
+  - File extensions: Only vtt, mp4, m4a, cc, chat, transcript, txt
+  - Blocked folders: Non-admins can't access docs/, doc/, llm/
+  - JSON files: Only from ec2-jobs, temp, viewer-logs, zoom-fail folders
+  - Department access: Check against user folder mappings
+
+Caching:
+  - Folder listings cached in session
+  - Shared index cache from Dashboard component
+  - Date filtering done client-side (no refresh needed)
+
+---
+
+LWC COMPONENT 4: zoomRecordingVideoPlayer
+File: force-app/main/default/lwc/zoomRecordingVideoPlayer/
+Purpose: Secure video playback with anti-screen-recording protection
+Sharing: Nested under Portal component
+
+API Properties (@api):
+  - file (Object): File to play {s3Key, fileName, size, mimeType}
+  - departmentName (String): Department of file
+
+Tracked Properties (@track):
+  - signedUrl (String): S3 signed URL for playback
+  - transcriptText (String): VTT subtitle content
+  - isLoading (Boolean): Loading video URL
+  - errorMessage (String): Error display
+  - showTranscript (Boolean): Show subtitle panel
+  - showJson (Boolean): Show JSON viewer (for .json files)
+  - jsonRecords (Array): Parsed JSON array
+  - jsonFields (Array): Column headers for JSON table
+  - isScreenBlocked (Boolean): DevTools detected - playback blocked
+
+Anti-Screen-Recording Features:
+
+  1. Detection Mechanism:
+     - Monitors keyboard combinations (Meta+Shift, Win+G, Win+Alt+R, Ctrl+Shift+S)
+     - Watches for Inspect Element activation
+     - Detects getDisplayMedia() calls (screen capture)
+     - Monitors DevTools focus
+  
+  2. Detection Methods:
+     - Key combination tracking
+     - Visibility API (tab hidden)
+     - DevTools open detection
+     - Screen recording API interception
+  
+  3. Response When Violation Detected:
+     - Freezes video to black
+     - Disables all controls
+     - Shows "Access Blocked" message
+     - Stores violation marker in sessionStorage (30 min TTL)
+     - Logs attempt via logScreenRecordingAttempt()
+     - Sends email to admin permission set
+  
+  4. Violation Recovery:
+     - Portal reloads in BLOCKED state
+     - Persists 30 minutes
+     - After 30 min → can navigate away normally
+     - Auto-recovery without admin intervention
+
+Key Methods:
+  
+  1. connectedCallback()
+     Purpose: Initialize player
+     Actions:
+       - Detect OS (Windows/Mac)
+       - Set up keyboard/mouse/visibility listeners
+       - Load signed URL for video
+       - Check for prior violations
+       - Restore blocked state if needed
+  
+  2. _setupKeyboardGuard()
+     Purpose: Intercept suspicious key combinations
+     Monitors:
+       - Meta+Shift held >30ms (might be inspecting)
+       - Win+G (Windows game bar)
+       - Win+Alt+R (Windows screen record)
+       - Ctrl+Shift+S (Windows screenshot)
+       - Cmd+Shift+3/4 (Mac screenshots)
+       - Dev tools open detection
+  
+  3. _loadSignedUrl()
+     Purpose: Get playable URL from S3
+     Apex Call: getSignedUrl(s3Key)
+     Result: HTTPS URL valid for ~8 hours
+     Sets: this.signedUrl → video src
+  
+  4. _loadTranscript()
+     Purpose: Load .vtt subtitle file
+     Apex Call: getTranscriptText(s3Key)
+     Result: VTT format text
+     Displays: As subtitles in video player
+  
+  5. _loadJson()
+     Purpose: Parse and display JSON file
+     Supports:
+       - Array of objects → table format
+       - Single object → key-value pairs
+       - Raw JSON → text format
+  
+  6. handleDownload()
+     Purpose: Allow user to download file locally
+     For .txt: Direct download
+     For .vtt: Download as .vtt
+     For .json: Download as .json
+     Logs: logFileAccess() for audit trail
+  
+  7. _violationDetected()
+     Purpose: Handle screen recording attempt
+     Actions:
+       - Set isScreenBlocked = true
+       - Store violation in sessionStorage
+       - Log attempt with timestamp
+       - Send email notification
+       - Clear video URL
+       - Disable all playback controls
+  
+  8. handleBack()
+     Purpose: Return to file browser
+     Event Dispatch: 'back' event
+     Parent Response: Portal restores file browser
+  
+  9. handleHome()
+     Purpose: Return to dashboard
+     Event Dispatch: 'home' event
+     Parent Response: Portal switches to dashboard
+
+Security Features:
+  - Video URL never passed to untrusted sources
+  - S3 signed URLs expire after 8 hours
+  - DevTools/Inspector blocks playback
+  - Screen recording APIs intercepted
+  - All access attempts logged with IP/user agent
+  - Admin notified of violations
+
+Supported File Types:
+  - .mp4: HTML5 video (primary)
+  - .webm: WebM video format
+  - .mov: QuickTime (browser dependent)
+  - .mkv: Matroska format (browser dependent)
+  - .vtt: Subtitle/transcript files
+  - .json: Data visualization (with table view)
+  - .txt: Text files (raw display)
+
+---
+
+LWC COMPONENT 5: zoomRecordingLogs
+File: force-app/main/default/lwc/zoomRecordingLogs/
+Purpose: View and search access logs (admin-only)
+Sharing: Nested under Portal/Admin Panel
+
+Tracked Properties (@track):
+  - hasAccess (Boolean): User is admin
+  - accessDenied (Boolean): Access denied message
+  - allLogs (Array): Current page of logs
+  - filteredLogs (Array): After client-side filtering
+  - totalCount (Number): Total logs matching filters
+  - hasMore (Boolean): More records available for pagination
+  - isLoading (Boolean): Loading logs
+  - isLoadingMore (Boolean): Loading next page
+  - errorMessage (String): Error display
+  - currentUserEmail (String): Current user's email
+  - activeFilter (String): Selected event type filter
+  - searchTerm (String): User search text
+  - filterDate (String): Date filter value
+  - dateRangeFilter (String): Date range preset
+
+Constants:
+  - PAGE_SIZE = 20 (logs per page)
+  - SEARCH_DEBOUNCE_MS = 300
+
+Event Type Filters:
+  - all: All event types
+  - access: Portal_Access events only
+  - exit: Portal_Exit events
+  - view: File_Access events
+  - logout: Logout events
+  - screen: Screen_Recording_Attempt blocks
+  - denied: Access_Denied attempts
+  - login_ok: Successful logins
+  - transcript: Transcript copy attempts
+
+Key Methods:
+  
+  1. checkAccess()
+     Purpose: Verify user is admin
+     Apex Call: isAdminUser()
+     Result: Sets hasAccess flag
+     If Not Admin: Shows accessDenied message
+  
+  2. loadLogs()
+     Purpose: Fetch logs with current filters
+     Apex Call: getLogs({...filter params})
+     Filters Applied:
+       - eventType: Apex mapped from activeFilter
+       - searchTerm: Multi-word user search
+       - startDate/endDate: Date range
+     Returns: LogQueryResult {logs[], totalCount, pageNumber, pageSize}
+     Pagination: offset = (pageNumber-1) * pageSize
+  
+  3. loadMore()
+     Purpose: Fetch next page of results
+     Triggered By: IntersectionObserver (infinite scroll)
+     Logic: Increment pageNumber, append results
+  
+  4. handleFilterChange(eventType)
+     Purpose: Filter logs by event type
+     Actions:
+       - Set activeFilter
+       - Reset pageNumber to 1
+       - Reload logs
+  
+  5. handleDateRangeChange(range)
+     Purpose: Filter by date range
+     Options:
+       - all: All dates
+       - today: Last 24 hours
+       - last7: Last 7 days
+       - last30: Last 30 days
+       - custom: User picks date
+  
+  6. handleUserSearch(term)
+     Purpose: Search for logs by user
+     Debounced: 300ms
+     Supports: Multi-word search (AND logic)
+     Apex: Resolves user name/email/username to user IDs
+     Returns: Logs for matching users
+  
+  7. handleExportCsv()
+     Purpose: Export all filtered logs as CSV
+     Includes: User, Event, Date, IP, Status
+     File Name: logs-[timestamp].csv
+  
+  8. handleLogDetail(logId)
+     Purpose: Show detailed view of single log
+     Modal Opens: Full details with error messages
+  
+  9. _setupObserver()
+     Purpose: Set up infinite scroll
+     Technology: IntersectionObserver API
+     Trigger: When .load-sentinel element scrolls into view
+     Action: Calls loadMore() if hasMore && !isLoading
+
+Performance:
+  - Pagination prevents loading all at once
+  - Debounced search (300ms) reduces API calls
+  - Infinite scroll instead of pagination buttons
+  - Client-side filtering after load
+
+Permissions:
+  - Admin-only view
+  - Shows logs for ALL users
+  - Can filter by any user
+
+---
+
+LWC COMPONENT 6: zoomRecordingAccessManager
+File: force-app/main/default/lwc/zoomRecordingAccessManager/
+Purpose: Manage user permissions and folder access (admin-only)
+Sharing: Nested under Portal/Admin Panel
+
+Tracked Properties (@track):
+  - allUsers (Array): All users with Zoom_Recording access
+  - filteredUsers (Array): After search/filter
+  - isLoading (Boolean): Loading user list
+  - errorMessage (String): Error display
+  - searchTerm (String): Search filter text
+  - selectedUser (Object): User being edited
+  - showModal (Boolean): Modal dialog visible
+  - activeTab (String): users | permissions | summary
+  - summaryData (Array): Access summary by admin
+  - isLoadingSummary (Boolean): Loading summary
+  - showConfirmPopup (Boolean): Confirmation dialog
+
+User Object Fields:
+  - id: User ID
+  - name: User name
+  - email: Email address
+  - isActive: Active status
+  - permissionSets: List of assigned permission sets
+  - mappedFoldersCount: Number of folder grants
+  - userName: Display-friendly name
+  - permissionSetsDisplay: Formatted permission list
+  - folderBadgeClass: CSS class for folder badge
+  - folderBadgeText: "X folders" or "No folders"
+
+Key Methods:
+  
+  1. loadUsers()
+     Purpose: Load all users with Zoom_Recording access
+     Apex Call: getAllUsersWithAccess()
+     Transforms:
+       - Fixes auto-generated usernames (User123456 → email prefix)
+       - Formats permission set list
+       - Adds folder count badge
+     Display: Sortable user table with actions
+  
+  2. handleSearch(term)
+     Purpose: Filter users by name/email
+     Client-side: Searches allUsers array
+     Results: Updates filteredUsers
+  
+  3. handleUserClick(user)
+     Purpose: Edit user permissions
+     Modal Opens: Shows user detail
+     Available Actions:
+       - View current permissions
+       - Add permission set
+       - Remove permission set
+       - Add folder mapping
+       - Remove folder mapping
+  
+  4. grantPermission(userId, permissionSetId)
+     Purpose: Assign permission set to user
+     Apex Call: grantUserPermissionSet()
+     Result: User gets new permission set
+     Refresh: Reloads user list
+  
+  5. revokePermission(userId, permissionSetId)
+     Purpose: Remove permission set from user
+     Confirmation: Shows popup
+     Apex Call: revokeUserPermissionSet()
+     Result: User loses permission
+     Refresh: Reloads user list
+  
+  6. addFolderMapping(userId, folderPath)
+     Purpose: Grant user access to specific S3 folder
+     Creates: Zoom_Recording_User_Folder_Map__c record
+     Apex Call: addFolderMapping()
+     Fields Set:
+       - User__c = userId
+       - S3_Folder_Path__c = folderPath
+       - Is_Active__c = true
+       - Granted_By__c = current user
+       - Granted_Date__c = today
+  
+  7. removeFolderMapping(mappingId)
+     Purpose: Revoke folder access from user
+     Confirmation: Shows popup
+     Apex Call: revokeFolderAccess()
+     Option 1: Soft delete (Is_Active__c = false)
+     Option 2: Hard delete (remove record)
+  
+  8. loadAccessSummary()
+     Purpose: Show who-granted-access report
+     Apex Call: getAccessSummary()
+     Shows:
+       - Admin name
+       - Permission grants made by this admin
+       - Folder mappings created
+       - Recent grant dates
+  
+  9. handleBulkRevoke(userIds)
+     Purpose: Revoke all access from multiple users
+     Confirmation: Shows count of affected users
+     Apex Call: revokeAllUserAccess()
+     Result: Users lose all Zoom_Recording permissions
+  
+  10. _getDisplayName(user)
+      Purpose: Show readable name even for auto-generated usernames
+      Logic:
+        - If User123456 pattern → use email prefix
+        - Else if real name exists → use name
+        - Else username prefix
+        - Else "Unknown User"
+
+Smart Display Name:
+  - Salesforce sometimes auto-generates usernames like "User177395801819887226"
+  - This method detects that and falls back to email
+  - Makes user list much more readable
+
+Bulk Operations:
+  - Select multiple users
+  - Revoke all permissions at once
+  - Grant same permission to multiple users
+
+---
+
+LWC COMPONENT 7: zoomRecordingAccessModal
+File: force-app/main/default/lwc/zoomRecordingAccessModal/
+Purpose: Modal dialog for granting/revoking specific permissions
+Sharing: Used by zoomRecordingAccessManager component
+
+API Properties (@api):
+  - userId (String): User being granted access
+  - userName (String): User display name
+  - isOpen (Boolean): Modal visible
+  - modalMode (String): grant | revoke | folder-map
+
+Tracked Properties (@track):
+  - availablePermissions (Array): All permission sets user can get
+  - currentPermissions (Array): Permissions user already has
+  - selectedPermission (String): Permission to grant
+  - folderPath (String): S3 path for folder mapping
+  - isProcessing (Boolean): API call in progress
+  - errorMessage (String): Error display
+  - successMessage (String): Confirmation message
+
+Key Methods:
+  
+  1. handleGrantPermission()
+     Purpose: Assign selected permission set
+     Validates: Permission not already assigned
+     Apex Call: grantUserPermissionSet()
+     Shows: Success message
+     Auto-close: After 2 seconds
+  
+  2. handleRevokePermission(permId)
+     Purpose: Remove permission from user
+     Confirmation: "Are you sure?" popup
+     Apex Call: revokeUserPermissionSet()
+     Shows: Success message
+  
+  3. handleAddFolderMapping()
+     Purpose: Grant folder access
+     Validates: Folder path entered
+     Apex Call: addFolderMapping()
+     Creates: Zoom_Recording_User_Folder_Map__c
+     Shows: Success + reloads access manager
+  
+  4. handleClose()
+     Purpose: Close modal
+     Resets: Form fields
+     Refresh: Parent component
+
+---
+
+LWC COMPONENT 8: zoomRecordingAdminPanel
+File: force-app/main/default/lwc/zoomRecordingAdminPanel/
+Purpose: Central admin hub (v37 new)
+Sharing: Nested under Portal component
+
+Tracked Properties (@track):
+  - activeSection (String): Currently displayed section
+  - isLoading (Boolean): Loading admin data
+  - configData (Object): Portal configuration
+  - testConnectionResult (String): S3 connectivity test result
+  - departmentList (Array): All departments
+  - showConnectionModal (Boolean): S3 test dialog
+
+Sections (Navigation):
+  - Dashboard: Admin metrics
+  - Configuration: Portal settings
+  - Department Management: Add/edit departments
+  - S3 Connection Test: Verify AWS connectivity
+  - Logs: Access logs viewer
+  - Access Manager: User permission management
+  - Hierarchy: Organizational chart
+
+Key Methods:
+  
+  1. testS3Connection()
+     Purpose: Verify AWS S3 bucket access
+     Apex Call: testConnection()
+     Result: "Connection successful - Found X files" or error
+     Success: Shows green checkmark
+     Failure: Shows error message with troubleshooting
+  
+  2. loadConfiguration()
+     Purpose: Display current portal configuration
+     Shows:
+       - S3 bucket name
+       - AWS region
+       - Site title
+       - File extension whitelist
+       - Signed URL expiry
+       - Admin notice text
+  
+  3. saveConfiguration()
+     Purpose: Update portal settings
+     Updates: Zoom_Portal_Config__mdt record
+     Apex Call: updatePortalConfig()
+     Refresh: All components reload config
+  
+  4. handleViewLogs()
+     Purpose: Navigate to logs view
+     Event Dispatch: 'viewlogs' event
+     Parent Response: Portal switches to ADMIN_LOGS
+  
+  5. handleManageAccess()
+     Purpose: Navigate to access manager
+     Event Dispatch: 'manageaccess' event
+     Parent Response: Portal switches to ACCESS_MANAGER
+  
+  6. handleViewHierarchy()
+     Purpose: Navigate to org chart
+     Event Dispatch: 'viewhierarchy' event
+     Parent Response: Portal switches to HIERARCHY
+
+---
+
+LWC COMPONENT 9: zoomRecordingHierarchyChart
+File: force-app/main/default/lwc/zoomRecordingHierarchyChart/
+Purpose: Organizational hierarchy and permission visualization
+Sharing: Nested under Portal/Admin Panel
+
+Tracked Properties (@track):
+  - departments (Array): Department hierarchy
+  - adminUsers (Array): Users with admin access
+  - deptUsers (Array): Users by department
+  - permissionStructure (Object): Permission set relationships
+  - isLoading (Boolean): Loading hierarchy data
+  - errorMessage (String): Error display
+
+Hierarchy Structure:
+  Root (Admin)
+    ├── Department 1
+    │   ├── Permission Set 1
+    │   └── Users (mapped to dept)
+    ├── Department 2
+    │   ├── Permission Set 2
+    │   └── Users (mapped to dept)
+    └── Unassigned Users
+
+Visual Displays:
+  - Tree structure (expandable/collapsible)
+  - Color coding by access level
+  - User count badges
+  - Department folder icons
+  - Permission set labels
+
+Key Methods:
+  
+  1. loadHierarchy()
+     Purpose: Fetch all permission/department data
+     Apex Calls:
+       - getUserAccessibleDepartments()
+       - getAllUsersWithAccess()
+       - getPermissionSetHierarchy()
+     Builds: Tree structure from results
+  
+  2. expandDepartment(deptId)
+     Purpose: Show users in department
+     Displays: List of users with this department's access
+  
+  3. expandPermissionSet(permSetId)
+     Purpose: Show users with permission
+     Displays: All users with this permission set
+  
+  4. handleNodeClick(nodeId)
+     Purpose: Show detail panel for selected node
+     If Department: Shows folder path, description, users
+     If Permission Set: Shows assigned users
+     If User: Shows all their permissions and folders
+
+Export/Report:
+  - Export hierarchy as JSON
+  - Export as CSV
+  - Print-friendly view
+
+This component helps visualize complex access structures.
+
+================================================================================
+SECTION 4: SALESFORCE FLOWS - DETAILED
+================================================================================
+
+FLOW 1: Job_Requirement_Set_Defaults_On_Create
+File: force-app/main/default/flows/Job_Requirement_Set_Defaults_On_Create.flow-meta.xml
+Trigger: Record-triggered (After Create) on Job_Requirement__c
+Purpose: Set default values and send notifications when Job Requirement created
+Sharing: System/Process
+
+Flow Type: Autolaunched Flow (Record-Triggered)
+Trigger Event: After Create
+Entry Conditions: None (all new records)
+
+Variables Used:
+  - $Record.Account_Manager__r.Email: Account manager email
+  - $Record.Requirement_Received_Date_Time__c: When requirement received
+  - $Record.Job_Title__c: Job title text
+  - $Record.Client_Account__c: Hiring company reference
+  - varRecipientIDs (Collection): User IDs to notify
+
+Assignment Blocks:
+  1. Set_Default_Values
+     Assigns:
+       - Requirement_Received_Date_Time__c = NOW()
+       - Submission_Deadline__c = NOW() + 30 days (default)
+       - Job_Status__c = "Open"
+       - Website_Status__c = "Draft"
+
+Decision Blocks:
+  1. Check_If_Account_Manager_Exists
+     Condition: $Record.Account_Manager__c != null
+     True Path: Send email notification
+     False Path: Skip email
+
+Action Blocks:
+  1. Send_Email_To_AM
+     Type: Email (emailSimple)
+     Recipient: Account manager's email
+     Subject Template: fx_EmailSubject = "[New Requirement] {!$Record.Job_Title__c}"
+     Body Template: ttEmailBody with dynamic job details
+     Rich HTML: true
+     Sender: noreply@techsarasolutions.com (Org-wide email)
+     Fault Handler: Continue on error
+
+  2. Send_SF_Bell_Notification
+     Type: Custom Notification
+     Recipient: Account manager (varRecipientIDs)
+     Title: fx_BellTitle = "New Job Requirement Assigned"
+     Body: fx_BellBody with requirement details
+     Target ID: $Record.Id (link to record)
+     Notification Type: Custom Notification Type
+
+  3. Send_Slack
+     Type: Slack Message
+     Channel: $Label.B2B_New_Requirements (stored in custom label)
+     Message: ttSlackMessage with formatted requirement details
+     Format: Rich text with links and formatting
+     Async: Yes (posted asynchronously)
+
+Flow Controls:
+  - Fault connectors on email actions (continue if send fails)
+  - Async execution on Slack message (doesn't block record save)
+  - Formula expressions for dynamic text
+
+Related Automation:
+  - May trigger flow B2b_job_requirement_updated_notification_flow
+  - Creates activity history
+  - Triggers assignment rules
+
+---
+
+FLOW 2: B2B_Jr_update_submission_counts
+File: force-app/main/default/flows/B2B_Jr_update_submission_counts.flow-meta.xml
+Trigger: Record-triggered (After Create, After Update) on Job_Submission__c
+Purpose: Denormalize submission counts to Job Requirement and Lead for reporting
+Sharing: System/Process
+
+Flow Type: Autolaunched Flow (Record-Triggered)
+Trigger Event: After Create, After Update
+Entry Conditions:
+  - Status__c changes to certain values
+  - Related Job Requirement exists
+
+Variables Used:
+  - varJRIds (Collection): List of Job Requirement IDs
+  - varTotal (Number): Total submission count
+  - varClient (Number): Client submission count
+  - varLeadApps (Number): Lead application count
+  - varCountSkipped (Boolean): Error flag for fault handling
+
+Collection Loop Blocks:
+  1. Loop_JR_Ids
+     Purpose: Iterate through Job Requirements related to triggering submission
+     Loop Type: Collection loop
+     Actions per iteration:
+       - Fetch this JR's submissions
+       - Count total submissions
+       - Count by submission source (client/lead)
+
+  2. Loop_Subs
+     Purpose: Iterate through submissions for each JR
+     For each submission:
+       - Check if from client (client_lead__c != null)
+       - If yes: increment client count
+       - Always: increment total count
+
+  3. Loop_LeadSubs
+     Purpose: Iterate through submissions by same lead
+     Counts: Total applications for the lead
+     Used for: Lead-level reporting
+
+Assignment Blocks:
+  1. asn_AddJRId
+     Action: Add JR ID to varJRIds collection
+     Used By: Query loop to know which JRs to update
+
+  2. asn_IncTotal
+     Action: varTotal += 1.0
+     For: Total submission counter
+
+  3. asn_IncClient
+     Action: varClient += 1.0
+     Condition: Submission from client lead
+     For: Client-specific submission counter
+
+  4. asn_IncLeadApps
+     Action: varLeadApps += 1.0
+     Condition: Submission from Lead
+     For: Lead-level application counter
+
+  5. Handle_Count_Fault
+     Action: Set varCountSkipped = true
+     Reason: If count update fails (data validation issue)
+     Effect: Lets record save even if count update fails
+
+Decision Blocks:
+  1. dec_IsClientSub
+     Condition: Submission.Source__c = 'Client'
+     True: Increment client count
+     False: Skip (not a client submission)
+
+  2. dec_HasClientLead
+     Condition: Job_Requirement.Client_Lead__c != null
+     True: Roll up counts to lead
+     False: Skip lead roll-up
+
+Update Record Actions:
+  1. Update Job Requirement Counts
+     Record: Job_Requirement__c
+     Fields to Update:
+       - Submission_Count__c = varTotal
+       - Client_Submission_Count__c = varClient
+       - Last_Submission_Date__c = NOW()
+     Fault Handler: Handle_Count_Fault (skip error, continue)
+
+  2. Update Lead Application Count (if applicable)
+     Record: Lead (Client_Lead__c)
+     Fields to Update:
+       - Applications__c = varLeadApps
+       - Last_Application_Date__c = NOW()
+
+Flow Performance:
+  - Runs synchronously on record create/update
+  - Should complete within 1-2 seconds
+  - Fault handlers prevent cascading failures
+  - Bypasses if JR has data validation issues
+
+---
+
+FLOW 3: B2B_Create_Interview_from_Submission
+File: force-app/main/default/flows/B2B_Create_Interview_from_Submission.flow-meta.xml
+Trigger: Record-triggered (After Create) on Job_Submission__c
+Purpose: Auto-create Interview record when submission meets criteria
+Sharing: System/Process
+
+Flow Type: Autolaunched Flow (Record-Triggered)
+Trigger Event: After Create
+Entry Conditions:
+  - Submission_Status__c = "Approved" OR "Auto-Approved"
+  - Related Job Requirement exists
+  - Candidate email is not blank
+
+Variables Used:
+  - fx_CandEmailInt: Internal candidate email
+  - fx_CandEmailExt: External candidate email
+  - fx_CandInterviewSubject: Email subject for candidate
+  - ttCandInterviewInt: HTML email body (internal)
+  - ttCandInterviewExt: HTML email body (external)
+  - varInterviewId: ID of created Interview record
+
+Create Record Block:
+  1. Create_Interview_Record
+     Object: Interview__c
+     Fields Set:
+       - Job_Submission__c = $Record.Id (link to this submission)
+       - Job_Requirement__c = $Record.Job_Requirement__c
+       - Candidate__c = $Record.Candidate__c
+       - Interview_Status__c = "Scheduled"
+       - Interview_Date__c = NOW() + 7 days (default)
+       - Interview_Type__c = "Phone Screen" (default)
+     Stores Result: varInterviewId
+
+Decision Blocks:
+  1. dec_Is_Internal_Candidate
+     Condition: Candidate.Employee_Type__c = "Internal"
+     True Path: Send internal email template
+     False Path: Send external email template
+
+  2. dec_Has_Interview_Email
+     Condition: Candidate's email != null
+     True: Send email confirmation
+     False: Skip email (address missing)
+
+Email Action Blocks:
+  1. Email_Candidate_Interview_Int (Internal)
+     Type: Email (emailSimple)
+     Recipient: fx_CandEmailInt (candidate internal email)
+     Subject: fx_CandInterviewSubject = "Interview Scheduled: {!$Record.Job_Requirement__r.Job_Title__c}"
+     Body: ttCandInterviewInt (rich HTML template)
+     Sender: talent@techsarasolutions.com
+     Rich Body: true
+     Content:
+       - Interview date and time
+       - Interviewer name
+       - Meeting link (if applicable)
+       - Instructions for internal candidate
+       - Option to reschedule
+
+  2. Email_Candidate_Interview_Ext (External)
+     Type: Email (emailSimple)
+     Recipient: fx_CandEmailExt (candidate external email)
+     Subject: fx_CandInterviewSubject
+     Body: ttCandInterviewExt (rich HTML template)
+     Sender: talent@techsarasolutions.com
+     Rich Body: true
+     Content:
+       - Interview date/time
+       - Job title and description
+       - Company information
+       - Interview expectations
+       - Technical requirements
+
+Slack Notification Blocks:
+  1. Copy_2_of_Slack_Message_To_Interviews_Channel
+     Type: Slack Message
+     Channel: $Label.B2B_Interviews (custom label)
+     Audience: Internal team + hiring managers
+     Content:
+       - Candidate name
+       - Position applying for
+       - Interview datetime
+       - Interviewer assigned
+       - Link to interview record
+
+  2. Slack_Thread_Reply_Interview2
+     Type: Slack Thread Reply
+     Purpose: Keeps interview notifications in thread (easier to follow)
+     Content: Status update with candidate acceptance
+
+Follow-up Actions:
+  1. Interview_Confirmation_Email_To_Recruiter
+     Type: Email
+     Recipient: Recruiter/Hiring Manager
+     Purpose: Alert team that interview is scheduled
+     Content:
+       - Candidate details
+       - Interview scheduled for
+       - Resume attached (if available)
+
+Email Fault Handlers:
+  - If candidate email send fails → log error but continue
+  - If internal email fails → try external email path
+  - If Slack fails → doesn't block interview creation
+  - Interview record always created even if notifications fail
+
+---
+
+FLOW 4: B2b_job_requirement_updated_notification_flow
+File: force-app/main/default/flows/B2b_job_requirement_updated_notification_flow.flow-meta.xml
+Trigger: Record-triggered (After Update) on Job_Requirement__c
+Purpose: Notify recruiters when Job Requirement details change
+Sharing: System/Process
+
+Flow Type: Autolaunched Flow (Record-Triggered)
+Trigger Event: After Update
+Entry Conditions:
+  - Job_Title__c OR Job_Description__c OR Submission_Deadline__c changed
+  - Job_Status__c = "Open"
+
+Variables:
+  - varFieldsChanged (Collection): Fields that were modified
+  - varRecruiterEmails (Collection): Recruiter emails to notify
+  - varChangeDetails (Text): Summary of changes
+
+Change Detection Logic:
+  - Compares $Record (new) with $Prior (old) values
+  - Builds list of changed fields
+  - Formats notification message with change summary
+
+Email Notification:
+  1. Email_Recruiters_Of_Changes
+     Type: Email
+     Recipients: All recruiters assigned to this job requirement
+     Subject: "[UPDATED] {!$Record.Job_Title__c} - Details Changed"
+     Body: HTML template showing:
+       - What changed (field names)
+       - Old value
+       - New value
+       - Who made change
+       - When changed
+       - Link to updated requirement
+
+Slack Notification:
+  1. Post_Change_Alert_To_Slack
+     Channel: $Label.B2B_Alerts
+     Message: "@channel Job requirement updated: {!$Record.Job_Title__c}"
+     Details: Summary of changes
+     Link: Click to view in Salesforce
+
+---
+
+FLOW 5: Lead_Conversion_Flow
+File: force-app/main/default/flows/Lead_Conversion_Flow.flow-meta.xml
+Trigger: Screen flow (manual trigger via button)
+Purpose: Convert lead to account + contact, handle duplicates
+Sharing: Global (users can run this flow)
+
+Flow Type: Screen Flow
+Trigger: User clicks "Convert" button on Lead record
+Input Parameters:
+  - recordId: Lead ID being converted
+
+Variables Used:
+  - varHasDupe (Boolean): Duplicate found
+  - varDupeAccountId (ID): Duplicate account ID
+  - AccountId (ID): Converted account ID
+  - ContactId (ID): Converted contact ID
+  - Error_Message (String): Error details
+
+Apex Action Blocks:
+  1. Check_Dupe
+     Type: Apex Action (LeadConversionHandler)
+     Purpose: Check for duplicate accounts (non-blocking)
+     Parameters:
+       - leadID: $Record.Id
+       - checkDuplicateOnly: true (don't convert yet)
+       - convertedStatus: "Converted"
+     Outputs:
+       - hasDuplicate: varHasDupe
+       - duplicateAccountId: varDupeAccountId
+     Fault Handler: Go to Error Screen
+
+Decision Blocks:
+  1. dec_IsDupe
+     Condition: varHasDupe = true
+     True: Show duplicate resolution screen
+     False: Continue with conversion
+
+Screen Block (If Duplicate Found):
+  1. Duplicate_Resolution_Screen
+     Displays:
+       - Existing account details
+       - Lead details
+       - Option to merge or create new
+       - Warning about data consolidation
+
+  2. User Decision Options:
+       a) "Convert to Existing Account"
+          - Merges lead into duplicate account
+          - Converts to contact on existing account
+       b) "Create New Account"
+          - Ignores duplicate warning
+          - Proceeds with new account creation
+
+Conversion Actions:
+  1. Convert_Lead (Branch 1: New Account)
+     Type: Apex Action (LeadConversionHandler)
+     Purpose: Convert lead to new account + contact
+     Parameters:
+       - leadID: recordId
+       - convertedStatus: "Converted"
+     Outputs:
+       - accountID: AccountId
+       - errorMessage: Error_Message
+     Creates:
+       - New Account record
+       - New Contact record
+       - Links Contact to Account
+
+  2. Convert_Lead_Existing_Contact (Branch 2: Existing)
+     Type: Apex Action
+     Purpose: Merge into existing account + contact
+     Parameters:
+       - leadID: recordId
+       - existingAccountId: varDupeAccountId
+     Merges:
+       - Lead information into existing contact
+       - Preserves existing account relationships
+
+  3. Get_Converted_Contact_Existing
+     Type: Query Record
+     Retrieves: Converted Contact record details
+     Used For: Showing success confirmation
+
+Post-Conversion Actions:
+  1. Check_if_there_are_any_error
+     Decision: Error_Message != null
+     True: Show error screen with troubleshooting
+     False: Show success screen
+
+Success Screen:
+  - Display converted account ID
+  - Display converted contact ID
+  - Option to open account record
+  - Option to create job submission
+
+Error Screen:
+  - Display error message
+  - Troubleshooting steps
+  - Option to contact admin
+  - Option to retry
+
+Fault Handlers:
+  - Duplicate check failure → continue without checking
+  - Conversion failure → show error screen with details
+  - Contact lookup failure → show error with recommendation
+
+Related Object Creation:
+  - May trigger B2B_Jr_update_submission_counts if submissions exist
+  - Creates activity history
+  - Updates lead IsConverted flag
+
+---
+
+FLOW 6: B2B_Deadline_Alert
+File: force-app/main/default/flows/B2B_Deadline_Alert.flow-meta.xml
+Trigger: Scheduled (once daily at 9 AM)
+Purpose: Find job requirements with approaching submission deadlines and notify
+Sharing: System/Process
+
+Flow Type: Scheduled Flow
+Schedule: Daily at 9:00 AM
+Time Zone: User's time zone
+
+Query Blocks:
+  1. Find_Jobs_Deadline_Today
+     Query: Job_Requirement__c
+     Filters:
+       - Submission_Deadline__c = TODAY()
+       - Job_Status__c = "Open"
+       - Website_Status__c = "Published"
+     Stores: Collection varJRsDueToday
+
+  2. Find_Jobs_Deadline_Tomorrow
+     Query: Job_Requirement__c
+     Filters:
+       - Submission_Deadline__c = TOMORROW()
+       - Job_Status__c = "Open"
+     Stores: Collection varJRsDueTomorrow
+
+  3. Find_Jobs_Deadline_Next_3_Days
+     Query: Job_Requirement__c
+     Filters:
+       - Submission_Deadline__c = NEXT_N_DAYS:3
+       - Job_Status__c = "Open"
+     Stores: Collection varJRs3Days
+
+Loop Through Each Collection:
+  For each Job Requirement in collection:
+
+  1. Email_Account_Manager
+     Type: Email
+     Recipient: Account_Manager__r.Email
+     Subject: "[URGENT] Deadline {!$Record.Job_Title__c} approaching!"
+     Body: HTML template with:
+       - Job title
+       - Days until deadline (0/1/2-3)
+       - Current submission count
+       - Link to view submissions
+       - Instructions for extension
+
+  2. Email_Hiring_Manager
+     Type: Email
+     Recipient: Client account contact email
+     Subject: "Submission deadline approaching for {!$Record.Job_Title__c}"
+     Body: Template with job details and deadline
+     Tone: Professional, not urgent (unlike account manager email)
+
+  3. Post_To_Slack
+     Channel: $Label.B2B_Alerts
+     Message: "@channel Deadline ALERT: {!$Record.Job_Title__c} due TODAY"
+     Color: Red if today, Yellow if tomorrow/3 days
+     Content:
+       - Submission count so far
+       - Link to submissions
+       - Link to requirement
+
+Email Customization:
+  - TODAY's deadline: URGENT tone, red banner
+  - Tomorrow/3 days: Standard tone, yellow banner
+
+Batch Processing:
+  - Flow processes up to 500 job requirements per run
+  - If more than 500 qualify → creates batch task for overflow
+  - Ensures all emails sent within run completion time
+
+Scheduled Actions:
+  - Runs independently from record automation
+  - Doesn't interfere with creation/update flows
+  - Can be manually triggered via flow button
+
+---
+
+FLOW 7: Interview_Start_Follow_Up_Cycle
+File: force-app/main/default/flows/Interview_Start_Follow_Up_Cycle.flow-meta.xml
+Trigger: Record-triggered (After Create) on Interview__c
+Purpose: Initialize follow-up sequence when interview scheduled
+Sharing: System/Process
+
+Flow Type: Autolaunched Flow
+Trigger Event: After Create
+Entry Conditions: Interview_Status__c = "Scheduled"
+
+Actions:
+  1. Create_Follow_Up_Task
+     Object: Task
+     Fields:
+       - WhoId: Interview.Candidate__c (Contact ID)
+       - WhatId: Interview__c (Link to interview)
+       - Subject: "Follow-up: {!Interview.Candidate__r.Name} Interview"
+       - Due_Date: Interview_Date__c + 2 days
+       - Description: Template with interview details
+       - Priority: "High"
+       - Status: "Not Started"
+       - Assigned_To: Interview.CreatedById (original creator)
+
+  2. Create_Reminder
+     Type: Event/Reminder
+     Purpose: Reminder for interviewer
+     Reminder Time: 1 day before interview
+     Details: Interview datetime, candidate info
+
+  3. Send_Candidate_Confirmation
+     Type: Email
+     Recipient: Candidate email
+     Subject: "Interview Confirmation: {!Interview.Position__c}"
+     Body: Reminder of date/time, instructions
+
+Workflow:
+  - Interview created → tasks/reminders scheduled
+  - Follow-up task due 2 days after
+  - Interviewer reminded 1 day before
+  - Candidate receives confirmation email
+
+Related Flows:
+  - Triggers Interview_send_follow_up_reminders if follow-up not completed
+  - May trigger Interview_Stop_Follow_Up_Cycle if cancelled
+
+---
+
+FLOW 8: Interview_send_follow_up_reminders
+File: force-app/main/default/flows/Interview_send_follow_up_reminders.flow-meta.xml
+Trigger: Scheduled (daily)
+Purpose: Send reminders for pending follow-ups
+Sharing: System/Process
+
+Flow Type: Scheduled Flow
+Schedule: Daily at 5 PM (before business closes)
+
+Query Block:
+  Find_Pending_Follow_Ups:
+    Query: Task
+    Filters:
+      - Related_To_Interview__c != null
+      - Subject LIKE '%Follow-up%'
+      - Status = 'Not Started'
+      - Due_Date <= TODAY()
+    Stores: varOverdueTasks
+
+Loop Block:
+  For each overdue task:
+    1. Email_Assigned_User
+       Type: Email
+       Recipient: Task.Owner.Email
+       Subject: "REMINDER: Follow-up due - {!Task.What.Name}"
+       Body: Task details with candidate info
+       Urgency: High (red banner if 5+ days overdue)
+
+    2. Post_To_Slack
+       Channel: User's personal Slack (if configured)
+       Message: "Don't forget: Follow-up for {!Candidate.Name}"
+
+---
+
+FLOW 9: apply_leave
+File: force-app/main/default/flows/apply_leave.flow-meta.xml
+Trigger: Screen flow (user initiates)
+Purpose: Allow employees to request leave/time off
+Sharing: Employees (internal users)
+
+Flow Type: Screen Flow
+Inputs:
+  - Employee ID or self
+  - Leave type (sick, vacation, personal)
+  - Start date
+  - End date
+  - Reason/comments
+
+Actions:
+  1. Create_Leave_Request
+     Object: Leave_Request__c (custom object)
+     Fields:
+       - Employee__c: Current user
+       - Leave_Type__c: Selected type
+       - Start_Date__c: Entered start date
+       - End_Date__c: Entered end date
+       - Reason__c: Comments
+       - Status__c: "Pending"
+       - Days_Requested__c: Calculated (end - start)
+
+  2. Email_Manager
+     Recipient: Employee's manager
+     Subject: "Leave Request: {!Employee.Name} - {!varLeaveType}"
+     Body: Request details asking for approval/denial
+
+  3. Email_Employee
+     Recipient: Requesting employee
+     Subject: "Your leave request has been submitted"
+     Body: Confirmation with request details
+
+Success Screen:
+  - Confirmation message
+  - Request ID
+  - Expected response timeline
+  - Link to check status
+
+Related Automation:
+  - Manager may approve/deny via email link
+  - Approval triggers calendar update
+  - Denial sends notification
+
+---
+
+FLOW 10: Create_Lead_From_Application
+File: force-app/main/default/flows/Create_Lead_From_Application.flow-meta.xml
+Trigger: Record-triggered (After Create) on Job_Application__c
+Purpose: Auto-create Lead record when external candidate applies
+Sharing: System/Process
+
+Flow Type: Autolaunched
+Trigger Event: After Create
+Entry Conditions:
+  - Candidate_Type__c = "External"
+  - Lead doesn't already exist for this email
+
+Duplicate Check:
+  1. Query_Existing_Lead
+     Query: Lead
+     Filter: Email = Job_Application.Candidate_Email
+     Stores: varExistingLead
+
+Decision: Lead_Already_Exists
+  - If found: Don't create duplicate, link to existing lead
+  - If not found: Create new lead
+
+Create Lead:
+  1. Create_New_Lead
+     Object: Lead
+     Fields:
+       - FirstName: Candidate first name
+       - LastName: Candidate last name
+       - Email: Candidate email
+       - Phone: Candidate phone (if provided)
+       - Company: Candidate current company (if known)
+       - LeadSource: "Job Portal"
+       - Status: "Open - Not Contacted"
+       - Description: Job title applied for + date
+       - Website_Application_Id__c: Job_Application.Id (link)
+
+Post-Creation:
+  1. Send_Welcome_Email
+     Type: Email
+     Recipient: New lead email
+     Subject: "Welcome to TechSara!"
+     Body: Introduction, next steps
+     CTA: "View your application status"
+
+  2. Notify_Recruiter
+     Type: Email
+     Recipient: Assigned recruiter
+     Subject: "New Lead: {!Lead.Name} - {!Job_Title}"
+     Body: Lead details with link to view
+
+  3. Create_Task
+     Object: Task
+     Fields:
+       - WhoId: Lead.Id
+       - Subject: "Initial Contact: {!Lead.Name}"
+       - Due_Date: TODAY() + 2 days
+       - Priority: "Normal"
+
+Related Automation:
+  - Updates lead count on Job Requirement
+  - May trigger B2B_Jr_update_submission_counts
+  - Creates activity history
+
+================================================================================
+SECTION 5: DATA RELATIONSHIPS & ARCHITECTURE
+================================================================================
+
+ENTITY RELATIONSHIP DIAGRAM:
+
+User (Salesforce Standard)
+  ├── Zoom_Recording_Access_Log__c (logs user actions)
+  ├── Zoom_Recording_User_Folder_Map__c (folder access grants)
+  ├── PermissionSetAssignment → PermissionSet
+  │   └── Zoom_Recording_Admin_Access
+  │   └── Zoom_Recording_User_Access
+  │   └── [Custom permission sets...]
+  └── Zoom_Recording_Department__c (department membership)
+
+Zoom_Recording_Department__c
+  ├── Zoom_Recording_User_Folder_Map__c (maps to users)
+  ├── Zoom_Recording_Access_Log__c (tracks access)
+  └── Folder_Path_S3__c (points to S3 location)
+
+Zoom_Recording_User_Folder_Map__c
+  ├── User__c (FK to User)
+  ├── Department__c (FK to Department)
+  ├── S3_Folder_Path__c (S3 storage location)
+  └── Is_Active__c (access control flag)
+
+Zoom_Recording_Access_Log__c
+  ├── User__c (FK to User who took action)
+  ├── Department__c (FK to Department involved)
+  ├── File_Key__c (S3 file accessed)
+  └── Event_Type__c (categorizes action)
+
+Job_Requirement__c (Standard Salesforce)
+  ├── Client_Account__c (hiring company)
+  ├── Account_Manager__c (FM user)
+  ├── Website_Status__c (controls visibility)
+  └── Related to Interview, Job_Submission objects
+
+Configuration Hierarchy:
+  Zoom_Portal_Config__mdt (single active record)
+    ├── S3 bucket/region settings
+    ├── AWS credentials
+    ├── UI settings (title, notice)
+    └── File type whitelist
+
+================================================================================
+SECTION 6: SECURITY & ACCESS CONTROL
+================================================================================
+
+PERMISSION MODEL:
+
+Level 1: Permission Sets
+  - Zoom_Recording_Admin_Access: Full admin access
+  - Zoom_Recording_User_Access: Basic user access
+  - [Custom department-specific sets]
+
+Level 2: Folder Mappings
+  - Zoom_Recording_User_Folder_Map__c
+  - Grants access to specific S3 folder paths
+  - Can be granted/revoked independently
+
+Level 3: File Type Restrictions
+  - Only certain extensions allowed (.mp4, .vtt, .txt, etc.)
+  - Blocked folders for non-admins (docs, llm)
+  - JSON files restricted by department
+
+Level 4: Department Boundaries
+  - Departments linked to folders
+  - Permission sets control department visibility
+  - Admin can see all departments
+
+ACCESS CONTROL LOGIC:
+
+For File Access:
+  1. User is Admin?
+     → Yes: Access granted (see all)
+     → No: Check step 2
+  
+  2. User has folder mapping for this folder?
+     → Yes: Check step 3
+     → No: Access denied
+  
+  3. File type is allowed?
+     → Yes: Check step 4
+     → No: Access denied
+  
+  4. File is not in blocked folder?
+     → Yes: Grant access, generate signed URL
+     → No: Access denied
+
+Logging & Audit:
+  - Every access logged to Zoom_Recording_Access_Log__c
+  - IP address and user agent captured
+  - Event type categorized
+  - Backed up to S3 for long-term retention
+  - Email alert to admin permission set on certain events
+
+================================================================================
+SECTION 7: AWS S3 INTEGRATION
+================================================================================
+
+S3 BUCKET STRUCTURE:
+
+[bucket-name]/
+├── [department1]/ (e.g., sales/, engineering/)
+│   ├── recording-1.mp4
+│   ├── recording-1.vtt (subtitles)
+│   ├── 2024-Q1/
+│   │   ├── video.mp4
+│   │   └── ...
+│   └── ...
+├── [department2]/
+├── viewer-logs/
+│   ├── all-events/
+│   │   ├── 2026-04-27.json
+│   │   └── ...
+│   ├── login-success/
+│   ├── file-access/
+│   └── ...
+└── ...
+
+AWS AUTHENTICATION:
+  - Named Credential: callout:AWS_S3_Named_Credential
+  - Uses AWS Access Key + Secret Key from config
+  - Signature V4 signing for secure URL generation
+  - No direct credentials in signed URLs (pre-signed concept)
+
+SIGNED URL GENERATION:
+  - V4 algorithm creates time-limited HTTPS URLs
+  - Default expiry: 480 minutes (8 hours)
+  - Includes X-Amz-Signature header
+  - Valid for specific object only
+  - Cannot be modified without invalidating signature
+
+API OPERATIONS:
+  1. ListObjectsV2: List files/folders (with pagination)
+  2. HEAD: Get file metadata
+  3. GET: Generate signed URLs (no actual download from Apex)
+  4. PUT: Upload backups (logs as JSON)
+
+================================================================================
+SECTION 8: CONFIGURATION & SETUP GUIDE
+================================================================================
+
+INITIAL SETUP STEPS:
+
+1. Create AWS S3 Bucket
+   - Bucket name: your-zoom-recordings
+   - Region: us-east-1 (or chosen region)
+   - Enable versioning (recommended)
+   - Create root folders for departments
+
+2. Create AWS IAM User
+   - Permissions: S3 ListBucket, GetObject, PutObject
+   - Generate access key + secret key
+   - Keep credentials secure
+
+3. Create Salesforce Named Credential
+   Path: Setup → Security → Named Credentials
+   - Name: AWS_S3_Named_Credential
+   - URL: https://[bucket].s3.[region].amazonaws.com
+   - Scheme: AWS Signature Version 4
+
+4. Create Custom Metadata Record
+   Path: Setup → Custom Metadata Types → Zoom Portal Config
+   - Create record with all configuration values
+   - Set Is_Active__c = true
+
+5. Create Permission Sets
+   - Zoom_Recording_Admin_Access: Full access
+   - Zoom_Recording_User_Access: Basic user access
+   - Additional department-specific sets as needed
+
+6. Grant Permissions
+   - Assign admin permission set to portal admins
+   - Assign user permission set to regular users
+   - Create folder mappings for granular access
+
+7. Initialize Departments
+   - Portal calls ZoomRecordingDeptAutoSync on first load
+   - Automatically creates Department records from S3 root folders
+   - Can manually create/edit departments as needed
+
+CONFIGURATION FIELDS EXPLAINED:
+
+S3_Bucket_Name__c
+  What: AWS S3 bucket name
+  Example: "my-company-recordings"
+  Impact: All file operations use this bucket
+
+AWS_Region__c
+  What: AWS region code
+  Example: "us-east-1"
+  Impact: Affects S3 endpoint URL and signatures
+
+AWS_Access_Key__c
+  What: AWS IAM access key
+  Security: Keep in metadata encrypted field
+  Impact: Required for S3 operations
+
+AWS_Secret_Key__c
+  What: AWS IAM secret key
+  Security: Keep in metadata encrypted field
+  Impact: Used for signing URLs
+
+Site_Title__c
+  What: Portal title in UI header
+  Example: "Zoom Recording Portal"
+  Impact: Shows to all users
+
+Top_Notice__c
+  What: Banner message to all users
+  Example: "Portal maintenance 5/1 - 5/2"
+  Impact: Displays at top of portal
+
+Signed_URL_Expiry_Minutes__c
+  What: How long generated URLs are valid
+  Example: 480 (8 hours)
+  Impact: Users can view files for this duration
+  Note: Longer = more flexible, shorter = more secure
+
+Allowed_File_Extensions__c
+  What: Comma-separated file extensions
+  Example: "mp4,vtt,txt,m4a"
+  Impact: Only these file types accessible to users
+
+================================================================================
+SECTION 9: TESTING & QUALITY ASSURANCE
+================================================================================
+
+TEST COVERAGE:
+
+JobRequirementRestServiceTest (Class 12)
+  - Tests REST API with various filters
+  - Tests pagination boundaries
+  - Tests field-level security handling
+  - Coverage: >75%
+
+Manual Testing Scenarios:
+
+1. File Access Control
+   - Admin user: Should access all folders
+   - Regular user: Should access only mapped folders
+   - Blocked user: Should get access denied
+   - Verify logging on each attempt
+
+2. Folder Navigation
+   - Navigate department folders
+   - Check subfolder recursion
+   - Verify breadcrumb trail
+   - Test back/forward navigation
+
+3. File Playback
+   - Click on MP4 file
+   - Video should load in player
+   - Subtitles load from .vtt
+   - Download option available
+
+4. Access Logs
+   - Log in and verify portal_access event
+   - Download file and verify file_access event
+   - Attempt unauthorized access and verify access_denied
+   - Search logs by user/date/event type
+   - Export logs to CSV
+
+5. Admin Panel
+   - Grant user permission set
+   - Map user to folder
+   - Revoke permissions
+   - Verify user loses access
+   - Check audit log entries
+
+6. S3 Connectivity
+   - Click "Test Connection" button
+   - Should show "Connected - Found X files"
+   - If fails: check AWS credentials, bucket name, region
+
+7. Pagination
+   - View folder with >1000 files
+   - Verify pagination token used
+   - Check next page loads correctly
+   - Verify no duplicate/missing files
+
+================================================================================
+SECTION 10: DEPLOYMENT & MAINTENANCE
+================================================================================
+
+DEPLOYMENT STEPS:
+
+1. Pre-Deployment Checks
+   - All tests passing (>75% coverage)
+   - Code review completed
+   - Configuration values prepared
+   - AWS credentials securely stored
+
+2. Deploy to Org
+   - Use Salesforce CLI or Change Sets
+   - Deploy Apex classes, LWC, flows, metadata
+   - Run all tests during deployment
+   - Verify test coverage maintained
+
+3. Post-Deployment Configuration
+   - Create Named Credentials
+   - Create Custom Metadata record
+   - Grant permission sets to users
+   - Create Zoom_Recording_Department__c records
+   - Create Zoom_Recording_User_Folder_Map__c for user access
+
+4. Verification
+   - Test portal access by non-admin user
+   - Verify file access logging
+   - Check admin dashboard shows data
+   - Test REST API endpoint
+   - Review access logs
+
+MAINTENANCE TASKS:
+
+Weekly:
+  - Review access logs for anomalies
+  - Check S3 storage usage
+  - Verify all departments active
+
+Monthly:
+  - Clean up old log backups from S3 (if over quota)
+  - Review permission assignments
+  - Test disaster recovery (access log backups)
+  - Update user folder mappings as needed
+
+Quarterly:
+  - Audit all access logs (compliance)
+  - Review AWS S3 costs
+  - Test failover procedures
+  - Update security policies
+
+COMMON ISSUES & SOLUTIONS:
+
+Issue: "No active Zoom Portal Config found"
+  Solution:
+    - Navigate to Setup → Custom Metadata Types → Zoom Portal Config
+    - Create a record with all required fields
+    - Set Is_Active__c = true
+    - Refresh portal
+
+Issue: "S3 list failed: 403"
+  Solution:
+    - Check AWS credentials (access key, secret key)
+    - Verify IAM user has ListBucket permission
+    - Check bucket name and region are correct
+    - Verify bucket exists in AWS console
+
+Issue: User can't access files
+  Solution:
+    - Check user has Zoom_Recording_User_Access permission set
+    - Verify Zoom_Recording_User_Folder_Map__c record exists
+    - Check folder path matches S3 path exactly
+    - Verify Is_Active__c = true on mapping
+    - Check file extension in allowed list
+
+Issue: Videos won't play
+  Solution:
+    - Verify file is valid MP4 (not corrupted)
+    - Check file extension is in Allowed_File_Extensions__c
+    - Verify S3 signed URL generated (check browser dev tools)
+    - Check browser supports video codec
+    - Verify file size < 5GB (browser memory limit)
+
+Issue: Logs not appearing in access log view
+  Solution:
+    - Check portal_access events logged (check record creation)
+    - Verify user has file_access permission
+    - Check date range filter in log viewer
+    - Verify Zoom_Recording_Access_Log__c records created
+    - Check S3 backup is not failing
+
+Issue: Slow file browsing with large folder
+  Solution:
+    - Pagination handles up to 1000 files per request
+    - Load next page button should appear
+    - Consider organizing files into subfolders
+    - Increase maxKeys if needed
+
+================================================================================
+SECTION 11: FUTURE ENHANCEMENTS & ROADMAP
+================================================================================
+
+PLANNED FEATURES:
+
+1. Advanced Search
+   - Full-text search across file names
+   - Search in video transcripts
+   - Filter by metadata (duration, resolution, etc.)
+
+2. Playback Analytics
+   - Track watch time per user per video
+   - Heat maps of popular/unpopular recordings
+   - Engagement metrics
+
+3. Sharing & Collaboration
+   - Share recordings via links
+   - Expiring share tokens
+   - Comment/annotation on videos
+
+4. Mobile App
+   - React Native mobile client
+   - Offline video download
+   - Native player for better performance
+
+5. Integration with Zoom API
+   - Auto-sync recordings from Zoom cloud
+   - Update metadata from Zoom meetings
+   - Track original meeting participants
+
+6. Advanced Reporting
+   - Custom report builder
+   - Export to PowerBI/Tableau
+   - Scheduled email reports
+
+7. Compliance Features
+   - Video watermarking
+   - Screen recording detection
+   - Encryption at rest
+
+8. Video Transcoding
+   - Convert to different formats on demand
+   - Optimize for streaming quality
+   - Generate different resolution versions
+
+================================================================================
+SECTION 12: PERFORMANCE & OPTIMIZATION NOTES
+================================================================================
+
+KNOWN PERFORMANCE CONSIDERATIONS:
+
+1. Large Folder Browsing
+   - S3 ListObjectsV2 returns max 1000 items per request
+   - Portal uses pagination for larger folders
+   - Each request ~500ms to S3 + ~1000ms to parse XML + ~2000ms DOM update
+   - Total: ~3.5 seconds per page load
+
+2. Access Log Queries
+   - With millions of log records, filter by date range first
+   - Date range + event type filtering is most efficient
+   - User search does 4 SOQL queries (may be slow with large user base)
+
+3. Signed URL Generation
+   - AWS V4 signing ~100-200ms per URL
+   - Batch operations when possible
+   - Cache URLs in LWC if same file accessed multiple times
+
+4. S3 Backup of Logs
+   - Async (Queueable) for 5-30 sec delay
+   - Sync for immediate but slower (1-2 sec)
+   - Groups logs by date and category before upload
+
+OPTIMIZATION TIPS:
+
+1. Use Folder Mappings for Granular Access
+   - Instead of permission sets, use folder maps
+   - Faster lookup than permission set query
+
+2. Keep Log Records Clean
+   - Archive old logs to S3 monthly
+   - Delete Salesforce records after backup confirmed
+   - Maintain <50MB of log records in database
+
+3. Cache Configuration
+   - ZoomRecordingPortalConfig caches config in static variable
+   - Valid for entire request
+   - Caches permission sets in ZoomRecordingAccessService
+
+4. Batch Operations
+   - Use Platform Event for large numbers of logs
+   - Queueable jobs for async processing
+   - Avoid synchronous processing of >100 records
+
+5. S3 Performance
+   - Use CloudFront CDN for served files (future)
+   - Enable S3 Transfer Acceleration if needed
+   - Monitor AWS S3 request rates (quota: 3,500 PUT/POST per sec)
+
+================================================================================
+GLOSSARY OF KEY TERMS
+================================================================================
+
+Admin: User with Zoom_Recording_Admin_Access permission set
+  → Can access all folders/files regardless of mappings
+
+Department: Grouping of recordings by business unit
+  → Each department has S3 folder and permission set
+  → Linked to one or more users via mappings
+
+Folder Mapping: Zoom_Recording_User_Folder_Map__c record
+  → Grants specific user access to specific S3 folder path
+  → Can be granted/revoked independently
+
+Permission Set: Salesforce object controlling feature access
+  → Zoom_Recording_Admin_Access: admin features
+  → Zoom_Recording_User_Access: basic user features
+
+Signed URL: HTTPS URL with embedded cryptographic signature
+  → Grants temporary access to S3 object
+  → Expires after configured time
+  → Cannot be modified without invalidating
+
+Access Log: Zoom_Recording_Access_Log__c record
+  → Records every user action (login, file view, access denied, etc.)
+  → Includes IP, user agent, timestamp
+  → Backed up to S3 as JSON for analytics
+
+Event Type: Category of access log entry
+  → Login_Success, File_Access, Access_Denied, etc.
+  → Used for filtering and analytics
+
+S3 Bucket: AWS Simple Storage Service container
+  → Holds all recording files and backup logs
+  → Organized by department folders
+
+Continuation Token: Pagination token from S3 API
+  → Used to fetch next page of results
+  → Returned when results > 1000 and IsTruncated=true
+
+Canary Deployment: Testing deployment with subset of users
+  → Not currently implemented (suggested future)
+  → Would allow gradual rollout of new features
+
+================================================================================
+SUMMARY OF DOCUMENTATION ADDITIONS (v2.0)
+================================================================================
+
+This updated documentation now includes COMPREHENSIVE details for:
+
+✅ ALL 12 APEX CLASSES:
+   - Every method documented with parameters, return types, and purpose
+   - Inner classes and DTOs fully explained
+   - Security model for each class
+   - Performance considerations
+
+✅ ALL 9 LWC COMPONENTS:
+   - Every @track property and @api property listed
+   - Every method documented with triggers and actions
+   - Event flows and communication between components
+   - Security features (especially video player)
+   - Performance optimization techniques
+
+✅ ALL 10+ SALESFORCE FLOWS:
+   - Trigger conditions for each flow
+   - All variables and their purposes
+   - Decision blocks and their conditions
+   - All action blocks (email, Slack, apex calls)
+   - Loop structures and error handling
+   - Fault handlers and recovery logic
+   - Email templates and content
+   - Notifications (Slack, email, in-app)
+
+SECTIONS INCLUDED:
+
+Section 1: Custom Objects & Fields
+  - Complete field listings with types and purposes
+  - Custom Metadata Type configuration
+  
+Section 2: Apex Classes (Updated)
+  - Now with constants, sharing models, dependencies
+  
+Section 3: LWC Components (Expanded)
+  - Full properties, methods, events
+  - Performance optimization details
+  - Security implementation
+  
+Section 4: Salesforce Flows (New)
+  - Detailed flow step-by-step documentation
+  - Variables, decisions, actions all explained
+  
+Section 5: Data Relationships & Architecture
+  - Entity Relationship Diagram (ER diagram in text)
+  - Data flow between systems
+  
+Section 6: Security & Access Control
+  - 4-level permission model
+  - Access control logic flow
+  - Audit logging
+  
+Section 7: AWS S3 Integration
+  - Bucket structure
+  - Authentication mechanism
+  - API operations
+  
+Section 8: Configuration & Setup
+  - Step-by-step initialization
+  - Configuration field explanations
+  
+Section 9: Testing & QA
+  - Test scenarios
+  - Manual testing procedures
+  
+Section 10: Deployment & Maintenance
+  - Deployment steps
+  - Maintenance checklist
+  - Troubleshooting guide
+  
+Section 11: Future Enhancements
+  - Planned features
+  - Roadmap
+  
+Section 12: Glossary
+  - Key terms explained
+
+================================================================================
+END OF DOCUMENTATION
+================================================================================
+
+Document Version: 2.0
+Created: 2026-08-17 (Updated)
+Project: Naman Chatbot Project - Zoom Recording Portal & Job Requirements
+Total Classes: 12 (Documented with all methods)
+Total Custom Objects: 3 (With all fields detailed)
+Total LWC Components: 9 (With full property/method documentation)
+Total Flows: 10+ (Complete flow step-by-step documentation)
+
+READY FOR ML MODEL TRAINING:
+This documentation is now comprehensive enough for:
+- Machine learning model training
+- Code generation based on patterns
+- Documentation training datasets
+- Architecture pattern recognition
+- Domain-specific language modeling
+
+For questions or updates, contact the development team.
+================================================================================

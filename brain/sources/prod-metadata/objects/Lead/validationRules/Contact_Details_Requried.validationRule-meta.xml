@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ValidationRule xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Contact_Details_Requried</fullName>
+    <active>true</active>
+    <errorConditionFormula>AND(
+ISPICKVAL(Status,&apos;Contacted&apos;),
+ISBLANK( Email ), ISBLANK( Phone ), ISBLANK( LinkedIn_URL__c ))</errorConditionFormula>
+    <errorMessage>Provide either Email or Phone or LinkedIn URL before moving this Lead to Contacted.</errorMessage>
+</ValidationRule>

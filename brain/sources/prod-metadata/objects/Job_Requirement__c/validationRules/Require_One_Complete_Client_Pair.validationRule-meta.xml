@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ValidationRule xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Require_One_Complete_Client_Pair</fullName>
+    <active>false</active>
+    <description>Ensures each Job Requirement has exactly one complete client pairing: either Client Company + Client Lead (prospect) or Client Account + Client Contact (converted client). Blocks saving a partial pair (only one of the two filled) or a mixed combination ac</description>
+    <errorConditionFormula>AND(
+  /* Only police the pairing on create or when one of the four client fields moves.
+     Without this guard the rule also rejects saves that never touch them — e.g. the
+     B2B_Deadline_Alert flow stamping Last_Notification_Sent__c — which silently kills
+     that flow&apos;s re-arm loop on any record already holding a partial pair. */
+  OR(
+    ISNEW(),
+    ISCHANGED(Client_Company__c),
+    ISCHANGED(Client_Lead__c),
+    ISCHANGED(Client_Account__c),
+    ISCHANGED(Client_Contact__c)
+  ),
+
+  NOT(
+    OR(
+      /* State 1: Valid Prospect Pair (Company + Lead are filled, Account + Contact are blank) */
+      AND(
+        NOT(ISBLANK(Client_Company__c)),
+        NOT(ISBLANK(Client_Lead__c)),
+        ISBLANK(Client_Account__c),
+        ISBLANK(Client_Contact__c)
+      ),
+
+      /* State 2: Valid Converted Client Pair (Account + Contact are filled, Company + Lead are blank) */
+      AND(
+        ISBLANK(Client_Company__c),
+        ISBLANK(Client_Lead__c),
+        NOT(ISBLANK(Client_Account__c)),
+        NOT(ISBLANK(Client_Contact__c))
+      )
+    )
+  )
+)</errorConditionFormula>
+    <errorMessage>Enter either Client Company + Client Lead (prospect) or Client Account + Client Contact (converted client) — not a mix, and not just one of the pair.</errorMessage>
+</ValidationRule>

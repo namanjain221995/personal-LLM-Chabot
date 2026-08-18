@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Rating</fullName>
+    <inlineHelpText>Hot: Call Done, Pricing explained- Agreed to pricing or open to consider, will think about it and let us know
+
+Warm: Call done - Chargeable services mentioned, haven&apos;t explained pricing in detail yet, but the customer is interested in knowing more.
+
+Cold: No established contact and shows no interest in the service.</inlineHelpText>
+    <trackFeedHistory>false</trackFeedHistory>
+    <trackHistory>true</trackHistory>
+    <type>Picklist</type>
+</CustomField>

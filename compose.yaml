@@ -138,6 +138,10 @@ services:
       XDG_CACHE_HOME: /tmp/cache
     volumes:
       - data:/data
+      # The Salesforce brain packs, read-only and LIVE: core/brain.py re-reads
+      # on file change, so dropping a new pack into brain/packs/ takes effect
+      # on the next question — no rebuild, no restart.
+      - ./brain/packs:/data/brain:ro
       - reports:/reports
       - hf-cache:/root/.cache/huggingface
     ports:

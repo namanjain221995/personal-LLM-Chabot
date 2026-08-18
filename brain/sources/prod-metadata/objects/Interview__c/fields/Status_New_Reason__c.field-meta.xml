@@ -1,0 +1,279 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Status_New_Reason__c</fullName>
+    <label>Status  Reason</label>
+    <required>false</required>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Picklist</type>
+    <valueSet>
+        <controllingField>Interview_Status__c</controllingField>
+        <restricted>true</restricted>
+        <valueSetDefinition>
+            <sorted>false</sorted>
+            <value>
+                <fullName>Candidate requested change</fullName>
+                <default>false</default>
+                <label>Candidate requested change</label>
+            </value>
+            <value>
+                <fullName>Interviewer requested change</fullName>
+                <default>false</default>
+                <label>Interviewer requested change</label>
+            </value>
+            <value>
+                <fullName>Company / Hiring Manager requested change</fullName>
+                <default>false</default>
+                <label>Company / Hiring Manager requested change</label>
+            </value>
+            <value>
+                <fullName>Scheduling conflict</fullName>
+                <default>false</default>
+                <label>Scheduling conflict</label>
+            </value>
+            <value>
+                <fullName>Time zone confusion</fullName>
+                <default>false</default>
+                <label>Time zone confusion</label>
+            </value>
+            <value>
+                <fullName>Technical issue</fullName>
+                <default>false</default>
+                <label>Technical issue</label>
+            </value>
+            <value>
+                <fullName>Candidate not prepared</fullName>
+                <default>false</default>
+                <label>Candidate not prepared</label>
+            </value>
+            <value>
+                <fullName>Panel unavailable</fullName>
+                <default>false</default>
+                <label>Panel unavailable</label>
+            </value>
+            <value>
+                <fullName>Emergency / personal reason</fullName>
+                <default>false</default>
+                <label>Emergency / personal reason</label>
+            </value>
+            <value>
+                <fullName>Candidate withdrew</fullName>
+                <default>false</default>
+                <label>Candidate withdrew</label>
+            </value>
+            <value>
+                <fullName>Company cancelled role</fullName>
+                <default>false</default>
+                <label>Company cancelled role</label>
+            </value>
+            <value>
+                <fullName>Position filled</fullName>
+                <default>false</default>
+                <label>Position filled</label>
+            </value>
+            <value>
+                <fullName>Duplicate interview</fullName>
+                <default>false</default>
+                <label>Duplicate interview</label>
+            </value>
+            <value>
+                <fullName>Candidate not eligible</fullName>
+                <default>false</default>
+                <label>Candidate not eligible</label>
+            </value>
+            <value>
+                <fullName>Candidate no longer interested</fullName>
+                <default>false</default>
+                <label>Candidate no longer interested</label>
+            </value>
+            <value>
+                <fullName>Internal team unavailable</fullName>
+                <default>false</default>
+                <label>Internal team unavailable</label>
+            </value>
+            <value>
+                <fullName>Interviewer unavailable</fullName>
+                <default>false</default>
+                <label>Interviewer unavailable</label>
+            </value>
+            <value>
+                <fullName>Technical / system issue</fullName>
+                <default>false</default>
+                <label>Technical / system issue</label>
+            </value>
+            <value>
+                <fullName>Candidate no show</fullName>
+                <default>false</default>
+                <label>Candidate no show</label>
+            </value>
+            <value>
+                <fullName>Interviewer no show</fullName>
+                <default>false</default>
+                <label>Interviewer no show</label>
+            </value>
+            <value>
+                <fullName>Candidate joined late beyond cutoff</fullName>
+                <default>false</default>
+                <label>Candidate joined late beyond cutoff</label>
+            </value>
+            <value>
+                <fullName>Interviewer joined late beyond cutoff</fullName>
+                <default>false</default>
+                <label>Interviewer joined late beyond cutoff</label>
+            </value>
+            <value>
+                <fullName>Wrong meeting link / access issue</fullName>
+                <default>false</default>
+                <label>Wrong meeting link / access issue</label>
+            </value>
+            <value>
+                <fullName>Internet / technical issue</fullName>
+                <default>false</default>
+                <label>Internet / technical issue</label>
+            </value>
+            <value>
+                <fullName>Time zone misunderstanding</fullName>
+                <default>false</default>
+                <label>Time zone misunderstanding</label>
+            </value>
+            <value>
+                <fullName>Candidate unreachable</fullName>
+                <default>false</default>
+                <label>Candidate unreachable</label>
+            </value>
+            <value>
+                <fullName>Interviewer unreachable</fullName>
+                <default>false</default>
+                <label>Interviewer unreachable</label>
+            </value>
+            <value>
+                <fullName>Emergency / personal issue</fullName>
+                <default>false</default>
+                <label>Emergency / personal issue</label>
+            </value>
+            <value>
+                <fullName>Other</fullName>
+                <default>false</default>
+                <label>Other</label>
+            </value>
+        </valueSetDefinition>
+        <valueSettings>
+            <controllingFieldValue>Cancelled</controllingFieldValue>
+            <valueName>Candidate withdrew</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>Cancelled</controllingFieldValue>
+            <valueName>Company cancelled role</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>Cancelled</controllingFieldValue>
+            <valueName>Position filled</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>Cancelled</controllingFieldValue>
+            <valueName>Duplicate interview</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>Cancelled</controllingFieldValue>
+            <valueName>Candidate not eligible</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>Cancelled</controllingFieldValue>
+            <valueName>Candidate no longer interested</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>Cancelled</controllingFieldValue>
+            <valueName>Internal team unavailable</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>Cancelled</controllingFieldValue>
+            <valueName>Interviewer unavailable</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>Cancelled</controllingFieldValue>
+            <valueName>Technical / system issue</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>Cancelled</controllingFieldValue>
+            <controllingFieldValue>Rescheduled</controllingFieldValue>
+            <controllingFieldValue>No Show</controllingFieldValue>
+            <valueName>Other</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>Rescheduled</controllingFieldValue>
+            <valueName>Candidate requested change</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>Rescheduled</controllingFieldValue>
+            <valueName>Interviewer requested change</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>Rescheduled</controllingFieldValue>
+            <valueName>Company / Hiring Manager requested change</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>Rescheduled</controllingFieldValue>
+            <valueName>Scheduling conflict</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>Rescheduled</controllingFieldValue>
+            <valueName>Time zone confusion</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>Rescheduled</controllingFieldValue>
+            <valueName>Technical issue</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>Rescheduled</controllingFieldValue>
+            <valueName>Candidate not prepared</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>Rescheduled</controllingFieldValue>
+            <valueName>Panel unavailable</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>Rescheduled</controllingFieldValue>
+            <valueName>Emergency / personal reason</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>No Show</controllingFieldValue>
+            <valueName>Candidate no show</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>No Show</controllingFieldValue>
+            <valueName>Interviewer no show</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>No Show</controllingFieldValue>
+            <valueName>Candidate joined late beyond cutoff</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>No Show</controllingFieldValue>
+            <valueName>Interviewer joined late beyond cutoff</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>No Show</controllingFieldValue>
+            <valueName>Wrong meeting link / access issue</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>No Show</controllingFieldValue>
+            <valueName>Internet / technical issue</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>No Show</controllingFieldValue>
+            <valueName>Time zone misunderstanding</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>No Show</controllingFieldValue>
+            <valueName>Candidate unreachable</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>No Show</controllingFieldValue>
+            <valueName>Interviewer unreachable</valueName>
+        </valueSettings>
+        <valueSettings>
+            <controllingFieldValue>No Show</controllingFieldValue>
+            <valueName>Emergency / personal issue</valueName>
+        </valueSettings>
+    </valueSet>
+</CustomField>

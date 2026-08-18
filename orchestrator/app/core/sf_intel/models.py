@@ -110,6 +110,41 @@ def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex}"
 
 
+#: A Salesforce API name as it appears in prose: `Internal_Interview__c`,
+#: `Candidate_Training__r`, `Final_Descion__c`. Matched with the suffix
+#: REQUIRED, so an ordinary capitalised word is never touched.
+_API_NAME_RE = re.compile(r"\b([A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)*)__[cr]\b")
+
+#: Standard objects and the field suffixes that give an internal name away in a
+#: label. Only whole words, and only ones a business user would never say.
+_INTERNAL_TOKEN_RE = re.compile(
+    r"\b(RecordTypeId|RecordType\.\w+|\w+Id|SOQL|soql|API name|api_name)\b"
+)
+
+
+def humanize(text: str) -> str:
+    """Strip implementation vocabulary out of text a user will read.
+
+    Option labels are the one place a planner reliably leaks the schema:
+    "Internal_Interview__c rows" is a perfectly good answer to which object to
+    query and a terrible thing to show someone who asked about mock interviews.
+    The machine-facing half of an option — `value` — keeps the API name, which
+    is where it belongs and where the query planner reads it from.
+
+    Deterministic and reversible-looking rather than clever: `Foo_Bar__c`
+    becomes "foo bar", so the sentence around it still reads.
+    """
+    cleaned = _API_NAME_RE.sub(
+        lambda m: m.group(1).replace("_", " ").strip().lower(), text or ""
+    )
+    cleaned = _INTERNAL_TOKEN_RE.sub("", cleaned)
+    # Collapse whatever the substitutions left behind — a removed token can
+    # strand a double space or a space before punctuation.
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
+    return cleaned.strip()
+
+
 def fingerprint(slot: str, question: str) -> str:
     """A SEMANTIC fingerprint for "have we already asked this?".
 
@@ -158,8 +193,14 @@ class ClarificationOption(BaseModel):
 
     @model_validator(mode="after")
     def _value_defaults_to_label(self) -> "ClarificationOption":
+        # ORDER MATTERS: `value` inherits the label BEFORE the label is
+        # cleaned, so an option whose only content is an object name still
+        # tells the query planner which object — while the user reads "internal
+        # interview" rather than "Internal_Interview__c".
         if not self.value.strip():
             object.__setattr__(self, "value", self.label)
+        object.__setattr__(self, "label", humanize(self.label) or self.label)
+        object.__setattr__(self, "description", humanize(self.description))
         return self
 
 
@@ -201,6 +242,11 @@ class ClarificationRequest(BaseModel):
         if slot not in SLOTS:
             raise ValueError(f"unknown slot {value!r} (allowed: {', '.join(SLOTS)})")
         return slot
+
+    @field_validator("question", "header")
+    @classmethod
+    def _reads_as_english(cls, value: str) -> str:
+        return humanize(value) or value
 
     @field_validator("options")
     @classmethod
@@ -553,7 +599,13 @@ class ClarificationDraft(BaseModel):
     options: List[ClarificationOption] = Field(default_factory=list)
     allow_custom: bool = True
     custom_placeholder: str = Field(default="", max_length=120)
-    multi_select: bool = False
+    #: TRI-STATE, and deliberately so. `None` means the planner expressed no
+    #: view and the deployment default applies; `False` is an explicit "ticking
+    #: two of these is incoherent" that must be honoured. Collapsing the two
+    #: into one boolean is what let a global default override the planner on
+    #: every card, including the ones whose options were alternative readings
+    #: of a single number.
+    multi_select: Optional[bool] = None
 
     @model_validator(mode="before")
     @classmethod
@@ -567,6 +619,11 @@ class ClarificationDraft(BaseModel):
         if slot not in SLOTS:
             raise ValueError(f"unknown slot {value!r}")
         return slot
+
+    @field_validator("question", "header")
+    @classmethod
+    def _reads_as_english(cls, value: str) -> str:
+        return humanize(value) or value
 
     @field_validator("options")
     @classmethod

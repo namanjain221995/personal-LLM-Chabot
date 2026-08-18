@@ -1,0 +1,1489 @@
+===== PAGE 1 / 32 =====
+                                                   TECHSARA SOLUTIONS
+
+
+
+
+                   Training Module Handbook
+                    Complete Reference — Objects · Flows · Dashboards · Lifecycle · Use Cases
+
+
+
+
+                                                Prepared for: Internal Product & Engineering
+
+                      Scope: Candidate Portal + Admin Training Dashboard + Mock Interview + Cohort Management
+
+                                                       Version: 1.0 · Handbook Edition
+
+
+                   Note: In this document "Cohort" and "Slot" refer to the same entity. The user-facing term is "Slot"; the
+                                               Salesforce metadata name is Cohort__c .
+
+===== PAGE 2 / 32 =====
+          Contents
+
+          1. Introduction & Scope
+
+          2. Vocabulary — Slots, Cohorts, Windows & Sessions
+          3. Object Reference
+
+              1. Program & Program Version
+              2. Cohort (Slot) & Session Window
+              3. Candidate Training & Training Step
+              4. Step Template
+              5. Session & Session Attendee
+              6. Deliverable & Deliverable Result
+              7. Internal Interview (Mock)
+              8. Interview Type · Availability · Recurring Break Series
+
+          4. Lifecycles & State Machines
+
+              1. Candidate Training
+              2. Deliverable
+              3. Session
+              4. Session Window
+              5. Mock Interview
+
+          5. Automation Catalog — Every Flow, Trigger & Purpose
+
+          6. Admin Training Dashboard
+
+              1. List View — Columns & Filters
+              2. Chart View — All 9 Visualizations
+              3. Drill-downs & Detail Drawer
+
+          7. Candidate Portal — Every Training-Facing View
+
+          8. Mock Interview Subsystem — Config, Booking, Deadline
+
+          9. Permission Sets & Access Control
+
+        10. Validation Rules That Matter
+        11. Common Use Cases & Playbooks
+
+        12. Apex Controllers & REST Endpoints
+
+        13. Appendix — Field Glossary & Reserved Words
+
+===== PAGE 3 / 32 =====
+       1. Introduction & Scope
+       The Training Module is the core delivery engine of the Techsara Candidate Portal. It handles the end-to-end
+       journey of a candidate through structured technical training: enrolment into a Program, day-by-day module
+       scheduling in a Cohort (called a "Slot" in operational language), delivery of live Sessions, submission and
+       evaluation of Deliverables, and periodic Mock Interviews as competency checks.
+       Everything the candidate sees on the portal — the Overview tiles, Training tab, Deliverables tab, Mock Interview
+       tab, session calendar — is served by Apex controllers running as the unlicensed Guest User, using a custom
+       session-token model rather than per-candidate Salesforce licences. All authoritative gating happens at the Apex
+       layer via the CandidateContext pattern.
+
+
+          Coverage. This handbook covers: the Candidate Portal training surfaces, the Admin Training Dashboard (list + chart
+          views), the Session/Session Window scheduling stack, the Deliverable submission and roll-up pipeline, the Mock
+          Interview subsystem (v1–v6.9+), the Recruiter Break Scheduler, and every automation flow and permission set that
+          governs the above. Non-training features (Marketing, Recruiting, B2B Interviews, Onboarding) are out of scope except
+          where they intersect (e.g. Session.Purpose values).
+
+
+
+
+          1.1 How to read this document
+           Objects are described with every custom field, its type, and a one-line purpose. Standard system fields (Owner,
+           CreatedDate, etc.) are omitted.
+           Picklist statuses are shown as coloured pills for quick lifecycle recognition:       Planned        Active   Paused
+
+             Completed     Dropped
+
+           Flow names and API names appear in mono . UI labels appear in regular text.
+           Use cases at the end tie the pieces together into end-to-end playbooks.
+
+===== PAGE 4 / 32 =====
+       2. Vocabulary — Slots, Cohorts, Windows &
+       Sessions
+       Terminology matters here because the operational language and metadata names diverge. This table is the source
+       of truth for the rest of the document.
+
+        Operational         Metadata name                          Meaning
+        term
+
+        Slot                Cohort__c                              A group of candidates progressing through a program together, with
+                                                                   a defined start and end date.
+
+        Session Window      Session_Window__c                      A recurring daily time slot inside a Slot — e.g., "Morning Batch 9–11
+        / Window                                                   AM IST". A Slot can host multiple Windows for different candidate
+                                                                   groups.
+
+        Session             Session__c                             One actual scheduled meeting (a training day, an interview, a
+                                                                   welcome call, etc.). One per calendar day per Window, per candidate.
+
+        Session Attendee    Session_Attendee__c                    An additional candidate riding on someone else's master Session —
+                                                                   used for Group Sessions.
+
+        Program             Program__c                             A named curriculum (e.g., "Advanced AI/ML Training").
+
+        Program Version     Program_Version__c                     A specific configured version of a Program — controls session type,
+                                                                   duration, mock cadence. Versions are frozen once Published.
+
+        Candidate           Candidate_Training__c                  One candidate's enrolment into one Program Version — the live
+        Training                                                   tracker.
+
+        Training Step /     CandidateTrainingStep__c               One day/module of a Candidate Training — think "Day 3 — LSTM
+        Module                                                     basics".
+
+        Step Template       StepTemplate__c                        The reusable blueprint of a module, cloned into Training Steps when a
+                                                                   Candidate Training is created.
+
+        Deliverable         Deliverable__c                         A task or artefact the candidate must submit tied to a Step (e.g., a
+                                                                   quiz, an assignment).
+
+        Deliverable         Deliverable_Result__c                  One submission attempt against a Deliverable — carries the AWS AI
+        Result                                                     score.
+
+        Mock Interview      Internal_Interview__c                  A periodic competency check. Same object as external interviews; a
+                                                                   Mock is identified by Candidate_Training__c being populated.
+
+        Interview Type      Interview_Type__c                      Lookup record naming the mock (e.g., "AI ML - V1 - Week 3", "AI ML -
+                                                                   V1 - Final Mock").
+
+
+
+          The mental model. Program → Program Version → Cohort (Slot) with N Session Windows → each Window has M
+          Candidate Trainings enrolled → each Training has D Training Steps → each Step has one Session (per day) and 0..K
+          Deliverables. Mock Interviews sit alongside Sessions but attach at the Training level, not the Step level.
+
+===== PAGE 5 / 32 =====
+       3. Object Reference
+
+          3.1 Program & Program Version
+
+       Program__c
+       The top-level named curriculum. A Program can have many Program Versions; only one is normally active at a
+       time.
+
+        Field                                 Type                    Purpose
+
+        Auto_Create_Sessions__c               Checkbox                When true, per-day Session records auto-generate on Candidate
+                                                                      Training creation.
+
+        Session_Type__c                       Picklist                Single Session or Group Session. Blank when auto-create is off.
+                                                                      Copied into Program_Version at creation.
+
+
+
+       Program_Version__c
+       The concrete, configured template. This is where all the operational parameters live — session duration, session
+       type, mock cadence, deliverable defaults. Program Versions are the immutable template that Candidate Trainings
+       clone from.
+
+       Core / Meta fields
+
+        Field                                 Type                    Purpose
+
+        Program__c                            Lookup                  Parent program.
+
+        Version_Number__c                     Number                  Human version (V1, V2, …).
+
+        Status__c                             Picklist                Lifecycle —   Draft     Published      Superseded . Only
+                                                                      Published versions accept new Candidate Trainings.
+
+        Effective_From__c                     DateTime                When this version becomes bookable.
+
+        Duration_Days__c                      Number                  Total number of training days.
+
+        Total_Expected_Duration__c            Summary                 Sum of Step Template expected durations.
+
+        Notes__c                              LongText                Author notes / release description.
+
+
+       Session / Booking config
+
+        Field                                 Type                    Purpose
+
+        Session_Type__c                       Picklist                Single Session (1-to-1) or Group Session (many candidates, one
+                                                                      master).
+
+        Booking_Mode__c                       Picklist                Anytime (pick within trainer availability) or Fixed Schedule (pick a
+                                                                      Session Window).
+
+        Booking_Owner__c                      Picklist                Trainer Books or Candidate Books.
+
+===== PAGE 6 / 32 =====
+        Field                                 Type                    Purpose
+
+        Session_Duration__c                   Picklist                String minutes — 15/30/45/60/…/180. 15-min intervals.
+
+        Sessions_Per_Day__c                   Number                  Number of Session Windows per day (Fixed Schedule mode).
+
+
+       Mock Interview config (all gated by Has_Mock__c)
+
+        Field                                 Type                    Purpose
+
+        Has_Mock__c                           Checkbox                Master switch for the mock subsystem on this PV.
+
+        Mock_Frequency__c                     Picklist                Weekly · Once · End of Program · Custom (After Specific Steps).
+
+        Mock_Cadence_Day__c                   Picklist                Weekday regular mocks land on (default Monday).
+
+        Mock_Final_Week_Day__c                Picklist                Weekday the last week's mock lands on (default Friday).
+
+        Mock_Duration_Min__c                  Number                  Mock length in minutes.
+
+        Mock_Slot_Granularity_Min__c          Number                  Slot picker step (default 60).
+
+        Mock_Booking_Owner__c                 Picklist                Trainer Books / Candidate Books.
+
+        Mock_Interviewer_Group__c             Text                    DeveloperName of the Public Group that supplies mock
+                                                                      interviewers.
+
+        Mock_Booking_Window_Days__c           Number                  How many working days before mock date the booking opens
+                                                                      (default 4).
+
+        Mock_Reschedule_Lock_Days__c          Number                  Reschedule locks this many working days before mock (default 2).
+
+        Mock_Result_Deadline_Days__c          Number                  Trainer result deadline after mock (default 3).
+
+        Mock_Miss_Action__c                   Picklist                What to do when result is missed: Drop Training · Warn Only ·
+                                                                      Notify Admin (default Drop Training).
+
+        Mock_Overflow_Threshold__c            Number                  When remaining supply on the primary date ≤ this, open the next
+                                                                      working day as overflow (default 3).
+
+        Mock_Failure_Requires_Retake__c       Checkbox                If failed mock forces a retake, not a drop.
+
+        Mock_Blocks_Progress__c               Checkbox                If failed mock blocks subsequent training steps.
+
+
+
+
+          3.2 Cohort (Slot) & Session Window
+
+       Cohort__c — a.k.a. Slot
+       A Cohort is a group of candidates going through the same Program Version at the same time. In operational
+       speech this is called a "Slot" (e.g., "Slot 128"). Cohort schema in production (retrieved earlier):
+
+        Field                                 Type                    Purpose
+
+        Name                                  Text                    Human name — normally "Slot NNN".
+
+        Start_Date                            Date                    First day of the cohort.
+
+        End_Date                              Date                    Last day; drives Session Window auto-completion.
+
+===== PAGE 7 / 32 =====
+        Field                                 Type                    Purpose
+
+        Lead_Trainer                          Lookup (User)           Primary trainer for the cohort.
+
+        Description                           LongText                Notes / description.
+
+
+
+       Session_Window__c
+       A recurring daily slot within a Cohort. If a Cohort runs mornings AND evenings, that's two Session Windows on the
+       same Cohort.
+
+        Field                                 Type                    Purpose
+
+        Cohort__c                             Lookup                  Parent Slot.
+
+        Program_Version__c                    Master-Detail           The PV being taught. Enforced unique per Cohort+PV pair.
+
+        Window_Label__c                       Text                    Human label (e.g., "Morning Batch").
+
+        Sequence__c                           Number                  Order (1st Window in a Slot, 2nd, …).
+
+        Start_Date__c                         Date                    Auto-populated from Cohort.Start_Date.
+
+        Activate_From__c                      Date                    When the Window becomes visible to candidates on the portal —
+                                                                      auto Start-7.
+
+        Start_Time__c / End_Time__c           Time                    Daily start/end (End < Start means cross-midnight next day).
+
+        Time_Zone__c                          Picklist                Uses the shared Candidate_Time_Zone global value set.
+
+        Trainer__c                            Lookup                  Host Recruiter/trainer for this Window.
+
+        Candidate_Capacity__c                 Number                  Max candidates. Portal enforces hard cap 5; admin can override
+                                                                      via quick action.
+
+        Booked_Count__c                       Number                  Running enrollment count.
+
+        Status__c                             Picklist                Lifecycle —    Upcoming      Active        Completed
+
+
+
+
+          3.3 Candidate Training & Training Step
+
+       Candidate_Training__c
+       The live tracker for one candidate's journey through one Program Version. Every operational thing on the portal
+       keys off this record.
+
+        Field                                   Type                    Purpose
+
+        Candidate__c                            Lookup (Account)        The candidate.
+
+        Candidate_Owner__c                      Lookup                  Candidate's account owner (denormalised for sharing).
+
+        Candidate_Email__c                      Email                   Denormalised email — used by notification flows.
+
+        Program__c / Program_Version__c         Lookup                  What curriculum the candidate is taking.
+
+        Cohort__c                               Lookup                  The Slot the candidate is assigned to.
+
+===== PAGE 8 / 32 =====
+        Field                                   Type                      Purpose
+
+        Session_Window__c                       Lookup                    Booked Window (if any).
+
+        Assigned_Trainer__c                     Lookup (Recruiter)        Trainer for this training.
+
+        Assigned_Trainer_User__c                Lookup (User)             Trainer as User — used for record sharing and portal display.
+
+        Updated_Trainer__c                      Lookup                    Last-changed trainer (audit).
+
+        Niche__c                                Picklist                  Candidate's track (Data Engineering, AI/ML, etc.).
+
+        Start_Date__c / End_Date__c             Date                      Training window.
+
+        Start_Tme_IST__c /                      Text                      IST-formatted time strings for display.
+        End_Time_IST__c
+
+        Time_Zone__c                            Picklist                  Candidate's chosen time zone.
+
+        Candidate_Time_Zone_Start_Time__c       Picklist                  Session times in the candidate's TZ.
+        / _End_Time__c
+
+        Whatsapp_No__c                          Text                      Candidate WhatsApp for notifications.
+
+        Secret_Token__c                         Text                      Portal login/session token.
+
+        Status__c                               Picklist (required)       Lifecycle —      Planned     Active    Paused    Completed
+
+                                                                            Dropped . Default Planned.
+
+
+        Status_Message__c                       Formula (Text)            Dynamic banner text keyed off Status.
+
+        Drop_Date__c                            Date                      Cutoff for the drop cascade. Set before flipping Status to
+                                                                          Dropped.
+
+        Candidate_Feedback__c /                 LongText                  End-of-training feedback.
+        Trainer_Feedback__c
+
+
+
+       CandidateTrainingStep__c
+       Master-detail child of Candidate Training. One row per module (day) the candidate must complete.
+
+        Field                                 Type                      Purpose
+
+        Candidate_Training__c                 Master-Detail             Parent training.
+
+        Step_Template__c                      Lookup                    Reusable module template this step was cloned from.
+
+        Sequence__c                           Number                    Day/order number.
+
+        Training_Step__c /                    LongText                  Module content overrides.
+        Training_Method__c /
+        Learning_Goal__c
+
+        Assigned_Trainer__c /                 Lookup                    Per-step trainer override.
+        Assigned_Trainer_User__c
+
+        Assigned_Trainer_Name__c              Formula                   First+Middle+Last of the trainer User.
+
+        Started_At__c / Completed__c /        DateTime                  Timing checkpoints.
+        Due_At__c
+
+===== PAGE 9 / 32 =====
+        Field                                 Type                    Purpose
+
+        Duration__c /                         Number                  Actual vs expected minutes.
+        Expected_Duration__c
+
+        Notes__c                              LongText                Trainer notes.
+
+        Status__c                             Picklist                Lifecycle — Not Started · In Progress · Blocked · Skipped ·
+                                                                      Completed · Absent · Dropped. Absent = candidate no-show,
+                                                                      Skipped = trainer absent, Blocked = removed from training,
+                                                                      Dropped = cascaded from training drop.
+
+
+
+
+          3.4 Step Template — the reusable module blueprint
+       Blueprints owned by a Program Version. Cloned into Training Steps when a Candidate Training is created via the
+       wizard.
+
+        Field                                 Type                    Purpose
+
+        Program__c / Program_Version__c       Lookup / MD             Ownership.
+
+        Sequence__c                           Number                  Order within the PV.
+
+        Title__c                              Text                    Module title.
+
+        Step_Description__c                   Html                    Rich description.
+
+        Training_Step__c /                    LongText                Reusable content.
+        Training_Method__c /
+        Learning_Goal__c
+
+        Expected_Duration_Min__c              Number                  Planned minutes.
+
+        Is_Required__c                        Checkbox                Skippable vs required.
+
+        Tags__c / Lookup_Key__c               Text                    For filtering.
+
+        Triggers_Mock__c                      Checkbox                For Custom cadence — when this step completes, spawn a Mock.
+
+
+
+
+          3.5 Session & Session Attendee
+
+       Session__c — the meeting itself
+       One Session per candidate per day per Window (for training). Also used for interviews, welcome calls, background
+       checks, resume sessions. Discriminator is Purpose__c .
+
+       Identity & parents
+
+        Field                                 Type                    Purpose
+
+        Candidate__c                          Lookup                  Master candidate for this Session.
+
+        Candidate_Training__c                 Lookup                  Training this Session serves.
+
+        Candidate_Training_Step__c            Lookup                  The Step being taught this day.
+
+===== PAGE 10 / 32 =====
+        Field                                 Type                     Purpose
+
+        Cohort__c / Session_Window__c /       Lookup                   Structural ancestors.
+        Program_Version__c
+
+        Host_User__c                          Lookup (User)            The trainer running the Session.
+
+        Additional_Attendee_1__c /            Lookup                   Manual extra invitees on the callout.
+        _2__c
+
+        Lead__c / Onboarding__c /             Lookup                   Cross-links for non-training Session purposes.
+        Interview__c /
+        Internal_Interview__c /
+        Background_Check__c
+
+
+
+       Scheduling & time fields
+
+        Field                                  Type                     Purpose
+
+        Scheduled_Date__c                      Date                     The calendar day of the Session in the Window's timezone.
+
+        Scheduled_Start__c /                   DateTime                 Full UTC datetimes.
+        Scheduled_End__c
+
+        Start_Time_IST__c /                    Text                     IST display strings.
+        End_Time_IST__c
+
+        Selected_Time_Zone_Start_Time__c       Picklist                 Times as picklist labels in the candidate's TZ.
+        / _ETim__c
+
+        Time_Zone__c                           Picklist                 Candidate-facing timezone label.
+
+        Duration_Minutes__c /                  Number/Text              Session length.
+        Planned_Minutes__c /
+        Approx_time__c
+
+        Actual_Start__c / Actual_End__c        DateTime                 When it actually ran.
+
+        Day_Title__c /                         Text/Number              Display metadata.
+        Training_Day_Number__c
+
+
+
+       Integration & meeting
+
+        Field                                 Type                     Purpose
+
+        Meeting_Link__c                       URL                      Zoom join URL (populated by callout flow).
+
+        External_Meeting_ID__c /              Text                     Zoom meeting ID + passcode.
+        _Passcode__c
+
+        calendar_event_id__c /                Text/URL                 Google/Outlook calendar sync.
+        calendar_link__c
+
+        Create_Meeting_Error__c               Text                     Populated when callout fails — diagnostic.
+
+        Recording_URL__c                      URL                      Post-session recording.
+
+
+       Formulas (rendered live from other fields)
+            Candidate_Name__c — resolves Candidate/Lead/Onboarding to First+Last name string.
+
+===== PAGE 11 / 32 =====
+            Candidate_Email__c — resolves email the same way.
+            MeetingTopic__c — Program.Name + " - " + Step.Name when a training step is set, else CandidateName +
+           " - " + Purpose . This is what Zoom shows as the meeting title.
+
+       AI & integrity fields
+       After a Session is recorded and processed by the AWS AI pipeline, the following are backfilled:
+
+            Analysis_Status__c , Analyzed_At__c                              Trainer_Coverage_Pct__c , Coverage_Detail__c
+            Session_Summary__c , Red_Flags_Summary__c                        Session_Length_Pct__c
+            Integrity_Score__c , Integrity_Tier__c ,                         Max_Reading_Likelihood_Pct__c ,
+            Points__c                                                        Non_English_Seconds__c
+            Candidate_Talk_Pct__c , Trainer_Talk_Pct__c                      Candidate_Identities__c ,
+            Candidate_On_Camera_Pct__c ,                                     Same_Person_Throughout__c
+            Trainer_On_Camera_Pct__c                                         Flag_Type__c , Severity__c , Evidence__c ,
+                                                                             Result_JSON_URL__c , Report_URL__c ,
+                                                                             S3_Prefix__c , Proof_path__c
+
+
+       Status & Purpose
+       Status__c (restricted):   Unscheduled      Scheduled     Completed       Rescheduled      Cancelled
+
+       Purpose__c (restricted): Training · Internal Interview · Welcome Call — Customer Success · Resume Understanding
+       Session · Initial Call — Marketing · Background Check
+
+
+       Session_Attendee__c
+       Master-detail child of Session. Represents an additional candidate riding on a Group Session's master.
+
+        Field                                  Type                   Purpose
+
+        Session__c                             Master-Detail          The master Session being attended.
+
+        Candidate__c                           Lookup                 The attending candidate.
+
+        Candidate_Training__c                  Lookup                 Attendee's own training (NOT the master's).
+
+        Candidate_Training_Step__c             Lookup                 Attendee's own step (matched by Sequence).
+
+        Session_Status__c /                    Formula                All read-through to the master Session — attendee inherits
+        Scheduled_Date__c /                                           everything.
+        Time_Zone__c /
+        Candidate_TZ_Start_Time__c /
+        _End_Time__c / Meeting_Topic__c
+        / Meeting_Link__c
+
+
+
+
+          Common bug pattern. If the enrolment code accidentally stamps Session_Attendee.Candidate_Training__c with
+          the master's training instead of the attendee's own, the drop cascade will delete the attendee row when the master
+          drops — the fallback promotion never fires. Always verify this field points to the attendee's own training.
+
+
+
+
+          3.6 Deliverable & Deliverable Result
+
+       Deliverable__c
+
+===== PAGE 12 / 32 =====
+       An artefact the candidate must submit. Tied to a Training Step. Activates when the corresponding Session is
+       completed.
+
+        Field                                 Type                     Purpose
+
+        Candidate_Training_Step__c            Master-Detail            Parent step.
+
+        Candidate_Training__c                 Lookup                   Denormalised — used by portal Deliverable queries for perf.
+
+        Definitions__c                        Lookup                   Reusable deliverable definition.
+
+        Linked_Session__c                     Lookup                   Session that unlocked this deliverable (stamped by activation
+                                                                       flow).
+
+        Is_Required__c /                      Checkbox                 Business rules.
+        Approval_Required__c
+
+        Days_To_Complete__c                   Number                   SLA — used to compute due date.
+
+        Due_Date_IST__c /                     Text                     Display strings.
+        Due_Date_Candidate_Time_Zone__c
+
+        Due_Date_Sort__c                      DateTime                 Sortable due date.
+
+        Attempt_Count__c                      Number                   Submission attempts.
+
+        Extension_Requested__c /              Checkbox/DT              Candidate extension request.
+        Extension_Requested_At__c
+
+        Submitted_At__c /                     DT/Lookup                Submission audit.
+        Submitted_By__c
+
+        Approved_At__c / Approved_By__c       DT/Lookup                Approval audit.
+
+        AI_Latest_Score__c                    Text                     Latest AI score rolled up from Deliverable_Result.
+
+        Latest_AI_Feedback__c                 LongText                 Latest AI reasoning.
+
+        Notes__c                              LongText                 Trainer notes.
+
+        Status__c                             Picklist (restricted)    Inprogress ·     Not Active       · Pending · Submitted · Failed · Locked ·
+
+                                                                         Approved       ·   Active   ·    Dropped
+
+
+
+
+       Deliverable_Result__c
+       Master-detail child of Deliverable. One submission attempt.
+
+        Field                                 Type                     Purpose
+
+        S3_Object_Key__c /                    Text                     Where the file lives in S3.
+        Deliverable_Path__c
+
+        Submitted_At__c                       DateTime                 Submission time.
+
+        AI_Score__c                           Number                   AWS-returned AI score.
+
+        AI_Feedback__c                        LongText                 AWS-returned reasoning.
+
+        Threshold_Score__c                    Text                     Pass threshold for this deliverable.
+
+        Result_Status__c                      Picklist (restricted)    Pass · Fail · Pending
+
+===== PAGE 13 / 32 =====
+          3.7 Internal Interview (Mock)
+       Same object as external interviews. A Mock is identified by Candidate_Training__c being populated; a real
+       interview leaves it blank.
+
+       Scheduling / calendar
+
+        Field                                  Type                      Purpose
+
+        Scheduled_Date__c                      Date                      Mock day.
+
+        Deadline__c                            Date                      Trainer must record result by this date.
+
+        Selected_Time_Zone_Start_Time__c       Picklist                  Slot labels in candidate TZ.
+        / _End_Time__c
+
+        Start_Time_IST__c /                    Text                      IST strings.
+        End_Time_IST__c
+
+        Time_Zone__c                           Picklist                  Candidate's zone.
+
+        Meeting_ID__c / Meeting_Link__c        Text/URL                  Zoom.
+
+        Session__c                             Lookup                    Auto-created linked Session (by Mock_Auto_Create_Session flow).
+
+
+       Cohort / classification
+
+        Field                                 Type                     Purpose
+
+        Week_Number__c                        Number                   Which week's mock (Weekly cadence).
+
+        Is_Final_Week_Mock__c                 Checkbox                 Set true for the last week's mock.
+
+        Triggered_By_Step__c                  Lookup                   For Custom cadence — the step whose completion spawned this
+                                                                       mock.
+
+        Interview_Type__c                     Lookup                   Naming record ("PV - Week N" / "PV - Final Mock" / "PV - Mock
+                                                                       N" / "OOT").
+
+        Practice_Type__c                      Picklist                 Rejection · Practice · Upcoming Interview.
+
+        Round__c / Round_Info__c              Picklist                 Interview round metadata.
+
+        Launch_mode__c                        Picklist                 Launch classification.
+
+
+       Result & evaluation
+
+        Field                                 Type                          Purpose
+
+        Human_Decision__c                     Picklist                      Hire · NoHire · Retake · Pass · Fail · Needs Improvement.
+
+        Human_Total_Score__c                  Number                        Trainer's numeric score.
+
+        Final_Descion__c /                    Picklist/Lookup/Date          Final call.
+        Final_Decision_By__c /
+        Final_Decision_Date__c
+
+        AI_Audio_Analysis__c /                LongText/Number/Picklist      AI evaluation.
+        AI_Video_Analysis__c /
+
+===== PAGE 14 / 32 =====
+        Field                                 Type                        Purpose
+        AI_Total_score__c /
+        AI_Decision__c
+
+        Combined_Score__c                     Number                      Rolled AI + human.
+
+        IR_Feedback__c / IS_Feedback__c       LongText                    Interviewer/support feedback.
+        / IS_Improvement_Feedback__c
+
+        Candidate_Lacking_IR__c /             Multi-picklist              Skill gaps.
+        Candidate_Lacking_IS__c
+
+        Comment_Summary__c /                  Text/Html                   Notes.
+        Support_Notes__c /
+        Interview_History_Notes__c
+
+
+
+       Reminders & status
+
+        Field                                 Type                     Purpose
+
+        Result_Reminder_Count__c              Number                   Count of reminder emails sent (capped at 2).
+
+        Last_Result_Reminder_At__c            DateTime                 Last reminder timestamp.
+
+        Status__c                             Picklist (restricted)    Unscheduled ·       Scheduled   · Rescheduled ·   Cancelled   ·
+
+                                                                         Completed
+
+
+        Mock_Status__c                        Picklist (restricted)    Active · Unassigned · Resolved
+
+
+
+
+          3.8 Interview Type · Availability · Recurring Break Series
+
+       Interview_Type__c
+       Lookup record whose Name matches a cadence-aware convention (see Section 9). Admin creates one per PV-
+       week combo; mock booking auto-links to it. Missing record → mock still books but with a null Interview_Type
+       lookup.
+
+
+       Availability__c
+       Candidate availability slots for mock interview matching.
+
+        Field                                 Type                     Purpose
+
+        Candidate__c                          Lookup                   The candidate.
+
+        Date__c / Date_EST__c                 Date                     Date in candidate zone and EST.
+
+        Start_Time__c / End_Time__c           Text                     Local slot times.
+
+        Start_Time_EST__c /                   Text                     EST-normalised times.
+        End_Time_EST__c
+
+        Start_DateTime__c /                   DateTime                 Full UTC datetimes.
+        End_DateTime__c
+
+        Time_Zone__c                          Picklist                 Candidate's zone.
+
+===== PAGE 15 / 32 =====
+       Recurring_Break_Series__c
+       Trainer/recruiter recurring calendar block — the parent record for a set of Event records created by the Recruiter
+       Break Scheduler.
+
+        Field                                 Type                      Purpose
+
+        Name (AutoNumber)                     Text                      RBS-0001, RBS-0002…
+
+        Subject__c                            Text (80)                 Break subject.
+
+        Description__c                        Text (255)                Human summary.
+
+        Start_Date__c / End_Date__c           Date                      Series date range.
+
+        Start_Time__c / End_Time__c           Text (20)                 Time-of-day picklist labels.
+
+        Time_Zone__c                          Picklist                  Candidate_Time_Zone GVS.
+
+        Event_Count__c                        Number (4,0)              Number of Events created — populated after series creation.
+
+===== PAGE 16 / 32 =====
+       4. Lifecycles & State Machines
+
+          4.1 Candidate Training
+            Planned            →         Active         →         (Paused)       →        Completed               OR         Dropped
+
+        1. Planned — created via Candidate_Training_Creation screen flow. Portal shows a "Training is being set up"
+           banner.
+        2. Active — admin flips when training goes live. Sessions/deliverables begin surfacing to the candidate.
+        3. Paused — temporary halt (medical leave, batch merge, etc.). Portal banner explains.
+        4. Completed — end-of-program. Deliverables and steps typically already terminal.
+        5. Dropped — cascade fires. Set Drop_Date__c first (or let Candidate_Training_Auto_Set_Drop_Date stamp
+           today's date). Then Candidate_Training_Dropped_Cascade runs and:
+               Calls CandidateTrainingDropHandler to handle Sessions (solo cancel, attendee delete, or master
+               promotion).
+               Sets Deliverables →        Dropped   for records with due-date ≥ Drop_Date and status not in
+               (Approved/Failed/Dropped).
+               Sets Steps →        Dropped   for records started on/after Drop_Date and not Completed.
+
+           Records dated before Drop_Date keep their prior status.
+
+
+
+          4.2 Deliverable
+                                                                                          Approved /                         Locked /
+           Not Active          →         Active         →          Pending       →                                OR
+                                                                                            Failed                           Dropped
+
+        1. Created      Not Active    when the parent Step is generated.
+        2. Session_Complete_Activate_Deliverables flips them to               Active   the moment the master Session for that
+           Step goes Completed — and emails the candidate a digest of newly-unlocked deliverables with a portal deep-
+           link.
+        3. Candidate uploads via portal S3 flow → Deliverable_Result__c row inserted with Result_Status                       Pending   .
+        4. AWS AI callback via DeliverableResultRest writes AI_Score and Result_Status (Pass/Fail).
+        5. Deliverable_result_roll_up_status flow rolls to parent — Pass →                 Approved    , Fail →    Failed   . Pending
+           leaves parent alone.
+        6. Candidate may set Extension_Requested__c → Extension_Requested_Notify_Trainer emails trainer.
+        7. Past-due deliverables still open → Lock_overdue_deliverables (scheduled) sets                 Locked    .
+        8. On training drop → cascade sets          Dropped   .
+
+
+
+          4.3 Session
+          Unscheduled          →       Scheduled        →         Completed          OR      Rescheduled / Cancelled
+
+        1. Created      Unscheduled    — no meeting link yet.
+        2. Session_Scheduling_Callout_Flow fires (condition: Status=Unscheduled AND Meeting_Link=null AND
+           External_Meeting_ID=null), builds Zoom payload from Host_User + Candidate_Email +
+
+===== PAGE 17 / 32 =====
+           Additional_Attendee_1/2, calls the external service, writes back Meeting_Link/External_Meeting_ID/Passcode.
+           Status flips to   Scheduled   .
+        3. Session_To_Calendar_Event syncs the Session to a calendar Event on the host's calendar.
+        4. After delivery, host records feedback ( Host_Feedback__c is REQUIRED to save Status = Completed —
+           validation rule Require_Host_Feedback_On_Complete ). Status →            Completed   .
+        5. On Completion, SessionCompletionAttendeeTrigger propagates to attendees' Step statuses, and
+           Session_Complete_Activate_Deliverables activates downstream deliverables.
+        6. Reschedule: Status → Rescheduled. Validation rule Lock_Rescheduled_Session then blocks any further edit to
+           the record — a new Session record must be created for the new slot.
+        7. Cancel: Status →      Cancelled   . Reached via drop cascade (solo) or manual admin action.
+
+
+
+          4.4 Session Window
+           Upcoming          →           Active        →      Completed
+
+           Created    Upcoming     via sessionWindowCreator LWC or Program_Creation flow. Start_Date auto-populates
+           from Cohort. Activate_From = Start-7 days.
+            Session_Window_Status_Roll (scheduled) flips Upcoming →              Active   when Cohort.Start_Date is reached, then
+           Active →    Completed    when Cohort.End_Date passes.
+            Session_Window_Enforce_Unique_Cohort blocks creating a second Window on the same Cohort + PV combo.
+           Portal booking increments Booked_Count__c and caps at 5. Admin can bypass the cap via
+            assignSessionWindowToTraining quick action.
+
+
+
+          4.5 Mock Interview
+        1. Expectation computed by MockScheduleCalculator from PV config (Weekly / Once / End of Program /
+           Custom).
+        2. Booking window opens Mock_Booking_Window_Days__c before the mock date (default 4 working days).
+        3. Candidate picks a slot from MockAvailabilityService.listMockSlots — free interviewer × candidate TZ ×
+           granularity.
+        4. Book via bookMockSlot : inserts Internal_Interview (Status=Unscheduled) → Mock_Auto_Create_Session flow
+           inserts the linked Session → callout flow generates Zoom link → calendar sync.
+        5. Reschedule allowed up to Mock_Reschedule_Lock_Days__c working days before the mock. After that, the
+           "Reschedule" button locks and the candidate must contact CS.
+        6. Result deadline = mock date + Mock_Result_Deadline_Days__c working days (default 3).
+        7. Missed result: MockDeadlineEnforcer (scheduled) sends reminder emails — interviewer at +4h,
+           interviewer+trainer at +7h, cap 2 emails. After that, applies Mock_Miss_Action (default: Drop Training →
+           triggers full drop cascade).
+        8. Failed result: Mock_Result_Handler flow applies same miss action.
+
+===== PAGE 18 / 32 =====
+       5. Automation Catalog — Every Flow, Trigger &
+       Purpose
+
+        Flow                                          Trigger                What it does
+
+        Candidate_Training_Creation                   Screen                 Wizard to create a Candidate Training with candidate + PV
+                                                                             + trainer + cohort + dates + TZ.
+
+        Update_Candidate_Training                     Screen                 Guided update of an existing training.
+
+        Candidate_Training_IST_Time_Population        Create+Update          Populates IST/candidate-TZ time strings after edits.
+
+        Candidate_Training_Auto_Set_Drop_Date         Update                 Auto-stamps Drop_Date = today when Status flips to
+                                                                             Dropped and no date was set.
+
+        Candidate_Training_Dropped_Cascade            Update                 On Status → Dropped, invokes
+                                                                             CandidateTrainingDropHandler + updates Deliverables
+                                                                             and Steps to Dropped.
+
+        Session_Complete_Activate_Deliverables        Update on Session      When Session.Status → Completed, activates Not-Active
+                                                                             deliverables under the corresponding Step and emails the
+                                                                             candidate.
+
+        Deliverable_result_roll_up_status             Create/Update on       Pass ⇒ parent Deliverable Approved · Fail ⇒ Failed.
+                                                      Deliverable_Result
+
+        Extension_Requested_Notify_Trainer            Create/Update on       Emails trainer when candidate flags Extension_Requested.
+                                                      Deliverable
+
+        Lock_overdue_deliverables                     Scheduled              Sets Locked on any past-due Deliverable still in an open
+                                                      (autolaunched)         state.
+
+        Session_Window_Status_Roll                    Scheduled              Rolls Session_Window Status Upcoming → Active →
+                                                      (autolaunched)         Completed based on Cohort start/end.
+
+        Session_Window_Enforce_Unique_Cohort          Create on              Adds error if a Session Window already exists for the same
+                                                      Session_Window         Cohort+PV combo.
+
+        Session_Scheduling_Callout_Flow               Create/Update on       Builds Zoom payload, adds attendees + host, calls
+                                                      Session                scheduling API, writes back Meeting Link/External
+                                                                             ID/passcode.
+
+        Session_To_Calendar_Event                     Create/Update on       Syncs Session to a standard Event on the host's calendar.
+                                                      Session
+
+        Internal_Interview_To_Calendar_Event          Create/Update on       Syncs Mock to a calendar Event.
+                                                      Internal_Interview
+
+        Interview_To_Calendar_Event                   Create/Update on       Same for hire-flow interviews.
+                                                      Interview
+
+        Mock_Auto_Create_Session                      Create on              When a Mock is inserted, creates the linked Session so
+                                                      Internal_Interview     callout + calendar flows fire (runs system context so Guest
+                                                                             inserts work).
+
+        Mock_Result_Handler                           Update on              When trainer records a Fail verdict, applies
+                                                      Internal_Interview     PV.Mock_Miss_Action.
+
+===== PAGE 19 / 32 =====
+        Flow                                          Trigger                What it does
+
+        Schedule_Session_From_Training                Screen                 sessionScheduler LWC to create+link a Session to a
+                                                                             specific training.
+
+        Schedule_Session_From_Interview               Screen                 Pick training then sessionScheduler LWC.
+
+        Interview_Create_Reschedule_Flow              Screen                 Create/reschedule Interview with attendees + callout.
+
+        Program_Creation                              Screen                 Wizard to build Program + Program Version +
+                                                                             StepTemplates + Session Windows.
+
+        Update_Program_Version                        Screen                 Edit an existing PV.
+
+        Display_Deliverable                           Screen                 Display a deliverable + submission history.
+
+        Recruiter_Break_Manager / _Scheduler /        Screen                 Recurring calendar break create/manage/delete for
+        _Deleter                                                             recruiters.
+
+===== PAGE 20 / 32 =====
+       6. Admin Training Dashboard
+       The        Admin     Training    Dashboard         is     a     single       LWC    ( adminTrainingDashboard )         backed     by
+       AdminDashboardController . It has two view modes toggled via header buttons — List and Chart — plus a
+       Refresh action. Access is gated by the Admin_Training_Dashboard_Access permission set.
+
+
+
+          6.1 List View — Columns & Filters
+
+       Filters (header)
+
+        Filter       Type         Behaviour
+
+        Slot         Typeahead    Search Cohorts by name; shows count of active candidates per slot. Selecting a slot loads its dashboard.
+
+        Week         Combobox     Filters to a specific week within the training.
+
+        Program      Combobox     Filters the grouped tables to a single program.
+
+        Status       Combobox     Candidate Training status filter (All · Planned · Active · Paused · Completed · Dropped).
+
+        Search       Free text    Candidate-name search across the loaded slot.
+
+
+
+       Summary tile row (KPIs)
+       Above the tables: coloured tiles showing counts of Total Candidates, Active, Dropped, Completed, and per-
+       program counts.
+
+
+       Grouped tables — two column shapes
+
+       IRT programs (Interview Readiness Training)
+
+        Column                           What it shows
+
+        Candidate                        Name (clickable → opens Training detail drawer)
+
+        Niche                            Candidate's technology track
+
+        Trainer                          Assigned trainer name
+
+        Status                           Current Candidate_Training.Status badge
+
+        Sessions held                    "X / Y" — completed vs total
+
+
+       Non-IRT programs
+
+        Column                                                       What it shows
+
+        Candidate                                                    Name (clickable)
+
+        Niche                                                        Track
+
+        Cohort                                                       Slot name
+
+        Trainer                                                      Assigned trainer
+
+===== PAGE 21 / 32 =====
+        Column                                                     What it shows
+
+        Status                                                     Badge
+
+        Deliverables cleared                                       "X / Y" — approved vs total
+
+
+       Sortable columns: Candidate Name, Niche, Trainer, Deliverables Approved (click header to toggle asc/desc).
+
+
+
+            6.2 Chart View — All 9 Visualizations
+       Chart view has its own two filters at the top: Time Range and Niche. Below is a KPI tile row (Org-wide totals), then
+       a responsive grid of nine charts. All donuts are CSS conic-gradients rendered inline (no external chart libraries).
+
+        #    Chart                           Type                          What it shows
+
+        1    Training status (all cohorts)   Donut                         Planned / Active / Paused / Completed / Dropped mix.
+
+        2    Retention vs Rejection          Donut                         Retained vs dropped trainings — headline retention metric.
+
+        3    Retraining ratio                Donut                         Candidates on 1st training vs repeat training.
+
+        4    Program mix                     Donut                         Distribution of trainings across Programs.
+
+        5    Niche mix (candidates)          Donut                         Candidate count per niche.
+
+        6    Deliverable status (all)        Donut                         All deliverables broken down by status.
+
+        7    Cohort trend (last 10 slots)    Bar (wide)                    Candidate count per Cohort — last 10 slots. Click a bar to drill.
+
+        8    Mock outcomes (all-time)        Donut                         Pass / Fail / Retake / etc.
+
+        9    Trainer workload                Horizontal bar (scrollable)   Trainings assigned per trainer.
+
+
+
+
+            6.3 Drill-downs & Detail Drawer
+       Row click (List view)
+       Opens a right-side Training detail drawer containing:
+
+            Hero tiles: Modules progress, Deliverables progress, Sessions held, Mocks progress.
+            Collapsible sections:
+
+                 Modules — mini table of every CandidateTrainingStep with status + trainer.
+                 Deliverables — mini table of every Deliverable with status + due date + latest AI score.
+                 Sessions — mini table of every Session with date, status, meeting link.
+                 Mock Interviews — mini table of every Internal_Interview with date, decision, deadline.
+
+            Trainer / Candidate feedback blocks (LongText renderers).
+            "See all trainings for this candidate" link — switches drawer to Candidate view (cards for every training the
+            candidate has ever had).
+
+       Chart click
+       Segment / bar click opens a separate drill drawer listing every training that matches the clicked slice (e.g., clicking
+       "Dropped" on the Retention donut opens a list of every dropped training). Clicking a card jumps into the Training
+       detail drawer.
+
+===== PAGE 22 / 32 =====
+       7. Candidate Portal — Every Training-Facing View
+       All   portal   LWCs    run   under    the   Guest      User.    Each   authenticated        call   resolves   the   candidate   via
+       CandidateContext.fromSession(sessionId) before any SOQL.
+
+
+        LWC                                   Purpose
+
+        candidateHome                         Portal shell / router.
+
+        candidateHeader                       Top nav + profile menu.
+
+        candidateLogin                        Session-token login screen.
+
+        portalNavState                        Utility for sessionStorage nav restoration.
+
+        sessionUtil                           Session-token helper (getSession).
+
+        dashboard                             Overview/landing tab with tiles + recent items.
+
+        today                                 "Today at a glance" view — session for today, due deliverables, mocks.
+
+        planner                               Weekly planner grid.
+
+        training                              Training tab — LIST → DETAIL → MODULE 3-state drill (tiles → modules + deliverables +
+                                              sessions).
+
+        trainingStatusBanner                  Renders Candidate_Training.Status_Message__c as a banner.
+
+        deliverables                          Deliverable list, submit-to-S3 flow (createPendingResult → getUploadUrl → PUT →
+                                              finalizeSubmission), request-extension, history viewer.
+
+        deliverableCard                       Reusable deliverable tile.
+
+        sessions                              Session list for a candidate.
+
+        sessionCard                           Reusable session tile.
+
+        sessionScheduler                      Calendly-style slot picker for creating a Session.
+
+        trainingSlotPicker                    Candidate view of bookable Session Windows for a training.
+
+        mockBooking                           Mock booking state, slot picker, book/reschedule/cancel.
+
+        mockInterview                         Landing card that opens the availability calendar.
+
+        candidateAvailability                 Candidate availability calendar (mock interviews).
+
+        availabilityCalendar                  Recruiter/internal availability grid (Eastern-view, DST-safe).
+
+        profile                               Candidate profile view/edit.
+
+        resumeUpload / s3Upload               File upload helpers.
+
+        monacoEditor / monacoEditorDemo       Code-editor deliverables.
+
+
+
+
+          Internal / trainer-facing training LWCs
+
+===== PAGE 23 / 32 =====
+        LWC                                   Purpose
+
+        adminTrainingDashboard                The dashboard covered in Section 6.
+
+        assignSessionWindowToTraining         Quick action: assign a Candidate_Training to any Session Window (Upcoming/Active).
+
+        sessionWindowCreator                  Record-page LWC to create a Session Window (auto Start_Date from Cohort, auto
+                                              End_Time from PV duration).
+
+        sessionWindowBuilder                  Reusable multi-row Session-Window row editor (used inside Program Creation flow).
+
+        recruiterBreakScheduler               Creates Recurring_Break_Series with 1WEEK / 2WEEKS / 1MONTH duration options.
+
+===== PAGE 24 / 32 =====
+       8. Mock Interview Subsystem — Config, Booking,
+       Deadline
+
+          8.1 Config knobs on Program_Version
+       See Section 3.1 for the field list. The critical knobs during operation:
+            Mock_Frequency__c — Weekly, Once, End of Program, Custom.
+            Mock_Booking_Window_Days__c — how many working days before the mock the booking opens.
+            Mock_Reschedule_Lock_Days__c — reschedule blocked within this many working days of the mock.
+            Mock_Result_Deadline_Days__c — trainer must record result by mock date + this many working days.
+            Mock_Miss_Action__c — what to do when result missed or verdict = Fail. Default Drop Training.
+            Mock_Overflow_Threshold__c — if remaining supply on the primary date ≤ this, open next working day as
+           overflow.
+            Mock_Interviewer_Group__c — DeveloperName of the Public Group that supplies interviewers.
+
+
+
+          8.2 Interview_Type naming convention
+       The Mock's Interview_Type__c lookup auto-links to a record whose Name follows a cadence-aware convention.
+       Admin creates one Interview_Type per PV+week (or per mock) combo as a one-time setup.
+
+        PV Frequency                                                    Which mock               Interview_Type.Name
+
+        Any PV starting with "Resume Based Training"                    any                      OOT
+
+
+        End of Program / Once                                           the single mock          <PV Name> - Final Mock
+
+
+        Custom (After Specific Steps)                                   Nth step                 <PV Name> - Mock N
+
+
+        Weekly                                                          Final week               <PV Name> - Final Mock
+
+
+        Weekly                                                          Regular week N           <PV Name> - Week N
+
+
+        Frequency blank/unknown                                         fallback                 <PV Name> - Week N
+
+
+
+
+          Missing Interview_Type record? The booking still succeeds — the field simply stays blank. Diagnose by comparing the
+          exact PV name + week to the Interview_Type list on the org.
+
+
+
+
+          8.3 The booking guardrails
+       Every entry point in MockAvailabilityService now enforces:
+
+        1. Training status — must be Active or Planned (blocks dropped/paused/completed candidates from booking or
+           rescheduling — deployed August 2026).
+        2. Duplicate booking — no other active Internal_Interview for the same Candidate_Training + Week_Number.
+        3. Booking window open — today ≥ mockDate - Mock_Booking_Window_Days.
+        4. Booking window not closed — today ≤ mockDate.
+        5. Interviewer available — pickFreeInterviewer excludes anyone whose Events overlap the slot, in the
+           interviewer's own timezone.
+
+===== PAGE 25 / 32 =====
+        6. Reschedule cutoff — reschedule blocked within Mock_Reschedule_Lock_Days working days of the mock.
+
+===== PAGE 26 / 32 =====
+       9. Permission Sets & Access Control
+
+        Perm Set                               Purpose
+
+        Training_Module_All_Access             Enables the Training Module app + Apex access (AdminSessionAssignmentController,
+                                               CandidatePortalController, DashboardService, SessionWindowCreationController,
+                                               SessionWindowService) and field perms across training objects.
+
+        Admin_Training_Dashboard_Access        Apex access to AdminDashboardController + AdminDtos (tab visibility granted
+                                               separately). Gates the Admin Training Dashboard.
+
+        Program_Creation_Access                Grants R/W on the advanced Program Creation fields (Session_Type, Booking_Mode,
+                                               Booking_Owner, Sessions_Per_Day, session-window fields) for program authors.
+
+        Recruiter_Break_Scheduler_Access       Access to the 3 Recruiter Break flows + Recurring_Break_Series object + Activity/Event
+                                               lookup.
+
+        Mock_Interview_Readiness               Field perms on Availability__c so recruiters can run the interview readiness workflow.
+
+        Candidate_Portal_Admin_FLS             Admin field-level security bundle for the portal-backing objects.
+
+        Candidate_Portal_Guest_Access          Guest User FLS for the public candidate portal.
+
+        AWS_Result_Callback_Access             Access for the AWS-invoked DeliverableResultRest endpoint.
+
+        Integration_Admin                      Admin access to integration classes and Named Credentials.
+
+===== PAGE 27 / 32 =====
+       10. Validation Rules That Matter
+
+        Object                Rule                                       What it enforces
+
+        Session               Lock_Rescheduled_Session                   Once Status transitions to Rescheduled, blocks all further
+                                                                         edits. Reschedules must be handled by creating a NEW
+                                                                         Session, not mutating the old one.
+
+        Session               Require_Host_Feedback_On_Complete          Cannot save with Status = Completed unless
+                                                                         Host_Feedback__c is populated.
+
+        Deliverable           Prevent_Past_Approval_Date                 Approved_At cannot be in the past on insert or when it
+                                                                         changes.
+
+        Session_Window        Session_Window_Enforce_Unique_Cohort       Only one Session Window per Cohort + PV combination.
+        (via flow)
+
+===== PAGE 28 / 32 =====
+       11. Common Use Cases & Playbooks
+
+          UC-1: Enrol a new candidate into a training
+        1. Admin runs Candidate_Training_Creation screen flow.
+        2. Picks Candidate, Program, Program Version (only Published PVs shown).
+        3. Picks Cohort (Slot) → Session Window auto-populates.
+        4. Sets Time Zone, Start Date.
+        5. Assigns Trainer.
+        6. Flow inserts Candidate_Training__c with Status =             Planned   .
+        7. Deliverables are pre-created in     Not Active   state.
+        8. Steps are cloned from the PV's Step Templates.
+        9. Sessions (if Auto_Create_Sessions on Program) are inserted             Unscheduled   .
+
+
+
+          UC-2: Candidate books into a Session Window
+        1. Candidate opens portal Training tab.
+        2. Sees "Book your Session Window" card (only if Activate_From ≤ today).
+        3. trainingSlotPicker LWC calls getBookableSessionWindows → filters by PV match, Booked_Count < 5, Status
+           Upcoming/Active.
+        4. Candidate picks a Window → calls bookSessionWindow .
+        5. If Window has no live sessions yet → creates fresh Sessions under this candidate (they become the master).
+        6. If Window has live sessions → creates Session_Attendee rows for this candidate under the existing masters.
+
+
+          Bug fixed August 2026. The "Window has live sessions" check now excludes Status = Cancelled . Previously, if the
+          original master dropped and their Sessions were cancelled, new candidates would be stapled as attendees onto dead
+          Sessions with no Zoom link.
+
+
+
+
+          UC-3: Trainer marks a Session Complete
+        1. Trainer edits the Session record; fills Host_Feedback__c ; sets Status = Completed.
+        2. Validation rule Require_Host_Feedback_On_Complete passes.
+        3. Session_Complete_Activate_Deliverables flow fires: activates every Deliverable under the corresponding
+           Step and emails candidate with HTML digest + portal link.
+        4. SessionCompletionAttendeeTrigger propagates completion to all attendees' Steps.
+
+
+
+          UC-4: Candidate submits a deliverable
+        1. Candidate opens portal Deliverables tab; sees Active deliverables.
+        2. Uploads file → LWC calls createPendingResult → getUploadUrl (pre-signed S3 URL) → PUT to S3 →
+            finalizeSubmission .
+        3. Deliverable_Result inserted with Result_Status =          Pending   ; Deliverable.Status = Submitted.
+        4. AWS AI pipeline processes the file; calls back DeliverableResultRest with score + feedback.
+        5. Result_Status flips to Pass/Fail.
+
+===== PAGE 29 / 32 =====
+        6. Deliverable_result_roll_up_status rolls to parent — Pass ⇒               Approved   , Fail ⇒   Failed   .
+
+
+
+          UC-5: Candidate books a Mock Interview
+        1. Candidate opens Mock Interview tab.
+        2. getMockBookingState returns state — book-now, booked, awaiting-result, etc.
+        3. Candidate picks a slot from listMockSlots .
+        4. bookMockSlot guardrails run (see 8.3), interviewer picked, Internal_Interview inserted (Scheduled).
+        5. Mock_Auto_Create_Session creates linked Session → callout → calendar → email invites.
+
+
+
+          UC-6: Drop a candidate mid-training
+        1. Admin sets Drop_Date__c (or leaves blank → today).
+        2. Flips Status to    Dropped   .
+        3. Candidate_Training_Dropped_Cascade fires:
+
+               Deliverables due on/after Drop_Date → Dropped.
+               Steps started on/after Drop_Date → Dropped.
+                   CandidateTrainingDropHandler handles Sessions: solo cancel · attendee delete · master promotion to
+               earliest remaining Session_Attendee for group sessions.
+
+        4. Records before Drop_Date keep their prior status (audit-preserved).
+
+
+
+          UC-7: Recurring break in a trainer's calendar
+        1. Trainer opens their Recruiter record → clicks Manage Recurring Break button.
+        2. Recruiter_Break_Manager flow presents mode picker (Schedule / Delete).
+        3. On Schedule: pick Subject, Duration (1 week / 2 weeks / 1 month), Start Date, Start/End Time, Time Zone.
+        4. Flow creates a Recurring_Break_Series, loops each weekday in range, skips weekends, skips days where an
+           existing event overlaps the break time (time-overlap check as of Aug 2026), creates one Event per remaining
+           day linked to the Series.
+        5. On Delete: pick a Series → all its Events + the Series record are removed.
+
+
+
+          UC-8: Add an ad-hoc extra session to a Session Window
+       Say a Cohort ran through Aug 6 and you need a make-up on Aug 7 with the same attendee group but no Step
+       exists for it. Use anonymous Apex:
+        1. Load the Session_Window.
+        2. Query the most recent non-cancelled Session in the window as a "template" (source of master + times +
+           trainer).
+        3. Insert a new Session with Status=Unscheduled, Candidate_Training_Step=(template's step to satisfy required
+           field), Scheduled_Date=Aug 7.
+        4. Copy Session_Attendee rows from the template session onto the new one — each attendee keeps their own
+           Candidate_Training + Candidate_Training_Step.
+        5. Callout flow auto-fires → Zoom link generated → invites sent.
+
+===== PAGE 30 / 32 =====
+          UC-9: Reassign master when the original candidate is moved between
+          windows
+       Session records' Candidate_Training__c points to the master's training — even if that candidate has been
+       moved to a different Session Window. To rebase:
+
+        1. Detach cancelled Sessions from the Window: Session_Window__c = null on those rows so future assignment
+           code takes the "create fresh" branch.
+        2. Re-run AdminSessionAssignmentController.assignTrainingToWindow for the new master candidate — fresh
+           Sessions get created under them, new Zoom links minted.
+
+===== PAGE 31 / 32 =====
+       12. Apex Controllers & REST Endpoints
+
+        Class                                   Role
+
+        CandidatePortalController               @AuraEnabled API surface for the candidate portal (dashboard, profile, deliverable
+                                                request/submit/finalize, S3 pre-signed URL flow, mock booking, session-window
+                                                booking).
+
+        AdminSessionAssignmentController        Admin-side assignTrainingToCohort / assignTrainingToWindow (bypasses portal capacity
+                                                + activation-date filters).
+
+        AdminDashboardController                Read-only endpoints for the Admin Training Dashboard (slots, dashboard, candidate
+                                                detail, training detail, org overview).
+
+        MockAvailabilityService                 Interviewer discovery, slot computation, booking guardrails, book/cancel/reschedule
+                                                Mock.
+
+        MockScheduleCalculator                  Pure calc — given training+PV, returns expected mocks with dates + deadlines.
+
+        MockDeadlineEnforcer                    Scheduled: enforces missed-result deadline with reminders + drop action.
+
+        CandidateTrainingDropHandler            Invocable — handles Sessions on training drop (cancel, attendee delete, master
+                                                promote).
+
+        DashboardService                        Builds DashboardDTO for candidate Overview (partitions deliverables active / locked /
+                                                submitted / approved).
+
+        DeliverableActionService                Extension request, legacy submit, S3 upload URL, finalize submission, history query.
+
+        DeliverableResultRest                   REST endpoint /services/apexrest/v1/deliverable-result/ — AWS callback with result
+                                                JSON; rolls Deliverable status.
+
+        SessionSchedulerController              Supports sessionScheduler LWC: training lookup, business hours, available slots,
+                                                timezone/purpose/holiday options.
+
+        SessionWindowService /                  Server-side Session Window logic (PV duration, next-sequence, cohort start-date
+        SessionWindowCreationController         lookup).
+
+        RecruiterBreakSchedulerController       Bulk-creates weekday Events under a Recurring_Break_Series.
+
+        AvailabilityController /                Internal and portal-side CRUD for Availability__c calendar.
+        AvailabilityPortalController
+
+        AWSTrainingIntegration                  Outbound calls to AWS Candidate API.
+
+        AuthService / CandidateContext /        Portal auth + session-token resolution.
+        StemPortalAuthRest /
+        StemPortalDataRest
+
+        PortalDtos / AdminDtos /                DTO shapes and helpers.
+        PortalHelpers
+
+        EasternTimeUtil                         DST-safe EST ↔ zone conversions (server-side only).
+
+===== PAGE 32 / 32 =====
+       13. Appendix
+
+          13.1 Field naming glossary
+        Suffix / Prefix                       Convention
+
+        _Time_IST__c                          Text — IST-formatted time-of-day string for display.
+
+        Selected_Time_Zone_..._Time__c        Picklist — time in the candidate's chosen TZ (15-min interval labels).
+
+        Candidate_Time_Zone_..._Time__c       Picklist — analogous, on the parent record.
+
+        Started_At__c / Completed__c          DateTime — actual event timestamps.
+
+        Scheduled_Date__c                     Date — the calendar day the record refers to, in the Window's timezone.
+
+        External_Meeting_ID__c                Third-party (Zoom) meeting identifier.
+
+        calendar_link__c /                    Google/Outlook Event link + ID (lowercase — legacy naming).
+        calendar_event_id__c
+
+
+
+
+          13.2 Reserved words to avoid as Apex variable names
+       Per project convention: list , desc , dateTime . Use items , descText , whenText respectively.
+
+
+
+          13.3 Deployment target aliases
+        Environment       Alias                                  Notes
+
+        Dev sandbox       dev9                                   parth.patil@techsarasolutions.com.dev9
+
+        Dev sandbox       dev10                                  parth.patil@techsarasolutions.com.dev10
+        (secondary)
+
+        Preprod           preprod_org Dev                        dev.panchal@techsarasolutions.com.prod.preprod (quote name — has
+                                                                 space)
+
+        Prod              TechSaraProf                           dev.panchal@techsarasolutions.com.prod. Test level RunSpecifiedTests
+                                                                 required — RunLocalTests currently blocked by pre-existing
+                                                                 InvoiceControllerTest failure.
+
+
+
+          End of handbook. This is a living document — as the Training Module evolves (new PV knobs, new dashboard charts,
+          new automation flows), update the corresponding section here so future engineers have a single source of truth.

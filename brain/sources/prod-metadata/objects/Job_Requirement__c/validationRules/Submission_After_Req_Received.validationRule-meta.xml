@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ValidationRule xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Submission_After_Req_Received</fullName>
+    <active>true</active>
+    <description>Ensures Submission Deadline is later than Requirement Received Date/Time</description>
+    <errorConditionFormula>AND(
+    NOT(ISBLANK(Submission_Deadline__c)),
+    NOT(ISBLANK(Requirement_Received_Date_Time__c)),
+    Submission_Deadline__c &lt;= Requirement_Received_Date_Time__c
+)</errorConditionFormula>
+    <errorDisplayField>Submission_Deadline__c</errorDisplayField>
+    <errorMessage>Submission Deadline must be later than the Requirement Received Date/Time.</errorMessage>
+</ValidationRule>

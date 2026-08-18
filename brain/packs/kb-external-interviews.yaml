@@ -1,0 +1,1696 @@
+# Compiled 2026-08-16 from brain/sources/techsara-org-knowledge-base.txt (preprod org documentation, 71 objects) by the brain ingestion pipeline: deterministic section/field parsing, every field name validated against the production dictionary + warehouse table list, rules distilled and adversarially verified. Fields the production warehouse lacks are only ever mentioned as explicit not-synced caveats.
+# Domain: PART 4 — verifier verdict: ship_with_fixes.
+name: kb-external-interviews
+description: 'How TechSara''s external client/company interviews work: Interview__c
+  round records, status vs outcome and the auto-Ghosted sweep, interview-support
+  requests, COMPASS AI support-person assignment with its AI_Assignment_Logs__c
+  audit trail, and support incentives.'
+triggers:
+- interview
+- interviews
+- interviewing
+- interviewer
+- interviewers
+- client interview
+- client interviews
+- external interview
+- b2b interview
+- b2b interviews
+- round
+- rounds
+- ghosted
+- incentive
+- interview support
+- support person
+- support request
+- proxy support
+- compass
+- reassignment
+- incentives
+- reshuffle
+- rollback
+- psp
+- preferred support person
+- offer received
+- no show
+- loop round
+- initial call
+- weighted credit
+tables:
+- Interview__c
+- AI_Assignment_Logs__c
+- Interview_Participant__c
+rules: 'External-interview rules (Interview__c):
+
+  - 1 row = 1 ROUND; unique interviews = Marketing_Unique_Interview_Key__c.
+
+  - Mock/intake/OOT = Internal_Interview__c; Interview_Evaluation__c has NO link
+  to Interview__c.
+
+  - Nearly all rows: record type ''Interview''; B2B lookups Job_Submission__c/Client_Account__c
+  barely used, blanks expected.
+
+  - Company = company_new__c -> Company__c master list; Interview__c.Company__c
+  = legacy free text.
+
+  - Time-filter on Date_of_Interview__c (held), not Schedule_Date__c (booked); times
+  = StartTime__c/EndTime__c (skip ''Do Not Use'' twins).
+
+  - Interview_Status__c = lifecycle: Scheduled|Completed|Rescheduled|Cancelled|No
+  Show (stray outcome values too); Interview_Outcome__c = result: Moved to Next
+  Round|Rejected|Ghosted|Offer Received|NA.
+
+  - ''Ghosted'' = no company reply; auto-set 14 days after Date_of_Interview__c,
+  never manual; bypass = IsValidated__c.
+
+  - Status_New_Reason__c = why the STATUS; Status_Reason__c (label ''Outcome Reason'')
+  = why the OUTCOME.
+
+  - Round_Info__c = round kind; Interview_Type__c/Interview_Mode__c fields unused;
+  Call_Type__c = platform.
+
+  - Recruiter__c = our recruiter; Interview_Support_Person__c = assigned support
+  person (COMPASS: Assigned_By__c/Assignment_Status__c); Vendor__c = ''Proxy Support''.
+
+  - Request_Raised__c opens a support request; Approve_Stage__c Ready->Submitted->Assigned->Completed/Rejected.
+
+  - Incentive amount = Incentive_Amount_Formula__c (stored twin sparse); Weighted_Credit__c
+  only when Completed; Incentive_eligiblle__c typo is real.
+
+  - AI_Assignment_Logs__c: join via Interview_ID__c (Interview__c lookup empty);
+  too new to count runs - use Assigned_By__c.
+
+  - Interview_Participant__c: unused, empty.
+
+  - Preferred_Support_Person__c/Previous_Support_Person__c/Rejected_Flag__c: not
+  synced to production - answer conceptually, say so.'
+glossary:
+  Ghosted: The outside company never responded after an interview; the outcome is
+    set automatically by a daily sweep 14 days after the interview date and can
+    never be chosen by a user.
+  COMPASS: The external AWS-hosted AI engine that picks which internal employee
+    supports each external interview and updates that employee's per-skill ratings
+    from each outcome.
+  Support person: The internal employee assigned (usually by the COMPASS AI) to
+    help a candidate through an external interview - the Interview__c.Interview_Support_Person__c
+    lookup.
+  Proxy support: A vendor (third-party or in-house proxy) providing support services
+    on the interview call - the Vendor__c lookup, whose on-screen label is 'Proxy
+    Support'.
+  Support request: Ticking Request_Raised__c on an interview to ask for interview
+    support; it notifies the support team on Slack and auto-creates a tracking Case.
+  Reassignment: Asking the COMPASS engine to replace an interview's support person;
+    every run is audited as a row in AI_Assignment_Logs__c.
+  Reshuffle: A bulk COMPASS re-run that rebalances support assignments across several
+    of the day's interviews at once.
+  Rollback: Undoing the last COMPASS assignment run via the Rollback button on the
+    interview page.
+  PSP: '''Preferred Support Person'' - nominating an employee the COMPASS engine
+    should try to honor when assigning interview support.'
+  Loop round: Several back-to-back interview rounds compressed into one day (common
+    at big tech companies), flagged by Is_Loop_Round__c.
+  Initial call: The first touch-point call of the candidate-marketing pipeline;
+    it has its own Interview__c record type and its round earns no incentive credit.
+  Weighted credit: Duration-based base credit times the round multiplier - the credit
+    a support person earns when a supported interview completes.
+field_notes:
+  Interview__c:
+    Candidate__c: 'THE required parent link: which candidate (Person Account) this
+      interview belongs to. 100% populated. Everything else about the interview
+      hangs off this relationship, including record sharing.'
+    Candidate_Name__c: Denormalized copy of the candidate's name, stamped by the
+      Interview_Record_Initial_Call_Flow at creation. Kept as text so lists/ reports
+      don't need the relationship.
+    Candidate_Name_For__c: Live formula version of the candidate's name (FirstName
+      + LastName from the linked Account). Always current even if the Account is
+      renamed (unlike the stamped text field above).
+    Candidate_Phone_Number__c: Live formula pulling the candidate's phone from the
+      Account.
+    Candidate_Status__c: Live formula showing the candidate's overall lifecycle
+      status from the Account (In Progress / Active / Hold / Placed / Terminate
+      ...). Lets users see the candidate's state without leaving the interview.
+    Applicant_Email__c: The candidate's email as it was on the Job Submission, auto-copied
+      by the B2B Create Interview flow ("Flow 4"). Used in interview email templates.
+    Lead__c: 'The original website Lead, for interviews scheduled before the lead
+      was converted to a candidate. Auto-populated from the Job Submission by the
+      B2B create flow. Validation: either Candidate or Lead must be present.'
+    Is_Lead_Populated__c: TRUE when Lead__c is filled - a helper for reports/automation
+      entry criteria.
+    company_new__c: 'Which outside company the candidate is interviewing with, from
+      the Company__c master list (market intelligence: tier, difficulty, typical
+      rounds). This is the normal "company" field - 98% populated.'
+    Company__c: LEGACY free-text company name, kept for old records and used inside
+      dedupe keys. New records should use company_new__c instead.
+    Company_Name__c: Displays the linked Company__c record's name (empty if no link).
+    Client_Account__c: The Techsara B2B CLIENT company (a business Account) - only
+      for B2B- requirement interviews, auto-copied from the Job Requirement by the
+      create flow.
+    Position__c: The job title / role the candidate is interviewing for (e.g. "Software
+      Engineer", "Sr. Account Executive").
+    Salary_Compensation__c: The compensation discussed/offered for the position,
+      entered by the recruiter at creation (marketing path).
+    Employment_Type__c: 'The engagement type of the target job: Full-Time | C2C
+      | W2 Contract | B2B | Contract | Contract-to-Hire | Full Time. (Note: "Full-Time"
+      and "Full Time" both exist - legacy duplicate values.)'
+    Interview_Source__c: 'Which pipeline produced this interview: B2B Requirement
+      | Candidate Marketing | Other. Auto-set to "B2B Requirement" by the B2B create
+      flow. Mostly empty on legacy data (the record type carries the same signal).'
+    Job_Submission__c: The exact candidate-to-job-requirement submission this interview
+      belongs to (B2B). Auto-populated by the B2B create flow. Required for B2B
+      records.
+    Job_Requirement__c: The client's open job requirement (B2B). Auto-copied from
+      the submission. Required for B2B records.
+    Application__c: The marketing-side daily application log that led to this interview.
+      Auto-linked at creation by matching candidate + recruiter.
+    Marketing__c: The candidate-marketing engagement this interview belongss to
+      (marketing- sourced interviews only).
+    Candidate_Rate__c: 'SNAPSHOT of the candidate''s pay rate copied from the Job
+      Submission when the interview was created. Deliberately frozen: later edits
+      to the submission don''t change what was true at scheduling time.'
+    Submission_Rate__c: SNAPSHOT of the bill rate submitted to the client (from
+      Job Submission "Submitted Bill Rate") at interview creation. Same snapshot
+      logic.
+    Schedule_Date__c: The date the interview was BOOKED/REQUESTED - i.e. when our
+      employee raised/scheduled it. Compare with Date_of_Interview__c below.
+    Date_of_Interview__c: The date the interview actually TAKES PLACE - the (usually
+      future) date the candidate will appear in front of the company. Drives the
+      ghosted sweep, the month rollups, and the 14-day cutoff.
+    StartTime__c: Interview start time, chosen from a shared list of time slots
+      (e.g. "10:00 AM"). This is the CURRENT start-time field.
+    EndTime__c: Interview end time, from the same shared time-slot list. Current
+      field.
+    Start_Time_Text__c: Formats the deprecated Start_Time__c into "h:mm AM/PM" text
+      (legacy display helper).
+    End_Time_Text__c: Same formatting helper for the deprecated End_Time__c.
+    Interview_Time_Zone__c: 'Timezone the interview times are quoted in: ET | CT
+      | MT | PT | AT | HT | UTC. Candidates interview across US timezones while
+      the support team is in India - hence the IST conversion fields below.'
+    Scheduled_Minutes__c: Planned duration in minutes, computed from StartTime/EndTime
+      picklists. Feeds Base_Credit__c (longer interviews earn more credit).
+    Cutoff_Date__c: Date_of_Interview + 14 days - the deadline after which an outcome-less
+      interview is auto-marked "Ghosted" by the daily sweep.
+    Interview_Month__c: First day of the interview's month - a grouping key for
+      monthly reports.
+    Is_Current_Month__c: TRUE when the interview date falls in the current calendar
+      month - used for "this month" list views/reports.
+    Round__c: 'Which round of the company''s process this record represents: Initial
+      | First | Second | ... | Fifteenth | Final. Real data is mostly Initial/ First/Second;
+      the long tail exists because prep/mock rounds also get logged.'
+    Round_Info__c: 'WHAT KIND of round it is: Hiring Manager | Leet code style Coding
+      | System Design | Coding Frontend | Backend Coding | AI/ML Coding | Offer
+      Negotiation | Final Round | Introduction Call | Technical Discussion |'
+    Round_Number__c: Numeric round sequence (1, 2, 3...) used by code/reporting;
+      historically backfilled by the InterviewRoundNumberBackfill Apex job.
+    Is_Loop_Round__c: Marks a "loop" interview - several back-to-back rounds compressed
+      into one day (common at big tech companies).
+    Interview_Type__c: Screening Round | Technical Round | HR Round | Interview.
+      Essentially unused in practice (populated on only 2 of ~10k records) - Round_Info__c
+      is the field that actually carries this meaning.
+    Interview_Mode__c: Audio | Onsite | Video. NEVER USED in practice (100% empty)
+      - Call_Type__c below is the field the team actually fills.
+    Call_Type__c: 'How the interview call happens: Zoom video call | Google meet
+      video call | Microsoft Teams Video Call | Normal phone call | Other.'
+    Interview_Status__c: 'The lifecycle state, driven by users via the Path on the
+      record page: Scheduled | Completed | Rescheduled | Cancelled | No Show | Ghosted
+      | Loop Round | Moved to Next Round | Offer Received | Rejected.'
+    Interview_Outcome__c: 'The RESULT of the interview: Moved to Next Round | Rejected
+      | Ghosted | Offer Received | NA. "Ghosted" cannot be chosen manually - the
+      daily flow sets it 14 days after the interview date if the company never responded.'
+    Status_New_Reason__c: 'WHY the status changed - required for Rescheduled / Cancelled
+      / No Show. Long picklist covering who caused it and how: candidate requested
+      change, interviewer requested change, scheduling conflict, time zone confusion'
+    Status_Reason__c: 'Categorizes WHY the outcome went the way it did: Candidate
+      Issue | Support Issue | Network Issue | AI Issue | Company Issue | Work Auth/Visa
+      Mismatch | NA.'
+    Status_Reason_Comment__c: Free-text explanation; required when the reason chosen
+      is "Other".
+    Status_Change__c: System flag flipped by the Interview_Status_Change flow when
+      the outcome is set - used by downstream automation to detect "something changed".
+      Not meant for manual use.
+    Offer_Letter_Date__c: Date the offer letter was received. MUST be filled before
+      status can be set to "Offer Received" (validation rule).
+    Advanced_to_Next_Round__c: Did the candidate clear this round? Used in the vendor/support
+      success tracking reports (was the supported interview successful?).
+    If_yes_why__c: Companion free-text to the Yes/No question above - why/how the
+      round was cleared (e.g. what the support contributed). Used in vendor success
+      tracking. (Exact on-screen pairing not fully documented - verify with team.)
+    IsValidated__c: 'Per-record escape hatch: when checked, the daily "auto-Ghosted"
+      sweep skips this record. The API name is misleading - read it as "Bypass_Ghosted_Validation".'
+    Interview_Meeting_Link__c: 'The meeting link the candidate must join (whatever
+      platform the company uses). Entered by the scheduler; help text: "Please provide
+      the interview meeting link here."'
+    Job_Description__c: The full JD text for the role being interviewed for.
+    JD_Link_url__c: Link(s) to the job description posting. This is the CURRENT
+      JD-link field.
+    Resume_Link__c: Link to the resume version the candidate is using for this interview.
+    Interview_Questions__c: Questions asked / expected in this interview (knowledge
+      capture for later rounds and other candidates at the same company).
+    Interview_Notes__c: 'Prep notes for the candidate: client instructions, interview
+      format, topics to prepare (from the field''s help text).'
+    Description__c: General free-form notes about the interview.
+    Project_Understanding_Document__c: Link/content of the candidate's "project
+      understanding" document - auto-copied from the candidate Account when the
+      interview is created, so the support person has the candidate's project story
+      at hand.
+    Candidate_Feedback__c: What the candidate reported after the interview (how
+      it went, what was asked).
+    Client_Feedback__c: Feedback from the client/company side (B2B path - what the
+      client said about the candidate).
+    Vendor_Feedback__c: Feedback about/from the proxy-support vendor on this interview
+      - part of vendor success tracking.
+    Request_Raised__c: 'THE trigger of the support workflow: the scheduling employee
+      checks this to request interview support. Firing it sends the Slack support-request
+      post and auto-creates the tracking Case.'
+    Approve_Stage__c: 'Stage of the support request: Ready | Submitted | Assigned
+      | Rejected | Completed. Auto-set to "Assigned" by the Apex trigger when a
+      Vendor (Proxy Support) is placed on the record.'
+    Vendor__c: 'Which vendor (or in-house proxy) provides support services during
+      this interview. Setting it advances the Approve Stage and notifies Slack.
+      (Note the label: users see "Proxy Support", not "Vendor".)'
+    Vendor_Name__c: Denormalized/legacy text of the vendor's name.
+    Interview_Support_provided__c: Post-interview record of whether support was
+      actually delivered.
+    Support_not_provided_reason__c: Why support was NOT delivered when it had been
+      requested/assigned.
+    Support_Notes__c: Rich-text working notes for the support engagement (what to
+      focus on, logistics). Included in the Slack support-request message.
+    Interviewer_Assignment_Constraint__c: A pinned employee the engine MUST use/honor
+      for this interview (hard constraint, e.g. "must-interview-with").
+    Assigned_By__c: 'How the current assignment happened: AI Nightly | AI Suggestion
+      | Manual | Extended Reassign | Other. In data, "AI Suggestion" dominates (~73%
+      of all interviews).'
+    Assignment_Status__c: 'State of the assignment process: Not Assigned | Assigned
+      | No Bandwidth | Needs Manual Review | Assignment Failed | Reassigned Due
+      To Extension.'
+    Assignment_Priority__c: Low | Medium | High | Critical - how urgently this interview
+      needs a support person (feeds the engine's ordering).
+    Assignment_Reason__c: The engine's explanation of why it picked this support
+      person.
+    Assignment_Error_Message__c: Error detail when an assignment run failed for
+      this interview.
+    AI_Suggestion_Status__c: 'Lifecycle of the AI''s suggestion for this interview:
+      Not Requested | Requested | Available | Used | Expired | Error.'
+    AI_Suggestion_JSON__c: Raw JSON payload of the engine's suggestion(s) - candidates
+      ranked, scores, constraints considered.
+    AI_Assignment_Confidence__c: The engine's confidence in its pick (0-100%). Populated
+      on ~75% of interviews.
+    AI_Assignment_Reason__c: Human-readable explanation the engine gives for its
+      pick.
+    AI_Assignment_Version__c: Version tag of the engine/model that made the assignment
+      (traceability).
+    Reassigned_Due_To_Extension__c: TRUE when this interview had to be reassigned
+      because the support person's previous interview ran over time.
+    Reassignment_Reason__c: 'Why the reassignment: Previous round extended for current
+      Interview Support Person | Interview Support Person unavailable | Scheduling
+      conflict | at capacity | Skill / domain mismatch | Candidate preference |
+      Time zone'
+    Reassignment_Reason_Comment__c: Free-text detail for the reassignment reason.
+    Round_Multiplier__c: LEGACY hard-coded multiplier by round (Initial=0, First=1,
+      Second=1.2, Third=1.5, Fourth=2, Fifth+=2.5...). Superseded by the field below.
+    Round_Multiplier_New__c: The CURRENT round multiplier, stamped by the Interview_Incentive_
+      Calculation_Framework flow from the metadata config (admins can change rates
+      without editing formulas).
+    Weighted_Credit__c: Base_Credit x Round_Multiplier_New, but only when the interview
+      status is "Completed" (otherwise blank). The credit the support person earns.
+    Weighted_Credit_New__c: Stored (non-formula) copy of the weighted credit, written
+      by the engine/ incentive process for records it has processed (~2% populated
+      so far).
+    Incentive_Type__c: Stored incentive category for this interview.
+    Incentive_Type_Formula__c: 'Derives the category from the outcome: Moved to
+      Next Round / Offer Received -> Positive; Rejected / Ghosted -> Negative; else
+      None.'
+    Incentive_Rate_Applied__c: Stored rate actually applied to this interview.
+    Incentive_Rate_Applied_Formula__c: 'Rate from category: Positive = 400, Negative
+      = -100, else 0.'
+    Incentive_Amount__c: Stored final incentive amount for the support person on
+      this interview (written by the incentive process; only ~3% of records so far).
+    Incentive_Amount_Formula__c: Weighted_Credit x Incentive_Rate_Applied - the
+      live-computed amount.
+    Incentive_Calculated_On__c: When the incentive framework last stamped this record.
+    Incentive_eligiblle__c: Whether this interview counts for incentives at all
+      (note the typo in the API name - it is really "eligible").
+    Why_not_eligible__c: Explanation when the interview is excluded from incentives.
+    L10_Score_Before__c: '"Last 10 interviews" rolling score before/after this update.'
+    L10_Score_After__c: '"Last 10 interviews" rolling score before/after this update.'
+    Recruiter__c: The Techsara recruiter handling this candidate/interview (97%
+      populated). Receives the Slack reminders and confirmation emails.
+    Recruiter_Name__c: Denormalized recruiter name stamped at creation by flow.
+    Recruiter_Name_formula__c: Live formula version of the recruiter's name.
+    Account_Manager__c: The Account Manager owning the client relationship - auto-filled
+      from the Job Requirement (B2B path).
+    Interview_Recording_Key__c: Storage key (S3) of the interview recording file.
+    Interview_Recording_Link__c: Direct link to the interview recording.
+    View_Recording__c: A "View Recording" hyperlink that opens the org's RecordingViewer
+      page for this interview (access is logged).
+    Current_Record_Link__c: Hyperlink to this interview inside the AIC Portal (the
+      employee Experience Cloud site) - used in emails/Slack so portal users land
+      on the portal page, not internal Salesforce.
+    Final_Notification_Date_Time__c: When the last scheduled Slack reminder for
+      this interview was set to fire (written by the Slack notification flow).
+    IsInterview__c: Constant 1 - a counting helper so reports can SUM "number of
+      interviews" across joined objects.
+    Interview_After_Application_Start_Date__c: 'Data-quality check: TRUE when the
+      interview date is on/after the candidate''s Application Start Date (an interview
+      should not predate the marketing engagement).'
+    Unique_Interview_Month_Key__c: Candidate + company + year + month composite
+      key - used to detect/dedupe multiple interviews of the same candidate at the
+      same company in the same month.
+    Marketing_Unique_Interview_Key__c: 'A stricter dedupe key for marketing metrics:
+      only produced for Initial/ First-round interviews in countable statuses -
+      i.e. "one first interview per candidate per company" for unique-interview
+      counting.'
+  Interview_Participant__c:
+    Interview__c: 'THE required parent link: which external interview this participant
+      row belongs to. Drives sharing (controlled by parent). One of only two fields
+      placed on the page layout (with Name).'
+    Participant_Name__c: The person's display name as free text. Needed because
+      most attendees (client interviewers, client HR) exist nowhere else in Salesforce.
+      Would be set by the creating automation or manually.
+    Email__c: The participant's email address - e.g. the client interviewer's invite
+      address. Intended for calendar invites and for matching meeting-join events
+      back to a person.
+    Company__c: Free-text company the participant belongs to - the client/employer
+      name for client-side people, "Techsara" (or blank) for internal ones. Not
+      a lookup to the Company__c master list despite the same name.
+    Employee__c: 'Filled only for Techsara-side participants: links the row to the
+      internal staff record (e.g. the interview support person or an internal observer/trainer
+      sitting in).'
+    User__c: Filled when the participant is an actual Salesforce/portal User. The
+      retired calendar sync used this to find the user's Contact so it could add
+      them as a Google Calendar event invitee.
+    Side__c: 'Which side of the table the person sits on: Candidate | Internal (Techsara
+      staff) | Client (the interviewing company). Lets reports split "our people"
+      from "their people" on a call.'
+    Participant_Type__c: 'The person''s role: Candidate | Client Interviewer | Client
+      Recruiter | Hiring Manager | HR | Internal Observer | Internal Support | Internal
+      Trainer.'
+    Is_Primary__c: 'Marks the PRIMARY interviewer/recruiter when several people
+      of the same role are on the call (field description: "Primary Interviewer/
+      Recruiter"). Defaults to unchecked.'
+    Attendance_Status__c: 'Did the person actually attend: Invited | Joined | No
+      Show | Cancelled | Left Early. Designed as the per-person outcome of the call
+      (the interview-level No Show status says the call failed'
+    Joined_At__c: Timestamp when the participant joined the call. Intended to be
+      written by a meeting-platform integration (e.g. Zoom attendance), never by
+      hand. Never populated.
+    Left_At__c: Timestamp when the participant left the call - together with Joined
+      At gives per-person time-on-call for audit/billing. Never populated.
+  Interview_Type__c:
+    Name: The type's display name - this IS the business content of the record.
+      Entered by the admin in Add_Interview_Type_Flow.
+    Is_Active__c: Whether this type is currently offered when scheduling internal
+      interviews. Set in the creation flow, toggled manually thereafter. Inactivating
+      hides the type from new use while preserving history.
+  Question_Bank__c:
+    Question_Text__c: The full question the interviewer asks (e.g. an ML-fundamentals
+      or coding question). Entered via the bulk-add flow. Copied verbatim into Internal_Interview_Question_Log__c
+      when asked, so the log survives later edits.
+    Is_Active__c: 'Retire switch: only active questions are served to interviews
+      and templates. All 620 records are currently TRUE - nothing has been retired
+      yet.'
+    Section__c: The interview section (segment) that asks this question - how the
+      conduct flow finds a Standard section's question pool. Set at authoring.
+  Section__c:
+    Is_Active__c: Whether the section is currently runnable/selectable. The conduct
+      and template flows filter on it. TRUE on all 6 live rows.
+    Interview_Sequence__c: A section-level ordering number whose metadata description
+      says "Used in Template Creation Flow only". The real running order lives on
+      the junction (Section_Interview_Type__c.Sequence__c) and on Template_Section__c.
+  Section_Interview_Type__c:
+    Interview_Type__c: Which internal interview type this row extends. Set by the
+      admin flows at creation; required. All 6 live rows point at "Advanced AI/ML
+      Training - V1 - Week 1".
+    Section__c: Which section is being placed into that type's running order. Set
+      by the admin flows; required. The 6 live rows cover the 6 live sections exactly
+      (Day 01-05 plus the Week 1 Coding Round).
+  AI_Assignment_Logs__c:
+    Interview_ID__c: The interview the logged action concerned. Set by the Reassignment
+      flow when the Reassignment button is used (5 of 7 rows populated).
+    Interview__c: A second lookup to Interview added alongside the one above. No
+      active flow writes it and it is empty on all rows. Presumably meant to replace
+      Interview_ID__c one day (not fully documented - verify with team).
+    Interviews_ID__c: A plain-number interview identifier, predating the lookups.
+      Never populated; no automation writes it (not fully documented - verify with
+      team).
+    Candidate_Interview_Change__c: Intended pointer to the candidate (Person Account)
+      whose interview assignment was changed, which would let the candidate page
+      show an "AI Assignment Logs" related list. No flow fills it; 0% populated.
+    Round__c: Text snapshot of the interview's round (e.g. "First") at the moment
+      of the action. Written by the PSP flow; in the current flow definitions only
+      PSP writes it
+    Round_Info__c: 'Text snapshot of the interview''s round TYPE (e.g. "Introduction
+      Call", mirroring Interview__c.Round_Info__c). Same population pattern as Round__c:
+      written by the PSP flow'
+    Last_Support_Person1__c: The employee who WAS the interview's support person
+      before this action replaced them - the "before" side of the change.
+    Main_AI_Assignment_scheduler_run_on__c: Timestamp of the nightly batch run.
+      To be set by the scheduler flow.
+    Main_AI_Assignment_scheduler_run_respons__c: Raw HTTP response body returned
+      by the AWS engine for the nightly run (name truncated by the 40-character
+      API-name limit).
+    Main_AI_Assignment_scheduler_run_status__c: HTTP status code of the nightly
+      run callout (200 = success).
+    Manual_Main_AI_Assignment_run_by__c: Older Employee-lookup variant of the initiator
+      field. Not written by the current flow version; empty.
+    Manual_Main_AI_Assignment_run_on__c: When the manual batch run happened. Set
+      by the launcher flow.
+    Manual_Main_AI_Assignment_run_Response__c: Raw HTTP response body from the AWS
+      "Main AI Assign" callout - the engine's full answer (assignments made, errors),
+      kept verbatim for debugging.
+    Manual_Main_AI_Assignment_run_status_cod__c: HTTP status code of the manual-run
+      callout (truncated API name). The flow can write it, but the one logged run
+      left it blank.
+    Reassignment_by__c: Older Employee-lookup variant of the initiator; not written
+      by the current flow, 0% populated.
+    Reassignment_on__c: When the reassignment ran. Set by the flow (5 of 7 rows).
+    Reassignment_Reason_Picklist_Values__c: 'The reason the user picked in the flow''s
+      screen. Values: Previous round extended for current Interview Support Person
+      (the support person''s earlier interview ran over) | Interview Support Person
+      unavailable | Scheduling'
+    Reassignment_Other_Reason__c: Free-text reason when "Other" is chosen (only
+      20 characters long). Never used yet.
+    Reassignment_run_response_body__c: Raw HTTP response from the AWS Reassignment
+      service - who the engine picked as the replacement and why, kept verbatim.
+    Reassignment_run_status_code__c: HTTP status of the reassignment callout. All
+      5 logged runs returned 200.
+    Reshuffle_Initiated_On__c: When the reshuffle ran. Set by the flow.
+    Reshuffle_Reason__c: Why the reshuffle was needed - same 9 values as the reassignment
+      reason list (Previous round extended... | unavailable | Scheduling conflict
+      | at capacity | Skill / domain mismatch | Candidate preference | Time zone
+    Reshuffle_Run_Reason__c: Duplicate of Reshuffle_Reason__c with the identical
+      value list. Sits on the layout but is NOT written by the flow - a leftover
+      from an earlier build (not fully documented - verify with team).
+    Reshuffle_Reason_Comment__c: Free-text comment for the reshuffle reason (250
+      chars). On the layout but not written by the current flow version.
+    Reshuffle_run_response_body__c: Raw HTTP response from the AWS Reshuffle service.
+    reshuffle_run_status_code__c: HTTP status of the reshuffle callout (note the
+      lower-case API name).
+    Rollback_Run_On__c: When the rollback ran. Set by the flow.
+    Rollback_Response_Body__c: Raw HTTP response from the AWS Rollback service (what
+      was undone).
+    preferred_support_person_initiated_On__c: When the PSP nomination was made.
+      1 of 7 rows.
+    Compass_R_scheduler_run_on__c: When the Compass-R run happened.
+    Compass_R_scheduler_run_Response_Body__c: Raw HTTP response body of the Compass-R
+      callout.
+    Compass_R_scheduler_run_Status_Code__c: HTTP status code of the Compass-R callout.
+    Total_Interview_Assigned__c: 'Intended summary of a batch run: how many interviews
+      got a support person assigned. No flow writes it yet; 0% populated.'
+    Total_Interviews_Unassigned__c: 'Intended companion count: how many interviews
+      the run left without a support person (no bandwidth / no match). Not written
+      yet; 0% populated.'
+    testing_field_for_jenkins__c: Throwaway field created to test the Jenkins CI/CD
+      deployment pipeline (this object is in the Jenkins_CICD permission set used
+      for that testing). No business meaning; always empty. Safe to delete.
+  Interview_Incentive_Configuration__mdt:
+    Interview_Round__c: 'The lookup key of the rate card: which interview round
+      this row configures. Values match Interview__c.Round__c exactly: Initial |
+      First | Second | Third | Fourth | Fifth | Sixth | Seventh | Eighth | Ninth
+      | Tenth |'
+    Round_Multiplier__c: 'THE FIELD THAT ACTUALLY DRIVES THE SYSTEM TODAY: the weight
+      of a completed interview of this round. Stamped onto the interview (Round_Multiplier_New__c)
+      by the incentive flow'
+    Positive_Incentive_Rate__c: The bonus rate per weighted credit when the interview
+      outcome is good (Moved to Next Round / Offer Received). Configured as 400.00
+      on every row.
+    Negative_Incentive_Rate__c: 'The penalty rate per weighted credit for bad outcomes
+      (Rejected / Ghosted). Configured as -100.00 on every row. Same status as the
+      positive rate: defined and populated'
+    Incentivized__c: Whether interviews of this round participate in the incentive
+      program at all. TRUE on every row except Initial (initial calls are excluded).
+knowledge:
+- title: Interview__c — What This Object Is
+  keywords:
+  - interview
+  text: 'Interview__c records ONE interview of a Techsara candidate with an OUTSIDE
+
+    company - either a Techsara B2B client (via a Job Requirement / Job Submission)
+
+    or an open-market employer the candidate applied to under a candidate-marketing
+
+    engagement. One record = one round of one interview process (Initial call,
+
+    First round, Second round ... Final round). If a candidate goes through 4
+
+    rounds with one company, that is 4 Interview__c records.'
+- title: Interview__c — What This Object Is (2)
+  keywords:
+  - interview
+  text: "It is the single largest object in the org (217 custom fields) because\
+    \ it\ncarries five jobs at once:\n  a) The interview logistics themselves (who,\
+    \ when, which company, what round,\n     meeting links, timezone).\n  b) The\
+    \ \"interview support\" workflow - the internal process where an employee\n\
+    \     raises a request for another employee (a support person) or a vendor\n\
+    \     (\"proxy support\") to help the candidate through the interview.\n  c)\
+    \ The AI (\"COMPASS\") support-person assignment - an external AWS-hosted AI\n\
+    \     engine that automatically picks which employee should support each\n \
+    \    interview, plus the audit trail of reassignments.\n  d) The employee incentive/credit\
+    \ system - completed interviews earn the\n     support person credits and bonus/penalty\
+    \ amounts depending on the outcome.\n  e) The COMPASS skill-scoring engine -\
+    \ after each supported interview, the\n     external engine updates the support\
+    \ person's per-skill confidence ratings\n     (Kalman-filter based) and writes\
+    \ a full audit of that math onto the\n     interview record."
+- title: Interview__c — Kind Of Object
+  keywords:
+  - interview
+  text: "- Custom object, part of the Interviewing domain.\n- MASTER-DETAIL CHILD\
+    \ OF ACCOUNT via Candidate__c: every interview MUST belong\n  to a candidate\
+    \ (Person Account). Sharing is \"Controlled By Parent\" - whoever\n  can see\
+    \ the candidate can see the interview. The interview has no owner of\n  its\
+    \ own.\n- 217 custom fields, 3 record types, 7 validation rules, 28 list views.\n\
+    - Auto-number Name in the format I-XXXXXX (e.g. I-031360).\n- Scale: ~9,991\
+    \ records in preprod (data from Jul 2024 to today; some future-\n  dated because\
+    \ interviews are scheduled ahead)."
+- title: Interview__c — Record Types
+  keywords:
+  - interview
+  text: "- \"Interview\" (developer name: Interview) - the default and by far the\
+    \ most\n  common type (~97% of records). Used for candidate-marketing interviews:\n\
+    \  the candidate interviews with an open-market company (company_new__c ->\n\
+    \  Company__c master list).\n- \"Initial Call\" (Initial_Call) - the first touch-point\
+    \ call in the marketing\n  pipeline (~2.5% of records). Matches the Marketing__c\
+    \ status \"Initial Call\".\n- \"B2B Interviews\" (B2B_Interviews) - interviews\
+    \ for a Techsara B2B client's\n  Job Requirement, created from a Job Submission.\
+    \ Very new/rare in data (only\n  9 records so far) but this is the strategic\
+    \ B2B path. These records must\n  have Job_Requirement__c and Job_Submission__c\
+    \ filled (validation rule)."
+- title: Interview__c — How It Is Used — The Business Process
+  keywords:
+  - interview
+  text: "STEP 1 - CREATION. Two main entry points:\n  - B2B path: on a Job Submission\
+    \ record, a user clicks the \"Create B2B\n    Interview\" button (screen flow\
+    \ B2B_Create_Interview_from_Submission -\n    internally nicknamed \"Flow 4\
+    \ - Create Interview\"). The flow copies\n    everything it can from the Job\
+    \ Submission: candidate, Lead, Job\n    Requirement, client account, account\
+    \ manager, recruiter, applicant email,\n    and snapshots the money fields (candidate\
+    \ rate, submitted bill rate). It\n    also marks the Job Submission \"Interview\
+    \ Requested\", bumps the Job\n    Requirement's interview counter, and sends\
+    \ confirmation emails plus Slack\n    messages.\n  - Marketing path: the screen\
+    \ flow Interview_Creation_V2 creates the\n    interview directly (recruiter\
+    \ picks the candidate, company - it can create\n    a new Company__c on the\
+    \ fly - position, round, date/time, interviewer\n    name/email, JD/resume links,\
+    \ etc.).\n  NOTE: the \"Create Interview\" buttons on Candidate (Account) and\
+    \ Lead pages\n  create INTERNAL_INTERVIEW__c records (internal screening), NOT\
+    \ Interview__c."
+- title: Interview__c — How It Is Used — The Business Process (2)
+  keywords:
+  - interview
+  text: "STEP 2 - AUTO-ENRICHMENT ON SAVE. Before the record saves, flows copy the\n\
+    \  candidate's Project Understanding Document onto it, link the matching\n \
+    \ Application__c, stamp candidate/recruiter names, and compute IST-converted\n\
+    \  start/end times (the team operates across US timezones and IST). After save,\n\
+    \  Apex creates a Google Calendar event for it, and a Slack reminder to the\n\
+    \  recruiter is scheduled near the interview time.\n\nSTEP 3 - SUPPORT REQUEST\
+    \ (OPTIONAL BUT CENTRAL). The scheduling employee can\n  tick \"Request Raised\"\
+    \ to ask for interview support. That fires a Slack post\n  to the support team\
+    \ AND auto-creates a Case linked to this interview so the\n  request is tracked\
+    \ as a ticket. The request then moves through Approve_Stage\n  (Ready -> Submitted\
+    \ -> Assigned -> Completed/Rejected). Assigning a Vendor\n  (\"Proxy Support\"\
+    ) automatically sets Approve_Stage to \"Assigned\" (Apex\n  trigger) and notifies\
+    \ Slack."
+- title: Interview__c — How It Is Used — The Business Process (3)
+  keywords:
+  - interview
+  text: "STEP 4 - AI SUPPORT-PERSON ASSIGNMENT (COMPASS). An external AI service\
+    \ on AWS\n  (called via named-credential callouts) picks the best internal employee\n\
+    \  (Interview_Support_Person__c) for each interview based on skill confidence\n\
+    \  scores, availability, workload caps and constraints. It runs as a nightly\n\
+    \  batch and on demand. Humans can override it from buttons on the interview\n\
+    \  page: Reassignment, Reshuffle, Rollback, PSP (set preferred support person)\
+    \ -\n  each of these calls the AWS service and writes an audit row to\n  AI_Assignment_Logs__c.\
+    \ These buttons/panels are only visible to users with\n  the Run_AI_Interview_Assignment\
+    \ custom permission. In practice ~73% of all\n  interviews have been AI-assigned.\n\
+    \nSTEP 5 - THE INTERVIEW HAPPENS, STATUS IS UPDATED. Users drive\n  Interview_Status__c\
+    \ through the Path on the record page: Scheduled ->\n  Completed (or Rescheduled\
+    \ / Cancelled / No Show). Rescheduling or cancelling\n  requires a Status Reason.\
+    \ The result is recorded in Interview_Outcome__c:\n  Moved to Next Round, Rejected,\
+    \ Offer Received, or NA. \"Ghosted\" (the company\n  never responded) can NOT\
+    \ be set manually - a daily scheduled flow\n  automatically marks interviews\
+    \ Ghosted when 14 days pass after the interview\n  date with no outcome (the\
+    \ per-record \"Bypass Ghosted Validation\" checkbox\n  exempts a record from\
+    \ this sweep)."
+- title: Interview__c — How It Is Used — The Business Process (4)
+  keywords:
+  - interview
+  text: "STEP 6 - DOWNSTREAM EFFECTS OF THE OUTCOME.\n  - B2B: a flow syncs the\
+    \ outcome back to the Job Submission (status, offer\n    received flag) and\
+    \ emails the candidate (next-round / offer / rejection\n    templates).\n  -\
+    \ Moving forward: \"Offer Received\" requires the Offer Letter Date; a\n   \
+    \ successful placement leads to Background_Check__c and Onboarding__c\n    records\
+    \ downstream.\n  - Incentives: when the interview completes, the incentive framework\
+    \ stamps\n    the round multiplier from metadata config; formulas then compute\
+    \ the\n    weighted credit and a positive (+400 per outcome \"Moved to Next\
+    \ Round\" /\n    \"Offer Received\") or negative (-100 for \"Rejected\"/\"Ghosted\"\
+    ) incentive for\n    the support person.\n  - Scoring: the external COMPASS\
+    \ engine updates the support person's\n    per-skill ratings from the outcome\
+    \ and writes the full calculation audit\n    (before/after scores, Kalman parameters)\
+    \ onto the interview.\n  - Prep sessions: from the interview page a recruiter\
+    \ can click \"Schedule\n    Session\" to book a training/prep Session__c linked\
+    \ back to the interview."
+- title: Interview__c — Connected Objects
+  keywords:
+  - interview
+  - each
+  - relationship
+  - means
+  text: "PARENT:\n- Account (via Candidate__c, MASTER-DETAIL, required, 100% populated).\
+    \ The\n  candidate this interview is for. The interview inherits sharing from\
+    \ the\n  candidate. Interviews feed candidate-level metrics (Total_Interviews__c,\n\
+    \  expected-interview pacing, Candidate_Status__c lifecycle)."
+- title: Interview__c — Connected Objects (2)
+  keywords:
+  - interview
+  - each
+  - relationship
+  - means
+  text: "LOOKUPS FROM INTERVIEW TO OTHER OBJECTS:\n- Job_Submission__c (Job_Submission__c):\
+    \ the B2B submission this interview was\n  created from. Source of the rate\
+    \ snapshots. B2B-only (8 records so far).\n- Job_Requirement__c (Job_Requirement__c):\
+    \ the client's open job req (B2B).\n  Auto-copied from the submission. The req\
+    \ counts its interviews.\n- Application__c (Application__c): the marketing-side\
+    \ daily application batch\n  that produced this interview (\"this interview\
+    \ came from the applications we\n  made for the candidate on that day\").\n\
+    - Marketing__c (Marketing__c): the candidate-marketing engagement this\n  interview\
+    \ belongs to (marketing-sourced interviews).\n- Lead (Lead__c): the original\
+    \ website lead, for interviews created before/\n  without a converted candidate.\
+    \ Either Candidate or Lead must be present\n  (validation rule).\n- Account\
+    \ as client (Client_Account__c): the Techsara B2B client company\n  (business\
+    \ Account) - reserved for the B2B path (currently always empty in\n  data; the\
+    \ flow populates it going forward).\n- Company__c (company_new__c, label \"\
+    Company\"): which outside company the\n  candidate is interviewing with, from\
+    \ the company master list (98% populated -\n  this is the normal \"which company\"\
+    \ field for marketing interviews).\n- Recruiter__c / \"Employee\" - FOUR different\
+    \ roles:\n    * Recruiter__c (field): the recruiter handling this candidate/interview."
+- title: Interview__c — Connected Objects (3)
+  keywords:
+  - interview
+  - each
+  - relationship
+  - means
+  text: "* Interview_Support_Person__c: the employee assigned (usually by the AI)\n\
+    \      to support the candidate through this interview.\n    * Preferred_Support_Person__c\
+    \ / Previous_Support_Person__c: preferred pick\n      and the pre-reassignment\
+    \ support person (AI reassignment history).\n    * Interviewer_Assignment_Constraint__c:\
+    \ a pinned employee the AI engine\n      must honor when assigning (e.g. \"\
+    must interview with X\").\n- Vendor__c (Vendor__c, label \"Proxy Support\"):\
+    \ the third-party vendor or\n  in-house proxy providing support services on\
+    \ the call.\n- User (Account_Manager__c): the AM who owns the client relationship\
+    \ (B2B,\n  auto-filled from the Job Requirement).\n- User (User_Initiated_By__c,\
+    \ Reassignment_Initiated_By__c): audit of who\n  triggered AI runs / reassignments."
+- title: Interview__c — Connected Objects (4)
+  keywords:
+  - interview
+  - each
+  - relationship
+  - means
+  text: "OBJECTS THAT POINT AT INTERVIEW (children / references):\n- Interview_Participant__c\
+    \ (MASTER-DETAIL child): the attendee roster of the\n  call - one row per person\
+    \ (candidate, client interviewer, internal support,\n  observer...) with side,\
+    \ role, and join/leave attendance audit. (Object is\n  deployed but has no data\
+    \ yet in preprod.)\n- Session__c (lookup Session__c.Interview__c): a concrete\
+    \ scheduled Zoom/\n  calendar meeting booked for or around this interview (e.g.\
+    \ a prep session\n  booked via the \"Schedule Session\" button).\n- Case (lookup\
+    \ Case.Interview__c): internal ops tickets raised about this\n  interview -\
+    \ including the auto-created \"interview support request\" Case and\n  one-off\
+    \ issues (proxy exception, recording request, scheduling problem).\n- Background_Check__c\
+    \ (lookup): the post-offer verification/payment-agreement\n  record tied back\
+    \ to the interview that won the offer.\n- AI_Assignment_Logs__c (two lookups:\
+    \ Interview__c and legacy Interview_ID__c):\n  audit rows for every AI assignment/reassignment/reshuffle/rollback\
+    \ run.\n- Zoom_Recording_Access_Log__c (lookup): who accessed this interview's\
+    \ Zoom\n  recording, when (compliance logging)."
+- title: Interview__c — Connected Objects (5)
+  keywords:
+  - interview
+  - each
+  - relationship
+  - means
+  text: "EXPLICIT NON-RELATIONSHIPS (common confusions):\n- Interview_Evaluation__c\
+    \ has NO relationship to Interview__c. It is a child\n  of Internal_Interview__c\
+    \ (internal screening evaluations).\n- Internal_Interview__c has no direct link\
+    \ to Interview__c; they share only\n  the candidate."
+- title: Interview__c — Business Rules
+  keywords:
+  - interview
+  - validation
+  - all
+  - active
+  text: "- B2B_Interview_Needs_Submission: B2B-Requirement interviews must have\
+    \ both\n  Job Submission and Job Requirement filled.\n- Interview_Candidate_OR_Lead_Required:\
+    \ either Candidate or Lead must be\n  linked (B2B interviews can precede lead\
+    \ conversion).\n- Offer_Requires_OfferLetterDate: cannot set status \"Offer\
+    \ Received\" without\n  filling Offer Letter Date.\n- Prevent_Manual_Ghosted:\
+    \ users cannot set the outcome to \"Ghosted\" manually -\n  it is system-managed\
+    \ (set automatically 14 days after the interview date by\n  the scheduled flow).\n\
+    - Requires_Status_Reason: a Status Reason is required when status becomes\n\
+    \  Rescheduled, Cancelled, or No Show.\n- Require_Comment_For_Other: Status\
+    \ Reason Comment is required when the Status\n  Reason chosen is \"Other\".\n\
+    - Edit_Interview_Support_Person: only authorized users (custom permission\n\
+    \  Edit_Interview_Support_Person) may change the Interview Support Person."
+- title: Interview__c — Automation
+  keywords:
+  - interview
+  - runs
+  text: "RECORD-TRIGGERED FLOWS (active):\n- Copy_Project_Understanding_Document_from_Candidate\
+    \ (before save, create):\n  copies the candidate's PU document link onto the\
+    \ interview.\n- Interview_Record_Initial_Call_Flow (before save, create): finds\
+    \ the matching\n  Application__c from candidate+recruiter, stamps Candidate_Name__c\
+    \ /\n  Recruiter_Name__c and the record type; blocks the save if lookups fail.\n\
+    - Interview_IST_Time_Population (before save, create+update): converts the\n\
+    \  schedule to IST (IST_Start_Time__c / IST_End_Time__c).\n- Interview_Status_Change\
+    \ (before save): flips the Status_Change__c flag when\n  the outcome is set.\n\
+    - Interview_Incentive_Calculation_Framework (before save, update on status):\n\
+    \  reads Interview_Incentive_Configuration__mdt for the round and stamps\n \
+    \ Round_Multiplier_New__c + Incentive_Calculated_On__c.\n- Slack_Notification_When_There_is_an_interview\
+    \ (after save + scheduled path):\n  Slack interview reminder to the recruiter\
+    \ near interview time; stamps\n  Final_Notification_Date_Time__c.\n- Interview_Support_Request\
+    \ (after save, when Request_Raised = true): Slack\n  post of the full support\
+    \ request (candidate, company, round, IST times,\n  JD/resume links) to the\
+    \ support team.\n- Interview_Request_Case_Flow (after save, when Request_Raised\
+    \ becomes true):\n  creates the tracking Case (subject, deadline, owner, priority,\
+    \ tags)."
+- title: Interview__c — Automation (2)
+  keywords:
+  - interview
+  - runs
+  text: "- B2B_Interview_Outcome_Sync_With_Job_Submission_Flow (after save, on status/\n\
+    \  outcome change): updates the Job Submission, emails the candidate\n  (next-round\
+    \ / offer / rejection), marks the Job Requirement filled when all\n  openings\
+    \ are placed.\n\nSCHEDULED FLOW:\n- Auto_Update_Interview_records_to_Ghosted\
+    \ (daily): marks past interviews with\n  no outcome as Ghosted after the 14-day\
+    \ cutoff, unless \"Bypass Ghosted\n  Validation\" is checked.\n\nAPEX TRIGGER\
+    \ (InterviewTrigger -> InterviewTriggerHandler):\n- After insert: creates the\
+    \ Google Calendar event (GoogleCalendarAPI), gated\n  by a custom label switch.\n\
+    - Before update: when Vendor (Proxy Support) is set, auto-sets Approve_Stage\n\
+    \  to \"Assigned\".\n- After update: Slack notification when the support assignment\
+    \ happens\n  (SlackCalloutHelper), gated by a custom label switch."
+- title: Interview__c — Automation (3)
+  keywords:
+  - interview
+  - runs
+  text: "SCREEN FLOWS / BUTTONS ON THE PAGE:\n- Create paths: B2B_Create_Interview_from_Submission\
+    \ (from Job Submission);\n  Interview_Creation_V2 (marketing path).\n- Reassignment\
+    \ / Reshuffle / Rollback / PSP buttons: human overrides of the AI\n  assignment;\
+    \ each calls the AWS AI service and logs to AI_Assignment_Logs__c.\n  Visible\
+    \ only with the Run_AI_Interview_Assignment custom permission.\n- View Recording:\
+    \ opens the interview recording and logs the access.\n- Schedule Session: books\
+    \ a prep/training Session__c linked to the interview.\n- Approve Support Request:\
+    \ defined but not placed on any page (currently\n  unreachable; its flow is\
+    \ still Draft).\n\nEXTERNAL WRITERS (important!): the COMPASS AI engine on AWS\
+    \ writes back to\nInterview__c through the API. ALL of the AI-suggestion fields,\
+    \ assignment\nfields and the ~70 scoring/Kalman fields (section 8, groups J\
+    \ and L) are\nwritten by that external service - no Apex class or flow in the\
+    \ org sets them."
+- title: Interview_Participant__c — What This Object Is
+  keywords:
+  - interview
+  - participant
+  text: 'Interview_Participant__c is the ATTENDEE ROSTER of an external interview
+    call
+
+    (Interview__c): one record per person who is expected on - or actually joins
+    -
+
+    the call, with which side of the table they sit on (candidate / internal /
+
+    client), what role they play (client interviewer, hiring manager, internal
+
+    support, observer...), and a join/leave attendance audit trail.
+
+
+    IMPORTANT REALITY CHECK: the object is deployed but NOT YET IN USE. It has
+
+    ZERO records in preprod, no active automation writes to it, and the only flow
+
+    that ever read it (Interview_support_person_Assign, a calendar-invitee sync)
+
+    is marked Obsolete. Treat it as built-ahead infrastructure for a future
+
+    "who was actually on the call" feature (e.g. Zoom attendance capture), not as
+
+    a live part of the business process today.'
+- title: Interview_Participant__c — Kind Of Object
+  keywords:
+  - interview
+  - participant
+  text: "- Custom object, part of the (external) Interviewing domain.\n- MASTER-DETAIL\
+    \ CHILD OF Interview__c via Interview__c: every participant row\n  must belong\
+    \ to one interview. Sharing is \"Controlled By Parent\" - whoever\n  can see\
+    \ the interview (and through it the candidate) sees the roster.\n- 12 custom\
+    \ fields, 0 record types, 0 validation rules, 1 list view.\n- Name is a plain\
+    \ Text field (label \"Interview Participant\"), not auto-number.\n- Its page\
+    \ layout is minimal (only Interview + Name placed) - the object was\n  clearly\
+    \ designed to be filled by automation/API, not by hand.\n- Object permissions\
+    \ are granted only by the Jenkins_CICD permission set (and\n  read-only to Salesforce\
+    \ internal integration users) - no department\n  permission set exposes it,\
+    \ so normal users cannot even see it yet.\n- Scale: 0 records in preprod."
+- title: Interview_Participant__c — Record Types
+  keywords:
+  - interview
+  - participant
+  text: 'None. Every participant row is the same shape; the Side and Participant
+    Type
+
+    picklists carry the "flavor" instead.'
+- title: Interview_Participant__c — How It Is Used — The Business Process
+  keywords:
+  - interview
+  - participant
+  text: "INTENDED process (nothing executes it yet):\nSTEP 1 - when an interview\
+    \ is scheduled, one row per expected attendee would\n  be created: the candidate,\
+    \ the client-side interviewer(s)/recruiter/HR, and\n  any Techsara-side people\
+    \ (support person, observer, trainer).\nSTEP 2 - internal attendees link to\
+    \ their Recruiter__c (\"Employee\") record\n  and/or Salesforce User; outside\
+    \ attendees are captured as free text name +\n  email + company (they have no\
+    \ user record).\nSTEP 3 - during/after the call, Attendance Status plus Joined\
+    \ At / Left At\n  timestamps would record who actually showed up and for how\
+    \ long - an audit\n  usable for no-show disputes, support-person verification,\
+    \ and billing.\n\nHISTORICAL trace: the now-Obsolete record-triggered flow\n\
+    Interview_support_person_Assign (on Interview__c) looked up participant rows\n\
+    by Participant Type while syncing the assigned support person into the\ninterview's\
+    \ Google Calendar event invitees (EventRelation). That was the only\nconsumer;\
+    \ since it was retired nothing reads or writes this object."
+- title: Interview_Participant__c — Connected Objects
+  keywords:
+  - interview
+  - participant
+  - each
+  - relationship
+  - means
+  text: "PARENT:\n- Interview__c (via Interview__c, MASTER-DETAIL, required): the\
+    \ external\n  interview this person is on the roster of. Child relationship\
+    \ name:\n  Interview_Participants (the roster would appear as a related list\
+    \ on the\n  interview page).\n\nLOOKUPS FROM PARTICIPANT TO OTHER OBJECTS:\n\
+    - Recruiter__c / \"Employee\" (Employee__c): when the participant is a Techsara\n\
+    \  employee, the link to their internal staff record.\n- User (User__c): when\
+    \ the participant maps to an actual Salesforce/portal\n  User - what the old\
+    \ calendar-invitee sync used to resolve the user's\n  Contact for the calendar\
+    \ invite.\n\nNo other object points at Interview_Participant__c."
+- title: Interview_Participant__c — Business Rules
+  keywords:
+  - interview
+  - participant
+  - validation
+  text: 'None. There are no validation rules on this object (nothing creates records
+
+    yet, so no save-time rules were needed).'
+- title: Interview_Participant__c — Automation
+  keywords:
+  - interview
+  - participant
+  - runs
+  text: 'None active. No trigger, no active flow, no Apex class creates or updates
+
+    Interview_Participant__c records. The single historical reference -
+
+    Interview_support_person_Assign (record-triggered on Interview__c, which did
+
+    a Lookup on this object''s Participant Type) - is marked Obsolete. There are
+
+    also no quick actions or buttons for it on any page.'
+- title: Interview_Type__c — What This Object Is
+  keywords:
+  - interview
+  - type
+  text: "Interview_Type__c is the admin-maintained CATALOG OF INTERNAL INTERVIEW\
+    \ /\nASSESSMENT TYPES for the Internal_Interview__c subsystem (Techsara's own\n\
+    template-driven screening and training assessments - NOT interviews with\noutside\
+    \ companies). Each record is one named kind of internal interview,\ne.g. \"\
+    Intake\", \"Mock\", \"Practice Mock Interview\", or a training-week\nassessment\
+    \ like \"Advanced AI/ML Training - V1 - Week 1\". Choosing a type\ndetermines\
+    \ (via the Section_Interview_Type__c junction) which question\nSECTIONS the\
+    \ interview runs and in what order.\n\nCOMMON CONFUSION - do not mix this up\
+    \ with:\n- Interview__c.Interview_Type__c, a PICKLIST FIELD on the external\
+    \ Interview\n  object (Screening Round / Technical Round / HR Round / Interview,\
+    \ and\n  essentially unused). Same name, totally different thing.\n- The catalog\
+    \ started as screening types (Intake/Mock/OOT) and has grown to\n  cover training\
+    \ assessments and marketing-prep interview flavors - it is\n  the generic \"\
+    what kind of internal session is this\" list."
+- title: Interview_Type__c — Kind Of Object
+  keywords:
+  - interview
+  - type
+  text: "- Custom object, part of the Internal Interview (screening/assessment)\n\
+    \  domain. Configuration/catalog data, not transactional data.\n- Standalone\
+    \ parent object; sharing is Public Read/Write (it is org-wide\n  reference data).\
+    \ Owned by whoever creates it.\n- Only 1 custom field (Is Active) plus the Name\
+    \ text field (label\n  \"Interview Type Name\") - the record basically IS its\
+    \ name.\n- 0 record types, 0 validation rules, 1 list view; has its own Lightning\n\
+    \  record page (generic detail + related lists layout).\n- MASTER parent of\
+    \ Section_Interview_Type__c (its section links are deleted\n  with it); looked\
+    \ up by Internal_Interview__c, Template__c, and (in the\n  metadata snapshot\
+    \ only - see part 8 notes on the other objects) by the\n  now-removed deprecated\
+    \ lookups on Section__c and Question_Bank__c.\n- Scale: 8 records in preprod,\
+    \ all active."
+- title: Interview_Type__c — How It Is Used — The Business Process
+  keywords:
+  - interview
+  - type
+  text: "STEP 1 - AN ADMIN CREATES A TYPE. On the Interview Type list view a \"\
+    New\n  Interview Type\" button launches the Add_Interview_Type_Flow screen flow\n\
+    \  (this button, not the standard New, is the intended path). The flow asks\n\
+    \  for the name and active flag, creates the record, and can also attach\n \
+    \ existing sections to the new type by creating Section_Interview_Type__c\n\
+    \  junction rows.\nSTEP 2 - SECTIONS GET ATTACHED. The Add_Section_Flow (\"\
+    New Section\" button\n  on the Section list) lets the admin pick which interview\
+    \ types a new\n  section belongs to, creating junction rows with a Sequence\
+    \ number - so\n  the type ends up with an ordered playlist of sections.\nSTEP\
+    \ 3 - SCHEDULING AN INTERNAL INTERVIEW. When an employee schedules or\n  reschedules\
+    \ an internal interview (Interview_Create_Reschedule_Flow, the\n  screen flow\
+    \ behind the \"Create Interview\" buttons on Candidate and Lead\n  pages), they\
+    \ pick the Interview Type; it is stamped into\n  Internal_Interview__c.Interview_Type__c.\n\
+    STEP 4 - CONDUCTING. The Internal_Interview_Conduct_Interview screen flow\n\
+    \  reads the type's junction rows to know which sections to run in which\n \
+    \ order (and/or uses a prebuilt Template__c, which also references an\n  Interview\
+    \ Type). Question logs and evaluations are written per section.\nSTEP 5 - REVIEWING.\
+    \ View_Interview_Log_Flow shows past internal-interview"
+- title: Interview_Type__c — How It Is Used — The Business Process (2)
+  keywords:
+  - interview
+  - type
+  text: 'logs and displays the type; reports group internal interviews by type.
+
+    Inactive types (Is Active unchecked) stop appearing as choices but keep
+
+    their history. In practice all 8 types are still active.'
+- title: Interview_Type__c — Connected Objects
+  keywords:
+  - interview
+  - type
+  - each
+  - relationship
+  - means
+  text: "OBJECTS THAT POINT AT INTERVIEW TYPE (it has no lookups of its own):\n\
+    - Section_Interview_Type__c (MASTER-DETAIL child): the junction rows tying\n\
+    \  this type to its ordered list of Section__c records. Deleting a type\n  deletes\
+    \ its junction rows (not the sections themselves).\n- Internal_Interview__c\
+    \ (lookup Interview_Type__c): every internal interview\n  records which type\
+    \ it was - 100% populated on the 302 internal interviews\n  in preprod.\n- Template__c\
+    \ (lookup Interview_Type__c): a reusable interview template is\n  built FOR\
+    \ a given type (1 template exists so far).\n- Section__c (lookup Interview_Type__c)\
+    \ and Question_Bank__c (lookup\n  Interview_Type__c): DEPRECATED direct links\
+    \ that the junction replaced;\n  they still exist in this repo's metadata snapshot\
+    \ but have already been\n  DELETED in the live preprod org (queries against\
+    \ them fail)."
+- title: Interview_Type__c — Business Rules
+  keywords:
+  - interview
+  - type
+  - validation
+  text: 'None. Catalog hygiene relies on the guided creation flow, not on validation
+
+    rules.'
+- title: Interview_Type__c — Automation
+  keywords:
+  - interview
+  - type
+  - runs
+  text: "- Add_Interview_Type_Flow (ACTIVE screen flow) - launched from the \"New\n\
+    \  Interview Type\" list-view button (/flow/Add_Interview_Type_Flow). Creates\n\
+    \  the Interview_Type__c record (Name, Is Active) and can create\n  Section_Interview_Type__c\
+    \ junction rows for it.\n- Interview_Create_Reschedule_Flow (ACTIVE screen flow)\
+    \ - reads this object\n  so the scheduler can pick a type for the Internal_Interview__c\
+    \ being\n  created/rescheduled.\n- View_Interview_Log_Flow (ACTIVE screen flow)\
+    \ - reads it while displaying\n  internal-interview history.\n- Internal_Interview_Conduct_Interview\
+    \ reaches it indirectly through the\n  junction and Template lookups.\nNo record-triggered\
+    \ flows, no Apex triggers, no scheduled jobs."
+- title: Question_Bank__c — What This Object Is
+  keywords:
+  - question
+  - bank
+  text: 'Question_Bank__c is the reusable LIBRARY OF INTERVIEW QUESTIONS for the
+
+    INTERNAL interview subsystem (Internal_Interview__c - Techsara screening and
+
+    training its own candidates). One record = one question: its text, the
+
+    evaluation criteria an interviewer should score it against, a difficulty
+
+    level, and the Section (interview segment) it belongs to. At interview time
+
+    the conduct flow pulls a section''s active questions, randomly picks the
+
+    required number, and the interviewer scores the candidate''s answers.
+
+
+    It has NOTHING to do with external interviews (Interview__c) - questions
+
+    asked by client companies are captured free-text on the interview record,
+
+    not here. Note the object also feeds "standard" sections only: sections of
+
+    type "AI Resume Based" get their questions generated on the fly by an
+
+    external AI service from the candidate''s resume, bypassing the bank.'
+- title: Question_Bank__c — Kind Of Object
+  keywords:
+  - question
+  - bank
+  text: "- Custom object, part of the Internal Interview (screening/assessment)\n\
+    \  domain. Semi-static content/config data maintained by admins/trainers.\n\
+    - Standalone object, sharing Public Read/Write (shared question library).\n\
+    - 8 custom fields (2 of them deprecated - and already physically DELETED in\n\
+    \  the live org, see part 8), 0 record types, 0 validation rules, 1 list\n \
+    \ view; generic Lightning record page.\n- Auto-number Name in the format QB-{00000}\
+    \ (label \"Question Bank ID\") -\n  the question text field, not the Name, is\
+    \ the human-readable content.\n- MASTER parent of Niche_Question__c (junction\
+    \ to Niche__c); looked up by\n  Internal_Interview_Question_Log__c and Template_Section_Question__c.\n\
+    - Scale: 620 records in preprod (created 2026-05-27 to 2026-07-27)."
+- title: Question_Bank__c — Record Types
+  keywords:
+  - question
+  - bank
+  text: 'None. All questions are one shape; Section, Difficulty and (via junction)
+
+    Niche carry the classification.'
+- title: Question_Bank__c — How It Is Used — The Business Process
+  keywords:
+  - question
+  - bank
+  text: "STEP 1 - AUTHORING. On the Question Bank list view the \"Bulk Add Questions\"\
+    \n  button launches Bulk_Add_Questions_Flow: an admin/trainer pastes a batch\n\
+    \  of questions, picks the target Niche, and the flow mass-creates\n  Question_Bank__c\
+    \ rows plus Niche_Question__c junction rows tying each\n  question to that niche\
+    \ (1,160 junction rows exist for the 620 questions -\n  a question can serve\
+    \ several niches).\nSTEP 2 - ORGANIZING. Each question is tied to a Section__c\
+    \ (the interview\n  segment that asks it), directly via the Section lookup.\
+    \ Sections define\n  how many questions they need (Total Questions) and whether\
+    \ they draw from\n  the bank at all (Question Source Type = Standard) or generate\
+    \ questions\n  from the resume via AI (AI Resume Based).\nSTEP 3 - TEMPLATE\
+    \ BUILDING (optional). Template_Creation_Flow lets an admin\n  hand-pick specific\
+    \ bank questions into a reusable Template__c (via\n  Template_Section_Question__c\
+    \ rows); Template_Structure_Flow displays that\n  structure read-only.\nSTEP\
+    \ 4 - INTERVIEW TIME. Internal_Interview_Conduct_Interview loads the\n  active\
+    \ questions of each Standard section, calls the RandomizeQuestions\n  Apex action\
+    \ (cryptographic shuffle) to pick N of them, and shows the\n  interviewer each\
+    \ question with its Evaluation Criteria. Every question\n  actually asked is\
+    \ SNAPSHOTTED into Internal_Interview_Question_Log__c"
+- title: Question_Bank__c — How It Is Used — The Business Process (2)
+  keywords:
+  - question
+  - bank
+  text: "(text and criteria copied, plus a lookup back to the bank row), so later\n\
+    \  edits to the bank do not rewrite history. 338 of the 428 question-log\n \
+    \ rows link back to a bank question (the rest were AI-generated).\nSTEP 5 -\
+    \ MAINTENANCE. Is Active is the retire switch - inactive questions\n  stop being\
+    \ served. (All 620 are currently active.)"
+- title: Question_Bank__c — Connected Objects
+  keywords:
+  - question
+  - bank
+  - each
+  - relationship
+  - means
+  text: "LOOKUPS FROM QUESTION BANK TO OTHER OBJECTS:\n- Section__c (Section__c):\
+    \ the interview segment this question belongs to -\n  the main organizing link.\
+    \ NOTE the data reality: 490 of 620 rows hold a\n  Section id that NO LONGER\
+    \ RESOLVES (those Section records were deleted),\n  so in the live org most\
+    \ questions are effectively orphaned (see part 9).\n- Interview_Type__c (Interview_Type__c)\
+    \ - DEPRECATED, and already deleted\n  in the live org (snapshot metadata only).\n\
+    - Niche__c (Niche__c) - DEPRECATED direct link, also deleted in the live\n \
+    \ org; niche classification now goes through the Niche_Question__c\n  junction\
+    \ instead.\n\nOBJECTS THAT POINT AT QUESTION BANK:\n- Niche_Question__c (MASTER-DETAIL\
+    \ child via Question__c): junction to\n  Niche__c - which candidate niches (skill\
+    \ domains) this question applies\n  to. Created by Bulk_Add_Questions_Flow.\
+    \ 1,160 rows.\n- Internal_Interview_Question_Log__c (lookup Question_Bank__c):\
+    \ the\n  interview-time snapshot of an asked question, pointing back at its\n\
+    \  source bank row.\n- Template_Section_Question__c (lookup Question__c): a\
+    \ question slotted\n  into a reusable interview template (4 rows so far)."
+- title: Question_Bank__c — Automation
+  keywords:
+  - question
+  - bank
+  - runs
+  text: "- Bulk_Add_Questions_Flow (ACTIVE screen flow) - the \"Bulk Add Questions\"\
+    \n  list-view button; mass-creates questions and their Niche_Question__c\n \
+    \ junction rows.\n- Internal_Interview_Conduct_Interview (ACTIVE screen flow)\
+    \ - READS active\n  questions per section at interview time; calls the RandomizeQuestions\n\
+    \  invocable Apex class to pick a random subset (a Crypto-based shuffle\n  for\
+    \ true randomness); writes the asked questions to the question log.\n- Template_Creation_Flow\
+    \ (ACTIVE) / Template_Structure_Flow (ACTIVE) -\n  READ bank questions while\
+    \ building/showing templates.\n- RandomizeQuestions.cls (+ its test class) is\
+    \ the only Apex touching the\n  object, and it only shuffles in-memory record\
+    \ collections passed by the\n  flow - it performs no DML/SOQL of its own.\n\
+    No record-triggered flows, triggers, or scheduled jobs write to this object."
+- title: Section__c — What This Object Is
+  keywords:
+  - section
+  text: 'Section__c is a reusable SEGMENT OF AN INTERNAL INTERVIEW in the
+
+    Internal_Interview__c subsystem - a named block such as "Week 1 Coding
+
+    Round" or "Day 01 Machine Learning Fundamentals" that groups questions and
+
+    carries the rules for running that block: how many questions to ask, roughly
+
+    how long it takes, whether it applies to tech or non-tech roles, and whether
+
+    its questions come from the Question Bank ("Standard") or are AI-generated
+
+    from the candidate''s resume ("AI Resume Based"). Sections are attached to
+
+    one or more Interview Types through the Section_Interview_Type__c junction,
+
+    which also gives them their running order.
+
+
+    Despite the generic name, it has nothing to do with page-layout sections or
+
+    with external interviews (Interview__c). Current live data shows it being
+
+    used as the day-by-day curriculum of the "Advanced AI/ML Training - V1 -
+
+    Week 1" assessment.'
+- title: Section__c — Kind Of Object
+  keywords:
+  - section
+  text: "- Custom object, Internal Interview (screening/assessment) domain.\n  Configuration/content\
+    \ data maintained by admins/trainers.\n- Standalone object, sharing Public Read/Write.\n\
+    - 8 custom fields (2 deprecated - and already deleted in the live org),\n  0\
+    \ record types, 0 validation rules, 1 list view; generic Lightning\n  record\
+    \ page. Name is a plain Text field (\"Section Name\").\n- MASTER parent of Section_Interview_Type__c;\
+    \ looked up by\n  Question_Bank__c, Template_Section__c, Internal_Interview_Section_Log__c,\n\
+    \  Internal_Interview_Question_Log__c, and Section_Evaluation__c.\n- Scale:\
+    \ 6 records in preprod (all created for the AI/ML training week)."
+- title: Section__c — Record Types
+  keywords:
+  - section
+  text: 'None. The Domain Type and Question Source Type picklists differentiate
+
+    section behavior instead.'
+- title: Section__c — How It Is Used — The Business Process
+  keywords:
+  - section
+  text: "STEP 1 - CREATION. On the Section list view the \"New Section\" button\n\
+    \  launches Add_Section_Flow: the admin names the section, sets domain type,\n\
+    \  question source, question count and estimated time, picks which Interview\n\
+    \  Types it belongs to, and the flow creates the Section__c record plus one\n\
+    \  Section_Interview_Type__c junction row per chosen type (with a sequence).\n\
+    STEP 2 - FILLING WITH QUESTIONS. For \"Standard\" sections, Question_Bank__c\n\
+    \  rows are pointed at the section (its question pool). \"AI Resume Based\"\n\
+    \  sections stay empty - their questions are generated per candidate by the\n\
+    \  external AI service (AWS Lambda) from the resume at interview time.\nSTEP\
+    \ 3 - RUNNING. When an internal interview is conducted\n  (Internal_Interview_Conduct_Interview\
+    \ screen flow), the flow resolves the\n  section list - from the interview type's\
+    \ junction rows, from the chosen\n  Template__c's Template_Section__c rows,\
+    \ or (in \"Techsara's Magic\" launch\n  mode) by fetching sections whose Domain\
+    \ Type matches the candidate\n  Niche's domain. For each section it creates\
+    \ an\n  Internal_Interview_Section_Log__c row, asks Total Questions questions\n\
+    \  (randomized from the pool, or AI-generated), logs each in\n  Internal_Interview_Question_Log__c,\
+    \ and captures a per-section score and\n  comment.\nSTEP 4 - EVALUATION. The\
+    \ human evaluation writes Section_Evaluation__c"
+- title: Section__c — How It Is Used — The Business Process (2)
+  keywords:
+  - section
+  text: "rows (score + comment per section) under the Interview_Evaluation__c\n\
+    \  record, referencing the section.\nSTEP 5 - MAINTENANCE. Is Active retires\
+    \ a section from future interviews;\n  logs keep the history."
+- title: Section__c — Connected Objects
+  keywords:
+  - section
+  - each
+  - relationship
+  - means
+  text: "LOOKUPS FROM SECTION TO OTHER OBJECTS (both deprecated):\n- Interview_Type__c\
+    \ (Interview_Type__c) - DEPRECATED 2026-05-20, replaced\n  by the Section_Interview_Type__c\
+    \ junction \"so one Section can serve\n  multiple Interview Types\". Its metadata\
+    \ description notes it was \"still\n  read by Internal_Interview_Conduct_Interview\
+    \ flow until flow rework\n  completes\" - but the field has ALREADY BEEN DELETED\
+    \ in the live preprod\n  org (SOQL fails), so treat it as gone.\n- Niche__c\
+    \ (Niche__c) - DEPRECATED 2026-05-17, replaced by the Domain Type\n  picklist.\
+    \ Also already deleted in the live org; snapshot metadata only."
+- title: Section__c — Connected Objects (2)
+  keywords:
+  - section
+  - each
+  - relationship
+  - means
+  text: "OBJECTS THAT POINT AT SECTION:\n- Section_Interview_Type__c (MASTER-DETAIL\
+    \ child): junction to\n  Interview_Type__c with a Sequence - \"this section\
+    \ is step N of that\n  interview type\". Deleting a section deletes its junction\
+    \ rows.\n- Question_Bank__c (lookup Section__c): the section's question pool\n\
+    \  (Standard sections). Note: in preprod today no live question points at\n\
+    \  any live section - the wiring is stale (see Question Bank part 9).\n- Template_Section__c\
+    \ (lookup Section__c): this section slotted into a\n  reusable Template__c with\
+    \ its own sequence/active flag.\n- Internal_Interview_Section_Log__c (lookup\
+    \ Section__c): the run-time log\n  of this section inside one internal interview\
+    \ (score, comment, question\n  source used). 104 rows, all referencing a section.\n\
+    - Internal_Interview_Question_Log__c (lookup Section__c): each asked\n  question's\
+    \ log also stamps which section it was asked in.\n- Section_Evaluation__c (lookup\
+    \ Section__c): per-section score/comment in\n  the human evaluation (child of\
+    \ Interview_Evaluation__c). 6 rows."
+- title: Section__c — Automation
+  keywords:
+  - section
+  - runs
+  text: "- Add_Section_Flow (ACTIVE screen flow) - the \"New Section\" list-view\n\
+    \  button; creates the section and its interview-type junction rows.\n- Internal_Interview_Conduct_Interview\
+    \ (ACTIVE screen flow) - READS\n  sections (domain type, question source, question\
+    \ count, estimated time,\n  active flag) to run each block and write the logs.\n\
+    - Template_Creation_Flow / Template_Structure_Flow (ACTIVE) - READ sections\n\
+    \  when building/displaying reusable templates (Interview_Sequence__c is,\n\
+    \  per its description, used only by the template-creation flow).\nNo record-triggered\
+    \ flows, no Apex, no scheduled jobs touch this object."
+- title: Section_Interview_Type__c — What This Object Is
+  keywords:
+  - section
+  - interview
+  - type
+  text: 'Section_Interview_Type__c is a pure MANY-TO-MANY JUNCTION between Section__c
+
+    and Interview_Type__c in the internal-interview subsystem, with one payload
+
+    field: Sequence. Each row means "when running an internal interview of THIS
+
+    type, run THAT section as step N". It exists so one section (e.g. a coding
+
+    round) can be reused across several interview types without duplication -
+
+    it replaced the old single Interview Type lookup on Section__c (deprecated
+
+    2026-05-20 for exactly this reason).'
+- title: Section_Interview_Type__c — Kind Of Object
+  keywords:
+  - section
+  - interview
+  - type
+  text: "- Custom object, Internal Interview (screening/assessment) domain.\n  Configuration\
+    \ data - created when admins wire sections to types.\n- JUNCTION with TWO MASTER-DETAIL\
+    \ parents: Interview_Type__c and\n  Section__c. Sharing is \"Controlled By Parent\"\
+    ; deleting either parent\n  deletes the junction row.\n- 3 custom fields, 0\
+    \ record types, 0 validation rules, 1 list view.\n- Auto-number Name in the\
+    \ format SIT-{00000} (label \"Section Interview\n  Type ID\") - users never\
+    \ read these names.\n- No Lightning record page of its own; it surfaces as related\
+    \ lists on the\n  two parents.\n- Scale: 6 records in preprod."
+- title: Section_Interview_Type__c — How It Is Used — The Business Process
+  keywords:
+  - section
+  - interview
+  - type
+  text: "STEP 1 - WIRING. Junction rows are created by the guided admin flows, not\n\
+    \  by hand: Add_Section_Flow creates one row per interview type the new\n  section\
+    \ is attached to (looping over the admin's selections), and\n  Add_Interview_Type_Flow\
+    \ can create rows when a new type is given its\n  sections. The Sequence number\
+    \ recorded on each row defines the section's\n  position in that type's running\
+    \ order.\nSTEP 2 - RESOLUTION AT INTERVIEW TIME. When an internal interview\
+    \ of a\n  given type is conducted, Internal_Interview_Conduct_Interview reads\
+    \ the\n  type's junction rows (section + sequence) to build the ordered list\
+    \ of\n  sections to run.\nSTEP 3 - RE-WIRING. Attaching an existing section\
+    \ to another type just\n  means another junction row with its own sequence;\
+    \ removing it means\n  deleting the row - the section itself is untouched."
+- title: Section_Interview_Type__c — Connected Objects
+  keywords:
+  - section
+  - interview
+  - type
+  - each
+  - relationship
+  - means
+  text: "PARENTS (both master-detail, both required):\n- Interview_Type__c (via\
+    \ Interview_Type__c): the internal interview type\n  whose playlist this row\
+    \ belongs to. Child relationship:\n  Section_Interview_Types.\n- Section__c\
+    \ (via Section__c): the section being scheduled as one step of\n  that playlist.\
+    \ Child relationship: Section_Interview_Types.\n\nNothing points at Section_Interview_Type__c\
+    \ - it is a leaf junction."
+- title: Section_Interview_Type__c — Business Rules
+  keywords:
+  - section
+  - interview
+  - type
+  - validation
+  text: 'None. Nothing prevents duplicate section-type pairs or clashing sequence
+
+    numbers except the guided flows themselves.'
+- title: Section_Interview_Type__c — Automation
+  keywords:
+  - section
+  - interview
+  - type
+  - runs
+  text: "- Add_Section_Flow (ACTIVE screen flow) - creates junction rows (and looks\n\
+    \  existing ones up) when a section is created and attached to types.\n- Add_Interview_Type_Flow\
+    \ (ACTIVE screen flow) - can create junction rows\n  when a new interview type\
+    \ is set up with sections.\n- Internal_Interview_Conduct_Interview (ACTIVE screen\
+    \ flow) - READS the\n  rows (Interview Type, Section, Sequence) to order the\
+    \ sections of a\n  running internal interview.\nNo record-triggered flows, no\
+    \ Apex, no scheduled jobs."
+- title: AI_Assignment_Logs__c — What This Object Is
+  keywords:
+  - assignment
+  - logs
+  text: 'AI_Assignment_Logs__c is the AUDIT LOG of the COMPASS AI support-person
+
+    assignment engine. Every time the AI assignment machinery runs - the nightly
+
+    batch, the manual "run the assignment now" launcher, or one of the human
+
+    override buttons on an Interview record (Reassignment, Reshuffle, Rollback,
+
+    PSP/Preferred Support Person) - a row is created here recording WHO initiated
+
+    it, WHEN, WHY (a reason picklist for the override buttons), and WHAT the
+
+    external AWS service answered (the raw HTTP response body and status code).
+
+
+    One record = one run/click of one of those actions. The object does not hold
+
+    the assignment DECISION itself - the decision (which employee supports which
+
+    interview) lands on Interview__c (Interview_Support_Person__c and the Group
+    J
+
+    AI fields of the Interview section). This object only proves the run happened
+
+    and keeps the API evidence, so the team can answer "who reassigned this
+
+    interview, when, why, and what did the engine say back?".'
+- title: AI_Assignment_Logs__c — What This Object Is (2)
+  keywords:
+  - assignment
+  - logs
+  text: 'The design is unusual: instead of a generic "log type" picklist plus shared
+
+    columns, the object has a SEPARATE column set per action type (scheduler run
+
+    fields, manual run fields, reassignment fields, reshuffle fields, rollback
+
+    fields, preferred-support-person fields, Compass-R fields). Each flow fills
+
+    only its own columns and leaves the rest blank, and one list view per action
+
+    type filters the rows. That is why 45 fields exist for such a simple object
+
+    and why any single row is mostly empty.'
+- title: AI_Assignment_Logs__c — Kind Of Object
+  keywords:
+  - assignment
+  - logs
+  text: "- Custom object, part of the Interviewing / AI-assignment (COMPASS) domain.\n\
+    - Standalone object with its own owner (not master-detail). Org-wide default\n\
+    \  sharing is Public Read/Write; the security-model design treats it as an\n\
+    \  audit trail that should be read-only for most users.\n- 45 custom fields,\
+    \ 0 record types, 0 validation rules, 7 list views (one\n  \"All\" view plus\
+    \ one view per action type: Compass R scheduler, Main AI\n  Assignment scheduler,\
+    \ Manual Main AI Assignment, Preferred Support Person,\n  Reassignment, Reshuffle).\n\
+    - Auto-number Name in the format AI-XXXXX.\n- Access is granted by the AI_Interview_Operations\
+    \ permission set (create/\n  read/edit/delete), AI_Reassignment_Button (create/edit)\
+    \ and Jenkins_CICD\n  (full incl. View All/Modify All). Its tab shows in the\
+    \ Techsara Solutions\n  and Training Module apps.\n- Scale: only 7 records in\
+    \ preprod (Jul 29 - Aug 11, 2026). The object and\n  its buttons are brand new\
+    \ and barely used yet."
+- title: AI_Assignment_Logs__c — Record Types
+  keywords:
+  - assignment
+  - logs
+  text: 'None. The object has no record types - the per-action column sets and list
+
+    views play that role instead.'
+- title: AI_Assignment_Logs__c — How It Is Used — The Business Process
+  keywords:
+  - assignment
+  - logs
+  text: "Background: the external COMPASS AI engine (AWS API Gateway/Lambda, called\n\
+    through named-credential External Services) assigns an internal employee\n(Interview_Support_Person__c)\
+    \ to each upcoming interview. Users never edit\nthis log by hand - every row\
+    \ is created by one of six flows, all tied to the\nAI machinery. All the entry\
+    \ points are gated on the Run_AI_Interview_\nAssignment custom permission.\n\
+    \nWAYS A LOG ROW GETS CREATED:\n\na) NIGHTLY BATCH (planned, not live). The\
+    \ scheduled flow Interview_Main_AI_\n   Assignment_Schedular is meant to run\
+    \ daily at 20:00 UTC: it collects\n   unassigned upcoming interviews, calls\
+    \ the AWS engine through the\n   ScheduledCalloutMaster Apex action, then emails\
+    \ + Slacks a summary and\n   writes a log row (scheduler run by/on fields).\
+    \ THIS FLOW IS STILL DRAFT\n   in preprod - it has never run and its columns\
+    \ are empty on all rows."
+- title: AI_Assignment_Logs__c — How It Is Used — The Business Process (2)
+  keywords:
+  - assignment
+  - logs
+  text: "b) MANUAL \"RUN NOW\" LAUNCHER. The active screen flow Main_AI_Assignment_\n\
+    \   Launcher_Flow is embedded on the \"Main AI Assignment\" app page (Techsara\n\
+    \   Solutions app; page visibility gated on Run_AI_Interview_Assignment).\n\
+    \   An operator opens the page, the flow shows the eligible interviews\n   (upcoming,\
+    \ right status, request raised), calls the AWS \"Main AI Assign\n   Callout\"\
+    \ external service, and logs the run: who ran it, when, the raw\n   response\
+    \ and the HTTP status code. The same app page also embeds the\n   Compass_R\
+    \ flow (still Draft) and six list-view cards - one per action\n   type of this\
+    \ object - so the page doubles as the AI-operations console.\n\nc) REASSIGNMENT\
+    \ BUTTON. On an Interview record, an authorized user clicks\n   \"Reassignment\"\
+    \ (quick action -> screen flow Reassignment, active). The\n   user picks a reason\
+    \ from a picklist, the flow calls the AWS Reassignment\n   external service\
+    \ (the engine picks a replacement support person), and a\n   log row records:\
+    \ the interview (Interview_ID__c), the support person who\n   was replaced (Last_Support_Person1__c),\
+    \ who clicked, when, the reason,\n   the raw response body and status code."
+- title: AI_Assignment_Logs__c — How It Is Used — The Business Process (3)
+  keywords:
+  - assignment
+  - logs
+  text: "d) RESHUFFLE BUTTON. Quick action -> screen flow Interview_Reshuffle\n\
+    \   (active). Reshuffle re-runs the assignment across the day's interviews\n\
+    \   (rebalancing several assignments, not just one). Logs initiator, time,\n\
+    \   reason, response body, status code. Never used yet in preprod data.\n\n\
+    e) ROLLBACK BUTTON. Quick action -> screen flow Interview_Roll_Back\n   (active).\
+    \ Undoes the last assignment run by calling the AWS Rollback\n   service. Logs\
+    \ initiator, run time and the raw response. Never used yet.\n\nf) PSP (PREFERRED\
+    \ SUPPORT PERSON) BUTTON. Quick action -> screen flow\n   Interview_Preferred_Support_Person.\
+    \ The user nominates a preferred\n   employee (the flow checks the employee\
+    \ is Active_For_Interview_Support__c\n   on Recruiter__c) and the engine is\
+    \ told to honor that preference. Logs\n   initiator, time, the interview's round/round-type\
+    \ text and the previous\n   support person. NOTE: this flow's latest version\
+    \ is marked Obsolete\n   (deactivated) in this snapshot even though the PSP\
+    \ button is still on two\n   Interview record pages and one row was logged on\
+    \ Jul 29, 2026 - verify\n   with team whether PSP is currently enabled."
+- title: AI_Assignment_Logs__c — How It Is Used — The Business Process (4)
+  keywords:
+  - assignment
+  - logs
+  text: 'READING THE LOG. Ops and admins read the rows through the 7 list views
+    (or
+
+    the list-view cards on the Main AI Assignment page) to monitor whether runs
+
+    succeeded (status code 200) and to trace who triggered overrides. Nothing
+
+    downstream consumes the log - no flow, Apex, or report automation reads it
+
+    back; it exists purely as evidence.'
+- title: AI_Assignment_Logs__c — Connected Objects
+  keywords:
+  - assignment
+  - logs
+  - each
+  - relationship
+  - means
+  text: 'All relationships are optional lookups; a row only fills the ones its action
+
+    type needs.'
+- title: AI_Assignment_Logs__c — Connected Objects (2)
+  keywords:
+  - assignment
+  - logs
+  - each
+  - relationship
+  - means
+  text: "- Interview__c via Interview_ID__c (label \"Interview ID\"): the interview\
+    \ the\n  logged action was about. This is the lookup ACTUALLY IN USE - the active\n\
+    \  Reassignment flow writes it (populated on 5 of 7 rows).\n- Interview__c via\
+    \ Interview__c (label \"Interview\"): a second, later-added\n  lookup to the\
+    \ same object. No current flow writes it and it is empty on\n  every row. (The\
+    \ approved Interview section describes Interview_ID__c as\n  the legacy one\
+    \ of the pair; in the actual data the roles are reversed -\n  Interview_ID__c\
+    \ carries the data, Interview__c is unused.)\n- Account via Candidate_Interview_Change__c:\
+    \ intended link to the candidate\n  (Person Account) whose interview assignment\
+    \ changed; surfaced as a related\n  list on the Account layout but never populated\
+    \ (no flow writes it).\n- Recruiter__c (\"Employee\") via Last_Support_Person1__c:\
+    \ the employee who\n  WAS the support person before the change (Reassignment\
+    \ and PSP flows).\n- User via Last_Support_Person__c: unused User-based twin\
+    \ of the above.\n- User via Reassignment_Initiated_By__c / Reshuffle_Initiated_By__c\
+    \ /\n  Rollback_Initiated_By__c / preferred_support_person_initiated_by__c /\n\
+    \  Main_AI_Assignment_scheduler_run_by__c /\n  Manual_Main_AI_Assignment_Flow_run_by__c:\
+    \ the internal user who triggered\n  each action type (one \"who\" field per\
+    \ action).\n- Recruiter__c via Reassignment_by__c / Manual_Main_AI_Assignment_run_by__c\
+    \ /"
+- title: AI_Assignment_Logs__c — Connected Objects (3)
+  keywords:
+  - assignment
+  - logs
+  - each
+  - relationship
+  - means
+  text: "Main_AI_Assignment_scheduler_run_by_old__c / Compass_R_scheduler_run_by__c:\n\
+    \  older Employee-lookup variants of those same \"who\" fields; none are\n \
+    \ written by the current flows (all empty).\n\nNo object looks up to AI_Assignment_Logs__c\
+    \ - it is a leaf/audit object."
+- title: AI_Assignment_Logs__c — Business Rules
+  keywords:
+  - assignment
+  - logs
+  - validation
+  text: 'None. Rows are only ever created by system flows, so no user-facing
+
+    validation was built.'
+- title: AI_Assignment_Logs__c — Automation
+  keywords:
+  - assignment
+  - logs
+  - runs
+  text: "Nothing triggers ON this object - no record-triggered flows, no Apex trigger,\n\
+    and no Apex class references it at all. It is purely a WRITE TARGET of six\n\
+    flows (each creates a row as part of its run):\n\n- Interview_Main_AI_Assignment_Schedular\
+    \ (Scheduled flow, DRAFT - not\n  running): daily nightly-batch launcher; would\
+    \ write the \"Main AI\n  Assignment scheduler\" columns and send a Slack + email\
+    \ summary.\n- Main_AI_Assignment_Launcher_Flow (Screen flow, Active; embedded\
+    \ on the\n  Main AI Assignment app page): manual batch run; writes the \"Manual\
+    \ Main\n  AI Assignment\" columns.\n- Reassignment (Screen flow, Active; \"\
+    Reassignment\" quick action on the\n  Interview record pages): writes the Reassignment\
+    \ columns plus\n  Interview_ID__c and Last_Support_Person1__c.\n- Interview_Reshuffle\
+    \ (Screen flow, Active; \"Reshuffle\" quick action):\n  writes the Reshuffle\
+    \ columns.\n- Interview_Roll_Back (Screen flow, Active; \"Rollback\" quick action):\n\
+    \  writes the Rollback columns.\n- Interview_Preferred_Support_Person (Screen\
+    \ flow, marked Obsolete in this\n  snapshot; \"PSP\" quick action): writes the\
+    \ preferred-support-person\n  columns plus Round__c, Round_Info__c and Last_Support_Person1__c.\n\
+    \nThe Compass_R screen flow (Draft, also embedded on the Main AI Assignment\n\
+    page) calls the shared HttpCalloutGeneric Apex but does NOT yet write a log\n\
+    row - the Compass_R_scheduler_* columns wait for it to be finished."
+- title: AI_Assignment_Logs__c — Automation (2)
+  keywords:
+  - assignment
+  - logs
+  - runs
+  text: 'There are no quick actions on AI_Assignment_Logs__c itself; all the buttons
+
+    live on Interview__c and on the Main AI Assignment app page.'
+- title: Interview_Incentive_Configuration__mdt — What This Object Is
+  keywords:
+  - interview
+  - incentive
+  - configuration
+  - mdt
+  text: 'Interview_Incentive_Configuration__mdt is the RATE CARD of the interview
+
+    support incentive framework - a small configuration table with exactly one
+
+    row per interview round (Initial, First, Second ... Fifteenth, Final) that
+
+    says, for that round: the round multiplier (how much a completed supported
+
+    interview of that round weighs), whether the round is incentivized at all,
+
+    and the positive/negative incentive rates.
+
+
+    It exists so admins can tune the incentive economics WITHOUT editing formula
+
+    fields or redeploying code: the incentive flow on Interview__c looks up the
+
+    row matching the interview''s round and stamps the configured multiplier onto
+
+    the interview, replacing the older hard-coded Round_Multiplier__c formula.
+
+    See the Interview__c section, Group K, for how the multiplier flows into
+
+    Weighted Credit and the final incentive amount for the support person.'
+- title: Interview_Incentive_Configuration__mdt — Kind Of Object
+  keywords:
+  - interview
+  - incentive
+  - configuration
+  - mdt
+  text: "- CUSTOM METADATA TYPE (__mdt), not a data object: its 17 rows are\n  configuration\
+    \ records that deploy with the metadata (they live as files\n  under customMetadata/\
+    \ in the repo), survive sandbox refreshes, and are\n  edited in Setup > Custom\
+    \ Metadata Types - not through tabs, imports or\n  normal record CRUD. There\
+    \ is no OwnerId, no sharing, no reports.\n- 5 custom fields, 0 record types,\
+    \ 0 validation rules, 0 list views.\n- Visibility: Public (any code/flow in\
+    \ the org can read it).\n- Referenced by exactly one piece of automation (the\
+    \ incentive flow below);\n  no Apex class reads it."
+- title: Interview_Incentive_Configuration__mdt — Record Types
+  keywords:
+  - interview
+  - incentive
+  - configuration
+  - mdt
+  text: 'None. Custom metadata types do not use record types; each row is simply
+    one
+
+    round''s configuration.'
+- title: Interview_Incentive_Configuration__mdt — How It Is Used — The Business
+    Process
+  keywords:
+  - interview
+  - incentive
+  - configuration
+  - mdt
+  text: "STEP 1 - CONFIGURATION. An admin maintains one row per round value of\n\
+    \  Interview__c.Round__c (17 rows: Initial through Fifteenth plus Final).\n\
+    \  Each row carries the multiplier and rates for that round. Changing a rate\n\
+    \  is a config edit (or a source-file change deployed via the pipeline) - no\n\
+    \  formula or flow edit needed.\n\nSTEP 2 - CONSUMPTION AT INTERVIEW COMPLETION.\
+    \ When an Interview__c record\n  is updated to Interview_Status__c = \"Completed\"\
+    , the record-triggered\n  before-save flow Interview_Incentive_Calculation_Framework\
+    \ runs on the\n  interview: it fetches the single mdt row where Interview_Round__c\
+    \ equals\n  the interview's Round__c, then stamps that row's Round_Multiplier__c\
+    \ into\n  Interview__c.Round_Multiplier_New__c and sets Incentive_Calculated_On__c\n\
+    \  to now. (If no row matches the round, the multiplier is left unchanged.)\n\
+    \nSTEP 3 - DOWNSTREAM MATH ON THE INTERVIEW. Formula fields on Interview__c\n\
+    \  take over: Weighted_Credit__c = Base_Credit (from duration) x the stamped\n\
+    \  multiplier; Incentive_Type_Formula__c classifies the outcome (Positive\n\
+    \  for Moved to Next Round / Offer Received, Negative for Rejected /\n  Ghosted);\
+    \ Incentive_Amount_Formula__c = weighted credit x rate. So a\n  higher-round\
+    \ interview earns proportionally more credit - and Initial\n  calls earn nothing\
+    \ (multiplier 0)."
+- title: Interview_Incentive_Configuration__mdt — How It Is Used — The Business
+    Process (2)
+  keywords:
+  - interview
+  - incentive
+  - configuration
+  - mdt
+  text: "IMPORTANT NUANCE - ONLY THE MULTIPLIER IS WIRED UP TODAY. The flow reads\n\
+    \  ONLY Round_Multiplier__c. The Positive/Negative rate fields and the\n  Incentivized\
+    \ checkbox are defined and filled in, but no flow or Apex\n  reads them yet:\
+    \ the live +400/-100 rates are still HARD-CODED in the\n  Interview__c formula\
+    \ Incentive_Rate_Applied_Formula__c (the mdt rows\n  mirror those same numbers),\
+    \ and \"Initial is not incentivized\" is\n  effectively enforced by its multiplier\
+    \ of 0 rather than by the checkbox.\n  Changing a rate in the mdt alone would\
+    \ therefore NOT change payouts today\n  - the formula would need to be rewired\
+    \ first (verify with team before\n  relying on rate edits)."
+- title: Interview_Incentive_Configuration__mdt — Connected Objects
+  keywords:
+  - interview
+  - incentive
+  - configuration
+  - mdt
+  text: 'None - the type has no relationship fields. Its only connection is BY VALUE:
+
+    Interview_Round__c holds the same values as the Interview__c.Round__c
+
+    picklist, and the incentive flow joins the two by simple equality at run
+
+    time. Its output lands on Interview__c (Round_Multiplier_New__c and
+
+    Incentive_Calculated_On__c).'
+- title: Interview_Incentive_Configuration__mdt — Business Rules
+  keywords:
+  - interview
+  - incentive
+  - configuration
+  - mdt
+  - validation
+  text: 'None. Integrity (one row per round, rates in sensible ranges) is maintained
+
+    by admin discipline, not by validation.'
+- title: Interview_Incentive_Configuration__mdt — Automation
+  keywords:
+  - interview
+  - incentive
+  - configuration
+  - mdt
+  - runs
+  text: "Custom metadata cannot have triggers or record-triggered flows. This type\
+    \ is\nonly READ, by exactly one consumer:\n\n- Interview_Incentive_Calculation_Framework\
+    \ (record-triggered flow on\n  Interview__c, before save, on update, entry condition\
+    \ Interview_Status__c\n  = \"Completed\", Active): gets the row matching the\
+    \ interview's round and\n  stamps Round_Multiplier_New__c + Incentive_Calculated_On__c\
+    \ on the\n  interview.\n\nNo Apex class, no other flow, and no report reads\
+    \ it. (The +400/-100 rate\nfields are not yet consumed by anything - see part\
+    \ 4.)"

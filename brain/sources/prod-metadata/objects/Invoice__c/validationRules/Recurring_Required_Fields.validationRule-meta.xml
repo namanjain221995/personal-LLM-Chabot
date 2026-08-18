@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ValidationRule xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Recurring_Required_Fields</fullName>
+    <active>false</active>
+    <description>Ensures recurring invoices have all required fields</description>
+    <errorConditionFormula>AND(
+    ISPICKVAL(Type__c, &quot;Recurring&quot;),
+    OR(
+        ISBLANK(Recurring_Template_Name__c),
+        ISBLANK(Recurring_Amount__c),
+        ISPICKVAL(Frequency__c, &quot;&quot;),
+        ISBLANK(Recurring_Start_Date__c)
+    )
+)</errorConditionFormula>
+    <errorMessage>Recurring invoices require Template Name, Amount, Frequency, and Start Date</errorMessage>
+</ValidationRule>

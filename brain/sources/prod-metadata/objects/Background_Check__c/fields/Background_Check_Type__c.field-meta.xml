@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Background_Check_Type__c</fullName>
+    <label>Verification Type</label>
+    <required>false</required>
+    <trackFeedHistory>false</trackFeedHistory>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>MultiselectPicklist</type>
+    <valueSet>
+        <restricted>true</restricted>
+        <valueSetDefinition>
+            <sorted>false</sorted>
+            <value>
+                <fullName>Background Verification</fullName>
+                <default>false</default>
+                <label>Background Verification</label>
+            </value>
+            <value>
+                <fullName>I9 Verification</fullName>
+                <default>false</default>
+                <label>I9 Verification</label>
+            </value>
+            <value>
+                <fullName>Visa Assessment</fullName>
+                <default>false</default>
+                <label>Visa Assessment</label>
+            </value>
+        </valueSetDefinition>
+    </valueSet>
+    <visibleLines>4</visibleLines>
+</CustomField>

@@ -28,6 +28,22 @@ from .auth import UserRow, require_user
 
 router = APIRouter(prefix="/history", tags=["history"])
 
+
+def _cancel_pending_clarification(conversation_id: str) -> None:
+    """Close any question this conversation is waiting on. Never raises.
+
+    Best-effort on purpose: the caller has already committed the change the
+    user asked for, and failing their request because a side table would not
+    close a row is the wrong trade. The next Salesforce turn cancels a stale
+    question anyway (main.py) — this just makes it immediate.
+    """
+    try:
+        if db.cancel_sf_clarifications(conversation_id):
+            db.close_sf_intents(conversation_id, "cancelled")
+    except Exception:  # noqa: BLE001 — a side table must not fail the request
+        pass
+
+
 # Client-supplied conversation ids (the frontend uses its own uuids).
 _CONVERSATION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _MAX_TITLE_LENGTH = 200
@@ -251,6 +267,12 @@ def truncate_messages(
     # The stored summary describes turns that no longer exist, so keeping it
     # would let the model assert things the user just removed.
     db.clear_summary(conversation_id)
+    # So does a question the user was being asked. Its card lived on one of the
+    # removed turns, so nothing can answer it any more — and because only ONE
+    # clarification may be pending per conversation (a partial unique index),
+    # an unanswerable one left open does not merely go stale: it silently
+    # blocks every future question in this chat.
+    _cancel_pending_clarification(conversation_id)
     return result
 
 

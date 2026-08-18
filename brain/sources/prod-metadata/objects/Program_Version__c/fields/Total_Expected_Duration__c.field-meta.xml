@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Total_Expected_Duration__c</fullName>
+    <label>Total Expected Duration</label>
+    <summarizedField>StepTemplate__c.Expected_Duration_Min__c</summarizedField>
+    <summaryForeignKey>StepTemplate__c.Program_Version__c</summaryForeignKey>
+    <summaryOperation>sum</summaryOperation>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Summary</type>
+</CustomField>

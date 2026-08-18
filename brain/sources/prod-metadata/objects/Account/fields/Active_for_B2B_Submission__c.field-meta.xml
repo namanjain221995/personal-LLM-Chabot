@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Active_for_B2B_Submission__c</fullName>
+    <defaultValue>false</defaultValue>
+    <description>Indicates candidate is currently active and available to be submitted for B2B client job requirements. Submit flow checks this field.</description>
+    <inlineHelpText>Check when candidate is actively looking and available for B2B job submissions. Uncheck when candidate is placed or unavailable.</inlineHelpText>
+    <label>Active for B2B Submission</label>
+    <trackFeedHistory>false</trackFeedHistory>
+    <trackHistory>false</trackHistory>
+    <type>Checkbox</type>
+</CustomField>

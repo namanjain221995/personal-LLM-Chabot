@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Converted_to_Job_Requirement__c</fullName>
+    <defaultValue>false</defaultValue>
+    <description>Indicates whether a Job Requirement has been created after this lead was qualified and converted to a Client Account.</description>
+    <inlineHelpText>Check this box after you have created the Job Requirement record for this client. Helps track which B2B leads have been fully processed.</inlineHelpText>
+    <label>Converted to Job Requirement</label>
+    <trackFeedHistory>false</trackFeedHistory>
+    <trackHistory>false</trackHistory>
+    <type>Checkbox</type>
+</CustomField>

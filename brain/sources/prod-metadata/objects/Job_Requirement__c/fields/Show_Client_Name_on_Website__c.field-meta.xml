@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Show_Client_Name_on_Website__c</fullName>
+    <defaultValue>false</defaultValue>
+    <description>Controls whether client name is shown on website job listing. Overridden by Confidential Client flag on Account — confidential clients are always hidden.</description>
+    <inlineHelpText>Check to show client name on website. If Confidential Client is checked on the Account, client name will NEVER show regardless of this setting.</inlineHelpText>
+    <label>Show Client Name on Website</label>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Checkbox</type>
+</CustomField>

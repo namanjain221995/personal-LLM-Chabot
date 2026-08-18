@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Interview_Type__c</fullName>
+    <deleteConstraint>SetNull</deleteConstraint>
+    <description>DEPRECATED 2026-05-20. Replaced by Section_Interview_Type__c junction so one Section can serve multiple Interview Types. Still read by Internal_Interview_Conduct_Interview flow until flow rework completes. Do not use in new flows.</description>
+    <inlineHelpText>DEPRECATED - do not use. Add Section Interview Type junction rows instead.</inlineHelpText>
+    <label>Interview Type (DEPRECATED - do not use)</label>
+    <referenceTo>Interview_Type__c</referenceTo>
+    <relationshipLabel>Sections</relationshipLabel>
+    <relationshipName>Sections</relationshipName>
+    <required>false</required>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Lookup</type>
+</CustomField>

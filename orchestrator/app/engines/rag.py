@@ -212,6 +212,20 @@ def _answer_messages(message: str, hits: Sequence[dict], history: Sequence[dict]
         "records. Cite the record IDs you rely on in square brackets, e.g. "
         "[001xx000003DGbY]. If the records do not contain the answer, say so."
     )
+    # Brain knowledge: process questions ("how does the recurring plan
+    # work?") route here, and no CRM record contains that answer — the
+    # Salesforce team's documentation packs do (core/brain.py).
+    from ..core import brain
+
+    notes = brain.knowledge_for(message)
+    if notes:
+        system += (
+            "\n\nInternal documentation is provided below. Use it to interpret "
+            "the records and to answer questions about how this org's "
+            "processes work, even when no record contains the answer. Never "
+            "invent a record citation for something the documentation said.\n\n"
+            + notes
+        )
     user = f"Records:\n{_context_block(hits)}\n\nQuestion: {message}"
     return [{"role": "system", "content": system + DIAGRAM_INSTRUCTION}] + recent_turns(history, 6) + [
         {"role": "user", "content": user}

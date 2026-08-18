@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Summary__c</fullName>
+    <externalId>false</externalId>
+    <formula>Candidate__r.FirstName &amp; &quot; &quot; &amp; Candidate__r.LastName &amp; &quot; - &quot; &amp; TEXT(Stage__c) &amp; &quot; - &quot; &amp; Interview__r.company_new__r.Name</formula>
+    <formulaTreatBlanksAs>BlankAsZero</formulaTreatBlanksAs>
+    <label>Summary</label>
+    <required>false</required>
+    <trackHistory>false</trackHistory>
+    <trackTrending>false</trackTrending>
+    <type>Text</type>
+    <unique>false</unique>
+</CustomField>

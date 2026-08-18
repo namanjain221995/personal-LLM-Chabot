@@ -1,0 +1,1240 @@
+================================================================================
+DOCUSIGN + SALESFORCE INTEGRATION — KNOWLEDGE AND TRAINING REFERENCE FILE
+Organization: Techsara Solutions Inc.
+Environment: Salesforce Sandbox Dev9 / DocuSign Sandbox demo.docusign.net
+Package: DocuSign Apps Launcher (DAL) v7.11.1
+Last Updated: Based on implementation session June–August 2026
+================================================================================
+
+
+OVERVIEW
+
+This integration connects Salesforce (sandbox org Dev9) to DocuSign
+(demo.docusign.net) using the DocuSign Apps Launcher (DAL) managed package
+v7.11.1. It automates the generation, sending, signing, and writeback of two
+agreement documents in the candidate onboarding lifecycle at Techsara Solutions
+Inc.: the Employment Placement Services Agreement and the combined ACH
+Authorization Form + Promissory Note.
+
+Documents are generated from Salesforce records using DocuSign Gen Templates,
+which pull Salesforce field data into a Word document via anchor text tags. The
+generated PDF is immediately sent for electronic signature through a linked
+Envelope Template that defines the recipient chain, signing order, ID
+verification, field placements, and Salesforce writeback rules.
+
+When signing is complete, the signed PDF and Certificate of Completion are
+automatically saved back to the originating Salesforce record. Salesforce fields
+(checkbox and picklist) are updated at key envelope event milestones via Field
+Value Updates defined inside each Envelope Template. Lightning Dynamic Actions
+and Salesforce Validation Rules enforce business rules around when buttons are
+visible and when record stages can advance.
+
+
+KEY CONCEPTS / GLOSSARY
+
+DocuSign Gen Template
+- A Salesforce-side configuration that maps a Word (.docx) document to
+  Salesforce object fields using anchor text XML tags.
+- Generates a populated PDF from live Salesforce record data when a user clicks
+  a button on a Salesforce record page.
+- Cannot be exported/imported between orgs or environments; must be recreated
+  manually in each environment.
+
+DocuSign Envelope Template
+- A reusable DocuSign-side configuration that defines recipients, signing order,
+  email subject/message, field placements (tabs), ID verification, document
+  writeback settings, and Field Value Updates.
+- Can be exported from one DocuSign account and imported into another.
+- When linked to a Gen Template via "Launch automatically after generation," it
+  is applied automatically after document generation without sender input.
+
+Envelope
+- A DocuSign container holding one or more documents, recipients, and status
+  information. Each send creates one envelope.
+- Envelope statuses used in this integration: Sent, Completed, Voided, Declined,
+  Authentication Failed.
+
+Tab (Field)
+- A DocuSign term for a field placed on a document in the tagger (Place Fields
+  step). Types used: Text, Signature, Name, Date Signed, Dropdown, Checkbox.
+- Each tab can have validation (custom regex), Required flag, Read Only flag,
+  Collaborative flag, and Data Label.
+
+Merge Field
+- A tab configured in the "Add and Manage Merge Fields" step of an Envelope
+  Template. Maps a Salesforce field as the source of a pre-populated value in
+  the document. Can have Allow Writeback to Salesforce enabled so that a
+  signer-entered value is written back to Salesforce on envelope completion.
+
+Anchor Text
+- An XML tag embedded inside the Word document body (not visible to readers)
+  that tells DocuSign Gen where to inject a Salesforce field value during
+  document generation.
+- Format: <# <Content Select="/ObjectAPIName__c/FieldAPIName"/> #>
+- For relationship fields: <# <Content Select="/Object__c/LookupField__r.ChildField"/> #>
+
+DocuSign Connect (Webhook)
+- A push service that sends real-time event notifications to an external URL
+  when envelope status changes. In this integration, the DAL manages a Connect
+  configuration called "DocuSign Apps Launcher" that updates Salesforce envelope
+  and recipient status records when events occur.
+
+Field Value Update
+- A setting inside an Envelope Template's Options step that maps a DocuSign
+  envelope event (Sent, Signed/Completed, Voided, Declined) to a Salesforce
+  field update on the source object. Executes automatically when the event fires.
+
+Sending Experience
+- A setting in the Envelope Template Options step controlling what the sender
+  sees after clicking the send button. Values: Default (all stages shown), Quick
+  Send (recipients only), Place Fields, Send Now (no stages, sends immediately).
+- This integration uses Send Now on both Envelope Templates to eliminate all
+  manual stages.
+
+ID Verification
+- A DocuSign feature configured per recipient in the Envelope Template that
+  requires the recipient to verify their identity before accessing the document.
+- Services Agreement uses: DocuSign ID Verification.
+- ACH + Promissory Note uses: DocuSign ID Verification with Liveness.
+
+Collaborative Field
+- A tab property enabling multiple recipients to edit the same field. Used in
+  the ACH + Promissory Envelope Template to allow CS Person to correct values
+  filled by Candidate without voiding the envelope.
+- Related settings: Recipients Can Collaborate, Changes Require Initials,
+  Required for Selected Signers.
+
+Document Writeback
+- A setting in the Envelope Template Options step that saves the signed,
+  completed PDF (and optionally the Certificate of Completion) back to the
+  originating Salesforce record's Files section when the envelope is completed.
+
+Certificate of Completion (COC)
+- A DocuSign-generated audit document listing all signing events, timestamps,
+  IP addresses, and authentication results. Saved alongside the signed PDF.
+
+Signing Group
+- A DocuSign Admin-defined group of users where any single member can sign on
+  behalf of the group. Used (or planned) for the Offer Letter template so that
+  an authorized delegate can sign instead of the CEO directly.
+
+Dynamic Actions
+- A Salesforce Lightning App Builder feature that applies conditional visibility
+  rules to buttons on a record page. Used in this integration to control when
+  each send button is visible based on record field values.
+
+Onboarding__c
+- Salesforce custom object. Source object for the Services Agreement Gen
+  Template and Envelope Template.
+- Key fields: Account__c (Lookup to Person Account / Candidate),
+  Service_Agreement_Sent__c (Checkbox), Service_Agreement_Signed__c (Checkbox),
+  Status__c (Picklist).
+
+Background_Check__c
+- Salesforce custom object. Source object for the ACH + Promissory Gen Template
+  and Envelope Template.
+- Key fields: Candidate__c (Lookup to Person Account),
+  ACH_Authorization_Status__c (Picklist: Pending / Signed),
+  Promissory_Note_Status__c (Picklist: Pending / Signed),
+  Background_Check_Status__c (Picklist — stages listed in Business Rules).
+
+Account (Person Account)
+- Represents Candidate in Salesforce. API object name: Account.
+- Key fields: Name, PersonEmail, Phone, Current_Address__c (compound address),
+  OwnerId (Lookup to User — the Candidate's assigned CS Person).
+
+User
+- Represents the CS Person (Candidate Owner) in Salesforce.
+- Key fields: Name (API: Name), Email (API: Email, standard field — not
+  SenderEmail or EmailEncodingKey).
+
+
+ARCHITECTURE AND DATA FLOW
+
+The end-to-end flow for each document type is as follows.
+
+Services Agreement Flow:
+
+1. A Salesforce user navigates to an Onboarding__c record where
+   Background_Check_Status__c does not apply; instead the condition checked is
+   Status__c = "Service Agreement" AND Service_Agreement_Sent__c = False AND
+   Service_Agreement_Signed__c = False. When all three are true, the Lightning
+   Dynamic Action exposes the "Send Services Agreement" button.
+
+2. The user clicks "Send Services Agreement." The button was created by the
+   Gen Template and placed on the Onboarding Layout.
+
+3. The Gen Template (Service Agreement Template / Onboarding_ServicesAgreement_v1)
+   executes. It queries the Onboarding__c record and related Account__r fields
+   (Name, PersonEmail, Phone, Current_Address__c) and injects their values into
+   the Word document (Techsara Solutions Services Agreement - 2026.docx) at the
+   anchor text positions.
+
+4. A PDF is generated. Because Sending Experience = Send Now and "Launch
+   automatically after generation" is enabled, the system immediately applies
+   the linked Envelope Template (Onboarding_ServicesAgreement_Envelope_v1)
+   without any sender interaction.
+
+5. The envelope is created with two recipients:
+   - Routing 1: Candidate — name and email auto-populated from
+     {!Onboarding__c.Account__r.Name} and {!Onboarding__c.Account__r.PersonEmail}.
+     ID Verification (standard) applied.
+   - Routing 2: Techsara Authorised — name = Kunal Dhote (hardcoded), email =
+     legal@techsarasolutions.com (hardcoded). No ID Verification.
+
+6. DocuSign sends the invitation email to the Candidate. The email subject and
+   message are customized per recipient (enabled via Sending Settings: Enable
+   custom email and language for each recipient).
+
+7. When the envelope is sent, the Field Value Update fires:
+   Onboarding__c.Service_Agreement_Sent__c = True. The "Send Services Agreement"
+   button is now hidden by Dynamic Actions.
+
+8. Candidate completes ID Verification, then signs, fills the ID Type dropdown
+   and ID Number text field, and clicks Finish.
+
+9. DocuSign routes the envelope to Techsara Authorised (Kunal Dhote /
+   legal@techsarasolutions.com) for counter-signature.
+
+10. Techsara Authorised reviews the Candidate's signature and signs. On
+    completion, the Field Value Update fires:
+    Onboarding__c.Service_Agreement_Signed__c = True.
+
+11. Document Writeback saves the combined signed PDF
+    (filename: Email Subject + Envelope Status + .pdf) and the COC to the
+    Onboarding__c record's Salesforce Files section.
+
+12. The existing Validation Rule (Service_Agreement_Required_Before_Resume) now
+    allows the record Status__c to be advanced to "Resume Creation" because
+    Service_Agreement_Signed__c = True.
+
+
+ACH Authorization Form + Promissory Note Flow:
+
+1. A Salesforce user navigates to a Background_Check__c record where
+   Background_Check_Status__c = "Documents Pending" AND
+   ACH_Authorization_Status__c != "Signed" AND
+   Promissory_Note_Status__c != "Signed". When all conditions are true, the
+   Lightning Dynamic Action exposes the "Send ACH and Promissory" button.
+   Note: Both status fields default to "Pending" when the record is created;
+   "Required for Selected Signers" is OFF on collaborative fields, so CS Person
+   can clear and submit without a required-field error.
+
+2. The user clicks "Send ACH and Promissory." The button was created by the
+   Gen Template and placed on the Background Check Layout.
+
+3. The Gen Template (ACH + Promissory Notes Template /
+   BackgroundCheck_ACHPromissory_v1) executes. It queries Candidate__r.Name and
+   Candidate__r.Current_Address__c and injects them into the Word document
+   (Techsara ACH + Promissory Form template.docx) at anchor text positions.
+
+4. A PDF is generated. Sending Experience = Send Now + Launch automatically
+   links to BackgroundCheck_ACH_Promissory_Envelope_v1. No sender interaction.
+
+5. The envelope is created with three recipients:
+   - Routing 1: CS Person — name from
+     {!Background_Check__c.Candidate__r.Owner.Name}, email from
+     {!Background_Check__c.Candidate__r.Owner.Email}. Role = CS Person.
+     Action = Needs to Sign (fills text fields; no signature field is placed for
+     this recipient). No ID Verification.
+   - Routing 2: Candidate — name from
+     {!Background_Check__c.Candidate__r.Name}, email from
+     {!Background_Check__c.Candidate__r.PersonEmail}. Role = Candidate.
+     Action = Needs to Sign. ID Verification with Liveness applied.
+   - Routing 3: Techsara Authorised — name = Kunal Dhote (hardcoded), email =
+     legal@techsarasolutions.com (hardcoded). Role = Techsara Authorised.
+     Action = Needs to Sign. No ID Verification.
+
+6. CS Person receives the invitation email first. CS Person fills all financial
+   amount fields (monthly debit amount, commencement date, period in months,
+   total amount, principal sum, monthly installment, number of months, first
+   payment date) and clicks Finish. CS Person does not have a Signature field.
+
+7. DocuSign routes to Candidate. Candidate completes ID Verification with
+   Liveness, then fills all personal/bank fields (bank name, bank account number,
+   bank routing number, account type, borrower address, document type, document
+   number, SSN or last 4 digits) and signs.
+
+8. If CS Person finds that Candidate filled a wrong value: CS Person can clear
+   the field value (no required-field error because Required for Selected Signers
+   is OFF for CS Person). Because Changes Require Initials = ON, the envelope
+   automatically routes back to Candidate to review and initial the change.
+   Candidate re-fills the corrected field and the flow continues.
+
+9. On full completion, Field Value Updates fire:
+   ACH_Authorization_Status__c = Signed, Promissory_Note_Status__c = Signed.
+
+10. If voided, Field Value Updates fire:
+    ACH_Authorization_Status__c = Pending, Promissory_Note_Status__c = Pending.
+
+11. Document Writeback saves the combined signed PDF and COC to the
+    Background_Check__c record's Salesforce Files section.
+
+12. The existing Validation Rule (Require_Documents_For_Candidate_Details) now
+    allows Background_Check_Status__c to be advanced to "Candidate Details
+    Pending" because both statuses = Signed.
+
+
+TEMPLATES, RECIPIENTS AND FIELDS
+
+GEN TEMPLATE 1: Service Agreement Template
+- Internal / Salesforce name: Onboarding_ServicesAgreement_v1
+- Source Object: Onboarding__c
+- Word document uploaded: Techsara Solutions Services Agreement - 2026.docx
+- Generated File Name Suffix: Main Data Source Name
+- File Format: PDF
+- Salesforce fields mapped and anchor texts:
+  - Candidate Name: <# <Content Select="/Onboarding__c/Account__r.Name"/> #>
+  - Email: <# <Content Select="/Onboarding__c/Account__r.PersonEmail"/> #>
+  - Current Address: <# <Content Select="/Onboarding__c/Account__r.Current_Address__c"/> #>
+  - Account Phone: <# <Content Select="/Onboarding__c/Account__r.Phone"/> #>
+- Date/Currency locale: Generator's Locale; Currency: Display as symbol
+- Button Label: Send Services Agreement
+- Page Layout: Onboarding Layout
+- Post Generation: Launch automatically after generation = ON
+- Linked Envelope Template: Onboarding_ServicesAgreement_Envelope_v1
+
+
+GEN TEMPLATE 2: ACH + Promissory Notes Template
+- Internal / Salesforce name: BackgroundCheck_ACHPromissory_v1
+- Source Object: Background_Check__c
+- Word document uploaded: Techsara ACH + Promissory Form template.docx
+- Generated File Name Suffix: Main Data Source Name
+- File Format: PDF
+- Salesforce fields mapped and anchor texts:
+  - Candidate Name: <# <Content Select="/Background_Check__c/Candidate__r.Name"/> #>
+  - Current Address: <# <Content Select="/Background_Check__c/Candidate__r.Current_Address__c"/> #>
+- Button Label: Send ACH and Promissory
+- Page Layout: Background Check Layout
+- Post Generation: Launch automatically after generation = ON
+- Linked Envelope Template: BackgroundCheck_ACH_Promissory_Envelope_v1
+
+
+ENVELOPE TEMPLATE 1: Service Agreement Envelope
+- Internal / DocuSign name: Onboarding_ServicesAgreement_Envelope_v1
+- Data Source Object: Onboarding__c
+- Document: same Services Agreement Word/PDF (uploaded in template)
+- Attach documents from Salesforce record: OFF (unchecked)
+
+Recipients:
+  Recipient 1:
+  - Role: Candidate
+  - Action: Needs to Sign
+  - Routing Order: 1
+  - Name source: {!Onboarding__c.Account__r.Name}
+  - Email source: {!Onboarding__c.Account__r.PersonEmail}
+  - ID Verification: DocuSign ID Verification (standard)
+
+  Recipient 2:
+  - Role: Techsara Authorised
+  - Action: Needs to Sign
+  - Routing Order: 2
+  - Name: Kunal Dhote (hardcoded)
+  - Email: legal@techsarasolutions.com (hardcoded)
+  - ID Verification: None
+
+Email:
+  Subject: "Action Required: Please review and sign your Services Agreement
+            — Techsara Solutions Inc."
+  Message (Candidate): "Hi, Please review the attached Services Agreement from
+  Techsara Solutions Inc. and complete the electronic signature process within
+  24 hours of receiving this email. For any questions or clarifications, please
+  contact legal@techsarasolutions.com. Thank you, Techsara Solutions Inc."
+  Message (Techsara Authorised): Custom counter-signature message.
+  Per-recipient email customization: ON (requires Sending Settings flag enabled).
+
+Merge Fields: None added in this template.
+
+Place Fields — Candidate tabs:
+  - Signature (Required)
+  - Name (Required)
+  - Date Signed (Required)
+  - Dropdown: ID Type (Required; options: Passport, Driver's License, State ID)
+  - Text: ID Number (Required)
+
+Place Fields — Techsara Authorised tabs:
+  - Signature (Required)
+  - Name (Required)
+
+Options:
+  - Automatic Reminders: Do Not Remind
+  - Envelope Expires: default (not set to a specific number)
+  - Sending Experience: Send Now
+  - Document Writeback: Save completed documents to Onboarding__c record = ON
+  - Combine all documents into one PDF = ON
+  - Filename: Email Subject + Envelope Status + .pdf
+  - Save COC to Onboarding__c = ON
+
+Field Value Updates:
+  - Event: Envelope Sent -> Field: Service_Agreement_Sent__c -> Value: True
+  - Event: Envelope Signed/Completed -> Field: Service_Agreement_Signed__c -> Value: True
+
+Custom Button (Envelope Template create-button step):
+  - Page Layouts: NOT added (button is created by Gen Template, not Envelope Template)
+  - Button label in template: BackgroundCheck_ACH_Promissory_Envelope_v1
+    (internal identifier; not customer-facing)
+
+
+ENVELOPE TEMPLATE 2: ACH + Promissory Form Envelope
+- Internal / DocuSign name: BackgroundCheck_ACH_Promissory_Envelope_v1
+- Data Source Object: Background_Check__c
+- Document: Techsara ACH + Promissory Form template Word/PDF (uploaded)
+- Attach documents from Salesforce record: OFF (unchecked)
+
+Recipients:
+  Recipient 1:
+  - Role: CS Person
+  - Action: Needs to Sign
+  - Routing Order: 1
+  - Name source: {!Background_Check__c.Candidate__r.Owner.Name}
+  - Email source: {!Background_Check__c.Candidate__r.Owner.Email}
+  - Note: OwnerId on Account (Candidate) is the lookup to User. The relationship
+    name in Salesforce merge field syntax is "Owner" not "OwnerId."
+    Email API field on User is Email (standard field), not SenderEmail.
+  - ID Verification: None
+
+  Recipient 2:
+  - Role: Candidate
+  - Action: Needs to Sign
+  - Routing Order: 2
+  - Name source: {!Background_Check__c.Candidate__r.Name}
+  - Email source: {!Background_Check__c.Candidate__r.PersonEmail}
+  - Note: PersonEmail is the correct API field for a Person Account email;
+    standard Email field does not exist on Person Account.
+  - ID Verification: DocuSign ID Verification with Liveness
+
+  Recipient 3:
+  - Role: Techsara Authorised
+  - Action: Needs to Sign
+  - Routing Order: 3
+  - Name: Kunal Dhote (hardcoded)
+  - Email: legal@techsarasolutions.com (hardcoded)
+  - ID Verification: None
+
+Email:
+  Subject: "Action Required: Please sign your ACH Authorization Form and
+            Promissory Note — Techsara Solutions Inc."
+  Message (CS Person): "Hi [Owner Name], Please fill in the required financial
+  details (amounts, dates, and period) in the attached ACH Authorization Form
+  and Promissory Note for your candidate before it is sent for signature.
+  Thank you, Techsara Solutions Inc."
+  Message (Candidate): "Hi [Candidate Name], The ACH Authorization Form and
+  Promissory Note from Techsara Solutions Inc. are attached for your review and
+  electronic signature. Please complete the signing process within 24-48 hours
+  of receiving this email. If you need any assistance, please contact your POC.
+  Thank you, Techsara Solutions Inc."
+  Message (Techsara Authorised): Custom counter-signature review message.
+
+Merge Fields:
+  - Name: Candidate Name
+  - Source Object: Background Check
+  - Field path: Background_Check__c/Candidate__r.Name
+  - Allow Writeback: dependent on implementation; Read Only when used purely for
+    pre-population display.
+
+Place Fields — CS Person tabs (ACH section):
+  - Monthly debit amount (Text, Required)
+  - Commencing date (Text, Required)
+  - Period in months (Text, Required)
+  - Total amount (Text, Required)
+
+Place Fields — CS Person tabs (Promissory section):
+  - Principal sum amount (Text, Required)
+  - Monthly installment amount (Text, Required)
+  - Number of months (Text, Required)
+  - First payment date (Text, Required)
+
+Place Fields — Candidate tabs (ACH section):
+  - Bank Name (Text, Required)
+  - Bank Account Number (Text, Required, Custom regex: ^\d{6,17}$,
+    validation message: digits only, 6-17 characters)
+  - Bank Routing Number (Text, Required, Custom regex: ^\d{9}$,
+    validation message: exactly 9 digits)
+  - Account Type (Dropdown, Required, options: Checking / Savings)
+  - Signature (Required)
+  - Name (Required)
+  - Date Signed (Required)
+
+Place Fields — Candidate tabs (Promissory section):
+  - Borrower Address (Text, Required)
+  - Document Type (Text, Required)
+  - Document Number (Text, Required)
+  - SSN (Text, Required, Custom regex: ^(\d{4}|\d{3}-\d{2}-\d{4}|\d{9})$,
+    accepts last 4 digits OR full SSN with or without dashes)
+  - Signature (Required)
+  - Name (Required)
+
+Collaborative Field Settings (applied to all Candidate-filled text tabs
+above except Signature, Name, Date Signed):
+  - Recipients Can Collaborate: ON
+  - Changes Require Initials: ON
+  - Required for Selected Signers: OFF
+  - Select Collaborators: All Recipients
+  REASON: Allows CS Person to clear an incorrect value entered by Candidate,
+  route the envelope back to Candidate for correction, without triggering a
+  required-field validation error on CS Person's submit.
+
+Place Fields — Techsara Authorised tabs (ACH section):
+  - Signature (Required)
+  - Name (Required)
+
+Place Fields — Techsara Authorised tabs (Promissory section):
+  - Signature (Required)
+  - Name (Required)
+
+Options:
+  - Automatic Reminders: Do Not Remind
+  - Envelope Expires: 2 days
+  - Sending Experience: Send Now
+  - Document Writeback: Save completed documents to Background_Check__c = ON
+  - Combine all documents into one PDF = ON
+  - Filename: Email Subject + Envelope Status + .pdf
+  - Save COC to Background_Check__c = ON
+
+Field Value Updates:
+  - Event: Envelope Signed/Completed -> Field: ACH_Authorization_Status__c
+    -> Value: Signed
+  - Event: Envelope Signed/Completed -> Field: Promissory_Note_Status__c
+    -> Value: Signed
+  - Event: Envelope Voided -> Field: ACH_Authorization_Status__c
+    -> Value: Pending
+  - Event: Envelope Voided -> Field: Promissory_Note_Status__c
+    -> Value: Pending
+  NOTE: "Envelope Sent → Pending" updates were intentionally removed because
+  both fields default to Pending on record creation. Adding them was redundant
+  and caused the button to become re-visible during collaborative routing, which
+  could trigger a re-send that would void the in-progress envelope.
+
+Custom Button (created by Envelope Template create-button step):
+  - Button Label: BackgroundCheck_ACH_Promissory_Envelope_v1
+  - Page Layouts: Background Check Layout (checked during setup)
+  NOTE: The "Send ACH and Promissory" button visible to users is the button
+  created by the Gen Template, not this envelope template button. The envelope
+  template button label is an internal identifier.
+
+
+VALIDATION RULES — COMPLETE LIST
+
+Object: Onboarding__c
+
+Rule: Service_Agreement_Required_Before_Resume
+  Formula: AND(ISPICKVAL(Status__c, 'Resume Creation'), NOT(Service_Agreement_Signed__c))
+  Error: "Get the Service Agreement signed before starting on the Resume."
+  Location: Top of Page
+  WHY: Prevents advancing the record past the Service Agreement stage without a
+  confirmed signed agreement, ensuring the candidate has legally agreed to terms
+  before resume work begins.
+
+Object: Background_Check__c
+
+Rule: Require_Payment_For_Documents_Pending
+  Formula: AND(ISCHANGED(Background_Check_Status__c),
+               ISPICKVAL(Background_Check_Status__c, "Documents Pending"),
+               NOT(ISPICKVAL(Offer_Letter_Payment_Status__c, "Received")))
+  Error: "Offer Letter Payment Status must be Received before moving to
+          Documents Pending."
+  Location: Background Check Status
+
+Rule: Require_Documents_For_Candidate_Details
+  Formula: AND(ISCHANGED(Background_Check_Status__c),
+               ISPICKVAL(Background_Check_Status__c, "Candidate Details Pending"),
+               OR(NOT(ISPICKVAL(ACH_Authorization_Status__c, "Signed")),
+                  NOT(ISPICKVAL(Promissory_Note_Status__c, "Signed"))))
+  Error: "ACH Authorization and Promissory Note must both be Signed before
+          moving to Candidate Details Pending."
+  Location: Background Check Status
+
+Rule: Require_CandidateDetail_For_Verification
+  Formula: AND(ISCHANGED(Background_Check_Status__c),
+               ISPICKVAL(Background_Check_Status__c, "Verification In Progress"),
+               NOT(ISPICKVAL(Candidate_Details_Status__c, "Submitted")))
+  Error: "Candidate Details Status must be Submitted before moving to
+          Verification In Progress."
+  Location: Background Check Status
+
+Rule: Require_Project_For_Candidate_Submitted
+  Formula: AND(ISCHANGED(Candidate_Details_Status__c),
+               ISPICKVAL(Candidate_Details_Status__c, "Submitted"),
+               Background_Check_Project_Count__c = 0)
+  Error: "At least one related Background Check Employment must exist before
+          submitting Candidate Details."
+  Location: Candidate Details Status
+
+Rule: Require_Verification_For_Completed
+  Formula: AND(ISCHANGED(Background_Check_Status__c),
+               ISPICKVAL(Background_Check_Status__c, "Completed"),
+               OR(NOT(ISPICKVAL(Verification_Status__c, "Completed")),
+                  Final_Employer_Confirmation_Received__c = FALSE))
+  Error: "Verification Status must be Completed and Final Employer Confirmation
+          must be received before completing the Background Check."
+  Location: Background Check Status
+
+
+BUTTON VISIBILITY — DYNAMIC ACTIONS (LIGHTNING APP BUILDER)
+
+Button: Send Services Agreement
+Object: Onboarding__c record page
+Conditions (ALL must be true / AND logic):
+  - Service_Agreement_Sent__c Equals False
+  - Service_Agreement_Signed__c Equals False
+  - Status__c Equals "Service Agreement"
+WHY: Prevents sending the Services Agreement outside the correct lifecycle
+stage, and prevents re-sending after the agreement has already been dispatched
+or signed. The Status__c condition ensures the button only appears when the
+Onboarding record is in the right stage.
+
+Button: Send ACH and Promissory
+Object: Background_Check__c record page
+Conditions (ALL must be true / AND logic):
+  - Background_Check_Status__c Equals "Documents Pending"
+  - ACH_Authorization_Status__c Not Equal "Signed"
+  - Promissory_Note_Status__c Not Equal "Signed"
+WHY: The button is suppressed when either document has been fully signed,
+preventing duplicate envelope sends. The status stage condition restricts
+sending to only the correct point in the background check workflow. "Not Equal
+Signed" (rather than "Equals blank") is used because both fields default to
+"Pending" at record creation and would never be blank.
+
+
+RECORD STAGE PATHS
+
+Onboarding__c Status__c picklist stages (in order):
+  Welcome Call → Service Agreement → Resume Creation → Onboarding Complete
+
+Background_Check__c Background_Check_Status__c picklist stages (in order):
+  Payment Verification Pending → Documents Pending → Candidate Details Pending
+  → Verification In Progress → Complete
+
+
+DOCUSIGN ACCOUNT USERS
+
+Three users exist on the sandbox DocuSign account (demo.docusign.net):
+
+1. Sahil Patel
+   Email: sahil.patel@techsarasolutions.com
+   DocuSign Permission Profile: DS Admin
+   Salesforce connection: Active (DS Admin)
+
+2. Techsara Solutions Inc. (legal email user)
+   Email: legal@techsarasolutions.com
+   DocuSign Permission Profile: DS Admin
+   Salesforce connection: Active (DS Admin)
+
+3. Techsara Solutions Inc. (Jenish Gangani)
+   Email: jenish.gangani@techsarasolutions.com
+   DocuSign Permission Profile: DS Admin
+   Salesforce connection: Connected Salesforce user (sends all envelopes)
+
+All three users have DS Admin permission profile. Due to this, no DS Admin can
+edit another DS Admin's account details via the DocuSign portal UI.
+
+
+BUSINESS RULES AND LOGIC
+
+Rule: Services Agreement must be sent before resume creation can begin.
+Enforcement: Validation Rule Service_Agreement_Required_Before_Resume.
+WHY: Legally required that the candidate agrees to placement terms before
+Techsara begins work on their resume.
+
+Rule: Services Agreement send button is hidden once the agreement has been sent.
+Enforcement: Dynamic Actions condition Service_Agreement_Sent__c = False.
+WHY: Prevents accidental duplicate sends, which would create multiple unsigned
+PDFs in the Salesforce Files section and confuse the audit trail.
+
+Rule: Services Agreement send button is hidden once the agreement has been signed.
+Enforcement: Dynamic Actions condition Service_Agreement_Signed__c = False.
+WHY: Once signed, the agreement is legally complete. Re-sending would create
+a new separate agreement.
+
+Rule: ACH + Promissory can only be sent when the record is in "Documents Pending"
+stage and neither document is already signed.
+Enforcement: Dynamic Actions on Background_Check__c.
+WHY: Ensures financial documents are only exchanged at the correct process step,
+after payment has been confirmed (enforced by a separate validation rule).
+
+Rule: CS Person acts as Recipient 1 (first signer) on ACH + Promissory
+documents, not the Candidate.
+WHY: CS Person must pre-fill financial amounts (monthly debit, period, totals)
+before the document reaches the Candidate. DocuSign does not have a native
+"Prefill" role in Apps Launcher; "Needs to Sign" without a Signature field is
+the correct implementation. The CS Person fills text fields and clicks Finish;
+this routes the document to the Candidate.
+
+Rule: The Candidate is Recipient 2 on ACH + Promissory documents and must pass
+ID Verification with Liveness before signing.
+WHY: Financial authorization documents require stronger identity assurance than
+the Services Agreement. Liveness detection prevents use of a photo of an ID.
+
+Rule: CS Person can correct Candidate's wrong field values without voiding.
+Enforcement: Collaborative Fields with Changes Require Initials = ON and
+Required for Selected Signers = OFF on all Candidate-filled text tabs.
+WHY: If Candidate enters a wrong bank account number, voiding would require CS
+Person to re-fill all financial amounts from scratch. The collaborative
+correction flow preserves CS Person's data while routing the document back to
+Candidate for re-entry.
+
+Rule: Completion and voided notification emails cannot be customized.
+WHY: DocuSign intentionally restricts editing of these system emails for legal
+compliance reasons. The organization's DocuSign plan does not include Advanced
+Branding / Email Resource Files that would allow XML-level customization.
+
+Rule: Invitation emails are customized per recipient.
+Implementation: Sending Settings flag "Enable custom email and language for each
+recipient" is ON. Each recipient in both Envelope Templates has a distinct
+email subject and message body.
+
+Rule: The send button does not appear during the collaborative routing cycle
+(when envelope is routing back to Candidate for correction).
+WHY: During collaborative field correction, DocuSign internally routes the
+envelope without creating a new send event that would set Service_Agreement_Sent__c
+or ACH statuses to states that would hide the button. The Voided Field Value
+Update resets ACH statuses to Pending if the envelope is truly voided, not
+during normal collaborative routing. The Services Agreement does not use
+collaborative fields.
+
+
+DESIGN DECISIONS AND TRADE-OFFS
+
+Decision: Use DocuSign Gen Templates for document generation instead of uploading
+static PDFs to Envelope Templates.
+WHY: Gen Templates allow Salesforce field data (name, address, phone, email) to
+be merged directly into the Word document content (not as overlay fields), so
+the generated PDF is a clean, fully populated document. Overlay fields (tabs)
+in Envelope Templates can cause overflow or spacing issues when field values
+are too long or too short.
+
+Decision: Use "Send Now" sending experience on both Envelope Templates.
+WHY: Without Send Now, the sender must manually uncheck the "Envelope" checkbox
+in Step 1 of the sending flow, or the document will appear twice in Step 3
+(the generated PDF from Gen Template plus the raw document from the Envelope
+Template). Send Now eliminates all sender stages, removes the duplication risk,
+and prevents unauthorized changes to recipients, email, or expiration settings.
+
+Decision: CS Person is set as Recipient 1 with role "Needs to Sign" and no
+Signature field placed.
+WHY: DocuSign Apps Launcher does not offer a native "Prefill" or "Admin Fill"
+recipient role. "Needs to Sign" without a Signature field is the correct and
+officially supported workaround. The recipient fills required text fields and
+clicks Finish.
+
+Decision: Collaborative Fields used on ACH + Promissory Candidate-filled tabs
+with Required for Selected Signers = OFF.
+WHY: This is the only native DocuSign mechanism to allow CS Person to correct
+a Candidate-filled field and route the envelope back to Candidate, without
+voiding. With Required for Selected Signers = OFF, CS Person can clear a field
+and click Finish without hitting a validation error. With Changes Require
+Initials = ON, any modification by CS Person triggers automatic re-routing to
+Candidate.
+
+Decision: Reject System Sender (Apex Toolkit) as the solution for sender email.
+WHY: System Sender via DAL Apex Toolkit only works with custom Apex-based
+sending code, not with standard Gen Template buttons. Replacing all buttons
+with Apex code is a major development project and was not justified.
+
+Decision: Reject "Allow to Edit" recipient role for CS Person.
+WHY: The DocuSign account does not have permission for the Editor recipient
+type. Attempting to set a recipient to this role produces the error:
+"failed to update one or more template recipients. Account does not have
+permission to send to Editor recipient type."
+
+Decision: Do not remove the document from the Envelope Template to fix duplicate
+documents.
+WHY: The Place Fields (tabs) configuration in the Envelope Template is stored
+relative to the document uploaded in that template. Removing the document would
+delete all field placement data. The correct fix is Sending Experience = Send Now,
+which eliminates the duplicate-selection issue.
+
+Decision: Envelope Template is exported/imported when moving to Production;
+Gen Template must be recreated manually.
+WHY: DocuSign Apps Launcher does not provide a migration path for Gen Templates
+between environments (sandbox DocuSign account vs production DocuSign account
+are completely separate). Envelope Templates can be exported from the template
+list Actions dropdown and imported in the target environment.
+
+Decision: ACH Authorization Form and Promissory Note are combined into a single
+Word document and a single Gen Template / Envelope Template.
+WHY: Originally three separate templates existed (BackgroundCheck_PromissoryNote_v1,
+Lead_PromissoryNote_v1, Lead_ACHForm_v1). Combining them reduces the number of
+DocuSign sends, simplifies the signing flow for all parties, and ensures the CS
+Person fills financial fields for both documents in a single session.
+
+Decision: Services Agreement uses Onboarding__c as source object, not Lead.
+Decision: ACH + Promissory uses Background_Check__c as source object, not Lead.
+WHY: Previous Lead-based templates were replaced because the business process
+was redesigned around dedicated Onboarding and Background Check objects. All
+Lead-based templates have been deleted.
+
+
+AUTHENTICATION AND CONFIG
+
+DocuSign Sandbox:
+  URL: https://demo.docusign.net
+  Account ID: 242804513
+  Salesforce connected user: jenish.gangani@techsarasolutions.com (DS Admin)
+  Authentication method: OAuth via DAL Connected App in Salesforce
+  Token stored by: DocuSign Apps Launcher managed package in Salesforce org
+
+DocuSign Production (planned):
+  URL: https://app.docusign.com
+  Connected Salesforce user: CEO (production Salesforce user; email TBD)
+  Note: Production and sandbox are completely separate DocuSign accounts.
+  Templates, users, and settings do not transfer automatically.
+
+Salesforce Sandbox:
+  Org: Dev9 (techsara--dev9.sandbox.my.salesforce.com)
+  Connected App: DocuSign Apps Launcher (installed via AppExchange)
+  Package version: v7.11.1
+
+DocuSign Connect (Webhook):
+  Configuration name in DocuSign Admin: DocuSign Apps Launcher
+  Configuration ID: 21749884
+  Status: Active
+  Managed by: DAL package; do not modify manually unless troubleshooting.
+  Publish URL: managed by DAL (not manually set)
+
+Remote Site Settings required in Salesforce:
+  https://demo.docusign.net (sandbox)
+  https://app.docusign.com (production)
+
+Sender email issue (UNRESOLVED — see Open Items):
+  All envelopes are currently sent from jenish.gangani@techsarasolutions.com
+  because that user is connected to Salesforce. The desired From address is
+  legal@techsarasolutions.com. Custody Transfer Rules are the recommended
+  solution and have not yet been fully implemented.
+
+Sending Settings flags that must be enabled in DocuSign Admin:
+  - Enable custom email and language for each recipient (ON)
+  - Allow sender to download form data (ON — required for API form data retrieval)
+  - Enable conditional fields (ON — if conditional field workflows are used)
+  - Enable collaborative fields (ON — required for collaborative tab feature)
+  - Enable formula field / calculated field (ON — if formula tabs are used)
+
+
+SALESFORCE FIELDS CREATED FOR THIS INTEGRATION
+
+All fields below were created specifically to support the DocuSign integration.
+
+Object: Account (Person Account / Candidate)
+  - DS_Today_Date__c | Formula (Text) | Returns TODAY() formatted as MM/DD/YYYY
+    Formula: RIGHT("0"&TEXT(MONTH(TODAY())),2)&"/"&RIGHT("0"&TEXT(DAY(TODAY())),2)&"/"&TEXT(YEAR(TODAY()))
+    WHY: Salesforce Date fields serialize as YYYY-MM-DD, which DocuSign's Date
+    validation rejects. A Text formula field returns the correctly formatted string.
+
+Object: Background_Check__c (or the object housing financial date fields)
+  - DS_Final_Payment_Due_Date__c | Date | Actual date value; supports writeback.
+  - DS_Final_Payment_Due_Date_Formatted__c | Formula (Text) | MM/DD/YYYY format for DocuSign pre-population.
+    Formula: RIGHT("0"&TEXT(MONTH(DS_Final_Payment_Due_Date__c)),2)&"/"&RIGHT("0"&TEXT(DAY(DS_Final_Payment_Due_Date__c)),2)&"/"&TEXT(YEAR(DS_Final_Payment_Due_Date__c))
+  - DS_First_Installment_Due_Date__c | Date | Actual date value.
+  - DS_First_Installment_Due_Date_Formatted__c | Formula (Text) | MM/DD/YYYY format.
+    Formula: RIGHT("0"&TEXT(MONTH(DS_First_Installment_Due_Date__c)),2)&"/"&RIGHT("0"&TEXT(DAY(DS_First_Installment_Due_Date__c)),2)&"/"&TEXT(YEAR(DS_First_Installment_Due_Date__c))
+  - DS_Payment_Commencement_Date__c | Date | Actual date value.
+  - DS_Payment_Commencement_Date_Formatted__c | Formula (Text) | MM/DD/YYYY format.
+    Formula: RIGHT("0"&TEXT(MONTH(DS_Payment_Commencement_Date__c)),2)&"/"&RIGHT("0"&TEXT(DAY(DS_Payment_Commencement_Date__c)),2)&"/"&TEXT(YEAR(DS_Payment_Commencement_Date__c))
+  - DS_Debit_Amount__c | Currency | Raw debit amount.
+  - DS_Total_Amount_to_be_Paid__c | Currency | Raw total amount.
+
+RULE: Always use the Formatted (Text) formula field as the DocuSign Merge Field
+source for date pre-population, not the raw Date field. Use the raw Date field
+as the writeback target if writeback is needed. For currency amounts displayed
+in DocuSign, use a Formula (Text) field with $X,XXX.XX formatting rather than
+the raw Currency field, because DocuSign Date validation rejects YYYY-MM-DD
+formatted date strings.
+
+Currency formatting formula template (replace DS_Debit_Amount__c with field):
+"$" &IF(FLOOR(DS_Debit_Amount__c)>=1000000,TEXT(FLOOR(DS_Debit_Amount__c/1000000))&","&RIGHT("000"&TEXT(MOD(FLOOR(DS_Debit_Amount__c/1000),1000)),3)&","&RIGHT("000"&TEXT(MOD(FLOOR(DS_Debit_Amount__c),1000)),3),IF(FLOOR(DS_Debit_Amount__c)>=1000,TEXT(FLOOR(DS_Debit_Amount__c/1000))&","&RIGHT("000"&TEXT(MOD(FLOOR(DS_Debit_Amount__c),1000)),3),TEXT(FLOOR(DS_Debit_Amount__c))))&"."&RIGHT("00"&TEXT(ROUND(MOD(DS_Debit_Amount__c,1)*100,0)),2)
+
+
+REGEX PATTERNS USED IN DOCUSIGN FIELD VALIDATION
+
+Tab validation type: Custom. Set in Place Fields tagger, right panel, Validation.
+
+Bank Account Number: ^\d{6,17}$
+  Accepts: 6 to 17 digits, no letters or special characters.
+
+Bank Routing Number: ^\d{9}$
+  Accepts: exactly 9 digits.
+
+Debit Amount (dollar format): ^\$[\d,]+(\.\d{1,2})?$
+  Accepts: $1,234.56 / $500 / $1,234,567.89. Requires $ sign prefix.
+
+USA Phone Number: ^(\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}$
+  Accepts: (123) 456-7890 / 123-456-7890 / +1 123-456-7890 / 1234567890.
+
+Day of month (1-31): ^([1-9]|[12][0-9]|3[01])$
+  Accepts: 1 through 31. Rejects 0 and 32+.
+
+SSN — last 4 digits OR full SSN: ^(\d{4}|\d{3}-\d{2}-\d{4}|\d{9})$
+  Accepts: 1234 / 123-45-6789 / 123456789.
+
+SSN — last 4 digits only: ^\d{4}$
+  Accepts: exactly 4 digits.
+
+
+DELETED TEMPLATES (DO NOT RECREATE)
+
+The following Gen Templates and Envelope Templates were deleted after the
+integration was redesigned around Onboarding and Background Check objects.
+Their functionality has been fully replaced by the active templates.
+
+Deleted Gen Templates:
+  - BackgroundCheck_PromissoryNote_v1 (merged into BackgroundCheck_ACHPromissory_v1)
+  - Lead_ServicesAgreement_v1 (replaced by Onboarding_ServicesAgreement_v1)
+  - Lead_PromissoryNote_v1 (merged and replaced)
+  - Lead_ACHForm_v1 (merged and replaced)
+
+Deleted Envelope Templates:
+  - BackgroundCheck_Promissory_Envelope_v1 (merged into BackgroundCheck_ACH_Promissory_Envelope_v1)
+  - Lead_ACH_Promissory_Envelope_v1 (replaced by BackgroundCheck version)
+  - Lead_ServicesAgreement_Envelope_v1 (replaced by Onboarding version)
+
+
+KNOWN LIMITATIONS AND GOTCHAS
+
+Symptom: Multiple unsigned PDFs appear in the Salesforce Files section of the
+Onboarding or Background Check record.
+Cause: DocuSign Gen Template automatically saves a copy of the generated
+(unsigned) PDF to Salesforce Files every time the send button is clicked. This
+is a known DocuSign limitation with no UI toggle to disable it in Apps Launcher.
+Fix / Rule to follow: No clean DocuSign-side fix exists. The signed completed
+PDF is identifiable by "_completed" in its filename. A Salesforce Flow triggered
+on ContentDocumentLink creation can detect the completed file's arrival and
+delete all unsigned PDFs matching the document name pattern. Alternatively,
+accept the behavior and train users to use only the file prefixed with the email
+subject and "_completed."
+
+Symptom: Document appears twice (stacked vertically) in the DocuSign preparation
+screen (Stage 3 of the sending flow).
+Cause: In Default sending experience, both the "Template" (Gen-generated PDF)
+and the "Envelope" (Envelope Template's own uploaded document) are selected.
+Fix / Rule to follow: Set Sending Experience = Send Now in the Envelope Template
+Options. This eliminates all sender stages and prevents the duplication issue.
+Do not remove the document from the Envelope Template, as that would destroy
+all Place Fields configurations.
+
+Symptom: "Error [103] Access Denied" when clicking a send button or loading
+DocuSign components in Salesforce.
+Cause 1: The Salesforce user lacks proper DocuSign permission set assignment.
+Fix: Assign DocuSign Sender or DocuSign Administrator permission set to the user.
+Cause 2: "Allow sender to download form data" is not enabled in DocuSign Admin
+Sending Settings.
+Fix: Enable the setting in demo.docusign.net → Admin → Sending Settings.
+Cause 3: DocuSign Apps Launcher disruption due to Salesforce platform update.
+Fix: In Salesforce Setup → Visualforce Pages → search "troubleshoot" → find
+dfsle namespace page → Preview → select "Disconnect Account and Preserve Users"
+→ reconnect. Clear browser cache and cookies. If unresolved, update the DAL
+package via AppExchange.
+Cause 4: DAL package is outdated.
+Fix: Update DocuSign Apps Launcher package in Salesforce Setup → Installed
+Packages.
+
+Symptom: Envelope shows "Authentication Failed" status in Salesforce or DocuSign.
+Cause: The recipient failed the ID Verification step (expired ID, blurry photo,
+name mismatch, liveness check failure, or face mismatch with ID photo).
+Fix: Click the Resend button next to the failed envelope. Candidate receives a
+new email link. Candidate must retry with a valid, non-expired government ID in
+good lighting. For ID Verification with Liveness, the candidate must complete a
+live selfie — a photo of a photo will fail.
+
+Symptom: Candidate's invitation email pre-population shows date as 2003-03-03
+(YYYY-MM-DD) and DocuSign shows "Invalid date format" error.
+Cause: Salesforce Date fields serialize as YYYY-MM-DD. DocuSign Date validation
+expects MM/DD/YYYY. Using a raw Salesforce Date field as a Merge Field source
+will always cause this error.
+Fix / Rule to follow: Never use a raw Salesforce Date field as the Merge Field
+source for a DocuSign tab with Date validation. Always use a Formula (Text)
+field that formats the date as MM/DD/YYYY. Use the raw Date field only as the
+writeback target.
+
+Symptom: Merge Field writeback fails with error "Illegal assignment from Date
+to String."
+Cause: DocuSign is sending a Date-typed value to a Salesforce Text field. This
+happens when the DocuSign tab has Date validation and the Merge Field source is
+a Salesforce Date field while the writeback target is a Text field.
+Fix: Change the Salesforce writeback target field to a Date type (not Text) to
+match the Date-typed value DocuSign sends.
+
+Symptom: Merge Field writeback does not update Salesforce at all.
+Possible Cause 1: The Merge Field has "Allow Writeback to Salesforce" unchecked.
+Possible Cause 2: The Merge Field has "Read Only (for signer)" checked, which
+prevents the signer from modifying the value and therefore prevents writeback.
+Possible Cause 3: Multi-Factor Authentication for API Logins is enabled on the
+Salesforce user. This blocks all merge field writeback.
+Possible Cause 4: The Salesforce field is a Formula field, which is read-only
+and cannot receive writeback.
+Possible Cause 5: The Salesforce user profile lacks Edit access to the target
+field.
+Fix: Verify all five conditions: Allow Writeback = ON, Read Only = OFF, MFA for
+API Logins = OFF on the integration user, target field is not a Formula field,
+and field-level security grants Edit access to the profile.
+
+Symptom: Writeback works once but on the second send the date value pre-populates
+in the wrong format and causes a DocuSign validation error.
+Cause: The Merge Field source is a Salesforce Date field. Writeback saves the
+value correctly, but when the envelope is sent again, Salesforce sends the date
+back to DocuSign in YYYY-MM-DD format, which DocuSign's Date validation rejects.
+Fix: Create a separate Salesforce Text field (DS_Date_Display__c) formatted as
+MM/DD/YYYY using a Salesforce Flow. Use this Text field as the Merge Field
+source. Use the original Date field as the writeback target via a second Flow
+that parses the MM/DD/YYYY string back to a Date.
+
+Symptom: CS Person receives a required-field validation error when trying to
+clear a Candidate-filled field and submit.
+Cause: "Required for Selected Signers" is ON for the collaborative field,
+applying the required rule to all collaborators including CS Person.
+Fix: Set "Required for Selected Signers" = OFF on all collaborative tabs.
+The field remains required for Candidate (because it is assigned to Candidate)
+but CS Person can clear and submit without error.
+
+Symptom: Send button reappears on Background_Check__c after CS Person corrects
+a collaborative field, leading to a re-send that voids the original envelope.
+Cause: The Envelope Voided Field Value Update resets ACH_Authorization_Status__c
+and Promissory_Note_Status__c to Pending. If the original in-progress envelope
+is somehow marked Voided during collaborative routing, the button conditions are
+met again. Someone clicks the button, sending a new envelope and voiding the old.
+Fix / Rule to follow: Do not add "Envelope Sent → Pending" Field Value Updates
+if the fields already default to Pending. Use the existing button conditions
+(Not Equal Signed) to handle visibility. If collaborative routing triggers a
+false Voided event, investigate the Connect webhook logs and the Envelope Status
+component on the record before re-clicking the send button.
+
+Symptom: Completion and voided emails cannot be customized.
+Cause: DocuSign intentionally restricts editing of system notification emails
+for legal compliance. The organization's current DocuSign plan does not include
+Advanced Branding / Email Resource Files.
+Fix: This is a permanent limitation on the current plan. Only invitation emails
+(sent when a recipient's turn begins) can be customized per recipient. Voided
+and completion notification content is fixed by DocuSign.
+
+Symptom: [103] Access Denied Reference ID error in Apex logs with
+"Failed to complete product setup."
+Cause: Same as [103] Access Denied above. Often triggered by Salesforce platform
+updates (e.g., Winter 26 upgrade) disrupting the DAL authentication state.
+Fix: Update DAL package, then disconnect and reconnect (Preserve Users option),
+clear cache, retest.
+
+Symptom: Salesforce Integration User license type cannot be used as the System
+Sender or DocuSign integration user.
+Cause: Salesforce Integration User (API Only System Integrations profile) cannot
+log into Salesforce UI and therefore cannot complete the OAuth grant consent step
+required for DocuSign connection. DocuSign permission sets cannot be assigned to
+Integration license users.
+Fix / Rule to follow: Always use a Salesforce Standard User license for the
+DocuSign-connected user and System Sender. A Salesforce Platform User license
+may work (it can log into UI and can have permission sets assigned) but is not
+officially documented by DocuSign as supported.
+
+
+HOW-TO PROCEDURES
+
+Procedure 1: Add a new DocuSign user in Salesforce and connect their account.
+
+1. In Salesforce, go to DocuSign Setup (via App Launcher).
+2. Click User Management (left sidebar, under Administration).
+3. Click Add Users.
+4. Search for and select the Salesforce user.
+5. Set eSignature permission to Administrator or User as appropriate.
+6. Set Gen permission to Generator if the user will send from Gen Templates.
+7. Click Add.
+8. The user must log into Salesforce, navigate to DocuSign Setup, and click
+   Grant Consent to authorize the OAuth connection.
+9. Verify the user appears in User Management with Status = Active.
+
+Procedure 2: Create a new Gen Template (e.g., for a new document type).
+
+1. In Salesforce, navigate to DocuSign Gen Templates.
+2. Click New.
+3. On Select Data Source: enter the Template Name and select the Salesforce
+   Source Object.
+4. On Add Data Fields: click + Add for each Salesforce field needed. Expand
+   lookup relationships to access related object fields. Copy each anchor text
+   shown and paste it into the correct location in the Word document.
+5. Set Date/Currency format and locale.
+6. On Upload Documents: upload the Word document (.docx). Set Generated File
+   Name Suffix and File Format (PDF recommended).
+7. On Preview Documents: select a real record and click Preview to verify fields
+   populate correctly.
+8. On Create Button: enter the Button Label. Select the correct Page Layout.
+   Click Update Layouts.
+9. Under Post Generation Actions: check Enable the Send for Signature button,
+   check Launch automatically after generation, and select the linked Envelope
+   Template.
+10. Click Save and Finish.
+11. Verify the button appears on the record page layout (check via Lightning App
+    Builder if not visible).
+
+Procedure 3: Create a new Envelope Template.
+
+1. In Salesforce, navigate to DocuSign Envelope Templates.
+2. Click New.
+3. Enter the Template Name.
+4. On Add Documents: upload the Word document or PDF. Leave "Attach documents
+   from Salesforce record" unchecked unless the document comes from Salesforce
+   Files at send time.
+5. On Add Recipients: add each recipient with Role, Action, Routing Order, and
+   Name/Email source (Salesforce merge field syntax or hardcoded).
+   For ID Verification: click Customize on the recipient row, click Add Identity
+   Verification, select the verification type.
+6. On Message to All Recipients (or per-recipient custom messages if enabled):
+   set the Email Subject and Email Message.
+7. On Add and Manage Merge Fields: add any Salesforce fields to be pre-populated.
+   Set Allow Writeback and Read Only as needed.
+8. On Place Fields: switch the recipient selector to each recipient in turn.
+   Drag fields from the left panel onto the document. For merge fields, drag
+   from the Merge Fields section and click Apply on the AutoPlace dialog.
+   Set Required, Read Only, validation regex, Collaborative settings per field.
+9. Click Save and Close.
+10. On Options: set Reminders, Expiration, Sending Experience, Document Writeback,
+    and Field Value Updates.
+11. On Create Custom Button: enter the Button Label and select Page Layouts only
+    if this template needs its own button (not needed if it is linked to a Gen
+    Template).
+12. Click Save and Finish.
+
+Procedure 4: Deploy to Production.
+
+Prerequisites:
+- All sandbox tests have passed.
+- CEO has an active Salesforce Production user and a DocuSign Production account
+  (app.docusign.com).
+- DocuSign Production account has ID Verification features enabled.
+
+Steps:
+1. Install DocuSign Apps Launcher in Salesforce Production via AppExchange.
+2. Connect DocuSign Production account in Salesforce Production: DocuSign Setup
+   → Connect to DocuSign → log in with CEO's DocuSign Production credentials.
+3. Add CEO as a user in DocuSign User Management with eSignature = Administrator
+   and Gen = Generator.
+4. Export each Envelope Template from sandbox DocuSign account (Actions dropdown
+   → Export) and import into Production DocuSign account (Import button in
+   Envelope Template list). Note: Envelope Template export/import may not
+   preserve all settings; verify each section after import.
+5. Recreate each Gen Template manually in Production Salesforce following
+   Procedure 2. Gen Templates are NOT portable between environments.
+6. In Production DocuSign Admin (app.docusign.com): create Custody Transfer Rule:
+   From = CEO user, To = legal@techsarasolutions.com, Timing = On Send, check
+   "Transfer Prior to First Send."
+   WARNING: Custody Transfer Rules cannot be edited after creation. Verify all
+   fields before clicking Add Transfer Rule.
+7. Add the send buttons to the correct record page layouts in Production via
+   Lightning App Builder if not added automatically by Gen Template setup.
+8. Add DocuSign Envelope Status Lightning component to Onboarding and Background
+   Check record pages in Lightning App Builder.
+9. Run the full Production Testing Checklist (12+ test cases).
+
+Procedure 5: Troubleshoot a stuck envelope or Access Denied error.
+
+1. Open the Salesforce record where the envelope was sent.
+2. Check the DocuSign Envelope Status component for envelope status and last
+   event.
+3. If status is "Authentication Failed": click Resend. Candidate retries ID
+   verification.
+4. If status is "Voided": check who voided it and when via DocuSign Admin →
+   Agreements → Voided → envelope → History. Determine root cause before
+   resending.
+5. For [103] Access Denied in Apex logs:
+   a. Check the sending user's DocuSign permission set in Salesforce Setup →
+      Permission Sets.
+   b. Check DocuSign Admin → Sending Settings → Allow sender to download form
+      data = ON.
+   c. Navigate to Salesforce Setup → Visualforce Pages → search "troubleshoot"
+      → open dfsle namespace page → Preview → Disconnect Account and Preserve
+      Users → reconnect.
+   d. Clear browser cache and cookies, or use Incognito.
+   e. If unresolved, update the DAL package via AppExchange.
+
+
+OPEN ITEMS AND TO-DO
+
+1. SENDER EMAIL — UNRESOLVED
+   Current state: All envelopes sent from jenish.gangani@techsarasolutions.com.
+   Desired state: Envelopes appear from legal@techsarasolutions.com.
+   Planned solution: Custody Transfer Rule (From: CEO → To: legal email, Timing:
+   Prior to First Send) in both sandbox and production DocuSign accounts.
+   System Sender via Apex Toolkit was rejected as unsuitable for button-based
+   sending.
+   Alternative explored: Reconnecting Salesforce to the legal email DocuSign
+   user account. Blocked because that user is already a DS Admin, and DS Admins
+   cannot edit each other's accounts via portal.
+   Status: Deferred. Implement Custody Transfer Rule when deploying to Production.
+
+2. DUPLICATE UNSIGNED PDFs IN SALESFORCE FILES — NO CLEAN FIX
+   Current state: Every Gen Template button click saves an unsigned PDF to
+   Salesforce Files. No DocuSign UI toggle exists to disable this behavior in
+   Apps Launcher.
+   Pending solution: Salesforce Flow on ContentDocumentLink that deletes unsigned
+   PDFs (those not containing "_completed" in the filename) when the completed
+   signed PDF arrives.
+   Status: Not yet implemented. Accepted as a known limitation in sandbox.
+
+3. DOCUSIGN ENVELOPE STATUS COMPONENT — MAY NEED VERIFICATION
+   The DocuSign Envelope Status Lightning component should be added to both the
+   Onboarding and Background Check record pages in Lightning App Builder. This
+   component enables Correct, Void, Remind, and View actions directly from
+   Salesforce. Current status of component placement on both objects: verify
+   before Production deployment.
+
+4. OFFER LETTER TEMPLATE — IN PLANNING
+   A direct DocuSign template (not a Salesforce Gen Template) is being built for
+   the Offer Letter document. The CEO's signature is required but CEO should not
+   need to sign manually for every letter.
+   Planned solution: Create a DocuSign Signing Group ("Offer Letter Signatories")
+   containing CEO and an authorized delegate. Use this Signing Group as the
+   signing recipient only in the Offer Letter Envelope Template. Other templates
+   continue to use CEO as a direct recipient.
+   Status: Not yet implemented.
+
+5. PRODUCTION DEPLOYMENT — NOT YET EXECUTED
+   All configuration steps have been documented. Production deployment has not
+   yet been authorized or executed.
+   Readiness: Sandbox tests completed, documentation complete.
+   Blocking items: Authorization from Techsara Solutions Inc. leadership,
+   access to CEO's DocuSign Production credentials, access to legal email inbox
+   for Custody Transfer verification step.
+
+6. SALESFORCE FLOW FOR DATE FORMAT WRITEBACK — PARTIAL
+   A Salesforce Flow is required to convert the MM/DD/YYYY text written back by
+   DocuSign (into DS_Date_Display__c) to a proper Salesforce Date value in the
+   original Date field. This second Flow (parse MM/DD/YYYY to Date) has been
+   designed but implementation status should be verified.
+
+7. ID VERIFICATION PLAN SUPPORT — NEEDS VERIFICATION
+   Both DocuSign ID Verification (standard) and ID Verification with Liveness
+   must be active on the DocuSign account plan before production deployment.
+   Verify these features are enabled on the production DocuSign account before
+   executing production deployment.
+
+
+NEEDS CLARIFICATION
+
+Q1: What is the exact API name of the Status__c field on Onboarding__c, and
+what are all the picklist API values (not just labels)? The button visibility
+condition uses Status__c Equals "Service Agreement" — confirm this is the exact
+picklist API value, not just the display label.
+
+Q2: What is the exact API name of the field DS_Testing_Field__c and on which
+object is it deployed? The conversation references it as being on Account, but
+the production use case may require it on Background_Check__c or another object.
+
+Q3: Has the Sending Experience been changed to "Send Now" on both
+Onboarding_ServicesAgreement_Envelope_v1 and BackgroundCheck_ACH_Promissory_Envelope_v1
+in the sandbox, and has it been tested end-to-end to confirm no document
+duplication occurs?
+
+Q4: What is the exact Salesforce user record for the CEO in Production (name,
+email, username)? This is required for the User Management and Custody Transfer
+setup in Production.
+
+Q5: The word document uploaded to each Envelope Template is the same file as
+uploaded to each Gen Template. Confirm whether the document in the Envelope
+Template is used only for field placement reference or whether it is also sent
+to recipients in some scenarios (e.g., if Send Now is not used).
+
+Q6: The ACH + Promissory Envelope Template Field Value Update sets
+ACH_Authorization_Status__c and Promissory_Note_Status__c back to "Pending" on
+Envelope Voided. Confirm this does not trigger the "Send ACH and Promissory"
+button to appear unexpectedly during collaborative field correction routing
+(which may internally fire a Voided-like event).
+
+================================================================================
+END OF FILE
+================================================================================
