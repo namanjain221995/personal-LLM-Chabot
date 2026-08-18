@@ -19,6 +19,8 @@ Nothing here performs network I/O at import time.
 """
 from __future__ import annotations
 
+import contextlib
+import logging
 from collections.abc import Mapping
 from typing import AsyncIterator, List, Optional, Sequence, Tuple
 
@@ -26,6 +28,8 @@ from . import context
 from .config import settings
 from .context import clip_message_contents
 from .model_capabilities import ModelCapabilities, ReasoningField
+
+log = logging.getLogger(__name__)
 
 # Local inference servers: the key is a placeholder, never a real secret.
 LOCAL_API_KEY = "local-no-key"
@@ -212,6 +216,21 @@ def wants_thinking(model_choice: str = "smart", effort: str = "medium") -> bool:
     return effort in ("medium", "high", "extra_high")
 
 
+def thinking_budget(effort: str) -> Optional[int]:
+    """Thinking tokens this effort may spend, or None when it does not think.
+
+    Budgets are DERIVED from the measured decode rate of this deployment
+    (46.6 tok/s thinking-on, 2026-08-19 — docs/CONFIG.md) so each level maps
+    to a wall-clock target: medium ≈ 1.5 min, high ≈ 4.3 min, extra_high
+    ≈ 8.6 min. Env-overridable via THINKING_BUDGET_{MEDIUM,HIGH,EXTRA_HIGH}.
+    """
+    return {
+        "medium": settings.thinking_budget_medium,
+        "high": settings.thinking_budget_high,
+        "extra_high": settings.thinking_budget_extra_high,
+    }.get(effort)
+
+
 def thinking_body(enabled: bool) -> dict:
     """`extra_body` toggling the chat template's thinking block.
 
@@ -299,6 +318,16 @@ async def stream_chat_events(
     """
     base_url, api_key, model_id = resolve_model_choice(model_choice)
     client = _client(base_url, api_key)
+    thinking_on = wants_thinking(model_choice, effort)
+    budget_tokens = thinking_budget(effort) if thinking_on else None
+    # The thinking budget GROWS the request: reasoning and answer draw from
+    # one max_tokens pool, and the documented failure mode is the model
+    # spending the whole allowance thinking and streaming nothing. When the
+    # caller asked for an answer ceiling, the thinking budget is added on top
+    # so the answer's room is never what the thinking ate.
+    requested = max_tokens
+    if budget_tokens and max_tokens is not None:
+        requested = max_tokens + budget_tokens
     # Size the call to the window of the model that will actually serve it.
     # "fast" resolves to a much smaller window than "smart", so a fixed
     # max_tokens that is fine on one is a 400 on the other.
@@ -306,7 +335,7 @@ async def stream_chat_events(
         normalize_system(apply_reasoning_effort(messages, effort, model_choice)),
         base_url=base_url,
         model=model_id,
-        requested_max_tokens=max_tokens,
+        requested_max_tokens=requested,
     )
     request = dict(
         model=model_id,
@@ -318,11 +347,23 @@ async def stream_chat_events(
     capabilities = capabilities_for_model_choice(model_choice)
     # THE picker's real mechanism on the DGX runtime: Smart thinks, Fast does
     # not. Other runtimes omit this vLLM-specific extension entirely.
-    extra_body = reasoning_extra_body(
-        capabilities, wants_thinking(model_choice, effort)
-    )
+    extra_body = reasoning_extra_body(capabilities, thinking_on)
     if extra_body is not None:
+        if budget_tokens and settings.server_thinking_budget:
+            # OFF by default: tested 2026-08-19 against this vLLM/Qwen3.6
+            # build and silently ignored (docs/CONFIG.md). Client-side
+            # enforcement below runs regardless, and stays the ONLY
+            # mechanism whenever tools are attached.
+            extra_body["chat_template_kwargs"]["thinking_token_budget"] = budget_tokens
         request["extra_body"] = extra_body
+
+    # Client-side budget enforcement. On this deployment one streamed chunk
+    # is one token (verified: usage.completion_tokens == chunk count), so
+    # counting reasoning deltas IS counting reasoning tokens. The cap carries
+    # a grace factor so a thought at the nominal budget finishes its clause
+    # instead of being guillotined mid-sentence.
+    cap = int(budget_tokens * settings.thinking_budget_grace) if budget_tokens else None
+    reasoning_seen = 0
     stream = await client.chat.completions.create(**request)
     async for chunk in stream:
         if not chunk.choices:
@@ -335,6 +376,42 @@ async def stream_chat_events(
         # (v0.20+, e.g. the 26.05 NGC image) and `reasoning_content` (older).
         reasoning = _reasoning_delta(delta, capabilities)
         if reasoning:
+            reasoning_seen += 1
+            if cap is not None and reasoning_seen > cap:
+                # Forced closure: the model is looping in its own head. Stop
+                # paying for it and answer the question directly — the
+                # reasoning shown so far stays on screen, the answer comes
+                # from a thinking-off pass over the identical prompt.
+                log.warning(
+                    "thinking overran its budget (%d tokens, cap %d) at "
+                    "effort %r on %s; forcing closure and answering without "
+                    "thinking",
+                    budget_tokens, cap, effort, model_id,
+                )
+                with contextlib.suppress(Exception):
+                    await stream.close()
+                fallback = dict(request)
+                # The retry only writes the ANSWER, so the caller's original
+                # ceiling is the honest budget for it.
+                fallback["max_tokens"] = (
+                    min(budget, max_tokens) if max_tokens is not None else budget
+                )
+                fb_extra = reasoning_extra_body(capabilities, False)
+                if fb_extra is not None:
+                    fallback["extra_body"] = fb_extra
+                else:
+                    fallback.pop("extra_body", None)
+                fb_stream = await client.chat.completions.create(**fallback)
+                async for fb_chunk in fb_stream:
+                    if not fb_chunk.choices:
+                        continue
+                    fb_delta = fb_chunk.choices[0].delta
+                    if fb_delta is None:
+                        continue
+                    fb_content = _delta_value(fb_delta, "content")
+                    if fb_content:
+                        yield "token", str(fb_content)
+                return
             yield "reasoning", reasoning
         content = _delta_value(delta, "content")
         if content:
@@ -420,20 +497,32 @@ async def chat_with_tools(
     temperature: float = 0.0,
     max_tokens: Optional[int] = None,
     thinking: bool = False,
+    effort: str = "medium",
 ) -> Tuple[str, List[ToolCall]]:
     """One completion that may call tools. → (text, tool_calls).
 
     Raises whatever the client raises: a backend without
     `--enable-auto-tool-choice` answers 400, and the caller downgrades to
     guided JSON rather than pretending tool calling worked.
+
+    Budget policy for tools + thinking: NEVER a server-side thinking cut —
+    a budget enforced inside the <think> block can truncate mid-tool-call
+    and corrupt the arguments. Instead the effort's thinking budget is added
+    to max_tokens (generous room), and overruns surface as a normal finish
+    rather than a mangled call.
     """
     client = _openai_client()
     model_id = model or settings.llm_model
+    requested = max_tokens
+    if thinking and max_tokens is not None:
+        budget_tokens = thinking_budget(effort)
+        if budget_tokens:
+            requested = max_tokens + budget_tokens
     sized, budget = await context.fit_request(
         normalize_system(messages),
         base_url=settings.openai_base_url,
         model=model_id,
-        requested_max_tokens=max_tokens,
+        requested_max_tokens=requested,
     )
     request = dict(
         model=model_id,

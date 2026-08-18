@@ -186,6 +186,30 @@ class Settings:
         # its assumptions stated does not fit in the default reservation, and
         # truncating the conclusion is the worst place to run out.
         self.model_high_max_output: int = _int("MAIN_MODEL_HIGH_MAX_OUTPUT_TOKENS", 16384)
+
+        # --- Thinking token budgets by effort (Phase 1, 2026-08-19) ---
+        # Derived from the MEASURED decode rate on this box — 46.6 tok/s with
+        # thinking on (see docs/CONFIG.md) — as target_minutes × 60 × tok/s:
+        # medium ≈ 1.4 min, high ≈ 4.3 min, extra_high ≈ 8.6 min of thinking.
+        # The budget GROWS max_tokens so reasoning can never starve the answer
+        # (the documented 121s/zero-output failure), and is enforced
+        # CLIENT-SIDE in llm.stream_chat_events.
+        self.thinking_budget_medium: int = _int("THINKING_BUDGET_MEDIUM", 4000)
+        self.thinking_budget_high: int = _int("THINKING_BUDGET_HIGH", 12000)
+        self.thinking_budget_extra_high: int = _int("THINKING_BUDGET_EXTRA_HIGH", 24000)
+        #: Overrun slack before the client forces closure: the cap is
+        #: budget × grace, so a thought mid-sentence at the nominal budget is
+        #: not guillotined for one more clause.
+        self.thinking_budget_grace: float = _float("THINKING_BUDGET_GRACE", 1.25)
+        #: Server-side thinking budget. Tested empirically 2026-08-19 against
+        #: this vLLM build (0.20.1 NGC 26.05) + Qwen3.6: chat_template_kwargs
+        #: thinking_token_budget / thinking_budget / max_thinking_tokens were
+        #: ALL silently ignored (600/600 reasoning tokens at a budget of 64).
+        #: Leave False unless a future build demonstrably honors it; client-
+        #: side enforcement runs regardless, and is the ONLY mechanism allowed
+        #: when tools are attached (a server-side cut inside a <think> block
+        #: can corrupt tool-call arguments).
+        self.server_thinking_budget: bool = _bool("SERVER_THINKING_BUDGET", False)
         # Serving parameters, mirrored here so /health can report what the app
         # BELIEVES it is running against and a drift from the actual vLLM flags
         # is visible instead of mysterious.
