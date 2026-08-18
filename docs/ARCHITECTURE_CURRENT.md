@@ -264,3 +264,28 @@ search's 10/min (config.py:290-292).
 6. Existing behaviours that must not change: Salesforce brain/grounding
    pipeline, dataset profile-only path for existing suffixes, report/chart
    spec pipeline, clarification flow, history/feedback storage.
+
+## 6. Future state — Phase 3 sandbox topology (approved 2026-08-19, docs only)
+
+Two placement decisions are fixed ahead of the build:
+
+1. **A dedicated `sandbox-manager` service owns Docker.** Only the
+   sandbox-manager mounts `/var/run/docker.sock`; the orchestrator NEVER
+   gets socket access. Rationale: socket access is root-equivalent on the
+   host, and the orchestrator is the internet-adjacent, prompt-injectable,
+   unauthenticated surface (auth.py:17-20) — it must not hold host-takeover
+   credentials. The orchestrator talks to the sandbox-manager over the
+   internal network with a narrow API (`create/exec/upload/reap` per
+   session); the manager applies the caps (`--network none`, non-root,
+   read-only rootfs, memory/cpus/pids limits, gVisor when available,
+   `SANDBOX_EXEC_TIMEOUT`, idle TTL, `MAX_CONCURRENT_SANDBOXES`).
+2. **Per-session workspaces are HOST-PATH bind mounts.** Sandbox containers
+   are *siblings* (spawned via the host daemon), so a path inside the
+   orchestrator's named `data` volume is not mountable into them by its
+   container path. A host directory (e.g.
+   `${TECHSARA_SANDBOX_ROOT}/<session>/workspace`) is bind-mounted into BOTH
+   the sandbox (`/workspace`, rw) and the orchestrator (read-only, for
+   upload staging and artifact downloads), making file handoff a plain
+   filesystem move with no docker-cp in the hot path. The launcher owns
+   creating/reaping these directories alongside its existing
+   workspace TTL/quota pattern (uploads.py:8-12).
