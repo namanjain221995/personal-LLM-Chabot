@@ -210,6 +210,10 @@ class Settings:
         #: when tools are attached (a server-side cut inside a <think> block
         #: can corrupt tool-call arguments).
         self.server_thinking_budget: bool = _bool("SERVER_THINKING_BUDGET", False)
+        #: Best-of-N at extra_high: candidates generated CONCURRENTLY, a
+        #: thinking-off guided-JSON judge picks the winner (core/best_of.py).
+        #: 1 keeps the extra_high thinking budget but skips the sampling.
+        self.extra_high_samples: int = _int("EXTRA_HIGH_SAMPLES", 3)
         # Serving parameters, mirrored here so /health can report what the app
         # BELIEVES it is running against and a drift from the actual vLLM flags
         # is visible instead of mysterious.

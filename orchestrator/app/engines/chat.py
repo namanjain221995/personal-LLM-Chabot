@@ -18,6 +18,8 @@ from typing import Awaitable, Callable, List, Sequence
 
 from . import CODE_INSTRUCTION, DIAGRAM_INSTRUCTION, recent_turns
 from .. import llm
+from ..config import settings
+from ..core import best_of
 
 Emit = Callable[[str, dict], Awaitable[None]]
 
@@ -86,6 +88,44 @@ async def run_chat_engine(
     # Thinking levels are used for code and analysis, where 0.6 invents API
     # names and drifts. Fast/Low stay conversational.
     temperature = 0.3 if effort in ("medium", "high", "extra_high") else 0.6
+
+    # extra_high = best-of-N: EXTRA_HIGH_SAMPLES candidates generated
+    # CONCURRENTLY, a thinking-off guided-JSON judge picks the winner, and
+    # the winner's thinking + answer stream to the UI (core/best_of.py).
+    # Zero usable candidates falls through to the ordinary single stream —
+    # best-of-N must never make extra_high worse than high.
+    if (
+        effort == "extra_high"
+        and model_choice == "smart"
+        and settings.extra_high_samples > 1
+    ):
+        prompt = _messages(message, history, mode)
+        candidates = await best_of.generate_candidates(
+            prompt,
+            n=settings.extra_high_samples,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        if any(c.usable for c in candidates):
+            winner, reason = await best_of.select_best(message, candidates)
+            best_of.log_losers(candidates, winner)
+            for start in range(0, len(winner.reasoning), 1000):
+                await emit(
+                    "reasoning", {"text": winner.reasoning[start : start + 1000]}
+                )
+            for start in range(0, len(winner.answer), 200):
+                await emit("token", {"text": winner.answer[start : start + 200]})
+            await emit(
+                "meta",
+                {
+                    "route": "chat",
+                    "best_of": settings.extra_high_samples,
+                    "best_of_winner": winner.index,
+                    "best_of_reason": reason,
+                },
+            )
+            return winner.answer
+
     parts: List[str] = []
     async for kind, text in llm.stream_chat_events(
         _messages(message, history, mode),
