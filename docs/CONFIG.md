@@ -5,58 +5,93 @@ the reasoning knobs; Phase 4 will centralize the remaining subsystems here.
 Every value is an environment variable read once at orchestrator startup
 (`orchestrator/app/config.py`).
 
-## Reasoning effort & thinking budgets
+## The effort ladder (2026-08-19 collapse)
+
+| Level | Thinking | Tools | Extra |
+|---|---|---|---|
+| `fast` | off | none | answers straight away |
+| `think` | **unbounded** | agent + search | default level |
+| `max` | **unbounded** | agent + search (planning forced with search) | best-of-N with a judge |
+
+Legacy wire values are accepted forever and normalized at the API boundary:
+`low → fast`, `medium → think`, `high → think`, `extra_high → max`. Two
+deliberate consequences: legacy *low* loses its search-only allowance, and
+legacy *high* searches at Think depth (15 sources) — the old High research
+depth now lives at Max.
+
+## Unbounded thinking — the trade-off, stated plainly
+
+**Budgets are OFF by default** (`THINKING_BUDGET_MODE=off`): this is a local
+deployment with no per-token cost, so thinking runs until the model closes
+it naturally. That buys maximum answer quality and costs **variable
+latency**: hard questions at Think/Max may reason for **5–20+ minutes**
+(the measured decode rate is ~46.6 tok/s single-stream, lower when Max runs
+its N candidates concurrently). Nothing cuts a long thought — only two
+physical guards exist:
+
+- the **context window** (prompt + 65,536-token completion floor inside the
+  262,144 window), and
+- the **hang guard** (below), which only catches degenerate repetition
+  loops, never real thinking.
+
+**How to watch it live:**
+
+```sh
+# The thinking stream in the UI: the "Thinking…" panel updates live.
+# Server side — per-generation usage telemetry (chunks ≈ tokens) and guards:
+docker logs -f sf-local-ai-orchestrator-1 2>&1 | grep -E "generation usage|WALL CLOCK|best-of"
+```
+
+Every thinking generation logs `generation usage: <reasoning> + <answer>
+chunks in <seconds>` — with budgets off this is the record of what
+unbounded thinking actually costs, and the data any future budget decision
+should be made from.
+
+## Reasoning env vars
+
+| Var | Default | Meaning |
+|---|---|---|
+| `THINKING_BUDGET_MODE` | `off` | `off`: unbounded thinking, no cutoff, no regeneration. `client`: re-enables the Phase 1 client-side enforcement exactly as built. |
+| `MAX_OUTPUT_TOKENS` | `65536` | Completion floor for thinking-on requests (streaming, collector, and tools paths), so thinking + answer always fit. |
+| `GEN_WALL_CLOCK_S` | `1800` | Hang guard per generation stream: past it the stream is killed, an ERROR is logged, and what was produced is returned with an inline note. 1800 s ≈ 84k tokens at 46.6 tok/s — far beyond any real answer; it exists for degenerate loops only. Also guards each best-of-N candidate via the non-streaming collector. |
+| `EXTRA_HIGH_SAMPLES` | `3` | Best-of-N candidates at `max`, generated CONCURRENTLY; a thinking-off guided-JSON judge picks the winner (losers logged at INFO). `1` disables sampling. |
+
+### Re-enabling budgets (if ever needed)
+
+1. Set `THINKING_BUDGET_MODE=client` (and optionally tune
+   `THINKING_BUDGET_HIGH` → Think, `THINKING_BUDGET_EXTRA_HIGH` → Max;
+   `THINKING_BUDGET_MEDIUM` is retired by the ladder collapse).
+2. Restart the orchestrator. Enforcement resumes exactly as built in
+   Phase 1: max_tokens grows by the budget, reasoning chunks are counted
+   (1 chunk = 1 token on this build), and past budget ×
+   `THINKING_BUDGET_GRACE` (1.25) the stream is force-closed and the answer
+   regenerates thinking-off on the original ceiling.
+3. `SERVER_THINKING_BUDGET` stays `false` on this vLLM build: probed
+   2026-08-19 under three key spellings and silently ignored (600/600
+   reasoning tokens vs a budget of 64). If a future vLLM upgrade claims
+   support, re-run the probe before flipping it, and never with tools
+   attached (a server-side cut inside `<think>` can corrupt tool-call
+   arguments).
+
+Budget values were derived from the measured decode rate — see the
+derivation kept below for the client mode.
 
 ### Measured basis (2026-08-19, this DGX Spark)
 
-Decode rate on the main model (`Qwen/Qwen3.6-35B-A3B-NVFP4`, vLLM 0.20.1
-NGC 26.05, thinking on, warm prefix cache, single stream, 1,200-token
-generations):
+Decode rate on `Qwen/Qwen3.6-35B-A3B-NVFP4` (vLLM 0.20.1 NGC 26.05,
+thinking on, warm, single stream): runs 43.4 and 49.7 → **mean 46.6 tok/s**.
+Verified: one streamed chunk = one completion token on this build.
 
-| run | tok/s |
-|---|---|
-| 1 | 43.4 |
-| 2 | 49.7 |
-| **mean** | **46.6** |
+Client-mode budgets (`budget ≈ target_minutes × 60 × 46.6`):
 
-Also verified on this build: **one streamed chunk = one completion token**
-(`usage.completion_tokens` equalled the chunk count exactly), which is why
-client-side budget enforcement counts chunks.
-
-### Budget derivation — `budget ≈ target_minutes × 60 × 46.6`
-
-| Effort | Thinking target | Budget (tokens) | Env override |
+| Effort (canonical) | Env | Tokens | Thinking target |
 |---|---|---|---|
-| fast | none (thinking off) | — | — |
-| low | none (thinking off) | — | — |
-| medium | ~1.5 min | 4,000 | `THINKING_BUDGET_MEDIUM` |
-| high | ~4.3 min | 12,000 | `THINKING_BUDGET_HIGH` |
-| extra_high | ~8.6 min | 24,000 | `THINKING_BUDGET_EXTRA_HIGH` |
-
-extra_high runs its samples concurrently (best-of-N), so per-stream decode
-drops below 46.6 tok/s under load and the wall-clock target stretches
-accordingly — budgets are token ceilings, not time guarantees.
-
-### Enforcement
-
-| Var | Default | Meaning |
-|---|---|---|
-| `THINKING_BUDGET_GRACE` | `1.25` | Client-side cap = budget × grace; the stream is force-closed past it and the answer is regenerated with thinking off (warning logged, partial reasoning stays visible). |
-| `SERVER_THINKING_BUDGET` | `false` | Send `chat_template_kwargs.thinking_token_budget` server-side. **Leave false on this build**: tested empirically 2026-08-19 — `thinking_token_budget`, `thinking_budget` and `max_thinking_tokens` were all silently ignored (600/600 reasoning tokens generated against a budget of 64, no error). If a future vLLM upgrade honors it, re-run the probe before enabling, and note it is *never* used when tools are attached (a server-side cut inside `<think>` can corrupt tool-call arguments — client-side sizing handles the tools path). |
-
-The budget always **grows** `max_tokens` (answer ceiling + thinking budget)
-so reasoning can never starve the answer — the historical failure was 121 s
-of thinking and zero output on an 11,500-token SQL prompt.
-
-### Best-of-N (extra_high)
-
-| Var | Default | Meaning |
-|---|---|---|
-| `EXTRA_HIGH_SAMPLES` | `3` | Concurrent candidate generations at extra_high on the chat route; a thinking-off judge (`select_best`, guided JSON) picks the winner, whose thinking + answer stream to the UI. Losing candidates are logged at INFO for debugging. `1` disables best-of-N while keeping the extra_high thinking budget. |
+| think | `THINKING_BUDGET_HIGH` | 12,000 | ~4.3 min |
+| max | `THINKING_BUDGET_EXTRA_HIGH` | 24,000 | ~8.6 min |
 
 ### Related pre-existing knobs
 
 | Var | Default | Meaning |
 |---|---|---|
-| `MAIN_MODEL_DEFAULT_MAX_OUTPUT_TOKENS` | `8192` | Answer reservation, fast/low/medium |
-| `MAIN_MODEL_HIGH_MAX_OUTPUT_TOKENS` | `16384` | Answer reservation, high and extra_high |
+| `MAIN_MODEL_DEFAULT_MAX_OUTPUT_TOKENS` | `8192` | Answer reservation (context budgeting), fast |
+| `MAIN_MODEL_HIGH_MAX_OUTPUT_TOKENS` | `16384` | Answer reservation, think and max |
