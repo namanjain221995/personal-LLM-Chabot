@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import logging
 import mimetypes
+import os
 import uuid
 from typing import AsyncIterator, List, Literal, Optional
 
@@ -17,6 +18,17 @@ from pydantic import BaseModel, model_validator
 from . import context, db, llm
 from .auth import router as auth_router
 from .config import settings
+
+# App-module logging was silently dropped: uvicorn configures only its own
+# loggers, and with no root handler every app `log.info/warning/error` —
+# the generation-usage telemetry, best-of-N losers, and the wall-clock hang
+# guard's LOUD error — went nowhere. One root handler, level via LOG_LEVEL
+# (default INFO), added only when nothing else configured logging first.
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
 from .core.report_paths import ReportPathError, list_reports, resolve_report_file
 from .graph import get_graph
 from .health import check_dependencies
