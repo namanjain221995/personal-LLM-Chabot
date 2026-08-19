@@ -187,7 +187,27 @@ class Settings:
         # truncating the conclusion is the worst place to run out.
         self.model_high_max_output: int = _int("MAIN_MODEL_HIGH_MAX_OUTPUT_TOKENS", 16384)
 
+        # --- Thinking budget MODE (owner decision 2026-08-19: local
+        # deployment, no per-token cost — thinking runs until the model
+        # closes it naturally). "off" (default): no client-side cutoff, no
+        # forced closure, no thinking-off regeneration; only physical
+        # ceilings apply. "client": re-enables the Phase 1 enforcement
+        # exactly as built, using the THINKING_BUDGET_* values below.
+        _budget_mode = os.environ.get("THINKING_BUDGET_MODE", "off").strip().lower()
+        self.thinking_budget_mode: str = _budget_mode if _budget_mode == "client" else "off"
+        #: The physical ceiling when thinking is UNBOUNDED: requests with
+        #: thinking on are sized to at least this many completion tokens so
+        #: thinking + answer always fit (262k window minus prompt applies on
+        #: top via fit_request).
+        self.max_output_tokens: int = _int("MAX_OUTPUT_TOKENS", 65536)
+        #: Hang guard, NOT a budget: a generation stream that exceeds this
+        #: wall clock is killed loudly and returns what it produced so far.
+        #: It exists to catch degenerate repetition loops only — at the
+        #: measured 46.6 tok/s, 1800s ≈ 84k tokens, far past any real answer.
+        self.gen_wall_clock_s: float = _float("GEN_WALL_CLOCK_S", 1800.0)
+
         # --- Thinking token budgets by effort (Phase 1, 2026-08-19) ---
+        # ACTIVE ONLY when THINKING_BUDGET_MODE=client (see above). ---
         # Derived from the MEASURED decode rate on this box — 46.6 tok/s with
         # thinking on (see docs/CONFIG.md) — as target_minutes × 60 × tok/s:
         # medium ≈ 1.4 min, high ≈ 4.3 min, extra_high ≈ 8.6 min of thinking.
@@ -424,6 +444,15 @@ class Settings:
         # --- Row caps (§8) ---
         self.sql_preview_row_cap: int = _int("SQL_PREVIEW_ROW_CAP", PREVIEW_ROW_CAP)  # 500
         self.export_row_cap: int = _int("EXPORT_ROW_CAP", EXPORT_ROW_CAP)  # 100_000
+        # How many rows the deterministic summary — the "authoritative,
+        # computed over every row" block the model must quote from — is
+        # actually computed over. It used to inherit the 500-row PREVIEW cap,
+        # so a query matching 33,000 interviews had its "totals" computed over
+        # 1.5% of the result while the prompt called them exact. The preview
+        # cap is a UI concern (rows on meta.data); this one is a truth concern,
+        # so it matches the export cap: if we will write 100k rows to a CSV,
+        # we can count 100k rows in memory.
+        self.sql_summary_row_cap: int = _int("SQL_SUMMARY_ROW_CAP", EXPORT_ROW_CAP)
 
         # --- RAG (§8): LanceDB top-30 → rerank → top-8 ---
         self.rag_top_k: int = _int("RAG_TOP_K", 30)

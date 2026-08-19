@@ -77,8 +77,9 @@ def test_chat_completion_with_reasoning_returns_both(monkeypatch):
         [{"role": "user", "content": "q"}], effort="high", max_tokens=1000,
     ))
     assert (reasoning, content) == ("thought", "answer")
-    # effort=high thinks, so the request grew by the thinking budget.
-    assert captured["max_tokens"] == 1000 + settings.thinking_budget_high
+    # effort=high thinks; with budgets OFF (the default) the request is
+    # floored at the unbounded-thinking ceiling.
+    assert captured["max_tokens"] == settings.max_output_tokens
 
 
 def test_chat_with_tools_strips_a_leaked_think_block(monkeypatch):

@@ -156,8 +156,13 @@ async def chat_completion_with_reasoning(
     thinking_on = wants_thinking("smart", effort)
     budget_tokens = thinking_budget(effort) if thinking_on else None
     requested = max_tokens
-    if budget_tokens and max_tokens is not None:
-        requested = max_tokens + budget_tokens
+    if thinking_on:
+        if budget_tokens and max_tokens is not None:
+            requested = max_tokens + budget_tokens
+        elif budget_tokens is None:
+            # Unbounded thinking: floor at MAX_OUTPUT_TOKENS so thinking +
+            # answer always fit (same policy as the streaming path).
+            requested = max(max_tokens or 0, settings.max_output_tokens)
     sized, budget = await context.fit_request(
         normalize_system(messages),
         base_url=settings.openai_base_url,
@@ -170,7 +175,25 @@ async def chat_completion_with_reasoning(
     extra_body = reasoning_extra_body(settings.main_capabilities, thinking_on)
     if extra_body is not None:
         request["extra_body"] = extra_body
-    resp = await client.chat.completions.create(**request)
+    import asyncio as _asyncio
+
+    try:
+        # The hang guard for the non-streaming collector: a candidate stuck
+        # in a repetition loop dies at the wall clock instead of holding the
+        # whole best-of-N gather hostage.
+        resp = await _asyncio.wait_for(
+            client.chat.completions.create(**request),
+            timeout=settings.gen_wall_clock_s,
+        )
+    except _asyncio.TimeoutError:
+        log.error(
+            "GENERATION WALL CLOCK EXCEEDED (non-streaming collector): "
+            ">%.0fs on %s (effort %r) — candidate abandoned",
+            settings.gen_wall_clock_s, model_id, effort,
+        )
+        raise RuntimeError(
+            f"generation exceeded the {int(settings.gen_wall_clock_s)}s wall clock"
+        ) from None
     return split_reasoning(resp.choices[0].message, settings.main_capabilities)
 
 
@@ -257,13 +280,16 @@ def wants_thinking(model_choice: str = "smart", effort: str = "medium") -> bool:
 
 
 def thinking_budget(effort: str) -> Optional[int]:
-    """Thinking tokens this effort may spend, or None when it does not think.
+    """Thinking tokens this effort may spend, or None for unbounded/none.
 
-    Budgets are DERIVED from the measured decode rate of this deployment
-    (46.6 tok/s thinking-on, 2026-08-19 — docs/CONFIG.md) so each level maps
-    to a wall-clock target: medium ≈ 1.5 min, high ≈ 4.3 min, extra_high
-    ≈ 8.6 min. Env-overridable via THINKING_BUDGET_{MEDIUM,HIGH,EXTRA_HIGH}.
+    OFF by default (owner decision 2026-08-19: local deployment, no
+    per-token cost — thinking runs until the model closes it naturally).
+    Returns a budget ONLY when THINKING_BUDGET_MODE=client, which re-enables
+    the Phase 1 enforcement exactly as built. Budget values were DERIVED
+    from the measured decode rate (46.6 tok/s thinking-on — docs/CONFIG.md).
     """
+    if settings.thinking_budget_mode != "client":
+        return None
     return {
         "medium": settings.thinking_budget_medium,
         "high": settings.thinking_budget_high,
@@ -396,14 +422,19 @@ async def stream_chat_events(
     client = _client(base_url, api_key)
     thinking_on = wants_thinking(model_choice, effort)
     budget_tokens = thinking_budget(effort) if thinking_on else None
-    # The thinking budget GROWS the request: reasoning and answer draw from
-    # one max_tokens pool, and the documented failure mode is the model
-    # spending the whole allowance thinking and streaming nothing. When the
-    # caller asked for an answer ceiling, the thinking budget is added on top
-    # so the answer's room is never what the thinking ate.
+    # Sizing: reasoning and answer draw from one max_tokens pool, and the
+    # documented failure mode is the model spending the whole allowance
+    # thinking and streaming nothing. Budgeted mode (THINKING_BUDGET_MODE=
+    # client) adds the budget on top of the caller's answer ceiling.
+    # UNBOUNDED mode (the default) floors the request at MAX_OUTPUT_TOKENS
+    # (65,536) whenever thinking is on, so however long the model thinks the
+    # answer always has room — the 262k window is the only wall above that.
     requested = max_tokens
-    if budget_tokens and max_tokens is not None:
-        requested = max_tokens + budget_tokens
+    if thinking_on:
+        if budget_tokens and max_tokens is not None:
+            requested = max_tokens + budget_tokens
+        elif budget_tokens is None:
+            requested = max(max_tokens or 0, settings.max_output_tokens)
     # Size the call to the window of the model that will actually serve it.
     # "fast" resolves to a much smaller window than "smart", so a fixed
     # max_tokens that is fine on one is a 400 on the other.
@@ -433,15 +464,40 @@ async def stream_chat_events(
             extra_body["chat_template_kwargs"]["thinking_token_budget"] = budget_tokens
         request["extra_body"] = extra_body
 
-    # Client-side budget enforcement. On this deployment one streamed chunk
-    # is one token (verified: usage.completion_tokens == chunk count), so
-    # counting reasoning deltas IS counting reasoning tokens. The cap carries
-    # a grace factor so a thought at the nominal budget finishes its clause
-    # instead of being guillotined mid-sentence.
+    # Client-side budget enforcement — ACTIVE ONLY in budgeted mode. On this
+    # deployment one streamed chunk is one token (verified:
+    # usage.completion_tokens == chunk count), so counting reasoning deltas
+    # IS counting reasoning tokens. The cap carries a grace factor so a
+    # thought at the nominal budget finishes its clause instead of being
+    # guillotined mid-sentence.
     cap = int(budget_tokens * settings.thinking_budget_grace) if budget_tokens else None
     reasoning_seen = 0
+    token_seen = 0
+    # Hang guard, NOT a budget: it exists to catch degenerate repetition
+    # loops, and at the measured decode rate it only fires far past any real
+    # answer. Applies in BOTH modes.
+    import time as _time
+
+    started = _time.monotonic()
     stream = await client.chat.completions.create(**request)
     async for chunk in stream:
+        elapsed = _time.monotonic() - started
+        if elapsed > settings.gen_wall_clock_s:
+            log.error(
+                "GENERATION WALL CLOCK EXCEEDED: %.0fs > %.0fs on %s "
+                "(effort %r, %d reasoning + %d answer chunks) — killing the "
+                "stream and returning what was produced",
+                elapsed, settings.gen_wall_clock_s, model_id, effort,
+                reasoning_seen, token_seen,
+            )
+            with contextlib.suppress(Exception):
+                await stream.close()
+            yield (
+                "token",
+                f"\n\n[generation stopped after {int(elapsed)}s — wall-clock "
+                "guard; the text above is what was produced]",
+            )
+            return
         if not chunk.choices:
             continue
         delta = chunk.choices[0].delta
@@ -491,7 +547,18 @@ async def stream_chat_events(
             yield "reasoning", reasoning
         content = _delta_value(delta, "content")
         if content:
+            token_seen += 1
             yield "token", str(content)
+    # Usage telemetry (log-only): with budgets off this is the record of what
+    # unbounded thinking actually cost, and the data a future budget decision
+    # would be made from.
+    if thinking_on:
+        log.info(
+            "generation usage: %d reasoning + %d answer chunks in %.1fs "
+            "(effort %r, budget_mode %s)",
+            reasoning_seen, token_seen, _time.monotonic() - started,
+            effort, settings.thinking_budget_mode,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -590,10 +657,12 @@ async def chat_with_tools(
     client = _openai_client()
     model_id = model or settings.llm_model
     requested = max_tokens
-    if thinking and max_tokens is not None:
+    if thinking:
         budget_tokens = thinking_budget(effort)
-        if budget_tokens:
+        if budget_tokens and max_tokens is not None:
             requested = max_tokens + budget_tokens
+        elif budget_tokens is None:
+            requested = max(max_tokens or 0, settings.max_output_tokens)
     sized, budget = await context.fit_request(
         normalize_system(messages),
         base_url=settings.openai_base_url,
