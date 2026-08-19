@@ -1,5 +1,180 @@
 # Changelog
 
+## The Customer Success SOPs, and the keywords that never matched (2026-08-19)
+
+Two Customer Success SOPs ingested — the Phase 1-7 candidate-lifecycle chart
+flow and the internal-operations SOP — as `brain/packs/cs-candidate-lifecycle.yaml`
+and `brain/packs/cs-internal-operations.yaml`. Both sources refuse, on purpose,
+to name a single Salesforce field: they say every mapping must be verified
+separately first. Verified against the live warehouse, and the labels are real.
+
+- `Onboarding__c.Status__c` IS the SOP's ladder — `Welcome Call`, `Service
+  Agreement`, `Resume Creation`, `Onboarding Completed` — so "change the
+  Salesforce status to Service Agreement" was describing a picklist it could not
+  name. Phase 1 intake / Week 1 / Week 2 / OOT / rejection sessions are all
+  `Internal_Interview__c`, separable only by the `Interview_Type__c` lookup's
+  Name. Phase 7's credential gate is
+  `Background_Check__c.ACH_Authorization_Status__c`. Warnings and escalations
+  are `Case.Case_Reason__c`. And the trap: the SOP says "Terminated", production
+  stores `Terminate`.
+- No `field_notes` bar one, deliberately: every field these SOPs touch is
+  already owned by another pack, and `cs-*` sorts first in the filename order
+  `field_overlay` walks, so a note here would silently shadow the owner.
+
+**A known lesson that recurred because nothing enforced it.** `knowledge_for`
+stems each keyword as a WHOLE STRING while the question side is tokenised into
+single words, so a multi-word keyword (`out of training`, `phase 1`) can never
+match anything. This was learned on 2026-08-17 during the background-check
+ingestion and written down — and then repeated here, because a lesson with no
+gate is a lesson you get to learn twice. The before/after snapshot caught it
+("when does marketing start?" was answering from the Phase **1** chunk); all 33
+new chunks now use single words, and `test_no_pack_gains_a_keyword_that_can_never_match`
+makes it mechanical. Six older packs carry 25 dead keywords between them
+(qb-invoicing has 9); they are inert rather than wrong, so they are a ratcheted
+baseline that can fall but not rise.
+
+The same 20-question snapshot tuned the footprint down: `signed` and `agreement`
+came out of CS keyword lists once they were seen pushing the DocuSign pack off
+its own question. Two of the twenty existing questions still change — one a pure
+addition, one a fair swap. 17 of 18 new CS questions retrieve a CS chunk; the
+one miss is "what is the I-983 process?", because `_WORD_RE` needs a 2+ char
+token starting with a letter and **"I-983" tokenises to nothing**. The glossary
+path covers it — `glossary_for` regex-matches the raw question text.
+
+Gate: `validate_packs.py` passes all 21 packs, 0 failures, 0 advisories on the
+two new ones. No rebuild needed — packs are mounted read-only at `/data/brain`
+and the running orchestrator picked both up on the mtime scan.
+
+## The "computed over every row" block now actually is (2026-08-19)
+
+The deterministic summary — the block the answer model is REQUIRED to quote
+its numbers from, introduced because models mis-count samples — claimed
+"counts_cover: every row in the result". It was computed over at most 501
+rows: the fetch cap inherited the 500-row UI PREVIEW cap, so a query matching
+17,000 interviews had its "authoritative totals" calculated over 3% of the
+result and presented as exact.
+
+- New `SQL_SUMMARY_ROW_CAP` (default 100,000 — the export cap: if we will
+  write 100k rows to a CSV we can count 100k rows in memory). The fetch uses
+  it; `meta.data` stays a 500-row preview; the figures cover everything
+  fetched. Verified live: 17,393 rows fetched and summarised where 501 was
+  the ceiling.
+- Past even that cap, a COUNT(*) wrap fetches the TRUE total and the
+  coverage note changes to "the FIRST N rows of M total — state every figure
+  as covering those rows, never as the whole population".
+- The agent's SQL steps carried NO authoritative figures at all — synthesis
+  read a 30-row sample raw, so an agent-routed count was eyeballed while the
+  direct route quoted exact numbers. Each sql step's output now carries the
+  same deterministic block, computed over its whole fetched result.
+
+Deployed by hot-copy + container restart rather than an image rebuild, ON
+PURPOSE: the working tree carries in-progress extra_high-effort work
+(llm.py, best_of.py, ModelPicker) with 6 of its tests still red, and a
+rebuild would have baked that in half-finished. My changes pass; the
+extra_high work fails its own tests only.
+
+Tests: 1,398 passing for everything except the in-progress extra_high files.
+
+## No raw errors, and the words people actually use for money (2026-08-19)
+
+"from aug 1st till today how many candidates are being enrolled and how much
+money they have paid individually" ended in a red pill reading
+`Binder Error: Table "p" does not have a column named "Status__c"` — after the
+user had answered two clarifications. Four-link chain, each fixed:
+
+1. **No alias mapped "paid", "money" or "enrolled" to any table**, so the
+   prompt carried ZERO Payment__c fields and the model invented `p.Status__c`
+   (the real column is Payment_Status__c). TABLE_ALIASES now maps
+   paid/pay/money/fee/fees/amount → Payment__c+Invoice__c,
+   enrolled/enrolment/enrollment → Candidate_Training__c, and emi/emis/
+   installment → Invoice__c+Payment__c.
+2. **The retry learned nothing.** It got only the error string, guessed again,
+   failed again. A DuckDB binder error now gets PARSED — the failing alias is
+   resolved from the SQL we just ran and the retry receives that table's
+   COMPLETE real column list with "do not invent columns".
+3. **Both attempts failing re-raised**, and main.py turned it into an `error`
+   SSE frame — the raw binder text as a red pill. `run_sql_engine` now ends
+   the ladder with an honest in-conversation message; the raw detail goes to
+   `meta.salesforce_error` for the proof drawer, never the transcript.
+4. **Picklist literals were guessed.** "background checks pending payment
+   verification" filtered on the user's word order; the stored value is
+   'Payment Verification Pending' — 0 rows, no error, silently wrong (truth:
+   36). The SQL prompt now requires exact literals only when the prompt lists
+   them, and loose ILIKE word-matching otherwise.
+
+Verified on the deployed image: the exact failing question returns 45
+candidates with enrollments and individual amounts; the background-check count
+returns exactly 36; "unpaid EMIs" returns an HONEST zero (ground-truthed: no
+invoice in the warehouse has any EMI activity — the feature is unused, and the
+empty-result rules already make the answer say that rather than "no records
+exist").
+
+A 12-question battery across every domain (enrollment+payments, invoices,
+mocks, recruiters, background checks, DocuSign, dropouts, bill rates, sessions,
+EMIs, submissions) ran through the live pipeline: 11/12 clean after these
+fixes, the remaining gap being one cosmetic wrong-shape (an extra GROUP BY
+column). Side observation recorded for later: 12 PARALLEL out-of-process test
+scripts each opening their own PostgreSQL pool briefly exhausted
+max_connections ("too many clients") — an artifact of the test method, not of
+the single-process production server, but worth remembering if anything else
+ever spawns per-request processes.
+
+Tests: 1,398 backend.
+
+## The brain learns the portal, and unlearns three things it had wrong (2026-08-19)
+
+`Training_Module_Feature_Map_and_Memory.txt` — 336 KB documenting the Candidate
+Portal's Dev9 **sandbox** repo — became two packs: 308 knowledge chunks in a new
+`training-portal-implementation.yaml`, and verified data rules plus 67 field
+notes folded into `training-module.yaml`. Nine distillers, nine adversarial
+verifiers, every field name checked against the production warehouse.
+
+The interesting part was not what the document added. It was what production
+said about it. Three of four `Deliverable_Result__c` status values are wrong in
+the doc; `Program_Version__c.Status__c` is Draft/Published, not "Draft/Active";
+ten documented fields are not in the warehouse at all. The doc's mock
+discriminator is the one `org_brief` already forbids, and the probes refuted it
+again. One verifier returned **reject**: its distiller had declared the portal
+auth objects unqueryable, and the verifier disproved that by querying them.
+
+That catch reversed knowledge already shipped. `kb-portal-auth` was telling the
+model the portal was a preprod pilot and production adoption was "not rolled
+out" — there are 310 credentials and 878 sessions, 132 with a login, covering
+294 of the 333 candidates who have a training. It had been turning an
+answerable metric into a refusal. Two more corrections: the portal session
+token IS synced (so "never display it" is a real instruction now, not a
+theoretical one), and `Session__c.Create_Meeting_Error__c` — documented as the
+failed-Zoom-callout diagnostic — is NULL on all 3,263 rows and can never
+explain a missing meeting link.
+
+New traps, all measured: 997 deliverables carry no due date on either column,
+so a deadline filter drops them silently; only 313 of 618 trainings have any
+step and 360 have no deliverable, because Interview Readiness Training (half
+the org) uses neither by design; 618 trainings belong to 333 people;
+`Time_Zone__c` stores `'ET (Eastern Time)'` so `= 'ET'` matches nothing; and
+`Start_Tme_IST__c` — an API-name typo that cannot be renamed — is never NULL
+yet holds the literal string `': AM'` on 297 of 618 rows.
+
+Two rules went into `org_brief.TRAINING_RULES` rather than a pack, for a
+mechanical reason: `training` and `candidates` are org_brief trigger words, so a
+pack carrying the counting trap would never fire on "how many candidates are in
+training?" — precisely the question it exists to answer. There is a test.
+
+Adding 308 chunks to a shared retrieval pool is not free, and a before/after
+snapshot over 16 questions proved it twice. Prefixing every chunk "Training
+portal — " put `portal` in all 308 titles, which score 3x, and "how does a
+candidate log in to the portal?" began returning the availability calendar
+instead of the credential chunks; the prefix is now "Dev9 repo — ". And chunks
+at 2,800 chars meant one filled the 4,000-char budget where three had fit, so
+they are 1,400 now — the `kb-*` norm.
+
+`orchestrator/scripts/validate_packs.py` is in the repo instead of being
+rewritten from scratch a third time. It fails a phantom field named without a
+caveat, metric SQL selecting one, and duplicate `field_notes` keys — YAML keeps
+the last silently, and it ate one of these notes mid-ingestion. Chunks that
+name a sandbox-only field now carry their own caveat header, because
+`knowledge_for` labels retrieved prose "authoritative". All 19 packs pass.
+
 ## The platform hands over rows, never homework (2026-08-18)
 
 "give you a list of candidates having 150+ interviews" ended two different
