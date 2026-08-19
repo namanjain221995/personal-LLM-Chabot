@@ -31,14 +31,14 @@ def test_client_mode_restores_the_phase1_mapping(monkeypatch):
     monkeypatch.setattr(settings, "thinking_budget_mode", "client")
     assert llm.thinking_budget("fast") is None
     assert llm.thinking_budget("low") is None
-    assert llm.thinking_budget("medium") == settings.thinking_budget_medium
+    # Post-collapse: think carries the old High budget, max the Extra-High
+    # one; legacy names resolve through the aliases.
+    assert llm.thinking_budget("think") == settings.thinking_budget_high
+    assert llm.thinking_budget("max") == settings.thinking_budget_extra_high
+    assert llm.thinking_budget("medium") == settings.thinking_budget_high
     assert llm.thinking_budget("high") == settings.thinking_budget_high
     assert llm.thinking_budget("extra_high") == settings.thinking_budget_extra_high
-    assert (
-        settings.thinking_budget_medium
-        < settings.thinking_budget_high
-        < settings.thinking_budget_extra_high
-    )
+    assert settings.thinking_budget_high < settings.thinking_budget_extra_high
 
 
 def test_budgets_are_env_overridable(monkeypatch):
@@ -189,16 +189,16 @@ def test_client_mode_server_key_only_behind_the_proven_flag(
     stream = FakeStream([_chunk(content="hi")])
     stream_env["client"], completions = _fake_client([stream])
     asyncio.run(_collect(llm.stream_chat_events(
-        [{"role": "user", "content": "q"}], effort="medium", max_tokens=1000,
+        [{"role": "user", "content": "q"}], effort="think", max_tokens=1000,
     )))
     kwargs = completions.requests[0]["extra_body"]["chat_template_kwargs"]
-    assert kwargs["thinking_token_budget"] == settings.thinking_budget_medium
+    assert kwargs["thinking_token_budget"] == settings.thinking_budget_high
 
 
 def test_client_mode_overrun_forces_closure_and_regenerates(
     stream_env, client_mode, monkeypatch, caplog
 ):
-    monkeypatch.setattr(settings, "thinking_budget_medium", 10)
+    monkeypatch.setattr(settings, "thinking_budget_high", 10)
     monkeypatch.setattr(settings, "thinking_budget_grace", 1.2)  # cap = 12
 
     runaway = FakeStream([_chunk(reasoning="t")] * 40)
@@ -207,7 +207,7 @@ def test_client_mode_overrun_forces_closure_and_regenerates(
 
     with caplog.at_level("WARNING"):
         events = asyncio.run(_collect(llm.stream_chat_events(
-            [{"role": "user", "content": "q"}], effort="medium", max_tokens=500,
+            [{"role": "user", "content": "q"}], effort="think", max_tokens=500,
         )))
 
     kinds = [k for k, _ in events]
@@ -223,11 +223,11 @@ def test_client_mode_overrun_forces_closure_and_regenerates(
 def test_client_mode_within_budget_stream_is_untouched(
     stream_env, client_mode, monkeypatch
 ):
-    monkeypatch.setattr(settings, "thinking_budget_medium", 100)
+    monkeypatch.setattr(settings, "thinking_budget_high", 100)
     stream = FakeStream([_chunk(reasoning="r")] * 5 + [_chunk(content="ok")])
     stream_env["client"], completions = _fake_client([stream])
     events = asyncio.run(_collect(llm.stream_chat_events(
-        [{"role": "user", "content": "q"}], effort="medium", max_tokens=500,
+        [{"role": "user", "content": "q"}], effort="think", max_tokens=500,
     )))
     assert events == [("reasoning", "r")] * 5 + [("token", "ok")]
     assert len(completions.requests) == 1

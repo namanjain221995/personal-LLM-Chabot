@@ -76,7 +76,7 @@ def budget_for(effort: str = "medium", *, window: Optional[int] = None) -> Conte
     """
     reserved = (
         settings.model_high_max_output
-        if effort in ("high", "extra_high")
+        if effort in ("think", "max", "high", "extra_high")
         else settings.model_max_output
     )
     return ContextBudget(

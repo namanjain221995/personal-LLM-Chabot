@@ -113,16 +113,14 @@ def parse_plan(raw: str) -> Plan:
 #: Which tools each effort level may use.
 ALLOWED = {
     "fast": {"agent": False, "search": False},
-    "low": {"agent": False, "search": True},
-    "medium": {"agent": True, "search": True},
-    "high": {"agent": True, "search": True},
-    "extra_high": {"agent": True, "search": True},
+    "think": {"agent": True, "search": True},
+    "max": {"agent": True, "search": True},
 }
 
 
 def allowances(effort: str) -> dict:
     """What this effort level is permitted to do (unknown → treat as medium)."""
-    return ALLOWED.get(effort, ALLOWED["medium"])
+    return ALLOWED.get(llm.normalize_effort(effort), ALLOWED["think"])
 
 
 async def decide(message: str, history: Sequence[dict], effort: str) -> Plan:
@@ -152,7 +150,7 @@ async def decide(message: str, history: Sequence[dict], effort: str) -> Plan:
     # below it planned. Anything worth searching for at High is worth planning,
     # so the two travel together there. A question needing no tools at all is
     # still answered directly — High does not mean "always slow".
-    if effort in ("high", "extra_high") and search:
+    if llm.normalize_effort(effort) == "max" and search:
         agent = True
     return Plan(agent=agent, search=search)
 

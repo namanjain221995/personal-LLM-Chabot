@@ -245,7 +245,9 @@ class ChatRequest(BaseModel):
     # copy. Only meaningful in salesforce mode; ignored elsewhere.
     sf_live: bool = False
     model: Literal["smart", "fast"] = "smart"
-    effort: Literal["fast", "low", "medium", "high", "extra_high"] = "medium"
+    effort: Literal[
+        "fast", "think", "max", "low", "medium", "high", "extra_high"
+    ] = "think"
     agent: bool = False
     # V8: an uploaded PDF (base64, optionally a data: URL) + its filename.
     pdf: Optional[str] = None
@@ -302,6 +304,14 @@ class ChatRequest(BaseModel):
         if out and out[-1]["role"] == "user":
             out.pop()
         return out
+
+    @model_validator(mode="after")
+    def _canonical_effort(self) -> "ChatRequest":
+        # Legacy wire values (low/medium/high/extra_high) normalize to the
+        # 3-level ladder HERE, once — every engine and the trust metadata
+        # (meta.effort) see only fast|think|max.
+        self.effort = llm.normalize_effort(self.effort)
+        return self
 
     @model_validator(mode="after")
     def _require_input(self) -> "ChatRequest":
@@ -403,7 +413,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             extras["effort"] = request.effort  # applied to synthesis (§3b)
         elif route in ("sql", "rag", "report"):
             extras["model"] = llm.served_model_id("smart")
-            extras["effort"] = "medium"  # gpt-oss default; picker not applied
+            extras["effort"] = "think"  # engine default; picker not applied
         else:  # "chat": assistant mode or the salesforce chat class (§3a)
             extras["model"] = llm.served_model_id(request.model)
             extras["effort"] = request.effort

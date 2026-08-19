@@ -88,16 +88,22 @@ def test_merge_is_round_robin_so_each_angle_leads(monkeypatch):
 def test_high_collects_more_than_medium_more_than_low(monkeypatch):
     many = [result(f"https://s{i}.test/p") for i in range(80)]
     fake_provider(monkeypatch, many)
-    lo = len(collect(["q"], "low"))
-    med = len(collect(["q"], "medium"))
-    hi = len(collect(["q"], "high"))
-    assert lo < med < hi
-    assert hi == search.source_budget("high")
+    lo = len(collect(["q"], "think"))
+    med = len(collect(["q"], "think"))
+    hi = len(collect(["q"], "max"))
+    assert lo == med < hi
+    assert hi == search.source_budget("max")
 
 
 def test_low_was_not_cut_by_the_rework(monkeypatch):
     """Low read 10 sources before this change and must still read 10."""
-    assert search.source_budget("low") == 10
+    # 2026-08-19 ladder collapse: legacy names ride aliases — medium and
+    # high both land on Think's budget; only Max digs at the old High depth.
+    assert search.source_budget("medium") == search.source_budget("think") == 15
+    assert search.source_budget("high") == search.source_budget("think")
+    assert search.source_budget("extra_high") == search.source_budget("max") == 60
+    # Legacy low maps to fast, which never searches (allowance retired).
+    assert search.source_budget("low") == 0
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +147,7 @@ def test_one_site_cannot_dominate_the_result_set(monkeypatch):
     })
     out = collect(["q"], "high")
     spam = [r for r in out if "spam.test" in r.url]
-    assert len(spam) <= search._MAX_PER_DOMAIN["high"]
+    assert len(spam) <= search._MAX_PER_DOMAIN["max"]
 
 
 def test_subdomains_count_against_the_same_site(monkeypatch):
@@ -152,7 +158,7 @@ def test_subdomains_count_against_the_same_site(monkeypatch):
     })
     out = collect(["q"], "high")
     spam = [r for r in out if "spam.test" in r.url]
-    assert len(spam) <= search._MAX_PER_DOMAIN["high"], [r.url for r in out]
+    assert len(spam) <= search._MAX_PER_DOMAIN["max"], [r.url for r in out]
 
 
 def test_capped_pages_are_used_rather_than_wasted_when_results_are_thin(monkeypatch):

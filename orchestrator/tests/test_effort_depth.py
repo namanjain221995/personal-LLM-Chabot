@@ -21,9 +21,9 @@ from app.engines import agent, chat, search
 
 def test_high_searches_more_than_medium_which_searches_more_than_low():
     assert (
-        search.query_budget("low")
-        < search.query_budget("medium")
-        < search.query_budget("high")
+        search.query_budget("fast")
+        < search.query_budget("think")
+        < search.query_budget("max")
     )
 
 
@@ -41,7 +41,7 @@ def test_the_query_cap_is_actually_applied(monkeypatch):
         return '["q1","q2","q3","q4","q5","q6","q7","q8","q9","q10"]'
 
     monkeypatch.setattr(llm, "router_chat_completion", many)
-    for effort in ("low", "medium", "high"):
+    for effort in ("think", "max"):
         out = asyncio.run(search.rewrite_queries("q", [], effort))
         assert len(out) == search.query_budget(effort)
 
@@ -61,7 +61,7 @@ def test_query_rewriting_runs_on_the_small_model(monkeypatch):
 
     monkeypatch.setattr(llm, "router_chat_completion", router)
     monkeypatch.setattr(llm, "chat_completion", main)
-    asyncio.run(search.rewrite_queries("anything", [], "medium"))
+    asyncio.run(search.rewrite_queries("anything", [], "think"))
     assert calls == {"router": 1, "main": 0}
 
 
@@ -70,7 +70,7 @@ def test_a_failed_rewrite_still_searches_the_original_question(monkeypatch):
         raise RuntimeError("down")
 
     monkeypatch.setattr(llm, "router_chat_completion", boom)
-    assert asyncio.run(search.rewrite_queries("what is X", [], "high")) == ["what is X"]
+    assert asyncio.run(search.rewrite_queries("what is X", [], "max")) == ["what is X"]
 
 
 # ---------------------------------------------------------------------------
@@ -79,12 +79,15 @@ def test_a_failed_rewrite_still_searches_the_original_question(monkeypatch):
 
 
 def test_high_plans_more_steps_than_medium():
-    assert agent.step_budget("medium") < agent.step_budget("high")
+    assert agent.step_budget("think") < agent.step_budget("max")
+    # Legacy names ride the aliases to the same budgets.
+    assert agent.step_budget("medium") == agent.step_budget("think")
+    assert agent.step_budget("high") == agent.step_budget("think")
 
 
 def test_the_plan_budget_never_exceeds_the_validated_cap():
     """The schema rejects more than MAX_STEPS, so asking for more wastes a retry."""
-    for effort in ("fast", "low", "medium", "high", "bogus"):
+    for effort in ("fast", "think", "max", "low", "medium", "high", "bogus"):
         assert agent.step_budget(effort) <= agent.MAX_STEPS
 
 
@@ -99,13 +102,13 @@ def test_the_planner_is_asked_for_this_levels_step_count(monkeypatch, salesforce
         return '{"steps": [{"id": 1, "title": "t", "kind": "llm", "input": "x"}]}'
 
     monkeypatch.setattr(llm, "chat_completion", capture)
-    asyncio.run(agent.make_plan("q", [], salesforce, "medium"))
+    asyncio.run(agent.make_plan("q", [], salesforce, "think"))
     assert f"at most {agent.step_budget('medium')} " in seen["system"]
     assert f"at most {agent.MAX_STEPS} " not in seen["system"]
 
 
 def test_high_gets_more_room_for_the_final_answer():
-    assert agent._SYNTH_TOKENS["high"] > agent._SYNTH_TOKENS["medium"]
+    assert agent._SYNTH_TOKENS["max"] > agent._SYNTH_TOKENS["think"]
 
 
 def test_effort_reaches_the_step_runner():
@@ -126,7 +129,7 @@ def test_effort_reaches_the_step_runner():
 def test_thinking_levels_use_a_lower_temperature_than_chat():
     """0.6 invents API names in code; the thinking levels are used for code."""
     src = inspect.getsource(chat.run_chat_engine)
-    assert 'temperature = 0.3 if effort in ("medium", "high", "extra_high") else 0.6' in src
+    assert 'temperature = 0.3 if effort in ("think", "max") else 0.6' in src
 
 
 def test_high_gets_a_bigger_answer_ceiling():
@@ -150,25 +153,43 @@ def test_small_talk_gets_neither_diagrams_nor_code_rules():
 
 
 # ---------------------------------------------------------------------------
-# extra_high (Phase 1, 2026-08-19)
+# The 3-level ladder and its aliases (2026-08-19 collapse)
 # ---------------------------------------------------------------------------
 
 
-def test_extra_high_exists_at_every_effort_gate():
-    """extra_high must behave as at-least-High everywhere effort branches;
-    a missing dict key silently degrades it to Medium via .get fallbacks."""
+def test_max_exists_at_every_effort_gate():
+    """max must behave as at-least-Think everywhere effort branches; a
+    missing dict key silently degrades it via .get fallbacks."""
     from app import llm
     from app.engines import agent, orchestrate, search
 
-    assert "extra_high" in llm.REASONING_EFFORTS
-    assert llm.wants_thinking("smart", "extra_high") is True
-    assert search._QUERY_BUDGET["extra_high"] >= search._QUERY_BUDGET["high"]
-    assert search._SOURCE_BUDGET["extra_high"] >= search._SOURCE_BUDGET["high"]
-    assert agent._STEP_BUDGET["extra_high"] == agent.MAX_STEPS
-    assert agent._SYNTH_TOKENS["extra_high"] >= agent._SYNTH_TOKENS["high"]
+    assert llm.REASONING_EFFORTS == ("fast", "think", "max")
+    assert llm.wants_thinking("smart", "max") is True
+    assert search._QUERY_BUDGET["max"] >= search._QUERY_BUDGET["think"]
+    assert search._SOURCE_BUDGET["max"] >= search._SOURCE_BUDGET["think"]
+    assert agent._STEP_BUDGET["max"] == agent.MAX_STEPS
+    assert agent._SYNTH_TOKENS["max"] >= agent._SYNTH_TOKENS["think"]
+    assert orchestrate.allowances("max") == {"agent": True, "search": True}
+
+
+def test_legacy_wire_values_normalize_to_the_ladder():
+    """Old clients and stored prefs keep working: low->fast, medium/high->
+    think, extra_high->max, unknown->think."""
+    from app import llm
+    from app.engines import orchestrate, search
+
+    assert llm.normalize_effort("low") == "fast"
+    assert llm.normalize_effort("medium") == "think"
+    assert llm.normalize_effort("high") == "think"
+    assert llm.normalize_effort("extra_high") == "max"
+    assert llm.normalize_effort("bogus") == "think"
+    # Aliases reach the depth gates through normalization, not dict keys.
+    assert search.query_budget("high") == search.query_budget("think")
+    assert search.query_budget("extra_high") == search.query_budget("max")
     assert orchestrate.allowances("extra_high") == {"agent": True, "search": True}
+    assert orchestrate.allowances("fast") == {"agent": False, "search": False}
 
 
-def test_extra_high_gets_the_high_output_ceiling():
+def test_max_gets_the_high_output_ceiling():
     src = inspect.getsource(chat.run_chat_engine)
-    assert 'effort in ("high", "extra_high") and mode == "assistant"' in src
+    assert 'effort in ("think", "max") and mode == "assistant"' in src

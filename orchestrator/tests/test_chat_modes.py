@@ -77,12 +77,16 @@ def test_effort_is_expressed_as_thinking_not_a_system_line():
     messages = [{"role": "user", "content": "hi"}]
     assert llm.apply_reasoning_effort(messages, "high", "smart") == messages
 
-    # Four levels on one model: the top two think, the bottom two answer directly.
-    assert llm.wants_thinking("smart", "high") is True
-    assert llm.wants_thinking("smart", "medium") is True
-    assert llm.wants_thinking("smart", "low") is False
+    # Three levels on one model (2026-08-19 collapse): Think and Max
+    # reason, Fast answers directly. Legacy names normalize as aliases.
+    assert llm.wants_thinking("smart", "think") is True
+    assert llm.wants_thinking("smart", "max") is True
     assert llm.wants_thinking("smart", "fast") is False
-    assert "fast" in llm.REASONING_EFFORTS and "low" in llm.REASONING_EFFORTS
+    assert llm.wants_thinking("smart", "high") is True    # alias -> think
+    assert llm.wants_thinking("smart", "medium") is True  # alias -> think
+    assert llm.wants_thinking("smart", "low") is False    # alias -> fast
+    assert llm.REASONING_EFFORTS == ("fast", "think", "max")
+    assert llm.normalize_effort("extra_high") == "max"
 
 
 def test_thinking_body_is_the_chat_template_switch():
@@ -247,7 +251,7 @@ def test_assistant_mode_bypasses_router_and_duckdb(monkeypatch):
         "route": "chat",
         "mode": "assistant",
         "model": settings.llm_model,
-        "effort": "medium",
+        "effort": "think",
     }
     # No Salesforce claims: assistant system prompt, user message last.
     assert rec["model_choice"] == "smart"
@@ -268,9 +272,10 @@ def test_assistant_mode_fast_model_reports_router_model(monkeypatch):
         )
     events = dict(_parse_sse(resp.text))
     assert events["meta"]["model"] == settings.router_model
-    assert events["meta"]["effort"] == "low"
+    # Legacy "low" normalizes at the API boundary; meta reports canonical.
+    assert events["meta"]["effort"] == "fast"
     assert rec["model_choice"] == "fast"
-    assert rec["effort"] == "low"
+    assert rec["effort"] == "fast"
 
 
 def test_salesforce_mode_chat_route_streams_via_graph(monkeypatch):
@@ -300,7 +305,7 @@ def test_salesforce_mode_chat_route_streams_via_graph(monkeypatch):
         "route": "chat",
         "mode": "salesforce",
         "model": settings.llm_model,
-        "effort": "medium",
+        "effort": "think",
     }
     # The prompt used to tell users to toggle Salesforce OFF, which the
     # model generalised into "I don't have access to your Salesforce
@@ -342,7 +347,7 @@ def test_sql_route_meta_reports_serving_model_not_picker(monkeypatch):
     # The request asked for "fast" + "high"; the data engines are pinned to the
     # main model and report it honestly. (One model serves every path now, so
     # this is about the REPORTED id being the serving one, not the picker's.)
-    assert meta["effort"] == "medium"                # picker effort not applied
+    assert meta["effort"] == "think"                 # picker effort not applied
 
 
 def test_vision_route_meta_reports_vision_model(monkeypatch):
@@ -393,7 +398,9 @@ def test_agent_meta_reports_smart_model_and_applied_effort(monkeypatch):
         )
     meta = dict(_parse_sse(resp.text))["meta"]
     assert meta["model"] == settings.llm_model  # §3b: synthesis uses smart
-    assert meta["effort"] == "high"             # effort IS applied to synthesis
+    # Legacy "high" normalizes at the boundary; meta reports the canonical
+    # level that was actually applied to synthesis.
+    assert meta["effort"] == "think"
 
 
 def test_salesforce_mode_default_unchanged_router_still_runs(monkeypatch):

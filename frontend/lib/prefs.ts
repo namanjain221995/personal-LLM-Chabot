@@ -41,7 +41,7 @@ export const DEFAULT_PREFS: ChatPrefs = {
   salesforce: true,
   sfLive: false,
   model: 'smart',
-  effort: 'medium',
+  effort: 'think',
   agent: false,
   webSearch: 'auto',
 };
@@ -50,6 +50,24 @@ const STORAGE_KEY = 'techsara.chatprefs.v1';
 const DRAFT_SLOT = '__draft__';
 /** Cap the map so years of conversations cannot bloat localStorage. */
 const MAX_ENTRIES = 200;
+
+/** Pre-collapse levels stored by earlier builds normalize to the 3-level
+ *  ladder (2026-08-19): a saved 'high' keeps thinking as 'think', a saved
+ *  'extra_high' keeps best-of-N as 'max'. */
+const LEGACY_EFFORTS: Record<string, ReasoningEffort> = {
+  low: 'fast',
+  medium: 'think',
+  high: 'think',
+  extra_high: 'max',
+};
+
+function sanitizeEffort(value: unknown): ReasoningEffort {
+  if (value === 'fast' || value === 'think' || value === 'max') return value;
+  if (typeof value === 'string' && value in LEGACY_EFFORTS) {
+    return LEGACY_EFFORTS[value];
+  }
+  return DEFAULT_PREFS.effort;
+}
 
 function sanitize(raw: unknown): ChatPrefs {
   const p = (raw ?? {}) as Partial<ChatPrefs>;
@@ -61,14 +79,7 @@ function sanitize(raw: unknown): ChatPrefs {
     // there is no menu item to undo it, so it never survives salesforce=off.
     sfLive: p.sfLive === true && salesforce,
     model: p.model === 'fast' || p.model === 'smart' ? p.model : DEFAULT_PREFS.model,
-    effort:
-      p.effort === 'fast' ||
-      p.effort === 'low' ||
-      p.effort === 'medium' ||
-      p.effort === 'high' ||
-      p.effort === 'extra_high'
-        ? p.effort
-        : DEFAULT_PREFS.effort,
+    effort: sanitizeEffort(p.effort),
     // Both of these had composer toggles that are now gone, so a value saved
     // by the old UI can no longer be changed by the user. Left as-is, someone
     // who once switched search off would never search again, and someone who

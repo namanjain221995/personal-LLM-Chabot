@@ -40,7 +40,18 @@ MODEL_CHOICES = ("smart", "fast")
 # Four levels on ONE model. "fast" and "low" skip the reasoning pass; the
 # difference between them is how much work the orchestrator may do (low may
 # search the web, fast may not). See engines/orchestrate.py.
-REASONING_EFFORTS = ("fast", "low", "medium", "high", "extra_high")
+REASONING_EFFORTS = ("fast", "think", "max")
+#: Pre-collapse wire values (2026-08-19 ladder collapse) normalize to the
+#: three honest levels; accepted forever for stored prefs and old clients.
+EFFORT_ALIASES = {"low": "fast", "medium": "think", "high": "think", "extra_high": "max"}
+
+
+def normalize_effort(effort: str) -> str:
+    """Canonical effort for any accepted wire value; unknown -> think."""
+    value = (effort or "").strip().lower()
+    if value in REASONING_EFFORTS:
+        return value
+    return EFFORT_ALIASES.get(value, "think")
 
 
 def normalize_system(messages: Sequence[dict]) -> List[dict]:
@@ -275,8 +286,8 @@ def wants_thinking(model_choice: str = "smart", effort: str = "medium") -> bool:
     """
     if model_choice != "smart":
         return False
-    # Fast and Low answer directly; Medium and above think first.
-    return effort in ("medium", "high", "extra_high")
+    # Fast answers directly; Think and Max reason first.
+    return normalize_effort(effort) in ("think", "max")
 
 
 def thinking_budget(effort: str) -> Optional[int]:
@@ -290,11 +301,13 @@ def thinking_budget(effort: str) -> Optional[int]:
     """
     if settings.thinking_budget_mode != "client":
         return None
+    # Post-collapse mapping: think carries the old High budget, max the
+    # old Extra-High one. THINKING_BUDGET_MEDIUM is retired (kept as an
+    # env for compatibility, no longer consulted).
     return {
-        "medium": settings.thinking_budget_medium,
-        "high": settings.thinking_budget_high,
-        "extra_high": settings.thinking_budget_extra_high,
-    }.get(effort)
+        "think": settings.thinking_budget_high,
+        "max": settings.thinking_budget_extra_high,
+    }.get(normalize_effort(effort))
 
 
 def thinking_body(enabled: bool) -> dict:

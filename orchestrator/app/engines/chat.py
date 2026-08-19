@@ -75,6 +75,7 @@ async def run_chat_engine(
     effort: str = "medium",
 ) -> str:
     """Stream a plain completion from the selected model; meta route=chat."""
+    effort = llm.normalize_effort(effort)
     # The thinking model spends a large, variable share of its budget on
     # reasoning before emitting a single answer token — a small ceiling makes
     # longer asks (e.g. "draw a flowchart of X") come back EMPTY. max_tokens is
@@ -83,11 +84,11 @@ async def run_chat_engine(
     # High is the level for hard questions — long code, real derivations — so
     # it gets room to finish. A ceiling that cuts the answer mid-function is
     # worse than a slow answer.
-    if effort in ("high", "extra_high") and mode == "assistant":
+    if effort in ("think", "max") and mode == "assistant":
         max_tokens = 16000
     # Thinking levels are used for code and analysis, where 0.6 invents API
     # names and drifts. Fast/Low stay conversational.
-    temperature = 0.3 if effort in ("medium", "high", "extra_high") else 0.6
+    temperature = 0.3 if effort in ("think", "max") else 0.6
 
     # extra_high = best-of-N: EXTRA_HIGH_SAMPLES candidates generated
     # CONCURRENTLY, a thinking-off guided-JSON judge picks the winner, and
@@ -95,7 +96,7 @@ async def run_chat_engine(
     # Zero usable candidates falls through to the ordinary single stream —
     # best-of-N must never make extra_high worse than high.
     if (
-        effort == "extra_high"
+        effort == "max"
         and model_choice == "smart"
         and settings.extra_high_samples > 1
     ):

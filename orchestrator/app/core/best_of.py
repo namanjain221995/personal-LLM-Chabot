@@ -66,7 +66,7 @@ async def _generate_one(
     try:
         reasoning, answer = await llm.chat_completion_with_reasoning(
             messages,
-            effort="extra_high",
+            effort="max",
             temperature=temperature,
             max_tokens=max_tokens,
         )

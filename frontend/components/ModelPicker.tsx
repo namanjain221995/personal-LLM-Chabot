@@ -20,32 +20,28 @@ import { useEffect, useRef, useState } from 'react';
 import type { ModelChoice, ReasoningEffort } from '@/lib/types';
 import { IconCheck, IconChevronDown } from './icons';
 
-const EFFORTS: ReasoningEffort[] = ['fast', 'low', 'medium', 'high', 'extra_high'];
+// Three honest levels (2026-08-19 collapse): thinking is UNBOUNDED at Think
+// and Max — no token budgets — so the ladder is about capability, not caps.
+const EFFORTS: ReasoningEffort[] = ['fast', 'think', 'max'];
 
 const EFFORT_LABEL: Record<ReasoningEffort, string> = {
   fast: 'Fast',
-  low: 'Low',
-  medium: 'Medium',
-  high: 'High',
-  extra_high: 'Extra-High',
+  think: 'Think',
+  max: 'Max',
 };
 
 const EFFORT_SHORT: Record<ReasoningEffort, string> = {
   fast: 'Fast',
-  low: 'Low',
-  medium: 'Med',
-  high: 'High',
-  extra_high: 'XHigh',
+  think: 'Think',
+  max: 'Max',
 };
 
 /** What each level actually does — shown so the trade-off is never a guess. */
 const EFFORT_HELP: Record<ReasoningEffort, string> = {
   fast: 'Answers straight away · no thinking, no tools',
-  low: 'No thinking · searches the web only if the question needs it',
-  medium: 'Thinks first · plans multi-step work and searches when useful',
-  high: 'Thinks long · same tools as Medium for the hardest tasks',
-  extra_high:
-    'Thinks longest · drafts several answers in parallel and keeps the best',
+  think:
+    'Thinks as long as it needs · plans multi-step work and searches when useful',
+  max: 'Unbounded thinking · drafts several answers in parallel, keeps the best',
 };
 
 export function ModelPicker({

@@ -39,14 +39,14 @@ STEP_CONCURRENCY = 3
 # Plan size by level — the schema cap stays MAX_STEPS; this is how many the
 # planner is ASKED for. High is the level you pick for a hard question, so it
 # is allowed to break the work down further than Medium.
-_STEP_BUDGET = {"medium": 5, "high": MAX_STEPS, "extra_high": MAX_STEPS}
+_STEP_BUDGET = {"think": 5, "max": MAX_STEPS}
 # Room for the final answer. A long plan needs a long synthesis, or High reads
 # more and then truncates what it learned.
-_SYNTH_TOKENS = {"medium": 6000, "high": 12000, "extra_high": 12000}
+_SYNTH_TOKENS = {"think": 6000, "max": 12000}
 
 
 def step_budget(effort: str) -> int:
-    return _STEP_BUDGET.get(effort, _STEP_BUDGET["medium"])
+    return _STEP_BUDGET.get(llm.normalize_effort(effort), _STEP_BUDGET["think"])
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.S | re.I)
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.S | re.I)
@@ -241,7 +241,7 @@ async def make_plan(
                 f"{message}"
             )
     messages = (
-        llm.apply_reasoning_effort([{"role": "system", "content": system}], "high")
+        llm.apply_reasoning_effort([{"role": "system", "content": system}], "max")
         + recent_turns(history, 6)
         + [{"role": "user", "content": user_content}]
     )
@@ -371,8 +371,19 @@ async def _run_step_impl(
         # Same pipeline, same guarantees as the direct SQL route — an
         # agent-routed chart request now behaves identically to a direct one.
         await attach_chart(sub_meta, f"{message}\n{step.input}", columns, preview)
+        # The synthesis used to see ONLY a 30-row sample — no authoritative
+        # figures at all — so an agent-routed count was read off the sample
+        # while the direct route quoted numbers computed over every row. Same
+        # mechanism now: exact counts/totals over the WHOLE fetched result
+        # ride with the step output, and the sample stays an illustration.
+        from .sql import deterministic_summary
+
+        computed = deterministic_summary(columns, rows)
         return (
-            f"SQL result ({len(rows)} row(s)):\n{sample}",
+            f"SQL result ({len(rows)} row(s)):\n{sample}\n"
+            "Computed figures (AUTHORITATIVE — calculated in code over every "
+            f"row; quote these, never count the sample):\n"
+            f"{json.dumps(computed, default=str)[:3000]}",
             f"{len(rows)} row(s)",
             sub_meta,
         )
@@ -725,7 +736,9 @@ async def _synthesize_node(state: AgentState) -> dict:
         model_choice="smart",
         effort=state.get("effort", "medium"),
         temperature=0.2,
-        max_tokens=_SYNTH_TOKENS.get(state.get("effort", "medium"), 6000),
+        max_tokens=_SYNTH_TOKENS.get(
+            llm.normalize_effort(state.get("effort", "think")), 6000
+        ),
     ):
         if kind == "reasoning":
             await emit("reasoning", {"text": text})

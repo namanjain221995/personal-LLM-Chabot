@@ -637,7 +637,9 @@ async def _execute_live(
 
     parts: List[str] = []
     max_tokens = (
-        settings.model_high_max_output if effort in ("high", "extra_high") else settings.model_max_output
+        settings.model_high_max_output
+        if effort in ("think", "max", "high", "extra_high")
+        else settings.model_max_output
     )
     async for kind, delta in llm.stream_chat_events(
         messages,

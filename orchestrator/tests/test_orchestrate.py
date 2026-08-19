@@ -68,31 +68,36 @@ def test_fast_never_escalates_and_never_even_asks(monkeypatch):
     assert called["n"] == 0, "Fast must not even pay for the classifier"
 
 
-def test_low_may_search_but_never_runs_the_agent(monkeypatch):
-    """Low is 'quick, but look it up if you must'."""
+def test_legacy_low_now_behaves_as_fast(monkeypatch):
+    """2026-08-19 collapse: 'low' aliases to Fast — quick answer, no tools.
+    Its old search-only allowance is retired with the level."""
     monkeypatch.setattr(
         llm, "router_chat_completion", fake_classifier('{"agent": true, "search": true}')
     )
     plan = asyncio.run(orchestrate.decide("design a huge system", [], "low"))
-    assert plan.search is True, "low may search"
-    assert plan.agent is False, "low must never escalate to agent steps"
+    assert plan.search is False, "legacy low = fast: never searches"
+    assert plan.agent is False, "legacy low = fast: never escalates"
 
 
 def test_the_classifier_can_only_narrow_never_escalate():
     """A level's allowance is a ceiling the model cannot argue its way past."""
     assert orchestrate.allowances("fast") == {"agent": False, "search": False}
-    assert orchestrate.allowances("low") == {"agent": False, "search": True}
+    # 2026-08-19 collapse: legacy low -> fast, which neither searches nor
+    # plans (its old search-only allowance is retired with the level).
+    assert orchestrate.allowances("low") == {"agent": False, "search": False}
+    assert orchestrate.allowances("think") == {"agent": True, "search": True}
     assert orchestrate.allowances("medium") == {"agent": True, "search": True}
+    assert orchestrate.allowances("max") == {"agent": True, "search": True}
     assert orchestrate.allowances("high") == {"agent": True, "search": True}
     # An unrecognised value must not silently unlock everything or nothing.
-    assert orchestrate.allowances("bogus") == orchestrate.allowances("medium")
+    assert orchestrate.allowances("bogus") == orchestrate.allowances("think")
 
 
 def test_medium_and_high_effort_do_classify(monkeypatch):
     monkeypatch.setattr(
         llm, "router_chat_completion", fake_classifier('{"agent": true, "search": true}')
     )
-    for effort in ("medium", "high"):
+    for effort in ("think", "max"):
         plan = asyncio.run(orchestrate.decide("design a migration", [], effort))
         assert plan.agent is True and plan.search is True
 
@@ -163,19 +168,17 @@ def test_escalation_is_described_for_the_user():
 # ---------------------------------------------------------------------------
 
 
-def test_high_plans_whenever_it_searches(monkeypatch):
-    """Observed live: the same research question came back {agent, search} at
-    Medium and {search} at High, so High answered with a one-shot search while
-    the level below it planned. Anything worth searching for at High is worth
-    planning."""
+def test_max_plans_whenever_it_searches(monkeypatch):
+    """The deepest level forces planning alongside search — anything worth
+    searching for at Max is worth planning. Think does exactly what the
+    classifier said (the pre-collapse High forcing now lives at Max)."""
     monkeypatch.setattr(
         llm, "router_chat_completion", fake_classifier('{"agent": false, "search": true}')
     )
-    high = asyncio.run(orchestrate.decide("research this", [], "high"))
-    assert high.agent is True and high.search is True
-    # Medium still does exactly what the classifier said.
-    medium = asyncio.run(orchestrate.decide("research this", [], "medium"))
-    assert medium.agent is False and medium.search is True
+    deepest = asyncio.run(orchestrate.decide("research this", [], "max"))
+    assert deepest.agent is True and deepest.search is True
+    think = asyncio.run(orchestrate.decide("research this", [], "think"))
+    assert think.agent is False and think.search is True
 
 
 def test_high_still_answers_simple_questions_directly(monkeypatch):

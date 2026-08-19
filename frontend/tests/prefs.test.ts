@@ -18,15 +18,15 @@ function makeStorage(): StorageLike {
 }
 
 describe('composer prefs (V2 §4c per-conversation persistence)', () => {
-  it('defaults to Salesforce ON, Smart, Medium, search Auto', () => {
+  it('defaults to Salesforce ON, Smart, Think, search Auto', () => {
     expect(DEFAULT_PREFS).toEqual({
       salesforce: true,
       sfLive: false,
       model: 'smart',
-      effort: 'medium',
+      effort: 'think',
       agent: false,
       // The composer toggle is gone (2026-07-28) — the level decides, so the
-      // default must be Auto or Low/Medium/High could never search.
+      // default must be Auto or Fast could never search.
       webSearch: 'auto',
     });
     expect(loadPrefs(makeStorage(), 'unknown-conv')).toEqual(DEFAULT_PREFS);
@@ -38,7 +38,7 @@ describe('composer prefs (V2 §4c per-conversation persistence)', () => {
       salesforce: false,
       sfLive: false,
       model: 'fast',
-      effort: 'medium',
+      effort: 'think',
       agent: false,
       webSearch: 'auto',
     });
@@ -47,13 +47,13 @@ describe('composer prefs (V2 §4c per-conversation persistence)', () => {
       salesforce: false,
       sfLive: false,
       model: 'smart',
-      effort: 'high',
+      effort: 'max',
       agent: false,
       webSearch: 'on',
     });
     expect(loadPrefs(storage, 'c1').salesforce).toBe(false);
     expect(loadPrefs(storage, 'c1').model).toBe('fast');
-    expect(loadPrefs(storage, 'c2').effort).toBe('high');
+    expect(loadPrefs(storage, 'c2').effort).toBe('max');
     expect(loadPrefs(storage, 'c2').webSearch).toBe('on');
   });
 
@@ -63,12 +63,12 @@ describe('composer prefs (V2 §4c per-conversation persistence)', () => {
       salesforce: false,
       sfLive: false,
       model: 'smart',
-      effort: 'low',
+      effort: 'fast',
       agent: false,
       webSearch: 'auto',
     });
     const adopted = adoptDraftPrefs(storage, 'new-conv');
-    expect(adopted.effort).toBe('low');
+    expect(adopted.effort).toBe('fast');
     expect(loadPrefs(storage, 'new-conv').salesforce).toBe(false);
     // Draft slot resets afterwards.
     expect(loadPrefs(storage, null)).toEqual(DEFAULT_PREFS);
@@ -108,7 +108,7 @@ describe('composer prefs (V2 §4c per-conversation persistence)', () => {
     storage.setItem(
       'techsara.chatprefs.v1',
       JSON.stringify({
-        c1: { salesforce: 'yes', model: 'gpt5', effort: 'max', agent: 1 },
+        c1: { salesforce: 'yes', model: 'gpt5', effort: 'ultra', agent: 1 },
       }),
     );
     expect(loadPrefs(storage, 'c1')).toEqual(DEFAULT_PREFS);
@@ -131,7 +131,7 @@ describe('Live Salesforce pref (2026-08-06)', () => {
       salesforce: false,
       sfLive: true,
       model: 'smart',
-      effort: 'medium',
+      effort: 'think',
       agent: false,
       webSearch: 'auto',
     });
@@ -144,10 +144,30 @@ describe('Live Salesforce pref (2026-08-06)', () => {
       salesforce: true,
       sfLive: true,
       model: 'smart',
-      effort: 'medium',
+      effort: 'think',
       agent: false,
       webSearch: 'auto',
     });
     expect(loadPrefs(storage, 'c1').sfLive).toBe(true);
+  });
+});
+
+describe('legacy effort values (pre-collapse builds)', () => {
+  it('normalizes stored low/medium/high/extra_high to the 3-level ladder', () => {
+    const storage = makeStorage();
+    storage.setItem(
+      'techsara.chatprefs.v1',
+      JSON.stringify({
+        // Raw JSON as an old build wrote it — deliberately not typed.
+        a: { ...structuredClone(DEFAULT_PREFS), effort: 'low' as string },
+        b: { ...structuredClone(DEFAULT_PREFS), effort: 'medium' as string },
+        c: { ...structuredClone(DEFAULT_PREFS), effort: 'high' as string },
+        d: { ...structuredClone(DEFAULT_PREFS), effort: 'extra_high' as string },
+      }),
+    );
+    expect(loadPrefs(storage, 'a').effort).toBe('fast');
+    expect(loadPrefs(storage, 'b').effort).toBe('think');
+    expect(loadPrefs(storage, 'c').effort).toBe('think');
+    expect(loadPrefs(storage, 'd').effort).toBe('max');
   });
 });
