@@ -83,3 +83,52 @@ similar future questions; a 👎 on the same SQL anywhere disqualifies it.
 | `BRAIN_MAX_CHARS`          | `4000`       | Cap on retrieved knowledge per prompt   |
 | `LEARNED_EXAMPLES_ENABLED` | `true`       | Learn-from-chat few-shots               |
 | `LEARNED_EXAMPLES_K`       | `2`          | Max examples per prompt                 |
+
+## Before you ship a pack: run the gate
+
+```sh
+python orchestrator/scripts/validate_packs.py            # all packs, live warehouse
+python orchestrator/scripts/validate_packs.py --advisories
+```
+
+It enforces the one rule that decides accuracy — *never teach the model a field
+production does not have* — and it blocks on the things that reach the SQL
+writer: a phantom field in `tables`, `rules`, `metrics` or `glossary` without a
+caveat nearby, metric SQL selecting one, and **duplicate `field_notes` keys**
+(YAML silently keeps the last, so the first note vanishes with no error).
+
+Dead field notes and `knowledge` prose are advisory, not failures: the merge
+drops unknown notes at load, and knowledge chunks are exactly where sandbox
+detail belongs. If a chunk must name a sandbox-only field, open it with
+
+```
+NOT IN THE PRODUCTION WAREHOUSE (Dev9 repo/sandbox names — describe them,
+never query them): Foo__c, Bar__c
+```
+
+and the gate treats the whole chunk as covered for those names only.
+
+## Two things that bite when a pack gets large
+
+- **Field notes are global and last-write-wins.** `brain.field_overlay` walks
+  packs in filename order and `sf_dictionary.merge` overwrites, so two packs
+  noting the same field means the alphabetically later one wins silently. Keep
+  one owner per object, and make an override deliberate.
+- **Knowledge is a shared pool with a small budget.** `knowledge_for` returns
+  the top 3 across ALL packs inside `BRAIN_MAX_CHARS` (4,000), scoring a
+  title/keyword hit 3x a body hit. So: keep chunks near 1,400 chars (one 3,000
+  char chunk starves the other two), and keep common query words out of a
+  shared title prefix — a prefix of "Training portal — " put `portal` in 308
+  titles and displaced the packs that actually own that word.
+- **`keywords` must be SINGLE WORDS.** `knowledge_for` stems each keyword as a
+  whole string and matches it against the question's individual word tokens, so
+  a multi-word keyword — `out of training`, `phase 1`, `service agreement` —
+  matches nothing, ever, and is silently dead weight. Write `[out, training]`,
+  not `[out of training]`. (Found 2026-08-19 ingesting the CS SOPs: "when does
+  marketing start?" was answering from the Phase 1 chunk because the Phase 5
+  chunk's `ready to start marketing` keyword could not fire.)
+- **Take a before/after retrieval snapshot.** Adding chunks to a top-3 pool is
+  never free. Diff what a set of EXISTING questions retrieves with the new pack
+  present and absent — that is how both of the traps above were caught, and how
+  a keyword worth removing (`signed`, pushing the DocuSign pack off its own
+  question) shows itself.

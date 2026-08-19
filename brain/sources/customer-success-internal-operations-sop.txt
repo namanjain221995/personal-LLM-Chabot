@@ -1,0 +1,785 @@
+CUSTOMER SUCCESS INTERNAL OPERATIONS SOP - BRAIN KNOWLEDGE SOURCE
+=================================================================
+
+SOURCE PURPOSE
+--------------
+This file converts the internal Customer Success SOP PDF into structured knowledge for an LLM / Salesforce-aware business brain.
+
+The goal is to teach the AI:
+- what Customer Success (CS) is responsible for,
+- the operational sequence of major CS workflows,
+- the handoffs between CS and internal teams,
+- the decision points, timing expectations, follow-up loops, warnings, escalations, and closure rules,
+- which Salesforce status changes are explicitly mentioned in the SOP,
+- and how to answer process questions without inventing Salesforce objects or fields.
+
+This is PROCESS KNOWLEDGE. It is not a Salesforce schema specification.
+
+IMPORTANT SALESFORCE GROUNDING RULE
+-----------------------------------
+The SOP explicitly requires Salesforce updates, but it does NOT provide Salesforce object API names or field API names.
+
+Therefore:
+1. Treat terms such as "Salesforce status", "Service Agreement", "Resume Creation", and "Terminated" as business-process concepts/states.
+2. Do NOT invent object names such as Candidate__c, Contact, Opportunity, Interview__c, or any other object unless verified by the existing Salesforce data brain/schema.
+3. Do NOT invent field names such as Status__c, Stage__c, Candidate_Status__c, or similar.
+4. If a user asks which Salesforce object or field stores one of these concepts, first use the verified Salesforce schema knowledge already available to the brain.
+5. If the schema does not confirm the mapping, say that the SOP defines the business action but does not identify the Salesforce API field/object.
+6. Process knowledge from this file and schema knowledge from the Salesforce brain should be combined only when both are verified.
+
+=================================================================
+1. CUSTOMER SUCCESS OPERATING MODEL
+=================================================================
+
+Customer Success acts as an operational coordination layer across the candidate journey. The SOP shows CS responsibilities covering:
+- welcome call and onboarding,
+- agreement/status progression,
+- document verification,
+- resume coordination,
+- training allocation,
+- marketing/application handoff,
+- offer-letter and I-983 workflows,
+- issue resolution and escalation,
+- termination handling,
+- offer-received onboarding support,
+- ACH/EMI payment follow-up,
+- Salesforce status maintenance,
+- communication, documentation, transparency, and record keeping.
+
+Core operating principles repeated or implied throughout the SOP:
+- Keep Salesforce status current in real time.
+- Keep proper documentation of warnings and escalations.
+- Communicate professionally at every stage.
+- Maintain 24-hour turnaround time wherever applicable.
+- Be transparent with candidates and internal teams.
+- Document processes and decisions.
+- Keep the candidate informed while issues are being resolved.
+- Escalate when a problem cannot be resolved at the operational level.
+
+=================================================================
+2. WELCOME CALL AND ONBOARDING PROCESS
+=================================================================
+
+TRIGGER
+-------
+A candidate enters the Customer Success onboarding process.
+
+STEP 1 - WELCOME AND PROCESS BRIEFING
+-------------------------------------
+Customer Success should:
+- Call the candidate.
+- Explain the company process.
+- Explain/document the major process areas, including:
+  - documentation,
+  - resume creation,
+  - training,
+  - marketing.
+- Complete the onboarding form.
+- Get the agreement signed.
+
+Interpretation:
+The welcome call is not just a greeting. It is the process-orientation stage where the candidate is introduced to the end-to-end journey and required onboarding documentation is completed.
+
+STEP 2 - STATUS UPDATE
+----------------------
+After the onboarding form/agreement step:
+- Change the Salesforce status to "Service Agreement".
+
+Salesforce note:
+"Service Agreement" is an SOP-defined business status label. The PDF does not identify the Salesforce object or API field that stores it.
+
+STEP 3 - DOCUMENT VERIFICATION
+------------------------------
+Customer Success should:
+- Verify candidate details.
+- Request resume creation.
+- Assign a Team Lead within 24 hours.
+- Change the status to "Resume Creation".
+
+Timing rule:
+Team Lead assignment is expected within 24 hours.
+
+Salesforce note:
+"Resume Creation" is an SOP-defined business status label. The PDF does not identify the Salesforce object or API field that stores it.
+
+STEP 4 - RESUME PROCESS
+-----------------------
+Customer Success should:
+- Follow up with the Team Lead.
+- Get candidate approval within 24 hours.
+- Arrange a 30-minute call if modifications are needed.
+- Auto-approve the resume after 24 hours when applicable.
+
+Process intent:
+The resume stage is designed to prevent indefinite waiting. Candidate review should happen within the defined turnaround window, with a short discussion arranged when revisions are required.
+
+STEP 5 - TRAINING ALLOCATION
+----------------------------
+Customer Success should:
+- Share the resume with the Training Team.
+- Confirm training completion.
+
+Handoff:
+The resume process transitions into training coordination. CS is responsible for ensuring the relevant training team receives the candidate/resume and that training completion is confirmed.
+
+STEP 6 - MARKETING AND APPLICATION
+----------------------------------
+Customer Success should:
+- Ensure the Team Lead begins marketing.
+- Collect credentials.
+- Complete onboarding.
+
+END STATE
+---------
+The initial Customer Success onboarding flow is complete and the candidate proceeds into the marketing/application stage.
+
+=================================================================
+3. OFFER LETTER / I-983 PROCESS
+=================================================================
+
+The SOP separates this process into three tracks.
+
+TRACK A - INITIAL OPT CANDIDATES
+--------------------------------
+Sequence:
+1. Provide an unpaid 24-hour offer letter.
+2. Collect the USCIS email.
+3. Create the USCIS case.
+4. Candidate completes the case.
+5. Verify details thoroughly.
+6. Issue the offer letter.
+
+Key control:
+The details must be verified before the offer letter is issued.
+
+TRACK B - STEM OPT CANDIDATES
+-----------------------------
+Sequence:
+1. Provide a full-time 40-hours offer letter.
+2. Follow USCIS case creation.
+3. Complete the verification process.
+4. Issue the offer letter.
+
+Key control:
+The verification process occurs before final offer-letter issuance.
+
+TRACK C - I-983 FORM PROCESS
+----------------------------
+Sequence:
+1. Verify all I-983 details.
+2. Cross-check employer and candidate information.
+3. Get the supervisor signature.
+4. Share the signed copy with the candidate.
+
+COMPLETION
+----------
+Each track reaches a completed state only after its required steps are finished.
+
+AI BOUNDARY FOR IMMIGRATION-RELATED QUESTIONS
+---------------------------------------------
+This SOP describes an internal workflow only. It does not provide legal interpretations, eligibility rules, government policy explanations, or a complete immigration compliance standard.
+
+When answering from this source:
+- Explain the documented internal sequence.
+- Do not infer legal requirements beyond the SOP.
+- Do not state that an internal workflow guarantees USCIS or immigration compliance.
+- If a user asks for legal/immigration interpretation, distinguish that question from the operational SOP.
+
+=================================================================
+4. CASE RESOLUTION PROCESS
+=================================================================
+
+TRIGGER
+-------
+An issue arises.
+
+DECISION - ISSUE TYPE
+---------------------
+The issue is categorized into one of two paths:
+A. Candidate issue
+B. Internal team issue
+
+A. CANDIDATE ISSUE PATH
+-----------------------
+Sequence:
+1. Understand the problem.
+2. Coordinate with the relevant team.
+3. Provide a solution within TAT.
+4. Keep the candidate informed.
+5. Mark/consider the matter resolved when the required action is complete.
+
+Core expectation:
+The candidate should not be left without communication while the issue is being handled.
+
+B. INTERNAL TEAM ISSUE PATH
+---------------------------
+Sequence:
+1. Discuss with the team member.
+2. Investigate properly.
+3. Decide: Can the issue be resolved at the operational level?
+
+If YES:
+- Resolve and close the issue.
+- Move to resolved state.
+
+If NO:
+- Escalate to Management.
+- Document the escalation.
+- Continue to resolution/closure.
+
+MANDATORY DOCUMENTATION RULE
+----------------------------
+All escalations must be documented.
+
+AI INTERPRETATION
+-----------------
+Operational teams should solve issues directly when they can do so within their authority. Management escalation is the path for issues that cannot be resolved operationally. Documentation is required for escalations regardless of the ultimate outcome.
+
+=================================================================
+5. TERMINATION PROCESS
+=================================================================
+
+The SOP defines two different termination paths:
+A. Availability issues
+B. Behavioral issues
+
+A. AVAILABILITY ISSUES - PROGRESSIVE WARNING PATH
+-------------------------------------------------
+Trigger:
+- Candidate misses availability twice.
+
+Step 1 - First Warning
+- Send a formal warning email.
+- Explain the issue.
+
+Decision: Does the issue repeat?
+- If NO: Process ends / monitor.
+- If YES: Continue to Second Warning.
+
+Step 2 - Second Warning
+- Inform the candidate about the termination consequence.
+
+Decision: Does the issue repeat again?
+- If NO: Process ends / monitor.
+- If YES: Continue to Third Warning.
+
+Step 3 - Third Warning
+- Issue the final warning.
+
+Then:
+- Wait 24 hours.
+- Proceed to termination.
+- Update Salesforce.
+
+Documentation rule:
+All warnings must be documented.
+
+B. BEHAVIORAL ISSUES - IMMEDIATE TERMINATION PATH
+-------------------------------------------------
+Trigger:
+- Serious misconduct or unprofessional behavior.
+
+Sequence:
+1. Immediate termination.
+2. Inform Management.
+3. Update Salesforce status.
+4. Candidate reaches "Terminated" state.
+
+Documentation rule:
+All warnings must be documented. For the behavioral branch, the SOP also requires management notification and Salesforce status update.
+
+IMPORTANT DISTINCTION
+---------------------
+Availability issues use a progressive warning process with monitoring opportunities between warnings.
+Serious behavioral issues use an immediate termination path rather than the progressive warning sequence.
+
+Salesforce note:
+"Terminated" is an SOP-defined business status. The PDF does not specify the object or field API name.
+
+=================================================================
+6. OFFER RECEIVED PROCESS
+=================================================================
+
+TRIGGER
+-------
+The candidate receives an offer.
+
+STEP 1 - OFFER VERIFICATION
+---------------------------
+Customer Success should:
+- Verify legitimacy.
+- Confirm company details.
+- Confirm the role.
+
+Process intent:
+Before the post-offer onboarding workflow begins, the offer and core company/role information are checked.
+
+STEP 2 - CONGRATULATE CANDIDATE
+-------------------------------
+Customer Success should:
+- Send a congratulations email.
+- Express excitement.
+- Schedule a kick-off call.
+
+STEP 3 - INVOICE AND UPFRONT PAYMENT
+------------------------------------
+Customer Success should:
+- Inform Accounting.
+- Create the invoice.
+- Collect same-day payment.
+- Share the screenshot with the Manager.
+
+Timing expectation:
+The SOP explicitly calls for same-day payment at this stage.
+
+STEP 4 - ACH AND PROMISSORY NOTE
+--------------------------------
+Customer Success should:
+- Create the ACH form.
+- Create the Promissory Agreement.
+- Get the candidate signature.
+- Verify details.
+
+STEP 5 - BACKGROUND VERIFICATION SUPPORT
+----------------------------------------
+Customer Success should:
+- Assist until the candidate is fully onboarded.
+- Help with background verification.
+- Assist with immigration forms.
+- Support with employer documentation.
+
+STEP 6 - JOB SUPPORT IF REQUIRED
+--------------------------------
+If job support is required:
+- Connect the candidate with the vendor for job support.
+
+END STATE
+---------
+The SOP describes the desired completion as the candidate being successfully onboarded in a legitimate company.
+
+AI INTERPRETATION
+-----------------
+This flow is a post-offer operational checklist. It combines verification, candidate communication, payment handling, ACH/promissory documentation, background/onboarding support, and optional job-support coordination.
+
+=================================================================
+7. EMI / ACH PAYMENT FOLLOW-UP PROCESS
+=================================================================
+
+TRIGGER
+-------
+Accounting alerts Customer Success that EMI has not been received.
+
+STEP 1 - CALL CANDIDATE
+-----------------------
+Contact the candidate about the pending payment.
+
+STEP 2 - INFORM POLITELY ABOUT PENDING EMI
+------------------------------------------
+Communication should remain professional and polite.
+
+STEP 3 - SHARE INVOICE
+----------------------
+Provide the relevant invoice to the candidate.
+
+STEP 4 - REQUEST IMMEDIATE PAYMENT
+----------------------------------
+Request that the pending payment be completed immediately.
+
+DECISION - PAYMENT RECEIVED?
+----------------------------
+If NO:
+- Continue follow-up until closure.
+- The process loops back into candidate follow-up.
+
+If YES:
+- Proceed to Accounting confirmation.
+
+STEP 5 - CONFIRM WITH ACCOUNTING TEAM
+-------------------------------------
+Verify that Accounting confirms receipt.
+
+STEP 6 - UPDATE RECORDS
+-----------------------
+Update the relevant records after confirmation.
+
+END STATE
+---------
+Payment closure complete.
+
+AI INTERPRETATION
+-----------------
+A candidate statement that payment was made is not the final closure condition in this SOP. CS should confirm with Accounting, update records, and only then treat the payment follow-up as closed.
+
+=================================================================
+8. IMPORTANT GENERAL GUIDELINES
+=================================================================
+
+The PDF repeats the same general guideline page twice. Treat it as one set of authoritative operating expectations.
+
+1. REAL-TIME UPDATES
+- Always update Salesforce status in real time.
+
+2. DOCUMENTATION
+- Maintain proper documentation of all warnings and escalations.
+
+3. PROFESSIONAL COMMUNICATION
+- Maintain professional communication at every stage.
+
+4. 24-HOUR TAT
+- Keep TAT (Turn Around Time) within 24 hours wherever applicable.
+
+5. TRANSPARENCY
+- Ensure transparency with the candidate and internal teams.
+
+6. RECORD KEEPING
+- Document all processes and decisions.
+
+These are cross-cutting rules and apply across the workflows unless a specific process defines a different or more immediate timing requirement.
+
+=================================================================
+9. ROLE AND HANDOFF MODEL
+=================================================================
+
+CUSTOMER SUCCESS (CS)
+---------------------
+Primary responsibilities described in the SOP include:
+- candidate communication,
+- onboarding form/agreement completion,
+- Salesforce status updates,
+- document verification,
+- resume follow-up,
+- training coordination,
+- issue coordination,
+- escalation/documentation,
+- warning and termination process execution,
+- offer verification,
+- post-offer coordination,
+- payment follow-up,
+- ACH/promissory documentation,
+- onboarding/background support,
+- record keeping.
+
+TEAM LEAD
+---------
+Referenced responsibilities include:
+- assignment during onboarding,
+- resume coordination/follow-up,
+- beginning marketing.
+
+TRAINING TEAM
+-------------
+Referenced responsibilities include:
+- receiving the candidate/resume for training,
+- participating in training completion flow.
+
+MARKETING
+---------
+Referenced as the downstream operational stage where candidate marketing/application work begins after onboarding/resume/training readiness.
+
+ACCOUNTING
+----------
+Referenced responsibilities include:
+- being informed during invoice/upfront payment processing,
+- alerting CS when EMI is not received,
+- confirming payment receipt before closure.
+
+MANAGEMENT
+----------
+Referenced responsibilities include:
+- receiving escalations that cannot be resolved at the operational level,
+- being informed during immediate behavioral termination,
+- receiving the payment screenshot during the offer-received process where specified.
+
+VENDOR
+------
+Referenced as the destination for job-support coordination when job support is required.
+
+SUPERVISOR
+----------
+Referenced in the I-983 process as the person whose signature must be obtained.
+
+=================================================================
+10. PROCESS STATES AND CONCEPTUAL STATUS TERMS
+=================================================================
+
+The following are process/state terms explicitly represented by the SOP. They are useful for semantic retrieval, but they are NOT verified Salesforce API fields.
+
+- Service Agreement
+- Resume Creation
+- Onboarding
+- Resume Process
+- Training Allocation
+- Marketing and Application
+- Resolved
+- Process Ends / Monitor
+- First Warning
+- Second Warning
+- Third Warning
+- Termination
+- Terminated
+- Offer Received
+- Offer Verification
+- Invoice and Upfront Payment
+- ACH and Promissory Note
+- Background Verification Support
+- Payment Closure Complete
+- Complete
+
+Salesforce-specific state references explicitly stated by the SOP:
+- Change Salesforce status to "Service Agreement".
+- Change status to "Resume Creation".
+- Update Salesforce after availability-based termination.
+- Update Salesforce status during behavioral termination.
+- Always update Salesforce status in real time.
+
+=================================================================
+11. TIMING AND SLA / TAT RULES
+=================================================================
+
+Explicit timing rules in the SOP include:
+- Assign Team Lead within 24 hours during document verification.
+- Get candidate resume approval within 24 hours.
+- Arrange a 30-minute call if resume modifications are needed.
+- Auto-approve after 24 hours where the resume process calls for it.
+- Wait 24 hours after the third availability warning before termination.
+- Collect same-day payment during the offer-received invoice/upfront-payment stage.
+- Keep TAT within 24 hours wherever applicable.
+
+AI RESPONSE RULE
+----------------
+When a user asks about timing, return the timing exactly as the SOP states. Do not convert "within 24 hours", "after 24 hours", and "same-day" into one generic SLA because they mean different things in the workflow.
+
+=================================================================
+12. DECISION RULES AND LOOPING BEHAVIOR
+=================================================================
+
+CASE RESOLUTION
+- If an internal issue can be resolved operationally -> resolve and close.
+- If it cannot -> escalate to Management and document escalation.
+
+AVAILABILITY TERMINATION
+- After warning 1: if no repeat -> end/monitor; if repeated -> warning 2.
+- After warning 2: if no repeat -> end/monitor; if repeated again -> warning 3.
+- After warning 3 -> wait 24 hours -> termination -> Salesforce update.
+
+BEHAVIORAL TERMINATION
+- Serious misconduct/unprofessional behavior -> immediate termination -> inform Management -> update Salesforce.
+
+EMI/ACH FOLLOW-UP
+- If payment not received -> continue follow-up until closure.
+- If payment received -> confirm with Accounting -> update records -> close.
+
+=================================================================
+13. DOCUMENTATION REQUIREMENTS
+=================================================================
+
+Documentation is a mandatory control in this SOP, not an optional administrative step.
+
+Explicit requirements include:
+- Fill the onboarding form.
+- Sign/get the agreement signed.
+- Verify candidate details.
+- Document all escalations.
+- Document all warnings.
+- Update Salesforce status in real time.
+- Update records after payment confirmation.
+- Document all processes and decisions.
+
+AI RESPONSE RULE
+----------------
+When describing a process that includes warnings, escalations, termination, or payment closure, include the related documentation/record-update step if it is part of the SOP. Do not summarize only the verbal/communication action and omit the record-keeping requirement.
+
+=================================================================
+14. COMMUNICATION STANDARDS
+=================================================================
+
+Communication expectations include:
+- Professional communication at every stage.
+- Transparent communication with candidates and internal teams.
+- Keep the candidate informed during issue resolution.
+- Inform candidates politely about pending EMI.
+- Use formal warning communication for availability issues.
+- Send a congratulations email after a verified offer.
+- Inform Management where the workflow requires escalation or immediate behavioral termination.
+
+=================================================================
+15. BRAIN RETRIEVAL / QUESTION-ANSWERING GUIDE
+=================================================================
+
+The AI should be able to answer questions such as:
+
+Q: What happens during the CS welcome call?
+A: CS calls the candidate, explains the company process including documentation, resume creation, training and marketing, completes the onboarding form, gets the agreement signed, then moves into the Salesforce/status and document-verification steps.
+
+Q: What status comes after the agreement step?
+A: The SOP says to change Salesforce status to "Service Agreement". The exact Salesforce object/field is not defined in this source.
+
+Q: What happens after document verification?
+A: CS verifies details, requests resume creation, assigns a Team Lead within 24 hours, and changes the process status to "Resume Creation" before the resume process continues.
+
+Q: What happens if a candidate wants resume modifications?
+A: CS follows up with the Team Lead and should arrange a 30-minute call if modifications are needed. Candidate approval is expected within 24 hours, with auto-approval after 24 hours where applicable.
+
+Q: What is the Initial OPT offer-letter process?
+A: Provide an unpaid 24-hour offer letter, collect USCIS email, create the USCIS case, have the candidate complete the case, verify details thoroughly, then issue the offer letter.
+
+Q: What is the STEM OPT offer-letter process?
+A: Provide a full-time 40-hours offer letter, follow USCIS case creation, complete verification, then issue the offer letter.
+
+Q: What is the I-983 process?
+A: Verify I-983 details, cross-check employer and candidate information, obtain supervisor signature, and share the signed copy with the candidate.
+
+Q: How should candidate issues be handled?
+A: Understand the problem, coordinate with the relevant team, provide a solution within TAT, keep the candidate informed, and close when resolved.
+
+Q: When should an internal issue be escalated?
+A: After investigation, if it cannot be resolved at the operational level, escalate it to Management and document the escalation.
+
+Q: What is the termination flow for availability issues?
+A: It uses progressive warnings. First warning and monitor; if repeated, second warning with termination consequence; if repeated again, third/final warning; wait 24 hours; terminate and update Salesforce. All warnings must be documented.
+
+Q: What about serious misconduct?
+A: The SOP uses an immediate termination path for serious misconduct or unprofessional behavior, followed by informing Management and updating Salesforce status.
+
+Q: What should CS do when a candidate receives an offer?
+A: Verify the offer/company/role, congratulate the candidate and schedule a kick-off call, coordinate invoice and same-day payment, complete ACH/promissory documentation, support background/onboarding work, and connect job support if required.
+
+Q: What happens if EMI is not received?
+A: CS calls the candidate, politely explains the pending EMI, shares the invoice, requests immediate payment, continues follow-up until closure if unpaid, and if paid confirms with Accounting, updates records, and closes the payment process.
+
+Q: What are the general CS operating rules?
+A: Real-time Salesforce updates, proper warning/escalation documentation, professional communication, 24-hour TAT wherever applicable, transparency, and complete record keeping.
+
+=================================================================
+16. SYNONYMS / SEARCH TERMS FOR SEMANTIC RETRIEVAL
+=================================================================
+
+Use the following terms as retrieval aliases for the concepts in this SOP:
+
+Welcome/onboarding:
+- welcome call
+- onboarding call
+- onboarding process
+- service agreement
+- agreement signed
+- candidate onboarding
+- onboarding form
+
+Resume:
+- resume creation
+- resume approval
+- resume modification
+- resume process
+- team lead resume
+
+Training/marketing:
+- training allocation
+- training completion
+- marketing start
+- application process
+- marketing handoff
+
+Offer / OPT / STEM / I-983:
+- initial OPT
+- STEM OPT
+- offer letter
+- USCIS case
+- I-983
+- supervisor signature
+
+Issue management:
+- case resolution
+- candidate issue
+- internal issue
+- escalation
+- management escalation
+- operational resolution
+- TAT
+
+Termination:
+- availability warning
+- first warning
+- second warning
+- third warning
+- final warning
+- immediate termination
+- behavioral issue
+- misconduct
+- unprofessional behavior
+- terminated
+
+Offer received:
+- offer verification
+- company verification
+- invoice
+- upfront payment
+- same-day payment
+- ACH form
+- promissory agreement
+- background verification
+- immigration forms
+- employer documentation
+- job support
+
+Payment follow-up:
+- EMI
+- EMI not received
+- ACH payment
+- payment follow-up
+- pending EMI
+- accounting confirmation
+- payment closure
+
+Governance:
+- Salesforce status update
+- real-time update
+- documentation
+- professional communication
+- transparency
+- record keeping
+- 24-hour TAT
+
+=================================================================
+17. AI SAFETY AGAINST HALLUCINATION
+=================================================================
+
+When this source is used by the Customer Success brain:
+
+DO:
+- Follow the workflow order shown in the SOP.
+- Preserve explicit timing rules.
+- Distinguish candidate issues from internal team issues.
+- Distinguish progressive availability termination from immediate behavioral termination.
+- Mention mandatory documentation when relevant.
+- Mention Salesforce updates when explicitly required.
+- Use verified Salesforce schema knowledge for actual object/field mappings.
+- State when the source does not define a requested field, object, legal rule, or exception.
+
+DO NOT:
+- Invent Salesforce objects, fields, picklist values, automations, flows, triggers, or Apex behavior.
+- Invent an approval authority that the SOP does not name.
+- Invent exceptions to the warning or termination processes.
+- Invent legal/immigration requirements from the OPT/STEM/I-983 workflow.
+- Treat a payment as closed before Accounting confirmation and record update where the SOP requires them.
+- Omit escalation or warning documentation requirements.
+- Merge multiple statuses into one unless the Salesforce schema explicitly does so.
+
+=================================================================
+18. SOURCE PRECEDENCE / INTEGRATION WITH THE EXISTING BRAIN
+=================================================================
+
+This file should be used as Customer Success INTERNAL OPERATIONS process knowledge.
+
+It can coexist with:
+- the Customer Success candidate lifecycle / phase-flow SOP source,
+- verified Salesforce object and field documentation,
+- any future Customer Success policy or process source.
+
+Integration rule:
+- Use this file to answer "what should CS do / what is the process?"
+- Use verified Salesforce schema sources to answer "which object/field stores it?"
+- Use both only when the process term and schema mapping are independently supported.
+
+If two approved SOP sources conflict, do not silently choose or merge the conflicting rule. Surface the conflict and prefer the organization's latest approved source when version/approval information is available.
+
+END OF BRAIN KNOWLEDGE SOURCE

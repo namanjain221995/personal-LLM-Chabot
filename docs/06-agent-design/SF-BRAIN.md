@@ -188,3 +188,150 @@ updated: interviews now legitimately own a domain-rules block). Verified in
 the live container; note that `sf_dictionary.load()` caches per process, so
 field-note enrichment needs an orchestrator restart even though
 rules/knowledge/glossary hot-reload — the 2026-08-16 restart covered that.
+
+## 7. The training-module feature map (2026-08-19)
+
+`Training_Module_Feature_Map_and_Memory.txt` (336 KB, 6,493 lines — the
+Candidate Portal's **Dev9 SANDBOX repo** documented feature by feature) is the
+first knowledge drop that is mostly *implementation*: Apex classes, LWC
+bundles, flows, permission sets, deploy IDs. None of that is queryable, which
+made rule §3 the whole design problem rather than a side check.
+
+**Two packs, split by what the knowledge IS.**
+
+| | `training-module.yaml` (extended) | `training-portal-implementation.yaml` (new) |
+|---|---|---|
+| Holds | data rules + 67 field notes | 308 knowledge chunks + a provenance rules block |
+| Answers | "how many / which / when" | "how does it work, why is the data like this" |
+| Field notes | yes — it is the authority | **none**, deliberately |
+
+The new pack ships no `field_notes` on purpose. `brain.field_overlay` walks
+packs in filename order and `sf_dictionary.merge` lets the LAST note win, so a
+third pack noting `Candidate_Training__c` fields would silently outrank both
+`kb-training-lms` and `training-module`. Notes live in one place per domain.
+
+**Pipeline** (same shape as §6, re-run): deterministic section parse → 308
+chunks ≤1,400 chars → 9 distillers → 9 adversarial verifiers → assemble → gate.
+Eight domains came back `ship_with_fixes`; **one came back `reject`** — the
+distiller claimed the portal auth objects were not in the warehouse, and the
+verifier disproved it by querying them (310 credentials, 878 sessions). That
+single catch reversed a shipped rule (see below).
+
+**What production said about the document.** The doc is a sandbox artefact and
+disagreed with the warehouse in ways that would have produced wrong numbers:
+
+- `Deliverable_Result__c.Result_Status__c` is Pass/Fail/Pending — three of the
+  document's four values are wrong.
+- `Program_Version__c.Status__c` is Draft/Published, not "Draft/Active".
+- `Deliverable__c` has no 'Upcoming'; `CandidateTrainingStep__c` has an
+  undocumented `Absent`.
+- Ten documented fields are not in the warehouse at all (`Secret_Token__c`,
+  `Status_Message__c`, `Updated_Trainer__c`, five on `Deliverable_Result__c`,
+  two phantom `Internal_Interview__c` zone fields).
+- The document's mock discriminator ("`Candidate_Training__c` NOT NULL = mock")
+  is the claim `org_brief` already forbids; the probes refuted it again
+  (74 of 352 populated, every OOT and Intake row empty). Not restated.
+
+**Corrections to knowledge already shipped.** Three live claims were wrong:
+
+1. `kb-portal-auth` said the portal was an "Aug-2026 preprod pilot; zero/tiny
+   production rows = not rolled out". Production holds 310 credentials and 878
+   sessions, 132 with a login. The rule made an answerable metric unanswerable.
+2. `training-module` said the portal session token "is not synced". It IS —
+   `Candidate_Portal_Session__c.Session_Id__c` on all 878 rows. The correction
+   keeps the never-display instruction, which now actually matters.
+3. `training-module` described `Session__c.Create_Meeting_Error__c` as the
+   diagnostic for a failed Zoom callout. It is NULL on all 3,263 rows.
+
+**New traps that change answers**, all warehouse-verified:
+
+- 997 deliverables ('Inprogress' + 'Completed') have NO due date on either
+  column, so a deadline filter silently drops them.
+- Only 313 of 618 trainings have any step and 360 have no deliverable —
+  Interview Readiness Training (299, half the org) uses neither by design.
+- 618 trainings belong to 333 distinct candidates; counting rows nearly
+  doubles "how many candidates are in training".
+- `Time_Zone__c` stores the full label, so `= 'ET'` returns zero rows.
+- `Start_Tme_IST__c` (API-name typo) is never NULL yet holds the literal
+  placeholder `': AM'` on 297 of 618 rows.
+- Only `AI ML Engineer` of the seven `Niche__c` picklist values matches a
+  `Niche__c` record; the other six match nothing.
+
+**Where a rule lives is a mechanical question, not a stylistic one.** The
+counting trap and the coverage denominator went into
+`org_brief.TRAINING_RULES`, not a pack, because `training`, `trainings` and
+`candidates` are org_brief trigger words: a pack carrying them would never fire
+on "how many candidates are in training?" — the exact question the trap exists
+to stop getting wrong. Verified by test, not by assumption.
+
+**Two retrieval regressions this caused, and the fixes.** `knowledge_for`
+scores a title/keyword hit 3× and spends a 4,000-char budget on the top 3, so
+a big pack is not a free addition:
+
+- Prefixing all chunks "Training portal — " put `portal` in every title, and
+  "how does a candidate log in to the portal?" started returning the
+  availability calendar instead of the credential chunks. The prefix is now
+  "Dev9 repo — " — provenance that is not query vocabulary.
+- Chunks at 2,800 chars meant ONE filled the budget where three used to fit.
+  Chunked at 1,400 now, matching the `kb-*` norm.
+
+A before/after retrieval snapshot over 16 representative questions is how both
+were found; the remaining four swaps each replace a generic chunk with the
+topically correct one.
+
+**The gate is now in the repo**: `orchestrator/scripts/validate_packs.py`,
+after living as a scratchpad throwaway twice. It fails a pack for a phantom
+field in `tables`/`rules`/`metrics`/`glossary` without a caveat, for metric SQL
+selecting one, and for duplicate `field_notes` keys (YAML keeps the last
+silently — it ate a note during this very ingestion). Dead field notes and
+`knowledge` prose are advisory. All 21 packs pass.
+
+## The Customer Success SOPs (2026-08-19)
+
+Two process SOPs — the Phase 1-7 candidate-lifecycle chart flow and the internal
+operations SOP — arrived written *defensively*: both state, repeatedly, that
+their labels are not field names and that any Salesforce mapping must be
+verified separately before it is taught. Doing that verification is what made
+them worth ingesting, because the labels turned out to be real:
+
+- `Onboarding__c.Status__c` **is** the SOP's status ladder, value for value:
+  `Welcome Call` -> `Service Agreement` -> `Resume Creation` -> `Onboarding
+  Completed`. The SOP that says "change the Salesforce status to Service
+  Agreement" was describing a picklist it could not name.
+- Phase 1 intake, Phase 4's Week 1/Week 2 panels, Phase 5's out-of-training
+  confirmation and Phase 6's rejection session are all `Internal_Interview__c`
+  rows, separable only by the `Interview_Type__c` lookup's *Name* (`Intake`,
+  `... Week 1`, `... Week 2`, `... Final Mock`, `OOT`, `Rejection Interview`).
+- Phase 7's credential gate is `Background_Check__c.ACH_Authorization_Status__c`.
+- And the trap: the SOP says "Terminated"; production stores `Terminate`.
+
+`packs/cs-candidate-lifecycle.yaml` and `packs/cs-internal-operations.yaml`
+carry no `field_notes` bar one, deliberately — every field they touch is already
+owned elsewhere, and `cs-*` sorts first in the filename order `field_overlay`
+walks, so a note here would silently shadow the pack that owns it.
+
+**A known lesson that recurred, and is now a gate.** `knowledge_for` stems each
+keyword as a whole string (`{_stem(k) for k in chunk["keywords"]}`) while the
+question side is tokenised into single words, so a multi-word keyword — `out of
+training`, `phase 1`, `service agreement` — can never match anything. §7 learned
+this in August and wrote it down; the first draft of these two packs repeated
+it anyway, and the before/after snapshot is what exposed it ("when does
+marketing start?" was returning the Phase **1** chunk).
+
+A written lesson is not a gate, which is the same conclusion `validate_packs.py`
+came from. `test_no_pack_gains_a_keyword_that_can_never_match` now enforces it:
+zero tolerance for packs written since, and a ratcheted baseline of 25 for the
+six older packs that carry them (qb-invoicing has 9). Those are inert rather
+than wrong — splitting them would move retrieval for questions this ingestion
+never looked at — so the number may fall but never rise.
+
+The same snapshot, over 20 existing questions, is how the pack's own footprint
+was tuned down: `signed` and `agreement` came out of CS keyword lists once they
+were seen pushing the DocuSign pack off its own question. Two of the twenty
+still change, one a pure addition and one a fair swap.
+
+One question is knowingly unserved by retrieval: `_WORD_RE` needs a token of two
+or more characters starting with a letter, so **"I-983" tokenises to nothing at
+all** and "what is the I-983 process?" is scored on the single word `process`.
+The glossary path saves it — `glossary_for` regex-matches the raw question text,
+so the `I-983` term is injected even though no chunk is.

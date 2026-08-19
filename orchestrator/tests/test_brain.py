@@ -446,3 +446,212 @@ def test_the_shipped_internal_interview_pack_fits_its_budget(shipped_packs):
     # …and Recruiter__c is pinned, so its columns are in the slice when a
     # person is named.
     assert "Recruiter__c" in pack["tables"]
+
+
+def test_the_shipped_training_portal_implementation_pack_is_knowledge_first(shipped_packs):
+    """The feature-map pack (2026-08-19): 166 chunks of Dev9 REPO
+    documentation plus a rules block whose only job is to stop the model
+    treating repo metadata as columns."""
+    pack = shipped_packs["training-portal-implementation"]
+    assert pack["knowledge"] and pack["rules"]
+    # Knowledge-first: no metrics, no field notes. Field notes would collide
+    # with kb-training-lms/training-module, and the LAST pack alphabetically
+    # silently wins that collision in sf_dictionary.merge.
+    assert pack["metrics"] == []
+    assert pack["field_notes"] == {}
+    assert len(pack["knowledge"]) > 150
+    assert len(pack["rules"]) <= brain._RULES_CAP
+    # Every chunk is inside the loader's per-chunk cap, so nothing is
+    # truncated mid-sentence on the way into a prompt.
+    assert all(len(c["text"]) <= brain._KNOWLEDGE_CHUNK_CAP for c in pack["knowledge"])
+
+    # The provenance rule is the point of the whole pack.
+    assert "SANDBOX" in pack["rules"] and "never columns" in pack["rules"]
+
+    # Retrieval: the questions this pack exists to answer.
+    assert "S3" in brain.knowledge_for("how does a candidate submit a deliverable file?")
+    assert brain.knowledge_for("why do i have to republish the experience site?") != ""
+
+
+def test_the_feature_map_pack_caveats_every_sandbox_field_it_names(shipped_packs):
+    """knowledge_for labels these chunks "authoritative", so a repo field
+    list production lacks would read as a schema. Chunks that name one carry
+    their own caveat — this is what keeps validate_packs.py at 0 advisories."""
+    pack = shipped_packs["training-portal-implementation"]
+    caveated = [c for c in pack["knowledge"]
+                if c["text"].startswith("NOT IN THE PRODUCTION WAREHOUSE")]
+    assert len(caveated) >= 30
+    # The known phantoms must be inside a caveat header, never bare.
+    for phantom in ("Secret_Token__c", "Status_Message__c", "S3_Object_Key__c",
+                    "Human_Score__c", "Password__c"):
+        naming = [c for c in pack["knowledge"] if phantom in c["text"]]
+        assert naming, f"{phantom} vanished from the pack"
+        for chunk in naming:
+            header = chunk["text"].split("\n\n", 1)[0]
+            assert phantom in header, f"{phantom} named without a caveat in {chunk['title']!r}"
+
+
+def test_the_training_module_pack_fits_its_budget_after_the_feature_map(shipped_packs):
+    """The 2026-08-19 additions took this pack to within a few chars of the
+    per-pack cap. If it goes over, `_capped_rules` drops whole rules at a
+    boundary and logs — the knowledge is gone from the prompt silently."""
+    pack = shipped_packs["training-module"]
+    assert len(pack["rules"]) <= brain._RULES_CAP
+    # The last-added rule must still be present, i.e. nothing was trimmed.
+    assert "SCHEDULED day" in pack["rules"]
+
+
+def test_the_feature_map_corrections_reach_grounding(shipped_packs):
+    """Facts the feature-map ingestion proved against production. Each one
+    has to actually reach a prompt, which is a different question from
+    whether it is written down somewhere."""
+    # Deadline maths: the open work carries no due date at all.
+    overdue = org_brief.grounding_for("how many deliverables are overdue?")
+    assert "997" in overdue and "Due_Date_Sort__c" in overdue
+
+
+def test_the_two_org_wide_training_traps_reach_every_training_question():
+    """These two live in org_brief.TRAINING_RULES, not in a pack, and the
+    reason is mechanical: `training`, `trainings` and `candidates` are
+    org_brief trigger words, so a pack carrying them would never fire on
+    "how many candidates are in training?" — which is exactly the question
+    the counting trap exists to stop getting wrong."""
+    for question in (
+        "how many candidates are in training?",
+        "how many trainings are active?",
+        "how many modules has this candidate completed?",
+        "list the candidates in training",
+    ):
+        grounding = org_brief.grounding_for(question)
+        assert "COUNT(DISTINCT Candidate__c)" in grounding, question
+        assert "Interview Readiness Training" in grounding, question
+
+
+def test_the_portal_is_no_longer_described_as_unrolled_out(shipped_packs):
+    """kb-portal-auth told the model "zero/tiny production rows = not rolled
+    out". Production holds 310 credentials and 878 sessions, so that rule
+    made a real, answerable metric unanswerable."""
+    rules = shipped_packs["kb-portal-auth"]["rules"]
+    # The old PRESCRIPTION is gone; the phrase survives only inside the
+    # correction that quotes it, which is deliberate provenance.
+    assert "zero/tiny production rows = not rolled out" not in rules
+    assert "the portal IS live in production" in rules
+    assert "310" in rules and "878" in rules
+    # And the training-module pack no longer claims the token is unsynced.
+    portal = shipped_packs["training-module"]
+    tokens = [c for c in portal["knowledge"] if "session token" in c["text"]]
+    assert tokens, "the portal knowledge chunk disappeared"
+    assert not any("token field itself is not synced" in c["text"] for c in tokens)
+
+
+def test_the_cs_sop_packs_parse_and_reach_their_own_questions(shipped_packs):
+    """The two Customer Success SOPs (2026-08-19). Both sources refuse to name
+    a Salesforce field on purpose, so these packs are process knowledge plus a
+    rules block carrying the mappings that were verified separately against
+    production."""
+    for name, chunks in (("cs-candidate-lifecycle", 15),
+                         ("cs-internal-operations", 18)):
+        pack = shipped_packs[name]
+        assert len(pack["knowledge"]) == chunks
+        assert len(pack["rules"]) <= brain._RULES_CAP
+        assert all(len(c["text"]) <= brain._KNOWLEDGE_CHUNK_CAP
+                   for c in pack["knowledge"])
+        # Both metrics survived the required-keys filter in _normalise.
+        assert len(pack["metrics"]) == 2
+
+    # The questions these packs exist to answer, each reaching its own chunk.
+    for question, expected in (
+        ("can marketing share new credentials as soon as an offer arrives?",
+         "Phase 7"),
+        ("what happens if training fails?", "Phase 4"),
+        ("when does marketing start?", "Phase 5"),
+        ("how does the warning process work before termination?",
+         "progressive warning"),
+        ("what happens if EMI is not received?", "Accounting confirms"),
+        ("when should an internal issue be escalated to management?",
+         "Case resolution"),
+    ):
+        assert expected in brain.knowledge_for(question), question
+
+    # "I-983" tokenises to NOTHING (_WORD_RE wants 2+ chars starting with a
+    # letter), so retrieval cannot reach it. The glossary regex-matches the
+    # raw question text, which is what saves the answer.
+    assert "I-983" in brain.glossary_for("what is the I-983 process?")
+
+
+#: Multi-word `keywords` that already shipped before the rule below was known.
+#: A ratchet, not a target: the count may fall, never rise.
+_DEAD_KEYWORDS_BASELINE = 25
+
+
+def test_no_pack_gains_a_keyword_that_can_never_match(shipped_packs):
+    """`knowledge_for` stems each keyword as a WHOLE STRING and matches it
+    against the question's individual word tokens, so a multi-word keyword
+    ("out of training", "phase 1") can never match anything — it is silently
+    dead weight. Caught 2026-08-19: the CS Phase 5 chunk's "ready to start
+    marketing" could not fire, so "when does marketing start?" was answered
+    from the Phase 1 chunk.
+
+    Six older packs carry 25 of these between them (qb-invoicing has 9). They
+    are inert rather than wrong, and splitting them would move retrieval for
+    questions nobody asked about here, so they are a ratcheted baseline: any
+    NEW one fails, and the number can only go down."""
+    dead = [
+        (pack["name"], chunk["title"], keyword)
+        for pack in shipped_packs.values()
+        for chunk in pack["knowledge"]
+        for keyword in chunk["keywords"]
+        if " " in keyword.strip()
+    ]
+    # Packs written since the rule was known carry none at all.
+    assert not [d for d in dead if d[0].startswith("cs-")], dead
+    assert len(dead) <= _DEAD_KEYWORDS_BASELINE, (
+        f"new dead keyword(s): {len(dead)} > {_DEAD_KEYWORDS_BASELINE}\n"
+        + "\n".join(f"  {p} / {t!r}: {k!r}" for p, t, k in dead)
+    )
+
+
+def test_the_cs_packs_never_shadow_another_packs_field_notes(shipped_packs):
+    """field_notes are global and last-write-wins in FILENAME order, and
+    `cs-*` sorts before every other pack — so a note here would lose to the
+    owning pack, and a note here for a field nobody else claims must be a
+    deliberate addition, not an accident."""
+    theirs = {
+        (obj, field)
+        for name, pack in shipped_packs.items() if not name.startswith("cs-")
+        for obj, fields in pack["field_notes"].items()
+        if isinstance(fields, dict) for field in fields
+    }
+    mine = {
+        (obj, field)
+        for name, pack in shipped_packs.items() if name.startswith("cs-")
+        for obj, fields in pack["field_notes"].items()
+        if isinstance(fields, dict) for field in fields
+    }
+    assert not (mine & theirs), f"shadowed field notes: {mine & theirs}"
+    # The one deliberate addition: the Team Lead the SOP requires within 24h.
+    assert mine == {("Account", "Assigned_Marketing_Team_Lead__c")}
+
+
+def test_the_cs_packs_carry_the_verified_status_mappings(shipped_packs):
+    """The SOPs say "change the Salesforce status to Service Agreement" while
+    stating they cannot name the field. Verifying that against production is
+    what made them worth ingesting — and it also found the spelling trap."""
+    lifecycle = shipped_packs["cs-candidate-lifecycle"]["rules"]
+    internal = shipped_packs["cs-internal-operations"]["rules"]
+
+    # The SOP status ladder IS a real picklist.
+    assert "'Welcome Call'" in internal and "'Service Agreement'" in internal
+    assert "'Resume Creation'" in internal and "Onboarding__c.Status__c" in internal
+
+    # The trap: the SOPs say "Terminated"; production stores 'Terminate'.
+    for rules in (lifecycle, internal):
+        assert "'Terminate'" in rules
+        assert "Candidate_Status_Change_Reason__c" in rules
+
+    # The lifecycle phases are separated by the Interview_Type__c lookup NAME,
+    # not by anything on the record itself.
+    assert "'Intake'" in lifecycle and "'OOT'" in lifecycle
+    assert "Interview_Type__c.Id" in lifecycle
+    # Phase 7's credential gate.
+    assert "ACH_Authorization_Status__c" in lifecycle

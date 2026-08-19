@@ -10,6 +10,7 @@ validated by pydantic (invalid → table only; model output is NEVER executed)
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import time
@@ -86,6 +87,15 @@ _SQL_SYSTEM = (
     "or compare lower(Name). Casing, spacing and middle names vary row to row, "
     "and an exact match silently yields 0 for that one person while everybody "
     "else's figures look right.\n"
+    # The org's picklists are exact strings the users never quote precisely:
+    # asked about "background checks pending payment verification", the model
+    # filtered on that phrase verbatim, while the stored value is 'Payment
+    # Verification Pending' — zero rows, no error, a silently wrong answer.
+    "- STATUS/TYPE/PICKLIST filters: when the prompt lists the column's exact "
+    "values (shown as [a | b]), use one of those verbatim. When it does NOT, "
+    "never guess an exact literal — match loosely, e.g. "
+    "Status__c ILIKE '%payment%verification%pending%' OR reorderings of the "
+    "same words, so a differently-worded picklist value still matches.\n"
     "- WRITE every date literal in the SQL as ISO, e.g. DATE '2026-08-17' or "
     "TRY_CAST(col AS DATE) = DATE '2026-08-17'. A day-first literal like "
     "'17-08-2026' is NOT parseable: TRY_CAST returns NULL, the comparison is "
@@ -472,7 +482,11 @@ async def generate_and_run_sql(
     joins = sf_dictionary.join_map(list(sliced))
     if joins:
         schema_text = f"{schema_text}\n\n{joins}"
-    cap = fetch_cap if fetch_cap is not None else settings.sql_preview_row_cap + 1
+    # The default cap is the SUMMARY cap, not the 500-row preview cap: the
+    # deterministic figures are computed over what is fetched, and fetching
+    # 501 rows of a 33,000-row result made "authoritative" totals cover 1.5%
+    # of the data. The preview stays 500 (a UI concern, applied by callers).
+    cap = fetch_cap if fetch_cap is not None else settings.sql_summary_row_cap + 1
     raw = await _ask_sql(
         question, schema_text, history, grounding_question=ground
     )
@@ -508,12 +522,63 @@ async def generate_and_run_sql(
         raise
     except Exception as exc:  # one retry on guard/execution error (§8)
         raw2 = await _ask_sql(
-            question, schema_text, history, previous_sql=raw, error=str(exc),
+            question, schema_text, history, previous_sql=raw,
+            error=_enriched_error(str(exc), raw, schema),
             grounding_question=ground,
         )
         sql2 = guard_sql(raw2)
         columns, rows = _execute(sql2, cap)
         return sql2, columns, rows
+
+
+#: DuckDB's binder error for a missing column, e.g.
+#:   Binder Error: Table "p" does not have a column named "Status__c"
+_BINDER_COLUMN_RE = re.compile(
+    r'Table "(?P<alias>[^"]+)" does not have a column named "(?P<column>[^"]+)"'
+)
+#: FROM/JOIN <table> [AS] <alias> — enough to resolve which real table the
+#: failing alias referred to in the SQL we just ran.
+_ALIAS_RE = re.compile(
+    r'\b(?:FROM|JOIN)\s+"?(?P<table>[A-Za-z_][A-Za-z0-9_]*)"?\s+(?:AS\s+)?'
+    r'(?P<alias>[A-Za-z_][A-Za-z0-9_]*)\b',
+    re.I,
+)
+
+
+def _enriched_error(error: str, failed_sql: str, schema: dict) -> str:
+    """The execution error, plus the failing table's REAL column list.
+
+    The retry used to get only the error string. For a hallucinated column
+    ("p.Status__c = 'Paid'" — the real column is Payment_Status__c) that tells
+    the model WHAT failed but not what to use instead, so it guessed again,
+    failed again, and the raw binder error reached the user as a red pill.
+    The alias is resolved from the SQL we just ran, and the retry gets the
+    whole truth about that one table.
+    """
+    match = _BINDER_COLUMN_RE.search(error)
+    if not match:
+        return error
+    alias = match.group("alias").lower()
+    table = next(
+        (
+            m.group("table")
+            for m in _ALIAS_RE.finditer(failed_sql or "")
+            if m.group("alias").lower() == alias
+        ),
+        # No alias in the SQL: DuckDB names the table itself in that case.
+        match.group("alias"),
+    )
+    columns = schema.get(table) or next(
+        (cols for name, cols in schema.items() if name.lower() == table.lower()),
+        None,
+    )
+    if not columns:
+        return error
+    listed = ", ".join(name for name, _t in columns)
+    return (
+        f"{error}\n\nThe COMPLETE column list of {table} is: {listed}\n"
+        f"Use only these exact names for {table}. Do not invent columns."
+    )
 
 
 async def _ask_chart_model(messages: List[dict]) -> str:
@@ -842,7 +907,7 @@ async def run_sql_engine(
         return NO_DATA_MESSAGE
 
     wants_export = bool(EXPORT_RE.search(message))
-    fetch_cap = (settings.export_row_cap + 1) if wants_export else (settings.sql_preview_row_cap + 1)
+    fetch_cap = (settings.export_row_cap + 1) if wants_export else (settings.sql_summary_row_cap + 1)
 
     try:
         if force_live:
@@ -1023,6 +1088,42 @@ async def run_sql_engine(
         await emit("meta", live_meta)
         return "".join(parts)
 
+    except Exception as exc:
+        # BOTH query attempts failed — the retry (which now carries the failing
+        # table's real column list) still produced something the database
+        # refused. This used to re-raise, and main.py turned it into an `error`
+        # SSE frame: after answering two clarifications the user got a red pill
+        # reading `Binder Error: Table "p" does not have a column named
+        # "Status__c"`. A query WE wrote wrong is our bug — say what happened
+        # in words, keep the conversation, and keep the raw detail in meta for
+        # the proof drawer rather than the transcript.
+        logging.getLogger(__name__).warning(
+            "both SQL attempts failed for %r: %s", message[:120], str(exc)[:300]
+        )
+        text = (
+            "I could not write a valid query for that — I tried twice and the "
+            "second attempt was still wrong, so nothing was run and there is "
+            "no number to report. Naming the object usually fixes this (for "
+            "example 'payments', 'invoices' or 'training enrollments')."
+        )
+        await emit("token", {"text": text})
+        await emit("meta", {"route": "sql", "salesforce_error": str(exc)[:300]})
+        return text
+
+    # Even the summary cap can overflow. When it does, get the TRUE total with
+    # a COUNT(*) wrap — cheap for DuckDB — so the model states real numbers
+    # with an honest coverage note instead of presenting the cap as the total.
+    summary_overflow: Optional[int] = None
+    if len(rows) > settings.sql_summary_row_cap:
+        rows = rows[: settings.sql_summary_row_cap]
+        try:
+            _c, count_rows = _execute(
+                f"SELECT COUNT(*) FROM ({sql.rstrip(';')})", 2
+            )
+            summary_overflow = int(count_rows[0][0])
+        except Exception:  # noqa: BLE001 — the wrap is best-effort
+            summary_overflow = -1  # unknown, but definitely more than the cap
+
     preview, truncated = cap_rows(rows, settings.sql_preview_row_cap)  # 500-row meta cap
     # §10: data = array of row objects (≤500), truncated = TOP-LEVEL boolean.
     meta: dict = {
@@ -1059,6 +1160,19 @@ async def run_sql_engine(
     # sample the model sees is capped at 30, and both were being used as the
     # population for counts and ratios.
     computed = deterministic_summary(columns, rows)
+    if summary_overflow is not None:
+        # The one case the figures do NOT cover everything — say so in the
+        # authoritative block itself, with the true total when the COUNT(*)
+        # wrap got one, so the model reports "N of M" instead of passing the
+        # cap off as the population.
+        true_total = summary_overflow if summary_overflow > 0 else None
+        computed["true_total_rows"] = true_total or "unknown (larger than summarised)"
+        computed["counts_cover"] = (
+            f"the FIRST {len(rows)} rows of a larger result"
+            + (f" of {true_total} total rows" if true_total else "")
+            + " — state every figure as covering those rows, never as the "
+            "whole population"
+        )
 
     parts: List[str] = []
     async for token in llm.stream_chat_completion(

@@ -1,0 +1,1036 @@
+================================================================================
+TECHSARA CUSTOMER SUCCESS - CANDIDATE LIFECYCLE SOP
+PHASE 1 THROUGH PHASE 7 BUSINESS PROCESS KNOWLEDGE BASE
+================================================================================
+
+SOURCE
+------
+Source document: SOP - Chartflow from Phase 1 to 7
+Source type: visual process-flow SOP
+Primary purpose of this file: teach the TechSara AI Brain how the Customer Success
+process works across the candidate lifecycle, including team ownership, handoffs,
+decision points, timing rules, retry/closure paths, and offer-stage controls.
+
+IMPORTANT SCHEMA SAFETY RULE
+----------------------------
+This SOP is BUSINESS-PROCESS KNOWLEDGE. It does NOT define Salesforce object API
+names, field API names, picklist API values, formulas, record types, or automation
+names.
+
+When answering questions:
+- Use this SOP to explain HOW the Customer Success / candidate process works.
+- Use the verified production Salesforce schema/warehouse to answer WHICH object,
+  field, or record stores a value.
+- Do not invent a Salesforce object or field from a business term in this SOP.
+- A business label such as "training result", "resume approved", "marketing started",
+  "ACH signed", or "closure reason" is not automatically a Salesforce field name.
+- If a field/object mapping is needed, it must be separately verified against the
+  production org dictionary before it is taught to the Brain.
+
+
+================================================================================
+1. PROCESS PURPOSE
+================================================================================
+
+The candidate lifecycle is organized into seven business phases:
+
+Phase 1 - Screening + Intake
+Phase 2 - Payment + Onboarding Setup
+Phase 3 - Resume Process (Before Training)
+Phase 4 - Training
+Phase 5 - Out-of-Training Confirmation + Marketing Start Handoff
+Phase 6 - Interview Operations + Readiness + Rejection Training
+Phase 7 - Offer Stage + ACH Confirmation + Credential Release
+
+The process is cross-functional. Customer Success (CS) is a major coordination and
+handoff owner, but Sales, Marketing, QA, Training, Interview Readiness, and Rejection
+Training teams own specific steps.
+
+The end-to-end business objective is to move an eligible candidate from screening,
+through onboarding and training, into marketing and interviews, and finally through
+the offer-stage controls, while stopping or closing the candidate when required.
+
+
+================================================================================
+2. CORE ACTORS AND RESPONSIBILITIES
+================================================================================
+
+CANDIDATE
+- Person moving through the lifecycle.
+- Participates in screening/intake, onboarding, resume review, training, interviews,
+  rejection coaching when needed, and offer-stage actions.
+
+SALES
+- Performs the initial screening call.
+- Decides whether the candidate passes the Sales approval gate.
+- Collects upfront payment after Marketing intake approval.
+
+MARKETING
+- Performs the intake interview and approval gate in Phase 1.
+- Creates and updates the resume in Phase 3.
+- Starts marketing after CS hands over a ready candidate in Phase 5.
+- Confirms candidate availability for readiness/rejection sessions in Phase 6.
+- Changes offer-stage email credentials immediately in Phase 7.
+- Shares new credentials only after CS confirms ACH is signed.
+
+CUSTOMER SUCCESS (CS)
+- Owns major onboarding, expectation-setting, coordination, and lifecycle handoffs.
+- Handles/coordinates the service agreement, onboarding document, and required
+  candidate information after payment.
+- Explains the end-to-end process, expectations, and rules.
+- Creates the Marketing WhatsApp group.
+- Confirms coursework and timeline before resume work.
+- Raises the resume request to Marketing.
+- Creates the training group after resume approval.
+- Receives training pass/fail information from QA.
+- Confirms out-of-training status, performs a final audit/checklist, and hands the
+  candidate to Marketing as ready to start marketing.
+- In the offer stage, confirms whether ACH is signed before credentials may be
+  released to the candidate.
+
+QA
+- Receives Week 1 and Week 2 interview-panel scores during training.
+- Communicates Pass/Fail to CS for each training track.
+- Confirms to CS that a candidate is out of training before the Phase 5 handoff.
+
+TRAINING TEAM
+- Runs training.
+- Training deliverables must meet the required threshold.
+- Supports the Week 1 and Week 2 training tracks.
+- A failed final training result gets one additional chance to repeat the training
+  plan once.
+
+INTERVIEW READINESS TEAM
+- Runs an interview-readiness session when readiness training is required before an
+  interview.
+
+REJECTION TRAINING TEAM
+- Runs a rejection-training session after a candidate is rejected or ghosted, when
+  the process routes the candidate into that recovery path.
+
+AIC PORTAL
+- Used to raise the interview request in Phase 6.
+
+
+================================================================================
+3. END-TO-END LIFECYCLE SUMMARY
+================================================================================
+
+The normal success path is:
+
+Sales screening
+-> Sales approval
+-> Marketing intake interview
+-> Marketing approval
+-> Upfront payment collection
+-> CS onboarding setup
+-> CS expectation-setting
+-> Marketing WhatsApp group
+-> Resume creation / review / approval
+-> Training group
+-> Week 1 / Week 2 training evaluation
+-> Final training pass
+-> CS out-of-training audit
+-> Marketing start
+-> Interview request(s)
+-> Interview readiness when needed
+-> Interview(s)
+-> Next rounds as applicable
+-> Offer received
+-> Marketing changes email credentials
+-> CS verifies ACH signed
+-> New credentials shared to candidate
+-> End
+
+Common non-success/recovery paths include:
+- Sales rejects candidate -> stop/close candidate and log reason.
+- Marketing rejects candidate -> stop/close candidate and log reason.
+- Training final result fails -> one more chance; repeat training plan once.
+- Interview outcome is rejected/ghosted -> rejection-training flow.
+- Post-rejection decision can either return the candidate to interview flow or
+  stop/close the candidate and log reason.
+- ACH is not signed -> continue waiting/follow-up; do not share new credentials.
+
+
+================================================================================
+4. PHASE 1 - SCREENING + INTAKE PROCESS FLOW
+================================================================================
+
+ENTRY CONDITION
+- Candidate enters the process at Start.
+
+PRIMARY OWNERS
+- Sales first.
+- Marketing second.
+
+PROCESS
+1. Sales conducts a screening call.
+2. The purpose of the screening call is to check candidate criteria fit.
+3. Decision: Does Sales approve the candidate?
+
+IF SALES = YES
+4. Candidate moves to a Marketing intake interview.
+5. Decision: Does Marketing approve the candidate?
+
+IF MARKETING = YES
+6. Candidate proceeds to Phase 2.
+
+IF SALES = NO
+- Stop/close the candidate.
+- Log the reason.
+- Process ends for that candidate.
+
+IF MARKETING = NO
+- Stop/close the candidate.
+- Log the reason.
+- Process ends for that candidate.
+
+CUSTOMER SUCCESS INVOLVEMENT
+- No explicit CS action is shown in Phase 1.
+- CS begins explicit operational ownership in Phase 2 after payment.
+
+PHASE 1 BUSINESS RULES
+- Both approval gates are mandatory for the normal path.
+- A rejection at either gate terminates the active process.
+- The closure reason must be logged.
+
+NOT SPECIFIED BY SOURCE
+- Exact Sales screening criteria.
+- Exact Marketing approval criteria.
+- Exact Salesforce status/field used for either approval.
+- Exact closure reason values.
+
+
+================================================================================
+5. PHASE 2 - PAYMENT + ONBOARDING SETUP
+================================================================================
+
+ENTRY CONDITION
+- Marketing intake approved in Phase 1.
+
+PRIMARY OWNERS
+- Sales collects upfront payment.
+- CS owns the onboarding setup after payment.
+
+PROCESS
+1. Sales collects upfront payment.
+2. Timing expectation: this should occur within 4 hours after intake.
+3. After payment, CS must complete the onboarding setup activities.
+
+CS ONBOARDING ACTIVITIES
+A. Service agreement signed.
+B. Onboarding document filled.
+C. Collect all required candidate information.
+
+TIMING EXPECTATION FOR CS ONBOARDING ACTIVITIES
+- The diagram marks these activities as within 24 hours of payment.
+
+4. CS explains the end-to-end flow over a call.
+5. The explanation includes expectations and rules.
+6. CS creates the Marketing WhatsApp group.
+7. Candidate proceeds to Phase 3, the Resume Process.
+
+IMPORTANT INTERPRETATION
+- The service agreement, onboarding document, and required candidate information are
+  shown as parallel onboarding requirements after payment.
+- The process should not be interpreted as "only one of the three". They are all
+  onboarding responsibilities shown in the flow.
+- The end-to-end explanation call is a core CS expectation-setting step.
+
+CS PURPOSE IN THIS PHASE
+- Convert a paid, approved candidate into a fully onboarded candidate.
+- Make sure agreements/documents/information are in place.
+- Make sure the candidate understands what happens next.
+- Establish the Marketing communication channel.
+
+NOT SPECIFIED BY SOURCE
+- Exact fields in the onboarding document.
+- Exact required candidate information list.
+- Service agreement template/version.
+- Payment amount or payment method.
+- Salesforce object/field where payment or onboarding completion is stored.
+
+
+================================================================================
+6. PHASE 3 - RESUME PROCESS (BEFORE TRAINING)
+================================================================================
+
+ENTRY CONDITION
+- Phase 2 onboarding completed and candidate enters the resume process.
+
+PRIMARY OWNERS
+- CS initiates and coordinates.
+- Marketing creates/updates the resume.
+- Candidate can request changes.
+
+PROCESS
+1. CS confirms coursework and timeline.
+2. CS -> Marketing: raise resume request.
+3. Marketing creates the resume.
+4. Marketing shares the resume in the WhatsApp group.
+5. Decision: Does the candidate request changes?
+
+IF CANDIDATE REQUESTS CHANGES = YES
+6. Marketing conducts a Zoom call and notes requested changes.
+7. Marketing performs a one-time resume update.
+8. Resume becomes auto-approved after the one update.
+
+IF CANDIDATE REQUESTS CHANGES = NO
+6. Resume proceeds to auto-approved path.
+
+AUTO-APPROVAL RULES SHOWN IN THE SOP
+- Auto-approve in 24 hours if there is no response.
+- Auto-approve after one update.
+
+AFTER RESUME APPROVAL
+9. CS creates the training group.
+10. Candidate proceeds to Phase 4.
+
+CS PURPOSE IN THIS PHASE
+- Validate pre-resume readiness inputs such as coursework/timeline.
+- Trigger the Marketing resume workflow.
+- Ensure the approved resume transitions the candidate into training.
+
+IMPORTANT BUSINESS RULES
+- Candidate feedback is not an unlimited revision loop.
+- The SOP explicitly shows a one-time resume update.
+- No response for 24 hours leads to auto-approval.
+- After one update, the resume is auto-approved.
+
+NOT SPECIFIED BY SOURCE
+- What "coursework" must contain.
+- Exact timeline fields.
+- Resume template or scoring criteria.
+- What qualifies as a change request.
+- Salesforce object/field that represents resume approval.
+
+
+================================================================================
+7. PHASE 4 - TRAINING
+================================================================================
+
+ENTRY CONDITION
+- Training begins from the Phase 3 training group.
+
+PRIMARY OWNERS
+- Training Team.
+- Interview panel participants.
+- QA for score review / pass-fail communication.
+- CS receives pass/fail communication from QA.
+
+PROCESS OVERVIEW
+1. Training Team runs training.
+2. Training deliverables must meet the required threshold.
+3. The SOP shows a Week 1 track and a Week 2 track.
+
+WEEK 1 TRACK
+- Interview panel interviews occur.
+- Scores are submitted to QA.
+- QA -> CS communicates Pass/Fail for Week 1.
+
+WEEK 2 TRACK
+- Interview panel interviews occur.
+- Scores are submitted to QA.
+- QA -> CS communicates Pass/Fail for Week 2.
+
+FINAL TRAINING RESULT
+- The Week 1 and Week 2 tracks feed a final training result decision.
+
+IF FINAL TRAINING RESULT = PASS
+- Exit Phase 4.
+- Proceed to Phase 5: Out-of-Training Confirmation.
+
+IF FINAL TRAINING RESULT = FAIL
+- Candidate gets one more chance.
+- Repeat the training plan once.
+- The retry loops the candidate back into training.
+
+IMPORTANT BUSINESS RULE
+- The SOP shows one additional training chance, not unlimited retries.
+
+CS PURPOSE IN THIS PHASE
+- CS is the recipient of QA pass/fail status and participates in the lifecycle handoff.
+- CS is not shown as the team that runs the training itself.
+
+NOT SPECIFIED BY SOURCE
+- Exact deliverable threshold.
+- Exact scoring formula.
+- Exact definition of final training result.
+- Whether Week 1 and Week 2 are always mandatory for every candidate.
+- Exact behavior after a failed retry beyond the diagram's one-more-chance rule.
+- Salesforce fields/objects for training scores and status.
+
+
+================================================================================
+8. PHASE 5 - OUT-OF-TRAINING CONFIRMATION + MARKETING START HANDOFF
+================================================================================
+
+ENTRY CONDITION
+- Candidate passed training in Phase 4.
+
+PRIMARY OWNERS
+- QA confirms out-of-training status to CS.
+- CS performs final audit and handoff.
+- Marketing starts marketing.
+
+PROCESS
+1. QA -> CS: confirm the candidate is Out of Training.
+2. CS audits one more time using the final checklist.
+3. CS -> Marketing: submit candidate as Ready to Start Marketing.
+4. Marketing starts marketing.
+5. Candidate exits to Phase 6, Interview Operations.
+
+EXPECTATION
+- Interviews are expected within 1-2 weeks after marketing starts.
+
+CS PURPOSE IN THIS PHASE
+- Act as the final readiness checkpoint after training.
+- Ensure the candidate is actually ready before Marketing activation.
+- Create a clean operational handoff from Training/QA to Marketing.
+
+IMPORTANT BUSINESS RULE
+- Passing training alone is followed by explicit out-of-training confirmation and a
+  CS final audit before Marketing starts.
+
+NOT SPECIFIED BY SOURCE
+- Items in the final checklist.
+- Exact definition of "Ready to Start Marketing".
+- Exact Salesforce status change or automation used for marketing start.
+- Whether the 1-2 week interview expectation is an SLA, KPI, or target; the diagram
+  labels it as an expectation.
+
+
+================================================================================
+9. PHASE 6 - INTERVIEW OPS + READINESS + REJECTION TRAINING
+================================================================================
+
+ENTRY CONDITION
+- Marketing started in Phase 5.
+
+EXPECTATION
+- Interviews are expected in 1-2 weeks after marketing starts.
+
+PRIMARY OWNERS / SYSTEMS
+- AIC Portal for interview request.
+- Marketing for candidate availability confirmation.
+- Interview Readiness Team when readiness training is needed.
+- Rejection Training Team after rejected/ghosted outcome.
+
+INTERVIEW REQUEST
+1. Raise an interview request in the AIC Portal.
+2. SOP timing text: "SLA: Immediate OR latest 4:15 AM previous day."
+
+IMPORTANT NOTE ABOUT THIS SLA
+- Preserve the wording exactly as a source rule.
+- The source does not explain the business meaning of "4:15 AM previous day" or its
+  timezone. Do not reinterpret it without another authoritative document.
+
+READINESS DECISION
+3. Decision: Is interview readiness training needed?
+
+IF READINESS TRAINING = YES
+4. Marketing confirms candidate availability.
+5. Interview Readiness Team conducts a session with Candidate + Team.
+6. Candidate returns to the interview flow.
+7. Interview happens.
+
+IF READINESS TRAINING IS NOT NEEDED
+- The diagram proceeds to the interview happening without the readiness-session branch.
+
+INTERVIEW OUTCOME
+8. Evaluate the interview outcome.
+
+OUTCOME = NEXT ROUND
+- Candidate proceeds to the next interview.
+- The diagram shows a normal next-round route and a "Next round (No action)" route.
+- An optional route is also visually indicated near the next-round exit.
+- The source does not define when the optional route is used.
+
+OUTCOME = REJECTED/GHOSTED
+9. Marketing confirms availability for Candidate + Rejection Team.
+10. Rejection Training Team conducts a session.
+11. A decision is made after the rejection-training session.
+12. One path sends the candidate Back to flow for the next interview.
+13. The other path stops/closes the candidate and logs the reason.
+
+CS INVOLVEMENT
+- No explicit CS action box is shown in Phase 6.
+- CS may have broader organizational visibility, but this SOP does not assign an
+  explicit Phase 6 operational step to CS.
+
+IMPORTANT BUSINESS RULES
+- Readiness coaching is conditional, not automatically required for every interview.
+- Rejected/ghosted candidates have a recovery/training path before either returning
+  to interview flow or being closed.
+- Closure requires logging a reason.
+
+NOT SPECIFIED BY SOURCE
+- Criteria for deciding whether readiness training is needed.
+- Exact AIC Portal request fields.
+- Criteria for deciding "back to flow" versus "stop/close" after rejection training.
+- Definition of ghosted.
+- Meaning/criteria for the optional next-round path.
+- Timezone for the 4:15 AM rule.
+- Salesforce object/fields for interview requests, readiness, outcomes, or rejections.
+
+
+================================================================================
+10. PHASE 7 - OFFER STAGE + ACH CONFIRMATION + CREDENTIAL RELEASE
+================================================================================
+
+ENTRY CONDITION
+- Candidate is in Offer Stage and an offer is received.
+
+PRIMARY OWNERS
+- Marketing changes and later shares email credentials.
+- CS confirms ACH signing status.
+
+PROCESS
+1. Offer is received.
+2. Marketing changes email credentials immediately.
+3. Wait/follow up with CS.
+4. During this waiting period, do NOT share the new credentials yet.
+5. Decision: Does CS confirm ACH is signed?
+
+IF ACH SIGNED = YES
+6. Share the new credentials with the candidate.
+7. End.
+
+IF ACH SIGNED = NO
+- Return to the wait/follow-up state.
+- Continue to withhold new credentials.
+- Do not release the new credentials until CS confirms ACH is signed.
+
+CRITICAL CONTROL RULE
+- Credential release is gated by CS confirmation that ACH is signed.
+
+MARKETING / CS SEPARATION OF DUTIES IN THIS PHASE
+- Marketing performs the credential change.
+- CS provides the ACH signed confirmation.
+- Marketing shares the new credentials only after that confirmation.
+
+NOT SPECIFIED BY SOURCE
+- What ACH stands for in this SOP.
+- ACH document content or signing mechanism.
+- Where ACH status is stored.
+- How credentials are generated, secured, or transmitted.
+- Salesforce object/field used for offer stage or ACH confirmation.
+
+
+================================================================================
+11. CUSTOMER SUCCESS RESPONSIBILITY SUMMARY BY PHASE
+================================================================================
+
+PHASE 1
+- No explicit CS step.
+
+PHASE 2
+- Service agreement signed.
+- Onboarding document filled.
+- Collect all required candidate information.
+- Explain end-to-end flow over a call, including expectations and rules.
+- Create Marketing WhatsApp group.
+
+PHASE 3
+- Confirm coursework + timeline.
+- Raise resume request to Marketing.
+- Create training group after resume approval.
+
+PHASE 4
+- Receive QA -> CS Pass/Fail communication for Week 1 and Week 2.
+- Support lifecycle coordination around final training result.
+
+PHASE 5
+- Receive confirmation from QA that candidate is Out of Training.
+- Audit candidate one more time using final checklist.
+- Submit candidate to Marketing as Ready to Start Marketing.
+
+PHASE 6
+- No explicit CS box in the source diagram.
+
+PHASE 7
+- Confirm whether ACH is signed.
+- This confirmation controls whether Marketing can share the new credentials.
+
+CUSTOMER SUCCESS ROLE IN ONE SENTENCE
+- CS is the operational bridge that converts an approved/paid candidate into a
+  properly onboarded, resume-ready, training-ready, out-of-training, marketing-ready,
+  and offer-stage-compliant candidate.
+
+
+================================================================================
+12. TIMING, SLA, AND EXPECTATION RULES
+================================================================================
+
+PHASE 2
+- Sales collects upfront payment within 4 hours after intake.
+- CS onboarding activities are marked within 24 hours of payment:
+  * service agreement signed
+  * onboarding document filled
+  * all required candidate information collected
+
+PHASE 3
+- Resume auto-approves in 24 hours if there is no response.
+- Resume auto-approves after one update.
+
+PHASE 5 / PHASE 6
+- Expect interviews within 1-2 weeks after marketing starts.
+
+PHASE 6
+- Interview request SLA text from source:
+  "Immediate OR latest 4:15 AM previous day."
+- Timezone and detailed interpretation are not provided in the SOP.
+
+PHASE 7
+- Marketing changes email credentials immediately after offer is received.
+- New credentials remain withheld until CS confirms ACH is signed.
+
+
+================================================================================
+13. CANONICAL DECISION RULES
+================================================================================
+
+RULE P1-SALES-APPROVAL
+IF Sales does not approve candidate
+THEN stop/close candidate AND log reason.
+
+RULE P1-MARKETING-APPROVAL
+IF Marketing does not approve candidate
+THEN stop/close candidate AND log reason.
+
+RULE P1-TO-P2
+IF Sales approves AND Marketing approves
+THEN proceed to Phase 2.
+
+RULE P2-ONBOARDING
+AFTER upfront payment
+THEN CS completes agreement/document/information onboarding requirements,
+explains expectations/rules, and creates Marketing WhatsApp group.
+
+RULE P3-NO-RESPONSE
+IF candidate does not respond to resume review within 24 hours
+THEN resume is auto-approved.
+
+RULE P3-ONE-UPDATE
+IF candidate requests changes
+THEN Marketing performs a one-time resume update
+AND resume is auto-approved after that update.
+
+RULE P3-TO-P4
+AFTER resume approval
+THEN CS creates training group
+AND candidate proceeds to training.
+
+RULE P4-PASS
+IF final training result is Pass
+THEN proceed to Phase 5.
+
+RULE P4-FAIL
+IF final training result is Fail
+THEN candidate gets one more chance
+AND repeats the training plan once.
+
+RULE P5-START-MARKETING
+IF QA confirms candidate is Out of Training
+AND CS final audit is complete
+THEN CS submits candidate to Marketing as Ready to Start Marketing
+AND Marketing starts marketing.
+
+RULE P6-READINESS
+IF interview readiness training is needed
+THEN Marketing confirms candidate availability
+AND Interview Readiness Team runs session
+BEFORE interview flow continues.
+
+RULE P6-REJECTED-GHOSTED
+IF interview outcome is Rejected/Ghosted
+THEN Marketing confirms availability for Candidate + Rejection Team
+AND Rejection Training Team runs session
+THEN candidate either returns to flow OR is stopped/closed with reason logged.
+
+RULE P7-CREDENTIAL-GATE
+IF CS has NOT confirmed ACH signed
+THEN do not share new credentials.
+
+RULE P7-CREDENTIAL-RELEASE
+IF CS confirms ACH signed
+THEN Marketing can share new credentials with candidate.
+
+
+================================================================================
+14. CROSS-TEAM HANDOFFS
+================================================================================
+
+Sales -> Marketing
+- After Sales approves candidate, Marketing performs intake interview.
+
+Marketing -> Sales / Payment Path
+- After Marketing approval, process moves to upfront payment collection by Sales.
+
+Sales -> CS
+- After payment, CS onboarding work begins.
+
+CS -> Marketing
+- Phase 3: CS raises resume request.
+- Phase 5: CS submits candidate as Ready to Start Marketing.
+
+Marketing -> CS / Candidate
+- Phase 3: Marketing shares resume through the WhatsApp group and handles one-time
+  revision when requested.
+
+QA -> CS
+- Phase 4: Week 1 and Week 2 Pass/Fail communication.
+- Phase 5: confirm candidate is Out of Training.
+
+CS -> Training Lifecycle
+- Phase 3: CS creates training group after resume approval.
+
+Marketing -> Interview Readiness Team
+- Phase 6: Marketing confirms candidate availability before readiness session.
+
+Marketing -> Rejection Training Team
+- Phase 6: Marketing confirms availability after rejected/ghosted outcome.
+
+Marketing <-> CS in Offer Stage
+- Marketing changes credentials.
+- CS confirms ACH signed.
+- Marketing releases credentials only after CS confirmation.
+
+
+================================================================================
+15. CONCEPTUAL BUSINESS ENTITIES
+================================================================================
+
+These are conceptual entities for understanding the SOP. They are NOT confirmed
+Salesforce object names.
+
+CANDIDATE
+- The person progressing through phases.
+
+SCREENING
+- Sales evaluation of criteria fit.
+
+INTAKE
+- Marketing intake interview and approval.
+
+PAYMENT
+- Upfront payment collected by Sales before CS onboarding.
+
+SERVICE AGREEMENT
+- Agreement that must be signed during CS onboarding.
+
+ONBOARDING DOCUMENT
+- Candidate onboarding document completed after payment.
+
+CANDIDATE INFORMATION
+- Required information collected by CS.
+
+RESUME
+- Created and updated by Marketing, with one revision path and auto-approval rules.
+
+TRAINING
+- Week 1 / Week 2 training and evaluation process with final pass/fail result.
+
+MARKETING ACTIVATION
+- State where candidate is ready and Marketing has started marketing.
+
+INTERVIEW REQUEST
+- Request raised through AIC Portal.
+
+INTERVIEW READINESS SESSION
+- Conditional coaching before an interview.
+
+INTERVIEW OUTCOME
+- Includes next-round and rejected/ghosted paths.
+
+REJECTION TRAINING
+- Recovery/coaching session after rejected/ghosted outcome.
+
+OFFER
+- Offer-stage event that starts Phase 7.
+
+ACH SIGNED CONFIRMATION
+- CS-controlled confirmation that gates credential release.
+
+CREDENTIALS
+- Email credentials changed by Marketing and later shared with candidate only after
+  ACH signing confirmation.
+
+CLOSURE REASON
+- Reason that must be logged when a candidate is stopped/closed.
+
+
+================================================================================
+16. CONCEPTUAL LIFECYCLE STATES
+================================================================================
+
+The following labels are useful for explaining the process but must NOT be assumed to
+be exact Salesforce picklist values:
+
+- Screening
+- Sales Approved
+- Marketing Intake
+- Marketing Approved
+- Payment Pending
+- Payment Collected
+- Onboarding In Progress
+- Onboarding Complete
+- Resume In Progress
+- Resume Review
+- Resume Approved
+- Training In Progress
+- Training Retry
+- Training Passed
+- Out of Training
+- Ready to Start Marketing
+- Marketing Started
+- Interview Request Raised
+- Interview Readiness
+- Interview Scheduled / Interview Happens
+- Next Round
+- Rejected / Ghosted
+- Rejection Training
+- Offer Received
+- ACH Pending
+- ACH Confirmed
+- Credentials Released
+- Closed / Stopped
+
+These are process concepts only.
+
+
+================================================================================
+17. GLOSSARY
+================================================================================
+
+CS
+- Customer Success.
+
+QA
+- Quality Assurance role/team in the training evaluation and out-of-training handoff.
+
+AIC Portal
+- Portal used to raise interview requests in Phase 6.
+
+MARKETING WHATSAPP GROUP
+- Communication group created by CS after onboarding and expectation-setting.
+
+TRAINING GROUP
+- Group created by CS after resume approval to start training.
+
+OUT OF TRAINING
+- Candidate has passed the training path and QA confirms readiness to CS before final
+  audit and Marketing handoff.
+
+READY TO START MARKETING
+- Handoff state used by CS when the candidate passes the final Phase 5 audit and is
+  submitted to Marketing.
+
+REJECTED/GHOSTED
+- Interview outcome category that routes candidate into rejection-training flow.
+
+ACH SIGNED
+- A required confirmation in Phase 7. The SOP does not define the full ACH mechanism.
+
+AUTO-APPROVED RESUME
+- Resume approval that occurs either after 24 hours with no response or after the
+  one-time update.
+
+STOP/CLOSE CANDIDATE
+- Termination path. The reason must be logged.
+
+
+================================================================================
+18. AI INTERPRETATION GUIDANCE
+================================================================================
+
+When the user asks "What does Customer Success do?"
+- Explain CS responsibilities across onboarding, resume initiation, training handoff,
+  out-of-training audit, Marketing readiness, and ACH confirmation.
+
+When the user asks "What happens after payment?"
+- Explain the Phase 2 CS onboarding activities, 24-hour expectation, end-to-end call,
+  and Marketing WhatsApp group creation.
+
+When the user asks "How does resume approval work?"
+- Explain candidate review, one-time update, 24-hour no-response auto-approval, and
+  auto-approval after one update.
+
+When the user asks "What happens if training fails?"
+- Explain one additional chance and repeat-training-plan-once rule.
+
+When the user asks "When does marketing start?"
+- Explain that QA first confirms Out of Training to CS, CS performs final audit, CS
+  submits Ready to Start Marketing, then Marketing starts.
+
+When the user asks "What happens after rejection?"
+- Explain rejected/ghosted -> Marketing availability confirmation -> Rejection
+  Training Team session -> either back to interview flow or stop/close with reason.
+
+When the user asks "Can Marketing share new credentials as soon as an offer arrives?"
+- No. Marketing changes credentials immediately, but the new credentials must not be
+  shared until CS confirms ACH is signed.
+
+When the user asks "Which Salesforce field tracks this?"
+- Do NOT answer from this SOP alone.
+- Look up the verified production schema / org dictionary.
+- If no verified mapping exists, state that the SOP defines the business concept but
+  not the Salesforce field.
+
+When the user asks a process question that contains a Salesforce term
+- Combine this SOP's business meaning with verified Salesforce metadata.
+- Never let an unverified business label override the production schema.
+
+
+================================================================================
+19. SOURCE LIMITATIONS / DO NOT HALLUCINATE
+================================================================================
+
+The source does NOT provide:
+- Salesforce object API names for these phases.
+- Salesforce field API names for approvals, status, training, marketing, interviews,
+  offer, ACH, or closure.
+- Exact screening criteria.
+- Exact Marketing intake approval criteria.
+- Exact onboarding information list.
+- Exact service agreement contents.
+- Exact final checklist contents.
+- Exact training threshold or scoring formula.
+- Exact decision criteria for interview readiness training.
+- Exact decision criteria after rejection training for back-to-flow versus closure.
+- Exact meaning of the optional next-round path in Phase 6.
+- Phase 6 SLA timezone.
+- ACH document/process details beyond the signing confirmation gate.
+- Credential security implementation.
+
+If a question depends on one of these missing details, answer that the SOP does not
+specify it and request or retrieve a separate authoritative source.
+
+
+================================================================================
+20. HIGH-CONFIDENCE PROCESS FACTS FOR RETRIEVAL
+================================================================================
+
+FACT 01
+The normal lifecycle starts with Sales screening and then Marketing intake approval.
+
+FACT 02
+A candidate rejected by Sales or Marketing is stopped/closed and the reason is logged.
+
+FACT 03
+After Marketing intake approval, Sales collects upfront payment within 4 hours after
+intake.
+
+FACT 04
+Within 24 hours of payment, CS is expected to have the service agreement signed, the
+onboarding document filled, and required candidate information collected.
+
+FACT 05
+CS explains the end-to-end flow, expectations, and rules over a call and creates the
+Marketing WhatsApp group.
+
+FACT 06
+Before resume creation, CS confirms coursework and timeline and raises the resume
+request to Marketing.
+
+FACT 07
+Marketing creates the resume and shares it in the WhatsApp group.
+
+FACT 08
+If the candidate requests resume changes, Marketing conducts a Zoom call to capture
+changes and performs one update.
+
+FACT 09
+The resume auto-approves in 24 hours if there is no response, and it auto-approves
+after one update.
+
+FACT 10
+After resume approval, CS creates the training group.
+
+FACT 11
+Training has Week 1 and Week 2 tracks with interview-panel scores submitted to QA,
+and QA communicates Pass/Fail to CS.
+
+FACT 12
+If the final training result fails, the candidate gets one more chance and repeats
+the training plan once.
+
+FACT 13
+After training passes, QA confirms Out of Training to CS, CS performs one final audit,
+and CS submits the candidate to Marketing as Ready to Start Marketing.
+
+FACT 14
+Marketing then starts marketing; interviews are expected within 1-2 weeks.
+
+FACT 15
+Phase 6 uses the AIC Portal to raise interview requests.
+
+FACT 16
+If interview readiness training is needed, Marketing confirms candidate availability
+and the Interview Readiness Team conducts a session before the interview flow continues.
+
+FACT 17
+If the interview outcome is rejected/ghosted, Marketing confirms availability and the
+Rejection Training Team conducts a session.
+
+FACT 18
+After rejection training, the candidate can return to interview flow or be stopped/
+closed with a logged reason.
+
+FACT 19
+When an offer is received, Marketing changes email credentials immediately but does
+not share the new credentials yet.
+
+FACT 20
+New credentials can be shared only after CS confirms ACH is signed.
+
+
+================================================================================
+21. BRAIN USAGE NOTE
+================================================================================
+
+This file should be treated as a Customer Success / candidate-lifecycle PROCESS source.
+It complements the Salesforce schema and synced data; it does not replace them.
+
+Recommended retrieval concepts / trigger terms include:
+- customer success
+- CS process
+- candidate lifecycle
+- screening
+- intake
+- onboarding
+- service agreement
+- onboarding document
+- upfront payment
+- resume process
+- resume approval
+- training
+- QA pass fail
+- out of training
+- ready to start marketing
+- marketing started
+- interview ops
+- interview readiness
+- rejected
+- ghosted
+- rejection training
+- offer stage
+- ACH signed
+- credentials
+- close candidate
+- closure reason
+- Phase 1
+- Phase 2
+- Phase 3
+- Phase 4
+- Phase 5
+- Phase 6
+- Phase 7
+
+The highest-priority safety behavior is:
+BUSINESS PROCESS TERMS MUST NOT BE INVENTED INTO SALESFORCE FIELDS.
+Use this SOP for process meaning and verified production metadata for data mapping.
+
+================================================================================
+END OF CUSTOMER SUCCESS CANDIDATE LIFECYCLE SOP KNOWLEDGE BASE
+================================================================================

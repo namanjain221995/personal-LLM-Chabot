@@ -709,7 +709,19 @@ Training-module rules (this question is about training):
   in Draft — that filter returns almost nothing.
 - Mock verdicts in practice are Pass / Fail / Needs Improvement (not the
   Hire / NoHire the picklist also allows), and Human_Decision__c is unset on
-  about half the records. State the denominator."""
+  about half the records. State the denominator.
+- A TRAINING IS NOT A CANDIDATE. The 618 Candidate_Training__c rows belong to
+  only 333 distinct people: 151 hold two or more (retraining and re-enrolment
+  are normal here, and one candidate holds 12). "How many candidates are in
+  training" is COUNT(DISTINCT Candidate__c); counting rows nearly doubles it.
+  Say which of the two you counted.
+- Steps and deliverables do not cover the whole org, so a completion figure
+  needs its denominator stated. Only 313 of the 618 trainings have ANY
+  CandidateTrainingStep__c row and 360 have no Deliverable__c at all:
+  Interview Readiness Training (299 trainings, half the org) has neither by
+  design, and Retraining Program (57) has steps but no deliverables. Those
+  are not candidates at 0% — they are programmes that do not use the
+  mechanism."""
 
 #: Each entry: the words that mean the question is in this domain, and the
 #: rules to inject when they appear.
@@ -1048,6 +1060,25 @@ TABLE_ALIASES: Dict[str, Sequence[str]] = {
     "payment": ("Payment__c", "Invoice__c"),
     "collection": ("Payment__c",),
     "outstanding": ("Invoice__c",),
+    # The words people actually use for payment questions. "how much money
+    # they have paid" matched NO alias, so the prompt carried zero Payment__c
+    # fields and the model invented `p.Status__c` (the real column is
+    # Payment_Status__c) — a raw DuckDB binder error reached the user after
+    # two answered clarifications.
+    "paid": ("Payment__c", "Invoice__c"),
+    "emi": ("Invoice__c", "Payment__c"),
+    "emis": ("Invoice__c", "Payment__c"),
+    "installment": ("Invoice__c", "Payment__c"),
+    "pay": ("Payment__c",),
+    "pays": ("Payment__c",),
+    "money": ("Payment__c", "Invoice__c"),
+    "fee": ("Payment__c", "Invoice__c"),
+    "fees": ("Payment__c", "Invoice__c"),
+    "amount": ("Payment__c", "Invoice__c"),
+    # "candidates enrolled" is the training pipeline, not a bare Account scan.
+    "enrolled": ("Candidate_Training__c", "Account"),
+    "enrolment": ("Candidate_Training__c",),
+    "enrollment": ("Candidate_Training__c",),
     "marketing": ("Marketing__c",),
     "submission": ("Job_Submission__c", "Job_Requirement__c"),
     "onboarding": ("Onboarding__c",),

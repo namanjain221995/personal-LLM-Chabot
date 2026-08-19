@@ -74,8 +74,14 @@ rules: 'Candidate-portal auth rules:
 
   - Pre-enrolment links store their token on Pre_Enrolment_Request__c, NOT here.
 
-  - Aug-2026 preprod pilot; zero/tiny production rows = not rolled out, never zero
-  adoption — say so.
+  - CORRECTED 2026-08-19 (was "Aug-2026 preprod pilot ... not rolled out"): the
+  portal IS live in production — 310 Candidate_Portal_Credential__c rows (all
+  Is_Active__c ''true'', 309 joining an Account, 132 with a Last_Login_At__c) and
+  878 Candidate_Portal_Session__c rows covering 294 of the 333 candidates who
+  have a training. Portal adoption is a real, answerable metric: never call it
+  not-rolled-out. Lockout, though, is a genuine zero — Locked_Until__c is NULL
+  and Failed_Login_Count__c is ''0.0'' on all 310, so "who is locked out" is
+  nobody, not missing data.
 
   - Token_Secret__mdt / In_App_Checklist_Settings__c are not synced to the warehouse
   — answer conceptually and say so. Never output Password__c (plain text in preprod),

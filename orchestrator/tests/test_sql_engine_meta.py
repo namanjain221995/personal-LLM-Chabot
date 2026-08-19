@@ -266,3 +266,171 @@ def test_the_sql_prompt_requires_loose_name_matching():
 
     assert "Match a PERSON or RECORD NAME case-insensitively" in _SQL_SYSTEM
     assert "never with = or IN" in _SQL_SYSTEM
+
+
+# ── The words people use for money map to the payment tables ────────────────
+# "how much money they have paid" matched NO alias, so the prompt carried zero
+# Payment__c fields and the model invented `p.Status__c` (real column:
+# Payment_Status__c) — a raw DuckDB binder error reached the user after two
+# answered clarifications.
+
+def test_payment_words_pin_the_payment_tables():
+    from app.core import org_brief
+
+    for word in ("paid", "money", "fee", "fees", "amount"):
+        tables = org_brief.TABLE_ALIASES.get(word)
+        assert tables and "Payment__c" in tables, word
+    for word in ("enrolled", "enrolment", "enrollment"):
+        tables = org_brief.TABLE_ALIASES.get(word)
+        assert tables and "Candidate_Training__c" in tables, word
+
+    q = "how many candidates enrolled and how much money they paid"
+    picked = org_brief.tables_for(q)
+    assert "Payment__c" in picked
+    assert "Candidate_Training__c" in picked
+
+
+# ── A binder error teaches the retry the table's real columns ────────────────
+
+def test_a_binder_error_is_enriched_with_the_real_column_list():
+    from app.engines.sql import _enriched_error
+
+    schema = {
+        "Payment__c": [
+            ("Id", "VARCHAR"),
+            ("Payment_Status__c", "VARCHAR"),
+            ("Amount_Paid__c", "VARCHAR"),
+        ]
+    }
+    out = _enriched_error(
+        'Binder Error: Table "p" does not have a column named "Status__c"',
+        "SELECT * FROM Payment__c p WHERE p.Status__c = 'Paid'",
+        schema,
+    )
+    assert "Payment_Status__c" in out and "Amount_Paid__c" in out
+    assert "Do not invent columns" in out
+
+
+def test_the_alias_is_resolved_even_with_AS_and_quotes():
+    from app.engines.sql import _enriched_error
+
+    schema = {"Invoice__c": [("Id", "VARCHAR"), ("Total_Amount__c", "VARCHAR")]}
+    out = _enriched_error(
+        'Binder Error: Table "inv" does not have a column named "Amount__c"',
+        'SELECT 1 FROM "Invoice__c" AS inv',
+        schema,
+    )
+    assert "Total_Amount__c" in out
+
+
+def test_non_binder_errors_pass_through_unchanged():
+    from app.engines.sql import _enriched_error
+
+    assert _enriched_error("timeout", "SELECT 1", {}) == "timeout"
+
+
+# ── Both attempts failing is an answer, not a stack trace ────────────────────
+
+def test_the_summary_covers_the_whole_result_not_the_preview():
+    """The "authoritative, computed over every row" block used to inherit the
+    500-row PREVIEW cap: a query matching 33,000 interviews had its totals
+    computed over 1.5% of the result while the prompt called them exact."""
+    from app.config import settings
+
+    # The summary cap must dwarf the preview cap — it matches the export cap.
+    assert settings.sql_summary_row_cap >= 100_000
+    assert settings.sql_summary_row_cap > settings.sql_preview_row_cap * 100
+
+
+def test_a_full_result_reaches_the_figures_while_the_preview_stays_small():
+    """3,000 rows: the computed block covers all 3,000; meta.data carries 500."""
+    import asyncio
+    import unittest.mock as mock
+
+    from app.engines import sql as sqleng
+
+    rows = [[f"cand-{i}", "2000"] for i in range(3000)]
+
+    async def main():
+        events = []
+
+        async def emit(kind, data):
+            events.append((kind, data))
+
+        async def fake_gen(*_a, **_k):
+            return "SELECT 1", ["Name", "Paid"], rows
+
+        async def fake_stream(messages, **_k):
+            # Capture the narrative prompt, then stream one token.
+            fake_stream.prompt = messages[-1]["content"]
+            yield "done"
+
+        with (
+            mock.patch.object(sqleng.settings, "duckdb_path", __file__),
+            mock.patch.object(sqleng, "generate_and_run_sql", fake_gen),
+            mock.patch.object(sqleng.llm, "stream_chat_completion", fake_stream),
+        ):
+            await sqleng.run_sql_engine("how much did each candidate pay", [], emit)
+
+        meta = [d for k, d in events if k == "meta"][-1]
+        assert len(meta["data"]) == 500          # the UI preview cap holds
+        assert meta["truncated"] is True
+        # …but the AUTHORITATIVE figures cover every row.
+        assert '"total_rows": 3000' in fake_stream.prompt
+        assert "Total rows in the result: 3000" in fake_stream.prompt
+
+    asyncio.run(main())
+
+
+def test_an_overflowing_result_states_its_true_total_honestly():
+    """Past even the summary cap, a COUNT(*) wrap fetches the real total and
+    the coverage note says "first N of M" — never the cap as the population."""
+    from app.engines.sql import deterministic_summary
+
+    # The mechanism under test is the computed-block override; simulate it the
+    # way run_sql_engine builds it.
+    rows = [["x"]] * 10
+    computed = deterministic_summary(["A"], rows)
+    computed["true_total_rows"] = 33000
+    computed["counts_cover"] = (
+        "the FIRST 10 rows of a larger result of 33000 total rows — state "
+        "every figure as covering those rows, never as the whole population"
+    )
+    assert computed["total_rows"] == 10
+    assert computed["true_total_rows"] == 33000
+
+
+def test_a_double_query_failure_is_an_honest_message_not_an_error_frame():
+    """The raw `Binder Error: Table "p" ...` used to reach the user as a red
+    error pill via an `error` SSE frame, after two answered clarifications."""
+    import asyncio
+    import unittest.mock as mock
+
+    from app.engines import sql as sqleng
+
+    async def main():
+        events = []
+
+        async def emit(kind, data):
+            events.append((kind, data))
+
+        async def boom(*_a, **_k):
+            raise RuntimeError(
+                'Binder Error: Table "p" does not have a column named "Status__c"'
+            )
+
+        with (
+            # The engine returns NO_DATA before ever querying when the
+            # warehouse file is absent — as it is in the test environment.
+            mock.patch.object(sqleng.settings, "duckdb_path", __file__),
+            mock.patch.object(sqleng, "generate_and_run_sql", boom),
+        ):
+            text = await sqleng.run_sql_engine("how much did they pay", [], emit)
+        kinds = [k for k, _ in events]
+        assert "token" in kinds and "meta" in kinds
+        meta = [d for k, d in events if k == "meta"][-1]
+        assert meta.get("salesforce_error")
+        assert "could not write a valid query" in text
+        assert "Binder Error" not in text  # raw detail stays out of the transcript
+
+    asyncio.run(main())

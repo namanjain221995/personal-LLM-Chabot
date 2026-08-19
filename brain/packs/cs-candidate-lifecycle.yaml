@@ -1,0 +1,625 @@
+# Compiled 2026-08-19 from brain/sources/customer-success-candidate-lifecycle-sop.txt
+# ("SOP - Chartflow from Phase 1 to 7", a visual process-flow SOP).
+#
+# The source is deliberately schema-free: it says, repeatedly, that its business
+# labels are NOT Salesforce field names and that any mapping must be verified
+# separately against production before it is taught. So the mapping was done
+# here, against the live warehouse (1,064 tables / 19,556 columns, read
+# 2026-08-19) — every value quoted in `rules` is a real picklist value with its
+# real production count. Where production has nothing, the rules say so instead
+# of guessing.
+#
+# No `field_notes`: every field this SOP touches is already owned by another
+# pack (Onboarding__c.Status__c by docusign-integration/kb-onboarding-hr,
+# Account.Candidate_Status__c by kb-core-people, Interview__c.Interview_Outcome__c
+# by kb-external-interviews, Internal_Interview__c.Human_Decision__c by
+# internal-interview). Notes are global and last-write-wins in filename order,
+# and `cs-*` sorts first, so a note here would silently shadow theirs.
+name: cs-candidate-lifecycle
+description: >-
+  The Customer Success candidate-lifecycle SOP, Phase 1 to Phase 7: Sales
+  screening, the Marketing intake gate, upfront payment and CS onboarding,
+  the resume process and its auto-approval rules, Week 1/Week 2 training with
+  a single retry, out-of-training confirmation and the marketing handoff,
+  interview operations with readiness and rejection coaching, and the offer
+  stage where credential release is gated on a CS confirmation that ACH is
+  signed — plus which production record each business phase actually lands in.
+
+triggers:
+- customer success
+- cs process
+- cs team
+- cs sop
+- candidate lifecycle
+- lifecycle
+- chart flow
+- chartflow
+- process flow
+- phase
+- phases
+- phase 1
+- phase 2
+- phase 3
+- phase 4
+- phase 5
+- phase 6
+- phase 7
+- handoff
+- handoffs
+- screening call
+- intake interview
+- sales approval
+- marketing approval
+- upfront payment
+- expectation setting
+- whatsapp
+- whatsapp group
+- training group
+- out of training
+- oot
+- ready to start marketing
+- start marketing
+- marketing started
+- final audit
+- final checklist
+- interview readiness
+- readiness training
+- rejection training
+- rejected
+- ghosted
+- next round
+- offer stage
+- ach signed
+- credential release
+- share credentials
+- close candidate
+- stop candidate
+- closure reason
+- auto-approve
+- auto approved
+- one-time update
+- week 1
+- week 2
+- aic portal
+- training result
+- repeat training
+
+tables:
+- Onboarding__c
+- Internal_Interview__c
+- Interview_Type__c
+- Marketing__c
+- Background_Check__c
+
+rules: |
+  Customer Success candidate-lifecycle SOP (Phase 1-7) — process rules, and the
+  production record behind each phase:
+  - The SOP is BUSINESS PROCESS, not schema. Its labels ("training result",
+    "resume approved", "marketing started", "closure reason") are not field
+    names. Answer HOW the process works from the SOP; answer WHICH field stores
+    it only from the mappings below or the org dictionary.
+  - Phases 1, 4, 5 and 6's coaching sessions are all Internal_Interview__c rows,
+    told apart ONLY by the Interview_Type__c lookup's Name: 'Intake' (124, the
+    Phase 1 Marketing intake), 'Advanced AI/ML Training - V1 - Week 1' (47) and
+    '- Week 2' (31) and '- Final Mock' (18) (Phase 4), 'OOT' (126, the Phase 5
+    out-of-training confirmation), 'Rejection Interview' (2, Phase 6), 'Mock'
+    (6), 'Practice Mock Interview'. Join Internal_Interview__c.Interview_Type__c
+    -> Interview_Type__c.Id and filter on Name; the column holds an Id, never
+    text.
+  - The SOP's QA Pass/Fail is Internal_Interview__c.Human_Decision__c ('Pass'
+    113, 'Fail' 59, 'Needs Improvement' 8, 'Hire' 1). AI_Decision__c is 'None'
+    on all 355 rows, so never answer a pass/fail question from it.
+    Week_Number__c is 1/2/3 and Is_Final_Week_Mock__c flags the final week.
+  - Phase 2 and 3 run on Onboarding__c.Status__c, whose production values ARE
+    the SOP's stages: 'Welcome Call' -> 'Service Agreement' -> 'Resume Creation'
+    -> 'Onboarding Completed', with 'Inactive' as the exit. 737 of 800 rows sit
+    at 'Onboarding Completed', so a status breakdown is history, not a queue.
+  - Phase 5's "marketing started" is Marketing__c.Status__c = 'Applications'
+    (234); the rest of the ladder is 'New Candidate' (22), 'Paused' (303),
+    'Stopped' (158), 'Closed' (215), 'Offer Letter' (15). Reason_for_paused__c
+    and Reason_for_Stop__c hold the why.
+  - Phase 6 outcomes are Interview__c.Interview_Outcome__c: 'Ghosted' (9,062),
+    'Rejected' (4,206), 'Moved to Next Round' (3,486), 'Offer Received' (132),
+    'Loop Round' (11) — the SOP's rejected/ghosted branch is
+    Interview_Outcome__c IN ('Rejected','Ghosted'). Interview_Status__c repeats
+    those words AND adds 'Scheduled'/'Completed'/'Rescheduled'/'Cancelled'/'No
+    Show'; do not mix the two columns in one filter.
+  - Phase 7's credential gate is Background_Check__c.ACH_Authorization_Status__c
+    ('Pending' 40 / 'Signed' 29) with ACH_Authorization_Signed_Date__c. While it
+    reads 'Pending', new credentials must NOT be shared. Promissory_Note_Status__c
+    and Offer_Letter_Payment_Status__c ('Received' 32 / 'Pending' 36) sit beside
+    it on the same record, whose Stage__c is 'Offer Received' (47).
+  - "Stop/close the candidate and log the reason" is Account.Candidate_Status__c
+    — production spells it 'Terminate' (18), NOT the SOP's "Terminated"; the
+    others are 'Active' (552), 'Closed' (279), 'Hold' (192), 'Placed' (11),
+    'In Progress' (3), 'Paused' (1). The logged reason is the free-text
+    Account.Candidate_Status_Change_Reason__c, empty on 963 of 1,059 accounts —
+    never read that emptiness as "no closure happened".
+  - The SOP names no field, and production has none, for: the Sales screening
+    gate, a closure-reason picklist, the Phase 5 final checklist, the AIC Portal
+    interview request, whether readiness training was needed, the WhatsApp/
+    training groups, or the 4:15 AM SLA. If asked which field holds one of
+    those, say the SOP defines the business step but not the mapping.
+
+metrics:
+- name: candidates held at the ACH credential gate
+  aliases:
+  - ach not signed
+  - ach pending
+  - credential gate
+  - credentials withheld
+  - waiting on ach
+  table: Background_Check__c
+  definition: >
+    Offer-stage candidates whose ACH authorization is still unsigned — the
+    Phase 7 control: Marketing has changed the email credentials but may not
+    share the new ones until this reads 'Signed'.
+  sql: >
+    SELECT count(*) FROM Background_Check__c WHERE Stage__c = 'Offer Received'
+    AND ACH_Authorization_Status__c = 'Pending'
+  date_column: CreatedDate
+  chart: single value, or donut Signed vs Pending
+  caveat: >
+    Only 69 background checks exist in total, so quote the denominator. The
+    status is set by hand — DocuSign never writes it back — so a stale
+    'Pending' means nobody ticked it, not necessarily that nobody signed.
+- name: lifecycle assessments by stage
+  aliases:
+  - assessments by phase
+  - intake vs oot
+  - week 1 week 2 mocks
+  - lifecycle stage mix
+  table: Internal_Interview__c
+  definition: >
+    Every internal assessment grouped by the lifecycle stage it belongs to,
+    which lives on the Interview_Type__c lookup rather than on the record.
+  sql: >
+    SELECT it.Name AS stage, count(*) FROM Internal_Interview__c ii LEFT JOIN
+    Interview_Type__c it ON ii.Interview_Type__c = it.Id GROUP BY 1 ORDER BY 2 DESC
+  date_column: Scheduled_Date__c
+  chart: bar in lifecycle order (Intake, Week 1, Week 2, Final Mock, OOT, Rejection Interview)
+  caveat: >
+    Date__c is empty on every row — use Scheduled_Date__c. One row has no type
+    at all; keep it visible rather than dropping it.
+
+glossary:
+  OOT: >
+    Out Of Training. The Phase 5 confirmation that a candidate has finished the
+    training path — QA tells Customer Success, CS runs one final audit, and only
+    then does the candidate go to Marketing. In production it is an
+    Internal_Interview__c whose Interview_Type__c lookup is named 'OOT'.
+  Out of Training: >
+    The lifecycle state between passing training and Marketing starting. QA
+    confirms it to CS; CS audits once more against the final checklist and
+    submits the candidate as Ready to Start Marketing.
+  Ready to Start Marketing: >
+    The Phase 5 handoff state CS uses when a candidate clears the final audit
+    and is submitted to Marketing. The SOP does not name a field for it; the
+    nearest production signal is Marketing__c.Status__c moving to 'Applications'.
+  Marketing WhatsApp group: >
+    The candidate communication channel Customer Success creates in Phase 2,
+    after payment and the end-to-end expectation call. Marketing later shares
+    the resume in it. Not tracked anywhere in Salesforce.
+  Training group: >
+    The group Customer Success creates in Phase 3 once the resume is approved,
+    which starts Phase 4 training. Not tracked anywhere in Salesforce.
+  Auto-approved resume: >
+    Resume approval that happens without an explicit candidate yes — either 24
+    hours passed with no response, or Marketing already made the one permitted
+    update. Candidate feedback is not an unlimited revision loop.
+  Interview readiness: >
+    Conditional Phase 6 coaching before an interview. Marketing confirms the
+    candidate's availability and the Interview Readiness Team runs a session;
+    it is not required for every interview and the SOP gives no criteria for
+    deciding it is needed.
+  Rejection training: >
+    The Phase 6 recovery session run by the Rejection Training Team after an
+    interview outcome of Rejected or Ghosted. Afterwards the candidate either
+    returns to interview flow or is stopped/closed with a reason logged.
+  ACH signed: >
+    The Phase 7 confirmation Customer Success gives before Marketing may share
+    the changed email credentials. Verified in production as
+    Background_Check__c.ACH_Authorization_Status__c = 'Signed'.
+  Credential release: >
+    Sharing the new email credentials with a candidate after an offer. Gated:
+    Marketing changes the credentials immediately when the offer arrives but
+    withholds the new ones until CS confirms ACH is signed.
+  Closure reason: >
+    The reason that must be logged whenever a candidate is stopped or closed —
+    at the Sales gate, the Marketing gate, or after rejection training. Stored
+    as free text in Account.Candidate_Status_Change_Reason__c, not a picklist.
+  Final audit: >
+    The one-more-time check CS performs against the final checklist in Phase 5,
+    between QA's out-of-training confirmation and the Marketing handoff. The
+    SOP does not list what is on the checklist.
+  Intake interview: >
+    Marketing's Phase 1 approval gate, after the Sales screening call and before
+    payment. In production it is an Internal_Interview__c whose
+    Interview_Type__c lookup is named 'Intake' (124 records).
+
+knowledge:
+- title: The seven phases of the candidate lifecycle, end to end
+  keywords: [lifecycle, phase, phases, seven, sop, chartflow, overview, journey, path, flow]
+  text: |
+    The SOP organises the candidate journey into seven phases: 1 Screening +
+    Intake, 2 Payment + Onboarding Setup, 3 Resume Process, 4 Training,
+    5 Out-of-Training Confirmation + Marketing Start, 6 Interview Ops +
+    Readiness + Rejection Training, 7 Offer Stage + ACH + Credential Release.
+
+    The success path runs: Sales screening -> Sales approval -> Marketing intake
+    interview -> Marketing approval -> upfront payment -> CS onboarding setup ->
+    expectation-setting call -> Marketing WhatsApp group -> resume creation,
+    review and approval -> training group -> Week 1 / Week 2 evaluation -> final
+    training pass -> CS out-of-training audit -> Marketing starts -> interview
+    requests -> readiness coaching where needed -> interviews -> further rounds
+    -> offer received -> Marketing changes email credentials -> CS confirms ACH
+    signed -> new credentials shared -> end.
+
+    The recovery paths: Sales or Marketing rejects, and the candidate is
+    stopped/closed with a reason logged; the final training result fails and the
+    candidate repeats the plan once; an interview ends rejected or ghosted and
+    rejection training decides between returning to flow and closing; ACH is not
+    signed and the credentials stay withheld while follow-up continues.
+
+    The process is cross-functional. Customer Success is the coordination and
+    handoff owner, but Sales, Marketing, QA, Training, Interview Readiness and
+    Rejection Training each own specific steps.
+
+- title: Phase 1 — Sales screening and the intake approval gate
+  keywords: [phase, screening, intake, sales, approval, gate, criteria, reject, rejected]
+  text: |
+    A candidate enters at Start. Sales runs a screening call to check criteria
+    fit and decides whether to approve. If Sales approves, the candidate goes to
+    a Marketing intake interview and Marketing decides. Both gates are mandatory
+    on the normal path; clearing both moves the candidate to Phase 2.
+
+    A rejection at either gate terminates the active process: stop/close the
+    candidate and log the reason. There is no appeal branch drawn in the SOP.
+
+    Customer Success has NO explicit step in Phase 1. CS ownership begins in
+    Phase 2, after payment.
+
+    In production, the Marketing intake is an Internal_Interview__c record whose
+    Interview_Type__c lookup is named 'Intake' — 124 of them. The Sales
+    screening call has no record of its own; leads live on Lead (Status 'New',
+    'Contacted', 'Converted', 'Junk', 'Lost', 'Negotiation', 'Payment') but the
+    SOP's screening decision is not one of those values and must not be equated
+    with them.
+
+    The SOP does not specify the Sales screening criteria, the Marketing
+    approval criteria, which field records either approval, or what the closure
+    reason values are.
+
+- title: Phase 2 — upfront payment and the CS onboarding setup
+  keywords: [phase, payment, upfront, paid, onboarding, expectations, whatsapp, hours]
+  text: |
+    Entry condition: Marketing approved the intake. Sales collects the upfront
+    payment, expected within 4 hours after intake. After payment, Customer
+    Success owns everything.
+
+    CS onboarding activities, all marked within 24 hours of payment, and all
+    three required — not one of three:
+      A. service agreement signed,
+      B. onboarding document filled,
+      C. all required candidate information collected.
+
+    CS then explains the end-to-end flow over a call, including expectations and
+    rules, and creates the Marketing WhatsApp group. The candidate proceeds to
+    Phase 3.
+
+    The purpose of the phase is to convert a paid, approved candidate into a
+    fully onboarded one: agreements and documents in place, the candidate
+    understanding what happens next, and the Marketing channel open.
+
+    In production this is the Onboarding__c record moving 'Welcome Call' ->
+    'Service Agreement', with Service_Agreement_Signed__c, Candidate_form_filled__c
+    and Account_information_collected__c as the three checkboxes. The 4-hour and
+    24-hour expectations themselves are not stored — there is no SLA field to
+    query, only CreatedDate and LastModifiedDate to reason from.
+
+- title: Phase 3 — resume creation and the auto-approval rules
+  keywords: [phase, resume, coursework, timeline, approval, approved, revision, zoom, update]
+  text: |
+    CS confirms coursework and timeline, then raises the resume request to
+    Marketing. Marketing creates the resume and shares it in the WhatsApp group.
+
+    If the candidate requests changes, Marketing runs a Zoom call to capture
+    them and performs ONE update; the resume is auto-approved after that update.
+    If the candidate requests no changes, the resume goes straight to
+    auto-approval. Either way the SOP states two auto-approval rules: approve in
+    24 hours if there is no response, and approve after one update.
+
+    Candidate feedback is explicitly not an unlimited revision loop. There is
+    one revision, not a negotiation.
+
+    After approval, CS creates the training group and the candidate moves to
+    Phase 4.
+
+    In production the onboarding record is at Onboarding__c.Status__c = 'Resume
+    Creation' (32 rows) with Resume_Created__c, Candidate_Approval__c and
+    Internal_Approval__c as flags; the resume document itself is Resume__c
+    (Resume_Status__c 'Uploaded'/'Draft', Approval_Date__c, Approved_By__c).
+    Nothing in production distinguishes an auto-approval from an explicit one.
+
+- title: Phase 4 — Week 1 and Week 2 evaluation, and what happens when training fails
+  keywords: [phase, week, deliverable, threshold, qa, pass, fail, failed, retry, repeat, panel, chance]
+  text: |
+    The Training Team runs training and its deliverables must meet the required
+    threshold. The SOP draws two tracks. In each, interview-panel interviews
+    happen, scores are submitted to QA, and QA communicates Pass or Fail to
+    Customer Success — Week 1 and Week 2 separately.
+
+    Both tracks feed one final training result. Pass exits Phase 4 into Phase 5.
+    Fail gives the candidate ONE more chance: repeat the training plan once,
+    looping back into training. The SOP shows one additional chance, not
+    unlimited retries, and does not say what happens after a failed retry.
+
+    CS does not run the training. CS is the recipient of QA's pass/fail and
+    coordinates the lifecycle around the result.
+
+    In production the panel rounds are Internal_Interview__c rows whose
+    Interview_Type__c lookup is named 'Advanced AI/ML Training - V1 - Week 1'
+    (47), '- Week 2' (31) or '- Final Mock' (18), with Week_Number__c 1/2/3 and
+    Is_Final_Week_Mock__c on the final one. QA's verdict is Human_Decision__c
+    ('Pass' 113, 'Fail' 59, 'Needs Improvement' 8). The deliverable threshold
+    itself and the scoring formula are not specified by the SOP.
+
+- title: Phase 5 — out-of-training confirmation and the marketing handoff
+  keywords: [phase, oot, audit, checklist, ready, start, starts, marketing, handoff, confirmation]
+  text: |
+    Entry condition: the candidate passed training. QA confirms to CS that the
+    candidate is Out of Training. CS then audits one more time against the final
+    checklist and submits the candidate to Marketing as Ready to Start
+    Marketing. Marketing starts marketing and the candidate exits to Phase 6.
+
+    Passing training alone is not enough. The SOP puts an explicit
+    out-of-training confirmation AND a CS final audit between the training pass
+    and Marketing activation — CS is the last readiness checkpoint.
+
+    The stated expectation is that interviews follow within 1-2 weeks of
+    marketing starting. The diagram labels this an expectation; it does not call
+    it an SLA or a KPI, so do not present it as one.
+
+    In production the confirmation is an Internal_Interview__c whose
+    Interview_Type__c lookup is named 'OOT' (126 records), and marketing
+    starting is Marketing__c.Status__c = 'Applications'. The final checklist is
+    not enumerated by the SOP and has no field.
+
+- title: Phase 6 — interview requests, the AIC Portal SLA and readiness coaching
+  keywords: [phase, interview, request, aic, portal, sla, readiness, availability, round, immediate]
+  text: |
+    Entry condition: marketing started. Interviews are expected in 1-2 weeks.
+
+    An interview request is raised in the AIC Portal. The SOP's timing text,
+    preserved verbatim, is: "SLA: Immediate OR latest 4:15 AM previous day."
+    The source does not explain what "4:15 AM previous day" means in business
+    terms and gives no timezone — do not reinterpret it without another
+    authoritative document.
+
+    Then a decision: is interview readiness training needed? If yes, Marketing
+    confirms the candidate's availability, the Interview Readiness Team runs a
+    session with the candidate and team, and the candidate returns to the
+    interview flow. If readiness training is not needed the flow proceeds
+    straight to the interview. Readiness coaching is conditional, not automatic.
+
+    On a next-round outcome the candidate proceeds to the next interview; the
+    diagram shows a normal next-round route, a "Next round (No action)" route,
+    and an optional route near the next-round exit whose use it never defines.
+
+    Customer Success has no explicit action box in Phase 6.
+
+    The SOP gives no criteria for deciding readiness is needed, no AIC Portal
+    request fields, and no field for any of it.
+
+- title: Phase 6 — rejected or ghosted, and the rejection-training recovery path
+  keywords: [rejected, rejection, ghosted, recovery, stop, close, closed, reason, outcome]
+  text: |
+    When an interview outcome is Rejected or Ghosted, Marketing confirms
+    availability for the candidate and the Rejection Team, the Rejection
+    Training Team conducts a session, and a decision follows. One path sends the
+    candidate back to flow for the next interview. The other stops/closes the
+    candidate, with the reason logged.
+
+    Rejected and ghosted candidates get a recovery path before any closure — the
+    SOP never closes a candidate straight off a bad interview. But closure,
+    whenever it happens, always requires a logged reason.
+
+    The SOP does not define "ghosted", and gives no criteria for choosing
+    back-to-flow over stop/close after the session.
+
+    In production the outcome is Interview__c.Interview_Outcome__c: 'Ghosted'
+    (9,062) and 'Rejected' (4,206) against 'Moved to Next Round' (3,486).
+    Account.Interviews_Ghosted__c rolls ghosting up per candidate. The rejection
+    session is an Internal_Interview__c whose type is named 'Rejection
+    Interview' — only 2 exist, so this path is far more common in the SOP than
+    in the data.
+
+- title: Phase 7 — the offer stage ACH gate on credential release
+  keywords: [phase, offer, ach, credential, credentials, email, gate, release, share, shared, duties]
+  text: |
+    An offer is received. Marketing changes the email credentials immediately.
+    Then the flow waits and follows up with CS, and during that wait the new
+    credentials are NOT shared.
+
+    The decision is: has CS confirmed ACH is signed? If yes, share the new
+    credentials with the candidate; end. If no, return to the wait, keep
+    following up, and keep withholding.
+
+    This is a separation of duties, and it is the critical control of the phase:
+    Marketing performs the credential change, CS provides the ACH-signed
+    confirmation, and Marketing shares the new credentials only after that
+    confirmation. Marketing cannot release credentials the moment an offer
+    arrives, no matter how good the news is.
+
+    In production the confirmation is
+    Background_Check__c.ACH_Authorization_Status__c ('Pending' 40 / 'Signed' 29)
+    with ACH_Authorization_Signed_Date__c, on the record whose Stage__c is
+    'Offer Received'. The status is ticked by hand; DocuSign does not write it
+    back. The SOP does not say what ACH stands for here, how the document is
+    signed, or how credentials are generated or transmitted — and nothing in
+    Salesforce records the credential share itself.
+
+- title: What Customer Success owns in each phase
+  keywords: [customer, success, cs, responsibilities, owns, owner, role, duties, phase]
+  text: |
+    Phase 1 — no explicit CS step.
+
+    Phase 2 — service agreement signed; onboarding document filled; all required
+    candidate information collected; explain the end-to-end flow, expectations
+    and rules over a call; create the Marketing WhatsApp group.
+
+    Phase 3 — confirm coursework and timeline; raise the resume request to
+    Marketing; create the training group once the resume is approved.
+
+    Phase 4 — receive QA's Pass/Fail for Week 1 and Week 2; coordinate the
+    lifecycle around the final training result. CS does not run training.
+
+    Phase 5 — receive QA's confirmation that the candidate is Out of Training;
+    audit once more against the final checklist; submit the candidate to
+    Marketing as Ready to Start Marketing.
+
+    Phase 6 — no explicit CS box in the source diagram.
+
+    Phase 7 — confirm whether ACH is signed. That confirmation is what lets
+    Marketing share the new credentials.
+
+    In one sentence: CS is the operational bridge that converts an approved,
+    paid candidate into a properly onboarded, resume-ready, training-ready,
+    out-of-training, marketing-ready and offer-stage-compliant candidate.
+
+- title: Every timing rule the lifecycle SOP states
+  keywords: [timing, sla, expectation, hours, hour, weeks, deadline, turnaround, tat, immediate]
+  text: |
+    Phase 2 — Sales collects the upfront payment within 4 hours after intake.
+    The three CS onboarding activities (service agreement signed, onboarding
+    document filled, required candidate information collected) are marked within
+    24 hours of payment.
+
+    Phase 3 — the resume auto-approves in 24 hours if there is no response, and
+    auto-approves after one update.
+
+    Phases 5 and 6 — interviews are expected within 1-2 weeks after marketing
+    starts. The diagram calls this an expectation, not an SLA or a KPI.
+
+    Phase 6 — the interview-request timing, verbatim: "Immediate OR latest 4:15
+    AM previous day." No timezone and no interpretation are provided.
+
+    Phase 7 — Marketing changes the email credentials immediately once the offer
+    is received; the new credentials stay withheld until CS confirms ACH is
+    signed, with no time limit on the wait.
+
+    Return each of these exactly as stated. "Within 4 hours", "within 24 hours",
+    "in 24 hours" and "1-2 weeks" are different rules at different points in the
+    flow, and none of them is stored in Salesforce as a deadline field.
+
+- title: Cross-team handoffs across the lifecycle
+  keywords: [handoff, handoffs, handover, teams, sales, qa, ownership, owns]
+  text: |
+    Sales -> Marketing: after Sales approves, Marketing runs the intake
+    interview.
+
+    Marketing -> payment path: after Marketing approves, Sales collects the
+    upfront payment.
+
+    Sales -> CS: after payment, CS onboarding work begins.
+
+    CS -> Marketing: Phase 3, CS raises the resume request; Phase 5, CS submits
+    the candidate as Ready to Start Marketing.
+
+    Marketing -> CS / candidate: Phase 3, Marketing shares the resume in the
+    WhatsApp group and handles the one permitted revision.
+
+    QA -> CS: Phase 4, Week 1 and Week 2 Pass/Fail; Phase 5, confirmation that
+    the candidate is Out of Training.
+
+    CS -> training lifecycle: Phase 3, CS creates the training group after
+    resume approval.
+
+    Marketing -> Interview Readiness Team: Phase 6, Marketing confirms
+    availability before a readiness session.
+
+    Marketing -> Rejection Training Team: Phase 6, Marketing confirms
+    availability after a rejected or ghosted outcome.
+
+    Marketing <-> CS in the offer stage: Marketing changes credentials, CS
+    confirms ACH signed, Marketing releases credentials only after that.
+
+- title: Where the lifecycle phases land in the production org
+  keywords: [mapping, mapped, production, warehouse, verified, schema, picklist, stores, stored]
+  text: |
+    Verified against the live warehouse on 2026-08-19. The SOP itself supplies
+    none of this — it says every mapping must be verified separately, and this
+    is that verification.
+
+    Phase 1 intake, Phase 4 Week 1/Week 2/Final Mock, Phase 5 OOT and Phase 6
+    rejection sessions are ALL Internal_Interview__c rows, distinguished only by
+    the Interview_Type__c lookup's Name ('Intake', 'Advanced AI/ML Training -
+    V1 - Week 1', '- Week 2', '- Final Mock', 'OOT', 'Rejection Interview',
+    'Mock', 'Practice Mock Interview'). QA's verdict is Human_Decision__c.
+
+    Phases 2 and 3 are Onboarding__c.Status__c: 'Welcome Call', 'Service
+    Agreement', 'Resume Creation', 'Onboarding Completed', 'Inactive'.
+
+    Phase 5's marketing start and Phase 6's ongoing marketing are
+    Marketing__c.Status__c ('New Candidate', 'Applications', 'Paused',
+    'Stopped', 'Closed', 'Offer Letter').
+
+    Phase 6 interview outcomes are Interview__c.Interview_Outcome__c
+    ('Ghosted', 'Rejected', 'Moved to Next Round', 'Offer Received', 'Loop
+    Round').
+
+    Phase 7 is Background_Check__c (Stage__c 'Offer Received',
+    ACH_Authorization_Status__c, Promissory_Note_Status__c,
+    Offer_Letter_Payment_Status__c).
+
+    Closure is Account.Candidate_Status__c = 'Terminate' or 'Closed', with the
+    reason in the free-text Account.Candidate_Status_Change_Reason__c.
+
+- title: What the lifecycle SOP deliberately does not define
+  keywords: [unspecified, unknown, missing, undefined, hallucinate, limitations, criteria]
+  text: |
+    The source provides no Salesforce object or field API names for any phase,
+    and no criteria for several decisions. Specifically it does NOT give: the
+    Sales screening criteria; the Marketing intake approval criteria; the exact
+    required-information list or onboarding-document fields; the service
+    agreement contents; what "coursework" must contain; the resume template or
+    what counts as a change request; the training deliverable threshold or
+    scoring formula; the definition of the final training result; whether Week 1
+    and Week 2 are mandatory for everyone; what happens after a failed retry;
+    the Phase 5 final checklist items; the AIC Portal request fields; the
+    criteria for needing readiness training; the criteria for back-to-flow
+    versus closure after rejection training; the definition of "ghosted"; the
+    meaning of the optional next-round path; the timezone for the 4:15 AM rule;
+    what ACH stands for or how it is signed; or how credentials are generated,
+    secured or transmitted.
+
+    If a question depends on one of these, say the SOP does not specify it and
+    ask for or retrieve a separate authoritative source. Do not fill the gap
+    from a plausible-sounding field name.
+
+- title: Lifecycle state labels that are NOT Salesforce picklist values
+  keywords: [states, state, labels, label, status, picklist, conceptual, vocabulary, terminated]
+  text: |
+    The SOP uses these labels to explain the flow. They are process concepts;
+    do not assume any is a picklist value: Screening, Sales Approved, Marketing
+    Intake, Marketing Approved, Payment Pending, Payment Collected, Onboarding
+    In Progress, Onboarding Complete, Resume In Progress, Resume Review, Resume
+    Approved, Training In Progress, Training Retry, Training Passed, Out of
+    Training, Ready to Start Marketing, Marketing Started, Interview Request
+    Raised, Interview Readiness, Interview Scheduled, Next Round, Rejected /
+    Ghosted, Rejection Training, Offer Received, ACH Pending, ACH Confirmed,
+    Credentials Released, Closed / Stopped.
+
+    A few DO coincide with real production values, and only those may be used in
+    a filter: 'Service Agreement', 'Resume Creation' and 'Onboarding Completed'
+    on Onboarding__c.Status__c; 'Rejected', 'Ghosted', 'Moved to Next Round' and
+    'Offer Received' on Interview__c.Interview_Outcome__c. The rest have no
+    production equivalent — notably "Onboarding Complete" is stored as
+    'Onboarding Completed', and "Terminated" as 'Terminate' on
+    Account.Candidate_Status__c.
+
+    The conceptual entities the SOP names (Screening, Intake, Payment, Service
+    Agreement, Onboarding Document, Resume, Training, Marketing Activation,
+    Interview Request, Interview Outcome, Rejection Training, Offer, ACH Signed
+    Confirmation, Credentials, Closure Reason) are business entities, not object
+    API names.

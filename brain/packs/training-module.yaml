@@ -77,20 +77,21 @@ tables:
 rules: |
   Training-module rules (deliverables / windows / program versions / drops —
   on top of the training rules above):
-  - Deliverable Status__c semantics (6,635 rows): 'Not Active' = created with
+  - Deliverable Status__c semantics (6,831 rows): 'Not Active' = created with
     the step but LOCKED until its session completes — it is not pending work;
     'Active' / 'Inprogress' = open for the candidate; 'Submitted' = uploaded,
     awaiting AI; 'Approved' / 'Failed' = final AI verdict rolled up;
-    'Locked' = went past due and was never finished (869 rows — this is the
+    'Locked' = went past due and was never finished (920 rows — this is the
     overdue bucket); 'Dropped' = cascaded from a training drop. The data also
     holds 'Completed' (210 rows), a value the documented picklist lacks —
     report it, never silently merge or drop it. "Outstanding deliverables"
     means Active + Inprogress (+ Submitted if the question includes awaiting
     grades) — never count 'Not Active'.
-  - One Deliverable_Result__c row per submission ATTEMPT (Pass 2,648 / Fail
-    2,158 / Pending 6). The parent Deliverable__c.AI_Latest_Score__c is TEXT
+  - One Deliverable_Result__c row per submission ATTEMPT (Pass 2,730 / Fail
+    2,204 / Pending 6). The parent Deliverable__c.AI_Latest_Score__c is TEXT
     — TRY_CAST before comparing; the per-attempt AI_Score__c on the result
-    row is the numeric source.
+    row is the numeric source. All 2,204 Fail rows carry AI_Score__c but only
+    2,204 of 2,730 Pass rows do — state that 526 passes are unscored.
   - A Session_Window__c is one daily batch inside a Slot (Cohort__c) — e.g.
     "Slot 137 / Batch 1". Bookable = Status__c IN ('Upcoming','Active').
     Booked_Count__c and Candidate_Capacity__c are VARCHAR numbers — cast
@@ -111,7 +112,7 @@ rules: |
   - The session AI-analysis fields exist on Session__c (Integrity_Score__c,
     Integrity_Tier__c, Candidate_Talk_Pct__c, Trainer_Talk_Pct__c,
     Candidate_On_Camera_Pct__c, Session_Summary__c, Red_Flags_Summary__c,
-    Flag_Type__c, Severity__c) but Analysis_Status__c is EMPTY on all 3,101
+    Flag_Type__c, Severity__c) but Analysis_Status__c is EMPTY on all 3,263
     rows — the pipeline is not live in production. Answer "the session
     analysis feature is not populated yet", never a zero or an average of
     nothing.
@@ -124,6 +125,24 @@ rules: |
     fields are formulas reading through to the master session.
   - Whatsapp_No__c on Candidate_Training__c is personal contact information
     — same handling as other personal identifiers: do not read it out.
+  - DUE DATES ARE MISSING ON THE OPEN WORK: Due_Date_Sort__c and
+    Due_Date_IST__c are both NULL on 100% of 'Inprogress' (787) and
+    'Completed' (210) deliverables, so any deadline query keyed on a due
+    date silently drops those 997 rows. Overdue = Status__c='Locked'.
+  - The trainer is Assigned_Trainer__c -> Recruiter__c (566 of 618);
+    Assigned_Trainer_User__c has 2. The documented fallbacks recover nothing
+    — of the 52 trainings with no trainer, none has a Session_Window__c or
+    Cohort__c either. Report those as unassigned.
+  - Candidate_Training__c.Niche__c is picklist TEXT copied from the Account,
+    not a lookup: only 'AI ML Engineer' also exists as a Niche__c record —
+    the other six match zero rows there. Group on the text.
+  - Time_Zone__c holds the FULL label ('ET (Eastern Time)'), so = 'ET'
+    returns nothing — use ILIKE 'ET%'. It is NULL on 258 of 618 trainings;
+    Session__c.Time_Zone__c is set on 3,262 of 3,263 and IST is the second
+    largest zone (903) — this is not a US-only org.
+  - CandidateTrainingStep__c.Completed__c, Due_At__c and Duration__c are NULL
+    on all 2,743 rows. "Modules completed" is Status__c='Completed' (915);
+    Started_At__c (2,241) is a SCHEDULED day, with future dates.
 
 metrics:
   - name: session window occupancy
@@ -253,6 +272,11 @@ field_notes:
     Trainer__c: Host trainer for this window.
     Cohort__c: The Slot this window belongs to.
   Deliverable__c:
+    Due_Date_Sort__c: >
+      THE sortable due date, but NULL on 100% of 'Inprogress' (787) and
+      'Completed' (210) deliverables — a deadline filter on it silently drops
+      those 997 rows. It is THE sortable due date; the IST and candidate-TZ
+      due-date fields are display strings, not dates.
     Status__c: >
       Not Active (waiting for its session) | Active | Inprogress | Submitted
       | Approved | Failed | Locked (overdue) | Dropped; data also holds
@@ -260,12 +284,16 @@ field_notes:
     AI_Latest_Score__c: Latest AI score rolled up from results — stored as TEXT, cast it.
     Attempt_Count__c: Number of submission attempts.
     Extension_Requested__c: Candidate asked for more time ('true'/'false').
-    Due_Date_Sort__c: THE sortable due date; the other due-date fields are display strings.
     Linked_Session__c: The session whose completion unlocked this deliverable.
     Approval_Required__c: Whether trainer approval is part of the flow.
   Deliverable_Result__c:
-    AI_Score__c: The AWS AI score for this attempt (numeric source of truth).
+    AI_Score__c: >
+      The AWS AI score for this attempt (numeric source of truth), but not on
+      every row: all 2,204 Fail rows carry it while only 2,204 of 2,730 Pass
+      rows do — 526 passes are unscored. State the denominator for averages.
     Result_Status__c: Pass | Fail | Pending (awaiting the AI callback).
+    Deliverable_Path__c: Empty on all 4,940 rows — submitted files live in S3 and never reach Salesforce, so the artefact cannot be linked from here.
+    Threshold_Score__c: Empty on all 4,940 rows — there is no stored pass mark to compare against.
   Session__c:
     Analysis_Status__c: Session AI-analysis state — empty on every production row so far.
     Integrity_Score__c: Designed AI integrity score; not populated yet.
@@ -275,12 +303,45 @@ field_notes:
     Candidate_On_Camera_Pct__c: Camera-on share; not populated yet.
     Session_Summary__c: AI-written session summary; not populated yet.
     Red_Flags_Summary__c: AI-flagged concerns; not populated yet.
-    Recording_URL__c: Post-session recording link.
-    Create_Meeting_Error__c: Populated when the Zoom callout failed — the diagnostic for missing links.
+    Recording_URL__c: Post-session recording link, populated on 2,091 of 3,263 sessions.
+    Scheduled_Start__c: NULL on all 3,263 rows despite being the documented datetime — use TRY_CAST(Scheduled_Date__c AS DATE) for session date maths.
+    Scheduled_End__c: NULL on all 3,263 rows.
+    Time_Zone__c: Set on 3,262 of 3,263 and stores the FULL label; IST is the second-largest zone (903) — this is not a US-only org.
+    Create_Meeting_Error__c: Designed as the failed-Zoom-callout diagnostic but NULL on all 3,263 production rows — a missing meeting link cannot be explained from it.
   Candidate_Training__c:
     Drop_Date__c: The cascade cutoff — records dated before it keep their status.
-    Session_Window__c: The batch the candidate booked into.
+    Session_Window__c: Set on only 88 of 618 — blank does NOT mean unbooked; Cohort__c is the booked sentinel (307 set).
+    Time_Zone__c: >
+      Stores the FULL label — 'ET (Eastern Time)', 'IST (India Standard
+      Time)' — so = 'ET' returns zero rows; use ILIKE 'ET%'. NULL on 258 of
+      618. Session__c.Time_Zone__c is far better populated (3,262 of 3,263).
+    Start_Tme_IST__c: >
+      API-name typo ('Tme'), Text not a time, and never NULL — yet 297 of 618
+      rows hold the literal placeholder ': AM'. Treat ': AM' as missing.
+    End_Time_IST__c: >
+      Text IST end time, same ': AM' placeholder on the same 297 rows. Not
+      comparable to the zero-padded Candidate_Time_Zone_* strings.
+    Candidate_Time_Zone_Start_Time__c: >
+      Display picklist TEXT on a 15-minute set, zero-padded 12-hour
+      ('01:00 AM'). Sorts alphabetically, not chronologically — never
+      ORDER BY or range-compare it. Set on 320 of 618.
+    Candidate_Time_Zone_End_Time__c: Same zero-padded 'Times' picklist text as the start field; it is the hour the overdue lock is computed from.
+    Niche__c: >
+      Picklist TEXT copied from the Account, NOT a lookup. Only 'AI ML
+      Engineer' (311) also exists as a Niche__c record; the other six values
+      match zero rows there. Group on the text, never join to Niche__c.
+    Candidate_Owner__c: Lookup to USER (618 of 618 join User, 10 distinct owners) — the internal owner, NOT the candidate. The candidate is Candidate__c.
+    Assigned_Trainer__c: The working trainer link -> Recruiter__c (566 of 618). 52 trainings have no trainer by any path — report those as unassigned.
+    Assigned_Trainer_User__c: Lookup to User, set on 2 of 618 — never use it as the trainer.
+    Trainer_Feedback__c: Hand-typed, no automation — empty on all 618 rows. Not a source for feedback questions.
     Whatsapp_No__c: Personal contact number — never read out.
+  CandidateTrainingStep__c:
+    Completed__c: NULL on all 2,743 rows — "modules completed" is Status__c = 'Completed' (915), never this field.
+    Started_At__c: A SCHEDULED day, not an actual start — NULL on 502 rows and carrying future dates on steps not yet started.
+    Expected_Duration__c: VARCHAR holding '60.0'/'120.0' (1,441 of 2,743 set) — TRY_CAST before averaging. Duration__c and Due_At__c are empty on every row.
+  Session_Attendee__c:
+    Time_Zone__c: The ATTENDEE's own zone, which differs from the master Session__c on 218 of 446 rows — quote this, not the master's, for an attendee's time.
+    Session_Status__c: Formula reading through to the master session — Completed 230 | Scheduled 207 | Rescheduled 9.
   StepTemplate__c:
     Triggers_Mock__c: Custom-cadence marker — completing a step cloned from this template spawns a mock.
     Expected_Duration_Min__c: Planned minutes for the module.
@@ -406,8 +467,11 @@ knowledge:
     keywords: [portal, guest, token, tabs, today, planner]
     text: |
       The portal runs as an unlicensed Guest User; every call resolves the
-      candidate from a session token (the token field itself is not synced
-      to the warehouse and must never be displayed). Surfaces: an Overview
+      candidate from a session token. Corrected 2026-08-19: that token IS
+      synced — Candidate_Portal_Session__c.Session_Id__c is populated on all
+      878 session rows — so it must never be selected or displayed, and
+      portal usage IS answerable (310 Candidate_Portal_Credential__c rows,
+      132 of them with a Last_Login_At__c). Surfaces: an Overview
       dashboard with tiles, "Today at a glance" (today's session, due
       deliverables, mocks), a weekly Planner, the Training tab (drill from
       training -> modules -> module detail with its sessions and
@@ -424,12 +488,14 @@ knowledge:
       score and tier, candidate/trainer talk percentages, camera-on
       percentages, coverage, session summary, red-flag summaries, flag
       type/severity/evidence, and links to the recording and result files.
-      Verified 2026-08-17: Analysis_Status__c is empty on ALL 3,101 session
+      Verified again 2026-08-19: Analysis_Status__c is empty on ALL 3,263 session
       rows — the pipeline has not run in production. Questions about talk
       time, integrity or red flags should be answered as "the session
       analysis feature is not populated yet", never as zeros or averages
-      over missing data. Recording_URL__c and Create_Meeting_Error__c are
-      ordinary operational fields and can be populated independently.
+      over missing data. Recording_URL__c is an ordinary operational field
+      and IS populated (2,091 of 3,263 sessions); Create_Meeting_Error__c,
+      despite being the designed Zoom-failure diagnostic, is NULL on every
+      production row, so it can never explain a missing meeting link.
   - title: Trainer breaks and candidate availability
     keywords: [break, series, event, calendar, availability, slots]
     text: |
@@ -451,9 +517,13 @@ knowledge:
       V1" (a demo) while every delivered programme's version sits in Draft,
       so Published is not a liveness filter. Mock cadence is configured
       (Weekly) only on the Advanced AI/ML versions. 18 session windows
-      (6 Active, 3 Upcoming, 9 Completed) named "Batch 1/2" under slots,
-      several legitimately over their capacity of 5. 6,635 deliverables
-      (2,649 Approved, 1,054 Not Active, 951 Dropped, 869 Locked, 787
-      Inprogress, 210 'Completed' — a value off the documented picklist),
-      4,812 graded attempts, 77 extension requests, 484 group-session
-      attendee rows, 52 step templates, 28 break series.
+      (9 Active, 9 Completed, no 'Upcoming' today) named "Batch 1/2" under
+      slots, several legitimately over their capacity of 5 — and ALL 18
+      belong to one programme version, "Advanced AI/ML Training - V1", so
+      session windows are a single-programme feature rather than an org-wide
+      one. 6,831 deliverables (2,731 Approved, 1,087 Dropped, 957 Not
+      Active, 920 Locked, 787 Inprogress, 210 'Completed' — a value off the
+      documented picklist, 128 Active, 6 Submitted, 5 Failed), 4,940 graded
+      attempts, 76 extension requests, 446 group-session attendee rows, 52
+      step templates, 32 break series, 618 trainings held by 333 distinct
+      candidates.

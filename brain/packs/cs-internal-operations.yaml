@@ -1,0 +1,720 @@
+# Compiled 2026-08-19 from brain/sources/customer-success-internal-operations-sop.txt
+# (the internal Customer Success SOP PDF, converted to structured knowledge).
+#
+# This SOP is the one that explicitly tells CS to "change the Salesforce status
+# to Service Agreement" and "change the status to Resume Creation" — while
+# stating that the PDF names no object or field. Both labels turned out to be
+# real production picklist values on Onboarding__c.Status__c, so the mapping is
+# supplied here, verified against the live warehouse (read 2026-08-19), with
+# real counts. Where the SOP describes work the org does not store at all (I-983
+# tracks, USCIS cases, warning letters, TAT, kick-off calls), the rules say so
+# rather than inventing a field.
+#
+# Companion pack: cs-candidate-lifecycle (the Phase 1-7 chart-flow SOP). The two
+# sources overlap and disagree in places; see the "When the two Customer Success
+# SOPs disagree" chunk below — the source itself forbids silently merging them.
+#
+# Only one `field_notes` entry, on the single field no other pack claims. Notes
+# are global and last-write-wins in filename order, and `cs-*` sorts first, so
+# anything else here would silently shadow the pack that owns it.
+name: cs-internal-operations
+description: >-
+  The Customer Success internal-operations SOP: the welcome call and its status
+  ladder, document verification and the 24-hour Team Lead assignment, resume
+  follow-up, training allocation and the marketing handoff, the Initial OPT /
+  STEM OPT / I-983 offer-letter tracks, case resolution and management
+  escalation, the progressive-warning and immediate-behavioural termination
+  paths, the offer-received checklist, EMI/ACH payment follow-up to Accounting
+  confirmation, and the cross-cutting 24-hour TAT and documentation rules.
+
+triggers:
+- customer success
+- cs sop
+- internal operations
+- welcome call
+- onboarding form
+- onboarding document
+- process briefing
+- document verification
+- team lead
+- tat
+- turn around time
+- turnaround time
+- resume follow-up
+- resume modification
+- training allocation
+- case resolution
+- candidate issue
+- internal issue
+- escalate
+- escalated to management
+- management escalation
+- warning
+- warnings
+- first warning
+- second warning
+- third warning
+- final warning
+- warning email
+- termination
+- terminate
+- terminated
+- misconduct
+- unprofessional
+- behavioral issue
+- behavioural issue
+- availability issue
+- progressive warning
+- offer verification
+- kick-off call
+- kickoff call
+- congratulations email
+- same-day payment
+- ach form
+- promissory agreement
+- immigration forms
+- employer documentation
+- job support
+- pending emi
+- emi not received
+- payment follow-up
+- accounting confirmation
+- payment closure
+- i-983
+- i983
+- initial opt
+- stem opt
+- uscis
+- uscis case
+- offer letter
+- supervisor signature
+- record keeping
+- real-time update
+- documentation requirement
+
+tables:
+- Onboarding__c
+- Case
+- Background_Check__c
+- Account
+
+rules: |
+  Customer Success internal-operations SOP — process rules, and the production
+  records behind them:
+  - The SOP is process knowledge. "Service Agreement", "Resume Creation" and
+    "Terminated" are SOP status LABELS; the PDF names no object or field. Every
+    mapping below comes from the production warehouse, not from the SOP.
+  - The SOP's status ladder IS Onboarding__c.Status__c: 'Welcome Call' (4) ->
+    'Service Agreement' (4) -> 'Resume Creation' (32) -> 'Onboarding Completed'
+    (737), with 'Inactive' (23) as the exit. 800 records; 92% already complete,
+    so a raw status count is history, not a live queue.
+  - The onboarding checkboxes beside it are Service_Agreement_Sent__c /
+    Service_Agreement_Signed__c, Candidate_form_sent__c / Candidate_form_filled__c,
+    Account_information_collected__c, Resume_Created__c, Candidate_Approval__c,
+    Internal_Approval__c and Assigned_to_Marketing__c — all stored as the STRINGS
+    'true'/'false' in the warehouse, so compare to 'true', never to a boolean.
+  - The SOP's "Terminated" is spelled 'Terminate' in Account.Candidate_Status__c
+    (18 rows); 'Closed' (279) and 'Hold' (192) are the other exits, against
+    'Active' (552) and 'Placed' (11). The narrative reason is the free-text
+    Account.Candidate_Status_Change_Reason__c, empty on 963 of 1,059 accounts.
+  - Warnings and escalations are Cases. Case.Case_Reason__c carries 'Escalation'
+    (273), 'Availability' (178), 'Legal Warning' (151), 'Missed Session' (149),
+    'Warning (Responsiveness)' (141), 'Policy Breach' (30) among ~25 values.
+    There is NO first/second/third-warning counter — reconstruct the sequence by
+    counting a candidate's Cases in date order and say that is what you did.
+    Case.IsEscalated is stock Salesforce, not the SOP's management escalation.
+  - Open ops work is Case.Status IN ('New','In Progress','Waiting on Candidate')
+    — only 24 of 1,857 rows; 'Resolved' (736) and 'Closed' (1,097) are the SOP's
+    resolved state. Deadline__c is required on every Case and Next_Action_Date__c
+    paces the follow-up.
+  - The Team Lead assignment is Account.Assigned_Marketing_Team_Lead__c, a
+    lookup to Recruiter__c (786 of 1,059 accounts have none). Marketing__c also
+    carries Assign_to_Lead__c and the TL_Recruiter_Name__c formula. Nothing
+    records WHEN the lead was assigned, so the 24-hour rule cannot be measured.
+  - The offer-received checklist is Background_Check__c: Stage__c 'Offer
+    Received' (47), Offer_Letter_Payment_Status__c ('Received' 32 / 'Pending'
+    36) with Offer_Letter_Payment_Received_Date__c, ACH_Authorization_Status__c
+    and Promissory_Note_Status__c (each 'Signed' 29 / 'Pending' 40) with their
+    *_Signed_Date__c, and Background_Check_Status__c ('Payment Verification
+    Pending' -> 'Documents Pending' -> 'Verification In Progress' ->
+    'Completed'). Only 69 records exist — always quote the denominator.
+  - The OPT and STEM OPT tracks are told apart by Account.Current_Visa_Status__c:
+    'OPT' (87), 'STEM OPT Extension' (33), 'CPT', 'H1B', 'Green Card /
+    Permanent Resident', 'US Citizen'; 929 read 'None'. Production has NO I-983,
+    USCIS-case, supervisor-signature or offer-letter-issued field anywhere —
+    describe that workflow, never query it.
+  - EMI follow-up: Invoice__c (Invoice_Status__c 'Paid' 37 / 'Partially Paid' 15
+    / 'Not Paid' 15, plus Last_EMI_Amount__c, Last_EMI_Date__c,
+    Last_EMI_Applied__c) and Payment__c (Payment_Status__c, CS_Notes__c). The
+    SOP's Accounting confirmation is a human step with no field of its own, so
+    never report a payment as closed just because a status flipped.
+  - Production stores nothing at all for: TAT, warning emails sent, kick-off
+    calls, congratulations emails, the payment screenshot shared with the
+    Manager, job-support vendor referrals, or the welcome call's content
+    (Onboarding__c.Welcome_Script__c is a template field, not a call log).
+    Explain those as process and say the org does not track them as data.
+
+metrics:
+- name: warning and escalation cases
+  aliases:
+  - warnings raised
+  - escalations raised
+  - legal warnings
+  - availability cases
+  - responsiveness warnings
+  table: Case
+  definition: >
+    The documentation trail the SOP mandates for warnings and escalations,
+    grouped by reason: the Cases whose Case_Reason__c is one of the
+    warning/escalation/availability reasons.
+  sql: >
+    SELECT Case_Reason__c, count(*) FROM Case WHERE Case_Reason__c IN
+    ('Escalation','Legal Warning','Warning (Responsiveness)','Availability',
+    'Missed Session','Policy Breach') GROUP BY 1 ORDER BY 2 DESC
+  date_column: CreatedDate
+  chart: bar
+  caveat: >
+    743 of 1,857 Cases fall in this set. The SOP's first/second/third warning
+    sequence is not stored — these are individual Cases, so counting them per
+    candidate is the only way to see a progression, and it should be labelled
+    as reconstructed rather than recorded.
+- name: onboardings not yet complete
+  aliases:
+  - onboarding backlog
+  - onboarding in progress
+  - stuck in onboarding
+  - open onboardings
+  table: Onboarding__c
+  definition: >
+    The live onboarding queue: records still short of 'Onboarding Completed' and
+    not written off as 'Inactive' — the ones CS still owes the 24-hour
+    turnaround on.
+  sql: >
+    SELECT Status__c, count(*) FROM Onboarding__c WHERE Status__c NOT IN
+    ('Onboarding Completed','Inactive') GROUP BY 1 ORDER BY 2 DESC
+  date_column: CreatedDate
+  chart: bar in ladder order (Welcome Call, Service Agreement, Resume Creation)
+  caveat: >
+    Only 40 of 800 rows qualify. 'Inactive' is an exit, not a stage, and
+    excluding it is a choice worth stating in the answer.
+
+glossary:
+  TAT: >
+    Turn Around Time — keep it within 24 hours wherever applicable. A standing
+    expectation, not a stored value: nothing in Salesforce records a TAT, so it
+    cannot be measured from the warehouse.
+  Turn Around Time: >
+    See TAT. "Within 24 hours", "after 24 hours" and "same-day" appear at
+    different points of the SOP and mean different things; never collapse them
+    into one generic SLA.
+  Welcome call: >
+    The process-orientation call that opens onboarding: explain documentation,
+    resume creation, training and marketing, complete the onboarding form, get
+    the agreement signed. Not a greeting. Its production stage is
+    Onboarding__c.Status__c = 'Welcome Call'.
+  Resume Creation: >
+    An SOP status label set after document verification and Team Lead
+    assignment; also a real value of Onboarding__c.Status__c (32 records).
+  Progressive warning: >
+    The availability-issue termination path: first warning (formal email), second
+    warning (stating the termination consequence), third and final warning, then
+    a 24-hour wait, then termination and a Salesforce update. Monitoring happens
+    between warnings; a non-repeat ends the process.
+  Immediate termination: >
+    The behavioural-issue path for serious misconduct or unprofessional
+    behaviour: terminate at once, inform Management, update the Salesforce
+    status. It replaces the warning ladder rather than following it.
+  Behavioral issue: >
+    Serious misconduct or unprofessional behaviour. Routes to immediate
+    termination, not to the warning ladder.
+  Availability issue: >
+    A candidate missing availability twice, which starts the progressive warning
+    path. Logged as Case.Case_Reason__c = 'Availability' (178).
+  Case resolution: >
+    The issue-handling flow, split at its first decision into a candidate issue
+    (understand, coordinate, solve within TAT, keep the candidate informed,
+    close) and an internal team issue (discuss, investigate, resolve
+    operationally if possible, otherwise escalate to Management and document it).
+  I-983: >
+    The third offer-letter track: verify all I-983 details, cross-check employer
+    and candidate information, obtain the supervisor signature, share the signed
+    copy. Production has no I-983 field — describable, not queryable.
+  Initial OPT: >
+    Offer-letter track A: unpaid 24-hour offer letter, collect the USCIS email,
+    create the USCIS case, candidate completes it, verify details, then issue.
+    Verification comes BEFORE issue. These candidates read 'OPT' in
+    Account.Current_Visa_Status__c (87).
+  STEM OPT: >
+    Offer-letter track B: full-time 40-hours offer letter, USCIS case creation,
+    verification, then issue. These candidates read 'STEM OPT Extension' in
+    Account.Current_Visa_Status__c (33).
+  USCIS case: >
+    A step in both OPT offer-letter tracks. An internal workflow only — not a
+    legal or immigration compliance standard, and not stored in Salesforce.
+  Supervisor signature: >
+    Required on the I-983 before the signed copy is shared with the candidate.
+    No production field records it.
+  Kick-off call: >
+    Scheduled by CS in the offer-received flow with the congratulations email,
+    after the offer's legitimacy, company and role are verified.
+  Offer verification: >
+    The first offer-received step: verify legitimacy, confirm the company,
+    confirm the role — before any post-offer onboarding work begins.
+  ACH form: >
+    Created by CS in the offer-received flow with the Promissory Agreement,
+    signed by the candidate, then verified. Status lives in
+    Background_Check__c.ACH_Authorization_Status__c.
+  Promissory agreement: >
+    Created with the ACH form and signed by the candidate. Tracked as
+    Background_Check__c.Promissory_Note_Status__c.
+  Payment closure: >
+    The end state of EMI follow-up, reached only after Accounting confirms
+    receipt and records are updated — a candidate saying they paid is not
+    closure.
+
+field_notes:
+  Account:
+    Assigned_Marketing_Team_Lead__c: >
+      Lookup to Recruiter__c: the Team Lead the Customer Success SOP requires to
+      be assigned within 24 hours of document verification. Empty on 786 of
+      1,059 accounts. Nothing records when the assignment happened, so the
+      24-hour rule cannot be measured from this field — join to Recruiter__c for
+      the name rather than displaying the raw Id.
+
+knowledge:
+- title: The Customer Success operating model and its six standing rules
+  keywords: [customer, success, operating, model, principles, guidelines, standing, general, tat, transparency]
+  text: |
+    Customer Success is an operational coordination layer across the candidate
+    journey. Its documented span covers the welcome call and onboarding,
+    agreement and status progression, document verification, resume
+    coordination, training allocation, the marketing and application handoff,
+    offer-letter and I-983 workflows, issue resolution and escalation,
+    termination handling, offer-received onboarding support, ACH/EMI payment
+    follow-up, Salesforce status maintenance, and communication, documentation
+    and record keeping.
+
+    Six general guidelines run across every workflow (the source PDF prints them
+    twice; treat them as one authoritative set):
+
+      1. Real-time updates — always update the Salesforce status in real time.
+      2. Documentation — maintain proper documentation of all warnings and
+         escalations.
+      3. Professional communication — at every stage.
+      4. 24-hour TAT — keep turn around time within 24 hours wherever
+         applicable.
+      5. Transparency — with the candidate and with internal teams.
+      6. Record keeping — document all processes and decisions.
+
+    These apply unless a specific process defines a different or more immediate
+    timing requirement (the offer-received flow's same-day payment, for
+    instance, and the immediate credential change at offer stage).
+
+- title: The CS welcome call and process briefing
+  keywords: [welcome, call, briefing, orientation, explain, greeting, opens]
+  text: |
+    A candidate enters the Customer Success onboarding process. CS calls the
+    candidate and explains the company process, walking through the major
+    areas — documentation, resume creation, training, and marketing — then
+    completes the onboarding form and gets the agreement signed.
+
+    The welcome call is not a greeting. It is the process-orientation stage: the
+    candidate is introduced to the end-to-end journey and the required
+    onboarding documentation is completed in the same step.
+
+    Immediately afterwards the Salesforce status changes to "Service Agreement".
+
+    In production the record is Onboarding__c at Status__c = 'Welcome Call'
+    (4 rows) moving to 'Service Agreement' (4 rows), with
+    Service_Agreement_Sent__c and Service_Agreement_Signed__c as the flags and
+    Candidate_form_sent__c / Candidate_form_filled__c for the onboarding form.
+    Onboarding__c.Welcome_Script__c is the script template, not a record of what
+    was said on the call — nothing logs the call itself.
+
+- title: The onboarding status ladder from Welcome Call to Onboarding Completed
+  keywords: [ladder, stage, stages, creation, completed, salesforce, inactive, values]
+  text: |
+    The SOP names two explicit Salesforce status changes and implies the rest of
+    a ladder: after the onboarding form and agreement step, change the status to
+    "Service Agreement"; after document verification and Team Lead assignment,
+    change it to "Resume Creation".
+
+    The PDF states it does not identify the object or field. The production
+    warehouse does: it is Onboarding__c.Status__c, and its values are exactly
+    the SOP's labels — 'Welcome Call' (4), 'Service Agreement' (4), 'Resume
+    Creation' (32), 'Onboarding Completed' (737), plus 'Inactive' (23) for
+    onboardings that stopped. 800 records in total.
+
+    Two consequences for answering. First, 92% of records are already at
+    'Onboarding Completed', so an unfiltered status breakdown measures history
+    rather than the live queue — the queue is the 40 rows below completion.
+    Second, the SOP's spelling and production's spelling agree here but not
+    everywhere: "Onboarding Complete" in prose is 'Onboarding Completed' in
+    data, and the termination status the SOP calls "Terminated" is 'Terminate'
+    on Account.Candidate_Status__c.
+
+- title: Document verification and the 24-hour Team Lead assignment
+  keywords: [document, verification, verify, lead, assign, assigned, assignment, hours, request]
+  text: |
+    After the status reaches "Service Agreement", CS verifies the candidate's
+    details, requests resume creation, assigns a Team Lead within 24 hours, and
+    changes the status to "Resume Creation".
+
+    The timing rule is specific: Team Lead assignment is expected within 24
+    hours. It is the only assignment deadline the SOP states.
+
+    In production the Team Lead is Account.Assigned_Marketing_Team_Lead__c, a
+    lookup to Recruiter__c — empty on 786 of 1,059 accounts, so most candidates
+    have none recorded. Marketing__c carries Assign_to_Lead__c and the
+    TL_Recruiter_Name__c formula for the marketing-side view. Nothing anywhere
+    records WHEN the lead was assigned, so the 24-hour rule can be stated as a
+    policy but not measured or audited from the warehouse.
+
+    Onboarding__c.Resume_Created__c and Resume_Creation_Notes__c carry the
+    resume request's outcome and notes.
+
+- title: Resume follow-up, the 30-minute modification call and auto-approval
+  keywords: [resume, follow, approval, approved, modification, modifications, auto, approve, revision]
+  text: |
+    CS follows up with the Team Lead, gets candidate approval within 24 hours,
+    arranges a 30-minute call if modifications are needed, and auto-approves the
+    resume after 24 hours where applicable.
+
+    The design intent is to prevent indefinite waiting. The candidate's review
+    window is bounded; when revisions are wanted, a short scheduled discussion
+    replaces an open-ended comment loop.
+
+    In production the resume document is Resume__c (Resume_Status__c 'Uploaded'
+    164 / 'Draft' 1, with Approval_Date__c and Approved_By__c). The onboarding
+    side carries Candidate_Approval__c and Internal_Approval__c as 'true'/'false'
+    strings. Nothing distinguishes an auto-approval from an explicit one, and
+    nothing records the 30-minute call, so "how many resumes auto-approved?"
+    cannot be answered from data — only described from the SOP.
+
+- title: Training allocation and the marketing and application handoff
+  keywords: [allocation, allocate, share, shared, application, credentials, complete, completion]
+  text: |
+    Two short steps close the CS onboarding flow.
+
+    Training allocation: CS shares the resume with the Training Team and
+    confirms training completion. The resume process transitions into training
+    coordination — CS is responsible for the Training Team receiving the
+    candidate and resume, and for confirming that training completed.
+
+    Marketing and application: CS ensures the Team Lead begins marketing,
+    collects credentials, and completes onboarding. At that point the initial
+    Customer Success onboarding flow is done and the candidate proceeds into the
+    marketing and application stage.
+
+    In production, training completion is Candidate_Training__c.Status__c
+    ('Completed' 139 against 'Active' 319, 'Planned' 96, 'Dropped' 62, 'Paused'
+    6), marketing beginning is Marketing__c.Status__c = 'Applications', and
+    onboarding completing is Onboarding__c.Status__c = 'Onboarding Completed'
+    with Assigned_to_Marketing__c set. The credentials CS collects here are the
+    candidate's marketing email accounts; Onboarding__c holds
+    Marketing_Email_Id__c, LinkedIn_Email_Id__c and LinkedIn_Password_Updated__c,
+    but no password value is stored.
+
+- title: Offer letter track A — Initial OPT candidates
+  keywords: [initial, opt, offer, letter, uscis, unpaid, verify, issue, issued, track, process]
+  text: |
+    Sequence for Initial OPT candidates:
+
+      1. Provide an unpaid 24-hour offer letter.
+      2. Collect the USCIS email.
+      3. Create the USCIS case.
+      4. The candidate completes the case.
+      5. Verify details thoroughly.
+      6. Issue the offer letter.
+
+    The key control is the order: details are verified BEFORE the offer letter
+    is issued, never after.
+
+    Candidates on this track read 'OPT' in Account.Current_Visa_Status__c — 87
+    of 1,059 accounts. That field is the only production signal of the track;
+    the USCIS email, the USCIS case, the unpaid 24-hour letter and the issuance
+    itself have no fields anywhere in the org.
+
+    This is an internal workflow description. It is not a legal or immigration
+    interpretation, it does not state eligibility rules or government policy,
+    and following it does not by itself guarantee USCIS or immigration
+    compliance. A question asking for legal interpretation is a different
+    question from a question about this SOP.
+
+- title: Offer letter track B — STEM OPT candidates
+  keywords: [stem, opt, offer, letter, uscis, verification, issue, issued, track, process]
+  text: |
+    Sequence for STEM OPT candidates:
+
+      1. Provide a full-time 40-hours offer letter.
+      2. Follow USCIS case creation.
+      3. Complete the verification process.
+      4. Issue the offer letter.
+
+    As with Initial OPT, the verification process comes before final offer-letter
+    issuance. The difference between the tracks is the letter itself: unpaid and
+    24-hour for Initial OPT, full-time 40-hours for STEM OPT.
+
+    Candidates on this track read 'STEM OPT Extension' in
+    Account.Current_Visa_Status__c — 33 of 1,059 accounts. Nothing else about
+    the track is stored.
+
+    The same boundary applies: describe the documented internal sequence, do not
+    infer legal requirements from it, and do not present it as an immigration
+    compliance standard.
+
+- title: The I-983 form process and its supervisor signature
+  keywords: [i983, form, employer, crosscheck, supervisor, signature, track, process]
+  text: |
+    Sequence for the I-983 form:
+
+      1. Verify all I-983 details.
+      2. Cross-check employer and candidate information.
+      3. Get the supervisor signature.
+      4. Share the signed copy with the candidate.
+
+    Each of the three offer-letter tracks reaches a completed state only after
+    its own required steps are finished; they are not interchangeable.
+
+    Production has no I-983 field, no supervisor-signature field and no signed-
+    copy record anywhere in the org. This track can be explained but never
+    queried — if asked how many I-983s were completed, say the org does not
+    store it.
+
+    As with the OPT tracks, this describes internal workflow only and is not a
+    legal or immigration interpretation.
+
+- title: Case resolution — candidate issues versus internal team issues
+  keywords: [case, resolution, issue, issues, escalation, escalate, escalated, management, investigate, resolve, tat]
+  text: |
+    An issue arises and is categorised into one of two paths.
+
+    Candidate issue: understand the problem, coordinate with the relevant team,
+    provide a solution within TAT, keep the candidate informed, and treat the
+    matter as resolved when the required action is complete. The core
+    expectation is that the candidate is never left without communication while
+    the issue is being handled.
+
+    Internal team issue: discuss with the team member, investigate properly,
+    then decide whether it can be resolved at the operational level. If yes,
+    resolve and close. If no, escalate to Management, document the escalation,
+    and continue to resolution and closure.
+
+    All escalations must be documented, regardless of the eventual outcome.
+    Operational teams solve what is within their authority; Management
+    escalation is the path for what is not.
+
+    In production these are Cases. Case.Case_Reason__c = 'Escalation' covers 273
+    of 1,857 Cases; open work is Status IN ('New','In Progress','Waiting on
+    Candidate') — just 24 rows, against 'Resolved' (736) and 'Closed' (1,097).
+    Case.IsEscalated is the stock Salesforce flag and is not the SOP's
+    management escalation.
+
+- title: Termination for availability — the progressive warning path
+  keywords: [availability, warning, warnings, first, second, third, final, terminate, termination, monitor, hours]
+  text: |
+    Trigger: the candidate misses availability twice.
+
+    First warning — send a formal warning email explaining the issue. Then a
+    decision: does the issue repeat? If no, the process ends and the candidate
+    is monitored. If yes, continue.
+
+    Second warning — inform the candidate about the termination consequence.
+    Same decision again: no repeat ends the process; a repeat continues.
+
+    Third warning — issue the final warning. Then wait 24 hours, proceed to
+    termination, and update Salesforce.
+
+    All warnings must be documented.
+
+    In production the warnings are Cases: Case_Reason__c 'Availability' (178),
+    'Warning (Responsiveness)' (141), 'Legal Warning' (151), 'Missed Session'
+    (149). There is NO first/second/third counter and no warning-letter record —
+    the ladder can only be reconstructed by counting a candidate's Cases in date
+    order, and an answer that does so should say it is reconstructed. The
+    termination itself is Account.Candidate_Status__c = 'Terminate' (18) with
+    the narrative in Account.Candidate_Status_Change_Reason__c.
+
+- title: Termination for behaviour — the immediate path
+  keywords: [behavioral, behavioural, behaviour, misconduct, unprofessional, immediate, termination, terminate, terminated]
+  text: |
+    Trigger: serious misconduct or unprofessional behaviour.
+
+    Sequence: immediate termination, inform Management, update the Salesforce
+    status, candidate reaches the "Terminated" state.
+
+    This path REPLACES the progressive warning sequence. Availability issues get
+    warnings with monitoring opportunities between them; serious behavioural
+    issues do not — there is no warning ladder and no 24-hour wait here. Warning
+    documentation rules still apply, and this branch additionally requires
+    management notification and a Salesforce status update.
+
+    "Terminated" is the SOP's word. Production spells the value 'Terminate' on
+    Account.Candidate_Status__c (18 rows across BOTH termination paths — the
+    data does not distinguish behavioural from availability terminations). The
+    only place the distinction survives is the free-text
+    Account.Candidate_Status_Change_Reason__c, and only when someone wrote it
+    there: it is empty on 963 of 1,059 accounts.
+
+- title: The offer-received checklist CS runs after an offer
+  keywords: [offer, received, congratulations, kickoff, invoice, upfront, promissory, vendor, checklist, support]
+  text: |
+    Six steps, in order.
+
+      1. Offer verification — verify legitimacy, confirm the company details,
+         confirm the role. This happens before any post-offer onboarding work.
+      2. Congratulate — send a congratulations email, express excitement,
+         schedule a kick-off call.
+      3. Invoice and upfront payment — inform Accounting, create the invoice,
+         collect same-day payment, share the screenshot with the Manager. The
+         SOP explicitly calls for same-day payment at this stage, not the
+         general 24-hour TAT.
+      4. ACH and promissory note — create the ACH form, create the Promissory
+         Agreement, get the candidate signature, verify details.
+      5. Background verification support — assist until the candidate is fully
+         onboarded: background verification, immigration forms, employer
+         documentation.
+      6. Job support if required — connect the candidate with the vendor.
+
+    The desired end state is the candidate successfully onboarded in a
+    legitimate company.
+
+    In production, steps 3 and 4 are Background_Check__c at Stage__c = 'Offer
+    Received' (47 records): Offer_Letter_Payment_Status__c ('Received' 32 /
+    'Pending' 36), ACH_Authorization_Status__c and Promissory_Note_Status__c
+    (each 'Signed' 29 / 'Pending' 40), tracked through
+    Background_Check_Status__c. Steps 1, 2 and 6 — verification, the
+    congratulations email, the kick-off call, the vendor referral — have no
+    fields at all.
+
+- title: EMI and ACH payment follow-up until Accounting confirms
+  keywords: [emi, pending, follow, accounting, confirm, confirms, records, closure, unpaid, received]
+  text: |
+    Trigger: Accounting alerts Customer Success that an EMI has not been
+    received.
+
+    CS calls the candidate, informs them politely about the pending EMI, shares
+    the invoice, and requests immediate payment. Then the decision: was payment
+    received?
+
+    If no — continue follow-up until closure; the process loops back into
+    candidate follow-up. There is no give-up branch.
+
+    If yes — confirm with the Accounting team that receipt is verified, update
+    the relevant records, and only then is payment closure complete.
+
+    The important rule: a candidate saying they paid is NOT the closure
+    condition. CS confirms with Accounting and updates records first.
+
+    In production the invoice side is Invoice__c (Invoice_Status__c 'Paid' 37,
+    'Partially Paid' 15, 'Not Paid' 15, with Last_EMI_Amount__c, Last_EMI_Date__c
+    and Last_EMI_Applied__c) and the money side is Payment__c (Payment_Status__c,
+    with CS_Notes__c for the CS narrative). The Accounting confirmation itself
+    is a human step with no field, so a status alone never proves the SOP's
+    closure was reached.
+
+- title: Documentation and record keeping are mandatory controls
+  keywords: [documentation, record, keeping, mandatory, document, warnings, escalations, realtime, update, communication]
+  text: |
+    Documentation in this SOP is a control, not administrative overhead. The
+    explicit requirements are: fill the onboarding form; get the agreement
+    signed; verify candidate details; document all escalations; document all
+    warnings; update the Salesforce status in real time; update records after
+    payment confirmation; and document all processes and decisions.
+
+    The response rule that follows: when describing any process involving
+    warnings, escalations, termination or payment closure, INCLUDE the related
+    documentation or record-update step. Do not summarise only the verbal or
+    communication action and drop the record-keeping requirement — the record
+    step is part of the process, not a footnote.
+
+    Communication standards sit alongside: professional communication at every
+    stage; transparency with candidates and internal teams; keeping the
+    candidate informed during issue resolution; informing candidates politely
+    about a pending EMI; formal warning communication for availability issues; a
+    congratulations email after a verified offer; and informing Management where
+    escalation or immediate behavioural termination requires it.
+
+- title: Roles and handoffs in the internal operations SOP
+  keywords: [roles, role, lead, accounting, management, vendor, supervisor, responsibilities]
+  text: |
+    Customer Success — candidate communication; onboarding form and agreement
+    completion; Salesforce status updates; document verification; resume
+    follow-up; training coordination; issue coordination; escalation and its
+    documentation; warning and termination execution; offer verification;
+    post-offer coordination; payment follow-up; ACH and promissory
+    documentation; onboarding and background support; record keeping.
+
+    Team Lead — assigned during onboarding; coordinates and is followed up with
+    on the resume; begins marketing.
+
+    Training Team — receives the candidate and resume; participates in the
+    training completion flow.
+
+    Marketing — the downstream stage where candidate marketing and application
+    work begins after onboarding, resume and training readiness.
+
+    Accounting — informed during invoice and upfront payment processing; alerts
+    CS when an EMI is not received; confirms payment receipt before closure.
+
+    Management — receives escalations that cannot be resolved operationally; is
+    informed during immediate behavioural termination; receives the payment
+    screenshot during the offer-received process.
+
+    Vendor — the destination for job-support coordination when job support is
+    required.
+
+    Supervisor — the person whose signature must be obtained on the I-983.
+
+- title: What the internal operations SOP does not define
+  keywords: [undefined, missing, unknown, invent, limitations, boundaries, hallucination, mapping]
+  text: |
+    The SOP provides no Salesforce object API names, no field API names, no
+    picklist API values, no automations, flows, triggers or Apex behaviour. Its
+    status words are business labels.
+
+    Do not invent: an approval authority the SOP does not name; exceptions to
+    the warning or termination processes; legal or immigration requirements from
+    the OPT / STEM OPT / I-983 workflow. Do not treat a payment as closed before
+    Accounting confirmation and the record update. Do not omit escalation or
+    warning documentation. Do not merge two statuses into one unless the
+    Salesforce schema itself does.
+
+    Where a mapping is genuinely needed, use the verified production schema (the
+    rules block of this pack carries the ones that were verified on 2026-08-19).
+    Where the schema does not confirm a mapping, say the SOP defines the business
+    action but does not identify the Salesforce field or object — that answer is
+    correct and complete, and it is much better than a plausible guess, because
+    a wrong field name returns zero rows silently rather than erroring.
+
+- title: When the two Customer Success SOPs disagree
+  keywords: [conflict, conflicting, disagree, sources, precedence, reconcile, contradiction, version]
+  text: |
+    Two approved Customer Success sources describe the same journey from
+    different angles: this internal-operations SOP, and the Phase 1-7
+    candidate-lifecycle chart flow (pack cs-candidate-lifecycle). Neither
+    supersedes the other, and this source explicitly forbids silently choosing
+    between them or merging a conflicting rule — surface the conflict, and
+    prefer the latest approved source when version information is available.
+
+    Resume ownership. Internal operations has CS request resume creation and
+    follow up with a Team Lead who coordinates it; the lifecycle SOP has CS
+    raise the request to Marketing, and Marketing create and share the resume.
+
+    Resume revision. Internal operations says approval within 24 hours, a
+    30-minute call for modifications, auto-approval after 24 hours. The
+    lifecycle SOP adds the harder rule: exactly ONE update, after which the
+    resume is auto-approved regardless.
+
+    Training handoff. Internal operations has CS share the resume with the
+    Training Team and confirm completion. The lifecycle SOP inserts QA: Week 1
+    and Week 2 panel scores go to QA, QA reports Pass/Fail to CS, and QA
+    separately confirms Out of Training before the handoff.
+
+    Termination. Internal operations is the only source with the warning ladder
+    and the immediate behavioural path; the lifecycle SOP only says stop/close
+    and log the reason.
+
+    Offer stage. Internal operations gives the six-step offer-received
+    checklist; the lifecycle SOP gives the credential-release gate. These are
+    complementary, not conflicting — a complete answer needs both.
