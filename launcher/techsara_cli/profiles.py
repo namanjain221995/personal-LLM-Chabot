@@ -239,6 +239,16 @@ def _dynamic_id(profile_id: str, hardware: HardwareInfo) -> str:
     return profile_id
 
 
+# Measured FP8 KV layouts for the DGX main models; anything else receives the
+# more conservative allowance below.  Qwen3.8-27B is dense (64 layers x 4 KV
+# heads x 256 head dim, FP8 KV), so its per-token cost is larger than the 35B
+# MoE despite the smaller parameter count.
+_DGX_KV_BYTES_PER_TOKEN = {
+    "dgx-qwen36-35b-nvfp4": 40 * 1024,
+    "dgx-qwen38-27b-nvfp4": 128 * 1024,
+}
+
+
 def _model_bytes(
     main: ModelSpec | None,
     embed: ModelSpec | None,
@@ -258,11 +268,11 @@ def _model_bytes(
     # activations. The DGX profile uses the measured/preserved FP8 KV layout;
     # other backends receive the more conservative allowance. Startup still
     # performs a real generation probe and may retry once at the safer context.
-    kv_bytes_per_token = 40 * 1024 if main and main.key == "dgx-qwen36-35b-nvfp4" else 96 * 1024
+    kv_bytes_per_token = _DGX_KV_BYTES_PER_TOKEN.get(main.key if main else "", 96 * 1024)
     kv_and_activations = context * kv_bytes_per_token + max(1, concurrency) * 512 * 1024**2
     if main and main.backend == "vllm-metal":
         overhead = int(weights * 0.14) + GIB
-    elif main and main.key == "dgx-qwen36-35b-nvfp4":
+    elif main and main.key in _DGX_KV_BYTES_PER_TOKEN:
         overhead = int(weights * 0.10) + GIB
     else:
         overhead = int(weights * 0.22) + 2 * GIB
@@ -484,6 +494,18 @@ def select_profile(
         degraded.append("Apple inference disabled under Rosetta; run the launcher from a native arm64 terminal")
     if hardware.operating_system == "windows" and hardware.gpu_vendor == "nvidia" and chosen["family"] != "nvidia":
         degraded.append("Windows NVIDIA acceleration requires WSL2, Linux containers, and a passing Docker GPU probe")
+    if hardware.operating_system == "linux" and hardware.gpu_vendor == "nvidia" and chosen["family"] != "nvidia":
+        # Without this, a host with a working driver but no *container* GPU path
+        # drops to the CPU profile in silence: the accelerator is detected and
+        # printed, yet the tiny CPU model is selected with nothing explaining it.
+        reason = (
+            "NVIDIA acceleration unavailable: the host driver was detected but the Docker GPU probe did not pass"
+        )
+        if not hardware.nvidia_container_toolkit_available:
+            reason += "; install the NVIDIA Container Toolkit"
+        else:
+            reason += "; register its runtime with Docker (`sudo nvidia-ctk runtime configure --runtime=docker` then restart Docker)"
+        degraded.append(reason)
 
     candidates = list(chosen.get("context_candidates") or [chosen_context])
     safer = next((value for value in candidates if value < chosen_context), max(2048, chosen_context // 2))

@@ -859,6 +859,12 @@ export function createServerHistoryStore(
         role: m.role === 'user' ? 'user' : 'assistant',
         content: typeof m.content === 'string' ? m.content : '',
         ...(m.meta ? { meta: m.meta as Meta } : {}),
+        // 2026-08-21: rebuild the file card from server history — the name
+        // rides on meta.attachments, so a browser that never held the File
+        // object (another device, a cleared cache) still shows the chip.
+        ...(m.role === 'user' && (m.meta as Meta | null)?.attachments?.[0]?.name
+          ? { pdfName: (m.meta as Meta).attachments![0].name }
+          : {}),
         ...(m.role === 'user' ? {} : { status: 'done' as const }),
         createdAt: now - (server.messages.length - i),
       }));

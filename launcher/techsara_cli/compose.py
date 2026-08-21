@@ -321,11 +321,12 @@ def reconcile_project_services(
     undesired services are stopped.
     """
     known_optional = {
-        "vllm", "vllm-router", "vllm-embed", "vllm-ocr", "vllm-vision",
+        "vllm", "vllm-router", "vllm-embed", "vllm-reranker", "vllm-ocr", "vllm-vision",
         "llama-cpp", "sync-worker", "searxng", "pgadmin",
     }
     model_services = {
-        "vllm", "vllm-router", "vllm-embed", "vllm-ocr", "vllm-vision", "llama-cpp",
+        "vllm", "vllm-router", "vllm-embed", "vllm-reranker", "vllm-ocr", "vllm-vision",
+        "llama-cpp",
     }
     desired = set(desired_services)
     result = runner(

@@ -44,6 +44,7 @@ class HardwareInfo:
     docker_linux_containers: bool = False
     docker_installed: bool = False
     docker_running: bool = False
+    docker_permission_denied: bool = False
     docker_compose_available: bool = False
     docker_compose_version: str = ""
     docker_desktop_version: str = ""
@@ -136,10 +137,29 @@ def _parse_nvidia_csv(text: str) -> tuple[str, int, int, int, str]:
     return ", ".join(unique_names), len(rows), sum(totals), sum(frees), max(capabilities, key=capability_key, default="")
 
 
+# A stopped daemon and an unreadable socket are different host problems with
+# different fixes, but both make `docker version` exit non-zero.  Docker reports
+# the second as a permission error on the endpoint it tried ("permission denied"
+# on a unix socket, "access is denied" on a Windows named pipe), so the stderr
+# text is the only signal that separates "start Docker" from "grant this account
+# access to Docker".
+_DOCKER_DENIED_PATTERN = re.compile(
+    r"permission denied|access is denied|operation not permitted", re.I
+)
+
+
+def _docker_permission_denied(stderr: str) -> bool:
+    text = stderr.strip()
+    if not text:
+        return False
+    return bool(_DOCKER_DENIED_PATTERN.search(text))
+
+
 def _docker_details(command: Command) -> dict:
     details = {
         "installed": shutil.which("docker") is not None,
         "running": False,
+        "permission_denied": False,
         "compose": False,
         "compose_version": "",
         "server_arch": "",
@@ -150,7 +170,7 @@ def _docker_details(command: Command) -> dict:
     }
     if not details["installed"]:
         return details
-    code, output, _ = command(
+    code, output, error = command(
         ["docker", "version", "--format", "{{json .}}"], 12.0
     )
     if code == 0:
@@ -167,6 +187,8 @@ def _docker_details(command: Command) -> dict:
             ["docker", "info", "--format", "{{.OSType}}"], 12.0
         )
         details["linux_containers"] = code_info == 0 and info.strip().lower() == "linux"
+    else:
+        details["permission_denied"] = _docker_permission_denied(error)
     code, compose_output, _ = command(["docker", "compose", "version"], 8.0)
     details["compose"] = code == 0
     if code == 0:
@@ -236,11 +258,13 @@ def _detect_dgx_spark(
     signals = 0
     if arch == "arm64":
         signals += 1
-    if re.search(r"\bGB10\b|DGX\s*Spark", gpu_name, re.I):
+    # DMI spells this host "NVIDIA_DGX_Spark", so the separator class must allow
+    # underscores and hyphens; `\s*` alone silently loses the strongest signal.
+    if re.search(r"\bGB10\b|DGX[\s_-]*Spark", gpu_name, re.I):
         signals += 2
     if total_memory >= 96 * GIB:
         signals += 1
-    if re.search(r"DGX\s*Spark|NVIDIA", f"{cpu_name} {system_metadata}", re.I):
+    if re.search(r"DGX[\s_-]*Spark|NVIDIA", f"{cpu_name} {system_metadata}", re.I):
         signals += 1
     return signals >= 4
 
@@ -363,6 +387,7 @@ def detect_hardware(
         "cpu_core_count": os.cpu_count() or 1,
         "docker_installed": docker["installed"],
         "docker_running": docker["running"],
+        "docker_permission_denied": docker["permission_denied"],
         "docker_compose_available": docker["compose"],
         "docker_compose_version": docker["compose_version"],
         "docker_desktop_version": docker["desktop_version"],

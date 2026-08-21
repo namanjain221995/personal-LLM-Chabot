@@ -107,3 +107,5 @@ the portable-runtime documentation pass.
 
 For platform startup, profiles, data preservation, and security boundaries,
 see [`../docs/PORTABLE-RUNTIME.md`](../docs/PORTABLE-RUNTIME.md).
+
+## Initial setup for frontend changes

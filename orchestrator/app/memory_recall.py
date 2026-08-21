@@ -50,7 +50,12 @@ def format_recall_block(hits: List[dict]) -> Optional[str]:
     for h in hits:
         title = (h.get("title") or "Untitled").strip()
         snippet = (h.get("snippet") or "").strip()
-        lines.append(f'- From "{title}": {snippet}')
+        # Attribution matters: a fact the user stated is something to accept,
+        # while one you asserted earlier is only as good as it ever was.
+        speaker = {"user": " (the user said)", "assistant": " (you answered)"}.get(
+            (h.get("role") or "").strip().lower(), ""
+        )
+        lines.append(f'- From "{title}"{speaker}: {snippet}')
     return "\n".join(lines)
 
 

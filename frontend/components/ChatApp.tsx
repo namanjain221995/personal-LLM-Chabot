@@ -546,7 +546,28 @@ export function ChatApp() {
         pdfName: isPdf || isDataset ? first?.name : undefined,
         // V5: pasted blocks ride on meta so they round-trip through server
         // history and are folded into the model input at request time.
-        meta: pasted.length ? { route: 'chat', pasted } : undefined,
+        // 2026-08-21: attachments ride the same way, so the file card can be
+        // rendered by any browser from server history — pdfName alone never
+        // left this browser's cache.
+        meta:
+          pasted.length || isPdf || isDataset
+            ? {
+                route: 'chat',
+                ...(pasted.length ? { pasted } : {}),
+                ...(isPdf || isDataset
+                  ? {
+                      attachments: [
+                        {
+                          name: first?.name ?? 'file',
+                          kind: isDataset
+                            ? ('dataset' as const)
+                            : ('pdf' as const),
+                        },
+                      ],
+                    }
+                  : {}),
+              }
+            : undefined,
         createdAt: Date.now(),
       };
       // Keep the payloads in memory so regenerate/retry re-send the same
@@ -580,8 +601,18 @@ export function ChatApp() {
             form.append('file', first.file as File);
             form.append('conversation_id', conversationId);
             const res = await fetch('/api/upload', { method: 'POST', body: form });
-            const body = (await res.json()) as { detail?: string; files?: number };
+            const body = (await res.json()) as {
+              detail?: string;
+              files?: number;
+              upload_id?: string;
+            };
             if (!res.ok) throw new Error(body.detail ?? 'upload failed');
+            // Link the turn to the server's durable uploads row, so the
+            // persisted message names the exact attachment it was asked about.
+            if (body.upload_id && userMessage.meta?.attachments?.[0]) {
+              userMessage.meta.attachments[0].id = body.upload_id;
+              persist(conversationId, turns);
+            }
             toast(
               `Profiled ${body.files ?? 0} file${body.files === 1 ? '' : 's'} from ${first.name}.`,
             );
@@ -590,13 +621,24 @@ export function ChatApp() {
               err instanceof Error ? err.message : 'That dataset could not be read.',
               'error',
             );
-          } finally {
-            void startStream({
-              conversationId,
-              turns,
-              prefs: prefsRef.current,
-            });
+            // The dataset never made it in, so generating would answer from a
+            // context that doesn't exist. No stream was registered, so nothing
+            // else will clear the optimistic streaming flag set above.
+            if (conversationId === activeIdRef.current) setStreaming(false);
+            // Un-persist the attachment metadata: other devices must not see
+            // a card for a dataset the server never accepted. (The local
+            // pdfName chip stays, next to the error toast, as before.)
+            if (userMessage.meta?.attachments) {
+              delete userMessage.meta.attachments;
+              persist(conversationId, turns);
+            }
+            return;
           }
+          void startStream({
+            conversationId,
+            turns,
+            prefs: prefsRef.current,
+          });
         })();
         return;
       }

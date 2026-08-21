@@ -32,9 +32,19 @@ verify_sha256() {
     fi
 }
 
-if [ ! -x "$TECHSARA_UV" ]; then
+# `uv --version` prints "uv <version> (<target triple>)", so compare the version
+# field rather than the whole line.  An unreadable, corrupt, or directory-shaped
+# path simply reports nothing and is treated as "not the pinned version".
+installed_uv_version() {
+    [ -f "$TECHSARA_UV" ] && [ -x "$TECHSARA_UV" ] || return 0
+    "$TECHSARA_UV" --version 2>/dev/null | head -n 1 | awk '{print $2}'
+}
+
+# Reinstall whenever the pinned version is not the installed one, so bumping
+# TECHSARA_UV_VERSION self-heals instead of dead-ending on a manual `rm`.
+if [ "$(installed_uv_version)" != "$TECHSARA_UV_VERSION" ]; then
     if [ "$TECHSARA_OFFLINE" -eq 1 ]; then
-        echo "TechSara error: pinned uv is missing and --offline forbids downloading it." >&2
+        echo "TechSara error: pinned uv $TECHSARA_UV_VERSION is unavailable and --offline forbids downloading it." >&2
         exit 2
     fi
     mkdir -p "$TECHSARA_BIN_DIR"
@@ -55,15 +65,17 @@ if [ ! -x "$TECHSARA_UV" ]; then
     fi
     verify_sha256 "$TECHSARA_INSTALLER"
     UV_UNMANAGED_INSTALL="$TECHSARA_BIN_DIR" UV_NO_MODIFY_PATH=1 sh "$TECHSARA_INSTALLER"
-fi
+    # This script ends in `exec`, which replaces the process and so never runs an
+    # EXIT trap.  Clean up here or every bootstrap leaks its temp dir forever.
+    cleanup_techsara_installer
+    trap - EXIT HUP INT TERM
 
-# `uv --version` prints "uv <version> (<target triple>)", so compare the
-# version field rather than the whole line.
-TECHSARA_UV_ACTUAL=$("$TECHSARA_UV" --version 2>/dev/null | head -n 1 | awk '{print $2}')
-if [ "$TECHSARA_UV_ACTUAL" != "$TECHSARA_UV_VERSION" ]; then
-    echo "TechSara error: $TECHSARA_UV reports '${TECHSARA_UV_ACTUAL:-unknown}', not the pinned uv $TECHSARA_UV_VERSION." >&2
-    echo "                Remove $TECHSARA_UV and rerun to reinstall the pinned version." >&2
-    exit 2
+    TECHSARA_UV_ACTUAL=$(installed_uv_version)
+    if [ "$TECHSARA_UV_ACTUAL" != "$TECHSARA_UV_VERSION" ]; then
+        echo "TechSara error: $TECHSARA_UV reports '${TECHSARA_UV_ACTUAL:-unknown}' after installing the pinned uv $TECHSARA_UV_VERSION." >&2
+        echo "                Remove $TECHSARA_BIN_DIR and rerun, or install uv $TECHSARA_UV_VERSION manually." >&2
+        exit 2
+    fi
 fi
 
 export TECHSARA_HOME="$TECHSARA_SHARED_ROOT"
