@@ -16,6 +16,7 @@ from techsara_cli.hardware import (
     HARDWARE_SCHEMA_VERSION,
     HardwareInfo,
     _detect_dgx_spark,
+    _docker_permission_denied,
     _normalize_arch,
     _parse_nvidia_csv,
     choose_cache_path,
@@ -84,6 +85,19 @@ class HardwareValueTests(unittest.TestCase):
                 total_memory=128 * GIB,
                 cpu_name="Fixture CPU",
                 system_metadata="Generic workstation",
+            )
+        )
+
+    def test_dgx_detection_accepts_the_dmi_spelling_of_the_product_name(self) -> None:
+        # Real DGX Spark DMI reports "NVIDIA_DGX_Spark"; an `\s*` separator
+        # silently dropped the strongest signal on the very host it identifies.
+        self.assertTrue(
+            _detect_dgx_spark(
+                arch="arm64",
+                gpu_name="NVIDIA_DGX_Spark",
+                total_memory=128 * GIB,
+                cpu_name="",
+                system_metadata="NVIDIA_DGX_Spark",
             )
         )
 
@@ -242,6 +256,7 @@ class LinuxDetectionTests(unittest.TestCase):
         *,
         nvidia_row: str = "",
         docker_running: bool = True,
+        docker_denied: bool = False,
         linux_containers: bool = True,
         gpu_smoke: bool = True,
         files: ReadTextStub | None = None,
@@ -259,6 +274,7 @@ class LinuxDetectionTests(unittest.TestCase):
         command = CommandStub(
             docker_handler(
                 running=docker_running,
+                denied=docker_denied,
                 linux_containers=linux_containers,
                 gpu_smoke=gpu_smoke,
                 cached_images=cached_images,
@@ -371,6 +387,41 @@ class LinuxDetectionTests(unittest.TestCase):
         self.assertFalse(info.docker_running)
         self.assertTrue(info.docker_compose_available)
         self.assertTrue(command.called("docker", "version", "--format", "{{json .}}"))
+
+    def test_stopped_daemon_is_not_reported_as_a_permission_problem(self) -> None:
+        info, _ = self._detect_linux(docker_running=False, nvidia_row="")
+        self.assertFalse(info.docker_running)
+        self.assertFalse(info.docker_permission_denied)
+
+    def test_unreadable_socket_is_distinct_from_a_stopped_daemon(self) -> None:
+        info, command = self._detect_linux(docker_denied=True, nvidia_row="")
+        self.assertTrue(info.docker_installed)
+        self.assertFalse(info.docker_running)
+        self.assertTrue(info.docker_permission_denied)
+        self.assertTrue(command.called("docker", "version", "--format", "{{json .}}"))
+
+    def test_permission_classifier_reads_the_endpoint_error_not_the_exit_code(self) -> None:
+        # Docker words this differently per platform and release; every wording
+        # must land on "grant access", never on "start the daemon".
+        for text in (
+            "permission denied while trying to connect to the docker API at"
+            " unix:///var/run/docker.sock",
+            "Got permission denied while trying to connect to the Docker daemon socket",
+            "dial unix /var/run/docker.sock: connect: permission denied",
+            "open //./pipe/docker_engine: Access is denied.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(_docker_permission_denied(text))
+        for text in (
+            "",
+            "   ",
+            "Cannot connect to the Docker daemon at unix:///var/run/docker.sock."
+            " Is the docker daemon running?",
+            "dial unix /var/run/docker.sock: connect: no such file or directory",
+            "error during connect: connection refused",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(_docker_permission_denied(text))
 
     def test_docker_unavailable_makes_no_docker_subprocess_calls(self) -> None:
         command = CommandStub(

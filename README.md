@@ -21,6 +21,9 @@ For the full runtime design, see
 
 - Docker Engine or Docker Desktop, running Linux containers.
 - Docker Compose v2.24 or newer.
+- On Linux, an account that may open the Docker socket: membership in the
+  `docker` group (`sudo usermod -aG docker "$USER"`, then `newgrp docker` or a
+  fresh login), or a rootless Docker installation.
 - On macOS/Linux, `curl` or `wget` and `sha256sum` or `shasum` when the pinned
   uv bootstrap is not already cached.
 - Enough free disk for the selected model set plus download staging space.
@@ -366,6 +369,12 @@ Common cases:
 
 - **Pinned uv/Python missing offline:** run once without `--offline` on a
   networked host, or pre-populate the pinned artifacts under `TECHSARA_HOME`.
+- **"not allowed to use its socket":** the daemon is running and answering, but
+  this account may not open it. `./techsara doctor` prints the exact fix for the
+  host, which on Linux is usually `sudo usermod -aG docker "$USER"` followed by
+  `newgrp docker`. `newgrp` is required because group changes do not apply to a
+  login session that started before them, so `usermod` alone leaves the very
+  next `./techsara up` failing in the same shell.
 - **Docker check fails:** start the daemon, enable Linux containers, and update
   Compose to v2.24+. Windows CUDA also needs WSL2; NVIDIA hosts need a passing
   Docker GPU smoke test, not only a working host driver. The probe prefers an

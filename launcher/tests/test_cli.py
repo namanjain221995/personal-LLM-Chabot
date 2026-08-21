@@ -293,6 +293,40 @@ class CliSelectionHelperTests(unittest.TestCase):
                     cli._require_docker(replace(base, **{field: False}))
         cli._require_docker(base)
 
+    def test_unreadable_docker_socket_is_not_reported_as_a_stopped_daemon(self) -> None:
+        # The daemon answering with EACCES and the daemon being down are opposite
+        # problems; sending the user to "start Docker" wastes the whole session.
+        hardware = replace(cpu(), docker_running=False, docker_permission_denied=True)
+        with patch.object(cli, "_docker_group_members", return_value=(False, [])), patch.dict(
+            cli.os.environ, {"USER": "fixture"}, clear=True
+        ):
+            with self.assertRaises(PrerequisiteError) as caught:
+                cli._require_docker(hardware)
+        message = str(caught.exception)
+        self.assertNotIn("daemon is not running", message)
+        self.assertIn("not allowed to use its socket", message)
+        self.assertIn("sudo usermod -aG docker fixture", message)
+        self.assertIn("newgrp docker", message)
+
+    def test_docker_permission_remedy_matches_the_actual_group_state(self) -> None:
+        # (group applied to this process, members of the group, expected hint)
+        cases = [
+            (False, [], "sudo usermod -aG docker fixture"),
+            (False, ["fixture"], "newgrp docker"),
+            (True, ["fixture"], "endpoint is at fault"),
+        ]
+        for active, members, expected in cases:
+            with self.subTest(active=active, members=members):
+                with patch.object(
+                    cli, "_docker_group_members", return_value=(active, members)
+                ), patch.dict(cli.os.environ, {"USER": "fixture"}, clear=True):
+                    self.assertIn(expected, cli._docker_permission_remedy())
+        # A host with no `docker` group at all must not invent one.
+        with patch.object(cli, "_docker_group_members", return_value=None), patch.dict(
+            cli.os.environ, {"USER": "fixture"}, clear=True
+        ):
+            self.assertIn("No 'docker' group exists", cli._docker_permission_remedy())
+
     def test_compose_files_are_deterministic_and_windows_nvidia_gets_wsl_overlay(self) -> None:
         root = Path("/fixture")
         linux_profile = selected(nvidia(24))
@@ -333,6 +367,25 @@ class CliSelectionHelperTests(unittest.TestCase):
         ) as manager:
             cli._model_manager(layout, hardware, {}, {"HF_TOKEN": "dotenv-token"})
         self.assertEqual(manager.call_args.kwargs["environ"]["HF_TOKEN"], "exported-token")
+
+    def test_only_the_dgx_overlay_gets_a_standalone_reranker_service(self) -> None:
+        """compose.nvidia.yaml declares no vllm-reranker, so only DGX asks for one."""
+        dgx = selected(nvidia(128, dgx=True))
+        self.assertTrue(cli._has_reranker_service(dgx))
+        self.assertIn("reranker", cli._compose_profiles(dgx, {}, skip_ocr=False))
+        self.assertIn(
+            "vllm-reranker",
+            cli._desired_optional_services(dgx, [], salesforce_ready=False),
+        )
+
+        generic = selected(nvidia(80))
+        self.assertTrue(generic.reranker_model)
+        self.assertFalse(cli._has_reranker_service(generic))
+        self.assertNotIn("reranker", cli._compose_profiles(generic, {}, skip_ocr=False))
+        self.assertNotIn(
+            "vllm-reranker",
+            cli._desired_optional_services(generic, [], salesforce_ready=False),
+        )
 
     def test_compose_profiles_follow_features_skip_ocr_and_user_opt_ins(self) -> None:
         profile = selected(nvidia(80))
@@ -1587,6 +1640,38 @@ class StatusAndDoctorTests(unittest.TestCase):
         create.assert_not_called()
         self.assertIn("FAIL  Docker daemon", stdout.getvalue())
         self.assertIn("FAIL  Free disk", stdout.getvalue())
+
+    def test_doctor_does_not_cascade_a_denied_socket_into_invented_problems(self) -> None:
+        # Every container probe runs *through* the socket, so a denied socket
+        # makes them all look failed.  A Linux host with no Docker Desktop was
+        # being told to switch Docker Desktop to Linux containers.
+        hardware = replace(
+            nvidia(24),
+            docker_running=False,
+            docker_permission_denied=True,
+            docker_linux_containers=False,
+            docker_gpu_available=False,
+        )
+        stdout = io.StringIO()
+        with (
+            patch.object(cli.RuntimeLayout, "for_project", return_value=self.layout),
+            patch.object(cli, "detect_hardware", return_value=hardware),
+            patch.object(cli, "_load_profile", return_value=None),
+            patch.object(cli, "_reachable_host", return_value=True),
+            patch.object(cli, "_docker_group_members", return_value=(False, [])),
+            patch.dict(cli.os.environ, {"USER": "fixture"}, clear=True),
+            redirect_stdout(stdout),
+        ):
+            self.assertEqual(cli._cmd_doctor(argparse.Namespace(), root=self.root), 1)
+        output = stdout.getvalue()
+        self.assertIn("FAIL  Docker socket access", output)
+        # Match whole report lines; the skip note legitimately names both checks.
+        self.assertNotIn("  Docker daemon\n", output)
+        self.assertNotIn("  Linux containers\n", output)
+        self.assertNotIn("  Container GPU\n", output)
+        self.assertIn("were skipped", output)
+        # The one-line rendering must not run two commands together.
+        self.assertIn("sudo usermod -aG docker fixture; then: newgrp docker.", output)
 
     def test_doctor_validates_existing_compose_without_starting_it(self) -> None:
         profile = selected(cpu())

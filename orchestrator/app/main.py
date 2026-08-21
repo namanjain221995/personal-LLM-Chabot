@@ -33,6 +33,7 @@ from .core.report_paths import ReportPathError, list_reports, resolve_report_fil
 from .graph import get_graph
 from .health import check_dependencies
 from .history import router as history_router
+from .memory_api import router as memory_router
 from .uploads import router as uploads_router
 from .memory import memory
 from .sse import sse_event
@@ -83,6 +84,7 @@ app.add_middleware(
 app.include_router(auth_router)
 app.include_router(history_router)
 app.include_router(uploads_router)
+app.include_router(memory_router)
 
 
 class LiveGeneration:
@@ -436,6 +438,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
     # calls. Cross-chat memory: for a signed-in user, look through their OTHER
     # conversations for relevant context and prepend it as a system note.
     from .auth import current_user
+    from . import facts, memory_semantic
     from .memory_recall import recall_block
 
     signed_in = await db.run_in_thread(current_user, http_request)
@@ -474,6 +477,12 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
     context_state: dict = {}
     # What the auto-orchestration decided, surfaced on the final meta.
     orchestration_state: dict = {}
+    # Facts the background extractor saved from THIS message; surfaced on the
+    # final meta as `memory_updated` (the ChatGPT-style chip). Extraction runs
+    # concurrently with generation, so by meta time it has almost always
+    # finished; when it hasn't, the facts still persist — only the chip is
+    # skipped for this turn.
+    memory_state: dict = {}
     # Salesforce Intelligence Mode extras (assumptions, resolved scope, the
     # final phase) merged into whichever engine's meta ends up being emitted.
     salesforce_state: dict = {}
@@ -494,6 +503,8 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 data["context"] = dict(context_state)
             if orchestration_state:
                 data["auto"] = dict(orchestration_state)
+            if memory_state.get("facts"):
+                data["memory_updated"] = list(memory_state["facts"])
             # Merged rather than overwritten: the engine that answered owns
             # `route`, `data` and `chart`, and the Salesforce planner only ever
             # ADDS provenance and assumptions on top of them.
@@ -595,12 +606,59 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     )
 
             if signed_in is not None and request.text:
-                block = await db.run_in_thread(
-                    recall_block,
-                    int(signed_in["id"]),
-                    request.text,
-                    request.conversation_id,
-                )
+                user_id = int(signed_in["id"])
+                if request.mode == "assistant":
+                    # V10 cross-chat memory — normal chat only, by request:
+                    # Salesforce mode answers from CRM data, not chat memory.
+                    # 1. Kick fact extraction off CONCURRENTLY with the
+                    #    answer (it reads only the user's message); the strong
+                    #    ref keeps it alive past this request if need be.
+                    if settings.fact_extraction_enabled:
+                        fact_task = asyncio.create_task(
+                            facts.remember_from_message(
+                                user_id, request.text, request.conversation_id
+                            )
+                        )
+                        _background_tasks.add(fact_task)
+
+                        def _facts_done(task) -> None:
+                            _background_tasks.discard(task)
+                            try:
+                                saved = task.result()
+                            except BaseException:
+                                # CancelledError is a BaseException; a bare
+                                # Exception clause would let it escape the
+                                # event loop's callback handler.
+                                return
+                            if saved:
+                                memory_state["facts"] = [
+                                    f["fact"] for f in saved
+                                ]
+
+                        fact_task.add_done_callback(_facts_done)
+                    # 2. Saved facts, injected verbatim (their memory).
+                    saved_facts = await db.run_in_thread(
+                        db.list_user_facts, user_id, settings.memory_max_facts
+                    )
+                    facts_text = facts.facts_block(saved_facts)
+                    if facts_text:
+                        history = [
+                            {"role": "system", "content": facts_text},
+                            *history,
+                        ]
+                    # 3. Semantic + keyword recall over other conversations,
+                    #    merged into one block.
+                    block = await memory_semantic.cross_chat_block(
+                        user_id, request.text, request.conversation_id
+                    )
+                else:
+                    # Salesforce mode keeps the original keyword-only recall.
+                    block = await db.run_in_thread(
+                        recall_block,
+                        user_id,
+                        request.text,
+                        request.conversation_id,
+                    )
                 if block:
                     history = [{"role": "system", "content": block}, *history]
 
@@ -936,11 +994,19 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 answer = await run_url_engine(
                     text, url_list, conv_key, history, emit
                 )
-            elif want_agent:
+            elif want_agent and (request.agent or not dataset_ready):
                 # V2 §3b: agent (deep-task) engine. Checked BEFORE plain search
                 # because the agent can search inside its own plan ("web"
                 # steps): a request that needs both planning and the web gets
                 # both, instead of losing the plan to a one-shot search.
+                #
+                # A conversation with uploaded datasets keeps its turns unless
+                # the user forced the agent: the auto classifier judges only
+                # the phrasing ("read this file and give me insights" sounds
+                # like a task), never sees that a dataset exists, and the
+                # agent cannot read datasets — so letting its wish outrank
+                # dataset_ready answered dataset questions with "no file came
+                # through" (found 2026-08-21).
                 #
                 # The Salesforce toggle gates Salesforce access — off → the
                 # agent works only from the conversation context (shared
@@ -963,8 +1029,10 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     # trust line saying searches go to the internet.
                     web_forced=(request.web_search == "on"),
                 )
-            elif want_search:
+            elif want_search and (request.web_search == "on" or not dataset_ready):
                 # Phase 1: web search — cited answer from fetched sources.
+                # Auto-decided search yields to uploaded datasets for the same
+                # reason as the agent above; an explicit "on" still wins.
                 from .engines.search import run_search_engine
 
                 answer = await run_search_engine(text, history, emit, request.effort)

@@ -325,6 +325,15 @@ export function MessageRow({
             </p>
           )}
 
+          {(message.meta?.memory_updated?.length ?? 0) > 0 && (
+            <p
+              className="mt-2 inline-flex items-center gap-1.5 rounded-md border border-border bg-surface px-2 py-1 text-xs text-muted"
+              title={message.meta!.memory_updated!.join('\n')}
+            >
+              Memory updated
+            </p>
+          )}
+
           {message.status === 'stopped' && (
             <p className="mt-2 inline-flex items-center gap-1.5 rounded-md border border-border bg-surface px-2 py-0.5 text-xs text-muted">
               Stopped

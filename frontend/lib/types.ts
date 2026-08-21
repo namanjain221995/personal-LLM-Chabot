@@ -121,6 +121,15 @@ export interface DocumentActivity {
   pages: { page: number; text: string }[];
 }
 
+/** A file attached to a user turn, as persisted in server history. */
+export interface MessageAttachment {
+  /** Server-side upload id (uploads.id) — absent on PDFs and on turns
+      persisted before the upload response arrived. */
+  id?: string;
+  name: string;
+  kind: 'dataset' | 'pdf';
+}
+
 export interface Meta {
   route: Engine;
   sql?: string;
@@ -150,6 +159,14 @@ export interface Meta {
   reasoning_seconds?: number;
   /** V5: long text/code the user pasted as chips on a user message. */
   pasted?: PastedText[];
+  /**
+   * 2026-08-21: file attachments on a user message, riding on meta for the
+   * same reason `pasted` does — so they round-trip through server history and
+   * ANY browser can render the file card. `id` is the server's upload_id
+   * (datasets; filled in after the upload succeeds); the file itself is
+   * already durable server-side, keyed by conversation.
+   */
+  attachments?: MessageAttachment[];
   /** 2026-08-07: what the document engine read — shown in the Activity
       panel (filename, page count, OCR'd pages, per-page text excerpts). */
   document?: DocumentActivity;
@@ -157,6 +174,9 @@ export interface Meta {
   sources?: WebSource[];
   /** Phase 1: set when search was requested but unavailable. */
   search_unavailable?: boolean;
+  /** V10: facts the background extractor saved from this turn's user
+      message — renders the ChatGPT-style "Memory updated" chip. */
+  memory_updated?: string[];
   /** Phase 3: cited code excerpts (path:Lstart-Lend + snippet). */
   code_sources?: CodeSource[];
   /**

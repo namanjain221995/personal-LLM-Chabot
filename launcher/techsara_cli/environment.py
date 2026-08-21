@@ -48,6 +48,9 @@ class RuntimeLayout:
             path.mkdir(parents=True, exist_ok=True)
 
 
+
+DGX_COMPOSE_OVERLAY = "compose/compose.dgx-spark.yaml"
+
 def _configured(value: str | None) -> bool:
     normalized = (value or "").strip().lower()
     return bool(normalized and not normalized.startswith(("change-me", "please-change", "replace-me")))
@@ -306,7 +309,14 @@ def build_generated_environment(
     elif family == "nvidia":
         main_url = "http://vllm:30000/v1"
         embed_url = "http://vllm-embed:30003/v1"
-        rerank_url = ""
+        # Only the DGX overlay declares a standalone vllm-reranker service;
+        # the other NVIDIA overlays still score in-process.  No /v1 suffix:
+        # reranker_score_url() appends the root /score path.
+        rerank_url = (
+            "http://vllm-reranker:30005"
+            if DGX_COMPOSE_OVERLAY in profile.compose_files
+            else ""
+        )
         ocr_url = "http://vllm-ocr:30004/v1"
     elif family == "cpu":
         main_url = "http://llama-cpp:30000/v1"
@@ -357,7 +367,7 @@ def build_generated_environment(
         "OCR_BASE_URL": ocr_url,
         "OCR_MODEL": ocr.api_model_id if ocr else "disabled",
         "OCR_ENABLED": _bool(bool(ocr and profile.features.get("ocr"))),
-        "RERANK_BACKEND": "remote" if native and reranker else ("inprocess" if family == "nvidia" and reranker else "disabled"),
+        "RERANK_BACKEND": ("remote" if rerank_url else "inprocess") if reranker else "disabled",
         "RERANK_ENABLED": _bool(bool(reranker)),
         "RERANK_BASE_URL": rerank_url,
         "RERANK_MODEL": reranker.api_model_id if reranker else "disabled",

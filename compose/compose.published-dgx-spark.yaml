@@ -39,3 +39,10 @@ services:
       - application
     ports:
       - "${TECHSARA_BIND_ADDRESS:-127.0.0.1}:${VLLM_OCR_PORT:-8004}:30004"
+
+  vllm-reranker:
+    networks:
+      - inference
+      - application
+    ports:
+      - "${TECHSARA_BIND_ADDRESS:-127.0.0.1}:${VLLM_RERANKER_PORT:-8005}:30005"

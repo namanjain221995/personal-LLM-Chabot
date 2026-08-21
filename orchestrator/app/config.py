@@ -113,9 +113,19 @@ class Settings:
         self.rerank_enabled: bool = self.rerank_backend is not RerankerBackend.DISABLED
         # §6: docker-compose sets RERANKER_MODEL=Qwen/Qwen3-Reranker-0.6B.
         # RERANK_MODEL is kept as a secondary fallback for local overrides.
+        # The remote scorer addresses the model by the name the server
+        # advertises, while the in-process loader needs the on-disk path.
+        # RERANKER_MODEL carries the path and RERANK_MODEL the API name, so
+        # the preference order flips with the backend; sending a path to a
+        # remote /score endpoint gets an HTTP 404 for an unknown model.
+        _rerank_model_order = (
+            ("RERANK_MODEL", "RERANKER_MODEL")
+            if self.rerank_backend is RerankerBackend.REMOTE
+            else ("RERANKER_MODEL", "RERANK_MODEL")
+        )
         self.rerank_model: str = (
-            os.environ.get("RERANKER_MODEL")
-            or os.environ.get("RERANK_MODEL")
+            os.environ.get(_rerank_model_order[0])
+            or os.environ.get(_rerank_model_order[1])
             or "Qwen/Qwen3-Reranker-0.6B"
         )
         self.rerank_base_url: str = os.environ.get("RERANK_BASE_URL", "").rstrip("/")
@@ -291,6 +301,18 @@ class Settings:
         # --- Phase B: semantic recall over compacted turns.
         self.semantic_recall_enabled: bool = _bool("SEMANTIC_RECALL_ENABLED", True)
         self.retrieve_top_k: int = _int("RETRIEVE_TOP_K", 6)
+        # V10 cross-chat memory: semantic recall over the user's other
+        # conversations, plus the explicit fact store (ChatGPT-style Memory).
+        # Both assistant-mode only; both fail soft.
+        self.cross_chat_semantic_enabled: bool = _bool(
+            "CROSS_CHAT_SEMANTIC_ENABLED", True
+        )
+        # Cosine floor below which a candidate is noise, not a memory.
+        self.semantic_recall_min_score: float = _float(
+            "SEMANTIC_RECALL_MIN_SCORE", 0.30
+        )
+        self.fact_extraction_enabled: bool = _bool("FACT_EXTRACTION_ENABLED", True)
+        self.memory_max_facts: int = _int("MEMORY_MAX_FACTS", 200)
 
         # --- Phase C: context meter.
         self.context_meter_enabled: bool = _bool("CONTEXT_METER_ENABLED", True)

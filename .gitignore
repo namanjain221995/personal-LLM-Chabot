@@ -93,3 +93,15 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# ---------------------------------------------------------------------------
+# Raw ChatGPT export
+#
+# chatgptdata/ is every conversation ever had, plus ~3.6k file attachments, and
+# it is dense with third-party PII: 68 % of conversations contain someone's
+# email address (548 distinct), 67 % a phone number. It must never reach a
+# remote. Kept on disk deliberately — it can be re-parsed if ever needed.
+#
+# See docs/finetune-postmortem/ for why a fine-tune on this corpus was aborted.
+# ---------------------------------------------------------------------------
+chatgptdata/
