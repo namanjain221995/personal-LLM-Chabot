@@ -93,3 +93,6 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+.chatgptdata
+*.chatgptdata
+chatgptdata/
