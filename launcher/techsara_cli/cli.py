@@ -18,6 +18,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from .compose import ComposeManager, docker_project_has_running_models
 from .environment import (
+    DGX_COMPOSE_OVERLAY,
     RuntimeLayout,
     build_generated_environment,
     effective_user_environment,
@@ -106,6 +107,19 @@ def _compose_files(
     return files
 
 
+def _has_reranker_service(profile: SelectedProfile) -> bool:
+    """Only the DGX overlay declares a standalone ``vllm-reranker`` service.
+
+    Every other NVIDIA profile shares ``compose.nvidia.yaml``, which has no
+    such service, and keeps scoring in-process.
+    """
+    return bool(
+        profile.reranker_model
+        and profile.features.get("reranker")
+        and DGX_COMPOSE_OVERLAY in profile.compose_files
+    )
+
+
 def _compose_profiles(profile: SelectedProfile, user_env: Mapping[str, str], *, skip_ocr: bool) -> list[str]:
     requested = {
         item.strip().lower()
@@ -115,6 +129,8 @@ def _compose_profiles(profile: SelectedProfile, user_env: Mapping[str, str], *, 
     profiles: list[str] = []
     if profile.embedding_model and profile.features.get("embeddings"):
         profiles.append("embeddings")
+    if _has_reranker_service(profile):
+        profiles.append("reranker")
     if profile.ocr_model and profile.features.get("ocr") and not skip_ocr:
         profiles.append("ocr")
     search_provider = (user_env.get("SEARCH_PROVIDER") or "searxng").strip().lower()
@@ -138,6 +154,8 @@ def _desired_optional_services(
             desired.add("vllm-router")
         if profile.embedding_model and profile.features.get("embeddings"):
             desired.add("vllm-embed")
+        if _has_reranker_service(profile):
+            desired.add("vllm-reranker")
         if profile.ocr_model and profile.features.get("ocr"):
             desired.add("vllm-ocr")
     elif profile.family == "cpu":
@@ -223,9 +241,118 @@ def _print_selection(hardware: HardwareInfo, profile: SelectedProfile, installs:
         print(f"  Degraded: {reason}")
 
 
+def _docker_group_members(group: str = "docker") -> tuple[bool, list[str]] | None:
+    """Return whether the ``docker`` group exists and who belongs to it.
+
+    ``None`` means the question is unanswerable on this host (Windows, or a
+    system without a ``docker`` group), so the caller must not claim anything
+    about group membership.
+    """
+    try:
+        import grp  # Unix only; absent on Windows.
+        import pwd
+    except ImportError:
+        return None
+    try:
+        entry = grp.getgrnam(group)
+    except KeyError:
+        return None
+    members = list(entry.gr_mem)
+    try:
+        login = pwd.getpwuid(os.getuid())
+        # A user whose *primary* group is `docker` never appears in gr_mem.
+        if login.pw_gid == entry.gr_gid and login.pw_name not in members:
+            members.append(login.pw_name)
+    except KeyError:
+        pass
+    return entry.gr_gid in os.getgroups(), members
+
+
+def _docker_permission_diagnosis() -> tuple[str, list[str], str]:
+    """Explain, for this exact host, how to make the Docker socket readable.
+
+    Returned as (explanation, commands, closing) so the same diagnosis can be
+    rendered as an indented block for an error and as one line for ``doctor``
+    without either rendering mangling the commands.
+    """
+    if os.name == "nt":
+        return (
+            "Docker refused this account access to its API.",
+            [],
+            "Add your Windows account to the 'docker-users' local group, then sign out and back in.",
+        )
+    user = os.environ.get("USER") or os.environ.get("LOGNAME") or "$USER"
+    membership = _docker_group_members()
+    header = "Docker is running, but this account is not allowed to use its socket."
+    if membership is None:
+        return (
+            f"{header} No 'docker' group exists on this host. Either run Docker"
+            " rootless (see https://docs.docker.com/engine/security/rootless/),"
+            " or create the group and grant access:",
+            [f"sudo groupadd docker && sudo usermod -aG docker {user}"],
+            "Then open a new login session and rerun ./techsara up",
+        )
+    active, members = membership
+    if active:
+        # The group is already applied to this process, so the socket itself is
+        # the problem -- a custom DOCKER_HOST, a non-default context, or socket
+        # permissions that were changed by hand.
+        host = os.environ.get("DOCKER_HOST", "")
+        endpoint = f" DOCKER_HOST is set to {host!r}." if host else ""
+        return (
+            f"{header} This account is already in the 'docker' group, so the"
+            f" endpoint is at fault.{endpoint}",
+            ["docker context ls"],
+            "Check that context and the socket's owner/mode, then rerun ./techsara up",
+        )
+    if user in members:
+        # The classic trap: usermod succeeded but this shell predates it.
+        return (
+            f"{header} '{user}' is in the 'docker' group, but this login session"
+            " started before that change, so the kernel has not applied it yet."
+            " Refresh the session:",
+            ["newgrp docker"],
+            "(or log out and back in), then rerun ./techsara up",
+        )
+    return (
+        f"{header} Add '{user}' to the 'docker' group and refresh this session:",
+        [f"sudo usermod -aG docker {user}", "newgrp docker"],
+        "(`newgrp` applies the group to the current shell; a fresh login works"
+        " too.) Then rerun ./techsara up",
+    )
+
+
+def _docker_permission_remedy(*, indent: str = " " * 16) -> str:
+    """Render the diagnosis as an indented multi-line block for an error."""
+    explanation, commands, closing = _docker_permission_diagnosis()
+    # The first line is not indented: it is printed straight after the
+    # "TechSara error: " prefix.  Every following line carries its own indent so
+    # the block lines up underneath that prefix.
+    lines = [explanation]
+    lines.extend(f"{indent}    {command}" for command in commands)
+    if closing:
+        lines.append(f"{indent}{closing}")
+    return "\n".join(lines)
+
+
+def _docker_permission_summary() -> str:
+    """Render the same diagnosis as a single line for the doctor report."""
+    explanation, commands, closing = _docker_permission_diagnosis()
+    parts = [explanation]
+    if commands:
+        # The explanation already ends in a colon, so the commands read as its
+        # continuation; "then" keeps two commands from looking like one.
+        parts.append("; then: ".join(commands) + ".")
+    if closing:
+        parts.append(closing)
+    return re.sub(r"\s+", " ", " ".join(parts)).strip()
+
+
 def _require_docker(hardware: HardwareInfo) -> None:
     if not hardware.docker_installed:
         raise PrerequisiteError("Docker is not installed. Install Docker Engine/Desktop, start it, then rerun ./techsara up")
+    if hardware.docker_permission_denied:
+        raise PrerequisiteError(_docker_permission_remedy())
     if not hardware.docker_running:
         raise PrerequisiteError("Docker is installed but its daemon is not running. Start Docker, then rerun ./techsara up")
     if not hardware.docker_compose_available:
@@ -709,6 +836,18 @@ def _start_compose(
                 )
                 compose.stop_service("vllm-embed")
                 disable_role("embeddings")
+        if _has_reranker_service(profile):
+            try:
+                _step("Starting the reranker model (vllm-reranker)...")
+                compose.up_service("vllm-reranker")
+                compose.wait_service("vllm-reranker", timeout=1800.0, reporter=_step)
+            except TechSaraError:
+                # The scorer is optional: fall back to the in-process reranker
+                # rather than losing reranking altogether.
+                compose.stop_service("vllm-reranker")
+                generated["RERANK_BACKEND"] = "inprocess"
+                generated["RERANK_BASE_URL"] = ""
+                publish_generated()
         if not profile.router_shared and profile.router_model:
             try:
                 _step("Starting the router model (vllm-router)...")
@@ -1246,6 +1385,9 @@ _BLOCKING_CHECKS = frozenset(
     {
         "Docker CLI",
         "Docker daemon",
+        # `up` cannot reach Docker without socket access either, so this stands
+        # in for the daemon check whenever the daemon answered but refused us.
+        "Docker socket access",
         "Linux containers",
         "Docker Compose",
         "Compose env-file support",
@@ -1282,8 +1424,25 @@ def _cmd_doctor(args: argparse.Namespace, *, root: Path) -> int:
     notes: list[str] = []
 
     checks.append(("Docker CLI", hardware.docker_installed, "Install Docker Engine or Docker Desktop, then rerun."))
-    checks.append(("Docker daemon", hardware.docker_running, "Start Docker Desktop/Engine, then rerun."))
-    checks.append(("Linux containers", hardware.docker_linux_containers, "Switch Docker Desktop to Linux containers."))
+    if hardware.docker_permission_denied:
+        # The daemon answered; it just refused this account.  Reporting that as
+        # "start Docker" sends the user to fix something that is not broken.
+        checks.append(("Docker socket access", False, _docker_permission_summary()))
+    else:
+        checks.append(("Docker daemon", hardware.docker_running, "Start Docker Desktop/Engine, then rerun."))
+    # Everything below this point is probed *through* the daemon.  While the
+    # socket is unreachable those probes cannot distinguish "wrong setting" from
+    # "never ran", so reporting them as failures invents problems the user does
+    # not have -- a Linux host with no Docker Desktop was being told to switch
+    # Docker Desktop to Linux containers.
+    docker_reachable = hardware.docker_running and not hardware.docker_permission_denied
+    if docker_reachable:
+        checks.append(("Linux containers", hardware.docker_linux_containers, "Switch Docker Desktop to Linux containers."))
+    else:
+        notes.append(
+            "Container checks (Linux containers, GPU access) were skipped: they need a"
+            " reachable Docker daemon. Fix the Docker check above, then rerun ./techsara doctor."
+        )
     checks.append(("Docker Compose", hardware.docker_compose_available, "Install Docker Compose v2.24 or newer."))
     if hardware.docker_compose_version:
         compose_recent = tuple(int(part) for part in hardware.docker_compose_version.split(".")[:2]) >= (2, 24)
@@ -1312,7 +1471,7 @@ def _cmd_doctor(args: argparse.Namespace, *, root: Path) -> int:
     ))
 
     # --- accelerator runtime ------------------------------------------------
-    if hardware.gpu_vendor == "nvidia":
+    if hardware.gpu_vendor == "nvidia" and docker_reachable:
         checks.append((
             "Container GPU",
             hardware.docker_gpu_available,

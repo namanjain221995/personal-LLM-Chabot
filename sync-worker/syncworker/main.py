@@ -23,7 +23,7 @@ from .jsonlog import setup_logging
 from .objects import is_credential_field
 from .rag_index import OpenAIEmbedder, RagIndexer
 from .secrets import fetch_sf_credentials
-from .sf_auth import TokenManager
+from .sf_auth import SalesforceAuthError, TokenManager
 from .sf_client import (SalesforceClient, build_deleted_soql, build_full_soql,
                         build_incremental_soql)
 from .storage import Store, normalize_records, sf_datetime_literal, write_parquet_batch
@@ -282,6 +282,11 @@ def sync_object(
     supports_deletes = True
     try:
         visible = client.describe_fields(obj.name)
+    except SalesforceAuthError:
+        # A refused credential is not a describe problem, and pretending it is
+        # ("using configured fields as-is") hides the real fault behind a
+        # warning while the sync marches on to fail again on the next object.
+        raise
     except Exception:
         log.warning(
             "describe failed; using configured fields as-is",
@@ -437,6 +442,12 @@ def discover_new_objects(
         return []
     try:
         available = client.list_objects()
+    except SalesforceAuthError:
+        # Discovery is best-effort, but a refused credential is not something
+        # to shrug off with an empty list — it is the first call of the cycle
+        # and re-raising here means one token request per cycle, not one per
+        # object after it.
+        raise
     except Exception:
         return []
     known = {o.name for o in objects}
@@ -487,6 +498,10 @@ def report_new_objects(
     """
     try:
         available = client.list_objects()
+    except SalesforceAuthError:
+        # Same reasoning as discover_new_objects: an empty list here would
+        # report "no new objects" when the truth is that nobody could log in.
+        raise
     except Exception:
         return []
     known = {o.name for o in objects}
@@ -520,11 +535,23 @@ def run_cycle(
         report_new_objects(objects, client)
     total = 0
     failed: list = []
-    for obj in objects:
+    for position, obj in enumerate(objects):
         # One inaccessible/broken object must not block the other seven —
         # log it loudly, keep syncing, and retry it next cycle.
         try:
             total += sync_object(obj, client, store, indexer, settings)
+        except SalesforceAuthError as exc:
+            # Not per-object: the org has refused our credentials, so every
+            # remaining object would fail the same way. Continuing would fire
+            # two doomed token requests per object — hundreds per cycle — which
+            # buys nothing and risks tripping Salesforce's login lockout.
+            log.error(
+                "salesforce authentication failed; abandoning this cycle",
+                extra={"event": "auth_failed", "object": obj.name,
+                       "sf_error": exc.error, "detail": str(exc),
+                       "objects_skipped": len(objects) - position},
+            )
+            raise
         except Exception:
             failed.append(obj.name)
             log.error(

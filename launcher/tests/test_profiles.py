@@ -373,6 +373,34 @@ class NvidiaAndFallbackSelectionTests(unittest.TestCase):
                 self.assertNotEqual(selected.family, "nvidia")
                 self.assertTrue(any("WSL2" in reason for reason in selected.degraded_reasons))
 
+    def test_linux_nvidia_downgrade_to_cpu_always_records_a_reason(self) -> None:
+        # A DGX Spark falling back to a 0.6B CPU model must say why; silence here
+        # looks exactly like "this box has no GPU".
+        cases = [
+            ("toolkit missing", replace(
+                nvidia(120, dgx=True, docker_gpu=False),
+                nvidia_container_toolkit_available=False,
+            ), "install the NVIDIA Container Toolkit"),
+            ("toolkit unregistered", replace(
+                nvidia(120, dgx=True, docker_gpu=False),
+                nvidia_container_toolkit_available=True,
+            ), "nvidia-ctk runtime configure"),
+        ]
+        for label, hardware, expected in cases:
+            with self.subTest(label=label):
+                selected = select_profile(hardware, REPO_ROOT, reuse_running_models=True)
+                self.assertNotEqual(selected.family, "nvidia")
+                reasons = " ".join(selected.degraded_reasons)
+                self.assertIn("NVIDIA acceleration unavailable", reasons)
+                self.assertIn(expected, reasons)
+
+    def test_working_linux_nvidia_host_records_no_acceleration_complaint(self) -> None:
+        selected = select_profile(nvidia(120, dgx=True), REPO_ROOT, reuse_running_models=True)
+        self.assertEqual(selected.family, "nvidia")
+        self.assertNotIn(
+            "NVIDIA acceleration unavailable", " ".join(selected.degraded_reasons)
+        )
+
     def test_windows_without_nvidia_uses_cpu_profile_without_cloud_fallback(self) -> None:
         selected = select_profile(
             cpu(memory_gib=32, operating_system="windows"),

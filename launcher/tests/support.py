@@ -71,6 +71,7 @@ def linux_files(*, total_gib: int = 128, available_gib: int = 96) -> ReadTextStu
 def docker_handler(
     *,
     running: bool = True,
+    denied: bool = False,
     linux_containers: bool = True,
     compose: bool = True,
     model_status: str = "",
@@ -84,6 +85,9 @@ def docker_handler(
     ``cached_images`` is ``None`` for the common case where every candidate
     probe image is already on the host; pass an explicit (possibly empty)
     sequence to model a clean clone that has to pull the pinned tiny probe.
+
+    ``denied`` models a *running* daemon whose socket this account may not open,
+    which Docker reports with the same non-zero exit as a stopped daemon.
     """
     pulled: set[str] = set()
 
@@ -93,6 +97,13 @@ def docker_handler(
             if response is not None:
                 return response
         if args == ("docker", "version", "--format", "{{json .}}"):
+            if denied:
+                return (
+                    1,
+                    '{"Client":{"Version":"29.2.1"},"Server":null}',
+                    "permission denied while trying to connect to the docker API"
+                    " at unix:///var/run/docker.sock",
+                )
             if not running:
                 return 1, "", "daemon unavailable"
             return (
@@ -102,6 +113,8 @@ def docker_handler(
                 "",
             )
         if args == ("docker", "info", "--format", "{{.OSType}}"):
+            if denied:
+                return 1, "", "permission denied while trying to connect to the docker API"
             return (0, "linux" if linux_containers else "windows", "") if running else (1, "", "")
         if args == ("docker", "compose", "version"):
             return (0, "Docker Compose fixture", "") if compose else (1, "", "")

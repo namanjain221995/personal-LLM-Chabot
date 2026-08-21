@@ -218,7 +218,7 @@ def test_agent_is_routed_before_plain_search():
     from app import main
 
     src = inspect.getsource(main)
-    assert src.index("elif want_agent:") < src.index("elif want_search:"), (
+    assert src.index("elif want_agent") < src.index("elif want_search"), (
         "search before agent means a plan-and-search request loses its plan"
     )
 

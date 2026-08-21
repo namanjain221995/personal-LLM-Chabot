@@ -335,6 +335,46 @@ describe('server history store: pull + lazy load (V2 §4b)', () => {
     expect(again?.messages).toHaveLength(2);
   });
 
+  it('rebuilds the file card from meta.attachments on another device', async () => {
+    // 2026-08-21: the card's name rides on meta so it round-trips through
+    // server history — a browser that never held the File object (another
+    // device) must still get pdfName, and the upload_id link must survive.
+    const server = makeServer();
+    server.convs.set('remote-csv', {
+      title: 'Dataset chat',
+      messages: [
+        {
+          role: 'user',
+          content: 'read this file and give me insights',
+          meta: {
+            route: 'chat',
+            attachments: [
+              {
+                id: 'bafe4ec868584f76a436570d0efcee21',
+                name: 'sample_opportunities.csv',
+                kind: 'dataset' as const,
+              },
+            ],
+          },
+        },
+        { role: 'assistant', content: 'It has 5 rows.', meta: null },
+      ],
+    });
+    const store = createServerHistoryStore({
+      storage: makeStorage(),
+      api: server.api,
+    });
+    await store.refresh();
+    const loaded = await store.load('remote-csv');
+    expect(loaded?.messages[0].pdfName).toBe('sample_opportunities.csv');
+    expect(loaded?.messages[0].meta?.attachments?.[0]).toMatchObject({
+      id: 'bafe4ec868584f76a436570d0efcee21',
+      kind: 'dataset',
+    });
+    // Old messages without the key keep behaving as before: no card, no crash.
+    expect(loaded?.messages[1].pdfName).toBeUndefined();
+  });
+
   it('appending after a server load does not duplicate loaded messages', async () => {
     const server = makeServer();
     server.convs.set('remote-2', {
