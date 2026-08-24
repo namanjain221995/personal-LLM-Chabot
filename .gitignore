@@ -28,7 +28,11 @@ secrets/
 # PostgreSQL itself lives in the `pgdata` Docker volume, not in the repo.
 # ---------------------------------------------------------------------------
 data/
-reports/
+# Anchored: unanchored `reports/` matches a directory of that name at ANY
+# depth, which silently hid the frontend's app/api/reports route handler
+# from git. REPORTS_DIR is a root-level path (or a Docker volume), so the
+# leading slash is what this rule always meant.
+/reports/
 uploads/
 workspace/
 *.duckdb

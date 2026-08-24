@@ -526,7 +526,29 @@ class Settings:
 
         # --- Misc ---
         self.session_max_turns: int = _int("SESSION_MAX_TURNS", 20)
-        self.llm_request_timeout: float = _float("LLM_REQUEST_TIMEOUT", 300.0)
+        # Read timeout for model calls. For a NON-streaming completion (agent
+        # planning, synthesis, classification) this covers the WHOLE
+        # generation, not an inter-byte gap, so it must not expire before the
+        # generation the app itself permits: at 300s against a 1800s
+        # GEN_WALL_CLOCK_S, a long planning call died inside the HTTP client
+        # and the SDK silently re-ran it — burning the GPU and never
+        # finishing. Defaulting to the wall clock keeps transport and
+        # application consistent, leaving GEN_WALL_CLOCK_S the single place
+        # that decides what "too long" means.
+        self.llm_request_timeout: float = _float(
+            "LLM_REQUEST_TIMEOUT", self.gen_wall_clock_s
+        )
+        #: vLLM is one hop away on the compose network, so a slow CONNECT means
+        #: a dead service rather than a busy one — this stays short however
+        #: long a generation is allowed to run.
+        self.llm_connect_timeout: float = _float("LLM_CONNECT_TIMEOUT", 10.0)
+        #: Sending the prompt (a large paste can be megabytes) and pool checkout.
+        self.llm_write_timeout: float = _float("LLM_WRITE_TIMEOUT", 60.0)
+        #: Automatic SDK retries are OFF by default: the SDK treats a read
+        #: timeout as retryable, so one slow call silently became three, each
+        #: re-running minutes of local GPU work. Callers that can retry
+        #: meaningfully (the agent planner) already do so on parse failures.
+        self.llm_max_retries: int = _int("LLM_MAX_RETRIES", 0)
         self.schema_cache_ttl: float = _float("SCHEMA_CACHE_TTL", 300.0)
         # §8 /health: per-dependency probe timeout — short so /health answers
         # quickly even when every vLLM service is down.

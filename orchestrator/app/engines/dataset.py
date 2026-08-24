@@ -108,6 +108,18 @@ async def run_dataset_engine(
         await emit("meta", {"route": "dataset"})
         return note
 
+    # H-03: a request for a generated DOCUMENT is answered with a real file
+    # rather than prose about not being able to attach one. This branch is
+    # here, not in the router, because the dataset branch is terminal — see
+    # engines/dataset_report.py. `uploads` is passed through unchanged, so the
+    # report describes exactly the file this conversation is grounded in.
+    from .dataset_report import run_dataset_report, wants_document_report
+
+    if wants_document_report(message):
+        return await run_dataset_report(
+            message, uploads, emit, model_choice=model_choice
+        )
+
     parts: List[str] = []
     async for kind, delta in llm.stream_chat_events(
         build_messages(message, uploads, history),
