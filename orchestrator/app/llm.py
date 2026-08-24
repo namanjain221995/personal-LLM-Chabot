@@ -88,12 +88,24 @@ def normalize_system(messages: Sequence[dict]) -> List[dict]:
 
 
 def _client(base_url: str, api_key: Optional[str] = None):
+    import httpx
     from openai import AsyncOpenAI  # cheap, but keep out of module import path
 
     return AsyncOpenAI(
         base_url=base_url,
         api_key=api_key or LOCAL_API_KEY,
-        timeout=settings.llm_request_timeout,
+        # A bare float collapses all four httpx timeouts onto one number —
+        # including `connect`, which then waits minutes on a dead service, and
+        # `read`, which for a non-streaming completion IS the whole generation.
+        # Splitting them lets a real outage fail fast while a legitimately long
+        # generation runs to the app's own wall clock.
+        timeout=httpx.Timeout(
+            connect=settings.llm_connect_timeout,
+            read=settings.llm_request_timeout,
+            write=settings.llm_write_timeout,
+            pool=settings.llm_write_timeout,
+        ),
+        max_retries=settings.llm_max_retries,
     )
 
 

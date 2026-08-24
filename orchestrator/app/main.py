@@ -36,7 +36,7 @@ from .history import router as history_router
 from .memory_api import router as memory_router
 from .uploads import router as uploads_router
 from .memory import memory
-from .sse import sse_event
+from .sse import HEARTBEAT_SECONDS, sse_comment, sse_event
 
 @contextlib.asynccontextmanager
 async def lifespan(_app: FastAPI):
@@ -131,19 +131,40 @@ class LiveGeneration:
             self.cond.notify_all()
 
     async def follow(self) -> AsyncIterator[str]:
-        """Replay buffered events, then stream live ones until the end."""
+        """Replay buffered events, then stream live ones until the end.
+
+        Planning, retrieval and a long thinking pass all produce NO events for
+        minutes at a time. Waiting on the condition without a bound made the
+        response body go completely silent for that whole stretch, and every
+        idle-timeout in the path treats silence as a dead peer — Node/undici
+        in the Next.js proxy cut the stream at 300s (UND_ERR_BODY_TIMEOUT) and
+        the user was told the orchestrator was unreachable while the model was
+        still working. Bounding the wait lets us emit an SSE comment instead:
+        it carries no event, so the contract is untouched, but it proves the
+        connection is alive. The frame is yielded OUTSIDE the condition's lock
+        — holding it across a yield would block publish() for as long as the
+        consumer takes to drain.
+        """
         self.subscribers += 1
         try:
             index = 0
             while True:
+                frame: Optional[str] = None
                 async with self.cond:
                     while index >= len(self.events) and not self.done:
-                        await self.cond.wait()
-                    if index >= len(self.events):
+                        try:
+                            await asyncio.wait_for(
+                                self.cond.wait(), HEARTBEAT_SECONDS
+                            )
+                        except asyncio.TimeoutError:
+                            break  # idle — fall through and send a keep-alive
+                    if index < len(self.events):
+                        event, data = self.events[index]
+                        index += 1
+                        frame = sse_event(event, data)
+                    elif self.done:
                         break  # done and fully drained
-                    event, data = self.events[index]
-                    index += 1
-                yield sse_event(event, data)
+                yield frame if frame is not None else sse_comment()
         finally:
             self.subscribers -= 1
 

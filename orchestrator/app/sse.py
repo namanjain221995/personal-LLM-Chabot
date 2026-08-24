@@ -28,6 +28,7 @@ Every event ends with a blank line, per the SSE specification.
 from __future__ import annotations
 
 import json
+import os
 from typing import Any, Mapping, Optional
 
 # The v1 contract events (spec §10) — unchanged, byte-identical on the wire.
@@ -83,3 +84,21 @@ def step_event(id: int, title: str, status: str, detail: Optional[str] = None) -
     if detail is not None:
         payload["detail"] = detail
     return sse_event("step", payload)
+
+
+# --- keep-alive ---------------------------------------------------------
+# A generation can legitimately go minutes without producing an event: agent
+# planning, retrieval + reranking, or a long thinking pass on the dense 27B
+# (~10-15 tok/s here) all run silent. An SSE body that emits nothing for that
+# long is indistinguishable from a dead connection to anything in the middle:
+# Node/undici cuts the response at 300s idle (UND_ERR_BODY_TIMEOUT), which is
+# what the Next.js proxy was reporting to users as "the orchestrator is
+# unreachable". A comment frame is the SSE spec's own keep-alive — every
+# compliant parser (including frontend/lib/sse.ts) drops lines starting with
+# ":" — so it resets those idle timers without touching the event contract.
+HEARTBEAT_SECONDS: float = float(os.environ.get("SSE_HEARTBEAT_SECONDS", "15"))
+
+
+def sse_comment(note: str = "keep-alive") -> str:
+    """Format an SSE comment frame. Ignored by clients; keeps the pipe warm."""
+    return f": {note}\n\n"

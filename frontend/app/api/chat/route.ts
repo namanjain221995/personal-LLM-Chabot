@@ -26,6 +26,58 @@ const SSE_HEADERS = {
   'X-Accel-Buffering': 'no',
 } as const;
 
+/** Walk undici's nested `cause` chain for the machine-readable error code. */
+function causeCode(err: unknown): string | undefined {
+  let cur: unknown = err;
+  for (let depth = 0; cur && depth < 5; depth += 1) {
+    const code = (cur as { code?: unknown }).code;
+    if (typeof code === 'string') return code;
+    cur = (cur as { cause?: unknown }).cause;
+  }
+  return undefined;
+}
+
+function isAbort(err: unknown): boolean {
+  return (
+    (err as { name?: unknown } | null)?.name === 'AbortError' ||
+    causeCode(err) === 'ABORT_ERR'
+  );
+}
+
+function isTimeout(err: unknown): boolean {
+  const code = causeCode(err);
+  return (
+    code === 'UND_ERR_HEADERS_TIMEOUT' ||
+    code === 'UND_ERR_BODY_TIMEOUT' ||
+    code === 'UND_ERR_CONNECT_TIMEOUT' ||
+    code === 'ETIMEDOUT'
+  );
+}
+
+/**
+ * The orchestrator's own error sentence, or a safe generic one. Bounded and
+ * trace-screened: a user-facing banner must never become a stack dump.
+ */
+async function upstreamMessage(upstream: Response): Promise<string> {
+  const generic = `The orchestrator responded with status ${upstream.status}.`;
+  try {
+    const body = (await upstream.json()) as {
+      message?: unknown;
+      detail?: unknown;
+    };
+    const said = body.message ?? body.detail;
+    if (typeof said === 'string') {
+      const trimmed = said.trim();
+      if (trimmed && trimmed.length <= 300 && !/traceback|\bat \w+ \(/i.test(trimmed)) {
+        return trimmed;
+      }
+    }
+  } catch {
+    // Not JSON (an intermediary's own error page) — use the generic sentence.
+  }
+  return generic;
+}
+
 function sseFrame(event: string, data: unknown): Uint8Array {
   return new TextEncoder().encode(
     `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`,
@@ -164,7 +216,20 @@ export async function POST(req: Request): Promise<Response> {
       body: JSON.stringify(chatRequest),
       signal: req.signal,
     });
-  } catch {
+  } catch (err) {
+    // The browser navigated away or hit Stop: the fetch it was reading is
+    // already gone, so there is nobody left to read a body.
+    if (isAbort(err)) return new Response(null, { status: 499 });
+    // "Unreachable" must mean unreachable. undici reports the real cause in a
+    // nested chain: a refused/unresolvable host is a down service, while a
+    // timeout means the orchestrator DID answer the socket and then went
+    // quiet — a different problem, and a different thing for the user to do.
+    if (isTimeout(err)) {
+      return Response.json(
+        { message: 'The orchestrator stopped responding before the answer started.' },
+        { status: 504 },
+      );
+    }
     return Response.json(
       { message: 'The orchestrator is unreachable.' },
       { status: 502 },
@@ -172,11 +237,12 @@ export async function POST(req: Request): Promise<Response> {
   }
 
   if (!upstream.ok || !upstream.body) {
+    // Forward the orchestrator's OWN sentence when it sent one: it is the only
+    // party that knows whether the model is loading, out of memory, or over its
+    // context window. "responded with status 502" told the user none of that.
     return Response.json(
-      {
-        message: `The orchestrator responded with status ${upstream.status}.`,
-      },
-      { status: 502 },
+      { message: await upstreamMessage(upstream) },
+      { status: upstream.status === 503 ? 503 : 502 },
     );
   }
 

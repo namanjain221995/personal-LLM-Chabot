@@ -19,6 +19,7 @@
  */
 
 import type { ClarificationResponse } from './clarification';
+import { friendlyError } from './errors';
 import { getHistoryStore, newId } from './history';
 import { foldModelContent } from './pasted';
 import type { ChatPrefs } from './prefs';
@@ -176,6 +177,46 @@ function markUnreachable(s: LiveStream): void {
   s.status = 'unreachable';
   getHistoryStore().saveMessages(s.conversationId, s.messages);
   notify(s.conversationId);
+}
+
+/**
+ * The stream died AFTER the orchestrator accepted the request. That is a very
+ * different story from "unreachable": the generation is DETACHED server-side
+ * (LiveGeneration), so it is still running, and re-sending would start a
+ * SECOND one rather than recover this one. Reopening the conversation re-joins
+ * it through GET /api/chat/attach/{id}. Whatever already streamed stays on the
+ * message — this patches status/errorMessage and leaves `content` alone.
+ */
+function markInterrupted(s: LiveStream): void {
+  updateAssistant(s, {
+    status: 'error',
+    errorMessage:
+      'The connection to this answer was interrupted. The model is still working on it — reopen this chat to re-join.',
+  });
+  s.status = 'error';
+  getHistoryStore().saveMessages(s.conversationId, s.messages);
+  notify(s.conversationId);
+}
+
+/**
+ * A send that never became a stream. The route answers with JSON describing
+ * what actually failed, so report THAT instead of blaming the connection for
+ * everything: only a genuine transport failure earns the "kept and can be
+ * re-sent" banner, while a model that is loading, out of memory, or given too
+ * much context gets its own accurate sentence.
+ */
+async function markSendFailed(s: LiveStream, res: Response): Promise<void> {
+  let upstream = '';
+  try {
+    upstream = ((await res.json()) as { message?: string }).message ?? '';
+  } catch {
+    // Non-JSON body (an intermediary's own error page) — fall through.
+  }
+  if (!upstream || /orchestrator is unreachable/i.test(upstream)) {
+    markUnreachable(s);
+    return;
+  }
+  finalize(s, { status: 'error', errorMessage: friendlyError(upstream).message });
 }
 
 async function consume(s: LiveStream, body: ReadableStream<Uint8Array>) {
@@ -349,6 +390,9 @@ export function markClarificationSubmitted(key: string): void {
 export async function startStream(opts: StartStreamOptions): Promise<void> {
   const { conversationId, turns, prefs } = opts;
   const s = register(conversationId, turns);
+  // Did the orchestrator accept the request? Decides whether a failure below
+  // is "unreachable" (retry) or "interrupted" (re-join) — see markInterrupted.
+  let connected = false;
   try {
     const res = await fetch('/api/chat', {
       method: 'POST',
@@ -382,14 +426,19 @@ export async function startStream(opts: StartStreamOptions): Promise<void> {
       signal: s.controller.signal,
     });
     if (!res.ok || !res.body) {
-      markUnreachable(s);
+      await markSendFailed(s, res);
       return;
     }
+    // Past this point the orchestrator HAS the request and owns the answer, so
+    // a later failure is a dropped pipe, not an unreachable service.
+    connected = true;
     await consume(s, res.body);
   } catch (err) {
     if (err instanceof DOMException && err.name === 'AbortError') {
       settleReasoningClock(s);
       finalize(s, { status: 'stopped' });
+    } else if (connected) {
+      markInterrupted(s);
     } else {
       markUnreachable(s);
     }
