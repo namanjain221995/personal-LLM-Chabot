@@ -10,7 +10,7 @@ This is a Salesforce application that manages:
 3. Access Control & Logging - Track user access to recordings and portal activity
 4. Department Management - Organize recordings by department with permission sets
 
-Technology Stack
+Technology Stack:
 - Salesforce Apex (Backend)
 - Lightning Web Components (LWC) (Frontend UI)
 - AWS S3 (File Storage)
