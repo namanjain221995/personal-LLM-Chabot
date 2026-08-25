@@ -19,10 +19,10 @@
  */
 
 import type { ClarificationResponse } from './clarification';
-import { friendlyError } from './errors';
 import { getHistoryStore, newId } from './history';
 import { foldModelContent } from './pasted';
 import type { ChatPrefs } from './prefs';
+import { toClientError } from './errorTypes';
 import { foldStreamState, mergeStep, readChatStream } from './sse';
 import type { ChatMessage } from './types';
 
@@ -164,15 +164,29 @@ function finalize(s: LiveStream, patch: Partial<ChatMessage>): void {
   notify(s.conversationId);
 }
 
-function markUnreachable(s: LiveStream): void {
-  // Record the failure ON the message and PERSIST it. Previously this dropped
-  // the placeholder and relied on a banner that only renders for the chat
-  // currently on screen — so a send that failed while the user was in another
-  // chat left no trace at all: no answer, no error, nothing in history.
+/**
+ * A fatal request-level failure: the send never became a stream.
+ *
+ * Record it ON the message and PERSIST it. This dropped the placeholder once
+ * and relied on a banner that only renders for the chat currently on screen —
+ * so a send that failed while the user was in another chat left no trace at
+ * all: no answer, no error, nothing in history.
+ *
+ * `errorStatus`/`errorCode` are what the error page renders. `errorMessage`
+ * holds the SAFE public sentence, never the upstream body: it is persisted to
+ * history and exported to Markdown, so anything put here outlives the request.
+ */
+function markUnreachable(
+  s: LiveStream,
+  status: number | null,
+  code?: unknown,
+): void {
+  const err = toClientError(status, code);
   updateAssistant(s, {
     status: 'error',
-    errorMessage:
-      'The orchestrator is unreachable — your message was kept and can be re-sent.',
+    errorMessage: err.message,
+    errorStatus: err.status,
+    errorCode: err.code,
   });
   s.status = 'unreachable';
   getHistoryStore().saveMessages(s.conversationId, s.messages);
@@ -199,24 +213,24 @@ function markInterrupted(s: LiveStream): void {
 }
 
 /**
- * A send that never became a stream. The route answers with JSON describing
- * what actually failed, so report THAT instead of blaming the connection for
- * everything: only a genuine transport failure earns the "kept and can be
- * re-sent" banner, while a model that is loading, out of memory, or given too
- * much context gets its own accurate sentence.
+ * A send that never became a stream.
+ *
+ * Classification is driven by the STATUS, never by the error sentence. The
+ * previous version ran `/orchestrator is unreachable/i` over the body text,
+ * which meant a backend 500, a real 404 and a model timeout were reported
+ * identically — and any non-JSON body (an intermediary's own error page) fell
+ * into the same bucket for want of a string to match. The status is a fact
+ * and it is always present; the prose was neither.
  */
 async function markSendFailed(s: LiveStream, res: Response): Promise<void> {
-  let upstream = '';
+  let code: unknown;
   try {
-    upstream = ((await res.json()) as { message?: string }).message ?? '';
+    code = ((await res.json()) as { code?: unknown }).code;
   } catch {
-    // Non-JSON body (an intermediary's own error page) — fall through.
+    // Non-JSON body (an intermediary's own error page). The status still
+    // says everything the page needs.
   }
-  if (!upstream || /orchestrator is unreachable/i.test(upstream)) {
-    markUnreachable(s);
-    return;
-  }
-  finalize(s, { status: 'error', errorMessage: friendlyError(upstream).message });
+  markUnreachable(s, res.status, code);
 }
 
 async function consume(s: LiveStream, body: ReadableStream<Uint8Array>) {
@@ -440,7 +454,10 @@ export async function startStream(opts: StartStreamOptions): Promise<void> {
     } else if (connected) {
       markInterrupted(s);
     } else {
-      markUnreachable(s);
+      // The request never reached a response, so there is no status to
+      // report — null renders "Error / Connection unavailable" rather than
+      // a number nothing actually sent.
+      markUnreachable(s, null, 'NETWORK_ERROR');
     }
   }
 }

@@ -4,6 +4,8 @@
  * extends it backward-compatibly (route "chat"/"agent", mode/model/effort
  * keys, reasoning + step events). Unknown future meta keys must be tolerated.
  */
+import type { ErrorCategory } from './errorTypes';
+
 
 /**
  * `clarify` was always emitted by the orchestrator (main.py) and always
@@ -317,6 +319,14 @@ export interface ChatMessage {
   status?: MessageStatus;
   /** Populated when status === 'error' — the exact `error` event message. */
   errorMessage?: string;
+  /**
+   * A fatal request-level failure, in the only two fields the error page may
+   * render. `errorStatus` is the REAL upstream status (null when the request
+   * never got one); `errorCode` is its category. Absent on non-fatal errors,
+   * which keep their inline treatment.
+   */
+  errorStatus?: number | null;
+  errorCode?: ErrorCategory;
   /** data: URL preview for a user-attached image. */
   imageDataUrl?: string;
   /** 2026-08-05: previews when SEVERAL images were attached (max 5);
