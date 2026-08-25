@@ -149,3 +149,101 @@ def test_a_missing_run_as_user_is_named():
     tm = TokenManager(creds, http=httpx.Client(transport=httpx.MockTransport(handler)))
     with pytest.raises(RuntimeError, match="Run As"):
         tm.get_token()
+
+
+def test_a_disabled_oauth_flow_is_named_and_not_blamed_on_the_secret():
+    """The real 400 from this org. Salesforce's own text ("The external client
+    app or the OAuth plugin is disabled") does not say WHERE to turn it on, and
+    the same error is returned for a wrong secret — so an operator reading a
+    bare HTTP 400 rotates credentials that were never the problem."""
+    import httpx
+    import pytest
+
+    from syncworker.sf_auth import SalesforceAuthError, TokenManager
+    from syncworker.secrets import SalesforceCredentials
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={
+            "error": "oauth_flow_disabled",
+            "error_description":
+                "The external client app or the OAuth plugin is disabled."})
+
+    creds = SalesforceCredentials(
+        client_id="cid", username="u",
+        login_url="https://x.my.salesforce.com", client_secret="shhh",
+    )
+    tm = TokenManager(creds, http=httpx.Client(transport=httpx.MockTransport(handler)))
+    with pytest.raises(SalesforceAuthError) as excinfo:
+        tm.get_token()
+
+    message = str(excinfo.value)
+    assert excinfo.value.error == "oauth_flow_disabled"
+    assert "oauth_flow_disabled" in message      # the machine-readable code
+    assert "Edit Policies" in message            # where to actually fix it
+    assert "org-side" in message                 # not fixable on this host
+
+
+def test_the_token_error_carries_salesforce_own_words():
+    """A code we have no hint for must still reach the operator intact, rather
+    than being flattened to "HTTP 400"."""
+    import httpx
+    import pytest
+
+    from syncworker.sf_auth import TokenManager
+    from syncworker.secrets import SalesforceCredentials
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={
+            "error": "something_new", "error_description": "a novel failure"})
+
+    creds = SalesforceCredentials(
+        client_id="cid", username="u",
+        login_url="https://x.my.salesforce.com", client_secret="shhh",
+    )
+    tm = TokenManager(creds, http=httpx.Client(transport=httpx.MockTransport(handler)))
+    with pytest.raises(RuntimeError, match="something_new.*a novel failure"):
+        tm.get_token()
+
+
+def test_a_non_json_token_error_still_raises_cleanly():
+    """An HTML error page from a proxy must not turn into a JSONDecodeError."""
+    import httpx
+    import pytest
+
+    from syncworker.sf_auth import SalesforceAuthError, TokenManager
+    from syncworker.secrets import SalesforceCredentials
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(502, text="<html>bad gateway</html>")
+
+    creds = SalesforceCredentials(
+        client_id="cid", username="u",
+        login_url="https://x.my.salesforce.com", client_secret="shhh",
+    )
+    tm = TokenManager(creds, http=httpx.Client(transport=httpx.MockTransport(handler)))
+    with pytest.raises(SalesforceAuthError, match="HTTP 502") as excinfo:
+        tm.get_token()
+    assert excinfo.value.error == ""
+
+
+def test_the_secret_is_never_echoed_in_the_error():
+    """Diagnostics are widened above; the credential must not widen with them."""
+    import httpx
+    import pytest
+
+    from syncworker.sf_auth import SalesforceAuthError, TokenManager
+    from syncworker.secrets import SalesforceCredentials
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        # A hostile/echoing endpoint reflecting the secret back at us.
+        return httpx.Response(400, json={
+            "error": "invalid_client", "error_description": "secret topsecret123"})
+
+    creds = SalesforceCredentials(
+        client_id="cid", username="u",
+        login_url="https://x.my.salesforce.com", client_secret="topsecret123",
+    )
+    tm = TokenManager(creds, http=httpx.Client(transport=httpx.MockTransport(handler)))
+    with pytest.raises(SalesforceAuthError) as excinfo:
+        tm.get_token()
+    assert "topsecret123" not in str(excinfo.value)
