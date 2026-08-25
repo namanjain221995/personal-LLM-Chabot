@@ -23,7 +23,7 @@ from .jsonlog import setup_logging
 from .objects import is_credential_field
 from .rag_index import OpenAIEmbedder, RagIndexer
 from .secrets import fetch_sf_credentials
-from .sf_auth import TokenManager
+from .sf_auth import SalesforceAuthError, TokenManager
 from .sf_client import (SalesforceClient, build_deleted_soql, build_full_soql,
                         build_incremental_soql)
 from .storage import Store, normalize_records, sf_datetime_literal, write_parquet_batch
@@ -259,6 +259,30 @@ def _retry_pending_rag(
     )
 
 
+def _recycle_bin_ids(client, obj: ObjectConfig, watermark: str) -> list[str]:
+    """Ids soft-deleted since the watermark, or [] when the bin cannot be read.
+
+    Best effort by design: visibility follows sharing rules and the bin keeps
+    ~15 days, so a failure here is logged and the sync continues. `python -m
+    syncworker.objects resync <Object>` forces the exact full-extract
+    reconcile if drift is suspected.
+    """
+    try:
+        deleted: list[str] = []
+        for batch in client.soql_query_all(
+            build_deleted_soql(obj.name, watermark, obj.watermark_field)
+        ):
+            deleted.extend(str(r["Id"]) for r in batch if r.get("Id"))
+        return deleted
+    except Exception:
+        log.error(
+            "delete detection failed; local copy may keep deleted rows",
+            exc_info=True,
+            extra={"event": "delete_sync_error", "object": obj.name},
+        )
+        return []
+
+
 def sync_object(
     obj: ObjectConfig,
     client: SalesforceClient,
@@ -266,11 +290,21 @@ def sync_object(
     indexer: RagIndexer | None,
     settings: Settings,
 ) -> int:
-    """Sync one object; returns the number of records processed."""
+    """Sync one object; returns the number of records processed.
+
+    LOCK DISCIPLINE. The warehouse is opened in exactly two short sessions:
+    one for the DuckDB work before the extract, one for the work after it.
+    Every Salesforce call, every embedding call and the extract itself run
+    BETWEEN them with the file unlocked, because a session holds the write
+    lock for its whole lifetime and the orchestrator's queries cannot open
+    the file at all while it does. Opening the warehouse costs ~0.3 s on this
+    catalog, so the two sessions replace four to five per-operation opens
+    without ever holding the lock across network I/O.
+    """
+    started = time.monotonic()
     wm_field = obj.watermark_field
-    # No watermark field → no incremental filter exists for this object;
-    # every cycle is a full extract, kept honest by reconcile_full.
-    watermark = store.get_watermark(obj.name) if wm_field else None
+    # Watermark = time the extraction started, so records modified while the
+    # extract ran are re-fetched next cycle (upsert makes that idempotent).
     cycle_start = sf_datetime_literal(datetime.now(timezone.utc))
 
     # Drop configured fields this org/user cannot see (field-level security)
@@ -282,6 +316,11 @@ def sync_object(
     supports_deletes = True
     try:
         visible = client.describe_fields(obj.name)
+    except SalesforceAuthError:
+        # A refused credential is not a describe problem, and pretending it is
+        # ("using configured fields as-is") hides the real fault behind a
+        # warning while the sync marches on to fail again on the next object.
+        raise
     except Exception:
         log.warning(
             "describe failed; using configured fields as-is",
@@ -308,14 +347,51 @@ def sync_object(
                 obj.name, fields, rag_fields, client, settings
             )
 
-    # A configured object with zero records must still exist as an (empty)
-    # table: "how many X are there" should answer 0, not "table not found".
-    store.ensure_table(obj.name, fields)
+    with store.session():
+        # No watermark field → no incremental filter exists for this object;
+        # every cycle is a full extract, kept honest by reconcile_full.
+        watermark = store.get_watermark(obj.name) if wm_field else None
+
+        # A configured object with zero records must still exist as an (empty)
+        # table: "how many X are there" should answer 0, not "table not found".
+        added_columns = store.ensure_table(obj.name, fields)
+
+        # A COLUMN THAT JUST APPEARED NEEDS ONE FULL EXTRACT.
+        #
+        # It holds NULL for every row already stored, and the incremental
+        # SELECT below fetches only records modified since the watermark —
+        # typically a handful. Nothing would ever revisit the rest: the
+        # watermark has already moved past them. The column then reads as
+        # "almost entirely empty", and "how many candidates have X" answers 2
+        # instead of 3,400 with no error to suggest anything is wrong.
+        #
+        # The trigger is the warehouse's own schema, not "was a field adopted
+        # this cycle": adoption compares describe against the YAML config,
+        # which is never rewritten, so an adopted field is re-adopted EVERY
+        # cycle and that test would force a full extract every five minutes
+        # forever. A column is added exactly once.
+        #
+        # Two things happen, and both matter. The stored watermark is CLEARED
+        # so that if this extract fails partway — leaving the column half
+        # populated — the next cycle is full again and finishes the job; a
+        # successful cycle re-stamps it below and the object goes back to
+        # incremental. The local variable is ALSO dropped, because the
+        # full-vs-incremental decision for this cycle reads it, not the row.
+        if added_columns and watermark is not None:
+            log.info(
+                "columns added to an existing table; forcing a full extract "
+                "to backfill them",
+                extra={"event": "adoption_backfill", "object": obj.name,
+                       "columns": added_columns},
+            )
+            store.clear_watermark(obj.name)
+            watermark = None
 
     # Retry failures from PRIOR cycles before fetching changes. This runs even
     # when the incremental query returns zero rows, closing the old hole where
     # an embedding service that was cold on first sync left records unindexed
-    # forever after their data watermark advanced.
+    # forever after their data watermark advanced. Outside the session: it
+    # talks to the embedding service.
     if indexer is not None and rag_fields:
         _retry_pending_rag(obj.name, rag_fields, indexer, store)
 
@@ -336,6 +412,9 @@ def sync_object(
                "watermark": watermark},
     )
 
+    # Batches stream from Salesforce and are written as they arrive, so this
+    # loop interleaves HTTP with DuckDB writes by nature. Each upsert takes
+    # its own short connection; the lock is free while the next page loads.
     total = 0
     extracted_ids: set[str] = set()
     for batch in batches:
@@ -367,39 +446,57 @@ def sync_object(
     # SystemModstamp filter cannot see them. Two complementary answers:
     # a FULL extract is a complete snapshot, so local rows absent from it
     # are gone from the org (exact); an incremental cycle asks the recycle
-    # bin via queryAll for Ids soft-deleted since the watermark (best effort:
-    # visibility follows sharing rules, and the bin keeps ~15 days).
-    if mode == "full" and total > 0:
-        _purge_local(obj.name, store.reconcile_full(obj.name, extracted_ids),
-                     indexer, source="full_reconcile")
-    elif mode == "incremental" and supports_deletes:
-        try:
-            deleted: list[str] = []
-            for batch in client.soql_query_all(
-                build_deleted_soql(obj.name, watermark, wm_field)
-            ):
-                deleted.extend(str(r["Id"]) for r in batch if r.get("Id"))
-            _purge_local(obj.name, deleted, indexer, source="recycle_bin",
-                         store=store)
-        except Exception:
-            # Best-effort: a failed delete pass must not block the sync.
-            # `python -m syncworker.objects resync <Object>` forces the exact
-            # full-extract reconcile if drift is suspected.
-            log.error(
-                "delete detection failed; local copy may keep deleted rows",
-                exc_info=True,
-                extra={"event": "delete_sync_error", "object": obj.name},
-            )
+    # bin via queryAll for Ids soft-deleted since the watermark (best effort).
+    # The bin is read here, before the lock is taken again.
+    deleted: list[str] = []
+    if mode == "incremental" and supports_deletes:
+        deleted = _recycle_bin_ids(client, obj, watermark)
 
-    # Watermark = time the extraction started, so records modified while the
-    # extract ran are re-fetched next cycle (upsert makes that idempotent).
-    # Objects with no watermark field stay unstamped: full extract every cycle.
-    if wm_field:
-        store.set_watermark(obj.name, cycle_start)
+    # Describe is cached from the top of this function, so this is normally
+    # free; the one case it is not (that describe failed) is a network call,
+    # which is why it happens out here.
+    try:
+        specs = client.describe_field_specs(obj.name)
+    except Exception:
+        specs = []
+
+    with store.session():
+        if mode == "full" and total > 0:
+            _purge_local(obj.name, store.reconcile_full(obj.name, extracted_ids),
+                         indexer, source="full_reconcile")
+        elif deleted:
+            try:
+                _purge_local(obj.name, deleted, indexer, source="recycle_bin",
+                             store=store)
+            except Exception:
+                # Same policy as reading the bin: best effort, never blocking.
+                log.error(
+                    "delete purge failed; local copy may keep deleted rows",
+                    exc_info=True,
+                    extra={"event": "delete_sync_error", "object": obj.name},
+                )
+
+        # Objects with no watermark field stay unstamped: full extract every
+        # cycle.
+        if wm_field:
+            store.set_watermark(obj.name, cycle_start)
+
+        # Rebuild this object's typed view from the SAME describe the extract
+        # used, so the view can never describe a shape the table does not
+        # have. Runs every cycle rather than once: a field adopted above needs
+        # a column in the view, and an unchanged view is skipped cheaply.
+        #
+        # Deliberately AFTER the watermark. A failure here must not make the
+        # sync re-fetch data it already stored correctly -- the raw table is
+        # the durable copy and stays queryable with or without a view.
+        if specs:
+            store.refresh_typed_view(obj.name, specs, settings.sf_org_timezone)
+
     log.info(
         "object sync finished",
         extra={"event": "object_sync_done", "object": obj.name, "mode": mode,
-               "rows": total, "new_watermark": cycle_start},
+               "rows": total, "new_watermark": cycle_start,
+               "seconds": round(time.monotonic() - started, 2)},
     )
     return total
 
@@ -437,6 +534,12 @@ def discover_new_objects(
         return []
     try:
         available = client.list_objects()
+    except SalesforceAuthError:
+        # Discovery is best-effort, but a refused credential is not something
+        # to shrug off with an empty list — it is the first call of the cycle
+        # and re-raising here means one token request per cycle, not one per
+        # object after it.
+        raise
     except Exception:
         return []
     known = {o.name for o in objects}
@@ -487,6 +590,10 @@ def report_new_objects(
     """
     try:
         available = client.list_objects()
+    except SalesforceAuthError:
+        # Same reasoning as discover_new_objects: an empty list here would
+        # report "no new objects" when the truth is that nobody could log in.
+        raise
     except Exception:
         return []
     known = {o.name for o in objects}
@@ -512,6 +619,7 @@ def run_cycle(
     settings: Settings,
 ) -> None:
     started = time.monotonic()
+    connects_before = store.connects
     # Fresh describes every cycle: fields created in Salesforce since the
     # last cycle must be visible to adopt_new_fields without a restart.
     client.clear_describe_cache()
@@ -520,11 +628,23 @@ def run_cycle(
         report_new_objects(objects, client)
     total = 0
     failed: list = []
-    for obj in objects:
+    for position, obj in enumerate(objects):
         # One inaccessible/broken object must not block the other seven —
         # log it loudly, keep syncing, and retry it next cycle.
         try:
             total += sync_object(obj, client, store, indexer, settings)
+        except SalesforceAuthError as exc:
+            # Not per-object: the org has refused our credentials, so every
+            # remaining object would fail the same way. Continuing would fire
+            # two doomed token requests per object — hundreds per cycle — which
+            # buys nothing and risks tripping Salesforce's login lockout.
+            log.error(
+                "salesforce authentication failed; abandoning this cycle",
+                extra={"event": "auth_failed", "object": obj.name,
+                       "sf_error": exc.error, "detail": str(exc),
+                       "objects_skipped": len(objects) - position},
+            )
+            raise
         except Exception:
             failed.append(obj.name)
             log.error(
@@ -536,7 +656,10 @@ def run_cycle(
         "sync cycle complete",
         extra={"event": "cycle_done", "objects": len(objects), "rows": total,
                "failed_objects": failed,
-               "seconds": round(time.monotonic() - started, 1)},
+               "seconds": round(time.monotonic() - started, 1),
+               # Read-write opens of the warehouse this cycle. ~2 per object
+               # is the design; ~4-5 means the sessions are not taking effect.
+               "warehouse_connects": store.connects - connects_before},
     )
 
 
