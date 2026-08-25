@@ -9,12 +9,15 @@
  *                   and pipe the upstream SSE stream through untouched.
  */
 
+import { parseSimulateCommand, simulationEnabled } from '@/lib/devErrors';
+import { categoryForStatus, type ErrorCategory } from '@/lib/errorTypes';
 import { FIXTURES, MOCK_MODEL_IDS, pickFixtureEngine } from '@/lib/fixtures';
 import {
   lastUserContent,
   toOrchestratorChatRequest,
   type ChatRequestBody,
 } from '@/lib/orchestrator';
+import { logProxyError, requestIdOf } from '@/lib/serverLog';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -55,25 +58,28 @@ function isTimeout(err: unknown): boolean {
 }
 
 /**
- * The orchestrator's own error sentence, or a safe generic one. Bounded and
- * trace-screened: a user-facing banner must never become a stack dump.
+ * The orchestrator's own account of the failure, for the SERVER LOG.
+ *
+ * This used to feed a user-facing banner, so it screened out anything that
+ * looked like a stack trace. It does not any more — the browser is sent a
+ * status and a category and nothing else — and a traceback is precisely what
+ * an engineer reading the log wants. `sanitizeForLog` redacts credentials,
+ * flattens newlines and caps the length on the way out, so the screening that
+ * remains here is only about finding the string at all.
  */
 async function upstreamMessage(upstream: Response): Promise<string> {
-  const generic = `The orchestrator responded with status ${upstream.status}.`;
+  const generic = `orchestrator responded with status ${upstream.status}`;
   try {
     const body = (await upstream.json()) as {
       message?: unknown;
       detail?: unknown;
     };
     const said = body.message ?? body.detail;
-    if (typeof said === 'string') {
-      const trimmed = said.trim();
-      if (trimmed && trimmed.length <= 300 && !/traceback|\bat \w+ \(/i.test(trimmed)) {
-        return trimmed;
-      }
-    }
+    if (typeof said === 'string' && said.trim()) return said.trim();
+    if (said !== undefined) return JSON.stringify(said);
   } catch {
-    // Not JSON (an intermediary's own error page) — use the generic sentence.
+    // Not JSON (an intermediary's own error page) — the status still says
+    // what happened, and the category is derived from it.
   }
   return generic;
 }
@@ -172,15 +178,92 @@ function mockStream(body: ChatRequestBody): Response {
   return new Response(stream, { headers: SSE_HEADERS });
 }
 
+/**
+ * One exit for every failed chat request: log the real cause server-side,
+ * answer the browser with the STATUS and a category and nothing else.
+ *
+ * The body carries no upstream text on purpose. lib/errorTypes turns
+ * {status, code} into the page's copy, so there is no route by which an
+ * orchestrator sentence — or anything it quoted — can reach the DOM.
+ */
+function failure(
+  req: Request,
+  info: {
+    status: number | null;
+    category: ErrorCategory;
+    logMessage?: string | null;
+    exception?: string | null;
+    startedAt: number;
+    simulated?: boolean;
+  },
+): Response {
+  logProxyError({
+    route: '/api/chat',
+    status: info.status,
+    category: info.category,
+    message: info.logMessage,
+    requestId: requestIdOf(req),
+    durationMs: Date.now() - info.startedAt,
+    retryable: true,
+    exception: info.exception,
+    simulated: info.simulated,
+  });
+  return Response.json(
+    { code: info.category },
+    // A transport failure has no status of its own; 502 is what this proxy
+    // reports for "I could not complete this upstream call", while `code`
+    // carries the distinction the page actually renders.
+    { status: info.status ?? 502 },
+  );
+}
+
+/** A short, non-leaking description of a thrown transport error, for the log. */
+function describeThrown(err: unknown): string {
+  const code = causeCode(err);
+  const name = (err as { name?: unknown })?.name;
+  const msg = (err as { message?: unknown })?.message;
+  return [
+    typeof name === 'string' ? name : null,
+    code ?? null,
+    typeof msg === 'string' ? msg : null,
+  ]
+    .filter(Boolean)
+    .join(': ');
+}
+
 export async function POST(req: Request): Promise<Response> {
+  const startedAt = Date.now();
   let body: ChatRequestBody;
   try {
     body = (await req.json()) as ChatRequestBody;
   } catch {
-    return Response.json(
-      { message: 'Request body must be JSON with a messages array.' },
-      { status: 400 },
-    );
+    return failure(req, {
+      status: 400,
+      category: 'APPLICATION_ERROR',
+      logMessage: 'request body was not JSON',
+      startedAt,
+    });
+  }
+
+  // DEV ONLY: "/simulate 503" in the composer fails the send with that
+  // status, so the error page can be exercised by hand without breaking a
+  // service. Checked before MOCK_MODE so it works in either mode, and before
+  // any outbound call — a simulated failure never touches the orchestrator.
+  if (simulationEnabled()) {
+    const simulation = parseSimulateCommand(lastUserContent(body));
+    if (simulation) {
+      const status = simulation.kind === 'network' ? null : simulation.status;
+      return failure(req, {
+        status,
+        category:
+          simulation.kind === 'network'
+            ? 'NETWORK_ERROR'
+            : categoryForStatus(status),
+        logMessage: 'SIMULATED_ERROR requested from the composer',
+        startedAt,
+        simulated: true,
+      });
+    }
   }
 
   if (process.env.MOCK_MODE === 'true') {
@@ -195,10 +278,12 @@ export async function POST(req: Request): Promise<Response> {
   // translate before forwarding (§10).
   const chatRequest = toOrchestratorChatRequest(body);
   if (!chatRequest) {
-    return Response.json(
-      { message: 'The request contains no user message or image to send.' },
-      { status: 400 },
-    );
+    return failure(req, {
+      status: 400,
+      category: 'APPLICATION_ERROR',
+      logMessage: 'no user message or image in request',
+      startedAt,
+    });
   }
 
   let upstream: Response;
@@ -224,26 +309,30 @@ export async function POST(req: Request): Promise<Response> {
     // nested chain: a refused/unresolvable host is a down service, while a
     // timeout means the orchestrator DID answer the socket and then went
     // quiet — a different problem, and a different thing for the user to do.
-    if (isTimeout(err)) {
-      return Response.json(
-        { message: 'The orchestrator stopped responding before the answer started.' },
-        { status: 504 },
-      );
-    }
-    return Response.json(
-      { message: 'The orchestrator is unreachable.' },
-      { status: 502 },
-    );
+    const timedOut = isTimeout(err);
+    return failure(req, {
+      // A refused socket has no HTTP status and must not be given a fake one:
+      // the page says "Error / Connection unavailable" rather than inventing
+      // a number the service never sent.
+      status: timedOut ? 504 : null,
+      category: timedOut ? 'TIMEOUT' : 'NETWORK_ERROR',
+      logMessage: describeThrown(err),
+      exception: causeCode(err) ?? (err as { name?: string })?.name ?? null,
+      startedAt,
+    });
   }
 
   if (!upstream.ok || !upstream.body) {
-    // Forward the orchestrator's OWN sentence when it sent one: it is the only
-    // party that knows whether the model is loading, out of memory, or over its
-    // context window. "responded with status 502" told the user none of that.
-    return Response.json(
-      { message: await upstreamMessage(upstream) },
-      { status: upstream.status === 503 ? 503 : 502 },
-    );
+    // The orchestrator's OWN sentence is the only account of whether the model
+    // is loading, out of memory or over its context window — so it is kept,
+    // and it is written to the SERVER log. It is not sent to the browser: the
+    // user gets the status and the safe copy that goes with it.
+    return failure(req, {
+      status: upstream.status,
+      category: categoryForStatus(upstream.status),
+      logMessage: await upstreamMessage(upstream),
+      startedAt,
+    });
   }
 
   // Pipe the SSE stream through untouched.

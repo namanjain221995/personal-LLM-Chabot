@@ -14,6 +14,7 @@ import {
   useCallback,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
 } from 'react';
@@ -22,6 +23,7 @@ import {
 const useIsomorphicLayoutEffect =
   typeof window !== 'undefined' ? useLayoutEffect : useEffect;
 import { fetchMe } from '@/lib/auth';
+import { toClientError, type ClientError } from '@/lib/errorTypes';
 import { downloadMarkdown } from '@/lib/exportMarkdown';
 import { getHistoryStore, newId, setEvictListener } from '@/lib/history';
 import {
@@ -33,6 +35,7 @@ import {
   type ChatPrefs,
 } from '@/lib/prefs';
 import { attachmentsForResend, rememberAttachments } from '@/lib/attachments';
+import ChatErrorPage from './ChatErrorPage';
 import { shortcutAction } from '@/lib/searchPalette';
 import {
   attachStream,
@@ -79,7 +82,7 @@ import { ClarificationCard } from './ClarificationCard';
 import { SearchPalette } from './SearchPalette';
 import { Sidebar } from './Sidebar';
 import { useToast } from './Providers';
-import { IconAlert, IconArrowDown, IconRefresh, IconSidebar } from './icons';
+import { IconArrowDown, IconSidebar } from './icons';
 
 const APP_NAME =
   process.env.NEXT_PUBLIC_APP_NAME ?? 'TechSara AI';
@@ -816,7 +819,29 @@ export function ChatApp() {
     [runRegenerate],
   );
 
-  /** Banner retry: re-send the last user turn, attachment included. */
+  /**
+   * The fatal request-level failure currently on screen, if any.
+   *
+   * `unreachable` is the gate — every send that never became a stream sets it
+   * (lib/streams.ts markUnreachable) and every fresh action clears it, so it
+   * already tracks exactly "a request failed and the user has not moved on".
+   * The STATUS and category come off the failed message, which is persisted,
+   * so the page survives a reload and a trip to another chat and back.
+   */
+  const fatalError = useMemo<ClientError | null>(() => {
+    if (!unreachable) return null;
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const m = messages[i];
+      if (m.role === 'assistant' && m.status === 'error' && m.errorCode) {
+        return toClientError(m.errorStatus ?? null, m.errorCode);
+      }
+    }
+    // The stream reported a failure but left no classified message — treat it
+    // as what it certainly was: a request that never reached a response.
+    return toClientError(null, 'NETWORK_ERROR');
+  }, [unreachable, messages]);
+
+  /** Retry: re-send the last user turn, attachment included. */
   const retryLastTurn = useCallback(() => {
     const id = activeIdRef.current;
     if (!id || isStreaming(id)) return;
@@ -1109,33 +1134,21 @@ export function ChatApp() {
           )}
         </header>
 
-        {unreachable && (
-          <div
-            role="alert"
-            className="flex flex-wrap items-center gap-3 border-b border-danger/40 bg-danger/10 px-4 py-2.5"
-          >
-            <IconAlert size={16} className="shrink-0 text-danger" />
-            <span className="min-w-0 flex-1 text-sm">
-              The orchestrator is unreachable — your message was kept and can
-              be re-sent.
-            </span>
-            <button
-              type="button"
-              onClick={retryLastTurn}
-              className="inline-flex items-center gap-1.5 rounded-md border border-border bg-surface px-2.5 py-1 text-xs font-medium transition-colors duration-ts hover:bg-surface-2"
-            >
-              <IconRefresh size={13} />
-              Retry
-            </button>
-          </div>
-        )}
-
         <div
           ref={scrollRef}
           onScroll={handleScroll}
           className="relative min-h-0 flex-1 overflow-y-auto"
         >
-          {messages.length === 0 ? (
+          {fatalError ? (
+            <ChatErrorPage
+              error={fatalError}
+              onRetry={retryLastTurn}
+              // Dismiss the page only. The conversation, the failed user
+              // message and its error all stay exactly where they are, and
+              // nothing is re-sent.
+              onReturn={() => setUnreachable(false)}
+            />
+          ) : messages.length === 0 ? (
             <EmptyState />
           ) : (
             <div className="mx-auto w-full max-w-thread space-y-6 px-4 py-6">
