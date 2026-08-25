@@ -5,9 +5,16 @@
  * OpenAI/vLLM payload like:
  *   Error code: 400 - {'error': {'message': "This model's maximum context
  *   length is 8192 tokens. However, you requested 8000 output tokens..."}}
- * Dumping that into the thread is noise: the user cannot tell what to do, and
- * the sentence that matters is buried. We show a plain explanation and keep
- * the original available behind a disclosure.
+ * Dumping that into the thread is noise AND a leak: the user cannot tell what
+ * to do, and an upstream sentence can carry a DSN, an echoed header or a
+ * traceback. So every branch here returns copy WE wrote. Nothing that came
+ * off the wire is ever returned for display — the original goes to the server
+ * log instead (lib/serverLog.ts), which is where an engineer can use it.
+ *
+ * This is the NON-FATAL path: an error event that arrives mid-stream, after
+ * the orchestrator already accepted the request. A send that never became a
+ * stream is a fatal request failure and gets the error page instead
+ * (lib/errorTypes.ts + components/ChatErrorPage.tsx).
  */
 
 /**
@@ -40,8 +47,6 @@ export function trimNotice(info: {
 export interface FriendlyError {
   /** One sentence, plain language, ending in what to do next. */
   message: string;
-  /** The raw upstream text, or null when it adds nothing. */
-  detail: string | null;
 }
 
 /** Pull the human sentence out of a stringified error payload. */
@@ -58,47 +63,41 @@ const CONNECTION = /connection|unreachable|refused|timeout|timed out|ECONN/i;
 const OUT_OF_MEMORY = /out of memory|CUDA|OOM/i;
 const NOT_FOUND_MODEL = /model .* does not exist|not found/i;
 
+/** The safe sentence for a failure we could not classify. */
+const GENERIC =
+  "We couldn't complete that request. Please try again.";
+
 export function friendlyError(raw?: string | null): FriendlyError {
   const text = (raw ?? '').trim();
-  if (!text) {
-    return { message: 'The engine reported an error.', detail: null };
-  }
+  if (!text) return { message: 'The engine reported an error.' };
+  // The upstream sentence is used to CLASSIFY. It is never returned.
   const upstream = extractUpstreamMessage(text) ?? text;
 
   if (CONTEXT_OVERFLOW.test(upstream)) {
     return {
       message:
         'This conversation is too long for the selected model. Switch the model picker to Smart, or start a new chat.',
-      detail: text,
     };
   }
   if (CONNECTION.test(upstream)) {
     return {
       message:
-        'The model server did not respond. It may still be starting up — wait a moment and retry.',
-      detail: text,
+        'The model is temporarily unavailable. It may still be starting up — please try again in a moment.',
     };
   }
   if (OUT_OF_MEMORY.test(upstream)) {
     return {
       message:
         'The model server ran out of memory on this request. Try a shorter message or a smaller attachment.',
-      detail: text,
     };
   }
   if (NOT_FOUND_MODEL.test(upstream)) {
     return {
-      message:
-        'The selected model is not available on this machine right now.',
-      detail: text,
+      message: 'The selected model is not available on this machine right now.',
     };
   }
-  // Unrecognized: show the upstream sentence if we isolated one (it is far
-  // more readable than the wrapper), and keep the full payload behind the
-  // disclosure. If it was already a bare sentence, there is nothing to hide.
-  const isolated = extractUpstreamMessage(text);
-  return {
-    message: isolated ?? text,
-    detail: isolated ? text : null,
-  };
+  // Unrecognized. Previously this returned the upstream sentence itself,
+  // which is how raw payload text reached the thread; there is no way to know
+  // what such a string contains, so it does not get rendered.
+  return { message: GENERIC };
 }

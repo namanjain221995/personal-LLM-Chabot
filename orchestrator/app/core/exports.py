@@ -2,7 +2,12 @@
 widths) and csv. Filenames are `<slug>-<timestamp>.<ext>`. Exports are capped
 at 100k rows; SQL result previews at 500 rows.
 
-Pure module: openpyxl is imported lazily inside export_xlsx only.
+Pure module: openpyxl is imported lazily inside the xlsx writers only.
+
+`export_xlsx` writes ONE sheet, which is what a SQL result set is.
+`export_workbook` writes several — a dataset export wants its statistics and
+its rows side by side — and both share `_write_sheet`, so the header styling
+and column sizing can only ever be defined once.
 """
 from __future__ import annotations
 
@@ -50,29 +55,21 @@ def _cell_value(value: object) -> object:
     return str(value)
 
 
-def export_xlsx(
-    columns: Sequence[str],
-    rows: Sequence[Sequence],
-    directory: str | Path,
-    slug: str,
-    cap: int = EXPORT_ROW_CAP,
-) -> Tuple[Path, bool]:
-    """Write an .xlsx file with a bold header row and auto-sized columns.
+# Excel refuses a sheet name over 31 characters or containing []:*?/\\ .
+_SHEET_BAD_RE = re.compile(r"[\[\]:*?/\\]")
 
-    Returns (path, truncated). Rows beyond `cap` (default 100k) are dropped.
-    """
-    from openpyxl import Workbook  # lazy: keep core imports light
+
+def safe_sheet_name(name: str, fallback: str = "Sheet") -> str:
+    """A sheet title Excel will accept: legal characters, 31 chars, non-empty."""
+    cleaned = _SHEET_BAD_RE.sub(" ", str(name or "")).strip()
+    return (cleaned[:31].strip() or fallback)
+
+
+def _write_sheet(ws, columns: Sequence[str], rows: Sequence[Sequence]) -> None:
+    """Header row in bold, then the rows, then width-to-content columns."""
     from openpyxl.styles import Font
     from openpyxl.utils import get_column_letter
 
-    rows, truncated = apply_export_cap(rows, cap)
-    directory = Path(directory)
-    directory.mkdir(parents=True, exist_ok=True)
-    path = directory / timestamped_filename(slug, "xlsx")
-
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Data"
     ws.append([str(c) for c in columns])
     bold = Font(bold=True)
     for cell in ws[1]:
@@ -89,6 +86,67 @@ def export_xlsx(
                 longest = max(longest, len(str(row[idx])))
         ws.column_dimensions[get_column_letter(idx + 1)].width = min(longest + 2, 60)
 
+
+def export_workbook(
+    sheets: Sequence[Tuple[str, Sequence[str], Sequence[Sequence]]],
+    directory: str | Path,
+    slug: str,
+    cap: int = EXPORT_ROW_CAP,
+) -> Tuple[Path, bool]:
+    """Write a multi-sheet .xlsx from (title, columns, rows) triples.
+
+    Returns (path, truncated) — truncated if ANY sheet hit the row cap. An
+    empty `sheets` still produces a valid workbook with one empty sheet,
+    because a caller that found no data should get a readable file rather
+    than an exception.
+    """
+    from openpyxl import Workbook  # lazy: keep core imports light
+
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / timestamped_filename(slug, "xlsx")
+
+    wb = Workbook()
+    wb.remove(wb.active)  # replaced by the sheets below
+    truncated = False
+    used: set = set()
+    for index, (title, columns, rows) in enumerate(sheets):
+        name = safe_sheet_name(title, fallback=f"Sheet{index + 1}")
+        while name.lower() in used:  # Excel treats titles case-insensitively
+            name = safe_sheet_name(f"{name[:28]}-{index + 1}", f"Sheet{index + 1}")
+        used.add(name.lower())
+        capped, hit = apply_export_cap(rows, cap)
+        truncated = truncated or hit
+        _write_sheet(wb.create_sheet(title=name), columns, capped)
+
+    if not wb.sheetnames:
+        wb.create_sheet(title="Summary")
+    wb.save(path)
+    return path, truncated
+
+
+def export_xlsx(
+    columns: Sequence[str],
+    rows: Sequence[Sequence],
+    directory: str | Path,
+    slug: str,
+    cap: int = EXPORT_ROW_CAP,
+) -> Tuple[Path, bool]:
+    """Write an .xlsx file with a bold header row and auto-sized columns.
+
+    Returns (path, truncated). Rows beyond `cap` (default 100k) are dropped.
+    """
+    from openpyxl import Workbook  # lazy: keep core imports light
+
+    rows, truncated = apply_export_cap(rows, cap)
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / timestamped_filename(slug, "xlsx")
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Data"
+    _write_sheet(ws, columns, rows)
     wb.save(path)
     return path, truncated
 
@@ -121,5 +179,7 @@ __all__: List[str] = [
     "cap_rows",
     "apply_export_cap",
     "export_xlsx",
+    "export_workbook",
     "export_csv",
+    "safe_sheet_name",
 ]

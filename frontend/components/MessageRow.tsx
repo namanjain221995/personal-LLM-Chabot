@@ -343,8 +343,11 @@ export function MessageRow({
           {message.status === 'error' &&
             (() => {
               // Raw upstream payloads ("Error code: 400 - {'error': …}") are
-              // unreadable in a chat thread; show the plain-language cause and
-              // keep the original one click away.
+              // unreadable in a chat thread AND are not the user's business:
+              // they can quote a DSN, a header or a traceback. Only the plain
+              // sentence is rendered. The original is written to the server
+              // log instead (lib/serverLog.ts), which is where an engineer
+              // can actually use it.
               const friendly = friendlyError(message.errorMessage);
               return (
                 <div
@@ -366,16 +369,6 @@ export function MessageRow({
                       Retry
                     </button>
                   </div>
-                  {friendly.detail && (
-                    <details className="mt-2">
-                      <summary className="cursor-pointer text-xs text-faint hover:text-muted">
-                        Technical details
-                      </summary>
-                      <pre className="mt-1.5 max-h-48 overflow-auto whitespace-pre-wrap break-words rounded-md bg-surface-2 p-2 text-[11px] leading-relaxed text-muted">
-                        {friendly.detail}
-                      </pre>
-                    </details>
-                  )}
                 </div>
               );
             })()}

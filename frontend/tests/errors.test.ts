@@ -39,13 +39,13 @@ describe('friendlyError', () => {
     expect(out.message).toContain('Smart');
     // No JSON, no token arithmetic, no error codes in the visible sentence.
     expect(out.message).not.toMatch(/\{|\}|BadRequestError|8192|400/);
-    expect(out.detail).toBe(CONTEXT_400);
   });
 
   it('explains a connection failure', () => {
     const out = friendlyError('Connection refused to http://vllm:30000');
-    expect(out.message).toContain('did not respond');
-    expect(out.detail).toBeTruthy();
+    expect(out.message).toContain('temporarily unavailable');
+    // The upstream host must not survive into the visible sentence.
+    expect(out.message).not.toMatch(/vllm|30000|http/i);
   });
 
   it('explains an out-of-memory failure', () => {
@@ -54,24 +54,31 @@ describe('friendlyError', () => {
     );
   });
 
-  it('falls back to the isolated upstream sentence for unknown errors', () => {
-    const raw = `Error code: 500 - {'error': {'message': "something odd"}}`;
+  /**
+   * This assertion is INVERTED from what it was. It used to require that an
+   * unclassified failure be shown to the user verbatim ("something odd"),
+   * which is precisely how raw upstream payloads reached the thread. There is
+   * no way to know what such a string contains — a DSN, a header, a path — so
+   * an unrecognized error now gets our own sentence and the original goes to
+   * the server log.
+   */
+  it('never renders an unrecognized upstream sentence', () => {
+    const raw = `Error code: 500 - {'error': {'message': "connect ECONNREFUSED 10.0.0.4:8080, token=sk-abcd1234efgh"}}`;
     const out = friendlyError(raw);
-    expect(out.message).toBe('something odd');
-    expect(out.detail).toBe(raw); // full payload still available
+    expect(out.message).not.toMatch(/ECONNREFUSED|10\.0\.0\.4|8080|sk-/);
+    expect(out.message).toMatch(/couldn't complete|try again/i);
   });
 
-  it('shows a bare sentence as-is with nothing to hide', () => {
-    const out = friendlyError('The engine gave up.');
-    expect(out.message).toBe('The engine gave up.');
-    expect(out.detail).toBeNull();
+  it('does not echo a bare upstream sentence either', () => {
+    const out = friendlyError('Traceback (most recent call last): boom');
+    expect(out.message).not.toMatch(/Traceback|boom/i);
   });
 
   it('handles missing/empty input', () => {
     expect(friendlyError(undefined).message).toBe(
       'The engine reported an error.',
     );
-    expect(friendlyError('   ').detail).toBeNull();
+    expect(friendlyError('   ').message).toBe('The engine reported an error.');
   });
 });
 
