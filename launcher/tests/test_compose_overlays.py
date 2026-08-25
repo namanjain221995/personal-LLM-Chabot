@@ -20,15 +20,18 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 try:
-    from .support import GIB, REPO_ROOT
+    from .support import GIB, REPO_ROOT, fake_discovery
     from .test_profiles import cpu, mac, nvidia
 except ImportError:  # `unittest discover -s launcher/tests` imports top-level modules.
-    from support import GIB, REPO_ROOT
+    from support import GIB, REPO_ROOT, fake_discovery
     from test_profiles import cpu, mac, nvidia
 
+from techsara_cli import environment
 from techsara_cli.cli import _compose_files
+from techsara_cli.cluster import ClusterDetectors
 from techsara_cli.errors import TechSaraError
 from techsara_cli.environment import RuntimeLayout, build_generated_environment
 from techsara_cli.hardware import HardwareInfo
@@ -98,6 +101,13 @@ class ComposeOverlayValidationTests(unittest.TestCase):
         if not COMPOSE_AVAILABLE:
             raise unittest.SkipTest("Docker Compose v2.24+ is required for overlay validation")
 
+    def setUp(self) -> None:
+        # CLUSTER_MODE defaults to auto; the dgx-spark fixture must not probe
+        # this host's RoCE links or ssh anywhere while rendering overlays.
+        discovery = patch.object(environment, "CLUSTER_DISCOVERY", fake_discovery())
+        discovery.start()
+        self.addCleanup(discovery.stop)
+
     def _render(
         self, hardware: HardwareInfo, user_environment: dict | None = None
     ) -> tuple[SelectedProfile, dict]:
@@ -146,7 +156,9 @@ class ComposeOverlayValidationTests(unittest.TestCase):
             )
 
             files = _compose_files(
-                REPO_ROOT, hardware, profile, publish_model_ports=publish_model_ports
+                REPO_ROOT, hardware, profile,
+                publish_model_ports=publish_model_ports,
+                cluster_mode=str(generated.get("TECHSARA_CLUSTER_MODE") or "single"),
             )
             command = ["docker", "compose", "--project-name", "sf-local-ai-overlay-test"]
             command += ["--env-file", str(secrets_env), "--env-file", str(generated_env)]
@@ -424,6 +436,90 @@ class ComposeOverlayValidationTests(unittest.TestCase):
             rendered["services"]["sync-worker"]["environment"]["EMBED_VIA"],
             "http://vllm-embed:30003/v1",
         )
+
+    def test_the_dgx_cluster_head_overlay_turns_vllm_into_node_rank_zero_on_the_host(self) -> None:
+        """CLUSTER_MODE=dual: host networking, identical engine args, one JSON argv."""
+        detectors = ClusterDetectors(
+            ifname_for_ip=lambda ip: {"192.168.100.1": "enP2p1s0f1np1"}.get(ip),
+            hcas_for_ifnames=lambda names: ["rocep1s0f1" for name in names if name == "enP2p1s0f1np1"],
+            docker_bridge_gateway=lambda: "172.17.0.1",
+        )
+        dual = {
+            "CLUSTER_MODE": "dual",
+            "CLUSTER_HEAD_IP": "192.168.100.1",
+            "CLUSTER_WORKER_IP": "192.168.100.2",
+        }
+        with (
+            patch.object(environment, "CLUSTER_DETECTORS", detectors),
+            patch.object(environment, "CLUSTER_DISCOVERY", fake_discovery()),
+        ):
+            profile, rendered = self._render(FIXTURES["dgx-spark"], dual)
+            _profile, published = self._render(
+                FIXTURES["dgx-spark"],
+                {**dual, "PUBLISH_MODEL_PORTS": "true", "TECHSARA_BIND_ADDRESS": "0.0.0.0", "VLLM_PORT": "18000"},
+            )
+        self.assertEqual(profile.hardware_profile_id, "dgx-spark")
+        vllm = rendered["services"]["vllm"]
+        self.assertEqual(vllm.get("network_mode"), "host")
+        self.assertFalse(vllm.get("ports"))
+        self.assertFalse(vllm.get("networks"))
+        self.assertFalse(vllm.get("expose"))
+        argv = list(vllm["command"])
+        command = " ".join(argv)
+        for flag in (
+            "--nnodes 2",
+            "--node-rank 0",
+            "--tensor-parallel-size 2",
+            "--pipeline-parallel-size 1",
+            "--master-addr 192.168.100.1",
+            "--master-port 29501",
+            "--distributed-executor-backend mp",
+            "--host 172.17.0.1",
+            "--port 8000",
+            "--gpu-memory-utilization 0.30",
+            "--quantization modelopt",
+            "--attention-backend flashinfer",
+            f"--max-model-len {profile.context_length}",
+            "--served-model-name Qwen/Qwen3.8-27B-NVFP4",
+        ):
+            self.assertIn(flag, command)
+        self.assertNotIn("--headless", argv)
+        # The speculative JSON must survive Compose's shell-style split intact.
+        self.assertEqual(
+            argv[argv.index("--speculative-config") + 1],
+            '{"method":"mtp","num_speculative_tokens":1}',
+        )
+        self.assertEqual(vllm["environment"]["VLLM_HOST_IP"], "192.168.100.1")
+        self.assertEqual(vllm["environment"]["NCCL_SOCKET_IFNAME"], "enP2p1s0f1np1")
+        self.assertEqual(vllm["environment"]["NCCL_IB_HCA"], "rocep1s0f1")
+        for service in ("orchestrator", "sync-worker"):
+            # Compose renders `host:target` as `host=target` in newer versions.
+            extra_hosts = {
+                str(item).replace("=", ":")
+                for item in rendered["services"][service].get("extra_hosts") or []
+            }
+            self.assertIn("vllm:host-gateway", extra_hosts, f"{service} cannot resolve the host-mode head")
+        self.assertEqual(
+            rendered["services"]["orchestrator"]["environment"]["OPENAI_BASE_URL"],
+            "http://vllm:8000/v1",
+        )
+        # Every other model service keeps its single-node internal layout.
+        for service in ("vllm-router", "vllm-embed", "vllm-ocr"):
+            self.assertNotEqual(rendered["services"][service].get("network_mode"), "host")
+            self.assertFalse(rendered["services"][service].get("ports"))
+
+        # With the publish opt-in the head listens on every interface at the
+        # configured port; the cluster overlay still strips the port mapping
+        # the published overlay adds, because a host-mode container has none.
+        published_vllm = published["services"]["vllm"]
+        self.assertEqual(published_vllm.get("network_mode"), "host")
+        self.assertFalse(published_vllm.get("ports"))
+        self.assertIn("--host 0.0.0.0 --port 18000", " ".join(published_vllm["command"]))
+        self.assertEqual(
+            published["services"]["orchestrator"]["environment"]["OPENAI_BASE_URL"],
+            "http://vllm:18000/v1",
+        )
+        self.assertTrue(published["services"]["vllm-router"].get("ports"))
 
 
 if __name__ == "__main__":

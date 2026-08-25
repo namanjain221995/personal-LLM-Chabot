@@ -80,12 +80,15 @@ quickly than the path inventory.
 Ignored `.env.bak-*`, `docker-compose.yml.bak-*`, local `.env`, and runtime
 state are not repository inventory entries even when they exist on one machine.
 
-### Compose overlays (6)
+### Compose overlays
 
 | Path | Selected for |
 |---|---|
 | `compose/compose.mac.yaml` | Apple Silicon with native host vLLM-Metal |
-| `compose/compose.dgx-spark.yaml` | DGX Spark main/router/embed/OCR CUDA topology |
+| `compose/compose.dgx-spark.yaml` | DGX Spark main/router/embed/reranker/OCR CUDA topology |
+| `compose/compose.cluster-dgx-spark.yaml` | added 2026-08-25; layered last on `dgx-spark` when `CLUSTER_MODE=dual` — `vllm` becomes node-rank 0 on host networking ([`CLUSTER.md`](CLUSTER.md)) |
+| `compose/compose.cluster-worker.yaml` | added 2026-08-25; Node 2 only, run as project `sf-local-ai-worker` from `~/.techsara-cluster/` — the `--headless` node-rank 1 worker |
+| `compose/compose.published-{cpu,dgx-spark,nvidia}.yaml` | per-family model-port publication when `PUBLISH_MODEL_PORTS=true` |
 | `compose/compose.nvidia.yaml` | generic NVIDIA tiers |
 | `compose/compose.windows-wsl2.yaml` | modifier after NVIDIA overlay on validated Windows/WSL2 |
 | `compose/compose.cpu.yaml` | llama.cpp CPU-minimal inference |
@@ -98,6 +101,18 @@ state are not repository inventory entries even when they exist on one machine.
 | `config/hardware-profiles.yaml` | 13 profile declarations and feature/context/model composition |
 | `config/model-manifest.yaml` | 16 immutable model entries plus uv, vLLM-Metal and container runtime pins |
 | `config/vllm-metal-runtime.txt` | verified direct native artifacts used by runtime install |
+
+### Cluster scripts (`scripts/`, added 2026-08-25)
+
+Node 1 operations for the two-node DGX Spark cluster; not part of the
+2026-08-11 path count above. Reference: [`CLUSTER.md`](CLUSTER.md#operations).
+
+```text
+scripts/cluster-up.sh        scripts/cluster-down.sh     scripts/cluster-status.sh
+scripts/cluster-doctor.sh    scripts/cluster-test.sh     scripts/cluster-bench.sh
+scripts/cluster-logs.sh      scripts/cluster-sync.sh     scripts/cluster-worker.sh
+scripts/lib/cluster-common.sh                scripts/lib/nccl_allreduce_bench.py
+```
 
 ## 4. Launcher inventory (23)
 
@@ -114,18 +129,21 @@ state are not repository inventory entries even when they exist on one machine.
 | `launcher/techsara_cli/runtime.py` | native runtime, owned processes and capability probes |
 | `launcher/techsara_cli/bridge.py` | authenticated bounded container-to-host proxy |
 | `launcher/techsara_cli/compose.py` | exact Compose argv/env, reconciliation and readiness |
+| `launcher/techsara_cli/cluster.py` | added 2026-08-25; `CLUSTER_*` validation, interface/HCA detection, `CLUSTER_ENGINE_ARGS` |
 | `launcher/techsara_cli/environment.py` | runtime layout, secrets and generated capability env |
 | `launcher/techsara_cli/utils.py` | safe subprocess/files/env/locks/download/archive utilities |
 | `launcher/techsara_cli/errors.py` | launcher error taxonomy |
 
-### Tests/support (11)
+### Tests/support (13)
 
 ```text
 launcher/tests/__init__.py
 launcher/tests/support.py
 launcher/tests/test_bridge.py
 launcher/tests/test_cli.py
+launcher/tests/test_cluster.py
 launcher/tests/test_compose.py
+launcher/tests/test_compose_overlays.py
 launcher/tests/test_environment.py
 launcher/tests/test_hardware.py
 launcher/tests/test_model_manager.py
@@ -134,7 +152,8 @@ launcher/tests/test_runtime.py
 launcher/tests/test_utils.py
 ```
 
-The nine `test_*.py` modules use stdlib `unittest`. See
+The eleven `test_*.py` modules use stdlib `unittest` (`test_cluster.py` and
+`test_compose_overlays.py` were absent from the 2026-08-11 listing). See
 [`01-codebase/test-map.md`](01-codebase/test-map.md) for the current run result
 and the mocked/live boundary.
 
@@ -335,6 +354,7 @@ Current operational documents are:
 
 ```text
 docs/PORTABLE-RUNTIME.md
+docs/CLUSTER.md
 docs/00-INVENTORY.md
 docs/README.md
 docs/01-codebase/CRITICAL-PATHS.md
@@ -398,7 +418,7 @@ must not be described as full per-file hashing.
 
 | Suite | Test modules | Command |
 |---|---:|---|
-| launcher | 9 | `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s launcher/tests -v` |
+| launcher | 11 | `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s launcher/tests -v` |
 | orchestrator | 64 | `cd orchestrator && python3 -m pytest tests -q` |
 | sync worker | 14 | `cd sync-worker && python3 -m pytest tests -q` |
 | frontend | 24 | `cd frontend && npm test` |

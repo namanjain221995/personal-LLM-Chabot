@@ -1,5 +1,95 @@
 # Changelog
 
+## Two DGX Sparks, one model (2026-08-25)
+
+A dense 27B model decoding at 10-11 tok/s on one GB10 is memory-bandwidth
+physics, not a tuning problem, and the second Spark on the bench was idle. The
+two are wired back-to-back over two RoCE links (`rocep1s0f1` + `roceP2p1s0f1`).
+`CLUSTER_MODE=dual` in `.env` now shards `RadixArk/Qwen3.8-27B-NVFP4` across
+both machines with vLLM tensor parallelism (TP=2): vLLM 0.26's native
+multi-node `mp` executor (`--nnodes 2`, `--node-rank`, a `--headless` worker),
+NCCL over both links, no Ray. Only the main model is distributed. Router,
+embeddings, reranker, OCR, PostgreSQL and the application stay on Node 1 and
+still reach the head by the `vllm` hostname; only the port moves, from the
+container's 30000 to the host `VLLM_PORT` (8000). No application code changed.
+Full reference: `docs/CLUSTER.md`.
+
+- **TP, not PP, and not by preference.** `--pipeline-parallel-size 2` was
+  tried first and vLLM refused it: `Qwen3_5ForConditionalGeneration` does not
+  implement `SupportsPP` in this build. TP=2 is the only two-GPU layout this
+  model can run, and it is the right one for a chatbot: each node now streams
+  half the weights per token (10.61 GiB resident per node instead of 20.75).
+- **Measured, single stream:** 20 tok/s -> 24-27 tok/s (+20-35 %; an earlier
+  chunk-counted baseline of 10-11 tok/s was wrong by the MTP factor). KV cache: 542k
+  tokens at util 0.35 on one node -> ~924k-1,000k tokens *per node* at 0.30.
+  Utilization went down because half the weights left; router/OCR/embed/
+  reranker shares are unchanged.
+- **Measured, and NOT improved:** concurrency-4 512/128 throughput is 54 vs
+  53 tok/s. Prefill is all-reduce-bound at the fabric's real speed, and that
+  comm time cancels what the halved compute saves. Dual mode is a latency
+  win, not a throughput win.
+- **The fabric is the limitation.** Every RDMA and TCP test caps at ~13.3 Gb/s
+  per link, on both links, with clean counters; NCCL dual-rail reaches 22 Gb/s
+  busbw at 17.6 us latency. Unexplained, and everything that could explain it
+  needs root (MTU is stuck at 1500 on both ends; no sudo). GPU Direct RDMA is
+  disabled by NCCL on GB10, which is expected.
+- **Added:** `launcher/techsara_cli/cluster.py` validates the `CLUSTER_*` keys
+  and generates one `CLUSTER_ENGINE_ARGS` string that both nodes interpolate,
+  so the two vLLM processes cannot disagree on the model configuration;
+  `compose/compose.cluster-dgx-spark.yaml` is layered last on Node 1 and
+  `compose/compose.cluster-worker.yaml` runs alone on Node 2 as project
+  `sf-local-ai-worker`; `scripts/cluster-{up,down,status,doctor,test,bench,
+  logs,sync,worker}.sh` operate the pair; `launcher/tests/test_cluster.py`
+  and a dual render in `test_compose_overlays.py` bring the suite to 318.
+- **The one exposure change, stated plainly:** the head needs host networking
+  (RoCE GIDs come from the host netdevs), so its API is a host listener at
+  `VLLM_PORT`: `0.0.0.0` when `PUBLISH_MODEL_PORTS=true`, otherwise the
+  Docker bridge gateway. Every other model container stays expose-only.
+
+- Found and fixed while bringing this up, because the first dual-mode
+  `./techsara up` tripped over it: `ComposeManager.wait_service` read Docker's
+  **lifetime** `RestartCount` and treated `>= 3` as "restart loop", so
+  `vllm-embed` and `vllm-reranker` (RestartCount 5 from the 2026-08-21 cold
+  start, healthy ever since) were stopped and *disabled*, and the router
+  fallback then rewrote `ROUTER_*` to the main model - a re-run of `up` on any
+  long-lived stack would have done the same. Now a running+healthy service
+  wins outright and only restarts *during* the wait count
+  (`launcher/techsara_cli/compose.py`, two regression tests). The `up -d`
+  timeout also rose from 600 s to 900 s: sync-worker's `stop_grace_period` is
+  10 minutes, so a recreate mid-sync used to abort the whole start-up with
+  `TimeoutExpired`.
+
+- Failure handling was tested by pulling the worker out from under a running
+  cluster, and the first cut failed it silently: the head stayed "healthy"
+  (`/v1/models` is answered by the API server alone) while every completion
+  hung, until the cross-node RPC timed out 15 minutes later - and even then
+  the API server kept running. Now `--distributed-timeout-seconds 300`, the
+  head and worker run under `init: true` with healthchecks that kill the real
+  `vllm serve` process when the engine is dead or the peer has been
+  unreachable for minutes (never during a cold start), so a crashed worker
+  healed in a measured 584 s with no operator involved.
+
+- **Measured, concurrent:** 512-token prompts / 128 output, concurrency 4:
+  54 vs 53 tok/s (equal); concurrency 16: 123 tok/s single node vs 105 tok/s
+  dual - the ~13 Gb/s-per-link fabric turns TP's 128 all-reduces per prefill
+  into a cost. Dual mode is a latency/capacity win, not a throughput win, and
+  `CLUSTER_MODE=single` remains fully supported (re-validated the same day).
+
+- Second pass the same day: `./techsara up` is the one command everywhere.
+  `CLUSTER_MODE=auto` (the default) finds the second Spark on the RoCE links
+  (neighbour table, then the .1/.2 convention, then TCP/22), verifies it over
+  ssh (GB10, Docker, RDMA), syncs image + model, starts the worker itself and
+  stops it again on `down`; one Spark or a Mac runs exactly as before, with a
+  printed reason. `scripts/cluster-up.sh` became an alias.
+
+- The first clean-slate `up` after that died on the worker with vLLM's
+  `Error in memory profiling: initial free 65.7 GiB, current free 89.7 GiB` -
+  on unified-memory GB10 "free GPU memory" is free system memory and it
+  grows while the 21 GB weight read leaves the page cache. Dual mode now
+  passes an explicit `--kv-cache-memory-bytes` (`CLUSTER_KV_CACHE_MEMORY_GIB`,
+  16 GiB per node), which makes vLLM skip that profiling assertion and makes
+  the per-node footprint deterministic.
+
 ## The Customer Success SOPs, and the keywords that never matched (2026-08-19)
 
 Two Customer Success SOPs ingested — the Phase 1-7 candidate-lifecycle chart

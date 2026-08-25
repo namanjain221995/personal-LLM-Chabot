@@ -150,7 +150,11 @@ runtime/safety reserves, and estimates loaded weights plus bounded runtime/KV
 overhead. On a cold NVIDIA start, free VRAM per usable device is the binding
 accelerator value. Aggregate memory across multiple GPUs is not treated as one
 contiguous allocation because the generic profiles do not configure tensor
-parallelism.
+parallelism. The one explicit exception is `dgx-spark` with `CLUSTER_MODE=dual`,
+which shards the main model across two DGX Sparks with vLLM tensor parallelism
+(TP=2); even there each node is budgeted against its own GB10
+(`CLUSTER_GPU_MEMORY_UTILIZATION`, default 0.30) and the two memories are never
+one address space. See [`CLUSTER.md`](CLUSTER.md).
 
 Two gates run before the budget arithmetic:
 
@@ -189,7 +193,7 @@ by startup and API probes rather than by that initial hint.
 | `mac-48-79gb` | `mac-qwen36-35b-4bit` | 32,768 → 16,384 → 8,192 | 1 | embeddings, reranking |
 | `mac-80-127gb` | `mac-qwen36-35b-4bit` | 32,768 → 16,384 → 8,192 | 2 | embeddings, reranking |
 | `mac-128gb-plus` | `mac-qwen36-35b-6bit` | 65,536 → 32,768 → 16,384 | 2 | embeddings, reranking |
-| `dgx-spark` | `dgx-qwen36-35b-nvfp4` | 262,144 → 131,072 → 65,536 | 4 | vision router, embeddings, reranking, OCR |
+| `dgx-spark` | `dgx-qwen38-27b-nvfp4` | 262,144 → 131,072 → 65,536 | 4 | vision router, embeddings, reranking, OCR; `CLUSTER_MODE=dual` serves the main model across two nodes ([`CLUSTER.md`](CLUSTER.md)) |
 | `nvidia-large` | `nvidia-qwen36-35b-fp8` | 32,768 → 16,384 → 8,192 | 2 | vision, embeddings, reranking |
 | `nvidia-medium` | `nvidia-qwen3-30b-fp8` | 16,384 → 8,192 → 4,096 | 1 | embeddings |
 | `nvidia-small` | `nvidia-qwen3-14b-awq` | 16,384 → 8,192 → 4,096 | 1 | embeddings |
@@ -241,6 +245,7 @@ instead of silently changing the request.
 | `mac-qwen36-35b-6bit` | `mlx-community/Qwen3.6-35B-A3B-6bit` | vLLM-Metal | MLX 6-bit |
 | `mac-qwen3-embed-06b-8bit` | `mlx-community/Qwen3-Embedding-0.6B-8bit` | vLLM-Metal | MLX 8-bit |
 | `mac-qwen3-reranker-06b-8bit` | `mku64/Qwen3-Reranker-0.6B-mlx-8Bit` | vLLM-Metal | MLX 8-bit |
+| `dgx-qwen38-27b-nvfp4` | `RadixArk/Qwen3.8-27B-NVFP4` (served as `Qwen/Qwen3.8-27B-NVFP4`; the `dgx-spark` main model, single or dual node) | vLLM CUDA | NVFP4/ModelOpt |
 | `dgx-qwen36-35b-nvfp4` | `nvidia/Qwen3.6-35B-A3B-NVFP4` | vLLM CUDA | NVFP4/ModelOpt |
 | `dgx-qwen3-vl-8b-fp8` | `Qwen/Qwen3-VL-8B-Instruct-FP8` | vLLM CUDA | FP8 |
 | `qwen3-embed-06b` | `Qwen/Qwen3-Embedding-0.6B` | vLLM CUDA | BF16 |
@@ -353,8 +358,8 @@ period and another identity check.
 
 ## 9. Generated environment and Compose
 
-The base file is `compose.yaml`. Exactly one runtime overlay is selected, plus
-the Windows WSL2 modifier where applicable:
+The base file is `compose.yaml`. Exactly one runtime overlay is selected (plus
+the Windows WSL2 modifier where applicable), followed by the modifiers below:
 
 | Profile family | Overlay |
 |---|---|
@@ -364,6 +369,13 @@ the Windows WSL2 modifier where applicable:
 | Windows NVIDIA | NVIDIA overlay, then `compose/compose.windows-wsl2.yaml` |
 | CPU | `compose/compose.cpu.yaml` |
 | app-only/external | `compose/compose.external-development.yaml` |
+
+Two modifiers may follow the runtime overlay: the per-family
+`compose/compose.published-*.yaml` when `PUBLISH_MODEL_PORTS=true` (§12), and —
+only on `dgx-spark` with `CLUSTER_MODE=dual` — `compose/compose.cluster-dgx-spark.yaml`,
+layered last, which turns `vllm` into node-rank 0 of a two-node engine. Node 2
+runs `compose/compose.cluster-worker.yaml` as its own project
+(`sf-local-ai-worker`), outside the launcher; see [`CLUSTER.md`](CLUSTER.md).
 
 The environment chain is:
 
@@ -381,7 +393,13 @@ overriding the selected configuration.
 Important generated fields include selected profile/backend, cache and model
 container paths, local service URLs/model IDs, per-role capability flags,
 contexts, concurrency, selected Compose env paths, validated search state and
-provider (`searxng`, `tavily`, or `brave`), and bounded runtime arguments. Only complete/legacy-complete installs are mapped into real
+provider (`searxng`, `tavily`, or `brave`), and bounded runtime arguments.
+`TECHSARA_CLUSTER_MODE` is always generated (`single` unless `.env` sets
+`CLUSTER_MODE=dual`); in dual mode the validated `CLUSTER_*` keys follow,
+including the detected `CLUSTER_NCCL_SOCKET_IFNAME`/`CLUSTER_NCCL_IB_HCA`,
+`CLUSTER_API_BIND_ADDRESS`, and the single `CLUSTER_ENGINE_ARGS` string both
+nodes interpolate, while `OPENAI_BASE_URL`/`VISION_BASE_URL` become
+`http://vllm:${VLLM_PORT}/v1` ([`CLUSTER.md`](CLUSTER.md#configuration-env-user-owned)). Only complete/legacy-complete installs are mapped into real
 containers; dry-run may map explicit `planned` installs inside its temporary
 environment.
 
@@ -405,7 +423,11 @@ The non-dry run is serialized with a launcher lock:
     repoints router/agent roles to main.
 11. Start and probe main inference. On the first failure, stop it and retry
     once at `startup_retry_context` with concurrency one. A second failure is
-    terminal.
+    terminal. In dual mode the head (`vllm`, node-rank 0) waits for the Node 2
+    worker to rendezvous; the launcher prints the head/worker line first, and
+    a failure points at `scripts/cluster-status.sh` instead of the context
+    retry, which cannot supply a missing worker. `scripts/cluster-up.sh` starts
+    the worker around this stage ([`CLUSTER.md`](CLUSTER.md#operations)).
 12. For profiles declaring vision, perform the additional role-specific image
     probe and disable vision if that optional contract fails.
 13. Start orchestrator and validate `/health`, including the application DB
@@ -447,6 +469,13 @@ avoids turning a transient validation or version mismatch into data loss.
 - Optional pgAdmin: `127.0.0.1:${PGADMIN_PORT:-5050}`.
 - Model containers: internal `expose` only on the `inference` network.
 - The inference network is `internal: true`.
+- Documented exception: with `CLUSTER_MODE=dual` the `vllm` head runs with host
+  networking (NCCL over RoCE needs the host netdevs) and its API listens on the
+  host at `CLUSTER_API_BIND_ADDRESS:${VLLM_PORT}` — `0.0.0.0` when
+  `PUBLISH_MODEL_PORTS=true`, otherwise the Docker bridge gateway
+  (`172.17.0.1`), reachable only by containers on Node 1. Router, embeddings,
+  reranker, and OCR stay expose-only. See
+  [`CLUSTER.md`](CLUSTER.md#security-notes).
 
 `TECHSARA_BIND_ADDRESS` is generated as `127.0.0.1`; user environment cannot
 silently override it through the normal launcher flow. Native Mac model
@@ -470,7 +499,8 @@ Publication is loopback-by-default and widened only by explicit configuration:
 |---|---|---|
 | `TECHSARA_BIND_ADDRESS` | `127.0.0.1` | Host address for the frontend and orchestrator. Must be a literal IP; a hostname or free text is rejected rather than interpolated into a port mapping. |
 | `PUBLISH_MODEL_PORTS` | `false` | When true, layers a per-family `compose/compose.published-*.yaml` overlay that publishes the model APIs. |
-| `VLLM_PORT` / `VLLM_ROUTER_PORT` / `VLLM_EMBED_PORT` / `VLLM_OCR_PORT` / `LLAMA_CPP_PORT` | `8000` / `8002` / `8003` / `8004` / `8000` | Host ports used by that overlay. |
+| `VLLM_PORT` / `VLLM_ROUTER_PORT` / `VLLM_EMBED_PORT` / `VLLM_OCR_PORT` / `VLLM_RERANKER_PORT` / `LLAMA_CPP_PORT` | `8000` / `8002` / `8003` / `8004` / `8005` / `8000` | Host ports used by that overlay. |
+| `CLUSTER_MODE` | `single` | `dual` (dgx-spark only) moves the `vllm` head onto host networking, so `VLLM_PORT` is bound on the host regardless of the published overlay: `0.0.0.0` with `PUBLISH_MODEL_PORTS=true`, otherwise the Docker bridge gateway. |
 
 There is one overlay per family rather than one shared file, because Compose
 merges an unknown service name into a new, imageless service — a single file
@@ -523,7 +553,10 @@ or edit upstream revisions.
    hardware tier automatically selectable.
 3. Add or extend a Compose overlay only when the existing family overlay cannot
    express the runtime. Keep model paths read-only, model ports expose-only,
-   and base application/data services in `compose.yaml`.
+   and base application/data services in `compose.yaml`. Cluster (`CLUSTER_*`)
+   keys are not profile data: they are validated, detected, and rendered into
+   `CLUSTER_ENGINE_ARGS` by `launcher/techsara_cli/cluster.py`, paired with
+   `compose/compose.cluster-*.yaml`.
 4. Add constructed fixtures for nominal, boundary, insufficient available
    memory/VRAM/disk, multiple devices, malformed detection, manual override,
    and degradation. Validate generated env and exact overlay/profile argv.
@@ -595,7 +628,7 @@ aarch64, NVIDIA GB10, 121.7 GiB unified memory).
 
 | Suite | Command | Result |
 |---|---|---|
-| Launcher | `PYTHONPATH=launcher python3 -m pytest launcher/tests -q` | 264 passed, 266 subtests |
+| Launcher | `PYTHONPATH=launcher python3 -m pytest launcher/tests -q` | 264 passed, 266 subtests (318 tests as of 2026-08-25, after `test_cluster.py` was added) |
 | Orchestrator | `TEST_DATABASE_URL=… .venv/bin/python -m pytest tests -q` | 1014 passed |
 | Sync worker | `.venv/bin/python -m pytest tests -q` | 157 passed |
 | Frontend | `npm run test` | 310 passed (24 files) |
@@ -608,7 +641,9 @@ offline/marker/symlink behavior; native runtime architecture and artifact
 validation; process ownership and PID-reuse defense; strict capability schemas;
 environment containment and secret boundaries; Compose command/env precedence;
 published-endpoint resolution; doctor coverage; and mocked CLI lifecycle/
-fallback/dry-run behavior.
+fallback/dry-run behavior. `launcher/tests/test_cluster.py` (2026-08-25) covers
+`CLUSTER_*` validation, interface/HCA detection fallbacks, the bind address
+following the publish opt-in, and the exact `CLUSTER_ENGINE_ARGS` string.
 
 `launcher/tests/test_compose_overlays.py` is the one module that does invoke
 Docker. It renders every supported host fixture — five Apple Silicon memory
@@ -621,7 +656,11 @@ reservations off NVIDIA, NVIDIA device reservations retained on NVIDIA, the
 DGX overlay's measured vLLM flags unchanged, digest-pinned images everywhere
 (including every `FROM` in the four build Dockerfiles), no developer home
 directory in any overlay, and generated environment values arriving in the
-orchestrator, sync-worker, and frontend containers. It skips when Docker
+orchestrator, sync-worker, and frontend containers. It also renders the DGX
+Spark fixture a second time with `CLUSTER_MODE=dual` and asserts the head
+overlay's host networking, stripped `networks`/`expose`/`ports`, the
+`--nnodes 2 --node-rank 0` argv, and the API bind address following the publish
+opt-in ([`CLUSTER.md`](CLUSTER.md)). It skips when Docker
 Compose v2.24+ is unavailable. `config` resolves and renders only: it starts,
 pulls, and creates nothing.
 

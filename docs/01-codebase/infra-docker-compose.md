@@ -16,7 +16,7 @@ with a hardware-selected overlay:
 | Selected family | Files, in order | Inference placement |
 |---|---|---|
 | Apple Silicon | `compose.yaml`, `compose/compose.mac.yaml` | native vLLM-Metal on host; app/data in Docker |
-| DGX Spark | `compose.yaml`, `compose/compose.dgx-spark.yaml` | pinned CUDA containers |
+| DGX Spark | `compose.yaml`, `compose/compose.dgx-spark.yaml`; with `CLUSTER_MODE=dual`, `compose/compose.cluster-dgx-spark.yaml` last | pinned CUDA containers; dual mode shards the main model across two nodes |
 | Generic Linux NVIDIA | `compose.yaml`, `compose/compose.nvidia.yaml` | pinned CUDA containers |
 | Windows NVIDIA | base, NVIDIA overlay, `compose/compose.windows-wsl2.yaml` | CUDA in WSL2 Docker Linux containers |
 | CPU | `compose.yaml`, `compose/compose.cpu.yaml` | llama.cpp container |
@@ -25,6 +25,13 @@ with a hardware-selected overlay:
 The Mac and Windows modifier overlays add `host.docker.internal` host-gateway
 resolution where containers must call a host service. They do not publish a
 model port.
+
+When `PUBLISH_MODEL_PORTS=true` the per-family `compose/compose.published-*.yaml`
+follows the runtime overlay. On DGX Spark with `CLUSTER_MODE=dual` the launcher
+layers `compose/compose.cluster-dgx-spark.yaml` after that, last; Node 2 runs
+`compose/compose.cluster-worker.yaml` as a separate project
+(`sf-local-ai-worker`, started by `scripts/cluster-worker.sh`, not by the
+launcher). See [`../CLUSTER.md`](../CLUSTER.md).
 
 Use `techsara up`, not a bare `docker compose up`. The launcher supplies
 generated env files, immutable model paths, selected profiles, optional Compose
@@ -71,7 +78,9 @@ Salesforce warehouse synchronization when embeddings are disabled.
 
 `postgres` and the public application services use the `application` network.
 The `inference` network is declared `internal: true`; model sidecars are not
-reachable from an external Docker network by default.
+reachable from an external Docker network by default. The documented exception
+is `CLUSTER_MODE=dual`, where the `vllm` head leaves the inference network for
+host networking (§4.2, §9).
 
 ## 4. Runtime overlays
 
@@ -100,10 +109,18 @@ probe fails.
 
 | Service | Internal port | Model/role | Host port |
 |---|---:|---|---|
-| `vllm` | 30000 | Qwen3.6 35B NVFP4 main | none (`expose` only) |
+| `vllm` | 30000 | Qwen3.8 27B NVFP4 main (`RadixArk/Qwen3.8-27B-NVFP4`, served as `Qwen/Qwen3.8-27B-NVFP4`) | none (`expose` only) |
 | `vllm-router` | 30002 | Qwen3-VL 8B FP8 router/vision | none |
-| `vllm-embed` | 30003 | Qwen3 Embedding 0.6B | none |
-| `vllm-ocr` | 30004 | Unlimited-OCR | none |
+| `vllm-embed` | 30003 | Qwen3 Embedding 0.6B; profile `embeddings` | none |
+| `vllm-reranker` | 30005 | Qwen3 Reranker 0.6B (`/score`); profile `reranker` | none |
+| `vllm-ocr` | 30004 | Unlimited-OCR; profile `ocr` | none |
+| `vllm` with `CLUSTER_MODE=dual` | — (host networking) | node-rank 0 of a two-node TP=2 engine; Node 2 runs `vllm-worker` (node-rank 1, `--headless`) | host `CLUSTER_API_BIND_ADDRESS:${VLLM_PORT}` (8000): `0.0.0.0` when `PUBLISH_MODEL_PORTS=true`, else the Docker bridge gateway |
+
+In dual mode only the `vllm` row changes: the head keeps the same image digest,
+model path, and served model id, gains `/dev/infiniband`, unlimited memlock,
+`IPC_LOCK`, and the NCCL environment, and the orchestrator and sync-worker
+resolve `vllm` to the host via `extra_hosts`. Everything else stays on Node 1
+as above. Details, measurements, and operations: [`../CLUSTER.md`](../CLUSTER.md).
 
 All model paths are generated container paths beneath `/models`. The selected
 host cache is mounted read-only. Images are digest-pinned from the model
@@ -125,7 +142,11 @@ Generic NVIDIA profiles share the main model for router/agent roles. Startup
 arguments, context, concurrency, GPU-memory utilization, and model paths come
 from generated env and the pinned manifest. No generic profile configures
 tensor parallelism; the selector consequently budgets per-device/free VRAM,
-not aggregate VRAM.
+not aggregate VRAM. The only layout that does configure it is the DGX Spark
+`CLUSTER_MODE=dual` overlay (`CLUSTER_TENSOR_PARALLEL_SIZE=2` across two
+nodes, `launcher/techsara_cli/cluster.py`), and even that budgets each node
+against its own GB10 at `CLUSTER_GPU_MEMORY_UTILIZATION` (0.30), never the
+sum.
 
 The Windows WSL2 overlay is layered only after detection confirms WSL2, Linux
 containers, and a passing Docker GPU smoke probe.
@@ -188,6 +209,8 @@ resolution is not yet fully hash-locked.
 Compose profiles are added by the launcher:
 
 - `embeddings` when the selected profile declares an embedding model;
+- `reranker` when the selected profile declares a reranker model and the
+  reranker feature (on DGX Spark: `vllm-reranker` on internal port 30005);
 - `ocr` when the selected profile declares OCR and `--skip-ocr` was not used;
 - `search` when enabled provider `searxng` needs the local service, or when
   explicitly requested in `COMPOSE_PROFILES`; Tavily/Brave do not start it;
@@ -232,6 +255,15 @@ Container commands still bind their internal listeners to `0.0.0.0`; that is a
 container namespace detail, not a host publication. The host exposure boundary
 is the loopback-only `ports` mapping.
 
+`CLUSTER_MODE=dual` is the documented exception: the `vllm` head runs with
+`network_mode: host` (NCCL over RoCE needs the ConnectX-7 netdevs and the
+cross-node message queue must be reachable at the link address), so its API
+is a host listener at `CLUSTER_API_BIND_ADDRESS:${VLLM_PORT}` — `0.0.0.0` when
+`PUBLISH_MODEL_PORTS=true`, otherwise the Docker bridge gateway (`172.17.0.1`)
+that only containers on Node 1 can reach. Cluster traffic is pinned to the
+direct links; the host firewall is the boundary. See
+[`../CLUSTER.md`](../CLUSTER.md#security-notes).
+
 Changing bind addresses, publishing model ports, or placing a reverse proxy in
 front creates a different security model. Add explicit authentication, TLS,
 network policy, and origin review before doing so.
@@ -261,6 +293,10 @@ PYTHONPATH=launcher python3 -m pytest launcher/tests -q
 264 passed, 266 subtests passed
 ```
 
+As of 2026-08-25 the suite holds 318 tests, including
+`launcher/tests/test_cluster.py` for the `CLUSTER_*` validation, detection,
+and engine-argument contract.
+
 Those are mocked/unit tests: they do not build images, start Docker, pull
 models, access external networks, or signal real processes.
 
@@ -281,9 +317,16 @@ and `admin` profiles all active, then asserts:
   `driver: nvidia` / `capabilities: [gpu]` reservation;
 - the DGX overlay keeps its measured flags (`--kv-cache-dtype fp8`,
   `--reasoning-parser qwen3`, `--quantization modelopt`,
-  `--attention-backend flashinfer`, `--moe-backend marlin`, chunked prefill,
+  `--attention-backend flashinfer`, chunked prefill,
   prefix caching, `--max-num-batched-tokens 8192`,
-  `--gpu-memory-utilization 0.35`) and its served model id;
+  `--gpu-memory-utilization 0.35`) and its served model id
+  (`Qwen/Qwen3.8-27B-NVFP4`);
+- the DGX fixture rendered again with `CLUSTER_MODE=dual` turns `vllm` into
+  node-rank 0 on host networking with no `networks`/`expose`/`ports`, carries
+  `--nnodes 2 --tensor-parallel-size 2 --gpu-memory-utilization 0.30`, keeps
+  the other model services off host networking, gives orchestrator and
+  sync-worker `vllm:host-gateway`, and binds `--host 0.0.0.0` only under the
+  publish opt-in;
 - the main model keeps its tool-calling flags (`--tool-call-parser qwen3_xml`,
   `--enable-auto-tool-choice`, added 2026-08-11 for Salesforce Intelligence
   Mode's request planner). They are additive: nothing else in the app sends
