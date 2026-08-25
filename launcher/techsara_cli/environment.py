@@ -11,10 +11,17 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 from urllib.parse import urlsplit
 
+from .cluster import DEFAULT_DETECTORS, DEFAULT_DISCOVERY, ClusterDetectors, ClusterDiscovery, resolve_cluster
 from .errors import TechSaraError
 from .model_manager import ModelInstall
 from .profiles import ModelSpec, SelectedProfile
 from .utils import atomic_write_text, parse_env_file, render_env, secure_token
+
+#: Host probes used to derive the two-node cluster settings. Module-level so
+#: tests can substitute fakes without touching real interfaces or Docker.
+CLUSTER_DETECTORS: ClusterDetectors = DEFAULT_DETECTORS
+#: Peer discovery for CLUSTER_MODE=auto (RoCE links, neighbour, ssh preflight).
+CLUSTER_DISCOVERY: ClusterDiscovery = DEFAULT_DISCOVERY
 
 
 @dataclass(frozen=True)
@@ -297,6 +304,23 @@ def build_generated_environment(
     cache = cache_root.expanduser().resolve()
     install_map = {(item.model_id, item.revision): item for item in installs}
 
+    # Two-node DGX Spark cluster: CLUSTER_MODE=auto (default) discovers and
+    # verifies a second Spark on the dgx-spark profile only; every other host
+    # resolves to single without touching the network, so its generated.env
+    # gains just TECHSARA_CLUSTER_MODE/TECHSARA_CLUSTER_REASON.
+    cluster = resolve_cluster(
+        user_values,
+        profile_id=profile.hardware_profile_id,
+        publish_model_ports=publish_model_ports,
+        context=context,
+        startup_arguments=profile.main_model.startup_arguments if profile.main_model else (),
+        vllm_port=resolve_published_port(user_values, "VLLM_PORT"),
+        detectors=CLUSTER_DETECTORS,
+        discovery=CLUSTER_DISCOVERY,
+    )
+    cluster_mode = cluster.mode
+    cluster_values = cluster.generated()
+
     native = profile.runtime_backend == "native-vllm-metal"
     family = profile.family
     if native:
@@ -307,7 +331,13 @@ def build_generated_environment(
             "http://disabled.invalid/v1",
         )
     elif family == "nvidia":
-        main_url = "http://vllm:30000/v1"
+        # In dual mode the head runs with host networking and its API listens
+        # on the host port VLLM_PORT; `vllm` resolves to the host via extra_hosts.
+        main_url = (
+            f"http://vllm:{resolve_published_port(user_values, 'VLLM_PORT')}/v1"
+            if cluster_mode == "dual"
+            else "http://vllm:30000/v1"
+        )
         embed_url = "http://vllm-embed:30003/v1"
         # Only the DGX overlay declares a standalone vllm-reranker service;
         # the other NVIDIA overlays still score in-process.  No /v1 suffix:
@@ -353,6 +383,8 @@ def build_generated_environment(
         "TECHSARA_SECRET_ENV": str(layout.secrets_env),
         "TECHSARA_BIND_ADDRESS": bind_address,
         "TECHSARA_PUBLISH_MODEL_PORTS": _bool(publish_model_ports),
+        "TECHSARA_CLUSTER_MODE": cluster_mode,
+        "TECHSARA_CLUSTER_REASON": cluster.reason,
         "OPENAI_BASE_URL": main_url,
         "MAIN_MODEL": main.api_model_id if main else "disabled",
         "ROUTER_BASE_URL": router_url,
@@ -398,6 +430,7 @@ def build_generated_environment(
     # whether or not it is layered in.
     for name in MODEL_PORT_DEFAULTS:
         values[name] = str(resolve_published_port(user_values, name))
+    values.update(cluster_values)
     if family == "external":
         for prefix in ("MAIN", "ROUTER", "AGENT", "VISION", "EMBED", "OCR", "RERANKER"):
             values.update(

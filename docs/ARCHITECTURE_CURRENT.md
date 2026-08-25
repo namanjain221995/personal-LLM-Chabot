@@ -26,7 +26,7 @@ flowchart LR
             UP["/uploads router (uploads.py)"]
         end
         subgraph MODELS["inference network (internal-only)"]
-            VMAIN["vllm :30000<br/>Qwen/Qwen3.6-35B-A3B-NVFP4<br/>262k ctx, thinking + tools"]
+            VMAIN["vllm :30000<br/>Qwen/Qwen3.8-27B-NVFP4<br/>262k ctx, thinking + tools"]
             VROUTER["vllm-router :30002<br/>Qwen3-VL-8B-Instruct-FP8"]
             VEMBED["vllm-embed :30003<br/>Qwen3-Embedding-0.6B"]
             VOCR["vllm-ocr :30004<br/>baidu/Unlimited-OCR"]
@@ -49,6 +49,10 @@ flowchart LR
     SYNC --> SF
     SYNC --> DUCK & LANCE
 ```
+
+Dual-node note (2026-08-25): `CLUSTER_MODE=dual` adds a second DGX Spark
+holding the other half of the `vllm` main model only (TP=2); every other box
+above stays on Node 1 — see [`CLUSTER.md`](CLUSTER.md).
 
 **Run model.** The only supported entrypoint is `./techsara` (pinned uv →
 `launcher/techsara_cli` → `docker compose` with `compose.yaml` +
@@ -114,7 +118,7 @@ typed SOQL with ONE forced tool call (`submit_plan`, planner.py:218-231).
 ## 3. vLLM serving — actual vs mission-recommended flags
 
 Main service (compose/compose.dgx-spark.yaml:33-76), served model
-`Qwen/Qwen3.6-35B-A3B-NVFP4`, port 30000:
+`Qwen/Qwen3.8-27B-NVFP4` (`RadixArk/Qwen3.8-27B-NVFP4`), port 30000:
 
 | Mission recommendation | Current state | Verdict |
 |---|---|---|
@@ -123,13 +127,12 @@ Main service (compose/compose.dgx-spark.yaml:33-76), served model
 | `--enable-prefix-caching` | **already set** (line 49) | ✅ keep |
 | `--max-model-len 262144` | **already set** (line 40; needle-verified) | ✅ keep |
 | `--tool-call-parser qwen3_coder` | `qwen3_xml` (line 50) | ❌ **do not change** — qwen3_xml matches Qwen3.6's XML tool template; qwen3_coder would regress tool calling |
-| `--gpu-memory-utilization 0.85` | `0.35` (line 41) | ❌ **do not change** — four vLLM services share one unified-memory pool (main .35 + router .17 + embed .04 + OCR .14); 0.85 assumes single-model |
+| `--gpu-memory-utilization 0.85` | `0.35` (line 41) | ❌ **do not change** — four vLLM services share one unified-memory pool (main .35 + router .17 + embed .04 + OCR .14); 0.85 assumes single-model. Dual mode uses `0.30` per node (`CLUSTER_GPU_MEMORY_UTILIZATION`) because half the weights leave each node and the other services' shares are unchanged — [`CLUSTER.md`](CLUSTER.md#memory) |
 | model `Qwen3.6-35B-A3B-FP8` | NVFP4/ModelOpt quant | ❌ **do not change** — FP8 exists in the manifest (nvidia-large profile) but is ~16 GB heavier and tested only to 32k context; NVFP4 is tested at the full 262,144 |
 
 Also already set beyond the brief: `--kv-cache-dtype fp8`,
 `--quantization modelopt`, `--attention-backend flashinfer`,
-`--moe-backend marlin`, `--enable-chunked-prefill`,
-`--max-num-batched-tokens 8192`.
+`--enable-chunked-prefill`, `--max-num-batched-tokens 8192`.
 
 **Memory budget for new work** (.runtime/selected-profile.json:119-129):
 130.7 GB unified total; ~52.9 GB model runtime; 8 GiB
@@ -246,7 +249,9 @@ search's 10/min (config.py:290-292).
 
 1. **This repo is the target**: `origin` is
    `github.com/namanjain221995/personal-LLM-Chabot.git`, matching the
-   mission; the deployed box is the described DGX Spark.
+   mission; the deployed box is the described DGX Spark (since 2026-08-25
+   optionally two of them with `CLUSTER_MODE=dual`, sharing only the main
+   model; the application still sees one endpoint — [`CLUSTER.md`](CLUSTER.md)).
 2. **The three "recommended flag" divergences stay** (parser, gpu-util,
    model quant) for the reasons in §3 — adopting them verbatim would regress
    a live, tuned deployment. Documented rather than applied.

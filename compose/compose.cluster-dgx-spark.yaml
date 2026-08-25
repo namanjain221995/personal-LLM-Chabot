@@ -1,0 +1,114 @@
+# Two-node DGX Spark cluster — HEAD overlay (Node 1).
+#
+# Layered LAST by the launcher (cli._compose_files) only when CLUSTER_MODE=dual
+# is set in .env on a dgx-spark profile. It turns the existing `vllm` service
+# into node-rank 0 of a two-node vLLM multiprocessing ("mp") executor and leaves
+# every other service exactly as compose.yaml / compose.dgx-spark.yaml define
+# them (router, embed, reranker, OCR, postgres, ... stay local to Node 1).
+#
+# The matching worker (node-rank 1) is compose/compose.cluster-worker.yaml,
+# started on Node 2 as its own Compose project (sf-local-ai-worker) by
+# scripts/cluster-worker.sh. Both nodes receive the SAME engine arguments from
+# the launcher-generated CLUSTER_ENGINE_ARGS (tensor/pipeline parallel sizes,
+# context, memory utilisation, master address/port, quantisation, spec-decode);
+# only the frontend flags (--host/--port/parsers) and --node-rank differ.
+#
+# Why host networking: NCCL over RoCE and vLLM's cross-node message queue need
+# the head process to be reachable at the RoCE-link address (CLUSTER_HEAD_IP)
+# and to see the ConnectX-7 netdevs for RoCE v2 GIDs. A bridged container has
+# neither. Consequences, all handled here:
+#   * the OpenAI API listens on the host at CLUSTER_API_BIND_ADDRESS:VLLM_PORT
+#     (0.0.0.0 when PUBLISH_MODEL_PORTS=true — the same exposure the published
+#     overlay already opted into — otherwise the Docker bridge gateway, which
+#     only containers on this host can reach);
+#   * `networks`, `expose` and `ports` inherited from the base overlays are
+#     reset (host-mode containers cannot carry them);
+#   * orchestrator and sync-worker resolve the service name `vllm` to the host
+#     via extra_hosts, so OPENAI_BASE_URL=http://vllm:${VLLM_PORT}/v1 keeps
+#     working without any application change;
+#   * /dev/infiniband is passed through and memlock is unlimited so NCCL can
+#     register RDMA memory (otherwise it silently falls back to TCP sockets).
+services:
+  vllm:
+    network_mode: host
+    networks: !reset []
+    expose: !reset []
+    ports: !reset []
+    command: >
+      ${MAIN_MODEL_CONTAINER_PATH:?MAIN_MODEL_CONTAINER_PATH must be generated}
+      --served-model-name ${MAIN_MODEL:?MAIN_MODEL must be generated}
+      --host ${CLUSTER_API_BIND_ADDRESS:?CLUSTER_API_BIND_ADDRESS must be generated}
+      --port ${VLLM_PORT:?VLLM_PORT must be generated}
+      --reasoning-parser qwen3
+      --tool-call-parser qwen3_xml
+      --enable-auto-tool-choice
+      ${CLUSTER_ENGINE_ARGS:?CLUSTER_ENGINE_ARGS must be generated (CLUSTER_MODE=dual)}
+      --node-rank 0
+    environment:
+      HF_HOME: /root/.cache/huggingface
+      HF_HUB_OFFLINE: "1"
+      # Address the remote worker uses to reach this node's engine (message
+      # queue + torch.distributed master). Must be the RoCE-link address.
+      VLLM_HOST_IP: ${CLUSTER_HEAD_IP:?CLUSTER_HEAD_IP must be generated}
+      # NCCL out-of-band bootstrap + gloo CPU groups: pin to the RoCE link so
+      # nothing rides the 1 GbE LAN by accident.
+      NCCL_SOCKET_IFNAME: ${CLUSTER_NCCL_SOCKET_IFNAME:?CLUSTER_NCCL_SOCKET_IFNAME must be generated}
+      GLOO_SOCKET_IFNAME: ${CLUSTER_NCCL_SOCKET_IFNAME:?CLUSTER_NCCL_SOCKET_IFNAME must be generated}
+      # Both ConnectX-7 RoCE HCAs (multi-rail): measured 22 Gb/s vs 11 Gb/s
+      # single-rail vs 14.6 Gb/s TCP on this hardware (docs/CLUSTER.md).
+      NCCL_IB_HCA: ${CLUSTER_NCCL_IB_HCA}
+      NCCL_IB_DISABLE: "0"
+      # INIT,NET at INFO logs only the transport selection at start-up; the
+      # status/doctor scripts read those lines to prove RDMA (not TCP) is used.
+      NCCL_DEBUG: ${CLUSTER_NCCL_DEBUG:-INFO}
+      NCCL_DEBUG_SUBSYS: ${CLUSTER_NCCL_DEBUG_SUBSYS:-INIT,NET}
+    devices:
+      - /dev/infiniband:/dev/infiniband
+    cap_add:
+      - IPC_LOCK
+    ulimits:
+      memlock: -1
+    stop_grace_period: 2m
+    # Engine-aware, self-healing health. /v1/models is answered by the API
+    # server even when the engine behind it is dead (observed 2026-08-25:
+    # worker gone, head "healthy", every completion hung). What actually
+    # happens when the worker disappears: after --distributed-timeout-seconds
+    # (300 s) the cross-node RPC times out, the engine is marked dead and the
+    # API server closes its listener - but the process does not exit, so
+    # `restart: unless-stopped` never fires. Hence:
+    #   * /health 200                      -> healthy
+    #   * /health 5xx (engine reported dead) -> kill the vllm process now
+    #   * no answer (000) while the process is younger than 15 min -> still
+    #     starting (a cold start takes 4-7 min), just report unhealthy
+    #   * no answer for 4 consecutive checks (2 min) after that -> the engine
+    #     died: kill the vllm process
+    # `init: true` puts tini at PID 1 so killing the real `vllm serve` process
+    # ends the container and Docker restarts it (PID 1 itself ignores signals
+    # it has no handler for, which is why `kill 1` is not used). The pgrep
+    # patterns use [ ] so they never match this healthcheck's own shell.
+    init: true
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          main=$$(pgrep -o -f '/usr/local/bin/vl[l]m serve');
+          [ -n "$$main" ] || exit 1;
+          code=$$(curl -s -o /dev/null -m 10 -w '%{http_code}' http://${CLUSTER_API_BIND_ADDRESS:-127.0.0.1}:${VLLM_PORT:-8000}/health);
+          if [ "$$code" = 200 ]; then rm -f /tmp/health-missed; exit 0; fi;
+          n=$$(( $$(cat /tmp/health-missed 2>/dev/null || echo 0) + 1 )); echo $$n > /tmp/health-missed;
+          age=$$(ps -o etimes= -p "$$main" | tr -d ' ');
+          case "$$code" in 5*) echo "vLLM engine dead (HTTP $$code): restarting the head"; kill -9 "$$main";; esac;
+          if [ "$${age:-0}" -gt 900 ] && [ "$$n" -ge 4 ]; then echo "vLLM API unreachable for $$n checks after $${age}s: restarting the head"; kill -9 "$$main"; fi;
+          exit 1
+      interval: 30s
+      timeout: 15s
+      retries: 4
+      start_period: 30m
+
+  orchestrator:
+    extra_hosts:
+      - "vllm:host-gateway"
+
+  sync-worker:
+    extra_hosts:
+      - "vllm:host-gateway"

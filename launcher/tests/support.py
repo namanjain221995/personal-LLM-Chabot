@@ -135,3 +135,45 @@ def docker_handler(
 
     return handle
 
+
+
+def fake_discovery(
+    *,
+    links=(),
+    peers: Mapping[str, str] | None = None,
+    preflight=None,
+    user: str = "tester",
+    calls: list[str] | None = None,
+):
+    """A ``ClusterDiscovery`` that never touches interfaces, sockets, or ssh.
+
+    ``links`` are ``ClusterLink`` tuples, ``peers`` maps an interface name to
+    the peer address that "answers" on it, and ``preflight`` is either a
+    ``WorkerPreflight`` or a callable taking the ssh target.  Every probe is
+    appended to ``calls`` when given, so tests can prove nothing ran.
+    """
+    from techsara_cli.cluster import ClusterDiscovery, WorkerPreflight
+
+    peer_map = dict(peers or {})
+    record = calls if calls is not None else []
+    ready = WorkerPreflight(
+        True, "spark-2", "GPU 0: NVIDIA GB10 (UUID: GPU-fixture)", "Docker version 29.2.1, build fixture"
+    )
+
+    def links_fn():
+        record.append("links")
+        return list(links)
+
+    def peer_fn(link):
+        record.append(f"peer:{link.ifname}")
+        return peer_map.get(link.ifname)
+
+    def preflight_fn(target):
+        record.append(f"preflight:{target}")
+        if callable(preflight):
+            return preflight(target)
+        return preflight if preflight is not None else ready
+
+    return ClusterDiscovery(
+        links=links_fn, peer_ip=peer_fn, preflight=preflight_fn, worker_ssh=lambda ip: f"{user}@{ip}"
+    )

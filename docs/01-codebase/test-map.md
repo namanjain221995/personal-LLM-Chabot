@@ -8,7 +8,7 @@ Spark host.
 
 | Suite | Runner | Current test files | Result |
 |---|---|---:|---|
-| Portable launcher | pytest / stdlib `unittest` | 10 `test_*.py` modules | **264 passed, 266 subtests** |
+| Portable launcher | pytest / stdlib `unittest` | 11 `test_*.py` modules | **264 passed, 266 subtests** (2026-08-11; 318 tests as of 2026-08-25 with `test_cluster.py`) |
 | Orchestrator | pytest | 68 `test_*.py` modules | **1226 passed** |
 | Sync worker | pytest | 14 `test_*.py` modules | **157 passed** |
 | Frontend | Vitest | 30 modules (`*.test.ts` + `*.test.tsx`) | **425 passed** |
@@ -44,7 +44,13 @@ profile enabled, and asserts the platform invariants (device reservations,
 orchestrator image family, loopback-only publication, no published model API,
 retained volumes, digest-pinned images including every Dockerfile `FROM`, no
 developer home directory, and generated-environment delivery to the application
-containers). `config` only resolves and renders — it starts, pulls, and creates
+containers). Since 2026-08-25 it also renders the DGX Spark fixture with
+`CLUSTER_MODE=dual` and asserts the cluster head overlay: `vllm` on host
+networking with no `networks`/`expose`/`ports`, the `--nnodes 2 --node-rank 0
+--tensor-parallel-size 2` argv with the speculative JSON intact, `vllm:host-gateway`
+on orchestrator and sync-worker, the other model services still bridged, and
+`--host 0.0.0.0` only under the publish opt-in ([`../CLUSTER.md`](../CLUSTER.md)).
+`config` only resolves and renders — it starts, pulls, and creates
 nothing — and the whole module skips when Docker Compose v2.24+ is unavailable.
 
 ## 2. Launcher suite
@@ -64,10 +70,11 @@ subtests and dynamic cases may make runner accounting differ.
 | `test_runtime.py` | 46 | native arm64/runtime marker validation, verified artifact argv, partial/invalid preservation, process ownership/health/version/identity/ports, strict model/capability response schemas |
 | `test_environment.py` | 19 | runtime layout, local secret reuse/permissions, Salesforce credential gates, container-path containment, complete-only installs, context clamp, capability env, local external URL and search-provider policy |
 | `test_cli.py` | 66 | command dispatch, status/doctor/logs/down safety, pure launcher dry-run, staged Compose and native startup, role-specific probes, optional degradation, router fallback, one main retry, sync independent of embeddings, saved-state traversal rejection, wrapper contracts, published-endpoint resolution, doctor check coverage and offline behavior |
+| `test_cluster.py` | 25 | added 2026-08-25: `CLUSTER_MODE` parsing, dual mode only on `dgx-spark`, literal-IPv4 head/worker and paired second-rail addresses, bounded master port, TP×PP must equal 2, utilization bounds, NCCL debug levels, speculative-config JSON, batched-tokens floor, interface/HCA overrides rejecting shell metacharacters, detection fallbacks, API bind address following the publish opt-in, exact shell-splittable `CLUSTER_ENGINE_ARGS` |
 | `test_bridge.py` | 10 | bearer authentication, header stripping, bounded request bodies, target path/query behavior, secret-free errors, no request logging |
 | `test_compose.py` | 6 | env-file precedence over inherited managed vars, preservation of unrelated host env, command construction, orchestrator health and reasoning-probe contracts |
 | `test_utils.py` | 23 | argv-without-shell, validation, dotenv non-evaluation, redaction, atomic files/modes, live-owner locks, stale locks, resumable/hash-verified direct downloads, archive extraction safety |
-| `test_compose_overlays.py` | 6 | real `docker compose config` for all 13 host fixtures with every optional profile, platform invariants, digest-pinned images and Dockerfile bases, no developer home directory, generated-environment delivery |
+| `test_compose_overlays.py` | 13 | real `docker compose config` for all 13 host fixtures with every optional profile, platform invariants, digest-pinned images and Dockerfile bases, no developer home directory, generated-environment delivery, publish opt-in behaviour, and the DGX fixture rendered again in `CLUSTER_MODE=dual` |
 
 ### Hardware fixtures represented
 

@@ -145,7 +145,12 @@ class ComposeManager:
         if force_recreate:
             args.append("--force-recreate")
         args.append(service)
-        self.run(*args, timeout=600.0)
+        # Recreating a service blocks until its old container has stopped, and
+        # sync-worker declares stop_grace_period: 10m (a Salesforce sync in
+        # flight is allowed to finish). The timeout here must exceed that or
+        # every environment change that touches sync-worker mid-sync aborts
+        # the whole start-up with TimeoutExpired (observed 2026-08-25).
+        self.run(*args, timeout=900.0)
 
     def down(self) -> None:
         # Intentionally no -v/--volumes and no cache/model removal.
@@ -204,6 +209,7 @@ class ComposeManager:
         deadline = started + timeout
         next_report = started + report_every
         last: dict[str, Any] = {}
+        baseline_restarts: int | None = None
         while time.monotonic() < deadline:
             rows = self.ps(service)
             if rows:
@@ -212,21 +218,31 @@ class ComposeManager:
                 health = str(last.get("Health") or last.get("health") or "").lower()
                 if state in {"exited", "dead", "removing"}:
                     raise TechSaraError(f"service {service} exited before readiness")
-                # A `restart: unless-stopped` service that cannot initialise is
-                # never observed as "exited": Docker keeps bringing it back, so
-                # a plain state/health poll would burn the entire timeout on a
-                # container that has already told us why it failed.
-                restarts = self._restart_count(last)
-                if restarts >= max_restarts:
-                    detail = self._failure_detail(service)
-                    raise TechSaraError(
-                        f"service {service} restarted {restarts} times without becoming ready"
-                        + (f"; last error: {detail}" if detail else "")
-                    )
                 if state == "running" and ((not require_health) or health == "healthy"):
                     if reporter:
                         reporter(f"  {service}: ready after {time.monotonic() - started:.0f}s")
                     return last
+                # A `restart: unless-stopped` service that cannot initialise is
+                # never observed as "exited": Docker keeps bringing it back, so
+                # a plain state/health poll would burn the entire timeout on a
+                # container that has already told us why it failed. Only
+                # restarts that happen during THIS wait count: Docker keeps
+                # RestartCount for the life of the container, so a service
+                # that looped during an earlier cold start and then ran
+                # healthy for days must not be declared failed (and stopped,
+                # and disabled) by the next `techsara up` - which is exactly
+                # what happened to vllm-embed/vllm-reranker/vllm-router on
+                # 2026-08-25 (RestartCount 5 from the 08-21 start).
+                restarts = self._restart_count(last)
+                if baseline_restarts is None:
+                    baseline_restarts = restarts
+                if restarts - baseline_restarts >= max_restarts:
+                    detail = self._failure_detail(service)
+                    raise TechSaraError(
+                        f"service {service} restarted {restarts - baseline_restarts} times "
+                        "without becoming ready"
+                        + (f"; last error: {detail}" if detail else "")
+                    )
             now = time.monotonic()
             if reporter and now >= next_report:
                 observed = str(last.get("Health") or last.get("health") or last.get("State") or "starting")

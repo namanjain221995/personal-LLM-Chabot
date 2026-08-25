@@ -169,3 +169,47 @@ class ProjectServiceReconciliationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WaitServiceRestartCountTests(unittest.TestCase):
+    """RestartCount is a lifetime counter: only restarts during the wait count."""
+
+    def _manager(self, counts, states):
+        import types
+        from techsara_cli import compose as compose_module
+
+        calls = {"ps": 0, "inspect": 0}
+
+        def runner(argv, timeout=0.0, cwd=None, env=None):
+            if argv[:2] == ["docker", "inspect"]:
+                idx = min(calls["inspect"], len(counts) - 1)
+                calls["inspect"] += 1
+                return types.SimpleNamespace(returncode=0, stdout=f"{counts[idx]}\n", stderr="")
+            if "ps" in argv:
+                idx = min(calls["ps"], len(states) - 1)
+                calls["ps"] += 1
+                state, health = states[idx]
+                row = {"ID": "abc", "Name": "svc", "State": state, "Health": health}
+                return types.SimpleNamespace(returncode=0, stdout=__import__("json").dumps(row), stderr="")
+            if "logs" in argv:
+                return types.SimpleNamespace(returncode=0, stdout="boom\n", stderr="")
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        root = Path(tempfile.mkdtemp())
+        (root / "compose.yaml").write_text("services: {}\n")
+        return compose_module.ComposeManager(
+            root, [root / "compose.yaml"], root / "g.env", root / "s.env", runner=runner
+        )
+
+    def test_old_restarts_on_a_healthy_container_are_not_a_failure(self):
+        manager = self._manager(counts=[5], states=[("running", "healthy")])
+        row = manager.wait_service("svc", timeout=5.0, interval=0.0)
+        self.assertEqual(row["State"], "running")
+
+    def test_restarts_during_the_wait_still_fail_fast(self):
+        manager = self._manager(
+            counts=[5, 6, 7, 8], states=[("running", "starting")] * 10
+        )
+        with self.assertRaises(TechSaraError) as ctx:
+            manager.wait_service("svc", timeout=5.0, interval=0.0)
+        self.assertIn("restarted 3 times", str(ctx.exception))
