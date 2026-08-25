@@ -1,0 +1,96 @@
+# Two-node DGX Spark cluster — WORKER (Node 2), node-rank 1.
+#
+# This file is NOT layered into the Node 1 stack. scripts/cluster-sync.sh copies
+# it together with a generated worker.env to the worker host
+# (~/.techsara-cluster/) and scripts/cluster-worker.sh runs it there as its own
+# Compose project. The project name deliberately differs from `sf-local-ai` so
+# a pre-existing single-node stack on the worker host is never touched.
+#
+# The engine arguments (CLUSTER_ENGINE_ARGS) are byte-identical to the head's:
+# vLLM's multi-node mp executor requires every node to build the same
+# VllmConfig. Only --node-rank and --headless differ. There is no API server
+# on this node; the single public endpoint stays on Node 1.
+name: sf-local-ai-worker
+
+services:
+  vllm-worker:
+    image: ${CLUSTER_VLLM_IMAGE:?CLUSTER_VLLM_IMAGE must be set (run scripts/cluster-sync.sh)}
+    command: >
+      ${MAIN_MODEL_CONTAINER_PATH:?MAIN_MODEL_CONTAINER_PATH must be set}
+      --served-model-name ${MAIN_MODEL:?MAIN_MODEL must be set}
+      ${CLUSTER_ENGINE_ARGS:?CLUSTER_ENGINE_ARGS must be set}
+      --node-rank 1
+      --headless
+    environment:
+      HF_HOME: /root/.cache/huggingface
+      HF_HUB_OFFLINE: "1"
+      VLLM_HOST_IP: ${CLUSTER_WORKER_IP:?CLUSTER_WORKER_IP must be set}
+      NCCL_SOCKET_IFNAME: ${CLUSTER_WORKER_NCCL_SOCKET_IFNAME:?CLUSTER_WORKER_NCCL_SOCKET_IFNAME must be set}
+      GLOO_SOCKET_IFNAME: ${CLUSTER_WORKER_NCCL_SOCKET_IFNAME:?CLUSTER_WORKER_NCCL_SOCKET_IFNAME must be set}
+      NCCL_IB_HCA: ${CLUSTER_WORKER_NCCL_IB_HCA}
+      NCCL_IB_DISABLE: "0"
+      NCCL_DEBUG: ${CLUSTER_NCCL_DEBUG:-INFO}
+      NCCL_DEBUG_SUBSYS: ${CLUSTER_NCCL_DEBUG_SUBSYS:-INIT,NET}
+    volumes:
+      - type: bind
+        source: ${CLUSTER_WORKER_MODEL_CACHE:?CLUSTER_WORKER_MODEL_CACHE must be set}
+        target: /models
+        read_only: true
+      - hf-cache:/root/.cache/huggingface
+    network_mode: host
+    ipc: host
+    shm_size: 32g
+    devices:
+      - /dev/infiniband:/dev/infiniband
+    cap_add:
+      - IPC_LOCK
+    ulimits:
+      memlock: -1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+    stop_grace_period: 2m
+    # A headless node has no HTTP endpoint of its own, so "healthy" means: the
+    # TP worker process is alive AND the head's engine answers /health. A
+    # restarted head is a new torch.distributed process group that the old
+    # worker can never rejoin, so the worker restarts itself when the head
+    # reports its engine dead (5xx) or - once this worker has been up for
+    # 15 minutes - when the head has been unreachable for 10 checks (5 min).
+    # Start-up is never interrupted: while the pair is still loading, an
+    # unreachable head only keeps this container in "starting". `init: true`
+    # + killing the real `vllm serve` process (not PID 1) is what makes the
+    # container exit so `restart: unless-stopped` brings it back; the pgrep
+    # patterns use [ ] so they never match this healthcheck's own shell.
+    init: true
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          main=$$(pgrep -o -f '/usr/local/bin/vl[l]m serve');
+          [ -n "$$main" ] || exit 1;
+          pgrep -f 'VLLM::Worke[r]' >/dev/null || exit 1;
+          code=$$(curl -s -o /dev/null -m 10 -w '%{http_code}' http://${CLUSTER_HEAD_IP:?}:${VLLM_PORT:-8000}/health);
+          if [ "$$code" = 200 ]; then rm -f /tmp/head-missed; exit 0; fi;
+          n=$$(( $$(cat /tmp/head-missed 2>/dev/null || echo 0) + 1 )); echo $$n > /tmp/head-missed;
+          age=$$(ps -o etimes= -p "$$main" | tr -d ' ');
+          case "$$code" in 5*) echo "head engine dead (HTTP $$code): restarting worker to rejoin the next process group"; kill -9 "$$main";; esac;
+          if [ "$${age:-0}" -gt 900 ] && [ "$$n" -ge 10 ]; then echo "head unreachable for $$n checks after $${age}s: restarting worker"; kill -9 "$$main"; fi;
+          exit 1
+      interval: 30s
+      timeout: 15s
+      retries: 10
+      start_period: 30m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  hf-cache:
+    name: sf-local-ai-worker_hf-cache

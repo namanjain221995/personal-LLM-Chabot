@@ -5,16 +5,19 @@ import os
 import stat
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
 try:
-    from .support import REPO_ROOT
+    from .support import REPO_ROOT, fake_discovery
     from .test_profiles import cpu, mac, nvidia
 except ImportError:  # `unittest discover -s launcher/tests` imports top-level modules.
-    from support import REPO_ROOT
+    from support import REPO_ROOT, fake_discovery
     from test_profiles import cpu, mac, nvidia
 
+from techsara_cli import environment
+from techsara_cli.cluster import ClusterDetectors
 from techsara_cli.environment import (
     RuntimeLayout,
     _container_path,
@@ -39,6 +42,12 @@ class EnvironmentCase(unittest.TestCase):
         self.shared = self.root / "shared home"
         with patch.dict(os.environ, {"TECHSARA_HOME": str(self.shared)}, clear=False):
             self.layout = RuntimeLayout.for_project(self.project)
+        # CLUSTER_MODE defaults to auto: without this, a dgx-spark fixture would
+        # probe the real RoCE links and ssh to a real peer.
+        self.discovery_calls: list[str] = []
+        discovery = patch.object(environment, "CLUSTER_DISCOVERY", fake_discovery(calls=self.discovery_calls))
+        discovery.start()
+        self.addCleanup(discovery.stop)
 
     @staticmethod
     def installs(profile: SelectedProfile, cache: Path) -> list[ModelInstall]:
@@ -469,6 +478,143 @@ class GeneratedEnvironmentTests(EnvironmentCase):
         self.assertEqual(values["DEFAULT_MAX_CONTEXT"], str(profile.main_model.context_limit))
         self.assertEqual(values["REPORT_MAX_CONTEXT"], str(profile.main_model.context_limit))
         self.assertEqual(values["MAIN_CONTEXT_LENGTH"], str(profile.main_model.context_limit))
+
+
+class ClusterEnvironmentTests(EnvironmentCase):
+    """Two-node DGX Spark cluster keys are generated only when requested."""
+
+    DUAL = {
+        "CLUSTER_MODE": "dual",
+        "CLUSTER_HEAD_IP": "192.168.100.1",
+        "CLUSTER_WORKER_IP": "192.168.100.2",
+    }
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.detectors = ClusterDetectors(
+            ifname_for_ip=lambda ip: {"192.168.100.1": "enP2p1s0f1np1"}.get(ip),
+            hcas_for_ifnames=lambda names: ["rocep1s0f1" for name in names if name == "enP2p1s0f1np1"],
+            docker_bridge_gateway=lambda: "172.17.0.1",
+        )
+        patcher = patch.object(environment, "CLUSTER_DETECTORS", self.detectors)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _generate(self, profile: SelectedProfile, user_environment: dict[str, str]) -> dict[str, str]:
+        cache = self.root / "cache"
+        return build_generated_environment(
+            self.layout,
+            profile,
+            self.installs(profile, cache),
+            cache_root=cache,
+            user_environment=user_environment,
+        )
+
+    def test_single_mode_emits_only_the_mode_marker_and_no_cluster_keys(self) -> None:
+        profile = select_profile(nvidia(128, dgx=True), REPO_ROOT)
+        # The default (auto) with no RoCE link degrades to single with a reason.
+        baseline = self._generate(profile, {})
+        self.assertEqual(baseline["TECHSARA_CLUSTER_MODE"], "single")
+        self.assertEqual(baseline["TECHSARA_CLUSTER_REASON"], "no RoCE link carries an address")
+        self.assertEqual(self.discovery_calls, ["links"])
+        explicit = self._generate(profile, {"CLUSTER_MODE": "single"})
+        self.assertEqual(explicit["TECHSARA_CLUSTER_MODE"], "single")
+        self.assertEqual(explicit["TECHSARA_CLUSTER_REASON"], "CLUSTER_MODE=single in .env")
+        self.assertEqual(self.discovery_calls, ["links"], "forced single must not probe anything")
+        self.assertEqual({**explicit, "TECHSARA_CLUSTER_REASON": ""}, {**baseline, "TECHSARA_CLUSTER_REASON": ""})
+        self.assertEqual([key for key in baseline if key.startswith("CLUSTER_")], [])
+        self.assertEqual(baseline["OPENAI_BASE_URL"], "http://vllm:30000/v1")
+        # Cluster-only keys are ignored, not validated, when the mode is single.
+        ignored = self._generate(profile, {"CLUSTER_MODE": "single", "CLUSTER_HEAD_IP": "not-an-address"})
+        self.assertEqual(ignored, explicit)
+
+    def test_auto_mode_off_dgx_spark_is_single_without_any_discovery(self) -> None:
+        for name, hardware in (("nvidia-large", nvidia(80)), ("local-minimal", cpu()), ("mac", mac(64))):
+            with self.subTest(profile=name):
+                values = self._generate(select_profile(hardware, REPO_ROOT, reuse_running_models=True), {})
+                self.assertEqual(values["TECHSARA_CLUSTER_MODE"], "single")
+                self.assertEqual(values["TECHSARA_CLUSTER_REASON"], "")
+                self.assertEqual([key for key in values if key.startswith("CLUSTER_")], [])
+        self.assertEqual(self.discovery_calls, [])
+
+    def test_auto_mode_on_dgx_spark_generates_dual_from_the_discovered_peer(self) -> None:
+        from techsara_cli.cluster import ClusterLink
+
+        profile = select_profile(nvidia(128, dgx=True), REPO_ROOT)
+        discovery = fake_discovery(
+            links=[ClusterLink("enP2p1s0f1np1", "192.168.100.1", 24)],
+            peers={"enP2p1s0f1np1": "192.168.100.2"},
+            calls=self.discovery_calls,
+        )
+        with patch.object(environment, "CLUSTER_DISCOVERY", discovery):
+            values = self._generate(profile, {})
+        self.assertEqual(values["TECHSARA_CLUSTER_MODE"], "dual")
+        self.assertEqual(values["TECHSARA_CLUSTER_REASON"], "second DGX Spark spark-2 at 192.168.100.2 (auto-detected)")
+        self.assertEqual(values["CLUSTER_HEAD_IP"], "192.168.100.1")
+        self.assertEqual(values["CLUSTER_WORKER_IP"], "192.168.100.2")
+        self.assertEqual(values["CLUSTER_WORKER_SSH"], "tester@192.168.100.2")
+        self.assertEqual(values["OPENAI_BASE_URL"], "http://vllm:8000/v1")
+        self.assertIn("--master-addr 192.168.100.1", values["CLUSTER_ENGINE_ARGS"])
+        self.assertEqual(self.discovery_calls, ["links", "peer:enP2p1s0f1np1", "preflight:tester@192.168.100.2"])
+
+    def test_dual_mode_on_dgx_spark_emits_cluster_keys_and_host_port_urls(self) -> None:
+        profile = select_profile(nvidia(128, dgx=True), REPO_ROOT)
+        values = self._generate(profile, dict(self.DUAL))
+        self.assertEqual(values["TECHSARA_CLUSTER_MODE"], "dual")
+        self.assertEqual(values["TECHSARA_CLUSTER_REASON"], "second DGX Spark spark-2 at 192.168.100.2 (configured)")
+        self.assertEqual(values["CLUSTER_WORKER_SSH"], "tester@192.168.100.2")
+        self.assertEqual(values["OPENAI_BASE_URL"], "http://vllm:8000/v1")
+        self.assertEqual(values["VISION_BASE_URL"], "http://vllm:8000/v1")
+        self.assertEqual(values["VLLM_PORT"], "8000")
+        # The separate router is unchanged; only the main endpoint moves to the host.
+        self.assertEqual(values["ROUTER_BASE_URL"], "http://vllm-router:30002/v1")
+        self.assertEqual(values["EMBED_BASE_URL"], "http://vllm-embed:30003/v1")
+        self.assertEqual(values["RERANK_BASE_URL"], "http://vllm-reranker:30005")
+        self.assertEqual(values["CLUSTER_HEAD_IP"], "192.168.100.1")
+        self.assertEqual(values["CLUSTER_WORKER_IP"], "192.168.100.2")
+        self.assertEqual(values["CLUSTER_HEAD_IP_2"], "")
+        self.assertEqual(values["CLUSTER_WORKER_IP_2"], "")
+        self.assertEqual(values["CLUSTER_MASTER_PORT"], "29501")
+        self.assertEqual(values["CLUSTER_TENSOR_PARALLEL_SIZE"], "2")
+        self.assertEqual(values["CLUSTER_PIPELINE_PARALLEL_SIZE"], "1")
+        self.assertEqual(values["CLUSTER_GPU_MEMORY_UTILIZATION"], "0.30")
+        self.assertEqual(values["CLUSTER_NCCL_DEBUG"], "INFO")
+        self.assertEqual(values["CLUSTER_NCCL_SOCKET_IFNAME"], "enP2p1s0f1np1")
+        self.assertEqual(values["CLUSTER_NCCL_IB_HCA"], "rocep1s0f1")
+        self.assertEqual(values["CLUSTER_API_BIND_ADDRESS"], "172.17.0.1")
+        engine = values["CLUSTER_ENGINE_ARGS"]
+        self.assertTrue(engine.startswith(f"--max-model-len {values['MODEL_MAX_CONTEXT']} "))
+        self.assertIn("--quantization modelopt --attention-backend flashinfer", engine)
+        self.assertIn("--nnodes 2 --master-addr 192.168.100.1 --master-port 29501", engine)
+        # A shared router (main model) follows the main endpoint.
+        shared = replace(profile, router_model=profile.main_model, router_shared=True)
+        self.assertEqual(self._generate(shared, dict(self.DUAL))["ROUTER_BASE_URL"], "http://vllm:8000/v1")
+
+    def test_dual_mode_honours_a_custom_published_port_and_the_publish_opt_in(self) -> None:
+        profile = select_profile(nvidia(128, dgx=True), REPO_ROOT)
+        values = self._generate(
+            profile, {**self.DUAL, "VLLM_PORT": "18000", "PUBLISH_MODEL_PORTS": "true"}
+        )
+        self.assertEqual(values["OPENAI_BASE_URL"], "http://vllm:18000/v1")
+        self.assertEqual(values["VLLM_PORT"], "18000")
+        self.assertEqual(values["CLUSTER_API_BIND_ADDRESS"], "0.0.0.0")
+        self.assertEqual(values["TECHSARA_PUBLISH_MODEL_PORTS"], "true")
+
+    def test_dual_mode_is_rejected_on_every_non_dgx_profile(self) -> None:
+        for name, hardware in (("nvidia-large", nvidia(80)), ("local-minimal", cpu()), ("mac", mac(64))):
+            with self.subTest(profile=name), self.assertRaisesRegex(
+                TechSaraError, "CLUSTER_MODE=dual is only supported on the dgx-spark profile"
+            ):
+                self._generate(
+                    select_profile(hardware, REPO_ROOT, reuse_running_models=True), dict(self.DUAL)
+                )
+
+    def test_invalid_cluster_values_are_rejected_before_anything_is_generated(self) -> None:
+        profile = select_profile(nvidia(128, dgx=True), REPO_ROOT)
+        with self.assertRaisesRegex(TechSaraError, "CLUSTER_MODE must be one of auto, single, dual"):
+            self._generate(profile, {"CLUSTER_MODE": "triple"})
+        with self.assertRaisesRegex(TechSaraError, "CLUSTER_WORKER_IP is required"):
+            self._generate(profile, {"CLUSTER_MODE": "dual", "CLUSTER_HEAD_IP": "192.168.100.1"})
 
 
 if __name__ == "__main__":

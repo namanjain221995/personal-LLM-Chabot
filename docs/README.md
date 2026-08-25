@@ -18,6 +18,7 @@ source.
 |---|---|
 | Install/start/stop/troubleshoot | [`../README.md`](../README.md) |
 | Hardware matrix, model policy, state, fallback and upgrades | [`PORTABLE-RUNTIME.md`](PORTABLE-RUNTIME.md) |
+| Two-node DGX Spark cluster (`CLUSTER_MODE=dual`): topology, generated config, scripts, benchmarks, limitations | [`CLUSTER.md`](CLUSTER.md) |
 | Current files and entrypoints | [`00-INVENTORY.md`](00-INVENTORY.md) |
 | Launcher plus application request flows | [`01-codebase/CRITICAL-PATHS.md`](01-codebase/CRITICAL-PATHS.md) |
 | Base Compose and runtime overlays | [`01-codebase/infra-docker-compose.md`](01-codebase/infra-docker-compose.md) |
@@ -36,7 +37,10 @@ The supported Compose files bind frontend, orchestrator, PostgreSQL, and
 optional pgAdmin publications to loopback by default. Model containers are
 `expose`-only on an internal inference network. This mitigates the historical
 audit's broad `0.0.0.0` host-publication finding for the supported launcher
-path.
+path. The one documented exception is `CLUSTER_MODE=dual` on DGX Spark: the
+`vllm` head runs with host networking for NCCL over RoCE, so its API is a host
+listener at `VLLM_PORT` (`0.0.0.0` with `PUBLISH_MODEL_PORTS=true`, otherwise
+the Docker bridge gateway); see [`CLUSTER.md`](CLUSTER.md#security-notes).
 
 There is still no real application login/session boundary: `/auth/me` reports a
 stable single local identity. Loopback is therefore a core security assumption,
@@ -56,6 +60,7 @@ policy remains relevant.
 
 | Path | Purpose |
 |---|---|
+| [`CLUSTER.md`](CLUSTER.md) | two-node DGX Spark cluster: what TP=2 sharding is and is not, measured interconnect and benchmarks, `CLUSTER_*` configuration, `scripts/cluster-*.sh`, failure behaviour, limitations |
 | [`00-INVENTORY.md`](00-INVENTORY.md) | regenerated repository composition, entrypoints, configs, tests and generated/ignored state |
 | [`01-codebase/CRITICAL-PATHS.md`](01-codebase/CRITICAL-PATHS.md) | current launcher Flow 0 plus historical detailed application flows |
 | [`01-codebase/infra-docker-compose.md`](01-codebase/infra-docker-compose.md) | current base/overlay/service/network/volume/env topology |

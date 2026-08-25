@@ -10,7 +10,9 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import os
 import runpy
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -23,13 +25,14 @@ from types import SimpleNamespace
 from unittest.mock import ANY, MagicMock, Mock, call, patch
 
 try:
-    from .support import GIB, REPO_ROOT
+    from .support import GIB, REPO_ROOT, fake_discovery
     from .test_profiles import cpu, mac, nvidia
 except ImportError:  # `unittest discover -s launcher/tests` imports top-level modules.
-    from support import GIB, REPO_ROOT
+    from support import GIB, REPO_ROOT, fake_discovery
     from test_profiles import cpu, mac, nvidia
 
-from techsara_cli import cli
+from techsara_cli import cli, environment
+from techsara_cli.cluster import ClusterLink, WorkerPreflight
 from techsara_cli.environment import RuntimeLayout
 from techsara_cli.errors import PrerequisiteError, TechSaraError
 from techsara_cli.model_manager import ModelInstall
@@ -344,6 +347,34 @@ class CliSelectionHelperTests(unittest.TestCase):
         self.assertEqual(windows_files[:-1], linux_files)
         self.assertEqual(windows_files[-1], root / "compose" / "compose.windows-wsl2.yaml")
 
+    def test_compose_files_append_the_cluster_overlay_last_only_in_dual_mode(self) -> None:
+        root = Path("/fixture")
+        hardware = nvidia(122, dgx=True, system_memory_gib=122)
+        profile = selected(hardware)
+        self.assertEqual(profile.hardware_profile_id, "dgx-spark")
+        cluster_overlay = root / "compose" / "compose.cluster-dgx-spark.yaml"
+
+        single = cli._compose_files(root, hardware, profile)
+        explicit_single = cli._compose_files(root, hardware, profile, cluster_mode="single")
+        self.assertEqual(explicit_single, single)
+        self.assertNotIn(cluster_overlay, single)
+
+        dual = cli._compose_files(root, hardware, profile, cluster_mode="dual")
+        self.assertEqual(dual[:-1], single)
+        self.assertEqual(dual[-1], cluster_overlay)
+
+        # The cluster overlay resets what the published overlay adds, so it
+        # must come after it.
+        dual_published = cli._compose_files(
+            root, hardware, profile, publish_model_ports=True, cluster_mode="dual"
+        )
+        self.assertEqual(dual_published[-2], root / "compose" / "compose.published-dgx-spark.yaml")
+        self.assertEqual(dual_published[-1], cluster_overlay)
+        self.assertEqual(
+            dual_published[:-1],
+            cli._compose_files(root, hardware, profile, publish_model_ports=True),
+        )
+
     def test_model_downloader_reads_only_hf_token_from_dotenv_and_export_wins(self) -> None:
         root = Path("/fixture")
         layout = RuntimeLayout.for_project(root)
@@ -599,6 +630,7 @@ class UpCommandTests(unittest.TestCase):
                 "orchestrator": "http://127.0.0.1:8080",
                 "frontend": "http://127.0.0.1:3000",
             },
+            root=self.root,
         )
         state = self.atomic_json.call_args.args[1]
         self.assertEqual(state["status"], "running")
@@ -1435,6 +1467,164 @@ class ComposeStartupTests(unittest.TestCase):
         self.assertEqual(generated["MAIN_CONCURRENCY"], "1")
         publish.assert_called_once()
 
+    @staticmethod
+    def _cluster_generated() -> dict[str, str]:
+        return {
+            "EMBED_BASE_URL": "http://embed/v1",
+            "EMBED_MODEL": "embed",
+            "OPENAI_BASE_URL": "http://vllm:8000/v1",
+            "MAIN_MODEL": "main",
+            "MODEL_MAX_CONTEXT": "262144",
+            "TECHSARA_CLUSTER_MODE": "dual",
+            "CLUSTER_HEAD_IP": "192.168.100.1",
+            "CLUSTER_WORKER_IP": "192.168.100.2",
+            "CLUSTER_MASTER_PORT": "29501",
+        }
+
+    @staticmethod
+    def _cluster_profile() -> SelectedProfile:
+        """The dgx-spark selection with the main model doubling as router and no OCR."""
+        profile = selected(nvidia(122, dgx=True, system_memory_gib=122))
+        return replace(
+            profile,
+            router_model=profile.main_model,
+            router_shared=True,
+            ocr_model=None,
+            features=dict(profile.features, ocr=False),
+        )
+
+    def test_cluster_head_failure_is_not_retried_at_a_smaller_context(self) -> None:
+        profile = self._cluster_profile()
+        self.assertTrue(profile.startup_retry_context, "fixture must have a retry context to prove it is skipped")
+        generated = self._cluster_generated()
+        compose = Mock()
+        compose.profiles = ()
+        compose.generated_env = Path("/fixture/generated.env")
+
+        def wait(service, **_kwargs):
+            if service == "vllm":
+                raise TechSaraError("service vllm exited before readiness")
+            return {}
+
+        compose.wait_service.side_effect = wait
+        stdout = io.StringIO()
+        with (
+            patch.object(cli, "_probe_orchestrator") as health,
+            patch.object(cli, "atomic_write_text") as publish,
+            patch.object(cli, "_run_cluster_script") as scripts,
+            redirect_stdout(stdout),
+        ):
+            with self.assertRaisesRegex(TechSaraError, "scripts/cluster-status.sh.*scripts/cluster-logs.sh worker") as caught:
+                cli._start_compose(
+                    compose, profile, generated, salesforce_ready=False, search_enabled=False, dry_run=False,
+                    root=Path("/fixture/root"),
+                )
+        self.assertIsInstance(caught.exception.__cause__, TechSaraError)
+        self.assertEqual(scripts.call_count, 2)
+        self.assertEqual(
+            [item for item in compose.up_service.call_args_list if item.args == ("vllm",)],
+            [call("vllm")],
+        )
+        compose.validate.assert_not_called()
+        publish.assert_not_called()
+        health.assert_not_called()
+        self.assertEqual(generated["MODEL_MAX_CONTEXT"], "262144")
+        output = stdout.getvalue()
+        self.assertIn("cluster: starting vLLM head (node-rank 0) on 192.168.100.1:29501", output)
+        self.assertIn("worker on 192.168.100.2 must be running (scripts/cluster-worker.sh start)", output)
+
+    def test_cluster_head_success_follows_the_normal_startup_order(self) -> None:
+        profile = self._cluster_profile()
+        generated = self._cluster_generated()
+        compose = Mock()
+        compose.profiles = ()
+        health_result = {"status": "healthy", "checks": {"app_db": {"status": "ok"}}}
+        with (
+            patch.object(cli, "_probe_orchestrator", return_value=health_result),
+            patch.object(cli, "_run_cluster_script"),
+            redirect_stdout(io.StringIO()),
+        ):
+            result = cli._start_compose(
+                compose, profile, generated, salesforce_ready=False, search_enabled=False, dry_run=False,
+                root=Path("/fixture/root"),
+            )
+        self.assertEqual(result["startup_retry_context"], 0)
+        compose.probe_internal_model.assert_any_call("http://vllm:8000/v1", "main")
+        self.assertEqual(
+            [item for item in compose.up_service.call_args_list if item.args == ("vllm",)],
+            [call("vllm")],
+        )
+
+    def test_cluster_sync_and_worker_start_run_in_order_right_before_the_head(self) -> None:
+        profile = self._cluster_profile()
+        generated = self._cluster_generated()
+        compose = Mock()
+        compose.profiles = ()
+        root = Path("/fixture/root")
+        events: list[str] = []
+        compose.up_service.side_effect = lambda service, **_kwargs: events.append(f"up:{service}")
+
+        def script(script_root, name, *args, reporter, timeout):
+            self.assertEqual(script_root, root)
+            self.assertIs(reporter, cli._step)
+            events.append(f"script:{name} {' '.join(args)}".strip() + f" [{timeout:.0f}s]")
+
+        health_result = {"status": "healthy", "checks": {"app_db": {"status": "ok"}}}
+        with (
+            patch.object(cli, "_probe_orchestrator", return_value=health_result),
+            patch.object(cli, "_run_cluster_script", side_effect=script),
+            redirect_stdout(io.StringIO()),
+        ):
+            cli._start_compose(
+                compose, profile, generated, salesforce_ready=False, search_enabled=False, dry_run=False, root=root,
+            )
+        sync = events.index("script:cluster-sync.sh [3600s]")
+        worker = events.index("script:cluster-worker.sh start [300s]")
+        head = events.index("up:vllm")
+        self.assertLess(sync, worker)
+        self.assertLess(worker, head)
+        # The worker is started after the other model services and right before the head.
+        self.assertEqual(events[head - 1], "script:cluster-worker.sh start [300s]")
+        self.assertEqual(events[head - 2], "script:cluster-sync.sh [3600s]")
+        self.assertIn("up:vllm-embed", events[:sync])
+
+    def test_cluster_sync_failure_stops_before_the_head_is_started(self) -> None:
+        profile = self._cluster_profile()
+        generated = self._cluster_generated()
+        compose = Mock()
+        compose.profiles = ()
+        with (
+            patch.object(cli, "_probe_orchestrator") as health,
+            patch.object(cli, "_run_cluster_script", side_effect=TechSaraError("scripts/cluster-sync.sh failed with exit status 2")) as scripts,
+            redirect_stdout(io.StringIO()),
+        ):
+            with self.assertRaisesRegex(TechSaraError, "scripts/cluster-sync.sh failed with exit status 2"):
+                cli._start_compose(
+                    compose, profile, generated, salesforce_ready=False, search_enabled=False, dry_run=False,
+                    root=Path("/fixture/root"),
+                )
+        scripts.assert_called_once()
+        self.assertEqual(scripts.call_args.args[:2], (Path("/fixture/root"), "cluster-sync.sh"))
+        self.assertNotIn(call("vllm"), compose.up_service.call_args_list)
+        health.assert_not_called()
+
+    def test_single_mode_never_touches_the_cluster_scripts(self) -> None:
+        profile = self._cluster_profile()
+        generated = {**self._cluster_generated(), "TECHSARA_CLUSTER_MODE": "single"}
+        compose = Mock()
+        compose.profiles = ()
+        health_result = {"status": "healthy", "checks": {"app_db": {"status": "ok"}}}
+        with (
+            patch.object(cli, "_probe_orchestrator", return_value=health_result),
+            patch.object(cli, "_run_cluster_script") as scripts,
+            redirect_stdout(io.StringIO()),
+        ):
+            cli._start_compose(
+                compose, profile, generated, salesforce_ready=False, search_enabled=False, dry_run=False,
+                root=Path("/fixture/root"),
+            )
+        scripts.assert_not_called()
+
     def test_embedding_failure_preserves_salesforce_sync_and_keeps_main_and_frontend(self) -> None:
         profile = selected(nvidia(80))
         generated = {
@@ -1618,6 +1808,53 @@ class StatusAndDoctorTests(unittest.TestCase):
         self.assertIn("not configured", output)
         self.assertIn("Native processes:\n  none", output)
         self.assertIn("Docker services:\n  none/unavailable", output)
+        self.assertIn("Cluster mode: single", output)
+
+    def test_status_reports_the_recorded_cluster_mode_with_both_node_addresses(self) -> None:
+        self.layout.runtime_dir.mkdir(parents=True)
+        self.layout.generated_env.write_text(
+            "CLUSTER_HEAD_IP=192.168.100.1\nCLUSTER_WORKER_IP=192.168.100.2\nTECHSARA_CLUSTER_MODE=dual\n",
+            encoding="utf-8",
+        )
+        process = Mock()
+        process.status.return_value = []
+
+        def load(path, default):
+            return {"cluster_mode": "dual", "status": "running"} if path == self.layout.state_file else default
+
+        stdout = io.StringIO()
+        with (
+            patch.object(cli.RuntimeLayout, "for_project", return_value=self.layout),
+            patch.object(cli, "_load_hardware", return_value=None),
+            patch.object(cli, "_load_profile", return_value=None),
+            patch.object(cli, "ProcessManager", return_value=process),
+            patch.object(cli, "run_command", return_value=command_result(127, "", "missing")),
+            patch.object(cli, "load_json", side_effect=load),
+            redirect_stdout(stdout),
+        ):
+            self.assertEqual(cli._cmd_status(argparse.Namespace(), root=self.root), 0)
+        self.assertIn("Cluster mode: dual (head 192.168.100.1, worker 192.168.100.2)", stdout.getvalue())
+
+    def test_status_prints_the_generated_cluster_reason_when_present(self) -> None:
+        self.layout.runtime_dir.mkdir(parents=True)
+        self.layout.generated_env.write_text(
+            "TECHSARA_CLUSTER_MODE=single\nTECHSARA_CLUSTER_REASON=no second DGX Spark answered on 10.100.184.x\n",
+            encoding="utf-8",
+        )
+        process = Mock()
+        process.status.return_value = []
+        stdout = io.StringIO()
+        with (
+            patch.object(cli.RuntimeLayout, "for_project", return_value=self.layout),
+            patch.object(cli, "_load_hardware", return_value=None),
+            patch.object(cli, "_load_profile", return_value=None),
+            patch.object(cli, "ProcessManager", return_value=process),
+            patch.object(cli, "run_command", return_value=command_result(127, "", "missing")),
+            patch.object(cli, "load_json", return_value={}),
+            redirect_stdout(stdout),
+        ):
+            self.assertEqual(cli._cmd_status(argparse.Namespace(), root=self.root), 0)
+        self.assertIn("Cluster mode: single\n  no second DGX Spark answered on 10.100.184.x", stdout.getvalue())
 
     def test_doctor_is_non_mutating_and_fails_only_blocking_prerequisites(self) -> None:
         hardware = replace(cpu(), docker_running=False, free_disk_bytes=GIB)
@@ -1846,6 +2083,72 @@ class LifecycleAndUtilityCommandTests(unittest.TestCase):
         runtimes.assert_not_called()
         self.assertIn("Models, runtimes, data volumes, reports, and user configuration were preserved", stdout.getvalue())
 
+    def test_down_stops_the_worker_only_when_the_recorded_mode_is_dual(self) -> None:
+        compose = Mock()
+        process = Mock()
+        process.stop_all.return_value = []
+        self.layout.runtime_dir.mkdir(parents=True)
+        for recorded, expected_calls in (("dual", 1), ("single", 0), (None, 0)):
+            with self.subTest(cluster_mode=recorded):
+                state = {"status": "running", "compose_files": ["compose.yaml"]}
+                if recorded:
+                    state["cluster_mode"] = recorded
+                self.layout.state_file.write_text(json.dumps(state), encoding="utf-8")
+                compose.reset_mock()
+                stdout = io.StringIO()
+                with (
+                    patch.object(cli.RuntimeLayout, "for_project", return_value=self.layout),
+                    patch.object(cli, "_compose_from_state", return_value=compose),
+                    patch.object(cli, "ProcessManager", return_value=process),
+                    patch.object(cli, "run_command", return_value=command_result(0, "")),
+                    patch.object(cli, "_run_cluster_script") as scripts,
+                    redirect_stdout(stdout),
+                ):
+                    self.assertEqual(cli._cmd_down(argparse.Namespace(dry_run=False), root=self.root), 0)
+                compose.down.assert_called_once_with()
+                self.assertEqual(scripts.call_count, expected_calls)
+                if expected_calls:
+                    self.assertEqual(scripts.call_args.args, (self.root, "cluster-worker.sh", "down"))
+                    self.assertEqual(scripts.call_args.kwargs["timeout"], 300.0)
+                    self.assertIn("Stopped the vLLM worker on the second DGX Spark", stdout.getvalue())
+                else:
+                    self.assertNotIn("worker", stdout.getvalue())
+
+    def test_down_reports_an_unreachable_worker_as_a_warning_not_a_failure(self) -> None:
+        compose = Mock()
+        process = Mock()
+        process.stop_all.return_value = []
+        self.layout.runtime_dir.mkdir(parents=True)
+        self.layout.state_file.write_text(json.dumps({"cluster_mode": "dual", "compose_files": ["compose.yaml"]}), encoding="utf-8")
+        stdout = io.StringIO()
+        with (
+            patch.object(cli.RuntimeLayout, "for_project", return_value=self.layout),
+            patch.object(cli, "_compose_from_state", return_value=compose),
+            patch.object(cli, "ProcessManager", return_value=process),
+            patch.object(cli, "run_command", return_value=command_result(0, "")),
+            patch.object(cli, "_run_cluster_script", side_effect=TechSaraError("scripts/cluster-worker.sh down failed with exit status 255")),
+            redirect_stdout(stdout),
+        ):
+            self.assertEqual(cli._cmd_down(argparse.Namespace(dry_run=False), root=self.root), 0)
+        compose.down.assert_called_once_with()
+        output = stdout.getvalue()
+        self.assertIn("Warning: could not stop the vLLM worker on the second DGX Spark", output)
+        self.assertIn("exit status 255", output)
+        self.assertIn("scripts/cluster-worker.sh down", output)
+        # Dry run only announces the worker step.
+        stdout = io.StringIO()
+        with (
+            patch.object(cli.RuntimeLayout, "for_project", return_value=self.layout),
+            patch.object(cli, "_compose_from_state", return_value=compose),
+            patch.object(cli, "ProcessManager", return_value=process),
+            patch.object(cli, "run_command", return_value=command_result(0, "")),
+            patch.object(cli, "_run_cluster_script") as scripts,
+            redirect_stdout(stdout),
+        ):
+            self.assertEqual(cli._cmd_down(argparse.Namespace(dry_run=True), root=self.root), 0)
+        scripts.assert_not_called()
+        self.assertIn("Would run: scripts/cluster-worker.sh down", stdout.getvalue())
+
     def test_down_never_claims_to_have_stopped_a_stack_it_does_not_manage(self) -> None:
         """A no-op `down` must not read as "everything is stopped now".
 
@@ -2059,6 +2362,133 @@ class LifecycleAndUtilityCommandTests(unittest.TestCase):
         self.assertIn("[orchestrator]", output)
         self.assertNotIn("old line", output)
         self.assertNotIn("unselected", output)
+
+
+class ClusterScriptRunnerTests(unittest.TestCase):
+    """`_run_cluster_script` streams a script's output and turns failures into errors."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        (self.root / "scripts").mkdir()
+
+    def script(self, name: str, body: str) -> None:
+        (self.root / "scripts" / name).write_text("#!/usr/bin/env bash\n" + body, encoding="utf-8")
+
+    @unittest.skipUnless(shutil.which("bash"), "bash is required to exercise the script runner")
+    def test_output_is_streamed_through_the_reporter_and_arguments_are_passed(self) -> None:
+        self.script("demo.sh", 'echo "one $1"; echo "two" >&2; printf "progress 10%%\\rprogress 100%%\\n"; echo "cwd=$(pwd)"\n')
+        lines: list[str] = []
+        cli._run_cluster_script(self.root, "demo.sh", "start", reporter=lines.append, timeout=30.0)
+        self.assertEqual(lines[0], "  | one start")
+        self.assertIn("  | two", lines)
+        self.assertIn("  | progress 100%", lines)
+        self.assertNotIn("  | progress 10%", lines)
+        self.assertIn(f"  | cwd={self.root.resolve()}", lines)
+
+    @unittest.skipUnless(shutil.which("bash"), "bash is required to exercise the script runner")
+    def test_non_zero_exit_and_timeouts_are_actionable_errors(self) -> None:
+        self.script("fail.sh", "echo boom; exit 3\n")
+        lines: list[str] = []
+        with self.assertRaisesRegex(TechSaraError, "scripts/fail.sh down failed with exit status 3"):
+            cli._run_cluster_script(self.root, "fail.sh", "down", reporter=lines.append, timeout=30.0)
+        self.assertEqual(lines, ["  | boom"])
+        self.script("slow.sh", "sleep 30\n")
+        with self.assertRaisesRegex(TechSaraError, "scripts/slow.sh did not finish within 1s"):
+            cli._run_cluster_script(self.root, "slow.sh", reporter=lines.append, timeout=1.0)
+
+    def test_a_missing_script_is_reported_without_spawning_anything(self) -> None:
+        with patch.object(cli.subprocess, "Popen") as popen:
+            with self.assertRaisesRegex(TechSaraError, "scripts/absent.sh is missing"):
+                cli._run_cluster_script(self.root, "absent.sh", timeout=5.0)
+        popen.assert_not_called()
+
+
+class ClusterSummaryAndDoctorTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.layout = RuntimeLayout.for_project(self.root)
+
+    def test_summary_line_is_printed_only_on_dgx_spark_or_in_dual_mode(self) -> None:
+        dgx = selected(nvidia(122, dgx=True, system_memory_gib=122))
+        self.assertEqual(
+            cli._cluster_summary(dgx, {"TECHSARA_CLUSTER_MODE": "dual", "TECHSARA_CLUSTER_REASON": "second DGX Spark spark-476e at 10.100.184.2 (auto-detected)"}),
+            "Cluster: dual - second DGX Spark spark-476e at 10.100.184.2 (auto-detected)",
+        )
+        self.assertEqual(
+            cli._cluster_summary(dgx, {"TECHSARA_CLUSTER_MODE": "single", "TECHSARA_CLUSTER_REASON": "no RoCE link carries an address"}),
+            "Cluster: single - no RoCE link carries an address",
+        )
+        self.assertEqual(
+            cli._cluster_summary(dgx, {"TECHSARA_CLUSTER_MODE": "single", "TECHSARA_CLUSTER_REASON": ""}),
+            "Cluster: single - CLUSTER_MODE=single in .env",
+        )
+        for hardware in (mac(64), nvidia(80), cpu()):
+            with self.subTest(profile=hardware.gpu_name):
+                self.assertEqual(cli._cluster_summary(selected(hardware), {"TECHSARA_CLUSTER_MODE": "single", "TECHSARA_CLUSTER_REASON": ""}), "")
+                self.assertEqual(cli._cluster_summary(selected(hardware), {}), "")
+
+    def _doctor(self, hardware, discovery, user_env: dict[str, str] | None = None) -> str:
+        stdout = io.StringIO()
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(cli.RuntimeLayout, "for_project", return_value=self.layout))
+            stack.enter_context(patch.object(cli, "detect_hardware", return_value=hardware))
+            stack.enter_context(patch.object(cli, "_load_profile", return_value=None))
+            stack.enter_context(patch.object(cli, "_reachable_host", return_value=True))
+            stack.enter_context(patch.object(cli, "parse_env_file", return_value=dict(user_env or {})))
+            stack.enter_context(patch.object(environment, "CLUSTER_DISCOVERY", discovery))
+            stack.enter_context(redirect_stdout(stdout))
+            cli._cmd_doctor(argparse.Namespace(offline=True), root=self.root)
+        return stdout.getvalue()
+
+    def test_doctor_reports_links_peer_and_preflight_on_a_dgx_spark_without_blocking(self) -> None:
+        dgx = nvidia(122, dgx=True, system_memory_gib=122)
+        link = ClusterLink("enp1s0f1np1", "10.100.184.1", 24)
+        ready = fake_discovery(links=[link], peers={"enp1s0f1np1": "10.100.184.2"})
+        output = self._doctor(dgx, ready)
+        self.assertIn("PASS  Cluster RoCE links", output)
+        self.assertIn("PASS  Cluster peer discovered", output)
+        self.assertIn("PASS  Cluster worker preflight", output)
+        self.assertIn("Cluster: second DGX Spark spark-2 at 10.100.184.2 (tester@10.100.184.2) is ready for dual mode.", output)
+
+        output = self._doctor(dgx, fake_discovery())
+        self.assertIn("FAIL  Cluster RoCE links", output)
+        self.assertNotIn("Cluster peer discovered", output)
+        self.assertNotIn("Cluster worker preflight", output)
+
+        output = self._doctor(dgx, fake_discovery(links=[link]))
+        self.assertIn("PASS  Cluster RoCE links", output)
+        self.assertIn("FAIL  Cluster peer discovered", output)
+        self.assertIn("no second DGX Spark answered on 10.100.184.x; ./techsara up runs single-node.", output)
+
+        denied = fake_discovery(links=[link], peers={"enp1s0f1np1": "10.100.184.2"}, preflight=WorkerPreflight(False, detail="ssh: Permission denied (publickey)"))
+        output = self._doctor(dgx, denied)
+        self.assertIn("FAIL  Cluster worker preflight", output)
+        self.assertIn("ssh: Permission denied (publickey); set up key auth for tester@10.100.184.2 or CLUSTER_MODE=single in .env.", output)
+
+        calls: list[str] = []
+        output = self._doctor(dgx, fake_discovery(links=[link], calls=calls), {"CLUSTER_MODE": "single"})
+        self.assertIn("CLUSTER_MODE=single in .env, so the second DGX Spark was not probed", output)
+        self.assertNotIn("Cluster RoCE links", output)
+        self.assertEqual(calls, [])
+
+        calls = []
+        explicit = {"CLUSTER_HEAD_IP": "10.100.184.1", "CLUSTER_WORKER_IP": "10.100.184.2", "CLUSTER_WORKER_SSH": "ops@spark-2"}
+        output = self._doctor(dgx, fake_discovery(calls=calls), explicit)
+        self.assertNotIn("Cluster RoCE links", output)
+        self.assertIn("PASS  Cluster worker preflight", output)
+        self.assertEqual(calls, ["preflight:ops@spark-2"])
+
+    def test_doctor_never_probes_the_cluster_off_a_dgx_spark(self) -> None:
+        calls: list[str] = []
+        for hardware in (nvidia(80), cpu()):
+            with self.subTest(gpu=hardware.gpu_name):
+                output = self._doctor(hardware, fake_discovery(calls=calls))
+                self.assertNotIn("Cluster", output)
+        self.assertEqual(calls, [])
 
 
 if __name__ == "__main__":

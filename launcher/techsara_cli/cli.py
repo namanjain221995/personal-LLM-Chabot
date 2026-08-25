@@ -6,6 +6,8 @@ import argparse
 import json
 import os
 import re
+import selectors
+import subprocess
 import sys
 import tempfile
 import time
@@ -14,8 +16,10 @@ import urllib.request
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
+from . import environment as environment_module
+from .cluster import CLUSTER_COMPOSE_OVERLAY, discover_cluster_peer, resolve_cluster_mode
 from .compose import ComposeManager, docker_project_has_running_models
 from .environment import (
     DGX_COMPOSE_OVERLAY,
@@ -58,6 +62,102 @@ def _yes(value: str | None) -> bool:
     return (value or "").strip().lower() in {"1", "true", "yes", "on", "enabled"}
 
 
+def _cluster_mode(generated: Mapping[str, str]) -> str:
+    """The generated cluster mode; anything unset means the single-node layout."""
+    return (generated.get("TECHSARA_CLUSTER_MODE") or "single").strip().lower()
+
+
+def _recorded_cluster_mode(layout: RuntimeLayout) -> str:
+    """The mode of the deployed stack: state.json first, then generated.env."""
+    state = load_json(layout.state_file, {})
+    if isinstance(state, dict) and state.get("cluster_mode"):
+        return str(state["cluster_mode"]).strip().lower()
+    return _cluster_mode(parse_env_file(layout.generated_env))
+
+
+def _cluster_summary(profile: SelectedProfile, generated: Mapping[str, str]) -> str:
+    """One line saying which cluster mode `up` chose and why; empty off DGX Spark."""
+    mode = _cluster_mode(generated)
+    reason = (generated.get("TECHSARA_CLUSTER_REASON") or "").strip()
+    if mode != "dual" and profile.hardware_profile_id != "dgx-spark":
+        return ""
+    return f"Cluster: {mode} - {reason or 'CLUSTER_MODE=single in .env'}"
+
+
+def _report_script_line(reporter: Callable[[str], None], raw: bytes) -> None:
+    text = raw.decode("utf-8", errors="replace").split("\r")[-1].rstrip()
+    if text:
+        reporter(f"  | {text}")
+
+
+def _run_cluster_script(
+    root: Path,
+    script_name: str,
+    *args: str,
+    reporter: Callable[[str], None] | None = None,
+    timeout: float,
+) -> None:
+    """Run ``scripts/<script_name>`` and narrate its output line by line.
+
+    The cluster helpers stay bash on purpose (they drive ssh, rsync, and
+    Docker on the worker host); this is the launcher's only hand-off to them.
+    A non-zero exit or the timeout is a ``TechSaraError``.
+    """
+    report = reporter or _step
+    script = root / "scripts" / script_name
+    label = " ".join(("scripts/" + script_name,) + tuple(args))
+    if not script.is_file():
+        raise TechSaraError(f"{label} is missing from {root}")
+    try:
+        process = subprocess.Popen(
+            ["bash", str(script), *args],
+            cwd=str(root),
+            env=dict(os.environ, NO_COLOR="1"),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+    except OSError as exc:
+        raise TechSaraError(f"could not run {label}: {exc}") from exc
+    deadline = time.monotonic() + timeout
+    pending = b""
+    progress_at = 0.0
+    assert process.stdout is not None
+    with selectors.DefaultSelector() as selector, process.stdout as stream:
+        selector.register(stream, selectors.EVENT_READ)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                process.kill()
+                process.wait()
+                raise TechSaraError(f"{label} did not finish within {timeout:.0f}s")
+            if not selector.select(timeout=min(remaining, 1.0)):
+                continue
+            chunk = os.read(stream.fileno(), 65536)
+            if not chunk:
+                break
+            pending += chunk
+            *lines, pending = pending.split(b"\n")
+            for line in lines:
+                _report_script_line(report, line)
+            # rsync-style progress rewrites one line with \r; show it sparingly.
+            if b"\r" in pending:
+                pending = pending.rsplit(b"\r", 1)[-1]
+                if time.monotonic() - progress_at >= 2.0:
+                    progress_at = time.monotonic()
+                    _report_script_line(report, pending)
+    if pending:
+        _report_script_line(report, pending)
+    try:
+        code = process.wait(timeout=max(1.0, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired as exc:
+        process.kill()
+        process.wait()
+        raise TechSaraError(f"{label} did not finish within {timeout:.0f}s") from exc
+    if code != 0:
+        raise TechSaraError(f"{label} failed with exit status {code}; see its output above")
+
+
 def _verbose(args: argparse.Namespace, message: str) -> None:
     if bool(getattr(args, "verbose", False)):
         print(f"  [verbose] {message}")
@@ -87,6 +187,7 @@ def _compose_files(
     profile: SelectedProfile,
     *,
     publish_model_ports: bool = False,
+    cluster_mode: str = "single",
 ) -> list[Path]:
     files = [root / "compose.yaml"] + [root / item for item in profile.compose_files]
     if hardware.operating_system == "windows" and profile.family == "nvidia":
@@ -104,6 +205,10 @@ def _compose_files(
         )
         if published:
             files.append(root / published)
+    if cluster_mode == "dual":
+        # Always last: it resets the `ports`/`networks` the published overlay
+        # adds to `vllm` and switches that one service to host networking.
+        files.append(root / CLUSTER_COMPOSE_OVERLAY)
     return files
 
 
@@ -490,12 +595,19 @@ def _cmd_up_dry(args: argparse.Namespace, *, root: Path) -> int:
             generation_options["external_environment"] = user_env
         generated = build_generated_environment(layout, profile, installs, **generation_options)
         publish_model_ports = _yes(generated.get("TECHSARA_PUBLISH_MODEL_PORTS"))
+        cluster_mode = _cluster_mode(generated)
+        cluster_line = _cluster_summary(profile, generated)
+        if cluster_line:
+            print(cluster_line)
         atomic_write_text(layout.generated_env, render_env(generated), mode=0o644)
         atomic_write_text(layout.secrets_env, render_env(secrets), mode=0o600)
         profiles = _compose_profiles(profile, user_env, skip_ocr=args.skip_ocr)
         compose = ComposeManager(
             root,
-            _compose_files(root, hardware, profile, publish_model_ports=publish_model_ports),
+            _compose_files(
+                root, hardware, profile,
+                publish_model_ports=publish_model_ports, cluster_mode=cluster_mode,
+            ),
             layout.generated_env, layout.secrets_env,
             profiles=profiles, secret_values=_secret_values(effective),
         )
@@ -729,10 +841,12 @@ def _start_compose(
     search_enabled: bool,
     dry_run: bool,
     endpoints: Mapping[str, str] | None = None,
+    root: Path | None = None,
 ) -> dict[str, Any]:
     orchestrator_base = (endpoints or {}).get("orchestrator", "http://127.0.0.1:8080")
     if dry_run:
         return {"status": "planned"}
+    project_root = root or _project_root()
     _step("Building application images (orchestrator, sync-worker, frontend)...")
     compose.build()
     _step("Starting core services...")
@@ -875,12 +989,35 @@ def _start_compose(
                 )
                 compose.stop_service("vllm-ocr")
                 disable_role("ocr")
+        cluster = _cluster_mode(generated) == "dual"
+        if cluster:
+            # Node 2 first: the head's rendezvous waits for the worker, and a
+            # sync/start failure here must surface as itself, not as a head
+            # readiness timeout.
+            _step("cluster: preparing the worker host (scripts/cluster-sync.sh)...")
+            _run_cluster_script(project_root, "cluster-sync.sh", reporter=_step, timeout=3600.0)
+            _step("cluster: starting the vLLM worker (scripts/cluster-worker.sh start)...")
+            _run_cluster_script(project_root, "cluster-worker.sh", "start", reporter=_step, timeout=300.0)
         try:
+            if cluster:
+                _step(
+                    "cluster: starting vLLM head (node-rank 0) on "
+                    f"{generated.get('CLUSTER_HEAD_IP', '?')}:{generated.get('CLUSTER_MASTER_PORT', '?')}; "
+                    f"the worker on {generated.get('CLUSTER_WORKER_IP', '?')} must be running "
+                    "(scripts/cluster-worker.sh start)"
+                )
             _step("Starting the main model (vllm) - this is the longest step...")
             compose.up_service("vllm")
             compose.wait_service("vllm", timeout=2400.0, reporter=_step)
             record_probe("main", generated["OPENAI_BASE_URL"], generated["MAIN_MODEL"])
-        except TechSaraError:
+        except TechSaraError as exc:
+            if cluster:
+                # The safer-context retry recreates only the head; it cannot
+                # help when the worker is missing, unreachable, or mismatched.
+                raise TechSaraError(
+                    f"the two-node vLLM head did not become ready ({exc}). Check both nodes with "
+                    "scripts/cluster-status.sh and the worker output with scripts/cluster-logs.sh worker"
+                ) from exc
             if not profile.startup_retry_context:
                 raise
             retry_context = profile.startup_retry_context
@@ -1034,9 +1171,20 @@ def _cmd_up(args: argparse.Namespace, *, root: Path) -> int:
             layout, hardware, profile, installs, **configuration_options,
         )
         publish_model_ports = _yes(generated.get("TECHSARA_PUBLISH_MODEL_PORTS"))
+        cluster_mode = _cluster_mode(generated)
+        cluster_line = _cluster_summary(profile, generated)
+        if cluster_line:
+            _step(cluster_line)
         compose_files = _compose_files(
-            root, hardware, profile, publish_model_ports=publish_model_ports
+            root, hardware, profile,
+            publish_model_ports=publish_model_ports, cluster_mode=cluster_mode,
         )
+        if cluster_mode == "dual" and not publish_model_ports:
+            _step(
+                "cluster: PUBLISH_MODEL_PORTS is off, so the vLLM head API binds to the Docker bridge "
+                f"gateway {generated.get('CLUSTER_API_BIND_ADDRESS', '?')}:{generated.get('VLLM_PORT', '?')} "
+                "(reachable by this host's containers only), not to a loopback-published port"
+            )
         profiles = _compose_profiles(profile, user_env, skip_ocr=args.skip_ocr)
         compose = ComposeManager(
             root, compose_files, layout.generated_env, layout.secrets_env,
@@ -1054,7 +1202,7 @@ def _cmd_up(args: argparse.Namespace, *, root: Path) -> int:
         result = _start_compose(
             compose, profile, generated, salesforce_ready=salesforce_ready,
             search_enabled="search" in profiles, dry_run=args.dry_run,
-            endpoints=endpoints,
+            endpoints=endpoints, root=root,
         )
         combined_capability_results = list(capability_results)
         docker_capability_results = result.get("capability_results", [])
@@ -1093,6 +1241,7 @@ def _cmd_up(args: argparse.Namespace, *, root: Path) -> int:
             "status": "planned" if args.dry_run else "running",
             "profile": profile.id,
             "hardware_profile": profile.hardware_profile_id,
+            "cluster_mode": cluster_mode,
             "compose_files": [str(path.relative_to(root)) for path in compose_files],
             "compose_profiles": profiles,
             "compose_command": compose.command("up", "-d"),
@@ -1185,6 +1334,20 @@ def _cmd_down(args: argparse.Namespace, *, root: Path) -> int:
             print(f"Would run: {compose.display_command('down', '--timeout', '120')}")
         else:
             compose.down()
+    if compose and _recorded_cluster_mode(layout) == "dual":
+        # The worker on Node 2 belongs to this deployment too. Its host may
+        # already be off, so failing to reach it is a warning, not an error.
+        if args.dry_run:
+            print("Would run: scripts/cluster-worker.sh down")
+        else:
+            try:
+                _run_cluster_script(root, "cluster-worker.sh", "down", reporter=_step, timeout=300.0)
+                print("Stopped the vLLM worker on the second DGX Spark.")
+            except TechSaraError as exc:
+                print(
+                    f"Warning: could not stop the vLLM worker on the second DGX Spark ({exc}); "
+                    "it may be powered off, or stop it later with scripts/cluster-worker.sh down"
+                )
     process = ProcessManager(root, layout.runtime_dir)
     stopped = process.stop_all(dry_run=args.dry_run)
 
@@ -1363,6 +1526,19 @@ def _cmd_status(args: argparse.Namespace, *, root: Path) -> int:
     else:
         print("  unknown")
 
+    cluster_mode = str(state.get("cluster_mode") or "single") if isinstance(state, dict) else "single"
+    cluster_env = parse_env_file(layout.generated_env)
+    if cluster_mode == "dual":
+        print(
+            f"\nCluster mode: dual (head {cluster_env.get('CLUSTER_HEAD_IP') or 'unknown'}, "
+            f"worker {cluster_env.get('CLUSTER_WORKER_IP') or 'unknown'})"
+        )
+    else:
+        print("\nCluster mode: single")
+    cluster_reason = (cluster_env.get("TECHSARA_CLUSTER_REASON") or "").strip()
+    if cluster_reason:
+        print(f"  {cluster_reason}")
+
     capability_lines = _capability_summary(layout)
     print("\nRecorded capability probes:")
     for line in capability_lines or ["  none recorded"]:
@@ -1414,6 +1590,51 @@ def _reachable_host(host: str, port: int = 443, *, timeout: float = 4.0) -> bool
             return True
     except OSError:
         return False
+
+
+def _doctor_cluster_checks(
+    user_env: Mapping[str, str],
+    checks: list[tuple[str, bool, str]],
+    notes: list[str],
+) -> None:
+    """Read-only probes of the RoCE links and the worker host on a DGX Spark."""
+    try:
+        mode = resolve_cluster_mode(user_env)
+    except TechSaraError as exc:
+        checks.append(("Cluster mode", False, str(exc)))
+        return
+    if mode == "single":
+        notes.append("Cluster: CLUSTER_MODE=single in .env, so the second DGX Spark was not probed.")
+        return
+    discovery = environment_module.CLUSTER_DISCOVERY
+    worker_ip = (user_env.get("CLUSTER_WORKER_IP") or "").strip()
+    if worker_ip and (user_env.get("CLUSTER_HEAD_IP") or "").strip():
+        notes.append(f"Cluster: CLUSTER_HEAD_IP/CLUSTER_WORKER_IP are set in .env; discovery is skipped for {worker_ip}.")
+    else:
+        peer = discover_cluster_peer(discovery=discovery)
+        checks.append((
+            "Cluster RoCE links",
+            bool(peer.links),
+            "No interface is up with an IPv4 address and an RDMA device; ./techsara up runs single-node.",
+        ))
+        if peer.links:
+            checks.append((
+                "Cluster peer discovered",
+                peer.found,
+                f"{peer.failure}; ./techsara up runs single-node.",
+            ))
+        worker_ip = peer.worker_ip if peer.found else ""
+    if not worker_ip:
+        return
+    target = (user_env.get("CLUSTER_WORKER_SSH") or "").strip() or discovery.worker_ssh(worker_ip)
+    report = discovery.preflight(target)
+    checks.append((
+        "Cluster worker preflight",
+        report.ok,
+        f"{report.detail}; set up key auth for {target} or CLUSTER_MODE=single in .env.",
+    ))
+    if report.ok:
+        notes.append(f"Cluster: second DGX Spark {report.hostname} at {worker_ip} ({target}) is ready for dual mode.")
 
 
 def _cmd_doctor(args: argparse.Namespace, *, root: Path) -> int:
@@ -1557,6 +1778,10 @@ def _cmd_doctor(args: argparse.Namespace, *, root: Path) -> int:
                 _reachable_host(host),
                 f"{host} is unreachable; first-run downloads will fail. Use --offline with a warm cache.",
             ))
+
+    # --- second DGX Spark (non-blocking; single-node always works) ----------
+    if hardware.dgx_spark:
+        _doctor_cluster_checks(user_env, checks, notes)
 
     # --- resolved configuration ---------------------------------------------
     profile = _load_profile(layout)
