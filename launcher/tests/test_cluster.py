@@ -42,6 +42,11 @@ from techsara_cli.errors import TechSaraError
 HEAD_IP = "192.168.100.1"
 WORKER_IP = "192.168.100.2"
 STARTUP_ARGUMENTS = ("--quantization", "modelopt", "--attention-backend", "flashinfer")
+#: What the launcher hands down for a window past the model's native one.
+ROPE_OVERRIDE = (
+    '--hf-overrides \'{"text_config":{"rope_parameters":{"rope_type":"yarn","factor":3.2,'
+    '"original_max_position_embeddings":262144}}}\''
+)
 
 IP_ADDR_JSON = json.dumps(
     [
@@ -281,6 +286,48 @@ class EngineArgumentTests(unittest.TestCase):
             "--max-num-batched-tokens 8192 --tensor-parallel-size 2 --pipeline-parallel-size 1 "
             "--distributed-executor-backend mp --nnodes 2 --master-addr 192.168.100.1 --master-port 29501 "
             "--distributed-timeout-seconds 300",
+        )
+
+    def test_the_rope_override_rides_beside_max_model_len_in_the_one_shared_string(self) -> None:
+        """An extended window and the YaRN argument that makes it real, together.
+
+        Both nodes interpolate CLUSTER_ENGINE_ARGS verbatim, so the override
+        has to live in this string or the worker would build a different rope
+        than the head.
+        """
+        values = resolve(dual(), context=838860, rope_override=ROPE_OVERRIDE)
+        engine = values["CLUSTER_ENGINE_ARGS"]
+        self.assertTrue(
+            engine.startswith(f"--max-model-len 838860 {ROPE_OVERRIDE} --gpu-memory-utilization 0.30 "),
+            engine,
+        )
+        argv = shlex.split(engine)
+        self.assertEqual(
+            argv[argv.index("--hf-overrides") + 1],
+            '{"text_config":{"rope_parameters":{"rope_type":"yarn","factor":3.2,'
+            '"original_max_position_embeddings":262144}}}',
+        )
+        self.assertEqual(argv.count("--hf-overrides"), 1)
+        self.assertNotIn("  ", engine)
+        # Whitespace-only input adds nothing rather than a stray argument.
+        self.assertEqual(resolve(dual(), context=838860, rope_override="   ")["CLUSTER_ENGINE_ARGS"],
+                         resolve(dual(), context=838860)["CLUSTER_ENGINE_ARGS"])
+
+    def test_no_override_leaves_the_engine_line_exactly_as_it_was(self) -> None:
+        self.assertNotIn("--hf-overrides", resolve(dual())["CLUSTER_ENGINE_ARGS"])
+        self.assertNotIn(
+            "--hf-overrides",
+            build_engine_arguments(
+                context=262144,
+                gpu_memory_utilization="0.30",
+                startup_arguments=STARTUP_ARGUMENTS,
+                speculative_config="",
+                max_num_batched_tokens=8192,
+                tensor_parallel_size=2,
+                pipeline_parallel_size=1,
+                head_ip=HEAD_IP,
+                master_port=29501,
+            ),
         )
 
     def test_engine_arguments_are_shell_splittable_with_json_as_one_element(self) -> None:

@@ -145,3 +145,108 @@ export function breakdownTotal(
   // already excluded from the usable budget this total is compared with.
   return rows.reduce((sum, r) => (r.heldBack ? sum : sum + r.tokens), 0);
 }
+
+/* -------------------------------------------------------------------------
+ * "Compact now" — what the button may claim before it is pressed.
+ *
+ * The control used to look equally actionable whether or not anything could
+ * be folded, and said nothing lasting once it had run. The counts below come
+ * from the server (the summary endpoint, and the compact response itself), so
+ * the label can only ever promise what the button will actually do.
+ * ---------------------------------------------------------------------- */
+
+/** The server's answer to "what would a compaction fold right now?". */
+export interface FoldableCounts {
+  /** Turns an on-demand compaction would fold at this moment. */
+  foldableTurns: number;
+  /** Turns in the conversation, folded or not. */
+  totalTurns: number;
+}
+
+/**
+ * Read the counts off a server payload — the summary GET or the compact POST.
+ *
+ * Returns null for anything it cannot trust (missing fields, an older
+ * orchestrator, a mock response, garbage). Null means UNKNOWN, and unknown
+ * deliberately keeps the button enabled: a server that cannot answer must not
+ * be able to disable a control that still works.
+ */
+export function readFoldableCounts(body: unknown): FoldableCounts | null {
+  if (!body || typeof body !== 'object') return null;
+  const raw = body as Record<string, unknown>;
+  const foldable = raw.foldable_turns;
+  const total = raw.total_turns;
+  if (typeof foldable !== 'number' || !Number.isFinite(foldable)) return null;
+  if (typeof total !== 'number' || !Number.isFinite(total)) return null;
+  if (foldable < 0 || total < 0) return null;
+  return {
+    foldableTurns: Math.floor(foldable),
+    totalTurns: Math.floor(total),
+  };
+}
+
+export interface CompactPlanInput {
+  /** Turns that would be folded now; null when the server has not said. */
+  foldable: number | null;
+  /** Turns the last successful compaction folded, this session. */
+  lastFolded?: number | null;
+  /** A compaction request is in flight. */
+  compacting?: boolean;
+  /** The host already forbids it — no chat open, or a stream is running. */
+  blocked?: boolean;
+}
+
+export interface CompactPlan {
+  label: string;
+  disabled: boolean;
+  /** The line under the button: what it will do, or why it cannot. */
+  hint: string | null;
+  /** Lasting record of the last compaction; null until one succeeds. */
+  folded: string | null;
+  /** Whether to offer the way back into the existing SummaryPanel. */
+  showSummaryLink: boolean;
+  summaryLabel: string;
+}
+
+/** Why the button is dead when there is genuinely nothing to fold. */
+export const NOTHING_TO_COMPACT =
+  'Nothing to compact yet — earlier turns are folded automatically as the window fills.';
+
+/** "1 earlier message" / "12 earlier messages". */
+export function earlierMessages(count: number): string {
+  return `${count} earlier message${count === 1 ? '' : 's'}`;
+}
+
+/**
+ * Everything the popover renders about compaction, decided here so it is
+ * testable in node and the component stays a shell.
+ */
+export function compactPlan({
+  foldable,
+  lastFolded = null,
+  compacting = false,
+  blocked = false,
+}: CompactPlanInput): CompactPlan {
+  const known = typeof foldable === 'number' && Number.isFinite(foldable);
+  const count = known ? Math.max(0, Math.floor(foldable as number)) : null;
+  const nothing = count === 0;
+
+  const folded =
+    typeof lastFolded === 'number' && lastFolded > 0
+      ? `Compacted ${earlierMessages(Math.floor(lastFolded))}`
+      : null;
+
+  return {
+    label: compacting ? 'Compacting…' : 'Compact now',
+    disabled: blocked || compacting || nothing,
+    hint: nothing
+      ? NOTHING_TO_COMPACT
+      : count !== null
+        ? `Folds ${earlierMessages(count)} into a summary.`
+        : // Unknown: promise nothing rather than guess, and stay clickable.
+          null,
+    folded,
+    showSummaryLink: folded !== null,
+    summaryLabel: 'See what was kept',
+  };
+}

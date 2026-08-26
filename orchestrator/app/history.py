@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import re
 import uuid
-from typing import List, Literal, Optional
+from typing import List, Literal, Optional, Sequence
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict
@@ -377,21 +377,75 @@ async def generate_conversation_title(
     }
 
 
+def foldable_counts(
+    conversation_id: str, history: Optional[Sequence[dict]] = None
+) -> dict:
+    """How many turns an on-demand compaction would fold RIGHT NOW.
+
+    The UI needs this BEFORE the user presses "Compact now", so the button can
+    say what it will do instead of looking equally clickable on a conversation
+    with nothing older to fold. It is computed from exactly the inputs
+    `POST /chat/compact` uses — `compaction.split_history`, the stored
+    `covers_through` row, and the "never fold the turn being answered" rule —
+    so the number advertised cannot disagree with what the button does.
+
+    `history` mirrors that endpoint's own resolution: the caller's message list
+    when it has one, the stored messages otherwise.
+
+    Degrades to zeros on any error. This is decoration on a read-only endpoint
+    and must never be a reason to fail it.
+    """
+    try:
+        from . import compaction
+
+        rows = history if history is not None else db.list_messages(conversation_id)
+        # Blank turns are dropped by EVERY path that actually folds — the
+        # frontend filters them out of `POST /chat/compact`, and the automatic
+        # path builds its history from `ChatRequest.history_messages`, which
+        # applies the same `content and content.strip()` rule. `covers_through`
+        # is therefore stored against a blank-filtered turn list, so counting
+        # blanks here would both inflate the advertised number and compare
+        # `covers_through` against a different base.
+        _, turns = compaction.split_history(
+            [
+                {"role": m["role"], "content": str(m.get("content") or "")}
+                for m in rows
+                if str(m.get("content") or "").strip()
+            ]
+        )
+        total = len(turns)
+        row = db.get_summary(conversation_id)
+        covers = max(0, min(row["covers_through"] if row else 0, total))
+        # compaction.compact(force=True): fold everything except the turn
+        # currently being answered.
+        boundary = max(0, total - 1)
+        return {"foldable_turns": max(0, boundary - covers), "total_turns": total}
+    except Exception:
+        return {"foldable_turns": 0, "total_turns": 0}
+
+
 @router.get("/conversations/{conversation_id}/summary")
 def get_summary(
     conversation_id: str, user: UserRow = Depends(require_user)
 ) -> dict:
     """The rolling summary of compacted turns — what the assistant still
-    remembers about the older part of this conversation (read-only)."""
+    remembers about the older part of this conversation (read-only).
+
+    Also reports what a compaction would fold now (`foldable_turns` /
+    `total_turns`), additively: it is the one call the meter popover already
+    makes, so the "Compact now" button can be honest without a second request.
+    """
     if db.get_conversation(int(user["id"]), conversation_id) is None:
         raise _not_found()
+    counts = foldable_counts(conversation_id)
     row = db.get_summary(conversation_id)
     if row is None:
-        return {"summary": None, "covers_through": 0}
+        return {"summary": None, "covers_through": 0, **counts}
     return {
         "summary": row["summary"],
         "covers_through": row["covers_through"],
         "updated_at": row["updated_at"],
+        **counts,
     }
 
 

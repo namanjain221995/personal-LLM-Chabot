@@ -429,7 +429,7 @@ the keys that matter most — every key is documented in the example file:
 | Optional services | `SEARCH_ENABLED`, `SEARCH_PROVIDER=searxng|tavily|brave`, `TAVILY_API_KEY`, `BRAVE_API_KEY`, `COMPOSE_PROFILES=search,admin` |
 | Two-node cluster | `CLUSTER_MODE=auto|single|dual`; optional overrides `CLUSTER_HEAD_IP`, `CLUSTER_WORKER_IP`, `_2` variants, `CLUSTER_WORKER_SSH`, `CLUSTER_MASTER_PORT=29501`, `CLUSTER_TENSOR_PARALLEL_SIZE=2`, `CLUSTER_PIPELINE_PARALLEL_SIZE=1`, `CLUSTER_GPU_MEMORY_UTILIZATION=0.30`, `CLUSTER_KV_CACHE_MEMORY_GIB=16`, `CLUSTER_NCCL_*`, `CLUSTER_SPECULATIVE_CONFIG`, `CLUSTER_MAX_NUM_BATCHED_TOKENS` |
 | Search / fetch / repos | `SEARCH_MAX_RESULTS`, `SEARCH_SOURCE_CHAR_BUDGET`, `SEARCH_RATE_PER_MIN`, `SEARCH_CACHE_TTL`, `FETCH_TIMEOUT_MS`, `FETCH_MAX_BYTES`, `URL_ANALYSIS_ENABLED`, `URL_MAX_PAGES`, `REPO_ANALYSIS_ENABLED`, `REPO_MAX_MB`, `REPO_MAX_FILES`, `WORKSPACE_TTL_HOURS=24`, `WORKSPACE_QUOTA_GB=20` |
-| Model window | `MODEL_MAX_OUTPUT=8192`, `CONTEXT_SAFETY_MARGIN`, `TOKENIZE_TIMEOUT`, `MAIN_MODEL_DEFAULT_MAX_OUTPUT_TOKENS`, `MAIN_MODEL_HIGH_MAX_OUTPUT_TOKENS=16384`, `MAIN_MODEL_CONTEXT_SAFETY_MARGIN=8192` (262144 − 16384 − 8192 = **237,568** usable input tokens on DGX) |
+| Model window | **`MAIN_MODEL_MAX_LEN`** — the served context window (see [§9.1](#91-the-context-window)); `MODEL_MAX_OUTPUT=8192`, `CONTEXT_SAFETY_MARGIN`, `TOKENIZE_TIMEOUT`, `MAIN_MODEL_DEFAULT_MAX_OUTPUT_TOKENS`, `MAIN_MODEL_HIGH_MAX_OUTPUT_TOKENS=16384`, `MAIN_MODEL_CONTEXT_SAFETY_MARGIN=8192`; `GEN_WALL_CLOCK_S=1800` (raise it alongside a very large window) |
 | Salesforce Intelligence | `SALESFORCE_INTELLIGENCE_MODE_ENABLED`, `SALESFORCE_CONTEXTUAL_CLARIFICATION_ENABLED`, `SALESFORCE_STARTER_CARD_ENABLED`, `SALESFORCE_MAX_CLARIFICATION_ROUNDS=2`, `SALESFORCE_MULTI_SELECT_CLARIFICATION`, `CLARIFY_MODE=ambiguous|always|off`, `ROUTER_INPUT_CHAR_CAP`, `EMBED_INPUT_CHAR_CAP` |
 | Brain / learning | `BRAIN_ENABLED=true`, `BRAIN_MAX_CHARS`, `LEARNED_EXAMPLES_ENABLED=true`, `LEARNED_EXAMPLES_K=2` |
 | Memory / context | `CONTEXT_WARN_THRESHOLD=0.60`, `CONTEXT_BG_COMPACT_THRESHOLD=0.70`, `CONTEXT_COMPACT_THRESHOLD=0.80`, `KEEP_RECENT_TURNS=8`, `SUMMARY_MAX_TOKENS=2000`, `MIN_OUTPUT_FLOOR=1024`, `SEMANTIC_RECALL_ENABLED`, `RETRIEVE_TOP_K=6`, `CONTEXT_METER_ENABLED` |
@@ -444,6 +444,50 @@ The complete list of orchestrator settings with defaults is
 explained in [`docs/CONFIG.md`](docs/CONFIG.md).
 
 ---
+
+### 9.1 The context window
+
+`MAIN_MODEL_MAX_LEN` in `.env` is the one knob for the served window. Leave it
+unset and the profile's own value is used (262,144 on DGX Spark). Set it larger
+and the launcher enables **YaRN** rope scaling automatically — it reads the
+model's real geometry, computes the factor, and passes the override to both
+nodes:
+
+```text
+MAIN_MODEL_MAX_LEN=800000     # -> "Context: 800,000 tokens (model is natively
+                              #     262,144; YaRN factor 3.06 enabled)"
+```
+
+Measured on this deployment (2026-08-25):
+
+| | Native | Extended |
+|---|---|---|
+| Served window | 262,144 | **800,000** (max input 775,424) |
+| Rope | `default` | `yarn`, factor 3.06, `mrope_section` preserved |
+| KV pool / node | 933,232 tokens | 967,766 tokens (1.21× at full length) |
+| Short-prompt A/B (10 deterministic prompts) | baseline | 5/10 byte-identical, none worse, `4871*39` newly **correct** |
+| Needle recall at 20K / 100K | found | found, same latency |
+
+Three honest costs before you raise it:
+
+1. **A cold single prompt is slow.** Prefill measures `7.34e-4·n + 1.93e-9·n²`
+   seconds on this cluster (fit to five points, ±0.1 s): 262K ≈ 5.4 min,
+   400K ≈ 10 min, **800K ≈ 30 min**. That is why `GEN_WALL_CLOCK_S` is raised
+   to 4200 alongside it — the 1800 s default would kill the request just as it
+   finished prefilling. A conversation that *grows* to 800K is unaffected:
+   prefix caching means each turn only prefills the new tokens.
+2. **Concurrency at full length drops** to 1.21× — one 800K request at a time.
+   Ordinary chats are unaffected, because vLLM allocates KV blocks on demand
+   (a 657-token chat uses 657 tokens, not 800,000).
+3. **YaRN is static**, so the scaling applies at every length. The A/B above
+   found no degradation, but it is a 10-prompt probe, not a benchmark.
+
+The launcher refuses a window the KV pool provably cannot hold, with the
+arithmetic and the exact `CLUSTER_KV_CACHE_MEMORY_GIB` you would need. The
+ceiling is 4× native (1,048,576) and, at the default 16 GiB KV budget,
+~922,000 tokens. Set `MAIN_MODEL_MAX_LEN=262144` to serve the model exactly as
+it was trained.
+
 
 ## 10. How a chat message is answered
 

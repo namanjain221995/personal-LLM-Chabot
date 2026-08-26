@@ -7,15 +7,28 @@
  * Gray under 60%, amber 60–84%, red at 85%+, with a gentle pulse from 95%.
  * Click for a breakdown and a "Compact now" action.
  *
+ * The compact action is only as honest as what it knows: `foldableTurns` is
+ * the server's count of what a compaction would fold RIGHT NOW, so the button
+ * can say what it will do — or go dead with a reason — instead of looking
+ * equally clickable on a conversation with nothing older to fold. Undefined
+ * or null means the count is unknown, and unknown keeps the old behaviour.
+ *
  * The popover is portalled to <body>: the composer is inside transformed
  * ancestors, which would otherwise become the containing block for
  * position:fixed and mis-place it (the bug that hit the ⋯ menu).
  */
 
-import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from 'react';
 import { createPortal } from 'react-dom';
 import {
   breakdownTotal,
+  compactPlan,
   meterColor,
   type MeterView,
 } from '@/lib/contextMeter';
@@ -30,6 +43,14 @@ interface ContextMeterProps {
   compacting: boolean;
   onCompactNow: () => void;
   compactDisabled?: boolean;
+  /** Turns a compaction would fold now. null/undefined = not known yet. */
+  foldableTurns?: number | null;
+  /** Turns the last successful compaction folded, for the lasting line. */
+  lastFoldedTurns?: number | null;
+  /** Fired when the popover opens or closes, so the host can fetch lazily. */
+  onOpenChange?: (open: boolean) => void;
+  /** Opens the existing SummaryPanel — this component builds no new surface. */
+  onSeeSummary?: () => void;
 }
 
 export function ContextMeter({
@@ -37,11 +58,36 @@ export function ContextMeter({
   compacting,
   onCompactNow,
   compactDisabled = false,
+  foldableTurns = null,
+  lastFoldedTurns = null,
+  onOpenChange,
+  onSeeSummary,
 }: ContextMeterProps) {
   const [open, setOpen] = useState(false);
   const [pos, setPos] = useState<{ left: number; bottom: number } | null>(null);
   const buttonRef = useRef<HTMLButtonElement>(null);
+  const popoverRef = useRef<HTMLDivElement>(null);
   const color = meterColor(view.state);
+
+  // Every word and every enabled/disabled decision comes from the lib module,
+  // so the wording is tested in node rather than asserted against a DOM.
+  const plan = compactPlan({
+    foldable: foldableTurns ?? null,
+    lastFolded: lastFoldedTurns,
+    compacting,
+    blocked: compactDisabled,
+  });
+
+  // Notifying on every open/close keeps the fetch lazy: the host asks the
+  // server what is foldable when the popover opens, never while typing. Held
+  // in a ref so the identity of `setOpenAnd` is stable and the Escape /
+  // outside-click effect below does not re-subscribe on every render.
+  const onOpenChangeRef = useRef(onOpenChange);
+  onOpenChangeRef.current = onOpenChange;
+  const setOpenAnd = useCallback((next: boolean) => {
+    setOpen(next);
+    onOpenChangeRef.current?.(next);
+  }, []);
 
   useLayoutEffect(() => {
     if (!open) return;
@@ -62,11 +108,21 @@ export function ContextMeter({
         // generating" — closing this popover must not also kill the answer.
         e.preventDefault();
         e.stopPropagation();
-        setOpen(false);
+        setOpenAnd(false);
       }
     }
     function onDown(e: PointerEvent) {
-      if (!buttonRef.current?.contains(e.target as Node)) setOpen(false);
+      // The popover is PORTALLED, so it is not inside buttonRef — without
+      // checking it too, a pointerdown on the popover's own controls closed
+      // the popover before the click could land, and "Compact now" could not
+      // be pressed at all.
+      const target = e.target as Node;
+      if (
+        !buttonRef.current?.contains(target) &&
+        !popoverRef.current?.contains(target)
+      ) {
+        setOpenAnd(false);
+      }
     }
     document.addEventListener('keydown', onKey);
     document.addEventListener('pointerdown', onDown);
@@ -74,7 +130,7 @@ export function ContextMeter({
       document.removeEventListener('keydown', onKey);
       document.removeEventListener('pointerdown', onDown);
     };
-  }, [open]);
+  }, [open, setOpenAnd]);
 
   const dash = CIRCUMFERENCE * Math.min(1, Math.max(0, view.fraction));
   const rows = view.breakdown;
@@ -96,7 +152,7 @@ export function ContextMeter({
       <button
         ref={buttonRef}
         type="button"
-        onClick={() => setOpen((v) => !v)}
+        onClick={() => setOpenAnd(!open)}
         aria-label={`Context ${view.percent}% used`}
         aria-expanded={open}
         title={`Context ${view.percent}% used`}
@@ -141,6 +197,7 @@ export function ContextMeter({
         typeof document !== 'undefined' &&
         createPortal(
           <div
+            ref={popoverRef}
             role="dialog"
             aria-label="Context usage"
             className="fixed z-[60] w-[280px] rounded-ts border border-border bg-surface p-3 shadow-2xl"
@@ -189,17 +246,43 @@ export function ContextMeter({
                 {view.usableBudget.toLocaleString()}
               </span>
             </div>
+            {/* The popover deliberately stays OPEN on compact: the result is
+                a line in here, and closing would hide the one lasting piece
+                of feedback this action produces. */}
             <button
               type="button"
-              onClick={() => {
-                setOpen(false);
-                onCompactNow();
-              }}
-              disabled={compactDisabled || compacting}
-              className="mt-3 w-full rounded-lg border border-border px-2.5 py-1.5 text-xs font-medium transition-colors duration-ts hover:bg-surface-2 disabled:cursor-not-allowed disabled:opacity-40"
+              onClick={onCompactNow}
+              disabled={plan.disabled}
+              aria-describedby={plan.hint ? 'ctx-compact-hint' : undefined}
+              className="mt-3 w-full rounded-lg border border-border px-2.5 py-1.5 text-xs font-medium transition-colors duration-ts hover:bg-surface-2 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent"
             >
-              Compact now
+              {plan.label}
             </button>
+            {plan.hint && (
+              <p
+                id="ctx-compact-hint"
+                className="mt-1.5 text-[11px] leading-snug text-faint"
+              >
+                {plan.hint}
+              </p>
+            )}
+            {plan.folded && (
+              <div className="mt-2.5 border-t border-border pt-2">
+                <p className="text-[11px] text-muted">{plan.folded}</p>
+                {plan.showSummaryLink && onSeeSummary && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setOpenAnd(false);
+                      onSeeSummary();
+                    }}
+                    className="mt-1 text-[11px] font-medium text-accent underline underline-offset-2 transition-colors duration-ts hover:text-ink"
+                  >
+                    {plan.summaryLabel}
+                  </button>
+                )}
+              </div>
+            )}
           </div>,
           document.body,
         )}

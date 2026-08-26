@@ -24,9 +24,11 @@ from unittest.mock import patch
 
 try:
     from .support import GIB, REPO_ROOT, fake_discovery
+    from .test_model_shape import NESTED_CONFIG
     from .test_profiles import cpu, mac, nvidia
 except ImportError:  # `unittest discover -s launcher/tests` imports top-level modules.
     from support import GIB, REPO_ROOT, fake_discovery
+    from test_model_shape import NESTED_CONFIG
     from test_profiles import cpu, mac, nvidia
 
 from techsara_cli import environment
@@ -109,15 +111,29 @@ class ComposeOverlayValidationTests(unittest.TestCase):
         self.addCleanup(discovery.stop)
 
     def _render(
-        self, hardware: HardwareInfo, user_environment: dict | None = None
+        self,
+        hardware: HardwareInfo,
+        user_environment: dict | None = None,
+        *,
+        model_config: dict | None = None,
     ) -> tuple[SelectedProfile, dict]:
-        """Resolve one fixture's Compose plan through Docker Compose itself."""
+        """Resolve one fixture's Compose plan through Docker Compose itself.
+
+        ``model_config`` materialises a ``config.json`` for the main model, the
+        way a completed download would, so the launcher can read the geometry a
+        user-owned context window is measured against.
+        """
         with tempfile.TemporaryDirectory(prefix="techsara-overlay-") as temporary:
             workspace = Path(temporary)
             cache_root = workspace / "models"
             cache_root.mkdir(parents=True)
             hardware = replace(hardware, selected_cache_path=str(cache_root))
             profile = select_profile(hardware, REPO_ROOT)
+            if model_config is not None and profile.main_model:
+                main = profile.main_model
+                directory = cache_root / "repos" / f"{slug_model(main.id)}--{main.revision[:12]}"
+                directory.mkdir(parents=True, exist_ok=True)
+                (directory / "config.json").write_text(json.dumps(model_config), encoding="utf-8")
             layout = RuntimeLayout.for_project(REPO_ROOT)
             external = (
                 {"OPENAI_BASE_URL": "http://host.docker.internal:9099/v1", "MAIN_MODEL": "fixture-external"}
@@ -267,6 +283,71 @@ class ComposeOverlayValidationTests(unittest.TestCase):
         self.assertIn("--served-model-name Qwen/Qwen3.8-27B-NVFP4", command)
         self.assertIn("vllm-router", rendered["services"])
         self.assertIn("vllm-ocr", rendered["services"])
+
+    def test_an_extended_window_reaches_the_dgx_command_line_as_one_argv_element(self) -> None:
+        """MAIN_MODEL_MAX_LEN past the native window: --hf-overrides, intact.
+
+        The override is a single-quoted JSON blob travelling through a folded
+        YAML scalar, Compose interpolation, and Compose's shell-style split.
+        Anything that mangles it produces a vLLM argument parse error 30
+        minutes into a start-up, so it is proved with Compose itself.
+        """
+        _profile, rendered = self._render(
+            FIXTURES["dgx-spark"], {"MAIN_MODEL_MAX_LEN": "800000"}, model_config=NESTED_CONFIG
+        )
+        argv = list(rendered["services"]["vllm"]["command"])
+        window = argv.index("--max-model-len")
+        self.assertEqual(argv[window + 1], "800000")
+        # Immediately after the window it belongs to, and still one element.
+        self.assertEqual(argv[window + 2], "--hf-overrides")
+        self.assertEqual(argv.count("--hf-overrides"), 1)
+        parameters = json.loads(argv[window + 3])["text_config"]["rope_parameters"]
+        self.assertEqual(parameters["rope_type"], "yarn")
+        self.assertEqual(parameters["factor"], 3.06)
+        self.assertEqual(parameters["original_max_position_embeddings"], 262144)
+        self.assertEqual(parameters["mrope_section"], [11, 11, 10])
+        self.assertTrue(parameters["mrope_interleaved"])
+        # The speculative JSON is still whole, so nothing was re-split.
+        self.assertEqual(
+            argv[argv.index("--speculative-config") + 1],
+            '{"method":"mtp","num_speculative_tokens":1}',
+        )
+
+        # A window inside the native one folds the variable away completely.
+        _profile, native = self._render(FIXTURES["dgx-spark"], model_config=NESTED_CONFIG)
+        native_argv = list(native["services"]["vllm"]["command"])
+        self.assertNotIn("--hf-overrides", native_argv)
+        self.assertEqual(native_argv[native_argv.index("--max-model-len") + 2], "--gpu-memory-utilization")
+
+    def test_an_extended_window_reaches_both_cluster_nodes_through_the_shared_engine_args(self) -> None:
+        detectors = ClusterDetectors(
+            ifname_for_ip=lambda ip: {"192.168.100.1": "enP2p1s0f1np1"}.get(ip),
+            hcas_for_ifnames=lambda names: ["rocep1s0f1" for name in names if name == "enP2p1s0f1np1"],
+            docker_bridge_gateway=lambda: "172.17.0.1",
+        )
+        with (
+            patch.object(environment, "CLUSTER_DETECTORS", detectors),
+            patch.object(environment, "CLUSTER_DISCOVERY", fake_discovery()),
+        ):
+            _profile, rendered = self._render(
+                FIXTURES["dgx-spark"],
+                {
+                    "CLUSTER_MODE": "dual",
+                    "CLUSTER_HEAD_IP": "192.168.100.1",
+                    "CLUSTER_WORKER_IP": "192.168.100.2",
+                    # 838,860 tokens is 3.2x native and the widest window the
+                    # default 16 GiB per-node KV budget can hold at TP=2.
+                    "MAIN_MODEL_MAX_LEN": "838860",
+                },
+                model_config=NESTED_CONFIG,
+            )
+        argv = list(rendered["services"]["vllm"]["command"])
+        window = argv.index("--max-model-len")
+        self.assertEqual(argv[window + 1], "838860")
+        self.assertEqual(argv[window + 2], "--hf-overrides")
+        self.assertEqual(
+            json.loads(argv[window + 3])["text_config"]["rope_parameters"]["factor"], 3.2
+        )
 
     def test_every_host_bind_source_resolves_under_the_project_or_the_configured_cache(self) -> None:
         """No overlay may hard-code one developer's directory.
@@ -436,6 +517,26 @@ class ComposeOverlayValidationTests(unittest.TestCase):
             rendered["services"]["sync-worker"]["environment"]["EMBED_VIA"],
             "http://vllm-embed:30003/v1",
         )
+
+    def test_every_gpu_overlay_that_takes_a_window_also_takes_the_rope_override(self) -> None:
+        """A long window without its YaRN override is a start-up failure.
+
+        compose.nvidia.yaml once interpolated --max-model-len but not
+        MAIN_MODEL_ROPE_OVERRIDE, so an extended window on an nvidia-* profile
+        passed vLLM a length it had no rope for: the engine refuses with
+        "greater than the derived max_model_len" while the launcher had already
+        printed "YaRN factor N enabled". The narration is profile-independent,
+        so the delivery has to be too.
+        """
+        for name in ("compose.dgx-spark.yaml", "compose.nvidia.yaml"):
+            overlay = (REPO_ROOT / "compose" / name).read_text(encoding="utf-8")
+            window = overlay.count("--max-model-len ${MODEL_MAX_CONTEXT")
+            self.assertTrue(window, f"{name} no longer sets the main window")
+            self.assertIn(
+                "${MAIN_MODEL_ROPE_OVERRIDE:-}",
+                overlay,
+                f"{name} takes an extended --max-model-len but drops the rope override",
+            )
 
     def test_the_dgx_cluster_head_overlay_turns_vllm_into_node_rank_zero_on_the_host(self) -> None:
         """CLUSTER_MODE=dual: host networking, identical engine args, one JSON argv."""

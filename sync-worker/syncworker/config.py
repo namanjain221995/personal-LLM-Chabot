@@ -34,6 +34,12 @@ class Settings:
     embed_api_key: str = field(repr=False)
     sf_api_version: str
     config_path: str
+    #: IANA zone the typed views render DateTime columns in. Salesforce stores
+    #: UTC and displays in the reading user's zone, so this should be the org's
+    #: zone (User.TimeZoneSidKey) -- then a figure in an answer matches what the
+    #: same person sees in Salesforce. UTC means "do not convert", which is the
+    #: portable default and matches the pre-typed behaviour exactly.
+    sf_org_timezone: str
 
 
 def load_settings() -> Settings:
@@ -57,6 +63,7 @@ def load_settings() -> Settings:
         config_path=os.getenv(
             "SYNC_CONFIG_PATH", os.path.join(here, "..", "config.yaml")
         ),
+        sf_org_timezone=os.getenv("SF_ORG_TIMEZONE", "UTC").strip() or "UTC",
     )
 
 

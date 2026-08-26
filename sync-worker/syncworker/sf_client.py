@@ -186,8 +186,14 @@ class SalesforceClient:
             ) from None
         return resp
 
-    def describe_field_types(self, object_name: str) -> dict:
-        """{field name: Salesforce type} for fields visible to this user (cached)."""
+    def describe_field_map(self, object_name: str) -> dict:
+        """{field name: the full describe entry} for fields this user can see.
+
+        Cached per object per cycle. The whole entry is kept rather than just
+        the type because the typed views need `precision` and `scale` too --
+        this org has Number fields at scale 0, 1, 2, 4 and 6, and a fixed
+        DECIMAL(18,2) would silently truncate the ones past two.
+        """
         cache = getattr(self, "_describe_cache", None)
         if cache is None:
             cache = self._describe_cache = {}
@@ -196,9 +202,32 @@ class SalesforceClient:
                 "GET", f"/services/data/{self._v}/sobjects/{object_name}/describe"
             )
             cache[object_name] = {
-                f["name"]: f.get("type", "") for f in resp.json().get("fields", [])
+                f["name"]: f
+                for f in resp.json().get("fields", [])
+                if f.get("name")
             }
         return cache[object_name]
+
+    def describe_field_types(self, object_name: str) -> dict:
+        """{field name: Salesforce type} for fields visible to this user (cached).
+
+        Derived from `describe_fields` so there is still exactly one describe
+        call per object per cycle. Signature and return shape are unchanged;
+        every existing caller keeps working.
+        """
+        return {
+            name: field.get("type", "")
+            for name, field in self.describe_field_map(object_name).items()
+        }
+
+    def describe_field_specs(self, object_name: str) -> list:
+        """FieldSpec list for the typed-view generator (cached describe)."""
+        from .typemap import FieldSpec
+
+        return [
+            FieldSpec.from_describe(field)
+            for field in self.describe_field_map(object_name).values()
+        ]
 
     def describe_fields(self, object_name: str) -> set:
         """Field names actually visible to this user in this org (cached).

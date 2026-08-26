@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import base64
+import json
 import os
+import shlex
 import stat
 import tempfile
 import unittest
@@ -11,20 +13,25 @@ from unittest.mock import patch
 
 try:
     from .support import REPO_ROOT, fake_discovery
+    from .test_model_shape import FLAT_CONFIG, NESTED_CONFIG
     from .test_profiles import cpu, mac, nvidia
 except ImportError:  # `unittest discover -s launcher/tests` imports top-level modules.
     from support import REPO_ROOT, fake_discovery
+    from test_model_shape import FLAT_CONFIG, NESTED_CONFIG
     from test_profiles import cpu, mac, nvidia
 
 from techsara_cli import environment
 from techsara_cli.cluster import ClusterDetectors
 from techsara_cli.environment import (
+    MAIN_CONTEXT_RANGE,
     RuntimeLayout,
     _container_path,
     build_generated_environment,
     effective_user_environment,
     has_salesforce_credentials,
+    main_context_notices,
     prepare_local_secrets,
+    profile_context_length,
 )
 from techsara_cli.errors import TechSaraError
 from techsara_cli.model_manager import ModelInstall
@@ -615,6 +622,253 @@ class ClusterEnvironmentTests(EnvironmentCase):
             self._generate(profile, {"CLUSTER_MODE": "triple"})
         with self.assertRaisesRegex(TechSaraError, "CLUSTER_WORKER_IP is required"):
             self._generate(profile, {"CLUSTER_MODE": "dual", "CLUSTER_HEAD_IP": "192.168.100.1"})
+
+
+class MainContextWindowTests(EnvironmentCase):
+    """MAIN_MODEL_MAX_LEN: one user-owned knob, YaRN when it exceeds native."""
+
+    DUAL = {
+        "CLUSTER_MODE": "dual",
+        "CLUSTER_HEAD_IP": "192.168.100.1",
+        "CLUSTER_WORKER_IP": "192.168.100.2",
+    }
+    #: 800,000 / 262,144 rounded up to two decimals.
+    FACTOR_800K = 3.06
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.cache = self.root / "cache"
+        self.profile = select_profile(nvidia(128, dgx=True), REPO_ROOT)
+        self.detectors = ClusterDetectors(
+            ifname_for_ip=lambda ip: {"192.168.100.1": "enP2p1s0f1np1"}.get(ip),
+            hcas_for_ifnames=lambda names: ["rocep1s0f1" for name in names if name == "enP2p1s0f1np1"],
+            docker_bridge_gateway=lambda: "172.17.0.1",
+        )
+        patcher = patch.object(environment, "CLUSTER_DETECTORS", self.detectors)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _write_main_config(self, document: dict | None = NESTED_CONFIG) -> None:
+        """Materialise the main model's config.json where the install points."""
+        main = self.profile.main_model
+        directory = self.cache / "repos" / f"{main.key}--{main.revision[:12]}"
+        directory.mkdir(parents=True, exist_ok=True)
+        if document is not None:
+            (directory / "config.json").write_text(json.dumps(document), encoding="utf-8")
+
+    def _generate(self, user_environment: dict[str, str] | None = None) -> dict[str, str]:
+        return build_generated_environment(
+            self.layout,
+            self.profile,
+            self.installs(self.profile, self.cache),
+            cache_root=self.cache,
+            user_environment=user_environment or {},
+        )
+
+    def _notices(self, values: dict[str, str], generated: dict[str, str]) -> list[str]:
+        return main_context_notices(
+            values, generated, profile_context=profile_context_length(self.profile)
+        )
+
+    # -- the default: nothing changes -------------------------------------
+
+    def test_an_unset_window_keeps_the_profile_choice_and_still_emits_both_keys(self) -> None:
+        self._write_main_config()
+        generated = self._generate()
+        self.assertEqual(generated["MODEL_MAX_CONTEXT"], str(self.profile.context_length))
+        self.assertEqual(generated["MAIN_CONTEXT_LENGTH"], str(self.profile.context_length))
+        # Always emitted so the overlays interpolate deterministically.
+        self.assertEqual(generated["MAIN_MODEL_NATIVE_CONTEXT"], "262144")
+        self.assertEqual(generated["MAIN_MODEL_ROPE_OVERRIDE"], "")
+        self.assertEqual(generated["MAIN_MODEL_KV_BYTES_PER_TOKEN"], "32768")
+        self.assertEqual(self._notices({}, generated), [], "an ordinary window says nothing extra")
+
+    def test_an_unreadable_model_directory_falls_back_to_todays_behaviour(self) -> None:
+        generated = self._generate()  # no config.json was written
+        self.assertEqual(generated["MAIN_MODEL_NATIVE_CONTEXT"], "")
+        self.assertEqual(generated["MAIN_MODEL_ROPE_OVERRIDE"], "")
+        self.assertEqual(generated["MAIN_MODEL_KV_BYTES_PER_TOKEN"], "")
+        self.assertEqual(generated["MODEL_MAX_CONTEXT"], str(self.profile.context_length))
+        # An explicit window is still honoured; only the extension is unknown.
+        widened = self._generate({"MAIN_MODEL_MAX_LEN": "800000"})
+        self.assertEqual(widened["MODEL_MAX_CONTEXT"], "800000")
+        self.assertEqual(widened["MAIN_MODEL_ROPE_OVERRIDE"], "")
+
+    # -- the knob ----------------------------------------------------------
+
+    def test_the_knob_replaces_the_profile_window_in_every_derived_key(self) -> None:
+        self._write_main_config()
+        generated = self._generate({"MAIN_MODEL_MAX_LEN": "800000"})
+        for key in (
+            "MODEL_MAX_CONTEXT",
+            "DEFAULT_MAX_CONTEXT",
+            "REPORT_MAX_CONTEXT",
+            "MAIN_CONTEXT_LENGTH",
+        ):
+            with self.subTest(key=key):
+                self.assertEqual(generated[key], "800000")
+        # The router is the same model on this profile, so it moves too; a
+        # role with its own smaller limit does not.
+        self.assertEqual(generated["VISION_CONTEXT_LENGTH"], "800000")
+        self.assertEqual(
+            generated["EMBED_CONTEXT_LENGTH"], str(self.profile.embedding_model.context_limit)
+        )
+
+    def test_a_window_past_native_enables_yarn_with_the_exact_override(self) -> None:
+        self._write_main_config()
+        generated = self._generate({"MAIN_MODEL_MAX_LEN": "800000"})
+        self.assertEqual(generated["MAIN_MODEL_NATIVE_CONTEXT"], "262144")
+        override = generated["MAIN_MODEL_ROPE_OVERRIDE"]
+        argv = shlex.split(override)
+        self.assertEqual(argv[0], "--hf-overrides")
+        self.assertEqual(len(argv), 2, "the JSON must stay one argv element")
+        parameters = json.loads(argv[1])["text_config"]["rope_parameters"]
+        self.assertEqual(parameters["rope_type"], "yarn")
+        self.assertEqual(parameters["factor"], self.FACTOR_800K)
+        self.assertEqual(parameters["original_max_position_embeddings"], 262144)
+        self.assertEqual(parameters["mrope_section"], [11, 11, 10])
+        # A window inside the native one asks for no override at all.
+        self.assertEqual(self._generate({"MAIN_MODEL_MAX_LEN": "131072"})["MAIN_MODEL_ROPE_OVERRIDE"], "")
+
+    def test_beyond_four_times_native_is_refused(self) -> None:
+        # This model's 4x ceiling (1,048,576) is also the key's upper bound, so
+        # the refusal is proved on a model with a shorter native window.
+        self._write_main_config(FLAT_CONFIG)
+        with self.assertRaisesRegex(TechSaraError, "natively 32,768 tokens and 4x"):
+            self._generate({"MAIN_MODEL_MAX_LEN": str(32768 * 4 + 1)})
+        self.assertEqual(
+            self._generate({"MAIN_MODEL_MAX_LEN": str(32768 * 4)})["MODEL_MAX_CONTEXT"], "131072"
+        )
+
+    def test_the_window_is_validated_before_anything_is_generated(self) -> None:
+        self._write_main_config()
+        low, high = MAIN_CONTEXT_RANGE
+        for key in ("MAIN_MODEL_MAX_LEN", "MODEL_MAX_CONTEXT"):
+            for value in ("not-a-number", "800_000.5", "1e6"):
+                with self.subTest(key=key, value=value), self.assertRaisesRegex(
+                    TechSaraError, f"{key} must be a whole number of tokens"
+                ):
+                    self._generate({key: value})
+            for value in (str(low - 1), str(high + 1), "0", "-262144"):
+                with self.subTest(key=key, value=value), self.assertRaisesRegex(
+                    TechSaraError, f"{key} must be between 4,096 and 1,048,576 tokens"
+                ):
+                    self._generate({key: value})
+
+    # -- the deprecated alias ---------------------------------------------
+
+    def test_the_deprecated_alias_is_honoured_only_when_it_asks_for_something_else(self) -> None:
+        self._write_main_config()
+        baseline = self._generate()
+        # Repeating the profile's own number changes nothing at all: this is
+        # what most existing .env files contain.
+        repeated = {"MODEL_MAX_CONTEXT": str(self.profile.context_length)}
+        self.assertEqual(self._generate(repeated), baseline)
+        self.assertEqual(self._notices(repeated, baseline), [])
+
+        alias = {"MODEL_MAX_CONTEXT": "400000"}
+        generated = self._generate(alias)
+        self.assertEqual(generated["MODEL_MAX_CONTEXT"], "400000")
+        self.assertEqual(generated["MAIN_CONTEXT_LENGTH"], "400000")
+        self.assertTrue(generated["MAIN_MODEL_ROPE_OVERRIDE"].startswith("--hf-overrides "))
+        notices = self._notices(alias, generated)
+        self.assertIn("MAIN_MODEL_MAX_LEN is the supported spelling", notices[0])
+        # Nothing extra is generated for the alias; only the line is different.
+        self.assertEqual(generated, self._generate({"MAIN_MODEL_MAX_LEN": "400000"}))
+
+    def test_the_supported_spelling_wins_when_both_are_set(self) -> None:
+        self._write_main_config()
+        both = {"MAIN_MODEL_MAX_LEN": "300000", "MODEL_MAX_CONTEXT": "400000"}
+        generated = self._generate(both)
+        self.assertEqual(generated["MODEL_MAX_CONTEXT"], "300000")
+        self.assertEqual(
+            self._notices(both, generated),
+            [
+                "Context: 300,000 tokens (model is natively 262,144; YaRN factor 1.15 enabled "
+                "- long-context extension trades some short-prompt quality)",
+                "Context: that window needs about 11 GiB of KV cache at TP=1 (32,768 bytes/token); "
+                "vLLM sizes the pool while it starts and will refuse the window if the GPU cannot hold it",
+            ],
+        )
+
+    # -- what `up` says ----------------------------------------------------
+
+    def test_the_extended_window_is_announced_once_with_its_factor(self) -> None:
+        self._write_main_config()
+        values = {"MAIN_MODEL_MAX_LEN": "800000"}
+        generated = self._generate(values)
+        self.assertEqual(
+            self._notices(values, generated)[0],
+            "Context: 800,000 tokens (model is natively 262,144; YaRN factor 3.06 enabled "
+            "- long-context extension trades some short-prompt quality)",
+        )
+
+    def test_a_single_node_only_estimates_the_kv_cost_and_never_refuses(self) -> None:
+        self._write_main_config()
+        values = {"MAIN_MODEL_MAX_LEN": "800000"}
+        generated = self._generate(values)
+        self.assertEqual(generated["TECHSARA_CLUSTER_MODE"], "single")
+        # 800,000 x 32,768 B = 24.42 GiB of tokens, but only 88% of a hybrid
+        # model's KV budget becomes paged tokens (the gated-delta-net layers
+        # take the rest), so the honest estimate is 28 GiB.
+        self.assertIn("about 28 GiB of KV cache at TP=1", self._notices(values, generated)[1])
+
+    # -- the two-node KV budget -------------------------------------------
+
+    def test_the_measured_838860_window_fits_the_default_16_gib_budget(self) -> None:
+        self._write_main_config()
+        values = {**self.DUAL, "MAIN_MODEL_MAX_LEN": "838860"}
+        generated = self._generate(values)
+        self.assertEqual(generated["TECHSARA_CLUSTER_MODE"], "dual")
+        self.assertEqual(generated["CLUSTER_KV_CACHE_MEMORY_GIB"], "16")
+        self.assertEqual(generated["MODEL_MAX_CONTEXT"], "838860")
+        engine = generated["CLUSTER_ENGINE_ARGS"]
+        self.assertIn("--max-model-len 838860 --hf-overrides ", engine)
+        self.assertEqual(json.loads(shlex.split(engine)[shlex.split(engine).index("--hf-overrides") + 1])
+                         ["text_config"]["rope_parameters"]["factor"], 3.2)
+        # Exactly 4x native does NOT fit 16 GiB: the measured pool is 922,746
+        # tokens, not the naive 1,048,576, so the guard refuses it here rather
+        # than letting vLLM refuse it 30 minutes into a start-up.
+        with self.assertRaisesRegex(TechSaraError, "set CLUSTER_KV_CACHE_MEMORY_GIB=19"):
+            self._generate({**self.DUAL, "MAIN_MODEL_MAX_LEN": "1048576"})
+        # It fits once the budget is raised to what the guard asks for.
+        self.assertEqual(
+            self._generate({**self.DUAL, "MAIN_MODEL_MAX_LEN": "1048576",
+                            "CLUSTER_KV_CACHE_MEMORY_GIB": "19"})["MODEL_MAX_CONTEXT"],
+            "1048576",
+        )
+        # The cluster line is the only extra narration beyond the window ones.
+        self.assertEqual(len(self._notices(values, generated)), 1, "no TP=1 estimate in dual mode")
+
+    def test_a_window_the_kv_pool_cannot_hold_is_refused_with_the_arithmetic(self) -> None:
+        self._write_main_config()
+        with self.assertRaises(TechSaraError) as caught:
+            self._generate({**self.DUAL, "MAIN_MODEL_MAX_LEN": "1048576", "CLUSTER_KV_CACHE_MEMORY_GIB": "15"})
+        message = str(caught.exception)
+        self.assertIn("MAIN_MODEL_MAX_LEN=1,048,576 needs a KV pool of at least 1,048,576 tokens", message)
+        self.assertIn("CLUSTER_KV_CACHE_MEMORY_GIB=15 holds 865,075 tokens at TP=2", message)
+        self.assertIn("16,384 bytes/token at --kv-cache-dtype fp8", message)
+        self.assertIn("set CLUSTER_KV_CACHE_MEMORY_GIB=19", message)
+        self.assertIn("recurrent layers take their per-sequence state", message)
+        # TP=1 (pipeline parallel across the two nodes) doubles the per-token
+        # cost, so the same budget holds half as much.
+        with self.assertRaisesRegex(TechSaraError, "holds 461,373 tokens at TP=1"):
+            self._generate(
+                {
+                    **self.DUAL,
+                    "MAIN_MODEL_MAX_LEN": "600000",
+                    "CLUSTER_TENSOR_PARALLEL_SIZE": "1",
+                    "CLUSTER_PIPELINE_PARALLEL_SIZE": "2",
+                }
+            )
+
+    def test_a_flat_config_model_is_measured_from_its_own_geometry(self) -> None:
+        self._write_main_config(FLAT_CONFIG)
+        generated = self._generate({"MAIN_MODEL_MAX_LEN": "65536"})
+        self.assertEqual(generated["MAIN_MODEL_NATIVE_CONTEXT"], "32768")
+        # 32 paged layers, 8 KV heads, head_dim 128, fp8.
+        self.assertEqual(generated["MAIN_MODEL_KV_BYTES_PER_TOKEN"], str(2 * 32 * 8 * 128))
+        self.assertIn('"factor":2.0', generated["MAIN_MODEL_ROPE_OVERRIDE"])
 
 
 if __name__ == "__main__":
