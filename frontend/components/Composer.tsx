@@ -55,6 +55,18 @@ export interface ComposerHandle {
   focus: () => void;
   /** Focus, and append `seed` to whatever is already typed. */
   insert: (seed?: string) => void;
+  /**
+   * Load `text` into the input for editing, then focus with the caret at the
+   * end. "Edit" on a sent message is the only caller.
+   *
+   * Distinct from `insert`, which exists for the clarification panel and
+   * appends single keystrokes with no separator — correct there, and wrong
+   * here, where it would weld a whole prompt onto the end of a half-typed
+   * word. An unsent draft is never destroyed: the loaded text goes on a new
+   * paragraph after it, so the two are visibly separate and the user can
+   * delete whichever they did not want.
+   */
+  prefill: (text: string) => void;
 }
 
 export interface Attachment {
@@ -148,6 +160,8 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
     const textareaRef = useRef<HTMLTextAreaElement>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
     const pasteSeq = useRef(0);
+    /** Armed by `prefill`; consumed by the effect that runs after `text` lands. */
+    const caretToEnd = useRef(false);
     const { toast } = useToast();
 
     useImperativeHandle(ref, () => ({
@@ -170,6 +184,20 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
           return next;
         });
       },
+      prefill: (seed: string) => {
+        if (!seed) return;
+        setText((prev) => {
+          // Empty box: the text IS the draft. Occupied box: keep what is
+          // there and start the loaded text on its own paragraph.
+          const next = prev.trim() ? `${prev.replace(/\s+$/, '')}\n\n${seed}` : seed;
+          onDraftChange?.(next);
+          return next;
+        });
+        // Focus and caret are deferred to the effect below: `value` is React
+        // state, so the textarea does not hold the new text until after this
+        // render and setting the range here would clamp to the OLD length.
+        caretToEnd.current = true;
+      },
     }));
 
     const autogrow = useCallback(() => {
@@ -182,6 +210,18 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
     }, []);
 
     useEffect(autogrow, [text, autogrow]);
+
+    // After `prefill` lands: focus the input and put the caret after the text
+    // that was just loaded, so typing continues the prompt rather than
+    // inserting at position 0.
+    useEffect(() => {
+      if (!caretToEnd.current) return;
+      caretToEnd.current = false;
+      const ta = textareaRef.current;
+      if (!ta) return;
+      ta.focus();
+      ta.setSelectionRange(ta.value.length, ta.value.length);
+    }, [text]);
 
     const hasContent = Boolean(
       text.trim() || attachments.length || pastedTexts.length,

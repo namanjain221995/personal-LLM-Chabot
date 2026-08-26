@@ -68,6 +68,7 @@ import {
   meterView,
   readFoldableCounts,
 } from '@/lib/contextMeter';
+import { isCompacting, requestCompact } from '@/lib/compact';
 import type {
   ChatMessage,
   ConversationSummary,
@@ -130,8 +131,6 @@ export function ChatApp() {
   /** Debounced draft text — the meter's only estimated component. */
   const [draft, setDraft] = useState('');
   const [compacting, setCompacting] = useState(false);
-  /** Set by "Compact now" so the ring drops at once, cleared on the next reply. */
-  const [compactedAt, setCompactedAt] = useState<number | null>(null);
   /**
    * Turns a compaction would fold RIGHT NOW, from the server. null means the
    * question has not been asked yet or could not be answered — the meter then
@@ -340,7 +339,6 @@ export function ChatApp() {
       }
       if (id !== activeIdRef.current) return;
       if (s.status !== 'streaming') {
-        setCompactedAt(null);
         // The continuation this answer belongs to is over — however it ended.
         // The lock was only ever cleared when the CONVERSATION changed, so a
         // card whose run failed, was stopped, or lost its connection sat with
@@ -456,58 +454,53 @@ export function ChatApp() {
     [refreshFoldable],
   );
 
-  /** "Compact now" from the meter popover. */
+  /**
+   * "Compact now" from the meter popover.
+   *
+   * Two things this deliberately does NOT do any more:
+   *
+   * - It does not touch the context meter. The ring used to be forced to zero
+   *   the instant this returned, on the assumption that the next request had
+   *   to be smaller. It does not have to be, and measurably often is not — so
+   *   the reading stayed a fiction until the following reply replaced it with
+   *   a number that could be HIGHER than before the user pressed the button.
+   *   The last server-measured usage now simply stands until the server sends
+   *   another one.
+   * - It does not believe `compacted: true` on its own. `requestCompact`
+   *   confirms it against the summary endpoint first, because the server
+   *   reports a fold as successful even when the summary it stored is empty.
+   *
+   * Duplicate presses are suppressed in `lib/compact` (per conversation), so
+   * the guarantee holds even if a click gets past the disabled button.
+   */
   const compactNow = useCallback(() => {
     const id = activeIdRef.current;
-    if (!id || compacting) return;
+    if (!id || isCompacting(id)) return;
     setCompacting(true);
     void (async () => {
       try {
-        const res = await fetch('/api/chat/compact', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            conversation_id: id,
-            messages: messagesRef.current
-              .filter((m) => m.content)
-              .map((m) => ({ role: m.role, content: m.content })),
-          }),
-        });
-        const body = (await res.json()) as {
-          compacted?: boolean;
-          folded_turns?: number;
-          reason?: string;
-        };
-        if (!res.ok) throw new Error('compact failed');
-        // The same two fields the summary endpoint serves, so the popover is
-        // correct straight away without a second round trip.
-        const counts = readFoldableCounts(body);
-        setFoldableTurns(counts ? counts.foldableTurns : null);
-        toast(
-          body.compacted
-            ? `Compacted ${body.folded_turns} earlier message${
-                body.folded_turns === 1 ? '' : 's'
-              } into the summary.`
-            : (body.reason ?? 'Nothing to compact yet.'),
+        const run = await requestCompact(
+          id,
+          messagesRef.current.filter((m) => m.content),
         );
-        // The next request will be smaller; reflect that immediately rather
-        // than waiting for the following reply's meta.
-        if (body.compacted) {
-          // The next request will be much smaller; reflect that immediately
-          // instead of waiting for the following reply's meta.
-          setCompactedAt(Date.now());
-          // A toast disappears; this line stays in the popover, next to the
-          // way back into the summary it just wrote.
-          setLastFoldedTurns(body.folded_turns ?? null);
-        }
-      } catch {
-        toast('Could not compact this conversation.', 'error');
-        setFoldableTurns(null);
+        // null = another compaction for this chat was already in flight.
+        // Nothing happened, so say nothing.
+        if (!run) return;
+        // The chat may have been switched while this was in flight; its
+        // result belongs to the conversation that asked for it.
+        if (activeIdRef.current !== id) return;
+        setFoldableTurns(run.foldableTurns);
+        toast(run.outcome.message, run.outcome.tone);
+        // The lasting popover line, and the way into the summary, appear only
+        // for a compaction whose summary was actually seen.
+        setLastFoldedTurns(
+          run.outcome.kind === 'compacted' ? run.outcome.foldedTurns : null,
+        );
       } finally {
         setCompacting(false);
       }
     })();
-  }, [compacting, toast]);
+  }, [toast]);
 
   /* --------------------------------- Salesforce Intelligence Mode */
 
@@ -856,6 +849,21 @@ export function ChatApp() {
   );
 
   /**
+   * "Edit" on one of the user's own messages: put its text back in the
+   * composer, ready to change and send as a NEW turn.
+   *
+   * Nothing is rewritten and nothing is discarded. Editing a sent message
+   * in place would mean deleting every turn after it and regenerating from
+   * there — the destructive path `runRegenerate` takes, behind a
+   * confirmation and the server's truncate endpoint. This is the reuse half
+   * of that, and it is pure client state: no request, no history change, and
+   * no send until the user presses send themselves.
+   */
+  const editUserMessage = useCallback((text: string) => {
+    composerRef.current?.prefill(text);
+  }, []);
+
+  /**
    * Regenerating an OLDER answer restarts the thread from that point and
    * discards every later turn. That is destructive and irreversible, so it
    * asks first; regenerating the last answer runs straight away.
@@ -957,7 +965,6 @@ export function ChatApp() {
       setPrefs(loadPrefs(window.localStorage, id));
       setUnreachable(false);
       setAtBottom(true);
-      setCompactedAt(null);
       // Both belong to the chat being left, not the one being opened.
       setFoldableTurns(null);
       setLastFoldedTurns(null);
@@ -1224,6 +1231,7 @@ export function ChatApp() {
                   isLast={i === messages.length - 1 && m.role === 'assistant'}
                   onRegenerate={() => regenerate(m.id)}
                   onRetry={() => regenerate(m.id)}
+                  onEdit={editUserMessage}
                   onShowSummary={() => setSummaryOpen(true)}
                   clarificationPending={card.pending}
                   clarificationAnswer={card.answeredWith}
@@ -1265,7 +1273,11 @@ export function ChatApp() {
           onDraftChange={handleDraftChange}
           meter={
             <ContextMeter
-              view={meterView(compactedAt ? null : latestUsage(messages), draft)}
+              // The last reading the SERVER measured, plus the live draft —
+              // never adjusted by anything the browser assumes a compaction
+              // saved. If the value is stale it is stale honestly; a made-up
+              // smaller number is worse than an old true one.
+              view={meterView(latestUsage(messages), draft)}
               compacting={compacting}
               onCompactNow={compactNow}
               compactDisabled={!activeId || streaming}

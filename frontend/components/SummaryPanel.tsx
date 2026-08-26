@@ -12,6 +12,7 @@
 
 import { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
+import { NO_USABLE_SUMMARY, usableSummary } from '@/lib/compact';
 import { IconFileText, IconX } from './icons';
 
 interface SummaryPanelProps {
@@ -40,9 +41,13 @@ export function SummaryPanel({
           { cache: 'no-store' },
         );
         if (!res.ok) throw new Error(String(res.status));
-        const body = (await res.json()) as { summary?: string | null };
+        const body = (await res.json()) as unknown;
         if (!cancelled) {
-          setState({ kind: 'ready', summary: body.summary ?? null });
+          // One definition of "there is a summary", shared with the compact
+          // toast (lib/compact). A whitespace-only summary is nothing, and
+          // reading it as something is how the panel came to contradict the
+          // toast that sent the user here.
+          setState({ kind: 'ready', summary: usableSummary(body) });
         }
       } catch {
         if (!cancelled) setState({ kind: 'error' });
@@ -99,11 +104,15 @@ export function SummaryPanel({
               Couldn&apos;t load the summary for this conversation.
             </p>
           )}
+          {/* NEUTRAL on purpose. This used to read "Nothing has been
+              compacted yet — the assistant still sees every message in this
+              chat exactly as written", which is two claims the browser cannot
+              make: the server may well have compacted (and stored an empty
+              summary), and what the model can still see is not observable
+              from here. Absence of a summary is the only fact available, so
+              it is the only thing said. */}
           {state.kind === 'ready' && !state.summary && (
-            <p className="text-sm text-muted">
-              Nothing has been compacted yet — the assistant still sees every
-              message in this chat exactly as written.
-            </p>
+            <p className="text-sm text-muted">{NO_USABLE_SUMMARY}</p>
           )}
           {state.kind === 'ready' && state.summary && (
             <pre className="whitespace-pre-wrap break-words font-sans text-[13px] leading-relaxed text-ink">
@@ -111,10 +120,16 @@ export function SummaryPanel({
             </pre>
           )}
         </div>
-        <p className="border-t border-border px-4 py-2 text-[11px] text-faint">
-          Older messages were summarized to free up space. This summary is what
-          the model sees in place of them — it is read-only.
-        </p>
+        {/* The footnote describes a summary, so it only appears when there is
+            one. Under the empty state it was asserting that older messages
+            "were summarized" on exactly the conversations where that is the
+            thing in doubt. */}
+        {state.kind === 'ready' && state.summary && (
+          <p className="border-t border-border px-4 py-2 text-[11px] text-faint">
+            Older messages were summarized to free up space. This summary is
+            what the model sees in place of them — it is read-only.
+          </p>
+        )}
       </div>
     </div>,
     document.body,
