@@ -102,3 +102,74 @@ def test_the_passthrough_view_survives_a_column_being_added(tmp_path):
     q = store._con
     assert q.execute('SELECT count(*) FROM main."Account"').fetchone()[0] == 3   # no "contents altered"
     q.close(); store.close()
+
+
+# ---------------------------------------------------------------------------
+# bookkeeping constraints survive relocation
+# ---------------------------------------------------------------------------
+
+
+def _pk_count(con, schema, table):
+    return con.execute(
+        "SELECT count(*) FROM duckdb_constraints() "
+        "WHERE schema_name=? AND table_name=? AND constraint_type='PRIMARY KEY'",
+        [schema, table],
+    ).fetchone()[0]
+
+
+def test_relocated_bookkeeping_keeps_its_primary_key(tmp_path):
+    """CREATE TABLE ... AS SELECT copies rows but NOT constraints. A _sync_meta
+    relocated that way reads fine and then rejects every write: set_watermark's
+    ON CONFLICT has no conflict target, so no watermark ever advances and the
+    sync re-extracts the whole org, forever, with no data-level symptom."""
+    db = str(tmp_path / "wh.duckdb"); _old_layout(db)
+    store = Store(db)
+    q = store._con
+    assert _pk_count(q, "raw", "_sync_meta") == 1
+    assert q.execute('SELECT count(*) FROM raw."_sync_meta"').fetchone()[0] == 1
+    q.close()
+    # the write that failed 201 times in production
+    store.set_watermark("Account", "2026-08-26T00:00:00Z")
+    assert store.get_watermark("Account") == "2026-08-26T00:00:00Z"
+    store.close()
+
+
+def test_a_bookkeeping_table_that_already_lost_its_key_is_repaired(tmp_path):
+    """Self-heal: a warehouse migrated by the earlier CTAS build must recover
+    on the next start without manual SQL, preserving every watermark."""
+    db = str(tmp_path / "wh.duckdb")
+    con = duckdb.connect(db)
+    con.execute("CREATE SCHEMA raw")
+    con.execute('CREATE TABLE main."_sync_meta" (object_name VARCHAR PRIMARY KEY, watermark VARCHAR, updated_at TIMESTAMP)')
+    con.execute("INSERT INTO main._sync_meta VALUES ('Account','t1',now()), ('Contact','t2',now())")
+    con.execute('CREATE TABLE raw."_sync_meta" AS SELECT * FROM main."_sync_meta"')   # the broken path
+    con.execute('DROP TABLE main."_sync_meta"')
+    assert _pk_count(con, "raw", "_sync_meta") == 0
+    con.close()
+
+    store = Store(db)                       # __init__ repairs it
+    q = store._con
+    assert _pk_count(q, "raw", "_sync_meta") == 1
+    assert q.execute('SELECT count(*) FROM raw."_sync_meta"').fetchone()[0] == 2   # watermarks kept
+    q.close()
+    store.set_watermark("Account", "t3")
+    assert store.get_watermark("Account") == "t3"
+    assert store.get_watermark("Contact") == "t2"
+    store.close()
+
+
+def test_rag_pending_keeps_its_composite_key(tmp_path):
+    """mark_rag_pending's ON CONFLICT (object_name, record_id) needs it too."""
+    db = str(tmp_path / "wh.duckdb")
+    con = duckdb.connect(db)
+    con.execute('CREATE TABLE main."_rag_index_pending" (object_name VARCHAR NOT NULL, record_id VARCHAR NOT NULL, attempts INTEGER NOT NULL DEFAULT 1, last_error VARCHAR, updated_at TIMESTAMP NOT NULL DEFAULT now(), PRIMARY KEY (object_name, record_id))')
+    con.execute("INSERT INTO main._rag_index_pending VALUES ('Account','001A',1,'boom',now())")
+    con.close()
+
+    store = Store(db)
+    q = store._con
+    assert _pk_count(q, "raw", "_rag_index_pending") == 1
+    q.close()
+    store.mark_rag_pending("Account", ["001A"], "again")     # ON CONFLICT path
+    assert store.pending_rag_ids("Account") == ["001A"]
+    store.close()

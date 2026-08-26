@@ -35,6 +35,27 @@ RAG_PENDING_TABLE = "_rag_index_pending"
 #: connection issues `USE raw`. That is deliberate -- it keeps one schema
 #: decision in one place instead of threading a prefix through 25 SQL strings.
 RAW_SCHEMA = "raw"
+
+#: The bookkeeping tables' column definitions, in ONE place. They carry
+#: PRIMARY KEYs that `set_watermark` and `mark_rag_pending` rely on for their
+#: ON CONFLICT clauses -- and CREATE TABLE ... AS SELECT does NOT copy a
+#: constraint, so a relocation that used CTAS produced a table that looked
+#: right and rejected every upsert into it. Both paths build from these.
+_BOOKKEEPING_DDL = {
+    META_TABLE: (
+        "object_name VARCHAR PRIMARY KEY, "
+        "watermark VARCHAR, "
+        "updated_at TIMESTAMP"
+    ),
+    RAG_PENDING_TABLE: (
+        "object_name VARCHAR NOT NULL, "
+        "record_id VARCHAR NOT NULL, "
+        "attempts INTEGER NOT NULL DEFAULT 1, "
+        "last_error VARCHAR, "
+        "updated_at TIMESTAMP NOT NULL DEFAULT now(), "
+        "PRIMARY KEY (object_name, record_id)"
+    ),
+}
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 #: How long a Store operation waits for the cross-process file lock. The
@@ -77,8 +98,14 @@ def _relocate_bookkeeping(con) -> list[str]:
             continue
         con.execute("BEGIN TRANSACTION")
         try:
+            # DDL first, then INSERT. CTAS would copy the rows and silently
+            # drop the PRIMARY KEY that ON CONFLICT depends on.
             con.execute(
-                f'CREATE TABLE "{RAW_SCHEMA}"."{table}" AS '
+                f'CREATE TABLE "{RAW_SCHEMA}"."{table}" '
+                f"({_BOOKKEEPING_DDL[table]})"
+            )
+            con.execute(
+                f'INSERT INTO "{RAW_SCHEMA}"."{table}" '
                 f'SELECT * FROM main."{table}"'
             )
             con.execute(f'DROP TABLE main."{table}"')
@@ -93,6 +120,60 @@ def _relocate_bookkeeping(con) -> list[str]:
             extra={"event": "bookkeeping_relocated", "tables": moved},
         )
     return moved
+
+
+def _repair_bookkeeping_constraints(con) -> list[str]:
+    """Rebuild a bookkeeping table that lost its PRIMARY KEY.
+
+    An earlier relocation used CREATE TABLE ... AS SELECT, which copies rows
+    but not constraints. The result reads fine and then fails every write:
+    `set_watermark`'s ON CONFLICT has no conflict target, so no watermark ever
+    advances and the sync re-extracts the whole org forever.
+
+    Detect by asking the catalog for the constraint, not by trying a write --
+    a failed write inside a session would poison the transaction. Rows are
+    preserved; only the table definition changes.
+    """
+    repaired: list[str] = []
+    for table, ddl in _BOOKKEEPING_DDL.items():
+        present = con.execute(
+            "SELECT count(*) FROM information_schema.tables "
+            "WHERE table_schema = ? AND table_name = ?",
+            [RAW_SCHEMA, table],
+        ).fetchone()
+        if not (present and present[0]):
+            continue
+        constraints = con.execute(
+            "SELECT count(*) FROM duckdb_constraints() "
+            "WHERE schema_name = ? AND table_name = ? "
+            "AND constraint_type = 'PRIMARY KEY'",
+            [RAW_SCHEMA, table],
+        ).fetchone()
+        if constraints and constraints[0]:
+            continue
+        con.execute("BEGIN TRANSACTION")
+        try:
+            con.execute(f'CREATE TABLE "{RAW_SCHEMA}"."{table}__fixed" ({ddl})')
+            con.execute(
+                f'INSERT INTO "{RAW_SCHEMA}"."{table}__fixed" '
+                f'SELECT * FROM "{RAW_SCHEMA}"."{table}"'
+            )
+            con.execute(f'DROP TABLE "{RAW_SCHEMA}"."{table}"')
+            con.execute(
+                f'ALTER TABLE "{RAW_SCHEMA}"."{table}__fixed" '
+                f'RENAME TO "{table}"'
+            )
+            con.execute("COMMIT")
+        except Exception:
+            con.execute("ROLLBACK")
+            raise
+        repaired.append(table)
+    if repaired:
+        log.warning(
+            "rebuilt bookkeeping tables that had lost their PRIMARY KEY",
+            extra={"event": "bookkeeping_repaired", "tables": repaired},
+        )
+    return repaired
 
 
 def _safe_ident(name: str) -> str:
@@ -198,21 +279,13 @@ class Store:
             # BEFORE the CREATE IF NOT EXISTS below, or the watermarks stay
             # stranded in main behind a freshly-made empty table in raw.
             _relocate_bookkeeping(con)
-            con.execute(
-                f'CREATE TABLE IF NOT EXISTS "{META_TABLE}" ('
-                "object_name VARCHAR PRIMARY KEY, "
-                "watermark VARCHAR, "
-                "updated_at TIMESTAMP)"
-            )
-            con.execute(
-                f'CREATE TABLE IF NOT EXISTS "{RAG_PENDING_TABLE}" ('
-                "object_name VARCHAR NOT NULL, "
-                "record_id VARCHAR NOT NULL, "
-                "attempts INTEGER NOT NULL DEFAULT 1, "
-                "last_error VARCHAR, "
-                "updated_at TIMESTAMP NOT NULL DEFAULT now(), "
-                "PRIMARY KEY (object_name, record_id))"
-            )
+            # Heal a table relocated by an earlier build's CTAS, which copied
+            # the rows without the PRIMARY KEY.
+            _repair_bookkeeping_constraints(con)
+            for table, ddl in _BOOKKEEPING_DDL.items():
+                con.execute(
+                    f'CREATE TABLE IF NOT EXISTS "{table}" ({ddl})'
+                )
 
     def _connect(self):
         """Open one read-write connection, waiting out a competing lock."""
