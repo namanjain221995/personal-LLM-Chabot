@@ -38,10 +38,26 @@ import {
   IconAlert,
   IconBook,
   IconFileText,
+  IconPencil,
   IconRefresh,
   IconThumbDown,
   IconThumbUp,
 } from './icons';
+
+/**
+ * The message action row, shared by both roles so they cannot drift apart.
+ *
+ * Assistant rows pin the LAST answer's actions open; every other row — and
+ * every user row — reveals them on hover or keyboard focus. Same classes,
+ * same spacing, same reveal, whoever sent the message.
+ */
+const ACTION_ROW =
+  'mt-1.5 flex items-center gap-0.5 transition-opacity duration-ts';
+const ACTION_ROW_HIDDEN =
+  'opacity-0 focus-within:opacity-100 group-hover/msg:opacity-100';
+/** The ghost icon button used by every action in that row. */
+const ACTION_BUTTON =
+  'rounded-lg p-2 text-icon transition-colors duration-ts hover:bg-surface-2 hover:text-ink';
 
 /** "report.pdf" → "PDF", "sales.csv" → "CSV", "data.tar.gz" → "TAR.GZ". */
 function fileBadge(name: string): string {
@@ -55,6 +71,7 @@ export function MessageRow({
   onRegenerate,
   onShowSummary,
   onRetry,
+  onEdit,
   onFeedback,
   clarificationPending = false,
   clarificationAnswer = '',
@@ -65,6 +82,16 @@ export function MessageRow({
   /** Opens the read-only rolling-summary panel (compaction notice). */
   onShowSummary?: () => void;
   onRetry: () => void;
+  /**
+   * "Edit" on a USER message: hand its exact text back to the composer.
+   *
+   * Deliberately NOT an in-place rewrite. Editing a sent message for real
+   * means deleting every turn after it and regenerating from that point,
+   * which is destructive and needs the server's truncate path; this reuses
+   * the prompt instead and leaves the transcript exactly as it was. Omitted
+   * (previews, tests) simply hides the control.
+   */
+  onEdit?: (text: string) => void;
   /**
    * Is THIS message's question the one the thread is waiting on?
    *
@@ -117,8 +144,15 @@ export function MessageRow({
   }
 
   if (message.role === 'user') {
+    // Actions need something to act ON. An attachment-only turn (a dropped
+    // PDF, images with no caption) has no text to copy or reuse, so it gets
+    // no row rather than two buttons that would silently do nothing.
+    const userText = message.content ?? '';
+    const showUserActions = Boolean(userText.trim());
     return (
-      <div className="flex justify-end">
+      // `group/msg` only marks the hover scope — it paints nothing. The
+      // bubble below is untouched.
+      <div className="group/msg flex justify-end">
         <div className="max-w-[85%] sm:max-w-[70%]">
           {(message.imageDataUrls?.length || message.imageDataUrl) && (
             <div className="mb-1.5 flex flex-wrap justify-end gap-1.5">
@@ -166,6 +200,32 @@ export function MessageRow({
           {message.content && (
             <div className="whitespace-pre-wrap break-words rounded-[20px] bg-bubble px-4 py-2.5 text-[15px] leading-relaxed">
               {message.content}
+            </div>
+          )}
+          {/* Edit · Copy, in the assistant row's own classes and its
+              hover-to-reveal behaviour, right-aligned under the bubble to
+              follow it. Neither button sends anything, touches history or
+              reaches the network. */}
+          {showUserActions && (
+            <div className={`${ACTION_ROW} ${ACTION_ROW_HIDDEN} justify-end`}>
+              {onEdit && (
+                <button
+                  type="button"
+                  onClick={() => onEdit(userText)}
+                  aria-label="Edit message"
+                  title="Edit — puts this prompt back in the message box"
+                  className={ACTION_BUTTON}
+                >
+                  <IconPencil size={18} />
+                </button>
+              )}
+              {/* The user's own words, verbatim: no citation stripping (there
+                  are none to strip) and no trimming. */}
+              <CopyButton
+                text={userText}
+                label="Copy message"
+                variant="icon"
+              />
             </div>
           )}
         </div>
@@ -377,10 +437,8 @@ export function MessageRow({
 
           {!streaming && message.content && message.status !== 'error' && (
             <div
-              className={`mt-1.5 flex items-center gap-0.5 transition-opacity duration-ts ${
-                isLast
-                  ? 'opacity-100'
-                  : 'opacity-0 focus-within:opacity-100 group-hover/msg:opacity-100'
+              className={`${ACTION_ROW} ${
+                isLast ? 'opacity-100' : ACTION_ROW_HIDDEN
               }`}
             >
               {/* ChatGPT-style icon row (2026-08-05): quiet ghost icons
@@ -423,7 +481,7 @@ export function MessageRow({
                 onClick={onRegenerate}
                 aria-label="Try again"
                 title="Try again"
-                className="rounded-lg p-2 text-icon transition-colors duration-ts hover:bg-surface-2 hover:text-ink"
+                className={ACTION_BUTTON}
               >
                 <IconRefresh size={18} />
               </button>

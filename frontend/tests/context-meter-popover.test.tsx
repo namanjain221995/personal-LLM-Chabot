@@ -101,6 +101,20 @@ describe('what the button claims', () => {
     expect(screen.getByText('Folds 12 earlier messages into a summary.')).toBeTruthy();
   });
 
+  it('goes dead and says so while a compaction is running', () => {
+    // The other half of "one press, one request" — lib/compact refuses a
+    // duplicate, and the control refuses to offer one. Both, because the
+    // guard has to hold whether or not the click reaches the callback.
+    const { onCompactNow } = open({ compacting: true });
+    const button = screen.getByRole('button', {
+      name: 'Compacting…',
+    }) as HTMLButtonElement;
+    expect(button.disabled).toBe(true);
+
+    fireEvent.click(button);
+    expect(onCompactNow).not.toHaveBeenCalled();
+  });
+
   it('stays live and silent when the server could not say', () => {
     open({ foldableTurns: null });
     const button = screen.getByRole('button', {
