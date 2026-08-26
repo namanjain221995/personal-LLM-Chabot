@@ -32,7 +32,7 @@ if not logging.getLogger().handlers:
 from .core.report_paths import ReportPathError, list_reports, resolve_report_file
 from .graph import get_graph
 from .health import check_dependencies
-from .history import router as history_router
+from .history import foldable_counts, router as history_router
 from .memory_api import router as memory_router
 from .uploads import router as uploads_router
 from .memory import memory
@@ -1301,14 +1301,27 @@ async def chat_compact(body: CompactRequest, http_request: Request) -> dict:
         history = [
             {"role": m["role"], "content": m["content"]}
             for m in await db.run_in_thread(db.list_messages, body.conversation_id)
+            # Same rule as the `body.messages` branch above and as
+            # `ChatRequest.history_messages`: a blank turn has nothing to
+            # summarize, and `covers_through` counts blank-filtered turns.
+            if m["content"] and m["content"].strip()
         ]
     result = await compaction.compact(body.conversation_id, history, force=True)
+    # What is STILL foldable afterwards, from the same helper the summary
+    # endpoint serves — so the popover can update without a refetch and can
+    # never disagree with what this button would do on the next press.
+    counts = await db.run_in_thread(foldable_counts, body.conversation_id, history)
     if result is None:
-        return {"compacted": False, "reason": "nothing older to summarize"}
+        return {
+            "compacted": False,
+            "reason": "nothing older to summarize",
+            **counts,
+        }
     return {
         "compacted": True,
         "folded_turns": result["folded"],
         "covers_through": result["covers_through"],
+        **counts,
     }
 
 

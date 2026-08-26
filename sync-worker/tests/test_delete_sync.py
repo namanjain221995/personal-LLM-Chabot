@@ -48,9 +48,12 @@ def _seed(store):
         "Account",
         pd.DataFrame(
             [
-                {"Id": "001A", "Name": "Acme"},
-                {"Id": "001B", "Name": "Globex"},
-                {"Id": "001C", "Name": "Initech"},
+                # SystemModstamp is present, as it is in every real warehouse
+                # table: a configured column missing from the table is exactly
+                # what triggers a full backfill extract (test_adoption_backfill).
+                {"Id": "001A", "Name": "Acme", "SystemModstamp": "t1"},
+                {"Id": "001B", "Name": "Globex", "SystemModstamp": "t1"},
+                {"Id": "001C", "Name": "Initech", "SystemModstamp": "t1"},
             ]
         ),
     )

@@ -27,7 +27,9 @@ from .environment import (
     build_generated_environment,
     effective_user_environment,
     has_salesforce_credentials,
+    main_context_notices,
     prepare_local_secrets,
+    profile_context_length,
 )
 from .errors import PrerequisiteError, TechSaraError
 from .hardware import HardwareInfo, detect_hardware
@@ -82,6 +84,27 @@ def _cluster_summary(profile: SelectedProfile, generated: Mapping[str, str]) -> 
     if mode != "dual" and profile.hardware_profile_id != "dgx-spark":
         return ""
     return f"Cluster: {mode} - {reason or 'CLUSTER_MODE=single in .env'}"
+
+
+def _context_summary(
+    profile: SelectedProfile, generated: Mapping[str, str], user_environment: Mapping[str, str]
+) -> list[str]:
+    """What `up` says about the main-model window; nothing when it is ordinary."""
+    return main_context_notices(
+        user_environment, generated, profile_context=profile_context_length(profile)
+    )
+
+
+def _served_context(generated: Mapping[str, str], profile: SelectedProfile) -> int:
+    """The window the generated environment actually serves, for the summary.
+
+    ``_print_selection`` used to print ``profile.context_length`` unconditionally,
+    so an extended window printed two contradictory numbers in one ``up``.
+    """
+    try:
+        return int(str(generated.get("MODEL_MAX_CONTEXT") or "").strip())
+    except (TypeError, ValueError):
+        return profile.context_length
 
 
 def _report_script_line(reporter: Callable[[str], None], raw: bytes) -> None:
@@ -311,7 +334,13 @@ def _project_has_running_models(layout: RuntimeLayout) -> bool:
     )
 
 
-def _print_selection(hardware: HardwareInfo, profile: SelectedProfile, installs: Iterable[ModelInstall] = ()) -> None:
+def _print_selection(
+    hardware: HardwareInfo,
+    profile: SelectedProfile,
+    installs: Iterable[ModelInstall] = (),
+    *,
+    context: int | None = None,
+) -> None:
     print("\nHost:")
     print(f"  Operating system: {hardware.operating_system} {hardware.operating_system_version}")
     print(f"  Architecture: {hardware.host_architecture} (native {hardware.native_architecture})")
@@ -329,7 +358,11 @@ def _print_selection(hardware: HardwareInfo, profile: SelectedProfile, installs:
     print("\nRuntime:")
     print(f"  Selected profile: {profile.id}")
     print(f"  Backend: {profile.runtime_backend}")
-    print(f"  Context / concurrency: {profile.context_length} / {profile.concurrency}")
+    # The window actually being served, which MAIN_MODEL_MAX_LEN may have
+    # moved away from the profile's own pick; falls back to the profile for
+    # the callers that have no generated environment in hand.
+    served = int(context) if context else profile.context_length
+    print(f"  Context / concurrency: {served} / {profile.concurrency}")
     print("\nModels:")
     print(f"  Main: {profile.main_model.id if profile.main_model else 'disabled'}")
     print(f"  Router: {'shared with main' if profile.router_shared else (profile.router_model.id if profile.router_model else 'disabled')}")
@@ -599,6 +632,8 @@ def _cmd_up_dry(args: argparse.Namespace, *, root: Path) -> int:
         cluster_line = _cluster_summary(profile, generated)
         if cluster_line:
             print(cluster_line)
+        for line in _context_summary(profile, generated, user_env):
+            print(line)
         atomic_write_text(layout.generated_env, render_env(generated), mode=0o644)
         atomic_write_text(layout.secrets_env, render_env(secrets), mode=0o600)
         profiles = _compose_profiles(profile, user_env, skip_ocr=args.skip_ocr)
@@ -619,7 +654,7 @@ def _cmd_up_dry(args: argparse.Namespace, *, root: Path) -> int:
             search_enabled="search" in profiles, dry_run=True,
             endpoints=_local_endpoints(generated, user_env),
         )
-    _print_selection(hardware, profile, installs)
+    _print_selection(hardware, profile, installs, context=_served_context(generated, profile))
     print("\nPlan validated; no services, persistent runtime state, runtimes, or downloads were changed.")
     print(f"Frontend: planned at {_local_endpoints(generated, user_env)['frontend']}")
     print("Orchestrator: planned")
@@ -1025,6 +1060,9 @@ def _start_compose(
             generated["DEFAULT_MAX_CONTEXT"] = str(retry_context)
             generated["REPORT_MAX_CONTEXT"] = str(retry_context)
             generated["MAIN_CONTEXT_LENGTH"] = str(retry_context)
+            # The retry window is inside the model's native one, so the YaRN
+            # override that belonged to the wider window must go with it.
+            generated["MAIN_MODEL_ROPE_OVERRIDE"] = ""
             generated["MODEL_CONCURRENCY"] = "1"
             generated["MAIN_CONCURRENCY"] = "1"
             publish_generated()
@@ -1175,6 +1213,8 @@ def _cmd_up(args: argparse.Namespace, *, root: Path) -> int:
         cluster_line = _cluster_summary(profile, generated)
         if cluster_line:
             _step(cluster_line)
+        for line in _context_summary(profile, generated, user_env):
+            _step(line)
         compose_files = _compose_files(
             root, hardware, profile,
             publish_model_ports=publish_model_ports, cluster_mode=cluster_mode,
@@ -1252,7 +1292,7 @@ def _cmd_up(args: argparse.Namespace, *, root: Path) -> int:
             "result": result,
         }
         atomic_write_json(layout.state_file, state)
-        _print_selection(hardware, profile, installs)
+        _print_selection(hardware, profile, installs, context=_served_context(generated, profile))
         for warning in secret_warnings:
             print(f"Warning: {warning}")
         print(

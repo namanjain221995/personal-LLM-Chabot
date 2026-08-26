@@ -570,6 +570,35 @@ class UpCommandTests(unittest.TestCase):
         values.update(overrides)
         return argparse.Namespace(**values)
 
+    def test_up_announces_an_extended_window_and_stays_quiet_about_an_ordinary_one(self) -> None:
+        self.parse_env.return_value = {**self.user_env, "MAIN_MODEL_MAX_LEN": "800000"}
+        self.write_configuration.return_value = {
+            **self.generated,
+            "MODEL_MAX_CONTEXT": "800000",
+            "MAIN_MODEL_NATIVE_CONTEXT": "262144",
+            "MAIN_MODEL_KV_BYTES_PER_TOKEN": "32768",
+            "MAIN_MODEL_ROPE_OVERRIDE": (
+                '--hf-overrides \'{"text_config":{"rope_parameters":{"rope_type":"yarn",'
+                '"factor":3.06,"original_max_position_embeddings":262144}}}\''
+            ),
+        }
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            self.assertEqual(cli._cmd_up(self.args(), root=self.root), 0)
+        output = stdout.getvalue()
+        self.assertIn(
+            "Context: 800,000 tokens (model is natively 262,144; YaRN factor 3.06 enabled", output
+        )
+        self.assertIn("about 25 GiB of KV cache at TP=1", output)
+
+        # The default window narrates nothing extra.
+        self.parse_env.return_value = dict(self.user_env)
+        self.write_configuration.return_value = dict(self.generated)
+        quiet = io.StringIO()
+        with redirect_stdout(quiet):
+            self.assertEqual(cli._cmd_up(self.args(), root=self.root), 0)
+        self.assertNotIn("Context:", quiet.getvalue())
+
     def test_up_passes_manual_overrides_and_follows_staged_startup_order(self) -> None:
         events: list[str] = []
         self.layout.create.side_effect = lambda: events.append("layout")

@@ -63,7 +63,11 @@ import {
   shouldShowStarter,
   type StarterOption,
 } from '@/lib/salesforceApi';
-import { latestUsage, meterView } from '@/lib/contextMeter';
+import {
+  latestUsage,
+  meterView,
+  readFoldableCounts,
+} from '@/lib/contextMeter';
 import type {
   ChatMessage,
   ConversationSummary,
@@ -128,6 +132,14 @@ export function ChatApp() {
   const [compacting, setCompacting] = useState(false);
   /** Set by "Compact now" so the ring drops at once, cleared on the next reply. */
   const [compactedAt, setCompactedAt] = useState<number | null>(null);
+  /**
+   * Turns a compaction would fold RIGHT NOW, from the server. null means the
+   * question has not been asked yet or could not be answered — the meter then
+   * leaves the button enabled, which is the behaviour that predates this.
+   */
+  const [foldableTurns, setFoldableTurns] = useState<number | null>(null);
+  /** Turns the last successful compaction folded — a lasting popover line. */
+  const [lastFoldedTurns, setLastFoldedTurns] = useState<number | null>(null);
   const [summaryOpen, setSummaryOpen] = useState(false);
   const draftTimer = useRef<number | null>(null);
   /** Salesforce starter-card suggestions for the OPEN chat (server-filtered). */
@@ -408,6 +420,42 @@ export function ChatApp() {
     draftTimer.current = window.setTimeout(() => setDraft(text), 300);
   }, []);
 
+  /**
+   * Ask the server what a compaction would fold right now.
+   *
+   * Called only when the meter popover OPENS and after a compaction — never
+   * per keystroke. Any failure is treated as "unknown" rather than "nothing":
+   * an unreachable orchestrator must not disable a control that still works.
+   */
+  const refreshFoldable = useCallback(async () => {
+    const id = activeIdRef.current;
+    if (!id) {
+      setFoldableTurns(null);
+      return;
+    }
+    try {
+      const res = await fetch(
+        `/api/history/conversations/${encodeURIComponent(id)}/summary`,
+        { cache: 'no-store' },
+      );
+      if (!res.ok) throw new Error(String(res.status));
+      const counts = readFoldableCounts(await res.json());
+      // The chat may have been switched while this was in flight.
+      if (activeIdRef.current !== id) return;
+      setFoldableTurns(counts ? counts.foldableTurns : null);
+    } catch {
+      if (activeIdRef.current === id) setFoldableTurns(null);
+    }
+  }, []);
+
+  /** The meter popover opened or closed; only opening costs a request. */
+  const handleMeterOpenChange = useCallback(
+    (open: boolean) => {
+      if (open) void refreshFoldable();
+    },
+    [refreshFoldable],
+  );
+
   /** "Compact now" from the meter popover. */
   const compactNow = useCallback(() => {
     const id = activeIdRef.current;
@@ -431,6 +479,10 @@ export function ChatApp() {
           reason?: string;
         };
         if (!res.ok) throw new Error('compact failed');
+        // The same two fields the summary endpoint serves, so the popover is
+        // correct straight away without a second round trip.
+        const counts = readFoldableCounts(body);
+        setFoldableTurns(counts ? counts.foldableTurns : null);
         toast(
           body.compacted
             ? `Compacted ${body.folded_turns} earlier message${
@@ -444,9 +496,13 @@ export function ChatApp() {
           // The next request will be much smaller; reflect that immediately
           // instead of waiting for the following reply's meta.
           setCompactedAt(Date.now());
+          // A toast disappears; this line stays in the popover, next to the
+          // way back into the summary it just wrote.
+          setLastFoldedTurns(body.folded_turns ?? null);
         }
       } catch {
         toast('Could not compact this conversation.', 'error');
+        setFoldableTurns(null);
       } finally {
         setCompacting(false);
       }
@@ -883,6 +939,8 @@ export function ChatApp() {
     setActiveId(null);
     activeIdRef.current = null;
     setMessages([]);
+    setFoldableTurns(null);
+    setLastFoldedTurns(null);
     setUnreachable(false);
     setStreaming(false);
     setPrefs(DEFAULT_PREFS);
@@ -900,6 +958,9 @@ export function ChatApp() {
       setUnreachable(false);
       setAtBottom(true);
       setCompactedAt(null);
+      // Both belong to the chat being left, not the one being opened.
+      setFoldableTurns(null);
+      setLastFoldedTurns(null);
       setUrlConversation(id);
 
       const live = getLiveStream(id);
@@ -1208,6 +1269,10 @@ export function ChatApp() {
               compacting={compacting}
               onCompactNow={compactNow}
               compactDisabled={!activeId || streaming}
+              foldableTurns={foldableTurns}
+              lastFoldedTurns={lastFoldedTurns}
+              onOpenChange={handleMeterOpenChange}
+              onSeeSummary={() => setSummaryOpen(true)}
             />
           }
           prefs={prefs}

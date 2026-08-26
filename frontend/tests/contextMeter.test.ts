@@ -2,15 +2,19 @@ import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_USABLE_BUDGET,
   HIGH_AT,
+  NOTHING_TO_COMPACT,
   PULSE_AT,
   WARN_AT,
   breakdownTotal,
+  compactPlan,
+  earlierMessages,
   estimateDraftTokens,
   latestUsage,
   meterColor,
   meterPercent,
   meterState,
   meterView,
+  readFoldableCounts,
 } from '../lib/contextMeter';
 import type { ChatMessage, ContextUsage } from '../lib/types';
 
@@ -186,5 +190,128 @@ describe('the tooltip total must agree with the ring', () => {
     const view = meterView(usage({ tokens_used: 8555 }), '');
     const fromTotal = breakdownTotal(view.breakdown) / view.usableBudget;
     expect(Math.round(fromTotal * 100)).toBe(view.percent);
+  });
+});
+
+describe('readFoldableCounts — trusting only what the server actually said', () => {
+  it('reads the two additive fields off the summary payload', () => {
+    expect(
+      readFoldableCounts({
+        summary: 'older stuff',
+        covers_through: 4,
+        foldable_turns: 12,
+        total_turns: 17,
+      }),
+    ).toEqual({ foldableTurns: 12, totalTurns: 17 });
+  });
+
+  it('reads the same fields off the compact response', () => {
+    expect(
+      readFoldableCounts({
+        compacted: true,
+        folded_turns: 27,
+        covers_through: 27,
+        foldable_turns: 0,
+        total_turns: 28,
+      }),
+    ).toEqual({ foldableTurns: 0, totalTurns: 28 });
+  });
+
+  it('is UNKNOWN, not zero, when the fields are missing', () => {
+    // An older orchestrator, MOCK_MODE, or a 502 body. Zero would disable a
+    // button that still works.
+    expect(readFoldableCounts({ summary: null, covers_through: 0 })).toBeNull();
+    expect(readFoldableCounts({ compacted: false, reason: 'mock mode' })).toBeNull();
+    expect(readFoldableCounts(null)).toBeNull();
+    expect(readFoldableCounts('nope')).toBeNull();
+  });
+
+  it('rejects values that cannot be counts', () => {
+    expect(readFoldableCounts({ foldable_turns: '3', total_turns: 5 })).toBeNull();
+    expect(readFoldableCounts({ foldable_turns: -1, total_turns: 5 })).toBeNull();
+    expect(readFoldableCounts({ foldable_turns: Number.NaN, total_turns: 5 })).toBeNull();
+    expect(readFoldableCounts({ foldable_turns: 3 })).toBeNull();
+  });
+});
+
+describe('compactPlan — the button may only promise what it will do', () => {
+  it('goes dead WITH A REASON when nothing is foldable', () => {
+    const plan = compactPlan({ foldable: 0 });
+    expect(plan.disabled).toBe(true);
+    expect(plan.hint).toBe(NOTHING_TO_COMPACT);
+    expect(plan.hint).toContain('Nothing to compact yet');
+    expect(plan.hint).toContain('folded automatically as the window fills');
+  });
+
+  it('says how much it will fold when there is something', () => {
+    const plan = compactPlan({ foldable: 12 });
+    expect(plan.disabled).toBe(false);
+    expect(plan.label).toBe('Compact now');
+    expect(plan.hint).toBe('Folds 12 earlier messages into a summary.');
+  });
+
+  it('does not say "1 messages"', () => {
+    expect(compactPlan({ foldable: 1 }).hint).toBe(
+      'Folds 1 earlier message into a summary.',
+    );
+    expect(earlierMessages(1)).toBe('1 earlier message');
+    expect(earlierMessages(2)).toBe('2 earlier messages');
+  });
+
+  it('stays enabled and silent while the count is UNKNOWN', () => {
+    // Requirement 3: an unreachable orchestrator must not brick the control.
+    const plan = compactPlan({ foldable: null });
+    expect(plan.disabled).toBe(false);
+    expect(plan.hint).toBeNull();
+    expect(plan.label).toBe('Compact now');
+  });
+
+  it('is disabled while a compaction is in flight, spinner or not', () => {
+    const plan = compactPlan({ foldable: 12, compacting: true });
+    expect(plan.disabled).toBe(true);
+    expect(plan.label).toBe('Compacting…');
+  });
+
+  it('honours the host\'s own veto (no chat open, or streaming)', () => {
+    expect(compactPlan({ foldable: 12, blocked: true }).disabled).toBe(true);
+    expect(compactPlan({ foldable: null, blocked: true }).disabled).toBe(true);
+  });
+
+  it('says nothing lasting until a compaction has actually succeeded', () => {
+    const plan = compactPlan({ foldable: 12 });
+    expect(plan.folded).toBeNull();
+    expect(plan.showSummaryLink).toBe(false);
+  });
+
+  it('keeps a lasting line after a compaction, with the way back in', () => {
+    // A toast disappears; this is what the popover still says afterwards.
+    const plan = compactPlan({ foldable: 0, lastFolded: 12 });
+    expect(plan.folded).toBe('Compacted 12 earlier messages');
+    expect(plan.showSummaryLink).toBe(true);
+    expect(plan.summaryLabel).toBe('See what was kept');
+    // And the button beneath it is now honestly dead.
+    expect(plan.disabled).toBe(true);
+    expect(plan.hint).toBe(NOTHING_TO_COMPACT);
+  });
+
+  it('singularises the lasting line too', () => {
+    expect(compactPlan({ foldable: 0, lastFolded: 1 }).folded).toBe(
+      'Compacted 1 earlier message',
+    );
+  });
+
+  it('shows no lasting line for a compaction that folded nothing', () => {
+    expect(compactPlan({ foldable: 0, lastFolded: 0 }).folded).toBeNull();
+  });
+
+  it('the 28-message conversation from the live check, before and after', () => {
+    // Server returned folded_turns 27 / covers_through 27 on 28 messages, and
+    // "nothing older to summarize" on the second press.
+    const before = compactPlan({ foldable: 27 });
+    expect(before.disabled).toBe(false);
+    expect(before.hint).toBe('Folds 27 earlier messages into a summary.');
+    const after = compactPlan({ foldable: 0, lastFolded: 27 });
+    expect(after.disabled).toBe(true);
+    expect(after.folded).toBe('Compacted 27 earlier messages');
   });
 });

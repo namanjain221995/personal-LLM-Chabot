@@ -120,6 +120,9 @@ CLUSTER_TENSOR_PARALLEL_SIZE=2        # TP × PP must be 2
 CLUSTER_PIPELINE_PARALLEL_SIZE=1
 CLUSTER_GPU_MEMORY_UTILIZATION=0.30
 CLUSTER_KV_CACHE_MEMORY_GIB=16        # explicit per-node KV budget (see Memory: why not profiled)
+# MAIN_MODEL_MAX_LEN=800000           # served window; above the model's native 262,144 the
+                                      # launcher auto-enables YaRN and refuses windows this
+                                      # KV budget cannot hold (~922,000 tokens at 16 GiB)
 CLUSTER_MASTER_PORT=29501             # torch.distributed rendezvous on the head
 # optional: CLUSTER_NCCL_SOCKET_IFNAME, CLUSTER_NCCL_IB_HCA, CLUSTER_NCCL_DEBUG,
 #           CLUSTER_SPECULATIVE_CONFIG, CLUSTER_MAX_NUM_BATCHED_TOKENS,

@@ -59,6 +59,9 @@ DEFAULT_MAX_NUM_BATCHED_TOKENS = 8192
 # that profiling path entirely (observed 2026-08-25).
 DEFAULT_KV_CACHE_MEMORY_GIB = 16
 KV_CACHE_MEMORY_GIB_RANGE = (2, 96)
+#: The KV cache element type both nodes serve with; the launcher sizes the pool
+#: with the same dtype it puts on the command line.
+CLUSTER_KV_CACHE_DTYPE = "fp8"
 MINIMUM_MAX_NUM_BATCHED_TOKENS = 256
 DISTRIBUTED_TIMEOUT_SECONDS = 300
 DEFAULT_API_BIND_ADDRESS = "0.0.0.0"
@@ -508,18 +511,23 @@ def build_engine_arguments(
     head_ip: str,
     master_port: int,
     kv_cache_memory_gib: int = DEFAULT_KV_CACHE_MEMORY_GIB,
+    rope_override: str = "",
 ) -> str:
     """The single-line, shell-splittable engine argument string.
 
     Both Compose files interpolate this verbatim so the head and the worker
     build byte-identical engine configurations. The speculative JSON stays
-    single-quoted so Compose's shell-style split keeps it as one argv element.
+    single-quoted so Compose's shell-style split keeps it as one argv element;
+    ``rope_override`` (the ``--hf-overrides`` YaRN argument, empty unless the
+    requested window exceeds the model's native one) is quoted the same way and
+    sits next to ``--max-model-len`` because the two only make sense together.
     """
     segments = [
         f"--max-model-len {int(context)}",
+        rope_override.strip(),
         f"--gpu-memory-utilization {gpu_memory_utilization}",
         f"--kv-cache-memory-bytes {int(kv_cache_memory_gib) * 1024 ** 3}",
-        "--kv-cache-dtype fp8",
+        f"--kv-cache-dtype {CLUSTER_KV_CACHE_DTYPE}",
         "--trust-remote-code",
         shlex.join(list(startup_arguments)),
         "--enable-chunked-prefill",
@@ -546,6 +554,7 @@ def resolve_cluster_settings(
     startup_arguments: Sequence[str],
     vllm_port: int,
     detectors: ClusterDetectors = DEFAULT_DETECTORS,
+    rope_override: str = "",
 ) -> dict[str, str]:
     """Validate the user's ``CLUSTER_*`` keys and derive the generated ones.
 
@@ -628,6 +637,7 @@ def resolve_cluster_settings(
         head_ip=head_ip,
         master_port=master_port,
         kv_cache_memory_gib=kv_cache_gib,
+        rope_override=rope_override,
     )
     return {
         "CLUSTER_HEAD_IP": head_ip,
@@ -682,6 +692,7 @@ def resolve_cluster(
     vllm_port: int,
     detectors: ClusterDetectors = DEFAULT_DETECTORS,
     discovery: ClusterDiscovery = DEFAULT_DISCOVERY,
+    rope_override: str = "",
 ) -> ClusterResolution:
     """Turn ``CLUSTER_MODE`` (auto|single|dual) into an effective mode.
 
@@ -733,6 +744,7 @@ def resolve_cluster(
         startup_arguments=startup_arguments,
         vllm_port=vllm_port,
         detectors=detectors,
+        rope_override=rope_override,
     )
     worker_ip = settings["CLUSTER_WORKER_IP"]
     ssh_target = _ssh_target(user_values) or discovery.worker_ssh(worker_ip)

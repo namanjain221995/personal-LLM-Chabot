@@ -11,9 +11,28 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 from urllib.parse import urlsplit
 
-from .cluster import DEFAULT_DETECTORS, DEFAULT_DISCOVERY, ClusterDetectors, ClusterDiscovery, resolve_cluster
+from .cluster import (
+    CLUSTER_KV_CACHE_DTYPE,
+    DEFAULT_DETECTORS,
+    DEFAULT_DISCOVERY,
+    DEFAULT_KV_CACHE_MEMORY_GIB,
+    DEFAULT_TENSOR_PARALLEL_SIZE,
+    ClusterDetectors,
+    ClusterDiscovery,
+    resolve_cluster,
+)
 from .errors import TechSaraError
 from .model_manager import ModelInstall
+from .modelshape import (
+    ModelShape,
+    kv_bytes_per_token,
+    kv_gib_for_tokens,
+    kv_pool_tokens,
+    kv_usable_fraction,
+    read_model_shape,
+    rope_override_argument,
+    yarn_factor,
+)
 from .profiles import ModelSpec, SelectedProfile
 from .utils import atomic_write_text, parse_env_file, render_env, secure_token
 
@@ -163,6 +182,154 @@ def _truthy(value: str | None) -> bool:
     return (value or "").strip().lower() in {"1", "true", "yes", "on", "enabled"}
 
 
+# --------------------------------------------------------------------------
+# The user-owned main-model window
+# --------------------------------------------------------------------------
+
+#: The supported spelling of the user's context knob. It REPLACES the window
+#: the profile would pick and moves every derived key with it, so there is one
+#: number to change and nothing left to disagree with it.
+MAIN_CONTEXT_KEY = "MAIN_MODEL_MAX_LEN"
+#: The historical spelling. Setting it in .env used to do nothing at all: the
+#: launcher emits MODEL_MAX_CONTEXT into .runtime/generated.env, and
+#: generated.env is the LAST --env-file Compose reads, so the generated value
+#: always won. It is honoured now, but only when it asks for a window other
+#: than the one the profile would have chosen, so an existing .env that merely
+#: repeats the profile number changes nothing.
+MAIN_CONTEXT_ALIAS = "MODEL_MAX_CONTEXT"
+#: Below the low bound the deployment cannot do its own retrieval prompts; the
+#: high bound is 4x the longest native window any supported model has.
+MAIN_CONTEXT_RANGE = (4096, 1048576)
+
+
+def _requested_window(values: Mapping[str, str], name: str) -> int | None:
+    """One context key from .env: an int in range, or None when unset."""
+    raw = str(values.get(name, "") or "").strip()
+    if not raw:
+        return None
+    low, high = MAIN_CONTEXT_RANGE
+    try:
+        number = int(raw)
+    except ValueError as exc:
+        raise TechSaraError(
+            f"{name} must be a whole number of tokens between {low:,} and {high:,}; got {raw!r}"
+        ) from exc
+    if not low <= number <= high:
+        raise TechSaraError(f"{name} must be between {low:,} and {high:,} tokens; got {number:,}")
+    return number
+
+
+def profile_context_length(profile: SelectedProfile, context_override: int | None = None) -> int:
+    """The window the profile selects, clamped to the model's manifest limit."""
+    requested = int(context_override or profile.context_length)
+    return min(requested, profile.main_model.context_limit) if profile.main_model else requested
+
+
+def resolve_requested_context(
+    values: Mapping[str, str], *, profile_context: int
+) -> tuple[int, str]:
+    """The main-model window to serve, and the name of the key that chose it.
+
+    ``MAIN_MODEL_MAX_LEN`` wins outright; ``MODEL_MAX_CONTEXT`` is accepted as
+    a deprecated alias only when it differs from the profile's own choice.
+    """
+    explicit = _requested_window(values, MAIN_CONTEXT_KEY)
+    if explicit is not None:
+        return explicit, MAIN_CONTEXT_KEY
+    alias = _requested_window(values, MAIN_CONTEXT_ALIAS)
+    if alias is not None and alias != int(profile_context):
+        return alias, MAIN_CONTEXT_ALIAS
+    return int(profile_context), "profile"
+
+
+def _main_model_shape(
+    profile: SelectedProfile,
+    install_map: Mapping[tuple[str, str], ModelInstall],
+    *,
+    allow_planned: bool,
+) -> ModelShape | None:
+    """The main model's geometry, or None when it cannot be read yet."""
+    main = profile.main_model
+    if not main:
+        return None
+    install = install_map.get((main.id, main.revision))
+    if not install or not (install.ready or (allow_planned and install.status == "planned")):
+        return None
+    return read_model_shape(Path(install.path).expanduser())
+
+
+def _require_cluster_kv_capacity(
+    cluster_values: Mapping[str, str], *, context: int, shape: ModelShape, key: str
+) -> None:
+    """Refuse a window the explicit two-node KV budget provably cannot hold.
+
+    vLLM requires the KV pool to fit at least one max-length request, and in
+    dual mode the pool is not profiled - it is exactly
+    ``--kv-cache-memory-bytes``, so the arithmetic is decidable here instead of
+    30 minutes into a start-up.
+    """
+    parallel = int(cluster_values.get("CLUSTER_TENSOR_PARALLEL_SIZE") or DEFAULT_TENSOR_PARALLEL_SIZE)
+    budget = int(cluster_values.get("CLUSTER_KV_CACHE_MEMORY_GIB") or DEFAULT_KV_CACHE_MEMORY_GIB)
+    per_token = kv_bytes_per_token(
+        shape, tensor_parallel_size=parallel, kv_cache_dtype=CLUSTER_KV_CACHE_DTYPE
+    )
+    fraction = kv_usable_fraction(shape)
+    pool = kv_pool_tokens(budget, per_token, usable_fraction=fraction)
+    if pool >= int(context):
+        return
+    hybrid_note = (
+        " (the recurrent layers take their per-sequence state from the same budget)"
+        if fraction < 1.0
+        else ""
+    )
+    raise TechSaraError(
+        f"{key}={int(context):,} needs a KV pool of at least {int(context):,} tokens; "
+        f"CLUSTER_KV_CACHE_MEMORY_GIB={budget} holds {pool:,} tokens at TP={parallel} "
+        f"({per_token:,} bytes/token at --kv-cache-dtype {CLUSTER_KV_CACHE_DTYPE}){hybrid_note}; "
+        f"set CLUSTER_KV_CACHE_MEMORY_GIB="
+        f"{kv_gib_for_tokens(context, per_token, usable_fraction=fraction)} on both nodes "
+        f"or lower {key}"
+    )
+
+
+def main_context_notices(
+    values: Mapping[str, str], generated: Mapping[str, str], *, profile_context: int
+) -> list[str]:
+    """The lines ``up`` prints about the window; empty when nothing is unusual.
+
+    Derived from the generated values so the launcher narrates exactly what it
+    is about to serve rather than a second, parallel calculation.
+    """
+    lines: list[str] = []
+    _window, source = resolve_requested_context(values, profile_context=profile_context)
+    if source == MAIN_CONTEXT_ALIAS:
+        lines.append(
+            f"Context: {MAIN_CONTEXT_ALIAS} in .env is applied as the main-model window; "
+            f"{MAIN_CONTEXT_KEY} is the supported spelling"
+        )
+    context = int(str(generated.get("MODEL_MAX_CONTEXT") or 0) or 0)
+    native = int(str(generated.get("MAIN_MODEL_NATIVE_CONTEXT") or 0) or 0)
+    if not (native and context > native):
+        return lines
+    factor = yarn_factor(context, native)
+    lines.append(
+        f"Context: {context:,} tokens (model is natively {native:,}; YaRN factor {factor:g} enabled "
+        "- long-context extension trades some short-prompt quality)"
+    )
+    per_token = int(str(generated.get("MAIN_MODEL_KV_BYTES_PER_TOKEN") or 0) or 0)
+    fraction = float(str(generated.get("MAIN_MODEL_KV_USABLE_FRACTION") or 1.0) or 1.0)
+    if per_token and str(generated.get("TECHSARA_CLUSTER_MODE") or "single") != "dual":
+        # Single node: the pool is profiled at start-up from whatever memory is
+        # free, so this is the honest estimate rather than a refusal.
+        lines.append(
+            f"Context: that window needs about "
+            f"{kv_gib_for_tokens(context, per_token, usable_fraction=fraction)} GiB of KV cache "
+            f"at TP=1 ({per_token:,} bytes/token); vLLM sizes the pool while it starts and will "
+            "refuse the window if the GPU cannot hold it"
+        )
+    return lines
+
+
 #: Host ports the launcher may publish, with the values this deployment has
 #: historically used. Model ports are only published on explicit opt-in.
 MODEL_PORT_DEFAULTS = {
@@ -299,10 +466,19 @@ def build_generated_environment(
         raise TechSaraError(
             "SEARCH_PROVIDER must be one of searxng, tavily, or brave"
         )
-    requested_context = int(context_override or profile.context_length)
-    context = min(requested_context, profile.main_model.context_limit) if profile.main_model else requested_context
     cache = cache_root.expanduser().resolve()
     install_map = {(item.model_id, item.revision): item for item in installs}
+
+    # The window: the profile's choice unless the user owns it in .env. An
+    # explicit MAIN_MODEL_MAX_LEN replaces the profile value outright (that is
+    # the point of the knob) and, when it is longer than the window the model
+    # was trained for, brings a YaRN --hf-overrides argument with it.
+    profile_context = profile_context_length(profile, context_override)
+    context, context_source = resolve_requested_context(user_values, profile_context=profile_context)
+    shape = _main_model_shape(profile, install_map, allow_planned=allow_planned)
+    rope_override = ""
+    if shape is not None and context > shape.native_context:
+        rope_override = rope_override_argument(shape, yarn_factor(context, shape.native_context))
 
     # Two-node DGX Spark cluster: CLUSTER_MODE=auto (default) discovers and
     # verifies a second Spark on the dgx-spark profile only; every other host
@@ -317,9 +493,17 @@ def build_generated_environment(
         vllm_port=resolve_published_port(user_values, "VLLM_PORT"),
         detectors=CLUSTER_DETECTORS,
         discovery=CLUSTER_DISCOVERY,
+        rope_override=rope_override,
     )
     cluster_mode = cluster.mode
     cluster_values = cluster.generated()
+    if shape is not None and cluster_mode == "dual":
+        _require_cluster_kv_capacity(
+            cluster_values,
+            context=context,
+            shape=shape,
+            key=context_source if context_source != "profile" else MAIN_CONTEXT_KEY,
+        )
 
     native = profile.runtime_backend == "native-vllm-metal"
     family = profile.family
@@ -406,6 +590,16 @@ def build_generated_environment(
         "MODEL_MAX_CONTEXT": str(context),
         "DEFAULT_MAX_CONTEXT": str(context),
         "REPORT_MAX_CONTEXT": str(context),
+        # Always emitted, empty when the model's geometry could not be read, so
+        # the overlays interpolate deterministically in both states.
+        "MAIN_MODEL_NATIVE_CONTEXT": str(shape.native_context) if shape else "",
+        "MAIN_MODEL_ROPE_OVERRIDE": rope_override,
+        "MAIN_MODEL_KV_BYTES_PER_TOKEN": (
+            str(kv_bytes_per_token(shape, tensor_parallel_size=1, kv_cache_dtype=CLUSTER_KV_CACHE_DTYPE))
+            if shape
+            else ""
+        ),
+        "MAIN_MODEL_KV_USABLE_FRACTION": f"{kv_usable_fraction(shape):g}",
         "MODEL_CONCURRENCY": str(profile.concurrency),
         "SEARCH_ENABLED": _bool(search_enabled),
         "SEARCH_PROVIDER": search_provider,
@@ -525,7 +719,14 @@ def build_generated_environment(
     }
     if family != "external":
         for prefix, model in role_models.items():
-            role_context = min(context, model.context_limit) if model else 0
+            # The main model serves exactly the window above, extension
+            # included: clamping it back to the manifest limit here is what
+            # used to make one knob disagree with itself. Every other role
+            # keeps its own limit.
+            if model is not None and model is main:
+                role_context = context
+            else:
+                role_context = min(context, model.context_limit) if model else 0
             values.update(_capability_values(prefix, model, enabled=model is not None, context=role_context, concurrency=profile.concurrency, native_auth=native and model is not None and model.endpoint_type != "in-process"))
 
     for key, model in (
