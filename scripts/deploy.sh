@@ -155,7 +155,11 @@ else
 fi
 
 if [ "$ROLLBACK" != 1 ]; then die "left in place for inspection (--no-rollback)"; fi
-if [ "$TARGET" = "$PREVIOUS" ]; then die "nothing to roll back to: the failure is at the already-live commit"; fi
+if [ "$TARGET" = "$PREVIOUS" ]; then
+  die "the checkout was already at $TARGET, so this was a reconcile rather than a\
+ version change and there is no earlier commit to return to. The stack is in the\
+ state the health gate rejected - inspect it with scripts/cluster-status.sh"
+fi
 say "ROLLING BACK to $PREVIOUS"
 if apply "$PREVIOUS" && health; then
   die "deploy of $TARGET failed; rolled back to $PREVIOUS and the stack is healthy again"

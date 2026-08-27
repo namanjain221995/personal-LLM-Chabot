@@ -82,19 +82,48 @@ else
   echo "  API: NOT RESPONDING at $(api_url)"; check_fail "API not responding" >/dev/null
 fi
 if [ -n "$hid" ]; then
-  logs="$(docker logs "$hid" 2>&1 | tail -n 20000)"
-  eng="$(printf '%s\n' "$logs" | grep -E "Initializing a V1 LLM engine" | tail -n1)"
-  tp="$(printf '%s' "$eng" | grep -oE 'tensor_parallel_size=[0-9]+' | cut -d= -f2)"; pp="$(printf '%s' "$eng" | grep -oE 'pipeline_parallel_size=[0-9]+' | cut -d= -f2)"
-  ws="$(printf '%s\n' "$logs" | grep -oE 'world_size=[0-9]+' | tail -n1 | cut -d= -f2)"
-  kv="$(printf '%s\n' "$logs" | grep -oE 'GPU KV cache size: [0-9,]+ tokens' | tail -n1)"
+  # Every grep below MUST tolerate no match. The engine's start-up banner rolls
+  # out of the log window after a day or so of request logging, and under
+  # `set -euo pipefail` an empty grep inside $(...) aborts the whole script -
+  # which made this report exit 1 on a perfectly healthy cluster once the head
+  # had been up ~41 hours, and failed a deploy health gate for no reason.
+  logs="$(docker logs "$hid" 2>&1 | tail -n 20000 || true)"
+  # Parallelism comes from the RUNNING CONTAINER'S ARGV, which cannot roll over,
+  # and only falls back to the log banner if that is somehow unavailable.
+  tp="$(docker inspect "$hid" --format '{{json .Config.Cmd}}' 2>/dev/null \
+        | python3 -c 'import json,sys
+try:
+    c=json.load(sys.stdin); print(c[c.index("--tensor-parallel-size")+1])
+except Exception: print("")' 2>/dev/null || true)"
+  pp="$(docker inspect "$hid" --format '{{json .Config.Cmd}}' 2>/dev/null \
+        | python3 -c 'import json,sys
+try:
+    c=json.load(sys.stdin); print(c[c.index("--pipeline-parallel-size")+1])
+except Exception: print("")' 2>/dev/null || true)"
+  eng="$(printf '%s\n' "$logs" | grep -E "Initializing a V1 LLM engine" | tail -n1 || true)"
+  [ -n "$tp" ] || tp="$(printf '%s' "$eng" | grep -oE 'tensor_parallel_size=[0-9]+' | cut -d= -f2 || true)"
+  [ -n "$pp" ] || pp="$(printf '%s' "$eng" | grep -oE 'pipeline_parallel_size=[0-9]+' | cut -d= -f2 || true)"
+  ws="$(printf '%s\n' "$logs" | grep -oE 'world_size=[0-9]+' | tail -n1 | cut -d= -f2 || true)"
+  kv="$(printf '%s\n' "$logs" | grep -oE 'GPU KV cache size: [0-9,]+ tokens' | tail -n1 || true)"
   printf '  Engine: tensor_parallel=%s pipeline_parallel=%s world_size=%s\n' "${tp:-?}" "${pp:-?}" "${ws:-?}"
   [ -n "$kv" ] && printf '  Per-node %s\n' "$kv"
-  if [ "${ws:-1}" = "2" ] || [ "$(( ${tp:-1} * ${pp:-1} ))" = "2" ]; then check_pass "Distributed GPUs: 2" >/dev/null; echo "  Distributed GPUs: 2"; else echo "  Distributed GPUs: ${ws:-?}"; [ "$CLUSTER_MODE" = dual ] && check_fail "engine is not 2-way distributed" >/dev/null; fi
-  m="$(curl -fsS -m 5 "$(api_url)/metrics" 2>/dev/null | grep -E '^vllm:(num_requests_running|num_requests_waiting|kv_cache_usage_perc)\{' | sed -E 's/\{[^}]*\}//' | tr '\n' ' ')"
+  product=$(( ${tp:-0} * ${pp:-0} ))
+  if [ "${ws:-0}" = "2" ] || [ "$product" = 2 ]; then
+    check_pass "Distributed GPUs: 2" >/dev/null; echo "  Distributed GPUs: 2"
+  elif [ "$product" = 0 ] && [ -z "${ws:-}" ]; then
+    # Neither argv nor the log window could tell us. Unknown is not failure:
+    # the worker's own health and the NCCL transport are checked separately.
+    echo "  Distributed GPUs: unknown (engine banner has rolled out of the log window)"
+    check_warn "could not determine the parallel layout" >/dev/null
+  else
+    echo "  Distributed GPUs: ${ws:-$product}"
+    [ "$CLUSTER_MODE" = dual ] && check_fail "engine is not 2-way distributed" >/dev/null
+  fi
+  m="$(curl -fsS -m 5 "$(api_url)/metrics" 2>/dev/null | grep -E '^vllm:(num_requests_running|num_requests_waiting|kv_cache_usage_perc)\{' | sed -E 's/\{[^}]*\}//' | tr '\n' ' ' || true)"
   [ -n "$m" ] && echo "  Metrics: $m"
   echo
   echo "NCCL"
-  using="$(printf '%s\n' "$logs" | grep -E 'NET/(IB|Socket) : Using' | tail -n1 | sed -E 's/^.*NCCL INFO //')"
+  using="$(printf '%s\n' "$logs" | grep -E 'NET/(IB|Socket) : Using' | tail -n1 | sed -E 's/^.*NCCL INFO //' || true)"
   ib="$(printf '%s\n' "$logs" | grep -cE 'via NET/IB' || true)"; sock="$(printf '%s\n' "$logs" | grep -cE 'via NET/Socket' || true)"
   if [ "$ib" -gt 0 ] && [ "$sock" -eq 0 ]; then
     hcas="$(printf '%s' "$using" | grep -oE '\[[0-9]+\][A-Za-z0-9_]+:[0-9]+/RoCE' | wc -l)"
