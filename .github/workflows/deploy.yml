@@ -23,6 +23,9 @@ on:
         description: "Recreate EVERY container, including the models (+6-10 min)"
         type: boolean
         default: false
+      branch:
+        description: "Branch to leave the production checkout on (blank = repo variable DEPLOY_BRANCH; '-' = detached HEAD)"
+        default: ""
 
 # Never let two deploys touch the same box. Queue, do not cancel: cancelling a
 # half-finished `techsara up` is how you get a partially recreated stack.
@@ -73,6 +76,15 @@ jobs:
           # contain none of this repo's code, so it only matters when you want a
           # guaranteed-clean slate rather than a correct one.
           DEPLOY_FULL: ${{ vars.DEPLOY_FULL }}
+          # Repository variable DEPLOY_BRANCH: the branch the production
+          # checkout should be left ON, fast-forwarded to the deployed commit.
+          # That checkout is also the machine owner's working directory, and a
+          # bare deploy leaves it in "detached HEAD", which is confusing to walk
+          # into. Empty (the default) keeps that detached-HEAD behaviour. The
+          # deploy only ever FAST-FORWARDS this branch; if it cannot, the branch
+          # is left untouched and the deploy detaches with a warning.
+          # A one-off dispatch can override it; "-" forces a detached HEAD.
+          DEPLOY_BRANCH: ${{ github.event.inputs.branch || vars.DEPLOY_BRANCH }}
         run: |
           set -euo pipefail
           cd "$TECHSARA_DEPLOY_ROOT"
@@ -81,6 +93,15 @@ jobs:
             FLAGS="--full"
             echo "full restart requested (inputs.full or vars.DEPLOY_FULL)"
           fi
+          # Recorded for the summary step, which runs even when this one fails.
+          echo "DEPLOY_WAS_FULL=${FLAGS:+true}" >> "$GITHUB_ENV"
+
+          # "-" is the only way a dispatch can ask for a detached HEAD while the
+          # repo variable is set, because an empty input falls back to the var.
+          if [ "${DEPLOY_BRANCH:-}" = "-" ]; then DEPLOY_BRANCH=""; fi
+          export DEPLOY_BRANCH
+          echo "checkout will land on: ${DEPLOY_BRANCH:-<detached HEAD>}"
+
           # From the workspace (the new commit), targeting the production root.
           "$GITHUB_WORKSPACE/scripts/deploy.sh" --ref "$DEPLOY_REF" $FLAGS
 
@@ -92,6 +113,20 @@ jobs:
           cd "$TECHSARA_DEPLOY_ROOT" || exit 0
           echo "### Deployed commit" >> "$GITHUB_STEP_SUMMARY"
           git log -1 --pretty='- `%h` %s' >> "$GITHUB_STEP_SUMMARY"
+
+          # `--abbrev-ref HEAD` prints the literal "HEAD" when detached.
+          ON="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+          if [ "$ON" = "HEAD" ]; then
+            echo "- checkout is on a **detached HEAD** (no DEPLOY_BRANCH, or the branch could not be fast-forwarded - see the log below)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- checkout is on branch **\`$ON\`**" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ "${DEPLOY_WAS_FULL:-}" = "true" ]; then
+            echo "- **every container was recreated** (\`--full\`: the models reloaded too)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- only containers whose definition changed were recreated; the model servers kept running (set the repo variable \`DEPLOY_FULL=true\`, or re-run with **full**, to recreate everything)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
           echo "### Containers" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           docker ps --filter label=com.docker.compose.project=sf-local-ai \
