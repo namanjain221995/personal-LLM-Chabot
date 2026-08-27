@@ -814,12 +814,66 @@ MOCK_MODE=true npm run dev        # UI-only development
 | Sync worker | discovery, JWT/secrets, Bulk fallback, upserts, deletes, watermarks, chunking, embedding integrity, CLI | 157 tests |
 | Frontend | Vitest; 28 pure-logic files in Node, 4 component files in jsdom (`// @vitest-environment jsdom`) | 32 files, 436 cases |
 
-Notes: there is **no CI workflow** in the repository — run the suites locally and
-record commands, dates and results separately (see
-[`docs/01-codebase/test-map.md`](docs/01-codebase/test-map.md)). `npm run lint`
-(`next lint`) no longer exists on Next 16; use `npx tsc --noEmit` and the editor's
-ESLint. Commit subjects follow Conventional Commits (`feat(reasoning): …`,
-`fix(logging): …`); the narrative and numbers go into a dated `CHANGELOG.md` entry.
+Notes: CI runs these suites on every pull request and on every push to `main` or
+`dev` (see §22.1); the local commands above stay the fast inner loop.
+`npm run lint` (`next lint`) no longer exists on Next 16; use `npx tsc --noEmit`
+and the editor's ESLint. Commit subjects
+follow Conventional Commits (`feat(reasoning): …`, `fix(logging): …`); the
+narrative and numbers go into a dated `CHANGELOG.md` entry.
+
+### 22.1 Continuous integration and deployment
+
+Two workflows. [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs the
+four suites on GitHub-hosted runners — the launcher one across Python 3.11 and
+3.12, so six job runs — behind a `ci-ok` gate job. [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml)
+runs on a **self-hosted runner on the DGX Spark itself**, because the deploy
+target *is* this machine: it owns the GPU, the 41 GB model cache, the named
+volumes and the `.env`. Nothing is copied anywhere and the workflow needs no
+secret.
+
+**What a merge to `main` does.** CI runs; only if it goes green does Deploy
+start (`workflow_run`, never `push`, so untested code cannot reach the box).
+Deploy then runs [`scripts/deploy.sh`](scripts/deploy.sh) against the production
+checkout, which takes a lock, refuses a dirty tree, resolves the target commit
+**remote-first**, moves the checkout, runs `./techsara up`, and then refuses to
+call it a success until the stack answers: orchestrator `/health`, the frontend,
+and a *real* chat completion (`/v1/models` answers even when the engine is
+dead). A `degraded` health status is tolerated — DuckDB legitimately reports an
+error while the sync worker holds the single-writer lock — but `app_db` or the
+main model being down is fatal. A failed gate rolls back to the commit that was
+live before. `down -v` is never used, so no volume is ever destroyed.
+
+**Two repository variables** (Settings → Secrets and variables → Actions →
+Variables) control the parts you are most likely to want to change:
+
+| Variable | Unset (default) | Set | What it costs |
+|---|---|---|---|
+| `DEPLOY_FULL` | `techsara up` recreates only the services whose definition changed. An app-only merge leaves `vllm`, `router`, `ocr`, `reranker` and `embed` running — correct, because those images are pinned upstream and contain none of this repo's code. Merge #17 took **55 s**. | `true` → `techsara down` first, so **every** container is recreated, models included. | **~17 min** end to end; the 27B alone reloads in ~441 s. Volumes are preserved — you pay time, not data. |
+| `DEPLOY_BRANCH` | The checkout is left on a **detached HEAD** at the deployed commit. | e.g. `dev` → the checkout is left **on that branch**, fast-forwarded to the deployed commit. | Nothing. Use it because this checkout is also a working directory, and walking into "detached HEAD" after every merge is confusing. |
+
+**`DEPLOY_BRANCH` fast-forwards; it never rewrites.** If the branch is behind
+the deployed commit it is fast-forwarded onto it. If it holds commits the
+deployed commit does not contain — you have local work, or it has diverged — the
+deploy **leaves the branch exactly where it is**, logs the divergence counts from
+`git rev-list --left-right --count`, and falls back to a detached HEAD so the
+*code being served is still correct*. It never resets, rebases, force-moves or
+discards a commit, and it aborts before starting anything if `HEAD` does not end
+up exactly at the requested commit. The same rule applies to a rollback: a
+rollback moves HEAD to the earlier commit but does not rewind the branch,
+because rewinding discards commits.
+
+**A one-off, from the Actions UI.** Actions → *Deploy* → *Run workflow*, which
+takes three inputs: `ref` (branch or SHA, default `main`), `full` (tick it to
+recreate every container for this run only), and `branch` (the branch to land
+the checkout on for this run; blank uses `DEPLOY_BRANCH`, and `-` forces a
+detached HEAD). The same knobs exist on the script:
+
+```bash
+scripts/deploy.sh --ref main --branch dev --full     # or --dry-run to just resolve
+```
+
+The job summary reports the deployed commit, which branch the checkout ended on,
+and whether every container was recreated or only the changed ones.
 
 ---
 

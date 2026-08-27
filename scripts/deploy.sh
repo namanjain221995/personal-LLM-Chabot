@@ -3,12 +3,17 @@
 # the application images, recreate the containers whose definition changed, and
 # refuse to call it a success until the stack actually answers.
 #
-#   scripts/deploy.sh [--ref origin/main] [--full] [--dry-run] [--no-rollback]
+#   scripts/deploy.sh [--ref origin/main] [--branch NAME] [--full] [--dry-run]
+#                     [--no-rollback]
 #
 #   --full          `techsara down` first, so EVERY container is recreated.
 #                   Costs 6-10 extra minutes because the 27B model reloads.
 #                   Without it the launcher recreates only what changed, which
 #                   for an app-only change leaves the model containers running.
+#   --branch NAME   leave the production checkout ON local branch NAME, fast-
+#                   forwarded to the deployed commit, instead of on a detached
+#                   HEAD. Also settable as DEPLOY_BRANCH=NAME; empty or unset
+#                   keeps the detached-HEAD behaviour exactly as it was.
 #   --dry-run       resolve and report; change nothing.
 #   --no-rollback   leave a failed deploy in place for inspection.
 #
@@ -21,19 +26,29 @@
 #     checkout cannot touch credentials, runtime state or the 41 GB of weights.
 #   * A dirty production tree aborts the deploy rather than discarding someone's
 #     work in progress.
+#   * A configured DEPLOY_BRANCH is FAST-FORWARDED ONLY. This checkout is also
+#     the machine owner's working directory, so the deploy will never reset,
+#     rebase or force-move their branch: if the branch cannot fast-forward to
+#     the deployed commit it is left untouched and the deploy detaches instead,
+#     which still ships the right code.
 #   * On a failed health gate it rolls back to the commit that was live before.
 set -euo pipefail
 
 ROOT="${TECHSARA_DEPLOY_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 REF="${DEPLOY_REF:-origin/main}"
+# Empty means "detached HEAD", which is what this script did before the setting
+# existed. Any non-empty value is a LOCAL branch name to land the checkout on.
+DEPLOY_BRANCH="${DEPLOY_BRANCH:-}"
 FULL=0; DRY=0; ROLLBACK=1
 while [ $# -gt 0 ]; do
   case "$1" in
     --ref) REF="$2"; shift ;;
+    --branch) DEPLOY_BRANCH="${2:-}"; shift ;;
     --full) FULL=1 ;;
     --dry-run) DRY=1 ;;
     --no-rollback) ROLLBACK=0 ;;
-    -h|--help) sed -n '2,26p' "$0"; exit 0 ;;
+    # Print the whole header block, so adding to it cannot desync a line range.
+    -h|--help) awk 'NR==1{next} /^#/{print; next} {exit}' "$0"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
   shift
@@ -52,7 +67,7 @@ if ! flock -n 9; then
   die "another deploy holds $ROOT/.runtime/locks/deploy.lock"
 fi
 
-say "deploy start  root=$ROOT ref=$REF full=$FULL log=$LOG"
+say "deploy start  root=$ROOT ref=$REF full=$FULL branch=${DEPLOY_BRANCH:-<detached>} log=$LOG"
 
 # ------------------------------------------------------------------- preflight
 [ -f "$ROOT/techsara" ] || die "$ROOT is not a TechSara checkout"
@@ -89,17 +104,124 @@ if [ "$TARGET" = "$PREVIOUS" ]; then
   say "already at the target commit; still reconciling containers so a manual "
   say "docker change cannot leave the box drifted from the repo"
 fi
+if [ -z "$DEPLOY_BRANCH" ]; then
+  say "branch =<none>  DEPLOY_BRANCH is unset, so HEAD will be detached at the target"
+elif ! git -C "$ROOT" show-ref --verify --quiet "refs/heads/$DEPLOY_BRANCH"; then
+  say "branch =$DEPLOY_BRANCH  (no such local branch yet; it will be created)"
+elif git -C "$ROOT" merge-base --is-ancestor "$DEPLOY_BRANCH" "$TARGET"; then
+  say "branch =$DEPLOY_BRANCH  (fast-forwards to the target)"
+else
+  say "branch =$DEPLOY_BRANCH  (CANNOT fast-forward: $(git -C "$ROOT" rev-list --left-right --count "$DEPLOY_BRANCH...$TARGET" | tr -s '\t ' '/') ahead/behind; the branch would be left alone and HEAD detached)"
+fi
+
 if [ "$DRY" = 1 ]; then say "dry run: nothing changed"; exit 0; fi
+
+# ------------------------------------------------------------ where HEAD lands
+# This checkout is production AND the machine owner's working directory, so the
+# deploy has two duties that pull against each other: the tree must end up at
+# the deployed commit, and the owner's branches must never be rewritten. The
+# rule that satisfies both is "fast-forward or nothing".
+
+detach_to() {  # detach_to <sha> <why> - ship the right code, touch no branch
+  local sha="$1" why="$2"
+  say "  branch: NOT moving $DEPLOY_BRANCH - $why"
+  say "  branch: the branch is left exactly where it was; nothing was reset,"
+  say "  branch: rebased, force-moved or discarded. Deploying $sha on a DETACHED"
+  say "  branch: HEAD instead, so the code being served is still correct."
+  say "  branch: merge or rebase $DEPLOY_BRANCH yourself, then deploy again."
+  git -C "$ROOT" checkout --detach --force --quiet "$sha"
+}
+
+land_on_branch() {  # land_on_branch <sha> - end up ON $DEPLOY_BRANCH at <sha>
+  local sha="$1" b="$DEPLOY_BRANCH" err counts ahead behind
+
+  # (a) A branch that exists only on the remote is created to track it. A branch
+  #     that exists nowhere is created at the target - inventing a ref that
+  #     points at nothing cannot destroy history, and it is the fresh-clone case.
+  if ! git -C "$ROOT" show-ref --verify --quiet "refs/heads/$b"; then
+    if git -C "$ROOT" show-ref --verify --quiet "refs/remotes/origin/$b"; then
+      say "  branch: $b is not a local branch yet; creating it to track origin/$b"
+      git -C "$ROOT" branch --quiet --track "$b" "origin/$b" \
+        || { detach_to "$sha" "could not create $b from origin/$b"; return $?; }
+    else
+      say "  branch: $b exists neither locally nor on origin; creating it at the target"
+      git -C "$ROOT" branch --quiet "$b" "$sha" \
+        || { detach_to "$sha" "could not create $b"; return $?; }
+    fi
+  fi
+
+  # (b) git REFUSES this when the branch is checked out in another worktree.
+  #     That is a real configuration on this box, so catch it instead of
+  #     fighting it with --ignore-other-worktrees.
+  if ! err="$(git -C "$ROOT" checkout --force --quiet "$b" 2>&1)"; then
+    say "  branch: git refused to check out $b: ${err//$'\n'/ | }"
+    detach_to "$sha" "it could not be checked out (checked out in another worktree?)"
+    return $?
+  fi
+
+  # (d) Decided before anything is moved, by a read-only ancestry test: if the
+  #     branch holds commits the target does not contain, fast-forwarding is
+  #     impossible and the ONLY safe move is to leave it alone.
+  if ! git -C "$ROOT" merge-base --is-ancestor "$b" "$sha"; then
+    counts="$(git -C "$ROOT" rev-list --left-right --count "$b...$sha" 2>/dev/null || printf '? ?')"
+    ahead="${counts%%[[:space:]]*}"; behind="${counts##*[[:space:]]}"
+    say "  branch: $b CANNOT be fast-forwarded to $sha"
+    say "  branch: git rev-list --left-right --count $b...$sha -> $ahead $behind"
+    say "  branch: $b holds $ahead commit(s) that $sha does not contain, and is"
+    say "  branch: missing $behind commit(s) that it does - it has diverged."
+    detach_to "$sha" "fast-forward is not possible ($ahead ahead / $behind behind)"
+    return $?
+  fi
+
+  # (c) The fast-forward itself. Cannot create a commit and cannot lose one.
+  behind="$(git -C "$ROOT" rev-list --count "$b..$sha" 2>/dev/null || printf '?')"
+  if ! git -C "$ROOT" merge --ff-only --quiet "$sha" >>"$LOG" 2>&1; then
+    say "  branch: $b fast-forwards on paper but git merge --ff-only failed (see $LOG)"
+    detach_to "$sha" "the fast-forward itself failed"
+    return $?
+  fi
+  if [ "$behind" = 0 ]; then
+    say "  branch: on $b, already at $sha - no fast-forward needed"
+  else
+    say "  branch: on $b, fast-forwarded $behind commit(s) to $sha"
+  fi
+  return 0
+}
+
+LANDED_ON="(detached)"   # set by land(), reported at the end and by the workflow
+land() {  # land <sha> - make the production checkout BE <sha>, non-destructively
+  local sha="$1" head on
+  if [ -n "$DEPLOY_BRANCH" ]; then
+    land_on_branch "$sha" || return 1
+  else
+    # Detach rather than reset: the production checkout may be sitting on a
+    # branch (it was on "dev"), and `reset --hard` would MOVE that branch to the
+    # deployed commit, silently rewriting the developer's own branch pointer.
+    # Detaching moves only HEAD, so branches are left exactly where they were.
+    git -C "$ROOT" checkout --detach --force --quiet "$sha" || return 1
+    say "  branch: DEPLOY_BRANCH is unset - detaching HEAD at $sha"
+  fi
+  git -C "$ROOT" clean -qfd -e .env -e .runtime || true
+
+  # Never negotiable: whatever route was taken above, the tree that is about to
+  # be built and started MUST be the commit we were asked to ship. Shipping a
+  # checkout that does not match the request is worse than not deploying.
+  head="$(git -C "$ROOT" rev-parse HEAD)"
+  if [ "$head" != "$sha" ]; then
+    die "aborting: HEAD is $head but the deploy target is $sha. Nothing was built\
+ or restarted, so the containers are still serving the previous commit."
+  fi
+  on="$(git -C "$ROOT" rev-parse --abbrev-ref HEAD)"
+  if [ "$on" = HEAD ]; then on="(detached)"; fi
+  LANDED_ON="$on"
+  say "  checkout: HEAD=$sha  branch=$on"
+  return 0
+}
 
 # --------------------------------------------------------------------- deploy
 apply() {  # apply <sha> - move the checkout and bring the stack up
   local sha="$1"
-  # Detach rather than reset: the production checkout may be sitting on a
-  # branch (it was on "dev"), and `reset --hard` would MOVE that branch to the
-  # deployed commit, silently rewriting the developer's own branch pointer.
-  # Detaching moves only HEAD, so branches are left exactly where they were.
-  git -C "$ROOT" checkout --detach --force --quiet "$sha" || return 1
-  git -C "$ROOT" clean -qfd -e .env -e .runtime || true
+  land "$sha" || return 1
   if [ "$FULL" = 1 ]; then
     # Every container goes, models included. `down` never passes -v, so the
     # database, warehouse, vector index and reports all survive; what is paid
@@ -160,7 +282,7 @@ print(",".join(bad) if bad else "-")' 2>/dev/null)"
 
 if apply "$TARGET"; then
   if health; then
-    say "DEPLOYED $TARGET"
+    say "DEPLOYED $TARGET  checkout is on $LANDED_ON"
     git -C "$ROOT" log -1 --pretty='  %h %s' "$TARGET" | tee -a "$LOG"
     exit 0
   fi
@@ -177,6 +299,15 @@ if [ "$TARGET" = "$PREVIOUS" ]; then
  state the health gate rejected - inspect it with scripts/cluster-status.sh"
 fi
 say "ROLLING BACK to $PREVIOUS"
+if [ -n "$DEPLOY_BRANCH" ]; then
+  # A rollback wants an EARLIER commit, so landing $DEPLOY_BRANCH on it would
+  # mean rewinding the branch - the one thing this script never does. HEAD goes
+  # back, the branch stays put, and the log says so rather than surprising the
+  # owner of the checkout.
+  say "  note: HEAD is being moved back, but $DEPLOY_BRANCH is NOT rewound:"
+  say "  note: rewinding a branch discards commits from it, and this script"
+  say "  note: only ever fast-forwards. Expect to finish on a detached HEAD."
+fi
 if apply "$PREVIOUS" && health; then
   die "deploy of $TARGET failed; rolled back to $PREVIOUS and the stack is healthy again"
 fi
