@@ -94,7 +94,7 @@ import { ContextMeter } from './ContextMeter';
 import { SummaryPanel } from './SummaryPanel';
 import { EmptyState } from './EmptyState';
 import { EngineBadge } from './EngineBadge';
-import { MessageRow } from './MessageRow';
+import { MessageRow, type UploadStatus } from './MessageRow';
 import { ClarificationCard } from './ClarificationCard';
 import { SearchPalette } from './SearchPalette';
 import { Sidebar } from './Sidebar';
@@ -111,6 +111,20 @@ export function ChatApp() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [streaming, setStreaming] = useState(false);
   const [unreachable, setUnreachable] = useState(false);
+  /**
+   * H-01: the dataset turn whose /api/upload is still in flight, or failed.
+   *
+   * Deliberately NOT `streaming`. A dataset uploads before any generation
+   * exists, so treating the two as one state made the composer offer Stop for
+   * a model that was not running — and pressing it did nothing, because no
+   * stream had been registered to abort.
+   */
+  const [datasetUpload, setDatasetUpload] = useState<{
+    /** The chat it belongs to — a first message CREATES this id mid-send. */
+    conversationId: string;
+    messageId: string;
+    status: UploadStatus;
+  } | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [searchOpen, setSearchOpen] = useState(false);
   const [atBottom, setAtBottom] = useState(true);
@@ -428,6 +442,19 @@ export function ChatApp() {
     };
   }, [refreshList]);
 
+  // H-01: an upload indicator belongs to the chat it was started in; leaving
+  // it on screen in another conversation would describe nothing.
+  //
+  // Compared rather than cleared outright: the FIRST message of a new chat
+  // creates the conversation inside the same send that starts the upload, so
+  // an unconditional reset here fired on that brand-new id and wiped the
+  // indicator a moment after it was set.
+  useEffect(() => {
+    setDatasetUpload((prev) =>
+      prev && prev.conversationId === activeId ? prev : null,
+    );
+  }, [activeId]);
+
   const stopStreaming = useCallback(() => {
     stopStream(activeIdRef.current);
   }, []);
@@ -700,9 +727,25 @@ export function ChatApp() {
       const context = [...threadRef.current, userMessage];
       const answerBranch = branchForAppend(turns, context);
       persist(conversationId, turns);
+      // H-01: the turn goes on screen HERE, not as a side effect of opening a
+      // stream. `persist` only writes the store and the sidebar, so a dataset
+      // send — which cannot start its stream until the upload finishes — used
+      // to clear the composer and then show nothing at all, for as long as a
+      // 200 MB file took. Rendering is not generation's job.
+      setMessages(turns);
       setAtBottom(true);
       setUnreachable(false);
-      setStreaming(true);
+      // A dataset has to be uploaded before a stream can exist, so say that
+      // instead of claiming the model is already running (see datasetUpload).
+      if (isDataset && first?.file) {
+        setDatasetUpload({
+          conversationId,
+          messageId: userMessage.id,
+          status: 'uploading',
+        });
+      } else {
+        setStreaming(true);
+      }
       // Sending moves the conversation on; an editor left open behind it is
       // about to be arguing with a thread that has changed underneath it.
       setEditingMessageId(null);
@@ -731,15 +774,25 @@ export function ChatApp() {
             toast(
               `Profiled ${body.files ?? 0} file${body.files === 1 ? '' : 's'} from ${first.name}.`,
             );
+            // H-01: the upload is done; the stream opened below owns the
+            // "busy" story from here.
+            setDatasetUpload(null);
           } catch (err) {
             toast(
               err instanceof Error ? err.message : 'That dataset could not be read.',
               'error',
             );
             // The dataset never made it in, so generating would answer from a
-            // context that doesn't exist. No stream was registered, so nothing
-            // else will clear the optimistic streaming flag set above.
-            if (conversationId === activeIdRef.current) setStreaming(false);
+            // context that doesn't exist. H-01: the turn STAYS on screen with
+            // its prompt and its file, now marked failed — the user's words
+            // must not vanish because a request did.
+            if (conversationId === activeIdRef.current) {
+              setDatasetUpload({
+                conversationId,
+                messageId: userMessage.id,
+                status: 'failed',
+              });
+            }
             // Un-persist the attachment metadata: other devices must not see
             // a card for a dataset the server never accepted. (The local
             // pdfName chip stays, next to the error toast, as before.)
@@ -1457,6 +1510,11 @@ export function ChatApp() {
                   isLast={i === thread.length - 1 && m.role === 'assistant'}
                   onRegenerate={() => regenerate(m.id)}
                   onRetry={() => regenerate(m.id)}
+                  uploadStatus={
+                    datasetUpload?.messageId === m.id
+                      ? datasetUpload.status
+                      : null
+                  }
                   versions={versions.get(m.id) ?? null}
                   onSelectVersion={selectBranch}
                   onEditStart={() => startEdit(m.id)}
@@ -1501,6 +1559,9 @@ export function ChatApp() {
           ref={composerRef}
           streaming={streaming}
           disabled={reconciling}
+          // H-01: a dataset upload blocks a second send without pretending a
+          // generation is running — that is what `streaming` would claim.
+          busy={datasetUpload?.status === 'uploading'}
           onDraftChange={handleDraftChange}
           meter={
             <ContextMeter
