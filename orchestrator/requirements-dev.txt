@@ -3,6 +3,11 @@
 # native; both are lazy at runtime), plus pytest. The whole test suite runs
 # OFFLINE — no vLLM servers, no GPU, no torch.
 fastapi>=0.115
+# FastAPI raises at ROUTE-DEFINITION time when a route declares File()/Form()
+# without this, so `import app.uploads` fails and 16 test modules cannot be
+# collected. Its absence only ever worked because developers had the full
+# requirements.txt installed; a clean checkout could not run the suite at all.
+python-multipart>=0.0.9
 uvicorn[standard]>=0.30
 langgraph>=0.2
 openai>=1.50

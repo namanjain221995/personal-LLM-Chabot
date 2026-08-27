@@ -104,7 +104,10 @@ def test_report_lists_columns_with_their_statistics():
     # withholds those on purpose — the alphabetically first cell can be a
     # secret from anywhere in the file).
     assert "4–11 chars" in md
-    assert "Prospecting — 20" in md
+    # The renderer writes "**Column** - Value (count), Value (count)"; the value
+    # and its count are never separated by a dash. This assertion and the code
+    # it tests landed in the same commit, so it had never passed.
+    assert "**StageName** \u2014 Prospecting (20), Closed Won (15)" in md
 
 
 def test_identifier_columns_are_not_broken_down():

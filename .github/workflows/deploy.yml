@@ -1,0 +1,80 @@
+# Deploys main to the DGX Spark after CI has gone green.
+#
+# This runs on a SELF-HOSTED runner on the box itself, because the deploy
+# target is this machine: it owns the GPU, the 41 GB model cache, the named
+# volumes, and the .env with the production Salesforce credentials. Nothing is
+# copied to a cloud runner and no secret is needed by this workflow.
+#
+# It is triggered by `workflow_run` rather than `push` so that a merge to main
+# can never deploy code whose tests did not pass.
+name: Deploy
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Commit-ish to deploy (default origin/main)"
+        default: "origin/main"
+      full:
+        description: "Recreate EVERY container, including the models (+6-10 min)"
+        type: boolean
+        default: false
+
+# Never let two deploys touch the same box. Queue, do not cancel: cancelling a
+# half-finished `techsara up` is how you get a partially recreated stack.
+concurrency:
+  group: deploy-dgx-spark
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    # workflow_dispatch has no workflow_run context, hence the second clause.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: [self-hosted, dgx-spark]
+    # Optional: add required reviewers to this environment in repo settings to
+    # turn every production deploy into an approval gate.
+    environment: production
+    timeout-minutes: 45
+    steps:
+      - name: What triggered this
+        run: |
+          echo "event      : ${{ github.event_name }}"
+          echo "CI run     : ${{ github.event.workflow_run.html_url || 'n/a (manual)' }}"
+          echo "head sha   : ${{ github.event.workflow_run.head_sha || 'origin/main' }}"
+
+      - name: Deploy and health-gate
+        env:
+          # The production checkout, NOT the runner workspace: that is where
+          # .env, .runtime/ and the model cache live.
+          TECHSARA_DEPLOY_ROOT: ${{ vars.TECHSARA_DEPLOY_ROOT || '/home/techsphere/Documents/project/personal-LLM-Chabot' }}
+          DEPLOY_REF: ${{ github.event.inputs.ref || github.event.workflow_run.head_sha || 'origin/main' }}
+        run: |
+          set -euo pipefail
+          cd "$TECHSARA_DEPLOY_ROOT"
+          FLAGS=""
+          if [ "${{ github.event.inputs.full }}" = "true" ]; then FLAGS="--full"; fi
+          ./scripts/deploy.sh --ref "$DEPLOY_REF" $FLAGS
+
+      - name: Report what is now serving
+        if: always()
+        env:
+          TECHSARA_DEPLOY_ROOT: ${{ vars.TECHSARA_DEPLOY_ROOT || '/home/techsphere/Documents/project/personal-LLM-Chabot' }}
+        run: |
+          cd "$TECHSARA_DEPLOY_ROOT"
+          echo "### Deployed commit" >> "$GITHUB_STEP_SUMMARY"
+          git log -1 --pretty='- `%h` %s' >> "$GITHUB_STEP_SUMMARY"
+          echo "### Containers" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          docker ps --filter label=com.docker.compose.project=sf-local-ai \
+            --format 'table {{.Names}}\t{{.Status}}' >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          tail -40 .runtime/logs/deploy-*.log >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
