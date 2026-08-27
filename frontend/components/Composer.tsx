@@ -105,6 +105,16 @@ function isDatasetName(name: string): boolean {
 interface ComposerProps {
   streaming: boolean;
   disabled?: boolean;
+  /**
+   * H-01: a send is in flight but the MODEL has not started yet — a dataset is
+   * still uploading.
+   *
+   * Distinct from `streaming` on purpose. `streaming` swaps Send for Stop, and
+   * during an upload that button was a lie twice over: no generation had begun,
+   * and pressing it did nothing (there is no registered stream to abort). This
+   * blocks a second send without claiming the model is running.
+   */
+  busy?: boolean;
   /** Phase C: live context meter shown next to the send button. */
   meter?: React.ReactNode;
   /** Draft text changes drive the meter's live estimate (debounced). */
@@ -146,6 +156,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
     {
       streaming,
       disabled = false,
+      busy = false,
       meter,
       onDraftChange,
       prefs,
@@ -233,7 +244,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
 
     function submit() {
       const trimmed = text.trim();
-      if (streaming || disabled) return;
+      if (streaming || disabled || busy) return;
       if (!trimmed && attachments.length === 0 && pastedTexts.length === 0)
         return;
       onSend(trimmed, attachments, pastedTexts);
@@ -613,7 +624,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
                   <button
                     type="button"
                     onClick={submit}
-                    disabled={disabled || !hasContent}
+                    disabled={disabled || busy || !hasContent}
                     aria-label="Send message"
                     title="Send (Enter)"
                     className="shrink-0 rounded-lg bg-accent-strong p-2 text-white transition-all duration-ts hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-35"
