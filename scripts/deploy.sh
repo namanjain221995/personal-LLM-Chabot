@@ -89,7 +89,11 @@ apply() {  # apply <sha> - move the checkout and bring the stack up
   git -C "$ROOT" checkout --detach --force --quiet "$sha" || return 1
   git -C "$ROOT" clean -qfd -e .env -e .runtime || true
   if [ "$FULL" = 1 ]; then
-    say "  full restart requested: techsara down (volumes are preserved)"
+    # Every container goes, models included. `down` never passes -v, so the
+    # database, warehouse, vector index and reports all survive; what is paid
+    # for is time, not data: the 27B reloads (~6-10 min) and the auxiliary
+    # model servers restart behind it.
+    say "  full restart: techsara down, then up (volumes preserved; expect ~10-15 min)"
     ( cd "$ROOT" && ./techsara down ) >>"$LOG" 2>&1 || return 1
   fi
   say "  techsara up  (builds images, recreates changed services, staged health gates)"

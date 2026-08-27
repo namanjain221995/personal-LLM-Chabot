@@ -66,11 +66,21 @@ jobs:
           # .env, .runtime/ and the model cache live.
           TECHSARA_DEPLOY_ROOT: ${{ vars.TECHSARA_DEPLOY_ROOT || '/home/techsphere/Documents/project/personal-LLM-Chabot' }}
           DEPLOY_REF: ${{ github.event.inputs.ref || github.event.workflow_run.head_sha || 'origin/main' }}
+          # Repository variable (Settings -> Secrets and variables -> Actions ->
+          # Variables). Set DEPLOY_FULL=true to recreate EVERY container on every
+          # merge, including the five model servers. Costs ~10-15 min per deploy
+          # because the 27B reloads; the model images are pinned upstream and
+          # contain none of this repo's code, so it only matters when you want a
+          # guaranteed-clean slate rather than a correct one.
+          DEPLOY_FULL: ${{ vars.DEPLOY_FULL }}
         run: |
           set -euo pipefail
           cd "$TECHSARA_DEPLOY_ROOT"
           FLAGS=""
-          if [ "${{ github.event.inputs.full }}" = "true" ]; then FLAGS="--full"; fi
+          if [ "${{ github.event.inputs.full }}" = "true" ] || [ "${DEPLOY_FULL:-}" = "true" ]; then
+            FLAGS="--full"
+            echo "full restart requested (inputs.full or vars.DEPLOY_FULL)"
+          fi
           # From the workspace (the new commit), targeting the production root.
           "$GITHUB_WORKSPACE/scripts/deploy.sh" --ref "$DEPLOY_REF" $FLAGS
 
