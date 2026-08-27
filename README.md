@@ -848,7 +848,7 @@ Variables) control the parts you are most likely to want to change:
 
 | Variable | Unset (default) | Set | What it costs |
 |---|---|---|---|
-| `DEPLOY_FULL` | `techsara up` recreates only the services whose definition changed. An app-only merge leaves `vllm`, `router`, `ocr`, `reranker` and `embed` running — correct, because those images are pinned upstream and contain none of this repo's code. Merge #17 took **55 s**. | `true` → `techsara down` first, so **every** container is recreated, models included. | **~17 min** end to end; the 27B alone reloads in ~441 s. Volumes are preserved — you pay time, not data. |
+| `DEPLOY_FULL` (`true`, `1`, `yes` or `on`) | `techsara up` recreates only the services whose definition changed. An app-only merge leaves `vllm`, `router`, `ocr`, `reranker` and `embed` running — correct, because those images are pinned upstream and contain none of this repo's code. Merge #17 took **55 s**. | `true` → `techsara down` first, so **every** container is recreated, models included. | **~17 min** end to end; the 27B alone reloads in ~441 s. Volumes are preserved — you pay time, not data. |
 | `DEPLOY_BRANCH` | The checkout is left on a **detached HEAD** at the deployed commit. | e.g. `dev` → the checkout is left **on that branch**, fast-forwarded to the deployed commit. | Nothing. Use it because this checkout is also a working directory, and walking into "detached HEAD" after every merge is confusing. |
 
 **`DEPLOY_BRANCH` fast-forwards; it never rewrites.** If the branch is behind
@@ -858,9 +858,21 @@ deploy **leaves the branch exactly where it is**, logs the divergence counts fro
 `git rev-list --left-right --count`, and falls back to a detached HEAD so the
 *code being served is still correct*. It never resets, rebases, force-moves or
 discards a commit, and it aborts before starting anything if `HEAD` does not end
-up exactly at the requested commit. The same rule applies to a rollback: a
-rollback moves HEAD to the earlier commit but does not rewind the branch,
-because rewinding discards commits.
+up exactly at the requested commit.
+
+A rollback follows the same rule, with one addition. If the deploy
+fast-forwarded the branch and the health gate then failed, the rollback undoes
+*that* fast-forward and nothing else, by compare-and-swap: it writes only if the
+branch still holds the value this deploy put there, and it restores only the
+value this deploy found before touching it. Every commit the branch held before
+the deploy started is still on it afterwards. It never rewinds further than its
+own move, so if somebody committed on the branch mid-deploy the swap refuses and
+the rollback finishes on a detached HEAD instead, saying so in the log.
+
+The branch name is validated before it reaches git. A value starting with `-`
+would be read as an *option* rather than a branch (`DEPLOY_BRANCH=-q` really
+did leave a stray branch named after a commit SHA), so those, plus `HEAD`, `@`
+and anything `git check-ref-format` rejects, abort the deploy with exit 1.
 
 **A one-off, from the Actions UI.** Actions → *Deploy* → *Run workflow*, which
 takes three inputs: `ref` (branch or SHA, default `main`), `full` (tick it to
