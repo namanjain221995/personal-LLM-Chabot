@@ -82,7 +82,12 @@ if [ "$DRY" = 1 ]; then say "dry run: nothing changed"; exit 0; fi
 # --------------------------------------------------------------------- deploy
 apply() {  # apply <sha> - move the checkout and bring the stack up
   local sha="$1"
-  git -C "$ROOT" reset --hard --quiet "$sha" || return 1
+  # Detach rather than reset: the production checkout may be sitting on a
+  # branch (it was on "dev"), and `reset --hard` would MOVE that branch to the
+  # deployed commit, silently rewriting the developer's own branch pointer.
+  # Detaching moves only HEAD, so branches are left exactly where they were.
+  git -C "$ROOT" checkout --detach --force --quiet "$sha" || return 1
+  git -C "$ROOT" clean -qfd -e .env -e .runtime || true
   if [ "$FULL" = 1 ]; then
     say "  full restart requested: techsara down (volumes are preserved)"
     ( cd "$ROOT" && ./techsara down ) >>"$LOG" 2>&1 || return 1

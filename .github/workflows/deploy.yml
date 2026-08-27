@@ -45,6 +45,15 @@ jobs:
     environment: production
     timeout-minutes: 45
     steps:
+      # Check out the commit being deployed, so the deploy SCRIPT is the one that
+      # commit ships. Running it out of the production checkout is a bootstrap
+      # trap: that checkout is by definition still at the OLD commit, so on the
+      # very first deploy scripts/deploy.sh did not exist there yet and the job
+      # died with "No such file or directory".
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.event.inputs.ref || 'main' }}
+
       - name: What triggered this
         run: |
           echo "event      : ${{ github.event_name }}"
@@ -62,14 +71,15 @@ jobs:
           cd "$TECHSARA_DEPLOY_ROOT"
           FLAGS=""
           if [ "${{ github.event.inputs.full }}" = "true" ]; then FLAGS="--full"; fi
-          ./scripts/deploy.sh --ref "$DEPLOY_REF" $FLAGS
+          # From the workspace (the new commit), targeting the production root.
+          "$GITHUB_WORKSPACE/scripts/deploy.sh" --ref "$DEPLOY_REF" $FLAGS
 
       - name: Report what is now serving
         if: always()
         env:
           TECHSARA_DEPLOY_ROOT: ${{ vars.TECHSARA_DEPLOY_ROOT || '/home/techsphere/Documents/project/personal-LLM-Chabot' }}
         run: |
-          cd "$TECHSARA_DEPLOY_ROOT"
+          cd "$TECHSARA_DEPLOY_ROOT" || exit 0
           echo "### Deployed commit" >> "$GITHUB_STEP_SUMMARY"
           git log -1 --pretty='- `%h` %s' >> "$GITHUB_STEP_SUMMARY"
           echo "### Containers" >> "$GITHUB_STEP_SUMMARY"
