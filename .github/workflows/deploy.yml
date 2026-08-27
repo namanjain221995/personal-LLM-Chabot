@@ -17,8 +17,8 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: "Commit-ish to deploy (default origin/main)"
-        default: "origin/main"
+        description: "Branch or commit SHA to deploy (must exist on the remote)"
+        default: "main"
       full:
         description: "Recreate EVERY container, including the models (+6-10 min)"
         type: boolean
