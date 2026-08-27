@@ -123,12 +123,22 @@ function fileBadge(name: string): string {
   return m ? m[1].toUpperCase() : 'FILE';
 }
 
+/**
+ * H-01: what a dataset turn is doing right now.
+ *
+ * Lives on the ROW rather than on the message because it describes an
+ * in-flight request, not the message itself — it must never be persisted, and
+ * it must survive the stream manager replacing every message object.
+ */
+export type UploadStatus = 'uploading' | 'failed';
+
 export function MessageRow({
   message,
   isLast,
   onRegenerate,
   onShowSummary,
   onRetry,
+  uploadStatus = null,
   versions = null,
   onSelectVersion,
   onEditStart,
@@ -145,6 +155,15 @@ export function MessageRow({
   /** Opens the read-only rolling-summary panel (compaction notice). */
   onShowSummary?: () => void;
   onRetry: () => void;
+  /**
+   * H-01: the dataset attached to this turn is still uploading, or failed.
+   *
+   * A dataset does not travel in the chat request — it streams to /api/upload
+   * first — so the turn can sit on screen for a long time with nothing
+   * happening yet. Without this the thread showed a question and no sign that
+   * anything was in progress, which read as a frozen app.
+   */
+  uploadStatus?: UploadStatus | null;
   /**
    * "Edit" on a USER message: rewrite it IN PLACE, ChatGPT-style.
    *
@@ -429,6 +448,30 @@ export function MessageRow({
                 </div>
               )}
             </>
+          )}
+          {/* H-01: a dataset turn is on screen long before its file has even
+              finished uploading, so the turn says so itself. Indeterminate on
+              purpose — /api/upload reports no byte progress, and a percentage
+              we cannot measure would be a fiction. */}
+          {uploadStatus && (
+            <div
+              className="mt-1.5 flex items-center justify-end gap-2 text-xs"
+              aria-live="polite"
+            >
+              {uploadStatus === 'uploading' ? (
+                <>
+                  <Loader size={16} />
+                  <span className="text-muted">Uploading dataset…</span>
+                </>
+              ) : (
+                <>
+                  <IconAlert size={13} className="shrink-0 text-danger" />
+                  <span className="text-danger">
+                    Dataset upload failed — nothing was sent to the model.
+                  </span>
+                </>
+              )}
+            </div>
           )}
         </div>
       </div>
