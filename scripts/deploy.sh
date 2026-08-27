@@ -30,7 +30,9 @@
 #     the machine owner's working directory, so the deploy will never reset,
 #     rebase or force-move their branch: if the branch cannot fast-forward to
 #     the deployed commit it is left untouched and the deploy detaches instead,
-#     which still ships the right code.
+#     which still ships the right code. A rollback undoes the fast-forward this
+#     same run made - by compare-and-swap, so it can only ever put the branch
+#     back where this run found it - and never rewinds it any further.
 #   * On a failed health gate it rolls back to the commit that was live before.
 set -euo pipefail
 
@@ -43,7 +45,8 @@ FULL=0; DRY=0; ROLLBACK=1
 while [ $# -gt 0 ]; do
   case "$1" in
     --ref) REF="$2"; shift ;;
-    --branch) DEPLOY_BRANCH="${2:-}"; shift ;;
+    --branch) [ $# -ge 2 ] || { echo "--branch needs a branch name (use '' for a detached HEAD)" >&2; exit 2; }
+              DEPLOY_BRANCH="$2"; shift ;;
     --full) FULL=1 ;;
     --dry-run) DRY=1 ;;
     --no-rollback) ROLLBACK=0 ;;
@@ -55,11 +58,29 @@ while [ $# -gt 0 ]; do
 done
 
 cd "$ROOT"
-LOG_DIR="$ROOT/.runtime/logs"; mkdir -p "$LOG_DIR"
+LOG_DIR="$ROOT/.runtime/logs"; mkdir -p "$LOG_DIR" "$ROOT/.runtime/locks"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 LOG="$LOG_DIR/deploy-$STAMP.log"
 say() { printf '%s %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$LOG"; }
 die() { printf '%s ERROR %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$LOG" >&2; exit 1; }
+
+# ------------------------------------------------- the branch name is untrusted
+# DEPLOY_BRANCH arrives from a repository variable or a free-text
+# workflow_dispatch input and is then handed to `git branch` and `git checkout`
+# as a bare operand, with no `--` separator available on either. That is option
+# injection: DEPLOY_BRANCH=-q really does turn `git branch --quiet "$b" "$sha"`
+# into `git branch -q <sha>` and leaves a junk branch named after the SHA in the
+# production checkout, and -D/-M aim the same trick at delete and rename.
+# `git check-ref-format` alone is not enough - it happily accepts "-q", "-D",
+# "--all" and "HEAD" - so the leading dash and HEAD are rejected explicitly.
+if [ -n "$DEPLOY_BRANCH" ]; then
+  case "$DEPLOY_BRANCH" in
+    -*) die "DEPLOY_BRANCH='$DEPLOY_BRANCH' starts with '-'; git would read it as an option, not a branch name" ;;
+    HEAD|@) die "DEPLOY_BRANCH='$DEPLOY_BRANCH' is a git rev shorthand, not a usable branch name; a local branch called that makes every later rev parse ambiguous" ;;
+  esac
+  git check-ref-format "refs/heads/$DEPLOY_BRANCH" 2>/dev/null \
+    || die "DEPLOY_BRANCH='$DEPLOY_BRANCH' is not a valid git branch name"
+fi
 
 # ---------------------------------------------------------------- one at a time
 exec 9>"$ROOT/.runtime/locks/deploy.lock"
@@ -133,7 +154,7 @@ detach_to() {  # detach_to <sha> <why> - ship the right code, touch no branch
 }
 
 land_on_branch() {  # land_on_branch <sha> - end up ON $DEPLOY_BRANCH at <sha>
-  local sha="$1" b="$DEPLOY_BRANCH" err counts ahead behind
+  local sha="$1" b="$DEPLOY_BRANCH" err counts ahead behind was on
 
   # (a) A branch that exists only on the remote is created to track it. A branch
   #     that exists nowhere is created at the target - inventing a ref that
@@ -150,18 +171,13 @@ land_on_branch() {  # land_on_branch <sha> - end up ON $DEPLOY_BRANCH at <sha>
     fi
   fi
 
-  # (b) git REFUSES this when the branch is checked out in another worktree.
-  #     That is a real configuration on this box, so catch it instead of
-  #     fighting it with --ignore-other-worktrees.
-  if ! err="$(git -C "$ROOT" checkout --force --quiet "$b" 2>&1)"; then
-    say "  branch: git refused to check out $b: ${err//$'\n'/ | }"
-    detach_to "$sha" "it could not be checked out (checked out in another worktree?)"
-    return $?
-  fi
-
-  # (d) Decided before anything is moved, by a read-only ancestry test: if the
+  # (b) Decided BEFORE anything is moved, by a read-only ancestry test: if the
   #     branch holds commits the target does not contain, fast-forwarding is
-  #     impossible and the ONLY safe move is to leave it alone.
+  #     impossible and the ONLY safe move is to leave it alone. This has to run
+  #     BEFORE the checkout below. Checking the branch out first would put the
+  #     diverged tree on disk for as long as it takes to decide, and a deploy
+  #     killed in that window (runner cancellation, the job's timeout-minutes)
+  #     would leave production sitting on the wrong commit with no log saying so.
   if ! git -C "$ROOT" merge-base --is-ancestor "$b" "$sha"; then
     counts="$(git -C "$ROOT" rev-list --left-right --count "$b...$sha" 2>/dev/null || printf '? ?')"
     ahead="${counts%%[[:space:]]*}"; behind="${counts##*[[:space:]]}"
@@ -173,8 +189,29 @@ land_on_branch() {  # land_on_branch <sha> - end up ON $DEPLOY_BRANCH at <sha>
     return $?
   fi
 
-  # (c) The fast-forward itself. Cannot create a commit and cannot lose one.
+  # Recorded before anything moves so a rollback can undo exactly this move.
+  was="$(git -C "$ROOT" rev-parse --verify --quiet "$b^{commit}")" \
+    || { detach_to "$sha" "could not read the current tip of $b"; return $?; }
   behind="$(git -C "$ROOT" rev-list --count "$b..$sha" 2>/dev/null || printf '?')"
+
+  # (c) git REFUSES this when the branch is checked out in another worktree.
+  #     That is a real configuration on this box, so catch it instead of
+  #     fighting it with --ignore-other-worktrees.
+  if ! err="$(git -C "$ROOT" checkout --force --quiet "$b" 2>&1)"; then
+    say "  branch: git refused to check out $b: ${err//$'\n'/ | }"
+    detach_to "$sha" "it could not be checked out (checked out in another worktree?)"
+    return $?
+  fi
+
+  # (d) The fast-forward itself - the ONLY command in this script that moves a
+  #     branch. `--ff-only` cannot create a commit and cannot lose one, and the
+  #     guard below makes sure it moves the branch we named rather than whatever
+  #     HEAD happens to be attached to.
+  on="$(git -C "$ROOT" symbolic-ref --quiet --short HEAD 2>/dev/null || printf '(detached)')"
+  if [ "$on" != "$b" ]; then
+    detach_to "$sha" "the checkout reported success but left HEAD on '$on', not on $b"
+    return $?
+  fi
   if ! git -C "$ROOT" merge --ff-only --quiet "$sha" >>"$LOG" 2>&1; then
     say "  branch: $b fast-forwards on paper but git merge --ff-only failed (see $LOG)"
     detach_to "$sha" "the fast-forward itself failed"
@@ -184,11 +221,15 @@ land_on_branch() {  # land_on_branch <sha> - end up ON $DEPLOY_BRANCH at <sha>
     say "  branch: on $b, already at $sha - no fast-forward needed"
   else
     say "  branch: on $b, fast-forwarded $behind commit(s) to $sha"
+    FF_BRANCH="$b"; FF_FROM="$was"; FF_TO="$sha"
   fi
   return 0
 }
 
 LANDED_ON="(detached)"   # set by land(), reported at the end and by the workflow
+# Set only when land_on_branch() actually moved a branch, so that - and only
+# that - can be undone if the deploy has to be rolled back.
+FF_BRANCH=""; FF_FROM=""; FF_TO=""
 land() {  # land <sha> - make the production checkout BE <sha>, non-destructively
   local sha="$1" head on
   if [ -n "$DEPLOY_BRANCH" ]; then
@@ -299,16 +340,29 @@ if [ "$TARGET" = "$PREVIOUS" ]; then
  state the health gate rejected - inspect it with scripts/cluster-status.sh"
 fi
 say "ROLLING BACK to $PREVIOUS"
-if [ -n "$DEPLOY_BRANCH" ]; then
-  # A rollback wants an EARLIER commit, so landing $DEPLOY_BRANCH on it would
-  # mean rewinding the branch - the one thing this script never does. HEAD goes
-  # back, the branch stays put, and the log says so rather than surprising the
-  # owner of the checkout.
-  say "  note: HEAD is being moved back, but $DEPLOY_BRANCH is NOT rewound:"
-  say "  note: rewinding a branch discards commits from it, and this script"
-  say "  note: only ever fast-forwards. Expect to finish on a detached HEAD."
+if [ -n "$FF_BRANCH" ]; then
+  # This run fast-forwarded $FF_BRANCH to a commit that then failed the health
+  # gate. Undo exactly that move and nothing else, with a compare-and-swap:
+  # `update-ref <ref> <new> <old>` writes only if the branch STILL holds the
+  # value this run put there, and the value it restores is the one this run
+  # read before touching anything. Every commit the branch held before this
+  # deploy started is still on it afterwards, and every commit dropped from it
+  # is one this same run added and is still reachable from $TARGET and origin.
+  # That is an undo of our own fast-forward, not a rewind of anybody's work -
+  # which is why it is the single `update-ref` in this file.
+  if git -C "$ROOT" update-ref -m "deploy rollback: undo this deploy's fast-forward" \
+       "refs/heads/$FF_BRANCH" "$FF_FROM" "$FF_TO" 2>>"$LOG"; then
+    say "  branch: undid this deploy's own fast-forward of $FF_BRANCH"
+    say "  branch: ($FF_TO -> $FF_FROM, compare-and-swap; nothing it held is gone)"
+  else
+    say "  branch: NOT undoing the fast-forward of $FF_BRANCH - it no longer points"
+    say "  branch: at $FF_TO, so something else moved it and this is not ours to undo."
+  fi
+elif [ -n "$DEPLOY_BRANCH" ]; then
+  say "  note: this deploy never moved $DEPLOY_BRANCH, so there is nothing to undo."
 fi
 if apply "$PREVIOUS" && health; then
-  die "deploy of $TARGET failed; rolled back to $PREVIOUS and the stack is healthy again"
+  die "deploy of $TARGET failed; rolled back to $PREVIOUS and the stack is healthy\
+ again. The checkout is on $LANDED_ON"
 fi
 die "deploy of $TARGET failed AND the rollback to $PREVIOUS did not come up healthy - this box needs a human"
