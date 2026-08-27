@@ -35,6 +35,18 @@ import {
   type ChatPrefs,
 } from '@/lib/prefs';
 import { attachmentsForResend, rememberAttachments } from '@/lib/attachments';
+import {
+  branchForAppend,
+  branchForVersion,
+  buildThread,
+  hasBranches,
+  metaWithBranch,
+  ROOT,
+  versionMap,
+  selectVersion,
+  type BranchSelection,
+} from '@/lib/branching';
+import { truncateFailure } from '@/lib/historyApi';
 import ChatErrorPage from './ChatErrorPage';
 import { shortcutAction } from '@/lib/searchPalette';
 import {
@@ -128,6 +140,23 @@ export function ChatApp() {
     messageId: string;
     discarded: number;
   } | null>(null);
+  /**
+   * The user turn open for in-place editing, if any (ChatGPT-style).
+   *
+   * Owned HERE rather than inside the row so at most one editor can be open —
+   * two boxes competing to add a version of the same turn is confusion with
+   * no upside.
+   */
+  const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
+  /**
+   * Which alternative is live at each fork of the conversation tree.
+   *
+   * Editing a turn no longer replaces it — it adds a version beside it — so
+   * `messages` holds EVERY branch and this says which single path is on
+   * screen. Empty means "the newest everywhere", which is what a freshly
+   * opened conversation shows and what an edit selects.
+   */
+  const [branchSelection, setBranchSelection] = useState<BranchSelection>({});
   /** Debounced draft text — the meter's only estimated component. */
   const [draft, setDraft] = useState('');
   const [compacting, setCompacting] = useState(false);
@@ -160,6 +189,20 @@ export function ChatApp() {
   const composerRef = useRef<ComposerHandle>(null);
   const messagesRef = useRef<ChatMessage[]>([]);
   messagesRef.current = messages;
+  /**
+   * The conversation as READ: one path down the tree.
+   *
+   * `messages` is everything stored, sibling branches included, and is what
+   * gets persisted. `thread` is what the user sees AND what the model is
+   * sent — the two were the same list until edits stopped being destructive.
+   * Anything about the conversation ON SCREEN reads this one.
+   */
+  const thread = useMemo(
+    () => buildThread(messages, branchSelection),
+    [messages, branchSelection],
+  );
+  const threadRef = useRef<ChatMessage[]>([]);
+  threadRef.current = thread;
   const activeIdRef = useRef<string | null>(null);
   activeIdRef.current = activeId;
   const prefsRef = useRef<ChatPrefs>(prefs);
@@ -404,7 +447,7 @@ export function ChatApp() {
   // Auto-scroll while content grows, unless the user scrolled up (§9).
   useEffect(() => {
     if (atBottom) scrollToBottom(false);
-  }, [messages, atBottom, scrollToBottom]);
+  }, [thread, atBottom, scrollToBottom]);
 
   function handleScroll() {
     const el = scrollRef.current;
@@ -508,7 +551,7 @@ export function ChatApp() {
   // message. Deriving it from the thread rather than holding it in its own
   // state is what makes it survive a reload for free: the message comes back
   // from history with `meta.clarification` on it, and the card rebuilds.
-  const pending = pendingClarification(messages);
+  const pending = pendingClarification(thread);
   const pendingRef = useRef<ClarificationRequest | null>(null);
   pendingRef.current = pending;
 
@@ -525,6 +568,10 @@ export function ChatApp() {
   useEffect(() => {
     setCustomAnswerFor(null);
     setSubmittingClarificationId(null);
+    // An open editor belongs to a turn in the chat being left behind, and its
+    // id means nothing in the next one. Neither does a branch selection.
+    setEditingMessageId(null);
+    setBranchSelection({});
   }, [activeId]);
 
   // Starter card + server-side pending state. Loaded when the chat changes and
@@ -587,6 +634,13 @@ export function ChatApp() {
         refreshList();
       }
       setUrlConversation(conversationId);
+      // A send continues the path ON SCREEN, so a follow-up asked while an
+      // older version is selected belongs to that version's branch — not to
+      // whichever branch happens to be newest.
+      const userBranch = branchForAppend(
+        messagesRef.current,
+        threadRef.current,
+      );
       const userMessage: ChatMessage = {
         id: newId(),
         role: 'user',
@@ -601,7 +655,7 @@ export function ChatApp() {
         // 2026-08-21: attachments ride the same way, so the file card can be
         // rendered by any browser from server history — pdfName alone never
         // left this browser's cache.
-        meta:
+        meta: metaWithBranch(
           pasted.length || isPdf || isDataset
             ? {
                 route: 'chat',
@@ -620,6 +674,8 @@ export function ChatApp() {
                   : {}),
               }
             : undefined,
+          userBranch,
+        ),
         createdAt: Date.now(),
       };
       // Keep the payloads in memory so regenerate/retry re-send the same
@@ -638,11 +694,18 @@ export function ChatApp() {
                 })),
         );
       }
+      // `turns` is everything STORED (sibling branches included); `context`
+      // is the single path the model is sent.
       const turns = [...messagesRef.current, userMessage];
+      const context = [...threadRef.current, userMessage];
+      const answerBranch = branchForAppend(turns, context);
       persist(conversationId, turns);
       setAtBottom(true);
       setUnreachable(false);
       setStreaming(true);
+      // Sending moves the conversation on; an editor left open behind it is
+      // about to be arguing with a thread that has changed underneath it.
+      setEditingMessageId(null);
 
       if (isDataset && first?.file) {
         // Datasets stream to their own endpoint and are then referenced by the
@@ -689,6 +752,8 @@ export function ChatApp() {
           void startStream({
             conversationId,
             turns,
+            context,
+            assistantBranch: answerBranch,
             prefs: prefsRef.current,
           });
         })();
@@ -698,6 +763,8 @@ export function ChatApp() {
       void startStream({
         conversationId,
         turns,
+        context,
+        assistantBranch: answerBranch,
         prefs: prefsRef.current,
         images: isPdf ? null : images.map((i) => i.base64).filter(Boolean),
         pdf: isPdf ? first?.base64 ?? null : null,
@@ -790,17 +857,21 @@ export function ChatApp() {
     async (messageId: string) => {
       const id = activeIdRef.current;
       if (!id || isStreaming(id)) return;
-      const msgs = messagesRef.current;
-      const idx = msgs.findIndex((m) => m.id === messageId);
+      const all = messagesRef.current;
+      // Located in the VISIBLE path: "the answer above this one" means the
+      // one on screen, not whichever message happens to sit there in storage
+      // once a conversation has more than one branch.
+      const view = threadRef.current;
+      const idx = view.findIndex((m) => m.id === messageId);
       if (idx === -1) return;
       let userIdx = idx - 1;
-      while (userIdx >= 0 && msgs[userIdx].role !== 'user') userIdx--;
+      while (userIdx >= 0 && view[userIdx].role !== 'user') userIdx--;
       if (userIdx < 0) return;
-      const turns = msgs.slice(0, userIdx + 1);
+      const context = view.slice(0, userIdx + 1);
 
       // Re-send the SAME question, attachments included. Without this the
       // model was re-asked "what's in this invoice?" with no invoice attached.
-      const { attachments, missing } = attachmentsForResend(msgs[userIdx]);
+      const { attachments, missing } = attachmentsForResend(view[userIdx]);
       if (missing) {
         toast(
           'Re-attach the file to regenerate this answer — its contents are no longer in memory.',
@@ -813,32 +884,43 @@ export function ChatApp() {
         .map((a) => a.base64);
       const resendPdf = attachments.find((a) => a.kind === 'pdf') ?? null;
 
-      // Regenerating an OLDER answer really does discard the turns after it.
-      // The sync path cannot shrink a thread (that guard is what stops a
-      // stale cache from destroying history), so this intentional shrink goes
-      // through the dedicated truncate endpoint — reached ONLY from here,
-      // and only after the user confirmed.
-      if (msgs.length > turns.length + 1) {
+      // In a conversation that has versions, truncating would delete the
+      // OTHER branches too — they live in the same flat list. So the retry is
+      // appended as a newer answer to the same question instead, and the one
+      // it supersedes stays reachable. A conversation that has never been
+      // edited has no branches to protect and keeps the original behaviour
+      // exactly: confirmed truncate, then re-stream.
+      let turns = context;
+      if (hasBranches(all)) {
+        turns = all;
+      } else if (all.length > context.length + 1) {
+        // The sync path cannot shrink a thread (that guard is what stops a
+        // stale cache from destroying history), so this intentional shrink
+        // goes through the dedicated truncate endpoint — reached ONLY from
+        // here, and only after the user confirmed.
         try {
-          await getHistoryStore().truncateMessages(id, turns.length);
-        } catch {
-          // The server refused (the thread changed elsewhere, or it is gone).
-          // Show truth rather than streaming into a thread we misread.
-          toast(
-            'This conversation changed elsewhere — reloaded it instead of regenerating.',
-            'error',
-          );
-          const conv = await getHistoryStore().load(id, { force: true });
-          if (conv && activeIdRef.current === id) setMessages(conv.messages);
+          await getHistoryStore().truncateMessages(id, context.length);
+        } catch (err) {
+          const { message, reload } = truncateFailure(err);
+          toast(message, 'error');
+          if (reload) {
+            const conv = await getHistoryStore()
+              .load(id, { force: true })
+              .catch(() => null);
+            if (conv && activeIdRef.current === id) setMessages(conv.messages);
+          }
           return;
         }
-        setMessages(turns);
+        setMessages(context);
       }
 
       setStreaming(true);
+      setEditingMessageId(null);
       void startStream({
         conversationId: id,
         turns,
+        context,
+        assistantBranch: branchForAppend(turns, context),
         prefs: prefsRef.current,
         images: resendImages,
         pdf: resendPdf?.base64 ?? null,
@@ -849,19 +931,148 @@ export function ChatApp() {
   );
 
   /**
-   * "Edit" on one of the user's own messages: put its text back in the
-   * composer, ready to change and send as a NEW turn.
+   * "Edit" on one of the user's own messages: open the in-place editor.
    *
-   * Nothing is rewritten and nothing is discarded. Editing a sent message
-   * in place would mean deleting every turn after it and regenerating from
-   * there — the destructive path `runRegenerate` takes, behind a
-   * confirmation and the server's truncate endpoint. This is the reuse half
-   * of that, and it is pure client state: no request, no history change, and
-   * no send until the user presses send themselves.
+   * This used to hand the text to the COMPOSER instead, which put the prompt
+   * at the bottom of the screen — far from the message it belonged to, on top
+   * of whatever was already typed there, and re-openable so many times that
+   * the box filled with copies of the same sentence. The rewrite now happens
+   * where the message is.
    */
-  const editUserMessage = useCallback((text: string) => {
-    composerRef.current?.prefill(text);
+  const startEdit = useCallback((messageId: string) => {
+    // Editing rewrites the thread from that turn, which cannot be done to a
+    // thread that is still being written. The pencil simply does nothing.
+    if (isStreaming(activeIdRef.current)) return;
+    setEditingMessageId(messageId);
   }, []);
+
+  const cancelEdit = useCallback(() => setEditingMessageId(null), []);
+
+  /**
+   * Switch which version of a turn is live.
+   *
+   * Pure view selection: no request, no generation, no history change. Every
+   * version is already loaded — the arrows only choose which path down the
+   * tree is rendered and, from then on, which one a follow-up continues.
+   */
+  const selectBranch = useCallback((parent: string, id: string) => {
+    setBranchSelection((prev) =>
+      selectVersion(messagesRef.current, prev, parent, id),
+    );
+  }, []);
+
+  /**
+   * Commit an edit: add the rewrite as a NEW VERSION beside the original.
+   *
+   * Nothing is deleted. The previous implementation truncated the original
+   * turn, its answer and every turn after it through the server's truncate
+   * endpoint, so asking a question a second way destroyed the first answer.
+   *
+   * The version is a sibling of the original — same parent, appended to the
+   * end of the stored list — which is what makes both readable and why the
+   * original needs nothing written to it. `< 1 / 2 >` under the message picks
+   * which one is live, and the answer is generated for THIS version only.
+   */
+  const runEdit = useCallback(
+    async (messageId: string, text: string) => {
+      const id = activeIdRef.current;
+      if (!id || isStreaming(id)) return;
+      const all = messagesRef.current;
+      const original = all.find((m) => m.id === messageId);
+      if (!original || original.role !== 'user') return;
+
+      // Re-ask the question WITH whatever was attached to it. Images survive
+      // as their own previews; a PDF's bytes do not outlive a reload and a
+      // dataset only ever lived server-side, so both report `missing` and the
+      // edit stops rather than silently re-asking with nothing attached.
+      const { attachments, missing } = attachmentsForResend(original);
+      if (missing) {
+        toast(
+          'Re-attach the file to edit this message — its contents are no longer in memory.',
+          'error',
+        );
+        return;
+      }
+
+      const version = branchForVersion(all, original);
+      const edited: ChatMessage = {
+        id: newId(),
+        role: 'user',
+        content: text,
+        // Attachments and pasted blocks belong to the TURN, not to its
+        // wording, so this version inherits them. `serverId` and `feedback`
+        // deliberately do not: they identify the original's stored row, which
+        // is still there and still its own message.
+        imageDataUrl: original.imageDataUrl,
+        imageDataUrls: original.imageDataUrls,
+        pdfName: original.pdfName,
+        meta: metaWithBranch(original.meta, version),
+        createdAt: Date.now(),
+      };
+
+      // Stored: everything that was there, plus the new version. Sent to the
+      // model: the turns BEFORE the edited one on screen, then the edit —
+      // never the version it is an alternative to.
+      const turns = [...all, edited];
+      const at = threadRef.current.findIndex((m) => m.id === messageId);
+      const context = [
+        ...(at === -1 ? [] : threadRef.current.slice(0, at)),
+        edited,
+      ];
+      const answerBranch = branchForAppend(turns, context);
+
+      setEditingMessageId(null);
+      rememberAttachments(edited.id, attachments);
+      persist(id, turns);
+      setMessages(turns);
+      // Show the version just written, the way ChatGPT lands you on 2 / 2.
+      setBranchSelection((prev) =>
+        selectVersion(turns, prev, version.parent ?? ROOT, version.self),
+      );
+      setAtBottom(true);
+      setUnreachable(false);
+      setStreaming(true);
+      const editedPdf = attachments.find((a) => a.kind === 'pdf') ?? null;
+      void startStream({
+        conversationId: id,
+        turns,
+        context,
+        assistantBranch: answerBranch,
+        prefs: prefsRef.current,
+        images: attachments
+          .filter((a) => a.kind === 'image')
+          .map((a) => a.base64),
+        pdf: editedPdf?.base64 ?? null,
+        pdfName: editedPdf?.name ?? null,
+      });
+    },
+    [persist, toast],
+  );
+
+  /**
+   * Send from the editor.
+   *
+   * There is nothing to confirm any more: an edit adds a version and removes
+   * nothing, so the dialog that used to warn about discarded turns would be
+   * describing something that no longer happens.
+   */
+  const submitEdit = useCallback(
+    (messageId: string, text: string) => {
+      const all = messagesRef.current;
+      const original = all.find((m) => m.id === messageId);
+      if (!original || original.role !== 'user') return;
+      const next = text.trim();
+      // Unchanged text is not an edit — a second identical version would add
+      // a navigator with nothing to navigate between. Re-asking as-is is what
+      // Regenerate is for.
+      if (!next || next === (original.content ?? '').trim()) {
+        setEditingMessageId(null);
+        return;
+      }
+      void runEdit(messageId, next);
+    },
+    [runEdit],
+  );
 
   /**
    * Regenerating an OLDER answer restarts the thread from that point and
@@ -870,8 +1081,14 @@ export function ChatApp() {
    */
   const regenerate = useCallback(
     (messageId: string) => {
+      // Once a conversation has versions, a retry adds an answer beside the
+      // old one and removes nothing — so there is nothing to warn about.
+      if (hasBranches(messagesRef.current)) {
+        void runRegenerate(messageId);
+        return;
+      }
       const discarded = messagesDiscardedByRegenerate(
-        messagesRef.current,
+        threadRef.current,
         messageId,
       );
       if (discarded > 0) {
@@ -894,8 +1111,8 @@ export function ChatApp() {
    */
   const fatalError = useMemo<ClientError | null>(() => {
     if (!unreachable) return null;
-    for (let i = messages.length - 1; i >= 0; i -= 1) {
-      const m = messages[i];
+    for (let i = thread.length - 1; i >= 0; i -= 1) {
+      const m = thread[i];
       if (m.role === 'assistant' && m.status === 'error' && m.errorCode) {
         return toClientError(m.errorStatus ?? null, m.errorCode);
       }
@@ -903,20 +1120,21 @@ export function ChatApp() {
     // The stream reported a failure but left no classified message — treat it
     // as what it certainly was: a request that never reached a response.
     return toClientError(null, 'NETWORK_ERROR');
-  }, [unreachable, messages]);
+  }, [unreachable, thread]);
 
   /** Retry: re-send the last user turn, attachment included. */
   const retryLastTurn = useCallback(() => {
     const id = activeIdRef.current;
     if (!id || isStreaming(id)) return;
-    const msgs = messagesRef.current;
-    let userIdx = msgs.length - 1;
-    while (userIdx >= 0 && msgs[userIdx].role !== 'user') userIdx--;
+    const all = messagesRef.current;
+    const view = threadRef.current;
+    let userIdx = view.length - 1;
+    while (userIdx >= 0 && view[userIdx].role !== 'user') userIdx--;
     if (userIdx < 0) {
       setUnreachable(false);
       return;
     }
-    const { attachments, missing } = attachmentsForResend(msgs[userIdx]);
+    const { attachments, missing } = attachmentsForResend(view[userIdx]);
     if (missing) {
       toast(
         'Re-attach the file to retry this message — its contents are no longer in memory.',
@@ -927,9 +1145,14 @@ export function ChatApp() {
     const retryPdf = attachments.find((a) => a.kind === 'pdf') ?? null;
     setUnreachable(false);
     setStreaming(true);
+    const context = view.slice(0, userIdx + 1);
     void startStream({
       conversationId: id,
-      turns: msgs.slice(0, userIdx + 1),
+      // Retrying must not drop the other branches from storage, so a branched
+      // conversation keeps its whole list and the answer is appended.
+      turns: hasBranches(all) ? all : context,
+      context,
+      assistantBranch: branchForAppend(hasBranches(all) ? all : context, context),
       prefs: prefsRef.current,
       images: attachments
         .filter((a) => a.kind === 'image')
@@ -1117,11 +1340,14 @@ export function ChatApp() {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [newChat, searchOpen, stopStreaming]);
 
+  /** Which visible turns have alternatives — one walk, not one per row. */
+  const versions = useMemo(() => versionMap(messages), [messages]);
+
   const activeTitle =
     conversations.find((c) => c.id === activeId)?.title ?? 'New chat';
-  const lastEngine: Engine | undefined = [...messages]
+  const lastEngine: Engine | undefined = [...thread]
     .reverse()
-    .find((m) => m.role === 'assistant' && m.meta)?.meta?.route;
+    .find((m) => m.role === 'assistant' && m.meta?.route)?.meta?.route;
 
   // Chats generating right now — in this tab OR server-side (after reload).
   const busyIds = Array.from(new Set([...streamingIds(), ...serverActive]));
@@ -1216,22 +1442,27 @@ export function ChatApp() {
               // nothing is re-sent.
               onReturn={() => setUnreachable(false)}
             />
-          ) : messages.length === 0 ? (
+          ) : thread.length === 0 ? (
             <EmptyState />
           ) : (
             <div className="mx-auto w-full max-w-thread space-y-6 px-4 py-6">
-              {messages.map((m, i) => {
+              {thread.map((m, i) => {
                 // Only the question the thread is WAITING on is a live control;
                 // every earlier card is a record of a decision already made.
-                const card = cardState(messages, i);
+                const card = cardState(thread, i);
                 return (
                 <MessageRow
                   key={m.id}
                   message={m}
-                  isLast={i === messages.length - 1 && m.role === 'assistant'}
+                  isLast={i === thread.length - 1 && m.role === 'assistant'}
                   onRegenerate={() => regenerate(m.id)}
                   onRetry={() => regenerate(m.id)}
-                  onEdit={editUserMessage}
+                  versions={versions.get(m.id) ?? null}
+                  onSelectVersion={selectBranch}
+                  onEditStart={() => startEdit(m.id)}
+                  editing={editingMessageId === m.id}
+                  onEditCancel={cancelEdit}
+                  onEditSubmit={(text) => submitEdit(m.id, text)}
                   onShowSummary={() => setSummaryOpen(true)}
                   clarificationPending={card.pending}
                   clarificationAnswer={card.answeredWith}
@@ -1253,7 +1484,7 @@ export function ChatApp() {
           )}
         </div>
 
-        {!atBottom && messages.length > 0 && (
+        {!atBottom && thread.length > 0 && (
           <div className="pointer-events-none relative">
             <button
               type="button"
@@ -1277,7 +1508,7 @@ export function ChatApp() {
               // never adjusted by anything the browser assumes a compaction
               // saved. If the value is stale it is stale honestly; a made-up
               // smaller number is worse than an old true one.
-              view={meterView(latestUsage(messages), draft)}
+              view={meterView(latestUsage(thread), draft)}
               compacting={compacting}
               onCompactNow={compactNow}
               compactDisabled={!activeId || streaming}
@@ -1316,7 +1547,7 @@ export function ChatApp() {
           starter={
             shouldShowStarter({
               salesforceEnabled: prefs.salesforce,
-              messageCount: messages.length,
+              messageCount: thread.length,
               streaming,
               hasPendingClarification: Boolean(pending),
               optionCount: starterOptions.length,

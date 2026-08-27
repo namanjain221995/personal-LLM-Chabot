@@ -56,15 +56,19 @@ export interface ComposerHandle {
   /** Focus, and append `seed` to whatever is already typed. */
   insert: (seed?: string) => void;
   /**
-   * Load `text` into the input for editing, then focus with the caret at the
-   * end. "Edit" on a sent message is the only caller.
+   * Load `text` into the input, then focus with the caret at the end.
    *
-   * Distinct from `insert`, which exists for the clarification panel and
-   * appends single keystrokes with no separator — correct there, and wrong
-   * here, where it would weld a whole prompt onto the end of a half-typed
-   * word. An unsent draft is never destroyed: the loaded text goes on a new
-   * paragraph after it, so the two are visibly separate and the user can
-   * delete whichever they did not want.
+   * No longer wired to anything: "Edit" on a sent message was its one caller
+   * and now rewrites the message in place instead, which is where a rewrite
+   * belongs — at the bottom of the screen it landed on top of whatever was
+   * already typed, and re-opening it stacked copy after copy of the same
+   * prompt in the box.
+   *
+   * Kept because it is the only safe way to put a whole prompt into the
+   * composer from outside: `insert` appends single keystrokes with no
+   * separator (right for the clarification panel, wrong here — it would weld
+   * a prompt onto the end of a half-typed word), while this starts the loaded
+   * text on its own paragraph and never destroys an unsent draft.
    */
   prefill: (text: string) => void;
 }
