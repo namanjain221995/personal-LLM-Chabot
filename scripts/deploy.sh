@@ -68,12 +68,19 @@ if [ -n "$DIRTY" ] && [ "${FORCE_DIRTY:-0}" != "1" ]; then
 fi
 
 git -C "$ROOT" fetch --quiet --prune origin || die "git fetch failed"
-# Accept a SHA, a local ref, or a bare branch name. The workflow passes a bare
-# name ("main") because that is what actions/checkout can fetch, while a human
-# on this box naturally types "origin/main"; both must resolve here.
-TARGET="$(git -C "$ROOT" rev-parse --verify --quiet "${REF}^{commit}" \
-       || git -C "$ROOT" rev-parse --verify --quiet "origin/${REF}^{commit}")" \
-  || die "cannot resolve '$REF' as a commit, a ref, or origin/$REF"
+# Accept a SHA, "origin/main", or a bare branch name. The REMOTE is tried FIRST
+# for a bare name: this checkout keeps local branches that are not deployed from
+# and go stale, and resolving "main" against the local branch shipped a commit
+# 30 behind origin/main in testing. A SHA or an explicit origin/... is used
+# as given.
+if git -C "$ROOT" rev-parse --verify --quiet "${REF}^{commit}" >/dev/null && \
+   case "$REF" in origin/*|refs/*) true ;; *) [ "${#REF}" -ge 7 ] && [ -z "${REF//[0-9a-fA-F]/}" ] ;; esac; then
+  TARGET="$(git -C "$ROOT" rev-parse --verify "${REF}^{commit}")"      # SHA or explicit remote ref
+else
+  TARGET="$(git -C "$ROOT" rev-parse --verify --quiet "origin/${REF}^{commit}" \
+         || git -C "$ROOT" rev-parse --verify --quiet "${REF}^{commit}")" \
+    || die "cannot resolve '$REF' as a commit, origin/$REF, or a local ref"
+fi
 PREVIOUS="$(git -C "$ROOT" rev-parse HEAD)"
 say "current=$PREVIOUS"
 say "target =$TARGET  $(git -C "$ROOT" log -1 --pretty='%s' "$TARGET" | cut -c1-72)"
