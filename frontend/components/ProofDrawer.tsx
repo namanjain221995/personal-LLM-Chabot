@@ -91,7 +91,9 @@ export function ProofDrawer({ meta }: { meta: Meta }) {
   return (
     <div className="mt-3 rounded-ts border border-border bg-surface/60">
       <div className="flex flex-wrap items-center gap-2 px-3 py-2">
-        <EngineBadge engine={meta.route} />
+        {/* A message can carry meta purely to record its tree position, so
+            the badge only renders once an engine has actually answered. */}
+        {meta.route && <EngineBadge engine={meta.route} />}
         {sections.length > 0 && (
           <span aria-hidden className="h-4 w-px bg-border" />
         )}

@@ -83,6 +83,40 @@ export function isUnreachable(err: unknown): boolean {
   return !(err instanceof HistoryApiError) || err.status === 0;
 }
 
+/** What to tell the user when a truncate was refused, and what to do next. */
+export interface TruncateFailure {
+  /** The sentence to show. Copy WE wrote — never an upstream body. */
+  message: string;
+  /** Should the thread be re-read from the server? */
+  reload: boolean;
+}
+
+/**
+ * Explain a refused truncate.
+ *
+ * Only a rejection the SERVER actually sent means the thread moved underneath
+ * us: 409 (someone appended) or 404 (the row is gone). Those are worth
+ * re-reading. Everything else — a 502 from the frontend's own proxy while the
+ * orchestrator is down, a 500, a dead network — means the request never
+ * landed, so nothing was destroyed and re-reading would only fail a second
+ * time. Reporting that as "changed elsewhere" sent the user hunting for a
+ * conflict that never happened, and threw away the edit they were mid-way
+ * through as if it had been superseded.
+ */
+export function truncateFailure(err: unknown): TruncateFailure {
+  if (isConflict(err) || isNotFound(err)) {
+    return {
+      message: 'This conversation changed elsewhere — reloaded it instead.',
+      reload: true,
+    };
+  }
+  return {
+    message:
+      'Could not reach the server — nothing was changed. Please try again.',
+    reload: false,
+  };
+}
+
 /** V3 §1: `PUT /history/conversations/{id}` accepts any subset of these. */
 export interface ConversationPatch {
   title?: string;

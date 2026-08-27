@@ -132,8 +132,39 @@ export interface MessageAttachment {
   kind: 'dataset' | 'pdf';
 }
 
+/**
+ * Where this message sits in the conversation TREE (ChatGPT-style editing).
+ *
+ * Editing a user turn does NOT replace it. The edit is appended as an
+ * alternative version alongside the original, and the two become siblings
+ * under the same parent; the thread you see is one path down that tree.
+ *
+ * Only messages created since this feature carry the field. A message without
+ * one is treated as a child of whatever physically precedes it — which is
+ * exactly what a linear conversation already is — so existing threads need no
+ * migration, no rewrite, and no metadata written back to them.
+ *
+ * `self` is a DURABLE id, deliberately not `ChatMessage.id`: reloading a
+ * conversation renumbers every message to `srv-<conversation>-<index>`, so an
+ * id-based pointer would dangle after the first refresh. This one rides in
+ * `meta`, which the server stores as opaque JSON and hands back verbatim
+ * (proven by the reasoning/attachments round-trips in history-server.test.ts).
+ */
+export interface BranchMeta {
+  /** This message's durable identity. Survives a reload. */
+  self: string;
+  /** Durable id of the message it follows. Absent = start of the thread. */
+  parent?: string;
+}
+
 export interface Meta {
-  route: Engine;
+  /**
+   * Which engine answered. Optional: a message may carry meta purely to
+   * record its place in the tree, before (or without) any engine running.
+   */
+  route?: Engine;
+  /** Tree position — see BranchMeta. Absent on every pre-branching message. */
+  branch?: BranchMeta;
   sql?: string;
   data?: DataRow[];
   truncated?: boolean;

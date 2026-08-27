@@ -11,8 +11,9 @@
  * behind the Sources button instead.
  */
 
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { ChatMessage } from '@/lib/types';
+import type { VersionInfo } from '@/lib/branching';
 import { parseClarification } from '@/lib/clarification';
 import { ClarificationRecord } from './ClarificationCard';
 import { Loader } from './Loader';
@@ -37,6 +38,7 @@ import { friendlyError, trimNotice } from '@/lib/errors';
 import {
   IconAlert,
   IconBook,
+  IconChevronRight,
   IconFileText,
   IconPencil,
   IconRefresh,
@@ -55,9 +57,65 @@ const ACTION_ROW =
   'mt-1.5 flex items-center gap-0.5 transition-opacity duration-ts';
 const ACTION_ROW_HIDDEN =
   'opacity-0 focus-within:opacity-100 group-hover/msg:opacity-100';
+/**
+ * `‹ 2 / 2 ›` — which version of an edited turn is on screen.
+ *
+ * Deliberately tiny and quiet: it sits in the message's existing action row,
+ * borrows its icon button styling, and adds no new spacing or colour of its
+ * own. An end of the range simply disables its arrow rather than hiding it,
+ * so the control does not change width as you move through versions.
+ */
+function VersionNav({
+  versions,
+  onSelect,
+}: {
+  versions: VersionInfo;
+  onSelect: (parent: string, id: string) => void;
+}) {
+  const step = (target: string | undefined) => () => {
+    if (target) onSelect(versions.parent, target);
+  };
+  return (
+    <span className="mr-0.5 inline-flex items-center gap-0.5 text-xs text-muted">
+      <button
+        type="button"
+        onClick={step(versions.previous)}
+        disabled={!versions.previous}
+        aria-label="Previous version"
+        title="Previous version"
+        className={VERSION_ARROW}
+      >
+        <IconChevronRight size={14} className="rotate-180" />
+      </button>
+      <span aria-live="polite" className="tabular-nums">
+        {versions.number} / {versions.total}
+      </span>
+      <button
+        type="button"
+        onClick={step(versions.next)}
+        disabled={!versions.next}
+        aria-label="Next version"
+        title="Next version"
+        className={VERSION_ARROW}
+      >
+        <IconChevronRight size={14} />
+      </button>
+    </span>
+  );
+}
+
+const VERSION_ARROW =
+  'rounded p-1 text-icon transition-colors duration-ts hover:bg-surface-2 hover:text-ink disabled:cursor-default disabled:opacity-30 disabled:hover:bg-transparent';
+
 /** The ghost icon button used by every action in that row. */
 const ACTION_BUTTON =
   'rounded-lg p-2 text-icon transition-colors duration-ts hover:bg-surface-2 hover:text-ink';
+
+/** The inline editor grows with its text, then scrolls (~12 rows). */
+const EDIT_MAX_HEIGHT = 288;
+/** Cancel · Send under the inline editor — ChatGPT's pill pair. */
+const EDIT_BUTTON =
+  'rounded-full px-4 py-1.5 text-sm font-medium transition-all duration-ts';
 
 /** "report.pdf" → "PDF", "sales.csv" → "CSV", "data.tar.gz" → "TAR.GZ". */
 function fileBadge(name: string): string {
@@ -71,7 +129,12 @@ export function MessageRow({
   onRegenerate,
   onShowSummary,
   onRetry,
-  onEdit,
+  versions = null,
+  onSelectVersion,
+  onEditStart,
+  editing = false,
+  onEditCancel,
+  onEditSubmit,
   onFeedback,
   clarificationPending = false,
   clarificationAnswer = '',
@@ -83,15 +146,33 @@ export function MessageRow({
   onShowSummary?: () => void;
   onRetry: () => void;
   /**
-   * "Edit" on a USER message: hand its exact text back to the composer.
+   * "Edit" on a USER message: rewrite it IN PLACE, ChatGPT-style.
    *
-   * Deliberately NOT an in-place rewrite. Editing a sent message for real
-   * means deleting every turn after it and regenerating from that point,
-   * which is destructive and needs the server's truncate path; this reuses
-   * the prompt instead and leaves the transcript exactly as it was. Omitted
-   * (previews, tests) simply hides the control.
+   * The pencil swaps the bubble for a textarea seeded with the exact text,
+   * over a Cancel · Send pair. This IS the destructive path the old
+   * composer-prefill version deliberately avoided — sending really does
+   * replace this turn and discard every turn after it — so the host owns the
+   * state: it confirms when turns would be lost, drives the server's truncate
+   * endpoint, and keeps at most one editor open. Omitting `onEditStart`
+   * (previews, tests) hides the control and leaves the row read-only.
    */
-  onEdit?: (text: string) => void;
+  onEditStart?: () => void;
+  /**
+   * The alternatives of this turn, when it has more than one.
+   *
+   * Editing a message adds a version beside it instead of replacing it, so a
+   * turn can have several. null — the usual case — renders no control at all:
+   * `1 / 1` is not a navigator.
+   */
+  versions?: VersionInfo | null;
+  /** Show a different version. Pure view selection — see ChatApp. */
+  onSelectVersion?: (parent: string, id: string) => void;
+  /** Is THIS row the one open for editing? Owned by the host. */
+  editing?: boolean;
+  /** Close the editor and change nothing at all. */
+  onEditCancel?: () => void;
+  /** Commit the rewrite. Always trimmed and non-empty. */
+  onEditSubmit?: (text: string) => void;
   /**
    * Is THIS message's question the one the thread is waiting on?
    *
@@ -143,6 +224,61 @@ export function MessageRow({
     onFeedback?.(next);
   }
 
+  /**
+   * The inline editor's own text: seeded from the message when the pencil
+   * opens it, dropped when it closes. Re-opening therefore always starts from
+   * what was actually sent, never from an abandoned half-edit.
+   */
+  const [editDraft, setEditDraft] = useState('');
+  const editRef = useRef<HTMLTextAreaElement>(null);
+  /** Armed when the editor opens; consumed once the seeded text has landed. */
+  const focusOnOpen = useRef(false);
+
+  // Opening seeds the box from the message; closing empties it. Keyed on
+  // `editing` ALONE — `message.content` must not be a dependency or a
+  // re-render mid-edit (a sibling stream tick, a history refresh) would throw
+  // away what is being typed. Seeding here rather than in the click handler
+  // is what makes the row a real controlled component: whoever opens it, the
+  // box is correct.
+  useEffect(() => {
+    setEditDraft(editing ? (message.content ?? '') : '');
+    if (editing) focusOnOpen.current = true;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editing]);
+
+  const autogrowEdit = useCallback((ta: HTMLTextAreaElement | null) => {
+    if (!ta) return;
+    ta.style.height = 'auto';
+    ta.style.height = `${Math.min(ta.scrollHeight, EDIT_MAX_HEIGHT)}px`;
+    ta.style.overflowY = ta.scrollHeight > EDIT_MAX_HEIGHT ? 'auto' : 'hidden';
+  }, []);
+
+  // Size, focus and drop the caret after the last character — deferred to the
+  // render AFTER the seed lands. `value` is React state, so doing this when
+  // the node mounts would measure and select against a textarea React has not
+  // written the text into yet, parking the caret at position 0.
+  useEffect(() => {
+    if (!focusOnOpen.current) return;
+    const ta = editRef.current;
+    if (!ta) return;
+    focusOnOpen.current = false;
+    autogrowEdit(ta);
+    ta.focus();
+    ta.setSelectionRange(ta.value.length, ta.value.length);
+  }, [editDraft, autogrowEdit]);
+
+  function beginEdit() {
+    onEditStart?.();
+  }
+
+  function commitEdit() {
+    const next = editDraft.trim();
+    // An empty box is not an edit — Cancel is how you back out of one. What
+    // an UNCHANGED text means is the host's call; it gets the trimmed string.
+    if (!next) return;
+    onEditSubmit?.(next);
+  }
+
   if (message.role === 'user') {
     // Actions need something to act ON. An attachment-only turn (a dropped
     // PDF, images with no caption) has no text to copy or reuse, so it gets
@@ -153,7 +289,9 @@ export function MessageRow({
       // `group/msg` only marks the hover scope — it paints nothing. The
       // bubble below is untouched.
       <div className="group/msg flex justify-end">
-        <div className="max-w-[85%] sm:max-w-[70%]">
+        {/* The editor needs room to be typed in, so it takes the full thread
+            width; the sent bubble keeps hugging its own text. */}
+        <div className={editing ? 'w-full' : 'max-w-[85%] sm:max-w-[70%]'}>
           {(message.imageDataUrls?.length || message.imageDataUrl) && (
             <div className="mb-1.5 flex flex-wrap justify-end gap-1.5">
               {/* 2026-08-05: up to 5 images per turn — `imageDataUrls` when
@@ -197,36 +335,100 @@ export function MessageRow({
               <PastedChip pasted={p} />
             </div>
           ))}
-          {message.content && (
-            <div className="whitespace-pre-wrap break-words rounded-[20px] bg-bubble px-4 py-2.5 text-[15px] leading-relaxed">
-              {message.content}
-            </div>
-          )}
-          {/* Edit · Copy, in the assistant row's own classes and its
-              hover-to-reveal behaviour, right-aligned under the bubble to
-              follow it. Neither button sends anything, touches history or
-              reaches the network. */}
-          {showUserActions && (
-            <div className={`${ACTION_ROW} ${ACTION_ROW_HIDDEN} justify-end`}>
-              {onEdit && (
+          {editing ? (
+            /* The in-place editor: the bubble becomes a textarea over
+               Cancel · Send, keeping the bubble's own shape and colour so the
+               turn still reads as the user's while it is being rewritten. */
+            <div className="rounded-[20px] bg-bubble px-4 py-3">
+              <textarea
+                ref={editRef}
+                value={editDraft}
+                onChange={(e) => {
+                  setEditDraft(e.target.value);
+                  autogrowEdit(e.target);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Escape') {
+                    // Swallowed here so it cannot ALSO reach the window-level
+                    // shortcut handler sitting behind the thread.
+                    e.preventDefault();
+                    e.stopPropagation();
+                    onEditCancel?.();
+                    return;
+                  }
+                  // Enter sends, Shift+Enter breaks the line — the composer's
+                  // own contract, so the two boxes never disagree.
+                  if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault();
+                    commitEdit();
+                  }
+                }}
+                rows={1}
+                aria-label="Edit your message"
+                className="block w-full resize-none bg-transparent text-[15px] leading-relaxed text-ink focus:outline-none"
+              />
+              <div className="mt-2 flex items-center justify-end gap-2">
                 <button
                   type="button"
-                  onClick={() => onEdit(userText)}
-                  aria-label="Edit message"
-                  title="Edit — puts this prompt back in the message box"
-                  className={ACTION_BUTTON}
+                  onClick={() => onEditCancel?.()}
+                  className={`${EDIT_BUTTON} border border-border text-ink hover:bg-surface-2`}
                 >
-                  <IconPencil size={18} />
+                  Cancel
                 </button>
-              )}
-              {/* The user's own words, verbatim: no citation stripping (there
-                  are none to strip) and no trimming. */}
-              <CopyButton
-                text={userText}
-                label="Copy message"
-                variant="icon"
-              />
+                <button
+                  type="button"
+                  onClick={commitEdit}
+                  disabled={!editDraft.trim()}
+                  className={`${EDIT_BUTTON} bg-accent-strong text-white hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40`}
+                >
+                  Send
+                </button>
+              </div>
             </div>
+          ) : (
+            <>
+              {message.content && (
+                <div className="whitespace-pre-wrap break-words rounded-[20px] bg-bubble px-4 py-2.5 text-[15px] leading-relaxed">
+                  {message.content}
+                </div>
+              )}
+              {/* Edit · Copy, in the assistant row's own classes and its
+                  hover-to-reveal behaviour, right-aligned under the bubble to
+                  follow it. Copy reaches nothing; Edit only opens the box
+                  above — neither sends or stores anything by itself. */}
+              {showUserActions && (
+                <div
+                  className={`${ACTION_ROW} ${
+                    // A turn WITH versions keeps its navigator visible: it is
+                    // the only sign that another answer exists, and hiding it
+                    // until hover would hide the fact itself.
+                    versions ? '' : ACTION_ROW_HIDDEN
+                  } justify-end`}
+                >
+                  {versions && onSelectVersion && (
+                    <VersionNav versions={versions} onSelect={onSelectVersion} />
+                  )}
+                  {onEditStart && (
+                    <button
+                      type="button"
+                      onClick={beginEdit}
+                      aria-label="Edit message"
+                      title="Edit"
+                      className={ACTION_BUTTON}
+                    >
+                      <IconPencil size={18} />
+                    </button>
+                  )}
+                  {/* The user's own words, verbatim: no citation stripping
+                      (there are none to strip) and no trimming. */}
+                  <CopyButton
+                    text={userText}
+                    label="Copy message"
+                    variant="icon"
+                  />
+                </div>
+              )}
+            </>
           )}
         </div>
       </div>
@@ -438,9 +640,15 @@ export function MessageRow({
           {!streaming && message.content && message.status !== 'error' && (
             <div
               className={`${ACTION_ROW} ${
-                isLast ? 'opacity-100' : ACTION_ROW_HIDDEN
+                isLast || versions ? 'opacity-100' : ACTION_ROW_HIDDEN
               }`}
             >
+              {/* An answer gets alternatives too: retrying inside a branched
+                  conversation adds one beside the old answer rather than
+                  destroying it, so it needs the same way back. */}
+              {versions && onSelectVersion && (
+                <VersionNav versions={versions} onSelect={onSelectVersion} />
+              )}
               {/* ChatGPT-style icon row (2026-08-05): quiet ghost icons
                   instead of labelled chip buttons. */}
               <CopyButton

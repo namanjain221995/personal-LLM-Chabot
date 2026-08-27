@@ -18,13 +18,14 @@
  * which conversation is on screen.
  */
 
+import { branchForAppend, branchOf, metaWithBranch } from './branching';
 import type { ClarificationResponse } from './clarification';
 import { getHistoryStore, newId } from './history';
 import { foldModelContent } from './pasted';
 import type { ChatPrefs } from './prefs';
 import { toClientError } from './errorTypes';
 import { foldStreamState, mergeStep, readChatStream } from './sse';
-import type { ChatMessage } from './types';
+import type { BranchMeta, ChatMessage } from './types';
 
 export type StreamStatus =
   | 'streaming'
@@ -307,13 +308,19 @@ async function consume(s: LiveStream, body: ReadableStream<Uint8Array>) {
         research: m.research ? { ...m.research, active: false } : undefined,
         // The star must stop when the answer arrives, not when a timer says so.
         phaseStatus: undefined,
-        meta: foldStreamState(ev.meta, {
-          reasoning: m.reasoning,
-          reasoningSeconds: m.reasoningSeconds ?? s.reasoningSeconds,
-          steps: m.steps,
-          research: m.research,
-          phaseStatus: m.phaseStatus,
-        }),
+        // The server's meta REPLACES the local one, so the answer's tree
+        // position has to be carried across explicitly — losing it would
+        // orphan the answer from the question it belongs to.
+        meta: metaWithBranch(
+          foldStreamState(ev.meta, {
+            reasoning: m.reasoning,
+            reasoningSeconds: m.reasoningSeconds ?? s.reasoningSeconds,
+            steps: m.steps,
+            research: m.research,
+            phaseStatus: m.phaseStatus,
+          }),
+          branchOf(m),
+        ),
       }));
     } else if (ev.kind === 'error') {
       sawTerminal = true;
@@ -335,7 +342,20 @@ async function consume(s: LiveStream, body: ReadableStream<Uint8Array>) {
   }
 }
 
-function register(conversationId: string, turns: ChatMessage[]): LiveStream {
+/**
+ * Open a stream and put its answer placeholder at the end of `turns`.
+ *
+ * `turns` is everything the conversation STORES — sibling branches included —
+ * not the path being sent to the model. Those were the same list until edits
+ * became non-destructive; keeping them the same would have meant a stream
+ * saving only the branch it answered and quietly dropping the others.
+ * `assistantBranch` is what files the answer under the right question.
+ */
+function register(
+  conversationId: string,
+  turns: ChatMessage[],
+  assistantBranch?: BranchMeta,
+): LiveStream {
   const s: LiveStream = {
     conversationId,
     assistantId: newId(),
@@ -354,6 +374,9 @@ function register(conversationId: string, turns: ChatMessage[]): LiveStream {
       content: '',
       status: 'streaming',
       createdAt: Date.now(),
+      ...(assistantBranch
+        ? { meta: metaWithBranch(undefined, assistantBranch) }
+        : {}),
     },
   ];
   streams.set(conversationId, s);
@@ -363,7 +386,19 @@ function register(conversationId: string, turns: ChatMessage[]): LiveStream {
 
 export interface StartStreamOptions {
   conversationId: string;
+  /** Everything the conversation STORES, sibling branches included. */
   turns: ChatMessage[];
+  /**
+   * The single path down the tree to send to the model. Defaults to `turns`,
+   * which is correct for every conversation that has never been edited.
+   *
+   * Kept separate so an edited conversation stores both versions of a turn
+   * while the prompt still carries exactly one — sending both would put two
+   * contradictory histories of the same question in one context window.
+   */
+  context?: ChatMessage[];
+  /** Where the answer belongs in the tree (see BranchMeta). */
+  assistantBranch?: BranchMeta;
   prefs: ChatPrefs;
   /** 2026-08-05: up to 5 attached images (base64, no data: prefix). */
   images?: string[] | null;
@@ -403,7 +438,8 @@ export function markClarificationSubmitted(key: string): void {
 /** Send a turn and stream the answer in the background. */
 export async function startStream(opts: StartStreamOptions): Promise<void> {
   const { conversationId, turns, prefs } = opts;
-  const s = register(conversationId, turns);
+  const context = opts.context ?? turns;
+  const s = register(conversationId, turns, opts.assistantBranch);
   // Did the orchestrator accept the request? Decides whether a failure below
   // is "unreachable" (retry) or "interrupted" (re-join) — see markInterrupted.
   let connected = false;
@@ -412,7 +448,7 @@ export async function startStream(opts: StartStreamOptions): Promise<void> {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        messages: turns
+        messages: context
           .map((m) => ({
             role: m.role,
             content: foldModelContent(m.content, m.meta?.pasted),
@@ -482,7 +518,15 @@ export async function attachStream(conversationId: string): Promise<boolean> {
     // backstop that keeps a stale copy from destroying anything.
   }
   const turns = attachBaseTurns(base?.messages ?? []);
-  const s = register(conversationId, turns);
+  // The replay rebuilds the answer from scratch, so its placeholder needs the
+  // tree position of the question it is answering — otherwise re-joining a
+  // generation after a reload would file the answer at the end of the flat
+  // list instead of under its own turn.
+  const s = register(
+    conversationId,
+    turns,
+    branchForAppend(base?.messages ?? turns, turns),
+  );
   try {
     const res = await fetch(
       `/api/chat/attach/${encodeURIComponent(conversationId)}`,

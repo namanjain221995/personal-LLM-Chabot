@@ -7,12 +7,19 @@
  * text in the thread the user actually wrote was the one text they could not
  * copy, and re-asking a long prompt with one word changed meant retyping it.
  *
- * The load-bearing constraint is what these two must NOT do. This task is
- * frontend-only: Edit hands the prompt back to the composer and stops. It does
- * not rewrite the stored message, does not discard the turns after it, does not
- * call the truncate endpoint, and does not send anything. A test that only
- * checked "the text arrives in the box" would pass just as happily for a
- * version that quietly deleted half the conversation on the way.
+ * Edit then landed the prompt in the COMPOSER, which was the wrong place: the
+ * rewrite appeared at the bottom of the screen instead of on the message it
+ * belonged to, on top of whatever was already typed there, and re-opening it
+ * stacked copy after copy of the same sentence in the box. It now rewrites the
+ * message where the message is — a textarea over Cancel · Send, ChatGPT-style.
+ *
+ * The load-bearing constraint has moved with it. The row may not decide
+ * anything: sending an edit really does replace the turn and discard every
+ * turn after it, so the row only ever REPORTS (`onEditStart`/`onEditSubmit`)
+ * and the host owns the truncate, the confirmation and the regeneration. A
+ * test that only checked "the box appears with the right text in it" would
+ * pass just as happily for a version that deleted half the conversation on its
+ * own initiative.
  */
 
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
@@ -40,19 +47,32 @@ const assistant = (over: Partial<ChatMessage> = {}): ChatMessage => ({
 });
 
 function renderRow(message: ChatMessage, props: Record<string, unknown> = {}) {
-  const onEdit = vi.fn();
-  render(
+  const onEditStart = vi.fn();
+  const onEditCancel = vi.fn();
+  const onEditSubmit = vi.fn();
+  const view = render(
     <MessageRow
       message={message}
       isLast={false}
       onRegenerate={vi.fn()}
       onRetry={vi.fn()}
-      onEdit={onEdit}
+      onEditStart={onEditStart}
+      onEditCancel={onEditCancel}
+      onEditSubmit={onEditSubmit}
       {...props}
     />,
   );
-  return { onEdit };
+  return { onEditStart, onEditCancel, onEditSubmit, ...view };
 }
+
+/** The row rendered with its editor already open — the host's `editing`. */
+function renderEditing(message: ChatMessage) {
+  return renderRow(message, { editing: true });
+}
+
+const editor = () => screen.getByRole('textbox') as HTMLTextAreaElement;
+const sendBtn = () =>
+  screen.getByRole('button', { name: 'Send' }) as HTMLButtonElement;
 
 /** Every network path the row could possibly reach, watched at once. */
 let fetchSpy: ReturnType<typeof vi.fn>;
@@ -88,12 +108,12 @@ describe('F — Copy on a user message', () => {
   });
 
   it('copies once per click, and touches nothing else', () => {
-    const { onEdit } = renderRow(user());
+    const { onEditStart } = renderRow(user());
     fireEvent.click(screen.getByRole('button', { name: 'Copy message' }));
 
     expect(navigator.clipboard.writeText).toHaveBeenCalledTimes(1);
     expect(fetchSpy).not.toHaveBeenCalled(); // no backend, no generation
-    expect(onEdit).not.toHaveBeenCalled();
+    expect(onEditStart).not.toHaveBeenCalled();
   });
 
   it('renders the bubble text unchanged next to it', () => {
@@ -102,35 +122,36 @@ describe('F — Copy on a user message', () => {
   });
 });
 
-/* ------------------------------------------------------------ G. Edit */
+/* ------------------------------------------------- G. Edit — opening it */
 
-describe('G — Edit on a user message', () => {
-  it('hands the exact text to the host and does nothing else', () => {
-    const text = 'first line\nsecond line';
-    const { onEdit } = renderRow(user({ content: text }));
+describe('G — the pencil asks the host to open the editor', () => {
+  it('reports the request and does nothing else', () => {
+    const { onEditStart, onEditSubmit } = renderRow(user());
 
     fireEvent.click(screen.getByRole('button', { name: 'Edit message' }));
 
-    expect(onEdit).toHaveBeenCalledTimes(1);
-    expect(onEdit).toHaveBeenCalledWith(text); // line breaks preserved
-    // No request of any kind — in particular no /truncate, and no send.
+    expect(onEditStart).toHaveBeenCalledTimes(1);
+    // Opening is not sending, and no request of any kind is made — in
+    // particular no /truncate.
+    expect(onEditSubmit).not.toHaveBeenCalled();
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
-  it('leaves the historical message object untouched', () => {
+  it('does NOT open the box by itself — `editing` is the host s to give', () => {
     const message = user({ content: 'original' });
     const snapshot = JSON.stringify(message);
     renderRow(message);
 
     fireEvent.click(screen.getByRole('button', { name: 'Edit message' }));
 
-    expect(JSON.stringify(message)).toBe(snapshot);
-    // …and the bubble still shows the original, not an edit box.
-    expect(screen.getByText('original')).toBeTruthy();
+    // A row that opened its own editor would be a row that could rewrite a
+    // turn the host never agreed to touch.
     expect(screen.queryByRole('textbox')).toBeNull();
+    expect(screen.getByText('original')).toBeTruthy();
+    expect(JSON.stringify(message)).toBe(snapshot);
   });
 
-  it('is absent when the host offers no edit handler', () => {
+  it('is absent when the host offers no way to start an edit', () => {
     render(
       <MessageRow
         message={user()}
@@ -145,9 +166,215 @@ describe('G — Edit on a user message', () => {
   });
 });
 
-/* ------------------------------------------- H. nothing worth acting on */
+/* ------------------------------------------------- H. Edit — the editor */
 
-describe('H — a turn with no text gets no action row', () => {
+describe('H — the open editor', () => {
+  it('replaces the bubble with a textarea holding the exact text', () => {
+    const text = 'first line\nsecond line';
+    renderEditing(user({ content: text }));
+
+    expect(editor().value).toBe(text); // line breaks preserved
+    // The read-only bubble and its actions are gone while it is open.
+    expect(screen.queryByRole('button', { name: 'Edit message' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Copy message' })).toBeNull();
+  });
+
+  it('seeds itself from the message however it was opened', () => {
+    // Rendered straight into `editing` with no click anywhere: the box must
+    // still be correct, or the row is only accidentally controlled.
+    renderEditing(user({ content: 'seeded from the message' }));
+    expect(editor().value).toBe('seeded from the message');
+  });
+
+  it('focuses the box and parks the caret after the last character', () => {
+    const text = 'edit me';
+    renderEditing(user({ content: text }));
+
+    const ta = editor();
+    expect(document.activeElement).toBe(ta);
+    // Typing continues the prompt instead of inserting at position 0.
+    expect(ta.selectionStart).toBe(text.length);
+    expect(ta.selectionEnd).toBe(text.length);
+  });
+
+  it('offers Cancel and Send, and reaches no network to render', () => {
+    renderEditing(user());
+    expect(screen.getByRole('button', { name: 'Cancel' })).toBeTruthy();
+    expect(sendBtn()).toBeTruthy();
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('re-opening starts from the message, never from an abandoned edit', () => {
+    const message = user({ content: 'the original' });
+    const { rerender } = renderEditing(message);
+
+    fireEvent.change(editor(), { target: { value: 'half-typed rubbish' } });
+    // Close…
+    rerender(
+      <MessageRow
+        message={message}
+        isLast={false}
+        onRegenerate={vi.fn()}
+        onRetry={vi.fn()}
+        onEditStart={vi.fn()}
+        editing={false}
+      />,
+    );
+    // …and open again.
+    rerender(
+      <MessageRow
+        message={message}
+        isLast={false}
+        onRegenerate={vi.fn()}
+        onRetry={vi.fn()}
+        onEditStart={vi.fn()}
+        editing
+      />,
+    );
+
+    expect(editor().value).toBe('the original');
+  });
+
+  it('keeps the turn s attachments visible while it is being rewritten', () => {
+    renderEditing(user({ content: 'about this file', pdfName: 'report.pdf' }));
+    expect(screen.getByText('report.pdf')).toBeTruthy();
+    expect(editor().value).toBe('about this file');
+  });
+});
+
+/* -------------------------------------------------- I. Edit — cancelling */
+
+describe('I — Cancel', () => {
+  it('reports the cancel and submits nothing', () => {
+    const { onEditCancel, onEditSubmit } = renderEditing(user());
+
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+
+    expect(onEditCancel).toHaveBeenCalledTimes(1);
+    expect(onEditSubmit).not.toHaveBeenCalled();
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('discards a rewrite without ever reporting it', () => {
+    const { onEditCancel, onEditSubmit } = renderEditing(user());
+
+    fireEvent.change(editor(), { target: { value: 'a change I regret' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+
+    expect(onEditCancel).toHaveBeenCalledTimes(1);
+    expect(onEditSubmit).not.toHaveBeenCalled();
+  });
+
+  it('Escape cancels too, and is swallowed before the window shortcuts', () => {
+    const { onEditCancel, onEditSubmit } = renderEditing(user());
+    const onWindowKey = vi.fn();
+    window.addEventListener('keydown', onWindowKey);
+
+    fireEvent.keyDown(editor(), { key: 'Escape' });
+
+    expect(onEditCancel).toHaveBeenCalledTimes(1);
+    expect(onEditSubmit).not.toHaveBeenCalled();
+    // Esc must not also reach the app-level handler behind the thread.
+    expect(onWindowKey).not.toHaveBeenCalled();
+    window.removeEventListener('keydown', onWindowKey);
+  });
+
+  it('leaves the stored message object untouched', () => {
+    const message = user({ content: 'original' });
+    const snapshot = JSON.stringify(message);
+    renderEditing(message);
+
+    fireEvent.change(editor(), { target: { value: 'rewritten' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+
+    // The row never writes to history — only the host does, and only on send.
+    expect(JSON.stringify(message)).toBe(snapshot);
+  });
+});
+
+/* ---------------------------------------------------- J. Edit — sending */
+
+describe('J — Send', () => {
+  it('reports the rewritten text, trimmed', () => {
+    const { onEditSubmit } = renderEditing(user());
+
+    fireEvent.change(editor(), { target: { value: '  the new question  ' } });
+    fireEvent.click(sendBtn());
+
+    expect(onEditSubmit).toHaveBeenCalledTimes(1);
+    expect(onEditSubmit).toHaveBeenCalledWith('the new question');
+  });
+
+  it('keeps the line breaks inside the rewrite', () => {
+    const { onEditSubmit } = renderEditing(user());
+
+    fireEvent.change(editor(), { target: { value: 'line one\nline two' } });
+    fireEvent.click(sendBtn());
+
+    expect(onEditSubmit).toHaveBeenCalledWith('line one\nline two');
+  });
+
+  it('sends on Enter and breaks the line on Shift+Enter', () => {
+    const { onEditSubmit } = renderEditing(user());
+    fireEvent.change(editor(), { target: { value: 'ask this instead' } });
+
+    fireEvent.keyDown(editor(), { key: 'Enter', shiftKey: true });
+    expect(onEditSubmit).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(editor(), { key: 'Enter' });
+    expect(onEditSubmit).toHaveBeenCalledTimes(1);
+    expect(onEditSubmit).toHaveBeenCalledWith('ask this instead');
+  });
+
+  it('refuses to send an emptied box, by button or by Enter', () => {
+    const { onEditSubmit } = renderEditing(user());
+
+    fireEvent.change(editor(), { target: { value: '   ' } });
+
+    expect(sendBtn().disabled).toBe(true);
+    fireEvent.click(sendBtn());
+    fireEvent.keyDown(editor(), { key: 'Enter' });
+    // Cancel is how you back out of an edit — never an empty send.
+    expect(onEditSubmit).not.toHaveBeenCalled();
+  });
+
+  it('re-enables Send as soon as there is something to send again', () => {
+    renderEditing(user());
+    fireEvent.change(editor(), { target: { value: '' } });
+    expect(sendBtn().disabled).toBe(true);
+    fireEvent.change(editor(), { target: { value: 'back' } });
+    expect(sendBtn().disabled).toBe(false);
+  });
+
+  it('reports and stops — it does not truncate, store or generate', () => {
+    const message = user({ content: 'original' });
+    const snapshot = JSON.stringify(message);
+    const { onEditSubmit } = renderEditing(message);
+
+    fireEvent.change(editor(), { target: { value: 'rewritten' } });
+    fireEvent.click(sendBtn());
+
+    expect(onEditSubmit).toHaveBeenCalledWith('rewritten');
+    // THE constraint: the row reports, the host acts. No /truncate, no
+    // /api/chat, and the historical message object is not rewritten here.
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(JSON.stringify(message)).toBe(snapshot);
+  });
+
+  it('an unchanged text is still reported — the host decides it is a no-op', () => {
+    const { onEditSubmit } = renderEditing(user({ content: 'same' }));
+
+    fireEvent.click(sendBtn());
+
+    // The row cannot know whether re-asking is meaningful; only the host can
+    // weigh it against the turns it would discard.
+    expect(onEditSubmit).toHaveBeenCalledWith('same');
+  });
+});
+
+/* ------------------------------------------- K. nothing worth acting on */
+
+describe('K — a turn with no text gets no action row', () => {
   it('shows neither action for an attachment-only message', () => {
     renderRow(user({ content: '', pdfName: 'report.pdf' }));
     expect(screen.queryByRole('button', { name: 'Copy message' })).toBeNull();
@@ -163,9 +390,9 @@ describe('H — a turn with no text gets no action row', () => {
   });
 });
 
-/* --------------------------------------------------- I. no regression */
+/* --------------------------------------------------- L. no regression */
 
-describe('I — the existing UI is unchanged', () => {
+describe('L — the existing UI is unchanged', () => {
   it('assistant messages keep their own action row exactly as it was', () => {
     render(
       <MessageRow
@@ -173,7 +400,7 @@ describe('I — the existing UI is unchanged', () => {
         isLast
         onRegenerate={vi.fn()}
         onRetry={vi.fn()}
-        onEdit={vi.fn()}
+        onEditStart={vi.fn()}
       />,
     );
     for (const name of [
@@ -215,5 +442,13 @@ describe('I — the existing UI is unchanged', () => {
     expect(edit.className).toBe(
       'rounded-lg p-2 text-icon transition-colors duration-ts hover:bg-surface-2 hover:text-ink',
     );
+  });
+
+  it('the editor wears the bubble s own shape and colour', () => {
+    renderEditing(user());
+    // It reads as the same turn being rewritten, not as a foreign panel.
+    const box = editor().parentElement as HTMLElement;
+    expect(box.className).toContain('rounded-[20px]');
+    expect(box.className).toContain('bg-bubble');
   });
 });
