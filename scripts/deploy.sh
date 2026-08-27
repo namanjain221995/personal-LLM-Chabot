@@ -68,7 +68,12 @@ if [ -n "$DIRTY" ] && [ "${FORCE_DIRTY:-0}" != "1" ]; then
 fi
 
 git -C "$ROOT" fetch --quiet --prune origin || die "git fetch failed"
-TARGET="$(git -C "$ROOT" rev-parse --verify "$REF^{commit}")" || die "cannot resolve $REF"
+# Accept a SHA, a local ref, or a bare branch name. The workflow passes a bare
+# name ("main") because that is what actions/checkout can fetch, while a human
+# on this box naturally types "origin/main"; both must resolve here.
+TARGET="$(git -C "$ROOT" rev-parse --verify --quiet "${REF}^{commit}" \
+       || git -C "$ROOT" rev-parse --verify --quiet "origin/${REF}^{commit}")" \
+  || die "cannot resolve '$REF' as a commit, a ref, or origin/$REF"
 PREVIOUS="$(git -C "$ROOT" rev-parse HEAD)"
 say "current=$PREVIOUS"
 say "target =$TARGET  $(git -C "$ROOT" log -1 --pretty='%s' "$TARGET" | cut -c1-72)"
