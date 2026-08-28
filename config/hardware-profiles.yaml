@@ -81,7 +81,7 @@
       "family": "nvidia",
       "runtime_backend": "docker-vllm-cuda",
       "compose_files": ["compose/compose.dgx-spark.yaml"],
-      "main_model": "dgx-qwen38-27b-nvfp4",
+      "main_model": "dgx-qwen36-35b-nvfp4",
       "router_model": "dgx-qwen3-vl-8b-fp8",
       "embedding_model": "qwen3-embed-06b",
       "reranker_model": "qwen3-reranker-06b",

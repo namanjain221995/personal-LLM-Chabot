@@ -245,8 +245,8 @@ instead of silently changing the request.
 | `mac-qwen36-35b-6bit` | `mlx-community/Qwen3.6-35B-A3B-6bit` | vLLM-Metal | MLX 6-bit |
 | `mac-qwen3-embed-06b-8bit` | `mlx-community/Qwen3-Embedding-0.6B-8bit` | vLLM-Metal | MLX 8-bit |
 | `mac-qwen3-reranker-06b-8bit` | `mku64/Qwen3-Reranker-0.6B-mlx-8Bit` | vLLM-Metal | MLX 8-bit |
-| `dgx-qwen38-27b-nvfp4` | `RadixArk/Qwen3.8-27B-NVFP4` (served as `Qwen/Qwen3.8-27B-NVFP4`; the `dgx-spark` main model, single or dual node) | vLLM CUDA | NVFP4/ModelOpt |
-| `dgx-qwen36-35b-nvfp4` | `nvidia/Qwen3.6-35B-A3B-NVFP4` | vLLM CUDA | NVFP4/ModelOpt |
+| `dgx-qwen38-27b-nvfp4` | `RadixArk/Qwen3.8-27B-NVFP4` (served as `Qwen/Qwen3.8-27B-NVFP4`; previous `dgx-spark` main model, still in the manifest) | vLLM CUDA | NVFP4/ModelOpt |
+| `dgx-qwen36-35b-nvfp4` | `nvidia/Qwen3.6-35B-A3B-NVFP4` (served as `Qwen/Qwen3.6-35B-A3B-NVFP4`; the `dgx-spark` main model since 2026-08-29, single or dual node) | vLLM CUDA | NVFP4/ModelOpt |
 | `dgx-qwen3-vl-8b-fp8` | `Qwen/Qwen3-VL-8B-Instruct-FP8` | vLLM CUDA | FP8 |
 | `qwen3-embed-06b` | `Qwen/Qwen3-Embedding-0.6B` | vLLM CUDA | BF16 |
 | `qwen3-reranker-06b` | `Qwen/Qwen3-Reranker-0.6B` | Transformers CUDA | BF16 |

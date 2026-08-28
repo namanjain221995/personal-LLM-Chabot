@@ -109,7 +109,7 @@ probe fails.
 
 | Service | Internal port | Model/role | Host port |
 |---|---:|---|---|
-| `vllm` | 30000 | Qwen3.8 27B NVFP4 main (`RadixArk/Qwen3.8-27B-NVFP4`, served as `Qwen/Qwen3.8-27B-NVFP4`) | none (`expose` only) |
+| `vllm` | 30000 | Qwen3.6 35B-A3B NVFP4 MoE main (`nvidia/Qwen3.6-35B-A3B-NVFP4`, served as `Qwen/Qwen3.6-35B-A3B-NVFP4`) | none (`expose` only) |
 | `vllm-router` | 30002 | Qwen3-VL 8B FP8 router/vision | none |
 | `vllm-embed` | 30003 | Qwen3 Embedding 0.6B; profile `embeddings` | none |
 | `vllm-reranker` | 30005 | Qwen3 Reranker 0.6B (`/score`); profile `reranker` | none |
@@ -320,7 +320,9 @@ and `admin` profiles all active, then asserts:
   `--attention-backend flashinfer`, chunked prefill,
   prefix caching, `--max-num-batched-tokens 8192`,
   `--gpu-memory-utilization 0.35`) and its served model id
-  (`Qwen/Qwen3.8-27B-NVFP4`);
+  (`Qwen/Qwen3.6-35B-A3B-NVFP4`); `--quantization modelopt --attention-backend
+  flashinfer` now arrive through `${MAIN_STARTUP_ARGUMENTS}` from the manifest
+  entry, as in `compose.nvidia.yaml`, instead of being literal in the overlay;
 - the DGX fixture rendered again with `CLUSTER_MODE=dual` turns `vllm` into
   node-rank 0 on host networking with no `networks`/`expose`/`ports`, carries
   `--nnodes 2 --tensor-parallel-size 2 --gpu-memory-utilization 0.30`, keeps

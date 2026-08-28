@@ -267,7 +267,7 @@ class ComposeOverlayValidationTests(unittest.TestCase):
     def test_the_dgx_overlay_keeps_its_measured_model_family_and_flags(self) -> None:
         profile, rendered = self._render(FIXTURES["dgx-spark"])
         self.assertEqual(profile.hardware_profile_id, "dgx-spark")
-        self.assertEqual(profile.main_model.id, "RadixArk/Qwen3.8-27B-NVFP4")
+        self.assertEqual(profile.main_model.id, "nvidia/Qwen3.6-35B-A3B-NVFP4")
         command = " ".join(rendered["services"]["vllm"]["command"])
         for flag in (
             "--kv-cache-dtype fp8",
@@ -280,7 +280,7 @@ class ComposeOverlayValidationTests(unittest.TestCase):
             "--gpu-memory-utilization 0.35",
         ):
             self.assertIn(flag, command)
-        self.assertIn("--served-model-name Qwen/Qwen3.8-27B-NVFP4", command)
+        self.assertIn("--served-model-name Qwen/Qwen3.6-35B-A3B-NVFP4", command)
         self.assertIn("vllm-router", rendered["services"])
         self.assertIn("vllm-ocr", rendered["services"])
 
@@ -510,7 +510,7 @@ class ComposeOverlayValidationTests(unittest.TestCase):
             environment = rendered["services"][service].get("environment", {})
             self.assertTrue(environment, f"{service} received no environment")
         orchestrator = rendered["services"]["orchestrator"]["environment"]
-        self.assertEqual(orchestrator["MAIN_MODEL"], "Qwen/Qwen3.8-27B-NVFP4")
+        self.assertEqual(orchestrator["MAIN_MODEL"], "Qwen/Qwen3.6-35B-A3B-NVFP4")
         self.assertEqual(orchestrator["OPENAI_BASE_URL"], "http://vllm:30000/v1")
         self.assertTrue(orchestrator["RERANKER_MODEL"].startswith("/models/"))
         self.assertEqual(
@@ -581,7 +581,7 @@ class ComposeOverlayValidationTests(unittest.TestCase):
             "--quantization modelopt",
             "--attention-backend flashinfer",
             f"--max-model-len {profile.context_length}",
-            "--served-model-name Qwen/Qwen3.8-27B-NVFP4",
+            "--served-model-name Qwen/Qwen3.6-35B-A3B-NVFP4",
         ):
             self.assertIn(flag, command)
         self.assertNotIn("--headless", argv)
