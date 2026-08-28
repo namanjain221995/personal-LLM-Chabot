@@ -350,15 +350,19 @@ def test_sql_route_meta_reports_serving_model_not_picker(monkeypatch):
     assert meta["effort"] == "think"                 # picker effort not applied
 
 
-def test_vision_route_meta_reports_vision_model(monkeypatch):
-    """The vision route is served by the vision model; it has no reasoning
-    effort, so meta carries the vision model id and omits effort (V2 §2)."""
+def test_vision_route_meta_reports_vision_model_and_applied_effort(monkeypatch):
+    """The vision route is served by the vision model — and since 2026-08-28
+    it DOES honour a reasoning effort (it streams through
+    `stream_chat_events`), so meta carries both the vision model id and the
+    level the request actually ran at (V2 §2)."""
     from app.engines import vision as vision_engine
 
     async def route_vision(message, has_image=False, history=()):
         return "vision"
 
-    async def fake_vision_engine(message, image_base64, history, emit):
+    async def fake_vision_engine(
+        message, image_base64, history, emit, *, effort="think", max_tokens=None
+    ):
         await emit("token", {"text": "An invoice."})
         await emit("meta", {"route": "vision"})
         return "An invoice."
@@ -373,7 +377,9 @@ def test_vision_route_meta_reports_vision_model(monkeypatch):
         )
     meta = dict(_parse_sse(resp.text))["meta"]
     assert meta["model"] == settings.vision_model
-    assert "effort" not in meta
+    # Legacy "high" normalizes at the boundary; meta reports the canonical
+    # level that was applied, never the raw wire value.
+    assert meta["effort"] == "think"
 
 
 def test_agent_meta_reports_smart_model_and_applied_effort(monkeypatch):

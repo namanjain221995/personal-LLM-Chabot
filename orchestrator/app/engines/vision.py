@@ -15,8 +15,19 @@ import re
 from typing import Awaitable, Callable, List, Optional, Sequence
 
 from .. import llm
+from ..config import settings
 
 Emit = Callable[[str, dict], Awaitable[None]]
+
+#: Effort this engine runs at when a caller does not name one. "think" is
+#: exactly what this route did before 2026-08-28, so every caller that is not
+#: updated (graph.py's `_vision_node`, bare API calls) keeps today's
+#: behaviour and nothing regresses.
+DEFAULT_EFFORT = "think"
+
+#: Completion ceiling asked of the vision model. Deliberately generous; see
+#: `vision_max_tokens` for why frugal is the wrong instinct on this route.
+VISION_ANSWER_TOKENS = 8000
 
 _JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.S)
 _DATA_URL_RE = re.compile(r"^data:image/[\w.+-]+;base64,", re.I)
@@ -79,12 +90,52 @@ def extract_json_block(text: str) -> Optional[dict]:
     return obj if isinstance(obj, dict) else None
 
 
+def vision_max_tokens(max_tokens: Optional[int] = None) -> int:
+    """Completion ceiling for one vision call, clamped to what the vision
+    endpoint says it will serve (`VISION_OUTPUT_LIMIT`, 8192 here).
+
+    WHY THE BUDGET MATTERS MORE HERE THAN ANYWHERE ELSE: reasoning and answer
+    are drawn from ONE `max_tokens` pool, and an image prompt makes the model
+    think long before it writes anything. Measured 2026-08-28 on three
+    1280x800 screenshots: with thinking ON and max_tokens=700 the stream
+    produced ZERO content chunks — 26-28s of reasoning, whole budget gone, no
+    answer at all. The same three images with thinking OFF answered in
+    2.3-2.9s. So a small ceiling here does not make the route cheaper, it
+    makes it return nothing.
+
+    `llm.stream_chat_events` already protects the thinking-ON case (it floors
+    the request at MAX_OUTPUT_TOKENS whenever thinking is on), which makes
+    this value the ceiling the FAST path actually runs under. It has to be
+    big enough for a full multi-image extraction to finish, hence generous.
+
+    Clamping keeps the request coherent with the declared capability: a
+    deployment that lowers VISION_OUTPUT_LIMIT is never asked for more than
+    it serves, and a caller that wants less (or the request-level budget a
+    future caller passes in) is honoured as-is.
+    """
+    want = max_tokens if max_tokens and max_tokens > 0 else VISION_ANSWER_TOKENS
+    limit = settings.vision_capabilities.output_limit or 0
+    return min(want, limit) if limit > 0 else want
+
+
 async def run_vision_engine(
     message: str,
     images: "Optional[str | Sequence[str]]",
     history: Sequence[dict],
     emit: Emit,
+    *,
+    effort: str = DEFAULT_EFFORT,
+    max_tokens: Optional[int] = None,
 ) -> str:
+    """Answer about attached image(s) at the effort the caller asked for.
+
+    `effort` accepts any wire value `llm.normalize_effort` understands and
+    means the same thing it means on the text route: fast -> thinking OFF,
+    think/max -> thinking ON. It is NOT a knob invented here — the whole
+    mechanism is `stream_chat_events` turning the effort into the chat
+    template's `enable_thinking`; this engine's only job is to stop
+    overriding it.
+    """
     imgs = [images] if isinstance(images, str) else list(images or [])
     if not imgs:
         raise ValueError("the vision engine requires an attached image")
@@ -95,7 +146,6 @@ async def run_vision_engine(
     # documents get a dedicated OCR transcript alongside the pixels — the OCR
     # model reads dense text/tables the general VLM misses. Photos with no
     # text produce an empty transcript and add nothing.
-    from ..config import settings
     from .ocr import ocr_images, transcript_block
 
     if settings.ocr_enabled:
@@ -117,10 +167,27 @@ async def run_vision_engine(
     ]
 
     parts: List[str] = []
-    # Reasoning-aware stream (the vision model is the thinking main model):
+    # Reasoning-aware stream (the vision model IS the thinking main model):
     # surface thinking in the panel and give room to finish the answer.
+    #
+    # Until 2026-08-28 this call hard-coded effort="medium" — an alias for
+    # "think" — so every image upload ran the 27B with thinking ON no matter
+    # which of Fast/Think/Max the user picked in the composer. Measured on
+    # three 1280x800 screenshots: thinking on -> 26-28s to the first visible
+    # token and no answer inside the budget; thinking off -> 2.3-2.9s and a
+    # complete answer. Passing the request's effort through is the entire
+    # fix; `stream_chat_events` already maps it to `enable_thinking`.
+    #
+    # model_choice stays "smart" on purpose: the 27B is the vision model on
+    # this deployment (VISION_BASE_URL == OPENAI_BASE_URL). The dedicated 8B
+    # VL model is NOT a fallback — measured 2026-08-28 it was slower to first
+    # token AND refused the extraction outright.
+    level = llm.normalize_effort(effort)
     async for kind, delta in llm.stream_chat_events(
-        messages, model_choice="smart", effort="medium", max_tokens=8000
+        messages,
+        model_choice="smart",
+        effort=level,
+        max_tokens=vision_max_tokens(max_tokens),
     ):
         await emit(kind, {"text": delta})
         if kind == "token":

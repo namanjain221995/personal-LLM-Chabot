@@ -1,5 +1,50 @@
 # Changelog
 
+## Image uploads honour the effort you picked (2026-08-28)
+
+Uploading images and choosing **Fast** was the slowest path in the app. The
+vision engine called `llm.stream_chat_events(..., effort="medium")` with the
+level hard-coded; `EFFORT_ALIASES` maps `medium` to `think`, and `think`
+turns the chat template's reasoning pass on. So every image upload ran the
+27B with thinking ON no matter what the composer said, and the picker was
+decorative on that route.
+
+Measured on three 1280x800 screenshots with the prompt "give me all data from
+these images and explain what it has":
+
+| | first visible token | answer |
+| --- | --- | --- |
+| thinking ON, `max_tokens=700` | 26.4-28.5 s | **none** — the whole budget went to the thought |
+| thinking OFF, `max_tokens=700` | 2.3-2.9 s | complete |
+| thinking ON, `max_tokens=4096`, non-streaming | 100.0 s | 2,697 completion tokens |
+
+- **The images were never the cost.** One 1280x800 screenshot is ~1,002
+  prompt tokens; three are ~3,006, about 3 s of prefill at the cluster's
+  ~1,000 tok/s. Decode runs at 24-27 tok/s. The seconds were all reasoning.
+- **The fix is a deletion, not a mechanism.** `stream_chat_events` already
+  turns an effort into `chat_template_kwargs.enable_thinking`;
+  `run_vision_engine` now takes an `effort` and forwards it instead of
+  overriding it. `main.py` passes `request.effort` (already normalized to
+  `fast|think|max`). `fast` → thinking off (~3 s to first token), `think` →
+  today's behaviour, `max` → whatever the text route does at max.
+- **Default unchanged.** Callers that do not name an effort — `graph.py`'s
+  `_vision_node`, bare API calls — still run at `think`, so nothing
+  regresses for a path that was not updated.
+- **No model fallback.** `model_choice` stays `"smart"`: the 27B *is* the
+  vision model here (`VISION_BASE_URL == OPENAI_BASE_URL`). Routing vision to
+  the dedicated 8B VL model was measured and rejected — it was slower to
+  first token (4.6 s) *and* refused the extraction outright.
+- **The budget is why an under-sized ceiling is worse than a generous one.**
+  Reasoning and answer share one `max_tokens` pool, so a thin ceiling on this
+  route does not make it cheap, it makes it return nothing (the 700-token row
+  above). The engine's ceiling is now clamped to the vision endpoint's
+  declared `VISION_OUTPUT_LIMIT` instead of being a bare literal.
+- **`meta` stopped lying.** The vision branch of `meta_extras` carried the
+  comment "no effort key: N/A". That was wrong the moment this route started
+  streaming through `stream_chat_events`; meta now reports the effort the
+  answer actually ran at, so the UI and the stored history agree with what
+  happened.
+
 ## Two DGX Sparks, one model (2026-08-25)
 
 A dense 27B model decoding at 10-11 tok/s on one GB10 is memory-bandwidth

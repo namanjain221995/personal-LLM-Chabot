@@ -435,14 +435,23 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
 
         meta is trust metadata, so model/effort must describe what actually
         served the answer, keyed on the engine's own `route`. The picker and
-        effort apply only where the design routes them: the chat engine (§3a)
-        and agent synthesis (§3b, smart-pinned). The data engines stay pinned
-        to the main model at its default effort per spec §8, and the vision
-        route is served by the vision model, which has no effort knob.
+        effort apply where the design routes them: the chat engine (§3a),
+        agent synthesis (§3b, smart-pinned) and — since 2026-08-28 — the
+        vision route. The data engines stay pinned to the main model at its
+        default effort per spec §8.
         """
         extras: dict = {"mode": request.mode}
         if route == "vision":
-            extras["model"] = settings.vision_model  # no effort key: N/A
+            # 2026-08-28: this used to say "no effort key: N/A", on the
+            # belief that the vision model had no effort knob. It does — the
+            # route streams through `llm.stream_chat_events`, which turns
+            # effort into the chat template's `enable_thinking` — and it was
+            # silently pinned to think, which is why Fast on an image spent
+            # its whole budget reasoning. run_vision_engine now runs at
+            # request.effort, so meta reports the level that actually served
+            # the answer instead of hiding it from the UI and the history.
+            extras["model"] = settings.vision_model
+            extras["effort"] = request.effort
         elif route == "agent":
             extras["model"] = llm.served_model_id("smart")
             extras["effort"] = request.effort  # applied to synthesis (§3b)
@@ -998,7 +1007,15 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 from .engines.vision import run_vision_engine
 
                 answer = await run_vision_engine(
-                    text, request.images_data, history, emit
+                    text,
+                    request.images_data,
+                    history,
+                    emit,
+                    # Honour the composer's Fast/Think/Max (already
+                    # normalized to fast|think|max by ChatRequest). Before
+                    # 2026-08-28 the engine ignored it and always thought,
+                    # so "Fast" on an image was the slowest path in the app.
+                    effort=request.effort,
                 )
             elif github_ref is not None or repo_followup:
                 # Phase 3: a GitHub repo URL → clone/index/overview; or a
