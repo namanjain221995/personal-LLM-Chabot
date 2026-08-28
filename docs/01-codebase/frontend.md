@@ -2236,8 +2236,13 @@ JPEG/WebP re-encode as JPEG at 0.92) and `downscaleImageFile(file)`
 (`createImageBitmap` + canvas; resolves `null` when the image already fits,
 the browser lacks the APIs, or anything throws — the caller then sends the
 original bytes). `Composer.handleFile` calls it for images before the base64
-step; PDFs are untouched. `MAX_IMAGE_EDGE = 1600`: the main model's image
-tokens scale with pixel count (~1,000 for 1280×800, ~4,000 for 2560×1440)
-while measured answer accuracy plateaus at ~1280 px on the long edge, so the
-cap cuts prompt tokens and upload size up to 4× with no accuracy loss. The
+step; PDFs are untouched. Attachments are counted as pending while they are
+read/downscaled, and `submit()` plus the Send button wait for that count to
+reach zero — decoding a 4K screenshot takes tens of milliseconds, long enough
+for Ctrl+V-then-Enter to post the message without the image otherwise.
+`MAX_IMAGE_EDGE = 1600`: image tokens scale with pixel count, measured on the
+served model's `/tokenize` — 1,013 at 1280×800, 1,413 at 1600×900, 3,613 at
+2560×1440, 8,173 at 3840×2160 — so the cap cuts a 1440p screenshot 2.6× and a
+4K one 5.8×. WebP stays on the PNG path: it is often lossless and carries
+alpha, which `toDataURL('image/jpeg')` would composite onto black. The
 10 MB / 5-image caps are unchanged and still apply to the file, not the pixels.

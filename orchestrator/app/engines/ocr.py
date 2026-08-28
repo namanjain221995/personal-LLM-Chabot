@@ -25,14 +25,24 @@ log = logging.getLogger(__name__)
 # structured text (tables included); no detection boxes are requested.
 _PROMPT = "document parsing"
 
-# Defaults when the capability block is missing: at most this many
-# pages/images transcribed concurrently (the OCR service has a small memory
-# slice and one uploaded PDF can be 8 pages), and the output ceiling that
-# fits the server's 8192 window next to ~1.5-2K image tokens. Since
-# 2026-08-29 both follow OCR_CONCURRENCY / OCR_OUTPUT_LIMIT when set — the
-# values were hard-coded before and silently ignored the configuration.
+# At most this many pages/images transcribed concurrently — the OCR service
+# has a small memory slice and one uploaded PDF can be 8 pages. Follows
+# OCR_CONCURRENCY when the profile declares one (2026-08-29; it was hard-coded
+# and silently ignored the configuration).
 _CONCURRENCY = 3
+
+# The output ceiling is derived from the OCR model's WINDOW, not from
+# OCR_OUTPUT_LIMIT. That variable looks like an OCR tuning but is not one: the
+# launcher emits `<ROLE>_OUTPUT_LIMIT = min(8192, max(256, context // 4))` for
+# every role generically, so on this deployment it is 8192 // 4 = 2048 —
+# a third of what the window actually affords, which would truncate dense
+# scans and tables mid-table with no signal. Measured prompt sizes on the
+# served model are 487-1807 tokens per page, so reserving 2200 leaves ~6000
+# in an 8192 window; that reserve is what the old hard-coded 6000 encoded.
+_CONTEXT_TOKENS = 8192
+_PROMPT_RESERVE_TOKENS = 2200
 _MAX_OUTPUT_TOKENS = 6000
+_MIN_OUTPUT_TOKENS = 512
 
 _TIMEOUT_S = 120.0
 
@@ -46,8 +56,14 @@ def _capability(name: str, default: int) -> int:
 
 
 def output_limit() -> int:
-    """Tokens the OCR model may emit per image (never above the window fit)."""
-    return min(_MAX_OUTPUT_TOKENS, _capability("output_limit", _MAX_OUTPUT_TOKENS))
+    """Tokens the OCR model may emit per image, from its declared window.
+
+    Shrinks with a smaller OCR_CONTEXT_LENGTH (the reserve still fits) and
+    never exceeds the measured 6000.
+    """
+    window = _capability("context_length", _CONTEXT_TOKENS)
+    room = window - _PROMPT_RESERVE_TOKENS
+    return max(_MIN_OUTPUT_TOKENS, min(_MAX_OUTPUT_TOKENS, room))
 
 
 def concurrency() -> int:
@@ -100,14 +116,19 @@ async def _ocr_one(client, image_base64: str) -> str:
                 ],
             }
         ],
-        # The OCR server runs a tight 8192 window (memory budget); image
-        # tokens + prompt take ~1.5-2K, so 6000 is the hard ceiling and
-        # OCR_OUTPUT_LIMIT (2048 in production) the configured one.
+        # Derived from the OCR window; see output_limit().
         max_tokens=output_limit(),
         temperature=0.0,
         timeout=_TIMEOUT_S,
     )
-    return clean_transcript(resp.choices[0].message.content or "")
+    choice = resp.choices[0]
+    text = clean_transcript(choice.message.content or "")
+    if getattr(choice, "finish_reason", None) == "length" and text:
+        # A page denser than the output ceiling comes back cut off mid-content.
+        # Saying so is the difference between the main model treating the tail
+        # as absent and treating it as "not transcribed here" (2026-08-29).
+        text += "\n[transcript truncated at the OCR output limit]"
+    return text
 
 
 async def ocr_images(images: Sequence[str]) -> List[str]:

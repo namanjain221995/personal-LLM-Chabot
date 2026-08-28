@@ -118,3 +118,70 @@ def test_documents_table_upserts_by_filename():
     assert len(docs) == 1
     assert docs[0]["text"] == "second version"
     assert docs[0]["total_pages"] == 3
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-29: the document route honours the composer's Fast/Think/Max
+#
+# `meta_extras` reports `request.effort` for route="vision", and run_pdf_engine
+# emits that route — so while this engine hard-coded effort="medium" (an alias
+# for "think"), a PDF sent with Fast was reported as "fast" and answered with a
+# full reasoning pass. The engine now runs at the level it is given.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def effort_recorder(monkeypatch):
+    from app import llm
+
+    seen: dict = {}
+
+    async def fake_stream(msgs, *, model_choice="smart", effort="think", **kw):
+        seen["effort"] = effort
+        seen["model_choice"] = model_choice
+        seen["thinking_on"] = llm.wants_thinking(model_choice, effort)
+        yield "token", "ok"
+
+    monkeypatch.setattr(llm, "stream_chat_events", fake_stream)
+    return seen
+
+
+@pytest.mark.parametrize(
+    "given, expected, thinking",
+    [("fast", "fast", False), ("think", "think", True), ("max", "max", True),
+     ("low", "fast", False), ("extra_high", "max", True)],
+)
+def test_document_engine_runs_at_the_effort_it_is_given(
+    effort_recorder, given, expected, thinking
+):
+    b64 = base64.b64encode(b"notes: 128 GB unified memory box").decode()
+    rec = Rec()
+    asyncio.run(
+        run_pdf_engine("what memory?", b64, "notes.txt", [], rec.emit, effort=given)
+    )
+    assert effort_recorder["effort"] == expected
+    assert effort_recorder["thinking_on"] is thinking
+
+
+def test_document_engine_default_is_think(effort_recorder):
+    """Callers that pass no effort keep the historical behaviour."""
+    b64 = base64.b64encode(b"notes: 128 GB unified memory box").decode()
+    rec = Rec()
+    asyncio.run(run_pdf_engine("what memory?", b64, "notes.txt", [], rec.emit))
+    assert effort_recorder["effort"] == "think"
+    assert effort_recorder["thinking_on"] is True
+
+
+def test_meta_effort_matches_the_level_the_document_engine_ran_at(effort_recorder):
+    """The regression the 2026-08-29 review caught: meta reported the picker
+    while the engine ignored it. Both sides must now agree."""
+    from app import llm
+
+    b64 = base64.b64encode(b"notes: 128 GB unified memory box").decode()
+    rec = Rec()
+    asyncio.run(
+        run_pdf_engine("what memory?", b64, "notes.txt", [], rec.emit, effort="fast")
+    )
+    meta = [d for e, d in rec.events if e == "meta"][-1]
+    assert meta["route"] == "vision"
+    assert effort_recorder["effort"] == llm.normalize_effort("fast")

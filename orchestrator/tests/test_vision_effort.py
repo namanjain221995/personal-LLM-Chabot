@@ -396,20 +396,65 @@ def test_ocr_runs_only_off_the_fast_path(monkeypatch, effort, expect_ocr):
     assert any("OCR transcript" in p.get("text", "") for p in parts if p["type"] == "text") is expect_ocr
 
 
-def test_ocr_limits_follow_the_configured_capabilities(monkeypatch):
+def test_ocr_output_ceiling_comes_from_the_window_not_the_role_heuristic(monkeypatch):
+    """OCR_OUTPUT_LIMIT is not an OCR tuning — the launcher derives every
+    role's limit as `context // 4`, which is 2048 here and would truncate
+    dense scans mid-table. The ceiling follows the OCR model's WINDOW."""
     import dataclasses
 
     from app.engines import ocr as ocr_module
 
     caps = settings.ocr_capabilities
-    monkeypatch.setattr(settings, "ocr_capabilities", dataclasses.replace(caps, output_limit=2048, concurrency=4))
-    assert ocr_module.output_limit() == 2048
+    # production shape: 8192 window, the generic 2048 output heuristic
+    monkeypatch.setattr(
+        settings,
+        "ocr_capabilities",
+        dataclasses.replace(caps, context_length=8192, output_limit=2048, concurrency=4),
+    )
+    assert ocr_module.output_limit() == 5992  # 8192 window - 2200 reserve
     assert ocr_module.concurrency() == 4
-    # the window-fit ceiling still wins over an over-generous limit
-    monkeypatch.setattr(settings, "ocr_capabilities", dataclasses.replace(caps, output_limit=9000, concurrency=2))
-    assert ocr_module.output_limit() == 6000
+    # a genuinely smaller window shrinks the ceiling with it
+    monkeypatch.setattr(
+        settings, "ocr_capabilities", dataclasses.replace(caps, context_length=4096, concurrency=2)
+    )
+    assert ocr_module.output_limit() == 1896
     assert ocr_module.concurrency() == 2
+    # a window so small the reserve swallows it still leaves a usable floor
+    monkeypatch.setattr(
+        settings, "ocr_capabilities", dataclasses.replace(caps, context_length=2048)
+    )
+    assert ocr_module.output_limit() == 512
     # no capability block at all (the dataclass forbids 0, so a bare object)
-    monkeypatch.setattr(settings, "ocr_capabilities", SimpleNamespace(output_limit=0, concurrency=0))
-    assert ocr_module.output_limit() == 6000
+    monkeypatch.setattr(settings, "ocr_capabilities", SimpleNamespace(context_length=0, concurrency=0))
+    assert ocr_module.output_limit() == 5992  # falls back to the 8192 default window
     assert ocr_module.concurrency() == 3
+
+
+def test_truncated_ocr_transcripts_say_so(monkeypatch):
+    """A page denser than the ceiling comes back cut off; the main model must
+    be told, or it treats the missing tail as absent from the page."""
+    from app.engines import ocr as ocr_module
+
+    class _Msg:
+        content = "Vendor: TechSara\nLine 1\nLine 2"
+
+    class _Choice:
+        message = _Msg()
+        finish_reason = "length"
+
+    class _Resp:
+        choices = [_Choice()]
+
+    class _Client:
+        class chat:
+            class completions:
+                @staticmethod
+                async def create(**kwargs):
+                    return _Resp()
+
+    out = asyncio.run(ocr_module._ocr_one(_Client(), IMG))
+    assert out.endswith("[transcript truncated at the OCR output limit]")
+
+    _Choice.finish_reason = "stop"
+    out = asyncio.run(ocr_module._ocr_one(_Client(), IMG))
+    assert "truncated" not in out

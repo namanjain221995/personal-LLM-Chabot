@@ -2,11 +2,11 @@
  * Client-side image downscaling before an upload becomes base64 (2026-08-29).
  *
  * Why: the composer used to send screenshots at full resolution. The main
- * model's image tokens grow with pixel count — a 1280x800 screenshot is
- * ~1,000 tokens, a 2560x1440 one ~4,000 — while measured answer accuracy
- * plateaus at ~1280 px on the long edge. Capping the long edge at
- * MAX_IMAGE_EDGE keeps the text crisp (PNG stays PNG), cuts prompt tokens and
- * upload size up to 4x, and shortens the time to the first token.
+ * model's image tokens grow with pixel count — measured on the served model's
+ * /tokenize endpoint: 1,013 tokens at 1280x800, 1,413 at 1600x900, 3,613 at
+ * 2560x1440, 8,173 at 3840x2160. Capping the long edge at MAX_IMAGE_EDGE
+ * keeps text crisp (PNG stays PNG) and cuts a 1440p screenshot 2.6x and a 4K
+ * one 5.8x, which shortens the time to the first token.
  *
  * The pure helpers are unit-tested; `downscaleImageFile` needs a browser
  * (createImageBitmap + canvas) and falls back to `null`, meaning "send the
@@ -41,13 +41,18 @@ export function fitWithin(
   };
 }
 
-/** PNG for anything with sharp edges (screenshots, diagrams, transparency);
- *  JPEG only when the source already was a lossy photo format. */
+/**
+ * PNG for anything with sharp edges or transparency (screenshots, diagrams,
+ * UI assets); JPEG only when the source already was a lossy photo.
+ *
+ * WebP deliberately stays on the PNG path even though it is often lossy: it
+ * is also routinely lossless and carries an alpha channel, and
+ * `canvas.toDataURL('image/jpeg')` composites transparency onto black, which
+ * would turn a transparent diagram into black-on-black.
+ */
 export function outputMime(sourceMime: string): 'image/png' | 'image/jpeg' {
   const m = (sourceMime || '').toLowerCase();
-  return m === 'image/jpeg' || m === 'image/jpg' || m === 'image/webp'
-    ? 'image/jpeg'
-    : 'image/png';
+  return m === 'image/jpeg' || m === 'image/jpg' ? 'image/jpeg' : 'image/png';
 }
 
 export interface DownscaledImage {

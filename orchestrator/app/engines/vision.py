@@ -1,12 +1,20 @@
 """Vision engine (spec §8, vLLM design).
 
-Qwen3-VL-4B-Instruct on the vLLM vision endpoint (OpenAI-compatible) with the
-image sent as multimodal content: [{"type": "text", ...}, {"type":
-"image_url", "image_url": {"url": "data:image/png;base64,<b64>"}}]. For
-invoices/contracts the model is instructed to lead with a fenced JSON block
-of structured fields followed by prose; the structured fields reach the user
-inside the streamed answer text. The final meta is the §10 contract shape:
-{"route": "vision"}.
+The MAIN model answers about images on this deployment — it is multimodal and
+`VISION_BASE_URL == OPENAI_BASE_URL` (the separate Qwen3-VL router model is
+deliberately not used here: measured 2026-08-28 it was slower to the first
+token and refused the extraction outright). Images travel as OpenAI
+multimodal content: [{"type": "text", ...}, {"type": "image_url",
+"image_url": {"url": "data:image/png;base64,<b64>"}}].
+
+Since 2026-08-29 the engine answers the user's question directly, in prose or
+Markdown, and emits a fenced JSON block of structured fields ONLY when the
+message asks for extraction (see `_SYSTEM` and `extraction_hint`) and the
+image is an invoice or a contract. Before that the prompt told the model to
+lead with that JSON for every document-ish image, which it also did for
+screenshots. The conversation so far is passed through `history_turns`, and
+the OCR pre-pass runs at Think/Max only. The final meta is the §10 contract
+shape: {"route": "vision"}.
 """
 from __future__ import annotations
 

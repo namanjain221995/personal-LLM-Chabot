@@ -26,7 +26,7 @@ flowchart LR
             UP["/uploads router (uploads.py)"]
         end
         subgraph MODELS["inference network (internal-only)"]
-            VMAIN["vllm :30000<br/>Qwen/Qwen3.6-35B-A3B-NVFP4<br/>800k ctx (YaRN), thinking + tools"]
+            VMAIN["vllm :30000<br/>Qwen/Qwen3.6-35B-A3B-NVFP4<br/>850k ctx (YaRN 3.25), thinking + tools"]
             VROUTER["vllm-router :30002<br/>Qwen3-VL-8B-Instruct-FP8"]
             VEMBED["vllm-embed :30003<br/>Qwen3-Embedding-0.6B"]
             VOCR["vllm-ocr :30004<br/>baidu/Unlimited-OCR"]
@@ -125,7 +125,7 @@ Main service (compose/compose.dgx-spark.yaml:33-76), served model
 | `--reasoning-parser qwen3` | **already set** (`compose.dgx-spark.yaml`) | ✅ keep |
 | `--enable-auto-tool-choice` | **already set** (`compose.dgx-spark.yaml`) | ✅ keep |
 | `--enable-prefix-caching` | **already set** (`compose.dgx-spark.yaml`) | ✅ keep |
-| `--max-model-len 262144` | compose default 262,144; production serves **800,000** via `MAIN_MODEL_MAX_LEN` (YaRN ×3.06, needle-verified) | ✅ keep |
+| `--max-model-len 262144` | compose default 262,144; production serves **850,000** via `MAIN_MODEL_MAX_LEN` (YaRN ×3.25; the measured ceiling — 959,894 tokens OOM'd the engine, 825,710 completed) | ✅ keep |
 | `--tool-call-parser qwen3_coder` | `qwen3_xml` (`compose.dgx-spark.yaml`) | ❌ **do not change** — qwen3_xml matches Qwen3.6's XML tool template; qwen3_coder would regress tool calling |
 | `--gpu-memory-utilization 0.85` | `0.35` (`compose.dgx-spark.yaml`) | ❌ **do not change** — four vLLM services share one unified-memory pool (main .35 + router .17 + embed .04 + OCR .14); 0.85 assumes single-model. Dual mode uses `0.30` per node (`CLUSTER_GPU_MEMORY_UTILIZATION`) because half the weights leave each node and the other services' shares are unchanged — [`CLUSTER.md`](CLUSTER.md#memory) |
 | model `Qwen3.6-35B-A3B-FP8` | NVFP4/ModelOpt quant | ❌ **do not change** — FP8 exists in the manifest (nvidia-large profile) but is ~16 GB heavier and tested only to 32k context; NVFP4 is tested at the full 262,144 |

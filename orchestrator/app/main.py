@@ -999,6 +999,11 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     history,
                     emit,
                     conversation_id=conv_key,
+                    # Same contract as the image route: the document engine
+                    # runs at the level the composer picked, so the effort
+                    # meta_extras reports for route="vision" is the truth for
+                    # documents too (2026-08-29).
+                    effort=request.effort,
                 )
             elif request.image_data:
                 # An attached image ALWAYS goes to the vision engine — text-only
