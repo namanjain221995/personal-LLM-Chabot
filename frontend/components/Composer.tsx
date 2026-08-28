@@ -23,6 +23,7 @@ import {
   type ClipboardEvent as ReactClipboardEvent,
 } from 'react';
 import type { ChatPrefs } from '@/lib/prefs';
+import { downscaleImageFile } from '@/lib/images';
 import {
   imageExtFromMime,
   makePastedText,
@@ -309,9 +310,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
         file.name && file.name.trim()
           ? file.name
           : `pasted-image-${Date.now()}.${imageExtFromMime(file.type)}`;
-      const reader = new FileReader();
-      reader.onload = () => {
-        const dataUrl = String(reader.result);
+      const attach = (dataUrl: string) => {
         const att: Attachment = {
           name,
           kind: isPdf ? 'pdf' : 'image',
@@ -328,7 +327,22 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
           return [...images, att];
         });
       };
-      reader.readAsDataURL(file);
+      const readOriginal = () => {
+        const reader = new FileReader();
+        reader.onload = () => attach(String(reader.result));
+        reader.readAsDataURL(file);
+      };
+      if (isPdf) {
+        readOriginal();
+        return;
+      }
+      // 2026-08-29: images larger than MAX_IMAGE_EDGE on the long edge are
+      // downscaled in the browser before they become base64 — fewer prompt
+      // tokens, smaller upload, faster first token; `null` = send as is.
+      void downscaleImageFile(file).then((scaled) => {
+        if (scaled) attach(scaled.dataUrl);
+        else readOriginal();
+      });
     }
 
     // Paste into the composer: an image blob becomes the attachment; a long

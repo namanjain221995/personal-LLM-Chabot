@@ -63,7 +63,7 @@ plain language. The platform:
 | "What does the onboarding SOP say about the welcome call?" | Retrieves **long-text fields and knowledge packs** (LanceDB + the Brain), reranks, answers with record citations | `engines/rag.py`, `core/brain.py` |
 | "Show me Jayesh's latest status" (ambiguous) | **Salesforce Intelligence Mode** resolves the request, asks *one* targeted clarifying question if needed, compiles a validated query plan (never free-form SOQL), runs it, resumes the original request after the answer | `engines/sf_intel.py`, `core/sf_intel/` |
 | Toggle **Live Salesforce** | Queries the org directly (read-only integration user); live values win when merged with warehouse rows | `engines/live_sf.py` |
-| Attach a PDF/DOCX, images, a CSV/XLSX/ZIP dataset | Reads **every page** (OCR sidecar for scanned pages), answers about uploaded data from a safe profile or the full table when small, generates real PDF/DOCX reports | `engines/document.py`, `dataset.py`, `dataset_report.py` |
+| Attach a PDF/DOCX, images, a CSV/XLSX/ZIP dataset | Images are downscaled in the browser to 1600 px on the long edge before upload (2026-08-29); reads **every page** of documents (OCR sidecar for scanned pages), answers about uploaded data from a safe profile or the full table when small, generates real PDF/DOCX reports | `engines/document.py`, `dataset.py`, `dataset_report.py` |
 | Paste a URL or a GitHub repo link | Fetches the pages (SSRF-safe) or shallow-clones the repo (code never executed) and answers with sources / `path:Lstart-Lend` citations | `engines/url.py`, `repo.py` |
 | Turn on **Web search** (assistant mode) | Multi-query search through SearXNG/Tavily/Brave, reads the sources, cites them; at *Max* effort runs deep research | `engines/search.py` |
 | "Write a report on Q3 placements" | Plans sections, fills them with SQL/RAG, renders charts, emits `.docx` + `.pdf` | `engines/report.py` |
@@ -459,18 +459,18 @@ model's real geometry, computes the factor, and passes the override to both
 nodes:
 
 ```text
-MAIN_MODEL_MAX_LEN=800000     # -> "Context: 800,000 tokens (model is natively
-                              #     262,144; YaRN factor 3.06 enabled)"
+MAIN_MODEL_MAX_LEN=1000000    # -> "Context: 1,000,000 tokens (model is natively
+                              #     262,144; YaRN factor 3.82 enabled)"
 ```
 
 Measured on this deployment (27B rows 2026-08-25; 35B-A3B rows 2026-08-29):
 
 | | Native | Extended |
 |---|---|---|
-| Served window | 262,144 | **800,000** (max input 775,424) |
-| Rope | `default` | `yarn`, factor 3.06, `mrope_section` preserved |
+| Served window | 262,144 | **1,000,000** since 2026-08-29 (800,000 from 08-27 to 08-29) |
+| Rope | `default` | `yarn`, factor 3.82 at 1M (3.06 at 800K), `mrope_section` preserved |
 | KV pool / node (27B, 16 full-attention layers) | 933,232 tokens | 967,766 tokens (1.21× at full length) |
-| KV pool / node (35B-A3B, 10 full-attention layers, current) | – | **2,977,319 tokens** (3.72× at full length) |
+| KV pool / node (35B-A3B, 10 full-attention layers, current) | – | **2,973,029 tokens** (2.97× at 1M; 3.72× at 800K) |
 | Short-prompt A/B (10 deterministic prompts) | baseline | 5/10 byte-identical, none worse, `4871*39` newly **correct** |
 | Needle recall at 20K / 100K | found | found, same latency |
 
@@ -488,8 +488,9 @@ Three honest costs before you raise it:
    and still the right value should the 27B come back. A conversation that
    *grows* to 800K is unaffected either way: prefix caching means each turn
    only prefills the new tokens.
-2. **Concurrency at full length drops** — to 3.72× with the current 35B-A3B
-   (three 800K requests at a time); it was 1.21× — one at a time — with the 27B.
+2. **Concurrency at full length drops** — to 2.97× at 1M with the current
+   35B-A3B (two full-length requests at a time; 3.72× at 800K); it was 1.21×
+   — one at a time — with the 27B at 800K.
    Ordinary chats are unaffected, because vLLM allocates KV blocks on demand
    (a 657-token chat uses 657 tokens, not 800,000).
 3. **YaRN is static**, so the scaling applies at every length. The A/B above

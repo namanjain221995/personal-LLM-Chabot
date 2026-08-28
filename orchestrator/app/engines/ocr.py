@@ -25,11 +25,33 @@ log = logging.getLogger(__name__)
 # structured text (tables included); no detection boxes are requested.
 _PROMPT = "document parsing"
 
-# At most this many pages/images transcribed concurrently — the OCR service
-# has a small memory slice and one uploaded PDF can be 8 pages.
+# Defaults when the capability block is missing: at most this many
+# pages/images transcribed concurrently (the OCR service has a small memory
+# slice and one uploaded PDF can be 8 pages), and the output ceiling that
+# fits the server's 8192 window next to ~1.5-2K image tokens. Since
+# 2026-08-29 both follow OCR_CONCURRENCY / OCR_OUTPUT_LIMIT when set — the
+# values were hard-coded before and silently ignored the configuration.
 _CONCURRENCY = 3
+_MAX_OUTPUT_TOKENS = 6000
 
 _TIMEOUT_S = 120.0
+
+
+def _capability(name: str, default: int) -> int:
+    caps = getattr(settings, "ocr_capabilities", None) or getattr(
+        getattr(settings, "model_capabilities", None), "ocr", None
+    )
+    value = int(getattr(caps, name, 0) or 0)
+    return value if value > 0 else default
+
+
+def output_limit() -> int:
+    """Tokens the OCR model may emit per image (never above the window fit)."""
+    return min(_MAX_OUTPUT_TOKENS, _capability("output_limit", _MAX_OUTPUT_TOKENS))
+
+
+def concurrency() -> int:
+    return max(1, _capability("concurrency", _CONCURRENCY))
 
 # Detection blocks are pure layout metadata — "<|det|>type [bbox]<|/det|>"
 # per the model card — so the WHOLE block goes, not just its markers.
@@ -79,8 +101,9 @@ async def _ocr_one(client, image_base64: str) -> str:
             }
         ],
         # The OCR server runs a tight 8192 window (memory budget); image
-        # tokens + prompt take ~1.5-2K, so 6000 is the safe output ceiling.
-        max_tokens=6000,
+        # tokens + prompt take ~1.5-2K, so 6000 is the hard ceiling and
+        # OCR_OUTPUT_LIMIT (2048 in production) the configured one.
+        max_tokens=output_limit(),
         temperature=0.0,
         timeout=_TIMEOUT_S,
     )
@@ -100,7 +123,7 @@ async def ocr_images(images: Sequence[str]) -> List[str]:
     from .. import llm
 
     client = llm._client(settings.ocr_base_url)
-    sem = asyncio.Semaphore(_CONCURRENCY)
+    sem = asyncio.Semaphore(concurrency())
 
     async def guarded(idx: int, img: str) -> str:
         async with sem:

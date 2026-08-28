@@ -16,6 +16,7 @@ from typing import Awaitable, Callable, List, Optional, Sequence
 
 from .. import llm
 from ..config import settings
+from . import recent_turns
 
 Emit = Callable[[str, dict], Awaitable[None]]
 
@@ -33,17 +34,62 @@ _JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.S)
 _DATA_URL_RE = re.compile(r"^data:image/[\w.+-]+;base64,", re.I)
 
 _SYSTEM = (
-    "You are a visual analyst for business documents and images.\n"
-    "If the image is an INVOICE: first output a fenced ```json block with "
-    "keys vendor, invoice_number, invoice_date, due_date, currency, subtotal, "
-    "tax, total, line_items (array of {description, quantity, unit_price, "
-    "amount}); then a short prose summary.\n"
-    "If the image is a CONTRACT: first output a fenced ```json block with "
-    "keys parties (array), effective_date, end_date, term, contract_value, "
-    "governing_law, key_obligations (array); then a short prose summary.\n"
-    "For any other image, just answer the user's question in prose.\n"
-    "Use null for fields that are not visible. Never invent values."
+    "You are TechSara's visual assistant. The user attached one or more "
+    "images; answer their question about them directly, the way an expert "
+    "colleague looking at the same screen would.\n"
+    "- Lead with the answer, in clear Markdown: short headings, numbered "
+    "steps for procedures, tables for tabular data. Do not restate the "
+    "question and do not describe the image unless that is what was asked.\n"
+    "- Ground every claim in what is visible: quote text, labels, numbers and "
+    "UI elements exactly as they appear. Say plainly when something is cut "
+    "off, blurry or not visible. Never invent values.\n"
+    "- Use the conversation so far and any notes about the user to tailor the "
+    "answer: names, repositories, tools, paths and files already mentioned "
+    "are context — reuse them verbatim instead of placeholders.\n"
+    "- Be practical: when asked how to do something shown on screen, give the "
+    "exact clicks or commands for what is on screen.\n"
+    "- Structured extraction ONLY on request. If the user asks to extract "
+    "data or fields, or asks for JSON, and the image is an invoice or a "
+    "contract, start with one fenced ```json block — invoice keys: vendor, "
+    "invoice_number, invoice_date, due_date, currency, subtotal, tax, total, "
+    "line_items (array of {description, quantity, unit_price, amount}); "
+    "contract keys: parties (array), effective_date, end_date, term, "
+    "contract_value, governing_law, key_obligations (array); null for "
+    "anything not visible — then a short summary. In every other case do "
+    "not output JSON."
 )
+
+# Words that mean "give me the data", not "answer my question". Deterministic
+# so the JSON-or-prose decision does not rest on the model's mood: the hint
+# below is appended to the user text only when one of these is present.
+_EXTRACT_RE = re.compile(
+    r"\b(extract|json|fields?|line items?|all (the )?data|structured|"
+    r"parse|key[- ]?value|table of|invoice (data|details|fields)|"
+    r"contract (data|details|terms))\b",
+    re.I,
+)
+_EXTRACT_HINT = (
+    "\n\n(If this is an invoice or a contract, lead with the fenced json "
+    "block described in your instructions; otherwise answer in Markdown.)"
+)
+
+
+def extraction_hint(message: str) -> str:
+    """The extraction hint when the message asks for data, else ''."""
+    return _EXTRACT_HINT if _EXTRACT_RE.search(message or "") else ""
+
+
+def history_turns(history: Sequence[dict], n: int = 6) -> List[dict]:
+    """Text turns (and pinned system blocks) the vision call should carry.
+
+    Until 2026-08-29 the engine sent ``[system, user]`` only, so a follow-up
+    about an image — or a question whose answer depends on what the user
+    said two turns ago — lost the whole conversation. Multimodal entries
+    (list content) are dropped: re-sending earlier images would multiply the
+    prompt for no gain, and main.py stores answers as plain text anyway.
+    """
+    turns = recent_turns(history, n)
+    return [m for m in turns if isinstance(m.get("content"), str) and m.get("role")]
 
 
 def to_data_url(image_base64: str) -> str:
@@ -140,15 +186,22 @@ async def run_vision_engine(
     if not imgs:
         raise ValueError("the vision engine requires an attached image")
 
-    user_content = build_user_content(message, imgs)
+    level = llm.normalize_effort(effort)
+    user_content = build_user_content(message + extraction_hint(message), imgs)
 
     # Unlimited-OCR pass (2026-08-06): screenshots, invoices and photographed
     # documents get a dedicated OCR transcript alongside the pixels — the OCR
     # model reads dense text/tables the general VLM misses. Photos with no
     # text produce an empty transcript and add nothing.
+    #
+    # 2026-08-29: Fast skips it. The pass runs BEFORE the main model can
+    # start and measured ~3.3 s of the 4.0 s to the first visible token on a
+    # 1280x800 screenshot (0.66 s straight to vLLM); the main model reads
+    # screenshots at that resolution itself. Think/Max keep the transcript —
+    # that is where dense scans and small print earn it.
     from .ocr import ocr_images, transcript_block
 
-    if settings.ocr_enabled:
+    if settings.ocr_enabled and level != "fast":
         transcripts = await ocr_images(imgs)
         block = transcript_block(transcripts, "image")
         if block:
@@ -163,6 +216,7 @@ async def run_vision_engine(
 
     messages: List[dict] = [
         {"role": "system", "content": _SYSTEM},
+        *history_turns(history),
         {"role": "user", "content": user_content},
     ]
 
@@ -182,7 +236,6 @@ async def run_vision_engine(
     # this deployment (VISION_BASE_URL == OPENAI_BASE_URL). The dedicated 8B
     # VL model is NOT a fallback — measured 2026-08-28 it was slower to first
     # token AND refused the extraction outright.
-    level = llm.normalize_effort(effort)
     async for kind, delta in llm.stream_chat_events(
         messages,
         model_choice="smart",

@@ -307,3 +307,109 @@ def test_image_request_without_an_effort_still_thinks(monkeypatch):
 
     assert rec["effort"] == "think"
     assert dict(_parse_sse(resp.text))["meta"]["effort"] == "think"
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-29: direct answers, conversation history, OCR only off the Fast path
+# ---------------------------------------------------------------------------
+
+from app.engines import vision  # noqa: E402 — the block above imports names
+
+
+def test_default_prompt_asks_for_a_direct_answer_not_json():
+    """The old prompt opened with invoice/contract JSON instructions and the
+    35B applied them to a GitHub screenshot (answer began with a contract
+    block). JSON is now an on-request behaviour."""
+    assert vision._SYSTEM.startswith("You are TechSara's visual assistant")
+    assert "ONLY on request" in vision._SYSTEM
+    assert "do not output JSON" in vision._SYSTEM
+
+
+@pytest.mark.parametrize(
+    "message, wants",
+    [
+        ("How i can create new branch here in this github repo ??", False),
+        ("what does this screenshot show", False),
+        ("give me all data from these images", True),
+        ("extract the line items as json", True),
+        ("Extract the fields from this invoice", True),
+    ],
+)
+def test_extraction_hint_is_deterministic(message, wants):
+    hint = vision.extraction_hint(message)
+    assert bool(hint) is wants
+
+
+def test_history_turns_keep_text_and_pinned_blocks_drop_multimodal():
+    history = [
+        {"role": "system", "content": "Notes about the user: repo is personal-LLM-Chabot"},
+        {"role": "user", "content": [{"type": "text", "text": "old image turn"}]},
+        {"role": "user", "content": "my repo is personal-LLM-Chabot"},
+        {"role": "assistant", "content": "Noted."},
+    ]
+    turns = vision.history_turns(history)
+    assert [m["role"] for m in turns] == ["system", "user", "assistant"]
+    assert all(isinstance(m["content"], str) for m in turns)
+
+
+def test_engine_sends_the_conversation_before_the_image_turn(monkeypatch):
+    rec: dict = {}
+    monkeypatch.setattr(llm, "stream_chat_events", _fake_stream(rec))
+    history = [
+        {"role": "user", "content": "my repo is personal-LLM-Chabot"},
+        {"role": "assistant", "content": "Noted."},
+    ]
+    asyncio.run(vision.run_vision_engine("how do I branch?", IMG, history, _collect, effort="fast"))
+    roles = [m["role"] for m in rec["messages"]]
+    assert roles == ["system", "user", "assistant", "user"]
+    assert rec["messages"][1]["content"] == "my repo is personal-LLM-Chabot"
+    # the image turn is last and still multimodal
+    assert isinstance(rec["messages"][-1]["content"], list)
+
+
+def test_extraction_hint_reaches_the_user_text_only_when_asked(monkeypatch):
+    rec: dict = {}
+    monkeypatch.setattr(llm, "stream_chat_events", _fake_stream(rec))
+    asyncio.run(vision.run_vision_engine("give me all data from this", IMG, [], _collect, effort="fast"))
+    assert "lead with the fenced json" in rec["messages"][-1]["content"][0]["text"]
+    asyncio.run(vision.run_vision_engine("how do I branch?", IMG, [], _collect, effort="fast"))
+    assert "json" not in rec["messages"][-1]["content"][0]["text"].lower()
+
+
+@pytest.mark.parametrize("effort, expect_ocr", [("fast", False), ("think", True), ("max", True)])
+def test_ocr_runs_only_off_the_fast_path(monkeypatch, effort, expect_ocr):
+    from app.engines import ocr as ocr_module
+
+    calls: list = []
+
+    async def fake_ocr(images):
+        calls.append(list(images))
+        return ["Vendor: TechSara" for _ in images]
+
+    monkeypatch.setattr(settings, "ocr_enabled", True)
+    monkeypatch.setattr(ocr_module, "ocr_images", fake_ocr)
+    rec: dict = {}
+    monkeypatch.setattr(llm, "stream_chat_events", _fake_stream(rec))
+    asyncio.run(vision.run_vision_engine("what is this", IMG, [], _collect, effort=effort))
+    assert bool(calls) is expect_ocr
+    parts = rec["messages"][-1]["content"]
+    assert any("OCR transcript" in p.get("text", "") for p in parts if p["type"] == "text") is expect_ocr
+
+
+def test_ocr_limits_follow_the_configured_capabilities(monkeypatch):
+    import dataclasses
+
+    from app.engines import ocr as ocr_module
+
+    caps = settings.ocr_capabilities
+    monkeypatch.setattr(settings, "ocr_capabilities", dataclasses.replace(caps, output_limit=2048, concurrency=4))
+    assert ocr_module.output_limit() == 2048
+    assert ocr_module.concurrency() == 4
+    # the window-fit ceiling still wins over an over-generous limit
+    monkeypatch.setattr(settings, "ocr_capabilities", dataclasses.replace(caps, output_limit=9000, concurrency=2))
+    assert ocr_module.output_limit() == 6000
+    assert ocr_module.concurrency() == 2
+    # no capability block at all (the dataclass forbids 0, so a bare object)
+    monkeypatch.setattr(settings, "ocr_capabilities", SimpleNamespace(output_limit=0, concurrency=0))
+    assert ocr_module.output_limit() == 6000
+    assert ocr_module.concurrency() == 3
