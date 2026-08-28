@@ -8,7 +8,7 @@ chosen for the machine it runs on — a Mac, a single NVIDIA GPU, a CPU-only
 box, or two NVIDIA DGX Sparks working as one model.
 
 Nothing leaves the machine: models run locally, Salesforce data is mirrored
-locally, and web search (optional) goes through a self-hosted SearXNG.
+locally, and web search (optional) goes through a self-hosted SearXNG
 
 ```bash
 cp .env.example .env      # add Salesforce credentials if you want the CRM synced
