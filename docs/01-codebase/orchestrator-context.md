@@ -124,7 +124,8 @@ deferred keeps `subscribers > 0` and suppresses the rescue persist; and `previou
 
 1. `text = request.text or "Analyze the attached image."` — [main.py:293](../../orchestrator/app/main.py#L293).
 2. Build the `meta_extras(route)` closure ([main.py:295-318](../../orchestrator/app/main.py#L295)): `vision` →
-   `settings.vision_model`, no `effort`; `agent` → smart id + request effort; `sql`/`rag`/`report` → smart id +
+   `settings.vision_model` + request effort (since 2026-08-28 — this route DOES have an effort knob, see below);
+   `agent` → smart id + request effort; `sql`/`rag`/`report` → smart id +
    hard-coded `effort="medium"` ([main.py:314](../../orchestrator/app/main.py#L314)); everything else →
    `llm.served_model_id(request.model)` + request effort.
 3. `signed_in = current_user(http_request)` — [main.py:327](../../orchestrator/app/main.py#L327). Always the
