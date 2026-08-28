@@ -171,14 +171,14 @@ async def run_vision_engine(
     # surface thinking in the panel and give room to finish the answer.
     #
     # Until 2026-08-28 this call hard-coded effort="medium" — an alias for
-    # "think" — so every image upload ran the 27B with thinking ON no matter
+    # "think" — so every image upload ran the main model (then the 27B) with thinking ON no matter
     # which of Fast/Think/Max the user picked in the composer. Measured on
     # three 1280x800 screenshots: thinking on -> 26-28s to the first visible
     # token and no answer inside the budget; thinking off -> 2.3-2.9s and a
     # complete answer. Passing the request's effort through is the entire
     # fix; `stream_chat_events` already maps it to `enable_thinking`.
     #
-    # model_choice stays "smart" on purpose: the 27B is the vision model on
+    # model_choice stays "smart" on purpose: the main model (Qwen3.6-35B-A3B since 2026-08-29; the 27B before) is the vision model on
     # this deployment (VISION_BASE_URL == OPENAI_BASE_URL). The dedicated 8B
     # VL model is NOT a fallback — measured 2026-08-28 it was slower to first
     # token AND refused the extraction outright.

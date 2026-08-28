@@ -73,7 +73,7 @@ jobs:
           # Variables). Set DEPLOY_FULL=true - 1, yes and on are accepted too -
           # to recreate EVERY container on every merge, including the five
           # model servers. Costs ~10-15 min per deploy
-          # because the 27B reloads; the model images are pinned upstream and
+          # because the main model reloads; the model images are pinned upstream and
           # contain none of this repo's code, so it only matters when you want a
           # guaranteed-clean slate rather than a correct one.
           DEPLOY_FULL: ${{ vars.DEPLOY_FULL }}

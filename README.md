@@ -463,7 +463,7 @@ MAIN_MODEL_MAX_LEN=800000     # -> "Context: 800,000 tokens (model is natively
                               #     262,144; YaRN factor 3.06 enabled)"
 ```
 
-Measured on this deployment (2026-08-25):
+Measured on this deployment (27B rows 2026-08-25; 35B-A3B rows 2026-08-29):
 
 | | Native | Extended |
 |---|---|---|
@@ -488,7 +488,8 @@ Three honest costs before you raise it:
    and still the right value should the 27B come back. A conversation that
    *grows* to 800K is unaffected either way: prefix caching means each turn
    only prefills the new tokens.
-2. **Concurrency at full length drops** to 1.21× — one 800K request at a time.
+2. **Concurrency at full length drops** — to 3.72× with the current 35B-A3B
+   (three 800K requests at a time); it was 1.21× — one at a time — with the 27B.
    Ordinary chats are unaffected, because vLLM allocates KV blocks on demand
    (a 657-token chat uses 657 tokens, not 800,000).
 3. **YaRN is static**, so the scaling applies at every length. The A/B above
@@ -862,7 +863,7 @@ Variables) control the parts you are most likely to want to change:
 
 | Variable | Unset (default) | Set | What it costs |
 |---|---|---|---|
-| `DEPLOY_FULL` (`true`, `1`, `yes` or `on`) | `techsara up` recreates only the services whose definition changed. An app-only merge leaves `vllm`, `router`, `ocr`, `reranker` and `embed` running — correct, because those images are pinned upstream and contain none of this repo's code. Merge #17 took **55 s**. | `true` → `techsara down` first, so **every** container is recreated, models included. | **~17 min** end to end; the 27B alone reloads in ~441 s. Volumes are preserved — you pay time, not data. |
+| `DEPLOY_FULL` (`true`, `1`, `yes` or `on`) | `techsara up` recreates only the services whose definition changed. An app-only merge leaves `vllm`, `router`, `ocr`, `reranker` and `embed` running — correct, because those images are pinned upstream and contain none of this repo's code. Merge #17 took **55 s**. | `true` → `techsara down` first, so **every** container is recreated, models included. | **~17 min** end to end; the main model alone reloads in ~5.5 min for the 35B-A3B (the 27B took ~441 s). Volumes are preserved — you pay time, not data. |
 | `DEPLOY_BRANCH` | The checkout is left on a **detached HEAD** at the deployed commit. | e.g. `dev` → the checkout is left **on that branch**, fast-forwarded to the deployed commit. | Nothing. Use it because this checkout is also a working directory, and walking into "detached HEAD" after every merge is confusing. |
 
 **`DEPLOY_BRANCH` fast-forwards; it never rewrites.** If the branch is behind

@@ -7,7 +7,7 @@
 #                     [--no-rollback]
 #
 #   --full          `techsara down` first, so EVERY container is recreated.
-#                   Costs 6-10 extra minutes because the 27B model reloads.
+#                   Costs 6-10 extra minutes because the main model reloads.
 #                   Without it the launcher recreates only what changed, which
 #                   for an app-only change leaves the model containers running.
 #   --branch NAME   leave the production checkout ON local branch NAME, fast-
@@ -266,7 +266,7 @@ apply() {  # apply <sha> - move the checkout and bring the stack up
   if [ "$FULL" = 1 ]; then
     # Every container goes, models included. `down` never passes -v, so the
     # database, warehouse, vector index and reports all survive; what is paid
-    # for is time, not data: the 27B reloads (~6-10 min) and the auxiliary
+    # for is time, not data: the main model reloads (~6-10 min) and the auxiliary
     # model servers restart behind it.
     say "  full restart: techsara down, then up (volumes preserved; expect ~10-15 min)"
     ( cd "$ROOT" && ./techsara down ) >>"$LOG" 2>&1 || return 1

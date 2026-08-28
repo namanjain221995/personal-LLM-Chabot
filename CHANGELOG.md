@@ -18,7 +18,7 @@ same `cluster-bench.sh` invocation as the 27B numbers in `docs/CLUSTER.md`:
 | TTFT, short prompt | 0.17–0.30 s | **0.07 s** |
 | Concurrency 4 / 16 output tok/s | 53 / 105 | **135 / 243** |
 | Per-node KV pool | 967,766 tokens | **2,977,319 tokens** |
-| Prefill 170K tokens | ≈3.5 min (from the 27B fit) | **42 s** |
+| Prefill 170K tokens | ≈3.0 min (180 s, from the 27B fit) | **42 s** |
 
 Thinking on/off, tool calls (`qwen3_xml`), vision (image input answered
 correctly, 267 prompt tokens for a 640×400 PNG), the 800K YaRN window
