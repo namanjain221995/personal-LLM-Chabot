@@ -1,5 +1,65 @@
 # Changelog
 
+## Main model switched to Qwen3.6-35B-A3B (MoE) on the DGX cluster (2026-08-29)
+
+The `dgx-spark` profile's main model is now `nvidia/Qwen3.6-35B-A3B-NVFP4`
+(served as `Qwen/Qwen3.6-35B-A3B-NVFP4`, pinned revision `491c2f1ea524`), a
+256-expert mixture-of-experts with ~3B parameters active per token, replacing
+the dense `RadixArk/Qwen3.8-27B-NVFP4`. The 27B stays in the manifest as
+`dgx-qwen38-27b-nvfp4` and its weights stay on disk; switching back is the
+profile's `main_model` key plus `./techsara redetect`.
+
+Measured on the two-node TP=2 cluster, same fabric, same 16 GiB KV budget,
+same `cluster-bench.sh` invocation as the 27B numbers in `docs/CLUSTER.md`:
+
+| | 27B dual | **35B-A3B dual** |
+|---|---|---|
+| Single-request decode | 24–27 tok/s | **76–81 tok/s** |
+| TTFT, short prompt | 0.17–0.30 s | **0.07 s** |
+| Concurrency 4 / 16 output tok/s | 53 / 105 | **135 / 243** |
+| Per-node KV pool | 967,766 tokens | **2,977,319 tokens** |
+| Prefill 170K tokens | ≈3.5 min (from the 27B fit) | **42 s** |
+
+Thinking on/off, tool calls (`qwen3_xml`), vision (image input answered
+correctly, 267 prompt tokens for a 640×400 PNG), the 800K YaRN window
+(`Maximum concurrency for 800,000 tokens per request: 3.72x`) and the MTP draft
+(`Qwen3_5MoeMTP`) all work unchanged; `cluster-status --probe` passes 12/12
+with both GPUs at 76–81 % during the probe.
+
+What changed, and why:
+
+- `config/hardware-profiles.yaml`: `dgx-spark.main_model` →
+  `dgx-qwen36-35b-nvfp4`.
+- `config/model-manifest.yaml`: the 35B entry no longer passes
+  `--moe-backend marlin`. That flag dates from an older nightly; the pinned
+  image (`vllm/vllm-openai@sha256:24f2f897…`, 0.26.1rc1.dev77) refuses it —
+  `moe_backend='marlin' is not supported for unquantized MoE` — and the first
+  start-up died on it. Without the flag vLLM selects the very same kernel on
+  its own (`Using 'MARLIN' NvFp4 MoE backend`).
+- `compose/compose.dgx-spark.yaml`: `--quantization modelopt
+  --attention-backend flashinfer` were literal in the overlay; they now come
+  from the manifest entry through `${MAIN_STARTUP_ARGUMENTS:-}`, as
+  `compose.nvidia.yaml` already did, so single-node mode follows the manifest
+  exactly like the cluster overlay does.
+- `launcher/tests/test_compose_overlays.py`: the four assertions that pin the
+  profile's model ids.
+- Docs (`README.md` §5/§7/§9.1, `docs/CLUSTER.md`, `.env.example`,
+  `docs/ARCHITECTURE_CURRENT.md`, `docs/01-codebase/infra-docker-compose.md`,
+  `docs/PORTABLE-RUNTIME.md`): model identity, the sharding geometry (40
+  layers = 30 gated-delta-net + 10 full attention, 2 KV heads → 5,120 B/token
+  at TP=2 against the 27B's 16,384), the KV arithmetic, and the benchmark
+  tables now show both models side by side. With this model the KV pool no
+  longer bounds the context window; the launcher's 4×-native YaRN ceiling
+  (1,048,576 tokens) does.
+
+Not changed: `GEN_WALL_CLOCK_S=4200` and `MAIN_MODEL_MAX_LEN=800000` in the
+production `.env` — the timeout is harmless with the faster prefill and stays
+correct should the 27B return. The weights were not downloaded: Node 2 already
+held the exact pinned revision from its earlier single-node deployment, so it
+was rsynced into the managed cache and registered through the launcher's own
+completion-marker code (`models` reports `complete`; `up` synced it back to
+Node 2's managed cache in ~45 s over RoCE).
+
 ## Image uploads honour the effort you picked (2026-08-28)
 
 Uploading images and choosing **Fast** was the slowest path in the app. The

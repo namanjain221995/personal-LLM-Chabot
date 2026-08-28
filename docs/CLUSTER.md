@@ -49,18 +49,27 @@ application keeps using the single endpoint it always used.
 * `--pipeline-parallel-size 2` was tried on 2026-08-25 and rejected by vLLM:
   `Pipeline parallelism is not supported for this model. Supported models
   implement the SupportsPP interface` — the multimodal
-  `Qwen3_5ForConditionalGeneration` class used by `RadixArk/Qwen3.8-27B-NVFP4`
-  does not implement it (only the text-only `Qwen3_5ForCausalLM` does). So
-  TP=2 is the only two-GPU layout this runtime can execute for this model.
+  `Qwen3_5ForConditionalGeneration` class used by the previous main model
+  (`RadixArk/Qwen3.8-27B-NVFP4`) does not implement it (only the text-only
+  `Qwen3_5ForCausalLM` does). The current main model's
+  `Qwen3_5MoeForConditionalGeneration` class is the MoE sibling of that class;
+  PP was not re-tried with it. TP=2 is the two-GPU layout this runtime executes.
 * TP=2 is also the layout that helps a chatbot most on this hardware: decode is
   memory-bandwidth-bound, and each node now streams half the weights per
   token. Measured single-stream decode went from **20 tok/s to 24–27 tok/s**
   (the first baseline in this work counted SSE chunks, which MTP packs two
   tokens into, and understated single-node decode by half; the number here
   counts tokens from `usage`).
-* The model shards cleanly: 24 attention heads / 4 KV heads / 48 GDN value
-  heads / 16 GDN key heads / intermediate 17408 / vocab 248320 are all even, and
-  the NVFP4 block size (16) divides every per-rank dimension.
+* The model shards cleanly. `nvidia/Qwen3.6-35B-A3B-NVFP4` (switched to on
+  2026-08-29): 40 layers (30 gated-delta-net + 10 full attention), 16 attention
+  heads / 2 KV heads (head_dim 256) / 32 GDN value heads / 16 GDN key heads /
+  256 routed experts (8 active) + 1 shared expert, MoE intermediate 512, vocab
+  248320 — all even, and the NVFP4 block size (16) divides every per-rank
+  dimension. vLLM picks the Marlin NVFP4 MoE kernel itself (`Using 'MARLIN'
+  NvFp4 MoE backend`); passing `--moe-backend marlin` explicitly is rejected by
+  the pinned build (`not supported for unquantized MoE`), so the manifest no
+  longer carries it. The previous main model (`RadixArk/Qwen3.8-27B-NVFP4`,
+  dense, 64 layers = 48 GDN + 16 full attention, 4 KV heads) sharded the same way.
 
 ## The interconnect, measured
 
@@ -196,9 +205,9 @@ Distributed runtime
   Head (vllm, node-rank 0): running / healthy
   Worker (vllm-worker, node-rank 1): running / healthy
 vLLM
-  Model: Qwen/Qwen3.8-27B-NVFP4  (max_model_len 262144)
+  Model: Qwen/Qwen3.6-35B-A3B-NVFP4  (max_model_len 800000)
   Engine: tensor_parallel=2 pipeline_parallel=1 world_size=2
-  Per-node GPU KV cache size: 924,244 tokens
+  Per-node GPU KV cache size: 2,977,319 tokens
 NCCL
   Transport: RDMA/RoCE (2 HCA(s), 128 channel endpoints)
   NET/IB : Using [0]rocep1s0f1:1/RoCE [1]roceP2p1s0f1:1/RoCE [RO]; OOB enp1s0f1np1:10.100.184.1<0>
@@ -213,14 +222,20 @@ Probe
 Same model, same flags, `vllm bench serve` with random 512-token prompts and
 128 generated tokens (`--ignore-eos`), plus a real 200-token chat request.
 
-| Metric | Single node (TP=1, util 0.35) | Dual node TP=2 (util 0.30 per node) |
-|---|---|---|
-| Single request: TTFT (short prompt) | 0.16–0.20 s | 0.17–0.30 s |
-| Single request: decode speed (tokens, from `usage`) | **20.0–20.1 tok/s** | **24.0–26.8 tok/s** (1.2–1.35×) |
-| Concurrency 4 (16 req): output tok/s | 54.0 | 53.4 |
-| Concurrency 4: TPOT mean / TTFT p50 / p95 | 66.0 ms / 718 ms / 1501 ms | 65.8 ms / 737 ms / 1778 ms |
-| Concurrency 16 (64 req): output tok/s | **123.1** (666 total tok/s)¹ | 105.5 (570 total tok/s) |
-| Concurrency 16: TPOT mean / TTFT p50 / p95 | 106.2 ms / 1.33 s / 6.33 s¹ | 126.8 ms / 1.61 s / 7.46 s |
+| Metric | 27B single node (TP=1, util 0.35) | 27B dual node TP=2 (util 0.30 per node) | **35B-A3B dual node TP=2 (current, 2026-08-29)** |
+|---|---|---|---|
+| Single request: TTFT (short prompt) | 0.16–0.20 s | 0.17–0.30 s | **0.07 s** |
+| Single request: decode speed (tokens, from `usage`) | **20.0–20.1 tok/s** | **24.0–26.8 tok/s** (1.2–1.35×) | **76.2–80.6 tok/s** |
+| Concurrency 4 (16 req): output tok/s | 54.0 | 53.4 | **135.4** |
+| Concurrency 4: TPOT mean / TTFT p50 / p95 | 66.0 ms / 718 ms / 1501 ms | 65.8 ms / 737 ms / 1778 ms | 23.9 ms / 589 ms / 1590 ms |
+| Concurrency 16 (64 req): output tok/s | **123.1** (666 total tok/s)¹ | 105.5 (570 total tok/s) | **243.3** |
+| Concurrency 16: TPOT mean / TTFT p50 / p95 | 106.2 ms / 1.33 s / 6.33 s¹ | 126.8 ms / 1.61 s / 7.46 s | 53.2 ms / 1.85 s / 2.20 s |
+| Per-node GPU KV cache (16 GiB budget) | – | 967,766 tokens | **2,977,319 tokens** |
+
+The 35B-A3B column is the same `cluster-bench.sh` invocation (random 512 in /
+128 out, `--ignore-eos`) on the same two nodes; both GPUs sampled at 76–81 %
+peak during the probe. It has no single-node column because the model was not
+run single-node on this cluster.
 | GPU busy during the c=4 run | Node 1 only | Node 1 86 % avg, Node 2 85 % avg (max 96 % both) |
 | MTP acceptance | 61.6 % | 68.7–69.7 % |
 | Weights resident per node | 20.75 GiB | 10.61 GiB |

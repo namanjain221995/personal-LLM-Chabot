@@ -43,8 +43,7 @@ services:
       --kv-cache-dtype fp8
       --reasoning-parser qwen3
       --trust-remote-code
-      --quantization modelopt
-      --attention-backend flashinfer
+      ${MAIN_STARTUP_ARGUMENTS:-}
       --enable-chunked-prefill
       --enable-prefix-caching
       --speculative-config '{"method":"mtp","num_speculative_tokens":1}'

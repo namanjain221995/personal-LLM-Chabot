@@ -221,7 +221,7 @@ What `./techsara up` decides for you:
 |---|---|
 | Mac M-series (e.g. M5 Max) | native vLLM-Metal main model sized to your RAM, embeddings/reranker on the larger tiers, app containers in Docker |
 | one NVIDIA GPU (10–70+ GiB free) | CUDA vLLM containers, model tier by free VRAM |
-| one DGX Spark (GB10, 128 GB unified) | the full DGX set: 27B main model + separate vision router + embeddings + reranker + OCR |
+| one DGX Spark (GB10, 128 GB unified) | the full DGX set: 35B-A3B MoE main model + separate vision router + embeddings + reranker + OCR |
 | **two DGX Sparks cabled together** | the same, plus the main model **sharded across both GPUs** (auto-detected over the RoCE links, see §7) |
 | CPU only, ≥8 GiB | llama.cpp with a 0.6B model |
 | not enough for any of the above | application-only (UI + data services, no local model) |
@@ -262,7 +262,7 @@ detected hardware and raise instead of silently degrading.
 | `mac-48-79gb` | native vLLM-Metal | Qwen3.6 35B-A3B MLX 4-bit | shared | ✓ / ✓ / – | 32768 … | 1 |
 | `mac-80-127gb` | native vLLM-Metal | Qwen3.6 35B-A3B MLX 4-bit | shared | ✓ / ✓ / – | 32768 … | 2 |
 | `mac-128gb-plus` | native vLLM-Metal | Qwen3.6 35B-A3B MLX 6-bit | shared | ✓ / ✓ / – | 65536 … | 2 |
-| `dgx-spark` | CUDA vLLM containers | **RadixArk/Qwen3.8-27B-NVFP4** (served as `Qwen/Qwen3.8-27B-NVFP4`) | **Qwen3-VL-8B FP8** (separate) | ✓ / ✓ / **✓ Unlimited-OCR** | **262144**, 131072, 65536 | 4 |
+| `dgx-spark` | CUDA vLLM containers | **nvidia/Qwen3.6-35B-A3B-NVFP4** (served as `Qwen/Qwen3.6-35B-A3B-NVFP4`; 256-expert MoE, 3B active) | **Qwen3-VL-8B FP8** (separate) | ✓ / ✓ / **✓ Unlimited-OCR** | **262144**, 131072, 65536 | 4 |
 | `nvidia-large` (≥70 GiB/device) | CUDA vLLM | Qwen3.6 35B-A3B FP8 | shared | ✓ / ✓ / – | 32768 … | 2 |
 | `nvidia-medium` (≥40 GiB) | CUDA vLLM | Qwen3 30B-A3B FP8 | shared | ✓ / – / – | 16384 … | 1 |
 | `nvidia-small` (≥20 GiB) | CUDA vLLM | Qwen3 14B AWQ | shared | ✓ / – / – | 16384 … | 1 |
@@ -357,16 +357,21 @@ unusable. The only manual prerequisite is ssh key authentication to Node 2.
 Measured on the two Sparks (`spark-0e68` head, `spark-476e` worker; details,
 topology, failure tests and limitations in [`docs/CLUSTER.md`](docs/CLUSTER.md)):
 
-| | Single node | Dual (TP=2) |
-|---|---|---|
-| Single-request decode | 20 tok/s | **24–27 tok/s** |
-| Concurrency 4 (512 in / 128 out) | 54 tok/s | 53 tok/s |
-| Concurrency 16 | **123 tok/s** | 105 tok/s |
-| KV cache | 542k tokens | ~950k tokens **per node** |
-| NCCL over both RoCE rails | – | 22 Gb/s, 17.6 µs (each link caps at ~13 Gb/s — see §24) |
+| | 27B single node | 27B dual (TP=2) | **35B-A3B dual (TP=2, current)** |
+|---|---|---|---|
+| Single-request decode | 20 tok/s | 24–27 tok/s | **76–81 tok/s** |
+| Single-request TTFT (short prompt) | 0.16–0.20 s | 0.17–0.30 s | **0.07 s** |
+| Concurrency 4 (512 in / 128 out) | 54 tok/s | 53 tok/s | **135 tok/s** (TPOT 24 ms) |
+| Concurrency 16 | 123 tok/s | 105 tok/s | **243 tok/s** (TPOT 53 ms) |
+| KV cache | 542k tokens | ~950k tokens per node | **~2.98M tokens per node** |
+| NCCL over both RoCE rails | – | 22 Gb/s, 17.6 µs (each link caps at ~13 Gb/s — see §24) | same fabric |
 
-So dual mode buys faster replies and roughly double context headroom, not peak
-throughput, on this fabric. Pipeline parallelism was tried and refused by vLLM
+The 27B columns are the dense model this cluster was built on (kept in the
+manifest as `dgx-qwen38-27b-nvfp4`); the main model was switched to the
+256-expert MoE `nvidia/Qwen3.6-35B-A3B-NVFP4` on 2026-08-29 (3B parameters
+active per token, so decode is ~3× faster and the KV cache 3× cheaper per
+token). Dual mode with the dense 27B bought faster replies and roughly double
+context headroom, not peak throughput, on this fabric. Pipeline parallelism was tried and refused by vLLM
 for this multimodal model class. The head and worker heal themselves after a
 crash (measured: worker killed → completions back in 584 s with no operator).
 
@@ -464,18 +469,25 @@ Measured on this deployment (2026-08-25):
 |---|---|---|
 | Served window | 262,144 | **800,000** (max input 775,424) |
 | Rope | `default` | `yarn`, factor 3.06, `mrope_section` preserved |
-| KV pool / node | 933,232 tokens | 967,766 tokens (1.21× at full length) |
+| KV pool / node (27B, 16 full-attention layers) | 933,232 tokens | 967,766 tokens (1.21× at full length) |
+| KV pool / node (35B-A3B, 10 full-attention layers, current) | – | **2,977,319 tokens** (3.72× at full length) |
 | Short-prompt A/B (10 deterministic prompts) | baseline | 5/10 byte-identical, none worse, `4871*39` newly **correct** |
 | Needle recall at 20K / 100K | found | found, same latency |
 
 Three honest costs before you raise it:
 
-1. **A cold single prompt is slow.** Prefill measures `7.34e-4·n + 1.93e-9·n²`
-   seconds on this cluster (fit to five points, ±0.1 s): 262K ≈ 5.4 min,
-   400K ≈ 10 min, **800K ≈ 30 min**. That is why `GEN_WALL_CLOCK_S` is raised
-   to 4200 alongside it — the 1800 s default would kill the request just as it
-   finished prefilling. A conversation that *grows* to 800K is unaffected:
-   prefix caching means each turn only prefills the new tokens.
+1. **A cold single prompt is slow — much less so with the MoE.** With the
+   dense 27B, prefill measured `7.34e-4·n + 1.93e-9·n²` seconds on this
+   cluster (fit to five points, ±0.1 s): 262K ≈ 5.4 min, 400K ≈ 10 min,
+   **800K ≈ 30 min**; that is why `GEN_WALL_CLOCK_S` was raised to 4200 — the
+   1800 s default would have killed the request just as it finished
+   prefilling. The current 35B-A3B measured 20.7K tokens in 4.8 s, 64.8K in
+   12.7 s and 169.7K in 42.3 s (≈4,000–5,000 tok/s; fit `1.75e-04·n + 4.38e-10·n²`),
+   which extrapolates to 262K ≈ 1.3 min, 400K ≈ 2.3 min and
+   800K ≈ 7 min — the raised timeout is kept because it is harmless
+   and still the right value should the 27B come back. A conversation that
+   *grows* to 800K is unaffected either way: prefix caching means each turn
+   only prefills the new tokens.
 2. **Concurrency at full length drops** to 1.21× — one 800K request at a time.
    Ordinary chats are unaffected, because vLLM allocates KV blocks on demand
    (a 657-token chat uses 657 tokens, not 800,000).
@@ -484,8 +496,10 @@ Three honest costs before you raise it:
 
 The launcher refuses a window the KV pool provably cannot hold, with the
 arithmetic and the exact `CLUSTER_KV_CACHE_MEMORY_GIB` you would need. The
-ceiling is 4× native (1,048,576) and, at the default 16 GiB KV budget,
-~922,000 tokens. Set `MAIN_MODEL_MAX_LEN=262144` to serve the model exactly as
+ceiling is 4× native (1,048,576). With the current 35B-A3B main model the
+16 GiB KV budget holds ~2.98M tokens, so that 4× limit is the only ceiling; the
+previous 27B paged 3.2× more KV per token and topped out at ~922,000 tokens on
+the same budget. Set `MAIN_MODEL_MAX_LEN=262144` to serve the model exactly as
 it was trained.
 
 

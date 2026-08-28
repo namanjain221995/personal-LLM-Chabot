@@ -207,7 +207,7 @@
       "supports_streaming": true,
       "requires_trust_remote_code": true,
       "endpoint_type": "openai-chat",
-      "startup_arguments": ["--quantization", "modelopt", "--attention-backend", "flashinfer", "--moe-backend", "marlin"],
+      "startup_arguments": ["--quantization", "modelopt", "--attention-backend", "flashinfer"],
       "tokenizer_arguments": {},
       "health_probe": {"path": "/v1/models", "method": "GET"},
       "legacy_directories": ["Qwen3.6-35B-A3B-NVFP4"],
