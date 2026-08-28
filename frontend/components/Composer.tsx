@@ -172,6 +172,8 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
   ) {
     const [text, setText] = useState('');
     const [attachments, setAttachments] = useState<Attachment[]>([]);
+    /** Files still being read/downscaled; a send must wait for them. */
+    const [pendingAttach, setPendingAttach] = useState(0);
     const [pastedTexts, setPastedTexts] = useState<PastedText[]>([]);
     const textareaRef = useRef<HTMLTextAreaElement>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
@@ -246,6 +248,9 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
     function submit() {
       const trimmed = text.trim();
       if (streaming || disabled || busy) return;
+      // An attachment is still being prepared — sending now would post the
+      // message without it.
+      if (pendingAttach > 0) return;
       if (!trimmed && attachments.length === 0 && pastedTexts.length === 0)
         return;
       onSend(trimmed, attachments, pastedTexts);
@@ -327,22 +332,35 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
           return [...images, att];
         });
       };
-      const readOriginal = () => {
-        const reader = new FileReader();
-        reader.onload = () => attach(String(reader.result));
-        reader.readAsDataURL(file);
-      };
-      if (isPdf) {
-        readOriginal();
-        return;
-      }
+      const readOriginal = () =>
+        new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(String(reader.result));
+          reader.onerror = () => reject(reader.error);
+          reader.readAsDataURL(file);
+        });
       // 2026-08-29: images larger than MAX_IMAGE_EDGE on the long edge are
       // downscaled in the browser before they become base64 — fewer prompt
       // tokens, smaller upload, faster first token; `null` = send as is.
-      void downscaleImageFile(file).then((scaled) => {
-        if (scaled) attach(scaled.dataUrl);
-        else readOriginal();
-      });
+      // Decoding + re-encoding a 4K screenshot takes tens of milliseconds, so
+      // the attachment is counted as pending until it lands: `submit()` and
+      // the Send button wait for it instead of posting the message without
+      // the image (the classic Ctrl+V-then-Enter race).
+      setPendingAttach((n) => n + 1);
+      void (async () => {
+        try {
+          const scaled = isPdf ? null : await downscaleImageFile(file);
+          attach(scaled ? scaled.dataUrl : await readOriginal());
+        } catch {
+          try {
+            attach(await readOriginal());
+          } catch {
+            /* unreadable file: nothing to attach, exactly as before */
+          }
+        } finally {
+          setPendingAttach((n) => Math.max(0, n - 1));
+        }
+      })();
     }
 
     // Paste into the composer: an image blob becomes the attachment; a long
@@ -638,7 +656,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
                   <button
                     type="button"
                     onClick={submit}
-                    disabled={disabled || busy || !hasContent}
+                    disabled={disabled || busy || !hasContent || pendingAttach > 0}
                     aria-label="Send message"
                     title="Send (Enter)"
                     className="shrink-0 rounded-lg bg-accent-strong p-2 text-white transition-all duration-ts hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-35"

@@ -28,6 +28,9 @@ describe('outputMime', () => {
   });
   it('re-encodes photos as JPEG', () => {
     expect(outputMime('image/jpeg')).toBe('image/jpeg');
-    expect(outputMime('image/webp')).toBe('image/jpeg');
+    expect(outputMime('image/jpg')).toBe('image/jpeg');
+  });
+  it('keeps webp lossless so alpha is not flattened to black', () => {
+    expect(outputMime('image/webp')).toBe('image/png');
   });
 });

@@ -1,5 +1,77 @@
 # Changelog
 
+## Review follow-ups: the document route honours the picker, OCR stops truncating, and the context window lands on a measured-safe 850K (2026-08-29)
+
+An adversarial review of the previous entry's change found 17 real defects.
+The important ones, and one discovery that outranks them all.
+
+**The 1,000,000-token window was not safe.** A 960K-token prompt made the
+engine run out of GPU memory (`NVRM: Out of memory [NV_ERR_NO_MEMORY]` in the
+kernel log) and take the whole stack down for ~6 minutes while it reloaded —
+found by running the needle validation the previous entry promised. An
+ascending prefill ladder on the live cluster then bracketed it:
+
+| Prompt | Result |
+|---|---|
+| 254,646 tokens | ok, 113 s |
+| 485,710 tokens | ok, 181 s |
+| 680,020 tokens | ok, 222 s |
+| **825,710 tokens** | **ok, 205 s** |
+| 959,894 tokens | **engine OOM, ~6 min outage** |
+
+So `MAIN_MODEL_MAX_LEN` is now **850,000** (YaRN 3.25) — the largest size this
+deployment is measured to survive, with the crash boundary ~12 % above it.
+Served: KV pool 2,979,126 tokens/node, `Maximum concurrency for 850,000 tokens
+per request: 3.50x`. The ceiling is unified memory on Node 1, which also hosts
+the router, OCR, embeddings, reranker and the app: the engine starts with
+49.4 GiB free and spends 11.35 on weights, 16 on KV and 2.85 on CUDA graphs.
+Node 2 currently has ~68 GiB free, so moving the auxiliary models there is the
+route to a genuinely usable 1M — untested, and a separate change.
+
+**Correction to the previous entry.** It claimed the 1M window "costs roughly
+10 % decode" (71 tok/s vs 76–81). That compared a five-run median against a
+single run taken on a quieter machine. Five-run medians on the same prompts:
+**69.9 tok/s at 850K, 71.2 at 1M** — within noise of each other. The window's
+decode cost is not established; the earlier 76–81 figures were single runs.
+
+**Defects fixed**
+
+- `document.py` hard-coded `effort="medium"` (an alias for *think*) while
+  emitting `route="vision"`, and `meta_extras` reports `request.effort` for
+  that route — so a PDF sent with **Fast** was reported as fast, ran a full
+  reasoning pass, and stored the wrong effort in history. The document engine
+  now runs at the level the composer picked, exactly like the image route.
+  Regression test included.
+- `ocr.py` derived its output ceiling from `OCR_OUTPUT_LIMIT`, which looks
+  like an OCR tuning but is the launcher's generic per-role formula
+  (`context // 4` = 2048 here). That silently cut every scanned PDF page and
+  Think/Max image transcript from 6000 to 2048 tokens. The ceiling now comes
+  from the OCR model's **window** (8192 − 2200 reserve = 5992, capped at
+  6000), and a transcript that still hits the ceiling is marked
+  `[transcript truncated at the OCR output limit]` instead of ending
+  mid-table with no signal.
+- `images.ts` re-encoded **WebP as JPEG**, which composites alpha onto black —
+  a transparent diagram would have arrived black-on-black. WebP stays on the
+  lossless PNG path; only real JPEG re-encodes as JPEG.
+- The composer now counts attachments that are still being read/downscaled and
+  makes `submit()` and the Send button wait for them. Decoding a 4K screenshot
+  takes tens of milliseconds — long enough for the usual Ctrl+V-then-Enter to
+  post the message without the image.
+- `vision.py`'s module docstring still described a Qwen3-VL-4B endpoint and
+  the invoice/contract-JSON-first behaviour, both untrue since the previous
+  entry.
+
+**Numbers corrected.** Image tokens are now measured through the served
+model's `/tokenize` rather than estimated: 1,013 at 1280×800, 1,413 at
+1600×900, 3,613 at 2560×1440, 8,173 at 3840×2160 — so the 1600 px cap cuts a
+1440p screenshot **2.6×** and a 4K one **5.8×** (the previous entry's "up to
+4×" was wrong in both directions). README's test-size table was three suites
+out of date: orchestrator 82 files / ~1,516 tests, frontend 47 files / 761
+cases (35 Node, 12 jsdom).
+
+Tests: orchestrator **1516 passed, 3 skipped**; frontend **761 passed** across
+47 files; `tsc --noEmit` clean.
+
 ## Images answer like a colleague, the window is 1M, and the engine knobs are measured (2026-08-29)
 
 Three user-visible problems from the same afternoon, each traced to a
@@ -34,9 +106,10 @@ passed.
 **2. Screenshots were uploaded at full resolution.** `frontend/lib/images.ts`
 downscales images in the browser to 1600 px on the long edge before the base64
 step (PNG stays PNG; JPEG/WebP re-encode at 0.92; any failure falls back to
-the original bytes). Image tokens scale with pixels (~1,000 for 1280×800,
-~4,000 for 2560×1440) while measured accuracy plateaus at ~1280 px, so this
-cuts prompt tokens and upload size up to 4× with no accuracy loss. Pure
+the original bytes). Image tokens scale with pixel count — measured through the served
+model's `/tokenize`: **1,013** at 1280×800, **1,413** at 1600×900, **3,613**
+at 2560×1440 and **8,173** at 3840×2160 — so the cap cuts a 1440p screenshot
+**2.6×** and a 4K one **5.8×**. Pure
 helpers unit-tested (`tests/images.test.ts`); `tsc` clean.
 
 **3. "Why is only one GPU busy?"** The DGX Dashboard gauge is the board-level

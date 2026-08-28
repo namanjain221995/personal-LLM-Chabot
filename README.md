@@ -164,7 +164,7 @@ referenced by immutable digest in [`compose.yaml`](compose.yaml) and
 │   └── search/                 searxng, tavily, brave providers
 ├── orchestrator/scripts/       validate_packs.py, compile_brain_source.py, validate_long_context.py,
 │                               build_dictionary_from_metadata.py, migrate_sqlite_to_postgres.py, backfill_titles.py
-├── orchestrator/tests/         80 files, ~1,240 tests (needs a test PostgreSQL)
+├── orchestrator/tests/         82 files, ~1,516 tests (needs a test PostgreSQL)
 ├── sync-worker/syncworker/     main.py (cycle), sf_auth.py (JWT / client credentials), sf_client.py
 │                               (REST + Bulk 2.0), objects.py (config + CLI), storage.py (Parquet + DuckDB),
 │                               rag_index.py + chunking.py + embedding_index.py (LanceDB), secrets.py
@@ -172,8 +172,8 @@ referenced by immutable digest in [`compose.yaml`](compose.yaml) and
 ├── sync-worker/tests/          157 tests
 ├── frontend/app/               page.tsx (the app), layout.tsx, api/* proxy routes
 ├── frontend/components/        39 components (ChatApp, Composer, MessageRow, ProofDrawer, ChartView, ...)
-├── frontend/lib/               32 headless modules (sse, streams, history, chartOption, clarification, ...)
-├── frontend/tests/             32 files, 436 cases
+├── frontend/lib/               38 headless modules (sse, streams, history, images, chartOption, ...)
+├── frontend/tests/             47 files, 761 cases
 ├── brain/packs/                21 YAML knowledge packs the model reads on every Salesforce question
 ├── brain/sources/              the raw documents, SOPs, org schema and metadata they were compiled from
 ├── scripts/                    two-node cluster tooling: cluster-status/doctor/test/bench/logs/sync/worker/up/down
@@ -459,18 +459,18 @@ model's real geometry, computes the factor, and passes the override to both
 nodes:
 
 ```text
-MAIN_MODEL_MAX_LEN=1000000    # -> "Context: 1,000,000 tokens (model is natively
-                              #     262,144; YaRN factor 3.82 enabled)"
+MAIN_MODEL_MAX_LEN=850000     # -> "Context: 850,000 tokens (model is natively
+                              #     262,144; YaRN factor 3.25 enabled)"
 ```
 
 Measured on this deployment (27B rows 2026-08-25; 35B-A3B rows 2026-08-29):
 
 | | Native | Extended |
 |---|---|---|
-| Served window | 262,144 | **1,000,000** since 2026-08-29 (800,000 from 08-27 to 08-29) |
-| Rope | `default` | `yarn`, factor 3.82 at 1M (3.06 at 800K), `mrope_section` preserved |
+| Served window | 262,144 | **850,000** (800,000 from 08-26 to 08-29; 1,000,000 was tried on 08-29 and reverted — see below) |
+| Rope | `default` | `yarn`, factor 3.25 at 850K (3.06 at 800K), `mrope_section` preserved |
 | KV pool / node (27B, 16 full-attention layers) | 933,232 tokens | 967,766 tokens (1.21× at full length) |
-| KV pool / node (35B-A3B, 10 full-attention layers, current) | – | **2,973,029 tokens** (2.97× at 1M; 3.72× at 800K) |
+| KV pool / node (35B-A3B, 10 full-attention layers, current) | – | **2,979,126 tokens** (3.50× at 850K; 3.72× at 800K) |
 | Short-prompt A/B (10 deterministic prompts) | baseline | 5/10 byte-identical, none worse, `4871*39` newly **correct** |
 | Needle recall at 20K / 100K | found | found, same latency |
 
@@ -488,9 +488,16 @@ Three honest costs before you raise it:
    and still the right value should the 27B come back. A conversation that
    *grows* to 800K is unaffected either way: prefix caching means each turn
    only prefills the new tokens.
-2. **Concurrency at full length drops** — to 2.97× at 1M with the current
-   35B-A3B (two full-length requests at a time; 3.72× at 800K); it was 1.21×
-   — one at a time — with the 27B at 800K.
+2. **Concurrency at full length drops** — to 3.50× at 850K with the current
+   35B-A3B (three full-length requests at a time); it was 1.21× — one at a
+   time — with the 27B at 800K.
+3. **The ceiling is unified memory, and it is hard.** A 959,894-token prompt
+   ran the GPU out of memory and restarted the engine (~6 min outage);
+   825,710 tokens completed in 205 s. That is why the window is 850,000 and
+   not the 1,048,576 the YaRN ceiling would allow. Node 1 hosts the router,
+   OCR, embeddings, reranker and the app alongside the engine; Node 2 has
+   ~68 GiB free, so relocating the auxiliary models is the untested route to
+   a larger window.
    Ordinary chats are unaffected, because vLLM allocates KV blocks on demand
    (a 657-token chat uses 657 tokens, not 800,000).
 3. **YaRN is static**, so the scaling applies at every length. The A/B above
@@ -826,9 +833,9 @@ MOCK_MODE=true npm run dev        # UI-only development
 | Suite | Scope | Size |
 |---|---|---|
 | Launcher | mocks + temp dirs; `test_compose_overlays.py` renders all 13 host fixtures (and the DGX dual-mode fixture) through real `docker compose config` and asserts platform invariants (loopback publication, digest-pinned images, no developer paths); skips without Compose ≥ 2.24 | 355 tests, all green on 2026-08-25 |
-| Orchestrator | SSE contract, routing, Salesforce Intelligence (engine, plans, clarification), org brief / brain / dictionary, charts, live Salesforce, security (SQL guard, SSRF, archives, report paths, DB guard), history, memory, context budgets, reasoning; every app table is truncated before each test | 80 files, ~1,240 tests |
+| Orchestrator | SSE contract, routing, Salesforce Intelligence (engine, plans, clarification), org brief / brain / dictionary, charts, live Salesforce, security (SQL guard, SSRF, archives, report paths, DB guard), history, memory, context budgets, reasoning; every app table is truncated before each test | 82 files, ~1,516 tests |
 | Sync worker | discovery, JWT/secrets, Bulk fallback, upserts, deletes, watermarks, chunking, embedding integrity, CLI | 157 tests |
-| Frontend | Vitest; 28 pure-logic files in Node, 4 component files in jsdom (`// @vitest-environment jsdom`) | 32 files, 436 cases |
+| Frontend | Vitest; 35 pure-logic files in Node, 12 component files in jsdom (`// @vitest-environment jsdom`) | 47 files, 761 cases |
 
 Notes: CI runs these suites on every pull request and on every push to `main` or
 `dev` (see §22.1); the local commands above stay the fast inner loop.

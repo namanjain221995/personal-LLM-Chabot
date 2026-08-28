@@ -100,8 +100,17 @@ async def run_pdf_engine(
     history: Sequence[dict],
     emit: Emit,
     conversation_id: Optional[str] = None,
+    *,
+    effort: str = "think",
 ) -> str:
-    """Any uploaded document — PDF, DOCX, or plain text (field name is V8)."""
+    """Any uploaded document — PDF, DOCX, or plain text (field name is V8).
+
+    `effort` is the composer's Fast/Think/Max, exactly as on the image route
+    (2026-08-29). Until then this engine hard-coded ``effort="medium"`` — an
+    alias for "think" — so a document uploaded with Fast still ran a full
+    reasoning pass, and `meta.effort` (which reports `request.effort` for the
+    shared ``route="vision"``) described a level the answer had not run at.
+    """
     raw = base64.b64decode(_strip_data_url(pdf_base64))
 
     images: List[str] = []
@@ -196,7 +205,10 @@ async def run_pdf_engine(
     # Reasoning-aware stream: the thinking model reasons a lot over documents,
     # so surface that in the "Thinking…" panel AND give a generous ceiling.
     async for kind, delta in llm.stream_chat_events(
-        messages, model_choice="smart", effort="medium", max_tokens=12000
+        messages,
+        model_choice="smart",
+        effort=llm.normalize_effort(effort),
+        max_tokens=12000,
     ):
         await emit(kind, {"text": delta})
         if kind == "token":
