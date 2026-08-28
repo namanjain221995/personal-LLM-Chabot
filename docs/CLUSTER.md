@@ -279,6 +279,33 @@ workload until the fabric ceiling is fixed; `dual` for snappier replies and
 long contexts. Prefix caching keeps the (large) shared
 Salesforce system prompt out of most prefills.
 
+## Engine tuning, measured (2026-08-29)
+
+Every knob below was either measured on the running two-node cluster or
+ruled out by reading the pinned build (`0.26.1rc1.dev77`) and the checkpoint.
+Nothing here is a guess; numbers are single-stream unless stated.
+
+| Knob | Tried / read | Result | Decision |
+|---|---|---|---|
+| `CLUSTER_SPECULATIVE_CONFIG` MTP `num_speculative_tokens` 1 → 2 | restarted, measured | decode **59–72 tok/s vs 76–81** at k=1; per-draft-token acceptance 62 % (1.25 accepted per step vs ~1.9). vLLM warns at start-up that re-running the single MTP layer lowers acceptance — it does. | keep **1** |
+| `CLUSTER_MAX_NUM_BATCHED_TOKENS` 8192 → 16384 | restarted, measured | prefill 3.9–4.0K tok/s vs 4.0–5.1K at 8192 (noise or slightly worse); +45 s torch.compile for the new range | keep **8192** |
+| `MAIN_MODEL_MAX_LEN` 800000 → 1000000 | restarted, measured | served (`max_model_len 1000000`, YaRN 3.82), KV pool 2,973,029 tokens/node, `Maximum concurrency for 1,000,000 tokens per request: 2.97x` | **kept** |
+| `--moe-backend` | read | the experts are `W4A16_NVFP4`, so only the Marlin kernel can run them (`modelopt.py`: every W4A4 backend rejects itself); vLLM selects Marlin on its own and rejects the explicit flag | no lever |
+| Full CUDA graphs for decode | read | FlashInfer on GB10 (sm 12.1) only supports `UNIFORM_SINGLE_TOKEN_DECODE`; with MTP the engine downgrades to `PIECEWISE` (visible in the start-up log). `triton_attn` declares full-graph support and is the untested A/B | not tried (needs a manifest change + A/B) |
+| GDN prefill kernel | read | FlashInfer/CuteDSL GDN prefill needs SM90/SM100; sm 12.1 gets Triton/FLA | no lever |
+| Prefix caching | metrics | **0 hits of 40,863 queries**: the hybrid model forces `mamba_cache_mode=align` and an attention block of 2112 tokens, so a prefix shorter than 2112 tokens can never hit. `--mamba-block-size` / `--mamba-cache-mode all` would enable hits for the shared system prompt at the cost of KV budget (experimental in this build) | recommended experiment for a maintenance window |
+| `--enable-expert-parallel` | read | all-to-all token dispatch across ~22 Gb/s RoCE is latency-bound; TP already shards the 512-wide expert FFNs evenly | not tried |
+| `--gpu-memory-utilization` | log | ignored for KV sizing when `--kv-cache-memory-bytes` is set (engine says so at start-up) | – |
+
+**How to read the DGX Dashboard's "GPU utilization".** That gauge is the
+board-level `utilization.gpu` counter, which also counts the GNOME
+remote-desktop sessions (three `gnome-remote-desktop` + `Xwayland` processes
+on Node 2) rendering the dashboard's own charts. Measured on an idle cluster
+it showed 77–94 % while `nvidia-smi pmon` had every vLLM process at 0–9 % SM.
+During a real request the per-process view is the truthful one: Node 1
+engine at max 79 % / Node 2 at max 76 % (p50 70 %) SM — both GPUs work every
+request; that is what tensor parallelism means.
+
 ## Failure behaviour
 
 Tested on 2026-08-25 by killing the worker under a running cluster (twice,

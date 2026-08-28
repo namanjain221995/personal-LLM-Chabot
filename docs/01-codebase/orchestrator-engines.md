@@ -1416,3 +1416,32 @@ callers at `sql.py:351` and `agent.py:294` pass real history believing it matter
 `SELECT` to end-of-string including trailing model prose, which then hits `guard_soql`. Additional,
 no ID: `describe_rows` caps at 30 rows (`:148`) while `MAX_ROWS` is 200 — 170 fetched rows are
 discarded before the prompt, and `sql.py:376` separately previews up to 500 of them.
+
+## vision.py — behaviour since 2026-08-29
+
+Measured on the two-node cluster with a 1280×800 GitHub screenshot: the old
+engine reached the first visible token in 4.0 s via `/chat` while vLLM alone
+took 0.66 s, and its answer opened with a contract-extraction JSON block
+(`parties`, `effective_date`, `key_obligations` invented from a repo page)
+because `_SYSTEM` told the model to lead with invoice/contract JSON. Four
+changes, all in [`vision.py`](../../orchestrator/app/engines/vision.py) and
+[`ocr.py`](../../orchestrator/app/engines/ocr.py), tested in
+[`test_vision_effort.py`](../../orchestrator/tests/test_vision_effort.py):
+
+1. **Prompt.** `_SYSTEM` asks for a direct, grounded Markdown answer to the
+   user's question; structured JSON only on request (invoice/contract keys
+   unchanged). `extraction_hint(message)` appends a deterministic hint when
+   the message asks for data/fields/JSON, so the JSON-or-prose decision does
+   not rest on the model.
+2. **Conversation context.** `history_turns(history)` (= `recent_turns(…, 6)`
+   filtered to string content, pinned system blocks kept) is sent between the
+   system prompt and the image turn. Before, the call was `[system, user]`
+   only, so follow-ups about an image and facts the user had already given
+   (repo names, their own name) were invisible to the model.
+3. **OCR only off the Fast path.** `settings.ocr_enabled and level != "fast"`
+   gates the Unlimited-OCR pre-pass; Fast sends pixels only (the 35B reads a
+   1280 px screenshot itself), Think/Max keep the transcript for dense scans.
+4. **OCR limits follow configuration.** `ocr.output_limit()` =
+   `min(6000, OCR_OUTPUT_LIMIT)` and `ocr.concurrency()` = `OCR_CONCURRENCY`
+   replace the hard-coded 6000 / 3 that ignored the production values
+   (2048 / 4).

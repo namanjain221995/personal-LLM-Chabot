@@ -1,5 +1,78 @@
 # Changelog
 
+## Images answer like a colleague, the window is 1M, and the engine knobs are measured (2026-08-29)
+
+Three user-visible problems from the same afternoon, each traced to a
+measured cause on the two-node cluster:
+
+**1. Image uploads answered with a contract JSON block.** The vision system
+prompt told the model to *lead with* invoice/contract JSON; the 35B applied
+it to a GitHub screenshot and invented `key_obligations`. Sent straight to
+vLLM without that prompt, the same screenshot got a direct, correct answer in
+0.66 s to the first token — the model was never the problem.
+`orchestrator/app/engines/vision.py` now:
+- asks for a direct, grounded Markdown answer; JSON only on request
+  (`extraction_hint()` adds a deterministic hint when the message asks for
+  data/fields/JSON, so the decision does not rest on the model);
+- sends the conversation (`history_turns()`: the last 6 text turns plus pinned
+  system blocks) between the system prompt and the image turn — before, the
+  call was `[system, user]` only, so follow-ups about an image and facts the
+  user had already given were invisible;
+- skips the Unlimited-OCR pre-pass on **Fast** (it ran before the main model
+  could start and was ~3.3 s of the 4.0 s to the first token); Think/Max keep
+  the transcript for dense scans;
+- `ocr.py` honours `OCR_OUTPUT_LIMIT` / `OCR_CONCURRENCY` (2048 / 4 in
+  production) instead of hard-coded 6000 / 3.
+
+Measured through `/chat` on a 1280×800 screenshot, Fast: first visible token
+**1.1 s warm** (2.8 s cold after a restart; 4.0 s before), answer opens with
+"Based on the screenshot of your GitHub repository `personal-LLM-Chabot`…";
+Think still calls OCR exactly once; a follow-up reuses the repository named
+two turns earlier. 8 new tests in `test_vision_effort.py`; full suite 1508
+passed.
+
+**2. Screenshots were uploaded at full resolution.** `frontend/lib/images.ts`
+downscales images in the browser to 1600 px on the long edge before the base64
+step (PNG stays PNG; JPEG/WebP re-encode at 0.92; any failure falls back to
+the original bytes). Image tokens scale with pixels (~1,000 for 1280×800,
+~4,000 for 2560×1440) while measured accuracy plateaus at ~1280 px, so this
+cuts prompt tokens and upload size up to 4× with no accuracy loss. Pure
+helpers unit-tested (`tests/images.test.ts`); `tsc` clean.
+
+**3. "Why is only one GPU busy?"** The DGX Dashboard gauge is the board-level
+`utilization.gpu` counter, which also counts the GNOME remote-desktop sessions
+rendering the dashboard itself: on an idle cluster it read 77–94 % while
+`nvidia-smi pmon` had every vLLM process at 0–9 %. Per process, during a real
+request, Node 1's engine peaks at 79 % and Node 2's at 76 % (p50 70 %) — both
+GPUs work every request. Documented in `docs/CLUSTER.md`.
+
+**Context window: 800K → 1,000,000 tokens** (`MAIN_MODEL_MAX_LEN=1000000`,
+YaRN 3.82, the launcher's 4×-native ceiling is 1,048,576). Served and
+verified: `max_model_len 1000000`, KV pool 2,973,029 tokens/node, "Maximum
+concurrency for 1,000,000 tokens per request: 2.99x". Cost, measured: single-
+stream decode **~71 tok/s at 1M** (five runs, median 71.2) against 76–81
+tok/s on two separate 800K restarts — the wider window costs roughly 10 %
+decode. `MAIN_MODEL_MAX_LEN=800000` gets it back; it is a one-line `.env`
+choice and a 6-minute restart.
+
+**Engine knobs, measured and reverted** (details and the full tunables table
+in `docs/CLUSTER.md` → "Engine tuning, measured"):
+- MTP `num_speculative_tokens` 2: decode 59–72 tok/s, per-draft-token
+  acceptance 62 % (vLLM warns that re-running the single MTP layer lowers
+  acceptance — it does). Kept at **1**.
+- `max-num-batched-tokens` 16384: prefill 3.9–4.0K tok/s vs 4.0–5.1K at 8192
+  and +45 s compile. Kept at **8192**.
+- Read, not tried: the experts are `W4A16_NVFP4`, so Marlin is the only
+  possible MoE kernel; FlashInfer on sm 12.1 forces PIECEWISE CUDA graphs
+  with MTP; prefix caching scores 0 hits of 40,863 queries because the hybrid
+  model's block size is 2112 tokens (a `--mamba-block-size` experiment is the
+  recommended next step for TTFT on shared system prompts).
+
+Noted, not changed: the previous single-node vLLM on Node 2
+(`0.0.0.0:8000`, 38 GB, still serving ~330K tokens in a few hours to
+something) shares that GPU with the cluster worker; stopping it is the user's
+call.
+
 ## Main model switched to Qwen3.6-35B-A3B (MoE) on the DGX cluster (2026-08-29)
 
 The `dgx-spark` profile's main model is now `nvidia/Qwen3.6-35B-A3B-NVFP4`

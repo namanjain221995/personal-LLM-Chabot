@@ -2225,3 +2225,19 @@ counter-example**: `package-lock.json` is committed and the lockfile pins exact 
 `safeProtocol = /^(https?|ircs?|mailto|xmpp)$/i`, and `MermaidBlock.tsx:58` sets
 `securityLevel: 'strict'` before both `dangerouslySetInnerHTML` sites. The frontend's HTML injection
 surface is closed.
+
+## Image downscaling before upload (2026-08-29)
+
+[`lib/images.ts`](../../frontend/lib/images.ts) — `fitWithin(width, height,
+maxEdge = MAX_IMAGE_EDGE)` (pure, tested in
+[`tests/images.test.ts`](../../frontend/tests/images.test.ts)),
+`outputMime(sourceMime)` (PNG stays PNG so screenshot text stays crisp;
+JPEG/WebP re-encode as JPEG at 0.92) and `downscaleImageFile(file)`
+(`createImageBitmap` + canvas; resolves `null` when the image already fits,
+the browser lacks the APIs, or anything throws — the caller then sends the
+original bytes). `Composer.handleFile` calls it for images before the base64
+step; PDFs are untouched. `MAX_IMAGE_EDGE = 1600`: the main model's image
+tokens scale with pixel count (~1,000 for 1280×800, ~4,000 for 2560×1440)
+while measured answer accuracy plateaus at ~1280 px on the long edge, so the
+cap cuts prompt tokens and upload size up to 4× with no accuracy loss. The
+10 MB / 5-image caps are unchanged and still apply to the file, not the pixels.
