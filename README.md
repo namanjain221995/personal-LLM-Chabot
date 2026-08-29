@@ -459,18 +459,18 @@ model's real geometry, computes the factor, and passes the override to both
 nodes:
 
 ```text
-MAIN_MODEL_MAX_LEN=850000     # -> "Context: 850,000 tokens (model is natively
-                              #     262,144; YaRN factor 3.25 enabled)"
+MAIN_MODEL_MAX_LEN=1000000    # -> "Context: 1,000,000 tokens (model is natively
+                              #     262,144; YaRN factor 3.82 enabled)"
 ```
 
 Measured on this deployment (27B rows 2026-08-25; 35B-A3B rows 2026-08-29):
 
 | | Native | Extended |
 |---|---|---|
-| Served window | 262,144 | **850,000** (800,000 from 08-26 to 08-29; 1,000,000 was tried on 08-29 and reverted — see below) |
-| Rope | `default` | `yarn`, factor 3.25 at 850K (3.06 at 800K), `mrope_section` preserved |
+| Served window | 262,144 | **1,000,000**, needle-verified at 949,915 tokens (800,000 from 08-26 to 08-29) |
+| Rope | `default` | `yarn`, factor 3.82 at 1M (3.06 at 800K), `mrope_section` preserved |
 | KV pool / node (27B, 16 full-attention layers) | 933,232 tokens | 967,766 tokens (1.21× at full length) |
-| KV pool / node (35B-A3B, 10 full-attention layers, current) | – | **2,979,126 tokens** (3.50× at 850K; 3.72× at 800K) |
+| KV pool / node (35B-A3B, 10 full-attention layers, current) | – | **1,494,824 tokens** (1.49× at 1M, `CLUSTER_KV_CACHE_MEMORY_GIB=8`) |
 | Short-prompt A/B (10 deterministic prompts) | baseline | 5/10 byte-identical, none worse, `4871*39` newly **correct** |
 | Needle recall at 20K / 100K | found | found, same latency |
 
@@ -488,16 +488,16 @@ Three honest costs before you raise it:
    and still the right value should the 27B come back. A conversation that
    *grows* to 800K is unaffected either way: prefix caching means each turn
    only prefills the new tokens.
-2. **Concurrency at full length drops** — to 3.50× at 850K with the current
-   35B-A3B (three full-length requests at a time); it was 1.21× — one at a
-   time — with the 27B at 800K.
-3. **The ceiling is unified memory, and it is hard.** A 959,894-token prompt
-   ran the GPU out of memory and restarted the engine (~6 min outage);
-   825,710 tokens completed in 205 s. That is why the window is 850,000 and
-   not the 1,048,576 the YaRN ceiling would allow. Node 1 hosts the router,
-   OCR, embeddings, reranker and the app alongside the engine; Node 2 has
-   ~68 GiB free, so relocating the auxiliary models is the untested route to
-   a larger window.
+2. **Concurrency at full length drops** to 1.49× — one 1M request at a time.
+   That is the deliberate trade for the window: `CLUSTER_KV_CACHE_MEMORY_GIB`
+   is 8, not 16, because the KV cache and the prefill share one pool.
+3. **The KV budget, not the window, is what makes a huge prompt fail.** At
+   16 GiB the cache reserved room for 2.95M tokens — three times what a 1M
+   window can use — and a 949,915-token prompt ran the GPU out of memory and
+   restarted the engine. At 8 GiB the same prompt completes and recalls all
+   three needles: the pool still holds 1,494,824 tokens while prefill working
+   memory goes from ~19 GiB to ~37 GiB. Raise the budget only together with a
+   smaller window.
    Ordinary chats are unaffected, because vLLM allocates KV blocks on demand
    (a 657-token chat uses 657 tokens, not 800,000).
 3. **YaRN is static**, so the scaling applies at every length. The A/B above
