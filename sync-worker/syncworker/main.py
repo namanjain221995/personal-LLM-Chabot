@@ -652,9 +652,22 @@ def run_cycle(
                 exc_info=True,
                 extra={"event": "object_sync_error", "object": obj.name},
             )
+    # Publish the readers' snapshot BEFORE announcing the cycle, so "complete"
+    # means "and the orchestrator can see it". Failure here is logged and never
+    # fatal: the previous snapshot stays in place and stays queryable.
+    published = ""
+    try:
+        published = store.publish_snapshot()
+    except Exception:  # noqa: BLE001 — a stale snapshot beats a broken cycle
+        log.error(
+            "failed to publish the warehouse snapshot; readers keep the previous one",
+            exc_info=True,
+            extra={"event": "snapshot_publish_error"},
+        )
     log.info(
         "sync cycle complete",
         extra={"event": "cycle_done", "objects": len(objects), "rows": total,
+               "snapshot_published": bool(published),
                "failed_objects": failed,
                "seconds": round(time.monotonic() - started, 1),
                # Read-write opens of the warehouse this cycle. ~2 per object

@@ -48,7 +48,14 @@ rules: 'External-interview rules (Interview__c):
   to Interview__c.
 
   - Nearly all rows: record type ''Interview''; B2B lookups Job_Submission__c/Client_Account__c
-  barely used, blanks expected.
+  barely used, blanks expected. NEVER filter interviews by record-type NAME
+  (rt.Name/DeveloperName = ''Interview''): a genuine Completed/Final interview is
+  filed under ''Initial Call'', so that predicate silently drops it and turns 225
+  into 224. Joining RecordType is fine; filtering on its name is not.
+
+  - COUNTS COME FROM COUNT(*), never from counting listed rows: a row list is
+  capped and the cap becomes the answer. For a list AND a count in one question,
+  state the count from COUNT(*) and present the rows as a sample of it.
 
   - Company = company_new__c -> Company__c master list; Interview__c.Company__c
   = legacy free text.

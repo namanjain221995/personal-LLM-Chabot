@@ -562,6 +562,24 @@ def _numeric(value: Any) -> Optional[float]:
     return None
 
 
+#: Salesforce names an unaliased aggregate in a GROUP BY result `expr0`
+#: (`expr1`, ... for further aggregates). One row comes back PER GROUP with the
+#: real record count in that column, so a grouped result must be read from it —
+#: counting the rows themselves counts GROUPS, which is how "break interviews
+#: down by status" once answered "11 total records" for 10,423 of them.
+_AGGREGATE_COLUMN_RE = re.compile(r"^expr\d+$", re.I)
+
+
+def aggregate_column(rows: Sequence[Mapping[str, Any]]) -> str:
+    """The `exprN` column holding the per-group count, or '' if there is none."""
+    for record in rows:
+        for key in record:
+            if _AGGREGATE_COLUMN_RE.match(str(key)) and _numeric(record.get(key)) is not None:
+                return str(key)
+        break  # every row of one result set has the same shape
+    return ""
+
+
 def calculate(
     rows: Sequence[Mapping[str, Any]],
     *,
@@ -594,12 +612,19 @@ def calculate(
             "counted": len(values),
         }
     if group_by:
+        # A GROUP BY result from Salesforce is ALREADY aggregated: one row per
+        # group, the count in `exprN`. Adding 1 per row counts groups, not
+        # records — every group came out as 1 and every share as 100/n.
+        column = aggregate_column(records)
         buckets: Dict[str, int] = {}
         for record in records:
             key = record.get(group_by)
-            buckets[str(key) if key is not None else "(none)"] = (
-                buckets.get(str(key) if key is not None else "(none)", 0) + 1
-            )
+            label = str(key) if key is not None else "(none)"
+            if column:
+                value = _numeric(record.get(column))
+                buckets[label] = buckets.get(label, 0) + int(value or 0)
+            else:
+                buckets[label] = buckets.get(label, 0) + 1
         denominator = sum(buckets.values()) or 1
         out["groups"] = [
             {
@@ -610,4 +635,13 @@ def calculate(
             for key, count in sorted(buckets.items(), key=lambda kv: -kv[1])
         ]
         out["group_denominator"] = denominator
+        if column:
+            # `total_records` came from totalSize, which for a grouped query is
+            # the NUMBER OF GROUPS. The summed group counts are the population.
+            out["record_count"] = denominator
+            out["grouped_from_aggregate"] = column
+            out["counts_cover"] = (
+                "every matching record, summed from the per-group counts "
+                "Salesforce returned"
+            )
     return out

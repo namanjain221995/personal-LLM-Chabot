@@ -29,6 +29,7 @@ from ...config import settings
 from .. import salesforce
 from .models import SalesforceQueryPlan
 from .plan import (
+    aggregate_column,
     CompiledQuery,
     ObjectSchema,
     PlanRejected,
@@ -391,13 +392,66 @@ async def execute_salesforce_query_plan(
     if next_url and wants_all:
         truncated = True
 
+    # A page of records is NOT a count. Salesforce sets totalSize to what the
+    # LIMIT allowed, so a 200-row page reports "200 matched" for a 225-record
+    # result — the wrong count in TechSara_Fix_Report.pdf. Records mode does
+    # not paginate on purpose (showing 50 rows should not spend the org's API
+    # budget on 2,000), so when the page may be capped the honest total comes
+    # from a SECOND, cheap aggregate carrying the IDENTICAL filters. One extra
+    # API call, no LIMIT, and it is the same shape plan.py already compiles
+    # for result_mode="count" (2026-08-29).
+    total_size = page.get("total_size")
+    may_be_capped = bool(next_url) or len(rows) >= max(1, int(compiled.limit))
+    if not compiled.is_aggregate and may_be_capped:
+        try:
+            # Strip everything that is not a filter. A COUNT() query may not
+            # carry selected fields ("Id is selected alongside an aggregate but
+            # is not in GROUP BY"), an ORDER BY, or an OFFSET — only the same
+            # object and the same WHERE, which is exactly what makes the number
+            # comparable to the list.
+            counted = await compile_and_validate(
+                plan.model_copy(
+                    update={
+                        "result_mode": "count",
+                        "select_fields": [],
+                        "relationship_paths": [],
+                        "aggregate_functions": [],
+                        "group_by": [],
+                        "having": [],
+                        "order_by": [],
+                        "offset": 0,
+                    }
+                )
+            )
+            count_page = await salesforce.run_soql_page(counted.soql)
+            count_rows = count_page.get("rows") or []
+            if count_rows:
+                column = aggregate_column(count_rows) or "count"
+                raw = count_rows[0].get(column)
+                if raw is None and count_rows[0]:
+                    raw = next(iter(count_rows[0].values()))
+                if raw is not None:
+                    total_size = int(raw)
+        except Exception as exc:  # noqa: BLE001 — best effort; never lose the answer
+            # WARNING, not info: when this fails the answer silently reverts to
+            # reporting the page size as the total, which is the exact bug this
+            # exists to prevent. It shipped broken once because the failure was
+            # only visible at info level.
+            log.warning("count companion query failed: %s", str(exc)[:200])
+
     return QueryResult(
         soql=compiled.soql,
         object_api_name=compiled.object_api_name,
         rows=rows[:MAX_TOTAL_RECORDS],
-        total_size=page.get("total_size"),
+        total_size=total_size,
         pages=pages,
-        truncated=truncated or len(rows) > MAX_TOTAL_RECORDS,
+        # Knowing the true total also tells us the page is a SAMPLE, which is
+        # what makes the narration say "200 of 225" instead of "200".
+        truncated=(
+            truncated
+            or len(rows) > MAX_TOTAL_RECORDS
+            or (total_size is not None and total_size > len(rows))
+        ),
         result_mode=compiled.result_mode,
         queried_at=queried_at,
         columns=compiled.columns,

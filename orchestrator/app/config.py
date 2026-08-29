@@ -47,6 +47,40 @@ CHART_TRIGGER_MODES = ("explicit", "hybrid")
 
 
 class Settings:
+
+    #: The warehouse file READERS should open, resolved on every access.
+    #:
+    #: The sync worker publishes a snapshot each cycle and the orchestrator
+    #: reads that, because DuckDB is many-readers-OR-one-writer and reading the
+    #: file being written failed 41.4% of the time — every failure falling back
+    #: to live Salesforce and its 200-row cap. Resolving PER ACCESS matters: the
+    #: first snapshot usually appears minutes after boot, and a value fixed at
+    #: start-up would pin this process to the contended file until restart.
+    @property
+    def duckdb_path(self) -> str:
+        if self._prefer_snapshot and os.path.exists(self.duckdb_snapshot_path):
+            return self.duckdb_snapshot_path
+        return self._duckdb_live_path
+
+    @duckdb_path.setter
+    def duckdb_path(self, value: str) -> None:
+        # An explicit assignment (tests, or an operator pinning a file) wins
+        # outright — otherwise a stale snapshot would silently shadow it.
+        self._duckdb_live_path = value
+        self._prefer_snapshot = False
+
+    @duckdb_path.deleter
+    def duckdb_path(self) -> None:
+        # `monkeypatch.setattr(settings, "duckdb_path", ...)` undoes itself with
+        # delattr, because the name lives on the CLASS rather than the instance.
+        # Without a deleter every test that pins a warehouse file fails in
+        # teardown; restoring the environment's own answer is the honest undo.
+        self._duckdb_live_path = os.environ.get(
+            "DUCKDB_PATH", "/data/warehouse.duckdb"
+        )
+        self._prefer_snapshot = os.environ.get(
+            "DUCKDB_USE_SNAPSHOT", "true"
+        ).lower() not in ("0", "false", "no", "off")
     """Orchestrator settings, resolved from the environment at construction."""
 
     def __init__(self) -> None:
@@ -133,7 +167,25 @@ class Settings:
         self.rerank_timeout: float = _float("RERANK_TIMEOUT", 60.0)
 
         # --- Data stores (defaults match §6/§7 and what the sync-worker writes) ---
-        self.duckdb_path: str = os.environ.get("DUCKDB_PATH", "/data/warehouse.duckdb")
+        # Readers prefer the PUBLISHED snapshot the sync worker renames into
+        # place each cycle. DuckDB is many-readers-OR-one-writer, so reading the
+        # file the worker is writing meant 41.4% of read opens failed with
+        # "Could not set lock" — and every failure fell back to live Salesforce,
+        # whose 200-row cap became the answer to "how many?". The snapshot has
+        # no writer, so nothing can lock a reader out of it. The live file stays
+        # the fallback for a first boot, before any cycle has published
+        # (2026-08-29).
+        self._duckdb_live_path: str = os.environ.get(
+            "DUCKDB_PATH", "/data/warehouse.duckdb"
+        )
+        self.duckdb_snapshot_path: str = os.environ.get("DUCKDB_SNAPSHOT_PATH") or (
+            self._duckdb_live_path[:-7] + ".read.duckdb"
+            if self._duckdb_live_path.endswith(".duckdb")
+            else self._duckdb_live_path + ".read.duckdb"
+        )
+        self._prefer_snapshot: bool = os.environ.get(
+            "DUCKDB_USE_SNAPSHOT", "true"
+        ).lower() not in ("0", "false", "no", "off")
         self.lancedb_dir: str = os.environ.get("LANCEDB_DIR", "/data/lancedb")
         self.lancedb_table: str = os.environ.get("LANCEDB_TABLE", "chunks")
         self.parquet_dir: str = os.environ.get("PARQUET_DIR", "/data/parquet")

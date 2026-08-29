@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import shutil
 import re
 import time
 import uuid
@@ -264,6 +265,43 @@ class Store:
     one short session around the DuckDB operations before the extract and
     one around those after it, and does its network I/O between them.
     """
+
+    #: Readers (the orchestrator) open this file, never the one being written.
+    #: DuckDB allows MANY READERS OR ONE WRITER on a file, so while this worker
+    #: holds the write lock every reader is refused — measured at 41.4% of
+    #: single-shot read opens failing, which is what pushed chat questions onto
+    #: the 200-row-capped live Salesforce path and produced wrong counts.
+    #: Publishing a snapshot removes the contention entirely: the writer keeps
+    #: its own file, readers get one nothing ever locks (2026-08-29).
+    SNAPSHOT_SUFFIX = ".read.duckdb"
+
+    @staticmethod
+    def snapshot_path(db_path: str) -> str:
+        base = db_path[:-7] if db_path.endswith(".duckdb") else db_path
+        return base + Store.SNAPSHOT_SUFFIX
+
+    def publish_snapshot(self) -> str:
+        """Copy the warehouse to the readers' file, atomically.
+
+        os.replace() is atomic within a filesystem, so a reader either opens the
+        previous snapshot or the new one and never a half-written file. A reader
+        already holding the old file keeps serving from it until it closes —
+        the inode outlives the rename — so no query fails mid-flight.
+        """
+        target = self.snapshot_path(self._path)
+        staging = f"{target}.tmp"
+        with self._connection() as con:
+            con.execute("CHECKPOINT")
+        try:
+            shutil.copyfile(self._path, staging)
+            os.replace(staging, target)
+        finally:
+            if os.path.exists(staging):
+                try:
+                    os.remove(staging)
+                except OSError:
+                    pass
+        return target
 
     def __init__(self, db_path: str) -> None:
         parent = os.path.dirname(db_path)
