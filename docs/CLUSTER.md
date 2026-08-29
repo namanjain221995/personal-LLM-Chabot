@@ -289,7 +289,7 @@ Nothing here is a guess; numbers are single-stream unless stated.
 |---|---|---|---|
 | `CLUSTER_SPECULATIVE_CONFIG` MTP `num_speculative_tokens` 1 → 2 | restarted, measured | decode **59–72 tok/s vs 76–81** at k=1; per-draft-token acceptance 62 % (1.25 accepted per step vs ~1.9). vLLM warns at start-up that re-running the single MTP layer lowers acceptance — it does. | keep **1** |
 | `CLUSTER_MAX_NUM_BATCHED_TOKENS` 8192 → 16384 | restarted, measured | prefill 3.9–4.0K tok/s vs 4.0–5.1K at 8192 (noise or slightly worse); +45 s torch.compile for the new range | keep **8192** |
-| `MAIN_MODEL_MAX_LEN` 800000 → 1000000 → **850000** | restarted, measured, laddered | 1M served fine until a real 959,894-token prompt: the GPU ran out of memory (`NVRM: ... NV_ERR_NO_MEMORY`), the engine died and reloaded (~6 min outage). An ascending ladder passed 254,646 (113 s), 485,710 (181 s), 680,020 (222 s) and **825,710 (205 s)** tokens. Settled at 850,000: KV pool 2,979,126 tokens/node, `Maximum concurrency for 850,000 tokens per request: 3.50x`, YaRN 3.25 | **850,000** |
+| `MAIN_MODEL_MAX_LEN` 800000 → 1000000 (with `CLUSTER_KV_CACHE_MEMORY_GIB` 16 → **8**) | restarted, laddered, needle-verified | At KV 16 GiB a real 949,915-token request exhausted unified memory (`NVRM: ... NV_ERR_NO_MEMORY`) and restarted the engine — twice. The KV cache was reserving room for 2.95M tokens in a window that can use 1M; at **8 GiB** the pool still holds 1,494,824 tokens and prefill working memory goes from ~19 GiB to ~37 GiB. The same prompt then completed in 878 s with **3/3 needles recalled**, engine healthy. 262,051 (109 s) and 449,844 (248 s) also 3/3 | **1,000,000, KV 8 GiB** |
 | Decode vs window | five-run medians, same prompts | 69.9 tok/s at 850K, 71.2 at 1M — within noise. An earlier claim that 1M "costs ~10 % decode" compared a median against a single run on a quieter machine and is withdrawn | no window penalty established |
 | `--moe-backend` | read | the experts are `W4A16_NVFP4`, so only the Marlin kernel can run them (`modelopt.py`: every W4A4 backend rejects itself); vLLM selects Marlin on its own and rejects the explicit flag | no lever |
 | Full CUDA graphs for decode | read | FlashInfer on GB10 (sm 12.1) only supports `UNIFORM_SINGLE_TOKEN_DECODE`; with MTP the engine downgrades to `PIECEWISE` (visible in the start-up log). `triton_attn` declares full-graph support and is the untested A/B | not tried (needs a manifest change + A/B) |
@@ -366,15 +366,21 @@ the overlay ships:
 
 ## Limitations (real ones)
 
-0. **The context window is bounded by unified memory on the head node, not by
-   the KV pool or the YaRN ceiling.** The engine starts with 49.4 GiB free and
-   spends 11.35 GiB on weights, 16 GiB on KV and 2.85 GiB on CUDA graphs; the
-   rest is prefill working memory, and a 959,894-token prompt exhausted it
-   (kernel `NV_ERR_NO_MEMORY`, engine restart, ~6 min outage). 825,710 tokens
-   complete in 205 s, so the served window is 850,000. Node 1 also hosts the
-   router, OCR, embeddings, reranker, orchestrator, frontend and PostgreSQL;
-   Node 2 currently has ~68 GiB free. Relocating the auxiliary models to
-   Node 2 is the untested route to a larger window.
+0. **The context window and the KV budget share one pool, and the KV budget is
+   the one that bites.** The engine starts with ~59 GiB free and spends
+   11.35 GiB on weights, 2.85 GiB on CUDA graphs and whatever
+   `CLUSTER_KV_CACHE_MEMORY_GIB` reserves; the rest is prefill working memory.
+   At 16 GiB the cache held room for 2.95M tokens — three times what a 1M
+   window can use — and a real 949,915-token request exhausted the remainder
+   (kernel `NV_ERR_NO_MEMORY`, engine restart, ~6 min outage), twice. At 8 GiB
+   the pool still holds 1,494,824 tokens, working memory is ~37 GiB, and the
+   same request completes in 878 s with all three needles recalled. A *bigger*
+   window therefore wants a *smaller* KV budget. Two caveats that remain real:
+   a cold full-window prompt takes ~15 minutes to prefill, and only 1.49 such
+   requests fit at once. Node 1 also hosts the router, OCR, embeddings,
+   reranker, orchestrator, frontend and PostgreSQL while Node 2 has ~67 GiB
+   free, so relocating the auxiliary models is the untested route to more
+   headroom still.
 
 1. **Fabric ceiling ~13 Gb/s per link.** Root-level investigation needed
    (`sudo mlxlink -d <pci> -m`, `sudo mlxconfig -d <pci> q`, `sudo ethtool -m`,

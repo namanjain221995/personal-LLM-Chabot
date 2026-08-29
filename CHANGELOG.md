@@ -1,5 +1,55 @@
 # Changelog
 
+## A real 1,000,000-token window: the KV cache was starving the prefill (2026-08-29)
+
+The previous entry capped the window at 850,000 because a ~950K-token prompt
+ran the GPU out of memory and restarted the engine. That diagnosis was right
+about the symptom and wrong about the cause: the window was never the problem,
+**the KV cache reservation was**.
+
+`CLUSTER_KV_CACHE_MEMORY_GIB` was 16 — room for **2.95 million tokens** of KV
+in a window that can never use more than 1 million. That over-reservation came
+straight out of the pool the prefill has to work in. Right-sizing it to **8
+GiB** still holds 1,494,824 tokens (a full 1M request plus ~50 % margin) and
+nearly doubles the prefill working memory:
+
+| | KV 16 GiB (before) | KV 8 GiB (now) |
+|---|---|---|
+| Engine free memory at start | 49.4 GiB | 59.06 GiB |
+| Reserved for KV | 16 GiB | 8 GiB |
+| Working memory for prefill | ~19 GiB | **~37 GiB** |
+| KV pool | 2,952,790 tokens | 1,494,824 tokens |
+| Concurrency at full length | 2.95× | 1.49× |
+
+With that one change the prompt that had killed the engine twice now completes
+and answers correctly. Needle recall (needles planted at the start, middle and
+end of the prompt, all three required):
+
+| prompt | result |
+|---|---|
+| 262,051 tokens | **3/3 recalled**, 109 s |
+| 449,844 tokens | **3/3 recalled**, 248 s |
+| **949,915 tokens** | **3/3 recalled**, 878 s — engine healthy, zero restarts |
+
+So `MAIN_MODEL_MAX_LEN=1000000` (YaRN 3.82) is now served *and verified*, not
+just accepted. Decode is unchanged — 71–72 tok/s at 500K, 850K and 1M alike,
+five-run medians on the same prompts; the window costs nothing per token.
+
+**The costs, honestly.** A cold full-window prompt is slow: 949,915 tokens took
+878 s (~15 min) to prefill, which is why `GEN_WALL_CLOCK_S` stays at 4200. And
+only one full-length request fits at a time (1.49×) instead of two — irrelevant
+for ordinary chats, which allocate KV blocks on demand, and the right trade for
+a window that works. If a workload ever needs more concurrency at full length
+than throughput of a single huge prompt, raise `CLUSTER_KV_CACHE_MEMORY_GIB`
+and lower `MAIN_MODEL_MAX_LEN` together.
+
+**Method note.** The earlier 850,000 figure came from an ascending prefill
+ladder that only asked the engine to *read* the prompt and emit four tokens;
+825,710 tokens passed that and a real 800,107-token request still died. Prefill
+ladders are not a safety test — the needle validator, which reads *and* answers
+*and* checks recall, is. Both earlier crash reports are kept in the previous
+entry as the record of how this was found.
+
 ## Review follow-ups: the document route honours the picker, OCR stops truncating, and the context window lands on a measured-safe 850K (2026-08-29)
 
 An adversarial review of the previous entry's change found 17 real defects.
