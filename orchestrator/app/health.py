@@ -13,6 +13,8 @@ time, and the offline test suite mocks the probe functions.
 """
 from __future__ import annotations
 
+import time
+
 import asyncio
 import importlib.util
 from typing import Dict, List, Tuple
@@ -158,24 +160,50 @@ async def _probe_reranker(client: httpx.AsyncClient) -> dict:
     return await asyncio.to_thread(_probe_inprocess_reranker)
 
 
+#: A transient sync-worker write lock is expected, not a fault.
+_HEALTH_LOCK_WAIT_SECONDS = 3.0
+
+
 def _check_duckdb(path: str) -> dict:
     """Open the warehouse read-only (same posture as the sql engine, §8/§12);
     never raises. Blocking — callers run it in a thread."""
     import duckdb  # lazy
 
-    try:
-        con = duckdb.connect(
-            path,
-            read_only=True,
-            config={"enable_external_access": False},
-        )
+    # The config MUST match engines/sql.py exactly. DuckDB refuses a second
+    # connection to one file whose configuration differs from the connection
+    # already open ("Can't open a connection to same database file with a
+    # different configuration"), so a one-key config here turned a perfectly
+    # healthy warehouse into a "degraded" report whenever the SQL engine had
+    # it open — a different failure from a lock, and one no retry recognises.
+    #
+    # The lock retry matters just as much: the sync worker holds the write
+    # lock a large fraction of the time, and both real readers wait for it
+    # (engines/sql.py, core/schema_cache.py). Opening once and reporting
+    # "error" on a transient lock made /health flap for a warehouse that was
+    # about to be readable (2026-08-29).
+    deadline = time.monotonic() + _HEALTH_LOCK_WAIT_SECONDS
+    last: Exception | None = None
+    while True:
         try:
-            con.execute("SELECT 1")
-        finally:
-            con.close()
-    except Exception as exc:
-        return {"status": "error", "detail": f"{type(exc).__name__}: {exc}"}
-    return {"status": "ok"}
+            con = duckdb.connect(
+                path,
+                read_only=True,
+                config={
+                    "enable_external_access": False,
+                    "autoinstall_known_extensions": False,
+                    "autoload_known_extensions": False,
+                },
+            )
+            try:
+                con.execute("SELECT 1")
+            finally:
+                con.close()
+            return {"status": "ok"}
+        except Exception as exc:  # noqa: BLE001 — never raises, by contract
+            last = exc
+            if time.monotonic() >= deadline:
+                return {"status": "error", "detail": f"{type(exc).__name__}: {exc}"}
+            time.sleep(0.25)
 
 
 def _check_embedding_index() -> dict:

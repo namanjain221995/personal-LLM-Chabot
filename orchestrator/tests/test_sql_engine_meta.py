@@ -339,7 +339,10 @@ def test_the_summary_covers_the_whole_result_not_the_preview():
 
     # The summary cap must dwarf the preview cap — it matches the export cap.
     assert settings.sql_summary_row_cap >= 100_000
-    assert settings.sql_summary_row_cap > settings.sql_preview_row_cap * 100
+    # The figures must cover FAR more than the table shows. The exact ratio is
+    # a tuning value (the preview rose 500 -> 2000 on 2026-08-29); what matters
+    # is that the summary population dwarfs the preview.
+    assert settings.sql_summary_row_cap >= settings.sql_preview_row_cap * 10
 
 
 def test_a_full_result_reaches_the_figures_while_the_preview_stays_small():
@@ -373,7 +376,7 @@ def test_a_full_result_reaches_the_figures_while_the_preview_stays_small():
             await sqleng.run_sql_engine("how much did each candidate pay", [], emit)
 
         meta = [d for k, d in events if k == "meta"][-1]
-        assert len(meta["data"]) == 500          # the UI preview cap holds
+        assert len(meta["data"]) == settings.sql_preview_row_cap  # the UI preview cap holds
         assert meta["truncated"] is True
         # …but the AUTHORITATIVE figures cover every row.
         assert '"total_rows": 3000' in fake_stream.prompt

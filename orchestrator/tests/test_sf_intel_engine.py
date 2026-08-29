@@ -1067,7 +1067,17 @@ def test_an_ungrouped_sum_never_claims_a_record_count():
     assert "not queried" in computed["matching_record_count"]
 
 
-def test_grouped_aggregates_keep_the_group_row_semantics():
+def test_grouped_aggregates_report_records_not_groups():
+    """A GROUP BY result is one row PER GROUP with the count in exprN.
+
+    Until 2026-08-29 this counted the group ROWS: "break interviews down by
+    status" answered "there are 11 total Interview__c records ... each status
+    appears exactly once (9.09%)" for an object holding 10,423 of them. Both
+    the population and every share were wrong by three orders of magnitude,
+    and totalSize does not save it — for a grouped query Salesforce sets
+    totalSize to the NUMBER OF GROUPS (here 2), which is why this test used to
+    assert 2.
+    """
     result = _aggregate_result(
         [{"Status__c": "Locked", "expr0": 866}, {"Status__c": "Active", "expr0": 107}],
         ("Status__c", "COUNT(Id)"),
@@ -1075,9 +1085,30 @@ def test_grouped_aggregates_keep_the_group_row_semantics():
         total_size=2,
     )
     computed = tools.calculate_result(result, group_by="Status__c")
-    # Two GROUPS returned; the per-group counts live in the groups breakdown.
-    assert computed["record_count"] == 2
+    assert computed["record_count"] == 973  # 866 + 107, not the 2 groups
+    assert computed["group_denominator"] == 973
+    assert computed["groups"] == [
+        {"value": "Locked", "count": 866, "share_percent": 89.0},
+        {"value": "Active", "count": 107, "share_percent": 11.0},
+    ]
     assert "aggregate_values" not in computed
+
+
+def test_grouped_rows_without_an_aggregate_column_still_count_rows():
+    """Not every grouped shape carries exprN — fall back to counting rows."""
+    result = _aggregate_result(
+        [{"Status__c": "Locked"}, {"Status__c": "Active"}, {"Status__c": "Locked"}],
+        ("Status__c",),
+        result_mode="records",
+        total_size=3,
+    )
+    computed = tools.calculate_result(result, group_by="Status__c")
+    assert computed["group_denominator"] == 3
+    assert computed["groups"][0] == {
+        "value": "Locked",
+        "count": 2,
+        "share_percent": 66.67,
+    }
 
 
 def test_a_records_mode_result_is_untouched_by_the_aggregate_path():
@@ -1107,3 +1138,64 @@ def test_a_plan_without_filters_adds_no_population_noise():
 
     plan = SalesforceQueryPlan(object_api_name="Deliverable__c", result_mode="count")
     assert sf_intel._population_line(plan) == ""
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-29: a records page must never report its own size as the total
+# ---------------------------------------------------------------------------
+
+
+def test_the_count_companion_keeps_the_filters_and_drops_everything_else():
+    """The companion COUNT must be the same question, counted.
+
+    A records query is LIMITed, so Salesforce sets totalSize to what the LIMIT
+    allowed — 200 for a 225-record result. The honest total comes from a second
+    aggregate with the IDENTICAL filters. It must NOT carry the selected
+    fields (SOQL: "Id is selected alongside an aggregate but is not in GROUP
+    BY" — which is how this fix first shipped broken), nor an ORDER BY, nor a
+    LIMIT.
+    """
+    from app.core.sf_intel.models import SalesforceQueryPlan
+    from app.core.sf_intel.plan import build_object_schema, compile_plan
+
+    plan = SalesforceQueryPlan(
+        object_api_name="Interview__c",
+        select_fields=["Id", "Name"],
+        filters=[
+            {"field": "Interview_Status__c", "operator": "eq", "value": "Completed"},
+            {"field": "Round__c", "operator": "eq", "value": "Final"},
+        ],
+        order_by=[{"field": "Name", "direction": "desc"}],
+        limit=200,
+        result_mode="records",
+    )
+    companion = plan.model_copy(
+        update={
+            "result_mode": "count",
+            "select_fields": [],
+            "relationship_paths": [],
+            "aggregate_functions": [],
+            "group_by": [],
+            "having": [],
+            "order_by": [],
+            "offset": 0,
+        }
+    )
+    schema = build_object_schema(
+        {
+            "name": "Interview__c",
+            "fields": [
+                {"name": "Id", "type": "id"},
+                {"name": "Name", "type": "string"},
+                {"name": "Interview_Status__c", "type": "picklist"},
+                {"name": "Round__c", "type": "picklist"},
+            ],
+        }
+    )
+    soql = compile_plan(companion, schema).soql
+
+    assert soql.upper().startswith("SELECT COUNT")
+    assert "LIMIT" not in soql.upper()          # SOQL rejects LIMIT on an aggregate
+    assert "ORDER BY" not in soql.upper()
+    assert "Interview_Status__c = 'Completed'" in soql   # identical filters
+    assert "Round__c = 'Final'" in soql

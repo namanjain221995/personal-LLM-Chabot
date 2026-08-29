@@ -53,10 +53,50 @@ def configured() -> bool:
     )
 
 
-def guard_soql(soql: str) -> str:
+def _outer_select_clause(text: str) -> str:
+    """The SELECT list of the OUTER query, with child subqueries removed.
+
+    `SELECT Id, (SELECT COUNT(Id) FROM Contacts) FROM Account` must not read as
+    an aggregate query: the aggregate belongs to the child. Parenthesised
+    groups are stripped before the split so the first surviving " FROM " is the
+    outer one.
+    """
+    out: List[str] = []
+    index = 0
+    length = len(text)
+    while index < length:
+        char = text[index]
+        if char != "(":
+            out.append(char)
+            index += 1
+            continue
+        # Balanced group: blank it out ONLY when it is a child subquery.
+        # COUNT(Id) is a function call and must keep its parentheses, or the
+        # aggregate test below stops recognising it and a LIMIT gets appended
+        # to a query SOQL forbids one on.
+        depth = 0
+        end = index
+        while end < length:
+            if text[end] == "(":
+                depth += 1
+            elif text[end] == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            end += 1
+        group = text[index : end + 1]
+        out.append(" " * len(group) if re.match(r"\(\s*SELECT\s", group, re.I) else group)
+        index = end + 1
+    return re.split(r"\sFROM\s", "".join(out), maxsplit=1, flags=re.I)[0]
+
+
+def guard_soql(soql: str, *, max_rows: int = MAX_ROWS) -> str:
     """Validate and normalise model-generated SOQL. Raises UnsafeSoql.
 
-    Returns the query with a LIMIT guaranteed.
+    Returns the query with a LIMIT guaranteed, capped at `max_rows`. Callers
+    that page through a whole result set pass a higher ceiling — Salesforce
+    only returns a `nextRecordsUrl` when the LIMIT exceeds one 2,000-row batch,
+    so a hard 200 makes pagination impossible by construction.
     """
     if not soql or not soql.strip():
         raise UnsafeSoql("empty query")
@@ -80,22 +120,36 @@ def guard_soql(soql: str) -> str:
     # the model wrote SELECT COUNT(Id) FROM Contact and the forced LIMIT
     # broke it). An aggregate WITH a GROUP BY returns one row per group, so
     # the row cap still applies there.
-    select_clause = re.split(r"\sFROM\s", text, maxsplit=1, flags=re.I)[0]
+    #
+    # The aggregate test must look at the OUTER select list only. Splitting on
+    # the first " FROM " read `SELECT Id, (SELECT COUNT(Id) FROM Contacts)
+    # FROM Account` as an aggregate query and stripped the LIMIT altogether —
+    # an UNBOUNDED query against a production org, from a child subquery the
+    # SOQL prompt actively tells the model to write (2026-08-29).
+    select_clause = _outer_select_clause(text)
     has_aggregate = re.search(
         r"\b(COUNT|COUNT_DISTINCT|SUM|AVG|MIN|MAX)\s*\(", select_clause, re.I
     )
     has_group_by = re.search(r"\sGROUP\s+BY\s", text, re.I)
     if has_aggregate and not has_group_by:
-        return re.sub(r"\s+LIMIT\s+\d+\s*$", "", text, flags=re.I)
+        return re.sub(r"\s+LIMIT\s+\d+(\s+OFFSET\s+\d+)?\s*$", "", text, flags=re.I)
 
     # Enforce a LIMIT rather than trusting one to be present. A top-level
     # LIMIT that is too high is lowered; a missing one is added.
-    limit_match = re.search(r"\sLIMIT\s+(\d+)\s*$", text, re.I)
+    #
+    # OFFSET is part of the tail: anchoring only on LIMIT missed
+    # "... LIMIT 200 OFFSET 50" and appended a SECOND limit, producing
+    # "... LIMIT 200 OFFSET 50 LIMIT 200" — MALFORMED_QUERY on every paged
+    # request the planner makes (2026-08-29).
+    limit_match = re.search(
+        r"\sLIMIT\s+(\d+)(\s+OFFSET\s+\d+)?\s*$", text, re.I
+    )
     if limit_match:
-        if int(limit_match.group(1)) > MAX_ROWS:
-            text = text[: limit_match.start()] + f" LIMIT {MAX_ROWS}"
+        if int(limit_match.group(1)) > max_rows:
+            offset = limit_match.group(2) or ""
+            text = text[: limit_match.start()] + f" LIMIT {max_rows}{offset}"
     else:
-        text = f"{text} LIMIT {MAX_ROWS}"
+        text = f"{text} LIMIT {max_rows}"
     return text
 
 

@@ -14,10 +14,14 @@ from __future__ import annotations
 import csv
 import re
 import time
+from xml.sax.saxutils import escape as _xml_escape
 from pathlib import Path
 from typing import List, Sequence, Tuple
 
-PREVIEW_ROW_CAP = 500
+#: Rows sent to the browser table. 500 stopped a 225-row answer from showing in
+#: full; 2,000 covers ordinary Salesforce results while still bounding what the
+#: browser must paint. Anything larger belongs in an export, not a DOM table.
+PREVIEW_ROW_CAP = 2000
 EXPORT_ROW_CAP = 100_000
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
@@ -171,6 +175,73 @@ def export_csv(
     return path, truncated
 
 
+#: XML element names cannot start with a digit and may not contain "." or most
+#: punctuation, but Salesforce column keys routinely do: `expr0` is fine,
+#: `Account.Name` is not, and an aliased aggregate can be anything. Sanitising
+#: to a legal Name keeps the document parseable instead of emitting something
+#: only a lenient reader accepts.
+_XML_NAME_BAD = re.compile(r"[^A-Za-z0-9_.\-]")
+
+
+def xml_element_name(key: str, fallback: str = "field") -> str:
+    """A legal XML element name for an arbitrary column key."""
+    name = _XML_NAME_BAD.sub("_", str(key or "").strip()).replace(".", "_")
+    name = name.lstrip("-.")
+    if not name:
+        return fallback
+    if not (name[0].isalpha() or name[0] == "_"):
+        name = f"_{name}"
+    if name[:3].lower() == "xml":
+        name = f"_{name}"
+    return name
+
+
+def rows_to_xml(
+    rows: Sequence[dict],
+    root: str = "records",
+    row_tag: str = "record",
+    cap: int = EXPORT_ROW_CAP,
+) -> str:
+    """Serialise rows as XML, capped like every other export.
+
+    Attribute values are quoted (an unquoted `truncated=1` is rejected by every
+    conformant parser — and it would appear precisely in the truncated case the
+    attribute exists to signal), and every key is sanitised into a legal
+    element name.
+    """
+    capped, was_capped = apply_export_cap(list(rows), cap)
+    out: List[str] = ['<?xml version="1.0" encoding="UTF-8"?>']
+    root_tag = xml_element_name(root, "records")
+    item_tag = xml_element_name(row_tag, "record")
+    out.append(
+        f'<{root_tag} count="{len(capped)}"'
+        + (' truncated="true"' if was_capped else "")
+        + ">"
+    )
+    for row in capped:
+        out.append(f"  <{item_tag}>")
+        for key, value in (row or {}).items():
+            tag = xml_element_name(key)
+            text = "" if value is None else _xml_escape(str(value))
+            out.append(f"    <{tag}>{text}</{tag}>")
+        out.append(f"  </{item_tag}>")
+    out.append(f"</{root_tag}>")
+    return "\n".join(out)
+
+
+def export_xml(
+    rows: Sequence[dict],
+    directory,
+    slug: str = "export",
+    cap: int = EXPORT_ROW_CAP,
+) -> Tuple[Path, bool]:
+    """Write a .xml file next to the csv/xlsx exports. Returns (path, truncated)."""
+    capped, truncated = apply_export_cap(list(rows), cap)
+    path = Path(directory) / timestamped_filename(slug, "xml")
+    path.write_text(rows_to_xml(capped, cap=cap), encoding="utf-8")
+    return path, truncated
+
+
 __all__: List[str] = [
     "PREVIEW_ROW_CAP",
     "EXPORT_ROW_CAP",
@@ -181,5 +252,8 @@ __all__: List[str] = [
     "export_xlsx",
     "export_workbook",
     "export_csv",
+    "export_xml",
+    "rows_to_xml",
+    "xml_element_name",
     "safe_sheet_name",
 ]

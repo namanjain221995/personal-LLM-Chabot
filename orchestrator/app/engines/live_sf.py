@@ -138,13 +138,27 @@ def is_schema_question(text: str) -> bool:
     return bool(_SCHEMA_RE.search(t) and _COUNT_OR_LIST_RE.search(t))
 
 
+#: "how many objects", "which objects", "list all objects/tables/entities" —
+#: a question about the ORG'S SHAPE rather than about one object's fields.
+_ORG_SHAPE_RE = re.compile(
+    r"\b(how many|number of|count of|list|which|what)\b[^?]{0,40}"
+    r"\b(objects?|sobjects?|tables?|entities)\b",
+    re.I,
+)
+
+
 async def fetch_schema(question: str) -> Tuple[str, str]:
     """Answer a schema question from the describe API. → (source, text)."""
     from ..core import salesforce as sf
 
     named = _OBJECT_NAME_RE.findall(question or "")
+    # "How many objects does my org have, AND what fields does Interview__c
+    # have?" names an object and asks about the whole org. Returning only the
+    # named object's fields made the model answer "1 object" for an org with
+    # 1,439 — a compound question is natural and both halves must be answered
+    # (2026-08-29).
+    wants_org_shape = bool(_ORG_SHAPE_RE.search(question or ""))
     if named:
-        # Asked about specific objects: give their fields.
         blocks = []
         for name in list(dict.fromkeys(named))[:3]:
             try:
@@ -153,14 +167,15 @@ async def fetch_schema(question: str) -> Tuple[str, str]:
                 continue
             fields = ", ".join(f"{f['name']} ({f['type']})" for f in d["fields"])
             blocks.append(f"{d['name']} — {len(d['fields'])} fields:\n{fields}")
-        if blocks:
+        if blocks and not wants_org_shape:
             return "describe", "\n\n".join(blocks)
 
     objects = await sf.list_objects()
     custom = [o for o in objects if o["custom"]]
     standard = [o for o in objects if not o["custom"]]
     listing = ", ".join(o["name"] for o in objects)
-    return "sobjects", (
+    prefix = ("\n\n".join(blocks) + "\n\n") if (named and wants_org_shape and blocks) else ""
+    return ("describe+sobjects" if prefix else "sobjects"), prefix + (
         f"This org exposes {len(objects)} queryable objects to this user: "
         f"{len(custom)} custom and {len(standard)} standard.\n\n"
         f"API names:\n{listing}"
