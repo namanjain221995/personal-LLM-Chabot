@@ -23,6 +23,11 @@ open http://localhost:3000
 
 ---
 
+> **New here? Start with the pictures.** [`docs/FLOWS.md`](docs/FLOWS.md) draws
+> every flow in this system — the three answering modes, all five models and
+> what each is for, engine dispatch, the crawler, web memory, citations,
+> Salesforce and the streaming contract.
+
 ## Table of contents
 
 1. [What it does](#1-what-it-does)
@@ -35,6 +40,7 @@ open http://localhost:3000
 8. [Services, ports, networks, volumes](#8-services-ports-networks-volumes)
 9. [Configuration reference (`.env`)](#9-configuration-reference-env)
 10. [How a chat message is answered](#10-how-a-chat-message-is-answered)
+    - [10a. Three ways to answer: chat, web search, Deep Research](#10a-three-ways-to-answer-chat-web-search-deep-research)
 11. [The engines](#11-the-engines)
 12. [Salesforce: sync, warehouse, live queries](#12-salesforce-sync-warehouse-live-queries)
 13. [The Salesforce Brain (knowledge packs)](#13-the-salesforce-brain-knowledge-packs)
@@ -65,15 +71,17 @@ plain language. The platform:
 | Toggle **Live Salesforce** | Queries the org directly (read-only integration user); live values win when merged with warehouse rows | `engines/live_sf.py` |
 | Attach a PDF/DOCX, images, a CSV/XLSX/ZIP dataset | Images are downscaled in the browser to 1600 px on the long edge before upload (2026-08-29); reads **every page** of documents (OCR sidecar for scanned pages), answers about uploaded data from a safe profile or the full table when small, generates real PDF/DOCX reports | `engines/document.py`, `dataset.py`, `dataset_report.py` |
 | Paste a URL or a GitHub repo link | Fetches the pages (SSRF-safe) or shallow-clones the repo (code never executed) and answers with sources / `path:Lstart-Lend` citations | `engines/url.py`, `repo.py` |
-| Turn on **Web search** (assistant mode) | Multi-query search through SearXNG/Tavily/Brave, reads the sources, cites them; at *Max* effort runs deep research | `engines/search.py` |
+| Turn on **Web search** (assistant mode) | Multi-query search through SearXNG (self-hosted, keyless), reranks the candidates with a cross-encoder, reads the best sources and cites them — ~20 s | `engines/search.py` |
+| Turn on **Deep research** (assistant mode) | Plans the question into subquestions, searches, reads, **audits what is still missing**, searches again, then writes a structured report where every `[n]` is validated against the pages actually fetched — ~2-3 min | `engines/deep_research.py` |
+| "index this site `<url>`" | Robots-respecting, sitemap-first crawl of one whole site into the web store, then answers follow-up questions from the stored copy | `engines/crawl.py` |
 | "Write a report on Q3 placements" | Plans sections, fills them with SQL/RAG, renders charts, emits `.docx` + `.pdf` | `engines/report.py` |
 | Thumbs up on a SQL answer | That SQL becomes a **few-shot example** for similar future questions; a thumbs-down anywhere disqualifies it globally | `core/learned_examples.py` |
 | Chat across sessions | **Cross-chat memory**: durable facts extracted in the background, semantic + keyword recall over earlier conversations, rolling compaction so long threads never overflow the model window | `facts.py`, `memory_semantic.py`, `compaction.py` |
 
 UI features (all in [`frontend/`](frontend/)): ChatGPT-style shell with sidebar
 (pinned / recent / archived), search palette (`Ctrl/Cmd+K`), effort picker
-(**Fast / Think / Max**), `+` menu (files, web search, Salesforce, live
-Salesforce), paste-as-chip for long text, reasoning accordion, agent step
+(**Fast / Think / Max**), `+` menu (files, web search, **deep research**,
+Salesforce, live Salesforce), paste-as-chip for long text, reasoning accordion, agent step
 timeline, activity/research drawer, proof drawer (SQL · sources · code · data ·
 chart · files), nine chart types (ECharts), Mermaid diagrams with zoom and PNG
 export, context meter with **Compact now**, background generation that
@@ -434,6 +442,8 @@ the keys that matter most — every key is documented in the example file:
 | Optional services | `SEARCH_ENABLED`, `SEARCH_PROVIDER=searxng|tavily|brave`, `TAVILY_API_KEY`, `BRAVE_API_KEY`, `COMPOSE_PROFILES=search,admin` |
 | Two-node cluster | `CLUSTER_MODE=auto|single|dual`; optional overrides `CLUSTER_HEAD_IP`, `CLUSTER_WORKER_IP`, `_2` variants, `CLUSTER_WORKER_SSH`, `CLUSTER_MASTER_PORT=29501`, `CLUSTER_TENSOR_PARALLEL_SIZE=2`, `CLUSTER_PIPELINE_PARALLEL_SIZE=1`, `CLUSTER_GPU_MEMORY_UTILIZATION=0.30`, `CLUSTER_KV_CACHE_MEMORY_GIB=16`, `CLUSTER_NCCL_*`, `CLUSTER_SPECULATIVE_CONFIG`, `CLUSTER_MAX_NUM_BATCHED_TOKENS` |
 | Search / fetch / repos | `SEARCH_MAX_RESULTS`, `SEARCH_SOURCE_CHAR_BUDGET`, `SEARCH_RATE_PER_MIN`, `SEARCH_CACHE_TTL`, `FETCH_TIMEOUT_MS`, `FETCH_MAX_BYTES`, `URL_ANALYSIS_ENABLED`, `URL_MAX_PAGES`, `REPO_ANALYSIS_ENABLED`, `REPO_MAX_MB`, `REPO_MAX_FILES`, `WORKSPACE_TTL_HOURS=24`, `WORKSPACE_QUOTA_GB=20` |
+| Web memory / crawler | `WEB_MEMORY_ENABLED`, `LANCEDB_WEB_DIR`, `WEB_PAGE_TTL_S=86400`, `WEB_PAGE_FRESH_TTL_S=3600`, `WEB_CRAWL_ENABLED`, `WEB_CRAWL_MAX_PAGES=1000`, `WEB_CRAWL_MAX_MINUTES=15`, `WEB_CRAWL_MAX_DEPTH=4`, `WEB_CRAWL_CONCURRENCY=3`, `WEB_CRAWL_DELAY_MS=400`, `WEB_EXPAND_AFTER_SEARCH`, `WEB_EXPAND_PAGES_PER_DOMAIN=8`, `WEB_EXPAND_MAX_DOMAINS=3` |
+| Deep Research | `DEEP_RESEARCH_ENABLED`, `DEEP_RESEARCH_MAX_ITERATIONS=3`, `DEEP_RESEARCH_MAX_QUERIES_PER_ITERATION=5`, `DEEP_RESEARCH_SOURCES_PER_ITERATION=10`, `DEEP_RESEARCH_MAX_SOURCES=24`, `DEEP_RESEARCH_MIN_SOURCES=6`, `DEEP_RESEARCH_TIMEOUT_S=600`, `DEEP_RESEARCH_REPORT_MAX_TOKENS=6000` — every default is derived from measurement, see [`docs/01-codebase/deep-research.md`](docs/01-codebase/deep-research.md) |
 | Model window | **`MAIN_MODEL_MAX_LEN`** — the served context window (see [§9.1](#91-the-context-window)); `MODEL_MAX_OUTPUT=8192`, `CONTEXT_SAFETY_MARGIN`, `TOKENIZE_TIMEOUT`, `MAIN_MODEL_DEFAULT_MAX_OUTPUT_TOKENS`, `MAIN_MODEL_HIGH_MAX_OUTPUT_TOKENS=16384`, `MAIN_MODEL_CONTEXT_SAFETY_MARGIN=8192`; `GEN_WALL_CLOCK_S=1800` (raise it alongside a very large window) |
 | Salesforce Intelligence | `SALESFORCE_INTELLIGENCE_MODE_ENABLED`, `SALESFORCE_CONTEXTUAL_CLARIFICATION_ENABLED`, `SALESFORCE_STARTER_CARD_ENABLED`, `SALESFORCE_MAX_CLARIFICATION_ROUNDS=2`, `SALESFORCE_MULTI_SELECT_CLARIFICATION`, `CLARIFY_MODE=ambiguous|always|off`, `ROUTER_INPUT_CHAR_CAP`, `EMBED_INPUT_CHAR_CAP` |
 | Brain / learning | `BRAIN_ENABLED=true`, `BRAIN_MAX_CHARS`, `LEARNED_EXAMPLES_ENABLED=true`, `LEARNED_EXAMPLES_K=2` |
@@ -604,7 +614,9 @@ container IP. Each appears exactly once per process start.
 | `report.py` | `report` | ≤6 planned sections filled via sql/rag, matplotlib PNGs, Markdown → `.docx` + `.pdf` (pandoc + WeasyPrint) into `/reports` | router `report` |
 | `chat.py` | `chat` | Plain streamed completion (assistant or Salesforce small-talk prompt) | assistant mode, router `chat` |
 | `agent.py` | `agent` | PLAN → EXECUTE (≤8 steps of `sql|rag|llm|web|salesforce`, concurrency 3, `step` events) → SYNTHESIZE; grounded on the user's own sentence, not the planner's paraphrase | agent toggle or auto-plan |
-| `search.py` | `search` | Query rewrite → 1–6 queries → provider → SSRF-safe fetch (16 concurrent) → extraction → tiered budget → cited answer; cache + per-user rate limit; deep research at *Max* | assistant mode + search wanted |
+| `search.py` | `search` | Query rewrite (router model) → 1–6 parallel queries → round-robin merge, per-domain cap → **cross-encoder rerank** → warm store or SSRF-safe fetch (16 concurrent) → extraction → tiered budget → memory chunks → cited answer; SERP cache + per-user rate limit | assistant mode + search wanted |
+| `deep_research.py` | `deep_research` | **The iterative mode.** Plan → search → read → **audit the gaps** → search again (≤3 rounds) → streamed cited report, with every `[n]` validated against the pages actually fetched. One run at a time; run recorded in `research_runs`. See [`docs/01-codebase/deep-research.md`](docs/01-codebase/deep-research.md) | the **Deep research** pill (explicit only) |
+| `crawl.py` | `crawl` | "index this site `<url>`" — robots-respecting, sitemap-first crawl of one site into the web store (caps: 1000 pages / 15 min), then follow-up Q&A answered from the stored copy | crawl intent + URL, or a crawled site in the conversation |
 | `url.py` | `url` | Fetch pasted links safely, store page text, answer with sources | links are the request |
 | `repo.py` | `repo` | Shallow capped clone of a public GitHub repo (hooks off, never executed) → 60-line chunks → overview / code Q&A with `path:Lstart-Lend` | GitHub URL or an indexed repo in the conversation |
 | `dataset.py` / `dataset_report.py` | `dataset` | Answers from a safe **profile** of uploaded CSV/XLSX/ZIP data (full rows when ≤200) wrapped in "DATA, NOT INSTRUCTIONS" delimiters; report variant computes headline facts in Python | uploads exist in the conversation |
@@ -740,7 +752,8 @@ code in [`orchestrator/app/core/sf_intel/`](orchestrator/app/core/sf_intel/) and
 
 | Store | Where | Contents |
 |---|---|---|
-| **PostgreSQL 18** (app state) | `pgdata` volume, `APP_DATABASE_URL` (no default — fails loudly) | schema **v7** ([`db.py`](orchestrator/app/db.py), 7 transactional migrations under an advisory lock): `users`, `conversations`, `messages` (+ `feedback`, `generation_id`), `conversation_summaries`, `conversation_chunks`, `uploads`, `url_documents`, `documents`, `repos`, `repo_chunks`, `sf_intents`, `sf_clarifications`, `sf_conversation_state`, `user_facts`, `message_embeddings`, `schema_migrations` |
+| **PostgreSQL 18** (app state) | `pgdata` volume, `APP_DATABASE_URL` (no default — fails loudly) | schema **v11** ([`db.py`](orchestrator/app/db.py), 11 transactional migrations under an advisory lock): `users`, `conversations`, `messages` (+ `feedback`, `generation_id`), `conversation_summaries`, `conversation_chunks`, `uploads`, `url_documents`, `documents`, `repos`, `repo_chunks`, `sf_intents`, `sf_clarifications`, `sf_conversation_state`, `user_facts`, `message_embeddings`, `schema_migrations`, **`web_searches`, `web_results`, `web_pages`** (V8 web memory — the page store is global and deduped by normalised URL), **`web_crawls`** (V9), **`research_runs`** (V11 — one row per Deep Research run: question, counts, report, citation registry) |
+| **LanceDB (web)** | `/data/lancedb-web`, table `web_chunks` | embedded chunks of every web page read, so a later question in any conversation can reuse them. **Derived state** — deleting it is safe, PostgreSQL rebuilds it |
 | **DuckDB** warehouse | `/data/warehouse.duckdb` (`data` volume) | one `VARCHAR` table per synced Salesforce object + `_sync_meta`, `_rag_index_pending`; opened read-only by the orchestrator |
 | **Parquet** | `/data/parquet/<Object>/` | one file per sync batch (landing zone; not read back, no retention) |
 | **LanceDB** | `/data/lancedb`, table `chunks` | 800-word chunks of long-text fields with `object`, `record_id`, `field`; a sidecar pins the embedding model + dimension and refuses mismatched indexes rather than silently re-labelling them |
@@ -779,7 +792,7 @@ All under `http://<orchestrator>:8080`. There is no authentication (see §20).
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/health` | dependency probes (`vllm`, `vllm-router`, `vllm-embed`, `duckdb`, `app_db`, …), served window vs configured, serving flags; `status: ok|degraded`, always HTTP 200 |
-| `POST` | `/chat` | the SSE chat endpoint (`ChatRequest`: `messages` or `message`, `conversation_id`, `mode: salesforce|assistant`, `sf_live`, `model: smart|fast`, `effort: fast|think|max`, `agent`, `web_search: off|auto|on`, `images[]`, `pdf`, `clarification`) |
+| `POST` | `/chat` | the SSE chat endpoint (`ChatRequest`: `messages` or `message`, `conversation_id`, `mode: salesforce|assistant`, `sf_live`, `model: smart|fast`, `effort: fast|think|max`, `agent`, `web_search: off|auto|on`, **`deep_research`**, `images[]`, `pdf`, `clarification`) |
 | `GET` | `/chat/attach/{conversation_id}` | re-join a running generation (replays the buffer, then live; 404 once finished) |
 | `POST` | `/chat/stop` · `GET /chat/active` · `POST /chat/compact` | cancel, list running, force compaction |
 | `GET` | `/chat/salesforce/{conversation_id}` · `POST /chat/salesforce/cancel` | starter options + pending clarification; dismiss it |
@@ -789,7 +802,11 @@ All under `http://<orchestrator>:8080`. There is no authentication (see §20).
 | `GET` | `/reports` · `/reports/{filename}` | generated files |
 | `GET` | `/auth/me` | the single local identity |
 
-`meta.route` values: `sql | rag | vision | report | chat | agent | search | url | repo | dataset | clarify`.
+`meta.route` values: `sql | rag | vision | report | chat | agent | search | deep_research | crawl | url | repo | dataset | clarify`.
+
+A `deep_research` turn also carries `meta.research_run`: `iterations`,
+`queries`, `subquestions`, `sources_found`, `sources_cited`, `missing`,
+`contradictions`, `elapsed_s` and `invalid_citations_removed`.
 Contracts in detail: [`docs/01-codebase/frontend-api-contracts.md`](docs/01-codebase/frontend-api-contracts.md).
 
 ---
@@ -969,6 +986,8 @@ and whether every container was recreated or only the changed ones.
 
 Current (2026-08):
 
+- [`docs/FLOWS.md`](docs/FLOWS.md) — **every flow as a diagram**: the three answering modes, all five models, engine dispatch, crawler, web memory, citations, Salesforce, streaming
+- [`docs/01-codebase/deep-research.md`](docs/01-codebase/deep-research.md) — the iterative research engine: loop, budgets, citation validation, category routing, `research_runs`
 - [`docs/README.md`](docs/README.md) — index and reading order
 - [`docs/PORTABLE-RUNTIME.md`](docs/PORTABLE-RUNTIME.md) — launcher design: detection, selection, model policy, state, fallback, upgrades
 - [`docs/CLUSTER.md`](docs/CLUSTER.md) — the two-node DGX Spark cluster: measurements, configuration, failure behaviour
@@ -996,7 +1015,7 @@ numbers, counts, topology and finding status are not current): the rest of
 - **Node 2 runs an unrelated older `sf-local-ai` stack** (Qwen3.6-35B on port 8000) that competes for its memory; it was left untouched.
 - **Health semantics**: `/health` may report `degraded` transiently during sync writes (§12); `/v1/models` on the main model answers even when the engine is dead — use `scripts/cluster-status.sh --probe` or a real completion as the truth.
 - **Sync worker**: Parquet landing files are never read back and never pruned; a Bulk job stuck `InProgress` polls forever; API-limit warnings do not throttle; a full-size Long Text Area can exceed the CSV field limit and abort that object's extract; `SYNC_AUTO_FIELDS=off` parses as *true* (only `0/false/no` disable it).
-- **Docs drift**: `docs/01-codebase/data-model.md` and `sync-worker.md` describe the 48-object era (now ~1,020 objects, deletes *are* propagated, 7 migrations); some frontend docs still say Next 15 and four effort levels (it is Next 16 and three).
+- **Docs drift**: `docs/01-codebase/data-model.md` and `sync-worker.md` describe the 48-object era (now ~1,020 objects, deletes *are* propagated, 11 migrations); some frontend docs still say Next 15 and four effort levels (it is Next 16 and three).
 - **Housekeeping**: a stray git-tracked DuckDB file named `→` sits at the repo root (a shell-redirection accident); `brain/sources/` contains a duplicated 1 MB knowledge base; two top-level `customer-success-*.txt` files duplicate `brain/sources/`.
 - **Reproducibility**: the npm lockfile is committed; the two Python services use ranged requirements without hashes.
 - **Single user, no auth** by design (§20).
