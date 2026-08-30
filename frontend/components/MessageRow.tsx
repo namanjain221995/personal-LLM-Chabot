@@ -533,7 +533,7 @@ export function MessageRow({
           className="mb-2"
         />
       )}
-      {message.searchStatus && message.content.length === 0 && (
+      {message.searchStatus && streaming && message.content.length === 0 && (
         <LiveStatus
           text={message.searchStatus}
           effortNote={

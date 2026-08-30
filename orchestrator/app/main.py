@@ -739,20 +739,58 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 and not request.image_data
                 and github_ref is None
             ):
-                from .engines.crawl import detect_crawl, site_hits_for
+                from .engines.crawl import (
+                    _URL_RE,
+                    detect_crawl,
+                    detect_resume,
+                    site_hits_for,
+                )
 
                 crawl_url = detect_crawl(request.text)
-                if crawl_url is None and request.conversation_id:
+                if (
+                    crawl_url is None
+                    and request.conversation_id
+                    and detect_resume(request.text)
+                ):
+                    # "Continue crawling" names no URL — the capped-crawl
+                    # message advertises the phrase, so it must actually
+                    # route here: it means the newest crawl in THIS
+                    # conversation (review round, 2026-08-30).
                     try:
-                        # Follow-up: does a crawled site in this conversation
-                        # hold relevant material? Cheap (one embed + a scoped
-                        # flat scan, ~60 ms) and decisive — no hits above the
-                        # relevance floor means normal routing proceeds.
-                        crawl_site_hits, crawl_site_host = await site_hits_for(
-                            conv_key, request.text
+                        sites = await db.run_in_thread(
+                            db.get_conversation_crawl_sites, conv_key
                         )
+                        if sites:
+                            crawl_url = sites[0]["root_url"]
                     except Exception:
-                        crawl_site_hits = []
+                        crawl_url = None
+                if (
+                    crawl_url is None
+                    and request.conversation_id
+                    # Explicit wishes outrank the stored copy: the forced
+                    # web pill means LIVE search, a pasted URL means THAT
+                    # page, the agent toggle means a plan, and fresh-intent
+                    # wording ("latest", "today") should never be answered
+                    # from a crawl snapshot (review round, 2026-08-30).
+                    # Skipping also skips this pre-pass's embed round trip.
+                    and request.web_search != "on"
+                    and not request.agent
+                    and not _URL_RE.search(request.text)
+                ):
+                    from .engines.search import _FRESH_RE
+
+                    if not _FRESH_RE.search(request.text):
+                        try:
+                            # Follow-up: does a crawled site in this
+                            # conversation hold relevant material? Cheap (one
+                            # embed + a scoped flat scan, ~60 ms) and decisive
+                            # — no hits above the relevance floor means normal
+                            # routing proceeds.
+                            crawl_site_hits, crawl_site_host = await site_hits_for(
+                                conv_key, request.text
+                            )
+                        except Exception:
+                            crawl_site_hits = []
 
             # Phase 2: URL analysis. Pasted links → fetch+read; a follow-up with
             # no new link but pages already read this chat → inject their
@@ -1125,6 +1163,8 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     # current-events question from training memory under a
                     # trust line saying searches go to the internet.
                     web_forced=(request.web_search == "on"),
+                    user_id=int(signed_in["id"]) if signed_in is not None else None,
+                    conversation_id=conv_key,
                 )
             elif want_search and (request.web_search == "on" or not dataset_ready):
                 # Phase 1: web search — cited answer from fetched sources.
@@ -1132,7 +1172,14 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 # reason as the agent above; an explicit "on" still wins.
                 from .engines.search import run_search_engine
 
-                answer = await run_search_engine(text, history, emit, request.effort)
+                answer = await run_search_engine(
+                    text,
+                    history,
+                    emit,
+                    request.effort,
+                    user_id=int(signed_in["id"]) if signed_in is not None else None,
+                    conversation_id=conv_key,
+                )
             elif dataset_ready:
                 # Phase 4: this conversation has uploaded datasets — answer
                 # from their stored PROFILES (never the files themselves).

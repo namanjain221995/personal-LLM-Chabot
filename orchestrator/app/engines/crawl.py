@@ -46,13 +46,39 @@ Emit = Callable[[str, dict], Awaitable[None]]
 
 #: "index/crawl/scrape <url>" — intent word + URL. A bare pasted URL is NOT a
 #: crawl (that is the single-page URL engine); asking to read "this site/whole
-#: site/all pages" is.
+#: site/all pages" is. Matched against the message with every URL replaced by
+#: the token `<url>`: the review found "what does …/index.html say" and any
+#: URL containing "index"/"scrape" in its PATH launching thousand-page crawls.
+#: "index" is also the one intent word that is an everyday noun, so alone it
+#: only counts followed by an object ("index this site", "index <url>") —
+#: crawl/scrape/mirror/ingest stay strong verbs on their own.
+_INTENT_WORD = (
+    # -ing/-ed forms included ("continue crawling <url>"), but never the
+    # agent nouns: "the crawler at <url>" and "a scraper for <url>" describe
+    # software, not a request.
+    r"(?:\b(?:crawl(?:ing|ed)?|scrap(?:e|ing|ed)|mirror(?:ing)?|ingest(?:ing|ed)?)\b"
+    # Lookahead, not consumption: when the object IS the URL ("index
+    # <url>"), the URL token must stay available for the outer match.
+    r"|\bindex\b(?=\s+(?:<url>|this|that|the|its|whole|entire|all|every|site|website|page|docs|documentation))"
+    r")"
+)
 _INTENT_RE = re.compile(
-    r"\b(crawl|scrape|index|ingest|mirror)\b.{0,60}?\bhttps?://|"
-    r"\bhttps?://\S+.{0,60}?\b(crawl|scrape|index|ingest|whole site|entire site|all (the )?pages)\b",
+    _INTENT_WORD + r".{0,80}?<url>"
+    r"|<url>.{0,80}?(?:" + _INTENT_WORD
+    + r"|\bwhole site\b|\bentire site\b|\ball (?:the )?pages\b|\bevery page\b)",
     re.I | re.S,
 )
 _URL_RE = re.compile(r"https?://[^\s<>\"')\]]+", re.I)
+
+#: "continue/resume crawling" — the resume phrase the capped-crawl message
+#: advertises. It carries no URL, so detect_crawl can never see it; the
+#: dispatcher checks this against the conversation's crawled sites instead
+#: (the review found the advertised phrase routing to ordinary site Q&A).
+_RESUME_RE = re.compile(
+    r"\b(?:continue|resume|keep|finish)\b.{0,40}?\b(?:crawl\w*|index\w*|scrap\w*)\b"
+    r"|\b(?:crawl|index|scrape)\b.{0,30}?\b(?:more|the rest|remaining)\b",
+    re.I | re.S,
+)
 
 _SITEMAP_LOC_RE = re.compile(r"<loc>\s*([^<\s]+)\s*</loc>", re.I)
 _SITEMAP_INDEX_RE = re.compile(r"<\s*sitemapindex", re.I)
@@ -68,7 +94,7 @@ _SKIP_EXT_RE = re.compile(
 
 def detect_crawl(text: str) -> Optional[str]:
     """The URL to crawl, when the message asks for a whole-site crawl."""
-    if not text or not _INTENT_RE.search(text):
+    if not text:
         return None
     m = _URL_RE.search(text)
     if not m:
@@ -77,7 +103,17 @@ def detect_crawl(text: str) -> Optional[str]:
     parts = urlparse(url)
     if parts.scheme not in ("http", "https") or not parts.hostname:
         return None
+    # Words inside a URL are addresses, not requests: match intent against
+    # the message with URLs collapsed to a token.
+    tokenized = _URL_RE.sub(" <url> ", text)
+    if not _INTENT_RE.search(tokenized):
+        return None
     return url
+
+
+def detect_resume(text: str) -> bool:
+    """True when the message asks to continue an earlier crawl."""
+    return bool(text) and bool(_RESUME_RE.search(text)) and not _URL_RE.search(text)
 
 
 @dataclass
@@ -171,7 +207,13 @@ async def _fetch_page(url: str) -> Tuple[str, extract.Extracted, List[str], str]
     return fetched.url, extracted, links, fetched.content_type
 
 
-def _store(url: str, final_url: str, ext: extract.Extracted, content_type: str) -> None:
+def _store(
+    url: str,
+    final_url: str,
+    ext: extract.Extracted,
+    content_type: str,
+    links: Optional[List[str]] = None,
+) -> None:
     db.upsert_web_page(
         url_key=_normalize_url(url),
         url=url,
@@ -181,6 +223,7 @@ def _store(url: str, final_url: str, ext: extract.Extracted, content_type: str) 
         content_type=content_type,
         fetch_status=200 if ext.text else 0,
         content_hash=hashlib.sha256((ext.text or "").encode("utf-8")).hexdigest(),
+        links=links or [],
     )
 
 
@@ -211,7 +254,13 @@ async def _crawl_site(
     if walk_links:
         frontier = [(root_url, 0)]
     else:
-        frontier = [(u, 0) for u in sitemap_urls[: max_pages * 2]]
+        # The full sitemap (bounded for memory), NOT max_pages*2: pages past
+        # that slice could never be reached by ANY number of resumes, which
+        # silently contradicted the resume promise (review, 2026-08-30). The
+        # quiet background expansion keeps the tight slice — its whole point
+        # is smallness.
+        cut = max_pages * 2 if quiet else 20_000
+        frontier = [(u, 0) for u in sitemap_urls[:cut]]
     pages_found = len(sitemap_urls) if not walk_links else 0
 
     # Politeness: few concurrent connections to ONE host, spaced out. The
@@ -236,7 +285,16 @@ async def _crawl_site(
             age = time.time() - fetched_at.timestamp() if fetched_at else ttl + 1
             if age <= ttl and (stored[0].get("text") or "").strip():
                 state.from_store += 1
-                return []  # fresh already; links only matter in walk mode, skip
+                # The stored copy keeps the links its HTML pointed at (V10) —
+                # without them, walk mode dead-ended on every warm page and a
+                # "resume" re-read the store and stopped (review, 2026-08-30).
+                if not walk_links or depth >= settings.web_crawl_max_depth:
+                    return []
+                return [
+                    (l, depth + 1)
+                    for l in (stored[0].get("links") or [])
+                    if _in_scope(state, l) and _normalize_url(l) not in state.visited
+                ]
         async with sem:
             try:
                 final_url, ext, links, ctype = await _fetch_page(url)
@@ -250,7 +308,7 @@ async def _crawl_site(
             state.failed += 1
             return []
         if ext.text.strip():
-            await db.run_in_thread(_store, url, final_url, ext, ctype)
+            await db.run_in_thread(_store, url, final_url, ext, ctype, links)
             state.fetched += 1
         else:
             state.failed += 1
@@ -265,16 +323,29 @@ async def _crawl_site(
     status_at = 0.0
     capped = False
     while frontier:
-        done_count = state.fetched + state.from_store
-        if done_count >= max_pages:
+        # Only network fetches consume the page budget. Pages served fresh
+        # from the store are free — otherwise a resume spent its whole budget
+        # re-counting what the last run stored and stopped at the same spot
+        # every time (review, 2026-08-30). Wall-clock still bounds the loop.
+        if state.fetched >= max_pages:
             capped = True
             break
         if time.monotonic() - started > max_seconds:
             capped = True
             break
         batch, frontier = frontier[: settings.web_crawl_concurrency * 2], frontier[settings.web_crawl_concurrency * 2 :]
-        new_links = await asyncio.gather(*(process(u, d) for u, d in batch))
+        new_links = await asyncio.gather(
+            *(process(u, d) for u, d in batch), return_exceptions=True
+        )
         for links in new_links:
+            if isinstance(links, asyncio.CancelledError):
+                raise links
+            if isinstance(links, BaseException):
+                # One page's DB hiccup fails that page, not the whole run —
+                # plain gather() cancelled the siblings and aborted the crawl.
+                state.failed += 1
+                log.debug("crawl page failed", exc_info=links)
+                continue
             frontier.extend(links)
         if walk_links:
             pages_found = max(pages_found, len(state.visited) + len(frontier))
@@ -289,15 +360,35 @@ async def _crawl_site(
 
 
 async def _drain_index(emit: Optional[Emit], quiet: bool = False) -> int:
-    """Embed everything the crawl stored. Bounded, with progress."""
+    """Embed everything the crawl stored. Bounded, with progress.
+
+    Bails after two consecutive rounds with zero progress: index_pending never
+    raises, so with the embedding service down the old loop spun its full 400
+    rounds inside the user-facing request, re-reading the same queue (review,
+    2026-08-30). Unindexed pages are not lost — every later search's indexing
+    pass retries the same watermark.
+    """
     total_chunks = 0
+    stalled = 0
     for _round in range(400):  # safety bound ≫ any real crawl
         remaining = await db.run_in_thread(db.count_unindexed_web_pages)
         if remaining <= 0:
             break
         if emit is not None and not quiet:
             await emit("status", {"text": f"Indexing — {remaining} pages left…"})
-        total_chunks += await web_index.index_pending(limit=50)
+        wrote = await web_index.index_pending(limit=50)
+        if wrote > 0:
+            stalled = 0
+            total_chunks += wrote
+            continue
+        stalled += 1
+        if stalled >= 2:
+            if emit is not None and not quiet:
+                await emit(
+                    "status",
+                    {"text": "Indexing paused — it will finish in the background."},
+                )
+            break
     return total_chunks
 
 
@@ -314,6 +405,7 @@ async def run_crawl_engine(
         db.create_web_crawl, conversation_id, crawl_url, prefix
     )
     await emit("status", {"text": f"Crawling {host}…"})
+    state: Optional[_CrawlState] = None
     try:
         state, pages_found, status = await _crawl_site(
             crawl_url,
@@ -381,6 +473,28 @@ async def run_crawl_engine(
             },
         )
         return text
+    except asyncio.CancelledError:
+        # A closed tab or a stop click cancels this coroutine. Without this
+        # the row stayed 'running' forever, and site Q&A (which only trusts
+        # done/capped crawls) never activated (review, 2026-08-30). Partial
+        # pages ARE stored — 'capped' is the honest status, and it resumes.
+        partial = (state.fetched + state.from_store) if state else 0
+        try:
+            await asyncio.shield(
+                db.run_in_thread(
+                    db.finish_web_crawl,
+                    crawl_id,
+                    "capped" if partial > 0 else "failed",
+                    partial,
+                    state.fetched if state else 0,
+                    state.from_store if state else 0,
+                    state.failed if state else 0,
+                    "cancelled mid-run",
+                )
+            )
+        except Exception:  # noqa: BLE001 — cancellation still wins
+            log.warning("could not mark cancelled crawl", exc_info=True)
+        raise
     except Exception as exc:  # noqa: BLE001
         log.warning("crawl failed", exc_info=True)
         await db.run_in_thread(
@@ -472,6 +586,13 @@ async def run_site_qa_engine(
 # ---------------------------------------------------------------------------
 
 
+#: One expansion at a time. Concurrent searches each scheduling their own
+#: expansion multiplied the politeness caps against the same hosts and raced
+#: the per-crawl dedupe (review, 2026-08-30). Skipping is fine: expansion is
+#: opportunistic warming, and the next idle search will run it again.
+_EXPAND_LOCK = asyncio.Lock()
+
+
 async def expand_search_domains(urls: List[str]) -> None:
     """Quietly deepen the sites a search just read, one hop, tightly capped.
 
@@ -482,6 +603,13 @@ async def expand_search_domains(urls: List[str]) -> None:
     """
     if not settings.web_expand_after_search or not urls:
         return
+    if _EXPAND_LOCK.locked():
+        return
+    async with _EXPAND_LOCK:
+        await _expand_search_domains_locked(urls)
+
+
+async def _expand_search_domains_locked(urls: List[str]) -> None:
     try:
         by_host: dict = {}
         for u in urls:

@@ -75,7 +75,9 @@ def run_web_step(monkeypatch, research):
 
 
 def test_a_web_step_returns_its_answer_and_sources(monkeypatch):
-    async def research(question, history=(), effort="medium", emit=None):
+    async def research(
+        question, history=(), effort="medium", emit=None, **attribution
+    ):
         return "The market is large [1].", SOURCES
 
     output, detail, sub = run_web_step(monkeypatch, research)
@@ -88,7 +90,9 @@ def test_a_web_step_with_no_results_answers_from_knowledge(monkeypatch):
     """Search being down must not fail the step and lose that part of the plan
     — but it must SAY SO. The fallback used to be silent, so a stale-memory
     answer shipped under a trust line claiming searches go to the internet."""
-    async def research(question, history=(), effort="medium", emit=None):
+    async def research(
+        question, history=(), effort="medium", emit=None, **attribution
+    ):
         return "", []
 
     async def fake_completion(messages, **kwargs):

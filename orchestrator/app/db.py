@@ -558,6 +558,16 @@ CREATE INDEX IF NOT EXISTS idx_web_crawls_conv
 """
 
 
+# V10 (2026-08-30, review round): the links a page's HTML pointed at, kept
+# with the page. Without them a page served fresh-from-store is a dead end for
+# the crawler's walk mode — the review measured resume and post-search
+# expansion silently doing nothing because stored pages returned no links.
+_MIGRATION_V10 = """
+ALTER TABLE web_pages ADD COLUMN IF NOT EXISTS
+    links text[] NOT NULL DEFAULT '{}';
+"""
+
+
 _MIGRATIONS: tuple = (
     (1, _MIGRATION_V1),
     (2, _MIGRATION_V2),
@@ -568,6 +578,7 @@ _MIGRATIONS: tuple = (
     (7, _MIGRATION_V7),
     (8, _MIGRATION_V8),
     (9, _MIGRATION_V9),
+    (10, _MIGRATION_V10),
 )
 
 #: The version `init_schema` brings a database up to. Exported so callers (and
@@ -1123,6 +1134,7 @@ def upsert_web_page(
     content_type: str,
     fetch_status: int,
     content_hash: str,
+    links: Optional[List[str]] = None,
 ) -> dict:
     """Store (or refresh) one fetched page, globally deduped by `url_key`.
 
@@ -1141,15 +1153,16 @@ def upsert_web_page(
         changed = previous_hash is not None and previous_hash != content_hash
         row = con.execute(
             "INSERT INTO web_pages (url_key, url, canonical_url, title, text, "
-            "content_type, fetch_status, content_hash, fetch_count, "
+            "content_type, fetch_status, content_hash, links, fetch_count, "
             "first_seen_at, fetched_at, indexed_at) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 1, %s, %s, NULL) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 1, %s, %s, NULL) "
             "ON CONFLICT (url_key) DO UPDATE SET "
             "url = EXCLUDED.url, canonical_url = EXCLUDED.canonical_url, "
             "title = EXCLUDED.title, text = EXCLUDED.text, "
             "content_type = EXCLUDED.content_type, "
             "fetch_status = EXCLUDED.fetch_status, "
             "content_hash = EXCLUDED.content_hash, "
+            "links = EXCLUDED.links, "
             "fetch_count = web_pages.fetch_count + 1, "
             "fetched_at = EXCLUDED.fetched_at, "
             # A changed page must be re-indexed; an unchanged one keeps its
@@ -1162,10 +1175,15 @@ def upsert_web_page(
                 _text(url),
                 _text(canonical_url),
                 _text(title),
-                text or "",
+                # The one param that skipped _text() — and the largest
+                # untrusted one. A NUL survives utf-8 decoding (text/plain,
+                # PDF text layers), PostgreSQL rejects it, and the DataError
+                # aborted whole crawls (review round, 2026-08-30).
+                _text(text or ""),
                 _text(content_type),
                 int(fetch_status),
                 _text(content_hash),
+                [_text(l) for l in (links or [])][:500],
                 now,
                 now,
             ),
@@ -1180,7 +1198,7 @@ def get_web_pages(url_keys: List[str]) -> List[dict]:
     with connection() as con:
         rows = con.execute(
             "SELECT id, url_key, url, canonical_url, title, text, content_type, "
-            "fetch_status, content_hash, fetched_at FROM web_pages "
+            "fetch_status, content_hash, fetched_at, links FROM web_pages "
             "WHERE url_key = ANY(%s)",
             (list(url_keys),),
         ).fetchall()

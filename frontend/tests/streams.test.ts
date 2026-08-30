@@ -28,3 +28,28 @@ describe('attachBaseTurns (re-join after reload)', () => {
     expect(attachBaseTurns([])).toEqual([]);
   });
 });
+
+import { withLiveProgressRetired } from '../lib/streams';
+
+describe('withLiveProgressRetired', () => {
+  // Review round 2026-08-30: every terminal patch (done, error, unreachable,
+  // interrupted) must drop the live progress line and phase marker. They are
+  // persisted with the message, so a surviving "Searching the web…" made a
+  // reloaded or errored answer tick a fake clock forever.
+  it('clears searchStatus and phaseStatus on any terminal patch', () => {
+    const patch = withLiveProgressRetired({ status: 'error' });
+    expect(patch.searchStatus).toBeUndefined();
+    expect('searchStatus' in patch).toBe(true); // explicit undefined overwrites
+    expect(patch.phaseStatus).toBeUndefined();
+    expect(patch.status).toBe('error');
+  });
+
+  it('never overrides what the terminal patch itself sets', () => {
+    expect(withLiveProgressRetired({ status: 'done', content: 'x' })).toEqual({
+      searchStatus: undefined,
+      phaseStatus: undefined,
+      status: 'done',
+      content: 'x',
+    });
+  });
+});

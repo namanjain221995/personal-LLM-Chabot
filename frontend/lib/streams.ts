@@ -157,8 +157,19 @@ function settleReasoningClock(s: LiveStream): void {
   }
 }
 
+/**
+ * Terminal states retire the live progress line and phase marker: both are
+ * persisted with the message, and a saved "Searching the web…" made a
+ * reloaded or errored answer tick a fake clock forever (review 2026-08-30).
+ */
+export function withLiveProgressRetired(
+  patch: Partial<ChatMessage>,
+): Partial<ChatMessage> {
+  return { searchStatus: undefined, phaseStatus: undefined, ...patch };
+}
+
 function finalize(s: LiveStream, patch: Partial<ChatMessage>): void {
-  updateAssistant(s, patch);
+  updateAssistant(s, withLiveProgressRetired(patch));
   s.status = (patch.status as StreamStatus) ?? 'done';
   // Persist regardless of which conversation is on screen.
   getHistoryStore().saveMessages(s.conversationId, s.messages);
@@ -183,12 +194,15 @@ function markUnreachable(
   code?: unknown,
 ): void {
   const err = toClientError(status, code);
-  updateAssistant(s, {
-    status: 'error',
-    errorMessage: err.message,
-    errorStatus: err.status,
-    errorCode: err.code,
-  });
+  updateAssistant(
+    s,
+    withLiveProgressRetired({
+      status: 'error',
+      errorMessage: err.message,
+      errorStatus: err.status,
+      errorCode: err.code,
+    }),
+  );
   s.status = 'unreachable';
   getHistoryStore().saveMessages(s.conversationId, s.messages);
   notify(s.conversationId);
@@ -203,11 +217,14 @@ function markUnreachable(
  * message — this patches status/errorMessage and leaves `content` alone.
  */
 function markInterrupted(s: LiveStream): void {
-  updateAssistant(s, {
-    status: 'error',
-    errorMessage:
-      'The connection to this answer was interrupted. The model is still working on it — reopen this chat to re-join.',
-  });
+  updateAssistant(
+    s,
+    withLiveProgressRetired({
+      status: 'error',
+      errorMessage:
+        'The connection to this answer was interrupted. The model is still working on it — reopen this chat to re-join.',
+    }),
+  );
   s.status = 'error';
   getHistoryStore().saveMessages(s.conversationId, s.messages);
   notify(s.conversationId);
