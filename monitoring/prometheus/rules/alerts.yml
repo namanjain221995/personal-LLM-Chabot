@@ -1,0 +1,252 @@
+# Alerts, tuned for a two-node box that is deliberately run hot.
+#
+# Every `for:` here is long enough that a normal inference burst does not
+# page. The temperature thresholds are the hardware's OWN limits, not guesses:
+# DCGM reports slowdown 86 C, shutdown 90 C and max-operating 99 C for this
+# part (nvidia-smi returns N/A for all three, which is why they were read via
+# a one-off dcgmi query). GB10 idles at ~42 C and ~10 W.
+#
+# Note the die is shared with the CPU complex on this integrated part - an
+# 8-thread CPU-only burn moved temperature.gpu 44 -> 48 C while GPU power moved
+# 0.31 W - so a temperature alert here is a SoC alert, not proof of GPU load.
+
+groups:
+  - name: availability
+    rules:
+      - alert: SparkNodeDown
+        expr: up{job="node"} == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.node }} host metrics unreachable"
+          description: >-
+            node-exporter on {{ $labels.node }} has not answered for 2 minutes.
+            Either the Spark is down or the management LAN path
+            (192.168.9.0/22) is broken. The RoCE fabric is a separate path and
+            may still be fine.
+
+      - alert: GpuExporterDown
+        expr: up{job="dgx-gpu"} == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "GPU telemetry missing for {{ $labels.node }}"
+
+      - alert: GpuDriverNotAnswering
+        # The exporter is up but nvidia-smi is failing — a different and worse
+        # problem than the exporter being down.
+        expr: dgx_gpu_up == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "nvidia-smi not answering on {{ $labels.node }}"
+
+      - alert: VllmDown
+        expr: up{job="vllm-main"} == 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "vLLM main model is not serving metrics"
+          description: >-
+            The distributed engine's only API server is unreachable. Chat,
+            search and Deep Research are all down while this is true.
+
+      - alert: ServiceProbeFailing
+        expr: probe_success == 0
+        for: 3m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.service }} is not responding to HTTP probes"
+
+  - name: gpu-health
+    rules:
+      - alert: GpuTemperatureHigh
+        # 80 C leaves 6 C of warning before the hardware's own 86 C slowdown.
+        expr: dgx_gpu_temperature_celsius > 80
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.node }} GPU at {{ $value | printf \"%.0f\" }} C"
+          description: >-
+            Approaching the 86 C slowdown point. Check airflow.
+
+      - alert: GpuTemperatureCritical
+        # Past the 86 C slowdown, heading for the 90 C shutdown.
+        expr: dgx_gpu_temperature_celsius > 88
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.node }} GPU at {{ $value | printf \"%.0f\" }} C"
+
+      - alert: GpuThermalThrottling
+        # The hardware's own opinion, which beats any threshold guess.
+        expr: dgx_gpu_throttle_active{reason=~"hw_thermal_slowdown|sw_thermal_slowdown"} == 1
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.node }} GPU is thermally throttling"
+          description: "Tokens/sec will be below normal while this is true."
+
+      - alert: GpuPowerThrottling
+        expr: dgx_gpu_throttle_active{reason=~"sw_power_cap|hw_power_brake"} == 1
+        for: 5m
+        labels: { severity: info }
+        annotations:
+          summary: "{{ $labels.node }} GPU is power-capped"
+          description: >-
+            Expected during sustained load on a 240 W-class module; only
+            interesting if it correlates with a tokens/sec drop.
+
+  - name: host-health
+    rules:
+      - alert: UnifiedMemoryPressure
+        # GB10 has no separate VRAM: model weights and KV cache live in host
+        # memory, so this IS the GPU memory alert.
+        expr: node:memory_used_percent:current > 92
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.node }} unified memory {{ $value | printf \"%.0f\" }}% used"
+          description: >-
+            On GB10 this covers model weights and KV cache as well as the OS.
+            Reaching the ceiling shows up as CUDA OOM in vLLM, not as a
+            nvidia-smi memory reading.
+
+      - alert: DiskFillingUp
+        expr: >-
+          100 * (1 - node_filesystem_avail_bytes{mountpoint="/",fstype!="tmpfs"}
+          / node_filesystem_size_bytes{mountpoint="/",fstype!="tmpfs"}) > 85
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.node }} root filesystem {{ $value | printf \"%.0f\" }}% full"
+
+      - alert: RoceLinkDown
+        # 4 == ACTIVE in the IB port-state enum. The two f0 ports are DOWN by
+        # design on this hardware and are excluded.
+        expr: node_infiniband_state_id{device=~"rocep1s0f1|roceP2p1s0f1"} != 4
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "RoCE link {{ $labels.device }} down on {{ $labels.node }}"
+          description: >-
+            NCCL tensor-parallel traffic crosses these interfaces. With one
+            down the distributed model is degraded or stalled.
+
+      - alert: RoceErrorsRising
+        expr: node:roce_errors_per_second:sum > 1
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "RoCE errors/drops on {{ $labels.node }}"
+
+  - name: vllm-health
+    rules:
+      - alert: VllmQueueBacklog
+        expr: cluster:vllm_requests_waiting:current > 5
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $value }} requests waiting on the vLLM scheduler"
+          description: >-
+            Sustained queueing. Correlate with KV cache usage and GPU
+            utilisation on the LLM Performance dashboard to tell capacity
+            pressure from a stall.
+
+      - alert: VllmKvCacheNearlyFull
+        expr: cluster:vllm_kv_cache_usage_percent:current > 90
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "KV cache {{ $value | printf \"%.0f\" }}% used"
+          description: >-
+            Above ~90% vLLM starts preempting requests, which shows up as
+            latency rather than errors.
+
+      - alert: VllmPreemptionsHappening
+        expr: rate(vllm:num_preemptions_total{service="main"}[5m]) > 0
+        for: 5m
+        labels: { severity: info }
+        annotations:
+          summary: "vLLM is preempting requests"
+
+  - name: containers
+    rules:
+      - alert: ContainerRestartLoop
+        expr: >-
+          changes(container_start_time_seconds{name!=""}[30m]) > 3
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.name }} restarted repeatedly"
+
+  - name: databases
+    rules:
+      - alert: PostgresDown
+        expr: pg_up == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "PostgreSQL is not answering"
+          description: >-
+            Every conversation, message and research run lives here. The
+            orchestrator fails its own health check while this is true.
+
+      - alert: PostgresConnectionsHigh
+        # Default max_connections is 100; the pool plus pgAdmin plus this
+        # exporter sit well under 10 in normal use.
+        expr: sum(pg_stat_database_numbackends) > 70
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $value }} PostgreSQL connections open"
+
+      - alert: PostgresCacheHitRatioLow
+        expr: >-
+          100 * sum(pg_stat_database_blks_hit{datname="techsara"})
+          / clamp_min(sum(pg_stat_database_blks_hit{datname="techsara"})
+                      + sum(pg_stat_database_blks_read{datname="techsara"}), 1) < 90
+        for: 30m
+        labels: { severity: info }
+        annotations:
+          summary: "PostgreSQL cache hit ratio {{ $value | printf \"%.1f\" }}%"
+          description: >-
+            The working set no longer fits in shared_buffers. Harmless at this
+            data size; worth noting if it persists as the web store grows.
+
+      - alert: PostgresDeadlocks
+        expr: increase(pg_stat_database_deadlocks{datname="techsara"}[1h]) > 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "PostgreSQL deadlock detected"
+
+      - alert: WarehouseSnapshotStale
+        # The sync worker republishes the atomic read snapshot every cycle
+        # (default 30 min). Six hours means it has stopped, and Salesforce
+        # answers are being served from an old copy while /health still says ok.
+        expr: techsara_store_age_seconds{store="warehouse_snapshot"} > 21600
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "Salesforce warehouse snapshot is {{ $value | humanizeDuration }} old"
+          description: >-
+            Check the sync-worker container. Answers remain correct for the data
+            they cover - they are just not current.
+
+      - alert: DataStoreMissing
+        expr: techsara_store_present == 0
+        for: 15m
+        labels: { severity: info }
+        annotations:
+          summary: "Data store {{ $labels.store }} is not on disk"
+          description: >-
+            Expected on a fresh install before the first sync or crawl.
+
+      - alert: DataVolumeGrowingFast
+        # LanceDB and Parquet both grow without bound; Parquet is never pruned.
+        expr: increase(techsara_store_total_bytes[24h]) > 50e9
+        for: 1h
+        labels: { severity: warning }
+        annotations:
+          summary: "Data stores grew {{ $value | humanize1024 }}B in 24h"

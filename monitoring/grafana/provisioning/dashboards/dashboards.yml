@@ -1,0 +1,18 @@
+# Dashboards are files in this repository, not Grafana database rows: they are
+# reviewable in git and survive `docker volume rm sf-local-ai_grafana`.
+apiVersion: 1
+
+providers:
+  - name: dgx-spark
+    orgId: 1
+    folder: DGX Spark
+    type: file
+    disableDeletion: false
+    # Edits made in the UI are overwritten from disk on the next reload. That
+    # is deliberate: the repository is the source of truth. Use "Save JSON to
+    # file" and commit it to make a change stick.
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false
