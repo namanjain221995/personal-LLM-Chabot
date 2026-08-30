@@ -312,6 +312,23 @@ const urlFixture: Fixture = {
   },
 };
 
+const crawlFixture: Fixture = {
+  text:
+    'Indexed **docs.example.com** — 55 pages stored and searchable. Ask me ' +
+    'anything about the site; answers cite the stored copy [1].',
+  meta: {
+    route: 'crawl',
+    sources: [
+      {
+        n: 1,
+        title: 'Example Docs — Getting started',
+        url: 'https://docs.example.com/getting-started',
+        domain: 'docs.example.com',
+      },
+    ],
+  },
+};
+
 const repoFixture: Fixture = {
   text:
     'Authentication is handled in `app/auth.py`: `require_user` validates the ' +
@@ -391,6 +408,7 @@ export const FIXTURES: Record<Engine, Fixture> = {
   agent: agentFixture,
   search: searchFixture,
   url: urlFixture,
+  crawl: crawlFixture,
   repo: repoFixture,
 };
 

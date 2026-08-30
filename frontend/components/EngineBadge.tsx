@@ -14,6 +14,8 @@ const ENGINE_LABEL: Record<Engine, string> = {
   agent: 'Agent',
   search: 'Web',
   url: 'Page',
+  // The site crawler (2026-08-30): a whole indexed site, not a single page.
+  crawl: 'Site',
   repo: 'Repo',
   // The orchestrator has always emitted route "clarify" for a question asked
   // back; it was simply absent from the Engine union, so this map had no entry
@@ -38,6 +40,11 @@ const ENGINE_STYLE: Record<Engine, { color: string; ink: string }> = {
     ink: 'var(--ts-engine-rag-ink)',
   },
   url: {
+    color: 'var(--ts-engine-report)',
+    ink: 'var(--ts-engine-report-ink)',
+  },
+  // Same palette as Page on purpose: "Site" is Page's plural.
+  crawl: {
     color: 'var(--ts-engine-report)',
     ink: 'var(--ts-engine-report-ink)',
   },
