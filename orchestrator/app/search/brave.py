@@ -16,7 +16,11 @@ class BraveProvider(SearchProvider):
     def __init__(self, api_key: str) -> None:
         self.api_key = api_key
 
-    async def search(self, query: str, max_results: int) -> List[SearchResult]:
+    async def search(
+        self, query: str, max_results: int, categories: str = ""
+    ) -> List[SearchResult]:
+        # `categories` is a SearXNG concept; this API has no equivalent.
+        del categories
         headers = {
             "Accept": "application/json",
             "X-Subscription-Token": self.api_key,

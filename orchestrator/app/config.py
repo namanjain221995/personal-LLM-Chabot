@@ -443,6 +443,32 @@ class Settings:
         self.web_expand_pages_per_domain: int = _int("WEB_EXPAND_PAGES_PER_DOMAIN", 8)
         self.web_expand_max_domains: int = _int("WEB_EXPAND_MAX_DOMAINS", 3)
 
+        # --- Deep Research (2026-08-30): the iterative mode. Every default
+        # below is derived from measurement on this deployment, not taste:
+        # the main model decodes ~70 tok/s (1136 tokens in 16.1 s) and a
+        # guided-JSON planning call costs ~2 s, so three iterations plus a
+        # ~1500-token report is ~45 s of GPU time; SearXNG answers six
+        # parallel queries in ~2.2 s and page extraction is serialised on one
+        # worker, so the network side dominates. 24 sources at 8000 chars is
+        # ~48k tokens of evidence — comfortable in a 1M window, and small
+        # enough that the report call is not itself the bottleneck.
+        self.deep_research_enabled: bool = _bool("DEEP_RESEARCH_ENABLED", True)
+        self.deep_research_max_iterations: int = _int("DEEP_RESEARCH_MAX_ITERATIONS", 3)
+        self.deep_research_max_queries_per_iteration: int = _int(
+            "DEEP_RESEARCH_MAX_QUERIES_PER_ITERATION", 5
+        )
+        self.deep_research_sources_per_iteration: int = _int(
+            "DEEP_RESEARCH_SOURCES_PER_ITERATION", 10
+        )
+        self.deep_research_max_sources: int = _int("DEEP_RESEARCH_MAX_SOURCES", 24)
+        # Below this the loop searches the plan's remaining angles instead of
+        # asking the auditor whether three pages are enough.
+        self.deep_research_min_sources: int = _int("DEEP_RESEARCH_MIN_SOURCES", 6)
+        self.deep_research_timeout_s: float = _float("DEEP_RESEARCH_TIMEOUT_S", 600.0)
+        self.deep_research_report_max_tokens: int = _int(
+            "DEEP_RESEARCH_REPORT_MAX_TOKENS", 6000
+        )
+
         # --- Phase 2: URL / website analysis (fetches pasted links). ---
         self.url_analysis_enabled: bool = _bool("URL_ANALYSIS_ENABLED", True)
         self.url_max_pages: int = _int("URL_MAX_PAGES", 5)

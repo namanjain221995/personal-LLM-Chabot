@@ -1,5 +1,92 @@
 # Changelog
 
+## Deep Research, and the reranker that was never reranking (2026-08-30)
+
+A third answering mode, and two production defects found while measuring it.
+
+**The reranker was serving cosine similarity, not relevance.** `vllm-reranker`
+ran Qwen3-Reranker-0.6B with `--runner pooling` and no conversion, so vLLM
+loaded it as a plain embedding model — its own log says
+`Resolved architecture: Qwen3ForCausalLM`, `--convert embed`,
+`Supported tasks: ['embed', 'token_embed']`. There was no `score` task at all;
+`/score` returned embedding similarity. That is why ranking "NVIDIA DGX Spark
+memory bandwidth" put *Download - NVIDIA* and *Nvidia - Wikipedia* on top and
+the actual hardware guide 11th of 14. Adding `--convert classify` and the
+`Qwen3ForSequenceClassification` / `classifier_from_token: [no, yes]`
+hf-override makes it the cross-encoder it always was: score spread doubled
+(0.40 → 0.84 on a fixed set), junk collapsed (Download-NVIDIA 0.52 → 0.14),
+precision@5 doubled on the DGX query, and 40 documents still rerank in 52 ms.
+Verified on a throwaway container before the real one was touched.
+
+**Engine supply was one Google block from collapse.** Only google-cse, bing,
+mwmbl and yahoo answered a default query here — and google-cse IP-blocked this
+host during testing, a block that outlived SearXNG's own 180 s bench because
+every retry re-armed it. Four shipped-disabled, keyless engines are now on
+(duckduckgo-web, yandex, searchmysite, wiby), spreading load
+across independent quotas; the same query mix now returns results *while
+google-cse is still blocked*. `mojeek`/`dogpile` are removed (403 at this
+egress IP even to a browser UA), and `wikidata` — which failed to *register*
+at boot — works now that `outgoing.useragent_suffix` carries the contact
+Wikimedia's user-agent policy requires. The `limiter.toml` warning and the
+`X-Forwarded-For` error are cosmetic and deliberately left alone; both are
+documented in the README rather than papered over with a stub file.
+
+**Deep Research** (`engines/deep_research.py`) is the new mode: plan the
+question into subquestions, search, read, then *audit what is still missing*
+and search again for exactly that, up to a capped number of rounds, before
+writing a cited report. It is a plain async loop, not a LangGraph — the
+existing graph uses none of LangGraph's features and an iterative gap-driven
+loop fights a fixed edge list. It reuses the whole search stack rather than
+duplicating it, invents no new SSE events (the vocabulary is closed and an
+unknown name kills the stream mid-body), and is explicit-only: nothing infers
+a mode that costs minutes.
+
+Citation integrity is the part that earns a separate engine. Only pages
+actually fetched become sources; after generation any `[n]` outside the
+registry is **removed** and counted. The plain search engine cannot do this —
+its only defence is a prompt sentence, and the frontend strips `[n]` before
+rendering, so an invented `[99]` there is invisible rather than caught.
+
+Two defects the first live run exposed, both fixed and both now pinned by a
+test: routing research queries to `categories=it` filled 9 of 23 source slots
+with Docker Hub image pages (a registry listing is not evidence), and the
+report arrived as ONE 6,349-character event after ~40 s of nothing. Routing is
+now `science`-only and the report streams. The same question afterwards: 3
+iterations, 24 sources, **0 Docker Hub**, 15 cited, 0 fabricated, 937 token
+events, 170 s.
+
+Also: `.env.example` gained the `WEB_MEMORY_*`, `WEB_CRAWL_*` and
+`WEB_EXPAND_*` settings that shipped earlier the same day without ever being
+documented there.
+
+**The review round.** A 34-agent adversarial pass over the branch confirmed 23
+defects before any of it merged. The ones that mattered: `_gather` called
+`_persist_and_index` with four positional arguments, dropping user and
+conversation id — reintroducing, in a new file, the exact privacy regression
+fixed for `search.py` the day before, so a deleted conversation would keep its
+research question forever. Citation validation collapsed every run of two or
+more spaces in the *whole* report, flattening YAML indentation and nested
+bullets even when nothing had been removed, and it treated `arr[0]` inside a
+fenced code block as a citation to delete; both are now scoped — code is held
+out, and an invalid marker takes only its own adjacent space with it. The
+"no readable sources" exit never closed its `research_runs` row (a dead
+SearXNG reaches it *normally*, never via the exception handler), a failure
+part-way through the report threw away every source the run had already paid
+to read, and an exception left the in-flight step spinning forever in the
+timeline. On the frontend, `deepResearch` was restored from storage despite a
+comment promising it never would be, and nothing disarmed it after a send — so
+a one-shot command was in practice a sticky mode. Also corrected: the SERP
+cache key ignored the new category hint, `marginalia` is absent from this
+SearXNG build entirely so enabling it did nothing (four engines were added,
+not seven — the claim is fixed here and in the README), and the model manifest
+still described the reranker with its old serving arguments.
+
+A candidate-pool experiment was tried and REVERTED with its measurement kept
+in the source: gathering 3x the fetch budget and reranking down made results
+worse on every query (`anyscale.com`/`github.com`/`huggingface.co` gave way to
+personal blogs). Engine rank is an authority prior; the cross-encoder scores
+topical match only. Widening the pool throws the prior away.
+
 ## The review round: the crawler grows up (2026-08-30, same day)
 
 A 31-agent adversarial review of the branch below confirmed 14 distinct

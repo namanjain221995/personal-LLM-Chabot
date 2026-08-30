@@ -312,6 +312,31 @@ const urlFixture: Fixture = {
   },
 };
 
+const deepResearchFixture: Fixture = {
+  text:
+    '## Answer\n\nThe strongest option is the MoE variant [1], which keeps '
+    + 'active parameters low while retaining quality [2].\n\n'
+    + '### What this report could not establish\n\n'
+    + 'No source gave independent throughput numbers on this hardware.',
+  meta: {
+    route: 'deep_research',
+    sources: [
+      {
+        n: 1,
+        title: 'Model card — architecture and parameters',
+        url: 'https://example.com/model-card',
+        domain: 'example.com',
+      },
+      {
+        n: 2,
+        title: 'Independent evaluation write-up',
+        url: 'https://eval.example.org/report',
+        domain: 'eval.example.org',
+      },
+    ],
+  },
+};
+
 const crawlFixture: Fixture = {
   text:
     'Indexed **docs.example.com** — 55 pages stored and searchable. Ask me ' +
@@ -409,6 +434,7 @@ export const FIXTURES: Record<Engine, Fixture> = {
   search: searchFixture,
   url: urlFixture,
   crawl: crawlFixture,
+  deep_research: deepResearchFixture,
   repo: repoFixture,
 };
 

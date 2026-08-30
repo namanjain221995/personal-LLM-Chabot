@@ -22,6 +22,7 @@ export type Engine =
   | 'chat'
   | 'agent'
   | 'search'
+  | 'deep_research'
   | 'url'
   | 'repo'
   | 'clarify';

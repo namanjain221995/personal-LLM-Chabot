@@ -207,7 +207,7 @@ def test_search_answer_honours_the_effort(monkeypatch):
     async def fake_rewrite(message, history, effort="medium"):
         return ["q1"]
 
-    async def fake_collect(queries, effort="medium", emit=None):
+    async def fake_collect(queries, effort="medium", emit=None, **kw):
         return [_result()]
 
     async def fake_fetch(results, message=""):

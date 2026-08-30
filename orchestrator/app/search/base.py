@@ -24,7 +24,12 @@ class SearchProvider(abc.ABC):
     name: str = "base"
 
     @abc.abstractmethod
-    async def search(self, query: str, max_results: int) -> List[SearchResult]:
+    async def search(
+        self, query: str, max_results: int, categories: str = ""
+    ) -> List[SearchResult]:
+        """`categories` is an OPTIONAL provider-specific hint (SearXNG's
+        `it`/`science`/`news` pools). Providers that have no such concept
+        ignore it; callers must work when it is ignored."""
         ...
 
 

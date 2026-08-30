@@ -11,7 +11,12 @@
 
 import type { ChatPrefs } from './prefs';
 
-export type ComposerMenuItemId = 'files' | 'web-search' | 'salesforce' | 'sf-live';
+export type ComposerMenuItemId =
+  | 'files'
+  | 'web-search'
+  | 'deep-research'
+  | 'salesforce'
+  | 'sf-live';
 
 export interface ComposerMenuItem {
   id: ComposerMenuItemId;
@@ -30,6 +35,8 @@ export interface ComposerMenuState {
   sfLive: boolean;
   /** True when the user forced search on (prefs.webSearch === 'on'). */
   webSearchOn: boolean;
+  /** True when the next send will run the iterative research loop. */
+  deepResearchOn: boolean;
   streaming: boolean;
 }
 
@@ -69,6 +76,17 @@ export function composerMenuItems(
             'Text answers always search the web'
           : 'Force a web search for the next answers',
       checked: state.webSearchOn && !state.salesforce,
+    },
+    {
+      id: 'deep-research',
+      label: 'Deep research',
+      hint: state.salesforce
+        ? // Same warning-before-the-click rule as Web search above.
+          'Research the web and write a cited report · turns Salesforce off'
+        : state.deepResearchOn
+          ? 'The next answer is a researched, cited report — this takes minutes'
+          : 'Plan, search, read many sources, then write a cited report',
+      checked: state.deepResearchOn && !state.salesforce,
     },
     {
       id: 'salesforce',
@@ -113,6 +131,21 @@ export function activateComposerMenuItem(
   prefs: ChatPrefs,
 ): ComposerMenuOutcome {
   switch (id) {
+    case 'deep-research': {
+      const next = !prefs.deepResearch;
+      return {
+        kind: 'prefs',
+        prefs: {
+          ...prefs,
+          deepResearch: next,
+          // Research IS web work: leaving Salesforce on would make the server
+          // refuse the web and answer from the warehouse instead, which is
+          // not what the row promised.
+          salesforce: next ? false : prefs.salesforce,
+          sfLive: next ? false : prefs.sfLive,
+        },
+      };
+    }
     case 'web-search':
       if (prefs.salesforce) {
         // Mode switch, as the row's hint promised: leave Salesforce (and its
@@ -136,6 +169,10 @@ export function activateComposerMenuItem(
         prefs: {
           ...prefs,
           salesforce: next,
+          // Salesforce mode never touches the web, so a lingering Deep
+          // Research would be invisible AND un-runnable — the same trap the
+          // forced-web reset below exists for.
+          deepResearch: next ? false : prefs.deepResearch,
           // Live Salesforce cannot outlive its parent toggle: a lingering
           // true would silently go live the next time Salesforce turns on
           // (the same trap sanitize() guards).
@@ -155,6 +192,11 @@ export function activateComposerMenuItem(
             salesforce: true,
             sfLive: true,
             webSearch: prefs.webSearch === 'on' ? 'auto' : prefs.webSearch,
+            // Deep Research drops with the forced web search, and for the
+            // same reason: Salesforce mode never touches the web, so leaving
+            // it armed strands it behind a gate that can never run it — and
+            // its own menu row would then appear to no-op on the next click.
+            deepResearch: false,
           },
         };
       }

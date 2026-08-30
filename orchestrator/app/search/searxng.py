@@ -19,8 +19,19 @@ class SearxngProvider(SearchProvider):
     def __init__(self, base_url: str) -> None:
         self.base_url = base_url.rstrip("/")
 
-    async def search(self, query: str, max_results: int) -> List[SearchResult]:
+    async def search(
+        self, query: str, max_results: int, categories: str = ""
+    ) -> List[SearchResult]:
+        # Category routing (measured 2026-08-30): a plain general query only
+        # ever reaches google cse / bing / mwmbl / yahoo here, while
+        # `categories=it` (github, stackoverflow, mdn, docker hub) returned 60
+        # results with ZERO unresponsive engines and `categories=science`
+        # (arxiv, pubmed) returned full 1100-1900 character abstracts instead
+        # of 135-character snippets. Those pools have no rate-limit problem
+        # because nothing else on this host queries them.
         params = {"q": query, "format": "json", "safesearch": "1"}
+        if categories:
+            params["categories"] = categories
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
                 resp = await client.get(f"{self.base_url}/search", params=params)

@@ -58,6 +58,27 @@ _MIN_SOURCES = 8
 # scale: 60 x 8000 would be 480k chars of prefill for ONE step. The top-ranked
 # sources keep the full budget (so High is never shallower than Medium on the
 # pages that matter most) and the long tail is kept short.
+# WHY THE RERANKER ONLY REORDERS THE FETCH BUDGET, AND NOT A WIDER POOL.
+# It looks like a bug that _collect_results truncates to the budget before
+# _rerank_results sees anything — the cross-encoder can only reorder the
+# handful engine rank already chose. It was tried (2026-08-30): gather 3x the
+# budget, rerank down. It measurably made results WORSE on every query tested.
+#
+#   "vLLM continuous batching throughput"
+#     narrow -> anyscale.com, microsoft.com, arpitbhayani.me
+#     wide   -> dasroot.net, rajatpandit.com, heeviz.com
+#   "Qwen3 open source model release"
+#     narrow -> github.com, huggingface.co, openlm.ai
+#     wide   -> 2coffee.dev, daconta.us, orcarouter.ai
+#
+# The reason is that the two signals measure different things. Engine rank is
+# an AUTHORITY prior — Bing and Google already know anyscale.com outranks a
+# personal blog on this topic. The reranker scores TOPICAL match on title +
+# snippet, and knows nothing about authority; a keyword-dense blog post beats
+# an authoritative page on that measure. Widening the pool throws the
+# authority prior away and ranks purely on topicality. Keep both: engine rank
+# selects, the reranker reorders within that selection.
+
 _TIER_A_SOURCES = 10
 _TIER_B_CHARS = 2500
 
@@ -253,6 +274,7 @@ async def _collect_results(
     queries: List[str],
     effort: str = "medium",
     emit: Optional[Emit] = None,
+    categories: str = "",
 ) -> List[SearchResult]:
     """Search every query and merge the results fairly.
 
@@ -270,14 +292,25 @@ async def _collect_results(
     # paid ~2-5 s and max ~5-13 s of pure serialisation. gather() makes the
     # whole phase cost the slowest single query (2026-08-30).
     async def _one(q: str):
-        cached = _cache_get(f"q:{provider.name}:{q}")
+        # The category is part of the key: the same query routed to
+        # `science` returns a different result set from the general pool, and
+        # a shared key silently served whichever ran first (review, 2026-08-30).
+        cached = _cache_get(f"q:{provider.name}:{categories}:{q}")
         if cached is not None:
             return q, cached, None
         try:
-            results = await provider.search(q, settings.search_max_results)
+            # The category hint is passed ONLY when there is one, so a
+            # provider written against the two-argument signature (the
+            # interface before 2026-08-30, including any operator's own) keeps
+            # working untouched on the ordinary search path.
+            results = await (
+                provider.search(q, settings.search_max_results, categories)
+                if categories
+                else provider.search(q, settings.search_max_results)
+            )
         except SearchUnavailableError as exc:
             return q, None, exc
-        _cache_put(f"q:{provider.name}:{q}", results)
+        _cache_put(f"q:{provider.name}:{categories}:{q}", results)
         return q, results, None
 
     gathered = await asyncio.gather(*(_one(q) for q in queries))
@@ -333,13 +366,19 @@ async def _rerank_results(
 
     Engine rank was the only pre-read quality signal, and it measurably fails:
     in both probe runs the rank-1 source for "latest vLLM release" was an
-    anime video page. The Qwen3-Reranker service was already running for the
-    Salesforce RAG and idle here; scoring title+snippet pairs costs ~25 ms per
-    candidate (740 ms for 30, measured). Any failure returns the input order —
-    reranking is an upgrade, never a gate (2026-08-30).
+    anime video page. Scoring title+snippet pairs costs ~50 ms for 40
+    candidates (measured 2026-08-30, after the reranker was fixed to load as
+    a cross-encoder rather than an embedding model). Any failure returns the
+    input order — reranking is an upgrade, never a gate.
+
+    `target` is the number of results to KEEP. Callers hand in a candidate
+    pool several times larger than the fetch budget, so this is where "the
+    best 8 of 120" happens; before 2026-08-30 the pool was truncated to the
+    budget upstream and this function could only reorder what it was given.
     """
+    keep = target if target > 0 else len(results)
     if len(results) <= 2 or not settings.rerank_base_url:
-        return results
+        return results[:keep]
     try:
         import httpx
 
@@ -361,11 +400,11 @@ async def _rerank_results(
         data = payload.get("data") or []
         scores = {int(d.get("index", i)): float(d.get("score", 0.0)) for i, d in enumerate(data)}
         if len(scores) != len(results):
-            return results
+            return results[:keep]
         order = sorted(range(len(results)), key=lambda i: scores.get(i, 0.0), reverse=True)
-        return [results[i] for i in order]
+        return [results[i] for i in order][:keep]
     except Exception:  # noqa: BLE001
-        return results
+        return results[:keep]
 
 
 

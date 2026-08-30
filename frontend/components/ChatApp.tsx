@@ -635,6 +635,18 @@ export function ChatApp() {
     [],
   );
 
+  // Deep Research is a ONE-SHOT command, not a mode: it applies to the send
+  // that armed it and then disarms. Without this the pill stayed lit and the
+  // user's next ordinary question silently became another multi-minute
+  // report (review, 2026-08-30). prefs.deepResearch is also dropped on load,
+  // so a reload cannot resurrect it either.
+  const disarmDeepResearch = useCallback(() => {
+    if (!prefsRef.current.deepResearch) return;
+    const next = { ...prefsRef.current, deepResearch: false };
+    setPrefs(next);
+    savePrefs(window.localStorage, activeIdRef.current, next);
+  }, []);
+
   const send = useCallback(
     (
       text: string,
@@ -809,6 +821,7 @@ export function ChatApp() {
             assistantBranch: answerBranch,
             prefs: prefsRef.current,
           });
+          disarmDeepResearch();
         })();
         return;
       }
@@ -824,8 +837,9 @@ export function ChatApp() {
         pdfName: isPdf ? first?.name ?? null : null,
         clarification: clarification ?? null,
       });
+      disarmDeepResearch();
     },
-    [activeId, persist, refreshList, setUrlConversation, toast],
+    [activeId, disarmDeepResearch, persist, refreshList, setUrlConversation, toast],
   );
 
   /**
