@@ -27,7 +27,7 @@ describe('composer prefs (V2 §4c per-conversation persistence)', () => {
       agent: false,
       // The composer toggle is gone (2026-07-28) — the level decides, so the
       // default must be Auto or Fast could never search.
-      webSearch: 'auto',
+      webSearch: 'auto', deepResearch: false,
     });
     expect(loadPrefs(makeStorage(), 'unknown-conv')).toEqual(DEFAULT_PREFS);
   });
@@ -40,7 +40,7 @@ describe('composer prefs (V2 §4c per-conversation persistence)', () => {
       model: 'fast',
       effort: 'think',
       agent: false,
-      webSearch: 'auto',
+      webSearch: 'auto', deepResearch: false,
     });
     savePrefs(storage, 'c2', {
       // Forced search is only coherent with Salesforce OFF (2026-08-05).
@@ -49,7 +49,7 @@ describe('composer prefs (V2 §4c per-conversation persistence)', () => {
       model: 'smart',
       effort: 'max',
       agent: false,
-      webSearch: 'on',
+      webSearch: 'on', deepResearch: false,
     });
     expect(loadPrefs(storage, 'c1').salesforce).toBe(false);
     expect(loadPrefs(storage, 'c1').model).toBe('fast');
@@ -65,7 +65,7 @@ describe('composer prefs (V2 §4c per-conversation persistence)', () => {
       model: 'smart',
       effort: 'fast',
       agent: false,
-      webSearch: 'auto',
+      webSearch: 'auto', deepResearch: false,
     });
     const adopted = adoptDraftPrefs(storage, 'new-conv');
     expect(adopted.effort).toBe('fast');
@@ -133,7 +133,7 @@ describe('Live Salesforce pref (2026-08-06)', () => {
       model: 'smart',
       effort: 'think',
       agent: false,
-      webSearch: 'auto',
+      webSearch: 'auto', deepResearch: false,
     });
     expect(loadPrefs(storage, 'c1').sfLive).toBe(false);
   });
@@ -146,7 +146,7 @@ describe('Live Salesforce pref (2026-08-06)', () => {
       model: 'smart',
       effort: 'think',
       agent: false,
-      webSearch: 'auto',
+      webSearch: 'auto', deepResearch: false,
     });
     expect(loadPrefs(storage, 'c1').sfLive).toBe(true);
   });

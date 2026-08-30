@@ -13,6 +13,8 @@ const ENGINE_LABEL: Record<Engine, string> = {
   chat: 'Chat',
   agent: 'Agent',
   search: 'Web',
+  // The iterative research loop, distinct from a one-pass web answer.
+  deep_research: 'Research',
   url: 'Page',
   // The site crawler (2026-08-30): a whole indexed site, not a single page.
   crawl: 'Site',
@@ -42,6 +44,12 @@ const ENGINE_STYLE: Record<Engine, { color: string; ink: string }> = {
   url: {
     color: 'var(--ts-engine-report)',
     ink: 'var(--ts-engine-report-ink)',
+  },
+  // Research is web work that ends in a document: the agent palette marks it
+  // as the multi-step route it is, not another one-shot search.
+  deep_research: {
+    color: 'var(--ts-engine-agent)',
+    ink: 'var(--ts-engine-agent-ink)',
   },
   // Same palette as Page on purpose: "Site" is Page's plural.
   crawl: {

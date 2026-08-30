@@ -284,6 +284,10 @@ class ChatRequest(BaseModel):
         "fast", "think", "max", "low", "medium", "high", "extra_high"
     ] = "think"
     agent: bool = False
+    # Deep Research (2026-08-30): the iterative mode — plan, search, read,
+    # find the gaps, search again, then write a cited report. Explicit only:
+    # it costs minutes and the whole search budget, so nothing infers it.
+    deep_research: bool = False
     # V8: an uploaded PDF (base64, optionally a data: URL) + its filename.
     pdf: Optional[str] = None
     pdf_filename: Optional[str] = None
@@ -612,6 +616,29 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 else:  # "auto"
                     want_search = await should_search(request.text)
 
+            # Deep Research is EXPLICIT-only and needs the web: without a
+            # search provider there is nothing to research, so the request
+            # degrades to the ordinary engines rather than pretending. It is
+            # computed here, with the other web gates, because the pre-passes
+            # below all have to know about it — a research question that
+            # happens to quote a URL must not be diverted into the
+            # single-page reader, and one that says "index" must not be read
+            # as a crawl request.
+            deep_research_on = bool(
+                request.deep_research
+                and settings.deep_research_enabled
+                and settings.search_enabled
+                and request.text
+                and not request.pdf_data
+                and not request.image_data
+                and auto_web_search_allowed
+            )
+            if request.deep_research and not deep_research_on:
+                await emit(
+                    "status",
+                    {"text": "Deep Research is unavailable here — answering normally."},
+                )
+
             # Announce and record the auto-decision only AFTER the gates
             # above, so the status line and meta.auto describe what will
             # actually run. Before this reorder the label came straight from
@@ -698,7 +725,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             # a follow-up when a repo is already indexed → code Q&A.
             github_ref = None
             repo_followup = False
-            if settings.repo_analysis_enabled and request.text and not request.pdf_data and not request.image_data:
+            if settings.repo_analysis_enabled and not deep_research_on and request.text and not request.pdf_data and not request.image_data:
                 from .core.repo import detect_github
 
                 from .core.urls import extract_urls as _extract, links_are_the_request
@@ -734,6 +761,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             crawl_site_host = ""
             if (
                 settings.web_crawl_enabled
+                and not deep_research_on
                 and request.text
                 and not request.pdf_data
                 and not request.image_data
@@ -799,6 +827,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             url_list: list = []
             if (
                 settings.url_analysis_enabled
+                and not deep_research_on
                 and request.text
                 and not request.pdf_data
                 and not request.image_data
@@ -1128,6 +1157,22 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
 
                 answer = await run_url_engine(
                     text, url_list, conv_key, history, emit
+                )
+            elif deep_research_on:
+                # Deep Research: the iterative research loop. It sits ABOVE
+                # the agent engine because orchestrate.decide() classifies
+                # exactly this multi-part phrasing as agent=true (and at
+                # effort "max" with search it FORCES it), so any lower and
+                # the pill would be silently eaten by the planner.
+                from .engines.deep_research import run_deep_research_engine
+
+                answer = await run_deep_research_engine(
+                    text,
+                    history,
+                    emit,
+                    effort=request.effort,
+                    conversation_id=conv_key,
+                    user_id=int(signed_in["id"]) if signed_in is not None else None,
                 )
             elif want_agent and (request.agent or not dataset_ready):
                 # V2 §3b: agent (deep-task) engine. Checked BEFORE plain search

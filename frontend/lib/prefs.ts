@@ -35,6 +35,14 @@ export interface ChatPrefs {
   effort: ReasoningEffort;
   agent: boolean;
   webSearch: WebSearchMode;
+  /**
+   * Deep Research (2026-08-30): the iterative mode — plan, search, read,
+   * find the gaps, search again, then write a cited report. Explicit only,
+   * and never sticky: it costs minutes and the whole search budget, so it
+   * applies to the next send and then resets, like a one-shot command rather
+   * than a mode you can forget you left on.
+   */
+  deepResearch: boolean;
 }
 
 export const DEFAULT_PREFS: ChatPrefs = {
@@ -44,6 +52,7 @@ export const DEFAULT_PREFS: ChatPrefs = {
   effort: 'think',
   agent: false,
   webSearch: 'auto',
+  deepResearch: false,
 };
 
 const STORAGE_KEY = 'techsara.chatprefs.v1';
@@ -92,6 +101,10 @@ function sanitize(raw: unknown): ChatPrefs {
     // invisible and un-undoable — exactly the trap the agent migration above
     // exists for. Normalize it away on load.
     webSearch: p.webSearch === 'on' && !salesforce ? 'on' : DEFAULT_PREFS.webSearch,
+    // Deep Research needs the web, so it cannot coexist with Salesforce mode;
+    // and it never survives a reload, because a run the user has forgotten
+    // about turns the next ordinary question into a multi-minute report.
+    deepResearch: p.deepResearch === true && !salesforce,
   };
 }
 

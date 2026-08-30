@@ -536,6 +536,59 @@ SSE events ([`sse.py`](orchestrator/app/sse.py)): `token`, `reasoning`, `status`
 
 ---
 
+## 10a. Three ways to answer: chat, web search, Deep Research
+
+The app answers in three deliberately different shapes. All three run entirely
+on the local vLLM/Qwen deployment and the local SearXNG — **no paid API key is
+required or contacted on any of these paths.**
+
+| Mode | Path | Typical cost | Turn it on |
+|---|---|---|---|
+| **Normal chat** | local model answers directly | ~8 s | default |
+| **Web search** | search → read ~8 pages → cited answer | ~20 s | "Web search" in the **+** menu (or let the level decide) |
+| **Deep Research** | plan → search → read → audit the gaps → search again → **cited report** | ~2-3 min | "Deep research" in the **+** menu |
+
+Deep Research is the iterative one: it decomposes the question into
+subquestions, searches each, reads the pages, then asks itself what is still
+*missing* and searches again for exactly that — up to a capped number of
+rounds — before writing a report where every claim carries a citation that is
+validated against the pages actually fetched. A measured live run: 3
+iterations, 24 sources, 15 cited, 0 fabricated, 170 s.
+
+Full detail, budgets and the reasoning behind each default:
+[docs/01-codebase/deep-research.md](docs/01-codebase/deep-research.md).
+
+### Why free search engines return 403 / 429 / CAPTCHA — and what we do about it
+
+SearXNG queries public engines with no API key, and several of them push back.
+Measured on this host (2026-08-30), the behaviour splits into three kinds:
+
+| Behaviour | Engines seen | Cost | What we do |
+|---|---|---|---|
+| **Self-benches** (`suspended_time` > 0) | startpage (CAPTCHA, 3600 s), brave (429, 180 s) | cheap — SearXNG skips them entirely while suspended, costing zero network time | leave enabled |
+| **Never benches** (`suspended_time` = 0) | duckduckgo, qwant | expensive — fails on *every* query, spending part of the result window each time | **disabled** in `searxng/settings.yml` |
+| **Blocked at this IP** | mojeek, dogpile (403 even to a browser UA) | fails forever, benches forever | **removed** from the default set |
+
+Two more fixes came out of the same investigation:
+
+* **wikidata** failed to *register* at boot with HTTP 403 — Wikimedia's
+  user-agent policy rejects a UA with no contact. `outgoing.useragent_suffix`
+  now carries one, and the same request returns 200.
+* **Engine supply** was one Google block away from collapse: only google-cse,
+  bing, mwmbl and yahoo answered a default query, and google-cse *did*
+  IP-block this host during testing. Seven shipped-disabled, keyless engines
+  (duckduckgo-web, marginalia, yandex, searchmysite, wiby …) are now enabled,
+  spreading load across independent quotas. Result on the same query mix:
+  **47-129 results with google-cse still blocked**, where before the same
+  outage left mostly noise.
+
+The missing `/etc/searxng/limiter.toml` warning and the
+`X-Forwarded-For nor X-Real-IP header is set!` error are **cosmetic** and
+deliberately not "fixed": the limiter is off (and cannot be enabled without a
+Valkey/Redis this stack does not run), SearXNG falls back to its packaged
+schema defaults, and `REMOTE_ADDR` already resolves to the orchestrator's
+container IP. Each appears exactly once per process start.
+
 ## 11. The engines
 
 [`orchestrator/app/engines/`](orchestrator/app/engines/):

@@ -158,6 +158,8 @@ services:
       --max-model-len ${RERANKER_MAX_CONTEXT:-4096}
       --gpu-memory-utilization ${RERANKER_GPU_MEMORY_UTILIZATION:-0.04}
       --runner pooling
+      --convert classify
+      --hf-overrides '{"architectures":["Qwen3ForSequenceClassification"],"classifier_from_token":["no","yes"],"is_original_qwen3_reranker":true}'
     environment:
       HF_HOME: /root/.cache/huggingface
       HF_HUB_OFFLINE: "1"

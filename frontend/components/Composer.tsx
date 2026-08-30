@@ -36,11 +36,12 @@ import { ModelPicker } from './ModelPicker';
 import { PastedChip } from './PastedChip';
 import { useToast } from './Providers';
 import {
+  IconBook,
   IconCloud,
-  IconSparkles,
   IconFileText,
   IconGlobe,
   IconSend,
+  IconSparkles,
   IconStop,
   IconX,
 } from './icons';
@@ -623,6 +624,31 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
                 >
                   <IconGlobe size={13} />
                   Web search
+                  <IconX size={11} />
+                </button>
+              )}
+
+              {/* Deep Research (2026-08-30). Like the Web search pill this
+                  appears only while the tool is ON, and only outside
+                  Salesforce mode — research IS web work. It says "next
+                  answer" because the pref is deliberately one-shot: a
+                  multi-minute report the user forgot they armed would be a
+                  worse surprise than an extra click. */}
+              {!prefs.salesforce && prefs.deepResearch && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    onPrefsChange({ ...prefs, deepResearch: false });
+                    // Same focus handoff as the pills above: this click
+                    // unmounts the button it is on.
+                    textareaRef.current?.focus();
+                  }}
+                  aria-pressed
+                  title="The next answer will be a researched, cited report — click to cancel"
+                  className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-accent/50 bg-accent/10 px-2.5 py-1 text-xs font-medium text-accent transition-colors duration-ts"
+                >
+                  <IconBook size={13} />
+                  Deep research
                   <IconX size={11} />
                 </button>
               )}

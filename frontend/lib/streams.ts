@@ -490,6 +490,7 @@ export async function startStream(opts: StartStreamOptions): Promise<void> {
         effort: prefs.effort,
         agent: prefs.agent,
         web_search: prefs.webSearch,
+        deep_research: prefs.deepResearch,
         // The single-image spelling stays for the proxy's v1 contract; the
         // full list rides alongside when more than one image is attached.
         ...(opts.images?.length ? { image: opts.images[0] } : {}),

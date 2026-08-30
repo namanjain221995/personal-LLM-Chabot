@@ -18,6 +18,7 @@ import {
 import { menuKeyAction } from '@/lib/conversationMenu';
 import type { ChatPrefs } from '@/lib/prefs';
 import {
+  IconBook,
   IconCheck,
   IconCloud,
   IconGlobe,
@@ -29,6 +30,7 @@ import {
 const ITEM_ICON: Record<ComposerMenuItemId, React.ComponentType<{ size?: number; className?: string }>> = {
   files: IconPaperclip,
   'web-search': IconGlobe,
+  'deep-research': IconBook,
   salesforce: IconCloud,
   'sf-live': IconSparkles,
 };
@@ -53,6 +55,7 @@ export function AttachMenu({
     salesforce: prefs.salesforce,
     sfLive: prefs.sfLive,
     webSearchOn: prefs.webSearch === 'on',
+    deepResearchOn: prefs.deepResearch,
     streaming,
   });
 

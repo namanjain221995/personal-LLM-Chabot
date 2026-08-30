@@ -253,6 +253,7 @@ async def _collect_results(
     queries: List[str],
     effort: str = "medium",
     emit: Optional[Emit] = None,
+    categories: str = "",
 ) -> List[SearchResult]:
     """Search every query and merge the results fairly.
 
@@ -274,7 +275,15 @@ async def _collect_results(
         if cached is not None:
             return q, cached, None
         try:
-            results = await provider.search(q, settings.search_max_results)
+            # The category hint is passed ONLY when there is one, so a
+            # provider written against the two-argument signature (the
+            # interface before 2026-08-30, including any operator's own) keeps
+            # working untouched on the ordinary search path.
+            results = await (
+                provider.search(q, settings.search_max_results, categories)
+                if categories
+                else provider.search(q, settings.search_max_results)
+            )
         except SearchUnavailableError as exc:
             return q, None, exc
         _cache_put(f"q:{provider.name}:{q}", results)

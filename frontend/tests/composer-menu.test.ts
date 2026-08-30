@@ -12,15 +12,24 @@ function prefs(over: Partial<ChatPrefs> = {}): ChatPrefs {
 }
 
 describe('composer "+" menu items', () => {
-  it('always offers all four rows: files, web, salesforce, live (owner 2026-08-06)', () => {
+  // Five rows since Deep Research joined the menu (2026-08-30); the
+  // owner-2026-08-06 rule is unchanged — the menu still reads as the COMPLETE
+  // capability list, with every row always visible whatever the mode.
+  it('always offers all five rows: files, web, research, salesforce, live', () => {
     for (const salesforce of [false, true]) {
       const ids = composerMenuItems({
         salesforce,
         sfLive: false,
-        webSearchOn: false,
+        webSearchOn: false, deepResearchOn: false,
         streaming: false,
       }).map((i) => i.id);
-      expect(ids).toEqual(['files', 'web-search', 'salesforce', 'sf-live']);
+      expect(ids).toEqual([
+        'files',
+        'web-search',
+        'deep-research',
+        'salesforce',
+        'sf-live',
+      ]);
     }
   });
 
@@ -28,7 +37,7 @@ describe('composer "+" menu items', () => {
     const items = composerMenuItems({
       salesforce: true,
       sfLive: false,
-      webSearchOn: false,
+      webSearchOn: false, deepResearchOn: false,
       streaming: false,
     });
     expect(items.find((i) => i.id === 'web-search')?.hint).toMatch(
@@ -40,7 +49,7 @@ describe('composer "+" menu items', () => {
     const items = composerMenuItems({
       salesforce: false,
       sfLive: false,
-      webSearchOn: false,
+      webSearchOn: false, deepResearchOn: false,
       streaming: false,
     });
     expect(items.find((i) => i.id === 'sf-live')?.hint).toMatch(
@@ -52,7 +61,7 @@ describe('composer "+" menu items', () => {
     const items = composerMenuItems({
       salesforce: false,
       sfLive: false,
-      webSearchOn: true,
+      webSearchOn: true, deepResearchOn: false,
       streaming: false,
     });
     expect(items.find((i) => i.id === 'files')?.checked).toBeUndefined();
@@ -64,7 +73,7 @@ describe('composer "+" menu items', () => {
     const items = composerMenuItems({
       salesforce: false,
       sfLive: false,
-      webSearchOn: false,
+      webSearchOn: false, deepResearchOn: false,
       streaming: true,
     });
     expect(items.find((i) => i.id === 'files')?.disabled).toBe(true);
@@ -123,18 +132,20 @@ describe('activating an item', () => {
 });
 
 describe('roving focus skips disabled rows', () => {
-  // Streaming menu: [files: DISABLED, web-search, salesforce, sf-live]
+  // Streaming menu: [files: DISABLED, web-search, deep-research, salesforce,
+  // sf-live] — index of the LAST row moved 3 -> 4 when Deep Research landed.
   const streaming = composerMenuItems({
     salesforce: false,
     sfLive: false,
-    webSearchOn: false,
+    webSearchOn: false, deepResearchOn: false,
     streaming: true,
   });
 
   it('walks past the disabled files row in the direction of travel', () => {
-    // ArrowUp from web-search (1) targets files (0) — dead — wraps to 3.
-    expect(nextEnabledIndex(streaming, 0, false)).toBe(3);
-    // ArrowDown wrap from sf-live (3) targets 0 — lands on 1.
+    // ArrowUp from web-search (1) targets files (0) — dead — wraps to the
+    // last row, now sf-live at 4.
+    expect(nextEnabledIndex(streaming, 0, false)).toBe(4);
+    // ArrowDown wrap from sf-live (4) targets 0 — dead — lands on 1.
     expect(nextEnabledIndex(streaming, 0, true)).toBe(1);
   });
 
@@ -175,7 +186,7 @@ describe('Live Salesforce (2026-08-06)', () => {
     const off = composerMenuItems({
       salesforce: false,
       sfLive: true, // stale stored value: must not read as active
-      webSearchOn: false,
+      webSearchOn: false, deepResearchOn: false,
       streaming: false,
     });
     const live = off.find((i) => i.id === 'sf-live');

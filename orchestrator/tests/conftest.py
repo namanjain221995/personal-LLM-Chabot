@@ -49,6 +49,10 @@ from app.config import settings  # noqa: E402
 #: about. `schema_migrations` is deliberately absent — truncating it would make
 #: the next init_schema() re-run every migration.
 _APP_TABLES = (
+    # V11 Deep Research runs. The user_id FK cascades, but a run started by an
+    # anonymous API call has user_id NULL and would survive every other
+    # truncation — so it is listed explicitly.
+    "research_runs",
     # V8 web-search memory: web_results cascades from web_searches, but the
     # explicit order keeps TRUNCATE happy either way; web_pages is global.
     "web_crawls",

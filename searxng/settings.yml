@@ -14,6 +14,11 @@ use_default_settings:
     remove:
       - ahmia
       - torch
+      # 403 from this host's egress IP even with a browser UA — an IP/ASN
+      # block that no setting here can undo (probed 2026-08-30). Left in the
+      # pool they fail every query and self-bench for 180 s forever.
+      - mojeek
+      - dogpile
 
 server:
   secret_key: "ultrasecretkey"
@@ -46,8 +51,6 @@ engines:
   # itself the way startpage (3600s) does (logged 2026-08-30 post-restart).
   - name: duckduckgo
     disabled: true
-  - name: mojeek
-    disabled: false
   - name: bing
     disabled: false
   # Qwant CAPTCHAs this host and raises suspended_time=0, so SearXNG never
@@ -57,8 +60,6 @@ engines:
     disabled: true
   - name: yahoo
     disabled: false
-  - name: dogpile
-    disabled: false
   - name: mwmbl
     disabled: false
   - name: wikipedia
@@ -66,6 +67,34 @@ engines:
   - name: github
     disabled: false
   - name: arxiv
+    disabled: false
+  # Engine supply, measured 2026-08-30. The four engines that answer a default
+  # general query here (google cse, bing, mwmbl, yahoo) are one Google IP-block
+  # away from two, and google cse DID block this host during testing — the
+  # block outlived SearXNG's 180 s bench and every retry re-armed it. These
+  # seven ship disabled, need no key and no account, and each returned results
+  # from this host on the day they were enabled; together with the existing
+  # pool they measured 70 unique URLs in 3.07 s. Independent quotas are the
+  # whole point: no single upstream can take search down any more.
+  #
+  # "duckduckgo web" is a DIFFERENT engine from "duckduckgo" (disabled above
+  # for its suspended_time=0 CAPTCHA); this one answered cleanly.
+  #
+  # NOT enabled, though they work: seznam (Czech) and naver (Korean). They are
+  # region search engines, and on the first live query after enabling them a
+  # Korean blog and a Korean product page took two of the eight source slots
+  # for an English question about DGX Spark. Volume is not the goal — usable
+  # sources are. yandex stays because its index is general-web rather than
+  # region-locked.
+  - name: duckduckgo web
+    disabled: false
+  - name: marginalia
+    disabled: false
+  - name: yandex
+    disabled: false
+  - name: searchmysite
+    disabled: false
+  - name: wiby
     disabled: false
 
 # Upstreams occasionally drop HTTP/2 streams mid-response, which httpx surfaces
@@ -75,3 +104,11 @@ engines:
 outgoing:
   enable_http2: false
   retries: 1
+  # Wikimedia's user-agent policy REJECTS a UA with no contact: query.wikidata.org
+  # answered 403 "Please respect our user-agent policy" to the default
+  # "SearXNG/2026.7.30", and 200 to the same request with a contact appended
+  # (probed in-container 2026-08-30). That 403 is why the wikidata engine failed
+  # to REGISTER at boot, not just to answer. The suffix is appended to the UA of
+  # every outgoing request, so it is deliberately an organisation URL and
+  # nothing personal.
+  useragent_suffix: "+https://techsarasolutions.com"
