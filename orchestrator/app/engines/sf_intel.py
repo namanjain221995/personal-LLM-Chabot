@@ -60,8 +60,20 @@ Emit = Callable[[str, dict], Awaitable[None]]
 #: everything retrieved; this is an illustration, and the prompt says so.
 ANSWER_SAMPLE_ROWS = 120  # was 30 (2026-08-18)
 
-#: Rows put on `meta.data` for the table the user sees.
-PREVIEW_ROWS = 200
+#: Rows put on `meta.data` for the table the user sees — and therefore what a
+#: CSV download of that table contains.
+#:
+#: This was a THIRD independent 200 (after core/salesforce.py's MAX_ROWS and
+#: plan.py's MAX_LIMIT). With the count fixed and the full list fetched, the
+#: answer correctly said "225" while the table and the CSV still held 200,
+#: because the payload was sliced here. It now follows the shared preview cap
+#: (SQL_PREVIEW_ROW_CAP, 2000) so the table shows what was actually retrieved
+#: (2026-08-29).
+def _preview_rows(columns: int = 0) -> int:
+    from ..config import settings
+    from ..core.exports import preview_row_limit
+
+    return preview_row_limit(columns, max(1, int(settings.sql_preview_row_cap)))
 
 
 @dataclass
@@ -595,7 +607,7 @@ async def _execute_live(
     # for out of █ characters in a code block.
     from .sql import _chart_line, attach_chart
 
-    preview = result.rows[:PREVIEW_ROWS]
+    preview = result.rows[: _preview_rows(len(result.columns or ()))]
     chart_extras: Dict[str, Any] = {}
     if preview and isinstance(preview[0], dict):
         chart_columns = [

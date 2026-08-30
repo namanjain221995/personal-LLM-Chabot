@@ -28,6 +28,8 @@ export class SSEParser {
   private dataLines: string[] = [];
   /** True when the previous chunk ended in \r (maybe half of a CRLF). */
   private pendingCR = false;
+  /** How far into `buffer` we have already looked for a line break. */
+  private scanned = 0;
 
   /**
    * Feed a decoded text chunk; returns every event completed by this chunk.
@@ -44,10 +46,34 @@ export class SSEParser {
     this.buffer += chunk;
     const events: SSEEvent[] = [];
 
+    // FAST PATH for a very large single event. A data table arrives as one
+    // `data:` line of several megabytes with no interior line break, split
+    // across hundreds of network chunks. If THIS chunk has no break, neither
+    // does the unscanned tail, and the head was already scanned — so there is
+    // no complete line and nothing to look for. Skipping the scan matters
+    // because indexOf() forces V8 to flatten the accumulated rope, which is
+    // O(n) per chunk and therefore O(n^2) over the event.
+    if (chunk.indexOf('\n') === -1 && chunk.indexOf('\r') === -1) {
+      this.scanned = this.buffer.length;
+      return events;
+    }
+
     // Process every complete line currently in the buffer.
+    //
+    // `scanned` is why this is linear. It used to be
+    // `this.buffer.search(/[\r\n]/)`, which rescans the WHOLE accumulated
+    // buffer from index 0 on every chunk. A meta event is a single `data:`
+    // line with no interior newline, so a large one was rescanned once per
+    // 16 KB chunk: measured 1 MB = 31 ms, 4 MB = 436 ms, 8 MB = 1.5 s, 16 MB =
+    // 6.7 s of BLOCKED main thread — a frozen tab, not a slow one. Resuming
+    // the search where the last one gave up makes a big table cost O(n)
+    // (2026-08-29).
     for (;;) {
-      const nl = this.buffer.search(/[\r\n]/);
-      if (nl === -1) break;
+      const nl = this.nextLineBreak();
+      if (nl === -1) {
+        this.scanned = this.buffer.length;
+        break;
+      }
       const line = this.buffer.slice(0, nl);
       let sepLen = 1;
       if (this.buffer[nl] === '\r') {
@@ -58,11 +84,22 @@ export class SSEParser {
         }
       }
       this.buffer = this.buffer.slice(nl + sepLen);
+      this.scanned = 0;
 
       const done = this.processLine(line);
       if (done) events.push(done);
     }
     return events;
+  }
+
+  /** Index of the next CR or LF at or after `scanned`, or -1. */
+  private nextLineBreak(): number {
+    const from = this.scanned;
+    const lf = this.buffer.indexOf('\n', from);
+    const cr = this.buffer.indexOf('\r', from);
+    if (lf === -1) return cr;
+    if (cr === -1) return lf;
+    return Math.min(lf, cr);
   }
 
   private processLine(line: string): SSEEvent | null {

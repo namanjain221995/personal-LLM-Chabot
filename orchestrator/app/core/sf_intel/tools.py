@@ -29,6 +29,7 @@ from ...config import settings
 from .. import salesforce
 from .models import SalesforceQueryPlan
 from .plan import (
+    MAX_LIMIT,
     aggregate_column,
     CompiledQuery,
     ObjectSchema,
@@ -52,10 +53,10 @@ COMMON_OBJECTS = ("Opportunity", "Account", "Case", "Task", "Contact", "Lead")
 
 #: Total records ONE request may pull across all pages. Pagination exists to
 #: answer "how many", not to mirror the org into a prompt.
-MAX_TOTAL_RECORDS = 2000
+MAX_TOTAL_RECORDS = 10_000
 
 #: Pages one request may fetch. A bound on the loop as well as on the rows.
-MAX_PAGES = 10
+MAX_PAGES = 20
 
 
 class SalesforceToolError(RuntimeError):
@@ -301,7 +302,9 @@ class QueryResult:
     columns: Tuple[str, ...] = ()
 
 
-async def compile_and_validate(plan: SalesforceQueryPlan) -> CompiledQuery:
+async def compile_and_validate(
+    plan: SalesforceQueryPlan, *, limit_cap: int = MAX_LIMIT
+) -> CompiledQuery:
     """Validate a plan against the live describes and compile it.
 
     Raises PlanRejected. Nothing is executed and no partial SOQL escapes: the
@@ -342,7 +345,9 @@ async def compile_and_validate(plan: SalesforceQueryPlan) -> CompiledQuery:
     def resolve_object(name: str) -> Optional[ObjectSchema]:
         return resolved.get(name)
 
-    return compile_plan(plan, schema, resolve_object=resolve_object)
+    return compile_plan(
+        plan, schema, resolve_object=resolve_object, limit_cap=limit_cap
+    )
 
 
 async def execute_salesforce_query_plan(
@@ -438,6 +443,42 @@ async def execute_salesforce_query_plan(
             # exists to prevent. It shipped broken once because the failure was
             # only visible at info level.
             log.warning("count companion query failed: %s", str(exc)[:200])
+
+    # The LIST half of the same bug. A records query compiles to LIMIT 200, so
+    # Salesforce returns 200 rows and NO cursor: the table and the CSV then hold
+    # 200 of 225 while the headline correctly says 225. Now that the true total
+    # is known, refetch with a LIMIT that can actually reach it and follow
+    # queryMore. queryMore CONTINUES ONE logical query rather than starting a
+    # new one, so a full list costs ~1 query against the org's daily limit, and
+    # MAX_TOTAL_RECORDS / MAX_PAGES still bound a runaway pull (2026-08-29).
+    # A CEILING, not a cliff. Gating on `total_size <= MAX_TOTAL_RECORDS` meant
+    # that a 2,500-record answer skipped this block entirely and left 200 rows
+    # on the table beside a correct headline of 2,500 — the larger the result,
+    # the worse the table. Fetch as much as the ceiling allows instead.
+    want = min(int(total_size or 0), MAX_TOTAL_RECORDS)
+    if not compiled.is_aggregate and total_size is not None and len(rows) < want:
+        try:
+            full = await compile_and_validate(
+                plan.model_copy(update={"limit": want, "offset": 0}),
+                limit_cap=want,
+            )
+            first_full = await salesforce.run_soql_page(full.soql, max_rows=want)
+            complete: List[Dict[str, Any]] = list(first_full["rows"])
+            cursor = first_full.get("next_records_url") or ""
+            extra_pages = 1
+            while cursor and extra_pages < MAX_PAGES and len(complete) < want:
+                nxt = await salesforce.query_more(cursor)
+                complete.extend(nxt["rows"])
+                cursor = nxt.get("next_records_url") or ""
+                extra_pages += 1
+                if on_page is not None:
+                    await on_page(len(complete))
+            if len(complete) > len(rows):
+                rows = complete
+                compiled = full
+                pages += extra_pages
+        except Exception as exc:  # noqa: BLE001 — the first page is still a valid answer
+            log.warning("full-list fetch failed, keeping the first page: %s", str(exc)[:200])
 
     return QueryResult(
         soql=compiled.soql,

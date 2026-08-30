@@ -352,7 +352,10 @@ def test_a_full_result_reaches_the_figures_while_the_preview_stays_small():
 
     from app.engines import sql as sqleng
 
-    rows = [[f"cand-{i}", "2000"] for i in range(3000)]
+    # Deliberately ABOVE the preview cap, whatever the cap currently is: the
+    # invariant under test is "the table is bounded, the figures are not".
+    total = settings.sql_preview_row_cap + 500
+    rows = [[f"cand-{i}", "2000"] for i in range(total)]
 
     async def main():
         events = []
@@ -376,11 +379,14 @@ def test_a_full_result_reaches_the_figures_while_the_preview_stays_small():
             await sqleng.run_sql_engine("how much did each candidate pay", [], emit)
 
         meta = [d for k, d in events if k == "meta"][-1]
-        assert len(meta["data"]) == settings.sql_preview_row_cap  # the UI preview cap holds
+        # The preview carries every row it has, up to the cap — the point of
+        # this test is that `data` never EXCEEDS the cap while the figures
+        # cover the whole result, not that it is always exactly the cap.
+        assert len(meta["data"]) == settings.sql_preview_row_cap
         assert meta["truncated"] is True
         # …but the AUTHORITATIVE figures cover every row.
-        assert '"total_rows": 3000' in fake_stream.prompt
-        assert "Total rows in the result: 3000" in fake_stream.prompt
+        assert f'"total_rows": {total}' in fake_stream.prompt
+        assert f"Total rows in the result: {total}" in fake_stream.prompt
 
     asyncio.run(main())
 

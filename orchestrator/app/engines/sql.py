@@ -21,7 +21,7 @@ from .. import llm
 from ..config import settings
 from ..core import chart_decision, org_brief, sf_dictionary
 from ..core.chart_pipeline import ChartResult, build_chart
-from ..core.exports import cap_rows, export_csv, export_xlsx, slugify
+from ..core.exports import cap_rows, export_csv, export_xlsx, slugify, preview_row_limit
 from ..core.schema_cache import format_schema, relevant_schema, schema_cache
 from ..core.sql_guard import guard_sql
 
@@ -1124,7 +1124,13 @@ async def run_sql_engine(
         except Exception:  # noqa: BLE001 — the wrap is best-effort
             summary_overflow = -1  # unknown, but definitely more than the cap
 
-    preview, truncated = cap_rows(rows, settings.sql_preview_row_cap)  # 500-row meta cap
+    # Bounded by cells as well as rows: the warehouse hands back every matching
+    # row (fetch cap 100,001) in milliseconds, so the only reason to cut here is
+    # what the browser and the message jsonb can carry — and that is a function
+    # of WIDTH as much as length.
+    preview, truncated = cap_rows(
+        rows, preview_row_limit(len(columns), settings.sql_preview_row_cap)
+    )
     # §10: data = array of row objects (≤500), truncated = TOP-LEVEL boolean.
     meta: dict = {
         "route": "sql",
