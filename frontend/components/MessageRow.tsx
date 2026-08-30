@@ -17,6 +17,7 @@ import type { VersionInfo } from '@/lib/branching';
 import { parseClarification } from '@/lib/clarification';
 import { ClarificationRecord } from './ClarificationCard';
 import { Loader } from './Loader';
+import { LiveStatus } from './LiveStatus';
 import { ReasoningStar } from './ReasoningStar';
 import { SalesforceSourceLine } from './SalesforceSourceLine';
 import {
@@ -533,10 +534,18 @@ export function MessageRow({
         />
       )}
       {message.searchStatus && message.content.length === 0 && (
-        <div className="mb-2 flex items-center gap-2.5 text-sm text-muted">
-          <Loader size={22} />
-          {message.searchStatus}
-        </div>
+        <LiveStatus
+          text={message.searchStatus}
+          effortNote={
+            // `meta.effort` does not exist yet while streaming, so the phase
+            // text itself is the signal: only the planning path runs several
+            // full model passes before it can show a step. Measured: 213 s to
+            // the first step on a 23,520-character paste (2026-08-29).
+            /^planning/i.test(message.searchStatus)
+              ? 'It plans first, then runs each step — a long input can take a few minutes before the first step appears.'
+              : undefined
+          }
+        />
       )}
       {showShimmer ? (
         /* The ordinary "waiting for the first token" state. It used to be three
