@@ -143,6 +143,9 @@ export function ProofDrawer({ meta }: { meta: Meta }) {
               <DataTable
                 rows={meta.data}
                 truncated={meta.truncated}
+                // How many records MATCHED, which is not always how many came
+                // back — so a truncated table can say "2,000 of 28,230".
+                totalRows={meta.salesforce_sources?.record_count}
                 csvName="techsara-data"
               />
             )}

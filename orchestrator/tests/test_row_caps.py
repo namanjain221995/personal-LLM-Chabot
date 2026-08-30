@@ -3,10 +3,10 @@ from app.core.exports import EXPORT_ROW_CAP, PREVIEW_ROW_CAP, apply_export_cap, 
 
 
 def test_cap_constants():
-    # Raised 500 -> 2000 on 2026-08-29: a 225-row answer was being cut to 500
-    # only in the sense that larger ordinary results were; 2000 covers normal
-    # Salesforce result sets while still bounding what the browser must paint.
-    assert PREVIEW_ROW_CAP == 2000
+    # 500 -> 2000 -> 10000 on 2026-08-29. The browser is no longer the limit
+    # (the table mounts only the rows in view); what remains bounded is the
+    # jsonb persisted per message and re-shipped on every conversation reload.
+    assert PREVIEW_ROW_CAP == 10_000
     assert EXPORT_ROW_CAP == 100_000
 
 

@@ -264,7 +264,7 @@ async def org_key() -> str:
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
 
 
-async def run_soql_page(soql: str) -> Dict[str, Any]:
+async def run_soql_page(soql: str, *, max_rows: int = MAX_ROWS) -> Dict[str, Any]:
     """Run a guarded query and return the FULL first page envelope.
 
     `run_soql` deliberately returns only rows, which is right for the engines
@@ -273,7 +273,11 @@ async def run_soql_page(soql: str) -> Dict[str, Any]:
     those from a row list is exactly how a summary claims "29 records" for a
     314-record result.
     """
-    safe = guard_soql(soql)
+    # `max_rows` exists so a caller fetching a WHOLE result set can lift the
+    # 200-row cap. Salesforce only returns a nextRecordsUrl when the LIMIT
+    # exceeds one batch, so a hard 200 makes pagination impossible and the
+    # first page silently becomes "the answer".
+    safe = guard_soql(soql, max_rows=max_rows)
     body = await _query(safe)
     records = body.get("records", []) or []
     rows = [_clean(r) for r in records]

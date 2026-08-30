@@ -18,10 +18,21 @@ from xml.sax.saxutils import escape as _xml_escape
 from pathlib import Path
 from typing import List, Sequence, Tuple
 
-#: Rows sent to the browser table. 500 stopped a 225-row answer from showing in
-#: full; 2,000 covers ordinary Salesforce results while still bounding what the
-#: browser must paint. Anything larger belongs in an export, not a DOM table.
-PREVIEW_ROW_CAP = 2000
+#: Rows sent to the browser table.
+#:
+#: History: 500 stopped a 225-row answer from showing in full; 2,000 covered
+#: ordinary results; 10,000 (2026-08-29) covers essentially every real
+#: Salesforce answer — the largest table in this warehouse holds 28,230 rows
+#: and a filtered answer is far smaller.
+#:
+#: Why there is still a number here. `meta.data` is not just painted, it is
+#: PERSISTED per message as jsonb and shipped again on every conversation
+#: reload. The browser side is no longer the constraint (the table mounts only
+#: the rows in view, and the SSE parser is linear, both since 2026-08-29); the
+#: database and the reload are. Raise with SQL_PREVIEW_ROW_CAP if a workload
+#: genuinely needs more, and use the export path (EXPORT_ROW_CAP, 100,000) for
+#: anything beyond that.
+PREVIEW_ROW_CAP = 10_000
 EXPORT_ROW_CAP = 100_000
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
@@ -36,6 +47,28 @@ def slugify(text: str, max_len: int = 40, fallback: str = "export") -> str:
 def timestamped_filename(slug: str, ext: str) -> str:
     stamp = time.strftime("%Y%m%d-%H%M%S")
     return f"{slugify(slug)}-{stamp}.{ext.lstrip('.')}"
+
+
+#: A preview is bounded by CELLS as well as rows, because rows alone is the
+#: wrong unit: a `SELECT *` on the 268-column Interview__c emits 16 KB per ROW
+#: (155 MB at 10,000 rows), while a 4-column answer is trivial at 20,000.
+#: Whichever limit binds first wins, so a narrow result shows in full and a
+#: very wide one is cut before it can bloat the message jsonb.
+#:
+#: Sized from what real answers actually weigh in this deployment, measured
+#: from the stored messages: 19-22 columns at ~700 bytes per row, i.e. ~35
+#: bytes per cell. 120,000 cells is therefore ~4 MB in the worst realistic
+#: case — 20 columns x 6,000 rows, or the full 10,000 rows at 12 columns.
+#: (An earlier note here assumed 285 bytes per row from a 10-column sample;
+#: real answers are 2.5x that, which is why this is bounded by cells now.)
+PREVIEW_CELL_CAP = 120_000
+
+
+def preview_row_limit(columns: int, cap: int = PREVIEW_ROW_CAP) -> int:
+    """Rows to show given how WIDE each row is. Always at least one row."""
+    if columns <= 0:
+        return cap
+    return max(1, min(cap, PREVIEW_CELL_CAP // columns))
 
 
 def cap_rows(rows: Sequence, cap: int) -> Tuple[list, bool]:
@@ -244,6 +277,8 @@ def export_xml(
 
 __all__: List[str] = [
     "PREVIEW_ROW_CAP",
+    "PREVIEW_CELL_CAP",
+    "preview_row_limit",
     "EXPORT_ROW_CAP",
     "slugify",
     "timestamped_filename",
