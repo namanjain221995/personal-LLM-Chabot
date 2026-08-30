@@ -9,10 +9,13 @@ them.
 """
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from typing import Optional
 from urllib.parse import urlparse
+
+log = logging.getLogger(__name__)
 
 _TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
 _TAG_RE = re.compile(r"<[^>]+>")
@@ -143,6 +146,10 @@ def extract_readable_and_links(
                     seen.add(clean)
                     links.append(clean)
         except Exception:  # noqa: BLE001 — links are an extra, never a gate
+            # Loud on purpose: a systematically broken harvest (lxml missing,
+            # API change) otherwise looks exactly like "this site has no
+            # links", and the crawler quietly explores nothing.
+            log.warning("link harvest failed for %s", url, exc_info=True)
             links = []
     return extracted, links
 

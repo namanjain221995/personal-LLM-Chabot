@@ -24,4 +24,10 @@ argon2-cffi>=23.1
 itsdangerous>=2.1
 # App state: PostgreSQL (see requirements.txt for why [binary,pool]).
 psycopg[binary,pool]>=3.2,<4
+# The crawler's link harvest (core/extract.py) is real frontier logic, and a
+# missing lxml degrades it to "zero links found" rather than an error — a
+# failure mode CI must be able to see. lxml alone is a small manylinux wheel;
+# trafilatura (the heavy tree above it) stays out, and text extraction keeps
+# its _strip_tags fallback.
+lxml>=5
 pytest>=8.0
