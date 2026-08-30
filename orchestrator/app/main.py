@@ -723,6 +723,37 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     except Exception:
                         repo_followup = False
 
+            # Phase 3.5 (2026-08-30): a whole-SITE crawl. "index/crawl this
+            # site <url>" walks every in-scope page into the web store — the
+            # repo engine's shape for websites. Detected here so Phase 2 does
+            # not swallow the URL as a single pasted page, and so a follow-up
+            # question in a conversation that crawled a site can answer from
+            # the stored copy.
+            crawl_url = None
+            crawl_site_hits: list = []
+            crawl_site_host = ""
+            if (
+                settings.web_crawl_enabled
+                and request.text
+                and not request.pdf_data
+                and not request.image_data
+                and github_ref is None
+            ):
+                from .engines.crawl import detect_crawl, site_hits_for
+
+                crawl_url = detect_crawl(request.text)
+                if crawl_url is None and request.conversation_id:
+                    try:
+                        # Follow-up: does a crawled site in this conversation
+                        # hold relevant material? Cheap (one embed + a scoped
+                        # flat scan, ~60 ms) and decisive — no hits above the
+                        # relevance floor means normal routing proceeds.
+                        crawl_site_hits, crawl_site_host = await site_hits_for(
+                            conv_key, request.text
+                        )
+                    except Exception:
+                        crawl_site_hits = []
+
             # Phase 2: URL analysis. Pasted links → fetch+read; a follow-up with
             # no new link but pages already read this chat → inject their
             # relevant content (no re-fetch). GitHub URLs are handled by Phase 3
@@ -734,6 +765,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 and not request.pdf_data
                 and not request.image_data
                 and github_ref is None
+                and crawl_url is None
             ):
                 from . import db as _db
                 from .core.urls import (
@@ -1029,6 +1061,28 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
 
                 answer = await run_repo_engine(
                     text, github_ref, conv_key, history, emit
+                )
+            elif crawl_url is not None:
+                # Phase 3.5: crawl the whole site into the web store.
+                from .engines.crawl import run_crawl_engine
+
+                answer = await run_crawl_engine(
+                    text, crawl_url, conv_key, history, emit
+                )
+            elif crawl_site_hits:
+                # Follow-up about a crawled site → answer from the stored
+                # copy, cited and dated. Only reached when the scoped
+                # retrieval found chunks above the relevance floor, so an
+                # unrelated question in the same conversation routes normally.
+                from .engines.crawl import run_site_qa_engine
+
+                answer = await run_site_qa_engine(
+                    text,
+                    crawl_site_hits,
+                    crawl_site_host,
+                    history,
+                    emit,
+                    effort=request.effort,
                 )
             elif url_list:
                 # Phase 2: the user pasted link(s) → read them and answer.

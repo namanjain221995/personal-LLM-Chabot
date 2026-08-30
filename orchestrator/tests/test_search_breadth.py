@@ -95,15 +95,20 @@ def test_high_collects_more_than_medium_more_than_low(monkeypatch):
     assert hi == search.source_budget("max")
 
 
-def test_low_was_not_cut_by_the_rework(monkeypatch):
-    """Low read 10 sources before this change and must still read 10."""
-    # 2026-08-19 ladder collapse: legacy names ride aliases — medium and
-    # high both land on Think's budget; only Max digs at the old High depth.
+def test_effort_budgets_after_the_fast_search_fix(monkeypatch):
+    """The ladder still collapses to fast/think/max — and fast now SEARCHES.
+
+    fast/low budgets were 0/0, so forcing the web pill ON at Fast ran no
+    search at all and fell back to "No web results found — answering from
+    model knowledge" (measured 2026-08-30). Forcing search means search:
+    one query, a small read set, still fast.
+    """
     assert search.source_budget("medium") == search.source_budget("think") == 15
     assert search.source_budget("high") == search.source_budget("think")
     assert search.source_budget("extra_high") == search.source_budget("max") == 60
-    # Legacy low maps to fast, which never searches (allowance retired).
-    assert search.source_budget("low") == 0
+    assert search.query_budget("fast") == 1
+    assert search.source_budget("fast") == 8
+    assert search.source_budget("low") == 8  # legacy alias for fast
 
 
 # ---------------------------------------------------------------------------

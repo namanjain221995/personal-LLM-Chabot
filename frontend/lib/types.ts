@@ -17,6 +17,7 @@ export type Engine =
   | 'sql'
   | 'rag'
   | 'vision'
+  | 'crawl'
   | 'report'
   | 'chat'
   | 'agent'

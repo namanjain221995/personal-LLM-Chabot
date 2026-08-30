@@ -413,6 +413,35 @@ class Settings:
         self.search_source_char_budget: int = _int("SEARCH_SOURCE_CHAR_BUDGET", 8000)
         self.search_rate_per_min: int = _int("SEARCH_RATE_PER_MIN", 10)
         self.search_cache_ttl: float = _float("SEARCH_CACHE_TTL", 900.0)  # 15 min
+        # V8 web-search memory (2026-08-30): persist every search + fetched
+        # page in PostgreSQL and keep an embedded-chunk index over them, so
+        # repeat and related questions reuse pages already read. The vector
+        # index is DERIVED — deleting the directory is safe, PostgreSQL
+        # rebuilds it.
+        self.web_memory_enabled: bool = _bool("WEB_MEMORY_ENABLED", True)
+        self.lancedb_web_dir: str = os.environ.get(
+            "LANCEDB_WEB_DIR", "/data/lancedb-web"
+        )
+        # A stored page younger than this is served without refetching. Fresh-
+        # intent questions (the _FRESH_RE shapes) use the short TTL: "latest
+        # release" must hit the network even when a day-old copy exists.
+        self.web_page_ttl_s: int = _int("WEB_PAGE_TTL_S", 24 * 3600)
+        self.web_page_fresh_ttl_s: int = _int("WEB_PAGE_FRESH_TTL_S", 3600)
+        # V9 site crawler (2026-08-30): "index this site" crawls one site,
+        # sitemap-first, robots-respecting, into the same web store. The caps
+        # are the difference between a librarian and a vacuum cleaner.
+        self.web_crawl_enabled: bool = _bool("WEB_CRAWL_ENABLED", True)
+        self.web_crawl_max_pages: int = _int("WEB_CRAWL_MAX_PAGES", 1000)
+        self.web_crawl_max_minutes: float = _float("WEB_CRAWL_MAX_MINUTES", 15.0)
+        self.web_crawl_max_depth: int = _int("WEB_CRAWL_MAX_DEPTH", 4)
+        self.web_crawl_concurrency: int = _int("WEB_CRAWL_CONCURRENCY", 3)
+        self.web_crawl_delay_ms: int = _int("WEB_CRAWL_DELAY_MS", 400)
+        # Background expansion after a search (owner idea): follow a few
+        # in-site links from the pages a search just read, so the next related
+        # question hits warm content. One hop, few pages, few domains.
+        self.web_expand_after_search: bool = _bool("WEB_EXPAND_AFTER_SEARCH", True)
+        self.web_expand_pages_per_domain: int = _int("WEB_EXPAND_PAGES_PER_DOMAIN", 8)
+        self.web_expand_max_domains: int = _int("WEB_EXPAND_MAX_DOMAINS", 3)
 
         # --- Phase 2: URL / website analysis (fetches pasted links). ---
         self.url_analysis_enabled: bool = _bool("URL_ANALYSIS_ENABLED", True)

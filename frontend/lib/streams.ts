@@ -300,7 +300,18 @@ async function consume(s: LiveStream, body: ReadableStream<Uint8Array>) {
         };
       });
     } else if (ev.kind === 'step') {
-      updateAssistant(s, (m) => ({ ...m, steps: mergeStep(m.steps, ev.step) }));
+      // The first step RETIRES the planning line. `describe(plan)` sets a
+      // single static label ("Planning the steps for this task") when the run
+      // is classified, and nothing ever cleared it — so it sat above the
+      // timeline for the whole run, still claiming to be planning while the
+      // plan was already executing underneath. The steps carry the real,
+      // task-specific text; once they exist the placeholder is not just
+      // redundant, it is wrong (2026-08-29).
+      updateAssistant(s, (m) => ({
+        ...m,
+        steps: mergeStep(m.steps, ev.step),
+        searchStatus: undefined,
+      }));
     } else if (ev.kind === 'meta') {
       settleReasoningClock(s);
       updateAssistant(s, (m) => ({
