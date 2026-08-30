@@ -16,7 +16,9 @@ source.
 
 | Need | Read |
 |---|---|
+| **Understand how anything flows — as diagrams** | [`FLOWS.md`](FLOWS.md) |
 | Install/start/stop/troubleshoot | [`../README.md`](../README.md) |
+| Deep Research: the loop, budgets, citation validation | [`01-codebase/deep-research.md`](01-codebase/deep-research.md) |
 | Hardware matrix, model policy, state, fallback and upgrades | [`PORTABLE-RUNTIME.md`](PORTABLE-RUNTIME.md) |
 | Two-node DGX Spark cluster (`CLUSTER_MODE=dual`): topology, generated config, scripts, benchmarks, limitations | [`CLUSTER.md`](CLUSTER.md) |
 | Current files and entrypoints | [`00-INVENTORY.md`](00-INVENTORY.md) |
