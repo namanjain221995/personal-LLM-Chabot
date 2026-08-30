@@ -371,6 +371,26 @@ async def _rerank_results(
 
 #: Pages served from the store during THIS request, for the research panel
 #: and for tests: {url_key: fetched_at}.
+#: Strong references to write-behind tasks. asyncio keeps only weak refs to
+#: tasks, so an unreferenced create_task can be garbage-collected mid-flight,
+#: and an unobserved exception dies in silence — the review found a page with
+#: a NUL byte failing to store on EVERY search with no log line at all.
+_BACKGROUND_TASKS: set = set()
+
+
+def _spawn(coro) -> None:
+    """create_task with a held reference and a logged (never raised) failure."""
+    task = asyncio.get_running_loop().create_task(coro)
+    _BACKGROUND_TASKS.add(task)
+
+    def _done(t) -> None:
+        _BACKGROUND_TASKS.discard(t)
+        if not t.cancelled() and t.exception() is not None:
+            log.warning("background web-memory task failed", exc_info=t.exception())
+
+    task.add_done_callback(_done)
+
+
 def _page_ttl(message: str) -> int:
     """How old a stored page may be and still count as fresh for this ask."""
     if _FRESH_RE.search(message or ""):
@@ -404,7 +424,12 @@ async def _stored_pages(results: List[SearchResult], message: str) -> dict:
 
 
 def _store_page(
-    r: SearchResult, canonical_url: str, title: str, text: str, content_type: str
+    r: SearchResult,
+    canonical_url: str,
+    title: str,
+    text: str,
+    content_type: str,
+    links: Optional[List[str]] = None,
 ) -> None:
     """Persist one fetched page (blocking; called via run_in_thread)."""
     db.upsert_web_page(
@@ -416,6 +441,7 @@ def _store_page(
         content_type=content_type or "",
         fetch_status=200 if text else 0,
         content_hash=hashlib.sha256((text or "").encode("utf-8")).hexdigest(),
+        links=links or [],
     )
 
 
@@ -448,9 +474,13 @@ async def _fetch_source(
         # and parsing two pages at once can abort the interpreter. A dedicated
         # single-worker pool keeps the loop free AND keeps extraction serial.
         loop = asyncio.get_running_loop()
-        ext = await loop.run_in_executor(
+        # extract_readable_and_links, not extract_readable: same parse cost,
+        # and the harvested links ride into the store so a later crawl or the
+        # post-search expansion can walk from a page served fresh-from-store
+        # (the review found that path silently linkless).
+        ext, page_links = await loop.run_in_executor(
             _EXTRACT_POOL,
-            extract.extract_readable,
+            extract.extract_readable_and_links,
             fetched.content_type,
             fetched.body,
             fetched.url,
@@ -461,8 +491,10 @@ async def _fetch_source(
         # answer never waits on PostgreSQL.
         if settings.web_memory_enabled and ext.text.strip():
             full_text, canon, ctype, title0 = ext.text, fetched.url, fetched.content_type, ext.title
-            asyncio.get_running_loop().create_task(
-                db.run_in_thread(_store_page, r, canon, title0, full_text, ctype)
+            _spawn(
+                db.run_in_thread(
+                    _store_page, r, canon, title0, full_text, ctype, page_links
+                )
             )
         text = extract.truncate_chars(ext.text, settings.search_source_char_budget)
         if not text.strip():
@@ -592,7 +624,12 @@ async def _memory_sources(
 
 
 def _log_search_background(
-    message: str, queries: List[str], results: List[SearchResult], effort: str
+    message: str,
+    queries: List[str],
+    results: List[SearchResult],
+    effort: str,
+    user_id: Optional[int] = None,
+    conversation_id: str = "",
 ) -> None:
     """Persist the search log + returned links; then nudge the indexer."""
     rows = []
@@ -608,8 +645,12 @@ def _log_search_background(
             }
         )
     db.log_web_search(
-        user_id=None,
-        conversation_id="",
+        # The ids come from the dispatcher. They are what make the V8 log a
+        # per-conversation history at all — and what lets delete_conversation
+        # actually delete these rows (hardcoded None/"" left every deleted
+        # conversation's search text stored forever; review round 2026-08-30).
+        user_id=user_id,
+        conversation_id=conversation_id,
         message=message,
         queries=queries,
         provider=get_provider().name,
@@ -619,7 +660,12 @@ def _log_search_background(
 
 
 async def _persist_and_index(
-    message: str, queries: List[str], results: List[SearchResult], effort: str
+    message: str,
+    queries: List[str],
+    results: List[SearchResult],
+    effort: str,
+    user_id: Optional[int] = None,
+    conversation_id: str = "",
 ) -> None:
     """Background: write the search log, then index any new/changed pages.
 
@@ -628,7 +674,13 @@ async def _persist_and_index(
     """
     try:
         await db.run_in_thread(
-            _log_search_background, message, queries, results, effort
+            _log_search_background,
+            message,
+            queries,
+            results,
+            effort,
+            user_id,
+            conversation_id,
         )
     except Exception:  # noqa: BLE001
         pass
@@ -670,6 +722,8 @@ async def research_step(
     history: Sequence[dict] = (),
     effort: str = "medium",
     emit: Optional[Emit] = None,
+    user_id: Optional[int] = None,
+    conversation_id: str = "",
 ) -> Tuple[str, List[dict]]:
     """Search → read → answer for ONE agent step. → (answer, sources).
 
@@ -697,8 +751,10 @@ async def research_step(
     if not sources:
         return "", []
     sources = await _memory_sources(question, sources)
-    asyncio.get_running_loop().create_task(
-        _persist_and_index(question, queries, results, effort)
+    _spawn(
+        _persist_and_index(
+            question, queries, results, effort, user_id, conversation_id
+        )
     )
     answer = await llm.chat_completion(
         _answer_messages(question, sources, history), temperature=0.2, max_tokens=5000
@@ -711,7 +767,12 @@ async def research_step(
 
 
 async def run_search_engine(
-    message: str, history: Sequence[dict], emit: Emit, effort: str = "medium"
+    message: str,
+    history: Sequence[dict],
+    emit: Emit,
+    effort: str = "medium",
+    user_id: Optional[int] = None,
+    conversation_id: str = "",
 ) -> str:
     """Full search pipeline with status events, cited streaming, and fallback."""
     await emit("status", {"text": "Searching the web…"})
@@ -745,8 +806,10 @@ async def run_search_engine(
     await emit("research", {"phase": "read", "count": len(sources)})
 
     # Remember this search — log, pages, vectors — behind the answer.
-    asyncio.get_running_loop().create_task(
-        _persist_and_index(message, queries, results, effort)
+    _spawn(
+        _persist_and_index(
+            message, queries, results, effort, user_id, conversation_id
+        )
     )
 
     parts: List[str] = []

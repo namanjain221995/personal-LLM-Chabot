@@ -236,10 +236,19 @@ async def retrieve(
             validate_query_dimension(metadata, vectors[0], lancedb_web_dir())
             query = table.search(vectors[0]).limit(max(int(top_k) * 6, 24))
             if site_prefix:
+                # scope_prefix is normalized (scheme dropped, "www." stripped)
+                # but the url column stores the ORIGINAL URL — a crawl of a
+                # www-canonical site stores "https://www.…", which a bare-host
+                # LIKE can never match, so site Q&A silently never fired for
+                # those sites (review round, 2026-08-30). Match both spellings
+                # under both schemes.
                 safe = site_prefix.replace("'", "''")
-                query = query.where(
-                    f"url LIKE 'https://{safe}%' OR url LIKE 'http://{safe}%'"
+                alts = " OR ".join(
+                    f"url LIKE '{scheme}://{host_form}%'"
+                    for scheme in ("https", "http")
+                    for host_form in (safe, f"www.{safe}")
                 )
+                query = query.where(alts)
             return query.to_list()
 
         hits = await asyncio.to_thread(_search)

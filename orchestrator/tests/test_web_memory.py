@@ -245,3 +245,61 @@ def test_search_answer_honours_the_effort(monkeypatch):
     # The measured bug: this call carried NO effort, so it defaulted to a full
     # thinking pass — 851 reasoning tokens ahead of a 32-token answer.
     assert rec.get("effort") == "fast"
+
+
+# ---------------------------------------------------------------------------
+# Review round (2026-08-30): NUL bytes, stored links, search attribution
+# ---------------------------------------------------------------------------
+
+
+def test_upsert_web_page_survives_nul_bytes():
+    # text/plain bodies and PDF text layers can carry \x00 through UTF-8
+    # decoding; PostgreSQL rejects it. This aborted whole crawls and silently
+    # killed the search path's write-behind store for the affected URL.
+    row = db.upsert_web_page(
+        url_key="example.com/nul", url="https://example.com/nul",
+        canonical_url="", title="N\x00ul", text="before\x00after " * 40,
+        content_type="text/plain", fetch_status=200, content_hash="h1",
+    )
+    assert row["id"] > 0
+    stored = db.get_web_pages(["example.com/nul"])
+    assert "\x00" not in stored[0]["text"] and "beforeafter" in stored[0]["text"]
+
+
+def test_upsert_web_page_stores_links_and_returns_them():
+    links = ["https://example.com/a", "https://example.com/b"]
+    db.upsert_web_page(
+        url_key="example.com/hub", url="https://example.com/hub",
+        canonical_url="", title="Hub", text="hub page " * 40,
+        content_type="text/html", fetch_status=200, content_hash="h1",
+        links=links,
+    )
+    assert db.get_web_pages(["example.com/hub"])[0]["links"] == links
+    # A refetch replaces the links along with the text they came from.
+    db.upsert_web_page(
+        url_key="example.com/hub", url="https://example.com/hub",
+        canonical_url="", title="Hub", text="hub page v2 " * 40,
+        content_type="text/html", fetch_status=200, content_hash="h2",
+        links=["https://example.com/c"],
+    )
+    assert db.get_web_pages(["example.com/hub"])[0]["links"] == ["https://example.com/c"]
+
+
+def test_search_log_carries_user_and_conversation(monkeypatch):
+    # The engine hardcoded user_id=None / conversation_id="" — so the V8 log
+    # was anonymous AND delete_conversation could never match its rows,
+    # leaving deleted conversations' search text stored forever.
+    captured = {}
+    monkeypatch.setattr(
+        search.db, "log_web_search", lambda **kw: captured.update(kw) or 1
+    )
+    monkeypatch.setattr(
+        search, "get_provider", lambda: SimpleNamespace(name="test")
+    )
+    search._log_search_background(
+        "who won", ["who won"],
+        [SearchResult(title="t", url="https://a.example/x", snippet="s")],
+        "fast", user_id=7, conversation_id="conv-attr-1",
+    )
+    assert captured["user_id"] == 7
+    assert captured["conversation_id"] == "conv-attr-1"

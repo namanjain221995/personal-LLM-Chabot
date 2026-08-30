@@ -59,4 +59,16 @@ describe('AgentTimeline', () => {
     const { container } = render(<AgentTimeline steps={[]} />);
     expect(container.firstChild).toBeNull();
   });
+  it('counts every step on a reloaded transcript, failed ones included', () => {
+    cleanup();
+    // Review round 2026-08-30: the label counted only 'done', so a plan with
+    // a failed step visibly disagreed with its own list ("2 steps" over 3).
+    const mixed: AgentStep[] = [
+      { id: 1, title: 'a', status: 'done' },
+      { id: 2, title: 'b', status: 'failed' },
+      { id: 3, title: 'c', status: 'done' },
+    ];
+    render(<AgentTimeline steps={mixed} />);
+    expect(screen.getAllByRole('button')[0].textContent).toContain('3 steps');
+  });
 });

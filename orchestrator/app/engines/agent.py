@@ -302,6 +302,8 @@ async def _run_step_impl(
     effort: str = "medium",
     emit: Optional[Emit] = None,
     message: str = "",
+    user_id: Optional[int] = None,
+    conversation_id: str = "",
 ) -> Tuple[str, str, dict]:
     """Run ONE step through the existing engines. → (output, detail, sub_meta).
 
@@ -440,7 +442,14 @@ async def _run_step_impl(
 
         # Pass emit so a plan's web steps feed ONE combined research panel.
         answer, sources = await research_step(
-            step.input, list(history), effort, emit
+            step.input,
+            list(history),
+            effort,
+            emit,
+            # Who asked, for the V8 search log — the same attribution the
+            # direct search route records (review round, 2026-08-30).
+            user_id=user_id,
+            conversation_id=conversation_id,
         )
         if sources:
             domains = ", ".join(dict.fromkeys(s["domain"] for s in sources))
@@ -495,6 +504,8 @@ async def execute_steps(
     salesforce: bool = True,
     effort: str = "medium",
     message: str = "",
+    user_id: Optional[int] = None,
+    conversation_id: str = "",
 ) -> List[dict]:
     """Run all steps concurrently (cap 3), emitting step events (§3b)."""
     semaphore = asyncio.Semaphore(STEP_CONCURRENCY)
@@ -504,7 +515,14 @@ async def execute_steps(
             await emit("step", {"id": step.id, "title": step.title, "status": "running"})
             try:
                 output, detail, sub_meta = await _run_step_impl(
-                    step, history, salesforce, effort, emit, message
+                    step,
+                    history,
+                    salesforce,
+                    effort,
+                    emit,
+                    message,
+                    user_id,
+                    conversation_id,
                 )
             except Exception as exc:
                 detail = _shorten(str(exc) or exc.__class__.__name__, 200)
@@ -693,6 +711,9 @@ class AgentState(TypedDict, total=False):
     web: bool
     #: The user FORCED search on (web pill), as opposed to auto allowing it.
     web_forced: bool
+    #: Search-log attribution: whose conversation these web steps belong to.
+    user_id: Optional[int]
+    conversation_id: str
     plan: AgentPlan
     results: List[dict]
     answer: str
@@ -719,6 +740,8 @@ async def _execute_node(state: AgentState) -> dict:
         state.get("salesforce", True),
         state.get("effort", "medium"),
         state.get("message", ""),
+        state.get("user_id"),
+        state.get("conversation_id", ""),
     )
     return {"results": results}
 
@@ -782,6 +805,8 @@ async def run_agent_engine(
     salesforce: bool = True,
     web: bool = True,
     web_forced: bool = False,
+    user_id: Optional[int] = None,
+    conversation_id: str = "",
 ) -> str:
     """Entry point used by /chat when agent=true.
 
@@ -797,6 +822,8 @@ async def run_agent_engine(
             "history": list(history),
             "emit": emit,
             "effort": effort,
+            "user_id": user_id,
+            "conversation_id": conversation_id,
             "salesforce": salesforce,
             "web": web,
             "web_forced": web_forced,

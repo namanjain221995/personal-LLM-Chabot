@@ -72,14 +72,16 @@ export function AgentTimeline({ steps }: { steps: AgentStep[] }) {
     });
   }
 
-  const done = steps.filter((s) => s.status === 'done').length;
+  // Reloaded transcripts have no client clock; label with the TOTAL step
+  // count — counting only 'done' undercounted whenever a step failed, and
+  // the list below visibly disagreed with its own summary.
   const summary = running
     ? elapsedMs != null && elapsedMs >= 1000
       ? `Working… ${formatElapsed(elapsedMs)}`
       : 'Working…'
     : elapsedMs != null
       ? `Worked for ${formatElapsed(elapsedMs)}`
-      : `${done} step${done === 1 ? '' : 's'}`;
+      : `${steps.length} step${steps.length === 1 ? '' : 's'}`;
 
   return (
     <div className="mb-3">

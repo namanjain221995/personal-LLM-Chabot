@@ -1,5 +1,41 @@
 # Changelog
 
+## The review round: the crawler grows up (2026-08-30, same day)
+
+A 31-agent adversarial review of the branch below confirmed 14 distinct
+defects; all are fixed here, each with a regression test.
+
+The ones that mattered most: **a single NUL byte** in a fetched page (PDF
+text layers carry them) raised a PostgreSQL error that aborted the whole
+crawl and silently blocked that URL from ever being stored — page text now
+goes through the same NUL-stripping every sibling field always had.
+**Site Q&A never fired on `www.` sites** — the scope prefix strips `www.`
+but stored URLs keep it, so the retrieval filter matched nothing; it now
+matches both spellings under both schemes. **Deleted conversations kept
+their search text forever**: the search log was written with a hardcoded
+empty conversation id, unreachable by deletion; the real user and
+conversation now ride through the search AND agent paths. **"index" inside
+a URL** (`…/index.html`) or as an ordinary noun launched thousand-page
+crawls — intent now matches against the message with URLs collapsed to a
+token, and "index" needs an object. **Resume was impossible**: stored pages
+consumed the fetch budget (every resume stopped at the same spot), the
+sitemap frontier was pre-cut to what one run could do, and the advertised
+"continue crawling" phrase didn't route anywhere — all three fixed, and a
+cancelled crawl now finishes as `capped` (partial copy usable, resumable)
+instead of sticking at `running` forever. Stored pages also keep the links
+their HTML pointed at (V10), so warm pages no longer dead-end walk-mode
+crawls or the post-search expansion.
+
+Smaller but real: explicit wishes (web pill, pasted URL, agent toggle,
+"latest/today" wording) now outrank the stored site copy in routing; the
+indexing drain bails after two stalled rounds instead of spinning 400 times
+against a down embedding service; background expansions are single-flight;
+write-behind store tasks hold references and log their failures instead of
+dying unobserved; one bad page no longer cancels its crawl batch. On the
+frontend, terminal states retire the live progress line (an errored or
+reloaded answer no longer ticks a fake clock forever) and the reloaded
+plan label counts failed steps too.
+
 ## The chatbot remembers the web: search memory, a site crawler, and a live pipeline UI (2026-08-30)
 
 Three rounds shipped together, each measured on the live cluster before and

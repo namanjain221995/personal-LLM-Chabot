@@ -276,3 +276,235 @@ def test_site_qa_honours_the_effort(monkeypatch):
     hits = [{"url": "https://x.example/a", "title": "A", "text": "t", "fetched_at": "2026-08-30"}]
     asyncio.run(crawl.run_site_qa_engine("q", hits, "x.example", [], collect, effort="fast"))
     assert rec.get("effort") == "fast"
+
+
+# ---------------------------------------------------------------------------
+# Review round (2026-08-30): intent precision, resume, budget, stall, cancel
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text, expect",
+    [
+        # Intent words INSIDE a URL are addresses, not requests.
+        ("what does https://docs.example.ai/index.html say", None),
+        ("read https://a.example/scrape-tips for me", None),
+        # "index" as an everyday noun does not start a thousand-page crawl.
+        ("compare the index performance of https://a.example vs local", None),
+        # …but as a verb with an object it still does.
+        ("index https://docs.example.ai", "https://docs.example.ai"),
+        ("continue crawling https://docs.example.ai", "https://docs.example.ai"),
+    ],
+)
+def test_detect_crawl_ignores_urlish_and_noun_index(text, expect):
+    assert crawl.detect_crawl(text) == expect
+
+
+@pytest.mark.parametrize(
+    "text, expect",
+    [
+        ("continue crawling", True),
+        ("please resume the crawl", True),
+        ("keep indexing the site", True),
+        ("crawl the rest", True),
+        ("continue", False),
+        ("resume our discussion about pricing", False),
+        # With a URL, detect_crawl owns the message instead.
+        ("continue crawling https://x.example", False),
+    ],
+)
+def test_detect_resume(text, expect):
+    assert crawl.detect_resume(text) == expect
+
+
+from app.core import extract  # noqa: E402 — used by the crawl fakes below
+
+
+def _allow_all_rules():
+    return robots.RobotRules(allowed_all=True)
+
+
+def _fresh_row(key, links=()):
+    from datetime import datetime, timezone
+
+    return {
+        "url_key": key,
+        "url": f"https://{key}",
+        "title": "t",
+        "text": "stored body " * 30,
+        "fetched_at": datetime.now(timezone.utc),
+        "links": list(links),
+    }
+
+
+def _crawl_env(monkeypatch, stored_keys, sitemap, fetch_log, stored_links=None):
+    """Wire _crawl_site's collaborators: canned robots/sitemap/store/fetch."""
+    async def fake_rules(url):
+        return _allow_all_rules()
+
+    async def fake_sitemap(root, rules, state):
+        return list(sitemap)
+
+    async def fake_run_in_thread(func, *args):
+        if func is crawl.db.get_web_pages:
+            key = args[0][0]
+            if key in stored_keys:
+                return [_fresh_row(key, (stored_links or {}).get(key, ()))]
+            return []
+        return None  # _store and friends: recorded via fetch_log only
+
+    async def fake_fetch_page(url):
+        fetch_log.append(url)
+        return url, extract.Extracted(title="T", text="fetched body " * 30), [], "text/html"
+
+    monkeypatch.setattr(crawl.robots, "fetch_rules", fake_rules)
+    monkeypatch.setattr(crawl, "_discover_sitemap", fake_sitemap)
+    monkeypatch.setattr(crawl.db, "run_in_thread", fake_run_in_thread)
+    monkeypatch.setattr(crawl, "_fetch_page", fake_fetch_page)
+    monkeypatch.setattr(crawl.settings, "web_crawl_delay_ms", 0)
+
+
+def test_stored_pages_do_not_consume_the_fetch_budget(monkeypatch):
+    # A resume used to spend its whole max_pages budget re-counting pages the
+    # last run stored, stopping at the same spot forever.
+    sitemap = [f"https://x.example/docs/p{i}" for i in range(12)]
+    stored = {crawl._normalize_url(u) for u in sitemap[:10]}
+    fetched: list = []
+    _crawl_env(monkeypatch, stored, sitemap, fetched)
+    state, found, status = asyncio.run(
+        crawl._crawl_site(
+            "https://x.example/docs/", None, max_pages=2, max_seconds=30.0
+        )
+    )
+    assert state.from_store == 10
+    assert state.fetched == 2 and len(fetched) == 2
+    assert status == "done"  # the frontier finished; nothing was silently cut
+
+
+def test_from_store_pages_feed_walk_mode_links(monkeypatch):
+    # Walk mode: the root is fresh in the store — its STORED links (V10) must
+    # keep the walk alive instead of dead-ending the crawl at one page.
+    root = "https://y.example/docs/"
+    root_key = crawl._normalize_url(root)
+    kids = ["https://y.example/docs/a", "https://y.example/docs/b"]
+    fetched: list = []
+    _crawl_env(
+        monkeypatch, {root_key}, sitemap=[], fetch_log=fetched,
+        stored_links={root_key: kids},
+    )
+    state, found, status = asyncio.run(
+        crawl._crawl_site(root, None, max_pages=10, max_seconds=30.0)
+    )
+    assert sorted(fetched) == sorted(kids)
+    assert state.from_store == 1 and state.fetched == 2
+
+
+def test_drain_index_bails_when_nothing_progresses(monkeypatch):
+    # Embedding down: index_pending returns 0 forever. The old loop spun its
+    # full 400 rounds inside the user-facing request.
+    events: list = []
+
+    async def emit(kind, payload):
+        events.append(payload.get("text", ""))
+
+    async def fake_run_in_thread(func, *args):
+        return 5  # always five pages left
+
+    async def fake_index_pending(limit=20):
+        return 0
+
+    monkeypatch.setattr(crawl.db, "run_in_thread", fake_run_in_thread)
+    monkeypatch.setattr(crawl.web_index, "index_pending", fake_index_pending)
+    chunks = asyncio.run(crawl._drain_index(emit))
+    assert chunks == 0
+    assert any("background" in e for e in events)
+    assert len(events) <= 4  # two stalled rounds, not four hundred
+
+
+def test_cancelled_crawl_is_not_left_running(monkeypatch):
+    # A closed tab cancels the coroutine; the run record must not stay
+    # 'running' forever (site Q&A only trusts done/capped crawls).
+    finished = {}
+
+    async def fake_run_in_thread(func, *args):
+        if func is crawl.db.create_web_crawl:
+            return 99
+        if func is crawl.db.finish_web_crawl:
+            finished["args"] = args
+            return None
+        return None
+
+    async def fake_crawl_site(*a, **kw):
+        state = crawl._CrawlState(scope_host="z.example", scope_prefix="z.example")
+        state.fetched = 3
+        return state, 3, "done"
+
+    async def hang(emit, quiet=False):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(crawl.db, "run_in_thread", fake_run_in_thread)
+    monkeypatch.setattr(crawl, "_crawl_site", fake_crawl_site)
+    monkeypatch.setattr(crawl, "_drain_index", hang)
+
+    async def emit(kind, payload):
+        return None
+
+    async def scenario():
+        task = asyncio.get_running_loop().create_task(
+            crawl.run_crawl_engine("crawl https://z.example", "https://z.example", "c1", [], emit)
+        )
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+    args = finished["args"]
+    assert args[0] == 99 and args[1] == "capped"  # partial pages stay usable
+    assert args[6] == "cancelled mid-run"
+
+
+def test_retrieve_site_prefix_matches_www_hosts(monkeypatch):
+    # scope_prefix strips "www." but stored URLs keep it — the filter must
+    # match both spellings or site Q&A silently never fires on www sites.
+    monkeypatch.setattr(settings, "web_memory_enabled", True)
+
+    async def fake_embed(texts, **kw):
+        return [[0.0] * 4]
+
+    table = _FakeTable([])
+    monkeypatch.setattr(web_index.llm, "embed_texts", fake_embed)
+    monkeypatch.setattr(web_index, "_open", lambda create_dim=None: (None, table, SimpleNamespace(dimension=4)))
+    monkeypatch.setattr(web_index, "validate_query_dimension", lambda *a, **k: None)
+    asyncio.run(web_index.retrieve("q", top_k=3, site_prefix="tensorflow.org/guide"))
+    clause = table.where_clause or ""
+    assert "https://tensorflow.org/guide" in clause
+    assert "https://www.tensorflow.org/guide" in clause
+    assert "http://www.tensorflow.org/guide" in clause
+
+
+def test_expand_search_domains_is_single_flight(monkeypatch):
+    # Two searches finishing together must not stack two polite crawlers
+    # against the same hosts.
+    monkeypatch.setattr(settings, "web_expand_after_search", True)
+    runs: list = []
+
+    async def slow_crawl(root, emit, **kw):
+        runs.append(root)
+        await asyncio.sleep(0.1)
+        return crawl._CrawlState(scope_host="h", scope_prefix="h"), 0, "done"
+
+    async def fake_index(limit=50):
+        return 0
+
+    monkeypatch.setattr(crawl, "_crawl_site", slow_crawl)
+    monkeypatch.setattr(crawl.web_index, "index_pending", fake_index)
+
+    async def scenario():
+        await asyncio.gather(
+            crawl.expand_search_domains(["https://a.example/x"]),
+            crawl.expand_search_domains(["https://b.example/y"]),
+        )
+
+    asyncio.run(scenario())
+    assert len(runs) == 1  # the second call saw the lock and skipped
