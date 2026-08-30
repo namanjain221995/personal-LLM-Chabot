@@ -6,7 +6,14 @@
 # The literal "ultrasecretkey" below is replaced at container start by the
 # SEARXNG_SECRET env var (the official image's entrypoint does this sed swap) —
 # set SEARXNG_SECRET in .env.
-use_default_settings: true
+use_default_settings:
+  engines:
+    # Onion engines: no Tor here, so they fail to register and print an
+    # ERROR at every container start. Removed, not disabled — disabled
+    # engines still attempt registration.
+    remove:
+      - ahmia
+      - torch
 
 server:
   secret_key: "ultrasecretkey"
@@ -34,12 +41,20 @@ ui:
 # that does happen costs a fraction of the results instead of all of them.
 # These all ship with SearXNG and need no API key and no account.
 engines:
+  # DuckDuckGo CAPTCHAs this host with suspended_time=0 — same never-bench
+  # pathology as qwant below: it fails on EVERY query instead of suspending
+  # itself the way startpage (3600s) does (logged 2026-08-30 post-restart).
+  - name: duckduckgo
+    disabled: true
   - name: mojeek
     disabled: false
   - name: bing
     disabled: false
+  # Qwant CAPTCHAs this host and raises suspended_time=0, so SearXNG never
+  # benches it — unlike DDG/Startpage it fails on EVERY query, spending part
+  # of the result window on a guaranteed error (logged 2026-08-30).
   - name: qwant
-    disabled: false
+    disabled: true
   - name: yahoo
     disabled: false
   - name: dogpile
@@ -48,9 +63,15 @@ engines:
     disabled: false
   - name: wikipedia
     disabled: false
-  - name: stackexchange
-    disabled: false
   - name: github
     disabled: false
   - name: arxiv
     disabled: false
+
+# Upstreams occasionally drop HTTP/2 streams mid-response, which httpx surfaces
+# as RemoteProtocolError("Server disconnected") and costs that engine's whole
+# result set for the query (logged 2026-08-30). HTTP/1.1 is the boring path
+# that doesn't have this failure mode; one retry covers a flaky connection.
+outgoing:
+  enable_http2: false
+  retries: 1

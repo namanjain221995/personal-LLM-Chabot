@@ -5,6 +5,19 @@
 Three rounds shipped together, each measured on the live cluster before and
 after.
 
+**Engine supply (SearXNG).** The production log showed two engines burning
+the result window on every single query: Qwant and DuckDuckGo both CAPTCHA
+this host and raise `suspended_time=0`, so SearXNG never benched them —
+unlike Startpage, which suspends itself for an hour. Both are disabled. The
+`stackexchange` settings entry referenced an engine name that does not exist
+in this SearXNG version (it is an engine *type*), so it had failed
+registration — and returned nothing — since the day it was added; removed,
+along with the two Tor-only engines that printed errors at every boot.
+Outgoing upstream requests drop to HTTP/1.1 with one retry, ending the
+`RemoteProtocolError("Server disconnected")` tracebacks. Measured on the
+same query mix: 74 → 117 results, and the only failures left are engines
+that bench themselves.
+
 **Web-search memory (V8).** The search engine fetched up to 60 pages per
 question, answered, and threw everything away — an identical question a
 minute later re-fetched every page, and even the 15-minute in-process SERP
