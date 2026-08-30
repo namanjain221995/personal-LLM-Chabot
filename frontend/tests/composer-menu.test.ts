@@ -241,3 +241,37 @@ describe('Live Salesforce (2026-08-06)', () => {
     expect(synced).toContain('nothing leaves this machine');
   });
 });
+
+describe('Deep Research interacts correctly with Salesforce (review 2026-08-30)', () => {
+  it('turning it on leaves Salesforce mode, because research is web work', () => {
+    const out = activateComposerMenuItem(
+      'deep-research',
+      prefs({ salesforce: true, sfLive: true, deepResearch: false }),
+    );
+    expect(out.kind).toBe('prefs');
+    if (out.kind !== 'prefs') return;
+    expect(out.prefs.deepResearch).toBe(true);
+    expect(out.prefs.salesforce).toBe(false);
+    expect(out.prefs.sfLive).toBe(false);
+  });
+
+  it('turning Salesforce on disarms it', () => {
+    const out = activateComposerMenuItem(
+      'salesforce',
+      prefs({ salesforce: false, deepResearch: true }),
+    );
+    if (out.kind !== 'prefs') return;
+    expect(out.prefs.salesforce).toBe(true);
+    expect(out.prefs.deepResearch).toBe(false);
+  });
+
+  it('Live Salesforce disarms it too — it would otherwise sit behind a gate that can never run it', () => {
+    const out = activateComposerMenuItem(
+      'sf-live',
+      prefs({ salesforce: false, sfLive: false, deepResearch: true }),
+    );
+    if (out.kind !== 'prefs') return;
+    expect(out.prefs.salesforce).toBe(true);
+    expect(out.prefs.deepResearch).toBe(false);
+  });
+});

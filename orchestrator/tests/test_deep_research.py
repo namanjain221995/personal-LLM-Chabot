@@ -75,7 +75,7 @@ def _wire(monkeypatch, *, plan=None, gap=None, results=None, sources=None, repor
             return json.dumps(plan)
         return json.dumps(gaps.pop(0) if len(gaps) > 1 else gaps[0])
 
-    async def fake_collect(queries, effort="medium", emit=None, categories=""):
+    async def fake_collect(queries, effort="medium", emit=None, categories="", **kw):
         return list(results if results is not None else _results(4))
 
     async def fake_rerank(message, res, target):
@@ -321,7 +321,7 @@ def test_route_category(query, expected):
 def test_each_routed_group_is_searched_in_its_own_pool(monkeypatch):
     calls = []
 
-    async def recording_collect(queries, effort="medium", emit=None, categories=""):
+    async def recording_collect(queries, effort="medium", emit=None, categories="", **kw):
         calls.append((tuple(queries), categories))
         return _results(2)
 
@@ -548,3 +548,123 @@ def test_the_report_is_streamed_not_delivered_in_one_lump(monkeypatch):
     tokens = [p for k, p in events if k == "token"]
     assert len(tokens) > 1, "the report was not streamed"
     assert "".join(t["text"] for t in tokens).startswith("A fairly long report")
+
+
+def test_the_long_tail_of_evidence_is_trimmed(monkeypatch):
+    """The first version handed _apply_char_tiers throwaway _Source copies, so
+    it mutated objects nobody read and trimmed nothing: a 24-source run put
+    every source in the prompt at full length."""
+    long_text = "x" * 20000
+    sources = [
+        dr.SourceRecord(n=i, title=f"T{i}", url=f"https://e.example/{i}",
+                        text=long_text, query="q", iteration=1)
+        for i in range(1, 15)
+    ]
+    dr._trim_evidence(sources)
+    # The top tier keeps its budget; everything after it is cut to an excerpt.
+    assert len(sources[0].text) == 20000
+    assert len(sources[-1].text) < 20000
+    assert len(sources[-1].text) <= dr._TIER_B_CHARS + 10
+
+
+# ---------------------------------------------------------------------------
+# Review round (2026-08-30): the defects an adversarial pass confirmed
+# ---------------------------------------------------------------------------
+
+
+def test_the_search_log_carries_who_asked(monkeypatch):
+    """_gather called _persist_and_index with four positional args, dropping
+    user_id/conversation_id — the exact regression fixed for search.py the day
+    before. The rows it wrote could never be matched by delete_conversation,
+    so a deleted conversation kept its research question forever."""
+    captured = {}
+
+    async def fake_persist(message, queries, results, effort, user_id=None, conversation_id=""):
+        captured.update(user_id=user_id, conversation_id=conversation_id)
+
+    _wire(monkeypatch)
+    monkeypatch.setattr(dr, "_persist_and_index", fake_persist)
+    monkeypatch.setattr(dr, "_spawn", lambda coro: asyncio.ensure_future(coro))
+    events, emit = _emitter()
+    asyncio.run(
+        dr.run_deep_research_engine(
+            "q", [], emit, conversation_id="conv-attr", user_id=42
+        )
+    )
+    assert captured.get("user_id") == 42
+    assert captured.get("conversation_id") == "conv-attr"
+
+
+def test_citations_inside_code_are_left_alone():
+    """`arr[0]` in a fenced block is a subscript, not a citation. Deleting it
+    silently corrupts a snippet the user will copy."""
+    report = "Use it [1].\n\n```python\nvalues = arr[0] + arr[99]\n```\n\nAlso `x[7]` inline."
+    cleaned, invalid = dr.validate_citations(report, 2)
+    assert "arr[0]" in cleaned and "arr[99]" in cleaned
+    assert "`x[7]`" in cleaned
+    assert invalid == []  # nothing in code counted as a fabricated citation
+
+
+def test_validation_does_not_reflow_the_document():
+    """An earlier version collapsed EVERY run of 2+ spaces in the whole
+    report, flattening YAML indentation and nested bullets — and did it even
+    when nothing had been removed."""
+    report = "services:\n  vllm:\n    image: x\n\n- parent\n  - child\n"
+    cleaned, invalid = dr.validate_citations(report, 3)
+    assert cleaned == report
+    assert invalid == []
+
+
+def test_indentation_survives_even_when_a_marker_is_removed():
+    report = "intro [99]\n\nservices:\n  vllm:\n    image: x\n"
+    cleaned, invalid = dr.validate_citations(report, 1)
+    assert invalid == [99]
+    assert "\n  vllm:\n    image: x" in cleaned
+
+
+def test_cited_numbers_ignores_code_and_out_of_range():
+    report = "Real [1] and [2].\n\n```\narr[9]\n```\n"
+    assert dr.cited_numbers(report, 2) == [1, 2]
+
+
+def test_the_no_sources_path_closes_the_run(monkeypatch):
+    """A dead SearXNG reaches the early return NORMALLY — the per-round errors
+    are swallowed — so it never hit the exception handler that closes the row.
+    The run stayed 'running' with finished_at NULL forever."""
+    closed = {}
+
+    def fake_finish(run_id, status, *a, **k):
+        closed["status"] = status
+
+    _wire(monkeypatch)
+    monkeypatch.setattr(dr.db, "finish_research_run", fake_finish)
+
+    async def dead(*a, **k):
+        raise SearchUnavailableError("down")
+
+    monkeypatch.setattr(dr, "_collect_results", dead)
+    events, emit = _emitter()
+    asyncio.run(dr.run_deep_research_engine("q", [], emit, conversation_id="c1"))
+    assert closed.get("status") == "failed"
+
+
+def test_a_failure_mid_report_keeps_the_sources_already_read(monkeypatch):
+    """Failing during the report emitted sources: [] and stored report: "",
+    discarding 20-odd pages the run had already paid to read."""
+    _wire(monkeypatch)
+
+    async def boom(messages, **kw):
+        raise RuntimeError("model exploded")
+        yield  # pragma: no cover — makes this an async generator
+
+    monkeypatch.setattr(dr.llm, "stream_chat_events", boom)
+    events, emit = _emitter()
+    out = asyncio.run(dr.run_deep_research_engine("q", [], emit, conversation_id="c1"))
+    meta = [p for k, p in events if k == "meta"][-1]
+    assert len(meta["sources"]) > 0, "the gathered sources were thrown away"
+    assert "failed" in out.lower()
+    # and the step that was in flight is closed, not left spinning
+    steps = [p for k, p in events if k == "step"]
+    running = {s["id"] for s in steps if s["status"] == "running"}
+    settled = {s["id"] for s in steps if s["status"] in ("done", "failed")}
+    assert running == settled

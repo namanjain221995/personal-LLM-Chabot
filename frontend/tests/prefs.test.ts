@@ -171,3 +171,22 @@ describe('legacy effort values (pre-collapse builds)', () => {
     expect(loadPrefs(storage, 'd').effort).toBe('max');
   });
 });
+
+describe('Deep Research is one-shot, not a mode (review 2026-08-30)', () => {
+  it('is never restored from storage, however it was saved', () => {
+    // sanitize() claimed this in a comment while the code restored the stored
+    // value, so a run armed days ago turned the user's next ordinary question
+    // into a multi-minute report.
+    const storage = makeStorage();
+    savePrefs(storage, 'c1', {
+      ...DEFAULT_PREFS,
+      salesforce: false,
+      deepResearch: true,
+    });
+    expect(loadPrefs(storage, 'c1').deepResearch).toBe(false);
+  });
+
+  it('defaults off', () => {
+    expect(DEFAULT_PREFS.deepResearch).toBe(false);
+  });
+});

@@ -72,23 +72,24 @@ engines:
   # general query here (google cse, bing, mwmbl, yahoo) are one Google IP-block
   # away from two, and google cse DID block this host during testing — the
   # block outlived SearXNG's 180 s bench and every retry re-armed it. These
-  # seven ship disabled, need no key and no account, and each returned results
-  # from this host on the day they were enabled; together with the existing
+  # These four ship disabled, need no key and no account, and each returned
+  # results from this host on the day they were enabled; with the existing
   # pool they measured 70 unique URLs in 3.07 s. Independent quotas are the
   # whole point: no single upstream can take search down any more.
   #
   # "duckduckgo web" is a DIFFERENT engine from "duckduckgo" (disabled above
   # for its suspended_time=0 CAPTCHA); this one answered cleanly.
   #
-  # NOT enabled, though they work: seznam (Czech) and naver (Korean). They are
+  # NOT enabled: `marginalia` — it is absent from this SearXNG build's engine
+  # set entirely (verified against the container's /config), so `disabled:
+  # false` on it silently does nothing. Also seznam (Czech) and naver (Korean),
+  # which DO work but are region search engines. They are
   # region search engines, and on the first live query after enabling them a
   # Korean blog and a Korean product page took two of the eight source slots
   # for an English question about DGX Spark. Volume is not the goal — usable
   # sources are. yandex stays because its index is general-web rather than
   # region-locked.
   - name: duckduckgo web
-    disabled: false
-  - name: marginalia
     disabled: false
   - name: yandex
     disabled: false

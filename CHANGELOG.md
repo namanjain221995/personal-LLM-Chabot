@@ -21,8 +21,8 @@ Verified on a throwaway container before the real one was touched.
 **Engine supply was one Google block from collapse.** Only google-cse, bing,
 mwmbl and yahoo answered a default query here — and google-cse IP-blocked this
 host during testing, a block that outlived SearXNG's own 180 s bench because
-every retry re-armed it. Seven shipped-disabled, keyless engines are now on
-(duckduckgo-web, marginalia, yandex, searchmysite, wiby …), spreading load
+every retry re-armed it. Four shipped-disabled, keyless engines are now on
+(duckduckgo-web, yandex, searchmysite, wiby), spreading load
 across independent quotas; the same query mix now returns results *while
 google-cse is still blocked*. `mojeek`/`dogpile` are removed (403 at this
 egress IP even to a browser UA), and `wikidata` — which failed to *register*
@@ -58,6 +58,34 @@ events, 170 s.
 Also: `.env.example` gained the `WEB_MEMORY_*`, `WEB_CRAWL_*` and
 `WEB_EXPAND_*` settings that shipped earlier the same day without ever being
 documented there.
+
+**The review round.** A 34-agent adversarial pass over the branch confirmed 23
+defects before any of it merged. The ones that mattered: `_gather` called
+`_persist_and_index` with four positional arguments, dropping user and
+conversation id — reintroducing, in a new file, the exact privacy regression
+fixed for `search.py` the day before, so a deleted conversation would keep its
+research question forever. Citation validation collapsed every run of two or
+more spaces in the *whole* report, flattening YAML indentation and nested
+bullets even when nothing had been removed, and it treated `arr[0]` inside a
+fenced code block as a citation to delete; both are now scoped — code is held
+out, and an invalid marker takes only its own adjacent space with it. The
+"no readable sources" exit never closed its `research_runs` row (a dead
+SearXNG reaches it *normally*, never via the exception handler), a failure
+part-way through the report threw away every source the run had already paid
+to read, and an exception left the in-flight step spinning forever in the
+timeline. On the frontend, `deepResearch` was restored from storage despite a
+comment promising it never would be, and nothing disarmed it after a send — so
+a one-shot command was in practice a sticky mode. Also corrected: the SERP
+cache key ignored the new category hint, `marginalia` is absent from this
+SearXNG build entirely so enabling it did nothing (four engines were added,
+not seven — the claim is fixed here and in the README), and the model manifest
+still described the reranker with its old serving arguments.
+
+A candidate-pool experiment was tried and REVERTED with its measurement kept
+in the source: gathering 3x the fetch budget and reranking down made results
+worse on every query (`anyscale.com`/`github.com`/`huggingface.co` gave way to
+personal blogs). Engine rank is an authority prior; the cross-encoder scores
+topical match only. Widening the pool throws the prior away.
 
 ## The review round: the crawler grows up (2026-08-30, same day)
 

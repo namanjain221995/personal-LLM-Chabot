@@ -576,8 +576,8 @@ Two more fixes came out of the same investigation:
   now carries one, and the same request returns 200.
 * **Engine supply** was one Google block away from collapse: only google-cse,
   bing, mwmbl and yahoo answered a default query, and google-cse *did*
-  IP-block this host during testing. Seven shipped-disabled, keyless engines
-  (duckduckgo-web, marginalia, yandex, searchmysite, wiby …) are now enabled,
+  IP-block this host during testing. Four shipped-disabled, keyless engines
+  (duckduckgo-web, yandex, searchmysite, wiby) are now enabled,
   spreading load across independent quotas. Result on the same query mix:
   **47-129 results with google-cse still blocked**, where before the same
   outage left mostly noise.

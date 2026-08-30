@@ -44,9 +44,10 @@ from ..config import settings
 from ..core.sf_intel.planner import extract_json_object
 from ..search.base import SearchResult, SearchUnavailableError
 from . import recent_turns
+from ..core import extract
 from .search import (
-    _Source,
-    _apply_char_tiers,
+    _TIER_A_SOURCES,
+    _TIER_B_CHARS,
     _collect_results,
     _fetch_sources,
     _normalize_url,
@@ -73,6 +74,11 @@ _RUN_LOCK = asyncio.Lock()
 
 #: A citation the model wrote: [1], [12].
 _CITE_RE = re.compile(r"\[(\d{1,3})\]")
+#: The same, with the single space that usually precedes it. Removing an
+#: invalid marker takes that space with it, so the sentence closes up cleanly
+#: without a document-wide whitespace pass (which flattened YAML indentation
+#: and nested bullets when it was tried).
+_CITE_WITH_SPACE_RE = re.compile(r"[ \t]?\[(\d{1,3})\]")
 
 #: Category routing. Measured on this host 2026-08-30: a default general query
 #: reaches only google cse / bing / mwmbl / yahoo — and google cse, the one
@@ -194,6 +200,12 @@ class ResearchState:
     research_id: str
     conversation_id: str
     question: str
+    #: Who asked. Without it the search log this run writes is stamped
+    #: user_id=NULL / conversation_id='' and delete_conversation can never
+    #: match it — the question text would outlive the conversation forever.
+    #: search.py had exactly this bug and it was fixed on 2026-08-30; passing
+    #: four positional args to _persist_and_index reintroduced it here.
+    user_id: Optional[int] = None
     subquestions: List[str] = field(default_factory=list)
     queries_run: List[str] = field(default_factory=list)
     seen_urls: Set[str] = field(default_factory=set)
@@ -361,7 +373,16 @@ async def _gather(
         )
     state.sources.extend(added)
     # Remember the round for the next question, exactly like a plain search.
-    _spawn(_persist_and_index(state.question, queries, results, effort))
+    _spawn(
+        _persist_and_index(
+            state.question,
+            queries,
+            results,
+            effort,
+            state.user_id,
+            state.conversation_id,
+        )
+    )
     return added
 
 
@@ -377,22 +398,62 @@ def validate_citations(report: str, source_count: int) -> Tuple[str, List[int]]:
     sentence in the prompt, and the frontend STRIPS [n] markers before
     rendering — so an invented [99] is invisible rather than caught. A report
     is a document people quote, so here the marker is checked against the
-    registry and dropped when it resolves to nothing. Returns the cleaned
-    report and the list of invalid numbers found (for logging).
+    registry. Returns the cleaned report and the invalid numbers found.
+
+    TWO THINGS IT MUST NOT DO, both found by review before this shipped:
+
+    * touch CODE. `arr[0]` inside a fenced block or an inline span is a
+      subscript, not a citation, and deleting it silently corrupts a snippet
+      the user will copy. Fenced blocks and inline spans are held out.
+    * reflow the document. An earlier version collapsed every run of two or
+      more spaces in the WHOLE report, which flattened YAML indentation,
+      four-space code blocks and nested bullets — and it did so even when
+      nothing had been removed. Only the gap left by a removed marker is
+      tidied, and only there.
     """
     invalid: List[int] = []
+    # Split on fenced blocks and inline code, keeping the delimiters, so the
+    # substitution below only ever runs on prose segments.
+    segments = re.split(r"(```.*?```|`[^`\n]*`)", report, flags=re.S)
 
-    def _sub(m: re.Match) -> str:
-        n = int(m.group(1))
-        if 1 <= n <= source_count:
-            return m.group(0)
-        invalid.append(n)
-        return ""
+    def _clean(prose: str) -> str:
+        def _sub(m: re.Match) -> str:
+            n = int(m.group(1))
+            if 1 <= n <= source_count:
+                return m.group(0)
+            invalid.append(n)
+            # The ONE space before the marker is part of the match, so
+            # removing "[99]" from "a [99] b" yields "a b" without touching
+            # any other whitespace in the document.
+            return ""
 
-    cleaned = _CITE_RE.sub(_sub, report)
-    # A citation run like "[1][99]" can leave a double space behind.
-    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+        return _CITE_WITH_SPACE_RE.sub(_sub, prose)
+
+    cleaned = "".join(
+        seg if i % 2 else _clean(seg) for i, seg in enumerate(segments)
+    )
     return cleaned, invalid
+
+
+def cited_numbers(report: str, source_count: int) -> List[int]:
+    """The valid citations a report actually uses, ignoring code."""
+    segments = re.split(r"(```.*?```|`[^`\n]*`)", report, flags=re.S)
+    prose = "".join(seg for i, seg in enumerate(segments) if i % 2 == 0)
+    return sorted(
+        {n for n in (int(m) for m in _CITE_RE.findall(prose)) if 1 <= n <= source_count}
+    )
+
+
+def _trim_evidence(sources: List[SourceRecord]) -> None:
+    """Full budget for the best sources, a summary excerpt for the long tail.
+
+    The same two-tier shape the search engine uses, so a 24-source run does
+    not spend its whole prompt on the pages that ranked last. Mutates in
+    place, like `search._apply_char_tiers`.
+    """
+    for s in sources:
+        if s.n > _TIER_A_SOURCES:
+            s.text = extract.truncate_chars(s.text, _TIER_B_CHARS)
 
 
 def _evidence_block(sources: Sequence[SourceRecord]) -> str:
@@ -456,6 +517,38 @@ def _report_messages(state: ResearchState, history: Sequence[dict]) -> List[dict
 # ---------------------------------------------------------------------------
 
 
+async def _close_run(
+    run_row: Optional[int],
+    state: "ResearchState",
+    status: str,
+    report: str,
+    sources_meta: List[dict],
+    detail: str = "",
+) -> None:
+    """Close the research_runs row. Never raises — the report is what matters.
+
+    Awaited rather than fire-and-forget: a spawned write can lose the race
+    with process shutdown, and the row it leaves behind says 'running'.
+    """
+    if run_row is None:
+        return
+    try:
+        await db.run_in_thread(
+            db.finish_research_run,
+            run_row,
+            status,
+            state.iterations,
+            len(state.queries_run),
+            len(state.sources),
+            len(cited_numbers(report, len(state.sources))) if report else 0,
+            report,
+            sources_meta,
+            detail,
+        )
+    except Exception:  # noqa: BLE001 — the answer already reached the user
+        log.warning("could not close the research run", exc_info=True)
+
+
 async def run_deep_research_engine(
     message: str,
     history: Sequence[dict],
@@ -492,6 +585,7 @@ async def _run(
         research_id=uuid.uuid4().hex,
         conversation_id=conversation_id,
         question=message,
+        user_id=user_id,
     )
     run_row: Optional[int] = None
     try:
@@ -501,15 +595,22 @@ async def _run(
     except Exception:  # noqa: BLE001 — the report matters, the record does not
         log.warning("could not record the research run", exc_info=True)
 
+    # The step currently in flight, so a failure can close it instead of
+    # leaving a spinner running in the timeline forever.
     step_id = 0
+    open_step: Optional[Tuple[int, str]] = None
+    parts: List[str] = []
 
     async def step(title: str) -> int:
-        nonlocal step_id
+        nonlocal step_id, open_step
         step_id += 1
+        open_step = (step_id, title)
         await emit("step", {"id": step_id, "title": title, "status": "running"})
         return step_id
 
     async def finish(sid: int, title: str, detail: str = "") -> None:
+        nonlocal open_step
+        open_step = None
         await emit(
             "step",
             {"id": sid, "title": title, "status": "done", "detail": detail},
@@ -578,6 +679,12 @@ async def _run(
             queries = followups
 
         if not state.sources:
+            # Close the row. Every other exit does, and a run left at
+            # 'running' forever is exactly the bug the crawler had before its
+            # own review round — a dead SearXNG reaches here NORMALLY (the
+            # search errors are swallowed per round), never via the exception
+            # handler below.
+            await _close_run(run_row, state, "failed", "", [], "no readable sources")
             text = (
                 "I could not gather any readable sources for this question — "
                 "the search provider returned nothing usable. Nothing was "
@@ -591,9 +698,11 @@ async def _run(
         # --- Report ----------------------------------------------------
         await emit("status", {"text": f"Writing the report from {len(state.sources)} sources…"})
         sid = await step("Writing the report")
-        _apply_char_tiers(
-            [_Source(n=s.n, title=s.title, url=s.url, text=s.text) for s in state.sources]
-        )
+        # Trim the tail before building the prompt. _apply_char_tiers mutates
+        # the objects it is handed, so it MUST be given the records the report
+        # is actually built from — handing it throwaway copies quietly trimmed
+        # nothing at all.
+        _trim_evidence(state.sources)
         # The report STREAMS. Buffering it to validate citations first made a
         # measured 6,349-character report land in one lump after ~40 s of
         # nothing but a thinking indicator — the worst-looking part of an
@@ -601,7 +710,6 @@ async def _run(
         # is returned and stored; a stray marker that survives on the client
         # is already invisible there, because the frontend strips every [n]
         # before rendering and draws the source list from meta.sources.
-        parts: List[str] = []
         async with _LLM_SEM:
             async for kind, delta in llm.stream_chat_events(
                 _report_messages(state, history),
@@ -621,7 +729,7 @@ async def _run(
                 len(invalid),
                 sorted(set(invalid))[:10],
             )
-        cited = sorted({int(n) for n in _CITE_RE.findall(report)})
+        cited = cited_numbers(report, len(state.sources))
         await finish(sid, "Wrote the report", f"{len(cited)} of {len(state.sources)} sources cited")
 
         sources_meta = [
@@ -647,21 +755,7 @@ async def _run(
                 },
             },
         )
-        if run_row is not None:
-            _spawn(
-                db.run_in_thread(
-                    db.finish_research_run,
-                    run_row,
-                    "done",
-                    state.iterations,
-                    len(state.queries_run),
-                    len(state.sources),
-                    len(cited),
-                    report,
-                    sources_meta,
-                    "",
-                )
-            )
+        await _close_run(run_row, state, "done", report, sources_meta)
         log.info(
             "deep research done: id=%s iterations=%d queries=%d sources=%d cited=%d "
             "invalid_citations=%d elapsed=%.1fs",
@@ -676,47 +770,49 @@ async def _run(
         return report
 
     except asyncio.CancelledError:
-        if run_row is not None:
-            try:
-                await asyncio.shield(
-                    db.run_in_thread(
-                        db.finish_research_run,
-                        run_row,
-                        "cancelled",
-                        state.iterations,
-                        len(state.queries_run),
-                        len(state.sources),
-                        0,
-                        "",
-                        [],
-                        "cancelled mid-run",
-                    )
-                )
-            except Exception:  # noqa: BLE001 — cancellation still wins
-                log.warning("could not mark the cancelled research run", exc_info=True)
+        # A closed tab cancels this coroutine; shield the write so the row
+        # does not stay 'running' forever with site-QA-style consequences.
+        try:
+            await asyncio.shield(
+                _close_run(run_row, state, "cancelled", "", [], "cancelled mid-run")
+            )
+        except Exception:  # noqa: BLE001 — cancellation still wins
+            log.warning("could not mark the cancelled research run", exc_info=True)
         raise
     except Exception as exc:  # noqa: BLE001
         log.warning("deep research failed", exc_info=True)
-        if run_row is not None:
-            try:
-                await db.run_in_thread(
-                    db.finish_research_run,
-                    run_row,
-                    "failed",
-                    state.iterations,
-                    len(state.queries_run),
-                    len(state.sources),
-                    0,
-                    "",
-                    [],
-                    str(exc)[:300],
-                )
-            except Exception:  # noqa: BLE001
-                pass
+        # Whatever was gathered is real and worth showing: a failure part-way
+        # through the report used to emit sources: [] and store report: "",
+        # discarding 20-odd pages the run had already read and paid for.
+        sources_meta = [
+            {"n": s.n, "title": s.title, "url": s.url, "domain": s.domain}
+            for s in state.sources
+        ]
+        partial = "".join(parts)
+        await _close_run(
+            run_row, state, "failed", partial, sources_meta, str(exc)[:300]
+        )
+        # The step that was in flight must not be left spinning in the UI.
+        if open_step is not None:
+            await emit(
+                "step",
+                {
+                    "id": open_step[0],
+                    "title": open_step[1],
+                    "status": "failed",
+                    "detail": str(exc)[:200],
+                },
+            )
         text = (
-            f"The research run failed ({exc}). Sources already gathered stay "
-            "in the web store, so asking again is cheaper than the first time."
+            f"The research run failed ({exc}). "
+            + (
+                f"The {len(state.sources)} source(s) it had already read are "
+                "listed below and stay in the web store, so asking again is "
+                "cheaper than the first time."
+                if state.sources
+                else "Sources already gathered stay in the web store."
+            )
         )
         await emit("token", {"text": text})
-        await emit("meta", {"route": "deep_research", "sources": []})
+        await emit("meta", {"route": "deep_research", "sources": sources_meta})
         return text

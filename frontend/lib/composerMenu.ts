@@ -192,6 +192,11 @@ export function activateComposerMenuItem(
             salesforce: true,
             sfLive: true,
             webSearch: prefs.webSearch === 'on' ? 'auto' : prefs.webSearch,
+            // Deep Research drops with the forced web search, and for the
+            // same reason: Salesforce mode never touches the web, so leaving
+            // it armed strands it behind a gate that can never run it — and
+            // its own menu row would then appear to no-op on the next click.
+            deepResearch: false,
           },
         };
       }

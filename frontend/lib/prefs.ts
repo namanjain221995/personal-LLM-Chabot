@@ -101,10 +101,12 @@ function sanitize(raw: unknown): ChatPrefs {
     // invisible and un-undoable — exactly the trap the agent migration above
     // exists for. Normalize it away on load.
     webSearch: p.webSearch === 'on' && !salesforce ? 'on' : DEFAULT_PREFS.webSearch,
-    // Deep Research needs the web, so it cannot coexist with Salesforce mode;
-    // and it never survives a reload, because a run the user has forgotten
-    // about turns the next ordinary question into a multi-minute report.
-    deepResearch: p.deepResearch === true && !salesforce,
+    // ALWAYS false on load. The comment used to promise this while the code
+    // restored the stored value, so a run the user armed days ago would turn
+    // their next ordinary question into a multi-minute report (review,
+    // 2026-08-30). sanitize() is the load path, so dropping it here is what
+    // makes "one-shot" true rather than aspirational.
+    deepResearch: false,
   };
 }
 
