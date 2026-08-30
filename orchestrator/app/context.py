@@ -104,7 +104,18 @@ async def count_tokens(
     """
     import httpx
 
-    payload = {"model": model, "messages": list(messages)}
+    from .llm import normalize_system
+
+    # Fold system blocks exactly as the completion path does before ITS call.
+    # Engines routinely carry more than one system message (their own prompt
+    # plus recall/memory blocks prepended to the history), and this model's
+    # chat template raises "System message must be at the beginning" on any
+    # extra one — so the raw list 400'd on /tokenize, every count silently
+    # fell back to the pessimistic estimate, and the engine log filled with
+    # tracebacks for requests that then succeeded (the completion had folded).
+    # Counting the SAME shape the completion sends is also simply more exact
+    # (2026-08-30).
+    payload = {"model": model, "messages": normalize_system(list(messages))}
     try:
         async with httpx.AsyncClient(timeout=settings.tokenize_timeout) as client:
             resp = await client.post(

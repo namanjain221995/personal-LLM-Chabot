@@ -346,3 +346,54 @@ def test_trim_notice_reaches_the_chat_meta(monkeypatch, tmp_path):
         "dropped_turns": 0,
         "clipped_messages": 1,
     }
+
+
+def test_count_tokens_folds_system_messages_before_tokenize(monkeypatch):
+    """Engines carry several system messages (their own prompt + recall
+    blocks prepended to history). The model's chat template raises "System
+    message must be at the beginning" on any extra one, so the raw list made
+    every /tokenize call 400, every count fell back to the pessimistic
+    estimate, and the engine log filled with tracebacks (2026-08-30). The
+    tokenize payload must be the SAME folded shape the completion sends.
+    """
+    import asyncio
+
+    from app import context
+
+    sent = {}
+
+    class _Resp:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"count": 42, "max_model_len": 1000}
+
+    class _Client:
+        def __init__(self, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, json=None):
+            sent.update(json or {})
+            return _Resp()
+
+    import httpx
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    messages = [
+        {"role": "system", "content": "engine prompt"},
+        {"role": "system", "content": "recall block"},
+        {"role": "user", "content": "hi"},
+    ]
+    count, window = asyncio.run(context.count_tokens("http://x/v1", "m", messages))
+    assert count == 42
+    roles = [m["role"] for m in sent["messages"]]
+    assert roles == ["system", "user"]  # folded to ONE leading system
+    assert "engine prompt" in sent["messages"][0]["content"]
+    assert "recall block" in sent["messages"][0]["content"]
