@@ -1,0 +1,79 @@
+# Monitoring exporters for Spark 2 (the worker).
+#
+# This file does NOT run on Spark 1. It is rsync'd to the worker's
+# $HOME/.techsara-cluster/ and started there as its own Compose project
+# (sf-local-ai-monitoring), exactly the way compose.cluster-worker.yaml is
+# handled by scripts/cluster-worker.sh. See scripts/monitoring.sh.
+#
+# Spark 2 runs vLLM with `--headless --node-rank 1` and has no API server, so
+# there is nothing here to scrape for LLM metrics — the head's single endpoint
+# already reports the whole distributed engine. What Spark 2 uniquely has is
+# its OWN GPU and its OWN host, which is exactly what these two exporters
+# publish.
+#
+# BINDING. Prometheus lives on Spark 1, so unlike the head's stack these ports
+# must be reachable off-box. They bind to the management IP only
+# (MONITORING_WORKER_BIND, default the worker's enP7s7 address), never to
+# 0.0.0.0 and never to the 10.100.x RoCE addresses.
+
+x-worker-logging: &worker-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  node-exporter:
+    image: prom/node-exporter@sha256:d00a542e409ee618a4edc67da14dd48c5da66726bbd5537ab2af9c1dfc442c8a
+    command:
+      - --path.rootfs=/host
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --web.listen-address=${MONITORING_WORKER_BIND:-127.0.0.1}:${NODE_EXPORTER_PORT:-9100}
+      - --collector.netdev
+      - --collector.netclass
+      - --no-collector.mdadm
+      - --no-collector.nfs
+      - --no-collector.nfsd
+      - --no-collector.zfs
+      - --no-collector.xfs
+      - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|run|var/lib/docker/.+|snap/.+)($|/)
+    # Host networking: node_exporter's netdev collector is namespace-scoped,
+    # so on a bridge it would report eth0/lo and silently miss the RoCE links.
+    # --web.listen-address below is what restricts exposure instead of a port
+    # publish, since host networking bypasses Docker's port mapping.
+    network_mode: host
+    pid: host
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/host:ro,rslave
+    restart: unless-stopped
+    logging: *worker-logging
+
+  dgx-gpu-exporter:
+    image: python:3.12-slim
+    command: ["python", "-u", "/app/dgx_gpu_exporter.py"]
+    volumes:
+      - ./dgx_gpu_exporter.py:/app/dgx_gpu_exporter.py:ro
+    environment:
+      DGX_GPU_EXPORTER_PORT: "9835"
+    # See the head overlay: without this, per-process GPU memory is empty.
+    pid: host
+    ports:
+      - "${MONITORING_WORKER_BIND:-127.0.0.1}:${DGX_GPU_EXPORTER_PORT:-9835}:9835"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:9835/healthz', timeout=3).status==200 else 1)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    logging: *worker-logging

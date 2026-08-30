@@ -1,0 +1,286 @@
+# Monitoring stack for Spark 1 (the head). Profile: monitoring.
+#
+# Nothing here touches the inference path. Every service is on the
+# `application` network or host-networked for host telemetry, scrapes over the
+# management LAN, and none of them are dependencies of anything that serves a
+# user request — `docker compose stop` on this whole profile leaves the LLM
+# running.
+#
+# Spark 2 runs its own two exporters as a separate Compose project; see
+# compose/compose.monitoring-worker.yaml and scripts/monitoring.sh.
+#
+# BINDING. These deliberately do NOT use ${TECHSARA_BIND_ADDRESS}. That
+# variable is 0.0.0.0 on this deployment (PUBLISH_MODEL_PORTS=true), and the
+# repo has no application login — inheriting it would put Grafana and
+# Prometheus on the LAN the moment the profile starts. MONITORING_BIND_ADDRESS
+# defaults to loopback and must be widened deliberately.
+
+# YAML anchors do not cross files - each Compose overlay defines its own, the
+# same way compose/compose.dgx-spark.yaml does.
+x-monitoring-logging: &monitoring-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-nvidia-devices: &nvidia-devices
+  resources:
+    reservations:
+      devices:
+        - driver: nvidia
+          count: all
+          capabilities: [gpu]
+
+services:
+  prometheus:
+    image: prom/prometheus@sha256:6559acbd5d770b15bb3c954629ce190ac3cbbdb2b7f1c30f0385c4e05104e218
+    profiles: [monitoring]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      # Retention: whichever limit is hit first. 15 days of 5 s GPU/vLLM
+      # samples on this target set measures well under 10 GiB; the size cap is
+      # the backstop that keeps Prometheus from ever filling the disk.
+      - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION_TIME:-15d}
+      - --storage.tsdb.retention.size=${PROMETHEUS_RETENTION_SIZE:-20GB}
+      - --web.enable-lifecycle
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "${MONITORING_BIND_ADDRESS:-127.0.0.1}:${PROMETHEUS_PORT:-9090}:9090"
+    extra_hosts:
+      # How Prometheus reaches host-published endpoints (vLLM on 8000/8002-5,
+      # the orchestrator on 8080) without leaving the bridge network.
+      - "host.docker.internal:host-gateway"
+    networks:
+      - application
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider --proxy=off http://127.0.0.1:9090/-/healthy || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging: *monitoring-logging
+
+  grafana:
+    image: grafana/grafana@sha256:5781759b3d27734d4d548fcbaf60b1180dbf4290e708f01f292faa6ae764c5e6
+    profiles: [monitoring]
+    environment:
+      # No default password. The launcher generates one into
+      # .runtime/secrets.env; Grafana refuses to start without it rather than
+      # coming up as admin/admin on a LAN with no firewall.
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD must be set - run ./techsara monitoring up, which generates one}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+      # Land on the cluster overview instead of an empty home page.
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/dgx-cluster-overview.json
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "${MONITORING_BIND_ADDRESS:-127.0.0.1}:${GRAFANA_PORT:-3300}:3000"
+    networks:
+      - application
+    restart: unless-stopped
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider --proxy=off http://127.0.0.1:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging: *monitoring-logging
+
+  # --- Spark 1 host telemetry -------------------------------------------
+  # HOST NETWORKING IS MANDATORY, not a convenience. node_exporter's netdev
+  # collector is network-namespace scoped: on a bridge network it reports
+  # eth0/lo only, and still reports success=1 — so the RoCE interfaces would
+  # silently not exist while everything looked healthy.
+  node-exporter:
+    image: prom/node-exporter@sha256:d00a542e409ee618a4edc67da14dd48c5da66726bbd5537ab2af9c1dfc442c8a
+    profiles: [monitoring]
+    command:
+      - --path.rootfs=/host
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      # Prometheus runs on the bridge network and reaches this through the
+      # host gateway, so loopback-only would make it unreachable. This is
+      # read-only telemetry; MONITORING_NODE_BIND tightens it to a specific
+      # interface where a firewall is not available (ufw is off on both nodes).
+      - --web.listen-address=${MONITORING_NODE_BIND:-0.0.0.0}:9100
+      - --collector.netdev
+      - --collector.netclass
+      # The infiniband collector is what actually measures the RoCE fabric.
+      # It is ON BY DEFAULT and must stay on: RoCE/RDMA traffic is INVISIBLE
+      # to netdev counters. Measured during one 300-token generation, the IB
+      # counters moved 335 MB and 76 MB while netdev on the same interfaces
+      # moved 170 kB and exactly zero.
+      - --no-collector.mdadm
+      - --no-collector.nfs
+      - --no-collector.nfsd
+      - --no-collector.zfs
+      - --no-collector.xfs
+      - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|run|var/lib/docker/.+|snap/.+)($$|/)
+    network_mode: host
+    pid: host
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/host:ro,rslave
+    restart: unless-stopped
+    logging: *monitoring-logging
+
+  # --- Spark 1 GPU telemetry --------------------------------------------
+  # dcgm-exporter WAS tested on this hardware and does run on GB10, but it is
+  # a strict subset: framebuffer memory is N/A at the DCGM library level, the
+  # profiling module will not load, and at its default 30 s interval it
+  # reported load that had already finished. This stdlib-only nvidia-smi
+  # exporter is fresher, cheaper and is the only source of per-process GPU
+  # memory. docs/MONITORING.md records the full comparison.
+  dgx-gpu-exporter:
+    image: python:3.12-slim
+    profiles: [monitoring]
+    command: ["python", "-u", "/app/dgx_gpu_exporter.py"]
+    volumes:
+      - ./monitoring/exporters/dgx-gpu/dgx_gpu_exporter.py:/app/dgx_gpu_exporter.py:ro
+    environment:
+      DGX_GPU_EXPORTER_PORT: "9835"
+    # Without the host PID namespace `nvidia-smi --query-compute-apps` returns
+    # an EMPTY list with exit code 0 - the per-process GPU memory metrics would
+    # silently be missing rather than error.
+    pid: host
+    networks:
+      - application
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:9835/healthz', timeout=3).status==200 else 1)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    deploy: *nvidia-devices
+    logging: *monitoring-logging
+
+  # --- Container telemetry -----------------------------------------------
+  # v0.52.1, not the older v0.49.1: this Docker daemon requires API >= 1.44
+  # and 0.49 speaks 1.41, so its Docker factory refused to register and every
+  # metric came back with id="/" and no container name. Forcing
+  # DOCKER_API_VERSION does not help - the version is compiled in.
+  #
+  # /var/run is mounted read-only for the daemon socket, which is what supplies
+  # container NAMES. That is the one privilege this stack takes, and it is the
+  # minimum for the "which container is restarting?" question to be answerable;
+  # nothing here is privileged, and no other service gets the socket.
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor@sha256:f40e65878e25c2e78ea037f73a449527a0fb994e303dc3e34cb6b187b4b91435
+    profiles: [monitoring]
+    command:
+      - --housekeeping_interval=10s
+      - --docker_only=true
+      - --store_container_labels=false
+      - --disable_metrics=advtcp,cpu_topology,cpuset,hugetlb,memory_numa,percpu,process,referenced_memory,resctrl,sched,tcp,udp
+    privileged: false
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+      - /dev/disk:/dev/disk:ro
+    devices:
+      - /dev/kmsg:/dev/kmsg:r
+    networks:
+      - application
+    restart: unless-stopped
+    logging: *monitoring-logging
+
+  # --- PostgreSQL: the application database ------------------------------
+  # Connects as the SAME user the app uses, over the internal `application`
+  # network. The password comes from ${POSTGRES_PASSWORD} - the identical
+  # variable the postgres service itself reads - so no credential is
+  # duplicated into this file or committed anywhere.
+  postgres-exporter:
+    image: quay.io/prometheuscommunity/postgres-exporter@sha256:6999a7657e2f2fb0ca6ebf417213eebf6dc7d21b30708c622f6fcb11183a2bb0
+    profiles: [monitoring]
+    environment:
+      DATA_SOURCE_URI: "postgres:5432/${POSTGRES_DB}?sslmode=disable"
+      DATA_SOURCE_USER: ${POSTGRES_USER}
+      DATA_SOURCE_PASS: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      PG_EXPORTER_EXCLUDE_DATABASES: "template0,template1"
+    command:
+      # Per-table live-row estimates and index usage: this is what answers
+      # "how many conversations / messages / web_pages do I actually have?"
+      - --collector.stat_user_tables
+      - --collector.statio_user_tables
+      - --collector.stat_database
+      # Per-database size, so growth is visible before the disk fills.
+      - --collector.database
+      - --collector.locks
+      - --collector.long_running_transactions
+      # Off on purpose: this deployment has one small database and these add
+      # cardinality without answering a question anyone here asks.
+      - --no-collector.replication
+      - --no-collector.replication_slot
+    networks:
+      - application
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    logging: *monitoring-logging
+
+  # --- The file-based stores: DuckDB, LanceDB, Parquet, reports ----------
+  # Most of this platform's data is NOT in PostgreSQL. The warehouse is a
+  # DuckDB file, the vector indexes are LanceDB directories, and the sync
+  # worker lands Parquet - none of which speak a wire protocol. The volumes
+  # are mounted READ-ONLY: this exporter can only measure, never modify.
+  data-stores-exporter:
+    image: python:3.12-slim
+    profiles: [monitoring]
+    command: ["python", "-u", "/app/data_stores_exporter.py"]
+    volumes:
+      - ./monitoring/exporters/data-stores/data_stores_exporter.py:/app/data_stores_exporter.py:ro
+      - data:/data:ro
+      - reports:/reports:ro
+    environment:
+      DATA_STORES_EXPORTER_PORT: "9836"
+    networks:
+      - application
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:9836/healthz', timeout=3).status==200 else 1)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    logging: *monitoring-logging
+
+  # --- HTTP liveness for the services with no /metrics -------------------
+  blackbox-exporter:
+    image: prom/blackbox-exporter@sha256:b04a9fef4fa086a02fc7fcd8dcdbc4b7b35cc30cdee860fdc6a19dd8b208d63e
+    profiles: [monitoring]
+    command:
+      - --config.file=/etc/blackbox/blackbox.yml
+    volumes:
+      - ./monitoring/blackbox/blackbox.yml:/etc/blackbox/blackbox.yml:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - application
+    restart: unless-stopped
+    logging: *monitoring-logging
+
+volumes:
+  prometheus-data:
+    name: sf-local-ai_prometheus
+  grafana-data:
+    name: sf-local-ai_grafana

@@ -1,0 +1,17 @@
+# The single datasource. Provisioned so a fresh Grafana volume comes up ready
+# — there is no manual "add datasource" step in this deployment.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: dgx-prometheus          # dashboards reference this uid, so keep it stable
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      # Must match prometheus.yml's scrape_interval or Grafana's $__rate_interval
+      # picks windows too short for a rate() to have two samples.
+      timeInterval: 5s
+      httpMethod: POST

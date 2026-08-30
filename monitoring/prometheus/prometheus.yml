@@ -1,0 +1,155 @@
+# Prometheus for the two-node DGX Spark cluster.
+#
+# TOPOLOGY LIVES HERE, NOT IN THE EXPORTERS. Every exporter is byte-identical
+# on both Sparks; the `node`, `role` and `cluster` labels are attached below,
+# so adding a third Spark later means adding target entries here and nothing
+# else.
+#
+# SCRAPING GOES OVER THE MANAGEMENT LAN (192.168.9.0/22, interface enP7s7) and
+# never over 10.100.184.0/24 or 10.100.185.0/24. Those two are the RoCE fabric
+# carrying NCCL tensor-parallel traffic between the Sparks; putting monitoring
+# on them would measure the thing it perturbs.
+
+global:
+  # 5s keeps GPU/vLLM panels genuinely live. Measured cost of one GPU scrape
+  # on this hardware: 60 ms (two nvidia-smi calls), so ~1.2% duty cycle.
+  scrape_interval: 5s
+  scrape_timeout: 4s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: dgx-spark-cluster
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+scrape_configs:
+  # --- Prometheus itself -------------------------------------------------
+  - job_name: prometheus
+    scrape_interval: 30s
+    static_configs:
+      - targets: ["localhost:9090"]
+        labels: { node: spark-1, role: head }
+
+  # --- GPU telemetry, one target per physical Spark ----------------------
+  # A custom nvidia-smi exporter rather than dcgm-exporter. DCGM does RUN on
+  # GB10, but returns no framebuffer memory (N/A at the library level), cannot
+  # load its profiling module, and at its default interval reported load that
+  # had already finished. docs/MONITORING.md records the comparison. Fields the
+  # GB10 driver reports as N/A are absent here rather than exported as zero.
+  - job_name: dgx-gpu
+    scrape_interval: 5s
+    static_configs:
+      - targets: ["dgx-gpu-exporter:9835"]
+        labels: { node: spark-1, role: head }
+      - targets: ["192.168.9.68:9835"]
+        labels: { node: spark-2, role: worker }
+
+  # --- Host telemetry, one target per physical Spark ---------------------
+  # On a unified-memory machine these ARE the memory metrics that matter:
+  # the GB10 driver reports no framebuffer capacity, so model weights and KV
+  # cache show up in the host's own memory counters.
+  - job_name: node
+    scrape_interval: 10s
+    static_configs:
+      # Via the host gateway, not a container name: node-exporter runs with
+      # host networking (mandatory - its netdev collector is namespace-scoped
+      # and would otherwise report the container's eth0 instead of the RoCE
+      # links), so it is not on the bridge DNS.
+      - targets: ["host.docker.internal:9100"]
+        labels: { node: spark-1, role: head }
+      - targets: ["192.168.9.68:9100"]
+        labels: { node: spark-2, role: worker }
+
+  # --- Containers (Spark 1 only; Spark 2 runs just the vLLM worker) ------
+  - job_name: cadvisor
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["cadvisor:8080"]
+        labels: { node: spark-1, role: head }
+    metric_relabel_configs:
+      # cAdvisor is the single biggest cardinality risk in this stack. Keep
+      # only whole-container series and drop the per-cpu/per-filesystem/
+      # per-network-interface breakdowns nothing here plots.
+      - source_labels: [__name__]
+        regex: "container_(cpu_usage_seconds_total|memory_working_set_bytes|memory_usage_bytes|spec_memory_limit_bytes|network_receive_bytes_total|network_transmit_bytes_total|start_time_seconds|last_seen|tasks_state|fs_usage_bytes)"
+        action: keep
+      # Drop the per-container-id noise: the compose service name is enough.
+      - regex: "^(id|image|container_label_.*)$"
+        action: labeldrop
+
+  # --- vLLM: ONE endpoint describes the WHOLE distributed engine ---------
+  # Spark 2 runs `--headless --node-rank 1` and has no API server at all
+  # (verified: connection refused on 8000/8001/8080). The head's EngineCore
+  # schedules both TP ranks, so these counters are cluster-wide. They are
+  # deliberately NOT labelled per-node — that would be a lie.
+  - job_name: vllm-main
+    scrape_interval: 5s
+    static_configs:
+      - targets: ["host.docker.internal:8000"]
+        labels: { service: main, role: head, engine_scope: cluster }
+    metric_relabel_configs:
+      # Prometheus client `_created` gauges are one timestamp per family that
+      # never changes — 64 useless series per scrape here.
+      - source_labels: [__name__]
+        regex: ".*_created$"
+        action: drop
+
+  # --- The four single-node model services -------------------------------
+  - job_name: vllm-aux
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["host.docker.internal:8002"]
+        labels: { service: router, node: spark-1, role: head }
+      - targets: ["host.docker.internal:8003"]
+        labels: { service: embed, node: spark-1, role: head }
+      - targets: ["host.docker.internal:8004"]
+        labels: { service: ocr, node: spark-1, role: head }
+      - targets: ["host.docker.internal:8005"]
+        labels: { service: reranker, node: spark-1, role: head }
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: ".*_created$"
+        action: drop
+
+  # --- Databases and data stores -----------------------------------------
+  - job_name: postgres
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["postgres-exporter:9187"]
+        labels: { node: spark-1, role: head, service: postgres }
+
+  # DuckDB warehouse, both LanceDB indexes, Parquet, reports, workspaces.
+  # Walked from disk, so a slower interval - these move on the scale of a
+  # sync cycle, not a scrape.
+  - job_name: data-stores
+    scrape_interval: 30s
+    static_configs:
+      - targets: ["data-stores-exporter:9836"]
+        labels: { node: spark-1, role: head }
+
+  # --- Application liveness ----------------------------------------------
+  # The orchestrator, frontend and SearXNG expose no /metrics, so their
+  # availability is probed rather than scraped. This is the only thing
+  # blackbox is used for.
+  - job_name: blackbox-http
+    scrape_interval: 15s
+    metrics_path: /probe
+    params:
+      module: [http_2xx]
+    static_configs:
+      - targets:
+          - http://host.docker.internal:8080/health
+        labels: { service: orchestrator, node: spark-1 }
+      - targets:
+          - http://host.docker.internal:3000/
+        labels: { service: frontend, node: spark-1 }
+      - targets:
+          - http://searxng:8080/healthz
+        labels: { service: searxng, node: spark-1 }
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: probe_url
+      - target_label: __address__
+        replacement: blackbox-exporter:9115

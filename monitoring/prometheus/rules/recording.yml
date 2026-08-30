@@ -1,0 +1,140 @@
+# Recording rules: the cluster-level aggregates the dashboards read.
+#
+# These exist so a panel is one cheap series lookup instead of a sum() over
+# every node evaluated on every refresh of every open dashboard. Names follow
+# the Prometheus convention level:metric:operation.
+
+groups:
+  # ------------------------------------------------------------------ GPU
+  - name: dgx-gpu
+    interval: 5s
+    rules:
+      # COMBINED ACCELERATOR POWER. This is the sum of what each GB10's
+      # driver reports for the GPU/accelerator rail. It is NOT whole-machine
+      # AC draw: no wall-socket telemetry exists on this hardware, and the
+      # driver reports no power LIMIT either, so there is no headroom figure.
+      - record: cluster:gpu_power_watts:sum
+        expr: sum(dgx_gpu_power_watts)
+
+      - record: node:gpu_power_watts:sum
+        expr: sum by (node) (dgx_gpu_power_watts)
+
+      - record: cluster:gpu_temperature_celsius:max
+        expr: max(dgx_gpu_temperature_celsius)
+
+      - record: cluster:gpu_temperature_celsius:avg
+        expr: avg(dgx_gpu_temperature_celsius)
+
+      - record: node:gpu_temperature_celsius:max
+        expr: max by (node) (dgx_gpu_temperature_celsius)
+
+      - record: cluster:gpu_utilization_percent:avg
+        expr: avg(dgx_gpu_utilization_percent)
+
+      - record: node:gpu_utilization_percent:avg
+        expr: avg by (node) (dgx_gpu_utilization_percent)
+
+      # Any throttle reason active anywhere, as one number to alert on.
+      - record: cluster:gpu_throttle_active:max
+        expr: max(dgx_gpu_throttle_active{reason!~"idle|app_clocks_setting|display_clock_setting"})
+
+  # ----------------------------------------------------------------- host
+  - name: dgx-host
+    interval: 10s
+    rules:
+      # UNIFIED MEMORY. On GB10 the GPU has no separate framebuffer, so this
+      # host figure is the real memory pressure signal for the LLM.
+      - record: node:memory_used_bytes:current
+        expr: node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes
+
+      - record: node:memory_used_percent:current
+        expr: >-
+          100 * (node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes)
+          / node_memory_MemTotal_bytes
+
+      - record: node:cpu_utilization_percent:avg
+        expr: >-
+          100 * (1 - avg by (node) (rate(node_cpu_seconds_total{mode="idle"}[1m])))
+
+      # ROCE FABRIC. These read the INFINIBAND counters, not netdev, and that
+      # distinction is the whole game: RoCE/RDMA traffic bypasses the network
+      # stack entirely. Measured during one 300-token generation, the IB
+      # counters moved 335 MB and 76 MB while netdev on the very same
+      # interfaces moved 170 kB and EXACTLY ZERO. A netdev-based interconnect
+      # panel would have read flat-zero forever and looked like a dead fabric.
+      #
+      # Only the two ACTIVE ports are matched: rocep1s0f0 and roceP2p1s0f0 are
+      # DOWN on both nodes and would drag any average to zero.
+      #   rocep1s0f1   -> enp1s0f1np1   -> 10.100.184.x -> NCCL NET/IB/0
+      #   roceP2p1s0f1 -> enP2p1s0f1np1 -> 10.100.185.x -> NCCL NET/IB/1
+      - record: node:roce_receive_bytes_per_second:sum
+        expr: >-
+          sum by (node) (rate(node_infiniband_port_data_received_bytes_total{device=~"rocep1s0f1|roceP2p1s0f1"}[1m]))
+
+      - record: node:roce_transmit_bytes_per_second:sum
+        expr: >-
+          sum by (node) (rate(node_infiniband_port_data_transmitted_bytes_total{device=~"rocep1s0f1|roceP2p1s0f1"}[1m]))
+
+      # Per rail, because the split is NOT even: one measured generation was
+      # 81.5% rail 1 / 18.5% rail 2, so a sum would hide a dead rail.
+      - record: node:roce_receive_bytes_per_second:rail
+        expr: >-
+          sum by (node, device) (rate(node_infiniband_port_data_received_bytes_total{device=~"rocep1s0f1|roceP2p1s0f1"}[1m]))
+
+      - record: node:roce_transmit_bytes_per_second:rail
+        expr: >-
+          sum by (node, device) (rate(node_infiniband_port_data_transmitted_bytes_total{device=~"rocep1s0f1|roceP2p1s0f1"}[1m]))
+
+      - record: cluster:roce_receive_bytes_per_second:sum
+        expr: sum(node:roce_receive_bytes_per_second:sum)
+
+      - record: cluster:roce_transmit_bytes_per_second:sum
+        expr: sum(node:roce_transmit_bytes_per_second:sum)
+
+      # Every standard IB error counter reads zero on a healthy fabric here,
+      # so any non-zero rate is worth an alert.
+      - record: node:roce_errors_per_second:sum
+        expr: >-
+          sum by (node) (
+            rate(node_infiniband_port_errors_received_total{device=~"rocep1s0f1|roceP2p1s0f1"}[5m])
+            + rate(node_infiniband_port_discards_transmitted_total{device=~"rocep1s0f1|roceP2p1s0f1"}[5m])
+            + rate(node_infiniband_link_downed_total{device=~"rocep1s0f1|roceP2p1s0f1"}[5m])
+          )
+
+  # ----------------------------------------------------------------- vLLM
+  # NO `by (node)` ANYWHERE IN THIS GROUP. The head's EngineCore schedules
+  # both tensor-parallel ranks, so every counter below already describes the
+  # whole distributed engine. Splitting it per node would invent a
+  # distinction the metric does not have.
+  - name: vllm
+    interval: 5s
+    rules:
+      - record: cluster:vllm_generation_tokens_per_second:rate1m
+        expr: sum(rate(vllm:generation_tokens_total{service="main"}[1m]))
+
+      - record: cluster:vllm_prompt_tokens_per_second:rate1m
+        expr: sum(rate(vllm:prompt_tokens_total{service="main"}[1m]))
+
+      - record: cluster:vllm_tokens_per_second:rate1m
+        expr: >-
+          cluster:vllm_generation_tokens_per_second:rate1m
+          + cluster:vllm_prompt_tokens_per_second:rate1m
+
+      - record: cluster:vllm_requests_running:current
+        expr: sum(vllm:num_requests_running{service="main"})
+
+      - record: cluster:vllm_requests_waiting:current
+        expr: sum(vllm:num_requests_waiting{service="main"})
+
+      - record: cluster:vllm_requests_per_second:rate5m
+        expr: sum(rate(vllm:request_success_total{service="main"}[5m]))
+
+      - record: cluster:vllm_kv_cache_usage_percent:current
+        # vLLM reports this as a 0..1 fraction; ×100 once, here, so no panel
+        # has to remember to do it.
+        expr: max(vllm:kv_cache_usage_perc{service="main"}) * 100
+
+      - record: cluster:vllm_prefix_cache_hit_ratio:rate5m
+        expr: >-
+          sum(rate(vllm:prefix_cache_hits_total{service="main"}[5m]))
+          / clamp_min(sum(rate(vllm:prefix_cache_queries_total{service="main"}[5m])), 1)
