@@ -31,6 +31,11 @@ class UnsafeURLError(ValueError):
 
 
 class FetchError(RuntimeError):
+    #: HTTP status when the failure IS an HTTP status (4xx/5xx), else None.
+    #: The crawler needs the distinction RFC 9309 draws for robots.txt:
+    #: 4xx means "no rules, crawl allowed"; 5xx means "assume disallowed".
+    status: "int | None" = None
+
     """Raised when a fetch fails for a benign reason (timeout, too big, status)."""
 
 
@@ -148,7 +153,9 @@ async def safe_fetch(
                 continue
 
             if resp.status_code >= 400:
-                raise FetchError(f"HTTP {resp.status_code} for {current}")
+                err = FetchError(f"HTTP {resp.status_code} for {current}")
+                err.status = resp.status_code
+                raise err
 
             body = resp.content[: max_bytes + 1]
             if len(body) > max_bytes:

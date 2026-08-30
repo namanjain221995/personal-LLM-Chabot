@@ -49,6 +49,12 @@ from app.config import settings  # noqa: E402
 #: about. `schema_migrations` is deliberately absent — truncating it would make
 #: the next init_schema() re-run every migration.
 _APP_TABLES = (
+    # V8 web-search memory: web_results cascades from web_searches, but the
+    # explicit order keeps TRUNCATE happy either way; web_pages is global.
+    "web_crawls",
+    "web_results",
+    "web_searches",
+    "web_pages",
     "sf_clarifications",
     "sf_intents",
     "sf_conversation_state",

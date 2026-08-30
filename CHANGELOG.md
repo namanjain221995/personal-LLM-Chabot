@@ -1,5 +1,75 @@
 # Changelog
 
+## The chatbot remembers the web: search memory, a site crawler, and a live pipeline UI (2026-08-30)
+
+Three rounds shipped together, each measured on the live cluster before and
+after.
+
+**Web-search memory (V8).** The search engine fetched up to 60 pages per
+question, answered, and threw everything away — an identical question a
+minute later re-fetched every page, and even the 15-minute in-process SERP
+cache died with the container. Now every search, every link returned, and
+every page read is persisted in PostgreSQL (`web_searches`, `web_results`,
+`web_pages` — global, deduped by normalized URL, full pre-truncation text,
+sha256 content hash), and an embedded-chunk index over the store
+(`orchestrator/app/web_index.py`, LanceDB at `/data/lancedb-web` — its own
+directory so web content can never surface as a Salesforce citation) lets any
+later question pull dated paragraphs from pages read in any conversation.
+Stored pages younger than 24 h (1 h for fresh-intent questions) answer
+without the network; a changed content hash re-indexes exactly the pages
+that changed.
+
+**Search speed and accuracy, measured.** The answer call never received the
+effort picker, so every web answer ran a full thinking pass — 851 reasoning
+tokens ahead of a 32-token answer, 77–82 % of wall-clock. Fast had a query
+budget of ZERO: forcing the web pill ON produced "No web results found"
+without searching. Both fixed — Fast now searches (1 query, 8 sources,
+measured 6.8 s end-to-end with cited answers) — plus: per-query searches run
+in parallel (they were sequential, 0.7–2.2 s each), the idle Qwen3-Reranker
+now orders candidates by relevance before fetch (engine rank had put an anime
+video page at [1] for "latest vLLM release", twice), and the candidate pool
+rose from 10 to 40 results per query. Also fixed: `_registrable_domain`
+corrupted hostnames via `lstrip("www.")` ("web.example.com" →
+"eb.example.com").
+
+**Site crawler (V9).** "index this site <url>" walks a whole site into the
+same store — sitemap-first (docs.vllm.ai measured: robots.txt names a flat
+2,451-URL sitemap), BFS link-walk fallback, robots.txt respected with RFC
+9309 status semantics and an honest `TechSaraBot/1.0` User-Agent, SSRF-guarded
+fetches, same-site scope checked at enqueue AND after redirects, politeness
+delays, hard caps (1,000 pages / 15 min, resumable — already-stored pages are
+skipped). Live proof: 55 pages of the vLLM feature docs crawled, stored and
+indexed (152 chunks) in 27 s with zero failures; a follow-up question then
+answered from the stored copy in 6 s with 4 dated citations. Follow-ups route
+to the crawled site only when scoped retrieval clears a measured relevance
+floor, so unrelated questions in the same conversation route normally. After
+every ordinary search, a background pass quietly follows a few in-site links
+from the pages just read (8 pages/domain, 3 domains) so the next related
+question hits warm content.
+
+Retrieval fixes shipped WITH the crawler because measurement showed a big
+crawl would otherwise make answers worse: a distance floor (real hits scored
+0.36–0.66, junk ≥ 1.19), best-chunk-per-URL grouping (top-6 used to collapse
+into six chunks of one page), a 2-of-3 per-domain cap in memory sources, and
+a per-page chunk cap raised 24 → 64 (24 silently dropped 12 % of the vLLM
+engine-args page).
+
+**Live pipeline UI.** The agent plan is a quiet vertical rail (no more
+"AGENT PLAN" box): one collapsible summary that ticks "Working… 12s" and
+settles to "Worked for 1m 12s", client-measured like the thinking accordion.
+The static "Planning the steps for this task…" line is retired by the first
+real step (it used to sit unchanged for the whole run — measured 213 s on a
+23,520-char paste before the first step event). While a phase IS genuinely
+silent, a per-second clock plus one honest note after 25 s replaces the
+frozen sentence; no fabricated progress text.
+
+Third occurrence of one bug class, now regression-tested: a user-facing
+route calling `stream_chat_events` without the effort (vision 2026-08-28,
+search and site-Q&A 2026-08-30) runs a full thinking pass whatever the
+picker says.
+
+Tests: orchestrator 1,547 passed (29 new), frontend 777 passed (9 new).
+
 ## A real 1,000,000-token window: the KV cache was starving the prefill (2026-08-29)
 
 The previous entry capped the window at 850,000 because a ~950K-token prompt

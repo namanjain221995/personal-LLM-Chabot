@@ -106,3 +106,43 @@ def truncate_chars(text: str, max_chars: int) -> str:
     if sp > max_chars * 0.6:
         cut = cut[:sp]
     return cut.rstrip() + " …"
+
+def extract_readable_and_links(
+    content_type: str, body: bytes, url: str
+) -> "tuple[Extracted, list[str]]":
+    """One parse pass for the crawler: readable text PLUS harvested links.
+
+    MUST run inside the same single-worker pool as extract_readable —
+    trafilatura shares non-thread-safe compiled lxml objects, and a parallel
+    parse on another thread can abort the interpreter (see the pool note in
+    engines/search.py). Combining the two here means the crawler pays one
+    pool submission per page, not two.
+
+    Links come only from HTML (a PDF has none worth walking), are
+    absolute-ized against the FINAL post-redirect URL with <base href>
+    honoured, and are de-fragmented — fragments multiply a crawl frontier
+    with self-links. Measured: 41 ms for ~2,500 links on a 727 KB doc page.
+    """
+    extracted = extract_readable(content_type, body, url)
+    links: list[str] = []
+    if "html" in (content_type or "").lower():
+        try:
+            import lxml.html  # already a trafilatura dependency
+
+            doc = lxml.html.document_fromstring(body)
+            doc.make_links_absolute(url, resolve_base_href=True)
+            from urllib.parse import urldefrag
+
+            seen: set[str] = set()
+            for a in doc.iter("a"):
+                href = (a.get("href") or "").strip()
+                if not href.startswith(("http://", "https://")):
+                    continue
+                clean, _frag = urldefrag(href)
+                if clean and clean not in seen:
+                    seen.add(clean)
+                    links.append(clean)
+        except Exception:  # noqa: BLE001 — links are an extra, never a gate
+            links = []
+    return extracted, links
+

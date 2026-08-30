@@ -27,8 +27,11 @@ def test_high_searches_more_than_medium_which_searches_more_than_low():
     )
 
 
-def test_fast_gets_no_search_budget_at_all():
-    assert search.query_budget("fast") == 0
+def test_fast_gets_one_query_when_search_is_forced():
+    """Was 0 — with the web pill ON that ran no search at all and answered
+    "No web results found" from model knowledge (measured 2026-08-30). One
+    query keeps Fast fast while making a forced search actually search."""
+    assert search.query_budget("fast") == 1
 
 
 def test_an_unknown_level_falls_back_to_the_middle():
