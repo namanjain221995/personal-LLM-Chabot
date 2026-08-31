@@ -31,6 +31,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence
 from .. import llm
 from ..config import settings
 from ..core import org_brief
+from ..core.exports import export_csv, slugify
 from ..core.sf_intel import budget as ctx_budget
 from ..core.sf_intel import (
     interpret,
@@ -686,6 +687,48 @@ async def _execute_live(
         },
         "status": {**phase.last, "phase": "completed"},
     }
+    # FULL-DATA EXPORT. The browser's "Download CSV" button serialises
+    # `meta.data`, which is the PREVIEW - so on a truncated result it produced
+    # a file quietly smaller than the record count printed directly above it
+    # (owner report 2026-08-31: 10,000 rows downloaded for a 10,423-record
+    # answer). Whenever the preview is short of what was retrieved, write the
+    # complete rows server-side and attach them on the existing
+    # `report_files` contract, which the frontend already renders as a
+    # download card served by GET /reports/{filename}. Bounded by
+    # EXPORT_ROW_CAP (100,000), not by the preview cap.
+    if result.rows and len(preview) < len(result.rows):
+        try:
+            # Rows are dicts here (the preview is handed to the chart as such),
+            # but the SELECT list in `columns` is the authority on ORDER, and
+            # a row dict can be missing an optional field entirely.
+            first = result.rows[0]
+            if isinstance(first, dict):
+                columns = list(result.columns) or list(first.keys())
+                matrix = [[row.get(c) for c in columns] for row in result.rows]
+            else:
+                columns = list(result.columns)
+                matrix = [list(row) for row in result.rows]
+            path, export_truncated = export_csv(
+                columns,
+                matrix,
+                settings.reports_dir,
+                slug=slugify(
+                    f"{result.object_api_name}-{question}",
+                    fallback="salesforce-export",
+                ),
+            )
+            meta["report_files"] = [
+                {
+                    "filename": path.name,
+                    "type": "csv",
+                    "size": path.stat().st_size,
+                }
+            ]
+            meta["export_rows"] = len(result.rows)
+            meta["export_truncated"] = export_truncated
+        except Exception:  # noqa: BLE001 - the answer matters, the file does not
+            log.warning("could not write the full-result CSV export", exc_info=True)
+
     if assumptions:
         meta["assumptions"] = assumptions
     # The user asked to see the query, or policy allows it. Otherwise it stays

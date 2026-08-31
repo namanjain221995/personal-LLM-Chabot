@@ -180,6 +180,14 @@ export interface Meta {
   chart_data?: DataRow[];
   citations?: Citation[];
   report_files?: ReportFile[];
+  /**
+   * Rows inside the full-result export in `report_files` — which is the whole
+   * result, not the `data` preview. Set by the Salesforce engine whenever the
+   * preview is shorter than what was retrieved.
+   */
+  export_rows?: number;
+  /** True when even the export hit its own cap (100k rows). */
+  export_truncated?: boolean;
   /** V2 §2: request mode ("salesforce" | "assistant"). */
   mode?: string;
   /** V2 §2: served model id. */

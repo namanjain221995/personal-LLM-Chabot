@@ -1,6 +1,6 @@
 /** Client-side CSV building + download for the proof drawer Data section. */
 
-import type { DataRow } from './types';
+import type { DataRow, Meta } from './types';
 
 function escapeCell(value: unknown): string {
   if (value === null || value === undefined) return '';
@@ -36,4 +36,51 @@ export function downloadCsv(rows: DataRow[], filename: string): void {
   a.click();
   a.remove();
   URL.revokeObjectURL(url);
+}
+
+/**
+ * A download name that describes the ANSWER, not the app.
+ *
+ * Every Data-section download used to be `techsara-data.csv`, so a folder of
+ * them was indistinguishable (owner report 2026-08-31) and each new one
+ * overwrote — or " (1)"-suffixed — the last. The name now comes from the data
+ * itself: the Salesforce object queried, then the moment it was queried.
+ *
+ *   Interview__c, fetched 14:32   ->  interview-2026-08-31-1432.csv
+ *
+ * The timestamp is the query's own `query_timestamp`, so two questions about
+ * the same object in one chat still land in two different files, and the file
+ * says WHICH pull it came from. Falls back through route to the old name, so a
+ * payload carrying none of this still downloads.
+ */
+export function csvFilenameFor(meta: Meta, fallback = 'techsara-data'): string {
+  const objects = meta.salesforce_sources?.objects ?? [];
+  const base =
+    objects
+      .slice(0, 2)
+      .map((o) => slugifyName(o))
+      .filter(Boolean)
+      .join('-') ||
+    slugifyName(meta.route ?? '') ||
+    fallback;
+
+  const when = new Date(meta.salesforce_sources?.query_timestamp ?? Date.now());
+  const stamp = Number.isNaN(when.getTime()) ? null : when;
+  if (!stamp) return `${base}.csv`;
+
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const date = `${stamp.getFullYear()}-${pad(stamp.getMonth() + 1)}-${pad(stamp.getDate())}`;
+  const time = `${pad(stamp.getHours())}${pad(stamp.getMinutes())}`;
+  return `${base}-${date}-${time}.csv`;
+}
+
+/** Salesforce API names to file-safe words: `Interview__c` -> `interview`. */
+function slugifyName(name: string): string {
+  return name
+    .replace(/__c$/i, '')
+    .replace(/[_\s]+/g, '-')
+    .replace(/[^A-Za-z0-9-]/g, '')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '')
+    .toLowerCase();
 }

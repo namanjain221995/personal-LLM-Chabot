@@ -57,14 +57,33 @@ services:
     volumes:
       - ./dgx_gpu_exporter.py:/app/dgx_gpu_exporter.py:ro
     environment:
-      DGX_GPU_EXPORTER_PORT: "9835"
+      # The exporter binds this ITSELF rather than Docker publishing a port to
+      # it. That is not a style choice - see the BINDING note above.
+      DGX_GPU_EXPORTER_HOST: "${MONITORING_WORKER_BIND:-127.0.0.1}"
+      DGX_GPU_EXPORTER_PORT: "${DGX_GPU_EXPORTER_PORT:-9835}"
     # See the head overlay: without this, per-process GPU memory is empty.
     pid: host
-    ports:
-      - "${MONITORING_WORKER_BIND:-127.0.0.1}:${DGX_GPU_EXPORTER_PORT:-9835}:9835"
+    # HOST NETWORKING, LIKE node-exporter ABOVE - AND FOR A SECOND REASON.
+    #
+    # Published as `ports: 192.168.9.68:9835:9835`, this container did not
+    # survive a reboot of Spark 2 (2026-08-31). Docker starts containers before
+    # enP7s7 has been assigned its address, so the bind failed with
+    #   failed to bind host port 192.168.9.68:9835/tcp:
+    #   cannot assign requested address
+    # and the container was left dead with RestartCount=0 - the failure is in
+    # Docker's own networking setup, BEFORE the process runs, so
+    # `restart: unless-stopped` never engaged. Grafana then showed one Spark.
+    # node-exporter came back from the same reboot untouched because it binds
+    # the address inside the container, where a missing IP is an ordinary
+    # process failure that the restart policy retries until the NIC is up.
+    network_mode: host
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:9835/healthz', timeout=3).status==200 else 1)\""]
+      # Probes the address the exporter ACTUALLY binds, by reading the same
+      # two environment variables it does - so the two can never drift apart.
+      # A fixed 127.0.0.1 here reported "unhealthy" forever the moment the
+      # listener moved off the loopback (2026-08-31).
+      test: ["CMD-SHELL", "python -c \"import os,urllib.request,sys; h=os.environ.get('DGX_GPU_EXPORTER_HOST','127.0.0.1'); p=os.environ.get('DGX_GPU_EXPORTER_PORT','9835'); sys.exit(0 if urllib.request.urlopen(f'http://{h}:{p}/healthz', timeout=3).status==200 else 1)\""]
       interval: 30s
       timeout: 5s
       retries: 5

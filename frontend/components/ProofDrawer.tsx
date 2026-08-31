@@ -9,6 +9,7 @@
 
 import { useState } from 'react';
 import type { Meta } from '@/lib/types';
+import { csvFilenameFor } from '@/lib/csv';
 import { EngineBadge } from './EngineBadge';
 import { SqlBlock } from './SqlBlock';
 import { DataTable } from './DataTable';
@@ -61,6 +62,19 @@ export function ProofDrawer({ meta }: { meta: Meta }) {
   if (meta.report_files?.length) {
     sections.push({ id: 'files', label: `Files (${meta.report_files.length})` });
   }
+
+  // The full-result CSV, when the engine wrote one. The Data section's rows
+  // are a preview; this is every row, already on disk and served by
+  // /api/reports. Only CSV — an .xlsx cannot stand in for a CSV download.
+  const fullCsvFile = meta.report_files?.find(
+    (f) => f.filename.toLowerCase().endsWith('.csv'),
+  );
+  const fullCsv = fullCsvFile
+    ? {
+        href: `/api/reports/${encodeURIComponent(fullCsvFile.filename)}`,
+        rows: meta.export_rows,
+      }
+    : undefined;
 
   const [open, setOpen] = useState<Set<SectionId>>(
     () =>
@@ -146,7 +160,14 @@ export function ProofDrawer({ meta }: { meta: Meta }) {
                 // How many records MATCHED, which is not always how many came
                 // back — so a truncated table can say "2,000 of 28,230".
                 totalRows={meta.salesforce_sources?.record_count}
-                csvName="techsara-data"
+                // Derived from the data (object + query time), so a folder
+                // of downloads is no longer N copies of techsara-data.csv.
+                csvName={csvFilenameFor(meta)}
+                // Present only when the orchestrator wrote the complete
+                // result to disk; then the button hands over THAT, not the
+                // preview these rows are.
+                fullCsvHref={fullCsv?.href}
+                fullCsvRows={fullCsv?.rows}
               />
             )}
             {s.id === 'chart' && meta.chart && chartRows && (

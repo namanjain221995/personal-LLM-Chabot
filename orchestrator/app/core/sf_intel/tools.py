@@ -51,12 +51,21 @@ DESCRIBE_TTL_SECONDS = 900.0
 #: metadata already supported by the application".
 COMMON_OBJECTS = ("Opportunity", "Account", "Case", "Task", "Contact", "Lead")
 
-#: Total records ONE request may pull across all pages. Pagination exists to
-#: answer "how many", not to mirror the org into a prompt.
-MAX_TOTAL_RECORDS = 10_000
+#: Total records ONE request may pull across all pages.
+#:
+#: Raised from 10,000 on 2026-08-31: an owner report showed a 10,423-record
+#: object coming back as exactly 10,000 rows, so the CSV download was silently
+#: 423 records short of the count printed directly above it. The old ceiling
+#: predates the full-CSV export below, when these rows only ever fed a prompt
+#: and a preview; now they are also what the export writes, so the fetch has
+#: to be able to reach the whole result set for an ordinary org-sized object.
+#: The export itself is still bounded by EXPORT_ROW_CAP (100,000).
+MAX_TOTAL_RECORDS = 50_000
 
 #: Pages one request may fetch. A bound on the loop as well as on the rows.
-MAX_PAGES = 20
+#: Salesforce returns 2,000 records per page, so 30 pages is 60,000 — the
+#: loop, not the page count, is what MAX_TOTAL_RECORDS stops.
+MAX_PAGES = 30
 
 
 class SalesforceToolError(RuntimeError):

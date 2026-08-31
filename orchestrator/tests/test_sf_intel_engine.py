@@ -1199,3 +1199,112 @@ def test_the_count_companion_keeps_the_filters_and_drops_everything_else():
     assert "ORDER BY" not in soql.upper()
     assert "Interview_Status__c = 'Completed'" in soql   # identical filters
     assert "Round__c = 'Final'" in soql
+
+
+# ── The download holds the WHOLE result ──────────────────────────────────────
+# Owner report 2026-08-31: an answer captioned "10,000 of 10,423 matching"
+# downloaded a 10,000-row CSV. Two separate ceilings caused it — the fetch
+# stopped at MAX_TOTAL_RECORDS, and the browser built the file out of
+# `meta.data`, which is only the preview. These pin both.
+
+
+def test_the_fetch_ceiling_clears_a_real_org_sized_object():
+    """10,423 Interview__c records must not be cut off by the pull limit."""
+    assert tools.MAX_TOTAL_RECORDS >= 10_423
+    # 2,000 records per Salesforce page: the page ceiling has to reach it too.
+    assert tools.MAX_PAGES * 2_000 >= tools.MAX_TOTAL_RECORDS
+
+
+def test_a_truncated_answer_publishes_a_full_result_csv(monkeypatch, tmp_path):
+    """The preview is capped; the FILE beside it must not be."""
+    monkeypatch.setattr(settings, "reports_dir", str(tmp_path))
+    rows = [
+        {"Name": f"Interview {i}", "StageName": "Won", "Amount": str(i)}
+        for i in range(2_500)
+    ]
+    _live(monkeypatch, pages=[rows], total=2_500)
+    stub_schema(monkeypatch)
+    stub_planner(monkeypatch, _execute_decision())
+    monkeypatch.setattr(llm, "stream_chat_events", _stream(["done"]))
+    # Force a short preview so the export path is the one under test.
+    monkeypatch.setattr(sf_intel, "_preview_rows", lambda *_a, **_k: 100)
+
+    rec = Recorder()
+    run(sf_intel.run("list every interview", [], rec.emit, conversation_id=CONV))
+    meta = rec.meta()
+
+    assert len(meta["data"]) == 100, "the preview is still capped"
+    assert meta["truncated"] is True
+    assert meta["export_rows"] == 2_500, "the file covers every retrieved row"
+    assert meta["export_truncated"] is False
+
+    files = meta["report_files"]
+    assert len(files) == 1 and files[0]["type"] == "csv"
+    written = tmp_path / files[0]["filename"]
+    body = written.read_text(encoding="utf-8").splitlines()
+    assert len(body) == 2_501, "header + every row, not the preview"
+    # The compiler always selects Id, so the header is the SELECT list as
+    # sent — not the planner's field list — which is what an export should be.
+    assert body[0].split(",") == ["Id", "Name", "StageName", "Amount"]
+    assert "Interview 2499" in body[-1]
+
+
+def test_the_export_filename_describes_the_question_not_the_app(monkeypatch, tmp_path):
+    """Two different questions must not produce two identically named files."""
+    monkeypatch.setattr(settings, "reports_dir", str(tmp_path))
+    rows = [{"Name": f"r{i}", "StageName": "Won", "Amount": "1"} for i in range(300)]
+    monkeypatch.setattr(sf_intel, "_preview_rows", lambda *_a, **_k: 10)
+    stub_schema(monkeypatch)
+    stub_planner(monkeypatch, _execute_decision())
+    monkeypatch.setattr(llm, "stream_chat_events", _stream(["done"]))
+
+    names = []
+    for i, question in enumerate(
+        ["interviews booked this quarter", "interviews that fell through"]
+    ):
+        _live(monkeypatch, pages=[rows], total=300)
+        rec = Recorder()
+        run(sf_intel.run(question, [], rec.emit, conversation_id=f"conv-name-{i}"))
+        names.append(rec.meta()["report_files"][0]["filename"])
+
+    assert names[0] != names[1], "the two downloads must be distinguishable"
+    assert "booked" in names[0] and "fell" in names[1]
+    assert all(n.startswith("opportunity") and n.endswith(".csv") for n in names)
+
+
+def test_an_untruncated_answer_writes_no_file(monkeypatch, tmp_path):
+    """A small result is already whole in the table — no file to clean up."""
+    monkeypatch.setattr(settings, "reports_dir", str(tmp_path))
+    rows = [{"Name": "a", "StageName": "Won", "Amount": "1"}]
+    _live(monkeypatch, pages=[rows], total=1)
+    stub_schema(monkeypatch)
+    stub_planner(monkeypatch, _execute_decision())
+    monkeypatch.setattr(llm, "stream_chat_events", _stream(["done"]))
+
+    rec = Recorder()
+    run(sf_intel.run("one interview", [], rec.emit, conversation_id="conv-small"))
+    assert "report_files" not in rec.meta()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_failed_export_never_costs_the_user_the_answer(monkeypatch, tmp_path):
+    """The file is a convenience; the answer is the product."""
+    monkeypatch.setattr(settings, "reports_dir", str(tmp_path))
+    rows = [{"Name": f"r{i}", "StageName": "Won", "Amount": "1"} for i in range(300)]
+    _live(monkeypatch, pages=[rows], total=300)
+    stub_schema(monkeypatch)
+    stub_planner(monkeypatch, _execute_decision())
+    monkeypatch.setattr(llm, "stream_chat_events", _stream(["done"]))
+    monkeypatch.setattr(sf_intel, "_preview_rows", lambda *_a, **_k: 10)
+
+    def boom(*_a, **_k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(sf_intel, "export_csv", boom)
+
+    rec = Recorder()
+    run(sf_intel.run("list interviews", [], rec.emit, conversation_id="conv-boom"))
+    meta = rec.meta()
+    assert "report_files" not in meta
+    assert meta["data"], "the table survived"
+    assert meta["status"]["phase"] == "completed"

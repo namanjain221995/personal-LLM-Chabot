@@ -44,12 +44,27 @@ export function DataTable({
   truncated,
   csvName,
   totalRows,
+  fullCsvHref,
+  fullCsvRows,
 }: {
   rows: DataRow[];
   truncated?: boolean;
   csvName: string;
   /** How many records matched, when more matched than were returned. */
   totalRows?: number;
+  /**
+   * The COMPLETE result, written server-side and served from /api/reports.
+   *
+   * `rows` is the preview, capped so the payload and the DOM stay sane. The
+   * download button used to serialise that preview, which meant a table
+   * captioned "10,000 of 10,423 matching" handed over a 10,000-row file
+   * (owner report 2026-08-31). When the orchestrator has written the full
+   * export, the button links to it instead of rebuilding the short version
+   * in the browser.
+   */
+  fullCsvHref?: string;
+  /** Row count inside that file, for the button's tooltip. */
+  fullCsvRows?: number;
 }) {
   const [sortKey, setSortKey] = useState<string | null>(null);
   const [sortDir, setSortDir] = useState<SortDir>('asc');
@@ -112,24 +127,44 @@ export function DataTable({
   }
 
   const shown = `${rows.length.toLocaleString()} row${rows.length === 1 ? '' : 's'}`;
+  // "Narrow the question" was the only way to reach the rest until the full
+  // export existed. Where the download now holds everything, say that instead
+  // of sending the user back to rewrite a question they answered correctly.
+  const rest = fullCsvHref ? 'download for the rest.' : 'narrow the question to see the rest.';
   const label = truncated
     ? totalRows && totalRows > rows.length
-      ? `${shown} of ${totalRows.toLocaleString()} matching — narrow the question to see the rest.`
-      : `${shown} — the full result was larger.`
+      ? `${shown} of ${totalRows.toLocaleString()} matching — ${rest}`
+      : `${shown} — the full result was larger; ${rest}`
     : shown;
 
   return (
     <div>
       <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
         <span className="text-xs text-muted">{label}</span>
-        <button
-          type="button"
-          onClick={() => downloadCsv(rows, csvName)}
-          className="inline-flex items-center gap-1.5 rounded-md border border-border bg-surface px-2.5 py-1 text-xs text-muted transition-colors duration-ts hover:bg-surface-2 hover:text-ink"
-        >
-          <IconDownload size={13} />
-          Download CSV
-        </button>
+        {fullCsvHref ? (
+          <a
+            href={fullCsvHref}
+            download={csvName}
+            title={
+              fullCsvRows
+                ? `All ${fullCsvRows.toLocaleString()} rows`
+                : 'The complete result'
+            }
+            className="inline-flex items-center gap-1.5 rounded-md border border-border bg-surface px-2.5 py-1 text-xs text-muted no-underline transition-colors duration-ts hover:bg-surface-2 hover:text-ink"
+          >
+            <IconDownload size={13} />
+            Download CSV{fullCsvRows ? ` (${fullCsvRows.toLocaleString()} rows)` : ''}
+          </a>
+        ) : (
+          <button
+            type="button"
+            onClick={() => downloadCsv(rows, csvName)}
+            className="inline-flex items-center gap-1.5 rounded-md border border-border bg-surface px-2.5 py-1 text-xs text-muted transition-colors duration-ts hover:bg-surface-2 hover:text-ink"
+          >
+            <IconDownload size={13} />
+            Download CSV
+          </button>
+        )}
       </div>
       <div
         ref={scrollRef}

@@ -190,6 +190,70 @@ class MonitoringComposeTests(unittest.TestCase):
                 f"dgx-gpu-exporter in {overlay.name} needs pid: host",
             )
 
+    def test_worker_exporters_survive_a_reboot_of_spark_2(self):
+        """Neither worker exporter may rely on Docker publishing a host port.
+
+        Spark 2 rebooted on 2026-08-31 and came back reporting host metrics but
+        NO GPU metrics, so every per-Spark GPU panel in Grafana showed one node.
+        The GPU exporter had been published as `192.168.9.68:9835:9835`, and
+        Docker starts containers before enP7s7 is assigned its address:
+
+            failed to bind host port 192.168.9.68:9835/tcp:
+            cannot assign requested address
+
+        That failure happens in Docker's networking setup, BEFORE the process
+        starts, so `restart: unless-stopped` never engaged and the container was
+        left dead with RestartCount=0. node-exporter survived the same reboot
+        because it binds the address itself, where a missing IP is an ordinary
+        process failure the restart policy retries until the NIC is up.
+        """
+        cfg = _render([WORKER_OVERLAY], profile=None)
+        for name in ("node-exporter", "dgx-gpu-exporter"):
+            svc = cfg["services"][name]
+            self.assertEqual(
+                svc.get("network_mode"),
+                "host",
+                f"{name} must use host networking, not a published port",
+            )
+            self.assertFalse(
+                svc.get("ports"),
+                f"{name} must not publish a host port - it dies at boot",
+            )
+            self.assertEqual(
+                svc.get("restart"),
+                "unless-stopped",
+                f"{name} must retry until the management NIC is up",
+            )
+
+    def test_the_worker_gpu_exporter_binds_the_management_ip_only(self):
+        """Host networking must not become "listening on every interface".
+
+        The RoCE addresses (10.100.184/185.x) carry NCCL tensor-parallel
+        traffic; monitoring must not be reachable on the fabric it measures.
+        """
+        cfg = _render([WORKER_OVERLAY], profile=None)
+        env = cfg["services"]["dgx-gpu-exporter"].get("environment") or {}
+        self.assertIn(
+            "DGX_GPU_EXPORTER_HOST",
+            env,
+            "with host networking the exporter must bind an explicit address, "
+            "or it serves on 0.0.0.0 including the RoCE links",
+        )
+        self.assertNotIn("0.0.0.0", str(env.get("DGX_GPU_EXPORTER_HOST")))
+
+    def test_the_worker_healthcheck_probes_the_address_it_binds(self):
+        """A hard-coded 127.0.0.1 probe reports unhealthy forever once the
+        listener moves off the loopback - which is what host networking did."""
+        body = WORKER_OVERLAY.read_text()
+        gpu = body.split("dgx-gpu-exporter:", 1)[1]
+        self.assertNotIn(
+            "http://127.0.0.1:9835/healthz",
+            gpu,
+            "the healthcheck must follow DGX_GPU_EXPORTER_HOST, not assume "
+            "the loopback",
+        )
+        self.assertIn("DGX_GPU_EXPORTER_HOST", gpu)
+
     def test_worker_overlay_renders_standalone(self):
         cfg = _render([WORKER_OVERLAY], profile=None)
         self.assertEqual(
