@@ -257,8 +257,17 @@ def test_the_resolved_block_names_the_join_and_the_stored_spelling(monkeypatch):
     block = sqleng.who_these_people_are("interviews run by Khushi Ghorawath")
     assert "Recruiter__c" in block
     assert "Internal_Interview__c.Interviewer__c" in block
-    assert "Stored as: Khushi ghorawath" in block
-    assert "case-insensitively" in block
+    # The block used to say "Stored as: <name>". It now hands the model a
+    # ready-made predicate instead: told only the spelling, the model kept
+    # building its LIKE pattern from the QUESTION, which matched nothing and
+    # returned zero rows — indistinguishable from "this person has no
+    # records". Same fact, stronger contract.
+    assert "Khushi ghorawath" in block
+    assert "FILTER WITH:" in block
+    # Case-insensitive advice was replaced by something stricter: the exact
+    # stored value to filter on. _SQL_SYSTEM still carries the general ILIKE
+    # rule (asserted separately below) for names this lookup never resolved.
+    assert "VERBATIM" in block
 
 
 def test_the_sql_prompt_requires_loose_name_matching():

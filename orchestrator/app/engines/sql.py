@@ -56,6 +56,16 @@ _SQL_SYSTEM = (
     # Qwen tends to emit MySQL backticks; DuckDB only accepts double quotes.
     '- This is DuckDB. Quote reserved-word identifiers (e.g. the "Case" table) '
     'with DOUBLE QUOTES like "Case" — NEVER backticks.\n'
+    # A short alias picked from the object's initials lands on a keyword
+    # surprisingly often. "Assigned_Trainer__c at" produced
+    #   Parser Error: syntax error at or near "."
+    # on at.First_Name__c — DuckDB reserves AT for time-travel syntax — and
+    # the message never says which word is the problem, so the retry could
+    # not fix it either. Both attempts failed and the user got nothing.
+    "- Table aliases must not be SQL keywords. AT, TO, IN, IS, AS, ON, BY, OR, "
+    "AND, ALL, ANY, DO, END, FOR, FROM, LEFT, RIGHT, FULL, ORDER, GROUP, "
+    "WHEN, WITH and LIKE are all reserved. Use a distinctive alias instead "
+    "(trainer, cand, iv) — never a bare two-letter abbreviation.\n"
     # Salesforce checkbox fields land here as the TEXT 'true'/'false', not as
     # booleans. `WHERE IsWon = 'True'` therefore matches nothing and answers
     # "0" with total confidence — a wrong number is worse than an error.
@@ -269,6 +279,19 @@ _PERSON_SOURCES = (
         "a candidate (Account, record type 'Person Account') — interviews they "
         "SAT link through Internal_Interview__c.Candidate__c",
     ),
+    # Contact and Lead carry the SAME human under a different lifecycle stage.
+    # "Everything about X" spans them, and a question that resolves only to
+    # Account silently hides the rest of the record.
+    (
+        "Contact",
+        "SELECT Name FROM Contact WHERE lower(Name) LIKE ?",
+        "a person (Contact) — related records link through their ContactId",
+    ),
+    (
+        "Lead",
+        "SELECT Name FROM Lead WHERE lower(Name) LIKE ?",
+        "a person (Lead) — an unconverted enquiry, before Account/Contact exist",
+    ),
 )
 
 #: A question naming more people than this is a report, not a lookup; resolving
@@ -276,11 +299,48 @@ _PERSON_SOURCES = (
 _MAX_RESOLVED_PEOPLE = 8
 
 
+#: Ordinary words that pair up next to a name in a lowercase question and
+#: would otherwise be proposed as one ("entire information", "about samyukt").
+#: Only needed for the uncapitalised path — the capitalised path has the shape
+#: of the words doing that job. Kept next to org_brief._NOT_A_NAME rather than
+#: merged into it: that set is about ORG vocabulary, this is about English.
+_FILLER_WORDS = frozenset(
+    """about above after also always any are ask asked before below best both
+    but complete completed data date detail details different does done each
+    entire every everything find first from full get give given has have here
+    his her info information into its just know last like list look made make
+    many more most much need needs new now number only other our out over
+    person please pull rest same see share should show single some status
+    still such summary tell than that their them then there these they thing
+    things this those total under upto using very want was were what when
+    where which while will with within would year years your
+    """.split()
+) | frozenset(
+    # Analytics vocabulary. Without it "total revenue by quarter" proposed
+    # "revenue quarter" as a person — harmless to the ANSWER (the warehouse
+    # recognises nobody, so it is dropped) but it puts a name lookup, and
+    # possibly a full fuzzy scan, on the metric path where there is never a
+    # person to find.
+    """above below top bottom highest lowest internal external overall recent
+    latest current previous next past upcoming active inactive open closed
+    amount average budget category city complete completed cost count
+    country created department goal group invoice invoices kpi manager median
+    metric modified month open owner payment payments pending price quarter
+    rate region revenue role score stage state sum target team title type
+    updated value week""".split()
+)
+
+
 def people_in_question(question: str) -> List[str]:
     """Capitalised multi-word names the question appears to be about.
 
-    Deliberately conservative: two adjacent capitalised words. A single one is
-    far more often a product, an object or the first word of a sentence.
+    PRECISE by contract: two adjacent capitalised words. A single one is far
+    more often a product, an object or the first word of a sentence. Callers
+    treat what comes back as a name, so this must not guess.
+
+    `name_candidates` below is the generous counterpart — it exists because
+    users do not capitalise, and its guesses are checked against the warehouse
+    before anything believes them.
     """
     from ..core import org_brief
 
@@ -293,6 +353,59 @@ def people_in_question(question: str) -> List[str]:
         if name not in out:
             out.append(name)
     return out[:_MAX_RESOLVED_PEOPLE]
+
+
+def _is_vocabulary(word: str) -> bool:
+    """Org or English vocabulary, singular OR plural.
+
+    _NOT_A_NAME holds singulars ("account", "interview"), so a bare membership
+    test let "top accounts" and "internal interviews" through as people.
+    Stripping one trailing 's' covers every plural in both lists at once
+    rather than maintaining a parallel set. Safe for real surnames: "Jones"
+    singularises to "jone", which is in neither list.
+    """
+    from ..core import org_brief
+
+    low = word.lower()
+    singular = low[:-1] if len(low) > 3 and low.endswith("s") else low
+    return (
+        low in org_brief._NOT_A_NAME
+        or singular in org_brief._NOT_A_NAME
+        or low in _FILLER_WORDS
+        or singular in _FILLER_WORDS
+    )
+
+
+def name_candidates(question: str) -> List[str]:
+    """Names to LOOK UP — capitalised ones plus lowercase guesses.
+
+    Separate from `people_in_question` on purpose. That function's answer is
+    treated as fact by its callers, so it stays conservative; this one feeds
+    `resolve_people`, which checks every candidate against the warehouse and
+    keeps only what the data recognises. A wrong guess costs one indexed query
+    and disappears — so here it is worth guessing.
+
+    This is what fixes the reported bug: "give me entire information about
+    samyukt challa candidate" resolved nobody, because the capitalised pass
+    is blind to lowercase and it was the only pass there was. The SQL model
+    was left to invent an object and failed twice.
+    """
+    out = list(people_in_question(question))
+    if len(out) >= _MAX_RESOLVED_PEOPLE:
+        return out
+    seen = {n.lower() for n in out}
+    tokens = re.findall(r"\b[A-Za-z][A-Za-z'-]{2,}\b", question or "")
+    for first, last in zip(tokens, tokens[1:]):
+        if _is_vocabulary(first) or _is_vocabulary(last):
+            continue
+        pair = f"{first} {last}"
+        if pair.lower() in seen:
+            continue
+        seen.add(pair.lower())
+        out.append(pair)
+        if len(out) >= _MAX_RESOLVED_PEOPLE:
+            break
+    return out
 
 
 def resolve_people(question: str) -> List[dict]:
@@ -312,7 +425,7 @@ def resolve_people(question: str) -> List[dict]:
     noise, labelled them all "candidates", and interrupted the user to choose —
     for names the warehouse matches exactly.
     """
-    names = people_in_question(question)
+    names = name_candidates(question)
     if not names:
         return []
     import duckdb  # lazy, same as _execute
@@ -325,6 +438,7 @@ def resolve_people(question: str) -> List[dict]:
     try:
         for name in names:
             pattern = "%" + "%".join(p.lower() for p in name.split()) + "%"
+            hit = False
             for table, sql, meaning in _PERSON_SOURCES:
                 try:
                     rows = con.execute(sql, [pattern]).fetchall()
@@ -339,10 +453,65 @@ def resolve_people(question: str) -> List[dict]:
                             "matches": sorted({str(r[0]) for r in rows})[:4],
                         }
                     )
+                    hit = True
                     break
+            if not hit:
+                # SUBSTRING MATCHING IS EXACT ABOUT SPELLING, and people are
+                # not. "samyukth chala" (one l) finds nothing at all, while
+                # the org stores "Samyukth - challa"; so does any transposed
+                # or dropped letter. Fall back to edit distance, which costs a
+                # scan of the name columns (~25 ms over 63k rows here) and only
+                # runs when the cheap path already failed.
+                fuzzy = _fuzzy_person(con, name)
+                if fuzzy is not None:
+                    out.append(fuzzy)
     finally:
         con.close()
     return out
+
+
+#: Jaro-Winkler above this is the same human spelled differently; below it is
+#: a different person who happens to share a few letters. Measured on this org:
+#: "samyukt challa" scores 0.97 against "Samyukth challa" and 0.83 against the
+#: nearest unrelated name, so the gap is wide and the threshold is not delicate.
+_FUZZY_NAME_MIN = 0.90
+
+
+def _fuzzy_person(con, name: str) -> Optional[dict]:
+    """Closest stored name across the person objects, or None.
+
+    One UNION ALL so the whole thing is a single scan. Ordered by similarity,
+    and anything under the threshold is discarded rather than guessed at — a
+    confidently wrong name is worse than no grounding at all.
+    """
+    parts = []
+    for table, _sql, meaning in _PERSON_SOURCES:
+        parts.append(
+            f"SELECT '{table}' AS obj, CAST(Name AS VARCHAR) AS nm FROM \"{table}\" "
+            "WHERE Name IS NOT NULL"
+        )
+    union = " UNION ALL ".join(parts)
+    try:
+        rows = con.execute(
+            f"""SELECT obj, nm, jaro_winkler_similarity(lower(nm), ?) AS s
+                  FROM ({union})
+                 WHERE jaro_winkler_similarity(lower(nm), ?) >= ?
+                 ORDER BY s DESC LIMIT 4""",
+            [name.lower(), name.lower(), _FUZZY_NAME_MIN],
+        ).fetchall()
+    except Exception:  # noqa: BLE001 — older DuckDB without the function
+        return None
+    if not rows:
+        return None
+    table = rows[0][0]
+    meaning = next((m for t, _s, m in _PERSON_SOURCES if t == table), table)
+    return {
+        "asked": name,
+        "object": table,
+        "meaning": meaning,
+        "matches": sorted({str(r[1]) for r in rows})[:4],
+        "fuzzy": True,
+    }
 
 
 def who_these_people_are(question: str) -> str:
@@ -362,14 +531,42 @@ def who_these_people_are(question: str) -> str:
         return ""
     lines = []
     for person in found:
-        stored = ", ".join(person["matches"][:3])
-        lines.append(f"- {person['asked']} is {person['meaning']}. Stored as: {stored}")
+        stored = person["matches"][:3]
+        shown = ", ".join(repr(name) for name in stored)
+        lines.append(f"- {person['asked']} is {person['meaning']}.")
+        lines.append(f"    STORED NAME: {shown}")
+        # A ready-made predicate, because telling the model the spelling was
+        # not enough. Asked about "samyukt challa" — stored "Samyukth - challa"
+        # — it acknowledged the lookup and then filtered on the USER's wording:
+        #   WHERE a.Name ILIKE '%samyukt challa%'
+        # which matches nothing, since the stored form has "h - " in the middle.
+        # A query that runs and returns zero rows is worse than one that fails
+        # loudly: it reads as "this person has no records".
+        if len(stored) == 1:
+            lines.append(f"    FILTER WITH: Name = {stored[0]!r}")
+        else:
+            joined = ", ".join(repr(name) for name in stored)
+            lines.append(f"    FILTER WITH: Name IN ({joined})")
     return (
         "Who the people named in this question are, looked up in the warehouse "
         "just now — treat this as fact and join accordingly:\n"
         + "\n".join(lines)
-        + "\nMatch these names case-insensitively (ILIKE); the stored spelling "
-        "above is what the data actually contains."
+        + "\n\nUSE THE STORED NAME VERBATIM in every filter. The user's "
+        "spelling is NOT in the data — filtering on what they typed returns "
+        "zero rows and reads as 'this person has no records'. Copy the "
+        "FILTER WITH clause above exactly; do not rewrite it into a LIKE "
+        "pattern built from the question."
+        # "Give me everything about X" invites a UNION of a dozen unrelated
+        # objects flattened into Detail1..Detail5. Asked exactly that, the
+        # model produced 180 lines and a Binder Error on its own CTE alias —
+        # nothing ran. A person profile is a handful of joins from the record
+        # that identifies them; breadth is what makes it fail.
+        + "\n\nIf the question is open-ended (\"everything\", \"entire "
+        "information\", \"full details\"), answer with ONE focused SELECT "
+        "from the object above joined to its two or three most informative "
+        "related tables. Do NOT build a UNION across many dissimilar objects, "
+        "and do not invent generic Detail1/Detail2 columns to make them line "
+        "up — a wide, readable row from the main record is the answer."
     )
 
 
