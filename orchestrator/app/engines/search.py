@@ -876,3 +876,118 @@ async def run_search_engine(
         },
     )
     return "".join(parts)
+
+
+async def fetch_for_freshness(
+    question: str, *, max_queries: int = 1, max_sources: int = 2
+) -> int:
+    """A deliberately tiny search+read, for the Fast-mode freshness fallback.
+
+    Reuses THIS module's provider fan-out, SSRF-guarded fetch, extraction and
+    page store — nothing here opens a socket of its own, so every protection
+    that guards an ordinary search guards this too, and pages land in the same
+    global corpus. Writing through the same store is what lets the NEXT
+    conversation answer the question locally with no network at all.
+
+    Returns how many sources were actually read. Never raises: the caller
+    falls back to stale-but-labelled evidence when this returns 0.
+
+    NOT a small `run_search_engine`. There is no query rewrite (one provider
+    call on the user's own words), no rerank, and no answer generation — this
+    exists to put two fresh pages on disk, not to compose a response.
+    """
+    if not settings.search_enabled:
+        return 0
+    try:
+        results = await _collect_results([question], effort="fast")
+    except Exception:  # noqa: BLE001 — no provider, no freshness; not fatal
+        return 0
+    if not results:
+        return 0
+
+    # One page per registrable domain: two copies of the same syndicated story
+    # corroborate nothing, and the whole budget here is two reads.
+    seen_domains: set = set()
+    picked: List[SearchResult] = []
+    for r in results:
+        dom = _registrable_domain(r.url)
+        if dom in seen_domains:
+            continue
+        seen_domains.add(dom)
+        picked.append(r)
+        if len(picked) >= max(1, int(max_sources)):
+            break
+
+    try:
+        sources = await _fetch_sources(picked, question)
+    except Exception:  # noqa: BLE001 — a failed read is a miss, not an error
+        return 0
+
+    # Index synchronously HERE, unlike the streaming path: the caller is about
+    # to read the corpus back, so a write-behind index would mean answering
+    # from evidence that has not landed yet.
+    try:
+        await web_index.index_pending()
+    except Exception:  # noqa: BLE001 — evidence is stored; indexing retries
+        pass
+
+    _spawn(
+        db.run_in_thread(
+            _log_search_background, question, [question], picked, "fast", None, ""
+        )
+    )
+    return len(sources)
+
+
+async def refetch_page(url: str, *, previous_hash: str = "") -> Optional[dict]:
+    """Re-read one already-known page through the ordinary safe path.
+
+    The refresh worker's only way to fetch. Everything here is the SAME code an
+    ordinary search source goes through — net.safe_fetch (SSRF guards, redirect
+    re-validation, size cap, timeout) and extraction on `_EXTRACT_POOL`, the
+    single-worker executor that exists because trafilatura shares module-level
+    lxml XPath objects that are not thread-safe and will abort the interpreter
+    if two pages parse at once.
+
+    Returns {'changed', 'title', 'hash'} or None when the page could not be
+    read. Storing happens here so the caller cannot forget the content-hash
+    rule that resets the vector watermark.
+    """
+    try:
+        fetched = await net.safe_fetch(
+            url,
+            timeout_ms=settings.fetch_timeout_ms,
+            max_bytes=settings.fetch_max_bytes,
+            accept="text/html,application/pdf,text/plain",
+        )
+        loop = asyncio.get_running_loop()
+        ext, page_links = await loop.run_in_executor(
+            _EXTRACT_POOL,
+            extract.extract_readable_and_links,
+            fetched.content_type,
+            fetched.body,
+            fetched.url,
+        )
+    except Exception:  # noqa: BLE001 — an unreadable page is a miss
+        return None
+
+    text = (ext.text or "").strip()
+    if not text:
+        return None
+    digest = hashlib.sha256(text.encode("utf-8", "ignore")).hexdigest()
+    try:
+        await db.run_in_thread(
+            db.upsert_web_page,
+            _normalize_url(url),
+            url,
+            fetched.url,
+            ext.title or "",
+            text,
+            fetched.content_type,
+            200,
+            digest,
+            list(page_links or [])[:500],
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    return {"changed": digest != (previous_hash or ""), "title": ext.title or "", "hash": digest}

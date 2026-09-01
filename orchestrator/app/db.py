@@ -740,6 +740,86 @@ CREATE TABLE IF NOT EXISTS user_preferences (
 """
 
 
+_MIGRATION_V13 = """
+-- V13 (2026-09-01): the living knowledge layer.
+--
+-- web_pages was already the right SHAPE — global, public, content-hashed,
+-- deduped by url_key, with indexed_at as the vector watermark. What it could
+-- not express is TIME and TRUST: nothing recorded when a page's content last
+-- actually changed, when it should next be re-read, how authoritative its
+-- domain is, or whether anyone has ever used it. Without those, retrieval
+-- could only rank by embedding distance, which is how a 2025 page naming the
+-- previous Vice President stayed indistinguishable from the 2026 page naming
+-- the current one.
+
+-- WHEN the page said what it says. published_at comes from page metadata when
+-- the site supplies it (never invented); last_changed_at is stamped by the
+-- upsert only when content_hash actually moves, so a page re-fetched daily
+-- with identical bytes does not look freshly authored.
+ALTER TABLE web_pages ADD COLUMN IF NOT EXISTS published_at    timestamptz;
+ALTER TABLE web_pages ADD COLUMN IF NOT EXISTS last_changed_at timestamptz;
+
+-- Conditional re-fetch. A 304 costs one round trip and no bandwidth, which is
+-- what makes refreshing thousands of pages on a schedule affordable.
+ALTER TABLE web_pages ADD COLUMN IF NOT EXISTS etag          text NOT NULL DEFAULT '';
+ALTER TABLE web_pages ADD COLUMN IF NOT EXISTS last_modified text NOT NULL DEFAULT '';
+
+-- The refresh scheduler's queue, kept ON the page rather than in a side table:
+-- the work item IS the page, and a second table would need its own dedupe,
+-- its own cleanup, and a way to not drift out of sync with this one.
+-- NULL next_refresh_at = never scheduled; the backfill below seeds it.
+ALTER TABLE web_pages ADD COLUMN IF NOT EXISTS next_refresh_at  timestamptz;
+ALTER TABLE web_pages ADD COLUMN IF NOT EXISTS refresh_failures integer NOT NULL DEFAULT 0;
+
+-- Demand signal. Which pages users actually pull evidence from decides refresh
+-- priority — a page nobody has ever retrieved does not deserve bandwidth ahead
+-- of one behind ten answers a day. Counts only; no user or query is recorded
+-- here, because this table is the SHARED PUBLIC corpus.
+ALTER TABLE web_pages ADD COLUMN IF NOT EXISTS retrieval_count   bigint NOT NULL DEFAULT 0;
+ALTER TABLE web_pages ADD COLUMN IF NOT EXISTS last_retrieved_at timestamptz;
+
+-- Source quality. `domain` is denormalized from url for cheap grouping and
+-- per-domain caps; `authority` is a small cached rank (0 unknown .. 100
+-- official) so ranking never has to re-derive it per query.
+ALTER TABLE web_pages ADD COLUMN IF NOT EXISTS domain    text     NOT NULL DEFAULT '';
+ALTER TABLE web_pages ADD COLUMN IF NOT EXISTS authority smallint NOT NULL DEFAULT 0;
+
+-- LEXICAL RETRIEVAL. Dense vectors alone cannot separate "Vice President of
+-- India" from "Vice President of the United States" — both are the same shape
+-- in embedding space, and for entity facts the exact surface form is the
+-- signal. A generated tsvector keeps this in sync with the text automatically;
+-- weight A on the title makes a page ABOUT the entity outrank one that merely
+-- mentions it.
+ALTER TABLE web_pages ADD COLUMN IF NOT EXISTS search_tsv tsvector
+    GENERATED ALWAYS AS (
+        setweight(to_tsvector('english', coalesce(title, '')), 'A') ||
+        setweight(to_tsvector('english', left(coalesce(text, ''), 200000)), 'B')
+    ) STORED;
+CREATE INDEX IF NOT EXISTS idx_web_pages_tsv ON web_pages USING gin (search_tsv);
+
+-- The scheduler's hot query: "what is due, most-wanted first".
+CREATE INDEX IF NOT EXISTS idx_web_pages_refresh
+    ON web_pages (next_refresh_at, retrieval_count DESC)
+    WHERE next_refresh_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_web_pages_domain ON web_pages (domain);
+-- Partial index for the indexer's "what still needs embedding" scan.
+CREATE INDEX IF NOT EXISTS idx_web_pages_pending
+    ON web_pages (id) WHERE indexed_at IS NULL;
+
+-- Backfill, derived only from data already present — no invented timestamps.
+-- domain from the stored url; last_changed_at from fetched_at (the best known
+-- lower bound); next_refresh_at staggered across the next 24h so migrating a
+-- 600-page corpus does not queue 600 simultaneous fetches on first boot.
+UPDATE web_pages
+   SET domain = lower(split_part(split_part(regexp_replace(url, '^https?://', ''), '/', 1), ':', 1))
+ WHERE domain = '' AND url <> '';
+UPDATE web_pages SET last_changed_at = fetched_at WHERE last_changed_at IS NULL;
+UPDATE web_pages
+   SET next_refresh_at = now() + (random() * interval '24 hours')
+ WHERE next_refresh_at IS NULL;
+"""
+
+
 _MIGRATIONS: tuple = (
     (1, _MIGRATION_V1),
     (2, _MIGRATION_V2),
@@ -753,6 +833,7 @@ _MIGRATIONS: tuple = (
     (10, _MIGRATION_V10),
     (11, _MIGRATION_V11),
     (12, _MIGRATION_V12),
+    (13, _MIGRATION_V13),
 )
 
 #: The version `init_schema` brings a database up to. Exported so callers (and
@@ -2966,3 +3047,23 @@ def fetch_message_embeddings(
         }
         for r in rows
     ]
+
+
+def web_corpus_counts() -> dict:
+    """Size, embedding backlog and refresh backlog of the public web corpus.
+
+    One query rather than three: this runs on every Prometheus scrape.
+    """
+    with connection() as con:
+        row = con.execute(
+            """SELECT count(*) AS pages,
+                      count(*) FILTER (WHERE indexed_at IS NULL) AS pending,
+                      count(*) FILTER (WHERE next_refresh_at IS NOT NULL
+                                         AND next_refresh_at <= now()) AS due
+                 FROM web_pages"""
+        ).fetchone()
+    return {
+        "pages": int(row["pages"]) if row else 0,
+        "pending": int(row["pending"]) if row else 0,
+        "due": int(row["due"]) if row else 0,
+    }

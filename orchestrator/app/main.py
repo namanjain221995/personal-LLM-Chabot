@@ -70,9 +70,18 @@ async def lifespan(_app: FastAPI):
     from .authn.store import prune_expired_sessions
 
     await db.run_in_thread(prune_expired_sessions)
+    # The living knowledge layer's keeper: drains the embedding backlog and
+    # re-reads pages past their TTL. In-process on purpose (see web_worker) —
+    # the queue is a PostgreSQL column, so a restart resumes rather than
+    # forgets, and no second container is needed for a few fetches every
+    # five minutes.
+    from . import web_worker
+
+    web_worker.start()
     try:
         yield
     finally:
+        await web_worker.stop()
         await db.run_in_thread(db.close_pool)
 
 
@@ -428,6 +437,32 @@ async def health() -> dict:
     }
 
 
+@app.get("/metrics")
+async def prometheus_metrics():
+    """Prometheus exposition for the living knowledge layer.
+
+    PUBLIC, like /health: Prometheus scrapes it unauthenticated from inside the
+    Docker network, and adding a session to that path would mean storing
+    credentials in the monitoring stack. It exposes only counters and
+    histograms — no query text, no URLs, no user ids (see app/metrics.py, where
+    every label is drawn from a closed set).
+    """
+    from fastapi.responses import PlainTextResponse
+
+    from . import metrics as metrics_mod
+
+    try:
+        counts = await db.run_in_thread(db.web_corpus_counts)
+        metrics_mod.corpus_gauges(
+            counts.get("pages", 0), counts.get("pending", 0), counts.get("due", 0)
+        )
+    except Exception:  # noqa: BLE001 — serve what we have
+        pass
+    return PlainTextResponse(
+        metrics_mod.render(), media_type="text/plain; version=0.0.4; charset=utf-8"
+    )
+
+
 @app.get("/reports")
 async def reports_index(user: UserRow = Depends(require_user)) -> dict:
     """The CALLER's generated files. The reports directory is one flat disk
@@ -612,6 +647,9 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
     # Salesforce Intelligence Mode extras (assumptions, resolved scope, the
     # final phase) merged into whichever engine's meta ends up being emitted.
     salesforce_state: dict = {}
+    # Living-knowledge extras: the sources a locally-grounded answer used, so
+    # the Sources panel can show provenance for an answer that never searched.
+    knowledge_state: dict = {}
 
     async def emit(event: str, data: dict) -> None:
         if event == "meta":
@@ -651,6 +689,15 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             # ADDS provenance and assumptions on top of them.
             for key, value in salesforce_state.items():
                 data.setdefault(key, value)
+            # Locally-sourced evidence rides the SAME `sources` key the search
+            # engine uses — one contract for the UI, whether the pages were
+            # read a second ago or a week ago.
+            if knowledge_state.get("sources") and not data.get("sources"):
+                data["sources"] = knowledge_state["sources"]
+                data["knowledge"] = {
+                    "freshness": knowledge_state.get("freshness", ""),
+                    "from_local_memory": knowledge_state.get("from_local_memory", True),
+                }
             gen.final_meta = data
         await gen.publish(event, data)
 
@@ -1358,6 +1405,15 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 # V2 §3a: SKIP the router and data engines entirely.
                 from .engines.chat import run_chat_engine
 
+                # LIVING KNOWLEDGE (2026-09-01). Before answering from frozen
+                # weights, ask whether this question is time-sensitive and
+                # whether this machine already read the answer. Web memory
+                # used to be reachable ONLY from inside the search engine, so
+                # a Fast/search-off chat answered "who's vice president of
+                # india" from pretraining while 19 stored pages said
+                # otherwise. Costs nothing for a timeless question (one regex)
+                # and one local lookup for a live one.
+                prepared = await _prepare_knowledge(request, text, allow_network=not want_search)
                 answer = await run_chat_engine(
                     text,
                     history,
@@ -1365,7 +1421,17 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     mode="assistant",
                     model_choice=request.model,
                     effort=request.effort,
+                    grounding=prepared.grounding,
                 )
+                if prepared.sources:
+                    # Same shape the search engine emits, so the Sources panel
+                    # and citation chips render locally-sourced evidence with
+                    # no client change.
+                    knowledge_state["sources"] = prepared.sources
+                    knowledge_state["freshness"] = (
+                        prepared.verdict.requirement.value if prepared.verdict else ""
+                    )
+                    knowledge_state["from_local_memory"] = not prepared.searched
             elif request.sf_live:
                 # "Live Salesforce" toggle: skip the router — every text
                 # answer queries the org directly (schema questions included;
@@ -1498,6 +1564,30 @@ async def salesforce_cancel(
 class StopRequest(BaseModel):
     conversation_id: Optional[str] = None
     session_id: str = "default"
+
+
+async def _prepare_knowledge(request, text: str, *, allow_network: bool):
+    """Freshness-aware grounding for one assistant turn, or an empty result.
+
+    Wrapped so a failure in the knowledge layer can never cost the user an
+    answer: on any error the caller gets empty grounding and the model answers
+    exactly as it did before this existed.
+    """
+    from .living_knowledge import Prepared, prepare
+
+    if not settings.living_knowledge_enabled:
+        return Prepared()
+    try:
+        return await prepare(
+            text,
+            effort=llm.normalize_effort(request.effort),
+            mode=request.mode,
+            web_search_pref=request.web_search,
+            allow_network=allow_network and settings.search_enabled,
+        )
+    except Exception:  # noqa: BLE001 — grounding is an enhancement
+        logging.getLogger(__name__).debug("living knowledge unavailable", exc_info=True)
+        return Prepared()
 
 
 async def _viewer_id(http_request: Request) -> Optional[int]:

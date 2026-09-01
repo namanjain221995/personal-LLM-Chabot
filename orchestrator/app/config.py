@@ -419,6 +419,35 @@ class Settings:
         # index is DERIVED — deleting the directory is safe, PostgreSQL
         # rebuilds it.
         self.web_memory_enabled: bool = _bool("WEB_MEMORY_ENABLED", True)
+        # --- Living knowledge layer (2026-09-01) -------------------------
+        # Web memory used to be reachable only from inside the search engine,
+        # so a Fast/no-search chat answered from frozen weights while the
+        # corpus already held the current answer. These govern the pre-answer
+        # stage that closes that gap (app/living_knowledge.py).
+        self.living_knowledge_enabled: bool = _bool("LIVING_KNOWLEDGE_ENABLED", True)
+        # Ask the 8B router when the lexical freshness rules are ambiguous.
+        # Off => ambiguous questions default to RECENT, which costs a local
+        # lookup rather than a wrong answer.
+        self.freshness_router_enabled: bool = _bool("FRESHNESS_ROUTER_ENABLED", True)
+        # Fast mode may spend THIS much network, and only when the question is
+        # time-sensitive and the corpus cannot answer it. A full search reads
+        # 5-8 pages; this reads two.
+        self.freshness_fast_lookup: bool = _bool("FRESHNESS_FAST_LOOKUP", True)
+        self.freshness_fast_sources: int = _int("FRESHNESS_FAST_SOURCES", 2)
+        self.freshness_fast_deadline_s: float = _float("FRESHNESS_FAST_DEADLINE_S", 12.0)
+        # Background keeper: drains the embedding backlog and re-reads pages
+        # past their TTL, newest-demand first. Runs inside the orchestrator as
+        # an asyncio task — no extra container, and the queue is a PostgreSQL
+        # column so a restart resumes rather than forgets.
+        self.web_knowledge_worker_enabled: bool = _bool("WEB_KNOWLEDGE_WORKER_ENABLED", True)
+        self.web_worker_interval_s: int = _int("WEB_WORKER_INTERVAL_S", 300)
+        self.web_refresh_max_pages_per_cycle: int = _int("WEB_REFRESH_MAX_PAGES_PER_CYCLE", 8)
+        self.web_refresh_concurrency: int = _int("WEB_REFRESH_CONCURRENCY", 2)
+        # Per-level re-read deadlines. A page about an office holder is worth
+        # re-reading daily; documentation is not.
+        self.web_refresh_realtime_ttl_s: int = _int("WEB_REFRESH_REALTIME_TTL_S", 6 * 3600)
+        self.web_refresh_recent_ttl_s: int = _int("WEB_REFRESH_RECENT_TTL_S", 24 * 3600)
+        self.web_refresh_static_ttl_s: int = _int("WEB_REFRESH_STATIC_TTL_S", 21 * 24 * 3600)
         self.lancedb_web_dir: str = os.environ.get(
             "LANCEDB_WEB_DIR", "/data/lancedb-web"
         )

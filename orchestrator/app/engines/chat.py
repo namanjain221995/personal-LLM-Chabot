@@ -50,7 +50,9 @@ SALESFORCE_CHAT_SYSTEM = (
 )
 
 
-def _messages(message: str, history: Sequence[dict], mode: str) -> List[dict]:
+def _messages(
+    message: str, history: Sequence[dict], mode: str, grounding: str = ""
+) -> List[dict]:
     # Salesforce-mode "chat" is greetings/small talk — a diagram would never
     # belong there, so only assistant mode carries the diagram capability.
     from ..identity import identity_line
@@ -60,6 +62,12 @@ def _messages(message: str, history: Sequence[dict], mode: str) -> List[dict]:
         if mode == "assistant"
         else SALESFORCE_CHAT_SYSTEM
     ) + identity_line()
+    # Evidence goes AFTER the persona and the identity line, so the last thing
+    # the model reads before the conversation is what today's date is and what
+    # the sources actually say. Empty for a timeless question, which keeps an
+    # ordinary chat exactly as cheap as it was.
+    if grounding:
+        system = system + "\n\n" + grounding
     return (
         [{"role": "system", "content": system}]
         + recent_turns(history, 6)
@@ -75,8 +83,16 @@ async def run_chat_engine(
     mode: str = "salesforce",
     model_choice: str = "smart",
     effort: str = "medium",
+    grounding: str = "",
 ) -> str:
-    """Stream a plain completion from the selected model; meta route=chat."""
+    """Stream a plain completion from the selected model; meta route=chat.
+
+    `grounding` is the living-knowledge block (app/web_memory.py): source-backed
+    passages this platform already read from the public web, plus today's date.
+    It arrives ALREADY BUILT so this engine stays a plain completion — the
+    decision about whether evidence was needed, and the cost of finding it,
+    belong to the caller.
+    """
     effort = llm.normalize_effort(effort)
     # The thinking model spends a large, variable share of its budget on
     # reasoning before emitting a single answer token — a small ceiling makes
@@ -102,7 +118,7 @@ async def run_chat_engine(
         and model_choice == "smart"
         and settings.extra_high_samples > 1
     ):
-        prompt = _messages(message, history, mode)
+        prompt = _messages(message, history, mode, grounding)
         candidates = await best_of.generate_candidates(
             prompt,
             n=settings.extra_high_samples,
@@ -131,7 +147,7 @@ async def run_chat_engine(
 
     parts: List[str] = []
     async for kind, text in llm.stream_chat_events(
-        _messages(message, history, mode),
+        _messages(message, history, mode, grounding),
         model_choice=model_choice,
         effort=effort,
         temperature=temperature,

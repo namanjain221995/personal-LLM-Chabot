@@ -116,6 +116,17 @@ scrape_configs:
         regex: ".*_created$"
         action: drop
 
+  # --- The living knowledge layer ----------------------------------------
+  # The orchestrator's own /metrics (app/metrics.py, stdlib-only). Public like
+  # /health so the scrape needs no session; it exposes counters and histograms
+  # only — every label comes from a closed set, so no query text, URL or user
+  # id can reach Prometheus.
+  - job_name: orchestrator
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["host.docker.internal:8080"]
+        labels: { node: spark-1, role: head, service: orchestrator }
+
   # --- Databases and data stores -----------------------------------------
   - job_name: postgres
     scrape_interval: 15s

@@ -441,6 +441,74 @@ PostgreSQL rebuilds it from `indexed_at IS NULL`.
 
 ---
 
+## 9a. The living knowledge layer (freshness)
+
+**The problem it solves.** The model's weights are frozen at its training
+cut-off. On 2026-08-31 it answered *"who's vice president of india"* with the
+previous holder — confidently — while 19 pages already stored on this machine
+named the current one. The evidence was stored, indexed and retrievable; it was
+simply never consulted, because `web_index.retrieve` was only ever called from
+inside the search engine. With Web Search off, no code path reached it.
+
+Now every assistant turn runs a cheap pre-answer stage first.
+
+```mermaid
+flowchart TD
+    Q["User question"] --> C{"Freshness classifier<br/>regex, ~6 microseconds"}
+    C -->|STATIC<br/>'what is photosynthesis'| W["Answer from the model.<br/>No retrieval, no cost."]
+    C -->|RECENT / REALTIME| R["Hybrid retrieval over the local corpus"]
+
+    R --> R1["dense vectors (LanceDB)"]
+    R --> R2["lexical full-text (PostgreSQL)"]
+    R1 --> RANK["Rank: similarity + surface match<br/>+ source authority + age"]
+    R2 --> RANK
+    RANK --> SUP["Drop clearly superseded pages<br/>flag genuine conflicts"]
+    SUP --> ENOUGH{"Fresh enough<br/>to answer?"}
+
+    ENOUGH -->|yes| G["Ground the prompt with dated,<br/>cited passages -> answer"]
+    ENOUGH -->|"no, Fast mode"| S["ONE query, 2 sources,<br/>12s deadline"]
+    ENOUGH -->|"no, think/max"| F["Hand to the full search engine"]
+    ENOUGH -->|"no, offline"| STALE["Answer from cache AND say<br/>how old it is"]
+
+    S --> STORE["Store + index"]
+    STORE --> G
+```
+
+**Why the answer improves for everyone.** The page store is global and public,
+so one person's search warms the corpus for the next person's question — which
+is what turns a one-off lookup into durable local knowledge. Private material
+(who asked, from which conversation, uploads, private URLs) never enters it:
+`web_pages` has no `user_id` or `conversation_id` column to leak through.
+
+**Ranking, in plain terms.** Embedding distance alone cannot tell
+*"Vice President of India"* from *"Vice President of the United States"* — the
+two are nearly the same vector — and it has no opinion at all about whether a
+page is from 2025 or 2026. So four signals are combined, weighted by how
+volatile the question is:
+
+| Signal | What it catches |
+|---|---|
+| dense similarity | topical relevance |
+| lexical overlap | the exact entity (`india` vs `united states`) |
+| source authority | `.gov`/`.nic.in` over a content farm |
+| recency | a page read 2 days ago over one read 400 days ago |
+
+For a time-sensitive question, evidence far older than the best available is
+**dropped**, not merely ranked lower — handing the model both names and hoping
+it picks the newer one is how a confident wrong answer happens. When two
+comparably fresh, comparably authoritative sources genuinely disagree, the
+prompt says so and the model is told not to feign certainty.
+
+**Keeping it warm.** A background task inside the orchestrator drains the
+embedding backlog (which previously only advanced when someone happened to run
+a search) and re-reads pages past their TTL, most-retrieved first. Volatility
+is inferred from the page — an office-holder page is re-read daily,
+documentation every three weeks — and a changed content hash automatically
+re-queues the page for embedding. No extra container: the queue is a
+PostgreSQL column, so a restart resumes rather than forgets.
+
+---
+
 ## 10. Citations: how a `[n]` is kept honest
 
 ```mermaid

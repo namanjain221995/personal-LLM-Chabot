@@ -599,6 +599,39 @@ Valkey/Redis this stack does not run), SearXNG falls back to its packaged
 schema defaults, and `REMOTE_ADDR` already resolves to the orchestrator's
 container IP. Each appears exactly once per process start.
 
+## 10b. Freshness: the living knowledge layer
+
+The model's weights are frozen at its training cut-off, so it will answer a
+question about a current office holder, software version or price from
+whatever was true when it was trained — confidently. Since 2026-09-01 every
+assistant turn first asks a cheap question of its own: **does this answer need
+to be current, and do we already know it?**
+
+- A **freshness classifier** (regex first, the 8B router only when genuinely
+  ambiguous; ~6 µs, no main-model call) sorts questions into STATIC / RECENT /
+  REALTIME. Timeless questions cost nothing extra.
+- For the rest, **hybrid retrieval** over the pages this platform has already
+  read: dense vectors *and* PostgreSQL full-text, ranked by relevance, exact
+  entity match, **source authority** (official sites over content farms) and
+  **age**. Clearly superseded pages are dropped rather than shown alongside
+  current ones; genuine disagreement between fresh, authoritative sources is
+  flagged so the model hedges instead of guessing.
+- **Fast mode is now current by default.** If the corpus already holds a fresh
+  answer it is used with no network at all. Only when the question is
+  time-sensitive *and* nothing local is fresh enough does Fast spend one query
+  and two page reads (a full web search reads five to eight).
+- **Offline**, a stale page still answers — labelled with the date it was read
+  and an explicit warning that it may have changed, never presented as current.
+- A background keeper inside the orchestrator drains the embedding backlog and
+  re-reads pages past their TTL, most-used first.
+
+The page store is global and public, so one person's search makes the next
+person's answer current. Private material never enters it — `web_pages` has no
+user or conversation column. Details and the diagram:
+[`docs/FLOWS.md` §9a](docs/FLOWS.md).
+
+---
+
 ## 11. The engines
 
 [`orchestrator/app/engines/`](orchestrator/app/engines/):
