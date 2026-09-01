@@ -1253,13 +1253,351 @@
       }
     },
     {
+      "type": "stat",
+      "title": "CPU utilisation - per Spark",
+      "description": "Host CPU, not the GPU. High CPU with idle GPUs usually means tokenisation, retrieval or the sync worker - not inference.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 5,
+        "x": 0,
+        "y": 13
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "node:cpu_utilization_percent:avg",
+          "refId": "A",
+          "editorMode": "code",
+          "legendFormat": "{{node}}",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 0,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#38BDF8",
+                "value": null
+              },
+              {
+                "color": "#2DD4BF",
+                "value": 20
+              },
+              {
+                "color": "#FACC15",
+                "value": 85
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Avg CPU utilisation",
+      "description": "Averaged across both Sparks.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 5,
+        "y": 13
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "cluster:cpu_utilization_percent:avg",
+          "refId": "A",
+          "editorMode": "code",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 0,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#38BDF8",
+                "value": null
+              },
+              {
+                "color": "#2DD4BF",
+                "value": 20
+              },
+              {
+                "color": "#FACC15",
+                "value": 85
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Ethernet traffic - per Spark",
+      "description": "Real LAN / internet throughput on the physical NICs. Virtual interfaces are excluded: counting veth and bridge alongside the NIC overstated spark-1 by 3.5x. This is NOT the RoCE fabric - RDMA bypasses these counters entirely.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 7,
+        "x": 9,
+        "y": 13
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "node:ethernet_transmit_bytes_per_second:sum",
+          "refId": "A",
+          "editorMode": "code",
+          "legendFormat": "{{node}} TX",
+          "instant": true,
+          "range": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "node:ethernet_receive_bytes_per_second:sum",
+          "refId": "B",
+          "editorMode": "code",
+          "legendFormat": "{{node}} RX",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "none",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "decimals": 1,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Combined ethernet",
+      "description": "Both Sparks together - the cluster's total traffic to the outside world.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 16,
+        "y": 13
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "cluster:ethernet_transmit_bytes_per_second:sum",
+          "refId": "A",
+          "editorMode": "code",
+          "legendFormat": "TX",
+          "instant": true,
+          "range": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "cluster:ethernet_receive_bytes_per_second:sum",
+          "refId": "B",
+          "editorMode": "code",
+          "legendFormat": "RX",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "none",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "decimals": 1,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Data transferred",
+      "description": "Total bytes in + out over the dashboard's selected time range - change the range at the top right and this follows it.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 13
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum(increase(node_network_receive_bytes_total{device!~\"lo|veth.*|br-.*|docker.*|tailscale.*|.*np[0-9]\"}[$__range])) + sum(increase(node_network_transmit_bytes_total{device!~\"lo|veth.*|br-.*|docker.*|tailscale.*|.*np[0-9]\"}[$__range]))",
+          "refId": "A",
+          "editorMode": "code",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "none",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "decimals": 2,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
       "type": "row",
       "title": "Databases and data stores",
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 13
+        "y": 17
       },
       "collapsed": false,
       "panels": []
@@ -1276,7 +1614,7 @@
         "h": 4,
         "w": 3,
         "x": 0,
-        "y": 14
+        "y": 18
       },
       "targets": [
         {
@@ -1351,7 +1689,7 @@
         "h": 4,
         "w": 4,
         "x": 3,
-        "y": 14
+        "y": 18
       },
       "targets": [
         {
@@ -1410,7 +1748,7 @@
         "h": 4,
         "w": 3,
         "x": 7,
-        "y": 14
+        "y": 18
       },
       "targets": [
         {
@@ -1477,7 +1815,7 @@
         "h": 4,
         "w": 6,
         "x": 10,
-        "y": 14
+        "y": 18
       },
       "targets": [
         {
@@ -1537,7 +1875,7 @@
         "h": 4,
         "w": 4,
         "x": 16,
-        "y": 14
+        "y": 18
       },
       "targets": [
         {
@@ -1604,7 +1942,7 @@
         "h": 4,
         "w": 4,
         "x": 20,
-        "y": 14
+        "y": 18
       },
       "targets": [
         {
@@ -1658,7 +1996,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 18
+        "y": 22
       },
       "collapsed": false,
       "panels": []
@@ -1675,7 +2013,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 19
+        "y": 23
       },
       "targets": [
         {
@@ -1758,7 +2096,7 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 19
+        "y": 23
       },
       "targets": [
         {
@@ -1951,7 +2289,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 19
+        "y": 23
       },
       "targets": [
         {
@@ -2065,7 +2403,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 26
+        "y": 30
       },
       "targets": [
         {
@@ -2273,7 +2611,7 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 26
+        "y": 30
       },
       "targets": [
         {
@@ -2469,7 +2807,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 26
+        "y": 30
       },
       "targets": [
         {
@@ -2662,7 +3000,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 33
+        "y": 37
       },
       "targets": [
         {
@@ -2869,7 +3207,7 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 33
+        "y": 37
       },
       "targets": [
         {
@@ -2986,7 +3324,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 33
+        "y": 37
       },
       "targets": [
         {
@@ -3063,13 +3401,353 @@
       }
     },
     {
+      "type": "timeseries",
+      "title": "CPU utilisation - per Spark",
+      "description": "On the same time axis as tokens/sec above, so a throughput dip that is CPU-bound rather than GPU-bound is visible.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 44
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "node:cpu_utilization_percent:avg",
+          "refId": "A",
+          "editorMode": "code",
+          "legendFormat": "{{node}}",
+          "range": true
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": null,
+          "max": null,
+          "decimals": null,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "spark-1.*"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#22D3EE"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "spark-2.*"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#A78BFA"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Ethernet throughput - per Spark",
+      "description": "TX and RX on the physical NICs of each Spark.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 44
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "node:ethernet_transmit_bytes_per_second:sum",
+          "refId": "A",
+          "editorMode": "code",
+          "legendFormat": "{{node}} TX",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "node:ethernet_receive_bytes_per_second:sum",
+          "refId": "B",
+          "editorMode": "code",
+          "legendFormat": "{{node}} RX",
+          "range": true
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "min": null,
+          "max": null,
+          "decimals": null,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "spark-1.*"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#22D3EE"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "spark-2.*"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#A78BFA"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Ethernet throughput - cluster total",
+      "description": "Both Sparks summed. Compare with RoCE throughput to the left: this is traffic leaving the cluster, that is traffic between the two nodes.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 44
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "cluster:ethernet_transmit_bytes_per_second:sum",
+          "refId": "A",
+          "editorMode": "code",
+          "legendFormat": "TX",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "cluster:ethernet_receive_bytes_per_second:sum",
+          "refId": "B",
+          "editorMode": "code",
+          "legendFormat": "RX",
+          "range": true
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "min": null,
+          "max": null,
+          "decimals": null,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "TX"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#F472B6"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "RX"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#34D399"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
       "type": "row",
       "title": "Service health",
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 40
+        "y": 51
       },
       "collapsed": false,
       "panels": []
@@ -3086,7 +3764,7 @@
         "h": 4,
         "w": 12,
         "x": 0,
-        "y": 41
+        "y": 52
       },
       "targets": [
         {
@@ -3162,7 +3840,7 @@
         "h": 4,
         "w": 8,
         "x": 12,
-        "y": 41
+        "y": 52
       },
       "targets": [
         {
@@ -3238,7 +3916,7 @@
         "h": 4,
         "w": 4,
         "x": 20,
-        "y": 41
+        "y": 52
       },
       "targets": [
         {

@@ -56,6 +56,37 @@ groups:
         expr: >-
           100 * (1 - avg by (node) (rate(node_cpu_seconds_total{mode="idle"}[1m])))
 
+      - record: cluster:cpu_utilization_percent:avg
+        expr: avg(node:cpu_utilization_percent:avg)
+
+      # ETHERNET. The LAN / internet path, and deliberately NOT the same thing
+      # as the RoCE rules below: RDMA bypasses the network stack, so the
+      # InfiniBand counters and these netdev counters measure disjoint traffic.
+      # Adding them together would be meaningless.
+      #
+      # The device filter is the whole correctness story. Summing every device
+      # counts container traffic THREE times -- once on the veth, once on the
+      # bridge, once on the physical NIC -- and measured here that inflated
+      # spark-1 from 19.4 to 67.4 KiB/s, a 3.5x overstatement. Excluded:
+      #   lo                  the orchestrator talking to itself
+      #   veth* br-* docker*  the container side of traffic already counted
+      #   tailscale*          an overlay; its bytes ride out over enP7s7 too
+      #   *np[0-9]            the four RoCE fabric NICs, counted by RoCE rules
+      # What survives is the real physical egress: enP7s7 and the wifi.
+      - record: node:ethernet_receive_bytes_per_second:sum
+        expr: >-
+          sum by (node) (rate(node_network_receive_bytes_total{device!~"lo|veth.*|br-.*|docker.*|tailscale.*|.*np[0-9]"}[1m]))
+
+      - record: node:ethernet_transmit_bytes_per_second:sum
+        expr: >-
+          sum by (node) (rate(node_network_transmit_bytes_total{device!~"lo|veth.*|br-.*|docker.*|tailscale.*|.*np[0-9]"}[1m]))
+
+      - record: cluster:ethernet_receive_bytes_per_second:sum
+        expr: sum(node:ethernet_receive_bytes_per_second:sum)
+
+      - record: cluster:ethernet_transmit_bytes_per_second:sum
+        expr: sum(node:ethernet_transmit_bytes_per_second:sum)
+
       # ROCE FABRIC. These read the INFINIBAND counters, not netdev, and that
       # distinction is the whole game: RoCE/RDMA traffic bypasses the network
       # stack entirely. Measured during one 300-token generation, the IB
