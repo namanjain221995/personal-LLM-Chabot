@@ -775,8 +775,9 @@ strict, Tailwind with semantic tokens (dark is primary, `html.light` overrides,
 no hard-coded hex), self-hosted fonts, `output: 'standalone'` in a 3-stage
 digest-pinned `node:20-alpine` image, non-root runtime.
 
-- **One page** (`app/page.tsx` → `components/ChatApp.tsx`); deep links use `?c=<conversationId>`. There is no login page and no reports page any more (older screenshots show them).
-- **API routes** (`app/api/*`) are server-side proxies to `ORCHESTRATOR_URL` (never exposed to the browser): `/api/chat` (SSE passthrough, undici timeout → 504, refused → 502, upstream 503 → 503, abort → 499), `/api/chat/{active,stop,compact,attach/[id],salesforce/[id],salesforce/cancel}`, `/api/history/[...path]` (an **allowlist**, forwarding cookies both ways), `/api/reports/[filename]` (safe-name checked), `/api/upload` (streamed multipart), `/api/auth/me`.
+- **Pages**: the chat (`app/page.tsx` → `components/ChatApp.tsx`; deep links use `?c=<conversationId>`), **`/login`** (split-screen with an animated constellation brand panel; static under `prefers-reduced-motion`), **`/accept-invite`** (invitation acceptance), and the **`/admin` area** (Overview, Members, Invitations, member detail with audited conversation/upload/report viewers, Audit Log — rendered per the signed-in user's capabilities). `middleware.ts` redirects cookie-less page loads to `/login`; the account menu lives in the sidebar footer (profile, workspace settings for admins, Settings with password change + session management, Log out).
+- **API routes** (`app/api/*`) are server-side proxies to `ORCHESTRATOR_URL` (never exposed to the browser): `/api/chat` (SSE passthrough, undici timeout → 504, refused → 502, upstream 503 → 503, abort → 499, 401 passed through), `/api/chat/{active,stop,compact,attach/[id],salesforce/[id],salesforce/cancel}`, `/api/history/[...path]` (an **allowlist**, forwarding cookies both ways), `/api/reports/[filename]` (safe-name checked), `/api/upload` (streamed multipart), `/api/auth/*` (login, logout, me, password, sessions, preferences, invitations), `/api/admin/[...path]` (capability-gated upstream).
+- **Per-user client caches**: IndexedDB and localStorage are keyed by user id; logout and account switches await a full wipe, so a shared computer never shows the previous person's cached conversations.
 - **Streaming**: a spec-compliant incremental SSE parser (`lib/sse.ts`) typed into `token | reasoning | status | step | research | meta | done | error`; unknown events are ignored, never fatal. Streams are keyed per conversation in a module-level map (`lib/streams.ts`), so switching chats never aborts a generation; failures are recorded on the message (`unreachable` / `interrupted` / `error` / `stopped`).
 - **History**: server-backed with a synchronous in-memory mirror persisted write-behind to IndexedDB (`lib/history.ts`, `lib/idbCache.ts`); the cache can never shrink a server thread (409); the only sanctioned shrink is a confirmed regenerate.
 - **Headless logic in `lib/`, pixels in `components/`** — menus, palette, composer menu, clarification, context meter and phases are pure modules, which is why 28 of 32 test files run in plain Node.
@@ -787,7 +788,10 @@ digest-pinned `node:20-alpine` image, non-root runtime.
 
 ## 19. Orchestrator API reference
 
-All under `http://<orchestrator>:8080`. There is no authentication (see §20).
+All under `http://<orchestrator>:8080`. **Every route except `/health`,
+`/auth/login|logout` and the token-gated invitation routes requires the
+`ts_session` cookie** (see §20 and [`docs/AUTH.md`](docs/AUTH.md)); the admin
+routes additionally require the matching workspace capability.
 
 | Method | Path | Purpose |
 |---|---|---|
@@ -799,8 +803,13 @@ All under `http://<orchestrator>:8080`. There is no authentication (see §20).
 | `GET/POST/PUT/DELETE` | `/history/conversations[/{id}[/messages[/{message_id}/feedback]|/truncate|/title|/summary]]`, `GET /history/search?q=` | conversations, messages, thumbs, titles, summaries, search |
 | `POST` | `/uploads` · `GET /uploads/{conversation_id}` | dataset uploads |
 | `GET/POST/DELETE` | `/memory/facts[/{id}]` | cross-chat facts |
-| `GET` | `/reports` · `/reports/{filename}` | generated files |
-| `GET` | `/auth/me` | the single local identity |
+| `GET` | `/reports` · `/reports/{filename}` | the caller's generated files (owner-scoped) |
+| `POST` | `/auth/login` · `/auth/logout` | opaque-session sign-in/out (cookie set/revoked server-side) |
+| `GET` | `/auth/me` | the signed-in principal: user, workspace, role, capabilities (401 when signed out) |
+| `POST` | `/auth/password` · `GET /auth/sessions` · `POST /auth/sessions/revoke` | change password (revokes other sessions), list/revoke own sessions |
+| `GET/PUT` | `/auth/preferences` | per-user personalization blob |
+| `GET/POST` | `/auth/invitations/{token}` · `/auth/invitations/accept` | invitation info + one-use accept (creates the account, signs in) |
+| — | `/admin/api/*` | capability-gated workspace administration: overview, members (list/detail/role/status/remove/sessions/reset-password), audited content viewers (conversations, uploads, reports, downloads), invitations, audit log |
 
 `meta.route` values: `sql | rag | vision | report | chat | agent | search | deep_research | crawl | url | repo | dataset | clarify`.
 
@@ -813,7 +822,8 @@ Contracts in detail: [`docs/01-codebase/frontend-api-contracts.md`](docs/01-code
 
 ## 20. Security model
 
-- **No application login.** Every request resolves to one local account; conversations are still owner-scoped (foreign ids → 404). *Anyone who can reach the port can read every conversation and query the Salesforce data* — the boundary is network exposure: frontend, orchestrator, PostgreSQL and pgAdmin bind to `127.0.0.1` by default; model APIs are `expose`-only on an internal network unless `PUBLISH_MODEL_PORTS=true` (they are unauthenticated). `TECHSARA_BIND_ADDRESS` widens exposure deliberately; PostgreSQL and pgAdmin never leave loopback. In dual cluster mode the main model's head listens on the host (`0.0.0.0:8000` when published, otherwise the Docker bridge gateway only) because NCCL/RoCE needs host networking.
+- **Enterprise login (2026-09-01).** Every request authenticates: opaque server-side sessions in an HttpOnly `ts_session` cookie (SameSite=Lax; Secure over HTTPS), Argon2id passwords, login throttling, invite-only account creation, workspace roles (`super_admin`/`admin`/`member`) enforced by capability checks on the backend, and an audited admin surface. Ownership is enforced in SQL — a member editing IDs/URLs/cookies gets 404 for anyone else's conversations, uploads, memory, reports and running generations. Full reference: [`docs/AUTH.md`](docs/AUTH.md). First-time setup: `./techsara auth bootstrap --email you@company.com`.
+- **Network exposure still matters.** Model APIs are `expose`-only on an internal network unless `PUBLISH_MODEL_PORTS=true` (they remain unauthenticated); PostgreSQL and pgAdmin never leave loopback; `TECHSARA_BIND_ADDRESS` widens exposure deliberately. In dual cluster mode the main model's head listens on the host (`0.0.0.0:8000` when published, otherwise the Docker bridge gateway only) because NCCL/RoCE needs host networking.
 - **Salesforce**: read-only integration user; SQL through `core/sql_guard.py` (one `SELECT`, no writes/DDL/extensions/file or network table functions, comment-smuggling rejected) on a **read-only DuckDB with external access disabled**; SOQL through a guard with forced `LIMIT`; Intelligence Mode compiles validated plans, the model never writes query text; no write path exists.
 - **SSRF**: every outbound fetch goes through `core/net.py` (private/loopback/link-local/metadata ranges refused after DNS, re-checked per redirect, bounded).
 - **Archives / uploads / reports**: zip-slip, symlink, device and bomb protections; report names path-safe; repo clones are data, never executed.
@@ -986,6 +996,8 @@ and whether every container was recreated or only the changed ones.
 
 Current (2026-08):
 
+- [`docs/AUTH.md`](docs/AUTH.md) — **authentication, workspaces, RBAC, audit**: sessions, persistent login, invitations, bootstrap, member privacy, admin surface
+- [`docs/MONITORING.md`](docs/MONITORING.md) — the Grafana/Prometheus observability platform for the two DGX Sparks
 - [`docs/FLOWS.md`](docs/FLOWS.md) — **every flow as a diagram**: the three answering modes, all five models, engine dispatch, crawler, web memory, citations, Salesforce, streaming
 - [`docs/01-codebase/deep-research.md`](docs/01-codebase/deep-research.md) — the iterative research engine: loop, budgets, citation validation, category routing, `research_runs`
 - [`docs/README.md`](docs/README.md) — index and reading order

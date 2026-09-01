@@ -1,5 +1,72 @@
 # Changelog
 
+## Enterprise login, workspaces and an audited admin surface (2026-09-01)
+
+TechSara became a real multi-user workspace. A login system existed once, was
+deliberately removed in the single-user era, and is now rebuilt properly — on
+the ownership scoping that never left the data model.
+
+**Identity.** Migration V12 (additive, transactional): `users` gains
+email/display-name/status, plus `workspaces`, `workspace_memberships`
+(super_admin / admin / member), `auth_sessions`, `workspace_invitations`,
+`audit_events`, `login_throttle`, `report_files`, `user_preferences`. The
+orchestrator's startup baseline gives every pre-existing user a membership;
+`./techsara auth bootstrap` establishes the first SUPER_ADMIN and **adopts the
+legacy local account**, so every conversation, upload and memory row keeps its
+owner. Nothing was wiped; nothing re-keyed.
+
+**Sessions, not JWTs.** The browser holds an HttpOnly SameSite=Lax `ts_session`
+cookie `"<id>.<secret>"`; PostgreSQL stores sha256(secret). Logout, password
+change, deactivation and admin revocation all kill rows server-side — access
+actually ends. Persistent login: expiry rolls forward with activity
+(AUTH_SESSION_DAYS=30) under a hard ceiling (AUTH_SESSION_ABSOLUTE_DAYS=90);
+"Stay signed in" unticked gives a browser-session cookie and 24 h. Argon2id
+(OWASP parameters, transparent re-hash), generic login failures with equalized
+timing, and short per-email + per-IP lockouts (8 fails / 15 min → 5 min) that
+throttle brute force without handing attackers a permanent DoS button.
+
+**Enforcement is in the backend, in SQL.** `require_user` 401s again, so all
+17 dependent history/uploads/memory routes became enforced without an edit.
+/chat, /reports and the Salesforce state routes — previously auth-free — are
+gated; the fail-open conversation-ownership check is fail-closed; an unowned
+conversation id is claimed for its first user (closing the pre-seeding hole);
+bare-API session keys are namespaced per user; report files are authorised by
+an ownership table, not by knowing a filename (bound automatically at the one
+emit choke point every engine's meta passes through); generations can only be
+stopped/attached by their owner. RBAC is one capability table
+(`authn/rbac.py`) — no role strings sprinkled through routes; admins cannot
+touch equal-or-higher roles; the last active super admin is undemotable,
+undisablable, unremovable. Every admin content access (conversation viewed,
+file downloaded) writes an audit event; there is no impersonation.
+
+**The UI.** A split-screen /login — white in both themes, because the sign-in
+artwork is drawn on white — whose brand column carries one of the workspace
+illustrations, chosen at random per page load (so two people see different art,
+and so does the same person after signing out) and cross-faded on a slow timer
+that reduced-motion turns off. /accept-invite
+for the invite-only account flow (tokens hashed, single-use, expiring,
+revocable; the accept link is shown exactly once), a sidebar account menu
+(workspace header, profile, Settings with password change + session
+management), and an /admin area — Overview, Members (search/filter/paginate,
+role and status chips, invite dialog, guarded destructive actions), member
+detail with read-only audited viewers for conversations/uploads/reports/
+sessions, and a keyset-paginated Audit Log for super admins. Client caches
+are keyed per user id and wiped on logout/account switch, so a shared
+computer never shows the previous person's chats. Model prompts carry a safe
+server-derived identity line ("You are assisting …"), so the assistant knows
+who it is talking to without the client being able to spoof anyone.
+
+**Verified.** Backend: the pre-auth corpus runs under an ambient test
+identity while the new suites (auth flows, RBAC, IDOR with two real logged-in
+clients, invitations, admin auditing) drive genuine HTTP sessions — the IDOR
+suite covers conversations, messages, uploads, reports, memory, generation
+stop/attach and Salesforce clarification state across accounts. Frontend: 68
+files / 917 tests, tsc clean, production build clean. Launcher: 428 tests.
+One real bug was caught by the new tests before it ever shipped: the admin
+conversation viewer 500ed on any conversation with messages (list_messages
+rows carry no created_at); fixed with a dedicated store query.
+
+
 ## Deep Research, and the reranker that was never reranking (2026-08-30)
 
 A third answering mode, and two production defects found while measuring it.
