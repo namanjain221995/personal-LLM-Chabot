@@ -65,3 +65,52 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+  # --- Second tunnel: Grafana on its own hostname ------------------------
+  # A SEPARATE tunnel, not a second ingress rule on the one above, because the
+  # hostname was registered against tunnel e57de1b0 in the Cloudflare
+  # dashboard and a tunnel's routing can only be changed where it was defined.
+  # Cloudflare answered 530 / error 1033 ("tunnel not available") for the
+  # hostname until something actually ran that tunnel -- this service is that
+  # something.
+  #
+  # It is deliberately isolated from the service above: its own profile, its
+  # own token, its own container. Stopping either leaves the other serving,
+  # and a Grafana outage cannot take ai.techsarasolutions.com down with it.
+  #
+  # Consolidating onto one tunnel later is a dashboard change (move the
+  # hostname onto tunnel 1ab174c1), after which this service and
+  # CLOUDFLARE_TUNNEL_TOKEN_GRAFANA can both be deleted.
+  cloudflared-grafana:
+    image: cloudflare/cloudflared@sha256:51c9cefcb4569df44e1ad403ab1d3d8065aa8e84339bcfc6aee75502e1140339
+    # Its OWN profile. Compose interpolates the whole file whatever the
+    # profile, so the token uses `:-` rather than `:?`: an install without a
+    # second tunnel must still be able to render this file.
+    profiles: [tunnel-grafana]
+    command: tunnel --no-autoupdate --metrics 0.0.0.0:20241 run
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN_GRAFANA:-}
+    # Same network as grafana, which is how it reaches http://grafana:3000.
+    # NOT on `inference`, for the same reason as the tunnel above.
+    networks:
+      - application
+    restart: unless-stopped
+    healthcheck:
+      # Exec form: this image ships no shell, so CMD-SHELL cannot start and
+      # the container would report unhealthy forever while serving fine.
+      test:
+        - CMD
+        - cloudflared
+        - tunnel
+        - --metrics
+        - 127.0.0.1:20241
+        - ready
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

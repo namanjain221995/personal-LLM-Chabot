@@ -402,20 +402,34 @@ Two settings make Grafana behave correctly behind the hostname, both in `.env`:
 | `GRAFANA_ROOT_URL` | `https://grafana.techsarasolutions.com` | Grafana only knows it listens on `:3000`. Without its external address every absolute URL it builds — share links, alert links, the post-login redirect — points at the container. Blank it for a LAN-only install. |
 | `GRAFANA_COOKIE_SECURE` | `false` | Cloudflare terminates TLS, so the browser connection is already HTTPS. Set this `true` **only** once `http://localhost:3300` is no longer used: a secure-only cookie is silently dropped over plain HTTP, and the login then appears to succeed and bounces straight back to the login page.
 
-### The one step that cannot be done from this repo
+### It runs on a SECOND tunnel
 
-The tunnel is **remotely managed** — it authenticates with
-`CLOUDFLARE_TUNNEL_TOKEN` and takes its ingress from Cloudflare, not from a
-local `config.yml`. Adding a hostname therefore happens in the dashboard (or
-via the Cloudflare API with a Zero Trust token, which this deployment does not
-hold):
+`grafana.techsarasolutions.com` is served by its own `cloudflared` container
+(`cloudflared-grafana`, profile `tunnel-grafana`, token
+`CLOUDFLARE_TUNNEL_TOKEN_GRAFANA`) rather than as a second ingress rule on the
+tunnel that serves `ai.`.
 
-> Zero Trust → Networks → Tunnels → *your tunnel* → **Public Hostname** → Add
-> * Subdomain `grafana`, Domain `techsarasolutions.com`
-> * Service **HTTP** → `grafana:3000`
+That is a consequence of where the hostname was registered, not a design
+preference: a tunnel is **remotely managed** — it authenticates with its token
+and pulls ingress from Cloudflare — so routing can only be changed on the
+tunnel it was defined against. Until something ran that tunnel, Cloudflare
+answered `530 / error 1033` ("tunnel not available") for the hostname, even
+though DNS resolved and Grafana was healthy.
 
-Saving it also creates the DNS record. Nothing needs restarting on this side:
-`cloudflared` picks the new ingress up from the edge within seconds.
+The two are deliberately independent: separate profiles, separate tokens,
+separate containers. Stopping either leaves the other serving, and a Grafana
+problem cannot take `ai.techsarasolutions.com` down with it.
+
+`scripts/tunnel.sh up|down|status` drives both, and silently ignores the second
+whenever `CLOUDFLARE_TUNNEL_TOKEN_GRAFANA` is absent — a single-tunnel install
+behaves exactly as before.
+
+To consolidate onto one tunnel later: move the hostname onto the `ai.` tunnel
+in the dashboard (Public Hostname → `grafana` / `techsarasolutions.com` →
+`HTTP` → `grafana:3000`), then delete the `cloudflared-grafana` service and its
+token. Note the service is `grafana:3000` — a Docker network name. `localhost`
+inside `cloudflared` means the tunnel container itself and cannot reach
+Grafana.
 
 ### Protect it with Cloudflare Access
 

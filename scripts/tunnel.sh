@@ -19,6 +19,15 @@ cluster_load_settings
 
 PROJECT="${TECHSARA_PROJECT:-sf-local-ai}"
 PUBLIC_HOSTNAME="${PUBLIC_HOSTNAME:-ai.techsarasolutions.com}"
+GRAFANA_HOSTNAME="${GRAFANA_HOSTNAME:-grafana.techsarasolutions.com}"
+
+# Grafana rides a SECOND tunnel, because its hostname was registered against a
+# different tunnel in the dashboard and routing can only be changed where it
+# was defined. Entirely optional: with no token this stays invisible and every
+# command below behaves exactly as it did before.
+has_grafana_tunnel() {
+  grep -qs '^CLOUDFLARE_TUNNEL_TOKEN_GRAFANA=.' "$ROOT/.env" "$SECRETS_ENV"
+}
 
 is_dual_mode() { [ "${CLUSTER_MODE:-single}" = "dual" ]; }
 
@@ -32,13 +41,15 @@ tunnel_compose() {
   esac
   is_dual_mode && files+=(-f compose/compose.cluster-dgx-spark.yaml)
   files+=(-f compose/compose.cloudflare.yaml)
+  local profiles=(--profile tunnel)
+  has_grafana_tunnel && profiles+=(--profile tunnel-grafana)
   ( cd "$ROOT" && docker compose \
       --project-name "$PROJECT" \
       --env-file .env \
       --env-file .runtime/secrets.env \
       --env-file .runtime/generated.env \
       "${files[@]}" \
-      --profile tunnel "$@" )
+      "${profiles[@]}" "$@" )
 }
 
 require_token() {
@@ -69,6 +80,10 @@ case "$cmd" in
   up)
     log_info "starting the Cloudflare tunnel"
     tunnel_compose up -d --no-deps cloudflared "$@"
+    if has_grafana_tunnel; then
+      log_info "starting the Grafana tunnel"
+      tunnel_compose up -d --no-deps cloudflared-grafana
+    fi
     log_info "waiting for the tunnel to register with Cloudflare"
     for _ in $(seq 1 30); do
       if docker exec "${PROJECT}-cloudflared-1" \
@@ -83,10 +98,14 @@ case "$cmd" in
   down)
     tunnel_compose stop cloudflared
     tunnel_compose rm -f cloudflared "$@"
+    if has_grafana_tunnel; then
+      tunnel_compose stop cloudflared-grafana
+      tunnel_compose rm -f cloudflared-grafana
+    fi
     log_info "the public hostname is offline; the app is still running locally"
     ;;
   status)
-    tunnel_compose ps cloudflared
+    tunnel_compose ps
     echo
     docker exec "${PROJECT}-cloudflared-1" \
       cloudflared tunnel --metrics 127.0.0.1:20241 ready 2>&1 | head -3 \
