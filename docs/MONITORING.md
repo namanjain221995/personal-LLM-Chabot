@@ -383,6 +383,55 @@ free at the time of writing). To change either, set the variable in `.env` and
 
 ---
 
+## Public access via the Cloudflare Tunnel
+
+Grafana can be served on `grafana.techsarasolutions.com` through the **same**
+tunnel that already serves `ai.techsarasolutions.com` — no second tunnel, no
+port forward, no new firewall rule. `cloudflared` and `grafana` are both on the
+`application` Docker network, so the tunnel reaches `http://grafana:3000`
+directly and the loopback binding on 3300 never has to be widened.
+
+**Prometheus is deliberately not routed.** It has no authentication of any
+kind; anything that reaches it can read every metric in the cluster. Grafana is
+the only thing with a login, so Grafana is the only thing exposed.
+
+Two settings make Grafana behave correctly behind the hostname, both in `.env`:
+
+| Variable | Value | Why |
+| --- | --- | --- |
+| `GRAFANA_ROOT_URL` | `https://grafana.techsarasolutions.com` | Grafana only knows it listens on `:3000`. Without its external address every absolute URL it builds — share links, alert links, the post-login redirect — points at the container. Blank it for a LAN-only install. |
+| `GRAFANA_COOKIE_SECURE` | `false` | Cloudflare terminates TLS, so the browser connection is already HTTPS. Set this `true` **only** once `http://localhost:3300` is no longer used: a secure-only cookie is silently dropped over plain HTTP, and the login then appears to succeed and bounces straight back to the login page.
+
+### The one step that cannot be done from this repo
+
+The tunnel is **remotely managed** — it authenticates with
+`CLOUDFLARE_TUNNEL_TOKEN` and takes its ingress from Cloudflare, not from a
+local `config.yml`. Adding a hostname therefore happens in the dashboard (or
+via the Cloudflare API with a Zero Trust token, which this deployment does not
+hold):
+
+> Zero Trust → Networks → Tunnels → *your tunnel* → **Public Hostname** → Add
+> * Subdomain `grafana`, Domain `techsarasolutions.com`
+> * Service **HTTP** → `grafana:3000`
+
+Saving it also creates the DNS record. Nothing needs restarting on this side:
+`cloudflared` picks the new ingress up from the edge within seconds.
+
+### Protect it with Cloudflare Access
+
+Grafana's login page is a small but real attack surface once it is on the
+public internet, and Grafana has no lockout on repeated failures. Put Access in
+front of it so the login page is never reached by an unauthenticated request:
+
+> Zero Trust → Access → Applications → Add → Self-hosted
+> * Domain `grafana.techsarasolutions.com`
+> * Policy: Allow → Emails ending in `@techsarasolutions.com`
+
+This is independent of Grafana's own admin login, which stays in force behind
+it.
+
+---
+
 ## Security
 
 * **Grafana and Prometheus bind to `127.0.0.1` by default.** They deliberately

@@ -79,6 +79,23 @@ services:
       GF_ANALYTICS_REPORTING_ENABLED: "false"
       GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
       GF_NEWS_NEWS_FEED_ENABLED: "false"
+      # PUBLIC HOSTNAME. Behind the Cloudflare Tunnel the browser's address is
+      # grafana.techsarasolutions.com, but Grafana only knows it is listening
+      # on :3000 -- so every absolute URL it builds (share links, alert links,
+      # the post-login redirect) would point at the container's own address.
+      # Set GRAFANA_ROOT_URL in .env to the public URL. The default keeps a
+      # LAN-only install working exactly as before.
+      GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL:-http://localhost:${GRAFANA_PORT:-3300}}
+      # Cloudflare terminates TLS, so the browser connection IS https even
+      # though this container speaks plain http to the tunnel. Leave this
+      # false while http://localhost:3300 is still used: a secure-only cookie
+      # is silently dropped over plain http and the login would appear to
+      # succeed and then bounce straight back to the login page.
+      GF_SECURITY_COOKIE_SECURE: ${GRAFANA_COOKIE_SECURE:-false}
+      GF_SECURITY_COOKIE_SAMESITE: lax
+      # Clickjacking defence, which matters once this is reachable publicly.
+      GF_SECURITY_X_CONTENT_TYPE_OPTIONS: "true"
+      GF_SECURITY_X_XSS_PROTECTION: "true"
       # Land on the cluster overview instead of an empty home page.
       GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/dgx-cluster-overview.json
     volumes:
