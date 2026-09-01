@@ -53,11 +53,13 @@ SALESFORCE_CHAT_SYSTEM = (
 def _messages(message: str, history: Sequence[dict], mode: str) -> List[dict]:
     # Salesforce-mode "chat" is greetings/small talk — a diagram would never
     # belong there, so only assistant mode carries the diagram capability.
+    from ..identity import identity_line
+
     system = (
         ASSISTANT_SYSTEM + DIAGRAM_INSTRUCTION + CODE_INSTRUCTION
         if mode == "assistant"
         else SALESFORCE_CHAT_SYSTEM
-    )
+    ) + identity_line()
     return (
         [{"role": "system", "content": system}]
         + recent_turns(history, 6)

@@ -55,7 +55,13 @@ export const DEFAULT_PREFS: ChatPrefs = {
   deepResearch: false,
 };
 
-const STORAGE_KEY = 'techsara.chatprefs.v1';
+/**
+ * Exported so the auth retrofit can wipe prefs on account change/logout:
+ * the map is keyed by conversation id, not by user, so on a shared browser
+ * it would otherwise leak one account's composer choices to the next.
+ */
+export const PREFS_STORAGE_KEY = 'techsara.chatprefs.v1';
+const STORAGE_KEY = PREFS_STORAGE_KEY;
 const DRAFT_SLOT = '__draft__';
 /** Cap the map so years of conversations cannot bloat localStorage. */
 const MAX_ENTRIES = 200;

@@ -609,6 +609,43 @@ class Settings:
         # database is how a deploy ends up writing history nobody can find;
         # missing configuration should fail loudly at startup instead.
         self.app_database_url: str = os.environ.get("APP_DATABASE_URL", "").strip()
+
+        # --- Identity (2026-09-01): opaque server-side sessions, workspaces,
+        # RBAC. Lifetimes are the persistent-login contract: a session rolls
+        # forward with activity up to AUTH_SESSION_DAYS of idleness, and dies
+        # unconditionally AUTH_SESSION_ABSOLUTE_DAYS after it was created.
+        # "Stay signed in" unticked shortens the rolling window to hours and
+        # drops the cookie's Max-Age (browser-session cookie).
+        self.auth_session_days: int = _int("AUTH_SESSION_DAYS", 30)
+        self.auth_session_absolute_days: int = _int("AUTH_SESSION_ABSOLUTE_DAYS", 90)
+        self.auth_session_unremembered_hours: int = _int(
+            "AUTH_SESSION_UNREMEMBERED_HOURS", 24
+        )
+        self.auth_cookie_name: str = os.environ.get("AUTH_COOKIE_NAME", "ts_session")
+        # "auto": Secure when the request arrived over https (directly or via a
+        # TRUSTED forwarded proto — see auth_trust_proxy_headers). localhost
+        # development stays plain http and still gets a cookie.
+        self.auth_cookie_secure: str = (
+            os.environ.get("AUTH_COOKIE_SECURE", "auto").strip().lower()
+        )
+        # Login throttling: N failures inside the window locks that email (and
+        # separately that source address) out for a few minutes. Short on
+        # purpose — brute force is made impractical without handing an
+        # attacker a permanent denial-of-service button for any email.
+        self.auth_login_max_fails: int = _int("AUTH_LOGIN_MAX_FAILS", 8)
+        self.auth_login_window_seconds: int = _int("AUTH_LOGIN_WINDOW_SECONDS", 900)
+        self.auth_login_lock_seconds: int = _int("AUTH_LOGIN_LOCK_SECONDS", 300)
+        self.auth_invitation_ttl_days: int = _int("AUTH_INVITATION_TTL_DAYS", 7)
+        # X-Forwarded-For / X-Forwarded-Proto are LIES unless a proxy this
+        # deployment controls sets them. Off by default; the compose frontend
+        # proxy does not need it (audit rows then record the proxy's address,
+        # which is honest about what is actually known).
+        self.auth_trust_proxy_headers: bool = _bool("AUTH_TRUST_PROXY_HEADERS", False)
+        # The workspace every account belongs to. One workspace per
+        # deployment today; the data model supports more.
+        self.workspace_name: str = os.environ.get(
+            "WORKSPACE_NAME", "TechSara's Workspace"
+        )
         # Pool bounds. max is per orchestrator process and must stay well under
         # the server's max_connections (60 in compose); 16 is far more than a
         # single-user box needs and leaves room for psql and the migration tool.

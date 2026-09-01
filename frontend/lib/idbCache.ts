@@ -91,14 +91,43 @@ export function isIdbAvailable(): boolean {
 }
 
 /**
+ * The database for one signed-in account (enterprise auth retrofit): every
+ * user gets their OWN database, `techsara-history:u<id>`, so an account
+ * switch never reads another account's cache — isolation by name, with the
+ * wipe on switch/logout as the belt to this suspender. `userKey` is the
+ * stable scoping key the history store binds (`u<id>`), never a display name.
+ */
+export function userDbName(userKey: string): string {
+  return `${DB_NAME}:${userKey}`;
+}
+
+/**
+ * Best-effort removal of the LEGACY shared database (the pre-auth,
+ * origin-wide 'techsara-history'). Called on account change and logout so a
+ * cache written before per-user databases existed cannot outlive the account
+ * that wrote it. Fire-and-forget by design: deletion of a database another
+ * tab still holds open completes when that connection closes.
+ */
+export function deleteLegacyDb(): void {
+  if (!isIdbAvailable()) return;
+  try {
+    indexedDB.deleteDatabase(DB_NAME);
+  } catch {
+    // best-effort — the per-user store never reads this database anyway
+  }
+}
+
+/**
  * IndexedDB persister with automatic fallback. `migrateLegacy` is called once
  * after a successful open when the database is empty — it returns whatever
  * conversations the old localStorage blob held, which are then imported and
- * the blob deleted by the caller.
+ * the blob deleted by the caller. `dbName` selects the per-user database
+ * (userDbName); omitted, it opens the legacy shared one.
  */
 export function createIdbPersister(
   fallback: CachePersister,
   onBroken?: (err: unknown) => void,
+  dbName: string = DB_NAME,
 ): CachePersister {
   let broken = false;
   let dbPromise: Promise<IDBDatabase> | null = null;
@@ -113,7 +142,7 @@ export function createIdbPersister(
   function openDb(): Promise<IDBDatabase> {
     if (!dbPromise) {
       dbPromise = new Promise((resolve, reject) => {
-        const req = indexedDB.open(DB_NAME, DB_VERSION);
+        const req = indexedDB.open(dbName, DB_VERSION);
         req.onupgradeneeded = () => {
           const db = req.result;
           if (!db.objectStoreNames.contains(CONV_STORE)) {

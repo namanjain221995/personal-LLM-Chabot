@@ -1,34 +1,21 @@
 /**
- * GET /api/auth/me — who the app is running as.
+ * GET /api/auth/me — who the session belongs to (ME_PAYLOAD | 401).
  *
- * This is NOT a login check any more: there is no login. It reports the single
- * local account so the UI can label things, and so the history store keeps
- * scoping its localStorage cache by a stable name (change the name and cached
- * conversations are orphaned, which is why this endpoint stayed).
+ * Reworked for the enterprise auth retrofit: the old version did a BARE
+ * fetch — no cookie in either direction — and collapsed every failure onto
+ * 502, so under real sessions it always resolved anonymous and a 401 could
+ * never reach the browser. Now it rides proxyToOrchestrator like the rest
+ * of /api/auth/*: the ts_session cookie goes upstream, any Set-Cookie comes
+ * back down, and the status — 401 included — passes through honestly.
  */
+
+import { handleMockAuth } from '@/lib/mockApi';
+import { proxyToOrchestrator } from '@/lib/proxy';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-export async function GET(): Promise<Response> {
-  const orchestratorUrl =
-    process.env.ORCHESTRATOR_URL ?? 'http://localhost:8080';
-
-  try {
-    const upstream = await fetch(`${orchestratorUrl}/auth/me`, {
-      cache: 'no-store',
-    });
-    if (!upstream.ok) {
-      return Response.json(
-        { message: `The orchestrator responded with status ${upstream.status}.` },
-        { status: 502 },
-      );
-    }
-    return Response.json(await upstream.json());
-  } catch {
-    return Response.json(
-      { message: 'The orchestrator is unreachable.' },
-      { status: 502 },
-    );
-  }
+export async function GET(req: Request): Promise<Response> {
+  if (process.env.MOCK_MODE === 'true') return handleMockAuth(req, ['me']);
+  return proxyToOrchestrator(req, '/auth/me');
 }

@@ -78,6 +78,11 @@ export function isConflict(err: unknown): boolean {
   return err instanceof HistoryApiError && err.status === 409;
 }
 
+/** 401 — the session is gone; the caller's job is to route to sign-in. */
+export function isUnauthorized(err: unknown): boolean {
+  return err instanceof HistoryApiError && err.status === 401;
+}
+
 /** Network failure (as opposed to a rejection the server actually sent). */
 export function isUnreachable(err: unknown): boolean {
   return !(err instanceof HistoryApiError) || err.status === 0;

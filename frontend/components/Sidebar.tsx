@@ -5,8 +5,9 @@
  * slide-over drawer). Header (mark · search icon · collapse icon) · New chat
  * · conversation list in ChatGPT's sections — Pinned, Recents, and a collapsed Archived
  * disclosure that lazily pulls `?archived=true` — each row carrying the "⋯"
- * menu (rename / pin / archive / export / delete) · theme toggle.
- * No account UI at all: this app has no users to show.
+ * menu (rename / pin / archive / export / delete) · theme toggle · account
+ * row (enterprise auth retrofit — AccountMenu fetches its own identity, so
+ * no user props flow through here).
  *
  * V4 §2 replaced the inline filter box with the search ICON below: filtering
  * only ever matched titles in the already-loaded list, while the palette it
@@ -16,6 +17,7 @@
 import { useRef, useState } from 'react';
 import { conversationMenuHandlers } from '@/lib/conversationMenu';
 import type { ConversationSummary } from '@/lib/types';
+import { AccountMenu } from './AccountMenu';
 import { ConversationMenu } from './ConversationMenu';
 import { TechSaraMark } from './TechSaraMark';
 import { useTheme } from './Providers';
@@ -306,6 +308,7 @@ export function Sidebar({
           {theme === 'dark' ? 'Light theme' : 'Dark theme'}
         </button>
 
+        <AccountMenu />
       </div>
     </div>
   );

@@ -18,6 +18,7 @@
  * which conversation is on screen.
  */
 
+import { redirectToLogin } from './auth';
 import { branchForAppend, branchOf, metaWithBranch } from './branching';
 import type { ClarificationResponse } from './clarification';
 import { getHistoryStore, newId } from './history';
@@ -98,6 +99,14 @@ export function stopStream(id: string | null | undefined): void {
 export async function fetchServerActive(): Promise<string[]> {
   try {
     const res = await fetch('/api/chat/active');
+    if (res.status === 401) {
+      // This is the app's heartbeat (ChatApp polls it every 8s), so it is
+      // where a mid-session sign-out surfaces first. A 401 here is session
+      // death, not "nothing active" — route to sign-in instead of letting
+      // the app degrade feature by feature.
+      redirectToLogin();
+      return [];
+    }
     if (!res.ok) return [];
     const data = (await res.json()) as { active?: unknown };
     return Array.isArray(data.active)
@@ -194,6 +203,16 @@ function markUnreachable(
   code?: unknown,
 ): void {
   const err = toClientError(status, code);
+  if (err.code === 'UNAUTHENTICATED') {
+    // Session death is not a message. Persisting the usual error bubble
+    // would write "Something went wrong" turns into the user's stored
+    // thread for something no retry can fix — drop the placeholder and
+    // route to sign-in instead.
+    streams.delete(s.conversationId);
+    notify(s.conversationId);
+    redirectToLogin();
+    return;
+  }
   updateAssistant(
     s,
     withLiveProgressRetired({

@@ -32,9 +32,13 @@ import type {
 } from './types';
 import {
   createIdbPersister,
+  deleteLegacyDb,
   isIdbAvailable,
+  userDbName,
   type CachePersister,
 } from './idbCache';
+import { PREFS_STORAGE_KEY } from './prefs';
+import { FEEDBACK_STORAGE_KEY } from './feedback';
 import {
   createHistoryApi,
   isConflict,
@@ -87,8 +91,21 @@ export interface ServerHistoryStore extends HistoryStore {
    * synchronous engines (legacy blob, tests, SSR).
    */
   ready(): Promise<void>;
-  /** Bind the store to the signed-in user; a USER CHANGE clears the cache. */
-  setActiveUser(username: string): void;
+  /**
+   * Bind the store to the signed-in account's STABLE scoping key (`u<id>`
+   * from ME_PAYLOAD's user.id — never a display name, which can be renamed
+   * and would orphan the cache). An ACCOUNT CHANGE wipes every trace of the
+   * previous account's local data: the conversation cache, sync bookkeeping,
+   * the legacy blob, composer prefs and thumbs. Returns true when that wipe
+   * fired, so the caller can rebind to the new account's own database.
+   */
+  setActiveUser(userKey: string): boolean;
+  /**
+   * Erase the ACTIVE account's local data, awaited to completion — the
+   * logout path calls this BEFORE redirecting, so the next person at this
+   * browser cannot read the previous account's cache.
+   */
+  wipeLocal(): Promise<void>;
   /** One-time upload of pre-auth local conversations (§4b). Returns count. */
   migrateLocalConversations(): Promise<number>;
   /** Pull server truth into the cache. false = offline/unauthorized. */
@@ -186,12 +203,27 @@ interface Cache {
   /** Await pending write-behind persistence (tests). */
   flushPersist(): Promise<void>;
   clear(): void;
+  /**
+   * clear(), but AWAITED to completion — including the persister's own
+   * clear. The logout path needs this: a fire-and-forget clear raced the
+   * redirect, and an in-flight debounced put could re-materialize data the
+   * user just asked to be rid of.
+   */
+  wipe(): Promise<void>;
 }
 
 function createCache(
   storage: StorageLike,
   onEvict?: (dropped: ConversationSummary) => void,
 ): Cache {
+  function clear(): void {
+    try {
+      storage.removeItem(STORAGE_KEY);
+    } catch {
+      // storage unavailable — nothing to clear
+    }
+  }
+
   return {
     ready: Promise.resolve(),
 
@@ -234,13 +266,10 @@ function createCache(
       }
     },
 
-    clear() {
-      try {
-        storage.removeItem(STORAGE_KEY);
-      } catch {
-        // storage unavailable — nothing to clear
-      }
-    },
+    clear,
+
+    // Synchronous engine: clear IS complete when it returns.
+    wipe: async () => clear(),
   };
 }
 
@@ -325,6 +354,23 @@ function createMemoryCache(
     if (!timer) timer = setTimeout(flushNow, PERSIST_DEBOUNCE_MS);
   }
 
+  function clearAll(): void {
+    conversations = [];
+    pendingPuts.clear();
+    pendingRemoves.clear();
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+    // Starts immediately (like flushNow's work) but its completion is
+    // TRACKED on inFlight so flushPersist()/wipe() can await it — a clear
+    // nothing tracked used to race the logout redirect.
+    const work = Promise.resolve(persister.clear()).catch(() => {
+      // best-effort
+    });
+    inFlight = inFlight.then(() => work);
+  }
+
   let ready: Promise<void>;
   if (persister.mode === 'sync') {
     // Synchronous engines (legacy blob, tests) hydrate before the store is
@@ -398,17 +444,15 @@ function createMemoryCache(
       await inFlight;
     },
 
-    clear() {
-      conversations = [];
-      pendingPuts.clear();
-      pendingRemoves.clear();
-      if (timer) {
-        clearTimeout(timer);
-        timer = null;
-      }
-      void Promise.resolve(persister.clear()).catch(() => {
-        // best-effort
-      });
+    clear: clearAll,
+
+    async wipe() {
+      // clearAll() cancels the debounce and starts the persister clear;
+      // awaiting the tracked chain means both it AND any already-in-flight
+      // put have settled before this resolves (IndexedDB orders the clear's
+      // transaction after the put's), so nothing re-materializes afterwards.
+      clearAll();
+      await inFlight;
     },
   };
 }
@@ -568,6 +612,13 @@ export interface ServerHistoryStoreOptions {
    * tests and non-IDB environments on the old synchronous behavior.
    */
   persister?: CachePersister;
+  /**
+   * The IndexedDB database to open (per-user: idbCache.userDbName). Omitted,
+   * the legacy shared database is used — correct only before an account has
+   * ever been bound (pre-auth data, the migration source). Ignored when an
+   * explicit `persister` is supplied.
+   */
+  dbName?: string;
 }
 
 export function createServerHistoryStore(
@@ -577,7 +628,11 @@ export function createServerHistoryStore(
   const useIdb = options.persister === undefined && isIdbAvailable();
   const persister =
     options.persister ??
-    (useIdb ? createIdbPersister(blobPersister) : blobPersister);
+    (useIdb
+      ? createIdbPersister(blobPersister, undefined, options.dbName)
+      : blobPersister);
+  /** On a per-user database the legacy shared one is safe to drop outright. */
+  const scopedDb = useIdb && options.dbName !== undefined;
   // When IndexedDB is the engine, the old blob (if any) is imported once and
   // deleted; while the blob IS the engine it must not be treated as legacy.
   const legacy =
@@ -635,6 +690,22 @@ export function createServerHistoryStore(
     mutateSync((s) => {
       if (!s.dirty.includes(id)) s.dirty.push(id);
     });
+  }
+
+  /**
+   * The localStorage keys that belong to ONE account and must not survive
+   * it: the legacy conversation blob, composer prefs and per-message thumbs.
+   * SYNC_KEY is handled by the caller — setActiveUser rewrites it for the
+   * incoming account, wipeLocal removes it outright.
+   */
+  function removeAccountScopedKeys(): void {
+    for (const key of [STORAGE_KEY, PREFS_STORAGE_KEY, FEEDBACK_STORAGE_KEY]) {
+      try {
+        options.storage.removeItem(key);
+      } catch {
+        // best-effort
+      }
+    }
   }
 
   function upsertCached(conv: Conversation): void {
@@ -1067,18 +1138,21 @@ export function createServerHistoryStore(
 
     /* ------------------------------------------------ v2 additions */
 
-    setActiveUser(username) {
+    setActiveUser(userKey) {
       const s = readSync();
-      if (s.username === username) return;
-      if (s.username && s.username !== username) {
+      if (s.username === userKey) return false;
+      if (s.username && s.username !== userKey) {
         // Different account on this browser: never show (or upload)
-        // another user's conversations.
+        // another user's conversations — and never leak their composer
+        // prefs or thumbs either, which live outside the conversation cache.
         cache.clear();
+        removeAccountScopedKeys();
+        if (scopedDb) deleteLegacyDb();
         try {
           options.storage.setItem(
             SYNC_KEY,
             JSON.stringify({
-              username,
+              username: userKey,
               migrated: true, // nothing local left to migrate
               pushed: {},
               dirty: [],
@@ -1088,11 +1162,23 @@ export function createServerHistoryStore(
         } catch {
           // best-effort
         }
-        return;
+        return true;
       }
       mutateSync((st) => {
-        st.username = username;
+        st.username = userKey;
       });
+      return false;
+    },
+
+    async wipeLocal() {
+      await cache.wipe();
+      removeAccountScopedKeys();
+      try {
+        options.storage.removeItem(SYNC_KEY);
+      } catch {
+        // best-effort
+      }
+      if (scopedDb) deleteLegacyDb();
     },
 
     async migrateLocalConversations() {
@@ -1228,10 +1314,58 @@ export function getHistoryStore(): ServerHistoryStore {
     });
   }
   if (!browserStore) {
+    // Bind to the LAST bound account's own database synchronously — boot
+    // renders cached history before /api/auth/me answers, so the scoping key
+    // has to come from what the previous session recorded, not the network.
+    const userKey = storedUserKey(window.localStorage);
     browserStore = createServerHistoryStore({
       storage: window.localStorage,
       onEvict: (dropped) => evictListener?.(dropped),
+      ...(userKey ? { dbName: userDbName(userKey) } : {}),
     });
   }
   return browserStore;
+}
+
+/** The scoping key the previous session bound (SyncState.username). */
+function storedUserKey(storage: StorageLike): string | null {
+  try {
+    const raw = storage.getItem(SYNC_KEY);
+    const parsed = raw ? (JSON.parse(raw) as { username?: unknown }) : null;
+    return typeof parsed?.username === 'string' && parsed.username
+      ? parsed.username
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Drop the browser singleton and hand out a fresh store bound to the
+ * CURRENT account's database. Called after setActiveUser reports an account
+ * change: the old singleton was constructed against the previous account's
+ * database, so its writes would land under a name the new account never
+ * reads. Awaits the old store's in-flight work (the wipe included) first.
+ */
+export async function rebuildHistoryStore(): Promise<ServerHistoryStore> {
+  if (browserStore) {
+    try {
+      await browserStore.flush();
+    } catch {
+      // best-effort — a failed push must not block the rebind
+    }
+    browserStore = null;
+  }
+  return getHistoryStore();
+}
+
+/**
+ * The logout path's local-data teardown: erase the active account's cache
+ * and account-scoped localStorage, AWAITED, then forget the singleton. The
+ * caller redirects to /login only after this resolves — see lib/auth.ts.
+ */
+export async function clearActiveUserData(): Promise<void> {
+  if (typeof window === 'undefined') return;
+  await getHistoryStore().wipeLocal();
+  browserStore = null;
 }

@@ -163,8 +163,10 @@ async def create_upload(
 def list_uploads(
     conversation_id: str, user: UserRow = Depends(require_user)
 ) -> dict:
+    # STRICT: a conversation with no row has no uploads to list, and one
+    # owned by someone else is indistinguishable from that.
     owner = db.conversation_owner(conversation_id)
-    if owner is not None and owner != int(user["id"]):
+    if owner is None or owner != int(user["id"]):
         raise HTTPException(status_code=404, detail="conversation not found")
     uploads = db.get_uploads(conversation_id)
     # Report expiry rather than pretending the bytes are still there.

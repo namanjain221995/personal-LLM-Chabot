@@ -28,6 +28,7 @@ export type ErrorCategory =
   | 'TIMEOUT'
   | 'APPLICATION_ERROR'
   | 'NETWORK_ERROR'
+  | 'UNAUTHENTICATED'
   | 'UNKNOWN_ERROR';
 
 /**
@@ -95,6 +96,12 @@ const COPY: Record<ErrorCategory, Copy> = {
       "We couldn't reach the service. Check your connection and try again.",
     retryable: true,
   },
+  UNAUTHENTICATED: {
+    title: 'Signed out',
+    message: 'Your session has ended. Please sign in again to continue.',
+    // Retrying without a session yields the same 401; signing in is the fix.
+    retryable: false,
+  },
   UNKNOWN_ERROR: {
     title: 'Something went wrong',
     message: "We couldn't complete your request. Please try again.",
@@ -109,6 +116,10 @@ const COPY: Record<ErrorCategory, Copy> = {
  */
 export function categoryForStatus(status: number | null): ErrorCategory {
   if (status === null) return 'NETWORK_ERROR';
+  // 401 alone: it means "no valid session", which routes to sign-in. A 403
+  // is a request the SIGNED-IN user was refused (wrong current password,
+  // capability gate) — an application answer, not a session death.
+  if (status === 401) return 'UNAUTHENTICATED';
   if (status === 404) return 'NOT_FOUND';
   if (status === 408 || status === 504) return 'TIMEOUT';
   if (status === 502) return 'MODEL_UNAVAILABLE';

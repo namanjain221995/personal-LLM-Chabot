@@ -56,6 +56,10 @@ let stored: ChatMessage[] = [];
 vi.mock('@/lib/history', () => ({
   newId: () => `m${Math.random().toString(36).slice(2, 10)}`,
   setEvictListener: () => undefined,
+  // Only reached after an ACCOUNT CHANGE, which this suite never simulates.
+  rebuildHistoryStore: async () => {
+    throw new Error('unexpected account switch in test');
+  },
   getHistoryStore: () => ({
     ready: async () => undefined,
     list: () => [],
@@ -73,7 +77,8 @@ vi.mock('@/lib/history', () => ({
       saveMessages(id, msgs);
     },
     load: async () => null,
-    setActiveUser: () => undefined,
+    setActiveUser: () => false,
+    wipeLocal: async () => undefined,
     migrateLocalConversations: async () => 0,
     refresh: async () => true,
     refreshArchived: async () => true,
@@ -89,7 +94,9 @@ vi.mock('@/lib/history', () => ({
 }));
 
 vi.mock('@/lib/auth', () => ({
-  fetchMe: async () => ({ ok: true, username: 'tester' }),
+  fetchMe: async () => ({ ok: true, username: 'tester', user: null }),
+  userScopeKey: (me: { user: { id: number } | null; username: string }) =>
+    me.user ? `u${me.user.id}` : me.username,
 }));
 vi.mock('@/lib/salesforceApi', () => ({
   fetchSalesforceContext: async () => ({ options: [], pending: null }),

@@ -22,10 +22,15 @@ import {
 /** useLayoutEffect on the client, useEffect on the server (no SSR warning). */
 const useIsomorphicLayoutEffect =
   typeof window !== 'undefined' ? useLayoutEffect : useEffect;
-import { fetchMe } from '@/lib/auth';
+import { fetchMe, userScopeKey } from '@/lib/auth';
 import { toClientError, type ClientError } from '@/lib/errorTypes';
 import { downloadMarkdown } from '@/lib/exportMarkdown';
-import { getHistoryStore, newId, setEvictListener } from '@/lib/history';
+import {
+  getHistoryStore,
+  newId,
+  rebuildHistoryStore,
+  setEvictListener,
+} from '@/lib/history';
 import {
   adoptDraftPrefs,
   DEFAULT_PREFS,
@@ -273,7 +278,7 @@ export function ChatApp() {
 
     let cancelled = false;
     void (async () => {
-      const store = getHistoryStore();
+      let store = getHistoryStore();
       // IndexedDB hydration (single-digit ms; instant for the fallback).
       await store.ready();
       if (cancelled) return;
@@ -293,9 +298,16 @@ export function ChatApp() {
       const me = await fetchMe();
       if (cancelled) return;
       if (!me.ok) {
-        // There is no login to bounce to any more, so ANY failure here (the
-        // orchestrator still booting, a network blip) is handled the same way:
-        // carry on, but never leave a running generation unguarded.
+        if (me.status === 401 || me.status === 403) {
+          // Signed out. The cookie is HttpOnly, so only the server can say
+          // so — hard-redirect to sign-in rather than keep serving cached
+          // data to whoever is at the keyboard now.
+          window.location.assign('/login');
+          return;
+        }
+        // Offline (status 0) or the orchestrator failing (5xx — still
+        // booting, a network blip): carry on with the cache, but never
+        // leave a running generation unguarded.
         if (wanted) {
           const active = await fetchServerActive();
           if (!cancelled) setServerActive(active);
@@ -303,7 +315,24 @@ export function ChatApp() {
         settleReconcile();
         return;
       }
-      store.setActiveUser(me.username);
+      let switchedAccount = false;
+      if (store.setActiveUser(userScopeKey(me))) {
+        // A DIFFERENT account signed in on this browser: its local data was
+        // just wiped — rebind to the new account's own database before
+        // anything is written, and drop the stale view (the ?c= fast path
+        // above may have already painted the previous account's cache).
+        switchedAccount = true;
+        store = await rebuildHistoryStore();
+        if (cancelled) return;
+        await store.ready();
+        if (cancelled) return;
+        setMessages([]);
+        setActiveId(null);
+        activeIdRef.current = null;
+        setUrlConversation(null);
+        setPrefs({ ...DEFAULT_PREFS });
+        refreshList();
+      }
       try {
         const migrated = await store.migrateLocalConversations();
         if (migrated > 0) {
@@ -319,7 +348,9 @@ export function ChatApp() {
       refreshList();
 
       try {
-        if (wanted) {
+        // After an account switch `wanted` names the PREVIOUS account's
+        // conversation — nothing of it may be reconciled for this one.
+        if (wanted && !switchedAccount) {
         // Still generating server-side? Re-join the live stream — it replays
         // the partial answer instantly, then keeps streaming. Otherwise load
         // server truth; FORCED when the chat ends on a user message, because
@@ -357,7 +388,7 @@ export function ChatApp() {
     return () => {
       cancelled = true;
     };
-  }, [refreshList, toast]);
+  }, [refreshList, setUrlConversation, toast]);
 
   const persist = useCallback(
     (conversationId: string, msgs: ChatMessage[]) => {

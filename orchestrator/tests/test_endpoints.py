@@ -100,8 +100,20 @@ def test_reports_empty(client):
     assert resp.json() == {"reports": []}
 
 
-def test_reports_lists_and_serves_files(client, tmp_path):
+def test_reports_lists_and_serves_owned_files(client, tmp_path, as_user):
+    """2026-09-01: the reports dir is one flat namespace shared by every
+    user, so a file is listed and served ONLY for the account it is bound to
+    (report_files) — a name on disk is not authorisation."""
+    from app.authn import store as authn_store
+
+    owner = as_user("local")
     (tmp_path / "q3.pdf").write_bytes(b"%PDF-1.4 fake")
+
+    # On disk but bound to nobody: invisible and undownloadable.
+    assert client.get("/reports").json()["reports"] == []
+    assert client.get("/reports/q3.pdf").status_code == 404
+
+    authn_store.bind_report("q3.pdf", int(owner["id"]), None)
     listing = client.get("/reports").json()["reports"]
     assert [i["filename"] for i in listing] == ["q3.pdf"]
 
@@ -109,6 +121,11 @@ def test_reports_lists_and_serves_files(client, tmp_path):
     assert resp.status_code == 200
     assert resp.content == b"%PDF-1.4 fake"
     assert resp.headers["content-type"].startswith("application/pdf")
+
+    # Bound to SOMEONE ELSE: indistinguishable from never existing.
+    as_user("intruder")
+    assert client.get("/reports/q3.pdf").status_code == 404
+    assert client.get("/reports").json()["reports"] == []
 
 
 def test_reports_missing_file_404(client):

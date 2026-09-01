@@ -71,6 +71,16 @@ _APP_TABLES = (
     "conversation_summaries",
     "messages",
     "conversations",
+    # V12 identity tables, children before parents. login_throttle has no FK
+    # but holds cross-test state (lockouts) all the same.
+    "report_files",
+    "user_preferences",
+    "audit_events",
+    "workspace_invitations",
+    "auth_sessions",
+    "workspace_memberships",
+    "login_throttle",
+    "workspaces",
     "users",
 )
 
@@ -230,39 +240,137 @@ def isolated_app_db(app_database, tmp_path, monkeypatch):
     yield
 
 
+def _materialize_test_user(username: str, role: str = "member") -> dict:
+    """A real user row + workspace membership for a test identity."""
+    from app import db
+    from app.authn import store
+    from app.authn.rbac import Role
+
+    Role(role)
+    row = db.get_user_by_username(username)
+    if row is None:
+        try:
+            db.create_user(username, "!test-ambient")
+        except db.IntegrityError:
+            pass
+        row = db.get_user_by_username(username)
+    store.set_credentials(
+        int(row["id"]), email=f"{username}@test.local", display_name=username
+    )
+    workspace = store.ensure_workspace(settings.workspace_name)
+    store.upsert_membership(workspace["id"], int(row["id"]), role)
+    return db.get_user_by_username(username)
+
+
+def _principal_for(username: str, role: str = "member"):
+    from app.authn.principal import Principal
+    from app.authn.rbac import Role, capabilities
+
+    row = _materialize_test_user(username, role)
+    from app.authn import store
+
+    workspace = store.default_workspace()
+    return Principal(
+        user_id=int(row["id"]),
+        username=row["username"],
+        email=row.get("email") or "",
+        display_name=row.get("display_name") or row["username"],
+        role=Role(role),
+        workspace_id=workspace["id"],
+        workspace_name=workspace["name"],
+        session_id=f"ambient-{username}",
+        caps=capabilities(Role(role)),
+    )
+
+
 @pytest.fixture(autouse=True)
-def reset_local_user():
-    """`auth.local_user()` caches the resolved id for the process lifetime.
+def ambient_identity(isolated_app_db, monkeypatch):
+    """The pre-login corpus's auth shim — AND the door to real auth.
 
-    Without this, the first test to resolve a user pins that id for the whole
-    session and every later test silently reads and writes ANOTHER test's rows
-    — the isolation tests would pass while proving nothing.
+    Login is back (2026-09-01), so a bare request now carries no identity and
+    would 401 everywhere. The ~1,600 pre-auth tests assert routing, scoping
+    and engine behaviour, not authentication; giving them an ambient signed-in
+    "local" member preserves exactly what they were written to prove.
+
+    THE DOOR: a request that carries a session cookie is resolved by the REAL
+    session machinery — so the auth/RBAC/IDOR suites log in over HTTP and
+    exercise genuine resolution end to end, in the same process, with the
+    shim standing aside. `anonymous_mode` turns the shim off entirely.
     """
-    from app import auth
+    from app import auth as auth_module
+    from app.authn import principal as principal_module
 
-    auth._cached_user_id = None
-    yield
-    auth._cached_user_id = None
+    real_resolve = principal_module.resolve_principal_sync
+    state: dict = {"principal": None, "ambient_enabled": True}
+
+    def resolver(request):
+        if request.cookies.get(settings.auth_cookie_name):
+            return real_resolve(request)
+        if not state["ambient_enabled"]:
+            return None
+        if state["principal"] is None:
+            state["principal"] = _principal_for("local", "member")
+        return state["principal"]
+
+    monkeypatch.setattr(principal_module, "resolve_principal_sync", resolver)
+    monkeypatch.setattr(auth_module, "resolve_principal_sync", resolver)
+    yield state
 
 
 @pytest.fixture()
-def as_user(monkeypatch):
-    """Run the app as a named local user.
+def anonymous_mode(ambient_identity):
+    """No ambient identity: a cookie-less request is genuinely anonymous."""
+    ambient_identity["ambient_enabled"] = False
+    ambient_identity["principal"] = None
+    return ambient_identity
 
-    Login is gone, but conversations are still scoped by user_id, so the
-    isolation those tests describe still matters. `LOCAL_USERNAME` is how the
-    single-user resolver is pointed at a specific account, which lets a test
-    act as two different owners in turn.
+
+@pytest.fixture()
+def as_user(ambient_identity):
+    """Run the app as a named user (ambient — no cookie needed).
+
+    The signature the pre-auth suite has always used: `as_user("alice")`
+    materialises the account and points cookie-less resolution at it, which
+    lets a test act as two different owners in turn. `role=` mints admins.
     """
-    from app import auth
 
-    def _switch(username: str):
-        monkeypatch.setenv("LOCAL_USERNAME", username)
-        auth._cached_user_id = None
-        # Materialise the row NOW. Resolution is lazy in production (first
-        # request creates it), but a test that seeds through the db layer
-        # before making any request would otherwise look up an account that
-        # does not exist yet.
-        return auth.local_user()
+    def _switch(username: str, role: str = "member"):
+        ambient_identity["principal"] = _principal_for(username, role)
+        from app import db
+
+        return db.get_user_by_username(username)
 
     return _switch
+
+
+@pytest.fixture()
+def login_client():
+    """A factory for REAL authenticated clients: creates the user with a
+    password, logs in over HTTP, returns a TestClient carrying the session
+    cookie. This path exercises the genuine session machinery."""
+    from fastapi.testclient import TestClient
+
+    from app import db
+    from app.authn import passwords, store
+    from app.authn.rbac import Role
+    from app.main import app
+
+    def _make(
+        username: str,
+        *,
+        role: str = "member",
+        password: str = "correct-horse-battery",
+    ) -> TestClient:
+        row = _materialize_test_user(username, role)
+        store.set_credentials(
+            int(row["id"]), password_hash=passwords.hash_password(password)
+        )
+        client = TestClient(app)
+        response = client.post(
+            "/auth/login",
+            json={"email": f"{username}@test.local", "password": password},
+        )
+        assert response.status_code == 200, response.text
+        return client
+
+    return _make

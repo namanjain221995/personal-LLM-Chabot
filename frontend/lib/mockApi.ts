@@ -44,16 +44,69 @@ function json(status: number, body: unknown, cookie?: string): Response {
 /* ------------------------------------------------------------------ auth */
 
 /**
- * There is no login in mock mode either — only "who am I". Kept so MOCK_MODE
- * exercises the same single-user shape the real orchestrator now serves.
+ * The ME_PAYLOAD the mock serves — same shape as the real orchestrator's
+ * /auth/me (enterprise auth retrofit) so the cache scoping (`u<id>`), the
+ * capability-driven UI and the login flow are all demo-able in MOCK_MODE.
+ */
+const MOCK_ME = {
+  username: MOCK_LOCAL_USER,
+  user: { id: 1, name: 'Local User', email: 'local@techsara.test' },
+  workspace: { id: 'ws-local', name: 'TechSara (mock)', role: 'super_admin' },
+  capabilities: ['members.read', 'audit.read', 'workspace_content.read'],
+  local: true,
+};
+
+/** The mock's session is the cookie's PRESENCE — mirrors the middleware. */
+function hasMockSession(req: Request): boolean {
+  return /(?:^|;\s*)ts_session=/.test(req.headers.get('cookie') ?? '');
+}
+
+const MOCK_SESSION_COOKIE =
+  'ts_session=mock-session; Path=/; HttpOnly; SameSite=Lax';
+const MOCK_SESSION_CLEAR =
+  'ts_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax';
+
+/**
+ * Mock login/logout/me, so MOCK_MODE exercises the full session flow: any
+ * email+password signs in (this is a demo, not a lock), logout clears the
+ * cookie, and /me is 401 without one — exactly the contract the real
+ * orchestrator serves, minus the credential check.
  */
 export async function handleMockAuth(
   req: Request,
   path: string[],
 ): Promise<Response> {
-  if (path.join('/') === 'me' && req.method === 'GET') {
-    return json(200, { username: MOCK_LOCAL_USER, local: true });
+  const endpoint = path.join('/');
+
+  if (endpoint === 'me' && req.method === 'GET') {
+    return hasMockSession(req)
+      ? json(200, MOCK_ME)
+      : json(401, { detail: 'Not signed in.' });
   }
+
+  if (endpoint === 'login' && req.method === 'POST') {
+    let body: { email?: unknown; password?: unknown } = {};
+    try {
+      body = (await req.json()) as typeof body;
+    } catch {
+      return json(422, { detail: 'Body must be JSON.' });
+    }
+    if (
+      typeof body.email !== 'string' ||
+      !body.email ||
+      typeof body.password !== 'string' ||
+      !body.password
+    ) {
+      return json(401, { detail: 'Incorrect email or password.' });
+    }
+    return json(200, MOCK_ME, MOCK_SESSION_COOKIE);
+  }
+
+  if (endpoint === 'logout' && req.method === 'POST') {
+    // Safe when signed out, like the real endpoint.
+    return json(200, { ok: true }, MOCK_SESSION_CLEAR);
+  }
+
   return json(404, { detail: 'Unknown auth endpoint.' });
 }
 

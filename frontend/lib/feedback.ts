@@ -10,7 +10,9 @@ import type { StorageLike } from './history';
 
 export type MessageFeedback = 'up' | 'down';
 
-const STORAGE_KEY = 'techsara.feedback.v1';
+/** Exported so the auth retrofit can wipe thumbs on account change/logout. */
+export const FEEDBACK_STORAGE_KEY = 'techsara.feedback.v1';
+const STORAGE_KEY = FEEDBACK_STORAGE_KEY;
 /** Cap so years of chatting cannot bloat localStorage. */
 const MAX_ENTRIES = 1000;
 

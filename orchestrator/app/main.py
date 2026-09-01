@@ -10,13 +10,14 @@ import os
 import uuid
 from typing import AsyncIterator, List, Literal, Optional
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, model_validator
 
 from . import context, db, llm
-from .auth import router as auth_router
+from .auth import UserRow, require_user, router as auth_router
+from .authn.admin_api import router as admin_router
 from .config import settings
 
 # App-module logging was silently dropped: uvicorn configures only its own
@@ -59,11 +60,26 @@ async def lifespan(_app: FastAPI):
     """
     await db.run_in_thread(db.wait_for_database)
     await db.run_in_thread(db.init_schema)
+    # Identity baseline: the workspace exists and every user (including the
+    # pre-auth local account) holds a membership. Idempotent.
+    from .authn.bootstrap import ensure_identity_baseline
+
+    await db.run_in_thread(ensure_identity_baseline)
+    # Housekeeping: rows for sessions long dead carry nothing the audit trail
+    # does not already hold. Once per process start is plenty.
+    from .authn.store import prune_expired_sessions
+
+    await db.run_in_thread(prune_expired_sessions)
     try:
         yield
     finally:
         await db.run_in_thread(db.close_pool)
 
+
+import re as _re
+
+#: Client-supplied conversation ids (same rule as POST /history/conversations).
+_CONVERSATION_ID_RE = _re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 app = FastAPI(title="TechSara Orchestrator", version="0.2.0", lifespan=lifespan)
 
@@ -81,10 +97,32 @@ app.add_middleware(
 
 # V2 (V2-DESIGN §3c): /auth + /history are the account boundary; /chat and
 # /reports* remain auth-free.
+# CSRF: sessions ride a SameSite=Lax cookie, which already blocks cross-site
+# POSTs from <form>/fetch — this middleware is the second layer. A state-
+# changing request that CARRIES an Origin header must carry one of ours; the
+# Next.js proxy strips Origin (server-to-server), so proxied traffic passes
+# untouched, and GET/HEAD (including every SSE stream) is never affected.
+_TRUSTED_ORIGINS = set(settings.cors_allow_origins)
+
+
+@app.middleware("http")
+async def _reject_cross_site_writes(request: Request, call_next):
+    if request.method not in ("GET", "HEAD", "OPTIONS"):
+        origin = request.headers.get("origin")
+        if origin and origin not in _TRUSTED_ORIGINS:
+            from fastapi.responses import JSONResponse
+
+            return JSONResponse(
+                status_code=403, content={"detail": "cross-site request refused"}
+            )
+    return await call_next(request)
+
+
 app.include_router(auth_router)
 app.include_router(history_router)
 app.include_router(uploads_router)
 app.include_router(memory_router)
+app.include_router(admin_router)
 
 
 class LiveGeneration:
@@ -391,17 +429,42 @@ async def health() -> dict:
 
 
 @app.get("/reports")
-async def reports_index() -> dict:
-    return {"reports": list_reports(settings.reports_dir)}
+async def reports_index(user: UserRow = Depends(require_user)) -> dict:
+    """The CALLER's generated files. The reports directory is one flat disk
+    namespace shared by everyone; the report_files table is what says whose
+    is whose, so the listing is a DB query, not a directory walk."""
+    from .authn import store as authn_store
+
+    rows = await db.run_in_thread(authn_store.list_report_files, int(user["id"]))
+    on_disk = {r["filename"] for r in list_reports(settings.reports_dir)}
+    return {
+        "reports": [
+            {
+                "filename": r["filename"],
+                "conversation_id": r["conversation_id"],
+                "created_at": r["created_at"].isoformat(),
+            }
+            for r in rows
+            if r["filename"] in on_disk
+        ]
+    }
 
 
 @app.get("/reports/{filename}")
-async def get_report(filename: str) -> FileResponse:
+async def get_report(
+    filename: str, user: UserRow = Depends(require_user)
+) -> FileResponse:
+    """Download one generated file — the OWNER's only. A filename someone
+    else generated 404s identically to one that never existed: the flat
+    namespace must not be a cross-user oracle, let alone a download."""
+    from .authn import store as authn_store
+
     try:
         path = resolve_report_file(settings.reports_dir, filename)
     except ReportPathError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    if not path.is_file():
+    owner = await db.run_in_thread(authn_store.report_owner, filename)
+    if owner != int(user["id"]) or not path.is_file():
         raise HTTPException(status_code=404, detail="report not found")
     media_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
     return FileResponse(path, filename=filename, media_type=media_type)
@@ -476,34 +539,63 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
     from .memory_recall import recall_block
 
     signed_in = await db.run_in_thread(current_user, http_request)
+    # 2026-09-01: /chat is no longer auth-free. Everything downstream — the
+    # conversation claim, memory, facts, report binding — assumes a real user.
+    if signed_in is None:
+        raise HTTPException(status_code=401, detail="Sign in required.")
+    viewer = int(signed_in["id"])
 
-    conv_key_outer = request.conversation_id or request.session_id
+    # Bare API calls (session_id only, no conversation row) used to share one
+    # global key namespace: two callers sending session_id="default" read each
+    # other's in-process memory and could cancel each other's generations. The
+    # fallback key is now scoped to the authenticated user.
+    scoped_session = f"u{viewer}-{request.session_id}"
+    conv_key_outer = request.conversation_id or scoped_session
 
     # The per-conversation stores below (url_documents, repo_chunks) and the
     # live-generation registry are keyed by conversation id ALONE. Without
     # this check, anyone who guessed an id could pull another account's
-    # fetched pages and indexed source code into their own prompt. A
-    # conversation with no row (a bare API call) has no owner to violate.
-    # If the DB is unreachable this raises; the stores it guards are read
-    # through the same connection, so they fail too and nothing can leak.
-    try:
-        conv_owner = await db.run_in_thread(db.conversation_owner, conv_key_outer)
-    except Exception:
-        conv_owner = None
-    viewer = int(signed_in["id"]) if signed_in is not None else None
-    if conv_owner is not None and conv_owner != viewer:
-        raise HTTPException(status_code=404, detail="conversation not found")
+    # fetched pages and indexed source code into their own prompt.
+    #
+    # FAIL CLOSED (was: fail open). The old `except: conv_owner = None`
+    # skipped the comparison when the ownership lookup itself failed — a
+    # database hiccup must surface as an error, never as access.
+    if request.conversation_id:
+        conv_owner = await db.run_in_thread(
+            db.conversation_owner, request.conversation_id
+        )
+        if conv_owner is None:
+            # First message of a NEW conversation: claim the id for this user
+            # before any side-table row is written under it, closing the
+            # pre-seeding hole (nobody else can later create-and-inherit it).
+            if not _CONVERSATION_ID_RE.match(request.conversation_id):
+                raise HTTPException(status_code=422, detail="invalid conversation id")
+            title = (request.text or "New chat").strip()[:80] or "New chat"
+            try:
+                await db.run_in_thread(
+                    db.create_conversation, viewer, request.conversation_id, title
+                )
+            except db.IntegrityError:
+                pass  # raced another request — the recheck below decides
+            conv_owner = await db.run_in_thread(
+                db.conversation_owner, request.conversation_id
+            )
+        if conv_owner != viewer:
+            raise HTTPException(status_code=404, detail="conversation not found")
 
     # A new send for a conversation that is still generating replaces the old
-    # generation — the user's newest message wins.
+    # generation — the user's newest message wins. Only the owner's newest
+    # message: replacement must never cancel someone else's work.
     previous = _live_generations.get(conv_key_outer)
-    if previous is not None and not previous.done and previous.task is not None:
+    if (
+        previous is not None
+        and not previous.done
+        and previous.task is not None
+        and previous.user_id == viewer
+    ):
         previous.task.cancel()
 
-    gen = LiveGeneration(
-        request.conversation_id,
-        int(signed_in["id"]) if signed_in is not None else None,
-    )
+    gen = LiveGeneration(request.conversation_id, viewer)
     _live_generations[conv_key_outer] = gen
 
     # Filled in by the compaction pass; rides out on the final meta so the
@@ -528,6 +620,21 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 **meta_extras(data.get("route")),
                 "generation_id": gen.generation_id,
             }
+            # Every file an engine writes into the shared reports dir is
+            # advertised on meta.report_files. Binding ownership HERE — the
+            # one choke point every engine's meta passes through — is what
+            # lets GET /reports/{filename} refuse everyone else.
+            for report_file in data.get("report_files") or ():
+                name = (report_file or {}).get("filename")
+                if name:
+                    from .authn import store as authn_store
+
+                    await db.run_in_thread(
+                        authn_store.bind_report,
+                        name,
+                        viewer,
+                        request.conversation_id,
+                    )
             # If anything had to be removed to fit the window, say so rather
             # than silently answering from a shortened prompt.
             trimmed = context.get_trim_notice()
@@ -554,8 +661,17 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
         nonlocal text
         # Per-request state: this task owns its own trim record.
         context.reset_trim_notice()
+        # Who the model is assisting — safe context for prompt builders
+        # (engines append identity.identity_line() to their system prompts).
+        from .identity import set_identity
+
+        set_identity(
+            str(signed_in.get("display_name") or signed_in.get("username") or ""),
+            str(signed_in.get("email") or ""),
+            str(signed_in.get("workspace_name") or ""),
+        )
         try:
-            history = request.history_messages or memory.history(request.session_id)
+            history = request.history_messages or memory.history(scoped_session)
             # Phase 1: decide whether to run web search (never for attachments).
             # AUTO-ORCHESTRATION (2026-07-28): with no Agent toggle in the UI,
             # one cheap non-thinking call decides whether this request deserves
@@ -602,7 +718,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             ):
                 from .engines.search import rate_ok, should_search
 
-                user_key = str(signed_in["id"]) if signed_in is not None else "anon"
+                user_key = str(viewer)
                 if not rate_ok(user_key):
                     await emit(
                         "status",
@@ -719,7 +835,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 if block:
                     history = [{"role": "system", "content": block}, *history]
 
-            conv_key = request.conversation_id or request.session_id
+            conv_key = request.conversation_id or scoped_session
 
             # Phase 3: GitHub repo analysis. A repo URL → clone/index/overview;
             # a follow-up when a repo is already indexed → code Q&A.
@@ -1273,7 +1389,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 )
                 answer = state.get("answer") or ""
             gen.answer = answer
-            memory.add_exchange(request.session_id, text, answer)
+            memory.add_exchange(scoped_session, text, answer)
             await gen.publish("done", {"session_id": request.session_id})
 
             # Background compaction: fold early so the next turn almost never
@@ -1330,11 +1446,12 @@ async def salesforce_context(
     Scoped to the conversation's owner, like /chat itself — a conversation whose
     id someone guessed must not disclose what it is asking about.
     """
-    viewer = await _viewer_id(http_request)
-    try:
-        owner = await db.run_in_thread(db.conversation_owner, conversation_id)
-    except Exception:
-        owner = None
+    viewer = await _require_viewer(http_request)
+    owner = await db.run_in_thread(db.conversation_owner, conversation_id)
+    # STRICT: an unowned id discloses nothing either. (A brand-new chat asks
+    # for starter options before its first message creates the row — that id
+    # has no state to leak, so it answers the same empty payload the owner
+    # would see.)
     if owner is not None and owner != viewer:
         raise HTTPException(status_code=404, detail="conversation not found")
 
@@ -1367,11 +1484,8 @@ async def salesforce_cancel(
     Salesforce turn in that chat would resume a question the user had visibly
     dismissed.
     """
-    viewer = await _viewer_id(http_request)
-    try:
-        owner = await db.run_in_thread(db.conversation_owner, body.conversation_id)
-    except Exception:
-        owner = None
+    viewer = await _require_viewer(http_request)
+    owner = await db.run_in_thread(db.conversation_owner, body.conversation_id)
     if owner is not None and owner != viewer:
         raise HTTPException(status_code=404, detail="conversation not found")
 
@@ -1399,6 +1513,15 @@ async def _viewer_id(http_request: Request) -> Optional[int]:
     return int(user["id"]) if user is not None else None
 
 
+async def _require_viewer(http_request: Request) -> int:
+    """The signed-in user's id, or 401. The generation-lifecycle and
+    Salesforce-state routes all carry user data; none serves anonymous."""
+    viewer = await _viewer_id(http_request)
+    if viewer is None:
+        raise HTTPException(status_code=401, detail="Sign in required.")
+    return viewer
+
+
 def _owns(gen: "LiveGeneration", viewer: Optional[int]) -> bool:
     """A generation is only visible to the identity that started it.
 
@@ -1414,10 +1537,14 @@ def _owns(gen: "LiveGeneration", viewer: Optional[int]) -> bool:
 async def chat_stop(body: StopRequest, http_request: Request) -> dict:
     """Cancel a running generation. Closing the SSE stream no longer stops
     the model (generations are detached), so the Stop button calls this."""
-    gen = _live_generations.get(body.conversation_id or body.session_id)
+    viewer = await _require_viewer(http_request)
+    # Bare-API generations register under the caller's user-scoped session
+    # key (see /chat), so stop looks them up the same way.
+    key = body.conversation_id or f"u{viewer}-{body.session_id}"
+    gen = _live_generations.get(key)
     if gen is None or gen.done or gen.task is None:
         return {"stopped": False}
-    if not _owns(gen, await _viewer_id(http_request)):
+    if not _owns(gen, viewer):
         return {"stopped": False}  # not yours — indistinguishable from absent
     gen.task.cancel()
     return {"stopped": True}
@@ -1428,7 +1555,7 @@ async def chat_active(http_request: Request) -> dict:
     """Conversation keys with a generation still running — the sidebar polls
     this to show a ChatGPT-style spinner next to busy chats. Scoped to the
     caller: another account's conversation ids are never disclosed."""
-    viewer = await _viewer_id(http_request)
+    viewer = await _require_viewer(http_request)
     return {
         "active": [
             k
@@ -1500,8 +1627,9 @@ async def chat_attach(
     """Re-join a running generation after a reload: replays every buffered
     event (so the partial answer rebuilds instantly) and then streams live.
     404 once it has finished — the answer is in history at that point."""
+    viewer = await _require_viewer(http_request)
     gen = _live_generations.get(conversation_id)
-    if gen is None or gen.done or not _owns(gen, await _viewer_id(http_request)):
+    if gen is None or gen.done or not _owns(gen, viewer):
         raise HTTPException(status_code=404, detail="no active generation")
     return StreamingResponse(
         gen.follow(),

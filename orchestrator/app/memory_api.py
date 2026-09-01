@@ -38,6 +38,13 @@ def list_facts(user: UserRow = Depends(require_user)) -> dict:
 @router.post("/facts")
 def add_facts(body: FactsIn, user: UserRow = Depends(require_user)) -> dict:
     user_id = int(user["id"])
+    # The provenance pointer must point at the CALLER's own conversation —
+    # accepting an arbitrary id would let a fact claim to originate from a
+    # chat its author cannot even read.
+    if body.source_conversation_id:
+        owner = db.conversation_owner(body.source_conversation_id)
+        if owner is None or owner != user_id:
+            body.source_conversation_id = None
     existing = {
         " ".join(f["fact"].lower().split()).rstrip(".")
         for f in db.list_user_facts(user_id, settings.memory_max_facts)
