@@ -38,6 +38,12 @@ export async function GET(
           : {},
       },
     );
+    if (upstream.status === 401) {
+      // Session death must be visible — an empty payload here would quietly
+      // strip the starter card from a signed-out tab instead of prompting a
+      // re-login through the app's 401 handling.
+      return Response.json({ message: 'Sign in required.' }, { status: 401 });
+    }
     if (!upstream.ok) return Response.json(EMPTY);
     return Response.json(await upstream.json());
   } catch {

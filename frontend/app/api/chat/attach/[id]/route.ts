@@ -58,9 +58,17 @@ export async function GET(
     );
   }
   if (!upstream.ok || !upstream.body) {
+    // 401 passes through untouched: a session that died mid-generation must
+    // reach the client as "sign in", never be disguised as "finished" (404)
+    // or "orchestrator down" (502).
+    const status =
+      upstream.status === 404 || upstream.status === 401 ? upstream.status : 502;
     return Response.json(
-      { message: 'no active generation' },
-      { status: upstream.status === 404 ? 404 : 502 },
+      {
+        message:
+          upstream.status === 401 ? 'Sign in required.' : 'no active generation',
+      },
+      { status },
     );
   }
   return new Response(upstream.body, { headers: SSE_HEADERS });
