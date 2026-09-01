@@ -197,13 +197,17 @@ def render() -> str:
         lines.append(f"# HELP {name} {_HELP.get(name, name)}")
         lines.append(f"# TYPE {name} histogram")
         for key, (counts, total, n) in sorted(series.items()):
-            cumulative = 0
+            # The le= label is built OUTSIDE the f-string. A backslash inside
+            # an f-string expression is only legal from Python 3.12 (PEP 701),
+            # and the containers run 3.11 — this file parsed fine on the dev
+            # box and on the 3.12 image, then failed to import in CI.
             for edge, c in zip(_BUCKETS, counts):
-                cumulative = c
+                edge_label = 'le="{}"'.format(edge)
                 lines.append(
-                    f'{name}_bucket{_fmt_labels(key, f"le=\"{edge}\"")} {cumulative}'
+                    "{}_bucket{} {}".format(name, _fmt_labels(key, edge_label), c)
                 )
-            lines.append(f'{name}_bucket{_fmt_labels(key, "le=\"+Inf\"")} {n}')
+            inf_label = 'le="+Inf"'
+            lines.append("{}_bucket{} {}".format(name, _fmt_labels(key, inf_label), n))
             lines.append(f"{name}_sum{_fmt_labels(key)} {total:g}")
             lines.append(f"{name}_count{_fmt_labels(key)} {n}")
 
