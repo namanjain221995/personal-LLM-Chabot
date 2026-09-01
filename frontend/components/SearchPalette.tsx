@@ -36,6 +36,7 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
 } from 'react';
 import { createPortal } from 'react-dom';
+import { focusableWithin, focusTrapNext } from '@/lib/focusTrap';
 import { searchConversations } from '@/lib/historyApi';
 import {
   buildPaletteModel,
@@ -47,16 +48,11 @@ import {
   rowSnippet,
   SEARCH_DEBOUNCE_MS,
   SEARCH_MAX_QUERY,
-  trapFocusIndex,
   type PaletteRow,
   type SearchResult,
 } from '@/lib/searchPalette';
 import type { ConversationSummary } from '@/lib/types';
 import { IconMessage, IconPin, IconPlus, IconSearch, IconX } from './icons';
-
-/** Elements Tab may land on inside the modal. */
-const FOCUSABLE =
-  'a[href],button:not([disabled]),input:not([disabled]),textarea:not([disabled]),select:not([disabled]),[tabindex]:not([tabindex="-1"])';
 
 type SearchStatus = 'idle' | 'loading' | 'error';
 
@@ -246,13 +242,10 @@ export function SearchPalette({
   /* ---------------------------------------------------------- keyboard */
 
   function trapTab(e: ReactKeyboardEvent<HTMLDivElement>) {
-    const panel = panelRef.current;
-    if (!panel) return;
-    const nodes = Array.from(panel.querySelectorAll<HTMLElement>(FOCUSABLE));
+    const nodes = focusableWithin(panelRef.current);
     if (nodes.length === 0) return;
     e.preventDefault();
-    const current = nodes.indexOf(document.activeElement as HTMLElement);
-    nodes[trapFocusIndex(current, nodes.length, e.shiftKey)]?.focus({
+    focusTrapNext(nodes, document.activeElement, e.shiftKey)?.focus({
       preventScroll: true,
     });
   }

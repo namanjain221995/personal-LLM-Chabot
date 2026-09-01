@@ -12,10 +12,33 @@
  * V4 §2 replaced the inline filter box with the search ICON below: filtering
  * only ever matched titles in the already-loaded list, while the palette it
  * opens searches message content server-side too.
+ *
+ * THE PANEL IS RENDERED TWICE — once as the desktop column, once inside the
+ * mobile drawer — and CSS picks which one is visible. Three consequences that
+ * the code below is shaped around:
+ *
+ * 1. Every id must be scoped per copy, or `sidebar-pinned` and friends appear
+ *    twice and `aria-labelledby` / `aria-controls` resolve to whichever the
+ *    document happens to hold first (M-12). `panel()` takes the scope and
+ *    builds every id from one `useId()`.
+ * 2. The collapsed desktop column is `w-0`, not unmounted, so its controls
+ *    stayed in the tab order behind a zero-width edge — and `aria-hidden`
+ *    over focusable content is itself invalid. `inert` closes both (L-02).
+ * 3. The drawer is a modal overlay and now says so: dialog semantics, initial
+ *    focus, a Tab trap, Escape, and focus restored to the toggle (L-03).
  */
 
-import { useRef, useState } from 'react';
+import {
+  useEffect,
+  useId,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type RefObject,
+} from 'react';
 import { conversationMenuHandlers } from '@/lib/conversationMenu';
+import { focusableWithin, focusTrapNext } from '@/lib/focusTrap';
+import { NEW_CHAT_SHORTCUT_LABEL } from '@/lib/searchPalette';
 import type { ConversationSummary } from '@/lib/types';
 import { AccountMenu } from './AccountMenu';
 import { ConversationMenu } from './ConversationMenu';
@@ -53,6 +76,17 @@ interface SidebarProps {
   onExport: (id: string) => void;
   /** First expand of the Archived disclosure (lazy `?archived=true` pull). */
   onLoadArchived: () => void;
+  /**
+   * The control that opens the sidebar (ChatApp's header toggle). Closing the
+   * mobile drawer hands focus back to it (L-03).
+   *
+   * It has to arrive as a ref rather than be read from `document.activeElement`
+   * when the drawer opens: the toggle only renders while the sidebar is
+   * CLOSED, so by the time the drawer has mounted the opener is already gone
+   * and the active element is <body>. The ref re-populates when the toggle
+   * comes back, which is the same commit the drawer unmounts in.
+   */
+  restoreFocusRef?: RefObject<HTMLElement | null>;
 }
 
 export function Sidebar({
@@ -71,12 +105,80 @@ export function Sidebar({
   onSetArchived,
   onExport,
   onLoadArchived,
+  restoreFocusRef,
 }: SidebarProps) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draftTitle, setDraftTitle] = useState('');
   const [archivedOpen, setArchivedOpen] = useState(false);
   const archivedLoaded = useRef(false);
   const { theme, toggleTheme } = useTheme();
+
+  /** One generated prefix for both copies; `panel()` scopes it per copy. */
+  const baseId = useId();
+
+  const drawerRef = useRef<HTMLElement>(null);
+  /** Whatever had focus when the drawer opened — the fallback restore target. */
+  const openerRef = useRef<HTMLElement | null>(null);
+  /**
+   * Did focus ever actually land inside the drawer?
+   *
+   * This is what keeps the desktop untouched without asking the viewport any
+   * questions. The drawer's JSX is mounted at every width — `md:hidden` only
+   * hides it — so on desktop the `focus()` below lands on a `display:none`
+   * subtree and does nothing, React's onFocus never fires, and this stays
+   * false, which means collapsing the desktop column restores nothing and
+   * leaves the caret exactly where the user left it.
+   */
+  const drawerOwnedFocus = useRef(false);
+
+  useEffect(() => {
+    if (!open) return;
+    openerRef.current = document.activeElement as HTMLElement | null;
+    drawerOwnedFocus.current = false;
+    // preventScroll for the same reason the palette does it: focusing inside a
+    // fixed overlay otherwise makes the browser scroll the thread behind it.
+    drawerRef.current?.focus({ preventScroll: true });
+    return () => {
+      if (drawerOwnedFocus.current) {
+        // Reading the ref LATE is the whole point here. react-hooks would have
+        // us copy `.current` into a variable while the effect runs, but that
+        // captures null: the toggle does not exist while the drawer is open,
+        // and React re-mounts it and re-attaches this ref in the very commit
+        // whose passive cleanup this is. See the prop's doc comment above.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+        const target = restoreFocusRef?.current ?? openerRef.current;
+        if (target?.isConnected) target.focus({ preventScroll: true });
+      }
+      drawerOwnedFocus.current = false;
+    };
+  }, [open, restoreFocusRef]);
+
+  function onDrawerKeyDown(e: ReactKeyboardEvent<HTMLElement>) {
+    const drawer = drawerRef.current;
+    if (!drawer) return;
+    // A row's "⋯" menu portals its popup to <body>, and a React portal still
+    // bubbles through the REACT tree — so its keystrokes arrive here. Escape
+    // and Tab belong to the innermost layer that is open, so anything whose
+    // real DOM home is outside the drawer is left to the layer that owns it.
+    if (!drawer.contains(e.target as Node)) return;
+
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      // The window-level map must not ALSO see this Escape: behind the drawer
+      // it would read as "stop the generation".
+      e.stopPropagation();
+      onClose();
+      return;
+    }
+
+    if (e.key !== 'Tab') return;
+    const nodes = focusableWithin(drawer);
+    if (nodes.length === 0) return;
+    e.preventDefault();
+    focusTrapNext(nodes, document.activeElement, e.shiftKey)?.focus({
+      preventScroll: true,
+    });
+  }
 
   const pinned = conversations.filter((c) => c.pinned);
   const recents = conversations.filter((c) => !c.pinned);
@@ -175,7 +277,15 @@ export function Sidebar({
     );
   }
 
-  const body = (
+  /**
+   * One copy of the panel. `scope` distinguishes the desktop column from the
+   * drawer so the two mounted copies never share an id (M-12) — every id and
+   * every reference to it below is built from `id()`, so they cannot drift.
+   */
+  function panel(scope: 'desktop' | 'mobile') {
+    const id = (name: string) => `${baseId}${scope}-${name}`;
+
+    return (
     <div className="flex h-full w-sidebar flex-col bg-sidebar">
       <div className="flex items-center gap-2 px-3 pb-2 pt-3">
         <TechSaraMark size={28} />
@@ -221,7 +331,7 @@ export function Sidebar({
           <IconPlus size={15} className="text-accent" />
           New chat
           <kbd className="ml-auto rounded border border-border px-1.5 py-px font-mono text-[10px] text-faint">
-            Ctrl ⇧ O
+            {NEW_CHAT_SHORTCUT_LABEL}
           </kbd>
         </button>
       </div>
@@ -239,9 +349,9 @@ export function Sidebar({
         )}
 
         {pinned.length > 0 && (
-          <section aria-labelledby="sidebar-pinned">
+          <section aria-labelledby={id('pinned')}>
             <h2
-              id="sidebar-pinned"
+              id={id('pinned')}
               className="px-2.5 pb-1 pt-1.5 text-[11px] font-medium uppercase tracking-wide text-faint"
             >
               Pinned
@@ -251,10 +361,10 @@ export function Sidebar({
         )}
 
         {recents.length > 0 && (
-          <section aria-labelledby="sidebar-recents">
+          <section aria-labelledby={pinned.length > 0 ? id('recents') : undefined}>
             {pinned.length > 0 && (
               <h2
-                id="sidebar-recents"
+                id={id('recents')}
                 className="px-2.5 pb-1 pt-3 text-[11px] font-medium uppercase tracking-wide text-faint"
               >
                 Recents
@@ -271,7 +381,7 @@ export function Sidebar({
                 type="button"
                 onClick={toggleArchived}
                 aria-expanded={archivedOpen}
-                aria-controls="sidebar-archived-list"
+                aria-controls={id('archived-list')}
                 className="flex w-full items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-left text-xs text-icon transition-colors duration-ts hover:bg-surface-2/60 hover:text-ink"
               >
                 <IconChevronRight
@@ -285,7 +395,7 @@ export function Sidebar({
               </button>
             </h2>
             <ul
-              id="sidebar-archived-list"
+              id={id('archived-list')}
               hidden={!archivedOpen}
               className="mt-0.5 space-y-0.5"
             >
@@ -311,7 +421,8 @@ export function Sidebar({
         <AccountMenu />
       </div>
     </div>
-  );
+    );
+  }
 
   return (
     <>
@@ -322,24 +433,50 @@ export function Sidebar({
         }`}
         aria-label="Sidebar"
         aria-hidden={!open}
+        // L-02. The column collapses to w-0 rather than unmounting — that is
+        // what animates the width — so every control inside it stayed a tab
+        // stop behind a zero-width edge, and `aria-hidden` wrapped around
+        // focusable content is an invalid combination in its own right.
+        // `inert` is the container-level answer to both: it drops the whole
+        // subtree from the tab order AND from the accessibility tree, with no
+        // per-control tabIndex bookkeeping to keep in sync, and it costs
+        // nothing visually.
+        inert={!open}
       >
-        {body}
+        {panel('desktop')}
       </aside>
 
-      {/* Mobile: slide-over drawer */}
+      {/* Mobile: slide-over drawer — a modal overlay, and now says so (L-03) */}
       {open && (
         <div className="fixed inset-0 z-50 md:hidden">
+          {/* Click-outside-to-close. It is deliberately NOT a tab stop: a
+              full-screen button ahead of the panel is a phantom stop for
+              keyboard users, and the panel's own "Close sidebar" ✕ already
+              provides that action to them. */}
           <button
             type="button"
-            aria-label="Close sidebar"
+            aria-hidden
+            tabIndex={-1}
             onClick={onClose}
             className="absolute inset-0 h-full w-full bg-black/50"
           />
           <aside
+            ref={drawerRef}
+            role="dialog"
+            aria-modal="true"
             aria-label="Sidebar"
-            className="absolute inset-y-0 left-0 border-r border-border shadow-2xl"
+            // Programmatically focusable so opening the drawer can move focus
+            // into it and announce the dialog; -1 keeps it out of the Tab
+            // cycle, and the ring is suppressed because this is never a stop
+            // the user chose to land on.
+            tabIndex={-1}
+            onFocus={() => {
+              drawerOwnedFocus.current = true;
+            }}
+            onKeyDown={onDrawerKeyDown}
+            className="absolute inset-y-0 left-0 border-r border-border shadow-2xl focus:outline-none"
           >
-            {body}
+            {panel('mobile')}
           </aside>
         </div>
       )}
