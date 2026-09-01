@@ -107,7 +107,24 @@
   --ts-sql-com: #7e8da3;
 }
 
-html.light {
+/* `.auth-light` carries the SAME token overrides as light mode so the sign-in
+   pages are white for everyone — the illustrations are drawn on white and the
+   owner asked for a light sign-in regardless of the app theme. Scoping the
+   variables (rather than hard-coding hexes in the auth components) keeps those
+   pages inside the design system: every class there is still bg-bg / text-ink /
+   accent, it just resolves to the paper palette. */
+/* The auth pages are white, so the PAGE behind them must be too. The wrapper
+   is min-h-dvh, but a viewport unit that resolves short (or content that does
+   not reach the fold) would otherwise leave a band of the dark app background
+   under a white sign-in page — which is exactly what it looked like. */
+html:has(.auth-light),
+body:has(.auth-light) {
+  background: #ffffff;
+}
+
+
+html.light,
+.auth-light {
   --ts-bg: #ffffff;
   --ts-sidebar: #f9f9f9;
   --ts-bubble: #f0f0f0;
@@ -151,6 +168,22 @@ html.light {
   --ts-sql-num: #8a5a14;
   --ts-sql-com: #5b6b7f;
 }
+/* Sign-in pages wear the LOGO's colour, not the product accent.
+   public/techsara-mark.png is deep indigo #1a2480 (sampled: hue 235deg,
+   sat .80); the app's Signal Teal is the in-product accent and stays exactly
+   as it is everywhere else. Overriding the accent tokens for this subtree
+   means the button, the checkbox, the field focus ring and the focus outlines
+   all follow the mark without a single component knowing about it.
+
+   Contrast: white on #1a2480 is 13.06:1 (AAA), and #1a2480 on white is the
+   same, so the tone is safe for both the filled button and text/borders. */
+.auth-light {
+  --ts-accent: #1a2480;
+  --ts-accent-rgb: 26 36 128; /* channels of --ts-accent — keep in sync */
+  --ts-accent-strong: #1a2480;
+  --ts-accent-soft: rgba(26, 36, 128, 0.1);
+}
+
 
 /* ------------------------------------------------------------------ base */
 
@@ -725,4 +758,130 @@ a {
 
 .hljs-strong {
   font-weight: 600;
+}
+
+/* ------------------------------------------------ auth pages (retrofit)
+
+   /login and /accept-invite. The page is WHITE in both themes (`.auth-light`
+   near the top of this file re-declares the light tokens for that subtree),
+   because the workspace illustrations in public/illustrator/ are drawn on
+   white — a dark page framed them in a black box.
+
+   The brand column is a tinted card carrying one illustration, chosen at
+   random per page load and then cross-faded on a slow timer. Only opacity and
+   transform animate; the reduced-motion block at the end of this section
+   leaves a still, fully legible panel.                                      */
+
+/* Form-column entrance — the palette-panel gesture at drawer tempo. */
+@keyframes ts-auth-card-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.auth-card-in {
+  animation: ts-auth-card-in 240ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+/* The tinted card. Its gradient is set inline per illustration (sampled from
+   each drawing), so only the shape and the wash sitting over it live here. */
+.auth-illustration-card {
+  transition: background 700ms ease;
+}
+
+.auth-illustration-card::after {
+  /* A faint light source top-left, so the flat tint reads as a surface. */
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: radial-gradient(
+    90% 70% at 22% 12%,
+    rgba(255, 255, 255, 0.55),
+    transparent 62%
+  );
+}
+
+/* Every illustration is mounted; exactly one is visible. Stacking them means
+   a switch never reflows the column and the next image is already decoded. */
+.auth-illustration {
+  position: absolute;
+  opacity: 0;
+  transform: scale(0.985);
+  transition:
+    opacity 700ms ease,
+    transform 700ms ease;
+  pointer-events: none;
+}
+
+.auth-illustration.is-current {
+  position: relative;
+  opacity: 1;
+  transform: scale(1);
+}
+
+/* The caption is keyed on its illustration, so React remounts the node on a
+   swap and this entrance replays. It is NOT opacity-gated on mount: the copy
+   must be readable whether or not the client script ever runs. */
+@keyframes ts-auth-copy-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.auth-illustration-copy {
+  animation: ts-auth-copy-in 460ms ease both;
+}
+
+.auth-dot {
+  height: 7px;
+  width: 7px;
+  border-radius: 999px;
+  background: rgba(18, 33, 46, 0.22);
+  transition:
+    width 260ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    background-color 260ms ease;
+}
+
+.auth-dot:hover {
+  background: rgba(18, 33, 46, 0.4);
+}
+
+.auth-dot.is-current {
+  width: 22px;
+  background: rgba(18, 33, 46, 0.62);
+}
+
+.auth-dot:focus-visible {
+  outline: 2px solid rgba(18, 33, 46, 0.55);
+  outline-offset: 3px;
+}
+
+/* Reduced motion: the panel becomes a still picture. The random choice is
+   kept (it is not motion), the timer never starts (IllustrationPanel checks
+   the same query), and nothing cross-fades or slides. */
+@media (prefers-reduced-motion: reduce) {
+  .auth-card-in,
+  .auth-illustration-card,
+  .auth-illustration,
+  .auth-illustration-copy,
+  .auth-dot {
+    animation: none;
+    transition: none;
+  }
+
+  .auth-illustration-copy {
+    opacity: 1;
+    transform: none;
+  }
 }
