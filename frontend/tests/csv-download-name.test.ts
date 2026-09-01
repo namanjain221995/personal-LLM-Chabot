@@ -51,7 +51,7 @@ describe('csvFilenameFor', () => {
   });
 
   it('falls back to the route, then to the old name, rather than throwing', () => {
-    expect(csvFilenameFor({ route: 'web' } as Meta)).toMatch(/^web-/);
+    expect(csvFilenameFor({ route: 'search' } as Meta)).toMatch(/^search-/);
     expect(csvFilenameFor({} as Meta)).toMatch(/^techsara-data-/);
   });
 
