@@ -349,13 +349,17 @@ the overlay ships:
   in 2 ms for the whole outage while every completion hung and spark-1 sat
   pinned at 96 % GPU doing nothing. The worker restarted itself and retried
   the rendezvous in a loop, timing out against the hung head every cycle.
-  The `vllm-watchdog` service exists for exactly this: it probes with a real
-  2-token completion every 60 s, and only the hung signature — `/v1/models`
-  answers, generation does not, twice in a row — restarts the head. The
-  freshly restarted head then pairs with the already-retrying worker with no
-  operator action. While a model is loading, `/v1/models` refuses
-  connections, so the watchdog counts nothing and cannot restart-loop a
-  starting engine.
+  The `vllm-watchdog` service exists for exactly this: a real 2-token
+  completion every 60 s. Its rules were bought with live outages — the first
+  two versions of the watchdog restarted a healthy warming engine three
+  times in one night, because vLLM answers `/v1/models` minutes before it
+  can generate and fast HTTP errors were being counted as hangs. Hence:
+  it **arms only after one completion has succeeded** since the API last
+  came up (readiness is demonstrated, never inferred), **only timeouts
+  count** (fast errors belong to the container healthcheck, which kills on
+  5xx), and **at most one restart per 45 minutes** — a second trigger stands
+  down loudly rather than loop. A restarted head then pairs with the
+  already-retrying worker unaided.
 * Reboot of either Spark: every container involved is `restart:
   unless-stopped`, the worker retries the rendezvous in a loop, a rebooted
   head waits for a worker, and the watchdog clears the one state that cannot

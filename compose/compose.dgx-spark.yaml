@@ -84,16 +84,30 @@ services:
   # request hangs. Found live 2026-09-01: spark-1 pinned at 96%, spark-2 at
   # 0%, RoCE at 0 B/s, generations timing out, health green.
   #
-  # So the probe is FUNCTIONAL: a 2-token completion. The hung state has a
-  # precise signature -- /v1/models answers but generation does not -- and
-  # only on that signature, twice in a row, is the head restarted. The worker
-  # needs no watchdog of its own: it already exits and retries the rendezvous
-  # in a loop, so a freshly restarted head pairs with it within minutes. That
-  # same dance covers a reboot of either Spark end to end.
+  # So the probe is FUNCTIONAL: a 2-token completion. Three rules, each paid
+  # for the same night with a live outage caused by the versions without it:
   #
-  # While the model is LOADING, /v1/models refuses connections, so the
-  # watchdog counts nothing and cannot restart-loop a starting engine; after
-  # a restart it also sleeps out the load time explicitly.
+  #   ARM ONLY AFTER PROOF. Nothing counts until one completion has
+  #   SUCCEEDED since the API last came up. "Ready" is demonstrated, not
+  #   inferred -- and a probe that is itself broken (as the first one was,
+  #   see the extraction note below: every probe 404'd) can then never fire
+  #   at all: it never proves anything, so it never arms, so it never
+  #   restarts. The three restarts of a healthy engine on 2026-09-01
+  #   (21:06, 21:22, 21:35) are what this rule buys.
+  #
+  #   ONLY TIMEOUTS COUNT. A fast HTTP error is an error, not a hang -- the
+  #   container healthcheck below already kills the process on 5xx, and
+  #   counting fast failures is how a loading engine got shot at 60-second
+  #   intervals. The watchdog's whole mandate is one signature: a PROVEN
+  #   engine whose generations stop returning.
+  #
+  #   NEVER LOOP. At most one restart per 45 minutes; a second trigger
+  #   stands down loudly instead. Even a detection bug can now cost at most
+  #   one reload per window, not an evening.
+  #
+  # The worker needs no watchdog of its own: it exits and retries the
+  # rendezvous in a loop, so a freshly restarted head pairs with it within
+  # minutes. That same dance covers a reboot of either Spark end to end.
   #
   # The Docker socket is mounted WRITABLE, which is root-equivalent on this
   # host -- it is the price of being able to restart the engine, it is the
@@ -110,37 +124,47 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
-        echo "[watchdog] probing 127.0.0.1:$${WATCHDOG_PORT} every 60s; two hung generations restart $${WATCHDOG_TARGET}"
+        echo "[watchdog] guarding $${WATCHDOG_TARGET}: arms only after a PROVEN completion, only timeouts count, max one restart per 45 min"
+        ARMED=0
         FAILS=0
-        READY_AT=0
+        LAST_RESTART=0
         while true; do
           sleep 60
-          models="$$(wget -q -O- -T 5 "http://127.0.0.1:$${WATCHDOG_PORT}/v1/models" 2>/dev/null)" || { FAILS=0; READY_AT=0; continue; }
-          # WARM-UP GRACE. /v1/models starts answering a few minutes before
-          # the engine can actually generate (torch.compile is still running),
-          # and a probe in that window times out against a perfectly healthy
-          # engine -- observed on the first bring-up: "hung (1/2)" with no
-          # hang. One more would have restarted a warming engine and could
-          # have looped it. So the clock starts when /v1/models FIRST answers
-          # and no probe counts for the next 300s.
-          NOW="$$(date +%s)"
-          if [ "$$READY_AT" = 0 ]; then READY_AT="$$NOW"; fi
-          if [ "$$((NOW - READY_AT))" -lt 300 ]; then continue; fi
-          model="$$(printf %s "$$models" | sed -n 's/.*"id": *"\([^"]*\)".*/\1/p' | head -1)"
-          [ -z "$$model" ] && { FAILS=0; continue; }
+          models="$$(wget -q -O- -T 5 "http://127.0.0.1:$${WATCHDOG_PORT}/v1/models" 2>/dev/null)" || { ARMED=0; FAILS=0; continue; }
+          # FIRST id, not last: sed's greedy .* here once matched the LAST
+          # "id" in the payload -- a modelperm-* permission id -- so every
+          # probe POSTed a nonexistent model, 404'd in 0s, and the counting
+          # logic turned a broken probe into three restarts of a perfectly
+          # healthy engine (2026-09-01, the whole evening). grep -o takes
+          # matches in order; head -1 is the model.
+          model="$$(printf %s "$$models" | grep -oE '"id": ?"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"$$/\1/')"
+          [ -z "$$model" ] && continue
           body="{\"model\":\"$$model\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":2,\"temperature\":0,\"chat_template_kwargs\":{\"enable_thinking\":false}}"
+          T0="$$(date +%s)"
           if wget -q -O /dev/null -T 120 --header 'Content-Type: application/json' --post-data "$$body" "http://127.0.0.1:$${WATCHDOG_PORT}/v1/chat/completions" 2>/dev/null; then
-            FAILS=0
-          else
-            FAILS=$$((FAILS+1))
-            echo "[watchdog] generation probe hung ($$FAILS/2) while /v1/models answers"
-            if [ "$$FAILS" -ge 2 ]; then
-              echo "[watchdog] engine is hung -- restarting $${WATCHDOG_TARGET}"
-              docker restart -t 30 "$${WATCHDOG_TARGET}" || echo "[watchdog] restart FAILED"
-              FAILS=0
-              echo "[watchdog] sleeping 600s for the model to load"
-              sleep 600
+            [ "$$ARMED" = 0 ] && echo "[watchdog] engine PROVEN ready - armed"
+            ARMED=1; FAILS=0; continue
+          fi
+          EL="$$(( $$(date +%s) - T0 ))"
+          if [ "$$ARMED" = 0 ]; then
+            echo "[watchdog] probe failed while unarmed ($${EL}s) - engine still warming; not counted"
+            continue
+          fi
+          if [ "$$EL" -lt 100 ]; then
+            echo "[watchdog] fast HTTP error ($${EL}s) - an error, not a hang; not counted (the container healthcheck owns 5xx)"
+            continue
+          fi
+          FAILS="$$((FAILS+1))"
+          echo "[watchdog] generation TIMED OUT ($${EL}s) on a proven-ready engine ($$FAILS/2)"
+          if [ "$$FAILS" -ge 2 ]; then
+            NOW="$$(date +%s)"
+            if [ "$$((NOW - LAST_RESTART))" -lt 2700 ]; then
+              echo "[watchdog] STANDING DOWN: already restarted within 45 min - refusing to loop; needs a human"
+              ARMED=0; FAILS=0; continue
             fi
+            echo "[watchdog] hung engine: restarting $${WATCHDOG_TARGET}"
+            docker restart -t 30 "$${WATCHDOG_TARGET}" || echo "[watchdog] restart FAILED"
+            LAST_RESTART="$$NOW"; ARMED=0; FAILS=0
           fi
         done
     logging: *model-logging
