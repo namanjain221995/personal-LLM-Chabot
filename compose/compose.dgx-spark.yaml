@@ -112,9 +112,20 @@ services:
       - |
         echo "[watchdog] probing 127.0.0.1:$${WATCHDOG_PORT} every 60s; two hung generations restart $${WATCHDOG_TARGET}"
         FAILS=0
+        READY_AT=0
         while true; do
           sleep 60
-          models="$$(wget -q -O- -T 5 "http://127.0.0.1:$${WATCHDOG_PORT}/v1/models" 2>/dev/null)" || { FAILS=0; continue; }
+          models="$$(wget -q -O- -T 5 "http://127.0.0.1:$${WATCHDOG_PORT}/v1/models" 2>/dev/null)" || { FAILS=0; READY_AT=0; continue; }
+          # WARM-UP GRACE. /v1/models starts answering a few minutes before
+          # the engine can actually generate (torch.compile is still running),
+          # and a probe in that window times out against a perfectly healthy
+          # engine -- observed on the first bring-up: "hung (1/2)" with no
+          # hang. One more would have restarted a warming engine and could
+          # have looped it. So the clock starts when /v1/models FIRST answers
+          # and no probe counts for the next 300s.
+          NOW="$$(date +%s)"
+          if [ "$$READY_AT" = 0 ]; then READY_AT="$$NOW"; fi
+          if [ "$$((NOW - READY_AT))" -lt 300 ]; then continue; fi
           model="$$(printf %s "$$models" | sed -n 's/.*"id": *"\([^"]*\)".*/\1/p' | head -1)"
           [ -z "$$model" ] && { FAILS=0; continue; }
           body="{\"model\":\"$$model\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":2,\"temperature\":0,\"chat_template_kwargs\":{\"enable_thinking\":false}}"
