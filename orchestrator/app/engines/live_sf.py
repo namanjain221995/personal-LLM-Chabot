@@ -106,14 +106,21 @@ async def write_soql(
     # Imported inside the function because engines.sql imports THIS module for
     # the live fallback, and off the event loop because the lookup is a
     # synchronous DuckDB query (~25 ms on the fuzzy path).
+    found: List[dict] = []
     try:
-        from .sql import who_these_people_are
+        from .sql import resolve_people, who_these_people_are
 
-        people = await asyncio.to_thread(who_these_people_are, question, "soql")
+        found = await asyncio.to_thread(resolve_people, question)
+        people = who_these_people_are(question, "soql", found) if found else ""
     except Exception:  # noqa: BLE001 — grounding is an optimisation, never fatal
-        people = ""
+        found, people = [], ""
     if people:
         grounding = f"{grounding}\n\n{people}"
+    # The real fields of whatever object the person lives on. Without this the
+    # model wrote SOQL against a 278-field object knowing only its NAME.
+    schema = await _fields_and_relationships([p.get("object", "") for p in found])
+    if schema:
+        grounding = f"{grounding}\n\n{schema}"
     user = f"{grounding}\n\n{context}Question: {question}"
     if correction:
         user += f"\n\n{correction}"
@@ -155,6 +162,63 @@ def is_schema_question(text: str) -> bool:
     """
     t = text or ""
     return bool(_SCHEMA_RE.search(t) and _COUNT_OR_LIST_RE.search(t))
+
+
+#: Objects described for one question. Each describe is a few thousand
+#: characters of field names; two covers "this person is an Account and a
+#: Contact" without turning the prompt into a schema dump.
+_MAX_DESCRIBED_OBJECTS = 2
+
+
+async def _fields_and_relationships(objects: Sequence[str]) -> str:
+    """The REAL fields and __r traversals for the objects a question is about.
+
+    Without this the live path wrote SOQL essentially blind. Asked for
+    everything about a candidate it selected Marketing__r.Name and
+    Candidate_Training__r.Name -- neither field exists on Account -- and
+    treated Salary__c, a percent, as a lookup. Salesforce rejected the whole
+    query with "Didn't understand relationship 'Marketing__r'".
+
+    The field dictionary cannot cover this case: it returned NOTHING at all for
+    the reported question, leaving `_object_hint()`'s bare list of object names
+    as the only grounding. A describe always answers, and it is the one source
+    that knows whether a relationship is real or merely plausible -- `X__c` is
+    NOT automatically a lookup, which is the specific mistake made here.
+    """
+    from ..core import salesforce as sf
+
+    seen: List[str] = []
+    for name in objects:
+        if name and name not in seen:
+            seen.append(name)
+
+    blocks: List[str] = []
+    for name in seen[:_MAX_DESCRIBED_OBJECTS]:
+        try:
+            described = await sf.describe_object(name)
+        except Exception:  # noqa: BLE001 — grounding is never fatal
+            continue
+        fields = described.get("fields", [])
+        if not fields:
+            continue
+        real = described.get("name", name)
+        block = (
+            f"{real} has EXACTLY these {len(fields)} fields. Every field you "
+            f"select or filter on MUST appear in this list:\n"
+            + ", ".join(f["name"] for f in fields)
+        )
+        rels = [f["relationshipName"] for f in fields if f.get("relationshipName")]
+        if rels:
+            block += (
+                f"\n\nThe ONLY valid relationship traversals on {real} are: "
+                + ", ".join(sorted(rels))
+                + ". Any other `X__r` does not exist and Salesforce rejects the "
+                "entire query. A field name ending in __c is NOT automatically "
+                "a lookup — most are plain values, so select the field itself "
+                "unless its relationship name is listed here."
+            )
+        blocks.append(block)
+    return "\n\n".join(blocks)
 
 
 #: "how many objects", "which objects", "list all objects/tables/entities" —
@@ -205,37 +269,90 @@ async def fetch_schema(question: str) -> Tuple[str, str]:
 #: "No such column 'Status__c' on entity 'Interview__c'".
 _NO_COLUMN_RE = re.compile(r"No such column '([^']+)' on entity '([^']+)'")
 
+#: "Didn't understand relationship 'Marketing__r' in field path ..." — the
+#: model invented a traversal. Salesforce names the bad relationship but NOT
+#: the object it was on, so the repair reads that out of the query itself.
+_NO_RELATIONSHIP_RE = re.compile(r"[Dd]idn't understand relationship '([^']+)'")
+
+
+def _from_object(soql: str) -> str:
+    """The object the OUTER query selects from.
+
+    A child subquery carries its own FROM -- `(SELECT Id FROM Contacts)` --
+    so parenthesised groups are removed first, innermost outwards, since they
+    nest. Returns "" when no object can be read, which the caller treats as
+    "cannot repair" rather than guessing.
+    """
+    flat = soql or ""
+    for _ in range(5):
+        flat, n = re.subn(r"\([^()]*\)", " ", flat)
+        if not n:
+            break
+    match = re.search(r"\bFROM\s+([A-Za-z][A-Za-z0-9_]*)", flat, re.I)
+    return match.group(1) if match else ""
+
+
+async def _repair_hint(soql: str, exc: Exception) -> str:
+    """A correction prompt for the mistakes Salesforce reports precisely.
+
+    Returns "" when the error is not one we can ground a retry on -- a wrong
+    VALUE, a permissions problem or a timeout are not fixed by re-prompting,
+    and a blind retry burns a minute of model time to fail the same way.
+    """
+    text = str(exc)
+    head = (
+        f"Your previous query failed.\nPrevious SOQL:\n{soql}\n"
+        f"Salesforce error:\n{text}\n\n"
+    )
+
+    match = _NO_COLUMN_RE.search(text)
+    if match:
+        entity = match.group(2)
+        described = await salesforce.describe_object(entity)
+        real = ", ".join(f["name"] for f in described.get("fields", []))
+        return head + (
+            f"{entity} has ONLY these fields:\n{real}\n\n"
+            "Write a corrected query using exactly these field names."
+        )
+
+    match = _NO_RELATIONSHIP_RE.search(text)
+    if match:
+        entity = _from_object(soql)
+        if not entity:
+            return ""
+        described = await salesforce.describe_object(entity)
+        fields = described.get("fields", [])
+        rels = sorted(f["relationshipName"] for f in fields if f.get("relationshipName"))
+        real = ", ".join(f["name"] for f in fields)
+        return head + (
+            f"'{match.group(1)}' is not a relationship on {entity}. The ONLY "
+            f"valid traversals are: {', '.join(rels)}.\n\n"
+            f"{entity}'s real fields are:\n{real}\n\n"
+            "A field ending in __c is usually a plain value, not a lookup — "
+            "select the field itself unless its relationship name is listed "
+            "above."
+        )
+    return ""
+
 
 async def fetch_live(
     question: str, history: Sequence[dict] = ()
 ) -> Tuple[str, List[Dict[str, Any]]]:
     """Question → SOQL → live rows. Raises SalesforceUnavailable/UnsafeSoql.
 
-    One self-repair pass on a wrong FIELD name: Salesforce's error names the
-    entity, so describe it and re-prompt with the REAL field list. A guessed
-    field that happens to exist elsewhere would silently return nothing —
-    this only saves the case where Salesforce itself catches the guess.
+    One self-repair pass on a wrong FIELD NAME or an invented RELATIONSHIP:
+    Salesforce catches both, so describe the object and re-prompt with the
+    real names. A guessed field that happens to exist elsewhere would silently
+    return nothing — this only saves the case Salesforce itself rejects.
     """
     soql = await write_soql(question, history)
     try:
         return await salesforce.run_soql(soql)
     except salesforce.SalesforceUnavailable as exc:
-        match = _NO_COLUMN_RE.search(str(exc))
-        if not match:
+        correction = await _repair_hint(soql, exc)
+        if not correction:
             raise
-        entity = match.group(2)
-        described = await salesforce.describe_object(entity)
-        real = ", ".join(f["name"] for f in described.get("fields", []))
-        retry = await write_soql(
-            question,
-            history,
-            correction=(
-                f"Your previous query failed.\nPrevious SOQL:\n{soql}\n"
-                f"Salesforce error:\n{exc}\n\n"
-                f"{entity} has ONLY these fields:\n{real}\n\n"
-                "Write a corrected query using exactly these field names."
-            ),
-        )
+        retry = await write_soql(question, history, correction=correction)
         return await salesforce.run_soql(retry)
 
 

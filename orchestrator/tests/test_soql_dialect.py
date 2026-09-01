@@ -145,21 +145,38 @@ def test_the_soql_brief_says_like_is_already_case_insensitive():
 # ── Person grounding on the live path ──────────────────────────────────────
 
 
-class _Resolved:
-    """`who_these_people_are` with the warehouse stubbed out."""
-
-    def __init__(self):
-        self.asked_with = None
-
-    def __call__(self, question, dialect="sql"):
-        self.asked_with = (question, dialect)
-        return "STORED NAME: 'Samyukth - challa'\nFILTER WITH: Name = 'Samyukth - challa'"
+#: One resolved person, as `resolve_people` returns them.
+PERSON = {
+    "asked": "samyukt challa",
+    "meaning": "a Person Account",
+    "matches": ["Samyukth - challa"],
+    "object": "Account",
+}
 
 
-def test_write_soql_grounds_on_who_the_person_is(monkeypatch):
-    """THE second regression: the live path never looked the person up."""
-    resolver = _Resolved()
-    monkeypatch.setattr(sqleng, "who_these_people_are", resolver)
+@pytest.fixture()
+def no_describe(monkeypatch):
+    """Keep `write_soql`'s schema grounding off the network.
+
+    That grounding has its own suite (test_live_soql_schema.py); here it would
+    only add a doomed HTTP call, and it is deliberately written to swallow the
+    failure, so leaving it live would hide nothing and slow every test.
+    """
+
+    async def fail(name, **kw):
+        raise RuntimeError("no org in tests")
+
+    monkeypatch.setattr(live_sf.salesforce, "describe_object", fail)
+
+
+def test_write_soql_grounds_on_who_the_person_is(monkeypatch, no_describe):
+    """THE second regression: the live path never looked the person up.
+
+    `resolve_people` is the seam, not `who_these_people_are` — the live path
+    needs the STRUCTURED result (to know the person is on Account) as well as
+    the rendered block, so it resolves once and renders from that.
+    """
+    monkeypatch.setattr(sqleng, "resolve_people", lambda q: [PERSON])
     seen = {}
 
     async def fake_chat(messages, **kw):
@@ -169,20 +186,38 @@ def test_write_soql_grounds_on_who_the_person_is(monkeypatch):
     monkeypatch.setattr(live_sf.llm, "chat_completion", fake_chat)
     asyncio.run(live_sf.write_soql("everything about samyukt challa"))
 
-    assert resolver.asked_with is not None, "the live path did not resolve anybody"
-    assert resolver.asked_with[1] == "soql", "resolved in the wrong dialect"
-    assert "Samyukth - challa" in seen["user"], "the stored spelling never reached the model"
+    prompt = seen["user"]
+    assert "Samyukth - challa" in prompt, "the stored spelling never reached the model"
+    assert "FILTER WITH: Name = 'Samyukth - challa'" in prompt, "no ready-made filter"
+    # Rendered in the SOQL dialect: the warehouse wording would say "joined to".
+    assert "__r" in prompt and "joined to" not in prompt
 
 
-def test_a_broken_warehouse_does_not_break_live_salesforce(monkeypatch):
+def test_the_person_lookup_runs_once_per_query(monkeypatch, no_describe):
+    """It is a warehouse round trip; resolving separately for the prompt block
+    and for the object name would double it on every live question."""
+    calls = []
+    monkeypatch.setattr(
+        sqleng, "resolve_people", lambda q: (calls.append(q), [PERSON])[1]
+    )
+
+    async def fake_chat(messages, **kw):
+        return "SELECT Id FROM Account"
+
+    monkeypatch.setattr(live_sf.llm, "chat_completion", fake_chat)
+    asyncio.run(live_sf.write_soql("everything about samyukt challa"))
+    assert len(calls) == 1, f"resolved {len(calls)} times"
+
+
+def test_a_broken_warehouse_does_not_break_live_salesforce(monkeypatch, no_describe):
     """Grounding is an optimisation. The warehouse is write-locked by the sync
     worker for a large part of the day, and that is precisely WHY questions
     land on the live path — it must not depend on the warehouse being up."""
 
-    def boom(question, dialect="sql"):
+    def boom(question):
         raise RuntimeError("database is locked")
 
-    monkeypatch.setattr(sqleng, "who_these_people_are", boom)
+    monkeypatch.setattr(sqleng, "resolve_people", boom)
 
     async def fake_chat(messages, **kw):
         return "SELECT Id FROM Account"
