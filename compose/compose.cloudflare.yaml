@@ -41,11 +41,21 @@ services:
     # anything here would defeat the point of using a tunnel.
     restart: unless-stopped
     healthcheck:
-      # cloudflared's own readiness endpoint: 200 once the tunnel has
+      # cloudflared's own readiness check: succeeds once the tunnel has
       # registered connections with Cloudflare's edge.
+      #
+      # EXEC FORM, NOT CMD-SHELL. This image ships no shell at all, so a
+      # CMD-SHELL probe cannot even start ("/bin/sh: no such file or
+      # directory") and the container reports unhealthy forever while
+      # serving traffic perfectly — a false alarm that would train everyone
+      # to ignore the health column.
       test:
-        - CMD-SHELL
-        - cloudflared tunnel --metrics 127.0.0.1:20241 ready || exit 1
+        - CMD
+        - cloudflared
+        - tunnel
+        - --metrics
+        - 127.0.0.1:20241
+        - ready
       interval: 30s
       timeout: 10s
       retries: 5
