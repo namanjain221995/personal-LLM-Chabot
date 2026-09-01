@@ -522,6 +522,27 @@ export function ChatApp() {
   }, []);
 
   /**
+   * Cancel a pending draft debounce on unmount.
+   *
+   * The timer above is cleared on the NEXT keystroke but never when the
+   * component goes away, so the last one always outlived it. It then fires,
+   * calls setDraft, and React reaches for `window` on a tree that no longer
+   * has one. In the browser that is a harmless update to a dead component; in
+   * the suite it surfaced as an unhandled `ReferenceError: window is not
+   * defined` AFTER all 961 tests had passed, failing CI with exit 1 while
+   * every single test was green -- the sibling setInterval above already gets
+   * this treatment.
+   */
+  useEffect(() => {
+    return () => {
+      if (draftTimer.current !== null) {
+        window.clearTimeout(draftTimer.current);
+        draftTimer.current = null;
+      }
+    };
+  }, []);
+
+  /**
    * Ask the server what a compaction would fold right now.
    *
    * Called only when the meter popover OPENS and after a compaction — never
