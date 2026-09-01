@@ -465,10 +465,29 @@ async def list_objects() -> List[Dict[str, Any]]:
     ]
 
 
-async def describe_object(name: str) -> Dict[str, Any]:
+#: Describes are the org's SHAPE, which changes on a release cadence, not per
+#: question -- but the live query path now needs one on every question that
+#: names a person, to ground the field and relationship names. Cached in
+#: process, with a TTL short enough that a schema change lands the same hour
+#: without a restart. Concurrent misses may each fetch; a duplicate describe is
+#: harmless and cheaper than holding a lock across a network call.
+_DESCRIBE_TTL_S = 900.0
+_describe_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+
+
+def clear_describe_cache() -> None:
+    """Tests, and any caller that has just changed the schema."""
+    _describe_cache.clear()
+
+
+async def describe_object(name: str, *, refresh: bool = False) -> Dict[str, Any]:
     """Field names and types for ONE object, as this user sees them."""
     if not re.match(r"^[A-Za-z][A-Za-z0-9_]*$", name or ""):
         raise UnsafeSoql(f"not a valid object name: {name!r}")
+    if not refresh:
+        hit = _describe_cache.get(name)
+        if hit and (time.monotonic() - hit[0]) < _DESCRIBE_TTL_S:
+            return hit[1]
     payload = await _get(
         f"/services/data/{settings.sf_api_version}/sobjects/{name}/describe"
     )
@@ -477,7 +496,7 @@ async def describe_object(name: str) -> Dict[str, Any]:
     # all, and `relationshipName`/`referenceTo` are the only honest way to check
     # that `Account.Owner.Name` is a real traversal rather than a plausible
     # guess. Purely additive — every existing caller reads name/type/label.
-    return {
+    described = {
         "name": payload.get("name", name),
         "label": payload.get("label", name),
         "queryable": payload.get("queryable", True),
@@ -496,6 +515,8 @@ async def describe_object(name: str) -> Dict[str, Any]:
             for f in payload.get("fields", [])
         ],
     }
+    _describe_cache[name] = (time.monotonic(), described)
+    return described
 
 
 def _clean(record: Dict[str, Any]) -> Dict[str, Any]:

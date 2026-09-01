@@ -514,7 +514,9 @@ def _fuzzy_person(con, name: str) -> Optional[dict]:
     }
 
 
-def who_these_people_are(question: str, dialect: str = "sql") -> str:
+def who_these_people_are(
+    question: str, dialect: str = "sql", resolved: Optional[List[dict]] = None
+) -> str:
     """`resolve_people`, rendered for a prompt.
 
     "How many internal interviews has X completed" is genuinely ambiguous —
@@ -526,7 +528,10 @@ def who_these_people_are(question: str, dialect: str = "sql") -> str:
     lower-case. A rule in the prompt cannot know who these particular people
     are; one indexed lookup can. Returns "" when the question names nobody.
     """
-    found = resolve_people(question)
+    # `resolved` lets a caller that already ran the lookup render it without
+    # paying for a second warehouse round trip. The live path needs the
+    # structured result too, to ground the SOQL on the right object's fields.
+    found = resolve_people(question) if resolved is None else resolved
     if not found:
         return ""
     lines = []
