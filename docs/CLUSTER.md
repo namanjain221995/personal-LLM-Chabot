@@ -341,6 +341,25 @@ the overlay ships:
   ~10 minutes `/v1/models` may still answer while completions fail, and the
   orchestrator's `/health` reports `vllm: error`. During the outage `/v1/models` may still answer; completions
   fail; `scripts/cluster-status.sh` shows which side is unhealthy.
+* **The variant the healthchecks cannot see** (found live 2026-09-01, a
+  73-minute outage): rank 1 died from a GPU fault (`CUDA error: an illegal
+  memory access`) **mid-collective**, so rank 0's NCCL kernel spun on-GPU and
+  never returned to the RPC layer — the `RPC ... timed out` path above never
+  ran, the API server never closed its listener, and `/health` answered 200
+  in 2 ms for the whole outage while every completion hung and spark-1 sat
+  pinned at 96 % GPU doing nothing. The worker restarted itself and retried
+  the rendezvous in a loop, timing out against the hung head every cycle.
+  The `vllm-watchdog` service exists for exactly this: it probes with a real
+  2-token completion every 60 s, and only the hung signature — `/v1/models`
+  answers, generation does not, twice in a row — restarts the head. The
+  freshly restarted head then pairs with the already-retrying worker with no
+  operator action. While a model is loading, `/v1/models` refuses
+  connections, so the watchdog counts nothing and cannot restart-loop a
+  starting engine.
+* Reboot of either Spark: every container involved is `restart:
+  unless-stopped`, the worker retries the rendezvous in a loop, a rebooted
+  head waits for a worker, and the watchdog clears the one state that cannot
+  clear itself. No operator action on either order.
 * NCCL cannot use RDMA (missing `/dev/infiniband`, memlock, HCA down) → it
   silently uses TCP sockets; `cluster-status.sh` reports `TCP SOCKET FALLBACK`
   as a warning and `cluster-test.sh` fails its transport check.

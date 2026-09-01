@@ -75,6 +75,65 @@ services:
     deploy: *nvidia-devices
     logging: *model-logging
 
+  # --- Engine watchdog ----------------------------------------------------
+  # The ONE failure nothing else catches: the worker on Spark 2 dies, its
+  # container restarts and waits at the rendezvous -- but the head's rank 0
+  # cannot re-admit a fresh rank 1, so it spins in NCCL at ~100% GPU forever.
+  # /health keeps answering 200 in 2ms throughout (the API process is fine;
+  # the engine behind it is not), the head logs NOTHING, and every real
+  # request hangs. Found live 2026-09-01: spark-1 pinned at 96%, spark-2 at
+  # 0%, RoCE at 0 B/s, generations timing out, health green.
+  #
+  # So the probe is FUNCTIONAL: a 2-token completion. The hung state has a
+  # precise signature -- /v1/models answers but generation does not -- and
+  # only on that signature, twice in a row, is the head restarted. The worker
+  # needs no watchdog of its own: it already exits and retries the rendezvous
+  # in a loop, so a freshly restarted head pairs with it within minutes. That
+  # same dance covers a reboot of either Spark end to end.
+  #
+  # While the model is LOADING, /v1/models refuses connections, so the
+  # watchdog counts nothing and cannot restart-loop a starting engine; after
+  # a restart it also sleeps out the load time explicitly.
+  #
+  # The Docker socket is mounted WRITABLE, which is root-equivalent on this
+  # host -- it is the price of being able to restart the engine, it is the
+  # only thing this container does with it, and the image is digest-pinned.
+  vllm-watchdog:
+    image: docker@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      WATCHDOG_TARGET: ${VLLM_WATCHDOG_TARGET:-sf-local-ai-vllm-1}
+      WATCHDOG_PORT: ${VLLM_WATCHDOG_PORT:-8000}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "[watchdog] probing 127.0.0.1:$${WATCHDOG_PORT} every 60s; two hung generations restart $${WATCHDOG_TARGET}"
+        FAILS=0
+        while true; do
+          sleep 60
+          models="$$(wget -q -O- -T 5 "http://127.0.0.1:$${WATCHDOG_PORT}/v1/models" 2>/dev/null)" || { FAILS=0; continue; }
+          model="$$(printf %s "$$models" | sed -n 's/.*"id": *"\([^"]*\)".*/\1/p' | head -1)"
+          [ -z "$$model" ] && { FAILS=0; continue; }
+          body="{\"model\":\"$$model\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":2,\"temperature\":0,\"chat_template_kwargs\":{\"enable_thinking\":false}}"
+          if wget -q -O /dev/null -T 120 --header 'Content-Type: application/json' --post-data "$$body" "http://127.0.0.1:$${WATCHDOG_PORT}/v1/chat/completions" 2>/dev/null; then
+            FAILS=0
+          else
+            FAILS=$$((FAILS+1))
+            echo "[watchdog] generation probe hung ($$FAILS/2) while /v1/models answers"
+            if [ "$$FAILS" -ge 2 ]; then
+              echo "[watchdog] engine is hung -- restarting $${WATCHDOG_TARGET}"
+              docker restart -t 30 "$${WATCHDOG_TARGET}" || echo "[watchdog] restart FAILED"
+              FAILS=0
+              echo "[watchdog] sleeping 600s for the model to load"
+              sleep 600
+            fi
+          fi
+        done
+    logging: *model-logging
+
   vllm-router:
     image: vllm/vllm-openai@sha256:24f2f8975d011ea7f7066a547886a08a1fd3c4bf0880463487fae4f01ce723c6
     command: >
