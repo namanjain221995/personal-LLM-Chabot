@@ -452,6 +452,16 @@ export interface StartStreamOptions {
   pdf?: string | null;
   pdfName?: string | null;
   /**
+   * NEW-14: this turn has an uploaded dataset.
+   *
+   * A flag rather than a payload, because that is genuinely all there is to
+   * send: the file already streamed to /api/upload and the orchestrator finds
+   * it through `conversation_id`. Its only job is to let the proxy tell a
+   * dataset send apart from an empty one when neither carries text — without
+   * it, both look identical on the wire and both were answered with a 400.
+   */
+  dataset?: boolean;
+  /**
    * Salesforce Intelligence Mode: the answer to a clarifying question this
    * conversation is waiting on. Present → the server resumes the ORIGINAL
    * request with this answer folded in, instead of treating the message as a
@@ -486,6 +496,17 @@ export function markClarificationSubmitted(key: string): void {
 export async function startStream(opts: StartStreamOptions): Promise<void> {
   const { conversationId, turns, prefs } = opts;
   const context = opts.context ?? turns;
+  // NEW-14: the turn being sent, read HERE — before the filter below removes
+  // it. Every caller (send, retry, regenerate, edit) ends `context` at the
+  // user turn being asked, so this is the question by construction, and it is
+  // folded the same way `messages` is so a pasted-only turn still counts as
+  // having said something. Empty means the send carried attachments alone,
+  // and the proxy needs that fact stated rather than guessed at.
+  const currentTurn = context[context.length - 1];
+  const currentText =
+    currentTurn?.role === 'user'
+      ? foldModelContent(currentTurn.content, currentTurn.meta?.pasted)
+      : '';
   const s = register(conversationId, turns, opts.assistantBranch);
   // Did the orchestrator accept the request? Decides whether a failure below
   // is "unreachable" (retry) or "interrupted" (re-join) — see markInterrupted.
@@ -501,6 +522,9 @@ export async function startStream(opts: StartStreamOptions): Promise<void> {
             content: foldModelContent(m.content, m.meta?.pasted),
           }))
           .filter((m) => m.content),
+        // NEW-14: what the transcript above can no longer say, because the
+        // filter drops exactly the turn a wordless send is made of.
+        current_text: currentText,
         session_id: conversationId,
         conversation_id: conversationId,
         mode: prefs.salesforce ? 'salesforce' : 'assistant',
@@ -519,6 +543,10 @@ export async function startStream(opts: StartStreamOptions): Promise<void> {
         ...(opts.pdf
           ? { pdf: opts.pdf, pdf_filename: opts.pdfName ?? undefined }
           : {}),
+        // NEW-14. Sent only when true, so every other request keeps exactly
+        // the key set it had — this is a proxy hint, not part of the contract
+        // with the orchestrator, which never sees it.
+        ...(opts.dataset ? { dataset: true } : {}),
         ...(opts.clarification ? { clarification: opts.clarification } : {}),
       }),
       signal: s.controller.signal,
