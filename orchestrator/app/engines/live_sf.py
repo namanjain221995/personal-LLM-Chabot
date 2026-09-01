@@ -133,8 +133,18 @@ async def write_soql(
         # The main model thinks before answering, and that reasoning is drawn
         # from the SAME budget. At 1200 the whole allowance went on thinking
         # and the reply arrived with no query in it at all, which surfaced as
-        # "the model did not produce a SOQL query".
+        # "the model did not produce a SOQL query". Raising the ceiling only
+        # BOUGHT room; it did not stop reasoning eating it, and once the
+        # schema grounding took the prompt to ~9,800 tokens the failure came
+        # straight back -- intermittently, because how long the model
+        # deliberates varies run to run.
+        #
+        # Turning the reasoning pass OFF is the actual fix, and the one the
+        # warehouse path already uses (`_ask_sql`, thinking=False). Writing a
+        # query from a schema is translation, not deduction: the whole budget
+        # goes to the query, and the call returns in a fraction of the time.
         max_tokens=6000,
+        thinking=False,
     )
     soql = extract_soql(raw)
     if not soql:
@@ -203,8 +213,19 @@ async def _fields_and_relationships(objects: Sequence[str]) -> str:
             continue
         real = described.get("name", name)
         block = (
-            f"{real} has EXACTLY these {len(fields)} fields. Every field you "
-            f"select or filter on MUST appear in this list:\n"
+            f"For an OPEN-ENDED question about one {real} record "
+            f'("everything", "entire information", "full details"), write:\n'
+            f"    SELECT FIELDS(ALL) FROM {real} WHERE <filter> LIMIT 200\n"
+            f"FIELDS(ALL) returns every one of {real}'s {len(fields)} fields "
+            f"without naming any of them. Do NOT enumerate fields for such a "
+            f"question: asked for everything, the model listed field after "
+            f"field, ran past the token limit and the query was cut off "
+            f"mid-list — no FROM clause, nothing ran at all. LIMIT 200 is "
+            f"required by FIELDS(ALL) and is already the cap here.\n\n"
+            f"For a TARGETED question, name the fields you need. {real} has "
+            f"EXACTLY these {len(fields)} — anything you select or filter on "
+            f"must appear here, and this list is the validity check, not a "
+            f"shopping list:\n"
             + ", ".join(f["name"] for f in fields)
         )
         rels = [f["relationshipName"] for f in fields if f.get("relationshipName")]
@@ -215,7 +236,12 @@ async def _fields_and_relationships(objects: Sequence[str]) -> str:
                 + ". Any other `X__r` does not exist and Salesforce rejects the "
                 "entire query. A field name ending in __c is NOT automatically "
                 "a lookup — most are plain values, so select the field itself "
-                "unless its relationship name is listed here."
+                "unless its relationship name is listed here.\n"
+                "THROUGH a relationship, select ONLY Id and Name (e.g. "
+                "Assigned_Recruiter__r.Name). The field list above describes "
+                f"{real} and nothing else, so any other field you traverse to "
+                "is a guess — and one invalid field rejects the WHOLE query, "
+                "losing every other column with it."
             )
         blocks.append(block)
     return "\n\n".join(blocks)

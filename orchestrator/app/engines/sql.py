@@ -559,11 +559,11 @@ def who_these_people_are(
     if dialect == "soql":
         shape = (
             "\n\nIf the question is open-ended (\"everything\", \"entire "
-            "information\", \"full details\"), answer with ONE SELECT against "
-            "the object above, listing its informative fields and traversing "
-            "the two or three most relevant relationships with __r. Do NOT "
-            "issue a query per object and do not invent generic "
-            "Detail1/Detail2 fields."
+            "information\", \"full details\"), answer with ONE "
+            "`SELECT FIELDS(ALL) FROM <object> WHERE <filter> LIMIT 200` — "
+            "that returns every field of the record without naming any of "
+            "them. Do NOT enumerate fields, do not issue a query per object, "
+            "and do not invent generic Detail1/Detail2 fields."
         )
     else:
         shape = (

@@ -243,7 +243,9 @@ def test_the_soql_person_block_does_not_tell_the_model_to_join(monkeypatch):
     soql_block = sqleng.who_these_people_are("everything about samyukt challa", "soql")
     sql_block = sqleng.who_these_people_are("everything about samyukt challa", "sql")
 
-    assert "__r" in soql_block
+    # SOQL answers "everything about X" with FIELDS(ALL), not a field list and
+    # not a JOIN. The warehouse block says "joined to"; this one must not.
+    assert "FIELDS(ALL)" in soql_block
     assert "UNION" not in soql_block.upper()
     # This block is appended AFTER grounding_for has done its ILIKE rewrite,
     # so it is never normalised — it has to be born correct.

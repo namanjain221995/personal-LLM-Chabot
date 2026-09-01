@@ -96,7 +96,7 @@ def test_an_unreadable_query_yields_no_object():
 def test_the_real_fields_are_supplied(described):
     block = asyncio.run(live_sf._fields_and_relationships(["Account"]))
     assert "Salary__c" in block and "Assigned_Recruiter__c" in block
-    assert "EXACTLY these 5 fields" in block
+    assert "EXACTLY these 5" in block
 
 
 def test_only_real_relationships_are_offered(described):
@@ -233,7 +233,8 @@ def test_write_soql_grounds_on_the_resolved_object_schema(monkeypatch, described
     asyncio.run(live_sf.write_soql("everything about samyukt challa"))
 
     assert "Assigned_Recruiter__r" in seen["user"], "no relationship grounding"
-    assert "EXACTLY these 5 fields" in seen["user"], "no field grounding"
+    assert "EXACTLY these 5" in seen["user"], "no field grounding"
+    assert "FIELDS(ALL)" in seen["user"], "no open-ended guidance"
     assert "Samyukth - challa" in seen["user"], "person grounding was lost"
 
 
@@ -277,3 +278,103 @@ def test_the_cache_never_serves_a_bad_object_name(monkeypatch):
     sf.clear_describe_cache()
     with pytest.raises(sf.UnsafeSoql):
         asyncio.run(sf.describe_object("Account; DROP"))
+
+
+# ── The reasoning budget ───────────────────────────────────────────────────
+
+
+def test_soql_generation_does_not_spend_its_budget_thinking(monkeypatch, described):
+    """Reasoning and output share one budget, and the schema grounding made
+    the prompt ~9,800 tokens.
+
+    Found on the deployed container: `write_soql` returned "the model did not
+    produce a SOQL query" — the whole 6,000-token allowance went on
+    deliberation and nothing came back. Re-running the IDENTICAL messages at
+    the IDENTICAL budget produced a perfect query, so it fails intermittently,
+    which is the worst way for it to fail.
+
+    Writing a query from a schema is translation, not deduction. The warehouse
+    path (`sql._ask_sql`) has passed thinking=False since it hit this same
+    wall; the live path raised max_tokens instead, which only bought room.
+    """
+    seen = {}
+
+    async def fake_chat(messages, **kw):
+        seen.update(kw)
+        return "SELECT Id FROM Account"
+
+    monkeypatch.setattr(live_sf.llm, "chat_completion", fake_chat)
+    asyncio.run(live_sf.write_soql("everything about samyukt challa"))
+    assert seen.get("thinking") is False, "the reasoning pass is still on"
+
+
+def test_the_warehouse_path_also_keeps_thinking_off():
+    """Both query writers must agree; this is the invariant that was violated."""
+    import inspect
+
+    from app.engines import sql as sqlmod
+
+    source = inspect.getsource(sqlmod._ask_sql)
+    assert "thinking=False" in source
+
+
+# ── FIELDS(ALL): the right way to answer "everything about X" ──────────────
+
+
+def test_open_ended_questions_are_steered_to_fields_all(described):
+    """Hand-picking N of 278 field names is inherently fragile.
+
+    Measured against the live org, three runs of the owner's question: the
+    model listed fields until it ran past the token limit and the query was
+    cut off before FROM ("query has no FROM clause"), invented Recruiter__c on
+    Account, and succeeded once with 26 columns — 1/3, at up to 82 seconds.
+    With FIELDS(ALL): 3/3, 1-5 seconds, all 278 fields.
+    """
+    block = asyncio.run(live_sf._fields_and_relationships(["Account"]))
+    assert "SELECT FIELDS(ALL) FROM Account" in block
+    assert "LIMIT 200" in block
+    assert "Do NOT enumerate fields" in block
+
+
+def test_the_field_list_is_still_supplied_for_targeted_questions(described):
+    """FIELDS(ALL) answers "everything about X"; "what is X's email" still
+    needs a real field name, and inventing one is the original bug."""
+    block = asyncio.run(live_sf._fields_and_relationships(["Account"]))
+    assert "TARGETED" in block
+    assert "Salary__c" in block and "Assigned_Recruiter__c" in block
+
+
+def test_the_person_block_asks_for_fields_all_in_soql(monkeypatch):
+    monkeypatch.setattr(
+        sqleng,
+        "resolve_people",
+        lambda q: [
+            {
+                "asked": "samyukt challa",
+                "meaning": "a Person Account",
+                "matches": ["Samyukth - challa"],
+                "object": "Account",
+            }
+        ],
+    )
+    block = sqleng.who_these_people_are("everything about samyukt challa", "soql")
+    assert "FIELDS(ALL)" in block
+    # The warehouse wording must not leak into the SOQL block.
+    assert "joined to" not in block
+
+
+def test_guard_soql_leaves_fields_all_intact():
+    """FIELDS(ALL) REQUIRES a LIMIT of at most 200. The guard already caps at
+    200, so the two agree — but a guard that rewrote the projection, or raised
+    the cap, would break every open-ended live answer."""
+    q = "SELECT FIELDS(ALL) FROM Account WHERE Name = 'Samyukth - challa' LIMIT 200"
+    out = sf.guard_soql(q)
+    assert "FIELDS(ALL)" in out
+    assert out.rstrip().endswith("LIMIT 200")
+
+
+def test_fields_all_without_a_limit_is_given_a_legal_one():
+    out = sf.guard_soql("SELECT FIELDS(ALL) FROM Account WHERE Name = 'x'")
+    assert "FIELDS(ALL)" in out
+    limit = int(out.rsplit("LIMIT", 1)[1])
+    assert 0 < limit <= 200, f"FIELDS(ALL) rejects LIMIT > 200, got {limit}"
