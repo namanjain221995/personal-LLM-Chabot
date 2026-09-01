@@ -206,6 +206,8 @@ export function ChatApp() {
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<ComposerHandle>(null);
+  /** The header toggle — where focus returns when the mobile drawer closes. */
+  const sidebarToggleRef = useRef<HTMLButtonElement>(null);
   const messagesRef = useRef<ChatMessage[]>([]);
   messagesRef.current = messages;
   /**
@@ -1468,6 +1470,7 @@ export function ChatApp() {
         onSetArchived={archiveConversation}
         onExport={exportConversation}
         onLoadArchived={loadArchived}
+        restoreFocusRef={sidebarToggleRef}
       />
 
       <SummaryPanel
@@ -1508,6 +1511,12 @@ export function ChatApp() {
         <header className="flex h-[52px] shrink-0 items-center gap-2 px-3">
           {!sidebarOpen && (
             <button
+              // Closing the mobile drawer hands focus back here. The button
+              // only exists while the sidebar is closed, so the drawer cannot
+              // capture it as `document.activeElement` on the way in — it
+              // reads this ref on the way out, by which point React has
+              // re-mounted the button and re-attached it (see Sidebar).
+              ref={sidebarToggleRef}
               type="button"
               onClick={() => setSidebarOpen(true)}
               aria-label="Show sidebar"

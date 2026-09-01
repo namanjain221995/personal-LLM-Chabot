@@ -339,16 +339,42 @@ export interface ShortcutContext {
 }
 
 /**
- * The app's global keyboard map (V4 §2), matching ChatGPT:
+ * What the sidebar's <kbd> prints next to "New chat".
  *
- * - Ctrl/Cmd + K       → open the search palette (V3 gave this to new chat);
- * - Ctrl/Cmd + Shift+O → new chat;
- * - Escape             → close the palette if it is open, else stop the stream;
- * - "/"                → focus the composer, but never while typing or while
- *                        the modal owns the keyboard.
+ * It lives beside the map that implements it so the advertised chord and the
+ * handled chord cannot drift apart — the previous pairing was maintained in
+ * two files and the only thing keeping them in step was memory.
+ *
+ * The label says "Ctrl" on every platform, as it always has: picking ⌘ for
+ * macOS needs a `navigator`-dependent render, which is exactly the kind of
+ * value that differs between the server and the client and produces a
+ * hydration mismatch. `shortcutAction` accepts Cmd and Ctrl alike, so the
+ * chord works on macOS whatever the chip prints.
+ */
+export const NEW_CHAT_SHORTCUT_LABEL = 'Ctrl ⇧ ⏎';
+
+/**
+ * The app's global keyboard map (V4 §2):
+ *
+ * - Ctrl/Cmd + K         → open the search palette (V3 gave this to new chat);
+ * - Ctrl/Cmd + Shift + ⏎ → new chat;
+ * - Escape               → close the palette if it is open, else stop the
+ *                          stream — but never while an editable element has
+ *                          focus;
+ * - "/"                  → focus the composer, but never while typing or while
+ *                          the modal owns the keyboard.
  *
  * Every other modifier chord returns null so browser and OS shortcuts keep
  * working.
+ *
+ * New chat was Ctrl/Cmd + Shift + O through V4, copied from ChatGPT. That
+ * chord is the BOOKMARK MANAGER in Chrome, Edge and Firefox on Windows: the
+ * browser can act on it before the page does, so an advertised app shortcut
+ * opened a bookmark window instead of a chat (NEW-08). Ctrl/Cmd + Shift + ⏎ is
+ * bound by none of the four major browsers on either Windows or macOS, is not
+ * an AltGr chord on European layouts nor an Option dead key on macOS, and the
+ * composer ignores Enter whenever Shift is held (components/Composer.tsx), so
+ * it arrives here intact and ChatApp's preventDefault stops the stray newline.
  */
 export function shortcutAction(
   event: ShortcutEvent,
@@ -359,7 +385,7 @@ export function shortcutAction(
   const key = event.key.toLowerCase();
 
   if (mod) {
-    if (shift && key === 'o') return 'new-chat';
+    if (shift && key === 'enter') return 'new-chat';
     // Ctrl+Shift+K is the browser's; only the bare chord opens the palette,
     // and re-pressing it while open is a no-op rather than a toggle.
     if (!shift && key === 'k') return ctx.paletteOpen ? null : 'open-search';
@@ -368,6 +394,14 @@ export function shortcutAction(
 
   if (event.key === 'Escape') {
     if (ctx.paletteOpen) return 'close-palette';
+    // L-17: while an editable element has focus it owns Escape. There, Escape
+    // means "dismiss the IME candidate / leave this field" — never "throw away
+    // the answer that is still generating", which is a destructive action the
+    // user cannot undo and did not ask for. Stopping stays available on the
+    // composer's own Stop button, and on Escape the moment focus is not in a
+    // text field. Controls with their own Escape contract (inline edit, the ⋯
+    // menu, the mobile drawer) stop propagation before reaching this map.
+    if (ctx.typing) return null;
     return ctx.streaming ? 'stop-streaming' : null;
   }
 
