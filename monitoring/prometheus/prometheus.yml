@@ -95,16 +95,21 @@ scrape_configs:
         action: drop
 
   # --- The four single-node model services -------------------------------
+  # Scraped over the internal `application` network by SERVICE NAME, not via
+  # the host's published ports. Those ports are debug-only and now bind to
+  # loopback (they are unauthenticated model APIs and were reachable from the
+  # whole office LAN until 2026-09-01); scraping through them would have made
+  # monitoring depend on that exposure staying open.
   - job_name: vllm-aux
     scrape_interval: 15s
     static_configs:
-      - targets: ["host.docker.internal:8002"]
+      - targets: ["vllm-router:30002"]
         labels: { service: router, node: spark-1, role: head }
-      - targets: ["host.docker.internal:8003"]
+      - targets: ["vllm-embed:30003"]
         labels: { service: embed, node: spark-1, role: head }
-      - targets: ["host.docker.internal:8004"]
+      - targets: ["vllm-ocr:30004"]
         labels: { service: ocr, node: spark-1, role: head }
-      - targets: ["host.docker.internal:8005"]
+      - targets: ["vllm-reranker:30005"]
         labels: { service: reranker, node: spark-1, role: head }
     metric_relabel_configs:
       - source_labels: [__name__]
