@@ -1112,6 +1112,11 @@ def tables_for(question: str) -> List[str]:
     return seen
 
 
+#: Warehouse SQL spells case-insensitive matching ILIKE; SOQL has no such
+#: operator. Applied to the assembled brief when the dialect is SOQL.
+_ILIKE = re.compile(r"\bILIKE\b")
+
+
 def grounding_for(question: str, dialect: str = "sql") -> str:
     """Everything a query stage should know about this org for this question.
 
@@ -1136,9 +1141,19 @@ def grounding_for(question: str, dialect: str = "sql") -> str:
     if extras:
         parts.append(extras)
     if dialect == "soql":
+        # Everything assembled above is written in WAREHOUSE SQL, and it
+        # teaches `Name ILIKE '%surname%'` in nine separate places -- the
+        # person-matching rule, the domain rules and most of the metric
+        # hints. SOQL has no ILIKE, so each of those examples was actively
+        # teaching the live path to write a query Salesforce rejects outright.
+        # Rewriting here keeps ONE copy of the brief: a hand-maintained SOQL
+        # duplicate would drift from the SQL one within a week.
+        parts = [_ILIKE.sub("LIKE", part) for part in parts]
         parts.append(
             SOQL_TRANSLATION
-            + f"\nToday, in the business timezone, is {business_today()}. "
+            + "- There is no ILIKE. SOQL's LIKE is already case-insensitive,\n"
+            "  so `Name LIKE '%<surname>%'` is the case-insensitive match.\n"
+            + f"Today, in the business timezone, is {business_today()}. "
             "Use that date (and dates relative to it) rather than TODAY."
         )
     return "\n\n".join(parts)

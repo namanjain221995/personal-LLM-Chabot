@@ -37,6 +37,23 @@ _FORBIDDEN = re.compile(
 )
 
 
+#: SOQL has no ILIKE, and its LIKE is ALREADY case-insensitive.
+_ILIKE = re.compile(r"\bILIKE\b", re.I)
+
+
+def _rewrite_outside_literals(text: str, pattern: "re.Pattern", replacement: str) -> str:
+    """Apply `pattern` to `text`, skipping single-quoted string literals.
+
+    A quoted value is user data being searched FOR, not syntax. Rewriting
+    inside it would silently change what the query asks.
+    """
+    parts = re.split(r"('(?:[^'\\]|\\.)*')", text)
+    return "".join(
+        part if i % 2 else pattern.sub(replacement, part)
+        for i, part in enumerate(parts)
+    )
+
+
 class SalesforceUnavailable(RuntimeError):
     """No credentials, or the org could not be reached."""
 
@@ -102,6 +119,16 @@ def guard_soql(soql: str, *, max_rows: int = MAX_ROWS) -> str:
         raise UnsafeSoql("empty query")
     text = " ".join(soql.strip().split())
     text = text.rstrip(";")
+
+    # ILIKE -> LIKE. An EXACT rewrite, not a loosening: SOQL's LIKE is already
+    # case-insensitive, and SOQL has no ILIKE at all. It belongs here and not
+    # only in the prompt because the org brief is written in warehouse SQL and
+    # teaches `Name ILIKE '%surname%'` in nine separate places. The model
+    # copied it roughly half the time, and Salesforce rejected the ENTIRE
+    # query -- "unexpected token: 'Name ILIKE'" -- so every live question that
+    # filtered on a person's name failed, twice, and surfaced to the user as
+    # "I could not write a valid query for that" (owner report, 2026-09-01).
+    text = _rewrite_outside_literals(text, _ILIKE, "LIKE")
 
     if ";" in text:
         raise UnsafeSoql("only a single statement is allowed")

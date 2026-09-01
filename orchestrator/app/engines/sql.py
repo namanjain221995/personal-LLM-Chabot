@@ -514,7 +514,7 @@ def _fuzzy_person(con, name: str) -> Optional[dict]:
     }
 
 
-def who_these_people_are(question: str) -> str:
+def who_these_people_are(question: str, dialect: str = "sql") -> str:
     """`resolve_people`, rendered for a prompt.
 
     "How many internal interviews has X completed" is genuinely ambiguous —
@@ -547,9 +547,32 @@ def who_these_people_are(question: str) -> str:
         else:
             joined = ", ".join(repr(name) for name in stored)
             lines.append(f"    FILTER WITH: Name IN ({joined})")
+    # The live path resolves names against the warehouse mirror too, but it
+    # cannot JOIN -- SOQL traverses relationships instead -- so the closing
+    # advice differs. The lookup and the FILTER WITH predicate are identical:
+    # `Name = 'Samyukth - challa'` is valid in both dialects.
+    if dialect == "soql":
+        shape = (
+            "\n\nIf the question is open-ended (\"everything\", \"entire "
+            "information\", \"full details\"), answer with ONE SELECT against "
+            "the object above, listing its informative fields and traversing "
+            "the two or three most relevant relationships with __r. Do NOT "
+            "issue a query per object and do not invent generic "
+            "Detail1/Detail2 fields."
+        )
+    else:
+        shape = (
+            "\n\nIf the question is open-ended (\"everything\", \"entire "
+            "information\", \"full details\"), answer with ONE focused SELECT "
+            "from the object above joined to its two or three most informative "
+            "related tables. Do NOT build a UNION across many dissimilar "
+            "objects, and do not invent generic Detail1/Detail2 columns to "
+            "make them line up — a wide, readable row from the main record is "
+            "the answer."
+        )
     return (
         "Who the people named in this question are, looked up in the warehouse "
-        "just now — treat this as fact and join accordingly:\n"
+        "just now — treat this as fact:\n"
         + "\n".join(lines)
         + "\n\nUSE THE STORED NAME VERBATIM in every filter. The user's "
         "spelling is NOT in the data — filtering on what they typed returns "
@@ -561,12 +584,7 @@ def who_these_people_are(question: str) -> str:
         # model produced 180 lines and a Binder Error on its own CTE alias —
         # nothing ran. A person profile is a handful of joins from the record
         # that identifies them; breadth is what makes it fail.
-        + "\n\nIf the question is open-ended (\"everything\", \"entire "
-        "information\", \"full details\"), answer with ONE focused SELECT "
-        "from the object above joined to its two or three most informative "
-        "related tables. Do NOT build a UNION across many dissimilar objects, "
-        "and do not invent generic Detail1/Detail2 columns to make them line "
-        "up — a wide, readable row from the main record is the answer."
+        + shape
     )
 
 

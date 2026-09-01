@@ -13,6 +13,7 @@ values winning — a stale copy presented as current is the worst outcome here.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -95,6 +96,24 @@ async def write_soql(
     # lands here. Ungrounded, it answered "0 OOT mocks today" off
     # Program_Version__c. It needs the same org knowledge the local engine has.
     grounding = org_brief.grounding_for(question, dialect="soql")
+    # Who the question is ABOUT, resolved against the warehouse mirror exactly
+    # as the local engine resolves it. The live path had no person lookup at
+    # all: asked about "samyukt challa" -- stored "Samyukth - challa" in the
+    # org -- it built the filter from the user's spelling and matched nothing,
+    # which reads as "this person has no records" rather than as a failure.
+    # Names only; every VALUE in the answer still comes from the live API.
+    #
+    # Imported inside the function because engines.sql imports THIS module for
+    # the live fallback, and off the event loop because the lookup is a
+    # synchronous DuckDB query (~25 ms on the fuzzy path).
+    try:
+        from .sql import who_these_people_are
+
+        people = await asyncio.to_thread(who_these_people_are, question, "soql")
+    except Exception:  # noqa: BLE001 — grounding is an optimisation, never fatal
+        people = ""
+    if people:
+        grounding = f"{grounding}\n\n{people}"
     user = f"{grounding}\n\n{context}Question: {question}"
     if correction:
         user += f"\n\n{correction}"
