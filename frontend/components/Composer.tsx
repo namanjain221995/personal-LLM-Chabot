@@ -73,6 +73,21 @@ export interface ComposerHandle {
    * text on its own paragraph and never destroys an unsent draft.
    */
   prefill: (text: string) => void;
+  /**
+   * NEW-10: attach files that arrived from somewhere other than the hidden
+   * input — today, a drag-and-drop onto the conversation column.
+   *
+   * This is deliberately the WHOLE entry point, not a "validate these for me"
+   * helper: it runs the same type and extension checks, the same size caps,
+   * the same five-image ceiling, the same PDF/dataset exclusivity and the same
+   * toasts as the "+" menu, because it IS the code the "+" menu runs. A second
+   * upload route may not come with a second rulebook — that is how the two
+   * paths drift until one of them accepts a file the other refuses.
+   *
+   * It also owns the refusal: a caller cannot talk it into attaching while an
+   * answer is streaming, a chat is loading, or an upload is already in flight.
+   */
+  acceptFiles: (files: File[]) => void;
 }
 
 export interface Attachment {
@@ -86,7 +101,17 @@ export interface Attachment {
   dataUrl: string;
   /** Raw base64 payload (no data: prefix) — what POST /chat expects. */
   base64: string;
-  /** Datasets keep the File itself: they stream to /api/upload, never base64. */
+  /**
+   * The original browser File.
+   *
+   * Datasets have always needed it: they stream to /api/upload rather than
+   * being base64'd into the chat body. NEW-09 keeps it for images and
+   * documents too, and for one reason only — so the card on the sent message
+   * can be OPENED. It never changes what is uploaded or how: images still send
+   * their (possibly downscaled) base64, documents still send theirs, datasets
+   * still stream. The handle is handed to lib/attachments' in-memory viewing
+   * store and dropped when the tab closes.
+   */
   file?: File;
 }
 
@@ -217,6 +242,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
         // render and setting the range here would clamp to the OLD length.
         caretToEnd.current = true;
       },
+      acceptFiles,
     }));
 
     const autogrow = useCallback(() => {
@@ -322,6 +348,9 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
           kind: isPdf ? 'pdf' : 'image',
           dataUrl,
           base64: dataUrl.slice(dataUrl.indexOf(',') + 1),
+          // NEW-09: kept so the card on the sent message can be opened. The
+          // request payload above is unchanged.
+          file,
         };
         setAttachments((prev) => {
           // A PDF stands alone. Images stack up to MAX_IMAGES (2026-08-05)
@@ -362,6 +391,61 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
           setPendingAttach((n) => Math.max(0, n - 1));
         }
       })();
+    }
+
+    /**
+     * The ONE way a batch of files becomes attachments (NEW-10).
+     *
+     * Every entry point lands here — the "+" menu's hidden input, a
+     * drag-and-drop onto the conversation column, and anything added later —
+     * so there is exactly one place that decides what is allowed and exactly
+     * one set of words for refusing it.
+     *
+     * The image room is counted HERE, synchronously, rather than inside
+     * `handleFile`: that function's own cap check reads `attachments`, which
+     * does not update until the whole batch has been dispatched, so a
+     * six-image drop would otherwise sail past a five-image limit.
+     */
+    function acceptFiles(incoming: File[]) {
+      if (!incoming.length) return;
+      // A drop must not be able to do what the picker cannot.
+      //
+      // `streaming` is the load-bearing one: composerMenuItems marks "Add
+      // photos & files" disabled mid-stream, so accepting a dropped file then
+      // would be a second entry point quietly overruling the first — the exact
+      // divergence this shared function exists to prevent. `disabled` is a chat
+      // still being restored; `busy` is a dataset already uploading, where a
+      // second file would race the request that owns the turn.
+      if (streaming || disabled || busy) {
+        toast(
+          streaming
+            ? 'Wait for the answer to finish — you can’t attach a file right now.'
+            : disabled
+              ? 'This chat is still loading — you can’t attach a file right now.'
+              : 'An upload is already in progress — you can’t attach a file right now.',
+          'error',
+        );
+        return;
+      }
+      let room =
+        MAX_IMAGES - attachments.filter((a) => a.kind === 'image').length;
+      let dropped = 0;
+      for (const f of incoming) {
+        if (f.type.startsWith('image/')) {
+          if (room <= 0) {
+            dropped += 1;
+            continue;
+          }
+          room -= 1;
+        }
+        handleFile(f);
+      }
+      if (dropped > 0) {
+        toast(
+          `You can attach up to ${MAX_IMAGES} images — ${dropped} ${dropped === 1 ? 'file was' : 'files were'} left out.`,
+          'error',
+        );
+      }
     }
 
     // Paste into the composer: an image blob becomes the attachment; a long
@@ -513,30 +597,10 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
                 onChange={(e) => {
                   // Multi-select (2026-08-05): each file goes through the
                   // same rules — images stack to MAX_IMAGES, a PDF/dataset
-                  // stands alone, oversized files toast individually. The
-                  // image room is counted HERE, synchronously: handleFile's
-                  // own cap check reads state that does not update until
-                  // this whole batch has been dispatched.
-                  let room =
-                    MAX_IMAGES -
-                    attachments.filter((a) => a.kind === 'image').length;
-                  let dropped = 0;
-                  for (const f of Array.from(e.target.files ?? [])) {
-                    if (f.type.startsWith('image/')) {
-                      if (room <= 0) {
-                        dropped += 1;
-                        continue;
-                      }
-                      room -= 1;
-                    }
-                    handleFile(f);
-                  }
-                  if (dropped > 0) {
-                    toast(
-                      `You can attach up to ${MAX_IMAGES} images — ${dropped} ${dropped === 1 ? 'file was' : 'files were'} left out.`,
-                      'error',
-                    );
-                  }
+                  // stands alone, oversized files toast individually. Those
+                  // rules live in `acceptFiles` (NEW-10) so that a
+                  // drag-and-drop runs exactly this code and not a copy of it.
+                  acceptFiles(Array.from(e.target.files ?? []));
                   e.target.value = '';
                 }}
               />

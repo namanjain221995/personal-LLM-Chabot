@@ -27,6 +27,13 @@ import {
   type MessageFeedback,
 } from '@/lib/feedback';
 import { stripCitations } from '@/lib/citations';
+import {
+  attachmentFile,
+  fileBadgeFor,
+  resolveAttachment,
+  type ResolvedAttachment,
+} from '@/lib/attachments';
+import { AttachmentPreview } from './AttachmentPreview';
 import { AgentTimeline } from './AgentTimeline';
 import { ActivityPanel } from './ActivityPanel';
 import { countSources, ResearchPanel } from './ResearchPanel';
@@ -118,10 +125,60 @@ const EDIT_MAX_HEIGHT = 288;
 const EDIT_BUTTON =
   'rounded-full px-4 py-1.5 text-sm font-medium transition-all duration-ts';
 
-/** "report.pdf" → "PDF", "sales.csv" → "CSV", "data.tar.gz" → "TAR.GZ". */
-function fileBadge(name: string): string {
-  const m = /\.(tar\.gz|[a-z0-9]{1,5})$/i.exec(name.trim());
-  return m ? m[1].toUpperCase() : 'FILE';
+/**
+ * NEW-09 / NEW-09A: an attachment on a sent message, as a control that
+ * PREVIEWS it.
+ *
+ * Everything here used to be a `<span>` and an `<img>` — no role, no focus, no
+ * handler — so the most obvious gesture in the thread, clicking the file you
+ * just sent, did nothing at all. A native `<button>` is the fix and not a
+ * detail of it: it brings the mouse, Enter, Space, the focus ring and the
+ * screen-reader announcement along in one step.
+ *
+ * NEW-09A corrected what the button DOES. It used to open a tab or, for
+ * anything a browser cannot render, save the file — and manual testing found
+ * both spellings putting attachments in the Downloads tray. It now opens an
+ * in-app dialog and nothing else. There is no path from this card to a
+ * download, which is why the click handler resolves bytes and sets state
+ * rather than touching `window` at all.
+ */
+function OpenableAttachment({
+  messageId,
+  index,
+  name,
+  dataUrl,
+  className,
+  children,
+}: {
+  messageId: string;
+  index: number;
+  /** What to call the file in the accessible name. */
+  name: string;
+  /** The message's own persisted preview, when it has one (images do). */
+  dataUrl?: string;
+  className: string;
+  children: React.ReactNode;
+}) {
+  // Resolved on click, not on render: reading the store during render would
+  // mint nothing but would tie the row to a mutable module-level map.
+  const [source, setSource] = useState<ResolvedAttachment | null>(null);
+  const label = `${name} — preview`;
+  return (
+    <>
+      <button
+        type="button"
+        aria-label={label}
+        title={label}
+        onClick={() => setSource(resolveAttachment(messageId, index, { name, dataUrl }))}
+        className={className}
+      >
+        {children}
+      </button>
+      {source && (
+        <AttachmentPreview source={source} onClose={() => setSource(null)} />
+      )}
+    </>
+  );
 }
 
 /**
@@ -320,20 +377,43 @@ export function MessageRow({
               {(message.imageDataUrls?.length
                 ? message.imageDataUrls
                 : [message.imageDataUrl as string]
-              ).map((url, i) => (
-                /* eslint-disable-next-line @next/next/no-img-element */
-                <img
-                  key={i}
-                  src={url}
-                  alt={`Attached image ${i + 1}`}
-                  className="max-h-40 rounded-ts border border-border object-cover"
-                />
-              ))}
+              ).map((url, i) => {
+                // The real filename when this tab still holds the file;
+                // otherwise the position, which is all the message persists.
+                const held = attachmentFile(message.id, i);
+                const name = held?.name ?? `Attached image ${i + 1}`;
+                return (
+                  <OpenableAttachment
+                    key={i}
+                    messageId={message.id}
+                    index={i}
+                    name={name}
+                    dataUrl={url}
+                    className="block rounded-ts focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+                  >
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img
+                      src={url}
+                      alt={`Attached image ${i + 1}`}
+                      className="max-h-40 rounded-ts border border-border object-cover"
+                    />
+                  </OpenableAttachment>
+                );
+              })}
             </div>
           )}
           {message.pdfName && (
-            <div className="mb-1.5 flex justify-end">
-              <span className="inline-flex items-center gap-2 rounded-2xl border border-border bg-surface-2 py-1.5 pl-1.5 pr-3">
+            <div className="mb-1.5 flex flex-col items-end">
+              {/* Same chip, now a real control (NEW-09). The classes below are
+                  the ones it already had; only the hover tint and the focus
+                  ring are new, because a thing that can be clicked has to look
+                  and behave like it. */}
+              <OpenableAttachment
+                messageId={message.id}
+                index={0}
+                name={message.pdfName}
+                className="inline-flex items-center gap-2 rounded-2xl border border-border bg-surface-2 py-1.5 pl-1.5 pr-3 text-left transition-colors duration-ts hover:border-accent/50 hover:bg-surface focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+              >
                 <span className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-danger/15 text-danger">
                   <IconFileText size={16} />
                 </span>
@@ -344,10 +424,10 @@ export function MessageRow({
                   {/* pdfName carries EVERY non-image attachment (datasets
                       included) — a .csv labelled "PDF" was just wrong. */}
                   <span className="text-[10px] uppercase tracking-wide text-faint">
-                    {fileBadge(message.pdfName)}
+                    {fileBadgeFor(message.pdfName)}
                   </span>
                 </span>
-              </span>
+              </OpenableAttachment>
             </div>
           )}
           {message.meta?.pasted?.map((p) => (

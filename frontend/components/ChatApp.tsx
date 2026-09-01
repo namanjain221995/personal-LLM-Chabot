@@ -39,7 +39,14 @@ import {
   savePrefs,
   type ChatPrefs,
 } from '@/lib/prefs';
-import { attachmentsForResend, rememberAttachments } from '@/lib/attachments';
+import {
+  attachmentsForResend,
+  carryAttachmentFiles,
+  dragHasFiles,
+  dropIntent,
+  rememberAttachments,
+  rememberAttachmentFiles,
+} from '@/lib/attachments';
 import {
   branchForAppend,
   branchForVersion,
@@ -203,6 +210,11 @@ export function ChatApp() {
   const [submittingClarificationId, setSubmittingClarificationId] = useState<
     string | null
   >(null);
+
+  /** NEW-10: a file is being dragged over the conversation column. */
+  const [dragActive, setDragActive] = useState(false);
+  /** How many nested elements that drag is currently inside — see onDragEnter. */
+  const dragDepth = useRef(0);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<ComposerHandle>(null);
@@ -750,6 +762,17 @@ export function ChatApp() {
         ),
         createdAt: Date.now(),
       };
+      // NEW-09: keep the original Files for this tab so the cards below can be
+      // OPENED. Positional and keyed by message id, because two turns are
+      // allowed to attach two different files both called `invoice.pdf`, and
+      // the order here is exactly the order MessageRow renders them in: the
+      // lone PDF/dataset, or the images in sequence.
+      rememberAttachmentFiles(
+        userMessage.id,
+        (isPdf || isDataset ? (first ? [first] : []) : images).map((a) =>
+          a.file ? { name: a.name, mime: a.file.type, blob: a.file } : null,
+        ),
+      );
       // Keep the payloads in memory so regenerate/retry re-send the same
       // question WITH its attachments (never persisted — see lib/attachments).
       if (!isDataset) {
@@ -853,6 +876,12 @@ export function ChatApp() {
             context,
             assistantBranch: answerBranch,
             prefs: prefsRef.current,
+            // NEW-14: the file itself does not travel — it is already on the
+            // server, keyed by this conversation. Saying so is what lets the
+            // proxy give a wordless dataset send a question to ask, instead of
+            // rejecting it as an empty request (which is what produced a 400
+            // immediately after a perfectly successful upload).
+            dataset: true,
           });
           disarmDeepResearch();
         })();
@@ -1123,6 +1152,9 @@ export function ChatApp() {
 
       setEditingMessageId(null);
       rememberAttachments(edited.id, attachments);
+      // The edit is a new message carrying the SAME attachments, so the files
+      // follow it — otherwise rewording a question turned its file card dead.
+      carryAttachmentFiles(original.id, edited.id);
       persist(id, turns);
       setMessages(turns);
       // Show the version just written, the way ChatGPT lands you on 2 / 2.
@@ -1452,6 +1484,106 @@ export function ChatApp() {
   // Chats generating right now — in this tab OR server-side (after reload).
   const busyIds = Array.from(new Set([...streamingIds(), ...serverActive]));
 
+  /* ------------------------------------------------- NEW-10: file drop -- */
+
+  // The same three conditions the Composer refuses on — a chat still being
+  // restored, a dataset upload in flight, and an answer streaming (the "+"
+  // menu greys "Add photos & files" out mid-stream). Read here only to decide
+  // whether to PROMISE a drop will work: whether one is actually ACCEPTED is
+  // the Composer's call, always, so a drop can never take a route the "+" menu
+  // would have refused, and a rejected drop still gets the picker's own toast
+  // rather than vanishing.
+  const uploading = datasetUpload?.status === 'uploading';
+  const canAttach = !reconciling && !uploading && !streaming;
+
+  /**
+   * Depth, not a boolean.
+   *
+   * `dragleave` fires when the pointer crosses into a CHILD, and it arrives
+   * after that child's `dragenter`. A plain enter/leave toggle therefore
+   * strobes the overlay on and off all the way down the message list. Counting
+   * how many nested elements the drag is currently inside is the reliable fix.
+   */
+  function onDragEnter(e: React.DragEvent<HTMLDivElement>) {
+    if (!dragHasFiles(e.dataTransfer)) return;
+    dragDepth.current += 1;
+    if (dragDepth.current === 1 && canAttach) setDragActive(true);
+  }
+
+  function onDragOver(e: React.DragEvent<HTMLDivElement>) {
+    // ONLY for files. Left alone, a text or link drag keeps the browser's own
+    // behaviour everywhere in the app.
+    if (!dragHasFiles(e.dataTransfer)) return;
+    e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+  }
+
+  function onDragLeave(e: React.DragEvent<HTMLDivElement>) {
+    if (!dragHasFiles(e.dataTransfer)) return;
+    dragDepth.current = Math.max(0, dragDepth.current - 1);
+    if (dragDepth.current === 0) setDragActive(false);
+  }
+
+  /**
+   * NEW-10A — the drop, decided once by `dropIntent`.
+   *
+   * The previous version asked `types.includes('Files')` and, when the answer
+   * was no, RETURNED WITHOUT PREVENTING THE DEFAULT. That is how a dragged file
+   * turned into `file:///…` typed into the composer: sources that describe a
+   * file only as `text/uri-list` fell straight through to the textarea, whose
+   * default action for dropped text is to insert it.
+   *
+   * So the intent decides, and only `ignore` — a genuine text or web-link drag,
+   * which must keep behaving exactly as the browser intends — is allowed to
+   * reach the default. Everything else is prevented here, before the textarea
+   * ever sees it. That is also why these are bound in the CAPTURE phase: the
+   * region has to own the event on the way DOWN to the textarea, not on the way
+   * back up from it.
+   */
+  function onDrop(e: React.DragEvent<HTMLDivElement>) {
+    const intent = dropIntent(e.dataTransfer);
+    if (intent.action !== 'ignore') {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+    dragDepth.current = 0;
+    setDragActive(false);
+
+    if (intent.action === 'ignore') return;
+
+    if (intent.action === 'file-uri') {
+      // The source handed over a LINK to a file rather than its bytes. A web
+      // page may not read a local path — that is browser security, not a gap
+      // to work around — so the only honest options are to say so or to paste
+      // the path into the prompt, and pasting it is what the bug did.
+      toast(
+        'This drag source gave a file link, not the file itself. Drag the file from your file manager, or use + → Add photos & files.',
+        'error',
+      );
+      return;
+    }
+
+    if (intent.action === 'directories') {
+      toast(
+        'Folders can’t be attached — drop the files inside it instead.',
+        'error',
+      );
+      return;
+    }
+
+    // Chrome hands a dropped folder over as a 0-byte File, so a mixed drop
+    // says so rather than failing validation with a baffling type complaint.
+    if (intent.directories > 0) {
+      toast(
+        'Folders can’t be attached — drop the files inside it instead.',
+        'error',
+      );
+    }
+    // Straight into the composer's own pipeline: same validation, same caps,
+    // same toasts, same refusal while a chat is loading or an upload is live.
+    composerRef.current?.acceptFiles(intent.files);
+  }
+
   return (
     <div className="flex h-dvh overflow-hidden">
       <Sidebar
@@ -1503,7 +1635,37 @@ export function ChatApp() {
         onNewChat={newChat}
       />
 
-      <div className="flex min-w-0 flex-1 flex-col">
+      {/* NEW-10: the conversation column is the drop region — the thread, the
+          header and the composer, but deliberately NOT the sidebar, where a
+          dropped file has no meaning. The handlers ignore every drag that is
+          not carrying files, so text and link dragging is untouched. */}
+      <div
+        data-file-drop-zone
+        // CAPTURE, not bubble (NEW-10A): the region must take the event on the
+        // way down, before the <textarea> inside it applies its own default of
+        // typing dropped text into the prompt.
+        onDragEnterCapture={onDragEnter}
+        onDragOverCapture={onDragOver}
+        onDragLeaveCapture={onDragLeave}
+        onDropCapture={onDrop}
+        className="relative flex min-w-0 flex-1 flex-col"
+      >
+        {dragActive && (
+          /* Pointer-events-none: an overlay that swallowed the drag would fire
+             leave/enter against itself and strobe. It paints over the column
+             and changes no layout, so nothing behind it moves. */
+          <div className="pointer-events-none absolute inset-2 z-40 flex items-center justify-center rounded-ts border-2 border-dashed border-accent/60 bg-bg/70">
+            {/* Words, not just a colour — and mounted exactly once per drag,
+                so a screen reader hears it once rather than on every
+                dragenter the pointer generates crossing the message list. */}
+            <span
+              role="status"
+              className="rounded-full border border-accent/40 bg-surface px-4 py-2 text-sm font-medium text-ink shadow-lg"
+            >
+              Drop files to attach
+            </span>
+          </div>
+        )}
         {/* ChatGPT-parity header: no app name, no chat title. The sidebar owns
             its own collapse button, so this one only appears once the sidebar
             is hidden — it is the only way back. The title stays as sr-only
