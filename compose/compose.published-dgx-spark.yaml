@@ -3,9 +3,17 @@
 # network and are reachable only by the orchestrator and sync worker.
 #
 # These endpoints have NO authentication. Publishing them on a non-loopback
-# TECHSARA_BIND_ADDRESS exposes unauthenticated model inference — and, through
-# it, whatever those models can be asked to do — to every host that can reach
-# this machine. Only do that on a network you control.
+# address exposes unauthenticated model inference — and, through it, whatever
+# those models can be asked to do — to every host that can reach this machine.
+#
+# The AUXILIARY models below therefore follow TECHSARA_MODEL_BIND_ADDRESS
+# (default 127.0.0.1), NOT TECHSARA_BIND_ADDRESS. The two were one variable
+# until 2026-09-01, which meant opening the app to the LAN also opened four
+# unauthenticated model APIs to it — measured: `curl 192.168.9.54:8002/v1/models`
+# answered 200 from any host on the office network. Nothing in the application
+# needs these published: the orchestrator reaches them by service name over the
+# `inference` network (ROUTER_BASE_URL=http://vllm-router:30002/v1), and
+# Prometheus scrapes them the same way. Publishing is for debugging only.
 #
 # Publishing also attaches these services to the routable `application`
 # network. Docker records a port binding for a container that is only on an
@@ -24,25 +32,25 @@ services:
       - inference
       - application
     ports:
-      - "${TECHSARA_BIND_ADDRESS:-127.0.0.1}:${VLLM_ROUTER_PORT:-8002}:30002"
+      - "${TECHSARA_MODEL_BIND_ADDRESS:-127.0.0.1}:${VLLM_ROUTER_PORT:-8002}:30002"
 
   vllm-embed:
     networks:
       - inference
       - application
     ports:
-      - "${TECHSARA_BIND_ADDRESS:-127.0.0.1}:${VLLM_EMBED_PORT:-8003}:30003"
+      - "${TECHSARA_MODEL_BIND_ADDRESS:-127.0.0.1}:${VLLM_EMBED_PORT:-8003}:30003"
 
   vllm-ocr:
     networks:
       - inference
       - application
     ports:
-      - "${TECHSARA_BIND_ADDRESS:-127.0.0.1}:${VLLM_OCR_PORT:-8004}:30004"
+      - "${TECHSARA_MODEL_BIND_ADDRESS:-127.0.0.1}:${VLLM_OCR_PORT:-8004}:30004"
 
   vllm-reranker:
     networks:
       - inference
       - application
     ports:
-      - "${TECHSARA_BIND_ADDRESS:-127.0.0.1}:${VLLM_RERANKER_PORT:-8005}:30005"
+      - "${TECHSARA_MODEL_BIND_ADDRESS:-127.0.0.1}:${VLLM_RERANKER_PORT:-8005}:30005"

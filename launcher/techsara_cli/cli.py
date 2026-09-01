@@ -1968,6 +1968,85 @@ def _cmd_logs(args: argparse.Namespace, *, root: Path) -> int:
     return 0
 
 
+def _cmd_auth_bootstrap(args: argparse.Namespace, *, root: Path) -> int:
+    """Establish the first SUPER_ADMIN by running the orchestrator's own
+    bootstrap module inside its container.
+
+    The password never touches argv or launcher output: an
+    AUTH_BOOTSTRAP_PASSWORD the caller exported is forwarded by NAME only
+    (``docker compose exec -e KEY`` resolves the value from the launcher's
+    process environment), and otherwise the module prompts over the allocated
+    TTY with echo off.
+    """
+    layout = RuntimeLayout.for_project(root)
+    compose = _compose_from_state(layout)
+    if compose is None:
+        raise TechSaraError(
+            "no launcher-managed stack is recorded here; run `./techsara up` "
+            "first, then retry `./techsara auth bootstrap`"
+        )
+    try:
+        rows = compose.ps("orchestrator")
+    except TechSaraError:
+        rows = []
+    state = (
+        str(rows[0].get("State") or rows[0].get("state") or "").lower() if rows else ""
+    )
+    if state != "running":
+        raise TechSaraError(
+            "the orchestrator container is not running"
+            + (f" (state: {state})" if state else "")
+            + "; run `./techsara up` first, then retry `./techsara auth bootstrap`"
+        )
+
+    interactive = sys.stdin.isatty()
+    password = os.environ.get("AUTH_BOOTSTRAP_PASSWORD", "")
+    if not password and not interactive:
+        raise TechSaraError(
+            "stdin is not a TTY and AUTH_BOOTSTRAP_PASSWORD is not set; export "
+            "AUTH_BOOTSTRAP_PASSWORD for unattended use or run from an "
+            "interactive terminal so the password can be prompted"
+        )
+    exec_args = ["exec"]
+    if not interactive:
+        # Compose allocates a pseudo-TTY by default; it refuses when stdin is
+        # not one, so disable it and rely on the exported password instead.
+        exec_args.append("-T")
+    if password:
+        exec_args.extend(["-e", "AUTH_BOOTSTRAP_PASSWORD"])
+    exec_args.extend(
+        ["orchestrator", "python", "-m", "app.authn.bootstrap", "--email", args.email]
+    )
+    if args.name:
+        exec_args.extend(["--name", args.name])
+    if args.no_adopt:
+        exec_args.append("--no-adopt")
+
+    # The same environment every other Compose invocation gets, so the
+    # ${...} interpolation of the compose files stays consistent.
+    env = compose._environment()
+    if password:
+        env["AUTH_BOOTSTRAP_PASSWORD"] = password
+    try:
+        # Deliberately not compose.run(): no capture and no timeout, because
+        # the container process may be holding a live no-echo password prompt.
+        completed = subprocess.run(
+            compose.command(*exec_args), cwd=str(compose.project_root), env=env
+        )
+    except OSError as exc:
+        raise TechSaraError(f"could not run docker compose exec: {exc}") from exc
+    return completed.returncode
+
+
+def _cmd_auth_invite(args: argparse.Namespace, *, root: Path) -> int:
+    print(
+        "Invitations are created in the web UI: sign in as an administrator,\n"
+        "open /admin -> Invitations, and create one there. Each invitation\n"
+        "produces a one-time accept link to hand to the new member."
+    )
+    return 0
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="techsara", description="Portable TechSara local AI platform launcher")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1992,6 +2071,13 @@ def _parser() -> argparse.ArgumentParser:
     update = sub.add_parser("update-models")
     update.add_argument("--offline", action="store_true")
     update.add_argument("--dry-run", action="store_true")
+    auth = sub.add_parser("auth")
+    auth_sub = auth.add_subparsers(dest="auth_command", required=True)
+    bootstrap = auth_sub.add_parser("bootstrap")
+    bootstrap.add_argument("--email", required=True)
+    bootstrap.add_argument("--name", default="")
+    bootstrap.add_argument("--no-adopt", action="store_true")
+    auth_sub.add_parser("invite")
     return parser
 
 
@@ -2021,6 +2107,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _cmd_redetect(args, root=root)
         if args.command == "update-models":
             return _cmd_models(args, root=root, ensure=True)
+        if args.command == "auth":
+            if args.auth_command == "bootstrap":
+                return _cmd_auth_bootstrap(args, root=root)
+            return _cmd_auth_invite(args, root=root)
         parser.error("unknown command")
     except KeyboardInterrupt:
         print("\nTechSara operation interrupted; rerun the same command to resume safely.", file=sys.stderr)

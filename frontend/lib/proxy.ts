@@ -27,6 +27,20 @@ export async function proxyToOrchestrator(
   if (cookie) headers.cookie = cookie;
   const contentType = req.headers.get('content-type');
   if (contentType) headers['content-type'] = contentType;
+  // Carry the CALLER's address and browser through to the orchestrator, or
+  // every audit event and session row records this proxy instead of the
+  // person. `cf-connecting-ip` is Cloudflare's (it overwrites anything a
+  // client sends, so it is the trustworthy one when a tunnel is in front);
+  // x-forwarded-for is the fallback. The orchestrator only believes either
+  // when AUTH_TRUST_PROXY_HEADERS is on, which is the deployment saying "a
+  // proxy I control sets these".
+  const forwardedFor =
+    req.headers.get('cf-connecting-ip') ?? req.headers.get('x-forwarded-for');
+  if (forwardedFor) headers['x-forwarded-for'] = forwardedFor;
+  const forwardedProto = req.headers.get('x-forwarded-proto');
+  if (forwardedProto) headers['x-forwarded-proto'] = forwardedProto;
+  const userAgent = req.headers.get('user-agent');
+  if (userAgent) headers['user-agent'] = userAgent;
 
   let upstream: Response;
   try {

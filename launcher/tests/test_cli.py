@@ -82,6 +82,39 @@ class ParserAndDispatchTests(unittest.TestCase):
         ):
             with self.subTest(command=command):
                 self.assertEqual(parser.parse_args([command]).command, command)
+        for argv, auth_command in (
+            (["auth", "bootstrap", "--email", "owner@example.com"], "bootstrap"),
+            (["auth", "invite"], "invite"),
+        ):
+            with self.subTest(command=" ".join(argv[:2])):
+                args = parser.parse_args(argv)
+                self.assertEqual(args.command, "auth")
+                self.assertEqual(args.auth_command, auth_command)
+
+    def test_auth_bootstrap_accepts_all_declared_flags_and_requires_email(self) -> None:
+        parser = cli._parser()
+        args = parser.parse_args(
+            [
+                "auth",
+                "bootstrap",
+                "--email",
+                "owner@example.com",
+                "--name",
+                "Workspace Owner",
+                "--no-adopt",
+            ]
+        )
+        self.assertEqual(args.email, "owner@example.com")
+        self.assertEqual(args.name, "Workspace Owner")
+        self.assertTrue(args.no_adopt)
+        defaults = parser.parse_args(["auth", "bootstrap", "--email", "owner@example.com"])
+        self.assertEqual(defaults.name, "")
+        self.assertFalse(defaults.no_adopt)
+        for argv in (["auth"], ["auth", "bootstrap"]):
+            with self.subTest(argv=argv), redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as caught:
+                    parser.parse_args(argv)
+                self.assertEqual(caught.exception.code, 2)
 
     def test_up_and_restart_accept_all_declared_overrides(self) -> None:
         parser = cli._parser()
@@ -137,6 +170,17 @@ class ParserAndDispatchTests(unittest.TestCase):
                 stack.enter_context(patch.object(cli, "_project_root", return_value=root))
                 handler = stack.enter_context(patch.object(cli, target, return_value=17))
                 self.assertEqual(cli.main([command]), 17)
+                handler.assert_called_once()
+                self.assertEqual(handler.call_args.kwargs["root"], root)
+        auth_cases = {
+            ("auth", "bootstrap", "--email", "owner@example.com"): "_cmd_auth_bootstrap",
+            ("auth", "invite"): "_cmd_auth_invite",
+        }
+        for argv, target in auth_cases.items():
+            with self.subTest(command=" ".join(argv[:2])), ExitStack() as stack:
+                stack.enter_context(patch.object(cli, "_project_root", return_value=root))
+                handler = stack.enter_context(patch.object(cli, target, return_value=17))
+                self.assertEqual(cli.main(list(argv)), 17)
                 handler.assert_called_once()
                 self.assertEqual(handler.call_args.kwargs["root"], root)
 
@@ -2391,6 +2435,141 @@ class LifecycleAndUtilityCommandTests(unittest.TestCase):
         self.assertIn("[orchestrator]", output)
         self.assertNotIn("old line", output)
         self.assertNotIn("unselected", output)
+
+    def test_auth_bootstrap_execs_the_module_with_password_by_name_never_argv(self) -> None:
+        secret = "fixture-bootstrap-password"
+        compose = Mock()
+        compose.project_root = self.root
+        compose.ps.return_value = [{"State": "running"}]
+        compose.command.return_value = ["docker", "compose", "exec-fixture"]
+        compose._environment.return_value = {"PATH": "/usr/bin"}
+        run = Mock(return_value=SimpleNamespace(returncode=7))
+        with (
+            patch.object(cli.RuntimeLayout, "for_project", return_value=self.layout),
+            patch.object(cli, "_compose_from_state", return_value=compose),
+            patch.object(cli.sys, "stdin", SimpleNamespace(isatty=lambda: False)),
+            patch.dict(os.environ, {"AUTH_BOOTSTRAP_PASSWORD": secret}),
+            patch.object(cli.subprocess, "run", run),
+        ):
+            result = cli._cmd_auth_bootstrap(
+                argparse.Namespace(
+                    email="owner@example.com", name="Workspace Owner", no_adopt=True
+                ),
+                root=self.root,
+            )
+        self.assertEqual(result, 7)
+        compose.ps.assert_called_once_with("orchestrator")
+        compose.command.assert_called_once_with(
+            "exec",
+            "-T",
+            "-e",
+            "AUTH_BOOTSTRAP_PASSWORD",
+            "orchestrator",
+            "python",
+            "-m",
+            "app.authn.bootstrap",
+            "--email",
+            "owner@example.com",
+            "--name",
+            "Workspace Owner",
+            "--no-adopt",
+        )
+        self.assertNotIn(secret, compose.command.call_args.args)
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[0], ["docker", "compose", "exec-fixture"])
+        self.assertEqual(run.call_args.kwargs["cwd"], str(self.root))
+        self.assertEqual(run.call_args.kwargs["env"]["AUTH_BOOTSTRAP_PASSWORD"], secret)
+
+    def test_auth_bootstrap_keeps_the_tty_prompt_when_interactive(self) -> None:
+        compose = Mock()
+        compose.project_root = self.root
+        compose.ps.return_value = [{"State": "running"}]
+        compose.command.return_value = ["fixture-argv"]
+        compose._environment.return_value = {"PATH": "/usr/bin"}
+        environ = {k: v for k, v in os.environ.items() if k != "AUTH_BOOTSTRAP_PASSWORD"}
+        run = Mock(return_value=SimpleNamespace(returncode=0))
+        with (
+            patch.object(cli.RuntimeLayout, "for_project", return_value=self.layout),
+            patch.object(cli, "_compose_from_state", return_value=compose),
+            patch.object(cli.sys, "stdin", SimpleNamespace(isatty=lambda: True)),
+            patch.dict(os.environ, environ, clear=True),
+            patch.object(cli.subprocess, "run", run),
+        ):
+            self.assertEqual(
+                cli._cmd_auth_bootstrap(
+                    argparse.Namespace(email="owner@example.com", name="", no_adopt=False),
+                    root=self.root,
+                ),
+                0,
+            )
+        exec_args = compose.command.call_args.args
+        self.assertNotIn("-T", exec_args)
+        self.assertNotIn("-e", exec_args)
+        self.assertEqual(
+            exec_args,
+            (
+                "exec",
+                "orchestrator",
+                "python",
+                "-m",
+                "app.authn.bootstrap",
+                "--email",
+                "owner@example.com",
+            ),
+        )
+        self.assertNotIn("AUTH_BOOTSTRAP_PASSWORD", run.call_args.kwargs["env"])
+
+    def test_auth_bootstrap_requires_a_recorded_stack_and_running_orchestrator(self) -> None:
+        args = argparse.Namespace(email="owner@example.com", name="", no_adopt=False)
+        with (
+            patch.object(cli.RuntimeLayout, "for_project", return_value=self.layout),
+            patch.object(cli, "_compose_from_state", return_value=None),
+        ):
+            with self.assertRaisesRegex(TechSaraError, "techsara up"):
+                cli._cmd_auth_bootstrap(args, root=self.root)
+        for rows in ([], [{"State": "exited"}], TechSaraError("daemon is down")):
+            compose = Mock()
+            if isinstance(rows, TechSaraError):
+                compose.ps.side_effect = rows
+            else:
+                compose.ps.return_value = rows
+            run = Mock()
+            with (
+                self.subTest(rows=rows),
+                patch.object(cli.RuntimeLayout, "for_project", return_value=self.layout),
+                patch.object(cli, "_compose_from_state", return_value=compose),
+                patch.object(cli.subprocess, "run", run),
+            ):
+                with self.assertRaisesRegex(TechSaraError, "techsara up"):
+                    cli._cmd_auth_bootstrap(args, root=self.root)
+            run.assert_not_called()
+
+    def test_auth_bootstrap_refuses_piped_stdin_without_exported_password(self) -> None:
+        compose = Mock()
+        compose.ps.return_value = [{"State": "running"}]
+        environ = {k: v for k, v in os.environ.items() if k != "AUTH_BOOTSTRAP_PASSWORD"}
+        run = Mock()
+        with (
+            patch.object(cli.RuntimeLayout, "for_project", return_value=self.layout),
+            patch.object(cli, "_compose_from_state", return_value=compose),
+            patch.object(cli.sys, "stdin", SimpleNamespace(isatty=lambda: False)),
+            patch.dict(os.environ, environ, clear=True),
+            patch.object(cli.subprocess, "run", run),
+        ):
+            with self.assertRaisesRegex(TechSaraError, "AUTH_BOOTSTRAP_PASSWORD"):
+                cli._cmd_auth_bootstrap(
+                    argparse.Namespace(email="owner@example.com", name="", no_adopt=False),
+                    root=self.root,
+                )
+        run.assert_not_called()
+
+    def test_auth_invite_points_to_the_admin_web_ui(self) -> None:
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            self.assertEqual(cli._cmd_auth_invite(argparse.Namespace(), root=self.root), 0)
+        output = stdout.getvalue()
+        self.assertIn("/admin", output)
+        self.assertIn("administrator", output)
 
 
 class ClusterScriptRunnerTests(unittest.TestCase):

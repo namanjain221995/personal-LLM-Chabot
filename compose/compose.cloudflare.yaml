@@ -1,0 +1,57 @@
+# Public access via Cloudflare Tunnel — OPT-IN (profile: tunnel).
+#
+# WHY A TUNNEL AND NOT A DNS RECORD. This machine has no public address: it
+# sits behind NAT on 192.168.9.0/22. `cloudflared` solves that by dialling OUT
+# to Cloudflare and holding the connection open, so requests arrive over a
+# link this side established. Nothing is port-forwarded, no firewall rule is
+# opened, and the router needs no configuration.
+#
+# WHAT IT EXPOSES. Only what the tunnel's ingress maps — one hostname to
+# `frontend:3000`, reached over the internal Docker network. The model APIs
+# (8000/8002-8005), PostgreSQL and pgAdmin are NOT part of that mapping and
+# stay unreachable from the internet even if their host bindings are wrong.
+# The orchestrator is not mapped either: browsers talk to the Next.js
+# frontend, which proxies to it server-side.
+#
+# CREDENTIALS. CLOUDFLARE_TUNNEL_TOKEN is issued by the Cloudflare dashboard
+# (Zero Trust -> Networks -> Tunnels) and lives in .runtime/secrets.env, which
+# is gitignored and 0600. It is a bearer credential for the tunnel: anyone
+# holding it can serve traffic on that hostname, so it is never committed,
+# never logged, and never passed on a command line.
+#
+#   docker compose ... --profile tunnel up -d cloudflared
+#
+# Bringing it DOWN takes the site offline within seconds and leaves everything
+# else running — the tunnel is not a dependency of any other service.
+services:
+  cloudflared:
+    # 2026.8.3. Digest-pinned like every other image here; cloudflared
+    # self-updates by default, which would silently change the binary under a
+    # pinned tag, so --no-autoupdate is passed below.
+    image: cloudflare/cloudflared@sha256:51c9cefcb4569df44e1ad403ab1d3d8065aa8e84339bcfc6aee75502e1140339
+    profiles: [tunnel]
+    command: tunnel --no-autoupdate --metrics 0.0.0.0:20241 run
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:?CLOUDFLARE_TUNNEL_TOKEN must be set — create the tunnel in the Cloudflare dashboard and put its token in .runtime/secrets.env}
+    # The application network is how it reaches `frontend:3000`. It is NOT on
+    # `inference`: the tunnel has no business being able to see the model APIs.
+    networks:
+      - application
+    # No `ports:` — deliberately. The connection is outbound; publishing
+    # anything here would defeat the point of using a tunnel.
+    restart: unless-stopped
+    healthcheck:
+      # cloudflared's own readiness endpoint: 200 once the tunnel has
+      # registered connections with Cloudflare's edge.
+      test:
+        - CMD-SHELL
+        - cloudflared tunnel --metrics 127.0.0.1:20241 ready || exit 1
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

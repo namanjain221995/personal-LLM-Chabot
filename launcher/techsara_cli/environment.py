@@ -361,6 +361,30 @@ def resolve_bind_address(values: Mapping[str, str]) -> str:
     return str(address)
 
 
+def resolve_model_bind_address(values: Mapping[str, str]) -> str:
+    """Where the UNAUTHENTICATED model APIs publish, if they publish at all.
+
+    Separate from TECHSARA_BIND_ADDRESS and defaulting to loopback REGARDLESS
+    of it (2026-09-01). One variable governed both until an audit found that
+    exposing the app — a reasonable thing to do, it sits behind a login —
+    had also put four model endpoints with no authentication on the office
+    LAN. Nothing in the stack needs them published: the orchestrator and
+    Prometheus both reach them by service name on the Docker network, so this
+    is purely a debugging convenience and should stay shut by default.
+    """
+    raw = str(values.get("TECHSARA_MODEL_BIND_ADDRESS", "") or "").strip()
+    if not raw:
+        return "127.0.0.1"
+    try:
+        address = ipaddress.ip_address(raw)
+    except ValueError as exc:
+        raise TechSaraError(
+            "TECHSARA_MODEL_BIND_ADDRESS must be a literal IP address such as "
+            f"127.0.0.1 (loopback only) or 0.0.0.0 (all interfaces); got {raw!r}"
+        ) from exc
+    return str(address)
+
+
 def publishes_beyond_loopback(bind_address: str) -> bool:
     try:
         return not ipaddress.ip_address(bind_address).is_loopback
@@ -460,6 +484,7 @@ def build_generated_environment(
     """Build a secret-free env map consumed by Compose and application code."""
     user_values = dict(user_environment or {})
     bind_address = resolve_bind_address(user_values)
+    model_bind_address = resolve_model_bind_address(user_values)
     publish_model_ports = _truthy(user_values.get("PUBLISH_MODEL_PORTS"))
     search_provider = search_provider.strip().lower() or "searxng"
     if search_provider not in {"searxng", "tavily", "brave"}:
@@ -566,6 +591,7 @@ def build_generated_environment(
         "TECHSARA_GENERATED_ENV": str(layout.generated_env),
         "TECHSARA_SECRET_ENV": str(layout.secrets_env),
         "TECHSARA_BIND_ADDRESS": bind_address,
+        "TECHSARA_MODEL_BIND_ADDRESS": model_bind_address,
         "TECHSARA_PUBLISH_MODEL_PORTS": _bool(publish_model_ports),
         "TECHSARA_CLUSTER_MODE": cluster_mode,
         "TECHSARA_CLUSTER_REASON": cluster.reason,

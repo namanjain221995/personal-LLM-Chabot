@@ -406,12 +406,20 @@ class ComposeOverlayValidationTests(unittest.TestCase):
             "VLLM_EMBED_PORT": "8003",
             "VLLM_OCR_PORT": "8004",
         }
+        # The AUXILIARY models deliberately do NOT follow TECHSARA_BIND_ADDRESS
+        # (2026-09-01). They have their own TECHSARA_MODEL_BIND_ADDRESS, which
+        # defaults to loopback, because they are UNAUTHENTICATED APIs: while
+        # one variable governed both, opening the app to the LAN also opened
+        # four model endpoints to it (measured — `curl 192.168.9.54:8002/v1/models`
+        # answered 200 from any host on the office network). Nothing needs them
+        # published: the orchestrator and Prometheus both reach them by service
+        # name on the Docker network.
         expected = {
             "dgx-spark": {
                 "vllm": ("0.0.0.0", 8000, 30000),
-                "vllm-router": ("0.0.0.0", 8002, 30002),
-                "vllm-embed": ("0.0.0.0", 8003, 30003),
-                "vllm-ocr": ("0.0.0.0", 8004, 30004),
+                "vllm-router": ("127.0.0.1", 8002, 30002),
+                "vllm-embed": ("127.0.0.1", 8003, 30003),
+                "vllm-ocr": ("127.0.0.1", 8004, 30004),
             },
             "nvidia-large": {
                 "vllm": ("0.0.0.0", 8000, 30000),
@@ -429,6 +437,48 @@ class ComposeOverlayValidationTests(unittest.TestCase):
                     self.assertEqual(port.get("host_ip"), host)
                     self.assertEqual(int(port.get("published")), published)
                     self.assertEqual(int(port.get("target")), target)
+
+    def test_model_bind_address_can_be_widened_deliberately(self) -> None:
+        """The loopback default is a default, not a wall.
+
+        Setting TECHSARA_MODEL_BIND_ADDRESS is how an operator says "I really
+        do want the unauthenticated model APIs on this interface" — the same
+        opt-in shape as PUBLISH_MODEL_PORTS, one level deeper.
+        """
+        env = {
+            "TECHSARA_BIND_ADDRESS": "0.0.0.0",
+            "TECHSARA_MODEL_BIND_ADDRESS": "192.168.9.54",
+            "PUBLISH_MODEL_PORTS": "true",
+            "VLLM_ROUTER_PORT": "8002",
+        }
+        _profile, rendered = self._render(FIXTURES["dgx-spark"], env)
+        ports = rendered["services"]["vllm-router"].get("ports") or []
+        self.assertEqual(ports[0].get("host_ip"), "192.168.9.54")
+
+    def test_aux_model_ports_stay_on_loopback_when_the_app_is_exposed(self) -> None:
+        """Exposing the APP must never be what exposes the MODELS.
+
+        This is the regression that mattered: TECHSARA_BIND_ADDRESS=0.0.0.0 is
+        a reasonable thing to set (the frontend and orchestrator are behind a
+        login), and before the split it silently published four endpoints that
+        have no authentication at all.
+        """
+        env = {
+            "TECHSARA_BIND_ADDRESS": "0.0.0.0",
+            "PUBLISH_MODEL_PORTS": "true",
+            "VLLM_ROUTER_PORT": "8002",
+            "VLLM_EMBED_PORT": "8003",
+            "VLLM_OCR_PORT": "8004",
+        }
+        _profile, rendered = self._render(FIXTURES["dgx-spark"], env)
+        for service in ("vllm-router", "vllm-embed", "vllm-ocr"):
+            with self.subTest(service=service):
+                ports = rendered["services"][service].get("ports") or []
+                self.assertEqual(
+                    ports[0].get("host_ip"),
+                    "127.0.0.1",
+                    f"{service} must not follow TECHSARA_BIND_ADDRESS",
+                )
 
     def test_a_published_service_is_attached_to_a_routable_network(self) -> None:
         """A port binding on an internal-only network is silently unreachable.
