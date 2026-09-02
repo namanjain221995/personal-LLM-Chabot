@@ -157,6 +157,41 @@ describe('B — a second press while one is in flight is not a second request', 
   });
 });
 
+/* ------------------------- B2. the transcript is never a casualty (CV-08) */
+
+describe('B2 — a failed or unverified compaction leaves the messages alone', () => {
+  it.each([
+    [
+      'unverified',
+      async (url: string) =>
+        url === '/api/chat/compact'
+          ? json({ compacted: true, folded_turns: 4, foldable_turns: 0, total_turns: 5 })
+          : json({ summary: '   ' }),
+    ],
+    [
+      'failed',
+      async () => {
+        throw new Error('network down');
+      },
+    ],
+  ])('CV-08 does not touch the thread it was handed (%s)', async (_kind, impl) => {
+    vi.stubGlobal('fetch', vi.fn(impl as never));
+    const messages = [
+      { role: 'user', content: 'My customer is Acme.' },
+      { role: 'assistant', content: 'Understood.' },
+    ];
+    const snapshot = JSON.stringify(messages);
+
+    const run = await requestCompact('conv-untouched', messages);
+
+    expect(run?.outcome.kind).not.toBe('compacted');
+    // The browser cannot repair the server's state; the least it can do is
+    // not damage what is on screen while reporting that.
+    expect(JSON.stringify(messages)).toBe(snapshot);
+    expect(messages).toHaveLength(2);
+  });
+});
+
 /* ------------------------------- C. success the browser cannot confirm */
 
 describe('C — a compaction with no summary behind it is NOT a success', () => {
