@@ -404,8 +404,8 @@ describe('sending several documents', () => {
     expect((opts.pdf as string).length).toBeGreaterThan(0);
     expect(opts.pdfUploads ?? null).toBeNull();
     // Background chrome (auth pings) may fetch; the UPLOAD rail must not.
-    const uploadCalls = fetchMock.mock.calls.filter(([u]: [unknown]) =>
-      String(u).startsWith('/api/upload'),
+    const uploadCalls = fetchMock.mock.calls.filter((call: unknown[]) =>
+      String(call[0]).startsWith('/api/upload'),
     );
     expect(uploadCalls.length).toBe(0);
   });
