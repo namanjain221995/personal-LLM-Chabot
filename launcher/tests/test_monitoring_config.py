@@ -22,9 +22,11 @@ and reads files; nothing starts, pulls or mutates.
 
 from __future__ import annotations
 
+import atexit
 import json
 import shutil
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -51,6 +53,32 @@ def _docker_compose_available() -> bool:
 
 HAVE_COMPOSE = _docker_compose_available()
 
+#: What `compose.yaml` demands that has NOTHING to do with monitoring. The env
+#: handed to Compose below is deliberately scrubbed, so without these it aborts
+#: on the FIRST thing it cannot resolve and every render here fails — which is
+#: what these six tests had been doing on every CI run, unnoticed because the
+#: job piped its output through `tail` and reported tail's exit status.
+#:
+#: `test_grafana_refuses_to_start_without_a_password` was the worst of it:
+#: Compose failed on POSTGRES_PASSWORD before it ever reached the Grafana
+#: guard, so the `assertIn` on the message failed and the test was RED — a
+#: red that CI masked. Each test still omits the one variable it is about.
+#:
+#: `.runtime/generated.env` is `required: true` in the x-runtime-env anchor but
+#: is written by `techsara up` and gitignored, so it never exists in a fresh
+#: checkout or on CI. Point the documented override at an EMPTY file rather
+#: than at `.env.example`, whose values would perturb the very settings these
+#: tests assert on — the bind address above all.
+_EMPTY_ENV_DIR = tempfile.mkdtemp(prefix="techsara-monitoring-test-")
+_EMPTY_ENV_FILE = Path(_EMPTY_ENV_DIR) / "generated.env"
+_EMPTY_ENV_FILE.write_text("")
+atexit.register(shutil.rmtree, _EMPTY_ENV_DIR, True)
+
+_REQUIRED_BY_BASE_COMPOSE = {
+    "POSTGRES_PASSWORD": "test-only",
+    "TECHSARA_GENERATED_ENV": str(_EMPTY_ENV_FILE),
+}
+
 
 def _render(files, env=None, profile="monitoring"):
     """`docker compose config --format json` over the given overlay chain.
@@ -70,7 +98,11 @@ def _render(files, env=None, profile="monitoring"):
         capture_output=True,
         text=True,
         timeout=180,
-        env={**{"PATH": "/usr/bin:/bin:/usr/local/bin"}, **(env or {})},
+        env={
+            **{"PATH": "/usr/bin:/bin:/usr/local/bin"},
+            **_REQUIRED_BY_BASE_COMPOSE,
+            **(env or {}),
+        },
     )
     if proc.returncode != 0:
         raise AssertionError(f"compose config failed:\n{proc.stderr[:2000]}")
