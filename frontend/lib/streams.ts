@@ -452,6 +452,13 @@ export interface StartStreamOptions {
   pdf?: string | null;
   pdfName?: string | null;
   /**
+   * 2026-09-02: documents that STREAMED to /api/upload (purpose=document)
+   * instead of riding inline — 512 MB of base64 through this JSON body would
+   * kill the tab and both servers. The orchestrator reads the stored bytes
+   * by reference; up to five per message.
+   */
+  pdfUploads?: { upload_id: string; name: string }[] | null;
+  /**
    * NEW-14: this turn has an uploaded dataset.
    *
    * A flag rather than a payload, because that is genuinely all there is to
@@ -543,6 +550,7 @@ export async function startStream(opts: StartStreamOptions): Promise<void> {
         ...(opts.pdf
           ? { pdf: opts.pdf, pdf_filename: opts.pdfName ?? undefined }
           : {}),
+        ...(opts.pdfUploads?.length ? { pdf_uploads: opts.pdfUploads } : {}),
         // NEW-14. Sent only when true, so every other request keeps exactly
         // the key set it had — this is a proxy hint, not part of the contract
         // with the orchestrator, which never sees it.

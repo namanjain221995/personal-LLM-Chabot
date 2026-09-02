@@ -12,13 +12,17 @@ asks for a re-upload — never a 500.
 """
 from __future__ import annotations
 
+import json
 import mimetypes
 import os
 import shutil
 import uuid
 from typing import Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+import re
+
+from fastapi import (APIRouter, Depends, File, Form, HTTPException, Request,
+                     UploadFile)
 from fastapi.responses import FileResponse
 
 from . import db
@@ -69,6 +73,10 @@ async def _stream_to_disk(upload: UploadFile, dest: str) -> int:
 async def create_upload(
     file: UploadFile = File(...),
     conversation_id: str = Form(...),
+    # "dataset" (extract + profile, the original is dropped) or "document"
+    # (keep the original byte-for-byte; PDFs/DOCX are not datasets and must
+    # not be profiled as one -- and the chat engine needs the actual bytes).
+    purpose: str = Form("dataset"),
     user: UserRow = Depends(require_user),
 ) -> dict:
     if not settings.dataset_uploads_enabled:
@@ -92,6 +100,36 @@ async def create_upload(
         pass  # housekeeping only; never blocks an upload
 
     size = await _stream_to_disk(file, raw_path)
+    if purpose == "document":
+        return await _finalise_document(conversation_id, upload_id, filename, size)
+    if purpose != "dataset":
+        shutil.rmtree(root, ignore_errors=True)
+        raise HTTPException(status_code=400, detail="unknown upload purpose")
+    return await _finalise_dataset(conversation_id, upload_id, filename, raw_path, size)
+
+
+async def _finalise_document(
+    conversation_id: str, upload_id: str, filename: str, size: int
+) -> dict:
+    """A document keeps its original bytes; nothing to extract or profile."""
+    await db.run_in_thread(
+        db.save_upload,
+        upload_id, conversation_id, filename, size, "ready", None, "document",
+    )
+    return {
+        "upload_id": upload_id,
+        "filename": filename,
+        "bytes": size,
+        "files": 1,
+        "notes": [],
+        "profile": [],
+    }
+
+
+async def _finalise_dataset(
+    conversation_id: str, upload_id: str, filename: str, raw_path: str, size: int
+) -> dict:
+    root = upload_root(conversation_id, upload_id)
     extract_dir = os.path.join(root, "extracted")
     notes: list = []
 
@@ -208,10 +246,22 @@ async def download_upload(
         raise HTTPException(status_code=404, detail="upload not found")
 
     if not path.is_file():
+        # DOCUMENTS keep their bytes in `_original`, not `extracted` — the
+        # dataset rail's shape. Without this fallback every document download
+        # answered 410 "expired" while the file sat on disk (owner report,
+        # 2026-09-02, minutes after document cards became openable at all).
+        original = resolve_upload_file(
+            settings.workspace_dir, conversation_id, upload_id, filename,
+            subdir="_original",
+        )
+        if original.is_file():
+            path = original
+
+    if not path.is_file():
         # Two ways to get here, and the user can act on both the same way.
-        # Either the workspace TTL swept the extracted files, or this upload was
-        # an ARCHIVE: create_upload deletes `_original` once it has extracted
-        # the members, so the .zip/.tar the user chose is genuinely not kept.
+        # Either the workspace TTL swept the files, or this upload was a
+        # DATASET ARCHIVE: the dataset finaliser deletes `_original` once it
+        # has extracted the members, so the .zip the user chose is not kept.
         raise HTTPException(
             status_code=410,
             detail=(
@@ -290,3 +340,140 @@ def list_uploads(
         if up["status"] == "ready" and not bytes_available(conversation_id, up["id"]):
             up["status"] = "expired"
     return {"uploads": uploads}
+
+
+# --------------------------------------------------------------- chunked
+# Cloudflare's edge caps a single request body at 100 MB on this plan, so a
+# 512 MB document cannot arrive in one POST over the public hostname however
+# generous every server-side limit is. The client slices big files into parts
+# under _PART_CAP and the pieces are reassembled here; each call carries the
+# same session and passes the same ownership check as everything else in this
+# file. LAN uploads may still use the single-shot endpoint above.
+
+_HEX32 = re.compile(r"^[0-9a-f]{32}$")
+#: Comfortably under the 100 MB edge wall, with room for multipart overhead.
+_PART_CAP = 90 * 1024 * 1024
+_MAX_PARTS = 64
+_MARKER = "_chunked.json"
+
+
+async def _own(conversation_id: str, user: UserRow) -> None:
+    owner = await db.run_in_thread(db.conversation_owner, conversation_id)
+    if owner is not None and owner != int(user["id"]):
+        raise HTTPException(status_code=404, detail="conversation not found")
+
+
+def _chunk_state(conversation_id: str, upload_id: str) -> tuple[str, dict]:
+    """The session's root and marker. 404 for ids init never minted — an
+    unmarked directory name is indistinguishable from a guess."""
+    if not _HEX32.fullmatch(upload_id or ""):
+        raise HTTPException(status_code=404, detail="upload not found")
+    root = upload_root(conversation_id, upload_id)
+    marker = os.path.join(root, _MARKER)
+    if not os.path.isfile(marker):
+        raise HTTPException(status_code=404, detail="upload not found")
+    with open(marker, encoding="utf-8") as fh:
+        return root, json.load(fh)
+
+
+@router.post("/chunked/init")
+async def chunked_init(
+    conversation_id: str = Form(...),
+    filename: str = Form(...),
+    purpose: str = Form("document"),
+    user: UserRow = Depends(require_user),
+) -> dict:
+    if not settings.dataset_uploads_enabled:
+        raise HTTPException(status_code=404, detail="uploads are disabled")
+    if purpose not in ("dataset", "document"):
+        raise HTTPException(status_code=400, detail="unknown upload purpose")
+    await _own(conversation_id, user)
+    upload_id = uuid.uuid4().hex
+    root = upload_root(conversation_id, upload_id)
+    os.makedirs(os.path.join(root, "_parts"), exist_ok=True)
+    with open(os.path.join(root, _MARKER), "w", encoding="utf-8") as fh:
+        json.dump(
+            {"filename": os.path.basename(filename or "upload.bin"),
+             "purpose": purpose},
+            fh,
+        )
+    return {
+        "upload_id": upload_id,
+        "part_limit_bytes": _PART_CAP,
+        "max_parts": _MAX_PARTS,
+    }
+
+
+@router.put("/chunked/{conversation_id}/{upload_id}/part/{index}")
+async def chunked_part(
+    conversation_id: str,
+    upload_id: str,
+    index: int,
+    request: Request,
+    user: UserRow = Depends(require_user),
+) -> dict:
+    await _own(conversation_id, user)
+    root, _state = _chunk_state(conversation_id, upload_id)
+    if not 0 <= index < _MAX_PARTS:
+        raise HTTPException(status_code=400, detail="part index out of range")
+    cap_total = settings.upload_max_mb * 1024 * 1024
+    parts_dir = os.path.join(root, "_parts")
+    already = sum(
+        e.stat().st_size for e in os.scandir(parts_dir) if e.is_file()
+    )
+    dest = os.path.join(parts_dir, f"{index:05d}")
+    written = 0
+    with open(dest, "wb") as out:
+        async for chunk in request.stream():
+            written += len(chunk)
+            if written > _PART_CAP or already + written > cap_total:
+                out.close()
+                os.unlink(dest)
+                raise HTTPException(
+                    status_code=413,
+                    detail=(
+                        f"part exceeds {_PART_CAP // (1024 * 1024)} MB"
+                        if written > _PART_CAP
+                        else f"That file is larger than {settings.upload_max_mb} MB."
+                    ),
+                )
+            out.write(chunk)
+    return {"received": written}
+
+
+@router.post("/chunked/{conversation_id}/{upload_id}/complete")
+async def chunked_complete(
+    conversation_id: str,
+    upload_id: str,
+    user: UserRow = Depends(require_user),
+) -> dict:
+    await _own(conversation_id, user)
+    root, state = _chunk_state(conversation_id, upload_id)
+    parts_dir = os.path.join(root, "_parts")
+    parts = sorted(e.name for e in os.scandir(parts_dir) if e.is_file())
+    if not parts:
+        raise HTTPException(status_code=400, detail="no parts were uploaded")
+    expected = [f"{i:05d}" for i in range(len(parts))]
+    if parts != expected:
+        raise HTTPException(
+            status_code=400,
+            detail="parts are not contiguous — re-upload the missing piece",
+        )
+    filename = state["filename"]
+    raw_path = os.path.join(root, "_original", filename)
+    os.makedirs(os.path.dirname(raw_path), exist_ok=True)
+    size = 0
+    with open(raw_path, "wb") as out:
+        for name in parts:
+            with open(os.path.join(parts_dir, name), "rb") as fh:
+                while True:
+                    chunk = fh.read(_CHUNK)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    out.write(chunk)
+    shutil.rmtree(parts_dir, ignore_errors=True)
+    os.unlink(os.path.join(root, _MARKER))
+    if state["purpose"] == "document":
+        return await _finalise_document(conversation_id, upload_id, filename, size)
+    return await _finalise_dataset(conversation_id, upload_id, filename, raw_path, size)

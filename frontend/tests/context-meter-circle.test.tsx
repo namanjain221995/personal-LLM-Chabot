@@ -382,6 +382,24 @@ describe('CTX-22 · compacting, announced but not shoved on screen', () => {
     expect(onCompactNow).toHaveBeenCalledTimes(1);
   });
 
+  it('is usable again after a failure left the count UNKNOWN', () => {
+    // Carried across from the other branch during conflict resolution: the
+    // test above re-enables with a known count, this one with `null`. A failed
+    // request is exactly how the count goes unknown, so the two are different
+    // recoveries and both are worth pinning.
+    const { onCompactNow, rerender } = setup({ compacting: true });
+    rerender(
+      <ContextMeter
+        view={viewAt(0.75)}
+        compacting={false}
+        onCompactNow={onCompactNow}
+        foldableTurns={null}
+      />,
+    );
+    fireEvent.click(ring());
+    expect(onCompactNow).toHaveBeenCalledTimes(1);
+  });
+
   it('keeps showing the last true reading — it never resets itself to 0%', () => {
     const { rerender, onCompactNow } = setup({ view: viewAt(0.75) });
     fireEvent.click(ring());

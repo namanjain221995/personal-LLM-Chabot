@@ -52,6 +52,7 @@ import {
   resolveAttachmentAsync,
   uploadRefFor,
 } from '@/lib/attachments';
+import { uploadDocumentFile } from '@/lib/uploadDocument';
 import {
   branchForAppend,
   branchForVersion,
@@ -728,6 +729,17 @@ export function ChatApp() {
       const first = attachments[0] ?? null;
       const isPdf = first?.kind === 'pdf';
       const isDataset = first?.kind === 'dataset';
+      // 2026-09-02: documents stack (up to five). ONE small document still
+      // rides inline — byte-identical wire to every conversation before it.
+      // Several documents, or any that skipped base64 for size, upload first
+      // (chunked past the Cloudflare 100 MB edge cap) and the request sends
+      // REFERENCES instead.
+      const docAttachments = attachments.filter((a) => a.kind === 'pdf');
+      const needsDocUpload =
+        docAttachments.length > 1 ||
+        docAttachments.some((a) => !a.base64 && !!a.file);
+      // Images and documents COEXIST in a message since 2026-09-02; only a
+      // dataset still stands alone (it answers through its own engine).
       const images = attachments.filter((a) => a.kind === 'image');
       let conversationId = activeId;
       if (!conversationId) {
@@ -770,14 +782,16 @@ export function ChatApp() {
                 ...(pasted.length ? { pasted } : {}),
                 ...(isPdf || isDataset
                   ? {
-                      attachments: [
-                        {
-                          name: first?.name ?? 'file',
-                          kind: isDataset
-                            ? ('dataset' as const)
-                            : ('pdf' as const),
-                        },
-                      ],
+                      // EVERY document, in attach order (2026-09-02). One
+                      // entry used to stand for the lot, which meant the sent
+                      // bubble showed one chip for five files and only the
+                      // first ever received its durable server id.
+                      attachments: isDataset
+                        ? [{ name: first?.name ?? 'file', kind: 'dataset' as const }]
+                        : docAttachments.map((a) => ({
+                            name: a.name,
+                            kind: 'pdf' as const,
+                          })),
                     }
                   : {}),
               }
@@ -829,7 +843,7 @@ export function ChatApp() {
       setUnreachable(false);
       // A dataset has to be uploaded before a stream can exist, so say that
       // instead of claiming the model is already running (see datasetUpload).
-      if (isDataset && first?.file) {
+      if ((isDataset && first?.file) || needsDocUpload) {
         setDatasetUpload({
           conversationId,
           messageId: userMessage.id,
@@ -842,30 +856,61 @@ export function ChatApp() {
       // about to be arguing with a thread that has changed underneath it.
       setEditingMessageId(null);
 
-      if (isDataset && first?.file) {
-        // Datasets stream to their own endpoint and are then referenced by the
-        // conversation, so the chat request itself stays small.
+      if ((isDataset && first?.file) || needsDocUpload) {
+        // Datasets and documents stream to their own endpoint and are then
+        // referenced by the conversation, so the chat request stays small
+        // whatever — and however many — the files weighed.
         void (async () => {
+          let docRefs: { upload_id: string; name: string }[] | null = null;
           try {
-            const form = new FormData();
-            form.append('file', first.file as File);
-            form.append('conversation_id', conversationId);
-            const res = await fetch('/api/upload', { method: 'POST', body: form });
-            const body = (await res.json()) as {
-              detail?: string;
-              files?: number;
-              upload_id?: string;
-            };
-            if (!res.ok) throw new Error(body.detail ?? 'upload failed');
+            let uploadedId: string | undefined;
+            if (needsDocUpload) {
+              const refs: { upload_id: string; name: string }[] = [];
+              for (const doc of docAttachments) {
+                // Reuse paths may carry only base64; the picker always keeps
+                // the File. Either way the server gets real bytes.
+                const src =
+                  doc.file ??
+                  new File(
+                    [Uint8Array.from(atob(doc.base64), (c) => c.charCodeAt(0))],
+                    doc.name,
+                  );
+                refs.push(await uploadDocumentFile(src, conversationId));
+              }
+              docRefs = refs;
+              refs.forEach((r, i) => {
+                const entry = userMessage.meta?.attachments?.[i];
+                if (entry) entry.id = r.upload_id;
+              });
+              uploadedId = undefined; // ids already linked, one per document
+              persist(conversationId, turns);
+              toast(
+                refs.length === 1
+                  ? `Uploaded ${docAttachments[0].name}.`
+                  : `Uploaded ${refs.length} documents.`,
+              );
+            } else {
+              const form = new FormData();
+              form.append('file', first.file as File);
+              form.append('conversation_id', conversationId);
+              const res = await fetch('/api/upload', { method: 'POST', body: form });
+              const body = (await res.json()) as {
+                detail?: string;
+                files?: number;
+                upload_id?: string;
+              };
+              if (!res.ok) throw new Error(body.detail ?? 'upload failed');
+              uploadedId = body.upload_id;
+              toast(
+                `Profiled ${body.files ?? 0} file${body.files === 1 ? '' : 's'} from ${first.name}.`,
+              );
+            }
             // Link the turn to the server's durable uploads row, so the
             // persisted message names the exact attachment it was asked about.
-            if (body.upload_id && userMessage.meta?.attachments?.[0]) {
-              userMessage.meta.attachments[0].id = body.upload_id;
+            if (uploadedId && userMessage.meta?.attachments?.[0]) {
+              userMessage.meta.attachments[0].id = uploadedId;
               persist(conversationId, turns);
             }
-            toast(
-              `Profiled ${body.files ?? 0} file${body.files === 1 ? '' : 's'} from ${first.name}.`,
-            );
             // H-01: the upload is done; the stream opened below owns the
             // "busy" story from here.
             setDatasetUpload(null);
@@ -905,22 +950,54 @@ export function ChatApp() {
             // proxy give a wordless dataset send a question to ask, instead of
             // rejecting it as an empty request (which is what produced a 400
             // immediately after a perfectly successful upload).
-            dataset: true,
+            ...(isDataset ? { dataset: true } : {}),
+            ...(docRefs?.length
+              ? {
+                  pdfUploads: docRefs,
+                  pdfName: docAttachments[0]?.name ?? null,
+                  images: images.map((i) => i.base64).filter(Boolean),
+                }
+              : {}),
           });
           disarmDeepResearch();
         })();
         return;
       }
 
+      // Durability for the inline path (2026-09-02): the answer streams NOW
+      // from the inline copy, while the same bytes upload quietly so the
+      // message's card can re-open in any browser, any time — the exact
+      // "no longer available in this browser session" complaint. Best-effort:
+      // a failed background upload costs only the re-open, never the answer.
+      if (isPdf && docAttachments[0]?.file && !needsDocUpload) {
+        const durableDoc = docAttachments[0];
+        void (async () => {
+          try {
+            const ref = await uploadDocumentFile(
+              durableDoc.file as File,
+              conversationId,
+            );
+            const entry = userMessage.meta?.attachments?.[0];
+            if (entry && !entry.id) {
+              entry.id = ref.upload_id;
+              persist(conversationId, turns);
+            }
+          } catch {
+            /* the inline answer already has the bytes */
+          }
+        })();
+      }
       void startStream({
         conversationId,
         turns,
         context,
         assistantBranch: answerBranch,
         prefs: prefsRef.current,
-        images: isPdf ? null : images.map((i) => i.base64).filter(Boolean),
-        pdf: isPdf ? first?.base64 ?? null : null,
-        pdfName: isPdf ? first?.name ?? null : null,
+        // 2026-09-02: images accompany documents now ("compare the chart to
+        // the report") — the document engine takes them as extra_images.
+        images: images.map((i) => i.base64).filter(Boolean),
+        pdf: isPdf ? docAttachments[0]?.base64 ?? null : null,
+        pdfName: isPdf ? docAttachments[0]?.name ?? null : null,
         clarification: clarification ?? null,
       });
       disarmDeepResearch();

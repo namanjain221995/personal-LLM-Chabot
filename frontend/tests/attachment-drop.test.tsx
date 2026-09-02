@@ -721,24 +721,26 @@ describe('CASE I — multiple file items', () => {
     ).toBeTruthy();
   });
 
-  it('gives an unsupported dropped file the picker message', async () => {
-    // NEW10A-22
-    const bad = new File(['x'], 'clip.mp4', { type: 'video/mp4' });
+  it('accepts a formerly-unsupported dropped file onto the document rail', async () => {
+    // NEW10A-22, inverted 2026-09-02: every file type is accepted now
+    // ("upload anything") — a video the engine cannot watch still gets
+    // attached, streamed, and named honestly by the server instead of being
+    // turned away at the door.
+    const clip = new File(['x'], 'clip.mp4', { type: 'video/mp4' });
     renderApp();
 
     dropOn(
       dropZone(),
       makeDataTransfer({
         types: ['Files'],
-        files: [bad],
-        items: [{ kind: 'file', file: bad }],
+        files: [clip],
+        items: [{ kind: 'file', file: clip }],
       }),
     );
 
-    expect(
-      await screen.findByText(/clip\.mp4 is MP4 — attach an image/),
-    ).toBeTruthy();
-    expect(chips().length).toBe(0);
+    await waitFor(() => expect(chips().length).toBe(1));
+    // The chip is the remove button; the filename lives in its aria-label.
+    expect(chips()[0].getAttribute('aria-label')).toContain('clip.mp4');
   });
 
   it('gives an oversized dropped file the picker size message', async () => {

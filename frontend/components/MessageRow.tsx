@@ -543,7 +543,54 @@ export function MessageRow({
               })}
             </div>
           )}
-          {message.pdfName && (
+          {(() => {
+            // 2026-09-02: several documents per message. Each meta entry gets
+            // its OWN chip at its own index, so every card opens, previews
+            // and re-attaches the right file. The single-pdfName block below
+            // keeps rendering one-document and legacy messages unchanged.
+            const docEntries = (message.meta?.attachments ?? []).filter(
+              (a) => a.kind === 'pdf',
+            );
+            if (docEntries.length <= 1) return null;
+            return (
+              <div className="mb-1.5 flex flex-col items-end gap-1.5">
+                {docEntries.map((entry, i) => (
+                  <OpenableAttachment
+                    key={i}
+                    messageId={message.id}
+                    index={i}
+                    name={entry.name ?? `Document ${i + 1}`}
+                    onReuse={
+                      onReuseAttachment ? () => onReuseAttachment(i) : undefined
+                    }
+                    upload={uploadRefFor(conversationId, message, i)}
+                    loaders={serverPreviewLoaders(
+                      conversationId,
+                      message,
+                      i,
+                      entry.name ?? `Document ${i + 1}`,
+                    )}
+                    className="inline-flex items-center gap-2 rounded-2xl border border-border bg-surface-2 py-1.5 pl-1.5 pr-3 text-left transition-colors duration-ts hover:border-accent/50 hover:bg-surface focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+                  >
+                    <span className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-danger/15 text-danger">
+                      <IconFileText size={16} />
+                    </span>
+                    <span className="flex flex-col">
+                      <span className="max-w-[220px] truncate text-xs text-ink">
+                        {entry.name ?? `Document ${i + 1}`}
+                      </span>
+                      <span className="text-[10px] uppercase tracking-wide text-faint">
+                        {fileBadgeFor(entry.name ?? '')}
+                      </span>
+                    </span>
+                  </OpenableAttachment>
+                ))}
+              </div>
+            );
+          })()}
+          {message.pdfName &&
+            ((message.meta?.attachments ?? []).filter((a) => a.kind === 'pdf')
+              .length ?? 0) <= 1 && (
             <div className="mb-1.5 flex flex-col items-end">
               {/* Same chip, now a real control (NEW-09). The classes below are
                   the ones it already had; only the hover tint and the focus

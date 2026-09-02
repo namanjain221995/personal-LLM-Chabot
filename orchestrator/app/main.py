@@ -338,6 +338,12 @@ class ChatRequest(BaseModel):
     # V8: an uploaded PDF (base64, optionally a data: URL) + its filename.
     pdf: Optional[str] = None
     pdf_filename: Optional[str] = None
+    # 2026-09-02: LARGE documents stream to /uploads (purpose=document) first
+    # and the chat request carries REFERENCES — 512 MB of base64 through a
+    # JSON body would kill the browser tab and both servers. Up to five per
+    # message: [{"upload_id": "<32 hex>", "name": "contract.pdf"}, ...].
+    # Small documents may still ride inline in `pdf` exactly as before.
+    pdf_uploads: Optional[List[dict]] = None
     # Phase 1: web search — "off" (never), "on" (force), "auto" (model decides).
     web_search: Literal["off", "auto", "on"] = "off"
     # Salesforce Intelligence Mode: the answer to a clarifying question this
@@ -415,6 +421,157 @@ class ChatRequest(BaseModel):
                 "provide a non-empty message/messages, an image, or a PDF"
             )
         return self
+
+
+
+#: How a message may reference streamed documents: at most five. One of them
+#: may be an ARCHIVE, whose members then count against the engine's own,
+#: larger cap — five zips of twelve files each is a report, not a question.
+_MAX_DOC_REFS = 5
+
+#: Archive members read as documents / attached as images. Extensions the
+#: expander trusts as text-bearing; everything else is sniffed, and true
+#: binaries become one honest manifest line instead of prompt mojibake.
+_TEXTY_EXTS = (
+    ".pdf", ".docx", ".txt", ".md", ".markdown", ".rst", ".csv", ".tsv",
+    ".json", ".yaml", ".yml", ".toml", ".xml", ".html", ".htm", ".css",
+    ".js", ".ts", ".tsx", ".jsx", ".py", ".java", ".c", ".h", ".cpp",
+    ".go", ".rs", ".rb", ".php", ".sh", ".sql", ".ini", ".cfg", ".log",
+)
+_IMAGE_EXTS = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".gif": "image/gif", ".webp": "image/webp",
+}
+_MAX_ARCHIVE_IMAGES = 4
+_MAX_ARCHIVE_IMAGE_BYTES = 10 * 1024 * 1024
+
+
+def _expand_archive(root: str, path: str, name: str) -> tuple[list, list, str]:
+    """Open an uploaded archive the way ChatGPT would: every member listed,
+    text-bearing members read as documents, images attached as images.
+
+    → (docs, image data-URLs, manifest text). Extraction reuses the SAME
+    hardened extractor the dataset rail trusts — zip-bomb budgets, member
+    caps, traversal guards, nested archives listed but never opened — and is
+    cached in the upload's `extracted/` directory so a follow-up question
+    does not pay for it twice.
+    """
+    import base64 as _b64
+
+    from .core import archive
+    from .engines.document import MAX_DOCS
+
+    extract_dir = os.path.join(root, "extracted")
+    skipped: list[tuple[str, str]] = []
+    if not os.path.isdir(extract_dir):
+        plan = archive.extract(path, extract_dir)
+        if plan is not None:
+            skipped = list(plan.skipped) + [
+                (n, "nested archive — listed, not opened")
+                for n in plan.nested_archives
+            ]
+
+    members: list[tuple[str, str, int]] = []  # (relname, abspath, size)
+    for dirpath, _dirs, files in os.walk(extract_dir):
+        for fname in sorted(files):
+            full = os.path.join(dirpath, fname)
+            rel = os.path.relpath(full, extract_dir)
+            members.append((rel, full, os.path.getsize(full)))
+    members.sort()
+
+    docs: list = []
+    images: list = []
+    lines = [f"Archive {name} contains {len(members)} file(s):"]
+    for rel, full, size in members:
+        ext = os.path.splitext(rel)[1].lower()
+        if ext in _IMAGE_EXTS and size <= _MAX_ARCHIVE_IMAGE_BYTES and \
+                len(images) < _MAX_ARCHIVE_IMAGES:
+            with open(full, "rb") as fh:
+                images.append(
+                    f"data:{_IMAGE_EXTS[ext]};base64,"
+                    + _b64.b64encode(fh.read()).decode("ascii")
+                )
+            lines.append(f"  - {rel} ({size:,} bytes) — attached as an image")
+        elif (ext in _TEXTY_EXTS or ext in (".docx",)) and len(docs) < MAX_DOCS - 1:
+            with open(full, "rb") as fh:
+                docs.append(
+                    (f"{name}/{rel}", _b64.b64encode(fh.read()).decode("ascii"))
+                )
+            lines.append(f"  - {rel} ({size:,} bytes) — read in full")
+        else:
+            lines.append(f"  - {rel} ({size:,} bytes) — listed only")
+    for member, why in skipped[:20]:
+        lines.append(f"  - {member} — skipped: {why}")
+    return docs, images, "\n".join(lines)
+
+
+async def _resolve_document_refs(
+    request: "ChatRequest", conversation_id: Optional[str]
+) -> tuple[list, list, Optional[str]]:
+    """The message's documents. → (docs as (name, base64), images, error).
+
+    References resolve against THIS conversation's upload workspace, so a
+    forged upload_id from another conversation is a 404-shaped miss, not a
+    read. The stored filename wins over whatever the client claims — the
+    bytes on disk are the truth. A swept (TTL) or unknown reference produces
+    one clear sentence instead of a stack trace mid-stream. An archive
+    reference is expanded: members become documents and images, and a
+    manifest of everything inside rides along as its own document.
+    """
+    import base64 as _b64
+
+    from .core import archive
+    from .uploads import upload_root
+
+    refs = list(request.pdf_uploads or [])
+    if len(refs) > _MAX_DOC_REFS:
+        return [], [], f"A message can carry at most {_MAX_DOC_REFS} documents."
+    docs: list = []
+    images: list = []
+    for ref in refs:
+        upload_id = str((ref or {}).get("upload_id", ""))
+        if not _re.fullmatch(r"[0-9a-f]{32}", upload_id) or not conversation_id:
+            return [], [], "One of the attached documents could not be found — please re-attach it."
+        root = upload_root(conversation_id, upload_id)
+        original = os.path.join(root, "_original")
+        try:
+            files = [e for e in os.scandir(original) if e.is_file()]
+        except OSError:
+            files = []
+        if len(files) != 1:
+            name = str((ref or {}).get("name") or "an attached document")
+            return [], [], (
+                f"{name} is no longer available on the server "
+                "(uploads are swept after their TTL) — please re-attach it."
+            )
+        entry = files[0]
+        lower = entry.name.lower()
+        is_archive = lower.endswith((".zip", ".tar", ".tar.gz", ".tgz")) or \
+            archive.is_zip_container(entry.path)
+        if is_archive and not lower.endswith((".docx", ".xlsx")):
+            # .docx/.xlsx ARE zip containers; sniffing alone would unzip a
+            # Word file into its XML skeleton. The extension decides those.
+            try:
+                more_docs, more_images, manifest = await asyncio.to_thread(
+                    _expand_archive, root, entry.path, entry.name
+                )
+            except archive.ArchiveError as exc:
+                return [], [], f"{entry.name} could not be opened: {exc}"
+            docs.append(
+                (
+                    f"{entry.name} (archive contents)",
+                    _b64.b64encode(manifest.encode("utf-8")).decode("ascii"),
+                )
+            )
+            docs.extend(more_docs)
+            images.extend(more_images[: _MAX_ARCHIVE_IMAGES - len(images)])
+        else:
+            with open(entry.path, "rb") as fh:
+                raw = fh.read()
+            docs.append((entry.name, _b64.b64encode(raw).decode("ascii")))
+    if request.pdf_data:
+        docs.append((request.pdf_filename, request.pdf_data))
+    return docs, images, None
 
 
 @app.get("/health")
@@ -1249,24 +1406,44 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 # is now waiting. Either way it already emitted its tokens and
                 # its single meta; there is nothing left for the chain below.
                 answer = sf_outcome.answer
-            elif request.pdf_data:
+            elif request.pdf_uploads or request.pdf_data:
                 # V8 → 2026-08-07: any document (PDF/DOCX/plain) — the WHOLE
-                # file is read and remembered for this conversation.
-                from .engines.document import run_pdf_engine
+                # file is read and remembered for this conversation. Since
+                # 2026-09-02 a message may carry several documents, large ones
+                # arriving as upload references rather than inline base64.
+                from .engines.document import run_pdf_engine_multi
 
-                answer = await run_pdf_engine(
-                    text,
-                    request.pdf_data,
-                    request.pdf_filename,
-                    history,
-                    emit,
-                    conversation_id=conv_key,
-                    # Same contract as the image route: the document engine
-                    # runs at the level the composer picked, so the effort
-                    # meta_extras reports for route="vision" is the truth for
-                    # documents too (2026-08-29).
-                    effort=request.effort,
+                docs, doc_images, doc_err = await _resolve_document_refs(
+                    request, conv_key
                 )
+                if doc_err:
+                    await emit("token", {"text": doc_err})
+                    await emit("meta", {"route": "vision"})
+                    answer = doc_err
+                else:
+                    # 2026-09-02: images may ride ALONGSIDE documents now
+                    # ("compare the chart to the report"). The document engine
+                    # grew extra_images for archive members; attached images
+                    # take the same door, normalised exactly as the vision
+                    # engine normalises them.
+                    from .engines.vision import to_data_url
+
+                    attached = [
+                        to_data_url(img) for img in (request.images_data or [])
+                    ]
+                    answer = await run_pdf_engine_multi(
+                        text,
+                        docs,
+                        history,
+                        emit,
+                        conversation_id=conv_key,
+                        # Same contract as the image route: the document engine
+                        # runs at the level the composer picked, so the effort
+                        # meta_extras reports for route="vision" is the truth
+                        # for documents too (2026-08-29).
+                        effort=request.effort,
+                        extra_images=list(doc_images) + attached,
+                    )
             elif request.image_data:
                 # An attached image ALWAYS goes to the vision engine — text-only
                 # engines (chat/agent/sql/rag) cannot see it, and silently

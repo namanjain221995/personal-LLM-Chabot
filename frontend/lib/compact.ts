@@ -1,5 +1,5 @@
 /**
- * "Compact now" — the CLIENT half, and the one rule it exists to enforce:
+ * Compaction — the CLIENT half, and the one rule it exists to enforce:
  * never claim a compaction succeeded unless a summary can actually be seen.
  *
  * `POST /chat/compact` answers `{compacted: true, folded_turns: N}` as soon as
@@ -10,7 +10,7 @@
  * the browser has no way to repair the conversation once that has happened.
  *
  * What it CAN do is stop asserting it. So a claimed compaction is confirmed
- * against the read-only summary endpoint the meter popover already calls, and
+ * against the read-only summary endpoint the context ring already calls, and
  * anything that cannot be confirmed is reported as unverified — never as
  * success, and never as "your messages are all still there", which is equally
  * unknowable from here.
@@ -19,7 +19,7 @@
  * decisions are testable in node, the way the rest of lib/ is.
  */
 
-/** How the browser resolved one press of "Compact now". */
+/** How the browser resolved one press of the context ring. */
 export type CompactOutcome =
   | { kind: 'compacted'; foldedTurns: number; message: string; tone: 'info' }
   | { kind: 'nothing'; message: string; tone: 'info' }
@@ -48,13 +48,21 @@ export const NOTHING_FOLDED = 'Nothing to compact yet.';
  * The server said it compacted, and the browser could not see a summary to
  * show for it.
  *
- * Says only what is actually known: the transcript on screen is untouched
- * (true — compaction never edits `messages`). It deliberately does NOT say
- * the model can still see those turns, because from here that is unknowable.
+ * Says only what is actually known. "No usable summary was RETURNED" is what
+ * the browser observed — it read the summary endpoint and found nothing
+ * usable; whether the server produced one and lost it is not visible from
+ * here. The transcript claim is safe for the same kind of reason: compaction
+ * never edits `messages`, so "your visible conversation has not been changed"
+ * is checkable (CV-08) rather than reassuring.
+ *
+ * It deliberately does NOT say the model can still see those turns, or that
+ * nothing was lost. The confirmed H-10 server defect means older turns CAN be
+ * dropped with an empty summary stored against them, and no amount of client
+ * code can see that, let alone repair it.
  */
 export const COMPACT_UNVERIFIED =
-  'Compaction could not be verified — no summary was produced. Your ' +
-  'conversation on screen has not been changed.';
+  'Compaction could not be verified. No usable summary was returned. Your ' +
+  'visible conversation has not been changed.';
 
 /** The request itself did not complete. */
 export const COMPACT_FAILED = 'Could not compact this conversation.';
@@ -63,7 +71,7 @@ export const COMPACT_FAILED = 'Could not compact this conversation.';
 export const NO_USABLE_SUMMARY =
   'No compact summary is available for this conversation.';
 
-/** "1 earlier message" / "12 earlier messages" — matches the popover. */
+/** "1 earlier message" / "12 earlier messages". */
 function earlier(count: number): string {
   return `${count} earlier message${count === 1 ? '' : 's'}`;
 }
@@ -104,7 +112,7 @@ export interface CompactOutcomeInput {
 }
 
 /**
- * What the user is told, and whether the popover may offer its summary link.
+ * What the user is told about one press.
  *
  * The `reason` string the server sends is NOT echoed: it is internal wording
  * ("nothing older to summarize") and the set of reasons is fixed, so it is
@@ -146,8 +154,8 @@ export function compactOutcome({
  * Module state rather than a component ref on purpose: the guard has to
  * survive a re-render, a re-mount and a trip to another chat and back, and
  * "at most one compaction per conversation" is a property of the CONVERSATION,
- * not of whichever popover happens to be open. `finally` always clears it, so
- * a failed request cannot wedge the control.
+ * not of whichever control happens to be on screen. `finally` always clears
+ * it, so a failed request cannot wedge the control.
  */
 const inFlight = new Set<string>();
 

@@ -26,6 +26,8 @@ export interface ChatRequestBody {
   /** V8: an uploaded PDF (base64) + its filename. */
   pdf?: string;
   pdf_filename?: string;
+  /** 2026-09-02: documents that streamed to /api/upload; sent by reference. */
+  pdf_uploads?: { upload_id: string; name: string }[];
   /** Phase 1: web search mode. */
   web_search?: string;
   deep_research?: boolean;
@@ -83,6 +85,7 @@ export interface OrchestratorChatRequest {
   agent?: boolean;
   pdf?: string;
   pdf_filename?: string;
+  pdf_uploads?: { upload_id: string; name: string }[];
   web_search?: string;
   deep_research?: boolean;
   sf_live?: boolean;
@@ -174,6 +177,7 @@ export function toOrchestratorChatRequest(
       : [];
   const image = images[0] ?? null;
   const pdf = body.pdf ?? null;
+  const pdfUploads = body.pdf_uploads?.length ? body.pdf_uploads : null;
   // Ordering is unchanged and deliberate: the kinds are mutually exclusive at
   // the composer, and where they are not, the payload that actually travels
   // inside this request outranks the one that only left a reference behind.
@@ -181,7 +185,7 @@ export function toOrchestratorChatRequest(
     text ||
     (image
       ? IMAGE_ONLY_PROMPT
-      : pdf
+      : pdf || pdfUploads
         ? PDF_ONLY_PROMPT
         : // NEW-14: the dataset itself is already on the server; all this turn
           // needs is a question to ask about it.
@@ -208,6 +212,7 @@ export function toOrchestratorChatRequest(
     ...(body.conversation_id !== undefined
       ? { conversation_id: body.conversation_id }
       : {}),
+    ...(pdfUploads ? { pdf_uploads: pdfUploads } : {}),
     ...(body.mode !== undefined ? { mode: body.mode } : {}),
     ...(body.sf_live !== undefined ? { sf_live: body.sf_live } : {}),
     ...(body.model !== undefined ? { model: body.model } : {}),

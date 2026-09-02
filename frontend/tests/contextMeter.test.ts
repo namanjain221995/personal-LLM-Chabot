@@ -283,6 +283,8 @@ describe('meterTooltip — the ring may only promise what a click will do', () =
   });
 
   it('claims no reason for a veto it was not given one for', () => {
+    // The component is not told WHY the host blocked it, so it invents
+    // nothing — the percentage stands alone.
     const tip = meterTooltip({ percent: 5, foldable: 12, blocked: true });
     expect(tip.action).toBeNull();
     expect(tip.heading).toBe('5% context used');
@@ -314,8 +316,8 @@ describe('meterTooltip — the ring may only promise what a click will do', () =
 
   it('never derives a "remaining until auto-compact" figure', () => {
     // The reference design has that line; the browser is not told the
-    // server's 0.70/0.80 thresholds, so `100 - percent` would be
-    // authoritative-looking and wrong.
+    // server's 0.70/0.80 thresholds, so `100 - percent` would be authoritative
+    // looking and wrong. Nothing here may mention auto-compaction.
     for (const percent of [0, 25, 75, 100]) {
       const tip = meterTooltip({ percent, foldable: 12 });
       const words = `${tip.heading} ${tip.action ?? ''}`.toLowerCase();
@@ -325,6 +327,8 @@ describe('meterTooltip — the ring may only promise what a click will do', () =
   });
 
   it('the 28-message conversation from the live check, before and after', () => {
+    // Server returned folded_turns 27 on 28 messages, then "nothing older to
+    // summarize" on the second press.
     const before = meterTooltip({ percent: 62, foldable: 27 });
     expect(before.inert).toBe(false);
     expect(before.action).toBe(CLICK_TO_COMPACT);
