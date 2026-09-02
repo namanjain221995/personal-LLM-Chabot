@@ -106,12 +106,26 @@ async def _topical(question: str, out: Prepared) -> Prepared:
     started = time.perf_counter()
     result = await retrieve(question, level=Freshness.STATIC, top_k=4)
     out.retrieval = result
-    best = next((e for e in result.evidence if e.relevant), None)
-    hit = bool(best) and best.score >= settings.living_knowledge_topical_min_score
+    # BOTH signals, not a high blend. Measured on the live corpus
+    # (2026-09-02): the right documentation page scored 0.44-0.61 — a dense
+    # match in the relevant band plus the question's own words on the page —
+    # while the best unrelated page reached 0.25 with NO dense match at all.
+    # A single blended threshold high enough to exclude the latter excluded
+    # the former; requiring vector agreement AND lexical overlap separates
+    # them cleanly, and the score floor only guards against junk.
+    def _topical_hit(e) -> bool:
+        return (
+            e.dense >= 0.35
+            and e.lexical >= 0.34
+            and e.score >= settings.living_knowledge_topical_min_score
+        )
+
+    best = next((e for e in result.evidence if _topical_hit(e)), None)
+    hit = best is not None
     metrics.web_memory_query(hit=hit, fresh=hit, seconds=time.perf_counter() - started)
     if not hit:
         return out
-    result.evidence = [e for e in result.evidence if e.relevant]
+    result.evidence = [e for e in result.evidence if _topical_hit(e) or e.relevant]
     out.grounding = topical_block(result, today_iso())
     out.sources = [e.as_source() for e in result.evidence]
     return out

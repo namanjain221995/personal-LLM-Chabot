@@ -261,6 +261,13 @@ _STOP = {
     "the", "a", "an", "of", "is", "are", "was", "were", "who", "what", "which",
     "in", "on", "at", "to", "for", "and", "or", "s", "current", "currently",
     "now", "latest", "please", "tell", "me", "about", "do", "does", "did",
+    # Question shapes, not topics (2026-09-03): "explain" matched a page
+    # titled "Explaining AI…" and made an unrelated page look relevant.
+    "explain", "describe", "summarize", "summarise", "list", "show", "give",
+    "how", "why", "when", "where", "whether", "can", "could", "would", "should",
+    "will", "need", "want", "know", "help", "info", "information", "details",
+    "detail", "question", "answer", "with", "from", "into", "this", "that",
+    "these", "those", "there", "here", "its", "it", "be", "been", "being",
 }
 
 
@@ -276,7 +283,11 @@ def _stem(word: str) -> str:
     without a stemming dependency; it is a matching aid, never shown."""
     for suffix in _SUFFIXES:
         if word.endswith(suffix) and len(word) - len(suffix) >= 4:
-            return word[: -len(suffix)]
+            word = word[: -len(suffix)]
+            break
+    # configure/configured, release/released, engine/engines all meet here.
+    if len(word) >= 6 and word.endswith("e"):
+        word = word[:-1]
     return word
 
 

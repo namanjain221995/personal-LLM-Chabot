@@ -590,6 +590,17 @@ def _rlog(state: ResearchState, msg: str, *args) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _conversation_turns(history: Sequence[dict], n: int) -> List[dict]:
+    """The last `n` real turns, WITHOUT the pinned system blocks.
+
+    `recent_turns` keeps every system message on purpose — the chat engine
+    needs the user's saved facts and cross-chat recall. A research PLAN does
+    not: on the first live run the planner read the memory block and listed
+    the signed-in user's own name as an entity to research. Only what the
+    user actually asked is research context."""
+    return [m for m in recent_turns(history, n) if m.get("role") != "system"]
+
+
 def _temporal_note(state: ResearchState) -> str:
     if not state.temporal:
         return ""
@@ -626,7 +637,7 @@ async def _plan(question: str, history: Sequence[dict], effort: str, state: Opti
     )
     msgs = [
         {"role": "system", "content": system},
-        *recent_turns(history, 4),
+        *_conversation_turns(history, 4),
         {"role": "user", "content": question},
     ]
     try:
@@ -788,6 +799,17 @@ def _topic_keywords(state: ResearchState) -> Set[str]:
     return set(keywords(text, max_keywords=24))
 
 
+def _entity_tokens(state: ResearchState) -> Set[str]:
+    """Alphanumeric tokens of the plan's named entities ("openai", "acme"),
+    for recognising the entity's OWN domain in a link's host."""
+    out: Set[str] = set()
+    for e in state.entities:
+        for tok in re.findall(r"[a-z0-9]+", e.lower()):
+            if len(tok) >= 3:
+                out.add(tok)
+    return out
+
+
 def _link_score(state: ResearchState, src: SourceRecord, link: str, kw: Set[str]) -> Optional[float]:
     try:
         parts = urlparse(link)
@@ -803,9 +825,13 @@ def _link_score(state: ResearchState, src: SourceRecord, link: str, kw: Set[str]
     overlap = len(tokens & kw)
     link_auth = authority_of(link)
     kind = provenance.source_type(link)
+    entity_host = any(tok in host for tok in _entity_tokens(state))
+    known_domain = host in {s.domain_key for s in state.sources}
     score = min(3, overlap) * 1.0
+    if entity_host:
+        score += 2.0  # the entity's own site: first-hand by definition
     if link_auth >= src.authority + 20:
-        score += 2.0  # an article pointing at a more authoritative page: its source
+        score += 1.0  # an article pointing at a more authoritative page
     if kind in provenance.PRIMARY_TYPES:
         score += 1.5
     if path.endswith(".pdf"):
@@ -818,13 +844,13 @@ def _link_score(state: ResearchState, src: SourceRecord, link: str, kw: Set[str]
         score -= 1.0
     if parts.query:
         score -= 0.5
-    if (
-        overlap == 0
-        and link_auth < 70
-        and kind not in provenance.PRIMARY_TYPES
-        and not path.endswith(".pdf")  # a linked document is worth a look on its own
-    ):
-        return None  # nothing suggests this link matters to the question
+    if overlap == 0 and not entity_host and not known_domain and not path.endswith(".pdf"):
+        # Nothing ties this link to the question: not its words, not the
+        # entity's own site, not a domain this run already found relevant. A
+        # high-authority target alone is not a reason — on the first live run
+        # an article's incidental links to government statistics and a
+        # vendor's press page were opened for a question about neither.
+        return None
     return score
 
 
@@ -1077,7 +1103,8 @@ async def _extract_claims(
         "date or version it asserts — or empty), the source number, as_of "
         "(YYYY-MM-DD, YYYY-MM or YYYY: WHEN the fact held according to the "
         "source — an effective date, event date or the article's own date; "
-        "empty when the source does not say), and status: 'current' when the "
+        "empty when the source does not say; NEVER today's date unless the "
+        "source itself states it), and status: 'current' when the "
         "source presents it as the present state, 'historical' when the source "
         "presents it as past (former, previously, until, was replaced), "
         "'unclear' otherwise. Only claims the sources ACTUALLY state — never "

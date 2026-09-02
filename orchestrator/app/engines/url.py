@@ -152,8 +152,17 @@ async def run_url_engine(
     conversation_id: str,
     history: Sequence[dict],
     emit: Emit,
+    effort: str = "think",
 ) -> str:
-    """Fetch any new URLs, then answer from all pages stored for this chat."""
+    """Fetch any new URLs, then answer from all pages stored for this chat.
+
+    `effort` is the composer's Fast/Think/Max (2026-09-03). Until then this
+    engine called stream_chat_events without it — the default is thinking
+    ON — so a shared link at Fast measured 19 s to the first token, 18 of
+    them reasoning. The fourth engine to make the same omission; the rule
+    stands: never call stream_chat_events on a user-facing route without it.
+    """
+    level = llm.normalize_effort(effort)
     already = await db.run_in_thread(db.get_url_document_urls, conversation_id)
     queued_sites: List[dict] = []
     for url in urls:
@@ -194,7 +203,9 @@ async def run_url_engine(
             *recent_turns(history, 4),
             {"role": "user", "content": message},
         ]
-        async for kind, delta in llm.stream_chat_events(messages, max_tokens=12000):
+        async for kind, delta in llm.stream_chat_events(
+            messages, effort=level, max_tokens=12000
+        ):
             await emit(kind, {"text": delta})
             if kind == "token":
                 parts.append(delta)
@@ -211,7 +222,7 @@ async def run_url_engine(
 
     parts: List[str] = []
     async for kind, delta in llm.stream_chat_events(
-        _answer_messages(message, docs, history), max_tokens=12000
+        _answer_messages(message, docs, history), effort=level, max_tokens=12000
     ):
         await emit(kind, {"text": delta})
         if kind == "token":

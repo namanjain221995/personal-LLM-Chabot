@@ -132,7 +132,7 @@ Stop reasons (`meta.research_run.stop_reason`, and the `research[…] assess:` l
 | Env var | Default | What it governs |
 |---|---|---|
 | `LIVING_KNOWLEDGE_EVIDENCE_CHARS` | `3600` | Characters of passages in a grounded answer (was 900). |
-| `LIVING_KNOWLEDGE_TOPICAL` / `LIVING_KNOWLEDGE_TOPICAL_MIN_SCORE` | `true` / `0.66` | Ground a *timeless* question on a strongly matching stored passage (an indexed site, a research source). |
+| `LIVING_KNOWLEDGE_TOPICAL` / `LIVING_KNOWLEDGE_TOPICAL_MIN_SCORE` | `true` / `0.4` | Ground a *timeless* question on a stored passage that matches on BOTH signals (vector agreement and the question's words on the page); the score is a floor. |
 | `FRESHNESS_FAST_DEADLINE_S` | `8.0` | The most a Fast answer waits for the two-page live lookup (was 12). |
 
 ### Attachments

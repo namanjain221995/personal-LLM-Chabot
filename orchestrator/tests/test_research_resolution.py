@@ -180,6 +180,26 @@ def test_candidate_links_prefer_the_primary_source_an_article_cites():
     assert len(picks) <= 2, "at most two links per page"
 
 
+def test_incidental_links_to_authoritative_but_unrelated_sites_are_not_followed():
+    """Live run 2026-09-02: a blog post about a company's chief executive
+    linked to a government statistics bureau and a phone maker's press page;
+    both were opened because the target was 'more authoritative'. Authority
+    alone is not a reason — the link must be tied to the question by its
+    words, by being the entity's own site, or by a domain already found."""
+    st = _state(question="who is the chief executive of Acme Corp", subqs=("who is the chief executive of Acme Corp",))
+    st.entities = ["Acme Corp"]
+    post = _src(
+        st, "https://someone.blog.example/thoughts", "post " * 50, authority=15, kind="blog",
+        links=[
+            "https://stats.gov.example/employment/2026/release",  # authoritative, unrelated
+            "https://phones.example/newsroom/new-device",  # press path, unrelated
+            "https://acme.example/about/leadership",  # the entity's own site, no keyword overlap
+        ],
+    )
+    picks = [link for link, _s in dr._candidate_links(st, [post], limit=6)]
+    assert picks == ["https://acme.example/about/leadership"]
+
+
 # ---------------------------------------------------------------------------
 # Stopping on evidence, and saying why
 # ---------------------------------------------------------------------------
@@ -382,3 +402,27 @@ def test_the_report_prompt_carries_the_date_and_the_evidence_table():
     assert f"Current date: {st.today}" in system
     assert "EVIDENCE STATUS" in user and "CURRENT" in user and "Person B" in user
     assert "same text as [n]" in system and "primary sources" in system.lower()
+
+
+def test_the_planner_never_sees_the_memory_blocks(monkeypatch):
+    """The saved-facts / cross-chat blocks ride in history as system
+    messages for the chat engine's benefit. The research planner must not
+    read them — it listed the signed-in user's name as an entity to research
+    on the first live run."""
+    seen = {}
+
+    async def fake_json_completion(messages, **kw):
+        seen["messages"] = messages
+        return json.dumps({"subquestions": ["a"], "queries": ["q"], "entities": ["Acme"]})
+
+    monkeypatch.setattr(dr.llm, "json_completion", fake_json_completion)
+    st = _state(question="who leads Acme")
+    history = [
+        {"role": "system", "content": "Facts about the user: their name is Someone Private."},
+        {"role": "user", "content": "earlier question"},
+        {"role": "assistant", "content": "earlier answer"},
+    ]
+    asyncio.run(dr._plan("who leads Acme", history, "think", st))
+    contents = " ".join(m["content"] for m in seen["messages"] if m["role"] != "system" or "research planner" not in m["content"])
+    assert "Someone Private" not in contents
+    assert any(m["content"] == "earlier question" for m in seen["messages"])

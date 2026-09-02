@@ -1539,7 +1539,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 from .engines.url import run_url_engine
 
                 answer = await run_url_engine(
-                    text, url_list, conv_key, history, emit
+                    text, url_list, conv_key, history, emit, effort=request.effort
                 )
             elif deep_research_on:
                 # Deep Research: the iterative research loop. It sits ABOVE

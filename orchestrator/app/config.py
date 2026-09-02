@@ -449,8 +449,11 @@ class Settings:
         # site is supposed to become. Gated on a strong match so ordinary
         # chat never drags in loosely related pages.
         self.living_knowledge_topical: bool = _bool("LIVING_KNOWLEDGE_TOPICAL", True)
+        # The FLOOR on the blended score; the real gate is vector agreement
+        # AND lexical overlap together (living_knowledge._topical). Measured
+        # 2026-09-02: a true documentation match scores 0.44-0.61 here.
         self.living_knowledge_topical_min_score: float = _float(
-            "LIVING_KNOWLEDGE_TOPICAL_MIN_SCORE", 0.66
+            "LIVING_KNOWLEDGE_TOPICAL_MIN_SCORE", 0.4
         )
         # --- Attachment latency (2026-09-03) ------------------------------
         # The OCR sidecar transcribes BEFORE the main model can start. On a
