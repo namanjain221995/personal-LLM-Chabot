@@ -10,13 +10,6 @@
 import { cleanup, render, screen } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-// Hoisted: the page reads its facts from the URL through next/navigation,
-// which has no app router under jsdom. The holder is filled per test.
-const search = { params: new URLSearchParams() };
-vi.mock('next/navigation', () => ({
-  useSearchParams: () => search.params,
-}));
-
 import {
   handleSessionEnd,
   sessionEndRoute,
@@ -27,6 +20,7 @@ import {
 import {
   AccessRemoved,
   accessRemovedCopy,
+  formatWhen,
   parseContact,
 } from '../components/auth/AccessRemoved';
 
@@ -111,9 +105,26 @@ describe('the page copy', () => {
 });
 
 describe('the page', () => {
+  it('states the time in UTC rather than the server zone', () => {
+    expect(formatWhen('2026-09-03T02:40:00+00:00')).toBe('3 Sept 2026, 02:40 UTC');
+    expect(formatWhen('garbage')).toBeNull();
+    expect(formatWhen(null)).toBeNull();
+  });
+
   it('renders the explanation, the contacts as mailto links, and a way to sign in as someone else', async () => {
-    search.params = new URLSearchParams(sessionEndRoute(removed).split('?')[1]);
-    render(<AccessRemoved />);
+    // Exactly what the page passes after reading the URL handleSessionEnd wrote.
+    const params = new URL(`http://x${sessionEndRoute(removed)}`).searchParams;
+    render(
+      <AccessRemoved
+        code={params.get('code')}
+        workspace={params.get('ws') ?? ''}
+        endedAt={params.get('at')}
+        contacts={params
+          .getAll('contact')
+          .map(parseContact)
+          .filter((c): c is { name: string; email: string } => c !== null)}
+      />,
+    );
     expect(await screen.findByText('Your access has been removed')).toBeTruthy();
     expect(screen.getByText(/removed your access to the TechSara workspace/)).toBeTruthy();
     const links = screen.getAllByRole('link');

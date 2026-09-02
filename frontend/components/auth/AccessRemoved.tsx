@@ -1,5 +1,3 @@
-'use client';
-
 /**
  * The page a removed or deactivated member lands on (2026-09-03).
  *
@@ -10,14 +8,13 @@
  * explanation belongs HERE, and only a browser that held the real session
  * gets sent here (the server matches the dead cookie's secret first).
  *
- * Everything shown comes from the query string the session-end handler
- * wrote — the code, the workspace name, when it happened, and the admins
- * to contact. None of it is secret, and this page makes no request of its
- * own: by the time it renders, the account has no session to make one with.
+ * SERVER-RENDERED on purpose. Everything shown arrives in the query string
+ * the session-end handler wrote (nothing secret: the code, the workspace
+ * name, when, the admins' contact emails), so the page needs no request,
+ * no hook and no JavaScript — the explanation is in the first byte of HTML,
+ * not painted after a blank Suspense frame. `app/access-removed/page.tsx`
+ * reads `searchParams` and passes props.
  */
-
-import { useSearchParams } from 'next/navigation';
-import { Suspense } from 'react';
 
 import { TechSaraMark } from '../TechSaraMark';
 import { IconAlert, IconLogout } from '../icons';
@@ -38,7 +35,7 @@ export interface AccessRemovedCopy {
 
 /** Pure, so the wording is unit-tested. */
 export function accessRemovedCopy(
-  code: string | null,
+  code: string | null | undefined,
   workspace: string,
 ): AccessRemovedCopy {
   const ws = workspace ? `the ${workspace} workspace` : 'this workspace';
@@ -66,37 +63,54 @@ export function accessRemovedCopy(
   };
 }
 
+export interface Contact {
+  name: string;
+  email: string;
+}
+
 /** "Priya Sharma <priya@x.com>" → {name, email}; a bare email → {email}. */
-export function parseContact(raw: string): { name: string; email: string } | null {
+export function parseContact(raw: string): Contact | null {
   const m = /^(.*?)\s*<([^<>\s]+@[^<>\s]+)>$/.exec(raw.trim());
   if (m) return { name: m[1].trim(), email: m[2] };
   const email = raw.trim();
   return /^[^\s@]+@[^\s@]+$/.test(email) ? { name: '', email } : null;
 }
 
-function formatWhen(iso: string | null): string | null {
+/**
+ * "3 Sep 2026, 02:40 UTC" — rendered on the server, so the zone is stated
+ * rather than silently being the server's.
+ */
+export function formatWhen(iso: string | null | undefined): string | null {
   if (!iso) return null;
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return null;
-  return d.toLocaleString(undefined, {
+  const date = d.toLocaleDateString('en-GB', {
     year: 'numeric',
     month: 'short',
     day: 'numeric',
+    timeZone: 'UTC',
+  });
+  const time = d.toLocaleTimeString('en-GB', {
     hour: '2-digit',
     minute: '2-digit',
+    timeZone: 'UTC',
   });
+  return `${date}, ${time} UTC`;
 }
 
-function AccessRemovedInner() {
-  const params = useSearchParams();
-  const code = params.get('code');
-  const workspace = params.get('ws') ?? '';
-  const when = formatWhen(params.get('at'));
-  const contacts = params
-    .getAll('contact')
-    .map(parseContact)
-    .filter((c): c is { name: string; email: string } => c !== null);
+export function AccessRemoved({
+  code,
+  workspace = '',
+  endedAt,
+  contacts = [],
+}: {
+  code?: string | null;
+  workspace?: string;
+  endedAt?: string | null;
+  contacts?: Contact[];
+}) {
   const copy = accessRemovedCopy(code, workspace);
+  const when = formatWhen(endedAt);
 
   return (
     <div data-testid="access-removed">
@@ -160,14 +174,5 @@ function AccessRemovedInner() {
         {copy.button}
       </a>
     </div>
-  );
-}
-
-export function AccessRemoved() {
-  // useSearchParams needs a Suspense boundary for static rendering.
-  return (
-    <Suspense fallback={null}>
-      <AccessRemovedInner />
-    </Suspense>
   );
 }
