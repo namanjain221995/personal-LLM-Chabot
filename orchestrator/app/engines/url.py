@@ -8,6 +8,8 @@ Sources panel).
 """
 from __future__ import annotations
 
+import hashlib
+import logging
 from typing import Awaitable, Callable, List, Optional, Sequence
 from urllib.parse import urlparse
 
@@ -17,11 +19,75 @@ from ..config import settings
 from ..core import extract, net
 from ..core.urls import select_relevant
 
+log = logging.getLogger(__name__)
+
 Emit = Callable[[str, dict], Awaitable[None]]
 
 # Room per page in the prompt; the 131072 window comfortably holds several.
 _PER_DOC_CHARS = 12000
 _TOTAL_DOC_CHARS = 90000
+
+
+async def _remember_globally(
+    conversation_id: str, url: str, fetched: net.FetchResult, ext: extract.Extracted
+) -> Optional[dict]:
+    """A shared page joins the GLOBAL corpus, and its site joins the crawl queue.
+
+    Until 2026-09-03 a pasted link was read into `url_documents` — this one
+    conversation's memory — and nowhere else. The owner's point: a shared
+    site "has multiple pages and more information"; one page in one chat is
+    not knowledge. Now the page is stored where every search and every Fast
+    answer reads from, and a bounded background crawl of the site is queued
+    (engines/crawl.py) so the rest of it follows without anyone waiting.
+
+    → {"host", "root_url", "job_id"} when a crawl was queued, else None.
+    Never raises: the answer about the page must not depend on this.
+    """
+    if not settings.web_memory_enabled:
+        return None
+    from .search import _normalize_url, _provenance_of
+
+    try:
+        headers = getattr(fetched, "headers", None) or {}
+        meta = _provenance_of(ext, fetched.url, fetched.content_type, headers)
+        digest = hashlib.sha256((ext.text or "").encode("utf-8")).hexdigest()
+
+        def _write() -> None:
+            db.upsert_web_page(
+                _normalize_url(url),
+                url,
+                fetched.url,
+                ext.title or "",
+                ext.text or "",
+                fetched.content_type or "",
+                200,
+                digest,
+                [],
+                **meta,
+            )
+
+        await db.run_in_thread(_write)
+    except Exception:  # noqa: BLE001 — memory is an enhancement
+        log.debug("could not store shared page %s globally", url[:120], exc_info=True)
+    if not settings.web_share_crawl_enabled:
+        # Still worth waking the worker: the page above needs embedding.
+        try:
+            from .. import web_worker
+
+            web_worker.kick()
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+    try:
+        from .crawl import enqueue_site_crawl
+
+        job_id = await enqueue_site_crawl(conversation_id, url, kind="share")
+    except Exception:  # noqa: BLE001
+        job_id = None
+    if job_id is None:
+        return None
+    host = (urlparse(url).hostname or url).removeprefix("www.")
+    return {"host": host, "root_url": url, "job_id": job_id, "status": "queued"}
 
 
 async def fetch_and_store(
@@ -53,7 +119,8 @@ async def fetch_and_store(
     await db.run_in_thread(
         db.save_url_document, conversation_id, url, ext.title, ext.text
     )
-    return {"url": url, "title": ext.title, "text": ext.text}
+    site_crawl = await _remember_globally(conversation_id, url, fetched, ext)
+    return {"url": url, "title": ext.title, "text": ext.text, "site_crawl": site_crawl}
 
 
 def _context_block(docs: List[dict], question: str) -> str:
@@ -88,9 +155,18 @@ async def run_url_engine(
 ) -> str:
     """Fetch any new URLs, then answer from all pages stored for this chat."""
     already = await db.run_in_thread(db.get_url_document_urls, conversation_id)
+    queued_sites: List[dict] = []
     for url in urls:
         if url not in already:
-            await fetch_and_store(conversation_id, url, emit)
+            doc = await fetch_and_store(conversation_id, url, emit)
+            if doc and doc.get("site_crawl"):
+                queued_sites.append(doc["site_crawl"])
+    if queued_sites:
+        hosts = ", ".join(dict.fromkeys(s["host"] for s in queued_sites))
+        await emit(
+            "status",
+            {"text": f"Indexing {hosts} in the background — later questions can draw on the whole site."},
+        )
 
     docs = await db.run_in_thread(db.get_url_documents, conversation_id)
     if not docs:
@@ -141,19 +217,21 @@ async def run_url_engine(
         if kind == "token":
             parts.append(delta)
 
-    await emit(
-        "meta",
-        {
-            "route": "url",
-            "sources": [
-                {
-                    "n": i,
-                    "title": d["title"],
-                    "url": d["url"],
-                    "domain": urlparse(d["url"]).hostname or d["url"],
-                }
-                for i, d in enumerate(docs, start=1)
-            ],
-        },
-    )
+    meta = {
+        "route": "url",
+        "sources": [
+            {
+                "n": i,
+                "title": d["title"],
+                "url": d["url"],
+                "domain": urlparse(d["url"]).hostname or d["url"],
+            }
+            for i, d in enumerate(docs, start=1)
+        ],
+    }
+    if queued_sites:
+        # Surfaced so the UI (and anyone reading the stored meta) can see
+        # that the site is being indexed behind this answer.
+        meta["site_crawl"] = queued_sites
+    await emit("meta", meta)
     return "".join(parts)

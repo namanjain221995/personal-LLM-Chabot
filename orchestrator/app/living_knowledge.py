@@ -10,10 +10,19 @@ Fast mode slow and pointless; never searching is how the platform answered
 "who's vice president of india" from 2024 weights while holding 19 pages that
 said otherwise. So the ladder is:
 
-    STATIC question            -> nothing at all (0 ms, no I/O)
+    STATIC question            -> one local lookup; grounded ONLY on a strong
+                                  match (a site indexed here, a doc research
+                                  read) — otherwise nothing at all
     fresh local evidence       -> use it (one vector + one SQL query)
+    resolved research claim    -> use it (a fact a Deep Research run verified)
     stale/absent, effort=fast  -> ONE query, 2 sources, hard deadline
     stale/absent, think/max    -> hand back to the full search engine
+
+THE CORPUS IS SHARED. `web_pages` and `web_claims` hold PUBLIC web content
+with no user attached: a page one user's search read, or a site one user
+shared, grounds the next user's Fast answer the same way. That is by design —
+it is what makes the platform's knowledge compound — and it is why nothing
+private is ever written to either table.
 
 Everything here fails soft: any error returns "no grounding" and the caller
 answers exactly as it does today.
@@ -25,14 +34,24 @@ import logging
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Awaitable, Callable, List, Optional
 
-from . import metrics
+from . import db, metrics
 from .config import settings
 from .freshness import Freshness, Verdict, classify
-from .web_memory import Retrieval, grounding_block, retrieve, staleness_note
+from .web_memory import (
+    Retrieval,
+    claims_block,
+    claims_for,
+    grounding_block,
+    retrieve,
+    staleness_note,
+    topical_block,
+)
 
 log = logging.getLogger(__name__)
+
+Emit = Callable[[str, dict], Awaitable[None]]
 
 
 def today_iso() -> str:
@@ -52,19 +71,50 @@ class Prepared:
     searched: bool = False
     #: Sources to attach to meta for citation, in the existing shape.
     sources: List[dict] = None  # type: ignore[assignment]
+    #: Resolved research claims that grounded the answer, if any.
+    claims: List[dict] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
         if self.sources is None:
             self.sources = []
+        if self.claims is None:
+            self.claims = []
 
 
 #: Fast-mode live lookup: deliberately a fraction of a real search. A full
 #: search rewrites the query, runs several providers, reranks and reads 5-8
 #: pages; this reads two. It exists to correct a single stale fact, not to
-#: research a topic.
+#: research a topic. The deadline lives in settings (FRESHNESS_FAST_DEADLINE_S).
 FAST_QUERIES = 1
 FAST_SOURCES = 2
-FAST_DEADLINE_S = 12.0
+FAST_DEADLINE_S = 8.0
+
+
+def _join(*parts: str) -> str:
+    return "\n\n".join(p for p in parts if p)
+
+
+async def _topical(question: str, out: Prepared) -> Prepared:
+    """A timeless question answered from a STRONG local match, or nothing.
+
+    This is what makes an indexed site a knowledge base: "how do I enable X"
+    about a product whose documentation was crawled here answers from that
+    documentation, cited, in any conversation and any mode. The gate is
+    deliberately high — a strong hybrid score AND topical relevance — so an
+    ordinary question never drags in a loosely related page.
+    """
+    started = time.perf_counter()
+    result = await retrieve(question, level=Freshness.STATIC, top_k=4)
+    out.retrieval = result
+    best = next((e for e in result.evidence if e.relevant), None)
+    hit = bool(best) and best.score >= settings.living_knowledge_topical_min_score
+    metrics.web_memory_query(hit=hit, fresh=hit, seconds=time.perf_counter() - started)
+    if not hit:
+        return out
+    result.evidence = [e for e in result.evidence if e.relevant]
+    out.grounding = topical_block(result, today_iso())
+    out.sources = [e.as_source() for e in result.evidence]
+    return out
 
 
 async def prepare(
@@ -74,12 +124,14 @@ async def prepare(
     mode: str,
     web_search_pref: str,
     allow_network: bool,
+    emit: Optional[Emit] = None,
 ) -> Prepared:
     """Freshness-aware grounding for one question.
 
     `allow_network` is the caller's policy (search enabled, not rate-limited,
     not an attachment turn). When False this degrades to local-only, which is
     also the offline path: stale evidence still answers, but it is labelled.
+    `emit` lets the one slow branch (the live lookup) say what it is doing.
     """
     out = Prepared()
     if not settings.web_memory_enabled or not (question or "").strip():
@@ -95,8 +147,10 @@ async def prepare(
     metrics.freshness_classified(verdict.requirement.value, verdict.reason)
 
     if not verdict.needs_evidence:
-        # Timeless. The model's own knowledge is the right source, and this
-        # path costs nothing at all beyond the regex above.
+        # Timeless. The model's own knowledge is the right source — unless
+        # this platform has already read something that answers it closely.
+        if settings.living_knowledge_topical:
+            return await _topical(question, out)
         return out
 
     started = time.perf_counter()
@@ -108,11 +162,36 @@ async def prepare(
     )
     out.retrieval = result
 
-    if result.sufficient(verdict.max_age_seconds):
+    # Facts an earlier Deep Research run RESOLVED — dated, sourced, already
+    # judged against contradicting pages. Cheap (one tsvector query) and
+    # the strongest local evidence there is for a live fact.
+    claim_rows: List[dict] = []
+    try:
+        claim_rows = await db.run_in_thread(claims_for, question)
+    except Exception:  # noqa: BLE001
+        claim_rows = []
+    claims_text = claims_block(claim_rows)
+    claims_fresh = any(
+        (now - r["created_at"]).total_seconds() <= verdict.max_age_seconds
+        for r in claim_rows
+        if r.get("created_at")
+    )
+    if claim_rows:
+        out.claims = [
+            {"claim": r.get("claim"), "value": r.get("value"),
+             "as_of": str(r.get("as_of") or ""), "url": r.get("url")}
+            for r in claim_rows
+        ]
+
+    if result.sufficient(verdict.max_age_seconds) or claims_fresh:
         # THE FIX. Evidence already on this machine, new enough to trust —
         # answered without touching the network, in any mode, at any effort.
-        out.grounding = grounding_block(result, today_iso())
-        out.sources = [e.as_source() for e in result.evidence]
+        out.grounding = _join(grounding_block(result, today_iso()), claims_text)
+        if not out.grounding:
+            out.grounding = f"Current date: {today_iso()}.\n" + claims_text
+        out.sources = [e.as_source() for e in result.evidence if e.relevant] or [
+            e.as_source() for e in result.evidence
+        ]
         return out
 
     # Not sufficient. Whether that is worth network depends on the caller.
@@ -120,12 +199,11 @@ async def prepare(
         # Explicitly offline, or the user turned search off at think/max where
         # they get the full engine anyway. Answer from what we have and SAY
         # how old it is, rather than implying it is current.
-        if result.found:
-            out.grounding = "\n".join(
-                x for x in (
-                    grounding_block(result, today_iso()),
-                    staleness_note(result, verdict.max_age_seconds),
-                ) if x
+        if result.found or claims_text:
+            out.grounding = _join(
+                grounding_block(result, today_iso()),
+                staleness_note(result, verdict.max_age_seconds),
+                claims_text,
             )
             out.sources = [e.as_source() for e in result.evidence]
         return out
@@ -134,17 +212,22 @@ async def prepare(
         # think/max already run the full search engine when the orchestrator
         # asks for it; duplicating a lookup here would be two searches for one
         # question. Pass what we have as a floor and let that path do its job.
-        if result.found:
-            out.grounding = grounding_block(result, today_iso())
+        if result.found or claims_text:
+            out.grounding = _join(grounding_block(result, today_iso()), claims_text)
             out.sources = [e.as_source() for e in result.evidence]
         return out
 
     # Fast mode, time-sensitive question, nothing fresh locally: the one case
     # that justifies spending network in a mode whose whole promise is speed.
+    if emit is not None:
+        try:
+            await emit("status", {"text": "Checking recent sources…"})
+        except Exception:  # noqa: BLE001
+            pass
     fresh = await _fast_lookup(question, verdict)
     if fresh is not None and fresh.found:
         out.searched = True
-        out.grounding = grounding_block(fresh, today_iso())
+        out.grounding = _join(grounding_block(fresh, today_iso()), claims_text)
         out.sources = [e.as_source() for e in fresh.evidence]
         out.retrieval = fresh
         metrics.freshness_auto_search(True)
@@ -153,12 +236,11 @@ async def prepare(
     metrics.freshness_auto_search(False)
     # The lookup failed (offline, rate limit, deadline). Stale evidence with an
     # honest date beats a confident wrong answer from 2024 weights.
-    if result.found:
-        out.grounding = "\n".join(
-            x for x in (
-                grounding_block(result, today_iso()),
-                staleness_note(result, verdict.max_age_seconds),
-            ) if x
+    if result.found or claims_text:
+        out.grounding = _join(
+            grounding_block(result, today_iso()),
+            staleness_note(result, verdict.max_age_seconds),
+            claims_text,
         )
         out.sources = [e.as_source() for e in result.evidence]
     return out
@@ -172,15 +254,19 @@ async def _fast_lookup(question: str, verdict: Verdict) -> Optional[Retrieval]:
     guards a normal search guards this too. Writing through the same store is
     what makes the NEXT conversation able to answer locally.
     """
+    if not settings.freshness_fast_lookup:
+        return None
     try:
         from .engines.search import fetch_for_freshness
     except Exception:  # noqa: BLE001
         return None
 
+    deadline = float(getattr(settings, "freshness_fast_deadline_s", FAST_DEADLINE_S) or FAST_DEADLINE_S)
+    sources = int(getattr(settings, "freshness_fast_sources", FAST_SOURCES) or FAST_SOURCES)
     try:
-        async with asyncio.timeout(FAST_DEADLINE_S):
+        async with asyncio.timeout(deadline):
             stored = await fetch_for_freshness(
-                question, max_queries=FAST_QUERIES, max_sources=FAST_SOURCES
+                question, max_queries=FAST_QUERIES, max_sources=sources
             )
     except (asyncio.TimeoutError, Exception):  # noqa: BLE001
         log.debug("fast freshness lookup did not complete", exc_info=True)

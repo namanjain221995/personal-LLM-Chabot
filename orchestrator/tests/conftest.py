@@ -58,6 +58,10 @@ _APP_TABLES = (
     "web_crawls",
     "web_results",
     "web_searches",
+    # V14: claims and page versions hang off web_pages (cascade / set null),
+    # listed first so the order is explicit.
+    "web_claims",
+    "web_page_versions",
     "web_pages",
     "sf_clarifications",
     "sf_intents",

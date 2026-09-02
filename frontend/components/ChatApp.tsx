@@ -53,6 +53,7 @@ import {
   uploadRefFor,
 } from '@/lib/attachments';
 import { uploadDocumentFile } from '@/lib/uploadDocument';
+import type { SendOptions } from './Composer';
 import {
   branchForAppend,
   branchForVersion,
@@ -723,7 +724,17 @@ export function ChatApp() {
       attachments: Attachment[],
       pasted: PastedText[],
       clarification?: ClarificationResponse | null,
+      options?: SendOptions,
     ) => {
+      if (options?.prefs) {
+        // A slash command sets the mode for THIS send (2026-09-03). The ref
+        // is updated synchronously on purpose: startStream below reads
+        // prefsRef.current, and a state update alone would land after the
+        // request had already gone out under the old prefs.
+        prefsRef.current = options.prefs;
+        setPrefs(options.prefs);
+        savePrefs(window.localStorage, activeIdRef.current, options.prefs);
+      }
       // Up to 5 images OR exactly one PDF/dataset (2026-08-05) — the
       // Composer enforces the shape; `first` covers the exclusive kinds.
       const first = attachments[0] ?? null;
@@ -865,18 +876,25 @@ export function ChatApp() {
           try {
             let uploadedId: string | undefined;
             if (needsDocUpload) {
-              const refs: { upload_id: string; name: string }[] = [];
-              for (const doc of docAttachments) {
-                // Reuse paths may carry only base64; the picker always keeps
-                // the File. Either way the server gets real bytes.
-                const src =
-                  doc.file ??
-                  new File(
-                    [Uint8Array.from(atob(doc.base64), (c) => c.charCodeAt(0))],
-                    doc.name,
-                  );
-                refs.push(await uploadDocumentFile(src, conversationId));
-              }
+              // In PARALLEL (2026-09-03), and a document that started
+              // uploading when it was attached (Composer.withEarlyUpload)
+              // is only awaited, not sent twice. Five 60 MB files used to
+              // upload one after another on the send's critical path.
+              const refs = await Promise.all(
+                docAttachments.map(async (doc) => {
+                  const early = doc.uploadPromise ? await doc.uploadPromise : null;
+                  if (early) return early;
+                  // Reuse paths may carry only base64; the picker always
+                  // keeps the File. Either way the server gets real bytes.
+                  const src =
+                    doc.file ??
+                    new File(
+                      [Uint8Array.from(atob(doc.base64), (c) => c.charCodeAt(0))],
+                      doc.name,
+                    );
+                  return uploadDocumentFile(src, conversationId);
+                }),
+              );
               docRefs = refs;
               refs.forEach((r, i) => {
                 const entry = userMessage.meta?.attachments?.[i];
@@ -1065,7 +1083,12 @@ export function ChatApp() {
    * "last 90 days" means exactly that.
    */
   const sendFromComposer = useCallback(
-    (text: string, attachments: Attachment[], pasted: PastedText[]) => {
+    (
+      text: string,
+      attachments: Attachment[],
+      pasted: PastedText[],
+      options?: SendOptions,
+    ) => {
       const armed = customAnswerRef.current;
       if (armed && text.trim() && attachments.length === 0) {
         const response = buildResponse(armed, { customText: text });
@@ -1077,7 +1100,7 @@ export function ChatApp() {
           return;
         }
       }
-      send(text, attachments, pasted);
+      send(text, attachments, pasted, undefined, options);
     },
     [send],
   );
@@ -1980,6 +2003,7 @@ export function ChatApp() {
           onPrefsChange={updatePrefs}
           onSend={sendFromComposer}
           onStop={stopStreaming}
+          uploadConversationId={activeId}
           clarificationPlaceholder={
             customAnswerFor?.custom_placeholder ??
             (pending ? pending.custom_placeholder : undefined)

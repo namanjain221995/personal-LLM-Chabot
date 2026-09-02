@@ -434,7 +434,39 @@ class Settings:
         # 5-8 pages; this reads two.
         self.freshness_fast_lookup: bool = _bool("FRESHNESS_FAST_LOOKUP", True)
         self.freshness_fast_sources: int = _int("FRESHNESS_FAST_SOURCES", 2)
-        self.freshness_fast_deadline_s: float = _float("FRESHNESS_FAST_DEADLINE_S", 12.0)
+        # 12 → 8 s (2026-09-03): the deadline is the worst case a Fast answer
+        # waits before it starts; a lookup that has not landed two pages in
+        # eight seconds is not going to make the answer better.
+        self.freshness_fast_deadline_s: float = _float("FRESHNESS_FAST_DEADLINE_S", 8.0)
+        # How much locally-read evidence a grounded answer may carry. 900
+        # characters was one paragraph — "a large amount of information from
+        # the site" (owner, 2026-09-03) needs several passages, and ~1k
+        # tokens of prefill costs the Fast answer well under half a second.
+        self.living_knowledge_evidence_chars: int = _int("LIVING_KNOWLEDGE_EVIDENCE_CHARS", 3600)
+        # Topical grounding: a TIMELESS question is also answered from the
+        # corpus when a strongly matching passage exists (a site the user
+        # indexed, a doc a research run read) — the knowledge base a shared
+        # site is supposed to become. Gated on a strong match so ordinary
+        # chat never drags in loosely related pages.
+        self.living_knowledge_topical: bool = _bool("LIVING_KNOWLEDGE_TOPICAL", True)
+        self.living_knowledge_topical_min_score: float = _float(
+            "LIVING_KNOWLEDGE_TOPICAL_MIN_SCORE", 0.66
+        )
+        # --- Attachment latency (2026-09-03) ------------------------------
+        # The OCR sidecar transcribes BEFORE the main model can start. On a
+        # text-dense screenshot at Think that measured 47 s to the first
+        # visible token (the 3.3B model decoding a long transcript), against
+        # 2.3 s at Fast with no OCR. OCR is an enhancer, never a gate: the
+        # image route now caps what it asks for and waits at most this long,
+        # then proceeds pixels-only.
+        self.ocr_vision_deadline_s: float = _float("OCR_VISION_DEADLINE_S", 10.0)
+        self.ocr_vision_max_tokens: int = _int("OCR_VISION_MAX_TOKENS", 1500)
+        # Extract a document the moment it finishes uploading (text layer,
+        # page renders, OCR of scanned pages) so the send that follows reads
+        # a cache instead of paying for extraction on the answer's critical
+        # path — the way ChatGPT processes a file while you type.
+        self.document_prewarm_enabled: bool = _bool("DOCUMENT_PREWARM_ENABLED", True)
+        self.document_prewarm_max_mb: int = _int("DOCUMENT_PREWARM_MAX_MB", 64)
         # Background keeper: drains the embedding backlog and re-reads pages
         # past their TTL, newest-demand first. Runs inside the orchestrator as
         # an asyncio task — no extra container, and the queue is a PostgreSQL
@@ -471,6 +503,17 @@ class Settings:
         self.web_expand_after_search: bool = _bool("WEB_EXPAND_AFTER_SEARCH", True)
         self.web_expand_pages_per_domain: int = _int("WEB_EXPAND_PAGES_PER_DOMAIN", 8)
         self.web_expand_max_domains: int = _int("WEB_EXPAND_MAX_DOMAINS", 3)
+        # --- Background crawl queue (2026-09-03) -------------------------
+        # Sharing a URL used to read ONE page. Now the page is answered from
+        # immediately AND the site it lives on is queued for a bounded
+        # background crawl (engines/crawl.py:enqueue_site_crawl), drained by
+        # the knowledge worker one job at a time. The caps are per job; a
+        # site bigger than them resumes for free on the next share because
+        # stored pages cost nothing.
+        self.web_background_crawl_enabled: bool = _bool("WEB_BACKGROUND_CRAWL_ENABLED", True)
+        self.web_share_crawl_enabled: bool = _bool("WEB_SHARE_CRAWL_ENABLED", True)
+        self.web_share_crawl_max_pages: int = _int("WEB_SHARE_CRAWL_MAX_PAGES", 150)
+        self.web_share_crawl_max_minutes: float = _float("WEB_SHARE_CRAWL_MAX_MINUTES", 8.0)
 
         # --- Deep Research (2026-08-30): the iterative mode. Every default
         # below is derived from measurement on this deployment, not taste:
@@ -482,14 +525,19 @@ class Settings:
         # ~48k tokens of evidence — comfortable in a 1M window, and small
         # enough that the report call is not itself the bottleneck.
         self.deep_research_enabled: bool = _bool("DEEP_RESEARCH_ENABLED", True)
-        self.deep_research_max_iterations: int = _int("DEEP_RESEARCH_MAX_ITERATIONS", 3)
+        # 2026-09-03: 3 → 5 rounds and 24 → 36 sources. The loop no longer
+        # stops on a fixed count — it stops on evidence (see
+        # engines/deep_research.py: sufficiency, information gain, duplicate
+        # rate, budget) — so the caps are a ceiling for the hard question,
+        # not the typical run. The wall-clock budget is unchanged.
+        self.deep_research_max_iterations: int = _int("DEEP_RESEARCH_MAX_ITERATIONS", 5)
         self.deep_research_max_queries_per_iteration: int = _int(
             "DEEP_RESEARCH_MAX_QUERIES_PER_ITERATION", 5
         )
         self.deep_research_sources_per_iteration: int = _int(
             "DEEP_RESEARCH_SOURCES_PER_ITERATION", 10
         )
-        self.deep_research_max_sources: int = _int("DEEP_RESEARCH_MAX_SOURCES", 24)
+        self.deep_research_max_sources: int = _int("DEEP_RESEARCH_MAX_SOURCES", 36)
         # Below this the loop searches the plan's remaining angles instead of
         # asking the auditor whether three pages are enough.
         self.deep_research_min_sources: int = _int("DEEP_RESEARCH_MIN_SOURCES", 6)
@@ -497,6 +545,32 @@ class Settings:
         self.deep_research_report_max_tokens: int = _int(
             "DEEP_RESEARCH_REPORT_MAX_TOKENS", 6000
         )
+        # Links followed FROM the pages a round read (the citation an article
+        # gives for its claim, the official page a summary links to, the PDF
+        # behind a news story). Per round, on top of search results.
+        self.deep_research_links_per_round: int = _int("DEEP_RESEARCH_LINKS_PER_ROUND", 6)
+        # The self-correction pass: before the report, review each
+        # subquestion's evidence and run ONE more targeted round when a
+        # key claim is thin, unverified against a primary source, or the
+        # sources disagree.
+        self.deep_research_verify: bool = _bool("DEEP_RESEARCH_VERIFY", True)
+        self.deep_research_min_confidence: float = _float("DEEP_RESEARCH_MIN_CONFIDENCE", 0.6)
+        # Near-duplicate threshold (word-shingle Jaccard). Ten syndicated
+        # copies of one report count as ONE independent source.
+        self.deep_research_duplicate_threshold: float = _float(
+            "DEEP_RESEARCH_DUPLICATE_THRESHOLD", 0.6
+        )
+        # Two consecutive rounds adding fewer than this share of new,
+        # non-duplicate sources (and no new claims) means the web has been
+        # mined for this question: stop, whatever the iteration cap says.
+        self.deep_research_min_gain: float = _float("DEEP_RESEARCH_MIN_GAIN", 0.15)
+        # After the report: queue the top primary domains for a bounded
+        # background crawl so the NEXT question about them answers locally.
+        self.deep_research_background_crawl: bool = _bool("DEEP_RESEARCH_BACKGROUND_CRAWL", True)
+        self.deep_research_crawl_pages_per_domain: int = _int(
+            "DEEP_RESEARCH_CRAWL_PAGES_PER_DOMAIN", 40
+        )
+        self.deep_research_crawl_max_domains: int = _int("DEEP_RESEARCH_CRAWL_MAX_DOMAINS", 3)
 
         # --- Phase 2: URL / website analysis (fetches pasted links). ---
         self.url_analysis_enabled: bool = _bool("URL_ANALYSIS_ENABLED", True)

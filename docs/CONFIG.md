@@ -95,3 +95,49 @@ Client-mode budgets (`budget ≈ target_minutes × 60 × 46.6`):
 |---|---|---|
 | `MAIN_MODEL_DEFAULT_MAX_OUTPUT_TOKENS` | `8192` | Answer reservation (context budgeting), fast |
 | `MAIN_MODEL_HIGH_MAX_OUTPUT_TOKENS` | `16384` | Answer reservation, think and max |
+
+
+## Research, knowledge and attachment knobs (2026-09-03)
+
+All read by `orchestrator/app/config.py`; every default is the measured
+choice on this deployment, and every one is an env var in `.env.example`.
+
+### Deep Research — the loop stops on evidence, the caps are ceilings
+
+| Env var | Default | What it governs |
+|---|---|---|
+| `DEEP_RESEARCH_MAX_ITERATIONS` | `5` | Ceiling on rounds (search + open + extract + assess). The loop normally stops earlier — see stop reasons below. |
+| `DEEP_RESEARCH_MAX_SOURCES` | `36` | Ceiling on pages registered as sources (top 10 keep ~8k chars in the report prompt, the rest 2.5k). |
+| `DEEP_RESEARCH_LINKS_PER_ROUND` | `6` | Links opened *from* the pages a round read: the citation an article gives, the official page a summary points at, PDFs. Scored by keyword overlap with the plan, the target's authority, and its source class. |
+| `DEEP_RESEARCH_VERIFY` | `true` | The self-correction pass before the report. |
+| `DEEP_RESEARCH_MIN_CONFIDENCE` | `0.6` | Below this a subquestion's resolved claim earns one more targeted round. |
+| `DEEP_RESEARCH_DUPLICATE_THRESHOLD` | `0.6` | Word-shingle Jaccard above which two pages are the same report (a copy keeps its citation number, corroborates nothing). |
+| `DEEP_RESEARCH_MIN_GAIN` | `0.15` | Two consecutive rounds below this share of new evidence stop the loop. |
+| `DEEP_RESEARCH_BACKGROUND_CRAWL` / `…_CRAWL_PAGES_PER_DOMAIN` / `…_CRAWL_MAX_DOMAINS` | `true` / `40` / `3` | After the report, the top primary domains are queued for a bounded background crawl. |
+
+Stop reasons (`meta.research_run.stop_reason`, and the `research[…] assess:` log line):
+`sufficient` · `no_information_gain` · `duplicate_rate` · `no_new_queries` ·
+`iteration_cap` · `source_cap` · `timeout`.
+
+### Background crawl queue
+
+| Env var | Default | What it governs |
+|---|---|---|
+| `WEB_BACKGROUND_CRAWL_ENABLED` | `true` | The queue as a whole (`web_crawls` rows with status `queued`, drained by the knowledge worker one job at a time). |
+| `WEB_SHARE_CRAWL_ENABLED` | `true` | Sharing a URL queues its site. The page itself is always stored in the global corpus. |
+| `WEB_SHARE_CRAWL_MAX_PAGES` / `WEB_SHARE_CRAWL_MAX_MINUTES` | `150` / `8` | Per-job caps. Stored pages are free, so a large site finishes over several shares. |
+
+### Living knowledge (Fast mode)
+
+| Env var | Default | What it governs |
+|---|---|---|
+| `LIVING_KNOWLEDGE_EVIDENCE_CHARS` | `3600` | Characters of passages in a grounded answer (was 900). |
+| `LIVING_KNOWLEDGE_TOPICAL` / `LIVING_KNOWLEDGE_TOPICAL_MIN_SCORE` | `true` / `0.66` | Ground a *timeless* question on a strongly matching stored passage (an indexed site, a research source). |
+| `FRESHNESS_FAST_DEADLINE_S` | `8.0` | The most a Fast answer waits for the two-page live lookup (was 12). |
+
+### Attachments
+
+| Env var | Default | What it governs |
+|---|---|---|
+| `OCR_VISION_DEADLINE_S` / `OCR_VISION_MAX_TOKENS` | `10.0` / `1500` | The image route's OCR pass is time-boxed and capped; past the deadline the answer proceeds from the pixels. PDF scans keep the full budget. |
+| `DOCUMENT_PREWARM_ENABLED` / `DOCUMENT_PREWARM_MAX_MB` | `true` / `64` | Extract a document at upload time so the send reads a cache. |

@@ -39,6 +39,20 @@ from .freshness import Freshness
 log = logging.getLogger(__name__)
 
 _task: Optional[asyncio.Task] = None
+#: Set by `kick()` when something is worth doing NOW — a crawl was just
+#: queued because a user shared a link. The loop otherwise sleeps its full
+#: interval, and a shared site that took five minutes to even start indexing
+#: would not feel like "in the background", it would feel broken.
+_wake: Optional[asyncio.Event] = None
+
+
+def kick() -> None:
+    """Wake the loop early. Safe from any coroutine; a no-op when not running."""
+    if _wake is not None:
+        try:
+            _wake.set()
+        except RuntimeError:  # pragma: no cover — loop closing
+            pass
 
 
 def _ttl_for(row: Dict[str, Any]) -> int:
@@ -144,8 +158,11 @@ def _mark_changed(page_id: int) -> None:
 
 
 async def run_once() -> Dict[str, int]:
-    """One cycle: index the backlog, then refresh what is due."""
-    done = {"indexed": 0, "refreshed": 0, "failed": 0}
+    """One cycle: index the backlog, refresh what is due, then drain one
+    queued background crawl (a shared link or a research run's primary
+    domains) — the crawl last, so the answer-serving work never queues
+    behind a site walk."""
+    done = {"indexed": 0, "refreshed": 0, "failed": 0, "crawled": 0}
 
     started = time.perf_counter()
     try:
@@ -155,17 +172,16 @@ async def run_once() -> Dict[str, int]:
         metrics.worker_job("index", False, time.perf_counter() - started)
         log.debug("index drain failed", exc_info=True)
 
-    if not settings.web_knowledge_worker_enabled:
-        return done
-
-    started = time.perf_counter()
-    try:
-        rows = await db.run_in_thread(
-            _due_pages, max(1, settings.web_refresh_max_pages_per_cycle)
-        )
-    except Exception:  # noqa: BLE001
-        log.debug("could not read the refresh queue", exc_info=True)
-        return done
+    rows: List[Dict[str, Any]] = []
+    if settings.web_knowledge_worker_enabled:
+        started = time.perf_counter()
+        try:
+            rows = await db.run_in_thread(
+                _due_pages, max(1, settings.web_refresh_max_pages_per_cycle)
+            )
+        except Exception:  # noqa: BLE001
+            log.debug("could not read the refresh queue", exc_info=True)
+            rows = []
 
     if rows:
         sem = asyncio.Semaphore(max(1, settings.web_refresh_concurrency))
@@ -187,27 +203,69 @@ async def run_once() -> Dict[str, int]:
             done["indexed"] += await web_index.index_pending(limit=40)
         except Exception:  # noqa: BLE001
             pass
+
+    if settings.web_background_crawl_enabled:
+        started = time.perf_counter()
+        try:
+            from .engines.crawl import run_queued_crawls
+
+            done["crawled"] = await run_queued_crawls(max_jobs=1)
+            if done["crawled"]:
+                metrics.worker_job("crawl", True, time.perf_counter() - started)
+        except Exception:  # noqa: BLE001
+            metrics.worker_job("crawl", False, time.perf_counter() - started)
+            log.debug("crawl queue drain failed", exc_info=True)
     return done
 
 
+async def _sleep_or_kick(seconds: float) -> None:
+    """Sleep the interval, or less when kick() says there is work now."""
+    global _wake
+    if _wake is None:
+        _wake = asyncio.Event()
+    _wake.clear()
+    try:
+        await asyncio.wait_for(_wake.wait(), timeout=seconds)
+    except asyncio.TimeoutError:
+        pass
+
+
 async def _loop() -> None:
+    global _wake
+    _wake = asyncio.Event()
     # A short delay before the first cycle: startup already has a migration,
     # a model handshake and the first requests competing for the box.
-    await asyncio.sleep(45)
+    await _sleep_or_kick(45)
+    # Jobs a restart interrupted go back to the queue before anything runs.
+    try:
+        requeued = await db.run_in_thread(db.requeue_interrupted_web_crawls)
+        if requeued:
+            log.info("crawl queue: %d interrupted job(s) requeued", requeued)
+    except Exception:  # noqa: BLE001
+        log.debug("could not requeue interrupted crawls", exc_info=True)
     while True:
         try:
             result = await run_once()
             if any(result.values()):
                 log.info(
                     "web knowledge worker: indexed=%(indexed)d refreshed=%(refreshed)d "
-                    "failed=%(failed)d",
+                    "failed=%(failed)d crawled=%(crawled)d",
                     result,
                 )
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 — the loop outlives any one cycle
             log.warning("web knowledge worker cycle failed", exc_info=True)
-        await asyncio.sleep(max(30, settings.web_worker_interval_s))
+        # A kicked cycle that found a job runs the next one promptly too:
+        # a research run can queue three domains at once.
+        try:
+            pending = await db.run_in_thread(db.web_crawl_queue_counts)
+        except Exception:  # noqa: BLE001
+            pending = {"queued": 0}
+        if pending.get("queued"):
+            await _sleep_or_kick(5)
+        else:
+            await _sleep_or_kick(max(30, settings.web_worker_interval_s))
 
 
 def start() -> None:

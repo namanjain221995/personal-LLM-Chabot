@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import socket
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional
 from urllib.parse import urlparse
 
@@ -45,6 +45,10 @@ class FetchResult:
     status: int
     content_type: str
     body: bytes
+    #: The few response headers provenance cares about (lower-cased keys:
+    #: last-modified, etag, date). Empty for callers and tests that build a
+    #: result by hand — nothing downstream requires them.
+    headers: dict = field(default_factory=dict)
 
 
 def _ip_is_blocked(ip: ipaddress._BaseAddress) -> bool:
@@ -165,5 +169,12 @@ async def safe_fetch(
                 status=resp.status_code,
                 content_type=resp.headers.get("content-type", ""),
                 body=resp.content[:max_bytes],
+                # Kept for provenance: when the server says the page last
+                # changed, and the validators a conditional re-fetch needs.
+                headers={
+                    k: resp.headers.get(k, "")
+                    for k in ("last-modified", "etag", "date")
+                    if resp.headers.get(k)
+                },
             )
     raise FetchError("too many redirects")

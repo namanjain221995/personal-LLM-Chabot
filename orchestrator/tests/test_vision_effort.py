@@ -382,7 +382,7 @@ def test_ocr_runs_only_off_the_fast_path(monkeypatch, effort, expect_ocr):
 
     calls: list = []
 
-    async def fake_ocr(images):
+    async def fake_ocr(images, **kw):  # the route passes a deadline + cap (2026-09-03)
         calls.append(list(images))
         return ["Vendor: TechSara" for _ in images]
 

@@ -566,6 +566,25 @@ async def _resolve_document_refs(
             docs.extend(more_docs)
             images.extend(more_images[: _MAX_ARCHIVE_IMAGES - len(images)])
         else:
+            # 2026-09-03: the upload-time prewarm may already have extracted
+            # this document; when its cache can serve this answer (render
+            # policy satisfied), the engine skips extraction entirely.
+            cached = None
+            try:
+                from .engines.document import load_document_cache
+
+                cached = await asyncio.to_thread(
+                    load_document_cache,
+                    root,
+                    entry.name,
+                    effort=request.effort,
+                    question=request.text or "",
+                )
+            except Exception:  # noqa: BLE001 — the cache is an accelerator
+                cached = None
+            if cached is not None:
+                docs.append(cached)
+                continue
             with open(entry.path, "rb") as fh:
                 raw = fh.read()
             docs.append((entry.name, _b64.b64encode(raw).decode("ascii")))
@@ -957,6 +976,30 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 await emit(
                     "status",
                     {"text": "Deep Research is unavailable here — answering normally."},
+                )
+
+            # LIVING KNOWLEDGE, started early (2026-09-03). The classifier +
+            # local retrieval are independent of every pre-pass below
+            # (memory recall, stored pages, compaction), so they run
+            # CONCURRENTLY with them instead of after — measured ~150-250 ms
+            # off a Fast answer's time to first token. Only for the turn
+            # shape the plain chat branch can actually answer; when another
+            # engine wins the dispatch the task is cancelled unread.
+            knowledge_task: Optional[asyncio.Task] = None
+            if (
+                settings.living_knowledge_enabled
+                and request.mode == "assistant"
+                and request.text
+                and not request.pdf_data
+                and not request.pdf_uploads
+                and not request.image_data
+                and not request.agent
+                and not want_agent
+                and not want_search
+                and not deep_research_on
+            ):
+                knowledge_task = asyncio.ensure_future(
+                    _prepare_knowledge(request, text, allow_network=True)
                 )
 
             # Announce and record the auto-decision only AFTER the gates
@@ -1590,7 +1633,29 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 # india" from pretraining while 19 stored pages said
                 # otherwise. Costs nothing for a timeless question (one regex)
                 # and one local lookup for a live one.
-                prepared = await _prepare_knowledge(request, text, allow_network=not want_search)
+                if knowledge_task is not None:
+                    if not knowledge_task.done():
+                        # Still working → it is in the slow branch (a live
+                        # lookup), and the user is now waiting on exactly
+                        # that. Say so instead of showing an empty spinner.
+                        await emit("status", {"text": "Checking recent sources…"})
+                    prepared = await knowledge_task
+                else:
+                    prepared = await _prepare_knowledge(
+                        request, text, allow_network=not want_search, emit=emit
+                    )
+                if prepared.sources:
+                    # Same shape the search engine emits, so the Sources panel
+                    # and citation chips render locally-sourced evidence with
+                    # no client change. Filled BEFORE the engine runs: the
+                    # engine emits the one meta, and until 2026-09-03 this
+                    # block came after it — the grounding reached the prompt
+                    # but the sources never reached the panel.
+                    knowledge_state["sources"] = prepared.sources
+                    knowledge_state["freshness"] = (
+                        prepared.verdict.requirement.value if prepared.verdict else ""
+                    )
+                    knowledge_state["from_local_memory"] = not prepared.searched
                 answer = await run_chat_engine(
                     text,
                     history,
@@ -1600,15 +1665,6 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     effort=request.effort,
                     grounding=prepared.grounding,
                 )
-                if prepared.sources:
-                    # Same shape the search engine emits, so the Sources panel
-                    # and citation chips render locally-sourced evidence with
-                    # no client change.
-                    knowledge_state["sources"] = prepared.sources
-                    knowledge_state["freshness"] = (
-                        prepared.verdict.requirement.value if prepared.verdict else ""
-                    )
-                    knowledge_state["from_local_memory"] = not prepared.searched
             elif request.sf_live:
                 # "Live Salesforce" toggle: skip the router — every text
                 # answer queries the org directly (schema questions included;
@@ -1631,6 +1687,9 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     }
                 )
                 answer = state.get("answer") or ""
+            if knowledge_task is not None and not knowledge_task.done():
+                # Another engine answered; the speculative lookup is moot.
+                knowledge_task.cancel()
             gen.answer = answer
             memory.add_exchange(scoped_session, text, answer)
             await gen.publish("done", {"session_id": request.session_id})
@@ -1743,7 +1802,7 @@ class StopRequest(BaseModel):
     session_id: str = "default"
 
 
-async def _prepare_knowledge(request, text: str, *, allow_network: bool):
+async def _prepare_knowledge(request, text: str, *, allow_network: bool, emit=None):
     """Freshness-aware grounding for one assistant turn, or an empty result.
 
     Wrapped so a failure in the knowledge layer can never cost the user an
@@ -1761,7 +1820,10 @@ async def _prepare_knowledge(request, text: str, *, allow_network: bool):
             mode=request.mode,
             web_search_pref=request.web_search,
             allow_network=allow_network and settings.search_enabled,
+            emit=emit,
         )
+    except asyncio.CancelledError:
+        raise
     except Exception:  # noqa: BLE001 — grounding is an enhancement
         logging.getLogger(__name__).debug("living knowledge unavailable", exc_info=True)
         return Prepared()

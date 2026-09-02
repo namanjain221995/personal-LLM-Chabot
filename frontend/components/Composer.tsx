@@ -25,6 +25,14 @@ import {
 import type { ChatPrefs } from '@/lib/prefs';
 import { downscaleImageFile } from '@/lib/images';
 import {
+  applySlashCommand,
+  completeCommand,
+  matchingCommands,
+  parseSlashCommand,
+  type SlashCommand,
+} from '@/lib/slashCommands';
+import { uploadDocumentFile, type DocumentRef } from '@/lib/uploadDocument';
+import {
   imageExtFromMime,
   makePastedText,
   shouldAttachPaste,
@@ -115,6 +123,20 @@ export interface Attachment {
    * store and dropped when the tab closes.
    */
   file?: File;
+  /**
+   * 2026-09-03: a streamed document starts uploading the moment it is
+   * attached — the way ChatGPT processes a file while you are still typing
+   * the question — so the send that follows only has to reference it.
+   * Resolves to the server reference, or null when the early upload failed;
+   * the send then uploads again instead of failing.
+   */
+  uploadPromise?: Promise<DocumentRef | null>;
+}
+
+/** 2026-09-03: what a slash command decided about THIS send. */
+export interface SendOptions {
+  /** The prefs the send must run under (e.g. Deep research armed). */
+  prefs?: ChatPrefs;
 }
 
 // 2026-09-02: 512 MB, ChatGPT-class. Small documents still ride inline as
@@ -161,8 +183,16 @@ interface ComposerProps {
     /** Up to MAX_IMAGES images, or exactly one PDF/dataset (2026-08-05). */
     attachments: Attachment[],
     pasted: PastedText[],
+    /** A slash command's decision for this send (2026-09-03). */
+    options?: SendOptions,
   ) => void;
   onStop: () => void;
+  /**
+   * The conversation a streamed document may upload into as soon as it is
+   * attached (2026-09-03). Null for a brand-new chat, which has no id until
+   * its first send — those documents upload at send time, in parallel.
+   */
+  uploadConversationId?: string | null;
   /**
    * Salesforce Intelligence Mode: the placeholder while a clarifying question
    * is waiting ("Enter another date range…"). Text already typed is NEVER
@@ -201,10 +231,13 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
       clarificationPlaceholder,
       starter,
       clarification,
+      uploadConversationId = null,
     },
     ref,
   ) {
     const [text, setText] = useState('');
+    /** Highlighted row of the slash-command picker while it is showing. */
+    const [commandIndex, setCommandIndex] = useState(0);
     const [attachments, setAttachments] = useState<Attachment[]>([]);
     /** Files still being read/downscaled; a send must wait for them. */
     const [pendingAttach, setPendingAttach] = useState(0);
@@ -281,22 +314,64 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
     );
 
     function submit() {
-      const trimmed = text.trim();
+      let trimmed = text.trim();
       if (streaming || disabled || busy) return;
       // An attachment is still being prepared — sending now would post the
       // message without it.
       if (pendingAttach > 0) return;
       if (!trimmed && attachments.length === 0 && pastedTexts.length === 0)
         return;
-      onSend(trimmed, attachments, pastedTexts);
+      // A slash command sets the mode for THIS send (2026-09-03):
+      // "/deep-research <question>" arms research, "/search" forces the
+      // web, "/crawl <url>" becomes the crawler's trigger phrase. The
+      // command word never reaches the model.
+      let options: SendOptions | undefined;
+      const parsed = trimmed ? parseSlashCommand(trimmed) : null;
+      if (parsed) {
+        const out = applySlashCommand(parsed, prefs);
+        if (out.error) {
+          toast(out.error, 'error');
+          return;
+        }
+        trimmed = out.text;
+        options = { prefs: out.prefs };
+      }
+      onSend(trimmed, attachments, pastedTexts, options);
       setText('');
       onDraftChange?.(''); // the draft is gone — drop it from the meter
       setAttachments([]);
       setPastedTexts([]);
     }
 
+    // The slash-command picker: rows for what is typed after "/".
+    const commands: SlashCommand[] = matchingCommands(text);
+    const picking = commands.length > 0;
+
+    function pickCommand(command: SlashCommand) {
+      const next = completeCommand(command);
+      setText(next);
+      onDraftChange?.(next);
+      setCommandIndex(0);
+      textareaRef.current?.focus();
+    }
+
+    /**
+     * Start a streamed document's upload NOW rather than on send. Only when
+     * the conversation already exists — a new chat has no id until its first
+     * send. A failure resolves to null and the send uploads again.
+     */
+    function withEarlyUpload(att: Attachment): Attachment {
+      if (!uploadConversationId || !att.file || att.base64) return att;
+      const conversationId = uploadConversationId;
+      const uploadPromise = uploadDocumentFile(att.file, conversationId).catch(
+        () => null,
+      );
+      return { ...att, uploadPromise };
+    }
+
     /** Documents stack to MAX_DOCS and displace images/datasets (2026-09-02). */
-    function appendDocument(att: Attachment) {
+    function appendDocument(input: Attachment) {
+      const att = withEarlyUpload(input);
       let refused = false;
       setAttachments((prev) => {
         const kept = prev.filter((a) => a.kind !== 'dataset');
@@ -596,6 +671,41 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
           <div className="rounded-[26px] bg-surface">
             {clarification}
             <div className="px-4 py-3">
+            {/* Slash commands (2026-09-03): "/" lists them, typing narrows,
+                Enter/Tab completes. ChatGPT-style — the command applies to
+                the next send and never reaches the model as text. */}
+            {picking && (
+              <div
+                role="listbox"
+                aria-label="Commands"
+                className="mb-2 overflow-hidden rounded-ts border border-border bg-surface shadow-sm"
+              >
+                {commands.map((c, i) => (
+                  <button
+                    key={c.id}
+                    type="button"
+                    role="option"
+                    aria-selected={i === commandIndex}
+                    onMouseDown={(e) => {
+                      // mousedown, not click: a click would first blur the
+                      // textarea and the picker would unmount under it.
+                      e.preventDefault();
+                      pickCommand(c);
+                    }}
+                    onMouseEnter={() => setCommandIndex(i)}
+                    className={`flex w-full items-baseline gap-3 px-3 py-2 text-left text-sm transition-colors duration-ts ${
+                      i === commandIndex ? 'bg-surface-2' : 'hover:bg-surface-2'
+                    }`}
+                  >
+                    <span className="font-medium text-ink">/{c.name}</span>
+                    <span className="text-xs text-faint">{c.argument}</span>
+                    <span className="ml-auto min-w-0 truncate text-xs text-muted">
+                      {c.hint}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            )}
             <textarea
               ref={textareaRef}
               value={text}
@@ -605,6 +715,26 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
                 onDraftChange?.(e.target.value);
               }}
               onKeyDown={(e) => {
+                if (picking) {
+                  // The picker owns the keys while it is showing: Enter/Tab
+                  // complete the highlighted command instead of sending
+                  // "/de" to the model.
+                  if (e.key === 'ArrowDown') {
+                    e.preventDefault();
+                    setCommandIndex((i) => (i + 1) % commands.length);
+                    return;
+                  }
+                  if (e.key === 'ArrowUp') {
+                    e.preventDefault();
+                    setCommandIndex((i) => (i - 1 + commands.length) % commands.length);
+                    return;
+                  }
+                  if (e.key === 'Enter' || e.key === 'Tab') {
+                    e.preventDefault();
+                    pickCommand(commands[Math.min(commandIndex, commands.length - 1)]);
+                    return;
+                  }
+                }
                 if (e.key === 'Enter' && !e.shiftKey) {
                   e.preventDefault();
                   submit();

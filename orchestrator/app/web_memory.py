@@ -119,6 +119,10 @@ class Evidence:
     authority: int
     fetched_at: Optional[datetime]
     published_at: Optional[datetime] = None
+    #: V14 provenance: when the page was last updated, and its structural
+    #: class (official / docs / news / community …) from core/provenance.
+    modified_at: Optional[datetime] = None
+    source_type: str = ""
     #: Component scores, kept for the debug view and the metrics — an opaque
     #: single number makes a bad ranking impossible to argue with.
     dense: float = 0.0
@@ -129,9 +133,39 @@ class Evidence:
 
     @property
     def age_seconds(self) -> float:
+        """Seconds since this platform READ the page — the freshness of the
+        copy, which decides whether the network is worth spending."""
         if self.fetched_at is None:
             return float("inf")
         return max(0.0, (_now() - self.fetched_at).total_seconds())
+
+    @property
+    def effective_age_seconds(self) -> float:
+        """Seconds since the page's content is FROM — its publication or
+        last update when the page states one, else the read time.
+
+        The distinction is the whole fix for a stale copy outranking a
+        current one: a 2019 article fetched this morning is fresh as a COPY
+        and five years old as EVIDENCE. Ranking and supersession use this;
+        the network decision keeps `age_seconds`."""
+        from .core.provenance import effective_time
+
+        when = effective_time(self.published_at, self.modified_at, self.fetched_at)
+        if when is None:
+            return float("inf")
+        return max(0.0, (_now() - when).total_seconds())
+
+    @property
+    def relevant(self) -> bool:
+        """Topically ABOUT the question, not merely fresh and official.
+
+        Recency and authority together can push an unrelated page past the
+        sufficiency score (measured: five fresh model-documentation pages
+        scored 0.53 against a question about a different product, and that
+        "evidence" blocked the live lookup). A passage counts as relevant
+        when the question's own words are in it, or the vector match is
+        strong on its own."""
+        return self.lexical >= 0.34 or self.dense >= 0.62
 
     def as_source(self) -> Dict[str, Any]:
         """The shape `meta.sources` already uses, so citations render as-is."""
@@ -168,12 +202,18 @@ class Retrieval:
             return False
         if self.newest_age > max_age_seconds:
             return False
+        # Only passages that are actually about the question count. Without
+        # this gate, fresh + authoritative + unrelated read as "answered" and
+        # the live lookup that would have found the real answer never ran.
+        relevant = [e for e in self.evidence if e.relevant]
+        if not relevant:
+            return False
         # One lone weak passage is not a basis for contradicting the model's
         # own prior; require either a decent score or corroboration.
-        best = self.evidence[0]
+        best = relevant[0]
         if best.score >= 0.62:
             return True
-        return len(self.evidence) >= 2 and best.score >= 0.5
+        return len(relevant) >= 2 and best.score >= 0.5
 
 
 def _now() -> datetime:
@@ -224,8 +264,28 @@ _STOP = {
 }
 
 
+_SUFFIXES = ("ing", "ed", "es", "s")
+
+
+def _stem(word: str) -> str:
+    """A deliberately tiny stemmer: 'configured' ~ 'configure' ~ 'configures'.
+
+    Exact-token overlap missed the obvious inflections — a page that says
+    "configure" scored zero for a question that says "configured". Suffix
+    stripping on words long enough to survive it fixes the common cases
+    without a stemming dependency; it is a matching aid, never shown."""
+    for suffix in _SUFFIXES:
+        if word.endswith(suffix) and len(word) - len(suffix) >= 4:
+            return word[: -len(suffix)]
+    return word
+
+
 def _terms(text: str) -> List[str]:
-    return [w for w in _WORD.findall((text or "").lower()) if w not in _STOP and len(w) > 1]
+    return [
+        _stem(w)
+        for w in _WORD.findall((text or "").lower())
+        if w not in _STOP and len(w) > 1
+    ]
 
 
 def _lexical_score(query: str, ev: Evidence) -> float:
@@ -253,7 +313,8 @@ def _lexical_score(query: str, ev: Evidence) -> float:
 def _score(query: str, ev: Evidence, level: Freshness) -> Evidence:
     w = _WEIGHTS[level]
     ev.lexical = _lexical_score(query, ev)
-    ev.recency = _recency_score(ev.age_seconds, level)
+    # Recency is about the CONTENT's date, not the copy's (see Evidence).
+    ev.recency = _recency_score(ev.effective_age_seconds, level)
     ev.score = (
         w["dense"] * ev.dense
         + w["lexical"] * ev.lexical
@@ -285,7 +346,8 @@ def _partition(evidence: List[Evidence], level: Freshness) -> Tuple[List[Evidenc
     if not evidence or level is Freshness.STATIC:
         return evidence, [], False
 
-    newest = min((e.age_seconds for e in evidence if e.age_seconds != float("inf")), default=None)
+    ages = {id(e): e.effective_age_seconds for e in evidence}
+    newest = min((a for a in ages.values() if a != float("inf")), default=None)
     if newest is None:
         return evidence, [], False
 
@@ -293,9 +355,11 @@ def _partition(evidence: List[Evidence], level: Freshness) -> Tuple[List[Evidenc
     kept, superseded = [], []
     for ev in evidence:
         # Only drop a stale source when a BETTER-SOURCED fresh one exists;
-        # an old official page still beats a fresh content farm.
-        if ev.age_seconds > cutoff and any(
-            k.age_seconds <= cutoff and k.authority >= ev.authority for k in evidence
+        # an old official page still beats a fresh content farm. Ages are
+        # the content's dates (published/updated) where the page states
+        # them, so a freshly re-read old article cannot pose as current.
+        if ages[id(ev)] > cutoff and any(
+            ages[id(k)] <= cutoff and k.authority >= ev.authority for k in evidence
         ):
             superseded.append(ev)
         else:
@@ -316,8 +380,8 @@ def _partition(evidence: List[Evidence], level: Freshness) -> Tuple[List[Evidenc
         authoritative = [e for e in top if e.authority >= AUTHORITY_REFERENCE]
         domains = {e.domain for e in authoritative if e.domain}
         if len(authoritative) >= 2 and len(domains) >= 2:
-            spread = max(e.age_seconds for e in authoritative) - min(
-                e.age_seconds for e in authoritative
+            spread = max(ages[id(e)] for e in authoritative) - min(
+                ages[id(e)] for e in authoritative
             )
             conflict = spread < _SUPERSEDE_GAP_DAYS * 86400 / 2
     return kept, superseded, conflict
@@ -335,14 +399,20 @@ def _lexical_candidates(query: str, limit: int) -> List[Dict[str, Any]]:
     person actually types (no operator syntax to get wrong) and never raises on
     punctuation — `to_tsquery` would.
     """
-    terms = " ".join(_terms(query)[:12])
-    if not terms:
+    words = _terms(query)[:12]
+    if not words:
         return []
+    # OR semantics, ranked. websearch_to_tsquery ANDs plain words, so ONE
+    # question word absent from a page ("explain", "how") excluded a page
+    # that matched every other term — exactly the pages a shared site is
+    # supposed to answer from. ts_rank_cd then puts the pages matching the
+    # most terms first, and the relevance gate downstream drops the rest.
+    terms = " OR ".join(words)
     try:
         with db.connection() as con:
             return con.execute(
                 """SELECT id, url, title, text, domain, authority, fetched_at,
-                          published_at,
+                          published_at, modified_at, source_type,
                           ts_rank_cd(search_tsv, websearch_to_tsquery('english', %s)) AS rank
                      FROM web_pages
                     WHERE search_tsv @@ websearch_to_tsquery('english', %s)
@@ -369,7 +439,7 @@ def _page_meta(urls: Sequence[str]) -> Dict[str, Dict[str, Any]]:
         with db.connection() as con:
             rows = con.execute(
                 """SELECT id, url, title, domain, authority, fetched_at, published_at,
-                          last_changed_at
+                          last_changed_at, modified_at, source_type
                      FROM web_pages WHERE url = ANY(%s)""",
                 (list(urls),),
             ).fetchall()
@@ -440,6 +510,8 @@ async def retrieve(
             authority=int(row.get("authority") or 0) or authority_of(url),
             fetched_at=row.get("fetched_at"),
             published_at=row.get("published_at"),
+            modified_at=row.get("modified_at"),
+            source_type=row.get("source_type") or "",
             page_id=row.get("id"),
         )
 
@@ -455,6 +527,8 @@ async def retrieve(
             ev.page_id = ev.page_id or m.get("id")
             ev.fetched_at = m.get("fetched_at") or ev.fetched_at
             ev.published_at = m.get("published_at") or ev.published_at
+            ev.modified_at = m.get("modified_at") or ev.modified_at
+            ev.source_type = ev.source_type or (m.get("source_type") or "")
             ev.title = ev.title or (m.get("title") or "")
             ev.domain = ev.domain or (m.get("domain") or "")
             stored_authority = int(m.get("authority") or 0)
@@ -504,18 +578,58 @@ def _bump_retrieval(page_ids: Sequence[int]) -> None:
 # Prompt grounding
 # ---------------------------------------------------------------------------
 
-#: Character budget for the whole evidence block. The window is 1M tokens, but
-#: spending it on web text is how a fast answer stops being fast — and a model
-#: given six focused passages answers better than one given six full pages.
-_EVIDENCE_CHARS = 900
+#: Fallback character budget for the whole evidence block when settings are
+#: unavailable. The live value is settings.living_knowledge_evidence_chars
+#: (3600 by default since 2026-09-03; it was 900 — one paragraph, which is
+#: not "a large amount of information from the site"). ~1k tokens of prefill
+#: costs a Fast answer well under half a second on this deployment.
+_EVIDENCE_CHARS = 3600
+
+
+def _evidence_budget() -> int:
+    try:
+        return max(600, int(settings.living_knowledge_evidence_chars))
+    except Exception:  # noqa: BLE001
+        return _EVIDENCE_CHARS
+
+
+def _dated_label(ev: Evidence) -> str:
+    """'(domain, published 2026-03-12, read 2026-09-02)' — both dates, so
+    the model can say 'as of' truthfully and weigh an old article read
+    today for what it is."""
+    read = ev.fetched_at.date().isoformat() if ev.fetched_at else "unknown date"
+    stamp = ""
+    if ev.published_at:
+        stamp = f"published {ev.published_at.date().isoformat()}, "
+    elif ev.modified_at:
+        stamp = f"updated {ev.modified_at.date().isoformat()}, "
+    kind = f"{ev.source_type}, " if ev.source_type and ev.source_type != "unknown" else ""
+    return f"({kind}{ev.domain}, {stamp}read {read})"
+
+
+def _passages(result: Retrieval, budget: int) -> List[str]:
+    """Numbered passages within the budget — several focused ones rather
+    than one long one, because the answer needs coverage, not a single page."""
+    lines: List[str] = []
+    n = max(1, min(len(result.evidence), 4))
+    per = max(300, min(1400, budget // n))
+    remaining = budget
+    for i, ev in enumerate(result.evidence, 1):
+        if remaining <= 0:
+            break
+        body = " ".join((ev.text or "").split())[: min(per, max(180, remaining))]
+        remaining -= len(body)
+        lines.append(f"[{i}] {ev.title or ev.domain} {_dated_label(ev)}: {body}")
+    return lines
 
 
 def grounding_block(result: Retrieval, today: str) -> str:
     """The system-prompt fragment that makes the model prefer evidence.
 
     Explicit about three things the model cannot infer: what today's date is,
-    that these passages postdate its training, and WHEN each one was read — so
-    it can say "as of <date>" instead of implying timeless certainty.
+    that these passages postdate its training, and WHEN each one was read and
+    published — so it can say "as of <date>" instead of implying timeless
+    certainty.
     """
     if not result.evidence:
         return ""
@@ -525,28 +639,78 @@ def grounding_block(result: Retrieval, today: str) -> str:
         "The sources below were read from the public web by this platform and "
         "are NEWER than your training data. Prefer them over your own recollection "
         "for anything time-sensitive, and do not contradict them unless the user "
-        "supplies better evidence.",
+        "supplies better evidence. Each source shows when it was published (where "
+        "the page says) and when it was read; a newer authoritative source "
+        "outranks an older one.",
     ]
     if result.conflict:
         lines.append(
             "NOTE: these sources disagree and are of comparable age and quality. "
             "Say so plainly rather than picking one and sounding certain."
         )
-
-    budget = _EVIDENCE_CHARS
-    for i, ev in enumerate(result.evidence, 1):
-        if budget <= 0:
-            break
-        when = ev.fetched_at.date().isoformat() if ev.fetched_at else "unknown date"
-        body = " ".join((ev.text or "").split())[: max(180, budget // 2)]
-        budget -= len(body)
-        lines.append(f"[{i}] {ev.title or ev.domain} ({ev.domain}, read {when}): {body}")
-
+    lines.extend(_passages(result, _evidence_budget()))
     lines.append(
         "Answer from these sources. If they do not actually contain the answer, "
         "say what you do not know rather than filling the gap from memory."
     )
     return "\n".join(lines)
+
+
+def topical_block(result: Retrieval, today: str) -> str:
+    """Grounding for a TIMELESS question that a strongly matching stored
+    passage can answer — a site the user indexed, a document a research run
+    read. The framing differs from the time-sensitive block: the passages are
+    reference material to draw on and cite, not a correction of the model's
+    knowledge, and the model may still answer the parts they do not cover."""
+    if not result.evidence:
+        return ""
+    lines = [
+        f"Current date: {today}.",
+        "Reference material this platform has already read from the web — pages "
+        "from sites indexed here or read during earlier research — that closely "
+        "matches the question. Draw on it where it answers the question and cite "
+        "it inline as [n]; say plainly when it does not cover a part of the "
+        "question, and answer that part from your own knowledge.",
+    ]
+    lines.extend(_passages(result, _evidence_budget()))
+    return "\n".join(lines)
+
+
+def claims_for(query: str, limit: int = 3) -> List[Dict[str, Any]]:
+    """Resolved claims from earlier Deep Research runs that match the
+    question's words. Blocking (run via db.run_in_thread). Never raises."""
+    terms = " ".join(_terms(query)[:12])
+    if not terms:
+        return []
+    try:
+        return db.search_web_claims(terms, limit=limit, kinds=["current"])
+    except Exception:  # noqa: BLE001
+        log.debug("claim lookup unavailable", exc_info=True)
+        return []
+
+
+def claims_block(rows: Sequence[Dict[str, Any]]) -> str:
+    """Lines for claims a research run resolved as CURRENT — each with the
+    date the claim was true as of, and where it came from, so the model
+    can state it as a dated fact rather than a timeless one."""
+    lines: List[str] = []
+    for r in rows:
+        claim = " ".join(str(r.get("claim") or "").split())
+        value = " ".join(str(r.get("value") or "").split())
+        if not claim:
+            continue
+        as_of = r.get("as_of")
+        when = f" (as of {as_of.isoformat() if hasattr(as_of, 'isoformat') else as_of})" if as_of else ""
+        made = r.get("created_at")
+        made_s = made.date().isoformat() if hasattr(made, "date") else "an earlier date"
+        origin = r.get("domain") or domain_of(str(r.get("url") or "")) or "a web source"
+        lines.append(
+            f"- {claim}{(': ' + value) if value and value.lower() not in claim.lower() else ''}"
+            f"{when} — established by a research run on {made_s} from {origin}"
+        )
+    if not lines:
+        return ""
+    return "Facts an earlier research run on this platform verified against web sources:\n" + "\n".join(lines)
 
 
 def staleness_note(result: Retrieval, max_age_seconds: int) -> str:

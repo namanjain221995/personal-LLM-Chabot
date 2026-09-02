@@ -1047,6 +1047,7 @@ export function MessageRow({
             reasoningSeconds={reasoningSeconds}
             steps={steps}
             research={research}
+            researchRun={message.meta?.research_run}
             sources={webSources}
           />
         </>

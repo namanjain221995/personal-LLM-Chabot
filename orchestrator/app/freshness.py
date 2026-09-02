@@ -224,6 +224,20 @@ async def _ask_router(question: str) -> Optional[Verdict]:
     return Verdict(level, _MAX_AGE[level], "router")
 
 
+def classify_offline(question: str, *, now_year: int) -> Verdict:
+    """The deterministic verdict, with the ambiguous case settled as RECENT.
+
+    For callers that must never wait on a model to decide how to treat time
+    (Deep Research, which already plans with the main model and only needs
+    the level to weight recency): the same regex pass as `classify`, minus
+    the router round trip, minus the possibility of blocking on it.
+    """
+    verdict = _deterministic(question, now_year)
+    if verdict is not None:
+        return verdict
+    return Verdict(Freshness.RECENT, _MAX_AGE[Freshness.RECENT], "default")
+
+
 async def classify(question: str, *, now_year: int, allow_router: bool = True) -> Verdict:
     """How fresh must the evidence behind this answer be?
 

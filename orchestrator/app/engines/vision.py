@@ -210,7 +210,17 @@ async def run_vision_engine(
     from .ocr import ocr_images, transcript_block
 
     if settings.ocr_enabled and level != "fast":
-        transcripts = await ocr_images(imgs)
+        # 2026-09-03: bounded. Measured on a text-dense 1280x800 screenshot
+        # at Think: 47 s before the first visible token, all of it the OCR
+        # sidecar decoding a long transcript the main model did not need to
+        # read the screenshot. The transcript is capped and time-boxed; when
+        # it misses the deadline the answer proceeds from the pixels.
+        await emit("status", {"text": "Reading the text in the image…"})
+        transcripts = await ocr_images(
+            imgs,
+            max_output_tokens=settings.ocr_vision_max_tokens,
+            deadline_s=settings.ocr_vision_deadline_s,
+        )
         block = transcript_block(transcripts, "image")
         if block:
             user_content.append(

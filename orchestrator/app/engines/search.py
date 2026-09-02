@@ -16,7 +16,8 @@ import json
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Awaitable, Callable, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
@@ -24,7 +25,7 @@ from . import DIAGRAM_INSTRUCTION, recent_turns
 from .. import llm
 from ..config import settings
 from .. import db, web_index
-from ..core import extract, net
+from ..core import extract, net, provenance
 from ..search.base import SearchResult, SearchUnavailableError, get_provider
 
 Emit = Callable[[str, dict], Awaitable[None]]
@@ -143,10 +144,57 @@ class _Source:
     title: str
     url: str
     text: str
+    # --- provenance (2026-09-03). Every field defaults, so the four-field
+    # constructor the tests and the agent use is unchanged. ---
+    #: Links the page pointed at (harvested in the same parse), so a caller
+    #: that reads the page can follow them without a second fetch.
+    links: List[str] = field(default_factory=list)
+    published_at: Optional[datetime] = None
+    modified_at: Optional[datetime] = None
+    fetched_at: Optional[datetime] = None
+    content_hash: str = ""
+    #: core/provenance.source_type — official / docs / news / community …
+    source_type: str = ""
+    #: web_memory's 0-100 authority prior for the domain.
+    authority: int = 0
+    #: True when served from the warm store rather than the network.
+    from_store: bool = False
 
     @property
     def domain(self) -> str:
         return urlparse(self.url).hostname or self.url
+
+
+def _call_extract(content_type: str, body: bytes, url: str, headers: Optional[dict]):
+    """extract_readable_and_links, with or without the headers argument.
+
+    Tests (and any operator's own extractor) may substitute a three-argument
+    callable; the real one takes the response headers so a page with no date
+    of its own can use Last-Modified. Passing what the callee accepts keeps
+    both working without a try/except that would mask real TypeErrors."""
+    fn = extract.extract_readable_and_links
+    code = getattr(fn, "__code__", None)
+    accepts_headers = bool(code) and (
+        code.co_argcount >= 4 or "headers" in code.co_varnames[: code.co_argcount + 4]
+    )
+    if accepts_headers:
+        return fn(content_type, body, url, headers)
+    return fn(content_type, body, url)
+
+
+def _provenance_of(ext: extract.Extracted, url: str, content_type: str, headers: Optional[dict]) -> dict:
+    """The metadata the store and the ranking layers want for one page."""
+    from ..web_memory import authority_of
+
+    kind = provenance.source_type(url, content_type, getattr(ext, "sitename", "") or "")
+    return {
+        "published_at": provenance.parse_date(getattr(ext, "published_at", None)),
+        "modified_at": provenance.parse_date(getattr(ext, "modified_at", None)),
+        "source_type": kind,
+        "authority": authority_of(url),
+        "etag": (headers or {}).get("etag", "") or "",
+        "last_modified": (headers or {}).get("last-modified", "") or "",
+    }
 
 
 # --------------------------------------------------------------------------
@@ -469,6 +517,7 @@ def _store_page(
     text: str,
     content_type: str,
     links: Optional[List[str]] = None,
+    meta: Optional[dict] = None,
 ) -> None:
     """Persist one fetched page (blocking; called via run_in_thread)."""
     db.upsert_web_page(
@@ -481,6 +530,7 @@ def _store_page(
         fetch_status=200 if text else 0,
         content_hash=hashlib.sha256((text or "").encode("utf-8")).hexdigest(),
         links=links or [],
+        **(meta or {}),
     )
 
 
@@ -497,7 +547,18 @@ async def _fetch_source(
                 hit["text"], settings.search_source_char_budget
             )
             return _Source(
-                n=idx, title=hit["title"] or r.title, url=r.url, text=text
+                n=idx,
+                title=hit["title"] or r.title,
+                url=r.url,
+                text=text,
+                links=list(hit.get("links") or [])[:500],
+                published_at=hit.get("published_at"),
+                modified_at=hit.get("modified_at"),
+                fetched_at=hit.get("fetched_at"),
+                content_hash=hit.get("content_hash") or "",
+                source_type=hit.get("source_type") or provenance.source_type(r.url),
+                authority=int(hit.get("authority") or 0),
+                from_store=True,
             )
     try:
         fetched = await net.safe_fetch(
@@ -517,13 +578,17 @@ async def _fetch_source(
         # and the harvested links ride into the store so a later crawl or the
         # post-search expansion can walk from a page served fresh-from-store
         # (the review found that path silently linkless).
+        headers = getattr(fetched, "headers", None) or {}
         ext, page_links = await loop.run_in_executor(
             _EXTRACT_POOL,
-            extract.extract_readable_and_links,
+            _call_extract,
             fetched.content_type,
             fetched.body,
             fetched.url,
+            headers,
         )
+        meta = _provenance_of(ext, fetched.url, fetched.content_type, headers)
+        digest = hashlib.sha256((ext.text or "").encode("utf-8")).hexdigest()
         # Persist the FULL extracted text BEFORE the prompt truncation — the
         # store is the whole point (V8): the same URL next time costs a DB
         # read, and the vector index chunks from here. Fire-and-forget so the
@@ -532,18 +597,33 @@ async def _fetch_source(
             full_text, canon, ctype, title0 = ext.text, fetched.url, fetched.content_type, ext.title
             _spawn(
                 db.run_in_thread(
-                    _store_page, r, canon, title0, full_text, ctype, page_links
+                    _store_page, r, canon, title0, full_text, ctype, page_links, meta
                 )
             )
         text = extract.truncate_chars(ext.text, settings.search_source_char_budget)
         if not text.strip():
             text = r.snippet
-        return _Source(n=idx, title=ext.title or r.title, url=r.url, text=text)
+        return _Source(
+            n=idx,
+            title=ext.title or r.title,
+            url=r.url,
+            text=text,
+            links=list(page_links or [])[:500],
+            published_at=meta["published_at"],
+            modified_at=meta["modified_at"],
+            fetched_at=datetime.now(timezone.utc),
+            content_hash=digest,
+            source_type=meta["source_type"],
+            authority=int(meta["authority"] or 0),
+        )
     except Exception:
         # Any failure (SSRF block, timeout, unsupported) → fall back to the
         # provider snippet so the source is still citable.
         if r.snippet.strip():
-            return _Source(n=idx, title=r.title, url=r.url, text=r.snippet)
+            return _Source(
+                n=idx, title=r.title, url=r.url, text=r.snippet,
+                source_type=provenance.source_type(r.url),
+            )
         return None
 
 
@@ -961,12 +1041,14 @@ async def refetch_page(url: str, *, previous_hash: str = "") -> Optional[dict]:
             accept="text/html,application/pdf,text/plain",
         )
         loop = asyncio.get_running_loop()
+        headers = getattr(fetched, "headers", None) or {}
         ext, page_links = await loop.run_in_executor(
             _EXTRACT_POOL,
-            extract.extract_readable_and_links,
+            _call_extract,
             fetched.content_type,
             fetched.body,
             fetched.url,
+            headers,
         )
     except Exception:  # noqa: BLE001 — an unreadable page is a miss
         return None
@@ -975,9 +1057,10 @@ async def refetch_page(url: str, *, previous_hash: str = "") -> Optional[dict]:
     if not text:
         return None
     digest = hashlib.sha256(text.encode("utf-8", "ignore")).hexdigest()
-    try:
-        await db.run_in_thread(
-            db.upsert_web_page,
+    meta = _provenance_of(ext, fetched.url, fetched.content_type, headers)
+
+    def _write() -> None:
+        db.upsert_web_page(
             _normalize_url(url),
             url,
             fetched.url,
@@ -987,7 +1070,11 @@ async def refetch_page(url: str, *, previous_hash: str = "") -> Optional[dict]:
             200,
             digest,
             list(page_links or [])[:500],
+            **meta,
         )
+
+    try:
+        await db.run_in_thread(_write)
     except Exception:  # noqa: BLE001
         return None
     return {"changed": digest != (previous_hash or ""), "title": ext.title or "", "hash": digest}
