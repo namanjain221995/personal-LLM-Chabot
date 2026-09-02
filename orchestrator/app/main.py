@@ -1421,6 +1421,16 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     await emit("meta", {"route": "vision"})
                     answer = doc_err
                 else:
+                    # 2026-09-02: images may ride ALONGSIDE documents now
+                    # ("compare the chart to the report"). The document engine
+                    # grew extra_images for archive members; attached images
+                    # take the same door, normalised exactly as the vision
+                    # engine normalises them.
+                    from .engines.vision import to_data_url
+
+                    attached = [
+                        to_data_url(img) for img in (request.images_data or [])
+                    ]
                     answer = await run_pdf_engine_multi(
                         text,
                         docs,
@@ -1432,7 +1442,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                         # meta_extras reports for route="vision" is the truth
                         # for documents too (2026-08-29).
                         effort=request.effort,
-                        extra_images=doc_images,
+                        extra_images=list(doc_images) + attached,
                     )
             elif request.image_data:
                 # An attached image ALWAYS goes to the vision engine — text-only

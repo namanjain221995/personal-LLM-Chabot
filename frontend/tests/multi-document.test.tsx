@@ -386,8 +386,19 @@ describe('sending several documents', () => {
     expect(opts.pdf ?? null).toBeNull();
   });
 
-  it('ONE small document keeps the inline wire exactly as before', async () => {
-    const fetchMock = vi.fn();
+  it('ONE small document: inline wire unchanged, PLUS a quiet durability upload', async () => {
+    const uploadForms: FormData[] = [];
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      if (String(url).startsWith('/api/upload')) {
+        uploadForms.push(init?.body as FormData);
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ upload_id: 'a'.repeat(32), filename: 'solo.pdf' }),
+        };
+      }
+      return { ok: true, status: 200, json: async () => ({}) };
+    });
     vi.stubGlobal('fetch', fetchMock);
     renderApp();
     dropFiles(pdf('solo.pdf'));
@@ -399,14 +410,21 @@ describe('sending several documents', () => {
     fireEvent.click(screen.getByRole('button', { name: /send message/i }));
 
     await waitFor(() => expect(startStream).toHaveBeenCalledTimes(1));
+    // The ANSWER path is byte-identical: inline base64, no references.
     const opts = startStream.mock.calls[0][0] as Record<string, unknown>;
     expect(typeof opts.pdf).toBe('string');
     expect((opts.pdf as string).length).toBeGreaterThan(0);
     expect(opts.pdfUploads ?? null).toBeNull();
-    // Background chrome (auth pings) may fetch; the UPLOAD rail must not.
-    const uploadCalls = fetchMock.mock.calls.filter((call: unknown[]) =>
-      String(call[0]).startsWith('/api/upload'),
-    );
-    expect(uploadCalls.length).toBe(0);
+    // And the SAME bytes upload once in the background (2026-09-02), so the
+    // sent card can re-open after a refresh, in any browser — the exact
+    // "no longer available in this browser session" complaint. The id lands
+    // on the message's attachment metadata when the upload settles.
+    await waitFor(() => expect(uploadForms.length).toBe(1));
+    expect(uploadForms[0].get('purpose')).toBe('document');
+    await waitFor(() => {
+      const entry = stored.find((m) => m.role === 'user')?.meta
+        ?.attachments?.[0] as { id?: string } | undefined;
+      expect(entry?.id).toBe('a'.repeat(32));
+    });
   });
 });

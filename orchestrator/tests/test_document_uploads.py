@@ -465,3 +465,37 @@ def test_a_binary_member_becomes_an_honest_stub(monkeypatch):
     assert err is None
     assert "Binary file: tool.bin" in doc.full_text
     assert "not readable as text" in doc.full_text
+
+
+def test_attached_images_ride_into_the_document_prompt(monkeypatch):
+    """"Compare the chart to the report": images sent WITH documents reach the
+    same prompt as extra image_url parts (2026-09-02)."""
+    import asyncio
+
+    from app.engines import document as eng
+
+    seen = {}
+
+    async def fake_stream(messages, **kw):
+        seen["messages"] = messages
+        yield ("token", "ok")
+
+    monkeypatch.setattr(eng.llm, "stream_chat_events", fake_stream)
+    monkeypatch.setattr("app.db.save_document", lambda *a: None)
+
+    async def emit(kind, payload):
+        pass
+
+    asyncio.run(
+        eng.run_pdf_engine_multi(
+            "compare the chart to the report",
+            [("report.txt", base64.b64encode(b"quarterly numbers").decode())],
+            [],
+            emit,
+            conversation_id="c3",
+            extra_images=["data:image/png;base64,QUJD"],
+        )
+    )
+    user = seen["messages"][-1]["content"]
+    urls = [p["image_url"]["url"] for p in user if p.get("type") == "image_url"]
+    assert urls == ["data:image/png;base64,QUJD"]

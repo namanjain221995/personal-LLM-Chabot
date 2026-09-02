@@ -740,6 +740,8 @@ export function ChatApp() {
       const needsDocUpload =
         docAttachments.length > 1 ||
         docAttachments.some((a) => !a.base64 && !!a.file);
+      // Images and documents COEXIST in a message since 2026-09-02; only a
+      // dataset still stands alone (it answers through its own engine).
       const images = attachments.filter((a) => a.kind === 'image');
       let conversationId = activeId;
       if (!conversationId) {
@@ -782,14 +784,16 @@ export function ChatApp() {
                 ...(pasted.length ? { pasted } : {}),
                 ...(isPdf || isDataset
                   ? {
-                      attachments: [
-                        {
-                          name: first?.name ?? 'file',
-                          kind: isDataset
-                            ? ('dataset' as const)
-                            : ('pdf' as const),
-                        },
-                      ],
+                      // EVERY document, in attach order (2026-09-02). One
+                      // entry used to stand for the lot, which meant the sent
+                      // bubble showed one chip for five files and only the
+                      // first ever received its durable server id.
+                      attachments: isDataset
+                        ? [{ name: first?.name ?? 'file', kind: 'dataset' as const }]
+                        : docAttachments.map((a) => ({
+                            name: a.name,
+                            kind: 'pdf' as const,
+                          })),
                     }
                   : {}),
               }
@@ -950,7 +954,11 @@ export function ChatApp() {
             // immediately after a perfectly successful upload).
             ...(isDataset ? { dataset: true } : {}),
             ...(docRefs?.length
-              ? { pdfUploads: docRefs, pdfName: first?.name ?? null }
+              ? {
+                  pdfUploads: docRefs,
+                  pdfName: docAttachments[0]?.name ?? null,
+                  images: images.map((i) => i.base64).filter(Boolean),
+                }
               : {}),
           });
           disarmDeepResearch();
@@ -958,15 +966,40 @@ export function ChatApp() {
         return;
       }
 
+      // Durability for the inline path (2026-09-02): the answer streams NOW
+      // from the inline copy, while the same bytes upload quietly so the
+      // message's card can re-open in any browser, any time — the exact
+      // "no longer available in this browser session" complaint. Best-effort:
+      // a failed background upload costs only the re-open, never the answer.
+      if (isPdf && docAttachments[0]?.file && !needsDocUpload) {
+        const durableDoc = docAttachments[0];
+        void (async () => {
+          try {
+            const ref = await uploadDocumentFile(
+              durableDoc.file as File,
+              conversationId,
+            );
+            const entry = userMessage.meta?.attachments?.[0];
+            if (entry && !entry.id) {
+              entry.id = ref.upload_id;
+              persist(conversationId, turns);
+            }
+          } catch {
+            /* the inline answer already has the bytes */
+          }
+        })();
+      }
       void startStream({
         conversationId,
         turns,
         context,
         assistantBranch: answerBranch,
         prefs: prefsRef.current,
-        images: isPdf ? null : images.map((i) => i.base64).filter(Boolean),
-        pdf: isPdf ? first?.base64 ?? null : null,
-        pdfName: isPdf ? first?.name ?? null : null,
+        // 2026-09-02: images accompany documents now ("compare the chart to
+        // the report") — the document engine takes them as extra_images.
+        images: images.map((i) => i.base64).filter(Boolean),
+        pdf: isPdf ? docAttachments[0]?.base64 ?? null : null,
+        pdfName: isPdf ? docAttachments[0]?.name ?? null : null,
         clarification: clarification ?? null,
       });
       disarmDeepResearch();

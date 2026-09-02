@@ -299,12 +299,12 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
     function appendDocument(att: Attachment) {
       let refused = false;
       setAttachments((prev) => {
-        const docs = prev.filter((a) => a.kind === 'pdf');
-        if (docs.length >= MAX_DOCS) {
+        const kept = prev.filter((a) => a.kind !== 'dataset');
+        if (kept.filter((a) => a.kind === 'pdf').length >= MAX_DOCS) {
           refused = true;
           return prev;
         }
-        return [...docs, att];
+        return [...kept, att];
       });
       if (refused) toast(`You can attach up to ${MAX_DOCS} documents.`, 'error');
     }
@@ -393,18 +393,16 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
           file,
         };
         setAttachments((prev) => {
-          // Documents STACK up to MAX_DOCS (2026-09-02; they used to stand
-          // alone). Images stack up to MAX_IMAGES (2026-08-05). The two
-          // still never mix — they use different server engines — so
-          // adding one kind replaces the other.
-          if (att.kind === 'pdf') {
-            const docs = prev.filter((a) => a.kind === 'pdf');
-            if (docs.length >= MAX_DOCS) return prev; // raced past the cap
-            return [...docs, att];
-          }
-          const images = prev.filter((a) => a.kind === 'image');
-          if (images.length >= MAX_IMAGES) return prev; // raced past the cap
-          return [...images, att];
+          // Documents stack to MAX_DOCS, images to MAX_IMAGES, and since
+          // 2026-09-02 the two COEXIST — the document engine takes attached
+          // images as extra context ("compare the chart to the report").
+          // Only a dataset still stands alone, so adding either kind
+          // displaces a dataset and nothing else.
+          const kept = prev.filter((a) => a.kind !== 'dataset');
+          const same = kept.filter((a) => a.kind === att.kind);
+          const cap = att.kind === 'pdf' ? MAX_DOCS : MAX_IMAGES;
+          if (same.length >= cap) return prev; // raced past the cap
+          return [...kept, att];
         });
       };
       const readOriginal = () =>
