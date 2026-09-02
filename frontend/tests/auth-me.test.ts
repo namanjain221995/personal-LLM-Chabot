@@ -96,3 +96,42 @@ describe('userScopeKey — the stable cache key', () => {
     expect(userScopeKey({ user: null, username: 'local' })).toBe('local');
   });
 });
+
+
+describe('fetchMe — why a session ended (2026-09-03)', () => {
+  it('carries the server code, workspace and admin contacts on a 401', async () => {
+    const me = await fetchMe(
+      respond(401, {
+        detail: {
+          detail: 'Your access to this workspace has been removed by an administrator.',
+          code: 'account_removed',
+          workspace: 'TechSara',
+          ended_at: '2026-09-03T02:40:00+00:00',
+          contact: [{ email: 'admin@techsara.test', name: 'Admin' }, { email: 7 }],
+        },
+      }),
+    );
+    expect(me.ok).toBe(false);
+    if (me.ok) return;
+    expect(me.status).toBe(401);
+    expect(me.code).toBe('account_removed');
+    expect(me.workspace).toBe('TechSara');
+    expect(me.endedAt).toBe('2026-09-03T02:40:00+00:00');
+    expect(me.contact).toEqual([{ email: 'admin@techsara.test', name: 'Admin' }]);
+  });
+
+  it('a plain 401 (string detail, or no body) carries nothing', async () => {
+    const plain = await fetchMe(respond(401, { detail: 'Sign in required.' }));
+    expect(plain).toEqual({ ok: false, status: 401 });
+    const empty = await fetchMe(
+      (async () => new Response('', { status: 401 })) as FetchLike,
+    );
+    expect(empty).toEqual({ ok: false, status: 401 });
+  });
+
+  it('ignores a code it does not know', async () => {
+    const me = await fetchMe(respond(401, { detail: { code: 'banned' } }));
+    expect(me.ok).toBe(false);
+    if (!me.ok) expect(me.code).toBeUndefined();
+  });
+});

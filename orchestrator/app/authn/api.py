@@ -128,7 +128,7 @@ async def login(body: LoginRequest, request: Request, response: Response) -> dic
 async def logout(request: Request, response: Response) -> dict:
     principal = await current_principal(request)
     if principal is not None:
-        await db.run_in_thread(store.revoke_session, principal.session_id)
+        await db.run_in_thread(store.revoke_session, principal.session_id, store.REVOKE_LOGOUT)
         await db.run_in_thread(
             audit, principal, request, "logout"
         )
@@ -136,13 +136,70 @@ async def logout(request: Request, response: Response) -> dict:
     return {"ok": True}
 
 
+#: 401 bodies from /auth/me for a browser whose cookie no longer works.
+#: `code` is the contract with the frontend's session-ended handling; the
+#: sentences are what a person is shown when nothing else is.
+_SESSION_END_DETAIL = {
+    sessions.END_SIGNED_OUT: "Sign in required.",
+    sessions.END_SESSION_EXPIRED: "Your session expired. Please sign in again.",
+    sessions.END_SESSION_REVOKED: "You were signed out. Please sign in again.",
+    sessions.END_ACCOUNT_DISABLED: "Your account has been deactivated by an administrator.",
+    sessions.END_ACCOUNT_REMOVED: "Your access to this workspace has been removed by an administrator.",
+}
+
+
+def _explain_sync(cookie: str) -> Dict[str, Any]:
+    """The blocking half of the 401 body: why the cookie is dead, and — for
+    an account-level end — who to contact. Best-effort: any failure here
+    still answers a plain 401."""
+    body: Dict[str, Any] = {"detail": _SESSION_END_DETAIL[sessions.END_SIGNED_OUT],
+                            "code": sessions.END_SIGNED_OUT}
+    try:
+        info = sessions.explain(cookie)
+    except Exception:  # noqa: BLE001 — never let diagnostics break sign-out
+        return body
+    code = info["code"]
+    body["code"] = code
+    body["detail"] = _SESSION_END_DETAIL.get(code, body["detail"])
+    if info.get("ended_at") is not None:
+        body["ended_at"] = info["ended_at"].isoformat()
+    if code in (sessions.END_ACCOUNT_DISABLED, sessions.END_ACCOUNT_REMOVED):
+        workspace = store.default_workspace()
+        body["workspace"] = (workspace or {}).get("name") or settings.workspace_name
+        # A removed member has no membership and a disabled one is not
+        # active, so neither can appear in their own contact list.
+        body["contact"] = [
+            {"email": c["email"], "name": c["name"]}
+            for c in store.workspace_admin_contacts((workspace or {}).get("id"))
+        ]
+    return body
+
+
 @router.get("/me")
-async def me(request: Request) -> dict:
-    """Who am I. 401 when signed out — the frontend's session probe."""
+async def me(request: Request, response: Response) -> dict:
+    """Who am I. 401 when signed out — the frontend's session probe.
+
+    Since 2026-09-03 the 401 SAYS WHY when the browser holds a cookie that
+    once was a real session: expired, signed out elsewhere, account
+    deactivated, or access removed — the last two with the workspace's admin
+    contacts, and with the dead cookie cleared so the edge gate stops
+    bouncing the person back into an app that will only 401 again.
+    """
     principal = await current_principal(request)
-    if principal is None:
-        raise HTTPException(status_code=401, detail="Sign in required.")
-    return _me_payload(principal)
+    if principal is not None:
+        return _me_payload(principal)
+    cookie = request.cookies.get(settings.auth_cookie_name) or ""
+    if not cookie:
+        raise HTTPException(status_code=401, detail=_SESSION_END_DETAIL[sessions.END_SIGNED_OUT])
+    body = await db.run_in_thread(_explain_sync, cookie)
+    headers = None
+    if body["code"] in (sessions.END_ACCOUNT_DISABLED, sessions.END_ACCOUNT_REMOVED,
+                        sessions.END_SESSION_REVOKED, sessions.END_SESSION_EXPIRED):
+        # A cookie that can never open a session again is only in the way.
+        probe = Response()
+        sessions.clear_cookie(probe, request=request)
+        headers = {"set-cookie": probe.headers["set-cookie"]}
+    raise HTTPException(status_code=401, detail=body, headers=headers)
 
 
 class PasswordChangeRequest(BaseModel):
@@ -172,7 +229,7 @@ async def change_password(body: PasswordChangeRequest, request: Request) -> dict
         )
         # Everyone else holding this account is signed out; this session stays.
         revoked = store.revoke_user_sessions(
-            principal.user_id, keep=principal.session_id
+            principal.user_id, keep=principal.session_id, reason=store.REVOKE_PASSWORD_CHANGED
         )
         audit(
             principal,
@@ -218,13 +275,15 @@ async def revoke_sessions(body: SessionRevokeRequest, request: Request) -> dict:
 
     def work() -> int:
         if body.others:
-            n = store.revoke_user_sessions(principal.user_id, keep=principal.session_id)
+            n = store.revoke_user_sessions(
+                principal.user_id, keep=principal.session_id, reason=store.REVOKE_USER_OTHERS
+            )
         elif body.session_id:
             # Own sessions only: the row must belong to this user.
             own = {r["id"] for r in store.list_sessions(principal.user_id)}
             if body.session_id not in own:
                 raise HTTPException(status_code=404, detail="No such session.")
-            n = 1 if store.revoke_session(body.session_id) else 0
+            n = 1 if store.revoke_session(body.session_id, store.REVOKE_USER_OTHERS) else 0
         else:
             raise HTTPException(status_code=422, detail="Nothing to revoke.")
         if n:

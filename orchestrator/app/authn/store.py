@@ -282,26 +282,65 @@ def roll_session(session_id: str, lifetime: timedelta) -> None:
         )
 
 
-def revoke_session(session_id: str) -> bool:
+#: Why a session ended (auth_sessions.revoke_reason). Read back by /auth/me
+#: for the browser that still holds the cookie, so the vocabulary is the
+#: contract with the frontend's session-ended page.
+REVOKE_LOGOUT = "logout"                      # the user signed out
+REVOKE_USER_OTHERS = "user_revoked"           # "sign out other sessions"
+REVOKE_PASSWORD_CHANGED = "password_changed"  # own password change
+REVOKE_ADMIN = "admin_revoked"                # an admin signed the user out
+REVOKE_PASSWORD_RESET = "password_reset"      # an admin reset the password
+REVOKE_ACCOUNT_DISABLED = "account_disabled"  # an admin deactivated the account
+REVOKE_ACCOUNT_REMOVED = "account_removed"    # an admin removed the member
+
+
+def revoke_session(session_id: str, reason: str = REVOKE_LOGOUT) -> bool:
     with db.connection() as con:
         cur = con.execute(
-            "UPDATE auth_sessions SET revoked_at = now() WHERE id = %s AND revoked_at IS NULL",
-            (session_id,),
+            "UPDATE auth_sessions SET revoked_at = now(), revoke_reason = %s "
+            "WHERE id = %s AND revoked_at IS NULL",
+            (reason[:40], session_id),
         )
         return cur.rowcount > 0
 
 
-def revoke_user_sessions(user_id: int, *, keep: Optional[str] = None) -> int:
+def revoke_user_sessions(
+    user_id: int, *, keep: Optional[str] = None, reason: str = REVOKE_ADMIN
+) -> int:
     """Revoke every live session for a user, optionally sparing one (the one
-    doing the revoking — 'log out other sessions')."""
+    doing the revoking — 'log out other sessions'). `reason` is what the
+    signed-out browser will be told."""
     with db.connection() as con:
         cur = con.execute(
-            """UPDATE auth_sessions SET revoked_at = now()
+            """UPDATE auth_sessions SET revoked_at = now(), revoke_reason = %s
                WHERE user_id = %s AND revoked_at IS NULL
                  AND (%s::text IS NULL OR id <> %s)""",
-            (user_id, keep, keep),
+            (reason[:40], user_id, keep, keep),
         )
         return cur.rowcount
+
+
+def workspace_admin_contacts(workspace_id: Optional[str], limit: int = 5) -> List[Dict[str, Any]]:
+    """Active admins of a workspace — who a removed member can ask for
+    access back. Super admins first. Emails only, no ids: this is shown to
+    someone who is no longer a member."""
+    with db.connection() as con:
+        rows = con.execute(
+            """SELECT u.email, u.display_name, m.role
+                 FROM workspace_memberships m
+                 JOIN users u ON u.id = m.user_id
+                WHERE (%s::text IS NULL OR m.workspace_id = %s)
+                  AND m.role IN ('super_admin', 'admin')
+                  AND u.status = 'active'
+                  AND coalesce(u.email, '') <> ''
+                ORDER BY CASE m.role WHEN 'super_admin' THEN 0 ELSE 1 END, u.id
+                LIMIT %s""",
+            (workspace_id, workspace_id, int(limit)),
+        ).fetchall()
+    return [
+        {"email": r["email"], "name": r.get("display_name") or "", "role": r["role"]}
+        for r in rows
+    ]
 
 
 def list_sessions(user_id: int, *, live_only: bool = True) -> List[Dict[str, Any]]:

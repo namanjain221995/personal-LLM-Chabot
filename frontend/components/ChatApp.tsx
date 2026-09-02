@@ -22,7 +22,7 @@ import {
 /** useLayoutEffect on the client, useEffect on the server (no SSR warning). */
 const useIsomorphicLayoutEffect =
   typeof window !== 'undefined' ? useLayoutEffect : useEffect;
-import { fetchMe, userScopeKey } from '@/lib/auth';
+import { fetchMe, handleSessionEnd, userScopeKey } from '@/lib/auth';
 import { toClientError, type ClientError } from '@/lib/errorTypes';
 import { downloadMarkdown } from '@/lib/exportMarkdown';
 import {
@@ -320,9 +320,10 @@ export function ChatApp() {
       if (!me.ok) {
         if (me.status === 401 || me.status === 403) {
           // Signed out. The cookie is HttpOnly, so only the server can say
-          // so — hard-redirect to sign-in rather than keep serving cached
-          // data to whoever is at the keyboard now.
-          window.location.assign('/login');
+          // so — hard-redirect rather than keep serving cached data to
+          // whoever is at the keyboard now. A removed or deactivated
+          // account is told WHY, on its own page (2026-09-03).
+          void handleSessionEnd(me);
           return;
         }
         // Offline (status 0) or the orchestrator failing (5xx — still

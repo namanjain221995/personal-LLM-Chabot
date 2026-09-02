@@ -892,6 +892,16 @@ CREATE INDEX IF NOT EXISTS idx_web_crawls_queue
 """
 
 
+_MIGRATION_V15 = """
+-- V15 (2026-09-03): why a session ended. Revocation already kept the row
+-- (revoked_at, pruned after 30 days) so a dead cookie could be recognised;
+-- the REASON lets /auth/me tell the person holding that cookie what
+-- happened — "an administrator removed your access" instead of a bare
+-- 401 that sends them to a login form which then says "incorrect password".
+ALTER TABLE auth_sessions ADD COLUMN IF NOT EXISTS revoke_reason text NOT NULL DEFAULT '';
+"""
+
+
 _MIGRATIONS: tuple = (
     (1, _MIGRATION_V1),
     (2, _MIGRATION_V2),
@@ -907,6 +917,7 @@ _MIGRATIONS: tuple = (
     (12, _MIGRATION_V12),
     (13, _MIGRATION_V13),
     (14, _MIGRATION_V14),
+    (15, _MIGRATION_V15),
 )
 
 #: The version `init_schema` brings a database up to. Exported so callers (and

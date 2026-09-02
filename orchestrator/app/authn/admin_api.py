@@ -197,8 +197,13 @@ async def change_status(
 
     def work() -> int:
         store.set_status(user_id, "disabled" if body.disabled else "active")
-        # Deactivation is immediate: every live session dies with it.
-        return store.revoke_user_sessions(user_id) if body.disabled else 0
+        # Deactivation is immediate: every live session dies with it — and
+        # each carries the reason, so the person's browser can say so.
+        return (
+            store.revoke_user_sessions(user_id, reason=store.REVOKE_ACCOUNT_DISABLED)
+            if body.disabled
+            else 0
+        )
 
     revoked = await db.run_in_thread(work)
     await db.run_in_thread(
@@ -239,7 +244,7 @@ async def remove_member(
     def work() -> int:
         store.remove_membership(principal.workspace_id, user_id)
         store.set_status(user_id, "disabled")
-        return store.revoke_user_sessions(user_id)
+        return store.revoke_user_sessions(user_id, reason=store.REVOKE_ACCOUNT_REMOVED)
 
     revoked = await db.run_in_thread(work)
     await db.run_in_thread(
@@ -292,7 +297,9 @@ async def revoke_member_sessions(
     target = await _target_member(principal, user_id)
     if user_id != principal.user_id and not outranks(principal.role, target["role"]):
         raise HTTPException(status_code=403, detail="You cannot manage that member.")
-    revoked = await db.run_in_thread(store.revoke_user_sessions, user_id)
+    revoked = await db.run_in_thread(
+        store.revoke_user_sessions, user_id, reason=store.REVOKE_ADMIN
+    )
     await db.run_in_thread(
         audit,
         principal,
@@ -328,7 +335,7 @@ async def reset_member_password(
         store.set_credentials(
             user_id, password_hash=passwords.hash_password(body.new_password)
         )
-        return store.revoke_user_sessions(user_id)
+        return store.revoke_user_sessions(user_id, reason=store.REVOKE_PASSWORD_RESET)
 
     revoked = await db.run_in_thread(work)
     await db.run_in_thread(

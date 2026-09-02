@@ -17,7 +17,7 @@ describe('signed out (no ts_session cookie)', () => {
     },
   );
 
-  it.each(['/login', '/accept-invite'])(
+  it.each(['/login', '/accept-invite', '/access-removed'])(
     'lets the public page %s through',
     (path) => {
       expect(authRedirect(path, false)).toBeNull();

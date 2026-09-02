@@ -321,3 +321,104 @@ def test_health_stays_public(anonymous_mode, monkeypatch):
         resp = c.get("/health")
     assert resp.status_code == 200
     assert resp.json()["status"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# Why a session ended (2026-09-03): the browser that held the cookie is told
+# ---------------------------------------------------------------------------
+
+
+def _me_401(client: TestClient):
+    resp = client.get("/auth/me")
+    assert resp.status_code == 401
+    return resp, resp.json()["detail"]
+
+
+def test_a_removed_member_is_told_and_given_admin_contacts(login_client):
+    """Remove Carol as the super admin; Carol's next /auth/me must SAY so —
+    code, plain sentence, workspace and who to contact — and clear the dead
+    cookie so the edge gate stops bouncing her into an app that only 401s."""
+    admin = login_client("root", role="super_admin")
+    carol = login_client("carol")
+    cid = _uid("carol")
+    assert admin.delete(f"/admin/api/members/{cid}").status_code == 200
+
+    resp, body = _me_401(carol)
+    assert body["code"] == "account_removed"
+    assert "removed" in body["detail"].lower()
+    assert body["workspace"] == settings.workspace_name
+    emails = [c["email"] for c in body["contact"]]
+    assert "root@test.local" in emails
+    assert "carol@test.local" not in emails
+    assert body["ended_at"]
+    cleared = resp.headers.get("set-cookie", "").lower()
+    assert settings.auth_cookie_name.lower() + "=" in cleared and "max-age=0" in cleared
+
+
+def test_a_deactivated_member_is_told_it_was_deactivated(login_client):
+    admin = login_client("root", role="super_admin")
+    dave = login_client("dave")
+    did = _uid("dave")
+    assert admin.post(f"/admin/api/members/{did}/status", json={"disabled": True}).status_code == 200
+    _resp, body = _me_401(dave)
+    assert body["code"] == "account_disabled"
+    assert "deactivated" in body["detail"].lower()
+    assert body["contact"], "a deactivated member is told who can reactivate them"
+
+
+def test_logout_and_expiry_are_distinguished_from_removal(login_client):
+    eve = login_client("eve")
+    dead = eve.cookies.get(settings.auth_cookie_name)
+    eve.post("/auth/logout")
+    # Logout clears the client's cookie; put the dead one back to simulate
+    # another tab that still carries it.
+    eve.cookies.set(settings.auth_cookie_name, dead)
+    _resp, body = _me_401(eve)
+    assert body["code"] == "session_revoked"
+    assert "contact" not in body
+
+    frank = login_client("frank")
+    sid = _sid(frank)
+    with db.connection() as con:
+        con.execute(
+            "UPDATE auth_sessions SET expires_at = now() - interval '1 minute' WHERE id = %s",
+            (sid,),
+        )
+    _resp, body = _me_401(frank)
+    assert body["code"] == "session_expired"
+    assert "contact" not in body
+
+
+def test_a_forged_or_absent_cookie_learns_nothing(anonymous_mode):
+    with TestClient(app) as c:
+        resp = c.get("/auth/me")
+        assert resp.status_code == 401
+        assert resp.json()["detail"] == "Sign in required."
+        c.cookies.set(settings.auth_cookie_name, "0" * 32 + ".not-a-real-secret")
+        resp = c.get("/auth/me")
+        assert resp.status_code == 401
+        body = resp.json()["detail"]
+        assert body["code"] == "signed_out"
+        assert "contact" not in body and "workspace" not in body
+
+
+def test_login_stays_generic_for_a_removed_member(login_client):
+    """The removed page knows because the COOKIE proved who they were; the
+    login form has no such proof and must not become an oracle."""
+    admin = login_client("root", role="super_admin")
+    login_client("gone")
+    gid = _uid("gone")
+    assert admin.delete(f"/admin/api/members/{gid}").status_code == 200
+    with TestClient(app) as fresh:
+        resp = _login(fresh, "gone@test.local", PASSWORD)
+        assert resp.status_code == 401
+        assert resp.json()["detail"] == "Incorrect email or password."
+
+
+def test_revoke_reasons_are_recorded(login_client):
+    grace = login_client("grace")
+    sid = _sid(grace)
+    grace.post("/auth/logout")
+    with db.connection() as con:
+        row = con.execute("SELECT revoke_reason FROM auth_sessions WHERE id = %s", (sid,)).fetchone()
+    assert row["revoke_reason"] == store.REVOKE_LOGOUT
