@@ -51,12 +51,22 @@ def resolve_upload_file(
     conversation_id: str,
     upload_id: str,
     filename: str,
+    *,
+    subdir: str = "extracted",
 ) -> Path:
-    """Resolve the extracted copy of `filename` for one upload, or raise.
+    """Resolve the stored copy of `filename` for one upload, or raise.
+
+    `subdir` names which copy: "extracted" is where the DATASET rail leaves
+    members; "_original" is where purpose=document keeps the file itself
+    (2026-09-02 — every document download 410'd as "expired" while the bytes
+    sat in the directory this function never looked in). Both live directly
+    under the upload root, so every guard below applies identically.
 
     Existence is NOT checked — the caller distinguishes "swept by the TTL"
     (410) from "never yours" (404), and those are different answers.
     """
+    if subdir not in ("extracted", "_original"):
+        raise UploadPathError("unknown upload subdirectory")
     if not UPLOAD_ID_RE.fullmatch(upload_id or ""):
         raise UploadPathError("malformed upload id")
 
@@ -75,7 +85,7 @@ def resolve_upload_file(
         raise UploadPathError("absolute paths are not allowed")
 
     root = (Path(workspace_dir) / "uploads" / conv / upload_id).resolve()
-    resolved = (root / "extracted" / name).resolve()
+    resolved = (root / subdir / name).resolve()
     if not resolved.is_relative_to(root):
         raise UploadPathError("path escapes the upload directory")
     return resolved

@@ -246,10 +246,22 @@ async def download_upload(
         raise HTTPException(status_code=404, detail="upload not found")
 
     if not path.is_file():
+        # DOCUMENTS keep their bytes in `_original`, not `extracted` — the
+        # dataset rail's shape. Without this fallback every document download
+        # answered 410 "expired" while the file sat on disk (owner report,
+        # 2026-09-02, minutes after document cards became openable at all).
+        original = resolve_upload_file(
+            settings.workspace_dir, conversation_id, upload_id, filename,
+            subdir="_original",
+        )
+        if original.is_file():
+            path = original
+
+    if not path.is_file():
         # Two ways to get here, and the user can act on both the same way.
-        # Either the workspace TTL swept the extracted files, or this upload was
-        # an ARCHIVE: create_upload deletes `_original` once it has extracted
-        # the members, so the .zip/.tar the user chose is genuinely not kept.
+        # Either the workspace TTL swept the files, or this upload was a
+        # DATASET ARCHIVE: the dataset finaliser deletes `_original` once it
+        # has extracted the members, so the .zip the user chose is not kept.
         raise HTTPException(
             status_code=410,
             detail=(

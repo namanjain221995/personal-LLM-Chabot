@@ -499,3 +499,50 @@ def test_attached_images_ride_into_the_document_prompt(monkeypatch):
     user = seen["messages"][-1]["content"]
     urls = [p["image_url"]["url"] for p in user if p.get("type") == "image_url"]
     assert urls == ["data:image/png;base64,QUJD"]
+
+
+# ── the download the whole ladder ends at ──────────────────────────────────
+
+
+def test_a_document_downloads_its_original_bytes(alice, conv):
+    """THE regression behind "This upload has expired": documents keep their
+    bytes in _original, and the download endpoint only looked in extracted —
+    so every document card 410'd minutes after becoming openable at all."""
+    up_resp = alice.post(
+        "/uploads",
+        files={"file": ("contract.pdf", PDF_BYTES, "application/pdf")},
+        data={"conversation_id": conv, "purpose": "document"},
+    )
+    assert up_resp.status_code == 200, up_resp.text
+    upload_id = up_resp.json()["upload_id"]
+
+    got = alice.get(f"/uploads/{conv}/{upload_id}/file")
+    assert got.status_code == 200, got.text
+    assert got.content == PDF_BYTES
+    assert got.headers["content-type"].startswith("application/pdf")
+
+
+def test_a_swept_document_is_still_an_honest_410(alice, conv):
+    import shutil as _shutil
+
+    up_resp = alice.post(
+        "/uploads",
+        files={"file": ("gone.pdf", PDF_BYTES, "application/pdf")},
+        data={"conversation_id": conv, "purpose": "document"},
+    )
+    upload_id = up_resp.json()["upload_id"]
+    _shutil.rmtree(os.path.join(up.upload_root(conv, upload_id), "_original"))
+    assert alice.get(f"/uploads/{conv}/{upload_id}/file").status_code == 410
+
+
+def test_dataset_downloads_are_unchanged(alice, conv):
+    """The extracted-first order stays: a dataset member still serves."""
+    up_resp = alice.post(
+        "/uploads",
+        files={"file": ("data.csv", b"a,b\n1,2\n", "text/csv")},
+        data={"conversation_id": conv},
+    )
+    upload_id = up_resp.json()["upload_id"]
+    got = alice.get(f"/uploads/{conv}/{upload_id}/file")
+    assert got.status_code == 200
+    assert got.content == b"a,b\n1,2\n"
