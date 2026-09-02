@@ -986,6 +986,17 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             # shape the plain chat branch can actually answer; when another
             # engine wins the dispatch the task is cancelled unread.
             knowledge_task: Optional[asyncio.Task] = None
+            # Set the moment the pre-pass enters its ONE slow branch (the
+            # live lookup). The status line below keys off this, not off
+            # "the task is still running": on a host where the embedding or
+            # router calls fail slowly (DNS timeouts on CI) an unfinished
+            # task means nothing is being fetched, and announcing a lookup
+            # that is not happening broke the assistant-mode event contract.
+            knowledge_lookup_started = asyncio.Event()
+
+            async def _note_lookup(kind: str, data: dict) -> None:
+                knowledge_lookup_started.set()
+
             if (
                 settings.living_knowledge_enabled
                 and request.mode == "assistant"
@@ -999,7 +1010,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 and not deep_research_on
             ):
                 knowledge_task = asyncio.ensure_future(
-                    _prepare_knowledge(request, text, allow_network=True)
+                    _prepare_knowledge(request, text, allow_network=True, emit=_note_lookup)
                 )
 
             # Announce and record the auto-decision only AFTER the gates
@@ -1634,10 +1645,10 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 # otherwise. Costs nothing for a timeless question (one regex)
                 # and one local lookup for a live one.
                 if knowledge_task is not None:
-                    if not knowledge_task.done():
-                        # Still working → it is in the slow branch (a live
-                        # lookup), and the user is now waiting on exactly
-                        # that. Say so instead of showing an empty spinner.
+                    if knowledge_lookup_started.is_set() and not knowledge_task.done():
+                        # A live lookup is genuinely in flight and the user
+                        # is now waiting on exactly that. Say so instead of
+                        # showing an empty spinner.
                         await emit("status", {"text": "Checking recent sources…"})
                     prepared = await knowledge_task
                 else:
