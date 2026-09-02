@@ -56,7 +56,6 @@ import {
   IconBook,
   IconChevronRight,
   IconFileText,
-  IconPaperclip,
   IconPencil,
   IconRefresh,
   IconThumbDown,
@@ -150,6 +149,11 @@ const EDIT_BUTTON =
  * in-app dialog and nothing else. There is no path from this card to a
  * download, which is why the click handler resolves bytes and sets state
  * rather than touching `window` at all.
+ *
+ * 2026-09-02: the visible "Attach again" button that sat under the card was
+ * removed on owner request. Only the button went — the card is still the drag
+ * SOURCE for re-attaching (`draggable` + `onDragStart` below), and ChatApp's
+ * `reuseAttachment` is still the single handler behind every internal drop.
  */
 function OpenableAttachment({
   messageId,
@@ -170,9 +174,15 @@ function OpenableAttachment({
   dataUrl?: string;
   className: string;
   /**
-   * PHASE 4A/4B — put this file back in the composer. Omitted (previews,
-   * tests) renders no action and makes the card undraggable, so a context
-   * with no composer cannot offer to fill one.
+   * PHASE 4A/4B — can this file be put back in the composer?
+   *
+   * Read as a CAPABILITY FLAG, not as a click handler: the visible "Attach
+   * again" button this used to render was removed on owner request
+   * (2026-09-02), leaving the internal drag as the gesture. Its presence is
+   * still what makes the card `draggable` and what lets `onDragStart` write
+   * the reference, so omitting it (previews, tests) correctly leaves a row
+   * that cannot offer to fill a composer that is not there. Keep it wired:
+   * deleting it would silently make every historical card undraggable.
    */
   onReuse?: () => void;
   /** PHASE 3: where the bytes can be fetched from, when this is an upload. */
@@ -236,21 +246,6 @@ function OpenableAttachment({
       >
         {children}
       </button>
-      {onReuse && (
-        // A real button beside the card, not a hover affordance: dragging is
-        // mouse-only and invisible, and this has to work from the keyboard and
-        // on a touch screen too.
-        <button
-          type="button"
-          onClick={onReuse}
-          aria-label={`Attach ${name} again`}
-          title="Attach again"
-          className="mt-1 inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] text-faint transition-colors duration-ts hover:bg-surface-2 hover:text-ink focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
-        >
-          <IconPaperclip size={11} />
-          Attach again
-        </button>
-      )}
       {source && (
         <AttachmentPreview
           source={source}
@@ -394,9 +389,10 @@ export function MessageRow({
   /**
    * PHASE 4A/4B: put the Nth attachment of this turn back in the composer.
    *
-   * Omitted in contexts with no composer (previews, tests), which is also what
-   * hides the "Attach again" action and makes the cards undraggable — a row
-   * cannot offer to fill an input that is not there.
+   * Omitted in contexts with no composer (previews, tests), which is what
+   * makes those rows' cards undraggable — a row cannot offer to fill an input
+   * that is not there. The host's `reuseAttachment` is still reached on every
+   * internal drop; this prop is what tells the card it may start such a drag.
    */
   onReuseAttachment?: (index: number) => void;
   /**
