@@ -33,8 +33,17 @@ data/
 # from git. REPORTS_DIR is a root-level path (or a Docker volume), so the
 # leading slash is what this rule always meant.
 /reports/
-uploads/
-workspace/
+# Runtime upload workspaces only. The bare pattern `uploads/` also swallowed
+# frontend/app/api/uploads/ -- SOURCE CODE -- which is how a PR shipped tests
+# for Next.js routes that git had silently refused to add, and CI went red on
+# a module that existed on the author's disk. Anchor runtime dirs explicitly;
+# never ignore a bare directory name that could be a route segment.
+/uploads/
+/orchestrator/uploads/
+/.runtime/uploads/
+!frontend/app/api/uploads/
+/workspace/
+/orchestrator/workspace/
 *.duckdb
 *.duckdb.wal
 *.sqlite3
