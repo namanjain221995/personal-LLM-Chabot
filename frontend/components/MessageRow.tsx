@@ -29,11 +29,19 @@ import {
 import { stripCitations } from '@/lib/citations';
 import {
   attachmentFile,
+  resolveAttachmentAsync,
+  uploadRefFor,
+  writeInternalAttachment,
   fileBadgeFor,
   resolveAttachment,
   type ResolvedAttachment,
 } from '@/lib/attachments';
-import { AttachmentPreview } from './AttachmentPreview';
+import { AttachmentPreview, type ServerPreviewLoaders } from './AttachmentPreview';
+import {
+  fetchDocumentText,
+  fetchUploadProfile,
+  workbookFromProfile,
+} from '@/lib/previewData';
 import { AgentTimeline } from './AgentTimeline';
 import { ActivityPanel } from './ActivityPanel';
 import { countSources, ResearchPanel } from './ResearchPanel';
@@ -48,6 +56,7 @@ import {
   IconBook,
   IconChevronRight,
   IconFileText,
+  IconPaperclip,
   IconPencil,
   IconRefresh,
   IconThumbDown,
@@ -148,6 +157,9 @@ function OpenableAttachment({
   name,
   dataUrl,
   className,
+  onReuse,
+  upload,
+  loaders,
   children,
 }: {
   messageId: string;
@@ -157,28 +169,141 @@ function OpenableAttachment({
   /** The message's own persisted preview, when it has one (images do). */
   dataUrl?: string;
   className: string;
+  /**
+   * PHASE 4A/4B — put this file back in the composer. Omitted (previews,
+   * tests) renders no action and makes the card undraggable, so a context
+   * with no composer cannot offer to fill one.
+   */
+  onReuse?: () => void;
+  /** PHASE 3: where the bytes can be fetched from, when this is an upload. */
+  upload?: ReturnType<typeof uploadRefFor>;
+  /**
+   * PHASE 4C — where to ask for a preview a browser cannot render itself.
+   * Absent (no conversation behind this row) the dialog keeps its honest
+   * "no preview" card, exactly as before.
+   */
+  loaders?: ServerPreviewLoaders;
   children: React.ReactNode;
 }) {
   // Resolved on click, not on render: reading the store during render would
   // mint nothing but would tie the row to a mutable module-level map.
   const [source, setSource] = useState<ResolvedAttachment | null>(null);
   const label = `${name} — preview`;
+
+  /**
+   * PHASE 3/4C. Opening a card is now allowed to go to the network, because
+   * after a reload that is the only place the bytes are — this used to report
+   * a file the server was still holding as "no longer available".
+   *
+   * A format with its OWN server-backed preview (a workbook's profile, a
+   * document's extracted text) skips the byte fetch entirely: the dialog is
+   * about to ask for something smaller and more useful, and downloading 50 MB
+   * of .xlsx to then not read it would be pure waste.
+   */
+  function open() {
+    const local = resolveAttachment(messageId, index, { name, dataUrl });
+    if (loaders || local.kind !== 'unavailable' || !upload) {
+      setSource(local);
+      return;
+    }
+    setSource({ ...local, kind: 'loading' });
+    void resolveAttachmentAsync(messageId, index, {
+      name,
+      dataUrl,
+      upload,
+    }).then(setSource);
+  }
   return (
     <>
       <button
         type="button"
         aria-label={label}
         title={label}
-        onClick={() => setSource(resolveAttachment(messageId, index, { name, dataUrl }))}
+        // 4B: the card is the drag SOURCE. A <button> is not draggable by
+        // default, which is why dragging one previously did nothing at all.
+        draggable={Boolean(onReuse)}
+        onDragStart={(e) => {
+          if (!onReuse) return;
+          // Identity only — never a path, a blob: URL, or anything in
+          // text/plain (NEW-10A: a drag whose readable part was text got
+          // typed into the prompt).
+          if (!writeInternalAttachment(e.dataTransfer, { messageId, index })) {
+            e.preventDefault();
+          }
+        }}
+        onClick={open}
         className={className}
       >
         {children}
       </button>
+      {onReuse && (
+        // A real button beside the card, not a hover affordance: dragging is
+        // mouse-only and invisible, and this has to work from the keyboard and
+        // on a touch screen too.
+        <button
+          type="button"
+          onClick={onReuse}
+          aria-label={`Attach ${name} again`}
+          title="Attach again"
+          className="mt-1 inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] text-faint transition-colors duration-ts hover:bg-surface-2 hover:text-ink focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+        >
+          <IconPaperclip size={11} />
+          Attach again
+        </button>
+      )}
       {source && (
-        <AttachmentPreview source={source} onClose={() => setSource(null)} />
+        <AttachmentPreview
+          source={source}
+          onClose={() => setSource(null)}
+          {...(loaders ?? {})}
+        />
       )}
     </>
   );
+}
+
+/**
+ * PHASE 4C — where a preview should ask for what the browser cannot read.
+ *
+ * Chosen by EXTENSION, like every other classification in this feature: a
+ * workbook comes from the profile the orchestrator stored at upload time, a
+ * .docx from the text it extracted with the standard library. Anything else
+ * gets no loader at all, which is what keeps the honest "no preview" card for
+ * .zip, .parquet and the executable formats — they are not merely unhandled
+ * here, they are deliberately unreachable.
+ *
+ * Returns undefined without a conversation to ask about, so a row rendered
+ * outside a chat behaves exactly as it did before this existed.
+ */
+function serverPreviewLoaders(
+  conversationId: string | null,
+  message: ChatMessage,
+  index: number,
+  name: string,
+): ServerPreviewLoaders | undefined {
+  if (!conversationId) return undefined;
+  if (/\.xlsx$/i.test(name)) {
+    const upload = uploadRefFor(conversationId, message, index);
+    if (!upload) return undefined;
+    return {
+      loadWorkbook: async (signal) => {
+        const found = await fetchUploadProfile(
+          upload.conversationId,
+          upload.uploadId,
+          signal,
+        );
+        if (!found || found.expired) return null;
+        return workbookFromProfile(found.profile, found.filename || name);
+      },
+    };
+  }
+  if (/\.docx$/i.test(name)) {
+    return {
+      loadDocumentText: (signal) =>
+        fetchDocumentText(conversationId, name, signal),
+    };
+  }
+  return undefined;
 }
 
 /**
@@ -206,6 +331,8 @@ export function MessageRow({
   onFeedback,
   clarificationPending = false,
   clarificationAnswer = '',
+  onReuseAttachment,
+  conversationId = null,
 }: {
   message: ChatMessage;
   isLast: boolean;
@@ -264,6 +391,20 @@ export function MessageRow({
   /** Persist a thumb server-side. Omitted in contexts with no store
    *  (previews, tests), where the localStorage fallback still applies. */
   onFeedback?: (feedback: MessageFeedback | null) => void;
+  /**
+   * PHASE 4A/4B: put the Nth attachment of this turn back in the composer.
+   *
+   * Omitted in contexts with no composer (previews, tests), which is also what
+   * hides the "Attach again" action and makes the cards undraggable — a row
+   * cannot offer to fill an input that is not there.
+   */
+  onReuseAttachment?: (index: number) => void;
+  /**
+   * PHASE 4C: which conversation this row belongs to, so a preview can ask the
+   * server for a workbook profile or a document's extracted text. null (a row
+   * rendered outside a chat) simply means no server-backed preview.
+   */
+  conversationId?: string | null;
 }) {
   // Hooks live above the user-bubble early return (rules of hooks).
   const [activityOpen, setActivityOpen] = useState(false);
@@ -389,6 +530,10 @@ export function MessageRow({
                     index={i}
                     name={name}
                     dataUrl={url}
+                    onReuse={
+                      onReuseAttachment ? () => onReuseAttachment(i) : undefined
+                    }
+                    upload={uploadRefFor(conversationId, message, i)}
                     className="block rounded-ts focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
                   >
                     {/* eslint-disable-next-line @next/next/no-img-element */}
@@ -412,6 +557,16 @@ export function MessageRow({
                 messageId={message.id}
                 index={0}
                 name={message.pdfName}
+                onReuse={
+                  onReuseAttachment ? () => onReuseAttachment(0) : undefined
+                }
+                upload={uploadRefFor(conversationId, message, 0)}
+                loaders={serverPreviewLoaders(
+                  conversationId,
+                  message,
+                  0,
+                  message.pdfName,
+                )}
                 className="inline-flex items-center gap-2 rounded-2xl border border-border bg-surface-2 py-1.5 pl-1.5 pr-3 text-left transition-colors duration-ts hover:border-accent/50 hover:bg-surface focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
               >
                 <span className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-danger/15 text-danger">

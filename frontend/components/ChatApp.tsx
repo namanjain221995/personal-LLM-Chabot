@@ -44,8 +44,13 @@ import {
   carryAttachmentFiles,
   dragHasFiles,
   dropIntent,
+  dragHasInternalAttachment,
+  isDatasetTurn,
+  previewMimeFor,
   rememberAttachments,
   rememberAttachmentFiles,
+  resolveAttachmentAsync,
+  uploadRefFor,
 } from '@/lib/attachments';
 import {
   branchForAppend,
@@ -1075,6 +1080,10 @@ export function ChatApp() {
         images: resendImages,
         pdf: resendPdf?.base64 ?? null,
         pdfName: resendPdf?.name ?? null,
+        // PHASE 3: a dataset turn resends no bytes, but it must still SAY it
+        // is a dataset turn — otherwise a wordless one rebuilds the exact
+        // NEW-14 request that has no message in it and 400s.
+        dataset: isDatasetTurn(view[userIdx]),
       });
     },
     [toast],
@@ -1197,6 +1206,9 @@ export function ChatApp() {
           .map((a) => a.base64),
         pdf: editedPdf?.base64 ?? null,
         pdfName: editedPdf?.name ?? null,
+        // The edit inherits the original turn's attachments, so it inherits
+        // its dataset-ness too (see regenerate above).
+        dataset: isDatasetTurn(edited),
       });
     },
     [persist, toast],
@@ -1312,6 +1324,7 @@ export function ChatApp() {
         .map((a) => a.base64),
       pdf: retryPdf?.base64 ?? null,
       pdfName: retryPdf?.name ?? null,
+      dataset: isDatasetTurn(view[userIdx]),
     });
   }, [toast]);
 
@@ -1505,6 +1518,65 @@ export function ChatApp() {
   // Chats generating right now — in this tab OR server-side (after reload).
   const busyIds = Array.from(new Set([...streamingIds(), ...serverActive]));
 
+  /**
+   * PHASE 4A/4B — put a previously sent attachment back in the composer.
+   *
+   * ONE function behind both gestures. "Attach again" and an internal drag are
+   * different ways of asking the same question, and giving them separate
+   * pipelines is how two entry points drift until one accepts what the other
+   * refuses — the same reasoning that made `acceptFiles` the single door for
+   * the picker and the desktop drop.
+   *
+   * It resolves bytes down the full ladder (this tab's File, the persisted
+   * image payload, then the orchestrator by upload_id), rebuilds a real `File`
+   * and hands it to the composer. It does NOT bypass validation: the caps, the
+   * five-image ceiling, the PDF/dataset exclusivity and the refusals while
+   * streaming or uploading all still apply, because this goes in through the
+   * same front door a picked file does.
+   */
+  const reuseAttachment = useCallback(
+    async (messageId: string, index: number) => {
+      const message = messagesRef.current.find((m) => m.id === messageId);
+      if (!message) return;
+      const previews = message.imageDataUrls?.length
+        ? message.imageDataUrls
+        : message.imageDataUrl
+          ? [message.imageDataUrl]
+          : [];
+      const source = await resolveAttachmentAsync(messageId, index, {
+        name: message.meta?.attachments?.[index]?.name ?? message.pdfName,
+        dataUrl: previews[index],
+        upload: uploadRefFor(activeIdRef.current, message, index),
+      });
+
+      if (source.kind === 'expired') {
+        toast(
+          'This upload has expired and can no longer be attached again. Attach the file from your computer instead.',
+          'error',
+        );
+        return;
+      }
+      if (!source.blob) {
+        toast(
+          'This file is no longer available in this browser session. Attach it from your computer instead.',
+          'error',
+        );
+        return;
+      }
+
+      // The type is taken from OUR allowlist, keyed off the name — never from
+      // whatever the blob claims. The composer classifies by name too, so this
+      // keeps one story about what a file is.
+      const type = previewMimeFor(source.name, source.mime) ?? source.blob.type;
+      const file = new File([source.blob], source.name, {
+        type,
+        lastModified: Date.now(),
+      });
+      composerRef.current?.acceptFiles([file]);
+    },
+    [toast],
+  );
+
   /* ------------------------------------------------- NEW-10: file drop -- */
 
   // The same three conditions the Composer refuses on — a chat still being
@@ -1525,22 +1597,27 @@ export function ChatApp() {
    * strobes the overlay on and off all the way down the message list. Counting
    * how many nested elements the drag is currently inside is the reliable fix.
    */
+  /** Files from the desktop, or one of our own cards (4B). */
+  function dragIsAttachable(dt: DataTransfer | null): boolean {
+    return dragHasFiles(dt) || dragHasInternalAttachment(dt);
+  }
+
   function onDragEnter(e: React.DragEvent<HTMLDivElement>) {
-    if (!dragHasFiles(e.dataTransfer)) return;
+    if (!dragIsAttachable(e.dataTransfer)) return;
     dragDepth.current += 1;
     if (dragDepth.current === 1 && canAttach) setDragActive(true);
   }
 
   function onDragOver(e: React.DragEvent<HTMLDivElement>) {
-    // ONLY for files. Left alone, a text or link drag keeps the browser's own
+    // ONLY for attachable drags. Left alone, a text or link drag keeps the browser's own
     // behaviour everywhere in the app.
-    if (!dragHasFiles(e.dataTransfer)) return;
+    if (!dragIsAttachable(e.dataTransfer)) return;
     e.preventDefault();
     if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
   }
 
   function onDragLeave(e: React.DragEvent<HTMLDivElement>) {
-    if (!dragHasFiles(e.dataTransfer)) return;
+    if (!dragIsAttachable(e.dataTransfer)) return;
     dragDepth.current = Math.max(0, dragDepth.current - 1);
     if (dragDepth.current === 0) setDragActive(false);
   }
@@ -1571,6 +1648,12 @@ export function ChatApp() {
     setDragActive(false);
 
     if (intent.action === 'ignore') return;
+
+    if (intent.action === 'internal') {
+      // 4B: same handler as the "Attach again" button, on purpose.
+      void reuseAttachment(intent.ref.messageId, intent.ref.index);
+      return;
+    }
 
     if (intent.action === 'file-uri') {
       // The source handed over a LINK to a file rather than its bytes. A web
@@ -1747,6 +1830,12 @@ export function ChatApp() {
                   isLast={i === thread.length - 1 && m.role === 'assistant'}
                   onRegenerate={() => regenerate(m.id)}
                   onRetry={() => regenerate(m.id)}
+                  onReuseAttachment={(index) => {
+                    void reuseAttachment(m.id, index);
+                  }}
+                  // 4C: which conversation to ask for a workbook profile or a
+                  // document's extracted text.
+                  conversationId={activeId}
                   uploadStatus={
                     datasetUpload?.messageId === m.id
                       ? datasetUpload.status
