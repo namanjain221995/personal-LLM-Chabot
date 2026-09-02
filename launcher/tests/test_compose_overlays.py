@@ -366,6 +366,21 @@ class ComposeOverlayValidationTests(unittest.TestCase):
                         if volume.get("type") != "bind":
                             continue
                         source = str(volume.get("source", ""))
+                        # The Docker control socket is a SYSTEM path, identical
+                        # on every host -- nothing developer-specific to leak.
+                        # Exactly one service may hold it: the engine watchdog,
+                        # which exists to `docker restart` a hung vLLM head and
+                        # can do that no other way. Anything else acquiring the
+                        # socket (it is root-equivalent) must fail this test
+                        # and argue its case here.
+                        if source == "/var/run/docker.sock":
+                            self.assertEqual(
+                                service,
+                                "vllm-watchdog",
+                                f"{name}/{service} must not mount the Docker "
+                                "socket; only the watchdog holds it",
+                            )
+                            continue
                         self.assertTrue(
                             source.startswith(root) or "techsara-overlay-" in source,
                             f"{name}/{service} binds an unmanaged host path: {source}",

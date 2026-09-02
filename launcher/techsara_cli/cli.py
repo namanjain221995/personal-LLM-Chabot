@@ -24,6 +24,7 @@ from .compose import ComposeManager, docker_project_has_running_models
 from .environment import (
     DGX_COMPOSE_OVERLAY,
     RuntimeLayout,
+    _truthy,
     build_generated_environment,
     effective_user_environment,
     has_salesforce_credentials,
@@ -1024,8 +1025,28 @@ def _start_compose(
                 )
                 compose.stop_service("vllm-ocr")
                 disable_role("ocr")
+        # A ROUTINE DEPLOY MUST NEVER RESTART THE MAIN MODEL. Reloading it
+        # costs 15-25 minutes of the site answering nothing, and one evening
+        # (2026-09-01) contained five such reloads, none of which shipped any
+        # model change. With TECHSARA_PRESERVE_MAIN_MODEL set (the deploy
+        # script sets it for every non---full deploy), a RUNNING, ANSWERING
+        # engine is probed and then left exactly as it is -- even if its
+        # compose definition changed, that change waits for a --full deploy,
+        # which is the operator saying "yes, reload the model" out loud.
+        # If the engine is NOT serving, the flag is ignored and the normal
+        # start (and its health gates) runs -- preserving a corpse helps
+        # nobody.
+        preserve_main = _truthy(os.environ.get("TECHSARA_PRESERVE_MAIN_MODEL"))
+        if preserve_main:
+            try:
+                _step("Main model: preserve flag set - probing the running engine instead of touching it...")
+                record_probe("main", generated["OPENAI_BASE_URL"], generated["MAIN_MODEL"])
+                _step("Main model: serving; left untouched (definition changes wait for a --full deploy)")
+            except TechSaraError:
+                _step("Main model: not serving - preserve flag ignored, starting it normally...")
+                preserve_main = False
         cluster = _cluster_mode(generated) == "dual"
-        if cluster:
+        if cluster and not preserve_main:
             # Node 2 first: the head's rendezvous waits for the worker, and a
             # sync/start failure here must surface as itself, not as a head
             # readiness timeout.
@@ -1033,43 +1054,44 @@ def _start_compose(
             _run_cluster_script(project_root, "cluster-sync.sh", reporter=_step, timeout=3600.0)
             _step("cluster: starting the vLLM worker (scripts/cluster-worker.sh start)...")
             _run_cluster_script(project_root, "cluster-worker.sh", "start", reporter=_step, timeout=300.0)
-        try:
-            if cluster:
-                _step(
-                    "cluster: starting vLLM head (node-rank 0) on "
-                    f"{generated.get('CLUSTER_HEAD_IP', '?')}:{generated.get('CLUSTER_MASTER_PORT', '?')}; "
-                    f"the worker on {generated.get('CLUSTER_WORKER_IP', '?')} must be running "
-                    "(scripts/cluster-worker.sh start)"
-                )
-            _step("Starting the main model (vllm) - this is the longest step...")
-            compose.up_service("vllm")
-            compose.wait_service("vllm", timeout=2400.0, reporter=_step)
-            record_probe("main", generated["OPENAI_BASE_URL"], generated["MAIN_MODEL"])
-        except TechSaraError as exc:
-            if cluster:
-                # The safer-context retry recreates only the head; it cannot
-                # help when the worker is missing, unreachable, or mismatched.
-                raise TechSaraError(
-                    f"the two-node vLLM head did not become ready ({exc}). Check both nodes with "
-                    "scripts/cluster-status.sh and the worker output with scripts/cluster-logs.sh worker"
-                ) from exc
-            if not profile.startup_retry_context:
-                raise
-            retry_context = profile.startup_retry_context
-            generated["MODEL_MAX_CONTEXT"] = str(retry_context)
-            generated["DEFAULT_MAX_CONTEXT"] = str(retry_context)
-            generated["REPORT_MAX_CONTEXT"] = str(retry_context)
-            generated["MAIN_CONTEXT_LENGTH"] = str(retry_context)
-            # The retry window is inside the model's native one, so the YaRN
-            # override that belonged to the wider window must go with it.
-            generated["MAIN_MODEL_ROPE_OVERRIDE"] = ""
-            generated["MODEL_CONCURRENCY"] = "1"
-            generated["MAIN_CONCURRENCY"] = "1"
-            publish_generated()
-            compose.validate()
-            compose.up_service("vllm", force_recreate=True)
-            compose.wait_service("vllm", timeout=2400.0, reporter=_step)
-            record_probe("main", generated["OPENAI_BASE_URL"], generated["MAIN_MODEL"])
+        if not preserve_main:
+            try:
+                if cluster:
+                    _step(
+                        "cluster: starting vLLM head (node-rank 0) on "
+                        f"{generated.get('CLUSTER_HEAD_IP', '?')}:{generated.get('CLUSTER_MASTER_PORT', '?')}; "
+                        f"the worker on {generated.get('CLUSTER_WORKER_IP', '?')} must be running "
+                        "(scripts/cluster-worker.sh start)"
+                    )
+                _step("Starting the main model (vllm) - this is the longest step...")
+                compose.up_service("vllm")
+                compose.wait_service("vllm", timeout=2400.0, reporter=_step)
+                record_probe("main", generated["OPENAI_BASE_URL"], generated["MAIN_MODEL"])
+            except TechSaraError as exc:
+                if cluster:
+                    # The safer-context retry recreates only the head; it cannot
+                    # help when the worker is missing, unreachable, or mismatched.
+                    raise TechSaraError(
+                        f"the two-node vLLM head did not become ready ({exc}). Check both nodes with "
+                        "scripts/cluster-status.sh and the worker output with scripts/cluster-logs.sh worker"
+                    ) from exc
+                if not profile.startup_retry_context:
+                    raise
+                retry_context = profile.startup_retry_context
+                generated["MODEL_MAX_CONTEXT"] = str(retry_context)
+                generated["DEFAULT_MAX_CONTEXT"] = str(retry_context)
+                generated["REPORT_MAX_CONTEXT"] = str(retry_context)
+                generated["MAIN_CONTEXT_LENGTH"] = str(retry_context)
+                # The retry window is inside the model's native one, so the YaRN
+                # override that belonged to the wider window must go with it.
+                generated["MAIN_MODEL_ROPE_OVERRIDE"] = ""
+                generated["MODEL_CONCURRENCY"] = "1"
+                generated["MAIN_CONCURRENCY"] = "1"
+                publish_generated()
+                compose.validate()
+                compose.up_service("vllm", force_recreate=True)
+                compose.wait_service("vllm", timeout=2400.0, reporter=_step)
+                record_probe("main", generated["OPENAI_BASE_URL"], generated["MAIN_MODEL"])
         if _yes(generated.get("VISION_ENABLED")):
             try:
                 record_probe(

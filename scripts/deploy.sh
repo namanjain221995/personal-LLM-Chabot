@@ -271,8 +271,13 @@ apply() {  # apply <sha> - move the checkout and bring the stack up
     say "  full restart: techsara down, then up (volumes preserved; expect ~10-15 min)"
     ( cd "$ROOT" && ./techsara down ) >>"$LOG" 2>&1 || return 1
   fi
-  say "  techsara up  (builds images, recreates changed services, staged health gates)"
-  ( cd "$ROOT" && ./techsara up ) >>"$LOG" 2>&1
+  # A routine deploy NEVER restarts the main model: reloading it is 15-25
+  # minutes of the site answering nothing. The launcher probes the running
+  # engine and leaves it alone; a definition change to vllm therefore waits
+  # for --full, which is the operator asking for the reload out loud.
+  PRESERVE=1; [ "$FULL" = 1 ] && PRESERVE=
+  say "  techsara up  (builds images, recreates changed services, staged health gates$([ -n "$PRESERVE" ] && printf '; main model preserved'))"
+  ( cd "$ROOT" && TECHSARA_PRESERVE_MAIN_MODEL="$PRESERVE" ./techsara up ) >>"$LOG" 2>&1
 }
 
 # ---------------------------------------------------------------- health gate
