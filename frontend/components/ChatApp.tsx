@@ -731,10 +731,15 @@ export function ChatApp() {
       const first = attachments[0] ?? null;
       const isPdf = first?.kind === 'pdf';
       const isDataset = first?.kind === 'dataset';
-      // 2026-09-02: a document above the inline cap carries a File handle and
-      // no base64 — it streams to /api/upload on send (chunked past the
-      // Cloudflare 100 MB edge cap) and the request sends a REFERENCE.
-      const isStreamedDoc = isPdf && !!first?.file && !first?.base64;
+      // 2026-09-02: documents stack (up to five). ONE small document still
+      // rides inline — byte-identical wire to every conversation before it.
+      // Several documents, or any that skipped base64 for size, upload first
+      // (chunked past the Cloudflare 100 MB edge cap) and the request sends
+      // REFERENCES instead.
+      const docAttachments = attachments.filter((a) => a.kind === 'pdf');
+      const needsDocUpload =
+        docAttachments.length > 1 ||
+        docAttachments.some((a) => !a.base64 && !!a.file);
       const images = attachments.filter((a) => a.kind === 'image');
       let conversationId = activeId;
       if (!conversationId) {
@@ -836,7 +841,7 @@ export function ChatApp() {
       setUnreachable(false);
       // A dataset has to be uploaded before a stream can exist, so say that
       // instead of claiming the model is already running (see datasetUpload).
-      if ((isDataset || isStreamedDoc) && first?.file) {
+      if ((isDataset && first?.file) || needsDocUpload) {
         setDatasetUpload({
           conversationId,
           messageId: userMessage.id,
@@ -849,21 +854,39 @@ export function ChatApp() {
       // about to be arguing with a thread that has changed underneath it.
       setEditingMessageId(null);
 
-      if ((isDataset || isStreamedDoc) && first?.file) {
-        // Datasets and big documents stream to their own endpoint and are
-        // then referenced by the conversation, so the chat request stays
-        // small whatever the file weighed.
+      if ((isDataset && first?.file) || needsDocUpload) {
+        // Datasets and documents stream to their own endpoint and are then
+        // referenced by the conversation, so the chat request stays small
+        // whatever — and however many — the files weighed.
         void (async () => {
-          let docRef: { upload_id: string; name: string } | null = null;
+          let docRefs: { upload_id: string; name: string }[] | null = null;
           try {
             let uploadedId: string | undefined;
-            if (isStreamedDoc) {
-              docRef = await uploadDocumentFile(
-                first.file as File,
-                conversationId,
+            if (needsDocUpload) {
+              const refs: { upload_id: string; name: string }[] = [];
+              for (const doc of docAttachments) {
+                // Reuse paths may carry only base64; the picker always keeps
+                // the File. Either way the server gets real bytes.
+                const src =
+                  doc.file ??
+                  new File(
+                    [Uint8Array.from(atob(doc.base64), (c) => c.charCodeAt(0))],
+                    doc.name,
+                  );
+                refs.push(await uploadDocumentFile(src, conversationId));
+              }
+              docRefs = refs;
+              refs.forEach((r, i) => {
+                const entry = userMessage.meta?.attachments?.[i];
+                if (entry) entry.id = r.upload_id;
+              });
+              uploadedId = undefined; // ids already linked, one per document
+              persist(conversationId, turns);
+              toast(
+                refs.length === 1
+                  ? `Uploaded ${docAttachments[0].name}.`
+                  : `Uploaded ${refs.length} documents.`,
               );
-              uploadedId = docRef.upload_id;
-              toast(`Uploaded ${first.name}.`);
             } else {
               const form = new FormData();
               form.append('file', first.file as File);
@@ -926,8 +949,8 @@ export function ChatApp() {
             // rejecting it as an empty request (which is what produced a 400
             // immediately after a perfectly successful upload).
             ...(isDataset ? { dataset: true } : {}),
-            ...(docRef
-              ? { pdfUploads: [docRef], pdfName: first?.name ?? null }
+            ...(docRefs?.length
+              ? { pdfUploads: docRefs, pdfName: first?.name ?? null }
               : {}),
           });
           disarmDeepResearch();

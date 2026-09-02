@@ -50,6 +50,8 @@ const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 /** Up to 5 images per message (owner request 2026-08-05); the orchestrator
     enforces the same ceiling (MAX_IMAGES in main.py). */
 const MAX_IMAGES = 5;
+//: Documents per message (2026-09-02) — matches the server's reference cap.
+const MAX_DOCS = 5;
 const LINE_HEIGHT = 24;
 const MAX_ROWS = 10;
 
@@ -293,6 +295,20 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
       setPastedTexts([]);
     }
 
+    /** Documents stack to MAX_DOCS and displace images/datasets (2026-09-02). */
+    function appendDocument(att: Attachment) {
+      let refused = false;
+      setAttachments((prev) => {
+        const docs = prev.filter((a) => a.kind === 'pdf');
+        if (docs.length >= MAX_DOCS) {
+          refused = true;
+          return prev;
+        }
+        return [...docs, att];
+      });
+      if (refused) toast(`You can attach up to ${MAX_DOCS} documents.`, 'error');
+    }
+
     function handleFile(file: File) {
       const isImage = file.type.startsWith('image/');
       const lower = file.name.toLowerCase();
@@ -330,9 +346,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
       }
       if (isArchive || isOtherDoc) {
         // Streamed like a big document: File handle only, referenced on send.
-        setAttachments([
-          { name: file.name, kind: 'pdf', dataUrl: '', base64: '', file },
-        ]);
+        appendDocument({ name: file.name, kind: 'pdf', dataUrl: '', base64: '', file });
         return;
       }
       if (isDataset) {
@@ -347,9 +361,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
       if (isPdf && file.size > INLINE_DOC_BYTES) {
         // A BIG document takes the dataset's road: File handle only, no
         // base64, streamed on send and referenced in the chat request.
-        setAttachments([
-          { name: file.name, kind: 'pdf', dataUrl: '', base64: '', file },
-        ]);
+        appendDocument({ name: file.name, kind: 'pdf', dataUrl: '', base64: '', file });
         return;
       }
       if (
@@ -357,6 +369,13 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
         attachments.filter((a) => a.kind === 'image').length >= MAX_IMAGES
       ) {
         toast(`You can attach up to ${MAX_IMAGES} images.`, 'error');
+        return;
+      }
+      if (
+        isPdf &&
+        attachments.filter((a) => a.kind === 'pdf').length >= MAX_DOCS
+      ) {
+        toast(`You can attach up to ${MAX_DOCS} documents.`, 'error');
         return;
       }
       const name =
@@ -374,10 +393,15 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
           file,
         };
         setAttachments((prev) => {
-          // A PDF stands alone. Images stack up to MAX_IMAGES (2026-08-05)
-          // — but never alongside a PDF/dataset, which use different
-          // server paths; a new image replaces those instead.
-          if (att.kind === 'pdf') return [att];
+          // Documents STACK up to MAX_DOCS (2026-09-02; they used to stand
+          // alone). Images stack up to MAX_IMAGES (2026-08-05). The two
+          // still never mix — they use different server engines — so
+          // adding one kind replaces the other.
+          if (att.kind === 'pdf') {
+            const docs = prev.filter((a) => a.kind === 'pdf');
+            if (docs.length >= MAX_DOCS) return prev; // raced past the cap
+            return [...docs, att];
+          }
           const images = prev.filter((a) => a.kind === 'image');
           if (images.length >= MAX_IMAGES) return prev; // raced past the cap
           return [...images, att];
