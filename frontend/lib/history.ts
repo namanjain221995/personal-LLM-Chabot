@@ -590,14 +590,112 @@ interface SyncState {
   deleted: string[];
 }
 
+/* --------------------------------------------------- what the server has
+
+   PHASE 2. `pushed` used to be a list of message IDS, and `syncConversation`
+   read "same ids, same count" as "nothing to do". That is a statement about
+   IDENTITY being unchanged, and it was used to conclude that CONTENT was
+   unchanged — which the dataset flow breaks by design: it persists the user
+   turn, uploads the file, and only then writes the `upload_id` onto the
+   message it already saved. Same id, same count, so the second push was
+   skipped and the id never left the browser (7 of 40 rows carried one at
+   audit time — the ones that happened to win a race with the first push).
+
+   Each entry is now `<id>\0<hash of the server payload>`, so the two
+   questions can be asked separately:
+
+     sameThread / isPrefix — is this the same conversation? (ids only, which
+       is what the load path has always meant and still means)
+     sameState             — is the server's copy actually up to date?
+
+   A HASH, not the payload: this state lives in localStorage, `meta` can carry
+   data rows and chart specs, and blowing that quota is the exact failure this
+   codebase has already had to fix once. */
+
+/** Key-sorted JSON, so two equal payloads cannot differ by key order alone. */
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  const entries = Object.entries(value as Record<string, unknown>)
+    .filter(([, v]) => v !== undefined)
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  return `{${entries
+    .map(([k, v]) => `${JSON.stringify(k)}:${canonicalJson(v)}`)
+    .join(',')}}`;
+}
+
+/** FNV-1a. Not a security primitive — a change detector, and a collision
+    costs exactly what the old code cost unconditionally: a skipped resync. */
+function hash32(text: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < text.length; i += 1) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(36);
+}
+
+/**
+ * EXACTLY what the server stores for a message — the whole basis for deciding
+ * whether a push is needed. Browser-only fields (`imageDataUrl`, `serverId`,
+ * live streaming state) are absent by construction, so touching them can never
+ * provoke a write.
+ */
+function toServerPayload(m: ChatMessage): ServerMessage {
+  return {
+    role: m.role,
+    content: m.content,
+    meta: m.meta ?? null,
+    // Sent so a whole-thread re-push does not resurrect a thumb this client
+    // has since cleared. The server also carries thumbs across by position,
+    // which covers older clients that omit the field; an explicit value
+    // here wins over that.
+    ...(m.feedback !== undefined ? { feedback: m.feedback } : {}),
+  };
+}
+
+/** Separates a key's two halves. A message id never contains it: ids are
+    uuids, or the positional `srv-<conversation>-<index>` a hydrate assigns. */
+const KEY_SEP = '#';
+
+/** A message's server-visible payload, as one comparable key. */
+function syncKey(m: ChatMessage): string {
+  return `${m.id}${KEY_SEP}${hash32(canonicalJson(toServerPayload(m)))}`;
+}
+
+/** The identity half of a key. Also accepts a BARE id, so an upgrade in place
+    reads the sync state this browser already holds instead of re-pushing every
+    conversation it has ever cached. */
+function idOf(key: string): string {
+  const sep = key.indexOf(KEY_SEP);
+  return sep === -1 ? key : key.slice(0, sep);
+}
+
+/**
+ * Identity AND payload: is the server's copy of this thread actually current?
+ *
+ * A bare (pre-upgrade) key can only answer the identity half, so it is read as
+ * current — exactly the answer the old code gave, which is what stops an
+ * upgrade from rewriting every conversation in the cache on its first run.
+ */
+function sameState(pushed: string[], msgs: ChatMessage[]): boolean {
+  return (
+    pushed.length === msgs.length &&
+    pushed.every((k, i) =>
+      k.includes(KEY_SEP) ? k === syncKey(msgs[i]) : idOf(k) === msgs[i].id,
+    )
+  );
+}
+
+/** Same THREAD — ids only. What the load path has always asked, unchanged. */
 function sameIds(a: string[], msgs: ChatMessage[]): boolean {
-  return a.length === msgs.length && a.every((id, i) => msgs[i].id === id);
+  return a.length === msgs.length && a.every((k, i) => msgs[i].id === idOf(k));
 }
 
 function isPrefix(prefix: string[], msgs: ChatMessage[]): boolean {
   return (
     prefix.length <= msgs.length &&
-    prefix.every((id, i) => msgs[i].id === id)
+    prefix.every((k, i) => msgs[i].id === idOf(k))
   );
 }
 
@@ -716,18 +814,9 @@ export function createServerHistoryStore(
     cache.writeAll(all, conv.id);
   }
 
-  function toServerMessage(m: ChatMessage): ServerMessage {
-    return {
-      role: m.role,
-      content: m.content,
-      meta: m.meta ?? null,
-      // Sent so a whole-thread re-push does not resurrect a thumb this client
-      // has since cleared. The server also carries thumbs across by position,
-      // which covers older clients that omit the field; an explicit value
-      // here wins over that.
-      ...(m.feedback !== undefined ? { feedback: m.feedback } : {}),
-    };
-  }
+  /** One definition of the wire shape, shared with the sync-key hash so the
+      two can never drift into disagreeing about what the server has. */
+  const toServerMessage = toServerPayload;
 
   function flagsOf(conv: Conversation): ConversationPatch {
     return { pinned: conv.pinned === true, archived: conv.archived === true };
@@ -828,7 +917,7 @@ export function createServerHistoryStore(
       await api.update(conv.id, flagsOf(conv));
     }
     mutateSync((s) => {
-      s.pushed[conv.id] = conv.messages.map((m) => m.id);
+      s.pushed[conv.id] = conv.messages.map(syncKey);
       s.dirty = s.dirty.filter((d) => d !== conv.id);
     });
   }
@@ -845,7 +934,26 @@ export function createServerHistoryStore(
     }
     const pushed = readSync().pushed[id];
     if (Array.isArray(pushed) && isPrefix(pushed, conv.messages)) {
-      if (pushed.length === conv.messages.length) return; // already in sync
+      // PHASE 2. The thread is the same one, so the only question left is
+      // whether the server's copy of the ALREADY-PUSHED part still matches.
+      // It is not enough to count messages: the dataset flow writes an
+      // `upload_id` onto a message it has already pushed, which changes no id
+      // and no count, and used to be dropped here in silence.
+      const prefixCurrent = sameState(
+        pushed,
+        conv.messages.slice(0, pushed.length),
+      );
+      if (pushed.length === conv.messages.length) {
+        if (prefixCurrent) return; // genuinely in sync — no write at all
+        await pushAll(conv); // payload diverged: rewrite the thread
+        return;
+      }
+      if (!prefixCurrent) {
+        // New messages AND a changed prefix. Appending would leave the stale
+        // rows behind, so one atomic replace carries both.
+        await pushAll(conv);
+        return;
+      }
       // Keep the row id the server assigns: it is the ONLY handle on a stored
       // message, and this is the only place the client sees one for a message
       // it sent. (loadConversation short-circuits to the cache whenever it is
@@ -871,7 +979,7 @@ export function createServerHistoryStore(
         }
       }
       mutateSync((s) => {
-        s.pushed[id] = conv.messages.map((m) => m.id);
+        s.pushed[id] = conv.messages.map(syncKey);
         s.dirty = s.dirty.filter((d) => d !== id);
       });
       return;
@@ -950,7 +1058,7 @@ export function createServerHistoryStore(
       };
       upsertCached(conv);
       mutateSync((st) => {
-        st.pushed[id] = messages.map((m) => m.id);
+        st.pushed[id] = messages.map(syncKey);
       });
       return conv;
     } catch {
@@ -1033,7 +1141,7 @@ export function createServerHistoryStore(
       const kept = conv.messages.slice(0, keep);
       local.saveMessages(id, kept);
       mutateSync((s) => {
-        s.pushed[id] = kept.map((m) => m.id);
+        s.pushed[id] = kept.map(syncKey);
         s.dirty = s.dirty.filter((d) => d !== id);
       });
     },

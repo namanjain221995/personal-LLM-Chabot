@@ -200,10 +200,8 @@ describe('clicking an attachment opens an in-app preview', () => {
   it.each([
     ['notes.txt', 'text/plain', 'hello from a text file'],
     ['README.md', 'text/markdown', '# a heading\n\nbody text'],
-    ['sales.csv', 'text/csv', 'a,b\n1,2'],
     ['payload.json', 'application/json', '{"ok":true}'],
     ['events.jsonl', '', '{"a":1}\n{"a":2}'],
-    ['data.tsv', 'text/tab-separated-values', 'a\tb'],
   ])('reads %s and shows its text in the dialog', async (name, mime, body) => {
     // NEW09A-04 … 09
     withFile(name, mime, body);
@@ -220,6 +218,33 @@ describe('clicking an attachment opens an in-app preview', () => {
     );
     expectNoDownloads();
   });
+
+  it.each([
+    ['sales.csv', 'text/csv', 'a,b\n1,2', ['a', 'b', '1', '2']],
+    ['data.tsv', 'text/tab-separated-values', 'a\tb\n3\t4', ['a', 'b', '3', '4']],
+  ])(
+    // PHASE 4C changed this deliberately: delimited data now renders as a
+    // TABLE. The old expectation was the raw text, which is technically the
+    // file's contents and practically unreadable past four columns. The
+    // no-download invariant below is unchanged and still the point.
+    'renders %s as a table of its cells',
+    async (name, mime, body, cells) => {
+      withFile(name, mime, body);
+      renderRow(userMessage({ pdfName: name }));
+
+      fireEvent.click(card(new RegExp(name.replace('.', '\\.'))));
+      const d = await screen.findByRole('dialog');
+
+      // The dialog opens before the blob has been read — the table appears
+      // when the text lands, so it is waited for rather than assumed.
+      await waitFor(() => expect(d.querySelector('table')).toBeTruthy());
+      // Headers come from the first row; the rest are cells.
+      const headers = Array.from(d.querySelectorAll('th')).map((h) => h.textContent);
+      const values = Array.from(d.querySelectorAll('td')).map((t) => t.textContent);
+      expect([...headers, ...values]).toEqual(cells);
+      expectNoDownloads();
+    },
+  );
 
   it('truncates a very large text file instead of rendering all of it', async () => {
     // NEW09A-10

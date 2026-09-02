@@ -41,6 +41,23 @@ export function base64FromDataUrl(dataUrl?: string | null): string | null {
   return payload || null;
 }
 
+/**
+ * Does this user turn carry an uploaded dataset?
+ *
+ * Load-bearing in two places at once, which is why it is one function: it
+ * decides that a resend needs no bytes (below), AND that the resend must still
+ * announce `dataset: true` to the chat proxy. Getting only the first right is
+ * how a regenerate of a wordless dataset turn would 400 — the exact NEW-14
+ * failure, reintroduced through a different door.
+ */
+export function isDatasetTurn(message: {
+  meta?: { attachments?: Array<{ kind?: string; name?: string; id?: string }> };
+}): boolean {
+  return Boolean(
+    message.meta?.attachments?.some((a) => a.kind === 'dataset'),
+  );
+}
+
 export interface AttachmentsLookup {
   /** The attachments to re-send, when we still have them (may be empty). */
   attachments: SentAttachment[];
@@ -61,7 +78,21 @@ export function attachmentsForResend(message: {
   imageDataUrl?: string;
   imageDataUrls?: string[];
   pdfName?: string;
+  meta?: { attachments?: Array<{ kind?: string; name?: string; id?: string }> };
 }): AttachmentsLookup {
+  // PHASE 3. A DATASET needs nothing resent. It never travelled in the chat
+  // body in the first place — it streams to /api/upload and the orchestrator
+  // finds it again through conversation_id — so the profile that answers the
+  // question is already server-side and outlives this tab entirely.
+  //
+  // This used to be missed because `pdfName` carries the filename of EVERY
+  // non-image attachment, datasets included, and the check below reads it as
+  // proof that something is gone. The result was a regenerate that refused to
+  // run, telling the user to re-attach a file the server had never lost.
+  if (isDatasetTurn(message)) {
+    return { attachments: [], missing: false };
+  }
+
   const remembered = sent.get(message.id);
   if (remembered) return { attachments: remembered, missing: false };
 
@@ -172,8 +203,17 @@ export function carryAttachmentFiles(fromId: string, toId: string): void {
  * again is "download it instead".
  */
 export type PreviewKind = 'image' | 'pdf' | 'text' | 'none';
-/** `unavailable` = the bytes are gone (a reload, or another device). */
-export type ResolvedKind = PreviewKind | 'unavailable';
+/**
+ * `unavailable` = the bytes are gone (a reload, or another device).
+ * `expired` = the server HAD them and its workspace TTL swept them — a
+ * different sentence, because the user can do something about it.
+ */
+export type ResolvedKind =
+  | PreviewKind
+  | 'unavailable'
+  | 'expired'
+  /** The dialog is open and the bytes are still on their way. */
+  | 'loading';
 
 const IMAGE_BY_EXT: Record<string, string> = {
   png: 'image/png',
@@ -338,6 +378,60 @@ export interface ResolvedAttachment {
   kind: ResolvedKind;
 }
 
+/* --------------------------------------------------------- the server tier
+
+   PHASE 3. A dataset's bytes were never actually lost — they stream to
+   /api/upload and live in the orchestrator's workspace until its TTL sweeps
+   them. What was missing was a way to ASK, so a reload turned a file the
+   server was still answering questions about into "no longer available in
+   this browser session".
+
+   `meta.attachments[].id` is the handle (Phase 2 is what makes it reliably
+   survive a push), and the fetch is deliberately LAZY: nothing here runs on
+   render. It is reached only when someone previews, re-attaches or drags. */
+
+/** Where an upload's bytes can be fetched from, when it has a server id. */
+export interface UploadRef {
+  conversationId: string;
+  uploadId: string;
+}
+
+/** Where the Phase 3 proxy lives. Same-origin; the cookie rides automatically. */
+export function uploadFileUrl(ref: UploadRef): string {
+  return `/api/uploads/${encodeURIComponent(ref.conversationId)}/${encodeURIComponent(ref.uploadId)}/file`;
+}
+
+/** `expired` is its own outcome: the row is real, the bytes are swept. */
+export type FetchOutcome =
+  | { status: 'ok'; blob: Blob }
+  | { status: 'expired' }
+  | { status: 'unavailable' };
+
+/**
+ * Fetch one upload's bytes.
+ *
+ * 410 is the interesting status and the reason this does not just return null:
+ * "expired" is something a user can act on ("attach it again") while a 404 is
+ * not. `signal` lets a closed dialog abort a large download it no longer needs.
+ */
+export async function fetchUploadBlob(
+  ref: UploadRef,
+  signal?: AbortSignal,
+): Promise<FetchOutcome> {
+  try {
+    const res = await fetch(uploadFileUrl(ref), {
+      cache: 'no-store',
+      signal,
+    });
+    if (res.status === 410) return { status: 'expired' };
+    if (!res.ok) return { status: 'unavailable' };
+    return { status: 'ok', blob: await res.blob() };
+  } catch {
+    // Offline, or the caller aborted. Neither is "expired".
+    return { status: 'unavailable' };
+  }
+}
+
 /**
  * Everything the preview dialog needs about the Nth attachment of a message.
  *
@@ -373,6 +467,65 @@ export function resolveAttachment(
     };
   }
   return { name, mime: '', blob: null, size: null, kind: 'unavailable' };
+}
+
+/**
+ * `resolveAttachment` plus the server tier — the full ladder, in order:
+ *
+ *   1. the File this tab still holds        (instant, any format)
+ *   2. the payload the message persists     (images: the preview IS the bytes)
+ *   3. the orchestrator, by upload_id       (datasets, any device, until TTL)
+ *   4. unavailable / expired                (an honest sentence, not a guess)
+ *
+ * Async because only step 3 is, and steps 1-2 still return without awaiting
+ * anything. Callers that cannot await (a render pass) must keep using the
+ * synchronous `resolveAttachment` — nothing here belongs in a render.
+ */
+export async function resolveAttachmentAsync(
+  messageId: string,
+  index: number,
+  fallback?: { name?: string; dataUrl?: string; upload?: UploadRef | null },
+  signal?: AbortSignal,
+): Promise<ResolvedAttachment> {
+  const local = resolveAttachment(messageId, index, fallback);
+  if (local.kind !== 'unavailable' || !fallback?.upload) return local;
+
+  const outcome = await fetchUploadBlob(fallback.upload, signal);
+  if (outcome.status === 'expired') {
+    return { ...local, kind: 'expired' };
+  }
+  if (outcome.status === 'unavailable') return local;
+
+  const name = fallback?.name ?? local.name;
+  // The type is decided by our allowlist from the NAME, exactly as it is for
+  // an in-memory file. What the server sent is advisory only.
+  const mime = previewMimeFor(name, outcome.blob.type) ?? outcome.blob.type;
+  return {
+    name,
+    mime,
+    blob: outcome.blob,
+    size: outcome.blob.size,
+    kind: previewKindFor(name, mime),
+  };
+}
+
+/**
+ * The upload this message's Nth attachment came from, when it has one.
+ *
+ * Only datasets ever get an id — an image or a PDF travels inside the chat
+ * request and leaves no upload row — so this returns null for everything else,
+ * and the ladder above simply stops one rung earlier.
+ */
+export function uploadRefFor(
+  conversationId: string | null | undefined,
+  message: {
+    meta?: { attachments?: Array<{ id?: string; kind?: string; name?: string }> };
+  },
+  index: number,
+): UploadRef | null {
+  const att = message.meta?.attachments?.[index];
+  if (!conversationId || !att?.id) return null;
+  return { conversationId, uploadId: att.id };
 }
 
 /* ==========================================================================
@@ -527,9 +680,89 @@ function dragText(dt: DataTransfer): string {
  * browser. Everything else is ours, which is what stops a URI reaching the
  * textarea.
  */
+/* ------------------------------------------------- an INTERNAL drag (4B)
+
+   Dragging a file OUT of the conversation and back into the composer is not
+   the same problem as dragging one in from the desktop, and it must not be
+   solved by pretending it is. The browser gives a page no way to put a real
+   File into a drag it starts, so what travels is a REFERENCE — the message and
+   the position — and the drop side turns that back into bytes through exactly
+   the same ladder "Attach again" uses.
+
+   The payload carries identity and nothing else. No filesystem path (a page
+   could not read one anyway), no blob: URL (it would be dead by the time it
+   was read, and it is a capability), no server path. And it never goes in
+   `text/plain`: NEW-10A exists because a drag whose only readable part was
+   text got typed into the prompt, and a JSON blob appearing in someone's
+   message box would be the same bug wearing a different hat. */
+
+/** The private type. A drag not carrying it is not one of ours. */
+export const INTERNAL_ATTACHMENT_MIME = 'application/x-techsara-attachment';
+
+export interface InternalAttachmentRef {
+  messageId: string;
+  index: number;
+}
+
+/** Put a sent attachment onto a drag. Returns false if the drag can't take it. */
+export function writeInternalAttachment(
+  dt: DataTransfer | null | undefined,
+  ref: InternalAttachmentRef,
+): boolean {
+  if (!dt || typeof dt.setData !== 'function') return false;
+  try {
+    dt.setData(INTERNAL_ATTACHMENT_MIME, JSON.stringify(ref));
+    dt.effectAllowed = 'copy';
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Read one back, or null when this drag is not ours / is malformed. */
+export function readInternalAttachment(
+  dt: DataTransfer | null | undefined,
+): InternalAttachmentRef | null {
+  if (!dt || typeof dt.getData !== 'function') return null;
+  let raw = '';
+  try {
+    raw = dt.getData(INTERNAL_ATTACHMENT_MIME) || '';
+  } catch {
+    return null;
+  }
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== 'object') return null;
+    const { messageId, index } = parsed as Record<string, unknown>;
+    // Both are used to index our own in-memory store, so both are validated
+    // rather than trusted: this string arrives from a DataTransfer, and a page
+    // does not get to assume it wrote everything it reads.
+    if (typeof messageId !== 'string' || !messageId) return null;
+    if (typeof index !== 'number' || !Number.isInteger(index) || index < 0) {
+      return null;
+    }
+    return { messageId, index };
+  } catch {
+    return null;
+  }
+}
+
+/** Is this drag carrying one of our own attachments? */
+export function dragHasInternalAttachment(
+  dt?: DataTransfer | null,
+): boolean {
+  if (!dt) return false;
+  // `types` is the only witness available DURING a drag — getData is empty
+  // until the drop in every browser that follows the spec.
+  return Array.from(dt.types ?? []).includes(INTERNAL_ATTACHMENT_MIME);
+}
+
 export type DropIntent =
   | { action: 'files'; files: File[]; directories: number }
   | { action: 'directories'; directories: number }
+  /** 4B: one of our own sent attachments, by reference. */
+  | { action: 'internal'; ref: InternalAttachmentRef }
   | { action: 'file-uri'; uri: string }
   | { action: 'ignore' };
 
@@ -540,6 +773,12 @@ export function dropIntent(dt?: DataTransfer | null): DropIntent {
   // is offering one file twice, and the File is the half we can actually use.
   if (files.length) return { action: 'files', files, directories };
   if (directories > 0) return { action: 'directories', directories };
+
+  // 4B, and deliberately AFTER real files: a drag carrying both is a file the
+  // OS is offering, and the bytes in hand always beat a reference we would
+  // have to go and resolve.
+  const internal = readInternalAttachment(dt);
+  if (internal) return { action: 'internal', ref: internal };
 
   const text = dragText(dt);
   if (!text) return { action: 'ignore' };

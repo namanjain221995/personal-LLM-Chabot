@@ -12,17 +12,20 @@ asks for a re-upload — never a 500.
 """
 from __future__ import annotations
 
+import mimetypes
 import os
 import shutil
 import uuid
 from typing import Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 
 from . import db
 from .auth import UserRow, require_user
 from .config import settings
 from .core import archive, profile as profiler
+from .core.upload_paths import UploadPathError, resolve_upload_file
 
 router = APIRouter(prefix="/uploads", tags=["uploads"])
 
@@ -156,6 +159,119 @@ async def create_upload(
         "files": len(profiles),
         "notes": notes[:20],
         "profile": profiles,
+    }
+
+
+@router.get("/{conversation_id}/{upload_id}/file")
+async def download_upload(
+    conversation_id: str,
+    upload_id: str,
+    user: UserRow = Depends(require_user),
+) -> FileResponse:
+    """The stored bytes of ONE upload — the owner's only (Phase 3).
+
+    The bytes were always here (uploads stream to the workspace and stay until
+    the TTL sweeps them); what was missing was any way to ask for them, so a
+    browser that had lost its in-memory copy of a CSV reported the file gone
+    while the server was still answering questions about it.
+
+    Modelled on GET /reports/{filename}, which is this project's established
+    shape for "owner-checked file on disk": STRICT 404 for anything that is not
+    yours — a conversation with no row, someone else's conversation, and an
+    upload id that belongs to a different conversation are all indistinguishable
+    from never having existed, so the flat id space cannot be used as an oracle.
+
+    Expiry is its own answer. A row whose files the TTL has swept is 410 Gone,
+    not 404: the client can tell "you may not have this" from "this is no longer
+    here", and only the second is worth telling the user to re-attach for.
+    """
+    # Ownership first, and STRICTLY: `is None` counts as refused, exactly as in
+    # list_uploads. An unowned conversation must not be readable by anyone.
+    owner = await db.run_in_thread(db.conversation_owner, conversation_id)
+    if owner is None or owner != int(user["id"]):
+        raise HTTPException(status_code=404, detail="upload not found")
+
+    # Scoped by BOTH ids: an upload id alone names nothing here.
+    uploads = await db.run_in_thread(db.get_uploads, conversation_id)
+    row = next((u for u in uploads if u["id"] == upload_id), None)
+    if row is None:
+        raise HTTPException(status_code=404, detail="upload not found")
+
+    filename = str(row.get("filename") or "")
+    try:
+        path = resolve_upload_file(
+            settings.workspace_dir, conversation_id, upload_id, filename
+        )
+    except UploadPathError:
+        # A malformed id cannot name a real row, so this is effectively
+        # unreachable — and it stays a 404 rather than leaking the distinction.
+        raise HTTPException(status_code=404, detail="upload not found")
+
+    if not path.is_file():
+        # Two ways to get here, and the user can act on both the same way.
+        # Either the workspace TTL swept the extracted files, or this upload was
+        # an ARCHIVE: create_upload deletes `_original` once it has extracted
+        # the members, so the .zip/.tar the user chose is genuinely not kept.
+        raise HTTPException(
+            status_code=410,
+            detail=(
+                "This upload has expired and is no longer stored. "
+                "Attach the file again to use it."
+            ),
+        )
+
+    # NEVER the type the browser declared at upload time — that value is
+    # attacker-chosen. Guessed from the stored name, defaulting to a type no
+    # browser will render, and served as an attachment (nosniff is set by the
+    # frontend for every response it proxies).
+    media_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    return FileResponse(path, filename=filename, media_type=media_type)
+
+
+#: How much extracted document text a preview may pull. A 300-page PDF's text
+#: is megabytes; one screen of it is what a preview needs, and the dialog says
+#: when it has been cut.
+DOCUMENT_PREVIEW_CHARS = 200_000
+
+
+@router.get("/{conversation_id}/document")
+async def document_text(
+    conversation_id: str,
+    name: str,
+    user: UserRow = Depends(require_user),
+) -> dict:
+    """The extracted TEXT of a document attached to this conversation (4C).
+
+    DOCX is a zip of XML: a browser cannot open one without a parser, and this
+    project ships none. It does not need one — engines/document.py already
+    extracted the text with the standard library when the file was sent, and
+    stored it here. So the preview reads what the model read.
+
+    TEXT, deliberately, never markup. There is no HTML anywhere on this path:
+    not from the extractor (core/docx.py returns paragraphs and tab-separated
+    table rows), not from this endpoint, and not in the dialog that renders it —
+    which means the document's own content can never become DOM. A .docx is an
+    untrusted file, and the safest renderer for one is a <pre>.
+
+    The filename is a QUERY parameter rather than a path segment: it never
+    touches the filesystem here (this is a database lookup keyed by exact
+    name), and keeping it out of the path keeps it out of route matching too.
+    """
+    owner = await db.run_in_thread(db.conversation_owner, conversation_id)
+    if owner is None or owner != int(user["id"]):
+        raise HTTPException(status_code=404, detail="document not found")
+
+    documents = await db.run_in_thread(db.get_documents, conversation_id)
+    row = next((d for d in documents if d.get("filename") == name), None)
+    if row is None:
+        raise HTTPException(status_code=404, detail="document not found")
+
+    text = str(row.get("text") or "")
+    return {
+        "filename": row.get("filename"),
+        "total_pages": row.get("total_pages") or 0,
+        "text": text[:DOCUMENT_PREVIEW_CHARS],
+        "truncated": len(text) > DOCUMENT_PREVIEW_CHARS,
     }
 
 
