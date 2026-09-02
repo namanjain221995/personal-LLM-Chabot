@@ -1,0 +1,285 @@
+# ONE pipeline: test -> deploy -> verify, visible as a single graph.
+#
+# It used to be two workflows chained by workflow_run (CI, then Deploy), which
+# worked but read as two disconnected runs in the Actions tab — a deploy's
+# tests were always "somewhere else". Same guarantees, one page:
+#
+#   * every push and PR runs the four test suites on free hosted runners;
+#   * a push to MAIN that passes them deploys from the self-hosted DGX runner
+#     (the box itself owns the GPU, the model cache and the credentials —
+#     nothing is copied to a cloud runner, no secret enters this file);
+#   * the deploy is ROLLING and MODEL-PRESERVING: only containers whose
+#     definition changed are recreated, and the main vLLM engine is probed
+#     and left running even then (TECHSARA_PRESERVE_MAIN_MODEL, set by
+#     scripts/deploy.sh for every non---full deploy). Blue-green in the
+#     textbook sense is not honest on this hardware — the 35B model fills the
+#     GPUs, so a second "green" stack cannot exist — but the property
+#     blue-green buys, deploys that never take the product down, is exactly
+#     what preserve + rolling recreate + the verify stage deliver;
+#   * a verify stage then proves from the box that the site, the API, the
+#     model and the monitoring plane are actually answering, and writes the
+#     evidence into the run summary.
+#
+# What is deliberately NOT here:
+#   * `npm run lint` - `next lint` was removed in Next 16 and the pinned
+#     eslint-config-next is still 15.x. `tsc --noEmit` is the type gate.
+#   * building the CUDA orchestrator image - its base is ~20 GB and a hosted
+#     runner has ~14 GB free. The DGX builds it at deploy time instead.
+name: Pipeline
+
+on:
+  pull_request:
+  push:
+    branches: [main, dev]
+  workflow_dispatch:
+    inputs:
+      full:
+        description: "Recreate EVERY container, including the models (+15-25 min: the main model reloads)"
+        type: boolean
+        default: false
+      branch:
+        description: "Branch to leave the production checkout on (blank = repo variable DEPLOY_BRANCH; '-' = detached HEAD)"
+        default: ""
+
+# A newer push to the same branch makes an in-flight TEST run pointless — but
+# never cancel main: a cancelled half-finished deploy is a partially recreated
+# stack. Main queues; everything else supersedes.
+concurrency:
+  group: pipeline-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  launcher:
+    name: "🧪 launcher (${{ matrix.python }})"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The shim pins 3.12; 3.11 is what the containers run. The launcher is
+        # standard-library only, so both must stay green.
+        python: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Show the Compose version the overlay tests need
+        # test_compose_overlays.py renders every host fixture through REAL
+        # `docker compose config`; it skips silently below v2.24, so print it.
+        run: docker compose version
+      - name: Run the launcher suite
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        # TECHSARA_MODEL_CACHE must not leak in from the environment: it changes
+        # the cache path the tests assert on.
+        run: |
+          env -u TECHSARA_MODEL_CACHE PYTHONPATH=launcher \
+            python -m unittest discover -s launcher/tests -v 2>&1 | tail -30
+
+  orchestrator:
+    name: "🧪 orchestrator"
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        # Same major and the same initdb settings as production. Both matter:
+        # conftest refuses a database whose LC_COLLATE is not C, and an
+        # SQL_ASCII database makes psycopg fail to encode the migration DDL
+        # (there is an em-dash in it) with UnicodeEncodeError on every test.
+        image: postgres@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: techsara_test
+          POSTGRES_INITDB_ARGS: "--locale=C --encoding=UTF8"
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U test -d techsara_test -q"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: orchestrator/requirements-dev.txt
+      - run: python -m pip install -q -r orchestrator/requirements-dev.txt
+      - name: Run the orchestrator suite
+        working-directory: orchestrator
+        env:
+          # conftest refuses any database name that is not unmistakably test-only.
+          TEST_DATABASE_URL: postgresql://test:test@127.0.0.1:5432/techsara_test
+        run: python -m pytest tests -q
+
+  sync-worker:
+    name: "🧪 sync-worker"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: sync-worker/requirements-dev.txt
+      - run: python -m pip install -q -r sync-worker/requirements-dev.txt
+      - working-directory: sync-worker
+        run: python -m pytest tests -q
+
+  frontend:
+    name: "🧪 frontend"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - working-directory: frontend
+        run: npm ci --no-audit --no-fund
+      - name: Unit tests
+        working-directory: frontend
+        run: npm test
+      - name: Type check
+        working-directory: frontend
+        run: npx tsc --noEmit
+      - name: Production build
+        working-directory: frontend
+        run: npm run build
+
+  # A single required check to protect main with, instead of six. The name is
+  # load-bearing: branch protection references it — do not rename.
+  ci-ok:
+    name: CI passed
+    if: always()
+    needs: [launcher, orchestrator, sync-worker, frontend]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail unless every suite succeeded
+        run: |
+          echo '${{ toJSON(needs) }}'
+          [ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" = "false" ]
+
+  deploy:
+    name: "🚀 Deploy (rolling, model-preserving)"
+    # Only main (or an explicit dispatch) deploys, and ONLY behind green
+    # tests: `needs` skips this job unless ci-ok succeeded, so a merge whose
+    # tests failed can never reach the box.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs: ci-ok
+    runs-on: [self-hosted, dgx-spark]
+    # Optional: add required reviewers to this environment in repo settings to
+    # turn every production deploy into an approval gate.
+    environment: production
+    # Never let two deploys touch the same box, whatever branch they came
+    # from. Queue, do not cancel.
+    concurrency:
+      group: deploy-dgx-spark
+      cancel-in-progress: false
+    timeout-minutes: 45
+    steps:
+      # Check out the commit being deployed, so the deploy SCRIPT is the one
+      # that commit ships. Running it out of the production checkout is a
+      # bootstrap trap: that checkout is by definition still at the OLD commit.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Deploy and health-gate
+        env:
+          # The production checkout, NOT the runner workspace: that is where
+          # .env, .runtime/ and the model cache live.
+          TECHSARA_DEPLOY_ROOT: ${{ vars.TECHSARA_DEPLOY_ROOT || '/home/techsphere/Documents/project/personal-LLM-Chabot' }}
+          DEPLOY_REF: ${{ github.sha }}
+          # Repository variable DEPLOY_FULL (true/1/yes/on): recreate EVERY
+          # container on every merge, models included (+15-25 min: the main
+          # model reloads). The dispatch input asks for the same, once.
+          DEPLOY_FULL: ${{ vars.DEPLOY_FULL }}
+          # Repository variable DEPLOY_BRANCH: the branch the production
+          # checkout is left ON, fast-forwarded to the deployed commit. The
+          # deploy only ever FAST-FORWARDS it; "-" forces a detached HEAD.
+          DEPLOY_BRANCH: ${{ github.event.inputs.branch || vars.DEPLOY_BRANCH }}
+        run: |
+          set -euo pipefail
+          cd "$TECHSARA_DEPLOY_ROOT"
+          FLAGS=""
+          # Accept the spellings a human actually types into a repo variable.
+          case "$(printf '%s' "${DEPLOY_FULL:-}" | tr 'A-Z' 'a-z')" in
+            true|1|yes|on) WANT_FULL=1 ;;
+            *)             WANT_FULL=0 ;;
+          esac
+          if [ "${{ github.event.inputs.full }}" = "true" ] || [ "$WANT_FULL" = 1 ]; then
+            FLAGS="--full"
+            echo "full restart requested (inputs.full or vars.DEPLOY_FULL) - the models WILL reload"
+          fi
+          echo "DEPLOY_WAS_FULL=${FLAGS:+true}" >> "$GITHUB_ENV"
+          if [ "${DEPLOY_BRANCH:-}" = "-" ]; then DEPLOY_BRANCH=""; fi
+          export DEPLOY_BRANCH
+          echo "checkout will land on: ${DEPLOY_BRANCH:-<detached HEAD>}"
+          "$GITHUB_WORKSPACE/scripts/deploy.sh" --ref "$DEPLOY_REF" $FLAGS
+
+      - name: Report what is now serving
+        if: always()
+        env:
+          TECHSARA_DEPLOY_ROOT: ${{ vars.TECHSARA_DEPLOY_ROOT || '/home/techsphere/Documents/project/personal-LLM-Chabot' }}
+        run: |
+          cd "$TECHSARA_DEPLOY_ROOT" || exit 0
+          echo "### Deployed commit" >> "$GITHUB_STEP_SUMMARY"
+          git log -1 --pretty='- `%h` %s' >> "$GITHUB_STEP_SUMMARY"
+          ON="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+          if [ "$ON" = "HEAD" ]; then
+            echo "- checkout is on a **detached HEAD**" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- checkout is on branch **\`$ON\`**" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ "${DEPLOY_WAS_FULL:-}" = "true" ]; then
+            echo "- **every container was recreated** (\`--full\`: the models reloaded too)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- rolling deploy: only changed containers were recreated, and the **main model was probed and left running** (\`TECHSARA_PRESERVE_MAIN_MODEL\`)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "### Containers" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          docker ps --filter label=com.docker.compose.project=sf-local-ai \
+            --format 'table {{.Names}}\t{{.Status}}' >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          tail -40 .runtime/logs/deploy-*.log >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+
+  verify:
+    name: "🔍 Verify production"
+    needs: deploy
+    runs-on: [self-hosted, dgx-spark]
+    timeout-minutes: 10
+    steps:
+      - name: Prove the stack answers
+        run: |
+          set -u
+          pass=0; fail=0
+          check() { # name url expect [retries]
+            local name="$1" url="$2" expect="$3" tries="${4:-6}" code=""
+            for i in $(seq 1 "$tries"); do
+              code="$(curl -s -o /dev/null -w '%{http_code}' -m 10 "$url" 2>/dev/null || echo 000)"
+              [ "$code" = "$expect" ] && break
+              sleep 10
+            done
+            if [ "$code" = "$expect" ]; then
+              echo "| $name | ✅ $code |" >> "$GITHUB_STEP_SUMMARY"; pass=$((pass+1))
+            else
+              echo "| $name | ❌ $code (wanted $expect) |" >> "$GITHUB_STEP_SUMMARY"; fail=$((fail+1))
+            fi
+          }
+          echo "### Post-deploy verification" >> "$GITHUB_STEP_SUMMARY"
+          echo "| check | result |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| --- | --- |" >> "$GITHUB_STEP_SUMMARY"
+          check "frontend /login"        "http://127.0.0.1:3000/login"        200
+          check "orchestrator /health"   "http://127.0.0.1:8080/health"       200
+          check "main model /v1/models"  "http://127.0.0.1:8000/v1/models"    200 9
+          check "grafana /api/health"    "http://127.0.0.1:3300/api/health"   200
+          check "prometheus /-/healthy"  "http://127.0.0.1:9090/-/healthy"    200
+          vllm_status="$(docker ps --filter name=sf-local-ai-vllm-1 --format '{{.Status}}' || echo '?')"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- main model container: \`${vllm_status}\` — a routine deploy must NOT have reset this clock" >> "$GITHUB_STEP_SUMMARY"
+          [ "$fail" -eq 0 ]
