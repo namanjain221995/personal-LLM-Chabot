@@ -147,12 +147,22 @@ export function breakdownTotal(
 }
 
 /* -------------------------------------------------------------------------
- * "Compact now" — what the button may claim before it is pressed.
+ * The circular compact control — what it may claim before it is pressed.
  *
- * The control used to look equally actionable whether or not anything could
- * be folded, and said nothing lasting once it had run. The counts below come
- * from the server (the summary endpoint, and the compact response itself), so
- * the label can only ever promise what the button will actually do.
+ * The ring USED to open a 280px popover listing "Messages and context",
+ * "Reserved for reply (held back)" and "5,235 / 991,296", above a separate
+ * "Compact now" button. That surface is gone (owner request 2026-09-02): the
+ * ring itself is now the control, and the only thing it ever says is a
+ * percentage and what a click will do.
+ *
+ * The numbers behind it are NOT gone — `buildBreakdown`, `breakdownTotal` and
+ * `MeterView.breakdown` above are untouched and still tested, because the
+ * arithmetic that produces `fraction` is the same arithmetic and deleting it
+ * would make the ring unverifiable. They are simply never rendered.
+ *
+ * Every word and every inert/live decision lives here rather than in the
+ * component, so the wording is asserted in node instead of scraped out of a
+ * rendered DOM.
  * ---------------------------------------------------------------------- */
 
 /** The server's answer to "what would a compaction fold right now?". */
@@ -168,7 +178,7 @@ export interface FoldableCounts {
  *
  * Returns null for anything it cannot trust (missing fields, an older
  * orchestrator, a mock response, garbage). Null means UNKNOWN, and unknown
- * deliberately keeps the button enabled: a server that cannot answer must not
+ * deliberately keeps the control live: a server that cannot answer must not
  * be able to disable a control that still works.
  */
 export function readFoldableCounts(body: unknown): FoldableCounts | null {
@@ -185,68 +195,100 @@ export function readFoldableCounts(body: unknown): FoldableCounts | null {
   };
 }
 
-export interface CompactPlanInput {
+export interface MeterTooltipInput {
+  /** Whole percent, already clamped by `meterPercent`. */
+  percent: number;
   /** Turns that would be folded now; null when the server has not said. */
   foldable: number | null;
-  /** Turns the last successful compaction folded, this session. */
-  lastFolded?: number | null;
   /** A compaction request is in flight. */
   compacting?: boolean;
   /** The host already forbids it — no chat open, or a stream is running. */
   blocked?: boolean;
 }
 
-export interface CompactPlan {
-  label: string;
-  disabled: boolean;
-  /** The line under the button: what it will do, or why it cannot. */
-  hint: string | null;
-  /** Lasting record of the last compaction; null until one succeeds. */
-  folded: string | null;
-  /** Whether to offer the way back into the existing SummaryPanel. */
-  showSummaryLink: boolean;
-  summaryLabel: string;
+export interface MeterTooltip {
+  /** Always shown while the tooltip is open. Percentage only — never tokens. */
+  heading: string;
+  /** What a click will do, or why it will not. Null when there is nothing
+      honest to say (the host vetoed it and did not say why). */
+  action: string | null;
+  /**
+   * Activating the control would do nothing.
+   *
+   * Deliberately NOT the `disabled` attribute: a disabled button is skipped by
+   * the keyboard and stops firing the hover/focus events this tooltip is built
+   * on, so the one state that most needs explaining would become the one state
+   * that cannot explain itself. The component renders `aria-disabled` and
+   * returns early instead — the control stays reachable and keeps talking.
+   */
+  inert: boolean;
+  /**
+   * The button's accessible name.
+   *
+   * This is the ONE place the percentage is allowed to exist while the tooltip
+   * is closed: a screen reader has no hover, so hiding the number from it
+   * would be hiding it from the only users who cannot glance at the ring.
+   */
+  ariaLabel: string;
 }
 
-/** Why the button is dead when there is genuinely nothing to fold. */
-export const NOTHING_TO_COMPACT =
-  'Nothing to compact yet — earlier turns are folded automatically as the window fills.';
-
-/** "1 earlier message" / "12 earlier messages". */
-export function earlierMessages(count: number): string {
-  return `${count} earlier message${count === 1 ? '' : 's'}`;
-}
+/** Why activation does nothing when the server says there is nothing older. */
+export const NOTHING_TO_COMPACT = 'Nothing to compact yet.';
+/** What activation will do when a fold is genuinely available. */
+export const CLICK_TO_COMPACT = 'Click to compact now.';
+/** While a compaction is in flight. */
+export const COMPACTING_NOW = 'Compacting…';
 
 /**
- * Everything the popover renders about compaction, decided here so it is
- * testable in node and the component stays a shell.
+ * Everything the ring's tooltip says, and whether pressing it does anything.
+ *
+ * Note what is deliberately absent: any "N% remaining until auto-compact"
+ * line. The reference design has one, but the browser does not know the
+ * server's background (0.70) or hard (0.80) compaction thresholds — they live
+ * in the orchestrator's settings and are not sent to the client. Deriving
+ * `100 - percent` and labelling it "until auto-compact" would be a number
+ * that looks authoritative and is simply wrong, so this says only what it can
+ * actually measure.
  */
-export function compactPlan({
+export function meterTooltip({
+  percent,
   foldable,
-  lastFolded = null,
   compacting = false,
   blocked = false,
-}: CompactPlanInput): CompactPlan {
+}: MeterTooltipInput): MeterTooltip {
+  const heading = `${percent}% context used`;
   const known = typeof foldable === 'number' && Number.isFinite(foldable);
-  const count = known ? Math.max(0, Math.floor(foldable as number)) : null;
-  const nothing = count === 0;
+  const nothing = known && Math.max(0, Math.floor(foldable as number)) === 0;
 
-  const folded =
-    typeof lastFolded === 'number' && lastFolded > 0
-      ? `Compacted ${earlierMessages(Math.floor(lastFolded))}`
-      : null;
-
+  // Order matters: an in-flight compaction outranks everything, and the
+  // host's veto outranks a count that may be about to change.
+  if (compacting) {
+    return {
+      heading,
+      action: COMPACTING_NOW,
+      inert: true,
+      ariaLabel: `${heading}. ${COMPACTING_NOW}`,
+    };
+  }
+  if (blocked) {
+    // The component is not told WHY the host vetoed it, so it claims nothing.
+    return { heading, action: null, inert: true, ariaLabel: `${heading}.` };
+  }
+  if (nothing) {
+    return {
+      heading,
+      action: NOTHING_TO_COMPACT,
+      inert: true,
+      ariaLabel: `${heading}. ${NOTHING_TO_COMPACT}`,
+    };
+  }
+  // Includes the UNKNOWN count: null is not zero, and treating it as zero
+  // would disable a control that still works against a server that simply
+  // could not answer.
   return {
-    label: compacting ? 'Compacting…' : 'Compact now',
-    disabled: blocked || compacting || nothing,
-    hint: nothing
-      ? NOTHING_TO_COMPACT
-      : count !== null
-        ? `Folds ${earlierMessages(count)} into a summary.`
-        : // Unknown: promise nothing rather than guess, and stay clickable.
-          null,
-    folded,
-    showSummaryLink: folded !== null,
-    summaryLabel: 'See what was kept',
+    heading,
+    action: CLICK_TO_COMPACT,
+    inert: false,
+    ariaLabel: `${heading}. Compact conversation.`,
   };
 }

@@ -198,7 +198,6 @@ export function ChatApp() {
    */
   const [foldableTurns, setFoldableTurns] = useState<number | null>(null);
   /** Turns the last successful compaction folded — a lasting popover line. */
-  const [lastFoldedTurns, setLastFoldedTurns] = useState<number | null>(null);
   const [summaryOpen, setSummaryOpen] = useState(false);
   const draftTimer = useRef<number | null>(null);
   /** Salesforce starter-card suggestions for the OPEN chat (server-filtered). */
@@ -562,8 +561,8 @@ export function ChatApp() {
   /**
    * Ask the server what a compaction would fold right now.
    *
-   * Called only when the meter popover OPENS and after a compaction — never
-   * per keystroke. Any failure is treated as "unknown" rather than "nothing":
+   * Called only when the meter's tooltip OPENS (hover or focus) and after a
+   * compaction — never per keystroke. Any failure is "unknown", not "nothing":
    * an unreachable orchestrator must not disable a control that still works.
    */
   const refreshFoldable = useCallback(async () => {
@@ -587,7 +586,7 @@ export function ChatApp() {
     }
   }, []);
 
-  /** The meter popover opened or closed; only opening costs a request. */
+  /** The meter tooltip opened or closed; only opening costs a request. */
   const handleMeterOpenChange = useCallback(
     (open: boolean) => {
       if (open) void refreshFoldable();
@@ -596,11 +595,11 @@ export function ChatApp() {
   );
 
   /**
-   * "Compact now" from the meter popover.
+   * Compact, from the context ring in the composer.
    *
    * Two things this deliberately does NOT do any more:
    *
-   * - It does not touch the context meter. The ring used to be forced to zero
+   * - It does not touch the context ring. It used to be forced to zero
    *   the instant this returned, on the assumption that the next request had
    *   to be smaller. It does not have to be, and measurably often is not — so
    *   the reading stayed a fiction until the following reply replaced it with
@@ -631,12 +630,11 @@ export function ChatApp() {
         // result belongs to the conversation that asked for it.
         if (activeIdRef.current !== id) return;
         setFoldableTurns(run.foldableTurns);
+        // The toast is now the whole report. The popover's lasting
+        // "Compacted N earlier messages" line went with the popover; the way
+        // into the SummaryPanel is still on the compaction notice in the
+        // transcript (MessageRow's onShowSummary).
         toast(run.outcome.message, run.outcome.tone);
-        // The lasting popover line, and the way into the summary, appear only
-        // for a compaction whose summary was actually seen.
-        setLastFoldedTurns(
-          run.outcome.kind === 'compacted' ? run.outcome.foldedTurns : null,
-        );
       } finally {
         setCompacting(false);
       }
@@ -1337,7 +1335,6 @@ export function ChatApp() {
     activeIdRef.current = null;
     setMessages([]);
     setFoldableTurns(null);
-    setLastFoldedTurns(null);
     setUnreachable(false);
     setStreaming(false);
     setPrefs(DEFAULT_PREFS);
@@ -1354,9 +1351,8 @@ export function ChatApp() {
       setPrefs(loadPrefs(window.localStorage, id));
       setUnreachable(false);
       setAtBottom(true);
-      // Both belong to the chat being left, not the one being opened.
+      // Belongs to the chat being left, not the one being opened.
       setFoldableTurns(null);
-      setLastFoldedTurns(null);
       setUrlConversation(id);
 
       const live = getLiveStream(id);
@@ -1900,9 +1896,7 @@ export function ChatApp() {
               onCompactNow={compactNow}
               compactDisabled={!activeId || streaming}
               foldableTurns={foldableTurns}
-              lastFoldedTurns={lastFoldedTurns}
               onOpenChange={handleMeterOpenChange}
-              onSeeSummary={() => setSummaryOpen(true)}
             />
           }
           prefs={prefs}

@@ -6,8 +6,9 @@ import {
   PULSE_AT,
   WARN_AT,
   breakdownTotal,
-  compactPlan,
-  earlierMessages,
+  CLICK_TO_COMPACT,
+  COMPACTING_NOW,
+  meterTooltip,
   estimateDraftTokens,
   latestUsage,
   meterColor,
@@ -234,84 +235,101 @@ describe('readFoldableCounts — trusting only what the server actually said', (
   });
 });
 
-describe('compactPlan — the button may only promise what it will do', () => {
-  it('goes dead WITH A REASON when nothing is foldable', () => {
-    const plan = compactPlan({ foldable: 0 });
-    expect(plan.disabled).toBe(true);
-    expect(plan.hint).toBe(NOTHING_TO_COMPACT);
-    expect(plan.hint).toContain('Nothing to compact yet');
-    expect(plan.hint).toContain('folded automatically as the window fills');
+describe('meterTooltip — the ring may only promise what a click will do', () => {
+  // Revised from the `compactPlan` block that described the removed popover.
+  // The decisions it pinned are unchanged and carried forward here; only the
+  // surface they drive is different (a tooltip on a ring, not a button in a
+  // dialog), so `label`/`folded`/`showSummaryLink` have no successor.
+
+  it('always leads with the percentage, and never with tokens', () => {
+    const tip = meterTooltip({ percent: 75, foldable: 12 });
+    expect(tip.heading).toBe('75% context used');
+    expect(tip.heading).not.toMatch(/\d{3,}/); // no 5,235 / 8,192 / 991,296
+    expect(tip.action).not.toMatch(/\d{3,}/);
   });
 
-  it('says how much it will fold when there is something', () => {
-    const plan = compactPlan({ foldable: 12 });
-    expect(plan.disabled).toBe(false);
-    expect(plan.label).toBe('Compact now');
-    expect(plan.hint).toBe('Folds 12 earlier messages into a summary.');
+  it('goes inert WITH A REASON when nothing is foldable', () => {
+    const tip = meterTooltip({ percent: 1, foldable: 0 });
+    expect(tip.inert).toBe(true);
+    expect(tip.action).toBe(NOTHING_TO_COMPACT);
+    expect(tip.action).toBe('Nothing to compact yet.');
+    // The percentage is still offered — only the ACTION is unavailable.
+    expect(tip.heading).toBe('1% context used');
   });
 
-  it('does not say "1 messages"', () => {
-    expect(compactPlan({ foldable: 1 }).hint).toBe(
-      'Folds 1 earlier message into a summary.',
+  it('invites the click when there is something to fold', () => {
+    const tip = meterTooltip({ percent: 75, foldable: 12 });
+    expect(tip.inert).toBe(false);
+    expect(tip.action).toBe(CLICK_TO_COMPACT);
+    expect(tip.action).toBe('Click to compact now.');
+  });
+
+  it('stays LIVE while the count is unknown — null is not zero', () => {
+    // An unreachable orchestrator must not brick a control that still works.
+    const tip = meterTooltip({ percent: 40, foldable: null });
+    expect(tip.inert).toBe(false);
+    expect(tip.action).toBe(CLICK_TO_COMPACT);
+  });
+
+  it('is inert and says so while a compaction is in flight', () => {
+    const tip = meterTooltip({ percent: 75, foldable: 12, compacting: true });
+    expect(tip.inert).toBe(true);
+    expect(tip.action).toBe(COMPACTING_NOW);
+  });
+
+  it("honours the host's own veto (no chat open, or streaming)", () => {
+    expect(meterTooltip({ percent: 5, foldable: 12, blocked: true }).inert).toBe(true);
+    expect(meterTooltip({ percent: 5, foldable: null, blocked: true }).inert).toBe(true);
+  });
+
+  it('claims no reason for a veto it was not given one for', () => {
+    const tip = meterTooltip({ percent: 5, foldable: 12, blocked: true });
+    expect(tip.action).toBeNull();
+    expect(tip.heading).toBe('5% context used');
+  });
+
+  it('lets an in-flight compaction outrank every other state', () => {
+    const tip = meterTooltip({
+      percent: 90,
+      foldable: 0,
+      compacting: true,
+      blocked: true,
+    });
+    expect(tip.action).toBe(COMPACTING_NOW);
+  });
+
+  it('carries the percentage in the accessible name, where hover cannot help', () => {
+    // The number is hidden from SIGHT until hover/focus; hiding it from a
+    // screen reader too would hide it from the users who cannot glance.
+    expect(meterTooltip({ percent: 75, foldable: 12 }).ariaLabel).toBe(
+      '75% context used. Compact conversation.',
     );
-    expect(earlierMessages(1)).toBe('1 earlier message');
-    expect(earlierMessages(2)).toBe('2 earlier messages');
-  });
-
-  it('stays enabled and silent while the count is UNKNOWN', () => {
-    // Requirement 3: an unreachable orchestrator must not brick the control.
-    const plan = compactPlan({ foldable: null });
-    expect(plan.disabled).toBe(false);
-    expect(plan.hint).toBeNull();
-    expect(plan.label).toBe('Compact now');
-  });
-
-  it('is disabled while a compaction is in flight, spinner or not', () => {
-    const plan = compactPlan({ foldable: 12, compacting: true });
-    expect(plan.disabled).toBe(true);
-    expect(plan.label).toBe('Compacting…');
-  });
-
-  it('honours the host\'s own veto (no chat open, or streaming)', () => {
-    expect(compactPlan({ foldable: 12, blocked: true }).disabled).toBe(true);
-    expect(compactPlan({ foldable: null, blocked: true }).disabled).toBe(true);
-  });
-
-  it('says nothing lasting until a compaction has actually succeeded', () => {
-    const plan = compactPlan({ foldable: 12 });
-    expect(plan.folded).toBeNull();
-    expect(plan.showSummaryLink).toBe(false);
-  });
-
-  it('keeps a lasting line after a compaction, with the way back in', () => {
-    // A toast disappears; this is what the popover still says afterwards.
-    const plan = compactPlan({ foldable: 0, lastFolded: 12 });
-    expect(plan.folded).toBe('Compacted 12 earlier messages');
-    expect(plan.showSummaryLink).toBe(true);
-    expect(plan.summaryLabel).toBe('See what was kept');
-    // And the button beneath it is now honestly dead.
-    expect(plan.disabled).toBe(true);
-    expect(plan.hint).toBe(NOTHING_TO_COMPACT);
-  });
-
-  it('singularises the lasting line too', () => {
-    expect(compactPlan({ foldable: 0, lastFolded: 1 }).folded).toBe(
-      'Compacted 1 earlier message',
+    expect(meterTooltip({ percent: 1, foldable: 0 }).ariaLabel).toBe(
+      '1% context used. Nothing to compact yet.',
     );
+    expect(
+      meterTooltip({ percent: 5, foldable: 12, blocked: true }).ariaLabel,
+    ).toBe('5% context used.');
   });
 
-  it('shows no lasting line for a compaction that folded nothing', () => {
-    expect(compactPlan({ foldable: 0, lastFolded: 0 }).folded).toBeNull();
+  it('never derives a "remaining until auto-compact" figure', () => {
+    // The reference design has that line; the browser is not told the
+    // server's 0.70/0.80 thresholds, so `100 - percent` would be
+    // authoritative-looking and wrong.
+    for (const percent of [0, 25, 75, 100]) {
+      const tip = meterTooltip({ percent, foldable: 12 });
+      const words = `${tip.heading} ${tip.action ?? ''}`.toLowerCase();
+      expect(words).not.toContain('remaining');
+      expect(words).not.toContain('auto');
+    }
   });
 
   it('the 28-message conversation from the live check, before and after', () => {
-    // Server returned folded_turns 27 / covers_through 27 on 28 messages, and
-    // "nothing older to summarize" on the second press.
-    const before = compactPlan({ foldable: 27 });
-    expect(before.disabled).toBe(false);
-    expect(before.hint).toBe('Folds 27 earlier messages into a summary.');
-    const after = compactPlan({ foldable: 0, lastFolded: 27 });
-    expect(after.disabled).toBe(true);
-    expect(after.folded).toBe('Compacted 27 earlier messages');
+    const before = meterTooltip({ percent: 62, foldable: 27 });
+    expect(before.inert).toBe(false);
+    expect(before.action).toBe(CLICK_TO_COMPACT);
+    const after = meterTooltip({ percent: 62, foldable: 0 });
+    expect(after.inert).toBe(true);
+    expect(after.action).toBe(NOTHING_TO_COMPACT);
   });
 });
