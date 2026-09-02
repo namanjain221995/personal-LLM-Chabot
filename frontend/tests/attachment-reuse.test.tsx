@@ -421,24 +421,27 @@ describe('P4A · Attach again', () => {
 
   it('P4A-03 — Composer validation still runs on the reused file', async () => {
     renderApp();
-    // 30 MB is over the 25 MB document cap; reuse must NOT smuggle it past
-    // the check a picked file faces.
-    const big = new File([new Uint8Array(26 * 1024 * 1024)], 'huge.pdf', {
-      type: 'application/pdf',
+    // The reused file must face the SAME composer checks a picked file
+    // does. Since 2026-09-02 every file TYPE is accepted (archives and
+    // binaries take the document rail), so the surviving gate to prove is
+    // the image size cap — 11 real megabytes, the one oversized case cheap
+    // enough for a test suite to allocate.
+    const bigImage = new File([new Uint8Array(11 * 1024 * 1024)], 'huge.png', {
+      type: 'image/png',
     });
     rememberAttachmentFiles('seed', []);
     attachAndSend(csv());
     await waitFor(() => expect(uploadCalls).toBe(1));
 
-    // Replace the held bytes with the oversized file, then reuse it.
+    // Replace the held bytes with the oversized image, then reuse it.
     const id = stored.find((m) => m.role === 'user')!.id;
     rememberAttachmentFiles(id, [
-      { name: 'huge.pdf', mime: 'application/pdf', blob: big },
+      { name: 'huge.png', mime: 'image/png', blob: bigImage },
     ]);
     fireEvent.click(
       await screen.findByRole('button', { name: /Attach .* again/ }),
     );
-    expect(await screen.findByText(/the limit is 25 MB/i)).toBeTruthy();
+    expect(await screen.findByText(/the limit is 10 MB/i)).toBeTruthy();
     expect(composerChips().length).toBe(0);
   });
 

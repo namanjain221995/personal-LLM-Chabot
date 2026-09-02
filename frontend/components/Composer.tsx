@@ -115,10 +115,16 @@ export interface Attachment {
   file?: File;
 }
 
-const MAX_PDF_BYTES = 25 * 1024 * 1024;
+// 2026-09-02: 512 MB, ChatGPT-class. Small documents still ride inline as
+// base64 (one FileReader pass, zero extra round trips); anything above
+// INLINE_DOC_BYTES keeps its File handle and STREAMS to /api/upload on send,
+// exactly like a dataset — reading half a gigabyte with readAsDataURL would
+// hold ~700 MB of string in the tab before the first byte left it.
+const MAX_PDF_BYTES = 512 * 1024 * 1024;
+const INLINE_DOC_BYTES = 25 * 1024 * 1024;
 // Datasets are streamed to their own endpoint, not base64'd into the chat
 // body, so they can be far larger than an image or PDF.
-const MAX_DATASET_BYTES = 200 * 1024 * 1024;
+const MAX_DATASET_BYTES = 512 * 1024 * 1024;
 const DATASET_SUFFIXES = [
   '.zip', '.tar', '.tar.gz', '.tgz', '.csv', '.tsv', '.parquet',
   '.xlsx', '.json', '.jsonl', '.ndjson',
@@ -299,35 +305,50 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
         lower.endsWith('.docx') ||
         lower.endsWith('.txt') ||
         lower.endsWith('.md');
-      const isDataset = !isImage && !isPdf && isDatasetName(file.name);
-      if (!isImage && !isPdf && !isDataset) {
-        const ext = file.name.split('.').pop()?.toUpperCase() ?? 'that type';
-        toast(
-          `${file.name || 'That file'} is ${ext} — attach an image, a document (.pdf, .docx, .txt), or a dataset (.zip, .csv, .xlsx, .parquet).`,
-          'error',
-        );
-        return;
-      }
-      const limit = isDataset
-        ? MAX_DATASET_BYTES
-        : isPdf
-          ? MAX_PDF_BYTES
-          : MAX_IMAGE_BYTES;
+      // 2026-09-02: archives open on the DOCUMENT rail — the server unzips
+      // them (same hardened extractor the dataset rail trusts), reads every
+      // text-bearing member, attaches images found inside, and lists the
+      // rest — ChatGPT-style. .docx/.xlsx ARE zip containers; the extension
+      // has already claimed those for their own paths above.
+      const isArchive =
+        !isImage && !isPdf && /\.(zip|tar|tar\.gz|tgz)$/.test(lower);
+      const isDataset =
+        !isImage && !isPdf && !isArchive && isDatasetName(file.name);
+      // Anything that is none of the above — code, logs, unknown binaries —
+      // is ALSO a document now ("upload anything"): the server reads text
+      // honestly and names binaries instead of rejecting them at the door.
+      const isOtherDoc = !isImage && !isPdf && !isArchive && !isDataset;
+      const limit = isImage ? MAX_IMAGE_BYTES : isDataset ? MAX_DATASET_BYTES : MAX_PDF_BYTES;
       if (file.size > limit) {
         const mb = (file.size / (1024 * 1024)).toFixed(1);
-        const cap = isDataset ? '200 MB' : isPdf ? '25 MB' : '10 MB';
+        const cap = isImage ? '10 MB' : '512 MB';
         toast(
           `${file.name || 'That file'} is ${mb} MB — the limit is ${cap}.`,
           'error',
         );
         return;
       }
+      if (isArchive || isOtherDoc) {
+        // Streamed like a big document: File handle only, referenced on send.
+        setAttachments([
+          { name: file.name, kind: 'pdf', dataUrl: '', base64: '', file },
+        ]);
+        return;
+      }
       if (isDataset) {
-        // Never read a 200 MB archive into memory: keep the File handle and
+        // Never read a 512 MB archive into memory: keep the File handle and
         // stream it to /api/upload when the message is sent. A dataset (like
         // a PDF) stands alone — it replaces whatever was attached.
         setAttachments([
           { name: file.name, kind: 'dataset', dataUrl: '', base64: '', file },
+        ]);
+        return;
+      }
+      if (isPdf && file.size > INLINE_DOC_BYTES) {
+        // A BIG document takes the dataset's road: File handle only, no
+        // base64, streamed on send and referenced in the chat request.
+        setAttachments([
+          { name: file.name, kind: 'pdf', dataUrl: '', base64: '', file },
         ]);
         return;
       }

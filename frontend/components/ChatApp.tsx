@@ -52,6 +52,7 @@ import {
   resolveAttachmentAsync,
   uploadRefFor,
 } from '@/lib/attachments';
+import { uploadDocumentFile } from '@/lib/uploadDocument';
 import {
   branchForAppend,
   branchForVersion,
@@ -730,6 +731,10 @@ export function ChatApp() {
       const first = attachments[0] ?? null;
       const isPdf = first?.kind === 'pdf';
       const isDataset = first?.kind === 'dataset';
+      // 2026-09-02: a document above the inline cap carries a File handle and
+      // no base64 — it streams to /api/upload on send (chunked past the
+      // Cloudflare 100 MB edge cap) and the request sends a REFERENCE.
+      const isStreamedDoc = isPdf && !!first?.file && !first?.base64;
       const images = attachments.filter((a) => a.kind === 'image');
       let conversationId = activeId;
       if (!conversationId) {
@@ -831,7 +836,7 @@ export function ChatApp() {
       setUnreachable(false);
       // A dataset has to be uploaded before a stream can exist, so say that
       // instead of claiming the model is already running (see datasetUpload).
-      if (isDataset && first?.file) {
+      if ((isDataset || isStreamedDoc) && first?.file) {
         setDatasetUpload({
           conversationId,
           messageId: userMessage.id,
@@ -844,30 +849,43 @@ export function ChatApp() {
       // about to be arguing with a thread that has changed underneath it.
       setEditingMessageId(null);
 
-      if (isDataset && first?.file) {
-        // Datasets stream to their own endpoint and are then referenced by the
-        // conversation, so the chat request itself stays small.
+      if ((isDataset || isStreamedDoc) && first?.file) {
+        // Datasets and big documents stream to their own endpoint and are
+        // then referenced by the conversation, so the chat request stays
+        // small whatever the file weighed.
         void (async () => {
+          let docRef: { upload_id: string; name: string } | null = null;
           try {
-            const form = new FormData();
-            form.append('file', first.file as File);
-            form.append('conversation_id', conversationId);
-            const res = await fetch('/api/upload', { method: 'POST', body: form });
-            const body = (await res.json()) as {
-              detail?: string;
-              files?: number;
-              upload_id?: string;
-            };
-            if (!res.ok) throw new Error(body.detail ?? 'upload failed');
+            let uploadedId: string | undefined;
+            if (isStreamedDoc) {
+              docRef = await uploadDocumentFile(
+                first.file as File,
+                conversationId,
+              );
+              uploadedId = docRef.upload_id;
+              toast(`Uploaded ${first.name}.`);
+            } else {
+              const form = new FormData();
+              form.append('file', first.file as File);
+              form.append('conversation_id', conversationId);
+              const res = await fetch('/api/upload', { method: 'POST', body: form });
+              const body = (await res.json()) as {
+                detail?: string;
+                files?: number;
+                upload_id?: string;
+              };
+              if (!res.ok) throw new Error(body.detail ?? 'upload failed');
+              uploadedId = body.upload_id;
+              toast(
+                `Profiled ${body.files ?? 0} file${body.files === 1 ? '' : 's'} from ${first.name}.`,
+              );
+            }
             // Link the turn to the server's durable uploads row, so the
             // persisted message names the exact attachment it was asked about.
-            if (body.upload_id && userMessage.meta?.attachments?.[0]) {
-              userMessage.meta.attachments[0].id = body.upload_id;
+            if (uploadedId && userMessage.meta?.attachments?.[0]) {
+              userMessage.meta.attachments[0].id = uploadedId;
               persist(conversationId, turns);
             }
-            toast(
-              `Profiled ${body.files ?? 0} file${body.files === 1 ? '' : 's'} from ${first.name}.`,
-            );
             // H-01: the upload is done; the stream opened below owns the
             // "busy" story from here.
             setDatasetUpload(null);
@@ -907,7 +925,10 @@ export function ChatApp() {
             // proxy give a wordless dataset send a question to ask, instead of
             // rejecting it as an empty request (which is what produced a 400
             // immediately after a perfectly successful upload).
-            dataset: true,
+            ...(isDataset ? { dataset: true } : {}),
+            ...(docRef
+              ? { pdfUploads: [docRef], pdfName: first?.name ?? null }
+              : {}),
           });
           disarmDeepResearch();
         })();
