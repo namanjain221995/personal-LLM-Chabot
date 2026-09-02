@@ -75,9 +75,17 @@ jobs:
           PYTHONDONTWRITEBYTECODE: "1"
         # TECHSARA_MODEL_CACHE must not leak in from the environment: it changes
         # the cache path the tests assert on.
+        #
+        # No `-v`, and NO pipe. This used to be `... -v 2>&1 | tail -30`, and a
+        # pipeline reports the LAST command's status: tail's. Runs 33583764792,
+        # 33586072369, 33587032363 and 33641066132 each logged "FAILED
+        # (failures=6)", this job reported success, ci-ok passed and the DGX
+        # deployed. tail also kept only 30 of ~90 traceback lines, so the log
+        # named 2 of the 6 failures. Unpiped, a failure is the step's exit code
+        # and every traceback survives; without -v a green run is ~60 lines.
         run: |
           env -u TECHSARA_MODEL_CACHE PYTHONPATH=launcher \
-            python -m unittest discover -s launcher/tests -v 2>&1 | tail -30
+            python -m unittest discover -s launcher/tests
 
   orchestrator:
     name: "🧪 orchestrator"
