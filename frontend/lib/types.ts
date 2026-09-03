@@ -266,6 +266,13 @@ export interface Meta {
   /** The searches behind this answer, kept so history replays the panel. */
   research?: Research;
   /**
+   * 2026-09-03: sites queued for a background crawl behind a shared link —
+   * the page was answered from now; the rest of the site follows quietly.
+   */
+  site_crawl?: SiteCrawlNotice[];
+  /** Deep Research (2026-09-03): what the run established and why it stopped. */
+  research_run?: ResearchRun;
+  /**
    * The question had more than one honest reading, so the answer is a question
    * back. Answering it RESUMES the original request server-side rather than
    * sending a rewritten question as a new message — see lib/clarification.ts.
@@ -364,6 +371,71 @@ export interface Research {
   elapsedMs?: number;
   /** True while searches are still arriving. */
   active?: boolean;
+}
+
+/** A site the server queued for a background crawl (meta.site_crawl). */
+export interface SiteCrawlNotice {
+  host: string;
+  root_url: string;
+  job_id?: number;
+  status: string;
+}
+
+/** What Deep Research resolved for one subquestion. */
+export interface ResearchResolution {
+  subquestion: string;
+  /** current | historical | superseded | conflicting | unknown */
+  status: string;
+  value: string;
+  as_of: string;
+  support: number[];
+  independent: number;
+  primary: boolean;
+  superseded: { value: string; as_of: string; sources: number[] }[];
+  conflicts: { value: string; as_of: string; sources: number[] }[];
+  confidence: number;
+}
+
+/** One round of a research run, as the server counted it. */
+export interface ResearchRound {
+  iteration: number;
+  label: string;
+  queries: string[];
+  attempted: number;
+  fetched: number;
+  new_sources: number;
+  duplicates: number;
+  links_followed: number;
+  new_claims: number;
+  gain: number;
+  elapsed_s: number;
+}
+
+/** meta.research_run — the Deep Research engine's account of itself. */
+export interface ResearchRun {
+  research_id: string;
+  iterations: number;
+  queries: string[];
+  subquestions: string[];
+  sources_found: number;
+  sources_cited: number;
+  missing: string[];
+  contradictions: string[];
+  elapsed_s: number;
+  invalid_citations_removed: number;
+  /** Why the loop ended: sufficient · no_information_gain · … (2026-09-03). */
+  stop_reason?: string;
+  today?: string;
+  temporal?: string;
+  rounds?: ResearchRound[];
+  links_followed?: number;
+  primary_sources?: number[];
+  duplicates_dropped?: number;
+  stale_downranked?: number;
+  claims?: number;
+  resolutions?: ResearchResolution[];
+  confidence?: number;
+  verification_rounds?: number;
 }
 
 export type MessageStatus = 'streaming' | 'done' | 'stopped' | 'error';

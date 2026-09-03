@@ -13,21 +13,26 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Awaitable, Callable, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
-from . import DIAGRAM_INSTRUCTION, recent_turns
+from . import DIAGRAM_INSTRUCTION, conversation_turns, recent_turns
 from .. import llm
 from ..config import settings
 from .. import db, web_index
-from ..core import extract, net
+from ..core import extract, net, provenance
+from ..freshness import Verdict
 from ..search.base import SearchResult, SearchUnavailableError, get_provider
 
 Emit = Callable[[str, dict], Awaitable[None]]
+
+log = logging.getLogger(__name__)
 
 _MAX_QUERIES = 3
 # Searches per request, by level. High is meant to be the one you reach for on
@@ -143,10 +148,57 @@ class _Source:
     title: str
     url: str
     text: str
+    # --- provenance (2026-09-03). Every field defaults, so the four-field
+    # constructor the tests and the agent use is unchanged. ---
+    #: Links the page pointed at (harvested in the same parse), so a caller
+    #: that reads the page can follow them without a second fetch.
+    links: List[str] = field(default_factory=list)
+    published_at: Optional[datetime] = None
+    modified_at: Optional[datetime] = None
+    fetched_at: Optional[datetime] = None
+    content_hash: str = ""
+    #: core/provenance.source_type — official / docs / news / community …
+    source_type: str = ""
+    #: web_memory's 0-100 authority prior for the domain.
+    authority: int = 0
+    #: True when served from the warm store rather than the network.
+    from_store: bool = False
 
     @property
     def domain(self) -> str:
         return urlparse(self.url).hostname or self.url
+
+
+def _call_extract(content_type: str, body: bytes, url: str, headers: Optional[dict]):
+    """extract_readable_and_links, with or without the headers argument.
+
+    Tests (and any operator's own extractor) may substitute a three-argument
+    callable; the real one takes the response headers so a page with no date
+    of its own can use Last-Modified. Passing what the callee accepts keeps
+    both working without a try/except that would mask real TypeErrors."""
+    fn = extract.extract_readable_and_links
+    code = getattr(fn, "__code__", None)
+    accepts_headers = bool(code) and (
+        code.co_argcount >= 4 or "headers" in code.co_varnames[: code.co_argcount + 4]
+    )
+    if accepts_headers:
+        return fn(content_type, body, url, headers)
+    return fn(content_type, body, url)
+
+
+def _provenance_of(ext: extract.Extracted, url: str, content_type: str, headers: Optional[dict]) -> dict:
+    """The metadata the store and the ranking layers want for one page."""
+    from ..web_memory import authority_of
+
+    kind = provenance.source_type(url, content_type, getattr(ext, "sitename", "") or "")
+    return {
+        "published_at": provenance.parse_date(getattr(ext, "published_at", None)),
+        "modified_at": provenance.parse_date(getattr(ext, "modified_at", None)),
+        "source_type": kind,
+        "authority": authority_of(url),
+        "etag": (headers or {}).get("etag", "") or "",
+        "last_modified": (headers or {}).get("last-modified", "") or "",
+    }
 
 
 # --------------------------------------------------------------------------
@@ -210,7 +262,14 @@ async def rewrite_queries(
         "Each query must look for something DIFFERENT — do not paraphrase the "
         "same search. Respond with ONLY a JSON array of strings, no prose."
     )
-    msgs = [{"role": "system", "content": system}, *recent_turns(history, 4),
+    # conversation_turns, NOT recent_turns. main.py pins the user's saved
+    # facts, the cross-chat recall block and the excerpts of pages/documents
+    # shared in this chat to `history` as system messages; recent_turns keeps
+    # them because the answer prompt needs them. Here they would be rewritten
+    # into search phrases and sent to SearXNG and the engines behind it — a
+    # private term sheet becoming a web query. Only what was said in this
+    # conversation is context for a query (security review 2026-09-03).
+    msgs = [{"role": "system", "content": system}, *conversation_turns(history, 4),
             {"role": "user", "content": message}]
     try:
         raw = await llm.router_chat_completion(msgs, temperature=0.0, max_tokens=200)
@@ -222,8 +281,18 @@ async def rewrite_queries(
     return (queries or [message])[:cap]
 
 
-async def should_search(message: str) -> bool:
-    """Auto-mode decision: heuristic first, then a cheap model yes/no."""
+async def should_search(message: str, history: Sequence[dict] = ()) -> bool:
+    """Auto-mode decision: heuristic first, then a cheap model yes/no.
+
+    `history` is optional: a couple of real turns let the yes/no read a
+    follow-up ("and is that still true?") that carries no signal on its own.
+    Only conversation turns go in, never the pinned system blocks (saved
+    facts, recall, shared-page and document excerpts) — the decision is about
+    what the user ASKED, and no prompt on the search path may carry private
+    context: this one is the model's view of the outbound question and sits
+    one refactor away from being logged or forwarded alongside the queries.
+    With no history the prompt is exactly the two messages it always was.
+    """
     if _FRESH_RE.search(message):
         return True
     try:
@@ -236,6 +305,7 @@ async def should_search(message: str) -> bool:
                         'information? Answer only "yes" or "no".'
                     ),
                 },
+                *conversation_turns(history, 2),
                 {"role": "user", "content": message},
             ],
             max_tokens=5,
@@ -377,34 +447,22 @@ async def _rerank_results(
     budget upstream and this function could only reorder what it was given.
     """
     keep = target if target > 0 else len(results)
-    if len(results) <= 2 or not settings.rerank_base_url:
+    if len(results) <= 2:
         return results[:keep]
+    # The shared, TEMPLATED client (app/rerank.py, ADR-0001 D4). Raw
+    # title+snippet pairs through /score measurably ranked a careers page
+    # above the passage naming the office holder; the model's own prompt
+    # format separates them by three orders of magnitude.
+    from .. import rerank
+
     try:
-        import httpx
-
-        from .rag import reranker_score_url
-
-        body = {
-            "model": settings.rerank_model,
-            "text_1": message,
-            "text_2": [
-                f"{r.title}\n{r.snippet}"[:1000] for r in results
-            ],
-        }
-        async with httpx.AsyncClient(timeout=settings.rerank_timeout) as client:
-            resp = await client.post(
-                reranker_score_url(settings.rerank_base_url), json=body
-            )
-            resp.raise_for_status()
-            payload = resp.json()
-        data = payload.get("data") or []
-        scores = {int(d.get("index", i)): float(d.get("score", 0.0)) for i, d in enumerate(data)}
-        if len(scores) != len(results):
-            return results[:keep]
-        order = sorted(range(len(results)), key=lambda i: scores.get(i, 0.0), reverse=True)
-        return [results[i] for i in order][:keep]
-    except Exception:  # noqa: BLE001
+        scores = await rerank.score(
+            message, [f"{r.title}\n{r.snippet}"[:1000] for r in results]
+        )
+    except rerank.RerankUnavailable:
         return results[:keep]
+    order = sorted(range(len(results)), key=lambda i: scores[i], reverse=True)
+    return [results[i] for i in order][:keep]
 
 
 
@@ -430,26 +488,50 @@ def _spawn(coro) -> None:
     task.add_done_callback(_done)
 
 
-def _page_ttl(message: str) -> int:
-    """How old a stored page may be and still count as fresh for this ask."""
+def _page_ttl(message: str, verdict: Optional[Verdict] = None) -> int:
+    """How old a stored page may be and still count as fresh for this ask.
+
+    With a freshness verdict (app.freshness — the classification every other
+    stage of the pipeline already runs, ADR-0001 D2/D6) the decision is the
+    verdict's: a VOLATILE one ("latest release", "current price", anything
+    REALTIME) gets the short TTL, everything else the long one. Re-matching
+    _FRESH_RE here disagreed with that verdict at the edges — "who is",
+    "score", a bare "2026" and "what is the" all trip the regex — so an
+    office-holder question (RECENT, its answer stable for months) threw away
+    a two-hour-old copy of the page that answered it and paid a network
+    fetch with a 3 s connect + 8 s read ceiling for the same text.
+
+    Without a verdict the regex fallback stands unchanged, so a caller that
+    has not classified the question (deep research's fetch path, the
+    crawler) gets exactly the TTL it always did.
+    """
+    if verdict is not None:
+        if verdict.volatile:
+            return settings.web_page_fresh_ttl_s
+        return settings.web_page_ttl_s
     if _FRESH_RE.search(message or ""):
         return settings.web_page_fresh_ttl_s
     return settings.web_page_ttl_s
 
 
-async def _stored_pages(results: List[SearchResult], message: str) -> dict:
+async def _stored_pages(
+    results: List[SearchResult], message: str, verdict: Optional[Verdict] = None
+) -> dict:
     """{url_key: stored page} for results whose stored copy is still fresh.
 
     This is the speed dividend of the V8 store: a warm hit skips a network
     fetch with a 3 s connect + 8 s read ceiling. Failures return {} — the
     store is an accelerator, never a gate.
+
+    `verdict`, when the caller has one, decides "fresh" (see _page_ttl);
+    without it the wording of `message` does, as it always has.
     """
     if not settings.web_memory_enabled:
         return {}
     try:
         keys = [_normalize_url(r.url) for r in results]
         rows = await db.run_in_thread(db.get_web_pages, keys)
-        ttl = _page_ttl(message)
+        ttl = _page_ttl(message, verdict)
         now = time.time()
         fresh: dict = {}
         for row in rows:
@@ -469,8 +551,15 @@ def _store_page(
     text: str,
     content_type: str,
     links: Optional[List[str]] = None,
+    meta: Optional[dict] = None,
+    user_id: Optional[int] = None,
+    conversation_id: str = "",
 ) -> None:
-    """Persist one fetched page (blocking; called via run_in_thread)."""
+    """Persist one fetched page (blocking; called via run_in_thread).
+
+    A page found by a search is origin 'search' (the default trust class);
+    who searched, and in which conversation, is recorded as its introducer
+    (V16) so every row in the shared corpus is attributable."""
     db.upsert_web_page(
         url_key=_normalize_url(r.url),
         url=r.url,
@@ -481,11 +570,20 @@ def _store_page(
         fetch_status=200 if text else 0,
         content_hash=hashlib.sha256((text or "").encode("utf-8")).hexdigest(),
         links=links or [],
+        origin="search",
+        introduced_by_user_id=user_id,
+        introduced_in_conversation_id=conversation_id or None,
+        **(meta or {}),
     )
 
 
 async def _fetch_source(
-    idx: int, r: SearchResult, stored: Optional[dict] = None
+    idx: int,
+    r: SearchResult,
+    stored: Optional[dict] = None,
+    *,
+    user_id: Optional[int] = None,
+    conversation_id: str = "",
 ) -> Optional[_Source]:
     # Warm path: a fresh stored copy of this exact URL answers without the
     # network. The FULL stored text is re-truncated to the prompt budget the
@@ -497,7 +595,18 @@ async def _fetch_source(
                 hit["text"], settings.search_source_char_budget
             )
             return _Source(
-                n=idx, title=hit["title"] or r.title, url=r.url, text=text
+                n=idx,
+                title=hit["title"] or r.title,
+                url=r.url,
+                text=text,
+                links=list(hit.get("links") or [])[:500],
+                published_at=hit.get("published_at"),
+                modified_at=hit.get("modified_at"),
+                fetched_at=hit.get("fetched_at"),
+                content_hash=hit.get("content_hash") or "",
+                source_type=hit.get("source_type") or provenance.source_type(r.url),
+                authority=int(hit.get("authority") or 0),
+                from_store=True,
             )
     try:
         fetched = await net.safe_fetch(
@@ -517,13 +626,17 @@ async def _fetch_source(
         # and the harvested links ride into the store so a later crawl or the
         # post-search expansion can walk from a page served fresh-from-store
         # (the review found that path silently linkless).
+        headers = getattr(fetched, "headers", None) or {}
         ext, page_links = await loop.run_in_executor(
             _EXTRACT_POOL,
-            extract.extract_readable_and_links,
+            _call_extract,
             fetched.content_type,
             fetched.body,
             fetched.url,
+            headers,
         )
+        meta = _provenance_of(ext, fetched.url, fetched.content_type, headers)
+        digest = hashlib.sha256((ext.text or "").encode("utf-8")).hexdigest()
         # Persist the FULL extracted text BEFORE the prompt truncation — the
         # store is the whole point (V8): the same URL next time costs a DB
         # read, and the vector index chunks from here. Fire-and-forget so the
@@ -532,30 +645,53 @@ async def _fetch_source(
             full_text, canon, ctype, title0 = ext.text, fetched.url, fetched.content_type, ext.title
             _spawn(
                 db.run_in_thread(
-                    _store_page, r, canon, title0, full_text, ctype, page_links
+                    _store_page, r, canon, title0, full_text, ctype, page_links, meta,
+                    user_id, conversation_id,
                 )
             )
         text = extract.truncate_chars(ext.text, settings.search_source_char_budget)
         if not text.strip():
             text = r.snippet
-        return _Source(n=idx, title=ext.title or r.title, url=r.url, text=text)
+        return _Source(
+            n=idx,
+            title=ext.title or r.title,
+            url=r.url,
+            text=text,
+            links=list(page_links or [])[:500],
+            published_at=meta["published_at"],
+            modified_at=meta["modified_at"],
+            fetched_at=datetime.now(timezone.utc),
+            content_hash=digest,
+            source_type=meta["source_type"],
+            authority=int(meta["authority"] or 0),
+        )
     except Exception:
         # Any failure (SSRF block, timeout, unsupported) → fall back to the
         # provider snippet so the source is still citable.
         if r.snippet.strip():
-            return _Source(n=idx, title=r.title, url=r.url, text=r.snippet)
+            return _Source(
+                n=idx, title=r.title, url=r.url, text=r.snippet,
+                source_type=provenance.source_type(r.url),
+            )
         return None
 
 
 async def _fetch_sources(
-    results: List[SearchResult], message: str = ""
+    results: List[SearchResult],
+    message: str = "",
+    *,
+    user_id: Optional[int] = None,
+    conversation_id: str = "",
+    verdict: Optional[Verdict] = None,
 ) -> List[_Source]:
-    stored = await _stored_pages(results, message)
+    stored = await _stored_pages(results, message, verdict=verdict)
     sem = asyncio.Semaphore(_FETCH_CONCURRENCY)
 
     async def guarded(i: int, r: SearchResult):
         async with sem:
-            return await _fetch_source(i + 1, r, stored)
+            return await _fetch_source(
+                i + 1, r, stored, user_id=user_id, conversation_id=conversation_id
+            )
 
     fetched = await asyncio.gather(*(guarded(i, r) for i, r in enumerate(results)))
     sources = [s for s in fetched if s is not None]
@@ -616,47 +752,73 @@ _MEMORY_HEADER_NOTE = (
 async def _memory_sources(
     message: str, sources: List[_Source], budget: int = 3
 ) -> List[_Source]:
-    """Chunks from previously read pages, appended as extra numbered sources.
+    """Stored passages that ANSWER the question, appended as dated sources.
 
     The web RAG never REPLACES live results — a cached paragraph about
     "latest release" is exactly how a bot confidently reports last month.
-    It adds recall the live results happen not to cover, each block dated so
-    the model can weigh it. Fresh-intent questions skip it entirely.
+    It adds what the live set happens not to cover, each block dated so the
+    model can weigh it.
+
+    Through the same pipeline as every other route (ADR-0001 D2): hybrid
+    candidates, the cross-encoder's answer probability, content-date
+    supersession for a live fact. Until 2026-09-03 this ranked by vector
+    distance alone and SKIPPED the store entirely for any "fresh-intent"
+    wording — "who is …" included — so Think answered from live results
+    only, at 15-19 s, while the store held the page that answered. Now a
+    fresh-intent question just uses the freshness verdict's own supersession
+    and a stored passage must clear the relevance bar to appear at all.
     """
-    if not settings.web_memory_enabled or _FRESH_RE.search(message or ""):
+    if not settings.web_memory_enabled:
         return sources
     try:
-        hits = await web_index.retrieve(message, top_k=budget * 2)
+        from ..freshness import classify_offline
+        from .. import web_memory
+
+        verdict = classify_offline(message, now_year=datetime.now(timezone.utc).year)
+        result = await web_memory.retrieve(
+            message, level=verdict.requirement, top_k=budget * 2, verdict=verdict
+        )
     except Exception:  # noqa: BLE001
         return sources
     have = {_normalize_url(s.url) for s in sources}
     added = 0
     per_domain: dict = {}
-    for hit in hits:
+    for ev in result.evidence:
         if added >= budget:
             break
-        key = _normalize_url(hit.get("url", ""))
+        if not ev.relevant:
+            continue
+        key = _normalize_url(ev.url)
         if not key or key in have:
             continue
         # One crawled site must not own every memory slot (measured: after a
         # site crawl the global top-k was all one domain). 2 of 3 max.
-        dom = _registrable_domain(hit.get("url", ""))
+        dom = _registrable_domain(ev.url)
         if per_domain.get(dom, 0) >= max(1, budget - 1):
             continue
-        per_domain[dom] = per_domain.get(dom, 0) + 1
-        text = (hit.get("text") or "").strip()
+        text = (ev.text or "").strip()
         if not text:
             continue
+        per_domain[dom] = per_domain.get(dom, 0) + 1
         have.add(key)
         added += 1
-        date = str(hit.get("fetched_at", ""))[:10]
+        read = ev.fetched_at.date().isoformat() if ev.fetched_at else "an earlier day"
+        stamp = ""
+        if ev.content_date is not None:
+            stamp = f"published {ev.content_date.date().isoformat()}, "
         sources.append(
             _Source(
                 n=len(sources) + 1,
-                title=(hit.get("title") or hit.get("url", ""))
-                + _MEMORY_HEADER_NOTE.format(date=date or "an earlier day"),
-                url=hit.get("url", ""),
+                title=(ev.title or ev.url)
+                + _MEMORY_HEADER_NOTE.format(date=f"{stamp}read {read}"),
+                url=ev.url,
                 text=extract.truncate_chars(text, _TIER_B_CHARS),
+                published_at=ev.published_at,
+                modified_at=ev.modified_at,
+                fetched_at=ev.fetched_at,
+                source_type=ev.source_type,
+                authority=int(ev.authority or 0),
+                from_store=True,
             )
         )
     return sources
@@ -786,7 +948,11 @@ async def research_step(
     results = await _rerank_results(question, results, len(results))
     if emit is not None:
         await emit("research", {"phase": "reading", "count": len(results)})
-    sources = _apply_char_tiers(await _fetch_sources(results, question))
+    sources = _apply_char_tiers(
+        await _fetch_sources(
+            results, question, user_id=user_id, conversation_id=conversation_id
+        )
+    )
     if not sources:
         return "", []
     sources = await _memory_sources(question, sources)
@@ -834,7 +1000,11 @@ async def run_search_engine(
 
     await emit("status", {"text": f"Reading {len(results)} sources…"})
     await emit("research", {"phase": "reading", "count": len(results)})
-    sources = _apply_char_tiers(await _fetch_sources(results, message))
+    sources = _apply_char_tiers(
+        await _fetch_sources(
+            results, message, user_id=user_id, conversation_id=conversation_id
+        )
+    )
     if not sources:
         return await _fallback(
             message, history, emit, "Couldn't read the sources — answering from model knowledge."
@@ -879,7 +1049,12 @@ async def run_search_engine(
 
 
 async def fetch_for_freshness(
-    question: str, *, max_queries: int = 1, max_sources: int = 2
+    question: str,
+    *,
+    max_queries: int = 1,
+    max_sources: int = 2,
+    user_id: Optional[int] = None,
+    conversation_id: str = "",
 ) -> int:
     """A deliberately tiny search+read, for the Fast-mode freshness fallback.
 
@@ -895,6 +1070,13 @@ async def fetch_for_freshness(
     NOT a small `run_search_engine`. There is no query rewrite (one provider
     call on the user's own words), no rerank, and no answer generation — this
     exists to put two fresh pages on disk, not to compose a response.
+
+    `user_id` / `conversation_id` attribute the lookup like any other search
+    (V16, ADR-0001 D7): the search log is what ties the pages this call
+    introduces to the conversation that asked — its result rows carry every
+    url_key read here — so they are part of that chat's history and go when
+    it is deleted, instead of an anonymous row nobody can purge. Until
+    2026-09-03 the ids were hardcoded None/"" on this path.
     """
     if not settings.search_enabled:
         return 0
@@ -919,7 +1101,9 @@ async def fetch_for_freshness(
             break
 
     try:
-        sources = await _fetch_sources(picked, question)
+        sources = await _fetch_sources(
+            picked, question, user_id=user_id, conversation_id=conversation_id
+        )
     except Exception:  # noqa: BLE001 — a failed read is a miss, not an error
         return 0
 
@@ -931,9 +1115,18 @@ async def fetch_for_freshness(
     except Exception:  # noqa: BLE001 — evidence is stored; indexing retries
         pass
 
+    # The pages themselves entered the store through the same _fetch_sources
+    # a full search uses, so their origin stays 'search' — a page read on this
+    # path earns no separate trust class and needs none.
     _spawn(
         db.run_in_thread(
-            _log_search_background, question, [question], picked, "fast", None, ""
+            _log_search_background,
+            question,
+            [question],
+            picked,
+            "fast",
+            user_id,
+            conversation_id,
         )
     )
     return len(sources)
@@ -961,12 +1154,14 @@ async def refetch_page(url: str, *, previous_hash: str = "") -> Optional[dict]:
             accept="text/html,application/pdf,text/plain",
         )
         loop = asyncio.get_running_loop()
+        headers = getattr(fetched, "headers", None) or {}
         ext, page_links = await loop.run_in_executor(
             _EXTRACT_POOL,
-            extract.extract_readable_and_links,
+            _call_extract,
             fetched.content_type,
             fetched.body,
             fetched.url,
+            headers,
         )
     except Exception:  # noqa: BLE001 — an unreadable page is a miss
         return None
@@ -975,9 +1170,10 @@ async def refetch_page(url: str, *, previous_hash: str = "") -> Optional[dict]:
     if not text:
         return None
     digest = hashlib.sha256(text.encode("utf-8", "ignore")).hexdigest()
-    try:
-        await db.run_in_thread(
-            db.upsert_web_page,
+    meta = _provenance_of(ext, fetched.url, fetched.content_type, headers)
+
+    def _write() -> None:
+        db.upsert_web_page(
             _normalize_url(url),
             url,
             fetched.url,
@@ -987,7 +1183,11 @@ async def refetch_page(url: str, *, previous_hash: str = "") -> Optional[dict]:
             200,
             digest,
             list(page_links or [])[:500],
+            **meta,
         )
+
+    try:
+        await db.run_in_thread(_write)
     except Exception:  # noqa: BLE001
         return None
     return {"changed": digest != (previous_hash or ""), "title": ext.title or "", "hash": digest}

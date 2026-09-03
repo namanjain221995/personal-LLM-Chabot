@@ -7,13 +7,23 @@ the chunks via the OpenAI-compatible /embeddings endpoint served by vLLM
 and insert rows into the LanceDB table chunks(vector, text, object,
 record_id, field, system_modstamp).
 
+Upkeep (ADR-0001 D8) lives here too, because this process is the table's
+only writer and the orchestrator must never pay for it on a request:
+periodic compaction + old-version pruning, and the IVF_FLAT vector index
+once the table is big enough for a flat scan to hurt. See `maintain`.
+
 lancedb is imported lazily so offline unit tests never need it installed.
 """
 
 from __future__ import annotations
 
 import logging
+import math
+import os
 import re
+import time
+from dataclasses import dataclass
+from datetime import timedelta
 
 import httpx
 
@@ -33,6 +43,65 @@ log = logging.getLogger("syncworker.rag_index")
 TABLE_NAME = "chunks"
 EMBED_BATCH_SIZE = 32
 _SF_ID_RE = re.compile(r"^[a-zA-Z0-9]{15,18}$")
+
+#: The column the ANN index is built over; the orchestrator's reader looks
+#: for an index on this column (engines/rag.retrieve) to decide nprobes.
+VECTOR_COLUMN = "vector"
+
+
+@dataclass(frozen=True)
+class MaintenancePolicy:
+    """When the writer compacts the table and (re)builds the vector index.
+
+    Every delete+add cycle leaves a fragment and a version behind and nothing
+    ever collected them. Measured on the deployment on 2026-09-03: 89,954 live
+    rows in 257 fragments, 444.8 MB of live data, and 137,362 retained
+    versions holding 3.1 GB on disk; the flat scan took 150 ms per question.
+    """
+
+    #: Compaction cadence, in sync cycles. main.py owns the cycle loop and
+    #: this module cannot see its boundaries, so "N cycles" is enforced as
+    #: N x the cycle interval on the wall clock: cycles are never closer than
+    #: SYNC_INTERVAL_MINUTES apart, so this can never run MORE often than
+    #: once per N cycles, and it runs only after something was written.
+    optimize_every_cycles: int = 12
+    cycle_seconds: float = 30 * 60.0
+    #: Versions younger than this survive a prune. Readers open the latest
+    #: version per request, so a week is generous; it exists so a snapshot
+    #: someone is inspecting by hand does not vanish under them.
+    keep_versions_for: timedelta = timedelta(days=7)
+    #: Below this many rows the flat scan is the index (measured 19 ms at 9k
+    #: rows on the web table); above it IVF_FLAT is built — measured 9 ms at
+    #: recall@10 = 0.995 with 50 probes on a 90k-row copy, versus 150 ms flat.
+    ann_min_rows: int = 50_000
+    #: A build (or a failed build) is not attempted again sooner than this.
+    ann_retry_seconds: float = 86_400.0
+
+    @classmethod
+    def from_env(cls) -> "MaintenancePolicy":
+        return cls(
+            optimize_every_cycles=int(os.getenv("RAG_OPTIMIZE_EVERY_CYCLES", "12")),
+            cycle_seconds=int(os.getenv("SYNC_INTERVAL_MINUTES", "30")) * 60.0,
+            keep_versions_for=timedelta(
+                days=int(os.getenv("RAG_OPTIMIZE_KEEP_DAYS", "7"))
+            ),
+            ann_min_rows=int(os.getenv("RAG_ANN_MIN_ROWS", "50000")),
+        )
+
+    @property
+    def optimize_interval_seconds(self) -> float:
+        return max(1, self.optimize_every_cycles) * max(1.0, self.cycle_seconds)
+
+
+def ann_partitions(rows: int) -> int:
+    """IVF partition count: clamp(sqrt(rows), 32, 1024).
+
+    sqrt(N) is the usual lists-per-vectors rule of thumb (300 partitions at
+    90k rows, ~300 vectors each); the floor keeps a small table from
+    degenerating into a handful of huge lists and the ceiling bounds the
+    k-means training cost.
+    """
+    return max(32, min(1024, int(math.sqrt(max(0, int(rows))))))
 
 
 class OpenAIEmbedder:
@@ -112,10 +181,25 @@ class OpenAIEmbedder:
 
 
 class RagIndexer:
-    def __init__(self, lancedb_dir: str, embedder: OpenAIEmbedder) -> None:
+    def __init__(
+        self,
+        lancedb_dir: str,
+        embedder: OpenAIEmbedder,
+        *,
+        policy: MaintenancePolicy | None = None,
+        clock=time.monotonic,
+    ) -> None:
         self._dir = lancedb_dir
         self._embedder = embedder
         self._db = None
+        self._policy = policy or MaintenancePolicy.from_env()
+        self._clock = clock
+        # Maintenance bookkeeping (see `maintain`). A fresh process compacts
+        # on its first write: the table it inherits may carry months of
+        # uncollected versions, and waiting N cycles buys nothing.
+        self._wrote_since_optimize = False
+        self._optimized_at: float | None = None
+        self._ann_attempted_at: float | None = None
 
     def _connect(self):
         if self._db is None:
@@ -247,6 +331,11 @@ class RagIndexer:
             batch = valid[start : start + 100]
             predicate = ", ".join(f"'{rid}'" for rid in batch)
             table.delete(f"record_id IN ({predicate})")
+        # A purge counts as a write, but upkeep is deferred to the next
+        # index_records: main.py purges from INSIDE a warehouse session, and
+        # a compaction there (minutes, the first time) would hold the DuckDB
+        # write lock against the orchestrator's readers for its duration.
+        self._wrote_since_optimize = True
         return len(valid)
 
     def index_records(
@@ -313,4 +402,177 @@ class RagIndexer:
                     "chunks": len(rows),
                 },
             )
+        if record_ids:
+            # Outside any warehouse session (see sync_object's lock
+            # discipline), so upkeep here never blocks a reader.
+            self._wrote_since_optimize = True
+            self.maintain(table)
         return len(rows)
+
+    # ------------------------------------------------------------------
+    # Upkeep (ADR-0001 D8): compaction, version pruning, the ANN index
+    # ------------------------------------------------------------------
+
+    def maintain(self, table=None, *, force: bool = False) -> dict:
+        """Compact the table and keep the vector index in step with its size.
+
+        Runs from the write path — after a batch was indexed; a purge only
+        marks the table dirty — never from a request: the orchestrator only
+        reads this table. Two
+        gated jobs, each recorded as attempted BEFORE it runs so a failing
+        job is retried on its cadence rather than on every batch:
+
+        - OPTIMIZE (compact fragments, prune versions older than
+          `keep_versions_for`, fold unindexed rows into the index) when
+          something was written since the last run and at least
+          `optimize_every_cycles` cycles' worth of time has passed. Logs the
+          fragment/version/byte counts before and after.
+        - ANN INDEX (IVF_FLAT, l2, sqrt(rows) partitions) once the table
+          holds `ann_min_rows` rows and no vector index exists, at most one
+          attempt per `ann_retry_seconds`.
+
+        `force` runs both now (an operator's "rebuild", or a test). Failures
+        are logged and swallowed: the sync must never stall on upkeep.
+        Returns what happened, for logs and tests.
+        """
+        out = {"optimized": False, "indexed": False, "rows": 0}
+        try:
+            if table is None:
+                table = self._open_table_if_exists()
+                if table is None:
+                    return out
+            now = float(self._clock())
+            if force or self._optimize_due(now):
+                self._optimized_at = now
+                self._wrote_since_optimize = False
+                out["optimized"] = self._optimize(table)
+
+            rows = int(table.count_rows())
+            out["rows"] = rows
+            if rows >= self._policy.ann_min_rows and (force or self._ann_due(now)):
+                if force or not self._vector_index_present(table):
+                    self._ann_attempted_at = now
+                    out["indexed"] = self._build_vector_index(table, rows)
+        except Exception:
+            log.error(
+                "rag index maintenance failed; will retry on its cadence",
+                exc_info=True,
+                extra={"event": "rag_maintenance_error"},
+            )
+        return out
+
+    def _optimize_due(self, now: float) -> bool:
+        if not self._wrote_since_optimize:
+            return False
+        if self._optimized_at is None:
+            return True
+        return now - self._optimized_at >= self._policy.optimize_interval_seconds
+
+    def _ann_due(self, now: float) -> bool:
+        if self._ann_attempted_at is None:
+            return True
+        return now - self._ann_attempted_at >= self._policy.ann_retry_seconds
+
+    def _optimize(self, table) -> bool:
+        before = self._table_shape(table)
+        started = time.perf_counter()
+        try:
+            table.optimize(cleanup_older_than=self._policy.keep_versions_for)
+        except TypeError:
+            # Older client without the keyword: compaction still happens,
+            # old versions stay until an upgrade.
+            table.optimize()
+        after = self._table_shape(table)
+        log.info(
+            "rag table compacted",
+            extra={
+                "event": "rag_optimized",
+                "fragments_before": before["fragments"],
+                "fragments_after": after["fragments"],
+                "versions_before": before["versions"],
+                "versions_after": after["versions"],
+                "bytes_before": before["bytes"],
+                "bytes_after": after["bytes"],
+                "seconds": round(time.perf_counter() - started, 2),
+            },
+        )
+        return True
+
+    def _table_shape(self, table) -> dict:
+        """Fragment, retained-version and byte counts, each None if unknown."""
+        shape: dict = {"fragments": None, "versions": None, "bytes": None}
+        try:
+            stats = table.stats()
+            stats = dict(stats) if not isinstance(stats, dict) else stats
+            fragments = stats.get("fragment_stats") or {}
+            shape["fragments"] = fragments.get("num_fragments")
+            shape["bytes"] = stats.get("total_bytes")
+        except Exception:  # noqa: BLE001 — a stats gap must not block the prune
+            pass
+        shape["versions"] = self._version_count(table)
+        return shape
+
+    def _version_count(self, table) -> int | None:
+        """Retained manifests, counted from the directory.
+
+        `list_versions()` reads every manifest: measured 28.75 s for the
+        137,362 versions the production table had accumulated — on the very
+        run whose job is to delete them. One manifest file per version is
+        the on-disk layout, so a directory listing gives the same figure in
+        milliseconds; the API call stays as the fallback for any layout this
+        does not recognise.
+        """
+        versions_dir = os.path.join(self._dir, f"{TABLE_NAME}.lance", "_versions")
+        try:
+            with os.scandir(versions_dir) as entries:
+                return sum(1 for entry in entries if entry.name.endswith(".manifest"))
+        except OSError:
+            pass
+        try:
+            return len(table.list_versions())
+        except Exception:  # noqa: BLE001
+            return None
+
+    @staticmethod
+    def _vector_index_present(table) -> bool:
+        for index in table.list_indices():
+            columns = [str(c) for c in (getattr(index, "columns", None) or [])]
+            name = str(getattr(index, "name", index))
+            if VECTOR_COLUMN in columns or VECTOR_COLUMN in name.lower():
+                return True
+        return False
+
+    def _build_vector_index(self, table, rows: int) -> bool:
+        partitions = ann_partitions(rows)
+        started = time.perf_counter()
+        try:
+            from lancedb.index import IvfFlat
+
+            # The unified API (column first, config object) is the one that is
+            # not deprecated on 0.37/0.38; `replace=True` swaps the previous
+            # index atomically, so a reader never sees the table without one.
+            table.create_index(
+                VECTOR_COLUMN,
+                config=IvfFlat(distance_type="l2", num_partitions=partitions),
+                replace=True,
+            )
+        except ImportError:
+            # Older client: the keyword form builds the same index.
+            table.create_index(
+                metric="l2",
+                vector_column_name=VECTOR_COLUMN,
+                index_type="IVF_FLAT",
+                num_partitions=partitions,
+                replace=True,
+            )
+        log.info(
+            "rag vector index built",
+            extra={
+                "event": "rag_ann_built",
+                "index_type": "IVF_FLAT",
+                "rows": rows,
+                "partitions": partitions,
+                "seconds": round(time.perf_counter() - started, 2),
+            },
+        )
+        return True

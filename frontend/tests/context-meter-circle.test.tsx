@@ -12,12 +12,13 @@
  * in-flight compaction cannot be double-fired, and that an UNKNOWN count
  * leaves the control live.
  *
- * Two properties are new and are the point of the redesign:
+ * Three properties are new and are the point of the redesign:
  *
- *   - the percentage is invisible until hover or focus, and
+ *   - the percentage is invisible until hover or focus,
+ *   - there is no native `title`, so exactly ONE tooltip exists, and
  *   - no raw token number is rendered anywhere, in any state.
  *
- * Both are asserted against the whole rendered subtree rather than against one
+ * They are asserted against the whole rendered subtree rather than against one
  * element, because "we removed the label" is not the same claim as "the number
  * is not on screen".
  */
@@ -34,7 +35,7 @@ import {
 
 afterEach(cleanup);
 
-/** A view at an arbitrary fill, built the way the app builds it. */
+/** A view at an arbitrary fill, carrying the real token fields throughout. */
 function viewAt(fraction: number, over: Partial<MeterView> = {}): MeterView {
   const percent = Math.min(100, Math.max(0, Math.round(fraction * 100)));
   return {
@@ -68,7 +69,6 @@ function setup(props: Partial<Parameters<typeof ContextMeter>[0]> = {}) {
   return { onCompactNow, onOpenChange, ...utils };
 }
 
-/** The one control this component renders. */
 const ring = () => screen.getByRole('button');
 const tooltip = () => screen.queryByRole('tooltip');
 /** Everything a human can actually read right now. */
@@ -76,7 +76,7 @@ const visibleText = () => document.body.textContent ?? '';
 
 /* ===================================================== the control itself */
 
-describe('UI-01 · the ring renders', () => {
+describe('CTX-01 · the ring renders', () => {
   it('renders one circular control with an SVG ring', () => {
     setup();
     expect(ring()).toBeTruthy();
@@ -87,7 +87,7 @@ describe('UI-01 · the ring renders', () => {
   });
 });
 
-describe('UI-02 · the percentage is not permanently visible', () => {
+describe('CTX-02 · the percentage is not permanently visible', () => {
   it('shows no percentage at all before hover or focus', () => {
     setup({ view: viewAt(0.75) });
     expect(visibleText()).not.toContain('75%');
@@ -103,14 +103,14 @@ describe('UI-02 · the percentage is not permanently visible', () => {
   });
 });
 
-describe('UI-03 … UI-06 · hover and focus reveal it', () => {
-  it('UI-03 shows the percentage on hover', () => {
+describe('CTX-03 … CTX-07 · hover, focus, and exactly one tooltip', () => {
+  it('CTX-03 shows the percentage on hover', () => {
     setup({ view: viewAt(0.75) });
     fireEvent.mouseEnter(ring());
     expect(screen.getByRole('tooltip').textContent).toContain('75% context used');
   });
 
-  it('UI-04 hides it again on mouse leave', () => {
+  it('CTX-04 hides it again on mouse leave', () => {
     setup({ view: viewAt(0.75) });
     fireEvent.mouseEnter(ring());
     expect(tooltip()).not.toBeNull();
@@ -119,17 +119,28 @@ describe('UI-03 … UI-06 · hover and focus reveal it', () => {
     expect(visibleText()).not.toContain('75%');
   });
 
-  it('UI-05 shows it on keyboard focus', () => {
+  it('CTX-05 shows it on keyboard focus', () => {
     setup({ view: viewAt(0.75) });
     fireEvent.focus(ring());
     expect(screen.getByRole('tooltip').textContent).toContain('75% context used');
   });
 
-  it('UI-06 hides it on blur', () => {
+  it('CTX-06 hides it on blur', () => {
     setup({ view: viewAt(0.75) });
     fireEvent.focus(ring());
     fireEvent.blur(ring());
     expect(tooltip()).toBeNull();
+  });
+
+  it('CTX-07 carries no native title, so there is only ONE tooltip', () => {
+    // The reverted implementation had title={`Context ${percent}% used`},
+    // which the browser renders on hover alongside the custom one.
+    setup();
+    expect(ring().hasAttribute('title')).toBe(false);
+    fireEvent.mouseEnter(ring());
+    expect(ring().hasAttribute('title')).toBe(false);
+    expect(document.querySelectorAll('[title]')).toHaveLength(0);
+    expect(screen.getAllByRole('tooltip')).toHaveLength(1);
   });
 
   it('names the tooltip as the control description while it is open', () => {
@@ -141,27 +152,20 @@ describe('UI-03 … UI-06 · hover and focus reveal it', () => {
     );
   });
 
-  it('does not ALSO carry a native title, which would duplicate it', () => {
-    setup();
-    expect(ring().hasAttribute('title')).toBe(false);
-    fireEvent.mouseEnter(ring());
-    expect(ring().hasAttribute('title')).toBe(false);
-  });
-
   it('dismisses on Escape without letting it reach "stop generating"', () => {
     setup();
     fireEvent.focus(ring());
-    const evt = fireEvent.keyDown(ring(), { key: 'Escape' });
+    const notPrevented = fireEvent.keyDown(ring(), { key: 'Escape' });
     expect(tooltip()).toBeNull();
     // fireEvent returns false when the handler called preventDefault.
-    expect(evt).toBe(false);
+    expect(notPrevented).toBe(false);
   });
 });
 
 /* ============================================ the removed popover surface */
 
-describe('UI-07 … UI-09 · the old surface is gone', () => {
-  it('UI-07 renders no raw token figure, hovered or not', () => {
+describe('CTX-08 … CTX-10 · the old surface is gone', () => {
+  it('CTX-08 renders no raw token figure, hovered or not', () => {
     setup({ view: viewAt(0.75) });
     for (const step of [() => undefined, () => fireEvent.mouseEnter(ring())]) {
       step();
@@ -175,7 +179,7 @@ describe('UI-07 … UI-09 · the old surface is gone', () => {
     }
   });
 
-  it('UI-08 opens no popover dialog on click', () => {
+  it('CTX-09 opens no popover dialog on click', () => {
     setup();
     fireEvent.click(ring());
     expect(screen.queryByRole('dialog')).toBeNull();
@@ -186,7 +190,7 @@ describe('UI-07 … UI-09 · the old surface is gone', () => {
     expect(text).not.toContain('This message uses');
   });
 
-  it('UI-09 renders no separate "Compact now" button', () => {
+  it('CTX-10 renders no separate "Compact now" button', () => {
     setup();
     fireEvent.mouseEnter(ring());
     expect(screen.queryByRole('button', { name: 'Compact now' })).toBeNull();
@@ -198,14 +202,14 @@ describe('UI-07 … UI-09 · the old surface is gone', () => {
 
 /* ================================================================ pressing */
 
-describe('UI-10 … UI-13 · activation', () => {
-  it('UI-10 compacts on click when a fold is available', () => {
+describe('CTX-11 … CTX-14 · activation', () => {
+  it('CTX-11 compacts on click when a fold is available', () => {
     const { onCompactNow } = setup({ foldableTurns: 12 });
     fireEvent.click(ring());
     expect(onCompactNow).toHaveBeenCalledTimes(1);
   });
 
-  it('UI-11 compacts on Enter', () => {
+  it('CTX-12 compacts on Enter', () => {
     const { onCompactNow } = setup({ foldableTurns: 12 });
     ring().focus();
     // A native button turns Enter into a click; this is what it dispatches.
@@ -213,39 +217,19 @@ describe('UI-10 … UI-13 · activation', () => {
     expect(onCompactNow).toHaveBeenCalledTimes(1);
   });
 
-  it('UI-12 compacts on Space', () => {
+  it('CTX-13 compacts on Space', () => {
     const { onCompactNow } = setup({ foldableTurns: 12 });
     ring().focus();
     fireEvent.click(ring(), { detail: 0 });
     expect(onCompactNow).toHaveBeenCalledTimes(1);
   });
 
-  it('UI-13 fires once, not twice, while a compaction is in flight', () => {
+  it('CTX-14 fires nothing at all while a compaction is in flight', () => {
     const { onCompactNow } = setup({ foldableTurns: 12, compacting: true });
     fireEvent.click(ring());
     fireEvent.click(ring());
     fireEvent.click(ring());
     expect(onCompactNow).not.toHaveBeenCalled();
-  });
-
-  it('announces the compaction it can only show as a spin', () => {
-    // The visible "Compacting conversation…" pill is gone (it shifted the
-    // whole row); the ring spins instead. A spinner is aria-hidden, so the
-    // announcement has to survive somewhere.
-    const { rerender, onCompactNow } = setup({ compacting: false });
-    expect(screen.queryByRole('status')).toBeNull();
-
-    rerender(
-      <ContextMeter
-        view={viewAt(0.75)}
-        compacting
-        onCompactNow={onCompactNow}
-        foldableTurns={12}
-      />,
-    );
-    expect(screen.getByRole('status').textContent).toContain('Compacting');
-    // …and it is for screen readers only — no visible pill returns.
-    expect(screen.getByRole('status').className).toContain('sr-only');
   });
 
   it('stays focusable while inert, so it can still explain itself', () => {
@@ -259,67 +243,24 @@ describe('UI-10 … UI-13 · activation', () => {
   });
 });
 
-/* ================================================================ the ring */
-
-describe('UI-14 … UI-18 · the ring draws every fill safely', () => {
-  const dashOf = () =>
-    Number(screen.getByTestId('ctx-ring').getAttribute('stroke-dasharray')!.split(' ')[0]);
-  const circumference = () =>
-    Number(screen.getByTestId('ctx-ring').getAttribute('stroke-dasharray')!.split(' ')[1]);
-
-  it.each([
-    ['UI-14', 0, 0],
-    ['UI-15', 0.25, 0.25],
-    ['UI-16', 0.75, 0.75],
-    ['UI-17', 1, 1],
-  ])('%s renders %f as %f of the ring', (_id, fraction, expected) => {
-    cleanup();
-    setup({ view: viewAt(fraction) });
-    expect(dashOf()).toBeCloseTo(circumference() * expected, 5);
-  });
-
-  it('UI-18 clamps beyond 100% to a full ring, never past it', () => {
-    setup({ view: viewAt(1.15) });
-    expect(dashOf()).toBeCloseTo(circumference(), 5);
-    fireEvent.mouseEnter(ring());
-    expect(screen.getByRole('tooltip').textContent).toContain('100% context used');
-  });
-
-  it('clamps a negative fraction to an empty ring', () => {
-    setup({ view: viewAt(-0.5, { fraction: -0.5, percent: 0 }) });
-    expect(dashOf()).toBe(0);
-  });
-
-  it('rounds the way the app already rounds', () => {
-    // The examples from the brief, through the real meterView.
-    expect(meterView({ tokens_used: 4, usable_budget: 1000 } as never, '').percent).toBe(0);
-    expect(meterView({ tokens_used: 249, usable_budget: 1000 } as never, '').percent).toBe(25);
-    expect(meterView({ tokens_used: 754, usable_budget: 1000 } as never, '').percent).toBe(75);
-    expect(meterView({ tokens_used: 1150, usable_budget: 1000 } as never, '').percent).toBe(100);
-  });
-});
-
 /* ================================================== nothing to compact */
 
-describe('NC-01 … NC-03 · what the ring does about foldability', () => {
-  it('NC-01 shows the percentage AND the reason when nothing is foldable', () => {
-    setup({ view: viewAt(0.01), foldableTurns: 0 });
+describe('CTX-15 … CTX-16 · what the ring does about foldability', () => {
+  it('CTX-15 shows the percentage AND the reason, and sends nothing', () => {
+    const { onCompactNow } = setup({ view: viewAt(0.01), foldableTurns: 0 });
     fireEvent.mouseEnter(ring());
     const text = screen.getByRole('tooltip').textContent ?? '';
     expect(text).toContain('1% context used');
     expect(text).toContain(NOTHING_TO_COMPACT);
     expect(text).toContain('Nothing to compact yet.');
-  });
 
-  it('NC-02 sends no request when the count is a known zero', () => {
-    const { onCompactNow } = setup({ foldableTurns: 0 });
     fireEvent.click(ring());
     fireEvent.click(ring());
     expect(onCompactNow).not.toHaveBeenCalled();
     expect(ring().getAttribute('aria-disabled')).toBe('true');
   });
 
-  it('NC-03 treats an UNKNOWN count as unknown, never as zero', () => {
+  it('CTX-16 treats an UNKNOWN count as unknown, never as zero', () => {
     const { onCompactNow } = setup({ foldableTurns: null });
     fireEvent.mouseEnter(ring());
     expect(screen.getByRole('tooltip').textContent).toContain(CLICK_TO_COMPACT);
@@ -339,9 +280,73 @@ describe('NC-01 … NC-03 · what the ring does about foldability', () => {
   });
 });
 
-/* ====================================== the lazy fetch, and recovery */
+/* ================================================================ the ring */
 
-describe('CV-06 … CV-07 · the control recovers', () => {
+describe('CTX-17 … CTX-21 · the ring draws every fill safely', () => {
+  const parts = () =>
+    screen
+      .getByTestId('ctx-ring')
+      .getAttribute('stroke-dasharray')!
+      .split(' ')
+      .map(Number);
+  const dashOf = () => parts()[0];
+  const circumference = () => parts()[1];
+
+  it.each([
+    ['CTX-17', 0, 0],
+    ['CTX-18', 0.25, 0.25],
+    ['CTX-19', 0.75, 0.75],
+    ['CTX-20', 1, 1],
+  ])('%s renders %f as %f of the ring', (_id, fraction, expected) => {
+    cleanup();
+    setup({ view: viewAt(fraction) });
+    expect(dashOf()).toBeCloseTo(circumference() * expected, 5);
+  });
+
+  it('CTX-21 clamps beyond 100% to a full ring, never past it', () => {
+    setup({ view: viewAt(1.2) });
+    expect(dashOf()).toBeCloseTo(circumference(), 5);
+    fireEvent.mouseEnter(ring());
+    expect(screen.getByRole('tooltip').textContent).toContain('100% context used');
+  });
+
+  it('clamps a negative fraction to an empty ring', () => {
+    setup({ view: viewAt(-0.5, { fraction: -0.5, percent: 0 }) });
+    expect(dashOf()).toBe(0);
+  });
+
+  it('rounds through the existing meterView, with no second formula', () => {
+    expect(meterView({ tokens_used: 4, usable_budget: 1000 } as never, '').percent).toBe(0);
+    expect(meterView({ tokens_used: 249, usable_budget: 1000 } as never, '').percent).toBe(25);
+    expect(meterView({ tokens_used: 754, usable_budget: 1000 } as never, '').percent).toBe(75);
+    expect(meterView({ tokens_used: 1150, usable_budget: 1000 } as never, '').percent).toBe(100);
+  });
+});
+
+/* ================================================ compacting + lazy fetch */
+
+describe('CTX-22 · compacting, announced but not shoved on screen', () => {
+  it('announces the compaction it can only show as a spin', () => {
+    // The visible "Compacting conversation…" pill is gone (it shifted the
+    // whole row); the ring spins instead. A spinner is aria-hidden, so the
+    // announcement has to survive somewhere.
+    const { rerender, onCompactNow } = setup({ compacting: false });
+    expect(screen.queryByRole('status')).toBeNull();
+
+    rerender(
+      <ContextMeter
+        view={viewAt(0.75)}
+        compacting
+        onCompactNow={onCompactNow}
+        foldableTurns={12}
+      />,
+    );
+    const status = screen.getByRole('status');
+    expect(status.textContent).toContain('Compacting');
+    // …and it is for screen readers only — no visible pill returns.
+    expect(status.className).toContain('sr-only');
+  });
+
   it('tells the host when the tooltip opens, so the count is fetched lazily', () => {
     const { onOpenChange } = setup();
     expect(onOpenChange).not.toHaveBeenCalled();
@@ -359,9 +364,7 @@ describe('CV-06 … CV-07 · the control recovers', () => {
     expect(onOpenChange.mock.calls.filter(([open]) => open)).toHaveLength(1);
   });
 
-  it('CV-06 is usable again once an unverified compaction finishes', () => {
-    // `compacting` goes true then false whatever the outcome was — the toast
-    // carries the bad news, the control does not stay stuck.
+  it('is usable again once a compaction finishes, whatever its outcome', () => {
     const { onCompactNow, rerender } = setup({ compacting: true });
     fireEvent.click(ring());
     expect(onCompactNow).not.toHaveBeenCalled();
@@ -379,7 +382,11 @@ describe('CV-06 … CV-07 · the control recovers', () => {
     expect(onCompactNow).toHaveBeenCalledTimes(1);
   });
 
-  it('CV-07 is usable again after a failed request left the count unknown', () => {
+  it('is usable again after a failure left the count UNKNOWN', () => {
+    // Carried across from the other branch during conflict resolution: the
+    // test above re-enables with a known count, this one with `null`. A failed
+    // request is exactly how the count goes unknown, so the two are different
+    // recoveries and both are worth pinning.
     const { onCompactNow, rerender } = setup({ compacting: true });
     rerender(
       <ContextMeter
@@ -394,8 +401,6 @@ describe('CV-06 … CV-07 · the control recovers', () => {
   });
 
   it('keeps showing the last true reading — it never resets itself to 0%', () => {
-    // The ring is driven entirely by `view`; nothing in here assumes a
-    // compaction made the next request smaller.
     const { rerender, onCompactNow } = setup({ view: viewAt(0.75) });
     fireEvent.click(ring());
     rerender(

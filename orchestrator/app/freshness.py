@@ -20,11 +20,15 @@ a "fast" mode stops being fast.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
+import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
+
+from . import metrics
 
 log = logging.getLogger(__name__)
 
@@ -43,6 +47,12 @@ class Verdict:
     #: Which rule fired — surfaced in metrics and the debug view, never to the
     #: user. Makes a misclassification diagnosable instead of mysterious.
     reason: str
+
+    #: The answer can change within days ("latest release", "current
+    #: price"): a stored page inside the RECENT window can still be stale
+    #: and an auto-decided live search must not be skipped for it
+    #: (ADR-0001 D6, design critique 2026-09-03).
+    volatile: bool = False
 
     @property
     def needs_evidence(self) -> bool:
@@ -224,6 +234,53 @@ async def _ask_router(question: str) -> Optional[Verdict]:
     return Verdict(level, _MAX_AGE[level], "router")
 
 
+def classify_offline(question: str, *, now_year: int) -> Verdict:
+    """The deterministic verdict, with the ambiguous case settled as RECENT.
+
+    For callers that must never wait on a model to decide how to treat time
+    (Deep Research, which already plans with the main model and only needs
+    the level to weight recency): the same regex pass as `classify`, minus
+    the router round trip, minus the possibility of blocking on it.
+    """
+    verdict = _deterministic(question, now_year)
+    if verdict is not None:
+        return _with_volatility(verdict, question)
+    return _with_volatility(
+        Verdict(Freshness.RECENT, _MAX_AGE[Freshness.RECENT], "default"), question
+    )
+
+
+#: Shapes whose answer moves within days. A page inside the RECENT window
+#: (14 d) that answers "latest vLLM release" can be three releases old.
+_VOLATILE = re.compile(
+    r"\b(release[sd]?|version|changelog|price[sd]?|pricing|stock|score[sd]?|"
+    r"rate[sd]?|schedule|status)\b",
+    re.I,
+)
+#: How old a stored page may be for a volatile question before it is worth a
+#: lookup: a day, not two weeks.
+VOLATILE_MAX_AGE_S = 24 * 3600
+#: How long the freshness router may take before the deterministic default
+#: stands. It shares the 8B model with fact extraction, titling and query
+#: rewriting; under load its queue must not become Fast's time to first token.
+ROUTER_DEADLINE_S = 0.6
+
+
+def _with_volatility(verdict: Verdict, question: str) -> Verdict:
+    q = question or ""
+    volatile = verdict.requirement is Freshness.REALTIME or bool(
+        _STRONG_RECENT.search(q) or _VOLATILE.search(q)
+    )
+    if not volatile or verdict.requirement is Freshness.STATIC:
+        return verdict
+    return Verdict(
+        verdict.requirement,
+        min(verdict.max_age_seconds, VOLATILE_MAX_AGE_S),
+        verdict.reason,
+        volatile=True,
+    )
+
+
 async def classify(question: str, *, now_year: int, allow_router: bool = True) -> Verdict:
     """How fresh must the evidence behind this answer be?
 
@@ -232,12 +289,23 @@ async def classify(question: str, *, now_year: int, allow_router: bool = True) -
     """
     verdict = _deterministic(question, now_year)
     if verdict is not None:
-        return verdict
+        return _with_volatility(verdict, question)
     if allow_router:
-        asked = await _ask_router(question)
+        started = time.perf_counter()
+        asked: Optional[Verdict] = None
+        try:
+            async with asyncio.timeout(ROUTER_DEADLINE_S):
+                asked = await _ask_router(question)
+            metrics.observe("freshness_router_seconds", time.perf_counter() - started, outcome="ok")
+        except TimeoutError:
+            metrics.observe("freshness_router_seconds", time.perf_counter() - started, outcome="timeout")
+        except Exception:  # noqa: BLE001 — the default below is the fallback
+            metrics.observe("freshness_router_seconds", time.perf_counter() - started, outcome="error")
         if asked is not None:
-            return asked
+            return _with_volatility(asked, question)
     # Unclassifiable and no router: treat as RECENT. The failure this module
     # exists to prevent is answering a live question from stale weights, so an
     # unnecessary cache lookup is the cheaper mistake than a wrong fact.
-    return Verdict(Freshness.RECENT, _MAX_AGE[Freshness.RECENT], "default")
+    return _with_volatility(
+        Verdict(Freshness.RECENT, _MAX_AGE[Freshness.RECENT], "default"), question
+    )

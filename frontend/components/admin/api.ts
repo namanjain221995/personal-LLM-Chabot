@@ -1,3 +1,4 @@
+import { handleSessionEnd } from '@/lib/auth';
 /**
  * Client helpers for the /admin area: the ME_PAYLOAD contract types, a fetch
  * wrapper with the signed-out rule baked in, and the small derivations the
@@ -102,7 +103,10 @@ export async function adminJson<T>(
     throw new AdminApiError(0, OFFLINE_MESSAGE);
   }
   if (res.status === 401) {
-    nav.assign('/login');
+    // Session death: a removed or deactivated admin is told why on its own
+    // page; any other end goes to sign-in (2026-09-03). The navigator stays
+    // injectable so the rule is testable.
+    void handleSessionEnd(undefined, fetch, nav);
     throw new AdminApiError(401, 'Signed out.');
   }
   if (!res.ok) {

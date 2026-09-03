@@ -47,9 +47,10 @@ class FakeClient:
 
 
 def _patch_client(monkeypatch, fake, recorder):
-    def fake_factory(base_url, api_key=None):
+    def fake_factory(base_url, api_key=None, **options):
         recorder["base_url"] = base_url
         recorder["api_key"] = api_key
+        recorder["options"] = options  # e.g. the embedding path's read_timeout
         return fake
 
     monkeypatch.setattr(llm, "_client", fake_factory)

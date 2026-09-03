@@ -126,6 +126,39 @@ title, body, and the two tint stops sampled from the drawing) to `ILLUSTRATIONS`
 in `components/auth/IllustrationPanel.tsx`. `tests/login-illustration.test.tsx`
 asserts every entry is reachable.
 
+## When a session ends — and the person is told why (2026-09-03)
+
+Removing or deactivating a member used to produce, for that person, a bare
+401, a bounce to the sign-in form, and then *"Incorrect email or password"*
+on every attempt. The login form is deliberately generic (it must never
+confirm which accounts exist), so it can never explain. The explanation now
+lives one step earlier, where it is safe:
+
+* every revocation records **why** (`auth_sessions.revoke_reason`, migration
+  V15): `logout`, `user_revoked`, `password_changed`, `admin_revoked`,
+  `password_reset`, `account_disabled`, `account_removed`;
+* `GET /auth/me` with a cookie that no longer opens a session answers **401
+  with a body** — `{detail, code, ended_at, workspace?, contact?}` where `code`
+  is `session_expired` · `session_revoked` · `account_disabled` ·
+  `account_removed` · `signed_out`. It explains **only when the cookie's
+  secret still matches the stored hash** — proof that browser held the real
+  session — so a forged or absent cookie learns nothing (`signed_out`, no
+  workspace, no contacts). For the two account-level codes the body carries
+  the workspace name and the active admins' emails (super admins first), and
+  the dead cookie is cleared so the edge gate stops bouncing the person back
+  into an app that only 401s;
+* the client (`lib/auth.ts: handleSessionEnd`) routes on that code from every
+  place a 401 surfaces — the boot probe, a send, the 8 s heartbeat, the admin
+  area. A removed or deactivated account has its **local data wiped** (the
+  same wipe logout performs — this may be a shared machine) and lands on
+  **`/access-removed`**, a public page in the sign-in layout that says what
+  happened, when, who to contact (mailto links), and offers *Sign in with a
+  different account*. Every other end goes to `/login` exactly as before.
+
+The login form's wording is unchanged and still generic: a removed member who
+returns days later without the cookie sees the same message as a wrong
+password, by design.
+
 ## First-time setup (bootstrap)
 
 A fresh (or upgraded) deployment has no credentialed account, so nobody can

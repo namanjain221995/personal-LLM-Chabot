@@ -247,6 +247,12 @@ def test_assistant_mode_bypasses_router_and_duckdb(monkeypatch):
     # attached to the same detached generation); the rest of the contract is
     # unchanged.
     assert meta.pop("generation_id")
+    # The knowledge pre-pass reports how it served the turn (ADR-0001 D12:
+    # `decision`, plus `degraded` when the judge was missing). Its VALUE
+    # depends on the offline corpus and the classifier, so only its shape is
+    # part of this contract.
+    knowledge = meta.pop("knowledge", {})
+    assert set(knowledge) <= {"decision", "degraded", "freshness", "from_local_memory"}
     assert meta == {
         "route": "chat",
         "mode": "assistant",

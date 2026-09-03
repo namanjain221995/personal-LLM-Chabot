@@ -22,7 +22,7 @@ import {
 /** useLayoutEffect on the client, useEffect on the server (no SSR warning). */
 const useIsomorphicLayoutEffect =
   typeof window !== 'undefined' ? useLayoutEffect : useEffect;
-import { fetchMe, userScopeKey } from '@/lib/auth';
+import { fetchMe, handleSessionEnd, userScopeKey } from '@/lib/auth';
 import { toClientError, type ClientError } from '@/lib/errorTypes';
 import { downloadMarkdown } from '@/lib/exportMarkdown';
 import {
@@ -53,6 +53,7 @@ import {
   uploadRefFor,
 } from '@/lib/attachments';
 import { uploadDocumentFile } from '@/lib/uploadDocument';
+import type { SendOptions } from './Composer';
 import {
   branchForAppend,
   branchForVersion,
@@ -352,9 +353,10 @@ export function ChatApp() {
       if (!me.ok) {
         if (me.status === 401 || me.status === 403) {
           // Signed out. The cookie is HttpOnly, so only the server can say
-          // so — hard-redirect to sign-in rather than keep serving cached
-          // data to whoever is at the keyboard now.
-          window.location.assign('/login');
+          // so — hard-redirect rather than keep serving cached data to
+          // whoever is at the keyboard now. A removed or deactivated
+          // account is told WHY, on its own page (2026-09-03).
+          void handleSessionEnd(me);
           return;
         }
         // Offline (status 0) or the orchestrator failing (5xx — still
@@ -756,7 +758,17 @@ export function ChatApp() {
       attachments: Attachment[],
       pasted: PastedText[],
       clarification?: ClarificationResponse | null,
+      options?: SendOptions,
     ) => {
+      if (options?.prefs) {
+        // A slash command sets the mode for THIS send (2026-09-03). The ref
+        // is updated synchronously on purpose: startStream below reads
+        // prefsRef.current, and a state update alone would land after the
+        // request had already gone out under the old prefs.
+        prefsRef.current = options.prefs;
+        setPrefs(options.prefs);
+        savePrefs(window.localStorage, activeIdRef.current, options.prefs);
+      }
       // Read (and release) the pending reference HERE — the one point at which
       // the turn is definitely being created. Every earlier refusal (streaming,
       // an empty box, an attachment still being read) returns from the composer
@@ -920,18 +932,25 @@ export function ChatApp() {
           try {
             let uploadedId: string | undefined;
             if (needsDocUpload) {
-              const refs: { upload_id: string; name: string }[] = [];
-              for (const doc of docAttachments) {
-                // Reuse paths may carry only base64; the picker always keeps
-                // the File. Either way the server gets real bytes.
-                const src =
-                  doc.file ??
-                  new File(
-                    [Uint8Array.from(atob(doc.base64), (c) => c.charCodeAt(0))],
-                    doc.name,
-                  );
-                refs.push(await uploadDocumentFile(src, conversationId));
-              }
+              // In PARALLEL (2026-09-03), and a document that started
+              // uploading when it was attached (Composer.withEarlyUpload)
+              // is only awaited, not sent twice. Five 60 MB files used to
+              // upload one after another on the send's critical path.
+              const refs = await Promise.all(
+                docAttachments.map(async (doc) => {
+                  const early = doc.uploadPromise ? await doc.uploadPromise : null;
+                  if (early) return early;
+                  // Reuse paths may carry only base64; the picker always
+                  // keeps the File. Either way the server gets real bytes.
+                  const src =
+                    doc.file ??
+                    new File(
+                      [Uint8Array.from(atob(doc.base64), (c) => c.charCodeAt(0))],
+                      doc.name,
+                    );
+                  return uploadDocumentFile(src, conversationId);
+                }),
+              );
               docRefs = refs;
               refs.forEach((r, i) => {
                 const entry = userMessage.meta?.attachments?.[i];
@@ -1120,7 +1139,12 @@ export function ChatApp() {
    * "last 90 days" means exactly that.
    */
   const sendFromComposer = useCallback(
-    (text: string, attachments: Attachment[], pasted: PastedText[]) => {
+    (
+      text: string,
+      attachments: Attachment[],
+      pasted: PastedText[],
+      options?: SendOptions,
+    ) => {
       const armed = customAnswerRef.current;
       if (armed && text.trim() && attachments.length === 0) {
         const response = buildResponse(armed, { customText: text });
@@ -1132,7 +1156,7 @@ export function ChatApp() {
           return;
         }
       }
-      send(text, attachments, pasted);
+      send(text, attachments, pasted, undefined, options);
     },
     [send],
   );
@@ -2103,6 +2127,7 @@ export function ChatApp() {
             setSelectedContext(null);
             selectedContextRef.current = null;
           }}
+          uploadConversationId={activeId}
           clarificationPlaceholder={
             customAnswerFor?.custom_placeholder ??
             (pending ? pending.custom_placeholder : undefined)

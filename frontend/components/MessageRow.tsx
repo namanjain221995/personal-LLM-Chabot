@@ -157,6 +157,11 @@ const EDIT_BUTTON =
  * in-app dialog and nothing else. There is no path from this card to a
  * download, which is why the click handler resolves bytes and sets state
  * rather than touching `window` at all.
+ *
+ * 2026-09-02: the visible "Attach again" button that sat under the card was
+ * removed on owner request. Only the button went — the card is still the drag
+ * SOURCE for re-attaching (`draggable` + `onDragStart` below), and ChatApp's
+ * `reuseAttachment` is still the single handler behind every internal drop.
  */
 function OpenableAttachment({
   messageId,
@@ -177,14 +182,15 @@ function OpenableAttachment({
   dataUrl?: string;
   className: string;
   /**
-   * PHASE 4A/4B — put this file back in the composer.
+   * PHASE 4A/4B — can this file be put back in the composer?
    *
-   * 2026-09-03: the visible "Attach again" button this used to render is gone
-   * (owner request). The PROP is not: it is what arms the drag — `draggable`
-   * and `onDragStart` below are gated on it, and the drop resolves through the
-   * very same handler the button called. Omitted (previews, tests) the card
-   * stays undraggable, because a context with no composer cannot offer to
-   * fill one.
+   * Read as a CAPABILITY FLAG, not as a click handler: the visible "Attach
+   * again" button this used to render was removed on owner request
+   * (2026-09-02), leaving the internal drag as the gesture. Its presence is
+   * still what makes the card `draggable` and what lets `onDragStart` write
+   * the reference, so omitting it (previews, tests) correctly leaves a row
+   * that cannot offer to fill a composer that is not there. Keep it wired:
+   * deleting it would silently make every historical card undraggable.
    */
   onReuse?: () => void;
   /** PHASE 3: where the bytes can be fetched from, when this is an upload. */
@@ -392,9 +398,9 @@ export function MessageRow({
    * PHASE 4A/4B: put the Nth attachment of this turn back in the composer.
    *
    * Omitted in contexts with no composer (previews, tests), which is what
-   * makes the cards undraggable — a row cannot offer to fill an input that is
-   * not there. Since 2026-09-03 the gesture is the DRAG alone; there is no
-   * visible action beside the card.
+   * makes those rows' cards undraggable — a row cannot offer to fill an input
+   * that is not there. The host's `reuseAttachment` is still reached on every
+   * internal drop; this prop is what tells the card it may start such a drag.
    */
   onReuseAttachment?: (index: number) => void;
   /**
@@ -1115,6 +1121,7 @@ export function MessageRow({
             reasoningSeconds={reasoningSeconds}
             steps={steps}
             research={research}
+            researchRun={message.meta?.research_run}
             sources={webSources}
           />
         </>

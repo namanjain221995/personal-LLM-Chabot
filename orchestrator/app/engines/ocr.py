@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from typing import List, Sequence
+from typing import List, Optional, Sequence
 
 from ..config import settings
 
@@ -101,7 +101,7 @@ def _to_data_url(image_base64: str) -> str:
     return f"data:image/png;base64,{raw}"
 
 
-async def _ocr_one(client, image_base64: str) -> str:
+async def _ocr_one(client, image_base64: str, max_tokens: Optional[int] = None) -> str:
     resp = await client.chat.completions.create(
         model=settings.ocr_model,
         messages=[
@@ -116,8 +116,9 @@ async def _ocr_one(client, image_base64: str) -> str:
                 ],
             }
         ],
-        # Derived from the OCR window; see output_limit().
-        max_tokens=output_limit(),
+        # Derived from the OCR window; see output_limit(). A caller on the
+        # interactive image route asks for less — see ocr_images().
+        max_tokens=min(output_limit(), max_tokens) if max_tokens else output_limit(),
         temperature=0.0,
         timeout=_TIMEOUT_S,
     )
@@ -131,12 +132,26 @@ async def _ocr_one(client, image_base64: str) -> str:
     return text
 
 
-async def ocr_images(images: Sequence[str]) -> List[str]:
+async def ocr_images(
+    images: Sequence[str],
+    *,
+    max_output_tokens: Optional[int] = None,
+    deadline_s: Optional[float] = None,
+) -> List[str]:
     """Transcribe each image (base64 or data: URL) with Unlimited-OCR.
 
     Returns one transcript per input, order preserved; '' where OCR was
     disabled or failed — the caller must treat '' as "no transcript", never
     as an error.
+
+    `max_output_tokens` and `deadline_s` (2026-09-03) exist for the
+    INTERACTIVE image route: the transcript is drafted before the main model
+    can start, and on a text-dense screenshot the sidecar measured 47 s of
+    decoding ahead of the first visible token. Past the deadline every
+    transcript still in flight is dropped and the caller proceeds
+    pixels-only — the main model reads the screenshot itself. Document
+    pages (the PDF route) pass neither and keep the full budget: a scanned
+    page has no other way to be read.
     """
     if not settings.ocr_enabled or not images:
         return ["" for _ in images]
@@ -149,14 +164,22 @@ async def ocr_images(images: Sequence[str]) -> List[str]:
     async def guarded(idx: int, img: str) -> str:
         async with sem:
             try:
-                return await _ocr_one(client, img)
+                return await _ocr_one(client, img, max_output_tokens)
             except Exception as exc:  # noqa: BLE001 — enhancer, never a gate
                 log.warning("OCR failed for image %d: %s", idx, exc)
                 return ""
 
-    return list(
-        await asyncio.gather(*(guarded(i, img) for i, img in enumerate(images)))
-    )
+    work = asyncio.gather(*(guarded(i, img) for i, img in enumerate(images)))
+    if deadline_s and deadline_s > 0:
+        try:
+            return list(await asyncio.wait_for(work, timeout=float(deadline_s)))
+        except asyncio.TimeoutError:
+            log.info(
+                "OCR did not finish %d image(s) within %.0fs — answering from the pixels",
+                len(images), deadline_s,
+            )
+            return ["" for _ in images]
+    return list(await work)
 
 
 def transcript_block(transcripts: Sequence[str], label: str) -> str:

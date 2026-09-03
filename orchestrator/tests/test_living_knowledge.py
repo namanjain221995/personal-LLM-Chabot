@@ -19,6 +19,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from app import db, web_index, web_memory
+from app.config import settings
 from app.freshness import Freshness, classify
 from app.living_knowledge import prepare, today_iso
 from app.web_memory import grounding_block, retrieve, staleness_note
@@ -140,8 +141,12 @@ def test_the_obsolete_page_is_dropped_not_merely_outranked(no_dense):
     assert OLD_PERSON in dropped
 
 
-def test_a_timeless_question_costs_nothing(no_dense):
-    """STATIC questions must not pay for retrieval at all."""
+def test_a_timeless_question_costs_nothing(no_dense, monkeypatch):
+    """STATIC questions must not pay for retrieval at all — with topical
+    grounding OFF. (Since 2026-09-03 the default is ON: an indexed site is
+    supposed to answer timeless questions about itself; that path is pinned
+    by the two tests below, and this one keeps the zero-cost path honest.)"""
+    monkeypatch.setattr(settings, "living_knowledge_topical", False)
     _seed_current()
     prepared = run(
         prepare(
@@ -155,6 +160,63 @@ def test_a_timeless_question_costs_nothing(no_dense):
     assert prepared.verdict.requirement is Freshness.STATIC
     assert prepared.grounding == ""
     assert prepared.retrieval is None, "no lookup should have happened"
+
+
+def test_a_timeless_question_is_grounded_only_on_a_strong_local_match(monkeypatch):
+    """Topical grounding: a page the platform read that closely matches a
+    timeless question grounds the answer — that is what makes an indexed
+    site a knowledge base. A weak match grounds nothing: ordinary chat must
+    never drag in a loosely related page.
+
+    The dense half is stubbed to a fixed near-hit for BOTH questions, so the
+    difference between them is the lexical signal alone — the words of the
+    question being on the page."""
+    page_url = "https://docs.example.org/guide/photosynthesis-simulator-configuration"
+
+    async def dense_hit(query, top_k=6, site_prefix=""):
+        return [{
+            "url": page_url,
+            "title": "Photosynthesis simulator configuration",
+            "text": "To configure the photosynthesis simulator set PHOTO_RATE in config.yaml.",
+            "fetched_at": "",
+            "score": 0.2,  # LanceDB distance: a close vector match
+        }]
+
+    monkeypatch.setattr(web_index, "retrieve", dense_hit)
+    _page(
+        "docs/config",
+        page_url,
+        "Photosynthesis simulator configuration",
+        "To configure the photosynthesis simulator set PHOTO_RATE in config.yaml. "
+        "The photosynthesis simulator reads config.yaml at startup.",
+        age_days=30.0,
+        authority=web_memory.AUTHORITY_REFERENCE,
+    )
+    strong = run(
+        prepare(
+            "explain how the photosynthesis simulator is configured",
+            effort="fast",
+            mode="assistant",
+            web_search_pref="off",
+            allow_network=False,
+        )
+    )
+    assert strong.verdict.requirement is Freshness.STATIC
+    assert strong.retrieval is not None, "the local corpus is consulted"
+    assert "config.yaml" in strong.grounding
+    assert strong.sources and "docs.example.org" in strong.sources[0]["url"]
+    assert not strong.searched
+
+    weak = run(
+        prepare(
+            "what is the boiling point of water?",
+            effort="fast",
+            mode="assistant",
+            web_search_pref="off",
+            allow_network=False,
+        )
+    )
+    assert weak.grounding == "", "a loose match must not ground a timeless answer"
 
 
 # ── Scenario 2: cached evidence has gone stale ──────────────────────────────
@@ -174,9 +236,10 @@ def test_a_stale_cache_triggers_the_lightweight_lookup(monkeypatch, no_dense):
     _seed_current(age_days=365)
     calls = {}
 
-    async def fake_fetch(question, *, max_queries=1, max_sources=2):
+    async def fake_fetch(question, *, max_queries=1, max_sources=2, **attribution):
         calls["question"] = question
         calls["max_sources"] = max_sources
+        calls["attribution"] = attribution
         _seed_current(age_days=0)  # the refreshed page lands in the store
         return 1
 
@@ -388,7 +451,14 @@ def test_the_evidence_block_stays_small_enough_for_fast_mode():
         for i in range(6)
     ]
     block = grounding_block(big, today_iso())
-    assert len(block) < 3000, f"grounding block was {len(block)} chars"
+    # 240k characters of evidence go in; a budgeted block (settings
+    # LIVING_KNOWLEDGE_EVIDENCE_CHARS of passages plus the framing lines)
+    # comes out. 900 chars used to be the whole budget — one paragraph —
+    # which was not "a large amount of information from the site" (owner,
+    # 2026-09-03); the ceiling is now a setting, and this pins that it holds.
+    ceiling = settings.living_knowledge_evidence_chars + 1500
+    assert len(block) <= ceiling, f"grounding block was {len(block)} chars (> {ceiling})"
+    assert len(block) < 40_000, "one page must never be pasted whole"
 
 
 def test_agreeing_pages_from_one_site_are_not_a_conflict(no_dense):
@@ -399,12 +469,21 @@ def test_agreeing_pages_from_one_site_are_not_a_conflict(no_dense):
     conflict flag, and the model was told its sources disagreed. Hedging on a
     unanimous official answer is precisely the timidity this layer removes.
     """
-    for i in range(4):
+    # Distinct wording per page: identical texts are ONE piece of evidence
+    # now (near-duplicate collapse, 2026-09-03), which is the other half of
+    # the same rule — copies corroborate nothing and conflict with nothing.
+    wordings = [
+        f"{NEW_PERSON} is the Vice President of India.",
+        f"The office of Vice President of India is held by {NEW_PERSON} since his election.",
+        f"Profile: {NEW_PERSON}, Vice President of India — biography and speeches.",
+        f"Press release: Vice President {NEW_PERSON} addressed the assembly today.",
+    ]
+    for i, wording in enumerate(wordings):
         _page(
             f"same/{i}",
             f"https://vicepresidentofindia.nic.in/page{i}",
             "Vice President of India",
-            f"{NEW_PERSON} is the Vice President of India.",
+            wording,
             age_days=1 + i * 0.2,
             authority=web_memory.AUTHORITY_OFFICIAL,
         )

@@ -64,6 +64,10 @@ function makeDataTransfer(init: {
   } as unknown as DataTransfer;
 }
 
+const png = (name = 'shot.png') =>
+  new File(['\u0089PNG\r\n'], name, { type: 'image/png' });
+const pdf = (name = 'report.pdf') =>
+  new File(['%PDF-1.4'], name, { type: 'application/pdf' });
 const csv = (name = 'sales.csv') =>
   new File(['col_a,col_b\n1,2\n'], name, { type: 'text/csv' });
 
@@ -320,6 +324,48 @@ function attachAndSend(file: File, text = 'look at this') {
   fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
 }
 
+/**
+ * Attach, WAIT for the read to land, then send.
+ *
+ * `attachAndSend` clicks Send in the same tick as the picker, which is fine
+ * for a dataset (its File handle is kept as-is) but not for an image or an
+ * inline document: those go through a FileReader, and the composer correctly
+ * refuses to send while `pendingAttach > 0`. Without this wait the message
+ * simply never leaves, and the missing card looks like a rendering bug.
+ */
+async function attachAndSendAsync(file: File, text = 'look at this') {
+  const input = document.querySelector('input[type="file"]') as HTMLInputElement;
+  fireEvent.change(input, { target: { files: [file] } });
+  await waitFor(() => expect(composerChips().length).toBe(1));
+  fireEvent.change(screen.getByRole('textbox', { name: 'Message' }), {
+    target: { value: text },
+  });
+  fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+}
+
+/**
+ * Re-attach by DRAGGING the card onto the composer.
+ *
+ * This is the gesture that replaced the "Attach again" button (2026-09-02).
+ * It deliberately drives BOTH halves — `dragstart` on the card writes the
+ * reference, the drop on the zone resolves it — so the tests below still
+ * exercise the whole reuse ladder rather than calling the handler directly.
+ */
+async function reuseByDrag(cardName: RegExp = /sales\.csv — preview/) {
+  const card = await screen.findByRole('button', { name: cardName });
+  const out = makeDataTransfer({});
+  fireEvent.dragStart(card, { dataTransfer: out });
+  const ref = readInternalAttachment(out);
+  expect(ref).not.toBeNull();
+  const zone = document.querySelector('[data-file-drop-zone]') as HTMLElement;
+  fireEvent.drop(zone, {
+    dataTransfer: makeDataTransfer({
+      types: [INTERNAL_ATTACHMENT_MIME],
+      data: { [INTERNAL_ATTACHMENT_MIME]: JSON.stringify(ref) },
+    }),
+  });
+}
+
 beforeEach(() => {
   clearAttachments();
   stubBrowserApis();
@@ -336,55 +382,12 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-/**
- * Drag the attachment card at `name` into the composer, end to end: the card
- * writes its reference, the drop zone reads it back.
- *
- * Deliberately NOT a shortcut past the DOM — it goes through the real
- * dragstart handler and the real drop zone, because "the drag still works" is
- * exactly the claim these tests exist to make now that no button does.
- */
-async function reuseByDrag(name = /sales\.csv — preview/) {
-  const card = await screen.findByRole('button', { name });
-  const out = makeDataTransfer({});
-  fireEvent.dragStart(card, { dataTransfer: out });
-  const ref = readInternalAttachment(out);
-  expect(ref).not.toBeNull();
-  const zone = document.querySelector('[data-file-drop-zone]') as HTMLElement;
-  fireEvent.drop(zone, {
-    dataTransfer: makeDataTransfer({
-      types: [INTERNAL_ATTACHMENT_MIME],
-      data: { [INTERNAL_ATTACHMENT_MIME]: JSON.stringify(ref) },
-    }),
-  });
-  return card;
-}
-
-describe('P4A · reusing a sent attachment (drag only)', () => {
-  it('ATTACH-01 — no visible "Attach again" action exists anywhere', async () => {
-    renderApp();
-    attachAndSend(csv());
-    await waitFor(() => expect(uploadCalls).toBe(1));
-    // The card itself must be on screen, or this asserts the absence of a
-    // button next to a card that was never rendered.
-    await screen.findByRole('button', { name: /sales\.csv — preview/ });
-
-    expect(screen.queryByRole('button', { name: /Attach .* again/i })).toBeNull();
-    expect(screen.queryByText(/attach again/i)).toBeNull();
-    expect(document.querySelector('[title="Attach again"]')).toBeNull();
-  });
-
-  it('ATTACH-02 — the historical card is still draggable', async () => {
-    renderApp();
-    attachAndSend(csv());
-    await waitFor(() => expect(uploadCalls).toBe(1));
-    const card = await screen.findByRole('button', {
-      name: /sales\.csv — preview/,
-    });
-    expect(card.getAttribute('draggable')).toBe('true');
-  });
-
-  it('ATTACH-03/P4A-01 — dragging puts a same-session file back in the composer', async () => {
+describe('P4A · re-attaching a file you already sent', () => {
+  // These tests were written against the "Attach again" button. The button is
+  // gone (2026-09-02) but every one of the behaviours it proved is still
+  // required, so each now performs the internal DRAG instead — same
+  // `reuseAttachment` handler, same resolution ladder, same assertions.
+  it('P4A-01/P4A-06 — puts a same-session file back in the composer', async () => {
     renderApp();
     attachAndSend(csv());
     await waitFor(() => expect(uploadCalls).toBe(1));
@@ -396,7 +399,25 @@ describe('P4A · reusing a sent attachment (drag only)', () => {
     expect(downloads).toEqual([]);
   });
 
-  it('ATTACH-04/P4A-02 — after a refresh, the bytes come from the server', async () => {
+  it('P4A-05 — the card itself is still keyboard-reachable, for PREVIEW', async () => {
+    renderApp();
+    attachAndSend(csv());
+    // Wait for the send to settle before touching focus: the row re-renders as
+    // the upload resolves, and asserting against a detached node is a race,
+    // not a finding.
+    await waitFor(() => expect(uploadCalls).toBe(1));
+    const card = await screen.findByRole('button', {
+      name: /sales\.csv — preview/,
+    });
+    // Removing the button removed the only KEYBOARD path to re-attaching —
+    // dragging is mouse-only. That is a deliberate product decision, recorded
+    // here rather than hidden: what the keyboard still reaches is the preview.
+    card.focus();
+    expect(document.activeElement).toBe(card);
+    expect((card as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('P4A-02 — after a refresh, the bytes come from the server', async () => {
     renderApp();
     attachAndSend(csv());
     await waitFor(() => expect(uploadCalls).toBe(1));
@@ -458,6 +479,10 @@ describe('P4A · reusing a sent attachment (drag only)', () => {
       { name: 'huge.png', mime: 'image/png', blob: bigImage },
     ]);
     await reuseByDrag();
+    // 10 MB, not 25: the fixture above is an 11 MB IMAGE, and the document
+    // rail no longer rejects at 25 MB (MAX_PDF_BYTES is 512 MB, with 25 MB
+    // only the inline/stream threshold). Composer's cap message for an
+    // oversized image is '10 MB'.
     expect(await screen.findByText(/the limit is 10 MB/i)).toBeTruthy();
     expect(composerChips().length).toBe(0);
   });
@@ -469,6 +494,67 @@ describe('P4A · reusing a sent attachment (drag only)', () => {
     await reuseByDrag();
     await waitFor(() => expect(composerChips().length).toBe(1));
     expect(downloads).toEqual([]);
+  });
+});
+
+describe('AA · the visible "Attach again" button is gone', () => {
+  /**
+   * Owner request 2026-09-02: the action is removed from the card, and ONLY
+   * the action. Everything behind it stays — the card is still the drag
+   * source, `reuseAttachment` is still the one handler, and the drop still
+   * resolves bytes down the same ladder. The tests that used to press the
+   * button now perform the drag instead; they assert the same outcomes.
+   *
+   * The pairing below is the point: for every type, "no button" and "still
+   * draggable" are asserted together, because deleting the prop that rendered
+   * the button would also have silently deleted `draggable={Boolean(onReuse)}`.
+   */
+  const noAttachAgain = () => {
+    expect(screen.queryByRole('button', { name: /attach .* again/i })).toBeNull();
+    expect(screen.queryByText(/attach again/i)).toBeNull();
+    expect(document.querySelector('[title="Attach again"]')).toBeNull();
+  };
+
+  it('AA-01 — no Attach again anywhere on a sent attachment', async () => {
+    renderApp();
+    attachAndSend(csv());
+    await screen.findByRole('button', { name: /sales\.csv — preview/ });
+    noAttachAgain();
+  });
+
+  it('AA-02 — gone for an image, which stays draggable', async () => {
+    renderApp();
+    await attachAndSendAsync(png());
+    const card = await screen.findByRole('button', { name: /shot\.png — preview/ });
+    noAttachAgain();
+    expect(card.getAttribute('draggable')).toBe('true');
+  });
+
+  it('AA-03 — gone for a document, which stays draggable', async () => {
+    renderApp();
+    await attachAndSendAsync(pdf());
+    const card = await screen.findByRole('button', { name: /report\.pdf — preview/ });
+    noAttachAgain();
+    expect(card.getAttribute('draggable')).toBe('true');
+  });
+
+  it('AA-04 — gone for a dataset, which stays draggable', async () => {
+    renderApp();
+    attachAndSend(csv());
+    const card = await screen.findByRole('button', { name: /sales\.csv — preview/ });
+    noAttachAgain();
+    expect(card.getAttribute('draggable')).toBe('true');
+  });
+
+  it('leaves the card itself untouched — name, badge and preview action', async () => {
+    renderApp();
+    attachAndSend(csv());
+    const card = await screen.findByRole('button', { name: /sales\.csv — preview/ });
+    // The filename and its type badge still render inside the card.
+    expect(card.textContent).toContain('sales.csv');
+    expect(card.textContent).toContain('CSV');
+    // And the card is still the ONE control on it.
+    expect(card.getAttribute('title')).toBe('sales.csv — preview');
   });
 });
 

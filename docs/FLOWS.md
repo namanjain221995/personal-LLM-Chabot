@@ -240,56 +240,84 @@ so*. A dead reranker → engine order is kept. Nothing here can fail the turn.
 
 ## 6. Mode 3 — Deep Research
 
-The iterative one. Plan → search → read → **audit what is missing** → search
-again → report. Roughly **2–3 minutes**.
+The iterative one, rebuilt on 2026-09-03. Plan → search → **open** the
+pages → **extract dated claims** → **follow the links** those pages give →
+resolve what each subquestion currently has → audit what is missing → search
+again → **verify** the important claims → report. Roughly **3–5 minutes**.
 
 ```mermaid
 flowchart TD
-    Q([Research question]) --> PLAN["<b>1 · PLAN</b><br/>MAIN model, guided JSON<br/>→ subquestions + first queries"]
+    Q([Research question]) --> T["<b>0 · TEMPORAL FRAME</b><br/>today's date · freshness level<br/>(offline regex, never the router)"]
+    T --> PLAN["<b>1 · PLAN</b><br/>MAIN model, guided JSON<br/>→ subquestions · queries (direct,<br/>primary-source, most-recent) · entities"]
     PLAN --> ROUND["<b>2 · ROUND</b>"]
 
     subgraph ROUNDBOX ["one round"]
         ROUND --> ROUTE["route each query<br/>science pool ↔ general pool"]
         ROUTE --> SEARCH["search in parallel<br/>SearXNG"]
         SEARCH --> SKIP["drop URLs already read<br/>this run"]
-        SKIP --> RR["rerank"]
-        RR --> FETCH["fetch + extract<br/>reuses the search pipeline"]
-        FETCH --> REG["<b>register sources</b><br/>n → url, title, text"]
+        SKIP --> RANK["<b>rank candidates</b><br/>reranker topicality × domain authority<br/>× source class · stale-year snippets down"]
+        RANK --> FETCH["fetch + extract<br/>reuses the search pipeline<br/>+ published/updated dates"]
+        FETCH --> REG["<b>register sources</b><br/>provenance · fingerprint ·<br/>DUPLICATE? · PRIMARY?"]
+        REG --> LINKS["<b>follow links</b><br/>the citation an article gives,<br/>the official page, the PDF"]
+        LINKS --> CLAIMS["<b>extract claims</b><br/>MAIN model, guided JSON<br/>claim · value · as_of · current/historical"]
+        CLAIMS --> RESOLVE["<b>resolve (code)</b><br/>CURRENT · SUPERSEDED ·<br/>CONFLICTING · UNKNOWN + confidence"]
     end
 
-    REG --> THIN{"Fewer than<br/>min_sources?"}
+    RESOLVE --> THIN{"Fewer than<br/>min_sources?"}
     THIN -->|yes| MORE["search the plan's<br/>remaining angles"]
     MORE --> ROUND
-    THIN -->|no| AUDIT["<b>3 · AUDIT</b><br/>MAIN model, guided JSON<br/>sufficient? · missing? ·<br/>contradictions? · follow-up queries?"]
+    THIN -->|no| AUDIT["<b>3 · AUDIT</b><br/>MAIN model, guided JSON, sees the<br/>evidence-status table + real excerpts<br/>sufficient? · missing? · contradictions? ·<br/>follow-ups · primary-source queries"]
 
-    AUDIT --> ENOUGH{"Enough<br/>evidence?"}
-    ENOUGH -->|no, and budget left| FOLLOW["follow-up queries<br/>not already run"]
+    AUDIT --> STOP{"<b>stop on evidence?</b><br/>sufficient & nothing UNKNOWN ·<br/>no information gain (2 rounds) ·<br/>duplicate rate · budget ·<br/>nowhere left to look"}
+    STOP -->|no| FOLLOW["follow-ups + primary-source queries<br/>+ site: queries on authoritative<br/>domains already found"]
     FOLLOW --> ROUND
-    ENOUGH -->|yes| REPORT
-    ENOUGH -->|budget spent| REPORT
+    STOP -->|yes| VERIFY["<b>4 · VERIFY</b><br/>MAIN model, guided JSON per subquestion<br/>enough? primary opened? newer likely?<br/>disagree? changed over time? confidence"]
+    VERIFY -->|low confidence & budget| VROUND["one more targeted round"]
+    VROUND --> REPORT
+    VERIFY -->|confident| REPORT
 
-    REPORT["<b>4 · REPORT</b><br/>MAIN model, streamed<br/>every claim carries [n]"]
-    REPORT --> VALIDATE["<b>5 · VALIDATE CITATIONS</b><br/>remove any [n] with no source<br/>code blocks left untouched"]
-    VALIDATE --> SAVE[("research_runs<br/>question · counts · report ·<br/>citation registry")]
-    VALIDATE --> OUT([Report + real sources])
+    REPORT["<b>5 · REPORT</b><br/>MAIN model, streamed<br/>current date · evidence-status table ·<br/>dated, labelled sources · every claim [n]"]
+    REPORT --> VALIDATE["<b>6 · VALIDATE CITATIONS</b><br/>remove any [n] with no source<br/>code blocks left untouched"]
+    VALIDATE --> SAVE[("research_runs · <b>web_claims</b><br/>report · registry · dated claims")]
+    VALIDATE --> CRAWLQ[("crawl queue<br/>top primary domains")]
+    VALIDATE --> OUT([Report + real sources + research summary])
 
     classDef app fill:#7C3AED,color:#fff,stroke:none
     classDef data fill:#D97706,color:#fff,stroke:none
-    class PLAN,ROUTE,SEARCH,SKIP,RR,FETCH,REG,AUDIT,MORE,FOLLOW,REPORT,VALIDATE app
-    class SAVE data
+    class T,PLAN,ROUTE,SEARCH,SKIP,RANK,FETCH,REG,LINKS,CLAIMS,RESOLVE,AUDIT,MORE,FOLLOW,VERIFY,VROUND,REPORT,VALIDATE app
+    class SAVE,CRAWLQ data
 ```
+
+### Time, in one table
+
+| Signal | Where it comes from | What it changes |
+|---|---|---|
+| today's date + freshness level | the clock; `freshness.classify_offline` | every prompt is dated; a time-sensitive question gets a query with the current year and a recency-weighted resolution |
+| a page's published / updated date | `core/provenance.page_dates` (page metadata, JSON-LD, `<time>`, `Last-Modified`) — never invented | the source label the model reads; the ranking; supersession |
+| a claim's `as_of` | extracted with the claim (an effective date, event date, or the article's own date) | which value is CURRENT and which is history |
+
+**CURRENT / SUPERSEDED / CONFLICTING / UNKNOWN** are decided *in code*
+(`deep_research._resolve`): claims are grouped by value; the best-supported
+group wins on recency × authority × independent corroboration; an earlier value
+with an earlier date is **superseded** (a change over time), a different value
+of comparable date and authority is a **conflict** (surfaced, both cited), and
+a subquestion with no claims is **unknown** — which the auditor is told is
+*not found yet*, not *does not exist*, until the follow-ups are exhausted.
 
 ### When the loop stops
 
-It stops on the **first** of these — there is no way to spin forever:
+It stops on the **first** of these, and says which (`meta.research_run.stop_reason`,
+the Activity panel's *Research summary*, and the `research[…] assess:` log line):
 
-| Stop condition | Default |
-|---|---|
-| the auditor says the evidence is sufficient | — |
-| iteration cap reached | `DEEP_RESEARCH_MAX_ITERATIONS=3` |
-| source cap reached | `DEEP_RESEARCH_MAX_SOURCES=24` |
-| wall-clock timeout | `DEEP_RESEARCH_TIMEOUT_S=600` |
-| the auditor only asks for queries already run | — |
+| Stop reason | Meaning | Default |
+|---|---|---|
+| `sufficient` | the auditor is satisfied and no subquestion is UNKNOWN | — |
+| `no_information_gain` | two consecutive rounds added < `DEEP_RESEARCH_MIN_GAIN` of new evidence | `0.15` |
+| `duplicate_rate` | a round's pages were mostly copies of pages already read | 70 % |
+| `no_new_queries` | the auditor, the primary-source pass and the `site:` fallback produced nothing new | — |
+| `iteration_cap` | rounds (verification included) | `DEEP_RESEARCH_MAX_ITERATIONS=5` |
+| `source_cap` | pages registered | `DEEP_RESEARCH_MAX_SOURCES=36` |
+| `timeout` | wall clock | `DEEP_RESEARCH_TIMEOUT_S=600` |
 
 ### What the user watches while it runs
 
@@ -303,23 +331,37 @@ sequenceDiagram
     O-->>U: step "Planned the research" · done + subquestions
     O-->>U: status "Searching the web — 5 queries…"
     O-->>U: research {phase:"query", query, results[]}
-    O-->>U: step "Searching the web" · done — 10 new sources
+    O-->>U: research {phase:"query", query:"↳ links followed from …", results[]}
+    O-->>U: status "Extracting claims from 10 source(s)…"
+    O-->>U: step "Searching the web" · done — 10 new; 3 links followed; 2 duplicates; 14 claims; 3 primary
     O-->>U: status "Checking what is still missing…"
-    O-->>U: step "Analyzed evidence" · done — gaps listed
+    O-->>U: step "Analyzed evidence" · done — gaps · not found yet: …
     O-->>U: status "Following up on gaps (round 2)…"
-    Note over O,U: …rounds repeat until a stop condition…
-    O-->>U: status "Writing the report from 24 sources…"
+    Note over O,U: …rounds repeat until a stop reason…
+    O-->>U: step "Verifying claims" · done — confidence 0.82 (or: one more targeted round)
+    O-->>U: status "Writing the report from 28 sources…"
     loop streamed
         O-->>U: token
     end
-    O-->>U: meta {route:"deep_research", sources[], research_run{}}
+    O-->>U: step "Wrote the report" · done — 19 of 28 cited · stopped: sufficient · confidence 0.82
+    O-->>U: meta {route:"deep_research", sources[] (dated, typed, primary/duplicate flags), research_run{stop_reason, rounds[], resolutions[], …}}
     O-->>U: done
 ```
 
 No new event types were invented. The SSE vocabulary is **closed** — an unknown
 name raises inside the response generator and would kill the stream with no
 error frame — so Deep Research reuses `step`, `status`, `research`, `token` and
-`meta`, all of which the frontend already renders.
+`meta`, all of which the frontend already renders; the links it follows appear
+in the Research panel as their own query group.
+
+### What the log shows
+
+Every decision is one `INFO` line prefixed `research[<id>]`: the plan, each
+round's queries, every page **opened** (with its label: class, published,
+read, primary, duplicate-of), the links **followed**, the claims extracted,
+each subquestion's **resolution**, the auditor's verdict and the **stop
+reason**, each verification verdict, and the final summary. `grep research\[`
+on the orchestrator log reconstructs a run.
 
 ### Concurrency guards
 
@@ -409,6 +451,26 @@ flowchart TD
     class ROBOTS,FRONTIER,WALK,LOOP,GET,FREE,INDEX app
 ```
 
+### The background queue (2026-09-03)
+
+The same crawler now also runs **behind** the chat. Two things enqueue a
+bounded job (`web_crawls` row, status `queued`, with its own page/minute caps):
+
+* **sharing a URL** — the pasted page is answered from immediately *and* stored
+  in the global corpus, and its site is queued (`WEB_SHARE_CRAWL_MAX_PAGES=150`,
+  8 min). The status line says *"Indexing docs.example.com in the background —
+  later questions can draw on the whole site."* and `meta.site_crawl` records it;
+* **a Deep Research run** — its top primary domains (up to 3, 40 pages each).
+
+The knowledge worker drains the queue one job at a time, after its index and
+refresh passes, and is **woken** the moment a job is queued (`web_worker.kick()`)
+rather than waiting for its five-minute cycle. A restart requeues a background
+job that was running; a foreground crawl cut off the same way is closed as
+`capped` so its pages stay usable. Same scope, already queued or crawled within
+24 h → not queued again; stored pages cost nothing, so a large site finishes over
+several shares. Type `/crawl <url>` in the composer for the foreground version
+with live progress.
+
 ---
 
 ## 9. Web memory: what gets stored and reused
@@ -466,8 +528,10 @@ flowchart TD
     SUP --> ENOUGH{"Fresh enough<br/>to answer?"}
 
     ENOUGH -->|yes| G["Ground the prompt with dated,<br/>cited passages -> answer"]
-    ENOUGH -->|"no, Fast mode"| S["ONE query, 2 sources,<br/>12s deadline"]
+    ENOUGH -->|"no, Fast mode"| S["ONE query, 2 sources,<br/>8s deadline"]
     ENOUGH -->|"no, think/max"| F["Hand to the full search engine"]
+    C -->|STATIC, strong local match| TOP["Topical grounding (2026-09-03):<br/>a site indexed here or a page<br/>research read answers it, cited"]
+    R --> CL["Resolved research claims<br/>(web_claims, dated) join the evidence"]
     ENOUGH -->|"no, offline"| STALE["Answer from cache AND say<br/>how old it is"]
 
     S --> STORE["Store + index"]

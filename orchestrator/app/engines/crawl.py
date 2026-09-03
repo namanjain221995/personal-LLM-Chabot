@@ -38,7 +38,7 @@ from ..config import settings
 from ..core import net, robots
 from ..core import extract
 from . import recent_turns
-from .search import _EXTRACT_POOL, _normalize_url
+from .search import _EXTRACT_POOL, _call_extract, _normalize_url, _provenance_of
 
 log = logging.getLogger(__name__)
 
@@ -199,10 +199,11 @@ async def _fetch_page(url: str) -> Tuple[str, extract.Extracted, List[str], str]
     loop = asyncio.get_running_loop()
     extracted, links = await loop.run_in_executor(
         _EXTRACT_POOL,
-        extract.extract_readable_and_links,
+        _call_extract,
         fetched.content_type,
         fetched.body,
         fetched.url,
+        getattr(fetched, "headers", None) or {},
     )
     return fetched.url, extracted, links, fetched.content_type
 
@@ -213,7 +214,19 @@ def _store(
     ext: extract.Extracted,
     content_type: str,
     links: Optional[List[str]] = None,
+    origin: str = "crawl",
+    conversation_id: str = "",
+    user_id: Optional[int] = None,
 ) -> None:
+    """Persist one crawled page with its trust class (V16, ADR-0001 D7).
+
+    A crawl started because a member SHARED a link stores every page it
+    reaches as origin 'share' — cited on its merits, never able to retire
+    other evidence, never above neutral authority — and records the
+    conversation (and user, when known) that introduced it. A research
+    run's crawl is 'research'; an operator's manual crawl and the
+    post-search expansion are 'crawl'.
+    """
     db.upsert_web_page(
         url_key=_normalize_url(url),
         url=url,
@@ -224,6 +237,10 @@ def _store(
         fetch_status=200 if ext.text else 0,
         content_hash=hashlib.sha256((ext.text or "").encode("utf-8")).hexdigest(),
         links=links or [],
+        origin=origin or "crawl",
+        introduced_by_user_id=user_id,
+        introduced_in_conversation_id=conversation_id or None,
+        **_provenance_of(ext, final_url or url, content_type, None),
     )
 
 
@@ -234,8 +251,15 @@ async def _crawl_site(
     max_pages: int,
     max_seconds: float,
     quiet: bool = False,
+    origin: str = "crawl",
+    conversation_id: str = "",
+    user_id: Optional[int] = None,
 ) -> Tuple[_CrawlState, int, str]:
-    """The frontier loop. → (state, pages_found, status)."""
+    """The frontier loop. → (state, pages_found, status).
+
+    `origin`/`conversation_id`/`user_id` are stamped on every page stored
+    (see _store): they decide how much a crawled page may do in the shared
+    corpus and make it attributable."""
     host, prefix = _scope_of(root_url)
     state = _CrawlState(scope_host=host, scope_prefix=prefix)
 
@@ -308,7 +332,9 @@ async def _crawl_site(
             state.failed += 1
             return []
         if ext.text.strip():
-            await db.run_in_thread(_store, url, final_url, ext, ctype, links)
+            await db.run_in_thread(
+                _store, url, final_url, ext, ctype, links, origin, conversation_id, user_id
+            )
             state.fetched += 1
         else:
             state.failed += 1
@@ -412,6 +438,8 @@ async def run_crawl_engine(
             emit,
             max_pages=settings.web_crawl_max_pages,
             max_seconds=settings.web_crawl_max_minutes * 60.0,
+            origin="crawl",
+            conversation_id=conversation_id,
         )
         if status.startswith("declined"):
             await db.run_in_thread(
@@ -579,6 +607,161 @@ async def run_site_qa_engine(
             parts.append(delta)
     await emit("meta", {"route": "crawl", "sources": sources})
     return "".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# The background crawl queue (2026-09-03)
+#
+# A crawl used to be a foreground request only: "index this site" and wait
+# in the chat for up to fifteen minutes. Sharing a URL, or finishing a
+# research run, now ENQUEUES a bounded crawl of that site; the knowledge
+# worker drains the queue one job at a time, quietly, and the pages land in
+# the same global store every search reads from. The queue is a PostgreSQL
+# row per job (db.web_crawls with status 'queued'), so a restart resumes
+# rather than forgets, and every job carries its own caps.
+# ---------------------------------------------------------------------------
+
+_QUEUE_LOCK = asyncio.Lock()
+
+
+async def enqueue_site_crawl(
+    conversation_id: str,
+    url: str,
+    *,
+    kind: str = "share",
+    max_pages: Optional[int] = None,
+    max_minutes: Optional[float] = None,
+    priority: int = 0,
+) -> Optional[int]:
+    """Queue a bounded background crawl of the site `url` lives on.
+
+    → the job id, or None when nothing was queued (feature off, bad URL, the
+    scope is already queued/running, or it was crawled recently). Never
+    raises: a queue failure must not cost the answer that triggered it.
+    """
+    if not settings.web_background_crawl_enabled or not url:
+        return None
+    try:
+        parts = urlparse(url)
+    except ValueError:
+        return None
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        return None
+    host, prefix = _scope_of(url)
+    pages = int(max_pages or settings.web_share_crawl_max_pages)
+    minutes = float(max_minutes or settings.web_share_crawl_max_minutes)
+    try:
+        job_id = await db.run_in_thread(
+            db.enqueue_web_crawl,
+            conversation_id or "",
+            url,
+            prefix,
+            kind,
+            pages,
+            minutes,
+            priority,
+        )
+    except Exception:  # noqa: BLE001 — enrichment, never the answer
+        log.debug("could not enqueue a crawl for %s", host, exc_info=True)
+        return None
+    if job_id is None:
+        log.info("crawl queue: %s already queued or crawled recently (%s)", host, kind)
+        return None
+    log.info(
+        "crawl queue: job %d queued for %s (kind=%s, up to %d pages / %.0f min)",
+        job_id, prefix, kind, pages, minutes,
+    )
+    try:
+        from .. import web_worker
+
+        web_worker.kick()
+    except Exception:  # noqa: BLE001
+        pass
+    return job_id
+
+
+async def _run_queued(job: dict) -> None:
+    """One background job, start to finish. Marks the row whatever happens."""
+    crawl_id = int(job["id"])
+    root_url = job["root_url"]
+    host, _prefix = _scope_of(root_url)
+    max_pages = int(job.get("max_pages") or settings.web_share_crawl_max_pages)
+    max_seconds = float(job.get("max_minutes") or settings.web_share_crawl_max_minutes) * 60.0
+    started = time.monotonic()
+    state: Optional[_CrawlState] = None
+    try:
+        kind = str(job.get("kind") or "")
+        state, pages_found, status = await _crawl_site(
+            root_url,
+            None,
+            max_pages=max_pages,
+            max_seconds=max_seconds,
+            quiet=True,
+            # A shared link's crawl inherits the SHARE trust class for every
+            # page it reaches; a research run's crawl is research material.
+            origin="share" if kind == "share" else "research" if kind == "research" else "crawl",
+            conversation_id=str(job.get("conversation_id") or ""),
+        )
+        if status.startswith("declined"):
+            await db.run_in_thread(
+                db.finish_web_crawl, crawl_id, "failed", 0, 0, 0, 0, status
+            )
+            log.info("background crawl[%d] %s declined: %s", crawl_id, host, status)
+            return
+        chunks = await _drain_index(None, quiet=True)
+        await db.run_in_thread(
+            db.finish_web_crawl,
+            crawl_id,
+            status,
+            pages_found,
+            state.fetched,
+            state.from_store,
+            state.failed,
+            "",
+        )
+        log.info(
+            "background crawl[%d] %s %s: %d fetched, %d from store, %d failed, "
+            "%d chunks indexed in %.0fs (kind=%s)",
+            crawl_id, host, status, state.fetched, state.from_store, state.failed,
+            chunks, time.monotonic() - started, job.get("kind"),
+        )
+    except asyncio.CancelledError:
+        # Shutdown mid-crawl: the pages already stored are real. The row goes
+        # back to the queue at the next start (db.requeue_interrupted_web_crawls).
+        raise
+    except Exception as exc:  # noqa: BLE001
+        log.warning("background crawl[%d] %s failed", crawl_id, host, exc_info=True)
+        try:
+            await db.run_in_thread(
+                db.finish_web_crawl, crawl_id, "failed", 0,
+                state.fetched if state else 0, state.from_store if state else 0,
+                state.failed if state else 0, str(exc)[:300],
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+
+async def run_queued_crawls(max_jobs: int = 1) -> int:
+    """Drain up to `max_jobs` queued crawls. Single-flight per process:
+    two concurrent background crawls would double the politeness load on the
+    same hosts and race the shared extraction worker. → jobs completed."""
+    if not settings.web_background_crawl_enabled:
+        return 0
+    if _QUEUE_LOCK.locked():
+        return 0
+    done = 0
+    async with _QUEUE_LOCK:
+        for _ in range(max(1, int(max_jobs))):
+            try:
+                job = await db.run_in_thread(db.next_queued_web_crawl)
+            except Exception:  # noqa: BLE001
+                log.debug("could not read the crawl queue", exc_info=True)
+                break
+            if not job:
+                break
+            await _run_queued(job)
+            done += 1
+    return done
 
 
 # ---------------------------------------------------------------------------

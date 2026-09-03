@@ -165,6 +165,32 @@ class Settings:
         self.rerank_base_url: str = os.environ.get("RERANK_BASE_URL", "").rstrip("/")
         self.rerank_api_key: str = os.environ.get("RERANK_API_KEY", "")
         self.rerank_timeout: float = _float("RERANK_TIMEOUT", 60.0)
+        # Backpressure for the shared cross-encoder client (app/rerank.py,
+        # ADR-0001 D13). The reranker container serves `concurrency=4`; more
+        # in-flight scoring calls than that only queue there. A caller waits
+        # at most RERANK_WAIT_S for a slot, then keeps its own order.
+        # Load-tested 2026-09-03 (25 concurrent Fast questions): with 4 slots
+        # and a 0.25 s wait, 16 of 25 answers went unjudged ("degraded_busy")
+        # while the main model's own prefill queue put the first token 12 s
+        # out anyway. The reranker is a 0.6B model that batches sequences;
+        # 8 in flight and a one-second wait keep every answer judged at that
+        # load for a cost nobody can see.
+        self.rerank_max_inflight: int = _int("RERANK_MAX_INFLIGHT", 8)
+        self.rerank_wait_s: float = _float("RERANK_WAIT_S", 1.5)
+        # The knowledge pipeline's own waits (a Fast answer must not queue
+        # behind a Think search's 48-candidate rerank) and its per-call
+        # deadline. Half of the in-flight slots are reserved for it.
+        self.rerank_wait_fast_s: float = _float("RERANK_WAIT_FAST_S", 1.0)
+        self.rerank_wait_think_s: float = _float("RERANK_WAIT_THINK_S", 2.0)
+        self.rerank_stage_timeout_s: float = _float("RERANK_STAGE_TIMEOUT_S", 2.0)
+        self.rerank_reserved_slots: int = _int("RERANK_RESERVED_SLOTS", 4)
+        # A healthy-looking reranker can still return garbage (a wrong
+        # served model, a broken template). A fixed canary triple is scored
+        # at first use and every worker cycle; a failure trips a breaker so
+        # every caller degrades to its hybrid order instead of amplifying
+        # nonsense into confident grounding.
+        self.rerank_canary_enabled: bool = _bool("RERANK_CANARY_ENABLED", True)
+        self.rerank_breaker_s: float = _float("RERANK_BREAKER_S", 300.0)
 
         # --- Data stores (defaults match §6/§7 and what the sync-worker writes) ---
         # Readers prefer the PUBLISHED snapshot the sync worker renames into
@@ -419,6 +445,32 @@ class Settings:
         # index is DERIVED — deleting the directory is safe, PostgreSQL
         # rebuilds it.
         self.web_memory_enabled: bool = _bool("WEB_MEMORY_ENABLED", True)
+        # --- Vector index policy (ADR-0001 D8) ------------------------------
+        # Flat scan below this many chunks (measured 19 ms at 9k rows); an
+        # IVF_FLAT index above it (measured on a 90k-row copy: 9 ms at
+        # recall@10 = 0.995 with 50 probes, versus 150 ms flat). Built by the
+        # background worker, never on a request. The table is compacted and
+        # old versions pruned every WEB_INDEX_OPTIMIZE_EVERY worker cycles.
+        self.web_index_ann_min_rows: int = _int("WEB_INDEX_ANN_MIN_ROWS", 50_000)
+        self.web_index_nprobes: int = _int("WEB_INDEX_NPROBES", 50)
+        self.web_index_optimize_every: int = _int("WEB_INDEX_OPTIMIZE_EVERY", 12)
+        # Embedding calls sit on every assistant turn's critical path; this is
+        # their own read timeout (the generation wall clock is far too long).
+        self.embed_timeout_s: float = _float("EMBED_TIMEOUT_S", 4.0)
+        self.embed_batch_timeout_s: float = _float("EMBED_BATCH_TIMEOUT_S", 90.0)
+        # Query embeddings are bounded the way reranking is (ADR-0001 D13):
+        # this many in flight, and a caller waits at most EMBED_WAIT_S for a
+        # slot before retrieving lexical-only.
+        self.embed_max_inflight: int = _int("EMBED_MAX_INFLIGHT", 8)
+        self.embed_wait_s: float = _float("EMBED_WAIT_S", 1.0)
+        # Reader-side escape hatch for an ANN index: bypass it (flat scan)
+        # without touching data — the instant rollback for D8.
+        self.knowledge_ann_bypass: bool = _bool("KNOWLEDGE_ANN_BYPASS", False)
+        # STALE (design critique 2026-09-03): the best ANSWERING passage's
+        # own content date is older than this for a RECENT question → the
+        # store does not count as sufficient even though the copy is fresh.
+        # A REALTIME question uses its max age; STATIC never goes stale.
+        self.knowledge_stale_after_recent_s: int = _int("KNOWLEDGE_STALE_AFTER_RECENT_S", 120 * 86400)
         # --- Living knowledge layer (2026-09-01) -------------------------
         # Web memory used to be reachable only from inside the search engine,
         # so a Fast/no-search chat answered from frozen weights while the
@@ -434,7 +486,82 @@ class Settings:
         # 5-8 pages; this reads two.
         self.freshness_fast_lookup: bool = _bool("FRESHNESS_FAST_LOOKUP", True)
         self.freshness_fast_sources: int = _int("FRESHNESS_FAST_SOURCES", 2)
-        self.freshness_fast_deadline_s: float = _float("FRESHNESS_FAST_DEADLINE_S", 12.0)
+        # 12 → 8 s (2026-09-03): the deadline is the worst case a Fast answer
+        # waits before it starts; a lookup that has not landed two pages in
+        # eight seconds is not going to make the answer better.
+        self.freshness_fast_deadline_s: float = _float("FRESHNESS_FAST_DEADLINE_S", 8.0)
+        # How much locally-read evidence a grounded answer may carry. 900
+        # characters was one paragraph — "a large amount of information from
+        # the site" (owner, 2026-09-03) needs several passages, and ~1k
+        # tokens of prefill costs the Fast answer well under half a second.
+        self.living_knowledge_evidence_chars: int = _int("LIVING_KNOWLEDGE_EVIDENCE_CHARS", 3600)
+        # Topical grounding: a TIMELESS question is also answered from the
+        # corpus when a strongly matching passage exists (a site the user
+        # indexed, a doc a research run read) — the knowledge base a shared
+        # site is supposed to become. Gated on a strong match so ordinary
+        # chat never drags in loosely related pages.
+        self.living_knowledge_topical: bool = _bool("LIVING_KNOWLEDGE_TOPICAL", True)
+        # --- The unified evidence pipeline (ADR-0001, 2026-09-03) -----------
+        # Every candidate passage is scored by the templated cross-encoder
+        # for "does this answer the question" (app/rerank.py); that
+        # probability — not entity-word overlap — decides relevance,
+        # sufficiency and the order the model sees. Off => the hybrid score
+        # alone, as before.
+        self.knowledge_rerank: bool = _bool("KNOWLEDGE_RERANK", True)
+        # How many hybrid candidates are sent to the reranker per question
+        # (after duplicate collapse). Measured: 8 → 82 ms, 15 → 105 ms,
+        # 30 → 172 ms. A STATIC question judges at most 8.
+        self.knowledge_rerank_candidates: int = _int("KNOWLEDGE_RERANK_CANDIDATES", 12)
+        # A passage is RELEVANT (may be cited, may supersede) above this
+        # answer probability, and the corpus is SUFFICIENT (no live lookup)
+        # when the best passage clears the higher bar, or two clear the
+        # lower one.
+        self.knowledge_relevant_threshold: float = _float("KNOWLEDGE_RELEVANT_THRESHOLD", 0.30)
+        self.knowledge_answer_threshold: float = _float("KNOWLEDGE_ANSWER_THRESHOLD", 0.70)
+        # Local first at every effort: when the stored corpus answers with at
+        # least this probability and is fresh enough for the question, an
+        # AUTO-decided web search is skipped and the answer is grounded on
+        # the store (a forced search still runs, merged with stored evidence).
+        self.knowledge_local_first: bool = _bool("KNOWLEDGE_LOCAL_FIRST", True)
+        # The whole pre-answer stage (classify, retrieve, judge, and at Fast
+        # the tiny live lookup with its own 8 s cap) may take at most this
+        # long before the answer proceeds without it. A wedged sidecar costs
+        # a request this budget, never the generation wall clock.
+        self.knowledge_prepare_deadline_s: float = _float("KNOWLEDGE_PREPARE_DEADLINE_S", 12.0)
+        self.knowledge_local_first_confidence: float = _float("KNOWLEDGE_LOCAL_FIRST_CONFIDENCE", 0.85)
+        # Public-scope evidence cache: normalised question -> ranked evidence,
+        # for a few seconds. Holds ONLY public web evidence (no user or
+        # conversation data can enter it), so it is safe to share between
+        # users; the TTL is far below every freshness window.
+        self.knowledge_evidence_cache_ttl_s: float = _float("KNOWLEDGE_EVIDENCE_CACHE_TTL_S", 60.0)
+        self.knowledge_evidence_cache_size: int = _int("KNOWLEDGE_EVIDENCE_CACHE_SIZE", 256)
+        # Cross-chat recall of the assistant's OWN earlier answers for a
+        # question that needs evidence (an office holder, a price, a release).
+        # Off (default): only what the USER said in earlier chats is recalled
+        # for such questions — the forensic audit found an earlier answer
+        # being repeated and cited against sources that did not contain it.
+        self.recall_assistant_answers_for_facts: bool = _bool("RECALL_ASSISTANT_ANSWERS_FOR_FACTS", False)
+        # The FLOOR on the blended score; the real gate is vector agreement
+        # AND lexical overlap together (living_knowledge._topical). Measured
+        # 2026-09-02: a true documentation match scores 0.44-0.61 here.
+        self.living_knowledge_topical_min_score: float = _float(
+            "LIVING_KNOWLEDGE_TOPICAL_MIN_SCORE", 0.4
+        )
+        # --- Attachment latency (2026-09-03) ------------------------------
+        # The OCR sidecar transcribes BEFORE the main model can start. On a
+        # text-dense screenshot at Think that measured 47 s to the first
+        # visible token (the 3.3B model decoding a long transcript), against
+        # 2.3 s at Fast with no OCR. OCR is an enhancer, never a gate: the
+        # image route now caps what it asks for and waits at most this long,
+        # then proceeds pixels-only.
+        self.ocr_vision_deadline_s: float = _float("OCR_VISION_DEADLINE_S", 10.0)
+        self.ocr_vision_max_tokens: int = _int("OCR_VISION_MAX_TOKENS", 1500)
+        # Extract a document the moment it finishes uploading (text layer,
+        # page renders, OCR of scanned pages) so the send that follows reads
+        # a cache instead of paying for extraction on the answer's critical
+        # path — the way ChatGPT processes a file while you type.
+        self.document_prewarm_enabled: bool = _bool("DOCUMENT_PREWARM_ENABLED", True)
+        self.document_prewarm_max_mb: int = _int("DOCUMENT_PREWARM_MAX_MB", 64)
         # Background keeper: drains the embedding backlog and re-reads pages
         # past their TTL, newest-demand first. Runs inside the orchestrator as
         # an asyncio task — no extra container, and the queue is a PostgreSQL
@@ -471,6 +598,17 @@ class Settings:
         self.web_expand_after_search: bool = _bool("WEB_EXPAND_AFTER_SEARCH", True)
         self.web_expand_pages_per_domain: int = _int("WEB_EXPAND_PAGES_PER_DOMAIN", 8)
         self.web_expand_max_domains: int = _int("WEB_EXPAND_MAX_DOMAINS", 3)
+        # --- Background crawl queue (2026-09-03) -------------------------
+        # Sharing a URL used to read ONE page. Now the page is answered from
+        # immediately AND the site it lives on is queued for a bounded
+        # background crawl (engines/crawl.py:enqueue_site_crawl), drained by
+        # the knowledge worker one job at a time. The caps are per job; a
+        # site bigger than them resumes for free on the next share because
+        # stored pages cost nothing.
+        self.web_background_crawl_enabled: bool = _bool("WEB_BACKGROUND_CRAWL_ENABLED", True)
+        self.web_share_crawl_enabled: bool = _bool("WEB_SHARE_CRAWL_ENABLED", True)
+        self.web_share_crawl_max_pages: int = _int("WEB_SHARE_CRAWL_MAX_PAGES", 150)
+        self.web_share_crawl_max_minutes: float = _float("WEB_SHARE_CRAWL_MAX_MINUTES", 8.0)
 
         # --- Deep Research (2026-08-30): the iterative mode. Every default
         # below is derived from measurement on this deployment, not taste:
@@ -482,14 +620,19 @@ class Settings:
         # ~48k tokens of evidence — comfortable in a 1M window, and small
         # enough that the report call is not itself the bottleneck.
         self.deep_research_enabled: bool = _bool("DEEP_RESEARCH_ENABLED", True)
-        self.deep_research_max_iterations: int = _int("DEEP_RESEARCH_MAX_ITERATIONS", 3)
+        # 2026-09-03: 3 → 5 rounds and 24 → 36 sources. The loop no longer
+        # stops on a fixed count — it stops on evidence (see
+        # engines/deep_research.py: sufficiency, information gain, duplicate
+        # rate, budget) — so the caps are a ceiling for the hard question,
+        # not the typical run. The wall-clock budget is unchanged.
+        self.deep_research_max_iterations: int = _int("DEEP_RESEARCH_MAX_ITERATIONS", 5)
         self.deep_research_max_queries_per_iteration: int = _int(
             "DEEP_RESEARCH_MAX_QUERIES_PER_ITERATION", 5
         )
         self.deep_research_sources_per_iteration: int = _int(
             "DEEP_RESEARCH_SOURCES_PER_ITERATION", 10
         )
-        self.deep_research_max_sources: int = _int("DEEP_RESEARCH_MAX_SOURCES", 24)
+        self.deep_research_max_sources: int = _int("DEEP_RESEARCH_MAX_SOURCES", 36)
         # Below this the loop searches the plan's remaining angles instead of
         # asking the auditor whether three pages are enough.
         self.deep_research_min_sources: int = _int("DEEP_RESEARCH_MIN_SOURCES", 6)
@@ -497,6 +640,32 @@ class Settings:
         self.deep_research_report_max_tokens: int = _int(
             "DEEP_RESEARCH_REPORT_MAX_TOKENS", 6000
         )
+        # Links followed FROM the pages a round read (the citation an article
+        # gives for its claim, the official page a summary links to, the PDF
+        # behind a news story). Per round, on top of search results.
+        self.deep_research_links_per_round: int = _int("DEEP_RESEARCH_LINKS_PER_ROUND", 6)
+        # The self-correction pass: before the report, review each
+        # subquestion's evidence and run ONE more targeted round when a
+        # key claim is thin, unverified against a primary source, or the
+        # sources disagree.
+        self.deep_research_verify: bool = _bool("DEEP_RESEARCH_VERIFY", True)
+        self.deep_research_min_confidence: float = _float("DEEP_RESEARCH_MIN_CONFIDENCE", 0.6)
+        # Near-duplicate threshold (word-shingle Jaccard). Ten syndicated
+        # copies of one report count as ONE independent source.
+        self.deep_research_duplicate_threshold: float = _float(
+            "DEEP_RESEARCH_DUPLICATE_THRESHOLD", 0.6
+        )
+        # Two consecutive rounds adding fewer than this share of new,
+        # non-duplicate sources (and no new claims) means the web has been
+        # mined for this question: stop, whatever the iteration cap says.
+        self.deep_research_min_gain: float = _float("DEEP_RESEARCH_MIN_GAIN", 0.15)
+        # After the report: queue the top primary domains for a bounded
+        # background crawl so the NEXT question about them answers locally.
+        self.deep_research_background_crawl: bool = _bool("DEEP_RESEARCH_BACKGROUND_CRAWL", True)
+        self.deep_research_crawl_pages_per_domain: int = _int(
+            "DEEP_RESEARCH_CRAWL_PAGES_PER_DOMAIN", 40
+        )
+        self.deep_research_crawl_max_domains: int = _int("DEEP_RESEARCH_CRAWL_MAX_DOMAINS", 3)
 
         # --- Phase 2: URL / website analysis (fetches pasted links). ---
         self.url_analysis_enabled: bool = _bool("URL_ANALYSIS_ENABLED", True)

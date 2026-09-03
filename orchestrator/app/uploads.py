@@ -12,7 +12,9 @@ asks for a re-upload — never a 500.
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import mimetypes
 import os
 import shutil
@@ -32,6 +34,8 @@ from .core import archive, profile as profiler
 from .core.upload_paths import UploadPathError, resolve_upload_file
 
 router = APIRouter(prefix="/uploads", tags=["uploads"])
+
+log = logging.getLogger(__name__)
 
 _CHUNK = 1024 * 1024
 
@@ -82,10 +86,9 @@ async def create_upload(
     if not settings.dataset_uploads_enabled:
         raise HTTPException(status_code=404, detail="dataset uploads are disabled")
 
-    # Same ownership rule as every other per-conversation store.
-    owner = await db.run_in_thread(db.conversation_owner, conversation_id)
-    if owner is not None and owner != int(user["id"]):
-        raise HTTPException(status_code=404, detail="conversation not found")
+    # Same ownership rule as every other per-conversation store — and the
+    # same claim-on-first-touch as /chat (see _own).
+    await _own(conversation_id, user)
 
     upload_id = uuid.uuid4().hex
     root = upload_root(conversation_id, upload_id)
@@ -108,14 +111,67 @@ async def create_upload(
     return await _finalise_dataset(conversation_id, upload_id, filename, raw_path, size)
 
 
+#: Strong references to upload-time extraction tasks — asyncio keeps only
+#: weak refs, and an unreferenced task can be collected mid-flight.
+_PREWARM_TASKS: set = set()
+
+
+async def _prewarm_document(conversation_id: str, upload_id: str, filename: str) -> None:
+    """Extract a just-uploaded document in the background and cache it.
+
+    The send that follows finds `extracted/document.json` and reads it
+    instead of extracting on the answer's critical path (text layer, page
+    renders, OCR of scanned pages — seconds to tens of seconds for a scan).
+    Best-effort: any failure leaves no cache, and the chat path extracts
+    exactly as it did before.
+    """
+    root = upload_root(conversation_id, upload_id)
+    raw_path = os.path.join(root, "_original", filename)
+    try:
+        from .engines.document import extract_document, write_document_cache
+
+        def _read() -> bytes:
+            with open(raw_path, "rb") as fh:
+                return fh.read()
+
+        raw = await asyncio.to_thread(_read)
+        doc, _err = await extract_document(filename, raw, effort="think", question="")
+        if doc is None:
+            return
+        await asyncio.to_thread(write_document_cache, root, doc)
+        log.info(
+            "prewarmed %s (%s pages, %s OCR'd) for %s", filename, doc.total, doc.ocred, upload_id
+        )
+    except Exception:  # noqa: BLE001 — the answer path does not depend on this
+        log.debug("document prewarm skipped for %s", upload_id, exc_info=True)
+
+
+def _schedule_prewarm(conversation_id: str, upload_id: str, filename: str, size: int) -> None:
+    if not settings.document_prewarm_enabled:
+        return
+    if size > settings.document_prewarm_max_mb * 1024 * 1024:
+        return
+    lower = filename.lower()
+    if lower.endswith((".zip", ".tar", ".tar.gz", ".tgz")):
+        return  # archives are expanded per question by the chat path
+    try:
+        task = asyncio.create_task(_prewarm_document(conversation_id, upload_id, filename))
+    except RuntimeError:  # pragma: no cover — no running loop
+        return
+    _PREWARM_TASKS.add(task)
+    task.add_done_callback(_PREWARM_TASKS.discard)
+
+
 async def _finalise_document(
     conversation_id: str, upload_id: str, filename: str, size: int
 ) -> dict:
-    """A document keeps its original bytes; nothing to extract or profile."""
+    """A document keeps its original bytes; extraction is prewarmed behind
+    the response (2026-09-03) so the next send reads a cache."""
     await db.run_in_thread(
         db.save_upload,
         upload_id, conversation_id, filename, size, "ready", None, "document",
     )
+    _schedule_prewarm(conversation_id, upload_id, filename, size)
     return {
         "upload_id": upload_id,
         "filename": filename,
@@ -357,9 +413,31 @@ _MAX_PARTS = 64
 _MARKER = "_chunked.json"
 
 
+_CONVERSATION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
 async def _own(conversation_id: str, user: UserRow) -> None:
+    """The uploader must own the conversation — and if nobody does yet, the
+    uploader claims it NOW, exactly as /chat claims an id on its first
+    message.
+
+    Until 2026-09-03 an unowned id was merely tolerated here, so bytes and
+    extracted text landed under an id that whoever sent the next /chat with
+    it would inherit (pre-seeding). Claiming first closes that: after this
+    returns, the id belongs to this user or the request is refused.
+    """
     owner = await db.run_in_thread(db.conversation_owner, conversation_id)
-    if owner is not None and owner != int(user["id"]):
+    if owner is None:
+        if not _CONVERSATION_ID_RE.match(conversation_id or ""):
+            raise HTTPException(status_code=422, detail="invalid conversation id")
+        try:
+            await db.run_in_thread(
+                db.create_conversation, int(user["id"]), conversation_id, "New chat"
+            )
+        except db.IntegrityError:
+            pass  # raced another request for the same id — the recheck decides
+        owner = await db.run_in_thread(db.conversation_owner, conversation_id)
+    if owner != int(user["id"]):
         raise HTTPException(status_code=404, detail="conversation not found")
 
 

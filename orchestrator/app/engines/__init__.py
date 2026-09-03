@@ -18,6 +18,26 @@ def recent_turns(history: Sequence[dict], n: int) -> List[dict]:
     turns = [m for m in items if m.get("role") != "system"]
     return system + turns[-n:] if n > 0 else system
 
+
+def conversation_turns(history: Sequence[dict], n: int) -> List[dict]:
+    """The last `n` real turns, WITHOUT the pinned system blocks.
+
+    `recent_turns` keeps every system message on purpose — the chat engine
+    needs the user's saved facts, cross-chat recall and the excerpts of pages
+    and documents shared in this chat. A prompt whose OUTPUT LEAVES THE BOX
+    must not see them: the search query rewriter turns its context into
+    SearXNG queries, so a saved fact or a document excerpt in that prompt is a
+    saved fact or a document excerpt on the wire to third-party engines; and
+    the research planner, given the memory block, once listed the signed-in
+    user's own name as an entity to research. Only what the user actually
+    said and what the assistant answered is context for those. The same
+    blocks still reach the ANSWER prompt, which stays on this machine.
+
+    Deep Research keeps a private copy of this (`_conversation_turns`); the
+    behaviour is identical.
+    """
+    return [m for m in recent_turns(history, n) if m.get("role") != "system"]
+
 # First-run state: the warehouse/vector store do not exist until the
 # sync-worker completes its first Salesforce extract. Engines stream this
 # as a NORMAL answer (not an error event) so the UI stays friendly.

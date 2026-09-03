@@ -39,25 +39,75 @@ _INSTRUCT = "Given a question about Salesforce data, judge whether the record he
 
 
 async def retrieve(query: str, top_k: Optional[int] = None) -> List[dict]:
-    """Embed via EMBED_BASE_URL and search LanceDB. Returns hit dicts (top-30)."""
-    import lancedb  # lazy
+    """Embed via EMBED_BASE_URL and search LanceDB. Returns hit dicts (top-30).
 
-    db = lancedb.connect(settings.lancedb_dir)
-    table, metadata = open_compatible_table(
-        db,
-        settings.lancedb_dir,
-        settings.lancedb_table,
-        settings.embed_model,
-    )
+    A hit carries only what the prompt and the citations read — record_id,
+    object, text, _distance. The 1024-float `vector` used to ride along on
+    every hit: 30 x 4 KB converted to Python lists per question, for nothing
+    downstream ever looked at.
+
+    ANN (ADR-0001 D8): the sync-worker builds an IVF_FLAT index once the
+    table passes RAG_ANN_MIN_ROWS. When one exists the query probes
+    WEB_INDEX_NPROBES partitions and re-ranks 2x the limit by exact distance
+    (measured on a 90k-row copy: 9 ms at recall@10 = 0.995 with 50 probes,
+    versus 150 ms flat). KNOWLEDGE_ANN_BYPASS forces the flat scan without
+    touching data — the instant rollback. Another process builds the index,
+    so its presence is read from the table on every call (0.2 ms measured on
+    an opened table) rather than cached here.
+
+    The LanceDB work runs in a thread: a 150 ms flat scan on the event loop
+    stalled every other request for its duration (D13).
+    """
+
+    def _open():
+        import lancedb  # lazy
+
+        db = lancedb.connect(settings.lancedb_dir)
+        return open_compatible_table(
+            db,
+            settings.lancedb_dir,
+            settings.lancedb_table,
+            settings.embed_model,
+        )
+
+    table, metadata = await asyncio.to_thread(_open)
     vectors = await llm.embed_texts([query])
     if not vectors:
         return []
     validate_query_dimension(metadata, vectors[0], settings.lancedb_dir)
-    return (
-        table.search(vectors[0])
-        .limit(top_k or settings.rag_top_k)
-        .to_list()
-    )
+
+    def _has_vector_index() -> bool:
+        try:
+            for index in table.list_indices():
+                columns = [str(c) for c in (getattr(index, "columns", None) or [])]
+                name = str(getattr(index, "name", index)).lower()
+                if "vector" in columns or "vector" in name:
+                    return True
+        except Exception:  # noqa: BLE001 — cannot list: the flat scan is always right
+            pass
+        return False
+
+    def _search() -> List[dict]:
+        query_builder = (
+            table.search(vectors[0])
+            .limit(top_k or settings.rag_top_k)
+            .select(["record_id", "object", "text", "_distance"])
+        )
+        if settings.knowledge_ann_bypass:
+            try:
+                query_builder = query_builder.bypass_vector_index()
+            except Exception:  # noqa: BLE001 — older client: nothing to bypass
+                pass
+        elif _has_vector_index():
+            try:
+                query_builder = query_builder.nprobes(
+                    max(1, int(settings.web_index_nprobes))
+                ).refine_factor(2)
+            except Exception:  # noqa: BLE001 — older client: flat is fine
+                pass
+        return query_builder.to_list()
+
+    return await asyncio.to_thread(_search)
 
 
 def _load_reranker():
@@ -139,32 +189,35 @@ def _rank_remote_response(hits: List[dict], payload: object, top_n: int) -> List
     return [hits[index] for index in order[:top_n]]
 
 
+#: What the cross-encoder is asked when judging CRM records rather than web
+#: passages — the model card's format, a task-specific instruction.
+_RECORD_INSTRUCTION = (
+    "Given a question about an organisation's CRM data, retrieve the records "
+    "that contain the information needed to answer it"
+)
+
+
 async def _remote_rerank(query: str, hits: List[dict], top_n: int) -> List[dict]:
-    """Score all query/document pairs through a remote vLLM ``/score`` API."""
+    """Score all query/record pairs through the shared templated client.
+
+    Raises when scoring did not happen (disabled, busy, down, malformed), so
+    `select_context` keeps vector order — the same contract as before, now
+    with the model's own prompt template (ADR-0001 D4) and the in-flight
+    bound (D13) every other reranked path shares.
+    """
+    from .. import rerank
+
     if not settings.rerank_base_url:
         raise ValueError("RERANK_BASE_URL is required for the remote reranker")
-    if (
-        settings.reranker_capabilities.requires_authentication
-        and not settings.rerank_api_key
-    ):
-        raise ValueError("RERANK_API_KEY is required by the configured reranker")
-    headers = {}
-    if settings.rerank_api_key:
-        headers["Authorization"] = f"Bearer {settings.rerank_api_key}"
-    body = {
-        "model": settings.rerank_model,
-        # vLLM supports the 1→N form and returns one indexed score per document.
-        "text_1": query,
-        "text_2": [str(hit.get("text", ""))[:4000] for hit in hits],
-    }
-    async with httpx.AsyncClient(timeout=settings.rerank_timeout) as client:
-        response = await client.post(
-            reranker_score_url(settings.rerank_base_url),
-            json=body,
-            headers=headers,
+    try:
+        scores = await rerank.score(
+            query,
+            [str(hit.get("text", "")) for hit in hits],
+            instruction=_RECORD_INSTRUCTION,
         )
-        response.raise_for_status()
-        payload = response.json()
+    except rerank.RerankUnavailable as exc:
+        raise ValueError(str(exc)) from exc
+    payload = {"data": [{"index": i, "score": s} for i, s in enumerate(scores)]}
     return _rank_remote_response(hits, payload, top_n)
 
 

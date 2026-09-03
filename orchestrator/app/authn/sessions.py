@@ -111,6 +111,63 @@ def resolve(cookie_value: str) -> Optional[Dict[str, Any]]:
     return row
 
 
+#: What /auth/me tells a browser whose cookie no longer opens a session.
+END_SIGNED_OUT = "signed_out"          # no recognisable session at all
+END_SESSION_EXPIRED = "session_expired"
+END_SESSION_REVOKED = "session_revoked"  # logout / other-device revoke / password
+END_ACCOUNT_DISABLED = "account_disabled"
+END_ACCOUNT_REMOVED = "account_removed"
+
+
+def explain(cookie_value: str) -> Dict[str, Any]:
+    """Why this cookie does not (or no longer) open a session.
+
+    Only a cookie whose secret still matches the stored hash gets an answer
+    beyond "signed out": that match proves the browser held the real
+    session, so telling it "an administrator removed your access" reveals
+    nothing to anyone who was not that user. The login form, which has no
+    such proof, keeps its deliberately generic wording.
+
+    → {"code": END_*, "reason": <revoke_reason>, "ended_at": datetime|None,
+       "user_id": int|None}
+    """
+    out: Dict[str, Any] = {"code": END_SIGNED_OUT, "reason": "", "ended_at": None, "user_id": None}
+    parts = split_cookie(cookie_value or "")
+    if parts is None:
+        return out
+    sid, secret = parts
+    row = store.get_session(sid)
+    if row is None or not hmac.compare_digest(row["token_hash"], _hash(secret)):
+        return out
+    out["user_id"] = int(row["user_id"])
+    now = datetime.now(timezone.utc)
+    reason = (row.get("revoke_reason") or "") if hasattr(row, "get") else ""
+    if row["revoked_at"] is not None:
+        out["reason"] = reason
+        out["ended_at"] = row["revoked_at"]
+        if reason == store.REVOKE_ACCOUNT_REMOVED:
+            out["code"] = END_ACCOUNT_REMOVED
+        elif reason == store.REVOKE_ACCOUNT_DISABLED:
+            out["code"] = END_ACCOUNT_DISABLED
+        else:
+            out["code"] = END_SESSION_REVOKED
+        return out
+    if row["expires_at"] <= now or row["absolute_expires_at"] <= now:
+        out["code"] = END_SESSION_EXPIRED
+        out["ended_at"] = min(row["expires_at"], row["absolute_expires_at"])
+        return out
+    # The session itself is live, so the principal failed on the ACCOUNT: a
+    # disabled user or a deleted membership (a revoke that has not landed
+    # yet, or an operator flipping status by hand).
+    user = store.get_user(int(row["user_id"]))
+    if user is None or store.membership(int(row["user_id"])) is None:
+        out["code"] = END_ACCOUNT_REMOVED
+    elif user["status"] != "active":
+        out["code"] = END_ACCOUNT_DISABLED
+    out["ended_at"] = now
+    return out
+
+
 def _cookie_secure(request: Optional[Request]) -> bool:
     mode = settings.auth_cookie_secure
     if mode == "true":

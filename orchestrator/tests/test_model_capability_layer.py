@@ -151,23 +151,40 @@ class _ScoreClient:
 
 
 def test_remote_reranker_uses_score_api_and_response_indices(monkeypatch):
+    """The RAG engine scores through the ONE shared client (app/rerank.py):
+    the model's prompt template around a CRM-specific instruction, the
+    root /score endpoint, strict index handling."""
+    from app import rerank
+
     recorder = {}
     _ScoreClient.recorder = recorder
-    monkeypatch.setattr(rag.httpx, "AsyncClient", _ScoreClient)
+    monkeypatch.setattr(rerank.httpx, "AsyncClient", _ScoreClient)
+    monkeypatch.setattr(settings, "rerank_enabled", True)
     monkeypatch.setattr(settings, "rerank_base_url", "http://reranker:9000/v1/")
     monkeypatch.setattr(settings, "rerank_api_key", "")
     monkeypatch.setattr(settings, "rerank_model", "test-reranker")
+    monkeypatch.setattr(settings, "rerank_canary_enabled", False)
+
+    class _Caps:
+        enabled = True
+        supports_reranking = True
+        requires_authentication = False
+
+    monkeypatch.setattr(settings, "reranker_capabilities", _Caps())
+    rerank.reset_for_tests()
     hits = [{"text": "first"}, {"text": "second"}, {"text": "third"}]
 
     ranked = asyncio.run(rag._remote_rerank("query", hits, 2))
 
     assert ranked == [hits[1], hits[2]]
     assert recorder["url"] == "http://reranker:9000/score"
-    assert recorder["request"]["json"] == {
-        "model": "test-reranker",
-        "text_1": "query",
-        "text_2": ["first", "second", "third"],
-    }
+    body = recorder["request"]["json"]
+    assert body["model"] == "test-reranker"
+    assert body["text_1"].startswith(rerank.PREFIX)
+    assert rag._RECORD_INSTRUCTION in body["text_1"]
+    assert body["text_1"].endswith("<Query>: query\n")
+    assert [t.startswith("<Document>: ") and t.endswith(rerank.SUFFIX) for t in body["text_2"]] == [True] * 3
+    assert [t[len("<Document>: "):].split("<|im_end|>")[0] for t in body["text_2"]] == ["first", "second", "third"]
 
 
 def test_remote_reranker_failure_preserves_vector_order(monkeypatch):
@@ -348,3 +365,159 @@ def test_enabled_remote_reranker_health_runs_score_probe(monkeypatch):
 
     assert result == {"status": "ok"}
     assert called["client"] is sentinel
+
+
+# ---------------------------------------------------------------------------
+# engines.rag.retrieve — hit projection and the ANN switches (ADR-0001 D8),
+# against a small temporary LanceDB table shaped like the sync-worker's.
+# ---------------------------------------------------------------------------
+
+_SF_DIM = 8
+_NEEDLE_ID = "006000000000001AAA"
+
+
+def _seed_sf_chunks(tmp_path, needle, *, with_index: bool):
+    import json
+    import random
+
+    import lancedb
+    import pyarrow as pa
+
+    from app.embedding_index import METADATA_FILENAME
+
+    directory = tmp_path / "lancedb"
+    directory.mkdir()
+    (directory / METADATA_FILENAME).write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "table": "chunks",
+                "model_id": settings.embed_model,
+                "dimension": _SF_DIM,
+            }
+        )
+    )
+    schema = pa.schema(
+        [
+            pa.field("vector", pa.list_(pa.float32(), _SF_DIM)),
+            pa.field("text", pa.string()),
+            pa.field("object", pa.string()),
+            pa.field("record_id", pa.string()),
+            pa.field("field", pa.string()),
+            pa.field("system_modstamp", pa.string()),
+        ]
+    )
+    table = lancedb.connect(str(directory)).create_table("chunks", schema=schema)
+    rng = random.Random(7)
+    rows = [
+        {
+            "vector": [rng.random() for _ in range(_SF_DIM)],
+            "text": f"note {i}",
+            "object": "Account",
+            "record_id": f"001{i:015d}",
+            "field": "Description",
+            "system_modstamp": "",
+        }
+        for i in range(60)
+    ]
+    rows.append(
+        {
+            "vector": list(needle),
+            "text": "the needle",
+            "object": "Opportunity",
+            "record_id": _NEEDLE_ID,
+            "field": "Description",
+            "system_modstamp": "",
+        }
+    )
+    table.add(rows)
+    if with_index:
+        from lancedb.index import IvfFlat
+
+        table.create_index(
+            "vector", config=IvfFlat(distance_type="l2", num_partitions=4), replace=True
+        )
+    return directory
+
+
+def _point_retrieve_at(monkeypatch, directory, needle):
+    monkeypatch.setattr(settings, "lancedb_dir", str(directory))
+    monkeypatch.setattr(settings, "lancedb_table", "chunks")
+    monkeypatch.setattr(settings, "knowledge_ann_bypass", False)
+    monkeypatch.setattr(settings, "rag_top_k", 5)
+
+    async def embed_texts(texts, **kwargs):
+        return [list(needle) for _ in texts]
+
+    monkeypatch.setattr(rag.llm, "embed_texts", embed_texts)
+
+
+def _spy_query_builder(monkeypatch):
+    """Record which ANN knobs retrieve() turns on the query it builds."""
+    from lancedb.query import LanceVectorQueryBuilder
+
+    calls = []
+    for name in ("nprobes", "refine_factor", "bypass_vector_index"):
+        original = getattr(LanceVectorQueryBuilder, name)
+
+        def wrapped(self, *args, _name=name, _original=original):
+            calls.append((_name, *args))
+            return _original(self, *args)
+
+        monkeypatch.setattr(LanceVectorQueryBuilder, name, wrapped)
+    return calls
+
+
+def test_retrieve_ships_prompt_columns_only_and_flat_scans_an_unindexed_table(
+    tmp_path, monkeypatch
+):
+    needle = [0.5] * _SF_DIM
+    directory = _seed_sf_chunks(tmp_path, needle, with_index=False)
+    _point_retrieve_at(monkeypatch, directory, needle)
+    calls = _spy_query_builder(monkeypatch)
+
+    hits = asyncio.run(rag.retrieve("which opportunity is the needle"))
+
+    assert len(hits) == 5
+    assert hits[0]["record_id"] == _NEEDLE_ID
+    assert hits[0]["object"] == "Opportunity"
+    assert hits[0]["text"] == "the needle"
+    # The 1024-float vector no longer rides along; distance still does.
+    assert set(hits[0]) == {"record_id", "object", "text", "_distance"}
+    assert [h["_distance"] for h in hits] == sorted(h["_distance"] for h in hits)
+    # No index: no probes to set, nothing to bypass.
+    assert calls == []
+
+
+def test_retrieve_probes_the_ann_index_when_the_worker_built_one(tmp_path, monkeypatch):
+    needle = [0.25] * _SF_DIM
+    directory = _seed_sf_chunks(tmp_path, needle, with_index=True)
+    _point_retrieve_at(monkeypatch, directory, needle)
+    monkeypatch.setattr(settings, "web_index_nprobes", 7)
+    calls = _spy_query_builder(monkeypatch)
+
+    hits = asyncio.run(rag.retrieve("which opportunity is the needle"))
+
+    assert hits[0]["record_id"] == _NEEDLE_ID
+    assert "vector" not in hits[0]
+    assert calls == [("nprobes", 7), ("refine_factor", 2)]
+
+
+def test_retrieve_bypass_flag_forces_the_flat_scan_without_touching_data(
+    tmp_path, monkeypatch
+):
+    needle = [0.75] * _SF_DIM
+    directory = _seed_sf_chunks(tmp_path, needle, with_index=True)
+    _point_retrieve_at(monkeypatch, directory, needle)
+    monkeypatch.setattr(settings, "knowledge_ann_bypass", True)
+    calls = _spy_query_builder(monkeypatch)
+
+    hits = asyncio.run(rag.retrieve("which opportunity is the needle"))
+
+    assert hits[0]["record_id"] == _NEEDLE_ID
+    assert calls == [("bypass_vector_index",)]
+    # The rollback is reader-side only: the index the worker built is intact.
+    import lancedb
+
+    table = lancedb.connect(str(directory)).open_table("chunks")
+    assert [i.name for i in table.list_indices()] == ["vector_idx"]

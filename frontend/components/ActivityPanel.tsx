@@ -10,7 +10,13 @@
  */
 
 import { useEffect, useRef } from 'react';
-import type { AgentStep, DocumentActivity, Research, WebSource } from '@/lib/types';
+import type {
+  AgentStep,
+  DocumentActivity,
+  Research,
+  ResearchRun,
+  WebSource,
+} from '@/lib/types';
 import { documentReadView } from '@/lib/documentActivity';
 import { AgentTimeline } from './AgentTimeline';
 import {
@@ -29,6 +35,7 @@ export function ActivityPanel({
   reasoningSeconds,
   steps,
   research,
+  researchRun,
   sources,
   documentRead,
 }: {
@@ -39,6 +46,9 @@ export function ActivityPanel({
   /** The agent plan steps — inline only while streaming (2026-08-05). */
   steps?: AgentStep[];
   research?: Research;
+  /** Deep Research's account of itself (2026-09-03): what it established,
+      how, and why it stopped. */
+  researchRun?: ResearchRun;
   /** The answer's numbered [n] citations (meta.sources) — shown here, not
       in the proof drawer (owner request 2026-08-05: no box in the chat). */
   sources?: WebSource[];
@@ -204,6 +214,16 @@ export function ActivityPanel({
           </section>
         )}
 
+        {researchRun && (
+          <section aria-label="Research summary">
+            <h3 className="mb-2 flex items-center gap-2 text-xs font-medium uppercase tracking-wide text-faint">
+              <IconBook size={13} />
+              Research summary
+            </h3>
+            <ResearchSummary run={researchRun} />
+          </section>
+        )}
+
         {research && researchSources > 0 && (
           <section aria-label="Web research">
             <h3 className="flex items-center gap-1.5 text-[11px] font-medium uppercase tracking-wide text-faint">
@@ -230,5 +250,89 @@ export function ActivityPanel({
         )}
       </div>
     </aside>
+  );
+}
+
+
+/** Humanise a stop reason the server logged: "no_information_gain" → "no new information". */
+function stopReasonLabel(reason?: string): string {
+  switch (reason) {
+    case 'sufficient':
+      return 'the evidence was sufficient';
+    case 'no_information_gain':
+      return 'further searches found nothing new';
+    case 'duplicate_rate':
+      return 'new results were copies of pages already read';
+    case 'no_new_queries':
+      return 'there was nowhere left to look';
+    case 'iteration_cap':
+      return 'the round limit was reached';
+    case 'source_cap':
+      return 'the source limit was reached';
+    case 'timeout':
+      return 'the time budget ran out';
+    default:
+      return reason ? reason.replace(/_/g, ' ') : 'done';
+  }
+}
+
+const STATUS_CLASS: Record<string, string> = {
+  current: 'border-accent/50 text-accent',
+  conflicting: 'border-amber-500/60 text-amber-600',
+  unknown: 'border-border text-faint',
+  superseded: 'border-border text-muted',
+  historical: 'border-border text-muted',
+};
+
+/** What Deep Research established, per subquestion, and why it stopped. */
+export function ResearchSummary({ run }: { run: ResearchRun }) {
+  const primaries = run.primary_sources?.length ?? 0;
+  return (
+    <div className="flex flex-col gap-2 rounded-ts border border-border bg-surface p-2.5 text-xs">
+      <p className="text-muted">
+        Stopped because {stopReasonLabel(run.stop_reason)}
+        {run.confidence != null ? ` · confidence ${Math.round(run.confidence * 100)}%` : ''}
+        {run.iterations ? ` · ${run.iterations} ${run.iterations === 1 ? 'round' : 'rounds'}` : ''}
+        {run.verification_rounds ? ` (${run.verification_rounds} verification)` : ''}
+        {run.links_followed ? ` · ${run.links_followed} ${run.links_followed === 1 ? 'link' : 'links'} followed` : ''}
+        {primaries ? ` · ${primaries} primary ${primaries === 1 ? 'source' : 'sources'}` : ''}
+        {run.duplicates_dropped ? ` · ${run.duplicates_dropped} duplicate${run.duplicates_dropped === 1 ? '' : 's'} discounted` : ''}
+        {run.today ? ` · as of ${run.today}` : ''}
+      </p>
+      {run.resolutions && run.resolutions.length > 0 && (
+        <ul className="flex flex-col gap-1.5">
+          {run.resolutions.map((r, i) => (
+            <li key={`${i}-${r.subquestion}`} className="flex flex-col gap-0.5">
+              <span className="flex items-center gap-2">
+                <span
+                  className={`shrink-0 rounded-full border px-1.5 py-px text-[10px] font-medium uppercase tracking-wide ${
+                    STATUS_CLASS[r.status] ?? STATUS_CLASS.unknown
+                  }`}
+                >
+                  {r.status}
+                </span>
+                <span className="min-w-0 truncate text-ink">{r.subquestion}</span>
+              </span>
+              {r.status !== 'unknown' && r.value && (
+                <span className="pl-1 text-muted">
+                  {r.value}
+                  {r.as_of ? ` (as of ${r.as_of})` : ''}
+                  {r.support?.length ? ` · ${r.support.map((n) => `[${n}]`).join('')}` : ''}
+                  {r.superseded?.length
+                    ? ` · previously ${r.superseded.map((s) => `${s.value}${s.as_of ? ` (${s.as_of})` : ''}`).join(', ')}`
+                    : ''}
+                  {r.conflicts?.length
+                    ? ` · disputed by ${r.conflicts.map((c) => `${c.value}${c.as_of ? ` (${c.as_of})` : ''}`).join(', ')}`
+                    : ''}
+                </span>
+              )}
+              {r.status === 'unknown' && (
+                <span className="pl-1 text-faint">not found in the sources consulted</span>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
   );
 }

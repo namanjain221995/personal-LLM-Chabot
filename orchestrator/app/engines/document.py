@@ -8,8 +8,8 @@ ChatGPT-style, and remembered for the rest of the conversation:
   2. PDF: pull the text layer of EVERY page (cheap). Pages whose layer is
      thin (< TEXT_OK_CHARS — scans, photos) are rendered and sent to the
      Unlimited-OCR sidecar, up to OCR_PAGE_BUDGET pages, so a 100-page scan
-     still reads; the first pages also go to the model AS IMAGES so layout,
-     stamps and signatures stay visible.
+     still reads; the first pages also go to the model AS IMAGES when the
+     layout matters (see `page_images_wanted`).
   3. The full text (page-marked) is stored in the `documents` table keyed by
      conversation — main.py injects question-relevant excerpts into EVERY
      later turn, so "what did that PDF say about X?" works ten turns later.
@@ -23,12 +23,29 @@ merged, per-document-labelled text so "compare the two contracts" is a
 single question, not five. Page images ride along only for the FIRST PDF —
 five documents' worth of page renders would drown the context for no gain.
 
+LATENCY (2026-09-03). Two changes, both measured on the deployed model:
+
+  * A born-digital PDF used to send SIX full-page renders (~1,500 image
+    tokens each) alongside its own text — 7.8 s to the first token at Fast
+    for a 12-page text document, almost all of it prefilling pictures of
+    text the model already had as text. Renders now go only where they
+    carry information the text layer does not: scans, or a question about
+    layout/tables/figures/signatures; Think keeps two pages for layout.
+  * Extraction can run at UPLOAD time (uploads.py → `extract_document` →
+    `write_document_cache`), so the send that follows reads a cache instead
+    of extracting on the answer's critical path — the way ChatGPT processes
+    a file while you are still typing the question.
+
 Emits meta route "vision" — same visual-understanding engine as before.
 """
 from __future__ import annotations
 
 import base64
-from typing import Awaitable, Callable, List, Optional, Sequence, Tuple
+import json
+import logging
+import os
+import re
+from typing import Awaitable, Callable, List, Optional, Sequence, Tuple, Union
 
 from . import DIAGRAM_INSTRUCTION, recent_turns
 from .. import llm
@@ -36,6 +53,8 @@ from ..config import settings
 from ..core.pdf import (MAX_PDF_PAGES, extract_pdf_pages, render_pdf_pages,
                         render_pdf)
 from ..core.urls import select_relevant
+
+log = logging.getLogger(__name__)
 
 Emit = Callable[[str, dict], Awaitable[None]]
 
@@ -50,6 +69,12 @@ DOC_CONTEXT_CHARS = 48_000
 #: at most five references, but one of them may be an ARCHIVE whose expansion
 #: legitimately yields more members than that.
 MAX_DOCS = 12
+#: Page renders a Think/Max answer keeps for a born-digital PDF: enough to
+#: see the letterhead and the first table's layout, not a picture of every
+#: paragraph the text layer already carries.
+LAYOUT_PAGES = 2
+#: The pre-extraction cache file inside an upload's `extracted/` directory.
+CACHE_NAME = "document.json"
 
 _SYSTEM = (
     "You are a careful document analyst. You are given a document's extracted "
@@ -58,6 +83,17 @@ _SYSTEM = (
     "Answer using what is actually in the document. When asked to extract "
     "fields (invoices, contracts, forms), return the structured values you "
     "find. Do not invent details that are not present."
+)
+
+#: Words that mean the QUESTION is about what the page looks like, where the
+#: text layer alone cannot answer and the renders earn their tokens.
+_VISUAL_INTENT_RE = re.compile(
+    r"\b(table|tables|chart|charts|graph|graphs|figure|figures|diagram|diagrams|"
+    r"image|images|picture|pictures|photo|photos|layout|stamp|stamps|signature|"
+    r"signatures|signed|logo|form|forms|handwrit\w*|scan|scanned|visual\w*|"
+    r"drawing|drawings|screenshot|design|colou?rs?|font|fonts|formatting|"
+    r"header|footer|watermark)\b",
+    re.I,
 )
 
 
@@ -71,23 +107,49 @@ def _page_marked(pages: List[str]) -> str:
     )
 
 
+def page_images_wanted(
+    pages: Sequence[str], total: int, effort: str, question: str
+) -> int:
+    """How many first-page renders the answer should carry.
+
+    Renders carry information the text layer lacks in exactly two cases: a
+    SCAN (thin text layer — the model must see the page) and a question
+    about the page's appearance (a table's layout, a signature, a chart).
+    Otherwise Fast sends none — the text IS the document — and Think keeps
+    LAYOUT_PAGES so letterhead and structure stay visible.
+    """
+    if total <= 0:
+        return 0
+    head = list(pages[:MAX_PDF_PAGES])
+    if any(len(t or "") < TEXT_OK_CHARS for t in head):
+        return MAX_PDF_PAGES
+    if _VISUAL_INTENT_RE.search(question or ""):
+        return MAX_PDF_PAGES
+    if llm.normalize_effort(effort) == "fast":
+        return 0
+    return min(LAYOUT_PAGES, MAX_PDF_PAGES)
+
+
 async def _extract_pdf(
-    pdf_base64: str, emit: Emit
+    pdf_base64: str, emit: Optional[Emit], *, render_pages: int
 ) -> tuple[str, List[str], int, int, List[str]]:
     """→ (page-marked text, first-page images, total pages, ocr'd pages, pages)."""
     pages, total = extract_pdf_pages(pdf_base64)
-    images, _text, _total = render_pdf(pdf_base64)  # first pages, for layout
+    images: List[str] = []
+    if render_pages > 0:
+        images, _text, _total = render_pdf(pdf_base64, max_pages=render_pages)
 
     ocred = 0
     if settings.ocr_enabled:
         thin = [i for i, t in enumerate(pages) if len(t) < TEXT_OK_CHARS]
         thin = thin[:OCR_PAGE_BUDGET]
         if thin:
-            await emit(
-                "status",
-                {"text": f"Reading {len(thin)} scanned page"
-                 f"{'s' if len(thin) != 1 else ''} with OCR…"},
-            )
+            if emit is not None:
+                await emit(
+                    "status",
+                    {"text": f"Reading {len(thin)} scanned page"
+                     f"{'s' if len(thin) != 1 else ''} with OCR…"},
+                )
             from .ocr import ocr_images
 
             page_images = render_pdf_pages(pdf_base64, thin)
@@ -116,18 +178,55 @@ class _Doc:
         self.ocred = ocred
         self.raw_pages = raw_pages
 
+    def to_json(self) -> dict:
+        return {
+            "name": self.name,
+            "full_text": self.full_text,
+            "images": list(self.images or []),
+            "total": int(self.total or 0),
+            "ocred": int(self.ocred or 0),
+            "raw_pages": list(self.raw_pages or []),
+        }
 
-async def _read_one(
-    name: Optional[str], pdf_base64: str, emit: Emit
+    @classmethod
+    def from_json(cls, data: dict) -> "_Doc":
+        return cls(
+            data.get("name"),
+            data.get("full_text") or "",
+            list(data.get("images") or []),
+            int(data.get("total") or 0),
+            int(data.get("ocred") or 0),
+            list(data.get("raw_pages") or []),
+        )
+
+
+async def extract_document(
+    name: Optional[str],
+    raw: bytes,
+    *,
+    effort: str = "think",
+    question: str = "",
+    emit: Optional[Emit] = None,
 ) -> Tuple[Optional[_Doc], Optional[str]]:
-    """Sniff and extract ONE document. → (doc, error note). Exactly one is set."""
-    raw = base64.b64decode(_strip_data_url(pdf_base64))
+    """Sniff and extract ONE document from its bytes. → (doc, error note).
+
+    Exactly one of the pair is set. `effort` and `question` drive the page
+    render policy; the upload-time prewarm passes Think and an empty
+    question, which yields the superset a later Fast answer trims from.
+    """
     label = name or "document"
 
     if raw.startswith(b"%PDF"):
-        await emit("status", {"text": f"Reading {label}…"})
+        if emit is not None:
+            await emit("status", {"text": f"Reading {label}…"})
+        pdf_base64 = base64.b64encode(raw).decode("ascii")
+        try:
+            pages, total = extract_pdf_pages(pdf_base64)
+        except Exception as exc:  # noqa: BLE001 — a broken PDF is a note, not a 500
+            return None, f"Could not read {label} ({exc})."
+        wanted = page_images_wanted(pages, total, effort, question)
         full_text, images, total, ocred, raw_pages = await _extract_pdf(
-            pdf_base64, emit
+            pdf_base64, emit, render_pages=wanted
         )
         return _Doc(name, full_text, images, total, ocred, raw_pages), None
 
@@ -156,6 +255,78 @@ async def _read_one(
     return _Doc(name, full_text, [], 0, 0, []), None
 
 
+async def _read_one(
+    name: Optional[str],
+    pdf_base64: str,
+    emit: Emit,
+    *,
+    effort: str = "think",
+    question: str = "",
+) -> Tuple[Optional[_Doc], Optional[str]]:
+    """Sniff and extract ONE base64 document. → (doc, error note)."""
+    raw = base64.b64decode(_strip_data_url(pdf_base64))
+    return await extract_document(name, raw, effort=effort, question=question, emit=emit)
+
+
+# ---------------------------------------------------------------------------
+# The upload-time cache
+# ---------------------------------------------------------------------------
+
+
+def cache_path(upload_root: str) -> str:
+    return os.path.join(upload_root, "extracted", CACHE_NAME)
+
+
+def write_document_cache(upload_root: str, doc: _Doc) -> str:
+    """Persist an extracted document next to its original bytes. Blocking."""
+    path = cache_path(upload_root)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(doc.to_json(), fh)
+    os.replace(tmp, path)
+    return path
+
+
+def load_document_cache(
+    upload_root: str, name: Optional[str], *, effort: str = "think", question: str = ""
+) -> Optional[_Doc]:
+    """The pre-extracted document, when the cache can serve THIS answer.
+
+    The prewarm renders the superset a Think answer wants; a Fast answer
+    trims, a visual question or a scan may want more than was rendered —
+    then the caller extracts from the original bytes instead. None when
+    there is no cache or it is unusable; never raises."""
+    path = cache_path(upload_root)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = _Doc.from_json(json.load(fh))
+    except (OSError, ValueError):
+        return None
+    if name and not doc.name:
+        doc.name = name
+    if doc.total:
+        wanted = page_images_wanted(doc.raw_pages, doc.total, effort, question)
+        if wanted > len(doc.images):
+            return None
+        doc.images = list(doc.images[:wanted])
+    return doc
+
+
+# ---------------------------------------------------------------------------
+# Engine
+# ---------------------------------------------------------------------------
+
+
+DocInput = Union[Tuple[Optional[str], str], _Doc]
+
+
+def _item_name(item: DocInput) -> Optional[str]:
+    if isinstance(item, _Doc):
+        return item.name
+    return item[0] if isinstance(item, tuple) else None
+
+
 async def run_pdf_engine(
     message: str,
     pdf_base64: str,
@@ -179,7 +350,7 @@ async def run_pdf_engine(
 
 async def run_pdf_engine_multi(
     message: str,
-    docs: Sequence[Tuple[Optional[str], str]],
+    docs: Sequence[DocInput],
     history: Sequence[dict],
     emit: Emit,
     conversation_id: Optional[str] = None,
@@ -189,23 +360,27 @@ async def run_pdf_engine_multi(
 ) -> str:
     """Up to MAX_DOCS uploaded documents, answered as ONE question.
 
-    `effort` is the composer's Fast/Think/Max, exactly as on the image route
-    (2026-08-29). Until then this engine hard-coded ``effort="medium"`` — an
-    alias for "think" — so a document uploaded with Fast still ran a full
-    reasoning pass, and `meta.effort` (which reports `request.effort` for the
-    shared ``route="vision"``) described a level the answer had not run at.
+    `docs` items are (name, base64) pairs, or `_Doc` instances that were
+    already extracted (the upload-time cache). `effort` is the composer's
+    Fast/Think/Max, exactly as on the image route (2026-08-29): until then
+    this engine hard-coded ``effort="medium"`` — an alias for "think" — so a
+    document uploaded with Fast still ran a full reasoning pass.
     """
     docs = list(docs)[:MAX_DOCS]
     read: List[_Doc] = []
     failures: List[str] = []
-    for name, b64 in docs:
-        doc, err = await _read_one(name, b64, emit)
+    for item in docs:
+        if isinstance(item, _Doc):
+            doc, err = item, None
+        else:
+            name, b64 = item
+            doc, err = await _read_one(name, b64, emit, effort=effort, question=message)
         if doc is not None and (doc.full_text.strip() or doc.images):
             read.append(doc)
         elif err:
             failures.append(err)
         else:
-            failures.append(f"{name or 'A document'} has no readable content.")
+            failures.append(f"{_item_name(item) or 'A document'} has no readable content.")
 
     if not read:
         note = failures[0] if failures else "That document has no readable content."

@@ -90,3 +90,20 @@ def test_follow_up_uses_stored_and_does_not_refetch(temp_db, monkeypatch):
         )
     )
     assert calls["n"] == 0  # no fetch — served from storage
+
+
+def test_url_answers_honour_the_effort(temp_db, monkeypatch):
+    """A shared link at Fast used to think first (18 s of reasoning before the
+    first token, measured live 2026-09-02): the engine never passed the
+    composer's effort to stream_chat_events, whose default is thinking ON."""
+    db.save_url_document("c3", "https://x.com/p", "P", "Pricing is $49 per month.")
+    seen = {}
+
+    async def spy_stream(messages, **kw):
+        seen.update(kw)
+        yield "token", "ok"
+
+    monkeypatch.setattr(url_engine.llm, "stream_chat_events", spy_stream)
+    rec = Rec()
+    asyncio.run(url_engine.run_url_engine("price?", ["https://x.com/p"], "c3", [], rec.emit, effort="fast"))
+    assert seen.get("effort") == "fast"

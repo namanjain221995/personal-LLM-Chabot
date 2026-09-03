@@ -45,9 +45,75 @@ export interface MePayload {
   capabilities: string[];
 }
 
-export type MeResult =
-  | ({ ok: true } & MePayload)
-  | { ok: false; status: number };
+/**
+ * Why a session ended, as /auth/me reports it on a 401 for a browser whose
+ * cookie once opened a real session (2026-09-03). The server only explains
+ * when the cookie's secret still matches — proof the browser held that
+ * session — so none of this is available to the login form, which stays
+ * deliberately generic.
+ */
+export type SessionEndCode =
+  | 'account_removed'
+  | 'account_disabled'
+  | 'session_revoked'
+  | 'session_expired'
+  | 'signed_out';
+
+export interface SessionEndContact {
+  email: string;
+  name: string;
+}
+
+export interface MeFailure {
+  ok: false;
+  status: number;
+  code?: SessionEndCode;
+  /** The workspace the account was removed from / deactivated in. */
+  workspace?: string;
+  /** Who can restore access — active admins, super admins first. */
+  contact?: SessionEndContact[];
+  /** ISO timestamp of the revocation, when the server knows it. */
+  endedAt?: string;
+}
+
+export type MeResult = ({ ok: true } & MePayload) | MeFailure;
+
+const SESSION_END_CODES: ReadonlySet<string> = new Set([
+  'account_removed',
+  'account_disabled',
+  'session_revoked',
+  'session_expired',
+  'signed_out',
+]);
+
+/** The two codes that mean "this account cannot sign in again by itself". */
+export function isAccessEnded(code: SessionEndCode | undefined): boolean {
+  return code === 'account_removed' || code === 'account_disabled';
+}
+
+function parseFailure(status: number, body: unknown): MeFailure {
+  // FastAPI wraps a structured 401 as {detail: {...}}; a plain one is a string.
+  const detail = (body as { detail?: unknown } | null)?.detail;
+  const info = detail && typeof detail === 'object' ? (detail as Record<string, unknown>) : null;
+  const out: MeFailure = { ok: false, status };
+  if (!info) return out;
+  if (typeof info.code === 'string' && SESSION_END_CODES.has(info.code)) {
+    out.code = info.code as SessionEndCode;
+  }
+  if (typeof info.workspace === 'string' && info.workspace) out.workspace = info.workspace;
+  if (typeof info.ended_at === 'string' && info.ended_at) out.endedAt = info.ended_at;
+  if (Array.isArray(info.contact)) {
+    out.contact = info.contact
+      .map((c) => {
+        const r = c as Partial<SessionEndContact> | null;
+        return r && typeof r.email === 'string' && r.email
+          ? { email: r.email, name: typeof r.name === 'string' ? r.name : '' }
+          : null;
+      })
+      .filter((c): c is SessionEndContact => c !== null);
+  }
+  return out;
+}
 
 function parseUser(raw: unknown): MeUser | null {
   const u = raw as Partial<MeUser> | null | undefined;
@@ -77,7 +143,15 @@ function parseWorkspace(raw: unknown): MeWorkspace | null {
 export async function fetchMe(fetchFn: FetchLike = fetch): Promise<MeResult> {
   try {
     const res = await fetchFn('/api/auth/me', { cache: 'no-store' });
-    if (!res.ok) return { ok: false, status: res.status };
+    if (!res.ok) {
+      let body: unknown = null;
+      try {
+        body = await res.json();
+      } catch {
+        body = null;
+      }
+      return parseFailure(res.status, body);
+    }
     const body = (await res.json()) as Partial<MePayload> | null;
     const user = parseUser(body?.user);
     const username =
@@ -115,8 +189,9 @@ export function userScopeKey(me: {
 
 /* ------------------------------------------------- route gating (pages) */
 
-/** Pages reachable signed out: sign-in itself, and invitation acceptance. */
-const PUBLIC_PAGES = new Set(['/login', '/accept-invite']);
+/** Pages reachable signed out: sign-in, invitation acceptance, and the
+    page that explains a removed or deactivated account (2026-09-03). */
+const PUBLIC_PAGES = new Set(['/login', '/accept-invite', '/access-removed']);
 
 /**
  * The middleware's redirect decision, pure so it is unit-testable.
@@ -158,6 +233,69 @@ export function authRedirect(
  */
 export function redirectToLogin(): void {
   if (typeof window !== 'undefined') window.location.assign('/login');
+}
+
+/** A minimal navigator, injectable so the routing rule is testable. */
+export interface Navigator {
+  assign: (url: string) => void;
+}
+
+const browserNavigator: Navigator = {
+  assign: (url) => {
+    if (typeof window !== 'undefined') window.location.assign(url);
+  },
+};
+
+/**
+ * The page a dead session should land on (2026-09-03), pure so it is
+ * unit-testable: a removed or deactivated account goes to /access-removed
+ * with what that page needs in the query string (nothing secret — the
+ * workspace name and the admins' contact emails); everything else goes to
+ * sign-in exactly as before.
+ */
+export function sessionEndRoute(me: MeFailure): string {
+  if (!isAccessEnded(me.code)) return '/login';
+  const params = new URLSearchParams();
+  params.set('code', me.code as string);
+  if (me.workspace) params.set('ws', me.workspace);
+  if (me.endedAt) params.set('at', me.endedAt);
+  for (const c of me.contact ?? []) {
+    params.append('contact', c.name ? `${c.name} <${c.email}>` : c.email);
+  }
+  return `/access-removed?${params.toString()}`;
+}
+
+/**
+ * Route a dead session to the right page. A removed/deactivated account
+ * gets its local data ERASED first (the person no longer has access, and
+ * this may be a shared machine) — the same wipe logout performs — then the
+ * explanation page; any other end goes straight to sign-in.
+ *
+ * `me` may be passed when the caller already probed /auth/me (the boot
+ * path); otherwise it is fetched here (a 401 mid-session).
+ */
+export async function handleSessionEnd(
+  me?: MeFailure,
+  fetchFn: FetchLike = fetch,
+  nav: Navigator = browserNavigator,
+): Promise<void> {
+  let failure = me;
+  if (!failure) {
+    const probed = await fetchMe(fetchFn);
+    failure = probed.ok ? { ok: false, status: 401 } : probed;
+  }
+  if (!isAccessEnded(failure.code)) {
+    nav.assign('/login');
+    return;
+  }
+  try {
+    const { clearActiveUserData } = await import('./history');
+    await clearActiveUserData();
+  } catch {
+    // The wipe is a courtesy to the next person at this keyboard; the
+    // explanation page must show either way.
+  }
+  nav.assign(sessionEndRoute(failure));
 }
 
 /**

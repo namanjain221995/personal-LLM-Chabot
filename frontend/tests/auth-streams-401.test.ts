@@ -17,6 +17,12 @@ vi.mock('../lib/auth', () => ({
   redirectToLogin: () => {
     redirects.push('/login');
   },
+  // 2026-09-03: the streaming layer routes through handleSessionEnd, which
+  // asks /auth/me why the session ended; with no explanation it lands on
+  // sign-in exactly as redirectToLogin did.
+  handleSessionEnd: async () => {
+    redirects.push('/login');
+  },
 }));
 
 const saved: Array<{ id: string; messages: unknown[] }> = [];

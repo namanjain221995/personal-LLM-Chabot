@@ -5,15 +5,18 @@
  * context fills, and IS the manual compact control.
  *
  * WHAT THIS REPLACED (owner request 2026-09-02). The ring used to sit beside a
- * permanent `50%` label and open a 280px popover on click: an explanatory
- * paragraph, a "Messages and context" row, a "Reserved for reply (held back)"
- * row, a `5,235 / 991,296` total, three progress bars and a separate "Compact
- * now" button under them. All of that is gone. Raw token counts were never
- * something anyone acted on, and a whole dialog to reach one button made the
- * one action it offered the hardest thing in the composer to press.
+ * permanent `50%` label, carry a native `title` tooltip, and open a 280px
+ * portalled popover on click: an explanatory paragraph, a "Messages and
+ * context" row, a "Reserved for reply (held back)" row, a `5,235 / 991,296`
+ * total, three progress bars and a separate "Compact now" button under them.
+ * All of that is gone. Raw token counts were never something anyone acted on,
+ * and a whole dialog to reach one button made the one action it offered the
+ * hardest thing in the composer to press.
  *
  * Now: the ring alone. Hover or focus it for a percentage and what a click
- * will do; click it to compact. No popover, no second button, no token counts.
+ * will do; click it to compact. No popover, no second button, no token counts,
+ * and no `title` — a native tooltip beside a custom one is two tooltips saying
+ * the same thing at different moments in different places.
  *
  * The numbers still EXIST — `view.breakdown`, `view.tokensUsed` and
  * `view.usableBudget` arrive on every render and are what `view.fraction` is
@@ -80,7 +83,7 @@ export function ContextMeter({
     blocked: compactDisabled,
   });
 
-  // Held in a ref so `show`/`hide` keep a stable identity across renders.
+  // Held in a ref so `setShownAnd` keeps a stable identity across renders.
   const onOpenChangeRef = useRef(onOpenChange);
   onOpenChangeRef.current = onOpenChange;
   const setShownAnd = useCallback((next: boolean) => {
@@ -144,11 +147,7 @@ export function ContextMeter({
           viewBox={`0 0 ${SIZE} ${SIZE}`}
           aria-hidden
           className={
-            compacting
-              ? 'animate-spin'
-              : view.pulsing
-                ? 'ctx-pulse'
-                : undefined
+            compacting ? 'animate-spin' : view.pulsing ? 'ctx-pulse' : undefined
           }
         >
           <circle

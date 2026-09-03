@@ -58,6 +58,10 @@ _APP_TABLES = (
     "web_crawls",
     "web_results",
     "web_searches",
+    # V14: claims and page versions hang off web_pages (cascade / set null),
+    # listed first so the order is explicit.
+    "web_claims",
+    "web_page_versions",
     "web_pages",
     "sf_clarifications",
     "sf_intents",
@@ -374,3 +378,19 @@ def login_client():
         return client
 
     return _make
+
+
+@pytest.fixture(autouse=True)
+def _knowledge_process_state_clear():
+    """The knowledge layer keeps process-wide state — the public evidence
+    cache, the query-embedding LRU, the reranker breaker — that tests which
+    TRUNCATE tables between runs would otherwise see leak across tests."""
+    from app import llm as _llm, rerank as _rerank, web_memory as _web_memory
+
+    _web_memory.cache_clear()
+    _llm.embed_cache_clear()
+    _rerank.reset_for_tests()
+    yield
+    _web_memory.cache_clear()
+    _llm.embed_cache_clear()
+    _rerank.reset_for_tests()

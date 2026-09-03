@@ -18,7 +18,7 @@
  * which conversation is on screen.
  */
 
-import { redirectToLogin } from './auth';
+import { handleSessionEnd } from './auth';
 import { branchForAppend, branchOf, metaWithBranch } from './branching';
 import type { ClarificationResponse } from './clarification';
 import { getHistoryStore, newId } from './history';
@@ -104,7 +104,7 @@ export async function fetchServerActive(): Promise<string[]> {
       // where a mid-session sign-out surfaces first. A 401 here is session
       // death, not "nothing active" — route to sign-in instead of letting
       // the app degrade feature by feature.
-      redirectToLogin();
+      void handleSessionEnd();
       return [];
     }
     if (!res.ok) return [];
@@ -210,7 +210,7 @@ function markUnreachable(
     // route to sign-in instead.
     streams.delete(s.conversationId);
     notify(s.conversationId);
-    redirectToLogin();
+    void handleSessionEnd();
     return;
   }
   updateAssistant(

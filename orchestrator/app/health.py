@@ -217,6 +217,83 @@ def _check_embedding_index() -> dict:
     )
 
 
+def _check_web_index() -> dict:
+    """The web vector index (web_index.py): compatibility plus what it holds.
+
+    Additive and NEVER fatal. The index is derived state — PostgreSQL rebuilds
+    it (`tools.reindex_web`, or the worker's self-heal) — so a missing or
+    mismatched directory is "empty" / "degraded", not an outage; it must not
+    flip `status`, which the container healthcheck gates on. What an operator
+    needs from this entry is the two numbers the manifest of a rebuild is
+    validated against: `rows` (chunks) and `distinct_pages`, plus
+    `pending_pages` (the watermark backlog) so "is the index behind?" has an
+    answer without a database session.
+
+    Cost: the distinct-page count reads ONE int64 column, not the vectors —
+    measured 43-49 ms for 9,017 rows on the live index, linear in rows, so a
+    90k-row table stays under half a second at the 30 s healthcheck interval.
+    """
+    import json
+
+    from .embedding_index import inspect_embedding_index, metadata_path  # lazy
+    from .web_index import TABLE as web_table  # lazy: web_index imports llm/db
+
+    directory = settings.lancedb_web_dir
+    out: dict = {
+        "status": "empty",
+        "directory": directory,
+        "table": web_table,
+        "rows": 0,
+        "distinct_pages": 0,
+    }
+    try:
+        inspected = inspect_embedding_index(directory, web_table, settings.embed_model)
+    except Exception as exc:  # noqa: BLE001 — /health reports, never raises
+        inspected = {"status": "error", "detail": f"{type(exc).__name__}: {exc}"}
+    for key, value in inspected.items():
+        if key != "status":
+            out[key] = value
+    if inspected.get("status") == "ok":
+        try:
+            import lancedb  # lazy
+            import pyarrow.compute as pc
+
+            table = lancedb.connect(directory).open_table(web_table)
+            rows = int(table.count_rows())
+            out["rows"] = rows
+            if rows:
+                ids = table.search().select(["page_id"]).limit(rows).to_arrow()
+                out["distinct_pages"] = int(len(pc.unique(ids["page_id"])))
+            # Additive sidecar keys (chunker_version, query_instruction) that
+            # the typed loader ignores; a chunker bump is visible here first.
+            try:
+                with open(metadata_path(directory), encoding="utf-8") as fh:
+                    raw = json.load(fh)
+                for key in ("chunker_version", "query_instruction"):
+                    if key in raw:
+                        out[key] = raw[key]
+            except (OSError, ValueError):
+                pass
+            out["status"] = "ok"
+        except Exception as exc:  # noqa: BLE001
+            out["status"] = "degraded"
+            out["detail"] = f"{type(exc).__name__}: {exc}"
+    elif inspected.get("status") == "empty":
+        out["status"] = "empty"
+    else:
+        # A model/dimension mismatch is the same class of fault the Salesforce
+        # index reports as "error"; here it is degraded because the fix is a
+        # rebuild, not a restart, and the platform answers without the index.
+        out["status"] = "degraded"
+    try:
+        from . import db  # lazy
+
+        out["pending_pages"] = int(db.count_unindexed_web_pages())
+    except Exception:  # noqa: BLE001 — the database has its own check
+        pass
+    return out
+
+
 def _expected_schema_version() -> int:
     """Every migration in `db._MIGRATIONS` must be applied before we are healthy.
 
@@ -365,6 +442,7 @@ async def check_dependencies() -> dict:
             _probe_ocr(client),
             _probe_reranker(client),
             probe_context_window(client),
+            asyncio.to_thread(_check_web_index),
         )
     required_count = len(vllm_targets)
     checks: Dict[str, dict] = {
@@ -377,6 +455,7 @@ async def check_dependencies() -> dict:
     ocr_result = results[required_count + 3]
     reranker_result = results[required_count + 4]
     context_result = results[required_count + 5]
+    web_index_result = results[required_count + 6]
 
     endpoint_results = {
         url: checks[name] for name, url in vllm_targets
@@ -456,10 +535,14 @@ async def check_dependencies() -> dict:
     # smaller window than the server serves is a valid deployment, not an
     # outage. It is here so "is 262144 real?" has an answer that does not
     # involve reading a .env file and trusting it.
+    # `web_index` is additive too (never `status`, never `capability_status`):
+    # the web vector index is derived state that PostgreSQL rebuilds, so its
+    # worst case is a slower, dense-less answer, not an unavailable service.
     return {
         "status": overall,
         "checks": checks,
         "capability_status": capability_status,
         "capabilities": capabilities,
         "context": context_result,
+        "web_index": web_index_result,
     }
