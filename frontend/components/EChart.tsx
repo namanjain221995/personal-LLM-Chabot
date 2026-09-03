@@ -65,6 +65,8 @@ export default function EChart({
 }) {
   const wrapper = useRef<HTMLDivElement | null>(null);
   const chart = useRef<ChartInstance | null>(null);
+  /** The pending first-paint resize frame — cancelled if we unmount first. */
+  const readyFrame = useRef<number | null>(null);
 
   // echarts-for-react only listens to window resize. The proof drawer
   // changes width without the window changing at all, which left charts
@@ -75,6 +77,15 @@ export default function EChart({
     const observer = new ResizeObserver(() => chart.current?.resize());
     observer.observe(el);
     return () => observer.disconnect();
+  }, []);
+
+  // A chart unmounted inside one frame of becoming ready (a drawer closed the
+  // instant it opened) left the frame below queued against a disposed
+  // instance. The resize itself stays — it fixes real first-paint geometry.
+  useEffect(() => {
+    return () => {
+      if (readyFrame.current !== null) cancelAnimationFrame(readyFrame.current);
+    };
   }, []);
 
   return (
@@ -102,7 +113,10 @@ export default function EChart({
           // frame catches a chart mounted mid-layout (the tab expanding),
           // which otherwise drew into yesterday's geometry until something
           // else nudged it.
-          requestAnimationFrame(() => instance.resize());
+          readyFrame.current = requestAnimationFrame(() => {
+            readyFrame.current = null;
+            instance.resize();
+          });
         }}
       />
     </div>

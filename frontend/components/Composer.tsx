@@ -59,6 +59,14 @@ const MAX_DOCS = 5;
 const LINE_HEIGHT = 24;
 const MAX_ROWS = 10;
 
+/** A draft attachment's composer-local identity. See Attachment.clientId. */
+function newClientId(): string {
+  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
+    return `att-${crypto.randomUUID()}`;
+  }
+  return `att-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
 export interface ComposerHandle {
   focus: () => void;
   /** Focus, and append `seed` to whatever is already typed. */
@@ -97,6 +105,21 @@ export interface ComposerHandle {
 }
 
 export interface Attachment {
+  /**
+   * This draft chip's identity IN THE COMPOSER, and nothing else.
+   *
+   * Deliberately NOT called `id`: the server's durable `upload_id` — the one
+   * persisted on `meta.attachments[i].id` and resent in `pdf_uploads[]` —
+   * lives somewhere else entirely, is minted by /api/upload, and must never
+   * be confused with this. This one exists before any upload does, never
+   * leaves the browser, and is dropped the moment the message is sent.
+   *
+   * It exists because the chip list was keyed on `${name}-${index}`. Attach
+   * two files called report.png, remove the first, and the survivor inherits
+   * the removed chip's key — so React reuses that component instance for a
+   * different file instead of unmounting it.
+   */
+  clientId: string;
   name: string;
   /**
    * image = sent to the vision path; pdf = rendered server-side;
@@ -425,7 +448,14 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
       }
       if (isArchive || isOtherDoc) {
         // Streamed like a big document: File handle only, referenced on send.
-        appendDocument({ name: file.name, kind: 'pdf', dataUrl: '', base64: '', file });
+        appendDocument({
+          clientId: newClientId(),
+          name: file.name,
+          kind: 'pdf',
+          dataUrl: '',
+          base64: '',
+          file,
+        });
         return;
       }
       if (isDataset) {
@@ -433,14 +463,28 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
         // stream it to /api/upload when the message is sent. A dataset (like
         // a PDF) stands alone — it replaces whatever was attached.
         setAttachments([
-          { name: file.name, kind: 'dataset', dataUrl: '', base64: '', file },
+          {
+            clientId: newClientId(),
+            name: file.name,
+            kind: 'dataset',
+            dataUrl: '',
+            base64: '',
+            file,
+          },
         ]);
         return;
       }
       if (isPdf && file.size > INLINE_DOC_BYTES) {
         // A BIG document takes the dataset's road: File handle only, no
         // base64, streamed on send and referenced in the chat request.
-        appendDocument({ name: file.name, kind: 'pdf', dataUrl: '', base64: '', file });
+        appendDocument({
+          clientId: newClientId(),
+          name: file.name,
+          kind: 'pdf',
+          dataUrl: '',
+          base64: '',
+          file,
+        });
         return;
       }
       if (
@@ -463,6 +507,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
           : `pasted-image-${Date.now()}.${imageExtFromMime(file.type)}`;
       const attach = (dataUrl: string) => {
         const att: Attachment = {
+          clientId: newClientId(),
           name,
           kind: isPdf ? 'pdf' : 'image',
           dataUrl,
@@ -620,9 +665,9 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
           )}
           {attachments.length > 0 && (
             <div className="mb-2 flex flex-wrap items-start gap-2">
-              {attachments.map((attachment, idx) => (
+              {attachments.map((attachment) => (
                 <div
-                  key={`${attachment.name}-${idx}`}
+                  key={attachment.clientId}
                   className="inline-flex items-center gap-2 rounded-ts border border-border bg-surface p-1.5 pr-2"
                 >
                   {attachment.kind === 'pdf' || attachment.kind === 'dataset' ? (
@@ -650,7 +695,9 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
                   <button
                     type="button"
                     onClick={() =>
-                      setAttachments((prev) => prev.filter((_, i) => i !== idx))
+                      setAttachments((prev) =>
+                        prev.filter((a) => a.clientId !== attachment.clientId),
+                      )
                     }
                     aria-label={`Remove attachment ${attachment.name}`}
                     className="rounded-md p-1 text-faint transition-colors duration-ts hover:bg-surface-2 hover:text-ink"

@@ -1,5 +1,8 @@
 import type { Config } from 'tailwindcss';
 
+/** `100vh` then `100dvh` — see the height/minHeight note below. */
+const FALLBACK_DVH = ['100vh', '100dvh'] as unknown as string;
+
 /**
  * TechSara design tokens (§9) are defined as CSS variables in app/globals.css
  * (dark theme is primary; light theme overrides under html.light).
@@ -75,6 +78,24 @@ const config: Config = {
       },
       width: {
         sidebar: '260px',
+      },
+      /* `h-dvh` / `min-h-dvh` emitted `100dvh` ALONE. An engine that does not
+         know the unit drops the whole declaration and the shell falls back to
+         `height: auto` — the sidebar shortens and the composer stops being
+         pinned. An array emits both declarations in order, so `100dvh` still
+         wins wherever it is understood and `100vh` catches everything else.
+         Centralised here rather than at each call site, so every h-dvh in the
+         app (chat shell, admin layout, auth pages) is covered by one edit.
+
+         The cast is a TYPE gap, not a behaviour one: Tailwind v3 resolves an
+         array to successive declarations, but types the scale as
+         KeyValuePair<string, string>. Verified against the compiled utility —
+         `.h-dvh{height:100vh;height:100dvh}`. */
+      height: {
+        dvh: FALLBACK_DVH,
+      },
+      minHeight: {
+        dvh: FALLBACK_DVH,
       },
     },
   },

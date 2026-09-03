@@ -12,6 +12,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type ReactNode,
@@ -143,9 +144,25 @@ export function Providers({ children }: { children: ReactNode }) {
     };
   }, []);
 
+  /**
+   * Stable context objects.
+   *
+   * These were fresh literals on every render, and context propagation skips
+   * React's children bailout — so every `useTheme()`/`useToast()` consumer
+   * (ChatApp and Composer among them) re-rendered whenever a toast appeared
+   * OR expired, five seconds later, for a value none of them read.
+   *
+   * `toast` is already useCallback([])-stable, so `toastValue` is stable for
+   * the life of the provider: toast churn now re-renders the toast stack
+   * below and nothing else. `themeValue` still changes when the theme does,
+   * which is exactly when consumers genuinely must re-render.
+   */
+  const themeValue = useMemo(() => ({ theme, toggleTheme }), [theme, toggleTheme]);
+  const toastValue = useMemo(() => ({ toast }), [toast]);
+
   return (
-    <ThemeContext.Provider value={{ theme, toggleTheme }}>
-      <ToastContext.Provider value={{ toast }}>
+    <ThemeContext.Provider value={themeValue}>
+      <ToastContext.Provider value={toastValue}>
         {children}
         {/* Top-center, ChatGPT-style (owner request 2026-08-05). Bottom-center
             hid them behind the composer and its attachment chips.

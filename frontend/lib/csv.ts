@@ -35,7 +35,11 @@ export function downloadCsv(rows: DataRow[], filename: string): void {
   document.body.appendChild(a);
   a.click();
   a.remove();
-  URL.revokeObjectURL(url);
+  // Give the browser a tick to start the download before dropping the blob.
+  // Revoking synchronously here raced the download in Safari and Firefox,
+  // which resolve the object URL after the click's task returns — the same
+  // reason exportMarkdown and MermaidBlock defer theirs.
+  setTimeout(() => URL.revokeObjectURL(url), 0);
 }
 
 /**
