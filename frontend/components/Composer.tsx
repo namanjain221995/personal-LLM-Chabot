@@ -21,6 +21,7 @@ import {
   useRef,
   useState,
   type ClipboardEvent as ReactClipboardEvent,
+  type ReactNode,
 } from 'react';
 import type { ChatPrefs } from '@/lib/prefs';
 import { downscaleImageFile } from '@/lib/images';
@@ -172,6 +173,56 @@ const DATASET_SUFFIXES = [
   '.zip', '.tar', '.tar.gz', '.tgz', '.csv', '.tsv', '.parquet',
   '.xlsx', '.json', '.jsonl', '.ndjson',
 ];
+
+/**
+ * One active-tool pill: [icon] [label] [×].
+ *
+ * The four modes rendered through this — Salesforce, Live Salesforce, Web
+ * search, Deep research — had four byte-identical copies of the same markup
+ * and class list. They share this now so the pill's appearance, and its
+ * responsive behaviour, are defined ONCE. Each caller keeps its own
+ * `onClick`, because turning a mode off is not the same action for all of
+ * them: Salesforce and Live go through activateComposerMenuItem's toggle
+ * rules, and closing Live steps DOWN to synced rather than all the way off.
+ *
+ * WHY THE LABEL IS `sr-only` AND NOT `hidden` BELOW md (2026-09-04).
+ * On a 375px screen "[☁ Live Salesforce ×]" ate the control row and pushed
+ * the effort picker and Send out of line, so the label is dropped there. It
+ * is dropped with `sr-only`, not `display:none`, because every icon in this
+ * app is `aria-hidden` (components/icons.tsx) — the label IS this button's
+ * accessible name, and `display:none` would leave four nameless buttons on
+ * every phone. `sr-only` is absolutely positioned, so it is not a flex item:
+ * it contributes no width and no gap, which is the real layout removal the
+ * row needed, while the accessible name stays "Salesforce" at every width.
+ * `md:not-sr-only` returns it to the flow at 768px — the same boundary the
+ * sidebar uses (md:hidden / matchMedia('(max-width: 767px)')).
+ */
+function ModeChip({
+  icon,
+  label,
+  title,
+  onClick,
+}: {
+  /** The mode's OWN icon — never a generic one. */
+  icon: ReactNode;
+  label: string;
+  title: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-pressed
+      title={title}
+      className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-accent/50 bg-accent/10 px-2.5 py-1 text-xs font-medium text-accent transition-colors duration-ts"
+    >
+      {icon}
+      <span className="sr-only md:not-sr-only">{label}</span>
+      <IconX size={11} />
+    </button>
+  );
+}
 
 function isDatasetName(name: string): boolean {
   const lower = name.toLowerCase();
@@ -861,38 +912,28 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
                   Salesforce. Closing the Live pill steps DOWN to synced
                   mode (not all the way off) — one × per level. */}
               {prefs.salesforce && !prefs.sfLive && (
-                <button
-                  type="button"
+                <ModeChip
+                  icon={<IconCloud size={13} />}
+                  label="Salesforce"
+                  title="Salesforce mode is on — answers come from your synced data. Click to turn it off."
                   onClick={() => {
                     const out = activateComposerMenuItem('salesforce', prefs);
                     if (out.kind === 'prefs') onPrefsChange(out.prefs);
                   }}
-                  aria-pressed
-                  title="Salesforce mode is on — answers come from your synced data. Click to turn it off."
-                  className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-accent/50 bg-accent/10 px-2.5 py-1 text-xs font-medium text-accent transition-colors duration-ts"
-                >
-                  <IconCloud size={13} />
-                  Salesforce
-                  <IconX size={11} />
-                </button>
+                />
               )}
 
               {prefs.salesforce && prefs.sfLive && (
-                <button
-                  type="button"
+                <ModeChip
+                  icon={<IconSparkles size={13} />}
+                  label="Live Salesforce"
+                  title="Live Salesforce is on — every answer queries your org directly. Click to use the synced copy again."
                   onClick={() => {
                     const out = activateComposerMenuItem('sf-live', prefs);
                     if (out.kind === 'prefs') onPrefsChange(out.prefs);
                     textareaRef.current?.focus();
                   }}
-                  aria-pressed
-                  title="Live Salesforce is on — every answer queries your org directly. Click to use the synced copy again."
-                  className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-accent/50 bg-accent/10 px-2.5 py-1 text-xs font-medium text-accent transition-colors duration-ts"
-                >
-                  <IconSparkles size={13} />
-                  Live Salesforce
-                  <IconX size={11} />
-                </button>
+                />
               )}
 
               {/* The always-visible Web search toggle was REMOVED
@@ -903,22 +944,17 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
                   item) exists only outside it. While forced, this pill shows
                   the active tool, ChatGPT-style; clicking returns to auto. */}
               {!prefs.salesforce && prefs.webSearch === 'on' && (
-                <button
-                  type="button"
+                <ModeChip
+                  icon={<IconGlobe size={13} />}
+                  label="Web search"
+                  title="Web search is forced on — click to let the model decide again"
                   onClick={() => {
                     onPrefsChange({ ...prefs, webSearch: 'auto' });
                     // This click unmounts the pill — without a handoff,
                     // keyboard focus silently drops to <body>.
                     textareaRef.current?.focus();
                   }}
-                  aria-pressed
-                  title="Web search is forced on — click to let the model decide again"
-                  className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-accent/50 bg-accent/10 px-2.5 py-1 text-xs font-medium text-accent transition-colors duration-ts"
-                >
-                  <IconGlobe size={13} />
-                  Web search
-                  <IconX size={11} />
-                </button>
+                />
               )}
 
               {/* Deep Research (2026-08-30). Like the Web search pill this
@@ -928,22 +964,17 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
                   multi-minute report the user forgot they armed would be a
                   worse surprise than an extra click. */}
               {!prefs.salesforce && prefs.deepResearch && (
-                <button
-                  type="button"
+                <ModeChip
+                  icon={<IconBook size={13} />}
+                  label="Deep research"
+                  title="The next answer will be a researched, cited report — click to cancel"
                   onClick={() => {
                     onPrefsChange({ ...prefs, deepResearch: false });
                     // Same focus handoff as the pills above: this click
                     // unmounts the button it is on.
                     textareaRef.current?.focus();
                   }}
-                  aria-pressed
-                  title="The next answer will be a researched, cited report — click to cancel"
-                  className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-accent/50 bg-accent/10 px-2.5 py-1 text-xs font-medium text-accent transition-colors duration-ts"
-                >
-                  <IconBook size={13} />
-                  Deep research
-                  <IconX size={11} />
-                </button>
+                />
               )}
 
               {/* The Agent toggle was REMOVED (2026-07-28). Deciding when a
