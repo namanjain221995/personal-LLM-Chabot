@@ -18,6 +18,7 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { DataRow } from '@/lib/types';
+import { isNumeric, toNumber, type Cell } from '@/lib/chartFormat';
 import { downloadCsv } from '@/lib/csv';
 import { IconDownload } from './icons';
 
@@ -30,12 +31,18 @@ const OVERSCAN = 10;
 /** Used until a real row has been measured. */
 const ESTIMATED_ROW_HEIGHT = 33;
 
+/**
+ * Sorting and cell styling MUST agree on what a number is, so both go through
+ * lib/chartFormat — the app's one numeric predicate. It used to be
+ * `Number(value)` here and in the cell below, and `Number(true)` is 1, so a
+ * checkbox column sorted (and rendered) as if it were a measure.
+ */
 function compareValues(a: unknown, b: unknown): number {
   if (a === null || a === undefined) return b === null || b === undefined ? 0 : -1;
   if (b === null || b === undefined) return 1;
-  const na = typeof a === 'number' ? a : Number(a);
-  const nb = typeof b === 'number' ? b : Number(b);
-  if (!Number.isNaN(na) && !Number.isNaN(nb)) return na - nb;
+  const na = toNumber(a as Cell);
+  const nb = toNumber(b as Cell);
+  if (na !== null && nb !== null) return na - nb;
   return String(a).localeCompare(String(b));
 }
 
@@ -220,9 +227,8 @@ export function DataTable({
               >
                 {columns.map((col) => {
                   const v = row[col];
-                  const isNum =
-                    typeof v === 'number' ||
-                    (v !== '' && v !== null && !Number.isNaN(Number(v)));
+                  // Booleans are NOT measures. See compareValues above.
+                  const isNum = isNumeric(v as Cell);
                   return (
                     <td
                       key={col}
