@@ -1649,46 +1649,256 @@ def _report_messages(state: ResearchState, history: Sequence[dict]) -> List[dict
 # Persistence of what was learned
 # ---------------------------------------------------------------------------
 
+#: A stored quote is one sentence of a public page, clipped. 400 characters
+#: holds the sentences the extractor works from (its own excerpts are 2,500
+#: characters of a page, so a sentence longer than this is a run-on list, not
+#: a statement) and keeps the Fast-mode claims block to one line per fact.
+_QUOTE_MAX_CHARS = 400
+#: Topic words stored beside the quote — the planner's entities that the
+#: source itself mentions. A lexical hook for search_tsv, never a sentence.
+_TOPIC_MAX_CHARS = 120
+#: A value that is not stated verbatim may still match one sentence closely
+#: (a diacritic the extractor dropped, a stray character). 0.85 is the
+#: cut-off on difflib's ratio against the WHOLE sentence — "Francois Dupont"
+#: against "François Dupont" scores 0.93; a different sentence never comes
+#: close.
+_FUZZY_MIN_RATIO = 0.85
+#: The fuzzy path is closed to short values on purpose: one wrong character
+#: in a short string is a different name or number, not a typo — "Person A"
+#: against "Person B" scores 0.875, "version 3.2" against "version 3.3"
+#: scores 0.91 — and a claim stored wrongly here is served to every user.
+_FUZZY_MIN_CHARS = 24
+_SENTENCE_BREAK_RE = re.compile(r"(?<=[.!?])\s+|\n+")
+
+
+def _fold(text: str) -> str:
+    """Case-, accent- and punctuation-insensitive form of `text`, character
+    for character: positions found in the folded string index the original
+    (a precomposed accented letter folds to one letter; only ligatures and
+    fractions drift by a character, which the quote clipping tolerates)."""
+    import unicodedata  # local: the only user in this module, stdlib
+
+    out: List[str] = []
+    for ch in unicodedata.normalize("NFKD", text or ""):
+        if unicodedata.combining(ch):
+            continue
+        out.append(ch.lower() if ch.isalnum() else " ")
+    return "".join(out)
+
+
+def _find_value(folded_text: str, value: str) -> Optional[Tuple[int, int]]:
+    """Where `value` is stated in `folded_text` — as whole words, with any
+    whitespace or punctuation between them — or None. Whole words, so that
+    "Person A" is not found inside "Person Abbott"."""
+    tokens = _fold(value).split()
+    if not tokens:
+        return None
+    pattern = r"(?<!\w)" + r"\W+".join(re.escape(t) for t in tokens) + r"(?!\w)"
+    m = re.search(pattern, folded_text)
+    return (m.start(), m.end()) if m else None
+
+
+def _sentence_spans(text: str) -> List[Tuple[int, int]]:
+    spans: List[Tuple[int, int]] = []
+    start = 0
+    for m in _SENTENCE_BREAK_RE.finditer(text):
+        if m.start() > start:
+            spans.append((start, m.start()))
+        start = m.end()
+    if start < len(text):
+        spans.append((start, len(text)))
+    return spans
+
+
+def _clip_quote(text: str, span: Tuple[int, int], hit: Tuple[int, int]) -> str:
+    """The sentence at `span`, cut to _QUOTE_MAX_CHARS around `hit` when it
+    is longer, whitespace collapsed. The value always stays inside the cut."""
+    s, e = span
+    if e - s > _QUOTE_MAX_CHARS:
+        room = _QUOTE_MAX_CHARS - 2  # the two ellipsis marks
+        a, b = hit
+        start = max(s, min(a - (room - (b - a)) // 2, e - room))
+        piece = text[start:start + room]
+        piece = ("…" if start > s else "") + piece + ("…" if start + room < e else "")
+    else:
+        piece = text[s:e]
+    return " ".join(piece.split())[:_QUOTE_MAX_CHARS]
+
+
+#: (folded text, sentence spans) — what the matching needs from a page.
+_Prepared = Tuple[str, List[Tuple[int, int]]]
+
+
+def _prepare(text: str) -> _Prepared:
+    """Fold a page once. `_fold` is a per-character Python loop (measured
+    8 ms per 100k characters; a fuzzy miss then costs 85 ms across 1,300
+    sentences), and one run checks every claim against every supporting
+    source, so it is computed once per source, not once per pair."""
+    return _fold(text), _sentence_spans(text)
+
+
+def _quote_in(text: str, value: str, prepared: Optional[_Prepared] = None) -> str:
+    """The sentence of `text` that states `value`, or "".
+
+    Verbatim first (whole words, case/accent/punctuation folded); the match
+    may straddle a sentence break ("Acme Inc. Ltd"), so the quote joins the
+    sentences it touches. Then, for values long enough to make it safe, the
+    one sentence that reads almost the same as the value."""
+    value = " ".join((value or "").split())
+    if not value or not text:
+        return ""
+    folded, spans = prepared or _prepare(text)
+    if not spans:
+        return ""
+    hit = _find_value(folded, value)
+    if hit is not None:
+        a, b = hit
+        covering = [sp for sp in spans if sp[0] < b and sp[1] > a] or [spans[0]]
+        span = (covering[0][0], covering[-1][1])
+        return _clip_quote(text, span, (max(a, span[0]), min(b, span[1])))
+    folded_value = " ".join(_fold(value).split())
+    if len(folded_value) < _FUZZY_MIN_CHARS:
+        return ""
+    import difflib  # local: the only user in this module, stdlib
+
+    best, best_span = 0.0, None
+    for sp in spans:
+        candidate = " ".join(folded[sp[0]:sp[1]].split())
+        if not candidate or abs(len(candidate) - len(folded_value)) > len(folded_value) // 2:
+            continue  # a sentence half or twice the length cannot score 0.85
+        ratio = difflib.SequenceMatcher(None, folded_value, candidate, autojunk=False).ratio()
+        if ratio > best:
+            best, best_span = ratio, sp
+    if best_span is None or best < _FUZZY_MIN_RATIO:
+        return ""
+    return _clip_quote(text, best_span, best_span)
+
+
+def _supporting_sources(state: ResearchState, numbers: Sequence[int]) -> List[SourceRecord]:
+    """The canonical sources behind a value, best evidence first: a primary
+    source, then authority, then the order they were opened in — so the
+    quote stored is the one from the page a reader would trust most."""
+    srcs = [s for s in (state.source(int(n)) for n in numbers if n) if s is not None]
+    return sorted(srcs, key=lambda s: (not s.primary, -s.authority, s.n))
+
+
+def _topic_words(state: ResearchState, folded_source: str) -> str:
+    """The planner's entities that this source actually mentions (searched
+    in its folded text), as a comma-separated hook for search_tsv. Never the
+    question: an entity no public page names (a client, a colleague) has no
+    business in a shared row, and the source's own words already carry the
+    topic."""
+    folded = folded_source
+    picked: List[str] = []
+    for entity in state.entities:
+        words = " ".join(entity.split())
+        if words and words not in picked and _find_value(folded, words) is not None:
+            picked.append(words)
+    out = ", ".join(picked)
+    if len(out) > _TOPIC_MAX_CHARS:
+        out = out[:_TOPIC_MAX_CHARS].rsplit(",", 1)[0].strip(", ")
+    return out
+
+
+async def _page_ids(urls: Sequence[str]) -> Dict[str, int]:
+    """url_key → web_pages.id for the pages this run read. Best effort: the
+    store write is a background task (`_persist_and_index`) that has usually
+    landed by the time the report is out, and a claim with no page_id is
+    still a claim — it just carries no domain/authority in the claims block."""
+    keys = sorted({_normalize_url(u) for u in urls if u})
+    if not keys:
+        return {}
+    try:
+        pages = await db.run_in_thread(db.get_web_pages, keys)
+    except Exception:  # noqa: BLE001 — the claim is worth keeping without the link
+        log.debug("could not resolve research pages", exc_info=True)
+        return {}
+    return {str(p.get("url_key") or ""): int(p["id"]) for p in pages if p.get("id") is not None}
+
 
 async def _persist_claims(state: ResearchState) -> None:
-    """Resolved claims → web_claims, dated, for the knowledge layer."""
-    rows: List[dict] = []
+    """Resolved claims → web_claims, dated, for the knowledge layer.
+
+    web_claims is SHARED: the Fast-mode grounding block shows a stored claim
+    to every user who asks something with the same words. So a row may hold
+    only what a public page states, never the asker's phrasing. Before
+    2026-09-03 the stored claim was "<subquestion> <value>" — the planner
+    writes the subquestion from the user's message and recent turns, so a
+    question naming a client or a colleague would have been replayed to
+    strangers — and page_id was always NULL. Now:
+
+    * a row is written only when the value is found in a supporting source's
+      text (`_quote_in`); the sentence that states it is the row's `quote`
+      and its `claim`. A value no source states verbatim is dropped and
+      logged — the report still cites it, the shared store does not repeat it;
+    * `subquestion` holds only the planner's entity words the source
+      mentions, never the sentence;
+    * `page_id` is resolved through the same url_key `_persist_and_index`
+      stores the page under;
+    * `origin_user_id` / `origin_conversation_id` make the row attributable
+      and purgeable with the conversation.
+    """
+    wanted: List[Tuple[str, str, Optional[date], float, List[int]]] = []
     for res in state.resolutions.values():
         if res.status not in (STATUS_CURRENT, STATUS_CONFLICTING):
             continue
-        src = state.source(res.support[0]) if res.support else None
+        wanted.append((res.status, res.value, res.as_of, res.confidence, list(res.support)))
+        for s in res.superseded[:3]:
+            wanted.append(
+                (
+                    STATUS_SUPERSEDED,
+                    str(s.get("value") or ""),
+                    _parse_as_of(s.get("as_of")),
+                    min(res.confidence, 0.6),
+                    [int(n) for n in (s.get("sources") or []) if n],
+                )
+            )
+    rows: List[dict] = []
+    prepared: Dict[int, _Prepared] = {}
+    for kind, value, as_of, confidence, support in wanted:
+        value = " ".join((value or "").split())
+        src, quote = None, ""
+        for candidate in _supporting_sources(state, support):
+            if candidate.n not in prepared:
+                prepared[candidate.n] = _prepare(candidate.text)
+            quote = _quote_in(candidate.text, value, prepared[candidate.n])
+            if quote:
+                src = candidate
+                break
+        if src is None:
+            _rlog(
+                state,
+                "claim not persisted (%s): %r is not stated by %s",
+                kind, value[:80], "".join(f"[{n}]" for n in support) or "any source",
+            )
+            continue
         rows.append(
             {
                 "research_id": state.research_id,
                 "page_id": None,
-                "url": src.url if src else "",
-                "subquestion": res.question,
-                "claim": f"{res.question} {res.value}".strip() if res.value else res.question,
-                "value": res.value,
-                "as_of": res.as_of,
-                "kind": res.status,
-                "confidence": res.confidence,
+                "url": src.url,
+                "subquestion": _topic_words(state, prepared[src.n][0]),
+                "claim": quote,
+                "quote": quote,
+                "value": value,
+                "as_of": as_of,
+                "kind": kind,
+                "confidence": confidence,
+                "origin_user_id": state.user_id,
+                "origin_conversation_id": state.conversation_id or None,
             }
         )
-        for s in res.superseded[:3]:
-            rows.append(
-                {
-                    "research_id": state.research_id,
-                    "page_id": None,
-                    "url": "",
-                    "subquestion": res.question,
-                    "claim": f"{res.question} {s.get('value', '')}".strip(),
-                    "value": s.get("value", ""),
-                    "as_of": _parse_as_of(s.get("as_of")),
-                    "kind": STATUS_SUPERSEDED,
-                    "confidence": min(res.confidence, 0.6),
-                }
-            )
     if not rows:
         return
+    ids = await _page_ids([r["url"] for r in rows])
+    for r in rows:
+        r["page_id"] = ids.get(_normalize_url(r["url"]))
     try:
         written = await db.run_in_thread(db.insert_web_claims, rows)
-        _rlog(state, "persisted %d claim(s)", written)
+        _rlog(
+            state, "persisted %d claim(s), %d linked to a stored page",
+            written, sum(1 for r in rows if r["page_id"] is not None),
+        )
     except Exception:  # noqa: BLE001 — the report already exists
         log.debug("could not persist research claims", exc_info=True)
 

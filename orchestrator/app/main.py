@@ -8,6 +8,7 @@ import logging
 import mimetypes
 import os
 import uuid
+from datetime import datetime, timezone
 from typing import AsyncIterator, List, Literal, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -826,6 +827,10 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
     # Living-knowledge extras: the sources a locally-grounded answer used, so
     # the Sources panel can show provenance for an answer that never searched.
     knowledge_state: dict = {}
+    # Wall clock for the route-mix / TTFT metrics stamped on meta.
+    from time import perf_counter as _perf_counter
+
+    _timing: dict = {"started": _perf_counter(), "first_token": None}
 
     async def emit(event: str, data: dict) -> None:
         if event == "meta":
@@ -874,7 +879,32 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     "freshness": knowledge_state.get("freshness", ""),
                     "from_local_memory": knowledge_state.get("from_local_memory", True),
                 }
+            if knowledge_state.get("decision") or knowledge_state.get("degraded"):
+                data.setdefault("knowledge", {})
+                if knowledge_state.get("decision"):
+                    data["knowledge"]["decision"] = knowledge_state["decision"]
+                if knowledge_state.get("degraded"):
+                    data["knowledge"]["degraded"] = knowledge_state["degraded"]
+            # Route mix and time to first token, orchestrator-side (vLLM's
+            # own TTFT excludes every pre-pass — the number that matters to
+            # the person waiting is this one).
+            from . import metrics as _metrics
+            from time import perf_counter as _pc
+
+            route = str(data.get("route") or "unknown")
+            _metrics.inc("chat_route_total", route=route, effort=str(request.effort or ""))
+            if _timing.get("first_token") is not None:
+                _metrics.observe(
+                    "chat_ttft_seconds", _timing["first_token"], route=route, effort=str(request.effort or "")
+                )
+            _metrics.observe(
+                "chat_total_seconds", _pc() - _timing["started"], route=route, effort=str(request.effort or "")
+            )
             gen.final_meta = data
+        elif event == "token" and _timing.get("first_token") is None:
+            from time import perf_counter as _pc
+
+            _timing["first_token"] = _pc() - _timing["started"]
         await gen.publish(event, data)
 
     async def worker() -> None:
@@ -924,6 +954,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             want_agent = request.agent or bool(auto_plan and auto_plan.agent)
 
             want_search = False
+            search_rate_limited = False
             if (
                 settings.search_enabled
                 and request.web_search != "off"
@@ -943,6 +974,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
 
                 user_key = str(viewer)
                 if not rate_ok(user_key):
+                    search_rate_limited = True
                     await emit(
                         "status",
                         {"text": "Search rate limit reached — answering from model knowledge."},
@@ -953,7 +985,9 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     # The orchestration call already judged this request.
                     want_search = auto_plan.search
                 else:  # "auto"
-                    want_search = await should_search(request.text)
+                    # The conversation's own turns only — never the pinned
+                    # memory blocks (should_search strips them itself).
+                    want_search = await should_search(request.text, history)
 
             # Deep Research is EXPLICIT-only and needs the web: without a
             # search provider there is nothing to research, so the request
@@ -997,6 +1031,24 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             async def _note_lookup(kind: str, data: dict) -> None:
                 knowledge_lookup_started.set()
 
+            # May this request spend network at all? The pill OFF is a hard
+            # stop at every effort (until 2026-09-03 the Fast pre-pass still
+            # fetched two pages with the pill off, outside the per-user rate
+            # limit and unattributed in the search log). Salesforce mode and
+            # the rate limit close it too.
+            search_allowed = bool(
+                settings.search_enabled
+                and request.web_search != "off"
+                and auto_web_search_allowed
+                and not search_rate_limited
+            )
+            # Stage 1 runs for every assistant text turn — including one the
+            # auto classifier wants to SEARCH (ADR-0001 D6): if the store
+            # answers with confidence, the search is skipped; if it cannot,
+            # a Think request escalates. Only a FORCED search skips it: the
+            # search engine merges stored passages itself. Network inside
+            # the pre-pass is only allowed when no search is going to run.
+            prepared_early = None
             if (
                 settings.living_knowledge_enabled
                 and request.mode == "assistant"
@@ -1006,11 +1058,18 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 and not request.image_data
                 and not request.agent
                 and not want_agent
-                and not want_search
+                and not (want_search and request.web_search == "on")
                 and not deep_research_on
             ):
                 knowledge_task = asyncio.ensure_future(
-                    _prepare_knowledge(request, text, allow_network=True, emit=_note_lookup)
+                    _prepare_knowledge(
+                        request,
+                        text,
+                        allow_network=search_allowed and not want_search,
+                        emit=_note_lookup,
+                        user_id=viewer,
+                        conversation_id=conv_key_outer,
+                    )
                 )
 
             # Announce and record the auto-decision only AFTER the gates
@@ -1079,8 +1138,25 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                         ]
                     # 3. Semantic + keyword recall over other conversations,
                     #    merged into one block.
+                    # For a question that needs EVIDENCE (an office holder,
+                    # a price, a release) the assistant's own earlier answers
+                    # are not evidence: the audit found one being repeated
+                    # and cited against sources that never contained it,
+                    # while a colleague asking the same thing got "not in
+                    # the sources". What the USER said earlier still counts.
+                    from .freshness import classify_offline
+
+                    needs_evidence = classify_offline(
+                        request.text, now_year=datetime.now(timezone.utc).year
+                    ).needs_evidence
                     block = await memory_semantic.cross_chat_block(
-                        user_id, request.text, request.conversation_id
+                        user_id,
+                        request.text,
+                        request.conversation_id,
+                        include_assistant=(
+                            settings.recall_assistant_answers_for_facts
+                            or not needs_evidence
+                        ),
                     )
                 else:
                     # Salesforce mode keeps the original keyword-only recall.
@@ -1455,6 +1531,51 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 with contextlib.suppress(Exception):
                     await sf_intel_state.cancel_pending(conv_key)
 
+            # LOCAL FIRST / ESCALATION (ADR-0001 D6). The knowledge pre-pass
+            # ran concurrently with everything above; its verdict now sets
+            # the ladder: a store that answers with confidence cancels an
+            # AUTO-decided search (a forced one always runs), and a Think
+            # request whose store cannot answer a confirmed time-sensitive
+            # question climbs to the full search engine. Bounded: a wedged
+            # sidecar costs this request the deadline, then it answers
+            # without grounding and says so in the metrics.
+            if knowledge_task is not None and request.text:
+                from . import metrics as _metrics
+                from .living_knowledge import Prepared
+
+                try:
+                    prepared_early = await asyncio.wait_for(
+                        asyncio.shield(knowledge_task),
+                        timeout=float(settings.knowledge_prepare_deadline_s),
+                    )
+                except asyncio.TimeoutError:
+                    knowledge_task.cancel()
+                    knowledge_task = None
+                    prepared_early = Prepared()
+                    _metrics.inc("knowledge_degraded_total", reason="prepare_timeout")
+                except Exception:  # noqa: BLE001 — grounding is an enhancement
+                    knowledge_task = None
+                    prepared_early = Prepared()
+                if prepared_early.local_first and want_search and request.web_search != "on":
+                    want_search = False
+                    orchestration_state["search"] = False
+                    orchestration_state["local_first"] = True
+                    _metrics.inc("knowledge_escalation_total", effort=request.effort or "", stage="local_first")
+                    await emit("status", {"text": "Answering from stored knowledge…"})
+                elif (
+                    prepared_early.escalate
+                    and not want_search
+                    and search_allowed
+                    and request.effort != "fast"
+                    and not want_agent
+                    and not deep_research_on
+                ):
+                    want_search = True
+                    orchestration_state["search"] = True
+                    orchestration_state["escalated"] = True
+                    _metrics.inc("knowledge_escalation_total", effort=request.effort or "", stage="search")
+                    await emit("status", {"text": "Stored knowledge is not enough — searching the web…"})
+
             if sf_outcome is not None and sf_outcome.handled:
                 # Salesforce Intelligence Mode answered, or asked a question and
                 # is now waiting. Either way it already emitted its tokens and
@@ -1550,7 +1671,15 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 from .engines.url import run_url_engine
 
                 answer = await run_url_engine(
-                    text, url_list, conv_key, history, emit, effort=request.effort
+                    text,
+                    url_list,
+                    conv_key,
+                    history,
+                    emit,
+                    effort=request.effort,
+                    # The sharer is the page's introducer in the shared
+                    # corpus (V16) — attributable, purgeable.
+                    user_id=viewer,
                 )
             elif deep_research_on:
                 # Deep Research: the iterative research loop. It sits ABOVE
@@ -1644,7 +1773,9 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 # india" from pretraining while 19 stored pages said
                 # otherwise. Costs nothing for a timeless question (one regex)
                 # and one local lookup for a live one.
-                if knowledge_task is not None:
+                if prepared_early is not None:
+                    prepared = prepared_early
+                elif knowledge_task is not None:
                     if knowledge_lookup_started.is_set() and not knowledge_task.done():
                         # A live lookup is genuinely in flight and the user
                         # is now waiting on exactly that. Say so instead of
@@ -1653,8 +1784,17 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     prepared = await knowledge_task
                 else:
                     prepared = await _prepare_knowledge(
-                        request, text, allow_network=not want_search, emit=emit
+                        request,
+                        text,
+                        allow_network=not want_search,
+                        emit=emit,
+                        user_id=viewer,
+                        conversation_id=conv_key,
                     )
+                if prepared.decision:
+                    knowledge_state["decision"] = prepared.decision
+                if prepared.degraded:
+                    knowledge_state["degraded"] = prepared.degraded
                 if prepared.sources:
                     # Same shape the search engine emits, so the Sources panel
                     # and citation chips render locally-sourced evidence with
@@ -1813,12 +1953,21 @@ class StopRequest(BaseModel):
     session_id: str = "default"
 
 
-async def _prepare_knowledge(request, text: str, *, allow_network: bool, emit=None):
+async def _prepare_knowledge(
+    request,
+    text: str,
+    *,
+    allow_network: bool,
+    emit=None,
+    user_id: Optional[int] = None,
+    conversation_id: str = "",
+):
     """Freshness-aware grounding for one assistant turn, or an empty result.
 
     Wrapped so a failure in the knowledge layer can never cost the user an
     answer: on any error the caller gets empty grounding and the model answers
-    exactly as it did before this existed.
+    exactly as it did before this existed. `user_id`/`conversation_id`
+    attribute any page the Fast lookup introduces (V16).
     """
     from .living_knowledge import Prepared, prepare
 
@@ -1832,6 +1981,8 @@ async def _prepare_knowledge(request, text: str, *, allow_network: bool, emit=No
             web_search_pref=request.web_search,
             allow_network=allow_network and settings.search_enabled,
             emit=emit,
+            user_id=user_id,
+            conversation_id=conversation_id,
         )
     except asyncio.CancelledError:
         raise

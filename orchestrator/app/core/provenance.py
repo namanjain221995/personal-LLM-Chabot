@@ -1,7 +1,7 @@
 """Provenance of a fetched page: WHEN it says what it says, WHAT KIND of
 source it is, and whether two pages are the SAME report wearing two URLs.
 
-Three families of pure helpers, no I/O, no model calls:
+Four families of pure helpers, no I/O, no model calls:
 
   DATES        `page_dates()` reads publication / modification dates out of
                the page's own metadata (OpenGraph, JSON-LD, <time>, the
@@ -15,6 +15,13 @@ Three families of pure helpers, no I/O, no model calls:
                purpose: it recognises the CLASS of a site (a government
                suffix, a /press-release/ path, a Q&A forum), never a
                particular site or a particular answer.
+
+  UGC          `is_ugc_host()` recognises the shapes that mean "anyone can
+               publish here" — a tenant subdomain, a forum label, a personal
+               page, a wiki talk page — so that authority and "primary" are
+               never inherited from a trusted registrable domain by a page
+               its owner did not write. `authority_cap()` is what the store
+               applies on top of its own score.
 
   DUPLICATES   `shingles()` / `jaccard()` / `near_duplicate()` catch the
                syndicated copy: the same wire story on ten domains is one
@@ -35,7 +42,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from typing import FrozenSet, Iterable, Mapping, Optional
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 # ---------------------------------------------------------------------------
 # Dates
@@ -190,14 +197,180 @@ _COMMUNITY_HOST_RE = re.compile(
     r"(^|\.)(reddit\.com|stackoverflow\.com|stackexchange\.com|quora\.com|"
     r"news\.ycombinator\.com|discourse\.|forum\.|forums\.|community\.)", re.I,
 )
-_COMMUNITY_PATH_RE = re.compile(r"/(forum|forums|questions?|discussion|discussions|thread|threads|t)/", re.I)
+#: Path shapes that can only be a forum: nobody publishes first-party content
+#: under /forum/ or /thread/. Counted on every host, government included.
+_FORUM_PATH_RE = re.compile(r"/(forum|forums|discussion|discussions|thread|threads)/", re.I)
+#: Q&A-shaped paths that are a forum on most hosts but an FAQ on an agency
+#: site (/questions/ on a .gov is the agency's own FAQ) and a topic listing
+#: on others (/t/ is Discourse's topic prefix). Not counted on official
+#: hosts, where the public cannot write anyway.
+_QA_PATH_RE = re.compile(r"/(question|questions|t)/", re.I)
 _SOCIAL_HOST_RE = re.compile(
     r"(^|\.)(twitter\.com|x\.com|facebook\.com|instagram\.com|linkedin\.com|"
     r"threads\.net|tiktok\.com|youtube\.com|youtu\.be|t\.me|pinterest\.)", re.I,
 )
-_BLOG_RE = re.compile(r"(^|\.)(blogspot|wordpress\.com|medium\.com|substack\.com|tumblr\.com)|/blog(/|$)", re.I)
+#: Hosted-blog platforms (blogspot, wordpress.com, medium, substack, tumblr)
+#: used to live here. They are tenant platforms — anyone gets a subdomain —
+#: so they belong to the UGC class below; only the path shape is left.
+_BLOG_RE = re.compile(r"/blog(/|$)", re.I)
 _WIKI_RE = re.compile(r"(^|\.)(wikipedia\.org|wikimedia\.org|wikidata\.org|britannica\.com)$", re.I)
 _CODE_HOST_RE = re.compile(r"(^|\.)(github\.com|gitlab\.com|bitbucket\.org|pypi\.org|npmjs\.com|huggingface\.co)$", re.I)
+
+# ---------------------------------------------------------------------------
+# User-generated content — "anyone can publish here"
+#
+# Security critique (2026-09-03): authority and "primary" were inherited from
+# the registrable domain, so a page anyone can create under a trusted domain
+# scored as a reference or first-hand source. Measured before the fix:
+# sites.google.com and techcommunity.microsoft.com both scored 70 (the
+# google.com / microsoft.com reference entries), and `someone.github.io/docs/`
+# was a `docs` class and therefore primary. A member could plant a
+# "reference" page on any of them and the store would believe it over a
+# newsroom. The class below is STRUCTURAL: shapes of host and path that mean
+# an individual, not the domain's owner, wrote the page. It never names a
+# site the platform prefers for an answer, and it needs no allowlist, so a
+# platform that did not exist when this was written is still caught by its
+# shape.
+# ---------------------------------------------------------------------------
+
+#: A leftmost label that names a space handed to individuals on somebody
+#: else's domain (a tenant): personal sites, pastes, user directories,
+#: "answers" Q&A portals. Needs a registrable domain to its right, so
+#: `people.com` (two labels: a magazine) is not `people.csail.mit.edu`.
+#: Skipped on government hosts, where no individual can obtain a hostname
+#: and `answers.` is the agency's own FAQ.
+_UGC_TENANT_LABEL_RE = re.compile(r"^(sites|users?|people|gist|pastes?|pastebin|answers)\.", re.I)
+#: A leftmost label that names a place where the public writes: mailing
+#: lists, groups, discussion boards, "techcommunity"-style forums. Counted
+#: everywhere — an agency-run forum is still a forum.
+_UGC_FORUM_LABEL_RE = re.compile(
+    r"^(discussions?|discuss|[a-z0-9-]*communit(y|ies)|groups|lists|bbs|boards|talk)\.", re.I
+)
+#: Platforms whose subdomains are tenants (the shape the Public Suffix List
+#: files under PRIVATE DOMAINS): `<anyone>.github.io`, `<anyone>.medium.com`,
+#: an S3 bucket, a tunnel, a dynamic-DNS name. The apex counts too — Medium
+#: and Substack publish members at `medium.com/@name`. readthedocs.io is
+#: deliberately absent: its tenant IS the project whose manual it hosts, the
+#: /readthedocs path is already a docs shape, and the primary rule's
+#: authority floor keeps a neutral-authority tenant out of "primary" anyway.
+_UGC_PLATFORM_SUFFIXES = (
+    # static-site and page hosts
+    "github.io", "gitlab.io", "bitbucket.io", "pages.dev", "netlify.app", "vercel.app",
+    "web.app", "firebaseapp.com", "herokuapp.com", "onrender.com", "fly.dev", "glitch.me",
+    "repl.co", "surge.sh", "neocities.org", "notion.site", "super.site", "carrd.co",
+    "webflow.io", "wixsite.com", "weebly.com", "squarespace.com", "godaddysites.com",
+    "jimdosite.com", "strikingly.com", "yolasite.com", "altervista.org", "000webhostapp.com",
+    "tripod.com", "angelfire.com",
+    # hosted blogs and newsletters
+    "medium.com", "substack.com", "hashnode.dev", "ghost.io", "wordpress.com", "tumblr.com",
+    "livejournal.com", "over-blog.com",
+    # hosted forums and lists
+    "groups.io", "proboards.com", "freeforums.net", "boards.net", "forumotion.com",
+    # object storage, CDN and app hosting — a bucket is anyone's web page
+    "amazonaws.com", "storage.googleapis.com", "blob.core.windows.net", "web.core.windows.net",
+    "azurewebsites.net", "cloudfront.net", "r2.dev", "digitaloceanspaces.com", "appspot.com",
+    "workers.dev",
+    # tunnels and dynamic DNS — a laptop with a public name
+    "ngrok.io", "ngrok.app", "ngrok-free.app", "trycloudflare.com", "loca.lt", "duckdns.org",
+    "no-ip.org", "ddns.net", "nip.io", "sslip.io",
+)
+_UGC_PLATFORM_RE = re.compile(
+    r"(^|\.)(" + "|".join(re.escape(s) for s in _UGC_PLATFORM_SUFFIXES) + r")$", re.I
+)
+#: Blogger hands out `<name>.blogspot.<cc>` under dozens of country TLDs.
+_UGC_BLOGSPOT_RE = re.compile(r"(^|\.)blogspot\.[a-z]{2,}(\.[a-z]{2,})?$", re.I)
+#: Path shapes that mean an individual's space, on any host:
+#:   /~name/                 the classic personal page, on a university host too
+#:   /@name/                 a handle-namespaced author (Medium, Substack, Fediverse)
+#:   /document/d/<id>        a Drive-style shared document (Docs, Sheets, Slides, a file)
+#:   /pipermail/, /mailman/  a mailing-list archive
+#: Deliberately NOT here: /user/ and /users/ (`docs.example/user/guide/` is
+#: a manual section) and /profile/ (a company profile on a finance site is
+#: editorial). The host classes above already catch profile pages.
+_UGC_PATH_RE = re.compile(
+    r"^/(~[^/]+|@[^/]+)(/|$)|"
+    r"^/(document|spreadsheets|presentation|forms|file|drawings|folders)/d/|"
+    r"/(pipermail|mailman|hyperkitty|archives/list)/", re.I
+)
+#: MediaWiki namespaces that are a person's page or a discussion, not an
+#: article: User:, Talk:, any *_talk:, Draft:, and the project namespace
+#: (Wikipedia:/Project: — village pumps, deletion debates). Matched on the
+#: decoded path and on the ?title= form MediaWiki also serves.
+_WIKI_NAMESPACE_RE = re.compile(r"(^|/)(user|talk|draft|wikipedia|project|[a-z]+_talk):", re.I)
+_WIKI_TITLE_QUERY_RE = re.compile(r"(?:^|&)title=([^&]*)")
+
+#: The authority a UGC page may not exceed: web_memory.AUTHORITY_LOW. Defined
+#: here rather than imported because core/ must not depend on app/ (web_memory
+#: imports this module); tests pin the two equal.
+UGC_AUTHORITY_CAP = 15
+
+
+def _is_official_host(host: str) -> bool:
+    return host.endswith(_OFFICIAL_SUFFIX) or ".gov." in host
+
+
+def _wiki_namespace(path: str, query: str) -> bool:
+    candidates = [path]
+    m = _WIKI_TITLE_QUERY_RE.search(query)
+    if m:
+        candidates.append("/" + m.group(1))
+    for c in candidates:
+        # `User%3AJane`, `User%20talk:Jane` and `User+talk:Jane` are the same
+        # page as `User_talk:Jane`; compare the canonical form.
+        decoded = unquote(c).replace(" ", "_").replace("+", "_")
+        if _WIKI_NAMESPACE_RE.search(decoded):
+            return True
+    return False
+
+
+def is_ugc_host(url: str) -> bool:
+    """Could anyone — not the domain's owner — have written this page?
+
+    True for the structural shapes of user-generated content: a social or
+    forum host, a tenant subdomain of a hosting platform, a host label that
+    names a public writing space, a personal-page / handle / talk-page /
+    shared-document path. False for a page only the domain's owner could
+    have published. Social hosts are included (they are the purest case);
+    `source_type` keeps their finer label.
+    """
+    host = domain_of(url)
+    if not host:
+        return False
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return False
+    path = parts.path or "/"
+    if _SOCIAL_HOST_RE.search(host) or _COMMUNITY_HOST_RE.search(host):
+        return True
+    if _UGC_PLATFORM_RE.search(host) or _UGC_BLOGSPOT_RE.search(host):
+        return True
+    # A label rule needs a registrable domain to its right — three labels or
+    # more. `talk.example` is a site called talk; `talk.example.org` is a
+    # forum on example.org.
+    subdomain = host.count(".") >= 2
+    if subdomain and _UGC_FORUM_LABEL_RE.match(host):
+        return True
+    if _FORUM_PATH_RE.search(path) or _UGC_PATH_RE.search(path) or _wiki_namespace(path, parts.query or ""):
+        return True
+    # Government hosts: nobody outside the agency can obtain a hostname, and
+    # a Q&A-shaped path is the agency's own FAQ. Only the unmistakable shapes
+    # above count there.
+    if _is_official_host(host):
+        return False
+    if subdomain and _UGC_TENANT_LABEL_RE.match(host):
+        return True
+    return bool(_QA_PATH_RE.search(path))
+
+
+def authority_cap(url: str) -> Optional[int]:
+    """The most authority a page at this URL may carry, or None for no cap.
+
+    web_memory.authority_of scores a host by its suffix and a small reference
+    set, then applies this: a page anyone could have written is capped at
+    LOW (15) however trusted its registrable domain is."""
+    return UGC_AUTHORITY_CAP if is_ugc_host(url) else None
+
 
 SOURCE_TYPES = (
     "official", "academic", "reference", "docs", "press", "news", "code",
@@ -222,24 +395,27 @@ def source_type(url: str, content_type: str = "", sitename: str = "") -> str:
         path = urlsplit(url).path or "/"
     except ValueError:
         path = "/"
-    lowered = url.lower()
     ct = (content_type or "").lower()
+    # WHO could have written it outranks WHERE it sits and what format it is
+    # in: a forum thread on a government host is a forum, a talk page on an
+    # encyclopedia is a conversation, a PDF on a tenant site is self-published.
+    # Social keeps its finer label; it is user-generated too (is_ugc_host).
+    if _SOCIAL_HOST_RE.search(host):
+        return "social"
+    if is_ugc_host(url):
+        return "community"
     if "pdf" in ct or path.lower().endswith(".pdf"):
         # A PDF on an official or academic host stays official/academic —
         # the document class outranks the container format.
-        if host.endswith(_OFFICIAL_SUFFIX) or ".gov." in host:
+        if _is_official_host(host):
             return "official"
         if host.endswith(_ACADEMIC_SUFFIX):
             return "academic"
         return "pdf"
-    if host.endswith(_OFFICIAL_SUFFIX) or ".gov." in host:
+    if _is_official_host(host):
         return "official"
     if host.endswith(_ACADEMIC_SUFFIX) or host in ("arxiv.org", "pubmed.ncbi.nlm.nih.gov"):
         return "academic"
-    if _SOCIAL_HOST_RE.search(host):
-        return "social"
-    if _COMMUNITY_HOST_RE.search(host) or _COMMUNITY_PATH_RE.search(path):
-        return "community"
     if _WIKI_RE.search(host):
         return "reference"
     if _DOCS_HOST_RE.search(host) or _DOCS_PATH_RE.search(path):
@@ -248,7 +424,7 @@ def source_type(url: str, content_type: str = "", sitename: str = "") -> str:
         return "press"
     if _CODE_HOST_RE.search(host):
         return "code"
-    if _BLOG_RE.search(lowered):
+    if _BLOG_RE.search(path):
         return "blog"
     if _NEWS_PATH_RE.search(path) or host.startswith("news."):
         return "news"
@@ -260,17 +436,33 @@ def source_type(url: str, content_type: str = "", sitename: str = "") -> str:
 #: on those.
 PRIMARY_TYPES = frozenset({"official", "academic", "docs", "press"})
 
+#: The authority below which a documentation or press path is not first-hand
+#: on its own: web_memory.AUTHORITY_REFERENCE. A /docs/ path on a neutral
+#: (40) host is anyone's project site; on a reference-grade host it is the
+#: product's own manual. Official and academic suffixes need no floor — the
+#: suffix is the credential.
+PRIMARY_AUTHORITY_MIN = 70
+
 
 def is_primary(url: str, kind: str, authority: int) -> bool:
     """Is this a first-hand source rather than a report about one?
 
-    Structural again: an official or academic host, first-party
-    documentation, or a press/announcement path. High cached authority
-    (reference sites, first-party corporate domains) also counts — the
-    living-knowledge layer's authority scale already encodes that."""
-    if kind in PRIMARY_TYPES:
-        return True
-    return authority >= 70 and kind not in ("community", "social", "blog")
+    BOTH conditions, structurally: the class must publish first-hand
+    (PRIMARY_TYPES) AND either the suffix is the credential (official,
+    academic) or the host carries reference-grade authority. Authority alone
+    no longer makes a page of unknown class primary — a high score says the
+    domain is trusted, not that this page is the first-hand account.
+
+    And never a page anyone could have written. That is checked on the URL
+    itself, not on the class or the authority passed in, because rows stored
+    before this rule carry a `docs` class for `sites.google.com/.../docs/`
+    and an authority inherited from google.com (security critique,
+    2026-09-03)."""
+    if kind not in PRIMARY_TYPES:
+        return False
+    if is_ugc_host(url):
+        return False
+    return kind in ("official", "academic") or authority >= PRIMARY_AUTHORITY_MIN
 
 
 # ---------------------------------------------------------------------------

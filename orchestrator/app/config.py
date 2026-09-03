@@ -165,6 +165,26 @@ class Settings:
         self.rerank_base_url: str = os.environ.get("RERANK_BASE_URL", "").rstrip("/")
         self.rerank_api_key: str = os.environ.get("RERANK_API_KEY", "")
         self.rerank_timeout: float = _float("RERANK_TIMEOUT", 60.0)
+        # Backpressure for the shared cross-encoder client (app/rerank.py,
+        # ADR-0001 D13). The reranker container serves `concurrency=4`; more
+        # in-flight scoring calls than that only queue there. A caller waits
+        # at most RERANK_WAIT_S for a slot, then keeps its own order.
+        self.rerank_max_inflight: int = _int("RERANK_MAX_INFLIGHT", 4)
+        self.rerank_wait_s: float = _float("RERANK_WAIT_S", 1.5)
+        # The knowledge pipeline's own, shorter waits (a Fast answer must not
+        # queue behind a Think search's 48-candidate rerank) and its per-call
+        # deadline. Two of the in-flight slots are reserved for it.
+        self.rerank_wait_fast_s: float = _float("RERANK_WAIT_FAST_S", 0.25)
+        self.rerank_wait_think_s: float = _float("RERANK_WAIT_THINK_S", 1.0)
+        self.rerank_stage_timeout_s: float = _float("RERANK_STAGE_TIMEOUT_S", 2.0)
+        self.rerank_reserved_slots: int = _int("RERANK_RESERVED_SLOTS", 2)
+        # A healthy-looking reranker can still return garbage (a wrong
+        # served model, a broken template). A fixed canary triple is scored
+        # at first use and every worker cycle; a failure trips a breaker so
+        # every caller degrades to its hybrid order instead of amplifying
+        # nonsense into confident grounding.
+        self.rerank_canary_enabled: bool = _bool("RERANK_CANARY_ENABLED", True)
+        self.rerank_breaker_s: float = _float("RERANK_BREAKER_S", 300.0)
 
         # --- Data stores (defaults match §6/§7 and what the sync-worker writes) ---
         # Readers prefer the PUBLISHED snapshot the sync worker renames into
@@ -419,6 +439,32 @@ class Settings:
         # index is DERIVED — deleting the directory is safe, PostgreSQL
         # rebuilds it.
         self.web_memory_enabled: bool = _bool("WEB_MEMORY_ENABLED", True)
+        # --- Vector index policy (ADR-0001 D8) ------------------------------
+        # Flat scan below this many chunks (measured 19 ms at 9k rows); an
+        # IVF_FLAT index above it (measured on a 90k-row copy: 9 ms at
+        # recall@10 = 0.995 with 50 probes, versus 150 ms flat). Built by the
+        # background worker, never on a request. The table is compacted and
+        # old versions pruned every WEB_INDEX_OPTIMIZE_EVERY worker cycles.
+        self.web_index_ann_min_rows: int = _int("WEB_INDEX_ANN_MIN_ROWS", 50_000)
+        self.web_index_nprobes: int = _int("WEB_INDEX_NPROBES", 50)
+        self.web_index_optimize_every: int = _int("WEB_INDEX_OPTIMIZE_EVERY", 12)
+        # Embedding calls sit on every assistant turn's critical path; this is
+        # their own read timeout (the generation wall clock is far too long).
+        self.embed_timeout_s: float = _float("EMBED_TIMEOUT_S", 4.0)
+        self.embed_batch_timeout_s: float = _float("EMBED_BATCH_TIMEOUT_S", 90.0)
+        # Query embeddings are bounded the way reranking is (ADR-0001 D13):
+        # this many in flight, and a caller waits at most EMBED_WAIT_S for a
+        # slot before retrieving lexical-only.
+        self.embed_max_inflight: int = _int("EMBED_MAX_INFLIGHT", 8)
+        self.embed_wait_s: float = _float("EMBED_WAIT_S", 1.0)
+        # Reader-side escape hatch for an ANN index: bypass it (flat scan)
+        # without touching data — the instant rollback for D8.
+        self.knowledge_ann_bypass: bool = _bool("KNOWLEDGE_ANN_BYPASS", False)
+        # STALE (design critique 2026-09-03): the best ANSWERING passage's
+        # own content date is older than this for a RECENT question → the
+        # store does not count as sufficient even though the copy is fresh.
+        # A REALTIME question uses its max age; STATIC never goes stale.
+        self.knowledge_stale_after_recent_s: int = _int("KNOWLEDGE_STALE_AFTER_RECENT_S", 120 * 86400)
         # --- Living knowledge layer (2026-09-01) -------------------------
         # Web memory used to be reachable only from inside the search engine,
         # so a Fast/no-search chat answered from frozen weights while the
@@ -449,6 +495,46 @@ class Settings:
         # site is supposed to become. Gated on a strong match so ordinary
         # chat never drags in loosely related pages.
         self.living_knowledge_topical: bool = _bool("LIVING_KNOWLEDGE_TOPICAL", True)
+        # --- The unified evidence pipeline (ADR-0001, 2026-09-03) -----------
+        # Every candidate passage is scored by the templated cross-encoder
+        # for "does this answer the question" (app/rerank.py); that
+        # probability — not entity-word overlap — decides relevance,
+        # sufficiency and the order the model sees. Off => the hybrid score
+        # alone, as before.
+        self.knowledge_rerank: bool = _bool("KNOWLEDGE_RERANK", True)
+        # How many hybrid candidates are sent to the reranker per question
+        # (after duplicate collapse). Measured: 8 → 82 ms, 15 → 105 ms,
+        # 30 → 172 ms. A STATIC question judges at most 8.
+        self.knowledge_rerank_candidates: int = _int("KNOWLEDGE_RERANK_CANDIDATES", 12)
+        # A passage is RELEVANT (may be cited, may supersede) above this
+        # answer probability, and the corpus is SUFFICIENT (no live lookup)
+        # when the best passage clears the higher bar, or two clear the
+        # lower one.
+        self.knowledge_relevant_threshold: float = _float("KNOWLEDGE_RELEVANT_THRESHOLD", 0.30)
+        self.knowledge_answer_threshold: float = _float("KNOWLEDGE_ANSWER_THRESHOLD", 0.70)
+        # Local first at every effort: when the stored corpus answers with at
+        # least this probability and is fresh enough for the question, an
+        # AUTO-decided web search is skipped and the answer is grounded on
+        # the store (a forced search still runs, merged with stored evidence).
+        self.knowledge_local_first: bool = _bool("KNOWLEDGE_LOCAL_FIRST", True)
+        # The whole pre-answer stage (classify, retrieve, judge, and at Fast
+        # the tiny live lookup with its own 8 s cap) may take at most this
+        # long before the answer proceeds without it. A wedged sidecar costs
+        # a request this budget, never the generation wall clock.
+        self.knowledge_prepare_deadline_s: float = _float("KNOWLEDGE_PREPARE_DEADLINE_S", 12.0)
+        self.knowledge_local_first_confidence: float = _float("KNOWLEDGE_LOCAL_FIRST_CONFIDENCE", 0.85)
+        # Public-scope evidence cache: normalised question -> ranked evidence,
+        # for a few seconds. Holds ONLY public web evidence (no user or
+        # conversation data can enter it), so it is safe to share between
+        # users; the TTL is far below every freshness window.
+        self.knowledge_evidence_cache_ttl_s: float = _float("KNOWLEDGE_EVIDENCE_CACHE_TTL_S", 60.0)
+        self.knowledge_evidence_cache_size: int = _int("KNOWLEDGE_EVIDENCE_CACHE_SIZE", 256)
+        # Cross-chat recall of the assistant's OWN earlier answers for a
+        # question that needs evidence (an office holder, a price, a release).
+        # Off (default): only what the USER said in earlier chats is recalled
+        # for such questions — the forensic audit found an earlier answer
+        # being repeated and cited against sources that did not contain it.
+        self.recall_assistant_answers_for_facts: bool = _bool("RECALL_ASSISTANT_ANSWERS_FOR_FACTS", False)
         # The FLOOR on the blended score; the real gate is vector agreement
         # AND lexical overlap together (living_knowledge._topical). Measured
         # 2026-09-02: a true documentation match scores 0.44-0.61 here.

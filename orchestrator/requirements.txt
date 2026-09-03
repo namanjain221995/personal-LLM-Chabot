@@ -8,9 +8,17 @@ langgraph>=0.2
 openai>=1.50
 httpx>=0.27
 duckdb>=1.0
-lancedb>=0.15
+# LanceDB + Arrow are EXACT pins, identical in sync-worker/requirements.txt,
+# and tests/test_dependency_pins.py fails if the two files ever disagree.
+# Both containers open the same Lance files (/data/lancedb is written by
+# the sync-worker and read here; /data/lancedb-web is written here), so
+# the on-disk format and the Arrow ABI must be one version, not a range:
+# on 2026-09-03 the ranges had resolved to lancedb 0.37.1 in both images
+# but pyarrow 25.0.1 here and 21.0.0 in the worker. 25.0.1 is what the
+# production orchestrator (the request path) runs today; the worker moves.
+lancedb==0.37.1
 pandas>=2.2
-pyarrow>=17
+pyarrow==25.0.1
 openpyxl>=3.1
 matplotlib>=3.8
 pydantic>=2.7

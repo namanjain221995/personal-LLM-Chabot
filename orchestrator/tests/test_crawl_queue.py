@@ -73,8 +73,12 @@ def test_enqueue_site_crawl_respects_the_flag_and_wakes_the_worker(monkeypatch):
 def test_run_queued_crawls_runs_one_job_and_records_it(monkeypatch):
     job = db.enqueue_web_crawl("c1", "https://site.example/", "site.example", "share", 50, 2.0)
 
-    async def fake_crawl(root_url, emit, *, max_pages, max_seconds, quiet=False):
+    async def fake_crawl(root_url, emit, *, max_pages, max_seconds, quiet=False, **provenance):
         assert quiet and max_pages == 50 and max_seconds == 120.0
+        # A shared link's crawl stamps every page it stores as origin
+        # 'share' for the sharing conversation (V16, ADR-0001 D7).
+        assert provenance.get("origin") == "share"
+        assert provenance.get("conversation_id") == "c1"
         return SimpleNamespace(fetched=7, from_store=2, failed=1), 9, "done"
 
     async def fake_drain(emit, quiet=False):

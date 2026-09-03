@@ -314,9 +314,13 @@ def _wire(monkeypatch, *, verify, claims, gap=None):
         out = []
         for i, r in enumerate(res, 1):
             official = "gov.example" in r.url
+            # Every page states the value the wired claims assert ("Person A")
+            # — persistence now verifies a value against the source text and
+            # drops what no page says.
             out.append(_Source(
                 n=i, title=r.title, url=r.url,
-                text=(f"official statement about the leader {i} " if official else f"body {i} ") * 30,
+                text=(f"official statement about the leader {i}. " if official else f"body {i}. ") * 15
+                + "The board confirmed that Person A leads it. " * 15,
                 authority=100 if official else 40, source_type="official" if official else "news",
                 published_at=_now() - timedelta(days=1), fetched_at=_now(),
             ))
@@ -363,8 +367,12 @@ def test_low_confidence_triggers_one_targeted_verification_round(monkeypatch, ca
     assert run["claims"] >= 1
     assert run["primary_sources"], "the official page was recognised as primary"
     assert meta["sources"][0]["published_at"]
-    # Claims were persisted for the knowledge layer.
+    # Claims were persisted for the knowledge layer — as the source's own
+    # sentence, never as the asker's question.
     assert persisted and persisted[0]["kind"] in ("current", "conflicting")
+    assert "Person A" in persisted[0]["quote"] and persisted[0]["claim"] == persisted[0]["quote"]
+    assert "who is the current chief" not in persisted[0]["claim"].lower()
+    assert "who is the current chief" not in persisted[0]["subquestion"].lower()
     # The decisions are visible in the log.
     text = caplog.text
     assert "opened [" in text and "resolution [" in text and "verify [" in text and "done:" in text
@@ -426,3 +434,192 @@ def test_the_planner_never_sees_the_memory_blocks(monkeypatch):
     contents = " ".join(m["content"] for m in seen["messages"] if m["role"] != "system" or "research planner" not in m["content"])
     assert "Someone Private" not in contents
     assert any(m["content"] == "earlier question" for m in seen["messages"])
+
+
+# ---------------------------------------------------------------------------
+# Persisting claims: only what a public page states, never the asker's words
+# ---------------------------------------------------------------------------
+
+#: A question carrying words that must never reach the shared store.
+_PRIVATE_QUESTION = "my client Private Person asked me who is the chief executive of Acme Corp"
+
+
+def _persist_state(source_text, *, value="Person B", url="https://acme.example/about/leadership",
+                   authority=100, kind="official", superseded=()):
+    """A state with one CURRENT resolution over one source, ready to persist."""
+    st = _state(question=_PRIVATE_QUESTION, subqs=(_PRIVATE_QUESTION,))
+    st.user_id = 7
+    st.entities = ["Acme Corp", "Private Person"]
+    src = _src(st, url, source_text, authority=authority, kind=kind,
+               published=_now() - timedelta(days=2))
+    st.resolutions = {1: dr.Resolution(
+        1, _PRIVATE_QUESTION, dr.STATUS_CURRENT, value=value,
+        as_of=_now().date() - timedelta(days=2), support=[src.n], independent=1,
+        primary=src.primary, superseded=list(superseded), confidence=0.8,
+    )}
+    return st, src
+
+
+def _capture(monkeypatch):
+    persisted = []
+    monkeypatch.setattr(dr.db, "insert_web_claims", lambda rows: persisted.extend(rows) or len(rows))
+    return persisted
+
+
+def _assert_nothing_private(row):
+    """No column of a shared row may carry the question or its private words."""
+    for key in ("claim", "subquestion", "quote", "value", "url"):
+        text = str(row.get(key) or "").lower()
+        assert _PRIVATE_QUESTION.lower() not in text, key
+        assert "private person" not in text, key
+        assert "my client" not in text, key
+
+
+def test_a_value_no_source_states_is_not_persisted(monkeypatch, caplog):
+    """The report may still say it; the SHARED store does not repeat a value
+    the extractor produced but no page contains."""
+    st, _ = _persist_state("Acme Corp is a company. Its leadership page lists the board. " * 10,
+                           value="Person B")
+    persisted = _capture(monkeypatch)
+    with caplog.at_level(logging.INFO, logger="app.engines.deep_research"):
+        asyncio.run(dr._persist_claims(st))
+    assert persisted == []
+    assert "not persisted" in caplog.text and "Person B" in caplog.text
+
+
+def test_a_value_the_source_states_is_persisted_with_its_sentence_and_page():
+    """End to end against the database: the quote is the source's sentence,
+    the page is linked through the same url_key the store uses, and the
+    origin columns say whose run it was."""
+    import hashlib
+
+    url = "https://www.acme.example/about/leadership/?utm_source=x"
+    text = ("Acme Corp leadership.\nFounder and chief executive: Person B has led "
+            "Acme Corp since March 2024.\nChief financial officer: Someone Else.")
+    page = db.upsert_web_page(
+        url_key=dr._normalize_url(url), url=url, canonical_url=url, title="Leadership",
+        text=text, content_type="text/html", fetch_status=200,
+        content_hash=hashlib.sha256(text.encode()).hexdigest(),
+    )
+    st, _ = _persist_state(text, value="Person B", url=url)
+    asyncio.run(dr._persist_claims(st))
+    with db.connection() as con:
+        rows = [dict(r) for r in con.execute(
+            "SELECT page_id, url, subquestion, claim, quote, value, kind, origin_user_id, "
+            "origin_conversation_id FROM web_claims ORDER BY id").fetchall()]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["page_id"] == page["id"]
+    assert row["quote"] == "Founder and chief executive: Person B has led Acme Corp since March 2024."
+    assert row["claim"] == row["quote"] and len(row["quote"]) <= 400
+    assert row["value"] == "Person B" and row["kind"] == "current"
+    assert row["subquestion"] == "Acme Corp", "only the entity the source mentions, not the question"
+    assert row["origin_user_id"] == 7 and row["origin_conversation_id"] == "c1"
+    _assert_nothing_private(row)
+    # ...and the Fast-mode lookup finds it by the entity's words.
+    found = db.search_web_claims("Acme Corp chief executive", limit=3)
+    assert found and found[0]["value"] == "Person B" and found[0]["domain"]
+
+
+def test_the_asker_s_question_never_reaches_the_shared_store(monkeypatch):
+    """Superseded values are verified the same way, and every stored column
+    of every row is built from the page, not the subquestion."""
+    text = ("Acme Corp announced today that Person B is its new chief executive. "
+            "Person A, the previous chief executive, stepped down in 2023.")
+    st, src = _persist_state(
+        text, value="Person B",
+        superseded=[{"value": "Person A", "as_of": "2023-06-01", "sources": [1]},
+                    {"value": "Person Never", "as_of": "2020-01-01", "sources": [1]}],
+    )
+    persisted = _capture(monkeypatch)
+    asyncio.run(dr._persist_claims(st))
+    kinds = {r["value"]: r["kind"] for r in persisted}
+    assert kinds == {"Person B": dr.STATUS_CURRENT, "Person A": dr.STATUS_SUPERSEDED}
+    for row in persisted:
+        _assert_nothing_private(row)
+        assert row["quote"] and row["claim"] == row["quote"]
+        assert row["url"] == src.url
+        assert row["origin_user_id"] == 7 and row["origin_conversation_id"] == "c1"
+    by_value = {r["value"]: r for r in persisted}
+    assert by_value["Person A"]["quote"] == "Person A, the previous chief executive, stepped down in 2023."
+
+
+def test_a_value_is_matched_as_whole_words_with_accents_and_punctuation_folded(monkeypatch):
+    """The extractor drops diacritics and the page may hyphenate; neither is
+    a different fact. A longer name that merely STARTS with the value is."""
+    st, _ = _persist_state("The founder, François Dupont-Martin, chairs the board.",
+                           value="Francois Dupont Martin")
+    persisted = _capture(monkeypatch)
+    asyncio.run(dr._persist_claims(st))
+    assert len(persisted) == 1 and "François Dupont-Martin" in persisted[0]["quote"]
+
+    st2, _ = _persist_state("Person Abbott chairs the board.", value="Person A")
+    persisted2 = _capture(monkeypatch)
+    asyncio.run(dr._persist_claims(st2))
+    assert persisted2 == [], "'Person A' is not stated by a page that names Person Abbott"
+
+
+def test_a_near_identical_sentence_counts_only_for_long_values(monkeypatch):
+    """difflib >= 0.85 against the whole sentence: a one-character slip in a
+    long statement passes; in a short name or number it is a different
+    fact ('Person A' vs 'Person B' would score 0.875) and is refused."""
+    long_value = "The board appointed Alexandra Petrov-Smith as chairman"
+    st, _ = _persist_state("Notice. The board appointed Alexandra Petrov-Smyth as chairman. End.",
+                           value=long_value)
+    persisted = _capture(monkeypatch)
+    asyncio.run(dr._persist_claims(st))
+    assert len(persisted) == 1
+    assert persisted[0]["quote"] == "The board appointed Alexandra Petrov-Smyth as chairman."
+
+    st2, _ = _persist_state("Chief executive: Person A.", value="Person B")
+    persisted2 = _capture(monkeypatch)
+    asyncio.run(dr._persist_claims(st2))
+    assert persisted2 == []
+    st3, _ = _persist_state("Release: version 3.3 shipped.", value="version 3.2")
+    persisted3 = _capture(monkeypatch)
+    asyncio.run(dr._persist_claims(st3))
+    assert persisted3 == []
+
+
+def test_a_long_sentence_is_clipped_around_the_value(monkeypatch):
+    filler = "the annual report lists many subsidiaries and offices around the world, "
+    text = "Overview. " + filler * 12 + "and names Person B as chief executive, " + filler * 12 + "end."
+    st, _ = _persist_state(text, value="Person B")
+    persisted = _capture(monkeypatch)
+    asyncio.run(dr._persist_claims(st))
+    assert len(persisted) == 1
+    quote = persisted[0]["quote"]
+    assert len(quote) <= 400 and "Person B" in quote
+    assert quote.startswith("…") and quote.endswith("…")
+
+
+def test_the_best_supporting_source_supplies_the_quote(monkeypatch):
+    """Two sources back the value; the primary/official one is quoted. The
+    value is missing from the first-opened blog, so it is skipped, not
+    treated as a reason to drop the claim."""
+    st = _state(question=_PRIVATE_QUESTION, subqs=(_PRIVATE_QUESTION,))
+    st.entities = ["Acme Corp"]
+    blog = _src(st, "https://someone.blog.example/post", "A post about Acme Corp. " * 20,
+                authority=15, kind="blog")
+    official = _src(st, "https://acme.example/press/new-chief", "Acme Corp names Person B chief executive. " * 5,
+                    authority=100, kind="official", published=_now() - timedelta(days=1))
+    st.resolutions = {1: dr.Resolution(1, _PRIVATE_QUESTION, dr.STATUS_CURRENT, value="Person B",
+                                       support=[blog.n, official.n], independent=2, confidence=0.9)}
+    persisted = _capture(monkeypatch)
+    asyncio.run(dr._persist_claims(st))
+    assert len(persisted) == 1 and persisted[0]["url"] == official.url
+    assert persisted[0]["quote"] == "Acme Corp names Person B chief executive."
+
+
+def test_persisting_survives_a_missing_page_store(monkeypatch):
+    """No stored page for the URL → page_id NULL, the row is still written;
+    a failing page lookup is not a failing persist."""
+    st, _ = _persist_state("Acme Corp: Person B is chief executive.", value="Person B")
+    persisted = _capture(monkeypatch)
+
+    def boom(*a, **k):
+        raise RuntimeError("store down")
+
+    monkeypatch.setattr(dr.db, "get_web_pages", boom)
+    asyncio.run(dr._persist_claims(st))
+    assert len(persisted) == 1 and persisted[0]["page_id"] is None

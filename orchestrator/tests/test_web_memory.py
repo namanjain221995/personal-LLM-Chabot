@@ -167,32 +167,67 @@ def test_fresh_intent_uses_the_short_ttl(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_memory_sources_skip_fresh_intent(monkeypatch):
+def _evidence(url, title, text, *, lexical=1.0, fetched="2026-08-28", published=None):
+    from datetime import datetime, timezone
+
+    from app.web_memory import Evidence
+
+    return Evidence(
+        url=url, title=title, text=text, domain=url.split("/")[2], authority=40,
+        fetched_at=datetime.fromisoformat(fetched).replace(tzinfo=timezone.utc),
+        published_at=datetime.fromisoformat(published).replace(tzinfo=timezone.utc) if published else None,
+        lexical=lexical,
+    )
+
+
+def test_memory_sources_consult_the_store_for_fresh_intent_too(monkeypatch):
+    """Until 2026-09-03 a "fresh-intent" wording ("latest", "who is") skipped
+    the store entirely, so Think answered from live results alone while the
+    store held the page that answered. The store is consulted for every
+    question; the freshness verdict's own supersession handles staleness,
+    and a passage must be RELEVANT to appear."""
+    from app import web_memory
+    from app.freshness import Freshness
+
     monkeypatch.setattr(settings, "web_memory_enabled", True)
+    seen = {}
 
-    async def boom(*a, **k):
-        raise AssertionError("web RAG consulted for a fresh-intent question")
+    async def fake(question, *, level, top_k):
+        seen["level"] = level
+        r = web_memory.Retrieval(query=question, freshness=level)
+        r.evidence = [
+            _evidence("https://b.example/y", "Answering page", "the release notes say 0.11", lexical=1.0),
+            _evidence("https://c.example/z", "Unrelated page", "nothing to do with it", lexical=0.0),
+        ]
+        return r
 
-    monkeypatch.setattr(web_index, "retrieve", boom)
+    monkeypatch.setattr(web_memory, "retrieve", fake)
     out = asyncio.run(search._memory_sources("latest vllm release", []))
-    assert out == []
+    assert seen["level"] is Freshness.RECENT
+    assert [s.url for s in out] == ["https://b.example/y"]  # the irrelevant one never appears
+    assert out[0].from_store
 
 
 def test_memory_sources_append_dated_and_deduped(monkeypatch):
+    from app import web_memory
+
     monkeypatch.setattr(settings, "web_memory_enabled", True)
     live = [search._Source(n=1, title="Live", url="https://a.example/x", text="t")]
 
-    async def fake(question, top_k=6):
-        return [
-            {"url": "https://a.example/x", "title": "Dup", "text": "dup", "fetched_at": "2026-08-29"},
-            {"url": "https://b.example/y", "title": "Memory", "text": "remembered paragraph", "fetched_at": "2026-08-28"},
+    async def fake(question, *, level, top_k):
+        r = web_memory.Retrieval(query=question, freshness=level)
+        r.evidence = [
+            _evidence("https://a.example/x", "Dup", "dup", fetched="2026-08-29"),
+            _evidence("https://b.example/y", "Memory", "remembered paragraph", fetched="2026-08-28", published="2026-06-15"),
         ]
+        return r
 
-    monkeypatch.setattr(web_index, "retrieve", fake)
+    monkeypatch.setattr(web_memory, "retrieve", fake)
     out = asyncio.run(search._memory_sources("how does the framework work", live))
     assert len(out) == 2  # dup dropped, memory appended
     assert out[1].n == 2
-    assert "2026-08-28" in out[1].title
+    assert "read 2026-08-28" in out[1].title
+    assert "published 2026-06-15" in out[1].title
     assert "verify against newer sources" in out[1].title
 
 
@@ -210,7 +245,7 @@ def test_search_answer_honours_the_effort(monkeypatch):
     async def fake_collect(queries, effort="medium", emit=None, **kw):
         return [_result()]
 
-    async def fake_fetch(results, message=""):
+    async def fake_fetch(results, message="", **attribution):
         return [search._Source(n=1, title="T", url="https://a.example/x", text="body")]
 
     async def fake_rerank(message, results, target):

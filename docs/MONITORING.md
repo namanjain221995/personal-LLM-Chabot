@@ -575,6 +575,33 @@ dashboard aggregates by label rather than by a hardcoded node list.
 
 ---
 
+## Knowledge pipeline metrics (orchestrator `/metrics`, ADR-0001 D12)
+
+All emitted by the orchestrator's own registry (`app/metrics.py`); labels in
+braces. Histograms use the registry's fixed buckets.
+
+| metric | labels | what it answers |
+|---|---|---|
+| `chat_route_total` | route, effort | route mix — which engine answered |
+| `chat_ttft_seconds`, `chat_total_seconds` | route, effort | orchestrator-side time to first token / total (vLLM's TTFT excludes every pre-pass) |
+| `knowledge_stage_seconds` | stage = embed, dense_scan, lexical, meta, rerank | where retrieval time goes |
+| `knowledge_decision_total` | decision, freshness | how questions were served: local, fast_lookup, escalate_search, stale_offline, degraded_busy, static_topical, static_model |
+| `knowledge_verdict_total` | verdict = sufficient / stale / insufficient, freshness | the sufficiency decision itself |
+| `knowledge_escalation_total` | effort, stage = local_first / search | auto searches cancelled by the store; Think escalations |
+| `knowledge_degraded_total` | reason = rerank_busy, rerank_error, rerank_canary, rerank_degenerate, embed_busy, embed_error, prepare_timeout | every time the judge or the embedder was missing |
+| `knowledge_evidence_cache_total` | outcome = hit / miss | evidence cache effectiveness |
+| `rerank_requests_total` | outcome = ok / busy / error / degenerate / canary_failed / disabled, kind = local / bulk | reranker health per caller class |
+| `rerank_seconds`, `rerank_queue_seconds`, `rerank_inflight` | kind, n | reranker latency, queueing, concurrency |
+| `rerank_canary_ok`, `rerank_canary_margin` | — | 0 when the breaker is tripped; the positive−negative margin of the canary triple |
+| `embed_requests_total`, `embed_seconds`, `embed_queue_seconds`, `embed_batch_size` | outcome, kind = query / index / batch | embedding sidecar pressure |
+| `freshness_router_seconds` | outcome = ok / timeout / error | the 8B classifier's cost on the Fast path |
+
+Alerting suggestions: `rerank_canary_ok == 0` for 10 min; rate of
+`knowledge_degraded_total` > 5% of `chat_route_total`; `chat_ttft_seconds`
+p95 for route=chat, effort=fast above 3 s.
+
+---
+
 ## Files
 
 ```

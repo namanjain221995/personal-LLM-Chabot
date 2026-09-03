@@ -16,6 +16,7 @@ enhancement, never a precondition for answering.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import List, Optional
 
@@ -94,6 +95,23 @@ async def ensure_message_embeddings(user_id: int) -> int:
         return 0
 
 
+_backfills: dict = {}
+
+
+def _backfill_in_background(user_id: int) -> None:
+    """At most one backfill in flight per user; the task holds its own
+    reference so it cannot be garbage-collected mid-flight."""
+    task = _backfills.get(user_id)
+    if task is not None and not task.done():
+        return
+    try:
+        task = asyncio.get_running_loop().create_task(ensure_message_embeddings(user_id))
+    except RuntimeError:  # pragma: no cover — no running loop
+        return
+    _backfills[user_id] = task
+    task.add_done_callback(lambda t: _backfills.pop(user_id, None) if _backfills.get(user_id) is t else None)
+
+
 async def semantic_hits(
     user_id: int,
     query: str,
@@ -121,7 +139,7 @@ async def semantic_hits(
         )
         if not candidates:
             return []
-        query_vec = (await llm.embed_texts([query]))[0]
+        query_vec = await llm.embed_query(query)
         norm_query = " ".join((query or "").lower().split())
         scored = []
         for c in candidates:
@@ -163,16 +181,31 @@ async def cross_chat_block(
     *,
     semantic_limit: int = 3,
     keyword_limit: int = 3,
+    include_assistant: bool = True,
 ) -> Optional[str]:
     """One combined recall block: semantic hits first, keyword hits after.
 
     Both retrievers run over the same stored messages, so overlapping hits
     are deduplicated by snippet. None when neither finds anything.
+
+    `include_assistant=False` keeps only what the USER said in earlier
+    chats. An answer the assistant gave before is only as good as it ever
+    was, and for a fact that changes (who holds an office, what a thing
+    costs) it is not evidence — recalled verbatim it becomes the answer, and
+    the model attaches the current sources' citations to it (measured
+    2026-09-03: 0/3 vs 3/3 answers driven by one recalled reply).
     """
-    await ensure_message_embeddings(user_id)
+    # The backfill (embedding this user's messages that have no vector yet)
+    # used to run INLINE before every answer: one synchronous batch of up to
+    # 64 embeddings on the critical path, against the most contended sidecar.
+    # It now runs behind the answer; recall sees the new vectors from the
+    # next turn on, which is when they can matter.
+    _backfill_in_background(user_id)
     semantic = await semantic_hits(
         user_id, query, exclude_conversation_id, limit=semantic_limit
     )
+    if not include_assistant:
+        semantic = [h for h in semantic if (h.get("role") or "").lower() != "assistant"]
     keyword: List[dict] = []
     if keywords(query):
         try:
@@ -185,6 +218,8 @@ async def cross_chat_block(
             )
         except Exception:
             log.warning("keyword recall failed", exc_info=True)
+    if not include_assistant:
+        keyword = [h for h in keyword if (h.get("role") or "").lower() != "assistant"]
     merged: List[dict] = []
     seen: set = set()
     for hit in [*semantic, *keyword]:

@@ -19,13 +19,16 @@ Nothing here performs network I/O at import time.
 """
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import re
+import time
+from collections import OrderedDict
 from collections.abc import Mapping
 from typing import AsyncIterator, List, Optional, Sequence, Tuple
 
-from . import context
+from . import context, metrics
 from .config import settings
 from .context import clip_message_contents
 from .model_capabilities import ModelCapabilities, ReasoningField
@@ -87,11 +90,29 @@ def normalize_system(messages: Sequence[dict]) -> List[dict]:
     return [{"role": "system", "content": "\n\n".join(system_blocks)}, *rest]
 
 
-def _client(base_url: str, api_key: Optional[str] = None):
+#: One client per (event loop, endpoint, read timeout). A fresh AsyncOpenAI
+#: per call — the shape until 2026-09-03 — opened a new connection pool for
+#: every embedding, router and generation request; under concurrency that
+#: is connection churn against four vLLM sidecars. Keyed by loop because an
+#: httpx pool is bound to the loop that created it (tests run many).
+_CLIENTS: dict = {}
+
+
+def _client(base_url: str, api_key: Optional[str] = None, *, read_timeout: Optional[float] = None):
     import httpx
     from openai import AsyncOpenAI  # cheap, but keep out of module import path
 
-    return AsyncOpenAI(
+    read = float(read_timeout if read_timeout is not None else settings.llm_request_timeout)
+    try:
+        loop_key = id(asyncio.get_running_loop())
+    except RuntimeError:
+        loop_key = None
+    key = (loop_key, base_url, api_key or LOCAL_API_KEY, read)
+    if loop_key is not None:
+        cached = _CLIENTS.get(key)
+        if cached is not None:
+            return cached
+    client = AsyncOpenAI(
         base_url=base_url,
         api_key=api_key or LOCAL_API_KEY,
         # A bare float collapses all four httpx timeouts onto one number —
@@ -101,12 +122,17 @@ def _client(base_url: str, api_key: Optional[str] = None):
         # generation runs to the app's own wall clock.
         timeout=httpx.Timeout(
             connect=settings.llm_connect_timeout,
-            read=settings.llm_request_timeout,
+            read=read,
             write=settings.llm_write_timeout,
             pool=settings.llm_write_timeout,
         ),
         max_retries=settings.llm_max_retries,
     )
+    if loop_key is not None:
+        if len(_CLIENTS) > 64:  # tests: many loops; production: a handful
+            _CLIENTS.clear()
+        _CLIENTS[key] = client
+    return client
 
 
 def _openai_client():
@@ -847,6 +873,8 @@ async def embed_texts(
     texts: Sequence[str],
     *,
     model: Optional[str] = None,
+    timeout: Optional[float] = None,
+    kind: str = "batch",
 ) -> List[List[float]]:
     """Embed texts via EMBED_BASE_URL ({model, input}); one vector per input,
     in input order.
@@ -855,10 +883,110 @@ async def embed_texts(
     question was previously sent to it verbatim — a 400 that, unlike the
     router's, was not caught anywhere. Inputs are clipped first.
     """
-    client = _client(settings.embed_base_url)
+    # Its own read timeout (ADR-0001 D13). Embeddings sit on the request
+    # path of every assistant turn (recall, dense retrieval); with the
+    # generation-sized read timeout a hung embedding service held every
+    # chat for up to the whole wall clock before failing soft. Batches (the
+    # indexer, the recall backfill) get the longer budget.
+    read = float(timeout if timeout is not None else settings.embed_batch_timeout_s)
+    client = _client(settings.embed_base_url, read_timeout=read)
     cap = settings.embed_input_char_cap
-    resp = await client.embeddings.create(
-        model=model or settings.embed_model,
-        input=[t[:cap] for t in texts],
-    )
+    started = time.perf_counter()
+    try:
+        resp = await client.embeddings.create(
+            model=model or settings.embed_model,
+            input=[t[:cap] for t in texts],
+        )
+    except Exception:
+        metrics.inc("embed_requests_total", outcome="error", kind=kind)
+        metrics.observe("embed_seconds", time.perf_counter() - started, kind=kind)
+        raise
+    metrics.inc("embed_requests_total", outcome="ok", kind=kind)
+    metrics.observe("embed_seconds", time.perf_counter() - started, kind=kind)
+    metrics.observe("embed_batch_size", float(len(texts)), kind=kind)
     return [item.embedding for item in sorted(resp.data, key=lambda d: d.index)]
+
+
+class EmbedUnavailable(RuntimeError):
+    """A query embedding did not happen (busy past the wait, or failed)."""
+
+
+#: Qwen3-Embedding is asymmetric: queries carry an instruction, documents do
+#: not. Documents stay as indexed (no reindex); only the query side changes.
+#: Measured by tools/rag_eval.py — see docs/07-brain/04-eval-and-benchmarks.md.
+QUERY_INSTRUCTION = (
+    "Instruct: Given a web search query, retrieve relevant passages that "
+    "answer the query\nQuery: "
+)
+
+_EMBED_LRU: "OrderedDict[tuple, List[float]]" = OrderedDict()
+_EMBED_LRU_MAX = 1024
+_embed_slots: Optional[asyncio.Semaphore] = None
+_embed_slots_loop: Optional[asyncio.AbstractEventLoop] = None
+
+
+def _embed_semaphore() -> asyncio.Semaphore:
+    global _embed_slots, _embed_slots_loop
+    loop = asyncio.get_running_loop()
+    if _embed_slots is None or _embed_slots_loop is not loop:
+        _embed_slots = asyncio.Semaphore(max(1, int(settings.embed_max_inflight)))
+        _embed_slots_loop = loop
+    return _embed_slots
+
+
+async def embed_query(
+    text: str,
+    *,
+    instruction: Optional[str] = None,
+    wait: Optional[float] = None,
+    timeout: Optional[float] = None,
+) -> List[float]:
+    """ONE embedding of a query, cached and bounded (ADR-0001 D10/D13).
+
+    The same question was embedded up to three times per turn (recall, the
+    dense half of retrieval, site Q&A). One LRU keyed on (model,
+    instruction, text) collapses that; a semaphore with a wait deadline
+    keeps a burst from piling onto the embedding sidecar (concurrency 4) —
+    past the deadline the caller gets `EmbedUnavailable` and retrieves
+    lexical-only, which it says in its metrics.
+    """
+    clean = " ".join((text or "").split())
+    if not clean:
+        raise EmbedUnavailable("empty query")
+    key = (settings.embed_model, instruction or "", clean)
+    hit = _EMBED_LRU.get(key)
+    if hit is not None:
+        _EMBED_LRU.move_to_end(key)
+        metrics.inc("embed_requests_total", outcome="cache", kind="query")
+        return list(hit)
+    sem = _embed_semaphore()
+    deadline = float(wait if wait is not None else settings.embed_wait_s)
+    queued = time.perf_counter()
+    try:
+        async with asyncio.timeout(deadline):
+            await sem.acquire()
+    except TimeoutError:
+        metrics.inc("embed_requests_total", outcome="busy", kind="query")
+        raise EmbedUnavailable("embedding service busy") from None
+    metrics.observe("embed_queue_seconds", time.perf_counter() - queued, kind="query")
+    try:
+        vectors = await embed_texts(
+            [f"{instruction}{clean}" if instruction else clean],
+            timeout=float(timeout if timeout is not None else settings.embed_timeout_s),
+            kind="query",
+        )
+    except Exception as exc:  # noqa: BLE001 — one outcome for callers
+        raise EmbedUnavailable(str(exc)) from exc
+    finally:
+        sem.release()
+    if not vectors or not vectors[0]:
+        raise EmbedUnavailable("empty embedding")
+    _EMBED_LRU[key] = list(vectors[0])
+    _EMBED_LRU.move_to_end(key)
+    while len(_EMBED_LRU) > _EMBED_LRU_MAX:
+        _EMBED_LRU.popitem(last=False)
+    return list(vectors[0])
+
+
+def embed_cache_clear() -> None:
+    _EMBED_LRU.clear()

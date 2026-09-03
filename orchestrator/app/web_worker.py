@@ -215,6 +215,19 @@ async def run_once() -> Dict[str, int]:
         except Exception:  # noqa: BLE001
             metrics.worker_job("crawl", False, time.perf_counter() - started)
             log.debug("crawl queue drain failed", exc_info=True)
+
+    # Index hygiene last (ADR-0001 D8): compaction on a cadence, the ANN
+    # index once the table is big enough, and the self-heal for a deleted
+    # index directory. Never on a request; failures are one log line.
+    started = time.perf_counter()
+    try:
+        upkeep = await web_index.maintain()
+        done["healed"] = int(upkeep.get("healed") or 0)
+        if upkeep.get("optimized") or upkeep.get("indexed") or upkeep.get("healed"):
+            metrics.worker_job("index_maintain", True, time.perf_counter() - started)
+    except Exception:  # noqa: BLE001
+        metrics.worker_job("index_maintain", False, time.perf_counter() - started)
+        log.debug("index maintenance failed", exc_info=True)
     return done
 
 

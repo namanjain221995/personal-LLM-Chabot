@@ -86,10 +86,9 @@ async def create_upload(
     if not settings.dataset_uploads_enabled:
         raise HTTPException(status_code=404, detail="dataset uploads are disabled")
 
-    # Same ownership rule as every other per-conversation store.
-    owner = await db.run_in_thread(db.conversation_owner, conversation_id)
-    if owner is not None and owner != int(user["id"]):
-        raise HTTPException(status_code=404, detail="conversation not found")
+    # Same ownership rule as every other per-conversation store — and the
+    # same claim-on-first-touch as /chat (see _own).
+    await _own(conversation_id, user)
 
     upload_id = uuid.uuid4().hex
     root = upload_root(conversation_id, upload_id)
@@ -414,9 +413,31 @@ _MAX_PARTS = 64
 _MARKER = "_chunked.json"
 
 
+_CONVERSATION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
 async def _own(conversation_id: str, user: UserRow) -> None:
+    """The uploader must own the conversation — and if nobody does yet, the
+    uploader claims it NOW, exactly as /chat claims an id on its first
+    message.
+
+    Until 2026-09-03 an unowned id was merely tolerated here, so bytes and
+    extracted text landed under an id that whoever sent the next /chat with
+    it would inherit (pre-seeding). Claiming first closes that: after this
+    returns, the id belongs to this user or the request is refused.
+    """
     owner = await db.run_in_thread(db.conversation_owner, conversation_id)
-    if owner is not None and owner != int(user["id"]):
+    if owner is None:
+        if not _CONVERSATION_ID_RE.match(conversation_id or ""):
+            raise HTTPException(status_code=422, detail="invalid conversation id")
+        try:
+            await db.run_in_thread(
+                db.create_conversation, int(user["id"]), conversation_id, "New chat"
+            )
+        except db.IntegrityError:
+            pass  # raced another request for the same id — the recheck decides
+        owner = await db.run_in_thread(db.conversation_owner, conversation_id)
+    if owner != int(user["id"]):
         raise HTTPException(status_code=404, detail="conversation not found")
 
 

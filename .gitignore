@@ -118,3 +118,6 @@ Thumbs.db
 # See docs/finetune-postmortem/ for why a fine-tune on this corpus was aborted.
 # ---------------------------------------------------------------------------
 chatgptdata/
+
+# Knowledge-store backups (scripts/backup-knowledge.sh) — never committed
+backups/

@@ -236,9 +236,10 @@ def test_a_stale_cache_triggers_the_lightweight_lookup(monkeypatch, no_dense):
     _seed_current(age_days=365)
     calls = {}
 
-    async def fake_fetch(question, *, max_queries=1, max_sources=2):
+    async def fake_fetch(question, *, max_queries=1, max_sources=2, **attribution):
         calls["question"] = question
         calls["max_sources"] = max_sources
+        calls["attribution"] = attribution
         _seed_current(age_days=0)  # the refreshed page lands in the store
         return 1
 
@@ -468,12 +469,21 @@ def test_agreeing_pages_from_one_site_are_not_a_conflict(no_dense):
     conflict flag, and the model was told its sources disagreed. Hedging on a
     unanimous official answer is precisely the timidity this layer removes.
     """
-    for i in range(4):
+    # Distinct wording per page: identical texts are ONE piece of evidence
+    # now (near-duplicate collapse, 2026-09-03), which is the other half of
+    # the same rule — copies corroborate nothing and conflict with nothing.
+    wordings = [
+        f"{NEW_PERSON} is the Vice President of India.",
+        f"The office of Vice President of India is held by {NEW_PERSON} since his election.",
+        f"Profile: {NEW_PERSON}, Vice President of India — biography and speeches.",
+        f"Press release: Vice President {NEW_PERSON} addressed the assembly today.",
+    ]
+    for i, wording in enumerate(wordings):
         _page(
             f"same/{i}",
             f"https://vicepresidentofindia.nic.in/page{i}",
             "Vice President of India",
-            f"{NEW_PERSON} is the Vice President of India.",
+            wording,
             age_days=1 + i * 0.2,
             authority=web_memory.AUTHORITY_OFFICIAL,
         )

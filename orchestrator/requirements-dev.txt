@@ -13,9 +13,9 @@ langgraph>=0.2
 openai>=1.50
 httpx>=0.27
 duckdb>=1.0
-lancedb>=0.15
+lancedb==0.37.1  # exact, same as requirements.txt (tests must see the production format)
 pandas>=2.2
-pyarrow>=17
+pyarrow==25.0.1  # exact, same as requirements.txt
 openpyxl>=3.1
 matplotlib>=3.8
 pydantic>=2.7

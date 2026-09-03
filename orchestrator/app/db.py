@@ -902,6 +902,31 @@ ALTER TABLE auth_sessions ADD COLUMN IF NOT EXISTS revoke_reason text NOT NULL D
 """
 
 
+_MIGRATION_V16 = """
+-- V16 (2026-09-03, ADR-0001 D7): provenance and trust for the SHARED corpus.
+-- The web store became member-writable on 2026-09-03 (a pasted link is stored
+-- globally and its site crawled). Who introduced a page, and how, is now a
+-- fact of the row: `origin` decides how much the page may do (a member-shared
+-- page is cited but never retires other evidence and never gains authority),
+-- the introducer columns make every row attributable and purgeable, and
+-- `quarantined_at` lets an operator pull a page out of every retrieval query
+-- without deleting it. All additive, all NULL/DEFAULT: the previous release's
+-- INSERTs keep working, so a code rollback needs no schema change.
+ALTER TABLE web_pages ADD COLUMN IF NOT EXISTS origin text NOT NULL DEFAULT 'search';
+ALTER TABLE web_pages ADD COLUMN IF NOT EXISTS introduced_by_user_id integer;
+ALTER TABLE web_pages ADD COLUMN IF NOT EXISTS introduced_in_conversation_id text;
+ALTER TABLE web_pages ADD COLUMN IF NOT EXISTS quarantined_at timestamptz;
+CREATE INDEX IF NOT EXISTS idx_web_pages_quarantined ON web_pages (id) WHERE quarantined_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_web_pages_introducer ON web_pages (introduced_by_user_id) WHERE introduced_by_user_id IS NOT NULL;
+-- Research claims: which run (and whose) produced them, and the sentence of
+-- the source they were taken from — a claim is rendered to every user, so
+-- nothing that came from the asker's own words may be stored as the claim.
+ALTER TABLE web_claims ADD COLUMN IF NOT EXISTS origin_user_id integer;
+ALTER TABLE web_claims ADD COLUMN IF NOT EXISTS origin_conversation_id text;
+ALTER TABLE web_claims ADD COLUMN IF NOT EXISTS quote text NOT NULL DEFAULT '';
+"""
+
+
 _MIGRATIONS: tuple = (
     (1, _MIGRATION_V1),
     (2, _MIGRATION_V2),
@@ -918,6 +943,7 @@ _MIGRATIONS: tuple = (
     (13, _MIGRATION_V13),
     (14, _MIGRATION_V14),
     (15, _MIGRATION_V15),
+    (16, _MIGRATION_V16),
 )
 
 #: The version `init_schema` brings a database up to. Exported so callers (and
@@ -1490,8 +1516,17 @@ def upsert_web_page(
     authority: int = 0,
     etag: str = "",
     last_modified: str = "",
+    origin: str = "search",
+    introduced_by_user_id: Optional[int] = None,
+    introduced_in_conversation_id: Optional[str] = None,
 ) -> dict:
     """Store (or refresh) one fetched page, globally deduped by `url_key`.
+
+    `origin` (V16) is how the page entered the shared corpus — search,
+    refresh, crawl, share, research. The first introducer is kept for the
+    life of the row; the origin is only ever UPGRADED (a page a member
+    shared that a later search finds independently becomes 'search' — trust
+    earned by independent discovery), never downgraded.
 
     Returns {"id", "changed", "previous_hash"}. `changed` is the re-store
     signal the owner asked for: the same URL fetched again with a DIFFERENT
@@ -1543,10 +1578,18 @@ def upsert_web_page(
             "INSERT INTO web_pages (url_key, url, canonical_url, title, text, "
             "content_type, fetch_status, content_hash, links, fetch_count, "
             "first_seen_at, fetched_at, indexed_at, published_at, modified_at, "
-            "last_changed_at, source_type, authority, domain, etag, last_modified) "
+            "last_changed_at, source_type, authority, domain, etag, last_modified, "
+            "origin, introduced_by_user_id, introduced_in_conversation_id) "
             "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 1, %s, %s, NULL, "
-            "%s, %s, %s, %s, %s, %s, %s, %s) "
+            "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
             "ON CONFLICT (url_key) DO UPDATE SET "
+            # Provenance (V16): the first introducer stays; origin may only
+            # move towards more trust ('share' → anything found independently).
+            "origin = CASE WHEN web_pages.origin = 'share' AND EXCLUDED.origin <> 'share' "
+            "THEN EXCLUDED.origin ELSE web_pages.origin END, "
+            "introduced_by_user_id = COALESCE(web_pages.introduced_by_user_id, EXCLUDED.introduced_by_user_id), "
+            "introduced_in_conversation_id = COALESCE(web_pages.introduced_in_conversation_id, "
+            "EXCLUDED.introduced_in_conversation_id), "
             "url = EXCLUDED.url, canonical_url = EXCLUDED.canonical_url, "
             "title = EXCLUDED.title, text = EXCLUDED.text, "
             "content_type = EXCLUDED.content_type, "
@@ -1598,9 +1641,29 @@ def upsert_web_page(
                 _text(domain),
                 _text(etag or "")[:200],
                 _text(last_modified or "")[:100],
+                _text(origin or "search")[:20],
+                int(introduced_by_user_id) if introduced_by_user_id is not None else None,
+                _text(introduced_in_conversation_id or "")[:64] or None,
             ),
         ).fetchone()
+        bump_web_corpus_generation()
         return {"id": int(row["id"]), "changed": changed, "previous_hash": previous_hash}
+
+
+#: Bumped on every write to the shared corpus (page upsert, index write,
+#: quarantine). The evidence cache (web_memory) keys on it, so a cached
+#: retrieval can never outlive the corpus it was computed from — the Fast
+#: lookup's read-back after fetching two pages sees those pages.
+_web_corpus_generation = 0
+
+
+def bump_web_corpus_generation() -> None:
+    global _web_corpus_generation
+    _web_corpus_generation += 1
+
+
+def web_corpus_generation() -> int:
+    return _web_corpus_generation
 
 
 def get_web_pages(url_keys: List[str]) -> List[dict]:
@@ -1634,7 +1697,15 @@ def get_web_page_versions(page_id: int, limit: int = _MAX_PAGE_VERSIONS) -> List
 # V14: research claims — public, shared, dated
 # ---------------------------------------------------------------------------
 def insert_web_claims(rows: List[dict]) -> int:
-    """Persist resolved claims from one research run. Returns rows written."""
+    """Persist resolved claims from one research run. Returns rows written.
+
+    V16 columns: `quote` is the sentence of the source the claim was taken
+    from (the engine only writes a row it could find such a sentence for);
+    `origin_user_id` / `origin_conversation_id` say whose run produced the
+    row, so it is attributable and can be purged with the conversation. Both
+    origin columns are NULL, not '', when the caller has no identity — a
+    conversation id of '' would never match a delete and would outlive it.
+    """
     if not rows:
         return 0
     now = _now()
@@ -1644,10 +1715,13 @@ def insert_web_claims(rows: List[dict]) -> int:
             claim = _text(str(r.get("claim") or "")).strip()
             if not claim:
                 continue
+            origin_user = r.get("origin_user_id")
+            origin_conversation = _text(str(r.get("origin_conversation_id") or "")).strip()
             con.execute(
                 "INSERT INTO web_claims (research_id, page_id, url, subquestion, "
-                "claim, value, as_of, kind, confidence, created_at) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                "claim, value, as_of, kind, confidence, created_at, "
+                "quote, origin_user_id, origin_conversation_id) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                 (
                     _text(str(r.get("research_id") or "")),
                     r.get("page_id"),
@@ -1659,6 +1733,9 @@ def insert_web_claims(rows: List[dict]) -> int:
                     _text(str(r.get("kind") or "unknown"))[:20],
                     float(r.get("confidence") or 0.0),
                     now,
+                    _text(str(r.get("quote") or ""))[:2000],
+                    int(origin_user) if origin_user is not None else None,
+                    origin_conversation[:200] or None,
                 ),
             )
             written += 1
@@ -1691,15 +1768,39 @@ def search_web_claims(terms: str, limit: int = 5, kinds: Optional[List[str]] = N
     return [dict(r) for r in rows]
 
 
-def get_unindexed_web_pages(limit: int = 20) -> List[dict]:
-    """Pages the vector index has not seen (new, or changed since last index)."""
+def reset_web_index_watermark() -> int:
+    """Queue every stored page for re-indexing. Returns rows affected.
+
+    The vector index is DERIVED state; this is how it is rebuilt from
+    PostgreSQL after the LanceDB directory is lost or a chunker changes."""
     with connection() as con:
-        rows = con.execute(
-            "SELECT id, url_key, url, title, text, fetched_at FROM web_pages "
-            "WHERE indexed_at IS NULL AND text <> '' "
-            "ORDER BY fetched_at DESC LIMIT %s",
-            (int(limit),),
-        ).fetchall()
+        cur = con.execute(
+            "UPDATE web_pages SET indexed_at = NULL WHERE indexed_at IS NOT NULL AND text <> ''"
+        )
+        return int(cur.rowcount or 0)
+
+
+def get_unindexed_web_pages(limit: int = 20, page_ids: Optional[List[int]] = None) -> List[dict]:
+    """Pages the vector index has not seen (new, or changed since last index).
+
+    `page_ids` restricts the pass to those pages — the Fast lookup indexes
+    the two pages it just fetched instead of draining the global queue
+    inside its deadline."""
+    with connection() as con:
+        if page_ids:
+            rows = con.execute(
+                "SELECT id, url_key, url, title, text, fetched_at FROM web_pages "
+                "WHERE indexed_at IS NULL AND text <> '' AND id = ANY(%s) "
+                "ORDER BY fetched_at DESC LIMIT %s",
+                ([int(i) for i in page_ids], int(limit)),
+            ).fetchall()
+        else:
+            rows = con.execute(
+                "SELECT id, url_key, url, title, text, fetched_at FROM web_pages "
+                "WHERE indexed_at IS NULL AND text <> '' "
+                "ORDER BY fetched_at DESC LIMIT %s",
+                (int(limit),),
+            ).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -1711,6 +1812,7 @@ def mark_web_pages_indexed(page_ids: List[int]) -> None:
             "UPDATE web_pages SET indexed_at = %s WHERE id = ANY(%s)",
             (_now(), list(page_ids)),
         )
+    bump_web_corpus_generation()
 
 
 # ---------------------------------------------------------------------------

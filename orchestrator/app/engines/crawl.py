@@ -214,7 +214,19 @@ def _store(
     ext: extract.Extracted,
     content_type: str,
     links: Optional[List[str]] = None,
+    origin: str = "crawl",
+    conversation_id: str = "",
+    user_id: Optional[int] = None,
 ) -> None:
+    """Persist one crawled page with its trust class (V16, ADR-0001 D7).
+
+    A crawl started because a member SHARED a link stores every page it
+    reaches as origin 'share' — cited on its merits, never able to retire
+    other evidence, never above neutral authority — and records the
+    conversation (and user, when known) that introduced it. A research
+    run's crawl is 'research'; an operator's manual crawl and the
+    post-search expansion are 'crawl'.
+    """
     db.upsert_web_page(
         url_key=_normalize_url(url),
         url=url,
@@ -225,6 +237,9 @@ def _store(
         fetch_status=200 if ext.text else 0,
         content_hash=hashlib.sha256((ext.text or "").encode("utf-8")).hexdigest(),
         links=links or [],
+        origin=origin or "crawl",
+        introduced_by_user_id=user_id,
+        introduced_in_conversation_id=conversation_id or None,
         **_provenance_of(ext, final_url or url, content_type, None),
     )
 
@@ -236,8 +251,15 @@ async def _crawl_site(
     max_pages: int,
     max_seconds: float,
     quiet: bool = False,
+    origin: str = "crawl",
+    conversation_id: str = "",
+    user_id: Optional[int] = None,
 ) -> Tuple[_CrawlState, int, str]:
-    """The frontier loop. → (state, pages_found, status)."""
+    """The frontier loop. → (state, pages_found, status).
+
+    `origin`/`conversation_id`/`user_id` are stamped on every page stored
+    (see _store): they decide how much a crawled page may do in the shared
+    corpus and make it attributable."""
     host, prefix = _scope_of(root_url)
     state = _CrawlState(scope_host=host, scope_prefix=prefix)
 
@@ -310,7 +332,9 @@ async def _crawl_site(
             state.failed += 1
             return []
         if ext.text.strip():
-            await db.run_in_thread(_store, url, final_url, ext, ctype, links)
+            await db.run_in_thread(
+                _store, url, final_url, ext, ctype, links, origin, conversation_id, user_id
+            )
             state.fetched += 1
         else:
             state.failed += 1
@@ -414,6 +438,8 @@ async def run_crawl_engine(
             emit,
             max_pages=settings.web_crawl_max_pages,
             max_seconds=settings.web_crawl_max_minutes * 60.0,
+            origin="crawl",
+            conversation_id=conversation_id,
         )
         if status.startswith("declined"):
             await db.run_in_thread(
@@ -664,8 +690,17 @@ async def _run_queued(job: dict) -> None:
     started = time.monotonic()
     state: Optional[_CrawlState] = None
     try:
+        kind = str(job.get("kind") or "")
         state, pages_found, status = await _crawl_site(
-            root_url, None, max_pages=max_pages, max_seconds=max_seconds, quiet=True
+            root_url,
+            None,
+            max_pages=max_pages,
+            max_seconds=max_seconds,
+            quiet=True,
+            # A shared link's crawl inherits the SHARE trust class for every
+            # page it reaches; a research run's crawl is research material.
+            origin="share" if kind == "share" else "research" if kind == "research" else "crawl",
+            conversation_id=str(job.get("conversation_id") or ""),
         )
         if status.startswith("declined"):
             await db.run_in_thread(

@@ -141,3 +141,50 @@ Stop reasons (`meta.research_run.stop_reason`, and the `research[…] assess:` l
 |---|---|---|
 | `OCR_VISION_DEADLINE_S` / `OCR_VISION_MAX_TOKENS` | `10.0` / `1500` | The image route's OCR pass is time-boxed and capped; past the deadline the answer proceeds from the pixels. PDF scans keep the full budget. |
 | `DOCUMENT_PREWARM_ENABLED` / `DOCUMENT_PREWARM_MAX_MB` | `true` / `64` | Extract a document at upload time so the send reads a cache. |
+
+## The knowledge "brain" (ADR-0001, 2026-09-03)
+
+Full rationale in `docs/07-brain/`. Every knob below has a sensible default;
+none needs to be set for a normal deployment. Flags are read at process
+start (a change = orchestrator recreate).
+
+### One evidence pipeline
+
+| variable | default | meaning |
+|---|---|---|
+| `KNOWLEDGE_RERANK` | true | the templated cross-encoder judges every candidate passage; its answer probability decides relevance, sufficiency and order |
+| `KNOWLEDGE_RERANK_CANDIDATES` | 12 | hybrid candidates judged per time-sensitive question (STATIC: at most 8, only past the pre-gate) |
+| `KNOWLEDGE_RELEVANT_THRESHOLD` / `KNOWLEDGE_ANSWER_THRESHOLD` | 0.30 / 0.70 | relevant (may be cited, may retire older evidence) / sufficient (no live lookup) |
+| `KNOWLEDGE_LOCAL_FIRST` / `KNOWLEDGE_LOCAL_FIRST_CONFIDENCE` | true / 0.85 | a confident store cancels an auto-decided web search; Think escalates when the store cannot answer a confirmed time-sensitive question |
+| `KNOWLEDGE_PREPARE_DEADLINE_S` | 12 | the whole pre-answer stage's budget; past it the answer proceeds ungrounded and the metric says so |
+| `KNOWLEDGE_STALE_AFTER_RECENT_S` | 10368000 (120 d) | an answering passage older than this by its OWN date is stale for a RECENT question |
+| `KNOWLEDGE_EVIDENCE_CACHE_TTL_S` / `_SIZE` | 60 / 256 | public-scope evidence cache (0 disables); keyed on the corpus generation |
+| `RECALL_ASSISTANT_ANSWERS_FOR_FACTS` | false | recall the assistant's own earlier answers for evidence questions (the audited failure) |
+
+### Reranker and embedding backpressure
+
+| variable | default | meaning |
+|---|---|---|
+| `RERANK_MAX_INFLIGHT` / `RERANK_RESERVED_SLOTS` | 4 / 2 | concurrent scoring calls; slots reserved for the knowledge pipeline's stage 1 |
+| `RERANK_WAIT_S` / `RERANK_WAIT_FAST_S` / `RERANK_WAIT_THINK_S` | 1.5 / 0.25 / 1.0 | how long a bulk caller / Fast stage 1 / Think stage 1 waits for a slot before keeping its own order |
+| `RERANK_STAGE_TIMEOUT_S` | 2.0 | per-call deadline for stage 1 |
+| `RERANK_CANARY_ENABLED` / `RERANK_BREAKER_S` | true / 300 | a fixed query/answer/non-answer triple is scored at first use and each worker cycle; a wrong answer disables the reranker for this long |
+| `EMBED_TIMEOUT_S` / `EMBED_BATCH_TIMEOUT_S` | 4 / 90 | read timeouts for query embeddings / index batches |
+| `EMBED_MAX_INFLIGHT` / `EMBED_WAIT_S` | 8 / 1.0 | concurrent query embeddings; wait before retrieving lexical-only |
+
+### Vector index policy
+
+| variable | default | meaning |
+|---|---|---|
+| `WEB_INDEX_ANN_MIN_ROWS` | 50000 | web chunks above which the worker builds an IVF_FLAT index |
+| `WEB_INDEX_NPROBES` | 50 | partitions probed per query when an index exists (recall@10 0.995 measured) |
+| `WEB_INDEX_OPTIMIZE_EVERY` | 12 | worker cycles between compactions of the web index |
+| `KNOWLEDGE_ANN_BYPASS` | false | force flat scans (reader-side rollback, no data change) |
+| `RAG_ANN_MIN_ROWS` (sync-worker) | 50000 | Salesforce chunks above which the sync-worker builds its IVF_FLAT index |
+| `RAG_OPTIMIZE_EVERY_CYCLES` / `RAG_OPTIMIZE_KEEP_DAYS` (sync-worker) | 12 / 7 | compaction cadence and version retention for the Salesforce table (the retention window is the rollback window for `restore(version)`) |
+
+Operator tools (inside the orchestrator container): `python -m tools.rag_eval`
+(retrieval eval), `python -m tools.reindex_web` (build-alongside reindex /
+watermark reset), `python -m tools.knowledge_admin` (list / quarantine /
+purge shared pages by domain, origin or introducer); on the host,
+`scripts/backup-knowledge.sh` before any change to the stores.
