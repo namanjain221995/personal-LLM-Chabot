@@ -5,7 +5,7 @@
  * slide-over drawer). Header (mark · search icon · collapse icon) · New chat
  * · conversation list in ChatGPT's sections — Pinned, Recents, and a collapsed Archived
  * disclosure that lazily pulls `?archived=true` — each row carrying the "⋯"
- * menu (rename / pin / archive / export / delete) · theme toggle · account
+ * menu (rename / pin / archive / export / delete) · account
  * row (enterprise auth retrofit — AccountMenu fetches its own identity, so
  * no user props flow through here).
  *
@@ -43,15 +43,12 @@ import type { ConversationSummary } from '@/lib/types';
 import { AccountMenu } from './AccountMenu';
 import { ConversationMenu } from './ConversationMenu';
 import { TechSaraMark } from './TechSaraMark';
-import { useTheme } from './Providers';
 import {
   IconChevronRight,
-  IconMoon,
   IconPin,
   IconPlus,
   IconSearch,
   IconSidebar,
-  IconSun,
   IconX,
 } from './icons';
 
@@ -111,7 +108,6 @@ export function Sidebar({
   const [draftTitle, setDraftTitle] = useState('');
   const [archivedOpen, setArchivedOpen] = useState(false);
   const archivedLoaded = useRef(false);
-  const { theme, toggleTheme } = useTheme();
 
   /** One generated prefix for both copies; `panel()` scopes it per copy. */
   const baseId = useId();
@@ -405,19 +401,13 @@ export function Sidebar({
         )}
       </nav>
 
+      {/* The theme toggle that used to sit here is gone (owner request
+          2026-09-03): Settings → Personalization already owns Theme, and two
+          controls for one preference is one too many. Only the shortcut went —
+          the theme itself, its persistence and the Settings radiogroup are
+          untouched. The border and padding belong to the account row, so
+          nothing is left behind where the button was. */}
       <div className="border-t border-border p-2">
-        <button
-          type="button"
-          onClick={toggleTheme}
-          aria-label={
-            theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'
-          }
-          className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-sm text-icon transition-colors duration-ts hover:bg-surface-2 hover:text-ink"
-        >
-          {theme === 'dark' ? <IconSun size={15} /> : <IconMoon size={15} />}
-          {theme === 'dark' ? 'Light theme' : 'Dark theme'}
-        </button>
-
         <AccountMenu />
       </div>
     </div>
