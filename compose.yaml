@@ -42,6 +42,24 @@ services:
       - maintenance_work_mem=128MB
       - -c
       - max_connections=60
+      # A client that opens connections and never closes them will otherwise
+      # take the whole server down with it: pgAdmin holds one backend per
+      # query tab, and on 2026-09-04 it had accumulated 55 idle sessions —
+      # 60 of 60 slots — so nothing new could connect, pgAdmin included.
+      # Measured that day: pgAdmin opens a BATCH of connections when it
+      # reconnects (34 within a minute of a restart) and then holds them
+      # idle forever — so the window has to be short enough that its
+      # steady-state footprint plus the app's 16-connection pool clears 60.
+      # These reap the abandoned ones. The orchestrator's pool is unaffected
+      # in practice: it checks a connection's liveness before handing it out
+      # (db.py, ConnectionPool check), so a reaped idle connection is
+      # replaced silently rather than surfacing as a failed request.
+      - -c
+      - idle_session_timeout=10min
+      # An abandoned OPEN TRANSACTION is worse than an idle session: it also
+      # holds locks and stops vacuum reclaiming rows.
+      - -c
+      - idle_in_transaction_session_timeout=15min
       - -c
       - random_page_cost=1.1
       - -c
