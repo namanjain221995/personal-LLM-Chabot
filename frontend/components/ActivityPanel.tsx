@@ -17,6 +17,7 @@ import type {
   ResearchRun,
   WebSource,
 } from '@/lib/types';
+import { documentReadView } from '@/lib/documentActivity';
 import { AgentTimeline } from './AgentTimeline';
 import {
   countSources,
@@ -122,42 +123,76 @@ export function ActivityPanel({
           </section>
         )}
 
-        {documentRead && (
-          <section aria-label="Document read">
-            <h3 className="flex items-center gap-1.5 text-[11px] font-medium uppercase tracking-wide text-faint">
-              <IconFileText size={12} />
-              Document read
-            </h3>
-            <p className="mt-1.5 text-[12.5px] text-muted">
-              {documentRead.filename} · {documentRead.total_pages} page
-              {documentRead.total_pages !== 1 ? 's' : ''} read in full
-              {documentRead.ocr_pages
-                ? ` · ${documentRead.ocr_pages} via OCR`
-                : ''}
-            </p>
-            <div className="mt-2 max-h-[45vh] space-y-1 overflow-y-auto">
-              {documentRead.pages.map((p) => (
-                <details
-                  key={p.page}
-                  className="rounded-lg border border-border bg-surface px-2.5 py-1.5"
-                >
-                  <summary className="cursor-pointer select-none text-[12px] font-medium text-muted">
-                    Page {p.page}
-                  </summary>
-                  <div className="mt-1.5 whitespace-pre-wrap font-mono text-[11.5px] leading-relaxed text-muted">
-                    {p.text}
-                  </div>
-                </details>
-              ))}
-              {documentRead.total_pages > documentRead.pages.length && (
-                <p className="pt-1 text-[11px] text-faint">
-                  Showing the first {documentRead.pages.length} pages here — the
-                  model read all {documentRead.total_pages}.
-                </p>
-              )}
-            </div>
-          </section>
-        )}
+        {documentRead &&
+          (() => {
+            // Several documents arrive folded into one payload; this splits
+            // them back out from the engine's own per-page prefixes — see
+            // lib/documentActivity.ts for why that is evidence and not a
+            // guess. One document renders exactly as it always did.
+            const view = documentReadView(documentRead);
+            const shown = view.documents.reduce((n, d) => n + d.pages.length, 0);
+            return (
+              <section aria-label="Document read">
+                <h3 className="flex items-center gap-1.5 text-[11px] font-medium uppercase tracking-wide text-faint">
+                  <IconFileText size={12} />
+                  {view.multi ? 'Documents read' : 'Document read'}
+                </h3>
+                {view.multi ? (
+                  <p className="mt-1.5 text-[12.5px] text-muted">
+                    {view.reported} documents · {view.totalPages} page
+                    {view.totalPages !== 1 ? 's' : ''} read in full
+                    {view.ocrPages ? ` · ${view.ocrPages} via OCR` : ''}
+                  </p>
+                ) : (
+                  <p className="mt-1.5 text-[12.5px] text-muted">
+                    {documentRead.filename} · {view.totalPages} page
+                    {view.totalPages !== 1 ? 's' : ''} read in full
+                    {view.ocrPages ? ` · ${view.ocrPages} via OCR` : ''}
+                  </p>
+                )}
+                <div className="mt-2 max-h-[45vh] space-y-2 overflow-y-auto">
+                  {view.documents.map((d, di) => (
+                    <div key={`${d.name}-${di}`} className="space-y-1">
+                      {view.multi && (
+                        <p className="text-[12px] font-medium text-ink">
+                          {d.name}
+                          <span className="font-normal text-faint">
+                            {' '}· {d.pages.length} page{d.pages.length !== 1 ? 's' : ''}
+                          </span>
+                        </p>
+                      )}
+                      {d.pages.map((p) => (
+                        <details
+                          key={`${di}-${p.page}`}
+                          className="rounded-lg border border-border bg-surface px-2.5 py-1.5"
+                        >
+                          <summary className="cursor-pointer select-none text-[12px] font-medium text-muted">
+                            Page {p.page}
+                          </summary>
+                          <div className="mt-1.5 whitespace-pre-wrap font-mono text-[11.5px] leading-relaxed text-muted">
+                            {p.text}
+                          </div>
+                        </details>
+                      ))}
+                    </div>
+                  ))}
+                  {view.totalPages > shown && (
+                    <p className="pt-1 text-[11px] text-faint">
+                      Showing the first {shown} pages here — the model read all{' '}
+                      {view.totalPages}.
+                    </p>
+                  )}
+                  {view.multi && view.reported > view.documents.length && (
+                    <p className="pt-1 text-[11px] text-faint">
+                      {view.reported - view.documents.length} more document
+                      {view.reported - view.documents.length !== 1 ? 's were' : ' was'}{' '}
+                      read, beyond the pages shown here.
+                    </p>
+                  )}
+                </div>
+              </section>
+            );
+          })()}
 
         {steps && steps.length > 0 && (
           // The card carries its own "Agent plan" header — no section

@@ -47,6 +47,7 @@ import { ActivityPanel } from './ActivityPanel';
 import { countSources, ResearchPanel } from './ResearchPanel';
 import { Markdown } from './Markdown';
 import { PastedChip } from './PastedChip';
+import { QuotedContext } from './QuotedContext';
 import { ProofDrawer } from './ProofDrawer';
 import { CopyButton } from './CopyButton';
 import { ReasoningAccordion } from './ReasoningAccordion';
@@ -71,8 +72,15 @@ import {
  */
 const ACTION_ROW =
   'mt-1.5 flex items-center gap-0.5 transition-opacity duration-ts';
+/**
+ * `focus-within` twice, on purpose: once for the row itself (tabbing onto Edit
+ * reveals the row it lives in) and once for the whole message group, so
+ * focusing an ATTACHMENT CARD reveals the same row a mouse would. Without the
+ * group form, a keyboard user on a file-only turn is standing on the card with
+ * the actions still at opacity 0 until they tab past them blind.
+ */
 const ACTION_ROW_HIDDEN =
-  'opacity-0 focus-within:opacity-100 group-hover/msg:opacity-100';
+  'opacity-0 focus-within:opacity-100 group-focus-within/msg:opacity-100 group-hover/msg:opacity-100';
 /**
  * `‹ 2 / 2 ›` — which version of an edited turn is on screen.
  *
@@ -494,11 +502,46 @@ export function MessageRow({
   }
 
   if (message.role === 'user') {
-    // Actions need something to act ON. An attachment-only turn (a dropped
-    // PDF, images with no caption) has no text to copy or reuse, so it gets
-    // no row rather than two buttons that would silently do nothing.
+    /**
+     * What the action row is FOR decides when it appears — and it is not
+     * "there is text here".
+     *
+     * It was, and that was the bug: `Boolean(userText.trim())` meant a turn
+     * made only of files got no row, so someone who attached two documents
+     * and forgot to type the question had no way back to it. That is the one
+     * case where Edit matters most, because the missing prompt is precisely
+     * what they returned to add.
+     *
+     * The predicate is now about the TURN rather than its prose, and it has
+     * to name every way this row already renders an attachment further up:
+     * the two image spellings, `pdfName` for a lone document or dataset, and
+     * `meta.attachments` for the multi-document case. Pasted blocks count for
+     * the same reason files do — a paste-only turn is a real turn with a
+     * missing instruction.
+     *
+     * COPY is deliberately NOT part of this. It still means "copy what I
+     * wrote", so it stays tied to the text; a Copy button on a fileonly turn
+     * would either do nothing or have to invent a meaning for copying a file,
+     * and neither is a thing to ship. See `rowHasSomething` below, which keeps
+     * an empty row from rendering when Edit is the only candidate and the host
+     * has not offered one.
+     */
     const userText = message.content ?? '';
-    const showUserActions = Boolean(userText.trim());
+    const hasText = Boolean(userText.trim());
+    const hasAttachments = Boolean(
+      message.imageDataUrls?.length ||
+        message.imageDataUrl ||
+        message.pdfName ||
+        message.meta?.attachments?.length,
+    );
+    const hasPasted = Boolean(message.meta?.pasted?.length);
+    const turnIsActionable = hasText || hasAttachments || hasPasted;
+    // Every control this row can hold. Without this an attachment-only turn
+    // rendered outside a chat (previews, tests) would emit an empty flex box
+    // with margin — invisible, but real, and it would move the layout.
+    const rowHasSomething =
+      hasText || Boolean(onEditStart) || Boolean(versions && onSelectVersion);
+    const showUserActions = turnIsActionable && rowHasSomething;
     return (
       // `group/msg` only marks the hover scope — it paints nothing. The
       // bubble below is untouched.
@@ -628,6 +671,20 @@ export function MessageRow({
               </OpenableAttachment>
             </div>
           )}
+          {/* The excerpt this turn replies to. Above the bubble and OUTSIDE
+              the quotable region below, so it reads as provenance for the
+              question rather than as part of it — and so quoting a quote is
+              not a thing anyone can do by accident. */}
+          {message.meta?.selected_context && (
+            <div className="mb-1.5 flex justify-end">
+              <div className="max-w-full">
+                <QuotedContext
+                  context={message.meta.selected_context}
+                  align="right"
+                />
+              </div>
+            </div>
+          )}
           {message.meta?.pasted?.map((p) => (
             <div key={p.id} className="mb-1.5 flex justify-end">
               <PastedChip pasted={p} />
@@ -686,7 +743,14 @@ export function MessageRow({
           ) : (
             <>
               {message.content && (
-                <div className="whitespace-pre-wrap break-words rounded-[20px] bg-bubble px-4 py-2.5 text-[15px] leading-relaxed">
+                /* Selecting inside THIS marks the region "Ask TechSara AI"
+                   may quote (lib/selectedContext.ts). Only message prose
+                   carries it; nothing in the chrome around it does. */
+                <div
+                  data-chat-message-id={message.id}
+                  data-chat-message-role="user"
+                  className="whitespace-pre-wrap break-words rounded-[20px] bg-bubble px-4 py-2.5 text-[15px] leading-relaxed"
+                >
                   {message.content}
                 </div>
               )}
@@ -718,12 +782,19 @@ export function MessageRow({
                     </button>
                   )}
                   {/* The user's own words, verbatim: no citation stripping
-                      (there are none to strip) and no trimming. */}
-                  <CopyButton
-                    text={userText}
-                    label="Copy message"
-                    variant="icon"
-                  />
+                      (there are none to strip) and no trimming.
+
+                      Gated on the TEXT, not on the row. A turn made only of
+                      files has nothing to copy, and a button that quietly
+                      wrote an empty string to the clipboard would be worse
+                      than no button — so the row shows Edit alone there. */}
+                  {hasText && (
+                    <CopyButton
+                      text={userText}
+                      label="Copy message"
+                      variant="icon"
+                    />
+                  )}
                 </div>
               )}
             </>
@@ -868,7 +939,10 @@ export function MessageRow({
                lose weight to greyscale antialiasing, and #ffffff stops
                looking white. It also left `.md h3`/`h4` (16px) rendering
                LARGER than the body they head. */
-            <div>
+            <div
+              data-chat-message-id={message.id}
+              data-chat-message-role="assistant"
+            >
               {/* [n] citation markers are stripped for display (2026-08-05)
                   — the numbered sources live in the ActivityPanel instead.
                   The stored content keeps them, so nothing is lost. */}

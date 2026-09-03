@@ -45,11 +45,38 @@ export interface ChatPrefs {
   deepResearch: boolean;
 }
 
+/**
+ * What a NEW chat starts as (owner request 2026-09-03): a plain, fast,
+ * general-purpose assistant with no optional source or research mode armed.
+ *
+ * This is the ONE place that decides it. `useState(DEFAULT_PREFS)` gives a
+ * freshly-loaded blank app these values, `newChat()` writes them back over
+ * whatever the previous conversation was using, and an account switch resets
+ * to them — so there is no second default anywhere to drift out of step with
+ * this object.
+ *
+ * Two of these changed today, and both were defaults rather than capabilities:
+ *
+ *   salesforce  true  → false   Salesforce was pre-selected, so every new
+ *                               chat began in warehouse mode and an ordinary
+ *                               question had to be un-scoped first. The mode
+ *                               is untouched and one click away.
+ *   effort      think → fast    A new chat now answers immediately instead of
+ *                               reasoning first. Think and Max are unchanged
+ *                               and still in the picker.
+ *
+ * `webSearch: 'auto'` is NOT a research mode being left on, and is deliberately
+ * unchanged. 'auto' is this control's OFF position: the composer menu ticks
+ * "Web search" only at 'on', its toggle flips 'on' ↔ 'auto' (never 'off'), and
+ * at Fast the server refuses to search whatever this says. Setting it to 'off'
+ * would read identically in the UI while quietly removing the model's ability
+ * to search at Think and Max — a capability change wearing a default's clothes.
+ */
 export const DEFAULT_PREFS: ChatPrefs = {
-  salesforce: true,
+  salesforce: false,
   sfLive: false,
   model: 'smart',
-  effort: 'think',
+  effort: 'fast',
   agent: false,
   webSearch: 'auto',
   deepResearch: false,

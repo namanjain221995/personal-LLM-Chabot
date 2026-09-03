@@ -2,18 +2,21 @@
 /**
  * PHASE 4A / 4B — using a file you already sent, a second time.
  *
- * Two gestures, ONE handler. "Attach again" is a real button because dragging
- * is mouse-only, invisible and untestable from a keyboard; the drag exists
- * because it is the gesture people reach for. They must not become two
- * pipelines — that is how one entry point ends up accepting what the other
- * refuses, which is precisely why `acceptFiles` is already the single door for
- * the picker and the desktop drop.
+ * 2026-09-03: the visible "Attach again" button is GONE (owner request). The
+ * capability behind it is not, and that distinction is the whole point of this
+ * file. Every scenario the button used to prove — a same-session file, a
+ * server-backed one after a reload, an expired upload, bytes that are simply
+ * gone, composer validation, and the standing no-download invariant — is
+ * proved here through the gesture that remains: dragging the card into the
+ * composer. Deleting that coverage along with the button would have retired
+ * the tests for a pipeline that is still running.
  *
- * The drag half carries a REFERENCE, never bytes: a page cannot put a File
- * into a drag it starts. So the payload is `{messageId, index}` under a private
- * MIME, and the drop resolves it through the same ladder the button uses. What
- * it must never carry is anything in `text/plain` — NEW-10A exists because a
- * drag whose only readable part was text got typed into the prompt.
+ * The drag carries a REFERENCE, never bytes: a page cannot put a File into a
+ * drag it starts. So the payload is `{messageId, index}` under a private MIME,
+ * and the drop resolves it through `reuseAttachment` — the same function the
+ * button called, now the only entry point. What it must never carry is
+ * anything in `text/plain` — NEW-10A exists because a drag whose only readable
+ * part was text got typed into the prompt.
  */
 
 import {
@@ -392,9 +395,7 @@ describe('P4A · re-attaching a file you already sent', () => {
     await reuseByDrag();
 
     await waitFor(() => expect(composerChips().length).toBe(1));
-    expect(
-      screen.getByLabelText('Remove attachment sales.csv'),
-    ).toBeTruthy();
+    expect(screen.getByLabelText('Remove attachment sales.csv')).toBeTruthy();
     expect(downloads).toEqual([]);
   });
 
@@ -458,7 +459,7 @@ describe('P4A · re-attaching a file you already sent', () => {
     expect(composerChips().length).toBe(0);
   });
 
-  it('P4A-03 — Composer validation still runs on the reused file', async () => {
+  it('ATTACH-05/P4A-03 — Composer validation still runs on the reused file', async () => {
     renderApp();
     // The reused file must face the SAME composer checks a picked file
     // does. Since 2026-09-02 every file TYPE is accepted (archives and
@@ -486,7 +487,7 @@ describe('P4A · re-attaching a file you already sent', () => {
     expect(composerChips().length).toBe(0);
   });
 
-  it('P4A-07 — no click anywhere on the card produces a download', async () => {
+  it('P4A-07 — neither opening nor reusing the card produces a download', async () => {
     renderApp();
     attachAndSend(csv());
     fireEvent.click(await screen.findByRole('button', { name: /sales\.csv — preview/ }));

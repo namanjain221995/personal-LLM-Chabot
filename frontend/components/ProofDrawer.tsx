@@ -2,15 +2,14 @@
 
 /**
  * The proof drawer — the signature element (§9).
- * A slim bar under any assistant message with meta: engine badge +
- * collapsible sections (View SQL / Sources / Data / Chart / Files).
+ * A slim bar under any assistant message with meta: collapsible sections
+ * (View SQL / Sources / Data / Chart / Files).
  * The chart section auto-opens when present — the one orchestrated moment.
  */
 
 import { useState } from 'react';
 import type { Meta } from '@/lib/types';
 import { csvFilenameFor } from '@/lib/csv';
-import { EngineBadge } from './EngineBadge';
 import { SqlBlock } from './SqlBlock';
 import { DataTable } from './DataTable';
 import { ChartView } from './ChartView';
@@ -105,12 +104,12 @@ export function ProofDrawer({ meta }: { meta: Meta }) {
   return (
     <div className="mt-3 rounded-ts border border-border bg-surface/60">
       <div className="flex flex-wrap items-center gap-2 px-3 py-2">
-        {/* A message can carry meta purely to record its tree position, so
-            the badge only renders once an engine has actually answered. */}
-        {meta.route && <EngineBadge engine={meta.route} />}
-        {sections.length > 0 && (
-          <span aria-hidden className="h-4 w-px bg-border" />
-        )}
+        {/* The engine badge that used to open this bar is gone (owner
+            request 2026-09-03) — see components/ChatApp.tsx for the same
+            removal in the header. Its divider went with it: a rule whose only
+            job was separating the badge from these buttons would now be a
+            stray line before the first one. `meta.route` still decides
+            everything it ever decided; it simply is not announced. */}
         {sections.map((s) => {
           const isOpen = open.has(s.id);
           return (

@@ -6,8 +6,17 @@
    TechSara design tokens (§9). Dark is the primary theme (:root); light
    overrides under html.light. Brand palette:
    Navy Ink #0A1D37 · Boardroom Blue #143A66 · Slate #5B6B7F · Paper #F6F8FB
-   · Signal Teal #0E9F9A. Engine colors: SQL amber #B7791F, Records teal
+   · Signal Blue #2563EB. Engine colors: SQL amber #B7791F, Records teal
    #0E9F9A, Vision violet #6D5AE6, Report blue #2F6FB2.
+
+   2026-09-03 (owner request): the PRODUCT ACCENT moved from Signal Teal to
+   the blue of the TechSara mark. It is a colour swap on these four tokens
+   and nothing else — every accent consumer already reads --ts-accent, so no
+   component changed. Deliberately NOT swapped: the engine identity palette
+   (Records/Web teal is a categorical hue beside SQL amber / Vision violet /
+   Report blue — recolouring it blue would collide with Report), the file-type
+   badge tints, the chart series, and the code/SQL syntax tokens. Those are
+   data and identity colours, not the product accent.
 --------------------------------------------------------------------------- */
 
 :root {
@@ -39,15 +48,26 @@
      beside it. #cfcfcf is 13.1:1 on #000 and still clearly recedes from the
      #ffffff it turns on hover. */
   --ts-text-icon: #cfcfcf;
-  --ts-accent: #19bcb5; /* Signal Teal, lifted for AA on dark */
+  --ts-accent: #60a5fa; /* TechSara blue, lifted for AA on dark */
   /* Raw RGB channels of --ts-accent, for Tailwind's <alpha-value> slot: with
      `accent: 'var(--ts-accent)'` every `accent/NN` opacity modifier compiled
      to NOTHING (verified: border-accent/50 emitted no CSS), so pill tints,
      hover borders and the research progress fill silently never rendered.
      Keep in sync with --ts-accent above. */
-  --ts-accent-rgb: 25 188 181;
-  --ts-accent-strong: #0e9f9a;
-  --ts-accent-soft: rgba(14, 159, 154, 0.14);
+  --ts-accent-rgb: 96 165 250;
+  /* The filled-button blue, shared by both themes. White on it is 5.17:1 —
+     the teal it replaces was 3.26:1, so every primary button gained AA. */
+  --ts-accent-strong: #2563eb;
+  --ts-accent-soft: rgba(37, 99, 235, 0.14);
+  /* Text selection, on purpose NOT --ts-accent-soft (2026-09-03, owner: the
+     highlight was too faint to pick out the selected words). It is its own
+     token so the product accent — buttons, chips, focus rings, the meter —
+     keeps the exact values the blue migration landed on.
+
+     .26 over #000 lands on ~#0a1a3d: unmistakably a highlight, while white
+     body text still reads at 17:1 against it. Anything near .5 turns the run
+     into a solid blue block and starts eating the glyphs. */
+  --ts-selection: rgba(37, 99, 235, 0.26);
   --ts-danger: #ef5a5f;
   --ts-danger-rgb: 239 90 95; /* channels of --ts-danger — keep in sync */
   --ts-danger-soft: rgba(229, 72, 77, 0.14);
@@ -137,10 +157,14 @@ html.light,
   /* Light mode inverts the reasoning: a thin dark stroke on paper needs to be
      DARKER than muted text to carry the same weight, not lighter. */
   --ts-text-icon: #444444;
-  --ts-accent: #0b7c77; /* Signal Teal, deepened for AA on paper */
-  --ts-accent-rgb: 11 124 119; /* channels of --ts-accent — keep in sync */
-  --ts-accent-strong: #0e9f9a;
-  --ts-accent-soft: rgba(14, 159, 154, 0.12);
+  --ts-accent: #1d4ed8; /* TechSara blue, deepened for AA on paper */
+  --ts-accent-rgb: 29 78 216; /* channels of --ts-accent — keep in sync */
+  --ts-accent-strong: #2563eb;
+  --ts-accent-soft: rgba(37, 99, 235, 0.12);
+  /* Paper needs LESS alpha than black for the same apparent strength: the
+     tint darkens here instead of lightening. .20 over #fff is ~#d3e0fb, and
+     #0d0d0d on it still reads at 15:1. */
+  --ts-selection: rgba(37, 99, 235, 0.2);
   --ts-danger: #c62a30;
   --ts-danger-rgb: 198 42 48; /* channels of --ts-danger — keep in sync */
   --ts-danger-soft: rgba(198, 42, 48, 0.1);
@@ -170,8 +194,8 @@ html.light,
 }
 /* Sign-in pages wear the LOGO's colour, not the product accent.
    public/techsara-mark.png is deep indigo #1a2480 (sampled: hue 235deg,
-   sat .80); the app's Signal Teal is the in-product accent and stays exactly
-   as it is everywhere else. Overriding the accent tokens for this subtree
+   sat .80); the app's own accent blue is lighter and stays exactly as it is
+   everywhere else. Overriding the accent tokens for this subtree
    means the button, the checkbox, the field focus ring and the focus outlines
    all follow the mark without a single component knowing about it.
 
@@ -182,6 +206,10 @@ html.light,
   --ts-accent-rgb: 26 36 128; /* channels of --ts-accent — keep in sync */
   --ts-accent-strong: #1a2480;
   --ts-accent-soft: rgba(26, 36, 128, 0.1);
+  /* Restated so the app's stronger blue highlight does not leak onto the
+     sign-in pages, which wear the logo indigo and are not what the owner was
+     looking at. Pixel-identical to what these pages already had. */
+  --ts-selection: rgba(26, 36, 128, 0.1);
 }
 
 
@@ -208,7 +236,7 @@ body {
 }
 
 ::selection {
-  background: var(--ts-accent-soft);
+  background: var(--ts-selection);
 }
 
 a {

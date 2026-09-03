@@ -112,6 +112,28 @@ export interface PastedText {
 }
 
 /**
+ * 2026-09-03: an excerpt the user highlighted in an earlier message and asked
+ * a follow-up about ("Ask TechSara AI").
+ *
+ * Rides on the user message's `meta` for exactly the reason `pasted` does: the
+ * server stores meta as opaque JSON and hands it back verbatim, so the
+ * reference survives a reload and can be rendered by any browser — and, like a
+ * pasted block, it is folded into the model-visible text at REQUEST time
+ * rather than being written into `content`. Keeping it out of `content` is
+ * what makes edit and regenerate safe: they re-send the stored message, so a
+ * quote living in the text would be re-wrapped and duplicated every pass.
+ */
+export interface SelectedContext {
+  /** The excerpt, outer whitespace trimmed, internal newlines preserved. */
+  text: string;
+  /** The message it was taken from, as identified when it was captured. */
+  messageId: string;
+  sourceRole: 'user' | 'assistant';
+  /** Set when the excerpt hit the length cap — the card says so. */
+  truncated?: boolean;
+}
+
+/**
  * `event: meta` payload — single final JSON before `done` (§10).
  * V2 (§2) adds mode / model / effort / steps; the frontend also persists the
  * client-captured reasoning stream here (meta.reasoning, §4d) so it survives
@@ -202,6 +224,11 @@ export interface Meta {
   reasoning_seconds?: number;
   /** V5: long text/code the user pasted as chips on a user message. */
   pasted?: PastedText[];
+  /**
+   * 2026-09-03: the excerpt this turn is replying to. Rendered as a quote
+   * above the bubble and folded into the model input at request time.
+   */
+  selected_context?: SelectedContext;
   /**
    * 2026-08-21: file attachments on a user message, riding on meta for the
    * same reason `pasted` does — so they round-trip through server history and
