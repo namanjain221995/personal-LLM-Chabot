@@ -137,6 +137,54 @@ describe('L-17 — Escape while typing', () => {
   });
 });
 
+describe('REPLY-18 — Escape and the floating "Ask TechSara AI" action', () => {
+  it('dismisses the action instead of stopping the generation', () => {
+    // The whole point. Escape over a selection must not be able to throw away
+    // an answer that is still being written — and the precedence is decided
+    // here, in the pure map, rather than by which listener happened to
+    // register first.
+    expect(
+      shortcutAction(
+        { key: 'Escape' },
+        ctx({ quoteActionOpen: true, streaming: true }),
+      ),
+    ).toBe('close-quote-action');
+  });
+
+  it('still yields to the palette, which is the more modal thing', () => {
+    expect(
+      shortcutAction(
+        { key: 'Escape' },
+        ctx({ paletteOpen: true, quoteActionOpen: true }),
+      ),
+    ).toBe('close-palette');
+  });
+
+  it('wins over `typing`, exactly as the palette does', () => {
+    // A selection made while the composer still held focus is a real case;
+    // the visible popover is what Escape most specifically refers to.
+    expect(
+      shortcutAction(
+        { key: 'Escape' },
+        ctx({ quoteActionOpen: true, typing: true }),
+      ),
+    ).toBe('close-quote-action');
+  });
+
+  it('changes nothing when no action is showing', () => {
+    expect(
+      shortcutAction({ key: 'Escape' }, ctx({ quoteActionOpen: false, streaming: true })),
+    ).toBe('stop-streaming');
+    expect(shortcutAction({ key: 'Escape' }, ctx({ quoteActionOpen: false }))).toBeNull();
+  });
+
+  it('does not touch any other key', () => {
+    expect(
+      shortcutAction({ key: '/' }, ctx({ quoteActionOpen: true })),
+    ).toBe('focus-composer');
+  });
+});
+
 describe('the rest of the map is unchanged', () => {
   it('Ctrl/Cmd+K opens search, and only the bare chord', () => {
     expect(shortcutAction({ key: 'k', ctrlKey: true }, ctx())).toBe('open-search');

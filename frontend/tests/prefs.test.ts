@@ -18,18 +18,54 @@ function makeStorage(): StorageLike {
 }
 
 describe('composer prefs (V2 §4c per-conversation persistence)', () => {
-  it('defaults to Salesforce ON, Smart, Think, search Auto', () => {
+  /**
+   * REPLACES "defaults to Salesforce ON, Smart, Think, search Auto".
+   *
+   * Owner request 2026-09-03: a new chat is a plain fast assistant, not a
+   * Salesforce session that reasons first. Both modes are untouched and one
+   * click away; only what a fresh chat STARTS as changed.
+   */
+  it('DEFAULT-01…06 · a new chat is Fast with no source or research armed', () => {
     expect(DEFAULT_PREFS).toEqual({
-      salesforce: true,
+      salesforce: false,
       sfLive: false,
       model: 'smart',
-      effort: 'think',
+      effort: 'fast',
       agent: false,
-      // The composer toggle is gone (2026-07-28) — the level decides, so the
-      // default must be Auto or Fast could never search.
-      webSearch: 'auto', deepResearch: false,
+      // 'auto' is this control's OFF position, not a research mode left on:
+      // the menu ticks "Web search" only at 'on', and at Fast the server
+      // refuses to search whatever this says. 'off' would read the same in the
+      // UI while removing the model's ability to search at Think and Max.
+      webSearch: 'auto',
+      deepResearch: false,
     });
     expect(loadPrefs(makeStorage(), 'unknown-conv')).toEqual(DEFAULT_PREFS);
+  });
+
+  it('DEFAULT-02 · Think and Max are still reachable, just not the default', () => {
+    // The task was about defaults, not about removing levels.
+    const storage = makeStorage();
+    savePrefs(storage, 'c1', { ...DEFAULT_PREFS, effort: 'think' });
+    expect(loadPrefs(storage, 'c1').effort).toBe('think');
+    savePrefs(storage, 'c2', { ...DEFAULT_PREFS, effort: 'max' });
+    expect(loadPrefs(storage, 'c2').effort).toBe('max');
+  });
+
+  it('DEFAULT-03/04 · Salesforce and Live still persist once chosen', () => {
+    const storage = makeStorage();
+    savePrefs(storage, 'c1', { ...DEFAULT_PREFS, salesforce: true, sfLive: true });
+    expect(loadPrefs(storage, 'c1')).toMatchObject({
+      salesforce: true,
+      sfLive: true,
+    });
+  });
+
+  it('DEFAULT-04 · Live Salesforce cannot arm itself without its parent', () => {
+    // Asserted explicitly rather than inferred from "Salesforce is off":
+    // sfLive is a separate stored boolean and must not survive on its own.
+    const storage = makeStorage();
+    savePrefs(storage, 'c1', { ...DEFAULT_PREFS, salesforce: false, sfLive: true });
+    expect(loadPrefs(storage, 'c1').sfLive).toBe(false);
   });
 
   it('persists per conversation independently', () => {

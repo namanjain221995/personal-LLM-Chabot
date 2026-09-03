@@ -320,6 +320,7 @@ export type ShortcutAction =
   | 'open-search'
   | 'new-chat'
   | 'close-palette'
+  | 'close-quote-action'
   | 'stop-streaming'
   | 'focus-composer';
 
@@ -336,6 +337,17 @@ export interface ShortcutContext {
   streaming: boolean;
   /** Focus is in an input / textarea / contenteditable. */
   typing: boolean;
+  /**
+   * The floating "Ask TechSara AI" action is showing over a text selection.
+   *
+   * Handled HERE rather than by a listener racing this one: a popover that
+   * swallowed Escape by stopping propagation would depend on capture-phase
+   * ordering against the window handler that owns this map, and the failure
+   * mode of getting that wrong is Escape silently killing a generation the
+   * user is still waiting for. Stated as context, the precedence is a fact of
+   * the map instead of a fact of registration order.
+   */
+  quoteActionOpen?: boolean;
 }
 
 /**
@@ -358,7 +370,8 @@ export const NEW_CHAT_SHORTCUT_LABEL = 'Ctrl ⇧ ⏎';
  *
  * - Ctrl/Cmd + K         → open the search palette (V3 gave this to new chat);
  * - Ctrl/Cmd + Shift + ⏎ → new chat;
- * - Escape               → close the palette if it is open, else stop the
+ * - Escape               → close the palette if it is open, else dismiss the
+ *                          floating "Ask TechSara AI" action, else stop the
  *                          stream — but never while an editable element has
  *                          focus;
  * - "/"                  → focus the composer, but never while typing or while
@@ -394,6 +407,9 @@ export function shortcutAction(
 
   if (event.key === 'Escape') {
     if (ctx.paletteOpen) return 'close-palette';
+    // Before `typing`, like the palette: dismissing a visible popover is the
+    // most specific reading of Escape and the only non-destructive one.
+    if (ctx.quoteActionOpen) return 'close-quote-action';
     // L-17: while an editable element has focus it owns Escape. There, Escape
     // means "dismiss the IME candidate / leave this field" — never "throw away
     // the answer that is still generating", which is a destructive action the

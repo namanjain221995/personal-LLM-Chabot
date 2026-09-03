@@ -372,21 +372,70 @@ describe('J — Send', () => {
   });
 });
 
-/* ------------------------------------------- K. nothing worth acting on */
+/* ------------------------------------------- K. what is worth acting on */
 
-describe('K — a turn with no text gets no action row', () => {
-  it('shows neither action for an attachment-only message', () => {
+/**
+ * REPLACES "a turn with no text gets no action row", which pinned the bug
+ * rather than the requirement.
+ *
+ * That test asserted that an attachment-only turn showed neither Edit nor
+ * Copy, and it passed for two years while the actual user problem was exactly
+ * that: attach two documents, forget to type the question, and there was no
+ * way back to the turn. The row is about the TURN, not about its prose.
+ *
+ * Copy's half of the old assertion survives unchanged, because it was never
+ * the bug: Copy still means "copy what I wrote".
+ */
+describe('K — the action row belongs to the turn, not to its text', () => {
+  it('EDIT-FILE-02 · an attachment-only message IS editable', () => {
     renderRow(user({ content: '', pdfName: 'report.pdf' }));
-    expect(screen.queryByRole('button', { name: 'Copy message' })).toBeNull();
-    expect(screen.queryByRole('button', { name: 'Edit message' })).toBeNull();
+    expect(screen.getByRole('button', { name: 'Edit message' })).toBeTruthy();
     // The attachment chip itself is untouched.
     expect(screen.getByText('report.pdf')).toBeTruthy();
   });
 
-  it('shows neither action for whitespace-only content', () => {
+  it('EDIT-FILE-14 · …but offers no Copy, because there is nothing to copy', () => {
+    renderRow(user({ content: '', pdfName: 'report.pdf' }));
+    expect(screen.queryByRole('button', { name: 'Copy message' })).toBeNull();
+  });
+
+  it('an image-only turn is editable too', () => {
+    renderRow(user({ content: '', imageDataUrl: 'data:image/png;base64,AAA' }));
+    expect(screen.getByRole('button', { name: 'Edit message' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Copy message' })).toBeNull();
+  });
+
+  it('a paste-only turn is editable — the same missing-prompt problem', () => {
+    renderRow(
+      user({
+        content: '',
+        meta: { pasted: [{ id: 'p1', content: 'LOG', lines: 1, chars: 3 }] },
+      }),
+    );
+    expect(screen.getByRole('button', { name: 'Edit message' })).toBeTruthy();
+  });
+
+  it('a turn with NOTHING in it still gets no row at all', () => {
+    // Whitespace and no attachment: there is genuinely nothing to act on, and
+    // this is the half of the old test that was always right.
     renderRow(user({ content: '   \n ' }));
     expect(screen.queryByRole('button', { name: 'Copy message' })).toBeNull();
     expect(screen.queryByRole('button', { name: 'Edit message' })).toBeNull();
+  });
+
+  it('renders no empty row where the host offers no editor', () => {
+    // Previews and tests pass no `onEditStart`. An attachment-only turn there
+    // has no Edit and no Copy, so the row must not render as an empty flex box
+    // with margin — invisible, but it would still move the layout.
+    const { container } = render(
+      <MessageRow
+        message={user({ content: '', pdfName: 'report.pdf' })}
+        isLast={false}
+        onRegenerate={vi.fn()}
+        onRetry={vi.fn()}
+      />,
+    );
+    expect(container.querySelectorAll('.mt-1\\.5.flex.items-center').length).toBe(0);
   });
 });
 

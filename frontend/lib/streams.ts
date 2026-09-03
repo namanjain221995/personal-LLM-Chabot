@@ -22,7 +22,7 @@ import { redirectToLogin } from './auth';
 import { branchForAppend, branchOf, metaWithBranch } from './branching';
 import type { ClarificationResponse } from './clarification';
 import { getHistoryStore, newId } from './history';
-import { foldModelContent } from './pasted';
+import { foldTurnForModel } from './selectedContext';
 import type { ChatPrefs } from './prefs';
 import { toClientError } from './errorTypes';
 import { foldStreamState, mergeStep, readChatStream } from './sse';
@@ -511,9 +511,7 @@ export async function startStream(opts: StartStreamOptions): Promise<void> {
   // and the proxy needs that fact stated rather than guessed at.
   const currentTurn = context[context.length - 1];
   const currentText =
-    currentTurn?.role === 'user'
-      ? foldModelContent(currentTurn.content, currentTurn.meta?.pasted)
-      : '';
+    currentTurn?.role === 'user' ? foldTurnForModel(currentTurn) : '';
   const s = register(conversationId, turns, opts.assistantBranch);
   // Did the orchestrator accept the request? Decides whether a failure below
   // is "unreachable" (retry) or "interrupted" (re-join) — see markInterrupted.
@@ -526,7 +524,11 @@ export async function startStream(opts: StartStreamOptions): Promise<void> {
         messages: context
           .map((m) => ({
             role: m.role,
-            content: foldModelContent(m.content, m.meta?.pasted),
+            // Pasted blocks AND a quoted excerpt are folded in here, at the
+            // one point a stored turn becomes model text — which is why
+            // neither is ever written into `content`, and why replaying the
+            // transcript cannot duplicate them.
+            content: foldTurnForModel(m),
           }))
           .filter((m) => m.content),
         // NEW-14: what the transcript above can no longer say, because the

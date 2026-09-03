@@ -5,8 +5,8 @@
  * ChatGPT-style "+" menu (AttachMenu, 2026-08-05: Add photos & files · Web
  * search · Salesforce) with upload chips + remove, and a controls row —
  * the toggles LIVE in the "+" menu, and a dismissible pill appears here only
- * while its tool is ON (Salesforce, which defaults on; Web search while
- * forced) — plus the effort picker (Fast/Low/Medium/High on the one model)
+ * while its tool is ON (Salesforce and Web search alike, both OFF on a new
+ * chat since 2026-09-03) — plus the effort picker (Fast/Think/Max on one model)
  * and the send button that morphs to Stop while streaming.
  * There is no Agent toggle: the model decides when to plan steps (2026-07-28).
  * Enter=send / Shift+Enter=newline. The trust footer line dims when the
@@ -29,11 +29,12 @@ import {
   makePastedText,
   shouldAttachPaste,
 } from '@/lib/pasted';
-import type { PastedText } from '@/lib/types';
+import type { PastedText, SelectedContext } from '@/lib/types';
 import { activateComposerMenuItem, trustLine } from '@/lib/composerMenu';
 import { AttachMenu } from './AttachMenu';
 import { ModelPicker } from './ModelPicker';
 import { PastedChip } from './PastedChip';
+import { QuotedContext } from './QuotedContext';
 import { useToast } from './Providers';
 import {
   IconBook,
@@ -170,6 +171,16 @@ interface ComposerProps {
    */
   clarificationPlaceholder?: string;
   /**
+   * The excerpt the next message replies to, captured by "Ask TechSara AI".
+   *
+   * Owned by ChatApp, not by this component: it outlives the composer's own
+   * draft state (it survives attachments being added, modes being toggled and
+   * the box being retyped) and it has to be readable at send time by the code
+   * that builds the turn. The composer only SHOWS it and offers the ×.
+   */
+  selectedContext?: SelectedContext | null;
+  onClearSelectedContext?: () => void;
+  /**
    * The Salesforce starter card. Rendered above the input and only while the
    * composer is EMPTY, so it can suggest without ever being in the way.
    */
@@ -198,6 +209,8 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
       onPrefsChange,
       onSend,
       onStop,
+      selectedContext,
+      onClearSelectedContext,
       clarificationPlaceholder,
       starter,
       clarification,
@@ -526,6 +539,18 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
               sitting above half-typed text is clutter, not help — and toggling
               Salesforce must never disturb what someone is writing. */}
           {!clarification && starter && !hasContent && starter}
+          {/* The pending reference. Its own row above the attachment chips, so
+              adding a file does not reflow it and removing it does not reflow
+              them. Nothing else about the composer's width or structure
+              changes — this sits inside the same max-w-thread column. */}
+          {selectedContext && (
+            <div className="mb-2">
+              <QuotedContext
+                context={selectedContext}
+                onRemove={onClearSelectedContext}
+              />
+            </div>
+          )}
           {(attachments.length > 0 || pastedTexts.length > 0) && (
             <div className="mb-2 flex flex-wrap items-start gap-2">
               {attachments.map((attachment, idx) => (

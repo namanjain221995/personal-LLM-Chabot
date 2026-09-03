@@ -23,8 +23,16 @@ export interface SentAttachment {
 
 const sent = new Map<string, SentAttachment[]>();
 
-/** Remember what was attached to the user message with this id —
-    up to 5 images or a single PDF (2026-08-05 multi-upload). */
+/**
+ * Remember what was attached to the user message with this id — every image
+ * and every document that has bytes, in attach order.
+ *
+ * "Or a single PDF" was the contract until 2026-09-03, and it was the root of
+ * the multi-document resend bug: `send()` stored only the FIRST document, so
+ * a regenerate or an edit of a four-document turn quietly re-asked the
+ * question with one file. Nothing here changed; the callers now hand over the
+ * whole list, and `resendOptionsFor` below reads it positionally.
+ */
 export function rememberAttachments(
   messageId: string,
   attachments: SentAttachment[],
@@ -59,10 +67,23 @@ export function isDatasetTurn(message: {
 }
 
 export interface AttachmentsLookup {
-  /** The attachments to re-send, when we still have them (may be empty). */
+  /** Inline payloads to re-send (images, and a document with no upload id). */
   attachments: SentAttachment[];
+  /**
+   * Documents re-sent BY REFERENCE — the durable upload ids the message
+   * persists in `meta.attachments`. Same contract `send()` uses for several
+   * documents (`pdf_uploads`), and the reason a document turn can now be
+   * regenerated after a reload: the bytes never had to be in this tab.
+   */
+  pdfUploads: DocumentRef[];
   /** True when the turn HAD attachments we can no longer reconstruct. */
   missing: boolean;
+}
+
+/** One document the orchestrator reads back by id — `pdf_uploads[]` on the wire. */
+export interface DocumentRef {
+  upload_id: string;
+  name: string;
 }
 
 /**
@@ -73,13 +94,44 @@ export interface AttachmentsLookup {
  * is kept — so after a reload they report `missing`, and the caller must ask
  * the user to re-attach instead of quietly sending a text-only prompt.
  */
-export function attachmentsForResend(message: {
+/** The message fields a resend reads. Structural, so tests need no ChatMessage. */
+export interface ResendableMessage {
   id: string;
   imageDataUrl?: string;
   imageDataUrls?: string[];
   pdfName?: string;
   meta?: { attachments?: Array<{ kind?: string; name?: string; id?: string }> };
-}): AttachmentsLookup {
+}
+
+/**
+ * Recover the attachments for a user turn being re-sent — ALL of them.
+ *
+ * Every document has up to two identities, and this is the one place that
+ * decides which travels:
+ *
+ *   1. its durable upload id, persisted on `meta.attachments[i].id` — the
+ *      canonical identity. Present, the document goes BY REFERENCE and its
+ *      bytes are never touched here, which is exactly what `send()` does for
+ *      several documents and what makes a resend work after a reload;
+ *   2. the base64 this tab remembered at send time — used only for a document
+ *      that has no id yet (the one-small-document inline path, before or
+ *      without its background durability upload).
+ *
+ * Never both. A document with an id is not ALSO sent inline, so the model
+ * cannot receive the same file twice; and the match between an id-less entry
+ * and its remembered bytes is by POSITION among the documents, not by name,
+ * because two different files may share a filename.
+ *
+ * Images are unchanged: the persisted previews are the payloads and survive a
+ * reload. Datasets are unchanged too — nothing is resent, the orchestrator
+ * finds the upload through conversation_id (PHASE 3, see isDatasetTurn).
+ *
+ * `missing` is only true when something genuinely cannot be rebuilt: a
+ * document with neither an id nor remembered bytes (a legacy turn after a
+ * reload), or an image whose preview is unreadable. That is when the caller
+ * shows the honest "re-attach" error instead of quietly re-asking with less.
+ */
+export function attachmentsForResend(message: ResendableMessage): AttachmentsLookup {
   // PHASE 3. A DATASET needs nothing resent. It never travelled in the chat
   // body in the first place — it streams to /api/upload and the orchestrator
   // finds it again through conversation_id — so the profile that answers the
@@ -90,29 +142,94 @@ export function attachmentsForResend(message: {
   // proof that something is gone. The result was a regenerate that refused to
   // run, telling the user to re-attach a file the server had never lost.
   if (isDatasetTurn(message)) {
-    return { attachments: [], missing: false };
+    return { attachments: [], pdfUploads: [], missing: false };
   }
 
-  const remembered = sent.get(message.id);
-  if (remembered) return { attachments: remembered, missing: false };
+  const remembered = sent.get(message.id) ?? [];
+  const rememberedImages = remembered.filter((a) => a.kind === 'image');
+  const rememberedPdfs = remembered.filter((a) => a.kind === 'pdf');
 
+  /* ---- images: remembered bytes, else the persisted previews ---- */
   const previews = message.imageDataUrls?.length
     ? message.imageDataUrls
     : message.imageDataUrl
       ? [message.imageDataUrl]
       : [];
-  const fromPreviews = previews
-    .map((p) => base64FromDataUrl(p))
-    .filter((b): b is string => Boolean(b))
-    .map((base64) => ({ kind: 'image' as const, name: 'image', base64 }));
-  if (fromPreviews.length === previews.length && fromPreviews.length > 0) {
-    return { attachments: fromPreviews, missing: false };
+  let images: SentAttachment[] = rememberedImages;
+  let imagesMissing = false;
+  if (images.length === 0 && previews.length > 0) {
+    const fromPreviews = previews
+      .map((p) => base64FromDataUrl(p))
+      .filter((b): b is string => Boolean(b))
+      .map((base64) => ({ kind: 'image' as const, name: 'image', base64 }));
+    if (fromPreviews.length === previews.length) images = fromPreviews;
+    else imagesMissing = true;
   }
+
+  /* ---- documents: by reference where there is an id, inline where not ---- */
+  const docs = (message.meta?.attachments ?? []).filter((a) => a.kind === 'pdf');
+  const pdfUploads: DocumentRef[] = [];
+  const inlinePdfs: SentAttachment[] = [];
+  let docsMissing = false;
+  if (docs.length > 0) {
+    docs.forEach((entry, i) => {
+      if (entry.id) {
+        pdfUploads.push({ upload_id: entry.id, name: entry.name ?? `Document ${i + 1}` });
+      } else if (rememberedPdfs[i]) {
+        inlinePdfs.push(rememberedPdfs[i]);
+      } else {
+        docsMissing = true;
+      }
+    });
+  } else if (message.pdfName) {
+    // A turn from before `meta.attachments` existed: one document, known only
+    // by name. Its bytes are in this tab or they are gone.
+    if (rememberedPdfs[0]) inlinePdfs.push(rememberedPdfs[0]);
+    else docsMissing = true;
+  }
+
   return {
-    attachments: [],
-    missing: Boolean(
-      message.pdfName || message.imageDataUrl || message.imageDataUrls?.length,
-    ),
+    attachments: [...images, ...inlinePdfs],
+    pdfUploads,
+    missing: imagesMissing || docsMissing,
+  };
+}
+
+/**
+ * Exactly the attachment slice of a `startStream` call for re-sending
+ * `message`, built ONCE here so regenerate, retry and edit cannot disagree.
+ *
+ * This replaced three copies of `attachments.find((a) => a.kind === 'pdf')`
+ * — a `.find` where an array was needed, which is the whole reason a
+ * four-document turn regenerated with one document. The chat body's own
+ * contract already carried several documents (`pdf_uploads`, since
+ * 2026-09-02); the resend paths simply never used it.
+ *
+ * The inline `pdf` field is single by contract. It is only ever needed for a
+ * document with no upload id, and `send()` uploads (and links ids for) every
+ * document the moment there is more than one — so at most one inline document
+ * can exist per turn. A second id-less document would be a turn this code
+ * cannot rebuild faithfully, and it is reported as `missing` rather than
+ * silently dropped.
+ */
+export function resendOptionsFor(message: ResendableMessage): {
+  images: string[];
+  pdf: string | null;
+  pdfName: string | null;
+  pdfUploads: DocumentRef[] | null;
+  dataset: boolean;
+  missing: boolean;
+} {
+  const { attachments, pdfUploads, missing } = attachmentsForResend(message);
+  const inline = attachments.filter((a) => a.kind === 'pdf');
+  const firstInline = inline[0] ?? null;
+  return {
+    images: attachments.filter((a) => a.kind === 'image').map((a) => a.base64),
+    pdf: firstInline?.base64 ?? null,
+    pdfName: firstInline?.name ?? pdfUploads[0]?.name ?? null,
+    pdfUploads: pdfUploads.length ? pdfUploads : null,
+    dataset: isDatasetTurn(message),
+    missing: missing || inline.length > 1,
   };
 }
 

@@ -41,11 +41,11 @@ import {
 } from '@/lib/prefs';
 import {
   attachmentsForResend,
+  resendOptionsFor,
   carryAttachmentFiles,
   dragHasFiles,
   dropIntent,
   dragHasInternalAttachment,
-  isDatasetTurn,
   previewMimeFor,
   rememberAttachments,
   rememberAttachmentFiles,
@@ -102,16 +102,17 @@ import { isCompacting, requestCompact } from '@/lib/compact';
 import type {
   ChatMessage,
   ConversationSummary,
-  Engine,
   PastedText,
+  SelectedContext,
 } from '@/lib/types';
+import type { SelectionCandidate } from '@/lib/selectedContext';
 import { Composer, type Attachment, type ComposerHandle } from './Composer';
+import { SelectionAsk } from './SelectionAsk';
 import { SalesforceStarterCard } from './SalesforceStarterCard';
 import { ConfirmDialog } from './ConfirmDialog';
 import { ContextMeter } from './ContextMeter';
 import { SummaryPanel } from './SummaryPanel';
 import { EmptyState } from './EmptyState';
-import { EngineBadge } from './EngineBadge';
 import { MessageRow, type UploadStatus } from './MessageRow';
 import { ClarificationCard } from './ClarificationCard';
 import { SearchPalette } from './SearchPalette';
@@ -223,6 +224,23 @@ export function ChatApp() {
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<ComposerHandle>(null);
+  /**
+   * "Ask TechSara AI" (2026-09-03), in two pieces on purpose.
+   *
+   * `selectionCandidate` is the live thing under the cursor — it comes and
+   * goes with the browser's own selection. `selectedContext` is the COMMITTED
+   * reference: once the user has clicked the action it must survive the
+   * selection being cleared (which clicking anything does), the composer being
+   * typed in, files being attached and modes being toggled. Only an explicit
+   * ×, a sent turn, or leaving the conversation ends it.
+   */
+  const [selectionCandidate, setSelectionCandidate] =
+    useState<SelectionCandidate | null>(null);
+  const [selectedContext, setSelectedContext] =
+    useState<SelectedContext | null>(null);
+  /** Read at send time, where a state value would be a render behind. */
+  const selectedContextRef = useRef<SelectedContext | null>(null);
+  selectedContextRef.current = selectedContext;
   /** The header toggle — where focus returns when the mobile drawer closes. */
   const sidebarToggleRef = useRef<HTMLButtonElement>(null);
   const messagesRef = useRef<ChatMessage[]>([]);
@@ -289,6 +307,21 @@ export function ChatApp() {
       setActiveId(wanted);
       activeIdRef.current = wanted;
       setPrefs(loadPrefs(window.localStorage, wanted));
+    } else {
+      /**
+       * No ?c= — the app opened straight onto a blank chat, and that chat's
+       * prefs are DEFAULT_PREFS, because that is what `useState` above was
+       * given. The STORED draft slot is not consulted for rendering, so it can
+       * still hold whatever a previous session left in it; write the defaults
+       * over it so storage says what the screen says.
+       *
+       * Not cosmetic. `send()` calls `adoptDraftPrefs` when it creates the
+       * conversation, and that reads the slot from storage — so a stale draft
+       * would leave the request correct (it goes through `prefsRef`) while
+       * snapping the composer to Salesforce/Think the instant the first message
+       * landed. Opening the app must not need a New Chat click to be neutral.
+       */
+      savePrefs(window.localStorage, null, DEFAULT_PREFS);
     }
 
     if (window.matchMedia('(max-width: 767px)').matches) {
@@ -724,6 +757,15 @@ export function ChatApp() {
       pasted: PastedText[],
       clarification?: ClarificationResponse | null,
     ) => {
+      // Read (and release) the pending reference HERE — the one point at which
+      // the turn is definitely being created. Every earlier refusal (streaming,
+      // an empty box, an attachment still being read) returns from the composer
+      // without ever calling this, so the reference simply stays put and the
+      // user can send again; and from this line on it is durable on the message
+      // itself rather than pending in the UI.
+      const quoted = selectedContextRef.current;
+      selectedContextRef.current = null;
+      setSelectedContext(null);
       // Up to 5 images OR exactly one PDF/dataset (2026-08-05) — the
       // Composer enforces the shape; `first` covers the exclusive kinds.
       const first = attachments[0] ?? null;
@@ -776,10 +818,15 @@ export function ChatApp() {
         // rendered by any browser from server history — pdfName alone never
         // left this browser's cache.
         meta: metaWithBranch(
-          pasted.length || isPdf || isDataset
+          pasted.length || isPdf || isDataset || quoted
             ? {
                 route: 'chat',
                 ...(pasted.length ? { pasted } : {}),
+                // Rides on meta exactly as `pasted` does: round-trips through
+                // server history, renders from history in any browser, and is
+                // folded into the model text at request time (lib/streams.ts)
+                // rather than being written into `content`.
+                ...(quoted ? { selected_context: quoted } : {}),
                 ...(isPdf || isDataset
                   ? {
                       // EVERY document, in attach order (2026-09-02). One
@@ -813,19 +860,27 @@ export function ChatApp() {
       );
       // Keep the payloads in memory so regenerate/retry re-send the same
       // question WITH its attachments (never persisted — see lib/attachments).
+      //
+      // EVERY document, not the first (2026-09-03). This line used to keep
+      // `[first]` alone, which is where a four-document turn lost three files
+      // on its way back through regenerate and edit: the resend read what was
+      // remembered, and one document was all there was. Documents are stored
+      // in attach order because `resendOptionsFor` matches them to
+      // `meta.attachments` by POSITION — never by name, since two files may
+      // share one.
       if (!isDataset) {
-        rememberAttachments(
-          userMessage.id,
-          isPdf && first?.base64
-            ? [{ kind: 'pdf', name: first.name, base64: first.base64 }]
-            : images
-                .filter((i) => i.base64)
-                .map((i) => ({
-                  kind: 'image' as const,
-                  name: i.name,
-                  base64: i.base64,
-                })),
-        );
+        rememberAttachments(userMessage.id, [
+          ...images
+            .filter((i) => i.base64)
+            .map((i) => ({
+              kind: 'image' as const,
+              name: i.name,
+              base64: i.base64,
+            })),
+          ...docAttachments
+            .filter((d) => d.base64)
+            .map((d) => ({ kind: 'pdf' as const, name: d.name, base64: d.base64 })),
+        ]);
       }
       // `turns` is everything STORED (sibling branches included); `context`
       // is the single path the model is sent.
@@ -1094,25 +1149,29 @@ export function ChatApp() {
       const view = threadRef.current;
       const idx = view.findIndex((m) => m.id === messageId);
       if (idx === -1) return;
-      let userIdx = idx - 1;
+      // `messageId` is normally the ANSWER (the "Try again" button). Since
+      // 2026-09-03 it may also be the USER turn itself — an edit submitted
+      // with its text unchanged is a regenerate, and that turn may not have
+      // an answer under it yet. Either way the question is the nearest user
+      // turn at or above the id, and everything from here is identical.
+      let userIdx = view[idx].role === 'user' ? idx : idx - 1;
       while (userIdx >= 0 && view[userIdx].role !== 'user') userIdx--;
       if (userIdx < 0) return;
       const context = view.slice(0, userIdx + 1);
 
-      // Re-send the SAME question, attachments included. Without this the
-      // model was re-asked "what's in this invoice?" with no invoice attached.
-      const { attachments, missing } = attachmentsForResend(view[userIdx]);
-      if (missing) {
+      // Re-send the SAME question, attachments included — ALL of them, by
+      // reference where the message carries upload ids, inline only where it
+      // does not (lib/attachments resendOptionsFor). Without this the model
+      // was re-asked "what's in this invoice?" with no invoice attached; and
+      // until 2026-09-03 a four-document turn was re-asked with one.
+      const resend = resendOptionsFor(view[userIdx]);
+      if (resend.missing) {
         toast(
           'Re-attach the file to regenerate this answer — its contents are no longer in memory.',
           'error',
         );
         return;
       }
-      const resendImages = attachments
-        .filter((a) => a.kind === 'image')
-        .map((a) => a.base64);
-      const resendPdf = attachments.find((a) => a.kind === 'pdf') ?? null;
 
       // In a conversation that has versions, truncating would delete the
       // OTHER branches too — they live in the same flat list. So the retry is
@@ -1152,13 +1211,14 @@ export function ChatApp() {
         context,
         assistantBranch: branchForAppend(turns, context),
         prefs: prefsRef.current,
-        images: resendImages,
-        pdf: resendPdf?.base64 ?? null,
-        pdfName: resendPdf?.name ?? null,
+        images: resend.images,
+        pdf: resend.pdf,
+        pdfName: resend.pdfName,
+        pdfUploads: resend.pdfUploads,
         // PHASE 3: a dataset turn resends no bytes, but it must still SAY it
         // is a dataset turn — otherwise a wordless one rebuilds the exact
         // NEW-14 request that has no message in it and 400s.
-        dataset: isDatasetTurn(view[userIdx]),
+        dataset: resend.dataset,
       });
     },
     [toast],
@@ -1219,8 +1279,8 @@ export function ChatApp() {
       // as their own previews; a PDF's bytes do not outlive a reload and a
       // dataset only ever lived server-side, so both report `missing` and the
       // edit stops rather than silently re-asking with nothing attached.
-      const { attachments, missing } = attachmentsForResend(original);
-      if (missing) {
+      const resend = resendOptionsFor(original);
+      if (resend.missing) {
         toast(
           'Re-attach the file to edit this message — its contents are no longer in memory.',
           'error',
@@ -1256,7 +1316,10 @@ export function ChatApp() {
       const answerBranch = branchForAppend(turns, context);
 
       setEditingMessageId(null);
-      rememberAttachments(edited.id, attachments);
+      // The new version remembers what the original remembered — every image
+      // and every inline document — so a later regenerate of the EDIT can
+      // rebuild the same request the edit itself is about to send.
+      rememberAttachments(edited.id, attachmentsForResend(original).attachments);
       // The edit is a new message carrying the SAME attachments, so the files
       // follow it — otherwise rewording a question turned its file card dead.
       carryAttachmentFiles(original.id, edited.id);
@@ -1269,49 +1332,22 @@ export function ChatApp() {
       setAtBottom(true);
       setUnreachable(false);
       setStreaming(true);
-      const editedPdf = attachments.find((a) => a.kind === 'pdf') ?? null;
       void startStream({
         conversationId: id,
         turns,
         context,
         assistantBranch: answerBranch,
         prefs: prefsRef.current,
-        images: attachments
-          .filter((a) => a.kind === 'image')
-          .map((a) => a.base64),
-        pdf: editedPdf?.base64 ?? null,
-        pdfName: editedPdf?.name ?? null,
+        images: resend.images,
+        pdf: resend.pdf,
+        pdfName: resend.pdfName,
+        pdfUploads: resend.pdfUploads,
         // The edit inherits the original turn's attachments, so it inherits
         // its dataset-ness too (see regenerate above).
-        dataset: isDatasetTurn(edited),
+        dataset: resend.dataset,
       });
     },
     [persist, toast],
-  );
-
-  /**
-   * Send from the editor.
-   *
-   * There is nothing to confirm any more: an edit adds a version and removes
-   * nothing, so the dialog that used to warn about discarded turns would be
-   * describing something that no longer happens.
-   */
-  const submitEdit = useCallback(
-    (messageId: string, text: string) => {
-      const all = messagesRef.current;
-      const original = all.find((m) => m.id === messageId);
-      if (!original || original.role !== 'user') return;
-      const next = text.trim();
-      // Unchanged text is not an edit — a second identical version would add
-      // a navigator with nothing to navigate between. Re-asking as-is is what
-      // Regenerate is for.
-      if (!next || next === (original.content ?? '').trim()) {
-        setEditingMessageId(null);
-        return;
-      }
-      void runEdit(messageId, next);
-    },
-    [runEdit],
   );
 
   /**
@@ -1339,6 +1375,51 @@ export function ChatApp() {
     },
     [runRegenerate],
   );
+
+  /**
+   * Send from the editor.
+   *
+   * There is nothing to confirm any more: an edit adds a version and removes
+   * nothing, so the dialog that used to warn about discarded turns would be
+   * describing something that no longer happens.
+   */
+  const submitEdit = useCallback(
+    (messageId: string, text: string) => {
+      const all = messagesRef.current;
+      const original = all.find((m) => m.id === messageId);
+      if (!original || original.role !== 'user') return;
+      const next = text.trim();
+      // An emptied box is Cancel, not an edit (the editor's Send is disabled
+      // for it anyway, and an attachment-only turn must never be re-asked as
+      // an empty request).
+      if (!next) {
+        setEditingMessageId(null);
+        return;
+      }
+      // Unchanged text is not an edit — a second identical version would add
+      // a `1 / 2` with nothing to navigate between. Re-asking as-is is what
+      // Regenerate is for, so that is what it does (owner request 2026-09-03):
+      // the SAME user turn, a new answer beside the old one, exactly as the
+      // "Try again" button would — confirmation for an older answer included,
+      // because the same rows are at stake. The comparison is the editor's own
+      // normalisation (outer trim only): "Read these" → "Read these carefully"
+      // and a moved line break are both real edits.
+      if (next === (original.content ?? '').trim()) {
+        setEditingMessageId(null);
+        const view = threadRef.current;
+        const at = view.findIndex((m) => m.id === messageId);
+        const answer = at === -1 ? undefined : view.slice(at + 1).find((m) => m.role === 'assistant');
+        if (answer) regenerate(answer.id);
+        // No answer under it yet (a failed or stopped first attempt): there
+        // is nothing to discard, so it runs straight away from the turn.
+        else void runRegenerate(messageId);
+        return;
+      }
+      void runEdit(messageId, next);
+    },
+    [runEdit, regenerate, runRegenerate],
+  );
+
 
   /**
    * The fatal request-level failure currently on screen, if any.
@@ -1374,15 +1455,14 @@ export function ChatApp() {
       setUnreachable(false);
       return;
     }
-    const { attachments, missing } = attachmentsForResend(view[userIdx]);
-    if (missing) {
+    const resend = resendOptionsFor(view[userIdx]);
+    if (resend.missing) {
       toast(
         'Re-attach the file to retry this message — its contents are no longer in memory.',
         'error',
       );
       return;
     }
-    const retryPdf = attachments.find((a) => a.kind === 'pdf') ?? null;
     setUnreachable(false);
     setStreaming(true);
     const context = view.slice(0, userIdx + 1);
@@ -1394,12 +1474,11 @@ export function ChatApp() {
       context,
       assistantBranch: branchForAppend(hasBranches(all) ? all : context, context),
       prefs: prefsRef.current,
-      images: attachments
-        .filter((a) => a.kind === 'image')
-        .map((a) => a.base64),
-      pdf: retryPdf?.base64 ?? null,
-      pdfName: retryPdf?.name ?? null,
-      dataset: isDatasetTurn(view[userIdx]),
+      images: resend.images,
+      pdf: resend.pdf,
+      pdfName: resend.pdfName,
+      pdfUploads: resend.pdfUploads,
+      dataset: resend.dataset,
     });
   }, [toast]);
 
@@ -1542,6 +1621,22 @@ export function ChatApp() {
     [toast],
   );
 
+  /**
+   * A pending "Ask TechSara AI" reference belongs to ONE conversation.
+   *
+   * Keyed on `activeId` rather than wired into each of newChat / open / delete
+   * / the history reset, because every one of those ends in the same place —
+   * a different active conversation — and four call sites is four chances for
+   * the next one to be forgotten and leak a quote from someone else's chat
+   * into this one. (A send that CREATES a conversation also lands here, and
+   * has already released the reference onto its message by then.)
+   */
+  useEffect(() => {
+    setSelectedContext(null);
+    selectedContextRef.current = null;
+    setSelectionCandidate(null);
+  }, [activeId]);
+
   // Keyboard shortcuts (§9 + V4 §2). The map itself is pure and unit-tested
   // in lib/searchPalette.ts; this only supplies the live context and runs the
   // action it names.
@@ -1550,6 +1645,7 @@ export function ChatApp() {
       const target = e.target as HTMLElement | null;
       const action = shortcutAction(e, {
         paletteOpen: searchOpen,
+        quoteActionOpen: selectionCandidate !== null,
         streaming: isStreaming(activeIdRef.current),
         typing:
           target?.tagName === 'INPUT' ||
@@ -1565,6 +1661,12 @@ export function ChatApp() {
         case 'close-palette':
           setSearchOpen(false);
           return;
+        case 'close-quote-action':
+          // The floating action only. A reference already committed to the
+          // composer is NOT thrown away by Escape — it took a deliberate
+          // click to make, and it takes the × to unmake.
+          setSelectionCandidate(null);
+          return;
         case 'new-chat':
           newChat();
           return;
@@ -1577,16 +1679,20 @@ export function ChatApp() {
     }
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [newChat, searchOpen, stopStreaming]);
+  }, [newChat, searchOpen, selectionCandidate, stopStreaming]);
 
   /** Which visible turns have alternatives — one walk, not one per row. */
   const versions = useMemo(() => versionMap(messages), [messages]);
 
   const activeTitle =
     conversations.find((c) => c.id === activeId)?.title ?? 'New chat';
-  const lastEngine: Engine | undefined = [...thread]
-    .reverse()
-    .find((m) => m.role === 'assistant' && m.meta?.route)?.meta?.route;
+  /* 2026-09-03 (owner request): the header no longer carries a passive engine
+     badge — "Vision" / "Chat" / "Records" in the top-right corner told the
+     reader which route answered, which is a fact about the machine rather than
+     about the answer. `meta.route` is untouched: it is still written, still
+     persisted, still what history, regenerate and the request path read. Only
+     the label is gone, and with it the `lastEngine` walk that existed solely to
+     feed it. */
 
   // Chats generating right now — in this tab OR server-side (after reload).
   const busyIds = Array.from(new Set([...streamingIds(), ...serverActive]));
@@ -1594,11 +1700,11 @@ export function ChatApp() {
   /**
    * PHASE 4A/4B — put a previously sent attachment back in the composer.
    *
-   * ONE function behind both gestures. "Attach again" and an internal drag are
-   * different ways of asking the same question, and giving them separate
-   * pipelines is how two entry points drift until one accepts what the other
-   * refuses — the same reasoning that made `acceptFiles` the single door for
-   * the picker and the desktop drop.
+   * ONE function behind both gestures. The internal drag and the drop that
+   * receives it are different ways of asking the same question, and giving
+   * them separate pipelines is how two entry points drift until one accepts
+   * what the other refuses — the same reasoning that made `acceptFiles` the
+   * single door for the picker and the desktop drop.
    *
    * It resolves bytes down the full ladder (this tab's File, the persisted
    * image payload, then the orchestrator by upload_id), rebuilds a real `File`
@@ -1723,7 +1829,9 @@ export function ChatApp() {
     if (intent.action === 'ignore') return;
 
     if (intent.action === 'internal') {
-      // 4B: same handler as the "Attach again" button, on purpose.
+      // 4B: the drag's drop resolves through the SAME handler, on purpose.
+      // (The visible "Attach again" button was removed 2026-09-03; this is
+      // now the only entry point, and it is unchanged.)
       void reuseAttachment(intent.ref.messageId, intent.ref.index);
       return;
     }
@@ -1867,11 +1975,6 @@ export function ChatApp() {
             </button>
           )}
           <h1 className="sr-only">{activeId ? activeTitle : APP_NAME}</h1>
-          {lastEngine && (
-            <span className="ml-auto">
-              <EngineBadge engine={lastEngine} size="xs" />
-            </span>
-          )}
         </header>
 
         <div
@@ -1954,6 +2057,21 @@ export function ChatApp() {
           </div>
         )}
 
+        {/* The floating action. Fixed-positioned against the viewport, so it
+            lives here rather than inside the scroller — a child of the
+            scrolling column would be clipped by its overflow. */}
+        <SelectionAsk
+          candidate={selectionCandidate}
+          onCandidateChange={setSelectionCandidate}
+          onAsk={(candidate) => {
+            setSelectedContext(candidate.context);
+            selectedContextRef.current = candidate.context;
+            setSelectionCandidate(null);
+            // The next thing the user does is type the follow-up.
+            composerRef.current?.focus();
+          }}
+        />
+
         <Composer
           ref={composerRef}
           streaming={streaming}
@@ -1980,6 +2098,11 @@ export function ChatApp() {
           onPrefsChange={updatePrefs}
           onSend={sendFromComposer}
           onStop={stopStreaming}
+          selectedContext={selectedContext}
+          onClearSelectedContext={() => {
+            setSelectedContext(null);
+            selectedContextRef.current = null;
+          }}
           clarificationPlaceholder={
             customAnswerFor?.custom_placeholder ??
             (pending ? pending.custom_placeholder : undefined)
