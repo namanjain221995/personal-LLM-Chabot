@@ -114,6 +114,7 @@ import { ConfirmDialog } from './ConfirmDialog';
 import { ContextMeter } from './ContextMeter';
 import { SummaryPanel } from './SummaryPanel';
 import { EmptyState } from './EmptyState';
+import { Loader } from './Loader';
 import { MessageRow, type UploadStatus } from './MessageRow';
 import { ClarificationCard } from './ClarificationCard';
 import { SearchPalette } from './SearchPalette';
@@ -129,6 +130,22 @@ export function ChatApp() {
   const [archived, setArchived] = useState<ConversationSummary[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  /**
+   * The conversation whose history is in flight with NOTHING yet to show.
+   *
+   * Selecting a chat this browser has never opened used to leave the previous
+   * chat's messages on screen under the new chat's id, title and URL — the
+   * cache seeds a server-listed conversation as `messages: []`, and the old
+   * code only called setMessages when a cache entry existed. Where it did
+   * fire, the empty array rendered EmptyState, so a chat with history claimed
+   * to be a brand-new one.
+   *
+   * One id rather than a Set, deliberately: selecting anything overwrites it,
+   * so a load that resolves for a conversation the user has already left
+   * cannot revive a stale flag. Every write below is identity-guarded for the
+   * same reason.
+   */
+  const [loadingId, setLoadingId] = useState<string | null>(null);
   const [streaming, setStreaming] = useState(false);
   const [unreachable, setUnreachable] = useState(false);
   /**
@@ -274,6 +291,11 @@ export function ChatApp() {
   const serverActiveRef = useRef<string[]>([]);
   serverActiveRef.current = serverActive;
 
+  /** Stop showing the loader for `id` — unless the user has moved on since. */
+  const settleLoading = useCallback((id: string) => {
+    setLoadingId((current) => (current === id ? null : current));
+  }, []);
+
   /** Keep the URL pointing at the open chat so a reload lands back on it. */
   const setUrlConversation = useCallback((id: string | null) => {
     window.history.replaceState(null, '', id ? `/?c=${id}` : '/');
@@ -315,6 +337,10 @@ export function ChatApp() {
       setActiveId(wanted);
       activeIdRef.current = wanted;
       setPrefs(loadPrefs(window.localStorage, wanted));
+      // Before the cache has even hydrated there is an id and no messages,
+      // which rendered the New Chat greeting for a conversation that has
+      // history. Cleared below the moment we know what this chat holds.
+      setLoadingId(wanted);
     } else {
       /**
        * No ?c= — the app opened straight onto a blank chat, and that chat's
@@ -337,6 +363,8 @@ export function ChatApp() {
     }
 
     let cancelled = false;
+    /** The ?c= restore handed off to a live stream, which now owns the screen. */
+    let handedToStream = false;
     void (async () => {
       let store = getHistoryStore();
       // IndexedDB hydration (single-digit ms; instant for the fallback).
@@ -347,6 +375,7 @@ export function ChatApp() {
         const cached = store.get(wanted);
         if (cached && cached.messages.length > 0 && !isStreaming(wanted)) {
           setMessages(cached.messages);
+          settleLoading(wanted);
         }
       }
       // Whatever happens with auth/refresh below, the running-generation
@@ -398,6 +427,7 @@ export function ChatApp() {
         setMessages([]);
         setActiveId(null);
         activeIdRef.current = null;
+        setLoadingId(null);
         setUrlConversation(null);
         setPrefs({ ...DEFAULT_PREFS });
         refreshList();
@@ -430,6 +460,7 @@ export function ChatApp() {
           setServerActive(active);
           if (active.includes(wanted)) {
             setStreaming(true);
+            handedToStream = true;
             void attachStream(wanted).then((ok) => {
               if (!ok && activeIdRef.current === wanted) {
                 // Finished during the reload gap — its answer is in history.
@@ -438,6 +469,7 @@ export function ChatApp() {
                   if (conv && activeIdRef.current === wanted && !isStreaming(wanted)) {
                     setMessages(conv.messages);
                   }
+                  settleLoading(wanted);
                 });
               }
             });
@@ -449,15 +481,22 @@ export function ChatApp() {
           if (conv && !cancelled && activeIdRef.current === wanted) {
             setMessages(conv.messages);
           }
+          if (!cancelled) settleLoading(wanted);
         }
       } finally {
         settleReconcile();
+        // Every early return above (signed out, offline, account switch) also
+        // ends the restore, so the loader can never outlive it. The streaming
+        // hand-off is the one exception: the stream settles it on delivery.
+        if (wanted && !cancelled && !handedToStream) settleLoading(wanted);
       }
     })();
     return () => {
       cancelled = true;
     };
-  }, [refreshList, setUrlConversation, toast]);
+    // settleLoading is useCallback([])-stable, so listing it keeps the effect
+    // mount-only exactly as before.
+  }, [refreshList, setUrlConversation, toast, settleLoading]);
 
   const persist = useCallback(
     (conversationId: string, msgs: ChatMessage[]) => {
@@ -505,6 +544,8 @@ export function ChatApp() {
       }
       setMessages([...s.messages]);
       setStreaming(s.status === 'streaming');
+      // The stream owns the screen now, so the history loader is done.
+      setLoadingId((current) => (current === id ? null : current));
       if (s.status === 'unreachable') setUnreachable(true);
     });
   }, [refreshList]);
@@ -1521,6 +1562,8 @@ export function ChatApp() {
     setActiveId(null);
     activeIdRef.current = null;
     setMessages([]);
+    // A new chat is genuinely empty — EmptyState is the right answer here.
+    setLoadingId(null);
     setFoldableTurns(null);
     setUnreachable(false);
     setStreaming(false);
@@ -1547,9 +1590,16 @@ export function ChatApp() {
         // This chat is generating in the background — adopt the live thread.
         setMessages([...live.messages]);
         setStreaming(live.status === 'streaming');
+        setLoadingId(null);
       } else {
         const cached = store.get(id);
-        if (cached) setMessages(cached.messages);
+        // ALWAYS take ownership of what is on screen. This was `if (cached)`,
+        // so an uncached chat left the PREVIOUS conversation's messages
+        // rendered under this one's identity.
+        const cachedMessages = cached?.messages ?? [];
+        setMessages(cachedMessages);
+        // Nothing to show yet is "loading", not "empty".
+        setLoadingId(cachedMessages.length === 0 ? id : null);
         setStreaming(false);
         if (serverActiveRef.current.includes(id)) {
           // Still generating server-side (started before a reload) — re-join.
@@ -1561,6 +1611,9 @@ export function ChatApp() {
                 if (conv && activeIdRef.current === id && !isStreaming(id)) {
                   setMessages(conv.messages);
                 }
+                // Settled either way: a chat we could not load is not still
+                // loading, and must not sit under a spinner for ever.
+                settleLoading(id);
               });
             }
           });
@@ -1570,9 +1623,13 @@ export function ChatApp() {
           // generation may have saved its answer while we were away.
           const force = cached?.messages.at(-1)?.role === 'user';
           void store.load(id, { force }).then((conv) => {
+            // The identity guard is what makes a late answer harmless: click
+            // A then B, and A's response finds activeIdRef pointing at B and
+            // does nothing at all — neither its messages nor its loader.
             if (conv && activeIdRef.current === id && !isStreaming(id)) {
               setMessages(conv.messages);
             }
+            settleLoading(id);
           });
         }
       }
@@ -1580,7 +1637,7 @@ export function ChatApp() {
         setSidebarOpen(false);
       }
     },
-    [setUrlConversation],
+    [setUrlConversation, settleLoading],
   );
 
   const renameConversation = useCallback(
@@ -1601,6 +1658,7 @@ export function ChatApp() {
         setActiveId(null);
         activeIdRef.current = null;
         setMessages([]);
+        setLoadingId(null);
         setUrlConversation(null);
       }
       toast('Conversation deleted.');
@@ -2022,6 +2080,24 @@ export function ChatApp() {
               // nothing is re-sent.
               onReturn={() => setUnreachable(false)}
             />
+          ) : thread.length === 0 && loadingId !== null && loadingId === activeId ? (
+            /* A conversation with history that has not arrived yet. Showing
+               EmptyState here claimed it was a brand-new chat; showing the
+               previous chat's messages was worse. Neither is true — this is
+               the third state, and it says so.
+
+               `loadingId !== null` is load-bearing: a New Chat has a null
+               activeId AND a null loadingId, and `null === null` would have
+               put a spinner on the one screen that really is empty. */
+            <div
+              data-testid="conversation-loading"
+              role="status"
+              aria-live="polite"
+              className="flex h-full flex-col items-center justify-center gap-3 px-4 py-10"
+            >
+              <Loader size={28} />
+              <p className="text-sm text-muted">Loading conversation…</p>
+            </div>
           ) : thread.length === 0 ? (
             <EmptyState />
           ) : (

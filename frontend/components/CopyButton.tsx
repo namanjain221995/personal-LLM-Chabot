@@ -1,7 +1,10 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { IconCheck, IconCopy } from './icons';
+
+/** How long the "Copied" confirmation stays, per press. */
+const CONFIRM_MS = 1600;
 
 export function CopyButton({
   text,
@@ -16,6 +19,16 @@ export function CopyButton({
   variant?: 'chip' | 'icon';
 }) {
   const [copied, setCopied] = useState(false);
+  /** The live reset timer, so a second press can own it instead of racing it. */
+  const resetTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Nothing may fire into an unmounted button: the confirmation outlives a
+  // message that is regenerated, edited, or scrolled out of a switched chat.
+  useEffect(() => {
+    return () => {
+      if (resetTimer.current !== null) clearTimeout(resetTimer.current);
+    };
+  }, []);
 
   async function copy() {
     try {
@@ -30,7 +43,15 @@ export function CopyButton({
       ta.remove();
     }
     setCopied(true);
-    setTimeout(() => setCopied(false), 1600);
+    // Each press OWNS the confirmation window. The previous timer used to be
+    // left running, so copying twice inside CONFIRM_MS let the FIRST press's
+    // timer clear the SECOND press's tick — the confirmation vanished after a
+    // few hundred ms instead of its full duration.
+    if (resetTimer.current !== null) clearTimeout(resetTimer.current);
+    resetTimer.current = setTimeout(() => {
+      resetTimer.current = null;
+      setCopied(false);
+    }, CONFIRM_MS);
   }
 
   if (variant === 'icon') {
