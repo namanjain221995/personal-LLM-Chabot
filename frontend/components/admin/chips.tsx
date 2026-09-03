@@ -1,76 +1,67 @@
 /**
- * Role and status chips for the admin area — the EngineBadge recipe (rounded
- * pill, color-mix 45% border / 12% background, 1.5px dot) on NEW base colors
- * so the engine palette keeps its established meaning: super_admin amber
- * (--ts-warn), admin the teal accent, member neutral slate. Statuses reuse
- * the same three families plus danger.
+ * Role and status marks for the admin area.
+ *
+ * Restrained on purpose (2026-09-04). These used to be full pills — tinted
+ * background, 45% border, a dot — repeated down every row of the roster,
+ * which made the loudest thing on the page the fact that everyone is a
+ * "Member". In a settings table the person's NAME is the subject; role and
+ * status are metadata and should read as metadata.
+ *
+ * So: role is quiet text, tinted only where the distinction earns attention
+ * (super admin, admin); status is a 6px dot beside a word. Colour still
+ * carries meaning, but it is never the only carrier — every mark states its
+ * value in words, so nothing here depends on telling amber from blue.
  */
 
 import { ROLE_LABEL, type InviteStatus, type Role } from './api';
 
-function Chip({
-  label,
-  color,
-  ink,
-}: {
-  label: string;
-  color: string;
-  /** Text color — a theme-aware var readable on both surfaces. */
-  ink?: string;
-}) {
+const ROLE_TONE: Record<Role, string> = {
+  // The one role that can change everyone else's access: worth a tint.
+  super_admin: 'border-warn/35 bg-warn/10 text-warn',
+  admin: 'border-accent/35 bg-accent/10 text-accent',
+  // The default. A border-less, tint-less label — 90% of rows are this one.
+  member: 'border-transparent text-muted',
+};
+
+export function RoleChip({ role }: { role: Role | string }) {
+  const tone = ROLE_TONE[role as Role] ?? ROLE_TONE.member;
+  const label = ROLE_LABEL[role as Role] ?? role;
   return (
     <span
-      className="inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-xs font-medium"
-      style={{
-        color: ink ?? color,
-        borderColor: `color-mix(in srgb, ${color} 45%, transparent)`,
-        background: `color-mix(in srgb, ${color} 12%, transparent)`,
-      }}
+      className={`inline-flex items-center rounded-md border px-2 py-0.5 text-xs font-medium ${tone}`}
     >
-      <span
-        aria-hidden
-        className="h-1.5 w-1.5 rounded-full"
-        style={{ background: ink ?? color }}
-      />
       {label}
     </span>
   );
 }
 
-const ROLE_STYLE: Record<Role, { color: string; ink?: string }> = {
-  super_admin: { color: 'var(--ts-warn)' },
-  admin: { color: 'var(--ts-accent)' },
-  member: { color: 'var(--ts-slate)', ink: 'var(--ts-text-muted)' },
-};
-
-export function RoleChip({ role }: { role: Role | string }) {
-  const style = ROLE_STYLE[role as Role];
-  // An unknown future role degrades to the neutral member style, raw text kept.
-  if (!style) {
-    return <Chip label={role} color="var(--ts-slate)" ink="var(--ts-text-muted)" />;
-  }
-  return <Chip label={ROLE_LABEL[role as Role]} {...style} />;
-}
-
 type Status = 'active' | 'disabled' | InviteStatus;
 
-const STATUS_STYLE: Record<Status, { label: string; color: string; ink?: string }> = {
-  active: { label: 'Active', color: 'var(--ts-accent)' },
-  disabled: { label: 'Disabled', color: 'var(--ts-danger)' },
-  pending: { label: 'Pending', color: 'var(--ts-warn)' },
-  accepted: { label: 'Accepted', color: 'var(--ts-accent)' },
-  revoked: { label: 'Revoked', color: 'var(--ts-danger)' },
-  expired: {
-    label: 'Expired',
-    color: 'var(--ts-slate)',
-    ink: 'var(--ts-text-muted)',
-  },
+const STATUS_STYLE: Record<Status, { label: string; dot: string; text?: string }> = {
+  active: { label: 'Active', dot: 'bg-ok' },
+  disabled: { label: 'Disabled', dot: 'bg-danger', text: 'text-danger' },
+  pending: { label: 'Pending', dot: 'bg-warn', text: 'text-warn' },
+  accepted: { label: 'Accepted', dot: 'bg-ok' },
+  revoked: { label: 'Revoked', dot: 'bg-danger', text: 'text-danger' },
+  expired: { label: 'Expired', dot: 'bg-faint' },
 };
 
 export function StatusChip({ status }: { status: Status | string }) {
   const style = STATUS_STYLE[status as Status];
   if (!style) {
-    return <Chip label={status} color="var(--ts-slate)" ink="var(--ts-text-muted)" />;
+    return (
+      <span className="inline-flex items-center gap-2 text-xs text-muted">
+        <span aria-hidden className="h-1.5 w-1.5 rounded-full bg-faint" />
+        {status}
+      </span>
+    );
   }
-  return <Chip label={style.label} color={style.color} ink={style.ink} />;
+  return (
+    <span
+      className={`inline-flex items-center gap-2 text-xs font-medium ${style.text ?? 'text-muted'}`}
+    >
+      <span aria-hidden className={`h-1.5 w-1.5 shrink-0 rounded-full ${style.dot}`} />
+      {style.label}
+    </span>
+  );
 }

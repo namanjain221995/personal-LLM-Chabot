@@ -12,6 +12,7 @@
  */
 
 import { useCallback, useEffect, useState } from 'react';
+import { Loader } from '@/components/Loader';
 import { useToast } from '@/components/Providers';
 import {
   AdminApiError,
@@ -20,7 +21,8 @@ import {
   applyFeatureRules,
   type MemberAccess,
 } from './api';
-import { AdminDialog, PRIMARY_BUTTON, SECONDARY_BUTTON } from './AdminDialog';
+import { AdminDialog } from './AdminDialog';
+import { ADMIN_PRIMARY_BUTTON, ADMIN_SECONDARY_BUTTON } from './controls';
 import { FeatureToggles } from './FeatureToggles';
 import { SkeletonLine } from './ui';
 
@@ -106,6 +108,7 @@ export function AccessDialog({
     <AdminDialog
       open={member !== null}
       title={`Access · ${member?.name ?? ''}`}
+      size="md"
       onClose={onClose}
     >
       {error ? (
@@ -139,15 +142,20 @@ export function AccessDialog({
             }
           />
           <div className="mt-4 flex justify-end gap-2">
-            <button type="button" onClick={onClose} className={SECONDARY_BUTTON}>
+            <button
+              type="button"
+              onClick={onClose}
+              className={ADMIN_SECONDARY_BUTTON}
+            >
               Cancel
             </button>
             <button
               type="button"
               onClick={save}
               disabled={saving || data.locked}
-              className={PRIMARY_BUTTON}
+              className={ADMIN_PRIMARY_BUTTON}
             >
+              {saving && <Loader size={14} />}
               {saving ? 'Saving…' : 'Save access'}
             </button>
           </div>

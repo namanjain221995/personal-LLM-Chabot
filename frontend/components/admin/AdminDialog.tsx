@@ -17,11 +17,14 @@ export function AdminDialog({
   open,
   title,
   onClose,
+  size = 'sm',
   children,
 }: {
   open: boolean;
   title: string;
   onClose: () => void;
+  /** 'md' for dialogs holding a settings list rather than a short form. */
+  size?: 'sm' | 'md';
   children: ReactNode;
 }) {
   const panelRef = useRef<HTMLDivElement>(null);
@@ -55,7 +58,9 @@ export function AdminDialog({
         aria-label={title}
         tabIndex={-1}
         onClick={(e) => e.stopPropagation()}
-        className="menu-pop w-full max-w-sm rounded-ts border border-border bg-surface p-4 shadow-2xl focus:outline-none"
+        className={`menu-pop w-full rounded-ts border border-border bg-surface p-4 shadow-2xl focus:outline-none ${
+          size === 'md' ? 'max-w-lg' : 'max-w-sm'
+        }`}
       >
         <div className="flex items-start justify-between gap-3">
           <h2 className="text-sm font-semibold text-ink">{title}</h2>

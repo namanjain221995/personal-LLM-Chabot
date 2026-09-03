@@ -1,49 +1,77 @@
 'use client';
 
 /**
- * The tool-access switch list, shared by the workspace defaults page and the
+ * The tool-access settings list, shared by the workspace Access page and the
  * per-member dialog — one component so both places phrase the same decision
- * the same way.
+ * the same way, and so both inherit any fix to either.
  *
- * Each row is a real <button role="switch">: a checkbox would be smaller
- * than a finger and would not read as "on/off" to a screen reader. A row
- * whose parent is off is disabled and says which parent it needs, because
- * the orchestrator enforces that dependency anyway (features.py) and a
- * toggle that silently reverts on save is worse than one that explains.
+ * ONE GRID, NOT FIVE FLEX ROWS (2026-09-04). Every row is
+ * `minmax(0,1fr) auto`: the text takes the slack, the switch sits in its own
+ * track, and `items-center` centres it against the row. That is what makes
+ * the switches share an exact X — and keeps sharing it when one row grows a
+ * third line of helper text, which is precisely where a per-row flex layout
+ * drifts. The row is also the only place padding is declared, so no card
+ * can disagree with another about its own inset.
+ *
+ * A row whose parent is off is disabled and SAYS which parent it needs. The
+ * orchestrator enforces that dependency anyway (authn/features.py), so a
+ * toggle that silently reverted on save would be the worse lie.
  */
 
+import { useId, type ReactNode } from 'react';
 import type { FeatureSpec } from './api';
+import { Switch } from './Switch';
 
-export function Switch({
-  checked,
-  disabled,
-  label,
+export { Switch };
+
+export function AccessSettingRow({
+  title,
+  description,
+  helperText,
+  enabled,
+  disabled = false,
   onChange,
 }: {
-  checked: boolean;
+  title: string;
+  description: string;
+  /** Muted line under the description: inheritance, or the missing parent. */
+  helperText?: ReactNode;
+  enabled: boolean;
   disabled?: boolean;
-  label: string;
   onChange: (next: boolean) => void;
 }) {
+  const descriptionId = useId();
   return (
-    <button
-      type="button"
-      role="switch"
-      aria-checked={checked}
-      aria-label={label}
-      disabled={disabled}
-      onClick={() => onChange(!checked)}
-      className={`relative h-5 w-9 shrink-0 rounded-full transition-colors duration-ts focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:cursor-not-allowed disabled:opacity-40 ${
-        checked ? 'bg-accent-strong' : 'bg-surface-2'
-      }`}
-    >
-      <span
-        aria-hidden
-        className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition-transform duration-ts ${
-          checked ? 'translate-x-[18px]' : 'translate-x-0.5'
-        }`}
+    <li className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-6 gap-y-1 px-5 py-4">
+      <div className="min-w-0">
+        <div
+          className={`text-sm font-medium ${disabled ? 'text-muted' : 'text-ink'}`}
+        >
+          {title}
+        </div>
+        <p id={descriptionId} className="mt-1 text-xs leading-relaxed text-muted">
+          {description}
+        </p>
+        {helperText ? (
+          <p className="mt-1.5 text-xs leading-relaxed text-faint">{helperText}</p>
+        ) : null}
+      </div>
+      <Switch
+        checked={enabled}
+        disabled={disabled}
+        label={title}
+        describedBy={descriptionId}
+        onChange={onChange}
       />
-    </button>
+    </li>
+  );
+}
+
+export function AccessSettingsCard({ children }: { children: ReactNode }) {
+  return (
+    <ul className="divide-y divide-[var(--admin-separator)] overflow-hidden rounded-xl border border-border bg-surface">
+      {children}
+    </ul>
   );
 }
 
@@ -52,7 +80,7 @@ export function FeatureToggles({
   values,
   onChange,
   disabled = false,
-  /** Per-feature note under the hint — e.g. "Workspace default: on". */
+  /** Per-feature note under the description — e.g. "Workspace default: on". */
   note,
 }: {
   catalog: FeatureSpec[];
@@ -61,38 +89,28 @@ export function FeatureToggles({
   disabled?: boolean;
   note?: (spec: FeatureSpec) => string | null;
 }) {
-  const labelOf = (id: string) =>
-    catalog.find((f) => f.id === id)?.label ?? id;
+  const labelOf = (id: string) => catalog.find((f) => f.id === id)?.label ?? id;
 
   return (
-    <ul className="divide-y divide-border rounded-ts border border-border bg-surface">
+    <AccessSettingsCard>
       {catalog.map((spec) => {
         const parentOff = Boolean(spec.requires && !values[spec.requires]);
-        const extra = note?.(spec) ?? null;
         return (
-          <li key={spec.id} className="flex items-start gap-3 p-3">
-            <div className="min-w-0 flex-1">
-              <div className="text-sm font-medium text-ink">{spec.label}</div>
-              <p className="mt-0.5 text-xs leading-relaxed text-muted">
-                {spec.hint}
-              </p>
-              {parentOff ? (
-                <p className="mt-1 text-xs text-faint">
-                  Needs {labelOf(spec.requires as string)}, which is off.
-                </p>
-              ) : (
-                extra && <p className="mt-1 text-xs text-faint">{extra}</p>
-              )}
-            </div>
-            <Switch
-              checked={Boolean(values[spec.id]) && !parentOff}
-              disabled={disabled || parentOff}
-              label={spec.label}
-              onChange={(next) => onChange(spec.id, next)}
-            />
-          </li>
+          <AccessSettingRow
+            key={spec.id}
+            title={spec.label}
+            description={spec.hint}
+            helperText={
+              parentOff
+                ? `Needs ${labelOf(spec.requires as string)}, which is off.`
+                : (note?.(spec) ?? null)
+            }
+            enabled={Boolean(values[spec.id]) && !parentOff}
+            disabled={disabled || parentOff}
+            onChange={(next) => onChange(spec.id, next)}
+          />
         );
       })}
-    </ul>
+    </AccessSettingsCard>
   );
 }

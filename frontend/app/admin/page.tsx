@@ -20,12 +20,16 @@ import {
   AdminApiError,
   adminJson,
   RANGE_LABEL,
-  ROLE_LABEL,
   type Analytics,
   type AnalyticsMember,
   type RangeKey,
 } from '@/components/admin/api';
 import { AdminTable, type AdminColumn } from '@/components/admin/AdminTable';
+import {
+  ADMIN_SECONDARY_BUTTON,
+  AdminTabs,
+  CONTROL_HEIGHT,
+} from '@/components/admin/controls';
 import { RoleChip, StatusChip } from '@/components/admin/chips';
 import { UsageChart } from '@/components/admin/UsageChart';
 import {
@@ -90,8 +94,8 @@ export default function AdminAnalyticsPage() {
         key: 'user',
         label: 'Name',
         render: (m) => (
-          <span className="flex min-w-0 items-center gap-2.5">
-            <AvatarInitial name={m.name} />
+          <span className="flex min-w-0 items-center gap-3">
+            <AvatarInitial name={m.name} size="md" />
             <span className="min-w-0">
               <span className="block truncate font-medium text-ink">{m.name}</span>
               <span className="block truncate text-xs text-muted">{m.email}</span>
@@ -166,10 +170,10 @@ export default function AdminAnalyticsPage() {
   );
 
   const pill = (activeItem: boolean) =>
-    `rounded-full px-3 py-1 text-xs font-medium transition-colors duration-ts ${
+    `h-full rounded-md px-3 text-xs font-medium transition-colors duration-ts focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent ${
       activeItem
         ? 'bg-surface-2 text-ink'
-        : 'text-muted hover:bg-surface-2 hover:text-ink'
+        : 'text-muted hover:text-ink'
     }`;
 
   return (
@@ -186,7 +190,7 @@ export default function AdminAnalyticsPage() {
             <div
               role="group"
               aria-label="Time range"
-              className="flex items-center rounded-full border border-border bg-surface p-0.5"
+              className={`${CONTROL_HEIGHT} flex items-center rounded-ts border border-border bg-[var(--admin-control)] p-1`}
             >
               {RANGES.map((key) => (
                 <button
@@ -202,9 +206,9 @@ export default function AdminAnalyticsPage() {
             </div>
             <a
               href={`/api/admin/analytics/export?range=${range}`}
-              className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-surface px-3 py-1.5 text-sm text-muted transition-colors duration-ts hover:bg-surface-2 hover:text-ink"
+              className={ADMIN_SECONDARY_BUTTON}
             >
-              <IconDownload size={14} />
+              <IconDownload size={15} />
               Export
             </a>
           </div>
@@ -245,37 +249,20 @@ export default function AdminAnalyticsPage() {
             />
           </div>
 
-          <div
-            role="tablist"
-            aria-label="Analytics sections"
-            className="mt-6 flex items-center gap-1 border-b border-border"
-          >
-            {(
-              [
-                ['overview', 'Overview'],
-                ['people', 'People'],
-              ] as [Tab, string][]
-            ).map(([id, label]) => (
-              <button
-                key={id}
-                type="button"
-                role="tab"
-                aria-selected={tab === id}
-                onClick={() => setTab(id)}
-                className={`-mb-px border-b-2 px-3 py-2 text-sm font-medium transition-colors duration-ts ${
-                  tab === id
-                    ? 'border-accent text-ink'
-                    : 'border-transparent text-muted hover:text-ink'
-                }`}
-              >
-                {label}
-                {id === 'people' && data ? (
-                  <span className="ml-1.5 text-xs text-faint">
-                    {data.members.length}
-                  </span>
-                ) : null}
-              </button>
-            ))}
+          <div className="mt-7">
+            <AdminTabs
+              label="Analytics sections"
+              active={tab}
+              onChange={(id) => setTab(id as Tab)}
+              tabs={[
+                { id: 'overview', label: 'Overview' },
+                {
+                  id: 'people',
+                  label: 'People',
+                  count: data?.members.length,
+                },
+              ]}
+            />
           </div>
 
           {tab === 'overview' ? (

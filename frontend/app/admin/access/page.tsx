@@ -7,9 +7,15 @@
  * individually (Members → ⋯ → Manage access) keeps their setting; that is
  * what an override is for, and the copy says so rather than leaving an
  * administrator to discover it.
+ *
+ * Layout (2026-09-04): a reading-width column, one settings card, and every
+ * switch on the same grid track — see FeatureToggles for why that is one
+ * grid rather than five flex rows. Save is state-aware: it does nothing to
+ * look at until something actually differs from what the server holds.
  */
 
 import { useCallback, useEffect, useState } from 'react';
+import { Loader } from '@/components/Loader';
 import { useToast } from '@/components/Providers';
 import { useAdminMe } from '@/components/admin/AdminMeContext';
 import {
@@ -20,7 +26,7 @@ import {
   can,
   type AccessSettings,
 } from '@/components/admin/api';
-import { PRIMARY_BUTTON } from '@/components/admin/AdminDialog';
+import { ADMIN_PRIMARY_BUTTON } from '@/components/admin/controls';
 import { FeatureToggles } from '@/components/admin/FeatureToggles';
 import { ErrorPanel, PageHeader, SkeletonLine } from '@/components/admin/ui';
 
@@ -71,6 +77,10 @@ export default function AdminAccessPage() {
         workspace_defaults: Record<string, boolean>;
         resolved: Record<string, boolean>;
       }>('access', { features: overrides });
+      // Re-seed from the SERVER's answer, not from the local guess: that is
+      // what makes the button go quiet again, and what shows the dependency
+      // rules the orchestrator applied on the way in.
+      setData({ ...data, ...res });
       setValues({ ...res.resolved });
       toast('Workspace access updated.');
     } catch (err) {
@@ -92,7 +102,7 @@ export default function AdminAccessPage() {
     );
 
   return (
-    <div>
+    <div className="max-w-3xl">
       <PageHeader
         title="Access"
         subtitle="Which tools members of this workspace can use"
@@ -102,8 +112,9 @@ export default function AdminAccessPage() {
               type="button"
               onClick={save}
               disabled={!dirty || saving}
-              className={PRIMARY_BUTTON}
+              className={ADMIN_PRIMARY_BUTTON}
             >
+              {saving && <Loader size={14} />}
               {saving ? 'Saving…' : 'Save changes'}
             </button>
           ) : undefined
@@ -115,45 +126,48 @@ export default function AdminAccessPage() {
           <ErrorPanel message={error} onRetry={() => setAttempt((n) => n + 1)} />
         </div>
       ) : !data ? (
-        <div className="mt-6 space-y-3 rounded-ts border border-border bg-surface p-4">
+        <div className="mt-6 space-y-4 rounded-xl border border-border bg-surface p-5">
           <SkeletonLine className="w-1/2" />
           <SkeletonLine className="w-2/3" />
           <SkeletonLine className="w-1/3" />
         </div>
       ) : (
-        <div className="mt-6 max-w-2xl">
-          <p className="mb-4 text-sm leading-relaxed text-muted">
+        <>
+          <p className="mt-6 text-sm leading-relaxed text-muted">
             This is the default for the whole workspace. A member whose access
             was set individually keeps their own setting — change that under{' '}
             <span className="text-ink">Members → ⋯ → Manage access</span>.
-            {!editable &&
-              ' Only a super admin can change these; you can see what they are.'}
+            {!editable && ' Only a super admin can change these.'}
           </p>
-          <FeatureToggles
-            catalog={data.catalog}
-            values={values}
-            disabled={!editable || saving}
-            note={(spec) =>
-              Boolean(values[spec.id]) === spec.default
-                ? null
-                : `Changed from the built-in default (${spec.default ? 'on' : 'off'})`
-            }
-            onChange={(featureId, next) =>
-              setValues((prev) =>
-                applyFeatureRules(
-                  data.catalog,
-                  { ...prev, [featureId]: next },
-                  featureId,
-                ),
-              )
-            }
-          />
-          <p className="mt-3 text-xs leading-relaxed text-faint">
+
+          <div className="mt-5">
+            <FeatureToggles
+              catalog={data.catalog}
+              values={values}
+              disabled={!editable || saving}
+              note={(spec) =>
+                Boolean(values[spec.id]) === spec.default
+                  ? null
+                  : `Changed from the built-in default (${spec.default ? 'on' : 'off'})`
+              }
+              onChange={(featureId, next) =>
+                setValues((prev) =>
+                  applyFeatureRules(
+                    data.catalog,
+                    { ...prev, [featureId]: next },
+                    featureId,
+                  ),
+                )
+              }
+            />
+          </div>
+
+          <p className="mt-4 text-xs leading-relaxed text-faint">
             Turning a tool off hides it in the composer and refuses it on the
             server — an old browser tab cannot use what was taken away. Super
             admins always keep every tool.
           </p>
-        </div>
+        </>
       )}
     </div>
   );

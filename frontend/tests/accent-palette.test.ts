@@ -319,6 +319,8 @@ describe('COLOR-12 · the remaining greens are the allowlisted ones', () => {
     '#0184bc': 'code builtin token (light) — syntax highlighting',
     '#7fd6a3': 'SQL string token (dark) — syntax highlighting',
     '#197a4b': 'SQL string token (light) — syntax highlighting',
+    '#3fb950': 'status OK dot (dark) — health, not the product accent',
+    '#1a7f37': 'status OK dot (light) — health, not the product accent',
   };
 
   /** Colour literals only: hex plus the rgb()/rgba() triples. */

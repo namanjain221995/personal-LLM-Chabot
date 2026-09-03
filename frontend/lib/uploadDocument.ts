@@ -21,15 +21,36 @@ export interface DocumentRef {
   name: string;
 }
 
-async function jsonOrThrow(res: Response, fallback: string): Promise<any> {
-  let body: any = null;
+/** A JSON error body, as far as anything here relies on its shape. */
+interface ErrorBody {
+  detail?: unknown;
+  message?: unknown;
+}
+
+/** What the upload endpoints answer with on success. */
+interface UploadBody {
+  upload_id?: string;
+  filename?: string;
+}
+
+async function jsonOrThrow<T>(res: Response, fallback: string): Promise<T> {
+  let body: unknown = null;
   try {
     body = await res.json();
   } catch {
     /* an HTML error page from a proxy — the status carries the story */
   }
-  if (!res.ok) throw new Error(body?.detail ?? body?.message ?? fallback);
-  return body;
+  if (!res.ok) {
+    const err = (body ?? {}) as ErrorBody;
+    const detail =
+      typeof err.detail === 'string'
+        ? err.detail
+        : typeof err.message === 'string'
+          ? err.message
+          : fallback;
+    throw new Error(detail);
+  }
+  return body as T;
 }
 
 async function uploadSingle(
@@ -41,8 +62,8 @@ async function uploadSingle(
   form.append('conversation_id', conversationId);
   form.append('purpose', 'document');
   const res = await fetch('/api/upload', { method: 'POST', body: form });
-  const body = await jsonOrThrow(res, 'upload failed');
-  return { upload_id: body.upload_id, name: body.filename ?? file.name };
+  const body = await jsonOrThrow<UploadBody>(res, 'upload failed');
+  return { upload_id: String(body.upload_id ?? ''), name: body.filename ?? file.name };
 }
 
 async function uploadChunked(
@@ -53,11 +74,11 @@ async function uploadChunked(
   form.append('conversation_id', conversationId);
   form.append('filename', file.name);
   form.append('purpose', 'document');
-  const init = await jsonOrThrow(
+  const init = await jsonOrThrow<UploadBody>(
     await fetch('/api/upload/chunked/init', { method: 'POST', body: form }),
     'upload could not start',
   );
-  const uploadId: string = init.upload_id;
+  const uploadId = String(init.upload_id ?? '');
 
   const parts = Math.ceil(file.size / CHUNK_PART_BYTES);
   for (let i = 0; i < parts; i += 1) {
@@ -66,15 +87,15 @@ async function uploadChunked(
       `/api/upload/chunked/${encodeURIComponent(conversationId)}/${uploadId}/part/${i}`,
       { method: 'PUT', body: slice },
     );
-    await jsonOrThrow(res, `part ${i + 1} of ${parts} failed`);
+    await jsonOrThrow<UploadBody>(res, `part ${i + 1} of ${parts} failed`);
   }
 
   const done = await fetch(
     `/api/upload/chunked/${encodeURIComponent(conversationId)}/${uploadId}/complete`,
     { method: 'POST' },
   );
-  const body = await jsonOrThrow(done, 'upload could not be assembled');
-  return { upload_id: body.upload_id, name: body.filename ?? file.name };
+  const body = await jsonOrThrow<UploadBody>(done, 'upload could not be assembled');
+  return { upload_id: String(body.upload_id ?? ''), name: body.filename ?? file.name };
 }
 
 /** Stream one document to the server; → the reference the chat request sends. */

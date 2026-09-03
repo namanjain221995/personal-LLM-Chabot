@@ -14,12 +14,8 @@ import { useEffect, useMemo, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
 import { useToast } from '@/components/Providers';
-import {
-  IconPencil,
-  IconSearch,
-  IconTrash,
-} from '@/components/icons';
-import { formatWhen } from '@/lib/format';
+import { IconPencil, IconTrash } from '@/components/icons';
+import { formatDay, formatRelative, formatWhen } from '@/lib/format';
 import { useAdminMe } from '@/components/admin/AdminMeContext';
 import {
   AdminApiError,
@@ -34,7 +30,7 @@ import { InvitesPanel } from '@/components/admin/InvitesPanel';
 import { ResetPasswordDialog } from '@/components/admin/ResetPasswordDialog';
 import { RowMenu, type RowMenuItem } from '@/components/admin/RowMenu';
 import { AccessDialog } from '@/components/admin/AccessDialog';
-import { RoleChip, StatusChip } from '@/components/admin/chips';
+import { StatusChip } from '@/components/admin/chips';
 import {
   IconBan,
   IconEye,
@@ -43,7 +39,14 @@ import {
   IconSliders,
   IconUserPlus,
 } from '@/components/admin/icons';
-import { PRIMARY_BUTTON } from '@/components/admin/AdminDialog';
+import {
+  ADMIN_PRIMARY_BUTTON,
+  AdminSearchInput,
+  AdminSelect,
+  AdminTabs,
+  AdminToolbar,
+} from '@/components/admin/controls';
+import { MemberRoleControl } from '@/components/admin/MemberRoleControl';
 import { AvatarInitial, PageHeader } from '@/components/admin/ui';
 import { useDebounced } from '@/components/admin/useDebounced';
 
@@ -65,9 +68,6 @@ interface MembersResponse {
   active_members: number;
   pending_invites: number;
 }
-
-const FIELD =
-  'rounded-lg border border-border bg-bg px-2.5 py-1.5 text-sm text-ink focus:border-accent/60 focus:outline-none';
 
 export default function AdminMembersPage() {
   const me = useAdminMe();
@@ -261,50 +261,81 @@ export default function AdminMembersPage() {
     }
   }
 
+  const canManageRoles = can(me, 'roles.manage');
+
   const columns: AdminColumn<Member>[] = useMemo(
     () => [
       {
         key: 'user',
-        label: 'User',
+        label: 'Name',
+        // No width: the identity column absorbs the slack, and its two
+        // lines truncate rather than widening the row.
         render: (m) => (
-          <span className="flex items-center gap-2.5">
-            <AvatarInitial name={m.name} />
-            <span className="min-w-0">
-              <span className="block max-w-56 truncate font-medium text-ink">
+          <div className="flex min-w-0 items-center gap-3">
+            <AvatarInitial name={m.name} size="md" />
+            <div className="min-w-0">
+              <div className="truncate font-medium text-ink" title={m.name}>
                 {m.name}
-              </span>
-              <span className="block max-w-56 truncate text-xs text-muted">
+              </div>
+              <div className="truncate text-xs text-muted" title={m.email}>
                 {m.email}
-              </span>
-            </span>
-          </span>
+              </div>
+            </div>
+          </div>
         ),
       },
-      { key: 'role', label: 'Role', render: (m) => <RoleChip role={m.role} /> },
+      {
+        key: 'role',
+        label: 'Role',
+        width: '160px',
+        render: (m) => (
+          <MemberRoleControl
+            role={m.role}
+            name={m.name}
+            editable={canManageRoles}
+            onEdit={() => setRoleTarget(m)}
+          />
+        ),
+      },
       {
         key: 'status',
         label: 'Status',
+        width: '120px',
         render: (m) => <StatusChip status={m.status} />,
       },
       {
         key: 'joined',
         label: 'Date added',
+        width: '140px',
         render: (m) =>
-          m.joined_at ? formatWhen(m.joined_at) : <span className="text-faint">—</span>,
-      },
-      {
-        key: 'active',
-        label: 'Last active',
-        render: (m) =>
-          m.last_active_at ? (
-            formatWhen(m.last_active_at)
+          m.joined_at ? (
+            // The day is what the column is for; the exact moment stays one
+            // hover away rather than costing every row 20 characters.
+            <span className="text-muted" title={formatWhen(m.joined_at)}>
+              {formatDay(m.joined_at)}
+            </span>
           ) : (
             <span className="text-faint">—</span>
           ),
       },
       {
+        key: 'active',
+        label: 'Last active',
+        width: '160px',
+        hideBelowLg: true,
+        render: (m) =>
+          m.last_active_at ? (
+            <span className="text-muted" title={formatWhen(m.last_active_at)}>
+              {formatRelative(m.last_active_at)}
+            </span>
+          ) : (
+            <span className="text-faint">Never</span>
+          ),
+      },
+      {
         key: 'actions',
         label: '',
+        width: '56px',
         align: 'right',
         render: (m) => (
           <RowMenu
@@ -316,7 +347,7 @@ export default function AdminMembersPage() {
       },
     ],
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [me],
+    [me, canManageRoles],
   );
 
   const counts =
@@ -328,13 +359,6 @@ export default function AdminMembersPage() {
           data.pending_invites === 1 ? '' : 's'
         }`;
 
-  const tabClass = (active: boolean) =>
-    `-mb-px border-b-2 px-3 py-2 text-sm font-medium transition-colors duration-ts ${
-      active
-        ? 'border-accent text-ink'
-        : 'border-transparent text-muted hover:text-ink'
-    }`;
-
   return (
     <div>
       <PageHeader
@@ -342,88 +366,80 @@ export default function AdminMembersPage() {
         subtitle={
           <>
             {me.workspace.name}
-            {counts && <span className="text-faint"> — {counts}</span>}
+            {counts && <span className="text-faint"> · {counts}</span>}
           </>
-        }
-        actions={
-          can(me, 'invites.manage') ? (
-            <button
-              type="button"
-              onClick={() => setInviteOpen(true)}
-              className={PRIMARY_BUTTON}
-            >
-              <IconUserPlus size={15} />
-              Invite member
-            </button>
-          ) : undefined
         }
       />
 
-      <div role="tablist" aria-label="Members tabs" className="mt-5 flex gap-1 border-b border-border">
-        <button
-          type="button"
-          role="tab"
-          aria-selected={tab === 'users'}
-          onClick={() => setTab('users')}
-          className={tabClass(tab === 'users')}
-        >
-          Users
-        </button>
-        <button
-          type="button"
-          role="tab"
-          aria-selected={tab === 'invites'}
-          onClick={() => setTab('invites')}
-          className={tabClass(tab === 'invites')}
-        >
-          Pending invites
-          {data !== null && data.pending_invites > 0 && (
-            <span className="ml-1.5 rounded-full bg-surface-2 px-1.5 py-px text-[11px] text-muted">
-              {data.pending_invites}
-            </span>
-          )}
-        </button>
+      <div className="mt-6">
+        <AdminTabs
+          label="Members tabs"
+          active={tab}
+          onChange={(id) => setTab(id as 'users' | 'invites')}
+          tabs={[
+            { id: 'users', label: 'Users' },
+            {
+              id: 'invites',
+              label: 'Pending invites',
+              count: data?.pending_invites,
+            },
+          ]}
+        />
       </div>
 
       {tab === 'users' ? (
         <>
-          <div className="mt-4 flex flex-wrap items-center gap-2">
-            <div className="flex min-w-0 flex-1 items-center gap-2 rounded-lg border border-border bg-bg px-2.5 transition-colors duration-ts focus-within:border-accent/60 sm:max-w-xs">
-              <IconSearch size={14} className="shrink-0 text-faint" />
-              <input
+          <div className="mt-5">
+            <AdminToolbar
+              action={
+                can(me, 'invites.manage') ? (
+                  <button
+                    type="button"
+                    onClick={() => setInviteOpen(true)}
+                    className={ADMIN_PRIMARY_BUTTON}
+                  >
+                    <IconUserPlus size={15} />
+                    Invite member
+                  </button>
+                ) : undefined
+              }
+            >
+              <AdminSearchInput
                 value={q}
-                onChange={(e) => setQ(e.target.value)}
+                onChange={setQ}
+                label="Search members"
                 placeholder="Search by name or email…"
-                aria-label="Search members"
-                className="min-w-0 flex-1 bg-transparent py-1.5 text-sm text-ink placeholder:text-faint focus:outline-none"
+                className="w-full sm:w-72"
               />
-            </div>
-            <select
-              value={roleFilter}
-              onChange={(e) => setRoleFilter(e.target.value)}
-              aria-label="Filter by role"
-              className={FIELD}
-            >
-              <option value="">All roles</option>
-              <option value="super_admin">Super admin</option>
-              <option value="admin">Admin</option>
-              <option value="member">Member</option>
-            </select>
-            <select
-              value={statusFilter}
-              onChange={(e) => setStatusFilter(e.target.value)}
-              aria-label="Filter by status"
-              className={FIELD}
-            >
-              <option value="">All statuses</option>
-              <option value="active">Active</option>
-              <option value="disabled">Disabled</option>
-            </select>
+              <AdminSelect
+                value={roleFilter}
+                onChange={setRoleFilter}
+                label="Filter by role"
+                options={[
+                  { value: '', label: 'All roles' },
+                  { value: 'super_admin', label: 'Super admin' },
+                  { value: 'admin', label: 'Admin' },
+                  { value: 'member', label: 'Member' },
+                ]}
+              />
+              <AdminSelect
+                value={statusFilter}
+                onChange={setStatusFilter}
+                label="Filter by status"
+                options={[
+                  { value: '', label: 'All statuses' },
+                  { value: 'active', label: 'Active' },
+                  { value: 'disabled', label: 'Disabled' },
+                ]}
+              />
+            </AdminToolbar>
           </div>
 
-          <div className="mt-4">
+          <div className="mt-5">
             <AdminTable
               columns={columns}
+              // 636px of fixed columns + ~264px the names actually need.
+              minWidth={900}
               rows={data?.members ?? []}
               rowKey={(m) => m.id}
               onRowClick={(m) => router.push(`/admin/members/${m.id}`)}
@@ -447,7 +463,7 @@ export default function AdminMembersPage() {
           </div>
         </>
       ) : (
-        <div className="mt-4">
+        <div className="mt-6">
           <InvitesPanel
             refresh={refresh}
             onChanged={bump}

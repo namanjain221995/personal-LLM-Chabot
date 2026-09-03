@@ -99,7 +99,7 @@ export function InvitesPanel({
   }, [revoking, toast, onChanged]);
 
   const smallButton =
-    'inline-flex items-center gap-1.5 rounded-md border border-border bg-surface px-2.5 py-1 text-xs text-muted transition-colors duration-ts hover:bg-surface-2 hover:text-ink';
+    'inline-flex items-center gap-1.5 rounded-lg border border-border bg-[var(--admin-control)] px-2.5 py-1.5 text-xs font-medium text-muted transition-colors duration-ts hover:bg-[var(--admin-control-hover)] hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-bg';
 
   const columns: AdminColumn<Invitation>[] = [
     {

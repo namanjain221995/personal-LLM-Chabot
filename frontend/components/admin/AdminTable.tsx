@@ -1,13 +1,20 @@
 'use client';
 
 /**
- * The admin list table — DataTable's visual vocabulary (rounded-ts bordered
- * wrapper, sticky bg-surface-2 header, odd/even striping, border-border/60
- * cells, em-dash faints) on a declarative-columns frame. DataTable itself
- * stays the in-chat results widget (max-h-80, virtualised, column inference);
- * admin lists need explicit columns, full-height scrolling, row click-through
- * and built-in loading/empty/error states, so they get their own component
- * rather than a mode flag on that one.
+ * The admin list table.
+ *
+ * FLAT on purpose (2026-09-04). It used to be a rounded bordered card with
+ * zebra striping and a filled sticky header — the chat area's card
+ * vocabulary applied to a roster, which made forty members read as forty
+ * objects stacked in a box. An enterprise settings table is one object: a
+ * quiet header rule, hairline separators between rows, and nothing else.
+ * The only decoration left is the hover, and it is a whisper.
+ *
+ * Geometry is deterministic. Columns declare their own width and the table
+ * is `table-fixed`, so every row lands on the same tracks and a long email
+ * truncates instead of pushing the Role column three pixels right on that
+ * one row. That drift is the single most visible difference between a table
+ * that was designed and one that was assembled.
  */
 
 import type { ReactNode } from 'react';
@@ -17,10 +24,24 @@ export interface AdminColumn<T> {
   key: string;
   label: string;
   align?: 'left' | 'right';
+  /**
+   * A CSS width for the column's <col>. Given on every column but the one
+   * that should absorb the slack (leave that one undefined).
+   */
+  width?: string;
+  /** Hidden below `lg` — for columns that are useful but not essential. */
+  hideBelowLg?: boolean;
   render: (row: T) => ReactNode;
 }
 
-const CELL = 'whitespace-nowrap border-b border-border/60 px-3 py-2';
+/**
+ * Row height is set here, once: 68px of breathing room around a 40px avatar.
+ * `whitespace-nowrap` is load-bearing — without it a two-word cell ("4 hours
+ * ago") wraps and that ONE row grows, which is exactly the drift the fixed
+ * tracks exist to prevent. Cells that can overflow truncate instead.
+ */
+const CELL =
+  'h-[68px] whitespace-nowrap border-b border-[var(--admin-separator)] px-4 align-middle';
 
 export function AdminTable<T>({
   columns,
@@ -29,6 +50,7 @@ export function AdminTable<T>({
   onRowClick,
   loading = false,
   skeletonRows = 5,
+  minWidth = 720,
   empty,
   error,
   onRetry,
@@ -39,6 +61,14 @@ export function AdminTable<T>({
   onRowClick?: (row: T) => void;
   loading?: boolean;
   skeletonRows?: number;
+  /**
+   * The width below which the table scrolls sideways instead of squeezing.
+   * Set it to the fixed columns PLUS a readable identity column: without
+   * that floor, a narrow window steals the slack from the one column that
+   * carries the names, and the roster truncates to "Na…" (measured at
+   * 1024px before this existed).
+   */
+  minWidth?: number;
   /** Shown instead of the table when there is nothing to list. */
   empty: string;
   error?: string | null;
@@ -49,22 +79,42 @@ export function AdminTable<T>({
   }
   if (!loading && rows.length === 0) {
     return (
-      <div className="rounded-ts border border-border bg-surface px-4 py-10 text-center text-sm text-muted">
+      <div className="border-t border-[var(--admin-separator)] px-4 py-16 text-center text-sm text-muted">
         {empty}
       </div>
     );
   }
+  const hidden = (col: AdminColumn<T>) => (col.hideBelowLg ? 'hidden lg:table-cell' : '');
+  // Fixed tracks only when the caller actually declared widths. A table that
+  // did not (the audit log, the usage report's eleven columns) keeps auto
+  // layout, where the browser's own sizing beats eleven equal thirds.
+  const fixed = columns.some((col) => col.width);
   return (
-    <div className="overflow-x-auto rounded-ts border border-border">
-      <table className="w-full border-collapse text-sm">
-        <thead className="sticky top-0 z-10">
+    <div className="-mx-4 overflow-x-auto px-4 md:mx-0 md:px-0">
+      <table
+        style={{ minWidth }}
+        className={`w-full border-collapse text-sm ${
+          fixed ? 'table-fixed' : 'table-auto'
+        }`}
+      >
+        <colgroup>
+          {columns.map((col) => (
+            <col
+              key={col.key}
+              style={col.width ? { width: col.width } : undefined}
+              className={hidden(col)}
+            />
+          ))}
+        </colgroup>
+        <thead>
           <tr>
             {columns.map((col) => (
               <th
                 key={col.key}
-                className={`whitespace-nowrap border-b border-border bg-surface-2 px-3 py-2 text-xs font-semibold text-muted ${
+                scope="col"
+                className={`whitespace-nowrap border-b border-border px-4 pb-2.5 text-xs font-semibold text-muted ${
                   col.align === 'right' ? 'text-right' : 'text-left'
-                }`}
+                } ${hidden(col)}`}
               >
                 {col.label}
               </th>
@@ -74,11 +124,11 @@ export function AdminTable<T>({
         <tbody>
           {loading
             ? Array.from({ length: skeletonRows }, (_, i) => (
-                <tr key={i} className="odd:bg-surface even:bg-surface-2/40">
+                <tr key={i}>
                   {columns.map((col, c) => (
-                    <td key={col.key} className={CELL}>
+                    <td key={col.key} className={`${CELL} ${hidden(col)}`}>
                       <SkeletonLine
-                        className={c === 0 ? 'w-36' : c % 2 ? 'w-16' : 'w-24'}
+                        className={c === 0 ? 'w-40' : c % 2 ? 'w-16' : 'w-24'}
                       />
                     </td>
                   ))}
@@ -88,16 +138,16 @@ export function AdminTable<T>({
                 <tr
                   key={rowKey(row)}
                   onClick={onRowClick ? () => onRowClick(row) : undefined}
-                  className={`odd:bg-surface even:bg-surface-2/40 ${
+                  className={
                     onRowClick
-                      ? 'cursor-pointer transition-colors duration-ts hover:bg-surface-2'
-                      : ''
-                  }`}
+                      ? 'cursor-pointer transition-colors duration-ts hover:bg-[var(--admin-row-hover)]'
+                      : 'transition-colors duration-ts hover:bg-[var(--admin-row-hover)]'
+                  }
                 >
                   {columns.map((col) => (
                     <td
                       key={col.key}
-                      className={`${CELL} ${col.align === 'right' ? 'text-right' : ''}`}
+                      className={`${CELL} ${col.align === 'right' ? 'text-right' : ''} ${hidden(col)}`}
                     >
                       {col.render(row)}
                     </td>
@@ -126,9 +176,9 @@ export function Pagination({
   const from = Math.min(offset + 1, total);
   const to = Math.min(offset + limit, total);
   const button =
-    'rounded-md border border-border bg-surface px-2.5 py-1 text-xs text-muted transition-colors duration-ts hover:bg-surface-2 hover:text-ink disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-surface disabled:hover:text-muted';
+    'rounded-lg border border-border bg-[var(--admin-control)] px-3 py-1.5 text-xs font-medium text-muted transition-colors duration-ts hover:bg-[var(--admin-control-hover)] hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-bg disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-[var(--admin-control)] disabled:hover:text-muted';
   return (
-    <div className="mt-3 flex items-center justify-between gap-2">
+    <div className="flex items-center justify-between gap-2 pt-4">
       <span className="text-xs text-muted">
         Showing {from.toLocaleString()}–{to.toLocaleString()} of{' '}
         {total.toLocaleString()}

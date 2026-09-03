@@ -75,6 +75,10 @@
   --ts-danger-soft: rgba(229, 72, 77, 0.14);
   /* Amber "heads up" state: trimmed input now, context meter 60-84% later. */
   --ts-warn: #f0a92e;
+  /* Success/health green (2026-09-04). The palette had danger and warn but
+     no OK, so "Active" in the admin roster had to borrow the accent — which
+     made every active member look like a link. Used as a dot, never as text. */
+  --ts-ok: #3fb950;
 
   /* Code syntax tokens (2026-08-06, ChatGPT-style highlighting) — One
      Dark-ish palette, mapped to hljs-* classes at the end of this file. */
@@ -127,6 +131,23 @@
   --ts-sql-str: #7fd6a3;
   --ts-sql-num: #e2ab52;
   --ts-sql-com: #7e8da3;
+
+  /* --- Admin surface (2026-09-04) ------------------------------------------
+     The admin area is an enterprise SETTINGS interface, not the chat surface:
+     its tables are flat — no card around them, no zebra striping — so a
+     40-row roster reads as one object instead of forty. These four names are
+     the whole admin-specific vocabulary, and every one is DERIVED from the
+     tokens above rather than being a new colour, so html.light and any future
+     accent change follow with no edit here (custom properties resolve at use
+     time, which is why they need no light-theme counterpart). */
+  --admin-separator: color-mix(in srgb, var(--ts-border) 72%, transparent);
+  --admin-row-hover: color-mix(in srgb, var(--ts-surface) 60%, transparent);
+  --admin-control: var(--ts-surface);
+  --admin-control-hover: var(--ts-surface-2);
+  /* A switch's OFF track. Not --ts-surface-2: on paper that is #ececec and
+     the white thumb disappears into it (caught in the light-mode pass). A
+     tint of the faint ink reads as "off" against both grounds. */
+  --admin-switch-off: color-mix(in srgb, var(--ts-text-faint) 38%, transparent);
 }
 
 /* `.auth-light` carries the SAME token overrides as light mode so the sign-in
@@ -172,6 +193,7 @@ html.light,
   --ts-danger-rgb: 198 42 48; /* channels of --ts-danger — keep in sync */
   --ts-danger-soft: rgba(198, 42, 48, 0.1);
   --ts-warn: #b26a00;
+  --ts-ok: #1a7f37; /* deepened for paper — see the dark value above */
 
   /* Code syntax tokens — One Light-ish, AA on the paper background. */
   --ts-code-comment: #a0a1a7;

@@ -131,10 +131,12 @@ export default function AdminLayout({ children }: { children: ReactNode }) {
   const items = navItems(me);
   const isActive = (item: NavItem) =>
     item.exact ? pathname === item.href : pathname.startsWith(item.href);
+  // One height for every nav row (36px), one icon box (18px), so the labels
+  // form a single column whatever the glyph inside each icon looks like.
   const rowClass = (active: boolean) =>
-    `flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-sm transition-colors duration-ts ${
+    `flex h-9 w-full items-center gap-2.5 rounded-lg px-2.5 text-sm transition-colors duration-ts focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-sidebar ${
       active
-        ? 'bg-surface-2 text-ink'
+        ? 'bg-surface-2 font-medium text-ink'
         : 'text-icon hover:bg-surface-2 hover:text-ink'
     }`;
 
@@ -165,7 +167,9 @@ export default function AdminLayout({ children }: { children: ReactNode }) {
                 aria-current={isActive(item) ? 'page' : undefined}
                 className={rowClass(isActive(item))}
               >
-                <span aria-hidden>{item.icon}</span>
+                <span aria-hidden className="flex w-[18px] shrink-0 justify-center">
+                  {item.icon}
+                </span>
                 {item.label}
               </Link>
             ))}
@@ -173,7 +177,9 @@ export default function AdminLayout({ children }: { children: ReactNode }) {
 
           <div className="border-t border-border p-2">
             <Link href="/" className={rowClass(false)}>
-              <IconArrowLeft size={15} />
+              <span aria-hidden className="flex w-[18px] shrink-0 justify-center">
+                <IconArrowLeft size={15} />
+              </span>
               Back to chat
             </Link>
             <p className="truncate px-2.5 pb-1 pt-1.5 text-xs text-faint">
@@ -204,7 +210,7 @@ export default function AdminLayout({ children }: { children: ReactNode }) {
           </header>
 
           <main className="min-h-0 flex-1 overflow-y-auto">
-            <div className="mx-auto w-full max-w-5xl px-4 py-6 md:px-8 md:py-8">
+            <div className="mx-auto w-full max-w-admin px-4 py-6 md:px-8 md:py-10">
               {children}
             </div>
           </main>

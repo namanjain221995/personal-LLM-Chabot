@@ -81,12 +81,15 @@ export function PageHeader({
   actions?: ReactNode;
 }) {
   return (
-    <div className="flex flex-wrap items-start justify-between gap-3">
+    <div className="flex flex-wrap items-start justify-between gap-4">
       <div className="min-w-0">
-        <h1 className="text-xl font-semibold tracking-tight text-ink">
+        {/* 28px semibold, tight — the page's one loud thing. */}
+        <h1 className="text-xl font-semibold leading-tight tracking-tight text-ink">
           {title}
         </h1>
-        {subtitle && <p className="mt-1 text-sm text-muted">{subtitle}</p>}
+        {subtitle && (
+          <p className="mt-1.5 text-sm leading-relaxed text-muted">{subtitle}</p>
+        )}
       </div>
       {actions && <div className="flex shrink-0 items-center gap-2">{actions}</div>}
     </div>
@@ -99,15 +102,21 @@ export function AvatarInitial({
   size = 'sm',
 }: {
   name: string;
-  size?: 'sm' | 'lg';
+  size?: 'sm' | 'md' | 'lg';
 }) {
   const initial = (name || '?').trim().charAt(0).toUpperCase() || '?';
+  // md (40px) is the roster's size: large enough to anchor a two-line
+  // identity cell, small enough that forty of them are not the page.
+  const box =
+    size === 'lg'
+      ? 'h-12 w-12 text-lg'
+      : size === 'md'
+        ? 'h-10 w-10 text-sm'
+        : 'h-8 w-8 text-xs';
   return (
     <span
       aria-hidden
-      className={`flex shrink-0 items-center justify-center rounded-full bg-surface-2 font-semibold text-muted ${
-        size === 'lg' ? 'h-12 w-12 text-lg' : 'h-8 w-8 text-xs'
-      }`}
+      className={`flex shrink-0 items-center justify-center rounded-full bg-surface-2 font-semibold text-muted ${box}`}
     >
       {initial}
     </span>

@@ -42,6 +42,7 @@ const config: Config = {
         // borders, file-chip tints) silently compiled to nothing before.
         danger: 'rgb(var(--ts-danger-rgb) / <alpha-value>)',
         warn: 'var(--ts-warn)',
+        ok: 'var(--ts-ok)',
       },
       fontFamily: {
         sans: ['"IBM Plex Sans"', 'system-ui', 'sans-serif'],
@@ -63,6 +64,11 @@ const config: Config = {
       },
       maxWidth: {
         thread: '768px',
+        /* The admin content column. 1180px holds the roster's six columns
+           without compressing them and still stops the eye from travelling
+           the full width of a 27" display — settings pages are read, not
+           scanned edge to edge. */
+        admin: '1180px',
       },
       width: {
         sidebar: '260px',

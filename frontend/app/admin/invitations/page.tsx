@@ -14,7 +14,7 @@
 import { useState } from 'react';
 import { useAdminMe } from '@/components/admin/AdminMeContext';
 import { can, type InviteStatus } from '@/components/admin/api';
-import { PRIMARY_BUTTON } from '@/components/admin/AdminDialog';
+import { ADMIN_PRIMARY_BUTTON, CONTROL_HEIGHT } from '@/components/admin/controls';
 import { InviteDialog } from '@/components/admin/InviteDialog';
 import { InvitesPanel } from '@/components/admin/InvitesPanel';
 import { IconUserPlus } from '@/components/admin/icons';
@@ -44,7 +44,7 @@ export default function AdminInvitationsPage() {
             <button
               type="button"
               onClick={() => setInviteOpen(true)}
-              className={PRIMARY_BUTTON}
+              className={ADMIN_PRIMARY_BUTTON}
             >
               <IconUserPlus size={15} />
               Invite member
@@ -56,7 +56,7 @@ export default function AdminInvitationsPage() {
       <div
         role="group"
         aria-label="Filter invitations"
-        className="mt-5 flex w-fit items-center rounded-full border border-border bg-surface p-0.5"
+        className={`${CONTROL_HEIGHT} mt-6 flex w-fit items-center rounded-ts border border-border bg-[var(--admin-control)] p-1`}
       >
         {FILTERS.map(([value, label]) => (
           <button
@@ -64,10 +64,10 @@ export default function AdminInvitationsPage() {
             type="button"
             aria-pressed={status === value}
             onClick={() => setStatus(value)}
-            className={`rounded-full px-3 py-1 text-xs font-medium transition-colors duration-ts ${
+            className={`h-full rounded-md px-3 text-xs font-medium transition-colors duration-ts focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent ${
               status === value
                 ? 'bg-surface-2 text-ink'
-                : 'text-muted hover:bg-surface-2 hover:text-ink'
+                : 'text-muted hover:text-ink'
             }`}
           >
             {label}
@@ -75,7 +75,7 @@ export default function AdminInvitationsPage() {
         ))}
       </div>
 
-      <div className="mt-3">
+      <div className="mt-5">
         <InvitesPanel
           refresh={refresh}
           status={status}
