@@ -192,14 +192,36 @@ groups:
             Every conversation, message and research run lives here. The
             orchestrator fails its own health check while this is true.
 
+      # Measured against the server's OWN max_connections, never a guess.
+      # This alert used to fire above 70 connections while the deployment
+      # runs `-c max_connections=60` — a threshold ABOVE the ceiling, so it
+      # could not fire at all. On 2026-09-04 pgAdmin filled all 60 slots and
+      # the first warning was a person being unable to connect.
       - alert: PostgresConnectionsHigh
-        # Default max_connections is 100; the pool plus pgAdmin plus this
-        # exporter sit well under 10 in normal use.
-        expr: sum(pg_stat_database_numbackends) > 70
+        expr: >-
+          100 * sum(pg_stat_database_numbackends)
+          / clamp_min(max(pg_settings_max_connections), 1) > 75
         for: 5m
         labels: { severity: warning }
         annotations:
-          summary: "{{ $value }} PostgreSQL connections open"
+          summary: "PostgreSQL is {{ $value | printf \"%.0f\" }}% of its connection limit"
+          description: >-
+            Usually a client leaking idle sessions rather than real load.
+            `select client_addr, state, count(*) from pg_stat_activity
+            group by 1, 2 order by 3 desc` names it.
+
+      - alert: PostgresConnectionsExhausted
+        expr: >-
+          100 * sum(pg_stat_database_numbackends)
+          / clamp_min(max(pg_settings_max_connections), 1) > 90
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "PostgreSQL is {{ $value | printf \"%.0f\" }}% of its connection limit"
+          description: >-
+            New connections are about to be refused with "too many clients
+            already" — the orchestrator's pool cannot grow, and no one can
+            open a session to investigate."
 
       - alert: PostgresCacheHitRatioLow
         expr: >-
