@@ -18,6 +18,7 @@ import {
   adminPost,
   inviteStatusOf,
   type Invitation,
+  type InviteStatus,
 } from './api';
 import { AdminTable, type AdminColumn } from './AdminTable';
 import { InviteDialog, type InvitePrefill } from './InviteDialog';
@@ -26,11 +27,23 @@ import { RoleChip, StatusChip } from './chips';
 export function InvitesPanel({
   refresh = 0,
   onChanged,
+  status = '',
+  empty,
 }: {
   /** Bump to force a reload (e.g. after the header's invite dialog). */
   refresh?: number;
   /** Called after a revoke or re-invite, so counts elsewhere can update. */
   onChanged?: () => void;
+  /**
+   * Server-side filter. The Members tab passes 'pending' — it is titled
+   * "Pending invites" and used to list every invitation ever sent, so a
+   * workspace whose invites had all been accepted showed nine rows reading
+   * "Accepted" under a heading promising one pending (owner report,
+   * 2026-09-03). Empty keeps the whole history, for /admin/invitations.
+   */
+  status?: '' | InviteStatus;
+  /** Override the empty-state sentence for a filtered list. */
+  empty?: string;
 }) {
   const { toast } = useToast();
   const [invitations, setInvitations] = useState<Invitation[]>([]);
@@ -44,7 +57,9 @@ export function InvitesPanel({
     let cancelled = false;
     setLoading(true);
     setError(null);
-    adminJson<{ invitations: Invitation[] }>('invitations')
+    adminJson<{ invitations: Invitation[] }>(
+      status ? `invitations?status=${status}` : 'invitations',
+    )
       .then((res) => {
         if (!cancelled) setInvitations(res.invitations);
       })
@@ -62,7 +77,7 @@ export function InvitesPanel({
     return () => {
       cancelled = true;
     };
-  }, [refresh, reload]);
+  }, [refresh, reload, status]);
 
   const revoke = useCallback(async () => {
     const target = revoking;
@@ -165,7 +180,10 @@ export function InvitesPanel({
         rows={invitations}
         rowKey={(inv) => inv.id}
         loading={loading}
-        empty="No invitations yet. Invite someone and the one-time link appears here."
+        empty={
+          empty ??
+          'No invitations yet. Invite someone and the one-time link appears here.'
+        }
         error={error}
         onRetry={() => setReload((n) => n + 1)}
       />

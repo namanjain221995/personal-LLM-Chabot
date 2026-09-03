@@ -51,6 +51,10 @@ def _me_payload(principal: Principal) -> Dict[str, Any]:
             "role": principal.role.value,
         },
         "capabilities": sorted(c.value for c in principal.caps),
+        # Which TOOLS this person may use (authn/features.py). The composer
+        # hides what is off; the server refuses it regardless, so this is a
+        # courtesy to the UI and never the gate itself.
+        "features": dict(principal.features),
     }
 
 

@@ -17,6 +17,9 @@ export interface Me {
   user: { id: number; name: string; email: string };
   workspace: { id: string; name: string; role: Role };
   capabilities: string[];
+  /** Which TOOLS this account may use (orchestrator authn/features.py).
+      Capabilities gate the admin surface; features gate the composer. */
+  features: Record<string, boolean>;
 }
 
 export const ROLE_LABEL: Record<Role, string> = {
@@ -31,6 +34,7 @@ export function parseMe(body: unknown): Me | null {
     user?: { id?: unknown; name?: unknown; email?: unknown };
     workspace?: { id?: unknown; name?: unknown; role?: unknown };
     capabilities?: unknown;
+    features?: unknown;
   } | null;
   if (!b || typeof b !== 'object') return null;
   if (!b.user || typeof b.user.id !== 'number') return null;
@@ -49,7 +53,22 @@ export function parseMe(body: unknown): Me | null {
     capabilities: Array.isArray(b.capabilities)
       ? b.capabilities.filter((c): c is string => typeof c === 'string')
       : [],
+    features: featureMap(b.features),
   };
+}
+
+/**
+ * A `{feature: boolean}` map from an untrusted body. An older orchestrator
+ * sends nothing, and the caller then falls back to "everything allowed" —
+ * a half-deployed pair must not hide tools the server still honours.
+ */
+export function featureMap(raw: unknown): Record<string, boolean> {
+  if (!raw || typeof raw !== 'object') return {};
+  const out: Record<string, boolean> = {};
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof value === 'boolean') out[key] = value;
+  }
+  return out;
 }
 
 export function can(me: Me, capability: string): boolean {
@@ -132,6 +151,123 @@ export function adminPost<T>(path: string, body: unknown): Promise<T> {
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
   });
+}
+
+export function adminPut<T>(path: string, body: unknown): Promise<T> {
+  return adminJson<T>(path, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Feature access — which tools a person may use
+// ---------------------------------------------------------------------------
+
+export interface FeatureSpec {
+  id: string;
+  label: string;
+  hint: string;
+  default: boolean;
+  requires: string | null;
+}
+
+export interface AccessSettings {
+  catalog: FeatureSpec[];
+  workspace_defaults: Record<string, boolean>;
+  resolved: Record<string, boolean>;
+  can_manage: boolean;
+}
+
+export interface MemberAccess {
+  catalog: FeatureSpec[];
+  workspace_resolved: Record<string, boolean>;
+  overrides: Record<string, boolean>;
+  resolved: Record<string, boolean>;
+  role: Role;
+  /** A super admin's access is unconditional — the dialog says so. */
+  locked: boolean;
+}
+
+/**
+ * The same dependency rule the orchestrator applies (features._apply_invariants),
+ * run locally so the toggles behave while the dialog is open rather than
+ * only after saving: turning a parent off turns its children off, turning a
+ * child on turns its parent on.
+ */
+export function applyFeatureRules(
+  catalog: FeatureSpec[],
+  next: Record<string, boolean>,
+  changed: string,
+): Record<string, boolean> {
+  const out = { ...next };
+  const spec = catalog.find((f) => f.id === changed);
+  if (!spec) return out;
+  if (out[changed]) {
+    // Turning a child on implies its parent (and its parent's parent).
+    let parent = spec.requires;
+    while (parent) {
+      out[parent] = true;
+      parent = catalog.find((f) => f.id === parent)?.requires ?? null;
+    }
+  } else {
+    // Turning a parent off drops every descendant, transitively.
+    let dropped = true;
+    while (dropped) {
+      dropped = false;
+      for (const child of catalog) {
+        if (child.requires && out[child.id] && !out[child.requires]) {
+          out[child.id] = false;
+          dropped = true;
+        }
+      }
+    }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Usage analytics
+// ---------------------------------------------------------------------------
+
+export type RangeKey = '7d' | '1m' | '3m' | '6m' | '12m';
+
+export const RANGE_LABEL: Record<RangeKey, string> = {
+  '7d': '7D',
+  '1m': '1M',
+  '3m': '3M',
+  '6m': '6M',
+  '12m': '12M',
+};
+
+export interface AnalyticsMember {
+  id: number;
+  name: string;
+  email: string;
+  role: Role;
+  status: string;
+  last_active_at: string | null;
+  messages: number;
+  answers: number;
+  conversations: number;
+  tool_runs: number;
+  web_search: number;
+  deep_research: number;
+  salesforce: number;
+  files: number;
+  agent: number;
+  links: number;
+}
+
+export interface Analytics {
+  workspace: { id: string; name: string };
+  range: { key: RangeKey; days: number; since: string; until: string };
+  summary: Record<string, number>;
+  tools: { id: string; label: string; count: number }[];
+  daily: { day: string; messages: number; active_users: number }[];
+  routes: { route: string; count: number }[];
+  members: AnalyticsMember[];
 }
 
 // ---------------------------------------------------------------------------

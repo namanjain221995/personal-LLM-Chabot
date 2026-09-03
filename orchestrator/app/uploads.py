@@ -73,6 +73,25 @@ async def _stream_to_disk(upload: UploadFile, dest: str) -> int:
     return written
 
 
+async def require_attachments(request: Request) -> None:
+    """Refuse the upload when this account may not attach files (V17).
+
+    THIS is the real gate for attachments — bytes land here, not in /chat —
+    so it is a hard 403 rather than the downgrade /chat performs on inline
+    base64. The composer hides the picker for these accounts, so reaching
+    this is a stale tab or a direct API call.
+    """
+    from .authn import features as feature_access
+    from .authn.principal import require_principal
+
+    principal = await require_principal(request)
+    if not feature_access.allowed(principal.features, feature_access.Feature.ATTACHMENTS):
+        raise HTTPException(
+            status_code=403,
+            detail="File uploads are turned off for your account. Ask an administrator.",
+        )
+
+
 @router.post("")
 async def create_upload(
     file: UploadFile = File(...),
@@ -82,6 +101,7 @@ async def create_upload(
     # not be profiled as one -- and the chat engine needs the actual bytes).
     purpose: str = Form("dataset"),
     user: UserRow = Depends(require_user),
+    _attachments: None = Depends(require_attachments),
 ) -> dict:
     if not settings.dataset_uploads_enabled:
         raise HTTPException(status_code=404, detail="dataset uploads are disabled")
@@ -460,6 +480,7 @@ async def chunked_init(
     filename: str = Form(...),
     purpose: str = Form("document"),
     user: UserRow = Depends(require_user),
+    _attachments: None = Depends(require_attachments),
 ) -> dict:
     if not settings.dataset_uploads_enabled:
         raise HTTPException(status_code=404, detail="uploads are disabled")

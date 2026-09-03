@@ -38,11 +38,14 @@ const ITEM_ICON: Record<ComposerMenuItemId, React.ComponentType<{ size?: number;
 export function AttachMenu({
   prefs,
   streaming,
+  features,
   onPrefsChange,
   onPickFiles,
 }: {
   prefs: ChatPrefs;
   streaming: boolean;
+  /** Resolved tool access — rows this account may not use are not listed. */
+  features?: Record<string, boolean>;
   onPrefsChange: (next: ChatPrefs) => void;
   onPickFiles: () => void;
 }) {
@@ -57,6 +60,7 @@ export function AttachMenu({
     webSearchOn: prefs.webSearch === 'on',
     deepResearchOn: prefs.deepResearch,
     streaming,
+    features,
   });
 
   // Close on outside click / Escape while open (ModelPicker pattern).

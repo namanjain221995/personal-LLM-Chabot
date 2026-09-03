@@ -1,0 +1,160 @@
+'use client';
+
+/**
+ * /admin/access — what every member of this workspace may use by default.
+ *
+ * This page sets the DEFAULT only. A member whose access was set
+ * individually (Members → ⋯ → Manage access) keeps their setting; that is
+ * what an override is for, and the copy says so rather than leaving an
+ * administrator to discover it.
+ */
+
+import { useCallback, useEffect, useState } from 'react';
+import { useToast } from '@/components/Providers';
+import { useAdminMe } from '@/components/admin/AdminMeContext';
+import {
+  AdminApiError,
+  adminJson,
+  adminPut,
+  applyFeatureRules,
+  can,
+  type AccessSettings,
+} from '@/components/admin/api';
+import { PRIMARY_BUTTON } from '@/components/admin/AdminDialog';
+import { FeatureToggles } from '@/components/admin/FeatureToggles';
+import { ErrorPanel, PageHeader, SkeletonLine } from '@/components/admin/ui';
+
+export default function AdminAccessPage() {
+  const me = useAdminMe();
+  const { toast } = useToast();
+  const [data, setData] = useState<AccessSettings | null>(null);
+  const [values, setValues] = useState<Record<string, boolean>>({});
+  const [error, setError] = useState<string | null>(null);
+  const [attempt, setAttempt] = useState(0);
+  const [saving, setSaving] = useState(false);
+  const editable = can(me, 'settings.manage');
+
+  useEffect(() => {
+    let cancelled = false;
+    setError(null);
+    adminJson<AccessSettings>('access')
+      .then((res) => {
+        if (cancelled) return;
+        setData(res);
+        setValues({ ...res.resolved });
+      })
+      .catch((err) => {
+        if (!cancelled)
+          setError(
+            err instanceof AdminApiError
+              ? err.message
+              : 'The access settings could not be loaded.',
+          );
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [attempt]);
+
+  const save = useCallback(async () => {
+    if (!data) return;
+    // Store only what differs from the built-in default, so a later change
+    // to a built-in still reaches a workspace that never touched that tool.
+    const overrides: Record<string, boolean> = {};
+    for (const spec of data.catalog) {
+      const want = Boolean(values[spec.id]);
+      if (want !== spec.default) overrides[spec.id] = want;
+    }
+    setSaving(true);
+    try {
+      const res = await adminPut<{
+        workspace_defaults: Record<string, boolean>;
+        resolved: Record<string, boolean>;
+      }>('access', { features: overrides });
+      setValues({ ...res.resolved });
+      toast('Workspace access updated.');
+    } catch (err) {
+      toast(
+        err instanceof AdminApiError
+          ? err.message
+          : 'The access settings could not be saved.',
+        'error',
+      );
+    } finally {
+      setSaving(false);
+    }
+  }, [data, values, toast]);
+
+  const dirty =
+    data !== null &&
+    data.catalog.some(
+      (spec) => Boolean(values[spec.id]) !== Boolean(data.resolved[spec.id]),
+    );
+
+  return (
+    <div>
+      <PageHeader
+        title="Access"
+        subtitle="Which tools members of this workspace can use"
+        actions={
+          editable ? (
+            <button
+              type="button"
+              onClick={save}
+              disabled={!dirty || saving}
+              className={PRIMARY_BUTTON}
+            >
+              {saving ? 'Saving…' : 'Save changes'}
+            </button>
+          ) : undefined
+        }
+      />
+
+      {error ? (
+        <div className="mt-6">
+          <ErrorPanel message={error} onRetry={() => setAttempt((n) => n + 1)} />
+        </div>
+      ) : !data ? (
+        <div className="mt-6 space-y-3 rounded-ts border border-border bg-surface p-4">
+          <SkeletonLine className="w-1/2" />
+          <SkeletonLine className="w-2/3" />
+          <SkeletonLine className="w-1/3" />
+        </div>
+      ) : (
+        <div className="mt-6 max-w-2xl">
+          <p className="mb-4 text-sm leading-relaxed text-muted">
+            This is the default for the whole workspace. A member whose access
+            was set individually keeps their own setting — change that under{' '}
+            <span className="text-ink">Members → ⋯ → Manage access</span>.
+            {!editable &&
+              ' Only a super admin can change these; you can see what they are.'}
+          </p>
+          <FeatureToggles
+            catalog={data.catalog}
+            values={values}
+            disabled={!editable || saving}
+            note={(spec) =>
+              Boolean(values[spec.id]) === spec.default
+                ? null
+                : `Changed from the built-in default (${spec.default ? 'on' : 'off'})`
+            }
+            onChange={(featureId, next) =>
+              setValues((prev) =>
+                applyFeatureRules(
+                  data.catalog,
+                  { ...prev, [featureId]: next },
+                  featureId,
+                ),
+              )
+            }
+          />
+          <p className="mt-3 text-xs leading-relaxed text-faint">
+            Turning a tool off hides it in the composer and refuses it on the
+            server — an old browser tab cannot use what was taken away. Super
+            admins always keep every tool.
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}

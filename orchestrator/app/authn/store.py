@@ -113,16 +113,212 @@ def ensure_workspace(name: str) -> Dict[str, Any]:
 
 def membership(user_id: int) -> Optional[Dict[str, Any]]:
     """The user's membership row joined with its workspace (single-workspace
-    deployment: first by workspace age)."""
+    deployment: first by workspace age).
+
+    Carries both feature layers (V17) so `Principal` can resolve tool access
+    in the SAME round trip that already resolves the role — the /chat gate
+    reads it on every request and must not cost a second query."""
     with db.connection() as con:
         return con.execute(
             """SELECT m.workspace_id, m.user_id, m.role, m.created_at AS member_since,
-                      w.name AS workspace_name
+                      m.features AS member_features,
+                      w.name AS workspace_name, w.feature_defaults
                FROM workspace_memberships m JOIN workspaces w ON w.id = m.workspace_id
                WHERE m.user_id = %s
                ORDER BY w.created_at, w.id LIMIT 1""",
             (user_id,),
         ).fetchone()
+
+
+# ---------------------------------------------------------------------------
+# Feature access (V17) — see authn/features.py for what the layers mean
+# ---------------------------------------------------------------------------
+
+
+def workspace_feature_defaults(workspace_id: str) -> Dict[str, Any]:
+    with db.connection() as con:
+        row = con.execute(
+            "SELECT feature_defaults FROM workspaces WHERE id = %s", (workspace_id,)
+        ).fetchone()
+    return dict(row["feature_defaults"] or {}) if row else {}
+
+
+def set_workspace_feature_defaults(
+    workspace_id: str, overrides: Dict[str, bool]
+) -> Dict[str, Any]:
+    """Replace the workspace's defaults. Callers pass an already-cleaned map
+    (features.clean), so what lands in the column is only known keys."""
+    with db.connection() as con:
+        row = con.execute(
+            """UPDATE workspaces SET feature_defaults = %s WHERE id = %s
+               RETURNING feature_defaults""",
+            (db._json_param(dict(overrides)), workspace_id),
+        ).fetchone()
+    return dict(row["feature_defaults"] or {}) if row else {}
+
+
+def member_feature_overrides(workspace_id: str, user_id: int) -> Dict[str, Any]:
+    with db.connection() as con:
+        row = con.execute(
+            """SELECT features FROM workspace_memberships
+               WHERE workspace_id = %s AND user_id = %s""",
+            (workspace_id, user_id),
+        ).fetchone()
+    return dict(row["features"] or {}) if row else {}
+
+
+def set_member_feature_overrides(
+    workspace_id: str, user_id: int, overrides: Dict[str, bool]
+) -> Dict[str, Any]:
+    with db.connection() as con:
+        row = con.execute(
+            """UPDATE workspace_memberships SET features = %s
+               WHERE workspace_id = %s AND user_id = %s RETURNING features""",
+            (db._json_param(dict(overrides)), workspace_id, user_id),
+        ).fetchone()
+    return dict(row["features"] or {}) if row else {}
+
+
+# ---------------------------------------------------------------------------
+# Usage analytics (2026-09-03) — read-only aggregates over the chat tables
+# ---------------------------------------------------------------------------
+
+#: How an assistant message's `meta.route` maps to the tool a person used.
+#: Routes not listed here (chat, clarify) are plain conversation. Kept as SQL
+#: CASE arms rather than Python so the whole report is one query per section.
+_TOOL_ROUTES = {
+    "web_search": ("search",),
+    "deep_research": ("deep_research",),
+    "salesforce": ("sql", "rag", "sf_intel", "live_sf"),
+    "files": ("vision", "dataset", "document"),
+    "agent": ("agent",),
+    "links": ("url", "crawl"),
+}
+
+
+def _tool_case(alias: str = "m") -> str:
+    arms = []
+    for tool, routes in _TOOL_ROUTES.items():
+        wanted = ", ".join(f"'{r}'" for r in routes)
+        arms.append(
+            f"count(*) FILTER (WHERE {alias}.role = 'assistant' "
+            f"AND {alias}.meta->>'route' IN ({wanted})) AS {tool}"
+        )
+    return ", ".join(arms)
+
+
+def usage_summary(
+    workspace_id: str, since: datetime, until: datetime
+) -> Dict[str, Any]:
+    """Workspace totals for a window, plus the seat counts that do not move
+    with it (a seat is a seat whatever range is selected)."""
+    with db.connection() as con:
+        seats = con.execute(
+            """SELECT count(*) AS members,
+                      count(*) FILTER (WHERE u.status = 'active') AS active_members,
+                      count(*) FILTER (WHERE u.status <> 'active') AS disabled_members
+                 FROM workspace_memberships m JOIN users u ON u.id = m.user_id
+                WHERE m.workspace_id = %s""",
+            (workspace_id,),
+        ).fetchone()
+        pending = con.execute(
+            """SELECT count(*) AS n FROM workspace_invitations
+                WHERE workspace_id = %s AND accepted_at IS NULL
+                  AND revoked_at IS NULL AND expires_at > now()""",
+            (workspace_id,),
+        ).fetchone()
+        totals = con.execute(
+            f"""SELECT count(*) FILTER (WHERE m.role = 'user') AS messages,
+                       count(*) FILTER (WHERE m.role = 'assistant') AS answers,
+                       count(DISTINCT c.user_id) AS active_users,
+                       count(DISTINCT c.id) AS conversations,
+                       {_tool_case()}
+                  FROM messages m JOIN conversations c ON c.id = m.conversation_id
+                  JOIN workspace_memberships wm ON wm.user_id = c.user_id
+                 WHERE wm.workspace_id = %s AND m.created_at >= %s AND m.created_at < %s""",
+            (workspace_id, since, until),
+        ).fetchone()
+    out = dict(totals or {})
+    out.update(
+        {
+            "members": (seats or {}).get("members", 0),
+            "active_members": (seats or {}).get("active_members", 0),
+            "disabled_members": (seats or {}).get("disabled_members", 0),
+            "pending_invites": (pending or {}).get("n", 0),
+        }
+    )
+    out["tool_runs"] = sum(int(out.get(tool) or 0) for tool in _TOOL_ROUTES)
+    return {k: (int(v) if isinstance(v, (int, float)) else v) for k, v in out.items()}
+
+
+def usage_by_member(
+    workspace_id: str, since: datetime, until: datetime, limit: int = 200
+) -> List[Dict[str, Any]]:
+    """Per-person usage for the window. LEFT JOIN from the roster, so someone
+    who sent nothing appears with zeros instead of vanishing — "who is not
+    using it" is the question this table is usually opened to answer."""
+    with db.connection() as con:
+        return con.execute(
+            f"""SELECT u.id, u.display_name, u.username, u.email, u.status,
+                       wm.role, u.last_active_at,
+                       count(m.id) FILTER (WHERE m.role = 'user') AS messages,
+                       count(m.id) FILTER (WHERE m.role = 'assistant') AS answers,
+                       count(DISTINCT c.id) AS conversations,
+                       {_tool_case()}
+                  FROM workspace_memberships wm
+                  JOIN users u ON u.id = wm.user_id
+                  LEFT JOIN conversations c ON c.user_id = u.id
+                  LEFT JOIN messages m ON m.conversation_id = c.id
+                       AND m.created_at >= %s AND m.created_at < %s
+                 WHERE wm.workspace_id = %s
+                 GROUP BY u.id, u.display_name, u.username, u.email, u.status,
+                          wm.role, u.last_active_at
+                 ORDER BY count(m.id) FILTER (WHERE m.role = 'user') DESC,
+                          lower(coalesce(u.display_name, u.username))
+                 LIMIT %s""",
+            (since, until, workspace_id, limit),
+        ).fetchall()
+
+
+def usage_daily(
+    workspace_id: str, since: datetime, until: datetime
+) -> List[Dict[str, Any]]:
+    """One row per day in the window — messages and distinct active people.
+    generate_series fills the quiet days, so a sparkline has no false gaps."""
+    with db.connection() as con:
+        return con.execute(
+            """SELECT d::date AS day,
+                      coalesce(s.messages, 0) AS messages,
+                      coalesce(s.active_users, 0) AS active_users
+                 FROM generate_series(%s::date, (%s::date - interval '1 day'), interval '1 day') d
+                 LEFT JOIN (
+                     SELECT date_trunc('day', m.created_at)::date AS day,
+                            count(*) FILTER (WHERE m.role = 'user') AS messages,
+                            count(DISTINCT c.user_id) AS active_users
+                       FROM messages m JOIN conversations c ON c.id = m.conversation_id
+                       JOIN workspace_memberships wm ON wm.user_id = c.user_id
+                      WHERE wm.workspace_id = %s AND m.created_at >= %s AND m.created_at < %s
+                      GROUP BY 1
+                 ) s ON s.day = d::date
+                ORDER BY d""",
+            (since, until, workspace_id, since, until),
+        ).fetchall()
+
+
+def usage_routes(
+    workspace_id: str, since: datetime, until: datetime
+) -> List[Dict[str, Any]]:
+    """Which engine answered, by count — the route mix behind the tool tiles."""
+    with db.connection() as con:
+        return con.execute(
+            """SELECT coalesce(m.meta->>'route', 'chat') AS route, count(*) AS n
+                 FROM messages m JOIN conversations c ON c.id = m.conversation_id
+                 JOIN workspace_memberships wm ON wm.user_id = c.user_id
+                WHERE wm.workspace_id = %s AND m.role = 'assistant'
+                  AND m.created_at >= %s AND m.created_at < %s
+                GROUP BY 1 ORDER BY n DESC""",
+            (workspace_id, since, until),
+        ).fetchall()
 
 
 def upsert_membership(workspace_id: str, user_id: int, role: str) -> None:

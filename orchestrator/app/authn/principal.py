@@ -17,6 +17,7 @@ from typing import Any, Dict, FrozenSet, Optional
 from fastapi import Depends, HTTPException, Request
 
 from .. import db
+from . import features as features_mod
 from . import sessions, store
 from .rbac import Cap, Role, capabilities
 
@@ -34,9 +35,17 @@ class Principal:
     workspace_name: str
     session_id: str
     caps: FrozenSet[Cap] = field(default_factory=frozenset)
+    #: Resolved tool access (authn/features.py): every feature id → bool.
+    #: Built from the workspace default and this member's override in the
+    #: same query that resolved the role, so the /chat gate costs nothing.
+    features: Dict[str, bool] = field(default_factory=dict)
 
     def can(self, cap: Cap) -> bool:
         return cap in self.caps
+
+    def may_use(self, feature: "features_mod.Feature") -> bool:
+        """May this person use this TOOL? (`can` answers about administering.)"""
+        return features_mod.allowed(self.features, feature)
 
     def as_user_row(self) -> Dict[str, Any]:
         """The legacy UserRow shape (`user["id"]`, `user["username"]`) that
@@ -71,6 +80,11 @@ def _build(session_row: Dict[str, Any]) -> Optional[Principal]:
         workspace_name=member["workspace_name"],
         session_id=session_row["id"],
         caps=capabilities(role),
+        features=features_mod.resolve(
+            role=role.value,
+            workspace_defaults=member.get("feature_defaults"),
+            member_overrides=member.get("member_features"),
+        ),
     )
 
 

@@ -15,6 +15,7 @@ const SUPER: Me = {
   user: { id: 1, name: 'Grace Hopper', email: 'grace@corp.com' },
   workspace: { id: 'w1', name: 'Corp Workspace', role: 'super_admin' },
   capabilities: ['members.read', 'invites.manage', 'roles.manage'],
+  features: {},
 };
 
 afterEach(() => {

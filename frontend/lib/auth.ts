@@ -43,6 +43,23 @@ export interface MePayload {
   workspace: MeWorkspace | null;
   /** Drives UI visibility (e.g. show Audit Log iff "audit.read"). */
   capabilities: string[];
+  /**
+   * Which TOOLS this account may use (orchestrator authn/features.py):
+   * `{web_search: true, salesforce: false, ...}`. The composer hides what is
+   * off. An older orchestrator sends nothing and this stays empty, which
+   * `featureAllowed` reads as "allowed" — a half-deployed pair must never
+   * hide a tool the server still honours.
+   */
+  features: Record<string, boolean>;
+}
+
+/** One tool's state, defaulting to allowed when the server did not say. */
+export function featureAllowed(
+  features: Record<string, boolean> | undefined,
+  id: string,
+): boolean {
+  const value = features?.[id];
+  return typeof value === 'boolean' ? value : true;
 }
 
 /**
@@ -115,6 +132,15 @@ function parseFailure(status: number, body: unknown): MeFailure {
   return out;
 }
 
+function parseFeatures(raw: unknown): Record<string, boolean> {
+  if (!raw || typeof raw !== 'object') return {};
+  const out: Record<string, boolean> = {};
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof value === 'boolean') out[key] = value;
+  }
+  return out;
+}
+
 function parseUser(raw: unknown): MeUser | null {
   const u = raw as Partial<MeUser> | null | undefined;
   if (!u || typeof u.id !== 'number' || !Number.isFinite(u.id)) return null;
@@ -168,6 +194,7 @@ export async function fetchMe(fetchFn: FetchLike = fetch): Promise<MeResult> {
       capabilities: Array.isArray(body?.capabilities)
         ? body.capabilities.filter((c): c is string => typeof c === 'string')
         : [],
+      features: parseFeatures(body?.features),
     };
   } catch {
     return { ok: false, status: 0 };

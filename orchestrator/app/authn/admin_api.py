@@ -13,7 +13,7 @@ handles the first; explicit 404s on foreign/missing ids handle the second).
 from __future__ import annotations
 
 import secrets
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field
 
 from .. import db
 from ..config import settings
+from . import features as feature_access
 from . import passwords, store
 from .api import _token_hash
 from .principal import Principal, audit, require_capability
@@ -66,6 +67,23 @@ async def _target_member(principal: Principal, user_id: int) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Overview
 # ---------------------------------------------------------------------------
+
+
+def _invite_status(row: Dict[str, Any]) -> str:
+    """The single source of truth for an invitation's state.
+
+    The client derives the same four values for its chips; deriving them HERE
+    too is what lets the list be filtered server-side without the two
+    definitions drifting apart.
+    """
+    if row.get("accepted_at"):
+        return "accepted"
+    if row.get("revoked_at"):
+        return "revoked"
+    expires = row.get("expires_at")
+    if expires is not None and expires <= datetime.now(timezone.utc):
+        return "expired"
+    return "pending"
 
 
 @router.get("/overview")
@@ -493,9 +511,20 @@ class InviteRequest(BaseModel):
 
 @router.get("/invitations")
 async def invitations(
+    status: str = Query("", pattern="^(|pending|accepted|revoked|expired)$"),
     principal: Principal = Depends(require_capability(Cap.INVITES_MANAGE)),
 ) -> dict:
+    """Invitations, newest first. `status` filters to one kind.
+
+    The Members page asks for `pending` — its tab is called "Pending invites"
+    and used to list every invitation ever sent, so a workspace whose invites
+    had all been accepted showed nine rows saying "Accepted" under a heading
+    promising one pending (owner report, 2026-09-03). The /admin/invitations
+    page keeps the full history and filters client-side.
+    """
     rows = await db.run_in_thread(store.list_invitations, principal.workspace_id)
+    if status:
+        rows = [r for r in rows if _invite_status(r) == status]
     return {
         "invitations": [
             {
@@ -598,6 +627,243 @@ async def revoke_invitation(
 # ---------------------------------------------------------------------------
 # Audit log (super admin)
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Feature access (V17) — which TOOLS a person may use
+# ---------------------------------------------------------------------------
+
+
+class FeatureOverrides(BaseModel):
+    """A partial map: only the keys being set. Absent means "inherit"."""
+
+    features: Dict[str, bool] = Field(default_factory=dict)
+
+
+@router.get("/access")
+async def access_settings(
+    principal: Principal = Depends(require_capability(Cap.MEMBERS_READ)),
+) -> dict:
+    """The catalog, the workspace defaults, and what those resolve to."""
+    stored = await db.run_in_thread(
+        store.workspace_feature_defaults, principal.workspace_id
+    )
+    return {
+        "catalog": feature_access.catalog(),
+        # What an admin explicitly set (may be empty = all built-in defaults).
+        "workspace_defaults": feature_access.clean(stored),
+        # What a NEW member would actually get, built-ins included.
+        "resolved": feature_access.resolve(role="member", workspace_defaults=stored),
+        "can_manage": principal.can(Cap.SETTINGS_MANAGE),
+    }
+
+
+@router.put("/access")
+async def set_access_settings(
+    body: FeatureOverrides,
+    request: Request,
+    principal: Principal = Depends(require_capability(Cap.SETTINGS_MANAGE)),
+) -> dict:
+    """Set the workspace default for each tool. Members who have their own
+    override keep it — that is what an override is for."""
+    cleaned = feature_access.clean(body.features)
+    stored = await db.run_in_thread(
+        store.set_workspace_feature_defaults, principal.workspace_id, cleaned
+    )
+    await db.run_in_thread(
+        audit, principal, request, "workspace_access_changed", meta={"features": cleaned}
+    )
+    return {
+        "ok": True,
+        "workspace_defaults": feature_access.clean(stored),
+        "resolved": feature_access.resolve(role="member", workspace_defaults=stored),
+    }
+
+
+@router.get("/members/{user_id}/access")
+async def member_access(
+    user_id: int,
+    principal: Principal = Depends(require_capability(Cap.MEMBERS_READ)),
+) -> dict:
+    """One member's tool access: the catalog, what the workspace grants by
+    default, this member's overrides, and the resolved answer."""
+    target = await _target_member(principal, user_id)
+    defaults = await db.run_in_thread(
+        store.workspace_feature_defaults, principal.workspace_id
+    )
+    overrides = await db.run_in_thread(
+        store.member_feature_overrides, principal.workspace_id, user_id
+    )
+    return {
+        "catalog": feature_access.catalog(),
+        "workspace_resolved": feature_access.resolve(
+            role="member", workspace_defaults=defaults
+        ),
+        "overrides": feature_access.clean(overrides),
+        "resolved": feature_access.resolve(
+            role=target["role"], workspace_defaults=defaults, member_overrides=overrides
+        ),
+        "role": target["role"],
+        # A super admin's access is unconditional (features.resolve), so the
+        # dialog says so instead of offering toggles that cannot bite.
+        "locked": target["role"] == Role.SUPER_ADMIN.value,
+    }
+
+
+@router.put("/members/{user_id}/access")
+async def set_member_access(
+    user_id: int,
+    body: FeatureOverrides,
+    request: Request,
+    principal: Principal = Depends(require_capability(Cap.MEMBERS_MANAGE)),
+) -> dict:
+    target = await _target_member(principal, user_id)
+    if not outranks(principal.role, target["role"]):
+        raise HTTPException(status_code=403, detail="You cannot manage that member.")
+    cleaned = feature_access.clean(body.features)
+    stored = await db.run_in_thread(
+        store.set_member_feature_overrides, principal.workspace_id, user_id, cleaned
+    )
+    defaults = await db.run_in_thread(
+        store.workspace_feature_defaults, principal.workspace_id
+    )
+    await db.run_in_thread(
+        audit,
+        principal,
+        request,
+        "member_access_changed",
+        target_user_id=user_id,
+        meta={"features": cleaned},
+    )
+    return {
+        "ok": True,
+        "overrides": feature_access.clean(stored),
+        "resolved": feature_access.resolve(
+            role=target["role"], workspace_defaults=defaults, member_overrides=stored
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Usage analytics
+# ---------------------------------------------------------------------------
+
+#: Selectable windows. Keys match the pills in the UI; the value is days.
+_RANGES = {"7d": 7, "1m": 30, "3m": 90, "6m": 182, "12m": 365}
+
+
+def _window(range_key: str) -> tuple[datetime, datetime, int]:
+    """(since, until, days) for a range key. `until` is tomorrow midnight so
+    today's messages count — a report that silently excluded the current day
+    reads as "nobody used it today"."""
+    days = _RANGES.get(range_key, 30)
+    now = datetime.now(timezone.utc)
+    until = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+    return until - timedelta(days=days), until, days
+
+
+def _analytics_member_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    out = {
+        "id": int(row["id"]),
+        "name": row.get("display_name") or row["username"],
+        "email": row.get("email") or "",
+        "role": row["role"],
+        "status": row["status"],
+        "last_active_at": _iso(row.get("last_active_at")),
+    }
+    for key in ("messages", "answers", "conversations", *store._TOOL_ROUTES):
+        out[key] = int(row.get(key) or 0)
+    out["tool_runs"] = sum(int(row.get(t) or 0) for t in store._TOOL_ROUTES)
+    return out
+
+
+@router.get("/analytics")
+async def analytics(
+    range: str = Query("1m", pattern="^(7d|1m|3m|6m|12m)$"),
+    principal: Principal = Depends(require_capability(Cap.WORKSPACE_READ)),
+) -> dict:
+    """Workspace usage for a window: totals, a daily series, the route mix,
+    and one row per member (including the members who used nothing)."""
+    since, until, days = _window(range)
+    summary = await db.run_in_thread(
+        store.usage_summary, principal.workspace_id, since, until
+    )
+    rows = await db.run_in_thread(
+        store.usage_by_member, principal.workspace_id, since, until
+    )
+    daily = await db.run_in_thread(
+        store.usage_daily, principal.workspace_id, since, until
+    )
+    routes = await db.run_in_thread(
+        store.usage_routes, principal.workspace_id, since, until
+    )
+    return {
+        "workspace": {"id": principal.workspace_id, "name": principal.workspace_name},
+        "range": {
+            "key": range,
+            "days": days,
+            "since": _iso(since),
+            "until": _iso(until),
+        },
+        "summary": summary,
+        "tools": [
+            {"id": tool, "label": feature_access.BY_ID[tool].label if tool in feature_access.BY_ID else tool.replace("_", " ").title(), "count": int(summary.get(tool) or 0)}
+            for tool in store._TOOL_ROUTES
+        ],
+        "daily": [
+            {
+                "day": r["day"].isoformat(),
+                "messages": int(r["messages"]),
+                "active_users": int(r["active_users"]),
+            }
+            for r in daily
+        ],
+        "routes": [{"route": r["route"], "count": int(r["n"])} for r in routes],
+        "members": [_analytics_member_row(r) for r in rows],
+    }
+
+
+@router.get("/analytics/export")
+async def analytics_export(
+    range: str = Query("1m", pattern="^(7d|1m|3m|6m|12m)$"),
+    request: Request = None,  # type: ignore[assignment]
+    principal: Principal = Depends(require_capability(Cap.WORKSPACE_READ)),
+):
+    """The per-member table as CSV — the same numbers the page shows.
+
+    Audited: a usage export is a list of who used what, which is exactly the
+    kind of read the audit log exists to record.
+    """
+    from fastapi.responses import StreamingResponse
+    import csv
+    import io
+
+    since, until, _days = _window(range)
+    rows = await db.run_in_thread(
+        store.usage_by_member, principal.workspace_id, since, until
+    )
+    await db.run_in_thread(
+        audit, principal, request, "analytics_exported", meta={"range": range}
+    )
+    columns = [
+        "name", "email", "role", "status", "last_active_at",
+        "messages", "answers", "conversations", "tool_runs", *store._TOOL_ROUTES,
+    ]
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(columns)
+    for row in rows:
+        payload = _analytics_member_row(row)
+        writer.writerow([payload.get(c, "") for c in columns])
+    buffer.seek(0)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
+    return StreamingResponse(
+        iter([buffer.getvalue()]),
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": f'attachment; filename="usage-{range}-{stamp}.csv"'
+        },
+    )
 
 
 @router.get("/audit")

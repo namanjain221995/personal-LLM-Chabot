@@ -13,6 +13,7 @@ const ME_PAYLOAD = {
   user: { id: 7, name: 'Naman', email: 'naman@techsara.test' },
   workspace: { id: 'ws-1', name: 'TechSara', role: 'admin' },
   capabilities: ['members.read', 'workspace_content.read'],
+  features: {},
 };
 
 const respond = (status: number, body: unknown): FetchLike =>
@@ -36,6 +37,7 @@ describe('fetchMe — the full payload', () => {
       user: null,
       workspace: null,
       capabilities: [],
+      features: {},
     });
   });
 

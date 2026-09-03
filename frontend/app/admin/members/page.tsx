@@ -33,12 +33,14 @@ import { InviteDialog } from '@/components/admin/InviteDialog';
 import { InvitesPanel } from '@/components/admin/InvitesPanel';
 import { ResetPasswordDialog } from '@/components/admin/ResetPasswordDialog';
 import { RowMenu, type RowMenuItem } from '@/components/admin/RowMenu';
+import { AccessDialog } from '@/components/admin/AccessDialog';
 import { RoleChip, StatusChip } from '@/components/admin/chips';
 import {
   IconBan,
   IconEye,
   IconKey,
   IconMonitor,
+  IconSliders,
   IconUserPlus,
 } from '@/components/admin/icons';
 import { PRIMARY_BUTTON } from '@/components/admin/AdminDialog';
@@ -85,6 +87,7 @@ export default function AdminMembersPage() {
   const [inviteOpen, setInviteOpen] = useState(false);
   const [roleTarget, setRoleTarget] = useState<Member | null>(null);
   const [resetTarget, setResetTarget] = useState<Member | null>(null);
+  const [accessTarget, setAccessTarget] = useState<Member | null>(null);
   const [sessionsTarget, setSessionsTarget] = useState<Member | null>(null);
   const [deactivateTarget, setDeactivateTarget] = useState<Member | null>(null);
   const [removeTarget, setRemoveTarget] = useState<Member | null>(null);
@@ -193,6 +196,13 @@ export default function AdminMembersPage() {
       });
     }
     if (can(me, 'members.manage')) {
+      // Which TOOLS this person may use — the per-member override over the
+      // workspace default set on /admin/access.
+      items.push({
+        id: 'access',
+        label: 'Manage access',
+        icon: <IconSliders size={15} />,
+      });
       items.push({
         id: 'reset',
         label: 'Reset password',
@@ -231,6 +241,9 @@ export default function AdminMembersPage() {
         break;
       case 'role':
         setRoleTarget(member);
+        break;
+      case 'access':
+        setAccessTarget(member);
         break;
       case 'reset':
         setResetTarget(member);
@@ -435,7 +448,12 @@ export default function AdminMembersPage() {
         </>
       ) : (
         <div className="mt-4">
-          <InvitesPanel refresh={refresh} onChanged={bump} />
+          <InvitesPanel
+            refresh={refresh}
+            onChanged={bump}
+            status="pending"
+            empty="No invitations are waiting. Accepted, expired and revoked ones are on the Invitations page."
+          />
         </div>
       )}
 
@@ -457,6 +475,10 @@ export default function AdminMembersPage() {
         member={resetTarget}
         open={resetTarget !== null}
         onClose={() => setResetTarget(null)}
+      />
+      <AccessDialog
+        member={accessTarget}
+        onClose={() => setAccessTarget(null)}
       />
       <ConfirmDialog
         open={sessionsTarget !== null}

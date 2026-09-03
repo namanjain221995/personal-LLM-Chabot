@@ -185,6 +185,56 @@ expire after `AUTH_INVITATION_TTL_DAYS`, are stored hashed, and can be
 revoked from the Pending invites tab. Re-inviting an address revokes the
 earlier pending invite.
 
+## Feature access — which tools a person may use
+
+Two different questions, deliberately two different mechanisms:
+
+| | question | where it lives |
+|---|---|---|
+| **Capability** (RBAC) | may this account *administer* — invite members, read the audit log? | `authn/rbac.py`, a property of the ROLE |
+| **Feature** | may this account *use* — web search, Salesforce, file uploads? | `authn/features.py`, a property of the PERSON |
+
+An admin may want the whole workspace on the synced Salesforce copy but only
+two analysts allowed to query the live org, and that has nothing to do with
+who can invite people.
+
+**The five tools**: photos/files/datasets, web search, deep research,
+Salesforce, live Salesforce. Deep research needs web search; live Salesforce
+needs Salesforce — a dependency that cannot dangle in either direction.
+
+**Resolution**, each layer overriding the one before:
+
+1. the built-in default (everything on)
+2. the workspace default — Admin → **Access** (`workspaces.feature_defaults`)
+3. the per-member override — Members → ⋯ → **Manage access**
+   (`workspace_memberships.features`)
+4. the dependency invariants
+5. super admins get everything, so a workspace cannot lock itself out
+
+Only keys someone actually set are stored, at either layer, so changing a
+built-in default still reaches everyone who never overrode it.
+
+**The client is never the gate.** `/auth/me` carries the resolved map and the
+composer hides what is off (and corrects sticky prefs, so a member cannot sit
+in a Salesforce mode whose trust footer the server would not honour), but:
+
+- `/chat` re-resolves from the database and **downgrades** a blocked tool
+  with one status line — never a 403 mid-conversation;
+- the upload routes **refuse** with 403, because that is the door bytes
+  actually arrive through.
+
+Both changes are audited (`workspace_access_changed`, `member_access_changed`).
+
+## Usage analytics
+
+Admin → **Overview** is the workspace's usage report: totals, a daily
+message chart, which tools were run, and one row per member — including
+members who used nothing, which is usually why the page is open. Windows are
+7D/1M/3M/6M/12M; seat counts do not move with the window, only the usage
+below them. **Export** downloads the same per-member table as CSV and records
+an `analytics_exported` audit event. It reads `messages.meta->>'route'`, so
+the tool columns are what actually ran, not what was requested.
+
 ## Login protection
 
 - Argon2id password hashing (OWASP parameters), transparent re-hash on login
@@ -283,6 +333,12 @@ adds `workspaces`, `workspace_memberships`, `auth_sessions`,
 `user_preferences`. Existing conversations were already keyed by `user_id`
 and are untouched; the startup baseline gives every pre-existing user a
 membership automatically.
+
+Migration **V15** adds `auth_sessions.revoke_reason` (why a session ended —
+see above). Migration **V17** adds the two feature-access layers:
+`workspaces.feature_defaults` and `workspace_memberships.features`, both
+`jsonb NOT NULL DEFAULT '{}'`. Additive with defaults, so the previous
+release's statements keep working and a code rollback needs no schema change.
 
 ## Operational notes
 

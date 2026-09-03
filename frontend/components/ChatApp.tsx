@@ -39,6 +39,7 @@ import {
   savePrefs,
   type ChatPrefs,
 } from '@/lib/prefs';
+import { prefsForFeatures } from '@/lib/composerMenu';
 import {
   attachmentsForResend,
   resendOptionsFor,
@@ -149,6 +150,13 @@ export function ChatApp() {
   const [searchOpen, setSearchOpen] = useState(false);
   const [atBottom, setAtBottom] = useState(true);
   const [prefs, setPrefs] = useState<ChatPrefs>(DEFAULT_PREFS);
+  /**
+   * Which tools this account may use (orchestrator authn/features.py),
+   * resolved by the boot probe. Empty until it lands, which `featureOn`
+   * reads as "allowed" — the composer must not flicker its menu shorter for
+   * a second on every load.
+   */
+  const [features, setFeatures] = useState<Record<string, boolean>>({});
   /** Conversations the SERVER is still generating for (polled; survives reloads). */
   const [serverActive, setServerActive] = useState<string[]>([]);
   /** Bumped on every stream notification so sidebar spinners re-render. */
@@ -369,6 +377,14 @@ export function ChatApp() {
         settleReconcile();
         return;
       }
+      setFeatures(me.features);
+      // Prefs are sticky. A member whose Salesforce access was removed
+      // yesterday must not reopen the app in Salesforce mode with a trust
+      // footer promising a mode the server will not run (composerMenu).
+      setPrefs((current) => {
+        const corrected = prefsForFeatures(current, me.features);
+        return corrected === current ? current : corrected;
+      });
       let switchedAccount = false;
       if (store.setActiveUser(userScopeKey(me))) {
         // A DIFFERENT account signed in on this browser: its local data was
@@ -2099,6 +2115,7 @@ export function ChatApp() {
         <Composer
           ref={composerRef}
           streaming={streaming}
+          features={features}
           disabled={reconciling}
           // H-01: a dataset upload blocks a second send without pretending a
           // generation is running — that is what `streaming` would claim.

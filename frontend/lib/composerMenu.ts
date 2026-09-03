@@ -29,6 +29,21 @@ export interface ComposerMenuItem {
   disabled?: boolean;
 }
 
+/**
+ * Menu row → the feature that must be granted for it to appear
+ * (orchestrator authn/features.py). A row whose feature is off is not shown
+ * disabled but REMOVED: the menu reads as the capability list of this
+ * account, and an account without Salesforce should not be told, every time
+ * it opens the menu, about a tool it cannot have.
+ */
+export const MENU_ITEM_FEATURE: Record<ComposerMenuItemId, string> = {
+  files: 'attachments',
+  'web-search': 'web_search',
+  'deep-research': 'deep_research',
+  salesforce: 'salesforce',
+  'sf-live': 'salesforce_live',
+};
+
 export interface ComposerMenuState {
   salesforce: boolean;
   /** Live Salesforce sub-toggle (only shown while salesforce is on). */
@@ -38,6 +53,50 @@ export interface ComposerMenuState {
   /** True when the next send will run the iterative research loop. */
   deepResearchOn: boolean;
   streaming: boolean;
+  /**
+   * Resolved feature access from /auth/me. A MISSING key means allowed —
+   * an orchestrator that predates feature access sends none, and hiding
+   * tools it still honours would be the worse failure.
+   */
+  features?: Record<string, boolean>;
+}
+
+/** Is this tool granted? Absent = allowed (see ComposerMenuState.features). */
+export function featureOn(
+  features: Record<string, boolean> | undefined,
+  id: string,
+): boolean {
+  const value = features?.[id];
+  return typeof value === 'boolean' ? value : true;
+}
+
+/**
+ * Prefs corrected to what this account may actually use.
+ *
+ * Prefs are sticky (localStorage), so a member whose Salesforce access was
+ * removed yesterday would otherwise reopen the app in Salesforce mode: the
+ * pill would claim it, the trust footer would promise "nothing leaves this
+ * machine", and the server would quietly answer from the web instead. The
+ * footer must never describe a mode the request will not run in.
+ */
+export function prefsForFeatures(
+  prefs: ChatPrefs,
+  features: Record<string, boolean> | undefined,
+): ChatPrefs {
+  let next = prefs;
+  if (!featureOn(features, 'salesforce') && next.salesforce) {
+    next = { ...next, salesforce: false, sfLive: false };
+  }
+  if (!featureOn(features, 'salesforce_live') && next.sfLive) {
+    next = { ...next, sfLive: false };
+  }
+  if (!featureOn(features, 'web_search') && next.webSearch === 'on') {
+    next = { ...next, webSearch: 'auto' };
+  }
+  if (!featureOn(features, 'deep_research') && next.deepResearch) {
+    next = { ...next, deepResearch: false };
+  }
+  return next;
 }
 
 /**
@@ -58,7 +117,7 @@ export interface ComposerMenuState {
 export function composerMenuItems(
   state: ComposerMenuState,
 ): ComposerMenuItem[] {
-  return [
+  const rows: ComposerMenuItem[] = [
     {
       id: 'files',
       label: 'Add photos & files',
@@ -107,6 +166,9 @@ export function composerMenuItems(
       checked: state.salesforce && state.sfLive,
     },
   ];
+  return rows.filter((row) =>
+    featureOn(state.features, MENU_ITEM_FEATURE[row.id]),
+  );
 }
 
 export type ComposerMenuOutcome =

@@ -133,13 +133,18 @@ describe('admin proxy — JSON passthrough', () => {
 });
 
 describe('admin proxy — downloads', () => {
-  it('recognises exactly the two file endpoints', () => {
+  it('recognises exactly the file endpoints', () => {
     expect(
       isDownloadPath(['members', '7', 'uploads', 'u1', 'download'], 'GET'),
     ).toBe(true);
     expect(isDownloadPath(['members', '7', 'reports', 'q3.xlsx'], 'GET')).toBe(
       true,
     );
+    // The usage CSV: without this it arrives as a nameless blob, because
+    // proxyToOrchestrator relays content-type and nothing else.
+    expect(isDownloadPath(['analytics', 'export'], 'GET')).toBe(true);
+    expect(isDownloadPath(['analytics'], 'GET')).toBe(false);
+    expect(isDownloadPath(['analytics', 'export'], 'POST')).toBe(false);
     // Method and shape both matter.
     expect(isDownloadPath(['members', '7', 'reports', 'q3.xlsx'], 'POST')).toBe(
       false,

@@ -28,6 +28,7 @@ const ME: Me = {
     'sessions.manage',
     'audit.read',
   ],
+  features: {},
 };
 
 const MEMBERS = {

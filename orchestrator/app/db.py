@@ -927,6 +927,20 @@ ALTER TABLE web_claims ADD COLUMN IF NOT EXISTS quote text NOT NULL DEFAULT '';
 """
 
 
+_MIGRATION_V17 = """
+-- V17 (2026-09-03): per-member FEATURE access (app/authn/features.py) —
+-- which tools a person may use, as opposed to what they may administer.
+-- Two layers, both storing only the keys someone actually set, so a later
+-- change to a built-in default still reaches everyone who never overrode it:
+-- the workspace default an admin picks, and the per-member override.
+-- Additive with a DEFAULT, so the previous release's INSERTs keep working.
+ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS
+    feature_defaults jsonb NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE workspace_memberships ADD COLUMN IF NOT EXISTS
+    features jsonb NOT NULL DEFAULT '{}'::jsonb;
+"""
+
+
 _MIGRATIONS: tuple = (
     (1, _MIGRATION_V1),
     (2, _MIGRATION_V2),
@@ -944,6 +958,7 @@ _MIGRATIONS: tuple = (
     (14, _MIGRATION_V14),
     (15, _MIGRATION_V15),
     (16, _MIGRATION_V16),
+    (17, _MIGRATION_V17),
 )
 
 #: The version `init_schema` brings a database up to. Exported so callers (and

@@ -750,12 +750,58 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
     from . import facts, memory_semantic
     from .memory_recall import recall_block
 
-    signed_in = await db.run_in_thread(current_user, http_request)
+    from .authn.principal import current_principal
+
+    principal = await current_principal(http_request)
     # 2026-09-01: /chat is no longer auth-free. Everything downstream — the
     # conversation claim, memory, facts, report binding — assumes a real user.
-    if signed_in is None:
+    if principal is None:
         raise HTTPException(status_code=401, detail="Sign in required.")
+    signed_in = principal.as_user_row()
     viewer = int(signed_in["id"])
+
+    # FEATURE ACCESS (V17, authn/features.py). The composer only offers what
+    # this person may use, but the composer is not the gate: rewrite the
+    # request itself HERE, once, so every branch below — auto-search, the
+    # Salesforce router, Deep Research, the agent's web step — reads flags
+    # that already respect it. A blocked tool is downgraded with one status
+    # line, never a mid-conversation 403.
+    from .authn import features as feature_access
+
+    gate = feature_access.enforce_chat(
+        principal.features,
+        mode=request.mode,
+        web_search=request.web_search,
+        deep_research=request.deep_research,
+        sf_live=request.sf_live,
+    )
+    request.mode = gate.mode  # type: ignore[assignment]
+    request.web_search = gate.web_search  # type: ignore[assignment]
+    request.deep_research = gate.deep_research
+    request.sf_live = gate.sf_live
+    attachments_allowed = feature_access.allowed(
+        principal.features, feature_access.Feature.ATTACHMENTS
+    )
+    attachment_blocked = False
+    if not attachments_allowed and (
+        request.pdf_data
+        or request.pdf_uploads
+        or request.image_data
+        or request.images_data
+    ):
+        # The upload routes refuse first (that is where files actually land);
+        # this covers inline base64 and a tab left open since access changed.
+        # The BACKING fields are cleared — pdf_data/images_data are computed.
+        attachment_blocked = True
+        request.pdf = None
+        request.pdf_filename = None
+        request.pdf_uploads = None
+        request.images = None
+        request.image = None
+        request.image_base64 = None
+    access_notice = feature_access.blocked_notice(
+        [*gate.blocked, *(["Photos and files"] if attachment_blocked else [])]
+    )
 
     # Bare API calls (session_id only, no conversation row) used to share one
     # global key namespace: two callers sending session_id="default" read each
@@ -924,6 +970,11 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             str(signed_in.get("workspace_name") or ""),
         )
         try:
+            if access_notice:
+                # One line, before any work: the tool the composer offered is
+                # off for this account, and the answer that follows is the
+                # downgraded one. Said once per turn, never as an error.
+                await emit("status", {"text": access_notice})
             history = request.history_messages or memory.history(scoped_session)
             # Phase 1: decide whether to run web search (never for attachments).
             # AUTO-ORCHESTRATION (2026-07-28): with no Agent toggle in the UI,

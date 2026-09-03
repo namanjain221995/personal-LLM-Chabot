@@ -29,6 +29,7 @@ import {
   IconGrid,
   IconMail,
   IconShield,
+  IconSliders,
   IconUsers,
 } from '@/components/admin/icons';
 import { nav } from '@/components/admin/nav';
@@ -51,6 +52,9 @@ function navItems(me: Me): NavItem[] {
       label: 'Invitations',
       icon: <IconMail size={15} />,
     },
+    // Which TOOLS members may use. Visible to anyone who can read the member
+    // list; the page itself is read-only without settings.manage.
+    { href: '/admin/access', label: 'Access', icon: <IconSliders size={15} /> },
   ];
   if (can(me, 'audit.read')) {
     items.push({

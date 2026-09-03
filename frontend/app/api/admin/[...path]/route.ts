@@ -24,11 +24,17 @@ export const dynamic = 'force-dynamic';
 type Ctx = { params: Promise<{ path: string[] }> };
 
 /**
- * The file-returning endpoints: members/{id}/uploads/{uid}/download and
- * members/{id}/reports/{filename}. Everything else is JSON.
+ * The file-returning endpoints: members/{id}/uploads/{uid}/download,
+ * members/{id}/reports/{filename}, and the analytics CSV export.
+ * Everything else is JSON.
  */
 export function isDownloadPath(parts: string[], method: string): boolean {
   if (method !== 'GET') return false;
+  // usage-1m-20260903.csv, not a nameless blob rendered in the tab:
+  // proxyToOrchestrator relays content-type only.
+  if (parts.length === 2 && parts[0] === 'analytics' && parts[1] === 'export') {
+    return true;
+  }
   if (
     parts.length === 5 &&
     parts[0] === 'members' &&

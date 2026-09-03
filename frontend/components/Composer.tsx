@@ -178,6 +178,8 @@ interface ComposerProps {
   /** Draft text changes drive the meter's live estimate (debounced). */
   onDraftChange?: (text: string) => void;
   prefs: ChatPrefs;
+  /** Resolved tool access from /auth/me (orchestrator authn/features.py). */
+  features?: Record<string, boolean>;
   onPrefsChange: (next: ChatPrefs) => void;
   onSend: (
     text: string,
@@ -237,6 +239,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
       onDraftChange,
       prefs,
       onPrefsChange,
+      features,
       onSend,
       onStop,
       selectedContext,
@@ -808,6 +811,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
               <AttachMenu
                 prefs={prefs}
                 streaming={streaming}
+                features={features}
                 onPrefsChange={onPrefsChange}
                 onPickFiles={() => fileInputRef.current?.click()}
               />
