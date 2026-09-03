@@ -1,35 +1,19 @@
 /**
- * Pasted-content helpers (V5, 2026-07-23).
+ * Pasted-content helpers.
  *
- * When a user pastes a long block of text or code into the composer we don't
- * dump it into the textarea — we turn it into a compact "PASTED" attachment
- * chip (ChatGPT-style). The block is stored on the user message's `meta.pasted`
- * (so it round-trips through server history untouched) and folded back into the
- * text the model actually receives at request time.
+ * HISTORY. Between V5 (2026-07-23) and 2026-09-04 a long paste was swallowed
+ * out of the composer into a compact "PASTED" attachment chip. That is gone:
+ * text pasted into the composer now goes into the textarea, at any length
+ * (see components/Composer.tsx handlePaste). What remains here is the read
+ * side, which must keep working forever — turns SENT under the old behaviour
+ * carry their blocks on `meta.pasted`, so they still render as chips
+ * (MessageRow) and are still folded into the model-visible text when such a
+ * turn is resent or edited.
  *
  * Pure module — no React, no DOM — so it is unit-testable in isolation.
  */
 
 import type { PastedText } from './types';
-
-/** A paste becomes a chip past either threshold — matches ChatGPT's feel. */
-export const PASTE_MIN_CHARS = 1200;
-export const PASTE_MIN_LINES = 12;
-
-export function countLines(text: string): number {
-  if (!text) return 0;
-  return text.split('\n').length;
-}
-
-/** Should this pasted text become a chip instead of inline textarea content? */
-export function shouldAttachPaste(text: string): boolean {
-  if (!text) return false;
-  return text.length >= PASTE_MIN_CHARS || countLines(text) >= PASTE_MIN_LINES;
-}
-
-export function makePastedText(content: string, id: string): PastedText {
-  return { id, content, lines: countLines(content), chars: content.length };
-}
 
 /**
  * Combine a user message's pasted blocks with its typed text into the single

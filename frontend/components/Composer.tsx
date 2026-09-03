@@ -32,16 +32,11 @@ import {
   type SlashCommand,
 } from '@/lib/slashCommands';
 import { uploadDocumentFile, type DocumentRef } from '@/lib/uploadDocument';
-import {
-  imageExtFromMime,
-  makePastedText,
-  shouldAttachPaste,
-} from '@/lib/pasted';
-import type { PastedText, SelectedContext } from '@/lib/types';
+import { imageExtFromMime } from '@/lib/pasted';
+import type { SelectedContext } from '@/lib/types';
 import { activateComposerMenuItem, trustLine } from '@/lib/composerMenu';
 import { AttachMenu } from './AttachMenu';
 import { ModelPicker } from './ModelPicker';
-import { PastedChip } from './PastedChip';
 import { QuotedContext } from './QuotedContext';
 import { useToast } from './Providers';
 import {
@@ -185,7 +180,6 @@ interface ComposerProps {
     text: string,
     /** Up to MAX_IMAGES images, or exactly one PDF/dataset (2026-08-05). */
     attachments: Attachment[],
-    pasted: PastedText[],
     /** A slash command's decision for this send (2026-09-03). */
     options?: SendOptions,
   ) => void;
@@ -257,10 +251,8 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
     const [attachments, setAttachments] = useState<Attachment[]>([]);
     /** Files still being read/downscaled; a send must wait for them. */
     const [pendingAttach, setPendingAttach] = useState(0);
-    const [pastedTexts, setPastedTexts] = useState<PastedText[]>([]);
     const textareaRef = useRef<HTMLTextAreaElement>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
-    const pasteSeq = useRef(0);
     /** Armed by `prefill`; consumed by the effect that runs after `text` lands. */
     const caretToEnd = useRef(false);
     const { toast } = useToast();
@@ -325,9 +317,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
       ta.setSelectionRange(ta.value.length, ta.value.length);
     }, [text]);
 
-    const hasContent = Boolean(
-      text.trim() || attachments.length || pastedTexts.length,
-    );
+    const hasContent = Boolean(text.trim() || attachments.length);
 
     function submit() {
       let trimmed = text.trim();
@@ -335,8 +325,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
       // An attachment is still being prepared — sending now would post the
       // message without it.
       if (pendingAttach > 0) return;
-      if (!trimmed && attachments.length === 0 && pastedTexts.length === 0)
-        return;
+      if (!trimmed && attachments.length === 0) return;
       // A slash command sets the mode for THIS send (2026-09-03):
       // "/deep-research <question>" arms research, "/search" forces the
       // web, "/crawl <url>" becomes the crawler's trigger phrase. The
@@ -352,11 +341,10 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
         trimmed = out.text;
         options = { prefs: out.prefs };
       }
-      onSend(trimmed, attachments, pastedTexts, options);
+      onSend(trimmed, attachments, options);
       setText('');
       onDraftChange?.(''); // the draft is gone — drop it from the meter
       setAttachments([]);
-      setPastedTexts([]);
     }
 
     // The slash-command picker: rows for what is typed after "/".
@@ -582,29 +570,30 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
       }
     }
 
-    // Paste into the composer: an image blob becomes the attachment; a long
-    // block of text/code becomes a "PASTED" chip; short text pastes normally.
+    // Paste into the composer: an image blob becomes an attachment; TEXT is
+    // never intercepted.
+    //
+    // Until 2026-09-04 a paste over 1,200 characters or 12 lines was swallowed
+    // into a "PASTED" chip. Owner decision: text belongs in the box the user
+    // is typing in, whatever its length, so they can see it, edit it, and
+    // write around it. There is no size threshold here any more, and no cap on
+    // what may be pasted — the textarea takes the lot and grows to its ten-row
+    // maximum, then scrolls.
+    //
+    // History still renders chips: turns already stored with `meta.pasted`
+    // keep working (MessageRow), and their blocks are still folded into the
+    // model text on resend (lib/pasted foldModelContent).
     function handlePaste(e: ReactClipboardEvent<HTMLTextAreaElement>) {
       const dt = e.clipboardData;
       if (!dt) return;
       const imageItem = Array.from(dt.items).find(
         (it) => it.kind === 'file' && it.type.startsWith('image/'),
       );
-      if (imageItem) {
-        const file = imageItem.getAsFile();
-        if (file) {
-          e.preventDefault();
-          handleFile(file);
-          return;
-        }
-      }
-      const clip = dt.getData('text/plain');
-      if (clip && shouldAttachPaste(clip)) {
-        e.preventDefault();
-        pasteSeq.current += 1;
-        const id = `paste-${Date.now()}-${pasteSeq.current}`;
-        setPastedTexts((prev) => [...prev, makePastedText(clip, id)]);
-      }
+      if (!imageItem) return; // plain text: let the browser insert it
+      const file = imageItem.getAsFile();
+      if (!file) return;
+      e.preventDefault();
+      handleFile(file);
     }
 
     // The bottom padding clears the home indicator on a phone. `max()` rather
@@ -629,7 +618,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
               />
             </div>
           )}
-          {(attachments.length > 0 || pastedTexts.length > 0) && (
+          {attachments.length > 0 && (
             <div className="mb-2 flex flex-wrap items-start gap-2">
               {attachments.map((attachment, idx) => (
                 <div
@@ -669,15 +658,6 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
                     <IconX size={13} />
                   </button>
                 </div>
-              ))}
-              {pastedTexts.map((p) => (
-                <PastedChip
-                  key={p.id}
-                  pasted={p}
-                  onRemove={() =>
-                    setPastedTexts((prev) => prev.filter((x) => x.id !== p.id))
-                  }
-                />
               ))}
             </div>
           )}

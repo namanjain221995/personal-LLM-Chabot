@@ -103,6 +103,10 @@ export type DataRow = Record<string, unknown>;
  * V5 (2026-07-23): a block of long text/code pasted into the composer, shown
  * as a "PASTED" chip. Stored on a user message's `meta.pasted` so it survives
  * server history, and folded into the model input at request time.
+ *
+ * No longer WRITTEN since 2026-09-04 — a paste stays in the textarea — but
+ * every turn sent before then still carries these, so they are read, rendered
+ * and folded exactly as they always were.
  */
 export interface PastedText {
   id: string;
@@ -222,7 +226,7 @@ export interface Meta {
   reasoning?: string;
   /** V2 §4d: client-measured "Thought for N s". */
   reasoning_seconds?: number;
-  /** V5: long text/code the user pasted as chips on a user message. */
+  /** V5: long text/code pasted as chips. Historic turns only since 2026-09-04. */
   pasted?: PastedText[];
   /**
    * 2026-09-03: the excerpt this turn is replying to. Rendered as a quote

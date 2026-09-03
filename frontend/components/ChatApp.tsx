@@ -104,7 +104,6 @@ import { isCompacting, requestCompact } from '@/lib/compact';
 import type {
   ChatMessage,
   ConversationSummary,
-  PastedText,
   SelectedContext,
 } from '@/lib/types';
 import type { SelectionCandidate } from '@/lib/selectedContext';
@@ -772,7 +771,6 @@ export function ChatApp() {
     (
       text: string,
       attachments: Attachment[],
-      pasted: PastedText[],
       clarification?: ClarificationResponse | null,
       options?: SendOptions,
     ) => {
@@ -813,8 +811,7 @@ export function ChatApp() {
       const images = attachments.filter((a) => a.kind === 'image');
       let conversationId = activeId;
       if (!conversationId) {
-        const title =
-          text || (pasted.length ? 'Pasted text' : '') || first?.name || '';
+        const title = text || first?.name || '';
         const conv = getHistoryStore().create(title);
         conversationId = conv.id;
         setActiveId(conv.id);
@@ -840,20 +837,19 @@ export function ChatApp() {
           images.length > 1 ? images.map((i) => i.dataUrl) : undefined,
         // V8: a PDF attachment shows a chip (filename) in the bubble.
         pdfName: isPdf || isDataset ? first?.name : undefined,
-        // V5: pasted blocks ride on meta so they round-trip through server
-        // history and are folded into the model input at request time.
-        // 2026-08-21: attachments ride the same way, so the file card can be
+        // 2026-08-21: attachments ride on meta, so the file card can be
         // rendered by any browser from server history — pdfName alone never
-        // left this browser's cache.
+        // left this browser's cache. (`meta.pasted` rode here the same way
+        // until 2026-09-04, when the composer stopped turning a long paste
+        // into a chip; turns already stored with it still render and still
+        // fold — this is only the write side.)
         meta: metaWithBranch(
-          pasted.length || isPdf || isDataset || quoted
+          isPdf || isDataset || quoted
             ? {
                 route: 'chat',
-                ...(pasted.length ? { pasted } : {}),
-                // Rides on meta exactly as `pasted` does: round-trips through
-                // server history, renders from history in any browser, and is
-                // folded into the model text at request time (lib/streams.ts)
-                // rather than being written into `content`.
+                // Round-trips through server history, renders from history in
+                // any browser, and is folded into the model text at request
+                // time (lib/streams.ts) rather than written into `content`.
                 ...(quoted ? { selected_context: quoted } : {}),
                 ...(isPdf || isDataset
                   ? {
@@ -1109,7 +1105,7 @@ export function ChatApp() {
       markClarificationSubmitted(response.client_message_id);
       setSubmittingClarificationId(response.clarification_id);
       setCustomAnswerFor(null);
-      send(summary, [], [], response);
+      send(summary, [], response);
     },
     [send],
   );
@@ -1155,12 +1151,7 @@ export function ChatApp() {
    * "last 90 days" means exactly that.
    */
   const sendFromComposer = useCallback(
-    (
-      text: string,
-      attachments: Attachment[],
-      pasted: PastedText[],
-      options?: SendOptions,
-    ) => {
+    (text: string, attachments: Attachment[], options?: SendOptions) => {
       const armed = customAnswerRef.current;
       if (armed && text.trim() && attachments.length === 0) {
         const response = buildResponse(armed, { customText: text });
@@ -1168,11 +1159,11 @@ export function ChatApp() {
           markClarificationSubmitted(response.client_message_id);
           setSubmittingClarificationId(response.clarification_id);
           setCustomAnswerFor(null);
-          send(text, [], pasted, response);
+          send(text, [], response);
           return;
         }
       }
-      send(text, attachments, pasted, undefined, options);
+      send(text, attachments, undefined, options);
     },
     [send],
   );
@@ -2177,7 +2168,7 @@ export function ChatApp() {
             }) ? (
               <SalesforceStarterCard
                 options={starterOptions}
-                onPick={(prompt) => void send(prompt, [], [])}
+                onPick={(prompt) => void send(prompt, [])}
                 onUseComposer={() => composerRef.current?.focus()}
               />
             ) : null

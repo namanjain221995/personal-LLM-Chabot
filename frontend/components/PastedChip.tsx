@@ -1,9 +1,14 @@
 'use client';
 
 /**
- * "PASTED" attachment chip (V5) — a compact card standing in for a long block
- * of pasted text/code, like ChatGPT's. Click to expand a read-only preview;
- * the composer variant adds a remove button. Purely presentational.
+ * "PASTED" chip (V5) — a compact card standing in for a long block of pasted
+ * text/code. Click to expand a read-only preview. Purely presentational.
+ *
+ * HISTORY ONLY since 2026-09-04. The composer no longer makes these: a paste
+ * goes into the textarea whatever its length. This still renders because
+ * turns SENT before that date carry their blocks on `meta.pasted`, and a
+ * conversation must not lose its content because the input changed. The
+ * `onRemove` arm is what the composer used; nothing passes it now.
  */
 
 import { useState } from 'react';

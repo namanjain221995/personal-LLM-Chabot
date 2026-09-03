@@ -1,46 +1,21 @@
 import { describe, expect, it } from 'vitest';
-import {
-  PASTE_MIN_CHARS,
-  PASTE_MIN_LINES,
-  countLines,
-  foldModelContent,
-  imageExtFromMime,
-  makePastedText,
-  shouldAttachPaste,
-} from '../lib/pasted';
+import { foldModelContent, imageExtFromMime } from '../lib/pasted';
 import type { PastedText } from '../lib/types';
 
-describe('shouldAttachPaste', () => {
-  it('leaves short single-line text inline', () => {
-    expect(shouldAttachPaste('hello world')).toBe(false);
-    expect(shouldAttachPaste('')).toBe(false);
-  });
-
-  it('chips text past the character threshold', () => {
-    expect(shouldAttachPaste('x'.repeat(PASTE_MIN_CHARS))).toBe(true);
-    expect(shouldAttachPaste('x'.repeat(PASTE_MIN_CHARS - 1))).toBe(false);
-  });
-
-  it('chips text past the line threshold even when short', () => {
-    const many = Array.from({ length: PASTE_MIN_LINES }, () => 'a').join('\n');
-    expect(shouldAttachPaste(many)).toBe(true);
-    const few = Array.from({ length: PASTE_MIN_LINES - 1 }, () => 'a').join(
-      '\n',
-    );
-    expect(shouldAttachPaste(few)).toBe(false);
-  });
-});
-
-describe('makePastedText', () => {
-  it('records line and char counts', () => {
-    const p = makePastedText('a\nb\nc', 'p1');
-    expect(p).toEqual({ id: 'p1', content: 'a\nb\nc', lines: 3, chars: 5 });
-    expect(countLines('')).toBe(0);
-  });
-});
+/**
+ * The composer no longer turns a long paste into a chip (2026-09-04) — that
+ * lives in tests/paste-inline.test.tsx now. What is left here is the READ
+ * side, which outlives the feature: every turn sent before that date still
+ * carries `meta.pasted`, and its blocks must still reach the model.
+ */
 
 describe('foldModelContent', () => {
-  const p = (content: string, id = 'x'): PastedText => makePastedText(content, id);
+  const p = (content: string, id = 'x'): PastedText => ({
+    id,
+    content,
+    lines: content.split('\n').length,
+    chars: content.length,
+  });
 
   it('returns typed content unchanged with no pasted blocks', () => {
     expect(foldModelContent('hi', undefined)).toBe('hi');

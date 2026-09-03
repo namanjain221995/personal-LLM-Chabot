@@ -65,10 +65,9 @@ describe('slash commands', () => {
       fireEvent.keyDown(box, { key: 'Enter' });
     });
     expect(onSend).toHaveBeenCalledTimes(1);
-    const [text, attachments, pasted, options] = onSend.mock.calls[0];
+    const [text, attachments, options] = onSend.mock.calls[0];
     expect(text).toBe('who leads Acme now?');
     expect(attachments).toEqual([]);
-    expect(pasted).toEqual([]);
     expect(options?.prefs?.deepResearch).toBe(true);
     expect(options?.prefs?.salesforce).toBe(false);
     expect(box.value).toBe('');
@@ -103,6 +102,6 @@ describe('slash commands', () => {
     act(() => {
       fireEvent.keyDown(box, { key: 'Enter' });
     });
-    expect(onSend).toHaveBeenCalledWith('hello there', [], [], undefined);
+    expect(onSend).toHaveBeenCalledWith('hello there', [], undefined);
   });
 });
