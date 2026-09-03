@@ -64,10 +64,12 @@
      token so the product accent — buttons, chips, focus rings, the meter —
      keeps the exact values the blue migration landed on.
 
-     .26 over #000 lands on ~#0a1a3d: unmistakably a highlight, while white
-     body text still reads at 17:1 against it. Anything near .5 turns the run
-     into a solid blue block and starts eating the glyphs. */
-  --ts-selection: rgba(37, 99, 235, 0.26);
+     Raised .26 → .36 (owner, 2026-09-03: still too faint to pick out). .36
+     over #000 lands on ~#0d2455 — perceptually half again as separated from
+     the page as .26 was (ΔL* 15.5 vs 10.1) — while white body text still
+     reads at 15:1 against it. Anything near .5 turns the run into a solid
+     blue block and starts eating the glyphs. */
+  --ts-selection: rgba(37, 99, 235, 0.36);
   --ts-danger: #ef5a5f;
   --ts-danger-rgb: 239 90 95; /* channels of --ts-danger — keep in sync */
   --ts-danger-soft: rgba(229, 72, 77, 0.14);
@@ -162,9 +164,10 @@ html.light,
   --ts-accent-strong: #2563eb;
   --ts-accent-soft: rgba(37, 99, 235, 0.12);
   /* Paper needs LESS alpha than black for the same apparent strength: the
-     tint darkens here instead of lightening. .20 over #fff is ~#d3e0fb, and
-     #0d0d0d on it still reads at 15:1. */
-  --ts-selection: rgba(37, 99, 235, 0.2);
+     tint darkens here instead of lightening. Raised .20 → .30 alongside the
+     dark theme: .30 over #fff is ~#bed0f9 (ΔL* 16.6 vs 11.0), and #0d0d0d on
+     it still reads at 12.6:1. */
+  --ts-selection: rgba(37, 99, 235, 0.3);
   --ts-danger: #c62a30;
   --ts-danger-rgb: 198 42 48; /* channels of --ts-danger — keep in sync */
   --ts-danger-soft: rgba(198, 42, 48, 0.1);

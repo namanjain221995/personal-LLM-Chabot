@@ -404,8 +404,16 @@ describe('SELECT-COLOR · the text-selection highlight', () => {
     return `#${mixed.map((c) => c.toString(16).padStart(2, '0')).join('')}`;
   }
 
-  /** The tint the ::selection rule resolved to before this change. */
+  /**
+   * Where the highlight has been.
+   *
+   * `soft` is the accent tint ::selection borrowed until 2026-09-03; `weak` is
+   * the first dedicated --ts-selection, which the owner still found too faint
+   * to pick a run of text out of the page. Both are floors: the highlight may
+   * only ever get stronger than either.
+   */
   const PREVIOUS_ALPHA = { dark: 0.14, light: 0.12 };
+  const WEAK_ALPHA = { dark: 0.26, light: 0.2 };
 
   it('SELECT-COLOR-01 · ::selection paints from --ts-selection, and it is blue', () => {
     const rule = CSS.slice(CSS.indexOf('::selection {'));
@@ -425,7 +433,24 @@ describe('SELECT-COLOR · the text-selection highlight', () => {
     expect(rgba(LIGHT['--ts-selection']).alpha).toBeGreaterThan(PREVIOUS_ALPHA.light);
   });
 
-  it('SELECT-COLOR-03 · the product accent tokens are untouched by it', () => {
+  it('SELECTION-STYLE-02 · and stronger again than the first dedicated value', () => {
+    // Raised a second time on 2026-09-03: .26 / .20 were still too quiet to
+    // pick a selected run out of the page at a glance.
+    expect(rgba(DARK['--ts-selection']).alpha).toBeGreaterThan(WEAK_ALPHA.dark);
+    expect(rgba(LIGHT['--ts-selection']).alpha).toBeGreaterThan(WEAK_ALPHA.light);
+  });
+
+  it('SELECTION-STYLE-01 · the highlight has a token of its very own', () => {
+    // The whole point of --ts-selection: strengthening the highlight must be
+    // reachable WITHOUT touching a token any button, ring or chip reads.
+    for (const { name, tokens } of THEMES) {
+      expect(tokens['--ts-selection'], `${name} has no selection token`).toBeTruthy();
+    }
+    const rule = CSS.slice(CSS.indexOf('::selection {'));
+    expect(rule.slice(0, rule.indexOf('}'))).toContain('var(--ts-selection)');
+  });
+
+  it('SELECT-COLOR-03 / SELECTION-STYLE-03 · the product accent tokens are untouched by it', () => {
     // A selection-specific token exists precisely so that making the
     // highlight stronger cannot darken buttons, chips, focus rings or the
     // meter. --ts-accent-soft keeps the exact values the blue migration set.

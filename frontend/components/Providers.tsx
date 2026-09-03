@@ -150,13 +150,25 @@ export function Providers({ children }: { children: ReactNode }) {
         {/* Top-center, ChatGPT-style (owner request 2026-08-05). Bottom-center
             hid them behind the composer and its attachment chips.
 
-            Errors wear the SAME neutral surface as everything else since
-            2026-09-03 (owner request): the red pill read as an alarm over a
-            message like "re-attach the file", and the app's danger red is for
-            destructive actions and inline failures, not for a passing note.
-            What separates an error is now its marker and its semantics —
-            `role="alert"` on the row, so a screen reader still hears it as
-            one — rather than a colour. */}
+            Errors stopped being a red pill on 2026-09-03 — the app's danger
+            red is for destructive actions and inline failures, not for a
+            passing note — but the neutral surface that replaced it was too
+            quiet to notice, so the SAME day they became a high-contrast light
+            card (owner request).
+
+            `paper`/`navy` rather than `surface`/`ink` on purpose: those two
+            are brand constants declared once in :root and never re-declared
+            per theme, so the error card stays near-white with near-black text
+            in BOTH themes. That is the point — in dark mode it is a bright
+            card against a black page (19.7:1), which is what makes it
+            impossible to miss. In light mode it would otherwise disappear
+            into the page (1.06:1), so its border and a heavier shadow are
+            what separate it there. Text on it reads at 15.9:1 either way.
+
+            Info toasts are untouched: they keep the themed neutral surface,
+            because a routine "Uploaded 4 documents." is not an alarm. And a
+            colour change is all this is — `role="alert"` still carries the
+            semantics, so a screen reader hears an error as one regardless. */}
         <div
           aria-live="polite"
           role="status"
@@ -167,10 +179,17 @@ export function Providers({ children }: { children: ReactNode }) {
               key={t.id}
               role={t.tone === 'error' ? 'alert' : undefined}
               data-tone={t.tone}
-              className="pointer-events-auto rounded-full border border-border bg-surface px-4 py-2 text-sm text-ink shadow-lg"
+              className={`pointer-events-auto rounded-full border px-4 py-2 text-sm ${
+                t.tone === 'error'
+                  ? 'border-black/15 bg-paper text-navy shadow-xl'
+                  : 'border-border bg-surface text-ink shadow-lg'
+              }`}
             >
               {t.tone === 'error' && (
-                <span aria-hidden className="mr-2 font-semibold text-muted">
+                // Inherits the card's near-black ink. It used to be
+                // `text-muted`, which flips with the theme and would sit at
+                // #b3b3b3 on this now-always-light card.
+                <span aria-hidden className="mr-2 font-semibold">
                   !
                 </span>
               )}

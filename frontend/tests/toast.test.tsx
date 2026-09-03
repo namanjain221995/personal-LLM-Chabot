@@ -141,25 +141,67 @@ describe('TOAST-DEDUPE', () => {
 });
 
 describe('TOAST-STYLE', () => {
-  it('01/02 · an error toast wears the neutral surface, not the danger red', () => {
+  it('ERROR-TOAST-01/02/04 · a light card with near-black text, and no danger red', () => {
+    // Neutral was quiet enough to miss (owner, 2026-09-03). `paper`/`navy`
+    // rather than `surface`/`ink`: those two are declared once in :root and
+    // never re-declared per theme, so this card stays light-with-dark-text in
+    // BOTH themes rather than following the page into the dark.
     renderToasts();
     act(() => click('fail A'));
     const el = alerts()[0];
-    expect(el.className).toContain('bg-surface');
-    expect(el.className).toContain('border-border');
-    expect(el.className).toContain('text-ink');
+    expect(el.className).toContain('bg-paper');
+    expect(el.className).toContain('text-navy');
     expect(el.className).not.toMatch(/bg-danger|text-danger|border-danger/);
+    expect(el.className).not.toContain('bg-surface');
   });
 
-  it('03/04 · text tokens are the page\'s own ink, readable in both themes by construction', () => {
-    // text-ink / bg-surface are the theme tokens every other panel uses; the
-    // contrast of that pair is already pinned per theme in accent-palette.
+  it('ERROR-TOAST-03 · it carries a border and a heavier shadow than an info toast', () => {
+    // In light mode a near-white card on a white page is 1.06:1 — the border
+    // and the elevation are the only things separating it from the page.
+    renderToasts();
+    act(() => {
+      click('fail A');
+      click('info A');
+    });
+    const error = alerts()[0];
+    expect(error.className).toMatch(/border-black\/\d+/);
+    expect(error.className).toContain('shadow-xl');
+    const info = document.querySelector('[data-tone="info"]') as HTMLElement;
+    expect(info.className).toContain('shadow-lg');
+    expect(info.className).not.toContain('shadow-xl');
+  });
+
+  it('ERROR-TOAST-09 · the info toast keeps the themed neutral surface', () => {
+    // A routine "Uploaded 4 documents." is not an alarm and was not asked to
+    // change; only the error treatment did.
+    renderToasts();
+    act(() => click('info A'));
+    const info = document.querySelector('[data-tone="info"]') as HTMLElement;
+    expect(info.className).toContain('bg-surface');
+    expect(info.className).toContain('border-border');
+    expect(info.className).toContain('text-ink');
+    expect(info.className).not.toContain('bg-paper');
+  });
+
+  it('the tokens the error card uses do not flip with the theme', () => {
+    // The claim above, checked against the stylesheet rather than assumed:
+    // --ts-paper and --ts-navy must be declared exactly once, in :root.
+    const css = readFileSync(join(process.cwd(), 'app/globals.css'), 'utf8');
+    expect(css.match(/--ts-paper:/g)).toHaveLength(1);
+    expect(css.match(/--ts-navy:/g)).toHaveLength(1);
+  });
+
+  it('ERROR-TOAST-02 · the marker inherits the card ink instead of the muted token', () => {
+    // It used to be `text-muted`, which flips with the theme and would sit at
+    // #b3b3b3 on this now-always-light card.
     renderToasts();
     act(() => click('fail A'));
-    expect(alerts()[0].className).toContain('text-ink');
+    const marker = alerts()[0].querySelector('span[aria-hidden]') as HTMLElement;
+    expect(marker.textContent).toBe('!');
+    expect(marker.className).not.toContain('text-muted');
   });
 
-  it('05 · an error is still announced as one', () => {
+  it('ERROR-TOAST-05 · an error is still announced as one', () => {
     renderToasts();
     act(() => {
       click('fail A');
@@ -171,7 +213,7 @@ describe('TOAST-STYLE', () => {
     expect(screen.getByRole('status').getAttribute('aria-live')).toBe('polite');
   });
 
-  it('06 · danger styling outside the toast is untouched', () => {
+  it('ERROR-TOAST-06 · danger styling outside the toast is untouched', () => {
     const composer = readFileSync(
       join(process.cwd(), 'components/Composer.tsx'),
       'utf8',
