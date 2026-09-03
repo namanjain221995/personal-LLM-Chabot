@@ -104,6 +104,19 @@ the bottleneck, not the GPU: the defaults moved to 8 slots (4 reserved) and
 a 1 s Fast wait (2 s Think), invisible next to the model's queue at that
 load. The embedding service never queued (query LRU + bounded batches).
 
+Second deployment (8 slots, 4 reserved, 1 s Fast wait), same harness:
+
+| concurrency | wall | TTFT p50 / p95 | total p50 / p95 | decisions | reranker queue peak |
+|---|---|---|---|---|---|
+| 10 | 18.1 s | 6.4 / 7.0 s | 12.8 / 18.1 s | local 4, topical 6 — all judged | 26 |
+| 25 | 34.6 s | 12.3 / 14.1 s | 19.6 / 27.6 s | local 7, topical 2, model 3, stale 6, **degraded_busy 7** | 78 |
+
+Degraded answers at 25 fell from 16 to 7; TTFT is unchanged because it is
+the main model's queue. The reranker service itself (78 sequences waiting)
+is the next bound: under sustained bursts above ~20 the right move is to
+shrink the judged set (12 → 6 passages) when `rerank_inflight` is at the
+cap, not to widen the app-side bound further.
+
 Modelled beyond 25: the main model's prefill is the limit. Each Fast turn
 carries ~1–1.5k tokens of grounding on top of the prompt; at the measured
 ~12 s p50 TTFT for 25 simultaneous arrivals, 50 → ~25 s, 100 → ~50 s,
