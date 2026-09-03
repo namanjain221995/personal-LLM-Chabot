@@ -113,3 +113,73 @@ export const IconSliders = ({ size, className }: IconProps) => (
     <circle cx="16" cy="18" r="2" />
   </svg>
 );
+
+// --- Analytics console (2026-09-04) -----------------------------------------
+
+export const IconChart = ({ size, className }: IconProps) => (
+  <svg {...base(size, className)}>
+    <path d="M3 3v16a2 2 0 0 0 2 2h16" />
+    <path d="M7 15l4-5 3 3 4-6" />
+  </svg>
+);
+
+export const IconTrophy = ({ size, className }: IconProps) => (
+  <svg {...base(size, className)}>
+    <path d="M8 21h8" />
+    <path d="M12 17v4" />
+    <path d="M7 4h10v5a5 5 0 0 1-10 0V4Z" />
+    <path d="M17 5h3v2a3 3 0 0 1-3 3" />
+    <path d="M7 5H4v2a3 3 0 0 0 3 3" />
+  </svg>
+);
+
+export const IconMessages = ({ size, className }: IconProps) => (
+  <svg {...base(size, className)}>
+    <path d="M21 11.5a8.4 8.4 0 0 1-9 8.4 9 9 0 0 1-3.9-.9L3 21l1.9-4.6A8.4 8.4 0 0 1 4 11.5 8.5 8.5 0 0 1 12.5 3 8.4 8.4 0 0 1 21 11.5Z" />
+  </svg>
+);
+
+export const IconFlask = ({ size, className }: IconProps) => (
+  <svg {...base(size, className)}>
+    <path d="M10 3h4" />
+    <path d="M10 3v6.5L4.6 18A2 2 0 0 0 6.3 21h11.4a2 2 0 0 0 1.7-3L14 9.5V3" />
+    <path d="M7 15h10" />
+  </svg>
+);
+
+export const IconWorld = ({ size, className }: IconProps) => (
+  <svg {...base(size, className)}>
+    <circle cx="12" cy="12" r="9" />
+    <path d="M3 12h18" />
+    <path d="M12 3a15 15 0 0 1 0 18a15 15 0 0 1 0-18Z" />
+  </svg>
+);
+
+export const IconCloudCog = ({ size, className }: IconProps) => (
+  <svg {...base(size, className)}>
+    <path d="M17.5 19H7a4.5 4.5 0 1 1 .9-8.9A6 6 0 0 1 19 11.4a4 4 0 0 1-1.5 7.6Z" />
+  </svg>
+);
+
+export const IconCpu = ({ size, className }: IconProps) => (
+  <svg {...base(size, className)}>
+    <rect x="6" y="6" width="12" height="12" rx="2" />
+    <path d="M10 10h4v4h-4z" />
+    <path d="M9 2v3M15 2v3M9 19v3M15 19v3M2 9h3M2 15h3M19 9h3M19 15h3" />
+  </svg>
+);
+
+export const IconGauge = ({ size, className }: IconProps) => (
+  <svg {...base(size, className)}>
+    <path d="M4 18a9 9 0 1 1 16 0" />
+    <path d="M12 15l4-4" />
+  </svg>
+);
+
+export const IconServer = ({ size, className }: IconProps) => (
+  <svg {...base(size, className)}>
+    <rect x="3" y="4" width="18" height="7" rx="2" />
+    <rect x="3" y="13" width="18" height="7" rx="2" />
+    <path d="M7 8h.01M7 17h.01" />
+  </svg>
+);

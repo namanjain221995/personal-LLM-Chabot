@@ -26,11 +26,20 @@ import {
 } from '@/components/admin/api';
 import {
   IconArrowLeft,
+  IconChart,
+  IconCloudCog,
+  IconCpu,
+  IconFlask,
+  IconGauge,
   IconGrid,
   IconMail,
+  IconMessages,
+  IconServer,
   IconShield,
   IconSliders,
+  IconTrophy,
   IconUsers,
+  IconWorld,
 } from '@/components/admin/icons';
 import { nav } from '@/components/admin/nav';
 import { ErrorPanel } from '@/components/admin/ui';
@@ -43,27 +52,122 @@ interface NavItem {
   exact?: boolean;
 }
 
-function navItems(me: Me): NavItem[] {
-  const items: NavItem[] = [
-    { href: '/admin', label: 'Overview', icon: <IconGrid size={15} />, exact: true },
-    { href: '/admin/members', label: 'Members', icon: <IconUsers size={15} /> },
+interface NavGroup {
+  /** Rendered as the small caps rule above the group. Omitted for the first. */
+  title?: string;
+  items: NavItem[];
+}
+
+/**
+ * The rail's shape.
+ *
+ * Grouped since the console arrived (2026-09-04): fourteen flat links is a
+ * list to read, where five labelled groups is a structure to scan. Groups
+ * appear only when their capability does — the analytics and infrastructure
+ * sections are ANALYTICS_READ, which rbac.py gives to super admins alone, and
+ * the pages behind them 404 for everyone else regardless of what is drawn
+ * here.
+ */
+function navGroups(me: Me): NavGroup[] {
+  const groups: NavGroup[] = [
     {
-      href: '/admin/invitations',
-      label: 'Invitations',
-      icon: <IconMail size={15} />,
+      items: [
+        { href: '/admin', label: 'Overview', icon: <IconGrid size={15} />, exact: true },
+      ],
     },
-    // Which TOOLS members may use. Visible to anyone who can read the member
-    // list; the page itself is read-only without settings.manage.
-    { href: '/admin/access', label: 'Access', icon: <IconSliders size={15} /> },
+    {
+      title: 'Access',
+      items: [
+        { href: '/admin/members', label: 'Members', icon: <IconUsers size={15} /> },
+        {
+          href: '/admin/invitations',
+          label: 'Invitations',
+          icon: <IconMail size={15} />,
+        },
+        // Which TOOLS members may use. Visible to anyone who can read the
+        // member list; the page is read-only without settings.manage.
+        { href: '/admin/access', label: 'Tool access', icon: <IconSliders size={15} /> },
+      ],
+    },
   ];
+  if (can(me, 'analytics.read')) {
+    groups.push(
+      {
+        title: 'Analytics',
+        items: [
+          {
+            href: '/admin/analytics',
+            label: 'Usage',
+            icon: <IconChart size={15} />,
+            exact: true,
+          },
+          {
+            href: '/admin/analytics/leaderboards',
+            label: 'Leaderboards',
+            icon: <IconTrophy size={15} />,
+          },
+          {
+            href: '/admin/analytics/chat',
+            label: 'Chat',
+            icon: <IconMessages size={15} />,
+          },
+          {
+            href: '/admin/analytics/research',
+            label: 'Deep research',
+            icon: <IconFlask size={15} />,
+          },
+          {
+            href: '/admin/analytics/search',
+            label: 'Web search',
+            icon: <IconWorld size={15} />,
+          },
+          {
+            href: '/admin/analytics/salesforce',
+            label: 'Salesforce',
+            icon: <IconCloudCog size={15} />,
+          },
+          {
+            href: '/admin/analytics/models',
+            label: 'Models',
+            icon: <IconCpu size={15} />,
+          },
+          {
+            href: '/admin/analytics/performance',
+            label: 'Performance',
+            icon: <IconGauge size={15} />,
+          },
+        ],
+      },
+      {
+        title: 'Infrastructure',
+        items: [
+          {
+            href: '/admin/analytics/nodes',
+            label: 'Nodes',
+            icon: <IconServer size={15} />,
+          },
+          {
+            href: '/admin/analytics/gpu',
+            label: 'GPU',
+            icon: <IconCpu size={15} />,
+          },
+        ],
+      },
+    );
+  }
   if (can(me, 'audit.read')) {
-    items.push({
-      href: '/admin/audit',
-      label: 'Audit Log',
-      icon: <IconShield size={15} />,
+    groups.push({
+      title: 'Security',
+      items: [
+        {
+          href: '/admin/audit',
+          label: 'Audit Log',
+          icon: <IconShield size={15} />,
+        },
+      ],
     });
   }
-  return items;
+  return groups;
 }
 
 export default function AdminLayout({ children }: { children: ReactNode }) {
@@ -128,9 +232,14 @@ export default function AdminLayout({ children }: { children: ReactNode }) {
     );
   }
 
-  const items = navItems(me);
+  const groups = navGroups(me);
+  const items = groups.flatMap((g) => g.items);
   const isActive = (item: NavItem) =>
     item.exact ? pathname === item.href : pathname.startsWith(item.href);
+  // The console's charts and its leaderboard rail need width the settings
+  // pages do not: 1180px is right for a roster, and cramped for a page with a
+  // 336px rail beside a time series.
+  const wide = pathname.startsWith('/admin/analytics');
   // One height for every nav row (36px), one icon box (18px), so the labels
   // form a single column whatever the glyph inside each icon looks like.
   const rowClass = (active: boolean) =>
@@ -159,19 +268,33 @@ export default function AdminLayout({ children }: { children: ReactNode }) {
             {me.workspace.name}
           </p>
 
-          <nav className="mt-1 min-h-0 flex-1 space-y-0.5 overflow-y-auto px-2">
-            {items.map((item) => (
-              <Link
-                key={item.href}
-                href={item.href}
-                aria-current={isActive(item) ? 'page' : undefined}
-                className={rowClass(isActive(item))}
-              >
-                <span aria-hidden className="flex w-[18px] shrink-0 justify-center">
-                  {item.icon}
-                </span>
-                {item.label}
-              </Link>
+          <nav className="mt-1 min-h-0 flex-1 overflow-y-auto px-2 pb-2">
+            {groups.map((group, i) => (
+              <div key={group.title ?? 'general'} className={i === 0 ? '' : 'mt-4'}>
+                {group.title && (
+                  <p className="px-2.5 pb-1.5 text-[11px] font-medium uppercase tracking-[0.06em] text-faint">
+                    {group.title}
+                  </p>
+                )}
+                <div className="space-y-0.5">
+                  {group.items.map((item) => (
+                    <Link
+                      key={item.href}
+                      href={item.href}
+                      aria-current={isActive(item) ? 'page' : undefined}
+                      className={rowClass(isActive(item))}
+                    >
+                      <span
+                        aria-hidden
+                        className="flex w-[18px] shrink-0 justify-center"
+                      >
+                        {item.icon}
+                      </span>
+                      {item.label}
+                    </Link>
+                  ))}
+                </div>
+              </div>
             ))}
           </nav>
 
@@ -210,7 +333,11 @@ export default function AdminLayout({ children }: { children: ReactNode }) {
           </header>
 
           <main className="min-h-0 flex-1 overflow-y-auto">
-            <div className="mx-auto w-full max-w-admin px-4 py-6 md:px-8 md:py-10">
+            <div
+              className={`mx-auto w-full px-4 py-6 md:px-8 md:py-10 ${
+                wide ? 'max-w-[1560px]' : 'max-w-admin'
+              }`}
+            >
               {children}
             </div>
           </main>
