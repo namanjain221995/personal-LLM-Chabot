@@ -44,7 +44,12 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence
 
-sys.path.insert(0, "/app")
+import os  # noqa: E402
+
+# APP_ROOT lets a candidate tree be scored against the live stores before it
+# is deployed: `docker cp orchestrator/app <container>:/tmp/newapp/app` then
+# `APP_ROOT=/tmp/newapp python -m tools.rag_eval run …`.
+sys.path.insert(0, os.environ.get("APP_ROOT", "/app"))
 
 from app import db, web_index, web_memory  # noqa: E402
 from app.freshness import Freshness  # noqa: E402

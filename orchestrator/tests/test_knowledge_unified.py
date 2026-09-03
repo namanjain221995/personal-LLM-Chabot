@@ -138,6 +138,79 @@ def test_a_member_shared_page_cannot_retire_anything():
     assert old in kept and not superseded
 
 
+class _V:
+    def __init__(self, requirement, reason, volatile=False):
+        self.requirement, self.reason, self.volatile = requirement, reason, volatile
+
+
+def test_supersession_runs_only_for_replaceable_facts():
+    """Measured on the eval set: with supersession on for every RECENT
+    question, 13 of 60 gold pages (each judged answering at 1.0) were retired
+    by newer pages that merely related. It runs for office holders, live
+    values, explicit current/latest asks and router-confirmed questions —
+    not for the ambiguous default."""
+    old = _ev("https://a.example/old", "The holder is A.", fetched_days=200, published_days=200, answer=0.95)
+    new = _ev("https://b.example/new", "The holder is B.", fetched_days=1, published_days=1, answer=0.95)
+    assert web_memory.supersession_allowed(Freshness.RECENT, _V(Freshness.RECENT, "lexical:office"))
+    assert web_memory.supersession_allowed(Freshness.RECENT, _V(Freshness.RECENT, "default", volatile=True))
+    assert not web_memory.supersession_allowed(Freshness.RECENT, _V(Freshness.RECENT, "default"))
+    assert not web_memory.supersession_allowed(Freshness.STATIC, _V(Freshness.STATIC, "lexical:static"))
+    kept, superseded, _ = _partition([new, old], Freshness.RECENT, verdict=_V(Freshness.RECENT, "default"))
+    assert old in kept and not superseded
+    kept, superseded, _ = _partition([new, old], Freshness.RECENT, verdict=_V(Freshness.RECENT, "lexical:office"))
+    assert kept == [new] and superseded == [old]
+
+
+def test_a_merely_relevant_newer_page_cannot_retire_a_strongly_answering_one():
+    old = _ev("https://a.example/old", "Jane Roe is the holder.", fetched_days=200, published_days=200, answer=1.0)
+    related = _ev("https://b.example/about", "About the organisation and its offices.", fetched_days=1, published_days=1, answer=0.4)
+    kept, superseded, _ = _partition([related, old], Freshness.RECENT, verdict=_V(Freshness.RECENT, "lexical:office"))
+    assert old in kept and not superseded
+
+
+def test_sibling_pages_that_differ_in_the_asked_term_are_not_collapsed():
+    """Release notes for 3.14.4 and 3.14.5 share almost every sentence; a
+    question about 3.14.4 must keep the 3.14.4 page."""
+    # Forty DISTINCT sentences: a repeated sentence would fingerprint to a
+    # handful of shingles and the differing tail would dominate them.
+    # No digits in the body: the question's version terms ("3", "14", "4")
+    # must occur ONLY in the tails, or both pages carry every term.
+    body = " ".join(
+        f"Section {a}{b} describes a change to the interpreter, the standard library module {a}{b}lib and its tests."
+        for a in "abcde"
+        for b in "fghijklm"
+    )
+    a = _ev("https://py.example/3.14.4", body + " Version 3.14.4 was released on 1 June.")
+    b = _ev("https://py.example/3.14.5", body + " Version 3.14.5 was released on 1 July.")
+    a.score, b.score = 0.5, 0.6
+    kept = web_memory._collapse_duplicates([b, a], "what is the release date of python 3.14.4")
+    assert a in kept and b in kept
+    # With no distinguishing question term they ARE one item.
+    assert len(web_memory._collapse_duplicates([b, a], "python release notes")) == 1
+
+
+def test_the_judged_set_includes_the_top_of_each_half(monkeypatch):
+    """Recency weighting pushed a ten-year-old page that dense retrieval
+    ranked first below the reranker cut; the top of each half is always
+    judged."""
+    monkeypatch.setattr(settings, "knowledge_rerank_candidates", 3)
+    ranked = [_ev(f"https://x.example/{i}", f"page {i}", dense=0.1, lexical=0.1) for i in range(6)]
+    for i, e in enumerate(ranked):
+        e.score = 0.9 - i * 0.1
+    ranked.append(_ev("https://old.example/gold", "gold", dense=0.95, lexical=0.05))
+    ranked[-1].score = 0.05
+    judged = {}
+
+    async def fake(query, docs, **kw):
+        judged["n"] = len(docs)
+        return [0.99 if "gold" in d else 0.01 for d in docs]
+
+    monkeypatch.setattr(rerank, "score", fake)
+    out, degraded = run(web_memory._answerability("q", ranked, level=Freshness.RECENT, effort="fast"))
+    assert not degraded and judged["n"] >= 4
+    assert out[0].url == "https://old.example/gold"
+
+
 def test_year_only_dates_count_as_undated():
     jan1 = _now().replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
     e = Evidence(url="https://x.example/p", title="x", text="x", domain="x.example", authority=40,

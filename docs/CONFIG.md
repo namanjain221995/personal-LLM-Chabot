@@ -165,8 +165,8 @@ start (a change = orchestrator recreate).
 
 | variable | default | meaning |
 |---|---|---|
-| `RERANK_MAX_INFLIGHT` / `RERANK_RESERVED_SLOTS` | 4 / 2 | concurrent scoring calls; slots reserved for the knowledge pipeline's stage 1 |
-| `RERANK_WAIT_S` / `RERANK_WAIT_FAST_S` / `RERANK_WAIT_THINK_S` | 1.5 / 0.25 / 1.0 | how long a bulk caller / Fast stage 1 / Think stage 1 waits for a slot before keeping its own order |
+| `RERANK_MAX_INFLIGHT` / `RERANK_RESERVED_SLOTS` | 8 / 4 | concurrent scoring calls; slots reserved for the knowledge pipeline's stage 1 |
+| `RERANK_WAIT_S` / `RERANK_WAIT_FAST_S` / `RERANK_WAIT_THINK_S` | 1.5 / 1.0 / 2.0 | how long a bulk caller / Fast stage 1 / Think stage 1 waits for a slot before keeping its own order |
 | `RERANK_STAGE_TIMEOUT_S` | 2.0 | per-call deadline for stage 1 |
 | `RERANK_CANARY_ENABLED` / `RERANK_BREAKER_S` | true / 300 | a fixed query/answer/non-answer triple is scored at first use and each worker cycle; a wrong answer disables the reranker for this long |
 | `EMBED_TIMEOUT_S` / `EMBED_BATCH_TIMEOUT_S` | 4 / 90 | read timeouts for query embeddings / index batches |

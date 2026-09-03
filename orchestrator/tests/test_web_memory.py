@@ -192,7 +192,7 @@ def test_memory_sources_consult_the_store_for_fresh_intent_too(monkeypatch):
     monkeypatch.setattr(settings, "web_memory_enabled", True)
     seen = {}
 
-    async def fake(question, *, level, top_k):
+    async def fake(question, *, level, top_k, **kw):
         seen["level"] = level
         r = web_memory.Retrieval(query=question, freshness=level)
         r.evidence = [
@@ -214,7 +214,7 @@ def test_memory_sources_append_dated_and_deduped(monkeypatch):
     monkeypatch.setattr(settings, "web_memory_enabled", True)
     live = [search._Source(n=1, title="Live", url="https://a.example/x", text="t")]
 
-    async def fake(question, *, level, top_k):
+    async def fake(question, *, level, top_k, **kw):
         r = web_memory.Retrieval(query=question, freshness=level)
         r.evidence = [
             _evidence("https://a.example/x", "Dup", "dup", fetched="2026-08-29"),

@@ -550,7 +550,31 @@ def _site_of(url: str) -> str:
         return domain_of(url)
 
 
-def _partition(evidence: List[Evidence], level: Freshness) -> Tuple[List[Evidence], List[Evidence], bool]:
+def supersession_allowed(level: Freshness, verdict: Optional[Any]) -> bool:
+    """May an older answering passage be retired by a newer one AT ALL?
+
+    Only for questions whose answer is the kind that gets REPLACED: an office
+    holder, a live value, an explicitly current/latest/volatile ask, one the
+    router judged time-sensitive, or one anchored to a present-day year. For
+    the ambiguous default ("what did release X change?", "how many flights
+    did Y fly?") the newest page is not "newer information about the same
+    fact" — measured on the eval set (2026-09-03), that rule retired 13 of
+    60 gold pages, each judged as answering with probability 1.0, in favour
+    of newer pages that were merely relevant.
+    """
+    if level is Freshness.STATIC:
+        return False
+    if verdict is None:
+        return True  # direct callers and tests: the level alone decides
+    if getattr(verdict, "requirement", None) is Freshness.REALTIME or getattr(verdict, "volatile", False):
+        return True
+    reason = str(getattr(verdict, "reason", "") or "")
+    return reason.startswith(("lexical:office", "lexical:realtime", "lexical:recent", "router", "year:"))
+
+
+def _partition(
+    evidence: List[Evidence], level: Freshness, verdict: Optional[Any] = None
+) -> Tuple[List[Evidence], List[Evidence], bool]:
     """(kept, superseded, conflict).
 
     For a live fact, evidence far older than the best evidence is DROPPED
@@ -558,11 +582,12 @@ def _partition(evidence: List[Evidence], level: Freshness) -> Tuple[List[Evidenc
     model prefers the newer one is how "here are two names, one from 2025 and
     one from 2026" becomes a confidently wrong answer.
     """
-    if not evidence or level is Freshness.STATIC:
+    if not evidence or not supersession_allowed(level, verdict):
         return evidence, [], False
 
     ages = {id(e): e.effective_age_seconds for e in evidence}
     gap = _SUPERSEDE_GAP_DAYS * 86400
+    strong = _answer_threshold()
 
     def _retires(newer: Evidence, older: Evidence) -> bool:
         """May `newer` retire `older` as out of date?
@@ -581,6 +606,15 @@ def _partition(evidence: List[Evidence], level: Freshness) -> Tuple[List[Evidenc
         """
         if not (newer.relevant and older.relevant):
             return False
+        if newer.scored or older.scored:
+            # Judged passages: both must ANSWER, not merely relate. "Newer
+            # information about the same fact" needs a newer page that states
+            # the fact — a page about the same entity that scores 0.3 is not
+            # a reason to discard one that scores 1.0.
+            if not (newer.scored and older.scored):
+                return False
+            if newer.answer < strong or older.answer < strong:
+                return False
         if older.dated and not newer.dated:
             return False
         if newer.origin == "share":
@@ -723,6 +757,7 @@ async def retrieve(
     top_k: int = 5,
     use_cache: bool = True,
     effort: str = "fast",
+    verdict: Optional[Any] = None,
 ) -> Retrieval:
     """Best local evidence for `query`, ranked for the freshness it needs.
 
@@ -859,10 +894,17 @@ async def retrieve(
         key=lambda e: e.score,
         reverse=True,
     )
-    ranked = _collapse_duplicates(ranked)
+    ranked = _collapse_duplicates(ranked, query)
     if settings.knowledge_rerank:
         ranked, out.degraded = await _answerability(query, ranked, level=level, effort=effort)
-    kept, superseded, conflict = _partition(ranked, level)
+    if verdict is None:
+        # The freshness verdict's REASON decides whether supersession may run
+        # at all (see supersession_allowed); a caller that has one passes it,
+        # every other caller gets the same deterministic classification.
+        from .freshness import classify_offline
+
+        verdict = classify_offline(query, now_year=_now().year)
+    kept, superseded, conflict = _partition(ranked, level, verdict=verdict)
 
     out.evidence = kept[:top_k]
     out.superseded = superseded[:3]
@@ -894,20 +936,30 @@ def _rerank_text(ev: Evidence) -> str:
     return f"{title}\n{body}" if title else body
 
 
-def _collapse_duplicates(ranked: List[Evidence]) -> List[Evidence]:
+def _collapse_duplicates(ranked: List[Evidence], query: str = "") -> List[Evidence]:
     """One evidence item per distinct text: mirrors (www./in.), syndicated
     copies and crawl duplicates otherwise count as corroboration and as
-    "two domains" for the conflict rule."""
+    "two domains" for the conflict rule.
+
+    Two passages that are near-duplicates by fingerprint but carry DIFFERENT
+    question terms are not copies of each other: sibling release notes
+    (3.14.4 vs 3.14.5) share almost every sentence and differ in exactly the
+    term the question asks about. Measured (2026-09-03): the fingerprint alone
+    collapsed the asked-for release into its sibling."""
     from .core.provenance import near_duplicate, shingles
 
+    # Raw tokens, not stems: the distinguishing term is often a single digit
+    # ("3.14.4" vs "3.14.5"), which the stemmer's length filter drops.
+    wanted = {w for w in _WORD.findall((query or "").lower()) if w not in _STOP}
     kept: List[Evidence] = []
-    prints: List[frozenset] = []
+    prints: List[Tuple[frozenset, frozenset]] = []
     for ev in ranked:
         fp = shingles(ev.text)
-        if fp and any(near_duplicate(fp, other) for other in prints):
+        hits = frozenset(wanted & set(_WORD.findall((ev.text or "").lower()))) if wanted else frozenset()
+        if fp and any(near_duplicate(fp, other) and hits == other_hits for other, other_hits in prints):
             continue
         kept.append(ev)
-        prints.append(fp)
+        prints.append((fp, hits))
     return kept
 
 
@@ -952,7 +1004,18 @@ async def _answerability(
         n = min(8, max(1, int(settings.knowledge_rerank_candidates)))
     else:
         n = max(1, int(settings.knowledge_rerank_candidates))
-    head, tail = ranked[:n], ranked[n:]
+    # The judged set is the top of the BLEND plus the top of EACH HALF. The
+    # blend weights recency for a time-sensitive question, which pushed a
+    # ten-year-old page that dense retrieval ranked first below the cut —
+    # unjudged, unranked, lost (measured on the eval set, 2026-09-03).
+    head = list(ranked[:n])
+    seen = {id(e) for e in head}
+    for key in ("dense", "lexical"):
+        for e in sorted(ranked, key=lambda x: getattr(x, key), reverse=True)[:4]:
+            if id(e) not in seen and getattr(e, key) > 0:
+                head.append(e)
+                seen.add(id(e))
+    tail = [e for e in ranked if id(e) not in seen]
     if not head:
         return ranked, ""
     wait = (

@@ -217,7 +217,9 @@ async def prepare(
         return out
 
     started = time.perf_counter()
-    result = await retrieve(question, level=verdict.requirement, top_k=5, effort=effort)
+    result = await retrieve(
+        question, level=verdict.requirement, top_k=5, effort=effort, verdict=verdict
+    )
     metrics.web_memory_query(
         hit=result.found,
         fresh=result.found and result.newest_age <= verdict.max_age_seconds,
@@ -423,5 +425,10 @@ async def _fast_lookup(
     # fetched page is judged on authority and recency like any other —
     # bypassing the evidence cache, which still holds the pre-fetch result.
     return await retrieve(
-        question, level=verdict.requirement, top_k=5, use_cache=False, effort="fast"
+        question,
+        level=verdict.requirement,
+        top_k=5,
+        use_cache=False,
+        effort="fast",
+        verdict=verdict,
     )

@@ -774,10 +774,10 @@ async def _memory_sources(
         from ..freshness import classify_offline
         from .. import web_memory
 
-        level = classify_offline(
-            message, now_year=datetime.now(timezone.utc).year
-        ).requirement
-        result = await web_memory.retrieve(message, level=level, top_k=budget * 2)
+        verdict = classify_offline(message, now_year=datetime.now(timezone.utc).year)
+        result = await web_memory.retrieve(
+            message, level=verdict.requirement, top_k=budget * 2, verdict=verdict
+        )
     except Exception:  # noqa: BLE001
         return sources
     have = {_normalize_url(s.url) for s in sources}

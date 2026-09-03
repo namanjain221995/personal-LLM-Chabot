@@ -169,15 +169,21 @@ class Settings:
         # ADR-0001 D13). The reranker container serves `concurrency=4`; more
         # in-flight scoring calls than that only queue there. A caller waits
         # at most RERANK_WAIT_S for a slot, then keeps its own order.
-        self.rerank_max_inflight: int = _int("RERANK_MAX_INFLIGHT", 4)
+        # Load-tested 2026-09-03 (25 concurrent Fast questions): with 4 slots
+        # and a 0.25 s wait, 16 of 25 answers went unjudged ("degraded_busy")
+        # while the main model's own prefill queue put the first token 12 s
+        # out anyway. The reranker is a 0.6B model that batches sequences;
+        # 8 in flight and a one-second wait keep every answer judged at that
+        # load for a cost nobody can see.
+        self.rerank_max_inflight: int = _int("RERANK_MAX_INFLIGHT", 8)
         self.rerank_wait_s: float = _float("RERANK_WAIT_S", 1.5)
-        # The knowledge pipeline's own, shorter waits (a Fast answer must not
-        # queue behind a Think search's 48-candidate rerank) and its per-call
-        # deadline. Two of the in-flight slots are reserved for it.
-        self.rerank_wait_fast_s: float = _float("RERANK_WAIT_FAST_S", 0.25)
-        self.rerank_wait_think_s: float = _float("RERANK_WAIT_THINK_S", 1.0)
+        # The knowledge pipeline's own waits (a Fast answer must not queue
+        # behind a Think search's 48-candidate rerank) and its per-call
+        # deadline. Half of the in-flight slots are reserved for it.
+        self.rerank_wait_fast_s: float = _float("RERANK_WAIT_FAST_S", 1.0)
+        self.rerank_wait_think_s: float = _float("RERANK_WAIT_THINK_S", 2.0)
         self.rerank_stage_timeout_s: float = _float("RERANK_STAGE_TIMEOUT_S", 2.0)
-        self.rerank_reserved_slots: int = _int("RERANK_RESERVED_SLOTS", 2)
+        self.rerank_reserved_slots: int = _int("RERANK_RESERVED_SLOTS", 4)
         # A healthy-looking reranker can still return garbage (a wrong
         # served model, a broken template). A fixed canary triple is scored
         # at first use and every worker cycle; a failure trips a breaker so
