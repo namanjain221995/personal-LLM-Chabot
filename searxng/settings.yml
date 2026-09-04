@@ -51,6 +51,24 @@ engines:
   # itself the way startpage (3600s) does (logged 2026-08-30 post-restart).
   - name: duckduckgo
     disabled: true
+  # Inherited from SearXNG's defaults and NEVER answers from this host.
+  # Measured 2026-09-04 over eight varied queries: google cse 0/8,
+  # startpage 0/8, brave 1/8 — and because a dead engine is waited on rather
+  # than skipped, the three of them cost 533 ms of the 1.57 s a search took:
+  # 34% of every query, spent waiting for nothing.
+  #
+  # DISABLED, NOT REMOVED. `remove` looks tidier and takes the whole instance
+  # down: other engines declare `network: brave` and SearXNG resolves those
+  # names at boot, so removing brave raises KeyError('brave') in
+  # network.initialize and every worker exits. A disabled engine keeps its
+  # network registered and is simply never queried, which is the part that
+  # costs time.
+  - name: google cse
+    disabled: true
+  - name: startpage
+    disabled: true
+  - name: brave
+    disabled: true
   - name: bing
     disabled: false
   # Qwant CAPTCHAs this host and raises suspended_time=0, so SearXNG never
@@ -60,8 +78,13 @@ engines:
     disabled: true
   - name: yahoo
     disabled: false
+  # Noise, measured 2026-09-04. For "who is the CEO of OpenAI" mwmbl returned
+  # SEVENTY-SIX results led by openai.com/blog/openai-gym-beta (2016), an
+  # OpenAIRE guidelines page and a Hustle piece about Uber scooters. Volume of
+  # the wrong kind is not supply: every one of those competes for a slot in
+  # the candidate pool the reranker then has to sift.
   - name: mwmbl
-    disabled: false
+    disabled: true
   - name: wikipedia
     disabled: false
   - name: github
@@ -93,10 +116,20 @@ engines:
     disabled: false
   - name: yandex
     disabled: false
+  # Both index by DESIGN the part of the web this workspace never asks about.
+  # Same probe, same query: searchmysite returned ten personal blogs, wiby
+  # returned a blog collection, a transhumanism site and
+  # philosophicalanthropology.net. Neither has any path to answering "who is
+  # the CEO of OpenAI" — they are indexes of personal and old-style sites.
+  #
+  # They stay in the file rather than being removed because the 2026-08-30
+  # note above is still true: engine supply IS the ceiling, and if the four
+  # general engines are ever all suspended at once these are the fallback to
+  # turn back on. Today all four answer 8/8, so the pool does not need them.
   - name: searchmysite
-    disabled: false
+    disabled: true
   - name: wiby
-    disabled: false
+    disabled: true
 
 # Upstreams occasionally drop HTTP/2 streams mid-response, which httpx surfaces
 # as RemoteProtocolError("Server disconnected") and costs that engine's whole
@@ -105,6 +138,14 @@ engines:
 outgoing:
   enable_http2: false
   retries: 1
+  # NO request_timeout override here, and that is a decision, not an omission.
+  # A 3.0 s cap was tried on 2026-09-04 and made things measurably worse: bing
+  # went from answering 8/8 queries to timing out on 8/8, and every search
+  # pinned to exactly 3.06 s — the cap became the cost. Measured per engine
+  # afterwards, bing is the FASTEST of them at 335 ms mean (arxiv 584,
+  # duckduckgo 781, yandex 825, yahoo 999, github 1145), so nothing here is
+  # slow enough to need cutting off. SearXNG's own default budget already
+  # bounds the tail; a second cap on top of it only removed good results.
   # Wikimedia's user-agent policy REJECTS a UA with no contact: query.wikidata.org
   # answered 403 "Please respect our user-agent policy" to the default
   # "SearXNG/2026.7.30", and 200 to the same request with a contact appended
