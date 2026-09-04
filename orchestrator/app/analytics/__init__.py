@@ -16,6 +16,8 @@ WHERE THE NUMBERS COME FROM.
   research_runs  Deep Research runs, outcome, duration, sources
   web_searches   searches, providers, results, the domains behind them
   sf_intents     Salesforce planning activity
+  voice_transcriptions  dictation: clip length, the wait, the language
+                 heard, and how the attempt ended (V19)
 
 NOTHING IS ESTIMATED. A count nobody made comes back NULL and the console
 says so. That rule is why `usage_events.input_tokens` is nullable and why
@@ -688,6 +690,169 @@ def salesforce_series(
                  ORDER BY g.t""",
             (since, until, workspace_id, since, until),
         ).fetchall()
+
+
+# ---------------------------------------------------------------------------
+# Voice dictation
+# ---------------------------------------------------------------------------
+
+
+def voice_totals(
+    workspace_id: str, since: datetime, until: datetime
+) -> Dict[str, Any]:
+    """Dictation over one window: how much was said, how long people waited
+    for the words to come back, and how each attempt ended.
+
+    Durations are summed and averaged WITHOUT coalesce. A clip whose length
+    the browser never reported is not a clip of zero seconds, and a window
+    nobody dictated in has no average to report — both come back NULL so the
+    console can say so instead of printing a confident zero.
+
+    The counts are the opposite case and are safe to read as numbers: a
+    status nobody produced happened zero times. `processing_ms` is measured
+    on failures too, because the wait before a 503 is still a wait somebody
+    sat through.
+
+    Scoped through `workspace_memberships`: the table records who spoke, not
+    which workspace they spoke in, exactly like research runs and searches.
+    """
+    with db.connection() as con:
+        row = con.execute(
+            """SELECT count(*)                                         AS transcriptions,
+                      count(DISTINCT v.user_id)                        AS users,
+                      count(*) FILTER (WHERE v.status = 'ok')          AS ok,
+                      count(*) FILTER (WHERE v.status = 'busy')        AS busy,
+                      count(*) FILTER (WHERE v.status = 'rejected')    AS rejected,
+                      count(*) FILTER (WHERE v.status = 'unavailable') AS unavailable,
+                      count(*) FILTER (WHERE v.status = 'error')       AS error,
+                      count(*) FILTER (WHERE v.degraded)               AS degraded,
+                      count(*) FILTER (WHERE v.language IS NOT NULL)   AS language_identified,
+                      count(DISTINCT v.language)                       AS languages,
+                      sum(v.duration_ms)                               AS duration_ms,
+                      avg(v.duration_ms)                               AS avg_duration_ms,
+                      percentile_disc(0.95) WITHIN GROUP (ORDER BY v.duration_ms)
+                          AS p95_duration_ms,
+                      avg(v.processing_ms)                             AS avg_processing_ms,
+                      percentile_disc(0.95) WITHIN GROUP (ORDER BY v.processing_ms)
+                          AS p95_processing_ms
+                 FROM voice_transcriptions v
+                 JOIN workspace_memberships wm ON wm.user_id = v.user_id
+                WHERE wm.workspace_id = %s
+                  AND v.created_at >= %s AND v.created_at < %s""",
+            (workspace_id, since, until),
+        ).fetchone()
+    return dict(row or {})
+
+
+def voice_series(
+    workspace_id: str, since: datetime, until: datetime, bucket: str = "day"
+) -> List[Dict[str, Any]]:
+    """Dictation per bucket, split by outcome.
+
+    `failed` is every status that is not 'ok' — busy, rejected, unavailable
+    and error together. They are told apart by `voice_totals`; on a trend
+    line the only question is whether the person got their words back.
+    """
+    trunc_unit = "hour" if bucket == "hour" else "day"
+    step = _series_gap(bucket)
+    with db.connection() as con:
+        return con.execute(
+            f"""SELECT g.t AS bucket,
+                       coalesce(s.transcriptions, 0) AS transcriptions,
+                       coalesce(s.ok, 0)             AS ok,
+                       coalesce(s.failed, 0)         AS failed
+                  FROM generate_series(
+                          date_trunc('{trunc_unit}', %s::timestamptz),
+                          date_trunc('{trunc_unit}', %s::timestamptz - interval '1 microsecond'),
+                          interval '{step}') g(t)
+                  LEFT JOIN (
+                      SELECT date_trunc('{trunc_unit}', v.created_at) AS t,
+                             count(*) AS transcriptions,
+                             count(*) FILTER (WHERE v.status = 'ok')  AS ok,
+                             count(*) FILTER (WHERE v.status <> 'ok') AS failed
+                        FROM voice_transcriptions v
+                        JOIN workspace_memberships wm ON wm.user_id = v.user_id
+                       WHERE wm.workspace_id = %s
+                         AND v.created_at >= %s AND v.created_at < %s
+                       GROUP BY 1
+                  ) s ON s.t = g.t
+                 ORDER BY g.t""",
+            (since, until, workspace_id, since, until),
+        ).fetchall()
+
+
+def voice_languages(
+    workspace_id: str, since: datetime, until: datetime, limit: int = 12
+) -> List[Dict[str, Any]]:
+    """The languages the model actually heard, ranked.
+
+    Only rows where identification survived: `language` is NULL when the
+    engine did not name one, and an "unknown" bar built out of those would
+    be a count of the parser's silence, not of a language anybody spoke.
+    How many clips were identified at all is reported by `voice_totals`, so
+    the share below always has an honest denominator.
+    """
+    with db.connection() as con:
+        return con.execute(
+            """SELECT v.language,
+                      count(*)                  AS transcriptions,
+                      count(DISTINCT v.user_id) AS users
+                 FROM voice_transcriptions v
+                 JOIN workspace_memberships wm ON wm.user_id = v.user_id
+                WHERE wm.workspace_id = %s
+                  AND v.created_at >= %s AND v.created_at < %s
+                  AND v.language IS NOT NULL
+                GROUP BY 1 ORDER BY transcriptions DESC, v.language LIMIT %s""",
+            (workspace_id, since, until, limit),
+        ).fetchall()
+
+
+def voice_top_users(
+    workspace_id: str, since: datetime, until: datetime, limit: int = 10
+) -> List[Dict[str, Any]]:
+    """Who dictates, ranked by how often.
+
+    Joined FROM the transcriptions rather than from the roster, unlike
+    `leaderboard`: "who has not tried voice" is the whole member list, which
+    is a list this page has no reason to draw.
+    """
+    with db.connection() as con:
+        return con.execute(
+            """SELECT u.id, u.display_name, u.username, u.email, u.status,
+                      wm.role, u.last_active_at,
+                      count(*)                                AS transcriptions,
+                      count(*) FILTER (WHERE v.status = 'ok') AS ok,
+                      sum(v.duration_ms)                      AS duration_ms
+                 FROM voice_transcriptions v
+                 JOIN users u ON u.id = v.user_id
+                 JOIN workspace_memberships wm
+                      ON wm.user_id = u.id AND wm.workspace_id = %s
+                WHERE v.created_at >= %s AND v.created_at < %s
+                GROUP BY u.id, u.display_name, u.username, u.email, u.status,
+                         wm.role, u.last_active_at
+                ORDER BY transcriptions DESC,
+                         lower(coalesce(u.display_name, u.username))
+                LIMIT %s""",
+            (workspace_id, since, until, limit),
+        ).fetchall()
+
+
+def voice_coverage(workspace_id: str) -> Dict[str, Any]:
+    """Dictation over ALL time, so the page can tell the two empty states
+    apart: a deployment where nobody has ever pressed the microphone reads
+    very differently from a quiet fortnight, and only one of them is worth
+    explaining to the reader."""
+    with db.connection() as con:
+        row = con.execute(
+            """SELECT min(v.created_at) AS first_transcription,
+                      max(v.created_at) AS last_transcription,
+                      count(*)          AS transcriptions
+                 FROM voice_transcriptions v
+                 JOIN workspace_memberships wm ON wm.user_id = v.user_id
+                WHERE wm.workspace_id = %s""",
+            (workspace_id,),
+        ).fetchone()
+    return dict(row or {})
 
 
 def top_users(

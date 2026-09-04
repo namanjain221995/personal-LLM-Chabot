@@ -36,6 +36,9 @@ import { imageExtFromMime } from '@/lib/pasted';
 import type { SelectedContext } from '@/lib/types';
 import { activateComposerMenuItem, trustLine } from '@/lib/composerMenu';
 import { AttachMenu } from './AttachMenu';
+import { VoiceBar } from './VoiceBar';
+import { useVoiceRecorder } from './useVoiceRecorder';
+import { mergeTranscript } from '@/lib/voice';
 import { ModelPicker } from './ModelPicker';
 import { QuotedContext } from './QuotedContext';
 import { useToast } from './Providers';
@@ -44,6 +47,7 @@ import {
   IconCloud,
   IconFileText,
   IconGlobe,
+  IconMic,
   IconSend,
   IconSparkles,
   IconStop,
@@ -58,6 +62,13 @@ const MAX_IMAGES = 5;
 const MAX_DOCS = 5;
 const LINE_HEIGHT = 24;
 const MAX_ROWS = 10;
+/**
+ * The dictation ceiling, ten minutes. Composer dictation, not transcription
+ * of a meeting: the server enforces the same number (ASR_MAX_AUDIO_SECONDS),
+ * and the recorder stops ITSELF at it so the person sees a finished recording
+ * rather than an upload that gets refused.
+ */
+const VOICE_MAX_MS = 10 * 60 * 1000;
 
 /** A draft attachment's composer-local identity. See Attachment.clientId. */
 function newClientId(): string {
@@ -280,6 +291,39 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
     const caretToEnd = useRef(false);
     const { toast } = useToast();
 
+    // Voice dictation (2026-09-04). The transcript is merged into whatever is
+    // already in the box and NEVER sent: it is a draft the person edits, the
+    // same as if they had typed it. `voiceAllowed` is the feature gate — the
+    // orchestrator refuses regardless, this only avoids offering a button
+    // that cannot work.
+    const voiceAllowed = features?.voice_input !== false;
+    const voice = useVoiceRecorder({
+      maxMs: VOICE_MAX_MS,
+      onTranscript: (transcript) => {
+        setText((prev) => {
+          const next = mergeTranscript(prev, transcript);
+          onDraftChange?.(next);
+          return next;
+        });
+        // Same handoff `prefill` uses: the textarea is controlled, so the
+        // caret has to move after the new text has actually landed.
+        caretToEnd.current = true;
+      },
+    });
+    const voiceActive =
+      voice.state === 'requesting' ||
+      voice.state === 'recording' ||
+      voice.state === 'transcribing';
+
+    // One place to surface a recording failure, so it reads like every other
+    // error in the app rather than inventing a second error surface inside
+    // the composer.
+    useEffect(() => {
+      if (voice.state !== 'error' || !voice.error) return;
+      toast(voice.error.message, 'error');
+      voice.dismissError();
+    }, [voice, toast]);
+
     useImperativeHandle(ref, () => ({
       focus: () => textareaRef.current?.focus(),
       /**
@@ -348,6 +392,10 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
       // An attachment is still being prepared — sending now would post the
       // message without it.
       if (pendingAttach > 0) return;
+      // A recording is in flight. Sending now would post the message WITHOUT
+      // the words being spoken into it, which is the one outcome dictation
+      // must never produce. Same guard, same line, as the attachment above.
+      if (voiceActive) return;
       if (!trimmed && attachments.length === 0) return;
       // A slash command sets the mode for THIS send (2026-09-03):
       // "/deep-research <question>" arms research, "/search" forces the
@@ -813,6 +861,23 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
               style={{ height: 24 }}
             />
 
+            {/* RECORDING IS A MODE. While it is on the controls row is
+                REPLACED — the model picker and the attachment button cannot
+                do anything useful mid-recording, and leaving them there
+                invites a click that silently does nothing. The bar keeps the
+                same height, so entering and leaving moves nothing. The
+                textarea above stays mounted and keeps its draft: the whole
+                point is that the transcript joins what is already typed. */}
+            {voiceActive ? (
+              <VoiceBar
+                state={voice.state as 'requesting' | 'recording' | 'transcribing'}
+                levels={voice.levels}
+                elapsedMs={voice.elapsedMs}
+                maxMs={VOICE_MAX_MS}
+                onCancel={voice.cancel}
+                onStop={voice.stop}
+              />
+            ) : (
             <div className="mt-1 flex flex-wrap items-center gap-1.5">
               <input
                 ref={fileInputRef}
@@ -954,6 +1019,22 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
                   status line, so it is automatic, not hidden. */}
 
               <span className="ml-auto flex items-center gap-1.5">
+                {/* Dictation. Between the tools and the send button, which is
+                    where a thumb already is, and hidden entirely when the
+                    browser cannot record or the account may not — an offered
+                    control that always fails is worse than no control. */}
+                {voiceAllowed && voice.supported && (
+                  <button
+                    type="button"
+                    onClick={voice.start}
+                    disabled={disabled || streaming || busy}
+                    aria-label="Start voice input"
+                    title="Dictate a message"
+                    className="shrink-0 rounded-lg p-2 text-icon transition-colors duration-ts hover:bg-surface-2 hover:text-ink disabled:cursor-not-allowed disabled:opacity-35"
+                  >
+                    <IconMic size={17} />
+                  </button>
+                )}
                 <ModelPicker
                   model={prefs.model}
                   effort={prefs.effort}
@@ -985,6 +1066,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
                 )}
               </span>
             </div>
+            )}
             </div>
           </div>
 

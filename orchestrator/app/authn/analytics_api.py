@@ -606,6 +606,107 @@ async def salesforce(
     }
 
 
+@router.get("/voice")
+async def voice(
+    range: str = Query("30d", pattern=RANGE_PATTERN),
+    principal: Principal = Gate,
+) -> dict:
+    """Voice dictation, as metadata.
+
+    The table behind this endpoint holds no transcript text — only how long
+    someone spoke, how long they waited, which language the model named and
+    whether it worked — so there is nothing here that could leak what was
+    said, by construction rather than by filtering.
+
+    `coverage` is LIFETIME, not windowed, and it is the difference between
+    "nobody dictated last week" and "voice has never been used here". The
+    page says something different for each, and cannot tell them apart from
+    a windowed zero.
+    """
+    w = Window(range)
+    ws = principal.workspace_id
+    totals, prev, series, languages, top, lifetime = await asyncio.gather(
+        db.run_in_thread(analytics.voice_totals, ws, w.since, w.until),
+        db.run_in_thread(analytics.voice_totals, ws, w.prev_since, w.prev_until),
+        db.run_in_thread(analytics.voice_series, ws, w.since, w.until, w.bucket),
+        db.run_in_thread(analytics.voice_languages, ws, w.since, w.until),
+        db.run_in_thread(analytics.voice_top_users, ws, w.since, w.until),
+        db.run_in_thread(analytics.voice_coverage, ws),
+    )
+    transcriptions = _int(totals.get("transcriptions")) or 0
+    ok = _int(totals.get("ok")) or 0
+    duration_ms = _int(totals.get("duration_ms"))
+    identified = _int(totals.get("language_identified")) or 0
+    return {
+        "range": w.payload(),
+        "coverage": {
+            "first_transcription": _iso(lifetime.get("first_transcription")),
+            "last_transcription": _iso(lifetime.get("last_transcription")),
+            "transcriptions": _int(lifetime.get("transcriptions")) or 0,
+        },
+        "totals": {
+            "transcriptions": transcriptions,
+            "users": _int(totals.get("users")) or 0,
+            "ok": ok,
+            "failed": transcriptions - ok,
+            "busy": _int(totals.get("busy")) or 0,
+            "rejected": _int(totals.get("rejected")) or 0,
+            "unavailable": _int(totals.get("unavailable")) or 0,
+            "error": _int(totals.get("error")) or 0,
+            "degraded": _int(totals.get("degraded")) or 0,
+            "success_rate": (
+                round(ok / transcriptions * 100, 1) if transcriptions else None
+            ),
+            # Nobody reporting a clip length is not zero speech, so the sum
+            # stays None and the minutes derived from it stay None with it.
+            "total_duration_ms": duration_ms,
+            "total_minutes": (
+                None if duration_ms is None else round(duration_ms / 60000, 1)
+            ),
+            "avg_duration_ms": _num(totals.get("avg_duration_ms")),
+            "p95_duration_ms": _num(totals.get("p95_duration_ms")),
+            "avg_processing_ms": _num(totals.get("avg_processing_ms")),
+            "p95_processing_ms": _num(totals.get("p95_processing_ms")),
+            "languages": _int(totals.get("languages")) or 0,
+            "language_identified": identified,
+        },
+        "deltas": {
+            "transcriptions": _delta(
+                transcriptions, _int(prev.get("transcriptions"))
+            ),
+        },
+        "series": [
+            {
+                "bucket": _iso(r["bucket"]),
+                "transcriptions": _int(r.get("transcriptions")) or 0,
+                "ok": _int(r.get("ok")) or 0,
+                "failed": _int(r.get("failed")) or 0,
+            }
+            for r in series
+        ],
+        "languages": [
+            {
+                "language": r["language"],
+                "transcriptions": _int(r.get("transcriptions")) or 0,
+                "users": _int(r.get("users")) or 0,
+                # Of the clips that WERE identified — sharing against every
+                # transcription would quietly report the parser's silence as
+                # a language nobody spoke.
+                "share": (
+                    round((_int(r.get("transcriptions")) or 0) / identified * 100, 1)
+                    if identified
+                    else None
+                ),
+            }
+            for r in languages
+        ],
+        "top_users": [
+            {**_member(r), "transcriptions": _int(r.get("transcriptions")) or 0}
+            for r in top
+        ],
+    }
+
+
 # ---------------------------------------------------------------------------
 # Infrastructure
 # ---------------------------------------------------------------------------

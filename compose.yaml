@@ -154,6 +154,22 @@ services:
       REPORTS_DIR: /reports
       MPLCONFIGDIR: /tmp/matplotlib
       XDG_CACHE_HOME: /tmp/cache
+      # Speech to text. Unlike the other model services these are passed
+      # EXPLICITLY, because the engine does not live on this Compose network:
+      # scripts/asr.sh puts it on whichever node has room (the worker, in dual
+      # mode) and writes the resolved address into .env. Defaults keep the
+      # feature off, so a deployment that has never run that script behaves
+      # exactly as it did before.
+      ASR_ENABLED: ${ASR_ENABLED:-false}
+      ASR_BASE_URL: ${ASR_BASE_URL:-}
+      ASR_MODEL: ${ASR_MODEL:-Qwen/Qwen3-ASR-1.7B}
+      ASR_BACKEND: ${ASR_BACKEND:-qwen3_asr}
+      ASR_LANGUAGE: ${ASR_LANGUAGE:-auto}
+      ASR_TIMEOUT_S: ${ASR_TIMEOUT_S:-60}
+      ASR_MAX_AUDIO_SECONDS: ${ASR_MAX_AUDIO_SECONDS:-600}
+      ASR_MAX_UPLOAD_BYTES: ${ASR_MAX_UPLOAD_BYTES:-33554432}
+      ASR_MAX_CONCURRENT: ${ASR_MAX_CONCURRENT:-4}
+      ASR_RATE_PER_MIN: ${ASR_RATE_PER_MIN:-20}
     volumes:
       - data:/data
       # The Salesforce brain packs, read-only and LIVE: core/brain.py re-reads

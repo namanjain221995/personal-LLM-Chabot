@@ -71,6 +71,11 @@ export interface MemberUsage {
   conversations: number;
   research_runs: number;
   web_searches: number;
+  /**
+   * How many times this person dictated. Only the voice endpoint counts it,
+   * so it is absent — not zero — on every other endpoint's rows.
+   */
+  transcriptions?: number;
 }
 
 export interface UsagePoint {
@@ -232,6 +237,59 @@ export interface SalesforceAnalytics {
   };
   deltas: Record<string, number | null>;
   series: { bucket: string; answers: number; live: number }[];
+}
+
+export interface VoiceAnalytics {
+  range: Window;
+  /**
+   * Voice over ALL time, not the window. It is what tells "nobody dictated
+   * this fortnight" apart from "voice has never been used here" — two empty
+   * pages that deserve to say different things.
+   */
+  coverage: {
+    first_transcription: string | null;
+    last_transcription: string | null;
+    transcriptions: number;
+  };
+  totals: {
+    transcriptions: number;
+    users: number;
+    ok: number;
+    failed: number;
+    busy: number;
+    rejected: number;
+    unavailable: number;
+    error: number;
+    /** Attempts the fallback engine answered — a quiet kind of outage. */
+    degraded: number;
+    success_rate: number | null;
+    /** Null when no clip in the window reported a length. Never 0. */
+    total_duration_ms: number | null;
+    total_minutes: number | null;
+    avg_duration_ms: number | null;
+    p95_duration_ms: number | null;
+    /** The wait the person sat through, failures included. */
+    avg_processing_ms: number | null;
+    p95_processing_ms: number | null;
+    languages: number;
+    /** Clips whose language the model actually named. */
+    language_identified: number;
+  };
+  deltas: Record<string, number | null>;
+  series: {
+    bucket: string;
+    transcriptions: number;
+    ok: number;
+    failed: number;
+  }[];
+  languages: {
+    language: string;
+    transcriptions: number;
+    users: number;
+    /** Share of the clips that were IDENTIFIED, not of every clip. */
+    share: number | null;
+  }[];
+  top_users: MemberUsage[];
 }
 
 /** A vLLM engine as Prometheus sees it. Every metric may be absent. */

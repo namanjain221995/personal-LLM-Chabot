@@ -116,6 +116,26 @@ scrape_configs:
         regex: ".*_created$"
         action: drop
 
+  # Speech to text, on the WORKER. Its own job rather than a target in
+  # vllm-aux above because it is on another machine and reached by IP: the
+  # aux services are Compose service names on this node's inference network,
+  # which does not exist on Spark 2. The address is the worker's MANAGEMENT
+  # IP for the same reason node-exporter's is — monitoring, like audio, stays
+  # off the RoCE fabric the tensor-parallel model runs on.
+  #
+  # The job is harmless when speech to text has never been started: Prometheus
+  # marks the target down and the analytics console reports the engine as
+  # unavailable, which is exactly the true answer.
+  - job_name: vllm-asr
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["192.168.9.68:30006"]
+        labels: { service: asr, node: spark-2, role: worker }
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: ".*_created$"
+        action: drop
+
   # --- The living knowledge layer ----------------------------------------
   # The orchestrator's own /metrics (app/metrics.py, stdlib-only). Public like
   # /health so the scrape needs no session; it exposes counters and histograms

@@ -34,6 +34,7 @@ import {
   IconGrid,
   IconMail,
   IconMessages,
+  IconMic,
   IconServer,
   IconShield,
   IconSliders,
@@ -125,6 +126,11 @@ function navGroups(me: Me): NavGroup[] {
             href: '/admin/analytics/salesforce',
             label: 'Salesforce',
             icon: <IconCloudCog size={15} />,
+          },
+          {
+            href: '/admin/analytics/voice',
+            label: 'Voice',
+            icon: <IconMic size={15} />,
           },
           {
             href: '/admin/analytics/models',

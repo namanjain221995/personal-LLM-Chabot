@@ -18,6 +18,7 @@ from pydantic import BaseModel, model_validator
 
 from . import context, db, llm
 from .auth import UserRow, require_user, router as auth_router
+from .audio_api import router as audio_router
 from .authn.admin_api import router as admin_router
 from .authn.analytics_api import router as analytics_router
 from .config import settings
@@ -132,6 +133,9 @@ async def _reject_cross_site_writes(request: Request, call_next):
 app.include_router(auth_router)
 app.include_router(history_router)
 app.include_router(uploads_router)
+# Speech to text for the composer. Its own router because it is the only
+# route that takes audio, and the only one gated on Feature.VOICE_INPUT.
+app.include_router(audio_router)
 app.include_router(memory_router)
 app.include_router(admin_router)
 # The analytics console. Its own router because its gate is its own

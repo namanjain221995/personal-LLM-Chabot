@@ -96,6 +96,7 @@ ENDPOINTS = [
     "/admin/api/analytics/research",
     "/admin/api/analytics/search",
     "/admin/api/analytics/salesforce",
+    "/admin/api/analytics/voice",
     "/admin/api/analytics/performance",
     "/admin/api/analytics/infrastructure",
 ]
@@ -237,7 +238,7 @@ def test_the_series_reaches_the_bucket_the_window_ends_in(console):
 
 
 def test_every_series_on_every_page_ends_today(console):
-    """The same bound, on all five of them — they are separate queries and
+    """The same bound, on all six of them — they are separate queries and
     only one of them had a test."""
     root, _admin, _member = console
     from datetime import datetime, timezone
@@ -248,6 +249,7 @@ def test_every_series_on_every_page_ends_today(console):
         ("research", lambda d: d["series"]),
         ("search", lambda d: d["series"]),
         ("salesforce", lambda d: d["series"]),
+        ("voice", lambda d: d["series"]),
     ]
     for name, pick in pages:
         data = root.get(
@@ -391,6 +393,65 @@ def test_performance_reports_percentiles_and_a_histogram(console):
     # must not be counted as instant.
     assert buckets["<1s"] == 4
     assert sum(buckets.values()) == 4
+
+
+def test_voice_reports_the_attempts_the_wait_and_the_languages(console):
+    """Dictation as METADATA, and the two places that shape is easy to get
+    wrong.
+
+    A clip whose length the browser never reported is not a clip of zero
+    seconds, so it must not be summed as one; and the language share is taken
+    against the clips that were IDENTIFIED, because dividing by every attempt
+    would report the parser's silence as a language nobody spoke.
+    """
+    root, _admin, _member = console
+    speaker = _uid("mo")
+    for language, duration in (("English", 4200), ("Hindi", 3100), (None, None)):
+        db.record_voice_transcription(
+            user_id=speaker,
+            duration_ms=duration,
+            language=language,
+            processing_ms=910,
+            status="ok",
+        )
+    db.record_voice_transcription(
+        user_id=speaker,
+        duration_ms=2000,
+        language=None,
+        processing_ms=8000,
+        status="unavailable",
+    )
+
+    body = root.get("/admin/api/analytics/voice", params={"range": "7d"}).json()
+    totals = body["totals"]
+    assert totals["transcriptions"] == 4
+    assert totals["ok"] == 3
+    assert totals["failed"] == 1
+    assert totals["unavailable"] == 1
+    assert totals["users"] == 1
+    # The clip nobody timed is absent from the sum, not counted as silence.
+    assert totals["total_duration_ms"] == 4200 + 3100 + 2000
+    assert totals["language_identified"] == 2
+
+    # The failure's eight-second wait is in the average: it is a wait somebody
+    # sat through, and leaving it out would report latency for the successes
+    # only — the one population nobody complains about.
+    assert totals["avg_processing_ms"] > 910
+
+    shares = {row["language"]: row["share"] for row in body["languages"]}
+    assert shares == {"English": 50.0, "Hindi": 50.0}
+
+
+def test_a_deployment_where_nobody_has_dictated_says_so_rather_than_nothing(console):
+    """`coverage` is LIFETIME on purpose: it is the whole difference between
+    "nobody dictated last week" and "voice has never been used here", and the
+    page says something different for each."""
+    root, _admin, _member = console
+
+    body = root.get("/admin/api/analytics/voice", params={"range": "7d"}).json()
+    assert body["coverage"]["transcriptions"] == 0
+    assert body["coverage"]["first_transcription"] is None
+    assert body["totals"]["success_rate"] is None
 
 
 # ---------------------------------------------------------------------------
