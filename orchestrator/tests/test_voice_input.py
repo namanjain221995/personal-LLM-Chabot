@@ -792,3 +792,150 @@ def test_a_broken_telemetry_write_does_not_cost_the_person_their_transcript(
     response = _post(bob)
     assert response.status_code == 200, response.text
     assert response.json()["text"] == SPOKEN
+
+
+# ---------------------------------------------------------------------------
+# Two engines
+#
+# "Use both GPUs" has two possible meanings and only one of them is faster.
+# Splitting one 1.7B model across two Sparks would put every layer on a
+# 13 Gb/s RoCE link the main model already uses, to save memory that was never
+# short. Two whole copies with requests balanced between them is what this
+# does, and these are the properties that make it safe to leave on.
+# ---------------------------------------------------------------------------
+
+
+class CountingEngine:
+    """An engine that records how many requests it is holding at once."""
+
+    name = "counting"
+    model = "test"
+
+    def __init__(self, base_url: str, *, fail: bool = False) -> None:
+        self.base_url = base_url
+        self.calls = 0
+        self.active = 0
+        self.peak = 0
+        self.fail = fail
+        self.release = asyncio.Event()
+        self.release.set()
+
+    async def transcribe(self, audio, *, filename, content_type, language=""):
+        self.calls += 1
+        if self.fail:
+            raise asr.ASRUnavailable(f"{self.base_url} is down")
+        self.active += 1
+        self.peak = max(self.peak, self.active)
+        try:
+            await self.release.wait()
+        finally:
+            self.active -= 1
+        return asr.Transcript(
+            text="ok", language=None, language_code=None,
+            provider=self.name, model=self.model, engine_ms=1,
+        )
+
+    async def health(self) -> bool:
+        return not self.fail
+
+
+def test_work_goes_to_whichever_engine_is_freest():
+    """Least ACTIVE, not round robin.
+
+    Clips are not the same size — a four-second question and a two-minute
+    dictation are one request each — so counting requests SENT would hand the
+    long one and the next one to the same engine. Counting requests still
+    running sends work where there is room for it.
+    """
+    busy = CountingEngine("http://busy/v1")
+    free = CountingEngine("http://free/v1")
+    busy.release.clear()
+    router = asr.RoutedProvider([busy, free])
+
+    async def drive():
+        # One request parks on `busy`, so it is no longer the freest.
+        parked = asyncio.create_task(
+            router.transcribe(b"x", filename="a.webm", content_type="audio/webm")
+        )
+        await asyncio.sleep(0)
+        await router.transcribe(b"x", filename="b.webm", content_type="audio/webm")
+        busy.release.set()
+        await parked
+
+    asyncio.run(drive())
+    assert busy.calls == 1
+    assert free.calls == 1, "the second clip should have gone to the idle engine"
+
+
+def test_a_dead_engine_is_skipped_and_the_clip_still_transcribes():
+    """One node rebooting must not fail a person's dictation."""
+    dead = CountingEngine("http://dead/v1", fail=True)
+    alive = CountingEngine("http://alive/v1")
+    router = asr.RoutedProvider([dead, alive])
+
+    result = asyncio.run(
+        router.transcribe(b"x", filename="a.webm", content_type="audio/webm")
+    )
+    assert result.text == "ok"
+    assert alive.calls == 1
+
+    # And it is STOOD DOWN, not hammered: the next clip skips it outright.
+    asyncio.run(router.transcribe(b"x", filename="b.webm", content_type="audio/webm"))
+    assert dead.calls == 1, "a failed engine should be skipped, not retried immediately"
+    assert alive.calls == 2
+
+
+def test_a_refused_clip_is_not_retried_on_the_other_engine():
+    """ASRRejected means the engine understood the request and refused the
+    AUDIO. Another engine would refuse it identically, more slowly."""
+
+    class Refuser(CountingEngine):
+        async def transcribe(self, audio, *, filename, content_type, language=""):
+            self.calls += 1
+            raise asr.ASRRejected("unreadable audio")
+
+    first = Refuser("http://one/v1")
+    second = CountingEngine("http://two/v1")
+    router = asr.RoutedProvider([first, second])
+
+    with pytest.raises(asr.ASRRejected):
+        asyncio.run(
+            router.transcribe(b"x", filename="a.webm", content_type="audio/webm")
+        )
+    assert second.calls == 0
+
+
+def test_the_fleet_is_healthy_while_any_engine_answers():
+    """Dictation works on one node. A half-down fleet is degraded, not down."""
+    dead = CountingEngine("http://dead/v1", fail=True)
+    alive = CountingEngine("http://alive/v1")
+    assert asyncio.run(asr.RoutedProvider([dead, alive]).health()) is True
+    assert asyncio.run(asr.RoutedProvider([dead]).health()) is False
+
+
+def test_one_endpoint_still_goes_through_the_router(monkeypatch):
+    """The code path a workspace runs every day should be the one the tests
+    exercise, not a special case that only appears on smaller deployments."""
+    monkeypatch.setattr(settings, "asr_base_urls", ("http://only/v1",))
+    asr.set_provider(None)
+    try:
+        assert isinstance(asr.provider(), asr.RoutedProvider)
+        assert len(asr.provider().stats()) == 1
+    finally:
+        asr.set_provider(None)
+
+
+def test_the_pool_scales_with_the_fleet_not_with_the_pressure(monkeypatch):
+    """Four per engine, times the fleet: two nodes carry twice the work at the
+    same pressure each. The limit exists to bound how hard ONE node is pushed
+    while the chat model shares it."""
+    monkeypatch.setattr(settings, "asr_max_concurrent", 4)
+    monkeypatch.setattr(settings, "asr_base_urls", ("http://a/v1", "http://b/v1"))
+    asr.POOL.reset_for_tests()
+
+    async def check():
+        async with asr.POOL:
+            return asr.POOL._semaphore()._value + 1
+
+    assert asyncio.run(check()) == 8
+    asr.POOL.reset_for_tests()

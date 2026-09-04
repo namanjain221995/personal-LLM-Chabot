@@ -34,7 +34,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass
-from typing import Any, Optional, Protocol
+from typing import Any, Dict, List, Optional, Protocol, Sequence
 
 from . import metrics
 from .config import settings
@@ -298,6 +298,109 @@ def _detail(response: Any) -> str:
     return f"engine returned {response.status_code}"
 
 
+class RoutedProvider:
+    """Several engines, one interface: send each clip to the freest one.
+
+    WHY REPLICAS AND NOT ONE SHARDED MODEL. "Use both GPUs" has two possible
+    meanings and only one of them is faster here. Splitting a single 1.7B
+    model across two Sparks puts every layer's activations on the RoCE fabric
+    — 13 Gb/s a link, already carrying the main model's own tensor-parallel
+    traffic — to save memory that was never short: the weights are 4.4 GB and
+    each node has room for them twice over. Two whole copies with requests
+    balanced between them adds throughput without adding a single byte of
+    cross-node chatter, and it degrades to one engine gracefully when a node
+    goes away. That is what this class does.
+
+    LEAST ACTIVE, not round robin. Clips are not the same size — a
+    four-second question and a two-minute dictation are one request each —
+    so counting requests sent would send the long one and the next one to the
+    same engine. Counting requests still RUNNING sends work where there is
+    room for it, which is the property that actually matters.
+
+    A FAILING ENGINE IS SKIPPED, BRIEFLY. An endpoint that raises
+    ASRUnavailable is stood down for `_COOLDOWN_S` and the request is retried
+    on another. It is never removed permanently: a node that reboots must
+    rejoin by itself, without anybody editing configuration.
+    """
+
+    #: Long enough that a restarting engine is not hammered, short enough that
+    #: a recovered one is back before anyone notices it left.
+    _COOLDOWN_S = 20.0
+
+    def __init__(self, engines: Sequence[ASRProvider]) -> None:
+        if not engines:
+            raise ValueError("RoutedProvider needs at least one engine")
+        self._engines = list(engines)
+        self._active: Dict[int, int] = {i: 0 for i in range(len(self._engines))}
+        self._down_until: Dict[int, float] = {i: 0.0 for i in range(len(self._engines))}
+        self.name = self._engines[0].name
+        self.model = self._engines[0].model
+
+    def _order(self) -> List[int]:
+        """Healthy engines first, freest first; then the ones standing down.
+
+        The stood-down engines stay on the end rather than being dropped, so a
+        fleet where every engine is cooling off still tries one instead of
+        failing a request nobody had to lose.
+        """
+        now = time.monotonic()
+        healthy = [i for i in range(len(self._engines)) if self._down_until[i] <= now]
+        cooling = [i for i in range(len(self._engines)) if self._down_until[i] > now]
+        healthy.sort(key=lambda i: self._active[i])
+        cooling.sort(key=lambda i: self._down_until[i])
+        return healthy + cooling
+
+    async def transcribe(
+        self, audio: bytes, *, filename: str, content_type: str, language: str = ""
+    ) -> Transcript:
+        last: Optional[Exception] = None
+        for index in self._order():
+            engine = self._engines[index]
+            self._active[index] += 1
+            try:
+                result = await engine.transcribe(
+                    audio,
+                    filename=filename,
+                    content_type=content_type,
+                    language=language,
+                )
+                self._down_until[index] = 0.0
+                return result
+            except ASRRejected:
+                # The engine understood the request and refused the AUDIO.
+                # Another engine would refuse it identically, more slowly.
+                raise
+            except ASRUnavailable as exc:
+                last = exc
+                self._down_until[index] = time.monotonic() + self._COOLDOWN_S
+                log.warning(
+                    "ASR engine %s is unavailable (%s); standing it down for %.0fs",
+                    getattr(engine, "base_url", index), exc, self._COOLDOWN_S,
+                )
+            finally:
+                self._active[index] -= 1
+        raise ASRUnavailable(str(last) if last else "no speech engine answered")
+
+    async def health(self) -> bool:
+        """True when ANY engine answers — the feature works on one node."""
+        for engine in self._engines:
+            if await engine.health():
+                return True
+        return False
+
+    def stats(self) -> List[Dict[str, Any]]:
+        """Per-engine state, for /audio/health and the admin console."""
+        now = time.monotonic()
+        return [
+            {
+                "endpoint": getattr(engine, "base_url", ""),
+                "active": self._active[i],
+                "available": self._down_until[i] <= now,
+            }
+            for i, engine in enumerate(self._engines)
+        ]
+
+
 # ---------------------------------------------------------------------------
 # Admission control
 #
@@ -326,7 +429,12 @@ class _Pool:
         # Rebuilt per event loop: a Semaphore bound to a dead loop (the test
         # suite makes a new one per test) blocks forever on the next acquire.
         if self._sem is None or self._loop is not loop:
-            self._sem = asyncio.Semaphore(max(1, settings.asr_max_concurrent))
+            # Per engine, times the fleet: two nodes carry twice the work at
+            # the same pressure each. `settings.asr_base_urls` is never empty
+            # (config falls back to the single URL), so this is at least one.
+            self._sem = asyncio.Semaphore(
+                max(1, settings.asr_max_concurrent) * max(1, len(settings.asr_base_urls))
+            )
             self._loop = loop
         return self._sem
 
@@ -372,12 +480,19 @@ def provider() -> ASRProvider:
     """
     global _provider
     if _provider is None:
-        _provider = VLLMAudioProvider(
-            base_url=settings.asr_base_url,
-            model=settings.asr_model,
-            name=settings.asr_backend,
-            timeout_s=settings.asr_timeout_s,
-        )
+        engines = [
+            VLLMAudioProvider(
+                base_url=url,
+                model=settings.asr_model,
+                name=settings.asr_backend,
+                timeout_s=settings.asr_timeout_s,
+            )
+            for url in settings.asr_base_urls
+        ]
+        # One engine still goes through the router: the code path a workspace
+        # runs every day should be the one the tests exercise, not a special
+        # case that only appears on smaller deployments.
+        _provider = RoutedProvider(engines)
     return _provider
 
 

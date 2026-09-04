@@ -145,6 +145,22 @@ class Settings:
         self.asr_base_url: str = os.environ.get(
             "ASR_BASE_URL", "http://vllm-asr:30006/v1"
         ).rstrip("/")
+        # More than one engine, comma-separated, when speech runs on both
+        # nodes. Requests go to whichever endpoint has the fewest in flight;
+        # see app/asr.RoutedProvider. Falls back to the single URL above, so a
+        # deployment that never sets this behaves exactly as it did.
+        #
+        # These are REPLICAS, not shards. A 1.7B model fits in 6 GiB and
+        # splitting one across two Sparks would put every layer's activations
+        # on a 13 Gb/s RoCE link that the main model's tensor-parallel traffic
+        # already uses — slower, and contending with the thing that must not
+        # be slowed. Two whole copies, load-balanced, is what "use both GPUs"
+        # actually means here.
+        self.asr_base_urls: tuple[str, ...] = tuple(
+            url.strip().rstrip("/")
+            for url in os.environ.get("ASR_BASE_URLS", "").split(",")
+            if url.strip()
+        ) or (self.asr_base_url,)
         self.asr_model: str = os.environ.get("ASR_MODEL", "Qwen/Qwen3-ASR-1.7B")
         # Auto-detection is the default and should stay it: a person dictating
         # must not have to declare a language before they speak, and the model
@@ -167,6 +183,10 @@ class Settings:
         # Not about protecting the ASR engine, which batches eight concurrent
         # clips in the time of one. About protecting the CHAT model: audio
         # must never contend with an answer someone is waiting for.
+        # PER ENGINE, not in total: the number exists to bound how hard any
+        # one node is pushed while the chat model shares it, so a second
+        # engine on a second node raises the fleet's ceiling without raising
+        # the pressure on either machine.
         self.asr_max_concurrent: int = _int("ASR_MAX_CONCURRENT", 4)
         # Past this, callers are told to try again instead of queueing behind
         # work they cannot see.

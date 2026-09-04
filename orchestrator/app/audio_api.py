@@ -281,14 +281,20 @@ async def health(
     """
     if not settings.asr_enabled:
         return {"enabled": False, "ready": False, "reason": "voice input is disabled"}
-    ready = await asr.provider().health()
+    engine = asr.provider()
+    ready = await engine.health()
+    fleet = engine.stats() if hasattr(engine, "stats") else []
     return {
         "enabled": True,
         "ready": ready,
         "model": settings.asr_model,
         "active": asr.POOL.active,
         "waiting": asr.POOL.waiting,
-        "reason": "" if ready else "the speech engine is not answering",
+        # One row per engine, so a half-down fleet is visible as exactly that
+        # rather than as an "enabled, ready" that quietly lost half its
+        # capacity.
+        "engines": fleet,
+        "reason": "" if ready else "no speech engine is answering",
     }
 
 
