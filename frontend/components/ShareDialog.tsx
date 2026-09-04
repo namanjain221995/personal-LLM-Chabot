@@ -284,14 +284,20 @@ export function ShareDialog({
                 </select>
               </Row>
 
-              {blocked && policy && (
+              {/* Shown whenever the server refused ANYTHING, not only when it
+                  refused the option currently selected. `load` pre-selects
+                  the narrower reach when public is unavailable, so keying
+                  this off `blocked` meant the one case that most needs an
+                  explanation — public refused, workspace fine — silently
+                  offered a disabled option and said nothing about why. */}
+              {policy && policy.blocking_reasons.length > 0 && (
                 <div className="flex gap-2 rounded-lg border border-warn/40 bg-warn/10 px-3 py-2.5">
                   <IconAlert size={15} className="mt-0.5 shrink-0 text-warn" />
                   <div className="min-w-0 text-xs leading-relaxed text-ink">
                     {policy.blocking_reasons.map((r) => (
                       <p key={r}>{r}</p>
                     ))}
-                    {policy.public_allowed === false && policy.workspace_allowed && (
+                    {!policy.public_allowed && policy.workspace_allowed && (
                       <p className="mt-1 text-muted">
                         You can still share it inside this workspace.
                       </p>
