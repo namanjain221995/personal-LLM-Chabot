@@ -623,3 +623,79 @@ def test_persisting_survives_a_missing_page_store(monkeypatch):
     monkeypatch.setattr(dr.db, "get_web_pages", boom)
     asyncio.run(dr._persist_claims(st))
     assert len(persisted) == 1 and persisted[0]["page_id"] is None
+
+
+# ---------------------------------------------------------------------------
+# Prose is not disagreement
+#
+# The grouping key was `value, or failing that the first 80 characters of the
+# claim SENTENCE`, so two sources describing one fact in different words
+# landed in different groups and the ranking read every group it did not pick
+# as a rival. Measured 2026-09-04: 17 of 18 logged resolutions came out
+# CONFLICTING, confidence sat at 0.28, and reports opened with a
+# "CONTRADICTIONS BETWEEN SOURCES" section listing non-contradictions.
+# ---------------------------------------------------------------------------
+
+
+def _prose_claim(st, subq, text, source_n, hint="current"):
+    """A claim the extractor could not reduce to a value — most of them."""
+    st.claims.append(
+        dr.Claim(subq=subq, text=text, value="", source_n=source_n,
+                 as_of=None, hint=hint, iteration=1)
+    )
+
+
+def test_two_sources_wording_the_same_fact_differently_do_not_conflict():
+    st = _state(subqs=("what does it do",))
+    a = _src(st, "https://a.example/x", "text a", authority=70)
+    b = _src(st, "https://b.example/y", "text b", authority=70)
+    _prose_claim(st, 1, "It serves models over an OpenAI-compatible API.", a.n)
+    _prose_claim(st, 1, "The server exposes an API compatible with OpenAI's.", b.n)
+
+    dr._resolve(st)
+    res = st.resolutions[1]
+    assert res.status == dr.STATUS_CURRENT, (
+        f"same fact, different words, got {res.status}"
+    )
+    assert not res.conflicts
+
+
+def test_prose_from_several_sources_counts_as_corroboration():
+    """Two independent domains saying it is worth more confidence than one."""
+    st = _state(subqs=("what does it do",))
+    a = _src(st, "https://a.example/x", "text a", authority=70)
+    b = _src(st, "https://b.example/y", "text b", authority=70)
+    _prose_claim(st, 1, "One phrasing.", a.n)
+    _prose_claim(st, 1, "Another phrasing.", b.n)
+
+    dr._resolve(st)
+    res = st.resolutions[1]
+    assert len(res.support) >= 2, "both sources should support the answer"
+
+
+def test_a_real_disagreement_about_a_value_is_still_a_conflict():
+    """The fix must not silence genuine contradictions — that is the whole
+    point of the resolution pass."""
+    st = _state(subqs=("who leads it",))
+    a = _src(st, "https://a.example/x", "text a", authority=70)
+    b = _src(st, "https://b.example/y", "text b", authority=70)
+    _claim(st, 1, "Alice", a.n)
+    _claim(st, 1, "Bob", b.n)
+
+    dr._resolve(st)
+    assert st.resolutions[1].status == dr.STATUS_CONFLICTING
+
+
+def test_prose_claims_do_not_outvote_a_real_value():
+    """A valued claim answers the question; prose beside it is support."""
+    st = _state(subqs=("who leads it",))
+    a = _src(st, "https://a.example/x", "text a", authority=80)
+    b = _src(st, "https://b.example/y", "text b", authority=50)
+    _claim(st, 1, "Alice", a.n)
+    _prose_claim(st, 1, "The leadership page was updated recently.", b.n)
+
+    dr._resolve(st)
+    res = st.resolutions[1]
+    assert res.status == dr.STATUS_CURRENT
+    assert not res.conflicts
+    assert "Alice" in (res.value or "")

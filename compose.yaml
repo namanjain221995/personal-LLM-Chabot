@@ -119,6 +119,27 @@ services:
       - ./searxng:/etc/searxng:rw
     networks:
       - application
+    # Resolve upstream engines through public resolvers instead of the host's
+    # systemd-resolved stub. Measured on this host 2026-09-04: the identical
+    # `www.bing.com A` query took 5.05 s and returned "no servers could be
+    # reached" via 127.0.0.53, and 0.03-0.09 s via 8.8.8.8, 1.1.1.1 and
+    # 9.9.9.9. Containers inherit the stub through Docker's embedded resolver,
+    # so that blip lands INSIDE SearXNG's 3.0 s outgoing.request_timeout: the
+    # engine records a timeout and benches itself for 180 s. Bing is the
+    # fastest engine here once resolved (0.23 s to /search) and it was being
+    # lost for three minutes at a time on a name lookup, not on anything Bing
+    # did. Seen twice, on two consecutive restarts: an 8.01 s A-record failure
+    # from a cold cache, after which bing went 0/8 on a query set it had just
+    # answered 8/8.
+    #
+    # This does NOT affect service discovery: Docker's embedded DNS at
+    # 127.0.0.11 still answers container names (`orchestrator`, `postgres`)
+    # itself and only forwards names it does not own to this list. Three
+    # independent operators so one provider's outage is not ours.
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+      - 9.9.9.9
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "wget -q --spider --proxy=off http://127.0.0.1:8080/healthz || exit 1"]

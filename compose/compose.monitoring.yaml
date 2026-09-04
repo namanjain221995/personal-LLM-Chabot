@@ -247,6 +247,22 @@ services:
       # cardinality without answering a question anyone here asks.
       - --no-collector.replication
       - --no-collector.replication_slot
+      # BROKEN against this server, not merely unwanted. postgres_exporter
+      # 0.16.0 ships stat_bgwriter ON by default and it still selects
+      # `checkpoints_timed` from pg_stat_bgwriter — a column PostgreSQL 17
+      # moved to pg_stat_checkpointer. This deployment runs 18.4, where
+      # pg_stat_bgwriter has only buffers_clean, maxwritten_clean,
+      # buffers_alloc and stats_reset, so the collector failed on EVERY scrape:
+      # `pq: column "checkpoints_timed" does not exist`, every 15 s, which was
+      # 100% of this container's log volume (500/500 lines) and ~5.7k error
+      # lines a day burying anything real.
+      #
+      # Turned off rather than upgraded because nothing consumes the metrics:
+      # no dashboard in monitoring/grafana/dashboards and no rule in
+      # monitoring/prometheus/rules references bgwriter or checkpoints
+      # (checked 2026-09-04), so disabling loses no signal, while bumping the
+      # image would re-cut every other pg_* metric name the dashboards DO use.
+      - --no-collector.stat_bgwriter
     networks:
       - application
     restart: unless-stopped

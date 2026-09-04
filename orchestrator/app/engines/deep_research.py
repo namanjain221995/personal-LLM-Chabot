@@ -1198,10 +1198,32 @@ def _resolve(state: ResearchState) -> None:
         if not claims:
             state.resolutions[i] = Resolution(i, subq, STATUS_UNKNOWN)
             continue
+        # TWO CLAIMS ONLY DISAGREE IF THEY SAY DIFFERENT THINGS ABOUT THE
+        # SAME SLOT. The key used to be `value, or failing that the first 80
+        # characters of the SENTENCE` — so two sources describing one fact in
+        # different words landed in different groups, and the ranking below
+        # then read every group it did not pick as a rival. Measured
+        # 2026-09-04: 17 of 18 logged resolutions came out CONFLICTING, run
+        # confidence sat at 0.28, and reports opened with a "CONTRADICTIONS
+        # BETWEEN SOURCES" section listing things that did not contradict.
+        #
+        # A claim the extractor gave no `value` has nothing to compare. It is
+        # EVIDENCE for the answer, not a competing answer, so all such claims
+        # pool into one non-comparable group whose sources are folded into the
+        # winner instead of being ranked against it.
         groups: Dict[str, List[Claim]] = {}
+        loose: List[Claim] = []
         for c in claims:
-            key = _norm_value(c.value) or _norm_value(c.text)[:80]
-            groups.setdefault(key, []).append(c)
+            key = _norm_value(c.value)
+            if key:
+                groups.setdefault(key, []).append(c)
+            else:
+                loose.append(c)
+        # Nothing had a value: the subquestion is prose, and prose that agrees
+        # is agreement. One group, one answer, no conflict.
+        if not groups and loose:
+            groups["_prose"] = loose
+            loose = []
 
         scored: List[dict] = []
         for key, cs in groups.items():
@@ -1240,6 +1262,13 @@ def _resolve(state: ResearchState) -> None:
 
         candidates.sort(key=composite, reverse=True)
         winner = candidates[0]
+        # The prose claims corroborate whichever value won; their sources
+        # belong in its support, not in a contradiction list.
+        for c in loose:
+            src = state.source(c.source_n)
+            if src is not None and src.canonical_n not in winner["support"]:
+                winner["support"].append(src.canonical_n)
+        winner["support"].sort()
         superseded: List[dict] = []
         conflicts: List[dict] = []
         for g in scored:
@@ -2160,7 +2189,18 @@ async def _run(
             return text
 
         # --- Verify (self-correction) ----------------------------------
-        if settings.deep_research_verify and state.budget_left():
+        # NOT gated on budget_left(). It was, and that made the pass dead
+        # exactly where it mattered: budget_left() is False precisely when the
+        # loop ended on source_cap / timeout / iteration_cap — the thin,
+        # over-run, low-confidence runs. Measured 2026-09-04, runs 24, 25 and
+        # 26 all ended on source_cap and none produced a single verify line,
+        # while the two runs that stopped `sufficient` — the ones that least
+        # needed checking — were the only ones verified.
+        #
+        # The pass itself is cheap: one ~900-token call over claims already in
+        # memory, no fetching. The FOLLOW-UP round it can request is the
+        # expensive part, and that is still gated on budget below.
+        if settings.deep_research_verify:
             await emit("status", {"text": "Cross-checking the important claims…"})
             sid = await step("Verifying claims")
             _verdict, vqueries = await _verify(state, effort)
