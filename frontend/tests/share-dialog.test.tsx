@@ -153,7 +153,13 @@ describe('before anything is shared', () => {
       }),
     });
     mount();
-    const create = await screen.findByRole('button', { name: 'Create link' });
+    // Wait for the LOADED body, not for the button: the footer renders from
+    // the first frame, so findByRole resolves during the skeleton and the
+    // click lands on a disabled control. That passed locally and failed in
+    // CI, which is the signature of exactly this race.
+    await screen.findByText(/read-only copy/i);
+    const create = screen.getByRole('button', { name: 'Create link' });
+    expect(create.hasAttribute('disabled')).toBe(false);
     fireEvent.click(create);
     await waitFor(() =>
       expect(toast).toHaveBeenCalledWith(
@@ -172,7 +178,7 @@ describe('before anything is shared', () => {
       }),
     });
     mount();
-    await screen.findByRole('button', { name: 'Create link' });
+    await screen.findByText(/read-only copy/i);
     fireEvent.change(screen.getByDisplayValue('30 days'), { target: { value: '7d' } });
     fireEvent.click(screen.getByLabelText(/show my display name/i));
     fireEvent.click(screen.getByRole('button', { name: 'Create link' }));
@@ -202,7 +208,8 @@ describe('once a link exists', () => {
       },
     });
     mount();
-    fireEvent.click(await screen.findByRole('button', { name: 'Create link' }));
+    await screen.findByText(/read-only copy/i);
+    fireEvent.click(screen.getByRole('button', { name: 'Create link' }));
 
     const field = (await screen.findByLabelText('Share link')) as HTMLInputElement;
     await waitFor(() => expect(field.value).toContain('the-secret-half'));
