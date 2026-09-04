@@ -26,7 +26,7 @@ import {
   toggleFeedback,
   type MessageFeedback,
 } from '@/lib/feedback';
-import { stripCitations } from '@/lib/citations';
+import { keepsCitations, linkCitations, stripCitations } from '@/lib/citations';
 import {
   attachmentFile,
   resolveAttachmentAsync,
@@ -829,6 +829,13 @@ export function MessageRow({
   }
 
   const streaming = message.status === 'streaming';
+  // What the reader actually sees. A chat answer reads clean and finds its
+  // sources in the panel (2026-08-05); a Deep Research report keeps its [n]
+  // markers and turns them into links, because there the citation IS the
+  // product and stripping it delivered a sourced report as an uncited essay.
+  const displayText = keepsCitations(message.meta?.route)
+    ? linkCitations(message.content, message.meta?.sources ?? [])
+    : stripCitations(message.content);
   // V2: reasoning + steps live on the message while streaming and inside
   // meta once persisted (§4d/§4e) — read whichever is present.
   const reasoningText = message.meta?.reasoning ?? message.reasoning ?? '';
@@ -945,8 +952,13 @@ export function MessageRow({
             >
               {/* [n] citation markers are stripped for display (2026-08-05)
                   — the numbered sources live in the ActivityPanel instead.
-                  The stored content keeps them, so nothing is lost. */}
-              <Markdown text={stripCitations(message.content)} />
+                  The stored content keeps them, so nothing is lost.
+                  EXCEPT a Deep Research report, where the citation is the
+                  product: the engine resolves claims against each other and
+                  writes per-claim markers, and stripping them delivered a
+                  12 KB sourced report as an uncited essay. There they become
+                  links to the source instead. */}
+              <Markdown text={displayText} />
               {streaming && <span aria-hidden className="stream-caret" />}
             </div>
           )}
@@ -1055,8 +1067,14 @@ export function MessageRow({
               )}
               {/* ChatGPT-style icon row (2026-08-05): quiet ghost icons
                   instead of labelled chip buttons. */}
+              {/* A pasted research report keeps its markers: they are what
+                  make it checkable by whoever receives it. */}
               <CopyButton
-                text={stripCitations(message.content)}
+                text={
+                  keepsCitations(message.meta?.route)
+                    ? message.content
+                    : stripCitations(message.content)
+                }
                 label="Copy message"
                 variant="icon"
               />

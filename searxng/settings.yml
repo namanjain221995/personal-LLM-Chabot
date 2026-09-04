@@ -67,6 +67,14 @@ engines:
     disabled: true
   - name: startpage
     disabled: true
+  # The news-category sibling of the startpage engine above, and it fails the
+  # same way: `categories=news` returned ('startpage news','Suspended: CAPTCHA')
+  # on 2026-09-04. A CAPTCHA is an anti-bot decision by the upstream, not
+  # something to work around, so the engine is simply not asked. The news pool
+  # is healthy without it — the same query returned 58 results from duckduckgo
+  # news, reuters, bing news and wikinews.
+  - name: startpage news
+    disabled: true
   - name: brave
     disabled: true
   - name: bing
@@ -76,8 +84,25 @@ engines:
   # of the result window on a guaranteed error (logged 2026-08-30).
   - name: qwant
     disabled: true
+  # Yahoo's search endpoint answers "500 INKApi Error" to EVERY query from this
+  # host — measured 0/8 on 2026-09-04 (the same nine queries bing/yandex/
+  # duckduckgo-web all answered), and again after the suspension expired. The
+  # homepage returns 200 from this container, so it is not DNS, egress or TLS:
+  # it is Yahoo's own search backend refusing this traffic. Nothing in this
+  # file can undo that, and while enabled it costs a guaranteed error per
+  # query plus the 180 s suspension churn that follows it.
   - name: yahoo
-    disabled: false
+    disabled: true
+  # Inherited enabled from SearXNG's defaults and TIMES OUT on every general
+  # query — 0/8 on 2026-09-04, and it is the reason a general search cost
+  # 3.02 s instead of the ~0.9 s it costs once wikidata has benched itself.
+  # The whole query waits on the 3.0 s outgoing.request_timeout for an engine
+  # that never answers. query.wikidata.org itself responds 200 in 1.27 s from
+  # this container, so the SPARQL endpoint behind the engine is what is slow,
+  # not the network. Wikipedia (enabled, in the same general pool) already
+  # covers the encyclopaedic angle.
+  - name: wikidata
+    disabled: true
   # Noise, measured 2026-09-04. For "who is the CEO of OpenAI" mwmbl returned
   # SEVENTY-SIX results led by openai.com/blog/openai-gym-beta (2016), an
   # OpenAIRE guidelines page and a Hustle piece about Uber scooters. Volume of
@@ -89,8 +114,21 @@ engines:
     disabled: false
   - name: github
     disabled: false
+  # RATE LIMITED, not slow — so a bigger timeout would not have helped and was
+  # not the fix. Probed directly against export.arxiv.org from this container
+  # on 2026-09-04: HTTP 429 on 3 of 4 requests, and the ones that did answer
+  # took 14.9 s and 15.7 s. arXiv's API asks for one request every 3 s, and
+  # deep research fans several science queries out at once, so it trips the
+  # limit immediately. Live effect: `categories=science` reported
+  # ('arxiv','timeout') on 2/2 queries and both pinned to exactly 5.02 s —
+  # arxiv WAS the science-pool tail.
+  #
+  # Disabling costs nothing measurable: the same two queries still returned 41
+  # and 52 results from google scholar, semantic scholar, pubmed and openaire,
+  # and Semantic Scholar indexes arXiv preprints anyway, so the preprints are
+  # still reachable — just through an upstream that will talk to us.
   - name: arxiv
-    disabled: false
+    disabled: true
   # Engine supply, measured 2026-08-30. The four engines that answer a default
   # general query here (google cse, bing, mwmbl, yahoo) are one Google IP-block
   # away from two, and google cse DID block this host during testing — the
