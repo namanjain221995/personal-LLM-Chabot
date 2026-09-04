@@ -58,14 +58,16 @@ import type { SendOptions } from './Composer';
 import {
   branchForAppend,
   branchForVersion,
-  buildThread,
   hasBranches,
   metaWithBranch,
   ROOT,
+  threadIndices,
+  treeShape,
   versionMap,
   selectVersion,
   type BranchSelection,
 } from '@/lib/branching';
+import type { MessageFeedback } from '@/lib/feedback';
 import { truncateFailure } from '@/lib/historyApi';
 import ChatErrorPage from './ChatErrorPage';
 import { shortcutAction } from '@/lib/searchPalette';
@@ -124,6 +126,18 @@ import { IconArrowDown, IconSidebar } from './icons';
 
 const APP_NAME =
   process.env.NEXT_PUBLIC_APP_NAME ?? 'TechSara AI';
+
+/** The row callbacks ChatApp caches per message id — see `rowHandlers`. */
+interface RowHandlers {
+  onRegenerate: () => void;
+  onRetry: () => void;
+  onReuseAttachment: (index: number) => void;
+  onEditStart: () => void;
+  onEditCancel: () => void;
+  onEditSubmit: (text: string) => void;
+  onShowSummary: () => void;
+  onFeedback: (feedback: MessageFeedback | null) => void;
+}
 
 export function ChatApp() {
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
@@ -277,10 +291,29 @@ export function ChatApp() {
    * gets persisted. `thread` is what the user sees AND what the model is
    * sent — the two were the same list until edits stopped being destructive.
    * Anything about the conversation ON SCREEN reads this one.
+   *
+   * NEW-24 — the tree is re-walked when the CONVERSATION changes shape, not
+   * when a token lands. `messages` gets a new array identity on every
+   * streaming frame, which used to re-run the full walk here and again for
+   * `versions` below: two complete rebuilds per token, for a structure that
+   * had not moved. The walk reads only ids, order and branch pointers, so
+   * keying it on exactly those (`treeShape`) skips both rebuilds for the
+   * whole answer — and, just as importantly, keeps the objects they produce
+   * identical, so the memoized rows downstream are not re-rendered by a
+   * fresh-but-equal prop (M-08). Only the final index lookup, which is what
+   * actually picks up the new text, runs per frame.
    */
+  const treeKey = useMemo(() => treeShape(messages), [messages]);
+  const threadPath = useMemo(
+    () => threadIndices(messages, branchSelection),
+    // `treeKey` is a complete description of everything the walk reads from
+    // `messages`; content changes cannot move an index.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [treeKey, branchSelection],
+  );
   const thread = useMemo(
-    () => buildThread(messages, branchSelection),
-    [messages, branchSelection],
+    () => threadPath.map((i) => messages[i]),
+    [threadPath, messages],
   );
   const threadRef = useRef<ChatMessage[]>([]);
   threadRef.current = thread;
@@ -600,28 +633,180 @@ export function ChatApp() {
     stopStream(activeIdRef.current);
   }, []);
 
-  const scrollToBottom = useCallback((smooth: boolean) => {
-    const el = scrollRef.current;
-    if (!el) return;
-    const reduced = window.matchMedia(
-      '(prefers-reduced-motion: reduce)',
-    ).matches;
-    el.scrollTo({
-      top: el.scrollHeight,
-      behavior: smooth && !reduced ? 'smooth' : 'auto',
+  /**
+   * NEW-24 — follow the bottom of a growing answer, at most once per frame.
+   *
+   * This ran once per token, from a passive effect: `scrollHeight` forced a
+   * synchronous layout immediately after the commit, the write that followed
+   * invalidated it again, and the next token repeated both before the browser
+   * had painted anything. Measured 502 forced layout round-trips for a
+   * 500-delta answer — layout thrash in lockstep with the stream, which is a
+   * large part of what the stutter actually was.
+   *
+   * Now the read and the write happen together inside the frame the browser
+   * is about to paint, and a frame already booked is reused rather than
+   * stacked. `matchMedia` is not consulted here at all: this path never
+   * animates, so reduced motion has nothing to say about it (it still governs
+   * the explicit "Jump to latest" below).
+   */
+  const followFrame = useRef<number | null>(null);
+  const followBottom = useCallback(() => {
+    if (followFrame.current !== null) return;
+    followFrame.current = requestAnimationFrame(() => {
+      followFrame.current = null;
+      const el = scrollRef.current;
+      if (!el) return;
+      el.scrollTop = el.scrollHeight;
     });
   }, []);
 
-  // Auto-scroll while content grows, unless the user scrolled up (§9).
-  useEffect(() => {
-    if (atBottom) scrollToBottom(false);
-  }, [thread, atBottom, scrollToBottom]);
+  // No frame may repaint into a view that is gone.
+  useEffect(
+    () => () => {
+      if (followFrame.current !== null) {
+        cancelAnimationFrame(followFrame.current);
+        followFrame.current = null;
+      }
+    },
+    [],
+  );
 
-  function handleScroll() {
+  const scrollToBottom = useCallback(
+    (smooth: boolean) => {
+      const el = scrollRef.current;
+      if (!el) return;
+      // Asking to go to the bottom is asking to follow again.
+      followRef.current = true;
+      if (!smooth) {
+        followBottom();
+        return;
+      }
+      const reduced = window.matchMedia(
+        '(prefers-reduced-motion: reduce)',
+      ).matches;
+      el.scrollTo({
+        top: el.scrollHeight,
+        behavior: reduced ? 'auto' : 'smooth',
+      });
+    },
+    [followBottom],
+  );
+
+  /**
+   * NEW-25 — where the viewport is, without measuring anything on the scroll
+   * path.
+   *
+   * This used to be an `onScroll` handler that read `scrollHeight`,
+   * `scrollTop` and `clientHeight` and then called `setAtBottom`. Three
+   * forced layouts per native scroll event, and a scroll gesture produces
+   * them at 60-120 Hz — on a DOM that is dirty by definition, because the
+   * answer changed on the frame before. That is the classic scroll-jank
+   * shape: the browser cannot service the gesture because every event drags
+   * a full layout of a long conversation behind it.
+   *
+   * Two observers on a sentinel at the end of the thread answer the same
+   * question for free. They run off the scroll path, measure nothing
+   * synchronously, and only report when the answer actually CHANGES — which
+   * during ordinary following is never, because the sentinel stays in view.
+   *
+   *   `atBottom`   — 80 px of slack, the existing "Jump to latest" threshold.
+   *   `nearBottom` — tight, and the only thing auto-follow is allowed to
+   *                  read. Keeping it tight is what removes the band in
+   *                  which the app used to drag the user back down: any real
+   *                  scroll away from the bottom, by any input device, takes
+   *                  the sentinel out of view and stops the follow at once.
+   */
+  const bottomRef = useRef<HTMLDivElement>(null);
+  const nearBottomRef = useRef(true);
+  /**
+   * Is auto-follow armed? A ref, not state: a gesture must be able to call
+   * off the follow without re-rendering the conversation it is trying to let
+   * the user read.
+   */
+  const followRef = useRef(true);
+
+  useEffect(() => {
+    const root = scrollRef.current;
+    const target = bottomRef.current;
+    if (!root || !target || typeof IntersectionObserver === 'undefined') return;
+
+    const button = new IntersectionObserver(
+      (entries) => {
+        const visible = entries[entries.length - 1].isIntersecting;
+        setAtBottom((current) => (current === visible ? current : visible));
+      },
+      { root, rootMargin: '0px 0px 80px 0px', threshold: 0 },
+    );
+    const follow = new IntersectionObserver(
+      (entries) => {
+        const visible = entries[entries.length - 1].isIntersecting;
+        nearBottomRef.current = visible;
+        // Arriving back at the bottom is the gesture that means "follow
+        // again" — whatever the user got there with.
+        if (visible) followRef.current = true;
+      },
+      // A few pixels of tolerance for sub-pixel layout, not a band to fight in.
+      { root, rootMargin: '0px 0px 8px 0px', threshold: 0 },
+    );
+    button.observe(target);
+    follow.observe(target);
+    return () => {
+      button.disconnect();
+      follow.disconnect();
+    };
+  }, []);
+
+  /**
+   * User intent, read straight off the gesture — no DOM access at all.
+   *
+   * Registered directly so they can be PASSIVE: neither handler calls
+   * preventDefault (they only read `deltaY` and touch coordinates), so the
+   * browser must never wait on them before scrolling. React would attach its
+   * own listeners for these, and passive-by-default is not something to rely
+   * on implicitly for the one path this bug is about.
+   */
+  useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
-    setAtBottom(el.scrollHeight - el.scrollTop - el.clientHeight < 80);
-  }
+
+    const onWheel = (e: WheelEvent) => {
+      if (e.deltaY < 0) followRef.current = false;
+      else if (nearBottomRef.current) followRef.current = true;
+    };
+    let lastTouchY = 0;
+    const onTouchStart = (e: TouchEvent) => {
+      lastTouchY = e.touches[0]?.clientY ?? 0;
+    };
+    const onTouchMove = (e: TouchEvent) => {
+      const y = e.touches[0]?.clientY ?? 0;
+      // Finger travelling DOWN drags the content down, i.e. scrolls up.
+      if (y > lastTouchY + 2) followRef.current = false;
+      else if (y < lastTouchY - 2 && nearBottomRef.current) {
+        followRef.current = true;
+      }
+      lastTouchY = y;
+    };
+
+    el.addEventListener('wheel', onWheel, { passive: true });
+    el.addEventListener('touchstart', onTouchStart, { passive: true });
+    el.addEventListener('touchmove', onTouchMove, { passive: true });
+    return () => {
+      el.removeEventListener('wheel', onWheel);
+      el.removeEventListener('touchstart', onTouchStart);
+      el.removeEventListener('touchmove', onTouchMove);
+    };
+  }, []);
+
+  // A different conversation follows again from the start.
+  useEffect(() => {
+    followRef.current = true;
+    nearBottomRef.current = true;
+  }, [activeId]);
+
+  // Auto-scroll while content grows, unless the user scrolled up (§9).
+  useEffect(() => {
+    if (followRef.current && nearBottomRef.current) followBottom();
+  }, [thread, followBottom]);
 
   /** Debounced (300 ms) so typing doesn't re-render the meter per keystroke. */
   const handleDraftChange = useCallback((text: string) => {
@@ -1770,8 +1955,17 @@ export function ChatApp() {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [newChat, searchOpen, selectionCandidate, stopStreaming]);
 
-  /** Which visible turns have alternatives — one walk, not one per row. */
-  const versions = useMemo(() => versionMap(messages), [messages]);
+  /**
+   * Which visible turns have alternatives — one walk, not one per row, and
+   * (NEW-24) not one per streaming token either: a `VersionInfo` is built
+   * from ids and positions alone, so it is stable for as long as the shape
+   * is, and a row that has one is not re-rendered by the answer growing.
+   */
+  const versions = useMemo(
+    () => versionMap(messages),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- see `treeKey`.
+    [treeKey],
+  );
 
   const activeTitle =
     conversations.find((c) => c.id === activeId)?.title ?? 'New chat';
@@ -1783,8 +1977,28 @@ export function ChatApp() {
      the label is gone, and with it the `lastEngine` walk that existed solely to
      feed it. */
 
-  // Chats generating right now — in this tab OR server-side (after reload).
-  const busyIds = Array.from(new Set([...streamingIds(), ...serverActive]));
+  /**
+   * Chats generating right now — in this tab OR server-side (after reload).
+   *
+   * NEW-24: kept at a STABLE identity while the set is unchanged. This is a
+   * fresh array on every render by construction (`streamingIds()` reads the
+   * stream registry, not React state, so it cannot be a `useMemo`), and as a
+   * prop it re-rendered the whole sidebar on every streaming frame — measured
+   * 721 ms of a 9.3 s run with 40 conversations in the list, for a spinner
+   * that had not moved. Comparing the contents costs one pass over a handful
+   * of ids; not comparing them cost a full list render per frame.
+   */
+  const busyNow = Array.from(new Set([...streamingIds(), ...serverActive]));
+  const busyRef = useRef<string[]>(busyNow);
+  if (
+    busyRef.current.length !== busyNow.length ||
+    busyRef.current.some((id, i) => id !== busyNow[i])
+  ) {
+    busyRef.current = busyNow;
+  }
+  const busyIds = busyRef.current;
+  const closeSidebar = useCallback(() => setSidebarOpen(false), []);
+  const openSearch = useCallback(() => setSearchOpen(true), []);
 
   /**
    * PHASE 4A/4B — put a previously sent attachment back in the composer.
@@ -1844,6 +2058,67 @@ export function ChatApp() {
     },
     [toast],
   );
+
+  /**
+   * M-08 — per-row callbacks with STABLE identity.
+   *
+   * Every handler a row receives used to be an inline arrow rebuilt on each
+   * render, so all 100 rows of a long thread got eight brand-new function
+   * props on every streaming token and re-rendered through any memo you cared
+   * to add. Measured: 50,200 row renders for one 500-delta answer, ~100 of
+   * them wasted per token.
+   *
+   * Built once per message id and cached. The cached functions never close
+   * over a handler directly — they read the CURRENT one off a ref when they
+   * are called — which is what makes them permanently stable AND impossible
+   * to go stale: a row rendered at token 1 still runs today's `regenerate`
+   * against today's `activeId`. They only ever fire from user events, long
+   * after the ref has been written.
+   */
+  const rowApi = {
+    regenerate,
+    reuseAttachment,
+    startEdit,
+    cancelEdit,
+    submitEdit,
+    setSummaryOpen,
+    activeId,
+  };
+  const rowApiRef = useRef(rowApi);
+  rowApiRef.current = rowApi;
+  const rowHandlersRef = useRef(new Map<string, RowHandlers>());
+  // A different conversation is a different set of rows; without this the
+  // cache would accumulate every message id visited in the session.
+  const handlerScope = useRef<string | null>(null);
+  if (handlerScope.current !== activeId) {
+    handlerScope.current = activeId;
+    rowHandlersRef.current = new Map();
+  }
+  const rowHandlers = useCallback((id: string): RowHandlers => {
+    const cache = rowHandlersRef.current;
+    const existing = cache.get(id);
+    if (existing) return existing;
+    const handlers: RowHandlers = {
+      onRegenerate: () => rowApiRef.current.regenerate(id),
+      onRetry: () => rowApiRef.current.regenerate(id),
+      onReuseAttachment: (index) => {
+        void rowApiRef.current.reuseAttachment(id, index);
+      },
+      onEditStart: () => rowApiRef.current.startEdit(id),
+      onEditCancel: () => rowApiRef.current.cancelEdit(),
+      onEditSubmit: (text) => rowApiRef.current.submitEdit(id, text),
+      onShowSummary: () => rowApiRef.current.setSummaryOpen(true),
+      onFeedback: (feedback) => {
+        const conversationId = rowApiRef.current.activeId;
+        if (!conversationId) return;
+        // Fire-and-forget: the store updates its cache first and swallows a
+        // failed request, so a thumb never blocks the UI or raises a pill.
+        void getHistoryStore().setMessageFeedback(conversationId, id, feedback);
+      },
+    };
+    cache.set(id, handlers);
+    return handlers;
+  }, []);
 
   /* ------------------------------------------------- NEW-10: file drop -- */
 
@@ -1962,13 +2237,13 @@ export function ChatApp() {
     <div className="flex h-dvh overflow-hidden">
       <Sidebar
         open={sidebarOpen}
-        onClose={() => setSidebarOpen(false)}
+        onClose={closeSidebar}
         conversations={conversations}
         archived={archived}
         activeId={activeId}
         streamingIds={busyIds}
         onNewChat={newChat}
-        onOpenSearch={() => setSearchOpen(true)}
+        onOpenSearch={openSearch}
         onSelect={selectConversation}
         onRename={renameConversation}
         onDelete={deleteConversation}
@@ -2068,7 +2343,6 @@ export function ChatApp() {
 
         <div
           ref={scrollRef}
-          onScroll={handleScroll}
           className="relative min-h-0 flex-1 overflow-y-auto"
         >
           {fatalError ? (
@@ -2106,16 +2380,20 @@ export function ChatApp() {
                 // Only the question the thread is WAITING on is a live control;
                 // every earlier card is a record of a decision already made.
                 const card = cardState(thread, i);
+                // Stable per-id callbacks (M-08). Everything else below is
+                // either the message object itself — which `updateAssistant`
+                // leaves untouched unless it really changed — or a primitive,
+                // so a memoized row re-renders when its own turn changes and
+                // at no other time.
+                const on = rowHandlers(m.id);
                 return (
                 <MessageRow
                   key={m.id}
                   message={m}
                   isLast={i === thread.length - 1 && m.role === 'assistant'}
-                  onRegenerate={() => regenerate(m.id)}
-                  onRetry={() => regenerate(m.id)}
-                  onReuseAttachment={(index) => {
-                    void reuseAttachment(m.id, index);
-                  }}
+                  onRegenerate={on.onRegenerate}
+                  onRetry={on.onRetry}
+                  onReuseAttachment={on.onReuseAttachment}
                   // 4C: which conversation to ask for a workbook profile or a
                   // document's extracted text.
                   conversationId={activeId}
@@ -2126,29 +2404,24 @@ export function ChatApp() {
                   }
                   versions={versions.get(m.id) ?? null}
                   onSelectVersion={selectBranch}
-                  onEditStart={() => startEdit(m.id)}
+                  onEditStart={on.onEditStart}
                   editing={editingMessageId === m.id}
-                  onEditCancel={cancelEdit}
-                  onEditSubmit={(text) => submitEdit(m.id, text)}
-                  onShowSummary={() => setSummaryOpen(true)}
+                  onEditCancel={on.onEditCancel}
+                  onEditSubmit={on.onEditSubmit}
+                  onShowSummary={on.onShowSummary}
                   clarificationPending={card.pending}
                   clarificationAnswer={card.answeredWith}
-                  onFeedback={(feedback) => {
-                    if (!activeId) return;
-                    // Fire-and-forget: the store updates its cache first and
-                    // swallows a failed request, so a thumb never blocks the
-                    // UI or raises an error pill.
-                    void getHistoryStore().setMessageFeedback(
-                      activeId,
-                      m.id,
-                      feedback,
-                    );
-                  }}
+                  onFeedback={on.onFeedback}
                 />
                 );
               })}
             </div>
           )}
+          {/* NEW-25: what the two IntersectionObservers watch. It is the last
+              thing in the scroller and it is always mounted, so "is the end of
+              the conversation on screen?" is answered by the browser instead
+              of by measuring the document on every scroll event. */}
+          <div ref={bottomRef} aria-hidden className="h-px w-full" />
         </div>
 
         {!atBottom && thread.length > 0 && (

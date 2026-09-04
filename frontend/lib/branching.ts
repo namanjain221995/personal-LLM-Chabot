@@ -131,9 +131,26 @@ export function buildThread(
   all: ChatMessage[],
   selection: BranchSelection = {},
 ): ChatMessage[] {
+  return threadIndices(all, selection).map((i) => all[i]);
+}
+
+/**
+ * The POSITIONS in `all` of the visible path — what `buildThread` then looks
+ * the messages up at.
+ *
+ * Split out because the walk reads only the tree (ids, parents, order) and
+ * never message content, so a caller that re-derives the thread on every
+ * streaming token can cache the path against `treeShape` and pay for nothing
+ * but the index lookup. `buildThread` is this plus that lookup, so there is
+ * still exactly one walk rather than two implementations that could drift.
+ */
+export function threadIndices(
+  all: ChatMessage[],
+  selection: BranchSelection = {},
+): number[] {
   if (all.length === 0) return [];
   const { ids, children } = buildTree(all);
-  const out: ChatMessage[] = [];
+  const out: number[] = [];
   const seen = new Set<number>();
   let cursor = ROOT;
   for (;;) {
@@ -142,8 +159,27 @@ export function buildThread(
     const pick = pickChild(candidates, ids, selection[cursor]);
     if (seen.has(pick)) break; // corrupt metadata must not hang the render
     seen.add(pick);
-    out.push(all[pick]);
+    out.push(pick);
     cursor = ids[pick];
+  }
+  return out;
+}
+
+/**
+ * A string that changes exactly when the TREE does — NEW-24.
+ *
+ * It carries everything `buildTree` reads (order, message ids, branch
+ * pointers) and deliberately nothing else. Content is absent on purpose: a
+ * streaming answer replaces its message object on every frame without moving
+ * anything in the tree, so a derivation keyed on this skips the walk for the
+ * whole generation AND keeps the identity of what it produced — which is
+ * what stops a `versions` prop from re-rendering a memoized row (M-08).
+ */
+export function treeShape(all: ChatMessage[]): string {
+  let out = String(all.length);
+  for (const m of all) {
+    const branch = branchOf(m);
+    out += `\u0001${m.id}\u0002${branch?.self ?? ''}\u0002${branch?.parent ?? ''}`;
   }
   return out;
 }

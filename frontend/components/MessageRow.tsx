@@ -11,7 +11,7 @@
  * behind the Sources button instead.
  */
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ChatMessage } from '@/lib/types';
 import type { VersionInfo } from '@/lib/branching';
 import { parseClarification } from '@/lib/clarification';
@@ -318,7 +318,7 @@ function serverPreviewLoaders(
  */
 export type UploadStatus = 'uploading' | 'failed';
 
-export function MessageRow({
+function MessageRowImpl({
   message,
   isLast,
   onRegenerate,
@@ -412,6 +412,27 @@ export function MessageRow({
 }) {
   // Hooks live above the user-bubble early return (rules of hooks).
   const [activityOpen, setActivityOpen] = useState(false);
+  /**
+   * The answer as it is DISPLAYED: [n] markers removed (the numbered sources
+   * live in the ActivityPanel; the stored content keeps them).
+   *
+   * Computed once per content change rather than twice per render. It is used
+   * by the markdown body and by Copy, and `stripCitations` is two nested
+   * regex splits over the whole answer — on the streaming row that was two
+   * full scans of a growing answer on every single frame.
+   */
+  // Memoised because this runs on every streamed frame (l-6), and
+  // conditional because a Deep Research report keeps its citations where a
+  // chat answer sheds them. `sources` is read for the link targets, so it
+  // belongs in the dependencies: a report whose sources arrive with the final
+  // meta must re-render with them.
+  const displayText = useMemo(
+    () =>
+      keepsCitations(message.meta?.route)
+        ? linkCitations(message.content, message.meta?.sources ?? [])
+        : stripCitations(message.content),
+    [message.content, message.meta?.route, message.meta?.sources],
+  );
   // The SERVER's value wins when the message has one: it is the copy that
   // survives a reload. localStorage is the fallback for messages that have
   // not been stored yet (and for anything rendering without a store), which
@@ -829,13 +850,6 @@ export function MessageRow({
   }
 
   const streaming = message.status === 'streaming';
-  // What the reader actually sees. A chat answer reads clean and finds its
-  // sources in the panel (2026-08-05); a Deep Research report keeps its [n]
-  // markers and turns them into links, because there the citation IS the
-  // product and stripping it delivered a sourced report as an uncited essay.
-  const displayText = keepsCitations(message.meta?.route)
-    ? linkCitations(message.content, message.meta?.sources ?? [])
-    : stripCitations(message.content);
   // V2: reasoning + steps live on the message while streaming and inside
   // meta once persisted (§4d/§4e) — read whichever is present.
   const reasoningText = message.meta?.reasoning ?? message.reasoning ?? '';
@@ -1070,11 +1084,7 @@ export function MessageRow({
               {/* A pasted research report keeps its markers: they are what
                   make it checkable by whoever receives it. */}
               <CopyButton
-                text={
-                  keepsCitations(message.meta?.route)
-                    ? message.content
-                    : stripCitations(message.content)
-                }
+                text={displayText}
                 label="Copy message"
                 variant="icon"
               />
@@ -1147,3 +1157,24 @@ export function MessageRow({
     </div>
   );
 }
+
+/**
+ * M-08 — a historical row must not re-render because the LAST answer received
+ * another token.
+ *
+ * A 100-message thread re-rendered all 100 rows on every streaming delta:
+ * measured 50,200 row renders for a 500-delta answer, ~100 of them wasted per
+ * token. Each one re-ran `stripCitations`, `parseClarification` and a deep
+ * JSX tree, then made React reconcile it — long enough per commit that the
+ * browser dropped frames, which is what the stutter actually was.
+ *
+ * The default shallow comparison is exactly right here, and it is only SAFE
+ * because of the two things done for it on the other side: `updateAssistant`
+ * keeps the object identity of every message it did not change, and ChatApp
+ * hands each row per-id callbacks that are created once and read their
+ * targets through a ref. Nothing is frozen — a row whose OWN message object
+ * changes (feedback, an edit, attachment metadata, a branch switch, the
+ * clarification card, the row becoming last) still re-renders, because that
+ * is a prop change like any other.
+ */
+export const MessageRow = memo(MessageRowImpl);

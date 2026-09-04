@@ -65,6 +65,68 @@ function notify(id: string): void {
   for (const fn of [...listeners]) fn(id);
 }
 
+/**
+ * NEW-24 — one visual commit per DISPLAY FRAME, not one per token.
+ *
+ * The tokens are not touched, delayed or replayed: `s.messages` is updated
+ * synchronously by `updateAssistant` exactly as before, and is complete and
+ * correct at every instant. What is coalesced is only the NOTIFICATION — how
+ * often the view is told to re-read state it can only paint 60 times a second
+ * anyway.
+ *
+ * Why this is needed even though React 19 already batches: React batches
+ * within one task, and every `reader.read()` resolution is its OWN task. A
+ * generation running at 60-100 tok/s therefore produced 60-100 separate React
+ * commits per second, each re-rendering the whole thread and forcing a
+ * synchronous layout for the auto-scroll. The browser never got a frame in
+ * which to paint, which is exactly what "jerky" looks like: work is thrown
+ * away half-done and the next paint jumps several tokens ahead.
+ *
+ * Because nothing is buffered there is no drain to get wrong. Every terminal
+ * path notifies through `notifyNow`, so no token can be left pending — see
+ * finalize / markUnreachable / markInterrupted.
+ */
+const frames = new Map<string, number>();
+
+/** Frame-coalesced notify. Direct notify off-browser (SSR, node tests). */
+function notifyFrame(s: LiveStream): void {
+  const id = s.conversationId;
+  if (typeof requestAnimationFrame !== 'function') {
+    notify(id);
+    return;
+  }
+  if (frames.has(id)) return; // a commit is already booked for this frame
+  frames.set(
+    id,
+    requestAnimationFrame(() => {
+      frames.delete(id);
+      // M-10 ownership: the conversation may have been restarted (or replaced
+      // by a newer stream) since this frame was booked. A callback may only
+      // ever speak for the stream that scheduled it.
+      if (streams.get(id) !== s) return;
+      notify(id);
+    }),
+  );
+}
+
+/**
+ * Terminal notify: drop the commit booked for this conversation, then deliver
+ * synchronously.
+ *
+ * Both halves matter. Delivering at once is what makes the final state — a
+ * `done`, an error, a Stop — land without waiting on a frame; cancelling is
+ * what stops the frame that WAS booked from repainting a now-finished stream
+ * afterwards.
+ */
+function notifyNow(id: string): void {
+  const handle = frames.get(id);
+  if (handle !== undefined) {
+    frames.delete(id);
+    if (typeof cancelAnimationFrame === 'function') cancelAnimationFrame(handle);
+  }
+  notify(id);
+}
+
 export function getLiveStream(
   id: string | null | undefined,
 ): LiveStreamView | null {
@@ -142,17 +204,37 @@ export function messagesDiscardedByRegenerate(
   return messages.length - idx - 1;
 }
 
+/**
+ * Patch the streaming answer — M-09.
+ *
+ * This ran `s.messages.map()` per token: a closure call and an id comparison
+ * for every historical message in the conversation, hundreds of times per
+ * answer, to change exactly one element that is almost always the last one.
+ *
+ * The placeholder is APPENDED by `register` and nothing inserts after it, so
+ * the tail is the answer by construction; the `findIndex` behind it is the
+ * honest fallback rather than an assumption. Immutability is unchanged — a
+ * new array and a new object for the message that changed — and every
+ * historical message keeps its exact object identity, which is what lets the
+ * memoized rows in the view skip re-rendering (M-08).
+ */
 function updateAssistant(
   s: LiveStream,
   patch: Partial<ChatMessage> | ((m: ChatMessage) => ChatMessage),
 ): void {
-  s.messages = s.messages.map((m) =>
-    m.id === s.assistantId
-      ? typeof patch === 'function'
-        ? patch(m)
-        : { ...m, ...patch }
-      : m,
-  );
+  const tail = s.messages.length - 1;
+  const at =
+    tail >= 0 && s.messages[tail].id === s.assistantId
+      ? tail
+      : s.messages.findIndex((m) => m.id === s.assistantId);
+  if (at === -1) return;
+  const current = s.messages[at];
+  const next =
+    typeof patch === 'function' ? patch(current) : { ...current, ...patch };
+  if (next === current) return;
+  const messages = s.messages.slice();
+  messages[at] = next;
+  s.messages = messages;
 }
 
 /** Client-measured thinking time: first reasoning delta → first token. */
@@ -182,7 +264,10 @@ function finalize(s: LiveStream, patch: Partial<ChatMessage>): void {
   s.status = (patch.status as StreamStatus) ?? 'done';
   // Persist regardless of which conversation is on screen.
   getHistoryStore().saveMessages(s.conversationId, s.messages);
-  notify(s.conversationId);
+  // Terminal: any commit booked for this frame is dropped and the FINAL
+  // state — every token included, `s.messages` was never behind — is
+  // delivered synchronously. Nothing can repaint after this.
+  notifyNow(s.conversationId);
 }
 
 /**
@@ -209,7 +294,7 @@ function markUnreachable(
     // thread for something no retry can fix — drop the placeholder and
     // route to sign-in instead.
     streams.delete(s.conversationId);
-    notify(s.conversationId);
+    notifyNow(s.conversationId);
     void handleSessionEnd();
     return;
   }
@@ -224,7 +309,7 @@ function markUnreachable(
   );
   s.status = 'unreachable';
   getHistoryStore().saveMessages(s.conversationId, s.messages);
-  notify(s.conversationId);
+  notifyNow(s.conversationId);
 }
 
 /**
@@ -246,7 +331,7 @@ function markInterrupted(s: LiveStream): void {
   );
   s.status = 'error';
   getHistoryStore().saveMessages(s.conversationId, s.messages);
-  notify(s.conversationId);
+  notifyNow(s.conversationId);
 }
 
 /**
@@ -272,10 +357,21 @@ async function markSendFailed(s: LiveStream, res: Response): Promise<void> {
 
 async function consume(s: LiveStream, body: ReadableStream<Uint8Array>) {
   let sawTerminal = false;
+  /**
+   * TTFT is untouched. The first event of a stream — and the first TOKEN of
+   * an answer, which is the one the reader is waiting for — commits
+   * immediately; only the high-frequency deltas after it ride the frame
+   * clock. Waiting a frame for the first token would be the one delay a
+   * reader can actually perceive, and it buys nothing: there is no second
+   * update to coalesce it with yet.
+   */
+  let committed = false;
+  let firstToken = false;
   for await (const ev of readChatStream(body)) {
     if (ev.kind === 'token') {
       if (!s.sawToken) {
         s.sawToken = true;
+        firstToken = true;
         settleReasoningClock(s);
       }
       updateAssistant(s, (m) => ({
@@ -380,7 +476,13 @@ async function consume(s: LiveStream, body: ReadableStream<Uint8Array>) {
       finalize(s, { status: 'done' });
       break;
     }
-    notify(s.conversationId);
+    if (committed && !firstToken) {
+      notifyFrame(s);
+    } else {
+      committed = true;
+      firstToken = false;
+      notifyNow(s.conversationId);
+    }
   }
   if (!sawTerminal) {
     // Stream ended without a terminal event — treat as complete.
@@ -427,7 +529,9 @@ function register(
     },
   ];
   streams.set(conversationId, s);
-  notify(conversationId);
+  // A brand-new stream replaces whatever was registered for this conversation;
+  // a frame booked by the previous one must not speak for this one.
+  notifyNow(conversationId);
   return s;
 }
 
@@ -620,7 +724,7 @@ export async function attachStream(conversationId: string): Promise<boolean> {
     );
     if (!res.ok || !res.body) {
       streams.delete(conversationId); // finished already — history has it
-      notify(conversationId);
+      notifyNow(conversationId);
       return false;
     }
     await consume(s, res.body);
@@ -632,7 +736,7 @@ export async function attachStream(conversationId: string): Promise<boolean> {
       return true;
     }
     streams.delete(conversationId);
-    notify(conversationId);
+    notifyNow(conversationId);
     return false;
   }
 }
