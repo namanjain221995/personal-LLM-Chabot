@@ -222,15 +222,34 @@ class Evidence:
             return self.answer >= _relevant_threshold()
         return self.lexical >= 0.34 or self.dense >= 0.62
 
-    def as_source(self) -> Dict[str, Any]:
-        """The shape `meta.sources` already uses, so citations render as-is."""
+    def as_source(self, n: int = 0) -> Dict[str, Any]:
+        """The shape `meta.sources` already uses, so citations render as-is.
+
+        `n` is the citation number the panel prints and the answer's [n]
+        markers point at, so it is the caller's to assign — one list, one
+        numbering. It used to be omitted entirely (along with `domain`), and
+        the panel then rendered a numbered list with no numbers, keyed on a
+        field that was `undefined` for every row.
+        """
         return {
+            "n": n,
             "url": self.url,
             "title": self.title or self.url,
+            "domain": self.domain or domain_of(self.url),
             "snippet": self.text[:400],
             "fetched_at": self.fetched_at.isoformat() if self.fetched_at else "",
             "origin": self.origin,
         }
+
+
+def as_sources(evidence: Sequence[Evidence]) -> List[Dict[str, Any]]:
+    """One evidence list -> the `meta.sources` list the UI renders.
+
+    Numbered here, once, from 1: every caller builds the panel's list the
+    same way, and `n` is unique across it — which is what the Sources list
+    keys its rows on.
+    """
+    return [e.as_source(i) for i, e in enumerate(evidence, start=1)]
 
 
 @dataclass
