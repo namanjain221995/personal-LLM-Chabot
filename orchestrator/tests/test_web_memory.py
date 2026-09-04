@@ -338,3 +338,77 @@ def test_search_log_carries_user_and_conversation(monkeypatch):
     )
     assert captured["user_id"] == 7
     assert captured["conversation_id"] == "conv-attr-1"
+
+
+# ---------------------------------------------------------------------------
+# What the model is actually shown
+#
+# Retrieval finding the answer is only half the job: the passage handed to the
+# prompt is a SLICE of what the reranker judged, and taking that slice off the
+# top of the page throws away the part the reranker scored. Measured
+# 2026-09-04 on the 50-item eval set, paired on identical retrievals: the
+# answer was present in the prompt for 30/50 questions before this and 39/50
+# after, against a ceiling of 41/50 that retrieval had already found.
+# ---------------------------------------------------------------------------
+
+
+def test_a_passage_is_centred_on_the_question_not_the_top_of_the_page():
+    """The defect this exists to prevent: an answer at character 1,500 of a
+    3,200-character chunk, invisible because the prompt got characters 0-900."""
+    from app.web_memory import Retrieval, _passages
+    from app.freshness import Freshness
+
+    noise = "unrelated boilerplate navigation text. " * 60      # ~2,300 chars
+    answer = "The maximum context length is 1048576 tokens. "
+    page = noise + answer + noise
+
+    result = Retrieval(query="what is the maximum context length", freshness=Freshness.RECENT)
+    result.evidence = [_evidence("https://example.com/a", "Doc", page)]
+
+    shown = " ".join(_passages(result, 6000))
+    assert "1048576" in shown, "the answer was cut off by head truncation"
+
+
+def test_it_still_works_when_the_question_shares_no_words_with_the_page():
+    """No overlap means no window to prefer, and the passage must still be
+    present rather than empty."""
+    from app.web_memory import Retrieval, _passages
+    from app.freshness import Freshness
+
+    result = Retrieval(query="zzz qqq", freshness=Freshness.RECENT)
+    result.evidence = [_evidence("https://example.com/a", "Doc", "some ordinary page content here " * 40)]
+    shown = " ".join(_passages(result, 6000))
+    assert "ordinary page content" in shown
+
+
+def test_the_budget_is_still_respected():
+    """A wider window must not become an unbounded prompt."""
+    from app.web_memory import Retrieval, _passages
+    from app.freshness import Freshness
+
+    result = Retrieval(query="context length", freshness=Freshness.RECENT)
+    result.evidence = [
+        _evidence(f"https://example.com/{i}", "Doc", "x " * 20000) for i in range(4)
+    ]
+    body = " ".join(_passages(result, 6000))
+    # Four passages, each capped at budget//n, plus the "[n] Title (...)"
+    # prefixes. Generous ceiling; the point is that it is BOUNDED.
+    assert len(body) < 6000 + 800
+
+
+def test_the_window_helper_keeps_its_old_default_for_the_reranker():
+    """`_best_window` is shared with the lexical path, which judges a
+    3,200-char window. Adding a width parameter must not have moved it."""
+    from app.web_memory import _best_window, _WINDOW_CHARS
+
+    long_text = "alpha beta gamma " * 1000
+    assert len(_best_window(long_text, "gamma")) <= _WINDOW_CHARS
+    assert len(_best_window(long_text, "gamma", 600)) <= 600
+
+
+def test_the_evidence_budget_default_is_the_measured_knee():
+    """3,600 left 11 answers out of the prompt that retrieval had found.
+    10,000 measured no better than 6,000."""
+    from app.config import settings
+
+    assert settings.living_knowledge_evidence_chars >= 6000

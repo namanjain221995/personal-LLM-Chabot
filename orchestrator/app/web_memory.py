@@ -489,24 +489,34 @@ _WINDOW_CHARS = 3200
 _WINDOW_STEP = 2800
 
 
-def _best_window(text: str, query: str) -> str:
-    """The ~3,200-char window of a page that carries the most of the
+def _best_window(text: str, query: str, width: int = _WINDOW_CHARS) -> str:
+    """The `width`-char window of a page that carries the most of the
     question's terms. A lexical hit used to hand the cross-encoder the page
     HEAD; an answer at character 6,000 was judged "no" and the same page
-    was fetched again to no effect (critique, 2026-09-03)."""
+    was fetched again to no effect (critique, 2026-09-03).
+
+    `width` is a parameter because the same question — "which part of this
+    page is about the question?" — is asked twice at different sizes. The
+    cross-encoder judges a 3,200-char window; the PROMPT then gets a much
+    smaller slice, and taking that slice off the top of the page throws away
+    the very passage the reranker scored (measured 2026-09-04: 11 of 60 eval
+    answers were lost to head truncation alone, McNemar p < 0.001).
+    """
+    width = max(200, width)
+    step = max(1, min(_WINDOW_STEP, width // 4))
     clean = " ".join((text or "").split())
-    if len(clean) <= _WINDOW_CHARS:
+    if len(clean) <= width:
         return clean
     wanted = set(_terms(query))
     if not wanted:
-        return clean[:_WINDOW_CHARS]
-    best, best_hits = clean[:_WINDOW_CHARS], -1
-    for start in range(0, len(clean), _WINDOW_STEP):
-        piece = clean[start : start + _WINDOW_CHARS]
+        return clean[:width]
+    best, best_hits = clean[:width], -1
+    for start in range(0, len(clean), step):
+        piece = clean[start : start + width]
         hits = len(wanted & set(_terms(piece)))
         if hits > best_hits:
             best, best_hits = piece, hits
-        if start + _WINDOW_CHARS >= len(clean):
+        if start + width >= len(clean):
             break
     return best
 
@@ -1180,7 +1190,26 @@ def _dated_label(ev: Evidence) -> str:
 
 def _passages(result: Retrieval, budget: int) -> List[str]:
     """Numbered passages within the budget — several focused ones rather
-    than one long one, because the answer needs coverage, not a single page."""
+    than one long one, because the answer needs coverage, not a single page.
+
+    EACH PASSAGE IS CENTRED ON THE QUESTION, not taken off the top of the
+    page. This used to be `text[:budget // n]`, and the cost was measured on
+    2026-09-04 over the 60-item eval set, paired on identical retrievals:
+
+        answer reachable anywhere in the retrieved evidence   44/60  0.733
+        head truncation at the old 3,600 budget               33/60  0.550
+        head truncation at 6,000                              43/60  0.717
+        query-centred window at 6,000                         44/60  0.733
+
+    Eleven questions were lost to truncation alone — 11 discordant flips,
+    none the other way (McNemar, p < 0.001). The reranker had already judged
+    a 3,200-char window and scored it 0.99 on an answer at character 1,500;
+    the model was then shown the first 900 characters and could not see it.
+
+    `_best_window` is the same helper the lexical path uses, at a smaller
+    width. Asking "which part of this text is about the question?" twice at
+    two sizes is cheaper than any of the alternatives and needs no model.
+    """
     lines: List[str] = []
     n = max(1, min(len(result.evidence), 4))
     per = max(300, min(1400, budget // n))
@@ -1188,7 +1217,8 @@ def _passages(result: Retrieval, budget: int) -> List[str]:
     for i, ev in enumerate(result.evidence, 1):
         if remaining <= 0:
             break
-        body = " ".join((ev.text or "").split())[: min(per, max(180, remaining))]
+        width = min(per, max(180, remaining))
+        body = _best_window(ev.text or "", result.query, width)
         remaining -= len(body)
         lines.append(f"[{i}] {ev.title or ev.domain} {_dated_label(ev)}: {body}")
     return lines

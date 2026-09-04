@@ -558,7 +558,13 @@ class Settings:
         # characters was one paragraph — "a large amount of information from
         # the site" (owner, 2026-09-03) needs several passages, and ~1k
         # tokens of prefill costs the Fast answer well under half a second.
-        self.living_knowledge_evidence_chars: int = _int("LIVING_KNOWLEDGE_EVIDENCE_CHARS", 3600)
+        # 6000, not 3600. Measured 2026-09-04 on the 60-item eval set, paired
+        # on identical retrievals: at 3,600 the prompt contained the answer for
+        # 33/60 questions, at 6,000 for 43/60. The retrieval had already found
+        # it in 44 of them — the budget, not the search, was the ceiling. The
+        # extra 2,400 characters are ~600 tokens of prefill against a 1M
+        # window, and 10,000 measured no better than 6,000, so this is the knee.
+        self.living_knowledge_evidence_chars: int = _int("LIVING_KNOWLEDGE_EVIDENCE_CHARS", 6000)
         # Topical grounding: a TIMELESS question is also answered from the
         # corpus when a strongly matching passage exists (a site the user
         # indexed, a doc a research run read) — the knowledge base a shared
