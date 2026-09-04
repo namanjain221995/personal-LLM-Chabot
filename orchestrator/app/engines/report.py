@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 from typing import Awaitable, Callable, List, Sequence
 
+from ..core.report_render import sanitise_for_render
 from .. import llm
 from ..config import settings
 from ..core.chart_pipeline import build_chart
@@ -100,6 +101,18 @@ def _markdown_table(columns: Sequence[str], rows: Sequence[Sequence], max_rows: 
 
 
 async def _run_pandoc(md_path: Path, out_path: Path, resource_dir: Path) -> None:
+    # The second copy of this invocation (see core/report_render.py, which
+    # documents why), and it needs the same guard: WeasyPrint fetches every
+    # reference in the HTML pandoc emits, over its own stack, bypassing
+    # core.net.safe_fetch. Proven 2026-09-04 with three loopback requests out
+    # of a three-line report.
+    try:
+        original = md_path.read_text(encoding="utf-8")
+        cleaned = sanitise_for_render(original)
+        if cleaned != original:
+            md_path.write_text(cleaned, encoding="utf-8")
+    except OSError:
+        pass
     cmd = [
         "pandoc",
         str(md_path),

@@ -37,6 +37,23 @@ services:
     # `inference`: the tunnel has no business being able to see the model APIs.
     networks:
       - application
+    # Same reason as the searxng service in compose.yaml: the host's
+    # systemd-resolved stub intermittently stalls or answers "no servers could
+    # be reached", and containers inherit it through Docker's embedded
+    # resolver. Here that showed up as 44 x `Failed to refresh DNS local
+    # resolver error="lookup region1.v2.argotunnel.com: i/o timeout"` plus
+    # `lookup cfd-features.argotunnel.com ... no such host` over three days.
+    # Neither took the tunnel down — it re-dials — but a tunnel that cannot
+    # resolve Cloudflare's own edge names is one blip away from an outage on
+    # the public entry point, and the same three resolvers answered the
+    # identical queries in 0.03-0.09 s.
+    #
+    # Container names still resolve: Docker's embedded DNS at 127.0.0.11
+    # answers `frontend` itself and only forwards what it does not own.
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+      - 9.9.9.9
     # No `ports:` — deliberately. The connection is outbound; publishing
     # anything here would defeat the point of using a tunnel.
     restart: unless-stopped
@@ -94,6 +111,13 @@ services:
     # NOT on `inference`, for the same reason as the tunnel above.
     networks:
       - application
+    # Same host-resolver problem as the tunnel above (this container logged the
+    # same argotunnel.com i/o timeouts); `grafana` still resolves via Docker's
+    # embedded DNS.
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+      - 9.9.9.9
     restart: unless-stopped
     healthcheck:
       # Exec form: this image ships no shell, so CMD-SHELL cannot start and

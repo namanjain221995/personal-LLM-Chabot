@@ -27,6 +27,43 @@
 #       - Notes__c
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ── Objects deliberately NOT listed ──────────────────────────────────────────
+# Removed 2026-09-04: 28 standard objects that this org cannot query through
+# the data API at all. Every one was failing on EVERY five-minute cycle with
+#   API_ERROR: sObject type '<name>' is not supported
+# and the failure is not about permissions or the Bulk API — each was retested
+# directly with the simplest possible REST call ("SELECT Id FROM <name> LIMIT 1")
+# and rejected the same way, so there is no fallback path that would make them
+# work. Left in the list they cost 28 failed Salesforce API calls and 28 ERROR
+# lines every cycle (~8k calls and ~8k log lines a day) and synced nothing.
+#
+# They are safe to leave out permanently: discover_new_objects() only adopts
+# names ending in __c or in WANTED_STANDARD_OBJECTS (Task, Event, EmailMessage,
+# TaskStatus), so none of these can be re-adopted automatically.
+#
+#   AssociatedLocationHistory, BotDefinition, BotVersion,
+#   ConvDefDialogDailyMetric, ConvDefDialogHourlyMetric, ConvDefSessionMetric,
+#   ConversationDefinitionDialog, ConversationDefinitionSessionEngagement,
+#   DialerCallUsage, DialerCallUsageShare, ExternalAIModel,
+#   ExtlClntAppSamplePlcyCnfg, ExtlClntAppSampleSettings,
+#   GenAiFunctionDefinition, GenAiPlannerAttrDefinition, GenAiPlannerDefinition,
+#   GenAiPlannerFunctionDef, GenAiPluginDefinition, GenAiPluginFunctionDef,
+#   GenAiPluginInstructionDef, LightningExitByPageMetrics, LightningToggleMetrics,
+#   LightningUsageByAppTypeMetrics, LightningUsageByBrowserMetrics,
+#   LightningUsageByFlexiPageMetrics, LightningUsageByPageMetrics,
+#   MlIntentUtterance, VoiceVendorInfo
+#
+# KEPT on purpose: PermissionSetLicense, RecordActionHistory and
+# ForecastingUserPreference also error today, but all three ARE queryable
+# ("SELECT Id ... LIMIT 1" succeeds; PermissionSetLicense returns 93 rows).
+# Their failures are separate, fixable bugs, not unsupported entities:
+#   PermissionSetLicense    431 Request Header Fields Too Large — the ~90-field
+#                           SOQL is sent in the GET query string and overflows it
+#   RecordActionHistory     400 on the incremental WHERE/ORDER BY SystemModstamp
+#   ForecastingUserPreference  transient DNS (Name or service not known)
+# Removing them would hide real gaps, so they stay and stay noisy.
+# ─────────────────────────────────────────────────────────────────────────────
+
 objects:
 - name: AIApplication
   fields:
@@ -1544,18 +1581,6 @@ objects:
   - ActiveFrom
   - ActiveTo
   - SystemModstamp
-- name: AssociatedLocationHistory
-  fields:
-  - Id
-  - IsDeleted
-  - AssociatedLocationId
-  - CreatedById
-  - Field
-  - DataType
-  - OldValue
-  - NewValue
-  - CreatedDate
-  watermark_field: CreatedDate
 - name: AsyncApexJob
   fields:
   - Id
@@ -1953,34 +1978,6 @@ objects:
   - SystemModstamp
   rag_fields:
   - Description
-- name: BotDefinition
-  fields:
-  - Id
-  - IsDeleted
-  - DeveloperName
-  - MasterLabel
-  - CreatedDate
-  - CreatedById
-  - LastModifiedDate
-  - LastModifiedById
-  - BotUserId
-  - Type
-  - SystemModstamp
-- name: BotVersion
-  fields:
-  - Id
-  - IsDeleted
-  - BotDefinitionId
-  - DeveloperName
-  - CreatedDate
-  - CreatedById
-  - LastModifiedDate
-  - LastModifiedById
-  - VersionNumber
-  - Status
-  - CopilotPrimaryLanguage
-  - ToneType
-  - SystemModstamp
 - name: BrandingSet
   fields:
   - Id
@@ -4087,93 +4084,6 @@ objects:
   - LastModifiedById
   - LastModifiedDate
   - SystemModstamp
-- name: ConvDefDialogDailyMetric
-  fields:
-  - Id
-  - IsDeleted
-  - Name
-  - CreatedDate
-  - CreatedById
-  - LastModifiedDate
-  - LastModifiedById
-  - DialogDefinitionId
-  - DialogDefinitionName
-  - ConversationDefinitionId
-  - BotDefinitionName
-  - MetricType
-  - MetricDateTime
-  - ChannelType
-  - Value
-  - SessionTransferType
-  - IsSuccessful
-  - SessionEndType
-  - StaticChoiceValue
-  - Article
-  - ArticleName
-  - Language
-  - IntegrationType
-  - IntegrationName
-  - GoalName
-  - IntentLabel
-  - ParentSessionKey
-  - DialogEntryPoint
-  - SystemModstamp
-- name: ConvDefDialogHourlyMetric
-  fields:
-  - Id
-  - IsDeleted
-  - Name
-  - CreatedDate
-  - CreatedById
-  - LastModifiedDate
-  - LastModifiedById
-  - ParentId
-  - DialogDefinitionId
-  - DialogDefinitionName
-  - ConversationDefinitionId
-  - BotDefinitionName
-  - MetricType
-  - MetricDateTime
-  - ChannelType
-  - Value
-  - SessionTransferType
-  - IsSuccessful
-  - SessionEndType
-  - StaticChoiceValue
-  - Article
-  - ArticleName
-  - Language
-  - IntegrationType
-  - IntegrationName
-  - GoalName
-  - IntentLabel
-  - ParentSessionKey
-  - DialogEntryPoint
-  - Hour
-  - SystemModstamp
-- name: ConvDefSessionMetric
-  fields:
-  - Id
-  - IsDeleted
-  - CreatedDate
-  - CreatedById
-  - LastModifiedDate
-  - LastModifiedById
-  - ParentId
-  - LastDialogName
-  - LastDialog
-  - WasSessionDropped
-  - StartedDialogCount
-  - InterruptedDialogCount
-  - OutputMessageCount
-  - InputMessageCount
-  - NlpIntentRequestCount
-  - NlpIntentRequestHitCount
-  - ChoiceSelectionCount
-  - GlobalChoiceSelectionCount
-  - ArticleChosenCount
-  - TransferWaitTime
-  - SystemModstamp
 - name: ConvMessageSendRequest
   fields:
   - Id
@@ -4218,28 +4128,6 @@ objects:
   - ConversationChannelId
   - LastModifiedDate
   watermark_field: LastModifiedDate
-- name: ConversationDefinitionDialog
-  fields:
-  - Id
-  - IsDeleted
-  - ParentId
-  - DeveloperName
-  - MasterLabel
-  - CreatedDate
-  - CreatedById
-  - LastModifiedDate
-  - LastModifiedById
-  - SystemModstamp
-- name: ConversationDefinitionSessionEngagement
-  fields:
-  - Id
-  - CreatedDate
-  - CreatedById
-  - LastModifiedDate
-  - LastModifiedById
-  - ConversationEngagementId
-  - SessionId
-  - SystemModstamp
 - name: ConversationEntry
   fields:
   - Id
@@ -5720,37 +5608,6 @@ objects:
   - LastViewedDate
   - LastReferencedDate
   - SystemModstamp
-- name: DialerCallUsage
-  fields:
-  - Id
-  - OwnerId
-  - IsDeleted
-  - Name
-  - CreatedDate
-  - CreatedById
-  - LastModifiedDate
-  - LastModifiedById
-  - VoiceCallId
-  - DurationInSeconds
-  - FromCountry
-  - ToCountry
-  - VendorType
-  - CallType
-  - CallStartDateTime
-  - ToPhoneNumber
-  - FromPhoneNumber
-  - SystemModstamp
-- name: DialerCallUsageShare
-  fields:
-  - Id
-  - ParentId
-  - UserOrGroupId
-  - AccessLevel
-  - RowCause
-  - LastModifiedById
-  - IsDeleted
-  - LastModifiedDate
-  watermark_field: LastModifiedDate
 - name: DigitalWallet
   fields:
   - Id
@@ -6497,23 +6354,6 @@ objects:
   - IsDeleted
   - LastModifiedDate
   watermark_field: LastModifiedDate
-- name: ExternalAIModel
-  fields:
-  - Id
-  - IsDeleted
-  - DeveloperName
-  - Language
-  - MasterLabel
-  - CreatedDate
-  - CreatedById
-  - LastModifiedDate
-  - LastModifiedById
-  - ApplicationType
-  - ExternalModelKey
-  - Status
-  - Threshold
-  - TrainingJobName
-  - SystemModstamp
 - name: ExternalClientApplication
   fields:
   - Id
@@ -6845,45 +6685,6 @@ objects:
   - ExternalClientApplicationId
   - IsEnabled
   - OauthPluginStatus
-  - SystemModstamp
-- name: ExtlClntAppSamplePlcyCnfg
-  fields:
-  - Id
-  - IsDeleted
-  - DeveloperName
-  - Language
-  - MasterLabel
-  - CreatedDate
-  - CreatedById
-  - LastModifiedDate
-  - LastModifiedById
-  - ExternalClientApplicationId
-  - AdminOnlyPolicy
-  - Policy1
-  - Policy2
-  - ExtlClntAppSampleSettingsId
-  - SystemModstamp
-- name: ExtlClntAppSampleSettings
-  fields:
-  - Id
-  - IsDeleted
-  - DeveloperName
-  - Language
-  - MasterLabel
-  - NamespacePrefix
-  - CreatedDate
-  - CreatedById
-  - LastModifiedDate
-  - LastModifiedById
-  - ExternalClientApplicationId
-  - Version
-  - DevicePlatform
-  - MinimumOsVersion
-  - DeviceType
-  - Policy1
-  - Policy2
-  - DevManagedPolicyFieldsPolicy1
-  - DevManagedPolicyFieldsPolicy2
   - SystemModstamp
 - name: FeedAttachment
   fields:
@@ -7671,119 +7472,6 @@ objects:
   - Name
   - Label
   watermark_field: null
-- name: GenAiFunctionDefinition
-  fields:
-  - Id
-  - IsDeleted
-  - DeveloperName
-  - Language
-  - MasterLabel
-  - NamespacePrefix
-  - CreatedDate
-  - CreatedById
-  - LastModifiedDate
-  - LastModifiedById
-  - Description
-  - InvocationTargetType
-  - InvocationTarget
-  - IsConfirmationRequired
-  - SystemModstamp
-  rag_fields:
-  - Description
-- name: GenAiPlannerAttrDefinition
-  fields:
-  - Id
-  - IsDeleted
-  - ParentId
-  - DeveloperName
-  - Language
-  - MasterLabel
-  - CreatedDate
-  - CreatedById
-  - LastModifiedDate
-  - LastModifiedById
-  - Description
-  - MappingType
-  - ParameterName
-  - SystemModstamp
-  rag_fields:
-  - Description
-- name: GenAiPlannerDefinition
-  fields:
-  - Id
-  - IsDeleted
-  - DeveloperName
-  - Language
-  - MasterLabel
-  - NamespacePrefix
-  - CreatedDate
-  - CreatedById
-  - LastModifiedDate
-  - LastModifiedById
-  - Description
-  - PlannerType
-  - Capabilities
-  - SystemModstamp
-  rag_fields:
-  - Description
-- name: GenAiPlannerFunctionDef
-  fields:
-  - Id
-  - IsDeleted
-  - CreatedDate
-  - CreatedById
-  - LastModifiedDate
-  - LastModifiedById
-  - PlannerId
-  - Plugin
-  - SystemModstamp
-- name: GenAiPluginDefinition
-  fields:
-  - Id
-  - IsDeleted
-  - DeveloperName
-  - Language
-  - MasterLabel
-  - NamespacePrefix
-  - CreatedDate
-  - CreatedById
-  - LastModifiedDate
-  - LastModifiedById
-  - Description
-  - PluginType
-  - Scope
-  - SystemModstamp
-  rag_fields:
-  - Description
-  - Scope
-- name: GenAiPluginFunctionDef
-  fields:
-  - Id
-  - IsDeleted
-  - CreatedDate
-  - CreatedById
-  - LastModifiedDate
-  - LastModifiedById
-  - PluginId
-  - Function
-  - SystemModstamp
-- name: GenAiPluginInstructionDef
-  fields:
-  - Id
-  - IsDeleted
-  - GenAiPluginDefinitionId
-  - DeveloperName
-  - Language
-  - MasterLabel
-  - NamespacePrefix
-  - CreatedDate
-  - CreatedById
-  - LastModifiedDate
-  - LastModifiedById
-  - Description
-  - SystemModstamp
-  rag_fields:
-  - Description
 - name: GoalAssignment
   fields:
   - Id
@@ -9536,14 +9224,6 @@ objects:
   - LastModifiedById
   - LicensedCustomPermissionId
   - SystemModstamp
-- name: LightningExitByPageMetrics
-  fields:
-  - Id
-  - MetricsDate
-  - UserId
-  - PageName
-  - RecordCount
-  - SystemModstamp
 - name: LightningExperienceTheme
   fields:
   - Id
@@ -9582,91 +9262,6 @@ objects:
   - SystemModstamp
   rag_fields:
   - CustomQuestion
-- name: LightningToggleMetrics
-  fields:
-  - Id
-  - MetricsDate
-  - UserId
-  - Action
-  - RecordCount
-  - SystemModstamp
-- name: LightningUsageByAppTypeMetrics
-  fields:
-  - Id
-  - MetricsDate
-  - UserId
-  - AppExperience
-  - SystemModstamp
-- name: LightningUsageByBrowserMetrics
-  fields:
-  - Id
-  - MetricsDate
-  - PageName
-  - Browser
-  - RecordCountEPT
-  - TotalCount
-  - SumEPT
-  - EptBinUnder3
-  - EptBin3To5
-  - EptBin5To8
-  - EptBin8To10
-  - EptBinOver10
-  - SystemModstamp
-- name: LightningUsageByFlexiPageMetrics
-  fields:
-  - Id
-  - MetricsDate
-  - FlexiPageType
-  - FlexiPageNameOrId
-  - RecordCountEPT
-  - TotalCount
-  - MedianEPT
-  - SumEPT
-  - EptBinUnder3
-  - EptBin3To5
-  - EptBin5To8
-  - EptBin8To10
-  - EptBinOver10
-  - CoresBinUnder2
-  - CoresBin2To4
-  - CoresBin4To8
-  - CoresBinOver8
-  - DownlinkBinUnder3
-  - DownlinkBin3To5
-  - DownlinkBin5To8
-  - DownlinkBin8To10
-  - DownlinkBinOver10
-  - RttBinUnder50
-  - RttBin50To150
-  - RttBinOver150
-  - SystemModstamp
-- name: LightningUsageByPageMetrics
-  fields:
-  - Id
-  - MetricsDate
-  - UserId
-  - PageName
-  - RecordCountEPT
-  - TotalCount
-  - SumEPT
-  - EptBinUnder3
-  - EptBin3To5
-  - EptBin5To8
-  - EptBin8To10
-  - EptBinOver10
-  - CoresBinUnder2
-  - CoresBin2To4
-  - CoresBin4To8
-  - CoresBinOver8
-  - DownlinkBinUnder3
-  - DownlinkBin3To5
-  - DownlinkBin5To8
-  - DownlinkBin8To10
-  - DownlinkBinOver10
-  - RttBinUnder50
-  - RttBin50To150
-  - RttBinOver150
-  - SystemModstamp
 - name: ListView
   fields:
   - Id
@@ -10945,21 +10540,6 @@ objects:
   - MetricKey
   - MetricValue
   - SystemModstamp
-- name: MlIntentUtterance
-  fields:
-  - Id
-  - IsDeleted
-  - CreatedDate
-  - CreatedById
-  - LastModifiedDate
-  - LastModifiedById
-  - Utterance
-  - MlDomainName
-  - MlIntentName
-  - Language
-  - SystemModstamp
-  rag_fields:
-  - Utterance
 - name: MobileApplicationDetail
   fields:
   - Id
@@ -19179,24 +18759,6 @@ objects:
   - IsDeleted
   - LastModifiedDate
   watermark_field: LastModifiedDate
-- name: VoiceVendorInfo
-  fields:
-  - Id
-  - IsDeleted
-  - CreatedDate
-  - CreatedById
-  - LastModifiedDate
-  - LastModifiedById
-  - VendorAccountKey
-  - VendorProviderName
-  - VendorType
-  - IsActive
-  - CorporateNumber
-  - LocalPresenceDefaultNumber
-  - TenantConfigVersion
-  - IsStirShakenEnrolled
-  - IsCallerIdTwilioVerified
-  - SystemModstamp
 - name: WaveAutoInstallRequest
   fields:
   - Id

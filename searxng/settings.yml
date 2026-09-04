@@ -110,8 +110,24 @@ engines:
   # the candidate pool the reranker then has to sift.
   - name: mwmbl
     disabled: true
+  # Enabled here since 2026-08-30 and contributing NOTHING to the application
+  # until now. SearXNG ships wikipedia with `display_type: ["infobox"]`, so a
+  # normal article is emitted as an infobox and the `results` array stays
+  # empty — measured 2026-09-04: "Alan Turing", "photosynthesis" and
+  # "NVIDIA DGX Spark" each returned results=0, infoboxes=1, and NO error, so
+  # nothing in any log ever said the engine was being ignored. The
+  # orchestrator's SearxngProvider reads `data["results"]` only, so every one
+  # of those summaries was dropped on the floor.
+  #
+  # Adding "list" (the upstream file documents this exact knob: "add 'list' to
+  # the array to get results in the results list") puts the same summary in
+  # `results` where the provider can see it, and KEEPS "infobox" so the HTML
+  # UI still renders the panel. The payload is a clean encyclopaedic paragraph
+  # with the canonical wikipedia URL — better evidence for a factual question
+  # than a 140-character SERP snippet.
   - name: wikipedia
     disabled: false
+    display_type: ["infobox", "list"]
   - name: github
     disabled: false
   # RATE LIMITED, not slow — so a bigger timeout would not have helped and was
@@ -150,6 +166,19 @@ engines:
   # for an English question about DGX Spark. Volume is not the goal — usable
   # sources are. yandex stays because its index is general-web rather than
   # region-locked.
+  # KEPT despite failing intermittently, and the reason is the failure MODE.
+  # Measured 2026-09-04 it answers roughly half the time; the rest return
+  # KeyError('results') in duckduckgo_web.py — DDG serving a shape that is not
+  # the expected JSON, i.e. an anti-bot response. That is upstream behaviour we
+  # cannot configure away.
+  #
+  # It stays because a FAST failure is nearly free, unlike the timeouts that
+  # got yahoo/wikidata/arxiv/semantic-scholar disabled above. General queries
+  # where duckduckgo web errored took 0.60-1.12 s — indistinguishable from the
+  # ones where it succeeded — because the error comes back immediately instead
+  # of burning the 3.0 s request budget. So it costs no latency and adds
+  # results whenever it does answer. Disable it only if it starts timing out
+  # rather than erroring.
   - name: duckduckgo web
     disabled: false
   - name: yandex
@@ -169,6 +198,38 @@ engines:
   - name: wiby
     disabled: true
 
+  # --- Category-pool engines (news / science). Same rule as the general pool:
+  # an engine that never answers is not supply, it is latency. ---
+  #
+  # RATE LIMITED UPSTREAM, exactly like arxiv above, and confirmed against the
+  # API rather than inferred: probed from this container 2026-09-04, the first
+  # request took 19.31 s and the next two returned HTTP 429 with the body
+  # "Too Many Requests. Please wait and try again or apply for a key for higher
+  # rate limits." Live, it was 0/8 over eight science queries (timeout x2,
+  # Suspended x3, parsing error x3) and it WAS the science tail: the queries it
+  # had not yet benched itself on pinned to exactly 5.02 s.
+  #
+  # The pool is unaffected by removing it — the same eight queries still
+  # answered 8/8 from google scholar, pubmed and openaire publications
+  # (19-50 results each). Re-enable if an S2 API key is ever configured.
+  - name: semantic scholar
+    disabled: true
+  # 429 "Too Many Requests" on both direct probes of search.brave.com/news
+  # (2026-09-04), and 0/6 live over six news queries. Brave's general engine is
+  # already disabled a few lines above for the same reason — this is the news
+  # sibling of it and shares the same upstream quota, so it fails the same way.
+  # The news pool is healthy without it: bing news 6/6, duckduckgo news 6/6,
+  # reuters 5/6, mean 1.02 s.
+  #
+  # NOTE: `wikinews` is deliberately NOT disabled despite appearing alongside
+  # brave.news as "too many requests" in the same run. That was a transient
+  # burst, not a block: the exact URL SearXNG had just failed on returned
+  # HTTP 200 three times in a row from this container, and once the 180 s
+  # suspension expired the engine answered normally (5 results). Benching an
+  # engine that recovers on its own would be throwing away working supply.
+  - name: brave.news
+    disabled: true
+
 # Upstreams occasionally drop HTTP/2 streams mid-response, which httpx surfaces
 # as RemoteProtocolError("Server disconnected") and costs that engine's whole
 # result set for the query (logged 2026-08-30). HTTP/1.1 is the boring path
@@ -177,13 +238,23 @@ outgoing:
   enable_http2: false
   retries: 1
   # NO request_timeout override here, and that is a decision, not an omission.
-  # A 3.0 s cap was tried on 2026-09-04 and made things measurably worse: bing
-  # went from answering 8/8 queries to timing out on 8/8, and every search
-  # pinned to exactly 3.06 s — the cap became the cost. Measured per engine
-  # afterwards, bing is the FASTEST of them at 335 ms mean (arxiv 584,
-  # duckduckgo 781, yandex 825, yahoo 999, github 1145), so nothing here is
-  # slow enough to need cutting off. SearXNG's own default budget already
-  # bounds the tail; a second cap on top of it only removed good results.
+  # SearXNG's own default is already request_timeout: 3.0 (verified in the
+  # image's /usr/local/searxng/searx/settings.yml, line 179), so writing 3.0
+  # here would change nothing and writing less would only cut good engines off.
+  #
+  # CORRECTION to the note that used to stand here. It read that a 3.0 s cap
+  # "made things measurably worse: bing went from answering 8/8 to timing out
+  # on 8/8". The observation was real; the diagnosis was wrong, and it was not
+  # the timeout. Bing was failing on NAME RESOLUTION: `www.bing.com A` took
+  # 5.05-8.01 s through the host's systemd-resolved stub and sometimes returned
+  # "no servers could be reached", while the same query against 8.8.8.8 /
+  # 1.1.1.1 / 9.9.9.9 answered in 0.03-0.09 s. A DNS stall longer than the 3.0 s
+  # budget is recorded as an engine timeout, which benches bing for 180 s — so
+  # it looked exactly like a timeout problem. The fix is the explicit `dns:`
+  # list on the searxng service in compose.yaml; with it, bing resolves in
+  # 0.02 s cold and went straight back to 8/8. Bing is in fact the FASTEST
+  # engine here (0.23 s to /search once resolved), which is why it was worth
+  # chasing rather than disabling.
   # Wikimedia's user-agent policy REJECTS a UA with no contact: query.wikidata.org
   # answered 403 "Please respect our user-agent policy" to the default
   # "SearXNG/2026.7.30", and 200 to the same request with a contact appended

@@ -11,6 +11,7 @@ Pure-ish: stdlib only, no app imports. The caller supplies the directory.
 from __future__ import annotations
 
 import asyncio
+import re
 import tempfile
 import time
 from pathlib import Path
@@ -18,11 +19,106 @@ from pathlib import Path
 from .exports import slugify
 
 
+# ---------------------------------------------------------------------------
+# Nothing the renderer can fetch
+#
+# WeasyPrint resolves every reference in the HTML pandoc hands it, and it does
+# so with its own HTTP stack — not through core.net.safe_fetch, which guards
+# every other outbound request in this application. PROVEN on 2026-09-04: a
+# report containing three references to a loopback address produced three GET
+# requests from inside the container:
+#
+#     ![probe](http://127.0.0.1:PORT/INTERNAL-SSRF)   -> GET /INTERNAL-SSRF
+#     ![probe2](http://127.0.0.1:PORT/second)         -> GET /second
+#     <img src="http://127.0.0.1:PORT/rawhtml">       -> GET /rawhtml
+#
+# `file:///etc/passwd` and `http://169.254.169.254/latest/meta-data/` are the
+# same code path. It matters because report markdown is not ours alone: a Deep
+# Research report is written from web pages, and a page that gets a marker
+# into the text gets a fetch out of the exporter.
+#
+# The ONE legitimate case is a chart this application just wrote next to the
+# markdown — `report.py` emits `![title](chart-abc.png)`, a bare filename
+# resolved through pandoc's --resource-path. So the rule is simply: a
+# reference may be a plain local filename and nothing else.
+# ---------------------------------------------------------------------------
+
+#: `![alt](target)` — the target is what the renderer would fetch.
+_MD_IMAGE = re.compile(r"!\[([^\]]*)\]\(\s*([^)\s]+)[^)]*\)")
+
+#: Raw HTML that pulls a resource. Pandoc passes HTML through untouched.
+#: Raw HTML that pulls a resource. Pandoc passes HTML through untouched.
+#:
+#: The tag-name boundary is a LOOKAHEAD, not \b. Written as \b through a
+#: shell heredoc it became a literal backspace (0x08) in the pattern, so the
+#: expression required a control character after the tag name and matched
+#: nothing at all — the guard was there, imported, called, and silently
+#: inert, which a passing test on markdown images would never have caught.
+_HTML_FETCHERS = re.compile(
+    r"<\s*/?\s*(?:img|link|style|script|iframe|object|embed|video|audio|source)"
+    r"(?=[\s/>])[^>]*>",
+    re.IGNORECASE,
+)
+
+#: `<style>` and `<script>` must go with their CONTENTS, not just their tags:
+#: the fetch lives in the body — `@import url("http://…")`, or a script that
+#: loads anything it likes — so removing the wrapper alone leaves the URL in
+#: the document for the renderer to resolve.
+_HTML_ELEMENTS_WITH_BODY = re.compile(
+    r"<\s*(style|script)\b[^>]*>.*?<\s*/\s*\1\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
+
+def _is_local_asset(target: str) -> bool:
+    """A bare filename beside the markdown, and nothing more.
+
+    Rejects a scheme (`http:`, `file:`, `data:`), a protocol-relative `//`,
+    an absolute path, any directory component, and traversal. Those are the
+    only shapes that can leave the resource directory.
+    """
+    t = target.strip().strip("'\"")
+    if not t or ":" in t or t.startswith(("/", "//", "#", "?")):
+        return False
+    if "/" in t or "\\" in t or ".." in t:
+        return False
+    return True
+
+
+def sanitise_for_render(markdown: str) -> str:
+    """Remove every reference the PDF renderer could fetch.
+
+    Links are LEFT ALONE: `[text](https://example.com)` is not fetched by
+    WeasyPrint, and in a research report those links are the citations — the
+    whole point of the document. Only things that are *loaded* are removed.
+    """
+
+    def _image(m: re.Match) -> str:
+        alt, target = m.group(1), m.group(2)
+        if _is_local_asset(target):
+            return m.group(0)
+        # Keep the alt text so the reader sees that something was referenced,
+        # and keep it as text so nothing resolves it.
+        return f"[image omitted: {alt}]" if alt else "[image omitted]"
+
+    without_bodies = _HTML_ELEMENTS_WITH_BODY.sub("", markdown)
+    return _HTML_FETCHERS.sub("", _MD_IMAGE.sub(_image, without_bodies))
+
+
 class ReportRenderError(RuntimeError):
     """Raised when pandoc could not produce the requested file."""
 
 
 async def _run_pandoc(md_path: Path, out_path: Path, resource_dir: Path) -> None:
+    # Sanitise HERE rather than at the call sites: this function is the one
+    # thing every PDF passes through, and a guard a caller can forget is not a
+    # guard.
+    try:
+        original = md_path.read_text(encoding="utf-8")
+        cleaned = sanitise_for_render(original)
+        if cleaned != original:
+            md_path.write_text(cleaned, encoding="utf-8")
+    except OSError:
+        pass  # unreadable markdown fails in pandoc below, with its own message
     cmd = [
         "pandoc",
         str(md_path),
