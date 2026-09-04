@@ -730,3 +730,43 @@ describe('the composer offering dictation', () => {
     expect(box.value).toBe('half a thought');
   });
 });
+
+// ---------------------------------------------------------------------------
+// The header that made the whole feature impossible
+// ---------------------------------------------------------------------------
+
+describe('the browser is actually allowed to open the microphone', () => {
+  /**
+   * `Permissions-Policy: microphone=()` is an empty ALLOWLIST, not a default.
+   * It tells the browser that NO origin may use the microphone, so
+   * getUserMedia is refused before the person is ever prompted — and the
+   * refusal arrives as NotAllowedError, which is indistinguishable from
+   * someone clicking Block. Shipped that way, the composer told every user
+   * "allow it in your browser settings" and no setting they could reach would
+   * have helped.
+   *
+   * This reads the real config rather than mocking it, because the failure it
+   * guards is precisely a config file drifting away from the feature.
+   */
+  // `import.meta.url` is an http URL under jsdom, so the config is read from
+  // the working directory instead — vitest runs with the frontend root as cwd.
+  async function permissionsPolicy(): Promise<string> {
+    const { readFileSync } = await import('node:fs');
+    const config = readFileSync(`${process.cwd()}/next.config.mjs`, 'utf8');
+    return config.match(/value: '([^']*microphone[^']*)'/)?.[1] ?? '';
+  }
+
+  it('does not send an empty microphone allowlist', async () => {
+    const header = await permissionsPolicy();
+    expect(header).toBeTruthy();
+    expect(header).not.toContain('microphone=()');
+    expect(header).toContain('microphone=(self)');
+  });
+
+  it('still denies the camera and geolocation outright', async () => {
+    // Dictation needed one permission. It must not have quietly bought three.
+    const header = await permissionsPolicy();
+    expect(header).toContain('camera=()');
+    expect(header).toContain('geolocation=()');
+  });
+});
