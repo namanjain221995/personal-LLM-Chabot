@@ -26,6 +26,7 @@ import re
 import time
 from collections import OrderedDict
 from collections.abc import Mapping
+from contextvars import ContextVar
 from typing import AsyncIterator, List, Optional, Sequence, Tuple
 
 from . import context, metrics
@@ -34,6 +35,90 @@ from .context import clip_message_contents
 from .model_capabilities import ModelCapabilities, ReasoningField
 
 log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Token accounting for one chat turn (V18 telemetry).
+#
+# A turn is rarely one model call: a route classification, the answer, a
+# vision pass and a thinking-budget fallback are all calls, and an operator
+# asks "what did this turn cost", not "what did the third call cost". So
+# these ACCUMULATE and the caller resets once per turn — the same ContextVar
+# idiom, and the same per-asyncio-task scope, as context._trim_notice.
+#
+# Exactness matters more than coverage: only what the SERVER reports is
+# counted. Where a runtime cannot report usage the fields stay None and the
+# analytics console says "not measured" rather than showing a guess.
+# ---------------------------------------------------------------------------
+
+_usage: ContextVar[Optional[dict]] = ContextVar("_usage", default=None)
+
+#: Turned off for the process the first time a server rejects the option, so
+#: an unsupporting runtime costs one failed stream, not every stream.
+_ASK_FOR_USAGE = {"enabled": True}
+
+
+def reset_usage() -> None:
+    """Start a fresh turn's accounting. Call once per chat request."""
+    _usage.set(None)
+
+
+def get_usage() -> Optional[dict]:
+    """Totals for this turn, or None when no call reported any.
+
+    None means NOT MEASURED. It must never be rendered as zero.
+    """
+    return _usage.get()
+
+
+def _record_usage(prompt: int, completion: int) -> None:
+    prev = _usage.get() or {"prompt_tokens": 0, "completion_tokens": 0, "calls": 0}
+    _usage.set(
+        {
+            "prompt_tokens": prev["prompt_tokens"] + max(0, int(prompt or 0)),
+            "completion_tokens": prev["completion_tokens"] + max(0, int(completion or 0)),
+            "calls": prev["calls"] + 1,
+        }
+    )
+
+
+def _capture_usage(chunk) -> None:
+    """Read the usage chunk vLLM sends last. It carries no choices, so every
+    streaming loop here already skips it for text purposes."""
+    usage = getattr(chunk, "usage", None)
+    if usage is None:
+        return
+    _record_usage(
+        getattr(usage, "prompt_tokens", 0) or 0,
+        getattr(usage, "completion_tokens", 0) or 0,
+    )
+
+
+async def _open_stream(client, request: dict):
+    """Open a streamed completion, asking for usage when the server allows it.
+
+    `stream_options` is an OpenAI-API extension. A server that does not know
+    it answers 400, which would otherwise turn a telemetry nicety into a total
+    outage — so the first refusal drops the option for the whole process and
+    the request is retried exactly as it would have been sent before.
+    """
+    if not _ASK_FOR_USAGE["enabled"]:
+        request.pop("stream_options", None)
+        return await client.chat.completions.create(**request)
+    ask = dict(request)
+    ask["stream_options"] = {"include_usage": True}
+    try:
+        return await client.chat.completions.create(**ask)
+    except Exception as exc:  # noqa: BLE001 — any refusal, not just 400
+        if not _ASK_FOR_USAGE["enabled"]:
+            raise
+        _ASK_FOR_USAGE["enabled"] = False
+        log.warning(
+            "this runtime refused stream_options.include_usage (%s: %s); "
+            "token telemetry will read 'not measured' until restart",
+            type(exc).__name__, exc,
+        )
+        request.pop("stream_options", None)
+        return await client.chat.completions.create(**request)
 
 # Local inference servers: the key is a placeholder, never a real secret.
 LOCAL_API_KEY = "local-no-key"
@@ -277,8 +362,9 @@ async def stream_chat_completion(
     extra_body = reasoning_extra_body(settings.main_capabilities, thinking)
     if extra_body is not None:
         request["extra_body"] = extra_body
-    stream = await client.chat.completions.create(**request)
+    stream = await _open_stream(client, request)
     async for chunk in stream:
+        _capture_usage(chunk)
         if not chunk.choices:
             continue
         delta = chunk.choices[0].delta
@@ -530,7 +616,7 @@ async def stream_chat_events(
     import time as _time
 
     started = _time.monotonic()
-    stream = await client.chat.completions.create(**request)
+    stream = await _open_stream(client, request)
     async for chunk in stream:
         elapsed = _time.monotonic() - started
         if elapsed > settings.gen_wall_clock_s:
@@ -549,6 +635,7 @@ async def stream_chat_events(
                 "guard; the text above is what was produced]",
             )
             return
+        _capture_usage(chunk)
         if not chunk.choices:
             continue
         delta = chunk.choices[0].delta
@@ -584,8 +671,9 @@ async def stream_chat_events(
                     fallback["extra_body"] = fb_extra
                 else:
                     fallback.pop("extra_body", None)
-                fb_stream = await client.chat.completions.create(**fallback)
+                fb_stream = await _open_stream(client, fallback)
                 async for fb_chunk in fb_stream:
+                    _capture_usage(fb_chunk)
                     if not fb_chunk.choices:
                         continue
                     fb_delta = fb_chunk.choices[0].delta
@@ -854,14 +942,18 @@ async def vision_chat_stream(
     [{"type": "text", ...}, {"type": "image_url", "image_url": {"url": "data:..."}}].
     """
     client = _client(settings.vision_base_url)
-    stream = await client.chat.completions.create(
-        model=settings.vision_model,
-        messages=normalize_system(messages),
-        temperature=temperature,
-        max_tokens=max_tokens,
-        stream=True,
+    stream = await _open_stream(
+        client,
+        dict(
+            model=settings.vision_model,
+            messages=normalize_system(messages),
+            temperature=temperature,
+            max_tokens=max_tokens,
+            stream=True,
+        ),
     )
     async for chunk in stream:
+        _capture_usage(chunk)
         if not chunk.choices:
             continue
         delta = chunk.choices[0].delta

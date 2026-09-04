@@ -41,6 +41,18 @@ _ALLOWED = {
     },
     "result": {"hit", "miss", "fresh", "stale", "ok", "fail"},
     "job": {"index", "refresh", "expand"},
+    # Speech to text. The vocabulary is the ASR model's own published set
+    # (app/asr.SUPPORTED_LANGUAGES) plus "unknown" for a clip whose language
+    # was not identified. Closed for the usual reason: a mis-parsed engine
+    # reply must not be able to mint a new series.
+    "language": {
+        "Chinese", "English", "Cantonese", "Arabic", "German", "French",
+        "Spanish", "Portuguese", "Indonesian", "Italian", "Korean", "Russian",
+        "Thai", "Vietnamese", "Japanese", "Turkish", "Hindi", "Malay",
+        "Dutch", "Swedish", "Danish", "Finnish", "Polish", "Czech",
+        "Filipino", "Persian", "Greek", "Romanian", "Hungarian", "Macedonian",
+        "unknown",
+    },
 }
 
 

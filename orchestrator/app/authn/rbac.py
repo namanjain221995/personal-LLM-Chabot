@@ -34,6 +34,12 @@ class Cap(str, Enum):
     WORKSPACE_CONTENT_READ = "workspace_content.read"
     SESSIONS_MANAGE = "sessions.manage"
     SETTINGS_MANAGE = "settings.manage"
+    #: The analytics console: platform-wide usage, per-person leaderboards and
+    #: the inference/GPU telemetry behind them. SUPER_ADMIN only — an admin
+    #: runs the workspace's people, not its infrastructure, and per-person
+    #: consumption is closer to the audit log than to the member list. It is
+    #: absent from _ADMIN_CAPS deliberately; do not add it there.
+    ANALYTICS_READ = "analytics.read"
 
 
 #: What each role can do. SUPER_ADMIN is computed as "everything" so a new

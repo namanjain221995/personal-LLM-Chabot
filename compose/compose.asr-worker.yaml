@@ -1,0 +1,100 @@
+# Speech-to-text for the composer's microphone — Qwen3-ASR on Spark 2.
+#
+# This file does NOT run on Spark 1 in dual mode. scripts/asr.sh copies it to
+# the worker's $HOME/.techsara-cluster/ and starts it there as its own Compose
+# project (sf-local-ai-asr), exactly the way compose.monitoring-worker.yaml is
+# handled by scripts/monitoring.sh.
+#
+# WHY ITS OWN PROJECT, AND WHY THE WORKER.
+#
+# Its own project because the worker's other stack (sf-local-ai-worker) is the
+# main model's tensor-parallel rank 1. Touching that project restarts the LLM
+# for the whole platform. A separate project means starting, restarting or
+# removing speech-to-text never comes near it.
+#
+# The worker because that is where the memory is. Measured 2026-09-04, before
+# this service existed:
+#
+#     spark-1 (head)    76.1 GB of GPU memory allocated, 29 GB system free
+#     spark-2 (worker)  30.0 GB allocated, 75 GB system free
+#
+# The head already carries the main model's rank 0, the vision router, the
+# embedder, OCR and the reranker. Qwen3-ASR-1.7B is 4.4 GB of weights; it fits
+# on either node, but only one of them has room to spare, and the main model
+# must keep its priority.
+#
+# BINDING — READ compose.monitoring-worker.yaml's BINDING NOTE BEFORE CHANGING
+# THIS. The orchestrator lives on Spark 1, so this port has to be reachable
+# off-box, and it binds the worker's MANAGEMENT address (ASR_BIND), never
+# 0.0.0.0 and never the 10.100.x RoCE addresses — audio must not share the
+# fabric the tensor-parallel model runs on. It uses host networking with vLLM
+# binding the address ITSELF rather than a published port, because a published
+# `192.168.9.68:30006:30006` does not survive a reboot: Docker binds before
+# the NIC has its address, the container dies before its process starts, and
+# `restart: unless-stopped` never engages. Bound inside the container, a
+# missing address is an ordinary process failure the restart policy retries.
+
+x-asr-logging: &asr-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  vllm-asr:
+    build:
+      context: ./asr
+      dockerfile: Dockerfile
+      args:
+        ASR_BASE_IMAGE: ${ASR_BASE_IMAGE:-vllm/vllm-openai:nightly}
+    image: ${ASR_IMAGE:-techsara-asr:local}
+    command: >
+      --model ${ASR_MODEL_CONTAINER_PATH:?ASR_MODEL_CONTAINER_PATH must be set}
+      --served-model-name ${ASR_MODEL:-Qwen/Qwen3-ASR-1.7B}
+      --host ${ASR_BIND:?ASR_BIND must be set - the management IP to serve on}
+      --port ${ASR_PORT:-30006}
+      --max-model-len ${ASR_MAX_MODEL_LEN:-8192}
+      --gpu-memory-utilization ${ASR_GPU_MEMORY_UTILIZATION:-0.08}
+      --max-num-seqs ${ASR_MAX_NUM_SEQS:-8}
+      --limit-mm-per-prompt '{"audio": 1}'
+    environment:
+      HF_HOME: /root/.cache/huggingface
+      # The weights are fetched by scripts/asr.sh before the service starts,
+      # so the engine never reaches the network at run time.
+      HF_HUB_OFFLINE: "1"
+    volumes:
+      - type: bind
+        source: ${ASR_MODEL_CACHE:?ASR_MODEL_CACHE must be set - the model cache on THIS host}
+        target: /models
+        read_only: true
+      - hf-cache:/root/.cache/huggingface
+    # See the BINDING note above — this is not a style choice.
+    network_mode: host
+    ipc: host
+    shm_size: 8g
+    restart: unless-stopped
+    healthcheck:
+      # /v1/models is the cheapest proof that the ENGINE is up, not just the
+      # HTTP server: vLLM does not serve it until the model has loaded. The
+      # probe reads the same two variables the process binds, so the two can
+      # never drift apart (the lesson from the GPU exporter's fixed 127.0.0.1).
+      test:
+        - CMD-SHELL
+        - >-
+          curl -fsS -m 5 "http://${ASR_BIND:-127.0.0.1}:${ASR_PORT:-30006}/v1/models"
+          -o /dev/null || exit 1
+      interval: 30s
+      timeout: 10s
+      retries: 40
+      start_period: 5m
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    logging: *asr-logging
+
+volumes:
+  hf-cache:

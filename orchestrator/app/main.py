@@ -18,7 +18,9 @@ from pydantic import BaseModel, model_validator
 
 from . import context, db, llm
 from .auth import UserRow, require_user, router as auth_router
+from .audio_api import router as audio_router
 from .authn.admin_api import router as admin_router
+from .authn.analytics_api import router as analytics_router
 from .config import settings
 
 # App-module logging was silently dropped: uvicorn configures only its own
@@ -131,8 +133,15 @@ async def _reject_cross_site_writes(request: Request, call_next):
 app.include_router(auth_router)
 app.include_router(history_router)
 app.include_router(uploads_router)
+# Speech to text for the composer. Its own router because it is the only
+# route that takes audio, and the only one gated on Feature.VOICE_INPUT.
+app.include_router(audio_router)
 app.include_router(memory_router)
 app.include_router(admin_router)
+# The analytics console. Its own router because its gate is its own
+# capability: SUPER_ADMIN only, where the admin surface above is
+# capability-per-route (see authn/rbac.Cap.ANALYTICS_READ).
+app.include_router(analytics_router)
 
 
 class LiveGeneration:
@@ -240,6 +249,58 @@ def _spawn_background_compaction(
     )
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
+
+
+async def _record_usage_event(
+    gen: LiveGeneration, timing: dict, workspace_id: str, effort: str
+) -> None:
+    """Persist one turn's telemetry (V18). Called from the generation's
+    `finally`, so it runs for a completed answer, a cancelled one and a failed
+    one alike — an error rate computed only from successes is not an error
+    rate.
+
+    Everything here is metadata that already exists at this point: the meta
+    the engine emitted (route, model, mode), the wall clock this request
+    measured, and the token counts the SERVING RUNTIME reported. Nothing is
+    estimated; a count nobody made stays NULL.
+    """
+    from . import usage
+
+    meta = gen.final_meta or {}
+    tokens = llm.get_usage() or {}
+    status = (
+        usage.CANCELLED if gen.cancelled else usage.ERROR if gen.failed else usage.OK
+    )
+    ttft = timing.get("first_token")
+    started = timing.get("started")
+    from time import perf_counter as _pc
+
+    duration = (_pc() - started) if started is not None else None
+    # `context` is what the meter shows the user: the exact prompt size from
+    # vLLM's /tokenize. It is kept beside the runtime's own prompt count
+    # because they answer different questions (what we sent vs what the engine
+    # billed, which differ whenever a prefix cache hits).
+    context_meta = meta.get("context") if isinstance(meta.get("context"), dict) else {}
+    await usage.record_async(
+        user_id=gen.user_id,
+        workspace_id=workspace_id,
+        conversation_id=gen.conversation_id,
+        generation_id=gen.generation_id,
+        route=str(meta.get("route") or ("chat" if status == usage.OK else "unknown")),
+        effort=effort,
+        model=str(meta.get("model") or ""),
+        mode=str(meta.get("mode") or ""),
+        input_tokens=tokens.get("prompt_tokens"),
+        output_tokens=tokens.get("completion_tokens"),
+        ttft_ms=None if ttft is None else int(ttft * 1000),
+        duration_ms=None if duration is None else int(duration * 1000),
+        status=status,
+        meta={
+            "model_calls": int(tokens.get("calls") or 0),
+            "context_tokens": context_meta.get("tokens_used"),
+            "context_window": context_meta.get("window"),
+        },
+    )
 
 
 async def _finalize_generation(conv_key: str, gen: LiveGeneration) -> None:
@@ -958,8 +1019,11 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
         # must be declared here — a `nonlocal` further down would come after
         # the reads above it and fail to compile.
         nonlocal text
-        # Per-request state: this task owns its own trim record.
+        # Per-request state: this task owns its own trim record, and its own
+        # token accounting (V18 — llm._usage is a ContextVar with exactly the
+        # same per-task scope).
         context.reset_trim_notice()
+        llm.reset_usage()
         # Who the model is assisting — safe context for prompt builders
         # (engines append identity.identity_line() to their system prompts).
         from .identity import set_identity
@@ -1921,6 +1985,19 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             gen.failed = True
             await gen.publish("error", {"message": str(exc)})
         finally:
+            # V18 telemetry. HERE rather than in emit(): this block is the one
+            # that runs for every outcome, so a cancelled or failed turn is
+            # counted as cancelled or failed instead of vanishing from the
+            # numbers — which is how error rates come to read as zero.
+            with contextlib.suppress(Exception):
+                await asyncio.shield(
+                    _record_usage_event(
+                        gen,
+                        _timing,
+                        principal.workspace_id,
+                        str(request.effort or ""),
+                    )
+                )
             # shield: finishing the bookkeeping must survive the cancellation
             # that may still be propagating through this task.
             with contextlib.suppress(Exception):

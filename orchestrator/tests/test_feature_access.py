@@ -177,6 +177,12 @@ def test_me_carries_the_resolved_features(login_client):
     me = bob.get("/auth/me").json()
     assert me["features"]["deep_research"] is False
     assert me["features"]["attachments"] is True
+    # EVERY feature in the registry, not just the ones this test names. The
+    # composer decides what to draw from this map alone, so a tool that
+    # reaches the registry but not /auth/me is a control offered to people the
+    # server will refuse — and the newest entry is always the one that would
+    # go missing without this line.
+    assert set(me["features"]) == set(fa.IDS)
     # The super admin's own map is unconditional.
     assert root.get("/auth/me").json()["features"]["deep_research"] is True
 

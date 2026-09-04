@@ -119,3 +119,38 @@ export function seriesColor(palette: ChartPalette, i: number): string {
   const colors = palette.series.length ? palette.series : [...SERIES_FALLBACK];
   return colors[i % colors.length];
 }
+
+/**
+ * Status colours, as literals a canvas can paint.
+ *
+ * Same reason `SERIES_FALLBACK` is here: ECharts draws to a canvas and cannot
+ * resolve `var()`, so the analytics console's "failed" series has to be given
+ * a concrete hex. These mirror `--ts-danger` / `--ts-warn` / `--ts-ok` in
+ * app/globals.css, which stays the single source of truth — `resolveTones`
+ * reads the real values whenever there is a DOM, and these only stand in for
+ * SSR and tests.
+ */
+export interface ChartTones {
+  danger: string;
+  warn: string;
+  ok: string;
+}
+
+export const TONE_FALLBACK: ChartTones = {
+  danger: '#ef5a5f',
+  warn: '#f0a92e',
+  ok: '#3fb950',
+};
+
+export function resolveTones(root?: Element | null): ChartTones {
+  const el = root ?? (typeof document === 'undefined' ? null : document.documentElement);
+  if (!el || typeof getComputedStyle !== 'function') return TONE_FALLBACK;
+  const style = getComputedStyle(el);
+  const token = (name: string, fallback: string) =>
+    style.getPropertyValue(name).trim() || fallback;
+  return {
+    danger: token('--ts-danger', TONE_FALLBACK.danger),
+    warn: token('--ts-warn', TONE_FALLBACK.warn),
+    ok: token('--ts-ok', TONE_FALLBACK.ok),
+  };
+}

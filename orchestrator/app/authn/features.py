@@ -40,6 +40,7 @@ class Feature(str, Enum):
     SALESFORCE = "salesforce"
     SALESFORCE_LIVE = "salesforce_live"
     ATTACHMENTS = "attachments"
+    VOICE_INPUT = "voice_input"
 
 
 @dataclass(frozen=True)
@@ -63,6 +64,15 @@ FEATURES: tuple[FeatureSpec, ...] = (
         id=Feature.ATTACHMENTS,
         label="Photos, files and datasets",
         hint="Upload images, PDFs, documents and spreadsheets to ask about them.",
+        default=True,
+    ),
+    FeatureSpec(
+        id=Feature.VOICE_INPUT,
+        label="Voice input",
+        hint=(
+            "Dictate into the message box. Audio is transcribed on this "
+            "platform's own hardware and never stored."
+        ),
         default=True,
     ),
     FeatureSpec(

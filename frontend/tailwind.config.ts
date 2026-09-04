@@ -45,7 +45,10 @@ const config: Config = {
         // borders, file-chip tints) silently compiled to nothing before.
         danger: 'rgb(var(--ts-danger-rgb) / <alpha-value>)',
         warn: 'var(--ts-warn)',
-        ok: 'var(--ts-ok)',
+        // Same alpha treatment as `accent` and `danger`: as a bare var() the
+        // `ok/NN` opacity modifiers compiled to nothing, so the analytics
+        // console's positive-change badge had green text on no background.
+        ok: 'rgb(var(--ts-ok-rgb) / <alpha-value>)',
       },
       fontFamily: {
         sans: ['"IBM Plex Sans"', 'system-ui', 'sans-serif'],

@@ -11,7 +11,18 @@ const nextConfig = {
   // - nosniff: uploaded/report files must never be content-sniffed into HTML
   // - DENY framing: the chat must not be embeddable for click-jacking
   // - referrer: never leak conversation URLs off-origin
-  // - permissions: this app uses no camera/mic/geolocation
+  // - permissions: camera and geolocation are denied outright; the
+  //   MICROPHONE is allowed for this origin only, because the composer
+  //   dictates through it (2026-09-04).
+  //
+  // `microphone=()` is an empty ALLOWLIST, not a default — it means "no
+  // origin may use the microphone", and the browser then refuses
+  // getUserMedia before it ever prompts. The refusal arrives as
+  // NotAllowedError, indistinguishable from the user clicking Block, so the
+  // UI said "access is blocked, allow it in your browser settings" and no
+  // amount of allowing it in settings could have helped. `self` is the
+  // narrowest value that works: this origin yes, every embed and third party
+  // still no.
   async headers() {
     return [
       {
@@ -22,7 +33,7 @@ const nextConfig = {
           { key: 'Referrer-Policy', value: 'strict-origin-when-cross-origin' },
           {
             key: 'Permissions-Policy',
-            value: 'camera=(), microphone=(), geolocation=()',
+            value: 'camera=(), microphone=(self), geolocation=()',
           },
         ],
       },

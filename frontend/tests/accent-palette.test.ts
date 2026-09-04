@@ -302,6 +302,29 @@ describe('COLOR-11 · nothing but the accent moved', () => {
 
 // ------------------------------------------------------------------ COLOR-12
 
+describe('COLOR-13 · the status tokens carry their channels', () => {
+  /**
+   * Tailwind compiles `bg-ok/12` only when the colour is declared as
+   * `rgb(var(--token-rgb) / <alpha-value>)`. As a bare `var()` the modifier
+   * silently produces NOTHING, which is how the analytics console's
+   * positive-change badge came to render green text on no background — the
+   * same trap `accent` and `danger` were fixed for earlier.
+   */
+  const CONFIG = readFileSync(
+    fileURLToPath(new URL('../tailwind.config.ts', import.meta.url)),
+    'utf8',
+  );
+
+  it('ok is alpha-capable, like accent and danger', () => {
+    expect(CONFIG).toContain("ok: 'rgb(var(--ts-ok-rgb) / <alpha-value>)'");
+  });
+
+  it('and its channels are defined for BOTH themes', () => {
+    // A token defined only on dark turns the badge invisible on paper.
+    expect(CSS.match(/--ts-ok-rgb:/g)?.length).toBe(2);
+  });
+});
+
 describe('COLOR-12 · the remaining greens are the allowlisted ones', () => {
   /**
    * Every green left in the stylesheet, with the reason it stays. The test

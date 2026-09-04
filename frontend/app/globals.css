@@ -79,6 +79,7 @@
      no OK, so "Active" in the admin roster had to borrow the accent — which
      made every active member look like a link. Used as a dot, never as text. */
   --ts-ok: #3fb950;
+  --ts-ok-rgb: 63 185 80; /* channels of --ts-ok — keep in sync */
 
   /* Code syntax tokens (2026-08-06, ChatGPT-style highlighting) — One
      Dark-ish palette, mapped to hljs-* classes at the end of this file. */
@@ -194,6 +195,7 @@ html.light,
   --ts-danger-soft: rgba(198, 42, 48, 0.1);
   --ts-warn: #b26a00;
   --ts-ok: #1a7f37; /* deepened for paper — see the dark value above */
+  --ts-ok-rgb: 26 127 55; /* channels of --ts-ok — keep in sync */
 
   /* Code syntax tokens — One Light-ish, AA on the paper background. */
   --ts-code-comment: #a0a1a7;
