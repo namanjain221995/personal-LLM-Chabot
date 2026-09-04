@@ -29,6 +29,7 @@
  */
 
 import {
+  memo,
   useEffect,
   useId,
   useRef,
@@ -86,7 +87,7 @@ interface SidebarProps {
   restoreFocusRef?: RefObject<HTMLElement | null>;
 }
 
-export function Sidebar({
+function SidebarImpl({
   open,
   onClose,
   conversations,
@@ -473,3 +474,20 @@ export function Sidebar({
     </>
   );
 }
+
+/**
+ * NEW-24 — the sidebar must not re-render because an answer received another
+ * token.
+ *
+ * Nothing here reads the streaming answer: the list shows titles, pins and a
+ * spinner per conversation. It was re-rendering on every frame anyway,
+ * because ChatApp re-renders on every frame and this is one of its children —
+ * measured 721 ms of a 9.3 s streaming run with 40 conversations listed, and
+ * growing linearly with the list.
+ *
+ * Every prop it takes is either React state, a `useCallback`-stable handler,
+ * a ref object, or (for `streamingIds`) an array ChatApp holds at a stable
+ * identity while its contents are unchanged — so the shallow comparison is
+ * exact, and a spinner really appearing or clearing still re-renders it.
+ */
+export const Sidebar = memo(SidebarImpl);
