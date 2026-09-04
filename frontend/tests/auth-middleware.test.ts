@@ -73,3 +73,42 @@ describe('contract details', () => {
     expect(authRedirect('/v1.2/report', false)).toBe('/login');
   });
 });
+
+// ---------------------------------------------------------------------------
+// A shared conversation is the one signed-out page with a variable path
+//
+// PUBLIC_PAGES is an exact-match Set and cannot express `/share/<token>`, so
+// this is the only prefix rule in the gate. It is also the only place a
+// signed-out request is let through, which is why the depth guard matters as
+// much as the prefix.
+// ---------------------------------------------------------------------------
+
+describe('the public share page', () => {
+  it('lets a signed-out visitor through', () => {
+    expect(authRedirect('/share/abc123.def456', false)).toBeNull();
+    expect(authRedirect('/share/abc123.def456/', false)).toBeNull();
+  });
+
+  it('lets a signed-in visitor through too', () => {
+    expect(authRedirect('/share/abc123.def456', true)).toBeNull();
+  });
+
+  it('does NOT make anything deeper public', () => {
+    // `startsWith('/share/')` alone would open every one of these.
+    expect(authRedirect('/share/abc/admin', false)).toBe('/login');
+    expect(authRedirect('/share/abc/def/ghi', false)).toBe('/login');
+  });
+
+  it('does not make the bare prefix public', () => {
+    expect(authRedirect('/share', false)).toBe('/login');
+    expect(authRedirect('/share/', false)).toBe('/login');
+  });
+
+  it('leaves every other page exactly as it was', () => {
+    expect(authRedirect('/', false)).toBe('/login');
+    expect(authRedirect('/admin', false)).toBe('/login');
+    expect(authRedirect('/admin/members', false)).toBe('/login');
+    expect(authRedirect('/sharealike', false)).toBe('/login');
+    expect(authRedirect('/notshare/abc', false)).toBe('/login');
+  });
+});

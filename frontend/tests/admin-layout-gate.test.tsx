@@ -134,3 +134,40 @@ describe('the /admin shell', () => {
     expect(link).not.toBeNull();
   });
 });
+
+describe('the Shared links entry', () => {
+  it('does not exist for an admin without shares.manage', async () => {
+    serveMe(200, ME);
+    mount();
+    await waitFor(() =>
+      expect(screen.getByText('admin page content')).toBeTruthy(),
+    );
+    expect(screen.queryAllByText('Shared links')).toHaveLength(0);
+    expect(document.querySelector('a[href="/admin/shares"]')).toBeNull();
+  });
+
+  it('appears with shares.manage, under Security', async () => {
+    serveMe(200, {
+      ...ME,
+      workspace: { ...ME.workspace, role: 'super_admin' },
+      capabilities: [...ME.capabilities, 'shares.manage'],
+    });
+    mount();
+    await waitFor(() =>
+      expect(screen.getByText('admin page content')).toBeTruthy(),
+    );
+    expect(document.querySelector('a[href="/admin/shares"]')).not.toBeNull();
+    // The group header appears because a link in it does — a Security
+    // heading over nothing is what the grouped rail must not produce.
+    expect(screen.getAllByText('Security').length).toBeGreaterThan(0);
+  });
+
+  it('draws no Security heading when neither capability is held', async () => {
+    serveMe(200, ME);
+    mount();
+    await waitFor(() =>
+      expect(screen.getByText('admin page content')).toBeTruthy(),
+    );
+    expect(screen.queryAllByText('Security')).toHaveLength(0);
+  });
+});

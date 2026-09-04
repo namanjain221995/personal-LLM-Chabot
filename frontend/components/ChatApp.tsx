@@ -122,7 +122,8 @@ import { ClarificationCard } from './ClarificationCard';
 import { SearchPalette } from './SearchPalette';
 import { Sidebar } from './Sidebar';
 import { useToast } from './Providers';
-import { IconArrowDown, IconSidebar } from './icons';
+import { IconArrowDown, IconShare, IconSidebar } from './icons';
+import { ShareDialog } from './ShareDialog';
 
 const APP_NAME =
   process.env.NEXT_PUBLIC_APP_NAME ?? 'TechSara AI';
@@ -1969,6 +1970,17 @@ export function ChatApp() {
 
   const activeTitle =
     conversations.find((c) => c.id === activeId)?.title ?? 'New chat';
+  const [shareOpen, setShareOpen] = useState(false);
+  /* Sharing needs a conversation that EXISTS on the server and has finished
+     saying something. A browser-minted id with nothing behind it has nothing
+     to snapshot, and a half-streamed answer would publish a sentence that
+     stops mid-word — the server refuses both, so this only avoids offering a
+     button that would fail. */
+  const streamingHere = Boolean(activeId && isStreaming(activeId));
+  const canShare = Boolean(
+    activeId &&
+      thread.some((m) => m.role === 'assistant' && m.status !== 'streaming'),
+  );
   /* 2026-09-03 (owner request): the header no longer carries a passive engine
      badge — "Vision" / "Chat" / "Records" in the top-right corner told the
      reader which route answered, which is a fact about the machine rather than
@@ -2339,7 +2351,39 @@ export function ChatApp() {
             </button>
           )}
           <h1 className="sr-only">{activeId ? activeTitle : APP_NAME}</h1>
+          {/* Share (2026-09-05). The header's one deliberate addition since
+              the engine badge was removed: an ACTION, not a passive label.
+              It appears only for a conversation that exists and has finished
+              saying something — sharing a half-streamed answer publishes a
+              sentence that stops mid-word — and the label collapses to the
+              icon on a phone the same way the composer's controls do
+              (Composer.tsx), because `display:none` would leave a nameless
+              button rather than a compact one. */}
+          {canShare && (
+            <button
+              type="button"
+              onClick={() => setShareOpen(true)}
+              aria-label="Share conversation"
+              title={
+                streamingHere
+                  ? 'Wait for the answer to finish'
+                  : 'Share conversation'
+              }
+              disabled={streamingHere}
+              className="ml-auto inline-flex h-8 items-center gap-1.5 rounded-lg px-2.5 text-sm text-muted transition-colors duration-ts hover:bg-surface-2 hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-bg disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              <IconShare size={16} />
+              <span className="sr-only md:not-sr-only">Share</span>
+            </button>
+          )}
         </header>
+        {shareOpen && activeId && (
+          <ShareDialog
+            conversationId={activeId}
+            title={activeTitle}
+            onClose={() => setShareOpen(false)}
+          />
+        )}
 
         <div
           ref={scrollRef}

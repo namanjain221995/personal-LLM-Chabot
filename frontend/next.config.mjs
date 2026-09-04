@@ -37,6 +37,27 @@ const nextConfig = {
           },
         ],
       },
+      {
+        // The public share pages. The Next metadata on /share/[token] already
+        // emits <meta name="robots" content="noindex">; this is the same
+        // instruction as a header, which is what a crawler fetching a
+        // non-HTML sub-resource (or one that never parses the head) sees.
+        //
+        // Note what is deliberately NOT done: robots.txt does not Disallow
+        // /share/. A disallowed URL is never fetched, so the noindex is never
+        // read — and a link somebody posts can then still be indexed as a
+        // bare URL. Letting crawlers in to be told "no" is the only
+        // combination that actually keeps these pages out of an index.
+        //
+        // Referrer-Policy is tightened from the site default: a share URL
+        // carries its own secret, so it must not travel in the Referer header
+        // to any site the shared conversation happens to cite.
+        source: '/share/:path*',
+        headers: [
+          { key: 'X-Robots-Tag', value: 'noindex, nofollow, noarchive, nosnippet' },
+          { key: 'Referrer-Policy', value: 'no-referrer' },
+        ],
+      },
     ];
   },
 };

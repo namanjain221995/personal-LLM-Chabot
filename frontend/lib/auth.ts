@@ -221,6 +221,26 @@ export function userScopeKey(me: {
 const PUBLIC_PAGES = new Set(['/login', '/accept-invite', '/access-removed']);
 
 /**
+ * Prefixes whose ONE next segment is public. Today: a shared conversation,
+ * whose id is in the path and so cannot be an exact-match entry above.
+ *
+ * The depth guard is the point. `startsWith('/share/')` alone would make
+ * EVERY path under it public — `/share/x/anything` included — and this is the
+ * only place in the application where a signed-out request is let through, so
+ * it must let through exactly what it says and nothing deeper.
+ */
+const PUBLIC_PREFIXES = ['/share/'] as const;
+
+function isPublicPrefixPage(page: string): boolean {
+  return PUBLIC_PREFIXES.some(
+    (prefix) =>
+      page.startsWith(prefix) &&
+      page.length > prefix.length &&
+      page.indexOf('/', prefix.length) === -1,
+  );
+}
+
+/**
  * The middleware's redirect decision, pure so it is unit-testable.
  *
  * Gates PAGES only, on cookie PRESENCE only — validity is the server's job
@@ -248,7 +268,11 @@ export function authRedirect(
     // place that makes no sense to show.
     return page === '/login' ? '/' : null;
   }
-  return PUBLIC_PAGES.has(page) ? null : '/login';
+  if (PUBLIC_PAGES.has(page)) return null;
+  // A shared conversation opens for anyone holding the link — that is what a
+  // share IS. The token in the path is the credential; the server checks it.
+  if (isPublicPrefixPage(page)) return null;
+  return '/login';
 }
 
 /* --------------------------------------------------------- 401 handling */

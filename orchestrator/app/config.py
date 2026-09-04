@@ -936,6 +936,26 @@ class Settings:
             "SESSION_SECRET_FILE", "/data/.session_secret"
         )
 
+        # --- Conversation sharing (V20) ---
+        # Off-by-default at the RISKY end only: sharing inside the workspace
+        # is on, sharing to the open internet is a decision a super admin
+        # makes for the workspace rather than one this file makes for them.
+        self.conversation_sharing_enabled: bool = _bool("CONVERSATION_SHARING_ENABLED", True)
+        self.public_sharing_enabled: bool = _bool("PUBLIC_CONVERSATION_SHARING_ENABLED", True)
+        #: Where a share link points. Empty means "same origin as the request",
+        #: which is right for every deployment that is not behind a tunnel with
+        #: a different public name.
+        self.public_share_base_url: str = os.environ.get("PUBLIC_SHARE_BASE_URL", "").rstrip("/")
+        self.public_share_default_days: int = _int("PUBLIC_SHARE_DEFAULT_EXPIRY_DAYS", 30)
+        self.public_share_max_days: int = _int("PUBLIC_SHARE_MAX_EXPIRY_DAYS", 365)
+        #: A link that never expires is a link nobody remembers exists.
+        self.public_share_allow_never: bool = _bool("PUBLIC_SHARE_ALLOW_NEVER_EXPIRE", False)
+        #: Per user, per hour. Creating a share writes a snapshot, so this
+        #: bounds the write amplification of a script as much as the abuse.
+        self.share_create_rate_per_hour: int = _int("SHARE_CREATE_RATE_PER_HOUR", 30)
+        #: Per public id, per minute — the anonymous read path.
+        self.share_view_rate_per_minute: int = _int("SHARE_VIEW_RATE_PER_MINUTE", 120)
+
         # --- Misc ---
         self.session_max_turns: int = _int("SESSION_MAX_TURNS", 20)
         # Read timeout for model calls. For a NON-streaming completion (agent

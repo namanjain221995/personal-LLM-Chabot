@@ -40,6 +40,14 @@ class Cap(str, Enum):
     #: consumption is closer to the audit log than to the member list. It is
     #: absent from _ADMIN_CAPS deliberately; do not add it there.
     ANALYTICS_READ = "analytics.read"
+    #: Govern conversation sharing across the workspace: see every live public
+    #: link, revoke any of them, and set the policy that constrains what
+    #: authors may do. SUPER_ADMIN only, and absent from _ADMIN_CAPS
+    #: deliberately — deciding what may leave the workspace entirely is a
+    #: different question from running the workspace day to day. It grants
+    #: METADATA and revocation, never the ability to read a member's private
+    #: conversation; that stays behind WORKSPACE_CONTENT_READ and its audit.
+    SHARES_MANAGE = "shares.manage"
 
 
 #: What each role can do. SUPER_ADMIN is computed as "everything" so a new

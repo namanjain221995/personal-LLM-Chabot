@@ -132,3 +132,7 @@ export async function PUT(req: Request, ctx: Ctx): Promise<Response> {
 export async function DELETE(req: Request, ctx: Ctx): Promise<Response> {
   return handle(req, ctx);
 }
+
+export async function PATCH(req: Request, ctx: Ctx): Promise<Response> {
+  return handle(req, ctx);
+}

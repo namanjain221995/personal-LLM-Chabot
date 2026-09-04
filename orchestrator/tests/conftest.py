@@ -71,6 +71,11 @@ _APP_TABLES = (
     "documents",
     "url_documents",
     "uploads",
+    # V20 sharing. Both cascade from `conversations`, but TRUNCATE CASCADE
+    # only restarts identity on tables it was told about — and a share id
+    # that keeps climbing across tests makes failures harder to read.
+    "conversation_share_versions",
+    "conversation_shares",
     "conversation_chunks",
     "conversation_summaries",
     "messages",

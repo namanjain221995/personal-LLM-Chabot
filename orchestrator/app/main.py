@@ -20,7 +20,9 @@ from . import context, db, llm
 from .auth import UserRow, require_user, router as auth_router
 from .audio_api import router as audio_router
 from .authn.admin_api import router as admin_router
+from .share_api import router as share_router
 from .authn.analytics_api import router as analytics_router
+from .authn.shares_api import router as shares_admin_router
 from .config import settings
 
 # App-module logging was silently dropped: uvicorn configures only its own
@@ -137,11 +139,19 @@ app.include_router(uploads_router)
 # route that takes audio, and the only one gated on Feature.VOICE_INPUT.
 app.include_router(audio_router)
 app.include_router(memory_router)
+# Conversation sharing. Mounted at the app root because ONE of its routes —
+# /public/shares/{token} — is the only endpoint in this application that
+# answers without a session, and that exception is easier to audit when it is
+# visible here rather than nested under an authenticated prefix.
+app.include_router(share_router)
 app.include_router(admin_router)
 # The analytics console. Its own router because its gate is its own
 # capability: SUPER_ADMIN only, where the admin surface above is
 # capability-per-route (see authn/rbac.Cap.ANALYTICS_READ).
 app.include_router(analytics_router)
+# Share governance, same shape and for the same reason: deciding what may
+# leave the workspace is SUPER_ADMIN's, not the day-to-day admin's.
+app.include_router(shares_admin_router)
 
 
 class LiveGeneration:

@@ -32,6 +32,7 @@ import {
   IconFlask,
   IconGauge,
   IconGrid,
+  IconLink,
   IconMail,
   IconMessages,
   IconMic,
@@ -161,18 +162,24 @@ function navGroups(me: Me): NavGroup[] {
       },
     );
   }
-  if (can(me, 'audit.read')) {
-    groups.push({
-      title: 'Security',
-      items: [
-        {
-          href: '/admin/audit',
-          label: 'Audit Log',
-          icon: <IconShield size={15} />,
-        },
-      ],
+  // Governance: what leaves the workspace, and the trail of who did what.
+  // Both are SUPER_ADMIN capabilities and both 404 server-side without them.
+  const security: NavItem[] = [];
+  if (can(me, 'shares.manage')) {
+    security.push({
+      href: '/admin/shares',
+      label: 'Shared links',
+      icon: <IconLink size={15} />,
     });
   }
+  if (can(me, 'audit.read')) {
+    security.push({
+      href: '/admin/audit',
+      label: 'Audit Log',
+      icon: <IconShield size={15} />,
+    });
+  }
+  if (security.length) groups.push({ title: 'Security', items: security });
   return groups;
 }
 

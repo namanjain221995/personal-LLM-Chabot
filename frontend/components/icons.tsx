@@ -316,3 +316,20 @@ export const IconDiagram = ({ size, className }: IconProps) => (
     <path d="M6.5 8v4h11V8M12 12v4" />
   </svg>
 );
+
+/** Conversation sharing (2026-09-05): the node-and-two-branches share mark. */
+export const IconShare = ({ size, className }: IconProps) => (
+  <svg {...base(size, className)}>
+    <circle cx="18" cy="5" r="3" />
+    <circle cx="6" cy="12" r="3" />
+    <circle cx="18" cy="19" r="3" />
+    <path d="M8.6 13.5l6.8 4M15.4 6.5l-6.8 4" />
+  </svg>
+);
+
+export const IconLink = ({ size, className }: IconProps) => (
+  <svg {...base(size, className)}>
+    <path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7" />
+    <path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7" />
+  </svg>
+);
