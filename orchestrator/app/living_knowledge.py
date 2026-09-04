@@ -42,6 +42,7 @@ from .freshness import Freshness, Verdict, classify
 from .web_memory import (
     Retrieval,
     _stale_after,
+    as_sources,
     claims_block,
     claims_for,
     grounding_block,
@@ -164,7 +165,7 @@ async def _topical(question: str, out: Prepared) -> Prepared:
         return out
     result.evidence = [e for e in result.evidence if _topical_hit(e) or e.relevant]
     out.grounding = topical_block(result, today_iso())
-    out.sources = [e.as_source() for e in result.evidence]
+    out.sources = as_sources(result.evidence)
     out.confidence = result.confidence
     _decided(out, "static_topical")
     return out
@@ -280,7 +281,7 @@ async def prepare(
                 "busy; treat these passages as unverified context.",
                 claims_text,
             )
-            out.sources = [e.as_source() for e in result.evidence]
+            out.sources = as_sources(result.evidence)
         _decided(out, "degraded_busy")
         return out
     if claim_rows:
@@ -303,7 +304,7 @@ async def prepare(
         out.grounding = _join(grounding_block(result, today_iso()), claims_text)
         if not out.grounding:
             out.grounding = f"Current date: {today_iso()}.\n" + claims_text
-        out.sources = [e.as_source() for e in result.evidence]
+        out.sources = as_sources(result.evidence)
         _decided(out, "local")
         return out
 
@@ -320,7 +321,7 @@ async def prepare(
                 staleness_note(result, verdict.max_age_seconds),
                 claims_text,
             )
-            out.sources = [e.as_source() for e in result.evidence]
+            out.sources = as_sources(result.evidence)
         _decided(out, "stale_offline")
         return out
 
@@ -338,7 +339,7 @@ async def prepare(
                 staleness_note(result, verdict.max_age_seconds),
                 claims_text,
             )
-            out.sources = [e.as_source() for e in result.evidence]
+            out.sources = as_sources(result.evidence)
         # Only a CONFIRMED time-sensitive question escalates. The classifier
         # settles the ambiguous case as RECENT ("default") so that a local
         # lookup runs — that is cheap; a full web search for "write me a
@@ -362,7 +363,7 @@ async def prepare(
         if any(e.relevant for e in fresh.evidence):
             fresh.evidence = [e for e in fresh.evidence if e.relevant]
         out.grounding = _join(grounding_block(fresh, today_iso()), claims_text)
-        out.sources = [e.as_source() for e in fresh.evidence]
+        out.sources = as_sources(fresh.evidence)
         out.retrieval = fresh
         out.confidence = fresh.confidence
         metrics.freshness_auto_search(True)
@@ -378,7 +379,7 @@ async def prepare(
             staleness_note(result, verdict.max_age_seconds),
             claims_text,
         )
-        out.sources = [e.as_source() for e in result.evidence]
+        out.sources = as_sources(result.evidence)
     _decided(out, "fast_lookup_failed")
     return out
 
