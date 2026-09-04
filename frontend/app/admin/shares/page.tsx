@@ -50,7 +50,10 @@ interface ShareRow {
   conversation_id: string;
   title: string;
   visibility: 'public' | 'workspace';
-  status: 'active' | 'revoked';
+  /** What the link ACTUALLY does — see the server's _effective_status. */
+  status: 'active' | 'expired' | 'revoked';
+  /** The raw column, so "revoked" stays distinguishable from "lapsed". */
+  db_status: 'active' | 'revoked';
   public_id: string | null;
   created_at: string | null;
   expires_at: string | null;
@@ -71,23 +74,36 @@ interface SharePolicy {
 
 interface SharesPage {
   shares: ShareRow[];
+  /** How many rows this page holds, against summary.total for the workspace. */
+  returned: number;
+  limit: number;
   summary: {
     active: number;
     public: number;
     workspace: number;
+    expired: number;
+    revoked: number;
     views: number;
     authors: number;
+    total: number;
   };
   policy: SharePolicy;
 }
 
 const em = <span className="text-faint">—</span>;
 
-function Pill({ tone, children }: { tone: 'live' | 'off' | 'internal'; children: string }) {
+function Pill({
+  tone,
+  children,
+}: {
+  tone: 'live' | 'off' | 'internal' | 'lapsed';
+  children: string;
+}) {
   const styles = {
     live: 'border-ok/40 bg-ok/10 text-ok',
     internal: 'border-border bg-surface-2 text-muted',
     off: 'border-border bg-surface-2 text-faint',
+    lapsed: 'border-border bg-surface-2 text-faint',
   }[tone];
   return (
     <span
@@ -253,9 +269,14 @@ export default function AdminSharesPage() {
       key: 'visibility',
       label: 'Reach',
       width: '130px',
+      // Driven by the EFFECTIVE status. Keyed off the raw column, an expired
+      // link drew a green "Anyone with link" while the link itself already
+      // answered 404 — this console was the only surface saying so.
       render: (r) =>
-        r.status !== 'active' ? (
+        r.status === 'revoked' ? (
           <Pill tone="off">Revoked</Pill>
+        ) : r.status === 'expired' ? (
+          <Pill tone="lapsed">Expired</Pill>
         ) : r.visibility === 'public' ? (
           <Pill tone="live">Anyone with link</Pill>
         ) : (
@@ -328,6 +349,9 @@ export default function AdminSharesPage() {
         </p>
       )}
 
+      {/* Workspace-wide, computed in SQL — deliberately NOT derived from the
+          rows below, which are one filtered, capped page. Tiles that quietly
+          tracked the toolbar made "Revoked" read "Live links 0". */}
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
         <StatTile label="Live links" value={data?.summary.active} loading={loading} />
         <StatTile label="Public" value={livePublic} loading={loading} />
@@ -393,6 +417,7 @@ export default function AdminSharesPage() {
           label="Status"
           options={[
             { value: 'active', label: 'Live links' },
+            { value: 'expired', label: 'Expired' },
             { value: 'revoked', label: 'Revoked' },
             { value: 'all', label: 'All' },
           ]}
@@ -411,6 +436,16 @@ export default function AdminSharesPage() {
             : 'No links match this filter.'
         }
       />
+
+      {/* The page header promises "every conversation published out of this
+          workspace". When the listing is capped it is not, and saying so is
+          the difference between a limit and a lie. */}
+      {data && data.returned < data.summary.total && (
+        <p className="text-xs text-faint">
+          Showing the {data.returned} most recent of {data.summary.total} links
+          in this workspace.
+        </p>
+      )}
 
       <AdminDialog
         open={confirming !== null}

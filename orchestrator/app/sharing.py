@@ -470,3 +470,49 @@ def resolve_expiry(
     if days > max_days:
         return None, f"This workspace caps shared links at {max_days} days."
     return datetime.now(timezone.utc) + timedelta(days=days), None
+
+
+def offered_expiries(policy: Optional[Dict[str, Any]] = None) -> List[str]:
+    """The choices a menu may show — the SAME predicate `resolve_expiry`
+    enforces.
+
+    These were two separate expressions once, and they disagreed: the menu
+    filtered on `allow_never` alone while resolve_expiry also capped on
+    `max_days`, so a workspace with max_days=7 offered "90 days" and then
+    refused it with an error the person had no way to anticipate. An option a
+    server will reject does not belong on the menu.
+    """
+    policy = policy or {}
+    allow_never = bool(policy.get("allow_never", settings.public_share_allow_never))
+    max_days = int(policy.get("max_days", settings.public_share_max_days))
+    out = []
+    for choice, days in EXPIRY_CHOICES.items():
+        if days is None:
+            if allow_never:
+                out.append(choice)
+        elif days <= max_days:
+            out.append(choice)
+    return out
+
+
+def default_expiry(policy: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """What a new link gets when nobody chooses.
+
+    Clamped to what is actually offered. The configured default was used
+    unchecked, so a workspace that capped links at 7 days still pre-selected
+    "30 days" — every author had to notice and change it, and one who did not
+    got a 422 on a value they never picked.
+
+    None only when policy offers nothing at all, which the caller renders as
+    "sharing is unavailable" rather than pretending to a choice.
+    """
+    offered = offered_expiries(policy)
+    preferred = f"{settings.public_share_default_days}d"
+    if preferred in offered:
+        return preferred
+    dated = [c for c in offered if EXPIRY_CHOICES[c] is not None]
+    if dated:
+        # The longest that still fits the cap — closest to the intent of a
+        # default that was set higher than the cap allows.
+        return max(dated, key=lambda c: EXPIRY_CHOICES[c] or 0)
+    return "never" if "never" in offered else None

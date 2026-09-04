@@ -8,7 +8,7 @@
  */
 import { describe, expect, it, vi, afterEach } from 'vitest';
 
-import { deriveExpiryChoice, expiryLabel } from '@/lib/share';
+import { EXPIRY_LABEL, deriveExpiryChoice, expiryLabel } from '@/lib/share';
 
 const CHOICES = ['24h', '7d', '30d', '90d'];
 const WITH_NEVER = [...CHOICES, 'never'];
@@ -35,11 +35,13 @@ describe('deriveExpiryChoice', () => {
     }
   });
 
-  it('says never only when the workspace offers it', () => {
+  it('says never for a link with no deadline, whatever the menu offers', () => {
     expect(deriveExpiryChoice(null, WITH_NEVER)).toBe('never');
-    // Policy forbids it: fall back to a real option rather than showing a
-    // choice the server would refuse.
-    expect(deriveExpiryChoice(null, CHOICES)).toBe('24h');
+    // Even when policy has since withdrawn the option. Falling back to a real
+    // option here would make the control read "24 hours" for a link that in
+    // fact never expires — the dialog keeps the truth in the list and
+    // disables it instead.
+    expect(deriveExpiryChoice(null, CHOICES)).toBe('never');
   });
 
   it('falls back to a real option for an expired or unparseable date', () => {
@@ -59,5 +61,14 @@ describe('expiryLabel', () => {
     expect(expiryLabel(inHours(3))).toBe('expires in 3 hours');
     expect(expiryLabel(inHours(-1))).toBe('expired');
     expect(expiryLabel(null)).toBeNull();
+  });
+});
+
+describe('a link that never expires', () => {
+  it('reads as "Never expires" rather than as a missing value', () => {
+    // expiryLabel returns null for no deadline; the dialog supplies the
+    // sentence. This pins the contract between the two.
+    expect(expiryLabel(null)).toBeNull();
+    expect(EXPIRY_LABEL.never).toBe('No expiry');
   });
 });

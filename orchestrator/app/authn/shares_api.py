@@ -27,6 +27,7 @@ revoke them silently; the console asks, and the caller says so explicitly.
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -46,7 +47,28 @@ def _iso(value: Any) -> Optional[str]:
     return value.isoformat() if value is not None else None
 
 
-def _row(share: Dict[str, Any]) -> Dict[str, Any]:
+def _effective_status(share: Dict[str, Any], now: datetime) -> str:
+    """What the link ACTUALLY does right now.
+
+    `conversation_shares.status` records revocation and nothing else — its
+    CHECK permits only 'active' and 'revoked', and no sweep marks anything
+    expired. So a link whose deadline has passed still reads 'active' in the
+    column while `/public/shares/{token}` already answers 404. Reporting that
+    as live made the governance console the one surface in the system that
+    disagreed with the link itself.
+
+    `now` is passed in and computed once per request so a long listing cannot
+    straddle a second boundary and report two different truths.
+    """
+    if share.get("status") != "active":
+        return "revoked"
+    expires = share.get("expires_at")
+    if expires is not None and expires <= now:
+        return "expired"
+    return "active"
+
+
+def _row(share: Dict[str, Any], now: datetime) -> Dict[str, Any]:
     """One row of the governance table.
 
     `public_id` only — see the module docstring. The author is named because
@@ -58,7 +80,10 @@ def _row(share: Dict[str, Any]) -> Dict[str, Any]:
         "conversation_id": share["conversation_id"],
         "title": share.get("title") or "Untitled conversation",
         "visibility": share["visibility"],
-        "status": share["status"],
+        "status": _effective_status(share, now),
+        # The raw column too, so "revoked at 3pm" stays distinguishable from
+        # "expired at 3pm" for anyone reading the API directly.
+        "db_status": share["status"],
         "public_id": share.get("public_id"),
         "created_at": _iso(share.get("created_at")),
         "expires_at": _iso(share.get("expires_at")),
@@ -76,26 +101,32 @@ def _row(share: Dict[str, Any]) -> Dict[str, Any]:
 
 @router.get("")
 async def list_shares(
-    status: str = Query("all", pattern="^(all|active|revoked)$"),
+    status: str = Query("all", pattern="^(all|active|expired|revoked)$"),
     limit: int = Query(200, ge=1, le=1000),
     principal: Principal = Gate,
 ) -> dict:
+    now = datetime.now(timezone.utc)
     rows = await db.run_in_thread(
         db.list_workspace_shares, principal.workspace_id, limit
     )
-    shares = [_row(dict(r)) for r in rows]
+    shares = [_row(dict(r), now) for r in rows]
     if status != "all":
         shares = [s for s in shares if s["status"] == status]
-    active = [s for s in shares if s["status"] == "active"]
+    # The summary is a WORKSPACE aggregate computed in SQL, deliberately NOT
+    # derived from the rows above: those are one capped, filtered page, and
+    # tiles that quietly track the toolbar are worse than no tiles. Choosing
+    # "Revoked" used to make "Live links" read 0 — which also suppressed the
+    # banner warning about public links still in the wild.
+    summary = await db.run_in_thread(
+        db.workspace_share_summary, principal.workspace_id
+    )
     return {
         "shares": shares,
-        "summary": {
-            "active": len(active),
-            "public": sum(1 for s in active if s["visibility"] == "public"),
-            "workspace": sum(1 for s in active if s["visibility"] == "workspace"),
-            "views": sum(s["view_count"] for s in shares),
-            "authors": len({s["author"]["id"] for s in active}),
-        },
+        # So the table can say "showing 200 of 250" instead of implying that
+        # what fits on the page is everything there is.
+        "returned": len(shares),
+        "limit": limit,
+        "summary": summary,
         "policy": await _policy(principal.workspace_id),
     }
 
@@ -168,30 +199,45 @@ async def set_policy(
     body: PolicyIn,
     principal: Principal = Gate,
 ) -> dict:
-    current = await _policy(principal.workspace_id)
+    # TWO DICTS, DELIBERATELY.
+    #
+    # `_policy()` returns a RESOLVED view: every key filled in, from the
+    # server defaults where the workspace has not chosen. Writing that back
+    # was a bug with a long fuse — the first time any admin flipped any one
+    # switch, all five values were frozen into workspaces.sharing_policy,
+    # including four nobody had chosen. From then on the server default was
+    # dead: changing PUBLIC_SHARE_ALLOW_NEVER_EXPIRE in the environment did
+    # nothing at all, silently, with the console still showing the toggle off
+    # and no indication that a configuration change had been ignored.
+    #
+    # So: persist only what was CHOSEN, and decide and reply with the
+    # resolved view. `exclude_none=True` drops absent fields only, so an
+    # explicit `false` is still stored and still overrides the default —
+    # which is the precedence we want.
+    stored = await db.run_in_thread(
+        db.workspace_sharing_policy, principal.workspace_id
+    )
     incoming = body.model_dump(exclude_none=True)
     incoming.pop("revoke_existing_public", None)
-    updated = {**current, **incoming}
+    to_store = {**stored, **incoming}
+    resolved = {**await _policy(principal.workspace_id), **incoming}
 
-    revoked = 0
-    if body.revoke_existing_public and updated["public_enabled"] is False:
-        rows = await db.run_in_thread(
-            db.list_workspace_shares, principal.workspace_id, 1000
+    revoked: List[int] = []
+    if body.revoke_existing_public and resolved["public_enabled"] is False:
+        # One statement, not a loop over a capped listing: a count reported as
+        # a finished job must not be a count that stopped early.
+        revoked = await db.run_in_thread(
+            db.revoke_workspace_public_shares,
+            principal.workspace_id,
+            revoked_by=principal.user_id,
         )
-        for r in rows:
-            r = dict(r)
-            if r["status"] == "active" and r["visibility"] == "public":
-                if await db.run_in_thread(
-                    db.revoke_share, int(r["id"]), revoked_by=principal.user_id
-                ):
-                    revoked += 1
 
     await db.run_in_thread(
-        db.set_workspace_sharing_policy, principal.workspace_id, updated
+        db.set_workspace_sharing_policy, principal.workspace_id, to_store
     )
     await db.run_in_thread(
         audit, principal, request, "workspace_sharing_policy_changed",
         resource_type="workspace", resource_id=principal.workspace_id,
-        meta={"changed": incoming, "revoked_existing_public": revoked},
+        meta={"changed": incoming, "revoked_existing_public": len(revoked)},
     )
-    return {"policy": updated, "revoked": revoked}
+    return {"policy": resolved, "revoked": len(revoked)}

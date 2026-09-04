@@ -163,13 +163,20 @@ export function ShareDialog({
     }
   };
 
-  async function run<T>(action: () => Promise<T>, done: (v: T) => void, label: string) {
+  async function run<T>(
+    action: () => Promise<T>,
+    done: (v: T) => void,
+    label: string,
+    /** Put an optimistic control back where it was. See the expiry select. */
+    onFail?: () => void,
+  ) {
     setBusy(true);
     try {
       done(await action());
       setLive(label);
       toast(label, 'info');
     } catch (err) {
+      onFail?.();
       const message =
         err instanceof ShareError ? err.message : 'That did not work. Try again.';
       setLive(message);
@@ -181,6 +188,11 @@ export function ShareDialog({
 
   const share = status?.share ?? null;
   const policy = status?.policy;
+  /** What the menu offers, plus this link's own state if policy dropped it. */
+  const expiryOptions = (() => {
+    const offered = status?.expiry_choices ?? [];
+    return offered.includes(liveExpiry) ? offered : [...offered, liveExpiry];
+  })();
   const linkToShow = fullUrl ?? share?.url ?? '';
   const blocked =
     policy && (visibility === 'public' ? !policy.public_allowed : !policy.workspace_allowed);
@@ -387,18 +399,42 @@ export function ShareDialog({
                       value={liveExpiry}
                       disabled={busy}
                       onChange={(e) => {
+                        // Optimistic, but REVERTED on refusal. Without the
+                        // revert a rejected change left the control showing
+                        // the value the server had just refused, directly
+                        // above a caption still reporting the real one —
+                        // `run`'s success callback is what reloads, and on
+                        // failure it never fires. The select is disabled
+                        // while busy, so `previous` cannot go stale.
+                        const previous = liveExpiry;
                         const next = e.target.value;
                         setLiveExpiry(next);
                         void run(
                           () => updateShare(conversationId, { expiry: next }),
                           () => void load(),
-                          `Link now ${EXPIRY_LABEL[next]?.toLowerCase() ?? next}`,
+                          next === 'never'
+                            ? 'This link no longer expires'
+                            : `Link now expires in ${
+                                EXPIRY_LABEL[next]?.toLowerCase() ?? next
+                              }`,
+                          () => setLiveExpiry(previous),
                         );
                       }}
                       className="h-7 w-full rounded-md border border-border bg-bg px-1.5 text-xs text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-50"
                     >
-                      {status.expiry_choices.map((c) => (
-                        <option key={c} value={c}>
+                      {/* The link's CURRENT state is always in the list,
+                          even when policy has since withdrawn it — otherwise
+                          a never-expiring link under a tightened policy would
+                          render as "24 hours" (a React select falls back to
+                          its first option) while the caption below said
+                          "Never expires". It is disabled, so it can be read
+                          but not re-chosen; the server would refuse anyway. */}
+                      {expiryOptions.map((c) => (
+                        <option
+                          key={c}
+                          value={c}
+                          disabled={!status.expiry_choices.includes(c)}
+                        >
                           {EXPIRY_LABEL[c] ?? c}
                         </option>
                       ))}

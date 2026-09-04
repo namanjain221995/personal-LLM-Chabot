@@ -314,3 +314,140 @@ describe('the dialog itself', () => {
     ).toBe(true);
   });
 });
+
+describe('a link that never expires', () => {
+  const NEVER_SHARE = { ...ACTIVE_SHARE, expires_at: null };
+
+  it('says so, and offers "No expiry" when the workspace allows it', async () => {
+    serve({
+      [`GET ${PATH}`]: () => ({
+        body: statusBody({
+          share: NEVER_SHARE,
+          expiry_choices: ['24h', '7d', '30d', '90d', 'never'],
+        }),
+      }),
+    });
+    mount();
+    await screen.findByLabelText('Share link');
+    const select = screen.getByLabelText('Expires') as HTMLSelectElement;
+    expect(select.value).toBe('never');
+    expect(screen.getByText('Never expires')).toBeTruthy();
+  });
+
+  it('still shows the truth after the workspace withdraws the option', async () => {
+    // The contradiction this prevents: a React select given a value that is
+    // not among its options renders the FIRST one, so the control would have
+    // said "24 hours" directly above a caption reading "Never expires".
+    serve({
+      [`GET ${PATH}`]: () => ({
+        body: statusBody({
+          share: NEVER_SHARE,
+          expiry_choices: ['24h', '7d', '30d', '90d'],
+        }),
+      }),
+    });
+    mount();
+    await screen.findByLabelText('Share link');
+    const select = screen.getByLabelText('Expires') as HTMLSelectElement;
+    expect(select.value).toBe('never');
+    expect(screen.getByText('Never expires')).toBeTruthy();
+    // Readable, but not re-selectable — the server would refuse it anyway.
+    const option = screen.getByRole('option', { name: 'No expiry' }) as HTMLOptionElement;
+    expect(option.disabled).toBe(true);
+    // The options policy DOES allow stay selectable.
+    expect((screen.getByRole('option', { name: '7 days' }) as HTMLOptionElement).disabled).toBe(false);
+  });
+
+  it('turns a dated link into one that never expires', async () => {
+    const calls = serve({
+      [`GET ${PATH}`]: () => ({
+        body: statusBody({
+          share: ACTIVE_SHARE,
+          expiry_choices: ['24h', '7d', '30d', '90d', 'never'],
+        }),
+      }),
+      [`PATCH ${PATH}`]: () => ({ body: { share: NEVER_SHARE } }),
+    });
+    mount();
+    await screen.findByLabelText('Share link');
+    fireEvent.change(screen.getByLabelText('Expires'), { target: { value: 'never' } });
+
+    await waitFor(() => expect(calls.some((c) => c.method === 'PATCH')).toBe(true));
+    expect(JSON.parse(calls.find((c) => c.method === 'PATCH')!.body!)).toEqual({
+      expiry: 'never',
+    });
+    // A sentence, not "Link now no expiry".
+    expect(toast).toHaveBeenCalledWith('This link no longer expires', 'info');
+  });
+
+  it('reports a shortened expiry as a sentence too', async () => {
+    serve({
+      [`GET ${PATH}`]: () => ({
+        body: statusBody({ share: NEVER_SHARE, expiry_choices: ['24h', '7d', 'never'] }),
+      }),
+      [`PATCH ${PATH}`]: () => ({ body: { share: ACTIVE_SHARE } }),
+    });
+    mount();
+    await screen.findByLabelText('Share link');
+    fireEvent.change(screen.getByLabelText('Expires'), { target: { value: '7d' } });
+    await waitFor(() =>
+      expect(toast).toHaveBeenCalledWith('Link now expires in 7 days', 'info'),
+    );
+  });
+
+  it('puts the control back when the server refuses the change', async () => {
+    // Without the revert the select kept showing the value the server had
+    // just rejected, directly above a caption reporting the real one.
+    serve({
+      [`GET ${PATH}`]: () => ({
+        body: statusBody({
+          share: NEVER_SHARE,
+          expiry_choices: ['24h', '7d', '30d', '90d', 'never'],
+        }),
+      }),
+      [`PATCH ${PATH}`]: () => ({
+        status: 422,
+        body: { detail: 'This workspace caps shared links at 7 days.' },
+      }),
+    });
+    mount();
+    await screen.findByLabelText('Share link');
+    const select = screen.getByLabelText('Expires') as HTMLSelectElement;
+    expect(select.value).toBe('never');
+
+    fireEvent.change(select, { target: { value: '90d' } });
+    await waitFor(() =>
+      expect(toast).toHaveBeenCalledWith(
+        'This workspace caps shared links at 7 days.',
+        'error',
+      ),
+    );
+    // Back to what the link actually is, and still agreeing with the caption.
+    expect(select.value).toBe('never');
+    expect(screen.getByText('Never expires')).toBeTruthy();
+  });
+
+  it('surfaces the server’s refusal if policy changed under the person', async () => {
+    serve({
+      [`GET ${PATH}`]: () => ({
+        body: statusBody({
+          share: ACTIVE_SHARE,
+          expiry_choices: ['24h', '7d', '30d', '90d', 'never'],
+        }),
+      }),
+      [`PATCH ${PATH}`]: () => ({
+        status: 422,
+        body: { detail: 'This workspace requires shared links to expire.' },
+      }),
+    });
+    mount();
+    await screen.findByLabelText('Share link');
+    fireEvent.change(screen.getByLabelText('Expires'), { target: { value: 'never' } });
+    await waitFor(() =>
+      expect(toast).toHaveBeenCalledWith(
+        'This workspace requires shared links to expire.',
+        'error',
+      ),
+    );
+  });
+});

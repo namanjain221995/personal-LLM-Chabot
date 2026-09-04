@@ -202,12 +202,20 @@ export function expiryLabel(expiresAt: string | null): string | null {
  * 90-day link two months old therefore reads as "30 days", which is why the
  * dialog prints the real date directly beneath the control rather than
  * letting this stand alone.
+ *
+ * NULL is the exception and is not a best fit at all: it means the link has
+ * no deadline, which is exactly "never" and nothing else.
  */
 export function deriveExpiryChoice(
   expiresAt: string | null,
   choices: string[],
 ): string {
-  if (!expiresAt) return choices.includes('never') ? 'never' : (choices[0] ?? '30d');
+  // A link with no expiry reads as "never" WHATEVER the menu currently
+  // offers. If the workspace has since withdrawn the option, the honest
+  // answer is still "never" and the caller shows it as an unselectable
+  // current state — the alternative was a control that displayed "24 hours"
+  // for a link that in fact never expires.
+  if (!expiresAt) return 'never';
   const hoursLeft = (new Date(expiresAt).getTime() - Date.now()) / 3_600_000;
   if (Number.isNaN(hoursLeft)) return choices[0] ?? '30d';
   const HOURS: Record<string, number> = { '24h': 24, '7d': 168, '30d': 720, '90d': 2160 };

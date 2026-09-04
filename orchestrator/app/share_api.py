@@ -39,6 +39,37 @@ _create_hits: Dict[int, List[float]] = {}
 _view_hits: Dict[str, List[float]] = {}
 
 
+#: Hard ceiling on how many keys a bucket may hold.
+#:
+#: THE VIEW BUCKET IS KEYED BY ATTACKER-CHOSEN DATA. `/public/shares/{token}`
+#: is anonymous, and the limiter runs BEFORE the database lookup — deliberately,
+#: so a flood of invented ids cannot be turned into a flood of queries. The
+#: consequence is that any 32-hex string becomes a key, which is 2^128 of them,
+#: and a dict that is only ever written to is a memory leak with a 404 in front
+#: of it. Bounding the structure is the only fix that works: re-keying it (on
+#: client IP, say) just swaps one attacker-controlled key space for another,
+#: and this deployment sits behind a tunnel where the client address is
+#: whatever the proxy reports.
+_RATE_BUCKET_MAX = 4096
+
+
+def _sweep(bucket: Dict[Any, List[float]], now: float, window_s: float) -> None:
+    """Drop keys whose window has passed, then force the size down if the
+    survivors alone still exceed the ceiling.
+
+    Evicting a live key resets that link's counter, which weakens the limit
+    for it. That is the deliberate trade: under a flood, bounded memory beats
+    exact accounting, and the keys being evicted are overwhelmingly the
+    attacker's own invented ids.
+    """
+    for key in [k for k, ts in bucket.items() if not ts or now - ts[-1] >= window_s]:
+        bucket.pop(key, None)
+    if len(bucket) > _RATE_BUCKET_MAX:
+        oldest = sorted(bucket, key=lambda k: bucket[k][-1])
+        for key in oldest[: len(bucket) - _RATE_BUCKET_MAX]:
+            bucket.pop(key, None)
+
+
 def _rate_ok(bucket: Dict[Any, List[float]], key: Any, limit: int, window_s: float) -> bool:
     now = time.monotonic()
     hits = [t for t in bucket.get(key, []) if now - t < window_s]
@@ -47,6 +78,8 @@ def _rate_ok(bucket: Dict[Any, List[float]], key: Any, limit: int, window_s: flo
         return False
     hits.append(now)
     bucket[key] = hits
+    if len(bucket) > _RATE_BUCKET_MAX:
+        _sweep(bucket, now, window_s)
     return True
 
 
@@ -169,13 +202,10 @@ async def get_share(
         "share": payload,
         "policy": verdict.as_dict(),
         "unshared_messages": unshared,
-        "expiry_choices": [
-            c for c in sharing.EXPIRY_CHOICES
-            if c != "never" or policy["allow_never"]
-        ],
-        "default_expiry": f"{settings.public_share_default_days}d"
-        if f"{settings.public_share_default_days}d" in sharing.EXPIRY_CHOICES
-        else "30d",
+        # One definition, shared with resolve_expiry — a menu must not offer
+        # what the server will refuse. See sharing.offered_expiries.
+        "expiry_choices": sharing.offered_expiries(policy),
+        "default_expiry": sharing.default_expiry(policy),
     }
 
 

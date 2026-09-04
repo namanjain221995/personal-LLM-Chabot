@@ -423,14 +423,40 @@ def test_expiry_is_enforced_by_the_server(public, login_client):
     assert resp.json()["detail"] == share_api._GONE
 
 
-def test_expiry_choices_are_checked_against_policy(login_client):
+def test_an_expiry_that_is_not_on_the_menu_is_refused(login_client):
     owner = login_client("olive")
     cid = _conversation("olive", "conv-share-expiry")
-    # "never" is off by default: a link that never expires is a decision an
-    # administrator makes, not one every author makes by accident.
-    assert _create(owner, cid, expiry="never").status_code == 422
     assert _create(owner, cid, expiry="10 years").status_code == 422
-    assert "never" not in owner.get(f"/conversations/{cid}/share").json()["expiry_choices"]
+    assert _create(owner, cid, expiry="").status_code == 422
+
+
+@pytest.mark.parametrize("allowed", [False, True])
+def test_never_is_offered_only_when_the_workspace_allows_it(
+    login_client, monkeypatch, allowed
+):
+    """Both directions, stated explicitly.
+
+    This used to assert only the refusal and read the answer from whatever
+    PUBLIC_SHARE_ALLOW_NEVER_EXPIRE happened to be — which passed in CI (no
+    .env) and would have failed on any machine where the operator had turned
+    the option on. A test that changes its mind with the deployment is not
+    testing the rule.
+    """
+    monkeypatch.setattr(share_api.settings, "public_share_allow_never", allowed)
+    monkeypatch.setattr(sharing.settings, "public_share_allow_never", allowed)
+    owner = login_client("olive")
+    cid = _conversation("olive", f"conv-never-{int(allowed)}")
+
+    choices = owner.get(f"/conversations/{cid}/share").json()["expiry_choices"]
+    assert ("never" in choices) is allowed
+
+    resp = _create(owner, cid, expiry="never")
+    if not allowed:
+        assert resp.status_code == 422
+        assert "requires shared links to expire" in resp.json()["detail"]
+    else:
+        assert resp.status_code == 200
+        assert resp.json()["share"]["expires_at"] is None
 
 
 def test_a_workspace_link_requires_a_session(public, login_client):
@@ -625,3 +651,346 @@ def test_the_policy_caps_how_long_a_link_may_live(login_client):
     root.patch("/admin/api/shares/policy", json={"max_days": 7})
     assert _create(owner, cid, expiry="30d").status_code == 422
     assert _create(owner, cid, expiry="7d").status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# A link that never expires (expires_at IS NULL)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def never_allowed(monkeypatch):
+    """The workspace offers "No expiry"."""
+    monkeypatch.setattr(share_api.settings, "public_share_allow_never", True)
+    monkeypatch.setattr(sharing.settings, "public_share_allow_never", True)
+
+
+def test_a_link_with_no_expiry_keeps_working(never_allowed, login_client, public):
+    owner = login_client("olive")
+    cid = _conversation("olive", "conv-never-1")
+    body = _create(owner, cid, expiry="never").json()
+    assert body["share"]["expires_at"] is None
+
+    resp = public.get(f"/public/shares/{body['token']}")
+    assert resp.status_code == 200
+    assert resp.json()["expires_at"] is None
+    # NULL must read as "no deadline", never as "a deadline in 1970".
+    assert resp.json()["snapshot"]["messages"]
+
+
+def test_expiry_survives_a_patch_that_does_not_mention_it(never_allowed, login_client, public):
+    """The bug to avoid: PATCHing visibility silently clearing or setting the
+    expiry, because the handler cannot tell "unset" from "set to nothing"."""
+    owner = login_client("olive")
+    cid = _conversation("olive", "conv-never-2")
+    token = _create(owner, cid, expiry="never").json()["token"]
+
+    owner.patch(f"/conversations/{cid}/share", json={"show_owner_name": True})
+    assert owner.get(f"/conversations/{cid}/share").json()["share"]["expires_at"] is None
+    assert public.get(f"/public/shares/{token}").status_code == 200
+
+    # And the mirror image: a dated link is not cleared by an unrelated PATCH.
+    other = _conversation("olive", "conv-never-3")
+    _create(owner, other, expiry="7d")
+    before = owner.get(f"/conversations/{other}/share").json()["share"]["expires_at"]
+    owner.patch(f"/conversations/{other}/share", json={"show_owner_name": True})
+    assert owner.get(f"/conversations/{other}/share").json()["share"]["expires_at"] == before
+
+
+def test_expiry_can_be_moved_both_ways(never_allowed, login_client, public):
+    owner = login_client("olive")
+    cid = _conversation("olive", "conv-never-4")
+    token = _create(owner, cid, expiry="7d").json()["token"]
+    assert owner.get(f"/conversations/{cid}/share").json()["share"]["expires_at"]
+
+    owner.patch(f"/conversations/{cid}/share", json={"expiry": "never"})
+    assert owner.get(f"/conversations/{cid}/share").json()["share"]["expires_at"] is None
+    assert public.get(f"/public/shares/{token}").status_code == 200
+
+    owner.patch(f"/conversations/{cid}/share", json={"expiry": "24h"})
+    assert owner.get(f"/conversations/{cid}/share").json()["share"]["expires_at"]
+    assert public.get(f"/public/shares/{token}").status_code == 200
+
+
+def test_withdrawing_never_does_not_kill_links_that_already_have_it(
+    never_allowed, login_client, public, monkeypatch
+):
+    """Tightening the policy binds NEW choices. An existing link is a separate
+    decision — the admin console has an explicit control for that."""
+    owner = login_client("olive")
+    cid = _conversation("olive", "conv-never-5")
+    token = _create(owner, cid, expiry="never").json()["token"]
+
+    monkeypatch.setattr(share_api.settings, "public_share_allow_never", False)
+    monkeypatch.setattr(sharing.settings, "public_share_allow_never", False)
+
+    assert public.get(f"/public/shares/{token}").status_code == 200
+    assert "never" not in owner.get(f"/conversations/{cid}/share").json()["expiry_choices"]
+    # And it cannot be re-chosen.
+    assert owner.patch(f"/conversations/{cid}/share", json={"expiry": "never"}).status_code == 422
+
+
+def test_republishing_a_never_link_keeps_it_never(never_allowed, login_client, public):
+    owner = login_client("olive")
+    cid = _conversation("olive", "conv-never-6")
+    token = _create(owner, cid, expiry="never").json()["token"]
+    _say(cid, "user", "one more question")
+    assert owner.post(f"/conversations/{cid}/share/refresh", json={}).status_code == 200
+    assert owner.get(f"/conversations/{cid}/share").json()["share"]["expires_at"] is None
+    assert len(public.get(f"/public/shares/{token}").json()["snapshot"]["messages"]) == 3
+
+
+def test_the_governance_table_reports_no_expiry_as_no_expiry(never_allowed, login_client):
+    owner = login_client("olive")
+    root = login_client("root", role="super_admin")
+    cid = _conversation("olive", "conv-never-7")
+    _create(owner, cid, expiry="never")
+    row = root.get("/admin/api/shares").json()["shares"][0]
+    assert row["expires_at"] is None
+    assert row["status"] == "active"
+
+
+def test_a_never_link_is_still_revocable(never_allowed, login_client, public):
+    """The one thing that must remain true of a link with no deadline: it can
+    still be ended. Otherwise "never expires" would mean "cannot be stopped"."""
+    owner = login_client("olive")
+    root = login_client("root", role="super_admin")
+    cid = _conversation("olive", "conv-never-8")
+    token = _create(owner, cid, expiry="never").json()["token"]
+    share_id = root.get("/admin/api/shares").json()["shares"][0]["id"]
+
+    assert root.delete(f"/admin/api/shares/{share_id}").json()["revoked"] is True
+    assert public.get(f"/public/shares/{token}").status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Policy storage: what an admin CHOSE vs what the server merely defaults to
+# ---------------------------------------------------------------------------
+
+
+def test_saving_one_setting_does_not_freeze_the_others(login_client, monkeypatch):
+    """The bug with the long fuse.
+
+    The policy endpoint used to write back a RESOLVED dict — every key filled
+    in from server defaults — so the first time anyone flipped any switch, all
+    five values were pinned into the workspace row, four of them never chosen
+    by a human. After that the server default was dead: changing
+    PUBLIC_SHARE_ALLOW_NEVER_EXPIRE did nothing, silently, and the console
+    showed the toggle off with no sign a config change had been ignored.
+    """
+    owner = login_client("olive")
+    root = login_client("root", role="super_admin")
+    cid = _conversation("olive", "conv-freeze-1")
+
+    # An admin changes ONE unrelated thing.
+    assert root.patch(
+        "/admin/api/shares/policy", json={"allow_owner_name": True}
+    ).status_code == 200
+
+    with db.connection() as con:
+        row = con.execute(
+            "SELECT sharing_policy p FROM workspaces WHERE id = "
+            "(SELECT workspace_id FROM conversation_shares LIMIT 1) "
+            "UNION ALL SELECT sharing_policy FROM workspaces LIMIT 1"
+        ).fetchone()
+    assert set(row["p"]) == {"allow_owner_name"}, (
+        f"only the chosen key may be stored, got {sorted(row['p'])}"
+    )
+
+    # The server default is therefore still live and still changeable.
+    monkeypatch.setattr(share_api.settings, "public_share_allow_never", True)
+    monkeypatch.setattr(sharing.settings, "public_share_allow_never", True)
+    assert "never" in owner.get(f"/conversations/{cid}/share").json()["expiry_choices"]
+    assert _create(owner, cid, expiry="never").status_code == 200
+
+
+def test_an_explicit_choice_still_beats_the_server_default(login_client, monkeypatch):
+    """The other half: storing less must not mean storing nothing. An admin
+    who deliberately turns something off outranks the environment."""
+    owner = login_client("olive")
+    root = login_client("root", role="super_admin")
+    cid = _conversation("olive", "conv-freeze-2")
+
+    monkeypatch.setattr(share_api.settings, "public_share_allow_never", True)
+    monkeypatch.setattr(sharing.settings, "public_share_allow_never", True)
+    root.patch("/admin/api/shares/policy", json={"allow_never": False})
+
+    assert "never" not in owner.get(f"/conversations/{cid}/share").json()["expiry_choices"]
+    assert _create(owner, cid, expiry="never").status_code == 422
+
+
+def test_the_policy_response_is_complete_even_when_the_row_is_not(login_client):
+    """The console renders the response directly, so a partial dict would draw
+    every unset toggle as off — the storage fix must not leak into the reply."""
+    root = login_client("root", role="super_admin")
+    body = root.patch("/admin/api/shares/policy", json={"max_days": 7}).json()
+    assert set(body["policy"]) == {
+        "public_enabled", "workspace_enabled", "allow_never",
+        "allow_owner_name", "max_days",
+    }
+    assert body["policy"]["max_days"] == 7
+    assert body["policy"]["public_enabled"] is True
+
+
+def test_bulk_revoke_on_an_untouched_workspace_does_not_crash(login_client):
+    """`revoke_existing_public` reads public_enabled out of the policy. With a
+    raw stored dict that key can be absent — this is the 500 that guards it."""
+    root = login_client("root", role="super_admin")
+    resp = root.patch(
+        "/admin/api/shares/policy",
+        json={"public_enabled": False, "revoke_existing_public": True},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["revoked"] == 0
+
+
+# ---------------------------------------------------------------------------
+# The governance console must agree with the link itself
+# ---------------------------------------------------------------------------
+
+
+def _expire_now(cid: str) -> None:
+    with db.connection() as con:
+        con.execute(
+            "UPDATE conversation_shares SET expires_at = %s WHERE conversation_id = %s",
+            (datetime.now(timezone.utc) - timedelta(minutes=1), cid),
+        )
+
+
+def test_an_expired_link_is_not_reported_as_live(login_client, public):
+    """`status` records revocation and nothing else — no sweep marks anything
+    expired — so a lapsed link stays 'active' in the column while the public
+    endpoint already 404s it. The console reporting that as live made it the
+    one surface that disagreed with the link."""
+    owner = login_client("olive")
+    root = login_client("root", role="super_admin")
+    cid = _conversation("olive", "conv-eff-1")
+    token = _create(owner, cid, expiry="24h").json()["token"]
+    _expire_now(cid)
+
+    assert public.get(f"/public/shares/{token}").status_code == 404
+
+    body = root.get("/admin/api/shares").json()
+    row = body["shares"][0]
+    assert row["status"] == "expired"
+    assert row["db_status"] == "active"
+    assert body["summary"]["active"] == 0
+    assert body["summary"]["public"] == 0
+    assert body["summary"]["expired"] == 1
+
+
+def test_the_tiles_do_not_follow_the_toolbar(login_client):
+    """Picking "Revoked" used to make Live links read 0 — which also hid the
+    banner warning about public links still in the wild."""
+    owner = login_client("olive")
+    root = login_client("root", role="super_admin")
+    live = _conversation("olive", "conv-sum-live")
+    dead = _conversation("olive", "conv-sum-dead")
+    _create(owner, live)
+    _create(owner, dead)
+    root.delete(f"/admin/api/shares/{root.get('/admin/api/shares').json()['shares'][0]['id']}")
+
+    for status in ("all", "active", "revoked"):
+        body = root.get(f"/admin/api/shares?status={status}").json()
+        assert body["summary"]["active"] == 1, status
+        assert body["summary"]["public"] == 1, status
+        assert body["summary"]["revoked"] == 1, status
+        assert body["summary"]["total"] == 2, status
+    # The rows, unlike the tiles, DO follow the toolbar.
+    assert len(root.get("/admin/api/shares?status=revoked").json()["shares"]) == 1
+    assert len(root.get("/admin/api/shares?status=active").json()["shares"]) == 1
+
+
+def test_the_listing_says_how_much_of_it_there_is(login_client):
+    owner = login_client("olive")
+    root = login_client("root", role="super_admin")
+    for i in range(3):
+        _create(owner, _conversation("olive", f"conv-page-{i}"))
+    body = root.get("/admin/api/shares?limit=2").json()
+    assert body["returned"] == 2 and body["limit"] == 2
+    assert body["summary"]["total"] == 3, "the total is the workspace's, not the page's"
+
+
+def test_revoking_every_public_link_misses_none(login_client, public):
+    """Was a Python loop over a capped listing, so revoked and workspace rows
+    consumed the budget and live public links could survive a bulk revoke that
+    reported success."""
+    owner = login_client("olive")
+    root = login_client("root", role="super_admin")
+    tokens = []
+    for i in range(4):
+        cid = _conversation("olive", f"conv-bulk-{i}")
+        vis = "workspace" if i == 3 else "public"
+        tokens.append((vis, _create(owner, cid, visibility=vis).json()["token"]))
+    # Revoke one PUBLIC link first, so the already-revoked path is covered.
+    # (The listing is newest-first, so pick by visibility, not by position.)
+    listed = root.get("/admin/api/shares").json()["shares"]
+    first_public = next(r for r in listed if r["visibility"] == "public")
+    root.delete(f"/admin/api/shares/{first_public['id']}")
+
+    done = root.patch(
+        "/admin/api/shares/policy",
+        json={"public_enabled": False, "revoke_existing_public": True},
+    ).json()
+    assert done["revoked"] == 2, "the two surviving public links, and only those"
+
+    for vis, token in tokens:
+        code = public.get(f"/public/shares/{token}").status_code
+        assert code == 404, "every public link must be dead"
+    # The workspace-visibility link was not collateral damage.
+    assert root.get("/admin/api/shares").json()["summary"]["workspace"] == 1
+
+
+# ---------------------------------------------------------------------------
+# The menu offers only what the server will accept
+# ---------------------------------------------------------------------------
+
+
+def test_the_menu_never_offers_what_the_server_refuses(login_client):
+    owner = login_client("olive")
+    root = login_client("root", role="super_admin")
+    cid = _conversation("olive", "conv-menu-1")
+    root.patch("/admin/api/shares/policy", json={"max_days": 7})
+
+    state = owner.get(f"/conversations/{cid}/share").json()
+    assert state["expiry_choices"] == ["24h", "7d"]
+    # And every offered choice actually works.
+    for choice in state["expiry_choices"]:
+        resp = _create(owner, cid, expiry=choice)
+        assert resp.status_code == 200, f"{choice}: {resp.text}"
+        owner.delete(f"/conversations/{cid}/share")
+
+
+def test_the_preselected_expiry_is_one_the_server_accepts(login_client):
+    """The configured default was used unchecked, so a workspace capping links
+    at 7 days still pre-selected "30 days" — a 422 on a value nobody picked."""
+    owner = login_client("olive")
+    root = login_client("root", role="super_admin")
+    cid = _conversation("olive", "conv-menu-2")
+    root.patch("/admin/api/shares/policy", json={"max_days": 7})
+
+    state = owner.get(f"/conversations/{cid}/share").json()
+    assert state["default_expiry"] in state["expiry_choices"]
+    assert _create(owner, cid, expiry=state["default_expiry"]).status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# The anonymous rate limiter is not a memory leak with a 404 in front of it
+# ---------------------------------------------------------------------------
+
+
+def test_the_view_bucket_cannot_grow_without_bound():
+    """`/public/shares/{token}` is anonymous and the limiter runs BEFORE the
+    database lookup — on purpose, so invented ids cannot be turned into
+    queries. The cost is that any 32-hex string becomes a key, and a dict only
+    ever written to is a leak. Only bounding the structure fixes it."""
+    bucket: dict = {}
+    for i in range(share_api._RATE_BUCKET_MAX * 3):
+        share_api._rate_ok(bucket, f"{i:032x}", 120, 60.0)
+    assert len(bucket) <= share_api._RATE_BUCKET_MAX
+
+
+def test_bounding_the_bucket_does_not_break_the_limit_it_enforces():
+    bucket: dict = {}
+    codes = [share_api._rate_ok(bucket, "same-key", 3, 60.0) for _ in range(5)]
+    assert codes == [True, True, True, False, False]

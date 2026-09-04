@@ -3995,3 +3995,62 @@ def set_workspace_sharing_policy(workspace_id: str, policy: dict) -> None:
             "UPDATE workspaces SET sharing_policy = %s WHERE id = %s",
             (_json_param(policy), workspace_id),
         )
+
+
+def workspace_share_summary(workspace_id: str) -> dict:
+    """Counts over the WHOLE workspace, not over a page of it.
+
+    The console derived these from whatever rows the listing happened to
+    return, so a workspace past the page limit under-reported, and picking
+    "Revoked" in the toolbar made the "Live links" tile read 0 — which in turn
+    hid a safety banner that keys off it.
+
+    `active` here means EFFECTIVELY active: `status` only records revocation,
+    so a link whose expiry has passed is still 'active' in the column while
+    the public endpoint already 404s it. Counting those as live is how a
+    governance console ends up being the one surface that lies.
+    """
+    live = "status = 'active' AND (expires_at IS NULL OR expires_at > now())"
+    with connection() as con:
+        row = con.execute(
+            f"""SELECT
+                  count(*) FILTER (WHERE {live})                            AS active,
+                  count(*) FILTER (WHERE {live} AND visibility = 'public')   AS public,
+                  count(*) FILTER (WHERE {live} AND visibility = 'workspace') AS workspace,
+                  count(*) FILTER (WHERE status = 'active'
+                                     AND expires_at IS NOT NULL
+                                     AND expires_at <= now())               AS expired,
+                  count(*) FILTER (WHERE status <> 'active')                AS revoked,
+                  count(DISTINCT created_by) FILTER (WHERE {live})          AS authors,
+                  coalesce(sum(view_count), 0)                              AS views,
+                  count(*)                                                  AS total
+                FROM conversation_shares
+               WHERE workspace_id = %s""",
+            (workspace_id,),
+        ).fetchone()
+    return {k: int(v or 0) for k, v in dict(row).items()}
+
+
+def revoke_workspace_public_shares(
+    workspace_id: str, *, revoked_by: Optional[int]
+) -> List[int]:
+    """Revoke every live PUBLIC link in one statement.
+
+    Was a Python loop over a capped listing, which meant "revoke them too"
+    could silently leave links serving: revoked and workspace-visibility rows
+    consumed the row budget, and nothing paged past the first batch. A number
+    reported as a completed job must not be a number that stopped early.
+    """
+    now = _now()
+    with connection() as con:
+        rows = con.execute(
+            """UPDATE conversation_shares
+                  SET status = 'revoked', revoked_at = %s, revoked_by = %s,
+                      updated_at = %s
+                WHERE workspace_id = %s
+                  AND status = 'active'
+                  AND visibility = 'public'
+                RETURNING id""",
+            (now, revoked_by, now, workspace_id),
+        ).fetchall()
+    return [int(r["id"]) for r in rows]
