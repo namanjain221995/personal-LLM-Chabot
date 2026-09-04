@@ -155,11 +155,23 @@ def test_the_personal_site_indexes_are_off():
         assert engines.get(name) is False, f"{name} floods the pool with noise"
 
 
-def test_the_general_engines_that_do_answer_are_on():
-    """The pool must not be narrowed to nothing: these four answered 8/8."""
+def test_the_general_pool_is_never_narrowed_to_nothing():
+    """The pool must not become one engine.
+
+    This asserts a PROPERTY, not a list. An earlier version of this test named
+    four engines including yahoo, and was wrong within the hour: yahoo answers
+    "500 INKApi Error" to every query from this host, which is Yahoo's
+    decision and not something this file can undo. Pinning a roster pins
+    yesterday's measurement; pinning "at least three general engines answer"
+    pins the thing that actually matters — when the pool collapses to one and
+    that one blocks us, `_collect_results` returns [] and the user silently
+    gets a model-knowledge answer with no web behind it.
+    """
     engines = _engines()
-    for name in ("bing", "duckduckgo web", "yandex", "yahoo"):
-        assert engines.get(name) is True, f"{name} answers reliably and must stay"
+    general = {"bing", "duckduckgo web", "yandex", "yahoo", "qwant", "startpage",
+               "brave", "google cse", "duckduckgo", "mwmbl"}
+    live = [n for n in general if engines.get(n)]
+    assert len(live) >= 3, f"only {live} left in the general pool — one block from zero"
 
 
 def test_no_second_timeout_is_imposed_on_the_engines():
