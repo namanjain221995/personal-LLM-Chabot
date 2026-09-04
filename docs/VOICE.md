@@ -116,6 +116,30 @@ never slowed down by someone else's dictation.
 
 The engine holds about **6 GiB** while warm and is never unloaded.
 
+### Two engines
+
+One engine **saturates at eight concurrent clips**: past that, throughput is
+flat at ~123 seconds of audio per wall-second and latency grows linearly.
+`scripts/asr.sh up --all-nodes` starts a second copy on the head and routes to
+whichever has the fewest requests in flight:
+
+| concurrent | one engine | two engines | |
+|---:|---:|---:|---:|
+| 8 | 1.00 s · 117 s/s | 0.91 s · 128 s/s | 1.10× |
+| 16 | 1.54 s · 123 s/s | 1.05 s · 214 s/s | **1.46×** |
+| 32 | 2.70 s · 122 s/s | 1.46 s · 241 s/s | **1.85×** |
+
+**These are replicas, not shards.** Splitting one 1.7B model across two Sparks
+would put every layer's activations on a 13 Gb/s RoCE link that the main
+model's own tensor-parallel traffic already uses, to save memory that was
+never short — the weights are 4.4 GB and either node holds them twice over.
+Two whole copies add throughput without one byte of cross-node chatter, and
+degrade to one engine gracefully when a node goes away.
+
+The second engine is not free: it costs the head node 8.3 GiB and takes the
+chat model from −5.8 % to **−6.7 %** under dictation load. Below eight
+concurrent dictations it buys nothing, because one engine was never busy.
+
 ---
 
 ## Format
