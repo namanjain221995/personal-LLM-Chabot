@@ -1,0 +1,49 @@
+{
+  "slug": "govuk-vat-rates",
+  "url": "https://www.gov.uk/vat-rates",
+  "cached_body_sha256": "b308887b21307218cca5810525d31d84fb8f5eadb084355df3b69ae3ef1b8836",
+  "markup": "jsonld",
+  "derived_by": "read out of the cached HTML by a human; NOT captured from the extractor",
+  "derived_on": "2026-09-07",
+  "quoted_source": [
+    "block 1: {\"@type\": \"FAQPage\", \"name\": \"VAT rates\", \"datePublished\": \"2011-09-12T16:43:03+01:00\", \"dateModified\": \"2014-12-12T14:55:23+00:00\", \"author\": {\"@type\": \"Organization\", \"name\": \"Government Digital Service\", \"url\": \"...\"}, \"mainEntity\": [{\"@type\": \"Question\", \"name\": \"VAT rates\", \"acceptedAnswer\": {\"@type\": \"Answer\", \"text\": \"<div class=\\\"highlight-answer\\\"><p>The standard VAT rate is <em>20%</em></p></div>...\"}}, ...]}",
+    "block 2: {\"@type\": \"BreadcrumbList\", \"itemListElement\": [{\"@type\": \"ListItem\", \"position\": 1, \"item\": {\"name\": \"Home\", \"@id\": \"https://www.gov.uk/\"}}, {\"@type\": \"ListItem\", \"position\": 2, \"item\": {\"name\": \"Money and tax\", ...}}, {\"@type\": \"ListItem\", \"position\": 3, \"item\": {\"name\": \"VAT\", ...}}]}"
+  ],
+  "expectations": [
+    {
+      "entity": "VAT rates", "entity_type": "FAQPage", "parent": "",
+      "field": "datePublished", "value": "2011-09-12T16:43:03+01:00",
+      "source": "jsonld",
+      "read_from": "\"datePublished\" on the FAQPage object; copied through verbatim, offset and all"
+    },
+    {
+      "entity": "VAT rates", "entity_type": "FAQPage", "parent": "",
+      "field": "dateModified", "value": "2014-12-12T14:55:23+00:00",
+      "source": "jsonld",
+      "read_from": "\"dateModified\" on the FAQPage object"
+    },
+    {
+      "entity": "VAT rates", "entity_type": "FAQPage", "parent": "",
+      "field": "author", "value": "Government Digital Service",
+      "source": "jsonld",
+      "read_from": "author is an Organization object whose only non-skipped scalar is its name, so the name must fold onto the FAQPage's own line rather than becoming a line of its own"
+    },
+    {
+      "entity": "Money and tax", "parent": "", "entity_is_bare_type": true,
+      "field": "position", "value": "2",
+      "source": "jsonld",
+      "read_from": "ListItem 2 wraps item {name: 'Money and tax'}. The rank lives on the WRAPPER and the name on the wrapped item; they must end on ONE line or the rank is orphaned. entity_is_bare_type is true because the wrapped item states no @type, so the head is the name alone"
+    }
+  ],
+  "known_absent": [
+    {
+      "entity": "VAT rates", "field": "text",
+      "value": "Current VAT rates - standard 20% and rates for reduced rate and zero-rated items",
+      "reason": "the FAQPage's own \"text\" property. `_SKIP_KEY_RE` matches ^text$ (its value is normally the article prose, already extracted). Here it is the page summary and it names the 20% rate."
+    },
+    {
+      "entity": "VAT rates", "field": "acceptedAnswer", "value": "The standard VAT rate is 20%",
+      "reason": "every Question's answer is an Answer object whose only content is `text`, which is skipped, leaving the Answer with no fields; a nested record with no fields is not emitted. On THIS page the prose states 20% anyway, so nothing is lost here -- but on a JavaScript-rendered FAQ the answer body would be the only copy."
+    }
+  ]
+}

@@ -1,0 +1,44 @@
+{
+  "slug": "datagov-ev-population",
+  "url": "https://catalog.data.gov/dataset/electric-vehicle-population-data",
+  "cached_body_sha256": "147689194ae270bc82838b0c5b227bff02f9a87d2624a86cf628be4bf358dcaa",
+  "markup": "jsonld",
+  "derived_by": "read out of the cached HTML by a human; NOT captured from the extractor",
+  "derived_on": "2026-09-07",
+  "quoted_source": [
+    "{\"@type\": \"Dataset\", \"name\": \"Electric Vehicle Population Data\", \"dateModified\": \"2026-08-24\", \"datePublished\": \"2023-10-19\", \"license\": \"http://opendatacommons.org/licenses/odbl/1.0/\", \"publisher\": {\"@type\": \"Organization\", \"name\": \"data.wa.gov\"}, \"keywords\": [\"bev\", \"bevs\", \"bolt\", \"car\", ...], \"distribution\": [{\"@type\": \"DataDownload\", \"contentUrl\": \"...query.json...\", \"encodingFormat\": \"application/json\"}, ... {\"encodingFormat\": \"text/csv\"} ... ]}"
+  ],
+  "expectations": [
+    {
+      "entity": "DataDownload", "parent": "Electric Vehicle Population Data",
+      "entity_is_bare_type": true,
+      "field": "encodingFormat", "value": "text/csv",
+      "source": "jsonld",
+      "read_from": "the third member of \"distribution\". A DataDownload has no name of its own, so the ONLY thing that says which dataset this CSV belongs to is the parent carried onto the line. That association is what is being asserted here, not the string 'text/csv'."
+    },
+    {
+      "entity": "DataDownload", "parent": "Electric Vehicle Population Data",
+      "entity_is_bare_type": true,
+      "field": "encodingFormat", "value": "application/geo+json",
+      "source": "jsonld",
+      "read_from": "the sixth member of \"distribution\"; six siblings must produce six lines, not one collapsed one"
+    }
+  ],
+  "known_absent": [
+    {
+      "entity": "Electric Vehicle Population Data", "field": "datePublished",
+      "value": "2023-10-19",
+      "reason": "DEDUPE, and correct here: the rendered page already prints 2023-10-19 next to the dataset title, so repeating it in the appended block would double the fact. Read in the JSON-LD; verified present in the extracted prose."
+    },
+    {
+      "entity": "Electric Vehicle Population Data", "field": "publisher",
+      "value": "data.wa.gov",
+      "reason": "DEDUPE, correct: the prose states data.wa.gov near the title."
+    },
+    {
+      "entity": "Electric Vehicle Population Data", "field": "license",
+      "value": "http://opendatacommons.org/licenses/odbl/1.0/",
+      "reason": "DEDUPE, correct: the prose links opendatacommons.org within the proximity window."
+    }
+  ]
+}

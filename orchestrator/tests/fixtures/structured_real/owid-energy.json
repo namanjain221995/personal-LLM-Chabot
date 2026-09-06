@@ -1,0 +1,29 @@
+{
+  "slug": "owid-energy",
+  "url": "https://ourworldindata.org/energy",
+  "cached_body_sha256": "91d49ae019164447539ce37bf8a70f52502261043c7a9789f8bf5f282af04c67",
+  "markup": "jsonld",
+  "derived_by": "read out of the cached HTML by a human; NOT captured from the extractor",
+  "derived_on": "2026-09-07",
+  "quoted_source": [
+    "{\"@type\": \"Article\", \"headline\": \"Energy\", \"description\": \"Explore our data and research on global energy.\", \"datePublished\": \"2023-12-20T15:32:00.000Z\", \"author\": [{\"@type\": \"Person\", \"name\": \"Hannah Ritchie\", \"url\": \"...\"}, {\"@type\": \"Person\", \"name\": \"Pablo Rosado\", \"url\": \"...\"}, {\"@type\": \"Person\", \"name\": \"Max Roser\", \"url\": \"...\"}], \"publisher\": {\"@type\": \"Organization\", \"name\": \"Our World in Data\", \"url\": \"...\", \"logo\": \"https://ourworldindata.org/owid-logo.png\"}}"
+  ],
+  "expectations": [
+    {
+      "entity": "Energy", "entity_type": "Article", "parent": "",
+      "field": "datePublished", "value": "2023-12-20T15:32:00.000Z",
+      "source": "jsonld",
+      "read_from": "\"datePublished\"; the millisecond form is kept exactly as written. The entity name comes from \"headline\" because the record states no \"name\"."
+    }
+  ],
+  "known_absent": [
+    {
+      "entity": "Energy", "field": "author", "value": "Hannah Ritchie",
+      "reason": "A GAP. `author` is a LIST of Person objects. The list branch only keeps SCALAR members; object members are pushed out as child records, and a Person whose only keys are `name` (the record's own name) and `url` (skipped) has no fields, so it is not emitted. One author object folds onto the parent line (see wikipedia-schema-org); three do not. The three names are in the page prose here, so nothing is lost on THIS page -- the asymmetry is the finding."
+    },
+    {
+      "entity": "Energy", "field": "publisher", "value": "Our World in Data",
+      "reason": "DEDUPE, correct: the prose names Our World in Data within the proximity window."
+    }
+  ]
+}

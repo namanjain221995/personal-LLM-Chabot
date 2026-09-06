@@ -16,7 +16,7 @@ from urllib.parse import urlparse
 from . import DIAGRAM_INSTRUCTION, recent_turns
 from .. import db, llm, metrics
 from ..config import settings
-from ..core import extract, net
+from ..core import extract, net, robots
 from ..core.urls import check_shareable, select_relevant
 
 log = logging.getLogger(__name__)
@@ -148,6 +148,8 @@ async def _remember_globally(
                 # main.py threads it (see run_url_engine); the conversation
                 # still names the owner via conversation_owner.
                 origin="share",
+                # V22: which extractor produced this text (see crawl/search).
+                extract_version=extract.EXTRACT_VERSION,
                 introduced_by_user_id=user_id,
                 introduced_in_conversation_id=conversation_id,
                 **meta,
@@ -190,6 +192,27 @@ async def fetch_and_store(
     """Fetch+extract one URL and store it; returns the doc or None on failure."""
     domain = urlparse(url).hostname or url
     await emit("status", {"text": f"Reading {domain}…"})
+    # robots.txt on the pasted-link read too (finding K6). This path is
+    # user-directed rather than a crawl, but it is still this server fetching a
+    # third-party page automatically, and the site's stated rules are the only
+    # signal it has to say no. Fail-open: `robots.allowed` allows when
+    # robots.txt could not be READ at all, so a site outage never turns into
+    # "this platform cannot open links any more".
+    try:
+        if not await robots.allowed(url):
+            await emit(
+                "status",
+                {"text": f"Skipped {domain} (its robots.txt asks bots not to read that page)."},
+            )
+            return None
+        if not await robots.reserve_slot(url):
+            await emit(
+                "status",
+                {"text": f"Skipped {domain} (it asks for a longer delay between requests)."},
+            )
+            return None
+    except Exception:  # noqa: BLE001 — the robots check is a courtesy, not a gate
+        log.debug("robots check unavailable for %s", domain, exc_info=True)
     try:
         fetched = await net.safe_fetch(
             url,

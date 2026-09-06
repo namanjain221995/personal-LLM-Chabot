@@ -58,27 +58,65 @@ WHAT IS NOT GUARANTEED
 - URL credentials (``user:pw@host``) pass through to the request as basic
   auth, as before. Out of scope for the address policy.
 
+CALLER-SUPPLIED REQUEST HEADERS (2026-09-06, finding K5)
+
+``safe_fetch`` accepts a ``headers`` mapping so a refresh can send the
+conditional validators (``If-None-Match`` / ``If-Modified-Since``) it has
+stored. That is a request-shaping argument, never a policy argument, and it
+is deliberately the narrowest thing that does the job:
+
+* it is an ALLOWLIST (``_ALLOWED_REQUEST_HEADERS``), not a filter of known-bad
+  names. A header this module has not vetted is dropped, so no caller can
+  reach ``Host`` (which is what makes DNS pinning and the TLS hostname check
+  agree), ``Cookie``/``Authorization`` (credentials into a user-influenced
+  URL), ``Connection``/``Transfer-Encoding`` (request smuggling), or a proxy
+  header;
+* the module's own ``User-Agent``/``Accept`` are applied ON TOP of whatever
+  survives the allowlist, so the honest identity this fetcher announces
+  cannot be overridden even if the allowlist is widened by mistake;
+* nothing here touches ``_validate``, the pin table, the redirect loop or the
+  byte cap. The headers ride along the same request the guards already
+  approved, and are re-sent unchanged on a re-validated redirect hop.
+
+A ``304 Not Modified`` is returned as a ``FetchResult`` with ``status=304``
+and an empty body — it is a successful answer to a conditional request, not a
+failure, and callers must not treat it as one.
+
 Pure-ish: stdlib + httpx + httpcore. No network at import time.
 """
 from __future__ import annotations
 
 import asyncio
 import ipaddress
+import logging
 import os
 import socket
 import ssl
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Mapping, Optional, Tuple
 from urllib.parse import urlparse
 
 import httpcore
 import httpx
 
+log = logging.getLogger(__name__)
+
 # Cloud metadata endpoints are link-local (169.254.169.254 / fd00:ec2::254) and
 # already covered by the reserved-range checks, but we name them for clarity.
 _MAX_REDIRECTS = 3
 _ALLOWED_SCHEMES = {"http", "https"}
+
+#: The ONLY request headers a caller may add (lower-case). Conditional
+#: validators and nothing else: they change what the server sends back, never
+#: where the request goes, who it claims to be, or how the body is framed.
+#: Widening this set is a security review, not a convenience — see the module
+#: docstring for what each excluded class would break.
+_ALLOWED_REQUEST_HEADERS = frozenset({"if-none-match", "if-modified-since"})
+
+#: Sent on every request. Applied AFTER the caller's headers so they always
+#: win: the fetcher's identity is not negotiable.
+_UA = "TechSaraBot/1.0 (+local analytics)"
 
 
 class UnsafeURLError(ValueError):
@@ -356,12 +394,44 @@ async def _read_capped(resp: httpx.Response, max_bytes: int) -> bytes:
     return b"".join(chunks)
 
 
+def _vetted_headers(headers: Optional[Mapping[str, str]]) -> Dict[str, str]:
+    """The caller's headers, reduced to the allowlist, with our own on top.
+
+    Order is the point. The caller's surviving headers go in first and the
+    module's identity headers are written over them, so even a future widening
+    of ``_ALLOWED_REQUEST_HEADERS`` cannot let a caller rename this fetcher or
+    change what it claims to accept. Nothing here can influence the SSRF
+    guard, the pin table or the redirect policy — those read the URL, never
+    the headers.
+
+    Dropped names are logged, never their VALUES: a validator is harmless but
+    the same code path would otherwise be one careless widening away from
+    printing an Authorization header into the log.
+    """
+    out: Dict[str, str] = {}
+    dropped: List[str] = []
+    for key, value in (headers or {}).items():
+        name = str(key or "").strip()
+        if name.lower() in _ALLOWED_REQUEST_HEADERS:
+            text = str(value or "").strip()
+            # A header value carrying CR/LF is a response-splitting attempt;
+            # httpx would reject it, but refusing here keeps the reason clear.
+            if text and "\r" not in text and "\n" not in text:
+                out[name] = text
+        elif name:
+            dropped.append(name)
+    if dropped:
+        log.debug("safe_fetch dropped non-allowlisted request header(s): %s", dropped)
+    return out
+
+
 async def safe_fetch(
     url: str,
     *,
     timeout_ms: int,
     max_bytes: int,
     accept: Optional[str] = None,
+    headers: Optional[Mapping[str, str]] = None,
 ) -> FetchResult:
     """Fetch a public URL with SSRF guards, DNS pinning, manual redirect
     re-validation, a time limit, and a streamed hard body-size cap.
@@ -370,6 +440,13 @@ async def safe_fetch(
     hop's Location is re-validated against the SSRF blocklist — a public URL
     that 302s to http://169.254.169.254/ is refused at the hop, not followed.
     See the module docstring for what is and is not guaranteed.
+
+    `headers` may carry ONLY the conditional validators (see
+    ``_ALLOWED_REQUEST_HEADERS``); everything else is dropped, and this
+    module's own User-Agent/Accept are applied afterwards so a caller can
+    never override them. A conditional request that the server answers with
+    **304 Not Modified** comes back as a normal ``FetchResult`` with
+    ``status=304`` and an empty body — success, not a ``FetchError``.
     """
     backend = _PinnedBackend()
     # SSRF validation resolves DNS, and socket.getaddrinfo is BLOCKING with no
@@ -382,15 +459,21 @@ async def safe_fetch(
     timeout = httpx.Timeout(
         connect=3.0, read=timeout_ms / 1000.0, write=3.0, pool=2.0
     )
-    headers = {"User-Agent": "TechSaraBot/1.0 (+local analytics)"}
+    # Ours are the CLIENT headers, sent on every hop. The caller's vetted
+    # extras go on the FIRST request only — see the loop below.
+    request_headers = {"User-Agent": _UA}
     if accept:
-        headers["Accept"] = accept
+        request_headers["Accept"] = accept
+    # Allowlisted, then written UNDER our own names by httpx's merge order:
+    # per-request headers cannot introduce a User-Agent or Accept because the
+    # allowlist has neither, and `_vetted_headers` would drop them if it did.
+    conditional = _vetted_headers(headers)
 
     async with httpx.AsyncClient(
         transport=_PinnedTransport(backend),
         follow_redirects=False,
         timeout=timeout,
-        headers=headers,
+        headers=request_headers,
         # No env proxies: a proxy would resolve the name itself and bypass
         # the pin. (httpx already ignores them with an explicit transport;
         # stating it keeps the property visible.)
@@ -398,7 +481,33 @@ async def safe_fetch(
     ) as client:
         for _hop in range(_MAX_REDIRECTS + 1):
             try:
-                async with client.stream("GET", current) as resp:
+                # A validator identifies a version of ONE resource, so it is
+                # sent to the URL it was stored for and to nothing else. A
+                # 301 to a different page whose Last-Modified predates our
+                # stored date would otherwise answer 304, and the caller would
+                # record "unchanged" for a page that had in fact MOVED — the
+                # stored copy frozen at the pre-redirect content forever.
+                async with client.stream(
+                    "GET", current, headers=conditional if _hop == 0 else None
+                ) as resp:
+                    if resp.status_code == 304:
+                        # The answer to a conditional request: the stored copy
+                        # is still current. Checked BEFORE the redirect test
+                        # (a 304 is in the 3xx range, so a stray Location
+                        # header would otherwise send us round the loop) and
+                        # before the >=400 test (it is not an error). There is
+                        # no body to read, by definition.
+                        return FetchResult(
+                            url=current,
+                            status=304,
+                            content_type=resp.headers.get("content-type", ""),
+                            body=b"",
+                            headers={
+                                k: resp.headers.get(k, "")
+                                for k in ("last-modified", "etag", "date")
+                                if resp.headers.get(k)
+                            },
+                        )
                     if resp.is_redirect:
                         location = resp.headers.get("location")
                         if not location:

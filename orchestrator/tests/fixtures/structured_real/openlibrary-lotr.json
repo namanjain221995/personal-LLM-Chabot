@@ -1,0 +1,88 @@
+{
+  "slug": "openlibrary-lotr",
+  "url": "https://openlibrary.org/works/OL27448W/The_Lord_of_the_Rings",
+  "cached_body_sha256": "c89132803f0ebf242e2599445c6595df94560bb73e688261c952fed408af8524",
+  "markup": "microdata",
+  "derived_by": "read out of the cached HTML by a human; NOT captured from the extractor",
+  "derived_on": "2026-09-07",
+  "note": "This is the ADVERSE case in the set and it is here on purpose. The page's single Book scope repeats itemprop=\"name\" three times (a mobile copy of the work title, a desktop copy, and the 'Book Details' section heading), so the record has no single name. It also describes a Turkish EDITION of a work the URL calls 'The Lord of the Rings'. The expectations below pin what the extractor actually does with that, so that a future change to the naming rule fails here and is read by a person.",
+  "separator_ambiguity": "The two multi-valued expectations below ('name' and 'isbn') are hand-read as the JOINED value, and they can only be checked because the checker reconstructs them. `structured._line` joins FIELDS with '; ' and `_collect` joins the members of a multi-valued property with '; ' too, so once the line is rendered 'isbn: 9753423470; 9789753423472' is indistinguishable from an isbn followed by a loose number -- to this checker, to a reader, and to the model. The checker's rule (a chunk with no 'key: ' prefix continues the previous value) is a GUESS, is flagged as separator_ambiguous in the report, and is recorded here rather than hidden inside a passing assertion.",
+  "quoted_source": [
+    "<div id=\"contentBody\" role=\"main\" itemscope itemtype=\"https://schema.org/Book\" ...>",
+    "<h1 class=\"work-title\" itemprop=\"name\">Yüzüklerin Efendisi</h1>   (appears twice: mobile + desktop)",
+    "<h2 class=\"details-title\" itemprop=\"name\">Book Details</h2>",
+    "<span itemprop=\"aggregateRating\" itemscope itemtype=\"https://schema.org/AggregateRating\"> <meta itemprop=\"ratingValue\" content=\"4.45\"/> <meta itemprop=\"ratingCount\" content=\"118\"/> ...",
+    "<span itemprop=\"datePublished\">2007</span>",
+    "<a itemprop=\"publisher\" href=\"/publishers/Metis_Yayıncılık\" ...>Metis Yayıncılık</a>",
+    "<span itemprop=\"inLanguage\"><a href=\"/languages/tur\">Turkish</a></span>",
+    "<a href=\"/authors/OL26320A/J.R.R._Tolkien\" itemprop=\"author\">J.R.R. Tolkien</a>   (appears twice)",
+    "<dd class=\"object\" itemprop=\"isbn\">9753423470</dd> and <dd class=\"object\" itemprop=\"isbn\">9789753423472</dd>"
+  ],
+  "expectations": [
+    {
+      "entity": "Book",
+      "parent": "",
+      "entity_is_bare_type": true,
+      "field": "ratingValue",
+      "value": "4.45",
+      "source": "microdata",
+      "read_from": "content=\"4.45\" on the AggregateRating meta. THE FINDING: the rating lands on a record whose head is the bare type 'Book' -- there is no entity name -- because itemprop=\"name\" occurs three times, becomes a list, and the name lookup only accepts a scalar. entity_is_bare_type is asserted TRUE deliberately: it is the defect, pinned. No bestRating is stated, so the value correctly carries no '/5'."
+    },
+    {
+      "entity": "Book",
+      "parent": "",
+      "entity_is_bare_type": true,
+      "field": "ratingCount",
+      "value": "118",
+      "source": "microdata",
+      "read_from": "content=\"118\"; kept beside ratingValue so the count is not read as a second score"
+    },
+    {
+      "entity": "Book",
+      "parent": "",
+      "entity_is_bare_type": true,
+      "field": "name",
+      "value": "Yüzüklerin Efendisi; Yüzüklerin Efendisi; Book Details",
+      "source": "microdata",
+      "read_from": "the three itemprop=\"name\" elements, in document order, joined by the list separator. Asserted exactly as it renders -- including the duplicate and the section heading -- because that string is what a reader and the model actually see."
+    },
+    {
+      "entity": "Book",
+      "parent": "",
+      "entity_is_bare_type": true,
+      "field": "isbn",
+      "value": "9753423470; 9789753423472",
+      "source": "microdata",
+      "read_from": "the ISBN-10 and ISBN-13 cells; a repeated property that SHOULD be a list, and here is one"
+    },
+    {
+      "entity": "Book",
+      "parent": "",
+      "entity_is_bare_type": true,
+      "field": "datePublished",
+      "value": "2007",
+      "source": "microdata",
+      "read_from": "<span itemprop=\"datePublished\">2007</span>; the Turkish edition's year, not the 1954 first-publication year the page also displays"
+    }
+  ],
+  "known_absent": [
+    {
+      "entity": "Book",
+      "field": "author",
+      "value": "J.R.R. Tolkien",
+      "reason": "<a itemprop=\"author\"> yields its href, so the value is '/authors/OL26320A/J.R.R._Tolkien; /authors/OL26320A/J.R.R._Tolkien' -- a path, twice. The author's name as written is not recovered. Same root cause as the Gutenberg creator field."
+    },
+    {
+      "entity": "Book",
+      "field": "publisher",
+      "value": "Metis Yayıncılık",
+      "reason": "<a itemprop=\"publisher\"> yields '/publishers/Metis_Yayıncılık'. The readable publisher name is in the link text and is discarded."
+    },
+    {
+      "entity": "The Lord of the Rings",
+      "field": "name",
+      "value": "The Lord of the Rings",
+      "reason": "The title the URL and the page heading use is NOT inside the Book scope as an itemprop, so no record names it. A query about The Lord of the Rings that retrieves this line gets a 4.45 attached to a Turkish edition title and a bare type."
+    }
+  ]
+}

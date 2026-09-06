@@ -2,11 +2,11 @@
 
 Runs inside the orchestrator container (``/app``):
 
-    python -m tools.knowledge_admin pages   [--domain D] [--origin O] [--introducer UID] [--quarantined] [--limit N]
+    python -m tools.knowledge_admin pages   [--domain D] [--url U] [--origin O] [--introducer UID] [--quarantined] [--limit N]
     python -m tools.knowledge_admin claims  [--page-id ID] [--domain D] [--introducer UID] [--origin-user UID] [--limit N]
-    python -m tools.knowledge_admin quarantine   (--id ID ... | --domain D | --introducer UID) --yes
-    python -m tools.knowledge_admin unquarantine (--id ID ... | --domain D | --introducer UID) --yes
-    python -m tools.knowledge_admin purge --introducer UID [--origin O] [--drop-vectors] --yes
+    python -m tools.knowledge_admin quarantine   (--id ID ... | --url U ... | --domain D | --introducer UID) --yes
+    python -m tools.knowledge_admin unquarantine (--id ID ... | --url U ... | --domain D | --introducer UID) --yes
+    python -m tools.knowledge_admin purge --introducer UID [--origin O] [--keep-vectors] --yes
 
 WHY THIS EXISTS (ADR-0001 D7, migration V16). The web store is shared by
 every account and became member-writable on 2026-09-03: a pasted link is
@@ -22,10 +22,26 @@ stops — ``--yes`` is what applies it. ``purge`` deletes ``web_claims`` and
 ``web_page_versions`` explicitly before the pages: the claims FK is
 ``ON DELETE SET NULL``, so without that a claim taken from a purged page
 would survive as an orphan and still be rendered to users. Quarantine is
-reversible and touches nothing but ``quarantined_at``; the retrieval queries
-(``web_memory``) exclude quarantined rows, so the vectors can stay put.
-``purge --drop-vectors`` additionally removes the pages' chunks from the
-live LanceDB table; without it they linger until ``tools.reindex_web``.
+reversible and touches nothing but ``quarantined_at``; every retrieval path
+now excludes quarantined rows (``web_memory`` by SQL, ``web_index.retrieve``
+by asking PostgreSQL which pages may still be served), so the vectors can
+stay put.
+
+A PURGE DELETES THE VECTORS TOO — that is the default, not a flag (K7,
+2026-09-06). It was ``--drop-vectors``, opt-in, so the ordinary outcome of a
+purge was a LanceDB table full of chunks for pages that no longer existed.
+Those chunks were not inert: ``crawl.site_hits_for`` reads the web index
+directly and rendered chunk text into an answer, so an orphan was a citation
+to a deleted page with no row left to date it, quarantine it or name it.
+
+TWO CHANGES, NOT ONE, because either alone leaves a hole. Deletion is now
+whole by default, AND ``web_index.retrieve`` asks PostgreSQL which page ids
+may still be served, so an orphan that gets in some other way is not served.
+``--keep-vectors`` is the deliberate exception, for an operator about to
+rebuild the index anyway (``python -m tools.reindex_web build``); it says what
+it left behind. A vector delete that FAILS never silently passes: purge exits
+non-zero and names the rebuild, because the PostgreSQL rows are already gone
+by then and only an operator can decide what to do about it.
 """
 from __future__ import annotations
 
@@ -60,6 +76,7 @@ def _domain_clause(domain: str, column: str = "domain") -> Tuple[str, List[Any]]
 def page_selector(
     *,
     ids: Sequence[int] = (),
+    urls: Sequence[str] = (),
     domain: str = "",
     origin: str = "",
     introducer: Optional[int] = None,
@@ -73,6 +90,14 @@ def page_selector(
         clauses.append("id = ANY(%s)")
         params.append([int(i) for i in ids])
         words.append(f"id in {sorted(int(i) for i in ids)}")
+    if urls:
+        # An operator arrives holding a URL out of a citation panel, not a
+        # page id. `url` is what was fetched and `canonical_url` is what the
+        # page said it was; a citation can carry either, so both are matched.
+        wanted = [str(u).strip() for u in urls if str(u).strip()]
+        clauses.append("(url = ANY(%s) OR canonical_url = ANY(%s))")
+        params.extend([wanted, wanted])
+        words.append(f"{len(wanted)} url(s)")
     if domain:
         clause, p = _domain_clause(domain)
         clauses.append(clause)
@@ -225,27 +250,20 @@ def purge_pages(where: str, params: List[Any]) -> Dict[str, Any]:
 
 
 def drop_vectors(page_ids: Sequence[int]) -> Dict[str, Any]:
-    """Best effort: remove the pages' chunks from the live web index.
+    """Remove the pages' chunks from the live web index.
 
-    Delete-by-predicate is what the live indexer itself does before re-adding
-    a page, so this is a write the table already sees routinely. Any failure
-    is reported, never raised — the pages are gone from PostgreSQL either
-    way, and `tools.reindex_web` rebuilds a clean table."""
+    Thin wrapper over `web_index.delete_pages`, which owns the LanceDB write
+    and the guard that refuses a directory overlapping the SALESFORCE corpus.
+    A failure is REPORTED, not raised — the PostgreSQL rows are already gone
+    by the time this runs, so the caller must be able to say what state the
+    store is in and name the rebuild rather than die mid-way."""
     from app import web_index  # lazy: pulls in llm/metrics
 
     ids = [int(i) for i in page_ids]
     if not ids:
-        return {"status": "skipped", "removed": 0}
+        return {"status": "skipped", "removed": 0, "rows": 0}
     try:
-        _conn, table, _meta = web_index._open()
-        if table is None:
-            return {"status": "empty", "removed": 0}
-        before = int(table.count_rows())
-        for start in range(0, len(ids), 500):
-            chunk = ids[start : start + 500]
-            table.delete("page_id IN (" + ", ".join(str(i) for i in chunk) + ")")
-        after = int(table.count_rows())
-        return {"status": "ok", "removed": before - after, "rows": after}
+        return web_index.delete_pages(ids)
     except Exception as exc:  # noqa: BLE001
         return {"status": "error", "removed": 0, "detail": f"{type(exc).__name__}: {exc}"}
 
@@ -317,6 +335,7 @@ def render_counts(counts: Dict[str, Any]) -> str:
 
 def _add_selector(parser: argparse.ArgumentParser, *, require_one: bool) -> None:
     parser.add_argument("--id", type=int, action="append", default=[], help="page id (repeatable)")
+    parser.add_argument("--url", action="append", default=[], help="exact page url (repeatable)")
     parser.add_argument("--domain", default="", help="domain and its subdomains")
     parser.add_argument("--introducer", type=int, default=None, help="introduced_by_user_id")
     if require_one:
@@ -353,10 +372,22 @@ def _parser() -> argparse.ArgumentParser:
         _add_selector(p, require_one=True)
         p.add_argument("--yes", action="store_true", help="apply; without it only the counts are printed")
 
-    purge = sub.add_parser("purge", help="DELETE pages an account introduced, with their claims and versions")
+    purge = sub.add_parser(
+        "purge",
+        help="DELETE pages an account introduced, with their claims, versions AND vectors",
+    )
     purge.add_argument("--introducer", type=int, required=True, help="introduced_by_user_id")
     purge.add_argument("--origin", default="", choices=("", *ORIGINS), help="only pages still carrying this origin (e.g. share)")
-    purge.add_argument("--drop-vectors", action="store_true", help="also delete the pages' chunks from the live web index")
+    vectors = purge.add_mutually_exclusive_group()
+    vectors.add_argument(
+        "--keep-vectors", action="store_true",
+        help="leave the pages' chunks in the live web index (retrieval refuses to serve "
+             "them, but they cost scan time and disk until `tools.reindex_web build` runs)",
+    )
+    vectors.add_argument(
+        "--drop-vectors", action="store_true",
+        help="accepted for compatibility and now the DEFAULT; has no effect",
+    )
     purge.add_argument("--yes", action="store_true", help="required: purge refuses to run without it")
     return parser
 
@@ -364,6 +395,7 @@ def _parser() -> argparse.ArgumentParser:
 def _selector_from(args: argparse.Namespace) -> Tuple[str, List[Any], str]:
     return page_selector(
         ids=args.id,
+        urls=getattr(args, "url", []) or [],
         domain=args.domain,
         origin=getattr(args, "origin", "") or "",
         introducer=args.introducer,
@@ -376,7 +408,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.command == "pages":
         quarantined = True if args.quarantined else (False if args.not_quarantined else None)
         where, params, words = page_selector(
-            ids=args.id, domain=args.domain, origin=args.origin,
+            ids=args.id, urls=args.url, domain=args.domain, origin=args.origin,
             introducer=args.introducer, quarantined=quarantined,
         )
         counts = page_counts(where, params)
@@ -395,8 +427,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     if args.command in ("quarantine", "unquarantine"):
-        if not (args.id or args.domain or args.introducer is not None):
-            print("error: give at least one of --id, --domain, --introducer", file=sys.stderr)
+        if not (args.id or args.url or args.domain or args.introducer is not None):
+            print("error: give at least one of --id, --url, --domain, --introducer", file=sys.stderr)
             return 2
         where, params, words = _selector_from(args)
         counts = page_counts(where, params)
@@ -427,21 +459,31 @@ def main(argv: Optional[List[str]] = None) -> int:
             f"deleted web_pages={result['pages']} web_claims={result['claims']} "
             f"web_page_versions={result['versions']}"
         )
-        if args.drop_vectors:
-            dropped = drop_vectors(result["ids"])
-            if dropped["status"] == "ok":
-                print(f"web index: removed {dropped['removed']} chunk row(s); {dropped['rows']} remain")
-            else:
-                print(
-                    f"web index: vectors NOT removed ({dropped.get('detail', dropped['status'])}); "
-                    "run `python -m tools.reindex_web build` to rebuild without them"
-                )
-        else:
+        if args.keep_vectors:
             print(
-                f"note: the {len(result['ids'])} page id(s) still have chunk rows in the web index "
-                "until `--drop-vectors` or `python -m tools.reindex_web build`"
+                f"WARNING: --keep-vectors: the {len(result['ids'])} purged page id(s) still have "
+                "chunk rows in the web index. Retrieval will not serve them (web_index checks "
+                "PostgreSQL for every hit), but they still cost scan time and disk and nothing "
+                "else will remove them. Run `python -m tools.reindex_web build` to rebuild "
+                "without them."
             )
-        return 0
+            return 0
+        dropped = drop_vectors(result["ids"])
+        if dropped["status"] in ("ok", "empty", "skipped"):
+            print(
+                f"web index: removed {dropped['removed']} chunk row(s); "
+                f"{dropped.get('rows', 0)} remain"
+            )
+            return 0
+        # The rows are already gone from PostgreSQL. Leaving with 0 here would
+        # report a clean purge over exactly the orphaned state K7 describes.
+        print(
+            f"web index: vectors NOT removed ({dropped.get('detail', dropped['status'])}); "
+            f"the {len(result['ids'])} purged page id(s) still have chunk rows in the web "
+            "index — run `python -m tools.reindex_web build` to rebuild without them",
+            file=sys.stderr,
+        )
+        return 1
 
     return 2
 

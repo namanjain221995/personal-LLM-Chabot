@@ -9,17 +9,42 @@ build, a healthcheck and a deployment surface bought for nothing.
 
 TWO JOBS, both idempotent and both interruptible:
 
-  INDEX    embed pages that are stored but have no vectors. Indexing was
+  INDEX    embed pages that are stored but have no vectors, and RE-CHUNK pages
+           whose vectors an older chunker produced (V24). Indexing was
            write-behind with three call sites, all of them inside a search or
            a crawl — so a page whose embedding failed stayed invisible until
            somebody happened to run another search. Now something always
            comes back for it.
+
+           The re-chunk half needs NO NETWORK. `web_pages.text` is retained, so
+           a chunker change is repaired from the store: no fetch, no ETag, no
+           robots check, nothing a remote server could refuse. That is the
+           whole reason it is a separate column from `extract_version` — a page
+           can be provably current upstream (a 304) and still be overdue for
+           reprocessing here.
 
   REFRESH  re-read pages past their deadline, most-wanted first, using
            conditional requests so an unchanged page costs one 304 and no
            bandwidth. This is what stops the corpus quietly becoming a
            museum: a stale page that nobody re-reads is exactly how the
            platform would keep answering with last year's Vice President.
+
+           That paragraph described an intention, not the code, until
+           2026-09-06 (finding K5): `etag` and `last_modified` were stored
+           and never read, `_refresh_one` returned a boolean that had no way
+           to say "304", and every refresh was a full download. Both halves
+           are now real, and `run_once` counts `not_modified` separately so
+           the difference is visible rather than assumed. robots.txt is
+           consulted on this path too (K6) — the refresh worker is the one
+           fetcher on this box with nobody waiting on it, so it obeys a
+           Disallow and waits out a Crawl-delay in full.
+
+           A page also goes stale when the EXTRACTOR improves (V21/V22): the
+           URL still says the same thing, but our stored copy of it is worse
+           than what we could read today, and the vector chunks were built
+           from that worse copy. Those rows join the same queue, drained in
+           the same demand order inside the same budget — the alternative
+           was a mass recrawl of the whole corpus.
 
 It never blocks a user request, and every failure is contained to one page.
 """
@@ -34,6 +59,7 @@ from typing import Any, Dict, List, Optional
 
 from . import db, metrics, web_index
 from .config import settings
+from .core.extract import EXTRACT_VERSION
 from .freshness import Freshness
 
 log = logging.getLogger(__name__)
@@ -94,20 +120,121 @@ def _ttl_for(row: Dict[str, Any]) -> int:
     return ttl
 
 
+_DUE_COLUMNS = (
+    "id, url, url_key, title, content_hash, etag, last_modified, "
+    "retrieval_count, refresh_failures, fetched_at"
+)
+
+#: The queue as it was before V21: deadline only.
+_DUE_SQL = (
+    f"SELECT {_DUE_COLUMNS} FROM web_pages "
+    "WHERE next_refresh_at IS NOT NULL AND next_refresh_at <= now() "
+    "AND text <> '' "
+    "ORDER BY retrieval_count DESC, next_refresh_at LIMIT %s"
+)
+
+#: V21 (recovered 2026-09-06): the SAME bounded queue, widened by one term.
+#:
+#: A better extractor makes every previously-stored page stale in a way no
+#: deadline knows about — the URL has not changed, so nothing would ever
+#: re-read it, and its LanceDB chunks stay built from the worse text. Rather
+#: than a mass re-crawl, rows below the current extractor version join the
+#: ordinary refresh queue and are drained most-retrieved-first inside the
+#: existing per-cycle budget. There is no new scan and no new loop: one extra
+#: OR term, the same LIMIT, the same ordering.
+#:
+#: TWO GUARDS KEEP THE NEW TERM BOUNDED, and both are load-bearing at a
+#: budget of 8 pages per 5-minute cycle ordered by demand — without them the
+#: SAME eight rows would be re-read every cycle forever.
+#:
+#: `refresh_failures = 0` covers failure. A stale-extractor page that fails
+#: leaves this term at once (`_schedule_next` bumps the counter) and comes
+#: back only through the deadline term, which already backs off
+#: exponentially.
+#:
+#: `fetched_at` spacing covers success. The term is supposed to end when the
+#: page is re-read and its new `extract_version` is written — but that write
+#: happens in `upsert_web_page`'s callers, and a caller that forgets to pass
+#: the version would leave the row at its old number and re-offer it on the
+#: very next cycle. One un-deadlined attempt per page per window turns that
+#: class of bug into a few wasted fetches instead of a starved queue. Six
+#: hours is comfortably shorter than a full pass over the corpus (2,208 rows
+#: at 8 per 300 s ≈ 23 h), so it costs the intended migration nothing.
+_EXTRACT_UPGRADE_MIN_SPACING_S = 6 * 3600
+
+_DUE_SQL_V21 = (
+    f"SELECT {_DUE_COLUMNS}, extract_version FROM web_pages "
+    "WHERE text <> '' AND ("
+    " (next_refresh_at IS NOT NULL AND next_refresh_at <= now())"
+    " OR (extract_version < %s AND refresh_failures = 0"
+    "     AND fetched_at < now() - make_interval(secs => %s))"
+    ") "
+    "ORDER BY retrieval_count DESC, next_refresh_at NULLS LAST LIMIT %s"
+)
+
+#: Cleared the first time PostgreSQL says the column is not there — i.e. on a
+#: deployment where the V21 migration has not run yet. The refresh queue must
+#: keep working in that window; it simply cannot see stale-extractor rows.
+_HAS_EXTRACT_VERSION = True
+
+
 def _due_pages(limit: int) -> List[Dict[str, Any]]:
-    """Pages past their deadline, most-retrieved first."""
+    """Pages past their deadline, or stored by an older extractor.
+
+    Most-retrieved first in both cases: the pages behind the most answers are
+    the ones worth spending the cycle's budget on.
+    """
+    global _HAS_EXTRACT_VERSION
+    if _HAS_EXTRACT_VERSION:
+        try:
+            with db.connection() as con:
+                return con.execute(
+                    _DUE_SQL_V21,
+                    (int(EXTRACT_VERSION), _EXTRACT_UPGRADE_MIN_SPACING_S, limit),
+                ).fetchall()
+        except Exception as exc:  # noqa: BLE001
+            if not _missing_extract_version(exc):
+                raise
+            _HAS_EXTRACT_VERSION = False
+            log.warning(
+                "web_pages.extract_version is absent (V21 migration not applied "
+                "yet); refreshing on deadline only until it is"
+            )
     with db.connection() as con:
-        return con.execute(
-            """SELECT id, url, url_key, title, content_hash, etag, last_modified,
-                      retrieval_count, refresh_failures, fetched_at
-                 FROM web_pages
-                WHERE next_refresh_at IS NOT NULL
-                  AND next_refresh_at <= now()
-                  AND text <> ''
-                ORDER BY retrieval_count DESC, next_refresh_at
-                LIMIT %s""",
-            (limit,),
-        ).fetchall()
+        return con.execute(_DUE_SQL, (limit,)).fetchall()
+
+
+def _missing_extract_version(exc: BaseException) -> bool:
+    """True when `exc` is PostgreSQL complaining about the V21 column only.
+
+    Narrow on purpose: any other database error must still surface, or a real
+    fault would be silently downgraded to "run the old query".
+    """
+    try:
+        import psycopg
+
+        if isinstance(exc, psycopg.errors.UndefinedColumn):
+            return "extract_version" in str(exc)
+    except Exception:  # noqa: BLE001 — psycopg shape changed; fall through
+        pass
+    return False
+
+
+def _stale_extractor(row: Dict[str, Any]) -> bool:
+    """True when this row is queued because OUR COPY is behind, not the site.
+
+    `extract_version` is only in the row when `_DUE_SQL_V21` ran, i.e. when the
+    column exists. A missing key, a NULL, and a version at or above the current
+    one all mean the same thing here: ordinary freshness, keep the conditional
+    request. Only a row we can see is behind earns an unconditional download.
+    """
+    version = row.get("extract_version")
+    if version is None:  # absent key, or a NULL: unknown, not "behind"
+        return False
+    try:
+        return int(version) < int(EXTRACT_VERSION)
+    except (TypeError, ValueError):
+        return False
 
 
 def _schedule_next(page_id: int, ttl_seconds: int, *, failed: bool) -> None:
@@ -123,33 +250,88 @@ def _schedule_next(page_id: int, ttl_seconds: int, *, failed: bool) -> None:
         )
 
 
-async def _refresh_one(row: Dict[str, Any]) -> bool:
-    """Re-read one page. True when it was read successfully.
+async def _refresh_one(row: Dict[str, Any]) -> str:
+    """Re-read one page. Returns the outcome, which is NOT just pass/fail.
 
     Delegates to search.refetch_page so there is exactly ONE fetch path in the
     codebase: same SSRF guards, same redirect re-validation, same size cap and
     timeout, same non-thread-safe-lxml executor, same content-hash rule (a
     changed hash resets indexed_at inside upsert_web_page, which is what puts
     the page back in the embedding queue automatically).
+
+    Four outcomes, because collapsing them to a boolean is what made the 304
+    path unrepresentable (finding K5) — the docstring at the top of this module
+    has described conditional refresh since it was written, and until
+    2026-09-06 no code could produce one:
+
+      "read"          the page was downloaded and stored;
+      "not_modified"  the server answered our If-None-Match/If-Modified-Since
+                      with 304. The stored copy is confirmed current. NOT a
+                      failure: `refresh_failures` must not move, or a stable
+                      page would back off exponentially for being stable;
+      "blocked"       robots.txt says we may not read it. Also not a failure —
+                      nothing is wrong with the page or with us — so it simply
+                      comes round again at its ordinary TTL, by which time the
+                      site may have changed its mind;
+      "failed"        anything else.
+
+    The stored validators ride out with the request. They are already in
+    `_DUE_COLUMNS` — they were selected and then thrown away.
+
+    EXCEPT WHEN THE PAGE NEEDS THE BODY (2026-09-06). REMOTE freshness and
+    PROCESSING freshness are different questions, and a conditional request
+    only answers the first:
+
+    * A page below `EXTRACT_VERSION` is in this queue because our STORED TEXT
+      is wrong, not because the site changed. Re-extraction needs the original
+      HTML, which is not kept anywhere — so a 304, which returns no body, is
+      the one answer that makes the repair impossible. The page would then sit
+      below the version for ever, re-offered every six hours, politely, without
+      ever being fixed. Those rows therefore go out UNCONDITIONALLY: no
+      `If-None-Match`, no `If-Modified-Since`, because we genuinely want the
+      bytes even if nothing changed.
+    * A page below `CHUNKER_VERSION` needs no request AT ALL — the stored text
+      is fine and only the vectors are mis-shaped. That is why chunk staleness
+      is deliberately absent from `_DUE_SQL_V21`: it is repaired by
+      `web_index.index_pending`, locally, and a 304 here leaves the page fully
+      visible to it (`touch_web_page_unchanged` moves `fetched_at` and nothing
+      else).
+
+    Everything else keeps the conditional request — that is what makes ~2,300
+    refreshes a day affordable and polite, and it is measured working in
+    production. `extract_version` is absent from the row on a deployment where
+    the V22 column does not exist yet; unknown means conditional, the polite
+    default.
     """
     url = row.get("url") or ""
     if not url:
-        return False
+        return "failed"
+    needs_body = _stale_extractor(row)
     try:
         from .engines.search import refetch_page
 
-        result = await refetch_page(url, previous_hash=row.get("content_hash") or "")
+        result = await refetch_page(
+            url,
+            previous_hash=row.get("content_hash") or "",
+            etag=row.get("etag") or "",
+            last_modified=row.get("last_modified") or "",
+            conditional=not needs_body,
+        )
     except Exception:  # noqa: BLE001 — one bad page must not stop the cycle
         log.debug("refresh failed for %s", url[:120], exc_info=True)
-        return False
+        return "failed"
     if result is None:
-        return False
+        return "failed"
+    if result.get("blocked"):
+        return "blocked"
+    if result.get("not_modified"):
+        return "not_modified"
     if result.get("changed"):
         # Only stamp last_changed_at when the CONTENT moved — a page re-read
         # daily would otherwise look freshly authored every day, and ranking
         # would trust it more than it deserves.
         await db.run_in_thread(_mark_changed, int(row["id"]))
-    return True
+    return "read"
 
 
 def _mark_changed(page_id: int) -> None:
@@ -162,7 +344,14 @@ async def run_once() -> Dict[str, int]:
     queued background crawl (a shared link or a research run's primary
     domains) — the crawl last, so the answer-serving work never queues
     behind a site walk."""
-    done = {"indexed": 0, "refreshed": 0, "failed": 0, "crawled": 0}
+    done = {
+        "indexed": 0, "refreshed": 0, "failed": 0, "crawled": 0,
+        # A 304 costs one conditional request and no bandwidth; counting it
+        # apart from "refreshed" is the only way to see whether conditional
+        # requests are actually working in production (finding K5).
+        "not_modified": 0,
+        "blocked": 0,
+    }
 
     started = time.perf_counter()
     try:
@@ -186,13 +375,27 @@ async def run_once() -> Dict[str, int]:
     if rows:
         sem = asyncio.Semaphore(max(1, settings.web_refresh_concurrency))
 
+        _OUTCOME_KEY = {
+            "read": "refreshed",
+            "not_modified": "not_modified",
+            "blocked": "blocked",
+            "failed": "failed",
+        }
+
         async def one(row: Dict[str, Any]) -> None:
             async with sem:
-                ok = await _refresh_one(row)
+                outcome = await _refresh_one(row)
+                # Only a genuine failure backs the page off. A 304 and a
+                # robots refusal both reschedule at the ordinary TTL with
+                # `refresh_failures` reset, because neither says anything is
+                # wrong with the page.
                 await db.run_in_thread(
-                    _schedule_next, int(row["id"]), _ttl_for(row), failed=not ok
+                    _schedule_next,
+                    int(row["id"]),
+                    _ttl_for(row),
+                    failed=outcome == "failed",
                 )
-                done["refreshed" if ok else "failed"] += 1
+                done[_OUTCOME_KEY[outcome]] += 1
 
         await asyncio.gather(*(one(r) for r in rows), return_exceptions=True)
         metrics.worker_job("refresh", done["failed"] == 0, time.perf_counter() - started)
@@ -223,6 +426,11 @@ async def run_once() -> Dict[str, int]:
     try:
         upkeep = await web_index.maintain()
         done["healed"] = int(upkeep.get("healed") or 0)
+        # How much of the corpus still carries chunks from an older chunker.
+        # A repair that needs no fetch is invisible in every other counter
+        # here, so without this a chunker migration would drain (or stall)
+        # unobserved.
+        done["chunk_repair_pending"] = int(upkeep.get("stale_chunk_pages") or 0)
         if upkeep.get("optimized") or upkeep.get("indexed") or upkeep.get("healed"):
             metrics.worker_job("index_maintain", True, time.perf_counter() - started)
     except Exception:  # noqa: BLE001
@@ -262,8 +470,10 @@ async def _loop() -> None:
             if any(result.values()):
                 log.info(
                     "web knowledge worker: indexed=%(indexed)d refreshed=%(refreshed)d "
-                    "failed=%(failed)d crawled=%(crawled)d",
-                    result,
+                    "unchanged=%(not_modified)d blocked=%(blocked)d "
+                    "failed=%(failed)d crawled=%(crawled)d "
+                    "rechunk_pending=%(chunk_repair_pending)d",
+                    {"chunk_repair_pending": 0, **result},
                 )
         except asyncio.CancelledError:
             raise
