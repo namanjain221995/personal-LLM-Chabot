@@ -26,7 +26,7 @@ from . import DIAGRAM_INSTRUCTION, conversation_turns, recent_turns
 from .. import llm
 from ..config import settings
 from .. import db, web_index
-from ..core import extract, net, provenance
+from ..core import extract, net, provenance, robots
 from ..freshness import Verdict
 from ..search.base import SearchResult, SearchUnavailableError, get_provider
 
@@ -163,10 +163,79 @@ class _Source:
     authority: int = 0
     #: True when served from the warm store rather than the network.
     from_store: bool = False
+    #: True when the PAGE could not be read and this is the search provider's
+    #: snippet standing in for it (finding S5). A failed fetch used to be
+    #: rebuilt from `r.snippet` and rendered byte-identically to a page that
+    #: was fully read, so a 150-character blurb was cited as a source.
+    from_snippet: bool = False
 
     @property
     def domain(self) -> str:
         return urlparse(self.url).hostname or self.url
+
+
+#: Why a source ended up on a head slice instead of query-centred passages,
+#: and how often. A counter rather than a log line per source: the answer path
+#: touches this up to 60 times per search. Read it from a shell
+#: (`search._HEAD_SLICE_FALLBACKS`) or a test; the FIRST occurrence of each
+#: reason is also logged, with the traceback where there is one.
+_HEAD_SLICE_FALLBACKS: dict = {}
+
+
+def _note_head_slice(reason: str, *, exc: bool = False) -> None:
+    first = reason not in _HEAD_SLICE_FALLBACKS
+    _HEAD_SLICE_FALLBACKS[reason] = _HEAD_SLICE_FALLBACKS.get(reason, 0) + 1
+    if not first:
+        return
+    if exc:
+        log.warning(
+            "falling back to a head slice (%s); query-centred passage "
+            "selection is off for this request", reason, exc_info=True,
+        )
+    else:
+        log.debug("head slice: %s", reason)
+
+
+class _RobotsRefusal(RuntimeError):
+    """The site's robots.txt says not to read this URL (or not to read it yet).
+
+    A distinct type only so the reason is readable in a traceback; it is
+    handled by the same `except` as a timeout, because the OUTCOME is the
+    same — the page was not read and the provider's snippet stands in for it.
+    """
+
+
+def _select_text(text: str, question: str, budget: int) -> str:
+    """`budget` characters of `text`, centred on the question (finding S1/C1).
+
+    `extract.truncate_chars` is a pure head slice, and it is how the answer
+    row of a long page stopped reaching the model: fetched, cited in the
+    panel, and truncated away. `web_memory.select_passages` spends the SAME
+    budget on the parts the question points at.
+
+    With no question there is nothing to centre on, so the head slice stands —
+    which is what a caller that never had a question (the char-tier trim in a
+    unit test, an operator's own call) keeps getting.
+    """
+    if not (question or "").strip():
+        # DELIBERATE, and the safe direction: with no question there is no
+        # signal to centre on, so this is the pre-C1 behaviour, not a
+        # degradation of the fix. Counted anyway — see `_HEAD_SLICE_FALLBACKS`.
+        _note_head_slice("no question to centre on")
+        return extract.truncate_chars(text, budget)
+    from ..web_memory import select_passages
+
+    try:
+        return select_passages(text or "", question, budget)
+    except Exception:  # noqa: BLE001 — selection is an upgrade, never a gate
+        # NOT silent. This is the fix C1 exists to deliver, and a bug inside
+        # `select_passages` would otherwise put every source back on the head
+        # slice — reinstating "fetched, cited, and truncated away" — while
+        # emitting nothing above DEBUG. First occurrence is a warning with the
+        # traceback; the rest are counted, because one broken page must not
+        # produce sixty warnings per search.
+        _note_head_slice("passage selection raised", exc=True)
+        return extract.truncate_chars(text, budget)
 
 
 def _call_extract(content_type: str, body: bytes, url: str, headers: Optional[dict]):
@@ -281,6 +350,48 @@ async def rewrite_queries(
     return (queries or [message])[:cap]
 
 
+#: A question this short is carrying its subject somewhere else — the previous
+#: turn. Three content words is "and its score?" and "what about 5.2?"; it is
+#: not "what is GPT-5.2's reasoning score on the BenchLM leaderboard".
+_TERSE_CONTENT_WORDS = 3
+
+
+def resolve_question(message: str, queries: Sequence[str]) -> str:
+    """The RETRIEVAL-facing form of a terse follow-up.
+
+    Finding S2: `rewrite_queries` resolves "and its score?" into a real search
+    phrase, and that resolution reached SearXNG and nothing else. The
+    reranker, the stored-page TTL, stored-evidence retrieval and the
+    `Question:` line of the answer prompt all still got the bare phrase, which
+    tokenises to `['score']` — no entity, so the cross-encoder scored every
+    passage the same and the store was searched for the word "score".
+
+    No second model call and no new prompt: the rewrite ALREADY did the
+    anaphora resolution (that is what makes it a usable search query), so the
+    referent is recovered from its own output. If the rewrite fell back to the
+    raw message, or the message was never terse, this returns it unchanged.
+
+    The user's literal words are kept — this only APPENDS what the
+    conversation supplied, so the question line still reads as they asked it.
+    Nothing private can enter here: `rewrite_queries` builds its prompt from
+    `conversation_turns`, which drops the pinned memory/recall/document blocks.
+    """
+    from ..web_memory import _content_words
+
+    text = (message or "").strip()
+    if not text or not queries:
+        return text
+    if len(_content_words(text)) > _TERSE_CONTENT_WORDS:
+        return text
+    extra = (queries[0] or "").strip()
+    if not extra or extra.lower() == text.lower():
+        return text
+    have = set(_content_words(text))
+    if not set(_content_words(extra)) - have:
+        return text  # the rewrite added no referent this phrase was missing
+    return f"{text} ({extra})"
+
+
 async def should_search(message: str, history: Sequence[dict] = ()) -> bool:
     """Auto-mode decision: heuristic first, then a cheap model yes/no.
 
@@ -345,6 +456,7 @@ async def _collect_results(
     effort: str = "medium",
     emit: Optional[Emit] = None,
     categories: str = "",
+    degraded: Optional[dict] = None,
 ) -> List[SearchResult]:
     """Search every query and merge the results fairly.
 
@@ -354,8 +466,15 @@ async def _collect_results(
     questions produced the same answer as asking one. The merge is now
     round-robin — rank 1 of every query, then rank 2 of every query — so each
     angle contributes before any angle contributes twice.
+
+    `degraded`, when a caller passes a dict, is FILLED IN with what went wrong
+    upstream — `{"engines": [...], "failed_queries": n, "queries": total}`
+    (finding S6). It is an out-parameter rather than a second return value so
+    every existing caller, and every test double, keeps the list return they
+    were written against.
     """
     provider = get_provider()
+    failed = 0
 
     # The queries are independent lookups against an engine that answers each
     # in ~0.7-2.2 s (measured), and they used to run one after another — think
@@ -380,16 +499,36 @@ async def _collect_results(
             )
         except SearchUnavailableError as exc:
             return q, None, exc
-        _cache_put(f"q:{provider.name}:{categories}:{q}", results)
+        # A result assembled while some engines were timing out is NOT the
+        # result this query has — caching it for 900 s (finding S6) makes one
+        # bad minute upstream the answer to every repeat of the question for
+        # the next quarter of an hour. A miss is cheap; a wrong hit is not.
+        if not getattr(provider, "unresponsive", {}).get(q):
+            _cache_put(f"q:{provider.name}:{categories}:{q}", results)
         return q, results, None
 
     gathered = await asyncio.gather(*(_one(q) for q in queries))
     per_query: List[List[SearchResult]] = []
     for q, results, exc in gathered:
         if results is None:
+            failed += 1
             continue
         per_query.append(results)
         await _emit_query(emit, q, results)
+    if degraded is not None:
+        engines = sorted(
+            {e for names in getattr(provider, "unresponsive", {}).values() for e in names}
+        )
+        if engines or failed:
+            # Engine names and counts only — never the query text (S6 must not
+            # become the thing that logs what a user asked).
+            degraded.update(
+                {"engines": engines, "failed_queries": failed, "queries": len(queries)}
+            )
+            log.info(
+                "search degraded: %d/%d queries failed, engines down: %s",
+                failed, len(queries), ",".join(engines) or "none",
+            )
     if not per_query:
         # One dead upstream engine is normal; ALL dead is unavailability.
         errors = [exc for _q, _r, exc in gathered if exc is not None]
@@ -573,6 +712,12 @@ def _store_page(
         origin="search",
         introduced_by_user_id=user_id,
         introduced_in_conversation_id=conversation_id or None,
+        # V22: which extractor produced this text. Not optional — a row left
+        # at 0 sits in the refresh worker's stale-extractor term and is re-read
+        # on a schedule it can never satisfy. 'search' is the dominant store
+        # path (1871 of 2208 live rows), so omitting it here would put most of
+        # the corpus into a permanent re-fetch loop.
+        extract_version=extract.EXTRACT_VERSION,
         **(meta or {}),
     )
 
@@ -584,15 +729,16 @@ async def _fetch_source(
     *,
     user_id: Optional[int] = None,
     conversation_id: str = "",
+    question: str = "",
 ) -> Optional[_Source]:
     # Warm path: a fresh stored copy of this exact URL answers without the
-    # network. The FULL stored text is re-truncated to the prompt budget the
-    # same way a live fetch would be.
+    # network. The FULL stored text is cut to the prompt budget the same way a
+    # live fetch would be — query-centred since 2026-09-06 (finding S1).
     if stored:
         hit = stored.get(_normalize_url(r.url))
         if hit:
-            text = extract.truncate_chars(
-                hit["text"], settings.search_source_char_budget
+            text = _select_text(
+                hit["text"], question, settings.search_source_char_budget
             )
             return _Source(
                 n=idx,
@@ -609,6 +755,16 @@ async def _fetch_source(
                 from_store=True,
             )
     try:
+        # robots.txt, on the READ path too (finding K6). Until 2026-09-06 only
+        # the site crawler asked; a search-result read fetched whatever the
+        # provider returned. Refusals and the politeness delay raise, which
+        # lands on the snippet fallback below — so a page we may not read is
+        # still citable as the provider's blurb, labelled `from_snippet`,
+        # exactly like one that timed out.
+        if not await robots.allowed(r.url):
+            raise _RobotsRefusal("robots.txt disallows this path")
+        if not await robots.reserve_slot(r.url):
+            raise _RobotsRefusal("crawl-delay longer than an interactive read may wait")
         fetched = await net.safe_fetch(
             r.url,
             timeout_ms=settings.fetch_timeout_ms,
@@ -649,14 +805,16 @@ async def _fetch_source(
                     user_id, conversation_id,
                 )
             )
-        text = extract.truncate_chars(ext.text, settings.search_source_char_budget)
-        if not text.strip():
+        text = _select_text(ext.text, question, settings.search_source_char_budget)
+        empty = not text.strip()
+        if empty:
             text = r.snippet
         return _Source(
             n=idx,
             title=ext.title or r.title,
             url=r.url,
             text=text,
+            from_snippet=empty,
             links=list(page_links or [])[:500],
             published_at=meta["published_at"],
             modified_at=meta["modified_at"],
@@ -669,9 +827,14 @@ async def _fetch_source(
         # Any failure (SSRF block, timeout, unsupported) → fall back to the
         # provider snippet so the source is still citable.
         if r.snippet.strip():
+            # NOT a read page. Before 2026-09-06 this was rendered
+            # byte-identically to a fully read source (finding S5), so a
+            # 150-character blurb from a page that timed out was cited as if
+            # the page had been read end to end.
             return _Source(
                 n=idx, title=r.title, url=r.url, text=r.snippet,
                 source_type=provenance.source_type(r.url),
+                from_snippet=True,
             )
         return None
 
@@ -690,7 +853,8 @@ async def _fetch_sources(
     async def guarded(i: int, r: SearchResult):
         async with sem:
             return await _fetch_source(
-                i + 1, r, stored, user_id=user_id, conversation_id=conversation_id
+                i + 1, r, stored, user_id=user_id, conversation_id=conversation_id,
+                question=message,
             )
 
     fetched = await asyncio.gather(*(guarded(i, r) for i, r in enumerate(results)))
@@ -701,29 +865,104 @@ async def _fetch_sources(
     return sources
 
 
-def _apply_char_tiers(sources: List[_Source]) -> List[_Source]:
+def _apply_char_tiers(sources: List[_Source], question: str = "") -> List[_Source]:
     """Trim the long tail so a big result set stays a sane prompt.
 
     Search rank is the only quality signal available before reading, so the
     top-ranked pages keep the full per-source budget — meaning High is never
     shallower than Medium on the pages most likely to matter — and everything
     after them is cut to a summary-sized excerpt.
+
+    That excerpt is where finding C1 bites hardest: on `max` effort this is 50
+    of 60 sources, each cut to 2,500 characters OFF THE TOP. `question` makes
+    the cut query-centred instead; without one the head slice stands, so a
+    caller that passes only the list behaves exactly as before.
     """
     for s in sources:
         if s.n > _TIER_A_SOURCES:
-            s.text = extract.truncate_chars(s.text, _TIER_B_CHARS)
+            s.text = _select_text(s.text, question, _TIER_B_CHARS)
     return sources
+
+
+#: How a source that was NOT read is labelled in the prompt (finding S5).
+_SNIPPET_LABEL = " — SEARCH SNIPPET ONLY, the page itself could not be read"
 
 
 def _context_block(sources: List[_Source]) -> str:
     blocks = [
-        f"[{s.n}] {s.title} ({s.url})\n{s.text}" for s in sources
+        f"[{s.n}] {s.title} ({s.url})"
+        f"{_SNIPPET_LABEL if s.from_snippet else ''}\n{s.text}"
+        for s in sources
     ]
     return "\n\n".join(blocks)
 
 
+def _coverage_gap(question: str, sources: Sequence[_Source]) -> List[str]:
+    """Question terms that appear in NONE of the assembled sources.
+
+    Finding S3: nothing on the live path could tell "the sources do not
+    mention this" from "this is not the case", so a page whose answer row had
+    been truncated away (C1) produced a confident "GPT-5.2 is not ranked" with
+    a full citation panel behind it. The store path has `_answerability` for
+    exactly this and it is unreachable from `run_search_engine`; this is the
+    cheap deterministic half — no model call, no network.
+
+    Stemmed comparison, so "leaderboards" covers "leaderboard". Returns the
+    RAW words, for a message a person can read.
+
+    COST. The first version asked this question the expensive way round: it
+    built `set(_terms(" ".join(title + text for every source)))` — on `max`
+    effort a ~205,000-character join, tokenised, stemmed and turned into a
+    20,000-entry set — in order to look up five words. It ran here, BEFORE the
+    first answer token, and again after the stream for `meta.coverage_gap`:
+    measured on this box, 12.0 ms a call and 24.0 ms a search, all of it on
+    the event loop in front of TTFT. This repo has already paid for a
+    CPU-bound pre-pass on that loop once (2026-09-05, TTFT 0.7 s -> 11.7 s at
+    8 concurrent).
+
+    `web_memory.terms_present` inverts it: the source texts are streamed
+    rather than joined, only tokens whose first two characters could match a
+    question term reach the stemmer, and the scan stops as soon as every term
+    has been found — which is the ordinary case. Same answer, 0.16 ms.
+    `run_search_engine` also computes it ONCE now and passes it to both
+    consumers.
+    """
+    from ..web_memory import _content_words, _stem, terms_present
+
+    if not sources or not (question or "").strip():
+        return []
+    raws = _content_words(question)
+    if not raws:
+        return []
+    stems = [_stem(w) for w in raws]
+    have = terms_present(
+        (part for s in sources for part in (s.title, s.text)), set(stems)
+    )
+    missing: List[str] = []
+    for raw, stem in zip(raws, stems):
+        if len(raw) > 2 and stem not in have and raw not in missing:
+            missing.append(raw)
+    return missing[:5]
+
+
+#: Deliberately narrow. It forbids ONE thing — asserting an absence the
+#: sources never state — and does not ask the model to refuse: over-hedging a
+#: question it can answer would just be a different wrong answer.
+_COVERAGE_NOTE = (
+    "\n\nCOVERAGE CHECK: these words from the question appear in NONE of the "
+    "sources above: {terms}. That means THE SOURCES RETRIEVED DO NOT COVER "
+    "them. It does NOT establish that they do not exist, are not ranked, are "
+    "not listed or have no value. If the answer depends on one of them, say "
+    "the sources found do not cover it; never state an absence as a fact "
+    "unless a source says so in as many words."
+)
+
+
 def _answer_messages(
-    message: str, sources: List[_Source], history: Sequence[dict]
+    message: str,
+    sources: List[_Source],
+    history: Sequence[dict],
+    gap: Optional[List[str]] = None,
 ) -> List[dict]:
     system = (
         "You answer using the numbered web sources provided. Cite the sources "
@@ -736,11 +975,48 @@ def _answer_messages(
         "cite them together. Where they DISAGREE, surface the disagreement "
         "explicitly instead of silently picking one. Call out anything only a "
         "single source claims. A long source list is not permission to write a "
-        "longer answer — it is material for a better-supported one."
+        "longer answer — it is material for a better-supported one.\n"
+        "A source marked SEARCH SNIPPET ONLY is a one-line blurb from the "
+        "search engine, not a page anyone read — treat it as a pointer, never "
+        "as evidence for a specific number or quotation."
     )
+    # `gap` is passed in by `run_search_engine`, which needs the same list
+    # again for `meta.coverage_gap` after the stream — computing it here as
+    # well was the second half of the 24 ms. Still computed on demand for a
+    # caller (or a test) that has only the question and the sources.
+    if gap is None:
+        gap = _coverage_gap(message, sources)
+    if gap:
+        system += _COVERAGE_NOTE.format(terms=", ".join(gap))
     user = f"Web sources:\n{_context_block(sources)}\n\nQuestion: {message}"
     return [{"role": "system", "content": system + DIAGRAM_INSTRUCTION}, *recent_turns(history, 4),
             {"role": "user", "content": user}]
+
+
+_CITE_MARKER = re.compile(r"\[(\d{1,3})\]")
+
+
+def _meta_sources(sources: Sequence[_Source], answer: str = "") -> List[dict]:
+    """The sources panel. Three states, not one (finding S5).
+
+    `meta.sources` was the FETCHED set, rendered identically whether the page
+    was read end to end, served from the store, or silently replaced by the
+    search engine's blurb after the fetch failed — and with no way to tell
+    which ones the answer actually leant on. `read`/`cited` say so.
+    """
+    cited = {int(n) for n in _CITE_MARKER.findall(answer or "")}
+    return [
+        {
+            "n": s.n,
+            "title": s.title,
+            "url": s.url,
+            "domain": s.domain,
+            "read": not s.from_snippet,
+            "from_store": s.from_store,
+            "cited": s.n in cited,
+        }
+        for s in sources
+    ]
 
 
 _MEMORY_HEADER_NOTE = (
@@ -812,7 +1088,10 @@ async def _memory_sources(
                 title=(ev.title or ev.url)
                 + _MEMORY_HEADER_NOTE.format(date=f"{stamp}read {read}"),
                 url=ev.url,
-                text=extract.truncate_chars(text, _TIER_B_CHARS),
+                # Query-centred, like every other source since 2026-09-06
+                # (finding S1): a stored passage head-sliced to 2,500 chars
+                # loses its answer exactly the way a live page does.
+                text=_select_text(text, message, _TIER_B_CHARS),
                 published_at=ev.published_at,
                 modified_at=ev.modified_at,
                 fetched_at=ev.fetched_at,
@@ -886,8 +1165,15 @@ async def _persist_and_index(
     except Exception:  # noqa: BLE001
         pass
     # Give the write-behind page stores a moment to land, then index.
+    #
+    # `repair_stale_chunks=False` for the same reason as the Fast path, one
+    # step removed. This runs after the answer has streamed, so it cannot slow
+    # THIS request — but a chunker bump makes the repair backlog the whole
+    # corpus, and `embed_query` sheds load ("busy") rather than queueing, so a
+    # 20-page re-embed started here can degrade the NEXT question's recall.
+    # The repair has an owner with nobody waiting on it: the worker.
     await asyncio.sleep(2.0)
-    await web_index.index_pending()
+    await web_index.index_pending(repair_stale_chunks=False)
     # Owner idea (2026-08-30): with the answer already streamed, quietly
     # follow a few in-site links from the pages just read so the NEXT related
     # question hits warm content. Tightly capped; robots respected.
@@ -898,6 +1184,24 @@ async def _persist_and_index(
     except Exception:  # noqa: BLE001 — enrichment, never surfaces
         pass
 
+
+
+def _degraded_note(degraded: dict) -> str:
+    """One human line about a reduced search, for a `status` event.
+
+    Contains engine names and counts and NOTHING else — never the query, which
+    is what makes this safe to emit and safe to log (finding S6).
+    """
+    bits: List[str] = []
+    failed = int(degraded.get("failed_queries") or 0)
+    total = int(degraded.get("queries") or 0)
+    if failed:
+        bits.append(f"{failed} of {total} searches failed")
+    engines = degraded.get("engines") or []
+    if engines:
+        bits.append("engines unavailable: " + ", ".join(engines[:6]))
+    detail = "; ".join(bits) or "some engines did not answer"
+    return f"Partial search results — {detail}."
 
 
 async def _fallback(message: str, history: Sequence[dict], emit: Emit, note: str) -> str:
@@ -945,30 +1249,32 @@ async def research_step(
         return "", []
     if not results:
         return "", []
-    results = await _rerank_results(question, results, len(results))
+    # The rewrite resolved the referent; every consumer below gets it, not the
+    # bare phrase (finding S2).
+    asked = resolve_question(question, queries)
+    results = await _rerank_results(asked, results, len(results))
     if emit is not None:
         await emit("research", {"phase": "reading", "count": len(results)})
     sources = _apply_char_tiers(
         await _fetch_sources(
-            results, question, user_id=user_id, conversation_id=conversation_id
-        )
+            results, asked, user_id=user_id, conversation_id=conversation_id
+        ),
+        asked,
     )
     if not sources:
         return "", []
-    sources = await _memory_sources(question, sources)
+    sources = await _memory_sources(asked, sources)
     _spawn(
         _persist_and_index(
             question, queries, results, effort, user_id, conversation_id
         )
     )
     answer = await llm.chat_completion(
-        _answer_messages(question, sources, history), temperature=0.2, max_tokens=5000
+        _answer_messages(asked, sources, history), temperature=0.2, max_tokens=5000
     )
     if emit is not None:
         await emit("research", {"phase": "read", "count": len(sources)})
-    return answer, [
-        {"n": s.n, "title": s.title, "url": s.url, "domain": s.domain} for s in sources
-    ]
+    return answer, _meta_sources(sources, answer)
 
 
 async def run_search_engine(
@@ -981,36 +1287,48 @@ async def run_search_engine(
 ) -> str:
     """Full search pipeline with status events, cited streaming, and fallback."""
     await emit("status", {"text": "Searching the web…"})
+    degraded: dict = {}
     try:
         queries = await rewrite_queries(message, history, effort)
-        results = await _collect_results(queries, effort, emit)
+        results = await _collect_results(queries, effort, emit, degraded=degraded)
     except SearchUnavailableError:
         return await _fallback(
             message, history, emit, "Web search unavailable — answering from model knowledge."
         )
+    if degraded:
+        # An existing event type, never a new one: `status` is what the panel
+        # already renders (finding S6 — this was invisible in every channel).
+        await emit("status", {"text": _degraded_note(degraded)})
     if not results:
         return await _fallback(
             message, history, emit, "No web results found — answering from model knowledge."
         )
 
+    # The rewrite already resolved "and its score?" into a query naming the
+    # entity; everything downstream used to get the bare phrase back
+    # (finding S2). Retrieval, the TTL and the question line get the resolved
+    # form; `history` still carries the user's literal words.
+    asked = resolve_question(message, queries)
+
     # Relevance-ordered selection: score the candidate snippets with the
     # reranker BEFORE spending fetch time on them, so "best 15 of the pool"
     # replaces "first 15 by engine rank" (which put an anime page at [1]).
-    results = await _rerank_results(message, results, len(results))
+    results = await _rerank_results(asked, results, len(results))
 
     await emit("status", {"text": f"Reading {len(results)} sources…"})
     await emit("research", {"phase": "reading", "count": len(results)})
     sources = _apply_char_tiers(
         await _fetch_sources(
-            results, message, user_id=user_id, conversation_id=conversation_id
-        )
+            results, asked, user_id=user_id, conversation_id=conversation_id
+        ),
+        asked,
     )
     if not sources:
         return await _fallback(
             message, history, emit, "Couldn't read the sources — answering from model knowledge."
         )
     # Paragraphs from pages read in EARLIER searches, dated, after the live set.
-    sources = await _memory_sources(message, sources)
+    sources = await _memory_sources(asked, sources)
 
     await emit("research", {"phase": "read", "count": len(sources)})
 
@@ -1021,9 +1339,13 @@ async def run_search_engine(
         )
     )
 
+    # Once per request, not once per consumer: the prompt below and the
+    # `meta` after the stream want the same list.
+    gap = _coverage_gap(asked, sources)
+
     parts: List[str] = []
     async for kind, delta in llm.stream_chat_events(
-        _answer_messages(message, sources, history),
+        _answer_messages(asked, sources, history, gap=gap),
         # The picker reaches the answer now. This call ran at the default
         # "medium" (= thinking ON) whatever the user chose: measured, the
         # thinking pass was 77-82% of search wall-clock — 851 reasoning
@@ -1035,17 +1357,16 @@ async def run_search_engine(
         if kind == "token":
             parts.append(delta)
 
-    await emit(
-        "meta",
-        {
-            "route": "search",
-            "sources": [
-                {"n": s.n, "title": s.title, "url": s.url, "domain": s.domain}
-                for s in sources
-            ],
-        },
-    )
-    return "".join(parts)
+    answer = "".join(parts)
+    meta = {"route": "search", "sources": _meta_sources(sources, answer)}
+    if gap:
+        # What the model was told, recorded where the client and the stored
+        # turn can see it (finding S3).
+        meta["coverage_gap"] = gap
+    if degraded:
+        meta["search_degraded"] = degraded
+    await emit("meta", meta)
+    return answer
 
 
 async def fetch_for_freshness(
@@ -1110,8 +1431,16 @@ async def fetch_for_freshness(
     # Index synchronously HERE, unlike the streaming path: the caller is about
     # to read the corpus back, so a write-behind index would mean answering
     # from evidence that has not landed yet.
+    #
+    # `repair_stale_chunks=False` keeps that promise cheap. V24 added a second
+    # reason to index — vectors built by an older chunker — and on a corpus
+    # that has just had a chunker bump that backlog is EVERY page. Draining it
+    # here would put up to `limit` pages of re-chunking and re-embedding inside
+    # a user's deadline for work nobody is waiting on. The repair belongs to
+    # the worker, which has nobody waiting on it; this call still stamps the
+    # current chunker on what it writes.
     try:
-        await web_index.index_pending()
+        await web_index.index_pending(repair_stale_chunks=False)
     except Exception:  # noqa: BLE001 — evidence is stored; indexing retries
         pass
 
@@ -1132,7 +1461,39 @@ async def fetch_for_freshness(
     return len(sources)
 
 
-async def refetch_page(url: str, *, previous_hash: str = "") -> Optional[dict]:
+def _conditional_headers(etag: str, last_modified: str) -> dict:
+    """The validators for a conditional re-fetch (RFC 9110 §13).
+
+    `etag` and `last_modified` have been WRITTEN by the store since V14 and
+    read by nothing (finding K5), so every refresh was a full re-download of a
+    page that had usually not changed. Both are sent when both are known: an
+    ETag is the stronger validator, and a server that ignores it may still
+    honour the date.
+
+    The stored ETag is echoed back exactly as the server sent it, weak prefix
+    (`W/"…"`) and quotes included — an ETag is an opaque string and rewriting
+    it is how a conditional request silently stops matching. Anything with a
+    CR/LF in it is dropped rather than sent; `net.safe_fetch` would refuse it
+    anyway, and a validator is not worth failing a refresh over.
+    """
+    out: dict = {}
+    tag = (etag or "").strip()
+    if tag and "\r" not in tag and "\n" not in tag:
+        out["If-None-Match"] = tag
+    since = (last_modified or "").strip()
+    if since and "\r" not in since and "\n" not in since:
+        out["If-Modified-Since"] = since
+    return out
+
+
+async def refetch_page(
+    url: str,
+    *,
+    previous_hash: str = "",
+    etag: str = "",
+    last_modified: str = "",
+    conditional: bool = True,
+) -> Optional[dict]:
     """Re-read one already-known page through the ordinary safe path.
 
     The refresh worker's only way to fetch. Everything here is the SAME code an
@@ -1142,17 +1503,77 @@ async def refetch_page(url: str, *, previous_hash: str = "") -> Optional[dict]:
     lxml XPath objects that are not thread-safe and will abort the interpreter
     if two pages parse at once.
 
-    Returns {'changed', 'title', 'hash'} or None when the page could not be
-    read. Storing happens here so the caller cannot forget the content-hash
-    rule that resets the vector watermark.
+    Two things this path did not do until 2026-09-06, and the V23 backfill is
+    what makes them urgent — it schedules 1,602 previously unreachable pages,
+    taking the worker to ~2,300 third-party fetches a day:
+
+    * **Conditional requests (K5).** The stored `etag`/`last_modified` are
+      sent as `If-None-Match`/`If-Modified-Since`. A **304** means the copy on
+      disk is still correct: the freshness clock advances and nothing else
+      happens — no body downloaded, no extraction, no re-chunk, no re-embed.
+      It is reported as `not_modified`, is NOT a failure, and must not
+      increment `refresh_failures`.
+    * **robots.txt (K6).** The refresh worker is an unattended bot re-reading
+      pages nobody asked for right now, so a `Disallow` is obeyed and a
+      `Crawl-delay` is waited out in full.
+
+    `conditional=False` sends NO validators even when they are stored, and it
+    is not a politeness regression — it is the only way to repair a page whose
+    stored TEXT is what is wrong. Re-extraction needs the original HTML, which
+    nothing keeps; a 304 returns no body, so a conditional request for such a
+    page can never do anything but confirm the bad copy and requeue it. The
+    caller (`web_worker._stale_extractor`) asks for this ONLY for rows below
+    `extract.EXTRACT_VERSION`; ordinary freshness keeps the conditional
+    request, which is what makes the refresh affordable. Robots, the SSRF
+    guards, the byte cap and the timeout are identical either way — the flag
+    changes two request headers and nothing else.
+
+    Returns {'changed', 'title', 'hash', 'not_modified', 'blocked'} or None
+    when the page could not be read. Storing happens here so the caller cannot
+    forget the content-hash rule that resets the vector watermark.
     """
+    url_key = _normalize_url(url)
+    # The worker is the least interactive fetcher we have — nobody is watching
+    # a stream — so it waits out the FULL crawl-delay rather than skipping.
+    try:
+        if not await robots.allowed(url):
+            log.debug("refresh skipped, robots.txt disallows %s", url[:120])
+            return {
+                "changed": False, "title": "", "hash": previous_hash or "",
+                "not_modified": False, "blocked": True,
+            }
+        await robots.reserve_slot(url, max_wait_s=15.0)
+    except Exception:  # noqa: BLE001 — robots must never break the refresh
+        log.debug("robots check unavailable for %s", url[:120], exc_info=True)
+
     try:
         fetched = await net.safe_fetch(
             url,
             timeout_ms=settings.fetch_timeout_ms,
             max_bytes=settings.fetch_max_bytes,
             accept="text/html,application/pdf,text/plain",
+            headers=_conditional_headers(etag, last_modified) if conditional else {},
         )
+        if fetched.status == 304:
+            # Return BEFORE the executor hop: entering extraction here would
+            # parse an empty body and store a blank page.
+            resp = getattr(fetched, "headers", None) or {}
+            try:
+                await db.run_in_thread(
+                    db.touch_web_page_unchanged,
+                    url_key,
+                    (resp.get("etag") or "").strip(),
+                    (resp.get("last-modified") or "").strip(),
+                )
+            except Exception:  # noqa: BLE001 — the deadline still gets stamped
+                log.debug("could not stamp 304 freshness for %s", url[:120], exc_info=True)
+            return {
+                "changed": False,
+                "title": "",
+                "hash": previous_hash or "",
+                "not_modified": True,
+                "blocked": False,
+            }
         loop = asyncio.get_running_loop()
         headers = getattr(fetched, "headers", None) or {}
         ext, page_links = await loop.run_in_executor(
@@ -1183,6 +1604,10 @@ async def refetch_page(url: str, *, previous_hash: str = "") -> Optional[dict]:
             200,
             digest,
             list(page_links or [])[:500],
+            # V22: the refresh worker's whole point is to re-read pages whose
+            # extractor is behind; if the re-read stored 0 again the page would
+            # never leave the queue.
+            extract_version=extract.EXTRACT_VERSION,
             **meta,
         )
 
@@ -1190,4 +1615,10 @@ async def refetch_page(url: str, *, previous_hash: str = "") -> Optional[dict]:
         await db.run_in_thread(_write)
     except Exception:  # noqa: BLE001
         return None
-    return {"changed": digest != (previous_hash or ""), "title": ext.title or "", "hash": digest}
+    return {
+        "changed": digest != (previous_hash or ""),
+        "title": ext.title or "",
+        "hash": digest,
+        "not_modified": False,
+        "blocked": False,
+    }

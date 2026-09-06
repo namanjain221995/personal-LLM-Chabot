@@ -34,7 +34,7 @@ import logging
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Awaitable, Callable, List, Optional
+from typing import Awaitable, Callable, List, Optional, Sequence
 
 from . import db, metrics
 from .config import settings
@@ -127,6 +127,98 @@ def _join(*parts: str) -> str:
     return "\n\n".join(p for p in parts if p)
 
 
+#: A question this short is treated as a follow-up whose subject lives in the
+#: previous turn. Same threshold the search path uses for the same judgement.
+_TERSE_CONTENT_WORDS = 3
+#: How many recovered terms to append. Enough to name an entity and its topic;
+#: small enough that the retrieval query is still about what was asked.
+_CONTEXT_TERMS = 6
+
+
+def resolve_from_history(message: str, history: Sequence[dict]) -> str:
+    """A terse follow-up, restored to something retrievable.
+
+    `_topical`'s gate is deliberately high — a strong dense score AND lexical
+    overlap — so an ordinary question never drags in a loosely related page.
+    That is right for a question that stands on its own and wrong for a
+    follow-up, which is artificially impoverished: "and the B200?" carries one
+    content word, scores below every threshold, and falls through to
+    `static_model`, i.e. the model answers from its own memory with no evidence
+    at all.
+
+    Measured on this box, 2026-09-06, against a seeded corpus:
+
+        "What does an H100 cost per GPU-hour on Orbital Compute?"
+            -> 1,584 chars of grounding, 2 sources, decision 'local'
+        "and the B200?"
+            -> 0 chars, 0 sources, decision 'static_model'
+        "and the B200 price on Orbital Compute?"
+            -> 1,584 chars, 2 sources, decision 'local'
+
+    The middle one is what a user actually types, and in the benchmark it
+    produced an invented price of $3.50 for a page that plainly states $6.75.
+    Restoring the subject is what lets the high gate work as designed instead
+    of silently disabling grounding.
+
+    NO MODEL CALL. This is on the Fast path, where the whole point is latency,
+    and the referent is already sitting in the conversation. The search path
+    solves the same problem with `engines.search.resolve_question`, which reads
+    the query rewrite it was already making; there is no rewrite here, so the
+    terms come from the turns themselves.
+
+    PRIVACY: `conversation_turns` drops every system message — saved facts,
+    cross-chat recall, shared-page and document excerpts. Only what the user
+    said and what the assistant answered can enter, which matters because this
+    string becomes a retrieval query and, on the escalation path, a web search.
+
+    The user's literal words are kept and the recovered terms are appended in
+    parentheses, so nothing the user wrote is replaced.
+    """
+    text = (message or "").strip()
+    if not text or not history:
+        return text
+    from .engines import conversation_turns
+    from .web_memory import _content_words
+
+    own = _content_words(text)
+    if len(own) > _TERSE_CONTENT_WORDS:
+        return text  # it stands on its own
+    have = set(own)
+
+    def _harvest(role: str) -> list:
+        for message_ in reversed(conversation_turns(history, 4)):
+            if message_.get("role") != role:
+                continue
+            content = message_.get("content")
+            if not isinstance(content, str):
+                continue
+            picked = [w for w in _content_words(content) if w not in have]
+            if picked:
+                return picked
+        return []
+
+    # The user's own previous question first: it names the topic, and it is
+    # what they would have repeated if asked to be explicit. The assistant's
+    # answer is the fallback, for "and its score?" where the entity was named
+    # only in the reply.
+    extra = _harvest("user") or _harvest("assistant")
+    if not extra:
+        return text
+    # Appended PLAIN, not parenthesised. The search path brackets its
+    # resolution because that string is shown as the question line; this one
+    # is embedded, and the punctuation measurably wrecks the dense score.
+    # Measured 2026-09-06 on the seeded corpus, "what about 5.2?" after a
+    # GPT-5 question (the gate needs dense >= 0.35):
+    #
+    #   "what about 5.2? (gpt-5 benchlm reasoning)"   dense 0.308  FAILS
+    #   "what about 5.2? gpt-5 benchlm reasoning"     dense 0.493  passes
+    #
+    # Same terms, same order; only the brackets differ. With them the page
+    # was not retrieved at all and the model invented a score of 89.2 for a
+    # leaderboard that plainly states 82.7.
+    return f"{text} {' '.join(extra[:_CONTEXT_TERMS])}"
+
+
 async def _topical(question: str, out: Prepared) -> Prepared:
     """A timeless question answered from a STRONG local match, or nothing.
 
@@ -189,6 +281,7 @@ async def prepare(
     emit: Optional[Emit] = None,
     user_id: Optional[int] = None,
     conversation_id: str = "",
+    history: Sequence[dict] = (),
 ) -> Prepared:
     """Freshness-aware grounding for one question.
 
@@ -200,6 +293,10 @@ async def prepare(
     out = Prepared()
     if not settings.web_memory_enabled or not (question or "").strip():
         return out
+    # A terse follow-up is resolved BEFORE retrieval, freshness classification
+    # or any escalation decision — every one of them reads the question, and
+    # all of them were reading a phrase with its subject missing.
+    question = resolve_from_history(question, history)
 
     now = datetime.now(timezone.utc)
     verdict = await classify(
