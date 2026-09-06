@@ -1,0 +1,105 @@
+{
+  "_comment": [
+    "Known gitleaks findings, accepted as NOT credentials. Fingerprints only:",
+    "no secret value, no matched text. A fingerprint is",
+    "<commit>:<file>:<rule>:<line>, so these entries are pinned to immutable",
+    "history and cannot silently start covering something new.",
+    "",
+    "Every entry below was reviewed on 2026-09-07. All 13 are the",
+    "`generic-api-key` / `jwt` ENTROPY heuristic firing on placeholder values:",
+    "  * frontend/tests/*        - fixture strings in error-classification and",
+    "                              share-dialog tests, which exist precisely to",
+    "                              assert that tokens get redacted in errors;",
+    "  * launcher/**             - test fixtures, and two lines in profiles.py",
+    "                              that COMPARE a config key NAME, not a value;",
+    "  * scripts/application_isolation.py, docs/_evidence/sync-worker.md",
+    "                            - an env-var name and a documentation example.",
+    "",
+    "None is a live credential. This repository is PUBLIC, so if that",
+    "assessment is ever wrong the fix is rotation, not an allowlist entry.",
+    "",
+    "TO ADD an entry: only after establishing the value is not a real secret.",
+    "TO REMOVE: the gate tells you when an entry stops being reported."
+  ],
+  "reviewed": "2026-09-07",
+  "findings": [
+    {
+      "fingerprint": "187d950902882905b969149fdd2ffc8f24eb73d5:docs/_evidence/sync-worker.md:generic-api-key:230",
+      "rule": "generic-api-key",
+      "file": "docs/_evidence/sync-worker.md",
+      "line": 230
+    },
+    {
+      "fingerprint": "adcd2eb76998d58ab085781574c0921470fa2e83:frontend/tests/error-classification.test.ts:generic-api-key:136",
+      "rule": "generic-api-key",
+      "file": "frontend/tests/error-classification.test.ts",
+      "line": 136
+    },
+    {
+      "fingerprint": "adcd2eb76998d58ab085781574c0921470fa2e83:frontend/tests/error-classification.test.ts:generic-api-key:139",
+      "rule": "generic-api-key",
+      "file": "frontend/tests/error-classification.test.ts",
+      "line": 139
+    },
+    {
+      "fingerprint": "adcd2eb76998d58ab085781574c0921470fa2e83:frontend/tests/error-classification.test.ts:generic-api-key:140",
+      "rule": "generic-api-key",
+      "file": "frontend/tests/error-classification.test.ts",
+      "line": 140
+    },
+    {
+      "fingerprint": "adcd2eb76998d58ab085781574c0921470fa2e83:frontend/tests/error-classification.test.ts:jwt:152",
+      "rule": "jwt",
+      "file": "frontend/tests/error-classification.test.ts",
+      "line": 152
+    },
+    {
+      "fingerprint": "adcd2eb76998d58ab085781574c0921470fa2e83:frontend/tests/errors.test.ts:generic-api-key:66",
+      "rule": "generic-api-key",
+      "file": "frontend/tests/errors.test.ts",
+      "line": 66
+    },
+    {
+      "fingerprint": "c1bf98e764d31226048389c55822afe5f9727c3f:frontend/tests/share-dialog.test.tsx:generic-api-key:198",
+      "rule": "generic-api-key",
+      "file": "frontend/tests/share-dialog.test.tsx",
+      "line": 198
+    },
+    {
+      "fingerprint": "bfbb79dc79220103cdfb02b02c22f881b51cf788:launcher/techsara_cli/environment.py:generic-api-key:121",
+      "rule": "generic-api-key",
+      "file": "launcher/techsara_cli/environment.py",
+      "line": 121
+    },
+    {
+      "fingerprint": "bfbb79dc79220103cdfb02b02c22f881b51cf788:launcher/techsara_cli/profiles.py:generic-api-key:261",
+      "rule": "generic-api-key",
+      "file": "launcher/techsara_cli/profiles.py",
+      "line": 261
+    },
+    {
+      "fingerprint": "bfbb79dc79220103cdfb02b02c22f881b51cf788:launcher/techsara_cli/profiles.py:generic-api-key:265",
+      "rule": "generic-api-key",
+      "file": "launcher/techsara_cli/profiles.py",
+      "line": 265
+    },
+    {
+      "fingerprint": "bfbb79dc79220103cdfb02b02c22f881b51cf788:launcher/tests/test_cli.py:generic-api-key:207",
+      "rule": "generic-api-key",
+      "file": "launcher/tests/test_cli.py",
+      "line": 207
+    },
+    {
+      "fingerprint": "bfbb79dc79220103cdfb02b02c22f881b51cf788:launcher/tests/test_environment.py:generic-api-key:221",
+      "rule": "generic-api-key",
+      "file": "launcher/tests/test_environment.py",
+      "line": 221
+    },
+    {
+      "fingerprint": "34a7e3cb2a7d8ef6f60ed39d2523397eae53cddd:scripts/application_isolation.py:generic-api-key:92",
+      "rule": "generic-api-key",
+      "file": "scripts/application_isolation.py",
+      "line": 92
+    }
+  ]
+}
