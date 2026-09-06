@@ -1,0 +1,3013 @@
+{
+  "tool": "tools/structured_real_world.py",
+  "generated_at": "2026-09-06T19:22:43Z",
+  "extract_version": 4,
+  "recovery_enabled": true,
+  "bounds": {
+    "MAX_BLOCKS": 20,
+    "MAX_BLOCK_CHARS": 262144,
+    "MAX_DEPTH": 6,
+    "MAX_FIELDS": 24,
+    "MAX_HTML_CHARS": 3000000,
+    "MAX_KEYS": 60,
+    "MAX_LINE_CHARS": 600,
+    "MAX_LIST_ITEMS": 100,
+    "MAX_MICRODATA_NODES": 20000,
+    "MAX_MICRODATA_SCOPES": 60,
+    "MAX_NODES": 20000,
+    "MAX_RECORDS": 100,
+    "MAX_SCRIPT_ELEMENTS": 400,
+    "MAX_TOTAL_BLOCK_CHARS": 1048576,
+    "MAX_TOTAL_CHARS": 12000,
+    "MAX_VALUE_CHARS": 200
+  },
+  "cache_dir": "/home/techsphere/.cache/techsara/structured-real-world",
+  "excluded_pages": {
+    "https://www.w3.org/TR/rdfa-primer/": "robots.txt disallows /TR/ for us",
+    "https://www.imdb.com/title/tt0111161/": "robots.txt disallows /title/",
+    "https://stackoverflow.com/questions/11227809/": "HTTP 403 to our UA",
+    "https://blog.mozilla.org/": "HTTP 403 to our UA",
+    "https://www.loc.gov/item/2021667925/": "HTTP 403 to our UA"
+  },
+  "summary": {
+    "pages": 14,
+    "resolved": 14,
+    "unreachable": [],
+    "with_records": 9,
+    "without_records": 5,
+    "records_total": 91,
+    "prediction_surprises": [
+      {
+        "slug": "zenodo-pandas",
+        "predicted": "both",
+        "found": "jsonld"
+      },
+      {
+        "slug": "schemaorg-product",
+        "predicted": "both",
+        "found": "jsonld"
+      },
+      {
+        "slug": "github-cpython",
+        "predicted": "microdata",
+        "found": "none"
+      }
+    ],
+    "pages_with_malformed_blocks": [
+      {
+        "slug": "who-malaria",
+        "malformed_blocks": 2,
+        "blocks": 4
+      }
+    ],
+    "pages_hitting_the_total_char_cap": [
+      "schemaorg-product"
+    ],
+    "pages_with_ambiguous_field_separator": [
+      "datagov-ev-population",
+      "schemaorg-product",
+      "openlibrary-lotr"
+    ],
+    "pages_with_a_nameless_top_level_record": [
+      "govuk-vat-rates",
+      "who-malaria",
+      "schemaorg-product",
+      "openlibrary-lotr"
+    ],
+    "pipeline_disagreements": [],
+    "extract_ms_median": 49.97,
+    "structured_ms_median": 2.527,
+    "structured_ms_max": 14.335
+  },
+  "pages": {
+    "govuk-vat-rates": {
+      "url": "https://www.gov.uk/vat-rates",
+      "slug": "govuk-vat-rates",
+      "why": "two blocks: an FAQPage whose answers hold the actual rates, and a BreadcrumbList of ListItem wrappers \u2014 the _unwrap path",
+      "predicted": "jsonld",
+      "from_cache": true,
+      "final_url": "https://www.gov.uk/vat-rates",
+      "status": 200,
+      "content_type": "text/html; charset=utf-8",
+      "bytes": 64015,
+      "sha256": "b308887b21307218cca5810525d31d84fb8f5eadb084355df3b69ae3ef1b8836",
+      "fetched_at": "2026-09-06T18:50:16Z",
+      "cache_file": "/home/techsphere/.cache/techsara/structured-real-world/govuk-vat-rates.053189b0a71dbeff.html",
+      "analysis": {
+        "found": "jsonld",
+        "predicted": "jsonld",
+        "prediction_held": true,
+        "record_count": 4,
+        "records": [
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "FAQPage",
+            "name": "VAT rates",
+            "ambiguous_head": false,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "datePublished",
+                "2011-09-12T16:43:03+01:00"
+              ],
+              [
+                "dateModified",
+                "2014-12-12T14:55:23+00:00"
+              ],
+              [
+                "author",
+                "Government Digital Service"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "Home",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "position",
+                "1"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "Money and tax",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "position",
+                "2"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "VAT",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "position",
+                "3"
+              ]
+            ]
+          }
+        ],
+        "entity_field_pairs": [
+          "FAQPage.author",
+          "FAQPage.dateModified",
+          "FAQPage.datePublished",
+          "Home.position",
+          "Money and tax.position",
+          "VAT.position"
+        ],
+        "lines": [
+          "[jsonld] FAQPage: VAT rates \u2014 datePublished: 2011-09-12T16:43:03+01:00; dateModified: 2014-12-12T14:55:23+00:00; author: Government Digital Service",
+          "[jsonld] Home \u2014 position: 1",
+          "[jsonld] Money and tax \u2014 position: 2",
+          "[jsonld] VAT \u2014 position: 3"
+        ],
+        "consistent_with_pipeline": true,
+        "stats": {
+          "parsed": 2,
+          "blocks": 2,
+          "lines": 4
+        },
+        "text_chars": 1073,
+        "prose_chars": 766,
+        "appended_chars": 307,
+        "title": "VAT rates - GOV.UK",
+        "published_at": "2011-09-12",
+        "modified_at": "2014-12-12",
+        "extract_ms": 13.766,
+        "structured_ms": 1.026,
+        "extract_ms_all": [
+          253.082,
+          14.064,
+          13.766,
+          13.741
+        ],
+        "structured_ms_all": [
+          1.111,
+          1.043,
+          1.026,
+          1.009
+        ]
+      }
+    },
+    "datagov-ev-population": {
+      "url": "https://catalog.data.gov/dataset/electric-vehicle-population-data",
+      "slug": "datagov-ev-population",
+      "why": "a Dataset with six named DataDownload children \u2014 the nested-record path where a child must keep its parent's name",
+      "predicted": "jsonld",
+      "from_cache": true,
+      "final_url": "https://catalog.data.gov/dataset/electric-vehicle-population-data",
+      "status": 200,
+      "content_type": "text/html; charset=utf-8",
+      "bytes": 137834,
+      "sha256": "147689194ae270bc82838b0c5b227bff02f9a87d2624a86cf628be4bf358dcaa",
+      "fetched_at": "2026-09-06T18:50:17Z",
+      "cache_file": "/home/techsphere/.cache/techsara/structured-real-world/datagov-ev-population.20206cf098926ed4.html",
+      "analysis": {
+        "found": "jsonld",
+        "predicted": "jsonld",
+        "prediction_held": true,
+        "record_count": 7,
+        "records": [
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "Dataset",
+            "name": "Electric Vehicle Population Data",
+            "ambiguous_head": false,
+            "separator_ambiguous": true,
+            "fields": [
+              [
+                "keywords",
+                "bev; bevs; bolt; car; cars; chevrolet; chevy; clean energy; department of licensing; dol; dol_open_data; electric; energy; environment; ev; evs; green report; hybrid; hybrids; leaf; model 3; nhtsa; n\u2026"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "Electric Vehicle Population Data",
+            "type": "",
+            "name": "DataDownload",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "encodingFormat",
+                "application/json"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "Electric Vehicle Population Data",
+            "type": "",
+            "name": "DataDownload",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "encodingFormat",
+                "application/xml"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "Electric Vehicle Population Data",
+            "type": "",
+            "name": "DataDownload",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "encodingFormat",
+                "text/csv"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "Electric Vehicle Population Data",
+            "type": "",
+            "name": "DataDownload",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "encodingFormat",
+                "application/vnd.google-earth.kml+xml"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "Electric Vehicle Population Data",
+            "type": "",
+            "name": "DataDownload",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "encodingFormat",
+                "application/vnd.google-earth.kmz"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "Electric Vehicle Population Data",
+            "type": "",
+            "name": "DataDownload",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "encodingFormat",
+                "application/geo+json"
+              ]
+            ]
+          }
+        ],
+        "entity_field_pairs": [
+          "DataDownload.encodingFormat",
+          "Dataset.keywords"
+        ],
+        "lines": [
+          "[jsonld] Dataset: Electric Vehicle Population Data \u2014 keywords: bev; bevs; bolt; car; cars; chevrolet; chevy; clean energy; department of licensing; dol; dol_open_data; electric; energy; environment; ev; evs; green report; hybrid; hybrids; leaf; model 3; nhtsa; n\u2026",
+          "[jsonld] Electric Vehicle Population Data \u203a DataDownload \u2014 encodingFormat: application/json",
+          "[jsonld] Electric Vehicle Population Data \u203a DataDownload \u2014 encodingFormat: application/xml",
+          "[jsonld] Electric Vehicle Population Data \u203a DataDownload \u2014 encodingFormat: text/csv",
+          "[jsonld] Electric Vehicle Population Data \u203a DataDownload \u2014 encodingFormat: application/vnd.google-earth.kml+xml",
+          "[jsonld] Electric Vehicle Population Data \u203a DataDownload \u2014 encodingFormat: application/vnd.google-earth.kmz",
+          "[jsonld] Electric Vehicle Population Data \u203a DataDownload \u2014 encodingFormat: application/geo+json"
+        ],
+        "consistent_with_pipeline": true,
+        "stats": {
+          "parsed": 1,
+          "blocks": 1,
+          "fields_deduped": 6,
+          "lines": 7
+        },
+        "text_chars": 4331,
+        "prose_chars": 3417,
+        "appended_chars": 914,
+        "title": "State of Washington - Electric Vehicle Population Data",
+        "published_at": "2023-10-19",
+        "modified_at": "2026-08-24",
+        "extract_ms": 21.344,
+        "structured_ms": 2.578,
+        "extract_ms_all": [
+          22.576,
+          21.782,
+          21.344,
+          21.278
+        ],
+        "structured_ms_all": [
+          2.637,
+          2.592,
+          2.578,
+          2.569
+        ]
+      }
+    },
+    "owid-energy": {
+      "url": "https://ourworldindata.org/energy",
+      "slug": "owid-energy",
+      "why": "a plain Article: dates and publisher, the commonest shape on the web",
+      "predicted": "jsonld",
+      "from_cache": true,
+      "final_url": "https://ourworldindata.org/energy",
+      "status": 200,
+      "content_type": "text/html; charset=utf-8",
+      "bytes": 244595,
+      "sha256": "91d49ae019164447539ce37bf8a70f52502261043c7a9789f8bf5f282af04c67",
+      "fetched_at": "2026-09-06T18:50:18Z",
+      "cache_file": "/home/techsphere/.cache/techsara/structured-real-world/owid-energy.0f073cc77a8ac7a2.html",
+      "analysis": {
+        "found": "jsonld",
+        "predicted": "jsonld",
+        "prediction_held": true,
+        "record_count": 1,
+        "records": [
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "Article",
+            "name": "Energy",
+            "ambiguous_head": false,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "datePublished",
+                "2023-12-20T15:32:00.000Z"
+              ]
+            ]
+          }
+        ],
+        "entity_field_pairs": [
+          "Article.datePublished"
+        ],
+        "lines": [
+          "[jsonld] Article: Energy \u2014 datePublished: 2023-12-20T15:32:00.000Z"
+        ],
+        "consistent_with_pipeline": true,
+        "stats": {
+          "parsed": 1,
+          "blocks": 1,
+          "fields_deduped": 2,
+          "lines": 1
+        },
+        "text_chars": 7371,
+        "prose_chars": 7237,
+        "appended_chars": 134,
+        "title": "Energy | Our World in Data",
+        "published_at": "2023-12-20",
+        "modified_at": "2023-12-20",
+        "extract_ms": 33.016,
+        "structured_ms": 3.501,
+        "extract_ms_all": [
+          34.938,
+          33.039,
+          33.016,
+          32.862
+        ],
+        "structured_ms_all": [
+          3.581,
+          3.517,
+          3.501,
+          3.494
+        ]
+      }
+    },
+    "wikipedia-schema-org": {
+      "url": "https://en.wikipedia.org/wiki/Schema.org",
+      "slug": "wikipedia-schema-org",
+      "why": "MediaWiki's Article block; dates that must survive verbatim",
+      "predicted": "jsonld",
+      "from_cache": true,
+      "final_url": "https://en.wikipedia.org/wiki/Schema.org",
+      "status": 200,
+      "content_type": "text/html; charset=UTF-8",
+      "bytes": 195510,
+      "sha256": "5f183f65f6febae36e7f4f71fb9075bcb6ab1ae4b3a3618ff8e51e44b25e4877",
+      "fetched_at": "2026-09-06T18:50:18Z",
+      "cache_file": "/home/techsphere/.cache/techsara/structured-real-world/wikipedia-schema-org.c94f579e87ff1ff7.html",
+      "analysis": {
+        "found": "jsonld",
+        "predicted": "jsonld",
+        "prediction_held": true,
+        "record_count": 1,
+        "records": [
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "Article",
+            "name": "Schema.org",
+            "ambiguous_head": false,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "mainEntity",
+                "http://www.wikidata.org/entity/Q3475322"
+              ],
+              [
+                "author",
+                "Contributors to Wikimedia projects"
+              ],
+              [
+                "datePublished",
+                "2011-06-02T19:00:51Z"
+              ],
+              [
+                "dateModified",
+                "2026-06-11T15:37:39Z"
+              ]
+            ]
+          }
+        ],
+        "entity_field_pairs": [
+          "Article.author",
+          "Article.dateModified",
+          "Article.datePublished",
+          "Article.mainEntity"
+        ],
+        "lines": [
+          "[jsonld] Article: Schema.org \u2014 mainEntity: http://www.wikidata.org/entity/Q3475322; author: Contributors to Wikimedia projects; datePublished: 2011-06-02T19:00:51Z; dateModified: 2026-06-11T15:37:39Z"
+        ],
+        "consistent_with_pipeline": true,
+        "stats": {
+          "parsed": 1,
+          "blocks": 1,
+          "microdata_scopes": 0,
+          "fields_deduped": 1,
+          "lines": 1
+        },
+        "text_chars": 10072,
+        "prose_chars": 9805,
+        "appended_chars": 267,
+        "title": "Schema.org - Wikipedia",
+        "published_at": "2011-06-02",
+        "modified_at": "2026-06-11",
+        "extract_ms": 83.52,
+        "structured_ms": 3.727,
+        "extract_ms_all": [
+          85.357,
+          83.52,
+          84.524,
+          83.44
+        ],
+        "structured_ms_all": [
+          3.896,
+          3.763,
+          3.727,
+          3.719
+        ]
+      }
+    },
+    "who-malaria": {
+      "url": "https://www.who.int/news-room/fact-sheets/detail/malaria",
+      "slug": "who-malaria",
+      "why": "four ld+json blocks on one page, of which some are malformed in the wild \u2014 the malformed-is-counted-not-raised path",
+      "predicted": "jsonld",
+      "from_cache": true,
+      "final_url": "https://www.who.int/news-room/fact-sheets/detail/malaria",
+      "status": 200,
+      "content_type": "text/html; charset=utf-8",
+      "bytes": 131259,
+      "sha256": "fd82771641ec62261234fb281a730184a642f62e2684e86b3a1bc82297a38817",
+      "fetched_at": "2026-09-06T18:50:19Z",
+      "cache_file": "/home/techsphere/.cache/techsara/structured-real-world/who-malaria.f9f35efe08c8c61d.html",
+      "analysis": {
+        "found": "jsonld",
+        "predicted": "jsonld",
+        "prediction_held": true,
+        "record_count": 7,
+        "records": [
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "BreadcrumbList",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "itemListOrder",
+                "ItemListOrderAscending"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "Home",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "position",
+                "1"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "Newsroom",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "position",
+                "2"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "Fact sheets",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "position",
+                "3"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "Detail",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "position",
+                "4"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "Malaria",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "position",
+                "5"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "ItemPage",
+            "name": "Detail",
+            "ambiguous_head": false,
+            "separator_ambiguous": false,
+            "fields": []
+          }
+        ],
+        "entity_field_pairs": [
+          "BreadcrumbList.itemListOrder",
+          "Detail.position",
+          "Fact sheets.position",
+          "Home.position",
+          "Malaria.position",
+          "Newsroom.position"
+        ],
+        "lines": [
+          "[jsonld] BreadcrumbList \u2014 itemListOrder: ItemListOrderAscending",
+          "[jsonld] Home \u2014 position: 1",
+          "[jsonld] Newsroom \u2014 position: 2",
+          "[jsonld] Fact sheets \u2014 position: 3",
+          "[jsonld] Detail \u2014 position: 4",
+          "[jsonld] Malaria \u2014 position: 5",
+          "[jsonld] ItemPage: Detail"
+        ],
+        "consistent_with_pipeline": true,
+        "stats": {
+          "parsed": 2,
+          "malformed": 2,
+          "blocks": 4,
+          "lines": 7
+        },
+        "text_chars": 13918,
+        "prose_chars": 13605,
+        "appended_chars": 313,
+        "title": "Malaria",
+        "published_at": "2025-12-04",
+        "modified_at": "2025-12-04",
+        "extract_ms": 42.372,
+        "structured_ms": 2.218,
+        "extract_ms_all": [
+          43.836,
+          43.303,
+          42.254,
+          42.372
+        ],
+        "structured_ms_all": [
+          2.365,
+          2.257,
+          2.218,
+          2.211
+        ]
+      }
+    },
+    "zenodo-pandas": {
+      "url": "https://zenodo.org/records/3509134",
+      "slug": "zenodo-pandas",
+      "why": "SoftwareSourceCode with a nested Person author, plus one itemscope: both passes on one page",
+      "predicted": "both",
+      "from_cache": true,
+      "final_url": "https://zenodo.org/records/21500199",
+      "status": 200,
+      "content_type": "text/html; charset=utf-8",
+      "bytes": 68390,
+      "sha256": "3df7dea7ca05d95a3cef330a0f9be9ca75ba1220007c555bddac0a5a8762fb75",
+      "fetched_at": "2026-09-06T18:50:21Z",
+      "cache_file": "/home/techsphere/.cache/techsara/structured-real-world/zenodo-pandas.90efc9f9f5aaa21b.html",
+      "analysis": {
+        "found": "jsonld",
+        "predicted": "both",
+        "prediction_held": false,
+        "record_count": 2,
+        "records": [
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "SoftwareSourceCode",
+            "name": "pandas-dev/pandas: Pandas",
+            "ambiguous_head": false,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "contentSize",
+                "5.26 MB"
+              ],
+              [
+                "dateCreated",
+                "2026-07-22T21:47:21.346630+00:00"
+              ],
+              [
+                "dateModified",
+                "2026-07-22T21:47:21.561509+00:00"
+              ],
+              [
+                "datePublished",
+                "2026-07-22"
+              ],
+              [
+                "keywords",
+                "python, data science, flexible, pandas, alignment, data analysis"
+              ],
+              [
+                "publisher",
+                "Zenodo"
+              ],
+              [
+                "size",
+                "5.26 MB"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "pandas-dev/pandas: Pandas",
+            "type": "Person",
+            "name": "The pandas development team",
+            "ambiguous_head": false,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "familyName",
+                "The pandas development team"
+              ]
+            ]
+          }
+        ],
+        "entity_field_pairs": [
+          "Person.familyName",
+          "SoftwareSourceCode.contentSize",
+          "SoftwareSourceCode.dateCreated",
+          "SoftwareSourceCode.dateModified",
+          "SoftwareSourceCode.datePublished",
+          "SoftwareSourceCode.keywords",
+          "SoftwareSourceCode.publisher",
+          "SoftwareSourceCode.size"
+        ],
+        "lines": [
+          "[jsonld] SoftwareSourceCode: pandas-dev/pandas: Pandas \u2014 contentSize: 5.26 MB; dateCreated: 2026-07-22T21:47:21.346630+00:00; dateModified: 2026-07-22T21:47:21.561509+00:00; datePublished: 2026-07-22; keywords: python, data science, flexible, pandas, alignment, data analysis; publisher: Zenodo; size: 5.26 MB",
+          "[jsonld] pandas-dev/pandas: Pandas \u203a Person: The pandas development team \u2014 familyName: The pandas development team"
+        ],
+        "consistent_with_pipeline": true,
+        "stats": {
+          "parsed": 1,
+          "blocks": 1,
+          "microdata_scopes": 1,
+          "fields_deduped": 4,
+          "records_deduped": 1,
+          "lines": 2
+        },
+        "text_chars": 1840,
+        "prose_chars": 1348,
+        "appended_chars": 492,
+        "title": "pandas-dev/pandas: Pandas | Zenodo",
+        "published_at": "2026-07-22",
+        "modified_at": "2026-07-22",
+        "extract_ms": 11.874,
+        "structured_ms": 1.133,
+        "extract_ms_all": [
+          12.586,
+          11.955,
+          11.874,
+          11.848
+        ],
+        "structured_ms_all": [
+          1.171,
+          1.143,
+          1.133,
+          1.124
+        ]
+      }
+    },
+    "schemaorg-product": {
+      "url": "https://schema.org/Product",
+      "slug": "schemaorg-product",
+      "why": "the vocabulary's own page: an RDF-shaped ld+json block and 20+ microdata scopes \u2014 the widest real input in the set",
+      "predicted": "both",
+      "from_cache": true,
+      "final_url": "https://schema.org/Product",
+      "status": 200,
+      "content_type": "text/html",
+      "bytes": 234353,
+      "sha256": "75d21e593da9aac700098102c5126a2d132a3045f1298281680d23d9b8e8247e",
+      "fetched_at": "2026-09-06T18:50:21Z",
+      "cache_file": "/home/techsphere/.cache/techsara/structured-real-world/schemaorg-product.dd62b9c029aec257.html",
+      "analysis": {
+        "found": "jsonld",
+        "predicted": "both",
+        "prediction_held": false,
+        "record_count": 67,
+        "records": [
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdfs:Class",
+            "ambiguous_head": true,
+            "separator_ambiguous": true,
+            "fields": [
+              [
+                "rdfs:comment",
+                "Any offered product or service. For example: a pair of shoes; a concert ticket; the rental of a car; a haircut; or an episode of a TV show streamed online."
+              ],
+              [
+                "rdfs:label",
+                "Product"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdfs:Class",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "The most generic type of item."
+              ],
+              [
+                "rdfs:label",
+                "Thing"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "A property-value pair representing an additional characteristic of the entity, e.g. a product feature or another characteristic for which there is no matching property in schema.org.\\n\\nNote: Publish\u2026"
+              ],
+              [
+                "rdfs:label",
+                "additionalProperty"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "An additional type for the item, typically used for adding more specific types from external vocabularies in microdata syntax. This is a relationship between something and a class that the thing is i\u2026"
+              ],
+              [
+                "rdfs:label",
+                "additionalType"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "The overall rating, based on a collection of reviews or ratings, of the item."
+              ],
+              [
+                "rdfs:label",
+                "aggregateRating"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "An alias for the item."
+              ],
+              [
+                "rdfs:label",
+                "alternateName"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "An Amazon Standard Identification Number (ASIN) is a 10-character alphanumeric unique identifier assigned by Amazon.com and its partners for product identification within the Amazon organization (sum\u2026"
+              ],
+              [
+                "rdfs:label",
+                "asin"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "An intended audience, i.e. a group for whom something was created."
+              ],
+              [
+                "rdfs:label",
+                "audience"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "An award won by or for this item."
+              ],
+              [
+                "rdfs:label",
+                "award"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "Awards won by or for this item."
+              ],
+              [
+                "rdfs:label",
+                "awards"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "The brand(s) associated with a product or service, or the brand(s) maintained by an organization or business person."
+              ],
+              [
+                "rdfs:label",
+                "brand"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "A category for the item. Greater signs or slashes can be used to informally indicate a category hierarchy."
+              ],
+              [
+                "rdfs:label",
+                "category"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "The color of the product."
+              ],
+              [
+                "rdfs:label",
+                "color"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "A color swatch image, visualizing the color of a [[Product]]. Should match the textual description specified in the [[color]] property. This can be a URL or a fully described ImageObject."
+              ],
+              [
+                "rdfs:label",
+                "colorSwatch"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "The place where the product was assembled."
+              ],
+              [
+                "rdfs:label",
+                "countryOfAssembly"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "The place where the item (typically [[Product]]) was last processed and tested before importation."
+              ],
+              [
+                "rdfs:label",
+                "countryOfLastProcessing"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "The country of origin of something, including products as well as creative works such as movie and TV content. In the case of TV and movie, this would be the country of the principle offices of the p\u2026"
+              ],
+              [
+                "rdfs:label",
+                "countryOfOrigin"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "The depth of the item."
+              ],
+              [
+                "rdfs:label",
+                "depth"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "A description of the item."
+              ],
+              [
+                "rdfs:label",
+                "description"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "A sub property of description. A short description of the item used to disambiguate from other, similar items. Information from other properties (in particular, name) may be necessary for the descrip\u2026"
+              ],
+              [
+                "rdfs:label",
+                "disambiguatingDescription"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "The location at which an item can be viewed or experienced in-person."
+              ],
+              [
+                "rdfs:label",
+                "displayLocation"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "A [[Grant]] that directly or indirectly provide funding or sponsorship for this item. See also [[ownershipFundingInfo]]."
+              ],
+              [
+                "rdfs:label",
+                "funding"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "A Global Trade Item Number ([GTIN](https://www.gs1.org/standards/id-keys/gtin)). GTINs identify trade items, including products and services, using numeric identification codes. A correct [[gtin]] va\u2026"
+              ],
+              [
+                "rdfs:label",
+                "gtin"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "The GTIN-12 code of the product, or the product to which the offer refers. The GTIN-12 is the 12-digit GS1 Identification Key composed of a U.P.C. Company Prefix, Item Reference, and Check Digit used\u2026"
+              ],
+              [
+                "rdfs:label",
+                "gtin12"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "The GTIN-13 code of the product, or the product to which the offer refers. This is equivalent to 13-digit ISBN codes and EAN UCC-13. Former 12-digit UPC codes can be converted into a GTIN-13 code by\u2026"
+              ],
+              [
+                "rdfs:label",
+                "gtin13"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "The GTIN-14 code of the product, or the product to which the offer refers. See [GS1 GTIN Summary](http://www.gs1.org/barcodes/technical/idkeys/gtin) for more details."
+              ],
+              [
+                "rdfs:label",
+                "gtin14"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "The GTIN-8 code of the product, or the product to which the offer refers. This code is also known as EAN/UCC-8 or 8-digit EAN. See [GS1 GTIN Summary](http://www.gs1.org/barcodes/technical/idkeys/gtin\u2026"
+              ],
+              [
+                "rdfs:label",
+                "gtin8"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "Used to tag an item to be intended or suitable for consumption or use by adults only."
+              ],
+              [
+                "rdfs:label",
+                "hasAdultConsideration"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "Certification information about a product, organization, service, place, or person."
+              ],
+              [
+                "rdfs:label",
+                "hasCertification"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "Defines the energy efficiency Category (also known as \"class\" or \"rating\") for a product according to an international energy efficiency standard."
+              ],
+              [
+                "rdfs:label",
+                "hasEnergyConsumptionDetails"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "The <a href=\"https://www.gs1.org/standards/gs1-digital-link\">GS1 digital link</a> associated with the object. This URL should conform to the particular requirements of digital links. The link should\u2026"
+              ],
+              [
+                "rdfs:label",
+                "hasGS1DigitalLink"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "A measurement of an item, For example, the inseam of pants, the wheel size of a bicycle, the gauge of a screw, or the carbon footprint measured for certification by an authority. Usually an exact mea\u2026"
+              ],
+              [
+                "rdfs:label",
+                "hasMeasurement"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "Specifies a MerchantReturnPolicy that may be applicable."
+              ],
+              [
+                "rdfs:label",
+                "hasMerchantReturnPolicy"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "Indicates a ProductReturnPolicy that may be applicable."
+              ],
+              [
+                "rdfs:label",
+                "hasProductReturnPolicy"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "The height of the item."
+              ],
+              [
+                "rdfs:label",
+                "height"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "The identifier property represents any kind of identifier for any kind of [[Thing]], such as ISBNs, GTIN codes, UUIDs etc. Schema.org provides dedicated properties for representing many of these, eit\u2026"
+              ],
+              [
+                "rdfs:label",
+                "identifier"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "An image of the item. This can be a [[URL]] or a fully described [[ImageObject]]."
+              ],
+              [
+                "rdfs:label",
+                "image"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "Indicates the [[productGroupID]] for a [[ProductGroup]] that this product [[isVariantOf]]."
+              ],
+              [
+                "rdfs:label",
+                "inProductGroupWithID"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "A pointer to another product (or multiple products) for which this product is an accessory or spare part."
+              ],
+              [
+                "rdfs:label",
+                "isAccessoryOrSparePartFor"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "A pointer to another product (or multiple products) for which this product is a consumable."
+              ],
+              [
+                "rdfs:label",
+                "isConsumableFor"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "Indicates whether this content is family friendly."
+              ],
+              [
+                "rdfs:label",
+                "isFamilyFriendly"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "A pointer to another, somehow related product (or multiple products)."
+              ],
+              [
+                "rdfs:label",
+                "isRelatedTo"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "A pointer to another, functionally similar product (or multiple products)."
+              ],
+              [
+                "rdfs:label",
+                "isSimilarTo"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "Indicates the kind of product that this is a variant of. In the case of [[ProductModel]], this is a pointer (from a ProductModel) to a base product from which this product is a variant. It is safe to\u2026"
+              ],
+              [
+                "rdfs:label",
+                "isVariantOf"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "A predefined value from OfferItemCondition specifying the condition of the product or service, or the products or services included in the offer. Also used for product return policies to specify the\u2026"
+              ],
+              [
+                "rdfs:label",
+                "itemCondition"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "Keywords or tags used to describe some item. Multiple textual entries in a keywords list are typically delimited by commas, or by repeating the property."
+              ],
+              [
+                "rdfs:label",
+                "keywords"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "An associated logo."
+              ],
+              [
+                "rdfs:label",
+                "logo"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "Indicates a page (or other CreativeWork) for which this thing is the main entity being described. See [background notes](/docs/datamodel.html#mainEntityBackground) for details."
+              ],
+              [
+                "rdfs:label",
+                "mainEntityOfPage"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "The manufacturer of the product."
+              ],
+              [
+                "rdfs:label",
+                "manufacturer"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "A material that something is made from, e.g. leather, wool, cotton, paper."
+              ],
+              [
+                "rdfs:label",
+                "material"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "The [[mobileUrl]] property is provided for specific situations in which data consumers need to determine whether one of several provided URLs is a dedicated 'mobile site'. To discourage over-use, and\u2026"
+              ],
+              [
+                "rdfs:label",
+                "mobileUrl"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "The model of the product. Use with the URL of a ProductModel or a textual representation of the model identifier. The URL of the ProductModel can be from an external source. It is recommended to addi\u2026"
+              ],
+              [
+                "rdfs:label",
+                "model"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "The Manufacturer Part Number (MPN) of the product, or the product to which the offer refers."
+              ],
+              [
+                "rdfs:label",
+                "mpn"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "The name of the item."
+              ],
+              [
+                "rdfs:label",
+                "name"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "Provides negative considerations regarding something, most typically in pro/con lists for reviews (alongside [[positiveNotes]]). For symmetry In the case of a [[Review]], the property describes the [\u2026"
+              ],
+              [
+                "rdfs:label",
+                "negativeNotes"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "Indicates the [NATO stock number](https://en.wikipedia.org/wiki/NATO_Stock_Number) (nsn) of a [[Product]]."
+              ],
+              [
+                "rdfs:label",
+                "nsn"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "An offer to provide this item&#x2014;for example, an offer to sell a product, rent the DVD of a movie, perform a service, or give away tickets to an event. Use [[businessFunction]] to indicate the ki\u2026"
+              ],
+              [
+                "rdfs:label",
+                "offers"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "A person or organization who owns this Thing."
+              ],
+              [
+                "rdfs:label",
+                "owner"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "A pattern that something has, for example 'polka dot', 'striped', 'Canadian flag'. Values are typically expressed as text, although links to controlled value schemes are also supported."
+              ],
+              [
+                "rdfs:label",
+                "pattern"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "Provides positive considerations regarding something, for example product highlights or (alongside [[negativeNotes]]) pro/con lists for reviews. In the case of a [[Review]], the property describes th\u2026"
+              ],
+              [
+                "rdfs:label",
+                "positiveNotes"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "Indicates a potential Action, which describes an idealized action in which this thing would play an 'object' role."
+              ],
+              [
+                "rdfs:label",
+                "potentialAction"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "The product identifier, such as ISBN. For example: ``` meta itemprop=\"productID\" content=\"isbn:123-456-789\" ```."
+              ],
+              [
+                "rdfs:label",
+                "productID"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "The date of production of the item, e.g. vehicle."
+              ],
+              [
+                "rdfs:label",
+                "productionDate"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "The date the item, e.g. vehicle, was purchased by the current owner."
+              ],
+              [
+                "rdfs:label",
+                "purchaseDate"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "The release date of a product or product model. This can be used to distinguish the exact variant of a product."
+              ],
+              [
+                "rdfs:label",
+                "releaseDate"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "A review of the item."
+              ],
+              [
+                "rdfs:label",
+                "review"
+              ]
+            ]
+          },
+          {
+            "source": "jsonld",
+            "parent": "",
+            "type": "",
+            "name": "rdf:Property",
+            "ambiguous_head": true,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "rdfs:comment",
+                "Review of the item."
+              ],
+              [
+                "rdfs:label",
+                "reviews"
+              ]
+            ]
+          }
+        ],
+        "entity_field_pairs": [
+          "rdf:Property.rdfs:comment",
+          "rdf:Property.rdfs:label",
+          "rdfs:Class.rdfs:comment",
+          "rdfs:Class.rdfs:label"
+        ],
+        "lines": [
+          "[jsonld] rdfs:Class \u2014 rdfs:comment: Any offered product or service. For example: a pair of shoes; a concert ticket; the rental of a car; a haircut; or an episode of a TV show streamed online.; rdfs:label: Product",
+          "[jsonld] rdfs:Class \u2014 rdfs:comment: The most generic type of item.; rdfs:label: Thing",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: A property-value pair representing an additional characteristic of the entity, e.g. a product feature or another characteristic for which there is no matching property in schema.org.\\n\\nNote: Publish\u2026; rdfs:label: additionalProperty",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: An additional type for the item, typically used for adding more specific types from external vocabularies in microdata syntax. This is a relationship between something and a class that the thing is i\u2026; rdfs:label: additionalType",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: The overall rating, based on a collection of reviews or ratings, of the item.; rdfs:label: aggregateRating",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: An alias for the item.; rdfs:label: alternateName",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: An Amazon Standard Identification Number (ASIN) is a 10-character alphanumeric unique identifier assigned by Amazon.com and its partners for product identification within the Amazon organization (sum\u2026; rdfs:label: asin",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: An intended audience, i.e. a group for whom something was created.; rdfs:label: audience",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: An award won by or for this item.; rdfs:label: award",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: Awards won by or for this item.; rdfs:label: awards",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: The brand(s) associated with a product or service, or the brand(s) maintained by an organization or business person.; rdfs:label: brand",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: A category for the item. Greater signs or slashes can be used to informally indicate a category hierarchy.; rdfs:label: category",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: The color of the product.; rdfs:label: color",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: A color swatch image, visualizing the color of a [[Product]]. Should match the textual description specified in the [[color]] property. This can be a URL or a fully described ImageObject.; rdfs:label: colorSwatch",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: The place where the product was assembled.; rdfs:label: countryOfAssembly",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: The place where the item (typically [[Product]]) was last processed and tested before importation.; rdfs:label: countryOfLastProcessing",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: The country of origin of something, including products as well as creative works such as movie and TV content. In the case of TV and movie, this would be the country of the principle offices of the p\u2026; rdfs:label: countryOfOrigin",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: The depth of the item.; rdfs:label: depth",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: A description of the item.; rdfs:label: description",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: A sub property of description. A short description of the item used to disambiguate from other, similar items. Information from other properties (in particular, name) may be necessary for the descrip\u2026; rdfs:label: disambiguatingDescription",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: The location at which an item can be viewed or experienced in-person.; rdfs:label: displayLocation",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: A [[Grant]] that directly or indirectly provide funding or sponsorship for this item. See also [[ownershipFundingInfo]].; rdfs:label: funding",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: A Global Trade Item Number ([GTIN](https://www.gs1.org/standards/id-keys/gtin)). GTINs identify trade items, including products and services, using numeric identification codes. A correct [[gtin]] va\u2026; rdfs:label: gtin",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: The GTIN-12 code of the product, or the product to which the offer refers. The GTIN-12 is the 12-digit GS1 Identification Key composed of a U.P.C. Company Prefix, Item Reference, and Check Digit used\u2026; rdfs:label: gtin12",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: The GTIN-13 code of the product, or the product to which the offer refers. This is equivalent to 13-digit ISBN codes and EAN UCC-13. Former 12-digit UPC codes can be converted into a GTIN-13 code by\u2026; rdfs:label: gtin13",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: The GTIN-14 code of the product, or the product to which the offer refers. See [GS1 GTIN Summary](http://www.gs1.org/barcodes/technical/idkeys/gtin) for more details.; rdfs:label: gtin14",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: The GTIN-8 code of the product, or the product to which the offer refers. This code is also known as EAN/UCC-8 or 8-digit EAN. See [GS1 GTIN Summary](http://www.gs1.org/barcodes/technical/idkeys/gtin\u2026; rdfs:label: gtin8",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: Used to tag an item to be intended or suitable for consumption or use by adults only.; rdfs:label: hasAdultConsideration",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: Certification information about a product, organization, service, place, or person.; rdfs:label: hasCertification",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: Defines the energy efficiency Category (also known as \"class\" or \"rating\") for a product according to an international energy efficiency standard.; rdfs:label: hasEnergyConsumptionDetails",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: The <a href=\"https://www.gs1.org/standards/gs1-digital-link\">GS1 digital link</a> associated with the object. This URL should conform to the particular requirements of digital links. The link should\u2026; rdfs:label: hasGS1DigitalLink",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: A measurement of an item, For example, the inseam of pants, the wheel size of a bicycle, the gauge of a screw, or the carbon footprint measured for certification by an authority. Usually an exact mea\u2026; rdfs:label: hasMeasurement",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: Specifies a MerchantReturnPolicy that may be applicable.; rdfs:label: hasMerchantReturnPolicy",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: Indicates a ProductReturnPolicy that may be applicable.; rdfs:label: hasProductReturnPolicy",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: The height of the item.; rdfs:label: height",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: The identifier property represents any kind of identifier for any kind of [[Thing]], such as ISBNs, GTIN codes, UUIDs etc. Schema.org provides dedicated properties for representing many of these, eit\u2026; rdfs:label: identifier",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: An image of the item. This can be a [[URL]] or a fully described [[ImageObject]].; rdfs:label: image",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: Indicates the [[productGroupID]] for a [[ProductGroup]] that this product [[isVariantOf]].; rdfs:label: inProductGroupWithID",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: A pointer to another product (or multiple products) for which this product is an accessory or spare part.; rdfs:label: isAccessoryOrSparePartFor",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: A pointer to another product (or multiple products) for which this product is a consumable.; rdfs:label: isConsumableFor",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: Indicates whether this content is family friendly.; rdfs:label: isFamilyFriendly",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: A pointer to another, somehow related product (or multiple products).; rdfs:label: isRelatedTo",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: A pointer to another, functionally similar product (or multiple products).; rdfs:label: isSimilarTo",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: Indicates the kind of product that this is a variant of. In the case of [[ProductModel]], this is a pointer (from a ProductModel) to a base product from which this product is a variant. It is safe to\u2026; rdfs:label: isVariantOf",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: A predefined value from OfferItemCondition specifying the condition of the product or service, or the products or services included in the offer. Also used for product return policies to specify the\u2026; rdfs:label: itemCondition",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: Keywords or tags used to describe some item. Multiple textual entries in a keywords list are typically delimited by commas, or by repeating the property.; rdfs:label: keywords",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: An associated logo.; rdfs:label: logo",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: Indicates a page (or other CreativeWork) for which this thing is the main entity being described. See [background notes](/docs/datamodel.html#mainEntityBackground) for details.; rdfs:label: mainEntityOfPage",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: The manufacturer of the product.; rdfs:label: manufacturer",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: A material that something is made from, e.g. leather, wool, cotton, paper.; rdfs:label: material",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: The [[mobileUrl]] property is provided for specific situations in which data consumers need to determine whether one of several provided URLs is a dedicated 'mobile site'. To discourage over-use, and\u2026; rdfs:label: mobileUrl",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: The model of the product. Use with the URL of a ProductModel or a textual representation of the model identifier. The URL of the ProductModel can be from an external source. It is recommended to addi\u2026; rdfs:label: model",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: The Manufacturer Part Number (MPN) of the product, or the product to which the offer refers.; rdfs:label: mpn",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: The name of the item.; rdfs:label: name",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: Provides negative considerations regarding something, most typically in pro/con lists for reviews (alongside [[positiveNotes]]). For symmetry In the case of a [[Review]], the property describes the [\u2026; rdfs:label: negativeNotes",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: Indicates the [NATO stock number](https://en.wikipedia.org/wiki/NATO_Stock_Number) (nsn) of a [[Product]].; rdfs:label: nsn",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: An offer to provide this item&#x2014;for example, an offer to sell a product, rent the DVD of a movie, perform a service, or give away tickets to an event. Use [[businessFunction]] to indicate the ki\u2026; rdfs:label: offers",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: A person or organization who owns this Thing.; rdfs:label: owner",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: A pattern that something has, for example 'polka dot', 'striped', 'Canadian flag'. Values are typically expressed as text, although links to controlled value schemes are also supported.; rdfs:label: pattern",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: Provides positive considerations regarding something, for example product highlights or (alongside [[negativeNotes]]) pro/con lists for reviews. In the case of a [[Review]], the property describes th\u2026; rdfs:label: positiveNotes",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: Indicates a potential Action, which describes an idealized action in which this thing would play an 'object' role.; rdfs:label: potentialAction",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: The product identifier, such as ISBN. For example: ``` meta itemprop=\"productID\" content=\"isbn:123-456-789\" ```.; rdfs:label: productID",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: The date of production of the item, e.g. vehicle.; rdfs:label: productionDate",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: The date the item, e.g. vehicle, was purchased by the current owner.; rdfs:label: purchaseDate",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: The release date of a product or product model. This can be used to distinguish the exact variant of a product.; rdfs:label: releaseDate",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: A review of the item.; rdfs:label: review",
+          "[jsonld] rdf:Property \u2014 rdfs:comment: Review of the item.; rdfs:label: reviews"
+        ],
+        "consistent_with_pipeline": true,
+        "stats": {
+          "parsed": 1,
+          "blocks": 1,
+          "microdata_scopes": 21,
+          "truncated": 1,
+          "lines": 67
+        },
+        "text_chars": 72956,
+        "prose_chars": 61007,
+        "appended_chars": 11949,
+        "title": "Product - Schema.org Type",
+        "published_at": "2026-03-19",
+        "modified_at": "2026-03-19",
+        "extract_ms": 134.469,
+        "structured_ms": 9.928,
+        "extract_ms_all": [
+          137.577,
+          134.469,
+          134.502,
+          134.081
+        ],
+        "structured_ms_all": [
+          10.113,
+          9.928,
+          9.849,
+          9.936
+        ]
+      }
+    },
+    "gutenberg-moby-dick": {
+      "url": "https://www.gutenberg.org/ebooks/2701",
+      "slug": "gutenberg-moby-dick",
+      "why": "a public-domain Book in pure microdata, no ld+json",
+      "predicted": "microdata",
+      "from_cache": true,
+      "final_url": "https://www.gutenberg.org/ebooks/2701",
+      "status": 200,
+      "content_type": "text/html;charset=utf-8",
+      "bytes": 24783,
+      "sha256": "b198b6fcf2d6e6edc6aab93e973d908d2bb626a609e7812560317c16a91beaca",
+      "fetched_at": "2026-09-06T18:50:24Z",
+      "cache_file": "/home/techsphere/.cache/techsara/structured-real-world/gutenberg-moby-dick.bd29a98ea499377f.html",
+      "analysis": {
+        "found": "microdata",
+        "predicted": "microdata",
+        "prediction_held": true,
+        "record_count": 1,
+        "records": [
+          {
+            "source": "microdata",
+            "parent": "",
+            "type": "Book",
+            "name": "Moby Dick; Or, The Whale by Herman Melville",
+            "ambiguous_head": false,
+            "separator_ambiguous": false,
+            "fields": [
+              [
+                "creator",
+                "/ebooks/author/9"
+              ],
+              [
+                "inLanguage",
+                "Language English"
+              ],
+              [
+                "datePublished",
+                "Jul 1, 2001"
+              ],
+              [
+                "dateModified",
+                "Feb 10, 2026"
+              ],
+              [
+                "interactionCount",
+                "165457 downloads in the last 30 days."
+              ],
+              [
+                "price",
+                "0.00 USD"
+              ],
+              [
+                "availability",
+                "InStock"
+              ]
+            ]
+          }
+        ],
+        "entity_field_pairs": [
+          "Book.availability",
+          "Book.creator",
+          "Book.dateModified",
+          "Book.datePublished",
+          "Book.inLanguage",
+          "Book.interactionCount",
+          "Book.price"
+        ],
+        "lines": [
+          "[microdata] Book: Moby Dick; Or, The Whale by Herman Melville \u2014 creator: /ebooks/author/9; inLanguage: Language English; datePublished: Jul 1, 2001; dateModified: Feb 10, 2026; interactionCount: 165457 downloads in the last 30 days.; price: 0.00 USD; availability: InStock"
+        ],
+        "consistent_with_pipeline": true,
+        "stats": {
+          "blocks": 0,
+          "microdata_scopes": 1,
+          "fields_deduped": 1,
+          "lines": 1
+        },
+        "text_chars": 2871,
+        "prose_chars": 2531,
+        "appended_chars": 340,
+        "title": "Moby Dick; Or, The Whale by Herman Melville | Project Gutenberg",
+        "published_at": "2001-07-01",
+        "modified_at": "2001-07-01",
+        "extract_ms": 18.289,
+        "structured_ms": 0.87,
+        "extract_ms_all": [
+          19.188,
+          18.515,
+          18.267,
+          18.289
+        ],
+        "structured_ms_all": [
+          0.926,
+          0.886,
+          0.87,
+          0.851
+        ]
+      }
+    },
+    "openlibrary-lotr": {
+      "url": "https://openlibrary.org/works/OL27448W/The_Lord_of_the_Rings",
+      "slug": "openlibrary-lotr",
+      "why": "Book microdata carrying a ratingValue and ratingCount",
+      "predicted": "microdata",
+      "from_cache": true,
+      "final_url": "https://openlibrary.org/works/OL27448W/The_Lord_of_the_Rings",
+      "status": 200,
+      "content_type": "text/html; charset=utf-8",
+      "bytes": 123648,
+      "sha256": "c89132803f0ebf242e2599445c6595df94560bb73e688261c952fed408af8524",
+      "fetched_at": "2026-09-06T18:50:31Z",
+      "cache_file": "/home/techsphere/.cache/techsara/structured-real-world/openlibrary-lotr.2e76409aabcfb1d4.html",
+      "analysis": {
+        "found": "microdata",
+        "predicted": "microdata",
+        "prediction_held": true,
+        "record_count": 1,
+        "records": [
+          {
+            "source": "microdata",
+            "parent": "",
+            "type": "",
+            "name": "Book",
+            "ambiguous_head": true,
+            "separator_ambiguous": true,
+            "fields": [
+              [
+                "exampleOfWork",
+                "/works/OL27448W"
+              ],
+              [
+                "name",
+                "Y\u00fcz\u00fcklerin Efendisi; Y\u00fcz\u00fcklerin Efendisi; Book Details"
+              ],
+              [
+                "author",
+                "/authors/OL26320A/J.R.R._Tolkien; /authors/OL26320A/J.R.R._Tolkien"
+              ],
+              [
+                "ratingValue",
+                "4.45"
+              ],
+              [
+                "ratingCount",
+                "118"
+              ],
+              [
+                "datePublished",
+                "2007"
+              ],
+              [
+                "publisher",
+                "/publishers/Metis_Yay\u0131nc\u0131l\u0131k"
+              ],
+              [
+                "inLanguage",
+                "Turkish"
+              ],
+              [
+                "isbn",
+                "9753423470; 9789753423472"
+              ]
+            ]
+          }
+        ],
+        "entity_field_pairs": [
+          "Book.author",
+          "Book.datePublished",
+          "Book.exampleOfWork",
+          "Book.inLanguage",
+          "Book.isbn",
+          "Book.name",
+          "Book.publisher",
+          "Book.ratingCount",
+          "Book.ratingValue"
+        ],
+        "lines": [
+          "[microdata] Book \u2014 exampleOfWork: /works/OL27448W; name: Y\u00fcz\u00fcklerin Efendisi; Y\u00fcz\u00fcklerin Efendisi; Book Details; author: /authors/OL26320A/J.R.R._Tolkien; /authors/OL26320A/J.R.R._Tolkien; ratingValue: 4.45; ratingCount: 118; datePublished: 2007; publisher: /publishers/Metis_Yay\u0131nc\u0131l\u0131k; inLanguage: Turkish; isbn: 9753423470; 9789753423472"
+        ],
+        "consistent_with_pipeline": true,
+        "stats": {
+          "blocks": 0,
+          "microdata_scopes": 1,
+          "lines": 1
+        },
+        "text_chars": 5079,
+        "prose_chars": 4671,
+        "appended_chars": 408,
+        "title": "Y\u00fcz\u00fcklerin Efendisi by J.R.R. Tolkien | Open Library",
+        "published_at": "2026-08-17",
+        "modified_at": "2026-08-17",
+        "extract_ms": 95.392,
+        "structured_ms": 2.812,
+        "extract_ms_all": [
+          96.344,
+          95.392,
+          95.518,
+          95.366
+        ],
+        "structured_ms_all": [
+          2.979,
+          2.83,
+          2.812,
+          2.811
+        ]
+      }
+    },
+    "github-cpython": {
+      "url": "https://github.com/python/cpython",
+      "slug": "github-cpython",
+      "why": "SoftwareSourceCode microdata on a page that is otherwise all script",
+      "predicted": "microdata",
+      "from_cache": true,
+      "final_url": "https://github.com/python/cpython",
+      "status": 200,
+      "content_type": "text/html; charset=utf-8",
+      "bytes": 385127,
+      "sha256": "a575bf08149aadd99a763595fc91e9a53506b2339ee8ca483b49f8cb63eee3c6",
+      "fetched_at": "2026-09-06T18:50:34Z",
+      "cache_file": "/home/techsphere/.cache/techsara/structured-real-world/github-cpython.cd1cb5b5b252b6c0.html",
+      "analysis": {
+        "found": "none",
+        "predicted": "microdata",
+        "prediction_held": false,
+        "record_count": 0,
+        "records": [],
+        "entity_field_pairs": [],
+        "lines": [],
+        "consistent_with_pipeline": true,
+        "stats": {
+          "blocks": 0,
+          "microdata_scopes": 1,
+          "fields_deduped": 1,
+          "records_deduped": 1,
+          "lines": 0
+        },
+        "text_chars": 6853,
+        "prose_chars": 6853,
+        "appended_chars": 0,
+        "title": "GitHub - python/cpython: The Python programming language \u00b7 GitHub",
+        "published_at": "2017-02-10",
+        "modified_at": "2017-02-10",
+        "extract_ms": 114.945,
+        "structured_ms": 6.684,
+        "extract_ms_all": [
+          814.04,
+          114.939,
+          116.169,
+          114.945
+        ],
+        "structured_ms_all": [
+          6.956,
+          6.733,
+          6.684,
+          6.679
+        ]
+      }
+    },
+    "python-org-home": {
+      "url": "https://www.python.org/",
+      "slug": "python-org-home",
+      "why": "NEGATIVE CONTROL, post-parse: one ld+json block that is real and correct and contains nothing a reader could use. Parsing it and emitting nothing is the right answer",
+      "predicted": "none",
+      "from_cache": true,
+      "final_url": "https://www.python.org/",
+      "status": 200,
+      "content_type": "text/html; charset=utf-8",
+      "bytes": 52727,
+      "sha256": "95186248340c3f518f913ce3805363173acc072f7d4692119be5fa5fced60b50",
+      "fetched_at": "2026-09-06T18:50:35Z",
+      "cache_file": "/home/techsphere/.cache/techsara/structured-real-world/python-org-home.3a612d3b0026605c.html",
+      "analysis": {
+        "found": "none",
+        "predicted": "none",
+        "prediction_held": true,
+        "record_count": 0,
+        "records": [],
+        "entity_field_pairs": [],
+        "lines": [],
+        "consistent_with_pipeline": true,
+        "stats": {
+          "parsed": 1,
+          "blocks": 1
+        },
+        "text_chars": 1781,
+        "prose_chars": 1781,
+        "appended_chars": 0,
+        "title": "Welcome to Python.org",
+        "published_at": "2026-08-31",
+        "modified_at": "2026-09-01",
+        "extract_ms": 31.367,
+        "structured_ms": 0.596,
+        "extract_ms_all": [
+          59.992,
+          32.191,
+          31.367,
+          31.256
+        ],
+        "structured_ms_all": [
+          0.636,
+          0.612,
+          0.595,
+          0.596
+        ]
+      }
+    },
+    "docs-python-json": {
+      "url": "https://docs.python.org/3/library/json.html",
+      "slug": "docs-python-json",
+      "why": "NEGATIVE CONTROL: hand-written documentation, no markup",
+      "predicted": "none",
+      "from_cache": true,
+      "final_url": "https://docs.python.org/3/library/json.html",
+      "status": 200,
+      "content_type": "text/html",
+      "bytes": 111909,
+      "sha256": "2562f3cfd3633ce875db1daee8818beba5cebdac89a0e4453972e9e0bd722ff2",
+      "fetched_at": "2026-09-06T18:50:35Z",
+      "cache_file": "/home/techsphere/.cache/techsara/structured-real-world/docs-python-json.c9c50a504fb81ab2.html",
+      "analysis": {
+        "found": "none",
+        "predicted": "none",
+        "prediction_held": true,
+        "record_count": 0,
+        "records": [],
+        "entity_field_pairs": [],
+        "lines": [],
+        "consistent_with_pipeline": true,
+        "stats": {
+          "blocks": 0
+        },
+        "text_chars": 24908,
+        "prose_chars": 24908,
+        "appended_chars": 0,
+        "title": "json \u2014 JSON encoder and decoder &#8212; Python 3.14.7 documentation",
+        "published_at": "2026-09-06",
+        "modified_at": "2026-09-06",
+        "extract_ms": 297.434,
+        "structured_ms": 1.349,
+        "extract_ms_all": [
+          917.15,
+          311.615,
+          296.17,
+          297.434
+        ],
+        "structured_ms_all": [
+          1.394,
+          1.355,
+          1.349,
+          1.344
+        ]
+      }
+    },
+    "mdn-http-404": {
+      "url": "https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404",
+      "slug": "mdn-http-404",
+      "why": "NEGATIVE CONTROL: a large modern doc site with no schema.org at all",
+      "predicted": "none",
+      "from_cache": true,
+      "final_url": "https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Status/404",
+      "status": 200,
+      "content_type": "text/html",
+      "bytes": 210477,
+      "sha256": "4045db5361a93aee3f8011c6a163ebf37305c3c1a8eb603651b66c960640cfbe",
+      "fetched_at": "2026-09-06T18:50:37Z",
+      "cache_file": "/home/techsphere/.cache/techsara/structured-real-world/mdn-http-404.0720e959d892593d.html",
+      "analysis": {
+        "found": "none",
+        "predicted": "none",
+        "prediction_held": true,
+        "record_count": 0,
+        "records": [],
+        "entity_field_pairs": [],
+        "lines": [],
+        "consistent_with_pipeline": true,
+        "stats": {
+          "blocks": 0
+        },
+        "text_chars": 2107,
+        "prose_chars": 2107,
+        "appended_chars": 0,
+        "title": "404 Not Found - HTTP | MDN",
+        "published_at": "2026-06-22",
+        "modified_at": "2026-06-22",
+        "extract_ms": 57.568,
+        "structured_ms": 2.477,
+        "extract_ms_all": [
+          57.805,
+          57.689,
+          57.3,
+          57.568
+        ],
+        "structured_ms_all": [
+          2.536,
+          2.491,
+          2.477,
+          2.475
+        ]
+      }
+    },
+    "rfc-9110": {
+      "url": "https://www.rfc-editor.org/rfc/rfc9110.html",
+      "slug": "rfc-9110",
+      "why": "NEGATIVE CONTROL and the cost ceiling: a 1.2 MB standards document with no markup, so the two probe regexes are all this pass may spend",
+      "predicted": "none",
+      "from_cache": true,
+      "final_url": "https://www.rfc-editor.org/rfc/rfc9110.html",
+      "status": 200,
+      "content_type": "text/html",
+      "bytes": 1187554,
+      "sha256": "d431760660ea44e130f6e919dab216df2d0b3a490567a98089267523368fe1e5",
+      "fetched_at": "2026-09-06T18:50:38Z",
+      "cache_file": "/home/techsphere/.cache/techsara/structured-real-world/rfc-9110.b1b13a12aee75c6e.html",
+      "analysis": {
+        "found": "none",
+        "predicted": "none",
+        "prediction_held": true,
+        "record_count": 0,
+        "records": [],
+        "entity_field_pairs": [],
+        "lines": [],
+        "consistent_with_pipeline": true,
+        "stats": {
+          "blocks": 0
+        },
+        "text_chars": 25222,
+        "prose_chars": 25222,
+        "appended_chars": 0,
+        "title": "RFC 9110: HTTP Semantics",
+        "published_at": "1998-04-01",
+        "modified_at": "1998-04-01",
+        "extract_ms": 622.325,
+        "structured_ms": 14.335,
+        "extract_ms_all": [
+          844.151,
+          622.325,
+          632.307,
+          618.733
+        ],
+        "structured_ms_all": [
+          14.492,
+          14.343,
+          14.302,
+          14.335
+        ]
+      }
+    }
+  },
+  "fixture_check": {
+    "ran": true,
+    "total": 41,
+    "passed": 41,
+    "failed": 0,
+    "checks": [
+      {
+        "fixture": "datagov-ev-population.json",
+        "slug": "datagov-ev-population",
+        "kind": "present",
+        "entity": "DataDownload",
+        "field": "encodingFormat",
+        "value": "text/csv",
+        "source": "jsonld",
+        "ok": true
+      },
+      {
+        "fixture": "datagov-ev-population.json",
+        "slug": "datagov-ev-population",
+        "kind": "present",
+        "entity": "DataDownload",
+        "field": "encodingFormat",
+        "value": "application/geo+json",
+        "source": "jsonld",
+        "ok": true
+      },
+      {
+        "fixture": "datagov-ev-population.json",
+        "slug": "datagov-ev-population",
+        "kind": "absent",
+        "entity": "Electric Vehicle Population Data",
+        "field": "datePublished",
+        "value": "2023-10-19",
+        "source": "",
+        "why": "DEDUPE, and correct here: the rendered page already prints 2023-10-19 next to the dataset title, so repeating it in the appended block would double the fact. Read in the JSON-LD; verified present in the extracted prose.",
+        "ok": true
+      },
+      {
+        "fixture": "datagov-ev-population.json",
+        "slug": "datagov-ev-population",
+        "kind": "absent",
+        "entity": "Electric Vehicle Population Data",
+        "field": "publisher",
+        "value": "data.wa.gov",
+        "source": "",
+        "why": "DEDUPE, correct: the prose states data.wa.gov near the title.",
+        "ok": true
+      },
+      {
+        "fixture": "datagov-ev-population.json",
+        "slug": "datagov-ev-population",
+        "kind": "absent",
+        "entity": "Electric Vehicle Population Data",
+        "field": "license",
+        "value": "http://opendatacommons.org/licenses/odbl/1.0/",
+        "source": "",
+        "why": "DEDUPE, correct: the prose links opendatacommons.org within the proximity window.",
+        "ok": true
+      },
+      {
+        "fixture": "govuk-vat-rates.json",
+        "slug": "govuk-vat-rates",
+        "kind": "present",
+        "entity": "VAT rates",
+        "field": "datePublished",
+        "value": "2011-09-12T16:43:03+01:00",
+        "source": "jsonld",
+        "ok": true
+      },
+      {
+        "fixture": "govuk-vat-rates.json",
+        "slug": "govuk-vat-rates",
+        "kind": "present",
+        "entity": "VAT rates",
+        "field": "dateModified",
+        "value": "2014-12-12T14:55:23+00:00",
+        "source": "jsonld",
+        "ok": true
+      },
+      {
+        "fixture": "govuk-vat-rates.json",
+        "slug": "govuk-vat-rates",
+        "kind": "present",
+        "entity": "VAT rates",
+        "field": "author",
+        "value": "Government Digital Service",
+        "source": "jsonld",
+        "ok": true
+      },
+      {
+        "fixture": "govuk-vat-rates.json",
+        "slug": "govuk-vat-rates",
+        "kind": "present",
+        "entity": "Money and tax",
+        "field": "position",
+        "value": "2",
+        "source": "jsonld",
+        "ok": true
+      },
+      {
+        "fixture": "govuk-vat-rates.json",
+        "slug": "govuk-vat-rates",
+        "kind": "absent",
+        "entity": "VAT rates",
+        "field": "text",
+        "value": "Current VAT rates - standard 20% and rates for reduced rate and zero-rated items",
+        "source": "",
+        "why": "the FAQPage's own \"text\" property. `_SKIP_KEY_RE` matches ^text$ (its value is normally the article prose, already extracted). Here it is the page summary and it names the 20% rate.",
+        "ok": true
+      },
+      {
+        "fixture": "govuk-vat-rates.json",
+        "slug": "govuk-vat-rates",
+        "kind": "absent",
+        "entity": "VAT rates",
+        "field": "acceptedAnswer",
+        "value": "The standard VAT rate is 20%",
+        "source": "",
+        "why": "every Question's answer is an Answer object whose only content is `text`, which is skipped, leaving the Answer with no fields; a nested record with no fields is not emitted. On THIS page the prose states 20% anyway, so nothing is lost here -- but on a JavaScript-rendered FAQ the answer body would be the only copy.",
+        "ok": true
+      },
+      {
+        "fixture": "gutenberg-moby-dick.json",
+        "slug": "gutenberg-moby-dick",
+        "kind": "present",
+        "entity": "Moby Dick; Or, The Whale by Herman Melville",
+        "field": "price",
+        "value": "0.00 USD",
+        "source": "microdata",
+        "ok": true
+      },
+      {
+        "fixture": "gutenberg-moby-dick.json",
+        "slug": "gutenberg-moby-dick",
+        "kind": "present",
+        "entity": "Moby Dick; Or, The Whale by Herman Melville",
+        "field": "availability",
+        "value": "InStock",
+        "source": "microdata",
+        "ok": true
+      },
+      {
+        "fixture": "gutenberg-moby-dick.json",
+        "slug": "gutenberg-moby-dick",
+        "kind": "present",
+        "entity": "Moby Dick; Or, The Whale by Herman Melville",
+        "field": "datePublished",
+        "value": "Jul 1, 2001",
+        "source": "microdata",
+        "ok": true
+      },
+      {
+        "fixture": "gutenberg-moby-dick.json",
+        "slug": "gutenberg-moby-dick",
+        "kind": "present",
+        "entity": "Moby Dick; Or, The Whale by Herman Melville",
+        "field": "interactionCount",
+        "value": "165457 downloads in the last 30 days.",
+        "source": "microdata",
+        "ok": true
+      },
+      {
+        "fixture": "gutenberg-moby-dick.json",
+        "slug": "gutenberg-moby-dick",
+        "kind": "absent",
+        "entity": "Moby Dick; Or, The Whale by Herman Melville",
+        "field": "publisher",
+        "value": "Project Gutenberg",
+        "source": "",
+        "why": "The page states it as content=\"Project Gutenberg\" on a <div>. The HTML microdata rules honour `content` on <meta> only, so a <div> falls back to its text -- which is empty. Spec-correct and still a loss: the publisher is stated in machine-readable form and does not reach the text.",
+        "ok": true
+      },
+      {
+        "fixture": "gutenberg-moby-dick.json",
+        "slug": "gutenberg-moby-dick",
+        "kind": "absent",
+        "entity": "Moby Dick; Or, The Whale by Herman Melville",
+        "field": "inLanguage",
+        "value": "en",
+        "source": "",
+        "why": "Same cause: <tr itemprop=\"inLanguage\" content=\"en\"> falls back to the row's text, so the value recovered is the visible label 'Language English' rather than the code 'en'. Recorded as absent because a consumer looking for a language CODE will not find one.",
+        "ok": true
+      },
+      {
+        "fixture": "gutenberg-moby-dick.json",
+        "slug": "gutenberg-moby-dick",
+        "kind": "absent",
+        "entity": "Moby Dick; Or, The Whale by Herman Melville",
+        "field": "creator",
+        "value": "Herman Melville",
+        "source": "",
+        "why": "<a itemprop=\"creator\" href=\"/ebooks/author/9\">. For <a> the microdata value is the href, so the recovered value is the relative path '/ebooks/author/9' and the author's NAME -- the link text -- is discarded. The name is in the book title on this page, so it survives by luck, not by design.",
+        "ok": true
+      },
+      {
+        "fixture": "openlibrary-lotr.json",
+        "slug": "openlibrary-lotr",
+        "kind": "present",
+        "entity": "Book",
+        "field": "ratingValue",
+        "value": "4.45",
+        "source": "microdata",
+        "ok": true
+      },
+      {
+        "fixture": "openlibrary-lotr.json",
+        "slug": "openlibrary-lotr",
+        "kind": "present",
+        "entity": "Book",
+        "field": "ratingCount",
+        "value": "118",
+        "source": "microdata",
+        "ok": true
+      },
+      {
+        "fixture": "openlibrary-lotr.json",
+        "slug": "openlibrary-lotr",
+        "kind": "present",
+        "entity": "Book",
+        "field": "name",
+        "value": "Y\u00fcz\u00fcklerin Efendisi; Y\u00fcz\u00fcklerin Efendisi; Book Details",
+        "source": "microdata",
+        "ok": true
+      },
+      {
+        "fixture": "openlibrary-lotr.json",
+        "slug": "openlibrary-lotr",
+        "kind": "present",
+        "entity": "Book",
+        "field": "isbn",
+        "value": "9753423470; 9789753423472",
+        "source": "microdata",
+        "ok": true
+      },
+      {
+        "fixture": "openlibrary-lotr.json",
+        "slug": "openlibrary-lotr",
+        "kind": "present",
+        "entity": "Book",
+        "field": "datePublished",
+        "value": "2007",
+        "source": "microdata",
+        "ok": true
+      },
+      {
+        "fixture": "openlibrary-lotr.json",
+        "slug": "openlibrary-lotr",
+        "kind": "absent",
+        "entity": "Book",
+        "field": "author",
+        "value": "J.R.R. Tolkien",
+        "source": "",
+        "why": "<a itemprop=\"author\"> yields its href, so the value is '/authors/OL26320A/J.R.R._Tolkien; /authors/OL26320A/J.R.R._Tolkien' -- a path, twice. The author's name as written is not recovered. Same root cause as the Gutenberg creator field.",
+        "ok": true
+      },
+      {
+        "fixture": "openlibrary-lotr.json",
+        "slug": "openlibrary-lotr",
+        "kind": "absent",
+        "entity": "Book",
+        "field": "publisher",
+        "value": "Metis Yay\u0131nc\u0131l\u0131k",
+        "source": "",
+        "why": "<a itemprop=\"publisher\"> yields '/publishers/Metis_Yay\u0131nc\u0131l\u0131k'. The readable publisher name is in the link text and is discarded.",
+        "ok": true
+      },
+      {
+        "fixture": "openlibrary-lotr.json",
+        "slug": "openlibrary-lotr",
+        "kind": "absent",
+        "entity": "The Lord of the Rings",
+        "field": "name",
+        "value": "The Lord of the Rings",
+        "source": "",
+        "why": "The title the URL and the page heading use is NOT inside the Book scope as an itemprop, so no record names it. A query about The Lord of the Rings that retrieves this line gets a 4.45 attached to a Turkish edition title and a bare type.",
+        "ok": true
+      },
+      {
+        "fixture": "owid-energy.json",
+        "slug": "owid-energy",
+        "kind": "present",
+        "entity": "Energy",
+        "field": "datePublished",
+        "value": "2023-12-20T15:32:00.000Z",
+        "source": "jsonld",
+        "ok": true
+      },
+      {
+        "fixture": "owid-energy.json",
+        "slug": "owid-energy",
+        "kind": "absent",
+        "entity": "Energy",
+        "field": "author",
+        "value": "Hannah Ritchie",
+        "source": "",
+        "why": "A GAP. `author` is a LIST of Person objects. The list branch only keeps SCALAR members; object members are pushed out as child records, and a Person whose only keys are `name` (the record's own name) and `url` (skipped) has no fields, so it is not emitted. One author object folds onto the parent line (see wikipedia-schema-org); three do not. The three names are in the page prose here, so nothing is lost on THIS page -- the asymmetry is the finding.",
+        "ok": true
+      },
+      {
+        "fixture": "owid-energy.json",
+        "slug": "owid-energy",
+        "kind": "absent",
+        "entity": "Energy",
+        "field": "publisher",
+        "value": "Our World in Data",
+        "source": "",
+        "why": "DEDUPE, correct: the prose names Our World in Data within the proximity window.",
+        "ok": true
+      },
+      {
+        "fixture": "wikipedia-schema-org.json",
+        "slug": "wikipedia-schema-org",
+        "kind": "present",
+        "entity": "Schema.org",
+        "field": "datePublished",
+        "value": "2011-06-02T19:00:51Z",
+        "source": "jsonld",
+        "ok": true
+      },
+      {
+        "fixture": "wikipedia-schema-org.json",
+        "slug": "wikipedia-schema-org",
+        "kind": "present",
+        "entity": "Schema.org",
+        "field": "dateModified",
+        "value": "2026-06-11T15:37:39Z",
+        "source": "jsonld",
+        "ok": true
+      },
+      {
+        "fixture": "wikipedia-schema-org.json",
+        "slug": "wikipedia-schema-org",
+        "kind": "present",
+        "entity": "Schema.org",
+        "field": "author",
+        "value": "Contributors to Wikimedia projects",
+        "source": "jsonld",
+        "ok": true
+      },
+      {
+        "fixture": "wikipedia-schema-org.json",
+        "slug": "wikipedia-schema-org",
+        "kind": "absent",
+        "entity": "Schema.org",
+        "field": "publisher",
+        "value": "Wikimedia Foundation, Inc.",
+        "source": "",
+        "why": "A GAP, not a dedupe -- the string appears nowhere in the extracted text. `publisher` here is an Organization that also carries a nested `logo` object. The folding rule requires the nested object to have no nested values of its own, so a publisher WITH a logo is pushed out to a child record; that child's only remaining key is its name, which is the record's name, so it has no fields and an unnamed-depth record with no fields is not emitted. Compare ourworldindata.org/energy, whose publisher carries `logo` as a plain STRING and therefore does fold onto the line. Same schema, opposite outcome, decided by the type of a field this module skips.",
+        "ok": true
+      },
+      {
+        "fixture": "wikipedia-schema-org.json",
+        "slug": "wikipedia-schema-org",
+        "kind": "absent",
+        "entity": "Schema.org",
+        "field": "sameAs",
+        "value": "http://www.wikidata.org/entity/Q3475322",
+        "source": "",
+        "why": "`sameAs` is on the skip list. `mainEntity` -- the SAME URL under a different key -- is not, so the identifier does reach the line once. Deliberate to record: the skip list is key-based, so an identifier's survival depends on which key a publisher chose for it.",
+        "ok": true
+      },
+      {
+        "fixture": "zenodo-pandas.json",
+        "slug": "zenodo-pandas",
+        "kind": "present",
+        "entity": "pandas-dev/pandas: Pandas",
+        "field": "contentSize",
+        "value": "5.26 MB",
+        "source": "jsonld",
+        "ok": true
+      },
+      {
+        "fixture": "zenodo-pandas.json",
+        "slug": "zenodo-pandas",
+        "kind": "present",
+        "entity": "pandas-dev/pandas: Pandas",
+        "field": "datePublished",
+        "value": "2026-07-22",
+        "source": "jsonld",
+        "ok": true
+      },
+      {
+        "fixture": "zenodo-pandas.json",
+        "slug": "zenodo-pandas",
+        "kind": "present",
+        "entity": "pandas-dev/pandas: Pandas",
+        "field": "dateCreated",
+        "value": "2026-07-22T21:47:21.346630+00:00",
+        "source": "jsonld",
+        "ok": true
+      },
+      {
+        "fixture": "zenodo-pandas.json",
+        "slug": "zenodo-pandas",
+        "kind": "present",
+        "entity": "pandas-dev/pandas: Pandas",
+        "field": "publisher",
+        "value": "Zenodo",
+        "source": "jsonld",
+        "ok": true
+      },
+      {
+        "fixture": "zenodo-pandas.json",
+        "slug": "zenodo-pandas",
+        "kind": "present",
+        "entity": "The pandas development team",
+        "field": "familyName",
+        "value": "The pandas development team",
+        "source": "jsonld",
+        "ok": true
+      },
+      {
+        "fixture": "zenodo-pandas.json",
+        "slug": "zenodo-pandas",
+        "kind": "absent",
+        "entity": "pandas-dev/pandas: Pandas",
+        "field": "version",
+        "value": "v3.0.5",
+        "source": "",
+        "why": "DEDUPE: the rendered page prints v3.0.5 beside the title.",
+        "ok": true
+      },
+      {
+        "fixture": "zenodo-pandas.json",
+        "slug": "zenodo-pandas",
+        "kind": "absent",
+        "entity": "pandas-dev/pandas: Pandas",
+        "field": "url",
+        "value": "https://zenodo.org/records/21500199",
+        "source": "",
+        "why": "`^url$` is on the skip list by design. Worth recording because this URL is NOT the URL that was fetched -- the record points at a later version of the deposit -- so the skip also suppresses a real inconsistency between the record and the page it sits on.",
+        "ok": true
+      }
+    ]
+  }
+}

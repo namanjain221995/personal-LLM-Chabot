@@ -1,0 +1,60 @@
+{
+ "mode": "current",
+ "transport": "http",
+ "rows": [
+  {
+   "label": "followup c=1",
+   "samples": 24,
+   "ok": 24,
+   "errors": 0,
+   "stream_buffered": false,
+   "first_token_ms_p50": 707.8,
+   "first_token_ms_p95": 972.6,
+   "total_ms_p50": 1960.7,
+   "total_ms_p95": 4836.6,
+   "tokens_p50": 42.5,
+   "graded": 24,
+   "quality_pass": 24,
+   "quality_failures": [],
+   "events": {
+    "token": 1420,
+    "meta": 24,
+    "done": 24
+   },
+   "error_kinds": [],
+   "scenario": "followup",
+   "concurrency": 1,
+   "conversations": 12,
+   "web_search": "off",
+   "server_cpu_s": 2.34,
+   "server_cpu_ms_per_turn": 97.5
+  },
+  {
+   "label": "followup c=8",
+   "samples": 24,
+   "ok": 24,
+   "errors": 0,
+   "stream_buffered": false,
+   "first_token_ms_p50": 1351.0,
+   "first_token_ms_p95": 1832.2,
+   "total_ms_p50": 4192.2,
+   "total_ms_p95": 9374.7,
+   "tokens_p50": 56.0,
+   "graded": 24,
+   "quality_pass": 24,
+   "quality_failures": [],
+   "events": {
+    "token": 1559,
+    "meta": 24,
+    "done": 24
+   },
+   "error_kinds": [],
+   "scenario": "followup",
+   "concurrency": 8,
+   "conversations": 12,
+   "web_search": "off",
+   "server_cpu_s": 2.13,
+   "server_cpu_ms_per_turn": 88.8
+  }
+ ]
+}

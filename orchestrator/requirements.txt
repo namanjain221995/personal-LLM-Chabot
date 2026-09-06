@@ -19,6 +19,13 @@ duckdb>=1.0
 lancedb==0.37.1
 pandas>=2.2
 pyarrow==25.0.1
+# Declared explicitly because app/recall.py's batched cosine uses it directly.
+# It was already present, but only as a transitive dependency of pyarrow and
+# pandas — so an upgrade that dropped it would have silently moved semantic
+# recall onto its pure-python fallback (measured ~20x slower, on the event
+# loop) with nothing failing to say so. A floor, not a pin: pyarrow's own
+# requirement is the binding constraint and must stay free to resolve.
+numpy>=1.26
 openpyxl>=3.1
 matplotlib>=3.8
 pydantic>=2.7

@@ -75,6 +75,17 @@ async def lifespan(_app: FastAPI):
     from .authn.store import prune_expired_sessions
 
     await db.run_in_thread(prune_expired_sessions)
+    # A research run keeps its plan and claims in process memory only, so a
+    # restart kills it — but nothing used to say so, and the row sat at
+    # 'running' forever, inflating the research analytics and hiding the
+    # death. web_crawls has had this reconciliation since V14; research_runs
+    # did not. Closed rather than requeued: there is no on-disk state to
+    # resume from (see db.close_interrupted_research_runs).
+    interrupted = await db.run_in_thread(db.close_interrupted_research_runs)
+    if interrupted:
+        logging.getLogger(__name__).info(
+            "closed %d research run(s) interrupted by a restart", interrupted
+        )
     # The living knowledge layer's keeper: drains the embedding backlog and
     # re-reads pages past their TTL. In-process on purpose (see web_worker) —
     # the queue is a PostgreSQL column, so a restart resumes rather than
@@ -91,6 +102,15 @@ async def lifespan(_app: FastAPI):
 
 
 import re as _re
+
+#: Citation markers in a streamed answer — `[1]`, `[12]`. Used only to mark
+#: which of the sources already in `meta.sources` the answer leant on; it never
+#: invents a source, so a stray number simply matches nothing.
+_CITE_MARKER_RE = _re.compile(r"\[(\d{1,3})\]")
+#: Cap on the per-request answer buffer (pieces, not bytes). A normal answer is
+#: a few hundred token frames; this only has to survive long enough to find the
+#: markers, and must not grow without bound on a runaway generation.
+_MAX_STREAM_PIECES = 20000
 
 #: Client-supplied conversation ids (same rule as POST /history/conversations).
 _CONVERSATION_ID_RE = _re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -682,6 +702,14 @@ async def health() -> dict:
         # believes are set. `status` is untouched — a window mismatch is a
         # configuration fact to surface, not a dependency outage.
         "context": report.get("context", {}),
+        # Additive (2026-09-06): the public-web vector index — rows, distinct
+        # pages, embedding model, chunker version and BOTH indexing backlogs.
+        # `check_dependencies` has always computed this and `/health` dropped
+        # it on the floor, so `health._check_web_index`'s promise that "a
+        # chunker bump is visible here first" was never true from outside the
+        # process. `status` is untouched: a stale index is a degraded answer,
+        # not an outage, and the container healthcheck gates on `status`.
+        "web_index": report.get("web_index", {}),
     }
 
 
@@ -941,6 +969,10 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
     # Salesforce Intelligence Mode extras (assumptions, resolved scope, the
     # final phase) merged into whichever engine's meta ends up being emitted.
     salesforce_state: dict = {}
+    #: The answer as it is streamed, so `meta.sources` can mark which sources
+    #: were actually cited. Capped because a runaway generation must not grow
+    #: an unbounded list in the request's memory.
+    streamed_text: List[str] = []
     # Living-knowledge extras: the sources a locally-grounded answer used, so
     # the Sources panel can show provenance for an answer that never searched.
     knowledge_state: dict = {}
@@ -950,6 +982,12 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
     _timing: dict = {"started": _perf_counter(), "first_token": None}
 
     async def emit(event: str, data: dict) -> None:
+        if event == "token":
+            # Kept so the meta below can say which sources the answer cited.
+            # Bounded: only the markers matter, and a marker is a few bytes.
+            piece = data.get("text")
+            if isinstance(piece, str) and len(streamed_text) < _MAX_STREAM_PIECES:
+                streamed_text.append(piece)
         if event == "meta":
             data = {
                 **data,
@@ -991,7 +1029,19 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             # engine uses — one contract for the UI, whether the pages were
             # read a second ago or a week ago.
             if knowledge_state.get("sources") and not data.get("sources"):
-                data["sources"] = knowledge_state["sources"]
+                # Mark which of them the answer actually leant on. The search
+                # path has done this since S5; the knowledge path emitted every
+                # retrieved source looking equally used, so a page that merely
+                # matched the query was presented exactly like the one the
+                # answer quoted. Parsed from the text that was really streamed,
+                # not from the model's intent.
+                cited_numbers = {
+                    int(m) for m in _CITE_MARKER_RE.findall("".join(streamed_text))
+                }
+                data["sources"] = [
+                    {**row, "cited": int(row.get("n") or 0) in cited_numbers}
+                    for row in knowledge_state["sources"]
+                ]
                 data["knowledge"] = {
                     "freshness": knowledge_state.get("freshness", ""),
                     "from_local_memory": knowledge_state.get("from_local_memory", True),
@@ -1194,6 +1244,10 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                         emit=_note_lookup,
                         user_id=viewer,
                         conversation_id=conv_key_outer,
+                        # A terse follow-up has no subject of its own; without
+                        # the turns it retrieves nothing and the answer is
+                        # ungrounded (living_knowledge.resolve_from_history).
+                        history=history,
                     )
                 )
 
@@ -1915,6 +1969,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                         emit=emit,
                         user_id=viewer,
                         conversation_id=conv_key,
+                        history=history,
                     )
                 if prepared.decision:
                     knowledge_state["decision"] = prepared.decision
@@ -2099,6 +2154,7 @@ async def _prepare_knowledge(
     emit=None,
     user_id: Optional[int] = None,
     conversation_id: str = "",
+    history=(),
 ):
     """Freshness-aware grounding for one assistant turn, or an empty result.
 
@@ -2121,6 +2177,7 @@ async def _prepare_knowledge(
             emit=emit,
             user_id=user_id,
             conversation_id=conversation_id,
+            history=history,
         )
     except asyncio.CancelledError:
         raise

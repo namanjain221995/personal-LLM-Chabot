@@ -24,7 +24,7 @@ from typing import List
 
 import pytest
 
-from app import db, health, llm
+from app import db, health, llm, web_index
 from app.config import settings
 from app.embedding_index import metadata_path
 from tools import knowledge_admin, reindex_web
@@ -147,7 +147,8 @@ def test_quarantine_by_domain_covers_subdomains_and_needs_a_selector(capsys):
     c = _page("https://notexample.com/c", MEDIUM)
 
     rc, _, err = _run(knowledge_admin.main, ["quarantine", "--yes"], capsys)
-    assert rc == 2 and "--id, --domain, --introducer" in err
+    # K7 (2026-09-06): the selector gained --url, so the refusal now names it.
+    assert rc == 2 and "--id, --url, --domain, --introducer" in err
 
     rc, out, _ = _run(knowledge_admin.main, ["quarantine", "--domain", "example.com", "--yes"], capsys)
     assert "quarantined 2 page(s)" in out
@@ -192,7 +193,12 @@ def test_purge_refuses_without_yes_and_deletes_only_the_introducers_pages(capsys
     rc, out, _ = _run(knowledge_admin.main, ["purge", "--introducer", "7", "--origin", "share", "--yes"], capsys)
     assert rc == 0
     assert "deleted web_pages=1 web_claims=1 web_page_versions=1" in out
-    assert "still have chunk rows" in out
+    # K7 (2026-09-06): this asserted "still have chunk rows" — the note a purge
+    # printed when it left the page's vectors behind, which was the DEFAULT.
+    # Dropping them is the default now, so a purge reports the vector delete it
+    # ran. Nothing is indexed in this test, hence 0 removed / 0 remaining.
+    assert "web index: removed 0 chunk row(s); 0 remain" in out
+    assert "still have chunk rows" not in out
     assert _pages_row(shared) is None
     assert _pages_row(found) is not None and _pages_row(other) is not None
     # The orphan-claim trap: the FK is SET NULL, so the explicit delete matters.
@@ -250,7 +256,14 @@ def test_build_writes_a_validated_index_with_the_live_sidecar_shape(fake_embed, 
         sidecar = json.load(fh)
     assert sidecar["table"] == "web_chunks" and sidecar["dimension"] == 4
     assert sidecar["model_id"] == settings.embed_model
-    assert sidecar["chunker_version"] == 1 and sidecar["schema_version"] == 1
+    # The CONSTANT, not a literal. This assertion is "the sidecar records
+    # whichever chunker built this directory", and it was written as `== 1`,
+    # so the first chunker bump (v2, 2026-09-06: a table's header row repeated
+    # into every chunk holding its data) turned a live invariant into a chore.
+    # A fresh build writes the sidecar from scratch, so there is no
+    # compatibility question here — only an out-of-date expectation.
+    assert sidecar["chunker_version"] == web_index.CHUNKER_VERSION
+    assert sidecar["schema_version"] == 1
 
 
 def test_build_embeds_in_batches_of_64(fake_embed, live_dir, tmp_path):
@@ -298,7 +311,12 @@ def test_main_prints_the_swap_and_the_rollback(fake_embed, live_dir, tmp_path, c
     assert "validated: distinct page_id == indexable pages" in out
     assert f"LANCEDB_WEB_DIR={out_dir}" in out
     assert f"set LANCEDB_WEB_DIR={live_dir} in .env" in out  # rollback
-    assert "reset-watermark --since" in out
+    # The post-swap step. It used to be a raw `reset-watermark --since <stamp>`
+    # the operator had to copy; `adopt` reads the same instant out of the
+    # manifest the build wrote, AND records the chunker, without which the
+    # worker re-chunks the whole corpus into byte-identical vectors.
+    assert "reindex_web adopt --yes" in out
+    assert f"chunk_version={reindex_web.web_index.CHUNKER_VERSION}" in out
 
     # A --limit build is a smoke test and must never offer the swap.
     rc, out, _ = _run(reindex_web.main, ["build", "--out", str(tmp_path / "smoke"), "--limit", "1", "--progress-every", "0"], capsys)
@@ -367,8 +385,51 @@ def test_check_web_index_reports_rows_distinct_pages_and_backlog(fake_embed, liv
     assert status["status"] == "ok"
     assert status["rows"] == 3 and status["distinct_pages"] == 2
     assert status["model_id"] == settings.embed_model and status["dimension"] == 4
-    assert status["chunker_version"] == 1
+    assert status["chunker_version"] == web_index.CHUNKER_VERSION
     assert status["pending_pages"] == 3  # nothing has been marked indexed in the test store
+
+
+def test_health_chunker_version_follows_a_bump_on_an_index_that_already_exists(
+    fake_embed, live_dir, tmp_path, monkeypatch
+):
+    """The failure the `== 1` literal in the test above was standing on.
+
+    That assertion is not about a number, it is about the promise in
+    health.py:268 — "a chunker bump is visible here first". `_write_sidecar`
+    returns early when the file exists (correct: model_id and dimension must
+    never move under a live table), and `chunker_version` was written by the
+    same one-shot. So on every deployment that ALREADY has an index — which is
+    production — a bump left the sidecar and /health frozen at the old number
+    for ever while the table filled with new-shaped chunks. Updating the
+    literal alone would have shipped that.
+
+    The repair is incremental, so the sidecar must not claim the new chunker
+    while chunker-1 chunks are still in the table: mid-repair, the OLD number
+    is the honest one. `maintain()` advances it exactly when the queue
+    `index_pending` drains is empty.
+    """
+    monkeypatch.setattr(web_index, "CHUNKER_VERSION", 1)
+    first = _page("https://example.com/one", MEDIUM)
+    assert asyncio.run(web_index.index_pending(limit=10)) == 1
+    assert health._check_web_index()["chunker_version"] == 1
+
+    # The bump lands. The directory, its table and its sidecar all survive it.
+    monkeypatch.setattr(web_index, "CHUNKER_VERSION", 2)
+    second = _page("https://example.com/two", MEDIUM)
+    assert asyncio.run(web_index.index_pending(limit=1)) == 1  # the NEW page first
+
+    # `first` still holds chunker-1 chunks, so the sidecar must still say 1.
+    assert db.count_stale_chunk_pages(2) == 1
+    asyncio.run(web_index.maintain())
+    assert health._check_web_index()["chunker_version"] == 1
+
+    # Repair the last page: now, and only now, the index is entirely chunker 2.
+    assert asyncio.run(web_index.index_pending(limit=10)) == 1
+    assert db.count_stale_chunk_pages(2) == 0
+    upkeep = asyncio.run(web_index.maintain())
+    assert upkeep["sidecar_advanced"] is True
+    assert health._check_web_index()["chunker_version"] == 2
+    assert first != second
 
 
 def test_check_web_index_degrades_on_model_mismatch_instead_of_failing(fake_embed, live_dir, tmp_path, monkeypatch):

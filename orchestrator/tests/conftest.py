@@ -56,6 +56,11 @@ _APP_TABLES = (
     # V8 web-search memory: web_results cascades from web_searches, but the
     # explicit order keeps TRUNCATE happy either way; web_pages is global.
     "web_crawls",
+    # V25's frontier hangs off web_crawls by a nullable FK, so CASCADE already
+    # reaches it — but a NULL crawl_id row (a foreground resume keeps the
+    # frontier keyed on scope_prefix, not on the run) would survive every other
+    # truncation, which is exactly the reason research_runs is listed above.
+    "web_crawl_frontier",
     "web_results",
     "web_searches",
     # V14: claims and page versions hang off web_pages (cascade / set null),
@@ -242,6 +247,19 @@ def isolated_app_db(app_database, tmp_path, monkeypatch):
     monkeypatch.setattr(
         settings, "session_secret_file", str(tmp_path / "appdb" / ".session_secret")
     )
+    # The vector stores are isolated per test for the same reason the database
+    # is. They default to /data/lancedb and /data/lancedb-web, which are SHARED:
+    # two pytest sessions running at once wrote the same Lance directory and
+    # produced roughly thirty failures whose set differed on every run and which
+    # all passed in isolation (observed 2026-09-06). That reads as flakiness in
+    # the code under test, which is the most expensive kind of false alarm.
+    # /data/lancedb is also the Salesforce corpus in a real deployment, so a
+    # test writing the default path is writing production's neighbour.
+    # Tests that manage their own directory (test_knowledge_admin) simply
+    # overwrite these, and get a clean starting value instead of whatever the
+    # previous test left on `settings`.
+    monkeypatch.setattr(settings, "lancedb_dir", str(tmp_path / "lancedb"))
+    monkeypatch.setattr(settings, "lancedb_web_dir", str(tmp_path / "lancedb-web"))
     with db.connection() as con:
         con.execute(
             f"TRUNCATE TABLE {', '.join(_APP_TABLES)} RESTART IDENTITY CASCADE"

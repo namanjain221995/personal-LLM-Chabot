@@ -410,7 +410,15 @@ def test_drain_index_bails_when_nothing_progresses(monkeypatch):
     async def fake_run_in_thread(func, *args):
         return 5  # always five pages left
 
-    async def fake_index_pending(limit=20):
+    # The stub mirrors the real signature, and records the flag: this loop
+    # runs inside a user's request, so it must NOT pull the V24 re-chunk
+    # backlog in with it (its own progress check counts unindexed pages only,
+    # so repair work would look like no progress AND cost the user seconds of
+    # embedding they did not ask for).
+    calls: list = []
+
+    async def fake_index_pending(limit=20, page_ids=None, repair_stale_chunks=True):
+        calls.append(repair_stale_chunks)
         return 0
 
     monkeypatch.setattr(crawl.db, "run_in_thread", fake_run_in_thread)
@@ -419,6 +427,9 @@ def test_drain_index_bails_when_nothing_progresses(monkeypatch):
     assert chunks == 0
     assert any("background" in e for e in events)
     assert len(events) <= 4  # two stalled rounds, not four hundred
+    assert calls and not any(calls), (
+        "a user-facing crawl must not drain the stale-chunk repair queue"
+    )
 
 
 def test_cancelled_crawl_is_not_left_running(monkeypatch):

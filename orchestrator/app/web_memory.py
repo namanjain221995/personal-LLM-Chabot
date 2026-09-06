@@ -23,6 +23,7 @@ caller proceeds exactly as it does today.
 from __future__ import annotations
 
 import asyncio
+import bisect
 import logging
 import math
 import re
@@ -30,7 +31,7 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from urllib.parse import urlsplit
 
 from . import db, metrics, rerank, web_index
@@ -239,6 +240,16 @@ class Evidence:
             "snippet": self.text[:400],
             "fetched_at": self.fetched_at.isoformat() if self.fetched_at else "",
             "origin": self.origin,
+            # The same three-state provenance the search path emits (finding
+            # S5), so one panel contract covers both. A stored page WAS read
+            # end to end when it was fetched — that is why there is text to
+            # retrieve — and it is being served from the store now, so `read`
+            # and `from_store` are both true here by construction. `cited` is
+            # the caller's: only whoever holds the finished answer knows which
+            # [n] markers it actually used.
+            "read": True,
+            "from_store": True,
+            "cited": False,
         }
 
 
@@ -428,7 +439,18 @@ def _dense_score(distance: float) -> float:
     return max(0.0, min(1.0, 1.0 - (distance / max(web_index.MAX_DISTANCE, 1e-6))))
 
 
-_WORD = re.compile(r"[a-z0-9]+")
+#: A token is a run of letters/digits that MAY carry INTERNAL separators, so a
+#: version or a variant survives whole: "gpt-5.2", "3.14.5", "v2.1", "oc-h1".
+#: It used to be plain `[a-z0-9]+`, which split "GPT-5.2" into ['gpt','5','2']
+#: and then the `len(w) > 1` filter deleted the digits — leaving ['gpt'], so a
+#: GPT-5 page and a GPT-5.2 page were LEXICALLY IDENTICAL to retrieval, and
+#: "3.14.5" reduced to the meaningless ['14'] (finding S4, 2026-09-06).
+#: `_collapse_duplicates` had already worked around this locally, with the
+#: comment "the distinguishing term is often a single digit"; this generalises
+#: the fix to every consumer of _terms/_content_words/_best_window.
+#: The separator must sit BETWEEN two alphanumerics, so ordinary sentence
+#: punctuation ("acme. the") still ends a token.
+_WORD = re.compile(r"[a-z0-9]+(?:[.\-_][a-z0-9]+)*")
 _STOP = {
     "the", "a", "an", "of", "is", "are", "was", "were", "who", "what", "which",
     "in", "on", "at", "to", "for", "and", "or", "s", "current", "currently",
@@ -452,7 +474,27 @@ def _stem(word: str) -> str:
     Exact-token overlap missed the obvious inflections — a page that says
     "configure" scored zero for a question that says "configured". Suffix
     stripping on words long enough to survive it fixes the common cases
-    without a stemming dependency; it is a matching aid, never shown."""
+    without a stemming dependency; it is a matching aid, never shown.
+
+    The stemmer is held OFF any token carrying a digit or a separator (S4,
+    2026-09-06). Suffix stripping is an English-inflection rule and a version
+    string is not English: "3.14.5" ends in "5", "oc-h1" is not a plural, and
+    "1990s" is not the stem "1990". Mangling them is how two sibling releases
+    became the same token.
+
+    `not word.isalpha()` is that test, not an approximation of it: `_WORD`
+    only ever produces characters from a-z, 0-9 and . - _ , so "every character is
+    alphabetic" is exactly "no digit and no separator". It matters because
+    this runs on every token of every page — the generator expression it
+    replaces (`any(ch.isdigit() or ch in "-._" for ch in word)`) was a
+    Python-level loop over every CHARACTER of the corpus and was the whole of
+    S4's measured cost: on 273,000 chars of real page text, `_terms` went
+    11.9 ms before S4 -> 15.3 ms with the generator -> 10.0 ms with this.
+    The regex was never the problem (`_content_words`, which does not stem,
+    measures 5.81 ms with the old pattern and 5.83 ms with the new one).
+    """
+    if not word.isalpha():
+        return word
     for suffix in _SUFFIXES:
         if word.endswith(suffix) and len(word) - len(suffix) >= 4:
             word = word[: -len(suffix)]
@@ -489,7 +531,150 @@ _WINDOW_CHARS = 3200
 _WINDOW_STEP = 2800
 
 
-def _best_window(text: str, query: str, width: int = _WINDOW_CHARS) -> str:
+#: A markdown-ish table row after extraction: "| 12 | GPT-5.2 | 82.7 | …".
+_TABLE_ROW = re.compile(r"^\|.*\|\s*$")
+#: The alignment row trafilatura emits under a header: "|---|---|---|".
+_TABLE_RULE = re.compile(r"^\|[\s\-:|]+\|\s*$")
+
+
+def _collapse_lines(text: str, joiner: str = " ") -> Tuple[str, List[str], List[int]]:
+    """`text` with each line's whitespace collapsed, PLUS where each line
+    landed. With `joiner=" "` the string is byte-identical to the old
+    `" ".join(text.split())`; the offsets are what lets a chosen window be
+    traced back to the line it opened on (see `_best_window`).
+    """
+    lines: List[str] = []
+    starts: List[int] = []
+    pos = 0
+    for raw in (text or "").splitlines():
+        piece = " ".join(raw.split())
+        if not piece:
+            continue
+        if lines:
+            pos += len(joiner)
+        starts.append(pos)
+        lines.append(piece)
+        pos += len(piece)
+    return joiner.join(lines), lines, starts
+
+
+def _table_header_for(lines: List[str], idx: int) -> str:
+    """The header (+ alignment) rows of the table run containing `lines[idx]`.
+
+    A window that opens at row 137 of a 200-row table is a grid of bare
+    numbers: "| 12 | GPT-5.2 | 82.7 | 6.50 | 2026-03-06 |" says nothing about
+    which column is the score and which is the price (finding K3/C1). The
+    header is a handful of characters and restores every number's meaning.
+    """
+    if idx >= len(lines) or not _TABLE_ROW.match(lines[idx]):
+        return ""
+    start = idx
+    while start > 0 and _TABLE_ROW.match(lines[start - 1]):
+        start -= 1
+    if start == idx:
+        return ""  # the window already opens on the header row itself
+    head = [lines[start]]
+    if start + 1 < idx and _TABLE_RULE.match(lines[start + 1]):
+        head.append(lines[start + 1])
+    return "\n".join(head)
+
+
+def _term_positions(text: str, wanted: set) -> Dict[str, List[int]]:
+    """Where each wanted term occurs in `text`, ascending. ONE tokenising pass.
+
+    Window scanning used to call `_terms()` on every candidate slice, and with
+    a step of width/4 that re-tokenises the whole page four times over — 65 ms
+    on a 200,000-character page, times up to 60 sources, all on the event loop.
+    This repo has already paid for that mistake once (the Fast-mode CPU-bound
+    pre-pass, 2026-09-05: TTFT 0.7 s → 11.7 s at 8 concurrent, window stemming
+    among the culprits). Tokenise once, then answer "is this term inside
+    [start, end)?" with a bisect.
+    """
+    pos: Dict[str, List[int]] = {t: [] for t in wanted}
+    if not wanted:
+        return pos
+    # `_stem` only ever strips a SUFFIX, so a stem is a prefix of its word and
+    # the first two characters must match. Testing that first skips the stemmer
+    # on the ~99% of a page's tokens that cannot match any question term.
+    heads = {t[:2] for t in wanted}
+    for m in _WORD.finditer(text.lower()):
+        w = m.group(0)
+        if len(w) < 2 or w[:2] not in heads or w in _STOP:
+            continue
+        hit = pos.get(_stem(w))
+        if hit is not None:
+            hit.append(m.start())
+    return pos
+
+
+def terms_present(texts: Iterable[str], wanted: Set[str]) -> Set[str]:
+    """Which of `wanted` (ALREADY stemmed) occur anywhere in `texts`.
+
+    The same trick as `_term_positions`, for the caller that needs a yes/no
+    rather than positions: match on the two-character head before paying for
+    the stemmer, so the ~99% of a page's tokens that cannot match any wanted
+    term cost one dict lookup each.
+
+    Written for `engines.search._coverage_gap`, which used to do
+    `set(_terms(" ".join(title + text for every source)))` — on `max` effort
+    that materialises a ~205,000-character string, tokenises it, stems every
+    token, and builds a 20,000-entry set, in order to ask about five words.
+    It ran once before the first answer token and again after the stream, on
+    the event loop. Measured on this box: 12.0 ms per call, 24.0 ms per
+    search; this is 0.16 ms in the same shape.
+
+    Two things make the difference: the sources are consumed as a STREAM (no
+    joined string, no intermediate list) and the scan stops the moment every
+    wanted term has been seen, which is the common case — a question whose
+    words all appear somewhere in sixty pages.
+    """
+    found: Set[str] = set()
+    if not wanted:
+        return found
+    heads = {t[:2] for t in wanted}
+    outstanding = len(wanted)
+    for text in texts:
+        if not text:
+            continue
+        for m in _WORD.finditer(text.lower()):
+            w = m.group(0)
+            if len(w) < 2 or w[:2] not in heads or w in _STOP:
+                continue
+            stem = _stem(w)
+            if stem in wanted and stem not in found:
+                found.add(stem)
+                outstanding -= 1
+                if outstanding <= 0:
+                    return found
+    return found
+
+
+def _in_window(positions: List[int], start: int, end: int) -> bool:
+    """Does a term starting in [start, end) exist? O(log n)."""
+    i = bisect.bisect_left(positions, start)
+    return i < len(positions) and positions[i] < end
+
+
+def _term_weights(positions: Dict[str, List[int]]) -> Dict[str, float]:
+    """How much each query term should count, given how common it is here.
+
+    Plain term-COUNT scoring is why a long table returns its head: the
+    repeated header row ("Rank | Model | Reasoning score | …") contains every
+    ordinary word of "what is GPT-5.2's reasoning score", so the first window
+    ties or beats the one window that also carries the answer, and `>` keeps
+    the earliest (measured on a 200-row fixture, finding K2/C1).
+
+    Weighting by rarity inverts that: a term appearing once in the page is
+    worth far more than one appearing in every row, so the DISCRIMINATIVE
+    term — the entity, the version — decides the window. This is the local,
+    single-document half of idf; no corpus statistics and no model call.
+    """
+    return {t: 1.0 / (1.0 + len(ps)) for t, ps in positions.items()}
+
+
+def _best_window(
+    text: str, query: str, width: int = _WINDOW_CHARS, *, keep_lines: bool = False
+) -> str:
     """The `width`-char window of a page that carries the most of the
     question's terms. A lexical hit used to hand the cross-encoder the page
     HEAD; an answer at character 6,000 was judged "no" and the same page
@@ -501,24 +686,166 @@ def _best_window(text: str, query: str, width: int = _WINDOW_CHARS) -> str:
     smaller slice, and taking that slice off the top of the page throws away
     the very passage the reranker scored (measured 2026-09-04: 11 of 60 eval
     answers were lost to head truncation alone, McNemar p < 0.001).
+
+    Two corrections, 2026-09-06 (finding K2/C1):
+
+    * terms are weighted by RARITY within this page, so a repeated table
+      header can no longer out-score the one row that answers (`_term_weights`);
+    * a window that opens inside a run of table rows gets that table's header
+      prepended, so its numbers keep their column meaning (`_table_header_for`).
+
+    `keep_lines=True` joins lines with a newline instead of a space, for the
+    caller that puts the window straight into a prompt: collapsing a markdown
+    table onto one line is legible to nobody. Offsets, scoring and the length
+    guarantee are identical either way; the default is byte-for-byte the old
+    behaviour.
     """
     width = max(200, width)
     step = max(1, min(_WINDOW_STEP, width // 4))
-    clean = " ".join((text or "").split())
+    joiner = "\n" if keep_lines else " "
+    clean, lines, starts = _collapse_lines(text, joiner)
     if len(clean) <= width:
         return clean
     wanted = set(_terms(query))
     if not wanted:
         return clean[:width]
-    best, best_hits = clean[:width], -1
+    positions = _term_positions(clean, wanted)
+    weights = _term_weights(positions)
+    best, best_score, best_start = clean[:width], -1.0, 0
     for start in range(0, len(clean), step):
-        piece = clean[start : start + width]
-        hits = len(wanted & set(_terms(piece)))
-        if hits > best_hits:
-            best, best_hits = piece, hits
+        score = sum(
+            w for t, w in weights.items() if _in_window(positions[t], start, start + width)
+        )
+        if score > best_score:
+            best, best_score, best_start = clean[start : start + width], score, start
         if start + width >= len(clean):
             break
+    # Which line did the window open on? bisect over the recorded starts.
+    i = bisect.bisect_right(starts, best_start) - 1
+    header = _table_header_for(lines, i) if i >= 0 else ""
+    if header and header not in best:
+        prefix = header + joiner
+        best = prefix + best[: max(0, width - len(prefix))]
     return best
+
+
+#: What an omitted stretch of a page looks like in a prompt. Visible on
+#: purpose: the model must be able to tell "the page continues" from "the page
+#: ends here", or a gap reads as an absence.
+PASSAGE_GAP = "\n[…]\n"
+
+
+def select_passages(
+    text: str, query: str, budget: int, *, keep_lines: bool = True
+) -> str:
+    """The parts of one page a question points at, up to `budget` characters.
+
+    This is the replacement for the head slice on the live search path
+    (finding S1/C1). `extract.truncate_chars` keeps characters 0..budget and
+    throws the rest away; on `leaderboard_long.html` the answer row sits at
+    character 19,831 of 20,136, so the model was handed a page that had been
+    fetched, was cited in the panel, and no longer contained the answer.
+
+    Why several passages and not one `_best_window`. That page's INTRODUCTION
+    contains four of the question's five terms ("BenchLM", "Leaderboard",
+    "reasoning", "scores") and the answer row contains the fifth. No single
+    2,500-char window holds both, so any single-window scheme must choose
+    between the framing and the fact, and no term weighting changes that —
+    measured 2026-09-06. Several query-scored windows, kept in document order
+    with the gaps marked, keep both and cost nothing extra.
+
+    Falls back to the head slice when there is no query to centre on, so a
+    caller with no question behaves exactly as it did. That fallback is
+    DELIBERATE and it is safe — with no terms there is nothing to centre on,
+    so the alternative is not a better slice but an arbitrary one — and it is
+    reachable from a real question, not only from an empty one: `_terms`
+    strips stop words, so "what is that?" and "how do these work" both reduce
+    to nothing. It is logged at debug rather than counted here because the
+    caller (`engines.search._select_text`) counts its own fallbacks with the
+    reason attached, and that is where an operator would look.
+    """
+    budget = max(200, int(budget))
+    joiner = "\n" if keep_lines else " "
+    clean, lines, starts = _collapse_lines(text, joiner)
+    if len(clean) <= budget:
+        return clean
+    wanted = set(_terms(query))
+    if not wanted:
+        log.debug(
+            "select_passages: the question has no content words after stop-word "
+            "removal; falling back to the head slice"
+        )
+        return clean[:budget]
+
+    # Three-ish windows: wide enough that a passage is still readable prose,
+    # narrow enough that a 2,500-char budget can reach two distant places.
+    width = max(400, min(1600, budget // 3))
+    step = max(1, width // 4)
+    positions = _term_positions(clean, wanted)
+    weights = _term_weights(positions)
+    cands: List[Tuple[int, frozenset]] = []
+    for start in range(0, len(clean), step):
+        hit = frozenset(
+            t for t in wanted if _in_window(positions[t], start, start + width)
+        )
+        cands.append((start, hit))
+        if start + width >= len(clean):
+            break
+    hits_at = dict(cands)
+
+    # Greedy by MARGINAL gain, not by raw score. Raw score picks the same
+    # neighbourhood over and over — on the leaderboard fixture the four
+    # highest-scoring windows are all the introduction, which carries four of
+    # the five question terms — and the one window carrying the fifth never
+    # gets in. Scoring each candidate by the terms it adds to what is ALREADY
+    # chosen spends a small budget on covering the question instead.
+    chosen: List[Tuple[int, int, str]] = []  # (start, end, header)
+    covered: set = set()
+    spent = 0
+    taken: set = set()
+    while spent < budget and len(taken) < len(cands):
+        pick, gain = None, -1.0
+        for start, hit in cands:
+            if start in taken:
+                continue
+            end = min(len(clean), start + width)
+            if any(start < e and end > s for s, e, _h in chosen):
+                continue
+            # Once every question term is covered the remaining windows all
+            # gain 0.0 and document order decides — so the rest of the budget
+            # fills from the top of the page, exactly as it does today.
+            g = sum(weights[t] for t in hit - covered)
+            if g > gain:
+                pick, gain = start, g
+        if pick is None:
+            break
+        taken.add(pick)
+        start = pick
+        end = min(len(clean), start + width)
+        i = bisect.bisect_right(starts, start) - 1
+        header = _table_header_for(lines, i) if i >= 0 else ""
+        if header and header in clean[start:end]:
+            header = ""
+        prefix = header + joiner if header else ""
+        gap = len(PASSAGE_GAP) if chosen else 0
+        if spent + gap + len(prefix) + (end - start) > budget:
+            room = budget - spent - gap - len(prefix)
+            if room < 200:
+                break
+            end = start + room
+        chosen.append((start, end, header))
+        covered |= hits_at[start]
+        spent += gap + len(prefix) + (end - start)
+
+    if not chosen:
+        return clean[:budget]
+    chosen.sort()
+    out = PASSAGE_GAP.join(
+        (h + joiner + clean[s:e]) if h else clean[s:e] for s, e, h in chosen
+    )
+    if chosen[0][0] > 0:
+        out = PASSAGE_GAP.lstrip("\n") + out
+    return out[:budget]
 
 
 def _lexical_score(query: str, ev: Evidence) -> float:
@@ -691,6 +1018,100 @@ def _partition(
 # ---------------------------------------------------------------------------
 
 
+#: A token `_WORD` kept whole across a HYPHEN or UNDERSCORE — "gpt-5.2",
+#: "oc-h1", "gpt_5". Those are the separators a person also writes as a space,
+#: so those are the ones with a spelling variant worth searching for.
+#:
+#: A dot is deliberately NOT one of them. "3.14.5" and "v2.1" are decimal
+#: points, not word breaks: nobody writes "3 14 5", and PostgreSQL keeps a
+#: dotted run as a single lexeme on both sides of the comparison, so there is
+#: no mismatch to repair. Splitting on it would only manufacture a nonsense
+#: alternative and double the query for nothing.
+_COMPOUND = re.compile(r"[a-z0-9.]*[a-z0-9][\-_][a-z0-9][a-z0-9.\-_]*")
+
+#: How many compound tokens get a spaced alternative. The query below
+#: distributes the alternatives over the AND terms, so the string grows as
+#: 2**n; two is already four disjuncts and no real question carries more than
+#: a couple of version strings. Beyond it the compounds are searched as typed.
+_MAX_VARIANT_TOKENS = 2
+
+
+def _spaced_variant(word: str) -> str:
+    """"gpt-5.2" -> "gpt 5.2", "oc-h1" -> "oc h1". Empty when there is nothing
+    to split. Hyphen and underscore only — see `_COMPOUND` on why not the dot."""
+    parts = [p for p in re.split(r"[\-_]", word) if p]
+    return " ".join(parts) if len(parts) > 1 else ""
+
+
+def lexical_query(words: Sequence[str]) -> str:
+    """The string handed to `websearch_to_tsquery`, with variant tokens
+    expanded so an exact match does not become an exact MISS.
+
+    THE BUG THIS FIXES (verified against PostgreSQL 18.4, the production
+    version, on an isolated database — 2026-09-06). Finding S4 made `_WORD`
+    keep "gpt-5.2" whole, which is right for the vector/overlap side and was
+    silently wrong for the PostgreSQL side, because the two disagree about
+    what a hyphen means:
+
+        to_tsvector('english', 'the GPT-5.2 model')   ->  'gpt':2  '-5.2':3
+        to_tsvector('english', 'the GPT 5.2 model')   ->  'gpt':2   '5.2':3
+        websearch_to_tsquery('english', 'gpt-5.2')    ->  'gpt' <-> '-5.2'
+
+    The parser reads the "-" as the SIGN of the number, so the hyphenated and
+    the spaced spelling of one version produce different lexemes, and the
+    query built from the hyphenated one matches only the hyphenated page.
+    Measured: query `gpt-5.2 leaderboard` matched the "GPT-5.2" page and
+    missed the "GPT 5.2" page, which the pre-S4 query (`gpt leaderboard`)
+    had matched. The lexical half of hybrid retrieval was silently losing
+    pages that write the version with a space.
+
+    THE FIX, and why it is not a revert. Each compound is searched as BOTH
+    spellings, so the exact-variant win survives: `GPT-5` and `GPT 5.1` are
+    still refused (they were what S4 was for), while `GPT 5.2` is found again.
+
+    `websearch_to_tsquery` has no parentheses, so `(A|B) & C` cannot be
+    written directly — it is distributed into `A C or B C`, which parses as
+    `A & C | B & C` (websearch ANDs adjacent words and `or` binds loosest).
+    Verified on 18.4:
+
+        websearch_to_tsquery('english', '"gpt-5.2" leaderboard or "gpt 5.2" leaderboard')
+          ->  'gpt' <-> '-5.2' & 'leaderboard' | 'gpt' <-> '5.2' & 'leaderboard'
+
+    Quoting each alternative keeps a multi-word variant a PHRASE ("gpt 5.2"
+    must be adjacent, not merely both present), which is what stops the
+    expansion from loosening the query into an OR of its pieces.
+
+    `words` are `_content_words` — unstemmed, because PostgreSQL stems them
+    itself. With no compound in the question this returns exactly what it
+    always did: the words joined by spaces.
+    """
+    # Deduped: a question that says "gpt-5.2" twice must not produce four
+    # branches of the same two alternatives.
+    compounds = list(dict.fromkeys(w for w in words if _COMPOUND.fullmatch(w)))
+    if not compounds:
+        return " ".join(words)
+    variable = compounds[:_MAX_VARIANT_TOKENS]
+    # Everything else keeps the caller's order, including any compound past
+    # the expansion cap — those are searched exactly as typed.
+    fixed = [w for w in words if w not in variable]
+
+    # Every combination of (as typed | spaced) for the expanded compounds.
+    branches: List[List[str]] = [[]]
+    for word in variable:
+        spaced = _spaced_variant(word)
+        options = [word] if not spaced else [word, spaced]
+        branches = [b + [o] for b in branches for o in options]
+
+    clauses = []
+    for branch in branches:
+        # Quote every alternative: an unquoted "gpt 5.2" would be two ANDed
+        # words rather than the phrase, which is a looser query than the one
+        # being replaced.
+        parts = [f'"{v}"' for v in branch] + list(fixed)
+        clauses.append(" ".join(parts))
+    return " or ".join(clauses)
+
+
 def _lexical_candidates(query: str, limit: int) -> List[Dict[str, Any]]:
     """PostgreSQL full-text candidates (V13 `search_tsv`).
 
@@ -701,6 +1122,10 @@ def _lexical_candidates(query: str, limit: int) -> List[Dict[str, Any]]:
     words = _content_words(query)[:12]
     if not words:
         return []
+    # Variant expansion, so a version written with a space still matches the
+    # version written with a hyphen (and vice versa). See `lexical_query`.
+    plain = lexical_query(words)
+    any_of = " or ".join(lexical_query([w]) for w in words)
     # AND first, OR to fill. websearch_to_tsquery ANDs plain words, which
     # puts the pages that carry EVERY question term first — for an entity
     # question those are the pages about the entity. OR alone, ranked by
@@ -729,8 +1154,6 @@ def _lexical_candidates(query: str, limit: int) -> List[Dict[str, Any]]:
                   AND quarantined_at IS NULL
              )
              SELECT * FROM ranked WHERE dn <= 3 ORDER BY rank DESC LIMIT %s"""
-    plain = " ".join(words)
-    any_of = " OR ".join(words)
     try:
         with db.connection() as con:
             rows = list(con.execute(sql, (plain, plain, plain, limit)).fetchall())
@@ -807,8 +1230,14 @@ async def retrieve(
     cache_key = _cache_key(query, level, top_k)
     if use_cache:
         cached = _cache_get(cache_key)
-        if cached is not None:
+        if cached is not None and await _cache_entry_still_servable(cached):
             return cached
+        if cached is not None:
+            # A page in the entry has been quarantined or purged since it was
+            # computed. Drop it and recompute rather than serving a shortened
+            # list: the caller asked for `top_k` sources, not for whatever
+            # survived.
+            _cache.pop(cache_key, None)
 
     # Dense and lexical halves run CONCURRENTLY (they touch different
     # services); both over-fetch because the ranking below reorders a lot.
@@ -1120,6 +1549,63 @@ def _cache_get(key: str) -> Optional[Retrieval]:
     )
 
 
+async def _cache_entry_still_servable(value: Retrieval) -> bool:
+    """Is every page this cached retrieval quotes still allowed to be shown?
+
+    THE GAP THIS CLOSES. The cache key carries `db.web_corpus_generation()`,
+    which is a MODULE GLOBAL — a per-process counter. The only quarantine and
+    purge interface that exists (`tools/knowledge_admin.py`) runs as a separate
+    process and issues `UPDATE web_pages SET quarantined_at = now()` directly,
+    so the orchestrator's counter never moves and the key of an already-cached
+    entry never changes. Measured before this: the SQL filter on the uncached
+    path correctly dropped the page while `retrieve` kept serving its text and
+    its URL out of `_cache` for the whole TTL
+    (`KNOWLEDGE_EVIDENCE_CACHE_TTL_S`, 60 s by default). An operator who has
+    just pulled a page was told it was out of retrieval while it was still
+    being quoted and cited.
+
+    Pointing the CLI at `db.set_web_page_quarantine` would not have fixed it:
+    a bump in the CLI's process says nothing to the server's. The only thing
+    that can be trusted across processes is the database, so the check is a
+    database read — `db.servable_web_page_ids`, the same one-indexed-lookup
+    helper `web_index.retrieve` already runs on every dense hit, over at most
+    a handful of ids, off the event loop.
+
+    Fails CLOSED. If the lookup cannot run, the entry is treated as unusable:
+    the recompute it forces needs the same database anyway, so nothing is lost
+    by refusing, whereas serving on a failed exclusion check is the exact bug.
+    """
+    wanted = {
+        int(e.page_id)
+        for e in list(value.evidence) + list(value.superseded)
+        if e.page_id
+    }
+    if not wanted:
+        return True
+    try:
+        servable = await db.run_in_thread(db.servable_web_page_ids, sorted(wanted))
+    except Exception:  # noqa: BLE001 — an unverifiable entry is not servable
+        log.debug("evidence cache could not be revalidated", exc_info=True)
+        metrics.inc(
+            "knowledge_evidence_cache_revalidation_failed_total",
+            "cached retrievals dropped because quarantine state could not be read",
+        )
+        return False
+    if wanted <= servable:
+        return True
+    metrics.inc(
+        "knowledge_evidence_cache_withdrawn_total",
+        "cached retrievals dropped because a page was quarantined or purged",
+    )
+    log.info(
+        "evidence cache: %d of %d cached page(s) are no longer servable; "
+        "recomputing",
+        len(wanted - servable),
+        len(wanted),
+    )
+    return False
+
+
 def _cache_put(key: str, value: Retrieval) -> None:
     ttl = float(getattr(settings, "knowledge_evidence_cache_ttl_s", 0) or 0)
     if ttl <= 0:
@@ -1291,8 +1777,12 @@ def topical_block(result: Retrieval, today: str) -> str:
 def claims_for(query: str, limit: int = 3) -> List[Dict[str, Any]]:
     """Resolved claims from earlier Deep Research runs that match the
     question's words. Blocking (run via db.run_in_thread). Never raises."""
-    # Unstemmed words: PostgreSQL stems them itself (see _content_words).
-    terms = " ".join(_content_words(query)[:12])
+    # Unstemmed words: PostgreSQL stems them itself (see _content_words), and
+    # variant-expanded for the same reason `_lexical_candidates` is — a claim
+    # recorded about "GPT 5.2" must still be found by a question that writes
+    # "GPT-5.2". `db.search_web_claims` hands this straight to
+    # websearch_to_tsquery.
+    terms = lexical_query(_content_words(query)[:12])
     if not terms:
         return []
     try:

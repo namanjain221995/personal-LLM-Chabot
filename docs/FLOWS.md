@@ -367,15 +367,19 @@ on the orchestrator log reconstructs a run.
 
 ```mermaid
 flowchart LR
-    R1["Research run A"] --> LOCK{"_RUN_LOCK"}
-    R2["Research run B"] --> LOCK
-    LOCK -->|holds| GO["runs"]
-    LOCK -->|busy| NO["refused with an honest sentence<br/>— not starved"]
-    GO --> SEM{"_LLM_SEM (2)"}
+    R1["Run A — user 1"] --> ADM{"_Admission"}
+    R2["Run B — user 2"] --> ADM
+    R3["Run C — user 1 again"] --> ADM
+    ADM -->|"slot free"| GO["runs"]
+    ADM -->|"per-user limit"| OWN["refused: your own run<br/>is still going"]
+    ADM -->|"ceiling busy"| WAIT["queues up to 45s"]
+    WAIT -->|"slot frees"| GO
+    WAIT -->|"still full"| NO["refused, quoting when<br/>the earliest finishes"]
+    GO --> SEM{"_LLM_SEM (2)<br/>shared by ALL runs"}
     SEM --> GPU["MAIN model<br/>shared with interactive chat"]
 
     classDef app fill:#7C3AED,color:#fff,stroke:none
-    class R1,R2,GO,NO,GPU app
+    class R1,R2,R3,GO,OWN,WAIT,NO,GPU app
 ```
 
 One run at a time per orchestrator process. A second would double every budget

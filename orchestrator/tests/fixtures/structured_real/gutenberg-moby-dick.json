@@ -1,0 +1,65 @@
+{
+  "slug": "gutenberg-moby-dick",
+  "url": "https://www.gutenberg.org/ebooks/2701",
+  "cached_body_sha256": "b198b6fcf2d6e6edc6aab93e973d908d2bb626a609e7812560317c16a91beaca",
+  "markup": "microdata",
+  "derived_by": "read out of the cached HTML by a human; NOT captured from the extractor",
+  "derived_on": "2026-09-07",
+  "quoted_source": [
+    "<div class=\"page_content\" id=\"content\" itemscope=\"itemscope\" itemtype=\"http://schema.org/Book\">",
+    "<h1 itemprop=\"name\" id=\"book_title\">Moby Dick; Or, The Whale by Herman Melville</h1>",
+    "<div class=\"offer-note\" itemprop=\"offers\" itemscope=\"itemscope\" itemtype=\"http://schema.org/Offer\"> <meta itemprop=\"priceCurrency\" content=\"USD\"> <meta itemprop=\"price\" content=\"0.00\"> <link itemprop=\"availability\" href=\"http://schema.org/InStock\"> </div>",
+    "<td itemprop=\"datePublished\">Jul 1, 2001</td>",
+    "<td itemprop=\"interactionCount\">165457 downloads in the last 30 days.</td>",
+    "<a href=\"/ebooks/author/9\" ... itemprop=\"creator\">Herman Melville</a>",
+    "<tr ... itemprop=\"inLanguage\" content=\"en\"><th>Language</th><td>English</td></tr>",
+    "<div property=\"dcterms:publisher\" itemprop=\"publisher\" content=\"Project Gutenberg\"></div>"
+  ],
+  "expectations": [
+    {
+      "entity": "Moby Dick; Or, The Whale by Herman Melville", "entity_type": "Book",
+      "parent": "",
+      "field": "price", "value": "0.00 USD",
+      "source": "microdata",
+      "read_from": "THE HEADLINE ASSERTION OF THIS WHOLE SET. The page states price and priceCurrency as two separate <meta> elements inside an anonymous Offer scope. Three things must all happen for this line to be right: the Offer must fold onto the Book (it has no identity of its own), the currency must be re-attached to the magnitude, and both must land on the line that names the book. '0.00' and 'USD' anywhere else on the page would be worse than nothing."
+    },
+    {
+      "entity": "Moby Dick; Or, The Whale by Herman Melville", "entity_type": "Book",
+      "parent": "",
+      "field": "availability", "value": "InStock",
+      "source": "microdata",
+      "read_from": "<link itemprop=\"availability\" href=\"http://schema.org/InStock\">. The href is an IDENTIFIER and must never be fetched; the last path segment is the readable form of the same value."
+    },
+    {
+      "entity": "Moby Dick; Or, The Whale by Herman Melville", "entity_type": "Book",
+      "parent": "",
+      "field": "datePublished", "value": "Jul 1, 2001",
+      "source": "microdata",
+      "read_from": "the cell text, kept in the page's own human format; nothing here parses or normalises a date"
+    },
+    {
+      "entity": "Moby Dick; Or, The Whale by Herman Melville", "entity_type": "Book",
+      "parent": "",
+      "field": "interactionCount", "value": "165457 downloads in the last 30 days.",
+      "source": "microdata",
+      "read_from": "the cell text; a magnitude whose unit is a whole English phrase, and it must not be split off the count"
+    }
+  ],
+  "known_absent": [
+    {
+      "entity": "Moby Dick; Or, The Whale by Herman Melville", "field": "publisher",
+      "value": "Project Gutenberg",
+      "reason": "The page states it as content=\"Project Gutenberg\" on a <div>. The HTML microdata rules honour `content` on <meta> only, so a <div> falls back to its text -- which is empty. Spec-correct and still a loss: the publisher is stated in machine-readable form and does not reach the text."
+    },
+    {
+      "entity": "Moby Dick; Or, The Whale by Herman Melville", "field": "inLanguage",
+      "value": "en",
+      "reason": "Same cause: <tr itemprop=\"inLanguage\" content=\"en\"> falls back to the row's text, so the value recovered is the visible label 'Language English' rather than the code 'en'. Recorded as absent because a consumer looking for a language CODE will not find one."
+    },
+    {
+      "entity": "Moby Dick; Or, The Whale by Herman Melville", "field": "creator",
+      "value": "Herman Melville",
+      "reason": "<a itemprop=\"creator\" href=\"/ebooks/author/9\">. For <a> the microdata value is the href, so the recovered value is the relative path '/ebooks/author/9' and the author's NAME -- the link text -- is discarded. The name is in the book title on this page, so it survives by luck, not by design."
+    }
+  ]
+}

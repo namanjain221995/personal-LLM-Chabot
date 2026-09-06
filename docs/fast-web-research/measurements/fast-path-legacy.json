@@ -1,0 +1,66 @@
+{
+ "mode": "legacy",
+ "legacy_shapes": [
+  "recall.cosine_many -> per-candidate cosine()",
+  "context._tokenize_client -> a fresh AsyncClient per call"
+ ],
+ "rows": [
+  {
+   "label": "concurrency=1",
+   "requests": 8,
+   "ok": 8,
+   "failed": 0,
+   "first_token_ms_p50": 1358.3,
+   "first_token_ms_p95": 1512.6,
+   "first_event_ms_p50": 1358.3,
+   "total_ms_p50": 1358.3,
+   "total_ms_p95": 1512.7,
+   "tokens_p50": 24.5,
+   "events": {
+    "token": 191,
+    "meta": 8,
+    "done": 8
+   },
+   "errors": [],
+   "concurrency": 1
+  },
+  {
+   "label": "concurrency=4",
+   "requests": 8,
+   "ok": 8,
+   "failed": 0,
+   "first_token_ms_p50": 2076.8,
+   "first_token_ms_p95": 2188.9,
+   "first_event_ms_p50": 2076.8,
+   "total_ms_p50": 2076.8,
+   "total_ms_p95": 2189.0,
+   "tokens_p50": 24.5,
+   "events": {
+    "token": 192,
+    "meta": 8,
+    "done": 8
+   },
+   "errors": [],
+   "concurrency": 4
+  },
+  {
+   "label": "concurrency=8",
+   "requests": 8,
+   "ok": 8,
+   "failed": 0,
+   "first_token_ms_p50": 2772.8,
+   "first_token_ms_p95": 2857.1,
+   "first_event_ms_p50": 2772.8,
+   "total_ms_p50": 2772.8,
+   "total_ms_p95": 2857.2,
+   "tokens_p50": 21.0,
+   "events": {
+    "token": 173,
+    "meta": 8,
+    "done": 8
+   },
+   "errors": [],
+   "concurrency": 8
+  }
+ ]
+}

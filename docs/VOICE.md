@@ -129,10 +129,15 @@ whichever has the fewest requests in flight:
 | 16 | 1.54 s · 123 s/s | 1.05 s · 214 s/s | **1.46×** |
 | 32 | 2.70 s · 122 s/s | 1.46 s · 241 s/s | **1.85×** |
 
-**These are replicas, not shards.** Splitting one 1.7B model across two Sparks
-would put every layer's activations on a 13 Gb/s RoCE link that the main
-model's own tensor-parallel traffic already uses, to save memory that was
-never short — the weights are 4.4 GB and either node holds them twice over.
+**These are replicas, not shards.** The "13 Gb/s RoCE link" this argument
+originally rested on was a unit error — the link measures ~109 Gb/s per rail
+(see [`CLUSTER.md`](CLUSTER.md)) — but the conclusion survives on its own
+merits, which are stronger than the bandwidth claim was. Splitting one 1.7B
+model across two Sparks would put every layer's activations on a link that the
+main model's own tensor-parallel traffic already uses, and cross-node tensor
+parallelism costs *latency* per collective (12.8 µs per round trip, on
+activations only a few KB wide) rather than bandwidth — so a faster wire does
+not recover it. All of that to save memory that was never short — the weights are 4.4 GB and either node holds them twice over.
 Two whole copies add throughput without one byte of cross-node chatter, and
 degrade to one engine gracefully when a node goes away.
 

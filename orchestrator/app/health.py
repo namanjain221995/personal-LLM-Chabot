@@ -246,6 +246,21 @@ def _check_web_index() -> dict:
         "rows": 0,
         "distinct_pages": 0,
     }
+    # This check opens LanceDB itself rather than through `web_index._open`, so
+    # it does not inherit that module's CRM guard. A `LANCEDB_WEB_DIR` that
+    # overlapped the Salesforce corpus would therefore be refused by every
+    # WRITE path and stay invisible here — /health would report a healthy web
+    # index while the configuration was one that no write could ever use. It is
+    # reported as misconfigured, not as an outage: `status` gates the container
+    # healthcheck, and this is a configuration fact, not a dependency failure.
+    try:
+        from .web_index import assert_not_salesforce  # lazy, same as above
+
+        assert_not_salesforce(directory)
+    except Exception as exc:  # noqa: BLE001 — a check never raises
+        out["status"] = "misconfigured"
+        out["detail"] = str(exc)[:200]
+        return out
     try:
         inspected = inspect_embedding_index(directory, web_table, settings.embed_model)
     except Exception as exc:  # noqa: BLE001 — /health reports, never raises
@@ -289,6 +304,14 @@ def _check_web_index() -> dict:
         from . import db  # lazy
 
         out["pending_pages"] = int(db.count_unindexed_web_pages())
+        # `pending_pages` counts only `indexed_at IS NULL`. Since V24 a page
+        # can also be waiting on a RE-CHUNK (its vectors exist but were built
+        # by an older chunker), and during a chunker migration that is the
+        # larger queue by far — so "is the index behind?" answered with the
+        # first number alone under-reports the backlog by the whole second one.
+        from .web_index import CHUNKER_VERSION
+
+        out["rechunk_pending"] = int(db.count_stale_chunk_pages(CHUNKER_VERSION))
     except Exception:  # noqa: BLE001 — the database has its own check
         pass
     return out

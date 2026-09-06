@@ -1,13 +1,20 @@
-# ONE pipeline: test -> deploy -> verify, visible as a single graph.
+# ONE pipeline: validate -> test -> scan -> gate -> deploy -> verify, visible as
+# a single graph.
 #
 # It used to be two workflows chained by workflow_run (CI, then Deploy), which
 # worked but read as two disconnected runs in the Actions tab — a deploy's
 # tests were always "somewhere else". Same guarantees, one page:
 #
-#   * every push and PR runs the four test suites on free hosted runners;
-#   * a push to MAIN that passes them deploys from the self-hosted DGX runner
-#     (the box itself owns the GPU, the model cache and the credentials —
-#     nothing is copied to a cloud runner, no secret enters this file);
+#   * every push and PR runs validation, the four test suites, the schema
+#     fresh-vs-upgrade proof, the supply-chain scans and the image builds, all
+#     on free hosted runners, all in parallel;
+#   * `CI passed` is the single aggregate gate. It asserts POSITIVELY that
+#     every one of those reported `success`; see .github/workflows/scripts/
+#     ci_gate.py for why `always()` plus "no failures" is not a gate;
+#   * deployment runs on the self-hosted DGX runner (the box itself owns the
+#     GPU, the model cache and the credentials — nothing is copied to a cloud
+#     runner, no secret enters this file). It is DELIBERATELY NOT automatic:
+#     see "THE DEPLOY GATE" below;
 #   * the deploy is ROLLING and MODEL-PRESERVING: only containers whose
 #     definition changed are recreated, and the main vLLM engine is probed
 #     and left running even then (TECHSARA_PRESERVE_MAIN_MODEL, set by
@@ -17,14 +24,48 @@
 #     blue-green buys, deploys that never take the product down, is exactly
 #     what preserve + rolling recreate + the verify stage deliver;
 #   * a verify stage then proves from the box that the site, the API, the
-#     model and the monitoring plane are actually answering, and writes the
-#     evidence into the run summary.
+#     model and the monitoring plane are actually answering — including a REAL
+#     completion whose token counter must move, because a wedged vLLM engine
+#     serves a green /health for hours — and writes the evidence into the run
+#     summary. A failure raises diagnostics rather than firing a second
+#     unattended `techsara up`.
 #
-# What is deliberately NOT here:
-#   * `npm run lint` - `next lint` was removed in Next 16 and the pinned
-#     eslint-config-next is still 15.x. `tsc --noEmit` is the type gate.
+# ---------------------------------------------------------------- THE DEPLOY GATE
+# This repository is PUBLIC and its self-hosted runner is the production box.
+# Two rules follow, and both are enforced mechanically by the `policy` job:
+#
+#   1. no `pull_request`-triggered job may ever land on [self-hosted, dgx-spark];
+#   2. every path to that runner — push AND workflow_dispatch — must be
+#      restricted to refs/heads/main. A dispatch clause without a ref check is
+#      a branch-restriction bypass: `workflow_dispatch` deploys whatever branch
+#      it was fired from.
+#
+# On top of those, deployment does not happen on a branch push unless it is
+# switched on explicitly:
+#
+#   * `workflow_dispatch` on main with the `deploy` input ticked  -> deploys;
+#   * a push to main                                              -> deploys
+#     ONLY if the repository variable DEPLOY_ON_PUSH is true/1/yes/on.
+#
+# With DEPLOY_ON_PUSH unset (the default), merging a PR into main runs the
+# tests and stops. That is on purpose: this box serves live traffic and runs
+# GPU benchmarks, and an unattended `techsara up` racing either of those is a
+# worse outcome than a deploy that waits for a human. Set the variable when
+# continuous deployment is wanted again; nothing else has to change.
+#
+# The `production` environment is also declared on the deploy job. Adding
+# required reviewers and a deployment-branch policy to it in repo settings
+# turns every deploy into an approval gate — recommended, and independent of
+# everything above.
+#
+# ------------------------------------------------------------ WHAT IS NOT HERE
+#   * `paths-ignore` / `paths` filters. A required check that is SKIPPED counts
+#     as SATISFIED by branch protection, so a path filter on a required job is
+#     a way to merge untested code. Everything runs on everything.
 #   * building the CUDA orchestrator image - its base is ~20 GB and a hosted
-#     runner has ~14 GB free. The DGX builds it at deploy time instead.
+#     runner has ~14 GB free. The DGX builds it at deploy time instead; the
+#     `images` job proves the OTHER images build and that no Dockerfile has an
+#     x86 assumption in it, which is the part a hosted runner can prove.
 name: Pipeline
 
 on:
@@ -33,6 +74,10 @@ on:
     branches: [main, dev]
   workflow_dispatch:
     inputs:
+      deploy:
+        description: "Actually deploy to the DGX (leave OFF to run tests only)"
+        type: boolean
+        default: false
       full:
         description: "Recreate EVERY container, including the models (+15-25 min: the main model reloads)"
         type: boolean
@@ -48,13 +93,99 @@ concurrency:
   group: pipeline-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
-permissions:
-  contents: read
+# Least privilege by construction: the token starts with NOTHING, and every job
+# adds back only what it needs (in practice `contents: read`, for checkout).
+# A job that forgets to declare permissions therefore gets a useless token
+# rather than the repository default — and the `policy` job fails the run.
+permissions: {}
 
 jobs:
+  # ==========================================================================
+  # 1. VALIDATION, LINT AND TYPES
+  # ==========================================================================
+  policy:
+    name: "🔒 policy"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Every workflow file is valid YAML
+        run: |
+          python -m pip install -q "PyYAML>=6"
+          python - <<'PY'
+          import pathlib, sys, yaml
+          bad = 0
+          for p in sorted(pathlib.Path(".github/workflows").glob("*.y*ml")):
+              try:
+                  yaml.safe_load(p.read_text())
+                  print(f"  ok  {p}")
+              except yaml.YAMLError as exc:
+                  print(f"  FAIL {p}: {exc}", file=sys.stderr); bad += 1
+          sys.exit(1 if bad else 0)
+          PY
+
+      # actionlint understands expression syntax, context availability, shell
+      # quoting inside `run:` and runner-label typos — the class of mistake
+      # that otherwise only shows up as a failed run. Pinned by DIGEST, and it
+      # is a container rather than an action, so nothing is added to the
+      # supply-chain surface that the `policy` job itself audits.
+      - name: actionlint
+        run: |
+          docker run --rm -v "$PWD:/repo:ro" -w /repo \
+            rhysd/actionlint@sha256:887a259a5a534f3c4f36cb02dca341673c6089431057242cdc931e9f133147e9 \
+            -color \
+            -config-file .github/workflows/actionlint.conf \
+            -ignore 'SC2016' -ignore 'SC2129'
+
+      # The repository's own rules: SHA pins, no pull_request_target, no fork
+      # code on the DGX, least-privilege tokens, no script injection. See the
+      # script's docstring for what each one is defending against.
+      - name: Workflow policy (pins, triggers, permissions, injection)
+        run: python .github/workflows/scripts/workflow_policy.py --default-branch main
+
+      # E9/F63/F7/F82 only: syntax errors, comparisons that cannot mean what
+      # they look like, and names that do not exist. A CORRECTNESS gate, not a
+      # style gate — line width does not get to block a security fix.
+      #
+      # The wrapper carries a two-way baseline: a NEW finding fails, and a
+      # baseline entry that stops being reported ALSO fails, so the list cannot
+        # quietly become a place bugs live. It is currently EMPTY. The one entry
+        # it held was a real pre-existing NameError risk in
+        # orchestrator/app/core/sf_dictionary.py that this gate found on the day it
+        # was switched on; it was fixed and the entry deleted the same day.
+      - name: Python syntax and undefined names
+        run: |
+          python -m pip install -q ruff==0.14.0
+          python .github/workflows/scripts/ruff_gate.py \
+            orchestrator sync-worker launcher scripts .github/workflows/scripts
+
+      - name: Shell scripts parse
+        run: |
+          fail=0
+          while IFS= read -r f; do
+            bash -n "$f" || { echo "  FAIL $f"; fail=1; }
+          done < <(git ls-files '*.sh' 'techsara')
+          exit "$fail"
+
+      - name: Migration table invariants (no database needed)
+        run: |
+          python -m pip install -q "psycopg[binary,pool]>=3.2,<4"
+          python .github/workflows/scripts/schema_parity.py invariants
+
+  # ==========================================================================
+  # 2. TEST SUITES  (names below are load-bearing: branch protection and every
+  #    saved PR filter reference them. Do not rename.)
+  # ==========================================================================
   launcher:
     name: "🧪 launcher (${{ matrix.python }})"
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -62,8 +193,8 @@ jobs:
         # standard-library only, so both must stay green.
         python: ["3.11", "3.12"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: ${{ matrix.python }}
       - name: Show the Compose version the overlay tests need
@@ -90,43 +221,68 @@ jobs:
   orchestrator:
     name: "🧪 orchestrator"
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     services:
       postgres:
-        # Same major and the same initdb settings as production. Both matter:
-        # conftest refuses a database whose LC_COLLATE is not C, and an
-        # SQL_ASCII database makes psycopg fail to encode the migration DDL
-        # (there is an em-dash in it) with UnicodeEncodeError on every test.
+        # PINNED BY DIGEST TO THE IMAGE PRODUCTION IS RUNNING. Verified on the
+        # box with `docker inspect sf-local-ai-postgres-1`: same digest, and
+        # the container reports PG_MAJOR=18 / PG_VERSION=18.4. It is a
+        # multi-arch index, so this same digest is the aarch64 image on the DGX
+        # and the x86_64 image here — one identity, two architectures.
+        #
+        # The initdb settings matter as much as the version: conftest refuses a
+        # database whose LC_COLLATE is not C, and an SQL_ASCII database makes
+        # psycopg fail to encode the migration DDL (there is an em-dash in it)
+        # with UnicodeEncodeError on every test.
         image: postgres@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
         env:
           POSTGRES_USER: test
           POSTGRES_PASSWORD: test
-          POSTGRES_DB: techsara_test
+          POSTGRES_DB: techsara_orchestrator_test
           POSTGRES_INITDB_ARGS: "--locale=C --encoding=UTF8"
         ports: ["5432:5432"]
         options: >-
-          --health-cmd "pg_isready -U test -d techsara_test -q"
+          --health-cmd "pg_isready -U test -d techsara_orchestrator_test -q"
           --health-interval 5s --health-timeout 5s --health-retries 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.11"
           cache: pip
           cache-dependency-path: orchestrator/requirements-dev.txt
       - run: python -m pip install -q -r orchestrator/requirements-dev.txt
+      # Print the server version into the log. The digest above is pinned to
+      # production's, but a pin is a claim; this is the evidence. If these two
+      # ever diverge, a test that passes here proves nothing about the box.
+      - name: Prove the server major matches production (18.x)
+        env:
+          PGPASSWORD: test
+        run: |
+          set -euo pipefail
+          v="$(psql -h 127.0.0.1 -U test -d techsara_orchestrator_test -tAc 'SHOW server_version')"
+          echo "postgres server_version = $v"
+          case "$v" in 18.*) ;; *) echo "expected PostgreSQL 18.x, got $v"; exit 1 ;; esac
       - name: Run the orchestrator suite
         working-directory: orchestrator
         env:
-          # conftest refuses any database name that is not unmistakably test-only.
-          TEST_DATABASE_URL: postgresql://test:test@127.0.0.1:5432/techsara_test
+        # An EPHEMERAL service container, and a database name no other job
+        # uses. conftest TRUNCATEs every table before every test, so the
+        # isolation here is not a nicety: two suites sharing one database
+        # delete each other's fixtures mid-run. conftest additionally refuses
+        # any database name that is not unmistakably test-only.
+          TEST_DATABASE_URL: postgresql://test:test@127.0.0.1:5432/techsara_orchestrator_test
         run: python -m pytest tests -q
 
   sync-worker:
     name: "🧪 sync-worker"
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.11"
           cache: pip
@@ -138,9 +294,11 @@ jobs:
   frontend:
     name: "🧪 frontend"
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "20"
           cache: npm
@@ -150,6 +308,13 @@ jobs:
       - name: Unit tests
         working-directory: frontend
         run: npm test
+      - name: Lint
+        # `next lint` was removed in Next 16 and the pinned eslint-config-next
+        # is still 15.x — but package.json's `lint` script calls eslint
+        # DIRECTLY (eslint 8 + .eslintrc.json), which works. Warnings do not
+        # fail the build; errors do.
+        working-directory: frontend
+        run: npm run lint
       - name: Type check
         working-directory: frontend
         run: npx tsc --noEmit
@@ -157,70 +322,477 @@ jobs:
         working-directory: frontend
         run: npm run build
 
-  # A single required check to protect main with, instead of six. The name is
-  # load-bearing: branch protection references it — do not rename.
+  # ==========================================================================
+  # 3. SCHEMA: a fresh install must land on the same schema as an upgrade
+  # ==========================================================================
+  schema:
+    name: "🗄️ schema"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    services:
+      postgres:
+        # Same digest as the orchestrator job and as production — a schema
+        # proof against a different major would prove nothing about this box.
+        image: postgres@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: techsara_schema_test
+          POSTGRES_INITDB_ARGS: "--locale=C --encoding=UTF8"
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U test -d techsara_schema_test -q"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      PGHOST: 127.0.0.1
+      PGPORT: "5432"
+      PGUSER: test
+      PGPASSWORD: test
+      FRESH_DSN: postgresql://test:test@127.0.0.1:5432/fresh_install_test
+      UPGRADE_DSN: postgresql://test:test@127.0.0.1:5432/upgraded_from_old_test
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: orchestrator/requirements-dev.txt
+      - run: python -m pip install -q -r orchestrator/requirements-dev.txt
+
+      # Two databases on one server: each is created empty here and used by
+      # exactly one arm of the proof, so neither can contaminate the other.
+      - name: Create the two isolated databases
+        run: |
+          psql -d techsara_schema_test -v ON_ERROR_STOP=1 \
+            -c "CREATE DATABASE fresh_install_test TEMPLATE template0 LC_COLLATE 'C' LC_CTYPE 'C' ENCODING 'UTF8'"
+          psql -d techsara_schema_test -v ON_ERROR_STOP=1 \
+            -c "CREATE DATABASE upgraded_from_old_test TEMPLATE template0 LC_COLLATE 'C' LC_CTYPE 'C' ENCODING 'UTF8'"
+
+      - name: A — fresh install runs every migration at once
+        working-directory: orchestrator
+        env:
+          APP_DATABASE_URL: ${{ env.FRESH_DSN }}
+        run: python ../.github/workflows/scripts/schema_parity.py --orchestrator . upgrade
+
+      # V20 is a deliberate choice, not an arbitrary one: it is old enough to
+      # predate the migrations most likely to assume a fresh shape (V21-V27,
+      # the extractor/chunker versioning and the durable crawl frontier) and
+      # new enough to be a state this box has actually been in.
+      - name: B1 — stage an OLD database at V20
+        working-directory: orchestrator
+        env:
+          APP_DATABASE_URL: ${{ env.UPGRADE_DSN }}
+        run: python ../.github/workflows/scripts/schema_parity.py --orchestrator . stage --to 20
+
+      - name: B2 — upgrade it the way a deploy does
+        working-directory: orchestrator
+        env:
+          APP_DATABASE_URL: ${{ env.UPGRADE_DSN }}
+        run: python ../.github/workflows/scripts/schema_parity.py --orchestrator . upgrade
+
+      - name: A must equal B — same tables, columns, constraints, indexes
+        run: |
+          python .github/workflows/scripts/schema_parity.py compare \
+            --a "$FRESH_DSN" --b "$UPGRADE_DSN"
+
+      - name: Re-running the upgrade changes nothing (idempotence)
+        working-directory: orchestrator
+        env:
+          APP_DATABASE_URL: ${{ env.UPGRADE_DSN }}
+        run: python ../.github/workflows/scripts/schema_parity.py --orchestrator . upgrade
+
+  # ==========================================================================
+  # 4. SUPPLY CHAIN: dependencies, secrets, container images
+  # ==========================================================================
+  security:
+    name: "🛡️ security"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+        # Full history: the secret scan looks at what was COMMITTED, not just
+        # at what survives in the tip. A credential deleted in a later commit
+        # is still a leaked credential.
+          fetch-depth: 0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      # ---- secrets: BLOCKING. A leaked credential is not advisory. ----------
+      # Blocking, with a reviewed fingerprint baseline. See
+      # .github/workflows/scripts/secret_gate.py for the three ways a naive
+      # secret-scan step reports "clean" when it is not — all three were
+      # reproduced on this repository on 2026-09-07 and all three are closed.
+      - name: Secret scan (full git history)
+        run: |
+          set -euo pipefail
+          mkdir -p .ci-reports
+          # --redact: findings carry rule, file and line, never the value. A CI
+          # log on a PUBLIC repository is not a place to reproduce a credential.
+          # The report needs a WRITABLE mount of its own: the source is bind
+          # mounted read-only, and a report path that cannot be written silently
+          # produces an empty report next to a non-zero exit code.
+          # GIT_CONFIG_*: the container runs as root against a checkout owned by
+          # the runner user, and git refuses "dubious ownership" repositories —
+          # without it gitleaks exits non-zero having scanned nothing.
+          set +e
+          docker run --rm \
+            -v "$PWD:/repo:ro" -v "$PWD/.ci-reports:/out" -w /repo \
+            -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0=/repo \
+            zricethezav/gitleaks@sha256:691af3c7c5a48b16f187ce3446d5f194838f91238f27270ed36eef6359a574d9 \
+            git --redact --no-banner --report-format json --report-path /out/gitleaks.json
+          rc=$?
+          set -e
+          python .github/workflows/scripts/secret_gate.py \
+            --report .ci-reports/gitleaks.json \
+            --baseline .github/workflows/gitleaks-baseline.json \
+            --exit-code "$rc"
+
+      # ---- dependencies: ADVISORY. Reported every run, never a silent pass,
+      #      but a transitive advisory with no fixed release must not be able
+      #      to block a security fix from shipping. -----------------------------
+      - name: Python dependency audit (advisory)
+        id: pipaudit
+        continue-on-error: true
+        run: |
+          python -m pip install -q pip-audit==2.10.1
+          for req in orchestrator/requirements-dev.txt sync-worker/requirements.txt; do
+            echo "::group::pip-audit $req"
+            pip-audit --progress-spinner off -r "$req" || echo "FINDINGS in $req"
+            echo "::endgroup::"
+          done
+
+      - name: npm dependency audit (advisory)
+        id: npmaudit
+        continue-on-error: true
+        working-directory: frontend
+        run: npm audit --audit-level=high
+
+      # ---- container images: CRITICAL-with-a-fix is BLOCKING. --------------
+      - name: Image and filesystem vulnerability scan
+        run: |
+          set -o pipefail
+          mkdir -p "$PWD/.trivy-cache"
+          scan() { # scan <scanners> <severity> <exit-code>
+            docker run --rm \
+              -v "$PWD:/src:ro" -v "$PWD/.trivy-cache:/root/.cache/trivy" \
+              aquasec/trivy@sha256:1c78ed1ef824ab8bb05b04359d186e4c1229d0b3e67005faacb54a7d71974f73 \
+              filesystem --scanners "$1" --no-progress \
+              --skip-dirs /src/node_modules --skip-dirs /src/frontend/node_modules \
+              --skip-dirs /src/.venv --skip-dirs /src/.runtime --skip-dirs /src/backups \
+              --severity "$2" --exit-code "$3" --ignore-unfixed /src
+          }
+          echo "::group::advisory — vulnerabilities and Dockerfile/compose misconfig"
+          scan vuln,misconfig CRITICAL,HIGH,MEDIUM 0 || true
+          echo "::endgroup::"
+          # BLOCKING, and deliberately narrow: a CRITICAL *vulnerability* that
+          # has a fixed version available is a patch we are choosing not to
+          # apply. Misconfiguration findings are NOT in the blocking pass —
+          # they are opinions about hardening, and an opinion must not be able
+          # to stop a security fix from reaching the box.
+          scan vuln CRITICAL 1
+
+      - name: Report what was advisory
+        if: always()
+        run: |
+          {
+            echo "### Supply chain"
+            echo "| scan | policy | outcome |"
+            echo "| --- | --- | --- |"
+            echo "| secrets (gitleaks) | blocking | see above |"
+            echo "| python deps (pip-audit) | advisory | ${{ steps.pipaudit.outcome }} |"
+            echo "| npm deps (npm audit) | advisory | ${{ steps.npmaudit.outcome }} |"
+            echo "| images/fs (trivy) | CRITICAL+fixed blocking | see above |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ==========================================================================
+  # 5. IMAGES: they must build for aarch64, and carry the revision they are
+  # ==========================================================================
+  images:
+    name: "📦 images"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+      # QEMU: this runner is x86_64 and production is aarch64. Without it,
+      # `--platform linux/arm64` silently is not an option.
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      # Cheap and total: catches the base image that has no aarch64 manifest at
+      # all, and the `x86_64` download URL — the two ways this repository can
+      # produce an image the DGX cannot run. Covers the CUDA Dockerfile too,
+      # which is far too large to build here.
+      - name: aarch64 compatibility gate (all Dockerfiles)
+        run: |
+          python .github/workflows/scripts/arm64_gate.py \
+            orchestrator/Dockerfile orchestrator/Dockerfile.cpu \
+            sync-worker/Dockerfile frontend/Dockerfile \
+            --skip-base nvcr.io/
+
+      - name: Record what these images are
+        run: |
+          {
+            echo "REV=${{ github.sha }}"
+            echo "CREATED=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "SRC=${{ github.server_url }}/${{ github.repository }}"
+          } >> "$GITHUB_ENV"
+
+      # Native builds prove the Dockerfiles are sound and are fast enough to
+      # run on every push. Every image carries org.opencontainers.image.*, so
+      # `docker inspect` on the box answers "which commit is this?" without a
+      # tag, a manifest or a guess. The labels are applied at BUILD time, so no
+      # Dockerfile has to be changed to gain them.
+      - name: Build (native) with the source revision baked in
+        run: |
+          set -euo pipefail
+          build() { # build <name> <context> [dockerfile]
+            local name="$1" ctx="$2" df="${3:-}"
+            echo "::group::build $name"
+            docker buildx build --load --platform linux/amd64 \
+              ${df:+--file "$df"} \
+              --label org.opencontainers.image.revision="$REV" \
+              --label org.opencontainers.image.source="$SRC" \
+              --label org.opencontainers.image.created="$CREATED" \
+              --label org.opencontainers.image.version="${REV:0:12}" \
+              --label com.techsara.pipeline.run="${{ github.run_id }}" \
+              --tag "ci-$name:${REV:0:12}" "$ctx"
+            echo "::endgroup::"
+          }
+          build sync-worker sync-worker
+          build orchestrator-cpu orchestrator orchestrator/Dockerfile.cpu
+          build frontend frontend
+
+      # A real linux/arm64 build, under emulation, of the image whose
+      # dependency set is small enough to make that affordable. It is the only
+      # place in CI where aarch64 wheels are actually resolved and installed —
+      # the static gate above cannot see a package that has no aarch64 wheel.
+      # The frontend and CUDA images are NOT emulated on purpose: `next build`
+      # and a 20 GB CUDA base under QEMU cost more than the signal is worth,
+      # and both are built natively on the DGX at deploy time.
+      - name: Build sync-worker for linux/arm64 (emulated)
+        run: |
+          set -euo pipefail
+          docker buildx build --load --platform linux/arm64 \
+            --label org.opencontainers.image.revision="$REV" \
+            --label org.opencontainers.image.source="$SRC" \
+            --label org.opencontainers.image.created="$CREATED" \
+            --tag "ci-sync-worker-arm64:${REV:0:12}" sync-worker
+
+      - name: Every image records the commit it was built from
+        run: |
+          set -euo pipefail
+          fail=0
+          for img in "ci-sync-worker:${REV:0:12}" "ci-orchestrator-cpu:${REV:0:12}" \
+                     "ci-frontend:${REV:0:12}" "ci-sync-worker-arm64:${REV:0:12}"; do
+            got="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$img")"
+            arch="$(docker image inspect --format '{{.Architecture}}' "$img")"
+            if [ "$got" = "$REV" ]; then
+              echo "  ok  $img  arch=$arch  revision=$got"
+            else
+              echo "  FAIL $img records revision '$got', expected '$REV'"; fail=1
+            fi
+          done
+          {
+            echo "### Images"
+            echo '```'
+            docker image ls --filter 'reference=ci-*' --format 'table {{.Repository}}\t{{.Tag}}\t{{.Size}}'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$fail"
+
+  # ==========================================================================
+  # 7. THE AGGREGATE RELEASE GATE
+  #
+  # One required check to protect main with, instead of eleven. The NAME is
+  # load-bearing — branch protection references it — so it does not change even
+  # though what it now covers has grown.
+  #
+  # `if: always()` is REQUIRED and is NOT SUFFICIENT, and the difference is the
+  # whole point of this job:
+  #
+  #   * required, because a gate that is itself SKIPPED when an upstream job
+  #     fails does not block anything: branch protection treats a skipped
+  #     required check as satisfied. The gate has to run in order to say no.
+  #
+  #   * not sufficient, because `always()` only decides whether this job runs.
+  #     The old assertion here was
+  #         contains(needs.*.result,'failure') || contains(needs.*.result,'cancelled')
+  #     which passes when a dependency is `skipped` — and a job skips whenever
+  #     its own `if:` is false, its dependency failed, its matrix expanded to
+  #     nothing, or someone deleted it from `needs:`. Proven locally: with the
+  #     old expression, [success, skipped, success] reports SUCCESS.
+  #
+  # ci_gate.py therefore asserts POSITIVELY: every named job must be present in
+  # `needs`, and every one must have result == 'success'. failure, cancelled,
+  # skipped and missing are all refusals, and a job in `needs` that is not in
+  # --require is also a refusal, so the two lists cannot drift apart.
+  # ==========================================================================
   ci-ok:
     name: CI passed
     if: always()
-    needs: [launcher, orchestrator, sync-worker, frontend]
+    needs: [policy, launcher, orchestrator, sync-worker, frontend, schema, security, images]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - name: Fail unless every suite succeeded
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Every required suite must have reported success
+        env:
+        # Through the environment, not interpolated into the script: the
+        # payload is JSON and a `run:` body is shell.
+          NEEDS_JSON: ${{ toJSON(needs) }}
         run: |
-          echo '${{ toJSON(needs) }}'
-          [ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" = "false" ]
+          python3 .github/workflows/scripts/ci_gate.py \
+            --title "CI passed" \
+            --require policy,launcher,orchestrator,sync-worker,frontend,schema,security,images
 
+  # ==========================================================================
+  # 6 + 8. TRUSTED HARDWARE: preflight, rollout, smoke test, recovery
+  #
+  # Everything below runs on [self-hosted, dgx-spark] — the production box.
+  # The `if:` on each job is the security boundary, not a convenience:
+  #   * `github.ref == 'refs/heads/main'` applies to BOTH the push and the
+  #     workflow_dispatch path, so a dispatch cannot deploy an arbitrary
+  #     branch. (`workflow_dispatch` runs from the ref it was fired on.)
+  #   * pull_request is not in either clause, so fork code never reaches here.
+  #   * a push additionally needs the repository variable DEPLOY_ON_PUSH; the
+  #     manual path additionally needs the `deploy` input ticked.
+  # ==========================================================================
   deploy:
     name: "🚀 Deploy (rolling, model-preserving)"
-    # Only main (or an explicit dispatch) deploys, and ONLY behind green
-    # tests: `needs` skips this job unless ci-ok succeeded, so a merge whose
-    # tests failed can never reach the box.
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'push' && github.ref == 'refs/heads/main')
     needs: ci-ok
+    if: >-
+      needs.ci-ok.result == 'success' &&
+      github.ref == 'refs/heads/main' &&
+      (
+        (github.event_name == 'workflow_dispatch' && inputs.deploy) ||
+        (github.event_name == 'push' &&
+         contains(fromJSON('["true","1","yes","on"]'), vars.DEPLOY_ON_PUSH))
+      )
     runs-on: [self-hosted, dgx-spark]
-    # Optional: add required reviewers to this environment in repo settings to
-    # turn every production deploy into an approval gate.
+    permissions:
+      contents: read
+    # Add required reviewers and a deployment-branch policy to this environment
+    # in repo settings to turn every production deploy into an approval gate.
     environment: production
     # Never let two deploys touch the same box, whatever branch they came
-    # from. Queue, do not cancel.
+    # from. Queue, do not cancel. (scripts/deploy.sh also holds an flock, which
+    # is what stops a HAND-RUN deploy from colliding with this one.)
     concurrency:
       group: deploy-dgx-spark
       cancel-in-progress: false
     timeout-minutes: 45
+    env:
+      # The production checkout, NOT the runner workspace: that is where
+      # .env, .runtime/ and the model cache live.
+      TECHSARA_DEPLOY_ROOT: ${{ vars.TECHSARA_DEPLOY_ROOT || '/home/techsphere/Documents/project/personal-LLM-Chabot' }}
+      DEPLOY_REF: ${{ github.sha }}
+      # Repository variable DEPLOY_FULL (true/1/yes/on): recreate EVERY
+      # container on every deploy, models included (+15-25 min: the main
+      # model reloads). The dispatch input asks for the same, once.
+      DEPLOY_FULL: ${{ vars.DEPLOY_FULL }}
+      # Never interpolated into a `run:` body — see the policy job's P6.
+      INPUT_FULL: ${{ inputs.full }}
+      # Repository variable DEPLOY_BRANCH: the branch the production
+      # checkout is left ON, fast-forwarded to the deployed commit. The
+      # deploy only ever FAST-FORWARDS it; "-" forces a detached HEAD.
+      # scripts/deploy.sh validates this value before handing it to git.
+      DEPLOY_BRANCH: ${{ inputs.branch || vars.DEPLOY_BRANCH }}
     steps:
       # Check out the commit being deployed, so the deploy SCRIPT is the one
       # that commit ships. Running it out of the production checkout is a
       # bootstrap trap: that checkout is by definition still at the OLD commit.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ github.sha }}
 
+      # ---------------------------------------------------------- PREFLIGHT
+      # Everything that can say "not today" BEFORE a container is touched.
+      # All of it is read-only.
+      - name: Preflight — is this box in a state to be deployed to?
+        run: |
+          set -euo pipefail
+          fail=0
+          note() { printf '  %-34s %s\n' "$1" "$2"; }
+          check() { if eval "$2" >/dev/null 2>&1; then note "$1" "ok"; else note "$1" "FAIL"; fail=1; fi; }
+
+          note "runner" "$(hostname) / $(uname -m)"
+          [ "$(uname -m)" = "aarch64" ] || { note "architecture" "FAIL: expected aarch64, got $(uname -m)"; fail=1; }
+          check "deploy root exists"      '[ -d "$TECHSARA_DEPLOY_ROOT" ]'
+          check "is a TechSara checkout"  '[ -f "$TECHSARA_DEPLOY_ROOT/techsara" ]'
+          check ".env present"            '[ -f "$TECHSARA_DEPLOY_ROOT/.env" ]'
+          check "docker reachable"        'docker info'
+          check "deploy script shipped"   '[ -x "$GITHUB_WORKSPACE/scripts/deploy.sh" ]'
+
+          # A deploy that runs out of disk halfway through leaves a half-built
+          # image set and a stack that will not come up. 20 GB is roughly one
+          # orchestrator image plus headroom.
+          free_gb="$(df -BG --output=avail "$TECHSARA_DEPLOY_ROOT" | tail -1 | tr -dc '0-9')"
+          note "free disk" "${free_gb} GB"
+          [ "${free_gb:-0}" -ge 20 ] || { note "free disk" "FAIL: under 20 GB"; fail=1; }
+
+          # deploy.sh takes this lock for the whole run. If something else
+          # already holds it, a hand-run deploy is in progress and this one
+          # would queue behind it inside the script — better to say so now.
+          if [ -e "$TECHSARA_DEPLOY_ROOT/.runtime/locks/deploy.lock" ]; then
+            if flock -n "$TECHSARA_DEPLOY_ROOT/.runtime/locks/deploy.lock" true 2>/dev/null; then
+              note "deploy lock" "free"
+            else
+              note "deploy lock" "FAIL: another deploy is running"; fail=1
+            fi
+          else
+            note "deploy lock" "not created yet (first deploy)"
+          fi
+
+          # A dirty production tree aborts deploy.sh anyway; finding out here
+          # costs seconds instead of minutes.
+          dirty="$(git -C "$TECHSARA_DEPLOY_ROOT" status --porcelain --untracked-files=no || true)"
+          if [ -n "$dirty" ]; then
+            note "production tree" "FAIL: uncommitted tracked changes"
+            printf '%s\n' "$dirty" | head -20
+            fail=1
+          else
+            note "production tree" "clean"
+          fi
+          exit "$fail"
+
+      # deploy.sh --dry-run resolves the ref, reports what HEAD and the
+      # configured branch would do, and changes nothing. It is the last chance
+      # to see "cannot fast-forward" before it happens.
+      - name: Preflight — dry run the real deploy script
+        run: |
+          set -euo pipefail
+          cd "$TECHSARA_DEPLOY_ROOT"
+          "$GITHUB_WORKSPACE/scripts/deploy.sh" --ref "$DEPLOY_REF" --dry-run
+
+      # ------------------------------------------------------------ ROLLOUT
       - name: Deploy and health-gate
-        env:
-          # The production checkout, NOT the runner workspace: that is where
-          # .env, .runtime/ and the model cache live.
-          TECHSARA_DEPLOY_ROOT: ${{ vars.TECHSARA_DEPLOY_ROOT || '/home/techsphere/Documents/project/personal-LLM-Chabot' }}
-          DEPLOY_REF: ${{ github.sha }}
-          # Repository variable DEPLOY_FULL (true/1/yes/on): recreate EVERY
-          # container on every merge, models included (+15-25 min: the main
-          # model reloads). The dispatch input asks for the same, once.
-          DEPLOY_FULL: ${{ vars.DEPLOY_FULL }}
-          # Repository variable DEPLOY_BRANCH: the branch the production
-          # checkout is left ON, fast-forwarded to the deployed commit. The
-          # deploy only ever FAST-FORWARDS it; "-" forces a detached HEAD.
-          DEPLOY_BRANCH: ${{ github.event.inputs.branch || vars.DEPLOY_BRANCH }}
         run: |
           set -euo pipefail
           cd "$TECHSARA_DEPLOY_ROOT"
           FLAGS=""
           # Accept the spellings a human actually types into a repo variable.
-          case "$(printf '%s' "${DEPLOY_FULL:-}" | tr 'A-Z' 'a-z')" in
+          case "$(printf '%s' "${DEPLOY_FULL:-}" | tr '[:upper:]' '[:lower:]')" in
             true|1|yes|on) WANT_FULL=1 ;;
             *)             WANT_FULL=0 ;;
           esac
-          if [ "${{ github.event.inputs.full }}" = "true" ] || [ "$WANT_FULL" = 1 ]; then
+          if [ "${INPUT_FULL:-}" = "true" ] || [ "$WANT_FULL" = 1 ]; then
             FLAGS="--full"
             echo "full restart requested (inputs.full or vars.DEPLOY_FULL) - the models WILL reload"
           fi
@@ -230,10 +802,16 @@ jobs:
           echo "checkout will land on: ${DEPLOY_BRANCH:-<detached HEAD>}"
           "$GITHUB_WORKSPACE/scripts/deploy.sh" --ref "$DEPLOY_REF" $FLAGS
 
+      - name: The box is serving the commit we asked for
+        run: |
+          set -euo pipefail
+          head="$(git -C "$TECHSARA_DEPLOY_ROOT" rev-parse HEAD)"
+          echo "requested $DEPLOY_REF"
+          echo "checkout  $head"
+          [ "$head" = "$DEPLOY_REF" ]
+
       - name: Report what is now serving
         if: always()
-        env:
-          TECHSARA_DEPLOY_ROOT: ${{ vars.TECHSARA_DEPLOY_ROOT || '/home/techsphere/Documents/project/personal-LLM-Chabot' }}
         run: |
           cd "$TECHSARA_DEPLOY_ROOT" || exit 0
           echo "### Deployed commit" >> "$GITHUB_STEP_SUMMARY"
@@ -256,19 +834,38 @@ jobs:
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           tail -40 .runtime/logs/deploy-*.log >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
 
+  # --------------------------------------------------------------------------
+  # SMOKE TESTS. Deliberately not "did the port answer": on 2026-09-02 this
+  # engine held a green /health for 5.5 hours with a dead engine behind it, and
+  # the only signal that saw it was a real completion whose token counter never
+  # moved. So the model check here IS a real completion, and it asserts the
+  # counter advanced.
+  # --------------------------------------------------------------------------
   verify:
     name: "🔍 Verify production"
     needs: deploy
+    # Redundant with `needs` (a job with `needs` and no status function already
+    # skips when its dependency fails) but stated anyway, because the `policy`
+    # job requires every self-hosted job to carry its own branch restriction.
+    # A guard that is only implied is a guard nobody can audit.
+    if: >-
+      needs.deploy.result == 'success' &&
+      github.ref == 'refs/heads/main'
     runs-on: [self-hosted, dgx-spark]
-    timeout-minutes: 10
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    env:
+      TECHSARA_DEPLOY_ROOT: ${{ vars.TECHSARA_DEPLOY_ROOT || '/home/techsphere/Documents/project/personal-LLM-Chabot' }}
     steps:
-      - name: Prove the stack answers
+      - name: Every endpoint answers
+        id: endpoints
         run: |
           set -u
           pass=0; fail=0
           check() { # name url expect [retries]
             local name="$1" url="$2" expect="$3" tries="${4:-6}" code=""
-            for i in $(seq 1 "$tries"); do
+            for _ in $(seq 1 "$tries"); do
               code="$(curl -s -o /dev/null -w '%{http_code}' -m 10 "$url" 2>/dev/null || echo 000)"
               [ "$code" = "$expect" ] && break
               sleep 10
@@ -287,7 +884,116 @@ jobs:
           check "main model /v1/models"  "http://127.0.0.1:8000/v1/models"    200 9
           check "grafana /api/health"    "http://127.0.0.1:3300/api/health"   200
           check "prometheus /-/healthy"  "http://127.0.0.1:9090/-/healthy"    200
-          vllm_status="$(docker ps --filter name=sf-local-ai-vllm-1 --format '{{.Status}}' || echo '?')"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "- main model container: \`${vllm_status}\` — a routine deploy must NOT have reset this clock" >> "$GITHUB_STEP_SUMMARY"
           [ "$fail" -eq 0 ]
+
+      - name: The model actually generates (not just answers /health)
+        run: |
+          set -euo pipefail
+          gen="$TECHSARA_DEPLOY_ROOT/.runtime/generated.env"
+          port="$(grep -m1 '^VLLM_PORT=' "$gen" | cut -d= -f2)"
+          model="$(grep -m1 '^MAIN_MODEL=' "$gen" | cut -d= -f2)"
+          counter() {
+            curl -fsS -m 15 "http://127.0.0.1:${port}/metrics" \
+              | awk '/^vllm:generation_tokens_total/ {s+=$2} END {printf "%.0f", s+0}'
+          }
+          before="$(counter)"
+          reply="$(curl -fsS -m 180 -H 'Content-Type: application/json' \
+            -d "{\"model\":\"${model}\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with the single word: READY.\"}],\"max_tokens\":8,\"temperature\":0,\"chat_template_kwargs\":{\"enable_thinking\":false}}" \
+            "http://127.0.0.1:${port}/v1/chat/completions" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["choices"][0]["message"]["content"].strip()[:40])')"
+          after="$(counter)"
+          echo "reply=${reply@Q}  generation_tokens_total ${before} -> ${after}"
+          {
+            echo ""
+            echo "- real completion: \`${reply}\`"
+            echo "- \`vllm:generation_tokens_total\` ${before} → ${after}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          [ -n "$reply" ] || { echo "the engine returned an empty completion"; exit 1; }
+          # THE check. A wedged engine keeps serving /health and /v1/models and
+          # this counter stops moving; that is the only difference visible from
+          # outside, and it is the one that mattered.
+          [ "$after" -gt "$before" ] || {
+            echo "generation_tokens_total did not advance: the API server answered but the engine did not generate"
+            exit 1
+          }
+
+      - name: A rolling deploy did not restart the main model
+        run: |
+          set -u
+          vllm_status="$(docker ps --filter name=sf-local-ai-vllm-1 --format '{{.Status}}' || echo '?')"
+          echo "- main model container: \`${vllm_status}\` — a routine deploy must NOT have reset this clock" >> "$GITHUB_STEP_SUMMARY"
+          echo "$vllm_status"
+
+  # --------------------------------------------------------------------------
+  # RECOVERY. It DIAGNOSES; it does not act.
+  #
+  # scripts/deploy.sh already owns automatic recovery for the case it can
+  # judge: if its own health gate fails it rolls the checkout back to the
+  # previous commit and brings the stack up again, and if THAT fails it says
+  # the box needs a human. By the time `verify` runs, deploy.sh has already
+  # declared the stack healthy — so a verify failure means something degraded
+  # afterwards, and the right response is not a second unattended `techsara
+  # up`. On this hardware a spurious rollback can reload a 35B model and take
+  # the product down for 15-25 minutes to fix a flaky HTTP probe. So: collect
+  # everything a human needs, print the exact command, and stop.
+  # --------------------------------------------------------------------------
+  recovery:
+    name: "🩺 Recovery diagnostics"
+    needs: [deploy, verify]
+    if: >-
+      always() &&
+      github.ref == 'refs/heads/main' &&
+      (needs.deploy.result == 'failure' || needs.verify.result == 'failure')
+    runs-on: [self-hosted, dgx-spark]
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    env:
+      TECHSARA_DEPLOY_ROOT: ${{ vars.TECHSARA_DEPLOY_ROOT || '/home/techsphere/Documents/project/personal-LLM-Chabot' }}
+    steps:
+      - name: Collect the state a human needs
+        run: |
+          set -u
+          cd "$TECHSARA_DEPLOY_ROOT" || exit 0
+          {
+            echo "## 🩺 Deploy/verify failed — diagnostics"
+            echo ""
+            echo "- deploy: \`${{ needs.deploy.result }}\`  ·  verify: \`${{ needs.verify.result }}\`"
+            echo "- checkout HEAD: \`$(git rev-parse --short HEAD 2>/dev/null || echo '?')\` on \`$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')\`"
+            echo ""
+            echo "### Containers"
+            echo '```'
+            docker ps -a --filter label=com.docker.compose.project=sf-local-ai \
+              --format 'table {{.Names}}\t{{.Status}}\t{{.RunningFor}}' 2>&1 | head -40
+            echo '```'
+            echo "### Orchestrator /health"
+            echo '```json'
+            curl -fsS -m 15 http://127.0.0.1:8080/health 2>&1 | head -60
+            echo '```'
+            echo "### Last deploy log"
+            echo '```'
+            newest="$(find .runtime/logs -maxdepth 1 -name 'deploy-*.log' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)"
+            if [ -n "$newest" ]; then tail -80 "$newest"; else echo "no deploy log"; fi
+            echo '```'
+            echo "### What deploy.sh already did"
+            if [ "${{ needs.deploy.result }}" = "failure" ]; then
+              echo "The deploy script's own health gate failed, so it ALREADY attempted a"
+              echo "rollback to the previously-live commit. Read the log above for whether"
+              echo "the rollback came up healthy."
+            else
+              echo "deploy.sh passed its health gate and did NOT roll back; the stack"
+              echo "degraded after it finished. Nothing has been changed automatically."
+            fi
+            echo ""
+            echo "### To roll back by hand, from the box"
+            echo '```bash'
+            echo "cd $TECHSARA_DEPLOY_ROOT"
+            echo "scripts/deploy.sh --ref <last-good-sha>      # health-gated, rolls itself back on failure"
+            echo "scripts/cluster-status.sh                    # two-node fabric"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Say plainly that nothing was changed automatically
+        run: |
+          echo "Diagnostics only. No container was restarted and no commit was moved by this job."
+          exit 1

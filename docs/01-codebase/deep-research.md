@@ -186,9 +186,17 @@ Two guards, both in the engine:
   two generations at once. The engine is memory-bandwidth bound, so a third
   concurrent generation costs every other stream latency rather than adding
   throughput.
-* `_RUN_LOCK` — **one research run at a time per orchestrator process.** A
-  second request is refused with an honest sentence rather than silently
-  halving both runs' budgets against the same SearXNG and the same GPU.
+* `_Admission` — **a budget, not a mutex** (2026-09-07). Was `_RUN_LOCK`, one
+  run per process, which meant one person's ten-minute run refused every other
+  user org-wide. Now: `DEEP_RESEARCH_MAX_CONCURRENT` (2) process-wide,
+  `DEEP_RESEARCH_MAX_PER_USER` (1) so nobody can occupy the machine, and
+  `DEEP_RESEARCH_QUEUE_WAIT_S` (45 s) to wait for a slot before refusing.
+  The ceiling is 2 because the constraint is MODEL time: both runs share the
+  same `_LLM_SEM`, so a second run interleaves inside those two slots instead
+  of adding a third for interactive chat to queue behind. What genuinely
+  doubles is outbound fetch volume (16 per gather → 32). A refusal quotes live
+  accounting and the wall clock — "the earliest finishes in about 10 minutes" —
+  and never promises a time when no budget is configured.
 
 Search pacing matters too: Google's free CSE endpoint IP-blocked this host
 during testing at roughly 15–20 queries in 3 minutes, and the block **outlived**

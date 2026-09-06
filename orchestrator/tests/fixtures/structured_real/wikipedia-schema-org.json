@@ -1,0 +1,41 @@
+{
+  "slug": "wikipedia-schema-org",
+  "url": "https://en.wikipedia.org/wiki/Schema.org",
+  "cached_body_sha256": "5f183f65f6febae36e7f4f71fb9075bcb6ab1ae4b3a3618ff8e51e44b25e4877",
+  "markup": "jsonld",
+  "derived_by": "read out of the cached HTML by a human; NOT captured from the extractor",
+  "derived_on": "2026-09-07",
+  "quoted_source": [
+    "{\"@type\": \"Article\", \"name\": \"Schema.org\", \"url\": \"...\", \"sameAs\": \"http://www.wikidata.org/entity/Q3475322\", \"mainEntity\": \"http://www.wikidata.org/entity/Q3475322\", \"author\": {\"@type\": \"Organization\", \"name\": \"Contributors to Wikimedia projects\"}, \"publisher\": {\"@type\": \"Organization\", \"name\": \"Wikimedia Foundation, Inc.\", \"logo\": {\"@type\": \"ImageObject\", \"url\": \"...\"}}, \"datePublished\": \"2011-06-02T19:00:51Z\", \"dateModified\": \"2026-06-11T15:37:39Z\", \"headline\": \"project to create, maintain, and promote schemas for structured data on the Internet, ...\"}"
+  ],
+  "expectations": [
+    {
+      "entity": "Schema.org", "entity_type": "Article", "parent": "",
+      "field": "datePublished", "value": "2011-06-02T19:00:51Z",
+      "source": "jsonld",
+      "read_from": "\"datePublished\"; the Z form the page wrote, unparsed and unreformatted"
+    },
+    {
+      "entity": "Schema.org", "entity_type": "Article", "parent": "",
+      "field": "dateModified", "value": "2026-06-11T15:37:39Z",
+      "source": "jsonld",
+      "read_from": "\"dateModified\". NOTE: this is the one value in this whole fixture set that a live re-fetch will legitimately change -- a Wikipedia edit moves it. The sha256 pin above is what makes that a visible failure rather than a silent one."
+    },
+    {
+      "entity": "Schema.org", "entity_type": "Article", "parent": "",
+      "field": "author", "value": "Contributors to Wikimedia projects",
+      "source": "jsonld",
+      "read_from": "author is an Organization whose only scalar is its name -> folds onto the Article line"
+    }
+  ],
+  "known_absent": [
+    {
+      "entity": "Schema.org", "field": "publisher", "value": "Wikimedia Foundation, Inc.",
+      "reason": "A GAP, not a dedupe -- the string appears nowhere in the extracted text. `publisher` here is an Organization that also carries a nested `logo` object. The folding rule requires the nested object to have no nested values of its own, so a publisher WITH a logo is pushed out to a child record; that child's only remaining key is its name, which is the record's name, so it has no fields and an unnamed-depth record with no fields is not emitted. Compare ourworldindata.org/energy, whose publisher carries `logo` as a plain STRING and therefore does fold onto the line. Same schema, opposite outcome, decided by the type of a field this module skips."
+    },
+    {
+      "entity": "Schema.org", "field": "sameAs", "value": "http://www.wikidata.org/entity/Q3475322",
+      "reason": "`sameAs` is on the skip list. `mainEntity` -- the SAME URL under a different key -- is not, so the identifier does reach the line once. Deliberate to record: the skip list is key-based, so an identifier's survival depends on which key a publisher chose for it."
+    }
+  ]
+}

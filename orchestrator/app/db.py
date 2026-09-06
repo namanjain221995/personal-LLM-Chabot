@@ -56,10 +56,11 @@ from __future__ import annotations
 
 import functools
 import json
+import random
 import threading
 from contextlib import contextmanager
-from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, TypeVar
+from datetime import datetime, timedelta, timezone
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, TypeVar
 
 import psycopg
 from psycopg.rows import dict_row
@@ -1147,6 +1148,308 @@ ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS
 """
 
 
+_MIGRATION_V21 = """
+-- V21 (2026-09-05): which extractor produced a page's stored text.
+--
+-- RESTORED HISTORY, NOT NEW WORK. This migration was applied to the live
+-- database on 2026-09-05 04:59:59Z by a build that was later rolled back.
+-- Restoring source cannot un-apply a migration, so production kept these
+-- objects while the code that created them left the tree, and `schema_
+-- migrations` recorded a 21 that no source file explained.
+--
+-- The definition below is recovered VERBATIM from commits 34a7e3c / 829f17c
+-- (identical in both), not reconstructed from a schema diff — which matters,
+-- because a column-level diff of the live database missed the index entirely.
+-- Restoring the authentic text under its own identifier is what keeps the
+-- ledger honest: a database that already ran it skips it (the row is present),
+-- a fresh database now gets exactly what production has, and no identifier is
+-- ever reused for different content.
+--
+-- The original comment, preserved as written:
+--
+--   The readable-text pass dropped every row of a ranking page (the GPT-5.2
+--   regression); core/structured.py now appends tables, card lists and
+--   embedded records. Pages stored before that carry the OLD text, and the
+--   vector index chunks built from it. Rather than a one-off mass recrawl,
+--   every page records the extractor version that filled it; the refresh
+--   worker re-reads pages below the current version most-retrieved first,
+--   inside its ordinary per-cycle budget (see web_worker._due_pages).
+--   0 = unknown/legacy; the constant lives in core/extract.EXTRACT_VERSION.
+--
+-- That reasoning still holds, and this phase's extraction change recreates the
+-- same situation, which is why the column is adopted deliberately rather than
+-- dropped. `core/structured.py` does not exist in this tree; the equivalent
+-- augmentation now lives inside core/extract.py.
+ALTER TABLE web_pages ADD COLUMN IF NOT EXISTS
+    extract_version smallint NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS idx_web_pages_extract_version
+    ON web_pages (extract_version) WHERE extract_version < 2;
+"""
+
+
+_MIGRATION_V22 = """
+-- V22 (2026-09-06): make the stale-extractor index version-agnostic.
+--
+-- V21's index hardcodes the then-current extractor version in its predicate
+-- (`WHERE extract_version < 2`). Every bump of core/extract.EXTRACT_VERSION
+-- therefore silently stops indexing the rows the refresh worker needs to find:
+-- at EXTRACT_VERSION 3, pages sitting at 2 are exactly the ones due for
+-- re-reading and are the ones the partial index excludes.
+--
+-- The replacement carries no version literal, so it never needs revisiting,
+-- and its column order matches the query the worker actually runs — pages
+-- below the current version, most-retrieved first (web_worker._due_pages).
+DROP INDEX IF EXISTS idx_web_pages_extract_version;
+CREATE INDEX IF NOT EXISTS idx_web_pages_extract_stale
+    ON web_pages (extract_version, retrieval_count DESC);
+"""
+
+
+_MIGRATION_V23 = """
+-- V23 (2026-09-06): heal the pages that could never be refreshed.
+--
+-- V21 is restored history and V22 modernises its index; this is the new work.
+--
+-- V13 added next_refresh_at and seeded it for every row that existed at the
+-- time, but `upsert_web_page` never listed the column, so every page stored
+-- AFTER that migration was written with NULL and `_due_pages` (which requires
+-- `next_refresh_at IS NOT NULL`) could never see it again. Measured on the
+-- live corpus 2026-09-06: origin 'research' 123/123 NULL, 'crawl' 214/214
+-- NULL, 'search' 1265/1871 NULL — 1602 of 2208 pages, 73%, permanently
+-- stranded. The 606 rows that were scheduled are exactly the V13 survivors.
+--
+-- The upsert now seeds the column, so this backfill only has to catch the
+-- rows already stranded. Staggered across 24h for the same reason V13
+-- staggered: healing 1600 pages must not queue 1600 simultaneous fetches on
+-- the first worker cycle. Only pages with text are scheduled, matching the
+-- `text <> ''` filter the scheduler itself applies.
+UPDATE web_pages
+   SET next_refresh_at = now() + (random() * interval '24 hours')
+ WHERE next_refresh_at IS NULL AND text <> '';
+"""
+
+
+_MIGRATION_V24 = """
+-- V24 (2026-09-06): which CHUNKER produced a page's vectors.
+--
+-- V21/V22 gave every page the extractor version that produced its TEXT. This
+-- is the same idea one stage later, and it is a genuinely different fact: the
+-- chunker can change while the extractor does not (chunk width, overlap, or —
+-- as in this phase — repeating a table's header row into every chunk that
+-- holds its data, so a retrieved chunk is not bare numbers with no columns).
+--
+-- Without this the only signal was `indexed_at`, which answers "were these
+-- vectors ever built" and not "were they built by the CURRENT chunker". So a
+-- page whose text never changes keeps chunks from an obsolete chunker forever,
+-- and the only remedy was an operator-run full reindex. `chunker_version` in
+-- the LanceDB sidecar is per-INDEX, not per-page, so it cannot drive an
+-- incremental repair either.
+--
+-- 0 = unknown/legacy, exactly as extract_version. The constant lives in
+-- web_index.CHUNKER_VERSION and is passed in by the caller — db.py must not
+-- import web_index, which imports db.
+--
+-- The index carries no version literal (see V22 for why that was a trap) and
+-- orders by demand, so the repair drains most-retrieved-first inside the
+-- worker's ordinary per-cycle budget.
+ALTER TABLE web_pages ADD COLUMN IF NOT EXISTS
+    chunk_version smallint NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS idx_web_pages_chunk_stale
+    ON web_pages (chunk_version, retrieval_count DESC);
+"""
+
+
+_MIGRATION_V25 = """
+-- V25 (2026-09-07): the crawl frontier becomes durable (K12).
+--
+-- WHAT WAS WRONG. `engines/crawl._crawl_site` held its whole work queue in
+-- two Python locals: `frontier: List[Tuple[str, int]]` and
+-- `_CrawlState.visited: Set[str]`. Nothing was persisted, so a restart, a
+-- deploy, a closed tab or an OOM threw the queue away. Progress appeared to
+-- survive only by accident: the requeued job re-derived the frontier from the
+-- sitemap and `process()` skipped pages still fresh in `web_pages` within
+-- `web_page_ttl_s` (24h). Two cases got no protection from that accident at
+-- all -- a LINK-WALK crawl of a site with no usable sitemap restarted from
+-- the root and had to re-walk its way back to where it stopped, and ANY crawl
+-- resumed after the 24h TTL re-fetched every page it had already read.
+--
+-- WHY A TABLE AND NOT A COLUMN. The queue is a set of URLs with depths, not a
+-- scalar, and it must survive a process that is not running. It is keyed by
+-- `scope_prefix`, NOT by `web_crawls.id`, because a crawl CAMPAIGN outlives
+-- any one row: a foreground "continue crawling" opens a brand-new web_crawls
+-- row (engines/crawl.run_crawl_engine -> db.create_web_crawl) for the same
+-- site, so a crawl_id key would have made every foreground resume start from
+-- an empty frontier -- exactly the defect this migration exists to remove.
+-- `scope_prefix` is already the project's identity for "a crawl of this
+-- site": db.enqueue_web_crawl dedupes queued and running jobs by it.
+--
+-- `crawl_id` therefore records WHICH run last touched a row (provenance for
+-- the operator, and a real FK so deleting crawl history cannot leave rows
+-- pointing at nothing) and is deliberately NOT part of the key. ON DELETE SET
+-- NULL: removing a crawl's history must never destroy the progress of a
+-- campaign that is still open.
+--
+-- STATE MACHINE, and why 'visited' is stamped AFTER the page settles rather
+-- than when it is claimed. The in-memory code added a URL to `visited` BEFORE
+-- fetching it. Persisting that shape would have converted "interrupted
+-- mid-fetch" into "permanently skipped": the row would say visited and the
+-- page would never have been read. A row leaves 'pending' only once the page
+-- has actually settled, so the worst an interruption can cost is re-fetching
+-- the handful of pages that were in flight -- duplication of bounded, polite
+-- work, never a silent hole in the crawl.
+--
+-- `failures` bounds the other direction. A page that fails to fetch stays
+-- pending so a transient blip is retried, but only until the counter reaches
+-- the caller's cap (engines/crawl._FRONTIER_MAX_FAILURES); after that it is
+-- marked visited/'failed' so a resume cannot spend its whole page budget
+-- re-attempting the same dead URL on every restart -- the "stopped at the
+-- same spot every time" failure the V9 review already recorded once.
+--
+-- No index predicate carries a literal that can move (see V22 for the trap
+-- V21 fell into): the ordering index is a plain composite over the columns
+-- the claim query actually orders by.
+CREATE TABLE IF NOT EXISTS web_crawl_frontier (
+    id           bigint      GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    -- The campaign this URL belongs to: web_crawls.scope_prefix, i.e. the
+    -- normalized "host/path" prefix every page of the crawl must start with.
+    scope_prefix text        NOT NULL,
+    -- The store key (engines.search._normalize_url), so the frontier and
+    -- web_pages agree on what "the same page" means.
+    url_key      text        NOT NULL,
+    url          text        NOT NULL,
+    depth        smallint    NOT NULL DEFAULT 0,
+    state        text        NOT NULL DEFAULT 'pending'
+                 CONSTRAINT web_crawl_frontier_state CHECK
+                 (state IN ('pending', 'visited')),
+    -- How the page settled: fetched | store | failed | refused | blocked |
+    -- offsite. '' while pending. Kept so "did the crawl skip anything, and
+    -- why" is answerable from the database instead of from log archaeology.
+    outcome      text        NOT NULL DEFAULT '',
+    failures     smallint    NOT NULL DEFAULT 0,
+    crawl_id     bigint      REFERENCES web_crawls (id) ON DELETE SET NULL,
+    enqueued_at  timestamptz NOT NULL DEFAULT now(),
+    visited_at   timestamptz
+);
+-- Identity of a frontier entry, and the ON CONFLICT target that makes
+-- re-seeding a resumed campaign idempotent: a URL already visited must not be
+-- reset to pending by the next run re-reading the same sitemap.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_web_crawl_frontier_key
+    ON web_crawl_frontier (scope_prefix, url_key);
+-- The claim query: the shallowest unvisited pages of one campaign, in
+-- discovery order (breadth-first, exactly as the in-memory list behaved).
+CREATE INDEX IF NOT EXISTS idx_web_crawl_frontier_next
+    ON web_crawl_frontier (scope_prefix, state, depth, id);
+"""
+
+
+_MIGRATION_V26 = """
+-- V26 (2026-09-07): stop `last_changed_at` claiming changes nobody observed.
+--
+-- WHAT THE COLUMN MEANS. V13 defined it precisely -- "stamped by the upsert
+-- only when content_hash actually moves, so a page re-fetched daily with
+-- identical bytes does not look freshly authored". The UPDATE path has always
+-- honoured that. Two other writes did not:
+--
+--   * `upsert_web_page` passed `now` for it on every FIRST insert, so a page
+--     seen once carried a change timestamp for a change that never happened;
+--   * V13's own backfill ran `SET last_changed_at = fetched_at WHERE
+--     last_changed_at IS NULL`, describing fetched_at as "the best known
+--     lower bound" -- an honest approximation that the column's stated
+--     meaning cannot express, because a lower bound is not an observation.
+--
+-- Measured on the live corpus 2026-09-06: 1,338 of 2,208 rows (61%) hold
+-- last_changed_at EXACTLY equal to fetched_at. The write-path half is fixed
+-- above (the INSERT now writes NULL); this migration decides what to do with
+-- the rows already written.
+--
+-- WHY NOT BACKFILL A BETTER GUESS. There is nothing to back-fill FROM. The
+-- moment a page's content moved was never recorded, and no column in this
+-- schema is a proxy for it: published_at and modified_at are what the PAGE
+-- claims about itself (frequently absent, frequently a build timestamp), and
+-- web_page_versions only exists from the second observed change onwards.
+-- Inventing a date here is the exact mistake being corrected.
+--
+-- WHY NOT A SECOND COLUMN. The obvious alternative -- leave this column alone
+-- and add a new, honest one beside it -- was rejected on evidence. Nothing
+-- READS last_changed_at for ranking today: web_memory._page_meta selects it
+-- (web_memory.py:1180) and never copies it onto Evidence, which has no field
+-- for it; the only consumer of the concept is web_worker._mark_changed, which
+-- WRITES it. So a second column would add a fourth thing for four call sites
+-- to maintain, in service of no reader, and would leave this column
+-- permanently ambiguous instead of converging on one meaning. Fixing the
+-- meaning in place is cheaper and leaves one column that means one thing.
+--
+-- WHAT IS CLEARED, AND WHY IT IS A PROOF RATHER THAN A GUESS. Only rows we
+-- have fetched EXACTLY ONCE:
+--
+--     fetch_count = 1 AND first_seen_at = fetched_at AND last_changed_at = fetched_at
+--
+-- A change is observed by comparing two fetches. A page that has been fetched
+-- once has no second observation to compare against, so its stored
+-- "last changed" CANNOT be an observation -- whatever wrote it, it wrote a
+-- default. fetch_count is bumped by both writers that see a page again
+-- (`upsert_web_page`'s ON CONFLICT and `touch_web_page_unchanged`'s 304
+-- path), and first_seen_at is set on insert and never updated, so the three
+-- conditions together are decidable from the row alone.
+--
+-- WHAT IS DELIBERATELY LEFT ALONE. Rows with fetch_count > 1 whose
+-- last_changed_at happens to equal fetched_at. Some are V13 backfill
+-- survivors (invented) and some are pages that genuinely changed on their
+-- most recent fetch -- `upsert_web_page` writes both timestamps from a single
+-- `now`, so a real change makes them exactly equal too. The two are not
+-- distinguishable from the data, and "probably invented" is not a reason to
+-- destroy a value that may be real. They stay, and they will correct
+-- themselves the next time the refresh worker observes an actual change.
+--
+-- AFTER THIS, NULL MEANS ONE THING: we have never observed this page's
+-- content move. A reader wanting a lower bound should fall back to
+-- first_seen_at explicitly -- which is what the old value was silently
+-- pretending to be.
+--
+-- Idempotent: re-running matches nothing, because the rows it touched no
+-- longer satisfy `last_changed_at = fetched_at`.
+UPDATE web_pages
+   SET last_changed_at = NULL
+ WHERE last_changed_at IS NOT NULL
+   AND last_changed_at = fetched_at
+   AND first_seen_at = fetched_at
+   AND fetch_count = 1;
+"""
+
+
+_MIGRATION_V27 = """
+-- V27 (2026-09-07): raise the chunk cap WITHOUT re-embedding the whole corpus.
+--
+-- `web_index._MAX_CHUNKS_PER_PAGE` rose 64 -> 256 and `CHUNKER_VERSION` 2 -> 3,
+-- which by itself would put all 2,063 indexable pages into the V24 re-chunk
+-- queue: ~16,000 chunks, ~6 minutes of embedding at full tilt, and — measured —
+-- 1.65x to 4x the time-to-first-token for anyone using the platform while it
+-- drains. Almost all of that work would be wasted.
+--
+-- IT IS PROVABLY UNNECESSARY FOR MOST PAGES. `chunk_page` stops on
+-- `start + CHUNK >= len(text)`, not on the cap, so the cap only binds for a
+-- page needing more than 64 chunks. A page whose text fits in the OLD ceiling
+-- (179,600 chars) therefore chunks BYTE-IDENTICALLY at either cap: same
+-- windows, same header carry, same text. Its vectors are already correct for
+-- chunker 3 and re-embedding them would produce the same numbers.
+--
+-- Measured on the live corpus 2026-09-07: 59 of 2,208 stored pages exceed
+-- 179,600 characters. Only those need re-chunking; the other ~2,004 indexable
+-- pages are stamped here.
+--
+-- The literal 179600 is deliberate and must NOT be replaced with
+-- `INDEXED_CHARS_PER_PAGE`: that constant now reads 717,200, and this migration
+-- is a statement about the ceiling that was in force when those rows were
+-- indexed. (V22 exists because a version literal in a predicate went stale;
+-- this is the opposite case — a historical constant that must stay pinned.)
+UPDATE web_pages
+   SET chunk_version = 3
+ WHERE indexed_at IS NOT NULL
+   AND chunk_version = 2
+   AND length(text) <= 179600;
+"""
+
+
 _MIGRATIONS: tuple = (
     (1, _MIGRATION_V1),
     (2, _MIGRATION_V2),
@@ -1168,6 +1471,13 @@ _MIGRATIONS: tuple = (
     (18, _MIGRATION_V18),
     (19, _MIGRATION_V19),
     (20, _MIGRATION_V20),
+    (21, _MIGRATION_V21),
+    (22, _MIGRATION_V22),
+    (23, _MIGRATION_V23),
+    (24, _MIGRATION_V24),
+    (25, _MIGRATION_V25),
+    (26, _MIGRATION_V26),
+    (27, _MIGRATION_V27),
 )
 
 #: The version `init_schema` brings a database up to. Exported so callers (and
@@ -1409,11 +1719,27 @@ def init_schema() -> None:
 
 
 def schema_version() -> int:
-    """Highest applied migration version, or 0 on an empty database."""
-    with connection() as con:
-        row = con.execute(
-            "SELECT COALESCE(MAX(version), 0) AS v FROM schema_migrations"
-        ).fetchone()
+    """Highest applied migration version, or 0 on an empty database.
+
+    "Empty" includes a database with no schema AT ALL. Before the first
+    `init_schema()` the `schema_migrations` table does not exist, and asking a
+    never-migrated database for its version is a fair question whose answer is
+    0 -- but the bare SELECT raised `UndefinedTable` instead, so the first call
+    against a fresh database was an error rather than a zero. CI's
+    fresh-install check hit exactly that, and `health.py` would have too on a
+    database that had never started up.
+
+    ONLY `UndefinedTable` is swallowed. A connection failure, a permission
+    error or a wrong-database DSN still propagates, so this cannot quietly
+    report 0 for a database it simply could not read.
+    """
+    try:
+        with connection() as con:
+            row = con.execute(
+                "SELECT COALESCE(MAX(version), 0) AS v FROM schema_migrations"
+            ).fetchone()
+    except psycopg.errors.UndefinedTable:
+        return 0
     return int(row["v"]) if row else 0
 
 
@@ -1723,6 +2049,25 @@ def log_web_search(
 _MAX_PAGE_VERSIONS = 5
 
 
+def _initial_refresh_deadline(now: datetime, text: str) -> Optional[datetime]:
+    """When a newly stored page first becomes eligible for re-fetch.
+
+    Without this the column stayed NULL and `web_worker._due_pages`, which
+    requires `next_refresh_at IS NOT NULL`, could never see the page again:
+    73% of the live corpus was stranded that way (see _MIGRATION_V23).
+
+    Staggered across 24h rather than stamped with a single deadline, so a
+    burst of stored pages does not come due as a burst of fetches. The worker
+    replaces this with a volatility-derived TTL (`web_worker._ttl_for`) the
+    first time it actually refreshes the page — this only has to get the row
+    into the queue. Pages with no text are left unscheduled, matching the
+    scheduler's own `text <> ''` filter.
+    """
+    if not (text or "").strip():
+        return None
+    return now + timedelta(seconds=random.uniform(0, 24 * 3600))
+
+
 def upsert_web_page(
     url_key: str,
     url: str,
@@ -1743,6 +2088,7 @@ def upsert_web_page(
     origin: str = "search",
     introduced_by_user_id: Optional[int] = None,
     introduced_in_conversation_id: Optional[str] = None,
+    extract_version: int = 0,
 ) -> dict:
     """Store (or refresh) one fetched page, globally deduped by `url_key`.
 
@@ -1762,6 +2108,22 @@ def upsert_web_page(
     structural source class, the cached authority) and a CHANGED page's
     previous text is preserved in web_page_versions before it is replaced —
     a change over time stays distinguishable from a contradiction.
+
+    V22: `extract_version` records WHICH extractor filled `text`, so a later
+    extractor improvement can re-read the pages that predate it in priority
+    order instead of triggering a mass recrawl. It only ever moves up.
+
+    V23: `next_refresh_at` is seeded here. It was missing from the column
+    list, so every page stored after V13 was written NULL and could never be
+    picked up by the refresh scheduler again. On conflict the stored deadline
+    wins whenever it is set, so healing an old NULL row never overwrites a
+    deadline the worker chose.
+
+    V26: `last_changed_at` means "when we OBSERVED this page's content move",
+    and a first insert observes nothing — it is NULL until a later fetch comes
+    back with a different hash. It used to be stamped with `now` on insert,
+    which made "when we first saw it" and "when it last changed" the same
+    column for any page fetched once, i.e. most of the corpus.
     """
     now = _now()
     from .core.provenance import domain_of as _domain_of
@@ -1803,9 +2165,10 @@ def upsert_web_page(
             "content_type, fetch_status, content_hash, links, fetch_count, "
             "first_seen_at, fetched_at, indexed_at, published_at, modified_at, "
             "last_changed_at, source_type, authority, domain, etag, last_modified, "
-            "origin, introduced_by_user_id, introduced_in_conversation_id) "
+            "origin, introduced_by_user_id, introduced_in_conversation_id, "
+            "next_refresh_at, extract_version) "
             "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 1, %s, %s, NULL, "
-            "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+            "%s, %s, NULL, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
             "ON CONFLICT (url_key) DO UPDATE SET "
             # Provenance (V16): the first introducer stays; origin may only
             # move towards more trust ('share' → anything found independently).
@@ -1830,8 +2193,18 @@ def upsert_web_page(
             # does not un-publish itself, so a known value is never erased.
             "published_at = COALESCE(EXCLUDED.published_at, web_pages.published_at), "
             "modified_at = COALESCE(EXCLUDED.modified_at, web_pages.modified_at), "
+            # K8 (2026-09-07): "when did this page's content MOVE" — and
+            # nothing else. The CASE was already right: an unchanged re-fetch
+            # keeps the stored value. What was wrong sat on the INSERT side,
+            # which stamped `now` on a page being seen for the FIRST time and
+            # so recorded a change that was never observed (61% of the live
+            # corpus; see _MIGRATION_V26). The INSERT now writes NULL and the
+            # timestamp is supplied HERE, where the SQL itself has just proved
+            # the hash moved — not from a `changed` flag computed in Python
+            # from an earlier SELECT, which a concurrent writer could have
+            # made stale between the two statements.
             "last_changed_at = CASE WHEN web_pages.content_hash = EXCLUDED.content_hash "
-            "THEN web_pages.last_changed_at ELSE EXCLUDED.last_changed_at END, "
+            "THEN web_pages.last_changed_at ELSE %s END, "
             "source_type = CASE WHEN EXCLUDED.source_type <> '' "
             "THEN EXCLUDED.source_type ELSE web_pages.source_type END, "
             "authority = CASE WHEN EXCLUDED.authority > 0 "
@@ -1839,7 +2212,15 @@ def upsert_web_page(
             "domain = CASE WHEN EXCLUDED.domain <> '' THEN EXCLUDED.domain ELSE web_pages.domain END, "
             "etag = CASE WHEN EXCLUDED.etag <> '' THEN EXCLUDED.etag ELSE web_pages.etag END, "
             "last_modified = CASE WHEN EXCLUDED.last_modified <> '' "
-            "THEN EXCLUDED.last_modified ELSE web_pages.last_modified END "
+            "THEN EXCLUDED.last_modified ELSE web_pages.last_modified END, "
+            # Heal a row stranded with NULL (see V23) without ever
+            # overriding a deadline the refresh worker has set.
+            "next_refresh_at = COALESCE(web_pages.next_refresh_at, EXCLUDED.next_refresh_at), "
+            # Never downgrade. A page re-read by a newer extractor records the
+            # newer version; a write from an older path (or one that does not
+            # set it at all) must not make the row look stale again and put it
+            # back in the re-extraction queue forever.
+            "extract_version = GREATEST(web_pages.extract_version, EXCLUDED.extract_version) "
             "RETURNING id",
             (
                 _text(url_key),
@@ -1859,7 +2240,6 @@ def upsert_web_page(
                 now,
                 published_at,
                 modified_at,
-                now,
                 _text(source_type or ""),
                 int(authority or 0),
                 _text(domain),
@@ -1868,10 +2248,123 @@ def upsert_web_page(
                 _text(origin or "search")[:20],
                 int(introduced_by_user_id) if introduced_by_user_id is not None else None,
                 _text(introduced_in_conversation_id or "")[:64] or None,
+                _initial_refresh_deadline(now, text),
+                int(extract_version or 0),
+                # The ON CONFLICT clause's own parameter — last in the SQL
+                # text, so last in this tuple: the moment a hash change was
+                # OBSERVED. Never reached on a first insert.
+                now,
             ),
         ).fetchone()
         bump_web_corpus_generation()
         return {"id": int(row["id"]), "changed": changed, "previous_hash": previous_hash}
+
+
+def touch_web_page_unchanged(url_key: str, etag: str = "", last_modified: str = "") -> None:
+    """Record a 304: advance the freshness clock and NOTHING else.
+
+    A conditional re-fetch that comes back 304 proves the stored copy is still
+    current. `text`, `content_hash`, `links`, `indexed_at`, `last_changed_at`
+    and `extract_version` are therefore all still correct — and `indexed_at` in
+    particular must not move, or the page would be re-chunked and re-embedded
+    for a body that was never downloaded. `fetched_at` is the one genuinely new
+    fact: we confirmed the copy is current just now, which is what the TTL and
+    every recency score actually ask about.
+
+    Deliberately not routed through `upsert_web_page`: that call needs a body.
+    Passing an empty `text` would blank the stored page, and passing the old
+    text back would rewrite the row — and append to its version history — to
+    say something happened when nothing did.
+
+    Fresh validators are stored when the server re-sent them (RFC 9110 allows a
+    304 to carry an updated ETag) and left alone when it did not.
+    """
+    with connection() as con:
+        con.execute(
+            """UPDATE web_pages
+                  SET fetched_at = now(),
+                      fetch_count = fetch_count + 1,
+                      etag = CASE WHEN %s <> '' THEN %s ELSE etag END,
+                      last_modified = CASE WHEN %s <> '' THEN %s ELSE last_modified END
+                WHERE url_key = %s""",
+            (
+                _text(etag or ""),
+                _text(etag or ""),
+                _text(last_modified or ""),
+                _text(last_modified or ""),
+                _text(url_key),
+            ),
+        )
+    bump_web_corpus_generation()
+
+
+def servable_web_page_ids(page_ids: Sequence[int]) -> set:
+    """Of these page ids, the ones a retrieval result may actually show.
+
+    The vector index is DERIVED state and can outlive its rows: a purge that
+    dropped the page (or an operator quarantine) leaves chunks behind, and
+    `engines/crawl.site_hits_for` renders `web_index.retrieve` output straight
+    into an answer with no database round trip of its own. Before this existed
+    a quarantined page was still being answered from and a purged one still
+    cited — the row was gone and its text still reached the user.
+
+    Cheap on purpose: one indexed `id = ANY(...)` over the ids a query is about
+    to return, called after the distance floor so only returnable hits are
+    looked up, and never on the event loop.
+    """
+    ids = [int(i) for i in page_ids]
+    if not ids:
+        return set()
+    with connection() as con:
+        rows = con.execute(
+            "SELECT id FROM web_pages WHERE id = ANY(%s) AND quarantined_at IS NULL",
+            (ids,),
+        ).fetchall()
+    return {int(r["id"]) for r in rows}
+
+
+def set_web_page_quarantine(page_ids: Sequence[int], *, quarantined: bool) -> int:
+    """Withhold (or restore) pages from every retrieval path. Returns rows hit.
+
+    Quarantine is a column rather than a delete so the decision is reversible
+    and auditable — the page's text, provenance and history stay put. The
+    corpus generation is bumped so a cached retrieval computed before the
+    change cannot outlive it.
+    """
+    ids = [int(i) for i in page_ids]
+    if not ids:
+        return 0
+    with connection() as con:
+        rows = con.execute(
+            "UPDATE web_pages SET quarantined_at = %s WHERE id = ANY(%s) RETURNING id",
+            (_now() if quarantined else None, ids),
+        ).fetchall()
+    bump_web_corpus_generation()
+    return len(rows)
+
+
+def web_page_ids_for_urls(urls: Sequence[str]) -> dict:
+    """{url as given: page id} for urls matching either `url` or `canonical_url`.
+
+    The handle an operator actually holds is a link out of a citation panel,
+    and that may be either spelling — a page fetched through a redirect is
+    stored under both. Unmatched urls are simply absent from the result.
+    """
+    wanted = [_text(u) for u in urls if (u or "").strip()]
+    if not wanted:
+        return {}
+    with connection() as con:
+        rows = con.execute(
+            "SELECT id, url, canonical_url FROM web_pages "
+            "WHERE url = ANY(%s) OR canonical_url = ANY(%s)",
+            (wanted, wanted),
+        ).fetchall()
+    out: dict = {}
+    for row in rows:
+        for spelling in (row["url"], row["canonical_url"]):
+            if spelling in wanted:
+                out[spelling] = int(row["id"])
+    return out
 
 
 #: Bumped on every write to the shared corpus (page upsert, index write,
@@ -2044,37 +2537,75 @@ def reset_web_index_watermark() -> int:
         return int(cur.rowcount or 0)
 
 
-def get_unindexed_web_pages(limit: int = 20, page_ids: Optional[List[int]] = None) -> List[dict]:
-    """Pages the vector index has not seen (new, or changed since last index).
+def get_unindexed_web_pages(
+    limit: int = 20,
+    page_ids: Optional[List[int]] = None,
+    chunk_version: int = 0,
+) -> List[dict]:
+    """Pages whose vectors are missing OR were built by an obsolete chunker.
+
+    Two distinct reasons a page needs indexing, and conflating them was the
+    bug (V24): `indexed_at IS NULL` means "no vectors for this text", while
+    `chunk_version < CHUNKER_VERSION` means "vectors exist and are shaped
+    wrong". A page whose text never changes only ever hits the second, so
+    before this it kept obsolete chunks forever.
+
+    `chunk_version` is the CURRENT chunker version, passed in because db.py
+    must not import web_index (which imports db). 0 keeps the old behaviour.
+
+    New/changed pages come first (a user is likely waiting on those), then the
+    stale-chunker repair, most-retrieved-first so the pages behind the most
+    answers are fixed first.
 
     `page_ids` restricts the pass to those pages — the Fast lookup indexes
     the two pages it just fetched instead of draining the global queue
     inside its deadline."""
+    stale = "(indexed_at IS NULL OR chunk_version < %s)"
+    order = "ORDER BY (indexed_at IS NULL) DESC, retrieval_count DESC, fetched_at DESC"
     with connection() as con:
         if page_ids:
             rows = con.execute(
                 "SELECT id, url_key, url, title, text, fetched_at FROM web_pages "
-                "WHERE indexed_at IS NULL AND text <> '' AND id = ANY(%s) "
-                "ORDER BY fetched_at DESC LIMIT %s",
-                ([int(i) for i in page_ids], int(limit)),
+                f"WHERE {stale} AND text <> '' AND id = ANY(%s) "
+                f"{order} LIMIT %s",
+                (int(chunk_version), [int(i) for i in page_ids], int(limit)),
             ).fetchall()
         else:
             rows = con.execute(
                 "SELECT id, url_key, url, title, text, fetched_at FROM web_pages "
-                "WHERE indexed_at IS NULL AND text <> '' "
-                "ORDER BY fetched_at DESC LIMIT %s",
-                (int(limit),),
+                f"WHERE {stale} AND text <> '' "
+                f"{order} LIMIT %s",
+                (int(chunk_version), int(limit)),
             ).fetchall()
     return [dict(r) for r in rows]
 
 
-def mark_web_pages_indexed(page_ids: List[int]) -> None:
+def count_stale_chunk_pages(chunk_version: int) -> int:
+    """How many stored pages still carry vectors from an older chunker."""
+    with connection() as con:
+        return int(
+            con.execute(
+                "SELECT count(*) AS n FROM web_pages "
+                "WHERE text <> '' AND indexed_at IS NOT NULL AND chunk_version < %s",
+                (int(chunk_version),),
+            ).fetchone()["n"]
+        )
+
+
+def mark_web_pages_indexed(page_ids: List[int], chunk_version: int = 0) -> None:
+    """Stamp the watermark AND the chunker that produced these vectors.
+
+    Recording the version is what stops a repaired page from being picked up
+    again on the next cycle; without it the stale-chunker scan would return the
+    same pages forever (the same spin `extract_version` needed GREATEST for).
+    """
     if not page_ids:
         return
     with connection() as con:
         con.execute(
-            "UPDATE web_pages SET indexed_at = %s WHERE id = ANY(%s)",
-            (_now(), list(page_ids)),
+            "UPDATE web_pages SET indexed_at = %s, "
+            "chunk_version = GREATEST(chunk_version, %s) WHERE id = ANY(%s)",
+            (_now(), int(chunk_version), list(page_ids)),
         )
     bump_web_corpus_generation()
 
@@ -2169,6 +2700,32 @@ def finish_research_run(
                 int(run_id),
             ),
         )
+
+
+def close_interrupted_research_runs() -> int:
+    """At startup: close research runs a restart left claiming to be running.
+
+    `web_crawls` has had this since V14 (`requeue_interrupted_web_crawls`);
+    `research_runs` never did, so a run interrupted by a restart stayed
+    'running' forever — inflating the admin research analytics and hiding
+    that the run had died.
+
+    These are closed rather than requeued, unlike a background crawl. A crawl
+    resumes nearly free because its fetched pages are already stored, but a
+    research run keeps its plan, claims and resolutions only in process
+    memory: there is nothing on disk to resume from, and silently restarting
+    someone's 10-minute investigation without them asking would be worse than
+    telling them it stopped. Any pages it fetched are already in the shared
+    corpus regardless.
+    """
+    with connection() as con:
+        closed = con.execute(
+            "UPDATE research_runs SET status = 'failed', "
+            "detail = 'interrupted by a restart', finished_at = %s "
+            "WHERE status = 'running' RETURNING id",
+            (_now(),),
+        ).fetchall()
+    return len(closed)
 
 
 def get_research_runs(conversation_id: str, limit: int = 10) -> List[dict]:
@@ -2294,6 +2851,249 @@ def get_web_crawl(crawl_id: int) -> Optional[dict]:
             (int(crawl_id),),
         ).fetchone()
     return dict(row) if row else None
+
+
+# ---------------------------------------------------------------------------
+# V25: the durable crawl frontier (K12)
+#
+# The crawl's work queue, keyed by CAMPAIGN (`scope_prefix`) rather than by
+# `web_crawls.id`, so a foreground "continue crawling" — which opens a new
+# web_crawls row for the same site — resumes the same frontier a background
+# job left behind. See _MIGRATION_V25 for why the shape is what it is.
+#
+# Every function here is synchronous and belongs on the `run_in_thread` pool,
+# like the rest of this module; the crawler never blocks its event loop on one.
+# ---------------------------------------------------------------------------
+
+
+#: A btree index entry cannot exceed roughly a third of an 8 KB page, and the
+#: frontier's identity index covers (scope_prefix, url_key). Anything near that
+#: bound is a query-parameter artifact rather than a page, so it is declined at
+#: enqueue instead of being truncated into a key that would never match again.
+_MAX_FRONTIER_KEY_BYTES = 2000
+
+
+def add_crawl_frontier(
+    scope_prefix: str,
+    entries: Sequence[Tuple[str, str, int]],
+    crawl_id: Optional[int] = None,
+) -> int:
+    """Enqueue `(url_key, url, depth)` triples for one campaign. → rows added.
+
+    Idempotent by construction: a URL already in the frontier keeps the state
+    it has. That is what makes re-seeding a resumed campaign from the same
+    sitemap safe — a page the last run already read must not be reset to
+    pending, and a page it left pending must not be duplicated.
+
+    `crawl_id` is provenance only (which run put this here); it never takes
+    part in the key.
+    """
+    rows = []
+    seen: set = set()
+    skipped_long = 0
+    for url_key, url, depth in entries:
+        key = _text(url_key or "")
+        if not key:
+            continue
+        if len(key.encode("utf-8")) > _MAX_FRONTIER_KEY_BYTES:
+            # SKIPPED, never truncated. A btree entry has a hard size limit, so
+            # this cannot simply be stored — and truncating it would produce a
+            # row key the crawler could never match when it settles the page,
+            # leaving the URL pending forever. A URL this long is a parameter
+            # artifact, not a page, so declining it (loudly) is the honest
+            # outcome. Nothing else in the crawl is affected.
+            skipped_long += 1
+            continue
+        if key in seen:
+            # Deduped in Python as well as in the index: ON CONFLICT cannot
+            # resolve two conflicting rows inside ONE statement, and a sitemap
+            # that lists the same page twice would otherwise abort the insert
+            # with "ON CONFLICT DO UPDATE command cannot affect row a second
+            # time" — taking the whole crawl down with it.
+            continue
+        seen.add(key)
+        rows.append((_text(scope_prefix), key, _text(url or ""), int(depth)))
+    if skipped_long:
+        import logging  # local, like every other logger in this module
+
+        logging.getLogger(__name__).info(
+            "crawl frontier: skipped %d URL(s) over %d bytes for scope %s",
+            skipped_long, _MAX_FRONTIER_KEY_BYTES, _text(scope_prefix)[:120],
+        )
+    if not rows:
+        return 0
+    added = 0
+    with connection() as con:
+        for chunk_start in range(0, len(rows), 1000):
+            chunk = rows[chunk_start : chunk_start + 1000]
+            result = con.execute(
+                "INSERT INTO web_crawl_frontier "
+                "(scope_prefix, url_key, url, depth, crawl_id) "
+                "SELECT s, k, u, d, %s FROM unnest(%s::text[], %s::text[], "
+                "%s::text[], %s::int[]) AS t(s, k, u, d) "
+                "ON CONFLICT (scope_prefix, url_key) DO NOTHING",
+                (
+                    int(crawl_id) if crawl_id else None,
+                    [r[0] for r in chunk],
+                    [r[1] for r in chunk],
+                    [r[2] for r in chunk],
+                    [r[3] for r in chunk],
+                ),
+            )
+            added += int(result.rowcount or 0)
+    return added
+
+
+def take_crawl_frontier(
+    scope_prefix: str,
+    limit: int,
+    after_depth: int = -1,
+    after_id: int = 0,
+) -> List[dict]:
+    """The next `limit` unvisited URLs of one campaign, breadth-first.
+
+    Deliberately NOT a claim: rows stay 'pending' until the page has actually
+    settled (see mark_crawl_frontier / defer_crawl_frontier), because a row
+    claimed-then-lost would be a page silently skipped. Two crawlers on one
+    scope would duplicate a batch of polite fetches at worst — and they cannot
+    normally coexist anyway: db.next_queued_web_crawl claims jobs FOR UPDATE
+    SKIP LOCKED, enqueue_web_crawl refuses a scope that is queued or running,
+    and engines.crawl._QUEUE_LOCK is single-flight per process.
+
+    Because nothing is claimed, "the next pending row" alone would hand back a
+    URL this run has already attempted and deferred, forever. `(after_depth,
+    after_id)` is a keyset cursor over the same (depth, id) order the index
+    carries: within a run it never returns a row twice, and a run that starts
+    fresh — a resume — sees every pending row again, deferred ones included.
+    New rows are always appended with a higher id at a depth at or below the
+    one being read, so the cursor cannot skip work that is discovered later.
+    """
+    if limit <= 0:
+        return []
+    with connection() as con:
+        rows = con.execute(
+            "SELECT id, url_key, url, depth, failures FROM web_crawl_frontier "
+            "WHERE scope_prefix = %s AND state = 'pending' "
+            "AND (depth, id) > (%s, %s) "
+            "ORDER BY depth, id LIMIT %s",
+            (_text(scope_prefix), int(after_depth), int(after_id), int(limit)),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def mark_crawl_frontier(
+    scope_prefix: str,
+    url_keys: Sequence[str],
+    outcome: str,
+    crawl_id: Optional[int] = None,
+) -> int:
+    """Settle URLs: 'pending' → 'visited', with why. → rows updated.
+
+    Terminal for this campaign. `outcome` is one of fetched | store | failed |
+    refused | blocked | offsite; it is recorded rather than discarded so the
+    question the durability work exists to answer — "did the resume skip
+    anything, and which" — is answerable from the table.
+    """
+    keys = [_text(k) for k in url_keys if k]
+    if not keys:
+        return 0
+    with connection() as con:
+        result = con.execute(
+            "UPDATE web_crawl_frontier SET state = 'visited', outcome = %s, "
+            "visited_at = %s, crawl_id = COALESCE(%s, crawl_id) "
+            "WHERE scope_prefix = %s AND url_key = ANY(%s) AND state = 'pending'",
+            (
+                _text(outcome or "")[:20],
+                _now(),
+                int(crawl_id) if crawl_id else None,
+                _text(scope_prefix),
+                keys,
+            ),
+        )
+        return int(result.rowcount or 0)
+
+
+def defer_crawl_frontier(
+    scope_prefix: str,
+    url_keys: Sequence[str],
+    max_failures: int,
+    crawl_id: Optional[int] = None,
+) -> int:
+    """A fetch failed: count it, and retire the URL once it has failed enough.
+
+    → the number of rows that were RETIRED (marked visited/'failed'); the rest
+    stay pending for a later attempt. A transient network blip must not cost a
+    page for the life of the campaign, and a permanently dead URL must not be
+    re-attempted by every resume forever — this is the bound between the two.
+    """
+    keys = [_text(k) for k in url_keys if k]
+    if not keys:
+        return 0
+    with connection() as con:
+        rows = con.execute(
+            "UPDATE web_crawl_frontier SET failures = failures + 1, "
+            "crawl_id = COALESCE(%s, crawl_id), "
+            "state = CASE WHEN failures + 1 >= %s THEN 'visited' ELSE state END, "
+            "outcome = CASE WHEN failures + 1 >= %s THEN 'failed' ELSE outcome END, "
+            "visited_at = CASE WHEN failures + 1 >= %s THEN %s ELSE visited_at END "
+            "WHERE scope_prefix = %s AND url_key = ANY(%s) AND state = 'pending' "
+            "RETURNING state",
+            (
+                int(crawl_id) if crawl_id else None,
+                int(max_failures),
+                int(max_failures),
+                int(max_failures),
+                _now(),
+                _text(scope_prefix),
+                keys,
+            ),
+        ).fetchall()
+    return sum(1 for r in rows if r["state"] == "visited")
+
+
+def crawl_frontier_counts(scope_prefix: str) -> dict:
+    """{"pending", "visited", "total"} for one campaign."""
+    with connection() as con:
+        row = con.execute(
+            "SELECT count(*) FILTER (WHERE state = 'pending') AS pending, "
+            "count(*) FILTER (WHERE state = 'visited') AS visited, "
+            "count(*) AS total FROM web_crawl_frontier WHERE scope_prefix = %s",
+            (_text(scope_prefix),),
+        ).fetchone()
+    if not row:
+        return {"pending": 0, "visited": 0, "total": 0}
+    return {
+        "pending": int(row["pending"] or 0),
+        "visited": int(row["visited"] or 0),
+        "total": int(row["total"] or 0),
+    }
+
+
+def clear_crawl_frontier(scope_prefix: str, older_than_s: Optional[float] = None) -> int:
+    """Close a campaign: drop its frontier rows. → rows removed.
+
+    Called with no age when a crawl DRAINS its frontier — the campaign is
+    finished, and the next crawl of that site must start from a clean sheet
+    rather than inherit a complete set of 'visited' rows that would make it a
+    no-op. Called WITH an age before seeding, to retire a campaign that was
+    capped and then abandoned: without that, a site crawled halfway a year ago
+    could never be crawled from scratch again.
+    """
+    with connection() as con:
+        if older_than_s is None:
+            result = con.execute(
+                "DELETE FROM web_crawl_frontier WHERE scope_prefix = %s",
+                (_text(scope_prefix),),
+            )
+        else:
+            result = con.execute(
+                "DELETE FROM web_crawl_frontier WHERE scope_prefix = %s AND NOT EXISTS ("
+                "SELECT 1 FROM web_crawl_frontier f2 WHERE f2.scope_prefix = %s "
+                "AND greatest(f2.enqueued_at, coalesce(f2.visited_at, f2.enqueued_at)) "
+                "> now() - make_interval(secs => %s))",
+                (_text(scope_prefix), _text(scope_prefix), float(older_than_s)),
+            )
+        return int(result.rowcount or 0)
 
 
 def count_unindexed_web_pages() -> int:

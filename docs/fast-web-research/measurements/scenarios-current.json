@@ -1,0 +1,294 @@
+{
+ "mode": "current",
+ "transport": "http",
+ "rows": [
+  {
+   "label": "plain c=1",
+   "samples": 12,
+   "ok": 12,
+   "errors": 0,
+   "stream_buffered": false,
+   "first_token_ms_p50": 373.8,
+   "first_token_ms_p95": 413.8,
+   "total_ms_p50": 1287.2,
+   "total_ms_p95": 1378.5,
+   "tokens_p50": 25.0,
+   "graded": 12,
+   "quality_pass": 12,
+   "quality_failures": [],
+   "events": {
+    "token": 273,
+    "meta": 12,
+    "done": 12
+   },
+   "error_kinds": [],
+   "scenario": "plain",
+   "concurrency": 1,
+   "conversations": 12,
+   "web_search": "off",
+   "server_cpu_s": 0.7,
+   "server_cpu_ms_per_turn": 58.3
+  },
+  {
+   "label": "plain c=8",
+   "samples": 12,
+   "ok": 12,
+   "errors": 0,
+   "stream_buffered": false,
+   "first_token_ms_p50": 1322.9,
+   "first_token_ms_p95": 1323.4,
+   "total_ms_p50": 2092.9,
+   "total_ms_p95": 2229.4,
+   "tokens_p50": 24.0,
+   "graded": 12,
+   "quality_pass": 12,
+   "quality_failures": [],
+   "events": {
+    "token": 270,
+    "meta": 12,
+    "done": 12
+   },
+   "error_kinds": [],
+   "scenario": "plain",
+   "concurrency": 8,
+   "conversations": 12,
+   "web_search": "off",
+   "server_cpu_s": 0.59,
+   "server_cpu_ms_per_turn": 49.2
+  },
+  {
+   "label": "cached c=1",
+   "samples": 12,
+   "ok": 12,
+   "errors": 0,
+   "stream_buffered": false,
+   "first_token_ms_p50": 737.0,
+   "first_token_ms_p95": 816.7,
+   "total_ms_p50": 1365.6,
+   "total_ms_p95": 1966.8,
+   "tokens_p50": 23.0,
+   "graded": 12,
+   "quality_pass": 12,
+   "quality_failures": [],
+   "events": {
+    "token": 339,
+    "meta": 12,
+    "done": 12
+   },
+   "error_kinds": [],
+   "scenario": "cached",
+   "concurrency": 1,
+   "conversations": 12,
+   "web_search": "off",
+   "server_cpu_s": 0.87,
+   "server_cpu_ms_per_turn": 72.5
+  },
+  {
+   "label": "cached c=8",
+   "samples": 12,
+   "ok": 12,
+   "errors": 0,
+   "stream_buffered": false,
+   "first_token_ms_p50": 1783.8,
+   "first_token_ms_p95": 1784.0,
+   "total_ms_p50": 2871.0,
+   "total_ms_p95": 3517.9,
+   "tokens_p50": 25.5,
+   "graded": 12,
+   "quality_pass": 12,
+   "quality_failures": [],
+   "events": {
+    "token": 341,
+    "meta": 12,
+    "done": 12
+   },
+   "error_kinds": [],
+   "scenario": "cached",
+   "concurrency": 8,
+   "conversations": 12,
+   "web_search": "off",
+   "server_cpu_s": 0.64,
+   "server_cpu_ms_per_turn": 53.3
+  },
+  {
+   "label": "followup c=1",
+   "samples": 24,
+   "ok": 24,
+   "errors": 0,
+   "stream_buffered": false,
+   "first_token_ms_p50": 793.8,
+   "first_token_ms_p95": 941.6,
+   "total_ms_p50": 2267.8,
+   "total_ms_p95": 4968.8,
+   "tokens_p50": 61.5,
+   "graded": 24,
+   "quality_pass": 16,
+   "quality_failures": [
+    {
+     "q": "and its score?",
+     "expected": [
+      "82.7"
+     ],
+     "got": "Here are the scores for the models on the BenchLM Reasoning Leaderboard:\n\n1. Aurora-Max: 98.7\n2. Meridian-Pro: 97.2\n3. Solaris-9: 95.8\n4. Kestrel-XL: 94.1\n5. Va"
+    },
+    {
+     "q": "what about 5.2?",
+     "expected": [
+      "82.7"
+     ],
+     "got": "GPT-5.2 is not a publicly released or benchmarked model as of my current knowledge cutoff. OpenAI has not officially launched a version called \"GPT-5.2,\" and it"
+    },
+    {
+     "q": "and the B200?",
+     "expected": [
+      "6.75"
+     ],
+     "got": "On Orbital Compute, an NVIDIA B200 (instance type `oc-b2`) costs **$3.50** per GPU-hour [1]."
+    },
+    {
+     "q": "and its score?",
+     "expected": [
+      "82.7"
+     ],
+     "got": "The top-ranked model is **Aurora-Max** with a score of **93.4**."
+    },
+    {
+     "q": "what about 5.2?",
+     "expected": [
+      "82.7"
+     ],
+     "got": "GPT-5.2 scored **91.3** on the BenchLM Reasoning leaderboard, making it the second-highest performing model in the suite [1].\n\nIt trails only Aurora-Max (93.4) "
+    }
+   ],
+   "events": {
+    "token": 1704,
+    "meta": 24,
+    "done": 24
+   },
+   "error_kinds": [],
+   "scenario": "followup",
+   "concurrency": 1,
+   "conversations": 12,
+   "web_search": "off",
+   "server_cpu_s": 2.46,
+   "server_cpu_ms_per_turn": 102.5
+  },
+  {
+   "label": "followup c=8",
+   "samples": 24,
+   "ok": 24,
+   "errors": 0,
+   "stream_buffered": false,
+   "first_token_ms_p50": 1197.0,
+   "first_token_ms_p95": 2341.7,
+   "total_ms_p50": 4955.7,
+   "total_ms_p95": 10107.9,
+   "tokens_p50": 53.5,
+   "graded": 24,
+   "quality_pass": 18,
+   "quality_failures": [
+    {
+     "q": "and its score?",
+     "expected": [
+      "82.7"
+     ],
+     "got": "Based on the BenchLM Reasoning Leaderboard data provided in source [1], the scores for the ranked models are:\n\n1. Aurora-Max: 92.5\n2. Meridian-Pro: 91.8\n3. Sola"
+    },
+    {
+     "q": "and the B200?",
+     "expected": [
+      "6.75"
+     ],
+     "got": "An H100 80GB on Orbital Compute costs **$2.90** per GPU-hour [[1]]."
+    },
+    {
+     "q": "and its score?",
+     "expected": [
+      "82.7"
+     ],
+     "got": "The overall score for the BenchLM Reasoning Leaderboard is **93.4**, which is the top score achieved by **Aurora-Max**.\n\nIf you are asking for the score of a sp"
+    },
+    {
+     "q": "and the B200?",
+     "expected": [
+      "6.75"
+     ],
+     "got": "Orbital Compute does not currently list an NVIDIA B200 instance in their public pricing [1]. As of now, the H100 (`oc-h1`) is the highest-performance GPU option"
+    },
+    {
+     "q": "and its score?",
+     "expected": [
+      "82.7"
+     ],
+     "got": "Here are the scores for the models on the BenchLM Reasoning Leaderboard (out of 100):\n\n1. **Aurora-Max**: 98.5\n2. **Meridian-Pro**: 97.2\n3. **Solaris-9**: 96.8\n"
+    }
+   ],
+   "events": {
+    "token": 1573,
+    "meta": 24,
+    "done": 24
+   },
+   "error_kinds": [],
+   "scenario": "followup",
+   "concurrency": 8,
+   "conversations": 12,
+   "web_search": "off",
+   "server_cpu_s": 2.04,
+   "server_cpu_ms_per_turn": 85.0
+  },
+  {
+   "label": "search c=1",
+   "samples": 12,
+   "ok": 12,
+   "errors": 0,
+   "stream_buffered": false,
+   "first_token_ms_p50": 371.3,
+   "first_token_ms_p95": 392.5,
+   "total_ms_p50": 1868.1,
+   "total_ms_p95": 2457.7,
+   "tokens_p50": 48.5,
+   "graded": 12,
+   "quality_pass": 12,
+   "quality_failures": [],
+   "events": {
+    "token": 550,
+    "meta": 12,
+    "done": 12
+   },
+   "error_kinds": [],
+   "scenario": "search",
+   "concurrency": 1,
+   "conversations": 12,
+   "web_search": "on",
+   "server_cpu_s": 1.04,
+   "server_cpu_ms_per_turn": 86.7
+  },
+  {
+   "label": "search c=8",
+   "samples": 12,
+   "ok": 12,
+   "errors": 0,
+   "stream_buffered": false,
+   "first_token_ms_p50": 1370.7,
+   "first_token_ms_p95": 1371.3,
+   "total_ms_p50": 3788.7,
+   "total_ms_p95": 4032.1,
+   "tokens_p50": 61.0,
+   "graded": 12,
+   "quality_pass": 12,
+   "quality_failures": [],
+   "events": {
+    "token": 671,
+    "meta": 12,
+    "done": 12
+   },
+   "error_kinds": [],
+   "scenario": "search",
+   "concurrency": 8,
+   "conversations": 12,
+   "web_search": "on",
+   "server_cpu_s": 0.92,
+   "server_cpu_ms_per_turn": 76.7
+  }
+ ]
+}

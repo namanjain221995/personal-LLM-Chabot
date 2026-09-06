@@ -182,6 +182,35 @@ def _truthy(value: str | None) -> bool:
     return (value or "").strip().lower() in {"1", "true", "yes", "on", "enabled"}
 
 
+#: Sidecar KV budgets are a fraction of TOTAL device memory, so on a 122 GiB
+#: GB10 a seemingly small fraction is a large reservation: 0.14 for OCR is
+#: 17.0 GiB, of which 12.1 GiB became KV cache -- 211,552 tokens for a model
+#: whose window is 8,192. These defaults must therefore be overridable per
+#: host. They were previously emitted as literals into generated.env, which is
+#: the LAST --env-file layer and so outranks the user's .env: setting either
+#: key in .env changed nothing and reported nothing. Read the user's value
+#: here so the documented knob is the one that wins.
+AUX_GPU_MEMORY_UTILIZATION_RANGE = (0.02, 0.95)
+
+
+def _aux_gpu_memory_utilization(
+    values: Mapping[str, str], name: str, default: str
+) -> str:
+    raw = str(values.get(name, "") or "").strip()
+    if not raw:
+        return default
+    try:
+        number = float(raw)
+    except ValueError as exc:
+        raise TechSaraError(f"{name} must be a number; got {raw!r}") from exc
+    low, high = AUX_GPU_MEMORY_UTILIZATION_RANGE
+    if not low <= number <= high:
+        raise TechSaraError(
+            f"{name} must be between {low:.2f} and {high:.2f}; got {raw!r}"
+        )
+    return f"{number:.2f}"
+
+
 # --------------------------------------------------------------------------
 # The user-owned main-model window
 # --------------------------------------------------------------------------
@@ -636,16 +665,29 @@ def build_generated_environment(
         ),
         "MAIN_STARTUP_ARGUMENTS": shlex.join(main.startup_arguments) if main else "",
         "MAIN_GPU_MEMORY_UTILIZATION": {"nvidia-large": "0.82", "nvidia-medium": "0.82", "nvidia-small": "0.85", "nvidia-minimal": "0.82"}.get(profile.hardware_profile_id, "0.35"),
-        "EMBED_GPU_MEMORY_UTILIZATION": "0.08",
-        # vLLM sizes its KV cache from memory free *at profile time*, and the
-        # launcher starts model services sequentially rather than all at once,
-        # so each later service profiles against less headroom than the old
-        # parallel `docker compose up` gave it. 0.09 was enough for OCR then
-        # and is not now: it yielded 0.06 GiB of KV against a 0.47 GiB need.
-        "OCR_GPU_MEMORY_UTILIZATION": "0.14",
-        "ROUTER_GPU_MEMORY_UTILIZATION": "0.17",
         "VLLM_SHM_SIZE": "16g",
     }
+    # Sidecar GPU budgets are emitted ONLY when the user set one, so the
+    # per-profile default in the overlay stays the single source of truth.
+    #
+    # Emitting a default here instead would be wrong in both directions.
+    # generated.env is the LAST --env-file, so a literal here outranks the
+    # user's .env: that is the defect this replaced, where setting
+    # OCR_GPU_MEMORY_UTILIZATION in .env changed nothing and reported nothing.
+    # But emitting a launcher-side default is equally wrong, because the
+    # defaults are NOT profile-independent -- embed is 0.04 on dgx-spark
+    # (compose.dgx-spark.yaml) and 0.08 on nvidia (compose.nvidia.yaml). A
+    # single default here would silently double embed's reservation on one
+    # profile. The overlays already spell every one as `${VAR:-default}`, so
+    # interpolation stays deterministic when the key is absent.
+    for _sidecar in (
+        "EMBED_GPU_MEMORY_UTILIZATION",
+        "OCR_GPU_MEMORY_UTILIZATION",
+        "ROUTER_GPU_MEMORY_UTILIZATION",
+    ):
+        _chosen = _aux_gpu_memory_utilization(user_values, _sidecar, "")
+        if _chosen:
+            values[_sidecar] = _chosen
     # Always emitted so the published-model overlay interpolates deterministically
     # whether or not it is layered in.
     for name in MODEL_PORT_DEFAULTS:

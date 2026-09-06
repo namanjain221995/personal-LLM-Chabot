@@ -1,0 +1,59 @@
+{
+  "slug": "zenodo-pandas",
+  "url": "https://zenodo.org/records/3509134",
+  "cached_body_sha256": "3df7dea7ca05d95a3cef330a0f9be9ca75ba1220007c555bddac0a5a8762fb75",
+  "markup": "jsonld",
+  "derived_by": "read out of the cached HTML by a human; NOT captured from the extractor",
+  "derived_on": "2026-09-07",
+  "quoted_source": [
+    "{\"@context\": \"http://schema.org\", \"@id\": \"https://doi.org/10.5281/zenodo.21500199\", \"@type\": \"https://schema.org/SoftwareSourceCode\", \"author\": [{\"@type\": \"Person\", \"familyName\": \"The pandas development team\", \"name\": \"The pandas development team\"}], \"contentSize\": \"5.26 MB\", \"creator\": [ ...the same Person... ], \"dateCreated\": \"2026-07-22T21:47:21.346630+00:00\", \"dateModified\": \"2026-07-22T21:47:21.561509+00:00\", \"datePublished\": \"2026-07-22\", \"description\": \"Pandas is a powerful data structures for data analysis, time series, and statistics.\", \"identifier\": \"https://doi.org/10.5281/zenodo.21500199\", \"keywords\": \"python, data science, flexible, pandas, alignment, data analysis\", \"license\": \"https://opensource.org/licenses/BSD-3-Clause\", \"name\": \"pandas-dev/pandas: Pandas\", \"publisher\": {\"@type\": \"Organization\", \"name\": \"Zenodo\"}, \"size\": \"5.26 MB\", \"url\": \"https://zenodo.org/records/21500199\", \"version\": \"v3.0.5\"}"
+  ],
+  "expectations": [
+    {
+      "entity": "pandas-dev/pandas: Pandas", "entity_type": "SoftwareSourceCode",
+      "parent": "",
+      "field": "contentSize", "value": "5.26 MB",
+      "source": "jsonld",
+      "read_from": "\"contentSize\": \"5.26 MB\". The page fused the magnitude and its unit into one string itself, so this asserts the pipeline does not SPLIT a unit that arrived attached -- the mirror image of the price/priceCurrency case."
+    },
+    {
+      "entity": "pandas-dev/pandas: Pandas", "entity_type": "SoftwareSourceCode",
+      "parent": "",
+      "field": "datePublished", "value": "2026-07-22",
+      "source": "jsonld",
+      "read_from": "\"datePublished\": \"2026-07-22\" -- a date-only value on a record that also carries two full timestamps; all three must stay distinct"
+    },
+    {
+      "entity": "pandas-dev/pandas: Pandas", "entity_type": "SoftwareSourceCode",
+      "parent": "",
+      "field": "dateCreated", "value": "2026-07-22T21:47:21.346630+00:00",
+      "source": "jsonld",
+      "read_from": "\"dateCreated\"; microseconds and offset preserved verbatim"
+    },
+    {
+      "entity": "pandas-dev/pandas: Pandas", "entity_type": "SoftwareSourceCode",
+      "parent": "",
+      "field": "publisher", "value": "Zenodo",
+      "source": "jsonld",
+      "read_from": "publisher is an Organization with nothing but a name -> folds"
+    },
+    {
+      "entity": "The pandas development team", "entity_type": "Person",
+      "parent": "pandas-dev/pandas: Pandas",
+      "field": "familyName", "value": "The pandas development team",
+      "source": "jsonld",
+      "read_from": "the sole \"author\" member. It has a name AND a second scalar (familyName), so it becomes its own line -- and that line must carry the software's name as its parent, or a chunk boundary would leave a bare person with no idea what they authored."
+    }
+  ],
+  "known_absent": [
+    {
+      "entity": "pandas-dev/pandas: Pandas", "field": "version", "value": "v3.0.5",
+      "reason": "DEDUPE: the rendered page prints v3.0.5 beside the title."
+    },
+    {
+      "entity": "pandas-dev/pandas: Pandas", "field": "url",
+      "value": "https://zenodo.org/records/21500199",
+      "reason": "`^url$` is on the skip list by design. Worth recording because this URL is NOT the URL that was fetched -- the record points at a later version of the deposit -- so the skip also suppresses a real inconsistency between the record and the page it sits on."
+    }
+  ]
+}

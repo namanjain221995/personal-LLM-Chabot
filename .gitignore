@@ -50,6 +50,12 @@ data/
 *.sqlite3-journal
 *.parquet
 lancedb/
+# The Fast-path benchmark's isolated storage (orchestrator/tools/fast_path_bench.py
+# `_bootstrap_env`). Anchored, per the `reports/` lesson above: unanchored it
+# would also swallow any real directory of that name. `lancedb/` above already
+# catches the Salesforce index inside it but NOT `lancedb-web/`, which is a
+# separate variable (LANCEDB_WEB_DIR) and left transaction logs untracked.
+/orchestrator/.bench-scratch/
 sf_dictionary.json
 # Quarantine file written by scripts/migrate_sqlite_to_postgres.py — it can
 # contain message bodies.

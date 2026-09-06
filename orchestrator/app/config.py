@@ -707,6 +707,34 @@ class Settings:
         # asking the auditor whether three pages are enough.
         self.deep_research_min_sources: int = _int("DEEP_RESEARCH_MIN_SOURCES", 6)
         self.deep_research_timeout_s: float = _float("DEEP_RESEARCH_TIMEOUT_S", 600.0)
+        # --- Admission control (R13). ---------------------------------
+        # Deep Research used to take a process-wide lock and REFUSE anyone
+        # else while it was held, so one person's ten-minute run failed every
+        # other user's request org-wide. These three bound it properly
+        # instead. The scarce resource is MODEL time, not CPU: the engine's
+        # `_LLM_SEM` already caps concurrent generations at 2 process-wide and
+        # is shared by every run, so a second run interleaves inside the same
+        # two model slots rather than adding a third stream for interactive
+        # chat to queue behind.
+        #
+        # 2 concurrent runs: what actually doubles is SearXNG queries and
+        # outbound fetches (16 per gather), not GPU streams. Raising it does
+        # not buy more research throughput — the model slots are the
+        # bottleneck — it only makes each run slower and more likely to hit
+        # its wall clock, so the honest ceiling is low.
+        self.deep_research_max_concurrent: int = _int("DEEP_RESEARCH_MAX_CONCURRENT", 2)
+        # 1 per person, so a single user (or a reloaded browser tab) can never
+        # occupy the whole machine. This is the fairness half: the ceiling
+        # above bounds the box, this bounds any one requester.
+        self.deep_research_max_per_user: int = _int("DEEP_RESEARCH_MAX_PER_USER", 1)
+        # How long a request may WAIT for a slot before it is refused with a
+        # reason. Queueing beats refusing, but only up to a point: the user is
+        # watching a stream that carries nothing but heartbeats while it
+        # waits, and a run holds its slot for minutes. 45 s absorbs the real
+        # case (a run finishing, two requests arriving together) and then
+        # hands back a truthful "try again in about N minutes" instead of a
+        # spinner. 0 disables queueing (refuse immediately).
+        self.deep_research_queue_wait_s: float = _float("DEEP_RESEARCH_QUEUE_WAIT_S", 45.0)
         self.deep_research_report_max_tokens: int = _int(
             "DEEP_RESEARCH_REPORT_MAX_TOKENS", 6000
         )
@@ -722,6 +750,27 @@ class Settings:
         self.deep_research_min_confidence: float = _float("DEEP_RESEARCH_MIN_CONFIDENCE", 0.6)
         # Near-duplicate threshold (word-shingle Jaccard). Ten syndicated
         # copies of one report count as ONE independent source.
+        #
+        # R11's rewrite rule (a large absolute volume of shared text that is
+        # also at least half the shorter page) is deliberately NOT scaled by
+        # this, and after checking, it deliberately gets NO knob of its own:
+        #
+        #   * its floor is a MEASUREMENT, not a taste — 200 shared 6-grams
+        #     against 31 for two independent reports of one event — and a
+        #     knob invites retuning it without the fixtures that produced it;
+        #   * the two directions are not symmetrical. Set it too low and
+        #     corroboration is merely withheld; set it too high and the rule
+        #     stops firing, syndicated copies count as independent voices
+        #     again, and confidence goes UP — the exact defect R11 exists to
+        #     stop, reintroduced silently by a configuration change;
+        #   * `provenance.near_duplicate` has a second caller
+        #     (`web_memory._collapse_duplicates`, on the retrieval path) that
+        #     passes the DEFAULT threshold, so a `DEEP_RESEARCH_*` variable
+        #     would name a rule it only half governs. If it ever becomes
+        #     configurable it belongs to `core/provenance`, not here.
+        #
+        # The operational escape hatch already exists and is honest about its
+        # scope: 0 disables duplicate detection for this engine entirely.
         self.deep_research_duplicate_threshold: float = _float(
             "DEEP_RESEARCH_DUPLICATE_THRESHOLD", 0.6
         )

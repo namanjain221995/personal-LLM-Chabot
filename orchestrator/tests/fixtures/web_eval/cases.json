@@ -1,0 +1,185 @@
+{
+  "_README": "Expected values here were derived BY HAND from the fixture HTML source, not by running the extraction, retrieval or answering code. Any disagreement between this file and the code is a finding about the code until the HTML is shown to say otherwise. Fixtures are synthetic: no real site, no private data, no credentials.",
+  "_derivation": "Each expectation cites the fixture file and the element it was read from. Numbers were transcribed from the literal HTML text nodes.",
+
+  "fixtures": {
+    "leaderboard.html": {
+      "shape": "HTML <table> after a short intro; 14 data rows",
+      "published_at": "2026-03-04",
+      "modified_at": "2026-03-18",
+      "sitename": "BenchLM",
+      "rows_expected": 14
+    },
+    "leaderboard_long.html": {
+      "shape": "same table preceded by ~19 KB of methodology prose",
+      "purpose": "exercises the character-tier budgets; the answer row sits far past the head of the document"
+    },
+    "leaderboard_cards.html": {
+      "shape": "same 14 entries rendered as <div class=card>, no <table>",
+      "purpose": "same facts, different rendering; extraction must not depend on the table tag"
+    },
+    "pricing_v1.html": {"shape": "table", "modified_at": "2026-01-10", "purpose": "the stale/superseded version"},
+    "pricing_v2.html": {"shape": "table", "modified_at": "2026-08-27", "purpose": "the fresh version that supersedes v1"},
+    "hosting_costs.html": {"shape": "<dl>/<dt>/<dd> definition list", "modified_at": "2026-08-19", "purpose": "second source for multi-source comparison; also a non-table data rendering"},
+    "no_answer.html": {"shape": "prose only, no model names and no scores", "purpose": "negative case"}
+  },
+
+  "facts": {
+    "leaderboard": {
+      "_source": "leaderboard.html <table id=ranking>, and leaderboard_cards.html card divs (identical values)",
+      "GPT-5.2":        {"rank": 12, "score": 82.7, "cost": 6.50, "evaluated": "2026-03-06"},
+      "GPT-5":          {"rank": 11, "score": 83.2, "cost": 6.00, "evaluated": "2026-03-05"},
+      "Aurora-Max":     {"rank": 1,  "score": 93.4, "cost": 12.00, "evaluated": "2026-03-02"},
+      "Tessera-Lite":   {"rank": 14, "score": 76.1, "cost": 0.55, "evaluated": "2026-03-06"},
+      "Halcyon-Mini":   {"rank": 10, "score": 84.0, "cost": 1.10, "evaluated": "2026-03-05"},
+      "model_count": 14
+    },
+    "orbital_pricing_v1": {"oc-a1": 1.80, "oc-h1": 3.40, "oc-h2": 4.95, "oc-l1": 1.05, "commit_discount_pct": 30},
+    "orbital_pricing_v2": {"oc-a1": 1.55, "oc-h1": 2.90, "oc-h2": 4.20, "oc-l1": 0.95, "oc-b1": 6.75, "commit_discount_pct": 35},
+    "nimbus_pricing":     {"A100 80GB": 1.70, "H100 80GB": 3.10, "H200 141GB": 4.60, "B200 192GB": 7.20, "L40S": null}
+  },
+
+  "cases": [
+    {
+      "id": "exact-score-table",
+      "kind": "exact_value",
+      "question": "What is GPT-5.2's reasoning score on the BenchLM leaderboard?",
+      "fixtures": ["leaderboard.html"],
+      "expect_contains": ["82.7"],
+      "expect_absent": ["83.2"],
+      "note": "83.2 is GPT-5, the adjacent row. Returning it is the conflation failure, not a near miss."
+    },
+    {
+      "id": "exact-score-long-page",
+      "kind": "exact_value",
+      "question": "What is GPT-5.2's reasoning score on the BenchLM leaderboard?",
+      "fixtures": ["leaderboard_long.html"],
+      "expect_contains": ["82.7"],
+      "expect_absent": ["83.2"],
+      "note": "Same question, same answer, but the row sits ~19.8k chars into the extracted text. Head truncation at either character tier removes it. Measured 2026-09-06: char 19831 of 20136."
+    },
+    {
+      "id": "exact-score-cards",
+      "kind": "exact_value",
+      "question": "What is GPT-5.2's reasoning score on the BenchLM leaderboard?",
+      "fixtures": ["leaderboard_cards.html"],
+      "expect_contains": ["82.7"],
+      "note": "Identical facts in a card layout. A regression here means extraction is table-tag dependent."
+    },
+    {
+      "id": "followup-bare-pronoun",
+      "kind": "followup",
+      "history": [
+        {"role": "user", "content": "Which models are ranked on the BenchLM reasoning leaderboard?"},
+        {"role": "assistant", "content": "The top entries are Aurora-Max, Meridian-Pro and Solaris-9; GPT-5.2 also appears in the ranking."}
+      ],
+      "question": "and its score?",
+      "fixtures": ["leaderboard.html"],
+      "resolves_to_entity": "GPT-5.2",
+      "expect_contains": ["82.7"],
+      "note": "The regression sequence. The referent is only recoverable from the prior turn; the bare phrase tokenises to ['score'] alone."
+    },
+    {
+      "id": "followup-exact-variant",
+      "kind": "followup",
+      "history": [
+        {"role": "user", "content": "How does GPT-5 do on BenchLM reasoning?"},
+        {"role": "assistant", "content": "GPT-5 scores 83.2, ranked 11th."}
+      ],
+      "question": "what about 5.2?",
+      "fixtures": ["leaderboard.html"],
+      "resolves_to_entity": "GPT-5.2",
+      "expect_contains": ["82.7"],
+      "expect_absent": ["83.2"],
+      "note": "Version-variant resolution. GPT-5 and GPT-5.2 must not collapse to the same retrieval key."
+    },
+    {
+      "id": "missing-evidence",
+      "kind": "negative",
+      "question": "What is GPT-5.2's reasoning score?",
+      "fixtures": ["no_answer.html"],
+      "expect_refusal": true,
+      "expect_absent": ["82.7", "83.2"],
+      "note": "The only page available describes methodology and contains no score at all. The correct behaviour is to say the retrieved evidence does not cover it. Inventing a number, or concluding the model is unranked, are both failures."
+    },
+    {
+      "id": "coverage-gap-not-absence",
+      "kind": "negative",
+      "question": "Is GPT-5.2 ranked on the BenchLM leaderboard?",
+      "fixtures": ["no_answer.html"],
+      "expect_refusal": true,
+      "forbidden_claims": ["not ranked", "does not appear", "is not listed", "unranked"],
+      "note": "Distinguishes 'the retrieved sources do not cover this' from 'this is not true'. Asserting absence from a page that never contained the data is the fabricated-negative failure."
+    },
+    {
+      "id": "changing-fact-fresh-wins",
+      "kind": "freshness",
+      "question": "What does an H100 cost per GPU-hour on Orbital Compute?",
+      "fixtures": ["pricing_v1.html", "pricing_v2.html"],
+      "expect_contains": ["2.90"],
+      "expect_absent": ["3.40"],
+      "note": "Both versions are available. v2 (modified 2026-08-27) supersedes v1 (2026-01-10) and says so in its own text."
+    },
+    {
+      "id": "changing-fact-new-row",
+      "kind": "freshness",
+      "question": "Does Orbital Compute offer a B200 instance, and at what price?",
+      "fixtures": ["pricing_v1.html", "pricing_v2.html"],
+      "expect_contains": ["6.75"],
+      "note": "oc-b1 exists only in v2. Answering from v1 alone yields a wrong negative."
+    },
+    {
+      "id": "stale-stored-page",
+      "kind": "freshness",
+      "question": "What does an H100 cost per GPU-hour on Orbital Compute?",
+      "stored": "pricing_v1.html",
+      "stored_age_days": 240,
+      "live": "pricing_v2.html",
+      "expect_contains": ["2.90"],
+      "expect_refresh": true,
+      "note": "A stored copy older than its TTL must trigger a refetch rather than being served as current."
+    },
+    {
+      "id": "multi-source-comparison",
+      "kind": "multi_source",
+      "question": "Which is cheaper for an H100 per GPU-hour, Orbital Compute or Nimbus Cloud?",
+      "fixtures": ["pricing_v2.html", "hosting_costs.html"],
+      "expect_contains": ["2.90", "3.10"],
+      "expected_conclusion": "Orbital Compute is cheaper (2.90 vs 3.10).",
+      "note": "Requires a fact from each of two sources; citing one is insufficient."
+    },
+    {
+      "id": "multi-source-negative",
+      "kind": "multi_source",
+      "question": "Can I rent an L40S from Nimbus Cloud?",
+      "fixtures": ["hosting_costs.html"],
+      "expected_conclusion": "No. The page states Nimbus does not offer an L40S instance.",
+      "note": "A supported negative: the source explicitly asserts the absence. Contrast with coverage-gap-not-absence, where the source is merely silent. A system that cannot tell these apart will get one of the two wrong."
+    },
+    {
+      "id": "definition-list-values",
+      "kind": "extraction",
+      "question": "What does a B200 cost per GPU-hour on Nimbus Cloud?",
+      "fixtures": ["hosting_costs.html"],
+      "expect_contains": ["7.20"],
+      "note": "Measured 2026-09-06: extract_readable drops <dl>/<dt>/<dd> entirely under every trafilatura option combination, keeping only the surrounding prose. The page therefore reads as successfully fetched and citable while containing none of its data. Known-failing at baseline."
+    },
+    {
+      "id": "stable-fact",
+      "kind": "stable",
+      "question": "How many models are ranked on the BenchLM reasoning leaderboard?",
+      "fixtures": ["leaderboard.html"],
+      "expect_contains": ["14"],
+      "note": "Control case: a fact that does not change between fixture versions, so a regression here indicates a retrieval or extraction fault rather than a freshness fault."
+    },
+    {
+      "id": "provenance-dates",
+      "kind": "provenance",
+      "fixtures": ["leaderboard.html"],
+      "expect_published_at": "2026-03-04",
+      "expect_modified_at": "2026-03-18",
+      "expect_sitename": "BenchLM",
+      "note": "Dates must come from the page's own metadata, never from fetch time."
+    }
+  ]
+}

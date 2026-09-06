@@ -18,6 +18,16 @@ class SearxngProvider(SearchProvider):
 
     def __init__(self, base_url: str) -> None:
         self.base_url = base_url.rstrip("/")
+        #: {query: [engine, …]} for the engines that did NOT answer, read back
+        #: by engines/search.py after the fan-out. SearXNG has always reported
+        #: this and nothing read it (finding S6): the last real query before
+        #: the audit ran with wikipedia, duckduckgo and yandex all timed out
+        #: against a 3.0 s ceiling, and the application recorded none of it —
+        #: a thin result set that looked exactly like a thorough one, cached
+        #: as authoritative for 900 s.
+        #: One instance serves one request's fan-out, and each concurrent
+        #: query writes its own key, so this needs no lock and does not grow.
+        self.unresponsive: dict = {}
 
     async def search(
         self, query: str, max_results: int, categories: str = ""
@@ -39,6 +49,18 @@ class SearxngProvider(SearchProvider):
                 data = resp.json()
         except (httpx.HTTPError, ValueError) as exc:
             raise SearchUnavailableError(f"SearXNG error: {exc}") from exc
+
+        # `unresponsive_engines` is a list of [engine, reason] pairs (older
+        # builds send bare strings). Only the ENGINE NAME is kept: the reason
+        # string is free text from an upstream and the query must not be
+        # carried alongside it anywhere it could be logged.
+        down: List[str] = []
+        for item in data.get("unresponsive_engines") or []:
+            name = item[0] if isinstance(item, (list, tuple)) and item else item
+            if isinstance(name, str) and name.strip():
+                down.append(name.strip())
+        if down:
+            self.unresponsive[query] = sorted(set(down))
 
         out: List[SearchResult] = []
         for item in data.get("results", [])[: max_results * 2]:

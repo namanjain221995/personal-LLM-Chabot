@@ -28,10 +28,15 @@ cd "$(dirname "$0")/.."
 
 [[ -f .env ]] || { echo "error: no .env in $(pwd) — copy .env.example first" >&2; exit 1; }
 
-set -a
-# shellcheck disable=SC1091
-source .env
-set +a
+# NOT `set -a; . ./.env`. Sourcing a dotenv file executes it, and .env holds
+# values with spaces and quotes in them: bash reports "command not found" on
+# stderr, keeps going, and leaves the environment half-built -- and with the
+# `set -e` above, it aborts outright and every later key is simply missing.
+# load_env_file parses the file instead, via the same parser Compose agrees
+# with. See scripts/lib/env-load.sh.
+# shellcheck source=../scripts/lib/env-load.sh
+. ./scripts/lib/env-load.sh
+load_env_file .env
 
 : "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is not set in .env}"
 POSTGRES_USER="${POSTGRES_USER:-techsara}"

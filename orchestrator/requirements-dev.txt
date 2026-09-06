@@ -26,8 +26,18 @@ itsdangerous>=2.1
 psycopg[binary,pool]>=3.2,<4
 # The crawler's link harvest (core/extract.py) is real frontier logic, and a
 # missing lxml degrades it to "zero links found" rather than an error — a
-# failure mode CI must be able to see. lxml alone is a small manylinux wheel;
-# trafilatura (the heavy tree above it) stays out, and text extraction keeps
-# its _strip_tags fallback.
+# failure mode CI must be able to see. lxml alone is a small manylinux wheel.
 lxml>=5
+# trafilatura USED to stay out here, on the reasoning that it is the heavy tree
+# above lxml and that text extraction keeps its _strip_tags fallback. That was
+# defensible until the extraction-ACCURACY suites arrived. It is not now: the
+# production image ships trafilatura 2.2.0, and without it CI silently
+# exercised the fallback extractor instead — so ten tests asserting on real
+# extraction output (pipe-table rendering, the augmentation pass, provenance
+# dates, and the measured character offset the truncation findings rest on)
+# failed on the first real Actions run while passing on every developer machine,
+# which has it. A test suite that validates a code path production does not run
+# is worse than a slow one. Skipping those tests instead would be worse still:
+# extraction accuracy would then be checked nowhere.
+trafilatura>=1.12
 pytest>=8.0

@@ -33,7 +33,35 @@
 #     which still ships the right code. A rollback undoes the fast-forward this
 #     same run made - by compare-and-swap, so it can only ever put the branch
 #     back where this run found it - and never rewinds it any further.
-#   * On a failed health gate it rolls back to the commit that was live before.
+#   * On a failed health gate it rolls back to the commit that was live before -
+#     but ONLY if that is honest. See "the schema boundary" below.
+#
+# Recoverability, added 2026-09-07. Four things this script now does that
+# "rebuild the tag and restart" did not:
+#
+#   * RECORD BEFORE REPLACING. scripts/deploy-record.sh writes what is running -
+#     image IDS (not tags), the rendered configuration with every env value
+#     hashed, the applied migration list, the PostgreSQL major - into
+#     .runtime/releases/<stamp>/ before anything is recreated. After the
+#     recreate those facts are gone, and a rollback needs all of them.
+#   * PROMOTE BY DIGEST. scripts/deploy-preflight.sh builds the application
+#     images ONCE, records each `{{.Id}}` in a release manifest, and after
+#     `techsara up` VERIFIES that the running containers were created from
+#     exactly those ids. A tag is a mutable pointer; assuming the rebuilt tag is
+#     the tested artifact is a guess, and this is where the guess gets checked.
+#   * DRAIN. scripts/deploy-drain.sh reports the stop_grace_period each
+#     recreated service will actually get and waits for a quiet moment before
+#     the SIGTERM. There is no second stack to shift traffic to on this
+#     hardware, so a graceful stop is the whole of what "drain" can honestly
+#     mean here.
+#   * THE SCHEMA BOUNDARY. orchestrator/app/db.py migrates FORWARD ONLY. An
+#     image rollback does not roll the database back, so this script compares
+#     the migration table in the target COMMIT against the version the live
+#     database has APPLIED, and refuses rather than starting old code on a
+#     newer schema. That check guards the deploy AND the automatic rollback -
+#     the rollback especially, because it is the one that fires unattended.
+#     It never restores a database: a pre-deploy dump is older than every row
+#     written since, and restoring it to fix a code problem deletes real data.
 set -euo pipefail
 
 ROOT="${TECHSARA_DEPLOY_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
@@ -58,11 +86,23 @@ while [ $# -gt 0 ]; do
 done
 
 cd "$ROOT"
+
+# The recoverability plumbing: the verified compose chain, the shared deploy
+# lock, image-id reads and the schema-version readers. Sourced rather than
+# duplicated so there is exactly one definition of "which compose files" and
+# "which lock".
+# shellcheck source=lib/deploy-common.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib/deploy-common.sh"
+DR_ROOT="$ROOT"
+
 LOG_DIR="$ROOT/.runtime/logs"; mkdir -p "$LOG_DIR" "$ROOT/.runtime/locks"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 LOG="$LOG_DIR/deploy-$STAMP.log"
 say() { printf '%s %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$LOG"; }
 die() { printf '%s ERROR %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$LOG" >&2; exit 1; }
+# Everything the sourced library prints lands in the same log as everything
+# this script prints. A recovery reads one file, not two.
+DR_LOG="$LOG"
 
 # ------------------------------------------------- the branch name is untrusted
 # DEPLOY_BRANCH arrives from a repository variable or a free-text
@@ -83,10 +123,22 @@ if [ -n "$DEPLOY_BRANCH" ]; then
 fi
 
 # ---------------------------------------------------------------- one at a time
-exec 9>"$ROOT/.runtime/locks/deploy.lock"
-if ! flock -n 9; then
-  die "another deploy holds $ROOT/.runtime/locks/deploy.lock"
-fi
+# The same flock as before, with two changes that matter when the other holder
+# is a person rather than a workflow.
+#
+#   * It WAITS (default 30 minutes) instead of failing instantly. A workflow
+#     deploy that starts 40 seconds before a hand-run one should make the
+#     second one queue, not fail - and requirement "never cancel a rollout
+#     mid-flight" is honoured from the outside by queueing behind it.
+#   * The holder writes its pid, actor, origin and commit into
+#     .runtime/locks/deploy.holder, so whoever is blocked is told WHO by.
+#
+# GitHub Actions `concurrency: deploy-dgx-spark` serialises workflow runs
+# against each other and nothing else. This lock is what actually stands
+# between a workflow-triggered deploy and someone running this script by hand,
+# because BOTH paths run this file. `scripts/deploy-lock.sh -- <cmd>` puts any
+# other stack-touching command inside the same lock.
+dr_lock_acquire "${DEPLOY_LOCK_WAIT:-1800}" "deploy.sh --ref $REF$([ "$FULL" = 1 ] && printf ' --full')"
 
 say "deploy start  root=$ROOT ref=$REF full=$FULL branch=${DEPLOY_BRANCH:-<detached>} log=$LOG"
 
@@ -133,6 +185,60 @@ elif git -C "$ROOT" merge-base --is-ancestor "$DEPLOY_BRANCH" "$TARGET"; then
   say "branch =$DEPLOY_BRANCH  (fast-forwards to the target)"
 else
   say "branch =$DEPLOY_BRANCH  (CANNOT fast-forward: $(git -C "$ROOT" rev-list --left-right --count "$DEPLOY_BRANCH...$TARGET" | tr -s '\t ' '/') ahead/behind; the branch would be left alone and HEAD detached)"
+fi
+
+# ----------------------------------------------------------- the schema gate
+# Migrations in orchestrator/app/db.py go one way. `init_schema` applies what is
+# missing and removes nothing, and there are no down migrations to remove it
+# with. So the question a deploy has to answer BEFORE it recreates anything is
+# not "is this commit newer" but "does this commit's code know about every
+# migration the live database has already applied".
+#
+# If it does not, starting it is a schema DOWNGRADE of the code while the schema
+# itself stays where it is. That does not fail cleanly - it fails as whatever
+# the older code does when it meets a column, table or constraint it has never
+# heard of, which can be a 500 on one route and silent wrong answers on another.
+#
+# The number for the target comes out of the COMMIT (git show <sha>:...db.py),
+# so it is known before anything is built. The number for the database comes
+# from /health, falling back to the database itself when the orchestrator is
+# the thing that is down.
+schema_gate() {  # schema_gate <sha> <what-this-is> -> 0 ok, 1 refuse
+  local sha="$1" what="$2" target live
+  live="$(dr_live_schema_version 2>/dev/null || true)"
+  if [ -z "$live" ]; then
+    say "  schema: cannot read the live schema version (orchestrator down and psql unavailable)."
+    say "  schema: proceeding WITHOUT the compatibility check - this is the one case where"
+    say "  schema: the check cannot be made, and it is worth knowing it was skipped."
+    return 0
+  fi
+  target="$(dr_code_schema_version_from_git "$sha" 2>/dev/null || true)"
+  if [ -z "$target" ]; then
+    say "  schema: $sha has no readable migration table in orchestrator/app/db.py; skipping the check"
+    return 0
+  fi
+  say "  schema: database has applied V$live; $what ($sha) knows V$target"
+  if [ "$target" -ge "$live" ]; then
+    [ "$target" -gt "$live" ] && say "  schema: it will apply V$((live + 1))..V$target on start (forward-only, not undoable)"
+    return 0
+  fi
+  say "  schema: REFUSING - $what is BEHIND the database."
+  say "  schema: V$((target + 1))..V$live have already run against this database and there are"
+  say "  schema: no down migrations. Deploying V$target code does not move the schema back to"
+  say "  schema: V$target; it runs V$target code on a V$live schema."
+  say "  schema: Roll FORWARD instead - the schema is already where newer code wants it."
+  say "  schema: To override deliberately: ALLOW_SCHEMA_DOWNGRADE=1"
+  say "  schema: Do NOT 'fix' this by restoring a database backup. Any backup old enough"
+  say "  schema: to be at V$target is older than every conversation and message written since."
+  [ "${ALLOW_SCHEMA_DOWNGRADE:-0}" = 1 ] || return 1
+  say "  schema: ALLOW_SCHEMA_DOWNGRADE=1 given; continuing anyway."
+  return 0
+}
+
+say "checking schema compatibility before touching anything"
+if ! schema_gate "$TARGET" "the commit being deployed"; then
+  die "refusing to deploy $TARGET across a schema migration boundary. Nothing was\
+ built, recreated or restarted; the stack is exactly as it was."
 fi
 
 if [ "$DRY" = 1 ]; then say "dry run: nothing changed"; exit 0; fi
@@ -260,9 +366,47 @@ land() {  # land <sha> - make the production checkout BE <sha>, non-destructivel
 }
 
 # --------------------------------------------------------------------- deploy
+MANIFEST=""     # set by apply(): the release manifest the digest gate checks against
 apply() {  # apply <sha> - move the checkout and bring the stack up
-  local sha="$1"
+  local sha="$1" record svc
   land "$sha" || return 1
+
+  # (1) RECORD BEFORE REPLACING. Image ids, rendered configuration, applied
+  #     migrations, PostgreSQL major. Every one of those stops being readable
+  #     the moment the containers are recreated, and every one of them is
+  #     needed to roll back to what was there a minute ago.
+  record="$("$ROOT/scripts/deploy-record.sh" --note "pre-deploy state, target $sha" 2>>"$LOG" | tail -1)" || record=""
+  if [ -n "$record" ] && [ -f "$record" ]; then
+    say "  record: what is running now is captured in $record"
+    # The sub-script's own narration goes into ITS log, because this shell
+    # consumed its stdout to learn the path. Fold it back in so the deploy log
+    # is still the single file a recovery has to read.
+    cat "$(dirname "$record")/record.log" >>"$LOG" 2>/dev/null || true
+  else
+    say "  record: WARNING - could not capture the pre-deploy state (see $LOG)"
+  fi
+
+  # (2) BUILD ONCE, AND WRITE DOWN WHAT WAS BUILT. Before `techsara down`, so a
+  #     build failure leaves the stack up rather than down with nothing to
+  #     start. The ids in this manifest are what the gate after `techsara up`
+  #     insists the containers were actually created from.
+  MANIFEST="$("$ROOT/scripts/deploy-preflight.sh" build 2>>"$LOG" | tail -1)" || {
+    say "  preflight: the image build FAILED; nothing was recreated"; return 1; }
+  [ -f "$MANIFEST" ] || { say "  preflight: no manifest was written; refusing to deploy unverifiable images"; return 1; }
+  cat "$(dirname "$MANIFEST")/preflight.log" >>"$LOG" 2>/dev/null || true
+  say "  preflight: promoted $MANIFEST"
+  # The ids, in the deploy log, in plain sight. This is the "digest flows from
+  # build to deploy" hand-off made legible to whoever reads this file later.
+  # A heredoc, not `python3 -c '...'`: a nested quote inside an f-string
+  # replacement field is a syntax error before Python 3.12, and this listing is
+  # decoration - it must never be the reason a deploy aborts, hence `|| true`.
+  python3 - "$MANIFEST" <<'PY' | tee -a "$LOG" || true
+import json, sys
+manifest = json.load(open(sys.argv[1]))
+for service, meta in sorted(manifest["images"].items()):
+    print("    %-14s %s" % (service, meta["id"]))
+PY
+
   if [ "$FULL" = 1 ]; then
     # Every container goes, models included. `down` never passes -v, so the
     # database, warehouse, vector index and reports all survive; what is paid
@@ -275,9 +419,33 @@ apply() {  # apply <sha> - move the checkout and bring the stack up
   # minutes of the site answering nothing. The launcher probes the running
   # engine and leaves it alone; a definition change to vllm therefore waits
   # for --full, which is the operator asking for the reload out loud.
+  # (3) DRAIN. There is no second stack to move traffic to, so draining here is
+  #     two honest things: report the grace period each recreated service will
+  #     actually get, and put the SIGTERM in a quiet moment rather than in the
+  #     middle of a burst. Neither can block the deploy - a service that never
+  #     goes quiet must not be able to hold production on a bad build.
+  "$ROOT/scripts/deploy-drain.sh" check >>"$LOG" 2>&1 \
+    || say "  drain: a service being recreated is on Docker's 10s default (see $LOG)"
+  for svc in orchestrator frontend sync-worker; do
+    "$ROOT/scripts/deploy-drain.sh" wait "$svc" \
+      --deadline "${DEPLOY_DRAIN_DEADLINE:-90}" --quiet-for 5 >>"$LOG" 2>&1 || true
+  done
+
   PRESERVE=1; [ "$FULL" = 1 ] && PRESERVE=
   say "  techsara up  (builds images, recreates changed services, staged health gates$([ -n "$PRESERVE" ] && printf '; main model preserved'))"
-  ( cd "$ROOT" && TECHSARA_PRESERVE_MAIN_MODEL="$PRESERVE" ./techsara up ) >>"$LOG" 2>&1
+  ( cd "$ROOT" && TECHSARA_PRESERVE_MAIN_MODEL="$PRESERVE" ./techsara up ) >>"$LOG" 2>&1 || return 1
+
+  # (4) THE DIGEST GATE. `techsara up` builds again into a warm cache and must
+  #     therefore land on the same ids. If it did not - a base image moved, an
+  #     apt or pip resolution changed, someone re-pointed a tag mid-deploy -
+  #     then what is now serving is NOT what was built and recorded above, and
+  #     that is a failure, not a curiosity.
+  if ! "$ROOT/scripts/deploy-preflight.sh" verify "$MANIFEST" >>"$LOG" 2>&1; then
+    say "  digest gate FAILED: the running containers are not the promoted images"
+    grep -E 'MISMATCH|manifest promoted|container running' "$LOG" | tail -6 | sed 's/^/    /' | tee -a "$LOG"
+    return 1
+  fi
+  say "  digest gate: every application container is running its promoted image id"
 }
 
 # ---------------------------------------------------------------- health gate
@@ -344,6 +512,28 @@ if [ "$TARGET" = "$PREVIOUS" ]; then
  version change and there is no earlier commit to return to. The stack is in the\
  state the health gate rejected - inspect it with scripts/cluster-status.sh"
 fi
+# The automatic rollback is the one that runs at three in the morning with
+# nobody watching, so it gets the SAME schema check the forward deploy got -
+# and here it matters more. Between `apply` and this line the new code may have
+# applied migrations; rolling the image back does not un-apply them, and an
+# automatic rollback that quietly starts older code on a newer schema turns one
+# broken deploy into a broken deploy plus a database nobody can reason about.
+if ! schema_gate "$PREVIOUS" "the rollback target"; then
+  say ""
+  say "NOT ROLLING BACK. The deploy of $TARGET failed, and the previous commit"
+  say "$PREVIOUS cannot be started safely because the database has moved past it."
+  say "The stack is left exactly as the health gate found it, running $TARGET."
+  say ""
+  say "This is deliberate. The alternatives are worse:"
+  say "  * starting $PREVIOUS anyway would run code against a schema it does not know;"
+  say "  * restoring a pre-deploy database dump would delete every conversation,"
+  say "    message and upload written since the deploy started."
+  say "Roll FORWARD: fix the defect and deploy a commit that knows the current schema."
+  say "To override, having read the above: ALLOW_SCHEMA_DOWNGRADE=1 $0 --ref $PREVIOUS"
+  die "deploy of $TARGET failed and an automatic rollback would have crossed a schema\
+ migration boundary. Nothing was rolled back. This box needs a human."
+fi
+
 say "ROLLING BACK to $PREVIOUS"
 if [ -n "$FF_BRANCH" ]; then
   # This run fast-forwarded $FF_BRANCH to a commit that then failed the health

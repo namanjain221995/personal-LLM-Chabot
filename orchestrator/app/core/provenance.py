@@ -26,8 +26,12 @@ Four families of pure helpers, no I/O, no model calls:
   DUPLICATES   `shingles()` / `jaccard()` / `near_duplicate()` catch the
                syndicated copy: the same wire story on ten domains is one
                source, not ten independent confirmations. Word 6-gram
-               fingerprints over the opening of the text; a few hundred
-               microseconds per page.
+               fingerprints over the text; a couple of milliseconds per page.
+
+  SELF-INTEREST `self_published()` / `primary_weight()` answer a question the
+               "primary" flag cannot: is the domain publishing this page the
+               same entity the claim is ABOUT? A vendor grading its own
+               product is first-hand and interested at the same time.
 
 Why this lives in core/ and not inside the research engine: the search
 engine, the crawler, the refresh worker and the living-knowledge layer all
@@ -466,19 +470,229 @@ def is_primary(url: str, kind: str, authority: int) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Self-interest — when the publisher IS the subject
+#
+# R12 (2026-09-06): `is_primary` asks WHO WROTE THIS, and answers it well. It
+# has no way to ask the other half of the question — WHO IS IT ABOUT. A
+# vendor's own leaderboard is `docs` or `press` on a reference-grade host, so
+# it is primary, and every bonus that hangs off primary is paid in full for a
+# claim about the vendor itself. The publisher of a page and the subject of a
+# claim are two different things, and when they are the same thing the page
+# is first-hand AND interested at once.
+#
+# The signal is structural and needs no maintained list: the registrable name
+# in the URL's host, compared against the entity the claim is about. What it
+# cannot see is written down in `self_published`; read that before relying on
+# it for anything stronger than withholding a bonus.
+# ---------------------------------------------------------------------------
+
+#: Words that name a KIND of organisation, not a particular one. An entity
+#: that reduces to nothing but these has no distinctive name to match, and
+#: matching on them would tie "Acme Systems" to every host called systems.*.
+_GENERIC_ENTITY_WORDS = frozenset({
+    "the", "and", "for", "inc", "incorporated", "corp", "corporation", "company",
+    "companies", "ltd", "limited", "llc", "llp", "plc", "gmbh", "sarl", "spa", "bhd",
+    "pte", "pty", "group", "holdings", "holding", "partners", "ventures",
+    "technologies", "technology", "tech", "labs", "laboratory", "laboratories",
+    "systems", "solutions", "software", "services", "service", "platform", "products",
+    "international", "global", "worldwide", "national", "european", "american",
+    "foundation", "institute", "institution", "university", "college", "school",
+    "department", "ministry", "agency", "office", "bureau", "board", "commission",
+    "committee", "council", "association", "organization", "organisation", "society",
+    "project", "team", "research", "studios", "studio", "media", "digital", "online",
+    "app", "apps", "web", "net", "com", "org", "www",
+})
+
+#: Second-level labels that belong to a public suffix rather than to a name:
+#: `acme.co.uk`, `acme.com.au`, `agency.gov.in`, `lab.ac.jp`. Consulted ONLY
+#: when the final label is a two-letter country code, so `acme.co` (Colombia,
+#: sold as a vanity TLD) still reduces to `acme`.
+_PUBLIC_SECOND_LEVEL = frozenset({
+    "co", "com", "net", "org", "edu", "ac", "gov", "govt", "go", "ne", "or", "mil",
+    "int", "gob", "gouv", "gc", "asn", "id", "sch", "res", "web", "in", "firm",
+    "nom", "gen", "k12", "lg", "police", "nhs", "plc", "ltd",
+})
+
+
+def registrable_label(url_or_host: str) -> str:
+    """The NAME part of a host: `docs.acme.co.uk` and `www.acme.com` -> "acme".
+
+    A deliberately small public-suffix heuristic rather than a PSL dependency:
+    drop the TLD, drop a second-level public label when the TLD is a country
+    code, and take what is left. Subdomains are dropped too, on purpose —
+    `openai.microsoft.com` is Microsoft publishing about OpenAI, not OpenAI.
+    """
+    raw = (url_or_host or "").strip().lower()
+    host = domain_of(raw) if "//" in raw or raw.startswith(("http:", "https:")) else raw
+    host = host.split("/")[0].split("@")[-1].split(":")[0]
+    if host.startswith("www."):
+        host = host[4:]
+    labels = [p for p in host.split(".") if p]
+    if len(labels) < 2:
+        return ""
+    tld = labels[-1]
+    rest = labels[:-1]
+    if len(rest) >= 2 and len(tld) == 2 and rest[-1] in _PUBLIC_SECOND_LEVEL:
+        rest = rest[:-1]
+    return rest[-1] if rest else ""
+
+
+def _significant(tokens: Iterable[str]) -> list:
+    return [t for t in tokens if len(t) >= 3 and t not in _GENERIC_ENTITY_WORDS]
+
+
+def entity_keys(subject: object) -> FrozenSet[str]:
+    """Host-shaped names for the entity (or entities) a claim is about.
+
+    `subject` is a string or an iterable of strings — the research plan's
+    ENTITY list, not the free-text question: a question tokenises into
+    ordinary words, and an ordinary word is a domain name somewhere.
+    "Acme Rocket Corp" yields {"acme", "rocket", "acmerocket"}, so it matches
+    `acme.com`, `acmerocket.io` and `acme-rocket.com` alike.
+    """
+    if subject is None:
+        return frozenset()
+    if isinstance(subject, str):
+        items = [subject]
+    else:
+        try:
+            items = list(subject)
+        except TypeError:  # not a string and not iterable: nothing to compare
+            return frozenset()
+    out = set()
+    for item in items:
+        if not isinstance(item, str):
+            continue
+        words = _significant(_WORD_RE.findall(item.lower()))
+        if not words:
+            continue
+        out.update(words)
+        if len(words) > 1:
+            out.add("".join(words))
+    return frozenset(out)
+
+
+def self_published(url: str, subject: object) -> bool:
+    """Is the domain publishing this page the entity the claim is ABOUT?
+
+    True when the host's registrable name IS one of the subject's names.
+    `https://acme.com/benchmarks` is self-published for "Acme"; the same page
+    on `reviews.example` is not.
+
+    WHAT THIS CANNOT SEE, and what therefore must not be built on top of it:
+
+    * OWNERSHIP. A brand whose domain does not carry the parent's name
+      (`youtube.com` for Google, `instagram.com` for Meta), a subsidiary, an
+      agency, a wire service, sponsored content, an "independent" review site
+      the vendor owns. There is no ownership graph here and there is no
+      structural signal for one.
+    * PRODUCTS. A claim about "GPT-5.2" on `openai.com` only registers if the
+      plan also named OpenAI as an entity. Product names are not domains.
+    * INTENT. Self-publication is not dishonesty. A vendor's API reference is
+      the right source for its own API, and this returns True for it. Use the
+      result to withhold a TRUST bonus, never to discard a source.
+    """
+    keys = entity_keys(subject)
+    if not keys:
+        return False
+    label = registrable_label(url)
+    if not label:
+        return False
+    parts = [p for p in label.split("-") if p]
+    label_keys = {label.replace("-", "")}
+    label_keys.update(_significant(parts))
+    return bool(label_keys & keys)
+
+
+#: What is left of the first-hand bonus when the publisher is the subject.
+#: A HALF, not zero: the page really is first-hand, and for a factual claim
+#: about the publisher's own product it is the best source there is. What it
+#: is not is disinterested, and "most trustworthy possible" is what the full
+#: bonus says. Reducing an unearned bonus, rather than inventing a penalty.
+SELF_PUBLISHED_PRIMARY_WEIGHT = 0.5
+
+
+def primary_weight(url: str, kind: str, authority: int, subject: object = ()) -> float:
+    """How much of the first-hand bonus this source has earned, in [0, 1].
+
+    0.0 when the page is not a primary source at all; 1.0 when it is primary
+    and not published by the entity it is about; SELF_PUBLISHED_PRIMARY_WEIGHT
+    when it is both. Pass no `subject` and this is exactly `is_primary` as a
+    float — every caller keeps its current behaviour until it has an entity
+    to compare against.
+
+    THE BOUND. `official` and `academic` keep the full weight even when they
+    are self-published, because for those two classes the suffix IS the
+    credential and self-publication is the normal, correct case: a statistics
+    office publishes its own statistics, a university publishes its own
+    papers, a ministry publishes its own regulations. Demoting them would
+    turn the best sources on the web into interested ones.
+
+    THE MISFIRE THIS STILL HAS, stated so it can be judged: a standards body
+    or a language project on a `.org` — `python.org`, `w3.org` — is demoted
+    for a claim about ITSELF (a question naming Python, answered from
+    python.org), because the suffix carries no credential there. The cost is
+    bounded to half of one bonus term: the source keeps `is_primary`, its
+    authority, its rank and its citation, and only a caller's first-hand
+    bonus is halved. It does not fire for the ordinary case, where the
+    question is about the product and the entity list names the product.
+    """
+    if not is_primary(url, kind, authority):
+        return 0.0
+    if kind in ("official", "academic"):
+        return 1.0
+    if self_published(url, subject):
+        return SELF_PUBLISHED_PRIMARY_WEIGHT
+    return 1.0
+
+
+# ---------------------------------------------------------------------------
 # Near-duplicate detection
 # ---------------------------------------------------------------------------
 
 _WORD_RE = re.compile(r"[a-z0-9]+")
-#: Fingerprint the OPENING of a page: syndicated copies share their lead, and
-#: a 6-gram over the first ~20k characters is cheap and decisive.
-_SHINGLE_CHARS = 20_000
+#: How much of a page is fingerprinted. This was 20,000 characters — the
+#: page's OPENING — on the reasoning that syndicated copies share their lead.
+#: They do, but the copies that matter most do not: an aggregator that
+#: prepends its own lede pushes the wire body past a short window, and a page
+#: whose first 20k characters are boilerplate fingerprints its boilerplate.
+#: 60,000 characters covers essentially every extracted page in the store
+#: (the chunk cap at web_index.INDEXED_CHARS_PER_PAGE is 179,600, and only
+#: ~2% of live rows are anywhere near it). Measured 2026-09-06: 1.7 ms for
+#: 20k chars, 5.0 ms for 60k — paid once per page at registration, and the
+#: retrieval caller (web_memory._collapse_duplicates) fingerprints 3,200-char
+#: windows, so its cost does not move at all.
+_SHINGLE_CHARS = 60_000
 _SHINGLE_K = 6
-_MAX_SHINGLES = 4000
+#: Upper bound on the fingerprint's size, so one enormous page cannot dominate
+#: a run's memory. ~10k distinct 6-grams is ~10k words, which is roughly what
+#: _SHINGLE_CHARS admits anyway.
+_MAX_SHINGLES = 10_000
+
+#: THE REWRITE RULE (R11). Jaccard and containment both compare a shared
+#: fingerprint against a WHOLE document, so a copy that replaces the opening
+#: and keeps the body scores below both thresholds while being, plainly, the
+#: same document. Measured on the fixtures in tests/test_corpus_integrity.py
+#: (a wire story, an aggregator that replaced the lede and the first third
+#: with its own prose, and an independent article on the same event):
+#:
+#:     pair                     shared  jaccard  containment
+#:     wire ~ aggregator-copy      250    0.391        0.568   <- was MISSED
+#:     wire ~ independent           31    0.052        0.166
+#:     wire ~ unrelated              0    0.000        0.000
+#:
+#: 250 shared 6-grams is ~250 words of identical text. Two independent
+#: reports of one event shared 31, and two unrelated pages shared none, so a
+#: floor of 200 shared grams is not something coincidence produces. The
+#: fraction is what keeps the floor honest: it must also be at least half of
+#: the shorter document, so a long page that happens to embed a long shared
+#: block is not collapsed into it.
+_DUP_MIN_SHARED = 200
+_DUP_SHARED_FRACTION = 0.50
 
 
 def shingles(text: str, k: int = _SHINGLE_K) -> FrozenSet[int]:
-    """Hashed word k-grams of the text's opening. Empty for short texts."""
+    """Hashed word k-grams of the text. Empty for short texts."""
     words = _WORD_RE.findall((text or "")[:_SHINGLE_CHARS].lower())
     if len(words) < k:
         return frozenset()
@@ -514,11 +728,56 @@ def containment(a: Iterable[int], b: Iterable[int]) -> float:
     return len(sa & sb) / float(min(len(sa), len(sb)))
 
 
+def shared_grams(a: Iterable[int], b: Iterable[int]) -> int:
+    """How many k-grams the two fingerprints have in common — the ABSOLUTE
+    volume of identical text, independent of how long either page is."""
+    return len(set(a) & set(b))
+
+
 def near_duplicate(a: Iterable[int], b: Iterable[int], threshold: float = 0.6) -> bool:
-    """Same report? True when the fingerprints overlap heavily either way."""
+    """Same report? True when the fingerprints overlap heavily either way.
+
+    Three rules, in order of how much of the page they need to agree:
+
+    1. JACCARD — the pages are largely the same text. The verbatim
+       syndication case.
+    2. CONTAINMENT — one page is nearly all inside the other. The copy that
+       trimmed the tail, or the aggregator that prepended a short lede.
+    3. THE REWRITE RULE — a large absolute volume of identical text that is
+       also at least half the shorter page. This is the one that catches a
+       copy whose OPENING was rewritten, which the first two miss because
+       both divide by a whole document (see _DUP_MIN_SHARED).
+
+    Rule 3 does not scale with `threshold`. `threshold` is a Jaccard cut and
+    rule 3 is not a ratio over a union, so there is no honest way to derive one
+    from the other; `threshold = 0` still disables everything, but no value
+    between 0 and 1 tightens rule 3. Its floor is a measurement, not a taste
+    setting — if it needs to become one, it needs its own knob.
+
+    Rule 3 is deliberately biased. Two genuinely independent articles that
+    each reproduce the same long statement, where that statement is more than
+    half of each of them, are also called duplicates: structurally that is
+    indistinguishable from a partial rewrite, and no signal in the text
+    separates them. The error is taken in this direction on purpose — calling
+    a copy independent INFLATES corroboration (the defect this module exists
+    to prevent), while calling a heavy quoter a duplicate only withholds a
+    corroboration bonus. The source is still read, still cited, still counted
+    for authority; it just stops being a second voice.
+    """
     if threshold <= 0:
         return False
-    return jaccard(a, b) >= threshold or containment(a, b) >= min(0.95, threshold + 0.25)
+    sa, sb = set(a), set(b)
+    if not sa or not sb:
+        return False
+    shared = len(sa & sb)
+    if shared == 0:
+        return False
+    if shared / float(len(sa | sb)) >= threshold:
+        return True
+    fraction_of_smaller = shared / float(min(len(sa), len(sb)))
+    if fraction_of_smaller >= min(0.95, threshold + 0.25):
+        return True
+    return shared >= _DUP_MIN_SHARED and fraction_of_smaller >= _DUP_SHARED_FRACTION
 
 
 _TITLE_NOISE_RE = re.compile(r"\s*[|\-–—:·]\s*[^|\-–—:·]{1,40}$")

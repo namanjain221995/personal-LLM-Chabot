@@ -16,6 +16,7 @@ Nothing here performs network I/O at import time.
 from __future__ import annotations
 
 import asyncio
+import weakref
 from contextvars import ContextVar
 from typing import List, Optional, Sequence, Tuple
 
@@ -66,6 +67,52 @@ _MIN_CLIPPED_CHARS = 2000
 _window_cache: dict = {}
 _lock = asyncio.Lock()
 
+#: One /tokenize client per (event loop, timeout), for the same reason
+#: llm._CLIENTS exists — except this call site was missed by that 2026-09-03
+#: change and kept building an AsyncClient per call.
+#:
+#: Constructing one costs a measured 11.7 ms of *synchronous* CPU on this
+#: box (2026-09-06), effectively all of it building the default SSL context:
+#: `AsyncClient(verify=False)` is 0.10 ms and `create_ssl_context(verify=True)`
+#: alone is 11.7 ms. That cost is paid on the event loop, so it stalls every
+#: other request in flight, and it buys nothing here — /tokenize is a plain
+#: http call to a vLLM sidecar and never completes a TLS handshake.
+#:
+#: count_tokens runs 2-3 times per chat turn (compaction.measure, fit_messages,
+#: model_window), so this is ~25-35 ms of avoidable event-loop block per turn,
+#: multiplied by concurrency. Reusing the client also stops opening a fresh
+#: connection pool per count. Keyed by loop because an httpx pool is bound to
+#: the loop that created it (tests run many).
+_TOKENIZE_CLIENTS: dict = {}
+
+
+def _tokenize_client():
+    """Shared httpx client for POST /tokenize; never closed mid-process."""
+    import httpx
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    # Keyed by id() for the lookup, but the loop itself is held weakly and
+    # re-checked: CPython recycles id()s once a loop is collected, so a bare
+    # id key hands a later loop a client bound to a dead one. Weak, so a
+    # finished loop is not kept alive by this cache.
+    key = (id(loop), float(settings.tokenize_timeout))
+    cached = _TOKENIZE_CLIENTS.get(key)
+    if cached is not None:
+        cached_loop_ref, client = cached
+        same_loop = loop is None or (
+            cached_loop_ref is not None and cached_loop_ref() is loop
+        )
+        if same_loop and not client.is_closed:
+            return client
+    client = httpx.AsyncClient(timeout=settings.tokenize_timeout)
+    if len(_TOKENIZE_CLIENTS) > 64:  # tests: many loops; production: a handful
+        _TOKENIZE_CLIENTS.clear()
+    _TOKENIZE_CLIENTS[key] = (weakref.ref(loop) if loop is not None else None, client)
+    return client
+
 
 def service_root(base_url: str) -> str:
     """`http://vllm:30000/v1` → `http://vllm:30000` (tokenize is not under /v1)."""
@@ -102,8 +149,6 @@ async def count_tokens(
     Returns max_model_len=None when the server could not be asked, so callers
     can fall back to the configured window.
     """
-    import httpx
-
     from .llm import normalize_system
 
     # Fold system blocks exactly as the completion path does before ITS call.
@@ -117,12 +162,10 @@ async def count_tokens(
     # (2026-08-30).
     payload = {"model": model, "messages": normalize_system(list(messages))}
     try:
-        async with httpx.AsyncClient(timeout=settings.tokenize_timeout) as client:
-            resp = await client.post(
-                f"{service_root(base_url)}/tokenize", json=payload
-            )
-            resp.raise_for_status()
-            data = resp.json()
+        client = _tokenize_client()
+        resp = await client.post(f"{service_root(base_url)}/tokenize", json=payload)
+        resp.raise_for_status()
+        data = resp.json()
         count = int(data["count"])
         window = data.get("max_model_len")
         window = int(window) if window else None
