@@ -74,7 +74,11 @@ from urllib.parse import urlparse
 
 from .. import db, llm
 from ..config import settings
-from ..core import extract, provenance
+# `extract` is deliberately NOT imported any more: every head slice this
+# module used to take (`extract.truncate_chars`) is now the search path's
+# query-centred `_select_text` — see `_trim_evidence` for what the head slice
+# was costing (C1).
+from ..core import provenance
 from ..core.sf_intel.planner import extract_json_object
 from ..freshness import Freshness, Verdict, classify_offline
 from ..memory_recall import keywords
@@ -88,6 +92,7 @@ from .search import (
     _fetch_sources,
     _normalize_url,
     _rerank_results,
+    _select_text,
     _spawn,
     _persist_and_index,
 )
@@ -101,12 +106,40 @@ Emit = Callable[[str, dict], Awaitable[None]]
 #: research run moving without pushing a chat turn behind a queue (the engine
 #: is memory-bandwidth bound, so the third concurrent generation costs every
 #: other stream latency rather than adding throughput).
+#:
+#: PROCESS-WIDE, and shared by every concurrent run (R13): two runs do not get
+#: two slots each, they share these two. That is the whole reason a second run
+#: is now allowed at all — it interleaves inside a budget interactive chat
+#: already tolerates, instead of adding a third generation stream. It costs the
+#: first run latency, never the chat path.
 _LLM_SEM = asyncio.Semaphore(2)
 
-#: One research run at a time per orchestrator process. A second run would
-#: double every budget below against the same SearXNG and the same GPU; the
-#: user gets a plain answer that says so rather than a starved one.
-_RUN_LOCK = asyncio.Lock()
+#: `_RUN_LOCK` used to live here: one research run at a time per process, and
+#: a second request was REFUSED outright. That made one person's ten-minute run
+#: fail every other user's Deep Research request org-wide (R13). It is replaced
+#: by `_Admission` further down — a per-user allowance under a process-wide
+#: ceiling, with a bounded queue and a refusal that says when to come back.
+
+#: The share of `deep_research_timeout_s` kept back for the report.
+#:
+#: The budget exists to bound GATHERING, and a run that spends all of it must
+#: still be able to say what it found — so the loop stops this much early and
+#: the writing gets the rest. A run that stops on its own (sufficient, source
+#: cap) keeps the WHOLE remainder, so nothing changes for a healthy run; only
+#: a run that would have overrun is squeezed.
+_REPORT_RESERVE_FRACTION = 0.25
+#: …but never more than this. A longer budget buys more gathering, not a
+#: proportionally longer report.
+_REPORT_RESERVE_MAX_S = 240.0
+#: The floor under the report's allowance whatever the configuration, so a run
+#: that is already over budget writes a short honest partial rather than an
+#: empty document.
+_REPORT_FLOOR_S = 15.0
+
+
+def _report_reserve_s(total: float) -> float:
+    return min(_REPORT_RESERVE_MAX_S, max(0.0, total) * _REPORT_RESERVE_FRACTION)
+
 
 #: A citation the model wrote: [1], [12].
 _CITE_RE = re.compile(r"\[(\d{1,3})\]")
@@ -186,6 +219,21 @@ STATUS_UNKNOWN = "unknown"
 _SUPERSEDE_GAP_DAYS = 45
 #: Authority points separating "comparable" sources from "much weaker".
 _AUTHORITY_GAP = 30
+
+#: A resolved value that NO supporting source states in its own words is not
+#: something this run can stand behind. `_quote_in` — the same matcher the
+#: shared claim store uses — decides that in `_resolve` now, BEFORE the report
+#: prompt is built: until 2026-09-06 the check ran only in `_persist_claims`,
+#: after the report was written, so a value no page states was dropped from
+#: the shared store while still reaching the report with a citation and a
+#: confidence number.
+#:
+#: A ceiling AND a penalty, because both properties are needed: the ceiling
+#: keeps an unstated value out of "confident" territory whatever else it has
+#: going for it, and the penalty preserves the ORDER within the unstated ones
+#: (two independent sources still beat one), which a bare ceiling flattens.
+_UNSTATED_CONFIDENCE_CAP = 0.45
+_UNSTATED_CONFIDENCE_PENALTY = 0.25
 
 
 # ---------------------------------------------------------------------------
@@ -345,6 +393,14 @@ class SourceRecord:
     #: its citation number but corroborates nothing on its own.
     dup_of: Optional[int] = None
     primary: bool = False
+    #: How much of the FIRST-HAND bonus this source has earned, in [0, 1]
+    #: (R12). `primary` says the page is first-hand; this says whether it is
+    #: also disinterested. A vendor's own page about the vendor is still a
+    #: primary source — it is just not the most trustworthy possible source
+    #: for a claim about itself, which is what the full bonus asserts. Kept
+    #: beside `primary` rather than replacing it: rank, link score, citation
+    #: and the "primary source opened" line all still key on the boolean.
+    primary_weight: float = 0.0
     from_store: bool = False
 
     @property
@@ -413,9 +469,14 @@ class Resolution:
     primary: bool = False
     #: [{value, as_of, sources}] — older values the current one replaced.
     superseded: List[dict] = field(default_factory=list)
-    #: [{value, as_of, sources}] — comparable-date disagreements.
+    #: [{value, as_of, sources}] — comparable-date disagreements. An entry
+    #: with "weak": True is a disagreement from a much weaker, undated source:
+    #: still an open disagreement, never a change over time.
     conflicts: List[dict] = field(default_factory=list)
     confidence: float = 0.0
+    #: False when no supporting source states `value` in its own words
+    #: (`_quote_in`). The report must not present it as an established fact.
+    stated_verbatim: bool = True
 
     def line(self) -> str:
         head = f"[{self.subq}] {self.question} — {self.status.upper()}"
@@ -435,12 +496,15 @@ class Resolution:
                 + ")"
             )
         for c in self.conflicts[:3]:
+            kind = "disputed by a weaker source" if c.get("weak") else "conflicting"
             tail += (
-                f' · conflicting: "{c["value"]}" ('
+                f' · {kind}: "{c["value"]}" ('
                 f"{('as of ' + c['as_of']) if c.get('as_of') else 'date not stated'}; "
                 + "".join(f"[{n}]" for n in c.get("sources", []))
                 + ")"
             )
+        if not self.stated_verbatim:
+            tail += " · NOT STATED VERBATIM by any cited source"
         return head + tail + f" · confidence {self.confidence:.2f}"
 
     def as_meta(self) -> dict:
@@ -455,6 +519,7 @@ class Resolution:
             "superseded": list(self.superseded),
             "conflicts": list(self.conflicts),
             "confidence": round(self.confidence, 2),
+            "stated_verbatim": self.stated_verbatim,
         }
 
 
@@ -469,6 +534,9 @@ class RoundStats:
     duplicates: int = 0
     links_followed: int = 0
     new_claims: int = 0
+    #: Query groups this round lost to a search-provider outage. A round that
+    #: searched nothing is not a round that found nothing.
+    search_outages: int = 0
     elapsed_s: float = 0.0
 
     @property
@@ -493,6 +561,7 @@ class RoundStats:
             "duplicates": self.duplicates,
             "links_followed": self.links_followed,
             "new_claims": self.new_claims,
+            "search_outages": self.search_outages,
             "gain": round(self.gain, 2),
             "elapsed_s": round(self.elapsed_s, 1),
         }
@@ -532,16 +601,86 @@ class ResearchState:
     stale_downranked: List[str] = field(default_factory=list)
     verification_rounds: int = 0
     verification: Optional[dict] = None
+    #: Query groups lost to a SearchUnavailableError across the whole run.
+    #: A run whose later rounds searched nothing must not read, in meta or in
+    #: the report, like a run that mined the web and found little.
+    search_outages: int = 0
+    #: True when the evidence auditor (`_assess`) could not be reached at all.
+    auditor_failed: bool = False
+    #: Set when the report stream stopped at its token ceiling (R9).
+    report_truncated: bool = False
+    #: Stages the wall-clock budget cut short or skipped, in order (R8). A run
+    #: that ran out of time must not read like a run that finished its plan.
+    cut_short: List[str] = field(default_factory=list)
+    #: Set when the REPORT stream itself was stopped by the budget.
+    report_cut_short: bool = False
+    #: source.n → folded text + sentence spans, so the verbatim check in
+    #: `_resolve` folds each page once per run rather than once per round.
+    folded: Dict[int, "_Prepared"] = field(default_factory=dict, repr=False)
 
     @property
     def elapsed(self) -> float:
         return time.monotonic() - self.started_at
 
+    @property
+    def gather_budget_s(self) -> float:
+        """The wall clock this run may spend BEFORE the report is written.
+
+        `deep_research_timeout_s` used to be advisory (R8): it was consulted
+        between rounds and before the verify follow-up, and nowhere else. A
+        run at 599 s of a 600 s budget could still start a whole round, a
+        verification pass and a long report — a nominal ten-minute run taking
+        twenty, while holding one of the process's few research slots against
+        every other user. Every expensive stage is now bounded by what is left
+        of THIS, and the remainder belongs to the report (`report_budget_s`).
+
+        Admission quotes this budget back to a refused request ("the earliest
+        finishes in about N minutes"), so it is now load-bearing for a promise
+        made to a DIFFERENT user, not only for this run's own honesty.
+        """
+        total = float(settings.deep_research_timeout_s or 0.0)
+        if total <= 0:
+            # A non-positive budget already meant "one round then stop" here;
+            # keep exactly that rather than inventing a new behaviour.
+            return 0.0
+        return max(0.0, total - _report_reserve_s(total))
+
+    def gather_left(self) -> float:
+        """Seconds left for gathering; `inf` when no budget is configured.
+
+        A non-positive `deep_research_timeout_s` has always meant "one round,
+        then stop" here (`budget_left` compared against it directly), and it
+        still does: the loop ends after the round, but the round itself runs
+        unbounded rather than being skipped before it starts. Bounding stages
+        must not turn a zero budget into a run that gathers nothing.
+        """
+        if float(settings.deep_research_timeout_s or 0.0) <= 0:
+            return float("inf")
+        return self.gather_budget_s - self.elapsed
+
+    def report_budget_s(self) -> float:
+        """Seconds the report stream may take.
+
+        A run that stopped early gets everything left of the budget; a run
+        that spent the whole gathering budget still gets the reserve, because
+        a run that reached its limit must still be able to report what it
+        read. With no research budget configured, `llm.py`'s own wall clock is
+        the only bound — exactly as before.
+        """
+        total = float(settings.deep_research_timeout_s or 0.0)
+        if total <= 0:
+            return float(settings.gen_wall_clock_s or 0.0) or _REPORT_FLOOR_S
+        return max(
+            _REPORT_FLOOR_S,
+            _report_reserve_s(total),
+            (self.started_at + total) - time.monotonic(),
+        )
+
     def budget_left(self) -> bool:
         return (
             self.iterations < settings.deep_research_max_iterations
             and len(self.sources) < settings.deep_research_max_sources
-            and self.elapsed < settings.deep_research_timeout_s
+            and self.elapsed < self.gather_budget_s
         )
 
     def budget_reason(self) -> str:
@@ -549,7 +688,7 @@ class ResearchState:
             return "iteration_cap"
         if len(self.sources) >= settings.deep_research_max_sources:
             return "source_cap"
-        if self.elapsed >= settings.deep_research_timeout_s:
+        if self.elapsed >= self.gather_budget_s:
             return "timeout"
         return ""
 
@@ -583,6 +722,45 @@ class ResearchState:
 
 def _rlog(state: ResearchState, msg: str, *args) -> None:
     log.info("research[%s] " + msg, state.research_id[:8], *args)
+
+
+async def _bounded(state: ResearchState, stage: str, coro, default=None):
+    """Await `coro` inside what is left of the gathering budget (R8).
+
+    Returns `(finished, value)`. A stage that does not finish is RECORDED, not
+    raised: everything it registered before the cut — sources, claims,
+    resolutions — is already in `state` and stays there, the run goes on to
+    write its report from exactly that, and `stop_reason` says the clock ended
+    it. A cut round is a SHORT round, not a lost one.
+
+    The log carries the stage name and the numbers only. A stage cut mid-flight
+    may be inside a third-party fetch or an LLM call whose exception text can
+    carry credentials, and this module's logs are shipped.
+    """
+    left = state.gather_left()
+    if left == float("inf"):
+        return True, await coro
+    if left <= 0:
+        coro.close()  # never started; do not leave an un-awaited coroutine
+        state.cut_short.append(stage)
+        _rlog(
+            state,
+            "%s skipped: the %.0fs gathering budget is spent (%.1fs elapsed)",
+            stage, state.gather_budget_s, state.elapsed,
+        )
+        return False, default
+    try:
+        return True, await asyncio.wait_for(coro, left)
+    except asyncio.TimeoutError:
+        state.cut_short.append(stage)
+        log.warning(
+            "research[%s] %s stopped at the run's time budget "
+            "(%.1fs elapsed of a %.0fs budget) — the report will be written "
+            "from what was already gathered",
+            state.research_id[:8], stage, state.elapsed,
+            float(settings.deep_research_timeout_s or 0.0),
+        )
+        return False, default
 
 
 # ---------------------------------------------------------------------------
@@ -723,6 +901,11 @@ def _register(
         links=list(getattr(src, "links", []) or [])[:500],
         fingerprint=provenance.shingles(text),
         primary=provenance.is_primary(url, kind, authority),
+        # The plan's entities are what makes self-publication visible: with an
+        # empty list this is exactly `is_primary` as a float, so a run whose
+        # planner named nothing behaves as before rather than half-trusting
+        # everything.
+        primary_weight=provenance.primary_weight(url, kind, authority, state.entities),
         from_store=bool(getattr(src, "from_store", False)),
     )
     threshold = float(settings.deep_research_duplicate_threshold or 0)
@@ -977,6 +1160,21 @@ async def _gather(
         try:
             found = await _collect_results(group, effort, emit, category)
         except SearchUnavailableError:
+            # A mid-run outage used to be a bare `continue`: no log, no
+            # counter. Search dying after round 1 then looked exactly like a
+            # web with nothing left to give — the loop stopped on
+            # `no_information_gain` and a thin report was presented as a
+            # mined web. Counted here, surfaced in meta and in the report
+            # prompt. The CATEGORY only: the exception carries the upstream
+            # message, which can hold credentials, and this module's logs are
+            # asserted on for exactly that.
+            stats.search_outages += 1
+            state.search_outages += 1
+            log.warning(
+                "research search provider unavailable (category=%s, round=%d, "
+                "queries=%d) — this round searched nothing in that pool",
+                category or "general", state.iterations, len(group),
+            )
             continue
         except Exception:  # noqa: BLE001 — one bad group must not end the run
             log.warning("research search group failed (%s)", category or "general", exc_info=True)
@@ -1060,6 +1258,35 @@ async def _gather(
     return added
 
 
+async def _gather_bounded(
+    state: ResearchState,
+    queries: List[str],
+    effort: str,
+    emit: Optional[Emit],
+    label: str,
+) -> Tuple[List[SourceRecord], bool]:
+    """One round under the run's remaining wall clock. → (added, was_cut).
+
+    `_gather` is the expensive stage — searches, fetches, an extraction call
+    per round — and it was entirely unbounded: the budget was only ever read
+    BETWEEN rounds (R8).
+    """
+    started = time.monotonic()
+    round_no = state.iterations
+    ok, added = await _bounded(
+        state,
+        f"round {round_no} ({label})",
+        _gather(state, queries, effort, emit, label),
+        [],
+    )
+    # A round cancelled mid-flight never reached its own bookkeeping, and a
+    # round reported as 0.0s in meta reads as one that never ran.
+    stats = state.rounds[-1] if state.rounds else None
+    if stats is not None and stats.iteration == round_no and not stats.elapsed_s:
+        stats.elapsed_s = time.monotonic() - started
+    return list(added or []), not ok
+
+
 # ---------------------------------------------------------------------------
 # Claims: extract with dates, resolve in code
 # ---------------------------------------------------------------------------
@@ -1114,7 +1341,14 @@ async def _extract_claims(
     )
     blocks = []
     for s in new_sources:
-        excerpt = extract.truncate_chars(" ".join((s.text or "").split()), 2500)
+        # Query-centred, not the first 2,500 characters (C1). This excerpt is
+        # what BECOMES the evidence: a fact outside it is never extracted as a
+        # claim, never resolved, and never verified, however many times the
+        # page is cited. Measured on `leaderboard_long.html`: the head slice
+        # drops the answer row, the selection keeps it. Lines are kept — the
+        # rows of a table are one per line, and flattening them to a single
+        # paragraph is what made a leaderboard read as a run of bare numbers.
+        excerpt = _select_text(s.text or "", state.question, 2500)
         blocks.append(f"[{s.n}] {s.title} ({s.label()})\n{excerpt}")
     user = (
         f"QUESTION: {state.question}\n\nSUBQUESTIONS:\n"
@@ -1180,6 +1414,28 @@ def _norm_value(value: str) -> str:
     return t
 
 
+def _value_is_stated(state: ResearchState, value: str, support: Sequence[int]) -> bool:
+    """Does one of the supporting sources actually state `value`?
+
+    The same matcher the shared claim store gates on (`_quote_in`: fold, whole
+    words, a bounded fuzzy path for long values) — moved in front of the
+    report instead of only behind it. Folding a page is a per-character Python
+    loop, and `_resolve` runs after every round, so each page is folded once
+    per run and cached on the state.
+    """
+    value = " ".join((value or "").split())
+    if not value:
+        return False
+    for src in _supporting_sources(state, support):
+        prepared = state.folded.get(src.n)
+        if prepared is None:
+            prepared = _prepare(src.text)
+            state.folded[src.n] = prepared
+        if _quote_in(src.text, value, prepared):
+            return True
+    return False
+
+
 def _resolve(state: ResearchState) -> None:
     """Decide, in code, what each subquestion's evidence adds up to.
 
@@ -1233,6 +1489,10 @@ def _resolve(state: ResearchState) -> None:
             domains = {s.domain_key for s in srcs if s.dup_of is None}
             auth = max((s.authority for s in srcs), default=40)
             primary = any(s.primary for s in srcs)
+            # The BEST first-hand claim in the group, not the average: one
+            # disinterested primary source earns the whole bonus even when the
+            # subject's own page is sitting next to it.
+            primary_weight = max((s.primary_weight for s in srcs), default=0.0)
             times = [t for t in (_claim_time(state, c) for c in cs) if t]
             when = max(times) if times else None
             historical = bool(cs) and all(c.hint == "historical" for c in cs)
@@ -1240,7 +1500,8 @@ def _resolve(state: ResearchState) -> None:
                 {
                     "key": key, "claims": cs, "support": canonical,
                     "independent": max(1, len(domains)) if srcs else 0,
-                    "authority": auth, "primary": primary, "when": when,
+                    "authority": auth, "primary": primary,
+                    "primary_weight": primary_weight, "when": when,
                     "historical": historical, "value": (cs[0].value or cs[0].text)[:200],
                 }
             )
@@ -1293,19 +1554,48 @@ def _resolve(state: ResearchState) -> None:
             elif g["authority"] >= winner["authority"] - _AUTHORITY_GAP:
                 conflicts.append(entry)  # comparable authority, comparable/unknown date
             else:
-                superseded.append(entry)  # a weak, undated outlier
+                # A MUCH weaker source, and no date on either side. Filing
+                # this as `superseded` invented history: rule 7 of the report
+                # prompt then presents a superseded value as a change over
+                # time ("previously X until Y"), so an open disagreement was
+                # narrated as a settled sequence of events that no source
+                # dated, let alone stated. It is a disagreement — recorded as
+                # one, with the weakness of the dissenting source marked.
+                entry["weak"] = True
+                conflicts.append(entry)
 
         status = STATUS_CONFLICTING if conflicts else STATUS_CURRENT
         confidence = 0.3
         confidence += 0.25 if winner["independent"] >= 2 else 0.0
         confidence += 0.2 if winner["authority"] >= 70 else (0.05 if winner["authority"] >= 40 else 0.0)
-        confidence += 0.1 if winner["primary"] else 0.0
+        # R12: SCALED by how first-hand the source actually is. It was
+        # `0.1 if primary`, which paid a vendor's own benchmark page the same
+        # first-hand bonus as an independent laboratory's measurement of it.
+        # A self-published primary keeps half — it is genuinely first-hand,
+        # it is just not disinterested (provenance.SELF_PUBLISHED_PRIMARY_WEIGHT).
+        confidence += 0.1 * float(winner.get("primary_weight") or 0.0)
         if winner["when"] and state.time_sensitive:
             age_days = (today - winner["when"]).days
             confidence += 0.1 if age_days * 86400 <= max_age else -0.05
         elif not state.time_sensitive:
             confidence += 0.05
-        confidence -= 0.25 if conflicts else 0.0
+        if conflicts:
+            # A disagreement between comparable sources is a real open
+            # question; one raised only by a much weaker source is a doubt.
+            confidence -= 0.1 if all(c.get("weak") for c in conflicts) else 0.25
+        # Does any source actually SAY this? Same matcher, same rule as the
+        # shared claim store — run here, before the value reaches the report
+        # prompt, the evidence table and meta, instead of only afterwards.
+        # Skipped for a prose group: it has no value to check, only the
+        # extractor's sentence, and holding a paraphrase to a verbatim test
+        # would mark every prose answer unstated.
+        stated = True
+        if winner["key"] != "_prose":
+            stated = _value_is_stated(state, winner["value"], winner["support"])
+            if not stated:
+                confidence = min(
+                    confidence - _UNSTATED_CONFIDENCE_PENALTY, _UNSTATED_CONFIDENCE_CAP
+                )
         confidence = max(0.05, min(0.98, confidence))
         state.resolutions[i] = Resolution(
             subq=i,
@@ -1319,6 +1609,7 @@ def _resolve(state: ResearchState) -> None:
             superseded=superseded,
             conflicts=conflicts,
             confidence=confidence,
+            stated_verbatim=stated,
         )
     for r in state.resolutions.values():
         _rlog(state, "resolution %s", r.line())
@@ -1338,7 +1629,10 @@ def _resolution_table(state: ResearchState) -> str:
 async def _assess(state: ResearchState, effort: str) -> dict:
     """Read what we have and decide whether another round is warranted."""
     covered = "\n".join(
-        f"[{s.n}] {s.title} ({s.domain_key}; {s.label()}) — {extract.truncate_chars(' '.join((s.text or '').split()), 1000)}"
+        # Query-centred (C1): an auditor shown the first 1,000 characters of
+        # a page judges the lede, not the evidence, and reports a gap the page
+        # actually closes — which costs another round of searching.
+        f"[{s.n}] {s.title} ({s.domain_key}; {s.label()}) — {_select_text(s.text or '', state.question, 1000)}"
         for s in state.sources[-24:]
     )
     system = (
@@ -1376,8 +1670,20 @@ async def _assess(state: ResearchState, effort: str) -> dict:
             )
         data = extract_json_object(raw) or {}
     except Exception:  # noqa: BLE001
-        log.warning("gap analysis failed; treating evidence as sufficient", exc_info=True)
-        return {"sufficient": True, "missing": [], "followup_queries": []}
+        # NOT "sufficient". Returning that made an auditor OUTAGE indis-
+        # tinguishable from an audit that found nothing missing: the step
+        # detail said "no gaps found", meta.research_run.stop_reason said
+        # `sufficient`, and the run claimed to have been judged adequate by a
+        # check that never ran. An outage is its own answer.
+        state.auditor_failed = True
+        log.warning("gap analysis failed; the evidence was NOT audited")
+        return {
+            "sufficient": False,
+            "auditor_failed": True,
+            "missing": [],
+            "contradictions": [],
+            "followup_queries": [],
+        }
     if not isinstance(data.get("sufficient"), bool):
         data["sufficient"] = True
     return data
@@ -1408,6 +1714,30 @@ def _synthetic_followups(state: ResearchState, missing: List[str]) -> List[str]:
     return out[:3]
 
 
+def _accumulate(existing: Sequence[str], incoming: object, cap: int = 24) -> List[str]:
+    """`existing` + the new strings of `incoming`, de-duplicated, first-seen
+    order kept.
+
+    The gap and contradiction lists used to be REASSIGNED from each audit, so
+    a gap found in round 2 and not repeated in round 4 never reached the
+    report's "What this report could not establish" section — the one place a
+    reader learns what the run could not do. Nothing else in the loop closes
+    a gap explicitly, so forgetting one is a silent claim to have answered it.
+    """
+    out = list(existing)
+    seen = {" ".join(s.lower().split()) for s in out}
+    for item in incoming or []:
+        if not isinstance(item, str):
+            continue
+        text = " ".join(item.split())
+        key = text.lower()
+        if not text or key in seen:
+            continue
+        seen.add(key)
+        out.append(text)
+    return out[:cap]
+
+
 def _followup_queries(state: ResearchState, verdict: dict) -> List[str]:
     cap = settings.deep_research_max_queries_per_iteration
     wanted: List[str] = []
@@ -1423,6 +1753,13 @@ def _followup_queries(state: ResearchState, verdict: dict) -> List[str]:
 
 def _should_stop(state: ResearchState, verdict: dict, followups: List[str]) -> str:
     """The stop reason, or '' to keep going. Evidence-driven, in this order."""
+    if verdict.get("auditor_failed"):
+        # The auditor is what decides whether to keep going, and it is down.
+        # Another round would search whatever the last one searched (it
+        # produces no follow-ups), so the run stops — under its own name, so
+        # the report and the run record say the evidence was never audited
+        # rather than that it was audited and found sufficient.
+        return "auditor_unavailable"
     if verdict.get("sufficient") and not state.unresolved():
         return "sufficient"
     if verdict.get("sufficient") and not followups:
@@ -1453,7 +1790,12 @@ async def _verify(state: ResearchState, effort: str) -> Tuple[dict, List[str]]:
     """Audit the resolved claims before writing. → (verdict, queries to run)."""
     subqs = state.subquestions or [state.question]
     excerpts = "\n".join(
-        f"[{s.n}] {s.title} ({s.domain_key}; {s.label()}) — {extract.truncate_chars(' '.join((s.text or '').split()), 700)}"
+        # Query-centred (C1), with the same caveat measured on the fixture:
+        # under ~1,000 characters the selector cannot always reach a passage
+        # 19,000 characters into a page. Never worse than the head slice; not
+        # always enough on its own, which is why this pass ASKS for a round
+        # rather than concluding absence.
+        f"[{s.n}] {s.title} ({s.domain_key}; {s.label()}) — {_select_text(s.text or '', state.question, 700)}"
         for s in state.canonical_sources[-20:]
     )
     system = (
@@ -1591,16 +1933,36 @@ def cited_numbers(report: str, source_count: int) -> List[int]:
     )
 
 
-def _trim_evidence(sources: List[SourceRecord]) -> None:
-    """Full budget for the best sources, a summary excerpt for the long tail.
+def _trim_evidence(sources: List[SourceRecord], question: str = "") -> None:
+    """Full budget for the best sources, a query-centred excerpt for the tail.
 
     The same two-tier shape the search engine uses, so a 24-source run does
     not spend its whole prompt on the pages that ranked last. Mutates in
     place, like `search._apply_char_tiers`.
+
+    THIS IS FINDING C1, one function further down the pipe. The tail cut used
+    `extract.truncate_chars` — a pure head slice — so on a 24-source run
+    sources 11-24 reached the report writer with their first 2,500 characters
+    and nothing else. On `leaderboard_long.html` the answer row is at
+    character 19,831 of 20,136: the page is fetched, cited in the panel, and
+    handed to the model with the answer removed, and the report then says the
+    fact is absent with a citation behind it.
+
+    Worse after the search path was fixed, not better. `_fetch_sources` now
+    returns 8,000 QUERY-CENTRED characters, and because passages are kept in
+    document order the passage the question actually points at ends up LAST —
+    measured at character 7,829 of 8,000 on that fixture. A head slice of a
+    query-centred selection is therefore near-guaranteed to drop the one
+    passage the selection existed to keep.
+
+    `_select_text` is the search path's own selector: with a question it
+    spends the same budget on the parts the question points at, and with no
+    question it is the head slice, so a caller that passes only the list (the
+    engine suite's own trim test) behaves exactly as before.
     """
     for s in sources:
         if s.n > _TIER_A_SOURCES:
-            s.text = extract.truncate_chars(s.text, _TIER_B_CHARS)
+            s.text = _select_text(s.text, question, _TIER_B_CHARS)
 
 
 def _evidence_block(sources: Sequence[SourceRecord]) -> str:
@@ -1631,6 +1993,36 @@ def _report_messages(state: ResearchState, history: Sequence[dict]) -> List[dict
         if state.contradictions
         else ""
     )
+    # A run whose search provider died mid-way read less of the web than it
+    # planned to. Saying so is the difference between a thin report and a
+    # thin report presented as a thorough one.
+    outage = (
+        "\n\nSEARCH COVERAGE: the search provider was unavailable for "
+        f"{state.search_outages} of this run's query groups, so parts of the "
+        "plan were never searched. Say so in the report's limitations rather "
+        "than presenting the evidence base as complete."
+        if state.search_outages
+        else ""
+    )
+    # A run the clock cut short read less of the web than its plan called
+    # for. Saying so is the difference between a thin report and a thin report
+    # presented as a thorough one (R8, the same argument as the outage note).
+    budget = (
+        "\n\nTIME BUDGET: this run reached its wall-clock limit and stopped "
+        "early — " + ", ".join(state.cut_short[:4]) + " did not finish. The "
+        "evidence below is what could be gathered in the time available, not "
+        "everything the plan called for: say so in the limitations rather "
+        "than presenting the evidence base as complete."
+        if state.cut_short
+        else ""
+    )
+    audit = (
+        "\n\nAUDIT: the evidence auditor could not be reached during this "
+        "run, so nothing checked what is missing. Do not claim the coverage "
+        "is complete; say the evidence was not audited."
+        if state.auditor_failed
+        else ""
+    )
     system = (
         "You are writing a research report from numbered sources that were "
         "actually fetched and read. Rules:\n"
@@ -1651,7 +2043,12 @@ def _report_messages(state: ResearchState, history: Sequence[dict]) -> List[dict
         "their as-of date; present SUPERSEDED values as history ('previously "
         "X until Y', 'changed on Z'), not as errors; present CONFLICTING "
         "values as an open disagreement with both citations; for UNKNOWN say "
-        "'not found in the sources consulted' and name what was searched.\n"
+        "'not found in the sources consulted' and name what was searched. A "
+        "value marked 'disputed by a weaker source' is an open disagreement "
+        "whose other side is weaker — say that, never that it changed over "
+        "time. A value marked 'NOT STATED VERBATIM' was not found in any "
+        "source's own words: attribute it as what the sources imply, or leave "
+        "it out; never state it as an established fact.\n"
         "8. A source marked 'same text as [n]' is a syndicated copy of [n]: "
         "it corroborates nothing on its own.\n"
         "9. Prefer primary sources (official, first-party, documentation, the "
@@ -1665,11 +2062,21 @@ def _report_messages(state: ResearchState, history: Sequence[dict]) -> List[dict
         + f"\n\nEVIDENCE STATUS (resolved from the sources; dates are when each value held):\n{_resolution_table(state)}"
         + gaps
         + conflicts
+        + outage
+        + audit
+        + budget
         + f"\n\nSOURCES:\n{_evidence_block(state.sources)}"
     )
     return [
         {"role": "system", "content": system},
-        *recent_turns(history, 2),
+        # `_conversation_turns`, NOT `recent_turns`: the latter keeps every
+        # system message in the history — the cross-chat recall block, the
+        # user's saved facts, a shared page's excerpt — and this report is
+        # exported to PDF and shared. The planner learned this on its first
+        # live run (it researched the signed-in user's own name); the report
+        # writer was still being handed the same blocks until 2026-09-06.
+        # Only what the user actually asked is research context.
+        *_conversation_turns(history, 2),
         {"role": "user", "content": user},
     ]
 
@@ -1997,6 +2404,325 @@ async def _close_run(
         log.warning("could not close the research run", exc_info=True)
 
 
+def _report_token_ceiling(effort: str) -> int:
+    """How many completion tokens the report call may produce before the
+    server cuts it off — mirroring the sizing `llm.stream_chat_events` does
+    with the ceiling this module asks for.
+
+    Deliberately reconstructed rather than assumed: the ledger's premise
+    ("the report is capped at deep_research_report_max_tokens") only holds
+    with thinking OFF. With thinking on and the default unbounded budget
+    mode, `stream_chat_events` floors the request at MAX_OUTPUT_TOKENS
+    (65,536), so 6,000 is not the wall — and comparing against 6,000 would
+    report every long report as truncated.
+
+    It is still only a lower bound on certainty: `context.fit_request` can
+    LOWER the cap when the prompt crowds the window, and nothing in this
+    process is told when it does. The honest fix is a `finish_reason` from
+    the streaming layer; `llm.py` has no handling for one at all.
+    """
+    asked = int(settings.deep_research_report_max_tokens or 0)
+    if not llm.wants_thinking("smart", effort):
+        return asked
+    budget = llm.thinking_budget(effort)
+    if budget:
+        return asked + int(budget)
+    return max(asked, int(settings.max_output_tokens or 0))
+
+
+# ---------------------------------------------------------------------------
+# Admission control (R13) — who may run, how many at once, and what a refused
+# request is told
+# ---------------------------------------------------------------------------
+
+
+class _Admission:
+    """Which research runs may be in flight in this process right now.
+
+    WHAT THE OLD GLOBAL LOCK GOT WRONG. `_RUN_LOCK` was one `asyncio.Lock` for
+    the whole process, and a request that found it held was refused. So a
+    single ten-minute run made every OTHER user's Deep Research request fail,
+    org-wide, with nothing to do but retry blind. On a shared platform that is
+    the wrong answer twice over: it is unfair (first arrival takes everything)
+    and it is uninformative (the refusal could not say when to come back).
+
+    WHAT IT WAS ACTUALLY PROTECTING — checked before removing it, because a
+    lock is often load-bearing for something nobody wrote down:
+
+      * NOT shared mutable state in this module. Everything at module level
+        here is a constant, a compiled regex or a semaphore; all run state
+        lives in the per-run `ResearchState`.
+      * NOT the index writer. `web_index` serialises itself on its own
+        `_index_lock`, and the write-behind path (`_persist_and_index`) is
+        already re-entered concurrently by the ordinary Web Search path, which
+        has never been serialised by anything.
+      * NOT the politeness rules. `core/robots` keeps per-origin locks, the
+        per-domain caps are per gather, and `core/net.safe_fetch` is untouched
+        by any of this. What a second run DOES double is outbound volume —
+        `_fetch_sources` bounds concurrency per call (16), so two runs can have
+        32 fetches open — but that is the same pressure the ordinary Web Search
+        path already puts on this box for two concurrent users, and it is the
+        reason the ceiling is 2 rather than a number picked to look generous.
+      * IT WAS, by accident, THE ONLY ADMISSION CONTROL ON THE PATH. Deep
+        Research never passes through `engines.search.rate_ok` — `main.py`
+        consults that for the web-search gate only — so nothing else caps how
+        much of this box research may take. That property is deliberately KEPT
+        below; what changes is that the cap is a budget, not a mutex.
+
+    THE REAL CONSTRAINT IS MODEL TIME. `_LLM_SEM` already bounds concurrent
+    generations at 2 for the whole process and every run shares it, so a
+    second run does not add a third stream for interactive chat to queue
+    behind — it interleaves inside the same two slots and mostly costs the
+    first run some latency. That is why a ceiling above one is safe here while
+    an unbounded one would not be.
+
+    Concurrency safety: `try_admit` and `release` never await, so the check
+    and the accounting cannot be interleaved by another task, and a released
+    slot is HANDED to the first waiting request that may take it rather than
+    waking every waiter to race for it.
+    """
+
+    def __init__(self) -> None:
+        #: admission key -> the monotonic start time of each run it holds.
+        self.running: Dict[str, List[float]] = {}
+        #: Arrival-ordered queue of requests waiting for a slot.
+        self.waiters: List[Tuple[str, "asyncio.Future"]] = []
+
+    # -- limits, read per call so a settings change (or a test) takes effect
+    @staticmethod
+    def ceiling() -> int:
+        return max(1, int(settings.deep_research_max_concurrent or 1))
+
+    @classmethod
+    def per_user(cls) -> int:
+        # Never above the ceiling: a per-user allowance larger than the whole
+        # machine is not an allowance, it is a rounding error waiting to be
+        # read as one.
+        return max(1, min(int(settings.deep_research_max_per_user or 1), cls.ceiling()))
+
+    @property
+    def total(self) -> int:
+        return sum(len(v) for v in self.running.values())
+
+    def held_by(self, key: str) -> int:
+        return len(self.running.get(key, ()))
+
+    def try_admit(self, key: str) -> Optional[float]:
+        """A slot's start time, or None when one is not available. Never
+        awaits — see the class docstring."""
+        if self.total >= self.ceiling():
+            return None
+        if self.held_by(key) >= self.per_user():
+            return None
+        started = time.monotonic()
+        self.running.setdefault(key, []).append(started)
+        return started
+
+    def release(self, key: str, started: float) -> None:
+        held = self.running.get(key)
+        if held:
+            try:
+                held.remove(started)
+            except ValueError:  # already released; releasing twice is not fatal
+                pass
+            if not held:
+                self.running.pop(key, None)
+        self._hand_over()
+
+    def enqueue(self, key: str, fut: "asyncio.Future") -> None:
+        self.waiters.append((key, fut))
+
+    def dequeue(self, fut: "asyncio.Future") -> None:
+        self.waiters = [w for w in self.waiters if w[1] is not fut]
+
+    def _hand_over(self) -> None:
+        """Give the freed slot(s) to the longest-waiting request that may have
+        one. A waiter blocked by its OWN per-user limit is skipped rather than
+        blocking the queue behind it — otherwise one user's second tab would
+        stall everybody else's first."""
+        i = 0
+        while i < len(self.waiters) and self.total < self.ceiling():
+            key, fut = self.waiters[i]
+            if fut.done():  # timed out or cancelled between wake-ups
+                self.waiters.pop(i)
+                continue
+            started = self.try_admit(key)
+            if started is None:
+                i += 1
+                continue
+            self.waiters.pop(i)
+            fut.set_result(started)
+
+    def frees_in_s(self, key: str = "") -> float:
+        """How long until the earliest run in flight MUST be over, in seconds.
+
+        Truthful only because R8 made `deep_research_timeout_s` a real bound
+        rather than an advisory one: every expensive stage is now wrapped by
+        what is left of it. The report still gets its floor after the gather
+        budget is spent, so the ceiling on a whole run is the budget plus that
+        floor. Returns 0.0 when nothing is running or no budget is configured
+        — in which case the caller says nothing rather than guessing.
+        """
+        budget = float(settings.deep_research_timeout_s or 0.0)
+        if budget <= 0:
+            return 0.0
+        starts = (
+            list(self.running.get(key, ()))
+            if key
+            else [t for times in self.running.values() for t in times]
+        )
+        if not starts:
+            return 0.0
+        return max(0.0, min(starts) + budget + _REPORT_FLOOR_S - time.monotonic())
+
+
+#: The admission state, and the loop it belongs to. `asyncio.Future`s are
+#: loop-bound, and this module state outlives any individual loop (the app has
+#: one for its lifetime; a test process has one per `asyncio.run`). Rebuilding
+#: on a loop change is the same guard `compaction._lock_for` and `rerank._pool`
+#: use, and it is correct rather than merely convenient: runs counted against a
+#: dead loop are not running any more.
+_ADMISSION: Optional[_Admission] = None
+_ADMISSION_LOOP: Optional[asyncio.AbstractEventLoop] = None
+
+
+def _admission() -> _Admission:
+    global _ADMISSION, _ADMISSION_LOOP
+
+    loop = asyncio.get_running_loop()
+    if _ADMISSION is None or _ADMISSION_LOOP is not loop:
+        _ADMISSION = _Admission()
+        _ADMISSION_LOOP = loop
+    return _ADMISSION
+
+
+def _admission_key(user_id: Optional[int]) -> str:
+    """The fairness bucket. One per signed-in user.
+
+    Everything reaching this engine carries a session (the enterprise auth
+    retrofit put a cookie in front of every orchestrator route), so `None` is
+    the CLI/test shape. It gets ONE shared bucket on purpose: a key the caller
+    can mint for itself — a conversation id, say — is not a fairness key, it
+    is a way around one.
+    """
+    return f"user:{user_id}" if user_id is not None else "anonymous"
+
+
+def _about_minutes(seconds: float) -> str:
+    if seconds <= 0:
+        return ""
+    if seconds < 90:
+        return "under a minute"
+    return f"about {round(seconds / 60)} minutes"
+
+
+def _refusal_text(adm: _Admission, key: str, waited_s: float) -> str:
+    """Why this request is not running, and when to come back.
+
+    A bare "no" is what R13 is about. Everything in here is read from live
+    accounting — never a guess, and never a promise the budget cannot keep.
+    """
+    mine = adm.held_by(key) >= adm.per_user()
+    left = _about_minutes(adm.frees_in_s(key if mine else ""))
+    if mine:
+        allowed = adm.per_user()
+        head = (
+            f"Your own research run{'s are' if adm.held_by(key) != 1 else ' is'} "
+            f"still going. Deep Research allows {allowed} "
+            f"run{'s' if allowed != 1 else ''} at a time per person, so one long "
+            f"run cannot take the whole machine."
+        )
+        when = f" It has {left} left." if left else ""
+    else:
+        total = adm.total
+        head = (
+            f"This machine is already running {total} research "
+            f"run{'s' if total != 1 else ''}, which is its limit — Deep Research "
+            f"reads and reasons for minutes at a time, and interactive chat "
+            f"shares the same model."
+        )
+        if not left:
+            when = ""
+        elif total == 1:
+            when = f" It finishes in {left}."
+        else:
+            when = f" The earliest finishes in {left}."
+    waited = ""
+    if waited_s >= 1:
+        waited = f" I waited {round(waited_s)}s for a slot to come free."
+    # "Try again then" needs a THEN. Without a configured budget there is no
+    # honest one, and pointing at a time nobody promised is the bare refusal
+    # this finding is about, dressed up.
+    retry = "Try again then" if when else "Try again once it finishes"
+    return (
+        f"{head}{waited}{when} {retry}, or ask the same question with "
+        f"Web Search for a quick cited answer now."
+    )
+
+
+def _handed_over(fut: "asyncio.Future") -> Optional[float]:
+    """The slot this future was given, if it was given one. Never raises —
+    `fut.exception()` on a cancelled future raises, which is exactly the state
+    this is asked about."""
+    if fut.done() and not fut.cancelled() and fut.exception() is None:
+        return fut.result()
+    return None
+
+
+async def _acquire_slot(key: str, emit: Emit) -> Optional[float]:
+    """A slot for this request, or None when it must be refused.
+
+    Queues rather than refusing on sight, but only for
+    `deep_research_queue_wait_s`: the user is watching a stream that has
+    nothing to say while it waits, and a run holds its slot for minutes. When
+    the wait runs out the caller gets a refusal that can quote real numbers.
+    """
+    adm = _admission()
+    started = adm.try_admit(key)
+    if started is not None:
+        return started
+
+    wait_s = max(0.0, float(settings.deep_research_queue_wait_s or 0.0))
+    if wait_s <= 0:
+        return None
+
+    # Enqueued with NO await since `try_admit` failed, so a release that
+    # happens in between cannot miss this request and leave it waiting out the
+    # whole budget next to a free slot.
+    fut: "asyncio.Future" = asyncio.get_running_loop().create_future()
+    adm.enqueue(key, fut)
+    queued_at = time.monotonic()
+    granted: Optional[float] = None
+    try:
+        await emit(
+            "status",
+            {"text": f"Deep Research is busy — waiting up to {round(wait_s)}s for a slot…"},
+        )
+        granted = await asyncio.wait_for(fut, wait_s)
+    except (asyncio.TimeoutError, TimeoutError):
+        # A slot handed over in the same tick the timeout fired is still a
+        # slot; taking it here is what stops it leaking.
+        granted = _handed_over(fut)
+    except BaseException:
+        # Cancelled (the client went away) — or the status emit itself failed,
+        # which is an await and therefore a point where a slot can arrive.
+        # Either way the slot must go back, or it is leaked until restart.
+        handed = _handed_over(fut)
+        if handed is not None:
+            adm.release(key, handed)
+        raise
+    finally:
+        adm.dequeue(fut)
+
+    if granted is None:
+        return None
+    await emit(
+        "status",
+        {"text": f"A research slot came free after {round(time.monotonic() - queued_at)}s — starting."},
+    )
+    return granted
+
+
 async def run_deep_research_engine(
     message: str,
     history: Sequence[dict],
@@ -2006,19 +2732,24 @@ async def run_deep_research_engine(
     user_id: Optional[int] = None,
 ) -> str:
     """Plan → search → open → extract → follow → assess → verify → report."""
-    if _RUN_LOCK.locked():
-        text = (
-            "A research run is already in progress on this machine. Deep "
-            "Research uses the whole search and GPU budget, so it runs one at "
-            "a time — try again when the current one finishes, or ask with "
-            "Web Search for a quick cited answer instead."
+    key = _admission_key(user_id)
+    adm = _admission()
+    queued_at = time.monotonic()
+    started = await _acquire_slot(key, emit)
+    if started is None:
+        text = _refusal_text(adm, key, time.monotonic() - queued_at)
+        log.info(
+            "deep research refused: %d run(s) in flight, %d for this requester",
+            adm.total, adm.held_by(key),
         )
         await emit("token", {"text": text})
         await emit("meta", {"route": "deep_research", "sources": []})
         return text
 
-    async with _RUN_LOCK:
+    try:
         return await _run(message, history, emit, effort, conversation_id, user_id)
+    finally:
+        adm.release(key, started)
 
 
 def _sources_meta(state: ResearchState) -> List[dict]:
@@ -2065,12 +2796,41 @@ async def _run(
         message[:120], state.temporal.requirement.value, state.temporal.reason, state.today, effort,
     )
     run_row: Optional[int] = None
-    try:
-        run_row = await db.run_in_thread(
+    # The INSERT that opens the run's record, held as a TASK rather than
+    # awaited bare. `db.run_in_thread` is anyio's `to_thread.run_sync`:
+    # cancelling the await raises CancelledError IMMEDIATELY and throws the
+    # worker thread's result away, while the thread commits the row anyway.
+    # So a Stop pressed in the first milliseconds of a run — which is exactly
+    # when someone notices they picked the wrong mode — used to leave a
+    # `research_runs` row at 'running' whose id nobody held. Nothing closes
+    # it: the cancellation handler below needs `run_row`, and
+    # `db.close_interrupted_research_runs` runs only at process START, so the
+    # row claimed to be running until the next restart — inflating the admin
+    # research analytics and making `frees_in_s` quote a dead run's budget to
+    # the next person refused a slot. Keeping the task means the id survives
+    # the cancellation and the row is closed like every other exit.
+    creating: Optional["asyncio.Future"] = asyncio.ensure_future(
+        db.run_in_thread(
             db.create_research_run, conversation_id, user_id, message, state.research_id
         )
-    except Exception:  # noqa: BLE001 — the report matters, the record does not
-        log.warning("could not record the research run", exc_info=True)
+    )
+
+    async def run_row_id() -> Optional[int]:
+        """The run's row id, waiting out the INSERT if it is still in flight.
+
+        Shielded, so a cancellation arriving mid-INSERT does not abandon the
+        row; idempotent, so the cancellation handler can ask again for an id
+        the main path never got to see. Never raises anything but the
+        cancellation itself.
+        """
+        nonlocal run_row, creating
+        if run_row is None and creating is not None:
+            try:
+                run_row = int(await asyncio.shield(creating))
+            except Exception:  # noqa: BLE001 — the report matters, the record does not
+                log.warning("could not record the research run", exc_info=True)
+                creating = None
+        return run_row
 
     # The step currently in flight, so a failure can close it instead of
     # leaving a spinner running in the timeline forever.
@@ -2103,16 +2863,30 @@ async def _run(
                 bits.append(f"{stats.duplicates} duplicate(s)")
             if stats.new_claims:
                 bits.append(f"{stats.new_claims} claim(s) extracted")
+            if stats.search_outages:
+                bits.append(f"{stats.search_outages} search outage(s) — some queries never ran")
         primaries = len(state.primary_sources)
         if primaries:
             bits.append(f"{primaries} primary")
         return "; ".join(bits)
 
     try:
+        # Inside the guarded region on purpose: the id is what lets every exit
+        # below — including the cancellation handler — CLOSE the row.
+        run_row = await run_row_id()
+
         # --- Plan ------------------------------------------------------
         await emit("status", {"text": "Planning the research…"})
         sid = await step("Planning the research")
-        state.subquestions, queries = await _plan(message, history, effort, state)
+        ok, planned = await _bounded(
+            state, "planning", _plan(message, history, effort, state)
+        )
+        if ok and planned:
+            state.subquestions, queries = planned
+        else:
+            # A wedged planner must not eat the run: research the question as
+            # it was asked rather than waiting out `llm.py`'s 1,800 s guard.
+            state.subquestions, queries = [], [message]
         _rlog(state, "plan: %d subquestion(s), %d quer(y/ies), entities=%s",
               len(state.subquestions), len(queries), state.entities)
         await finish(
@@ -2131,8 +2905,14 @@ async def _run(
             )
             await emit("status", {"text": f"{label} — {len(queries)} queries…"})
             sid = await step(label)
-            added = await _gather(state, queries, effort, emit, label="search" if state.iterations == 1 else "follow-up")
-            await finish(sid, label, round_detail(added))
+            added, cut = await _gather_bounded(
+                state, queries, effort, emit,
+                "search" if state.iterations == 1 else "follow-up",
+            )
+            detail = round_detail(added)
+            if cut:
+                detail += " · stopped by the run's time budget"
+            await finish(sid, label, detail)
 
             if not state.budget_left():
                 state.stop_reason = state.budget_reason() or "budget"
@@ -2147,14 +2927,35 @@ async def _run(
 
             await emit("status", {"text": "Checking what is still missing…"})
             sid = await step("Analyzing evidence")
-            verdict = await _assess(state, effort)
-            state.missing = [m for m in (verdict.get("missing") or []) if isinstance(m, str)]
-            state.contradictions = [
-                c for c in (verdict.get("contradictions") or []) if isinstance(c, str)
-            ]
+            ok, verdict = await _bounded(state, "evidence audit", _assess(state, effort))
+            if not ok:
+                # The audit never finished, so this run was NOT audited — the
+                # same honest state an auditor outage produces (R2), reached
+                # by the clock instead of by an error.
+                state.auditor_failed = True
+                await finish(
+                    sid,
+                    "Analyzed evidence",
+                    "the run reached its time budget before the audit "
+                    "finished — the evidence was NOT audited",
+                )
+                state.stop_reason = "timeout"
+                break
+            # ACCUMULATED, not reassigned: what round 2 could not establish is
+            # still unestablished in round 4 unless something found it.
+            round_missing = [m for m in (verdict.get("missing") or []) if isinstance(m, str)]
+            state.missing = _accumulate(state.missing, round_missing)
+            state.contradictions = _accumulate(
+                state.contradictions, verdict.get("contradictions")
+            )
             followups = _followup_queries(state, verdict)
             unresolved = [state.resolutions[i].question for i in state.unresolved()]
-            detail = ("Gaps: " + "; ".join(state.missing[:4])) if state.missing else "no gaps found"
+            if verdict.get("auditor_failed"):
+                detail = "the evidence auditor could not be reached — the evidence was NOT audited"
+            elif round_missing:
+                detail = "Gaps: " + "; ".join(round_missing[:4])
+            else:
+                detail = "no gaps found"
             if unresolved:
                 detail += " · not found yet: " + "; ".join(unresolved[:3])
             await finish(sid, "Analyzed evidence", detail)
@@ -2177,12 +2978,24 @@ async def _run(
             # own review round — a dead SearXNG reaches here NORMALLY (the
             # search errors are swallowed per round), never via the exception
             # handler below.
-            await _close_run(run_row, state, "failed", "", [], "no readable sources")
+            timed_out = bool(state.cut_short)
+            await _close_run(
+                run_row, state, "failed", "", [],
+                "the time budget ended the run before any source was read"
+                if timed_out
+                else "no readable sources",
+            )
             text = (
                 "I could not gather any readable sources for this question — "
-                "the search provider returned nothing usable. Nothing was "
-                "invented to fill the gap. Try rephrasing, or ask with Web "
-                "Search for a single-pass answer."
+                + (
+                    "the run reached its time budget before the first round "
+                    "finished. Nothing was invented to fill the gap. Try "
+                    "again, or give research a longer time budget."
+                    if timed_out
+                    else "the search provider returned nothing usable. Nothing "
+                    "was invented to fill the gap. Try rephrasing, or ask with "
+                    "Web Search for a single-pass answer."
+                )
             )
             await emit("token", {"text": text})
             await emit("meta", {"route": "deep_research", "sources": []})
@@ -2203,19 +3016,34 @@ async def _run(
         if settings.deep_research_verify:
             await emit("status", {"text": "Cross-checking the important claims…"})
             sid = await step("Verifying claims")
-            _verdict, vqueries = await _verify(state, effort)
-            low = list((state.verification or {}).get("low_confidence") or [])
-            if low and vqueries and state.budget_left():
+            # Bounded, and SKIPPED outright when the budget is already spent.
+            # The pass is cheap, but "cheap" is not "free" when the run is
+            # already over its limit and holding a research slot somebody else
+            # is queued for; an honest step detail beats another minute of
+            # somebody else's turn.
+            ok, vres = await _bounded(state, "verification", _verify(state, effort))
+            if ok:
+                _verdict, vqueries = vres
+                low = list((state.verification or {}).get("low_confidence") or [])
+            else:
+                await finish(
+                    sid, "Verifying claims", "not run: the run reached its time budget"
+                )
+                vqueries, low = [], []
+            if ok and low and vqueries and state.budget_left():
                 await finish(sid, "Verifying claims", f"{len(low)} claim(s) need more evidence — one more targeted round")
                 state.iterations += 1
                 state.verification_rounds += 1
                 label = f"Verifying claims (round {state.iterations})"
                 await emit("status", {"text": f"{label} — {len(vqueries)} queries…"})
                 sid = await step(label)
-                added = await _gather(state, vqueries, effort, emit, label="verify")
-                await finish(sid, label, round_detail(added))
+                added, cut = await _gather_bounded(state, vqueries, effort, emit, "verify")
+                detail = round_detail(added)
+                if cut:
+                    detail += " · stopped by the run's time budget"
+                await finish(sid, label, detail)
                 _rlog(state, "verification round: %d new source(s)", len(added))
-            else:
+            elif ok:
                 await finish(
                     sid,
                     "Verified claims",
@@ -2225,13 +3053,28 @@ async def _run(
             state.stop_reason = "sufficient"
 
         # --- Report ----------------------------------------------------
-        await emit("status", {"text": f"Writing the report from {len(state.sources)} sources…"})
+        await emit(
+            "status",
+            {
+                "text": (
+                    f"Time budget reached — writing the report from "
+                    f"{len(state.sources)} sources…"
+                    if state.cut_short
+                    else f"Writing the report from {len(state.sources)} sources…"
+                )
+            },
+        )
         sid = await step("Writing the report")
         # Trim the tail before building the prompt. _apply_char_tiers mutates
         # the objects it is handed, so it MUST be given the records the report
         # is actually built from — handing it throwaway copies quietly trimmed
         # nothing at all.
-        _trim_evidence(state.sources)
+        # WITH the question: the tail cut is query-centred, not a head slice
+        # that drops the answer row off the bottom of every page after the
+        # tenth (C1). `_fetch_sources` already selected 8,000 characters
+        # around the question, and those passages sit in DOCUMENT order, so a
+        # head slice of them lands squarely on the introduction.
+        _trim_evidence(state.sources, state.question)
         # The report STREAMS. Buffering it to validate citations first made a
         # measured 6,349-character report land in one lump after ~40 s of
         # nothing but a thinking indicator — the worst-looking part of an
@@ -2239,16 +3082,64 @@ async def _run(
         # is returned and stored; a stray marker that survives on the client
         # is already invisible there, because the frontend strips every [n]
         # before rendering and draws the source list from meta.sources.
-        async with _LLM_SEM:
-            async for kind, delta in llm.stream_chat_events(
-                _report_messages(state, history),
-                effort=llm.normalize_effort(effort),
-                max_tokens=settings.deep_research_report_max_tokens,
-            ):
-                await emit(kind, {"text": delta})
-                if kind == "token":
-                    parts.append(delta)
+        # Truncation was silent: a report cut off at its token ceiling reached
+        # the user, the store and the PDF looking finished. There is no
+        # finish_reason anywhere in `llm.py`, so this reads the usage the
+        # streaming layer already captures (`llm.get_usage`, a per-request
+        # ContextVar) and compares the completion this ONE call spent against
+        # the ceiling it was given. No usage reported (a runtime that refuses
+        # stream_options) means NOT MEASURED — never "fine".
+        ceiling = _report_token_ceiling(effort)
+        spent_before = int((llm.get_usage() or {}).get("completion_tokens", 0) or 0)
+        async def _stream_report() -> None:
+            async with _LLM_SEM:
+                async for kind, delta in llm.stream_chat_events(
+                    _report_messages(state, history),
+                    effort=llm.normalize_effort(effort),
+                    max_tokens=settings.deep_research_report_max_tokens,
+                ):
+                    await emit(kind, {"text": delta})
+                    if kind == "token":
+                        parts.append(delta)
+
+        # The one stage the budget may not simply skip — it is the deliverable
+        # — but it may not run unbounded either: the only guard underneath it
+        # is `llm.py`'s GEN_WALL_CLOCK_S, 1,800 s by default, three times a
+        # whole research run (R8). `parts` is appended as each delta arrives,
+        # so a stream stopped here keeps every word the user has already seen.
+        try:
+            await asyncio.wait_for(_stream_report(), state.report_budget_s())
+        except asyncio.TimeoutError:
+            state.report_cut_short = True
+            state.cut_short.append("report")
+            log.warning(
+                "research report stopped at the run's time budget after "
+                "%.1fs (%d characters written)",
+                state.elapsed, sum(len(p) for p in parts),
+            )
         report = "".join(parts)
+        if state.report_cut_short:
+            note = (
+                "\n\n[the run reached its time budget and the report stops "
+                "here — the sources above are complete]"
+            )
+            await emit("token", {"text": note})
+            report += note
+        produced = int((llm.get_usage() or {}).get("completion_tokens", 0) or 0) - spent_before
+        if ceiling > 0 and produced >= ceiling:
+            state.report_truncated = True
+            log.warning(
+                "research report hit its token ceiling (%d of %d tokens, %d sources): "
+                "the report is cut off",
+                produced, ceiling, len(state.sources),
+            )
+            note = (
+                "\n\n[the report reached its length limit and stops here — "
+                "the sources above are complete; ask about one section for "
+                "the rest]"
+            )
+            await emit("token", {"text": note})
+            report += note
 
         # Citation integrity: a marker that resolves to nothing is removed.
         report, invalid = validate_citations(report, len(state.sources))
@@ -2296,6 +3187,15 @@ async def _run(
                     "resolutions": resolutions_meta,
                     "confidence": round(state.confidence, 2),
                     "verification_rounds": state.verification_rounds,
+                    # What the run could NOT do, beside what it did.
+                    "search_outages": state.search_outages,
+                    "evidence_audited": not state.auditor_failed,
+                    "report_truncated": state.report_truncated,
+                    # R8: the wall-clock budget BOUNDS the run now instead of
+                    # advising it, so what it cut belongs on the record.
+                    "time_budget_s": round(float(settings.deep_research_timeout_s or 0.0), 1),
+                    "stages_cut_short": list(state.cut_short),
+                    "report_cut_short": state.report_cut_short,
                 },
             },
         )
@@ -2305,20 +3205,32 @@ async def _run(
         _rlog(
             state,
             "done: iterations=%d queries=%d sources=%d (%d distinct, %d primary, %d duplicates, "
-            "%d via links) claims=%d cited=%d invalid_citations=%d confidence=%.2f stop=%s elapsed=%.1fs",
+            "%d via links) claims=%d cited=%d invalid_citations=%d confidence=%.2f stop=%s elapsed=%.1fs "
+            "budget=%.0fs cut_short=%s",
             state.iterations, len(state.queries_run), len(state.sources),
             len(state.canonical_sources), len(state.primary_sources), len(state.duplicates),
             state.links_followed, len(state.claims), len(cited), len(invalid),
             state.confidence, state.stop_reason, state.elapsed,
+            float(settings.deep_research_timeout_s or 0.0), state.cut_short or "none",
         )
         return report
 
     except asyncio.CancelledError:
         # A closed tab cancels this coroutine; shield the write so the row
         # does not stay 'running' forever with site-QA-style consequences.
+        #
+        # With the partial report and the sources, exactly like the failure
+        # path below: cancelling at minute 9 of a 10-minute run used to store
+        # report "" and sources [], so the record said 0 sources and no
+        # report while 30 fetched pages and every resolved claim were sitting
+        # in `state`. The pages themselves stay in the shared store either
+        # way; the RECORD of the run is what was being destroyed.
         try:
             await asyncio.shield(
-                _close_run(run_row, state, "cancelled", "", [], "cancelled mid-run")
+                _close_run(
+                    await run_row_id(), state, "cancelled", "".join(parts),
+                    _sources_meta(state), "cancelled mid-run",
+                )
             )
         except Exception:  # noqa: BLE001 — cancellation still wins
             log.warning("could not mark the cancelled research run", exc_info=True)
@@ -2331,7 +3243,7 @@ async def _run(
         sources_meta = _sources_meta(state)
         partial = "".join(parts)
         await _close_run(
-            run_row, state, "failed", partial, sources_meta, str(exc)[:300]
+            await run_row_id(), state, "failed", partial, sources_meta, str(exc)[:300]
         )
         # The step that was in flight must not be left spinning in the UI.
         if open_step is not None:

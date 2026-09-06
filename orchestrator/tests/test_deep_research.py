@@ -340,25 +340,135 @@ def test_each_routed_group_is_searched_in_its_own_pool(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Concurrency — one run at a time per process
+# Concurrency — a per-user allowance under a process-wide ceiling
+#
+# This section used to assert the OPPOSITE ("a second concurrent run is
+# refused, not starved"), because the engine held one process-wide
+# `_RUN_LOCK` and refused anyone who found it held. That made one person's
+# ten-minute run fail every other user's Deep Research request org-wide
+# (R13), so the contract itself was wrong and the test was pinning it. What
+# is asserted now: two PEOPLE research at once, one person still cannot take
+# more than their allowance, the process ceiling holds against a third, and
+# every refusal says which limit it hit and when to come back.
+#
+# The deep coverage of admission — queueing, hand-over, cancellation, slot
+# release on failure — lives in tests/test_deep_research_integrity.py; these
+# pin the engine-level contract in the engine's own suite.
 # ---------------------------------------------------------------------------
 
 
-def test_a_second_concurrent_run_is_refused_not_starved(monkeypatch):
+def _parking_wire(monkeypatch):
+    """`_wire`, with the gather held open until the test lets it go, so a
+    second request meets a run that is genuinely IN FLIGHT."""
     _wire(monkeypatch)
+    parked, release = asyncio.Event(), asyncio.Event()
+
+    async def parking_collect(queries, effort="medium", emit=None, categories="", **kw):
+        parked.set()
+        await release.wait()
+        return _results(4)
+
+    monkeypatch.setattr(dr, "_collect_results", parking_collect)
+    return parked, release
+
+
+def test_two_people_research_at_once_instead_of_one_refusing_the_other(monkeypatch):
+    """The R13 acceptance case. Both runs are inside the gather at the same
+    time — a serialised pair would also both finish, so overlap is what is
+    measured."""
+    _wire(monkeypatch)
+    monkeypatch.setattr(settings, "deep_research_max_concurrent", 2)
+    monkeypatch.setattr(settings, "deep_research_max_per_user", 1)
+    inflight = {"now": 0, "peak": 0}
 
     async def scenario():
-        async with dr._RUN_LOCK:
-            events, emit = _emitter()
-            out = await dr.run_deep_research_engine(
-                "q", [], emit, conversation_id="c1"
-            )
-            return out, events
+        both = asyncio.Event()
+
+        async def counting_collect(queries, effort="medium", emit=None, categories="", **kw):
+            inflight["now"] += 1
+            inflight["peak"] = max(inflight["peak"], inflight["now"])
+            if inflight["now"] >= 2:
+                both.set()
+            try:
+                await asyncio.wait_for(both.wait(), 5)
+            except asyncio.TimeoutError:  # serialised — let the assertion say so
+                pass
+            inflight["now"] -= 1
+            return _results(4)
+
+        monkeypatch.setattr(dr, "_collect_results", counting_collect)
+        return await asyncio.gather(
+            dr.run_deep_research_engine("q", [], _emitter()[1], conversation_id="c1", user_id=1),
+            dr.run_deep_research_engine("q", [], _emitter()[1], conversation_id="c2", user_id=2),
+        )
+
+    out_a, out_b = asyncio.run(scenario())
+    assert inflight["peak"] == 2, "one user's run still blocked the other"
+    assert "Report" in out_a and "Report" in out_b
+
+
+def test_a_second_run_from_the_same_person_is_refused_with_a_reason(monkeypatch):
+    """Fairness, and the honesty half of R13: the machine has a free slot, but
+    the allowance is per person — and the refusal has to say so and say when."""
+    monkeypatch.setattr(settings, "deep_research_max_concurrent", 2)
+    monkeypatch.setattr(settings, "deep_research_max_per_user", 1)
+    monkeypatch.setattr(settings, "deep_research_queue_wait_s", 0.0)
+    monkeypatch.setattr(settings, "deep_research_timeout_s", 600.0)
+
+    async def scenario():
+        parked, release = _parking_wire(monkeypatch)
+        first = asyncio.create_task(
+            dr.run_deep_research_engine("q", [], _emitter()[1], conversation_id="c1", user_id=7)
+        )
+        await asyncio.wait_for(parked.wait(), 5)
+        events, emit = _emitter()
+        out = await dr.run_deep_research_engine("q", [], emit, conversation_id="c2", user_id=7)
+        release.set()
+        await first
+        return out, events
 
     out, events = asyncio.run(scenario())
-    assert "already in progress" in out
+    assert "Your own research run is still going" in out
+    assert "1 run at a time per person" in out
+    # Truthful about WHEN: the wall clock that bounds the other run (R8) is
+    # what makes this sentence safe to write.
+    assert "about 10 minutes" in out
     meta = [p for k, p in events if k == "meta"][-1]
     assert meta["route"] == "deep_research" and meta["sources"] == []
+
+
+def test_the_process_ceiling_still_holds_against_a_third_person(monkeypatch):
+    """Per-user fairness must not become a way to buy the whole box by
+    bringing more accounts."""
+    monkeypatch.setattr(settings, "deep_research_max_concurrent", 2)
+    monkeypatch.setattr(settings, "deep_research_max_per_user", 1)
+    monkeypatch.setattr(settings, "deep_research_queue_wait_s", 0.0)
+    monkeypatch.setattr(settings, "deep_research_timeout_s", 600.0)
+
+    async def scenario():
+        parked, release = _parking_wire(monkeypatch)
+        running = [
+            asyncio.create_task(
+                dr.run_deep_research_engine(
+                    "q", [], _emitter()[1], conversation_id=f"c{uid}", user_id=uid
+                )
+            )
+            for uid in (1, 2)
+        ]
+        await asyncio.wait_for(parked.wait(), 5)
+        while dr._admission().total < 2:
+            await asyncio.sleep(0.01)
+        out = await dr.run_deep_research_engine(
+            "q", [], _emitter()[1], conversation_id="c3", user_id=3
+        )
+        release.set()
+        await asyncio.gather(*running)
+        return out
+
+    out = asyncio.run(scenario())
+    assert "already running 2 research runs" in out
+    assert "The earliest finishes in about 10 minutes" in out
+    assert "Web Search" in out
 
 
 # ---------------------------------------------------------------------------
