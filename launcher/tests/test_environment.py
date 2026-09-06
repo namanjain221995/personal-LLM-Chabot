@@ -871,5 +871,156 @@ class MainContextWindowTests(EnvironmentCase):
         self.assertIn('"factor":2.0', generated["MAIN_MODEL_ROPE_OVERRIDE"])
 
 
+class SidecarMemoryKnobTests(EnvironmentCase):
+    """The sidecar KV budgets must be overridable from .env, and ONLY from it.
+
+    generated.env is the LAST --env-file Compose is given, so it outranks the
+    user's .env. These keys were emitted here as literals, which meant a host
+    that set OCR_GPU_MEMORY_UTILIZATION in .env got the launcher's value and no
+    diagnostic -- the compose default was unreachable by a user value. The
+    fractions are of TOTAL device memory, so on a 122 GiB GB10 the difference
+    is tens of GiB.
+
+    The fix is NOT to emit a launcher-side default: the defaults differ per
+    profile (embed is 0.04 on dgx-spark and 0.08 on nvidia), so one default
+    here would silently double embed's reservation on one of them. The key is
+    emitted only when the user set it, and the overlay's `${VAR:-default}`
+    governs otherwise.
+    """
+
+    KEYS = (
+        "EMBED_GPU_MEMORY_UTILIZATION",
+        "OCR_GPU_MEMORY_UTILIZATION",
+        "ROUTER_GPU_MEMORY_UTILIZATION",
+    )
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.cache = self.root / "cache"
+        self.profile = select_profile(nvidia(128, dgx=True), REPO_ROOT)
+
+    def _generate(self, user_environment: dict[str, str] | None = None) -> dict[str, str]:
+        return build_generated_environment(
+            self.layout,
+            self.profile,
+            self.installs(self.profile, self.cache),
+            cache_root=self.cache,
+            user_environment=user_environment or {},
+        )
+
+    def test_an_unset_knob_is_not_emitted_so_the_overlay_default_governs(self) -> None:
+        generated = self._generate()
+        for key in self.KEYS:
+            with self.subTest(key=key):
+                self.assertNotIn(key, generated)
+
+    def test_every_overlay_supplies_its_own_default_for_an_absent_key(self) -> None:
+        """Absence is only safe because each overlay spells `${VAR:-default}`.
+
+        This is the other half of the fix: if an overlay ever hardcodes one of
+        these again (compose.dgx-spark.yaml did, for embed), the knob goes dead
+        and the user's .env silently stops mattering.
+        """
+        overlays = sorted((REPO_ROOT / "compose").glob("compose.*.yaml"))
+        self.assertTrue(overlays, "no compose overlays found")
+        seen = 0
+        for overlay in overlays:
+            text = overlay.read_text(encoding="utf-8")
+            for key in self.KEYS:
+                if key not in text:
+                    continue
+                seen += 1
+                with self.subTest(overlay=overlay.name, key=key):
+                    self.assertRegex(
+                        text,
+                        r"\$\{" + key + r":-[0-9.]+\}",
+                        f"{overlay.name} mentions {key} without a `${{{key}:-default}}` "
+                        "fallback, so an unset key would render empty",
+                    )
+        self.assertGreater(seen, 0, "no overlay references any sidecar knob")
+
+    def test_no_overlay_hardcodes_a_sidecar_budget_next_to_its_knob(self) -> None:
+        """compose.dgx-spark.yaml hardcoded embed at 0.04 while the launcher
+        emitted 0.08, so the documented knob did nothing on the profile this
+        hardware actually runs."""
+        for overlay in sorted((REPO_ROOT / "compose").glob("compose.*.yaml")):
+            text = overlay.read_text(encoding="utf-8")
+            for line in text.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("--gpu-memory-utilization"):
+                    value = stripped.split(maxsplit=1)[1] if " " in stripped else ""
+                    if value.startswith("${MAIN") or value.startswith("${CLUSTER"):
+                        continue
+                    with self.subTest(overlay=overlay.name, line=stripped):
+                        self.assertTrue(
+                            value.startswith("${"),
+                            f"{overlay.name} hardcodes {value!r}; use "
+                            "${SOME_GPU_MEMORY_UTILIZATION:-default} so .env can reach it",
+                        )
+
+    def test_a_user_value_reaches_the_generated_file_for_every_sidecar(self) -> None:
+        for key in self.KEYS:
+            with self.subTest(key=key):
+                self.assertEqual(self._generate({key: "0.07"})[key], "0.07")
+
+    def test_one_override_does_not_emit_or_disturb_the_others(self) -> None:
+        generated = self._generate({"OCR_GPU_MEMORY_UTILIZATION": "0.07"})
+        self.assertEqual(generated["OCR_GPU_MEMORY_UTILIZATION"], "0.07")
+        self.assertNotIn("ROUTER_GPU_MEMORY_UTILIZATION", generated)
+        self.assertNotIn("EMBED_GPU_MEMORY_UTILIZATION", generated)
+
+    def test_a_value_is_normalised_to_two_decimals(self) -> None:
+        self.assertEqual(
+            self._generate({"OCR_GPU_MEMORY_UTILIZATION": ".0700"})[
+                "OCR_GPU_MEMORY_UTILIZATION"
+            ],
+            "0.07",
+        )
+
+    def test_normalisation_truncates_rather_than_rounds_and_that_is_pinned(self) -> None:
+        """Two decimals is a real narrowing: 0.125 becomes 0.12, not 0.13.
+
+        Pinned rather than fixed -- the resolution is far finer than any budget
+        this knob sets -- but pinned so it is a decision and not a surprise.
+        """
+        for given, expected in (("0.125", "0.12"), ("0.075", "0.07"), ("0.129", "0.13")):
+            with self.subTest(given=given):
+                self.assertEqual(
+                    self._generate({"ROUTER_GPU_MEMORY_UTILIZATION": given})[
+                        "ROUTER_GPU_MEMORY_UTILIZATION"
+                    ],
+                    expected,
+                )
+
+    def test_the_supported_range_is_inclusive_at_both_ends(self) -> None:
+        for good in ("0.02", "0.95"):
+            with self.subTest(value=good):
+                self.assertEqual(
+                    self._generate({"OCR_GPU_MEMORY_UTILIZATION": good})[
+                        "OCR_GPU_MEMORY_UTILIZATION"
+                    ],
+                    good,
+                )
+
+    def test_a_blank_value_falls_back_to_the_overlay_default(self) -> None:
+        self.assertNotIn(
+            "OCR_GPU_MEMORY_UTILIZATION",
+            self._generate({"OCR_GPU_MEMORY_UTILIZATION": "   "}),
+        )
+
+    def test_a_non_numeric_value_is_refused_by_name_and_never_silently_ignored(self) -> None:
+        with self.assertRaises(TechSaraError) as caught:
+            self._generate({"ROUTER_GPU_MEMORY_UTILIZATION": "half"})
+        self.assertIn("ROUTER_GPU_MEMORY_UTILIZATION", str(caught.exception))
+
+    def test_a_fraction_outside_the_supported_range_is_refused(self) -> None:
+        # 0 would leave no KV cache at all and 1.0 would leave the device no
+        # headroom for the other engines sharing this unified memory.
+        for bad in ("0", "0.01", "1.0", "-0.2", "nan", "inf"):
+            with self.subTest(value=bad):
+                with self.assertRaises(TechSaraError):
+                    self._generate({"OCR_GPU_MEMORY_UTILIZATION": bad})
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -24,6 +24,27 @@ GIB = 1024**3
 MIB = 1024**2
 
 _ENV_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_ENV_EXPORT_PREFIX = re.compile(r"^export\s+")
+_ENV_INLINE_COMMENT = re.compile(r"\s#")
+# What a writer may emit unquoted. Deliberately conservative: quoting is free,
+# and a value that escapes this set becomes shell code when someone sources it.
+_ENV_BARE_VALUE = re.compile(r"^[A-Za-z0-9_./:@%+,=-]+$")
+# What a shell actually reads back as itself. Wider than the writer's set by a
+# `#`, which only starts a comment at the start of a word, so `value#tight`
+# survives a `.` unharmed and must not be reported as a problem.
+_ENV_SHELL_SAFE_VALUE = re.compile(r"^[A-Za-z0-9_./:@%+,=#-]+$")
+_ENV_ESCAPES = {
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+    "f": "\f",
+    "v": "\v",
+    "b": "\b",
+    "\\": "\\",
+    '"': '"',
+    "'": "'",
+    "$": "$",
+}
 _PROFILE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 _MODEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _REVISION = re.compile(r"^[0-9a-f]{40}$")
@@ -92,26 +113,79 @@ def load_yaml_json(path: Path) -> Any:
         return json.load(handle)
 
 
+def _env_value(raw: str) -> str:
+    """Resolve one dotenv right-hand side the way Compose's loader does.
+
+    Single quotes are literal, double quotes honour backslash escapes, and an
+    unquoted value ends at the first whitespace-preceded `#`. Text after a
+    closing quote is a comment. This mirrors compose-go, which is the parser
+    that actually decides what the containers receive.
+    """
+    value = raw.lstrip()
+    if not value:
+        return ""
+    quote = value[0]
+    if quote in {"'", '"'}:
+        out: list[str] = []
+        index = 1
+        while index < len(value):
+            char = value[index]
+            if quote == '"' and char == "\\" and index + 1 < len(value):
+                nxt = value[index + 1]
+                out.append(_ENV_ESCAPES.get(nxt, "\\" + nxt))
+                index += 2
+                continue
+            if char == quote:
+                return "".join(out)
+            out.append(char)
+            index += 1
+        # Unterminated quote. Compose rejects the whole file; keep the literal
+        # text so callers still see something and let check_env_file() flag it.
+        return value
+    comment = _ENV_INLINE_COMMENT.search(value)
+    if comment is not None:
+        value = value[: comment.start()]
+    return value.rstrip()
+
+
 def parse_env_file(path: Path) -> dict[str, str]:
-    """Parse simple dotenv assignments without evaluating shell syntax."""
+    """Parse dotenv assignments the way Compose does, without a shell.
+
+    Deliberately NOT `sh -c '. file'`: a dotenv file is data, and sourcing it
+    makes a value containing a space, a parenthesis or a quote into shell code.
+    """
     values: dict[str, str] = {}
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return values
-    for raw in lines:
+    if text.startswith("\ufeff"):  # UTF-8 BOM, else it glues itself to the first key
+        text = text[1:]
+    for raw in text.splitlines():
         line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
-        key = key.strip()
+        key = _ENV_EXPORT_PREFIX.sub("", key.strip(), count=1)
         if not _ENV_KEY.fullmatch(key):
             continue
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
-            value = value[1:-1]
-        values[key] = value
+        values[key] = _env_value(value)
     return values
+
+
+def quote_env_value(value: str) -> str:
+    """Render a value so both Compose and a shell read back exactly `value`.
+
+    Single quotes are preferred: inside them nothing is expanded or escaped.
+    A value that itself contains a single quote falls back to double quotes,
+    where the expanding characters have to be escaped.
+    """
+    if _ENV_BARE_VALUE.fullmatch(value):
+        return value
+    if "'" not in value:
+        return f"'{value}'"
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$")
+    return f'"{escaped}"'
 
 
 def render_env(values: Mapping[str, Any]) -> str:
@@ -122,8 +196,58 @@ def render_env(values: Mapping[str, Any]) -> str:
         value = str(values[key])
         if any(ch in value for ch in "\r\n\x00"):
             raise ValueError(f"invalid newline in environment value for {key}")
-        lines.append(f"{key}={value}")
+        lines.append(f"{key}={quote_env_value(value)}")
     return "\n".join(lines) + "\n"
+
+
+def check_env_file(path: Path) -> list[tuple[int, str, str]]:
+    """Report lines a POSIX shell would mis-parse, as (line number, key, reason).
+
+    Values are never returned or logged — only the key and the shape of the
+    problem — because these files hold credentials.
+    """
+    problems: list[tuple[int, str, str]] = []
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return problems
+    if text.startswith("\ufeff"):
+        problems.append((1, "<file>", "starts with a UTF-8 BOM, which glues itself to the first key"))
+        text = text[1:]
+    for number, raw in enumerate(text.splitlines(), start=1):
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = _ENV_EXPORT_PREFIX.sub("", key.strip(), count=1)
+        if not _ENV_KEY.fullmatch(key):
+            problems.append((number, "<malformed>", "left-hand side is not a valid environment key"))
+            continue
+        value = value.strip()
+        if not value:
+            continue
+        quote = value[0]
+        if quote in {"'", '"'}:
+            if _env_value(value) == value:
+                problems.append((number, key, f"unterminated {quote} quote; Compose refuses the whole file"))
+            continue
+        if _ENV_SHELL_SAFE_VALUE.fullmatch(value):
+            continue
+        reasons = []
+        if any(ch in value for ch in " \t"):
+            reasons.append("whitespace")
+        if any(ch in value for ch in "()"):
+            reasons.append("parentheses (a shell syntax error)")
+        if any(ch in value for ch in "\"'"):
+            reasons.append("quote characters (a shell would strip them)")
+        if any(ch in value for ch in "$`"):
+            reasons.append("expansion characters")
+        if any(ch in value for ch in "*?[]{}~!|&;<>\\"):
+            reasons.append("glob or control characters")
+        problems.append(
+            (number, key, "unquoted value contains " + ", ".join(reasons or ["shell-significant characters"]))
+        )
+    return problems
 
 
 def validate_profile_name(value: str) -> str:

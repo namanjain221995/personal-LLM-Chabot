@@ -1,0 +1,3 @@
+# Keep the env-shape test fixture byte-exact: it intentionally carries a
+# UTF-8 BOM and CRLF lines that the parser tests assert on.
+launcher/tests/fixtures/env_shapes.env -text
