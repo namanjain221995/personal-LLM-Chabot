@@ -74,6 +74,37 @@ application keeps using the single endpoint it always used.
 
 ## The interconnect, measured
 
+> **SUPERSEDED 2026-09-07 — the fabric is healthy; the "~13 Gb/s ceiling"
+> below was never real.** Re-measured with the engine live:
+>
+> | Test | Result |
+> |---|---|
+> | `ib_write_bw -d rocep1s0f1 -x 3 -F --report_gbits -D 6` (65536 B, GID 3 = RoCE v2) | **108.91 Gb/s** rail A, **108.82 Gb/s** rail B |
+> | `scripts/cluster-test.sh` (NCCL 2.29.7, both HCAs) | **algbw 21.446 GB/s @ 512 MB = 171.57 Gb/s busbw**; 177.77 Gb/s 64 MiB send/recv; 12.8 µs 4-byte latency; RDMA/RoCE over 2 HCAs |
+>
+> NVIDIA's healthy two-node DGX Spark reference is 22.1 GB/s busbw — we measure
+> 21.4 GB/s, **97% of it**. There is no fabric bottleneck to investigate.
+>
+> **The old numbers are unit errors, and the trap is easy to fall into again:**
+> NCCL reports **GB/s**, not Gb/s, so a busbw of "22" is 176 Gb/s. `perftest`
+> `--report_gbits` is decimal Gb/s but its *default* is MiB/s (convert with
+> 119.2, not 8/1000). Never compare `ib_write_bw -b` against NCCL busbw: `-b`
+> sums both directions, busbw counts one. For n=2, busbw == algbw exactly
+> (factor 2(n-1)/n = 1), so nothing is being deflated.
+>
+> Note the one figure below that was always right: `iperf3` at 14–16 Gb/s is
+> genuine. TCP really is CPU-bound at MTU 1500 on these cores. That is exactly
+> why the wrong RDMA number survived — it sat next to a real one that agreed.
+>
+> Every conclusion further down that is derived from "~13 Gb/s per link" or
+> "~22 Gb/s bus bandwidth" — including the expert-parallelism and
+> activation-on-the-link arguments — rests on a false premise and must be
+> re-derived before being used. What remains true is that cross-node TP costs
+> *latency* on small messages: a decode all-reduce is a few KB, and at 12.8 µs
+> per round trip that is what makes TP=2 decode slower than TP=1, not bandwidth.
+
+The original 2026-08-25 measurements are kept below for the record.
+
 | Test | Result |
 |---|---|
 | Link speed reported | 200 Gb/s (2X NDR), ConnectX‑7, PCIe Gen5 x4, FEC RS, MTU 1500 both ends |
@@ -271,9 +302,15 @@ the KV budget**, costs nothing at concurrency 4, and **loses ~15 % of peak
 throughput at concurrency 16**;
 it does **not** raise prefill-heavy throughput, because a 512-token prefill
 costs 128 all-reduces of ~5 MB each and at ~22 Gb/s that comm time is about
-what the halved compute saves. With a 200 Gb/s fabric behaving like one, the
-same layout would win on both axes; with this ~13 Gb/s-per-link one, TP=2 is a
-latency and capacity win, not a throughput win. Both modes stay supported:
+what the halved compute saves. The clause that followed here — "with a
+200 Gb/s fabric behaving like one, the same layout would win on both axes;
+with this ~13 Gb/s-per-link one, TP=2 is a latency and capacity win" — is
+**withdrawn**: the fabric *does* behave like one (171.57 Gb/s NCCL busbw,
+2026-09-07), so the ceiling was never the reason. Re-measured on the 35B MoE,
+TP=2 is in fact a latency win **and** a concurrency win: median TTFT 188 ms vs
+351 ms single-node, and 163-171 tok/s at concurrency 4 vs 146. What TP=2 costs
+is single-stream decode (13.0 ms TPOT vs 11.2 ms), and that is per-collective
+*latency* on a few-KB all-reduce, which a faster wire cannot recover. Both modes stay supported:
 With the 27B, `CLUSTER_MODE=single` was the better choice for a purely throughput-bound
 workload until the fabric ceiling is fixed; `dual` for snappier replies and
 long contexts. Prefix caching keeps the (large) shared
@@ -405,10 +442,15 @@ the overlay ships:
    free, so relocating the auxiliary models is the untested route to more
    headroom still.
 
-1. **Fabric ceiling ~13 Gb/s per link.** Root-level investigation needed
-   (`sudo mlxlink -d <pci> -m`, `sudo mlxconfig -d <pci> q`, `sudo ethtool -m`,
-   `dmesg | grep mlx5`, trying `iommu.passthrough=1`, MTU 9000 on both ends).
-   Until then TP=2 improves latency, not prefill throughput.
+1. ~~**Fabric ceiling ~13 Gb/s per link.**~~ **CLOSED 2026-09-07 — there was
+   no ceiling.** The figure was a unit error; the fabric measures 108.91 Gb/s
+   per rail and 171.57 Gb/s NCCL bus bandwidth, 97 % of NVIDIA's healthy
+   two-node DGX Spark reference. No root access is needed and none of the
+   listed diagnostics are worth running. Jumbo MTU is not the fix either —
+   108.91 Gb/s was achieved at MTU 1500. GPUDirect RDMA is genuinely
+   unsupported on GB10 (`GPU_DIRECT_RDMA_SUPPORTED = 0`,
+   `DMA_BUF_SUPPORTED = 0`, and NVIDIA's DGX Spark Porting Guide says so), but
+   it costs nothing here because both figures above are host-memory numbers.
 2. **No pipeline parallelism** for this model class in this vLLM build.
 3. **MTU stays 1500** (no sudo). If you get root: `ip link set dev enp1s0f1np1
    mtu 9000` **on both nodes for both links**, persist via netplan, re-run

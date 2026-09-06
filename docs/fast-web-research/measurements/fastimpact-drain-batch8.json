@@ -1,0 +1,130 @@
+{
+ "mode": "current",
+ "transport": "http",
+ "rows": [
+  {
+   "label": "cached c=1",
+   "samples": 12,
+   "ok": 12,
+   "errors": 0,
+   "stream_buffered": false,
+   "first_token_ms_p50": 978.4,
+   "first_token_ms_p95": 1222.2,
+   "total_ms_p50": 2257.0,
+   "total_ms_p95": 3873.7,
+   "tokens_p50": 14.5,
+   "graded": 12,
+   "quality_pass": 12,
+   "quality_failures": [],
+   "events": {
+    "token": 231,
+    "meta": 12,
+    "done": 12
+   },
+   "error_kinds": [],
+   "scenario": "cached",
+   "concurrency": 1,
+   "conversations": 12,
+   "web_search": "off",
+   "server_cpu_s": 0.76,
+   "server_cpu_ms_per_turn": 63.3
+  },
+  {
+   "label": "cached c=8",
+   "samples": 12,
+   "ok": 12,
+   "errors": 0,
+   "stream_buffered": false,
+   "first_token_ms_p50": 3161.8,
+   "first_token_ms_p95": 3162.9,
+   "total_ms_p50": 5117.1,
+   "total_ms_p95": 6697.1,
+   "tokens_p50": 14.0,
+   "graded": 12,
+   "quality_pass": 12,
+   "quality_failures": [],
+   "events": {
+    "token": 227,
+    "meta": 12,
+    "done": 12
+   },
+   "error_kinds": [],
+   "scenario": "cached",
+   "concurrency": 8,
+   "conversations": 12,
+   "web_search": "off",
+   "server_cpu_s": 0.51,
+   "server_cpu_ms_per_turn": 42.5
+  },
+  {
+   "label": "search c=1",
+   "samples": 12,
+   "ok": 12,
+   "errors": 0,
+   "stream_buffered": false,
+   "first_token_ms_p50": 1336.8,
+   "first_token_ms_p95": 2595.2,
+   "total_ms_p50": 5262.3,
+   "total_ms_p95": 6245.9,
+   "tokens_p50": 43.5,
+   "graded": 12,
+   "quality_pass": 11,
+   "quality_failures": [
+    {
+     "q": "What is the latest released version of Python?",
+     "expected": [
+      "3."
+     ],
+     "got": "I do not have access to real-time data to determine the absolute latest released version of Python as of today (September 6, 2026). My knowledge cutoff is earli"
+    }
+   ],
+   "events": {
+    "token": 556,
+    "meta": 12,
+    "done": 12
+   },
+   "error_kinds": [],
+   "scenario": "search",
+   "concurrency": 1,
+   "conversations": 12,
+   "web_search": "on",
+   "server_cpu_s": 1.11,
+   "server_cpu_ms_per_turn": 92.5
+  },
+  {
+   "label": "search c=8",
+   "samples": 12,
+   "ok": 12,
+   "errors": 0,
+   "stream_buffered": false,
+   "first_token_ms_p50": 4950.0,
+   "first_token_ms_p95": 5075.9,
+   "total_ms_p50": 10010.9,
+   "total_ms_p95": 11378.6,
+   "tokens_p50": 44.5,
+   "graded": 12,
+   "quality_pass": 11,
+   "quality_failures": [
+    {
+     "q": "What is the latest released version of Python?",
+     "expected": [
+      "3."
+     ],
+     "got": "I do not have access to real-time data to confirm the absolute latest Python release version as of today (September 6, 2026). My training data cutoff prevents m"
+    }
+   ],
+   "events": {
+    "token": 557,
+    "meta": 12,
+    "done": 12
+   },
+   "error_kinds": [],
+   "scenario": "search",
+   "concurrency": 8,
+   "conversations": 12,
+   "web_search": "on",
+   "server_cpu_s": 0.75,
+   "server_cpu_ms_per_turn": 62.5
+  }
+ ]
+}

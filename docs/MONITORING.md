@@ -204,10 +204,17 @@ The `...f0` ports are DOWN by design and are filtered out everywhere.
 the rails, so the dashboard shows them separately. A summed panel would hide a
 dead rail.
 
-There is deliberately **no link-utilisation-percent panel**: the links
-advertise 200 Gb/s but this fabric measures ~13 Gb/s per direction (see
-[`CLUSTER.md`](CLUSTER.md)), so a percentage against line rate would read ~0 %
-forever and mean nothing.
+There is deliberately **no link-utilisation-percent panel**. The original
+reason given here — "this fabric measures ~13 Gb/s per direction" — was a
+unit error and is withdrawn (see [`CLUSTER.md`](CLUSTER.md); re-measured
+2026-09-07 at 108.91 Gb/s per rail and 171.57 Gb/s NCCL bus bandwidth, which
+is 97 % of NVIDIA's healthy reference). The panel is still not worth adding,
+but for a different and narrower reason: a single-device `ib_write_bw` on a
+DGX Spark is PCIe-bound near ~109 Gb/s because one QSFP port reaches the SoC
+through two independent PCIe Gen5 x4 links, so a percentage against the
+advertised 200 Gb/s line rate compares against a ceiling this hardware cannot
+reach through one device and would read low no matter how healthy the fabric
+is.
 
 ### NCCL observability
 

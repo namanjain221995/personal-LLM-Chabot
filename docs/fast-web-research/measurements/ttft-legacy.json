@@ -1,0 +1,68 @@
+{
+ "mode": "legacy",
+ "legacy_shapes": [],
+ "rows": [
+  {
+   "label": "concurrency=1",
+   "stream_buffered": false,
+   "requests": 8,
+   "ok": 8,
+   "failed": 0,
+   "first_token_ms_p50": 349.3,
+   "first_token_ms_p95": 459.3,
+   "first_event_ms_p50": 349.3,
+   "total_ms_p50": 1262.2,
+   "total_ms_p95": 1335.6,
+   "tokens_p50": 23.0,
+   "events": {
+    "token": 179,
+    "meta": 8,
+    "done": 8
+   },
+   "errors": [],
+   "concurrency": 1
+  },
+  {
+   "label": "concurrency=4",
+   "stream_buffered": false,
+   "requests": 8,
+   "ok": 8,
+   "failed": 0,
+   "first_token_ms_p50": 1065.2,
+   "first_token_ms_p95": 1071.5,
+   "first_event_ms_p50": 1065.2,
+   "total_ms_p50": 1789.3,
+   "total_ms_p95": 1897.7,
+   "tokens_p50": 23.0,
+   "events": {
+    "token": 181,
+    "meta": 8,
+    "done": 8
+   },
+   "errors": [],
+   "concurrency": 4
+  },
+  {
+   "label": "concurrency=8",
+   "stream_buffered": false,
+   "requests": 8,
+   "ok": 8,
+   "failed": 0,
+   "first_token_ms_p50": 1435.7,
+   "first_token_ms_p95": 1436.2,
+   "first_event_ms_p50": 1435.7,
+   "total_ms_p50": 2310.2,
+   "total_ms_p95": 2483.0,
+   "tokens_p50": 23.0,
+   "events": {
+    "token": 183,
+    "meta": 8,
+    "done": 8
+   },
+   "errors": [],
+   "concurrency": 8
+  }
+ ],
+ "transport": "http",
+ "mode_source": "server ran with FAST_BENCH_LEGACY=1; the client's own --legacy flag is not used in http mode because the shapes live in the server process"
+}

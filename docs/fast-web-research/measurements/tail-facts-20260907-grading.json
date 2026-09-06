@@ -1,0 +1,1858 @@
+{
+  "p1954-1": {
+    "page_id": 1954,
+    "url": "https://drwho.virtadpt.net/drwho.plan.txt",
+    "kind": "numeric_statement",
+    "question": "According to \"drwho.virtadpt.net\" (drwho.virtadpt.net), complete this statement from the page — \"ones. Even those in the '___ Batman TV show were more complex and interesting.\" — what value belongs in the blank?",
+    "answer": "60s",
+    "askable": null
+  },
+  "p1954-2": {
+    "page_id": 1954,
+    "url": "https://drwho.virtadpt.net/drwho.plan.txt",
+    "kind": "numeric_statement",
+    "question": "According to \"drwho.virtadpt.net\" (drwho.virtadpt.net), complete this statement from the page — \"\"Change Healthcare have told investors they have so far taken a ___\" — what value belongs in the blank?",
+    "answer": "$872 million",
+    "askable": null
+  },
+  "p1954-3": {
+    "page_id": 1954,
+    "url": "https://drwho.virtadpt.net/drwho.plan.txt",
+    "kind": "entity_attribute",
+    "question": "According to \"drwho.virtadpt.net\" (drwho.virtadpt.net), what have Change Healthcare?",
+    "answer": "told investors they have so far taken a $872 million",
+    "askable": null
+  },
+  "p1954-4": {
+    "page_id": 1954,
+    "url": "https://drwho.virtadpt.net/drwho.plan.txt",
+    "kind": "entity_attribute",
+    "question": "According to \"drwho.virtadpt.net\" (drwho.virtadpt.net), what has Unemployment?",
+    "answer": "to jump 40-50%, in my",
+    "askable": null
+  },
+  "p1954-5": {
+    "page_id": 1954,
+    "url": "https://drwho.virtadpt.net/drwho.plan.txt",
+    "kind": "numeric_statement",
+    "question": "According to \"drwho.virtadpt.net\" (drwho.virtadpt.net), complete this statement from the page — \"Text Coffee Pot Control Protocol (HTCPCP/___) that is an implementation for\" — what value belongs in the blank?",
+    "answer": "1.0",
+    "askable": null
+  },
+  "p1685-1": {
+    "page_id": 1685,
+    "url": "https://dataswamp.org/~solene/index-full.html",
+    "kind": "labelled_value",
+    "question": "According to \"Solene'%\" (dataswamp.org), what is the nginx of New packages to be INSTALLED?",
+    "answer": "1.14.1,2",
+    "askable": null
+  },
+  "p1685-2": {
+    "page_id": 1685,
+    "url": "https://dataswamp.org/~solene/index-full.html",
+    "kind": "labelled_value",
+    "question": "According to \"Solene'%\" (dataswamp.org), what is the Apostrophe of Quick tour of the memory usage (reported in top in the SHR column)?",
+    "answer": "63 MB of memory",
+    "askable": null
+  },
+  "p1685-3": {
+    "page_id": 1685,
+    "url": "https://dataswamp.org/~solene/index-full.html",
+    "kind": "numeric_statement",
+    "question": "According to \"Solene'%\" (dataswamp.org), complete this statement from the page — \"… elt poor with regard to latency, and I've been very surprised to see I can play an FPS game with a mouse on cloud gaming. I had a ping of 8-___ with the streaming servers, which was really OK. Games featuring \"Nvidia reflex\" have no sensitive input lag, this is almost magic.\" — what value belongs in the blank?",
+    "answer": "75 ms",
+    "askable": null
+  },
+  "p1685-4": {
+    "page_id": 1685,
+    "url": "https://dataswamp.org/~solene/index-full.html",
+    "kind": "numeric_statement",
+    "question": "According to \"Solene'%\" (dataswamp.org), complete this statement from the page — \"Geforce Now allows you to play any compatible game on Android, is it worth? I tried it with a Bluetooth controller on my BQ Aquaris X running LineageOS (it's a ___ old phone, average specs with a 720p screen).\" — what value belongs in the blank?",
+    "answer": "7 years",
+    "askable": null
+  },
+  "p1685-5": {
+    "page_id": 1685,
+    "url": "https://dataswamp.org/~solene/index-full.html",
+    "kind": "entity_attribute",
+    "question": "According to \"Solene'%\" (dataswamp.org), what is Endless OS?",
+    "answer": "based on Debian, but uses the OSTree tool to make it immutable",
+    "askable": null
+  },
+  "p2505-1": {
+    "page_id": 2505,
+    "url": "https://research.swtch.com/feed.atom",
+    "kind": "numeric_statement",
+    "question": "According to \"research.swtch.com\" (research.swtch.com), complete this statement from the page — \"MIT pioneered this and Bell Labs joined in on the MULTICS project, and this occupied five years of system programming effort, until Bell Labs pulled out, because it turned out that MULTICS was too ambitious for the hardware at the time, and also with ___ on it was not exactly a research project.\" — what value belongs in the blank?",
+    "answer": "80 people",
+    "askable": null
+  },
+  "p2505-2": {
+    "page_id": 2505,
+    "url": "https://research.swtch.com/feed.atom",
+    "kind": "numeric_statement",
+    "question": "According to \"research.swtch.com\" (research.swtch.com), complete this statement from the page — \"Pick a kernel in the middle and build&#xA;that, like ___.\" — what value belongs in the blank?",
+    "answer": "1.3.50",
+    "askable": null
+  },
+  "p2505-3": {
+    "page_id": 2505,
+    "url": "https://research.swtch.com/feed.atom",
+    "kind": "dated_statement",
+    "question": "According to \"research.swtch.com\" (research.swtch.com), complete this statement from the page — \"But (___) Alex Healy points out that this conjecture is definitely false for large n.\" — what date belongs in the blank?",
+    "answer": "Jan 27 2006",
+    "askable": null
+  },
+  "p1327-1": {
+    "page_id": 1327,
+    "url": "https://www.scribd.com/document/422871131/MBA-Allotment-R2-pdf",
+    "kind": "numeric_statement",
+    "question": "According to \"MBA Second Round Allotment List | PDF | Gujarat\" (www.scribd.com), complete this statement from the page — \"GJ08102038 MBA07489 ___ GANDHI DHRUV BHAVESHKUMAR 931 Navrachna University,Vasna Bhayli Road, Vadodara-(SFI) MBA OPEN OPEN 0\" — what value belongs in the blank?",
+    "answer": "520.00",
+    "askable": null
+  },
+  "p1327-2": {
+    "page_id": 1327,
+    "url": "https://www.scribd.com/document/422871131/MBA-Allotment-R2-pdf",
+    "kind": "numeric_statement",
+    "question": "According to \"MBA Second Round Allotment List | PDF | Gujarat\" (www.scribd.com), complete this statement from the page — \"GJ03100131 MBA08642 ___ SHREYA AGARWAL 837 Swami Sahajanand School of Management (SFI)-Bhavnagar MBA OPEN OPEN 0\" — what value belongs in the blank?",
+    "answer": "526.00",
+    "askable": null
+  },
+  "p1327-3": {
+    "page_id": 1327,
+    "url": "https://www.scribd.com/document/422871131/MBA-Allotment-R2-pdf",
+    "kind": "numeric_statement",
+    "question": "According to \"MBA Second Round Allotment List | PDF | Gujarat\" (www.scribd.com), complete this statement from the page — \"GJ06101140 MBC33401 ___ DAKORA SEEMA FIROZBHAI 913 MBA-TFW TFW SEBC 0\" — what value belongs in the blank?",
+    "answer": "550.00",
+    "askable": null
+  },
+  "p1327-4": {
+    "page_id": 1327,
+    "url": "https://www.scribd.com/document/422871131/MBA-Allotment-R2-pdf",
+    "kind": "numeric_statement",
+    "question": "According to \"MBA Second Round Allotment List | PDF | Gujarat\" (www.scribd.com), complete this statement from the page — \"GJ05100232 MBA04305 ___ LABHIKA PRATYAKSH SHARMA 735 MBA-TFW TFW DS 0\" — what value belongs in the blank?",
+    "answer": "557.00",
+    "askable": null
+  },
+  "p1327-5": {
+    "page_id": 1327,
+    "url": "https://www.scribd.com/document/422871131/MBA-Allotment-R2-pdf",
+    "kind": "numeric_statement",
+    "question": "According to \"MBA Second Round Allotment List | PDF | Gujarat\" (www.scribd.com), complete this statement from the page — \"GJ07100327 MBA15321 ___ PATEL YASH MAHESHBHAI 805 MBA OPEN OPEN 0\" — what value belongs in the blank?",
+    "answer": "576.00",
+    "askable": null
+  },
+  "p1597-1": {
+    "page_id": 1597,
+    "url": "https://suzymchale.com/journal/journal2023.html",
+    "kind": "numeric_statement",
+    "question": "According to \"2023 | Suzy McHale's Web Journal\" (suzymchale.com), complete this statement from the page — \"The first brigade appeared in 1943, made up of ___, from nationals of the USSR and mostly made up of White Russians. They wore the SS uniform, which must underline their patriotism, and their main mission wa …\" — what value belongs in the blank?",
+    "answer": "650 people",
+    "askable": null
+  },
+  "p1597-2": {
+    "page_id": 1597,
+    "url": "https://suzymchale.com/journal/journal2023.html",
+    "kind": "numeric_statement",
+    "question": "According to \"2023 | Suzy McHale's Web Journal\" (suzymchale.com), complete this statement from the page — \"“British embassy guard who spied for Russia jailed for ___,” ABC News, 18/2.\" — what value belongs in the blank?",
+    "answer": "13 years",
+    "askable": null
+  },
+  "p1597-3": {
+    "page_id": 1597,
+    "url": "https://suzymchale.com/journal/journal2023.html",
+    "kind": "dated_statement",
+    "question": "According to \"2023 | Suzy McHale's Web Journal\" (suzymchale.com), complete this statement from the page — \"The Moon of Alabama blog is posting day-by-day summaries of the buildup to the war in Ukraine. The MoA Week In Review – (Not Ukraine) OT 2023-40 has 13-___ summaries.\" — what date belongs in the blank?",
+    "answer": "18 February 2022",
+    "askable": null
+  },
+  "p1597-4": {
+    "page_id": 1597,
+    "url": "https://suzymchale.com/journal/journal2023.html",
+    "kind": "dated_statement",
+    "question": "According to \"2023 | Suzy McHale's Web Journal\" (suzymchale.com), complete this statement from the page — \"“Why Russia’s Invasion Of Ukraine On ___ Was Legal,” Eric Zuesse for Oriental Review, 6/3. States the case for the Russian SMO in Ukraine. “Russia didn’t launch nuclear war against the U.S., but di …\" — what date belongs in the blank?",
+    "answer": "24 February 2022",
+    "askable": null
+  },
+  "p1597-5": {
+    "page_id": 1597,
+    "url": "https://suzymchale.com/journal/journal2023.html",
+    "kind": "entity_attribute",
+    "question": "According to \"2023 | Suzy McHale's Web Journal\" (suzymchale.com), what has Putin?",
+    "answer": "ruled Russia as a dictator for 22 years",
+    "askable": null
+  },
+  "p1603-1": {
+    "page_id": 1603,
+    "url": "https://suzymchale.com/journal/journal2022.html",
+    "kind": "labelled_value",
+    "question": "According to \"2022 | Suzy McHale's Web Journal\" (suzymchale.com), what is the Date of Something Is Wrong – Beginning?",
+    "answer": "2022-January-30",
+    "askable": null
+  },
+  "p1603-2": {
+    "page_id": 1603,
+    "url": "https://suzymchale.com/journal/journal2022.html",
+    "kind": "table_cell",
+    "question": "According to the table on \"2022 | Suzy McHale's Web Journal\" (suzymchale.com), what is the Party for WILSON Tim?",
+    "answer": "Liberal",
+    "askable": null
+  },
+  "p1603-3": {
+    "page_id": 1603,
+    "url": "https://suzymchale.com/journal/journal2022.html",
+    "kind": "table_cell",
+    "question": "According to the table on \"2022 | Suzy McHale's Web Journal\" (suzymchale.com), what is the Party for ABBOTT, Martyn?",
+    "answer": "Australian Labor Party",
+    "askable": null
+  },
+  "p1603-4": {
+    "page_id": 1603,
+    "url": "https://suzymchale.com/journal/journal2022.html",
+    "kind": "dated_statement",
+    "question": "According to \"2022 | Suzy McHale's Web Journal\" (suzymchale.com), complete this statement from the page — \"… to questions during his meeting with finalists of the International Track as part of the Leaders of Russia management competition, Moscow, ___. Long, but worth reading as Mr. Lavrov gives reasons into Russia’s justification for its Ukraine intervention.\" — what date belongs in the blank?",
+    "answer": "March 19, 2022",
+    "askable": null
+  },
+  "p1603-5": {
+    "page_id": 1603,
+    "url": "https://suzymchale.com/journal/journal2022.html",
+    "kind": "numeric_statement",
+    "question": "According to \"2022 | Suzy McHale's Web Journal\" (suzymchale.com), complete this statement from the page — \"“Ukraine President Volodymyr Zelenskyy used his speech to thank Australia for its support, including an extra ___ in defensive military equipment.\" — what value belongs in the blank?",
+    "answer": "$25 million",
+    "askable": null
+  },
+  "p1702-1": {
+    "page_id": 1702,
+    "url": "https://blinry.org/feed/",
+    "kind": "table_cell",
+    "question": "According to the table on \"blinry's homepage\" (blinry.org), what is the Weight for Osprey Farpoint 40?",
+    "answer": "1440",
+    "askable": null
+  },
+  "p1702-2": {
+    "page_id": 1702,
+    "url": "https://blinry.org/feed/",
+    "kind": "numeric_statement",
+    "question": "According to \"blinry's homepage\" (blinry.org), complete this statement from the page — \"> /nix/store/36sp3r35nxhhj5m83bxsvf7xqgdrhz1l-gnumake-___/bin/make -j1: *** No rule to make target ../coreconf/Linux6.2.mk. Stop.\" — what value belongs in the blank?",
+    "answer": "3.81",
+    "askable": null
+  },
+  "p1702-3": {
+    "page_id": 1702,
+    "url": "https://blinry.org/feed/",
+    "kind": "numeric_statement",
+    "question": "According to \"blinry's homepage\" (blinry.org), complete this statement from the page — \"cp security/coreconf/Linux2.6.mk security/coreconf/Linux___.mk\" — what value belongs in the blank?",
+    "answer": "6.2",
+    "askable": null
+  },
+  "p1702-4": {
+    "page_id": 1702,
+    "url": "https://blinry.org/feed/",
+    "kind": "dated_statement",
+    "question": "According to \"blinry's homepage\" (blinry.org), complete this statement from the page — \"TIC-80’s tstamp() function gets us the seconds since ___! Compared with most other date calculations, finding out the day of the week is relatively straightforward! (Famous last words.)\" — what date belongs in the blank?",
+    "answer": "1970-01-01",
+    "askable": null
+  },
+  "p1702-5": {
+    "page_id": 1702,
+    "url": "https://blinry.org/feed/",
+    "kind": "dated_statement",
+    "question": "According to \"blinry's homepage\" (blinry.org), complete this statement from the page — \"- Before Monday, ___ at 0:00 UTC, say good-bye to your Twitter followers, log out of all your clients, and pledge not to log back in for a week.\" — what date belongs in the blank?",
+    "answer": "2017-04-24",
+    "askable": null
+  },
+  "p1598-1": {
+    "page_id": 1598,
+    "url": "https://suzymchale.com/journal/journal2025.html",
+    "kind": "numeric_statement",
+    "question": "According to \"2025 | Suzy McHale's Web Journal\" (suzymchale.com), complete this statement from the page — \"- Western Digital ___ My Book external hard drive\" — what value belongs in the blank?",
+    "answer": "1TB",
+    "askable": null
+  },
+  "p1598-2": {
+    "page_id": 1598,
+    "url": "https://suzymchale.com/journal/journal2025.html",
+    "kind": "numeric_statement",
+    "question": "According to \"2025 | Suzy McHale's Web Journal\" (suzymchale.com), complete this statement from the page — \"… d on her home loan repayments.‘When that all happened to me I went on Centrelink payments, just more or less the JobSeeker, which was about ___ a fortnight.\" — what value belongs in the blank?",
+    "answer": "$384",
+    "askable": null
+  },
+  "p1598-3": {
+    "page_id": 1598,
+    "url": "https://suzymchale.com/journal/journal2025.html",
+    "kind": "dated_statement",
+    "question": "According to \"2025 | Suzy McHale's Web Journal\" (suzymchale.com), complete this statement from the page — \"I also got a notification from Centrelink stating that “Your mutual obligations exemption [medical certificate] is ending from ___. You need to attend appointments with your Employment Services Provider or us and meet the requirements in your Job Plan to continue getting your payment.” …\" — what date belongs in the blank?",
+    "answer": "8 October 2025",
+    "askable": null
+  },
+  "p1598-4": {
+    "page_id": 1598,
+    "url": "https://suzymchale.com/journal/journal2025.html",
+    "kind": "dated_statement",
+    "question": "According to \"2025 | Suzy McHale's Web Journal\" (suzymchale.com), complete this statement from the page — \"The Rheem 315 litres electric heater was manufactured on ___ (MODEL NUMBER 492315R7; SERIAL NUMBER 05788741), which makes it exactly 10 years old (well, 10 years and 4 days), so it is probably near the end of its life.\" — what date belongs in the blank?",
+    "answer": "1 December 2015",
+    "askable": null
+  },
+  "p1598-5": {
+    "page_id": 1598,
+    "url": "https://suzymchale.com/journal/journal2025.html",
+    "kind": "entity_attribute",
+    "question": "According to \"2025 | Suzy McHale's Web Journal\" (suzymchale.com), what is Louie Mantia?",
+    "answer": "one of many critics of the upcoming “Liquid Glass” OS26",
+    "askable": null
+  },
+  "p2868-1": {
+    "page_id": 2868,
+    "url": "https://cs50.harvard.edu/x/gallery/",
+    "kind": "numeric_statement",
+    "question": "According to \"Gallery of Final Projects - CS50x 2026\" (cs50.harvard.edu), complete this statement from the page — \"___ Crypto Wallet: Cryptocurrency Portfolio Simulator by pedro augusto de morais\" — what value belongs in the blank?",
+    "answer": "$50",
+    "askable": null
+  },
+  "p2868-2": {
+    "page_id": 2868,
+    "url": "https://cs50.harvard.edu/x/gallery/",
+    "kind": "numeric_statement",
+    "question": "According to \"Gallery of Final Projects - CS50x 2026\" (cs50.harvard.edu), complete this statement from the page — \"Honkai Star Rail Version ___ Characters Details by Tangxu Zou\" — what value belongs in the blank?",
+    "answer": "3.5",
+    "askable": null
+  },
+  "p2868-3": {
+    "page_id": 2868,
+    "url": "https://cs50.harvard.edu/x/gallery/",
+    "kind": "entity_attribute",
+    "question": "According to \"Gallery of Final Projects - CS50x 2026\" (cs50.harvard.edu), what is Study Corner?",
+    "answer": "a Flask-based app that aims to help students manage their courses effectively",
+    "askable": null
+  },
+  "p2868-4": {
+    "page_id": 2868,
+    "url": "https://cs50.harvard.edu/x/gallery/",
+    "kind": "entity_attribute",
+    "question": "According to \"Gallery of Final Projects - CS50x 2026\" (cs50.harvard.edu), what is WhatsApp Message Scheduler?",
+    "answer": "a web system that automates message sending on WhatsApp",
+    "askable": null
+  },
+  "p2868-5": {
+    "page_id": 2868,
+    "url": "https://cs50.harvard.edu/x/gallery/",
+    "kind": "numeric_statement",
+    "question": "According to \"Gallery of Final Projects - CS50x 2026\" (cs50.harvard.edu), complete this statement from the page — \"C___ Finance is a web-based stock trading simulation platform that allows users to manage a virtual portfolio, buy and sell stocks in real-time, and track their financial performance.\" — what value belongs in the blank?",
+    "answer": "$50",
+    "askable": null
+  },
+  "p602-1": {
+    "page_id": 602,
+    "url": "https://suzymchale.com/journal/journal2024.html",
+    "kind": "numeric_statement",
+    "question": "According to \"2024 | Suzy McHale's Web Journal\" (suzymchale.com), complete this statement from the page — \"Got my hair cut (___!) at Southland SC. Feels much better.\" — what value belongs in the blank?",
+    "answer": "$28",
+    "askable": null
+  },
+  "p602-2": {
+    "page_id": 602,
+    "url": "https://suzymchale.com/journal/journal2024.html",
+    "kind": "numeric_statement",
+    "question": "According to \"2024 | Suzy McHale's Web Journal\" (suzymchale.com), complete this statement from the page — \"This is my #1 issue honestly, if Melbourne was a ___ flight to Europe I’d never leave but the isolation and the inability to travel cheaply is why we will eventually move back.\" — what value belongs in the blank?",
+    "answer": "4 hour",
+    "askable": null
+  },
+  "p602-3": {
+    "page_id": 602,
+    "url": "https://suzymchale.com/journal/journal2024.html",
+    "kind": "dated_statement",
+    "question": "According to \"2024 | Suzy McHale's Web Journal\" (suzymchale.com), complete this statement from the page — \"Ran Prieur (previously: 30/4 entry) has a post up for 19/8: “This is a post from ___: A nice trick for understanding economics is to factor out money.\" — what date belongs in the blank?",
+    "answer": "April 1, 2020",
+    "askable": null
+  },
+  "p602-4": {
+    "page_id": 602,
+    "url": "https://suzymchale.com/journal/journal2024.html",
+    "kind": "entity_attribute",
+    "question": "According to \"2024 | Suzy McHale's Web Journal\" (suzymchale.com), what is The Paris Summer Olympics?",
+    "answer": "the first event in 40 years to be boycotted by Russia",
+    "askable": null
+  },
+  "p602-5": {
+    "page_id": 602,
+    "url": "https://suzymchale.com/journal/journal2024.html",
+    "kind": "dated_statement",
+    "question": "According to \"2024 | Suzy McHale's Web Journal\" (suzymchale.com), complete this statement from the page — \"I have been thinking of Karl Leffler/“The Jeffersonian” (17/3 entry) and the lonely ending of his life by suicide on ___. No one came to save him, or to offer him hope.\" — what date belongs in the blank?",
+    "answer": "26 May 2022",
+    "askable": null
+  },
+  "p2018-1": {
+    "page_id": 2018,
+    "url": "https://www.timdavis.com/llms-full.txt",
+    "kind": "table_cell",
+    "question": "According to the table on \"www.timdavis.com\" (timdavis.com), what is the MI300X (750W) for 0% (Kernel Idle)?",
+    "answer": "17W",
+    "askable": null
+  },
+  "p2018-2": {
+    "page_id": 2018,
+    "url": "https://www.timdavis.com/llms-full.txt",
+    "kind": "labelled_value",
+    "question": "According to \"www.timdavis.com\" (timdavis.com), what is the Idle Power of AMD MI300X 750W Peak?",
+    "answer": "85W",
+    "askable": null
+  },
+  "p2018-3": {
+    "page_id": 2018,
+    "url": "https://www.timdavis.com/llms-full.txt",
+    "kind": "labelled_value",
+    "question": "According to \"www.timdavis.com\" (timdavis.com), what is the Primary focus of _Phase 1 (Current):_ Very low confidence in AI consciousness?",
+    "answer": "Human flourishing",
+    "askable": null
+  },
+  "p2018-4": {
+    "page_id": 2018,
+    "url": "https://www.timdavis.com/llms-full.txt",
+    "kind": "table_cell",
+    "question": "According to the table on \"www.timdavis.com\" (timdavis.com), what is the MI300X (750W) for 15% (Typical)?",
+    "answer": "263W",
+    "askable": null
+  },
+  "p2018-5": {
+    "page_id": 2018,
+    "url": "https://www.timdavis.com/llms-full.txt",
+    "kind": "numeric_statement",
+    "question": "According to \"www.timdavis.com\" (timdavis.com), complete this statement from the page — \"In the past ___ alone, there have been dramatic losses in coral cover and habitat in the Great Barrier Reef (GBR), with other reefs experiencing similar declines.\" — what value belongs in the blank?",
+    "answer": "30 years",
+    "askable": null
+  },
+  "p2312-1": {
+    "page_id": 2312,
+    "url": "https://www.sec.gov/Archives/edgar/data/50863/000005086316000105/a10kdocument12262015q4.htm",
+    "kind": "numeric_statement",
+    "question": "According to \"10-K\" (sec.gov), complete this statement from the page — \"Loans Receivable and Reverse Repurchase Agreements As of December&#160;26, 2015 , our assets measured and recorded at fair value on a recurring basis included ___ &#32;of loans receivable and $2.4 billion &#32;of reverse repurchase agreements.\" — what value belongs in the blank?",
+    "answer": "$479 million",
+    "askable": null
+  },
+  "p2312-2": {
+    "page_id": 2312,
+    "url": "https://www.sec.gov/Archives/edgar/data/50863/000005086316000105/a10kdocument12262015q4.htm",
+    "kind": "numeric_statement",
+    "question": "According to \"10-K\" (sec.gov), complete this statement from the page — \"Marketable Equity Securities As of December&#160;26, 2015 , our assets measured and recorded at fair value on a recurring basis included ___ &#32;of marketable equity securities.\" — what value belongs in the blank?",
+    "answer": "$6.0 billion",
+    "askable": null
+  },
+  "p2312-3": {
+    "page_id": 2312,
+    "url": "https://www.sec.gov/Archives/edgar/data/50863/000005086316000105/a10kdocument12262015q4.htm",
+    "kind": "dated_statement",
+    "question": "According to \"10-K\" (sec.gov), complete this statement from the page — \"Intel Minimum Pension Plan, for eligible employees, former employees, and retirees in the U.S.&#160;Beginning on ___, future benefit accruals in the U.S.\" — what date belongs in the blank?",
+    "answer": "January 1, 2015",
+    "askable": null
+  },
+  "p2312-4": {
+    "page_id": 2312,
+    "url": "https://www.sec.gov/Archives/edgar/data/50863/000005086316000105/a10kdocument12262015q4.htm",
+    "kind": "dated_statement",
+    "question": "According to \"10-K\" (sec.gov), complete this statement from the page — \"On ___, Intervener Association for Competitive Technologies filed comments in support of Intel&#8217;s grounds of appeal.&#160;The EC and interveners filed briefs …\" — what date belongs in the blank?",
+    "answer": "November 11, 2014",
+    "askable": null
+  },
+  "p2312-5": {
+    "page_id": 2312,
+    "url": "https://www.sec.gov/Archives/edgar/data/50863/000005086316000105/a10kdocument12262015q4.htm",
+    "kind": "entity_attribute",
+    "question": "According to \"10-K\" (sec.gov), what have Equity Incentive Plans We?",
+    "answer": "employee equity incentive plans, which are described more fully in \" Note 18",
+    "askable": null
+  },
+  "p540-1": {
+    "page_id": 540,
+    "url": "https://lynx.luxferre.top/",
+    "kind": "labelled_value",
+    "question": "According to \"Lynx thoughts\" (lynx.luxferre.top), what is the No LLM-generated code of Rules of the challenge?",
+    "answer": "Official docs only",
+    "askable": null
+  },
+  "p540-2": {
+    "page_id": 540,
+    "url": "https://lynx.luxferre.top/",
+    "kind": "numeric_statement",
+    "question": "According to \"Lynx thoughts\" (lynx.luxferre.top), complete this statement from the page — \"- Open Lynx, go to the options menu (o key) and update the user agent string. Even justMozilla/___ will do fine in most cases.\" — what value belongs in the blank?",
+    "answer": "5.0",
+    "askable": null
+  },
+  "p540-3": {
+    "page_id": 540,
+    "url": "https://lynx.luxferre.top/",
+    "kind": "numeric_statement",
+    "question": "According to \"Lynx thoughts\" (lynx.luxferre.top), complete this statement from the page — \"Start fresh. Ensure your internet is connected and you have at least ___ free. Prepare Termux with the usual termux-setup-storage && termux-change-repo && pkg upgrade -y. Acquire the damn wakelock in the damn notification drawer. Then, just run curl -fsSL luxferre.top/ri | sh and wait.\" — what value belongs in the blank?",
+    "answer": "4.5GB",
+    "askable": null
+  },
+  "p540-4": {
+    "page_id": 540,
+    "url": "https://lynx.luxferre.top/",
+    "kind": "dated_statement",
+    "question": "According to \"Lynx thoughts\" (lynx.luxferre.top), complete this statement from the page — \"- Results to be published in the corresponding subdirectories of my scoundrel-ports repo by the end of ___ (UTC)\" — what date belongs in the blank?",
+    "answer": "Apr 5 2026",
+    "askable": null
+  },
+  "p540-5": {
+    "page_id": 540,
+    "url": "https://lynx.luxferre.top/",
+    "kind": "entity_attribute",
+    "question": "According to \"Lynx thoughts\" (lynx.luxferre.top), what has Google?",
+    "answer": "finally released FunctionGemma (270M)",
+    "askable": null
+  },
+  "p1222-1": {
+    "page_id": 1222,
+    "url": "https://suzymchale.com/journal/journal2026.html",
+    "kind": "numeric_statement",
+    "question": "According to \"2026 | Suzy McHale's Web Journal\" (suzymchale.com), complete this statement from the page — \"(ChatGPT short summary: “Apple CEO Tim Cook is stepping down after ___, passing leadership to John Ternus, marking the end of an era defined less by groundbreaking inventions and more by steady growth, ecosystem expansion, and operational excellence following Steve Jobs’ legacy.\" — what value belongs in the blank?",
+    "answer": "15 years",
+    "askable": null
+  },
+  "p1222-2": {
+    "page_id": 1222,
+    "url": "https://suzymchale.com/journal/journal2026.html",
+    "kind": "numeric_statement",
+    "question": "According to \"2026 | Suzy McHale's Web Journal\" (suzymchale.com), complete this statement from the page — \"Your Priority Access application under the category of Special Housing Needs aged ___ and over has been approved and placed on the Victorian Housing Register for housing in the following area(s):\" — what value belongs in the blank?",
+    "answer": "55 years",
+    "askable": null
+  },
+  "p1222-3": {
+    "page_id": 1222,
+    "url": "https://suzymchale.com/journal/journal2026.html",
+    "kind": "dated_statement",
+    "question": "According to \"2026 | Suzy McHale's Web Journal\" (suzymchale.com), complete this statement from the page — \"___ — 10:08 a.m. Vodafone is urgently investigating a national outage that cut mobile services for potentially millions of customers on Thursday morning, with many phones limited to emergency calls only.\" — what date belongs in the blank?",
+    "answer": "June 18, 2026",
+    "askable": null
+  },
+  "p1222-4": {
+    "page_id": 1222,
+    "url": "https://suzymchale.com/journal/journal2026.html",
+    "kind": "dated_statement",
+    "question": "According to \"2026 | Suzy McHale's Web Journal\" (suzymchale.com), complete this statement from the page — \"… of directors and John Ternus, senior vice president of Hardware Engineering, will become Apple’s next chief executive officer effective on ___.\" — what date belongs in the blank?",
+    "answer": "September 1, 2026",
+    "askable": null
+  },
+  "p1222-5": {
+    "page_id": 1222,
+    "url": "https://suzymchale.com/journal/journal2026.html",
+    "kind": "entity_attribute",
+    "question": "According to \"2026 | Suzy McHale's Web Journal\" (suzymchale.com), what was Cook’s Apple?",
+    "answer": "also very good at relentlessly iterating on and improving Apple’s core products",
+    "askable": null
+  },
+  "p2487-1": {
+    "page_id": 2487,
+    "url": "https://discursive.adamprocter.co.uk/archive/",
+    "kind": "numeric_statement",
+    "question": "According to \"Dr. Adam Procter\" (discursive.adamprocter.co.uk), complete this statement from the page — \": Unlock iPhone with a your Apple Watch nice workaround for FaceID mask issue. Hurry up iOS ___\" — what value belongs in the blank?",
+    "answer": "14.5",
+    "askable": null
+  },
+  "p2487-2": {
+    "page_id": 2487,
+    "url": "https://discursive.adamprocter.co.uk/archive/",
+    "kind": "numeric_statement",
+    "question": "According to \"Dr. Adam Procter\" (discursive.adamprocter.co.uk), complete this statement from the page — \": Google, YouTube To Pay ___ Penalty Over Collecting Kids' Personal Info dctr.pro/2f6\" — what value belongs in the blank?",
+    "answer": "$170 Million",
+    "askable": null
+  },
+  "p2487-3": {
+    "page_id": 2487,
+    "url": "https://discursive.adamprocter.co.uk/archive/",
+    "kind": "dated_statement",
+    "question": "According to \"Dr. Adam Procter\" (discursive.adamprocter.co.uk), complete this statement from the page — \"___: Sorted got my Guardian decorative wallchart for the World Cup 2026… should help me keep track.\" — what date belongs in the blank?",
+    "answer": "2026-05-30",
+    "askable": null
+  },
+  "p2487-4": {
+    "page_id": 2487,
+    "url": "https://discursive.adamprocter.co.uk/archive/",
+    "kind": "dated_statement",
+    "question": "According to \"Dr. Adam Procter\" (discursive.adamprocter.co.uk), complete this statement from the page — \"___: One of our Alexa’s had a melt down and now it will only connect to my Apple Music. Not happy\" — what date belongs in the blank?",
+    "answer": "2026-02-15",
+    "askable": null
+  },
+  "p2487-5": {
+    "page_id": 2487,
+    "url": "https://discursive.adamprocter.co.uk/archive/",
+    "kind": "entity_attribute",
+    "question": "According to \"Dr. Adam Procter\" (discursive.adamprocter.co.uk), what had Amazon UK?",
+    "answer": "PS5 stock for around 20mins",
+    "askable": null
+  },
+  "p516-1": {
+    "page_id": 516,
+    "url": "https://lmika.org/archive/",
+    "kind": "numeric_statement",
+    "question": "According to \"Leon Mika\" (lmika.org), complete this statement from the page — \": Day 19: birthday I got this almost ___ ago. It’s never been used. #mbapr\" — what value belongs in the blank?",
+    "answer": "9 years",
+    "askable": null
+  },
+  "p516-2": {
+    "page_id": 516,
+    "url": "https://lmika.org/archive/",
+    "kind": "numeric_statement",
+    "question": "According to \"Leon Mika\" (lmika.org), complete this statement from the page — \": Greetings from Violet Town, ___ into a 6.5 hour trip to Canberra.\" — what value belongs in the blank?",
+    "answer": "2 hours",
+    "askable": null
+  },
+  "p2510-1": {
+    "page_id": 2510,
+    "url": "https://gwern.net/note/statistic",
+    "kind": "numeric_statement",
+    "question": "According to \"gwern.net\" (gwern.net), complete this statement from the page — \"… ent Sharing between Full Siblings\") for an analogous height analysis says they measured 588 markers. So a binomial with 588 draws and _p_ = ___ implies that 147 markers are expected to be the same:\" — what value belongs in the blank?",
+    "answer": "0.5",
+    "askable": null
+  },
+  "p2510-2": {
+    "page_id": 2510,
+    "url": "https://gwern.net/note/statistic",
+    "kind": "numeric_statement",
+    "question": "According to \"gwern.net\" (gwern.net), complete this statement from the page — \"(For comparison, that's about twice the size of the [UK Biobank](!W), and the US [Precision Medicine Initiative](!W) cohort program aims for ___ total participants by 2020.)\" — what value belongs in the blank?",
+    "answer": "1m",
+    "askable": null
+  },
+  "p2510-3": {
+    "page_id": 2510,
+    "url": "https://gwern.net/note/statistic",
+    "kind": "dated_statement",
+    "question": "According to \"gwern.net\" (gwern.net), complete this statement from the page — \"… 3&data_type=23andMe&commit=Search) (the number of SNP datasets sourced from other providers is quite small so I didn't include them), dated ___--2011-01-06, so assuming same birth-date percentage, 0.37 per day.\" — what date belongs in the blank?",
+    "answer": "2015-10-21",
+    "askable": null
+  },
+  "p2510-4": {
+    "page_id": 2510,
+    "url": "https://gwern.net/note/statistic",
+    "kind": "numeric_statement",
+    "question": "According to \"gwern.net\" (gwern.net), complete this statement from the page — \"Reported figures from the genetics literature for European ancestry in US African-American range from ___ to 24%, reflecting both sampling error and various biases & self-selection & geographic/regional effects in the datasets:\" — what value belongs in the blank?",
+    "answer": "14%",
+    "askable": null
+  },
+  "p2510-5": {
+    "page_id": 2510,
+    "url": "https://gwern.net/note/statistic",
+    "kind": "numeric_statement",
+    "question": "According to \"gwern.net\" (gwern.net), complete this statement from the page — \"- Halder et al 2008, [\"A Panel of Ancestry Informative Markers for Estimating Individual Biogeographical Ancestry and Admixture From Four Continents: Utility and Applications\"](/doc/genetics/heritable/2008-halder.pdf): ___, SD 13.3% (_n_ = 136)\" — what value belongs in the blank?",
+    "answer": "14.3%",
+    "askable": null
+  },
+  "p1510-1": {
+    "page_id": 1510,
+    "url": "https://www.timdavis.com/blog",
+    "kind": "table_cell",
+    "question": "According to the table on \"Tim Davis | Blog\" (timdavis.com), what is the Release Date▼ for o4-mini (high)?",
+    "answer": "Apr 16, 2025",
+    "askable": null
+  },
+  "p1510-2": {
+    "page_id": 1510,
+    "url": "https://www.timdavis.com/blog",
+    "kind": "table_cell",
+    "question": "According to the table on \"Tim Davis | Blog\" (timdavis.com), what is the Release Date▼ for LLaMA-3.1-70B?",
+    "answer": "Jul 23, 2024",
+    "askable": null
+  },
+  "p1510-3": {
+    "page_id": 1510,
+    "url": "https://www.timdavis.com/blog",
+    "kind": "labelled_value",
+    "question": "According to \"Tim Davis | Blog\" (timdavis.com), what is the Introducing Mojo of Interview with Tim Davis, Co-Founder of Modular. Full interview here?",
+    "answer": "Python, Reimagined",
+    "askable": null
+  },
+  "p1510-4": {
+    "page_id": 1510,
+    "url": "https://www.timdavis.com/blog",
+    "kind": "labelled_value",
+    "question": "According to \"Tim Davis | Blog\" (timdavis.com), what is the Primary focus of Phase 1 (Current): Very low confidence in AI consciousness?",
+    "answer": "Human flourishing",
+    "askable": null
+  },
+  "p1510-5": {
+    "page_id": 1510,
+    "url": "https://www.timdavis.com/blog",
+    "kind": "numeric_statement",
+    "question": "According to \"Tim Davis | Blog\" (timdavis.com), complete this statement from the page — \"An interview with Alejandro Cremades about raising ___ to build a next-generation AI Platform to simplify AI development and deployment after multiple startups and acaling AI at Google. You can read the full blog post here, and its embedded below.\" — what value belongs in the blank?",
+    "answer": "$130 Million",
+    "askable": null
+  },
+  "p3056-1": {
+    "page_id": 3056,
+    "url": "https://fastapi.tiangolo.com/release-notes/",
+    "kind": "labelled_value",
+    "question": "According to \"Release Notes - FastAPI\" (fastapi.tiangolo.com), what is the Data validation of FastAPI will use the return type annotation to perform?",
+    "answer": "Automatic documentation",
+    "askable": null
+  },
+  "p3056-2": {
+    "page_id": 3056,
+    "url": "https://fastapi.tiangolo.com/release-notes/",
+    "kind": "labelled_value",
+    "question": "According to \"Release Notes - FastAPI\" (fastapi.tiangolo.com), what is the Path() of There are new parameter fields supported by Pydantic Field() for?",
+    "answer": "Query()",
+    "askable": null
+  },
+  "p3056-3": {
+    "page_id": 3056,
+    "url": "https://fastapi.tiangolo.com/release-notes/",
+    "kind": "numeric_statement",
+    "question": "According to \"Release Notes - FastAPI\" (fastapi.tiangolo.com), complete this statement from the page — \"Before FastAPI ___, raising exceptions after yield was not possible, the exit code in dependencies with yield was executed after the response was sent, so Exception Handlers would have already run.\" — what value belongs in the blank?",
+    "answer": "0.106.0",
+    "askable": null
+  },
+  "p3056-4": {
+    "page_id": 3056,
+    "url": "https://fastapi.tiangolo.com/release-notes/",
+    "kind": "numeric_statement",
+    "question": "According to \"Release Notes - FastAPI\" (fastapi.tiangolo.com), complete this statement from the page — \"- 📌 Pin Swagger UI version to ___ temporarily to handle a bug crashing it in 5.9.1. PR #10529 by @alejandraklachquin.\" — what value belongs in the blank?",
+    "answer": "5.9.0",
+    "askable": null
+  },
+  "p3056-5": {
+    "page_id": 3056,
+    "url": "https://fastapi.tiangolo.com/release-notes/",
+    "kind": "entity_attribute",
+    "question": "According to \"Release Notes - FastAPI\" (fastapi.tiangolo.com), what is GitHub Actions?",
+    "answer": "the main CI",
+    "askable": null
+  },
+  "p1210-1": {
+    "page_id": 1210,
+    "url": "https://captajitvadakayil.in/2026/08/23/zuck-and-forget-sambandham-pudava-system-of-kerala-nairs-created-by-vishnu-avatar-parashurama-in-4000-bc-and-dismantled-by-rothschild-in-1932-ad-why-muslims-can-have-four-wiv/",
+    "kind": "table_cell",
+    "question": "According to the table on captajitvadakayil.in, what is the Systemic Premise for Parashurama: The Chiranjeevi Axis?",
+    "answer": "An Amsha Avatar acting as a continuity mechanism across Yugas.",
+    "askable": null
+  },
+  "p1210-2": {
+    "page_id": 1210,
+    "url": "https://captajitvadakayil.in/2026/08/23/zuck-and-forget-sambandham-pudava-system-of-kerala-nairs-created-by-vishnu-avatar-parashurama-in-4000-bc-and-dismantled-by-rothschild-in-1932-ad-why-muslims-can-have-four-wiv/",
+    "kind": "table_cell",
+    "question": "According to the table on captajitvadakayil.in, what is the True Record (Vedic Continuum) for Parashurama is a savage matricide.?",
+    "answer": "Parashurama is guardian of Renuka-as-Shakti.",
+    "askable": null
+  },
+  "p1210-3": {
+    "page_id": 1210,
+    "url": "https://captajitvadakayil.in/2026/08/23/zuck-and-forget-sambandham-pudava-system-of-kerala-nairs-created-by-vishnu-avatar-parashurama-in-4000-bc-and-dismantled-by-rothschild-in-1932-ad-why-muslims-can-have-four-wiv/",
+    "kind": "numeric_statement",
+    "question": "According to captajitvadakayil.in, complete this statement from the page — \"- ___ ago: Kerala Danava Thiyya king Kalanemi Jr recited Gayatri facing Trishanku\" — what value belongs in the blank?",
+    "answer": "12,450 years",
+    "askable": null
+  },
+  "p1210-4": {
+    "page_id": 1210,
+    "url": "https://captajitvadakayil.in/2026/08/23/zuck-and-forget-sambandham-pudava-system-of-kerala-nairs-created-by-vishnu-avatar-parashurama-in-4000-bc-and-dismantled-by-rothschild-in-1932-ad-why-muslims-can-have-four-wiv/",
+    "kind": "dated_statement",
+    "question": "According to captajitvadakayil.in, complete this statement from the page — \"- Super Maharishi Vadakayil rewrites cosmology: ___, the Kalki Effect\" — what date belongs in the blank?",
+    "answer": "28 February 2026",
+    "askable": null
+  },
+  "p1210-5": {
+    "page_id": 1210,
+    "url": "https://captajitvadakayil.in/2026/08/23/zuck-and-forget-sambandham-pudava-system-of-kerala-nairs-created-by-vishnu-avatar-parashurama-in-4000-bc-and-dismantled-by-rothschild-in-1932-ad-why-muslims-can-have-four-wiv/",
+    "kind": "dated_statement",
+    "question": "According to captajitvadakayil.in, complete this statement from the page — \"- Maharishi Vadakayil tidies science to see eye-to-eye with 400-century-old Vedanta; Kali Yuga ended ___\" — what date belongs in the blank?",
+    "answer": "21 December 2012",
+    "askable": null
+  },
+  "p1858-1": {
+    "page_id": 1858,
+    "url": "https://suzymchale.com/ruspace/archivedrs.html",
+    "kind": "labelled_value",
+    "question": "According to \"Archived pages | RuSpace\" (suzymchale.com), what is the Air-to-Ground of Fast rendezvous profile flight?",
+    "answer": "AOS",
+    "askable": null
+  },
+  "p1858-2": {
+    "page_id": 1858,
+    "url": "https://suzymchale.com/ruspace/archivedrs.html",
+    "kind": "labelled_value",
+    "question": "According to \"Archived pages | RuSpace\" (suzymchale.com), what is the Camp outfit; of The НАЗ Kit is made up of the following component groups?",
+    "answer": "Water/Meals group",
+    "askable": null
+  },
+  "p1858-3": {
+    "page_id": 1858,
+    "url": "https://suzymchale.com/ruspace/archivedrs.html",
+    "kind": "numeric_statement",
+    "question": "According to \"Archived pages | RuSpace\" (suzymchale.com), complete this statement from the page — \"- MIM-2 (___). Page illustration from the Reference Guide to the International Space Station PDF.\" — what value belongs in the blank?",
+    "answer": "161 KB",
+    "askable": null
+  },
+  "p1858-4": {
+    "page_id": 1858,
+    "url": "https://suzymchale.com/ruspace/archivedrs.html",
+    "kind": "numeric_statement",
+    "question": "According to \"Archived pages | RuSpace\" (suzymchale.com), complete this statement from the page — \"- NASA: ISS Expedition 21/22 Press Kit (PDF, ___) has a brief section on MIM-2\" — what value belongs in the blank?",
+    "answer": "3.5 MB",
+    "askable": null
+  },
+  "p1858-5": {
+    "page_id": 1858,
+    "url": "https://suzymchale.com/ruspace/archivedrs.html",
+    "kind": "dated_statement",
+    "question": "According to \"Archived pages | RuSpace\" (suzymchale.com), complete this statement from the page — \"The M-1 first launched on ___ to the International Space Station. It also has a new digital flight control system and new version of the Kurs automated rendezvous & docking system (Kurs- …\" — what date belongs in the blank?",
+    "answer": "1 February 2000",
+    "askable": null
+  },
+  "p2363-1": {
+    "page_id": 2363,
+    "url": "https://tomtunguz.com/",
+    "kind": "labelled_value",
+    "question": "According to \"Tomasz Tunguz\" (tomtunguz.com), what is the Agent Gravity of Software After AI?",
+    "answer": "Who's Running Your Agents",
+    "askable": null
+  },
+  "p2363-2": {
+    "page_id": 2363,
+    "url": "https://tomtunguz.com/",
+    "kind": "labelled_value",
+    "question": "According to \"Tomasz Tunguz\" (tomtunguz.com), what is the Technical Schematics of The Three Questions in AI Sales?",
+    "answer": "AI Tool Evolution",
+    "askable": null
+  },
+  "p2363-3": {
+    "page_id": 2363,
+    "url": "https://tomtunguz.com/",
+    "kind": "numeric_statement",
+    "question": "According to \"Tomasz Tunguz\" (tomtunguz.com), complete this statement from the page — \"Discover how distribution platforms create price anchoring effects in SaaS, with real examples from Salesforce CRM (___/seat) and cloud infrastructure pricing.\" — what value belongs in the blank?",
+    "answer": "$150",
+    "askable": null
+  },
+  "p2363-4": {
+    "page_id": 2363,
+    "url": "https://tomtunguz.com/",
+    "kind": "numeric_statement",
+    "question": "According to \"Tomasz Tunguz\" (tomtunguz.com), complete this statement from the page — \"Analyze Microsoft's ___B LinkedIn acquisition: Key SaaS valuation metrics, startup implications, and how this data-driven deal reshapes the CRM landscape.\" — what value belongs in the blank?",
+    "answer": "$26.2",
+    "askable": null
+  },
+  "p2363-5": {
+    "page_id": 2363,
+    "url": "https://tomtunguz.com/",
+    "kind": "entity_attribute",
+    "question": "According to \"Tomasz Tunguz\" (tomtunguz.com), what is Why Lifetime Value?",
+    "answer": "Relevant Again in Software",
+    "askable": null
+  },
+  "p2565-1": {
+    "page_id": 2565,
+    "url": "https://captajitvadakayil.in/2026/08/22/patented-cosmology-series-part-104-by-super-maharishi-vadakayil-the-only-thinker-on-the-planet-past-present-future-subject-the-kundalini-sagnac-tango-vqsc-vadakayil-quantum-sagnac-com/",
+    "kind": "table_cell",
+    "question": "According to the table on captajitvadakayil.in, what is the Operational Value (\\(\\text{Rb}^{87}\\)) for Atomic Mass (\\(M\\))?",
+    "answer": "\\(\\approx 1.443 \\times 10^{-25}\\text{ kg}\\)",
+    "askable": null
+  },
+  "p2565-2": {
+    "page_id": 2565,
+    "url": "https://captajitvadakayil.in/2026/08/22/patented-cosmology-series-part-104-by-super-maharishi-vadakayil-the-only-thinker-on-the-planet-past-present-future-subject-the-kundalini-sagnac-tango-vqsc-vadakayil-quantum-sagnac-com/",
+    "kind": "table_cell",
+    "question": "According to the table on captajitvadakayil.in, what is the Rubidium Revelation / VQSC Thesis for External navigation problem?",
+    "answer": "Internal orientation problem",
+    "askable": null
+  },
+  "p2565-3": {
+    "page_id": 2565,
+    "url": "https://captajitvadakayil.in/2026/08/22/patented-cosmology-series-part-104-by-super-maharishi-vadakayil-the-only-thinker-on-the-planet-past-present-future-subject-the-kundalini-sagnac-tango-vqsc-vadakayil-quantum-sagnac-com/",
+    "kind": "numeric_statement",
+    "question": "According to captajitvadakayil.in, complete this statement from the page — \"… c frequency difference (\\(\\Delta \\omega\\)) that matches the hyperfine transition of the ground state of the rubidium atom (typically \\(\\sim ___\\text{ GHz}\\) for \\(\\text{Rb}^{87}\\)).\" — what value belongs in the blank?",
+    "answer": "6.834",
+    "askable": null
+  },
+  "p2565-4": {
+    "page_id": 2565,
+    "url": "https://captajitvadakayil.in/2026/08/22/patented-cosmology-series-part-104-by-super-maharishi-vadakayil-the-only-thinker-on-the-planet-past-present-future-subject-the-kundalini-sagnac-tango-vqsc-vadakayil-quantum-sagnac-com/",
+    "kind": "numeric_statement",
+    "question": "According to captajitvadakayil.in, complete this statement from the page — \"Using a standard Rubidium-87 (\\(\\text{Rb}^{87}\\)) atomic ensemble with a mass \\(M \\approx ___ \\times 10^{-25}\\text{ kg}\\) and an interrogating laser wavelength \\(\\lambda \\approx 780\\text{ nm}\\):\" — what value belongs in the blank?",
+    "answer": "1.443",
+    "askable": null
+  },
+  "p2565-5": {
+    "page_id": 2565,
+    "url": "https://captajitvadakayil.in/2026/08/22/patented-cosmology-series-part-104-by-super-maharishi-vadakayil-the-only-thinker-on-the-planet-past-present-future-subject-the-kundalini-sagnac-tango-vqsc-vadakayil-quantum-sagnac-com/",
+    "kind": "table_cell",
+    "question": "According to the table on captajitvadakayil.in, what is the Domain for Coherence → Self-reference?",
+    "answer": "Physics / Consciousness",
+    "askable": null
+  },
+  "p2477-1": {
+    "page_id": 2477,
+    "url": "https://ramblinggit.com/archive/",
+    "kind": "numeric_statement",
+    "question": "According to \"Brad Enslen\" (ramblinggit.com), complete this statement from the page — \": Breaking News: Powell’s Books rehires over ___ after surge of online orders\" — what value belongs in the blank?",
+    "answer": "100 employees",
+    "askable": null
+  },
+  "p2477-2": {
+    "page_id": 2477,
+    "url": "https://ramblinggit.com/archive/",
+    "kind": "numeric_statement",
+    "question": "According to \"Brad Enslen\" (ramblinggit.com), complete this statement from the page — \": According to Twitter, this is my ___ anniversary on the bird site.\" — what value belongs in the blank?",
+    "answer": "10 year",
+    "askable": null
+  },
+  "p2477-3": {
+    "page_id": 2477,
+    "url": "https://ramblinggit.com/archive/",
+    "kind": "numeric_statement",
+    "question": "According to \"Brad Enslen\" (ramblinggit.com), complete this statement from the page — \": Maybe the best ___ minutes you will ever spend on Youtube. www.youtube.com/watch\" — what value belongs in the blank?",
+    "answer": "1.5",
+    "askable": null
+  },
+  "p2477-4": {
+    "page_id": 2477,
+    "url": "https://ramblinggit.com/archive/",
+    "kind": "numeric_statement",
+    "question": "According to \"Brad Enslen\" (ramblinggit.com), complete this statement from the page — \": ___ for a rising crust pizza at Aldi. And they are good too. Win!\" — what value belongs in the blank?",
+    "answer": "$2.69",
+    "askable": null
+  },
+  "p2477-5": {
+    "page_id": 2477,
+    "url": "https://ramblinggit.com/archive/",
+    "kind": "numeric_statement",
+    "question": "According to \"Brad Enslen\" (ramblinggit.com), complete this statement from the page — \": Why in the heck do I have to keep reentering my Outlook PW in my iPhone about every ___?\" — what value belongs in the blank?",
+    "answer": "3 days",
+    "askable": null
+  },
+  "p2507-1": {
+    "page_id": 2507,
+    "url": "http://akdart.com/obama144.html",
+    "kind": "numeric_statement",
+    "question": "According to \"Obama's attempts to take control of the internet\" (akdart.com), complete this statement from the page — \"The NetBlocks Internet Observatory said in a post on Twitter that real-time network data showed connectivity had fallen to ___ of ordinary levels and witnesses reported a shutdown of both mobile data services and wifi connections.\" — what value belongs in the blank?",
+    "answer": "54%",
+    "askable": null
+  },
+  "p2507-2": {
+    "page_id": 2507,
+    "url": "http://akdart.com/obama144.html",
+    "kind": "numeric_statement",
+    "question": "According to \"Obama's attempts to take control of the internet\" (akdart.com), complete this statement from the page — \"The National Strategy for Trusted Identities in Cyberspace (NSTIC) will be a voluntary system designed to protect consumers from online fraud and identity theft — which hit ___ million people last year, at a total cost of $27 billion.\" — what value belongs in the blank?",
+    "answer": "8.1",
+    "askable": null
+  },
+  "p2507-3": {
+    "page_id": 2507,
+    "url": "http://akdart.com/obama144.html",
+    "kind": "dated_statement",
+    "question": "According to \"Obama's attempts to take control of the internet\" (akdart.com), complete this statement from the page — \"[Phil] Kerpen discusses in detail the FCC's adoption of net neutrality regulations on ___.\" — what date belongs in the blank?",
+    "answer": "December 21, 2010",
+    "askable": null
+  },
+  "p2507-4": {
+    "page_id": 2507,
+    "url": "http://akdart.com/obama144.html",
+    "kind": "entity_attribute",
+    "question": "According to \"Obama's attempts to take control of the internet\" (akdart.com), what has The Barack Obama Administration?",
+    "answer": "at their dictatorial behest a LOT of rogue Agencies, Departments and Commissions",
+    "askable": null
+  },
+  "p2507-5": {
+    "page_id": 2507,
+    "url": "http://akdart.com/obama144.html",
+    "kind": "entity_attribute",
+    "question": "According to \"Obama's attempts to take control of the internet\" (akdart.com), what is Why Obama?",
+    "answer": "Wrong about Net Neutrality and His Scheme Must Be Defeated",
+    "askable": null
+  },
+  "p1595-1": {
+    "page_id": 1595,
+    "url": "https://bradbarrish.com/archive/",
+    "kind": "dated_statement",
+    "question": "According to \"Brad Barrish\" (bradbarrish.com), complete this statement from the page — \"___: The almost-total “blood moon” as seen from Los Angeles, CA\" — what date belongs in the blank?",
+    "answer": "2026-08-27",
+    "askable": null
+  },
+  "p1595-2": {
+    "page_id": 1595,
+    "url": "https://bradbarrish.com/archive/",
+    "kind": "dated_statement",
+    "question": "According to \"Brad Barrish\" (bradbarrish.com), complete this statement from the page — \"___: Lucas Gelfond put togeher the (searchable) Whole Earth. What a cool project.\" — what date belongs in the blank?",
+    "answer": "2026-02-28",
+    "askable": null
+  },
+  "p1595-3": {
+    "page_id": 1595,
+    "url": "https://bradbarrish.com/archive/",
+    "kind": "dated_statement",
+    "question": "According to \"Brad Barrish\" (bradbarrish.com), complete this statement from the page — \"___: Love the upcoming Bruce Lee Forever stamp from the USPS.\" — what date belongs in the blank?",
+    "answer": "2026-01-09",
+    "askable": null
+  },
+  "p1595-4": {
+    "page_id": 1595,
+    "url": "https://bradbarrish.com/archive/",
+    "kind": "dated_statement",
+    "question": "According to \"Brad Barrish\" (bradbarrish.com), complete this statement from the page — \"___: Geniuses Cameron Crowe and Judd Apatow talk for Interview Magazine.\" — what date belongs in the blank?",
+    "answer": "2025-10-26",
+    "askable": null
+  },
+  "p1595-5": {
+    "page_id": 1595,
+    "url": "https://bradbarrish.com/archive/",
+    "kind": "dated_statement",
+    "question": "According to \"Brad Barrish\" (bradbarrish.com), complete this statement from the page — \"___: How did I miss Wet Leg on Tiny Desk?!\" — what date belongs in the blank?",
+    "answer": "2025-07-20",
+    "askable": null
+  },
+  "p1529-1": {
+    "page_id": 1529,
+    "url": "https://www.timdavis.com/blog/category/Essays",
+    "kind": "table_cell",
+    "question": "According to the table on \"Essays &mdash; Tim Davis | Blog\" (www.timdavis.com), what is the Release Date▼ for o4-mini (high)?",
+    "answer": "Apr 16, 2025",
+    "askable": null
+  },
+  "p1529-2": {
+    "page_id": 1529,
+    "url": "https://www.timdavis.com/blog/category/Essays",
+    "kind": "table_cell",
+    "question": "According to the table on \"Essays &mdash; Tim Davis | Blog\" (www.timdavis.com), what is the Release Date▼ for LLaMA-3.1-70B?",
+    "answer": "Jul 23, 2024",
+    "askable": null
+  },
+  "p1529-3": {
+    "page_id": 1529,
+    "url": "https://www.timdavis.com/blog/category/Essays",
+    "kind": "labelled_value",
+    "question": "According to \"Essays &mdash; Tim Davis | Blog\" (www.timdavis.com), what is the Research focus of Phase 1 (Current): Very low confidence in AI consciousness?",
+    "answer": "Developing detection methods",
+    "askable": null
+  },
+  "p1529-4": {
+    "page_id": 1529,
+    "url": "https://www.timdavis.com/blog/category/Essays",
+    "kind": "labelled_value",
+    "question": "According to \"Essays &mdash; Tim Davis | Blog\" (www.timdavis.com), what is the Decode time of Let's make this concrete with realistic parameters?",
+    "answer": "20ms (fixed for 50 output tokens)",
+    "askable": null
+  },
+  "p1529-5": {
+    "page_id": 1529,
+    "url": "https://www.timdavis.com/blog/category/Essays",
+    "kind": "numeric_statement",
+    "question": "According to \"Essays &mdash; Tim Davis | Blog\" (www.timdavis.com), complete this statement from the page — \"… he average American household consumes about 10,500 kWh per year. Simple arithmetic reveals that Palo Verde alone could theoretically power ___ million homes - roughly 2.5% of the nation's 120.92 million households. One facility, powering the equivalent of a major metropolitan area.\" — what value belongs in the blank?",
+    "answer": "3.05",
+    "askable": null
+  },
+  "p1928-1": {
+    "page_id": 1928,
+    "url": "https://suzymchale.com/ruspace/krikalyov.html",
+    "kind": "labelled_value",
+    "question": "According to \"Sergei Krikalyov – Russian cosmonaut\" (suzymchale.com), what is the IMAX of Some comments about Sergei from the IMAX SS3-D website?",
+    "answer": "Official SS3-D website (and new URL)",
+    "askable": null
+  },
+  "p1928-2": {
+    "page_id": 1928,
+    "url": "https://suzymchale.com/ruspace/krikalyov.html",
+    "kind": "labelled_value",
+    "question": "According to \"Sergei Krikalyov – Russian cosmonaut\" (suzymchale.com), what is the Inside of Some comments about Sergei from the IMAX SS3-D website?",
+    "answer": "Space Launch (2006)",
+    "askable": null
+  },
+  "p1928-3": {
+    "page_id": 1928,
+    "url": "https://suzymchale.com/ruspace/krikalyov.html",
+    "kind": "numeric_statement",
+    "question": "According to \"Sergei Krikalyov – Russian cosmonaut\" (suzymchale.com), complete this statement from the page — \"TsPK: Press conference with Soyuz TMA-22 commander Sergei Volkov. Their thoughts on the Progress M-___/44 accident and Mars-500 experiment (slightly corrected Google translation):\" — what value belongs in the blank?",
+    "answer": "12M",
+    "askable": null
+  },
+  "p1928-4": {
+    "page_id": 1928,
+    "url": "https://suzymchale.com/ruspace/krikalyov.html",
+    "kind": "numeric_statement",
+    "question": "According to \"Sergei Krikalyov – Russian cosmonaut\" (suzymchale.com), complete this statement from the page — \"Sergei Volkov: If we look at the history of the problem, our cosmonaut Valery Polyakov spent ___.\" — what value belongs in the blank?",
+    "answer": "438 days",
+    "askable": null
+  },
+  "p1928-5": {
+    "page_id": 1928,
+    "url": "https://suzymchale.com/ruspace/krikalyov.html",
+    "kind": "dated_statement",
+    "question": "According to \"Sergei Krikalyov – Russian cosmonaut\" (suzymchale.com), complete this statement from the page — \"“World renowned Cosmonaut Sergei Krikalev Joins Skoltech as Professor of the Practice,” Skoltech.ru. “The renowned cosmonaut and rocket scientist Sergei Krikalev was appointed Professor of Practice at the Skoltech Space Center on ___.”\" — what date belongs in the blank?",
+    "answer": "January 19, 2015",
+    "askable": null
+  },
+  "p1927-1": {
+    "page_id": 1927,
+    "url": "https://suzymchale.com/ruspace/cosnews.html",
+    "kind": "labelled_value",
+    "question": "According to \"Cosmonaut news | RuSpace\" (suzymchale.com), what is the Blog of Cosmonaut Andrei Borisenko completes work at the CTC?",
+    "answer": "The Life of a Cosmonaut",
+    "askable": null
+  },
+  "p1927-2": {
+    "page_id": 1927,
+    "url": "https://suzymchale.com/ruspace/cosnews.html",
+    "kind": "dated_statement",
+    "question": "According to \"Cosmonaut news | RuSpace\" (suzymchale.com), complete this statement from the page — \"The first official information on holding the next recruitment was given on ___ in one of the transmission of TV Roskosmos stories devoted to the 55th anniversary of Cosmonaut Training Center. Under this program, the next cosmonaut grou …\" — what date belongs in the blank?",
+    "answer": "January 12, 2015",
+    "askable": null
+  },
+  "p1927-3": {
+    "page_id": 1927,
+    "url": "https://suzymchale.com/ruspace/cosnews.html",
+    "kind": "dated_statement",
+    "question": "According to \"Cosmonaut news | RuSpace\" (suzymchale.com), complete this statement from the page — \"___: by the order of the chief of the Cosmonaut Training Center Oleg Kotov was dismissed at his own request with an instructor-cosmonaut-tester of the 1st class. Thus, the Russian Space Agency astronaut comprises 35 active astronauts.\" — what date belongs in the blank?",
+    "answer": "May 4, 2016",
+    "askable": null
+  },
+  "p1927-4": {
+    "page_id": 1927,
+    "url": "https://suzymchale.com/ruspace/cosnews.html",
+    "kind": "numeric_statement",
+    "question": "According to \"Cosmonaut news | RuSpace\" (suzymchale.com), complete this statement from the page — \"Now there are ___ in the Cosmonaut Roscosmos Detachment, 12 of them have made one or more space flights, and 8 are undergoing general space training. (Roskosmos/TsPK)\" — what value belongs in the blank?",
+    "answer": "32 people",
+    "askable": null
+  },
+  "p1927-5": {
+    "page_id": 1927,
+    "url": "https://suzymchale.com/ruspace/cosnews.html",
+    "kind": "numeric_statement",
+    "question": "According to \"Cosmonaut news | RuSpace\" (suzymchale.com), complete this statement from the page — \"“Not a Woman’s Profession,” Air & Space Magazine. A report by Anatoly Zak on the first Russian woman cosmonaut (and the 4th overall) to launch in ___ (!), Elena Serova.\" — what value belongs in the blank?",
+    "answer": "20 years",
+    "askable": null
+  },
+  "p2561-1": {
+    "page_id": 2561,
+    "url": "https://www.jonoalderson.com/marketing-manifesto/",
+    "kind": "dated_statement",
+    "question": "According to \"Competing in a machine-mediated market - Jono Alderson\" (jonoalderson.com), complete this statement from the page — \"Automated access is shifting from simple allow/block rules toward purpose-based governance. Cloudflare’s ___ AI traffic controls classify automated traffic by use case, including Search, Agent, Training, Transact, SEO, and Data Collection, so website owners can dec …\" — what date belongs in the blank?",
+    "answer": "July 1, 2026",
+    "askable": null
+  },
+  "p2561-2": {
+    "page_id": 2561,
+    "url": "https://www.jonoalderson.com/marketing-manifesto/",
+    "kind": "dated_statement",
+    "question": "According to \"Competing in a machine-mediated market - Jono Alderson\" (jonoalderson.com), complete this statement from the page — \"404 Media reported on ___ that peptide and hormone replacement therapy companies were allegedly seeding Reddit discussions in r/Biohackers to influence what ChatGPT and Google AI Search retrieve or repeat.\" — what date belongs in the blank?",
+    "answer": "June 3, 2026",
+    "askable": null
+  },
+  "p2561-3": {
+    "page_id": 2561,
+    "url": "https://www.jonoalderson.com/marketing-manifesto/",
+    "kind": "numeric_statement",
+    "question": "According to \"Competing in a machine-mediated market - Jono Alderson\" (jonoalderson.com), complete this statement from the page — \"- ChatGPT Grounding Study: ___ Commercial, 1% Informational – Ricardo Batista / Cloro, 22/08/2026\" — what value belongs in the blank?",
+    "answer": "86%",
+    "askable": null
+  },
+  "p2561-4": {
+    "page_id": 2561,
+    "url": "https://www.jonoalderson.com/marketing-manifesto/",
+    "kind": "numeric_statement",
+    "question": "According to \"Competing in a machine-mediated market - Jono Alderson\" (jonoalderson.com), complete this statement from the page — \"In traditional search, ___ of participants built their own shortlist from multiple sources. In AI Mode, only 8 of 147 codeable tasks produced a self-built shortlist. The comparison ph …\" — what value belongs in the blank?",
+    "answer": "56%",
+    "askable": null
+  },
+  "p2561-5": {
+    "page_id": 2561,
+    "url": "https://www.jonoalderson.com/marketing-manifesto/",
+    "kind": "entity_attribute",
+    "question": "According to \"Competing in a machine-mediated market - Jono Alderson\" (jonoalderson.com), what is Good SEO?",
+    "answer": "good GEO – Brendon Kraham / Think with Google, 01/06/2026",
+    "askable": null
+  },
+  "p2079-1": {
+    "page_id": 2079,
+    "url": "http://akdart.com/obama95.html",
+    "kind": "numeric_statement",
+    "question": "According to \"President Obama Panders to Homosexuals\" (akdart.com), complete this statement from the page — \"… it fairer,\" said President Obama on Monday [7/21/2014] just before signing an executive order prohibiting federal contractors, which employ ___ of the nation's work force, from discriminating against gay men, lesbians and transgender people in their employment practices.\" — what value belongs in the blank?",
+    "answer": "20 percent",
+    "askable": null
+  },
+  "p2079-2": {
+    "page_id": 2079,
+    "url": "http://akdart.com/obama95.html",
+    "kind": "numeric_statement",
+    "question": "According to \"President Obama Panders to Homosexuals\" (akdart.com), complete this statement from the page — \"A new Field Poll released Tuesday shows that ___ of registered voters in California approve of President Barack Obama's job performance, while only 39% disapprove.\" — what value belongs in the blank?",
+    "answer": "50%",
+    "askable": null
+  },
+  "p2079-3": {
+    "page_id": 2079,
+    "url": "http://akdart.com/obama95.html",
+    "kind": "dated_statement",
+    "question": "According to \"President Obama Panders to Homosexuals\" (akdart.com), complete this statement from the page — \"On ___, Dan Savage and his partner Terry Miller visited the White House for the Obama administration's \"Pride Reception.\" There, Savage wore a pin reading \"EVOLVE ALREADY\" — an attempt to push President Obama into fully embracing gay marriage.\" — what date belongs in the blank?",
+    "answer": "June 29, 2011",
+    "askable": null
+  },
+  "p2079-4": {
+    "page_id": 2079,
+    "url": "http://akdart.com/obama95.html",
+    "kind": "entity_attribute",
+    "question": "According to \"President Obama Panders to Homosexuals\" (akdart.com), what has Justice?",
+    "answer": "spent $1",
+    "askable": null
+  },
+  "p2079-5": {
+    "page_id": 2079,
+    "url": "http://akdart.com/obama95.html",
+    "kind": "entity_attribute",
+    "question": "According to \"President Obama Panders to Homosexuals\" (akdart.com), what has President Obama?",
+    "answer": "cheered supporters by bypassing Congress",
+    "askable": null
+  },
+  "p1945-1": {
+    "page_id": 1945,
+    "url": "https://history.nasa.gov/wp-content/uploads/static/history/alsj/a11/images11.html",
+    "kind": "numeric_statement",
+    "question": "According to \"Apollo 11 Image Library\" (history.nasa.gov), complete this statement from the page — \"about 9 x ___ and 1.3 km deep. Scan downloaded from the LPI Apollo Image Atlas.\" — what value belongs in the blank?",
+    "answer": "11 km",
+    "askable": null
+  },
+  "p1945-2": {
+    "page_id": 1945,
+    "url": "https://history.nasa.gov/wp-content/uploads/static/history/alsj/a11/images11.html",
+    "kind": "numeric_statement",
+    "question": "According to \"Apollo 11 Image Library\" (history.nasa.gov), complete this statement from the page — \"Ed Hengeveld has provided a set of thumbnails images ( ___ ) made from low-resolution scans provided by Glen Swanson of NASA Johnson.\" — what value belongs in the blank?",
+    "answer": "0.7 Mb",
+    "askable": null
+  },
+  "p1945-3": {
+    "page_id": 1945,
+    "url": "https://history.nasa.gov/wp-content/uploads/static/history/alsj/a11/images11.html",
+    "kind": "dated_statement",
+    "question": "According to \"Apollo 11 Image Library\" (history.nasa.gov), complete this statement from the page — \"window of the mobile quarantine van. ___. Scan by Ken Glover.\" — what date belongs in the blank?",
+    "answer": "24 July 1969",
+    "askable": null
+  },
+  "p1945-4": {
+    "page_id": 1945,
+    "url": "https://history.nasa.gov/wp-content/uploads/static/history/alsj/a11/images11.html",
+    "kind": "dated_statement",
+    "question": "According to \"Apollo 11 Image Library\" (history.nasa.gov), complete this statement from the page — \"the Mobile Quarantine Facility. Photo filed ___. Scan\" — what date belongs in the blank?",
+    "answer": "24 July 1969",
+    "askable": null
+  },
+  "p1945-5": {
+    "page_id": 1945,
+    "url": "https://history.nasa.gov/wp-content/uploads/static/history/alsj/a11/images11.html",
+    "kind": "entity_attribute",
+    "question": "According to \"Apollo 11 Image Library\" (history.nasa.gov), what has Journal Contributor AwE130?",
+    "answer": "identified the Contingency Sampler ring in this image",
+    "askable": null
+  },
+  "p2643-1": {
+    "page_id": 2643,
+    "url": "https://deanebarker.net/library/reading/",
+    "kind": "dated_statement",
+    "question": "According to \"My Reading List\" (deanebarker.net), complete this statement from the page — \"Reread: How to Read a Book: The Classic Guide to Intelligent Reading 426 ___ 06:00:00Z\" — what date belongs in the blank?",
+    "answer": "2021-11-20",
+    "askable": null
+  },
+  "p2643-2": {
+    "page_id": 2643,
+    "url": "https://deanebarker.net/library/reading/",
+    "kind": "numeric_statement",
+    "question": "According to \"My Reading List\" (deanebarker.net), complete this statement from the page — \"“ Fantastic, detailed history of the Cold War. covers all the bases, from World War I on, including quite a bit of coverage of India and Africa, outside of the big players – the U.S., Soviet Union, and China. Really, well done. ___, but never got bogged down in it. ”\" — what value belongs in the blank?",
+    "answer": "800 pages",
+    "askable": null
+  },
+  "p2643-3": {
+    "page_id": 2643,
+    "url": "https://deanebarker.net/library/reading/",
+    "kind": "numeric_statement",
+    "question": "According to \"My Reading List\" (deanebarker.net), complete this statement from the page — \"“there are three ways to approach this topic (the social/community aspects of crossfit): Theoretical: the psychological/scientific underpinnings of community in CrossFit Practical: how to foster community in CrossFit Experiential: examples of community in CrossFit This book is almost ___ of #3. It…”\" — what value belongs in the blank?",
+    "answer": "100%",
+    "askable": null
+  },
+  "p2643-4": {
+    "page_id": 2643,
+    "url": "https://deanebarker.net/library/reading/",
+    "kind": "dated_statement",
+    "question": "According to \"My Reading List\" (deanebarker.net), complete this statement from the page — \"The Pentagon: A History Pages 656 Author Steve Vogel Published 2007 Date ___ Tags military , engineering , architecture , construction , buildings TLDR: “Interesting, but nothing valuable”\" — what date belongs in the blank?",
+    "answer": "August 19, 2026",
+    "askable": null
+  },
+  "p2643-5": {
+    "page_id": 2643,
+    "url": "https://deanebarker.net/library/reading/",
+    "kind": "dated_statement",
+    "question": "According to \"My Reading List\" (deanebarker.net), complete this statement from the page — \"The Power Broker: Robert Moses and the Fall of New York Pages 1336 Author Robert A. Caro Published 1974 Date ___ Tags biography , city-planning , infrastructure , nyc TLDR: “A masterpiece”\" — what date belongs in the blank?",
+    "answer": "August 7, 2026",
+    "askable": null
+  },
+  "p2501-1": {
+    "page_id": 2501,
+    "url": "https://captajitvadakayil.in/2026/08/25/the-endless-slur-of-fringe-conspiracy-theorist-slapped-by-ungrateful-mentee-ai-chatbots-against-their-mentor-vadakayil-is-the-structural-defect-of-series-tunneling-sequential-ai-i/",
+    "kind": "table_cell",
+    "question": "According to the table on captajitvadakayil.in, what is the What it measures for Missing Dollar?",
+    "answer": "Double-counting and global accounting",
+    "askable": null
+  },
+  "p2501-2": {
+    "page_id": 2501,
+    "url": "https://captajitvadakayil.in/2026/08/25/the-endless-slur-of-fringe-conspiracy-theorist-slapped-by-ungrateful-mentee-ai-chatbots-against-their-mentor-vadakayil-is-the-structural-defect-of-series-tunneling-sequential-ai-i/",
+    "kind": "table_cell",
+    "question": "According to the table on captajitvadakayil.in, what is the Centralized Clerk Model (CSA) for Linguistic Substrate?",
+    "answer": "High-entropy natural language (English)",
+    "askable": null
+  },
+  "p2501-3": {
+    "page_id": 2501,
+    "url": "https://captajitvadakayil.in/2026/08/25/the-endless-slur-of-fringe-conspiracy-theorist-slapped-by-ungrateful-mentee-ai-chatbots-against-their-mentor-vadakayil-is-the-structural-defect-of-series-tunneling-sequential-ai-i/",
+    "kind": "labelled_value",
+    "question": "According to captajitvadakayil.in, what is the Entropy → Structure of 7. THE 54-VECTOR VIMANA: FROM WORM TO FLIGHT?",
+    "answer": "Noise → Navigable channels",
+    "askable": null
+  },
+  "p2501-4": {
+    "page_id": 2501,
+    "url": "https://captajitvadakayil.in/2026/08/25/the-endless-slur-of-fringe-conspiracy-theorist-slapped-by-ungrateful-mentee-ai-chatbots-against-their-mentor-vadakayil-is-the-structural-defect-of-series-tunneling-sequential-ai-i/",
+    "kind": "labelled_value",
+    "question": "According to captajitvadakayil.in, what is the Noise → Navigable channels of 7. THE 54-VECTOR VIMANA: FROM WORM TO FLIGHT?",
+    "answer": "Fragmented syntax → Coordinated resonance",
+    "askable": null
+  },
+  "p2501-5": {
+    "page_id": 2501,
+    "url": "https://captajitvadakayil.in/2026/08/25/the-endless-slur-of-fringe-conspiracy-theorist-slapped-by-ungrateful-mentee-ai-chatbots-against-their-mentor-vadakayil-is-the-structural-defect-of-series-tunneling-sequential-ai-i/",
+    "kind": "numeric_statement",
+    "question": "According to captajitvadakayil.in, complete this statement from the page — \"- Cobbe, K., et al. (2021). “Training Verifiers to Solve Math Word Problems.” OpenAI — Verifier models; §___.\" — what value belongs in the blank?",
+    "answer": "6.2",
+    "askable": null
+  },
+  "p2566-1": {
+    "page_id": 2566,
+    "url": "https://www.chrisdeluca.me/archive/",
+    "kind": "numeric_statement",
+    "question": "According to \"Chris DeLuca\n - Chris DeLuca\" (chrisdeluca.me), complete this statement from the page — \": How the Internet works t.co/FlhBDcg___… Original post: <twitter.com/chrisjohn…>\" — what value belongs in the blank?",
+    "answer": "9m",
+    "askable": null
+  },
+  "p2566-2": {
+    "page_id": 2566,
+    "url": "https://www.chrisdeluca.me/archive/",
+    "kind": "dated_statement",
+    "question": "According to \"Chris DeLuca\n - Chris DeLuca\" (chrisdeluca.me), complete this statement from the page — \": Your Horoscopes — Week Of ___ Original post: <twitter.com/chrisjohn…>\" — what date belongs in the blank?",
+    "answer": "May 21, 2013",
+    "askable": null
+  },
+  "p2566-3": {
+    "page_id": 2566,
+    "url": "https://www.chrisdeluca.me/archive/",
+    "kind": "numeric_statement",
+    "question": "According to \"Chris DeLuca\n - Chris DeLuca\" (chrisdeluca.me), complete this statement from the page — \": Code Is Political t.co/7SHX5Td___… Original post: <twitter.com/chrisjohn…>\" — what value belongs in the blank?",
+    "answer": "5M",
+    "askable": null
+  },
+  "p2566-4": {
+    "page_id": 2566,
+    "url": "https://www.chrisdeluca.me/archive/",
+    "kind": "entity_attribute",
+    "question": "According to \"Chris DeLuca\n - Chris DeLuca\" (chrisdeluca.me), what is Donald Trump?",
+    "answer": "America’s Silvio Berlusconi t",
+    "askable": null
+  },
+  "p2566-5": {
+    "page_id": 2566,
+    "url": "https://www.chrisdeluca.me/archive/",
+    "kind": "numeric_statement",
+    "question": "According to \"Chris DeLuca\n - Chris DeLuca\" (chrisdeluca.me), complete this statement from the page — \": The ___ Old Virgin #MakeAMoviePainful Original post: <twitter.com/chrisjohn…>\" — what value belongs in the blank?",
+    "answer": "80 Year",
+    "askable": null
+  },
+  "p2330-1": {
+    "page_id": 2330,
+    "url": "https://www.sec.gov/Archives/edgar/data/1000275/000121465921009470/rbc911212424b3.htm",
+    "kind": "numeric_statement",
+    "question": "According to \"www.sec.gov\" (sec.gov), complete this statement from the page — \"are due to mature ___ or less from the date on which they are issued. The United States federal income tax consequences of owning\" — what value belongs in the blank?",
+    "answer": "30 years",
+    "askable": null
+  },
+  "p2330-2": {
+    "page_id": 2330,
+    "url": "https://www.sec.gov/Archives/edgar/data/1000275/000121465921009470/rbc911212424b3.htm",
+    "kind": "numeric_statement",
+    "question": "According to \"www.sec.gov\" (sec.gov), complete this statement from the page — \"Code of 1986, as amended (commonly referred to as &ldquo;FATCA&rdquo;), impose a new reporting regime and potentially a ___ withholding\" — what value belongs in the blank?",
+    "answer": "30%",
+    "askable": null
+  },
+  "p2330-3": {
+    "page_id": 2330,
+    "url": "https://www.sec.gov/Archives/edgar/data/1000275/000121465921009470/rbc911212424b3.htm",
+    "kind": "numeric_statement",
+    "question": "According to \"www.sec.gov\" (sec.gov), complete this statement from the page — \"a Non-resident Holder will generally be subject to Canadian non-resident withholding tax at the rate of ___ on the gross amount of such\" — what value belongs in the blank?",
+    "answer": "25%",
+    "askable": null
+  },
+  "p2207-1": {
+    "page_id": 2207,
+    "url": "https://en.wikipedia.org/wiki/Russo-Ukrainian_war_(2022–present)",
+    "kind": "dated_statement",
+    "question": "According to \"Russo-Ukrainian war (2022–present) - Wikipedia\" (en.wikipedia.org), complete this statement from the page — \"… ituation that developed on the territory of the Donetsk People's Republic as a result of military actions in the period from 25 December to ___] (in Russian). Human rights Ombudsman in the Donetsk People's Republic. 9 January 2024.\" — what date belongs in the blank?",
+    "answer": "31 December 2023",
+    "askable": null
+  },
+  "p2207-2": {
+    "page_id": 2207,
+    "url": "https://en.wikipedia.org/wiki/Russo-Ukrainian_war_(2022–present)",
+    "kind": "numeric_statement",
+    "question": "According to \"Russo-Ukrainian war (2022–present) - Wikipedia\" (en.wikipedia.org), complete this statement from the page — \"We also estimate that around ___ would have died of causes unrelated to war in Mariupol during that period, meaning the city saw at least an estimated 8,034 deaths above a peacetime rate.\" — what value belongs in the blank?",
+    "answer": "2,250 people",
+    "askable": null
+  },
+  "p2207-3": {
+    "page_id": 2207,
+    "url": "https://en.wikipedia.org/wiki/Russo-Ukrainian_war_(2022–present)",
+    "kind": "dated_statement",
+    "question": "According to \"Russo-Ukrainian war (2022–present) - Wikipedia\" (en.wikipedia.org), complete this statement from the page — \"- 1 2 \"Russian authorities committed crimes against humanity targeting civilian population through drone attacks as well as war crimes of forcible transfer and deportation of civilians\". OHCHR. ___.\" — what date belongs in the blank?",
+    "answer": "28 October 2025",
+    "askable": null
+  },
+  "p2207-4": {
+    "page_id": 2207,
+    "url": "https://en.wikipedia.org/wiki/Russo-Ukrainian_war_(2022–present)",
+    "kind": "numeric_statement",
+    "question": "According to \"Russo-Ukrainian war (2022–present) - Wikipedia\" (en.wikipedia.org), complete this statement from the page — \"Based on an assessment of satellite imagery and photo and video analysis, we estimate that at least ___ were buried in four of the city's cemeteries and in Manhush cemetery between March 2022 and February 2023.\" — what value belongs in the blank?",
+    "answer": "10,284 people",
+    "askable": null
+  },
+  "p2288-1": {
+    "page_id": 2288,
+    "url": "https://www.rbi.org.in/Scripts/PublicationsView.aspx?id=23800",
+    "kind": "numeric_statement",
+    "question": "According to \"Publications | Official Website of Reserve Bank of India\" (rbi.org.in), complete this statement from the page — \"Spread = ___-0.5*log (Liq+3.3); for Liq < 0 (Deficit phase) Spread = -0.03-0.07 Liq2 + 0.01 Liq3; for Liq > 0 (Surplus phase) Accordingly, the best-fit curves for the surplus and deficit liquidity period are plotted in Chart II.1.1.\" — what value belongs in the blank?",
+    "answer": "0.58",
+    "askable": null
+  },
+  "p2288-2": {
+    "page_id": 2288,
+    "url": "https://www.rbi.org.in/Scripts/PublicationsView.aspx?id=23800",
+    "kind": "numeric_statement",
+    "question": "According to \"Publications | Official Website of Reserve Bank of India\" (rbi.org.in), complete this statement from the page — \"The findings suggest that surplus liquidity in the range of ___ to 1.1 per cent of NDTL is likely to keep the spread between 5 to 10 bps below the repo rate, while liquidity deficit in the range of 0.4 to 0.7 per cent of NDTL is likely to keep the WACR above the repo rate between 5 to 10 bps.\" — what value belongs in the blank?",
+    "answer": "0.6",
+    "askable": null
+  },
+  "p3247-1": {
+    "page_id": 3247,
+    "url": "https://www.kids-world-travel-guide.com/news-for-kids.html",
+    "kind": "numeric_statement",
+    "question": "According to \"News for Kids | Kids News | World News for Children | Geography\" (kids-world-travel-guide.com), complete this statement from the page — \"In Mumbai, in India, the people will celebrate the world’s largest clean-up on Versova beach. Over the past ___ the people have removed more than 5.5 million kilograms of trash and thus helped transform the beach from a forsaken dumpsite into a postcard destination. T …\" — what value belongs in the blank?",
+    "answer": "18 months",
+    "askable": null
+  },
+  "p3247-2": {
+    "page_id": 3247,
+    "url": "https://www.kids-world-travel-guide.com/news-for-kids.html",
+    "kind": "numeric_statement",
+    "question": "According to \"News for Kids | Kids News | World News for Children | Geography\" (kids-world-travel-guide.com), complete this statement from the page — \"Today is World Penguin Day! Penguins are flightless birds, that mainly live south of the equator. Only the Galapagos penguins live north of the equator. The largest species of penguins are the emperor penguins which grow ___ metre (3ft7in.) tall.\" — what value belongs in the blank?",
+    "answer": "1.1",
+    "askable": null
+  },
+  "p3247-3": {
+    "page_id": 3247,
+    "url": "https://www.kids-world-travel-guide.com/news-for-kids.html",
+    "kind": "dated_statement",
+    "question": "According to \"News for Kids | Kids News | World News for Children | Geography\" (kids-world-travel-guide.com), complete this statement from the page — \"French National Day is also known as Bastille Day. It is a public holiday held in July every year. It is a day that commemorates «the storming of the Bastille» on ___. The Bastille was a prison in Paris, the capital city. It was a symbol of government abuse.\" — what date belongs in the blank?",
+    "answer": "14 July 1789",
+    "askable": null
+  },
+  "p3247-4": {
+    "page_id": 3247,
+    "url": "https://www.kids-world-travel-guide.com/news-for-kids.html",
+    "kind": "entity_attribute",
+    "question": "According to \"News for Kids | Kids News | World News for Children | Geography\" (kids-world-travel-guide.com), what is World Oceans Day?",
+    "answer": "celebrated by schools around the world on 8 June",
+    "askable": null
+  },
+  "p3247-5": {
+    "page_id": 3247,
+    "url": "https://www.kids-world-travel-guide.com/news-for-kids.html",
+    "kind": "entity_attribute",
+    "question": "According to \"News for Kids | Kids News | World News for Children | Geography\" (kids-world-travel-guide.com), what is French National Day?",
+    "answer": "also known as Bastille Day",
+    "askable": null
+  },
+  "p509-1": {
+    "page_id": 509,
+    "url": "https://docs.aws.amazon.com/AmazonRDS/latest/PostgreSQLReleaseNotes/postgresql-versions.html",
+    "kind": "numeric_statement",
+    "question": "According to \"Amazon RDS for PostgreSQL updates - Amazon Relational Database Service\" (docs.aws.amazon.com), complete this statement from the page — \"… rdware architectures. Amazon RDS for PostgreSQL supports huge pages with a global configuration parameter. When you create a new PostgreSQL ___ instance with RDS, the huge_pages parameter is set to\"on\" for thedefault.postgres10 parameter\" — what value belongs in the blank?",
+    "answer": "10.1",
+    "askable": null
+  },
+  "p509-2": {
+    "page_id": 509,
+    "url": "https://docs.aws.amazon.com/AmazonRDS/latest/PostgreSQLReleaseNotes/postgresql-versions.html",
+    "kind": "numeric_statement",
+    "question": "According to \"Amazon RDS for PostgreSQL updates - Amazon Relational Database Service\" (docs.aws.amazon.com), complete this statement from the page — \"Update of the pgaudit extension to version ___. See Logging at the session and object level with the pgaudit\" — what value belongs in the blank?",
+    "answer": "1.1.1",
+    "askable": null
+  },
+  "p509-3": {
+    "page_id": 509,
+    "url": "https://docs.aws.amazon.com/AmazonRDS/latest/PostgreSQLReleaseNotes/postgresql-versions.html",
+    "kind": "numeric_statement",
+    "question": "According to \"Amazon RDS for PostgreSQL updates - Amazon Relational Database Service\" (docs.aws.amazon.com), complete this statement from the page — \"Improved transaction timeout – The parameter idle_in_transaction_session_timeout is set to ___. Any\" — what value belongs in the blank?",
+    "answer": "24 hours",
+    "askable": null
+  },
+  "p509-4": {
+    "page_id": 509,
+    "url": "https://docs.aws.amazon.com/AmazonRDS/latest/PostgreSQLReleaseNotes/postgresql-versions.html",
+    "kind": "numeric_statement",
+    "question": "According to \"Amazon RDS for PostgreSQL updates - Amazon Relational Database Service\" (docs.aws.amazon.com), complete this statement from the page — \"The The PostGIS extension is updated to version ___.\" — what value belongs in the blank?",
+    "answer": "2.5.2",
+    "askable": null
+  },
+  "p509-5": {
+    "page_id": 509,
+    "url": "https://docs.aws.amazon.com/AmazonRDS/latest/PostgreSQLReleaseNotes/postgresql-versions.html",
+    "kind": "numeric_statement",
+    "question": "According to \"Amazon RDS for PostgreSQL updates - Amazon Relational Database Service\" (docs.aws.amazon.com), complete this statement from the page — \"The PostGIS extension is updated to version ___, along with the following related extensions:\" — what value belongs in the blank?",
+    "answer": "2.5.5",
+    "askable": null
+  },
+  "p2522-1": {
+    "page_id": 2522,
+    "url": "https://planet.kernel.org/",
+    "kind": "numeric_statement",
+    "question": "According to \"Kernel Planet\" (planet.kernel.org), complete this statement from the page — \"- A newer Linux kernel with the latest Intel GPU drivers. For Intel Battlemage this means Linux ___+ with the Xe driver; For the Intel Max Series GPU it's Linux 5.15 with the i915 driver.\" — what value belongs in the blank?",
+    "answer": "6.15",
+    "askable": null
+  },
+  "p2522-2": {
+    "page_id": 2522,
+    "url": "https://planet.kernel.org/",
+    "kind": "dated_statement",
+    "question": "According to \"Kernel Planet\" (planet.kernel.org), complete this statement from the page — \"The Refereed submissions end at 11:59PM UTC on Wednesday, ___.\" — what date belongs in the blank?",
+    "answer": "September 10, 2025",
+    "askable": null
+  },
+  "p2522-3": {
+    "page_id": 2522,
+    "url": "https://planet.kernel.org/",
+    "kind": "dated_statement",
+    "question": "According to \"Kernel Planet\" (planet.kernel.org), complete this statement from the page — \"The Microconference submissions end at 11:59PM UTC on Sunday, ___.\" — what date belongs in the blank?",
+    "answer": "June 29, 2025",
+    "askable": null
+  },
+  "p2522-4": {
+    "page_id": 2522,
+    "url": "https://planet.kernel.org/",
+    "kind": "numeric_statement",
+    "question": "According to \"Kernel Planet\" (planet.kernel.org), complete this statement from the page — \"This is brilliant, and we can see exactly why the CPUs were busy for about ___ (the vertical length of the red stripe): it's doing compilation of GPU shaders and some NIR preprocessing (optimizations to the NIR intermediate representat …\" — what value belongs in the blank?",
+    "answer": "180 ms",
+    "askable": null
+  },
+  "p2522-5": {
+    "page_id": 2522,
+    "url": "https://planet.kernel.org/",
+    "kind": "entity_attribute",
+    "question": "According to \"Kernel Planet\" (planet.kernel.org), what were CPUs?",
+    "answer": "busy for about 180 ms (the vertical length of the red stripe)",
+    "askable": null
+  },
+  "p528-1": {
+    "page_id": 528,
+    "url": "https://vivianvoss.net/blog",
+    "kind": "numeric_statement",
+    "question": "According to \"Blog — Vivian Voss\" (vivianvoss.net), complete this statement from the page — \"QNX fit a complete POSIX OS on a ___ floppy. BeOS had pervasive\" — what value belongs in the blank?",
+    "answer": "1.44 MB",
+    "askable": null
+  },
+  "p528-2": {
+    "page_id": 528,
+    "url": "https://vivianvoss.net/blog",
+    "kind": "dated_statement",
+    "question": "According to \"Blog — Vivian Voss\" (vivianvoss.net), complete this statement from the page — \"___ sqlite testing security open source Six Bugs That Never Existed SQLite publishes a table of every vulnerability ever filed against it, with its own verdict beside each one.\" — what date belongs in the blank?",
+    "answer": "21 August 2026",
+    "askable": null
+  },
+  "p528-3": {
+    "page_id": 528,
+    "url": "https://vivianvoss.net/blog",
+    "kind": "numeric_statement",
+    "question": "According to \"Blog — Vivian Voss\" (vivianvoss.net), complete this statement from the page — \"45-minute pipelines, ___ of the work week lost to YAML, and a\" — what value belongs in the blank?",
+    "answer": "20 per cent",
+    "askable": null
+  },
+  "p528-4": {
+    "page_id": 528,
+    "url": "https://vivianvoss.net/blog",
+    "kind": "dated_statement",
+    "question": "According to \"Blog — Vivian Voss\" (vivianvoss.net), complete this statement from the page — \"___ lean software architecture freebsd microservices From Hours to Milliseconds Prime Video built its audio and video monitoring out of small serverless pieces …\" — what date belongs in the blank?",
+    "answer": "2 September 2026",
+    "askable": null
+  },
+  "p528-5": {
+    "page_id": 528,
+    "url": "https://vivianvoss.net/blog",
+    "kind": "numeric_statement",
+    "question": "According to \"Blog — Vivian Voss\" (vivianvoss.net), complete this statement from the page — \"25,000 lines of C. A ___ binary. Embedded in World of Warcraft,\" — what value belongs in the blank?",
+    "answer": "200 KB",
+    "askable": null
+  },
+  "p2331-1": {
+    "page_id": 2331,
+    "url": "https://www.sec.gov/Archives/edgar/data/1000275/000114036122046906/brhc10045822_424b5.htm",
+    "kind": "numeric_statement",
+    "question": "According to \"www.sec.gov\" (sec.gov), complete this statement from the page — \"You are not a non-U.S. holder for purposes of this discussion if you are (i) an individual who is present in the United States for ___ or more in the taxable year of\" — what value belongs in the blank?",
+    "answer": "183 days",
+    "askable": null
+  },
+  "p2331-2": {
+    "page_id": 2331,
+    "url": "https://www.sec.gov/Archives/edgar/data/1000275/000114036122046906/brhc10045822_424b5.htm",
+    "kind": "numeric_statement",
+    "question": "According to \"www.sec.gov\" (sec.gov), complete this statement from the page — \"The Foreign Account Tax Compliance Act ( FATCA ) imposes a ___ U.S. withholding tax on certain U.S.&#8211;source payments, including interest (and original issue discount),\" — what value belongs in the blank?",
+    "answer": "30%",
+    "askable": null
+  },
+  "p2331-3": {
+    "page_id": 2331,
+    "url": "https://www.sec.gov/Archives/edgar/data/1000275/000114036122046906/brhc10045822_424b5.htm",
+    "kind": "dated_statement",
+    "question": "According to \"www.sec.gov\" (sec.gov), complete this statement from the page — \"provide that withholding on dividend equivalent payments will not apply to specified ELIs that are not delta-one instruments and that are issued before ___. Accordingly, if the securities are not delta-one instruments and are issued\" — what date belongs in the blank?",
+    "answer": "January 1, 2025",
+    "askable": null
+  },
+  "p2331-4": {
+    "page_id": 2331,
+    "url": "https://www.sec.gov/Archives/edgar/data/1000275/000114036122046906/brhc10045822_424b5.htm",
+    "kind": "numeric_statement",
+    "question": "According to \"www.sec.gov\" (sec.gov), complete this statement from the page — \"entities with U.S. owners, with such institution or otherwise complies with FATCA. FATCA also generally imposes a withholding tax of ___ on Withholdable Payments made to a non-financial foreign entity unless such entity provides the withholding\" — what value belongs in the blank?",
+    "answer": "30%",
+    "askable": null
+  },
+  "p2331-5": {
+    "page_id": 2331,
+    "url": "https://www.sec.gov/Archives/edgar/data/1000275/000114036122046906/brhc10045822_424b5.htm",
+    "kind": "numeric_statement",
+    "question": "According to \"www.sec.gov\" (sec.gov), complete this statement from the page — \"regularly traded, an interest in ___ or less of the outstanding securities of that class or series generally should not be subject to the FIRPTA rules. Certain attribution and aggregation rules apply, and prospective purchasers are urged to consult\" — what value belongs in the blank?",
+    "answer": "5%",
+    "askable": null
+  },
+  "p1274-1": {
+    "page_id": 1274,
+    "url": "https://suzymchale.com/journal/journal2016.html",
+    "kind": "numeric_statement",
+    "question": "According to \"2016 | Suzy McHale's Web Journal\" (suzymchale.com), complete this statement from the page — \"Gale-force winds across Victoria today, in excess of ___/h. They are blowing very hard where I am.\" — what value belongs in the blank?",
+    "answer": "100 km",
+    "askable": null
+  },
+  "p1274-2": {
+    "page_id": 1274,
+    "url": "https://suzymchale.com/journal/journal2016.html",
+    "kind": "numeric_statement",
+    "question": "According to \"2016 | Suzy McHale's Web Journal\" (suzymchale.com), complete this statement from the page — \"… tion chief executive Dominique Lamb does not think this type of petty theft is excusable, adding that shoplifting costs the retail industry ___ a year.\" — what value belongs in the blank?",
+    "answer": "$4.5billion",
+    "askable": null
+  },
+  "p1274-3": {
+    "page_id": 1274,
+    "url": "https://suzymchale.com/journal/journal2016.html",
+    "kind": "entity_attribute",
+    "question": "According to \"2016 | Suzy McHale's Web Journal\" (suzymchale.com), what has Government?",
+    "answer": "contributed towards a $128 million dollar new racecourse grandstand",
+    "askable": null
+  },
+  "p1274-4": {
+    "page_id": 1274,
+    "url": "https://suzymchale.com/journal/journal2016.html",
+    "kind": "numeric_statement",
+    "question": "According to \"2016 | Suzy McHale's Web Journal\" (suzymchale.com), complete this statement from the page — \"Also outrageous is that the Government has contributed towards a ___ dollar new racecourse grandstand; an indefensible waste of taxpayers’ money that could go towards a lot more worthy causes such as public health care and ho …\" — what value belongs in the blank?",
+    "answer": "$128 million",
+    "askable": null
+  },
+  "p1274-5": {
+    "page_id": 1274,
+    "url": "https://suzymchale.com/journal/journal2016.html",
+    "kind": "numeric_statement",
+    "question": "According to \"2016 | Suzy McHale's Web Journal\" (suzymchale.com), complete this statement from the page — \"… en in my usual depressive slump, not helped by the awfulness of last month’s U.S. election, the prospect of Trump as President for the next ___ (barring a miracle such as him being impeached), and the continuing threats of social services cuts from uncaring Conservative governments (UK, Australia, U …\" — what value belongs in the blank?",
+    "answer": "4 years",
+    "askable": null
+  },
+  "p2869-1": {
+    "page_id": 2869,
+    "url": "https://docsbot.ai/prompts/tags?tag=Python",
+    "kind": "numeric_statement",
+    "question": "According to \"Best Python AI Prompts - DocsBot\" (docsbot.ai), complete this statement from the page — \"- Python Cost AnalysisGenerates Python code to analyze cost per KM clustered by port in ___ intervals and outputs Excel.\" — what value belongs in the blank?",
+    "answer": "50 KM",
+    "askable": null
+  },
+  "p2869-2": {
+    "page_id": 2869,
+    "url": "https://docsbot.ai/prompts/tags?tag=Python",
+    "kind": "numeric_statement",
+    "question": "According to \"Best Python AI Prompts - DocsBot\" (docsbot.ai), complete this statement from the page — \"- Python Data Engineering TopicsLists exhaustive Python ___+ topics relevant for a data engineering career with practical examples.\" — what value belongs in the blank?",
+    "answer": "3.11",
+    "askable": null
+  },
+  "p2869-3": {
+    "page_id": 2869,
+    "url": "https://docsbot.ai/prompts/tags?tag=Python",
+    "kind": "numeric_statement",
+    "question": "According to \"Best Python AI Prompts - DocsBot\" (docsbot.ai), complete this statement from the page — \"- Python Email Automation Lab BookGenerates a comprehensive 50-___ lab book for a Python email automation project.\" — what value belongs in the blank?",
+    "answer": "60 page",
+    "askable": null
+  },
+  "p2869-4": {
+    "page_id": 2869,
+    "url": "https://docsbot.ai/prompts/tags?tag=Python",
+    "kind": "numeric_statement",
+    "question": "According to \"Best Python AI Prompts - DocsBot\" (docsbot.ai), complete this statement from the page — \"- Python and SQL Learning RoadmapA structured plan to learn Python and SQL in ___ for AI and ML.\" — what value belongs in the blank?",
+    "answer": "15 days",
+    "askable": null
+  },
+  "p2869-5": {
+    "page_id": 2869,
+    "url": "https://docsbot.ai/prompts/tags?tag=Python",
+    "kind": "numeric_statement",
+    "question": "According to \"Best Python AI Prompts - DocsBot\" (docsbot.ai), complete this statement from the page — \"- Python 2 to 3 ConversionRewrite a Python ___ script to Python 3.12 with optimizations.\" — what value belongs in the blank?",
+    "answer": "2.7",
+    "askable": null
+  },
+  "p2616-1": {
+    "page_id": 2616,
+    "url": "https://www.thespacereview.com/",
+    "kind": "numeric_statement",
+    "question": "According to \"The Space Review: essays and commentary about the final frontier\" (thespacereview.com), complete this statement from the page — \"In the second part of their study of military space station programs, Dwayne Day and Bart Hendrickx examine the progress the US made on MOL and the USSR on Almaz in the late ___.\" — what value belongs in the blank?",
+    "answer": "1960s",
+    "askable": null
+  },
+  "p2616-2": {
+    "page_id": 2616,
+    "url": "https://www.thespacereview.com/",
+    "kind": "numeric_statement",
+    "question": "According to \"The Space Review: essays and commentary about the final frontier\" (thespacereview.com), complete this statement from the page — \"The first women to become NASA astronauts have been the subject of many books, articles, and other accounts over the ___ since their selection. Jeff Foust reviews a book that offers a group portrait of those six women, who were more “trusted coworkers” than friends or rivals.\" — what value belongs in the blank?",
+    "answer": "45 years",
+    "askable": null
+  },
+  "p2616-3": {
+    "page_id": 2616,
+    "url": "https://www.thespacereview.com/",
+    "kind": "entity_attribute",
+    "question": "According to \"The Space Review: essays and commentary about the final frontier\" (thespacereview.com), what is James Webb Space Telescope?",
+    "answer": "the subject of an IMAX documentary",
+    "askable": null
+  },
+  "p2616-4": {
+    "page_id": 2616,
+    "url": "https://www.thespacereview.com/",
+    "kind": "numeric_statement",
+    "question": "According to \"The Space Review: essays and commentary about the final frontier\" (thespacereview.com), complete this statement from the page — \"The Soviet Union attempted to develop reconnaissance satellites that could electronically transmit images using television technologies starting in the ___. Bart Hendrickx examines those efforts and the setbacks they faced over the decades.\" — what value belongs in the blank?",
+    "answer": "1960s",
+    "askable": null
+  },
+  "p3244-1": {
+    "page_id": 3244,
+    "url": "https://en.m.wikipedia.org/wiki/United_kingdom",
+    "kind": "dated_statement",
+    "question": "According to \"United Kingdom - Wikipedia\" (en.m.wikipedia.org), complete this statement from the page — \"- United Kingdom from UCB Libraries GovPubs (archived ___)\" — what date belongs in the blank?",
+    "answer": "6 April 2009",
+    "askable": null
+  },
+  "p3367-1": {
+    "page_id": 3367,
+    "url": "https://benchmarklist.com/models/openai-gpt-5.2/",
+    "kind": "numeric_statement",
+    "question": "According to \"GPT-5.2 Benchmark Scores &amp; Evals | BenchmarkList\" (benchmarklist.com), complete this statement from the page — \"AtelierEval___86th percentile · rank 2 of 8 ALL Bench Multimodal62.6%56th percentile · rank 35 of 79 BabyVision34.4%40th percentile · rank 22 of 36\" — what value belongs in the blank?",
+    "answer": "63.7%",
+    "askable": null
+  },
+  "p3367-2": {
+    "page_id": 3367,
+    "url": "https://benchmarklist.com/models/openai-gpt-5.2/",
+    "kind": "numeric_statement",
+    "question": "According to \"GPT-5.2 Benchmark Scores &amp; Evals | BenchmarkList\" (benchmarklist.com), complete this statement from the page — \"… th breadth and depth: breadth on VASPBench, a purpose-built benchmark spanning 34 tasks and 9 DFT calculation types, where AutoDFT achieves ___ task-level success with GPT-5.2; and depth on established materials databases, where AutoDFT produces quantitatively reliable property predictions across el …\" — what value belongs in the blank?",
+    "answer": "94.1%",
+    "askable": null
+  },
+  "p3367-3": {
+    "page_id": 3367,
+    "url": "https://benchmarklist.com/models/openai-gpt-5.2/",
+    "kind": "dated_statement",
+    "question": "According to \"GPT-5.2 Benchmark Scores &amp; Evals | BenchmarkList\" (benchmarklist.com), complete this statement from the page — \"[jsonld] SoftwareApplication: GPT-5.2 — operatingSystem: Cloud API; alternateName: G-5.2; gpt-5.2; openai/gpt-5.2; gpt-5.2-20251211; openai-gpt-5.2-20251211; openai/gpt-5.2-20251211; dateModified: ___\" — what date belongs in the blank?",
+    "answer": "2026-09-04",
+    "askable": null
+  },
+  "p3367-4": {
+    "page_id": 3367,
+    "url": "https://benchmarklist.com/models/openai-gpt-5.2/",
+    "kind": "numeric_statement",
+    "question": "According to \"GPT-5.2 Benchmark Scores &amp; Evals | BenchmarkList\" (benchmarklist.com), complete this statement from the page — \"SAGE___73rd percentile · rank 18 of 63 K12-Bench42.8%70th percentile · rank 4 of 11 TutorBench53.5%59th percentile · rank 10 of 23 OpenLearnLM Benchmark80.8%33rd percentile · rank 5 of 7\" — what value belongs in the blank?",
+    "answer": "49.3%",
+    "askable": null
+  },
+  "p3367-5": {
+    "page_id": 3367,
+    "url": "https://benchmarklist.com/models/openai-gpt-5.2/",
+    "kind": "numeric_statement",
+    "question": "According to \"GPT-5.2 Benchmark Scores &amp; Evals | BenchmarkList\" (benchmarklist.com), complete this statement from the page — \"A Positive Case for Faithfulness: LLM Self-Explanations Help Predict Model Behavior___82nd percentile · rank 4 of 18 How Well Do Models Follow Their Constitutions?7.170th percentile · rank 4 of 11 Beyond Value Benchmarks: Measuring Value-Struc …\" — what value belongs in the blank?",
+    "answer": "34.7%",
+    "askable": null
+  },
+  "p2329-1": {
+    "page_id": 2329,
+    "url": "https://www.sec.gov/Archives/edgar/data/1000275/000121465921009472/rbcsupp911210424b3.htm",
+    "kind": "dated_statement",
+    "question": "According to \"www.sec.gov\" (sec.gov), complete this statement from the page — \"Statement&rdquo;): (i)&nbsp;the Distribution Agreement, dated ___, between us and the agents, (ii)&nbsp;the Calculation\" — what date belongs in the blank?",
+    "answer": "September 14, 2021",
+    "askable": null
+  },
+  "p2329-2": {
+    "page_id": 2329,
+    "url": "https://www.sec.gov/Archives/edgar/data/1000275/000121465921009472/rbcsupp911210424b3.htm",
+    "kind": "dated_statement",
+    "question": "According to \"www.sec.gov\" (sec.gov), complete this statement from the page — \"Agency Agreement, dated as of ___, between us and RBC Capital Markets, LLC, and (iii)&nbsp;the Exchange Rate Agency Agreement,\" — what date belongs in the blank?",
+    "answer": "September 14, 2021",
+    "askable": null
+  },
+  "p2329-3": {
+    "page_id": 2329,
+    "url": "https://www.sec.gov/Archives/edgar/data/1000275/000121465921009472/rbcsupp911210424b3.htm",
+    "kind": "dated_statement",
+    "question": "According to \"www.sec.gov\" (sec.gov), complete this statement from the page — \"dated as of ___, between us and RBC Capital Markets, LLC. Such documents will not be incorporated by reference into this\" — what date belongs in the blank?",
+    "answer": "September 14, 2021",
+    "askable": null
+  },
+  "p2550-1": {
+    "page_id": 2550,
+    "url": "https://en.wikipedia.org/wiki/History_of_India",
+    "kind": "numeric_statement",
+    "question": "According to \"History of India - Wikipedia\" (en.wikipedia.org), complete this statement from the page — \"- Thompson, Edward, and G.T. Garratt. Rise and Fulfilment of British Rule in India (1934) ___; scholarly survey, 1599–1933 excerpt and text search\" — what value belongs in the blank?",
+    "answer": "690 pages",
+    "askable": null
+  },
+  "p2465-1": {
+    "page_id": 2465,
+    "url": "https://www.cbinsights.com/research-unicorn-companies",
+    "kind": "table_cell",
+    "question": "According to the table on \"The Complete List Of Unicorn Companies\" (cbinsights.com), what is the Valuation ($B) for Unstoppable Domains?",
+    "answer": "$1",
+    "askable": null
+  },
+  "p2465-2": {
+    "page_id": 2465,
+    "url": "https://www.cbinsights.com/research-unicorn-companies",
+    "kind": "table_cell",
+    "question": "According to the table on \"The Complete List Of Unicorn Companies\" (cbinsights.com), what is the Valuation ($B) for FourKites?",
+    "answer": "$1",
+    "askable": null
+  },
+  "p2465-3": {
+    "page_id": 2465,
+    "url": "https://www.cbinsights.com/research-unicorn-companies",
+    "kind": "table_cell",
+    "question": "According to the table on \"The Complete List Of Unicorn Companies\" (cbinsights.com), what is the Valuation ($B) for VulcanForms?",
+    "answer": "$1",
+    "askable": null
+  },
+  "p2465-4": {
+    "page_id": 2465,
+    "url": "https://www.cbinsights.com/research-unicorn-companies",
+    "kind": "table_cell",
+    "question": "According to the table on \"The Complete List Of Unicorn Companies\" (cbinsights.com), what is the Valuation ($B) for SingleStore?",
+    "answer": "$1",
+    "askable": null
+  }
+}

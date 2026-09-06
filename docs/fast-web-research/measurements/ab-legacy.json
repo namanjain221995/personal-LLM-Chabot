@@ -1,0 +1,51 @@
+{
+ "mode": "current",
+ "legacy_shapes": [],
+ "rows": [
+  {
+   "label": "concurrency=1",
+   "stream_buffered": false,
+   "requests": 24,
+   "ok": 24,
+   "failed": 0,
+   "first_token_ms_p50": 470.9,
+   "first_token_ms_p95": 808.9,
+   "first_event_ms_p50": 470.9,
+   "total_ms_p50": 1284.6,
+   "total_ms_p95": 1428.3,
+   "tokens_p50": 22.5,
+   "events": {
+    "token": 531,
+    "meta": 24,
+    "done": 24
+   },
+   "errors": [],
+   "concurrency": 1,
+   "server_cpu_s": 4.25,
+   "server_cpu_ms_per_request": 177.1
+  },
+  {
+   "label": "concurrency=8",
+   "stream_buffered": false,
+   "requests": 24,
+   "ok": 24,
+   "failed": 0,
+   "first_token_ms_p50": 1598.1,
+   "first_token_ms_p95": 1658.4,
+   "first_event_ms_p50": 1598.1,
+   "total_ms_p50": 2477.6,
+   "total_ms_p95": 2667.4,
+   "tokens_p50": 22.5,
+   "events": {
+    "token": 534,
+    "meta": 24,
+    "done": 24
+   },
+   "errors": [],
+   "concurrency": 8,
+   "server_cpu_s": 3.34,
+   "server_cpu_ms_per_request": 139.2
+  }
+ ],
+ "transport": "http"
+}

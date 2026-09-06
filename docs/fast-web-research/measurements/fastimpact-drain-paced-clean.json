@@ -1,0 +1,122 @@
+{
+ "mode": "current",
+ "transport": "http",
+ "rows": [
+  {
+   "label": "cached c=1",
+   "samples": 12,
+   "ok": 12,
+   "errors": 0,
+   "stream_buffered": false,
+   "first_token_ms_p50": 755.8,
+   "first_token_ms_p95": 1195.6,
+   "total_ms_p50": 2232.2,
+   "total_ms_p95": 3447.2,
+   "tokens_p50": 14.0,
+   "graded": 12,
+   "quality_pass": 12,
+   "quality_failures": [],
+   "events": {
+    "token": 203,
+    "meta": 12,
+    "done": 12
+   },
+   "error_kinds": [],
+   "scenario": "cached",
+   "concurrency": 1,
+   "conversations": 12,
+   "web_search": "off",
+   "server_cpu_s": 0.74,
+   "server_cpu_ms_per_turn": 61.7
+  },
+  {
+   "label": "cached c=8",
+   "samples": 12,
+   "ok": 12,
+   "errors": 0,
+   "stream_buffered": false,
+   "first_token_ms_p50": 3013.2,
+   "first_token_ms_p95": 3014.1,
+   "total_ms_p50": 4915.5,
+   "total_ms_p95": 6796.9,
+   "tokens_p50": 14.0,
+   "graded": 12,
+   "quality_pass": 12,
+   "quality_failures": [],
+   "events": {
+    "token": 216,
+    "meta": 12,
+    "done": 12
+   },
+   "error_kinds": [],
+   "scenario": "cached",
+   "concurrency": 8,
+   "conversations": 12,
+   "web_search": "off",
+   "server_cpu_s": 0.47,
+   "server_cpu_ms_per_turn": 39.2
+  },
+  {
+   "label": "search c=1",
+   "samples": 12,
+   "ok": 12,
+   "errors": 0,
+   "stream_buffered": false,
+   "first_token_ms_p50": 969.3,
+   "first_token_ms_p95": 1280.3,
+   "total_ms_p50": 4098.8,
+   "total_ms_p95": 5401.2,
+   "tokens_p50": 39.0,
+   "graded": 12,
+   "quality_pass": 12,
+   "quality_failures": [],
+   "events": {
+    "token": 485,
+    "meta": 12,
+    "done": 12
+   },
+   "error_kinds": [],
+   "scenario": "search",
+   "concurrency": 1,
+   "conversations": 12,
+   "web_search": "on",
+   "server_cpu_s": 1.02,
+   "server_cpu_ms_per_turn": 85.0
+  },
+  {
+   "label": "search c=8",
+   "samples": 12,
+   "ok": 12,
+   "errors": 0,
+   "stream_buffered": false,
+   "first_token_ms_p50": 2101.4,
+   "first_token_ms_p95": 3974.1,
+   "total_ms_p50": 7231.1,
+   "total_ms_p95": 9213.0,
+   "tokens_p50": 40.5,
+   "graded": 12,
+   "quality_pass": 11,
+   "quality_failures": [
+    {
+     "q": "What is the latest released version of Python?",
+     "expected": [
+      "3."
+     ],
+     "got": "I do not have access to real-time data to confirm the absolute latest Python release version as of today (September 6, 2026). My training data cutoff prevents m"
+    }
+   ],
+   "events": {
+    "token": 516,
+    "meta": 12,
+    "done": 12
+   },
+   "error_kinds": [],
+   "scenario": "search",
+   "concurrency": 8,
+   "conversations": 12,
+   "web_search": "on",
+   "server_cpu_s": 1.0,
+   "server_cpu_ms_per_turn": 83.3
+  }
+ ]
+}

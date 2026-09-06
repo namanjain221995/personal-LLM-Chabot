@@ -1,0 +1,137 @@
+{
+ "mode": "current",
+ "transport": "http",
+ "rows": [
+  {
+   "label": "followup c=1",
+   "samples": 24,
+   "ok": 24,
+   "errors": 0,
+   "stream_buffered": false,
+   "first_token_ms_p50": 700.5,
+   "first_token_ms_p95": 882.5,
+   "total_ms_p50": 1987.8,
+   "total_ms_p95": 4689.8,
+   "tokens_p50": 52.5,
+   "graded": 24,
+   "quality_pass": 22,
+   "quality_failures": [
+    {
+     "q": "what about 5.2?",
+     "expected": [
+      "82.7"
+     ],
+     "got": "GPT-5.2 is not listed in the BenchLM Reasoning Leaderboard data [1]. The models included in the March 2026 evaluation are:\n\n1. o4-mini-high\n2. o4\n3. o3\n4. GPT-5"
+    },
+    {
+     "q": "what about 5.2?",
+     "expected": [
+      "82.7"
+     ],
+     "got": "GPT-5.2 achieved a reasoning score of **89.2** on the BenchLM Reasoning Leaderboard.\n\nThis places it as the **2nd highest** among the 14 evaluated models, signi"
+    }
+   ],
+   "events": {
+    "token": 1708,
+    "meta": 24,
+    "done": 24
+   },
+   "error_kinds": [],
+   "scenario": "followup",
+   "concurrency": 1,
+   "conversations": 12,
+   "web_search": "off",
+   "server_cpu_s": 2.5,
+   "server_cpu_ms_per_turn": 104.2
+  },
+  {
+   "label": "followup c=8",
+   "samples": 24,
+   "ok": 24,
+   "errors": 0,
+   "stream_buffered": false,
+   "first_token_ms_p50": 1309.6,
+   "first_token_ms_p95": 1856.2,
+   "total_ms_p50": 4667.4,
+   "total_ms_p95": 10068.8,
+   "tokens_p50": 48.5,
+   "graded": 24,
+   "quality_pass": 23,
+   "quality_failures": [
+    {
+     "q": "what about 5.2?",
+     "expected": [
+      "82.7"
+     ],
+     "got": "GPT-5.2 scores 85.7 on the BenchLM Reasoning Leaderboard [1]."
+    }
+   ],
+   "events": {
+    "token": 1327,
+    "meta": 24,
+    "done": 24
+   },
+   "error_kinds": [],
+   "scenario": "followup",
+   "concurrency": 8,
+   "conversations": 12,
+   "web_search": "off",
+   "server_cpu_s": 1.91,
+   "server_cpu_ms_per_turn": 79.6
+  },
+  {
+   "label": "cached c=1",
+   "samples": 12,
+   "ok": 12,
+   "errors": 0,
+   "stream_buffered": false,
+   "first_token_ms_p50": 506.8,
+   "first_token_ms_p95": 707.5,
+   "total_ms_p50": 1365.2,
+   "total_ms_p95": 1902.3,
+   "tokens_p50": 22.5,
+   "graded": 12,
+   "quality_pass": 12,
+   "quality_failures": [],
+   "events": {
+    "token": 326,
+    "meta": 12,
+    "done": 12
+   },
+   "error_kinds": [],
+   "scenario": "cached",
+   "concurrency": 1,
+   "conversations": 12,
+   "web_search": "off",
+   "server_cpu_s": 0.8,
+   "server_cpu_ms_per_turn": 66.7
+  },
+  {
+   "label": "cached c=8",
+   "samples": 12,
+   "ok": 12,
+   "errors": 0,
+   "stream_buffered": false,
+   "first_token_ms_p50": 1798.2,
+   "first_token_ms_p95": 2350.7,
+   "total_ms_p50": 2981.5,
+   "total_ms_p95": 3713.1,
+   "tokens_p50": 22.5,
+   "graded": 12,
+   "quality_pass": 12,
+   "quality_failures": [],
+   "events": {
+    "token": 348,
+    "meta": 12,
+    "done": 12
+   },
+   "error_kinds": [],
+   "scenario": "cached",
+   "concurrency": 8,
+   "conversations": 12,
+   "web_search": "off",
+   "server_cpu_s": 0.71,
+   "server_cpu_ms_per_turn": 59.2
+  }
+ ]
+}
