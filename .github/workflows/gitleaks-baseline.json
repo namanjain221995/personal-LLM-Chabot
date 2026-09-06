@@ -19,7 +19,9 @@
     "assessment is ever wrong the fix is rotation, not an allowlist entry.",
     "",
     "TO ADD an entry: only after establishing the value is not a real secret.",
-    "TO REMOVE: the gate tells you when an entry stops being reported."
+    "TO REMOVE: the gate tells you when an entry stops being reported.",
+    "",
+    "REACHABILITY: a fingerprint is <commit>:<file>:<rule>:<line>, so an entry is only ever reported if CI's clone CONTAINS that commit. This baseline was first built from the local repository, which had unpushed branches, and one entry (scripts/application_isolation.py, commit 34a7e3c, reachable only from backup/assignment-20260906, feat/general-ai-20260906 and rescue/codex-techsara-release-20260905) was therefore STALE on the first real run: the gate correctly failed because a baselined finding was not reported. Only add fingerprints whose commit is reachable from a pushed branch. If those branches are ever pushed, the finding returns as NEW and the gate will say so -- which is the intended behaviour, not a regression."
   ],
   "reviewed": "2026-09-07",
   "findings": [
@@ -94,12 +96,6 @@
       "rule": "generic-api-key",
       "file": "launcher/tests/test_environment.py",
       "line": 221
-    },
-    {
-      "fingerprint": "34a7e3cb2a7d8ef6f60ed39d2523397eae53cddd:scripts/application_isolation.py:generic-api-key:92",
-      "rule": "generic-api-key",
-      "file": "scripts/application_isolation.py",
-      "line": 92
     }
   ]
 }

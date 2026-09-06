@@ -1719,11 +1719,27 @@ def init_schema() -> None:
 
 
 def schema_version() -> int:
-    """Highest applied migration version, or 0 on an empty database."""
-    with connection() as con:
-        row = con.execute(
-            "SELECT COALESCE(MAX(version), 0) AS v FROM schema_migrations"
-        ).fetchone()
+    """Highest applied migration version, or 0 on an empty database.
+
+    "Empty" includes a database with no schema AT ALL. Before the first
+    `init_schema()` the `schema_migrations` table does not exist, and asking a
+    never-migrated database for its version is a fair question whose answer is
+    0 -- but the bare SELECT raised `UndefinedTable` instead, so the first call
+    against a fresh database was an error rather than a zero. CI's
+    fresh-install check hit exactly that, and `health.py` would have too on a
+    database that had never started up.
+
+    ONLY `UndefinedTable` is swallowed. A connection failure, a permission
+    error or a wrong-database DSN still propagates, so this cannot quietly
+    report 0 for a database it simply could not read.
+    """
+    try:
+        with connection() as con:
+            row = con.execute(
+                "SELECT COALESCE(MAX(version), 0) AS v FROM schema_migrations"
+            ).fetchone()
+    except psycopg.errors.UndefinedTable:
+        return 0
     return int(row["v"]) if row else 0
 
 
