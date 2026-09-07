@@ -690,56 +690,6 @@ jobs:
             esac
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # A push to main with every suite green did not deploy, twice, and a skipped
-  # job reports no reason at all. This evaluates each clause of the deploy
-  # condition SEPARATELY, through the same expression engine, so the run says
-  # which one is false instead of leaving it to be inferred. Cheap, on shared
-  # runners, and it touches nothing.
-  deploy-decision:
-    name: "🔎 deploy decision"
-    needs: ci-ok
-    if: always()
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - name: "clause: ci-ok succeeded"
-        if: needs.ci-ok.result == 'success'
-        run: echo "PASS ci-ok" >> "$GITHUB_STEP_SUMMARY"
-      - name: "clause: ref is main"
-        if: github.ref == 'refs/heads/main'
-        run: echo "PASS ref" >> "$GITHUB_STEP_SUMMARY"
-      - name: "clause: event is push"
-        if: github.event_name == 'push'
-        run: echo "PASS event" >> "$GITHUB_STEP_SUMMARY"
-      # The bug, kept as a demonstration: an UNSET variable is null, and
-      # `null != 'false'` is FALSE because both sides are coerced to numbers
-      # and 'false' is NaN. This step must NOT pass.
-      - name: "clause: kill switch, compared without format() (expected to fail)"
-        if: >-
-          vars.DEPLOY_ON_PUSH != 'false' && vars.DEPLOY_ON_PUSH != '0' &&
-          vars.DEPLOY_ON_PUSH != 'no' && vars.DEPLOY_ON_PUSH != 'off'
-        run: echo "PASS kill-switch-bare" >> "$GITHUB_STEP_SUMMARY"
-      - name: "clause: kill switch, string-forced"
-        if: >-
-          !contains(fromJSON('["false","0","no","off"]'),
-                    format('{0}', vars.DEPLOY_ON_PUSH))
-        run: echo "PASS kill-switch-formatted" >> "$GITHUB_STEP_SUMMARY"
-      - name: "clause: the whole deploy condition"
-        if: >-
-          needs.ci-ok.result == 'success' &&
-          github.ref == 'refs/heads/main' &&
-          (
-            (github.event_name == 'workflow_dispatch' && inputs.deploy) ||
-            (github.event_name == 'push' &&
-             !contains(fromJSON('["false","0","no","off"]'),
-                       format('{0}', vars.DEPLOY_ON_PUSH)))
-          )
-        run: echo "PASS whole-condition" >> "$GITHUB_STEP_SUMMARY"
-      - name: Report
-        if: always()
-        run: cat "$GITHUB_STEP_SUMMARY" || true
-
   # ==========================================================================
   # 6 + 8. TRUSTED HARDWARE: preflight, rollout, smoke test, recovery
   #
