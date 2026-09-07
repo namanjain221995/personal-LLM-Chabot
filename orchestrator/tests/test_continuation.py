@@ -447,13 +447,46 @@ def test_every_segment_offers_a_checkpoint(model):
 # ---------------------------------------------------------------------------
 
 
-def test_effort_decides_how_long_a_run_may_be():
-    assert continuation.budget_for("fast") == continuation.settings.model_max_output
-    assert continuation.budget_for("think") > continuation.budget_for("fast")
-    assert continuation.budget_for("max") == continuation.settings.max_logical_output_tokens
+def test_every_effort_may_run_to_the_ceiling():
+    """An answer runs until the MODEL says it is finished, at every effort.
+
+    The budget was tiered once and it was wrong twice over: a budget does not
+    stop an expensive question being asked, only a needed answer being
+    finished — and the Fast tier sat 192 tokens above the chat engine's
+    per-call ceiling, so every truncated Fast answer stopped on the FIRST
+    call and said it had reached its length limit.
+    """
+    ceiling = continuation.settings.max_logical_output_tokens
+    for effort in ("fast", "think", "max"):
+        assert continuation.budget_for(effort) == ceiling
     # Wire aliases resolve the same way the rest of the app resolves them.
-    assert continuation.budget_for("extra_high") == continuation.budget_for("max")
-    assert continuation.budget_for("low") == continuation.budget_for("fast")
+    assert continuation.budget_for("extra_high") == ceiling
+    assert continuation.budget_for("low") == ceiling
+
+
+def test_no_effort_budget_lands_just_above_one_segment(monkeypatch):
+    """The exact shape of the bug, pinned. A budget a little larger than one
+    call is the worst possible value: it buys nothing and converts silent
+    truncation into a notice that the answer hit a limit."""
+    from app.config import settings as cfg
+
+    # The chat engine's per-call ceilings (engines/chat.py).
+    for segment in (6000, 8000, 16000):
+        for effort in ("fast", "think", "max"):
+            remaining = continuation.budget_for(effort) - segment
+            assert (
+                remaining <= 0 or remaining > cfg.continuation_min_segment_tokens
+            ), (
+                f"{effort} leaves {remaining} tokens after a {segment}-token "
+                "segment — enough to claim a limit was reached, not enough to "
+                "write anything"
+            )
+
+
+def test_the_tiering_can_be_put_back(monkeypatch):
+    monkeypatch.setattr(continuation.settings, "continuation_budget_fast", 8_192)
+    assert continuation.budget_for("fast") == 8_192
+    assert continuation.budget_for("max") == continuation.settings.max_logical_output_tokens
 
 
 def test_turning_the_feature_off_returns_every_effort_to_one_call(monkeypatch):

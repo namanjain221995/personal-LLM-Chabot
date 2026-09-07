@@ -1015,16 +1015,34 @@ class Settings:
         self.max_logical_output_tokens: int = _int(
             "MAX_LOGICAL_OUTPUT_TOKENS", 1_000_000
         )
-        #: Per-effort budgets. A ceiling is a capability, not a default —
-        #: continuing every truncated Fast answer to a million tokens would
-        #: spend six hours of the only GPU here on a passing question. Fast
-        #: gets one segment (i.e. today's behaviour), and only `max` reaches
-        #: the configured ceiling.
+        #: Per-effort budgets. ALL THREE default to the ceiling: an answer
+        #: runs until the MODEL says it is finished, at every effort.
+        #:
+        #: These were tiered once (Fast one segment, Think 64k, Max the
+        #: ceiling) to stop a passing question costing hours of GPU. Two
+        #: things were wrong with that. The reasoning was backwards — a
+        #: budget does not stop an expensive question being asked, it stops a
+        #: needed answer being finished, and the guards that actually matter
+        #: (the model saying it is done, repetition, no forward progress) are
+        #: about QUALITY and are always on. And the Fast value was
+        #: pathological: 8,192 sits 192 tokens above the chat engine's 8,000
+        #: per-call ceiling, so every truncated Fast answer wrote exactly one
+        #: segment, found 192 tokens left against a 512 minimum, and stopped
+        #: with "this answer reached its length limit" on the FIRST call —
+        #: the old silent truncation, now with a notice attached.
+        #:
+        #: What this costs is real and worth knowing: ~46 output tokens/second
+        #: means 8k is about 3 minutes and 50k about 18. Almost nothing
+        #: reaches the ceiling, because almost everything stops at `complete`
+        #: — a 40,000-token budget measured against the live model produced
+        #: 2,011 tokens and stopped, because the model was done.
+        #:
+        #: Set any of these lower to put the tiering back.
         self.continuation_budget_fast: int = _int(
-            "CONTINUATION_BUDGET_FAST", self.model_max_output
+            "CONTINUATION_BUDGET_FAST", self.max_logical_output_tokens
         )
         self.continuation_budget_think: int = _int(
-            "CONTINUATION_BUDGET_THINK", 64_000
+            "CONTINUATION_BUDGET_THINK", self.max_logical_output_tokens
         )
         self.continuation_budget_max: int = _int(
             "CONTINUATION_BUDGET_MAX", self.max_logical_output_tokens

@@ -514,11 +514,14 @@ async def stream_long_completion(
 def budget_for(effort: str) -> int:
     """How many output tokens one request of this effort may spend.
 
-    A ceiling is a capability, not a default. Continuing every truncated Fast
-    answer to a million tokens would cost six hours of the only GPU in the
-    building for a question somebody asked in passing — so the budget rises
-    with the effort the person actually chose, and only the top of the scale
-    reaches the configured maximum.
+    Every effort gets the configured ceiling, so an answer runs until the
+    MODEL decides it is finished. That is the point: the budget was never a
+    quality control, and the things that ARE — the model stopping, repetition,
+    no forward progress — do not depend on it and are always on.
+
+    The per-effort settings remain, so the tiering can be restored by setting
+    any of them lower. `continuation_enabled=False` returns every effort to a
+    single call.
     """
     if not settings.continuation_enabled:
         return int(settings.model_max_output)
