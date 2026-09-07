@@ -644,13 +644,30 @@ async function tailwindColours(): Promise<Map<string, string>> {
   return out;
 }
 
-/** The Waveform bar's className — the one carrying the 2px bar width. */
+/**
+ * The Waveform bar's className.
+ *
+ * Found by what the bar IS — a fixed-width, rounded, height-animated span —
+ * not by the pixel value it happens to use. Keying the finder on `w-[2px]`
+ * meant that thickening the bars did not fail one assertion about width, it
+ * failed five unrelated assertions with "expected [] to have length 1",
+ * which says nothing about what actually changed.
+ */
 async function barClassName(): Promise<string> {
   const { readFileSync } = await import('node:fs');
   const source = readFileSync(`${process.cwd()}/components/VoiceBar.tsx`, 'utf8');
-  const found = [...source.matchAll(/className="([^"]*w-\[2px\][^"]*)"/g)];
+  const found = [...source.matchAll(/className="([^"]*transition-\[height\][^"]*)"/g)];
   expect(found).toHaveLength(1);
   return found[0]![1]!;
+}
+
+/** Every `name-[Npx]` in a className, as a lookup. */
+function pixels(className: string): Map<string, number> {
+  const out = new Map<string, number>();
+  for (const [, name, value] of className.matchAll(/(?:^|\s)((?:md:)?[a-z-]+)-\[(\d+)px\]/g)) {
+    out.set(name, Number(value));
+  }
+  return out;
 }
 
 describe('the waveform bar colour', () => {
@@ -765,19 +782,38 @@ describe('the trace presentation', () => {
   });
 
   it('keeps rounded ends and thickens the bars only above md', async () => {
-    const { readFileSync } = await import('node:fs');
     const className = await barClassName();
     expect(className).toContain('rounded-full');
-    // 3px bars with 3px gaps are 285px — fine in a 620px trace box, too wide
-    // for the 211px one a phone gives it, so the phone keeps 2px/2px. Both
-    // fit, which is what lets `justify-center` centre without clipping the
-    // NEWEST bars.
-    expect(className).toContain('w-[2px]');
-    expect(className).toContain('md:w-[3px]');
+    const bar = pixels(className);
+    expect(bar.get('w')).toBeGreaterThan(0);
+    expect(bar.get('md:w')).toBeGreaterThan(bar.get('w')!);
+  });
+
+  it('fits the trace inside the box at both sizes, so nothing is clipped', async () => {
+    // THE ASSERTION THE COMPONENT'S OWN COMMENT MAKES. `justify-center` with
+    // `overflow-hidden` clips at BOTH ends, so a trace one pixel too wide
+    // loses its NEWEST bars — a live meter that drops the sound you are
+    // making right now.
+    //
+    // This computes the width instead of pinning the literals, because the
+    // literals are exactly what changed underneath it: the bars were
+    // thickened from 2px to 3px and the 2px mobile gap was left alone, which
+    // put 48x3 + 47x2 = 238px into a ~228px box on every phone.
+    const { readFileSync } = await import('node:fs');
     const source = readFileSync(`${process.cwd()}/components/VoiceBar.tsx`, 'utf8');
-    const trace = source.match(/className="([^"]*overflow-hidden[^"]*)"/)![1]!;
-    expect(trace).toContain('gap-[2px]');
-    expect(trace).toContain('md:gap-[3px]');
+    const trace = pixels(source.match(/className="([^"]*overflow-hidden[^"]*)"/)![1]!);
+    const bar = pixels(await barClassName());
+
+    // Measured from the composer at each width, minus the buttons, timer and
+    // padding that share the row with the trace.
+    const boxes = { mobile: 228, desktop: 620 };
+    const used = (width: number, gap: number) =>
+      LEVEL_BARS * width + (LEVEL_BARS - 1) * gap;
+
+    expect(used(bar.get('w')!, trace.get('gap')!)).toBeLessThanOrEqual(boxes.mobile);
+    expect(used(bar.get('md:w')!, trace.get('md:gap')!)).toBeLessThanOrEqual(
+      boxes.desktop,
+    );
   });
 
   it('still keeps the trace decorative and the status spoken', async () => {

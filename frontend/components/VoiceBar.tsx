@@ -57,12 +57,20 @@ function Waveform({ levels }: { levels: number[] }) {
       aria-hidden
       // CENTRED, not end-aligned (owner request 2026-09-07). The trace used to
       // grow leftward from the timer, which read as hugging the Stop button.
-      // Centring is safe only because the whole trace FITS: 48 bars at 3px
-      // with 3px gaps is 285px against a 620px trace box on a 768px composer,
-      // and 190px at the mobile 2px/2px against 228px on a 375px one. If it
-      // ever stopped fitting, `justify-center` would clip the NEWEST bars as
-      // well as the oldest, which is the one thing a live meter must not do.
-      className="flex h-10 flex-1 items-center justify-center gap-[2px] overflow-hidden md:gap-[3px]"
+      //
+      // Centring is safe ONLY because the whole trace fits. `justify-center`
+      // plus `overflow-hidden` clips at BOTH ends, so an overflowing trace
+      // loses its newest bars — the one thing a live meter must not do.
+      //
+      // The arithmetic, with LEVEL_BARS = 48 (bars x width + gaps x gap):
+      //   md+     48x6 + 47x3 = 429px  in a  620px box on a 768px composer
+      //   mobile  48x3 + 47x1 = 191px  in a ~228px box on a 375px one
+      //
+      // The mobile GAP is 1px, not 2px: when the bars were thickened from
+      // 2px to 3px (2026-09-07) the gap was left alone, and 48x3 + 47x2 is
+      // 238px — ten pixels wider than the box, clipping the newest bars on
+      // every phone. Thicker bars are the point; the gap is what gives way.
+      className="flex h-10 flex-1 items-center justify-center gap-[1px] overflow-hidden md:gap-[3px]"
     >
       {levels.map((level, index) => (
         <span
