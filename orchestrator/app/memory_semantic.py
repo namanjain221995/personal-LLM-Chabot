@@ -157,8 +157,23 @@ async def semantic_hits(
         scored.sort(key=lambda pair: pair[0], reverse=True)
         hits: List[dict] = []
         seen_snippets: set = set()
+        # A RELATIVE floor as well as the absolute one. The absolute floor
+        # alone (0.30) behaves badly on a small corpus: with nothing genuinely
+        # relevant to find, everything that clears it is returned, and recall
+        # degenerates into "the three least-unrelated things this user ever
+        # said". Measured consequence — a French lesson asked "how to
+        # translate" and the memory block handed the model snippets about
+        # CODE, priming exactly the wrong reading of the word.
+        #
+        # Keyed off the best hit, so it never removes the top result and never
+        # fires when recall is genuinely confident; it only drops the tail
+        # that is much weaker than what was actually found.
+        best = scored[0][0] if scored else 0.0
+        relative_floor = best * settings.semantic_recall_relative_floor
         for score, c in scored:
             if score < settings.semantic_recall_min_score or len(hits) >= limit:
+                break
+            if score < relative_floor:
                 break
             snippet = _snippet(c["content"])
             if snippet in seen_snippets:

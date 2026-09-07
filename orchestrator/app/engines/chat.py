@@ -70,7 +70,14 @@ def _messages(
         system = system + "\n\n" + grounding
     return (
         [{"role": "system", "content": system}]
-        + recent_turns(history, 6)
+        # THE CONVERSATION, not a three-exchange slice. This was 6 — the
+        # reason a 60-message French lesson answered "how to translate" with
+        # a Python tutorial: the last six turns were a goodnight exchange and
+        # the lesson itself was outside the window. Bounding history is
+        # compaction's job (a rolling summary, on an absolute token budget)
+        # and fit_request's (the physical window); an engine cutting on top
+        # of both only throws away what they chose to keep.
+        + recent_turns(history, settings.chat_history_turns)
         + [{"role": "user", "content": message}]
     )
 

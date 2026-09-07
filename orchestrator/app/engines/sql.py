@@ -1109,7 +1109,7 @@ def _narrative_messages(
         f"Question: {question}\n\n{counted}{figures}"
         f"Result sample (illustration only, JSON): {sample}"
     )
-    return [{"role": "system", "content": system}] + recent_turns(history, 6) + [
+    return [{"role": "system", "content": system}] + recent_turns(history, settings.chat_history_turns) + [
         {"role": "user", "content": user}
     ]
 

@@ -911,7 +911,7 @@ async def run_site_qa_engine(
         )
     msgs = [
         {"role": "system", "content": _SITE_QA_SYSTEM.format(host=host)},
-        *recent_turns(history, 4),
+        *recent_turns(history, settings.chat_history_turns),
         {
             "role": "user",
             "content": "Excerpts:\n" + "\n\n".join(blocks) + f"\n\nQuestion: {message}",

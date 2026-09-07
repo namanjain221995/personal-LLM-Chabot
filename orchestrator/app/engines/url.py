@@ -263,7 +263,7 @@ def _answer_messages(
         "[1]. If the pages don't contain the answer, say so."
     )
     user = f"Pages:\n{_context_block(docs, question)}\n\nQuestion: {question}"
-    return [{"role": "system", "content": system + DIAGRAM_INSTRUCTION}, *recent_turns(history, 4),
+    return [{"role": "system", "content": system + DIAGRAM_INSTRUCTION}, *recent_turns(history, settings.chat_history_turns),
             {"role": "user", "content": user}]
 
 
@@ -341,7 +341,7 @@ async def run_url_engine(
                 )
                 + DIAGRAM_INSTRUCTION,
             },
-            *recent_turns(history, 4),
+            *recent_turns(history, settings.chat_history_turns),
             {"role": "user", "content": message},
         ]
         async for kind, delta in llm.stream_chat_events(

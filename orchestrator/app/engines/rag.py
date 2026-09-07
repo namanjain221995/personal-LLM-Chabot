@@ -280,7 +280,7 @@ def _answer_messages(message: str, hits: Sequence[dict], history: Sequence[dict]
             + notes
         )
     user = f"Records:\n{_context_block(hits)}\n\nQuestion: {message}"
-    return [{"role": "system", "content": system + DIAGRAM_INSTRUCTION}] + recent_turns(history, 6) + [
+    return [{"role": "system", "content": system + DIAGRAM_INSTRUCTION}] + recent_turns(history, settings.chat_history_turns) + [
         {"role": "user", "content": user}
     ]
 

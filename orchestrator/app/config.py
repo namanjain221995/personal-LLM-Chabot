@@ -433,6 +433,22 @@ class Settings:
         self.context_compact_threshold: float = _float(
             "CONTEXT_COMPACT_THRESHOLD", 0.80
         )
+        # An ABSOLUTE ceiling on the verbatim prompt, alongside the fractions
+        # above. Those fractions were written for a small window and are now
+        # mis-tuned in the other direction: against a 1,000,000-token window
+        # the usable budget is ~991,000, so 0.80 means compaction first runs
+        # at ~793,000 tokens — i.e. never, in any real conversation. A
+        # 60-message session measured 5,826 tokens, 0.58% of the window, and
+        # had no summary at all.
+        #
+        # That mattered because the engines then showed the model only the
+        # last few turns, so the ONLY memory a long chat had was a slice that
+        # ended three exchanges ago. Whichever of the two triggers fires
+        # first now wins, so older turns become a summary at a size that
+        # actually occurs. 0 disables the absolute one.
+        self.context_compact_max_tokens: int = _int(
+            "CONTEXT_COMPACT_MAX_TOKENS", 40_000
+        )
         self.keep_recent_turns: int = _int("KEEP_RECENT_TURNS", 8)
         self.summary_max_tokens: int = _int("SUMMARY_MAX_TOKENS", 2000)
         # An answer this short is a failure for a thinking model (it burns the
@@ -450,6 +466,13 @@ class Settings:
             "CROSS_CHAT_SEMANTIC_ENABLED", True
         )
         # Cosine floor below which a candidate is noise, not a memory.
+        # A hit must clear BOTH floors: this absolute one, and a fraction of
+        # the best hit in the same query (below). The absolute floor alone
+        # returns whatever clears it when nothing relevant exists, which on a
+        # small corpus is noise presented as memory.
+        self.semantic_recall_relative_floor: float = _float(
+            "SEMANTIC_RECALL_RELATIVE_FLOOR", 0.75
+        )
         self.semantic_recall_min_score: float = _float(
             "SEMANTIC_RECALL_MIN_SCORE", 0.30
         )
@@ -1083,6 +1106,20 @@ class Settings:
 
         # --- Misc ---
         self.session_max_turns: int = _int("SESSION_MAX_TURNS", 20)
+        # How many conversational turns the ASSISTANT sees. Was hardcoded at
+        # 6 in engines/chat.py — three exchanges — which is why a 60-message
+        # French lesson answered "how to translate" with a Python tutorial:
+        # the last six turns were a goodnight exchange and the entire lesson
+        # was outside the window.
+        #
+        # Six was a defence against a small context window. It is the wrong
+        # layer for that now: `compaction.prepare` decides what the model
+        # sees (a rolling summary plus recent turns, bounded by
+        # CONTEXT_COMPACT_MAX_TOKENS above) and `context.fit_request`
+        # guarantees the result physically fits. An engine truncating on top
+        # of both only discards what those two chose to keep. This is a
+        # backstop against a pathological thread, not a memory policy.
+        self.chat_history_turns: int = _int("CHAT_HISTORY_TURNS", 400)
         # Read timeout for model calls. For a NON-streaming completion (agent
         # planning, synthesis, classification) this covers the WHOLE
         # generation, not an inter-byte gap, so it must not expire before the

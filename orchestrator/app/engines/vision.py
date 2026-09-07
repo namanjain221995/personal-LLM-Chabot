@@ -87,7 +87,7 @@ def extraction_hint(message: str) -> str:
     return _EXTRACT_HINT if _EXTRACT_RE.search(message or "") else ""
 
 
-def history_turns(history: Sequence[dict], n: int = 6) -> List[dict]:
+def history_turns(history: Sequence[dict], n: Optional[int] = None) -> List[dict]:
     """Text turns (and pinned system blocks) the vision call should carry.
 
     Until 2026-08-29 the engine sent ``[system, user]`` only, so a follow-up
@@ -96,7 +96,7 @@ def history_turns(history: Sequence[dict], n: int = 6) -> List[dict]:
     (list content) are dropped: re-sending earlier images would multiply the
     prompt for no gain, and main.py stores answers as plain text anyway.
     """
-    turns = recent_turns(history, n)
+    turns = recent_turns(history, n or settings.chat_history_turns)
     return [m for m in turns if isinstance(m.get("content"), str) and m.get("role")]
 
 

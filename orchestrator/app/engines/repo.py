@@ -101,7 +101,7 @@ def _qa_messages(question: str, chunks: List[dict], history: Sequence[dict]) -> 
         "question, say what you'd need to look at."
     )
     user = f"Code excerpts:\n{_qa_context(chunks)}\n\nQuestion: {question}"
-    return [{"role": "system", "content": system + DIAGRAM_INSTRUCTION}, *recent_turns(history, 4),
+    return [{"role": "system", "content": system + DIAGRAM_INSTRUCTION}, *recent_turns(history, settings.chat_history_turns),
             {"role": "user", "content": user}]
 
 
