@@ -133,42 +133,35 @@ class Settings:
         ).rstrip("/")
         self.ocr_model: str = os.environ.get("OCR_MODEL", "baidu/Unlimited-OCR")
 
-        # -- Speech to text (2026-09-04) ------------------------------------
+        # -- Speech to text -------------------------------------------------
         #
-        # The composer's microphone. OFF by default: the engine is a separate
-        # service on a separate node, started by scripts/asr.sh, and a
-        # deployment that has not run it must not offer members a button that
-        # cannot work. The script writes ASR_BASE_URL into .env when it
-        # succeeds, which is what turns the feature on.
+        # NO ENGINE IS CONFIGURED. Qwen3-ASR-1.7B and TheWhisper were both
+        # evaluated and rejected; their providers, services and weights are
+        # gone. What remains here is the model-AGNOSTIC half — the caps, the
+        # admission limits and the rate limit — because those are the numbers
+        # the route enforces and they do not depend on which engine answers.
+        #
+        # OFF, and it must stay off until an engine exists: a deployment that
+        # offers a microphone with nothing behind it shows members a button
+        # that cannot work. `app/asr.provider()` raises while none is
+        # installed, and the route answers 404 before reaching it.
         self.asr_enabled: bool = _bool("ASR_ENABLED", False)
-        self.asr_backend: str = os.environ.get("ASR_BACKEND", "qwen3_asr")
-        self.asr_base_url: str = os.environ.get(
-            "ASR_BASE_URL", "http://vllm-asr:30006/v1"
-        ).rstrip("/")
-        # More than one engine, comma-separated, when speech runs on both
-        # nodes. Requests go to whichever endpoint has the fewest in flight;
-        # see app/asr.RoutedProvider. Falls back to the single URL above, so a
-        # deployment that never sets this behaves exactly as it did.
-        #
-        # These are REPLICAS, not shards. A 1.7B model fits in 6 GiB and
-        # splitting one across two Sparks would put every layer's activations
-        # on a 13 Gb/s RoCE link that the main model's tensor-parallel traffic
-        # already uses — slower, and contending with the thing that must not
-        # be slowed. Two whole copies, load-balanced, is what "use both GPUs"
-        # actually means here.
+        # Where the next engine will answer. Empty by default — there is
+        # nothing to point at yet, and a stale default would send audio to a
+        # port that is closed.
+        self.asr_base_url: str = os.environ.get("ASR_BASE_URL", "").rstrip("/")
+        # More than one endpoint, comma-separated, when speech runs on several
+        # nodes. Requests go to whichever has the fewest in flight; see
+        # app/asr.RoutedProvider. Falls back to the single URL above.
         self.asr_base_urls: tuple[str, ...] = tuple(
             url.strip().rstrip("/")
             for url in os.environ.get("ASR_BASE_URLS", "").split(",")
             if url.strip()
-        ) or (self.asr_base_url,)
-        self.asr_model: str = os.environ.get("ASR_MODEL", "Qwen/Qwen3-ASR-1.7B")
+        ) or ((self.asr_base_url,) if self.asr_base_url else ())
         # Auto-detection is the default and should stay it: a person dictating
-        # must not have to declare a language before they speak, and the model
-        # identifies 30 of them by itself.
+        # must not have to declare a language before they speak.
         self.asr_language: str = os.environ.get("ASR_LANGUAGE", "auto")
-        # Generous against the measured cost. 60 seconds of audio transcribes
-        # in 1.9s on this hardware, so this is a stuck-engine guard, not a
-        # budget.
+        # A stuck-engine guard, not a budget.
         self.asr_timeout_s: float = _float("ASR_TIMEOUT_S", 60.0)
         # Composer dictation, not podcast transcription. Ten minutes is the
         # ceiling; the browser stops recording at it rather than uploading
@@ -180,20 +173,14 @@ class Settings:
         self.asr_max_upload_bytes: int = _int(
             "ASR_MAX_UPLOAD_BYTES", 32 * 1024 * 1024
         )
-        # Not about protecting the ASR engine, which batches eight concurrent
-        # clips in the time of one. About protecting the CHAT model: audio
-        # must never contend with an answer someone is waiting for.
-        # PER ENGINE, not in total: the number exists to bound how hard any
-        # one node is pushed while the chat model shares it, so a second
-        # engine on a second node raises the fleet's ceiling without raising
-        # the pressure on either machine.
+        # Not about protecting the speech engine. About protecting the CHAT
+        # model: audio must never contend with an answer someone is waiting
+        # for. PER ENDPOINT, so a second node raises the fleet's ceiling
+        # without raising the pressure on either machine.
         self.asr_max_concurrent: int = _int("ASR_MAX_CONCURRENT", 4)
         # Past this, callers are told to try again instead of queueing behind
         # work they cannot see.
         self.asr_queue_wait_s: float = _float("ASR_QUEUE_WAIT_S", 8.0)
-        # A ceiling on the transcript, not on the audio: a runaway decode on
-        # a noisy clip must not stream forever.
-        self.asr_max_tokens: int = _int("ASR_MAX_TOKENS", 1024)
         # Per person, per minute. Dictation is bursty but not machine-fast.
         self.asr_rate_per_min: int = _int("ASR_RATE_PER_MIN", 20)
 

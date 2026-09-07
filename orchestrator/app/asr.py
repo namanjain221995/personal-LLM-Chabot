@@ -1,37 +1,33 @@
-"""Speech to text — the client for the local ASR engine.
+"""Speech to text — the model-agnostic half of voice input.
 
-WHAT THIS IS. One provider abstraction over an OpenAI-compatible audio
-endpoint, plus the admission control that keeps a workspace's microphones from
-becoming a queue on the main model's GPU. It is deliberately small: the engine
-does the hard part, and everything here is about doing it safely, once, with a
-number attached.
+WHAT IS HERE, AND WHAT IS NOT. The transcript dataclass, the provider protocol,
+the error vocabulary the route already knows how to turn into sentences, the
+fleet router and the admission control that keeps a workspace's microphones off
+the main model's GPU. All of it is independent of which engine transcribes.
+
+THERE IS CURRENTLY NO ENGINE. Qwen3-ASR-1.7B and TheWhisper were both
+evaluated and rejected, and their implementations, services and weights have
+been removed. `provider()` therefore raises: `ASR_ENABLED` defaults to false,
+the route answers 404 before ever reaching here, and the composer hides the
+microphone. That state is deliberate and temporary — the next engine plugs in
+by implementing `ASRProvider` and being returned from `provider()`.
+
+WHY THIS FILE SURVIVED THE REMOVAL. Everything above is the part that was never
+about a particular model: the pool sizing, the least-active routing, the
+cooldown on a failing endpoint, the metric names, and the promise that audio is
+held in memory for one call and dropped. Deleting it would mean rediscovering
+all of that for the next engine.
 
 WHERE THE AUDIO GOES. Nowhere but the engine. The bytes arrive in a request,
 are held in memory for the length of one call, and are dropped. Nothing is
 written to disk, nothing reaches the database, and the transcript is returned
 to the browser as a DRAFT — it becomes a message only if the person presses
 Send. See app/audio_api.py for the route that enforces that.
-
-WHY THE CHAT ENDPOINT AND NOT /v1/audio/transcriptions. Both work. Measured on
-this deployment (2026-09-04, Qwen3-ASR-1.7B on the worker, 15 seconds of
-audio): transcriptions 1.04s, chat 1.04s — identical. The chat path
-additionally returns the language the model IDENTIFIED, in its own output
-contract (`language English<asr_text>…`), and a console that reports which
-languages a workspace speaks needs that. The transcriptions endpoint stays as
-the fallback: it is a different code path in the engine, so a failure in one
-is not automatically a failure in both.
-
-FORMAT. None is converted here. vLLM decodes through PyAV, which bundles
-ffmpeg, so the WebM/Opus a browser's MediaRecorder produces is understood
-natively — verified byte-for-byte against the same clip as WAV. That is why
-this orchestrator needs no audio library at all.
 """
 from __future__ import annotations
 
 import asyncio
-import base64
 import logging
-import re
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Protocol, Sequence
@@ -40,34 +36,6 @@ from . import metrics
 from .config import settings
 
 log = logging.getLogger(__name__)
-
-#: The model's own output contract on the chat path. Not a heuristic: the
-#: engine always emits the identified language before the transcript marker.
-_CHAT_OUTPUT = re.compile(r"^language\s+(?P<language>[^<]+)<asr_text>(?P<text>.*)$", re.S)
-
-#: Languages Qwen3-ASR officially identifies (config.json `support_languages`).
-#: Anything else becomes "other" so a mis-parse cannot invent a language, and
-#: so the metric's label can never grow without bound.
-SUPPORTED_LANGUAGES = (
-    "Chinese", "English", "Cantonese", "Arabic", "German", "French", "Spanish",
-    "Portuguese", "Indonesian", "Italian", "Korean", "Russian", "Thai",
-    "Vietnamese", "Japanese", "Turkish", "Hindi", "Malay", "Dutch", "Swedish",
-    "Danish", "Finnish", "Polish", "Czech", "Filipino", "Persian", "Greek",
-    "Romanian", "Hungarian", "Macedonian",
-)
-
-#: Human name -> BCP-47-ish code, for a response field a browser can use.
-_LANGUAGE_CODES = {
-    "Chinese": "zh", "English": "en", "Cantonese": "yue", "Arabic": "ar",
-    "German": "de", "French": "fr", "Spanish": "es", "Portuguese": "pt",
-    "Indonesian": "id", "Italian": "it", "Korean": "ko", "Russian": "ru",
-    "Thai": "th", "Vietnamese": "vi", "Japanese": "ja", "Turkish": "tr",
-    "Hindi": "hi", "Malay": "ms", "Dutch": "nl", "Swedish": "sv",
-    "Danish": "da", "Finnish": "fi", "Polish": "pl", "Czech": "cs",
-    "Filipino": "fil", "Persian": "fa", "Greek": "el", "Romanian": "ro",
-    "Hungarian": "hu", "Macedonian": "mk",
-}
-
 
 class ASRUnavailable(Exception):
     """The engine could not be reached, or refused. Retryable."""
@@ -108,194 +76,6 @@ class ASRProvider(Protocol):
     ) -> Transcript: ...
 
     async def health(self) -> bool: ...
-
-
-def language_code(language: str) -> Optional[str]:
-    return _LANGUAGE_CODES.get(language.strip().title())
-
-
-def normalise_language(raw: str) -> Optional[str]:
-    """A language the model actually supports, or None.
-
-    Never invents one: an unrecognised value means the identification did not
-    survive, and the console shows nothing rather than a plausible guess.
-    """
-    candidate = (raw or "").strip().rstrip(".").title()
-    return candidate if candidate in SUPPORTED_LANGUAGES else None
-
-
-def parse_chat_output(content: str) -> tuple[Optional[str], str]:
-    """Split `language English<asr_text>Hello.` into (language, text)."""
-    match = _CHAT_OUTPUT.match((content or "").strip())
-    if not match:
-        # The engine answered something else — keep the words, drop the claim
-        # about which language they are in.
-        return None, (content or "").strip()
-    return normalise_language(match.group("language")), match.group("text").strip()
-
-
-class VLLMAudioProvider:
-    """An OpenAI-compatible audio endpoint served by vLLM.
-
-    One class covers Qwen3-ASR and Whisper because vLLM serves both behind the
-    same two routes; only the model id and how the language arrives differ.
-    """
-
-    def __init__(
-        self,
-        *,
-        base_url: str,
-        model: str,
-        name: str = "qwen3_asr",
-        timeout_s: float = 60.0,
-        prefer_chat: bool = True,
-    ) -> None:
-        self.base_url = base_url.rstrip("/")
-        self.model = model
-        self.name = name
-        self.timeout_s = timeout_s
-        self.prefer_chat = prefer_chat
-
-    # -- transport ---------------------------------------------------------
-
-    async def _client(self):
-        import httpx
-
-        return httpx.AsyncClient(timeout=self.timeout_s)
-
-    async def _chat(self, audio: bytes, content_type: str, language: str) -> Transcript:
-        """The path that reports the identified language."""
-        import httpx
-
-        data_url = f"data:{content_type};base64,{base64.b64encode(audio).decode()}"
-        content: list[dict[str, Any]] = [
-            {"type": "audio_url", "audio_url": {"url": data_url}}
-        ]
-        # A forced language is the caller's explicit choice; auto-detection is
-        # the default because a person dictating should not have to declare a
-        # language before speaking.
-        if language and language != "auto":
-            content.append({"type": "text", "text": language})
-        payload = {
-            "model": self.model,
-            "messages": [{"role": "user", "content": content}],
-            "max_tokens": settings.asr_max_tokens,
-            # Transcription is not a creative task: the same audio must give
-            # the same words every time.
-            "temperature": 0.0,
-        }
-        started = time.perf_counter()
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout_s) as client:
-                response = await client.post(
-                    f"{self.base_url}/chat/completions", json=payload
-                )
-        except Exception as exc:  # noqa: BLE001
-            raise ASRUnavailable(str(exc)) from exc
-        elapsed = int((time.perf_counter() - started) * 1000)
-        if response.status_code >= 500:
-            raise ASRUnavailable(f"engine returned {response.status_code}")
-        if response.status_code >= 400:
-            raise ASRRejected(_detail(response))
-        # A 200 is not a promise about the shape of the body. A proxy that
-        # answers with an HTML interstitial, or an engine build whose reply
-        # nests differently, would otherwise raise out of this module as
-        # something the route has no name for — and the person holding the
-        # microphone would get a 500 instead of a sentence. Unreadable is
-        # UNAVAILABLE: it is the same engine trouble as a refused connection,
-        # and it is worth trying the other endpoint for.
-        try:
-            body = response.json()
-            raw = str(
-                (body.get("choices") or [{}])[0].get("message", {}).get("content") or ""
-            )
-        except Exception as exc:  # noqa: BLE001
-            raise ASRUnavailable("the engine returned a reply this client cannot read") from exc
-        detected, text = parse_chat_output(raw)
-        return Transcript(
-            text=text,
-            language=detected,
-            language_code=language_code(detected or ""),
-            provider=self.name,
-            model=self.model,
-            engine_ms=elapsed,
-        )
-
-    async def _transcriptions(self, audio: bytes, filename: str, content_type: str) -> Transcript:
-        """The fallback: a different code path in the same engine.
-
-        Returns text alone — this endpoint does not report the language for
-        this model (the engine answers 400 to `verbose_json`), so `language`
-        is None rather than a guess.
-        """
-        import httpx
-
-        started = time.perf_counter()
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout_s) as client:
-                response = await client.post(
-                    f"{self.base_url}/audio/transcriptions",
-                    files={"file": (filename, audio, content_type)},
-                    data={"model": self.model},
-                )
-        except Exception as exc:  # noqa: BLE001
-            raise ASRUnavailable(str(exc)) from exc
-        elapsed = int((time.perf_counter() - started) * 1000)
-        if response.status_code >= 500:
-            raise ASRUnavailable(f"engine returned {response.status_code}")
-        if response.status_code >= 400:
-            raise ASRRejected(_detail(response))
-        try:
-            spoken = str(response.json().get("text") or "").strip()
-        except Exception as exc:  # noqa: BLE001
-            raise ASRUnavailable("the engine returned a reply this client cannot read") from exc
-        return Transcript(
-            text=spoken,
-            language=None,
-            language_code=None,
-            provider=self.name,
-            model=self.model,
-            engine_ms=elapsed,
-            degraded=True,
-        )
-
-    # -- interface ---------------------------------------------------------
-
-    async def transcribe(
-        self, audio: bytes, *, filename: str, content_type: str, language: str = ""
-    ) -> Transcript:
-        if not self.prefer_chat:
-            return await self._transcriptions(audio, filename, content_type)
-        try:
-            return await self._chat(audio, content_type, language)
-        except ASRRejected:
-            # The engine understood the request and refused the audio. Trying
-            # the other endpoint would refuse it again, more slowly.
-            raise
-        except ASRUnavailable as exc:
-            log.warning("ASR chat path failed (%s); trying the transcription path", exc)
-            return await self._transcriptions(audio, filename, content_type)
-
-    async def health(self) -> bool:
-        import httpx
-
-        try:
-            async with httpx.AsyncClient(timeout=min(5.0, self.timeout_s)) as client:
-                response = await client.get(f"{self.base_url}/models")
-            return response.status_code == 200
-        except Exception:  # noqa: BLE001
-            return False
-
-
-def _detail(response: Any) -> str:
-    try:
-        body = response.json()
-    except Exception:  # noqa: BLE001
-        return f"engine returned {response.status_code}"
-    error = body.get("error") if isinstance(body, dict) else None
-    if isinstance(error, dict) and error.get("message"):
-        return str(error["message"])
-    return f"engine returned {response.status_code}"
 
 
 class RoutedProvider:
@@ -472,28 +252,26 @@ _provider: Optional[ASRProvider] = None
 
 
 def provider() -> ASRProvider:
-    """The configured engine, built once.
+    """The configured engine — currently none.
 
-    Cached because building it is free but re-reading settings on every
-    request would let a mid-flight config change split one workspace's
-    transcripts across two engines.
+    Both evaluated engines were rejected and removed, so there is nothing to
+    return. This raises rather than returning a stub that would answer every
+    recording with silence: a deployment with no speech engine must fail
+    loudly here, and `audio_api` already refuses with 404 before it gets this
+    far because `ASR_ENABLED` defaults to false.
+
+    A stale deployment that still has ASR_ENABLED=true in its environment
+    reaches this and gets a 503 with a sentence, which is the honest answer.
+
+    THE NEXT ENGINE goes here: build it, wrap the fleet in `RoutedProvider`,
+    and cache it in `_provider` exactly as before.
     """
-    global _provider
-    if _provider is None:
-        engines = [
-            VLLMAudioProvider(
-                base_url=url,
-                model=settings.asr_model,
-                name=settings.asr_backend,
-                timeout_s=settings.asr_timeout_s,
-            )
-            for url in settings.asr_base_urls
-        ]
-        # One engine still goes through the router: the code path a workspace
-        # runs every day should be the one the tests exercise, not a special
-        # case that only appears on smaller deployments.
-        _provider = RoutedProvider(engines)
-    return _provider
+    if _provider is not None:
+        return _provider
+    raise ASRUnavailable(
+        "no speech engine is configured on this deployment "
+        "(voice input is disabled until one is installed)"
+    )
 
 
 def set_provider(value: Optional[ASRProvider]) -> None:

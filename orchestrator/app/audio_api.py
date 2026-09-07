@@ -281,13 +281,20 @@ async def health(
     """
     if not settings.asr_enabled:
         return {"enabled": False, "ready": False, "reason": "voice input is disabled"}
-    engine = asr.provider()
+    # No engine is installed. `provider()` raises rather than returning a stub,
+    # and an administrator asking whether dictation works deserves that answer
+    # rather than an "enabled, not ready" that hides the reason.
+    try:
+        engine = asr.provider()
+    except asr.ASRUnavailable as exc:
+        return {"enabled": True, "ready": False, "model": None,
+                "active": 0, "waiting": 0, "engines": [], "reason": str(exc)}
     ready = await engine.health()
     fleet = engine.stats() if hasattr(engine, "stats") else []
     return {
         "enabled": True,
         "ready": ready,
-        "model": settings.asr_model,
+        "model": getattr(engine, "model", None),
         "active": asr.POOL.active,
         "waiting": asr.POOL.waiting,
         # One row per engine, so a half-down fleet is visible as exactly that

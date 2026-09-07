@@ -28,9 +28,19 @@
       "endpoint_type": "openai-chat",
       "startup_arguments": [],
       "tokenizer_arguments": {},
-      "health_probe": {"path": "/v1/models", "method": "GET"},
-      "required_files": ["config.json", "tokenizer.json", "*.safetensors"],
-      "license_metadata": {"spdx": "Apache-2.0", "source": "model-card"}
+      "health_probe": {
+        "path": "/v1/models",
+        "method": "GET"
+      },
+      "required_files": [
+        "config.json",
+        "tokenizer.json",
+        "*.safetensors"
+      ],
+      "license_metadata": {
+        "spdx": "Apache-2.0",
+        "source": "model-card"
+      }
     },
     "mac-qwen3-14b-4bit": {
       "id": "mlx-community/Qwen3-14B-4bit",
@@ -58,9 +68,19 @@
       "endpoint_type": "openai-chat",
       "startup_arguments": [],
       "tokenizer_arguments": {},
-      "health_probe": {"path": "/v1/models", "method": "GET"},
-      "required_files": ["config.json", "tokenizer.json", "*.safetensors"],
-      "license_metadata": {"spdx": "Apache-2.0", "source": "model-card"}
+      "health_probe": {
+        "path": "/v1/models",
+        "method": "GET"
+      },
+      "required_files": [
+        "config.json",
+        "tokenizer.json",
+        "*.safetensors"
+      ],
+      "license_metadata": {
+        "spdx": "Apache-2.0",
+        "source": "model-card"
+      }
     },
     "mac-qwen36-35b-4bit": {
       "id": "mlx-community/Qwen3.6-35B-A3B-4bit",
@@ -88,9 +108,19 @@
       "endpoint_type": "openai-chat",
       "startup_arguments": [],
       "tokenizer_arguments": {},
-      "health_probe": {"path": "/v1/models", "method": "GET"},
-      "required_files": ["config.json", "tokenizer.json", "*.safetensors"],
-      "license_metadata": {"spdx": "Apache-2.0", "source": "model-card"}
+      "health_probe": {
+        "path": "/v1/models",
+        "method": "GET"
+      },
+      "required_files": [
+        "config.json",
+        "tokenizer.json",
+        "*.safetensors"
+      ],
+      "license_metadata": {
+        "spdx": "Apache-2.0",
+        "source": "model-card"
+      }
     },
     "mac-qwen36-35b-6bit": {
       "id": "mlx-community/Qwen3.6-35B-A3B-6bit",
@@ -118,9 +148,19 @@
       "endpoint_type": "openai-chat",
       "startup_arguments": [],
       "tokenizer_arguments": {},
-      "health_probe": {"path": "/v1/models", "method": "GET"},
-      "required_files": ["config.json", "tokenizer.json", "*.safetensors"],
-      "license_metadata": {"spdx": "Apache-2.0", "source": "model-card"}
+      "health_probe": {
+        "path": "/v1/models",
+        "method": "GET"
+      },
+      "required_files": [
+        "config.json",
+        "tokenizer.json",
+        "*.safetensors"
+      ],
+      "license_metadata": {
+        "spdx": "Apache-2.0",
+        "source": "model-card"
+      }
     },
     "mac-qwen3-embed-06b-8bit": {
       "id": "mlx-community/Qwen3-Embedding-0.6B-8bit",
@@ -146,11 +186,24 @@
       "supports_streaming": false,
       "requires_trust_remote_code": false,
       "endpoint_type": "openai-embeddings",
-      "startup_arguments": ["--runner", "pooling"],
+      "startup_arguments": [
+        "--runner",
+        "pooling"
+      ],
       "tokenizer_arguments": {},
-      "health_probe": {"path": "/v1/models", "method": "GET"},
-      "required_files": ["config.json", "tokenizer.json", "model.safetensors"],
-      "license_metadata": {"spdx": "Apache-2.0", "source": "model-card"}
+      "health_probe": {
+        "path": "/v1/models",
+        "method": "GET"
+      },
+      "required_files": [
+        "config.json",
+        "tokenizer.json",
+        "model.safetensors"
+      ],
+      "license_metadata": {
+        "spdx": "Apache-2.0",
+        "source": "model-card"
+      }
     },
     "mac-qwen3-reranker-06b-8bit": {
       "id": "mku64/Qwen3-Reranker-0.6B-mlx-8Bit",
@@ -176,11 +229,24 @@
       "supports_streaming": false,
       "requires_trust_remote_code": false,
       "endpoint_type": "vllm-score",
-      "startup_arguments": ["--runner", "pooling"],
+      "startup_arguments": [
+        "--runner",
+        "pooling"
+      ],
       "tokenizer_arguments": {},
-      "health_probe": {"path": "/v1/models", "method": "GET"},
-      "required_files": ["config.json", "tokenizer.json", "model.safetensors"],
-      "license_metadata": {"spdx": "Apache-2.0", "source": "model-card"}
+      "health_probe": {
+        "path": "/v1/models",
+        "method": "GET"
+      },
+      "required_files": [
+        "config.json",
+        "tokenizer.json",
+        "model.safetensors"
+      ],
+      "license_metadata": {
+        "spdx": "Apache-2.0",
+        "source": "model-card"
+      }
     },
     "dgx-qwen36-35b-nvfp4": {
       "id": "nvidia/Qwen3.6-35B-A3B-NVFP4",
@@ -207,12 +273,29 @@
       "supports_streaming": true,
       "requires_trust_remote_code": true,
       "endpoint_type": "openai-chat",
-      "startup_arguments": ["--quantization", "modelopt", "--attention-backend", "flashinfer"],
+      "startup_arguments": [
+        "--quantization",
+        "modelopt",
+        "--attention-backend",
+        "flashinfer"
+      ],
       "tokenizer_arguments": {},
-      "health_probe": {"path": "/v1/models", "method": "GET"},
-      "legacy_directories": ["Qwen3.6-35B-A3B-NVFP4"],
-      "required_files": ["config.json", "tokenizer.json", "*.safetensors"],
-      "license_metadata": {"spdx": "Apache-2.0", "source": "model-card"}
+      "health_probe": {
+        "path": "/v1/models",
+        "method": "GET"
+      },
+      "legacy_directories": [
+        "Qwen3.6-35B-A3B-NVFP4"
+      ],
+      "required_files": [
+        "config.json",
+        "tokenizer.json",
+        "*.safetensors"
+      ],
+      "license_metadata": {
+        "spdx": "Apache-2.0",
+        "source": "model-card"
+      }
     },
     "dgx-qwen38-27b-nvfp4": {
       "id": "RadixArk/Qwen3.8-27B-NVFP4",
@@ -239,11 +322,26 @@
       "supports_streaming": true,
       "requires_trust_remote_code": true,
       "endpoint_type": "openai-chat",
-      "startup_arguments": ["--quantization", "modelopt", "--attention-backend", "flashinfer"],
+      "startup_arguments": [
+        "--quantization",
+        "modelopt",
+        "--attention-backend",
+        "flashinfer"
+      ],
       "tokenizer_arguments": {},
-      "health_probe": {"path": "/v1/models", "method": "GET"},
-      "required_files": ["config.json", "tokenizer.json", "*.safetensors"],
-      "license_metadata": {"spdx": "Apache-2.0", "source": "model-card"}
+      "health_probe": {
+        "path": "/v1/models",
+        "method": "GET"
+      },
+      "required_files": [
+        "config.json",
+        "tokenizer.json",
+        "*.safetensors"
+      ],
+      "license_metadata": {
+        "spdx": "Apache-2.0",
+        "source": "model-card"
+      }
     },
     "dgx-qwen3-vl-8b-fp8": {
       "id": "Qwen/Qwen3-VL-8B-Instruct-FP8",
@@ -271,10 +369,22 @@
       "endpoint_type": "openai-chat",
       "startup_arguments": [],
       "tokenizer_arguments": {},
-      "health_probe": {"path": "/v1/models", "method": "GET"},
-      "legacy_directories": ["qwen3-vl-8b-fp8"],
-      "required_files": ["config.json", "tokenizer.json", "*.safetensors"],
-      "license_metadata": {"spdx": "Apache-2.0", "source": "model-card"}
+      "health_probe": {
+        "path": "/v1/models",
+        "method": "GET"
+      },
+      "legacy_directories": [
+        "qwen3-vl-8b-fp8"
+      ],
+      "required_files": [
+        "config.json",
+        "tokenizer.json",
+        "*.safetensors"
+      ],
+      "license_metadata": {
+        "spdx": "Apache-2.0",
+        "source": "model-card"
+      }
     },
     "qwen3-embed-06b": {
       "id": "Qwen/Qwen3-Embedding-0.6B",
@@ -300,11 +410,24 @@
       "supports_streaming": false,
       "requires_trust_remote_code": false,
       "endpoint_type": "openai-embeddings",
-      "startup_arguments": ["--runner", "pooling"],
+      "startup_arguments": [
+        "--runner",
+        "pooling"
+      ],
       "tokenizer_arguments": {},
-      "health_probe": {"path": "/v1/models", "method": "GET"},
-      "required_files": ["config.json", "tokenizer.json", "model.safetensors"],
-      "license_metadata": {"spdx": "Apache-2.0", "source": "model-card"}
+      "health_probe": {
+        "path": "/v1/models",
+        "method": "GET"
+      },
+      "required_files": [
+        "config.json",
+        "tokenizer.json",
+        "model.safetensors"
+      ],
+      "license_metadata": {
+        "spdx": "Apache-2.0",
+        "source": "model-card"
+      }
     },
     "unlimited-ocr": {
       "id": "baidu/Unlimited-OCR",
@@ -330,43 +453,26 @@
       "supports_streaming": false,
       "requires_trust_remote_code": true,
       "endpoint_type": "openai-chat",
-      "startup_arguments": ["--enforce-eager"],
+      "startup_arguments": [
+        "--enforce-eager"
+      ],
       "tokenizer_arguments": {},
-      "health_probe": {"path": "/v1/models", "method": "GET"},
-      "legacy_directories": ["unlimited-ocr"],
-      "required_files": ["config.json", "tokenizer.json", "*.safetensors"],
-      "license_metadata": {"spdx": "MIT", "source": "model-card"}
-    },
-    "qwen3-asr-17b": {
-      "id": "Qwen/Qwen3-ASR-1.7B",
-      "provider": "Qwen",
-      "revision": "7278e1e70fe206f11671096ffdd38061171dd6e5",
-      "backend": "vllm-cuda",
-      "quantization": "BF16",
-      "approximate_download_bytes": 4698521512,
-      "approximate_loaded_weight_bytes": 6442450944,
-      "context_limit": 8192,
-      "tested_context": 8192,
-      "minimum_memory_bytes": 8589934592,
-      "recommended_memory_bytes": 10737418240,
-      "supports_chat": false,
-      "supports_reasoning": false,
-      "supports_vision": false,
-      "supports_audio": true,
-      "supports_tool_calling": false,
-      "supports_structured_output": false,
-      "supports_embeddings": false,
-      "supports_reranking": false,
-      "supports_ocr": false,
-      "supports_streaming": true,
-      "requires_trust_remote_code": false,
-      "endpoint_type": "openai-chat",
-      "startup_arguments": [],
-      "tokenizer_arguments": {},
-      "health_probe": {"path": "/v1/models", "method": "GET"},
-      "legacy_directories": [],
-      "required_files": ["config.json", "preprocessor_config.json", "*.safetensors"],
-      "license_metadata": {"spdx": "Apache-2.0", "source": "model-card"}
+      "health_probe": {
+        "path": "/v1/models",
+        "method": "GET"
+      },
+      "legacy_directories": [
+        "unlimited-ocr"
+      ],
+      "required_files": [
+        "config.json",
+        "tokenizer.json",
+        "*.safetensors"
+      ],
+      "license_metadata": {
+        "spdx": "MIT",
+        "source": "model-card"
+      }
     },
     "qwen3-reranker-06b": {
       "id": "Qwen/Qwen3-Reranker-0.6B",
@@ -392,12 +498,28 @@
       "supports_streaming": false,
       "requires_trust_remote_code": false,
       "endpoint_type": "vllm-score",
-      "startup_arguments": ["--runner", "pooling", "--convert", "classify",
-        "--hf-overrides", "{\"architectures\":[\"Qwen3ForSequenceClassification\"],\"classifier_from_token\":[\"no\",\"yes\"],\"is_original_qwen3_reranker\":true}"],
+      "startup_arguments": [
+        "--runner",
+        "pooling",
+        "--convert",
+        "classify",
+        "--hf-overrides",
+        "{\"architectures\":[\"Qwen3ForSequenceClassification\"],\"classifier_from_token\":[\"no\",\"yes\"],\"is_original_qwen3_reranker\":true}"
+      ],
       "tokenizer_arguments": {},
-      "health_probe": {"path": "", "method": "none"},
-      "required_files": ["config.json", "tokenizer.json", "model.safetensors"],
-      "license_metadata": {"spdx": "Apache-2.0", "source": "model-card"}
+      "health_probe": {
+        "path": "",
+        "method": "none"
+      },
+      "required_files": [
+        "config.json",
+        "tokenizer.json",
+        "model.safetensors"
+      ],
+      "license_metadata": {
+        "spdx": "Apache-2.0",
+        "source": "model-card"
+      }
     },
     "nvidia-qwen36-35b-fp8": {
       "id": "Qwen/Qwen3.6-35B-A3B-FP8",
@@ -423,11 +545,25 @@
       "supports_streaming": true,
       "requires_trust_remote_code": true,
       "endpoint_type": "openai-chat",
-      "startup_arguments": ["--trust-remote-code", "--max-num-batched-tokens", "8192"],
+      "startup_arguments": [
+        "--trust-remote-code",
+        "--max-num-batched-tokens",
+        "8192"
+      ],
       "tokenizer_arguments": {},
-      "health_probe": {"path": "/v1/models", "method": "GET"},
-      "required_files": ["config.json", "tokenizer.json", "*.safetensors"],
-      "license_metadata": {"spdx": "Apache-2.0", "source": "model-card"}
+      "health_probe": {
+        "path": "/v1/models",
+        "method": "GET"
+      },
+      "required_files": [
+        "config.json",
+        "tokenizer.json",
+        "*.safetensors"
+      ],
+      "license_metadata": {
+        "spdx": "Apache-2.0",
+        "source": "model-card"
+      }
     },
     "nvidia-qwen3-30b-fp8": {
       "id": "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8",
@@ -455,9 +591,19 @@
       "endpoint_type": "openai-chat",
       "startup_arguments": [],
       "tokenizer_arguments": {},
-      "health_probe": {"path": "/v1/models", "method": "GET"},
-      "required_files": ["config.json", "tokenizer.json", "*.safetensors"],
-      "license_metadata": {"spdx": "Apache-2.0", "source": "model-card"}
+      "health_probe": {
+        "path": "/v1/models",
+        "method": "GET"
+      },
+      "required_files": [
+        "config.json",
+        "tokenizer.json",
+        "*.safetensors"
+      ],
+      "license_metadata": {
+        "spdx": "Apache-2.0",
+        "source": "model-card"
+      }
     },
     "nvidia-qwen3-14b-awq": {
       "id": "Qwen/Qwen3-14B-AWQ",
@@ -483,11 +629,24 @@
       "supports_streaming": true,
       "requires_trust_remote_code": false,
       "endpoint_type": "openai-chat",
-      "startup_arguments": ["--quantization", "awq"],
+      "startup_arguments": [
+        "--quantization",
+        "awq"
+      ],
       "tokenizer_arguments": {},
-      "health_probe": {"path": "/v1/models", "method": "GET"},
-      "required_files": ["config.json", "tokenizer.json", "*.safetensors"],
-      "license_metadata": {"spdx": "Apache-2.0", "source": "model-card"}
+      "health_probe": {
+        "path": "/v1/models",
+        "method": "GET"
+      },
+      "required_files": [
+        "config.json",
+        "tokenizer.json",
+        "*.safetensors"
+      ],
+      "license_metadata": {
+        "spdx": "Apache-2.0",
+        "source": "model-card"
+      }
     },
     "nvidia-qwen3-8b-awq": {
       "id": "Qwen/Qwen3-8B-AWQ",
@@ -513,11 +672,24 @@
       "supports_streaming": true,
       "requires_trust_remote_code": false,
       "endpoint_type": "openai-chat",
-      "startup_arguments": ["--quantization", "awq"],
+      "startup_arguments": [
+        "--quantization",
+        "awq"
+      ],
       "tokenizer_arguments": {},
-      "health_probe": {"path": "/v1/models", "method": "GET"},
-      "required_files": ["config.json", "tokenizer.json", "*.safetensors"],
-      "license_metadata": {"spdx": "Apache-2.0", "source": "model-card"}
+      "health_probe": {
+        "path": "/v1/models",
+        "method": "GET"
+      },
+      "required_files": [
+        "config.json",
+        "tokenizer.json",
+        "*.safetensors"
+      ],
+      "license_metadata": {
+        "spdx": "Apache-2.0",
+        "source": "model-card"
+      }
     },
     "cpu-qwen3-06b-q8": {
       "id": "Qwen/Qwen3-0.6B-GGUF",
@@ -546,10 +718,22 @@
       "endpoint_type": "openai-chat",
       "startup_arguments": [],
       "tokenizer_arguments": {},
-      "health_probe": {"path": "/health", "method": "GET"},
-      "allow_patterns": ["Qwen3-0.6B-Q8_0.gguf", "README.md", "LICENSE*"],
-      "required_files": ["Qwen3-0.6B-Q8_0.gguf"],
-      "license_metadata": {"spdx": "Apache-2.0", "source": "model-card"}
+      "health_probe": {
+        "path": "/health",
+        "method": "GET"
+      },
+      "allow_patterns": [
+        "Qwen3-0.6B-Q8_0.gguf",
+        "README.md",
+        "LICENSE*"
+      ],
+      "required_files": [
+        "Qwen3-0.6B-Q8_0.gguf"
+      ],
+      "license_metadata": {
+        "spdx": "Apache-2.0",
+        "source": "model-card"
+      }
     }
   },
   "runtimes": {

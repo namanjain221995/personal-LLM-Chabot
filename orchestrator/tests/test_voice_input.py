@@ -40,8 +40,8 @@ from app.config import settings
 #: Deliberately distinctive, so the "nothing leaks" test is looking for
 #: strings that could only have come from the server's own configuration.
 ENGINE_URL = "http://asr-node.internal:30006/v1"
-ENGINE_MODEL = "Qwen/Qwen3-ASR-1.7B-worker-build"
-ENGINE_NAME = "qwen3_asr_worker"
+ENGINE_MODEL = "test-engine/asr-worker-build"
+ENGINE_NAME = "test_engine_worker"
 
 #: What the fake engine hears. Chosen to be the sort of thing a person would
 #: be appalled to find in a telemetry table.
@@ -56,7 +56,7 @@ _SLICE = 64 * 1024
 
 
 class FakeEngine:
-    """Qwen3-ASR's stand-in: records what it was asked, answers as instructed.
+    """A speech engine's stand-in: records what it was asked, answers as told.
 
     Every test but the pure parsing ones goes through this, so a test failure
     is always about the orchestrator and never about a GPU being busy.
@@ -106,7 +106,6 @@ def engine(monkeypatch):
     """A deployment WITH a speech engine, and clean admission control."""
     monkeypatch.setattr(settings, "asr_enabled", True)
     monkeypatch.setattr(settings, "asr_base_url", ENGINE_URL)
-    monkeypatch.setattr(settings, "asr_model", ENGINE_MODEL)
     # The rate window and the pool are process-wide. Left alone, the twentieth
     # request of the file would 429 inside whichever test happened to be
     # twentieth, and the semaphore from the concurrency test would still hold
@@ -214,7 +213,7 @@ def test_one_persons_revoked_microphone_does_not_close_anybody_elses(
 def test_a_deployment_without_a_speech_engine_answers_not_found(
     engine, login_client, monkeypatch
 ):
-    """404, not 503: a deployment that never started scripts/asr.sh does not
+    """404, not 503: a deployment with no speech engine installed does not
     HAVE this feature, and 503 would promise it is coming back."""
     monkeypatch.setattr(settings, "asr_enabled", False)
     bob = login_client("bob")
@@ -520,31 +519,28 @@ def test_an_engine_failure_nobody_named_is_still_a_sentence_and_still_a_row(
     assert rows[0]["status"] == "error"
 
 
-def test_an_engine_reply_this_client_cannot_read_is_engine_trouble(monkeypatch):
+def test_an_engine_reply_this_client_cannot_read_is_engine_trouble(
+    engine, login_client
+):
     """A 200 is not a promise about the shape of a body.
 
-    An interstitial from a proxy in front of the worker parses as neither JSON
-    nor a completion. Letting that raise out of the provider turns one
-    misconfigured reverse proxy into 500s; it is the same trouble as a refused
-    connection, so it is ASRUnavailable and the caller may retry.
+    An interstitial from a proxy in front of the engine parses as neither JSON
+    nor a transcript. Whatever engine is installed, a provider that let that
+    raise would turn one misconfigured reverse proxy into 500s. It is the same
+    trouble as a refused connection, so it must arrive as ASRUnavailable and
+    the person gets a sentence rather than a stack-trace id.
+
+    Asserted through the route rather than against a particular provider: the
+    engine that used to be here is gone, and the property belongs to the
+    contract, not to its implementation.
     """
-    import httpx
-
-    def gateway_timeout(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, text="<html>504 Gateway Time-out</html>")
-
-    real_client = httpx.AsyncClient
-    monkeypatch.setattr(
-        httpx,
-        "AsyncClient",
-        lambda **kwargs: real_client(
-            transport=httpx.MockTransport(gateway_timeout), **kwargs
-        ),
+    engine.raises = asr.ASRUnavailable(
+        "the engine returned a reply this client cannot read"
     )
-    provider = asr.VLLMAudioProvider(base_url=ENGINE_URL, model=ENGINE_MODEL)
-
-    with pytest.raises(asr.ASRUnavailable):
-        asyncio.run(provider._chat(WEBM, "audio/webm", "auto"))
+    response = _post(login_client("proxy"))
+    assert response.status_code == 503
+    assert isinstance(response.json()["detail"], str)
+    assert "html" not in response.json()["detail"].lower()
 
 
 def test_a_failed_attempt_records_the_wait_the_person_actually_sat_through(
@@ -649,36 +645,6 @@ def test_an_administrator_gets_the_honest_operational_answer(engine, login_clien
     assert body["enabled"] is True
     assert body["ready"] is True
     assert body["model"] == ENGINE_MODEL
-
-
-# ---------------------------------------------------------------------------
-# The output contract
-# ---------------------------------------------------------------------------
-
-
-def test_the_models_own_output_contract_is_split_into_language_and_words():
-    assert asr.parse_chat_output("language English<asr_text>Hello there.") == (
-        "English",
-        "Hello there.",
-    )
-
-
-def test_a_reply_that_does_not_follow_the_contract_keeps_the_words_and_drops_the_claim():
-    """A parser that fell back to "the first word is the language" would file
-    a transcript beginning "Hello" under a language called Hello."""
-    assert asr.parse_chat_output("Hello there.") == (None, "Hello there.")
-    assert asr.parse_chat_output("") == (None, "")
-
-
-def test_a_language_the_model_does_not_speak_is_none_rather_than_a_guess():
-    """The console's language column is a label on a metric. Accepting
-    whatever the engine emitted would let a mis-parse invent a language and
-    grow the label set without bound."""
-    assert asr.normalise_language("English") == "English"
-    assert asr.normalise_language("english") == "English"
-    assert asr.normalise_language("Cantonese.") == "Cantonese"
-    assert asr.normalise_language("Klingon") is None
-    assert asr.normalise_language("") is None
 
 
 def test_a_transcript_never_tells_a_member_what_hardware_answered(
@@ -911,18 +877,6 @@ def test_the_fleet_is_healthy_while_any_engine_answers():
     alive = CountingEngine("http://alive/v1")
     assert asyncio.run(asr.RoutedProvider([dead, alive]).health()) is True
     assert asyncio.run(asr.RoutedProvider([dead]).health()) is False
-
-
-def test_one_endpoint_still_goes_through_the_router(monkeypatch):
-    """The code path a workspace runs every day should be the one the tests
-    exercise, not a special case that only appears on smaller deployments."""
-    monkeypatch.setattr(settings, "asr_base_urls", ("http://only/v1",))
-    asr.set_provider(None)
-    try:
-        assert isinstance(asr.provider(), asr.RoutedProvider)
-        assert len(asr.provider().stats()) == 1
-    finally:
-        asr.set_provider(None)
 
 
 def test_the_pool_scales_with_the_fleet_not_with_the_pressure(monkeypatch):

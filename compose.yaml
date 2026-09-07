@@ -175,16 +175,20 @@ services:
       REPORTS_DIR: /reports
       MPLCONFIGDIR: /tmp/matplotlib
       XDG_CACHE_HOME: /tmp/cache
-      # Speech to text. Unlike the other model services these are passed
-      # EXPLICITLY, because the engine does not live on this Compose network:
-      # scripts/asr.sh puts it on whichever node has room (the worker, in dual
-      # mode) and writes the resolved address into .env. Defaults keep the
-      # feature off, so a deployment that has never run that script behaves
-      # exactly as it did before.
+      # Speech to text. NO ENGINE IS INSTALLED: both evaluated models
+      # (Qwen3-ASR-1.7B and TheWhisper) were rejected and their services,
+      # images and weights removed. What is left here is the model-AGNOSTIC
+      # half — the caps and limits the route enforces regardless of which
+      # engine answers.
+      #
+      # These are passed EXPLICITLY rather than inherited, because a speech
+      # engine does not live on this Compose network: it runs as its own
+      # project on the node that has room for it, and the orchestrator is told
+      # the address. ASR_ENABLED stays false until that engine exists, so the
+      # composer hides the microphone rather than offering a button that
+      # cannot work.
       ASR_ENABLED: ${ASR_ENABLED:-false}
       ASR_BASE_URL: ${ASR_BASE_URL:-}
-      ASR_MODEL: ${ASR_MODEL:-Qwen/Qwen3-ASR-1.7B}
-      ASR_BACKEND: ${ASR_BACKEND:-qwen3_asr}
       ASR_LANGUAGE: ${ASR_LANGUAGE:-auto}
       ASR_TIMEOUT_S: ${ASR_TIMEOUT_S:-60}
       ASR_MAX_AUDIO_SECONDS: ${ASR_MAX_AUDIO_SECONDS:-600}
