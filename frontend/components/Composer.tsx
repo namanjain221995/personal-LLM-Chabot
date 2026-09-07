@@ -1050,7 +1050,15 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
                   status line, so it is automatic, not hidden. */}
 
               <span className="ml-auto flex items-center gap-1.5">
-                {/* Dictation. Between the tools and the send button, which is
+                <ModelPicker
+                  model={prefs.model}
+                  effort={prefs.effort}
+                  onChange={(model, effort) =>
+                    onPrefsChange({ ...prefs, model, effort })
+                  }
+                />
+                {/* Dictation. Between the effort picker and the send button
+                    (owner request 2026-09-07 — it used to lead the group),
                     where a thumb already is, and hidden entirely when the
                     browser cannot record or the account may not — an offered
                     control that always fails is worse than no control. */}
@@ -1063,16 +1071,9 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
                     title="Dictate a message"
                     className="shrink-0 rounded-lg p-2 text-icon transition-colors duration-ts hover:bg-surface-2 hover:text-ink disabled:cursor-not-allowed disabled:opacity-35"
                   >
-                    <IconMic size={17} />
+                    <IconMic size={20} />
                   </button>
                 )}
-                <ModelPicker
-                  model={prefs.model}
-                  effort={prefs.effort}
-                  onChange={(model, effort) =>
-                    onPrefsChange({ ...prefs, model, effort })
-                  }
-                />
                 {streaming ? (
                   <button
                     type="button"

@@ -104,7 +104,7 @@ export function ModelPicker({
       >
         {EFFORT_SHORT[effort]}
         <IconChevronDown
-          size={12}
+          size={20}
           className={`transition-transform duration-ts ${open ? 'rotate-180' : ''}`}
         />
       </button>
@@ -114,8 +114,8 @@ export function ModelPicker({
           role="menu"
           aria-label="Effort"
           // right-0: the chip sits at the RIGHT end of the controls row
-          // (next to Send since 2026-08-05), so the popover must grow
-          // leftward or it would clip past the composer's edge.
+          // (before the mic and Send since 2026-09-07), so the popover must
+          // grow leftward or it would clip past the composer's edge.
           className="absolute bottom-full right-0 z-30 mb-2 w-[288px] rounded-ts border border-border bg-surface p-1 shadow-xl"
         >
           <p className="px-2.5 pb-1 pt-1.5 text-[11px] font-medium uppercase tracking-wide text-faint">
