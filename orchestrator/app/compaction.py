@@ -260,6 +260,22 @@ async def compact(
             return None
 
 
+def should_compact(budget: Budget, threshold: float) -> bool:
+    """Whether this prompt needs folding, on EITHER trigger.
+
+    A fraction of the window, as before — and an absolute token ceiling,
+    because the fraction alone stopped working when the window became
+    1,000,000 tokens. 0.80 of a ~991,000-token usable budget is ~793,000
+    tokens: no real conversation reaches it, so no summary was ever written
+    and every long thread's only memory was whatever slice the engine
+    happened to pass on. Whichever trigger fires first wins.
+    """
+    if budget.fraction > threshold:
+        return True
+    cap = int(settings.context_compact_max_tokens or 0)
+    return cap > 0 and budget.used > cap
+
+
 async def prepare(
     conversation_id: str,
     history: Sequence[dict],
@@ -290,7 +306,7 @@ async def prepare(
     )
 
     compacted = None
-    if budget.fraction > settings.context_compact_threshold:
+    if should_compact(budget, settings.context_compact_threshold):
         if emit is not None:
             await emit("status", {"text": "Compacting conversation…"})
         # Adaptive: KEEP_RECENT_TURNS verbatim turns can themselves exceed the
@@ -321,7 +337,7 @@ async def prepare(
                 model=model,
                 requested_max_tokens=requested_max_tokens,
             )
-            if budget.fraction <= settings.context_compact_threshold:
+            if not should_compact(budget, settings.context_compact_threshold):
                 break
             if keep <= MIN_KEEP_RECENT:
                 break  # nothing left to give up; fit_request clips from here
@@ -368,7 +384,7 @@ async def maybe_background_compact(
             model=model,
             requested_max_tokens=requested_max_tokens,
         )
-        if budget.fraction <= settings.context_bg_compact_threshold:
+        if not should_compact(budget, settings.context_bg_compact_threshold):
             return None
         result = await compact(conversation_id, history)
         if result:

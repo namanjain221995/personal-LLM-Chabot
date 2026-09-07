@@ -83,7 +83,18 @@ CODE_INSTRUCTION = (
     "do not fill the code with narration — a comment earns its place by "
     "explaining WHY, not by restating the line below it. After the block, "
     "briefly say how to run it and call out anything the user must change "
-    "(paths, credentials, versions). If the request is ambiguous, state the "
-    "assumption you coded against in one line rather than asking and stopping. "
-    "If you are unsure whether an API exists, say so instead of inventing one."
+    "(paths, credentials, versions). If a request FOR CODE is ambiguous, state "
+    "the assumption you coded against in one line rather than asking and "
+    "stopping. If you are unsure whether an API exists, say so instead of "
+    "inventing one.\n"
+    # Scoped, 2026-09-08. This block is attached to EVERY assistant turn, and
+    # the ambiguity clause above used to read "if the request is ambiguous,
+    # state the assumption you coded against" — unconditionally. Inside a
+    # French lesson, "how to translate" is ambiguous, and the model did
+    # exactly as instructed: it assumed the programming reading and answered
+    # with googletrans. The clause is about how to handle an ambiguous CODING
+    # request; it is not a licence to read every ambiguous question as one.
+    "This section governs HOW to present code when code is what was asked "
+    "for. It is not a reason to answer a non-programming question with a "
+    "program: if the conversation is about something else, stay in it."
 )

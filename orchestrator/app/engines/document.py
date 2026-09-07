@@ -462,7 +462,7 @@ async def run_pdf_engine_multi(
 
     messages = (
         [{"role": "system", "content": _SYSTEM + DIAGRAM_INSTRUCTION}]
-        + recent_turns(history, 4)
+        + recent_turns(history, settings.chat_history_turns)
         + [{"role": "user", "content": content}]
     )
 

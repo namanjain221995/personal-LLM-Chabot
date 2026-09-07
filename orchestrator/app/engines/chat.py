@@ -17,7 +17,7 @@ from __future__ import annotations
 from typing import Awaitable, Callable, List, Sequence
 
 from . import CODE_INSTRUCTION, DIAGRAM_INSTRUCTION, recent_turns
-from .. import llm
+from .. import continuation, llm
 from ..config import settings
 from ..core import best_of
 
@@ -70,7 +70,14 @@ def _messages(
         system = system + "\n\n" + grounding
     return (
         [{"role": "system", "content": system}]
-        + recent_turns(history, 6)
+        # THE CONVERSATION, not a three-exchange slice. This was 6 — the
+        # reason a 60-message French lesson answered "how to translate" with
+        # a Python tutorial: the last six turns were a goodnight exchange and
+        # the lesson itself was outside the window. Bounding history is
+        # compaction's job (a rolling summary, on an absolute token budget)
+        # and fit_request's (the physical window); an engine cutting on top
+        # of both only throws away what they chose to keep.
+        + recent_turns(history, settings.chat_history_turns)
         + [{"role": "user", "content": message}]
     )
 
@@ -145,20 +152,36 @@ async def run_chat_engine(
             )
             return winner.answer
 
-    parts: List[str] = []
-    async for kind, text in llm.stream_chat_events(
-        _messages(message, history, mode, grounding),
-        model_choice=model_choice,
-        effort=effort,
-        temperature=temperature,
-        max_tokens=max_tokens,
-    ):
+    # LONG ANSWERS ARE MANY CALLS. `max_tokens` above is the ceiling on ONE
+    # call and stays exactly that; the total an answer may run to is decided
+    # by the effort the person chose (continuation.budget_for). At Fast the
+    # two are equal, so that path makes one call and behaves as it always
+    # has — the loop only engages where somebody asked for depth.
+    #
+    # The seams are invisible: deltas arrive here through `_out` in order,
+    # with re-emitted openings already stripped, so the UI streams one answer.
+    async def _out(kind: str, text: str) -> None:
         if kind == "reasoning":
             await emit("reasoning", {"text": text})
         else:
-            parts.append(text)
             await emit("token", {"text": text})
 
+    long = await continuation.stream_long_completion(
+        _messages(message, history, mode, grounding),
+        on_delta=_out,
+        model_choice=model_choice,
+        effort=effort,
+        temperature=temperature,
+        segment_max_tokens=max_tokens,
+        total_max_tokens=continuation.budget_for(effort),
+        deadline_s=settings.continuation_deadline_s or None,
+    )
+
     # §10/V2 §2: the SINGLE final meta — no citations/sql keys on this route.
-    await emit("meta", {"route": "chat"})
-    return "".join(parts)
+    # `continuation` is added only when there was something to say: a
+    # one-segment answer looks exactly as it did before.
+    meta = {"route": "chat"}
+    if long.segment_count > 1 or long.truncated:
+        meta["continuation"] = long.as_meta()
+    await emit("meta", meta)
+    return long.text

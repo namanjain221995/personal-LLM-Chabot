@@ -420,6 +420,22 @@ class Settings:
         self.context_compact_threshold: float = _float(
             "CONTEXT_COMPACT_THRESHOLD", 0.80
         )
+        # An ABSOLUTE ceiling on the verbatim prompt, alongside the fractions
+        # above. Those fractions were written for a small window and are now
+        # mis-tuned in the other direction: against a 1,000,000-token window
+        # the usable budget is ~991,000, so 0.80 means compaction first runs
+        # at ~793,000 tokens — i.e. never, in any real conversation. A
+        # 60-message session measured 5,826 tokens, 0.58% of the window, and
+        # had no summary at all.
+        #
+        # That mattered because the engines then showed the model only the
+        # last few turns, so the ONLY memory a long chat had was a slice that
+        # ended three exchanges ago. Whichever of the two triggers fires
+        # first now wins, so older turns become a summary at a size that
+        # actually occurs. 0 disables the absolute one.
+        self.context_compact_max_tokens: int = _int(
+            "CONTEXT_COMPACT_MAX_TOKENS", 40_000
+        )
         self.keep_recent_turns: int = _int("KEEP_RECENT_TURNS", 8)
         self.summary_max_tokens: int = _int("SUMMARY_MAX_TOKENS", 2000)
         # An answer this short is a failure for a thinking model (it burns the
@@ -437,6 +453,13 @@ class Settings:
             "CROSS_CHAT_SEMANTIC_ENABLED", True
         )
         # Cosine floor below which a candidate is noise, not a memory.
+        # A hit must clear BOTH floors: this absolute one, and a fraction of
+        # the best hit in the same query (below). The absolute floor alone
+        # returns whatever clears it when nothing relevant exists, which on a
+        # small corpus is noise presented as memory.
+        self.semantic_recall_relative_floor: float = _float(
+            "SEMANTIC_RECALL_RELATIVE_FLOOR", 0.75
+        )
         self.semantic_recall_min_score: float = _float(
             "SEMANTIC_RECALL_MIN_SCORE", 0.30
         )
@@ -986,6 +1009,82 @@ class Settings:
         self.public_share_max_days: int = _int("PUBLIC_SHARE_MAX_EXPIRY_DAYS", 365)
         #: A link that never expires is a link nobody remembers exists.
         self.public_share_allow_never: bool = _bool("PUBLIC_SHARE_ALLOW_NEVER_EXPIRE", False)
+        # --- Long-form output: many bounded calls, one text -----------------
+        #
+        # MODEL_MAX_OUTPUT above is the ceiling on ONE call. It is not the
+        # ceiling on an answer: `continuation.py` runs as many calls as the
+        # budget allows and stitches them. These settings govern that loop.
+        #
+        # The numbers below are grounded in what this hardware actually does,
+        # measured over 141 real requests: ~46 output tokens/second. So
+        # 1,000,000 tokens is about six hours of continuous decoding, and
+        # GEN_WALL_CLOCK_S (4,200 s) bounds any SINGLE call at ~190,000. The
+        # million is reachable only across segments, and only deliberately.
+        self.continuation_enabled: bool = _bool("CONTINUATION_ENABLED", True)
+        #: The system-level ceiling. No request may exceed it whatever it asks.
+        self.max_logical_output_tokens: int = _int(
+            "MAX_LOGICAL_OUTPUT_TOKENS", 1_000_000
+        )
+        #: Per-effort budgets. ALL THREE default to the ceiling: an answer
+        #: runs until the MODEL says it is finished, at every effort.
+        #:
+        #: These were tiered once (Fast one segment, Think 64k, Max the
+        #: ceiling) to stop a passing question costing hours of GPU. Two
+        #: things were wrong with that. The reasoning was backwards — a
+        #: budget does not stop an expensive question being asked, it stops a
+        #: needed answer being finished, and the guards that actually matter
+        #: (the model saying it is done, repetition, no forward progress) are
+        #: about QUALITY and are always on. And the Fast value was
+        #: pathological: 8,192 sits 192 tokens above the chat engine's 8,000
+        #: per-call ceiling, so every truncated Fast answer wrote exactly one
+        #: segment, found 192 tokens left against a 512 minimum, and stopped
+        #: with "this answer reached its length limit" on the FIRST call —
+        #: the old silent truncation, now with a notice attached.
+        #:
+        #: What this costs is real and worth knowing: ~46 output tokens/second
+        #: means 8k is about 3 minutes and 50k about 18. Almost nothing
+        #: reaches the ceiling, because almost everything stops at `complete`
+        #: — a 40,000-token budget measured against the live model produced
+        #: 2,011 tokens and stopped, because the model was done.
+        #:
+        #: Set any of these lower to put the tiering back.
+        self.continuation_budget_fast: int = _int(
+            "CONTINUATION_BUDGET_FAST", self.max_logical_output_tokens
+        )
+        self.continuation_budget_think: int = _int(
+            "CONTINUATION_BUDGET_THINK", self.max_logical_output_tokens
+        )
+        self.continuation_budget_max: int = _int(
+            "CONTINUATION_BUDGET_MAX", self.max_logical_output_tokens
+        )
+        #: A backstop against a loop that makes tiny forward progress forever.
+        #: At the default segment size this permits far more than any budget.
+        self.continuation_max_segments: int = _int("CONTINUATION_MAX_SEGMENTS", 400)
+        #: How much of the text so far each continuation sees verbatim. Big
+        #: enough to finish an interrupted sentence and hold the voice; small
+        #: enough that segment 200's prefill is the same cost as segment 2's.
+        self.continuation_tail_chars: int = _int("CONTINUATION_TAIL_CHARS", 6_000)
+        #: Never ask for a segment smaller than this — it would be all seam
+        #: and no text.
+        self.continuation_min_segment_tokens: int = _int(
+            "CONTINUATION_MIN_SEGMENT_TOKENS", 512
+        )
+        #: Wall-clock ceiling for a whole long run, independent of the
+        #: per-call GEN_WALL_CLOCK_S. 0 disables it.
+        self.continuation_deadline_s: float = _float(
+            "CONTINUATION_DEADLINE_S", 21_600.0
+        )
+        #: A research report gets its OWN total, well under the chat budget.
+        #: DEEP_RESEARCH_REPORT_MAX_TOKENS is now the size of one segment;
+        #: this is how long the whole report may run to. Nobody asking a
+        #: research question wants a book back, so the default is four
+        #: segments — enough that the report stops because it is finished
+        #: rather than because it ran out of room, which is the thing that
+        #: was actually wrong.
+        self.deep_research_report_total_tokens: int = _int(
+            "DEEP_RESEARCH_REPORT_TOTAL_TOKENS", 24_000
+        )
+
         #: Per user, per hour. Creating a share writes a snapshot, so this
         #: bounds the write amplification of a script as much as the abuse.
         self.share_create_rate_per_hour: int = _int("SHARE_CREATE_RATE_PER_HOUR", 30)
@@ -994,6 +1093,20 @@ class Settings:
 
         # --- Misc ---
         self.session_max_turns: int = _int("SESSION_MAX_TURNS", 20)
+        # How many conversational turns the ASSISTANT sees. Was hardcoded at
+        # 6 in engines/chat.py — three exchanges — which is why a 60-message
+        # French lesson answered "how to translate" with a Python tutorial:
+        # the last six turns were a goodnight exchange and the entire lesson
+        # was outside the window.
+        #
+        # Six was a defence against a small context window. It is the wrong
+        # layer for that now: `compaction.prepare` decides what the model
+        # sees (a rolling summary plus recent turns, bounded by
+        # CONTEXT_COMPACT_MAX_TOKENS above) and `context.fit_request`
+        # guarantees the result physically fits. An engine truncating on top
+        # of both only discards what those two chose to keep. This is a
+        # backstop against a pathological thread, not a memory policy.
+        self.chat_history_turns: int = _int("CHAT_HISTORY_TURNS", 400)
         # Read timeout for model calls. For a NON-streaming completion (agent
         # planning, synthesis, classification) this covers the WHOLE
         # generation, not an inter-byte gap, so it must not expire before the

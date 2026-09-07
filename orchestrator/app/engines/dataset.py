@@ -20,6 +20,7 @@ import json
 from typing import Awaitable, Callable, List, Sequence
 
 from . import DIAGRAM_INSTRUCTION, recent_turns
+from ..config import settings
 from .. import db, llm
 
 Emit = Callable[[str, dict], Awaitable[None]]
@@ -83,7 +84,7 @@ def build_messages(
 ) -> List[dict]:
     return [
         {"role": "system", "content": _SYSTEM + DIAGRAM_INSTRUCTION},
-        *recent_turns(history, 6),
+        *recent_turns(history, settings.chat_history_turns),
         {
             "role": "user",
             "content": f"{format_profile(uploads)}\n\nQuestion: {message}",

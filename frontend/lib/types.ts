@@ -265,6 +265,25 @@ export interface Meta {
    * a user who pasted a large document knows part of it was not sent.
    */
   input_trimmed?: { dropped_turns: number; clipped_messages: number };
+  /**
+   * 2026-09-08: this answer was written across MORE THAN ONE model call.
+   *
+   * One completion is capped at a few thousand tokens; a long answer is
+   * produced by continuing across calls and stitching the seams. Present only
+   * when that happened, or when the answer stopped before the model was
+   * finished — an ordinary one-call reply carries nothing.
+   *
+   * `stop_reason` is "complete" only when the MODEL decided it was done.
+   * Anything else means we stopped it, and `truncated` is then true.
+   * `output_tokens` is null when no server reported usage — NOT MEASURED,
+   * never zero.
+   */
+  continuation?: {
+    segments: number;
+    output_tokens: number | null;
+    stop_reason: string;
+    truncated: boolean;
+  };
   /** Phase A/C: this session's context accounting, for the meter. */
   context?: ContextUsage;
   /** The searches behind this answer, kept so history replays the panel. */

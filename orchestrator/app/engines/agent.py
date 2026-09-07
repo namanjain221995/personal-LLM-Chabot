@@ -30,6 +30,7 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from . import CODE_INSTRUCTION, DIAGRAM_INSTRUCTION, recent_turns
 from .. import llm
+from ..config import settings
 
 Emit = Callable[[str, dict], Awaitable[None]]
 
@@ -242,7 +243,7 @@ async def make_plan(
             )
     messages = (
         llm.apply_reasoning_effort([{"role": "system", "content": system}], "max")
-        + recent_turns(history, 6)
+        + recent_turns(history, settings.chat_history_turns)
         + [{"role": "user", "content": user_content}]
     )
     last_error: Optional[str] = None
@@ -317,7 +318,6 @@ async def _run_step_impl(
     word the user actually typed — "chart" — is usually not in it. Chart
     intent is read from both."""
     if step.kind == "sql" and salesforce:
-        from ..config import settings
         from ..core.exports import cap_rows
         from .live_sf import fetch_live
         from .sql import (  # reuse (§3b)
@@ -391,7 +391,6 @@ async def _run_step_impl(
         )
 
     if step.kind == "rag" and salesforce:
-        from ..config import settings
         from ..core.citations import build_citations
         from .rag import _answer_messages, select_context  # reuse (§3b)
 
@@ -406,7 +405,6 @@ async def _run_step_impl(
         # Straight to the org: newer than the warehouse, and works on objects
         # the warehouse does not carry. Honors SF_LIVE_ENABLED like the SQL
         # engine's fallback does — this path used to bypass the flag entirely.
-        from ..config import settings
         from ..core.salesforce import (SalesforceUnavailable, UnsafeSoql,
                                        merge_rows)
         from .live_sf import describe_rows, fetch_live
@@ -474,7 +472,7 @@ async def _run_step_impl(
                  "Answer from the conversation context and general knowledge. "
                  "State plainly that a web search found no readable sources "
                  "and that your knowledge may be out of date."},
-                *recent_turns(history, 6),
+                *recent_turns(history, settings.chat_history_turns),
                 {"role": "user", "content": step.input},
             ],
             temperature=0.2,
@@ -488,7 +486,7 @@ async def _run_step_impl(
     answer = await llm.chat_completion(
         [
             {"role": "system", "content": _STEP_LLM_SYSTEM},
-            *recent_turns(history, 8),
+            *recent_turns(history, settings.chat_history_turns),
             {"role": "user", "content": step.input},
         ],
         temperature=0.3,

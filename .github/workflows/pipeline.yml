@@ -83,7 +83,7 @@ on:
         type: boolean
         default: false
       branch:
-        description: "Branch to leave the production checkout on (blank = repo variable DEPLOY_BRANCH; '-' = detached HEAD)"
+        description: "Branch to leave the production checkout on (blank = the branch being deployed; '-' = detached HEAD)"
         default: ""
 
 # A newer push to the same branch makes an in-flight TEST run pointless — but
@@ -662,6 +662,34 @@ jobs:
             --title "CI passed" \
             --require policy,launcher,orchestrator,sync-worker,frontend,schema,security,images
 
+      # A skipped job reports NO reason — GitHub shows "skipped" and nothing
+      # else — so a deploy that does not happen is otherwise a guessing game.
+      # This states the inputs to that decision while they are still visible.
+      - name: Will the deploy run?
+        env:
+          KILL_SWITCH: ${{ vars.DEPLOY_ON_PUSH }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+        run: |
+          {
+            echo "### Deploy decision"
+            echo ""
+            echo "| input | value |"
+            echo "| --- | --- |"
+            echo "| event | \`${EVENT}\` |"
+            echo "| ref | \`${REF}\` |"
+            echo "| DEPLOY_ON_PUSH | \`${KILL_SWITCH:-<unset>}\` |"
+            echo ""
+            case "${EVENT}:${REF}:${KILL_SWITCH}" in
+              push:refs/heads/main:false|push:refs/heads/main:0|push:refs/heads/main:no|push:refs/heads/main:off)
+                echo "Deploy is **held**: the kill switch is set." ;;
+              push:refs/heads/main:*)
+                echo "Deploy **will run**." ;;
+              *)
+                echo "No deploy: this is not a push to main." ;;
+            esac
+          } >> "$GITHUB_STEP_SUMMARY"
+
   # ==========================================================================
   # 6 + 8. TRUSTED HARDWARE: preflight, rollout, smoke test, recovery
   #
@@ -671,19 +699,44 @@ jobs:
   #     workflow_dispatch path, so a dispatch cannot deploy an arbitrary
   #     branch. (`workflow_dispatch` runs from the ref it was fired on.)
   #   * pull_request is not in either clause, so fork code never reaches here.
-  #   * a push additionally needs the repository variable DEPLOY_ON_PUSH; the
-  #     manual path additionally needs the `deploy` input ticked.
+  #   * a push DEPLOYS unless the repository variable DEPLOY_ON_PUSH is set
+  #     to a falsey value — a kill switch, not an opt-in, so a deploy can be
+  #     stopped mid-incident without a commit and a CI run. The manual path
+  #     still needs the `deploy` input ticked.
   # ==========================================================================
   deploy:
     name: "🚀 Deploy (rolling, model-preserving)"
     needs: ci-ok
+    # A push to main DEPLOYS (2026-09-08, at the owner's request): merging any
+    # branch into main is the release action, so it should not also need a
+    # second manual step that is easy to forget.
+    #
+    # The repository variable is now a KILL SWITCH rather than an opt-in —
+    # set DEPLOY_ON_PUSH to false/0/no/off to stop automatic deploys without
+    # editing this file, which matters when the box is mid-incident and
+    # nobody wants to wait on a commit and a CI run to stop the bleeding.
+    # Unset (the normal state) means deploy.
+    #
+    # `format('{0}', ...)` IS LOAD-BEARING. An unset repository variable is
+    # `null`, not an empty string, and GitHub coerces mismatched types to a
+    # number before comparing: 'false' becomes NaN, and EVERY comparison
+    # against NaN is false — so `vars.DEPLOY_ON_PUSH != 'false'` is false
+    # when the variable is unset, and the deploy silently never runs. That
+    # cost three green pushes to main that deployed nothing, each reporting
+    # only "skipped" with no reason. format() forces the string comparison
+    # the condition is actually asking for.
+    #
+    # What still has to be true first: every CI job passed (`ci-ok`), the ref
+    # is main, the preflight below is happy, and the health gate after the
+    # rollout accepts the result — otherwise this rolls itself back.
     if: >-
       needs.ci-ok.result == 'success' &&
       github.ref == 'refs/heads/main' &&
       (
         (github.event_name == 'workflow_dispatch' && inputs.deploy) ||
         (github.event_name == 'push' &&
-         contains(fromJSON('["true","1","yes","on"]'), vars.DEPLOY_ON_PUSH))
+         !contains(fromJSON('["false","0","no","off"]'),
+                   format('{0}', vars.DEPLOY_ON_PUSH)))
       )
     runs-on: [self-hosted, dgx-spark]
     permissions:
@@ -709,11 +762,19 @@ jobs:
       DEPLOY_FULL: ${{ vars.DEPLOY_FULL }}
       # Never interpolated into a `run:` body — see the policy job's P6.
       INPUT_FULL: ${{ inputs.full }}
-      # Repository variable DEPLOY_BRANCH: the branch the production
-      # checkout is left ON, fast-forwarded to the deployed commit. The
-      # deploy only ever FAST-FORWARDS it; "-" forces a detached HEAD.
-      # scripts/deploy.sh validates this value before handing it to git.
-      DEPLOY_BRANCH: ${{ inputs.branch || vars.DEPLOY_BRANCH }}
+      # The branch the production checkout is left ON, fast-forwarded to the
+      # deployed commit. The deploy only ever FAST-FORWARDS it; "-" forces a
+      # detached HEAD, and scripts/deploy.sh validates the value before
+      # handing it to git.
+      #
+      # DERIVED from the ref being deployed rather than read from a
+      # repository variable. The `if:` above already pins deploys to main, so
+      # the only branch this can sensibly be IS the one being deployed — and
+      # a stale variable naming a DIFFERENT branch was a quiet foot-gun:
+      # `dev` cannot fast-forward to a commit merged straight into main, so
+      # every such deploy silently left the owner's own working directory on
+      # a detached HEAD. The dispatch input still overrides it.
+      DEPLOY_BRANCH: ${{ inputs.branch || github.ref_name }}
     steps:
       # Check out the commit being deployed, so the deploy SCRIPT is the one
       # that commit ships. Running it out of the production checkout is a

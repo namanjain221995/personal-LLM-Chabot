@@ -989,7 +989,7 @@ def _answer_messages(
     if gap:
         system += _COVERAGE_NOTE.format(terms=", ".join(gap))
     user = f"Web sources:\n{_context_block(sources)}\n\nQuestion: {message}"
-    return [{"role": "system", "content": system + DIAGRAM_INSTRUCTION}, *recent_turns(history, 4),
+    return [{"role": "system", "content": system + DIAGRAM_INSTRUCTION}, *recent_turns(history, settings.chat_history_turns),
             {"role": "user", "content": user}]
 
 
@@ -1211,7 +1211,7 @@ async def _fallback(message: str, history: Sequence[dict], emit: Emit, note: str
         {"role": "system", "content": "You are a helpful assistant. Web search is "
          "unavailable, so answer from your own knowledge and say so if the answer "
          "may be out of date."},
-        *recent_turns(history, 6),
+        *recent_turns(history, settings.chat_history_turns),
         {"role": "user", "content": message},
     ]
     async for kind, delta in llm.stream_chat_events(msgs, max_tokens=8000):
