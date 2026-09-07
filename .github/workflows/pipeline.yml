@@ -712,11 +712,19 @@ jobs:
       - name: "clause: event is push"
         if: github.event_name == 'push'
         run: echo "PASS event" >> "$GITHUB_STEP_SUMMARY"
-      - name: "clause: kill switch is not set"
+      # The bug, kept as a demonstration: an UNSET variable is null, and
+      # `null != 'false'` is FALSE because both sides are coerced to numbers
+      # and 'false' is NaN. This step must NOT pass.
+      - name: "clause: kill switch, compared without format() (expected to fail)"
         if: >-
           vars.DEPLOY_ON_PUSH != 'false' && vars.DEPLOY_ON_PUSH != '0' &&
           vars.DEPLOY_ON_PUSH != 'no' && vars.DEPLOY_ON_PUSH != 'off'
-        run: echo "PASS kill-switch" >> "$GITHUB_STEP_SUMMARY"
+        run: echo "PASS kill-switch-bare" >> "$GITHUB_STEP_SUMMARY"
+      - name: "clause: kill switch, string-forced"
+        if: >-
+          !contains(fromJSON('["false","0","no","off"]'),
+                    format('{0}', vars.DEPLOY_ON_PUSH))
+        run: echo "PASS kill-switch-formatted" >> "$GITHUB_STEP_SUMMARY"
       - name: "clause: the whole deploy condition"
         if: >-
           needs.ci-ok.result == 'success' &&
@@ -724,8 +732,8 @@ jobs:
           (
             (github.event_name == 'workflow_dispatch' && inputs.deploy) ||
             (github.event_name == 'push' &&
-             vars.DEPLOY_ON_PUSH != 'false' && vars.DEPLOY_ON_PUSH != '0' &&
-             vars.DEPLOY_ON_PUSH != 'no' && vars.DEPLOY_ON_PUSH != 'off')
+             !contains(fromJSON('["false","0","no","off"]'),
+                       format('{0}', vars.DEPLOY_ON_PUSH)))
           )
         run: echo "PASS whole-condition" >> "$GITHUB_STEP_SUMMARY"
       - name: Report
@@ -759,6 +767,15 @@ jobs:
     # nobody wants to wait on a commit and a CI run to stop the bleeding.
     # Unset (the normal state) means deploy.
     #
+    # `format('{0}', ...)` IS LOAD-BEARING. An unset repository variable is
+    # `null`, not an empty string, and GitHub coerces mismatched types to a
+    # number before comparing: 'false' becomes NaN, and EVERY comparison
+    # against NaN is false — so `vars.DEPLOY_ON_PUSH != 'false'` is false
+    # when the variable is unset, and the deploy silently never runs. That
+    # cost three green pushes to main that deployed nothing, each reporting
+    # only "skipped" with no reason. format() forces the string comparison
+    # the condition is actually asking for.
+    #
     # What still has to be true first: every CI job passed (`ci-ok`), the ref
     # is main, the preflight below is happy, and the health gate after the
     # rollout accepts the result — otherwise this rolls itself back.
@@ -768,8 +785,8 @@ jobs:
       (
         (github.event_name == 'workflow_dispatch' && inputs.deploy) ||
         (github.event_name == 'push' &&
-         vars.DEPLOY_ON_PUSH != 'false' && vars.DEPLOY_ON_PUSH != '0' &&
-         vars.DEPLOY_ON_PUSH != 'no' && vars.DEPLOY_ON_PUSH != 'off')
+         !contains(fromJSON('["false","0","no","off"]'),
+                   format('{0}', vars.DEPLOY_ON_PUSH)))
       )
     runs-on: [self-hosted, dgx-spark]
     permissions:
