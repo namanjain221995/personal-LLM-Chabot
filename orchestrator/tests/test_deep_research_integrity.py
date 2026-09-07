@@ -114,7 +114,7 @@ def _results(n, host="example.com"):
     ]
 
 
-def _wire(monkeypatch, *, plan=None, gap=None, report="Report [1]."):
+def _wire(monkeypatch, *, plan=None, gap=None, report="Report [1].", finish=None):
     """Every outside dependency of the loop, stubbed with canned answers."""
     plan = plan or {"subquestions": ["a"], "queries": ["q1"], "entities": ["Acme"]}
     gaps = list(gap or [{"sufficient": True, "missing": [], "followup_queries": []}])
@@ -142,9 +142,21 @@ def _wire(monkeypatch, *, plan=None, gap=None, report="Report [1]."):
             for i, r in enumerate(res, 1)
         ]
 
+    calls = {"n": 0}
+    reason = {"value": None}
+
     async def fake_stream(messages, **kw):
-        for piece in (report[i:i + 8] for i in range(0, len(report), 8)):
+        # `report` may be a callable of the call index, so a test can make a
+        # model that keeps producing NEW text and never says it is finished —
+        # identical text would trip the continuation engine's repetition guard
+        # instead of the condition under test.
+        body = report(calls["n"]) if callable(report) else report
+        calls["n"] += 1
+        for piece in (body[i:i + 8] for i in range(0, len(body), 8)):
             yield ("token", piece)
+        reason["value"] = finish
+
+    monkeypatch.setattr(dr.llm, "get_finish_reason", lambda: reason["value"])
 
     monkeypatch.setattr(dr.llm, "json_completion", fake_json_completion)
     monkeypatch.setattr(dr.llm, "stream_chat_events", fake_stream)
@@ -395,42 +407,66 @@ def test_a_dated_older_value_is_still_history():
 # ---------------------------------------------------------------------------
 
 
-def test_the_report_ceiling_is_the_one_the_call_actually_gets():
-    """The ledger's premise (a 6,000-token wall) holds only with thinking OFF:
-    `stream_chat_events` floors a thinking request at MAX_OUTPUT_TOKENS."""
-    assert dr._report_token_ceiling("fast") == settings.deep_research_report_max_tokens
-    assert dr._report_token_ceiling("think") >= settings.max_output_tokens
+def test_a_report_that_runs_out_of_room_is_continued_not_apologised_for(monkeypatch):
+    """This used to end the report with "ask about one section for the rest".
 
-
-def _usage_sequence(monkeypatch, *values):
-    state = {"i": 0}
-
-    def fake_usage():
-        i = min(state["i"], len(values) - 1)
-        state["i"] += 1
-        return {"prompt_tokens": 0, "completion_tokens": values[i], "calls": 1}
-
-    monkeypatch.setattr(dr.llm, "get_usage", fake_usage)
-
-
-def test_a_report_cut_off_at_its_ceiling_is_disclosed(monkeypatch):
-    _wire(monkeypatch, report="A report that ran out of room [1]")
-    _usage_sequence(monkeypatch, 0, dr._report_token_ceiling("think"))
+    The engine now reads the streaming layer's finish_reason and keeps
+    writing while the answer is "it ran out of room", so a report that would
+    have been one truncated call is several calls of one text.
+    """
+    _wire(
+        monkeypatch,
+        report=lambda i: f"Section {i} of the report, with distinct prose [1]. ",
+        finish="length",
+    )
     events, emit = _emitter()
     out = asyncio.run(dr.run_deep_research_engine("q", [], emit, conversation_id="c1"))
-    assert "reached its length limit" in out
+    assert "Section 0" in out and "Section 1" in out, "it continued past the first call"
+
+
+def test_a_report_stopped_before_the_model_finished_still_says_so(monkeypatch):
+    """Continuing is not the same as never being cut off. When the budget
+    runs out the reader is told — and told the REAL reason."""
+    _wire(
+        monkeypatch,
+        report=lambda i: f"Section {i} with enough distinct prose to count [1]. " * 4,
+        finish="length",
+    )
+    monkeypatch.setattr(settings, "deep_research_report_total_tokens", 400)
+    events, emit = _emitter()
+    out = asyncio.run(dr.run_deep_research_engine("q", [], emit, conversation_id="c1"))
+    assert "stops here" in out
     assert _run_meta(events)["report_truncated"] is True
-    # the disclosure was streamed too, not only stored
+    # The disclosure was streamed too, not only stored.
     streamed = "".join(p["text"] for k, p in events if k == "token")
-    assert "reached its length limit" in streamed
+    assert "stops here" in streamed
+
+
+def test_every_stop_reason_the_engine_can_report_has_words_for_it(monkeypatch):
+    """A reader told the wrong reason cannot act on it, and the old note said
+    "length limit" whatever had actually happened."""
+    from app import continuation
+
+    # COMPLETE needs no note (nothing is disclosed) and RUNNING is not an
+    # ending at all — it is what a mid-run checkpoint carries.
+    not_endings = {continuation.STOP_COMPLETE, continuation.STOP_RUNNING}
+    reasons = [
+        v for k, v in vars(continuation).items()
+        if k.startswith("STOP_") and isinstance(v, str) and v not in not_endings
+    ]
+    assert reasons, "the engine must expose its stop reasons"
+    seen = {dr._report_stop_note(r) for r in reasons}
+    generic = dr._report_stop_note("something-new")
+    assert generic not in seen, f"a stop reason falls through to the generic note: {reasons}"
+    for note in seen:
+        assert note.strip().startswith("[") and note.strip().endswith("]")
 
 
 def test_a_report_that_finished_is_not_flagged(monkeypatch):
-    _wire(monkeypatch, report="A short, complete report [1].")
-    _usage_sequence(monkeypatch, 0, 120)
+    _wire(monkeypatch, report="A short, complete report [1].", finish="stop")
     events, emit = _emitter()
     out = asyncio.run(dr.run_deep_research_engine("q", [], emit, conversation_id="c1"))
-    assert "length limit" not in out
+    assert "stops here" not in out
     assert _run_meta(events)["report_truncated"] is False
 
 

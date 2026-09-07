@@ -72,7 +72,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Awaitable, Callable, Dict, FrozenSet, List, Optional, Sequence, Set, Tuple
 from urllib.parse import urlparse
 
-from .. import db, llm
+from .. import continuation, db, llm
 from ..config import settings
 # `extract` is deliberately NOT imported any more: every head slice this
 # module used to take (`extract.truncate_chars`) is now the search path's
@@ -2404,30 +2404,57 @@ async def _close_run(
         log.warning("could not close the research run", exc_info=True)
 
 
-def _report_token_ceiling(effort: str) -> int:
-    """How many completion tokens the report call may produce before the
-    server cuts it off — mirroring the sizing `llm.stream_chat_events` does
-    with the ceiling this module asks for.
+def _report_stop_note(reason: str) -> str:
+    """What the reader is told when a report stops before the model finished.
 
-    Deliberately reconstructed rather than assumed: the ledger's premise
-    ("the report is capped at deep_research_report_max_tokens") only holds
-    with thinking OFF. With thinking on and the default unbounded budget
-    mode, `stream_chat_events` floors the request at MAX_OUTPUT_TOKENS
-    (65,536), so 6,000 is not the wall — and comparing against 6,000 would
-    report every long report as truncated.
+    One sentence, naming the REAL cause. The old text said the report "reached
+    its length limit", which was true of a single capped call and is now
+    simply wrong — a reader told the wrong reason cannot act on it.
 
-    It is still only a lower bound on certainty: `context.fit_request` can
-    LOWER the cap when the prompt crowds the window, and nothing in this
-    process is told when it does. The honest fix is a `finish_reason` from
-    the streaming layer; `llm.py` has no handling for one at all.
+    A function rather than a module-level dict on purpose: everything at
+    module scope in this file is a constant, a compiled regex or a semaphore,
+    and `test_the_engine_keeps_no_per_run_state_at_module_level` enforces that
+    mechanically. A lookup table is safe, but the guard cannot tell one from
+    shared run state, and weakening the guard to admit it is a bad trade.
     """
-    asked = int(settings.deep_research_report_max_tokens or 0)
-    if not llm.wants_thinking("smart", effort):
-        return asked
-    budget = llm.thinking_budget(effort)
-    if budget:
-        return asked + int(budget)
-    return max(asked, int(settings.max_output_tokens or 0))
+    return {
+        "budget": (
+            "\n\n[the report reached its length budget and stops here — the "
+            "sources above are complete; ask about one section for more depth]"
+        ),
+        "deadline": (
+            "\n\n[the run reached its time budget and the report stops here "
+            "— the sources above are complete]"
+        ),
+        "wall_clock": (
+            "\n\n[the report stopped at the generation guard — the sources "
+            "above are complete]"
+        ),
+        "repetition": (
+            "\n\n[the report stops here: it had begun repeating itself — "
+            "the sources above are complete]"
+        ),
+        "no_progress": (
+            "\n\n[the report stops here: the model had nothing further to "
+            "add — the sources above are complete]"
+        ),
+        "segments": (
+            "\n\n[the report reached its segment limit and stops here — the "
+            "sources above are complete]"
+        ),
+        "error": (
+            "\n\n[the report stops here: writing it failed part-way — "
+            "everything above was produced before the failure]"
+        ),
+        "cancelled": (
+            "\n\n[the report stops here: the run was cancelled — everything "
+            "above was produced before it stopped]"
+        ),
+    }.get(
+        reason,
+        "\n\n[the report stops here before it was finished — the sources "
+        "above are complete]",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -3082,25 +3109,40 @@ async def _run(
         # is returned and stored; a stray marker that survives on the client
         # is already invisible there, because the frontend strips every [n]
         # before rendering and draws the source list from meta.sources.
-        # Truncation was silent: a report cut off at its token ceiling reached
-        # the user, the store and the PDF looking finished. There is no
-        # finish_reason anywhere in `llm.py`, so this reads the usage the
-        # streaming layer already captures (`llm.get_usage`, a per-request
-        # ContextVar) and compares the completion this ONE call spent against
-        # the ceiling it was given. No usage reported (a runtime that refuses
-        # stream_options) means NOT MEASURED — never "fine".
-        ceiling = _report_token_ceiling(effort)
-        spent_before = int((llm.get_usage() or {}).get("completion_tokens", 0) or 0)
+        # Truncation used to be silent, then it was DETECTED and apologised
+        # for: a report that ran out of room ended with "ask about one section
+        # for the rest". Now it simply keeps writing. `continuation` asks the
+        # streaming layer why the call stopped — the finish_reason this file's
+        # own docstring asked for and `llm.py` now provides — and continues
+        # only while the answer is "it ran out of room".
+        #
+        # DEEP_RESEARCH_REPORT_MAX_TOKENS is the size of ONE segment;
+        # DEEP_RESEARCH_REPORT_TOTAL_TOKENS is how long the report may run to
+        # in total. It is deliberately far below the chat budget: nobody
+        # asking a research question wants a book back. The run's own time
+        # budget still bounds everything.
+        report_run: Optional[continuation.LongResult] = None
+
         async def _stream_report() -> None:
+            nonlocal report_run
+
+            async def _out(kind: str, delta: str) -> None:
+                await emit(kind, {"text": delta})
+                if kind == "token":
+                    parts.append(delta)
+
             async with _LLM_SEM:
-                async for kind, delta in llm.stream_chat_events(
+                report_run = await continuation.stream_long_completion(
                     _report_messages(state, history),
+                    on_delta=_out,
                     effort=llm.normalize_effort(effort),
-                    max_tokens=settings.deep_research_report_max_tokens,
-                ):
-                    await emit(kind, {"text": delta})
-                    if kind == "token":
-                        parts.append(delta)
+                    segment_max_tokens=settings.deep_research_report_max_tokens,
+                    total_max_tokens=min(
+                        settings.deep_research_report_total_tokens,
+                        continuation.budget_for(effort),
+                    ),
+                    deadline_s=state.report_budget_s(),
+                )
 
         # The one stage the budget may not simply skip — it is the deliverable
         # — but it may not run unbounded either: the only guard underneath it
@@ -3125,19 +3167,24 @@ async def _run(
             )
             await emit("token", {"text": note})
             report += note
-        produced = int((llm.get_usage() or {}).get("completion_tokens", 0) or 0) - spent_before
-        if ceiling > 0 and produced >= ceiling:
+        # The honest signal, not a token-count proxy: `stop_reason` is
+        # "complete" only when the model itself decided the report was
+        # finished. Anything else means it was stopped, and the reader is
+        # told which — the note now names a real cause instead of implying
+        # the report simply has a length limit.
+        if report_run is not None and report_run.truncated:
             state.report_truncated = True
             log.warning(
-                "research report hit its token ceiling (%d of %d tokens, %d sources): "
-                "the report is cut off",
-                produced, ceiling, len(state.sources),
+                "research report stopped early (%s) after %d segment(s), "
+                "%s tokens, %d sources",
+                report_run.stop_reason,
+                report_run.segment_count,
+                report_run.output_tokens
+                if report_run.output_tokens is not None
+                else "unmeasured",
+                len(state.sources),
             )
-            note = (
-                "\n\n[the report reached its length limit and stops here — "
-                "the sources above are complete; ask about one section for "
-                "the rest]"
-            )
+            note = _report_stop_note(report_run.stop_reason)
             await emit("token", {"text": note})
             report += note
 

@@ -51,7 +51,7 @@ import { QuotedContext } from './QuotedContext';
 import { ProofDrawer } from './ProofDrawer';
 import { CopyButton } from './CopyButton';
 import { ReasoningAccordion } from './ReasoningAccordion';
-import { friendlyError, trimNotice } from '@/lib/errors';
+import { continuationNotice, friendlyError, trimNotice } from '@/lib/errors';
 import {
   IconAlert,
   IconBook,
@@ -1016,6 +1016,18 @@ function MessageRowImpl({
               {trimNotice(message.meta.input_trimmed)}
             </p>
           )}
+
+          {/* A long answer is written across several model calls. Say so ONLY
+              when it stopped before the model had finished — that the text
+              was stitched is an implementation detail, but that it ends
+              early is something the reader cannot otherwise tell. */}
+          {message.meta?.continuation &&
+            continuationNotice(message.meta.continuation) && (
+              <p className="mt-2 inline-flex items-center gap-1.5 rounded-md border border-border bg-surface px-2 py-1 text-xs text-muted">
+                <IconAlert size={12} className="shrink-0 text-warn" />
+                {continuationNotice(message.meta.continuation)}
+              </p>
+            )}
 
           {(message.meta?.memory_updated?.length ?? 0) > 0 && (
             <p

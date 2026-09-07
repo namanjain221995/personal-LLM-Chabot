@@ -23,6 +23,45 @@
  * have different consequences: dropped turns lose older context, a clipped
  * message means part of what the user just pasted was not sent.
  */
+/**
+ * What to say under an answer that was written across several model calls.
+ *
+ * Only worth a line when something is worth knowing. A long answer that
+ * FINISHED is not news — the reader has it, and "written in 7 parts" is an
+ * implementation detail they did not ask about. An answer that STOPPED before
+ * the model was done is news, because the reader would otherwise assume the
+ * text simply ends there.
+ */
+export function continuationNotice(info: {
+  segments: number;
+  output_tokens: number | null;
+  stop_reason: string;
+  truncated: boolean;
+}): string | null {
+  if (!info.truncated) return null;
+  const written =
+    info.output_tokens !== null
+      ? ` ${info.output_tokens.toLocaleString()} tokens were written.`
+      : '';
+  switch (info.stop_reason) {
+    case 'budget':
+      return `This answer reached its length limit and stops here.${written} Ask for the next part to continue it.`;
+    case 'deadline':
+    case 'wall_clock':
+      return `This answer reached its time limit and stops here.${written} Ask for the next part to continue it.`;
+    case 'repetition':
+      return 'This answer stops here: it had begun repeating itself.';
+    case 'no_progress':
+      return 'This answer stops here: the model had nothing further to add.';
+    case 'segments':
+      return `This answer reached its continuation limit and stops here.${written}`;
+    case 'error':
+      return 'This answer stops part-way: writing it failed. Everything above was produced before the failure.';
+    default:
+      return 'This answer stops here before it was finished.';
+  }
+}
+
 export function trimNotice(info: {
   dropped_turns: number;
   clipped_messages: number;

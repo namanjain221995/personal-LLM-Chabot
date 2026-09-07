@@ -93,6 +93,68 @@ def _capture_usage(chunk) -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# WHY THE LAST CALL STOPPED.
+#
+# `finish_reason` is the only honest signal that a generation hit its ceiling
+# rather than finishing what it had to say. Until now this file had no
+# handling for one at all: the streaming loop read `choices[0].delta` and
+# never looked at `choices[0].finish_reason`, so every engine downstream had
+# to guess. OCR guessed with a non-streaming read (engines/ocr.py), Deep
+# Research guessed by reconstructing the ceiling and comparing token counts,
+# and its own docstring named the fix — "the honest fix is a finish_reason
+# from the streaming layer". This is that.
+#
+# A ContextVar, deliberately, for the same reason `_usage` is one: the
+# yielded tuple is (kind, delta) and fourteen call sites branch on `kind ==
+# "reasoning"` with `else` meaning "text". A third kind would be appended to
+# answers as prose by most of them.
+#
+# UNLIKE `_usage`, this does NOT accumulate — it is the reason the MOST RECENT
+# call ended, which is what a continuation loop must read after each segment.
+# Every entry point clears it before opening a stream, so a call that dies
+# before reporting one cannot leave the previous call's reason standing; a
+# stale "length" there would loop a continuation forever.
+# ---------------------------------------------------------------------------
+
+_finish_reason: ContextVar[Optional[str]] = ContextVar("_finish_reason", default=None)
+
+#: Set instead of a server reason when OUR guard stopped the stream, so a
+#: caller can tell "the model ran out of room" from "we pulled the plug".
+WALL_CLOCK_FINISH = "wall_clock"
+THINKING_OVERRUN_FINISH = "thinking_overrun"
+
+
+def reset_finish_reason() -> None:
+    _finish_reason.set(None)
+
+
+def get_finish_reason() -> Optional[str]:
+    """Why the last completion stopped, or None when the server said nothing.
+
+    None means NOT REPORTED. It must never be read as "finished cleanly" —
+    a continuation loop treats it as "stop", which is the safe direction.
+    """
+    return _finish_reason.get()
+
+
+def _set_finish_reason(reason: Optional[str]) -> None:
+    if reason:
+        _finish_reason.set(str(reason))
+
+
+def _capture_finish(chunk) -> None:
+    """Read the finish_reason off a streamed chunk.
+
+    It arrives on the last chunk that carries a choice; the usage chunk after
+    it has none, which is why this checks rather than indexing blindly.
+    """
+    choices = getattr(chunk, "choices", None)
+    if not choices:
+        return
+    _set_finish_reason(getattr(choices[0], "finish_reason", None))
+
+
 async def _open_stream(client, request: dict):
     """Open a streamed completion, asking for usage when the server allows it.
 
@@ -265,7 +327,10 @@ async def chat_completion(
     extra_body = reasoning_extra_body(settings.main_capabilities, thinking)
     if extra_body is not None:
         request["extra_body"] = extra_body
+    reset_finish_reason()
     resp = await client.chat.completions.create(**request)
+    _capture_usage(resp)
+    _capture_finish(resp)
     _, content = split_reasoning(resp.choices[0].message, settings.main_capabilities)
     return content
 
@@ -362,9 +427,11 @@ async def stream_chat_completion(
     extra_body = reasoning_extra_body(settings.main_capabilities, thinking)
     if extra_body is not None:
         request["extra_body"] = extra_body
+    reset_finish_reason()
     stream = await _open_stream(client, request)
     async for chunk in stream:
         _capture_usage(chunk)
+        _capture_finish(chunk)
         if not chunk.choices:
             continue
         delta = chunk.choices[0].delta
@@ -616,8 +683,10 @@ async def stream_chat_events(
     import time as _time
 
     started = _time.monotonic()
+    reset_finish_reason()
     stream = await _open_stream(client, request)
     async for chunk in stream:
+        _capture_finish(chunk)
         elapsed = _time.monotonic() - started
         if elapsed > settings.gen_wall_clock_s:
             log.error(
@@ -629,6 +698,10 @@ async def stream_chat_events(
             )
             with contextlib.suppress(Exception):
                 await stream.close()
+            # Not "length": the model had room left, we took it away. A
+            # continuation loop must be able to tell those apart — one is
+            # worth resuming, the other means something is wrong.
+            _finish_reason.set(WALL_CLOCK_FINISH)
             yield (
                 "token",
                 f"\n\n[generation stopped after {int(elapsed)}s — wall-clock "
@@ -671,9 +744,11 @@ async def stream_chat_events(
                     fallback["extra_body"] = fb_extra
                 else:
                     fallback.pop("extra_body", None)
+                reset_finish_reason()
                 fb_stream = await _open_stream(client, fallback)
                 async for fb_chunk in fb_stream:
                     _capture_usage(fb_chunk)
+                    _capture_finish(fb_chunk)
                     if not fb_chunk.choices:
                         continue
                     fb_delta = fb_chunk.choices[0].delta
@@ -819,7 +894,10 @@ async def chat_with_tools(
     extra_body = reasoning_extra_body(settings.main_capabilities, thinking)
     if extra_body is not None:
         request["extra_body"] = extra_body
+    reset_finish_reason()
     resp = await client.chat.completions.create(**request)
+    _capture_usage(resp)
+    _capture_finish(resp)
     message = resp.choices[0].message
     # The <think> fallback matters here most: a raw thinking block leaking
     # into `text` would be re-parsed downstream as if the model SAID it.

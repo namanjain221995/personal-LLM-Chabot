@@ -9,6 +9,8 @@ and bytes are refused outright at the door they actually arrive through.
 """
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from app import db
@@ -233,8 +235,17 @@ def test_chat_downgrades_a_blocked_tool_and_says_so_once(login_client, monkeypat
     assert "Salesforce" in body and "turned off for your account" in body
     # One notice, not one per blocked tool.
     assert body.count("turned off for your account") == 1
-    # And the answer still came.
-    assert "Answered without it." in body
+    # And the answer still came. Joined from the token frames rather than
+    # grepped out of the raw stream: a long answer is streamed in word-sized
+    # pieces so its seams can be repaired (app/continuation.py), so a
+    # sentence is not guaranteed to sit inside any single SSE frame — what
+    # matters is that the reader receives it whole.
+    answer = "".join(
+        json.loads(line[len("data: ") :])["text"]
+        for line in body.splitlines()
+        if line.startswith("data: ") and '"text"' in line and "turned off" not in line
+    )
+    assert "Answered without it." in answer
 
 
 def test_uploads_are_refused_when_attachments_are_off(login_client, tmp_path, monkeypatch):

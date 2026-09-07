@@ -999,6 +999,64 @@ class Settings:
         self.public_share_max_days: int = _int("PUBLIC_SHARE_MAX_EXPIRY_DAYS", 365)
         #: A link that never expires is a link nobody remembers exists.
         self.public_share_allow_never: bool = _bool("PUBLIC_SHARE_ALLOW_NEVER_EXPIRE", False)
+        # --- Long-form output: many bounded calls, one text -----------------
+        #
+        # MODEL_MAX_OUTPUT above is the ceiling on ONE call. It is not the
+        # ceiling on an answer: `continuation.py` runs as many calls as the
+        # budget allows and stitches them. These settings govern that loop.
+        #
+        # The numbers below are grounded in what this hardware actually does,
+        # measured over 141 real requests: ~46 output tokens/second. So
+        # 1,000,000 tokens is about six hours of continuous decoding, and
+        # GEN_WALL_CLOCK_S (4,200 s) bounds any SINGLE call at ~190,000. The
+        # million is reachable only across segments, and only deliberately.
+        self.continuation_enabled: bool = _bool("CONTINUATION_ENABLED", True)
+        #: The system-level ceiling. No request may exceed it whatever it asks.
+        self.max_logical_output_tokens: int = _int(
+            "MAX_LOGICAL_OUTPUT_TOKENS", 1_000_000
+        )
+        #: Per-effort budgets. A ceiling is a capability, not a default —
+        #: continuing every truncated Fast answer to a million tokens would
+        #: spend six hours of the only GPU here on a passing question. Fast
+        #: gets one segment (i.e. today's behaviour), and only `max` reaches
+        #: the configured ceiling.
+        self.continuation_budget_fast: int = _int(
+            "CONTINUATION_BUDGET_FAST", self.model_max_output
+        )
+        self.continuation_budget_think: int = _int(
+            "CONTINUATION_BUDGET_THINK", 64_000
+        )
+        self.continuation_budget_max: int = _int(
+            "CONTINUATION_BUDGET_MAX", self.max_logical_output_tokens
+        )
+        #: A backstop against a loop that makes tiny forward progress forever.
+        #: At the default segment size this permits far more than any budget.
+        self.continuation_max_segments: int = _int("CONTINUATION_MAX_SEGMENTS", 400)
+        #: How much of the text so far each continuation sees verbatim. Big
+        #: enough to finish an interrupted sentence and hold the voice; small
+        #: enough that segment 200's prefill is the same cost as segment 2's.
+        self.continuation_tail_chars: int = _int("CONTINUATION_TAIL_CHARS", 6_000)
+        #: Never ask for a segment smaller than this — it would be all seam
+        #: and no text.
+        self.continuation_min_segment_tokens: int = _int(
+            "CONTINUATION_MIN_SEGMENT_TOKENS", 512
+        )
+        #: Wall-clock ceiling for a whole long run, independent of the
+        #: per-call GEN_WALL_CLOCK_S. 0 disables it.
+        self.continuation_deadline_s: float = _float(
+            "CONTINUATION_DEADLINE_S", 21_600.0
+        )
+        #: A research report gets its OWN total, well under the chat budget.
+        #: DEEP_RESEARCH_REPORT_MAX_TOKENS is now the size of one segment;
+        #: this is how long the whole report may run to. Nobody asking a
+        #: research question wants a book back, so the default is four
+        #: segments — enough that the report stops because it is finished
+        #: rather than because it ran out of room, which is the thing that
+        #: was actually wrong.
+        self.deep_research_report_total_tokens: int = _int(
+            "DEEP_RESEARCH_REPORT_TOTAL_TOKENS", 24_000
+        )
+
         #: Per user, per hour. Creating a share writes a snapshot, so this
         #: bounds the write amplification of a script as much as the abuse.
         self.share_create_rate_per_hour: int = _int("SHARE_CREATE_RATE_PER_HOUR", 30)
