@@ -18,6 +18,19 @@
  * Bars are drawn as elements, not canvas: forty-eight 2px divs cost nothing,
  * they inherit the theme's colours without a resolve step, and they stay
  * crisp on a HiDPI screen without a devicePixelRatio dance.
+ *
+ * THE BAR COLOUR IS A COMPILING UTILITY, NOT `bg-ink/45`, AND THAT MATTERS.
+ * `ink` is `var(--ts-text)` in tailwind.config.ts — a BARE var(). Tailwind 3
+ * cannot parse a var() as a colour, so an opacity modifier on one does not
+ * dim it: the whole utility is dropped and NO background-color is emitted.
+ * `bg-ink/45` therefore shipped forty-eight fully transparent bars — the DOM,
+ * the heights and the audio were all correct and the trace was invisible.
+ * (The same trap is recorded three times in tailwind.config.ts, for `accent`,
+ * `danger` and `ok`, which were given `rgb(... / <alpha-value>)` to escape
+ * it.) The trace is now `bg-accent` — that `<alpha-value>` form, used with no
+ * modifier at all, so it cannot fall into the hole twice. The fade across the
+ * trace is the inline `opacity` below, which is a style, not a utility, and
+ * was never affected.
  */
 
 import { IconStop, IconX } from './icons';
@@ -33,20 +46,37 @@ export function formatElapsed(ms: number): string {
   return `${minutes}:${String(seconds).padStart(2, '0')}`;
 }
 
+/** Tallest a bar is drawn, at level 1.0. The container must be taller. */
+const PEAK_PX = 34;
+/** Silence. Not zero: a flat row of dots reads as "listening", not "broken". */
+const FLOOR_PX = 3;
+
 function Waveform({ levels }: { levels: number[] }) {
   return (
     <div
       aria-hidden
-      className="flex h-8 flex-1 items-center justify-end gap-[2px] overflow-hidden"
+      // CENTRED, not end-aligned (owner request 2026-09-07). The trace used to
+      // grow leftward from the timer, which read as hugging the Stop button.
+      // Centring is safe only because the whole trace FITS: 48 bars at 3px
+      // with 3px gaps is 285px against a 620px trace box on a 768px composer,
+      // and 190px at the mobile 2px/2px against 228px on a 375px one. If it
+      // ever stopped fitting, `justify-center` would clip the NEWEST bars as
+      // well as the oldest, which is the one thing a live meter must not do.
+      className="flex h-10 flex-1 items-center justify-center gap-[2px] overflow-hidden md:gap-[3px]"
     >
       {levels.map((level, index) => (
         <span
           key={index}
-          className="w-[2px] shrink-0 rounded-full bg-ink/45 transition-[height] duration-100 ease-out"
+          // `bg-accent` is the theme-aware TechSara blue (#60a5fa on dark,
+          // #1d4ed8 on light) — the token tuned for contrast AGAINST a
+          // surface, which is what a 3px mark needs. `accent-strong` is the
+          // Send button's FILL colour and reads as a dark smudge at this
+          // width on the dark composer. No opacity modifier is used here, and
+          // `accent` is the rgb(... / <alpha-value>) form in any case, so
+          // this compiles — unlike the `bg-ink/45` it replaced.
+          className="w-[3px] shrink-0 rounded-full bg-accent transition-[height] duration-100 ease-out md:w-[6px]"
           style={{
-            // A floor of 2px keeps the trace visible through silence, so the
-            // bar reads as "listening, nothing heard" rather than "broken".
-            height: `${Math.max(2, Math.round(level * 26))}px`,
+            height: `${Math.max(FLOOR_PX, Math.round(level * PEAK_PX))}px`,
             // The oldest bars fade out, which gives the trace direction
             // without moving anything.
             opacity: 0.35 + 0.65 * (index / Math.max(1, levels.length - 1)),
