@@ -45,13 +45,32 @@ _ALLOWED = {
     # (app/asr.SUPPORTED_LANGUAGES) plus "unknown" for a clip whose language
     # was not identified. Closed for the usual reason: a mis-parsed engine
     # reply must not be able to mint a new series.
+    #
+    # WIDENED from Qwen3-ASR's thirty to Whisper's ninety-nine. The two lists
+    # must move together — a language asr.py can report but this set does not
+    # hold is folded to "other", so the metric would have quietly lied about
+    # sixty-nine languages while transcription worked fine.
+    # `test_voice_input.py` asserts they agree.
     "language": {
-        "Chinese", "English", "Cantonese", "Arabic", "German", "French",
-        "Spanish", "Portuguese", "Indonesian", "Italian", "Korean", "Russian",
-        "Thai", "Vietnamese", "Japanese", "Turkish", "Hindi", "Malay",
-        "Dutch", "Swedish", "Danish", "Finnish", "Polish", "Czech",
-        "Filipino", "Persian", "Greek", "Romanian", "Hungarian", "Macedonian",
-        "unknown",
+        "Afrikaans", "Albanian", "Amharic", "Arabic", "Armenian",
+        "Assamese", "Azerbaijani", "Bashkir", "Basque", "Belarusian",
+        "Bengali", "Bosnian", "Breton", "Bulgarian", "Cantonese",
+        "Catalan", "Chinese", "Croatian", "Czech", "Danish", "Dutch",
+        "English", "Estonian", "Faroese", "Finnish", "French",
+        "Galician", "Georgian", "German", "Greek", "Gujarati",
+        "Haitian Creole", "Hausa", "Hawaiian", "Hebrew", "Hindi",
+        "Hungarian", "Icelandic", "Indonesian", "Italian", "Japanese",
+        "Javanese", "Kannada", "Kazakh", "Khmer", "Korean", "Lao",
+        "Latin", "Latvian", "Lingala", "Lithuanian", "Luxembourgish",
+        "Macedonian", "Malagasy", "Malay", "Malayalam", "Maltese",
+        "Maori", "Marathi", "Mongolian", "Myanmar", "Nepali",
+        "Norwegian", "Nynorsk", "Occitan", "Pashto", "Persian",
+        "Polish", "Portuguese", "Punjabi", "Romanian", "Russian",
+        "Sanskrit", "Serbian", "Shona", "Sindhi", "Sinhala", "Slovak",
+        "Slovenian", "Somali", "Spanish", "Sundanese", "Swahili",
+        "Swedish", "Tagalog", "Tajik", "Tamil", "Tatar", "Telugu",
+        "Thai", "Tibetan", "Turkish", "Turkmen", "Ukrainian", "Urdu",
+        "Uzbek", "Vietnamese", "Welsh", "Yiddish", "Yoruba", "unknown"
     },
 }
 

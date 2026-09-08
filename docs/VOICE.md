@@ -29,135 +29,225 @@ ends — the browser's capture indicator goes out.
 
 ```
    browser                    Spark 1 (head)                 Spark 2 (worker)
- ┌──────────┐   WebM/Opus   ┌────────────────┐  multipart   ┌────────────────┐
- │ Composer ├──────────────►│  orchestrator  ├─────────────►│  vLLM + Qwen3  │
- │  ~145 KB │  /api/audio/  │ /audio/        │ 192.168.9.68 │  ASR-1.7B      │
- │  per 15s │   transcribe  │  transcribe    │    :30006    │  ~6 GiB        │
- └──────────┘◄──────────────┤ auth · feature ├◄─────────────┤  warm, always  │
-      text                  │ gate · limits  │   text+lang  └────────────────┘
+ ┌──────────┐   WebM/Opus   ┌────────────────┐   multipart  ┌────────────────┐
+ │ Composer ├──────────────►│  orchestrator  ├─────────────►│ whisper-large  │
+ │  ~145 KB │  /api/audio/  │ /audio/        │ 192.168.9.68 │ -v3   ~5 GiB   │
+ │  per 15s │   transcribe  │  transcribe    │    :30007    │ warm, always   │
+ └──────────┘◄──────────────┤ auth · feature │              └────────────────┘
+      text                  │ gate · limits  │   optional second engine,
+                            │   RoutedProv.  ├──► 172.17.0.1:30007 (same node)
                             └────────────────┘
 ```
 
-**The worker, not the head, and that was measured.** Before this existed,
-Spark 1 held 76.1 GB of allocated GPU memory (the main model's rank 0, the
-vision router, the embedder, OCR and the reranker) against 30.0 GB on Spark 2,
-which runs only the main model's tensor-parallel rank 1. The engine fits on
-either; only one of them had room to spare.
+**The worker first, and that was a memory decision.** Measured 2026-09-08,
+Spark 1 held 65 GB of allocated GPU memory (the main model's rank 0, the
+vision router, the embedder, OCR and the reranker) against 33 GB on Spark 2.
+The engine fits on either; only one of them had room to spare without
+thinking about it.
 
-**Its own Compose project** (`sf-local-ai-asr`), never part of
+**Its own Compose project** (`sf-local-ai-whisper`), never part of
 `sf-local-ai-worker`. That other project is the main model's second shard:
 starting, restarting or removing speech-to-text must never come near it.
 
-**Its own bind.** The engine listens on the worker's *management* address, not
-the 10.100.x RoCE addresses — audio does not share the fabric the
+**Its own bind.** On the worker the engine listens on the *management*
+address, not the 10.100.x RoCE addresses — audio does not share the fabric the
 tensor-parallel model runs over. It binds inside the container with host
 networking rather than through a published port, because a published
-`192.168.9.68:30006:30006` does not survive a reboot: Docker binds before the
+`192.168.9.68:30007:30007` does not survive a reboot: Docker binds before the
 NIC has its address and the container dies before its process starts, where
 `restart: unless-stopped` never engages. That lesson is written down in
-`compose/compose.monitoring-worker.yaml` and it applies here unchanged.
+`compose/compose.monitoring-worker.yaml` and it applies here unchanged. On the
+head the engine binds the docker bridge gateway (`172.17.0.1`), which the
+orchestrator's container can reach and nothing off-box can.
 
 ---
 
 ## The model
 
-`Qwen/Qwen3-ASR-1.7B`, Apache-2.0, pinned at revision `7278e1e70fe2`.
+`openai/whisper-large-v3`, MIT, pinned at revision `06f233fe06e7`. 1.55B
+parameters, 3.1 GB in float16, ~5 GiB resident while warm.
 
-It identifies and transcribes **30 languages** — including Hindi, English,
-Arabic, Chinese, Japanese, Korean, Spanish, French, German, Russian,
-Portuguese, Indonesian, Italian, Thai, Vietnamese, Turkish, Malay, Dutch,
-Swedish, Danish, Finnish, Polish, Czech, Filipino, Persian, Greek, Romanian,
-Hungarian, Macedonian and Cantonese — plus 22 Chinese dialects.
+It identifies and transcribes **99 languages** — the full Whisper set, which
+adds to what came before it Gujarati, Marathi, Bengali, Tamil, Telugu, Punjabi,
+Urdu, Nepali, Sinhala, Kannada, Malayalam, Assamese and Sanskrit, among many
+others. `orchestrator/app/asr.py` derives `SUPPORTED_LANGUAGES` from the
+model's own tokenizer rather than from a hand-kept list, and a test asserts the
+two agree, so the set cannot drift from what the engine actually does.
 
-**It does not support Gujarati, Marathi, Bengali, Tamil, Telugu, Punjabi or
-Urdu.** Those are not in the model's published set and the platform does not
-claim them. Auto-detection is the default and should stay it: a person
-dictating should not have to declare a language before speaking.
+Auto-detection is the default and should stay it: a person dictating should not
+have to declare a language before speaking. **No language is sent to the engine
+at all**, which is deliberate — this deployment code-switches mid-sentence
+("kal ki meeting reschedule kar do for 3 PM"), and forcing a language
+mistranscribes the other half. It is transcribed as spoken. This is speech to
+text, not translation.
 
-Mixed-language speech ("kal ki meeting reschedule kar do for 3 PM") is
-transcribed as spoken. This is speech to text, not translation.
+### Large-v3 and not turbo
 
-### Why not Whisper
+Turbo is the same encoder with a four-layer decoder and it is roughly twice as
+fast. It was deliberately not installed. A person dictates "don't delete the
+Salesforce account", and the difference between the transcript keeping *don't*
+and losing it is the difference between the right action and the wrong one.
 
-Whisper large-v3 was not chosen because Qwen3-ASR measured better on the
-things this deployment needs — Hindi and Indian-accented English — and because
-the vLLM already running here supports it natively with no new runtime.
-`WhisperForConditionalGeneration` **is** in the same engine's registry, so
-switching is a change of two environment variables, not a rewrite. The
-provider abstraction in `orchestrator/app/asr.py` exists for exactly that.
+### Long form is sequential, which is a choice
+
+Whisper sees thirty seconds at a time, and there are two documented ways past
+that. **Chunked** cuts the audio into fixed windows and transcribes them
+independently — fast and batchable, and it decides sentence boundaries with a
+stride rather than with the model. **Sequential** slides the window using the
+model's own timestamp predictions, so each window starts where the last
+utterance actually ended and the decoder carries its context across the seam.
+The model card recommends sequential when accuracy matters more than speed,
+which here it does. Concretely: passing `chunk_length_s` selects chunked, and
+`compose/whisper/server.py` does not pass it. That single omission IS the
+long-form strategy, which is why it is written down rather than left to be
+inferred.
+
+### Silence
+
+Whisper answers digital silence with a plausible sentence — on this deployment,
+"Thank you." every time. The obvious fix, dropping transcripts matching a list
+of stock phrases, is a trap: it also deletes a person who really did say thank
+you, and it never generalises to the next phrase the model invents. The engine
+gates on `<|nospeech|>`, the token Whisper itself emits when it hears no
+speech, at the first decoding step. Measured across the validation set on
+2026-09-08: digital silence scores 0.708, and the most marginal real utterance
+— a three-second Hinglish clip — scores 0.238. The documented default of 0.6
+sits inside a 0.47-wide gap, so it separates them without being fitted to
+either.
 
 ---
 
 ## Measured on this hardware
 
-2026-09-04, Qwen3-ASR-1.7B on Spark 2, bf16, `--gpu-memory-utilization 0.08`:
+2026-09-08, whisper-large-v3 on a GB10, float16, real speech (the JFK clip,
+tiled to length):
 
 | audio | latency | real time |
 |------:|--------:|----------:|
-| 5 s   | 0.48 s  | 10.4× |
-| 15 s  | 1.04 s  | 14.4× |
-| 30 s  | 2.00 s  | 15.0× |
-| 60 s  | 1.85 s  | 32.4× |
+| 5 s   | 0.72 s  | 6.9× |
+| 15 s  | 2.02 s  | 7.4× |
+| 30 s  | 2.98 s  | 10.1× |
+| 60 s  | 5.63 s  | 10.7× |
 
-Eight simultaneous 15-second clips finished in **1.10 s of wall clock** — the
-engine batches them, so concurrency is nearly free on the ASR side.
+**One engine decodes one clip at a time.** `server.py` holds a `_gpu_lock`
+around every transcription, so concurrency does not batch the way the previous
+vLLM-hosted engine did — throughput is flat and latency grows linearly:
 
-**Cost to the chat model**, which is the number that actually constrains this:
+| concurrent | wall clock | p50 latency | audio per wall-second |
+|---:|---:|---:|---:|
+| 1  |  2.12 s |  2.12 s | 7 s/s |
+| 2  |  4.00 s |  3.01 s | 7 s/s |
+| 4  |  7.99 s |  5.01 s | 8 s/s |
+| 8  | 15.99 s |  9.02 s | 8 s/s |
+| 16 | 32.02 s | 16.97 s | 7 s/s |
 
-| dictations in flight | chat decode | change |
-|---:|---:|---:|
-| 0 (baseline) | 69–70 tok/s | — |
-| 4 (the configured limit) | 65 tok/s | **−5.8 %** |
-| 8 | 63 tok/s | −10.1 % |
-
-`ASR_MAX_CONCURRENT=4` is that trade-off, made explicitly. It is not there to
-protect the speech engine — it is there so a person waiting for an *answer* is
-never slowed down by someone else's dictation.
-
-The engine holds about **6 GiB** while warm and is never unloaded.
+That flat column is the whole reason the second engine exists, and the reason
+the concurrency ceiling is small.
 
 ### Two engines
 
-One engine **saturates at eight concurrent clips**: past that, throughput is
-flat at ~123 seconds of audio per wall-second and latency grows linearly.
-`scripts/asr.sh up --all-nodes` starts a second copy on the head and routes to
-whichever has the fewest requests in flight:
+`scripts/whisper.sh up --all-nodes` starts a second copy on the head and routes
+each clip to whichever engine has the fewest requests in flight
+(`RoutedProvider`). Same clips, one engine against two:
 
 | concurrent | one engine | two engines | |
 |---:|---:|---:|---:|
-| 8 | 1.00 s · 117 s/s | 0.91 s · 128 s/s | 1.10× |
-| 16 | 1.54 s · 123 s/s | 1.05 s · 214 s/s | **1.46×** |
-| 32 | 2.70 s · 122 s/s | 1.46 s · 241 s/s | **1.85×** |
+| 1  |  2.12 s |  2.03 s | 1.00× |
+| 2  |  4.00 s |  2.05 s | **1.95×** |
+| 4  |  7.99 s |  4.16 s | **1.92×** |
+| 8  | 15.99 s |  8.31 s | **1.92×** |
+| 16 | 32.02 s | 16.79 s | **1.91×** |
 
-**These are replicas, not shards.** The "13 Gb/s RoCE link" this argument
-originally rested on was a unit error — the link measures ~109 Gb/s per rail
-(see [`CLUSTER.md`](CLUSTER.md)) — but the conclusion survives on its own
-merits, which are stronger than the bandwidth claim was. Splitting one 1.7B
-model across two Sparks would put every layer's activations on a link that the
-main model's own tensor-parallel traffic already uses, and cross-node tensor
-parallelism costs *latency* per collective (12.8 µs per round trip, on
-activations only a few KB wide) rather than bandwidth — so a faster wire does
-not recover it. All of that to save memory that was never short — the weights are 4.4 GB and either node holds them twice over.
-Two whole copies add throughput without one byte of cross-node chatter, and
-degrade to one engine gracefully when a node goes away.
+**Read the first row before the others.** A second engine buys a second
+concurrent *speaker*, not a faster transcript. One clip is decoded by one
+engine start to finish; two nodes double how many people can dictate at once
+and do not shorten anyone's wait. The 1.00× at one concurrent clip is not a
+disappointment, it is the prediction.
 
-The second engine is not free: it costs the head node 8.3 GiB and takes the
-chat model from −5.8 % to **−6.7 %** under dictation load. Below eight
-concurrent dictations it buys nothing, because one engine was never busy.
+**These are replicas, not shards.** Splitting one 1.55B model across two Sparks
+would put every layer's activations on the link the main model's own
+tensor-parallel traffic already uses. Cross-node tensor parallelism costs
+*latency* per collective (~12.8 µs a round trip, on activations a few KB wide)
+rather than bandwidth, so the fabric being fast (~109 Gb/s a rail — see
+[`CLUSTER.md`](CLUSTER.md)) does not recover it. All of that to save memory
+that was never short: the weights are 3.1 GB and either node holds them several
+times over. Two whole copies add throughput without one byte of cross-node
+chatter, and degrade to one engine gracefully when a node goes away.
+
+### What it costs the chat model
+
+This is the number that actually constrains dictation, and it is larger than it
+was under the previous engine. Main-model single-stream decode, measured the
+same afternoon:
+
+| state | chat decode | change |
+|---|---:|---:|
+| no speech engine on the head | 71.4 tok/s | — |
+| head engine loaded, idle | 66.0 tok/s | −7.6 % |
+| **worker** engine saturated | 24.6 tok/s | **−66 %** |
+| **head** engine saturated | 23.0 tok/s | **−68 %** |
+| both saturated | 14.7 tok/s | **−79 %** |
+
+**Saturating either node costs the same**, which is the counter-intuitive part
+and the important one: the chat model is tensor-parallel across both Sparks and
+runs at the speed of its slower rank, so a busy GPU on the worker throttles
+chat exactly as a busy GPU on the head does. "Put speech on the worker so it
+does not disturb chat" was a *memory* argument, and it never was a compute one.
+
+Those rows are a saturation test — back-to-back clips with no gaps — and real
+dictation is nothing like that duty cycle: someone speaks for fifteen seconds,
+reads the result, and thinks. But it is the worst case, and it is why
+`ASR_MAX_CONCURRENT` is 2 per engine rather than 4. Two is one clip decoding
+and one ready to start, so the GPU never idles between clips and nobody queues
+behind more than one other person; past that a caller is told to try again
+rather than silently extending the window in which everyone's answers are slow.
+
+### Honest comparison with what this replaced
+
+The engine before this was `Qwen/Qwen3-ASR-1.7B` on vLLM, and swapping it in
+for whisper-large-v3 was **not** a free upgrade:
+
+| | Qwen3-ASR-1.7B | whisper-large-v3 |
+|---|---:|---:|
+| 15 s clip | 1.04 s | 2.02 s |
+| 8 concurrent clips | 1.10 s | 15.99 s (one engine) |
+| audio per wall-second | ~117 s/s | ~7 s/s |
+| languages | 30 | 99 |
+
+The two engines' effect on chat is **not** directly comparable and should not
+be put in that table: the old figure (−5.8 % at four concurrent dictations)
+was taken on an engine that batched those four and was done in about a second,
+while −66 % here is a saturation test that keeps a GPU busy indefinitely. The
+comparable statement is the weaker and truer one: whisper occupies a GPU for
+roughly fifteen times as long per second of audio, and the chat model feels
+whatever occupies either GPU.
+
+Whisper is about twice as slow on a single clip and roughly fifteen times
+lower in throughput, because vLLM gave the old engine continuous batching and
+the transformers pipeline here gives none. What it buys is **language
+breadth** — 30 languages to 99, including the Indic languages the previous
+model could not transcribe at all — and a decoder whose long-form behaviour is
+the reference implementation's. On English and French specifically, published
+WER favours the model that was removed.
+
+That trade was made deliberately and can be revisited: the provider
+abstraction in `orchestrator/app/asr.py` is one class per engine, and
+`RoutedProvider` does not care what is behind an endpoint.
 
 ---
 
 ## Format
 
-The browser records WebM/Opus and the engine decodes it natively through PyAV
-(bundled ffmpeg). **Nothing converts audio anywhere in this platform.** The
-same 15-second clip is 2.1 MB as WAV and 145 KB as WebM/Opus, and transcribes
-identically. Safari records MP4/AAC and that works the same way.
+The browser records WebM/Opus and the engine decodes it with ffmpeg.
+**Nothing converts audio anywhere in this platform.** The same 15-second clip
+is 2.1 MB as WAV and 145 KB as WebM/Opus, and transcribes identically. Safari
+records MP4/AAC and that works the same way.
 
-The one thing the stock vLLM image lacks is the decoder itself — the
-`vllm[audio]` extra — so `compose/asr/Dockerfile` adds `av`, `soundfile` and
-`librosa` on top of the image the cluster already runs. Without it every
-request fails with *"Please install vllm[audio] for audio support"*.
+`_decode` streams the upload through ffmpeg's *stdin* and reads a 16 kHz mono
+waveform off its *stdout*, so a recording never becomes a file that somebody
+has to remember to delete. The command is an allow-list and nothing more:
+demux, decode, downmix, resample. `-nostdin` is not decoration — without it
+ffmpeg competes with the parent process for the terminal's stdin.
 
 ---
 
@@ -200,18 +290,24 @@ concurrency pool above.
 ## Running it
 
 ```bash
-scripts/asr.sh up        # fetch weights, build, start, wait, record the URL
-scripts/asr.sh status    # container state and the engine's own /v1/models
-scripts/asr.sh verify    # transcribe a real clip and print what came back
-scripts/asr.sh bench     # the table above, regenerated
-scripts/asr.sh logs
-scripts/asr.sh down      # stops dictation; touches nothing else
+scripts/whisper.sh up              # fetch weights, build, start, wait, record the URL
+scripts/whisper.sh up --all-nodes  # ...and a second engine on the head
+scripts/whisper.sh status          # container state and the engine's own /health
+scripts/whisper.sh verify          # transcribe a real clip and print what came back
+scripts/whisper.sh url             # the endpoint(s) the orchestrator should use
+scripts/whisper.sh logs
+scripts/whisper.sh down            # stops dictation; touches nothing else
 ```
 
-`up` writes `ASR_ENABLED=true` and `ASR_BASE_URL` into `.env`, then the
+`up` writes `ASR_ENABLED=true` and `ASR_BASE_URLS` into `.env`, then the
 orchestrator needs a restart to read them (`./techsara up`). Until that has
 happened the feature is invisible: no microphone button, and the route answers
 404. That is deliberate — a button that cannot work is worse than no button.
+
+**`down` is per node.** `scripts/whisper.sh down` stops the engines on the
+nodes `WHISPER_NODES` names, and rewrites `ASR_BASE_URLS` to whatever is left,
+so dropping the head's engine is one command and does not need `.env` edited
+by hand. It never touches `sf-local-ai-worker`, which is the main model.
 
 Configuration is documented in `.env.example` under *Speech to text*.
 
@@ -219,9 +315,12 @@ Configuration is documented in `.env.example` under *Speech to text*.
 
 ## Operating it
 
-- **Prometheus** scrapes the engine as job `vllm-asr`, labelled
-  `service=asr, node=spark-2`, giving the same vLLM metrics as every other
-  engine: queue depth, KV cache, tokens per second, request latencies.
+- **Prometheus does not scrape the engine, deliberately.** `server.py` serves
+  `/health`, `/v1/models` and `/v1/audio/transcriptions` and nothing else —
+  there is no `/metrics` — so a scrape job for it could only ever report a
+  target that is permanently down, and a red target that is red by
+  construction teaches people to ignore red targets. The reasoning is written
+  where the job used to be, in `monitoring/prometheus/prometheus.yml`.
 - **The orchestrator** exposes `asr_requests_total`,
   `asr_request_duration_seconds`, `asr_errors_total`, `asr_queue_depth`,
   `asr_active_requests` and `asr_detected_language_total`. The language label
@@ -240,12 +339,20 @@ Configuration is documented in `.env.example` under *Speech to text*.
 
 ## Known limits
 
-- **Streaming (partial text while speaking) is not implemented.** The engine
-  supports it — `Qwen3ASRRealtimeGeneration` is in the same vLLM registry —
-  and the transport here was kept simple enough to add it later. Stop-then-
-  transcribe at ~1 s for a normal sentence did not justify the complexity yet.
-- **Timestamps are not returned.** They need `Qwen3-ForcedAligner-0.6B` as a
-  second model; nothing in the composer would use them.
+- **No batching, and that is the big one.** The engine decodes one clip at a
+  time behind a `_gpu_lock`, so the fleet's capacity is exactly the number of
+  engines running. The previous vLLM-hosted engine batched eight concurrent
+  clips in the time of one; this does not, and the tables above are what that
+  costs. Serving whisper under vLLM instead (`WhisperForConditionalGeneration`
+  is in its registry) would recover continuous batching, at the price of the
+  sequential long-form decoder this deployment chose it for. That is the next
+  real improvement available here, and it is a genuine trade, not a free win.
+- **Streaming (partial text while speaking) is not implemented.** The
+  transport was kept simple enough to add it later. Stop-then-transcribe at
+  ~2 s for a normal sentence did not justify the complexity yet.
+- **Timestamps are not returned.** The sequential decoder predicts them
+  internally — it needs them to slide its window — but nothing in the composer
+  would use them, so they are not surfaced.
 - The rate limiter is in-process, so it bounds one orchestrator container.
   That is the whole deployment today; the concurrency pool is what actually
   protects the GPU.

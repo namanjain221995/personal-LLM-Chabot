@@ -1,0 +1,86 @@
+# Whisper Large-v3. Its own Compose project (sf-local-ai-whisper).
+#
+# THE SAME FILE RUNS ON EITHER NODE, which is why it is not named for one.
+# On the worker it is rsync'd to $HOME/.techsara-cluster/ and started there,
+# like compose.cluster-worker.yaml and compose.monitoring-worker.yaml; on the
+# head it is used in place. `WHISPER_BIND` is the only thing that differs, and
+# scripts/whisper.sh sets it per node. Two engines are REPLICAS: each holds a
+# whole model and answers whole clips. Nothing here is sharded across nodes.
+#
+# WHY A SEPARATE PROJECT AND NOT A SERVICE IN THE MAIN STACK. A separate
+# project is the isolation promise: `docker compose up` here cannot restart
+# the main model, and a torch upgrade for dictation cannot move a dependency
+# under sf-local-ai-worker-vllm-worker-1, which shares the worker's GPU and
+# must not be touched.
+#
+# BINDING. On the worker the orchestrator reaches this from the other node, so
+# the port must be off-box — but bound to the MANAGEMENT address only, never
+# 0.0.0.0 and never a 10.100.x RoCE address, which belongs to the fabric the
+# main model's tensor-parallel shards talk over. On the head it binds the
+# docker bridge gateway (172.17.0.1), which the orchestrator's container can
+# reach and nothing off-box can.
+
+services:
+  whisper:
+    build:
+      context: ./whisper
+      dockerfile: Dockerfile
+    image: sf-local-ai-whisper:cuda13
+    environment:
+      # The process binds this itself; Docker does not publish a port to it.
+      # See the HOST NETWORKING note below — this is the same failure the
+      # monitoring stack hit on 2026-08-31 and the same fix.
+      WHISPER_BIND: "${WHISPER_BIND:-192.168.9.68}"
+      WHISPER_PORT: "${WHISPER_PORT:-30007}"
+      WHISPER_MAX_AUDIO_SECONDS: "${WHISPER_MAX_AUDIO_SECONDS:-600}"
+      HF_HOME: /cache/huggingface
+      # The weights are ~3.1 GB and are fetched once into the volume below.
+      # Offline after that would be safer still, but a first start needs the
+      # network and this service is not on the critical path for chat.
+      HF_HUB_DISABLE_TELEMETRY: "1"
+    # HOST NETWORKING, AND NOT A PORT PUBLISH.
+    #
+    # Published as `ports: 192.168.9.68:30007:30007`, a container on this node
+    # does not survive a reboot: Docker starts containers before enP7s7 has
+    # been assigned its address, the bind fails with "cannot assign requested
+    # address", and the container is left dead with RestartCount=0 — the
+    # failure is in Docker's networking setup, BEFORE the process runs, so
+    # `restart: unless-stopped` never engages. Binding the address inside the
+    # container makes a missing NIC an ordinary process failure that the
+    # restart policy retries until it is up. dgx-gpu-exporter lost a night to
+    # this; see compose/compose.monitoring-worker.yaml.
+    network_mode: host
+    volumes:
+      # ITS OWN CACHE, not the host's ~/.cache/huggingface. That directory
+      # holds the weights for models this node runs for other reasons, and a
+      # speech service has no business sharing a namespace with them.
+      - whisper-cache:/cache/huggingface
+    restart: unless-stopped
+    healthcheck:
+      # Probes the address the server ACTUALLY binds, by reading the same two
+      # variables it does, so the two cannot drift apart. `ready` is checked,
+      # not just the HTTP status: the process answers /health while the model
+      # is still loading, and "up but not loaded" is not healthy.
+      test: ["CMD-SHELL", "python3 -c \"import os,urllib.request,json,sys; h=os.environ.get('WHISPER_BIND','127.0.0.1'); p=os.environ.get('WHISPER_PORT','30007'); b=json.load(urllib.request.urlopen(f'http://{h}:{p}/health', timeout=5)); sys.exit(0 if b.get('ready') else 1)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      # The first start downloads 3.1 GB of weights and loads them onto the
+      # GPU. Marking it unhealthy before that finishes would restart-loop the
+      # download forever.
+      start_period: 900s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  whisper-cache:

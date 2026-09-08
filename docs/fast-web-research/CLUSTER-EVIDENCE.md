@@ -73,7 +73,7 @@ speed-up from relieving it without measuring one.
 * `docs/CLUSTER.md` still states a 16 GiB KV budget in three places; the running system uses 8 GiB
   (the change and the `NV_ERR_NO_MEMORY` incident behind it ARE recorded later in the same file, so
   the earlier sections are stale).
-* The doc says node 2 runs "nothing else from the stack". It also runs **ASR** (Qwen3-ASR-1.7B, a
+* The doc says node 2 runs "nothing else from the stack". It also runs **ASR** (whisper-large-v3, a
   real service the orchestrator routes to) and two monitoring exporters. The stale co-tenant the
   doc's Limitations warns about is `Exited (0) 8 days ago` and nothing listens on node 2:8000.
 * Served window is 1,000,000, not the 800,000 in the doc's example output.

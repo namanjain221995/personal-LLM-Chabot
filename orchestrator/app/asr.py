@@ -12,26 +12,30 @@ written to disk, nothing reaches the database, and the transcript is returned
 to the browser as a DRAFT — it becomes a message only if the person presses
 Send. See app/audio_api.py for the route that enforces that.
 
-WHY THE CHAT ENDPOINT AND NOT /v1/audio/transcriptions. Both work. Measured on
-this deployment (2026-09-04, Qwen3-ASR-1.7B on the worker, 15 seconds of
-audio): transcriptions 1.04s, chat 1.04s — identical. The chat path
-additionally returns the language the model IDENTIFIED, in its own output
-contract (`language English<asr_text>…`), and a console that reports which
-languages a workspace speaks needs that. The transcriptions endpoint stays as
-the fallback: it is a different code path in the engine, so a failure in one
-is not automatically a failure in both.
+ONE ENDPOINT. /v1/audio/transcriptions, and nothing else. There used to be
+two, because Qwen3-ASR was a chat model that also answered on
+/v1/chat/completions, and the chat contract was preferred for the language it
+named in its own output format. Whisper does not mount the chat route — it
+answers 404 — and the old code classified a 404 as "the engine refused this
+audio" and pointedly did NOT fall back, so every dictation would have failed
+while telling the member their recording was at fault.
 
-FORMAT. None is converted here. vLLM decodes through PyAV, which bundles
+WHAT THE ENGINE RETURNS, and why this file is small. The speech server on the
+worker (compose/whisper/server.py) answers with the transcript, the language
+by name AND as an ISO code, the clip duration, and `no_speech_prob` — its own
+judgement that there was nothing to transcribe. Whisper is documented to
+hallucinate on silence and, measured here, answers a 30-second silent clip
+with " you"; the engine short-circuits that before the model runs. So this
+client identifies no languages, splits no audio and guesses nothing.
+
+FORMAT. None is converted here. The engine decodes through PyAV, which bundles
 ffmpeg, so the WebM/Opus a browser's MediaRecorder produces is understood
-natively — verified byte-for-byte against the same clip as WAV. That is why
-this orchestrator needs no audio library at all.
+natively. That is why this orchestrator needs no audio library at all.
 """
 from __future__ import annotations
 
 import asyncio
-import base64
 import logging
-import re
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Protocol, Sequence
@@ -41,31 +45,67 @@ from .config import settings
 
 log = logging.getLogger(__name__)
 
-#: The model's own output contract on the chat path. Not a heuristic: the
-#: engine always emits the identified language before the transcript marker.
-_CHAT_OUTPUT = re.compile(r"^language\s+(?P<language>[^<]+)<asr_text>(?P<text>.*)$", re.S)
-
-#: Languages Qwen3-ASR officially identifies (config.json `support_languages`).
-#: Anything else becomes "other" so a mis-parse cannot invent a language, and
-#: so the metric's label can never grow without bound.
+#: The languages the engine can identify — Whisper's own published set,
+#: generated from the model's tokenizer rather than typed by hand.
+#:
+#: This was Qwen3-ASR's THIRTY. Whisper reports ninety-nine, and a name that
+#: is not in this tuple is dropped by `normalise_language` — so leaving the
+#: short list in place would have silently discarded the language of every
+#: clip in the other sixty-nine, while the transcript itself came out fine.
+#: `metrics._ALLOWED["language"]` must be widened with it or the metric folds
+#: them to "other"; a test asserts the two agree.
 SUPPORTED_LANGUAGES = (
-    "Chinese", "English", "Cantonese", "Arabic", "German", "French", "Spanish",
-    "Portuguese", "Indonesian", "Italian", "Korean", "Russian", "Thai",
-    "Vietnamese", "Japanese", "Turkish", "Hindi", "Malay", "Dutch", "Swedish",
-    "Danish", "Finnish", "Polish", "Czech", "Filipino", "Persian", "Greek",
-    "Romanian", "Hungarian", "Macedonian",
+    "Afrikaans", "Albanian", "Amharic", "Arabic", "Armenian", "Assamese",
+    "Azerbaijani", "Bashkir", "Basque", "Belarusian", "Bengali",
+    "Bosnian", "Breton", "Bulgarian", "Cantonese", "Catalan", "Chinese",
+    "Croatian", "Czech", "Danish", "Dutch", "English", "Estonian",
+    "Faroese", "Finnish", "French", "Galician", "Georgian", "German",
+    "Greek", "Gujarati", "Haitian Creole", "Hausa", "Hawaiian", "Hebrew",
+    "Hindi", "Hungarian", "Icelandic", "Indonesian", "Italian",
+    "Japanese", "Javanese", "Kannada", "Kazakh", "Khmer", "Korean", "Lao",
+    "Latin", "Latvian", "Lingala", "Lithuanian", "Luxembourgish",
+    "Macedonian", "Malagasy", "Malay", "Malayalam", "Maltese", "Maori",
+    "Marathi", "Mongolian", "Myanmar", "Nepali", "Norwegian", "Nynorsk",
+    "Occitan", "Pashto", "Persian", "Polish", "Portuguese", "Punjabi",
+    "Romanian", "Russian", "Sanskrit", "Serbian", "Shona", "Sindhi",
+    "Sinhala", "Slovak", "Slovenian", "Somali", "Spanish", "Sundanese",
+    "Swahili", "Swedish", "Tagalog", "Tajik", "Tamil", "Tatar", "Telugu",
+    "Thai", "Tibetan", "Turkish", "Turkmen", "Ukrainian", "Urdu", "Uzbek",
+    "Vietnamese", "Welsh", "Yiddish", "Yoruba"
 )
 
 #: Human name -> BCP-47-ish code, for a response field a browser can use.
+#: The engine already returns `language_code` itself; this stays as the
+#: fallback for a reply that carries only the name.
+#: The engine already returns `language_code` itself; this stays as the
+#: fallback for a reply that carries only the name.
 _LANGUAGE_CODES = {
-    "Chinese": "zh", "English": "en", "Cantonese": "yue", "Arabic": "ar",
-    "German": "de", "French": "fr", "Spanish": "es", "Portuguese": "pt",
-    "Indonesian": "id", "Italian": "it", "Korean": "ko", "Russian": "ru",
-    "Thai": "th", "Vietnamese": "vi", "Japanese": "ja", "Turkish": "tr",
-    "Hindi": "hi", "Malay": "ms", "Dutch": "nl", "Swedish": "sv",
-    "Danish": "da", "Finnish": "fi", "Polish": "pl", "Czech": "cs",
-    "Filipino": "fil", "Persian": "fa", "Greek": "el", "Romanian": "ro",
-    "Hungarian": "hu", "Macedonian": "mk",
+    "Afrikaans": "af", "Albanian": "sq", "Amharic": "am", "Arabic": "ar",
+    "Armenian": "hy", "Assamese": "as", "Azerbaijani": "az", "Bashkir":
+    "ba", "Basque": "eu", "Belarusian": "be", "Bengali": "bn", "Bosnian":
+    "bs", "Breton": "br", "Bulgarian": "bg", "Cantonese": "yue",
+    "Catalan": "ca", "Chinese": "zh", "Croatian": "hr", "Czech": "cs",
+    "Danish": "da", "Dutch": "nl", "English": "en", "Estonian": "et",
+    "Faroese": "fo", "Finnish": "fi", "French": "fr", "Galician": "gl",
+    "Georgian": "ka", "German": "de", "Greek": "el", "Gujarati": "gu",
+    "Haitian Creole": "ht", "Hausa": "ha", "Hawaiian": "haw", "Hebrew":
+    "he", "Hindi": "hi", "Hungarian": "hu", "Icelandic": "is",
+    "Indonesian": "id", "Italian": "it", "Japanese": "ja", "Javanese":
+    "jw", "Kannada": "kn", "Kazakh": "kk", "Khmer": "km", "Korean": "ko",
+    "Lao": "lo", "Latin": "la", "Latvian": "lv", "Lingala": "ln",
+    "Lithuanian": "lt", "Luxembourgish": "lb", "Macedonian": "mk",
+    "Malagasy": "mg", "Malay": "ms", "Malayalam": "ml", "Maltese": "mt",
+    "Maori": "mi", "Marathi": "mr", "Mongolian": "mn", "Myanmar": "my",
+    "Nepali": "ne", "Norwegian": "no", "Nynorsk": "nn", "Occitan": "oc",
+    "Pashto": "ps", "Persian": "fa", "Polish": "pl", "Portuguese": "pt",
+    "Punjabi": "pa", "Romanian": "ro", "Russian": "ru", "Sanskrit": "sa",
+    "Serbian": "sr", "Shona": "sn", "Sindhi": "sd", "Sinhala": "si",
+    "Slovak": "sk", "Slovenian": "sl", "Somali": "so", "Spanish": "es",
+    "Sundanese": "su", "Swahili": "sw", "Swedish": "sv", "Tagalog": "tl",
+    "Tajik": "tg", "Tamil": "ta", "Tatar": "tt", "Telugu": "te", "Thai":
+    "th", "Tibetan": "bo", "Turkish": "tr", "Turkmen": "tk", "Ukrainian":
+    "uk", "Urdu": "ur", "Uzbek": "uz", "Vietnamese": "vi", "Welsh": "cy",
+    "Yiddish": "yi", "Yoruba": "yo"
 }
 
 
@@ -124,21 +164,12 @@ def normalise_language(raw: str) -> Optional[str]:
     return candidate if candidate in SUPPORTED_LANGUAGES else None
 
 
-def parse_chat_output(content: str) -> tuple[Optional[str], str]:
-    """Split `language English<asr_text>Hello.` into (language, text)."""
-    match = _CHAT_OUTPUT.match((content or "").strip())
-    if not match:
-        # The engine answered something else — keep the words, drop the claim
-        # about which language they are in.
-        return None, (content or "").strip()
-    return normalise_language(match.group("language")), match.group("text").strip()
-
-
 class VLLMAudioProvider:
-    """An OpenAI-compatible audio endpoint served by vLLM.
+    """An OpenAI-compatible /v1/audio/transcriptions endpoint.
 
-    One class covers Qwen3-ASR and Whisper because vLLM serves both behind the
-    same two routes; only the model id and how the language arrives differ.
+    Any engine that speaks that route works here — the speech server on the
+    worker (compose/whisper/server.py) and vLLM's own transcription endpoint
+    both do. Nothing in this class is specific to a model.
     """
 
     def __init__(
@@ -146,15 +177,13 @@ class VLLMAudioProvider:
         *,
         base_url: str,
         model: str,
-        name: str = "qwen3_asr",
+        name: str = "whisper",
         timeout_s: float = 60.0,
-        prefer_chat: bool = True,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.name = name
         self.timeout_s = timeout_s
-        self.prefer_chat = prefer_chat
 
     # -- transport ---------------------------------------------------------
 
@@ -163,70 +192,19 @@ class VLLMAudioProvider:
 
         return httpx.AsyncClient(timeout=self.timeout_s)
 
-    async def _chat(self, audio: bytes, content_type: str, language: str) -> Transcript:
-        """The path that reports the identified language."""
-        import httpx
-
-        data_url = f"data:{content_type};base64,{base64.b64encode(audio).decode()}"
-        content: list[dict[str, Any]] = [
-            {"type": "audio_url", "audio_url": {"url": data_url}}
-        ]
-        # A forced language is the caller's explicit choice; auto-detection is
-        # the default because a person dictating should not have to declare a
-        # language before speaking.
-        if language and language != "auto":
-            content.append({"type": "text", "text": language})
-        payload = {
-            "model": self.model,
-            "messages": [{"role": "user", "content": content}],
-            "max_tokens": settings.asr_max_tokens,
-            # Transcription is not a creative task: the same audio must give
-            # the same words every time.
-            "temperature": 0.0,
-        }
-        started = time.perf_counter()
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout_s) as client:
-                response = await client.post(
-                    f"{self.base_url}/chat/completions", json=payload
-                )
-        except Exception as exc:  # noqa: BLE001
-            raise ASRUnavailable(str(exc)) from exc
-        elapsed = int((time.perf_counter() - started) * 1000)
-        if response.status_code >= 500:
-            raise ASRUnavailable(f"engine returned {response.status_code}")
-        if response.status_code >= 400:
-            raise ASRRejected(_detail(response))
-        # A 200 is not a promise about the shape of the body. A proxy that
-        # answers with an HTML interstitial, or an engine build whose reply
-        # nests differently, would otherwise raise out of this module as
-        # something the route has no name for — and the person holding the
-        # microphone would get a 500 instead of a sentence. Unreadable is
-        # UNAVAILABLE: it is the same engine trouble as a refused connection,
-        # and it is worth trying the other endpoint for.
-        try:
-            body = response.json()
-            raw = str(
-                (body.get("choices") or [{}])[0].get("message", {}).get("content") or ""
-            )
-        except Exception as exc:  # noqa: BLE001
-            raise ASRUnavailable("the engine returned a reply this client cannot read") from exc
-        detected, text = parse_chat_output(raw)
-        return Transcript(
-            text=text,
-            language=detected,
-            language_code=language_code(detected or ""),
-            provider=self.name,
-            model=self.model,
-            engine_ms=elapsed,
-        )
-
     async def _transcriptions(self, audio: bytes, filename: str, content_type: str) -> Transcript:
-        """The fallback: a different code path in the same engine.
+        """The transcription endpoint — the only one Whisper serves.
 
-        Returns text alone — this endpoint does not report the language for
-        this model (the engine answers 400 to `verbose_json`), so `language`
-        is None rather than a guess.
+        The engine's reply carries more than text: the language it identified
+        by NAME and as an ISO code, the clip's duration, and `no_speech_prob`
+        — its own judgement that the audio held no speech at all. That last
+        one matters: Whisper is documented to hallucinate on silence, and
+        measured here it answers a 30-second silent clip with " you". The
+        engine short-circuits that before the model runs; this reads the
+        number so the orchestrator can see it happen.
+
+        Fields are read defensively. A server that answers with text alone is
+        still a working server — it just identifies no language.
         """
         import httpx
 
@@ -246,17 +224,28 @@ class VLLMAudioProvider:
         if response.status_code >= 400:
             raise ASRRejected(_detail(response))
         try:
-            spoken = str(response.json().get("text") or "").strip()
+            body = response.json()
+            spoken = str(body.get("text") or "").strip()
         except Exception as exc:  # noqa: BLE001
             raise ASRUnavailable("the engine returned a reply this client cannot read") from exc
+        # The engine reports the language by name; keep our own vocabulary as
+        # the gate so a surprise value cannot mint a metric series, and fall
+        # back to our table when it sends only the name.
+        language = normalise_language(str(body.get("language") or ""))
+        code = str(body.get("language_code") or "").strip() or None
+        if language and not code:
+            code = language_code(language)
         return Transcript(
             text=spoken,
-            language=None,
-            language_code=None,
+            language=language,
+            language_code=code,
             provider=self.name,
             model=self.model,
             engine_ms=elapsed,
-            degraded=True,
+            # NOT degraded. This is the primary path now, and marking every
+            # successful dictation as degraded would make the console read as
+            # though the service were permanently limping.
+            degraded=False,
         )
 
     # -- interface ---------------------------------------------------------
@@ -264,17 +253,21 @@ class VLLMAudioProvider:
     async def transcribe(
         self, audio: bytes, *, filename: str, content_type: str, language: str = ""
     ) -> Transcript:
-        if not self.prefer_chat:
-            return await self._transcriptions(audio, filename, content_type)
-        try:
-            return await self._chat(audio, content_type, language)
-        except ASRRejected:
-            # The engine understood the request and refused the audio. Trying
-            # the other endpoint would refuse it again, more slowly.
-            raise
-        except ASRUnavailable as exc:
-            log.warning("ASR chat path failed (%s); trying the transcription path", exc)
-            return await self._transcriptions(audio, filename, content_type)
+        """One path. Whisper serves /v1/audio/transcriptions and nothing else.
+
+        There used to be two, because Qwen3-ASR was a CHAT model that also
+        answered here, and the chat contract was preferred for the language it
+        reported. Whisper does not mount the chat route at all — it answers
+        404 — and the old code read a 404 as ASRRejected, "the engine refused
+        this audio", and deliberately did not fall back. Every dictation would
+        have failed, and the member would have been told their recording was
+        the problem.
+
+        `language` is accepted and ignored: the engine is deliberately left to
+        detect it, because these users code-switch mid-sentence and forcing
+        one language mistranscribes the other.
+        """
+        return await self._transcriptions(audio, filename, content_type)
 
     async def health(self) -> bool:
         import httpx
@@ -302,14 +295,21 @@ class RoutedProvider:
     """Several engines, one interface: send each clip to the freest one.
 
     WHY REPLICAS AND NOT ONE SHARDED MODEL. "Use both GPUs" has two possible
-    meanings and only one of them is faster here. Splitting a single 1.7B
-    model across two Sparks puts every layer's activations on the RoCE fabric
-    — 13 Gb/s a link, already carrying the main model's own tensor-parallel
-    traffic — to save memory that was never short: the weights are 4.4 GB and
-    each node has room for them twice over. Two whole copies with requests
-    balanced between them adds throughput without adding a single byte of
-    cross-node chatter, and it degrades to one engine gracefully when a node
-    goes away. That is what this class does.
+    meanings, and the sharded one is not the faster one here. Splitting a
+    single 1.55B model across two Sparks puts every layer's activations on the
+    RoCE fabric the main model's own tensor-parallel traffic already uses —
+    and cross-node tensor parallelism costs LATENCY per collective (~12.8 µs a
+    round trip, on activations a few KB wide), not bandwidth, so the fabric
+    being fast (~109 Gb/s a rail) does not recover it. All of that to save
+    memory that was never short: whisper-large-v3 is 3.1 GB in float16 and
+    either node holds it several times over. Two whole copies with requests
+    balanced between them add throughput without one byte of cross-node
+    chatter, and degrade to one engine gracefully when a node goes away.
+
+    AND BE HONEST ABOUT WHAT THAT BUYS: a second concurrent SPEAKER, not a
+    faster transcript. One clip is decoded by one engine start to finish.
+    Two engines double how many people can dictate at once; they do not halve
+    the time any one of them waits.
 
     LEAST ACTIVE, not round robin. Clips are not the same size — a
     four-second question and a two-minute dictation are one request each —

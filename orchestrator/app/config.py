@@ -133,43 +133,65 @@ class Settings:
         ).rstrip("/")
         self.ocr_model: str = os.environ.get("OCR_MODEL", "baidu/Unlimited-OCR")
 
-        # -- Speech to text (2026-09-04) ------------------------------------
+        # -- Speech to text (2026-09-04; whisper-large-v3 from 2026-09-08) --
         #
         # The composer's microphone. OFF by default: the engine is a separate
-        # service on a separate node, started by scripts/asr.sh, and a
+        # service on a separate node, started by scripts/whisper.sh, and a
         # deployment that has not run it must not offer members a button that
-        # cannot work. The script writes ASR_BASE_URL into .env when it
-        # succeeds, which is what turns the feature on.
+        # cannot work. The script writes ASR_ENABLED and ASR_BASE_URLS into
+        # .env when it succeeds, which is what turns the feature on — and
+        # `whisper.sh down` takes the stopped engine back out of that list,
+        # so the two directions stay symmetric.
         self.asr_enabled: bool = _bool("ASR_ENABLED", False)
-        self.asr_backend: str = os.environ.get("ASR_BACKEND", "qwen3_asr")
+        self.asr_backend: str = os.environ.get("ASR_BACKEND", "whisper")
+        # The speech server on the worker (compose/compose.whisper.yaml),
+        # bound to its MANAGEMENT address because the orchestrator reaches it
+        # from the other node. Never a 10.100.x RoCE address: that fabric
+        # belongs to the main model's tensor-parallel shards.
         self.asr_base_url: str = os.environ.get(
-            "ASR_BASE_URL", "http://vllm-asr:30006/v1"
+            "ASR_BASE_URL", "http://192.168.9.68:30007/v1"
         ).rstrip("/")
         # More than one engine, comma-separated, when speech runs on both
         # nodes. Requests go to whichever endpoint has the fewest in flight;
         # see app/asr.RoutedProvider. Falls back to the single URL above, so a
         # deployment that never sets this behaves exactly as it did.
         #
-        # These are REPLICAS, not shards. A 1.7B model fits in 6 GiB and
-        # splitting one across two Sparks would put every layer's activations
-        # on a 13 Gb/s RoCE link that the main model's tensor-parallel traffic
-        # already uses — slower, and contending with the thing that must not
-        # be slowed. Two whole copies, load-balanced, is what "use both GPUs"
-        # actually means here.
+        # These are REPLICAS, not shards, and the distinction is the whole
+        # answer to "use both GPUs". whisper-large-v3 is 1.55B parameters,
+        # 3.1 GB in float16 — it fits on either node several times over.
+        # Splitting one across two Sparks would put every layer's activations
+        # on the RoCE link the main model's tensor-parallel traffic already
+        # uses, to save memory that was never short: slower, and contending
+        # with the thing that must not be slowed.
+        #
+        # SO BE PRECISE ABOUT WHAT A SECOND ENGINE BUYS: a second concurrent
+        # speaker, not a faster transcript. One clip is decoded by one engine.
+        # Two nodes double how many people can dictate at once; they do not
+        # halve the time any one of them waits. Measured 2026-09-08 on 15 s
+        # clips — 1 concurrent: 2.12 s → 2.03 s (1.0x, i.e. nothing); 2: 4.00 s
+        # → 2.05 s; 4: 7.99 s → 4.16 s; 8: 15.99 s → 8.31 s; 16: 32.02 s →
+        # 16.79 s. A clean 1.9x from two clips upward and 1.0x at one, which is
+        # exactly what replicas of a serial engine predict.
         self.asr_base_urls: tuple[str, ...] = tuple(
             url.strip().rstrip("/")
             for url in os.environ.get("ASR_BASE_URLS", "").split(",")
             if url.strip()
         ) or (self.asr_base_url,)
-        self.asr_model: str = os.environ.get("ASR_MODEL", "Qwen/Qwen3-ASR-1.7B")
+        self.asr_model: str = os.environ.get("ASR_MODEL", "openai/whisper-large-v3")
         # Auto-detection is the default and should stay it: a person dictating
-        # must not have to declare a language before they speak, and the model
-        # identifies 30 of them by itself.
+        # must not have to declare a language before they speak, and Whisper
+        # identifies ninety-nine by itself. It is also the only setting that
+        # serves the people on this deployment, who code-switch mid-sentence
+        # — forcing one language mistranscribes the other. The engine is not
+        # sent a language at all; see app/asr.transcribe.
         self.asr_language: str = os.environ.get("ASR_LANGUAGE", "auto")
-        # Generous against the measured cost. 60 seconds of audio transcribes
-        # in 1.9s on this hardware, so this is a stuck-engine guard, not a
-        # budget.
-        self.asr_timeout_s: float = _float("ASR_TIMEOUT_S", 60.0)
+        # A stuck-engine guard, not a budget — but it has to clear the worst
+        # legitimate case. Measured on this hardware: 11 s of audio in 1.24 s,
+        # about 9x realtime. Ten minutes of audio is therefore ~70 s of
+        # decoding, and Whisper's sequential long-form pass is slower per
+        # second than a short clip, so 60 s was too tight for a long
+        # dictation and would have failed it as an engine fault.
+        self.asr_timeout_s: float = _float("ASR_TIMEOUT_S", 240.0)
         # Composer dictation, not podcast transcription. Ten minutes is the
         # ceiling; the browser stops recording at it rather than uploading
         # something that will be refused.
@@ -180,14 +202,23 @@ class Settings:
         self.asr_max_upload_bytes: int = _int(
             "ASR_MAX_UPLOAD_BYTES", 32 * 1024 * 1024
         )
-        # Not about protecting the ASR engine, which batches eight concurrent
-        # clips in the time of one. About protecting the CHAT model: audio
-        # must never contend with an answer someone is waiting for.
-        # PER ENGINE, not in total: the number exists to bound how hard any
-        # one node is pushed while the chat model shares it, so a second
-        # engine on a second node raises the fleet's ceiling without raising
-        # the pressure on either machine.
-        self.asr_max_concurrent: int = _int("ASR_MAX_CONCURRENT", 4)
+        # PER ENGINE, not in total, and 2 rather than 4 because the engine
+        # SERIALISES. compose/whisper/server.py holds a `_gpu_lock` around
+        # every transcription, so one engine decodes exactly one clip at a
+        # time — measured 2026-09-08, throughput is flat at ~7 s of audio per
+        # wall-second from 1 concurrent clip to 16, while latency grows
+        # linearly (2.1 s → 17.0 s at 16). Whisper on transformers does not
+        # batch the way Qwen3-ASR on vLLM did, and a deep queue therefore buys
+        # nothing but waiting.
+        #
+        # 2 = one decoding, one ready to start, so the GPU never idles between
+        # clips and nobody waits behind more than one other person. Anything
+        # past that is refused fast (asr_queue_wait_s) instead of silently
+        # extending the window during which the CHAT model is degraded — and
+        # that window is expensive: a saturated speech engine takes the main
+        # model from 71 tok/s to ~24 on EITHER node, because the chat model is
+        # tensor-parallel across both and runs at the speed of its slower rank.
+        self.asr_max_concurrent: int = _int("ASR_MAX_CONCURRENT", 2)
         # Past this, callers are told to try again instead of queueing behind
         # work they cannot see.
         self.asr_queue_wait_s: float = _float("ASR_QUEUE_WAIT_S", 8.0)
