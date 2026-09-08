@@ -182,11 +182,16 @@ same afternoon:
 
 | state | chat decode | change |
 |---|---:|---:|
-| no speech engine on the head | 71.4 tok/s | — |
-| head engine loaded, idle | 66.0 tok/s | −7.6 % |
+| idle, no engine / engine loaded | 67–73 tok/s | not measurable |
 | **worker** engine saturated | 24.6 tok/s | **−66 %** |
 | **head** engine saturated | 23.0 tok/s | **−68 %** |
 | both saturated | 14.7 tok/s | **−79 %** |
+
+**A loaded but idle engine costs nothing detectable.** Repeated single-stream
+baselines on this box scatter across 54–74 tok/s run to run, so the ~5 tok/s
+difference an idle engine appears to make is inside the noise and is not
+claimed here. The saturated rows are far outside that band, which is why they
+are.
 
 **Saturating either node costs the same**, which is the counter-intuitive part
 and the important one: the chat model is tensor-parallel across both Sparks and

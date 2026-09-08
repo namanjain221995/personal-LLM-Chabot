@@ -67,9 +67,35 @@ model_dir_name() {
   printf '%s--%s' "${WHISPER_MODEL//\//--}" "${WHISPER_MODEL_REVISION:0:12}"
 }
 
+# WHICH NODES THIS COMMAND ACTS ON, in priority order:
+#   1. WHISPER_NODES, when the caller says explicitly.
+#   2. WHAT IS ACTUALLY RUNNING, read back from ASR_BASE_URLS in .env.
+#   3. the worker, which is where a first `up` puts it.
+#
+# Step 2 is the one worth explaining. Without it `up --all-nodes` starts two
+# engines and then `status`, `logs`, `url` and `down` all quietly act on the
+# worker alone — so `status` reports a healthy fleet while an engine nobody
+# can see is still holding a GPU, and `down` leaves it running. The commands
+# that INSPECT or STOP the fleet must default to the fleet that exists, not to
+# the fleet a fresh install would have.
 whisper_nodes() {
   if ! is_dual_mode; then printf 'head'; return; fi
   if [ -n "$WHISPER_NODES" ]; then printf '%s' "${WHISPER_NODES//,/ }"; return; fi
+  local recorded node_list="" url
+  recorded="$(grep -E '^ASR_BASE_URLS=' "$ROOT/.env" 2>/dev/null | cut -d= -f2- | tr ',' ' ')"
+  for url in $recorded; do
+    case "$url" in
+      *"$(whisper_bind_address head)"*) node_list="$node_list head" ;;
+      *) node_list="$node_list worker" ;;
+    esac
+  done
+  # Deduplicate, keeping the worker first so `logs` (which takes the first
+  # node) follows the engine that is always present.
+  local out=""
+  for node in worker head; do
+    case " $node_list " in *" $node "*) out="$out $node" ;; esac
+  done
+  if [ -n "$out" ]; then printf '%s' "${out# }"; return; fi
   printf 'worker'
 }
 
