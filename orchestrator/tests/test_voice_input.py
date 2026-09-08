@@ -39,9 +39,9 @@ from app.config import settings
 
 #: Deliberately distinctive, so the "nothing leaks" test is looking for
 #: strings that could only have come from the server's own configuration.
-ENGINE_URL = "http://asr-node.internal:30006/v1"
-ENGINE_MODEL = "test-engine/asr-worker-build"
-ENGINE_NAME = "test_engine_worker"
+ENGINE_URL = "http://asr-node.internal:30007/v1"
+ENGINE_MODEL = "openai/whisper-large-v3-worker-build"
+ENGINE_NAME = "whisper_worker"
 
 #: What the fake engine hears. Chosen to be the sort of thing a person would
 #: be appalled to find in a telemetry table.
@@ -56,7 +56,7 @@ _SLICE = 64 * 1024
 
 
 class FakeEngine:
-    """A speech engine's stand-in: records what it was asked, answers as told.
+    """The speech engine's stand-in: records what it was asked, answers as told.
 
     Every test but the pure parsing ones goes through this, so a test failure
     is always about the orchestrator and never about a GPU being busy.
@@ -102,10 +102,52 @@ class FakeEngine:
 
 
 @pytest.fixture()
+def engine_http(monkeypatch):
+    """A real VLLMAudioProvider talking to a fake HTTP engine.
+
+    The `engine` fixture below replaces the whole provider, which is right for
+    testing the ROUTE. These tests are about the CLIENT — that it posts
+    multipart to the transcription path, names the model, and turns the reply
+    into a Transcript — so the httpx layer has to be real and only the socket
+    is faked.
+    """
+    import httpx
+
+    def _install(reply: dict, status: int = 200):
+        seen: dict = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["url"] = str(request.url)
+            body = request.content.decode("latin-1")
+            seen["multipart"] = 'name="file"' in body
+            for field in ("model",):
+                marker = f'name="{field}"\r\n\r\n'
+                if marker in body:
+                    seen[field] = body.split(marker, 1)[1].split("\r\n", 1)[0]
+            return httpx.Response(status, json=reply)
+
+        transport = httpx.MockTransport(handler)
+        real = httpx.AsyncClient
+
+        def fake_client(*args, **kwargs):
+            kwargs["transport"] = transport
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(httpx, "AsyncClient", fake_client)
+        provider = asr.VLLMAudioProvider(
+            base_url=ENGINE_URL, model=ENGINE_MODEL, name=ENGINE_NAME
+        )
+        return seen, provider
+
+    return _install
+
+
+@pytest.fixture()
 def engine(monkeypatch):
     """A deployment WITH a speech engine, and clean admission control."""
     monkeypatch.setattr(settings, "asr_enabled", True)
     monkeypatch.setattr(settings, "asr_base_url", ENGINE_URL)
+    monkeypatch.setattr(settings, "asr_model", ENGINE_MODEL)
     # The rate window and the pool are process-wide. Left alone, the twentieth
     # request of the file would 429 inside whichever test happened to be
     # twentieth, and the semaphore from the concurrency test would still hold
@@ -213,7 +255,7 @@ def test_one_persons_revoked_microphone_does_not_close_anybody_elses(
 def test_a_deployment_without_a_speech_engine_answers_not_found(
     engine, login_client, monkeypatch
 ):
-    """404, not 503: a deployment with no speech engine installed does not
+    """404, not 503: a deployment that never started scripts/whisper.sh does not
     HAVE this feature, and 503 would promise it is coming back."""
     monkeypatch.setattr(settings, "asr_enabled", False)
     bob = login_client("bob")
@@ -519,28 +561,33 @@ def test_an_engine_failure_nobody_named_is_still_a_sentence_and_still_a_row(
     assert rows[0]["status"] == "error"
 
 
-def test_an_engine_reply_this_client_cannot_read_is_engine_trouble(
-    engine, login_client
-):
+def test_an_engine_reply_this_client_cannot_read_is_engine_trouble(monkeypatch):
     """A 200 is not a promise about the shape of a body.
 
-    An interstitial from a proxy in front of the engine parses as neither JSON
-    nor a transcript. Whatever engine is installed, a provider that let that
-    raise would turn one misconfigured reverse proxy into 500s. It is the same
-    trouble as a refused connection, so it must arrive as ASRUnavailable and
-    the person gets a sentence rather than a stack-trace id.
-
-    Asserted through the route rather than against a particular provider: the
-    engine that used to be here is gone, and the property belongs to the
-    contract, not to its implementation.
+    An interstitial from a proxy in front of the worker parses as neither JSON
+    nor a completion. Letting that raise out of the provider turns one
+    misconfigured reverse proxy into 500s; it is the same trouble as a refused
+    connection, so it is ASRUnavailable and the caller may retry.
     """
-    engine.raises = asr.ASRUnavailable(
-        "the engine returned a reply this client cannot read"
+    import httpx
+
+    def gateway_timeout(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="<html>504 Gateway Time-out</html>")
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(
+            transport=httpx.MockTransport(gateway_timeout), **kwargs
+        ),
     )
-    response = _post(login_client("proxy"))
-    assert response.status_code == 503
-    assert isinstance(response.json()["detail"], str)
-    assert "html" not in response.json()["detail"].lower()
+    provider = asr.VLLMAudioProvider(base_url=ENGINE_URL, model=ENGINE_MODEL)
+
+    with pytest.raises(asr.ASRUnavailable):
+        asyncio.run(
+            provider.transcribe(WEBM, filename="clip.webm", content_type="audio/webm")
+        )
 
 
 def test_a_failed_attempt_records_the_wait_the_person_actually_sat_through(
@@ -645,6 +692,81 @@ def test_an_administrator_gets_the_honest_operational_answer(engine, login_clien
     assert body["enabled"] is True
     assert body["ready"] is True
     assert body["model"] == ENGINE_MODEL
+
+
+# ---------------------------------------------------------------------------
+# The output contract
+# ---------------------------------------------------------------------------
+
+
+def test_the_engine_reply_becomes_a_transcript(engine_http):
+    """The whole client contract, in one assertion. The engine answers with
+    the transcript AND the language it identified, by name and as a code;
+    none of it is parsed out of prose the way the old chat contract was."""
+    fake, provider = engine_http(
+        {
+            "text": "  And so my fellow Americans.  ",
+            "language": "english",
+            "language_code": "en",
+            "duration": 11.0,
+            "no_speech_prob": 0.0286,
+        }
+    )
+    result = asyncio.run(
+        provider.transcribe(WEBM, filename="clip.webm", content_type="audio/webm")
+    )
+    assert result.text == "And so my fellow Americans."
+    assert (result.language, result.language_code) == ("English", "en")
+    # NOT degraded: this is the only path there is, and marking every
+    # dictation degraded would make a healthy service read as limping.
+    assert result.degraded is False
+    # It went to the transcription route, as multipart, naming the model.
+    assert fake["url"].endswith("/audio/transcriptions")
+    assert fake["model"] == provider.model
+
+
+def test_a_reply_with_only_text_still_works(engine_http):
+    """A server that answers with the transcript alone is a working server —
+    it just identifies no language. Nothing here may guess one."""
+    _fake, provider = engine_http({"text": "Hello there."})
+    result = asyncio.run(
+        provider.transcribe(WEBM, filename="clip.webm", content_type="audio/webm")
+    )
+    assert result.text == "Hello there."
+    assert result.language is None and result.language_code is None
+
+
+def test_a_language_the_engine_names_but_we_do_not_know_is_dropped(engine_http):
+    """The console's language column is a metric label. Accepting whatever
+    arrived would let a surprise value mint an unbounded label set."""
+    _fake, provider = engine_http({"text": "Qapla!", "language": "klingon"})
+    result = asyncio.run(
+        provider.transcribe(WEBM, filename="clip.webm", content_type="audio/webm")
+    )
+    assert result.text == "Qapla!"
+    assert result.language is None
+
+
+def test_the_name_is_filled_in_from_our_table_when_only_a_name_arrives(engine_http):
+    _fake, provider = engine_http({"text": "Bonjour.", "language": "french"})
+    result = asyncio.run(
+        provider.transcribe(WEBM, filename="clip.webm", content_type="audio/webm")
+    )
+    assert (result.language, result.language_code) == ("French", "fr")
+
+
+def test_a_language_the_model_does_not_speak_is_none_rather_than_a_guess():
+    """The console's language column is a label on a metric. Accepting
+    whatever the engine emitted would let a mis-parse invent a language and
+    grow the label set without bound."""
+    assert asr.normalise_language("English") == "English"
+    assert asr.normalise_language("english") == "English"
+    assert asr.normalise_language("Cantonese.") == "Cantonese"
+    # Whisper reports ninety-nine, not Qwen3-ASR's thirty.
+    assert asr.normalise_language("ukrainian") == "Ukrainian"
+    assert asr.normalise_language("hebrew") == "Hebrew"
+    assert asr.normalise_language("Klingon") is None
+    assert asr.normalise_language("") is None
 
 
 def test_a_transcript_never_tells_a_member_what_hardware_answered(
@@ -879,6 +1001,18 @@ def test_the_fleet_is_healthy_while_any_engine_answers():
     assert asyncio.run(asr.RoutedProvider([dead]).health()) is False
 
 
+def test_one_endpoint_still_goes_through_the_router(monkeypatch):
+    """The code path a workspace runs every day should be the one the tests
+    exercise, not a special case that only appears on smaller deployments."""
+    monkeypatch.setattr(settings, "asr_base_urls", ("http://only/v1",))
+    asr.set_provider(None)
+    try:
+        assert isinstance(asr.provider(), asr.RoutedProvider)
+        assert len(asr.provider().stats()) == 1
+    finally:
+        asr.set_provider(None)
+
+
 def test_the_pool_scales_with_the_fleet_not_with_the_pressure(monkeypatch):
     """Four per engine, times the fleet: two nodes carry twice the work at the
     same pressure each. The limit exists to bound how hard ONE node is pushed
@@ -893,3 +1027,65 @@ def test_the_pool_scales_with_the_fleet_not_with_the_pressure(monkeypatch):
 
     assert asyncio.run(check()) == 8
     asr.POOL.reset_for_tests()
+
+
+# ---------------------------------------------------------------------------
+# The vocabularies that have to move together
+# ---------------------------------------------------------------------------
+
+
+def test_every_language_the_client_can_report_has_a_metric_label():
+    """These are two lists in two files and they must agree.
+
+    `metrics` folds an unknown label to "other", so a language `asr` can
+    report but `metrics` does not hold produces a metric that LIES while
+    transcription works perfectly — the hardest kind of wrong to notice. That
+    is what happened when the engine went from Qwen3-ASR's thirty languages to
+    Whisper's ninety-nine and only one of the two lists was widened.
+
+    `metrics` cannot import `asr` (asr imports metrics), so this is the join.
+    """
+    from app import metrics
+
+    assert set(asr.SUPPORTED_LANGUAGES) | {"unknown"} == metrics._ALLOWED["language"]
+
+
+def test_every_language_has_a_code():
+    """`language_code` is returned to the browser. A name with no code would
+    surface as a language the client cannot act on."""
+    missing = [n for n in asr.SUPPORTED_LANGUAGES if not asr.language_code(n)]
+    assert not missing, f"no ISO code for: {missing}"
+
+
+def test_the_client_asks_the_engine_for_nothing_but_the_audio(engine_http):
+    """No `language`, no `prompt`, no `hotwords`.
+
+    Forcing a language mistranscribes the other one for people who
+    code-switch mid-sentence, which is what this workspace does. `prompt` is
+    worse: on Whisper it is a decoder prefix, so a biasing phrase can be
+    emitted as if it had been spoken.
+    """
+    fake, provider = engine_http({"text": "ok"})
+    asyncio.run(
+        provider.transcribe(
+            WEBM, filename="clip.webm", content_type="audio/webm", language="French"
+        )
+    )
+    assert "language" not in fake
+    assert "prompt" not in fake and "hotwords" not in fake
+
+
+def test_silence_comes_back_empty_rather_than_as_a_word(engine_http):
+    """Whisper hallucinates on silence — measured on this deployment, thirty
+    seconds of digital silence transcribes as " you". The engine short-circuits
+    it before the model runs and answers with an empty transcript; the client
+    must pass that through rather than treating empty as a failure."""
+    _fake, provider = engine_http(
+        {"text": "", "language": None, "language_code": None,
+         "duration": 30.0, "no_speech_prob": 0.98}
+    )
+    result = asyncio.run(
+        provider.transcribe(WEBM, filename="clip.webm", content_type="audio/webm")
+    )
+    assert result.text == ""
+    assert result.language is None

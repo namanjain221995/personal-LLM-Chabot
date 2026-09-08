@@ -116,6 +116,34 @@ scrape_configs:
         regex: ".*_created$"
         action: drop
 
+  # SPEECH TO TEXT HAS NO SCRAPE JOB, AND THAT IS NOT AN OVERSIGHT.
+  #
+  # There was a `vllm-asr` job here pointed at 192.168.9.68:30006, from when
+  # dictation ran on Qwen3-ASR under vLLM and inherited vLLM's /metrics for
+  # free. whisper-large-v3 is served by compose/whisper/server.py, a small
+  # FastAPI app that exposes /health, /v1/models and /v1/audio/transcriptions
+  # and NOTHING ELSE — there is no /metrics on any port, so a scrape job for
+  # it could only ever report a target that is permanently down. A red target
+  # that is red by construction trains people to ignore red targets, so the
+  # job was removed rather than repointed.
+  #
+  # What replaces it, and it is enough:
+  #   * the ORCHESTRATOR's own /metrics (job techsara-orchestrator below)
+  #     carries asr_requests_total, asr_request_duration_seconds,
+  #     asr_errors_total, asr_queue_depth, asr_active_requests and
+  #     asr_detected_language_total — every request goes through it, so its
+  #     view is complete;
+  #   * GET /audio/health reports each engine's liveness on demand;
+  #   * dgx-gpu-exporter already shows what the speech engine is doing to both
+  #     GPUs, which is the number that actually matters (see docs/VOICE.md,
+  #     "What it costs the chat model").
+  # If the engine ever grows a /metrics endpoint, add the job back here.
+
+  # --- The living knowledge layer ----------------------------------------
+  # The orchestrator's own /metrics (app/metrics.py, stdlib-only). Public like
+  # /health so the scrape needs no session; it exposes counters and histograms
+  # only — every label comes from a closed set, so no query text, URL or user
+  # id can reach Prometheus.
   - job_name: orchestrator
     scrape_interval: 15s
     static_configs:
