@@ -461,6 +461,52 @@ def _external_value(values: Mapping[str, str], name: str, default: str = "") -> 
     return value
 
 
+#: The user-owned .env key scripts/ocr.sh writes when it starts the OCR engine
+#: off the head (docs/ocr-on-the-worker.md), and clears when it stops it.
+OCR_REMOTE_KEY = "OCR_REMOTE_BASE_URL"
+
+
+def remote_ocr_url(values: Mapping[str, str]) -> str:
+    """The OCR engine scripts/ocr.sh started elsewhere, or "" for the head's own.
+
+    Checked the way the external-development URLs are (an http(s) scheme, a
+    host, no embedded credentials, no whitespace or control characters, at
+    most 512 characters) but WITHOUT their local-host rule: the whole point of
+    this key is an address on the other node, ``http://192.168.9.68:30004/v1``,
+    which ``_external_url`` would refuse as non-local. A bad value raises
+    rather than falling back to the head's engine, because the operator just
+    moved 17 GB of memory on the strength of it and a silent fallback would
+    start that engine again on the node they were emptying.
+    """
+    raw = str(values.get(OCR_REMOTE_KEY, "") or "").strip()
+    if not raw:
+        return ""
+    problem = ""
+    if len(raw) > 512:
+        problem = "is longer than 512 characters"
+    elif any(character.isspace() or ord(character) < 32 or ord(character) == 127 for character in raw):
+        problem = "contains whitespace or control characters"
+    else:
+        try:
+            parsed = urlsplit(raw)
+            hostname = parsed.hostname
+        except ValueError:
+            problem = "is not a valid URL"
+        else:
+            if parsed.scheme not in {"http", "https"}:
+                problem = "must start with http:// or https://"
+            elif not hostname:
+                problem = "has no host"
+            elif parsed.username or parsed.password:
+                problem = "must not embed credentials"
+    if problem:
+        raise TechSaraError(
+            f"{OCR_REMOTE_KEY} in .env {problem}; expected the address scripts/ocr.sh recorded, "
+            "for example http://192.168.9.68:30004/v1 (clear the key to use the head's own vllm-ocr)"
+        )
+    return raw.rstrip("/")
+
+
 def _capability_values(
     prefix: str,
     model: ModelSpec | None,
@@ -515,6 +561,8 @@ def build_generated_environment(
     bind_address = resolve_bind_address(user_values)
     model_bind_address = resolve_model_bind_address(user_values)
     publish_model_ports = _truthy(user_values.get("PUBLISH_MODEL_PORTS"))
+    # Validated here, before anything is generated, like every other knob.
+    remote_ocr = remote_ocr_url(user_values)
     search_provider = search_provider.strip().lower() or "searxng"
     if search_provider not in {"searxng", "tavily", "brave"}:
         raise TechSaraError(
@@ -611,6 +659,15 @@ def build_generated_environment(
     embed = profile.embedding_model if profile.features.get("embeddings") else None
     reranker = profile.reranker_model if profile.features.get("reranker") else None
     ocr = None if skip_ocr or not profile.features.get("ocr") else profile.ocr_model
+    if remote_ocr and ocr is not None:
+        # scripts/ocr.sh moved the engine off the head: the orchestrator is
+        # pointed at it, and cli._compose_profiles leaves the head's `ocr`
+        # profile off so `techsara up` stops starting vllm-ocr here. The
+        # model, the enabled flag and every OCR_* capability value below are
+        # exactly what they would be for the head's engine -- OCR is still
+        # on, just elsewhere. With OCR off (skipped, or not a feature of the
+        # profile) the key is validated but changes nothing.
+        ocr_url = remote_ocr
     router_url = main_url if profile.router_shared else "http://vllm-router:30002/v1"
     values: dict[str, str] = {
         "TECHSARA_PROFILE": profile.id,

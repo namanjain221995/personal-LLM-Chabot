@@ -27,6 +27,16 @@ best:
 | fusion and Q&A | main `Qwen3.6-35B-A3B-NVFP4` | the understanding, and answers; it LOOKS at up to three frames when a question is visual or names a time |
 | speech | `openai/whisper-large-v3` (both Sparks) | timestamped segments, 99 languages, code-switching kept |
 
+Where they run: whisper on both Sparks (two clips in flight, one each);
+OCR on the **worker** Spark since 2026-09-09 (`scripts/ocr.sh`, see
+[DECISIONS §11](DECISIONS.md)); router, embeddings, reranker and the main
+model's rank 0 on the head, rank 1 on the worker. Memory the day OCR moved:
+
+| | head | worker |
+|---|---:|---:|
+| before | 108 GB used · 13 available | 52 GB used · 68 available |
+| after | **86 GB used · 34 available** | 72 GB used · 49 available |
+
 The UI's Activity panel says which readers saw what; `meta.video.vision`
 records `main+router`.
 

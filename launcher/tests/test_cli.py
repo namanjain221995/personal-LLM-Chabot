@@ -488,6 +488,37 @@ class CliSelectionHelperTests(unittest.TestCase):
             ),
         )
 
+    def test_a_remote_ocr_engine_drops_the_heads_ocr_profile_and_service(self) -> None:
+        """OCR_REMOTE_BASE_URL (scripts/ocr.sh) means: do not run vllm-ocr here.
+
+        The profile is left off so `up` never starts it, and the service is
+        left out of the desired set so reconcile() stops a copy still running
+        from before the move. An empty key is the same as no key.
+        """
+        models, _ = load_model_manifest(REPO_ROOT)
+        profile = replace(
+            selected(nvidia(80)),
+            ocr_model=models["unlimited-ocr"],
+            features=dict(selected(nvidia(80)).features, ocr=True),
+        )
+        remote = {"OCR_REMOTE_BASE_URL": "http://192.168.9.68:30004/v1"}
+        self.assertEqual(cli._compose_profiles(profile, {}, skip_ocr=False), ["embeddings", "ocr"])
+        self.assertEqual(
+            cli._compose_profiles(profile, {"OCR_REMOTE_BASE_URL": ""}, skip_ocr=False),
+            ["embeddings", "ocr"],
+        )
+        self.assertEqual(cli._compose_profiles(profile, remote, skip_ocr=False), ["embeddings"])
+        self.assertIn(
+            "vllm-ocr",
+            cli._desired_optional_services(profile, ["embeddings", "ocr"], salesforce_ready=False),
+        )
+        self.assertNotIn(
+            "vllm-ocr",
+            cli._desired_optional_services(profile, ["embeddings"], salesforce_ready=False),
+        )
+        with self.assertRaisesRegex(TechSaraError, "OCR_REMOTE_BASE_URL"):
+            cli._compose_profiles(profile, {"OCR_REMOTE_BASE_URL": "vllm-ocr:30004"}, skip_ocr=False)
+
     def test_secret_value_discovery_uses_names_not_arbitrary_configuration(self) -> None:
         values = {
             "POSTGRES_PASSWORD": "database-secret",
@@ -704,11 +735,27 @@ class UpCommandTests(unittest.TestCase):
                 "frontend": "http://127.0.0.1:3000",
             },
             root=self.root,
+            ocr_remote=False,
         )
         state = self.atomic_json.call_args.args[1]
         self.assertEqual(state["status"], "running")
         self.assertEqual(state["profile"], self.profile.id)
         self.assertEqual(state["compose_command"], ["docker", "compose", "up", "-d"])
+
+    def test_up_tells_the_start_sequence_when_the_ocr_engine_is_remote(self) -> None:
+        self.user_env["OCR_REMOTE_BASE_URL"] = "http://192.168.9.68:30004/v1"
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(cli._cmd_up(self.args(), root=self.root), 0)
+        self.assertTrue(self.start_compose.call_args.kwargs["ocr_remote"])
+        self.assertNotIn("ocr", self.compose_manager.call_args.kwargs["profiles"])
+
+    def test_up_refuses_a_malformed_remote_ocr_address_before_starting_anything(self) -> None:
+        self.user_env["OCR_REMOTE_BASE_URL"] = "192.168.9.68:30004"
+        with redirect_stdout(io.StringIO()), self.assertRaisesRegex(
+            TechSaraError, "OCR_REMOTE_BASE_URL"
+        ):
+            cli._cmd_up(self.args(), root=self.root)
+        self.start_compose.assert_not_called()
 
     def test_up_dry_run_has_no_persistent_or_lifecycle_mutations(self) -> None:
         args = self.args(dry_run=True, offline=True)
@@ -760,6 +807,7 @@ class UpCommandTests(unittest.TestCase):
                 "orchestrator": "http://127.0.0.1:8080",
                 "frontend": "http://127.0.0.1:3000",
             },
+            ocr_remote=False,
         )
         self.compose.build.assert_not_called()
         self.compose.up_service.assert_not_called()
@@ -1325,6 +1373,110 @@ class ComposeStartupTests(unittest.TestCase):
         self.assertEqual(result["disabled_features"], ["ocr"])
         self.assertFalse(result["router_fallback"])
         self.assertEqual(result["startup_retry_context"], 0)
+        ocr_result = next(
+            item for item in result["capability_results"] if item["name"] == "docker-ocr"
+        )
+        self.assertFalse(ocr_result["ocr"]["supported"])
+
+    def _remote_ocr_fixture(self) -> tuple[SelectedProfile, dict[str, str]]:
+        models, _ = load_model_manifest(REPO_ROOT)
+        profile = selected(nvidia(80))
+        profile = replace(
+            profile,
+            ocr_model=models["unlimited-ocr"],
+            features=dict(profile.features, ocr=True),
+        )
+        generated = {
+            "EMBED_BASE_URL": "http://embed/v1",
+            "EMBED_MODEL": "embed",
+            "OCR_BASE_URL": "http://192.168.9.68:30004/v1",
+            "OCR_MODEL": "baidu/Unlimited-OCR",
+            "OPENAI_BASE_URL": "http://main/v1",
+            "MAIN_MODEL": "main",
+        }
+        return profile, generated
+
+    def test_a_remote_ocr_engine_is_probed_where_it_lives_and_never_started_here(self) -> None:
+        profile, generated = self._remote_ocr_fixture()
+        compose = Mock()
+        compose.profiles = ("embeddings",)
+        health_result = {"status": "healthy", "checks": {"app_db": {"status": "ok"}}}
+        with patch.object(cli, "_probe_orchestrator", return_value=health_result):
+            result = cli._start_compose(
+                compose,
+                profile,
+                generated,
+                salesforce_ready=False,
+                search_enabled=False,
+                dry_run=False,
+                ocr_remote=True,
+            )
+        self.assertNotIn(call.up_service("vllm-ocr"), compose.method_calls)
+        self.assertNotIn(
+            call.wait_service("vllm-ocr", timeout=1800.0, reporter=cli._step), compose.method_calls
+        )
+        compose.stop_service.assert_not_called()
+        self.assertIn(
+            call.probe_internal_model("http://192.168.9.68:30004/v1", "baidu/Unlimited-OCR", kind="ocr"),
+            compose.method_calls,
+        )
+        # The head's engine order is otherwise untouched: OCR is probed after
+        # embeddings and before the main model, exactly where vllm-ocr was.
+        probes = [item for item in compose.method_calls if item[0] == "probe_internal_model"]
+        self.assertEqual(
+            probes,
+            [
+                call.probe_internal_model("http://embed/v1", "embed", kind="embedding"),
+                call.probe_internal_model("http://192.168.9.68:30004/v1", "baidu/Unlimited-OCR", kind="ocr"),
+                call.probe_internal_model("http://main/v1", "main"),
+            ],
+        )
+        self.assertEqual(generated["OCR_BASE_URL"], "http://192.168.9.68:30004/v1")
+        self.assertEqual(result["disabled_features"], [])
+        ocr_result = next(
+            item for item in result["capability_results"] if item["name"] == "docker-ocr"
+        )
+        self.assertEqual(ocr_result["endpoint"], "http://192.168.9.68:30004/v1")
+        self.assertTrue(ocr_result["ocr"]["supported"])
+
+    def test_an_unreachable_remote_ocr_engine_disables_ocr_without_touching_the_head(self) -> None:
+        profile, generated = self._remote_ocr_fixture()
+        compose = Mock()
+        compose.profiles = ("embeddings",)
+        compose.generated_env = Path("/fixture/generated.env")
+        compose.probe_internal_model.side_effect = [
+            None,
+            TechSaraError("worker engine not answering"),
+            None,
+        ]
+        health_result = {"status": "degraded", "checks": {"app_db": {"status": "ok"}}}
+        with (
+            patch.object(cli, "_probe_orchestrator", return_value=health_result),
+            patch.object(cli, "atomic_write_text") as publish,
+        ):
+            result = cli._start_compose(
+                compose,
+                profile,
+                generated,
+                salesforce_ready=False,
+                search_enabled=False,
+                dry_run=False,
+                ocr_remote=True,
+            )
+        # There is no head service to stop, and the script's engine is not
+        # the launcher's to stop either.
+        compose.stop_service.assert_not_called()
+        self.assertNotIn(call.up_service("vllm-ocr"), compose.method_calls)
+        self.assertEqual(generated["OCR_ENABLED"], "false")
+        self.assertEqual(generated["OCR_MODEL"], "disabled")
+        publish.assert_called_once_with(
+            compose.generated_env,
+            cli.render_env(generated),
+            mode=0o644,
+        )
+        self.assertEqual(result["disabled_features"], ["ocr"])
+        self.assertIn(call.up_service("vllm"), compose.method_calls)
+        self.assertIn(call.up_service("orchestrator"), compose.method_calls)
         ocr_result = next(
             item for item in result["capability_results"] if item["name"] == "docker-ocr"
         )

@@ -201,6 +201,34 @@ gated 403-before-404 like voice. Unlike voice, the deployment switch
 so a deployment without ffmpeg or a speech engine shows no video picker at
 all instead of a picker that fails.
 
+## 11. The OCR engine runs on the worker Spark
+
+Measured 2026-09-09 before the change: the head held 108 of 121 GB with
+13 GB available; the worker held 52 GB with 68 GB available and its GPU
+idle outside transcription. On a unified-memory Spark the sidecars' KV
+caches are sized as fractions of the whole 121 GB, so the OCR engine —
+a 6.4 GB model — held 17.4 GB, the router 17.6 GB, the main model's rank
+27 GB. And every sidecar sat on the head, which is also tensor-parallel
+rank 0: all of a video's OCR and caption work landed on the rank the chat
+model is already waiting on.
+
+So `scripts/ocr.sh up` runs the same OCR engine, same image digest, on
+the worker — its own compose project there, an explicit 3 GiB KV budget
+(52k tokens, 6 pages of 8k at once), bound to the management address —
+and records `OCR_REMOTE_BASE_URL` in `.env`. The orchestrator's compose
+entry prefers that key over the generated head address, and the launcher
+drops the head's `ocr` profile and retires its container while the key
+is set, so a later `techsara up` does not start the engine again on the
+node being emptied. `scripts/ocr.sh down` reverses all of it.
+
+After: head 86 GB used, 34 GB available; worker 72 GB used, 49 GB
+available; the worker's engine holds 11.6 GB where the head's held 17.4.
+A silent 90-second screen recording, fresh bytes, took 28 s end to end
+with its three OCR calls answered from the worker in ~5 s each. The
+router stays on the head on purpose: every chat message's classification
+goes through it, and a worker outage must not take chat routing with it.
+Whisper stays on both nodes (the transcript uses both).
+
 ## Smaller calls
 
 * ffmpeg via apt in all three orchestrator images rather than PyAV: same

@@ -21,6 +21,7 @@ source.
 | Deep Research: the loop, budgets, citation validation | [`01-codebase/deep-research.md`](01-codebase/deep-research.md) |
 | Hardware matrix, model policy, state, fallback and upgrades | [`PORTABLE-RUNTIME.md`](PORTABLE-RUNTIME.md) |
 | Two-node DGX Spark cluster (`CLUSTER_MODE=dual`): topology, generated config, scripts, benchmarks, limitations | [`CLUSTER.md`](CLUSTER.md) |
+| Move the OCR engine to the worker (`scripts/ocr.sh`), the hand-over, and how to go back | [`ocr-on-the-worker.md`](ocr-on-the-worker.md) |
 | Current files and entrypoints | [`00-INVENTORY.md`](00-INVENTORY.md) |
 | Launcher plus application request flows | [`01-codebase/CRITICAL-PATHS.md`](01-codebase/CRITICAL-PATHS.md) |
 | Base Compose and runtime overlays | [`01-codebase/infra-docker-compose.md`](01-codebase/infra-docker-compose.md) |
