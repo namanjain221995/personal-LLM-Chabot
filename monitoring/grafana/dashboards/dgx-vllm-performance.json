@@ -2443,7 +2443,7 @@
     {
       "type": "timeseries",
       "title": "Auxiliary model throughput",
-      "description": "Router, embeddings, reranker and OCR - all on Spark 1.",
+      "description": "Router, embeddings and reranker on Spark 1; OCR on whichever node scripts/ocr.sh put it (its node label says).",
       "datasource": {
         "type": "prometheus",
         "uid": "dgx-prometheus"

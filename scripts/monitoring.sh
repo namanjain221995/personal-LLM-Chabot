@@ -128,6 +128,7 @@ case "$cmd" in
   up)
     ensure_grafana_password
     log_info "starting Grafana + Prometheus on this node"
+    write_ocr_scrape_target
     # Named services only: a bare `up -d` would reconcile every service in the
     # project, restarting the LLM stack for a monitoring change.
     head_monitoring_compose up -d --no-deps \

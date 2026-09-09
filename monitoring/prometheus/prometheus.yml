@@ -94,7 +94,7 @@ scrape_configs:
         regex: ".*_created$"
         action: drop
 
-  # --- The four single-node model services -------------------------------
+  # --- The single-node model services -------------------------------------
   # Scraped over the internal `application` network by SERVICE NAME, not via
   # the host's published ports. Those ports are debug-only and now bind to
   # loopback (they are unauthenticated model APIs and were reachable from the
@@ -107,10 +107,20 @@ scrape_configs:
         labels: { service: router, node: spark-1, role: head }
       - targets: ["vllm-embed:30003"]
         labels: { service: embed, node: spark-1, role: head }
-      - targets: ["vllm-ocr:30004"]
-        labels: { service: ocr, node: spark-1, role: head }
       - targets: ["vllm-reranker:30005"]
         labels: { service: reranker, node: spark-1, role: head }
+    # OCR IS NOT LISTED ABOVE ON PURPOSE. The engine moves between nodes
+    # (scripts/ocr.sh runs it on the worker to take 17 GB off the head, and
+    # `down` brings it back), so its address comes from a file that
+    # scripts/ocr.sh and scripts/monitoring.sh render from the same .env
+    # key the orchestrator follows — .runtime/prometheus/ocr.json, mounted
+    # at /etc/prometheus/targets. Same job and `service` label, so every
+    # panel keyed on them keeps working; the `node`/`role` labels say where
+    # it is today. A static target here showed OCR DOWN for an hour on
+    # 2026-09-09 while the engine answered from the other node.
+    file_sd_configs:
+      - files: ["/etc/prometheus/targets/ocr.json"]
+        refresh_interval: 30s
     metric_relabel_configs:
       - source_labels: [__name__]
         regex: ".*_created$"

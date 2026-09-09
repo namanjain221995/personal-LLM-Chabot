@@ -109,6 +109,36 @@ api_host() {
 }
 api_url() { printf 'http://%s:%s' "$(api_host)" "${VLLM_PORT:-8000}"; }
 
+# ------------------------------------------------------ scrape targets ----
+# write_ocr_scrape_target: tell Prometheus where the OCR engine is.
+#
+# The engine moves (scripts/ocr.sh puts it on the worker; `down` brings it
+# back to the head), and a scrape target written into prometheus.yml would
+# be wrong the moment it did — which is exactly how the Service-health tile
+# showed OCR DOWN for an hour on 2026-09-09 while the engine was answering
+# on the other node. So the target lives in a file Prometheus watches
+# (file_sd, 30 s refresh), rendered here from the same .env key the
+# orchestrator follows. Written under .runtime/ because it is generated:
+# a tracked file that changes at runtime would dirty the tree and stop the
+# next deploy. Both scripts/ocr.sh and scripts/monitoring.sh call this, so
+# the file exists before Prometheus starts and moves when the engine does.
+write_ocr_scrape_target() {
+  local remote host_port node role out_dir="$ROOT/.runtime/prometheus"
+  remote="$(env_get "$ROOT/.env" OCR_REMOTE_BASE_URL 2>/dev/null || true)"
+  if [ -n "$remote" ]; then
+    # http://192.168.9.68:30004/v1 -> 192.168.9.68:30004
+    host_port="${remote#*://}"; host_port="${host_port%%/*}"
+    node="spark-2"; role="worker"
+  else
+    host_port="vllm-ocr:30004"; node="spark-1"; role="head"
+  fi
+  mkdir -p "$out_dir"
+  printf '[{"targets": ["%s"], "labels": {"service": "ocr", "node": "%s", "role": "%s"}}]\n' \
+    "$host_port" "$node" "$role" > "$out_dir/ocr.json.tmp"
+  mv -f "$out_dir/ocr.json.tmp" "$out_dir/ocr.json"
+  check_pass "Prometheus OCR target: $host_port ($role)"
+}
+
 # ------------------------------------------------------------------ ssh ----
 # ssh_worker CMD... : run a command on the worker host (BatchMode: keys only).
 ssh_worker() {

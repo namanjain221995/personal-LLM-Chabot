@@ -47,6 +47,9 @@ services:
     volumes:
       - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./monitoring/prometheus/rules:/etc/prometheus/rules:ro
+      # Generated scrape targets (the OCR engine's current node); rendered by
+      # scripts/monitoring.sh up and scripts/ocr.sh, never committed.
+      - ./.runtime/prometheus:/etc/prometheus/targets:ro
       - prometheus-data:/prometheus
     ports:
       - "${MONITORING_BIND_ADDRESS:-127.0.0.1}:${PROMETHEUS_PORT:-9090}:9090"

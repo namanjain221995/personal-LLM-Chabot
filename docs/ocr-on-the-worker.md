@@ -138,3 +138,14 @@ ever needs to.
 is a different Compose project and is never started, stopped or recreated by
 any of this. Neither is `sf-local-ai-whisper`. `scripts/ocr.sh down` removes
 one container and one project, and leaves the weights on disk.
+
+## Monitoring follows the engine
+
+Prometheus does not scrape OCR from a fixed address. `scripts/ocr.sh up`
+and `down`, and `scripts/monitoring.sh up`, render
+`.runtime/prometheus/ocr.json` (a file_sd target, gitignored) from the same
+`OCR_REMOTE_BASE_URL` the orchestrator follows, and Prometheus re-reads it
+within 30 seconds. The Service-health tile keeps its `service="ocr"` label;
+the `node`/`role` labels say which Spark answers today. After a move the
+retired address lingers as a stale series for up to five minutes, so the
+tile can show both briefly.

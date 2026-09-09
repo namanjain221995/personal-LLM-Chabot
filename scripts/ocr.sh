@@ -253,6 +253,7 @@ record_endpoint() { # record_endpoint <url>
   touch "$ROOT/.env"
   _set_env OCR_REMOTE_BASE_URL "$1"
   check_pass "recorded OCR_REMOTE_BASE_URL=$1 in .env"
+  write_ocr_scrape_target
   log_info "the orchestrator is still using the engine it was started with."
   log_info "switch it over and retire the head's vllm-ocr:  ./techsara up"
   log_info "(a routine up: the main model is not restarted; or recreate just the orchestrator with the launcher's compose chain)"
@@ -268,6 +269,7 @@ forget_endpoint() {
   _set_env OCR_REMOTE_BASE_URL ""
   check_pass "cleared OCR_REMOTE_BASE_URL in .env -- OCR goes back to the head's vllm-ocr"
   log_info "start the head's engine and repoint the orchestrator:  ./techsara up"
+  write_ocr_scrape_target
 }
 
 _set_env() { # _set_env KEY VALUE — idempotent, in .env

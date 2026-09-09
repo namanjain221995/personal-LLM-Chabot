@@ -3831,7 +3831,7 @@
     {
       "type": "stat",
       "title": "Model services",
-      "description": "Router, embeddings, reranker and OCR.",
+      "description": "Router, embeddings, reranker and OCR (OCR runs on the worker when scripts/ocr.sh put it there).",
       "datasource": {
         "type": "prometheus",
         "uid": "dgx-prometheus"
