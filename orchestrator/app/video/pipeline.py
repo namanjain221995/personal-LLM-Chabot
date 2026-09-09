@@ -1,0 +1,749 @@
+"""The job: run the stages against one `video_analyses` row, resumably.
+
+DETACHED FROM THE CHAT TURN, ON PURPOSE. A new message in the same
+conversation cancels the running generation (main.py), and so does the Stop
+button. A two-hour recording takes longer to transcribe than anyone waits
+before asking a second question. So the analysis is a task of its own,
+started at upload time, holding a strong reference so the loop cannot
+collect it, checkpointing every stage to disk and PostgreSQL. A chat turn
+SUBSCRIBES to it — receives its progress, waits for it to finish, answers —
+and if that turn is cancelled the job does not notice.
+
+RESUMABLE. Every stage writes one output file and stamps itself `done` on
+the row only after the file is durable. On a re-run — a crash, a restart,
+the same video uploaded again next week — a stage whose file exists and
+whose stamp says done is skipped outright, so a failure in fusion never
+re-runs the twenty minutes of transcription that preceded it. `attempt`
+counts the runs; a stage that fails is re-tried from scratch on the next
+attempt because its file was never written.
+
+ONE JOB AT A TIME (VIDEO_MAX_CONCURRENT_JOBS=1). Measured 2026-09-08: a
+saturated speech engine on EITHER node takes the chat model from 71 tok/s to
+24, because the chat model is tensor-parallel across both. Two videos at
+once would double that. The queue is the database — rows at 'queued' —
+and it drains in id order.
+
+PROGRESS is fanned out to every subscriber as small dicts; the chat engine
+turns them into `step` events. Percent updates stay in memory; only stage
+transitions touch the row, so a two-hour job is a few dozen UPDATEs, not
+thousands.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import time
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Optional
+
+from .. import db, metrics
+from ..config import settings
+from . import artifacts as art
+from . import store
+from .types import STAGES, STAGE_TITLES, OcrSpan, Segment, Understanding
+
+log = logging.getLogger(__name__)
+
+
+def _router_enabled() -> bool:
+    """The router sidecar is optional on some profiles; its capability record says."""
+    caps = getattr(settings, "router_capabilities", None)
+    return bool(getattr(caps, "enabled", True)) and bool(settings.router_base_url)
+
+_DONE = "_done"
+
+#: Bump this when a stage's OUTPUT changes meaning — a transcription that
+#: used to drop words, a chunker that splits differently — so an analysis
+#: finished under the old code is re-run from the source the next time its
+#: file is attached, instead of being served from the cache forever. The
+#: row records the version it was produced with; stage files on disk are
+#: overwritten as each stage re-runs. Bumps are deliberate and rare: every
+#: re-attached video pays a full analysis for each one.
+#:   1  first cut (2026-09-09)
+#:   2  windows go to the engine with its 30-s silence gate off (a 12-s
+#:      clip with a quiet lead-in came back empty)
+PIPELINE_VERSION = 2
+
+
+def is_current(row: dict) -> bool:
+    """True when this row's results came from the code that is running."""
+    return int(row.get("pipeline_version") or 1) >= PIPELINE_VERSION
+
+#: Answers "is somebody chatting right now?" — installed by main.py at
+#: startup, because this module must not import main. None = never busy.
+_busy_probe: Optional[Callable[[], bool]] = None
+
+
+def set_busy_probe(fn: Optional[Callable[[], bool]]) -> None:
+    global _busy_probe
+    _busy_probe = fn
+
+
+async def pace() -> float:
+    """Hold GPU-heavy batch work while a person is waiting for an answer.
+
+    THE POLICY, IN ONE PLACE. Measured 2026-09-09 on the live meeting video:
+    chat decode 75 tok/s idle, ~35 during transcription, ~20 during OCR —
+    every GPU-heavy unit of this pipeline is felt by whoever is chatting,
+    because the chat model is tensor-parallel across both Sparks. So before
+    each unit — an ASR window, an OCR batch, a caption — the stage asks
+    whether a chat generation is in flight and, if so, waits a second and
+    asks again, up to `VIDEO_PACE_MAX_WAIT_S`. A quiet workspace runs the job
+    at full speed; a busy one runs it in the gaps. The cap keeps a chatty
+    workspace from starving a job forever: past it the unit runs anyway.
+
+    Returns the seconds waited, for the stage's own bookkeeping.
+    """
+    waited = 0.0
+    limit = float(settings.video_pace_max_wait_s)
+    while _busy_probe is not None and limit > 0 and waited < limit:
+        try:
+            busy = bool(_busy_probe())
+        except Exception:  # noqa: BLE001 — the probe is advisory
+            busy = False
+        if not busy:
+            break
+        await asyncio.sleep(1.0)
+        waited += 1.0
+    if waited:
+        metrics.observe("video_pace_seconds", waited, "seconds a batch unit waited for chat to finish")
+    return waited
+
+#: Stage -> whether the pipeline can carry on without it. A required stage
+#: that fails fails the video; an optional one is recorded as failed and the
+#: video is understood from what remains.
+_OPTIONAL = {"ocr", "vision", "index"}
+
+
+@dataclass
+class _Ctx:
+    """Everything a stage may need, loaded lazily from the stage files."""
+
+    row: dict
+    content_hash: str
+    source: str
+    probe: Optional[dict] = None
+    segments: Optional[List[Segment]] = None
+    language: Optional[str] = None
+    speech_fraction: Optional[float] = None
+    frames: Optional[List[dict]] = None
+    spans: Optional[List[OcrSpan]] = None
+    understanding: Optional[Understanding] = None
+    counts: Dict[str, Any] = field(default_factory=dict)
+
+    # -- loaders (resume reads the file a previous run wrote) --------------
+
+    def load_probe(self) -> dict:
+        if self.probe is None:
+            self.probe = store.read_json(store.stage_path(self.content_hash, "probe.json")) or {}
+        return self.probe
+
+    def load_transcript(self) -> List[Segment]:
+        if self.segments is None:
+            data = store.read_json(store.stage_path(self.content_hash, "transcript.json")) or {}
+            self.segments = [Segment.from_json(s) for s in data.get("segments") or []]
+            self.language = data.get("language") or None
+            report = data.get("report") or {}
+            self.speech_fraction = report.get("speech_fraction")
+        return self.segments
+
+    def load_frames(self) -> List[dict]:
+        if self.frames is None:
+            data = store.read_json(store.stage_path(self.content_hash, "frames.json")) or {}
+            self.frames = list(data.get("frames") or [])
+        return self.frames
+
+    def load_spans(self) -> List[OcrSpan]:
+        if self.spans is None:
+            data = store.read_json(store.stage_path(self.content_hash, "screen.json")) or {}
+            self.spans = [OcrSpan.from_json(s) for s in data.get("spans") or []]
+        return self.spans
+
+    def load_understanding(self) -> Understanding:
+        if self.understanding is None:
+            data = store.read_json(store.stage_path(self.content_hash, "understanding.json")) or {}
+            self.understanding = Understanding.from_json(data)
+        return self.understanding
+
+
+# ------------------------------------------------------------- registry --
+
+_tasks: Dict[int, "asyncio.Task[None]"] = {}
+_listeners: Dict[int, List["asyncio.Queue[dict]"]] = {}
+_latest: Dict[int, dict] = {}
+_sem: Optional[asyncio.Semaphore] = None
+_sem_loop: Optional[asyncio.AbstractEventLoop] = None
+_maintenance: Optional["asyncio.Task[None]"] = None
+
+
+def _semaphore() -> asyncio.Semaphore:
+    global _sem, _sem_loop
+    loop = asyncio.get_running_loop()
+    if _sem is None or _sem_loop is not loop:
+        _sem = asyncio.Semaphore(max(1, settings.video_max_concurrent_jobs))
+        _sem_loop = loop
+    return _sem
+
+
+def reset_for_tests() -> None:
+    global _sem, _sem_loop
+    _tasks.clear()
+    _listeners.clear()
+    _latest.clear()
+    _sem = None
+    _sem_loop = None
+
+
+def subscribe(analysis_id: int) -> "asyncio.Queue[dict]":
+    q: "asyncio.Queue[dict]" = asyncio.Queue(maxsize=256)
+    _listeners.setdefault(int(analysis_id), []).append(q)
+    last = _latest.get(int(analysis_id))
+    if last is not None:
+        q.put_nowait(last)
+    return q
+
+
+def unsubscribe(analysis_id: int, q: "asyncio.Queue[dict]") -> None:
+    lst = _listeners.get(int(analysis_id))
+    if lst and q in lst:
+        lst.remove(q)
+    if lst is not None and not lst:
+        _listeners.pop(int(analysis_id), None)
+
+
+def _publish(analysis_id: int, event: dict) -> None:
+    event = {**event, "ts": time.time()}
+    _latest[int(analysis_id)] = event
+    for q in list(_listeners.get(int(analysis_id), [])):
+        try:
+            q.put_nowait(event)
+        except asyncio.QueueFull:
+            # A subscriber that stopped reading loses a progress tick, not
+            # the job. The terminal event is retried below.
+            if event.get("stage") == _DONE:
+                try:
+                    q.get_nowait()
+                    q.put_nowait(event)
+                except Exception:  # noqa: BLE001
+                    pass
+
+
+def is_running(analysis_id: int) -> bool:
+    task = _tasks.get(int(analysis_id))
+    return task is not None and not task.done()
+
+
+async def ensure_running(analysis_id: int) -> bool:
+    """Start the job for this row unless it is running or already done."""
+    analysis_id = int(analysis_id)
+    if is_running(analysis_id):
+        return True
+    row = await db.run_in_thread(db.get_video_analysis, analysis_id)
+    if row is None:
+        return False
+    if row["status"] == "done":
+        if is_current(row):
+            return False
+        # Finished under older code: back to the queue BEFORE the task
+        # exists, so a reader that looks at the row while another job holds
+        # the slot sees 'queued' rather than a stale 'done'.
+        log.info("video analysis %d was produced by pipeline v%s; re-running under v%d", analysis_id, row.get("pipeline_version"), PIPELINE_VERSION)
+        await db.run_in_thread(db.update_video_analysis, analysis_id, status="queued", error="")
+    task = asyncio.get_running_loop().create_task(_run(analysis_id), name=f"video-analysis-{analysis_id}")
+    _tasks[analysis_id] = task
+    task.add_done_callback(lambda t, aid=analysis_id: _tasks.pop(aid, None) if _tasks.get(aid) is t else None)
+    return True
+
+
+async def wait_for(analysis_id: int) -> Optional[dict]:
+    """Block until the job (if any) finishes; return the fresh row."""
+    task = _tasks.get(int(analysis_id))
+    if task is not None:
+        try:
+            await asyncio.shield(task)
+        except Exception:  # noqa: BLE001 — the row records the failure
+            pass
+    return await db.run_in_thread(db.get_video_analysis, int(analysis_id))
+
+
+# ---------------------------------------------------------------- the run --
+
+
+async def _run(analysis_id: int) -> None:
+    async with _semaphore():
+        row = await db.run_in_thread(db.get_video_analysis, analysis_id)
+        if row is None:
+            return
+        if row["status"] == "done" and is_current(row):
+            _publish(analysis_id, {"stage": _DONE, "status": "done"})
+            return
+        stale = not is_current(row)
+        content_hash = row["content_hash"]
+        source = store.source_path(content_hash)
+        if not source:
+            await _finish(analysis_id, "failed", "the uploaded file is no longer on disk; please attach it again")
+            return
+        started = time.perf_counter()
+        await db.run_in_thread(
+            db.update_video_analysis,
+            analysis_id,
+            status="running",
+            error="",
+            attempt=int(row.get("attempt") or 0) + 1,
+            started_at=db.now(),
+            pipeline_version=PIPELINE_VERSION,
+            **({"stages": {}, "counts": {}} if stale else {}),
+        )
+        # A stale row keeps its source and nothing else: every stage re-runs
+        # and overwrites its file, because the old outputs are exactly what
+        # the version bump said not to trust.
+        ctx = _Ctx(row=row, content_hash=content_hash, source=source, counts={} if stale else dict(row.get("counts") or {}))
+        stages: Dict[str, dict] = {} if stale else dict(row.get("stages") or {})
+        for stage in STAGES:
+            state = stages.get(stage) or {}
+            output = _OUTPUTS.get(stage)
+            cached = state.get("status") in ("done", "skipped") and (
+                output is None or os.path.exists(store.stage_path(content_hash, output))
+            )
+            if cached:
+                _publish(analysis_id, {"stage": stage, "status": state.get("status"), "percent": 100, "detail": "from an earlier run" if state.get("status") == "done" else str(state.get("detail") or ""), "elapsed_s": 0, "cached": True})
+                continue
+            stage_started = time.perf_counter()
+            _publish(analysis_id, {"stage": stage, "status": "running", "percent": 0, "detail": "", "elapsed_s": 0})
+            await db.run_in_thread(db.update_video_analysis, analysis_id, stage=stage)
+
+            async def progress(percent: Optional[float], detail: str, _stage=stage, _t0=stage_started) -> None:
+                _publish(analysis_id, {
+                    "stage": _stage,
+                    "status": "running",
+                    "percent": None if percent is None else round(min(100.0, max(0.0, percent)), 1),
+                    "detail": detail,
+                    "elapsed_s": round(time.perf_counter() - _t0, 1),
+                })
+
+            try:
+                outcome = await asyncio.wait_for(
+                    _STAGE_FNS[stage](ctx, progress),
+                    timeout=settings.video_stage_timeout_s,
+                )
+            except asyncio.CancelledError:
+                # A shutdown. The row stays 'running' and the startup
+                # reconciliation requeues it; the stage file was never
+                # written, so this stage re-runs and nothing before it does.
+                raise
+            except asyncio.TimeoutError:
+                outcome = _StageResult(status="failed", detail=f"did not finish within {settings.video_stage_timeout_s:.0f}s")
+            except Exception as exc:  # noqa: BLE001 — recorded on the row, never a crash
+                log.exception("video %s: stage %s failed", content_hash[:12], stage)
+                outcome = _StageResult(status="failed", detail=f"{type(exc).__name__}: {str(exc)[:400]}")
+            ms = int((time.perf_counter() - stage_started) * 1000)
+            stages[stage] = {"status": outcome.status, "ms": ms, "detail": outcome.detail}
+            metrics.observe("video_stage_seconds", ms / 1000.0, "wall-clock per pipeline stage", stage=stage)
+            metrics.inc("video_stage_total", "pipeline stages finished", stage=stage, result="ok" if outcome.status != "failed" else "fail")
+            fields = {"stages": stages, "counts": ctx.counts, **outcome.row_fields}
+            await db.run_in_thread(db.update_video_analysis, analysis_id, **fields)
+            _publish(analysis_id, {"stage": stage, "status": outcome.status, "percent": 100, "detail": outcome.detail, "elapsed_s": round(ms / 1000.0, 1)})
+            if outcome.status == "failed" and stage not in _OPTIONAL:
+                await _finish(analysis_id, "failed", f"{STAGE_TITLES.get(stage, stage)}: {outcome.detail}", total_s=time.perf_counter() - started)
+                return
+        await _finish(analysis_id, "done", "", total_s=time.perf_counter() - started)
+
+
+async def _finish(analysis_id: int, status: str, error: str, *, total_s: float = 0.0) -> None:
+    await db.run_in_thread(
+        db.update_video_analysis,
+        analysis_id,
+        status=status,
+        error=error,
+        finished_at=db.now(),
+        stage="done" if status == "done" else None,
+    )
+    metrics.inc("video_jobs_total", "video analyses finished", result="ok" if status == "done" else "fail")
+    _publish(analysis_id, {"stage": _DONE, "status": status, "detail": error, "elapsed_s": round(total_s, 1)})
+
+
+@dataclass
+class _StageResult:
+    status: str  # done | skipped | failed
+    detail: str = ""
+    row_fields: Dict[str, Any] = field(default_factory=dict)
+
+
+#: Which file proves a stage's output exists. Stages with no file (index)
+#: are trusted from the row alone.
+_OUTPUTS = {
+    "probe": "probe.json",
+    "audio": "audio.wav",
+    "transcript": "transcript.json",
+    "frames": "frames.json",
+    "ocr": "ocr.json",
+    "vision": "screen.json",
+    "fusion": "understanding.json",
+    "index": None,
+    "artifacts": "artifacts.json",
+}
+
+
+# ------------------------------------------------------------- stages --
+
+
+async def _stage_probe(ctx: _Ctx, progress) -> _StageResult:
+    from . import media
+
+    probe = await media.probe(ctx.source, timeout_s=60.0)
+    if probe.duration_s > settings.video_max_duration_s:
+        return _StageResult(
+            "failed",
+            f"the video is {art.fmt_ts(probe.duration_s)} long; the limit is {art.fmt_ts(settings.video_max_duration_s)}",
+        )
+    summary = probe.summary()
+    store.write_json(store.stage_path(ctx.content_hash, "probe.json"), {**summary, "raw": probe.raw})
+    ctx.probe = {**summary, "raw": probe.raw}
+    detail = f"{art.fmt_ts(probe.duration_s)}"
+    if probe.has_video:
+        detail += f" · {probe.width}x{probe.height} {probe.video_codec}"
+    detail += f" · {'with' if probe.has_audio else 'NO'} audio"
+    return _StageResult(
+        "done",
+        detail,
+        {
+            "duration_ms": int(probe.duration_s * 1000),
+            "width": probe.width,
+            "height": probe.height,
+            "has_audio": probe.has_audio,
+            "has_video": probe.has_video,
+            "media_type": ctx.row.get("media_type") or "",
+            "probe": summary,
+        },
+    )
+
+
+async def _stage_audio(ctx: _Ctx, progress) -> _StageResult:
+    from . import media
+
+    probe = ctx.load_probe()
+    if not probe.get("has_audio"):
+        return _StageResult("skipped", "the file has no audio track")
+    wav = store.stage_path(ctx.content_hash, "audio.wav")
+    duration = float(probe.get("duration_s") or 0.0)
+    timeout = max(120.0, duration * 0.5 + 60.0)
+    samples = await media.extract_audio(ctx.source, wav, timeout_s=timeout)
+    ctx.counts["audio_samples"] = int(samples)
+    return _StageResult("done", f"{art.fmt_ts(samples / 16000)} of audio")
+
+
+async def _stage_transcript(ctx: _Ctx, progress) -> _StageResult:
+    from .transcribe import transcribe_audio
+
+    probe = ctx.load_probe()
+    wav = store.stage_path(ctx.content_hash, "audio.wav")
+    if not probe.get("has_audio") or not os.path.exists(wav):
+        store.write_json(store.stage_path(ctx.content_hash, "transcript.json"), {"language": None, "segments": [], "report": {"reason": "no audio"}})
+        ctx.segments, ctx.language, ctx.speech_fraction = [], None, 0.0
+        return _StageResult("skipped", "no audio to transcribe")
+    if not settings.asr_enabled:
+        store.write_json(store.stage_path(ctx.content_hash, "transcript.json"), {"language": None, "segments": [], "report": {"reason": "asr disabled"}})
+        ctx.segments, ctx.language, ctx.speech_fraction = [], None, None
+        return _StageResult("skipped", "speech-to-text is not enabled on this deployment")
+    duration = float(probe.get("duration_s") or 0.0)
+    segments, language, report = await transcribe_audio(
+        wav,
+        total_s=duration,
+        progress=progress,
+        max_window_s=min(settings.video_asr_window_s, settings.asr_max_audio_seconds - 5),
+        max_gap_s=settings.video_asr_max_gap_s,
+        overlap_s=settings.video_asr_overlap_s,
+    )
+    store.write_json(
+        store.stage_path(ctx.content_hash, "transcript.json"),
+        {"language": language, "segments": [s.to_json() for s in segments], "report": report},
+    )
+    ctx.segments, ctx.language = segments, language
+    ctx.speech_fraction = report.get("speech_fraction")
+    ctx.counts.update({
+        "segments": len(segments),
+        "transcript_chars": report.get("chars", 0),
+        "speech_s": report.get("speech_s"),
+        "asr_engine_ms": report.get("engine_ms"),
+    })
+    if not segments:
+        return _StageResult("done", f"no speech detected ({report.get('detector')}, {100 * float(report.get('speech_fraction') or 0):.0f}% speech)", {"language": None})
+    return _StageResult("done", f"{len(segments)} segments · {report.get('windows_done')} clip(s) · {language or 'language unknown'}", {"language": language})
+
+
+async def _stage_frames(ctx: _Ctx, progress) -> _StageResult:
+    from . import frames as fr
+    from . import media
+
+    probe = ctx.load_probe()
+    if not probe.get("has_video"):
+        store.write_json(store.stage_path(ctx.content_hash, "frames.json"), {"frames": [], "report": {"reason": "no video stream"}})
+        ctx.frames = []
+        return _StageResult("skipped", "the file has no video stream")
+    duration = float(probe.get("duration_s") or 0.0)
+    cap = fr.frame_cap(duration, per_seconds=settings.video_frame_per_seconds, minimum=settings.video_frame_min, maximum=settings.video_frame_max)
+    # The periodic floor is set so that the floor ALONE cannot exceed the cap
+    # by more than 3x — the detector adds the rest and dedupe takes it away.
+    floor = max(settings.video_frame_floor_min_s, min(settings.video_frame_floor_max_s, duration / max(1, cap * 3)))
+    out_dir = store.frames_dir(ctx.content_hash)
+    keyframes_only = duration >= settings.video_keyframes_only_after_s
+    await progress(5.0, f"scene detection{' (keyframes only)' if keyframes_only else ''} · floor {floor:.0f}s")
+    extracted = await media.extract_frames(
+        ctx.source,
+        out_dir,
+        scene_threshold=settings.video_frame_scene_threshold,
+        floor_s=floor,
+        max_width=settings.video_frame_max_width,
+        keyframes_only=keyframes_only,
+        timeout_s=max(300.0, duration * 1.5 + 120.0),
+    )
+    await progress(70.0, f"{len(extracted)} candidate frames · hashing")
+    kept, report = await asyncio.to_thread(fr.select, extracted, total_s=duration, cap=cap, distance=settings.video_frame_hash_distance)
+    keep_paths = {k.path for k in kept}
+    for f in extracted:
+        if f.path not in keep_paths:
+            try:
+                os.unlink(f.path)
+            except OSError:
+                pass
+    frames_json = [
+        {"file": os.path.basename(k.path), "t": round(k.t_s, 3), "end": round(k.end_s, 3), "phash": int(k.phash), "collapsed": k.collapsed}
+        for k in kept
+    ]
+    store.write_json(store.stage_path(ctx.content_hash, "frames.json"), {"frames": frames_json, "report": {**report, "floor_s": floor, "keyframes_only": keyframes_only}})
+    ctx.frames = frames_json
+    ctx.counts.update({"frames_extracted": report["extracted"], "frames_distinct": report["distinct"], "frames_kept": report["kept"]})
+    return _StageResult("done", f"{report['extracted']} extracted → {report['distinct']} distinct → {report['kept']} kept")
+
+
+def _kept_frames(ctx: _Ctx):
+    from .frames import KeptFrame
+
+    root = store.frames_dir(ctx.content_hash)
+    out = []
+    for i, f in enumerate(ctx.load_frames()):
+        path = os.path.join(root, f["file"])
+        if os.path.exists(path):
+            out.append(KeptFrame(path=path, t_s=float(f["t"]), end_s=float(f["end"]), index=i, phash=int(f.get("phash") or 0), collapsed=int(f.get("collapsed") or 1)))
+    return out
+
+
+async def _stage_ocr(ctx: _Ctx, progress) -> _StageResult:
+    from .screen import ocr_frames
+
+    kept = _kept_frames(ctx)
+    if not kept:
+        store.write_json(store.stage_path(ctx.content_hash, "ocr.json"), {"texts": []})
+        return _StageResult("skipped", "no frames to read")
+    if not settings.ocr_enabled or not settings.video_ocr_enabled:
+        store.write_json(store.stage_path(ctx.content_hash, "ocr.json"), {"texts": ["" for _ in kept]})
+        return _StageResult("skipped", "OCR is not enabled")
+    cap = max(1, settings.video_ocr_max_frames)
+    if len(kept) > cap:
+        # The longest-held frames are the slides that were actually on
+        # screen; flicker and transitions keep their captions only.
+        chosen = set(
+            k.index for k in sorted(kept, key=lambda k: (-(k.end_s - k.t_s), k.t_s))[:cap]
+        )
+        subset = [k for k in kept if k.index in chosen]
+        read = await ocr_frames(subset, progress=progress)
+        by_index = {k.index: text for k, text in zip(subset, read)}
+        texts = [by_index.get(k.index, "") for k in kept]
+        note = f" ({cap} of {len(kept)} frames read — the longest-held)"
+    else:
+        texts = await ocr_frames(kept, progress=progress)
+        note = ""
+    store.write_json(store.stage_path(ctx.content_hash, "ocr.json"), {"texts": texts})
+    legible = sum(1 for t in texts if t.strip())
+    ctx.counts.update({"ocr_frames": legible, "ocr_chars": sum(len(t) for t in texts)})
+    return _StageResult("done", f"{legible}/{len(kept)} frames had readable text{note}")
+
+
+async def _stage_vision(ctx: _Ctx, progress) -> _StageResult:
+    from .screen import build_spans, caption_frames
+
+    kept = _kept_frames(ctx)
+    ocr_data = store.read_json(store.stage_path(ctx.content_hash, "ocr.json")) or {}
+    texts = list(ocr_data.get("texts") or [])
+    if len(texts) < len(kept):
+        texts += ["" for _ in range(len(kept) - len(texts))]
+    if not kept:
+        store.write_json(store.stage_path(ctx.content_hash, "screen.json"), {"spans": []})
+        ctx.spans = []
+        return _StageResult("skipped", "no frames to describe")
+    captions: List[Optional[str]]
+    status, detail = "done", ""
+    if settings.video_captions_enabled and _router_enabled():
+        captions = await caption_frames(kept, progress=progress)
+        described = sum(1 for c in captions if c)
+        detail = f"{described}/{len(kept)} frames described by {settings.router_model.split('/')[-1]}"
+        if described == 0:
+            status = "failed"
+            detail = "the vision model described none of the frames"
+    else:
+        captions = [None for _ in kept]
+        status, detail = "skipped", "frame captions are not enabled"
+    spans = build_spans(kept, texts, captions)
+    store.write_json(store.stage_path(ctx.content_hash, "screen.json"), {"spans": [s.to_json() for s in spans]})
+    ctx.spans = spans
+    ctx.counts.update({"screen_spans": len(spans), "captions": sum(1 for c in captions if c)})
+    return _StageResult(status, detail)
+
+
+async def _stage_fusion(ctx: _Ctx, progress) -> _StageResult:
+    from .fusion import understand
+
+    probe = ctx.load_probe()
+    segments = ctx.load_transcript()
+    spans = ctx.load_spans()
+    u = await understand(
+        filename=str(ctx.row.get("filename") or "video"),
+        duration_s=float(probe.get("duration_s") or 0.0),
+        language=ctx.language,
+        has_audio=bool(probe.get("has_audio")),
+        speech_fraction=ctx.speech_fraction,
+        segments=segments,
+        spans=spans,
+        progress=progress,
+    )
+    store.write_json(store.stage_path(ctx.content_hash, "understanding.json"), u.to_json())
+    ctx.understanding = u
+    return _StageResult(
+        "done",
+        f"{u.content_type} · {len(u.chapters)} chapters · {len(u.decisions)} decisions · {u.method}",
+        {"summary": u.summary, "understanding": u.to_json()},
+    )
+
+
+async def _stage_index(ctx: _Ctx, progress) -> _StageResult:
+    from . import index
+
+    segments = ctx.load_transcript()
+    spans = ctx.load_spans()
+    chunks = index.build_chunks(segments, spans)
+    await progress(20.0, f"{len(chunks)} chunks to embed")
+    written = await index.index_analysis(int(ctx.row["id"]), chunks)
+    ctx.counts["chunks"] = written
+    return _StageResult("done", f"{written} evidence chunks indexed", {"indexed_at": db.now(), "chunk_version": index.CHUNKER_VERSION})
+
+
+async def _stage_artifacts(ctx: _Ctx, progress) -> _StageResult:
+    probe = ctx.load_probe()
+    segments = ctx.load_transcript()
+    spans = ctx.load_spans()
+    u = ctx.load_understanding()
+    duration = float(probe.get("duration_s") or 0.0)
+    title = str(ctx.row.get("filename") or "video")
+    out_dir = store.artifacts_dir(ctx.content_hash)
+    files = [
+        ("transcript_txt", "transcript.txt", "text/plain", art.transcript_txt(segments, title=title)),
+        ("transcript_srt", "transcript.srt", "application/x-subrip", art.transcript_srt(segments)),
+        ("transcript_vtt", "transcript.vtt", "text/vtt", art.transcript_vtt(segments)),
+        ("transcript_json", "transcript.json", "application/json", art.transcript_json(segments, language=ctx.language, duration_s=duration, extra={"source": title})),
+        ("screen_text_txt", "screen_text.txt", "text/plain", art.screen_text_txt(spans)),
+        ("screen_text_json", "screen_text.json", "application/json", art.screen_text_json(spans)),
+        ("summary_md", "summary.md", "text/markdown", art.summary_md(u, title=title, duration_s=duration, language=ctx.language)),
+    ]
+    written: List[dict] = []
+    for kind, name, media_type, body in files:
+        if not body.strip() or (kind.startswith("transcript") and not segments) or (kind.startswith("screen") and not any(s.text.strip() for s in spans)):
+            continue
+        size = await asyncio.to_thread(art.write_text, os.path.join(out_dir, name), body)
+        written.append({"kind": kind, "filename": name, "media_type": media_type, "bytes": size})
+    store.write_json(store.stage_path(ctx.content_hash, "artifacts.json"), {"artifacts": written})
+    return _StageResult("done", f"{len(written)} file(s)", {"artifacts": written})
+
+
+_STAGE_FNS = {
+    "probe": _stage_probe,
+    "audio": _stage_audio,
+    "transcript": _stage_transcript,
+    "frames": _stage_frames,
+    "ocr": _stage_ocr,
+    "vision": _stage_vision,
+    "fusion": _stage_fusion,
+    "index": _stage_index,
+    "artifacts": _stage_artifacts,
+}
+
+
+# ------------------------------------------------------- lifecycle hooks --
+
+
+async def start() -> None:
+    """Lifespan: put interrupted rows back in the queue, drain it, and keep
+    house. Nothing here blocks startup — the drain runs behind the app."""
+    global _maintenance
+    if not settings.video_analysis_enabled:
+        return
+    try:
+        requeued = await db.run_in_thread(db.requeue_interrupted_video_analyses)
+        if requeued:
+            log.info("requeued %d video analysis(es) interrupted by a restart", requeued)
+    except Exception:  # noqa: BLE001
+        log.warning("video: startup reconciliation failed", exc_info=True)
+    _maintenance = asyncio.get_running_loop().create_task(_maintenance_loop(), name="video-maintenance")
+
+
+async def stop() -> None:
+    global _maintenance
+    if _maintenance is not None:
+        _maintenance.cancel()
+        _maintenance = None
+    for task in list(_tasks.values()):
+        task.cancel()
+    _tasks.clear()
+
+
+async def drain_queue(limit: int = 4) -> int:
+    """Start jobs for rows still queued (a restart, or an upload that raced
+    the app's startup). Bounded per pass; the semaphore serialises them."""
+    started = 0
+    try:
+        rows = await db.run_in_thread(db.list_video_analyses, "queued", limit)
+    except Exception:  # noqa: BLE001
+        return 0
+    for row in rows:
+        if await ensure_running(int(row["id"])):
+            started += 1
+    return started
+
+
+async def reap_orphans() -> int:
+    """Delete analyses no conversation refers to any more, after a grace
+    period: the same file re-uploaded inside it is a free hit; after it the
+    bytes are nobody's."""
+    removed = 0
+    try:
+        rows = await db.run_in_thread(db.orphan_video_analyses, settings.video_orphan_ttl_hours)
+    except Exception:  # noqa: BLE001
+        return 0
+    from . import index
+
+    for row in rows:
+        if is_running(int(row["id"])):
+            continue
+        try:
+            await index.delete_analysis(int(row["id"]))
+        except Exception:  # noqa: BLE001
+            log.warning("video: could not drop index rows for %s", row["id"], exc_info=True)
+        await asyncio.to_thread(store.remove_analysis, row["content_hash"])
+        await db.run_in_thread(db.delete_video_analysis, int(row["id"]))
+        removed += 1
+    return removed
+
+
+async def _maintenance_loop() -> None:
+    await asyncio.sleep(5.0)
+    while True:
+        try:
+            await drain_queue()
+            reaped = await reap_orphans()
+            if reaped:
+                log.info("video: reaped %d orphan analysis(es)", reaped)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            log.warning("video maintenance pass failed", exc_info=True)
+        await asyncio.sleep(max(60.0, settings.video_maintenance_interval_s))

@@ -23,6 +23,8 @@ const ENGINE_LABEL: Record<Engine, string> = {
   // back; it was simply absent from the Engine union, so this map had no entry
   // and the badge fell through to the neutral Chat style.
   clarify: 'Question',
+  // 2026-09-09: a video, understood and cited by timestamp.
+  video: 'Video',
 };
 
 const ENGINE_STYLE: Record<Engine, { color: string; ink: string }> = {
@@ -67,6 +69,10 @@ const ENGINE_STYLE: Record<Engine, { color: string; ink: string }> = {
   clarify: {
     color: 'var(--ts-engine-chat)',
     ink: 'var(--ts-engine-chat-ink)',
+  },  // Same family as the image/document route: something the model looked at.
+  video: {
+    color: 'var(--ts-engine-vision)',
+    ink: 'var(--ts-engine-vision-ink)',
   },
 };
 

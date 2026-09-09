@@ -53,14 +53,17 @@ async function jsonOrThrow<T>(res: Response, fallback: string): Promise<T> {
   return body as T;
 }
 
+export type UploadPurpose = 'document' | 'video';
+
 async function uploadSingle(
   file: File,
   conversationId: string,
+  purpose: UploadPurpose,
 ): Promise<DocumentRef> {
   const form = new FormData();
   form.append('file', file);
   form.append('conversation_id', conversationId);
-  form.append('purpose', 'document');
+  form.append('purpose', purpose);
   const res = await fetch('/api/upload', { method: 'POST', body: form });
   const body = await jsonOrThrow<UploadBody>(res, 'upload failed');
   return { upload_id: String(body.upload_id ?? ''), name: body.filename ?? file.name };
@@ -69,11 +72,12 @@ async function uploadSingle(
 async function uploadChunked(
   file: File,
   conversationId: string,
+  purpose: UploadPurpose,
 ): Promise<DocumentRef> {
   const form = new FormData();
   form.append('conversation_id', conversationId);
   form.append('filename', file.name);
-  form.append('purpose', 'document');
+  form.append('purpose', purpose);
   const init = await jsonOrThrow<UploadBody>(
     await fetch('/api/upload/chunked/init', { method: 'POST', body: form }),
     'upload could not start',
@@ -98,12 +102,15 @@ async function uploadChunked(
   return { upload_id: String(body.upload_id ?? ''), name: body.filename ?? file.name };
 }
 
-/** Stream one document to the server; → the reference the chat request sends. */
+/** Stream one document to the server; → the reference the chat request sends.
+    2026-09-09: a video takes the same road with purpose=video — the server
+    keeps the bytes and starts its analysis behind the response. */
 export async function uploadDocumentFile(
   file: File,
   conversationId: string,
+  purpose: UploadPurpose = 'document',
 ): Promise<DocumentRef> {
   return file.size > CHUNK_THRESHOLD_BYTES
-    ? uploadChunked(file, conversationId)
-    : uploadSingle(file, conversationId);
+    ? uploadChunked(file, conversationId, purpose)
+    : uploadSingle(file, conversationId, purpose);
 }

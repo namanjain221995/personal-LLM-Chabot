@@ -194,7 +194,19 @@ sync_files() { # sync_files <node>
 # is what makes the fleet survive a restart of the stack. It is also the ONLY
 # automated link between "the engine started" and "the orchestrator knows
 # where it is", which is why it is carried over verbatim from scripts/asr.sh.
-record_endpoints() { # record_endpoints <url> [<url>...]
+record_endpoints() { # record_endpoints <url> [<url>...] — the ones just started
+  # MERGE, never replace. `up` on one node (WHISPER_NODES=head, say, to
+  # rebuild the head's engine) must not drop the other node's engine from the
+  # list — that is how a rebuild of one engine silently halved the fleet on
+  # 2026-09-08. Everything already recorded stays, in its order; the engines
+  # just started are appended if they are new.
+  local merged=() url seen
+  for url in $(grep -E '^ASR_BASE_URLS=' "$ROOT/.env" 2>/dev/null | cut -d= -f2- | tr ',' ' ') "$@"; do
+    seen=no
+    for have in "${merged[@]-}"; do [ "$have" = "$url" ] && seen=yes; done
+    [ "$seen" = no ] && merged+=("$url")
+  done
+  set -- "${merged[@]}"
   local urls; urls="$(printf '%s,' "$@")"; urls="${urls%,}"
   touch "$ROOT/.env"
   _set_env ASR_ENABLED true

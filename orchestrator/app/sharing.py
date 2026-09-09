@@ -125,6 +125,8 @@ PRIVATE_ROUTES: Dict[str, str] = {
     "sql": "Salesforce records",
     "dataset": "an uploaded dataset",
     "rag": "documents from this workspace",
+    # V28: an answer grounded on a video someone uploaded IS that video.
+    "video": "an uploaded video",
 }
 
 #: Meta keys whose PRESENCE means the answer drew on something private, even
@@ -148,6 +150,7 @@ PRIVATE_META_KEYS: Dict[str, str] = {
     "report_files": "generated files held in this workspace",
     "code_sources": "a private repository",
     "attachments": "uploaded files",
+    "video": "an uploaded video",
 }
 
 #: Secrets someone may have pasted into their own message. Provenance cannot

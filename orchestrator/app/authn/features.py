@@ -41,6 +41,7 @@ class Feature(str, Enum):
     SALESFORCE_LIVE = "salesforce_live"
     ATTACHMENTS = "attachments"
     VOICE_INPUT = "voice_input"
+    VIDEO_ANALYSIS = "video_analysis"
 
 
 @dataclass(frozen=True)
@@ -74,6 +75,16 @@ FEATURES: tuple[FeatureSpec, ...] = (
             "platform's own hardware and never stored."
         ),
         default=True,
+    ),
+    FeatureSpec(
+        id=Feature.VIDEO_ANALYSIS,
+        label="Video understanding",
+        hint=(
+            "Attach a video and ask about it: transcribed, read off the screen "
+            "and summarised on this platform's own hardware. Needs file uploads."
+        ),
+        default=True,
+        requires=Feature.ATTACHMENTS,
     ),
     FeatureSpec(
         id=Feature.WEB_SEARCH,

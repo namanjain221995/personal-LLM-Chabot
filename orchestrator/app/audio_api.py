@@ -90,6 +90,7 @@ def rate_ok(user_id: int) -> bool:
 def reset_for_tests() -> None:
     _recent.clear()
     asr.POOL.reset_for_tests()
+    asr.BATCH_POOL.reset_for_tests()
 
 
 async def require_voice(request: Request) -> None:

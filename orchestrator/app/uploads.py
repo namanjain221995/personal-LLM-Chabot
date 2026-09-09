@@ -94,17 +94,26 @@ async def require_attachments(request: Request) -> None:
 
 @router.post("")
 async def create_upload(
+    request: Request,
     file: UploadFile = File(...),
     conversation_id: str = Form(...),
-    # "dataset" (extract + profile, the original is dropped) or "document"
+    # "dataset" (extract + profile, the original is dropped), "document"
     # (keep the original byte-for-byte; PDFs/DOCX are not datasets and must
-    # not be profiled as one -- and the chat engine needs the actual bytes).
+    # not be profiled as one -- and the chat engine needs the actual bytes)
+    # or "video" (2026-09-09: keep the original, hash it, start the analysis
+    # job behind the response — see app/video/api.attach_upload).
     purpose: str = Form("dataset"),
     user: UserRow = Depends(require_user),
     _attachments: None = Depends(require_attachments),
 ) -> dict:
     if not settings.dataset_uploads_enabled:
         raise HTTPException(status_code=404, detail="dataset uploads are disabled")
+    if purpose == "video":
+        # Its own gate (403 for the member, 404 for the deployment), checked
+        # BEFORE any byte lands so a refused upload leaves nothing behind.
+        from .video.api import require_video
+
+        await require_video(request)
 
     # Same ownership rule as every other per-conversation store — and the
     # same claim-on-first-touch as /chat (see _own).
@@ -125,6 +134,8 @@ async def create_upload(
     size = await _stream_to_disk(file, raw_path)
     if purpose == "document":
         return await _finalise_document(conversation_id, upload_id, filename, size)
+    if purpose == "video":
+        return await _finalise_video(conversation_id, upload_id, filename, raw_path, size, user)
     if purpose != "dataset":
         shutil.rmtree(root, ignore_errors=True)
         raise HTTPException(status_code=400, detail="unknown upload purpose")
@@ -200,6 +211,27 @@ async def _finalise_document(
         "notes": [],
         "profile": [],
     }
+
+
+async def _finalise_video(
+    conversation_id: str, upload_id: str, filename: str, raw_path: str, size: int, user: UserRow
+) -> dict:
+    """A video keeps its bytes AND starts its analysis job; the response
+    returns while the job runs (app/video/api.attach_upload)."""
+    from .video.api import attach_upload
+
+    try:
+        return await attach_upload(
+            conversation_id=conversation_id,
+            upload_id=upload_id,
+            filename=filename,
+            raw_path=raw_path,
+            size=size,
+            user_id=int(user["id"]),
+        )
+    except HTTPException:
+        shutil.rmtree(upload_root(conversation_id, upload_id), ignore_errors=True)
+        raise
 
 
 async def _finalise_dataset(
@@ -429,7 +461,9 @@ def list_uploads(
 _HEX32 = re.compile(r"^[0-9a-f]{32}$")
 #: Comfortably under the 100 MB edge wall, with room for multipart overhead.
 _PART_CAP = 90 * 1024 * 1024
-_MAX_PARTS = 64
+#: 128 x 90 MiB = 11 GiB of headroom on the server side; the client's
+#: 64 MiB parts make a 4 GB video 60 parts (2026-09-09).
+_MAX_PARTS = 128
 _MARKER = "_chunked.json"
 
 
@@ -476,6 +510,7 @@ def _chunk_state(conversation_id: str, upload_id: str) -> tuple[str, dict]:
 
 @router.post("/chunked/init")
 async def chunked_init(
+    request: Request,
     conversation_id: str = Form(...),
     filename: str = Form(...),
     purpose: str = Form("document"),
@@ -484,8 +519,12 @@ async def chunked_init(
 ) -> dict:
     if not settings.dataset_uploads_enabled:
         raise HTTPException(status_code=404, detail="uploads are disabled")
-    if purpose not in ("dataset", "document"):
+    if purpose not in ("dataset", "document", "video"):
         raise HTTPException(status_code=400, detail="unknown upload purpose")
+    if purpose == "video":
+        from .video.api import require_video
+
+        await require_video(request)
     await _own(conversation_id, user)
     upload_id = uuid.uuid4().hex
     root = upload_root(conversation_id, upload_id)
@@ -575,4 +614,6 @@ async def chunked_complete(
     os.unlink(os.path.join(root, _MARKER))
     if state["purpose"] == "document":
         return await _finalise_document(conversation_id, upload_id, filename, size)
+    if state["purpose"] == "video":
+        return await _finalise_video(conversation_id, upload_id, filename, raw_path, size, user)
     return await _finalise_dataset(conversation_id, upload_id, filename, raw_path, size)

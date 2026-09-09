@@ -1030,9 +1030,13 @@ export function ChatApp() {
       // (chunked past the Cloudflare 100 MB edge cap) and the request sends
       // REFERENCES instead.
       const docAttachments = attachments.filter((a) => a.kind === 'pdf');
+      // 2026-09-09: videos ALWAYS travel by reference (purpose=video); the
+      // server starts the analysis the moment the bytes land.
+      const videoAttachments = attachments.filter((a) => a.kind === 'video');
       const needsDocUpload =
         docAttachments.length > 1 ||
-        docAttachments.some((a) => !a.base64 && !!a.file);
+        docAttachments.some((a) => !a.base64 && !!a.file) ||
+        videoAttachments.length > 0;
       // Images and documents COEXIST in a message since 2026-09-02; only a
       // dataset still stands alone (it answers through its own engine).
       const images = attachments.filter((a) => a.kind === 'image');
@@ -1063,7 +1067,8 @@ export function ChatApp() {
         imageDataUrls:
           images.length > 1 ? images.map((i) => i.dataUrl) : undefined,
         // V8: a PDF attachment shows a chip (filename) in the bubble.
-        pdfName: isPdf || isDataset ? first?.name : undefined,
+        pdfName:
+          isPdf || isDataset || first?.kind === 'video' ? first?.name : undefined,
         // 2026-08-21: attachments ride on meta, so the file card can be
         // rendered by any browser from server history — pdfName alone never
         // left this browser's cache. (`meta.pasted` rode here the same way
@@ -1071,25 +1076,33 @@ export function ChatApp() {
         // into a chip; turns already stored with it still render and still
         // fold — this is only the write side.)
         meta: metaWithBranch(
-          isPdf || isDataset || quoted
+          isPdf || isDataset || quoted || videoAttachments.length > 0
             ? {
                 route: 'chat',
                 // Round-trips through server history, renders from history in
                 // any browser, and is folded into the model text at request
                 // time (lib/streams.ts) rather than written into `content`.
                 ...(quoted ? { selected_context: quoted } : {}),
-                ...(isPdf || isDataset
+                ...(isPdf || isDataset || videoAttachments.length > 0
                   ? {
                       // EVERY document, in attach order (2026-09-02). One
                       // entry used to stand for the lot, which meant the sent
                       // bubble showed one chip for five files and only the
-                      // first ever received its durable server id.
+                      // first ever received its durable server id. Videos
+                      // follow the documents, in the same order the upload
+                      // loop below walks them, so ids link back correctly.
                       attachments: isDataset
                         ? [{ name: first?.name ?? 'file', kind: 'dataset' as const }]
-                        : docAttachments.map((a) => ({
-                            name: a.name,
-                            kind: 'pdf' as const,
-                          })),
+                        : [
+                            ...docAttachments.map((a) => ({
+                              name: a.name,
+                              kind: 'pdf' as const,
+                            })),
+                            ...videoAttachments.map((a) => ({
+                              name: a.name,
+                              kind: 'video' as const,
+                            })),
+                          ],
                     }
                   : {}),
               }
@@ -1168,6 +1181,7 @@ export function ChatApp() {
         // whatever — and however many — the files weighed.
         void (async () => {
           let docRefs: { upload_id: string; name: string }[] | null = null;
+          let videoRefs: { upload_id: string; name: string }[] | null = null;
           try {
             let uploadedId: string | undefined;
             if (needsDocUpload) {
@@ -1175,8 +1189,9 @@ export function ChatApp() {
               // uploading when it was attached (Composer.withEarlyUpload)
               // is only awaited, not sent twice. Five 60 MB files used to
               // upload one after another on the send's critical path.
+              const uploadable = [...docAttachments, ...videoAttachments];
               const refs = await Promise.all(
-                docAttachments.map(async (doc) => {
+                uploadable.map(async (doc) => {
                   const early = doc.uploadPromise ? await doc.uploadPromise : null;
                   if (early) return early;
                   // Reuse paths may carry only base64; the picker always
@@ -1187,10 +1202,17 @@ export function ChatApp() {
                       [Uint8Array.from(atob(doc.base64), (c) => c.charCodeAt(0))],
                       doc.name,
                     );
-                  return uploadDocumentFile(src, conversationId);
+                  return uploadDocumentFile(
+                    src,
+                    conversationId,
+                    doc.kind === 'video' ? 'video' : 'document',
+                  );
                 }),
               );
-              docRefs = refs;
+              docRefs = refs.slice(0, docAttachments.length);
+              videoRefs = refs.slice(docAttachments.length);
+              if (!docRefs.length) docRefs = null;
+              if (!videoRefs.length) videoRefs = null;
               refs.forEach((r, i) => {
                 const entry = userMessage.meta?.attachments?.[i];
                 if (entry) entry.id = r.upload_id;
@@ -1199,8 +1221,8 @@ export function ChatApp() {
               persist(conversationId, turns);
               toast(
                 refs.length === 1
-                  ? `Uploaded ${docAttachments[0].name}.`
-                  : `Uploaded ${refs.length} documents.`,
+                  ? `Uploaded ${uploadable[0].name}.`
+                  : `Uploaded ${refs.length} ${videoAttachments.length ? 'files' : 'documents'}.`,
               );
             } else {
               const form = new FormData();
@@ -1269,6 +1291,14 @@ export function ChatApp() {
                   pdfUploads: docRefs,
                   pdfName: docAttachments[0]?.name ?? null,
                   images: images.map((i) => i.base64).filter(Boolean),
+                }
+              : {}),
+            ...(videoRefs?.length
+              ? {
+                  videoUploads: videoRefs,
+                  ...(docRefs?.length
+                    ? {}
+                    : { images: images.map((i) => i.base64).filter(Boolean) }),
                 }
               : {}),
           });
@@ -1473,6 +1503,7 @@ export function ChatApp() {
         pdf: resend.pdf,
         pdfName: resend.pdfName,
         pdfUploads: resend.pdfUploads,
+        videoUploads: resend.videoUploads,
         // PHASE 3: a dataset turn resends no bytes, but it must still SAY it
         // is a dataset turn — otherwise a wordless one rebuilds the exact
         // NEW-14 request that has no message in it and 400s.
@@ -1600,6 +1631,7 @@ export function ChatApp() {
         pdf: resend.pdf,
         pdfName: resend.pdfName,
         pdfUploads: resend.pdfUploads,
+        videoUploads: resend.videoUploads,
         // The edit inherits the original turn's attachments, so it inherits
         // its dataset-ness too (see regenerate above).
         dataset: resend.dataset,
@@ -1736,6 +1768,7 @@ export function ChatApp() {
       pdf: resend.pdf,
       pdfName: resend.pdfName,
       pdfUploads: resend.pdfUploads,
+      videoUploads: resend.videoUploads,
       dataset: resend.dataset,
     });
   }, [toast]);

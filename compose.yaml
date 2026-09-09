@@ -197,6 +197,10 @@ services:
       ASR_MAX_UPLOAD_BYTES: ${ASR_MAX_UPLOAD_BYTES:-33554432}
       ASR_MAX_CONCURRENT: ${ASR_MAX_CONCURRENT:-2}
       ASR_RATE_PER_MIN: ${ASR_RATE_PER_MIN:-20}
+      # Video understanding (2026-09-09). Off unless .env says otherwise: the
+      # composer hides the picker when this is false (folded into /auth/me).
+      # Every other VIDEO_* knob reaches the container through env_file.
+      VIDEO_ANALYSIS_ENABLED: ${VIDEO_ANALYSIS_ENABLED:-false}
     volumes:
       - data:/data
       # The Salesforce brain packs, read-only and LIVE: core/brain.py re-reads

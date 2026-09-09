@@ -98,7 +98,7 @@ fi
 # ------------------------------------------------------------- size gate ----
 pg_bytes="$(docker exec "$PG" sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atqc "select pg_database_size(current_database())"')"
 [ -n "$pg_bytes" ] || die "could not size the database (is $PG healthy?)"
-LANCE_DIRS="$(docker exec "$ORCH" sh -c 'for d in lancedb lancedb-web; do [ -d "/data/$d" ] && printf "%s\n" "$d"; done; true')"
+LANCE_DIRS="$(docker exec "$ORCH" sh -c 'for d in lancedb lancedb-web lancedb-video; do [ -d "/data/$d" ] && printf "%s\n" "$d"; done; true')"
 lance_bytes=0
 if [ -n "$LANCE_DIRS" ]; then
   # shellcheck disable=SC2086

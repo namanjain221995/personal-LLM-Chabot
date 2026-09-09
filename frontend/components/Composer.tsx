@@ -53,6 +53,7 @@ import {
   IconSparkles,
   IconStop,
   IconX,
+  IconPlay,
 } from './icons';
 
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
@@ -137,7 +138,7 @@ export interface Attachment {
    * image = sent to the vision path; pdf = rendered server-side;
    * dataset = uploaded separately and referenced by id (never base64).
    */
-  kind: 'image' | 'pdf' | 'dataset';
+  kind: 'image' | 'pdf' | 'dataset' | 'video';
   /** Full data: URL for previews. */
   dataUrl: string;
   /** Raw base64 payload (no data: prefix) — what POST /chat expects. */
@@ -180,6 +181,11 @@ const INLINE_DOC_BYTES = 25 * 1024 * 1024;
 // Datasets are streamed to their own endpoint, not base64'd into the chat
 // body, so they can be far larger than an image or PDF.
 const MAX_DATASET_BYTES = 512 * 1024 * 1024;
+// 2026-09-09: a video streams by reference like a big document (chunked past
+// 90 MB); the server's own cap is VIDEO_MAX_UPLOAD_MB. Four hours of 1080p
+// screen recording is well under this.
+const MAX_VIDEO_BYTES = 4 * 1024 * 1024 * 1024;
+const VIDEO_EXT_RE = /\.(mp4|m4v|mov|webm|mkv|avi|mpg|mpeg|3gp|ogv)$/;
 const DATASET_SUFFIXES = [
   '.zip', '.tar', '.tar.gz', '.tgz', '.csv', '.tsv', '.parquet',
   '.xlsx', '.json', '.jsonl', '.ndjson',
@@ -348,6 +354,10 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
     // orchestrator refuses regardless, this only avoids offering a button
     // that cannot work.
     const voiceAllowed = features?.voice_input !== false;
+    // 2026-09-09: same shape for video. /auth/me folds the deployment switch
+    // in, so this is false both when an admin turned it off for this person
+    // and when the deployment has no video pipeline at all.
+    const videoAllowed = features?.video_analysis !== false;
     const voice = useVoiceRecorder({
       maxMs: VOICE_MAX_MS,
       onTranscript: (transcript) => {
@@ -489,9 +499,13 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
     function withEarlyUpload(att: Attachment): Attachment {
       if (!uploadConversationId || !att.file || att.base64) return att;
       const conversationId = uploadConversationId;
-      const uploadPromise = uploadDocumentFile(att.file, conversationId).catch(
-        () => null,
-      );
+      // A video's early upload is what starts its analysis on the server,
+      // so by the time the person presses Send the transcript is under way.
+      const uploadPromise = uploadDocumentFile(
+        att.file,
+        conversationId,
+        att.kind === 'video' ? 'video' : 'document',
+      ).catch(() => null);
       return { ...att, uploadPromise };
     }
 
@@ -501,7 +515,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
       let refused = false;
       setAttachments((prev) => {
         const kept = prev.filter((a) => a.kind !== 'dataset');
-        if (kept.filter((a) => a.kind === 'pdf').length >= MAX_DOCS) {
+        if (kept.filter((a) => a.kind === 'pdf' || a.kind === 'video').length >= MAX_DOCS) {
           refused = true;
           return prev;
         }
@@ -527,22 +541,53 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
       // text-bearing member, attaches images found inside, and lists the
       // rest — ChatGPT-style. .docx/.xlsx ARE zip containers; the extension
       // has already claimed those for their own paths above.
+      // 2026-09-09: a video is its own kind — transcribed, read off the
+      // screen and summarised on the server — BEFORE the "upload anything"
+      // fallback below can swallow it as an unreadable document.
+      const isVideo =
+        !isImage && !isPdf && (file.type.startsWith('video/') || VIDEO_EXT_RE.test(lower));
+      if (isVideo && !videoAllowed) {
+        toast(
+          'Video understanding is turned off for your account. Ask an administrator.',
+          'error',
+        );
+        return;
+      }
       const isArchive =
-        !isImage && !isPdf && /\.(zip|tar|tar\.gz|tgz)$/.test(lower);
+        !isImage && !isPdf && !isVideo && /\.(zip|tar|tar\.gz|tgz)$/.test(lower);
       const isDataset =
-        !isImage && !isPdf && !isArchive && isDatasetName(file.name);
+        !isImage && !isPdf && !isVideo && !isArchive && isDatasetName(file.name);
       // Anything that is none of the above — code, logs, unknown binaries —
       // is ALSO a document now ("upload anything"): the server reads text
       // honestly and names binaries instead of rejecting them at the door.
-      const isOtherDoc = !isImage && !isPdf && !isArchive && !isDataset;
-      const limit = isImage ? MAX_IMAGE_BYTES : isDataset ? MAX_DATASET_BYTES : MAX_PDF_BYTES;
+      const isOtherDoc = !isImage && !isPdf && !isVideo && !isArchive && !isDataset;
+      const limit = isImage
+        ? MAX_IMAGE_BYTES
+        : isVideo
+          ? MAX_VIDEO_BYTES
+          : isDataset
+            ? MAX_DATASET_BYTES
+            : MAX_PDF_BYTES;
       if (file.size > limit) {
         const mb = (file.size / (1024 * 1024)).toFixed(1);
-        const cap = isImage ? '10 MB' : '512 MB';
+        const cap = isImage ? '10 MB' : isVideo ? '4 GB' : '512 MB';
         toast(
           `${file.name || 'That file'} is ${mb} MB — the limit is ${cap}.`,
           'error',
         );
+        return;
+      }
+      if (isVideo) {
+        // File handle only; streamed (chunked) on attach or on send. Never
+        // read into memory — a two-hour recording is gigabytes.
+        appendDocument({
+          clientId: newClientId(),
+          name: file.name,
+          kind: 'video',
+          dataUrl: '',
+          base64: '',
+          file,
+        });
         return;
       }
       if (isArchive || isOtherDoc) {
@@ -769,7 +814,11 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
                   key={attachment.clientId}
                   className="inline-flex items-center gap-2 rounded-ts border border-border bg-surface p-1.5 pr-2"
                 >
-                  {attachment.kind === 'pdf' || attachment.kind === 'dataset' ? (
+                  {attachment.kind === 'video' ? (
+                    <span className="grid h-10 w-10 shrink-0 place-items-center rounded-md bg-accent/15 text-accent">
+                      <IconPlay size={18} />
+                    </span>
+                  ) : attachment.kind === 'pdf' || attachment.kind === 'dataset' ? (
                     <span className="grid h-10 w-10 shrink-0 place-items-center rounded-md bg-danger/15 text-danger">
                       <IconFileText size={18} />
                     </span>
@@ -787,7 +836,11 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
                     </span>
                     {attachment.kind !== 'image' && (
                       <span className="text-[10px] uppercase tracking-wide text-faint">
-                        {attachment.kind === 'pdf' ? 'PDF' : 'DATASET'}
+                        {attachment.kind === 'pdf'
+                          ? 'PDF'
+                          : attachment.kind === 'video'
+                            ? 'VIDEO'
+                            : 'DATASET'}
                       </span>
                     )}
                   </span>
@@ -934,7 +987,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
                 ref={fileInputRef}
                 type="file"
                 multiple
-                accept="image/*,application/pdf,.pdf,.docx,.txt,.md,.zip,.tar,.tar.gz,.tgz,.csv,.tsv,.parquet,.xlsx,.json,.jsonl,.ndjson"
+                accept="image/*,application/pdf,.pdf,.docx,.txt,.md,.zip,.tar,.tar.gz,.tgz,.csv,.tsv,.parquet,.xlsx,.json,.jsonl,.ndjson,video/*,.mp4,.m4v,.mov,.webm,.mkv"
                 className="sr-only"
                 aria-hidden
                 tabIndex={-1}

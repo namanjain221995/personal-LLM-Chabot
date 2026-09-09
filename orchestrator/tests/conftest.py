@@ -53,6 +53,10 @@ _APP_TABLES = (
     # anonymous API call has user_id NULL and would survive every other
     # truncation — so it is listed explicitly.
     "research_runs",
+    # V28 video: attachments carry a user FK (cascade) but a NULL-user row
+    # (bare API call) would survive; the analysis table has no FK at all.
+    "video_attachments",
+    "video_analyses",
     # V8 web-search memory: web_results cascades from web_searches, but the
     # explicit order keeps TRUNCATE happy either way; web_pages is global.
     "web_crawls",
@@ -260,6 +264,8 @@ def isolated_app_db(app_database, tmp_path, monkeypatch):
     # previous test left on `settings`.
     monkeypatch.setattr(settings, "lancedb_dir", str(tmp_path / "lancedb"))
     monkeypatch.setattr(settings, "lancedb_web_dir", str(tmp_path / "lancedb-web"))
+    monkeypatch.setattr(settings, "lancedb_video_dir", str(tmp_path / "lancedb-video"))
+    monkeypatch.setattr(settings, "video_data_dir", str(tmp_path / "video"))
     with db.connection() as con:
         con.execute(
             f"TRUNCATE TABLE {', '.join(_APP_TABLES)} RESTART IDENTITY CASCADE"

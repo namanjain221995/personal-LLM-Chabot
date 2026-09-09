@@ -47,3 +47,11 @@ weasyprint>=61
 pypdfium2>=4.30
 pillow>=10.0
 trafilatura>=1.12
+# Video understanding (2026-09-09). Voice-activity detection cuts a recording
+# into transcription windows at pauses. `webrtcvad-wheels` is the maintained
+# build of Google's detector WITH manylinux wheels for aarch64 and cp311/cp312
+# — plain `webrtcvad` is an sdist that needs a compiler the CPU image does not
+# have. Frame decoding is ffmpeg (apt, see the Dockerfiles), not a wheel:
+# PyAV/OpenCV in-process would run on the event loop's cores; a child process
+# is bounded by `-threads` and killed on a deadline.
+webrtcvad-wheels>=2.0.14

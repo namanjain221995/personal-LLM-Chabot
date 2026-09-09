@@ -55,6 +55,8 @@ STORES = [
     ("warehouse_snapshot", ROOT / "warehouse.read.duckdb", "duckdb"),
     ("lancedb_salesforce", ROOT / "lancedb", "lancedb"),
     ("lancedb_web", ROOT / "lancedb-web", "lancedb"),
+    ("lancedb_video", ROOT / "lancedb-video", "lancedb"),
+    ("video", ROOT / "video", "video"),
     ("parquet_landing", ROOT / "parquet", "parquet"),
     ("workspaces", ROOT / "workspaces", "workspace"),
     ("brain", ROOT / "brain", "knowledge"),

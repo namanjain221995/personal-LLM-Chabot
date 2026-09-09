@@ -41,6 +41,12 @@ _ALLOWED = {
     },
     "result": {"hit", "miss", "fresh", "stale", "ok", "fail"},
     "job": {"index", "refresh", "expand"},
+    # Video understanding pipeline stages (app/video/types.STAGES). Closed so
+    # a renamed stage folds to "other" rather than minting a series.
+    "stage": {
+        "probe", "audio", "transcript", "frames", "ocr", "vision", "fusion",
+        "index", "artifacts",
+    },
     # Speech to text. The vocabulary is the ASR model's own published set
     # (app/asr.SUPPORTED_LANGUAGES) plus "unknown" for a clip whose language
     # was not identified. Closed for the usual reason: a mis-parsed engine
