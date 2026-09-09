@@ -54,8 +54,26 @@ def _me_payload(principal: Principal) -> Dict[str, Any]:
         # Which TOOLS this person may use (authn/features.py). The composer
         # hides what is off; the server refuses it regardless, so this is a
         # courtesy to the UI and never the gate itself.
-        "features": dict(principal.features),
+        "features": _features_for_ui(principal),
     }
+
+
+def _features_for_ui(principal: Principal) -> Dict[str, bool]:
+    """The resolved map, with DEPLOYMENT switches folded in.
+
+    A member may be allowed video understanding by policy on a deployment
+    that has no ffmpeg or no speech engine. The route answers 404 either way;
+    folding the deployment flag in here is what keeps the composer from
+    offering a video picker that cannot work. (Voice is not folded: the
+    microphone's server check answers 404 and the composer copes with it.)
+    """
+    from ..config import settings
+
+    features = dict(principal.features)
+    key = "video_analysis"
+    if key in features and not settings.video_analysis_enabled:
+        features[key] = False
+    return features
 
 
 def _login_sync(body: LoginRequest, ip: str, user_agent: str) -> Dict[str, Any]:

@@ -748,13 +748,20 @@ def test_the_web_vector_index_has_one_writer_and_it_reads_web_pages():
     directly, without ever touching `web_pages`. Exactly one line in `app/`
     adds rows to that table, and the rows it adds are built from
     `db.get_unindexed_web_pages` — from `web_pages`, and nothing else.
+
+    V28 added a SECOND LanceDB writer, `video/index.py`, for a different
+    table in a different directory (`LANCEDB_VIDEO_DIR`, keyed by analysis
+    and reachable only through `video_attachments`). It is named here so the
+    invariant stays exact: two writers, each to its own table, and a third
+    still fails this test.
     """
     adds = []
     for path in sorted(_APP.rglob("*.py")):
         for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
             if "table.add(" in line:
                 adds.append(f"{path.relative_to(_APP)}:{lineno}")
-    assert len(adds) == 1 and adds[0].startswith("web_index.py:"), adds
+    writers = sorted(a.split(":")[0] for a in adds)
+    assert writers == ["video/index.py", "web_index.py"], adds
 
     indexer = inspect.getsource(web_index.index_pending)
     assert "db.get_unindexed_web_pages" in indexer

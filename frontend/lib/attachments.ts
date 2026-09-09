@@ -76,6 +76,8 @@ export interface AttachmentsLookup {
    * regenerated after a reload: the bytes never had to be in this tab.
    */
   pdfUploads: DocumentRef[];
+  /** 2026-09-09: videos, always by reference. */
+  videoUploads: DocumentRef[];
   /** True when the turn HAD attachments we can no longer reconstruct. */
   missing: boolean;
 }
@@ -142,7 +144,7 @@ export function attachmentsForResend(message: ResendableMessage): AttachmentsLoo
   // proof that something is gone. The result was a regenerate that refused to
   // run, telling the user to re-attach a file the server had never lost.
   if (isDatasetTurn(message)) {
-    return { attachments: [], pdfUploads: [], missing: false };
+    return { attachments: [], pdfUploads: [], videoUploads: [], missing: false };
   }
 
   const remembered = sent.get(message.id) ?? [];
@@ -165,6 +167,19 @@ export function attachmentsForResend(message: ResendableMessage): AttachmentsLoo
     if (fromPreviews.length === previews.length) images = fromPreviews;
     else imagesMissing = true;
   }
+
+  /* ---- videos: ALWAYS by reference (2026-09-09); no id = gone ---- */
+  const videoUploads: DocumentRef[] = [];
+  let videosMissing = false;
+  (message.meta?.attachments ?? [])
+    .filter((a) => a.kind === 'video')
+    .forEach((entry, i) => {
+      if (entry.id) {
+        videoUploads.push({ upload_id: entry.id, name: entry.name ?? `Video ${i + 1}` });
+      } else {
+        videosMissing = true;
+      }
+    });
 
   /* ---- documents: by reference where there is an id, inline where not ---- */
   const docs = (message.meta?.attachments ?? []).filter((a) => a.kind === 'pdf');
@@ -191,7 +206,8 @@ export function attachmentsForResend(message: ResendableMessage): AttachmentsLoo
   return {
     attachments: [...images, ...inlinePdfs],
     pdfUploads,
-    missing: imagesMissing || docsMissing,
+    videoUploads,
+    missing: imagesMissing || docsMissing || videosMissing,
   };
 }
 
@@ -217,10 +233,11 @@ export function resendOptionsFor(message: ResendableMessage): {
   pdf: string | null;
   pdfName: string | null;
   pdfUploads: DocumentRef[] | null;
+  videoUploads: DocumentRef[] | null;
   dataset: boolean;
   missing: boolean;
 } {
-  const { attachments, pdfUploads, missing } = attachmentsForResend(message);
+  const { attachments, pdfUploads, videoUploads, missing } = attachmentsForResend(message);
   const inline = attachments.filter((a) => a.kind === 'pdf');
   const firstInline = inline[0] ?? null;
   return {
@@ -228,6 +245,10 @@ export function resendOptionsFor(message: ResendableMessage): {
     pdf: firstInline?.base64 ?? null,
     pdfName: firstInline?.name ?? pdfUploads[0]?.name ?? null,
     pdfUploads: pdfUploads.length ? pdfUploads : null,
+    // 2026-09-09: a regenerate without the video would re-ask a question
+    // the model can no longer see the subject of — the document bug of
+    // 2026-09-03, one kind over.
+    videoUploads: videoUploads.length ? videoUploads : null,
     dataset: isDatasetTurn(message),
     missing: missing || inline.length > 1,
   };

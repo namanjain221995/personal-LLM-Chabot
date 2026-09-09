@@ -40,4 +40,11 @@ lxml>=5
 # is worse than a slow one. Skipping those tests instead would be worse still:
 # extraction accuracy would then be checked nowhere.
 trafilatura>=1.12
+# Video understanding: the VAD wheel is pure C with no model to download, so
+# the windowing tests run it for real; pillow renders the synthetic frames the
+# perceptual-hash tests hash (it is in requirements.txt already — this file
+# had been missing it, so the CUDA image and CI disagreed on whether PIL
+# imports).
+webrtcvad-wheels>=2.0.14
+pillow>=10.0
 pytest>=8.0

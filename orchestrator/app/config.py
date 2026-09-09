@@ -228,6 +228,128 @@ class Settings:
         # Per person, per minute. Dictation is bursty but not machine-fast.
         self.asr_rate_per_min: int = _int("ASR_RATE_PER_MIN", 20)
 
+        # -- Video understanding (2026-09-09) ----------------------------------
+        #
+        # A person attaches a video; the assistant transcribes it (Whisper,
+        # timestamped), reads what was on screen (OCR + the router's vision
+        # model), fuses both with the main model, indexes the evidence and
+        # hands back downloadable transcripts. OFF by default: it needs
+        # ffmpeg in the image and the speech engine running, and a
+        # deployment without either must not show a video picker.
+        self.video_analysis_enabled: bool = _bool("VIDEO_ANALYSIS_ENABLED", False)
+        # Where analyses live — NOT under WORKSPACE_DIR, whose top-level
+        # directories are swept by age (core/repo.enforce_quota_and_ttl); a
+        # job that takes an hour must not lose its inputs to somebody else's
+        # upload. Keyed by the sha256 of the file so a re-upload reuses it.
+        self.video_data_dir: str = os.environ.get("VIDEO_DATA_DIR", "/data/video")
+        # Its own LanceDB directory: the sidecar pins one table per directory
+        # and the two existing ones are the Salesforce and web corpora.
+        self.lancedb_video_dir: str = os.environ.get("LANCEDB_VIDEO_DIR", "/data/lancedb-video")
+        # Ceilings. Four hours is a full workshop; past it the transcript
+        # alone is an hour of speech-engine time on a GPU the chat model
+        # shares.
+        self.video_max_duration_s: int = _int("VIDEO_MAX_DURATION_S", 4 * 3600)
+        self.video_max_upload_mb: int = _int("VIDEO_MAX_UPLOAD_MB", 4096)
+        # ONE JOB AT A TIME. A saturated speech engine on either node takes
+        # the chat model from 71 to 24 tok/s (measured 2026-09-08); two
+        # videos at once would double that. Raise only on a deployment where
+        # nobody chats while videos are processed.
+        self.video_max_concurrent_jobs: int = _int("VIDEO_MAX_CONCURRENT_JOBS", 1)
+        # PACING. Before every GPU-heavy unit (an ASR window, an OCR batch, a
+        # caption) the job waits — up to this long — while a chat generation
+        # is in flight, so the people chatting never pay for a video being
+        # processed in the background. 0 disables pacing.
+        self.video_pace_max_wait_s: float = _float("VIDEO_PACE_MAX_WAIT_S", 20.0)
+        # A stage that runs longer than this is failed rather than left to
+        # hold the only job slot forever. Two hours covers a four-hour video's
+        # transcript at ~10x realtime with a margin.
+        self.video_stage_timeout_s: float = _float("VIDEO_STAGE_TIMEOUT_S", 2 * 3600.0)
+        # Transcription windows: at most this long (the engine refuses 600 s),
+        # never spanning a pause over `max_gap`, overlapping by `overlap`
+        # only where continuous speech had to be cut. Batch clips go through
+        # their own admission pool of this size so dictation is never starved.
+        # The ceiling on one clip sent to the speech engine. It is the length
+        # of the longest GPU unit the job cannot yield during: measured at
+        # 240 s, a window took ~41 s in the engine and a person chatting
+        # meanwhile saw 31-37 tok/s for that long. 90 s keeps the dip near
+        # 15 s at the price of a few more calls (the engine's own receptive
+        # field is 30 s, so seams are no worse than its internal ones).
+        self.video_asr_window_s: float = _float("VIDEO_ASR_WINDOW_S", 90.0)
+        self.video_asr_max_gap_s: float = _float("VIDEO_ASR_MAX_GAP_S", 2.0)
+        self.video_asr_overlap_s: float = _float("VIDEO_ASR_OVERLAP_S", 3.0)
+        # Clips in flight at once. Two = one per Spark: the speech router
+        # hands each clip to the engine with the fewest in flight, so both
+        # nodes decode side by side. A person dictating meanwhile may wait
+        # for one clip (~15 s at the 90-s window) — the price of using both.
+        self.video_asr_concurrency: int = _int("VIDEO_ASR_CONCURRENCY", 2)
+        # Frames: a scene-change detector plus a periodic floor, then a
+        # perceptual-hash dedupe, then a cap of one frame per
+        # `per_seconds` clamped to [min, max]. The floor is derived from the
+        # cap (see pipeline._stage_frames) within these bounds.
+        self.video_frame_scene_threshold: float = _float("VIDEO_FRAME_SCENE_THRESHOLD", 0.30)
+        self.video_frame_floor_min_s: float = _float("VIDEO_FRAME_FLOOR_MIN_S", 4.0)
+        self.video_frame_floor_max_s: float = _float("VIDEO_FRAME_FLOOR_MAX_S", 30.0)
+        self.video_frame_max_width: int = _int("VIDEO_FRAME_MAX_WIDTH", 1280)
+        self.video_frame_per_seconds: float = _float("VIDEO_FRAME_PER_SECONDS", 8.0)
+        self.video_frame_min: int = _int("VIDEO_FRAME_MIN", 24)
+        self.video_frame_max: int = _int("VIDEO_FRAME_MAX", 400)
+        self.video_frame_hash_distance: int = _int("VIDEO_FRAME_HASH_DISTANCE", 5)
+        # Above this length only keyframes are decoded for frame selection
+        # (tens of times faster; a slide change is noticed at the next
+        # keyframe rather than the exact frame).
+        # Decoder threads for the ffmpeg children (audio, frames, a single
+        # frame). h264 frame-threading scales to about 4-6x; the Sparks have
+        # 20 cores and nothing else CPU-bound runs during an analysis.
+        self.video_ffmpeg_threads: int = max(1, min(_int("VIDEO_FFMPEG_THREADS", 8), os.cpu_count() or 8))
+        self.video_keyframes_only_after_s: float = _float("VIDEO_KEYFRAMES_ONLY_AFTER_S", 1200.0)
+        # On-screen text via the OCR sidecar, in small batches with a
+        # deadline each — a text-dense frame has cost 47 s here.
+        self.video_ocr_enabled: bool = _bool("VIDEO_OCR_ENABLED", True)
+        self.video_ocr_max_tokens: int = _int("VIDEO_OCR_MAX_TOKENS", 1500)
+        self.video_ocr_batch_deadline_s: float = _float("VIDEO_OCR_BATCH_DEADLINE_S", 150.0)
+        self.video_ocr_concurrency: int = _int("VIDEO_OCR_CONCURRENCY", 4)
+        # OCR costs ~10 s per text-dense frame on this deployment (measured
+        # 2026-09-09) — 400 frames of a two-hour recording would be an hour.
+        # Past this many kept frames, only the longest-held ones are read
+        # (the slides that mattered); every frame still gets a caption.
+        self.video_ocr_max_frames: int = _int("VIDEO_OCR_MAX_FRAMES", 120)
+        # Frame captions via the ROUTER vision model (Qwen3-VL-8B), not the
+        # chat model: measured 2026-09-09 at ~2 s a frame at 896 px, 0.6 s
+        # effective at four in flight. Two in flight leaves the router room
+        # for the classification calls every chat message makes.
+        self.video_captions_enabled: bool = _bool("VIDEO_CAPTIONS_ENABLED", True)
+        self.video_caption_concurrency: int = _int("VIDEO_CAPTION_CONCURRENCY", 3)
+        self.video_caption_width: int = _int("VIDEO_CAPTION_WIDTH", 896)
+        self.video_caption_max_tokens: int = _int("VIDEO_CAPTION_MAX_TOKENS", 160)
+        self.video_caption_timeout_s: float = _float("VIDEO_CAPTION_TIMEOUT_S", 90.0)
+        # Fusion on the main model: one pass while the evidence pack is under
+        # `direct_tokens`, map-reduce in parts of `part_tokens` above it. The
+        # window is a million tokens but a prompt that size monopolises the
+        # engine (1.49x concurrency at full window), so this is a ceiling on
+        # what one video may ask of it at once.
+        self.video_fusion_direct_tokens: int = _int("VIDEO_FUSION_DIRECT_TOKENS", 60_000)
+        self.video_fusion_part_tokens: int = _int("VIDEO_FUSION_PART_TOKENS", 32_000)
+        self.video_fusion_max_tokens: int = _int("VIDEO_FUSION_MAX_TOKENS", 6_000)
+        # Question time: evidence chunks retrieved per question (after the
+        # reranker), the pinned summary block's size on later turns, and how
+        # close the nearest chunk must be for a text-only turn to be treated
+        # as being ABOUT the video (L2 distance; see engines/video.py).
+        self.video_retrieve_top_k: int = _int("VIDEO_RETRIEVE_TOP_K", 8)
+        self.video_context_chars: int = _int("VIDEO_CONTEXT_CHARS", 6_000)
+        # Measured 2026-09-09 on a Hindi tutorial asked about in English: the
+        # relevant question scored 1.29 (cross-lingual embeddings sit further
+        # apart), unrelated ones 1.66. Same-language relevant questions score
+        # 0.5-1.1. 1.45 admits the cross-lingual case and refuses the junk.
+        self.video_followup_distance: float = _float("VIDEO_FOLLOWUP_DISTANCE", 1.45)
+        # The main model may LOOK at up to this many frames when a question
+        # is visual ("read the code on the slide"). ~525 tokens per 896 px
+        # frame on this model.
+        self.video_answer_frames: int = _int("VIDEO_ANSWER_FRAMES", 3)
+        # Housekeeping: analyses no conversation refers to any more are
+        # deleted after this grace period (a re-upload inside it is free).
+        self.video_orphan_ttl_hours: int = _int("VIDEO_ORPHAN_TTL_HOURS", 72)
+        self.video_maintenance_interval_s: float = _float("VIDEO_MAINTENANCE_INTERVAL_S", 1800.0)
+
         # --- Reranker ------------------------------------------------------
         # Backward compatibility: RERANK_ENABLED=false still disables the
         # feature when no backend is named. New profiles select an explicit

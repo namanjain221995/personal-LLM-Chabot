@@ -94,9 +94,25 @@ async def lifespan(_app: FastAPI):
     from . import web_worker
 
     web_worker.start()
+    # Video understanding (2026-09-09): requeue analyses a restart cut off
+    # and drain the queue behind the app. Their stage files are on disk, so
+    # a resume costs only the stage that was interrupted.
+    from .video import pipeline as video_pipeline
+
+    await video_pipeline.start()
+    # The job paces itself against live chat: a generation that is merely
+    # WAITING for a video analysis does not count as chatting, or the job
+    # would wait for itself.
+    video_pipeline.set_busy_probe(
+        lambda: any(
+            not g.done and not getattr(g, "waiting_on_video", False)
+            for g in list(_live_generations.values())
+        )
+    )
     try:
         yield
     finally:
+        await video_pipeline.stop()
         await web_worker.stop()
         await db.run_in_thread(db.close_pool)
 
@@ -158,6 +174,12 @@ app.include_router(uploads_router)
 # Speech to text for the composer. Its own router because it is the only
 # route that takes audio, and the only one gated on Feature.VOICE_INPUT.
 app.include_router(audio_router)
+# Video understanding (2026-09-09): status for a running analysis. The
+# upload itself rides the /uploads routes with purpose=video; the answers
+# ride /chat. Gated on Feature.VIDEO_ANALYSIS and VIDEO_ANALYSIS_ENABLED.
+from .video.api import router as video_router  # noqa: E402
+
+app.include_router(video_router)
 app.include_router(memory_router)
 # Conversation sharing. Mounted at the app root because ONE of its routes —
 # /public/shares/{token} — is the only endpoint in this application that
@@ -436,6 +458,12 @@ class ChatRequest(BaseModel):
     # message: [{"upload_id": "<32 hex>", "name": "contract.pdf"}, ...].
     # Small documents may still ride inline in `pdf` exactly as before.
     pdf_uploads: Optional[List[dict]] = None
+    # 2026-09-09: videos ALWAYS stream to /uploads (purpose=video) first —
+    # nothing that size rides a JSON body — and the request carries
+    # references: [{"upload_id": "<32 hex>", "name": "standup.mp4"}, ...].
+    # The analysis is a detached job started at upload time; the chat turn
+    # attaches to it (engines/video.py).
+    video_uploads: Optional[List[dict]] = None
     # Phase 1: web search — "off" (never), "on" (force), "auto" (model decides).
     web_search: Literal["off", "auto", "on"] = "off"
     # Salesforce Intelligence Mode: the answer to a clarifying question this
@@ -505,12 +533,13 @@ class ChatRequest(BaseModel):
             not self.text
             and not self.image_data
             and not self.pdf_data
+            and not self.video_uploads
             # Answering a clarification by clicking "Skip" carries no text of
             # its own; the request it resumes is what supplies the question.
             and not self.clarification
         ):
             raise ValueError(
-                "provide a non-empty message/messages, an image, or a PDF"
+                "provide a non-empty message/messages, an image, a PDF or a video"
             )
         return self
 
@@ -685,6 +714,36 @@ async def _resolve_document_refs(
     return docs, images, None
 
 
+_MAX_VIDEO_REFS = 3
+
+
+async def _resolve_video_refs(
+    request: "ChatRequest", conversation_id: Optional[str], known: list
+) -> tuple[list, Optional[str]]:
+    """The message's videos → (analysis rows, error).
+
+    References resolve against THIS conversation's attachments, so an id
+    from another conversation is a miss, not a read. A follow-up with no
+    references answers over every video attached to the conversation.
+    """
+    refs = list(request.video_uploads or [])
+    if len(refs) > _MAX_VIDEO_REFS:
+        return [], f"A message can carry at most {_MAX_VIDEO_REFS} videos."
+    if not refs:
+        return list(known), None
+    rows = []
+    for ref in refs:
+        upload_id = str((ref or {}).get("upload_id", ""))
+        if not _re.fullmatch(r"[0-9a-f]{32}", upload_id) or not conversation_id:
+            return [], "One of the attached videos could not be found — please re-attach it."
+        row = await db.run_in_thread(db.get_video_by_upload, conversation_id, upload_id)
+        if row is None:
+            name = str((ref or {}).get("name") or "an attached video")
+            return [], f"{name} is not attached to this conversation — please re-attach it."
+        rows.append(row)
+    return rows, None
+
+
 @app.get("/health")
 async def health() -> dict:
     """§8: /health checks the model servers and DuckDB — under the all-vLLM
@@ -833,6 +892,13 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
         elif route == "agent":
             extras["model"] = llm.served_model_id("smart")
             extras["effort"] = request.effort  # applied to synthesis (§3b)
+        elif route == "video":
+            # Fusion and Q&A run on the main model; the frame captions come
+            # from the router, which meta.video records. `effort` is NOT set
+            # here: the engine reports the level that actually served the
+            # answer (question turns run without thinking below Max), and
+            # extras are merged over the engine's meta.
+            extras["model"] = llm.served_model_id("smart")
         elif route in ("sql", "rag", "report"):
             extras["model"] = llm.served_model_id("smart")
             extras["effort"] = "think"  # engine default; picker not applied
@@ -885,6 +951,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
     if not attachments_allowed and (
         request.pdf_data
         or request.pdf_uploads
+        or request.video_uploads
         or request.image_data
         or request.images_data
     ):
@@ -895,11 +962,23 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
         request.pdf = None
         request.pdf_filename = None
         request.pdf_uploads = None
+        request.video_uploads = None
         request.images = None
         request.image = None
         request.image_base64 = None
+    video_blocked = False
+    if request.video_uploads and not feature_access.allowed(
+        principal.features, feature_access.Feature.VIDEO_ANALYSIS
+    ):
+        # The upload route refused first; this covers a tab left open.
+        video_blocked = True
+        request.video_uploads = None
     access_notice = feature_access.blocked_notice(
-        [*gate.blocked, *(["Photos and files"] if attachment_blocked else [])]
+        [
+            *gate.blocked,
+            *(["Photos and files"] if attachment_blocked else []),
+            *(["Video understanding"] if video_blocked else []),
+        ]
     )
 
     # Bare API calls (session_id only, no conversation row) used to share one
@@ -1120,6 +1199,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 request.text
                 and not request.pdf_data
                 and not request.image_data
+                and not request.video_uploads
                 and not request.agent
             ):
                 from .engines.orchestrate import decide
@@ -1135,6 +1215,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 and request.web_search != "off"
                 and not request.pdf_data
                 and not request.image_data
+                and not request.video_uploads
                 and request.text
                 # Salesforce mode NEVER searches the web — at any effort
                 # level, and even if the client sends web_search="on" (owner
@@ -1230,6 +1311,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 and request.text
                 and not request.pdf_data
                 and not request.pdf_uploads
+                and not request.video_uploads
                 and not request.image_data
                 and not request.agent
                 and not want_agent
@@ -1537,6 +1619,52 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                         *history,
                     ]
 
+            # 2026-09-09: videos attached earlier in this conversation. Every
+            # later turn carries a COMPACT block (what each video is, its
+            # chapters, its decisions) exactly as documents do — and when the
+            # question is about a video, the turn goes to the video engine,
+            # which retrieves the evidence and cites timestamps. The block is
+            # a system message, so it is measured by the meter, pinned
+            # through compaction, and stripped before any outbound search
+            # prompt (engines.conversation_turns).
+            conversation_videos: list = []
+            video_followup = False
+            if (
+                settings.video_analysis_enabled
+                and request.text
+                and not request.video_uploads
+                and not request.pdf_data
+                and not request.pdf_uploads
+                and not request.image_data
+            ):
+                try:
+                    conversation_videos = await db.run_in_thread(
+                        db.get_conversation_videos, conv_key
+                    )
+                except Exception:
+                    conversation_videos = []  # best-effort
+                if conversation_videos:
+                    from .engines import video as video_engine
+
+                    history = [
+                        {
+                            "role": "system",
+                            "content": "Videos the user attached earlier in this "
+                            "chat — each was transcribed, read off the screen and "
+                            "summarised; cite timestamps like [12:34] when you "
+                            "refer to one:\n"
+                            + video_engine.pinned_block(
+                                conversation_videos,
+                                max_chars=settings.video_context_chars,
+                            ),
+                        },
+                        *history,
+                    ]
+                    if not deep_research_on and not request.agent and not github_ref and not url_list:
+                        video_followup = await video_engine.is_about_video(
+                            request.text, conversation_videos
+                        )
+
             # Phase A/B: assemble THIS session's context — rolling summary +
             # retrieved folded chunks + recent turns — compacting first if the
             # request would otherwise overflow the window. Scoped entirely to
@@ -1552,8 +1680,12 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 and not url_list
             ):
                 try:
-                    dataset_ready = bool(
-                        await db.run_in_thread(db.get_uploads, conv_key)
+                    # Documents and videos share the uploads table but answer
+                    # through their own engines; only a real dataset row makes
+                    # this conversation a dataset conversation.
+                    dataset_ready = any(
+                        (u.get("notes") or "") not in ("document", "video")
+                        for u in await db.run_in_thread(db.get_uploads, conv_key)
                     )
                 except Exception:
                     dataset_ready = False
@@ -1760,6 +1892,33 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 # is now waiting. Either way it already emitted its tokens and
                 # its single meta; there is nothing left for the chain below.
                 answer = sf_outcome.answer
+            elif request.video_uploads or video_followup:
+                # 2026-09-09: a video attached now, or a question about one
+                # attached earlier. The engine waits for the detached analysis
+                # (forwarding its progress as steps), then answers from the
+                # evidence with [m:ss] citations, or renders the understanding
+                # itself when nothing specific was asked.
+                from .engines import video as video_engine
+
+                videos, video_err = await _resolve_video_refs(
+                    request, conv_key, conversation_videos
+                )
+                if video_err:
+                    await emit("token", {"text": video_err})
+                    await emit("meta", {"route": "video"})
+                    answer = video_err
+                else:
+                    gen.waiting_on_video = True  # see video_pipeline.set_busy_probe
+                    answer = await video_engine.run_video_engine(
+                        text,
+                        videos,
+                        history,
+                        emit,
+                        conversation_id=conv_key,
+                        effort=request.effort,
+                        user_id=viewer,
+                        attach_turn=bool(request.video_uploads),
+                    )
             elif request.pdf_uploads or request.pdf_data:
                 # V8 → 2026-08-07: any document (PDF/DOCX/plain) — the WHOLE
                 # file is read and remembered for this conversation. Since

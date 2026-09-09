@@ -1,0 +1,111 @@
+# baidu/Unlimited-OCR off the head node. Its own Compose project (sf-local-ai-ocr).
+#
+# THE SAME FILE RUNS ON EITHER NODE, which is why it is not named for one.
+# On the worker it is copied to $HOME/.techsara-cluster/ and started there,
+# like compose.whisper.yaml; on the head it is used in place. scripts/ocr.sh
+# sets OCR_BIND per node and everything else from what the launcher already
+# derived (the model cache path, the pinned model directory).
+#
+# WHY THIS EXISTS. The head's own OCR service (`vllm-ocr` in
+# compose.dgx-spark.yaml) reserves 0.10-0.14 of the head's 121 GB of unified
+# memory -- about 17 GB -- for a model that serves single 8,192-token pages a
+# handful at a time. Measured 2026-09-09 the head sat at 113/121 GB with the
+# worker at 69 GB free and its GPU idle between tensor-parallel steps. This
+# file is the same engine, the same image digest and the same flags, sized
+# for the job and placed where the memory is.
+#
+# WHY A SEPARATE PROJECT AND NOT A SERVICE IN THE MAIN STACK. A separate
+# project is the isolation promise: `docker compose up` here cannot restart
+# the main model, and on the worker it never comes near sf-local-ai-worker,
+# which is the main model's tensor-parallel rank 1 and must not be touched.
+#
+# BINDING. On the worker the orchestrator reaches this from the other node,
+# so the port must be off-box -- but bound to the MANAGEMENT address only,
+# never 0.0.0.0 and never a 10.100.x RoCE address, which belongs to the
+# fabric the main model's tensor-parallel shards talk over. On the head it
+# binds the docker bridge gateway (172.17.0.1), which the orchestrator's
+# container can reach and nothing off-box can.
+name: sf-local-ai-ocr
+
+services:
+  ocr:
+    # The reference the script resolved ON THIS NODE. The default is the
+    # digest the head runs; an image that arrived by `docker save | docker
+    # load` (Docker Hub unreachable) has no registry digest on the receiving
+    # daemon, so the script passes the image ID instead -- the same rule
+    # scripts/cluster-sync.sh applies to the main model's image.
+    image: ${OCR_IMAGE:-vllm/vllm-openai@sha256:24f2f8975d011ea7f7066a547886a08a1fd3c4bf0880463487fae4f01ce723c6}
+    command: >
+      ${OCR_MODEL_CONTAINER_PATH:-/models/repos/baidu--Unlimited-OCR--07dea832e22a}
+      --served-model-name ${OCR_MODEL:-baidu/Unlimited-OCR}
+      --host ${OCR_BIND:?OCR_BIND must be set; scripts/ocr.sh derives it from the node's management interface}
+      --port ${OCR_PORT:-30004}
+      --max-model-len ${OCR_MAX_CONTEXT:-8192}
+      --kv-cache-memory-bytes 3221225472
+      --gpu-memory-utilization ${OCR_GPU_MEMORY_UTILIZATION:-0.10}
+      --max-num-seqs 8
+      --enforce-eager
+      --trust-remote-code
+    # THE KV BUDGET IS EXPLICIT, AND SMALL. 3 GiB of paged KV holds tens of
+    # 8,192-token pages, and the orchestrator sends at most a handful at once
+    # (engines/ocr.py caps concurrency at OCR_CONCURRENCY, 3 by default);
+    # --max-num-seqs 8 is the matching admission ceiling. An explicit budget
+    # also makes vLLM skip its free-memory profiling, which on GB10 measures
+    # free SYSTEM memory that moves while the profile runs and has killed
+    # start-ups here before (docs/CLUSTER.md). --gpu-memory-utilization 0.10
+    # stays as the outer ceiling the engine may never exceed, weights
+    # included: 12 GB on a 121 GB node, against the 17 GB the head reserved.
+    # Spelled `${OCR_GPU_MEMORY_UTILIZATION:-0.10}` like every sidecar knob,
+    # so an exported value reaches it and a hard-coded one cannot hide.
+    environment:
+      HF_HOME: /root/.cache/huggingface
+      # The weights are bind-mounted below; nothing is ever fetched at start.
+      HF_HUB_OFFLINE: "1"
+    volumes:
+      - type: bind
+        source: ${OCR_MODEL_CACHE:?OCR_MODEL_CACHE must be set; scripts/ocr.sh passes the node's model cache}
+        target: /models
+        read_only: true
+      # ITS OWN CACHE, never the host's ~/.cache/huggingface, for the same
+      # reason compose.whisper.yaml gives: a sidecar has no business sharing
+      # a namespace with the models this node runs for other reasons.
+      - hf-cache:/root/.cache/huggingface
+    # HOST NETWORKING, AND NOT A PORT PUBLISH. Published as
+    # `ports: 192.168.9.68:30004:30004`, a container on this node does not
+    # survive a reboot: Docker starts containers before enP7s7 has been
+    # assigned its address, the bind fails, and the container is left dead
+    # before its process ever ran -- where `restart: unless-stopped` never
+    # engages. Binding the address inside the process makes a missing NIC an
+    # ordinary process failure that the restart policy retries until it is
+    # up (compose/compose.monitoring-worker.yaml learned this the hard way).
+    network_mode: host
+    shm_size: 8g
+    ipc: host
+    restart: unless-stopped
+    healthcheck:
+      # Probes the address the server ACTUALLY binds, by reading the same two
+      # variables the command line does, so the two cannot drift apart. A
+      # loopback probe would sit "unhealthy" for the life of a container that
+      # was told to listen on the management address and did exactly that.
+      test: ["CMD-SHELL", "curl -fsS http://${OCR_BIND:-127.0.0.1}:${OCR_PORT:-30004}/v1/models -o /dev/null || exit 1"]
+      interval: 30s
+      timeout: 15s
+      retries: 60
+      # Loading 6.4 GB of weights and compiling the vision encoder takes a
+      # few minutes on a first start; the head's service allows the same.
+      start_period: 10m
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  hf-cache:

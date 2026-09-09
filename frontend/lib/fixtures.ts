@@ -423,6 +423,44 @@ const clarifyFixture: Fixture = {
   },
 };
 
+// 2026-09-09: a video understood and cited by timestamp.
+const videoFixture: Fixture = {
+  text:
+    '**standup.mp4** — 10:32 · meeting · English\n\n## Summary\n\nThe team reviewed pricing and agreed to raise the Team tier to $59 from November [1:21].\n\n## Chapters\n\n- **[0:00]** Agenda\n- **[0:31]** Pricing proposal\n- **[9:42]** Decisions',
+  meta: {
+    route: 'video',
+    report_files: [{ filename: 'standup-3f2a9c1d-u1.transcript.srt', type: 'srt', size: 4096 }],
+    video: {
+      vision: 'main+router',
+      videos: [
+        {
+          analysis_id: 1,
+          filename: 'standup.mp4',
+          status: 'done',
+          duration_s: 632,
+          content_type: 'meeting',
+          language: 'English',
+          counts: { segments: 118, frames_kept: 10, captions: 10 },
+          chapters: [
+            { start: 0, title: 'Agenda' },
+            { start: 31, title: 'Pricing proposal' },
+            { start: 582, title: 'Decisions' },
+          ],
+        },
+      ],
+      evidence: [
+        {
+          start: 81,
+          end: 125,
+          modality: 'screen',
+          analysis_id: 1,
+          text: 'Proposal: raise Team to $59 from November',
+        },
+      ],
+    },
+  },
+};
+
 export const FIXTURES: Record<Engine, Fixture> = {
   clarify: clarifyFixture,
   sql: sqlFixture,
@@ -436,6 +474,7 @@ export const FIXTURES: Record<Engine, Fixture> = {
   crawl: crawlFixture,
   deep_research: deepResearchFixture,
   repo: repoFixture,
+  video: videoFixture,
 };
 
 /**

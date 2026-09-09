@@ -28,9 +28,10 @@ hallucinate on silence and, measured here, answers a 30-second silent clip
 with " you"; the engine short-circuits that before the model runs. So this
 client identifies no languages, splits no audio and guesses nothing.
 
-FORMAT. None is converted here. The engine decodes through PyAV, which bundles
-ffmpeg, so the WebM/Opus a browser's MediaRecorder produces is understood
-natively. That is why this orchestrator needs no audio library at all.
+FORMAT. None is converted here for dictation. The engine decodes with ffmpeg
+on its own side, so the WebM/Opus a browser's MediaRecorder produces is
+understood natively. Video analysis (app/video) is the one caller that sends
+PCM it cut itself — see `transcribe_segments` and the BATCH pool.
 """
 from __future__ import annotations
 
@@ -137,6 +138,19 @@ class Transcript:
     degraded: bool = False
 
 
+@dataclass(frozen=True)
+class TranscriptSegments(Transcript):
+    """A transcript that also carries the engine's timestamped segments.
+
+    `segments` is a tuple of plain dicts — {start, end, text, language?} in
+    seconds from the start of THE CLIP — exactly as the engine's verbose_json
+    reply spells them. Video analysis offsets them into video time; nothing
+    else reads them.
+    """
+
+    segments: tuple = ()
+
+
 class ASRProvider(Protocol):
     """What the route needs from a speech engine, and nothing more."""
 
@@ -192,7 +206,15 @@ class VLLMAudioProvider:
 
         return httpx.AsyncClient(timeout=self.timeout_s)
 
-    async def _transcriptions(self, audio: bytes, filename: str, content_type: str) -> Transcript:
+    async def _transcriptions(
+        self,
+        audio: bytes,
+        filename: str,
+        content_type: str,
+        *,
+        segments: bool = False,
+        no_speech_check: bool = True,
+    ) -> Transcript:
         """The transcription endpoint — the only one Whisper serves.
 
         The engine's reply carries more than text: the language it identified
@@ -211,10 +233,20 @@ class VLLMAudioProvider:
         started = time.perf_counter()
         try:
             async with httpx.AsyncClient(timeout=self.timeout_s) as client:
+                data = {"model": self.model}
+                if segments:
+                    # OpenAI's name for "the shape with timestamped segments";
+                    # the speech server answers it since 2026-09-09.
+                    data["response_format"] = "verbose_json"
+                if not no_speech_check:
+                    # Only a caller that ran its own voice-activity detection
+                    # over a longer recording turns the engine's first-30-s
+                    # silence gate off; dictation never does.
+                    data["no_speech_check"] = "false"
                 response = await client.post(
                     f"{self.base_url}/audio/transcriptions",
                     files={"file": (filename, audio, content_type)},
-                    data={"model": self.model},
+                    data=data,
                 )
         except Exception as exc:  # noqa: BLE001
             raise ASRUnavailable(str(exc)) from exc
@@ -235,6 +267,34 @@ class VLLMAudioProvider:
         code = str(body.get("language_code") or "").strip() or None
         if language and not code:
             code = language_code(language)
+        if segments:
+            raw = body.get("segments")
+            parsed = tuple(
+                {
+                    "start": float(s.get("start", 0.0) or 0.0),
+                    "end": float(s.get("end", 0.0) or 0.0),
+                    "text": str(s.get("text") or ""),
+                    "language": (str(s["language"]) if s.get("language") else None),
+                }
+                for s in (raw if isinstance(raw, list) else [])
+                if isinstance(s, dict)
+            )
+            if not parsed and spoken:
+                # An engine that does not know verbose_json answers text
+                # alone. One segment spanning the clip is honest: the words
+                # are right, the timing is "somewhere in this window".
+                duration = float(body.get("duration") or 0.0)
+                parsed = ({"start": 0.0, "end": duration, "text": spoken, "language": code},)
+            return TranscriptSegments(
+                text=spoken,
+                language=language,
+                language_code=code,
+                provider=self.name,
+                model=self.model,
+                engine_ms=elapsed,
+                degraded=False,
+                segments=parsed,
+            )
         return Transcript(
             text=spoken,
             language=language,
@@ -268,6 +328,21 @@ class VLLMAudioProvider:
         one language mistranscribes the other.
         """
         return await self._transcriptions(audio, filename, content_type)
+
+    async def transcribe_segments(
+        self,
+        audio: bytes,
+        *,
+        filename: str,
+        content_type: str,
+        no_speech_check: bool = True,
+    ) -> TranscriptSegments:
+        """One clip -> text AND timestamped segments (video analysis)."""
+        result = await self._transcriptions(
+            audio, filename, content_type, segments=True, no_speech_check=no_speech_check
+        )
+        assert isinstance(result, TranscriptSegments)
+        return result
 
     async def health(self) -> bool:
         import httpx
@@ -353,17 +428,36 @@ class RoutedProvider:
     async def transcribe(
         self, audio: bytes, *, filename: str, content_type: str, language: str = ""
     ) -> Transcript:
+        return await self._routed(
+            "transcribe", audio, filename=filename, content_type=content_type, language=language
+        )
+
+    async def transcribe_segments(
+        self,
+        audio: bytes,
+        *,
+        filename: str,
+        content_type: str,
+        no_speech_check: bool = True,
+    ) -> TranscriptSegments:
+        return await self._routed(
+            "transcribe_segments",
+            audio,
+            filename=filename,
+            content_type=content_type,
+            no_speech_check=no_speech_check,
+        )
+
+    async def _routed(self, method: str, audio: bytes, **kwargs: Any):
+        """Send one call to the freest healthy engine, standing down any
+        that is unavailable and trying the next — the same loop for every
+        method an engine exposes."""
         last: Optional[Exception] = None
         for index in self._order():
             engine = self._engines[index]
             self._active[index] += 1
             try:
-                result = await engine.transcribe(
-                    audio,
-                    filename=filename,
-                    content_type=content_type,
-                    language=language,
-                )
+                result = await getattr(engine, method)(audio, **kwargs)
                 self._down_until[index] = 0.0
                 return result
             except ASRRejected:
@@ -424,17 +518,20 @@ class _Pool:
         self.waiting = 0
         self.active = 0
 
+    #: How many may be in flight at once. Dictation's pool scales with the
+    #: fleet (see below); the batch pool does NOT — see `BATCH_POOL`.
+    def _size(self) -> int:
+        # Per engine, times the fleet: two nodes carry twice the work at
+        # the same pressure each. `settings.asr_base_urls` is never empty
+        # (config falls back to the single URL), so this is at least one.
+        return max(1, settings.asr_max_concurrent) * max(1, len(settings.asr_base_urls))
+
     def _semaphore(self) -> asyncio.Semaphore:
         loop = asyncio.get_running_loop()
         # Rebuilt per event loop: a Semaphore bound to a dead loop (the test
         # suite makes a new one per test) blocks forever on the next acquire.
         if self._sem is None or self._loop is not loop:
-            # Per engine, times the fleet: two nodes carry twice the work at
-            # the same pressure each. `settings.asr_base_urls` is never empty
-            # (config falls back to the single URL), so this is at least one.
-            self._sem = asyncio.Semaphore(
-                max(1, settings.asr_max_concurrent) * max(1, len(settings.asr_base_urls))
-            )
+            self._sem = asyncio.Semaphore(self._size())
             self._loop = loop
         return self._sem
 
@@ -467,6 +564,27 @@ class _Pool:
 
 
 POOL = _Pool()
+
+
+class _BatchPool(_Pool):
+    """Admission for BATCH transcription (video analysis).
+
+    A separate pool from dictation's: the engine decodes one clip at a
+    time, so a video's windows sent through the dictation pool would hold
+    its slots and a person pressing the microphone would be told "busy"
+    after eight seconds. The size is `VIDEO_ASR_CONCURRENCY` — two by
+    default, one clip per Spark, spread by the router's least-active order
+    so a 10-minute recording is transcribed on both nodes at once. The
+    chat model is tensor-parallel across both Sparks and slows while either
+    engine decodes; the video job pays for that by pacing itself against
+    live chat before every clip (video.pipeline.pace), not by idling a GPU.
+    """
+
+    def _size(self) -> int:
+        return max(1, settings.video_asr_concurrency)
+
+
+BATCH_POOL = _BatchPool()
 
 _provider: Optional[ASRProvider] = None
 
@@ -528,5 +646,32 @@ async def transcribe(
         "asr_detected_language_total",
         "identified languages",
         language=result.language or "unknown",
+    )
+    return result
+
+
+async def transcribe_segments(
+    audio: bytes, *, filename: str, content_type: str, no_speech_check: bool = True
+) -> TranscriptSegments:
+    """One clip of a longer recording -> timestamped segments, under the
+    BATCH pool. Video analysis's door to the speech engine; dictation never
+    comes through here and is never queued behind it."""
+    started = time.perf_counter()
+    async with BATCH_POOL:
+        try:
+            result = await provider().transcribe_segments(
+                audio,
+                filename=filename,
+                content_type=content_type,
+                no_speech_check=no_speech_check,
+            )
+        except Exception:
+            metrics.inc("asr_batch_requests_total", "batch transcription clips", result="fail")
+            raise
+    metrics.inc("asr_batch_requests_total", "batch transcription clips", result="ok")
+    metrics.observe(
+        "asr_batch_request_duration_seconds",
+        time.perf_counter() - started,
+        "wall clock for one batch clip, orchestrator side",
     )
     return result

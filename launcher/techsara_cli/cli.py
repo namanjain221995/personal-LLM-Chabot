@@ -31,6 +31,7 @@ from .environment import (
     main_context_notices,
     prepare_local_secrets,
     profile_context_length,
+    remote_ocr_url,
 )
 from .errors import PrerequisiteError, TechSaraError
 from .hardware import HardwareInfo, detect_hardware
@@ -260,7 +261,17 @@ def _compose_profiles(profile: SelectedProfile, user_env: Mapping[str, str], *, 
         profiles.append("embeddings")
     if _has_reranker_service(profile):
         profiles.append("reranker")
-    if profile.ocr_model and profile.features.get("ocr") and not skip_ocr:
+    # The head runs its own vllm-ocr only while nothing else does: with
+    # OCR_REMOTE_BASE_URL recorded by scripts/ocr.sh the engine lives on the
+    # other node, and enabling the profile here would start a second copy on
+    # the machine the operator just freed 17 GB on. OCR stays ON either way;
+    # the generated OCR_BASE_URL says where.
+    if (
+        profile.ocr_model
+        and profile.features.get("ocr")
+        and not skip_ocr
+        and not remote_ocr_url(user_env)
+    ):
         profiles.append("ocr")
     search_provider = (user_env.get("SEARCH_PROVIDER") or "searxng").strip().lower()
     if (_yes(user_env.get("SEARCH_ENABLED")) and search_provider == "searxng") or "search" in requested:
@@ -277,6 +288,7 @@ def _desired_optional_services(
     salesforce_ready: bool,
 ) -> set[str]:
     desired: set[str] = set()
+    enabled_profiles = set(compose_profiles)
     if profile.family == "nvidia":
         desired.add("vllm")
         if not profile.router_shared and profile.router_model:
@@ -285,11 +297,14 @@ def _desired_optional_services(
             desired.add("vllm-embed")
         if _has_reranker_service(profile):
             desired.add("vllm-reranker")
-        if profile.ocr_model and profile.features.get("ocr"):
+        # Wanted only while its Compose profile is enabled (_compose_profiles
+        # drops it for a remote engine), so that reconcile() STOPS a head
+        # vllm-ocr that is still running from before scripts/ocr.sh moved the
+        # engine -- which is how `techsara up` retires it.
+        if profile.ocr_model and profile.features.get("ocr") and "ocr" in enabled_profiles:
             desired.add("vllm-ocr")
     elif profile.family == "cpu":
         desired.add("llama-cpp")
-    enabled_profiles = set(compose_profiles)
     if "search" in enabled_profiles:
         desired.add("searxng")
     if "admin" in enabled_profiles:
@@ -654,6 +669,7 @@ def _cmd_up_dry(args: argparse.Namespace, *, root: Path) -> int:
             salesforce_ready=has_salesforce_credentials(effective),
             search_enabled="search" in profiles, dry_run=True,
             endpoints=_local_endpoints(generated, user_env),
+            ocr_remote=bool(remote_ocr_url(user_env)),
         )
     _print_selection(hardware, profile, installs, context=_served_context(generated, profile))
     print("\nPlan validated; no services, persistent runtime state, runtimes, or downloads were changed.")
@@ -878,6 +894,7 @@ def _start_compose(
     dry_run: bool,
     endpoints: Mapping[str, str] | None = None,
     root: Path | None = None,
+    ocr_remote: bool = False,
 ) -> dict[str, Any]:
     orchestrator_base = (endpoints or {}).get("orchestrator", "http://127.0.0.1:8080")
     if dry_run:
@@ -1011,7 +1028,30 @@ def _start_compose(
                 )
                 compose.stop_service("vllm-router")
                 router_fallback = True
-        if profile.ocr_model and profile.features.get("ocr"):
+        if profile.ocr_model and profile.features.get("ocr") and ocr_remote:
+            # The engine is scripts/ocr.sh's, on the other node. It is probed
+            # the way every engine is -- from inside the orchestrator image,
+            # over the path the orchestrator will actually use -- and never
+            # started or stopped from here: its lifecycle belongs to that
+            # script, and there is no head service to stop when it fails.
+            try:
+                _step(
+                    f"OCR: remote engine at {generated['OCR_BASE_URL']} (scripts/ocr.sh); "
+                    "probing it instead of starting vllm-ocr here..."
+                )
+                record_probe(
+                    "ocr", generated["OCR_BASE_URL"], generated["OCR_MODEL"], kind="ocr"
+                )
+            except TechSaraError:
+                record_failed_probe(
+                    "ocr", generated["OCR_BASE_URL"], generated["OCR_MODEL"], kind="ocr"
+                )
+                _step(
+                    "OCR: the remote engine did not answer; OCR is disabled for this run "
+                    "(scripts/ocr.sh status, then ./techsara up again)"
+                )
+                disable_role("ocr")
+        elif profile.ocr_model and profile.features.get("ocr"):
             try:
                 _step("Starting the OCR model (vllm-ocr)...")
                 compose.up_service("vllm-ocr")
@@ -1265,6 +1305,7 @@ def _cmd_up(args: argparse.Namespace, *, root: Path) -> int:
             compose, profile, generated, salesforce_ready=salesforce_ready,
             search_enabled="search" in profiles, dry_run=args.dry_run,
             endpoints=endpoints, root=root,
+            ocr_remote=bool(remote_ocr_url(user_env)),
         )
         combined_capability_results = list(capability_results)
         docker_capability_results = result.get("capability_results", [])

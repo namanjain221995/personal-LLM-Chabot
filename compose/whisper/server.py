@@ -6,7 +6,9 @@ are REPLICAS: each holds the whole model and answers whole clips, and neither
 knows the other exists. Balancing between them is the orchestrator's job
 (`RoutedProvider` in orchestrator/app/asr.py), not this file's.
 
-    POST /v1/audio/transcriptions   multipart: file, [model], [language]
+    POST /v1/audio/transcriptions   multipart: file, [model], [language],
+                                    [response_format=json|text|verbose_json],
+                                    [no_speech_check=true|false]
     GET  /health                    readiness, and what is actually loaded
     GET  /v1/models                 the one model, for tooling that asks
 
@@ -329,13 +331,30 @@ def _iso_code(language: Optional[str]) -> Optional[str]:
     return None
 
 
-def _run(audio: np.ndarray, language: Optional[str]) -> dict:
-    """One transcription, on the GPU, in this thread."""
+def _run(
+    audio: np.ndarray,
+    language: Optional[str],
+    *,
+    segments: bool = False,
+    no_speech_check: bool = True,
+) -> dict:
+    """One transcription, on the GPU, in this thread.
+
+    `segments` asks for timestamped segments in the reply (the caller wants
+    them for subtitles, chapters or a searchable index — video analysis does).
+    `no_speech_check=False` skips the silence gate: the gate judges the FIRST
+    thirty seconds, which is right for a dictation clip and wrong for a window
+    cut out of a longer recording by a voice-activity detector that has
+    already decided there is speech in it — a window that opens on a pause
+    would otherwise come back empty, with everything said after the pause
+    silently lost. A caller that has run its own VAD says so and takes the
+    responsibility.
+    """
     pipe = _state["pipe"]
     seconds = audio.size / SAMPLE_RATE
 
-    silence = _no_speech_probability(audio)
-    if silence > NO_SPEECH_THRESHOLD:
+    silence = _no_speech_probability(audio) if no_speech_check else 0.0
+    if no_speech_check and silence > NO_SPEECH_THRESHOLD:
         # Nothing was said. An empty draft is the honest answer: the composer
         # leaves whatever the person had already typed alone, which is exactly
         # what should happen when they pressed the microphone and then did not
@@ -343,6 +362,7 @@ def _run(audio: np.ndarray, language: Optional[str]) -> dict:
         return {
             "text": "", "language": None, "language_code": None,
             "duration": round(seconds, 3), "no_speech_prob": round(silence, 4),
+            "segments": [],
         }
 
     generate_kwargs: dict = {
@@ -378,7 +398,7 @@ def _run(audio: np.ndarray, language: Optional[str]) -> dict:
     # than 3000 mel input features ... Please either pass return_timestamps".
     # That is not a hypothetical; it is what this service did on its first
     # deploy, and it is why the boundary is >= rather than >.
-    if seconds >= 30.0:
+    if seconds >= 30.0 or segments:
         kwargs["return_timestamps"] = True
 
     result = pipe({"raw": audio, "sampling_rate": SAMPLE_RATE}, **kwargs)
@@ -392,13 +412,49 @@ def _run(audio: np.ndarray, language: Optional[str]) -> dict:
             if chunk.get("language"):
                 detected = str(chunk["language"])
                 break
-    return {
+    out = {
         "text": text,
         "language": detected,
         "language_code": _iso_code(detected),
         "duration": round(seconds, 3),
         "no_speech_prob": round(silence, 4),
     }
+    if segments:
+        out["segments"] = _segments(result.get("chunks") or [], seconds)
+    return out
+
+
+def _segments(chunks: list, seconds: float) -> list:
+    """transformers' chunks -> OpenAI verbose_json-shaped segments.
+
+    Each chunk carries `timestamp: (start, end)` in seconds from the start of
+    THIS clip. `end` is None when the model ran out of audio mid-segment (the
+    last one, usually) — the clip's own length is the honest end. The
+    sequential long-form algorithm can also emit a segment that begins before
+    the previous one ended when a window boundary falls inside a word; those
+    are kept in order and clamped so `start <= end` always holds, because a
+    subtitle file with a negative-length cue is a broken file.
+    """
+    out = []
+    prev_end = 0.0
+    for i, chunk in enumerate(chunks):
+        text = (chunk.get("text") or "").strip()
+        if not text:
+            continue
+        ts = chunk.get("timestamp") or (None, None)
+        start = ts[0] if ts[0] is not None else prev_end
+        end = ts[1] if ts[1] is not None else seconds
+        start = max(0.0, min(float(start), seconds))
+        end = max(start, min(float(end), seconds))
+        out.append({
+            "id": i,
+            "start": round(start, 3),
+            "end": round(end, 3),
+            "text": text,
+            "language": _iso_code(chunk.get("language")) if chunk.get("language") else None,
+        })
+        prev_end = end
+    return out
 
 
 @app.get("/health")
@@ -434,8 +490,15 @@ async def transcriptions(
     # deployment does not have.
     model: str = Form(default=MODEL_ID),
     language: Optional[str] = Form(default=None),
+    # "json" (text only), "text" (a plain-text body) or "verbose_json" —
+    # OpenAI's name for the shape that also carries timestamped segments.
     response_format: str = Form(default="json"),
+    # Off only for callers that ran their own voice-activity detection over a
+    # longer recording; see `_run`. Dictation leaves it on.
+    no_speech_check: bool = Form(default=True),
 ) -> JSONResponse:
+    if response_format not in ("json", "text", "verbose_json"):
+        raise HTTPException(status_code=400, detail=f"unknown response_format {response_format!r}")
     if not _state["ready"]:
         raise HTTPException(
             status_code=503,
@@ -459,7 +522,15 @@ async def transcriptions(
 
     async with _gpu_lock:
         try:
-            result = await loop.run_in_executor(None, _run, audio, _language_arg(language))
+            result = await loop.run_in_executor(
+                None,
+                lambda: _run(
+                    audio,
+                    _language_arg(language),
+                    segments=(response_format == "verbose_json"),
+                    no_speech_check=no_speech_check,
+                ),
+            )
         except HTTPException:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -469,6 +540,8 @@ async def transcriptions(
     result["processing_ms"] = int((time.perf_counter() - started) * 1000)
     if response_format == "text":
         return JSONResponse(content=result["text"], media_type="text/plain")
+    if response_format == "verbose_json":
+        result["task"] = "transcribe"
     return JSONResponse(content=result)
 
 

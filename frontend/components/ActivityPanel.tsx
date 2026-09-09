@@ -16,6 +16,7 @@ import type {
   Research,
   ResearchRun,
   WebSource,
+  VideoActivity,
 } from '@/lib/types';
 import { documentReadView } from '@/lib/documentActivity';
 import { AgentTimeline } from './AgentTimeline';
@@ -26,7 +27,18 @@ import {
   QueryGroup,
 } from './ResearchPanel';
 import { WebSources } from './WebSources';
-import { IconBook, IconBulb, IconFileText, IconGlobe, IconX } from './icons';
+import { IconBook, IconBulb, IconFileText, IconGlobe, IconPlay, IconX } from './icons';
+
+/** m:ss, or h:mm:ss past an hour — the same shape the answers cite. */
+function formatClock(seconds: number): string {
+  const s = Math.max(0, Math.round(seconds));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  return h
+    ? `${h}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`
+    : `${m}:${String(sec).padStart(2, '0')}`;
+}
 
 export function ActivityPanel({
   open,
@@ -38,6 +50,7 @@ export function ActivityPanel({
   researchRun,
   sources,
   documentRead,
+  video,
 }: {
   open: boolean;
   onClose: () => void;
@@ -54,6 +67,9 @@ export function ActivityPanel({
   sources?: WebSource[];
   /** 2026-08-07: the uploaded document that was read — every page shown. */
   documentRead?: DocumentActivity;
+  /** 2026-09-09: the videos the answer drew on — chapters and the evidence
+      it cited, with timestamps. */
+  video?: VideoActivity;
 }) {
   const closeRef = useRef<HTMLButtonElement>(null);
 
@@ -193,6 +209,87 @@ export function ActivityPanel({
               </section>
             );
           })()}
+
+        {video && video.videos.length > 0 && (
+          <section aria-label="Video">
+            <h3 className="flex items-center gap-1.5 text-[11px] font-medium uppercase tracking-wide text-faint">
+              <IconPlay size={12} />
+              Video
+            </h3>
+            <div className="mt-2 flex flex-col gap-3">
+              {video.videos.map((v) => (
+                <div key={v.analysis_id} className="rounded-ts border border-border bg-surface px-3 py-2">
+                  <div className="flex items-baseline justify-between gap-2">
+                    <span className="truncate text-xs text-ink">{v.filename}</span>
+                    <span className="shrink-0 text-[11px] text-faint">
+                      {formatClock(v.duration_s)}
+                      {v.content_type && v.content_type !== 'other'
+                        ? ` · ${v.content_type.replace('_', ' ')}`
+                        : ''}
+                      {v.language ? ` · ${v.language}` : ''}
+                    </span>
+                  </div>
+                  {v.status !== 'done' && (
+                    <p className="mt-1 text-[11px] text-danger">
+                      Analysis {v.status}
+                      {v.error ? ` — ${v.error}` : ''}
+                    </p>
+                  )}
+                  {v.counts && (
+                    <p className="mt-1 text-[11px] text-faint">
+                      {[
+                        v.counts.segments != null ? `${v.counts.segments} speech segments` : null,
+                        v.counts.frames_kept != null ? `${v.counts.frames_kept} frames read` : null,
+                        v.counts.captions != null ? `${v.counts.captions} described` : null,
+                      ]
+                        .filter(Boolean)
+                        .join(' · ')}
+                    </p>
+                  )}
+                  {v.chapters && v.chapters.length > 0 && (
+                    <ol className="mt-2 flex flex-col gap-0.5">
+                      {v.chapters.map((c, i) => (
+                        <li key={i} className="flex gap-2 text-[12px] leading-snug text-muted">
+                          <span className="shrink-0 font-mono text-[11px] text-faint">
+                            {formatClock(c.start)}
+                          </span>
+                          <span>{c.title}</span>
+                        </li>
+                      ))}
+                    </ol>
+                  )}
+                </div>
+              ))}
+              {video.evidence && video.evidence.length > 0 && (
+                <details className="rounded-ts border border-border bg-surface px-3 py-2">
+                  <summary className="cursor-pointer text-[11px] font-medium uppercase tracking-wide text-faint">
+                    Evidence cited ({video.evidence.length})
+                  </summary>
+                  <ul className="mt-2 flex flex-col gap-1.5">
+                    {video.evidence.map((e, i) => (
+                      <li key={i} className="text-[12px] leading-snug text-muted">
+                        <span className="font-mono text-[11px] text-faint">
+                          [{formatClock(e.start)}]
+                        </span>{' '}
+                        <span className="uppercase text-[10px] tracking-wide text-faint">
+                          {e.modality === 'speech' ? 'said' : 'on screen'}
+                        </span>{' '}
+                        {e.text}
+                      </li>
+                    ))}
+                  </ul>
+                </details>
+              )}
+              {video.vision && (
+                <p className="text-[11px] text-faint">
+                  Frames were described by the router vision model; the main model
+                  looked at {video.frames_shown?.length ?? 0} frame
+                  {(video.frames_shown?.length ?? 0) === 1 ? '' : 's'} for this answer.
+                </p>
+              )}
+            </div>
+          </section>
+        )}
 
         {steps && steps.length > 0 && (
           // The card carries its own "Agent plan" header — no section

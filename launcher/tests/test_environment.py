@@ -487,6 +487,72 @@ class GeneratedEnvironmentTests(EnvironmentCase):
         self.assertEqual(values["MAIN_CONTEXT_LENGTH"], str(profile.main_model.context_limit))
 
 
+class RemoteOcrEngineTests(EnvironmentCase):
+    """OCR_REMOTE_BASE_URL: the engine scripts/ocr.sh started on the other node.
+
+    The key moves exactly one thing -- where the orchestrator sends pages --
+    and nothing else: OCR stays on, the model stays pinned, every capability
+    value stays what the head's engine would have produced.
+    """
+
+    REMOTE = "http://192.168.9.68:30004/v1"
+
+    def _generate(self, user_environment: dict[str, str], *, skip_ocr: bool = False) -> dict[str, str]:
+        profile = select_profile(nvidia(128, dgx=True), REPO_ROOT)
+        cache = self.root / "cache"
+        return build_generated_environment(
+            self.layout,
+            profile,
+            self.installs(profile, cache),
+            cache_root=cache,
+            skip_ocr=skip_ocr,
+            user_environment={"CLUSTER_MODE": "single", **user_environment},
+        )
+
+    def test_a_recorded_engine_replaces_only_the_address(self) -> None:
+        head = self._generate({})
+        remote = self._generate({"OCR_REMOTE_BASE_URL": self.REMOTE + "/"})
+        self.assertEqual(head["OCR_BASE_URL"], "http://vllm-ocr:30004/v1")
+        self.assertEqual(remote["OCR_BASE_URL"], self.REMOTE)
+        changed = {key for key in set(head) | set(remote) if head.get(key) != remote.get(key)}
+        self.assertEqual(changed, {"OCR_BASE_URL"})
+        self.assertEqual(remote["OCR_ENABLED"], "true")
+        self.assertEqual(remote["OCR_MODEL"], "baidu/Unlimited-OCR")
+        self.assertEqual(remote["OCR_SUPPORTS_OCR"], "true")
+        self.assertEqual(remote["OCR_CONTEXT_LENGTH"], head["OCR_CONTEXT_LENGTH"])
+        self.assertEqual(remote["OCR_MODEL_CONTAINER_PATH"], head["OCR_MODEL_CONTAINER_PATH"])
+
+    def test_an_absent_or_blank_key_changes_nothing(self) -> None:
+        head = self._generate({})
+        for value in ("", "   "):
+            with self.subTest(value=repr(value)):
+                self.assertEqual(self._generate({"OCR_REMOTE_BASE_URL": value}), head)
+
+    def test_a_malformed_address_is_refused_by_name_before_anything_is_generated(self) -> None:
+        for bad in (
+            "192.168.9.68:30004/v1",
+            "vllm-ocr:30004",
+            "ftp://192.168.9.68:30004/v1",
+            "http://192.168.9.68:30004/v1 extra",
+            "http://192.168.9.68:30004/v1\ttab",
+            "http://192.168.9.68:30004/v1\x01",
+            "http://user:secret@192.168.9.68:30004/v1",
+            "http://",
+            "http://192.168.9.68:30004/" + "v" * 512,
+        ):
+            with self.subTest(value=bad), self.assertRaisesRegex(
+                TechSaraError, r"OCR_REMOTE_BASE_URL in \.env .*scripts/ocr\.sh"
+            ):
+                self._generate({"OCR_REMOTE_BASE_URL": bad})
+
+    def test_the_key_is_validated_even_when_ocr_is_skipped_and_then_changes_nothing(self) -> None:
+        with self.assertRaisesRegex(TechSaraError, "OCR_REMOTE_BASE_URL"):
+            self._generate({"OCR_REMOTE_BASE_URL": "not a url"}, skip_ocr=True)
+        skipped = self._generate({}, skip_ocr=True)
+        self.assertEqual(skipped["OCR_ENABLED"], "false")
+        self.assertEqual(self._generate({"OCR_REMOTE_BASE_URL": self.REMOTE}, skip_ocr=True), skipped)
+
+
 class ClusterEnvironmentTests(EnvironmentCase):
     """Two-node DGX Spark cluster keys are generated only when requested."""
 

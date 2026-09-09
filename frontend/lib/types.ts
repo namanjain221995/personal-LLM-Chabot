@@ -25,7 +25,10 @@ export type Engine =
   | 'deep_research'
   | 'url'
   | 'repo'
-  | 'clarify';
+  | 'clarify'
+  // 2026-09-09: a video attached to the chat — transcribed, read off the
+  // screen, summarised, then answered with [m:ss] citations.
+  | 'video';
 
 /**
  * Historically two models. There is now ONE (Qwen3.6-35B-A3B) and the picker
@@ -157,7 +160,42 @@ export interface MessageAttachment {
       persisted before the upload response arrived. */
   id?: string;
   name: string;
-  kind: 'dataset' | 'pdf';
+  kind: 'dataset' | 'pdf' | 'video';
+}
+
+/** 2026-09-09: what the video engine did, small enough to ride on meta. */
+export interface VideoChapter {
+  start: number;
+  title: string;
+}
+export interface VideoActivityItem {
+  analysis_id: number;
+  filename: string;
+  upload_id?: string | null;
+  status: 'queued' | 'running' | 'done' | 'failed' | string;
+  error?: string;
+  duration_s: number;
+  content_type?: string;
+  language?: string | null;
+  has_audio?: boolean | null;
+  counts?: Record<string, number | null | undefined>;
+  chapters?: VideoChapter[];
+  stages?: Record<string, { status?: string; ms?: number | null }>;
+}
+export interface VideoEvidence {
+  start: number;
+  end: number;
+  modality: 'speech' | 'screen' | 'visual' | string;
+  analysis_id: number;
+  text: string;
+}
+export interface VideoActivity {
+  /** Which readers saw the frames: 'main+router' means captions came from
+      the router vision model and the main model looked at frames on demand. */
+  vision?: string;
+  videos: VideoActivityItem[];
+  evidence?: VideoEvidence[];
+  frames_shown?: number[];
 }
 
 /**
@@ -244,6 +282,8 @@ export interface Meta {
   /** 2026-08-07: what the document engine read — shown in the Activity
       panel (filename, page count, OCR'd pages, per-page text excerpts). */
   document?: DocumentActivity;
+  /** 2026-09-09: what the video engine understood and cited. */
+  video?: VideoActivity;
   /** Phase 1: web-search sources for the answer's [n] citations. */
   sources?: WebSource[];
   /** Phase 1: set when search was requested but unavailable. */

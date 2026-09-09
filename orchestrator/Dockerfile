@@ -26,6 +26,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # C libraries plus fonts.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         pandoc \
+        ffmpeg \
         libpango-1.0-0 \
         libpangoft2-1.0-0 \
         libpangocairo-1.0-0 \

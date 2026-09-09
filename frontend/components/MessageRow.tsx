@@ -61,6 +61,7 @@ import {
   IconRefresh,
   IconThumbDown,
   IconThumbUp,
+  IconPlay,
 } from './icons';
 
 /**
@@ -613,7 +614,7 @@ function MessageRowImpl({
             // and re-attaches the right file. The single-pdfName block below
             // keeps rendering one-document and legacy messages unchanged.
             const docEntries = (message.meta?.attachments ?? []).filter(
-              (a) => a.kind === 'pdf',
+              (a) => a.kind === 'pdf' || a.kind === 'video',
             );
             if (docEntries.length <= 1) return null;
             return (
@@ -636,9 +637,15 @@ function MessageRowImpl({
                     )}
                     className="inline-flex items-center gap-2 rounded-2xl border border-border bg-surface-2 py-1.5 pl-1.5 pr-3 text-left transition-colors duration-ts hover:border-accent/50 hover:bg-surface focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
                   >
-                    <span className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-danger/15 text-danger">
-                      <IconFileText size={16} />
-                    </span>
+                    {entry.kind === 'video' ? (
+                      <span className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-accent/15 text-accent">
+                        <IconPlay size={16} />
+                      </span>
+                    ) : (
+                      <span className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-danger/15 text-danger">
+                        <IconFileText size={16} />
+                      </span>
+                    )}
                     <span className="flex flex-col">
                       <span className="max-w-[220px] truncate text-xs text-ink">
                         {entry.name ?? `Document ${i + 1}`}
@@ -653,8 +660,9 @@ function MessageRowImpl({
             );
           })()}
           {message.pdfName &&
-            ((message.meta?.attachments ?? []).filter((a) => a.kind === 'pdf')
-              .length ?? 0) <= 1 && (
+            ((message.meta?.attachments ?? []).filter(
+              (a) => a.kind === 'pdf' || a.kind === 'video',
+            ).length ?? 0) <= 1 && (
             <div className="mb-1.5 flex flex-col items-end">
               {/* Same chip, now a real control (NEW-09). The classes below are
                   the ones it already had; only the hover tint and the focus
@@ -676,9 +684,15 @@ function MessageRowImpl({
                 )}
                 className="inline-flex items-center gap-2 rounded-2xl border border-border bg-surface-2 py-1.5 pl-1.5 pr-3 text-left transition-colors duration-ts hover:border-accent/50 hover:bg-surface focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
               >
-                <span className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-danger/15 text-danger">
-                  <IconFileText size={16} />
-                </span>
+                {message.meta?.attachments?.[0]?.kind === 'video' ? (
+                  <span className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-accent/15 text-accent">
+                    <IconPlay size={16} />
+                  </span>
+                ) : (
+                  <span className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-danger/15 text-danger">
+                    <IconFileText size={16} />
+                  </span>
+                )}
                 <span className="flex flex-col">
                   <span className="max-w-[220px] truncate text-xs text-ink">
                     {message.pdfName}
@@ -832,7 +846,11 @@ function MessageRowImpl({
               {uploadStatus === 'uploading' ? (
                 <>
                   <Loader size={16} />
-                  <span className="text-muted">Uploading dataset…</span>
+                  <span className="text-muted">
+                    {message.meta?.attachments?.some((a) => a.kind === 'video')
+                      ? 'Uploading video…'
+                      : 'Uploading dataset…'}
+                  </span>
                 </>
               ) : (
                 <>
@@ -868,7 +886,8 @@ function MessageRowImpl({
     steps.length > 0 ||
     Boolean(research && countSources(research) > 0) ||
     Boolean(webSources?.length) ||
-    Boolean(message.meta?.document);
+    Boolean(message.meta?.document) ||
+    Boolean(message.meta?.video?.videos?.length);
   // Salesforce Intelligence Mode: the live phase, or the one the finished
   // answer ended on. Only the LIVE one animates — a reopened chat shows the
   // final phase as history, not as work still in progress.
@@ -1155,6 +1174,7 @@ function MessageRowImpl({
 
           <ActivityPanel
             documentRead={message.meta?.document}
+            video={message.meta?.video}
             open={activityOpen}
             onClose={() => setActivityOpen(false)}
             reasoning={reasoningText || undefined}

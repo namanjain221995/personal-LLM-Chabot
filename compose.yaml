@@ -197,6 +197,20 @@ services:
       ASR_MAX_UPLOAD_BYTES: ${ASR_MAX_UPLOAD_BYTES:-33554432}
       ASR_MAX_CONCURRENT: ${ASR_MAX_CONCURRENT:-2}
       ASR_RATE_PER_MIN: ${ASR_RATE_PER_MIN:-20}
+      # Document OCR. OCR_BASE_URL IS LISTED HERE ON PURPOSE, even though
+      # `env_file` carries the generated one: scripts/ocr.sh can move the
+      # engine to the worker and records where in .env (OCR_REMOTE_BASE_URL),
+      # and that address must win over the head's `vllm-ocr` address in
+      # generated.env -- which, as the LAST env_file, would otherwise outrank
+      # it. `environment:` OVERRIDES `env_file`, so naming it here is what
+      # lets the remote engine take effect on a plain recreate of this
+      # service, before `./techsara up` has regenerated anything. With the
+      # key unset or empty the generated address governs, exactly as before.
+      OCR_BASE_URL: ${OCR_REMOTE_BASE_URL:-${OCR_BASE_URL:-http://disabled.invalid/v1}}
+      # Video understanding (2026-09-09). Off unless .env says otherwise: the
+      # composer hides the picker when this is false (folded into /auth/me).
+      # Every other VIDEO_* knob reaches the container through env_file.
+      VIDEO_ANALYSIS_ENABLED: ${VIDEO_ANALYSIS_ENABLED:-false}
     volumes:
       - data:/data
       # The Salesforce brain packs, read-only and LIVE: core/brain.py re-reads

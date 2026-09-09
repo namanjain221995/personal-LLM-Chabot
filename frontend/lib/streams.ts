@@ -563,6 +563,11 @@ export interface StartStreamOptions {
    */
   pdfUploads?: { upload_id: string; name: string }[] | null;
   /**
+   * 2026-09-09: videos that streamed to /api/upload (purpose=video). The
+   * orchestrator attaches to the analysis job it started at upload time.
+   */
+  videoUploads?: { upload_id: string; name: string }[] | null;
+  /**
    * NEW-14: this turn has an uploaded dataset.
    *
    * A flag rather than a payload, because that is genuinely all there is to
@@ -657,6 +662,7 @@ export async function startStream(opts: StartStreamOptions): Promise<void> {
           ? { pdf: opts.pdf, pdf_filename: opts.pdfName ?? undefined }
           : {}),
         ...(opts.pdfUploads?.length ? { pdf_uploads: opts.pdfUploads } : {}),
+        ...(opts.videoUploads?.length ? { video_uploads: opts.videoUploads } : {}),
         // NEW-14. Sent only when true, so every other request keeps exactly
         // the key set it had — this is a proxy hint, not part of the contract
         // with the orchestrator, which never sees it.

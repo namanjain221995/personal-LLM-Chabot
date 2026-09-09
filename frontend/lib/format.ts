@@ -79,6 +79,16 @@ const FILE_KIND: Record<string, { label: string; className: string }> = {
   pdf: { label: 'PDF', className: 'file-icon-pdf' },
   xlsx: { label: 'XLS', className: 'file-icon-xlsx' },
   csv: { label: 'CSV', className: 'file-icon-csv' },
+  // 2026-09-09: video transcripts and their siblings.
+  srt: { label: 'SRT', className: 'file-icon-other' },
+  vtt: { label: 'VTT', className: 'file-icon-other' },
+  txt: { label: 'TXT', className: 'file-icon-other' },
+  json: { label: 'JSON', className: 'file-icon-other' },
+  md: { label: 'MD', className: 'file-icon-other' },
+  mp4: { label: 'MP4', className: 'file-icon-other' },
+  webm: { label: 'WEBM', className: 'file-icon-other' },
+  mov: { label: 'MOV', className: 'file-icon-other' },
+  mkv: { label: 'MKV', className: 'file-icon-other' },
 };
 
 export function fileKind(nameOrType: string): {
