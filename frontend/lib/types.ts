@@ -279,6 +279,16 @@ export interface Meta {
    * already durable server-side, keyed by conversation.
    */
   attachments?: MessageAttachment[];
+  /**
+   * 2026-09-09: this turn was saved BEFORE its uploads finished (so a reload
+   * keeps the words and the chips), and the chat request only goes out once
+   * every upload is done. 'uploading' until that request starts, then
+   * removed; 'failed' when an upload was refused. A reload mid-upload leaves
+   * 'uploading' behind on a turn that never went out — which is exactly how
+   * a two-video turn sat under "sent" chips with no answer and no error.
+   * MessageRow reads it and says so.
+   */
+  send_state?: 'uploading' | 'failed';
   /** 2026-08-07: what the document engine read — shown in the Activity
       panel (filename, page count, OCR'd pages, per-page text excerpts). */
   document?: DocumentActivity;

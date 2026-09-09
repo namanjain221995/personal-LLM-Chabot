@@ -326,6 +326,7 @@ function MessageRowImpl({
   onShowSummary,
   onRetry,
   uploadStatus = null,
+  unsent = null,
   versions = null,
   onSelectVersion,
   onEditStart,
@@ -353,6 +354,13 @@ function MessageRowImpl({
    * anything was in progress, which read as a frozen app.
    */
   uploadStatus?: UploadStatus | null;
+  /**
+   * 2026-09-09: set on the last user turn when it was saved while its
+   * files were uploading and the request never went out (a reload). The
+   * row says which file did not make it and offers Send now when every
+   * file the turn names is on the server.
+   */
+  unsent?: { missing: string[]; kept: string[]; canResend: boolean } | null;
   /**
    * "Edit" on a USER message: rewrite it IN PLACE, ChatGPT-style.
    *
@@ -862,6 +870,29 @@ function MessageRowImpl({
               )}
             </div>
           )}
+          {unsent && (
+            <div
+              className="mt-1.5 flex flex-wrap items-center justify-end gap-2 text-xs"
+              role="status"
+              data-testid="unsent-turn"
+            >
+              <IconAlert size={13} className="shrink-0 text-danger" />
+              <span className="text-danger">
+                {unsent.canResend
+                  ? 'This message was never sent — the page closed while its files were still uploading.'
+                  : `This message was never sent — the page closed while ${listNames(unsent.missing)} ${unsent.missing.length === 1 ? 'was' : 'were'} still uploading. Attach ${unsent.missing.length === 1 ? 'it' : 'them'} again to send${unsent.kept.length ? `; ${listNames(unsent.kept)} stayed attached to this chat, so you can ask about ${unsent.kept.length === 1 ? 'it' : 'them'} now` : ''}.`}
+              </span>
+              {unsent.canResend && (
+                <button
+                  type="button"
+                  onClick={onRegenerate}
+                  className="rounded-md border border-border px-2 py-0.5 text-xs text-ink transition-colors duration-ts hover:bg-surface"
+                >
+                  Send now
+                </button>
+              )}
+            </div>
+          )}
         </div>
       </div>
     );
@@ -1209,4 +1240,10 @@ function MessageRowImpl({
  * clarification card, the row becoming last) still re-renders, because that
  * is a prop change like any other.
  */
+/** "a.mp4", "a.mp4 and b.mp4", "a.mp4, b.mp4 and c.mp4" — for the unsent notice. */
+function listNames(names: string[]): string {
+  if (names.length <= 1) return names.join('');
+  return `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
+}
+
 export const MessageRow = memo(MessageRowImpl);

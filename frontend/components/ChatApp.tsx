@@ -140,6 +140,23 @@ interface RowHandlers {
   onFeedback: (feedback: MessageFeedback | null) => void;
 }
 
+/**
+ * 2026-09-09: what to tell a person about a turn that never went out.
+ * `missing` are the files whose upload never finished (no server id — after
+ * a reload their bytes are gone with the tab); `kept` are the ones that did
+ * land, which the server has and may already have analysed.
+ */
+export function unsentTurnState(m: ChatMessage): {
+  missing: string[];
+  kept: string[];
+  canResend: boolean;
+} {
+  const atts = m.meta?.attachments ?? [];
+  const missing = atts.filter((a) => !a.id).map((a) => a.name);
+  const kept = atts.filter((a) => Boolean(a.id)).map((a) => a.name);
+  return { missing, kept, canResend: !resendOptionsFor(m).missing };
+}
+
 export function ChatApp() {
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [archived, setArchived] = useState<ConversationSummary[]>([]);
@@ -1168,6 +1185,10 @@ export function ChatApp() {
           messageId: userMessage.id,
           status: 'uploading',
         });
+        // The turn is already saved (above) so a reload keeps it; this says
+        // the request has NOT gone out yet. Cleared right before startStream.
+        userMessage.meta = { ...(userMessage.meta ?? {}), send_state: 'uploading' };
+        persist(conversationId, turns);
       } else {
         setStreaming(true);
       }
@@ -1191,34 +1212,42 @@ export function ChatApp() {
               // upload one after another on the send's critical path.
               const uploadable = [...docAttachments, ...videoAttachments];
               const refs = await Promise.all(
-                uploadable.map(async (doc) => {
+                uploadable.map(async (doc, i) => {
                   const early = doc.uploadPromise ? await doc.uploadPromise : null;
-                  if (early) return early;
-                  // Reuse paths may carry only base64; the picker always
-                  // keeps the File. Either way the server gets real bytes.
-                  const src =
-                    doc.file ??
-                    new File(
-                      [Uint8Array.from(atob(doc.base64), (c) => c.charCodeAt(0))],
-                      doc.name,
+                  let ref = early;
+                  if (!ref) {
+                    // Reuse paths may carry only base64; the picker always
+                    // keeps the File. Either way the server gets real bytes.
+                    const src =
+                      doc.file ??
+                      new File(
+                        [Uint8Array.from(atob(doc.base64), (c) => c.charCodeAt(0))],
+                        doc.name,
+                      );
+                    ref = await uploadDocumentFile(
+                      src,
+                      conversationId,
+                      doc.kind === 'video' ? 'video' : 'document',
                     );
-                  return uploadDocumentFile(
-                    src,
-                    conversationId,
-                    doc.kind === 'video' ? 'video' : 'document',
-                  );
+                  }
+                  // Link EACH file the moment it lands, not all of them once
+                  // the slowest has. A 400 MB video that never finishes must
+                  // not cost the 20 MB one next to it its identity: with the
+                  // id saved, the turn can be resent after a reload and the
+                  // analysis the server already ran stays reachable.
+                  const entry = userMessage.meta?.attachments?.[i];
+                  if (entry && !entry.id) {
+                    entry.id = ref.upload_id;
+                    persist(conversationId, turns);
+                  }
+                  return ref;
                 }),
               );
               docRefs = refs.slice(0, docAttachments.length);
               videoRefs = refs.slice(docAttachments.length);
               if (!docRefs.length) docRefs = null;
               if (!videoRefs.length) videoRefs = null;
-              refs.forEach((r, i) => {
-                const entry = userMessage.meta?.attachments?.[i];
-                if (entry) entry.id = r.upload_id;
-              });
               uploadedId = undefined; // ids already linked, one per document
-              persist(conversationId, turns);
               toast(
                 refs.length === 1
                   ? `Uploaded ${uploadable[0].name}.`
@@ -1265,14 +1294,25 @@ export function ChatApp() {
                 status: 'failed',
               });
             }
-            // Un-persist the attachment metadata: other devices must not see
-            // a card for a dataset the server never accepted. (The local
-            // pdfName chip stays, next to the error toast, as before.)
+            // Un-persist the attachment metadata the server never accepted:
+            // other devices must not see a card for a file that is not
+            // there. Files that DID land keep their card and their id. (The
+            // local pdfName chip stays, next to the error toast, as before.)
             if (userMessage.meta?.attachments) {
-              delete userMessage.meta.attachments;
-              persist(conversationId, turns);
+              const landed = userMessage.meta.attachments.filter((a) => a.id);
+              if (landed.length) userMessage.meta.attachments = landed;
+              else delete userMessage.meta.attachments;
             }
+            userMessage.meta = { ...(userMessage.meta ?? {}), send_state: 'failed' };
+            persist(conversationId, turns);
             return;
+          }
+          // Every upload is in: the request goes out now, so the turn is no
+          // longer "not sent yet". Saved before the stream opens, because a
+          // reload between the two must find the marker gone.
+          if (userMessage.meta?.send_state) {
+            delete userMessage.meta.send_state;
+            persist(conversationId, turns);
           }
           void startStream({
             conversationId,
@@ -2463,11 +2503,24 @@ export function ChatApp() {
                 // so a memoized row re-renders when its own turn changes and
                 // at no other time.
                 const on = rowHandlers(m.id);
+                // A user turn still marked "not sent yet" at the END of the
+                // thread, with nothing streaming, never went out: the page
+                // closed while its files were uploading. Say so, and offer
+                // Send now when every file it names is on the server.
+                const unsent =
+                  m.role === 'user' &&
+                  m.meta?.send_state &&
+                  i === thread.length - 1 &&
+                  !isStreaming(activeId) &&
+                  datasetUpload?.messageId !== m.id
+                    ? unsentTurnState(m)
+                    : null;
                 return (
                 <MessageRow
                   key={m.id}
                   message={m}
                   isLast={i === thread.length - 1 && m.role === 'assistant'}
+                  unsent={unsent}
                   onRegenerate={on.onRegenerate}
                   onRetry={on.onRetry}
                   onReuseAttachment={on.onReuseAttachment}
