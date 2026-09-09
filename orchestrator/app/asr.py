@@ -598,6 +598,13 @@ def provider() -> ASRProvider:
     """
     global _provider
     if _provider is None:
+        urls = [u for u in settings.asr_base_urls if u and u.strip()]
+        if not urls:
+            # Raise, never stub: a provider that answered every recording
+            # with an empty transcript would look like a microphone that
+            # hears nothing. The route turns this into a plain 503 and
+            # /audio/health into a reason an administrator can read.
+            raise ASRUnavailable("no speech engine is configured (ASR_BASE_URLS is empty)")
         engines = [
             VLLMAudioProvider(
                 base_url=url,
@@ -605,7 +612,7 @@ def provider() -> ASRProvider:
                 name=settings.asr_backend,
                 timeout_s=settings.asr_timeout_s,
             )
-            for url in settings.asr_base_urls
+            for url in urls
         ]
         # One engine still goes through the router: the code path a workspace
         # runs every day should be the one the tests exercise, not a special

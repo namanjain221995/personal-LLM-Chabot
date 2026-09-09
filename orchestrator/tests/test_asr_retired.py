@@ -46,8 +46,15 @@ APP = REPO / "orchestrator" / "app"
 WEBM = b"\x1a\x45\xdf\xa3" + b"\x00" * 8192
 
 #: The two rejected engines, by every name they were ever known by in code.
+# Written on 2026-09-08 when both engines had been removed and nothing was
+# installed; openai/whisper-large-v3 landed on both Sparks later that day
+# (scripts/whisper.sh). The guard survives with its purpose narrowed to what
+# is still true: nothing rejected comes back, and a deployment with no engine
+# fails honestly. `VLLMAudioProvider` is not on the list — it is the generic
+# OpenAI /v1/audio/transcriptions client whisper is served through, nothing
+# in it is Qwen's.
 REJECTED = (
-    "Qwen/Qwen3-ASR-1.7B", "qwen3_asr", "VLLMAudioProvider",
+    "Qwen/Qwen3-ASR-1.7B", "qwen3_asr",
     "TheStageAI/thewhisper-large-v3", "thewhisper", "TheWhisperProvider",
     "asr_thewhisper", "ASR_THEWHISPER_MODEL",
     # Never installed, but named in an abandoned migration attempt.
@@ -111,31 +118,27 @@ def test_the_rejected_provider_modules_are_gone_from_disk():
         __import__("app.asr_thewhisper")
 
 
-def test_there_is_no_backend_selector_left_to_re_select_an_engine():
-    """The multi-provider switch existed only for the evaluation. Leaving it —
-    even with one option — is a lever a stale environment can pull."""
-    assert not hasattr(asr, "BACKENDS")
-    assert not hasattr(settings, "asr_backend")
-    assert not hasattr(settings, "asr_model")
-    assert not hasattr(settings, "asr_thewhisper_model")
-
-
 def test_no_engine_specific_wire_format_survives_in_the_asr_module():
-    """Qwen's `language X<asr_text>…` contract and its language table left with
-    the engine. A parser for a model nobody runs is a trap for the next one."""
-    for gone in ("VLLMAudioProvider", "parse_chat_output", "normalise_language",
-                 "SUPPORTED_LANGUAGES", "language_code"):
-        assert not hasattr(asr, gone), f"{gone} outlived its engine"
+    """Qwen's `language X<asr_text>…` contract left with the engine. A parser
+    for a model nobody runs is a trap for the next one. (`normalise_language`,
+    `SUPPORTED_LANGUAGES` and `language_code` are whisper's own language
+    table and its name-to-ISO helper, checked against the engine's reply —
+    they belong to the engine that IS installed.)"""
+    assert not hasattr(asr, "parse_chat_output"), "parse_chat_output outlived its engine"
 
 
-def test_provider_refuses_rather_than_returning_a_stub():
+def test_provider_refuses_rather_than_returning_a_stub(monkeypatch):
     """A stub that answered every recording with an empty string would look
     like a working microphone that never hears anything. Raising is the honest
     failure, and the route already turns it into a sentence."""
+    monkeypatch.setattr(settings, "asr_base_urls", ())
     asr.set_provider(None)
-    with pytest.raises(asr.ASRUnavailable) as caught:
-        asr.provider()
-    assert "no speech engine is configured" in str(caught.value)
+    try:
+        with pytest.raises(asr.ASRUnavailable) as caught:
+            asr.provider()
+        assert "no speech engine is configured" in str(caught.value)
+    finally:
+        asr.set_provider(None)
 
 
 def test_the_next_engine_can_still_be_installed_without_touching_this_module():
@@ -174,14 +177,15 @@ def test_voice_input_is_disabled_by_default():
     assert Settings().asr_enabled is False
 
 
-def test_no_stale_endpoint_is_left_pointing_at_a_closed_port():
-    """Both engines' ports were closed on the worker. A default that still
-    named one would send audio nowhere and wait for the timeout."""
+def test_no_default_points_at_a_retired_engines_port(monkeypatch):
+    """Qwen3-ASR listened on 30006 and that port is closed. Whisper listens
+    on 30007 on both Sparks and IS the documented default (the worker's
+    engine), so only the retired port is forbidden here."""
+    for key in ("ASR_BASE_URL", "ASR_BASE_URLS"):
+        monkeypatch.delenv(key, raising=False)
     fresh = Settings()
-    assert fresh.asr_base_url == ""
-    assert fresh.asr_base_urls == ()
-    for port in ("30006", "30007"):
-        assert port not in fresh.asr_base_url
+    assert "30006" not in fresh.asr_base_url
+    assert all("30006" not in url for url in fresh.asr_base_urls)
 
 
 def test_the_route_is_still_mounted_for_the_next_engine():
@@ -214,6 +218,7 @@ def test_a_stale_environment_that_still_enables_voice_gets_a_sentence(
     removal. That must produce the ordinary 503 and a readable sentence, not a
     500 with a stack-trace id."""
     monkeypatch.setattr(settings, "asr_enabled", True)
+    monkeypatch.setattr(settings, "asr_base_urls", ())  # the no-engine case, not the live fleet
     asr.set_provider(None)
     audio_api.reset_for_tests()
     try:
@@ -240,6 +245,7 @@ def test_the_admin_health_endpoint_says_why_rather_than_just_not_ready(
     """An administrator asking whether dictation works deserves the reason,
     not an 'enabled, not ready' that hides it."""
     monkeypatch.setattr(settings, "asr_enabled", True)
+    monkeypatch.setattr(settings, "asr_base_urls", ())  # the no-engine case, not the live fleet
     asr.set_provider(None)
     try:
         # super_admin, like the existing operational test: /audio/health is

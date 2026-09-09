@@ -5,11 +5,11 @@ measured on. It is deliberately independent of any particular model: clips
 recorded once are scored the same way by whatever engine is installed, which is
 the only way two engines measured months apart can be compared.
 
-No engine is installed right now. Two were evaluated and rejected
-(Qwen3-ASR-1.7B and TheWhisper); their runtimes are gone and voice input is
-disabled until a replacement lands. This corpus and
-[`../evaluate.py`](../evaluate.py) survived that removal because neither was
-ever about a specific model.
+Two engines were evaluated and rejected (Qwen3-ASR-1.7B and TheWhisper) and
+their runtimes are gone; openai/whisper-large-v3 has been the installed engine
+on both Sparks since 2026-09-08 (`scripts/whisper.sh`). This corpus and
+[`../evaluate.py`](../evaluate.py) outlived that turnover because neither was
+ever about a specific model — score whisper against it the same way.
 
 ## The one rule
 

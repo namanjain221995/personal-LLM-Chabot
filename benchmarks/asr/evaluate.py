@@ -24,7 +24,6 @@ as inside a container.
 from __future__ import annotations
 
 import argparse
-import base64
 import json
 import re
 import statistics
@@ -34,7 +33,7 @@ import unicodedata
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 HERE = Path(__file__).resolve().parent
 CORPUS = HERE / "corpus"
