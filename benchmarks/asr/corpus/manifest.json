@@ -1,0 +1,66 @@
+[
+  {
+    "_comment": "TEMPLATE. Every row whose id starts with 'example-' is SKIPPED by evaluate.py. Delete these rows as you add real ones. See README.md before recording anything.",
+    "id": "example-000",
+    "audio": "example-000.webm",
+    "reference": "",
+    "category": "general_english",
+    "language": "en"
+  },
+  {
+    "id": "example-general-english",
+    "audio": "clip-001.webm",
+    "reference": "Please open yesterday's candidate report.",
+    "category": "general_english",
+    "language": "en"
+  },
+  {
+    "id": "example-indian-english",
+    "audio": "clip-002.webm",
+    "reference": "Kindly revert on the same by tomorrow evening.",
+    "category": "indian_english",
+    "language": "en"
+  },
+  {
+    "id": "example-hindi",
+    "audio": "clip-003.webm",
+    "reference": "कल की मीटिंग तीन बजे रीशेड्यूल कर दो।",
+    "category": "hindi",
+    "language": "hi"
+  },
+  {
+    "id": "example-hinglish",
+    "audio": "clip-004.webm",
+    "reference": "Kal ki meeting reschedule kar do for 3 PM.",
+    "category": "hinglish",
+    "language": "hi-en"
+  },
+  {
+    "id": "example-techsara-terms",
+    "audio": "clip-005.webm",
+    "reference": "Open the Invoice__c record for the TechSara customer success SOP.",
+    "category": "techsara_terminology",
+    "language": "en"
+  },
+  {
+    "id": "example-numbers-dates",
+    "audio": "clip-006.webm",
+    "reference": "Invoice 4417 is due on 15 March 2026 for 2,50,000 rupees at 3.30 PM.",
+    "category": "numbers_dates",
+    "language": "en"
+  },
+  {
+    "id": "example-silence",
+    "audio": "clip-007.webm",
+    "reference": "",
+    "category": "silence",
+    "language": null
+  },
+  {
+    "id": "example-noisy",
+    "audio": "clip-008.webm",
+    "reference": "Can you pull the pipeline numbers for this quarter?",
+    "category": "noisy_speech",
+    "language": "en"
+  }
+]

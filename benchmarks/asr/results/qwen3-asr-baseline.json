@@ -1,0 +1,201 @@
+{
+  "_status": "RETIRED HISTORICAL BASELINE",
+  "_retired_on": "2026-09-08",
+  "_retired_note": "Qwen3-ASR-1.7B was removed from this platform on 2026-09-08 — service, image, weights, provider and configuration. This file is kept ONLY as historical evidence of what was measured while it ran. It configures nothing: no service reads it, no test requires it, and the model it describes is no longer installed. Numbers below are from 2026-09-08 on spark-2 and are not reproducible without reinstalling that engine.",
+  "_about": "Phase 0 baseline for the FROZEN Qwen3-ASR implementation. Every number here was measured on 2026-09-08 against the live engine; nothing is copied from documentation or estimated. Fields that could not be measured are null with a stated reason, never filled in with a plausible value.",
+  "model": {
+    "id": "Qwen/Qwen3-ASR-1.7B",
+    "revision": "7278e1e70fe206f11671096ffdd38061171dd6e5",
+    "revision_short": "7278e1e70fe2",
+    "license": "Apache-2.0",
+    "precision": "BF16",
+    "served_model_name": "Qwen/Qwen3-ASR-1.7B",
+    "container_path": "/models/repos/Qwen--Qwen3-ASR-1.7B--7278e1e70fe2",
+    "max_model_len": 8192,
+    "verified_from": "GET http://192.168.9.68:30006/v1/models on 2026-09-08"
+  },
+  "runtime": {
+    "engine": "vLLM (OpenAI-compatible server)",
+    "image_base": "vllm/vllm-openai:nightly",
+    "image": "techsara-asr:local",
+    "image_adds": [
+      "av",
+      "soundfile",
+      "librosa"
+    ],
+    "why_derived_image": "vLLM ships Qwen3ASRForConditionalGeneration but the audio decode path is behind the vllm[audio] extra, which the published image omits.",
+    "compose_project": "sf-local-ai-asr",
+    "compose_file": "compose/compose.asr-worker.yaml",
+    "service": "vllm-asr",
+    "network_mode": "host",
+    "restart_policy": "unless-stopped",
+    "healthcheck": "curl -fsS -m 5 http://$ASR_BIND:$ASR_PORT/v1/models",
+    "startup_command": "--model /models/repos/Qwen--Qwen3-ASR-1.7B--7278e1e70fe2 --served-model-name Qwen/Qwen3-ASR-1.7B --host $ASR_BIND --port 30006 --max-model-len 8192 --gpu-memory-utilization 0.08 --max-num-seqs 8 --limit-mm-per-prompt '{\"audio\": 1}'"
+  },
+  "hardware": {
+    "cluster_mode": "dual",
+    "head": "spark-1 (NVIDIA GB10)",
+    "worker": "spark-2 (NVIDIA GB10)",
+    "asr_node": "spark-2 (worker)",
+    "why_the_worker": "The head carries the main model's TP rank 0, the vision router, the embedder, OCR and the reranker. Measured 2026-09-08: spark-1 70.01 GB GPU memory allocated, spark-2 40.44 GB."
+  },
+  "measured_at": "2026-09-08",
+  "measured_against": "http://192.168.9.68:30006/v1",
+  "measured_how": "Direct HTTP to the live engine, chat path, production decoding settings (temperature 0.0, max_tokens 1024). Audio is the model authors' published English sample (asr_en.wav, 15.1 s, 48 kHz mono), resliced by looping to the requested length, plus generated digital silence.",
+  "decoding": {
+    "path": "/v1/chat/completions",
+    "fallback_path": "/v1/audio/transcriptions",
+    "temperature": 0.0,
+    "max_tokens": 1024,
+    "language": "auto (no forced language)",
+    "note": "These are orchestrator/app/asr.py's settings verbatim. A run at different settings is not comparable."
+  },
+  "resource_baseline": {
+    "asr_process_gpu_memory_bytes": 10140000000,
+    "asr_process_gpu_memory_gb": 10.14,
+    "asr_process": "VLLM::EngineCore pid 3875691 on spark-2",
+    "source": "Prometheus dgx_gpu_process_memory_bytes, 2026-09-08",
+    "spark2_total_allocated_gb": 40.44,
+    "spark1_total_allocated_gb": 70.01,
+    "interpretation": "10.14 GB corresponds to --gpu-memory-utilization 0.08 of the GB10's 128 GB unified memory (~10.24 GB). Weights are ~4.4 GB on disk; the remainder is the engine's KV/activation reservation, which vLLM claims up front and does not release.",
+    "model_load_time_s": null,
+    "model_load_time_reason": "Not measured: the engine has been up for hours and measuring it requires a restart, which Phase 0 forbids.",
+    "vram_before_load_bytes": null,
+    "vram_before_load_reason": "Not measured: would require stopping the running engine.",
+    "cpu_memory_bytes": null,
+    "cpu_memory_reason": "Not measured: the container runs on the worker and this session has no SSH host key for it."
+  },
+  "latency": {
+    "_note": "5 repeats per length, warm engine, sequential. Median reported. Spread was under 4 % at every length, so these are stable.",
+    "first_request_ms": 1020,
+    "first_request_note": "First call of the session at 15 s of audio. Indistinguishable from the warm median (990 ms) — the engine was already loaded, so this is NOT a cold-start measurement.",
+    "by_audio_length": {
+      "5s": {
+        "median_s": 0.464,
+        "min_s": 0.459,
+        "max_s": 0.49,
+        "real_time_factor": 10.8
+      },
+      "15s": {
+        "median_s": 0.99,
+        "min_s": 0.987,
+        "max_s": 0.996,
+        "real_time_factor": 15.2
+      },
+      "30s": {
+        "median_s": 1.914,
+        "min_s": 1.909,
+        "max_s": 1.951,
+        "real_time_factor": 15.7
+      },
+      "60s": {
+        "median_s": 3.784,
+        "min_s": 3.762,
+        "max_s": 3.91,
+        "real_time_factor": 15.9
+      }
+    },
+    "p50_s": null,
+    "p95_s": null,
+    "percentile_reason": "Not reported. 5 samples per length is enough for a median and nowhere near enough for a p95; a percentile computed here would be a number people quote and nobody can defend.",
+    "silence_latency_s": {
+      "2s": 0.103,
+      "10s": 0.116
+    },
+    "fallback_path_latency_s": 1.002,
+    "fallback_path_note": "/v1/audio/transcriptions at 15 s: 1.002 s against the chat path's 0.990 s. The two paths cost the same; the chat path is preferred because it also reports the identified language."
+  },
+  "concurrency": {
+    "_note": "15-second clips, issued simultaneously, one engine. Throughput is seconds of audio transcribed per second of wall clock.",
+    "1": {
+      "wall_s": 1.011,
+      "slowest_request_s": 1.01,
+      "audio_s_per_wall_s": 14.8
+    },
+    "4": {
+      "wall_s": 0.964,
+      "slowest_request_s": 0.963,
+      "audio_s_per_wall_s": 62.2
+    },
+    "8": {
+      "wall_s": 1.131,
+      "slowest_request_s": 1.129,
+      "audio_s_per_wall_s": 106.1
+    },
+    "interpretation": "Four concurrent clips finish in the wall-clock time of one — the engine batches them. Eight cost 13 % more wall clock than one. ASR_MAX_CONCURRENT=4 per engine is therefore not protecting the ASR engine; it protects the CHAT model that shares the GPU.",
+    "cost_to_chat_model": null,
+    "cost_to_chat_model_reason": "Not re-measured. Measuring it means loading the production chat model while people are using it, which Phase 0 forbids. docs/VOICE.md records -5.8 % decode at 4 concurrent and -10.1 % at 8, measured 2026-09-04."
+  },
+  "quality": {
+    "_status": "NOT MEASURED — no benchmark corpus exists yet.",
+    "wer": null,
+    "cer": null,
+    "reason": "benchmarks/asr/corpus/ contains a manifest TEMPLATE and no audio. WER and CER require human-recorded clips with reference transcripts across the eight categories, and none exist in this repository. The scoring harness (benchmarks/asr/evaluate.py) is written, verified end to end against the live engine, and waiting on audio.",
+    "behavioural_checks": {
+      "_note": "What COULD be established without a reference corpus. These are behaviours, not accuracy scores.",
+      "language_identification_english": {
+        "result": "English",
+        "correct": true
+      },
+      "language_identification_chinese": {
+        "result": "Chinese",
+        "correct": true
+      },
+      "hallucination_on_silence_2s": {
+        "raw_output": "language None<asr_text>",
+        "text": "",
+        "hallucinated": false
+      },
+      "hallucination_on_silence_10s": {
+        "raw_output": "language None<asr_text>",
+        "text": "",
+        "hallucinated": false
+      },
+      "silence_language_handling": "The engine emits the literal token 'None' as the language on silence. app/asr.normalise_language rejects it (not in SUPPORTED_LANGUAGES) and returns null rather than inventing a language. Correct, and worth keeping when a candidate model replaces this one.",
+      "output_contract_held": true,
+      "output_contract": "language <Language><asr_text><transcript>",
+      "determinism_note": "Latency spread under 4 % across 5 repeats at each length; transcripts were byte-identical across repeats at temperature 0."
+    },
+    "failed_requests": 0,
+    "total_requests_issued": 40
+  },
+  "known_limitations": [
+    "No WER or CER: the benchmark corpus has no audio. This is the single biggest gap before any candidate model can be compared.",
+    "No Hindi, Indian-English or Hinglish measurement of any kind — the three categories this deployment was chosen for.",
+    "No cold-start / model-load time: measuring it requires restarting the engine.",
+    "No p95: 5 samples per length cannot support one.",
+    "Latency was measured with looped WAV rather than real WebM/Opus recordings. The engine decodes both through PyAV and docs/VOICE.md reports them identical, but this specific run did not re-verify that.",
+    "The reference audio is the model authors' own published sample, which a model author may have trained on. It is fit for latency and plumbing, and unfit for accuracy."
+  ],
+  "discrepancies_found": [
+    {
+      "what": "docs/VOICE.md reports 60 s of audio at 1.85 s / 32.4x real time.",
+      "measured": "3.784 s / 15.9x, five times, spread under 4 %.",
+      "assessment": "The documented 60 s row is not reproducible. The 5 s, 15 s and 30 s rows all reproduce within 8 %, and 15.9x at 60 s is the value consistent with them — real-time factor flattens with length, it does not double. The documented figure looks like a clip that was shorter than 60 s rather than a faster engine.",
+      "action": "Recorded, not corrected. Phase 0 does not edit documentation; source and runtime win, and this is the evidence."
+    },
+    {
+      "what": "docs/VOICE.md says the engine holds 'about 6 GiB while warm'.",
+      "measured": "10.14 GB (9.44 GiB) for the ASR VLLM::EngineCore process on spark-2.",
+      "assessment": "6 GiB is close to the manifest's approximate_loaded_weight_bytes (6.44 GB) — the weights. The process actually holds the full --gpu-memory-utilization 0.08 reservation, which is ~10.24 GB of the GB10's 128 GB. Both numbers are real; they measure different things, and the documented one understates the footprint a second engine would cost a node.",
+      "action": "Recorded, not corrected."
+    },
+    {
+      "what": "ASR_BASE_URLS names two engines; only one answers.",
+      "measured": "http://192.168.9.68:30006/v1 (worker) responds in 2.4 ms. http://172.17.0.1:30006/v1 (head) refuses the connection, and no ASR container runs on the head.",
+      "assessment": "Dictation still works. RoutedProvider sorts by in-flight count and both start at zero, so the healthy worker is tried first and the dead head is only reached under load, where it costs one failed connection and a 20 s stand-down. Not a fault in the code — a fleet that was started with --all-nodes and is now running one engine.",
+      "action": "Recorded. Not changed: altering ASR_BASE_URLS would change the running configuration, which is what Phase 0 froze."
+    },
+    {
+      "what": "The repository has no .env, but the running orchestrator has ASR_ENABLED=true and a full ASR configuration.",
+      "measured": "ls .env -> no such file. docker exec orchestrator env -> 11 ASR_* variables set.",
+      "assessment": "The running container holds configuration that no longer exists on disk. ASR_ENABLED defaults to false and scripts/asr.sh writes the .env that turns it on, so re-running ./techsara up today would start the orchestrator with voice input DISABLED and silently lose the feature. The container is the only copy of this configuration.",
+      "action": "Recorded and flagged as the highest-priority operational risk found in Phase 0. Not changed: creating a .env is a production configuration change."
+    }
+  ],
+  "still_needed_before_candidate_evaluation": [
+    "Human-recorded benchmark audio: >=10 clips in each of the eight categories, WebM/Opus mono from a browser MediaRecorder, with verbatim reference transcripts.",
+    "A re-run of benchmarks/asr/evaluate.py against this frozen engine once that audio exists, to fill in the WER/CER this file leaves null.",
+    "A decision on whether cold-start time matters enough to justify one controlled restart of the ASR service."
+  ]
+}

@@ -127,3 +127,23 @@ chatgptdata/
 
 # Knowledge-store backups (scripts/backup-knowledge.sh) — never committed
 backups/
+
+# ---------------------------------------------------------------------------
+# ASR benchmark audio
+#
+# benchmarks/asr/corpus/ holds the FIXED input every speech model is scored on
+# — recordings of real people saying real things, including customer and
+# candidate names. The manifest, the README and the harness are committed so
+# anyone can rebuild an equivalent corpus; the voices are not.
+#
+# Keep the audio on the benchmark host. See benchmarks/asr/corpus/README.md.
+# ---------------------------------------------------------------------------
+benchmarks/asr/corpus/*.webm
+benchmarks/asr/corpus/*.wav
+benchmarks/asr/corpus/*.ogg
+benchmarks/asr/corpus/*.opus
+benchmarks/asr/corpus/*.mp3
+benchmarks/asr/corpus/*.m4a
+benchmarks/asr/corpus/*.mp4
+benchmarks/asr/corpus/*.flac
+benchmarks/asr/corpus/*.aac
