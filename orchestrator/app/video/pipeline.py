@@ -35,7 +35,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .. import db, metrics
 from ..config import settings
@@ -270,6 +270,92 @@ async def wait_for(analysis_id: int) -> Optional[dict]:
 # ---------------------------------------------------------------- the run --
 
 
+#: Which stages may run side by side. Speech and screen never read each
+#: other's output — fusion is the first stage that needs both — so a video
+#: is transcribed on the Sparks' speech engines while its frames are cut,
+#: read and captioned on the OCR and router engines. Measured on the
+#: 10-minute meeting: the two branches were 96 s and 130 s run one after the
+#: other; side by side the job is as long as the longer one.
+_BRANCHES: Tuple[Tuple[str, ...], ...] = (("audio", "transcript"), ("frames", "ocr", "vision"))
+_PRELUDE: Tuple[str, ...] = ("probe",)
+_TAIL: Tuple[str, ...] = ("fusion", "index", "artifacts")
+
+
+class _Runner:
+    """One job's stage machinery: the cache check, the timeout, the row
+    update and the progress event, identical for every stage, so the shape
+    of the pipeline (what runs after what, and what runs together) is a
+    handful of tuples above rather than a loop body."""
+
+    def __init__(self, analysis_id: int, ctx: "_Ctx", stages: Dict[str, dict]) -> None:
+        self.analysis_id = analysis_id
+        self.ctx = ctx
+        self.stages = stages  # shared by every branch; each stage writes only its own key
+
+    async def stage(self, stage: str) -> Optional[str]:
+        """Run one stage. Returns the failure to report when the failure is
+        fatal for the job, None otherwise (done, skipped, or optional)."""
+        analysis_id, ctx, stages = self.analysis_id, self.ctx, self.stages
+        content_hash = ctx.content_hash
+        state = stages.get(stage) or {}
+        output = _OUTPUTS.get(stage)
+        cached = state.get("status") in ("done", "skipped") and (
+            output is None or os.path.exists(store.stage_path(content_hash, output))
+        )
+        if cached:
+            _publish(analysis_id, {"stage": stage, "status": state.get("status"), "percent": 100, "detail": "from an earlier run" if state.get("status") == "done" else str(state.get("detail") or ""), "elapsed_s": 0, "cached": True})
+            return None
+        stage_started = time.perf_counter()
+        _publish(analysis_id, {"stage": stage, "status": "running", "percent": 0, "detail": "", "elapsed_s": 0})
+        await db.run_in_thread(db.update_video_analysis, analysis_id, stage=stage)
+
+        async def progress(percent: Optional[float], detail: str, _stage=stage, _t0=stage_started) -> None:
+            _publish(analysis_id, {
+                "stage": _stage,
+                "status": "running",
+                "percent": None if percent is None else round(min(100.0, max(0.0, percent)), 1),
+                "detail": detail,
+                "elapsed_s": round(time.perf_counter() - _t0, 1),
+            })
+
+        try:
+            outcome = await asyncio.wait_for(
+                _STAGE_FNS[stage](ctx, progress),
+                timeout=settings.video_stage_timeout_s,
+            )
+        except asyncio.CancelledError:
+            # A shutdown. The row stays 'running' and the startup
+            # reconciliation requeues it; the stage file was never
+            # written, so this stage re-runs and nothing before it does.
+            raise
+        except asyncio.TimeoutError:
+            outcome = _StageResult(status="failed", detail=f"did not finish within {settings.video_stage_timeout_s:.0f}s")
+        except Exception as exc:  # noqa: BLE001 — recorded on the row, never a crash
+            log.exception("video %s: stage %s failed", content_hash[:12], stage)
+            outcome = _StageResult(status="failed", detail=f"{type(exc).__name__}: {str(exc)[:400]}")
+        ms = int((time.perf_counter() - stage_started) * 1000)
+        stages[stage] = {"status": outcome.status, "ms": ms, "detail": outcome.detail}
+        metrics.observe("video_stage_seconds", ms / 1000.0, "wall-clock per pipeline stage", stage=stage)
+        metrics.inc("video_stage_total", "pipeline stages finished", stage=stage, result="ok" if outcome.status != "failed" else "fail")
+        # Both branches write the whole `stages` map; each write carries the
+        # union as it stands, so the last one to land is also the most
+        # complete one.
+        fields = {"stages": dict(stages), "counts": dict(ctx.counts), **outcome.row_fields}
+        await db.run_in_thread(db.update_video_analysis, analysis_id, **fields)
+        _publish(analysis_id, {"stage": stage, "status": outcome.status, "percent": 100, "detail": outcome.detail, "elapsed_s": round(ms / 1000.0, 1)})
+        if outcome.status == "failed" and stage not in _OPTIONAL:
+            return f"{STAGE_TITLES.get(stage, stage)}: {outcome.detail}"
+        return None
+
+    async def chain(self, names: Sequence[str]) -> Optional[str]:
+        """Stages one after another; stops at the first fatal failure."""
+        for name in names:
+            failure = await self.stage(name)
+            if failure:
+                return failure
+        return None
+
+
 async def _run(analysis_id: int) -> None:
     async with _semaphore():
         row = await db.run_in_thread(db.get_video_analysis, analysis_id)
@@ -300,53 +386,20 @@ async def _run(analysis_id: int) -> None:
         # the version bump said not to trust.
         ctx = _Ctx(row=row, content_hash=content_hash, source=source, counts={} if stale else dict(row.get("counts") or {}))
         stages: Dict[str, dict] = {} if stale else dict(row.get("stages") or {})
-        for stage in STAGES:
-            state = stages.get(stage) or {}
-            output = _OUTPUTS.get(stage)
-            cached = state.get("status") in ("done", "skipped") and (
-                output is None or os.path.exists(store.stage_path(content_hash, output))
-            )
-            if cached:
-                _publish(analysis_id, {"stage": stage, "status": state.get("status"), "percent": 100, "detail": "from an earlier run" if state.get("status") == "done" else str(state.get("detail") or ""), "elapsed_s": 0, "cached": True})
-                continue
-            stage_started = time.perf_counter()
-            _publish(analysis_id, {"stage": stage, "status": "running", "percent": 0, "detail": "", "elapsed_s": 0})
-            await db.run_in_thread(db.update_video_analysis, analysis_id, stage=stage)
+        runner = _Runner(analysis_id, ctx, stages)
 
-            async def progress(percent: Optional[float], detail: str, _stage=stage, _t0=stage_started) -> None:
-                _publish(analysis_id, {
-                    "stage": _stage,
-                    "status": "running",
-                    "percent": None if percent is None else round(min(100.0, max(0.0, percent)), 1),
-                    "detail": detail,
-                    "elapsed_s": round(time.perf_counter() - _t0, 1),
-                })
-
-            try:
-                outcome = await asyncio.wait_for(
-                    _STAGE_FNS[stage](ctx, progress),
-                    timeout=settings.video_stage_timeout_s,
-                )
-            except asyncio.CancelledError:
-                # A shutdown. The row stays 'running' and the startup
-                # reconciliation requeues it; the stage file was never
-                # written, so this stage re-runs and nothing before it does.
-                raise
-            except asyncio.TimeoutError:
-                outcome = _StageResult(status="failed", detail=f"did not finish within {settings.video_stage_timeout_s:.0f}s")
-            except Exception as exc:  # noqa: BLE001 — recorded on the row, never a crash
-                log.exception("video %s: stage %s failed", content_hash[:12], stage)
-                outcome = _StageResult(status="failed", detail=f"{type(exc).__name__}: {str(exc)[:400]}")
-            ms = int((time.perf_counter() - stage_started) * 1000)
-            stages[stage] = {"status": outcome.status, "ms": ms, "detail": outcome.detail}
-            metrics.observe("video_stage_seconds", ms / 1000.0, "wall-clock per pipeline stage", stage=stage)
-            metrics.inc("video_stage_total", "pipeline stages finished", stage=stage, result="ok" if outcome.status != "failed" else "fail")
-            fields = {"stages": stages, "counts": ctx.counts, **outcome.row_fields}
-            await db.run_in_thread(db.update_video_analysis, analysis_id, **fields)
-            _publish(analysis_id, {"stage": stage, "status": outcome.status, "percent": 100, "detail": outcome.detail, "elapsed_s": round(ms / 1000.0, 1)})
-            if outcome.status == "failed" and stage not in _OPTIONAL:
-                await _finish(analysis_id, "failed", f"{STAGE_TITLES.get(stage, stage)}: {outcome.detail}", total_s=time.perf_counter() - started)
-                return
+        failure = await runner.chain(_PRELUDE)
+        if failure is None:
+            # The branches run to the end even when one of them fails: the
+            # other's stage files are kept, so the retry a re-upload triggers
+            # resumes with them instead of paying for them twice.
+            failures = await asyncio.gather(*(runner.chain(branch) for branch in _BRANCHES))
+            failure = next((f for f in failures if f), None)
+        if failure is None:
+            failure = await runner.chain(_TAIL)
+        if failure:
+            await _finish(analysis_id, "failed", failure, total_s=time.perf_counter() - started)
+            return
         await _finish(analysis_id, "done", "", total_s=time.perf_counter() - started)
 
 
@@ -428,7 +481,7 @@ async def _stage_audio(ctx: _Ctx, progress) -> _StageResult:
     wav = store.stage_path(ctx.content_hash, "audio.wav")
     duration = float(probe.get("duration_s") or 0.0)
     timeout = max(120.0, duration * 0.5 + 60.0)
-    samples = await media.extract_audio(ctx.source, wav, timeout_s=timeout)
+    samples = await media.extract_audio(ctx.source, wav, timeout_s=timeout, threads=settings.video_ffmpeg_threads)
     ctx.counts["audio_samples"] = int(samples)
     return _StageResult("done", f"{art.fmt_ts(samples / 16000)} of audio")
 
@@ -497,6 +550,7 @@ async def _stage_frames(ctx: _Ctx, progress) -> _StageResult:
         max_width=settings.video_frame_max_width,
         keyframes_only=keyframes_only,
         timeout_s=max(300.0, duration * 1.5 + 120.0),
+        threads=settings.video_ffmpeg_threads,
     )
     await progress(70.0, f"{len(extracted)} candidate frames · hashing")
     kept, report = await asyncio.to_thread(fr.select, extracted, total_s=duration, cap=cap, distance=settings.video_frame_hash_distance)

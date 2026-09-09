@@ -103,16 +103,25 @@ chat model from 71 tok/s to ~24, because the chat model is tensor-parallel
 across both Sparks and runs at the speed of its slower rank. The policy:
 
 * `VIDEO_MAX_CONCURRENT_JOBS=1` — one video at a time, queue in the DB.
-* ASR windows go through a SEPARATE batch pool of `VIDEO_ASR_CONCURRENCY=1`,
-  not dictation's pool. Dictation keeps its slots; a person pressing the
-  microphone during a video is never told "busy" because of it, and only one
-  node's speech engine is ever busy with a video.
-* OCR two-wide with a per-batch deadline; captions two-wide (the router's
-  four slots are shared with the classification call every chat message
-  makes).
-* Frames are extracted by an `ffmpeg` child process with `-threads 2`, never
-  in the event loop — the measured cause of an earlier TTFT regression here
-  was CPU work on the loop.
+* Inside a job, speech and screen run AT THE SAME TIME: audio → transcript
+  on the whisper engines, frames → OCR → captions on the OCR and router
+  engines, fusion after both. They never read each other's output, and
+  they use different engines, so running them in series was pure waiting:
+  the 10-minute meeting went from 4:02 to 1:55 the day this changed
+  (README, "same video, after").
+* ASR windows go through a SEPARATE batch pool, not dictation's, of
+  `VIDEO_ASR_CONCURRENCY=2` — one clip per Spark. The first cut held ONE
+  clip so dictation always had a free engine; the operator asked for both
+  GPUs to be used, so now a person dictating during a video's transcription
+  may wait for one clip (~15 s at the 90-second window). The router's
+  least-active order is what spreads the two clips over the two nodes.
+* OCR four-wide with a per-batch deadline; captions three-wide (the
+  router's four slots are shared with the classification call every chat
+  message makes, so one is left for it).
+* Frames and audio are decoded by `ffmpeg` child processes with 8 threads
+  (`VIDEO_FFMPEG_THREADS`, clamped to the core count), never in the event
+  loop — the measured cause of an earlier TTFT regression here was CPU
+  work on the loop.
 
 That was not enough. With the slots above, chat still fell to 20 tok/s
 while a video's frames were being OCR'd — each unit is short but there is

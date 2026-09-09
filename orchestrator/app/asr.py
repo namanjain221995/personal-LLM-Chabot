@@ -569,14 +569,15 @@ POOL = _Pool()
 class _BatchPool(_Pool):
     """Admission for BATCH transcription (video analysis).
 
-    A separate pool from dictation's, and a small one, for two reasons that
-    pull the same way. The engine decodes one clip at a time, so a video's
-    windows sent through the dictation pool would hold both of its slots and
-    a person pressing the microphone would be told "busy" after eight
-    seconds. And the chat model is tensor-parallel across both Sparks, so
-    saturating EITHER node's speech engine slows every answer (71 -> 24
-    tok/s measured); one window in flight keeps one engine busy and leaves
-    the other for dictation. The size does not scale with the fleet.
+    A separate pool from dictation's: the engine decodes one clip at a
+    time, so a video's windows sent through the dictation pool would hold
+    its slots and a person pressing the microphone would be told "busy"
+    after eight seconds. The size is `VIDEO_ASR_CONCURRENCY` — two by
+    default, one clip per Spark, spread by the router's least-active order
+    so a 10-minute recording is transcribed on both nodes at once. The
+    chat model is tensor-parallel across both Sparks and slows while either
+    engine decodes; the video job pays for that by pacing itself against
+    live chat before every clip (video.pipeline.pace), not by idling a GPU.
     """
 
     def _size(self) -> int:

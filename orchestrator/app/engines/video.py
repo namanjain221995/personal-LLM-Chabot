@@ -237,6 +237,17 @@ def overview_markdown(row: dict) -> str:
 # ----------------------------------------------------------- waiting --
 
 
+def _status_line(running: Dict[str, Optional[float]]) -> str:
+    """'Transcribing 40% · Reading on-screen text 3/10…' — every stage in
+    flight, in pipeline order, so the two branches read as one job."""
+    parts = []
+    for stage in STAGES:
+        if stage in running:
+            pct = running[stage]
+            parts.append(f"{STAGE_TITLES[stage]}{' ' + f'{pct:.0f}%' if pct is not None else ''}")
+    return (" · ".join(parts) or "Analysing the video") + "…"
+
+
 async def _wait_for_analysis(row: dict, emit: Emit) -> dict:
     """Forward the job's progress as steps until it finishes; return the row."""
     analysis_id = int(row["id"])
@@ -247,6 +258,10 @@ async def _wait_for_analysis(row: dict, emit: Emit) -> dict:
     queue = pipeline.subscribe(analysis_id)
     await pipeline.ensure_running(analysis_id)
     last_sent: Dict[str, Tuple[float, Optional[float], str]] = {}
+    # What is running right now, by stage: the status line names all of it,
+    # because speech and screen are analysed side by side and a line that
+    # flipped between them every second would read as two jobs fighting.
+    running: Dict[str, Optional[float]] = {}
     try:
         while True:
             try:
@@ -286,7 +301,11 @@ async def _wait_for_analysis(row: dict, emit: Emit) -> dict:
                 bits.insert(0, "cached")
             await emit("step", {"id": _STEP_IDS[stage], "title": STAGE_TITLES[stage], "status": step_status, "detail": " · ".join(bits)})
             if status == "running":
-                await emit("status", {"text": f"{STAGE_TITLES[stage]}{' ' + f'{percent:.0f}%' if percent is not None else ''}…"})
+                running[stage] = percent if isinstance(percent, (int, float)) else None
+            else:
+                running.pop(stage, None)
+            if status == "running":
+                await emit("status", {"text": _status_line(running)})
             last_sent[stage] = (now, percent if isinstance(percent, (int, float)) else None, status)
     finally:
         pipeline.unsubscribe(analysis_id, queue)

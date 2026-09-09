@@ -718,12 +718,138 @@ def test_an_analysis_from_an_older_pipeline_is_rerun_not_served(monkeypatch, tmp
         return fresh
 
     fresh = asyncio.run(scenario())
-    assert ran == list(pipeline.STAGES), "every stage must run again, none from the cache"
+    assert sorted(ran) == sorted(pipeline.STAGES), "every stage must run again, none from the cache"
+    assert ran[0] == "probe" and ran[-3:] == ["fusion", "index", "artifacts"]  # branches in between, in any order
     assert fresh["status"] == "done" and int(fresh["pipeline_version"]) == pipeline.PIPELINE_VERSION
     assert all(v["detail"] == "fresh" for v in fresh["stages"].values())
     # And now it is current: nothing to do.
     assert asyncio.run(pipeline.ensure_running(row["id"])) is False
     db.delete_video_analysis(row["id"])
+
+
+def test_speech_and_screen_branches_run_side_by_side(monkeypatch, tmp_path):
+    """Transcription and frame reading never read each other's output, so
+    they run at the same time and the job is as long as the longer one.
+    Fusion must still wait for both."""
+    from app.video import pipeline, store
+
+    monkeypatch.setattr(settings, "video_data_dir", str(tmp_path / "video"))
+    content_hash = "d" * 64
+    os.makedirs(store.analysis_dir(content_hash), exist_ok=True)
+    src = tmp_path / "clip.mp4"
+    src.write_bytes(b"\x00" * 64)
+    store.adopt_source(content_hash, str(src), "clip.mp4")
+    row = db.upsert_video_analysis(content_hash, 64, "video/mp4", "clip.mp4")
+
+    clock = {"t": 0.0}
+    log = []
+
+    def make(name, hold):
+        async def run(ctx, progress):
+            log.append(("start", name, clock["t"]))
+            # A cooperative sleep: every branch advances the shared clock, so
+            # overlap shows as a start that lands before another's end.
+            for _ in range(hold):
+                await asyncio.sleep(0.01)
+                clock["t"] += 1
+            log.append(("end", name, clock["t"]))
+            return pipeline._StageResult("done", name)
+        return run
+
+    monkeypatch.setattr(pipeline, "_STAGE_FNS", {
+        "probe": make("probe", 1), "audio": make("audio", 1), "transcript": make("transcript", 6),
+        "frames": make("frames", 1), "ocr": make("ocr", 2), "vision": make("vision", 2),
+        "fusion": make("fusion", 1), "index": make("index", 1), "artifacts": make("artifacts", 1),
+    })
+    asyncio.run(pipeline._run(row["id"]))
+    at = {(kind, name): t for kind, name, t in log}
+    assert at[("start", "frames")] < at[("end", "transcript")], "screen branch must not wait for speech"
+    assert at[("start", "transcript")] < at[("end", "vision")], "speech branch must not wait for screen"
+    assert at[("start", "fusion")] >= max(at[("end", "transcript")], at[("end", "vision")]), "fusion waits for both"
+    assert at[("start", "audio")] >= at[("end", "probe")]
+    fresh = db.get_video_analysis(row["id"])
+    assert fresh["status"] == "done" and set(fresh["stages"]) == set(pipeline.STAGES)
+    db.delete_video_analysis(row["id"])
+
+
+def test_a_fatal_failure_in_one_branch_fails_the_job_after_the_other_finishes(monkeypatch, tmp_path):
+    from app.video import pipeline, store
+
+    monkeypatch.setattr(settings, "video_data_dir", str(tmp_path / "video"))
+    content_hash = "e" * 64
+    os.makedirs(store.analysis_dir(content_hash), exist_ok=True)
+    src = tmp_path / "clip.mp4"
+    src.write_bytes(b"\x00" * 64)
+    store.adopt_source(content_hash, str(src), "clip.mp4")
+    row = db.upsert_video_analysis(content_hash, 64, "video/mp4", "clip.mp4")
+    ran = []
+
+    def make(name, status="done"):
+        async def run(ctx, progress):
+            ran.append(name)
+            return pipeline._StageResult(status, name)
+        return run
+
+    fns = {s: make(s) for s in pipeline.STAGES}
+    fns["transcript"] = make("transcript", "failed")
+    monkeypatch.setattr(pipeline, "_STAGE_FNS", fns)
+    asyncio.run(pipeline._run(row["id"]))
+    fresh = db.get_video_analysis(row["id"])
+    assert fresh["status"] == "failed" and "Transcribing" in fresh["error"]
+    assert {"frames", "ocr", "vision"} <= set(ran), "the screen branch still finishes (its files are kept for the retry)"
+    assert "fusion" not in ran
+    db.delete_video_analysis(row["id"])
+
+
+def test_transcription_windows_go_out_two_at_a_time_and_come_back_in_order(monkeypatch, tmp_path):
+    import math
+    import struct
+    import wave
+
+    from app import asr
+    from app.video import transcribe
+    from app.video.vad import SAMPLE_RATE, Window
+
+    wav = tmp_path / "a.wav"
+    with wave.open(str(wav), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(SAMPLE_RATE)
+        w.writeframes(b"".join(struct.pack("<h", int(8000 * math.sin(i / 7.0))) for i in range(SAMPLE_RATE * 8)))
+    monkeypatch.setattr(settings, "video_asr_concurrency", 2)
+    in_flight = {"now": 0, "peak": 0}
+
+    async def fake_engine(audio, *, filename, content_type, **kwargs):
+        in_flight["now"] += 1
+        in_flight["peak"] = max(in_flight["peak"], in_flight["now"])
+        i = int(filename[1:5])
+        await asyncio.sleep(0.05 if i % 2 else 0.01)  # odd clips finish last
+        in_flight["now"] -= 1
+        return asr.TranscriptSegments(text=f"w{i}", language="English", language_code="en", provider="t", model="t", engine_ms=1, segments=({"start": 0.0, "end": 1.0, "text": f"w{i}"},))
+
+    monkeypatch.setattr(asr, "transcribe_segments", fake_engine)
+    monkeypatch.setattr(transcribe, "plan_windows", lambda *a, **k: ([Window(start_s=float(i * 2), end_s=float(i * 2 + 2)) for i in range(4)], {"detector": "test", "speech_fraction": 1.0}))
+    seen = []
+
+    async def progress(pct, detail):
+        seen.append((pct, detail))
+
+    segments, language, report = asyncio.run(
+        transcribe.transcribe_audio(str(wav), total_s=8.0, progress=progress, max_window_s=90.0, max_gap_s=2.0, overlap_s=1.0)
+    )
+    assert in_flight["peak"] == 2, "two clips in the engines at once, never more"
+    assert [s.text for s in segments] == ["w0", "w1", "w2", "w3"], "time order, whichever clip came back first"
+    assert [round(s.start_s) for s in segments] == [0, 2, 4, 6]
+    assert report["windows_done"] == 4 and language == "en"
+    assert any("in the engine" in d for _p, d in seen)
+
+
+def test_status_line_names_every_stage_in_flight():
+    from app.engines.video import _status_line
+
+    assert _status_line({"transcript": 40.0, "ocr": 30.0}) == "Transcribing 40% · Reading on-screen text 30%…"
+    assert _status_line({"ocr": None}) == "Reading on-screen text…"
+    assert _status_line({}) == "Analysing the video…"
 
 
 # ------------------------------------------------------------- the gate --

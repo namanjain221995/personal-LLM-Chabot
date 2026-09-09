@@ -30,6 +30,7 @@ import struct
 import time
 from typing import Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
 
+from ..config import settings
 from .types import Segment
 from .vad import SAMPLE_RATE, Window, plan_windows
 
@@ -191,51 +192,71 @@ async def transcribe_audio(
         return [], None, {**report, "engine_ms": 0, "windows_done": 0}
 
     speech_total = sum(w.duration_s for w in windows) or 1.0
-    done_s = 0.0
-    engine_ms = 0
-    pieces: List[Tuple[Window, List[Segment]]] = []
     started = time.perf_counter()
-    failures = 0
-    paced_s = 0.0
-    for i, window in enumerate(windows):
-        paced_s += await _pipe.pace()
-        a = int(window.start_s * SAMPLE_RATE)
-        b = int(window.end_s * SAMPLE_RATE)
-        clip = await asyncio.to_thread(wav_bytes, pcm[a:b])
-        try:
-            # The engine's own silence gate is OFF here: it judges a clip on
-            # its first 30 s, and a window that opens on a quiet lead-in
-            # would lose every word after it (a 12-second LibriVox intro
-            # scored 0.62 against the 0.6 threshold and came back empty; a
-            # four-minute window would go the same way). The windows above
-            # are voice-activity regions already — that is the gate.
-            result = await asr.transcribe_segments(
-                clip, filename=f"w{i:04d}.wav", content_type="audio/wav", no_speech_check=False
-            )
-        except asr.ASRRejected as exc:
-            # The engine refused THIS clip (a decode fault, say). One bad
-            # window is a gap, not a failed video — recorded, and on we go.
-            log.warning("window %d (%.1f-%.1fs) rejected: %s", i, window.start_s, window.end_s, exc)
-            failures += 1
-            if failures > max(3, len(windows) // 4):
-                raise
-            continue
-        engine_ms += int(result.engine_ms or 0)
-        segs = [
-            Segment(
-                start_s=window.start_s + float(s.get("start", 0.0)),
-                end_s=window.start_s + float(s.get("end", 0.0)),
-                text=str(s.get("text") or "").strip(),
-                language=(str(s.get("language")) if s.get("language") else result.language_code),
-            )
-            for s in (result.segments or [])
-        ]
-        pieces.append((window, segs))
-        done_s += window.duration_s
+    # Windows go to the engines `video_asr_concurrency` at a time — two by
+    # default, which is one clip per Spark: the router hands each new clip
+    # to the engine with the fewest in flight, so the two nodes decode side
+    # by side and the transcript takes half the wall clock it did in series.
+    # Each clip is still paced against live chat before it is sent.
+    width = max(1, int(settings.video_asr_concurrency))
+    gate = asyncio.Semaphore(width)
+    results: Dict[int, List[Segment]] = {}
+    tally = {"engine_ms": 0, "failures": 0, "paced_s": 0.0, "done_s": 0.0, "in_flight": 0}
+
+    async def _say() -> None:
+        left = len(windows) - len(results) - tally["failures"] - tally["in_flight"]
+        done_pct = 100.0 * tally["done_s"] / speech_total
         await progress(
-            100.0 * done_s / speech_total,
-            f"{_mmss(window.end_s)} of {_mmss(total_s)} · {len(windows) - i - 1} clip(s) left",
+            done_pct,
+            f"{len(results)}/{len(windows)} clip(s) done · {tally['in_flight']} in the engine"
+            + (f" · {left} waiting" if left > 0 else ""),
         )
+
+    async def one(i: int, window: Window) -> None:
+        async with gate:
+            tally["paced_s"] += await _pipe.pace()
+            a = int(window.start_s * SAMPLE_RATE)
+            b = int(window.end_s * SAMPLE_RATE)
+            clip = await asyncio.to_thread(wav_bytes, pcm[a:b])
+            tally["in_flight"] += 1
+            await _say()
+            try:
+                # The engine's own silence gate is OFF here: it judges a clip
+                # on its first 30 s, and a window that opens on a quiet
+                # lead-in would lose every word after it (a 12-second
+                # LibriVox intro scored 0.62 against the 0.6 threshold and
+                # came back empty). The windows are voice-activity regions
+                # already — that is the gate.
+                result = await asr.transcribe_segments(
+                    clip, filename=f"w{i:04d}.wav", content_type="audio/wav", no_speech_check=False
+                )
+            except asr.ASRRejected as exc:
+                # The engine refused THIS clip (a decode fault, say). One bad
+                # window is a gap, not a failed video — recorded, and on we go.
+                log.warning("window %d (%.1f-%.1fs) rejected: %s", i, window.start_s, window.end_s, exc)
+                tally["failures"] += 1
+                if tally["failures"] > max(3, len(windows) // 4):
+                    raise
+                return
+            finally:
+                tally["in_flight"] -= 1
+            tally["engine_ms"] += int(result.engine_ms or 0)
+            results[i] = [
+                Segment(
+                    start_s=window.start_s + float(s.get("start", 0.0)),
+                    end_s=window.start_s + float(s.get("end", 0.0)),
+                    text=str(s.get("text") or "").strip(),
+                    language=(str(s.get("language")) if s.get("language") else result.language_code),
+                )
+                for s in (result.segments or [])
+            ]
+            tally["done_s"] += window.duration_s
+            await _say()
+
+    await asyncio.gather(*(one(i, w) for i, w in enumerate(windows)))
+    # Stitching wants the windows in time order, whichever finished first.
+    pieces: List[Tuple[Window, List[Segment]]] = [(windows[i], results[i]) for i in sorted(results)]
+    engine_ms, failures, paced_s = tally["engine_ms"], tally["failures"], tally["paced_s"]
     segments = stitch(pieces)
     language = dominant_language(segments)
     report = {

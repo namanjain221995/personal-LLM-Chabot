@@ -277,7 +277,11 @@ class Settings:
         self.video_asr_window_s: float = _float("VIDEO_ASR_WINDOW_S", 90.0)
         self.video_asr_max_gap_s: float = _float("VIDEO_ASR_MAX_GAP_S", 2.0)
         self.video_asr_overlap_s: float = _float("VIDEO_ASR_OVERLAP_S", 3.0)
-        self.video_asr_concurrency: int = _int("VIDEO_ASR_CONCURRENCY", 1)
+        # Clips in flight at once. Two = one per Spark: the speech router
+        # hands each clip to the engine with the fewest in flight, so both
+        # nodes decode side by side. A person dictating meanwhile may wait
+        # for one clip (~15 s at the 90-s window) — the price of using both.
+        self.video_asr_concurrency: int = _int("VIDEO_ASR_CONCURRENCY", 2)
         # Frames: a scene-change detector plus a periodic floor, then a
         # perceptual-hash dedupe, then a cap of one frame per
         # `per_seconds` clamped to [min, max]. The floor is derived from the
@@ -293,13 +297,17 @@ class Settings:
         # Above this length only keyframes are decoded for frame selection
         # (tens of times faster; a slide change is noticed at the next
         # keyframe rather than the exact frame).
+        # Decoder threads for the ffmpeg children (audio, frames, a single
+        # frame). h264 frame-threading scales to about 4-6x; the Sparks have
+        # 20 cores and nothing else CPU-bound runs during an analysis.
+        self.video_ffmpeg_threads: int = max(1, min(_int("VIDEO_FFMPEG_THREADS", 8), os.cpu_count() or 8))
         self.video_keyframes_only_after_s: float = _float("VIDEO_KEYFRAMES_ONLY_AFTER_S", 1200.0)
         # On-screen text via the OCR sidecar, in small batches with a
         # deadline each — a text-dense frame has cost 47 s here.
         self.video_ocr_enabled: bool = _bool("VIDEO_OCR_ENABLED", True)
         self.video_ocr_max_tokens: int = _int("VIDEO_OCR_MAX_TOKENS", 1500)
         self.video_ocr_batch_deadline_s: float = _float("VIDEO_OCR_BATCH_DEADLINE_S", 150.0)
-        self.video_ocr_concurrency: int = _int("VIDEO_OCR_CONCURRENCY", 2)
+        self.video_ocr_concurrency: int = _int("VIDEO_OCR_CONCURRENCY", 4)
         # OCR costs ~10 s per text-dense frame on this deployment (measured
         # 2026-09-09) — 400 frames of a two-hour recording would be an hour.
         # Past this many kept frames, only the longest-held ones are read
@@ -310,7 +318,7 @@ class Settings:
         # effective at four in flight. Two in flight leaves the router room
         # for the classification calls every chat message makes.
         self.video_captions_enabled: bool = _bool("VIDEO_CAPTIONS_ENABLED", True)
-        self.video_caption_concurrency: int = _int("VIDEO_CAPTION_CONCURRENCY", 2)
+        self.video_caption_concurrency: int = _int("VIDEO_CAPTION_CONCURRENCY", 3)
         self.video_caption_width: int = _int("VIDEO_CAPTION_WIDTH", 896)
         self.video_caption_max_tokens: int = _int("VIDEO_CAPTION_MAX_TOKENS", 160)
         self.video_caption_timeout_s: float = _float("VIDEO_CAPTION_TIMEOUT_S", 90.0)

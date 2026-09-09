@@ -61,16 +61,22 @@ records `main+router`.
    /uploads purpose=video                           ▼
    sha256 ─► video_analyses row ─► /data/video/<hash>/
                                      source.mp4 (hard link)
-        probe ── ffprobe                probe.json
-        audio ── ffmpeg → 16 kHz PCM   audio.wav
-   transcript ── VAD windows → whisper (both Sparks, batch pool of 1)   transcript.json
-       frames ── ffmpeg scene+floor → pHash dedupe → cap                frames/, frames.json
-          ocr ── Unlimited-OCR, 2-wide, deadline per batch              ocr.json
-       vision ── router captions, 2-wide                                screen.json
+        probe ── ffprobe                                                probe.json
+          ┌── speech branch ─────────────────┐ ┌── screen branch ──────────────────────┐
+          │ audio ── ffmpeg → 16 kHz PCM     │ │ frames ── ffmpeg scene+floor → pHash │
+          │ transcript ── VAD windows →      │ │ ocr ── Unlimited-OCR, 4-wide          │
+          │   whisper, 2 clips in flight,    │ │ vision ── router captions, 3-wide     │
+          │   one per Spark                  │ │                                       │
+          └──────────────────────────────────┘ └───────────────────────────────────────┘
        fusion ── main model, direct ≤60k tokens else map-reduce         understanding.json
         index ── embed → LanceDB /data/lancedb-video (video_chunks)
     artifacts ── txt/srt/vtt/json/md                                    artifacts/
 ```
+
+The two branches run at the same time: speech on the Sparks' whisper
+engines (two clips in flight, one per node), screen on the OCR and router
+engines. Fusion is the first stage that needs both. ffmpeg children decode
+with 8 threads.
 
 Every stage writes its file, then stamps itself done on the row. A crash,
 a restart, or the same file uploaded next week resumes at the first stage
@@ -110,6 +116,20 @@ so a fabricated fusion would be visible.
 | **total** | **4:02** | first answer at 4:02 (the attach turn waits for the analysis) |
 
 Peak orchestrator RSS during the run: **883 MiB**.
+
+**Same video, after the branches were made concurrent** (2026-09-09,
+quiet box, fresh bytes so nothing came from the cache):
+
+| stage | wall | note |
+|---|---:|---|
+| transcript | 70.9 s | 8 clips of ≤90 s, two in flight — one on each Spark |
+| frames | 13.3 s | ran during the transcript |
+| ocr | 77.4 s | 4-wide, ran during the transcript |
+| vision | 8.6 s | 3-wide |
+| fusion | 14.6 s | |
+| **total** | **1:55** | the head GPU was above 50 % in 49 of 50 two-second samples, the worker's in 27 |
+
+Same transcript (91 segments), same 10 frames, same evidence; half the wait.
 
 **The generated understanding** (verbatim, trimmed):
 
@@ -307,14 +327,15 @@ GET /video/{conversation_id}/{upload_id}/status
 
 ## What it does badly today
 
-1. **OCR is slow on text-dense frames** — ~10 s each on this sidecar. Ten
+1. **OCR is slow on text-dense frames** — ~8 s each on this sidecar. Ten
    frames is fine; four hundred is not, so above `VIDEO_OCR_MAX_FRAMES`
    (120) only the longest-held frames are read and the rest keep their
    captions. A long screencast of scrolling code loses some verbatim text.
-2. **The first answer waits for the whole analysis** — four minutes for a
-   ten-minute video, proportionally more for a long one. The stages stream,
-   but nothing is answered early. A partial answer from the transcript
-   while frames are still being read is the obvious next step.
+2. **The first answer waits for the whole analysis** — two minutes for a
+   ten-minute video now that speech and screen run side by side, more for
+   a long one. The stages stream, but nothing is answered early. A partial
+   answer from the transcript while frames are still being read is the
+   obvious next step.
 3. **Frame selection is bounded by the periodic floor** for slides with
    similar backgrounds (a dark code slide into a dark terminal did not trip
    the scene detector; the floor caught it 4 s later). A named-time question
