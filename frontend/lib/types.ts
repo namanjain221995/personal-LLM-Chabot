@@ -155,12 +155,88 @@ export interface DocumentActivity {
 }
 
 /** A file attached to a user turn, as persisted in server history. */
+/**
+ * 2026-09-10 (upload reliability): where one attachment's BYTES are, as the
+ * browser last knew it. Only the server declares `uploaded`; `interrupted`
+ * is this tab's word for "I lost it before the server said so" and is
+ * provisional until the session has been asked. See docs/upload-reliability.
+ */
+export type AttachmentUploadState =
+  | 'selected'
+  | 'uploading'
+  | 'finalizing'
+  | 'uploaded'
+  | 'interrupted'
+  | 'rejected'
+  | 'cancelled'
+  | 'expired';
+
 export interface MessageAttachment {
   /** Server-side upload id (uploads.id) — absent on PDFs and on turns
       persisted before the upload response arrived. */
   id?: string;
   name: string;
   kind: 'dataset' | 'pdf' | 'video';
+  /**
+   * 2026-09-10: a browser-minted identity for THIS attachment, assigned at
+   * selection and kept through persistence. Files are matched by it, never
+   * by position (a list filtered by `id` moves every index under a sibling
+   * still uploading) and never by name (two `invoice.pdf` in one turn is
+   * legal). Absent on turns saved before this field existed.
+   */
+  attachment_id?: string;
+  /** Bytes as declared by the picker, so a re-selected file can be checked
+      against the session it resumes before a single byte is sent. */
+  bytes?: number;
+  /** Chunked sessions only: the server's session id (same value as `id`
+      once finalised) so a reload can ask what already arrived. */
+  session_id?: string;
+  /** The browser's last knowledge of the bytes. Absent = uploaded, for
+      rows written before this field existed (they carried `id`). */
+  upload_state?: AttachmentUploadState;
+}
+
+/**
+ * 2026-09-10: one logical send. Minted when Send is pressed, saved with the
+ * user turn, carried on POST /chat as `intent_id`, and recorded server-side
+ * in `chat_requests` at acceptance. A retry of the same turn reuses the id,
+ * so it can never become a second generation; a reload reconciles `state`
+ * with GET /chat/requests/{id} — the server's answer wins.
+ */
+export type SendIntentState =
+  | 'waiting_for_attachments'
+  | 'submitting'
+  | 'accepted'
+  | 'processing'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+  | 'interrupted'
+  | 'unsent';
+
+export interface SendIntent {
+  id: string;
+  state: SendIntentState;
+  /** The server's generation for the accepted attempt, once known. */
+  generation_id?: string;
+  attempt?: number;
+  /** Why the intent is failed/unsent, in the SAFE public sentence. */
+  reason?: string;
+}
+
+/**
+ * 2026-09-10: a terminal error, PERSISTED. Until now `status`/`errorMessage`
+ * lived on the message object only, so an interrupted answer was saved as a
+ * blank assistant turn (content '', no error) and rendered as an empty
+ * bubble after a reload. This rides on meta like everything that must
+ * survive a save.
+ */
+export interface PersistedError {
+  message: string;
+  code?: ErrorCategory | string;
+  status?: number | null;
+  /** True when the server still holds the request and can resume it. */
+  resumable?: boolean;
 }
 
 /** 2026-09-09: what the video engine did, small enough to ride on meta. */
@@ -289,6 +365,15 @@ export interface Meta {
    * MessageRow reads it and says so.
    */
   send_state?: 'uploading' | 'failed';
+  /**
+   * 2026-09-10: the send intent this user turn carries (see SendIntent).
+   * Supersedes `send_state`, which is kept readable: a row with only
+   * `send_state` is treated as an intent with no id in state
+   * 'waiting_for_attachments' (nothing to look up server-side).
+   */
+  intent?: SendIntent;
+  /** 2026-09-10: on an assistant turn, the persisted terminal error. */
+  error?: PersistedError;
   /** 2026-08-07: what the document engine read — shown in the Activity
       panel (filename, page count, OCR'd pages, per-page text excerpts). */
   document?: DocumentActivity;

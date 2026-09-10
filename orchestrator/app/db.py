@@ -1517,6 +1517,85 @@ CREATE INDEX IF NOT EXISTS idx_video_attachments_analysis
 """
 
 
+_MIGRATION_V29 = """
+-- V29 (2026-09-10): upload reliability — durable upload sessions, durable
+-- chat intents, and a lease on analysis runs.
+--
+-- `upload_sessions` is the chunked rail's state, in the database instead of
+-- a marker file: who owns it, what is expected, which parts have ARRIVED
+-- (with their sizes and, when the client sent one, their sha256), when it
+-- expires, and — once finalised — the exact response `complete` returned, so
+-- a retried `complete` after a lost acknowledgement replays it instead of
+-- answering 404. Nothing here holds bytes; the parts stay on disk under the
+-- workspace, and `expires_at` is what the sweep reads before it removes them.
+--
+-- `chat_requests` is one row per SEND INTENT (a browser-minted id): what was
+-- asked, for which conversation, under which generation_id. It exists so a
+-- request the server accepted survives the process that accepted it. A
+-- restart marks every open row `interrupted`; re-attaching to the
+-- conversation resumes it from the stored request under a NEW attempt, and a
+-- second POST /chat with a known intent_id attaches or replays rather than
+-- starting a second generation. `request` is the snapshot to resume from;
+-- rows that cannot be resumed (inline bytes the server did not keep) say so
+-- in `resumable`.
+--
+-- `video_analyses.lease_*`: a run holds a lease with a heartbeat. Startup
+-- reconciliation requeues only rows whose lease has EXPIRED, so a second
+-- process (or a restart that was really a rolling recreate next to a healthy
+-- worker) cannot steal a run that is still going.
+CREATE TABLE IF NOT EXISTS upload_sessions (
+    id              text        PRIMARY KEY,
+    user_id         integer     NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    conversation_id text        NOT NULL,
+    filename        text        NOT NULL,
+    purpose         text        NOT NULL
+                    CONSTRAINT upload_sessions_purpose CHECK
+                    (purpose IN ('dataset', 'document', 'video')),
+    expected_bytes  bigint,
+    expected_parts  integer,
+    part_size       bigint,
+    accepted_parts  jsonb       NOT NULL DEFAULT '{}'::jsonb,
+    bytes_received  bigint      NOT NULL DEFAULT 0,
+    status          text        NOT NULL DEFAULT 'uploading'
+                    CONSTRAINT upload_sessions_status CHECK
+                    (status IN ('uploading', 'finalizing', 'complete', 'expired', 'rejected', 'cancelled')),
+    error           text        NOT NULL DEFAULT '',
+    result          jsonb,
+    created_at      timestamptz NOT NULL,
+    updated_at      timestamptz NOT NULL,
+    expires_at      timestamptz NOT NULL,
+    completed_at    timestamptz
+);
+CREATE INDEX IF NOT EXISTS idx_upload_sessions_conv
+    ON upload_sessions (conversation_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_upload_sessions_open
+    ON upload_sessions (expires_at) WHERE status IN ('uploading', 'finalizing');
+
+CREATE TABLE IF NOT EXISTS chat_requests (
+    intent_id       text        PRIMARY KEY,
+    user_id         integer     NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    conversation_id text        NOT NULL,
+    generation_id   text        NOT NULL UNIQUE,
+    status          text        NOT NULL DEFAULT 'accepted'
+                    CONSTRAINT chat_requests_status CHECK
+                    (status IN ('accepted', 'running', 'completed', 'failed', 'cancelled', 'interrupted')),
+    attempt         integer     NOT NULL DEFAULT 1,
+    resumable       boolean     NOT NULL DEFAULT true,
+    request         jsonb       NOT NULL,
+    error           text        NOT NULL DEFAULT '',
+    created_at      timestamptz NOT NULL,
+    updated_at      timestamptz NOT NULL,
+    finished_at     timestamptz
+);
+CREATE INDEX IF NOT EXISTS idx_chat_requests_conv
+    ON chat_requests (conversation_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_chat_requests_open
+    ON chat_requests (status) WHERE status IN ('accepted', 'running', 'interrupted');
+
+ALTER TABLE video_analyses ADD COLUMN IF NOT EXISTS lease_owner text NOT NULL DEFAULT '';
+ALTER TABLE video_analyses ADD COLUMN IF NOT EXISTS lease_expires_at timestamptz;
+"""
+
 _MIGRATIONS: tuple = (
     (1, _MIGRATION_V1),
     (2, _MIGRATION_V2),
@@ -1546,6 +1625,7 @@ _MIGRATIONS: tuple = (
     (26, _MIGRATION_V26),
     (27, _MIGRATION_V27),
     (28, _MIGRATION_V28),
+    (29, _MIGRATION_V29),
 )
 
 #: The version `init_schema` brings a database up to. Exported so callers (and
@@ -2061,6 +2141,9 @@ _SIDE_TABLES = (
     # analysis. The analysis itself is shared and outlives the conversation
     # until video.pipeline.reap_orphans finds nobody refers to it.
     "video_attachments",
+    # V29: a conversation's upload sessions and send intents are its own.
+    "upload_sessions",
+    "chat_requests",
 )
 
 
@@ -5066,12 +5149,40 @@ def requeue_interrupted_video_analyses() -> int:
     Its finished stages are on disk, so the resume costs only the stage that
     was cut off."""
     with connection() as con:
+        # V29: only a run whose LEASE has lapsed is interrupted. A row whose
+        # owner is still heartbeating belongs to a process that is alive —
+        # another instance, or this one before a rolling recreate finished —
+        # and requeuing it would start the same video twice.
         rows = con.execute(
-            "UPDATE video_analyses SET status = 'queued', updated_at = %s "
-            "WHERE status = 'running' RETURNING id",
-            (_now(),),
+            "UPDATE video_analyses SET status = 'queued', updated_at = %s, "
+            "lease_owner = '', lease_expires_at = NULL "
+            "WHERE status = 'running' "
+            "AND (lease_expires_at IS NULL OR lease_expires_at < %s) RETURNING id",
+            (_now(), _now()),
         ).fetchall()
     return len(rows)
+
+
+def claim_video_lease(analysis_id: int, owner: str, ttl_s: float) -> bool:
+    """Take (or renew) the run lease; False when another live owner holds it."""
+    now = _now()
+    with connection() as con:
+        row = con.execute(
+            "UPDATE video_analyses SET lease_owner = %s, lease_expires_at = %s, updated_at = %s "
+            "WHERE id = %s AND (lease_owner = %s OR lease_owner = '' "
+            "OR lease_expires_at IS NULL OR lease_expires_at < %s) RETURNING id",
+            (owner, now + timedelta(seconds=float(ttl_s)), now, int(analysis_id), owner, now),
+        ).fetchone()
+    return row is not None
+
+
+def release_video_lease(analysis_id: int, owner: str) -> None:
+    with connection() as con:
+        con.execute(
+            "UPDATE video_analyses SET lease_owner = '', lease_expires_at = NULL "
+            "WHERE id = %s AND lease_owner = %s",
+            (int(analysis_id), owner),
+        )
 
 
 def link_video_attachment(
@@ -5158,3 +5269,254 @@ def delete_video_analysis(analysis_id: int) -> bool:
         row = con.execute("DELETE FROM video_analyses WHERE id = %s RETURNING id", (int(analysis_id),)).fetchone()
     return row is not None
 
+
+# ---------------------------------------------------------------------------
+# V29 upload sessions — the chunked rail's durable state
+# ---------------------------------------------------------------------------
+
+_UPLOAD_SESSION_COLUMNS = (
+    "id", "user_id", "conversation_id", "filename", "purpose", "expected_bytes",
+    "expected_parts", "part_size", "accepted_parts", "bytes_received", "status",
+    "error", "result", "created_at", "updated_at", "expires_at", "completed_at",
+)
+
+
+def _upload_session_row(r: Any) -> dict:
+    out = {k: r[k] for k in _UPLOAD_SESSION_COLUMNS}
+    for k in ("created_at", "updated_at", "expires_at", "completed_at"):
+        out[k] = _iso(out[k]) if out.get(k) else None
+    for k in ("accepted_parts", "result"):
+        value = out.get(k)
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except ValueError:
+                value = None
+        out[k] = value if value is not None else ({} if k == "accepted_parts" else None)
+    out["user_id"] = int(out["user_id"])
+    return out
+
+
+def create_upload_session(
+    upload_id: str,
+    user_id: int,
+    conversation_id: str,
+    filename: str,
+    purpose: str,
+    *,
+    expected_bytes: Optional[int] = None,
+    expected_parts: Optional[int] = None,
+    part_size: Optional[int] = None,
+    ttl_hours: float = 24.0,
+) -> dict:
+    ts = _now()
+    with connection() as con:
+        row = con.execute(
+            """INSERT INTO upload_sessions
+                   (id, user_id, conversation_id, filename, purpose, expected_bytes,
+                    expected_parts, part_size, created_at, updated_at, expires_at)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+               RETURNING *""",
+            (
+                upload_id, int(user_id), conversation_id, _text(filename) or "upload.bin", purpose,
+                None if expected_bytes is None else int(expected_bytes),
+                None if expected_parts is None else int(expected_parts),
+                None if part_size is None else int(part_size),
+                ts, ts, ts + timedelta(hours=float(ttl_hours)),
+            ),
+        ).fetchone()
+    return _upload_session_row(row)
+
+
+def get_upload_session(upload_id: str) -> Optional[dict]:
+    with connection() as con:
+        row = con.execute("SELECT * FROM upload_sessions WHERE id = %s", (upload_id,)).fetchone()
+    return _upload_session_row(row) if row is not None else None
+
+
+def list_upload_sessions(conversation_id: str, user_id: int) -> List[dict]:
+    with connection() as con:
+        rows = con.execute(
+            "SELECT * FROM upload_sessions WHERE conversation_id = %s AND user_id = %s "
+            "ORDER BY created_at",
+            (conversation_id, int(user_id)),
+        ).fetchall()
+    return [_upload_session_row(r) for r in rows]
+
+
+def record_upload_part(upload_id: str, index: int, nbytes: int, sha256: Optional[str] = None) -> Optional[dict]:
+    """Mark one part ACCEPTED (its file is durable on disk). Re-recording the
+    same index replaces the earlier entry — a re-sent part counts once, and
+    `bytes_received` is recomputed from the map, never incremented."""
+    with connection() as con:
+        row = con.execute(
+            "SELECT accepted_parts FROM upload_sessions WHERE id = %s FOR UPDATE", (upload_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        parts = row["accepted_parts"]
+        if isinstance(parts, str):
+            parts = json.loads(parts)
+        parts = dict(parts or {})
+        parts[str(int(index))] = {"bytes": int(nbytes), "sha256": sha256 or None}
+        total = sum(int(v.get("bytes") or 0) for v in parts.values())
+        row = con.execute(
+            "UPDATE upload_sessions SET accepted_parts = %s, bytes_received = %s, updated_at = %s "
+            "WHERE id = %s RETURNING *",
+            (_json_param(parts), total, _now(), upload_id),
+        ).fetchone()
+    return _upload_session_row(row)
+
+
+def try_begin_upload_finalize(upload_id: str) -> Optional[str]:
+    """Atomically move uploading -> finalizing. Returns the status the row
+    was in BEFORE ('uploading' when this caller won, 'finalizing' or
+    'complete' when another request got there first), None when unknown."""
+    with connection() as con:
+        row = con.execute(
+            "SELECT status FROM upload_sessions WHERE id = %s FOR UPDATE", (upload_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        before = row["status"]
+        if before == "uploading":
+            con.execute(
+                "UPDATE upload_sessions SET status = 'finalizing', updated_at = %s WHERE id = %s",
+                (_now(), upload_id),
+            )
+    return before
+
+
+def set_upload_session_status(
+    upload_id: str, status: str, *, error: str = "", result: Optional[dict] = None
+) -> Optional[dict]:
+    ts = _now()
+    with connection() as con:
+        row = con.execute(
+            "UPDATE upload_sessions SET status = %s, error = %s, "
+            "result = COALESCE(%s, result), updated_at = %s, "
+            "completed_at = CASE WHEN %s = 'complete' THEN %s ELSE completed_at END "
+            "WHERE id = %s RETURNING *",
+            (status, _text(error) or "", _json_param(result) if result is not None else None, ts, status, ts, upload_id),
+        ).fetchone()
+    return _upload_session_row(row) if row is not None else None
+
+
+def expired_upload_sessions(limit: int = 50) -> List[dict]:
+    """Open sessions past their expiry — the sweep's work list. Complete,
+    rejected and cancelled sessions are never returned: their parts are
+    already gone or were never a session's responsibility."""
+    with connection() as con:
+        rows = con.execute(
+            "SELECT * FROM upload_sessions WHERE status IN ('uploading', 'finalizing') "
+            "AND expires_at < %s ORDER BY expires_at LIMIT %s",
+            (_now(), int(limit)),
+        ).fetchall()
+    return [_upload_session_row(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# V29 chat requests — one row per send intent
+# ---------------------------------------------------------------------------
+
+_CHAT_REQUEST_COLUMNS = (
+    "intent_id", "user_id", "conversation_id", "generation_id", "status", "attempt",
+    "resumable", "request", "error", "created_at", "updated_at", "finished_at",
+)
+
+
+def _chat_request_row(r: Any) -> dict:
+    out = {k: r[k] for k in _CHAT_REQUEST_COLUMNS}
+    for k in ("created_at", "updated_at", "finished_at"):
+        out[k] = _iso(out[k]) if out.get(k) else None
+    value = out.get("request")
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            value = {}
+    out["request"] = value if value is not None else {}
+    out["user_id"] = int(out["user_id"])
+    return out
+
+
+def create_chat_request(
+    intent_id: str,
+    user_id: int,
+    conversation_id: str,
+    generation_id: str,
+    request: dict,
+    *,
+    resumable: bool = True,
+) -> Optional[dict]:
+    """Record acceptance. Returns None when the intent already exists — the
+    caller then reads the existing row and attaches or replays."""
+    ts = _now()
+    with connection() as con:
+        row = con.execute(
+            """INSERT INTO chat_requests
+                   (intent_id, user_id, conversation_id, generation_id, request, resumable,
+                    created_at, updated_at)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+               ON CONFLICT (intent_id) DO NOTHING
+               RETURNING *""",
+            (intent_id, int(user_id), conversation_id, generation_id, _json_param(request), bool(resumable), ts, ts),
+        ).fetchone()
+    return _chat_request_row(row) if row is not None else None
+
+
+def get_chat_request(intent_id: str) -> Optional[dict]:
+    with connection() as con:
+        row = con.execute("SELECT * FROM chat_requests WHERE intent_id = %s", (intent_id,)).fetchone()
+    return _chat_request_row(row) if row is not None else None
+
+
+def latest_chat_request(conversation_id: str) -> Optional[dict]:
+    with connection() as con:
+        row = con.execute(
+            "SELECT * FROM chat_requests WHERE conversation_id = %s ORDER BY created_at DESC LIMIT 1",
+            (conversation_id,),
+        ).fetchone()
+    return _chat_request_row(row) if row is not None else None
+
+
+def set_chat_request_status(intent_id: str, status: str, *, error: str = "") -> Optional[dict]:
+    ts = _now()
+    terminal = status in ("completed", "failed", "cancelled")
+    with connection() as con:
+        row = con.execute(
+            "UPDATE chat_requests SET status = %s, error = %s, updated_at = %s, "
+            "finished_at = CASE WHEN %s THEN %s ELSE finished_at END "
+            "WHERE intent_id = %s RETURNING *",
+            (status, _text(error) or "", ts, terminal, ts, intent_id),
+        ).fetchone()
+    return _chat_request_row(row) if row is not None else None
+
+
+def resume_chat_request(intent_id: str, generation_id: str) -> Optional[dict]:
+    """A new attempt of an interrupted intent under a fresh generation id.
+    Only an 'interrupted' (or still 'accepted'/'running' after a lost
+    process) row can be resumed; a finished one is returned unchanged."""
+    ts = _now()
+    with connection() as con:
+        row = con.execute(
+            "UPDATE chat_requests SET generation_id = %s, attempt = attempt + 1, "
+            "status = 'accepted', error = '', updated_at = %s "
+            "WHERE intent_id = %s AND status IN ('interrupted', 'accepted', 'running') RETURNING *",
+            (generation_id, ts, intent_id),
+        ).fetchone()
+        if row is None:
+            row = con.execute("SELECT * FROM chat_requests WHERE intent_id = %s", (intent_id,)).fetchone()
+    return _chat_request_row(row) if row is not None else None
+
+
+def interrupt_open_chat_requests() -> int:
+    """Startup (or orderly shutdown): every request this process could have
+    been running is now 'interrupted'. Returns how many."""
+    with connection() as con:
+        rows = con.execute(
+            "UPDATE chat_requests SET status = 'interrupted', updated_at = %s "
+            "WHERE status IN ('accepted', 'running') RETURNING intent_id",
+            (_now(),),
+        ).fetchall()
+    return len(rows)
