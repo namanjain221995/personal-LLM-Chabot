@@ -13,19 +13,21 @@ asks for a re-upload — never a 500.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import mimetypes
 import os
+import re
 import shutil
+import time
 import uuid
 from typing import Optional
 
-import re
-
 from fastapi import (APIRouter, Depends, File, Form, HTTPException, Request,
                      UploadFile)
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
+from starlette.requests import ClientDisconnect
 
 from . import db
 from .auth import UserRow, require_user
@@ -130,6 +132,7 @@ async def create_upload(
         enforce_quota_and_ttl()
     except Exception:
         pass  # housekeeping only; never blocks an upload
+    await _sweep_quietly()  # the chunked rail's expiry rides the same hook
 
     size = await _stream_to_disk(file, raw_path)
     if purpose == "document":
@@ -457,6 +460,17 @@ def list_uploads(
 # under _PART_CAP and the pieces are reassembled here; each call carries the
 # same session and passes the same ownership check as everything else in this
 # file. LAN uploads may still use the single-shot endpoint above.
+#
+# V29 (2026-09-10, docs/upload-reliability/API.md): the session is a DATABASE
+# ROW, not a marker file. Until then the rail kept parts on disk and nothing
+# else, so a reload could not ask what had arrived, `complete` was not
+# idempotent, and a part whose body was cut short was accepted with whatever
+# bytes had landed. Now `upload_sessions` records owner, expectation, the
+# parts that are durable on disk and, once finalised, the exact response — the
+# disk holds bytes, the row holds truth about them, and every route reads the
+# row first. The pre-V29 marker is gone: a session that was mid-flight across
+# the deploy answers 404 and the browser starts it again, which is what a
+# deploy mid-upload already meant.
 
 _HEX32 = re.compile(r"^[0-9a-f]{32}$")
 #: Comfortably under the 100 MB edge wall, with room for multipart overhead.
@@ -464,7 +478,20 @@ _PART_CAP = 90 * 1024 * 1024
 #: 128 x 90 MiB = 11 GiB of headroom on the server side; the client's
 #: 64 MiB parts make a 4 GB video 60 parts (2026-09-09).
 _MAX_PARTS = 128
-_MARKER = "_chunked.json"
+#: Where a session's parts live under its upload root. Each accepted part is
+#: the file `<index>`; a part still streaming is `<index>.<nonce>.tmp`.
+_PARTS_DIR = "_parts"
+#: How long a `complete` that lost the race waits for the winner's outcome.
+#: A 4 GB assembly plus the video hash is tens of seconds on this disk; two
+#: minutes covers it with margin, and a caller that outlives it is told to
+#: ask again rather than left hanging on the edge's own timeout.
+_FINALIZE_WAIT_S = 120.0
+_FINALIZE_POLL_S = 0.25
+#: The expiry sweep piggybacks on upload traffic (there is no scheduler in
+#: this module); once a minute is plenty for a 24-hour TTL and keeps twenty
+#: simultaneous `init`s from all querying the same work list.
+_SWEEP_INTERVAL_S = 60.0
+_last_sweep_at: float = 0.0
 
 
 _CONVERSATION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -495,17 +522,258 @@ async def _own(conversation_id: str, user: UserRow) -> None:
         raise HTTPException(status_code=404, detail="conversation not found")
 
 
-def _chunk_state(conversation_id: str, upload_id: str) -> tuple[str, dict]:
-    """The session's root and marker. 404 for ids init never minted — an
-    unmarked directory name is indistinguishable from a guess."""
+async def _owned(conversation_id: str, user: UserRow) -> None:
+    """`_own` without the claim, for the routes that only READ or CANCEL.
+
+    A discovery GET on an id nobody owns must not mint a "New chat" row in
+    the caller's sidebar as a side effect; init already claimed the
+    conversation before any session could exist under it, so an unowned id
+    has no session to show and is refused exactly like someone else's.
+    """
+    owner = await db.run_in_thread(db.conversation_owner, conversation_id)
+    if owner is None or owner != int(user["id"]):
+        raise HTTPException(status_code=404, detail="upload not found")
+
+
+def _cap_total(purpose: str) -> int:
+    """The running-total ceiling for ONE session, by purpose.
+
+    PURPOSE-AWARE (2026-09-10): a video may be `VIDEO_MAX_UPLOAD_MB` (4096)
+    while documents and datasets stop at `UPLOAD_MAX_MB` (200). The rail used
+    to apply the smaller limit to everything, and yesterday's 400 MB video
+    only passed because the deployed UPLOAD_MAX_MB had been raised for it.
+    The same number is applied at all three points where bytes are counted —
+    the declared `size` at init, accepted-plus-streaming at every part, and
+    the assembled total at complete — so a session can never be refused later
+    for a total it was told was fine earlier.
+    """
+    mb = settings.video_max_upload_mb if purpose == "video" else settings.upload_max_mb
+    return int(mb) * 1024 * 1024
+
+
+def _too_large(purpose: str) -> HTTPException:
+    if purpose == "video":
+        return HTTPException(
+            status_code=413,
+            detail=f"That video is larger than {settings.video_max_upload_mb} MB.",
+        )
+    return HTTPException(
+        status_code=413, detail=f"That file is larger than {settings.upload_max_mb} MB."
+    )
+
+
+def _part_path(root: str, index: int) -> str:
+    return os.path.join(root, _PARTS_DIR, str(int(index)))
+
+
+def _uploads_base() -> str:
+    return os.path.join(settings.workspace_dir, "uploads")
+
+
+def _inside_uploads(path: str) -> bool:
+    """Only ever delete under `<workspace>/uploads`. The ids come from our own
+    rows, but a delete deserves its own fence regardless of who minted the
+    name."""
+    base = os.path.realpath(_uploads_base())
+    target = os.path.realpath(path)
+    return target != base and target.startswith(base + os.sep)
+
+
+def remove_session_parts(conversation_id: str, upload_id: str) -> None:
+    """Drop ONE session's parts directory and nothing else.
+
+    THE LAYOUT every caller relies on (the workspace sweep in core/repo.py
+    must learn it to spare live sessions):
+
+        <WORKSPACE_DIR>/uploads/<conversation_id>/<upload_id>/_parts/<index>
+                                                             /_parts/<index>.<nonce>.tmp
+                                                             /_original/<filename>
+
+    i.e. `upload_root(conversation_id, upload_id)/_parts`, with accepted parts
+    named by their bare index and in-flight ones carrying a nonce and `.tmp`.
+    This removes that `_parts` directory, and the session root only when it
+    is left empty. NEVER `_original`: for a completed upload that is the
+    file the conversation now refers to, and it has its own lifetime.
+    """
+    root = upload_root(conversation_id, upload_id)
+    if not _HEX32.fullmatch(upload_id or "") or not _inside_uploads(root):
+        return
+    shutil.rmtree(os.path.join(root, _PARTS_DIR), ignore_errors=True)
+    try:
+        if os.path.isdir(root) and not any(os.scandir(root)):
+            os.rmdir(root)
+    except OSError:
+        pass
+
+
+def _discard(tmp: str) -> None:
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        log.debug("could not remove %s", tmp, exc_info=True)
+
+
+def _keep_uploads_warm() -> None:
+    """Refresh the mtime of the top-level `uploads` directory.
+
+    core/repo.enforce_quota_and_ttl deletes whole TOP-LEVEL workspace
+    directories by age, and `uploads/` is one of them — its mtime moves only
+    when a conversation directory is created or removed directly inside it.
+    A quiet deployment whose last new conversation was a day ago would lose
+    every live session's parts to the next single-shot upload's housekeeping.
+    Touching the directory as parts arrive keeps it younger than the TTL for
+    exactly as long as something in it is still being uploaded.
+    """
+    try:
+        os.utime(_uploads_base(), None)
+    except OSError:
+        pass
+
+
+def _present_parts(session: dict, root: str) -> dict:
+    """index -> bytes for the parts the row lists AND the disk still holds at
+    that size. The row is written only after the file is durable, so the two
+    agree unless something outside this module removed the file (the
+    workspace sweep, an operator); then the disk wins, the part is reported
+    as not there, and the client sends it again."""
+    out: dict = {}
+    for key, entry in (session.get("accepted_parts") or {}).items():
+        try:
+            index = int(key)
+            nbytes = int((entry or {}).get("bytes") or 0)
+            if os.path.getsize(_part_path(root, index)) == nbytes:
+                out[index] = nbytes
+        except (OSError, TypeError, ValueError):
+            continue
+    return out
+
+
+def _accepted(session: dict, root: str) -> tuple:
+    """(sorted indexes, total bytes) as the client should see them. A
+    completed session's parts are gone by design, so its row is the record;
+    every other status is checked against the disk."""
+    if session.get("status") == "complete":
+        parts = session.get("accepted_parts") or {}
+        indexes = sorted(int(k) for k in parts)
+        return indexes, int(session.get("bytes_received") or 0)
+    present = _present_parts(session, root)
+    return sorted(present), sum(present.values())
+
+
+async def _load_session(conversation_id: str, upload_id: str, user: UserRow) -> dict:
+    """The row, or 404. Unknown, malformed, someone else's, or a session that
+    belongs to a different conversation are all the same answer: a flat id
+    space must not work as an oracle, and 403 would confirm the id exists."""
     if not _HEX32.fullmatch(upload_id or ""):
         raise HTTPException(status_code=404, detail="upload not found")
-    root = upload_root(conversation_id, upload_id)
-    marker = os.path.join(root, _MARKER)
-    if not os.path.isfile(marker):
+    session = await db.run_in_thread(db.get_upload_session, upload_id)
+    if (
+        session is None
+        or int(session["user_id"]) != int(user["id"])
+        or session["conversation_id"] != conversation_id
+    ):
         raise HTTPException(status_code=404, detail="upload not found")
-    with open(marker, encoding="utf-8") as fh:
-        return root, json.load(fh)
+    return session
+
+
+def _require_uploading(session: Optional[dict]) -> None:
+    """Parts land only on an `uploading` session: 409 while it is being (or
+    has been) finalised — the bytes belong to the conversation then — and
+    404 for every terminal state, where there is nothing left to add to."""
+    status = (session or {}).get("status")
+    if status == "uploading":
+        return
+    if status in ("finalizing", "complete"):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This upload is being finalised."
+                if status == "finalizing"
+                else "This upload is already complete."
+            ),
+        )
+    raise HTTPException(status_code=404, detail="upload not found")
+
+
+def _declared_sha256(request: Request) -> Optional[str]:
+    raw = (request.headers.get("x-part-sha256") or "").strip().lower()
+    if not raw:
+        return None
+    if not re.fullmatch(r"[0-9a-f]{64}", raw):
+        raise HTTPException(
+            status_code=422, detail="X-Part-SHA256 is not a hex-encoded SHA-256 digest"
+        )
+    return raw
+
+
+def _session_view(session: dict, root: str) -> dict:
+    accepted, received = _accepted(session, root)
+    return {
+        "upload_id": session["id"],
+        "status": session["status"],
+        "filename": session["filename"],
+        "purpose": session["purpose"],
+        "expected_bytes": session.get("expected_bytes"),
+        "expected_parts": session.get("expected_parts"),
+        "part_size": session.get("part_size"),
+        "accepted_parts": accepted,
+        "bytes_received": received,
+        "expires_at": session.get("expires_at"),
+        "result": session.get("result") if session["status"] == "complete" else None,
+        # Additive: the sentence a rejected session was refused with, so a
+        # browser that reloads can still show why instead of a bare status.
+        "error": session.get("error") or None,
+    }
+
+
+def _count_session(purpose: str, result: str) -> None:
+    from . import metrics
+
+    metrics.inc(
+        "upload_session_total", "Chunked upload sessions by final outcome.",
+        purpose=purpose, result=result,
+    )
+
+
+def _count_part_bytes(purpose: str, nbytes: int) -> None:
+    """upload_part_bytes_total{purpose} += nbytes.
+
+    metrics.inc adds exactly one, and there is no add-by-N in app/metrics
+    yet; this walks the same registry the same way `inc` does (declare,
+    clean the labels, take the lock) so the exposition is a plain counter
+    under the name API.md promises. Never raises, like everything there.
+    """
+    from . import metrics
+
+    try:
+        metrics._declare(
+            "upload_part_bytes_total", "counter", "Bytes accepted into chunked upload parts."
+        )
+        key = metrics._clean({"purpose": purpose})
+        with metrics._lock:
+            series = metrics._counters.setdefault("upload_part_bytes_total", {})
+            series[key] = series.get(key, 0.0) + float(nbytes)
+    except Exception:  # noqa: BLE001 — a metric must never break a request
+        pass
+
+
+async def _sweep_quietly() -> None:
+    """Run the expiry sweep behind an upload, at most once a minute, and
+    never let it touch the response: housekeeping is not the caller's
+    problem."""
+    global _last_sweep_at
+    now = time.monotonic()
+    if now - _last_sweep_at < _SWEEP_INTERVAL_S:
+        return
+    _last_sweep_at = now
+    try:
+        swept = await asyncio.to_thread(sweep_expired_upload_sessions)
+        if swept:
+            log.info("swept %d expired upload session(s)", swept)
+    except Exception:  # noqa: BLE001
+        log.debug("upload session sweep skipped", exc_info=True)
 
 
 @router.post("/chunked/init")
@@ -514,6 +782,12 @@ async def chunked_init(
     conversation_id: str = Form(...),
     filename: str = Form(...),
     purpose: str = Form("document"),
+    # Optional expectation (V29). A client that declares them lets `complete`
+    # tell a missing FINAL part from a finished file; one that does not gets
+    # the old behaviour, where the last part present is taken as the last.
+    size: Optional[int] = Form(None),
+    parts: Optional[int] = Form(None),
+    part_size: Optional[int] = Form(None),
     user: UserRow = Depends(require_user),
     _attachments: None = Depends(require_attachments),
 ) -> dict:
@@ -525,20 +799,51 @@ async def chunked_init(
         from .video.api import require_video
 
         await require_video(request)
-    await _own(conversation_id, user)
-    upload_id = uuid.uuid4().hex
-    root = upload_root(conversation_id, upload_id)
-    os.makedirs(os.path.join(root, "_parts"), exist_ok=True)
-    with open(os.path.join(root, _MARKER), "w", encoding="utf-8") as fh:
-        json.dump(
-            {"filename": os.path.basename(filename or "upload.bin"),
-             "purpose": purpose},
-            fh,
+    # Everything the declaration makes impossible is refused HERE, before a
+    # single byte moves: a file above the cap, more parts than the rail can
+    # take, a part size no part could carry, or three numbers that disagree.
+    if size is not None:
+        if size < 0:
+            raise HTTPException(status_code=400, detail="size cannot be negative")
+        if size > _cap_total(purpose):
+            raise _too_large(purpose)
+    if parts is not None and not 1 <= parts <= _MAX_PARTS:
+        raise HTTPException(
+            status_code=400, detail=f"parts must be between 1 and {_MAX_PARTS}"
         )
+    if part_size is not None:
+        if part_size < 1:
+            raise HTTPException(status_code=400, detail="part_size must be positive")
+        if part_size > _PART_CAP:
+            raise HTTPException(
+                status_code=413, detail=f"part_size exceeds {_PART_CAP // (1024 * 1024)} MB"
+            )
+    if size is not None and parts is not None and part_size is not None:
+        if not (parts - 1) * part_size < max(size, 1) <= parts * part_size:
+            raise HTTPException(
+                status_code=400, detail="size, parts and part_size do not agree"
+            )
+    await _own(conversation_id, user)
+    await _sweep_quietly()
+
+    upload_id = uuid.uuid4().hex
+    session = await db.run_in_thread(
+        db.create_upload_session,
+        upload_id, int(user["id"]), conversation_id,
+        os.path.basename(filename or "upload.bin"), purpose,
+        expected_bytes=size, expected_parts=parts, part_size=part_size,
+        ttl_hours=settings.upload_session_ttl_hours,
+    )
+    root = upload_root(conversation_id, upload_id)
+    os.makedirs(os.path.join(root, _PARTS_DIR), exist_ok=True)
+    _keep_uploads_warm()
     return {
         "upload_id": upload_id,
         "part_limit_bytes": _PART_CAP,
         "max_parts": _MAX_PARTS,
+        "expires_at": session["expires_at"],
+        "accepted_parts": [],
+        "bytes_received": 0,
     }
 
 
@@ -550,33 +855,292 @@ async def chunked_part(
     request: Request,
     user: UserRow = Depends(require_user),
 ) -> dict:
+    """One part: streamed to a temporary file, hashed on the way, renamed
+    into place only once the body ended cleanly.
+
+    A body cut short — the reload that produced yesterday's
+    `ClientDisconnect` traceback — leaves NO accepted part: the temporary
+    file goes, nothing is recorded, and the answer is quiet. Before, the
+    partial file kept the part's name and `complete` would have stitched it
+    in as if it were whole.
+    """
     await _own(conversation_id, user)
-    root, _state = _chunk_state(conversation_id, upload_id)
+    session = await _load_session(conversation_id, upload_id, user)
+    _require_uploading(session)
     if not 0 <= index < _MAX_PARTS:
         raise HTTPException(status_code=400, detail="part index out of range")
-    cap_total = settings.upload_max_mb * 1024 * 1024
-    parts_dir = os.path.join(root, "_parts")
-    already = sum(
-        e.stat().st_size for e in os.scandir(parts_dir) if e.is_file()
-    )
-    dest = os.path.join(parts_dir, f"{index:05d}")
+    expected_parts = session.get("expected_parts")
+    if expected_parts is not None and index >= int(expected_parts):
+        raise HTTPException(status_code=400, detail="part index out of range")
+    declared = _declared_sha256(request)
+    purpose = session["purpose"]
+    root = upload_root(conversation_id, upload_id)
+    # The quota is what the SESSION has accepted, not what the directory
+    # holds: an index being replaced counts once, and a stray temporary file
+    # from an interrupted attempt counts for nothing.
+    already = sum(n for i, n in _present_parts(session, root).items() if i != index)
+    cap_total = _cap_total(purpose)
+
+    final = _part_path(root, index)
+    # A nonce, not a bare `<index>.tmp`: a resumed upload can re-send a part
+    # while the server is still draining the connection the browser gave up
+    # on, and two writers on one temporary file would interleave.
+    tmp = f"{final}.{uuid.uuid4().hex[:8]}.tmp"
+    os.makedirs(os.path.dirname(final), exist_ok=True)
     written = 0
-    with open(dest, "wb") as out:
-        async for chunk in request.stream():
-            written += len(chunk)
-            if written > _PART_CAP or already + written > cap_total:
-                out.close()
-                os.unlink(dest)
-                raise HTTPException(
-                    status_code=413,
-                    detail=(
-                        f"part exceeds {_PART_CAP // (1024 * 1024)} MB"
-                        if written > _PART_CAP
-                        else f"That file is larger than {settings.upload_max_mb} MB."
-                    ),
-                )
-            out.write(chunk)
-    return {"received": written}
+    digest = hashlib.sha256()
+    try:
+        with open(tmp, "wb") as out:
+            async for chunk in request.stream():
+                if not chunk:
+                    continue
+                written += len(chunk)
+                if written > _PART_CAP:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"part exceeds {_PART_CAP // (1024 * 1024)} MB",
+                    )
+                if already + written > cap_total:
+                    raise _too_large(purpose)
+                digest.update(chunk)
+                out.write(chunk)
+            out.flush()
+            await asyncio.to_thread(os.fsync, out.fileno())
+    except ClientDisconnect:
+        _discard(tmp)
+        log.info(
+            "chunked part %d of %s: client went away after %d bytes; nothing recorded",
+            index, upload_id, written,
+        )
+        raise HTTPException(
+            status_code=408,
+            detail="The connection closed before the part was complete. Send it again.",
+        )
+    except BaseException:
+        _discard(tmp)
+        raise
+
+    actual = digest.hexdigest()
+    if declared is not None and actual != declared:
+        _discard(tmp)
+        raise HTTPException(
+            status_code=422,
+            detail="The part's bytes do not match X-Part-SHA256. Send it again.",
+        )
+    # The status is re-read AFTER the body: a `complete` can win the row while
+    # a slow part is still streaming, and a part renamed in under an assembly
+    # would land in a file that is already being read.
+    fresh = await db.run_in_thread(db.get_upload_session, upload_id)
+    if fresh is None or fresh.get("status") != "uploading":
+        _discard(tmp)
+        _require_uploading(fresh)
+    os.replace(tmp, final)
+    _keep_uploads_warm()
+    row = await db.run_in_thread(db.record_upload_part, upload_id, index, written, actual)
+    if row is None:  # the row vanished between the rename and the record
+        _discard(final)
+        raise HTTPException(status_code=404, detail="upload not found")
+    _count_part_bytes(purpose, written)
+    accepted, received = _accepted(row, root)
+    return {"received": written, "accepted_parts": accepted, "bytes_received": received}
+
+
+@router.get("/chunked/{conversation_id}/{upload_id}")
+async def chunked_status(
+    conversation_id: str,
+    upload_id: str,
+    user: UserRow = Depends(require_user),
+) -> dict:
+    """What the server already has — the resume call after a reload."""
+    await _owned(conversation_id, user)
+    session = await _load_session(conversation_id, upload_id, user)
+    if session["status"] == "expired":
+        # Swept: the parts are gone and the row is only a tombstone. The
+        # contract says 404 so the browser treats it exactly like an id it
+        # never had, and starts over rather than trying to resume nothing.
+        raise HTTPException(status_code=404, detail="upload not found")
+    return _session_view(session, upload_root(conversation_id, upload_id))
+
+
+def _missing_parts(session: dict, present: dict) -> list:
+    """The indexes the client must (re)send before the file can be assembled.
+
+    With `parts` declared the range is exact. Without it the last index
+    present is taken as the last there is — the only reading available —
+    and a declared `part_size` then checks the shape: every part but the
+    last must be exactly that size, the last at most that size. A part that
+    fails the shape check is listed as missing, since sending it again is
+    the fix. THE LIMIT: a client that declares neither `parts` nor `size`
+    cannot be told apart from one whose final part has not arrived when the
+    last present part is exactly `part_size` long — `complete` then trusts
+    the caller, as the rail always did for such clients.
+    """
+    expected_parts = session.get("expected_parts")
+    part_size = session.get("part_size")
+    if expected_parts:
+        count = int(expected_parts)
+    else:
+        count = (max(present) + 1) if present else 0
+    missing = {i for i in range(count) if i not in present}
+    if part_size:
+        size = int(part_size)
+        last = count - 1
+        for index, nbytes in present.items():
+            if index < last and nbytes != size:
+                missing.add(index)
+            elif index == last and nbytes > size:
+                missing.add(index)
+    return sorted(missing)
+
+
+def _not_ready(session: dict, present: dict) -> Optional[JSONResponse]:
+    """The refusal that sends the client back to uploading, or None when the
+    parts on disk are a whole file by every declaration the client made.
+
+    A JSONResponse rather than an HTTPException: the contract's 409 body is
+    FLAT (`detail`, `missing_parts`, `accepted_parts` side by side) so the
+    browser reads the list without unwrapping, and FastAPI would nest a
+    dict `detail` one level down.
+    """
+    accepted = sorted(present)
+    if not present:
+        raise HTTPException(status_code=400, detail="no parts were uploaded")
+    missing = _missing_parts(session, present)
+    if missing:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": "parts are missing",
+                "missing_parts": missing,
+                "accepted_parts": accepted,
+            },
+        )
+    expected_bytes = session.get("expected_bytes")
+    total = sum(present.values())
+    if expected_bytes is not None and total != int(expected_bytes):
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": f"received {total} bytes, expected {int(expected_bytes)}",
+                "missing_parts": [],
+                "accepted_parts": accepted,
+                "bytes_received": total,
+            },
+        )
+    return None
+
+
+def _assemble(root: str, present: dict, raw_path: str) -> int:
+    """Concatenate the parts in index order into `_original` — a streaming
+    copy through a 1 MiB buffer, written to a sibling temporary file and
+    renamed so a crash mid-way never leaves a short `_original` that a later
+    reader could mistake for the file.
+
+    Blocking by design and therefore ALWAYS called through asyncio.to_thread:
+    the pre-V29 `complete` did this concatenation on the event loop, and a
+    400 MB video stalled every other request for the seconds it took
+    (review F-02). The video finaliser's sha256 of the result is off-loop
+    too (video/api.attach_upload runs store.hash_file in a thread).
+    """
+    os.makedirs(os.path.dirname(raw_path), exist_ok=True)
+    tmp = raw_path + ".assembling"
+    size = 0
+    with open(tmp, "wb") as out:
+        for index in sorted(present):
+            with open(_part_path(root, index), "rb") as fh:
+                while True:
+                    chunk = fh.read(_CHUNK)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    out.write(chunk)
+        out.flush()
+        os.fsync(out.fileno())
+    os.replace(tmp, raw_path)
+    return size
+
+
+def _stored_rejection(session: dict) -> HTTPException:
+    """Replay the refusal the finaliser recorded, code and sentence alike."""
+    stored = session.get("result") if isinstance(session.get("result"), dict) else {}
+    code = int(stored.get("status_code") or 409)
+    detail = stored.get("detail") or session.get("error") or "This upload was rejected."
+    return HTTPException(status_code=code, detail=detail)
+
+
+async def _finalise_session(conversation_id: str, upload_id: str, user: UserRow):
+    """The winner's path: the row is `finalizing` and no part can land now.
+
+    Three outcomes. Not ready (a hole, a wrong total, nothing at all): the row
+    goes back to `uploading` and the client is told what to send. Rejected by
+    a finaliser (too big for its purpose, not a dataset): the row is terminal
+    and remembers the refusal so a retry replays it. Complete: the finaliser's
+    response is stored on the row FIRST, then the parts are dropped — a crash
+    between the two costs disk until the workspace TTL, never the answer.
+    """
+    from . import metrics
+
+    session = await db.run_in_thread(db.get_upload_session, upload_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="upload not found")
+    purpose = session["purpose"]
+    filename = os.path.basename(session["filename"] or "upload.bin")
+    root = upload_root(conversation_id, upload_id)
+    present = await asyncio.to_thread(_present_parts, session, root)
+
+    try:
+        problem = _not_ready(session, present)
+    except HTTPException:
+        await db.run_in_thread(db.set_upload_session_status, upload_id, "uploading")
+        raise
+    if problem is not None:
+        await db.run_in_thread(db.set_upload_session_status, upload_id, "uploading")
+        return problem
+
+    started = time.monotonic()
+    raw_path = os.path.join(root, "_original", filename)
+    try:
+        total = sum(present.values())
+        if total > _cap_total(purpose):
+            raise _too_large(purpose)
+        size = await asyncio.to_thread(_assemble, root, present, raw_path)
+        if purpose == "document":
+            result = await _finalise_document(conversation_id, upload_id, filename, size)
+        elif purpose == "video":
+            result = await _finalise_video(
+                conversation_id, upload_id, filename, raw_path, size, user
+            )
+        else:
+            result = await _finalise_dataset(conversation_id, upload_id, filename, raw_path, size)
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, str) else json.dumps(exc.detail)
+        await asyncio.to_thread(remove_session_parts, conversation_id, upload_id)
+        await db.run_in_thread(
+            db.set_upload_session_status, upload_id, "rejected",
+            error=detail, result={"status_code": int(exc.status_code), "detail": exc.detail},
+        )
+        _count_session(purpose, "rejected")
+        raise
+    except Exception:
+        # Not a verdict on the file — a full disk, a database hiccup. The
+        # parts are intact, so the row goes back to `uploading` and the
+        # client may call `complete` again rather than upload everything twice.
+        log.exception("chunked upload %s could not be finalised", upload_id)
+        await db.run_in_thread(db.set_upload_session_status, upload_id, "uploading")
+        raise HTTPException(
+            status_code=500, detail="The upload could not be finalised. Try again."
+        )
+
+    await db.run_in_thread(
+        db.set_upload_session_status, upload_id, "complete", result=result
+    )
+    await asyncio.to_thread(remove_session_parts, conversation_id, upload_id)
+    metrics.observe(
+        "upload_finalize_seconds", time.monotonic() - started,
+        "Time from winning the finalisation to the stored result.", purpose=purpose,
+    )
+    _count_session(purpose, "complete")
+    return result
 
 
 @router.post("/chunked/{conversation_id}/{upload_id}/complete")
@@ -585,35 +1149,90 @@ async def chunked_complete(
     upload_id: str,
     user: UserRow = Depends(require_user),
 ) -> dict:
+    """Idempotent: exactly one caller finalises; everyone else gets ITS answer.
+
+    The row moves `uploading -> finalizing` under a row lock, so of two
+    concurrent completes one assembles and the other waits and replays the
+    stored outcome — same body, same status code. A `complete` retried after
+    a lost acknowledgement finds the row already `complete` and answers
+    from it without touching the disk.
+    """
     await _own(conversation_id, user)
-    root, state = _chunk_state(conversation_id, upload_id)
-    parts_dir = os.path.join(root, "_parts")
-    parts = sorted(e.name for e in os.scandir(parts_dir) if e.is_file())
-    if not parts:
-        raise HTTPException(status_code=400, detail="no parts were uploaded")
-    expected = [f"{i:05d}" for i in range(len(parts))]
-    if parts != expected:
+    await _load_session(conversation_id, upload_id, user)
+    deadline = time.monotonic() + _FINALIZE_WAIT_S
+    while True:
+        before = await db.run_in_thread(db.try_begin_upload_finalize, upload_id)
+        if before is None:
+            raise HTTPException(status_code=404, detail="upload not found")
+        if before == "uploading":
+            return await _finalise_session(conversation_id, upload_id, user)
+        if before == "finalizing":
+            if time.monotonic() >= deadline:
+                raise HTTPException(
+                    status_code=409,
+                    detail="This upload is still being finalised. Ask again shortly.",
+                )
+            await asyncio.sleep(_FINALIZE_POLL_S)
+            continue
+        session = await db.run_in_thread(db.get_upload_session, upload_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="upload not found")
+        if before == "complete":
+            return session.get("result") or {"upload_id": upload_id}
+        if before == "rejected":
+            raise _stored_rejection(session)
+        # cancelled / expired: the parts are gone, there is nothing to finish.
+        raise HTTPException(status_code=404, detail="upload not found")
+
+
+@router.delete("/chunked/{conversation_id}/{upload_id}", status_code=204)
+async def chunked_cancel(
+    conversation_id: str,
+    upload_id: str,
+    user: UserRow = Depends(require_user),
+) -> Response:
+    """Cancel an `uploading` session and reclaim its parts. Idempotent for a
+    session that is already over (cancelled, expired, rejected): the bytes
+    are gone either way, and the person asked for exactly that."""
+    await _owned(conversation_id, user)
+    session = await _load_session(conversation_id, upload_id, user)
+    if session["status"] in ("finalizing", "complete"):
         raise HTTPException(
-            status_code=400,
-            detail="parts are not contiguous — re-upload the missing piece",
+            status_code=409,
+            detail="This upload has been finalised and belongs to the conversation now.",
         )
-    filename = state["filename"]
-    raw_path = os.path.join(root, "_original", filename)
-    os.makedirs(os.path.dirname(raw_path), exist_ok=True)
-    size = 0
-    with open(raw_path, "wb") as out:
-        for name in parts:
-            with open(os.path.join(parts_dir, name), "rb") as fh:
-                while True:
-                    chunk = fh.read(_CHUNK)
-                    if not chunk:
-                        break
-                    size += len(chunk)
-                    out.write(chunk)
-    shutil.rmtree(parts_dir, ignore_errors=True)
-    os.unlink(os.path.join(root, _MARKER))
-    if state["purpose"] == "document":
-        return await _finalise_document(conversation_id, upload_id, filename, size)
-    if state["purpose"] == "video":
-        return await _finalise_video(conversation_id, upload_id, filename, raw_path, size, user)
-    return await _finalise_dataset(conversation_id, upload_id, filename, raw_path, size)
+    if session["status"] == "uploading":
+        await asyncio.to_thread(remove_session_parts, conversation_id, upload_id)
+        await db.run_in_thread(
+            db.set_upload_session_status, upload_id, "cancelled",
+            error="cancelled by the uploader",
+        )
+        _count_session(session["purpose"], "cancelled")
+    return Response(status_code=204)
+
+
+def sweep_expired_upload_sessions(limit: int = 50) -> int:
+    """Reclaim the parts of open sessions past their TTL and mark them
+    `expired`. Returns how many were swept.
+
+    Only `uploading` rows: a `finalizing` one is somebody's assembly in
+    progress and API.md says the sweep never touches it (the work list
+    accessor returns both, so it is filtered here). `_original` is never
+    removed — it is not a session's to remove — and nothing outside
+    `<workspace>/uploads` can be reached from a row. Synchronous on purpose:
+    the async callers run it in a thread, and tests call it directly.
+    """
+    swept = 0
+    for session in db.expired_upload_sessions(limit):
+        if session.get("status") != "uploading":
+            continue
+        upload_id = str(session["id"])
+        if not _HEX32.fullmatch(upload_id):
+            continue
+        remove_session_parts(str(session["conversation_id"]), upload_id)
+        db.set_upload_session_status(
+            upload_id, "expired", error="the upload session expired before it was completed"
+        )
+        _count_session(str(session["purpose"]), "expired")
+        swept += 1
+    return swept

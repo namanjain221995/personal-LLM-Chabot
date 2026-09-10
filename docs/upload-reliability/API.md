@@ -166,3 +166,20 @@ requeues rows whose lease has lapsed.
 `upload_finalize_seconds{purpose}`, `chat_request_total{result}`
 (`accepted|attached|replayed|resumed|conflict`), `chat_request_resume_total`,
 `video_lease_steal_total`. No user, conversation or intent ids as labels.
+
+## History
+
+### `PUT /history/conversations/{conversation_id}/messages` — new optional `expected_updated_at`
+
+The thread replace becomes conditional. The client sends the conversation's
+`updated_at` it last loaded (ISO string, exactly as `GET` returned it). If
+the server's current value differs, the server answers **409**
+`{"detail": "conversation changed", "updated_at": "<server's>", "messages": <count>}`
+and writes nothing; the client reloads server truth and re-applies only its
+LOCAL-ONLY tail (turns whose ids are not on the server). Without the field
+the behaviour is unchanged (replace, never shrink). Old clients keep working;
+new clients always send it, so an older tab can no longer overwrite an answer
+the server persisted after the tab last loaded.
+
+Every successful write of a conversation's messages (append, replace,
+truncate, feedback) bumps `conversations.updated_at`, and `GET` returns it.

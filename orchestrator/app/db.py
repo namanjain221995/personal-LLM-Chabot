@@ -3731,8 +3731,22 @@ def truncate_messages(
     return {"id": conversation_id, "count": keep}
 
 
+class ConversationChanged(Exception):
+    """The thread moved since the client last loaded it (V29 conditional
+    replace): the server's updated_at is not what the client expected."""
+
+    def __init__(self, updated_at: Any, count: int) -> None:
+        super().__init__("conversation changed")
+        self.updated_at = updated_at
+        self.count = count
+
+
 def replace_messages(
-    user_id: int, conversation_id: str, messages: List[dict]
+    user_id: int,
+    conversation_id: str,
+    messages: List[dict],
+    *,
+    expected_updated_at: Optional[str] = None,
 ) -> Optional[dict]:
     """Atomically replace a conversation's messages, never reducing the count.
 
@@ -3752,7 +3766,7 @@ def replace_messages(
     now = _now()
     with connection() as con:
         owned = con.execute(
-            "SELECT 1 FROM conversations WHERE id = %s AND user_id = %s FOR UPDATE",
+            "SELECT updated_at FROM conversations WHERE id = %s AND user_id = %s FOR UPDATE",
             (conversation_id, user_id),
         ).fetchone()
         if not owned:
@@ -3763,6 +3777,15 @@ def replace_messages(
                 (conversation_id,),
             ).fetchone()["n"]
         )
+        # V29: a client that says what it last saw only replaces that. An
+        # older tab pushing a thread of the same length used to overwrite an
+        # answer the server had persisted after the tab last loaded — the
+        # count check cannot see a same-length replacement. The row lock
+        # above makes the comparison and the write one step.
+        if expected_updated_at is not None:
+            current = _iso(owned["updated_at"]) if owned.get("updated_at") else None
+            if str(expected_updated_at) != str(current):
+                raise ConversationChanged(current, existing)
         if len(messages) < existing:
             raise MessageCountWouldShrink(existing, len(messages))
         # Snapshot the thumbs before the rows they belong to are deleted.
@@ -3823,6 +3846,8 @@ def add_message(
     role: str,
     content: str,
     meta: Optional[dict] = None,
+    *,
+    replace_existing: bool = False,
 ) -> Optional[dict]:
     """Append a message to a conversation the user owns; bumps updated_at.
 
@@ -3870,6 +3895,15 @@ def add_message(
             # generation first. Hand back the row that won — no duplicate.
             if not generation_id:
                 raise
+            if replace_existing:
+                # V29: the server's own write of a finished answer wins over a
+                # placeholder a client stored under the same generation (a
+                # failure record, an interrupted stub): same row, new body.
+                con.execute(
+                    "UPDATE messages SET content = %s, meta = %s "
+                    "WHERE conversation_id = %s AND generation_id = %s",
+                    (_text(content), _json_param(meta), conversation_id, str(generation_id)),
+                )
             row = con.execute(
                 "SELECT id, role, content, meta, created_at FROM messages "
                 "WHERE conversation_id = %s AND generation_id = %s",
@@ -5025,7 +5059,7 @@ _VIDEO_COLUMNS = (
     "stages", "error", "attempt", "pipeline_version", "duration_ms", "width",
     "height", "has_audio", "has_video", "language", "probe", "counts", "summary",
     "understanding", "artifacts", "indexed_at", "chunk_version", "created_at",
-    "updated_at", "started_at", "finished_at",
+    "updated_at", "started_at", "finished_at", "lease_owner", "lease_expires_at",
 )
 
 #: Columns update_video_analysis may touch. Identity, hash and created_at are
@@ -5042,7 +5076,7 @@ _VIDEO_TEXT = frozenset({"media_type", "filename", "status", "stage", "error", "
 
 def _video_row(r: Any) -> dict:
     out = {k: r[k] for k in _VIDEO_COLUMNS}
-    for k in ("created_at", "updated_at", "started_at", "finished_at", "indexed_at"):
+    for k in ("created_at", "updated_at", "started_at", "finished_at", "indexed_at", "lease_expires_at"):
         out[k] = _iso(out[k]) if out.get(k) else None
     for k in _VIDEO_JSON:
         value = out.get(k)
@@ -5402,6 +5436,39 @@ def set_upload_session_status(
     return _upload_session_row(row) if row is not None else None
 
 
+def reset_stale_finalizing_upload_sessions(older_than_s: float) -> int:
+    """A session left `finalizing` by a process that died mid-complete goes
+    back to `uploading`, parts intact, so the next `complete` can finish the
+    job instead of waiting on a finaliser that no longer exists. Only rows
+    untouched for `older_than_s` — a finaliser that is merely slow keeps
+    bumping updated_at."""
+    cutoff = _now() - timedelta(seconds=float(older_than_s))
+    with connection() as con:
+        rows = con.execute(
+            "UPDATE upload_sessions SET status = 'uploading', updated_at = %s "
+            "WHERE status = 'finalizing' AND updated_at < %s RETURNING id",
+            (_now(), cutoff),
+        ).fetchall()
+    return len(rows)
+
+
+def set_upload_session_status_if(
+    upload_id: str, expected: Sequence[str], status: str, *, error: str = ""
+) -> Optional[dict]:
+    """A conditional transition: only from one of `expected`. Returns the row
+    after the write, or None when the row was not in an expected status (the
+    caller then reads it and decides). Lets DELETE refuse to cancel a session
+    another request is finalising at that very moment."""
+    ts = _now()
+    with connection() as con:
+        row = con.execute(
+            "UPDATE upload_sessions SET status = %s, error = %s, updated_at = %s "
+            "WHERE id = %s AND status = ANY(%s) RETURNING *",
+            (status, _text(error) or "", ts, upload_id, list(expected)),
+        ).fetchone()
+    return _upload_session_row(row) if row is not None else None
+
+
 def expired_upload_sessions(limit: int = 50) -> List[dict]:
     """Open sessions past their expiry — the sweep's work list. Complete,
     rejected and cancelled sessions are never returned: their parts are
@@ -5493,21 +5560,74 @@ def set_chat_request_status(intent_id: str, status: str, *, error: str = "") -> 
     return _chat_request_row(row) if row is not None else None
 
 
-def resume_chat_request(intent_id: str, generation_id: str) -> Optional[dict]:
-    """A new attempt of an interrupted intent under a fresh generation id.
-    Only an 'interrupted' (or still 'accepted'/'running' after a lost
-    process) row can be resumed; a finished one is returned unchanged."""
+def resume_chat_request(
+    intent_id: str,
+    generation_id: str,
+    *,
+    reopen_finished: bool = False,
+    expected_generation_id: Optional[str] = None,
+) -> Optional[dict]:
+    """A new attempt of an intent under a fresh generation id.
+
+    By default only an 'interrupted' (or still 'accepted'/'running' after a
+    lost process) row is resumed; `reopen_finished` also lets a 'failed' or
+    'cancelled' one be asked again. `expected_generation_id` makes the
+    transition conditional on the generation the caller saw, so two callers
+    racing to resume the same intent cannot both win — the loser sees the
+    row unchanged and attaches to the winner's generation instead."""
     ts = _now()
+    allowed = ["interrupted", "accepted", "running"] + (["failed", "cancelled"] if reopen_finished else [])
     with connection() as con:
-        row = con.execute(
-            "UPDATE chat_requests SET generation_id = %s, attempt = attempt + 1, "
-            "status = 'accepted', error = '', updated_at = %s "
-            "WHERE intent_id = %s AND status IN ('interrupted', 'accepted', 'running') RETURNING *",
-            (generation_id, ts, intent_id),
-        ).fetchone()
+        if expected_generation_id is None:
+            row = con.execute(
+                "UPDATE chat_requests SET generation_id = %s, attempt = attempt + 1, "
+                "status = 'accepted', error = '', updated_at = %s "
+                "WHERE intent_id = %s AND status = ANY(%s) RETURNING *",
+                (generation_id, ts, intent_id, allowed),
+            ).fetchone()
+        else:
+            row = con.execute(
+                "UPDATE chat_requests SET generation_id = %s, attempt = attempt + 1, "
+                "status = 'accepted', error = '', updated_at = %s "
+                "WHERE intent_id = %s AND status = ANY(%s) AND generation_id = %s RETURNING *",
+                (generation_id, ts, intent_id, allowed, expected_generation_id),
+            ).fetchone()
         if row is None:
             row = con.execute("SELECT * FROM chat_requests WHERE intent_id = %s", (intent_id,)).fetchone()
     return _chat_request_row(row) if row is not None else None
+
+
+def get_message_by_generation(conversation_id: str, generation_id: str) -> Optional[dict]:
+    """The stored message for a generation, if any — how `answer_persisted`
+    is answered without listing the whole thread."""
+    with connection() as con:
+        row = con.execute(
+            "SELECT id, role, content, meta, created_at FROM messages "
+            "WHERE conversation_id = %s AND generation_id = %s",
+            (conversation_id, str(generation_id)),
+        ).fetchone()
+    if row is None:
+        return None
+    meta = row["meta"]
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except ValueError:
+            meta = None
+    return {"id": int(row["id"]), "role": row["role"], "content": row["content"], "meta": meta, "created_at": _iso(row["created_at"])}
+
+
+def delete_failure_record(conversation_id: str, generation_id: str) -> bool:
+    """Remove the assistant row a FAILED generation left (meta.error), so a
+    successful new attempt is not shown under an old failure. Never touches
+    a row that holds an answer."""
+    with connection() as con:
+        row = con.execute(
+            "DELETE FROM messages WHERE conversation_id = %s AND generation_id = %s "
+            "AND meta ? 'error' RETURNING id",
+            (conversation_id, str(generation_id)),
+        ).fetchone()
+    return row is not None
 
 
 def interrupt_open_chat_requests() -> int:

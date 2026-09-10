@@ -131,3 +131,42 @@ def test_a_live_lease_is_not_requeued_and_an_expired_one_is():
         assert db.get_video_analysis(aid)["status"] == "queued"
     finally:
         db.delete_video_analysis(aid)
+
+
+# --------------------------------------------------- conditional replace ---
+
+
+def test_a_stale_tab_cannot_overwrite_a_newer_thread(login_client):
+    """RC-4: the whole-thread replace was unconditional. With the
+    conversation's updated_at the tab last saw, a same-length overwrite
+    of a server-persisted answer is refused with the server's value."""
+    client = login_client("v29-replace")
+    conv = "conv-v29-replace"
+    r = client.post("/history/conversations", json={"id": conv, "title": "t"})
+    assert r.status_code in (200, 201), r.text
+    r = client.post(f"/history/conversations/{conv}/messages", json={"role": "user", "content": "q1"})
+    assert r.status_code in (200, 201), r.text
+    seen = client.get(f"/history/conversations/{conv}").json()["updated_at"]
+
+    # Unchanged since: the replace goes through.
+    body = {"messages": [{"role": "user", "content": "q1"}, {"role": "assistant", "content": "a1 (tab)"}], "expected_updated_at": seen}
+    r = client.put(f"/history/conversations/{conv}/messages", json=body)
+    assert r.status_code == 200, r.text
+    later = client.get(f"/history/conversations/{conv}").json()["updated_at"]
+
+    # Meanwhile the server persisted a better answer (a different tab, or the
+    # server itself). A tab still holding `seen` must not overwrite it.
+    r = client.post(f"/history/conversations/{conv}/messages", json={"role": "user", "content": "q2"})
+    assert r.status_code in (200, 201)
+    stale = {"messages": [{"role": "user", "content": "q1"}, {"role": "assistant", "content": "a1 (stale)"}, {"role": "user", "content": "q2 (stale)"}], "expected_updated_at": later}
+    r = client.put(f"/history/conversations/{conv}/messages", json=stale)
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"] == "conversation changed" and r.json()["updated_at"] and r.json()["messages"] == 3
+    kept = [m["content"] for m in client.get(f"/history/conversations/{conv}").json()["messages"]]
+    assert kept == ["q1", "a1 (tab)", "q2"], "nothing was written"
+
+    # Without the field: the old unconditional behaviour, still never shrinking.
+    r = client.put(f"/history/conversations/{conv}/messages", json={"messages": stale["messages"]})
+    assert r.status_code == 200
+    r = client.put(f"/history/conversations/{conv}/messages", json={"messages": stale["messages"][:1]})
+    assert r.status_code == 409 and "shrink" in r.json()["detail"]

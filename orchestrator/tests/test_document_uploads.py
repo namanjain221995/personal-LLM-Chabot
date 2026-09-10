@@ -120,8 +120,7 @@ def test_chunked_document_reassembles_byte_for_byte(alice, conv):
         assert fh.read() == PDF_BYTES, "parts must concatenate in order"
     # The scaffolding is gone once assembled.
     root = up.upload_root(conv, upload_id)
-    assert not os.path.isdir(os.path.join(root, "_parts"))
-    assert not os.path.isfile(os.path.join(root, up._MARKER))
+    assert not os.path.isdir(os.path.join(root, up._PARTS_DIR))
 
 
 def test_a_missing_part_fails_loudly_not_quietly(alice, conv):
@@ -134,8 +133,11 @@ def test_a_missing_part_fails_loudly_not_quietly(alice, conv):
         f"/uploads/chunked/{conv}/{upload_id}/part/2", content=b"cc"
     ).status_code == 200
     resp = alice.post(f"/uploads/chunked/{conv}/{upload_id}/complete")
-    assert resp.status_code == 400
-    assert "contiguous" in resp.json()["detail"]
+    # 2026-09-10: a hole is named, not described — the client sends exactly
+    # the part that is missing and calls complete again.
+    assert resp.status_code == 409
+    assert resp.json()["missing_parts"] == [1]
+    assert resp.json()["accepted_parts"] == [0, 2]
 
 
 def test_a_forged_upload_id_is_a_404_not_a_write(alice, conv):

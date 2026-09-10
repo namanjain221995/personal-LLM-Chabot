@@ -33,7 +33,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import socket
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -44,6 +46,11 @@ from . import store
 from .types import STAGES, STAGE_TITLES, OcrSpan, Segment, Understanding
 
 log = logging.getLogger(__name__)
+
+#: This process, as the lease on a run names it (V29). Host and pid say
+#: where; the random tail keeps a pid recycled by a container restart from
+#: looking like the process that died — its lease must expire, not renew.
+_OWNER = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
 
 
 def _router_enabled() -> bool:
@@ -356,6 +363,35 @@ class _Runner:
         return None
 
 
+def _lease_holder(analysis_id: int) -> str:
+    """Who holds the row's lease right now ('' for nobody). In a thread."""
+    row = db.get_video_analysis(analysis_id)
+    return str((row or {}).get("lease_owner") or "")
+
+
+async def _heartbeat(analysis_id: int, run: "asyncio.Task[None]") -> None:
+    """Renew the lease every third of its TTL while the run lasts.
+
+    A renewal that FAILS means another process took the row over after this
+    one's lease lapsed — a stalled loop, a database outage longer than the
+    TTL. Two runs of the same video would now be racing for the same stage
+    files, so this one stands down: the other owner finishes the job.
+    """
+    ttl = float(settings.video_lease_ttl_s)
+    interval = max(1.0, ttl / 3.0)
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            renewed = await db.run_in_thread(db.claim_video_lease, analysis_id, _OWNER, ttl)
+        except Exception:  # noqa: BLE001 — the next beat retries
+            log.warning("video analysis %d: lease heartbeat failed", analysis_id, exc_info=True)
+            continue
+        if not renewed:
+            log.warning("video analysis %d: the lease was taken by another owner; standing down", analysis_id)
+            run.cancel()
+            return
+
+
 async def _run(analysis_id: int) -> None:
     async with _semaphore():
         row = await db.run_in_thread(db.get_video_analysis, analysis_id)
@@ -364,43 +400,82 @@ async def _run(analysis_id: int) -> None:
         if row["status"] == "done" and is_current(row):
             _publish(analysis_id, {"stage": _DONE, "status": "done"})
             return
-        stale = not is_current(row)
-        content_hash = row["content_hash"]
-        source = store.source_path(content_hash)
-        if not source:
-            await _finish(analysis_id, "failed", "the uploaded file is no longer on disk; please attach it again")
-            return
-        started = time.perf_counter()
-        await db.run_in_thread(
-            db.update_video_analysis,
-            analysis_id,
-            status="running",
-            error="",
-            attempt=int(row.get("attempt") or 0) + 1,
-            started_at=db.now(),
-            pipeline_version=PIPELINE_VERSION,
-            **({"stages": {}, "counts": {}} if stale else {}),
+        # THE LEASE (V29). The row is claimed for this process before any
+        # stage runs and renewed while they do. A claim fails only while a
+        # DIFFERENT owner's lease is still live — the same video is already
+        # being analysed by a process that is alive (a rolling recreate next
+        # to a healthy worker, a second orchestrator) — and then this run
+        # leaves it to that owner. A claim that takes over an EXPIRED lease
+        # is counted: that is a process that died mid-run, which is worth
+        # seeing on a dashboard.
+        holder = await db.run_in_thread(_lease_holder, analysis_id)
+        claimed = await db.run_in_thread(
+            db.claim_video_lease, analysis_id, _OWNER, settings.video_lease_ttl_s
         )
-        # A stale row keeps its source and nothing else: every stage re-runs
-        # and overwrites its file, because the old outputs are exactly what
-        # the version bump said not to trust.
-        ctx = _Ctx(row=row, content_hash=content_hash, source=source, counts={} if stale else dict(row.get("counts") or {}))
-        stages: Dict[str, dict] = {} if stale else dict(row.get("stages") or {})
-        runner = _Runner(analysis_id, ctx, stages)
-
-        failure = await runner.chain(_PRELUDE)
-        if failure is None:
-            # The branches run to the end even when one of them fails: the
-            # other's stage files are kept, so the retry a re-upload triggers
-            # resumes with them instead of paying for them twice.
-            failures = await asyncio.gather(*(runner.chain(branch) for branch in _BRANCHES))
-            failure = next((f for f in failures if f), None)
-        if failure is None:
-            failure = await runner.chain(_TAIL)
-        if failure:
-            await _finish(analysis_id, "failed", failure, total_s=time.perf_counter() - started)
+        if not claimed:
+            log.info("video analysis %d is held by %s; leaving it to that owner", analysis_id, holder or "another process")
             return
-        await _finish(analysis_id, "done", "", total_s=time.perf_counter() - started)
+        if holder and holder != _OWNER:
+            metrics.inc("video_lease_steal_total", "video runs taken over from an owner whose lease had expired")
+            log.warning("video analysis %d: took over the run from %s (its lease had expired)", analysis_id, holder)
+        run = asyncio.current_task()
+        heartbeat = asyncio.get_running_loop().create_task(
+            _heartbeat(analysis_id, run), name=f"video-lease-{analysis_id}"
+        ) if run is not None else None
+        try:
+            await _run_stages(analysis_id, row)
+        finally:
+            if heartbeat is not None:
+                heartbeat.cancel()
+            # Released on every exit — done, failed, cancelled — so a restart
+            # requeues the row at once instead of after a whole TTL. Owner-
+            # scoped in the database: if the lease was taken over meanwhile
+            # this is a no-op, never a release of somebody else's run.
+            try:
+                await asyncio.shield(db.run_in_thread(db.release_video_lease, analysis_id, _OWNER))
+            except Exception:  # noqa: BLE001 — the lease expires on its own
+                log.debug("video analysis %d: could not release the lease", analysis_id, exc_info=True)
+
+
+async def _run_stages(analysis_id: int, row: dict) -> None:
+    """The stages against one row — under a lease this process holds."""
+    stale = not is_current(row)
+    content_hash = row["content_hash"]
+    source = store.source_path(content_hash)
+    if not source:
+        await _finish(analysis_id, "failed", "the uploaded file is no longer on disk; please attach it again")
+        return
+    started = time.perf_counter()
+    await db.run_in_thread(
+        db.update_video_analysis,
+        analysis_id,
+        status="running",
+        error="",
+        attempt=int(row.get("attempt") or 0) + 1,
+        started_at=db.now(),
+        pipeline_version=PIPELINE_VERSION,
+        **({"stages": {}, "counts": {}} if stale else {}),
+    )
+    # A stale row keeps its source and nothing else: every stage re-runs
+    # and overwrites its file, because the old outputs are exactly what
+    # the version bump said not to trust.
+    ctx = _Ctx(row=row, content_hash=content_hash, source=source, counts={} if stale else dict(row.get("counts") or {}))
+    stages: Dict[str, dict] = {} if stale else dict(row.get("stages") or {})
+    runner = _Runner(analysis_id, ctx, stages)
+
+    failure = await runner.chain(_PRELUDE)
+    if failure is None:
+        # The branches run to the end even when one of them fails: the
+        # other's stage files are kept, so the retry a re-upload triggers
+        # resumes with them instead of paying for them twice.
+        failures = await asyncio.gather(*(runner.chain(branch) for branch in _BRANCHES))
+        failure = next((f for f in failures if f), None)
+    if failure is None:
+        failure = await runner.chain(_TAIL)
+    if failure:
+        await _finish(analysis_id, "failed", failure, total_s=time.perf_counter() - started)
+        return
+    await _finish(analysis_id, "done", "", total_s=time.perf_counter() - started)
 
 
 async def _finish(analysis_id: int, status: str, error: str, *, total_s: float = 0.0) -> None:
@@ -745,9 +820,17 @@ async def stop() -> None:
     if _maintenance is not None:
         _maintenance.cancel()
         _maintenance = None
-    for task in list(_tasks.values()):
+    pending = [task for task in _tasks.values() if not task.done()]
+    for task in pending:
         task.cancel()
     _tasks.clear()
+    if pending:
+        # Let the runs release their leases before the pool closes behind
+        # them (lifespan order): an unreleased lease keeps the next process
+        # from requeuing the row for a whole TTL. Bounded — a stage that
+        # will not stop within this is abandoned with its lease, which then
+        # simply expires.
+        await asyncio.wait(pending, timeout=5.0)
 
 
 async def drain_queue(limit: int = 4) -> int:

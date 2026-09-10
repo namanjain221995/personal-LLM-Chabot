@@ -20,6 +20,7 @@ import re
 import uuid
 from typing import List, Literal, Optional, Sequence
 
+from fastapi.responses import JSONResponse
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict
 
@@ -93,6 +94,10 @@ class MessagesReplaceIn(BaseModel):
     """Whole-thread replace used by the client's offline sync."""
 
     messages: List[SyncedMessageIn]
+    # V29: the conversation's `updated_at` the client last loaded. When
+    # present, the replace happens only if the thread has not moved since;
+    # otherwise 409 with the server's value, and the client reconciles.
+    expected_updated_at: Optional[str] = None
 
 
 def _clean_title(title: str) -> str:
@@ -210,6 +215,17 @@ def replace_messages(
                 }
                 for m in body.messages
             ],
+            expected_updated_at=body.expected_updated_at,
+        )
+    except db.ConversationChanged as exc:
+        # Not an error the client did anything wrong to earn: the server
+        # persisted something (an answer finished while this tab was away)
+        # after the tab last loaded. It reloads and re-applies its own tail.
+        # A plain body, not HTTPException's {"detail": {...}} nesting, so the
+        # client reads `updated_at` where the contract says it is.
+        return JSONResponse(
+            status_code=409,
+            content={"detail": "conversation changed", "updated_at": exc.updated_at, "messages": exc.count},
         )
     except db.MessageCountWouldShrink as exc:
         raise HTTPException(

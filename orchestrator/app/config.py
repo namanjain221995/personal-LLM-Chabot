@@ -255,6 +255,11 @@ class Settings:
         # videos at once would double that. Raise only on a deployment where
         # nobody chats while videos are processed.
         self.video_max_concurrent_jobs: int = _int("VIDEO_MAX_CONCURRENT_JOBS", 1)
+        # THE LEASE (V29). A run holds `video_analyses.lease_owner` for this
+        # long and renews it every third of it; startup reconciliation
+        # requeues only rows whose lease has lapsed, so a rolling recreate
+        # next to a healthy worker cannot start the same video twice.
+        self.video_lease_ttl_s: float = _float("VIDEO_LEASE_TTL_S", 90.0)
         # PACING. Before every GPU-heavy unit (an ASR window, an OCR batch, a
         # caption) the job waits — up to this long — while a chat generation
         # is in flight, so the people chatting never pay for a video being
@@ -639,6 +644,10 @@ class Settings:
         # executed and never sent to the model raw.
         self.dataset_uploads_enabled: bool = _bool("DATASET_UPLOADS_ENABLED", True)
         self.upload_max_mb: int = _int("UPLOAD_MAX_MB", 200)
+        # V29 (2026-09-10): how long a chunked upload session stays resumable
+        # after `init`. The sweep reclaims the parts of an open session past
+        # this and marks it expired; a finished one is never touched.
+        self.upload_session_ttl_hours: float = _float("UPLOAD_SESSION_TTL_HOURS", 24.0)
         # Caps applied to any ZIP-shaped container — including .xlsx, which is
         # itself a zip and would otherwise be a bomb path around archive.py.
         self.archive_max_uncompressed_mb: int = _int(
