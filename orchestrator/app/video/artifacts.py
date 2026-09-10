@@ -186,6 +186,13 @@ def summary_md(u: Understanding, *, title: str, duration_s: float, language: str
         out += ["## People, organisations and terms", ""]
         out += [f"- {e.strip()}" for e in u.entities if e.strip()]
         out.append("")
+    if u.limitations:
+        # Above "Not covered" on purpose: what the analysis could not SEE is
+        # a different claim from what the video did not cover, and a reader
+        # who stops after the summary must still meet it.
+        out += ["## What this analysis could not see", ""]
+        out += [f"- {lim.sentence.strip()}" for lim in u.limitations if lim.sentence.strip()]
+        out.append("")
     if u.not_covered:
         out += ["## Not covered", "", u.not_covered.strip(), ""]
     return "\n".join(out)

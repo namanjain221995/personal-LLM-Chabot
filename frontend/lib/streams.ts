@@ -26,7 +26,13 @@ import { foldTurnForModel } from './selectedContext';
 import type { ChatPrefs } from './prefs';
 import { toClientError } from './errorTypes';
 import { foldStreamState, mergeStep, readChatStream } from './sse';
-import type { BranchMeta, ChatMessage } from './types';
+import type {
+  BranchMeta,
+  ChatMessage,
+  PersistedError,
+  SendIntent,
+  SendIntentState,
+} from './types';
 
 export type StreamStatus =
   | 'streaming'
@@ -35,10 +41,30 @@ export type StreamStatus =
   | 'error'
   | 'unreachable';
 
+/**
+ * What this tab knows about a stream it LOST — the "connection knowledge"
+ * half of the contract (docs/upload-reliability/CONTRACT.md).
+ *
+ * Kept apart from `status` on purpose. `status` describes the generation;
+ * this describes our ability to find out about it. "I could not ask" is not
+ * "there is nothing there", and rendering the two the same way is how a
+ * running answer came to be labelled "never sent".
+ */
+export interface ReconnectView {
+  /** How many times the reconnect loop has asked so far. */
+  attempt: number;
+  /** The last ask failed (transport, proxy, or an old backend). */
+  statusUnknown: boolean;
+  /** The loop has given up; only an explicit Retry restarts it. */
+  exhausted: boolean;
+}
+
 export interface LiveStreamView {
   conversationId: string;
   messages: ChatMessage[];
   status: StreamStatus;
+  /** Present only while a lost stream is being re-established. */
+  reconnect?: ReconnectView;
 }
 
 interface LiveStream extends LiveStreamView {
@@ -49,6 +75,13 @@ interface LiveStream extends LiveStreamView {
   researchStartedAt: number | null;
   reasoningSeconds?: number;
   sawToken: boolean;
+  /** The send this stream serves (V29) — see StartStreamOptions.intentId. */
+  intentId?: string;
+  /** The user turn carrying `meta.intent`, so its state can be kept true. */
+  intentMessageId?: string;
+  /** The server's generation, from the FIRST meta event. */
+  generationId?: string;
+  attempt?: number;
 }
 
 const streams = new Map<string, LiveStream>();
@@ -157,26 +190,123 @@ export function stopStream(id: string | null | undefined): void {
   }).catch(() => undefined);
 }
 
-/** Conversations the SERVER is still generating for (survives reloads). */
+/**
+ * The status question could not be ASKED.
+ *
+ * fe-chat F4 / INF-2: `fetchServerActive` used to answer `[]` for a 503, a
+ * dead network and a healthy idle server alike, and every caller read that
+ * one answer as "nothing is running anywhere". On a reload during the
+ * orchestrator's recreate window that skipped the re-attach, unlocked the
+ * composer over a live generation, and — with a turn still marked
+ * `send_state` — put the red "never sent" notice on a question that was
+ * being answered. So "could not ask" is now a rejection, and every caller
+ * has to decide what to do about it.
+ */
+export class ServerStatusUnavailable extends Error {
+  constructor(public status: number | null) {
+    super('Could not ask the server what is running.');
+    this.name = 'ServerStatusUnavailable';
+  }
+}
+
+/**
+ * Conversations the SERVER is still generating for (survives reloads).
+ *
+ * Resolves ONLY when the server actually answered. Rejects with
+ * `ServerStatusUnavailable` when it could not be reached — see above.
+ */
 export async function fetchServerActive(): Promise<string[]> {
+  let res: Response;
   try {
-    const res = await fetch('/api/chat/active');
-    if (res.status === 401) {
-      // This is the app's heartbeat (ChatApp polls it every 8s), so it is
-      // where a mid-session sign-out surfaces first. A 401 here is session
-      // death, not "nothing active" — route to sign-in instead of letting
-      // the app degrade feature by feature.
-      void handleSessionEnd();
-      return [];
-    }
-    if (!res.ok) return [];
-    const data = (await res.json()) as { active?: unknown };
-    return Array.isArray(data.active)
-      ? data.active.filter((x): x is string => typeof x === 'string')
-      : [];
+    res = await fetch('/api/chat/active');
   } catch {
+    throw new ServerStatusUnavailable(null);
+  }
+  if (res.status === 401) {
+    // This is the app's heartbeat (ChatApp polls it every 8s), so it is
+    // where a mid-session sign-out surfaces first. A 401 here is session
+    // death, not "nothing active" — route to sign-in instead of letting
+    // the app degrade feature by feature.
+    void handleSessionEnd();
     return [];
   }
+  if (!res.ok) throw new ServerStatusUnavailable(res.status);
+  let data: { active?: unknown };
+  try {
+    data = (await res.json()) as { active?: unknown };
+  } catch {
+    // A 200 with a body we cannot read is not an answer about anything.
+    throw new ServerStatusUnavailable(res.status);
+  }
+  // A successful answer that lists nothing IS an answer: nothing is running.
+  return Array.isArray(data.active)
+    ? data.active.filter((x): x is string => typeof x === 'string')
+    : [];
+}
+
+/**
+ * What the server says about one send intent — GET /chat/requests/{id}.
+ *
+ * Four outcomes, and the difference between the last three is the whole
+ * point. `unknown-intent` is the server STATING that this send never reached
+ * it (the only thing that may become "never sent"); `unavailable` is any
+ * failure to find out, INCLUDING the 404 a backend without this route
+ * returns, which must read as "checking", never as "never sent"
+ * (CONTRACT.md, Compatibility).
+ */
+export type ChatRequestReport =
+  | {
+      kind: 'known';
+      status: string;
+      generationId: string | null;
+      attempt: number;
+      resumable: boolean;
+      answerPersisted: boolean;
+      live: boolean;
+    }
+  | { kind: 'unknown-intent' }
+  | { kind: 'unavailable'; status: number | null }
+  | { kind: 'unauthenticated' };
+
+export async function fetchChatRequest(
+  intentId: string,
+): Promise<ChatRequestReport> {
+  let res: Response;
+  try {
+    res = await fetch(`/api/chat/requests/${encodeURIComponent(intentId)}`, {
+      cache: 'no-store',
+    });
+  } catch {
+    return { kind: 'unavailable', status: null };
+  }
+  if (res.status === 401) return { kind: 'unauthenticated' };
+  let body: Record<string, unknown> | null = null;
+  try {
+    body = (await res.json()) as Record<string, unknown>;
+  } catch {
+    body = null;
+  }
+  if (res.status === 404) {
+    // The orchestrator's own refusal says `unknown intent`; FastAPI's
+    // missing-route 404 says `Not Found`. Only the first is an answer about
+    // the intent — the second means this backend predates the route.
+    return body && body.detail === 'unknown intent'
+      ? { kind: 'unknown-intent' }
+      : { kind: 'unavailable', status: 404 };
+  }
+  if (!res.ok || !body || typeof body.status !== 'string') {
+    return { kind: 'unavailable', status: res.status };
+  }
+  return {
+    kind: 'known',
+    status: body.status,
+    generationId:
+      typeof body.generation_id === 'string' ? body.generation_id : null,
+    attempt: typeof body.attempt === 'number' ? body.attempt : 1,
+    resumable: body.resumable === true,
+    answerPersisted: body.answer_persisted === true,
+    live: body.live === true,
+  };
 }
 
 /** Attach base: the turns up to (and including) the last user message —
@@ -237,6 +367,57 @@ function updateAssistant(
   s.messages = messages;
 }
 
+/**
+ * Move the send intent on the USER turn this stream serves (V29).
+ *
+ * The intent is the durable account of one logical send: it is what a
+ * reloaded tab reconciles against the server, and what stops a retry from
+ * becoming a second generation. It lives on the message rather than in this
+ * module's memory precisely because this module's memory does not survive the
+ * thing it is describing — a reload, a crash, a closed tab.
+ *
+ * `persist` is deliberately explicit per call site. Every transition matters
+ * on screen, but only the ones a reload must find (accepted, interrupted,
+ * failed, unsent) are worth a write; `processing` is a live label, and
+ * `completed` rides out with the answer's own save.
+ */
+function patchIntent(
+  s: LiveStream,
+  patch: Partial<SendIntent> & { state: SendIntentState },
+  options?: { persist?: boolean },
+): void {
+  const targetId = s.intentMessageId;
+  if (!targetId) return;
+  const at = s.messages.findIndex((m) => m.id === targetId);
+  if (at === -1) return;
+  const current = s.messages[at];
+  const existing = current.meta?.intent;
+  const id = patch.id ?? existing?.id ?? s.intentId;
+  if (!id) return;
+  const next: SendIntent = { ...existing, ...patch, id };
+  if (
+    existing &&
+    existing.state === next.state &&
+    existing.generation_id === next.generation_id &&
+    existing.attempt === next.attempt &&
+    existing.reason === next.reason
+  ) {
+    return;
+  }
+  const messages = s.messages.slice();
+  messages[at] = { ...current, meta: { ...(current.meta ?? {}), intent: next } };
+  s.messages = messages;
+  if (options?.persist) {
+    // The assistant placeholder is NOT part of what gets stored here: an
+    // answer that has not been written yet is not a record of anything
+    // (RC-2). Only the question and its intent are durable at this point.
+    getHistoryStore().saveMessages(
+      s.conversationId,
+      s.messages.filter((m) => m.id !== s.assistantId),
+    );
+  }
+}
+
 /** Client-measured thinking time: first reasoning delta → first token. */
 function settleReasoningClock(s: LiveStream): void {
   if (s.reasoningStartedAt !== null && s.reasoningSeconds === undefined) {
@@ -259,9 +440,53 @@ export function withLiveProgressRetired(
   return { searchStatus: undefined, phaseStatus: undefined, ...patch };
 }
 
+/**
+ * Put the failure ON the answer, where it survives being saved.
+ *
+ * RC-2: `status` and `errorMessage` are fields of the in-memory message
+ * object, and the history wire shape is `{role, content, meta}` — so an
+ * interrupted or failed answer was stored as `content: ''` with nothing
+ * else, and came back after a reload as an empty bubble with no error and no
+ * action. `meta.error` is the same information in the one place that
+ * round-trips (the server stores meta as opaque JSON), so the reloaded row
+ * can say what happened and offer the way out.
+ */
+function markPersistedError(s: LiveStream, error: PersistedError): void {
+  updateAssistant(s, (m) => ({
+    ...m,
+    meta: { ...(m.meta ?? {}), error },
+  }));
+}
+
 function finalize(s: LiveStream, patch: Partial<ChatMessage>): void {
   updateAssistant(s, withLiveProgressRetired(patch));
   s.status = (patch.status as StreamStatus) ?? 'done';
+  // A stream that reaches an end is not reconnecting any more, whatever the
+  // end was.
+  s.reconnect = undefined;
+  // The send is over: `completed` once the answer exists, `failed` with the
+  // reason when the stream itself said no. Both ride out on the save below,
+  // so the reload after them finds a turn that agrees with its answer.
+  if (patch.status === 'error') {
+    patchIntent(s, {
+      state: 'failed',
+      reason: typeof patch.errorMessage === 'string' ? patch.errorMessage : undefined,
+    });
+    // An answer that ends in an error is still a record of the failure, so
+    // it is stored — but only when there is something to store. An empty
+    // error-less row is exactly the blank bubble of RC-2.
+    markPersistedError(s, {
+      message:
+        typeof patch.errorMessage === 'string'
+          ? patch.errorMessage
+          : 'This answer failed.',
+      resumable: false,
+    });
+  } else if (patch.status === 'done') {
+    patchIntent(s, { state: 'completed' });
+  } else if (patch.status === 'stopped') {
+    patchIntent(s, { state: 'cancelled' });
+  }
   // Persist regardless of which conversation is on screen.
   getHistoryStore().saveMessages(s.conversationId, s.messages);
   // Terminal: any commit booked for this frame is dropped and the FINAL
@@ -307,7 +532,21 @@ function markUnreachable(
       errorCode: err.code,
     }),
   );
+  // Persisted alongside the browser-only fields above, so a reload shows the
+  // failure and its Retry rather than an empty answer.
+  markPersistedError(s, {
+    message: err.message,
+    code: err.code,
+    status: err.status,
+    resumable: false,
+  });
   s.status = 'unreachable';
+  s.reconnect = undefined;
+  // The request never reached the server, so the send did not happen. Said on
+  // the TURN, where a reload can still see it: `unsent` (not `failed`) is
+  // what makes Send now offer to send the same intent again rather than
+  // start a second one.
+  patchIntent(s, { state: 'unsent', reason: err.message });
   getHistoryStore().saveMessages(s.conversationId, s.messages);
   notifyNow(s.conversationId);
 }
@@ -320,17 +559,171 @@ function markUnreachable(
  * it through GET /api/chat/attach/{id}. Whatever already streamed stays on the
  * message — this patches status/errorMessage and leaves `content` alone.
  */
+const INTERRUPTED_MESSAGE =
+  'The connection to this answer was interrupted. The model is still working on it — reconnecting…';
+
 function markInterrupted(s: LiveStream): void {
   updateAssistant(
     s,
     withLiveProgressRetired({
       status: 'error',
-      errorMessage:
-        'The connection to this answer was interrupted. The model is still working on it — reopen this chat to re-join.',
+      errorMessage: INTERRUPTED_MESSAGE,
     }),
   );
+  markPersistedError(s, {
+    message: INTERRUPTED_MESSAGE,
+    // The server owns the request and can resume it — which is why nothing
+    // here re-sends, and why the row offers Resume rather than Retry.
+    resumable: true,
+  });
   s.status = 'error';
-  getHistoryStore().saveMessages(s.conversationId, s.messages);
+  s.reconnect = { attempt: 0, statusUnknown: false, exhausted: false };
+  // NOT the placeholder. The generation is still the server's, so an answer
+  // that has not been written yet must not be stored as though it had (RC-2:
+  // a blank assistant row also stopped every later reload from looking for
+  // the real answer). What IS durable is the state of the send.
+  patchIntent(s, { state: 'interrupted' }, { persist: true });
+  notifyNow(s.conversationId);
+  void reconnectInterrupted(s);
+}
+
+/**
+ * How hard, and for how long, a lost stream is chased.
+ *
+ * Exported so a test can drive the whole loop deterministically (base 0, no
+ * jitter) instead of waiting on wall-clock backoff. Nothing in the app
+ * writes to it.
+ */
+export const reconnectPolicy = {
+  baseMs: 1000,
+  capMs: 30_000,
+  attempts: 20,
+  jitter: true,
+};
+
+function backoffFor(attempt: number): number {
+  const base = Math.min(
+    reconnectPolicy.capMs,
+    reconnectPolicy.baseMs * 2 ** attempt,
+  );
+  // Jitter, so a restart does not bring every open tab back in lockstep.
+  return reconnectPolicy.jitter ? base * (0.5 + Math.random() / 2) : base;
+}
+
+function wait(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function setReconnect(s: LiveStream, view: ReconnectView): void {
+  s.reconnect = view;
+  notifyNow(s.conversationId);
+}
+
+/**
+ * Chase an interrupted generation until the server gives a straight answer.
+ *
+ * RC-3: an accepted generation lived only in the orchestrator's memory, so a
+ * deploy, a crash or a host reboot ended it — and the browser's re-attach got
+ * a 404 it could not tell from "finished". Now the REQUEST is durable, so
+ * there are only four honest conclusions, and this loop waits for one of
+ * them: it is live (attach), it finished (load the answer), it definitively
+ * never existed (unsent), or we still cannot tell (status unknown, and the
+ * row says exactly that).
+ *
+ * Bounded on purpose: ~20 asks with exponential backoff to a 30 s cap, then
+ * it stops and leaves an explicit Retry. A tab left open for a week must not
+ * poll a dead endpoint for a week.
+ */
+async function reconnectInterrupted(s: LiveStream): Promise<void> {
+  const conversationId = s.conversationId;
+  const intentId = s.intentId;
+  if (!intentId) {
+    // Nothing to ask about (an old turn, or a send that predates intents).
+    // A re-attach is still worth one try; beyond that the poll's own
+    // reconciliation is what will find the answer.
+    const outcome = await attachStream(conversationId);
+    if (outcome !== 'attached' && streams.get(conversationId) === s) {
+      setReconnect(s, { attempt: 1, statusUnknown: outcome !== 'ended', exhausted: true });
+    }
+    return;
+  }
+  for (let attempt = 0; attempt < reconnectPolicy.attempts; attempt += 1) {
+    await wait(backoffFor(attempt));
+    // Another stream took this conversation over (the user re-sent, or an
+    // attach succeeded elsewhere): this loop no longer speaks for it.
+    if (streams.get(conversationId) !== s) return;
+    const report = await fetchChatRequest(intentId);
+    if (streams.get(conversationId) !== s) return;
+    if (report.kind === 'unauthenticated') {
+      // Session death is not a retryable condition, and handleSessionEnd is
+      // already routing this tab to sign-in.
+      void handleSessionEnd();
+      return;
+    }
+    if (report.kind === 'unavailable') {
+      setReconnect(s, { attempt: attempt + 1, statusUnknown: true, exhausted: false });
+      continue;
+    }
+    if (report.kind === 'unknown-intent') {
+      // The server states it has no such request: this send never landed.
+      patchIntent(s, { state: 'unsent', reason: 'The request never reached the server.' }, { persist: true });
+      s.reconnect = undefined;
+      notifyNow(conversationId);
+      return;
+    }
+    setReconnect(s, { attempt: attempt + 1, statusUnknown: false, exhausted: false });
+    if (report.live || (report.status === 'interrupted' && report.resumable)) {
+      const outcome = await attachStream(conversationId);
+      if (outcome === 'attached') return;
+      if (outcome === 'unauthenticated') return;
+      // 'ended' here means the generation finished between the two calls;
+      // the next pass reads `completed` and loads the answer.
+      continue;
+    }
+    if (report.status === 'completed' || report.answerPersisted) {
+      await adoptPersistedAnswer(s);
+      return;
+    }
+    if (report.status === 'failed' || report.status === 'cancelled') {
+      patchIntent(
+        s,
+        {
+          state: report.status === 'cancelled' ? 'cancelled' : 'failed',
+          reason: 'The server stopped working on this answer.',
+        },
+        { persist: true },
+      );
+      s.reconnect = undefined;
+      notifyNow(conversationId);
+      return;
+    }
+    // accepted / running with nothing live yet: keep asking.
+  }
+  if (streams.get(conversationId) === s) {
+    setReconnect(s, {
+      attempt: reconnectPolicy.attempts,
+      statusUnknown: true,
+      exhausted: true,
+    });
+  }
+}
+
+/**
+ * The answer is on the server: show THAT, not our placeholder.
+ *
+ * The stream object stays in the registry holding the loaded thread, because
+ * that is the channel the view already listens on — replacing the messages
+ * here is what makes the interrupted row disappear the moment the real
+ * answer is in hand, in whichever conversation happens to be on screen.
+ */
+async function adoptPersistedAnswer(s: LiveStream): Promise<void> {
+  const conv = await getHistoryStore()
+    .load(s.conversationId, { force: true })
+    .catch(() => null);
+  if (streams.get(s.conversationId) !== s) return;
+  if (conv) s.messages = conv.messages;
+  s.status = 'done';
+  s.reconnect = undefined;
   notifyNow(s.conversationId);
 }
 
@@ -373,6 +766,10 @@ async function consume(s: LiveStream, body: ReadableStream<Uint8Array>) {
         s.sawToken = true;
         firstToken = true;
         settleReasoningClock(s);
+        // Tokens are the answer being written: the send is past acceptance.
+        // Not persisted — a reload reconciles with the server, whose account
+        // of a running generation is better than this label.
+        patchIntent(s, { state: 'processing' });
       }
       updateAssistant(s, (m) => ({
         ...m,
@@ -446,6 +843,31 @@ async function consume(s: LiveStream, body: ReadableStream<Uint8Array>) {
       }));
     } else if (ev.kind === 'meta') {
       settleReasoningClock(s);
+      // V29: a stream now carries SEVERAL meta events. The first one names
+      // the generation and arrives before any token — that is what lets the
+      // turn be marked `accepted` while the answer is still empty, so a
+      // reload in that window has an id to reconcile with instead of a
+      // guess. Every later meta is the engine's, and wins for everything
+      // else; the generation id is carried across explicitly because the
+      // browser must never lose the handle on the answer it is watching.
+      const extra = ev.meta as typeof ev.meta & {
+        attempt?: number;
+        intent_id?: string;
+      };
+      if (typeof extra.generation_id === 'string' && !s.generationId) {
+        s.generationId = extra.generation_id;
+        s.attempt = typeof extra.attempt === 'number' ? extra.attempt : 1;
+        patchIntent(
+          s,
+          {
+            state: 'accepted',
+            ...(typeof extra.intent_id === 'string' ? { id: extra.intent_id } : {}),
+            generation_id: extra.generation_id,
+            attempt: s.attempt,
+          },
+          { persist: true },
+        );
+      }
       updateAssistant(s, (m) => ({
         ...m,
         research: m.research ? { ...m.research, active: false } : undefined,
@@ -455,13 +877,19 @@ async function consume(s: LiveStream, body: ReadableStream<Uint8Array>) {
         // position has to be carried across explicitly — losing it would
         // orphan the answer from the question it belongs to.
         meta: metaWithBranch(
-          foldStreamState(ev.meta, {
-            reasoning: m.reasoning,
-            reasoningSeconds: m.reasoningSeconds ?? s.reasoningSeconds,
-            steps: m.steps,
-            research: m.research,
-            phaseStatus: m.phaseStatus,
-          }),
+          {
+            // The handle on the answer, kept whatever a later meta omits:
+            // it is how the server dedupes the persist and how a reload
+            // matches this answer to the send it belongs to.
+            ...(s.generationId ? { generation_id: s.generationId } : {}),
+            ...foldStreamState(ev.meta, {
+              reasoning: m.reasoning,
+              reasoningSeconds: m.reasoningSeconds ?? s.reasoningSeconds,
+              steps: m.steps,
+              research: m.research,
+              phaseStatus: m.phaseStatus,
+            }),
+          },
           branchOf(m),
         ),
       }));
@@ -585,6 +1013,19 @@ export interface StartStreamOptions {
    * retried send resolves to the first answer rather than a second generation.
    */
   clarification?: ClarificationResponse | null;
+  /**
+   * V29: this send's intent id, minted by the browser when Send was pressed
+   * and REUSED by every retry of the same turn. The server records it, so a
+   * second POST carrying it attaches to the generation that already exists
+   * instead of cancelling it and starting another (F14). Absent for sends
+   * that predate the intent (nothing changes for them).
+   */
+  intentId?: string;
+  /**
+   * The user turn that carries `meta.intent` — the one this stream keeps
+   * honest as the send moves accepted → processing → completed / failed.
+   */
+  intentMessageId?: string;
 }
 
 /** Conversations whose in-flight send already carries a clarification answer. */
@@ -622,6 +1063,17 @@ export async function startStream(opts: StartStreamOptions): Promise<void> {
   const currentText =
     currentTurn?.role === 'user' ? foldTurnForModel(currentTurn) : '';
   const s = register(conversationId, turns, opts.assistantBranch);
+  s.intentId = opts.intentId;
+  // The turn to keep honest. Stated by the caller where it knows (the send
+  // path); otherwise the last user turn, which is the question by
+  // construction for every caller of this function.
+  s.intentMessageId =
+    opts.intentMessageId ??
+    [...turns].reverse().find((m) => m.role === 'user' && m.meta?.intent?.id)?.id;
+  // Said before the request goes out, so a reload in the gap between this
+  // line and the server's first event finds a turn that admits it does not
+  // know yet — and reconciles it against the server rather than guessing.
+  if (opts.intentId) patchIntent(s, { state: 'submitting', id: opts.intentId });
   // Did the orchestrator accept the request? Decides whether a failure below
   // is "unreachable" (retry) or "interrupted" (re-join) — see markInterrupted.
   let connected = false;
@@ -668,6 +1120,8 @@ export async function startStream(opts: StartStreamOptions): Promise<void> {
         // with the orchestrator, which never sees it.
         ...(opts.dataset ? { dataset: true } : {}),
         ...(opts.clarification ? { clarification: opts.clarification } : {}),
+        // V29: one logical send, however many times it is retried.
+        ...(opts.intentId ? { intent_id: opts.intentId } : {}),
       }),
       signal: s.controller.signal,
     });
@@ -695,17 +1149,91 @@ export async function startStream(opts: StartStreamOptions): Promise<void> {
 }
 
 /**
- * Re-join a server-side generation after a reload. Replays the buffered
- * events (instant partial answer) and then streams live. Returns false when
- * there is nothing to attach to any more — load history instead.
+ * What a re-attach found. The three failures are NOT interchangeable
+ * (fe-chat F3).
+ *
+ * `ended`         — the server says there is nothing live and nothing to
+ *                   resume: the answer is in history, go and load it. This is
+ *                   the only outcome that may unlock the composer.
+ * `unreachable`   — we could not find out (a 502 while the orchestrator
+ *                   restarts, a dead network). The generation is very
+ *                   probably still running; reading this as "finished" is
+ *                   what detached tabs permanently and let the next send
+ *                   cancel a live generation.
+ * `unauthenticated` — the session died; sign-in is already being routed to.
  */
-export async function attachStream(conversationId: string): Promise<boolean> {
-  if (streams.get(conversationId)?.status === 'streaming') return true;
+export type AttachOutcome =
+  | 'attached'
+  | 'ended'
+  | 'unreachable'
+  | 'unauthenticated';
+
+/**
+ * Re-join a server-side generation after a reload. Replays the buffered
+ * events (instant partial answer) and then streams live.
+ */
+/**
+ * Attaches in flight, by conversation.
+ *
+ * Two callers routinely ask at once — the mount reconciliation and the poll's
+ * first tick — and, since the request now goes out before anything is
+ * registered, both would open their own SSE connection to the same
+ * generation. They share one instead. (Before 2026-09-10 the placeholder
+ * registration happened to serve as this lock, at the cost of an empty
+ * bubble on screen whenever the attach failed.)
+ */
+const attaching = new Map<string, Promise<AttachOutcome>>();
+
+export function attachStream(conversationId: string): Promise<AttachOutcome> {
+  const inFlight = attaching.get(conversationId);
+  if (inFlight) return inFlight;
+  const run = runAttach(conversationId).finally(() => {
+    attaching.delete(conversationId);
+  });
+  attaching.set(conversationId, run);
+  return run;
+}
+
+async function runAttach(conversationId: string): Promise<AttachOutcome> {
+  if (streams.get(conversationId)?.status === 'streaming') return 'attached';
+  /**
+   * The request goes out BEFORE any placeholder exists (2026-09-10).
+   *
+   * This used to register the stream first, so a refused attach left an
+   * empty assistant bubble on screen that nothing was writing into — and,
+   * because the registration had already replaced the view, the turn under
+   * it was no longer the last message and could say nothing about itself
+   * either. Nothing is shown until there is something to show.
+   */
+  const controller = new AbortController();
+  let res: Response;
+  try {
+    res = await fetch(`/api/chat/attach/${encodeURIComponent(conversationId)}`, {
+      signal: controller.signal,
+    });
+  } catch (err) {
+    if (err instanceof DOMException && err.name === 'AbortError') return 'ended';
+    // The fetch itself failed: we know nothing about the generation.
+    return 'unreachable';
+  }
+  if (!res.ok || !res.body) {
+    if (res.status === 401) {
+      void handleSessionEnd();
+      return 'unauthenticated';
+    }
+    // ONLY a 404 is the server saying there is nothing to attach to. The
+    // proxy answers 404 for "no active generation" and 502 for everything it
+    // could not complete, so the two are told apart by status and never by
+    // inference (F3).
+    return res.status === 404 ? 'ended' : 'unreachable';
+  }
   // Seed from SERVER truth, never from whatever this browser happens to have
   // cached. A cache entry can be empty (a chat listed but never opened here,
   // or evicted by a quota purge); seeding from it made the replayed answer
   // look like the entire conversation, and the sync then tried to shrink the
-  // real thread down to it.
+  // real thread down to it. Read only once the attach has SUCCEEDED: a
+  // forced read replaces the cache, and doing that for an attach that turns
+  // out to be a 502 would rewrite a thread for no reason at all.
   let base = getHistoryStore().get(conversationId);
   try {
     base = (await getHistoryStore().load(conversationId, { force: true })) ?? base;
@@ -723,26 +1251,24 @@ export async function attachStream(conversationId: string): Promise<boolean> {
     turns,
     branchForAppend(base?.messages ?? turns, turns),
   );
+  // Stop must reach the reader that is now running.
+  s.controller = controller;
+  // The turn being answered, so the resumed stream keeps its intent honest.
+  const question = [...turns].reverse().find((m) => m.role === 'user');
+  s.intentMessageId = question?.id;
+  s.intentId = question?.meta?.intent?.id;
   try {
-    const res = await fetch(
-      `/api/chat/attach/${encodeURIComponent(conversationId)}`,
-      { signal: s.controller.signal },
-    );
-    if (!res.ok || !res.body) {
-      streams.delete(conversationId); // finished already — history has it
-      notifyNow(conversationId);
-      return false;
-    }
     await consume(s, res.body);
-    return true;
   } catch (err) {
     if (err instanceof DOMException && err.name === 'AbortError') {
       settleReasoningClock(s);
       finalize(s, { status: 'stopped' });
-      return true;
+      return 'attached';
     }
-    streams.delete(conversationId);
-    notifyNow(conversationId);
-    return false;
+    // The pipe died after the replay began: the generation is still the
+    // server's, so this is an interruption to recover from, not a send to
+    // repeat.
+    markInterrupted(s);
   }
+  return 'attached';
 }

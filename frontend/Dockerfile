@@ -29,4 +29,24 @@ COPY --from=build --chown=nextjs:nodejs /app/.next/standalone ./
 COPY --from=build --chown=nextjs:nodejs /app/.next/static ./.next/static
 USER nextjs
 EXPOSE 3000
+# EXEC FORM, AND IT HAS TO STAY THAT WAY.
+#
+# A graceful stop of this container is a three-link chain and every link was
+# checked on 2026-09-11 rather than assumed (INF-1):
+#
+#   1. compose.yaml sets `init: true`, so docker-init (tini) is PID 1 and
+#      forwards SIGTERM to its direct child.
+#   2. This CMD is exec form, so that child is `node server.js` — no shell in
+#      between to swallow the signal. Rewriting it as `CMD node server.js`
+#      would put /bin/sh at PID 2, and sh does not forward signals to its
+#      child: the proxy would then die only on SIGKILL, which is the bug this
+#      chain exists to prevent.
+#   3. Next 16's standalone server (node_modules/next/dist/server/lib/
+#      start-server.js) installs SIGINT/SIGTERM handlers that call
+#      server.close() and exit 143 once it resolves. In production it does
+#      NOT call closeAllConnections(), so requests already in flight — a
+#      64 MiB chunked part PUT, a proxied SSE frame — are allowed to finish.
+#
+# The time to use that is compose.yaml's `stop_grace_period: 5m`; without it
+# Docker's 10 s default made the handler's politeness irrelevant.
 CMD ["node", "server.js"]

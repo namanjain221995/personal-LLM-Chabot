@@ -17,6 +17,19 @@ EVERY CALL HAS A DEADLINE. A corrupt file can make a decoder spin; a deadline
 turns that into a clean `MediaError` with the last line ffmpeg wrote, which is
 almost always the real reason ("moov atom not found", "Invalid data found
 when processing input").
+
+AND EVERY EXIT KILLS THE CHILD. A deadline was not the only way out of `_run`:
+the pipeline wraps each stage in its own `wait_for`, and a shutdown cancels
+the job, so `_run` can be CANCELLED while ffmpeg is decoding. That used to
+return without touching the child, which kept decoding — writing the very
+`audio.wav.part` and `frames/f_%06d.jpg` that the retry then started a second
+ffmpeg on top of. Now the child is terminated, given a moment, and killed on
+every exit that is not a clean one, and the cancellation continues only once
+it is gone.
+
+NOTHING GOES THROUGH A SHELL. Every call here is `create_subprocess_exec` with
+an argv LIST — filenames are arguments, never text a shell re-reads — so a
+file named `; rm -rf /` is a filename.
 """
 from __future__ import annotations
 
@@ -90,6 +103,51 @@ def _last_line(stderr: bytes) -> str:
     return lines[-1] if lines else ""
 
 
+#: How long a child gets to exit on SIGTERM before it is killed. ffmpeg
+#: finishes the frame it is on and closes its output; a decoder wedged on a
+#: corrupt file does not, and gets SIGKILL.
+_TERM_GRACE_S = 3.0
+
+
+async def _stop_child(proc: "asyncio.subprocess.Process") -> None:
+    """Terminate, wait briefly, kill. Returns only once the child is gone.
+
+    Every wait is shielded because the usual caller is an `except` block in a
+    coroutine that is ITSELF being cancelled; an unshielded await there would
+    raise immediately and leave the decoder running, which is the bug this
+    function exists for. If a cancellation does arrive mid-grace the child is
+    killed at once rather than waited for.
+    """
+    if proc.returncode is not None:
+        return
+    try:
+        proc.terminate()
+    except ProcessLookupError:  # it exited between the check and the signal
+        return
+    waiter = asyncio.ensure_future(proc.wait())
+    try:
+        await asyncio.wait_for(asyncio.shield(waiter), timeout=_TERM_GRACE_S)
+        return
+    except asyncio.TimeoutError:
+        pass
+    except asyncio.CancelledError:
+        _kill(proc)
+        raise
+    _kill(proc)
+    try:
+        await asyncio.shield(waiter)
+    except asyncio.CancelledError:
+        # Killed and reaped by the child watcher; the cancellation carries on.
+        pass
+
+
+def _kill(proc: "asyncio.subprocess.Process") -> None:
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        pass
+
+
 async def _run(
     argv: Sequence[str], *, timeout_s: float, what: str
 ) -> tuple[bytes, bytes]:
@@ -108,12 +166,15 @@ async def _run(
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
     except asyncio.TimeoutError:
-        proc.kill()
-        try:
-            await proc.wait()
-        except Exception:  # noqa: BLE001
-            pass
+        await _stop_child(proc)
         raise MediaTimeout(f"{what} did not finish within {timeout_s:.0f}s") from None
+    except BaseException:
+        # A stage timeout or a shutdown cancels this coroutine. The decoder
+        # has to go with it, or it keeps writing the output the next attempt
+        # is about to write.
+        log.info("%s: stopping %s because the caller went away", what, argv[0])
+        await _stop_child(proc)
+        raise
     if proc.returncode != 0:
         detail = _last_line(err) or f"{argv[0]} exited with {proc.returncode}"
         # The message reaches the chat; a storage path does not belong there.

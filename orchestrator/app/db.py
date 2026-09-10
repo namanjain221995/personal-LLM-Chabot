@@ -3731,9 +3731,16 @@ def truncate_messages(
     return {"id": conversation_id, "count": keep}
 
 
-class ConversationChanged(Exception):
+class ThreadMoved(Exception):
     """The thread moved since the client last loaded it (V29 conditional
-    replace): the server's updated_at is not what the client expected."""
+    replace): the server's `updated_at` is not the one the client expected.
+
+    Deliberately NOT `ConversationChanged` — that name is taken, by the
+    truncate guard above, which counts messages rather than comparing a
+    version and whose handler reads `.expected`/`.actual`. Two exceptions
+    with one name meant the truncate handler read this one's attributes and
+    turned a 409 into a 500.
+    """
 
     def __init__(self, updated_at: Any, count: int) -> None:
         super().__init__("conversation changed")
@@ -3785,7 +3792,7 @@ def replace_messages(
         if expected_updated_at is not None:
             current = _iso(owned["updated_at"]) if owned.get("updated_at") else None
             if str(expected_updated_at) != str(current):
-                raise ConversationChanged(current, existing)
+                raise ThreadMoved(current, existing)
         if len(messages) < existing:
             raise MessageCountWouldShrink(existing, len(messages))
         # Snapshot the thumbs before the rows they belong to are deleted.

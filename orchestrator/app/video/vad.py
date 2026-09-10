@@ -55,15 +55,31 @@ class Window:
         return self.end_s - self.start_s
 
 
+#: Frames converted at a time. `transcribe.read_wav_pcm16` hands these
+#: detectors a memory-MAP of the whole track precisely so that a four-hour
+#: recording is not 461 MB of process memory — and both detectors used to
+#: undo that in one line: `tobytes()` copied the whole track for webrtcvad,
+#: and `astype(np.float32)` made a 921 MB copy for the energy detector (twice
+#: over, with the squaring). Walking the map a block at a time keeps peak
+#: allocation at this many frames whatever the length: 2,000 frames is 60
+#: seconds, under 4 MB of float32. The flags are identical either way —
+#: blocks are whole multiples of a frame, and every frame's arithmetic is
+#: over its own 480 samples.
+_BLOCK_FRAMES = 2000
+
+
 def _frames_speech_webrtc(pcm16, aggressiveness: int) -> List[bool]:
     import webrtcvad  # lazy: optional dependency
 
     vad = webrtcvad.Vad(int(aggressiveness))
-    raw = pcm16.tobytes()
     step = FRAME_SAMPLES * 2
+    block_samples = _BLOCK_FRAMES * FRAME_SAMPLES
+    n = (len(pcm16) // FRAME_SAMPLES) * FRAME_SAMPLES  # a partial frame is dropped
     flags: List[bool] = []
-    for off in range(0, len(raw) - step + 1, step):
-        flags.append(bool(vad.is_speech(raw[off : off + step], SAMPLE_RATE)))
+    for start in range(0, n, block_samples):
+        raw = pcm16[start : min(n, start + block_samples)].tobytes()
+        for off in range(0, len(raw) - step + 1, step):
+            flags.append(bool(vad.is_speech(raw[off : off + step], SAMPLE_RATE)))
     return flags
 
 
@@ -73,14 +89,21 @@ def _frames_speech_energy(pcm16) -> List[bool]:
     The floor is the 15th percentile of frame energy (what "quiet" sounds
     like in THIS recording) scaled up, with an absolute minimum so a
     digitally silent file is silent rather than "everything above nothing".
+    Because the floor is a property of the whole recording, the RMS of every
+    frame is computed first — one float32 per 30 ms, 1.9 MB for four hours —
+    and only then compared.
     """
     import numpy as np
 
     n = (len(pcm16) // FRAME_SAMPLES) * FRAME_SAMPLES
     if n == 0:
         return []
-    x = pcm16[:n].astype(np.float32).reshape(-1, FRAME_SAMPLES) / 32768.0
-    rms = np.sqrt(np.mean(x * x, axis=1) + 1e-12)
+    block_samples = _BLOCK_FRAMES * FRAME_SAMPLES
+    parts = []
+    for start in range(0, n, block_samples):
+        x = pcm16[start : min(n, start + block_samples)].astype(np.float32).reshape(-1, FRAME_SAMPLES) / 32768.0
+        parts.append(np.sqrt(np.mean(x * x, axis=1) + 1e-12))
+    rms = np.concatenate(parts)
     floor = float(np.percentile(rms, 15))
     threshold = max(floor * 4.0, 0.006)
     return [bool(v) for v in (rms > threshold)]

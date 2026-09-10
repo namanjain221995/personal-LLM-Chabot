@@ -30,6 +30,18 @@ from app.config import settings
 from app.main import _live_generations, app
 
 
+@pytest.fixture(autouse=True)
+def _fresh_metrics():
+    """Counters are process-global and every POST /chat in the whole suite
+    records an intent, so an absolute assertion here reads whatever ran
+    before it. Reset per test: what these tests mean is "this action
+    incremented exactly this counter", which is only expressible from zero.
+    """
+    metrics.reset()
+    yield
+    metrics.reset()
+
+
 def _parse_sse(text: str):
     events = []
     for block in text.strip().split("\n\n"):

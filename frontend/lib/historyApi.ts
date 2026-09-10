@@ -32,6 +32,14 @@ export interface ServerConversation {
   id: string;
   title: string;
   messages: ServerMessage[];
+  /**
+   * 2026-09-10: the conversation's `updated_at` EXACTLY as the server sent
+   * it. Sent straight back as `expected_updated_at` on the whole-thread PUT,
+   * which is what makes that write conditional — see replaceMessages.
+   * Absent from a backend that predates the field (the PUT is then
+   * unconditional, exactly as before).
+   */
+  updatedAt?: string;
 }
 
 export type FetchLike = (
@@ -63,6 +71,14 @@ export class HistoryApiError extends Error {
   constructor(
     public status: number,
     message: string,
+    /**
+     * The server's own JSON body, when it sent one. Kept because a 409 now
+     * has TWO meanings and they need different recoveries: "conversation
+     * changed" carries `updated_at` and is reconciled by reloading and
+     * re-applying the local-only tail, while "refusing to shrink" is a stale
+     * cache that must not be re-pushed at all.
+     */
+    public body?: unknown,
   ) {
     super(message);
     this.name = 'HistoryApiError';
@@ -76,6 +92,33 @@ export function isNotFound(err: unknown): boolean {
 /** 409 — the id already exists (create), or a replace would SHRINK a thread. */
 export function isConflict(err: unknown): boolean {
   return err instanceof HistoryApiError && err.status === 409;
+}
+
+/**
+ * 409 `{detail: "conversation changed", updated_at, messages}` — the SERVER
+ * wrote this conversation after we last loaded it (it persists a finished
+ * answer itself when no viewer is attached, RC-4). Nothing was written; the
+ * client reloads server truth and re-applies only its local-only tail.
+ *
+ * Told apart from the shrink refusal by the body, never by the status: both
+ * are 409 and they call for opposite recoveries.
+ */
+export function isConversationChanged(err: unknown): boolean {
+  if (!isConflict(err)) return false;
+  const body = (err as HistoryApiError).body as { detail?: unknown } | null;
+  return (
+    typeof body === 'object' &&
+    body !== null &&
+    body.detail === 'conversation changed'
+  );
+}
+
+/** The server's current `updated_at` from a conversation-changed 409. */
+export function conflictUpdatedAt(err: unknown): string | undefined {
+  if (!isConversationChanged(err)) return undefined;
+  const value = ((err as HistoryApiError).body as { updated_at?: unknown })
+    .updated_at;
+  return typeof value === 'string' ? value : undefined;
 }
 
 /** 401 — the session is gone; the caller's job is to route to sign-in. */
@@ -177,8 +220,19 @@ export interface HistoryApi {
    * Replace the whole thread atomically. The server REFUSES (409) when the
    * incoming thread is shorter than what it stores — the guard that stops a
    * stale local cache from destroying a conversation.
+   *
+   * `expectedUpdatedAt` is the conversation's `updated_at` as this client
+   * last loaded it (V29). With it the replace becomes CONDITIONAL: if the
+   * server's value has moved on, nothing is written and it answers 409
+   * `conversation changed`. Without it the write is unconditional, which is
+   * how an older tab used to overwrite an answer the server had persisted
+   * after that tab last loaded (RC-4).
    */
-  replaceMessages(id: string, messages: ServerMessage[]): Promise<void>;
+  replaceMessages(
+    id: string,
+    messages: ServerMessage[],
+    expectedUpdatedAt?: string,
+  ): Promise<void>;
   /**
    * Drop every message after the first `keep` — the only sanctioned shrink,
    * used exclusively by a user-confirmed regenerate. `expectedTotal` guards
@@ -217,9 +271,20 @@ export function createHistoryApi(fetchFn?: FetchLike): HistoryApi {
       throw new HistoryApiError(0, 'History server unreachable.');
     }
     if (!res.ok) {
+      // The body is read BEFORE the throw: a 409 is two different events
+      // (someone appended vs the conversation moved on) and only its body
+      // says which. Best-effort — an intermediary's HTML page just leaves it
+      // undefined, and the status still classifies the failure.
+      let body: unknown;
+      try {
+        body = await res.json();
+      } catch {
+        body = undefined;
+      }
       throw new HistoryApiError(
         res.status,
         `History request failed with status ${res.status}.`,
+        body,
       );
     }
     try {
@@ -237,11 +302,19 @@ export function createHistoryApi(fetchFn?: FetchLike): HistoryApi {
     },
     async get(id) {
       const body = await request('GET', `/${encodeURIComponent(id)}`);
-      const conv = (body ?? {}) as Partial<ServerConversation>;
+      const conv = (body ?? {}) as Partial<ServerConversation> & {
+        updated_at?: unknown;
+      };
       return {
         id: typeof conv.id === 'string' ? conv.id : id,
         title: typeof conv.title === 'string' ? conv.title : 'Conversation',
         messages: Array.isArray(conv.messages) ? conv.messages : [],
+        // Carried VERBATIM, never re-formatted: the server compares it as a
+        // string, so a round trip through Date would make every conditional
+        // write fail.
+        ...(typeof conv.updated_at === 'string'
+          ? { updatedAt: conv.updated_at }
+          : {}),
       };
     },
     async create(id, title) {
@@ -273,8 +346,15 @@ export function createHistoryApi(fetchFn?: FetchLike): HistoryApi {
         { feedback },
       );
     },
-    async replaceMessages(id, messages) {
-      await request('PUT', `/${encodeURIComponent(id)}/messages`, { messages });
+    async replaceMessages(id, messages, expectedUpdatedAt) {
+      await request('PUT', `/${encodeURIComponent(id)}/messages`, {
+        messages,
+        // Omitted when unknown (a conversation this browser has never GOT,
+        // or a pre-V29 backend): the server then behaves exactly as before.
+        ...(expectedUpdatedAt !== undefined
+          ? { expected_updated_at: expectedUpdatedAt }
+          : {}),
+      });
     },
     async truncateMessages(id, keep, expectedTotal) {
       await request('POST', `/${encodeURIComponent(id)}/truncate`, {

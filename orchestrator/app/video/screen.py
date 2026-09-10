@@ -23,14 +23,24 @@ Both readers return '' / None on failure and the video is understood from
 whatever survived. A screen recording with a muted microphone is understood
 from these alone; a talking head with nothing on screen gets a caption per
 distinct shot and nothing to OCR.
+
+WHAT WAS NOT READ IS NOT A BLANK SCREEN. Until 2026-09-10 an OCR outage, a
+batch deadline and a slide with no words produced the same '' per frame, the
+stage was stamped done, and — because analyses are content-addressed — that
+answer was served from cache for those bytes forever. `read_frames` returns
+the per-frame status alongside the text and a stage-level summary, so the
+pipeline can record a failed read as a failed read and fusion can say which
+reader was missing.
 """
 from __future__ import annotations
 
 import asyncio
 import base64
 import logging
+import os
 import re
-from typing import Awaitable, Callable, List, Optional, Sequence
+from dataclasses import dataclass, field
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence
 
 from ..config import settings
 from .frames import KeptFrame
@@ -83,6 +93,87 @@ def _data_url(path: str, *, max_width: Optional[int] = None) -> str:
 
 _TRUNCATED_MARK = "[transcript truncated at the OCR output limit]"
 
+#: What the OCR engine is asked for a video FRAME.
+#:
+#: MEASURED, NOT ASSUMED (2026-09-11, against the engine now running on the
+#: worker Spark). The prompt the client has always sent, "document parsing"
+#: — the model card's own — makes this model loop on screenshots: on six real
+#: frames from finished analyses it looped on four, returning 3,747
+#: characters of "nije nije nije" for a slide whose text is two lines, and
+#: every one of its answers, looping or not, opened with a hallucinated
+#: "ovi…" prefix. The prompt "OCR" read the same frames correctly and in a
+#: tenth of the time ("Weekly Planning Meeting / Agenda / 1. Pricing for the
+#: Meryton launch"). Of the 740 stored frame transcripts on this box, 251 are
+#: loops.
+#:
+#: WHY os.environ AND NOT config.py: nobody on this programme owns
+#: config.py, so the setting is read here rather than added there. The diff
+#: that belongs in `Settings.__init__` is in this change's report; when it
+#: lands, this function becomes `settings.video_ocr_prompt` and the default
+#: below moves with it. VIDEO_OCR_PROMPT is read per call so an operator can
+#: change it in the environment of a restarted container without a rebuild.
+_DEFAULT_VIDEO_OCR_PROMPT = "OCR"
+
+
+def video_ocr_prompt() -> str:
+    """The prompt this deployment sends the OCR engine for a frame."""
+    return (os.environ.get("VIDEO_OCR_PROMPT") or "").strip() or _DEFAULT_VIDEO_OCR_PROMPT
+
+
+@dataclass(frozen=True)
+class ScreenRead:
+    """The OCR stage's answer for one video: per frame, and as a whole.
+
+    `texts` is what the rest of the pipeline indexes and shows — '' unless
+    the frame was actually READ, so a failed or looping read never reaches
+    the evidence pack as on-screen text. `reads` carries the status of each
+    frame, and `summary` is what the analysis row and fusion need in order to
+    say "the reader was unavailable" rather than "the screen was blank".
+    """
+
+    texts: List[str]
+    reads: List[Any] = field(default_factory=list)
+    summary: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def status(self) -> str:
+        return str(self.summary.get("status") or "ok")
+
+    @property
+    def unavailable(self) -> bool:
+        """Nothing was read, and not because there was nothing to read."""
+        return self.status == "unavailable"
+
+
+def _summarise(reads: Sequence, *, frames: int, prompt: str, note: str = "") -> Dict[str, Any]:
+    """Per-frame statuses -> the stage-level summary, in one place."""
+    counts = {"ok": 0, "empty": 0, "degenerate": 0, "failed": 0}
+    for read in reads:
+        counts[read.status] = counts.get(read.status, 0) + 1
+    unread = counts["degenerate"] + counts["failed"]
+    if frames == 0:
+        status = "skipped"
+    elif unread == 0:
+        status = "ok"
+    elif counts["ok"] + counts["empty"] == 0:
+        status = "unavailable"
+    else:
+        status = "partial"
+    detail = f"{counts['ok']}/{frames} frames had readable text"
+    if counts["degenerate"]:
+        detail += f" · {counts['degenerate']} unreadable (the reader looped)"
+    if counts["failed"]:
+        detail += f" · {counts['failed']} not read"
+    return {
+        "status": status,
+        "frames": frames,
+        "prompt": prompt,
+        "detail": detail + note,
+        **counts,
+        "unread": unread,
+        "errors": sorted({r.error for r in reads if r.error})[:3],
+    }
+
 
 def _clean_ocr(text: str) -> str:
     """Drop the client's truncation marker and collapse whitespace runs; the
@@ -103,30 +194,65 @@ def _clean_ocr(text: str) -> str:
     return "\n".join(out).strip()
 
 
-async def ocr_frames(
+async def read_frames(
     frames: Sequence[KeptFrame], *, progress: Progress
-) -> List[str]:
-    """One OCR transcript per frame ('' when nothing legible / failed)."""
+) -> ScreenRead:
+    """Read every frame, and say for each one what happened.
+
+    A batch that fails, times out or comes back as a loop is recorded as a
+    FAILED read of those frames — never as frames with nothing on them — so
+    the pipeline can decline to stamp the stage done and cache an outage for
+    the life of those bytes.
+    """
     from ..engines import ocr
 
-    if not settings.ocr_enabled or not settings.video_ocr_enabled or not frames:
-        return ["" for _ in frames]
+    prompt = video_ocr_prompt()
+    if not frames:
+        return ScreenRead([], [], _summarise([], frames=0, prompt=prompt))
+    if not settings.ocr_enabled or not settings.video_ocr_enabled:
+        reads = [ocr.OcrRead("", "failed", "the on-screen text reader is turned off") for _ in frames]
+        summary = _summarise(reads, frames=len(frames), prompt=prompt)
+        summary["status"] = "disabled"
+        summary["detail"] = "OCR is not enabled"
+        return ScreenRead(["" for _ in frames], reads, summary)
     batch = max(1, settings.video_ocr_concurrency)
-    out: List[str] = []
+    texts: List[str] = []
+    reads: List[Any] = []
     from . import pipeline as _pipe
 
     for i in range(0, len(frames), batch):
         await _pipe.pace()
         chunk = frames[i : i + batch]
         urls = await asyncio.to_thread(lambda c=chunk: [_data_url(f.path) for f in c])
-        texts = await ocr.ocr_images(
+        batch_reads = await ocr.read_images(
             urls,
+            prompt=prompt,
             max_output_tokens=settings.video_ocr_max_tokens,
             deadline_s=settings.video_ocr_batch_deadline_s,
         )
-        out.extend(_clean_ocr(t) for t in texts)
-        await progress(100.0 * len(out) / len(frames), f"{len(out)}/{len(frames)} frames")
-    return out
+        for read in batch_reads:
+            # Only a read that succeeded becomes on-screen text. A loop is
+            # kept in `reads` for the record and dropped from the evidence.
+            texts.append(_clean_ocr(read.text) if read.ok else "")
+        reads.extend(batch_reads)
+        await progress(100.0 * len(texts) / len(frames), f"{len(texts)}/{len(frames)} frames")
+    summary = _summarise(reads, frames=len(frames), prompt=prompt)
+    if summary["status"] in ("unavailable", "partial"):
+        log.warning(
+            "video OCR: %s (prompt %r) — %s", summary["status"], prompt, summary["detail"]
+        )
+    return ScreenRead(texts, reads, summary)
+
+
+async def ocr_frames(
+    frames: Sequence[KeptFrame], *, progress: Progress
+) -> List[str]:
+    """One OCR transcript per frame ('' when nothing legible / failed).
+
+    The flattened view of `read_frames`, for the caller that does not (yet)
+    carry the per-frame status.
+    """
+    return (await read_frames(frames, progress=progress)).texts
 
 
 # ---------------------------------------------------------------- captions --
@@ -190,6 +316,29 @@ async def caption_frames(
 
     await asyncio.gather(*(one(i, f) for i, f in enumerate(frames)))
     return results
+
+
+def caption_summary(captions: Sequence[Optional[str]], *, enabled: bool) -> Dict[str, Any]:
+    """The captioner's stage-level summary, in the shape `_summarise` uses.
+
+    Captions have always been allowed to fail one frame at a time, but the
+    number that failed was only ever a percentage in a progress line. Fusion
+    needs it as a fact so a video whose frames were never described is not
+    summarised as a video with nothing worth describing.
+    """
+    frames = len(captions)
+    described = sum(1 for c in captions if c)
+    if not enabled:
+        status, detail = "disabled", "frame captions are not enabled"
+    elif frames == 0:
+        status, detail = "skipped", "no frames to describe"
+    elif described == 0:
+        status, detail = "unavailable", "the vision model described none of the frames"
+    elif described < frames:
+        status, detail = "partial", f"{described}/{frames} frames described"
+    else:
+        status, detail = "ok", f"{described}/{frames} frames described"
+    return {"status": status, "frames": frames, "described": described, "detail": detail}
 
 
 def parse_caption(raw: Optional[str]) -> tuple:

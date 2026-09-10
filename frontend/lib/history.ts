@@ -42,6 +42,7 @@ import { FEEDBACK_STORAGE_KEY } from './feedback';
 import {
   createHistoryApi,
   isConflict,
+  isConversationChanged,
   isNotFound,
   isUnreachable,
   toEpoch,
@@ -54,6 +55,10 @@ import {
   buildConversationExport,
   type ExportedConversation,
 } from './exportMarkdown';
+import {
+  isPersistableMessage,
+  localOnlyTail,
+} from './threadReconcile';
 
 const STORAGE_KEY = 'techsara.history.v1';
 const SYNC_KEY = 'techsara.history.sync.v1';
@@ -588,6 +593,15 @@ interface SyncState {
   dirty: string[];
   /** Deletes that have not reached the server yet. */
   deleted: string[];
+  /**
+   * 2026-09-10: per conversation, the `updated_at` the last GET returned,
+   * verbatim. Sent back as `expected_updated_at` so the whole-thread PUT is
+   * conditional (RC-4: an older tab could overwrite an answer the server had
+   * persisted since). Absent = we have never read this conversation from the
+   * server, so there is nothing to be conditional ON and the write is
+   * unconditional exactly as it was before.
+   */
+  stamps?: Record<string, string>;
 }
 
 /* --------------------------------------------------- what the server has
@@ -768,9 +782,13 @@ export function createServerHistoryStore(
             : {},
         dirty: Array.isArray(parsed.dirty) ? parsed.dirty : [],
         deleted: Array.isArray(parsed.deleted) ? parsed.deleted : [],
+        stamps:
+          parsed.stamps && typeof parsed.stamps === 'object'
+            ? (parsed.stamps as Record<string, string>)
+            : {},
       };
     } catch {
-      return { pushed: {}, dirty: [], deleted: [] };
+      return { pushed: {}, dirty: [], deleted: [], stamps: {} };
     }
   }
 
@@ -888,7 +906,7 @@ export function createServerHistoryStore(
    * server refuses (409) any replace that would reduce the message count, and
    * we recover by adopting server truth instead of overwriting it.
    */
-  async function pushAll(conv: Conversation): Promise<void> {
+  async function pushAll(conv: Conversation, reconciled = false): Promise<void> {
     try {
       await api.create(conv.id, conv.title);
     } catch (err) {
@@ -899,8 +917,39 @@ export function createServerHistoryStore(
       await api.replaceMessages(
         conv.id,
         conv.messages.map(toServerMessage),
+        readSync().stamps?.[conv.id],
       );
     } catch (err) {
+      if (isConversationChanged(err)) {
+        // V29: the SERVER wrote this conversation after we last read it — it
+        // persists a finished answer itself when no viewer is attached — and
+        // it refused rather than let this copy overwrite that. Nothing was
+        // written. Adopt server truth, put back only what is genuinely ours
+        // (localOnlyTail dedupes on generation_id, so the answer we streamed
+        // is not appended a second time next to the one the server stored),
+        // and try once more. Once: a second refusal means another writer is
+        // active right now, and the retry belongs to the next refresh rather
+        // than to a loop.
+        const before = conv.messages;
+        const server = await loadConversation(conv.id, true, true);
+        if (!server || reconciled) {
+          markDirty(conv.id);
+          return;
+        }
+        const tail = localOnlyTail(before, server.messages);
+        if (tail.length === 0) {
+          mutateSync((s) => {
+            s.dirty = s.dirty.filter((d) => d !== conv.id);
+          });
+          return;
+        }
+        // local.saveMessages, not the store's: the re-push happens right
+        // here, and marking the conversation dirty would start the sync over.
+        local.saveMessages(conv.id, [...server.messages, ...tail]);
+        const fresh = local.get(conv.id);
+        if (fresh) await pushAll(fresh, true);
+        return;
+      }
       if (isConflict(err)) {
         // The server holds MORE than we do: our copy is stale, not canonical.
         // Pull its version down rather than destroying it.
@@ -912,6 +961,15 @@ export function createServerHistoryStore(
       }
       throw err;
     }
+    // The write moved the server's `updated_at` to a value only the server
+    // knows (the replace answers with {id, count}, not a timestamp). Keeping
+    // the old one would 409 every later write; inventing one would be worse.
+    // So the stamp is dropped and the next GET re-learns it — the conditional
+    // guard covers exactly what it can honestly cover: a tab writing over a
+    // conversation that moved on since IT last read.
+    mutateSync((s) => {
+      if (s.stamps) delete s.stamps[conv.id];
+    });
     // Flags are not part of the message sync; re-apply what we carry locally.
     if (conv.pinned || conv.archived) {
       await api.update(conv.id, flagsOf(conv));
@@ -1007,6 +1065,18 @@ export function createServerHistoryStore(
   async function loadConversation(
     id: string,
     force = false,
+    /**
+     * Take the server's copy even when it is SHORTER than ours.
+     *
+     * Only the conditional-write recovery passes this. The shrink guard
+     * below exists to stop a stale server read from destroying a longer
+     * local thread; but when the server has just refused a write because the
+     * conversation moved on, its copy is by definition the canonical one,
+     * and the caller re-applies our local-only tail on top of it
+     * immediately. Without this the recovery reads back its OWN copy, finds
+     * nothing to re-apply, and the retry never happens.
+     */
+    adoptServer = false,
   ): Promise<Conversation | null> {
     const cached = local.get(id);
     const s = readSync();
@@ -1024,7 +1094,12 @@ export function createServerHistoryStore(
     }
     try {
       const server = await api.get(id);
-      if (force && cached && server.messages.length < cached.messages.length) {
+      if (
+        force &&
+        !adoptServer &&
+        cached &&
+        server.messages.length < cached.messages.length
+      ) {
         return cached; // server is behind the local copy — keep local truth
       }
       const now = Date.now();
@@ -1059,6 +1134,11 @@ export function createServerHistoryStore(
       upsertCached(conv);
       mutateSync((st) => {
         st.pushed[id] = messages.map(syncKey);
+        // The value the next conditional write will quote back. Verbatim —
+        // the server compares strings.
+        if (!st.stamps) st.stamps = {};
+        if (server.updatedAt !== undefined) st.stamps[id] = server.updatedAt;
+        else delete st.stamps[id];
       });
       return conv;
     } catch {
@@ -1123,7 +1203,20 @@ export function createServerHistoryStore(
     },
 
     saveMessages(id, messages) {
-      local.saveMessages(id, messages);
+      // RC-2: refuse to store an assistant turn that says nothing at all —
+      // no text, no error, no meta. That row is what an interrupted answer
+      // used to become, and once it was in the thread the reload path stopped
+      // looking for the real answer behind it.
+      //
+      // Only rows the server does not already hold are dropped: a blank row
+      // written by an older build is still THERE, and filtering it out here
+      // would make every later push a shrink the server rightly refuses.
+      const known = readSync().pushed[id];
+      const from = Array.isArray(known) ? known.length : 0;
+      const kept = messages.filter(
+        (m, i) => i < from || isPersistableMessage(m),
+      );
+      local.saveMessages(id, kept);
       enqueue(id, () => syncConversation(id));
     },
 

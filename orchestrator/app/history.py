@@ -217,7 +217,7 @@ def replace_messages(
             ],
             expected_updated_at=body.expected_updated_at,
         )
-    except db.ConversationChanged as exc:
+    except db.ThreadMoved as exc:
         # Not an error the client did anything wrong to earn: the server
         # persisted something (an answer finished while this tab was away)
         # after the tab last loaded. It reloads and re-applies its own tail.

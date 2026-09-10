@@ -23,6 +23,14 @@ NOTHING IS INVENTED. The prompt says so, the schema forces `not_covered`,
 and every chapter start is checked to lie inside the video. A model that
 returns a timestamp past the end has hallucinated and the chapter is
 dropped rather than trusted.
+
+AND NOTHING MISSING IS PASSED OFF AS ABSENT. A stage that could not run —
+the OCR engine down, the captioner refusing every frame, speech-to-text
+turned off — leaves a hole in the evidence that looks exactly like a quiet,
+blank video. `limitations_from_reports` turns each stage's own summary into a
+sentence; the sentences go into the prompt (so the model does not write
+around them), into `not_covered` deterministically (so they are there even if
+it does), and into `summary.md`.
 """
 from __future__ import annotations
 
@@ -33,7 +41,7 @@ from typing import List, Optional, Sequence, Tuple
 
 from ..config import settings
 from .artifacts import fmt_ts, parse_ts
-from .types import CONTENT_TYPES, Chapter, OcrSpan, Segment, Understanding
+from .types import CONTENT_TYPES, Chapter, Limitation, OcrSpan, Segment, Understanding
 
 log = logging.getLogger(__name__)
 
@@ -75,8 +83,15 @@ def evidence_lines(
     spans: Sequence[OcrSpan],
     *,
     screen_chars: int = 700,
+    screen_unread: bool = False,
 ) -> List[Tuple[float, str]]:
-    """The merged, time-ordered timeline. Each entry is (start_s, line)."""
+    """The merged, time-ordered timeline. Each entry is (start_s, line).
+
+    `screen_unread` says the on-screen text reader did not manage this video.
+    A frame with no text is then reported as UNREAD rather than as blank —
+    the model is reading these lines as facts, and "nothing legible on
+    screen" is a claim about the video that nobody actually checked.
+    """
     lines: List[Tuple[float, str]] = []
     for start, end, text in speech_blocks(segments):
         lines.append((start, f"[{fmt_ts(start)}-{fmt_ts(end)}] SPEECH: {text}"))
@@ -91,7 +106,10 @@ def evidence_lines(
         if body:
             parts.append("TEXT: " + body)
         if not parts:
-            parts.append("nothing legible on screen")
+            parts.append(
+                "the on-screen text was NOT read for this frame" if screen_unread
+                else "nothing legible on screen"
+            )
         lines.append((span.start_s, f"[{fmt_ts(span.start_s)}-{fmt_ts(span.end_s)}] {label}: {' — '.join(parts)}"))
     lines.sort(key=lambda t: t[0])
     return lines
@@ -268,6 +286,98 @@ async def _ask(system: str, user: str, *, max_tokens: int) -> Optional[dict]:
     return data
 
 
+# ------------------------------------------------------------ limitations --
+
+
+def limitations_from_reports(
+    *,
+    ocr: Optional[dict] = None,
+    captions: Optional[dict] = None,
+    transcript: Optional[dict] = None,
+) -> List[Limitation]:
+    """Stage summaries -> the sentences the understanding has to carry.
+
+    Each argument is the summary its stage wrote next to its output file:
+    `screen.read_frames().summary`, `screen.caption_summary()` and the
+    transcript stage's report. Missing arguments mean "that stage said
+    nothing", which is not the same as "that stage was fine" — but a stage
+    that never wrote a summary is an old analysis, and an old analysis is
+    described exactly as it was before this existed.
+    """
+    out: List[Limitation] = []
+    ocr = ocr or {}
+    frames = int(ocr.get("frames") or 0)
+    unread = int(ocr.get("unread") or 0)
+    status = str(ocr.get("status") or "")
+    if status == "unavailable":
+        out.append(Limitation("ocr", (
+            f"On-screen text was NOT read for this video: the reader failed on all {frames} sampled "
+            "frame(s), so anything written on screen is missing from this analysis rather than absent "
+            "from the video."
+        )))
+    elif status == "partial":
+        out.append(Limitation("ocr", (
+            f"On-screen text is incomplete: {unread} of {frames} sampled frame(s) could not be read, "
+            "so some of what was written on screen is missing from this analysis."
+        )))
+    elif status == "disabled":
+        out.append(Limitation("ocr", (
+            "On-screen text was not read at all because the on-screen text reader is turned off on "
+            "this deployment; anything written on screen is missing from this analysis rather than "
+            "absent from the video."
+        )))
+
+    captions = captions or {}
+    described = int(captions.get("described") or 0)
+    caption_frames = int(captions.get("frames") or 0)
+    caption_status = str(captions.get("status") or "")
+    if caption_status == "unavailable":
+        out.append(Limitation("vision", (
+            f"The frames were not described: the vision model returned nothing for all {caption_frames} "
+            "of them, so anything that was only shown — not said and not written — is missing from "
+            "this analysis."
+        )))
+    elif caption_status == "partial":
+        out.append(Limitation("vision", (
+            f"Frame descriptions are incomplete: {described} of {caption_frames} frames were described, "
+            "so some of what was shown is missing from this analysis."
+        )))
+    elif caption_status == "disabled":
+        out.append(Limitation("vision", (
+            "Frame descriptions are turned off on this deployment, so the analysis knows what was "
+            "written on screen but not what the frames looked like."
+        )))
+
+    transcript = transcript or {}
+    reason = str(transcript.get("reason") or "")
+    failed_windows = int(transcript.get("windows_failed") or 0)
+    if reason == "asr disabled":
+        out.append(Limitation("transcript", (
+            "Speech was NOT transcribed because speech-to-text is turned off on this deployment, so "
+            "nothing that was said is in this analysis — the video is not silent, it was not listened "
+            "to."
+        )))
+    elif failed_windows:
+        out.append(Limitation("transcript", (
+            f"{failed_windows} clip(s) of the audio could not be transcribed, so parts of what was "
+            "said are missing from this analysis."
+        )))
+    return out
+
+
+def _with_limitations(not_covered: str, limitations: Sequence[Limitation]) -> str:
+    """Fold the sentences into `not_covered` without repeating the model."""
+    parts: List[str] = []
+    body = (not_covered or "").strip()
+    if body:
+        parts.append(body)
+    for lim in limitations:
+        sentence = lim.sentence.strip()
+        if sentence and sentence not in " ".join(parts):
+            parts.append(sentence)
+    return " ".join(parts).strip()
+
+
 def _header(
     *,
     filename: str,
@@ -276,6 +386,7 @@ def _header(
     has_audio: bool,
     speech_fraction: Optional[float],
     has_speech: bool = True,
+    limitations: Sequence[Limitation] = (),
 ) -> str:
     bits = [f"File: {filename}", f"Duration: {fmt_ts(duration_s)}"]
     if language:
@@ -286,6 +397,14 @@ def _header(
         # Said plainly so the model reports "no speech" rather than
         # describing the shape of the evidence it was given.
         bits.append("The audio track contains no transcribable speech; the evidence is on-screen only.")
+    if limitations:
+        # The model must not describe a gap as an absence, so it is told what
+        # is missing before it is shown what survived.
+        bits.append(
+            "LIMITS OF THIS EVIDENCE — repeat these in `not_covered`, and never write as though the "
+            "missing part was empty:"
+        )
+        bits += [f"- {lim.sentence}" for lim in limitations]
     return "\n".join(bits)
 
 
@@ -299,15 +418,32 @@ async def understand(
     segments: Sequence[Segment],
     spans: Sequence[OcrSpan],
     progress,
+    limitations: Sequence[Limitation] = (),
 ) -> Understanding:
-    """The whole thing: evidence -> Understanding, direct or map-reduce."""
-    lines = evidence_lines(segments, spans)
+    """The whole thing: evidence -> Understanding, direct or map-reduce.
+
+    `limitations` are the stages that could not contribute (see
+    `limitations_from_reports`). They are told to the model AND written into
+    the result, because a model asked to summarise a hole will describe the
+    hole as emptiness if nobody tells it otherwise.
+    """
+    lims = [lim for lim in limitations if lim.sentence.strip()]
+    screen_unread = any(lim.stage == "ocr" for lim in lims)
+    lines = evidence_lines(segments, spans, screen_unread=screen_unread)
     if not lines:
+        # Nothing to summarise — but WHY matters. A silent, blank video and a
+        # video whose two readers were both down look identical here.
+        empty = (
+            "No evidence could be gathered for this video."
+            if lims
+            else "The video produced no speech transcript and no readable on-screen content, so there is nothing to summarise."
+        )
         return Understanding(
             content_type="other",
             summary="",
-            not_covered="The video produced no speech transcript and no readable on-screen content, so there is nothing to summarise.",
+            not_covered=_with_limitations(empty, lims),
             method="empty",
+            limitations=list(lims),
         )
     header = _header(
         filename=filename,
@@ -316,6 +452,7 @@ async def understand(
         has_audio=has_audio,
         speech_fraction=speech_fraction,
         has_speech=any(s.text.strip() for s in segments),
+        limitations=lims,
     )
     pack = render_pack(lines)
     total_tokens = _estimate_tokens(pack)
@@ -334,7 +471,9 @@ async def understand(
         if data is None:
             raise RuntimeError("the model did not return a readable understanding")
         await progress(100.0, "done")
-        return _understanding_from(data, duration_s=duration_s, method="direct")
+        return _carrying(
+            _understanding_from(data, duration_s=duration_s, method="direct"), lims
+        )
 
     # Map: notes per part.
     parts = split_pack(lines, max(4_000, settings.video_fusion_part_tokens))
@@ -390,4 +529,18 @@ async def understand(
         }
         data = merged
     await progress(100.0, "done")
-    return _understanding_from(data, duration_s=duration_s, method=f"map_reduce:{len(notes)}")
+    return _carrying(
+        _understanding_from(data, duration_s=duration_s, method=f"map_reduce:{len(notes)}"), lims
+    )
+
+
+def _carrying(u: Understanding, limitations: Sequence[Limitation]) -> Understanding:
+    """Attach the limitations to a finished understanding.
+
+    `not_covered` is rewritten rather than trusted: the model was told what
+    was missing, but a summary that quietly drops the warning is exactly the
+    failure this guards against.
+    """
+    u.limitations = list(limitations)
+    u.not_covered = _with_limitations(u.not_covered, limitations)
+    return u

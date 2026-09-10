@@ -190,7 +190,10 @@ describe('while /api/upload is still unresolved', () => {
       await screen.findByText('What is the highest amount?'),
     ).toBeTruthy(); // H01-01
     expect(screen.getByText('sales.csv')).toBeTruthy(); // H01-02
-    expect(screen.getByText('Uploading dataset…')).toBeTruthy(); // H01-03
+    // 2026-09-10: the pending line names the FILE (CONTRACT.md's "What the
+    // person sees"): "Uploading dataset…" said nothing about which file a
+    // multi-file turn was waiting on.
+    expect(screen.getByText('Uploading sales.csv…')).toBeTruthy(); // H01-03
   });
 
   it('has NOT started a generation yet', async () => {
@@ -336,9 +339,11 @@ describe.each(failures)('when the upload fails with %s', (_label, make) => {
     );
     // H01-11 — the pending state is gone…
     expect(screen.queryByText('Uploading dataset…')).toBeNull();
-    // …replaced by something truthful and in-thread, not only a toast.
+    // …replaced by something truthful and in-thread, not only a toast. Since
+    // 2026-09-10 that sentence NAMES the file and says what happened to it,
+    // rather than describing every failure as a page that closed (T-02).
     expect(
-      screen.getByText(/Dataset upload failed/i),
+      screen.getByText(/sales\.csv could not be uploaded/i),
     ).toBeTruthy();
     // H01-02 on the failure path: the file is still understandable.
     expect(screen.getByText('sales.csv')).toBeTruthy();
