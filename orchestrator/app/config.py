@@ -269,6 +269,13 @@ class Settings:
         # hold the only job slot forever. Two hours covers a four-hour video's
         # transcript at ~10x realtime with a margin.
         self.video_stage_timeout_s: float = _float("VIDEO_STAGE_TIMEOUT_S", 2 * 3600.0)
+        # A stage that could not reach the model even after the recovery
+        # window (app/resilience.py) DEFERS the job — back to 'queued' with
+        # its finished stages kept — rather than failing it, up to this many
+        # attempts in total; the maintenance drain leaves a deferred row
+        # alone for VIDEO_RETRY_DELAY_S before trying again.
+        self.video_max_attempts: int = _int("VIDEO_MAX_ATTEMPTS", 5)
+        self.video_retry_delay_s: float = _float("VIDEO_RETRY_DELAY_S", 300.0)
         # Transcription windows: at most this long (the engine refuses 600 s),
         # never spanning a pause over `max_gap`, overlapping by `overlap`
         # only where continuous speech had to be cut. Batch clips go through
@@ -1323,6 +1330,19 @@ class Settings:
         #: re-running minutes of local GPU work. Callers that can retry
         #: meaningfully (the agent planner) already do so on parse failures.
         self.llm_max_retries: int = _int("LLM_MAX_RETRIES", 0)
+        # --- Surviving an engine outage (app/resilience.py) -----------------
+        # The SDK retries above stay OFF; this is the ONE retry layer, and it
+        # retries only what a restart can fix (connection refused/reset, a
+        # 5xx from a dying engine), never a 4xx or a read timeout. A reload of
+        # the TP=2 pair measured 13 min on 2026-09-10, so a background job
+        # waits up to LLM_RECOVERY_WINDOW_S for /health to come back; a
+        # person watching a chat waits only LLM_INTERACTIVE_RECOVERY_S before
+        # the MODEL_UNAVAILABLE sentence, which the client already handles.
+        self.llm_recovery_window_s: float = _float("LLM_RECOVERY_WINDOW_S", 1200.0)
+        self.llm_interactive_recovery_s: float = _float("LLM_INTERACTIVE_RECOVERY_S", 120.0)
+        self.llm_retry_base_s: float = _float("LLM_RETRY_BASE_S", 2.0)
+        self.llm_retry_cap_s: float = _float("LLM_RETRY_CAP_S", 30.0)
+        self.llm_health_poll_s: float = _float("LLM_HEALTH_POLL_S", 5.0)
         self.schema_cache_ttl: float = _float("SCHEMA_CACHE_TTL", 300.0)
         # §8 /health: per-dependency probe timeout — short so /health answers
         # quickly even when every vLLM service is down.

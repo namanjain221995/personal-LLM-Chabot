@@ -3303,8 +3303,17 @@ async def _run(
                     "detail": str(exc)[:200],
                 },
             )
+        # A person reads this; an engine outage gets the sentence the rest of
+        # the app uses for it rather than the SDK's "Connection error.".
+        from ..resilience import ModelUnavailable, is_recoverable
+
+        why = (
+            "the model was unavailable — it may still be restarting"
+            if isinstance(exc, ModelUnavailable) or is_recoverable(exc)
+            else str(exc)[:200]
+        )
         text = (
-            f"The research run failed ({exc}). "
+            f"The research run failed ({why}). "
             + (
                 f"The {len(state.sources)} source(s) it had already read are "
                 "listed below and stay in the web store, so asking again is "
