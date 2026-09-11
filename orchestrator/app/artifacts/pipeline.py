@@ -58,6 +58,7 @@ no row points at it.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import logging
 import os
@@ -178,10 +179,26 @@ class RenderFailed(StageFailure):
 Composer = Callable[["ComposeContext"], Awaitable[ArtifactSpec]]
 _composer: Optional[Composer] = None
 
+#: Max effort only: shown a few rendered pages, returns a REVISED spec when
+#: it found layout defects worth a correction, else None. Installed by the
+#: engine (compose.visual_review + compose.revise); absent in tests.
+VisualReviewer = Callable[["ComposeContext", ArtifactSpec, List[bytes]], Awaitable[Optional[ArtifactSpec]]]
+_visual_reviewer: Optional[VisualReviewer] = None
+
+#: How many times the visual loop may re-render one version. One: the
+#: brief asks for a bounded loop, and a second pass rarely fixes what the
+#: first could not — the corrections are logged and counted either way.
+_MAX_VISUAL_PASSES = 1
+
 
 def set_composer(fn: Optional[Composer]) -> None:
     global _composer
     _composer = fn
+
+
+def set_visual_reviewer(fn: Optional[VisualReviewer]) -> None:
+    global _visual_reviewer
+    _visual_reviewer = fn
 
 
 #: Answers "is somebody chatting right now?" — installed by main.py, because
@@ -909,6 +926,66 @@ async def _run(job_id: str) -> None:
                 log.debug("artifact job %s: could not release the lease", job_id[:8], exc_info=True)
 
 
+async def _visual_qa(runner: "_Runner", ctx: "_Ctx", stages: Dict[str, dict], progress: Dict[str, Any]) -> Optional[str]:
+    """Max effort: look at the rendered pages before releasing them.
+
+    A few pages of the preview PDF (ARTIFACT_QA_PAGES, downscaled to
+    ARTIFACT_QA_WIDTH) go to the vision-capable model through the installed
+    reviewer; when it returns a revised spec, the spec is rewritten and the
+    render / validate / preview stages run again — once. Bounded by
+    `_MAX_VISUAL_PASSES`; every pass is counted; a reviewer that fails is a
+    warning, never a failed job (the file it looked at is a good file).
+    Returns a failure string only when the RE-RENDER fails.
+    """
+    job = ctx.job
+    budget = T.EFFORT_BUDGETS.get(str(job.get("effort") or "fast"), T.EFFORT_BUDGETS["fast"])
+    if not budget.visual_qa or _visual_reviewer is None:
+        return None
+    passes = int(progress.get("visual_passes") or 0)
+    if passes >= _MAX_VISUAL_PASSES:
+        return None
+    report = ctx.load_report()
+    if str(report.get("preview_kind") or "none") != "pages":
+        return None
+    pdf = _preview_pdf_path(ctx.work_dir, report.get("preview_pdf"))
+    if pdf is None or not os.path.isfile(pdf):
+        return None
+    try:
+        count = min(int(await asyncio.to_thread(_page_count, pdf)), int(settings.artifact_qa_pages))
+        pages = [await asyncio.to_thread(_rasterise_page, pdf, i, int(settings.artifact_qa_width)) for i in range(1, count + 1)]
+    except Exception as exc:  # noqa: BLE001
+        log.warning("artifact job %s: visual QA could not rasterise: %s", runner.job_id[:8], type(exc).__name__)
+        return None
+    if not pages:
+        return None
+    _publish(runner.job_id, {"stage": "validate", "status": "running", "percent": None, "detail": f"looking at {len(pages)} page(s)", "elapsed_s": 0})
+    spec = ctx.load_spec()
+    ccx = ComposeContext(ctx, progress=lambda pct, detail: asyncio.sleep(0), progress_stage=lambda stage, status, detail="": asyncio.sleep(0))
+    try:
+        revised = await asyncio.wait_for(_visual_reviewer(ccx, spec, pages), timeout=stage_timeout("compose"))
+    except Exception as exc:  # noqa: BLE001 — the file is fine; the second look is what failed
+        log.warning("artifact job %s: visual QA failed: %s", runner.job_id[:8], type(exc).__name__)
+        ctx.warnings.append("the visual check could not run")
+        return None
+    progress["visual_passes"] = passes + 1
+    await core_db.run_in_thread(db.set_job_progress, runner.job_id, {**progress, "warnings": ctx.warnings})
+    if revised is None:
+        _publish(runner.job_id, {"stage": "validate", "status": "done", "percent": 100, "detail": "layout checked", "elapsed_s": 0})
+        return None
+    metrics.inc("artifact_corrections_total", "artifact correction passes", stage="visual")
+    ctx.warnings.append("the layout was corrected after a visual check")
+    # A new spec means the files are stale: rewrite it and re-run what
+    # depends on it, keeping the composer-owned stages as they were.
+    await asyncio.to_thread(store.write_spec, ctx.work_dir, revised)
+    ctx.spec, ctx.report = revised, None
+    for name in ("render", "validate", "preview"):
+        stages.pop(name, None)
+    for name in (store.RENDER_REPORT_NAME, T.VALIDATION_NAME, store.PREVIEW_META_NAME):
+        with contextlib.suppress(OSError):
+            os.unlink(os.path.join(ctx.work_dir, name))
+    return await runner.chain(("render", "validate", "preview"))
+
+
 async def _run_stages(job_id: str, row: dict) -> None:
     """The stages against one row — under a lease this process holds."""
     started = time.perf_counter()
@@ -954,6 +1031,8 @@ async def _run_stages(job_id: str, row: dict) -> None:
     runner = _Runner(job_id, ctx, stages)
 
     failure = await runner.chain(RUNNER_STAGES)
+    if failure is None and not runner.deferred:
+        failure = await _visual_qa(runner, ctx, stages, progress)
     if runner.deferred:
         deferrals = int(progress.get("deferrals") or 0) + 1
         if deferrals < _MAX_DEFERRALS:

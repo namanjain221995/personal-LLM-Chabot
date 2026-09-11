@@ -434,6 +434,22 @@ async def run_artifact_engine(
     return line
 
 
+async def visual_reviewer(ctx: "pipeline.ComposeContext", spec, pages: List[bytes]):
+    """Installed on the pipeline for Max effort: the vision-capable model
+    looks at a few rendered pages; layout defects it reports become ONE
+    correction pass through the composer's `revise`. None means the pages
+    looked right."""
+    verdict = await C.visual_review(pages, kind=spec.kind, title=spec.title)
+    issues = [i for i in (verdict or {}).get("issues", []) if isinstance(i, dict)]
+    if not issues:
+        return None
+    material = _material_from_dict(ctx.material)
+    material.instruction = ctx.instruction
+    req = C.ComposeRequest(kind=ctx.kind, formats=ctx.formats, template_id=ctx.template_id, effort=ctx.effort,
+                           operation="edit", material=material, parent_spec=spec, instruction=ctx.instruction)
+    return await C.revise(req, spec, issues)
+
+
 async def classify_hook(text: str) -> Optional[ArtifactIntent]:
     """The strict-JSON classifier the intent gate may consult for its
     ambiguous band. Returns an intent only when the model is sure."""
@@ -443,4 +459,4 @@ async def classify_hook(text: str) -> Optional[ArtifactIntent]:
     return ArtifactIntent("create", rule="model", instruction=text)
 
 
-__all__ = ["run_artifact_engine", "compose_for_pipeline", "classify_hook"]
+__all__ = ["run_artifact_engine", "compose_for_pipeline", "visual_reviewer", "classify_hook"]

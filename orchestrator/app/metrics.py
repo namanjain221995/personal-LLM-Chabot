@@ -76,6 +76,7 @@ _ALLOWED = {
         # runner's publish step, for artifact_stage_seconds and
         # artifact_corrections_total.
         "intent", "gather", "outline", "compose", "render", "validate",
+        "visual",  # the Max-effort visual correction pass
         "preview", "publish",
     },
     # A file format the Artifact Studio writes (app/artifacts/types.FORMATS):

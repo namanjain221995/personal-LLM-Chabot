@@ -153,6 +153,7 @@ async def lifespan(_app: FastAPI):
     from .engines import artifact as artifact_engine
 
     artifact_pipeline.set_composer(artifact_engine.compose_for_pipeline)
+    artifact_pipeline.set_visual_reviewer(artifact_engine.visual_reviewer)
     artifact_pipeline.install_busy_probe(_chat_is_busy)
     await artifact_pipeline.start()
     try:
@@ -890,6 +891,10 @@ async def health() -> dict:
         # outside the process. `status` is untouched: being busy is not an
         # outage, and the container healthcheck gates on `status`.
         "work": report.get("work", {}),
+        # Artifact Studio (2026-09-11): renderer availability and whether
+        # the reports volume takes writes — computed by check_dependencies
+        # like `work` above, and forwarded for the same reason.
+        "artifacts": report.get("artifacts", {}),
     }
 
 

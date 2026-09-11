@@ -308,3 +308,84 @@ def test_the_pipeline_composer_announces_its_stages_and_maps_compose(owner, monk
     assert req.material.history_text == "hello" and req.material.sources[0].id == "s1"
     names = [(e.get("stage"), e.get("status")) for e in stages]
     assert ("intent", "done") in names and ("gather", "done") in names and ("outline", "running") in names and ("outline", "done") in names
+
+
+# --------------------------------------------------------------- visual QA --
+
+
+def test_max_effort_runs_one_visual_correction_pass_and_no_more(owner, monkeypatch):
+    """The reviewer sees rendered pages, returns a revised spec, and the
+    render/validate/preview stages run again exactly once — bounded, counted,
+    and recorded as a warning on the version. A reviewer that finds nothing
+    changes nothing."""
+    renders = []
+    seen_pages = []
+
+    async def composer(ctx):
+        return _spec("document", title="Draft")
+
+    def _install_here():
+        _install(monkeypatch, composer=composer)
+        real_render = pipeline._render_in_subprocess
+
+        async def counting_render(work_dir, spec, formats, title_slug, version, effort):
+            renders.append(spec.title)
+            return await real_render(work_dir, spec, formats, title_slug, version, effort)
+
+        monkeypatch.setattr(pipeline, "_render_in_subprocess", counting_render)
+        monkeypatch.setattr(pipeline, "_page_count", lambda pdf: 3)
+        monkeypatch.setattr(pipeline, "_rasterise_page", lambda pdf, page, width: b"\x89PNG-" + str(page).encode())
+
+    _install_here()
+    monkeypatch.setattr(settings, "artifact_qa_pages", 2)
+
+    async def reviewer(ctx, spec, pages):
+        seen_pages.append(list(pages))
+        return _spec("document", title="Draft (fixed)")
+
+    pipeline.set_visual_reviewer(reviewer)
+    try:
+        answer, events = _turn(owner, "Create a PDF about the pricing change.", effort="max")
+    finally:
+        pipeline.set_visual_reviewer(None)
+    ref = _meta(events)["artifacts"][0]
+    assert ref["status"] == "completed_with_warnings"
+    assert renders == ["Draft", "Draft (fixed)"], "rendered twice: once to look, once with the correction"
+    assert seen_pages == [[b"\x89PNG-1", b"\x89PNG-2"]], "the reviewer saw ARTIFACT_QA_PAGES pages"
+    assert any("visual check" in w for w in ref["warnings"])
+    assert answer.startswith("Created **Draft (fixed)**")
+    # The published spec is the revised one.
+    from app.artifacts import store
+
+    published = store.read_spec(store.version_dir(owner, ref["artifact_id"], 1))
+    assert published.title == "Draft (fixed)"
+
+
+def test_a_clean_visual_review_renders_once_and_fast_never_looks(owner, monkeypatch):
+    renders = []
+
+    async def composer(ctx):
+        return _spec("document")
+
+    _install(monkeypatch, composer=composer)
+    real_render = pipeline._render_in_subprocess
+
+    async def counting_render(work_dir, spec, formats, title_slug, version, effort):
+        renders.append(effort)
+        return await real_render(work_dir, spec, formats, title_slug, version, effort)
+
+    monkeypatch.setattr(pipeline, "_render_in_subprocess", counting_render)
+    calls = {"n": 0}
+
+    async def reviewer(ctx, spec, pages):
+        calls["n"] += 1
+        return None
+
+    pipeline.set_visual_reviewer(reviewer)
+    try:
+        _, events = _turn(owner, "Create a PDF about the pricing change.", effort="max", gen="g-max")
+        assert _meta(events)["artifacts"][0]["status"] == "completed" and calls["n"] == 1 and renders == ["max"]
+        _, events = _turn(owner, "Create a PDF about the other change.", effort="fast", gen="g-fast", conv="conv-fast")
+        assert _meta(events)["artifacts"][0]["status"] == "completed" and calls["n"] == 1, "Fast never asks for a visual review"
+    finally:
+        pipeline.set_visual_reviewer(None)
