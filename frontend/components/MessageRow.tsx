@@ -319,6 +319,38 @@ function serverPreviewLoaders(
  */
 export type UploadStatus = 'uploading' | 'failed';
 
+/**
+ * 2026-09-10: what the row must SAY about the send this turn belongs to —
+ * the "What the person sees" table of docs/upload-reliability/CONTRACT.md.
+ *
+ * The kinds are deliberately not one flag. "Never sent", "the server is
+ * working on it", "the connection died and we are resuming" and "we cannot
+ * reach the server to find out" were all rendered as the same red notice,
+ * and three of the four were wrong — the state and the sentence are the same
+ * decision, so they are made together, once, by the host (ChatApp's
+ * `userTurnView`).
+ */
+export type UserTurnKind =
+  | 'unsent'
+  | 'working'
+  | 'interrupted'
+  | 'failed'
+  | 'status_unknown';
+
+export interface UserTurnView {
+  kind: UserTurnKind;
+  /** Files this turn names whose bytes never reached the server. */
+  missing: string[];
+  /** Files that DID land — the server has them, and may have analysed them. */
+  kept: string[];
+  /** Can the same question go out again as it stands? */
+  canResend: boolean;
+  /** The safe public sentence for a failure, when there is one. */
+  reason?: string;
+  /** An interrupted turn whose reconnect is actively running. */
+  resuming?: boolean;
+}
+
 function MessageRowImpl({
   message,
   isLast,
@@ -326,7 +358,9 @@ function MessageRowImpl({
   onShowSummary,
   onRetry,
   uploadStatus = null,
-  unsent = null,
+  turn = null,
+  onStopTurn,
+  onSendWithLanded,
   versions = null,
   onSelectVersion,
   onEditStart,
@@ -355,12 +389,24 @@ function MessageRowImpl({
    */
   uploadStatus?: UploadStatus | null;
   /**
-   * 2026-09-09: set on the last user turn when it was saved while its
-   * files were uploading and the request never went out (a reload). The
-   * row says which file did not make it and offers Send now when every
-   * file the turn names is on the server.
+   * 2026-09-10: what became of this turn's send, when there is anything to
+   * say. Null for every turn that is simply part of the transcript.
+   *
+   * The row NEVER decides this for itself: whether a send is lost, running,
+   * resuming or merely unknown is a fact about the server and about this
+   * tab's knowledge of it, and inferring it from what is on screen is the bug
+   * this whole exercise exists to remove.
    */
-  unsent?: { missing: string[]; kept: string[]; canResend: boolean } | null;
+  turn?: UserTurnView | null;
+  /** Stop the generation this turn is waiting on (the `working` state). */
+  onStopTurn?: () => void;
+  /**
+   * Send an unsent turn with only the attachments that reached the server —
+   * the explicit choice offered when one file of several never landed. It is
+   * a different action from Send now on purpose: the ordinary resend refuses
+   * a turn with a missing file rather than quietly asking about less.
+   */
+  onSendWithLanded?: () => void;
   /**
    * "Edit" on a USER message: rewrite it IN PLACE, ChatGPT-style.
    *
@@ -846,49 +892,108 @@ function MessageRowImpl({
               finished uploading, so the turn says so itself. Indeterminate on
               purpose — /api/upload reports no byte progress, and a percentage
               we cannot measure would be a fiction. */}
-          {uploadStatus && (
+          {/* H-01: a turn is on screen long before its files have finished
+              uploading, so the turn says so itself — per FILE since
+              2026-09-10, because "Uploading video…" over a two-video turn
+              said nothing about which one the wait was for. Indeterminate on
+              purpose where the rail cannot measure: a percentage we do not
+              have is a fiction. */}
+          {uploadStatus && !(uploadStatus === 'failed' && turn) && (
             <div
               className="mt-1.5 flex items-center justify-end gap-2 text-xs"
               aria-live="polite"
+              data-testid="upload-status"
             >
               {uploadStatus === 'uploading' ? (
                 <>
                   <Loader size={16} />
-                  <span className="text-muted">
-                    {message.meta?.attachments?.some((a) => a.kind === 'video')
-                      ? 'Uploading video…'
-                      : 'Uploading dataset…'}
-                  </span>
+                  <span className="text-muted">{uploadingLabel(message)}</span>
                 </>
               ) : (
                 <>
                   <IconAlert size={13} className="shrink-0 text-danger" />
                   <span className="text-danger">
-                    Dataset upload failed — nothing was sent to the model.
+                    Upload failed — nothing was sent to the model.
                   </span>
                 </>
               )}
             </div>
           )}
-          {unsent && (
+          {turn && (
             <div
               className="mt-1.5 flex flex-wrap items-center justify-end gap-2 text-xs"
               role="status"
-              data-testid="unsent-turn"
+              data-testid={
+                turn.kind === 'unsent' || turn.kind === 'failed'
+                  ? 'unsent-turn'
+                  : `turn-${turn.kind}`
+              }
             >
-              <IconAlert size={13} className="shrink-0 text-danger" />
-              <span className="text-danger">
-                {unsent.canResend
-                  ? 'This message was never sent — the page closed while its files were still uploading.'
-                  : `This message was never sent — the page closed while ${listNames(unsent.missing)} ${unsent.missing.length === 1 ? 'was' : 'were'} still uploading. Attach ${unsent.missing.length === 1 ? 'it' : 'them'} again to send${unsent.kept.length ? `; ${listNames(unsent.kept)} stayed attached to this chat, so you can ask about ${unsent.kept.length === 1 ? 'it' : 'them'} now` : ''}.`}
+              {turn.kind === 'working' || turn.kind === 'interrupted' ? (
+                <Loader size={16} />
+              ) : turn.kind === 'status_unknown' ? null : (
+                <IconAlert size={13} className="shrink-0 text-danger" />
+              )}
+              <span
+                className={
+                  turn.kind === 'unsent' || turn.kind === 'failed'
+                    ? 'text-danger'
+                    : 'text-muted'
+                }
+              >
+                {turnSentence(turn)}
               </span>
-              {unsent.canResend && (
+              {/* One action per state, and only where it can actually do
+                  something. Send now goes through the regenerate path, which
+                  re-sends the SAME intent — so pressing it twice, or pressing
+                  it while the server is still holding the request, converges
+                  on one answer instead of starting a second. */}
+              {(turn.kind === 'unsent' || turn.kind === 'failed') &&
+                turn.canResend && (
+                  <button
+                    type="button"
+                    onClick={onRegenerate}
+                    className="rounded-md border border-border px-2 py-0.5 text-xs text-ink transition-colors duration-ts hover:bg-surface"
+                  >
+                    {turn.kind === 'failed' ? 'Retry' : 'Send now'}
+                  </button>
+                )}
+              {(turn.kind === 'unsent' || turn.kind === 'failed') &&
+                !turn.canResend &&
+                turn.kept.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={onSendWithLanded ?? onRegenerate}
+                    className="rounded-md border border-border px-2 py-0.5 text-xs text-ink transition-colors duration-ts hover:bg-surface"
+                  >
+                    Send with {listNames(turn.kept)}
+                  </button>
+                )}
+              {turn.kind === 'interrupted' && !turn.resuming && (
                 <button
                   type="button"
                   onClick={onRegenerate}
                   className="rounded-md border border-border px-2 py-0.5 text-xs text-ink transition-colors duration-ts hover:bg-surface"
                 >
-                  Send now
+                  Resume
+                </button>
+              )}
+              {turn.kind === 'status_unknown' && (
+                <button
+                  type="button"
+                  onClick={onRetry}
+                  className="rounded-md border border-border px-2 py-0.5 text-xs text-ink transition-colors duration-ts hover:bg-surface"
+                >
+                  Retry
+                </button>
+              )}
+              {turn.kind === 'working' && onStopTurn && (
+                <button
+                  type="button"
+                  onClick={onStopTurn}
+                  className="rounded-md border border-border px-2 py-0.5 text-xs text-ink transition-colors duration-ts hover:bg-surface"
+                >
+                  Stop
                 </button>
               )}
             </div>
@@ -1094,7 +1199,7 @@ function MessageRowImpl({
             </p>
           )}
 
-          {message.status === 'error' &&
+          {(message.status === 'error' || message.meta?.error) &&
             (() => {
               // Raw upstream payloads ("Error code: 400 - {'error': …}") are
               // unreadable in a chat thread AND are not the user's business:
@@ -1102,7 +1207,16 @@ function MessageRowImpl({
               // sentence is rendered. The original is written to the server
               // log instead (lib/serverLog.ts), which is where an engineer
               // can actually use it.
-              const friendly = friendlyError(message.errorMessage);
+              //
+              // `meta.error` is the same failure AFTER a reload (RC-2): the
+              // live fields do not survive the history round trip, so a row
+              // that once said "the connection was interrupted" came back as
+              // an empty bubble with no error and no way out. It reads
+              // whichever is present, so a reloaded failure keeps its
+              // sentence and its Retry.
+              const friendly = friendlyError(
+                message.errorMessage ?? message.meta?.error?.message,
+              );
               return (
                 <div
                   role="alert"
@@ -1120,7 +1234,10 @@ function MessageRowImpl({
                       className="inline-flex items-center gap-1.5 rounded-md border border-border bg-surface px-2.5 py-1 text-xs font-medium transition-colors duration-ts hover:bg-surface-2"
                     >
                       <IconRefresh size={13} />
-                      Retry
+                      {/* A resumable failure is the server still holding the
+                          request: pressing this re-joins that one rather
+                          than asking again. */}
+                      {message.meta?.error?.resumable ? 'Resume' : 'Retry'}
                     </button>
                   </div>
                 </div>
@@ -1244,6 +1361,63 @@ function MessageRowImpl({
 function listNames(names: string[]): string {
   if (names.length <= 1) return names.join('');
   return `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
+}
+
+/**
+ * Which file the wait is for, by name.
+ *
+ * "Uploading video…" was the whole story for a turn with two videos, so the
+ * 400 MB one and the 21 MB one were indistinguishable — and when the page was
+ * reloaded, nothing on screen had ever said which was which.
+ */
+function uploadingLabel(message: ChatMessage): string {
+  const attachments = message.meta?.attachments ?? [];
+  const inFlight = attachments
+    .filter(
+      (a) =>
+        a.upload_state === 'uploading' ||
+        a.upload_state === 'finalizing' ||
+        (a.upload_state === undefined && !a.id),
+    )
+    .map((a) => a.name);
+  if (inFlight.length > 0) return `Uploading ${listNames(inFlight)}…`;
+  if (attachments.some((a) => a.kind === 'video')) return 'Uploading video…';
+  return 'Uploading dataset…';
+}
+
+/**
+ * The sentence for each state, written to be TRUE of every case that reaches
+ * it (T-02 / F9).
+ *
+ * The single sentence this replaces — "the page closed while its files were
+ * still uploading" — was shown for a refused upload, a 413 at the edge, a
+ * quota rejection and a dead network alike. Where the failure has a reason of
+ * its own, that reason is what the person reads.
+ */
+function turnSentence(turn: UserTurnView): string {
+  if (turn.kind === 'working') return 'Working on this — the server has it.';
+  if (turn.kind === 'interrupted') {
+    return turn.resuming
+      ? 'The connection dropped while this was being answered. Resuming…'
+      : 'The connection dropped while this was being answered.';
+  }
+  if (turn.kind === 'status_unknown') {
+    return 'Checking with the server…';
+  }
+  // The reason, when there is one, already names the files it is about —
+  // repeating them underneath it reads as two different problems.
+  const lead =
+    turn.reason ??
+    (turn.kind === 'failed'
+      ? 'This message could not be answered.'
+      : turn.missing.length
+        ? `${listNames(turn.missing)} never finished uploading, so this message was never sent.`
+        : 'This message was never sent.');
+  const kept =
+    turn.missing.length && turn.kept.length
+      ? ` ${listNames(turn.kept)} ${turn.kept.length === 1 ? 'is' : 'are'} on the server, so you can send with ${turn.kept.length === 1 ? 'it' : 'them'} instead.`
+      : '';
+  return `${lead}${kept}`.trim();
 }
 
 export const MessageRow = memo(MessageRowImpl);

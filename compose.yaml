@@ -301,8 +301,46 @@ services:
       - "${TECHSARA_BIND_ADDRESS:-127.0.0.1}:${FRONTEND_PORT:-3000}:3000"
     networks:
       - application
+    # docker-init (tini) is PID 1 and forwards SIGTERM to its direct child;
+    # the image's CMD is exec form, so that child is `node server.js` itself.
+    # Next 16's standalone server installs its own SIGTERM handler, which
+    # calls server.close() and only then exits — in production it does NOT
+    # call closeAllConnections(), so in-flight requests are allowed to
+    # finish, and Node >= 19 closes IDLE keep-alive sockets on close() so a
+    # quiet proxy still exits immediately. The chain works; what was missing
+    # was the time to use it.
     init: true
     restart: unless-stopped
+    # WHY 5m, when this service had nothing at all (Docker's 10 s default).
+    #
+    # On 2026-09-09 four deploys between 20:47 and 22:52 IST SIGKILLed this
+    # proxy ten seconds after SIGTERM, cutting in-flight chunked part PUTs
+    # and proxied SSE mid-frame (.runtime/logs/deploy-*.log; INF-1).
+    #
+    # The longest request this proxy legitimately carries BYTES for is one
+    # 64 MiB part (frontend/lib/uploadDocument.CHUNK_PART_BYTES), streamed
+    # through app/api/upload/chunked. Node's own `server.requestTimeout` —
+    # 300 s, left at its default in this image — is the hard ceiling on
+    # receiving one complete request body, so a part still arriving after
+    # five minutes is dropped by Node with a 408 whatever Docker does. Five
+    # minutes is therefore the largest grace that can still save a byte, and
+    # it covers 64 MiB down to ~219 KB/s (~1.75 Mbit/s) of client upstream.
+    #
+    # It deliberately does NOT cover a proxied SSE stream, which may
+    # legitimately run GEN_WALL_CLOCK_S (4,200 s): waiting seventy minutes
+    # for a deploy is not a trade anyone would take. A cut stream is the
+    # recoverable case — the browser re-asks GET /chat/requests/{intent_id}
+    # and re-attaches, and the orchestrator's shutdown hook has marked the
+    # request `interrupted` so that answer is true (docs/upload-reliability
+    # /CONTRACT.md, "Connection knowledge").
+    #
+    # This is a CEILING, not a delay. Compose recreates this service after
+    # the orchestrator (depends_on), so by the time SIGTERM lands here the
+    # upstream SSE responses have already ended and a quiet proxy exits in
+    # well under a second. Only a frontend-ONLY recreate with a live stream
+    # pays the full five minutes; see docs/upload-reliability/OPERATIONS.md
+    # for the `docker compose stop -t` escape hatch.
+    stop_grace_period: 5m
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/ >/dev/null || exit 1"]
       interval: 30s

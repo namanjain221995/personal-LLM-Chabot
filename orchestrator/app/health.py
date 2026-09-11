@@ -17,6 +17,7 @@ import time
 
 import asyncio
 import importlib.util
+import threading
 from typing import Dict, List, Tuple
 
 import httpx
@@ -363,6 +364,165 @@ def _check_app_db(_path: str = "") -> dict:
     return {"status": "ok", "schema_version": version}
 
 
+# ---------------------------------------------------------------------------
+# What this box is actually WORKING on (2026-09-11, INF-15 / the observability
+# gap in REVIEW-MANIFEST). Every existing check answers "can I still reach my
+# dependencies"; none of them answers "is anything in flight, and has it been
+# in flight too long". That question is the one an operator has during a
+# deploy, after a reboot, and while a person says "it has been spinning for
+# half an hour", and until now it could only be answered with a psql session.
+#
+# Rules this section keeps:
+#   * READ ONLY, and counts only. No user id, conversation id, intent id or
+#     filename appears here — /health is public inside the Docker network
+#     (Prometheus scrapes it unauthenticated), so it holds the same line
+#     app/metrics.py holds about labels.
+#   * CHEAP. Three grouped counts over partial indexes that exist for exactly
+#     these predicates (idx_video_analyses_queue, idx_upload_sessions_open,
+#     idx_chat_requests_open), behind a few seconds of cache — /health is
+#     called by the container healthcheck every 30 s AND by the blackbox probe
+#     every 15 s, and a deploy polls it in a loop.
+#   * NEVER FATAL. It is additive: it does not appear in `checks` and cannot
+#     move `status`, because "two videos are queued" is not an outage.
+_WORK_TTL_SECONDS = 5.0
+#: (monotonic time it was taken, the snapshot)
+_work_cache: Tuple[float, dict] = (0.0, {})
+_work_lock = threading.Lock()
+
+
+def _live_generation_count() -> int:
+    """Generations this PROCESS is streaming right now.
+
+    Read out of `sys.modules` rather than imported: app.main imports this
+    module, so importing it back would be a cycle at import time. By the time
+    anything calls /health, main is loaded and the lookup succeeds; when it is
+    not (a test importing health alone), the honest answer is zero, which is
+    also the true one — there is no registry to hold a generation.
+    """
+    import sys
+
+    main = sys.modules.get(f"{__package__}.main")
+    registry = getattr(main, "_live_generations", None)
+    if not isinstance(registry, dict):
+        return 0
+    return sum(1 for gen in list(registry.values()) if not getattr(gen, "done", False))
+
+
+def _publish_work_gauges(work: dict) -> None:
+    """Mirror the snapshot into the Prometheus registry.
+
+    WHY HERE. app/metrics.py is a passive registry: a gauge only exists once
+    something sets it, and nothing on the request path knows these numbers —
+    they are database aggregates, not events. /health is the one code path
+    that already computes them and is already called on a fixed cadence by
+    two independent callers (the container healthcheck every 30 s, the
+    blackbox probe every 15 s), so publishing from here makes the gauges no
+    more than a scrape interval stale without adding a second polling loop.
+    The alert rules in monitoring/prometheus/rules/alerts.yml read exactly
+    these names.
+    """
+    from . import metrics
+
+    video = work.get("video") or {}
+    uploads = work.get("uploads") or {}
+    metrics.set_gauge(
+        "live_generations", work.get("live_generations", 0),
+        "Chat generations streaming in this process.",
+    )
+    for state in ("queued", "running"):
+        metrics.set_gauge(
+            "video_queue_depth", video.get(state, 0),
+            "Video analyses by pipeline state.", state=state,
+        )
+    metrics.set_gauge(
+        "video_running_stage_age_seconds", video.get("oldest_running_age_s", 0),
+        "Seconds since the oldest RUNNING video analysis last changed stage.",
+    )
+    for state in ("uploading", "finalizing"):
+        metrics.set_gauge(
+            "upload_sessions_open", uploads.get(state, 0),
+            "Chunked upload sessions still open, by state.", state=state,
+        )
+    metrics.set_gauge(
+        "chat_requests_interrupted", work.get("chat_requests_interrupted", 0),
+        "Chat requests a restart left interrupted and unresumed.",
+    )
+
+
+def _read_work() -> dict:
+    """The counts, in one pooled connection. Blocking; run in a thread.
+
+    Written against `db.connection()` rather than accessors because none of
+    these aggregates has one: `list_video_analyses` and `list_upload_sessions`
+    return ROWS (and the latter needs a conversation and a user), and counting
+    by fetching would be both slower and a way to pull user data into a public
+    endpoint. The accessor this wants is named in the SRE report.
+    """
+    from . import db  # lazy: importing db must not open anything at import time
+
+    video = {"queued": 0, "running": 0, "oldest_running_age_s": 0}
+    uploads = {"uploading": 0, "finalizing": 0}
+    interrupted = 0
+    with db.connection() as con:
+        for row in con.execute(
+            "SELECT status, count(*) AS n FROM video_analyses "
+            "WHERE status IN ('queued', 'running') GROUP BY status"
+        ).fetchall():
+            video[row["status"]] = int(row["n"])
+        # `updated_at` moves on every stage transition and on every heartbeat
+        # of a running stage, so the oldest one is "how long has the most
+        # stuck job been silent" — the number the stalled-analysis alert is
+        # about. 0 when nothing is running.
+        row = con.execute(
+            "SELECT COALESCE(EXTRACT(EPOCH FROM (now() - min(updated_at))), 0) AS age "
+            "FROM video_analyses WHERE status = 'running'"
+        ).fetchone()
+        video["oldest_running_age_s"] = int(float(row["age"] or 0))
+        for row in con.execute(
+            "SELECT status, count(*) AS n FROM upload_sessions "
+            "WHERE status IN ('uploading', 'finalizing') GROUP BY status"
+        ).fetchall():
+            uploads[row["status"]] = int(row["n"])
+        row = con.execute(
+            "SELECT count(*) AS n FROM chat_requests WHERE status = 'interrupted'"
+        ).fetchone()
+        interrupted = int(row["n"])
+    return {
+        "status": "ok",
+        "live_generations": _live_generation_count(),
+        "video": video,
+        "uploads": uploads,
+        "chat_requests_interrupted": interrupted,
+    }
+
+
+def _check_work() -> dict:
+    """The cached snapshot. Never raises; a failure is reported as `unknown`
+    so a reader can tell "nothing in flight" from "I could not look"."""
+    import time as _time
+
+    global _work_cache
+    now = _time.monotonic()
+    taken_at, cached = _work_cache
+    if cached and now - taken_at < _WORK_TTL_SECONDS:
+        return cached
+    with _work_lock:
+        taken_at, cached = _work_cache
+        if cached and _time.monotonic() - taken_at < _WORK_TTL_SECONDS:
+            return cached
+        try:
+            work = _read_work()
+        except Exception as exc:  # noqa: BLE001 — additive, never fatal
+            work = {"status": "unknown", "detail": f"{type(exc).__name__}: {exc}"[:200]}
+        else:
+            try:
+                _publish_work_gauges(work)
+            except Exception:  # noqa: BLE001 — a metric never breaks a probe
+                pass
+        _work_cache = (_time.monotonic(), work)
+        return work
+
+
 async def probe_context_window(client: httpx.AsyncClient) -> dict:
     """What the MAIN model is actually serving, versus what we configured.
 
@@ -466,6 +626,7 @@ async def check_dependencies() -> dict:
             _probe_reranker(client),
             probe_context_window(client),
             asyncio.to_thread(_check_web_index),
+            asyncio.to_thread(_check_work),
         )
     required_count = len(vllm_targets)
     checks: Dict[str, dict] = {
@@ -479,6 +640,7 @@ async def check_dependencies() -> dict:
     reranker_result = results[required_count + 4]
     context_result = results[required_count + 5]
     web_index_result = results[required_count + 6]
+    work_result = results[required_count + 7]
 
     endpoint_results = {
         url: checks[name] for name, url in vllm_targets
@@ -561,6 +723,10 @@ async def check_dependencies() -> dict:
     # `web_index` is additive too (never `status`, never `capability_status`):
     # the web vector index is derived state that PostgreSQL rebuilds, so its
     # worst case is a slower, dense-less answer, not an unavailable service.
+    # `work` is additive for a different reason: it is not a dependency at
+    # all. It is what this box is currently doing — live generations, the
+    # video queue, open upload sessions, chat requests a restart interrupted —
+    # and being busy is never an outage. See `_check_work`.
     return {
         "status": overall,
         "checks": checks,
@@ -568,4 +734,5 @@ async def check_dependencies() -> dict:
         "capabilities": capabilities,
         "context": context_result,
         "web_index": web_index_result,
+        "work": work_result,
     }

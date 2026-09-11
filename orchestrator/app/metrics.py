@@ -39,7 +39,27 @@ _ALLOWED = {
         "lexical:realtime", "lexical:office", "lexical:recent", "lexical:static",
         "router", "default", "empty",
     },
-    "result": {"hit", "miss", "fresh", "stale", "ok", "fail"},
+    # `result` is shared by every counter that reports an outcome, so it is
+    # the union of their vocabularies. V29 (2026-09-10) added the upload
+    # session's terminal states and the chat request's dispositions; both are
+    # closed sets, so a typo folds to "other" instead of minting a series.
+    "result": {
+        "hit", "miss", "fresh", "stale", "ok", "fail",
+        # upload_session_total
+        "complete", "rejected", "cancelled", "expired",
+        # chat_request_total
+        "accepted", "attached", "replayed", "resumed", "conflict",
+    },
+    # What an upload is FOR. Three values, fixed by the upload rail.
+    "purpose": {"dataset", "document", "video"},
+    # `state` is the OPEN half of a lifecycle — what something is doing right
+    # now, as opposed to `result`, which is how it ended. Added 2026-09-11 for
+    # the gauges health._publish_work_gauges sets (video_queue_depth,
+    # upload_sessions_open). Both vocabularies are the database's own CHECK
+    # constraints (video_analyses.status, upload_sessions.status) narrowed to
+    # the states that are still in flight, so the set cannot drift without a
+    # migration; anything else folds to "other" rather than minting a series.
+    "state": {"queued", "running", "uploading", "finalizing"},
     "job": {"index", "refresh", "expand"},
     # Video understanding pipeline stages (app/video/types.STAGES). Closed so
     # a renamed stage folds to "other" rather than minting a series.

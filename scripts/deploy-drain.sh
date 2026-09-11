@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Do not cut a request in half to save eight seconds.
 #
-#   scripts/deploy-drain.sh check [SERVICE...]
-#   scripts/deploy-drain.sh wait  SERVICE [--deadline S] [--quiet-for S] [--max N]
+#   scripts/deploy-drain.sh check   [SERVICE...]
+#   scripts/deploy-drain.sh wait    SERVICE [--deadline S] [--quiet-for S] [--max N]
+#   scripts/deploy-drain.sh uploads [--deadline S] [--poll S]
 #
 # WHAT DRAINING CAN AND CANNOT BE HERE
 #
@@ -33,7 +34,26 @@
 #          deploy forever, so the deadline expiring is a warning (exit 2), not
 #          a failure. The grace period is what actually protects the request.
 #
-# Neither mode ever stops, kills or recreates anything.
+#   uploads waits for chunked upload sessions in status `finalizing` to clear.
+#          This is the ONE upload state a recreate cannot leave recoverable on
+#          its own timescale: `uploading` resumes from the browser (the parts
+#          are on disk and the session row says which arrived) and `complete`
+#          is done, but `finalizing` is a process holding a row lock while it
+#          concatenates parts, hashes the result and hard-links it into the
+#          video store — kill it there and the row sits `finalizing` until the
+#          NEXT process's startup hook resets it, with the person watching a
+#          spinner in between. Seconds of waiting removes that window.
+#
+#          WHAT IT GUARANTEES: at the moment it returned 0, no session was in
+#          `finalizing`. WHAT IT DOES NOT: nothing stops a new `complete` from
+#          arriving one millisecond later — there is no admission control here
+#          and adding one would mean refusing uploads during every deploy. It
+#          also says nothing about `uploading` sessions, deliberately: those
+#          are designed to survive a restart. Like `wait`, it is advisory and
+#          bounded (exit 2 on the deadline), and it reads the database through
+#          the postgres container with a SELECT and nothing else.
+#
+# No mode ever stops, kills or recreates anything, and none of them writes.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -230,9 +250,110 @@ do_wait() {
   done
 }
 
+# -------------------------------------------------------------------- uploads
+# One SELECT as the application user, inside the database's own container.
+#
+# READ-ONLY BY CONSTRUCTION: PGOPTIONS makes the whole session read-only, so a
+# statement that tried to write would be refused by PostgreSQL itself ("cannot
+# execute ... in a read-only transaction") rather than by this script's good
+# intentions. It is passed as a connection option rather than as a leading
+# `SET`, because a `SET` costs an extra "SET" line on stdout that the caller
+# would then have to parse around.
+dr_psql_ro() {
+  local pg user db
+  pg="$(dr_container_for postgres)"
+  docker inspect "$pg" >/dev/null 2>&1 || return 1
+  user="$(dr_env_value POSTGRES_USER)"; user="${user:-techsara}"
+  db="$(dr_env_value POSTGRES_DB)"; db="${db:-techsara}"
+  docker exec -e PGOPTIONS="-c default_transaction_read_only=on" "$pg" \
+    psql -U "$user" -d "$db" -tA -v ON_ERROR_STOP=1 -c "$1" 2>/dev/null \
+    | tr -d '[:space:]'
+}
+
+# How many chunked sessions are mid-finalisation right now, or "" when the
+# question cannot be answered (no postgres container, psql unhappy). "" and
+# "0" are deliberately different: one is "nothing in flight", the other is
+# "I do not know", and a deploy script must be able to tell them apart before
+# it decides to say something reassuring.
+#
+# The table's existence is asked FIRST and separately. `to_regclass(...) IS
+# NULL` inside the counting query would not have helped: PostgreSQL parses the
+# whole statement before evaluating any of it, so naming a table that is not
+# there is an error at parse time whatever the CASE says. A database that
+# predates V29 (upload_sessions arrives with it) therefore answers 0 —
+# truthfully, because a schema without the table has no finalising sessions.
+finalizing_count() {
+  local present out
+  present="$(dr_psql_ro "SELECT to_regclass('public.upload_sessions') IS NOT NULL")" || {
+    printf '\n'; return 0; }
+  case "$present" in
+    t) : ;;
+    f) printf '0\n'; return 0 ;;
+    *) printf '\n'; return 0 ;;
+  esac
+  out="$(dr_psql_ro "SELECT count(*) FROM upload_sessions WHERE status = 'finalizing'")" || true
+  case "$out" in
+    ''|*[!0-9]*) printf '\n' ;;
+    *) printf '%s\n' "$out" ;;
+  esac
+}
+
+do_uploads() {
+  local deadline="${DEPLOY_FINALIZE_DEADLINE:-90}" poll=2
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --deadline) deadline="${2:?}"; shift ;;
+      --poll) poll="${2:?}"; shift ;;
+      *) dr_die "unknown option: $1" ;;
+    esac
+    shift
+  done
+
+  local count; count="$(finalizing_count)"
+  if [ -z "$count" ]; then
+    dr_warn "drain uploads: cannot read upload_sessions (no postgres container, or"
+    dr_warn "the schema predates V29). Proceeding without the check."
+    return 2
+  fi
+  if [ "$count" = 0 ]; then
+    dr_say "drain uploads: no chunked upload is being finalised"
+    return 0
+  fi
+
+  # 90 s is sized on the work, not on taste: finalisation concatenates the
+  # parts, sha256s the result and hard-links it into the video store. A 4 GB
+  # video (VIDEO_MAX_UPLOAD_MB) is the worst case on this box's NVMe and lands
+  # inside a minute; anything still going after 90 s is a finaliser in trouble
+  # and must not be allowed to hold a deploy.
+  dr_say "drain uploads: $count session(s) finalising; waiting up to ${deadline}s"
+  local started; started="$(date +%s)" now
+  while :; do
+    sleep "$poll"
+    count="$(finalizing_count)"
+    if [ -z "$count" ]; then
+      dr_warn "drain uploads: lost the ability to read upload_sessions mid-wait"
+      return 2
+    fi
+    if [ "$count" = 0 ]; then
+      now="$(date +%s)"
+      dr_say "drain uploads: clear after $((now - started))s"
+      return 0
+    fi
+    now="$(date +%s)"
+    if [ $((now - started)) -ge "$deadline" ]; then
+      dr_warn "drain uploads: $count session(s) still finalising after ${deadline}s."
+      dr_warn "Proceeding anyway - an upload must not be able to block a deploy."
+      dr_warn "The orchestrator's startup hook returns a session abandoned mid-finalise"
+      dr_warn "to 'uploading', so the browser can resume it; nothing is lost but time."
+      return 2
+    fi
+  done
+}
+
 case "$MODE" in
-  check) do_check "$@" ;;
-  wait)  do_wait "$@" ;;
+  check)   do_check "$@" ;;
+  wait)    do_wait "$@" ;;
+  uploads) do_uploads "$@" ;;
   -h|--help) awk 'NR==1{next} /^#/{print; next} {exit}' "$0" ;;
-  *) dr_die "usage: $0 {check|wait} ..." ;;
+  *) dr_die "usage: $0 {check|wait|uploads} ..." ;;
 esac

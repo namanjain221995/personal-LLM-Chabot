@@ -19,6 +19,15 @@ export interface SentAttachment {
   name: string;
   /** Raw base64, no data: prefix — what POST /chat expects. */
   base64: string;
+  /**
+   * 2026-09-10: the browser-minted identity of the attachment these bytes
+   * belong to (`meta.attachments[].attachment_id`). Optional because every
+   * turn sent before it existed has none — those still match by position,
+   * which is all there ever was. When it IS present on both sides it wins:
+   * a list filtered by `id` moves every index under a sibling that is still
+   * uploading, and that is how a resend handed the model the wrong file.
+   */
+  attachment_id?: string;
 }
 
 const sent = new Map<string, SentAttachment[]>();
@@ -31,7 +40,8 @@ const sent = new Map<string, SentAttachment[]>();
  * the multi-document resend bug: `send()` stored only the FIRST document, so
  * a regenerate or an edit of a four-document turn quietly re-asked the
  * question with one file. Nothing here changed; the callers now hand over the
- * whole list, and `resendOptionsFor` below reads it positionally.
+ * whole list, and `resendOptionsFor` below reads it by `attachment_id` where
+ * both sides carry one and positionally otherwise.
  */
 export function rememberAttachments(
   messageId: string,
@@ -80,6 +90,15 @@ export interface AttachmentsLookup {
   videoUploads: DocumentRef[];
   /** True when the turn HAD attachments we can no longer reconstruct. */
   missing: boolean;
+  /**
+   * 2026-09-10: WHICH ones, so the person can be told. "This wasn't sent —
+   * big.mp4 never finished uploading. small.mp4 is on the server." needs the
+   * names, and a boolean could only ever produce the garbled sentence the
+   * 2026-09-09 notice actually showed. An unreadable image contributes to
+   * `missing` without a name (a preview has none), so this is never a count
+   * of what is missing — `missing` remains the gate.
+   */
+  missingNames: string[];
 }
 
 /** One document the orchestrator reads back by id — `pdf_uploads[]` on the wire. */
@@ -102,7 +121,15 @@ export interface ResendableMessage {
   imageDataUrl?: string;
   imageDataUrls?: string[];
   pdfName?: string;
-  meta?: { attachments?: Array<{ kind?: string; name?: string; id?: string }> };
+  meta?: {
+    attachments?: Array<{
+      kind?: string;
+      name?: string;
+      id?: string;
+      /** 2026-09-10: the identity the bytes were remembered under. */
+      attachment_id?: string;
+    }>;
+  };
 }
 
 /**
@@ -121,8 +148,9 @@ export interface ResendableMessage {
  *
  * Never both. A document with an id is not ALSO sent inline, so the model
  * cannot receive the same file twice; and the match between an id-less entry
- * and its remembered bytes is by POSITION among the documents, not by name,
- * because two different files may share a filename.
+ * and its remembered bytes is by `attachment_id` when both sides carry one,
+ * by POSITION among the documents otherwise — never by name, because two
+ * different files may share a filename.
  *
  * Images are unchanged: the persisted previews are the payloads and survive a
  * reload. Datasets are unchanged too — nothing is resent, the orchestrator
@@ -130,23 +158,12 @@ export interface ResendableMessage {
  *
  * `missing` is only true when something genuinely cannot be rebuilt: a
  * document with neither an id nor remembered bytes (a legacy turn after a
- * reload), or an image whose preview is unreadable. That is when the caller
- * shows the honest "re-attach" error instead of quietly re-asking with less.
+ * reload), a video with no id, or an image whose preview is unreadable. That
+ * is when the caller shows the honest "re-attach" error — naming the files
+ * through `missingNames` — instead of quietly re-asking with less.
  */
 export function attachmentsForResend(message: ResendableMessage): AttachmentsLookup {
-  // PHASE 3. A DATASET needs nothing resent. It never travelled in the chat
-  // body in the first place — it streams to /api/upload and the orchestrator
-  // finds it again through conversation_id — so the profile that answers the
-  // question is already server-side and outlives this tab entirely.
-  //
-  // This used to be missed because `pdfName` carries the filename of EVERY
-  // non-image attachment, datasets included, and the check below reads it as
-  // proof that something is gone. The result was a regenerate that refused to
-  // run, telling the user to re-attach a file the server had never lost.
-  if (isDatasetTurn(message)) {
-    return { attachments: [], pdfUploads: [], videoUploads: [], missing: false };
-  }
-
+  const entries = message.meta?.attachments ?? [];
   const remembered = sent.get(message.id) ?? [];
   const rememberedImages = remembered.filter((a) => a.kind === 'image');
   const rememberedPdfs = remembered.filter((a) => a.kind === 'pdf');
@@ -168,47 +185,100 @@ export function attachmentsForResend(message: ResendableMessage): AttachmentsLoo
     else imagesMissing = true;
   }
 
-  /* ---- videos: ALWAYS by reference (2026-09-09); no id = gone ---- */
-  const videoUploads: DocumentRef[] = [];
-  let videosMissing = false;
-  (message.meta?.attachments ?? [])
-    .filter((a) => a.kind === 'video')
-    .forEach((entry, i) => {
-      if (entry.id) {
-        videoUploads.push({ upload_id: entry.id, name: entry.name ?? `Video ${i + 1}` });
-      } else {
-        videosMissing = true;
-      }
-    });
+  /* ---- files: ONE decision per attachment, by its own kind and id ----
 
-  /* ---- documents: by reference where there is an id, inline where not ---- */
-  const docs = (message.meta?.attachments ?? []).filter((a) => a.kind === 'pdf');
+     fe-attach F1. This used to be two filtered passes with a `pdfName`
+     fallback wired to the DOCUMENT pass, and `pdfName` carries the filename
+     of every non-image attachment — datasets and videos included (ChatApp
+     sets it at send time, the history loader sets it on reload). So a
+     video-only turn had no documents, fell into the fallback meant for a
+     pre-`meta.attachments` PDF, found no remembered bytes and declared
+     itself missing: every video turn in production reported "re-attach the
+     file", Send now never appeared, and Regenerate refused — for files that
+     were sitting on the server with valid ids.
+
+     Each entry now answers for itself. A video or a dataset with an id is
+     resendable BY REFERENCE and can never be missing; only an attachment
+     with no id (and, for a document, no bytes in this tab) is. The legacy
+     `pdfName` fallback survives for exactly the turns it was written for:
+     those carrying no `meta.attachments` at all. */
   const pdfUploads: DocumentRef[] = [];
+  const videoUploads: DocumentRef[] = [];
   const inlinePdfs: SentAttachment[] = [];
-  let docsMissing = false;
-  if (docs.length > 0) {
-    docs.forEach((entry, i) => {
+  const missingNames: string[] = [];
+  let docIndex = 0;
+  for (const entry of entries) {
+    const name = entry.name ?? '';
+    if (entry.kind === 'video') {
       if (entry.id) {
-        pdfUploads.push({ upload_id: entry.id, name: entry.name ?? `Document ${i + 1}` });
-      } else if (rememberedPdfs[i]) {
-        inlinePdfs.push(rememberedPdfs[i]);
+        videoUploads.push({
+          upload_id: entry.id,
+          name: name || `Video ${videoUploads.length + 1}`,
+        });
       } else {
-        docsMissing = true;
+        // The bytes only ever lived on the server for a video — nothing in
+        // this tab can stand in for them.
+        missingNames.push(name || 'a video');
       }
-    });
-  } else if (message.pdfName) {
+      continue;
+    }
+    if (entry.kind !== 'pdf') {
+      // PHASE 3. A DATASET needs nothing resent: it never travelled in the
+      // chat body — it streams to /api/upload and the orchestrator finds it
+      // again through conversation_id — so the profile that answers the
+      // question is already server-side and outlives this tab entirely. An
+      // unrecognised kind is left alone rather than guessed at.
+      continue;
+    }
+    const i = docIndex;
+    docIndex += 1;
+    if (entry.id) {
+      pdfUploads.push({ upload_id: entry.id, name: name || `Document ${i + 1}` });
+      continue;
+    }
+    const bytes = rememberedDocFor(rememberedPdfs, entry.attachment_id, i);
+    if (bytes) inlinePdfs.push(bytes);
+    else missingNames.push(name || `Document ${i + 1}`);
+  }
+  if (entries.length === 0 && message.pdfName) {
     // A turn from before `meta.attachments` existed: one document, known only
     // by name. Its bytes are in this tab or they are gone.
     if (rememberedPdfs[0]) inlinePdfs.push(rememberedPdfs[0]);
-    else docsMissing = true;
+    else missingNames.push(message.pdfName);
   }
 
   return {
     attachments: [...images, ...inlinePdfs],
     pdfUploads,
     videoUploads,
-    missing: imagesMissing || docsMissing || videosMissing,
+    missing: imagesMissing || missingNames.length > 0,
+    missingNames,
   };
+}
+
+/**
+ * The remembered bytes for one id-less document.
+ *
+ * Identity first (T-03): once an attachment carries an `attachment_id` and
+ * the remembered payloads carry theirs, position is not consulted at all —
+ * a sibling that landed and got filtered out of `meta.attachments` shifts
+ * every index, and matching by position then hands the model a different
+ * file with a straight face. Position remains the answer for turns from
+ * before the identity existed, which is every turn sent before 2026-09-10.
+ */
+function rememberedDocFor(
+  pdfs: SentAttachment[],
+  attachmentId: string | undefined,
+  index: number,
+): SentAttachment | null {
+  if (attachmentId) {
+    const byIdentity = pdfs.find((p) => p.attachment_id === attachmentId);
+    if (byIdentity) return byIdentity;
+    // Identity is known on both sides and did not match: this document's
+    // bytes are genuinely not here.
+    if (pdfs.some((p) => p.attachment_id)) return null;
+  }
+  return pdfs[index] ?? null;
 }
 
 /**
@@ -236,10 +306,17 @@ export function resendOptionsFor(message: ResendableMessage): {
   videoUploads: DocumentRef[] | null;
   dataset: boolean;
   missing: boolean;
+  /** The files this resend cannot carry, by name — see AttachmentsLookup. */
+  missingNames: string[];
 } {
-  const { attachments, pdfUploads, videoUploads, missing } = attachmentsForResend(message);
+  const { attachments, pdfUploads, videoUploads, missing, missingNames } =
+    attachmentsForResend(message);
   const inline = attachments.filter((a) => a.kind === 'pdf');
   const firstInline = inline[0] ?? null;
+  // Only ONE inline document can travel (the `pdf` field is single by
+  // contract), so any further id-less document is named as missing rather
+  // than dropped silently.
+  const crowdedOut = inline.slice(1).map((a) => a.name);
   return {
     images: attachments.filter((a) => a.kind === 'image').map((a) => a.base64),
     pdf: firstInline?.base64 ?? null,
@@ -250,7 +327,8 @@ export function resendOptionsFor(message: ResendableMessage): {
     // 2026-09-03, one kind over.
     videoUploads: videoUploads.length ? videoUploads : null,
     dataset: isDatasetTurn(message),
-    missing: missing || inline.length > 1,
+    missing: missing || crowdedOut.length > 0,
+    missingNames: [...missingNames, ...crowdedOut],
   };
 }
 

@@ -32,7 +32,13 @@ import {
   parseSlashCommand,
   type SlashCommand,
 } from '@/lib/slashCommands';
-import { uploadDocumentFile, type DocumentRef } from '@/lib/uploadDocument';
+import {
+  cancelChunkedUpload,
+  uploadDocumentFile,
+  type DocumentRef,
+  type UploadProgress,
+} from '@/lib/uploadDocument';
+import { formatBytes } from '@/lib/format';
 import { imageExtFromMime } from '@/lib/pasted';
 import type { SelectedContext } from '@/lib/types';
 import { activateComposerMenuItem, trustLine } from '@/lib/composerMenu';
@@ -78,6 +84,54 @@ function newClientId(): string {
     return `att-${crypto.randomUUID()}`;
   }
   return `att-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+/**
+ * The DURABLE identity of one attachment (2026-09-10). See
+ * Attachment.attachment_id: unlike `clientId` this one is persisted with the
+ * turn and is how a landed upload finds its own entry again.
+ *
+ * `crypto.randomUUID` needs a secure context, which a plain-http LAN
+ * deployment is not, so the fallback is a real fallback and not decoration.
+ */
+function newAttachmentId(): string {
+  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
+    return crypto.randomUUID();
+  }
+  return `a-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+}
+
+/** What the chip knows about one attachment's bytes, live. */
+interface ChipUpload {
+  state: 'uploading' | 'finalizing' | 'uploaded' | 'rejected';
+  bytesSent: number;
+  bytesTotal: number;
+  partsDone: number;
+  partsTotal: number;
+  /** Chunked sessions only — its presence means "this can be resumed". */
+  sessionId?: string;
+  /** The safe sentence for a refusal, shown next to Retry. */
+  error?: string;
+}
+
+/**
+ * The one line a chip shows about its bytes.
+ *
+ * Only a chunked upload gets numbers, and it gets them because they are
+ * MEASURED: a part is done when the server has said so. A single request has
+ * nothing to measure — there is no progress event on a fetch body — so it
+ * says what is true and no more.
+ */
+function uploadLine(upload: ChipUpload): string {
+  if (upload.state === 'rejected') return upload.error ?? 'Upload failed.';
+  if (upload.state === 'uploaded') return 'Uploaded';
+  if (upload.state === 'finalizing') return 'Finishing…';
+  if (upload.sessionId && upload.partsTotal > 1) {
+    return `Uploading — ${upload.partsDone} of ${upload.partsTotal} parts · ${formatBytes(
+      upload.bytesSent,
+    )} of ${formatBytes(upload.bytesTotal)}`;
+  }
+  return 'Uploading…';
 }
 
 export interface ComposerHandle {
@@ -133,7 +187,21 @@ export interface Attachment {
    * different file instead of unmounting it.
    */
   clientId: string;
+  /**
+   * The attachment's DURABLE identity, minted here at selection and persisted
+   * on `meta.attachments[].attachment_id` (see docs/upload-reliability).
+   *
+   * Distinct from `clientId`, which dies with the send: this one is how an
+   * upload that lands later finds the entry it belongs to. Matching by
+   * position could not do it — a sibling that fails is filtered out of
+   * `meta.attachments` and every index under it moves — and matching by name
+   * could not either, since two `invoice.pdf` in one turn is legal.
+   */
+  attachment_id: string;
   name: string;
+  /** The file's size at selection, so a resumed session can be checked
+      against the file that is being re-selected before a byte is sent. */
+  bytes: number;
   /**
    * image = sent to the vision path; pdf = rendered server-side;
    * dataset = uploaded separately and referenced by id (never base64).
@@ -163,6 +231,19 @@ export interface Attachment {
    * the send then uploads again instead of failing.
    */
   uploadPromise?: Promise<DocumentRef | null>;
+  /**
+   * The conversation the early upload was started IN (fe-attach F2).
+   *
+   * The composer keeps its chips across a conversation switch, so a video
+   * attached in chat A and sent from chat B used to be uploaded and analysed
+   * under A while its id was linked into B's history — where the bytes it
+   * names cannot be read. Carrying the id makes the mismatch visible to the
+   * sender, which is the only place that can decide what to do about it.
+   */
+  uploadConversationId?: string | null;
+  /** Chunked uploads only: the server's session id, so an interrupted upload
+      can be resumed instead of restarted from byte 0. */
+  sessionId?: string;
 }
 
 /** 2026-09-03: what a slash command decided about THIS send. */
@@ -342,6 +423,30 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
     const [attachments, setAttachments] = useState<Attachment[]>([]);
     /** Files still being read/downscaled; a send must wait for them. */
     const [pendingAttach, setPendingAttach] = useState(0);
+    /**
+     * What each chip's bytes are doing, keyed by clientId (2026-09-10).
+     *
+     * Deliberately NOT on the Attachment: progress ticks several times a
+     * second and rewriting the attachment array on every one of them would
+     * race every add and remove that happens meanwhile.
+     */
+    const [uploads, setUploads] = useState<Record<string, ChipUpload>>({});
+    /**
+     * The live upload behind each chip: the promise the send hands on, the
+     * controller a removal aborts, the conversation the bytes are going to
+     * (F2), and the chunked session id a retry resumes from (F6).
+     */
+    const uploadsRef = useRef(
+      new Map<
+        string,
+        {
+          promise: Promise<DocumentRef | null>;
+          controller: AbortController;
+          conversationId: string;
+          sessionId?: string;
+        }
+      >(),
+    );
     const textareaRef = useRef<HTMLTextAreaElement>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
     /** Armed by `prefill`; consumed by the effect that runs after `text` lands. */
@@ -473,10 +578,29 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
         trimmed = out.text;
         options = { prefs: out.prefs };
       }
-      onSend(trimmed, attachments, options);
+      // Each chip hands over what its bytes are doing: the promise to await,
+      // the conversation they were uploaded INTO (F2 — the sender compares it
+      // with the conversation it is sending to), and the chunked session id
+      // so a send interrupted here can be resumed rather than restarted.
+      const outgoing = attachments.map((att) => {
+        const record = uploadsRef.current.get(att.clientId);
+        return record
+          ? {
+              ...att,
+              uploadPromise: record.promise,
+              uploadConversationId: record.conversationId,
+              sessionId: record.sessionId,
+            }
+          : att;
+      });
+      onSend(trimmed, outgoing, options);
       setText('');
       onDraftChange?.(''); // the draft is gone — drop it from the meter
       setAttachments([]);
+      // The uploads belong to the send now: its promises are already held by
+      // the caller, and nothing here may abort them any more.
+      uploadsRef.current.clear();
+      setUploads({});
     }
 
     // The slash-command picker: rows for what is typed after "/".
@@ -492,26 +616,142 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
     }
 
     /**
-     * Start a streamed document's upload NOW rather than on send. Only when
-     * the conversation already exists — a new chat has no id until its first
-     * send. A failure resolves to null and the send uploads again.
+     * Start (or resume) one attachment's upload NOW rather than on send —
+     * the way ChatGPT processes a file while you are still typing.
+     *
+     * A failure resolves to null, exactly as it did before, so the send
+     * uploads again rather than failing; what is new is that the chip SAYS
+     * so, keeps the session id, and offers Retry — which resumes rather than
+     * re-sending 400 MB from byte 0 (fe-attach F6). An abort resolves to null
+     * silently: the person removed the chip, and there is nothing to report.
      */
-    function withEarlyUpload(att: Attachment): Attachment {
-      if (!uploadConversationId || !att.file || att.base64) return att;
-      const conversationId = uploadConversationId;
-      // A video's early upload is what starts its analysis on the server,
-      // so by the time the person presses Send the transcript is under way.
-      const uploadPromise = uploadDocumentFile(
-        att.file,
-        conversationId,
-        att.kind === 'video' ? 'video' : 'document',
-      ).catch(() => null);
-      return { ...att, uploadPromise };
+    const startUpload = useCallback(
+      (att: Attachment, conversationId: string, resume?: { uploadId: string }) => {
+        const controller = new AbortController();
+        const known = uploadsRef.current.get(att.clientId)?.sessionId;
+        const sessionId = resume?.uploadId ?? known;
+        setUploads((prev) => ({
+          ...prev,
+          [att.clientId]: {
+            state: 'uploading',
+            bytesSent: 0,
+            bytesTotal: att.bytes,
+            partsDone: 0,
+            partsTotal: 1,
+            sessionId,
+          },
+        }));
+        const promise = uploadDocumentFile(
+          att.file as File,
+          conversationId,
+          att.kind === 'video' ? 'video' : 'document',
+          {
+            attachmentId: att.attachment_id,
+            signal: controller.signal,
+            resume,
+            onProgress: (progress: UploadProgress) => {
+              if (progress.sessionId) {
+                const held = uploadsRef.current.get(att.clientId);
+                if (held) held.sessionId = progress.sessionId;
+              }
+              setUploads((prev) => {
+                // A chip the person has already removed must never be
+                // resurrected by an event that was still in flight.
+                const current = prev[att.clientId];
+                if (!current) return prev;
+                return {
+                  ...prev,
+                  [att.clientId]: {
+                    state: progress.state,
+                    bytesSent: progress.bytesSent,
+                    bytesTotal: progress.bytesTotal,
+                    partsDone: progress.partsDone,
+                    partsTotal: progress.partsTotal,
+                    sessionId: progress.sessionId ?? current.sessionId,
+                  },
+                };
+              });
+            },
+          },
+        ).catch((err: unknown) => {
+          if (err instanceof Error && err.name === 'AbortError') return null;
+          const message =
+            err instanceof Error ? err.message : 'That file could not be uploaded.';
+          setUploads((prev) => {
+            const current = prev[att.clientId];
+            if (!current) return prev;
+            return { ...prev, [att.clientId]: { ...current, state: 'rejected', error: message } };
+          });
+          return null;
+        });
+        uploadsRef.current.set(att.clientId, {
+          promise,
+          controller,
+          conversationId,
+          sessionId,
+        });
+        return promise;
+      },
+      [],
+    );
+
+    /**
+     * Every accepted document/video starts uploading; nothing else does.
+     *
+     * fe-attach F7: this used to run INSIDE the chip-appending update, before
+     * the MAX_DOCS cap had ruled — so a sixth video was refused on screen and
+     * uploaded (and analysed) on the server anyway. Starting from the
+     * accepted list makes that impossible: a chip that does not exist has no
+     * upload.
+     */
+    useEffect(() => {
+      if (!uploadConversationId) return;
+      for (const att of attachments) {
+        if (uploadsRef.current.has(att.clientId)) continue;
+        // Images and small documents travel inline as base64; a dataset has
+        // its own rail (ChatApp streams it at send time).
+        if (!att.file || att.base64) continue;
+        if (att.kind !== 'pdf' && att.kind !== 'video') continue;
+        // A video's upload is what starts its analysis on the server, so by
+        // the time the person presses Send the transcript is under way.
+        void startUpload(att, uploadConversationId);
+      }
+    }, [attachments, uploadConversationId, startUpload]);
+
+    /** Drop a chip: stop its upload here AND give the session back. */
+    function removeAttachment(clientId: string) {
+      const record = uploadsRef.current.get(clientId);
+      if (record) {
+        // Aborting stops this tab sending. It does NOT tell the server that
+        // the parts it holds will never be completed — the DELETE does.
+        record.controller.abort();
+        if (record.sessionId) {
+          void cancelChunkedUpload(record.conversationId, record.sessionId);
+        }
+        uploadsRef.current.delete(clientId);
+      }
+      setUploads((prev) => {
+        if (!prev[clientId]) return prev;
+        const next = { ...prev };
+        delete next[clientId];
+        return next;
+      });
+      setAttachments((prev) => prev.filter((a) => a.clientId !== clientId));
+    }
+
+    /** Try a refused upload again — resuming its session when it has one. */
+    function retryUpload(att: Attachment) {
+      const record = uploadsRef.current.get(att.clientId);
+      const resume = record?.sessionId ? { uploadId: record.sessionId } : undefined;
+      // A resume belongs to the conversation its session was opened in; a
+      // fresh attempt goes wherever the person is now.
+      const conversationId = resume ? record?.conversationId : uploadConversationId;
+      if (!conversationId) return;
+      void startUpload(att, conversationId, resume);
     }
 
     /** Documents stack to MAX_DOCS and displace images/datasets (2026-09-02). */
-    function appendDocument(input: Attachment) {
-      const att = withEarlyUpload(input);
+    function appendDocument(att: Attachment) {
       let refused = false;
       setAttachments((prev) => {
         const kept = prev.filter((a) => a.kind !== 'dataset');
@@ -582,7 +822,9 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
         // read into memory — a two-hour recording is gigabytes.
         appendDocument({
           clientId: newClientId(),
+          attachment_id: newAttachmentId(),
           name: file.name,
+          bytes: file.size,
           kind: 'video',
           dataUrl: '',
           base64: '',
@@ -594,7 +836,9 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
         // Streamed like a big document: File handle only, referenced on send.
         appendDocument({
           clientId: newClientId(),
+          attachment_id: newAttachmentId(),
           name: file.name,
+          bytes: file.size,
           kind: 'pdf',
           dataUrl: '',
           base64: '',
@@ -609,7 +853,9 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
         setAttachments([
           {
             clientId: newClientId(),
+            attachment_id: newAttachmentId(),
             name: file.name,
+            bytes: file.size,
             kind: 'dataset',
             dataUrl: '',
             base64: '',
@@ -623,7 +869,9 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
         // base64, streamed on send and referenced in the chat request.
         appendDocument({
           clientId: newClientId(),
+          attachment_id: newAttachmentId(),
           name: file.name,
+          bytes: file.size,
           kind: 'pdf',
           dataUrl: '',
           base64: '',
@@ -652,7 +900,9 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
       const attach = (dataUrl: string) => {
         const att: Attachment = {
           clientId: newClientId(),
+          attachment_id: newAttachmentId(),
           name,
+          bytes: file.size,
           kind: isPdf ? 'pdf' : 'image',
           dataUrl,
           base64: dataUrl.slice(dataUrl.indexOf(',') + 1),
@@ -843,14 +1093,40 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
                             : 'DATASET'}
                       </span>
                     )}
+                    {/* Where this file's BYTES are, in the person's words.
+                        One live region per chip: the line is replaced in
+                        place as the upload moves, so a screen reader hears
+                        "3 of 7 parts" rather than the whole chip again. A
+                        chunked upload can say how far it is because parts
+                        are measurable; a single request cannot, and inventing
+                        a percentage for it would be a lie the person then
+                        has to unlearn. */}
+                    {uploads[attachment.clientId] && (
+                      <span
+                        aria-live="polite"
+                        className={`max-w-[200px] truncate text-[10px] ${
+                          uploads[attachment.clientId].state === 'rejected'
+                            ? 'text-danger'
+                            : 'text-faint'
+                        }`}
+                      >
+                        {uploadLine(uploads[attachment.clientId])}
+                      </span>
+                    )}
+                    {uploads[attachment.clientId]?.state === 'rejected' && (
+                      <button
+                        type="button"
+                        onClick={() => retryUpload(attachment)}
+                        aria-label={`Retry uploading ${attachment.name}`}
+                        className="self-start text-[10px] font-medium text-accent underline-offset-2 transition-colors duration-ts hover:underline"
+                      >
+                        Retry
+                      </button>
+                    )}
                   </span>
                   <button
                     type="button"
-                    onClick={() =>
-                      setAttachments((prev) =>
-                        prev.filter((a) => a.clientId !== attachment.clientId),
-                      )
-                    }
+                    onClick={() => removeAttachment(attachment.clientId)}
                     aria-label={`Remove attachment ${attachment.name}`}
                     className="rounded-md p-1 text-faint transition-colors duration-ts hover:bg-surface-2 hover:text-ink"
                   >

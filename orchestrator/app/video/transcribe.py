@@ -20,12 +20,25 @@ segment that ends inside the overlap and drops the later clip's copy, then
 checks the first surviving segment of the later clip against the tail of
 the earlier one textually, because Whisper's timestamps at a clip boundary
 drift by up to a second.
+
+A BUSY ENGINE IS NOT A FAILED VIDEO. `ASRBusy` (the batch pool's queue wait
+ran out) and `ASRUnavailable` (both engines standing down after a 5xx) are
+about the engine at this instant, not about this clip, so a clip that meets
+one waits and asks again — four attempts, exponential with jitter. Only a
+clip that fails every attempt counts against the failure threshold, and only
+crossing that threshold fails the stage. When the stage does fail, every
+sibling clip is CANCELLED before the failure leaves this module: gather()
+used to leave them decoding to the end of the recording, holding the two
+batch-pool slots, so the retry that a failed stage triggers met a busy engine
+and failed again (2026-09-10).
 """
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 import os
+import random
 import struct
 import time
 from typing import Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
@@ -48,6 +61,20 @@ def read_wav_pcm16(path: str):
     Parses the RIFF chunks rather than assuming a 44-byte header: ffmpeg
     writes a LIST chunk before `data`, and a fixed offset would return
     metadata bytes as audio. Returns a read-only int16 numpy view.
+
+    THE MEMORY BOUND, PRECISELY (2026-09-11). This does NOT read the track:
+    `np.memmap` maps it, so the process's own allocation is the mapping
+    object, and the bytes that become resident are page cache the kernel
+    reclaims under pressure. 16 kHz mono 16-bit is 32 kB/s — 115 MB an hour,
+    461 MB for a four-hour recording — and none of it is anonymous memory.
+
+    What IS allocated, per clip in flight: `wav_bytes(pcm[a:b])` copies one
+    WINDOW (the slice of a memmap is a view, not a copy) and the RIFF buffer
+    holds it a second time, so ~2x the window while the clip is built. The
+    window ceiling is `VIDEO_ASR_WINDOW_S` (240 s = 7.7 MB), the clip bytes
+    live until the engine answers, and `VIDEO_ASR_CONCURRENCY` (2) clips are
+    in flight at once: ~31 MB, independent of how long the recording is.
+    `vad.frame_flags` reads the mapping in blocks for the same reason.
     """
     import numpy as np
 
@@ -156,6 +183,43 @@ def dominant_language(segments: Sequence[Segment]) -> Optional[str]:
 
 # ------------------------------------------------------------- transcribe --
 
+#: A clip that meets a BUSY or UNREACHABLE engine is sent again this many
+#: times before it counts as a failed window. The waits (2 s, 4 s, 8 s, capped
+#: at 20 s, each multiplied by a random 0.5-1.0) are sized against the two
+#: things that produce those errors: the batch pool refuses after an 8-second
+#: queue wait, and an engine that answered 5xx is stood down for 20 seconds.
+#: The jitter matters because every clip of a long recording meets the same
+#: outage at the same moment and must not come back in step.
+_RETRY_ATTEMPTS = 4
+_RETRY_BASE_S = 2.0
+_RETRY_CAP_S = 20.0
+
+
+def _backoff_s(attempt: int) -> float:
+    """Seconds to wait after a failed attempt, jittered."""
+    return min(_RETRY_CAP_S, _RETRY_BASE_S * (2 ** (attempt - 1))) * (0.5 + random.random() / 2.0)
+
+
+async def _cancel_all(tasks: Sequence["asyncio.Task"]) -> None:
+    """Cancel every clip still running and wait for it to actually stop.
+
+    The wait is shielded because this also runs while THIS coroutine is being
+    cancelled (a stage timeout, a shutdown), and a cancellation arriving here
+    must not leave a clip decoding — leaving one is the whole thing this
+    function exists to prevent.
+    """
+    pending = [t for t in tasks if not t.done()]
+    for task in pending:
+        task.cancel()
+    if not pending:
+        return
+    try:
+        await asyncio.shield(asyncio.gather(*pending, return_exceptions=True))
+    except asyncio.CancelledError:
+        # The caller re-raises the cancellation it was already carrying; the
+        # clips have been cancelled, which is what had to happen here.
+        pass
+
 
 async def transcribe_audio(
     wav_path: str,
@@ -174,8 +238,6 @@ async def transcribe_audio(
     at once, because dictation would then answer "busy" and the chat model —
     tensor-parallel across both nodes — would slow for everyone.
     """
-    import asyncio
-
     from .. import asr
     from . import pipeline as _pipe
 
@@ -201,7 +263,8 @@ async def transcribe_audio(
     width = max(1, int(settings.video_asr_concurrency))
     gate = asyncio.Semaphore(width)
     results: Dict[int, List[Segment]] = {}
-    tally = {"engine_ms": 0, "failures": 0, "paced_s": 0.0, "done_s": 0.0, "in_flight": 0}
+    tally = {"engine_ms": 0, "failures": 0, "paced_s": 0.0, "done_s": 0.0, "in_flight": 0, "retries": 0}
+    threshold = max(3, len(windows) // 4)
 
     async def _say() -> None:
         left = len(windows) - len(results) - tally["failures"] - tally["in_flight"]
@@ -212,6 +275,40 @@ async def transcribe_audio(
             + (f" · {left} waiting" if left > 0 else ""),
         )
 
+    async def send(i: int, clip: bytes):
+        """One clip to the engine, waiting out a busy or unreachable one.
+
+        The retry happens INSIDE the dispatch gate, so a stood-down engine
+        never turns into every window retrying at once, and each attempt is
+        paced against live chat like any other GPU-heavy unit of this
+        pipeline — a retry is more work for the same two Sparks.
+        """
+        last: Exception = asr.ASRUnavailable("no attempt was made")
+        for attempt in range(1, _RETRY_ATTEMPTS + 1):
+            try:
+                # The engine's own silence gate is OFF here: it judges a clip
+                # on its first 30 s, and a window that opens on a quiet
+                # lead-in would lose every word after it (a 12-second
+                # LibriVox intro scored 0.62 against the 0.6 threshold and
+                # came back empty). The windows are voice-activity regions
+                # already — that is the gate.
+                return await asr.transcribe_segments(
+                    clip, filename=f"w{i:04d}.wav", content_type="audio/wav", no_speech_check=False
+                )
+            except (asr.ASRBusy, asr.ASRUnavailable) as exc:
+                last = exc
+                if attempt == _RETRY_ATTEMPTS:
+                    break
+                wait = _backoff_s(attempt)
+                tally["retries"] += 1
+                log.info(
+                    "window %d: %s; asking again in %.1fs (attempt %d of %d)",
+                    i, exc, wait, attempt + 1, _RETRY_ATTEMPTS,
+                )
+                await asyncio.sleep(wait)
+                tally["paced_s"] += await _pipe.pace()
+        raise last
+
     async def one(i: int, window: Window) -> None:
         async with gate:
             tally["paced_s"] += await _pipe.pace()
@@ -221,21 +318,17 @@ async def transcribe_audio(
             tally["in_flight"] += 1
             await _say()
             try:
-                # The engine's own silence gate is OFF here: it judges a clip
-                # on its first 30 s, and a window that opens on a quiet
-                # lead-in would lose every word after it (a 12-second
-                # LibriVox intro scored 0.62 against the 0.6 threshold and
-                # came back empty). The windows are voice-activity regions
-                # already — that is the gate.
-                result = await asr.transcribe_segments(
-                    clip, filename=f"w{i:04d}.wav", content_type="audio/wav", no_speech_check=False
-                )
-            except asr.ASRRejected as exc:
-                # The engine refused THIS clip (a decode fault, say). One bad
+                result = await send(i, clip)
+            except (asr.ASRRejected, asr.ASRBusy, asr.ASRUnavailable) as exc:
+                # Either the engine refused THIS clip (a decode fault, say),
+                # or it stayed busy/unreachable through every attempt. One bad
                 # window is a gap, not a failed video — recorded, and on we go.
-                log.warning("window %d (%.1f-%.1fs) rejected: %s", i, window.start_s, window.end_s, exc)
+                # Past the threshold the stage gives up, and the dispatcher
+                # below cancels the siblings rather than paying for a
+                # transcript nobody will read.
+                log.warning("window %d (%.1f-%.1fs) failed: %s", i, window.start_s, window.end_s, exc)
                 tally["failures"] += 1
-                if tally["failures"] > max(3, len(windows) // 4):
+                if tally["failures"] > threshold:
                     raise
                 return
             finally:
@@ -253,7 +346,29 @@ async def transcribe_audio(
             tally["done_s"] += window.duration_s
             await _say()
 
-    await asyncio.gather(*(one(i, w) for i, w in enumerate(windows)))
+    # FAIL FAST, LEAVING NOTHING BEHIND. `gather` propagates the first error
+    # and leaves every other clip running to the end of the recording, each
+    # holding one of the two batch-pool slots — which is why the retry after a
+    # failed transcript stage met 'every transcription slot is busy'. Waiting
+    # for the FIRST exception and cancelling the rest keeps the two-wide
+    # dispatch and ends the stage with no work outstanding.
+    tasks = [
+        asyncio.get_running_loop().create_task(one(i, w), name=f"asr-window-{i}")
+        for i, w in enumerate(windows)
+    ]
+    try:
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+    except BaseException:
+        # The stage timed out, or the job was cancelled by a shutdown: none of
+        # this transcript will be read, so none of it may keep decoding.
+        await _cancel_all(tasks)
+        raise
+    fatal = next(
+        (t.exception() for t in done if not t.cancelled() and t.exception() is not None), None
+    )
+    if fatal is not None:
+        await _cancel_all(pending)
+        raise fatal
     # Stitching wants the windows in time order, whichever finished first.
     pieces: List[Tuple[Window, List[Segment]]] = [(windows[i], results[i]) for i in sorted(results)]
     engine_ms, failures, paced_s = tally["engine_ms"], tally["failures"], tally["paced_s"]
@@ -264,6 +379,7 @@ async def transcribe_audio(
         "engine_ms": engine_ms,
         "windows_done": len(pieces),
         "windows_failed": failures,
+        "engine_retries": tally["retries"],
         "paced_s": round(paced_s, 1),
         "segments": len(segments),
         "chars": sum(len(s.text) for s in segments),

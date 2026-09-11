@@ -897,3 +897,34 @@ def test_the_chat_request_accepts_a_video_only_send():
     assert req.text == "" and req.video_uploads
     with pytest.raises(ValueError):
         ChatRequest()
+
+
+# ------------------------------------------------- added 2026-09-11 (V3) --
+
+
+def test_the_evidence_pack_never_reports_an_unread_screen_as_blank():
+    """The model reads these lines as facts. 'Nothing legible on screen' is a
+    claim about the video; when the OCR reader was down, nobody checked."""
+    spans = [OcrSpan(0.0, 10.0, "", kind="", caption=None)]
+    blank = fusion.evidence_lines([], spans)
+    unread = fusion.evidence_lines([], spans, screen_unread=True)
+    assert "nothing legible on screen" in blank[0][1]
+    assert "NOT read" in unread[0][1] and "nothing legible" not in unread[0][1]
+
+
+def test_read_wav_maps_the_track_rather_than_reading_it(tmp_path):
+    """The memory bound the transcription stage rests on: a four-hour track
+    is 461 MB, and none of it is the process's own memory."""
+    import numpy as np
+
+    from app.video.transcribe import read_wav_pcm16
+
+    path = tmp_path / "long.wav"
+    path.write_bytes(wav_bytes(_tone(2.0)))
+    pcm = read_wav_pcm16(str(path))
+    assert isinstance(pcm, np.memmap)
+    # A window is a VIEW of the mapping; only `wav_bytes` copies, and only
+    # the window it is given.
+    window = pcm[16000:32000]
+    assert isinstance(window, np.memmap) and window.base is not None
+    assert len(wav_bytes(window)) == 44 + 32000

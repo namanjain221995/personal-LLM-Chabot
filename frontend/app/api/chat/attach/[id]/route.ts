@@ -53,7 +53,7 @@ export async function GET(
     );
   } catch {
     return Response.json(
-      { message: 'The orchestrator is unreachable.' },
+      { message: 'The orchestrator is unreachable.', code: 'NETWORK_ERROR' },
       { status: 502 },
     );
   }
@@ -61,12 +61,24 @@ export async function GET(
     // 401 passes through untouched: a session that died mid-generation must
     // reach the client as "sign in", never be disguised as "finished" (404)
     // or "orchestrator down" (502).
+    //
+    // 2026-09-10 (fe-chat F3): the 404/502 split is load-bearing and the
+    // `code` says so out loud. 404 is the server stating there is nothing
+    // live and nothing to resume — the answer is in history. Anything else
+    // is this proxy failing to find out, and the client must NOT read it as
+    // "finished": it detached tabs from generations that were still running.
     const status =
       upstream.status === 404 || upstream.status === 401 ? upstream.status : 502;
     return Response.json(
       {
         message:
           upstream.status === 401 ? 'Sign in required.' : 'no active generation',
+        code:
+          status === 401
+            ? 'UNAUTHENTICATED'
+            : status === 404
+              ? 'NOT_FOUND'
+              : 'ORCHESTRATOR_UNAVAILABLE',
       },
       { status },
     );

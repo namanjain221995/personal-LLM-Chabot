@@ -31,6 +31,7 @@ import {
   rebuildHistoryStore,
   setEvictListener,
 } from '@/lib/history';
+import { reconcileThread } from '@/lib/threadReconcile';
 import {
   adoptDraftPrefs,
   DEFAULT_PREFS,
@@ -74,6 +75,7 @@ import { shortcutAction } from '@/lib/searchPalette';
 import {
   attachStream,
   clarificationAlreadySubmitted,
+  fetchChatRequest,
   fetchServerActive,
   getLiveStream,
   isStreaming,
@@ -83,6 +85,8 @@ import {
   stopStream,
   streamingIds,
   subscribeStreams,
+  type AttachOutcome,
+  type ReconnectView,
 } from '@/lib/streams';
 import {
   buildResponse,
@@ -107,6 +111,8 @@ import type {
   ChatMessage,
   ConversationSummary,
   SelectedContext,
+  SendIntent,
+  SendIntentState,
 } from '@/lib/types';
 import type { SelectionCandidate } from '@/lib/selectedContext';
 import { Composer, type Attachment, type ComposerHandle } from './Composer';
@@ -117,7 +123,11 @@ import { ContextMeter } from './ContextMeter';
 import { SummaryPanel } from './SummaryPanel';
 import { EmptyState } from './EmptyState';
 import { Loader } from './Loader';
-import { MessageRow, type UploadStatus } from './MessageRow';
+import {
+  MessageRow,
+  type UploadStatus,
+  type UserTurnView,
+} from './MessageRow';
 import { ClarificationCard } from './ClarificationCard';
 import { SearchPalette } from './SearchPalette';
 import { Sidebar } from './Sidebar';
@@ -128,10 +138,25 @@ import { ShareDialog } from './ShareDialog';
 const APP_NAME =
   process.env.NEXT_PUBLIC_APP_NAME ?? 'TechSara AI';
 
+/**
+ * An attachment whose bytes started uploading when it was ATTACHED
+ * (Composer.withEarlyUpload), read structurally.
+ *
+ * The early upload is keyed to the conversation that was open at the time,
+ * and the composer keeps its chips when the conversation changes — so a video
+ * attached in chat A and sent from chat B would otherwise ride A's upload id
+ * into B's request (F11). Read as an optional field so this compiles against
+ * a Composer that has not stamped it yet; missing simply means "assume it is
+ * ours", which is the behaviour that predates the check.
+ */
+type EarlyUpload = Attachment & { uploadConversationId?: string | null };
+
 /** The row callbacks ChatApp caches per message id — see `rowHandlers`. */
 interface RowHandlers {
   onRegenerate: () => void;
   onRetry: () => void;
+  /** Send an unsent turn with the attachments that reached the server. */
+  onSendWithLanded: () => void;
   onReuseAttachment: (index: number) => void;
   onEditStart: () => void;
   onEditCancel: () => void;
@@ -155,6 +180,129 @@ export function unsentTurnState(m: ChatMessage): {
   const missing = atts.filter((a) => !a.id).map((a) => a.name);
   const kept = atts.filter((a) => Boolean(a.id)).map((a) => a.name);
   return { missing, kept, canResend: !resendOptionsFor(m).missing };
+}
+
+/**
+ * One logical send, minted when Send is pressed (CONTRACT.md, Identities).
+ *
+ * The contract's shape: 1-64 characters of [A-Za-z0-9_-]. `randomUUID` is
+ * not everywhere (it needs a secure context, and jsdom does not always have
+ * it), so the fallback is time + randomness — this only has to be unique per
+ * browser, and the server owns the generation id that has to be unique per
+ * conversation.
+ */
+/**
+ * The intent a RETRY of this question must carry.
+ *
+ * Re-using the id is what makes "Send now", "Retry" and a double click
+ * converge on ONE generation: the server recognises the intent and attaches
+ * to (or resumes) what it already has instead of starting a second answer.
+ *
+ * A regenerate of an ANSWERED turn is the opposite case and must mint a new
+ * one — the server replays the stored answer for a completed intent, which is
+ * precisely not what "try again" means.
+ */
+export function intentForRetry(question: ChatMessage | undefined): string {
+  const intent = question?.meta?.intent;
+  const reusable: (SendIntentState | undefined)[] = [
+    'unsent',
+    'failed',
+    'interrupted',
+    'waiting_for_attachments',
+    'submitting',
+    'accepted',
+    'processing',
+  ];
+  return intent?.id && reusable.includes(intent.state)
+    ? intent.id
+    : newIntentId();
+}
+
+export function newIntentId(): string {
+  const uuid = globalThis.crypto?.randomUUID?.();
+  return (
+    uuid ??
+    `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 12)}`
+  ).replace(/-/g, '');
+}
+
+/**
+ * What the row must SAY about a user turn — the "What the person sees" table
+ * of CONTRACT.md, decided in one place.
+ *
+ * The rule that matters most is the one that is not a state at all: nothing
+ * here may conclude "never sent" from the absence of a stream in this tab.
+ * That inference is fe-chat F1/F2 and RC-1 — it put a red notice over
+ * generations that were running perfectly well, and offered a Send now that
+ * cancelled them. "Never sent" is only ever the SERVER's answer (the intent
+ * is unsent, or the intent is unknown to it); everything else that is not
+ * running is "checking".
+ */
+export interface TurnContext {
+  /** Is this the last message in the visible thread? */
+  isLast: boolean;
+  /** A stream for this conversation is live in THIS tab. */
+  streamingHere: boolean;
+  /** The server listed this conversation as generating. */
+  serverBusy: boolean;
+  /** This tab is uploading a file for this turn right now. */
+  uploadingHere: boolean;
+  /** The mount reconciliation has not finished yet. */
+  reconciling: boolean;
+  /** The last status question could not be asked. */
+  statusUnknown: boolean;
+  /** The stream layer's reconnect state for this conversation, if any. */
+  reconnect: ReconnectView | null;
+}
+
+export function userTurnView(
+  m: ChatMessage,
+  ctx: TurnContext,
+): UserTurnView | null {
+  if (m.role !== 'user' || !ctx.isLast) return null;
+  const files = unsentTurnState(m);
+  const intent = m.meta?.intent;
+  // A row saved by the 2026-09-09 build carries `send_state` and no intent.
+  // It means the same thing — "the request had not gone out when this was
+  // written" — but with nothing the server can be asked about, so it can only
+  // ever become `unsent`, and only once the server has been heard from.
+  const legacy = !intent && Boolean(m.meta?.send_state);
+  if (!intent && !legacy) return null;
+
+  // Work happening HERE outranks everything: the files are still going up,
+  // or the request is about to. The upload indicator is the whole story.
+  if (
+    ctx.uploadingHere ||
+    intent?.state === 'waiting_for_attachments' ||
+    intent?.state === 'submitting'
+  ) {
+    return null;
+  }
+  if (intent?.state === 'completed' || intent?.state === 'cancelled') return null;
+  if (ctx.streamingHere) return null;
+
+  const base = { ...files, reason: intent?.reason };
+  if (intent?.state === 'unsent') return { ...base, kind: 'unsent' };
+  if (intent?.state === 'failed') return { ...base, kind: 'failed' };
+  if (intent?.state === 'interrupted') {
+    return {
+      ...base,
+      kind: ctx.reconnect?.statusUnknown ? 'status_unknown' : 'interrupted',
+      resuming: Boolean(ctx.reconnect && !ctx.reconnect.exhausted),
+    };
+  }
+  // The server is generating for this conversation, or said it accepted the
+  // request: this turn is being worked on, whatever this tab is attached to.
+  if (ctx.serverBusy || intent?.state === 'accepted' || intent?.state === 'processing') {
+    return { ...base, kind: 'working' };
+  }
+  // Nothing running and nothing said. Only a definite answer from the server
+  // may become "never sent"; while we are still asking — or could not ask —
+  // the row says so instead.
+  if (ctx.reconciling || ctx.statusUnknown) {
+    return { ...base, kind: 'status_unknown' };
+  }
+  return legacy ? { ...base, kind: 'unsent' } : { ...base, kind: 'status_unknown' };
 }
 
 export function ChatApp() {
@@ -207,6 +355,14 @@ export function ChatApp() {
   const [features, setFeatures] = useState<Record<string, boolean>>({});
   /** Conversations the SERVER is still generating for (polled; survives reloads). */
   const [serverActive, setServerActive] = useState<string[]>([]);
+  /**
+   * The last status question could not be ASKED (the proxy answered 502, the
+   * network is gone). Not "nothing is running": the contract's
+   * `status_unknown`, and the reason the red notice may not appear.
+   */
+  const [statusUnknown, setStatusUnknown] = useState(false);
+  /** The stream layer's reconnect state for the conversation on screen. */
+  const [reconnect, setReconnect] = useState<ReconnectView | null>(null);
   /** Bumped on every stream notification so sidebar spinners re-render. */
   const [, setStreamTick] = useState(0);
   /**
@@ -303,6 +459,20 @@ export function ChatApp() {
   const messagesRef = useRef<ChatMessage[]>([]);
   messagesRef.current = messages;
   /**
+   * The thread AND the conversation it belongs to, together.
+   *
+   * `messagesRef` alone lies for one render after a switch: `activeIdRef` is
+   * written synchronously by the click, while `messages` only changes when
+   * React re-renders — so anything reading both would attribute the previous
+   * chat's turns to the new one. Reconciliation asks about a specific
+   * conversation, so it reads this pair or falls back to the store.
+   */
+  const viewRef = useRef<{ id: string | null; messages: ChatMessage[] }>({
+    id: null,
+    messages: [],
+  });
+  viewRef.current = { id: activeId, messages };
+  /**
    * The conversation as READ: one path down the tree.
    *
    * `messages` is everything stored, sibling branches included, and is what
@@ -341,6 +511,59 @@ export function ChatApp() {
   prefsRef.current = prefs;
   const serverActiveRef = useRef<string[]>([]);
   serverActiveRef.current = serverActive;
+  /**
+   * Conversations whose send is between "Send pressed" and "request out".
+   *
+   * A ref because it is read and written SYNCHRONOUSLY inside one event
+   * handler: a double click delivers both submits before React has re-rendered
+   * anything, so state cannot be the guard (F14 / QA 10a).
+   */
+  const pendingSendRef = useRef<Set<string>>(new Set());
+  /** The in-tab upload, read from callbacks that must not re-subscribe. */
+  const datasetUploadRef = useRef<typeof datasetUpload>(null);
+  datasetUploadRef.current = datasetUpload;
+
+  /**
+   * Move the send intent on one turn and WRITE it.
+   *
+   * The reconciliation's conclusions are facts about the send, so they belong
+   * on the message the same way the server's are: a reload must find the same
+   * answer this tab just got, not ask again from scratch.
+   */
+  const markIntentState = useCallback(
+    (
+      conversationId: string,
+      messageId: string,
+      patch: Partial<SendIntent> & { state: SendIntentState },
+    ) => {
+      let changed = false;
+      const source =
+        viewRef.current.id === conversationId && viewRef.current.messages.length > 0
+          ? viewRef.current.messages
+          : (getHistoryStore().get(conversationId)?.messages ?? []);
+      const next = source.map((m) => {
+        if (m.id !== messageId) return m;
+        const intent = m.meta?.intent;
+        if (!intent) return m;
+        if (
+          intent.state === patch.state &&
+          intent.generation_id === (patch.generation_id ?? intent.generation_id) &&
+          intent.reason === patch.reason
+        ) {
+          return m;
+        }
+        changed = true;
+        return {
+          ...m,
+          meta: { ...(m.meta ?? {}), intent: { ...intent, ...patch } },
+        };
+      });
+      if (!changed) return;
+      getHistoryStore().saveMessages(conversationId, next);
+      if (activeIdRef.current === conversationId) setMessages(next);
+    },
+    [],
+  );
 
   /** Stop showing the loader for `id` — unless the user has moved on since. */
   const settleLoading = useCallback((id: string) => {
@@ -359,6 +582,212 @@ export function ChatApp() {
     setConversations(store.list());
     setArchived(store.listArchived());
   }, []);
+
+  /**
+   * Server truth, folded into what is on screen (fe-chat F1).
+   *
+   * NOT `setMessages(conv.messages)`. That replaced every message object —
+   * and every id, since a hydrate renumbers them `srv-<conversation>-<i>` —
+   * which is what made the upload indicator (keyed on the message id)
+   * disappear from a turn whose files were still going up in this very tab,
+   * and the turn itself reappear as a bare, unanswered question. Rows the
+   * server did not change keep their identity; a turn this tab is still
+   * working on keeps its own account of that work.
+   */
+  const adoptServerMessages = useCallback(
+    (id: string, server: ChatMessage[]) => {
+      const current =
+        viewRef.current.id === id
+          ? viewRef.current.messages
+          : (getHistoryStore().get(id)?.messages ?? []);
+      const merged = reconcileThread(current, server);
+      // Nothing moved: no write, no state change, no re-render. The poll runs
+      // every 8 seconds and most ticks are exactly this.
+      const unchanged =
+        merged.length === current.length && merged.every((m, i) => m === current[i]);
+      if (unchanged) return;
+      // A forced read replaces the cache with the server's copy, so anything
+      // that survived the reconciliation because only WE have it has to be
+      // written back — otherwise the load that was meant to recover an answer
+      // would quietly delete the question waiting for it.
+      if (merged.length > server.length) {
+        getHistoryStore().saveMessages(id, merged);
+      }
+      if (activeIdRef.current === id) setMessages(merged);
+    },
+    [],
+  );
+
+  /** Load a conversation from the store and fold it into the view. */
+  const loadInto = useCallback(
+    async (id: string, force: boolean) => {
+      const conv = await getHistoryStore()
+        .load(id, { force })
+        .catch(() => null);
+      if (!conv || activeIdRef.current !== id || isStreaming(id)) {
+        settleLoading(id);
+        return;
+      }
+      adoptServerMessages(id, conv.messages);
+      settleLoading(id);
+      refreshList();
+    },
+    [adoptServerMessages, refreshList, settleLoading],
+  );
+
+  /**
+   * Re-join a generation, and treat the three ways that can fail as three
+   * different things (fe-chat F3).
+   *
+   * The old code took `false` from `attachStream` — returned for a 502, a
+   * 401 and a dead socket alike — as "finished during the reload gap", turned
+   * the spinner off and loaded history. The generation was still running: the
+   * tab stayed detached for ever (the 8 s poll only loads when the id is NOT
+   * active), and the next send cancelled the answer it was waiting for.
+   */
+  const attachOrExplain = useCallback(
+    async (id: string): Promise<AttachOutcome> => {
+      setStreaming(true);
+      const outcome = await attachStream(id);
+      if (activeIdRef.current !== id) return outcome;
+      if (outcome === 'attached' || outcome === 'unauthenticated') return outcome;
+      setStreaming(isStreaming(id));
+      if (outcome === 'ended') {
+        // The server SAID there is nothing live and nothing to resume, so the
+        // answer is in history.
+        setStatusUnknown(false);
+        await loadInto(id, true);
+      } else {
+        // We could not find out. Say so; the poll asks again.
+        setStatusUnknown(true);
+        settleLoading(id);
+      }
+      return outcome;
+    },
+    [loadInto, settleLoading],
+  );
+
+  /**
+   * Everything this tab does before it is entitled to claim anything about
+   * the open conversation — on mount, on reopen, and on every poll.
+   *
+   * The order is the contract's (CONNECTION KNOWLEDGE): ask what is running,
+   * then ask about the last turn's intent, and only then draw a conclusion.
+   * A failure at either step is `status_unknown` and nothing else; the one
+   * thing that may never happen is inferring "never sent" from silence.
+   */
+  const reconcileConversation = useCallback(
+    async (id: string) => {
+      let active: string[] | null = null;
+      try {
+        active = await fetchServerActive();
+        if (activeIdRef.current !== id) return;
+        setServerActive(active);
+        setStatusUnknown(false);
+      } catch {
+        // Could not ask. NOT "nothing is running" (F4 / INF-2).
+        if (activeIdRef.current !== id) return;
+        setStatusUnknown(true);
+      }
+      if (activeIdRef.current !== id || isStreaming(id)) return;
+      if (active?.includes(id)) {
+        await attachOrExplain(id);
+        return;
+      }
+      // The store is consulted whenever the view is not (yet) this
+      // conversation's: on mount before React has flushed the cached thread
+      // into state, and for the one render after a switch.
+      const cached = getHistoryStore().get(id)?.messages ?? [];
+      const thread =
+        viewRef.current.id === id && viewRef.current.messages.length > 0
+          ? viewRef.current.messages
+          : cached;
+      const last = thread.at(-1);
+      if (!last || last.role !== 'user') {
+        // The thread ends on an answer (or has nothing in it yet): an
+        // ordinary refresh is enough, and it is safe even when the status
+        // question failed — a non-forced load serves the cache whenever the
+        // cache is what the server has.
+        await loadInto(id, false);
+        return;
+      }
+      // Work happening HERE — an upload in this tab, a send between the click
+      // and the request — is newer than anything the server can tell us, and
+      // replacing the turn under it is the critical bug (F1).
+      if (
+        datasetUploadRef.current?.messageId === last.id ||
+        pendingSendRef.current.has(id)
+      ) {
+        return;
+      }
+      const intentId = last.meta?.intent?.id;
+      if (!intentId) {
+        // Nothing to look up: an old row, or one carrying only the
+        // 2026-09-09 marker. Server truth is all there is to ask for — and a
+        // FORCED read (which replaces what we hold) is only justified once
+        // the server has actually said nothing is running.
+        await loadInto(id, active !== null);
+        return;
+      }
+      const report = await fetchChatRequest(intentId);
+      if (activeIdRef.current !== id || isStreaming(id)) return;
+      if (report.kind === 'unauthenticated') return; // sign-in is being routed
+      if (report.kind === 'unavailable') {
+        // Includes the 404 an orchestrator without this route answers with:
+        // a new frontend against an old backend must fall back to the
+        // /chat/active behaviour, never to "never sent" (CONTRACT.md).
+        if (report.status === 404 && active) {
+          await loadInto(id, true);
+          return;
+        }
+        setStatusUnknown(true);
+        settleLoading(id);
+        return;
+      }
+      setStatusUnknown(false);
+      if (report.kind === 'unknown-intent') {
+        // The server states it never received this send. THIS is the only
+        // route to "never sent".
+        markIntentState(id, last.id, {
+          state: 'unsent',
+          reason: 'The request never reached the server.',
+        });
+        settleLoading(id);
+        return;
+      }
+      if (report.live || (report.status === 'interrupted' && report.resumable)) {
+        markIntentState(id, last.id, {
+          state: report.live ? 'processing' : 'interrupted',
+          ...(report.generationId ? { generation_id: report.generationId } : {}),
+          attempt: report.attempt,
+        });
+        await attachOrExplain(id);
+        return;
+      }
+      if (report.status === 'completed' || report.answerPersisted) {
+        markIntentState(id, last.id, { state: 'completed' });
+        await loadInto(id, true);
+        return;
+      }
+      if (report.status === 'failed' || report.status === 'cancelled') {
+        markIntentState(id, last.id, {
+          state: report.status === 'cancelled' ? 'cancelled' : 'failed',
+          reason: 'The server stopped working on this answer.',
+        });
+        await loadInto(id, true);
+        return;
+      }
+      // accepted / running with nothing live in this process yet: the answer
+      // is coming. Keep the turn honest and let the next poll look again.
+      markIntentState(id, last.id, {
+        state: 'accepted',
+        ...(report.generationId ? { generation_id: report.generationId } : {}),
+        attempt: report.attempt,
+      });
+      settleLoading(id);
+    },
+    [attachOrExplain, loadInto, markIntentState, settleLoading],
+  );
 
   // Initial load: cached history immediately, then auth check → one-time
   // migration → server refresh (V2 §4a/§4b); evict-toast wiring, ?c= deep
@@ -414,8 +843,6 @@ export function ChatApp() {
     }
 
     let cancelled = false;
-    /** The ?c= restore handed off to a live stream, which now owns the screen. */
-    let handedToStream = false;
     void (async () => {
       let store = getHistoryStore();
       // IndexedDB hydration (single-digit ms; instant for the fallback).
@@ -449,9 +876,19 @@ export function ChatApp() {
         // Offline (status 0) or the orchestrator failing (5xx — still
         // booting, a network blip): carry on with the cache, but never
         // leave a running generation unguarded.
+        //
+        // fe-chat F5: this used to fetch /chat/active for the SIDEBAR and
+        // then return without ever attaching — so a generation that was
+        // running server-side rendered as a bare user turn (with the old
+        // marker, the red notice), the composer unlocked, and only the poll
+        // eventually brought the answer. A failed /auth/me says nothing at
+        // all about the generation, so the same reconciliation runs.
         if (wanted) {
-          const active = await fetchServerActive();
-          if (!cancelled) setServerActive(active);
+          try {
+            await reconcileConversation(wanted);
+          } finally {
+            if (!cancelled) settleLoading(wanted);
+          }
         }
         settleReconcile();
         return;
@@ -501,53 +938,30 @@ export function ChatApp() {
         // After an account switch `wanted` names the PREVIOUS account's
         // conversation — nothing of it may be reconciled for this one.
         if (wanted && !switchedAccount) {
-        // Still generating server-side? Re-join the live stream — it replays
-        // the partial answer instantly, then keeps streaming. Otherwise load
-        // server truth; FORCED when the chat ends on a user message, because
-        // a detached generation may have finished and saved its answer while
-        // this tab was closed or reloading.
-          const active = await fetchServerActive();
-          if (cancelled) return;
-          setServerActive(active);
-          if (active.includes(wanted)) {
-            setStreaming(true);
-            handedToStream = true;
-            void attachStream(wanted).then((ok) => {
-              if (!ok && activeIdRef.current === wanted) {
-                // Finished during the reload gap — its answer is in history.
-                setStreaming(false);
-                void store.load(wanted, { force: true }).then((conv) => {
-                  if (conv && activeIdRef.current === wanted && !isStreaming(wanted)) {
-                    setMessages(conv.messages);
-                  }
-                  settleLoading(wanted);
-                });
-              }
-            });
-            return;
-          }
-          const cached = store.get(wanted);
-          const force = cached?.messages.at(-1)?.role === 'user';
-          const conv = await store.load(wanted, { force });
-          if (conv && !cancelled && activeIdRef.current === wanted) {
-            setMessages(conv.messages);
-          }
-          if (!cancelled) settleLoading(wanted);
+          // Ask the server what is running and what became of the last send
+          // BEFORE anything on screen is replaced or concluded — the whole
+          // of the mount reconciliation now lives in one place, shared with
+          // the poll and with reopening a chat, so the three can no longer
+          // disagree about what "no stream in this tab" means.
+          await reconcileConversation(wanted);
         }
       } finally {
         settleReconcile();
         // Every early return above (signed out, offline, account switch) also
-        // ends the restore, so the loader can never outlive it. The streaming
-        // hand-off is the one exception: the stream settles it on delivery.
-        if (wanted && !cancelled && !handedToStream) settleLoading(wanted);
+        // ends the restore, so the loader can never outlive it — and a
+        // reconciliation that threw must not leave a spinner behind either.
+        // A live stream is the one thing allowed to keep it: it settles the
+        // loader itself on delivery.
+        if (wanted && !cancelled && !isStreaming(wanted)) settleLoading(wanted);
       }
     })();
     return () => {
       cancelled = true;
     };
     // settleLoading is useCallback([])-stable, so listing it keeps the effect
-    // mount-only exactly as before.
-  }, [refreshList, setUrlConversation, toast, settleLoading]);
+    // mount-only exactly as before; so is reconcileConversation and the
+    // callbacks it is built from.
+  }, [reconcileConversation, refreshList, setUrlConversation, toast, settleLoading]);
 
   const persist = useCallback(
     (conversationId: string, msgs: ChatMessage[]) => {
@@ -585,6 +999,10 @@ export function ChatApp() {
         );
       }
       if (id !== activeIdRef.current) return;
+      // What this tab knows about a stream it lost, mirrored so the turn can
+      // say "Resuming…" or "Checking with the server…" instead of the app
+      // pretending nothing is happening.
+      setReconnect(s.reconnect ?? null);
       if (s.status !== 'streaming') {
         // The continuation this answer belongs to is over — however it ended.
         // The lock was only ever cleared when the CONVERSATION changed, so a
@@ -608,23 +1026,29 @@ export function ChatApp() {
     let stopped = false;
     async function tick() {
       if (document.hidden) return;
-      const active = await fetchServerActive();
-      if (stopped) return;
-      setServerActive(active);
       const id = activeIdRef.current;
-      if (
-        id &&
-        !isStreaming(id) &&
-        !active.includes(id) &&
-        messagesRef.current.at(-1)?.role === 'user'
-      ) {
-        // The open chat's detached generation finished — fetch its answer.
-        const conv = await getHistoryStore().load(id, { force: true });
-        if (!stopped && conv && activeIdRef.current === id && !isStreaming(id)) {
-          setMessages(conv.messages);
-          refreshList();
+      if (!id) {
+        // No conversation open: the sidebar still wants the busy set, and a
+        // failure to get it is not news worth showing anywhere.
+        try {
+          const active = await fetchServerActive();
+          if (!stopped) {
+            setServerActive(active);
+            setStatusUnknown(false);
+          }
+        } catch {
+          if (!stopped) setStatusUnknown(true);
         }
+        return;
       }
+      // fe-chat F1: this is where the 8-second poll used to force-load
+      // server history over a turn whose files were still uploading in THIS
+      // tab — replacing the message (and its id), killing the upload
+      // indicator and raising the "never sent" notice on a send that had not
+      // even been made yet. The reconciliation below asks first, never
+      // replaces a turn this tab is still working on, and folds server truth
+      // into the view instead of overwriting it.
+      await reconcileConversation(id);
     }
     void tick();
     const timer = window.setInterval(() => void tick(), 8000);
@@ -632,7 +1056,7 @@ export function ChatApp() {
       stopped = true;
       window.clearInterval(timer);
     };
-  }, [refreshList]);
+  }, [reconcileConversation]);
 
   // H-01: an upload indicator belongs to the chat it was started in; leaving
   // it on screen in another conversation would describe nothing.
@@ -1018,6 +1442,18 @@ export function ChatApp() {
       clarification?: ClarificationResponse | null,
       options?: SendOptions,
     ) => {
+      // F14 / 10a: a double click delivers TWO submits before any state
+      // update lands, and each used to become its own POST — which the
+      // orchestrator honours by cancelling the first generation. The refs are
+      // written synchronously (state would be a render behind), so the second
+      // click finds the first one already in progress and does nothing.
+      const openConversation = activeIdRef.current;
+      if (
+        openConversation &&
+        (isStreaming(openConversation) || pendingSendRef.current.has(openConversation))
+      ) {
+        return;
+      }
       if (options?.prefs) {
         // A slash command sets the mode for THIS send (2026-09-03). The ref
         // is updated synchronously on purpose: startStream below reads
@@ -1076,6 +1512,30 @@ export function ChatApp() {
         messagesRef.current,
         threadRef.current,
       );
+      // One id for this send, whatever happens to it from here: the POST
+      // carries it, the turn stores it, a retry re-uses it, and the server
+      // records it — so an acknowledgement lost to a reload is a question the
+      // browser can ASK rather than a fact it has to guess at.
+      const intentId = newIntentId();
+      /**
+       * Identity per attachment, minted here and never derived from position
+       * or name (F8a/F8b): a list filtered by `id` moves every index under a
+       * sibling that is still uploading, and two `invoice.pdf` in one turn is
+       * perfectly legal. `uploadable` below is walked in exactly this order.
+       */
+      const uploadable = [...docAttachments, ...videoAttachments];
+      const attachmentIds = new Map<string, string>();
+      for (const a of uploadable) {
+        // The composer mints this at SELECTION, which is where the contract
+        // puts it (an early upload is already running under it by the time
+        // Send is pressed). Minting one here is the fallback for an
+        // attachment that arrived without one — a reuse path, or a chip
+        // built before the field existed.
+        const chosen =
+          (a as Attachment & { attachment_id?: string }).attachment_id ??
+          newIntentId();
+        attachmentIds.set(a.clientId, chosen);
+      }
       const userMessage: ChatMessage = {
         id: newId(),
         role: 'user',
@@ -1109,17 +1569,43 @@ export function ChatApp() {
                       // follow the documents, in the same order the upload
                       // loop below walks them, so ids link back correctly.
                       attachments: isDataset
-                        ? [{ name: first?.name ?? 'file', kind: 'dataset' as const }]
-                        : [
-                            ...docAttachments.map((a) => ({
-                              name: a.name,
-                              kind: 'pdf' as const,
-                            })),
-                            ...videoAttachments.map((a) => ({
-                              name: a.name,
-                              kind: 'video' as const,
-                            })),
-                          ],
+                        ? [
+                            {
+                              name: first?.name ?? 'file',
+                              kind: 'dataset' as const,
+                              ...(first
+                                ? {
+                                    // The composer's identity when it has one,
+                                    // for the same reason as the loop above.
+                                    attachment_id:
+                                      (first as Attachment & {
+                                        attachment_id?: string;
+                                      }).attachment_id ?? newIntentId(),
+                                  }
+                                : {}),
+                              ...(first?.file
+                                ? { bytes: first.file.size }
+                                : {}),
+                              upload_state: 'uploading' as const,
+                            },
+                          ]
+                        : uploadable.map((a) => ({
+                            name: a.name,
+                            kind: a.kind === 'video' ? ('video' as const) : ('pdf' as const),
+                            // The durable identity of THIS file, carried
+                            // through persistence so the upload that lands
+                            // last still knows which entry is its own.
+                            attachment_id: attachmentIds.get(a.clientId),
+                            ...(a.file ? { bytes: a.file.size } : {}),
+                            // Where its bytes are, as this tab last knew.
+                            // Only the server ever declares `uploaded`. A
+                            // document small enough to ride INSIDE the
+                            // request is merely `selected`: the answer does
+                            // not wait on its bytes reaching the server.
+                            upload_state: needsDocUpload
+                              ? ('uploading' as const)
+                              : ('selected' as const),
+                          })),
                     }
                   : {}),
               }
@@ -1160,7 +1646,17 @@ export function ChatApp() {
             })),
           ...docAttachments
             .filter((d) => d.base64)
-            .map((d) => ({ kind: 'pdf' as const, name: d.name, base64: d.base64 })),
+            .map((d) => ({
+              kind: 'pdf' as const,
+              name: d.name,
+              base64: d.base64,
+              // The identity these bytes belong to, so a resend matches them
+              // to the right entry even when a sibling's upload moved the
+              // positions around (lib/attachments, fe-attach F1).
+              ...(attachmentIds.has(d.clientId)
+                ? { attachment_id: attachmentIds.get(d.clientId) }
+                : {}),
+            })),
         ]);
       }
       // `turns` is everything STORED (sibling branches included); `context`
@@ -1179,81 +1675,150 @@ export function ChatApp() {
       setUnreachable(false);
       // A dataset has to be uploaded before a stream can exist, so say that
       // instead of claiming the model is already running (see datasetUpload).
-      if ((isDataset && first?.file) || needsDocUpload) {
+      const uploadsFirst = (isDataset && first?.file) || needsDocUpload;
+      if (uploadsFirst) {
         setDatasetUpload({
           conversationId,
           messageId: userMessage.id,
           status: 'uploading',
         });
+        pendingSendRef.current.add(conversationId);
         // The turn is already saved (above) so a reload keeps it; this says
-        // the request has NOT gone out yet. Cleared right before startStream.
-        userMessage.meta = { ...(userMessage.meta ?? {}), send_state: 'uploading' };
+        // the request has NOT gone out yet — and, unlike the 2026-09-09
+        // `send_state`, it says it with an id the SERVER can be asked about
+        // once it has. Moved on at every step below.
+        userMessage.meta = {
+          ...(userMessage.meta ?? {}),
+          intent: { id: intentId, state: 'waiting_for_attachments' },
+        };
         persist(conversationId, turns);
       } else {
+        userMessage.meta = {
+          ...(userMessage.meta ?? {}),
+          intent: { id: intentId, state: 'submitting' },
+        };
+        persist(conversationId, turns);
         setStreaming(true);
       }
       // Sending moves the conversation on; an editor left open behind it is
       // about to be arguing with a thread that has changed underneath it.
       setEditingMessageId(null);
 
-      if ((isDataset && first?.file) || needsDocUpload) {
-        // Datasets and documents stream to their own endpoint and are then
-        // referenced by the conversation, so the chat request stays small
-        // whatever — and however many — the files weighed.
+      if (uploadsFirst) {
+        /**
+         * Datasets and documents stream to their own endpoint and are then
+         * referenced by the conversation, so the chat request stays small
+         * whatever — and however many — the files weighed.
+         *
+         * Rewritten 2026-09-10 (F8a/F8b). Three rules, each of which was a
+         * real failure:
+         *
+         * 1. `allSettled`, never `all`. `Promise.all` rejects on the FIRST
+         *    failure while its siblings carry on uploading — into a `catch`
+         *    that had already rewritten `meta.attachments`, so the sibling
+         *    that landed a second later wrote its id into a list whose
+         *    indexes had moved, or into nothing at all.
+         * 2. Nothing is ever removed from `meta.attachments`. The old catch
+         *    filtered it down to the files that had ids, which is how a
+         *    two-video turn came back from a reload as a one-video turn with
+         *    no record that the 400 MB file had ever been attached — and
+         *    Send now then re-sent it silently short.
+         * 3. Each file is matched by its own `attachment_id`, so completion
+         *    order is irrelevant.
+         */
         void (async () => {
           let docRefs: { upload_id: string; name: string }[] | null = null;
           let videoRefs: { upload_id: string; name: string }[] | null = null;
-          try {
-            let uploadedId: string | undefined;
-            if (needsDocUpload) {
-              // In PARALLEL (2026-09-03), and a document that started
-              // uploading when it was attached (Composer.withEarlyUpload)
-              // is only awaited, not sent twice. Five 60 MB files used to
-              // upload one after another on the send's critical path.
-              const uploadable = [...docAttachments, ...videoAttachments];
-              const refs = await Promise.all(
-                uploadable.map(async (doc, i) => {
-                  const early = doc.uploadPromise ? await doc.uploadPromise : null;
-                  let ref = early;
-                  if (!ref) {
-                    // Reuse paths may carry only base64; the picker always
-                    // keeps the File. Either way the server gets real bytes.
-                    const src =
-                      doc.file ??
-                      new File(
-                        [Uint8Array.from(atob(doc.base64), (c) => c.charCodeAt(0))],
-                        doc.name,
-                      );
-                    ref = await uploadDocumentFile(
-                      src,
-                      conversationId,
-                      doc.kind === 'video' ? 'video' : 'document',
+          /** Entry lookup by identity — never by position. */
+          const entryFor = (clientId: string) =>
+            userMessage.meta?.attachments?.find(
+              (a) => a.attachment_id === attachmentIds.get(clientId),
+            );
+          const failed: string[] = [];
+          if (needsDocUpload) {
+            // In PARALLEL (2026-09-03), and a document that started
+            // uploading when it was attached (Composer.withEarlyUpload)
+            // is only awaited, not sent twice. Five 60 MB files used to
+            // upload one after another on the send's critical path.
+            const settled = await Promise.allSettled(
+              uploadable.map(async (doc) => {
+                // F11: an early upload belongs to the conversation it was
+                // started in. A file attached in chat A and sent from chat B
+                // must not ride A's upload id into B's request — the bytes
+                // are re-sent under THIS conversation instead.
+                const early =
+                  doc.uploadPromise &&
+                  ((doc as EarlyUpload).uploadConversationId ?? conversationId) ===
+                    conversationId
+                    ? await doc.uploadPromise
+                    : null;
+                let ref = early;
+                if (!ref) {
+                  // Reuse paths may carry only base64; the picker always
+                  // keeps the File. Either way the server gets real bytes.
+                  const src =
+                    doc.file ??
+                    new File(
+                      [Uint8Array.from(atob(doc.base64), (c) => c.charCodeAt(0))],
+                      doc.name,
                     );
-                  }
-                  // Link EACH file the moment it lands, not all of them once
-                  // the slowest has. A 400 MB video that never finishes must
-                  // not cost the 20 MB one next to it its identity: with the
-                  // id saved, the turn can be resent after a reload and the
-                  // analysis the server already ran stays reachable.
-                  const entry = userMessage.meta?.attachments?.[i];
-                  if (entry && !entry.id) {
-                    entry.id = ref.upload_id;
-                    persist(conversationId, turns);
-                  }
-                  return ref;
-                }),
-              );
-              docRefs = refs.slice(0, docAttachments.length);
-              videoRefs = refs.slice(docAttachments.length);
-              if (!docRefs.length) docRefs = null;
-              if (!videoRefs.length) videoRefs = null;
-              uploadedId = undefined; // ids already linked, one per document
+                  ref = await uploadDocumentFile(
+                    src,
+                    conversationId,
+                    doc.kind === 'video' ? 'video' : 'document',
+                  );
+                }
+                // Link EACH file the moment it lands, not all of them once
+                // the slowest has. A 400 MB video that never finishes must
+                // not cost the 20 MB one next to it its identity: with the
+                // id saved, the turn can be resent after a reload and the
+                // analysis the server already ran stays reachable.
+                const entry = entryFor(doc.clientId);
+                if (entry) {
+                  entry.id = ref.upload_id;
+                  entry.upload_state = 'uploaded';
+                  persist(conversationId, turns);
+                }
+                return { doc, ref };
+              }),
+            );
+            const landed = new Map<string, { upload_id: string; name: string }>();
+            settled.forEach((outcome, i) => {
+              const doc = uploadable[i];
+              if (outcome.status === 'fulfilled') {
+                landed.set(doc.clientId, {
+                  upload_id: outcome.value.ref.upload_id,
+                  name: doc.name,
+                });
+                return;
+              }
+              failed.push(doc.name);
+              const entry = entryFor(doc.clientId);
+              if (entry && !entry.id) {
+                // The browser's word, and provisional: the bytes stopped
+                // arriving. Whether the session can still be resumed is the
+                // server's to answer.
+                entry.upload_state = 'interrupted';
+              }
+            });
+            persist(conversationId, turns);
+            docRefs = docAttachments
+              .map((d) => landed.get(d.clientId))
+              .filter((r): r is { upload_id: string; name: string } => Boolean(r));
+            videoRefs = videoAttachments
+              .map((v) => landed.get(v.clientId))
+              .filter((r): r is { upload_id: string; name: string } => Boolean(r));
+            if (!docRefs.length) docRefs = null;
+            if (!videoRefs.length) videoRefs = null;
+            if (landed.size > 0) {
               toast(
-                refs.length === 1
-                  ? `Uploaded ${uploadable[0].name}.`
-                  : `Uploaded ${refs.length} ${videoAttachments.length ? 'files' : 'documents'}.`,
+                landed.size === 1
+                  ? `Uploaded ${[...landed.values()][0].name}.`
+                  : `Uploaded ${landed.size} ${videoAttachments.length ? 'files' : 'documents'}.`,
               );
-            } else {
+            }
+          } else {
+            try {
               const form = new FormData();
               form.append('file', first.file as File);
               form.append('conversation_id', conversationId);
@@ -1264,29 +1829,37 @@ export function ChatApp() {
                 upload_id?: string;
               };
               if (!res.ok) throw new Error(body.detail ?? 'upload failed');
-              uploadedId = body.upload_id;
+              // Link the turn to the server's durable uploads row, so the
+              // persisted message names the exact attachment it was asked
+              // about.
+              const entry = userMessage.meta?.attachments?.[0];
+              if (body.upload_id && entry) {
+                entry.id = body.upload_id;
+                entry.upload_state = 'uploaded';
+                persist(conversationId, turns);
+              }
               toast(
                 `Profiled ${body.files ?? 0} file${body.files === 1 ? '' : 's'} from ${first.name}.`,
               );
+            } catch (err) {
+              toast(
+                err instanceof Error ? err.message : 'That dataset could not be read.',
+                'error',
+              );
+              // The name, never the upstream sentence: this is persisted and
+              // exported, so it has to be copy we wrote. The server's own
+              // words go to the toast, where they are read once.
+              failed.push(first?.name ?? 'the file');
+              const entry = userMessage.meta?.attachments?.[0];
+              if (entry && !entry.id) entry.upload_state = 'interrupted';
             }
-            // Link the turn to the server's durable uploads row, so the
-            // persisted message names the exact attachment it was asked about.
-            if (uploadedId && userMessage.meta?.attachments?.[0]) {
-              userMessage.meta.attachments[0].id = uploadedId;
-              persist(conversationId, turns);
-            }
-            // H-01: the upload is done; the stream opened below owns the
-            // "busy" story from here.
-            setDatasetUpload(null);
-          } catch (err) {
-            toast(
-              err instanceof Error ? err.message : 'That dataset could not be read.',
-              'error',
-            );
-            // The dataset never made it in, so generating would answer from a
-            // context that doesn't exist. H-01: the turn STAYS on screen with
-            // its prompt and its file, now marked failed — the user's words
-            // must not vanish because a request did.
+          }
+
+          if (failed.length > 0) {
+            // The request does NOT go out. Sending it would ask the model
+            // about files it cannot see, and quietly sending the subset that
+            // did land is exactly the silent loss this rewrite is about: the
+            // person is told which file is missing and chooses.
             if (conversationId === activeIdRef.current) {
               setDatasetUpload({
                 conversationId,
@@ -1294,27 +1867,36 @@ export function ChatApp() {
                 status: 'failed',
               });
             }
-            // Un-persist the attachment metadata the server never accepted:
-            // other devices must not see a card for a file that is not
-            // there. Files that DID land keep their card and their id. (The
-            // local pdfName chip stays, next to the error toast, as before.)
-            if (userMessage.meta?.attachments) {
-              const landed = userMessage.meta.attachments.filter((a) => a.id);
-              if (landed.length) userMessage.meta.attachments = landed;
-              else delete userMessage.meta.attachments;
-            }
-            userMessage.meta = { ...(userMessage.meta ?? {}), send_state: 'failed' };
+            userMessage.meta = {
+              ...(userMessage.meta ?? {}),
+              intent: {
+                id: intentId,
+                state: 'unsent',
+                reason:
+                  failed.length === 1
+                    ? `${failed[0]} could not be uploaded, so nothing was sent.`
+                    : `${failed.join(', ')} could not be uploaded, so nothing was sent.`,
+              },
+            };
             persist(conversationId, turns);
+            pendingSendRef.current.delete(conversationId);
             return;
           }
-          // Every upload is in: the request goes out now, so the turn is no
-          // longer "not sent yet". Saved before the stream opens, because a
-          // reload between the two must find the marker gone.
-          if (userMessage.meta?.send_state) {
-            delete userMessage.meta.send_state;
-            persist(conversationId, turns);
-          }
+          // H-01: the upload is done; the stream opened below owns the
+          // "busy" story from here.
+          setDatasetUpload(null);
+          // Every upload is in: the request goes out now. Saved before the
+          // stream opens, because a reload between the two must find a turn
+          // that says the request is on its way — with an id to ask about.
+          userMessage.meta = {
+            ...(userMessage.meta ?? {}),
+            intent: { id: intentId, state: 'submitting' },
+          };
+          persist(conversationId, turns);
+          pendingSendRef.current.delete(conversationId);
           void startStream({
+            intentId,
+            intentMessageId: userMessage.id,
             conversationId,
             turns,
             context,
@@ -1363,6 +1945,7 @@ export function ChatApp() {
             const entry = userMessage.meta?.attachments?.[0];
             if (entry && !entry.id) {
               entry.id = ref.upload_id;
+              entry.upload_state = 'uploaded';
               persist(conversationId, turns);
             }
           } catch {
@@ -1371,6 +1954,8 @@ export function ChatApp() {
         })();
       }
       void startStream({
+        intentId,
+        intentMessageId: userMessage.id,
         conversationId,
         turns,
         context,
@@ -1467,7 +2052,7 @@ export function ChatApp() {
 
   /** Re-run the turn that produced the assistant message at `messageId`. */
   const runRegenerate = useCallback(
-    async (messageId: string) => {
+    async (messageId: string, options?: { allowPartial?: boolean }) => {
       const id = activeIdRef.current;
       if (!id || isStreaming(id)) return;
       const all = messagesRef.current;
@@ -1493,13 +2078,17 @@ export function ChatApp() {
       // was re-asked "what's in this invoice?" with no invoice attached; and
       // until 2026-09-03 a four-document turn was re-asked with one.
       const resend = resendOptionsFor(view[userIdx]);
-      if (resend.missing) {
+      if (resend.missing && !options?.allowPartial) {
         toast(
           'Re-attach the file to regenerate this answer — its contents are no longer in memory.',
           'error',
         );
         return;
       }
+      // `allowPartial` is the person choosing, explicitly, to send with the
+      // files that DID land ("Send with small.mp4" on the unsent notice).
+      // Never a default: sending a subset without being asked is precisely
+      // the silent loss the notice exists to prevent.
 
       // In a conversation that has versions, truncating would delete the
       // OTHER branches too — they live in the same flat list. So the retry is
@@ -1534,6 +2123,11 @@ export function ChatApp() {
       setStreaming(true);
       setEditingMessageId(null);
       void startStream({
+        // The SAME send when this is a retry of one that never landed, a new
+        // one when the person is asking for a different answer to a question
+        // that already has one.
+        intentId: intentForRetry(view[userIdx]),
+        intentMessageId: view[userIdx].id,
         conversationId: id,
         turns,
         context,
@@ -1618,6 +2212,19 @@ export function ChatApp() {
       }
 
       const version = branchForVersion(all, original);
+      /**
+       * The rewrite inherits the turn's attachments and its quote, but NOT
+       * its send history (F15a): `intent` and the 2026-09-09 `send_state`
+       * describe an attempt at the ORIGINAL question. Copied onto a new
+       * version they resurface as "this message was never sent" over an
+       * answered turn, and their intent id would make the server replay the
+       * old answer.
+       */
+      const inherited = metaWithBranch(original.meta, version);
+      if (inherited) {
+        delete inherited.intent;
+        delete inherited.send_state;
+      }
       const edited: ChatMessage = {
         id: newId(),
         role: 'user',
@@ -1629,7 +2236,7 @@ export function ChatApp() {
         imageDataUrl: original.imageDataUrl,
         imageDataUrls: original.imageDataUrls,
         pdfName: original.pdfName,
-        meta: metaWithBranch(original.meta, version),
+        meta: inherited,
         createdAt: Date.now(),
       };
 
@@ -1662,6 +2269,10 @@ export function ChatApp() {
       setUnreachable(false);
       setStreaming(true);
       void startStream({
+        // A rewrite is a DIFFERENT question, so it is a different send: a new
+        // intent, on the new version's own turn.
+        intentId: newIntentId(),
+        intentMessageId: edited.id,
         conversationId: id,
         turns,
         context,
@@ -1797,6 +2408,10 @@ export function ChatApp() {
     setStreaming(true);
     const context = view.slice(0, userIdx + 1);
     void startStream({
+      // A retry of a send that failed is the same send (F14): the server
+      // attaches to what it has rather than starting a second generation.
+      intentId: intentForRetry(view[userIdx]),
+      intentMessageId: view[userIdx].id,
       conversationId: id,
       // Retrying must not drop the other branches from storage, so a branched
       // conversation keeps its whole list and the answer is appended.
@@ -1861,42 +2476,29 @@ export function ChatApp() {
         setLoadingId(cachedMessages.length === 0 ? id : null);
         setStreaming(false);
         if (serverActiveRef.current.includes(id)) {
-          // Still generating server-side (started before a reload) — re-join.
+          // Still generating server-side (started before a reload) — re-join,
+          // and let attachOrExplain decide what each way of failing means:
+          // "finished" (load the answer) is only ever the server's 404, never
+          // a 502 or a dead socket (F3).
           setStreaming(true);
-          void attachStream(id).then((ok) => {
-            if (!ok && activeIdRef.current === id) {
-              setStreaming(isStreaming(id));
-              void store.load(id, { force: true }).then((conv) => {
-                if (conv && activeIdRef.current === id && !isStreaming(id)) {
-                  setMessages(conv.messages);
-                }
-                // Settled either way: a chat we could not load is not still
-                // loading, and must not sit under a spinner for ever.
-                settleLoading(id);
-              });
-            }
-          });
+          void attachOrExplain(id);
         } else {
-          // Server truth may be newer / not cached yet (V2 §4b); force a
-          // refetch when the chat ends on a user message — a detached
-          // generation may have saved its answer while we were away.
-          const force = cached?.messages.at(-1)?.role === 'user';
-          void store.load(id, { force }).then((conv) => {
-            // The identity guard is what makes a late answer harmless: click
-            // A then B, and A's response finds activeIdRef pointing at B and
-            // does nothing at all — neither its messages nor its loader.
-            if (conv && activeIdRef.current === id && !isStreaming(id)) {
-              setMessages(conv.messages);
-            }
-            settleLoading(id);
-          });
+          // Server truth may be newer / not cached yet (V2 §4b). The full
+          // reconciliation runs here rather than a bare load: a chat reopened
+          // after a restart may have an interrupted request waiting to be
+          // resumed, and only asking can tell.
+          //
+          // The identity guard inside it is what makes a late answer
+          // harmless: click A then B, and A's response finds activeIdRef
+          // pointing at B and does nothing at all.
+          void reconcileConversation(id).finally(() => settleLoading(id));
         }
       }
       if (window.matchMedia('(max-width: 767px)').matches) {
         setSidebarOpen(false);
       }
     },
-    [setUrlConversation, settleLoading],
+    [attachOrExplain, reconcileConversation, setUrlConversation, settleLoading],
   );
 
   const renameConversation = useCallback(
@@ -2162,6 +2764,9 @@ export function ChatApp() {
    */
   const rowApi = {
     regenerate,
+    sendWithLanded: (messageId: string) => {
+      void runRegenerate(messageId, { allowPartial: true });
+    },
     reuseAttachment,
     startEdit,
     cancelEdit,
@@ -2186,6 +2791,7 @@ export function ChatApp() {
     const handlers: RowHandlers = {
       onRegenerate: () => rowApiRef.current.regenerate(id),
       onRetry: () => rowApiRef.current.regenerate(id),
+      onSendWithLanded: () => rowApiRef.current.sendWithLanded(id),
       onReuseAttachment: (index) => {
         void rowApiRef.current.reuseAttachment(id, index);
       },
@@ -2503,24 +3109,28 @@ export function ChatApp() {
                 // so a memoized row re-renders when its own turn changes and
                 // at no other time.
                 const on = rowHandlers(m.id);
-                // A user turn still marked "not sent yet" at the END of the
-                // thread, with nothing streaming, never went out: the page
-                // closed while its files were uploading. Say so, and offer
-                // Send now when every file it names is on the server.
-                const unsent =
-                  m.role === 'user' &&
-                  m.meta?.send_state &&
-                  i === thread.length - 1 &&
-                  !isStreaming(activeId) &&
-                  datasetUpload?.messageId !== m.id
-                    ? unsentTurnState(m)
-                    : null;
+                // What this turn's SEND is doing, decided in one place from
+                // the intent, the server's answer and this tab's own work —
+                // never from "there is no stream here" (F1/F2).
+                const turnView = userTurnView(m, {
+                  isLast: i === thread.length - 1,
+                  streamingHere: isStreaming(activeId),
+                  serverBusy: Boolean(activeId && serverActive.includes(activeId)),
+                  uploadingHere:
+                    datasetUpload?.messageId === m.id &&
+                    datasetUpload.status === 'uploading',
+                  reconciling,
+                  statusUnknown,
+                  reconnect,
+                });
                 return (
                 <MessageRow
                   key={m.id}
                   message={m}
                   isLast={i === thread.length - 1 && m.role === 'assistant'}
-                  unsent={unsent}
+                  turn={turnView}
+                  onStopTurn={stopStreaming}
+                  onSendWithLanded={on.onSendWithLanded}
                   onRegenerate={on.onRegenerate}
                   onRetry={on.onRetry}
                   onReuseAttachment={on.onReuseAttachment}

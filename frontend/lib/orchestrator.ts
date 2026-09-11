@@ -71,6 +71,18 @@ export interface ChatRequestBody {
    * the resume it exists to enable.
    */
   clarification?: Record<string, unknown>;
+  /**
+   * 2026-09-10 (upload reliability): the browser's id for THIS logical send,
+   * minted when Send was pressed and reused by every retry of the same turn.
+   *
+   * Forwarded verbatim, and only when present. It is what makes a send
+   * idempotent end to end: the orchestrator records it in `chat_requests`, so
+   * a second POST carrying it attaches to the generation that already exists,
+   * replays a finished answer, or resumes an interrupted one — instead of
+   * cancelling the first generation and starting a second (docs/upload-
+   * reliability/API.md, POST /chat).
+   */
+  intent_id?: string;
 }
 
 /** Body the orchestrator's POST /chat endpoint accepts (§10 + V2 §1 + V8). */
@@ -96,6 +108,8 @@ export interface OrchestratorChatRequest {
   images?: string[];
   /** Salesforce Intelligence Mode: answer to a pending clarifying question. */
   clarification?: Record<string, unknown>;
+  /** The browser's send intent — see ChatRequestBody.intent_id. */
+  intent_id?: string;
 }
 
 /**
@@ -241,5 +255,8 @@ export function toOrchestratorChatRequest(
       : {}),
     // Salesforce Intelligence Mode: forwarded untouched when present.
     ...(body.clarification ? { clarification: body.clarification } : {}),
+    // Only when the browser minted one, so a client that predates intents
+    // keeps producing byte-identical requests and the server mints its own.
+    ...(body.intent_id ? { intent_id: body.intent_id } : {}),
   };
 }

@@ -108,6 +108,28 @@ class Chapter:
 CONTENT_TYPES = ("meeting", "lecture", "demo", "screen_recording", "interview", "other")
 
 
+@dataclass(frozen=True)
+class Limitation:
+    """One thing the analysis could NOT see, and the sentence that says so.
+
+    A stage that fails is recorded on the row, but the row is not what a
+    person reads: they read the summary and the answer. An unread screen and
+    a blank screen produce the same silence in both unless the limitation
+    travels with the understanding — so it does, from the stage that hit it
+    through fusion into `summary.md`.
+    """
+
+    stage: str
+    sentence: str
+
+    def to_json(self) -> dict:
+        return {"stage": self.stage, "sentence": self.sentence}
+
+    @classmethod
+    def from_json(cls, d: dict) -> "Limitation":
+        return cls(stage=str(d.get("stage") or ""), sentence=str(d.get("sentence") or "").strip())
+
+
 @dataclass
 class Understanding:
     """What the main model concluded from the whole evidence pack."""
@@ -125,10 +147,15 @@ class Understanding:
     not_covered: str = ""
     #: How it was produced: 'direct' (one pass) or 'map_reduce:N'.
     method: str = ""
+    #: Which stages could not contribute. Empty on a complete analysis; the
+    #: sentences are also folded into `not_covered`, because that is the
+    #: field every reader of an Understanding already looks at.
+    limitations: List[Limitation] = field(default_factory=list)
 
     def to_json(self) -> dict:
         d = asdict(self)
         d["chapters"] = [c.to_json() for c in self.chapters]
+        d["limitations"] = [lim.to_json() for lim in self.limitations]
         return d
 
     @classmethod
@@ -145,6 +172,9 @@ class Understanding:
             entities=_str_list(d.get("entities")),
             not_covered=str(d.get("not_covered") or ""),
             method=str(d.get("method") or ""),
+            limitations=[
+                Limitation.from_json(lim) for lim in (d.get("limitations") or []) if isinstance(lim, dict)
+            ],
         )
 
 

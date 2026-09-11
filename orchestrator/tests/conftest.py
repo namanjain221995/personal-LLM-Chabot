@@ -56,6 +56,10 @@ _APP_TABLES = (
     # V28 video: attachments carry a user FK (cascade) but a NULL-user row
     # (bare API call) would survive; the analysis table has no FK at all.
     "video_attachments",
+    # V29 (2026-09-10): upload sessions and send intents cascade from users
+    # and conversations, but naming them keeps a truncation explicit.
+    "upload_sessions",
+    "chat_requests",
     "video_analyses",
     # V8 web-search memory: web_results cascades from web_searches, but the
     # explicit order keeps TRUNCATE happy either way; web_pages is global.

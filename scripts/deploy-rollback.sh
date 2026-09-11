@@ -281,10 +281,17 @@ PREFIX="$(dr_compose_prefix)"
 ROLL_SERVICES=()
 while IFS=$'\t' read -r svc id; do [ -n "$svc" ] && ROLL_SERVICES+=("$svc"); done <<<"$TARGET_IMAGES"
 
+# A rollback recreates the same containers a deploy does, so it must drain the
+# same way. It did not: the grace-period audit was never run here, and nothing
+# waited for a chunked upload being finalised — the identical exposure as a
+# deploy, on the path taken when a deploy has already gone wrong and the box is
+# least able to absorb another cut request.
 dr_say "rollback: draining ${ROLL_SERVICES[*]}"
+"$HERE/deploy-drain.sh" check "${ROLL_SERVICES[@]}" || true
 for svc in "${ROLL_SERVICES[@]}"; do
   "$HERE/deploy-drain.sh" wait "$svc" --deadline "${DEPLOY_DRAIN_DEADLINE:-90}" --quiet-for 5 || true
 done
+"$HERE/deploy-drain.sh" uploads --deadline "${DEPLOY_FINALIZE_DEADLINE:-90}" || true
 
 # Re-point the mutable tags at the recorded ids. THIS is the promotion step: the
 # id is the authority and the tag is made to agree with it, never the reverse.

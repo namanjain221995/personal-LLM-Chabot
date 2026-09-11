@@ -14,7 +14,7 @@ from typing import AsyncIterator, List, Literal, Optional
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, ValidationError, field_validator, model_validator
 
 from . import context, db, llm
 from .auth import UserRow, require_user, router as auth_router
@@ -63,6 +63,10 @@ async def lifespan(_app: FastAPI):
     process can, and does, come up before its own database. Waiting turns a
     crash-restart loop into one clean start.
     """
+    # A fresh start is not a shutdown: the flag below outlives a lifespan in
+    # a process that starts the app more than once (the test client does).
+    global _shutting_down
+    _shutting_down = False
     await db.run_in_thread(db.wait_for_database)
     await db.run_in_thread(db.init_schema)
     # Identity baseline: the workspace exists and every user (including the
@@ -94,9 +98,36 @@ async def lifespan(_app: FastAPI):
     from . import web_worker
 
     web_worker.start()
+    # Durable send intents (2026-09-10, docs/upload-reliability/API.md). A
+    # generation lives in this process's memory; the request that started
+    # it lives in `chat_requests`. Every row still 'accepted'/'running' was
+    # held by a process that no longer exists (RC-3: a deploy, a crash, two
+    # reboots on 2026-09-10), so it is marked 'interrupted' HERE — before
+    # the video pipeline requeues its analyses, so a resumed turn never
+    # attaches to a job that is about to be restarted underneath it.
+    interrupted_requests = await _interrupt_open_requests()
+    if interrupted_requests:
+        logging.getLogger(__name__).info(
+            "marked %d chat request(s) interrupted by a restart", interrupted_requests
+        )
+    # A chunked upload left `finalizing` by a process that died mid-complete
+    # would otherwise wait forever on a finaliser that no longer exists.
+    reset_sessions = await _reset_stale_upload_finalisations()
+    if reset_sessions:
+        logging.getLogger(__name__).info(
+            "returned %d stale finalizing upload session(s) to uploading", reset_sessions
+        )
+    # Expired chunked sessions give their parts back on a timer (API.md,
+    # Expiry). In-process for the same reason the video maintenance loop is:
+    # the queue is a PostgreSQL column and the work is a directory listing.
+    sweep_task = asyncio.get_running_loop().create_task(
+        _upload_session_sweep_loop(), name="upload-session-sweep"
+    )
     # Video understanding (2026-09-09): requeue analyses a restart cut off
     # and drain the queue behind the app. Their stage files are on disk, so
-    # a resume costs only the stage that was interrupted.
+    # a resume costs only the stage that was interrupted. Since V29 the
+    # requeue is lease-aware: a row whose owner is still heartbeating is
+    # another live process's run, not an interrupted one.
     from .video import pipeline as video_pipeline
 
     await video_pipeline.start()
@@ -112,6 +143,19 @@ async def lifespan(_app: FastAPI):
     try:
         yield
     finally:
+        # Orderly shutdown (a deploy's rolling recreate) is the common way a
+        # generation dies. The rows are marked interrupted BEFORE the pool
+        # closes so the next process resumes them; the flag makes a worker
+        # cancelled by the loop teardown record 'interrupted' rather than
+        # 'cancelled' — nobody pressed Stop.
+        _shutting_down = True
+        interrupted_requests = await _interrupt_open_requests()
+        if interrupted_requests:
+            logging.getLogger(__name__).info(
+                "marked %d open chat request(s) interrupted for shutdown",
+                interrupted_requests,
+            )
+        sweep_task.cancel()
         await video_pipeline.stop()
         await web_worker.stop()
         await db.run_in_thread(db.close_pool)
@@ -130,6 +174,9 @@ _MAX_STREAM_PIECES = 20000
 
 #: Client-supplied conversation ids (same rule as POST /history/conversations).
 _CONVERSATION_ID_RE = _re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+#: A send intent (V29): browser-minted, one per press of Send, re-sent on
+#: every retry of that message. Same alphabet as a conversation id.
+_INTENT_ID_RE = _re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 app = FastAPI(title="TechSara Orchestrator", version="0.2.0", lifespan=lifespan)
 
@@ -228,6 +275,22 @@ class LiveGeneration:
         self.final_meta: Optional[dict] = None
         self.cancelled = False
         self.failed = False
+        # V29 durable intents: the send this generation answers, which
+        # attempt of it this is, and whether the answer is already durable
+        # (persisted by this process, keyed by generation_id). None/1/False
+        # for a generation built outside /chat (tests, direct callers).
+        self.intent_id: Optional[str] = None
+        self.attempt: int = 1
+        self.persisted = False
+        # The last status written to the chat_requests row, and the failure
+        # text a 'failed' row records — the same sentence the error event
+        # carried, never an upstream body.
+        self.request_status = "accepted"
+        self.error = ""
+        self.error_code = ""
+        # Cancelled because a NEWER message arrived for the conversation
+        # (not Stop): its followers get a terminal frame saying so.
+        self.replaced = False
 
     async def publish(self, event: str, data: dict) -> None:
         async with self.cond:
@@ -281,6 +344,11 @@ class LiveGeneration:
 # One live generation per conversation key. Finished generations are removed
 # immediately (attach on a finished one 404s and the client loads history).
 _live_generations: dict = {}
+
+#: Set by the lifespan's exit. A worker cancelled by the loop's teardown
+#: after this is an INTERRUPTED request (resumable by the next process),
+#: not a cancelled one — nobody pressed Stop.
+_shutting_down = False
 
 
 # Detached background-compaction tasks. Held so the event loop keeps a strong
@@ -351,6 +419,11 @@ async def _record_usage_event(
             "model_calls": int(tokens.get("calls") or 0),
             "context_tokens": context_meta.get("tokens_used"),
             "context_window": context_meta.get("window"),
+            # V29: which send intent and which attempt of it this turn was,
+            # so a resumed request's attempts can be joined in analytics.
+            # In `meta` rather than a column: the table's shape is settled.
+            "intent_id": gen.intent_id,
+            "attempt": int(gen.attempt),
         },
     )
 
@@ -367,6 +440,10 @@ async def _finalize_generation(conv_key: str, gen: LiveGeneration) -> None:
         and gen.user_id is not None
         and gen.conversation_id
         and gen.answer
+        # V29: a generation started by /chat persists its answer BEFORE
+        # `done` whether or not anyone is attached (_store_answer); this
+        # path is now the fallback for a generation without an intent row.
+        and not gen.persisted
     ):
         # This is the ONLY copy of the answer: nobody was attached when it
         # finished, so no client will persist it. A bare `suppress(Exception)`
@@ -472,6 +549,19 @@ class ChatRequest(BaseModel):
     # Absent → an ordinary send, which may still be READ as an answer when a
     # question is pending (engines/sf_intel.py decides, not the client).
     clarification: Optional[dict] = None
+    # V29 (2026-09-10): the send intent — minted by the browser when Send is
+    # pressed and re-sent on every retry of that message, so the server can
+    # attach to, replay or resume the generation it already has instead of
+    # starting another (docs/upload-reliability/API.md). Absent from old
+    # clients: the server mints one and keeps the event shapes they expect.
+    intent_id: Optional[str] = None
+
+    @field_validator("intent_id")
+    @classmethod
+    def _valid_intent_id(cls, value: Optional[str]) -> Optional[str]:
+        if value is not None and not _INTENT_ID_RE.fullmatch(value):
+            raise ValueError("intent_id must be 1-64 characters of [A-Za-z0-9_-]")
+        return value
 
     @property
     def pdf_data(self) -> Optional[str]:
@@ -840,6 +930,359 @@ async def get_report(
     return FileResponse(path, filename=filename, media_type=media_type)
 
 
+# ---------------------------------------------------------------------------
+# V29 durable send intents (docs/upload-reliability/API.md, CONTRACT.md).
+#
+# A generation is an in-process object; the REQUEST that started it is a
+# `chat_requests` row keyed by the browser's intent_id. The helpers below are
+# what /chat, /chat/attach, /chat/stop and /chat/requests share: the snapshot
+# a resume runs from, the registry lookup by generation_id, the durable
+# answer under a generation_id, and the row's status transitions.
+# ---------------------------------------------------------------------------
+
+#: Row states a resume may act on: 'interrupted' is what startup/shutdown
+#: write; 'accepted'/'running' with no live generation means the process
+#: lost it without getting to say so (a crash, a kill).
+_RESUMABLE_STATUSES = ("interrupted", "accepted", "running")
+
+#: Request fields that carry inline bytes. They are dropped from the stored
+#: snapshot: base64 images and PDFs belong on the upload rails, not in a
+#: jsonb column, and a turn that depended on them is marked not resumable.
+_INLINE_BYTE_FIELDS = ("image", "image_base64", "images", "pdf")
+
+
+def _request_snapshot(request: "ChatRequest") -> tuple[dict, bool]:
+    """The request as a resume would run it, and whether a resume CAN run it.
+
+    Upload references (`pdf_uploads`, `video_uploads`) are kept — their
+    bytes live on disk under ids that survive a restart. Inline bytes are
+    not kept, so a turn that carried them can only be retried from the
+    browser, which sends them again (see the known-intent path in /chat).
+    """
+    body = request.model_dump(exclude_none=True)
+    had_inline = bool(request.images_data or request.pdf_data)
+    for name in _INLINE_BYTE_FIELDS:
+        body.pop(name, None)
+    return body, not had_inline
+
+
+def _live_generation_for(generation_id: str) -> Optional["LiveGeneration"]:
+    """The registry entry running this generation, if it is still going.
+    The registry is keyed by conversation; a request row names a generation,
+    so this is the join between the two."""
+    for candidate in list(_live_generations.values()):
+        if candidate.generation_id == generation_id and not candidate.done:
+            return candidate
+    return None
+
+
+def _persisted_answer(conversation_id: str, generation_id: str) -> Optional[dict]:
+    """The assistant message stored for this generation, or None (thread)."""
+    row = db.get_message_by_generation(conversation_id, generation_id)
+    if row is None or row.get("role") != "assistant":
+        return None
+    return {"content": row["content"], "meta": row["meta"]}
+
+
+def _is_answer(stored: Optional[dict]) -> bool:
+    """A stored row is an ANSWER unless it is the failure record of a failed
+    attempt (`meta.error`, see _store_failure) — which must neither be
+    replayed as one nor reported as one."""
+    return stored is not None and "error" not in (stored.get("meta") or {})
+
+
+def _overwrite_persisted_answer(
+    conversation_id: str, generation_id: str, content: str, meta: Optional[dict]
+) -> None:
+    """Replace the text and meta of the message stored under this generation.
+
+    Reached only when the server's persist deduplicated against a row a
+    viewer stored first — a PARTIAL answer a tab persisted when it lost its
+    stream. The finished answer wins (db.add_message replace_existing).
+    """
+    with db.connection() as con:
+        con.execute(
+            "UPDATE messages SET content = %s, meta = %s "
+            "WHERE conversation_id = %s AND generation_id = %s AND role = 'assistant'",
+            (content, db._json_param(meta), conversation_id, generation_id),
+        )
+
+
+#: What a follower is told when its generation was cancelled because a newer
+#: message arrived for the conversation (ORCH-02). `code` is what the client
+#: keys on; the sentence is what a person reads.
+_REPLACED_SENTENCE = "This answer was replaced by a newer message."
+
+
+def _failure_sentence(exc: BaseException) -> tuple[str, str]:
+    """(sentence, code) for a generation that died on an exception — written
+    for a person, in the client's ErrorCategory vocabulary
+    (frontend/lib/errorTypes.ts). Never the exception's own text: that can
+    carry an internal hostname or an upstream body, and whatever goes on the
+    wire here is persisted to history and exported. The raw exception goes
+    to the server log, where an engineer looks (ORCH-01)."""
+    import httpx
+
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError, httpx.TimeoutException)):
+        return "The model did not answer in time. Please try again.", "TIMEOUT"
+    if isinstance(exc, (httpx.TransportError, ConnectionError)):
+        return (
+            "The model is temporarily unavailable. It may still be starting up — "
+            "please try again in a moment.",
+            "MODEL_UNAVAILABLE",
+        )
+    return "The answer could not be completed. Please try again.", "APPLICATION_ERROR"
+
+
+def _discard_failure_record(conversation_id: str, generation_id: str) -> None:
+    """Remove the failure record a previous attempt stored under this
+    generation (an assistant row whose meta carries `error`) — and ONLY
+    that: a real answer never has `meta.error`. A new attempt supersedes
+    the record, and leaving it would make the thread one row longer than
+    the viewer's copy, so its whole-thread PUT would be refused as a shrink."""
+    db.delete_failure_record(conversation_id, generation_id)
+
+
+def _retry_chat_request(intent_id: str, generation_id: str) -> Optional[dict]:
+    """A new attempt of a known intent under `generation_id` (in a thread).
+
+    db.resume_chat_request moves only an OPEN row (interrupted, or
+    accepted/running after a lost process). A finished one — failed,
+    cancelled, or completed with nothing durable to replay — is reopened
+    first: the person asked again, and one row per intent is the invariant,
+    so that same row carries the new attempt. A failed attempt's persisted
+    failure record is discarded with it.
+    """
+    row = db.get_chat_request(intent_id)
+    if row is None:
+        return None
+    # One conditional step: the row moves only from the generation this
+    # caller saw, so two callers racing to retry the same intent cannot both
+    # start an attempt — the loser reads the row unchanged and attaches to
+    # the winner's generation.
+    resumed = db.resume_chat_request(
+        intent_id,
+        generation_id,
+        reopen_finished=row["status"] in ("completed", "failed", "cancelled"),
+        expected_generation_id=row["generation_id"],
+    )
+    if row["status"] == "failed" and resumed is not None and resumed["generation_id"] == generation_id:
+        _discard_failure_record(row["conversation_id"], row["generation_id"])
+    return resumed
+
+
+async def _store_failure(gen: "LiveGeneration", partial: str, *, resumable: bool) -> None:
+    """Persist what a failed generation leaves behind: whatever streamed
+    before it died, and `meta.error` in the client's PersistedError shape
+    (frontend/lib/types.ts) — so a reload shows the failure and a Retry,
+    not a bare turn with no answer and no reason (ORCH-01). Same dedupe
+    and partial-overwrite rules as the answer itself."""
+    if gen.user_id is None or not gen.conversation_id:
+        return
+    meta = {
+        "generation_id": gen.generation_id,
+        "intent_id": gen.intent_id,
+        "attempt": gen.attempt,
+        "error": {
+            "message": gen.error,
+            "code": gen.error_code,
+            "status": None,
+            "resumable": bool(resumable),
+        },
+    }
+    try:
+        stored = await db.run_in_thread(
+            db.add_message, gen.user_id, gen.conversation_id, "assistant", partial, meta
+        )
+        if stored is not None and stored.get("deduplicated"):
+            await db.run_in_thread(
+                _overwrite_persisted_answer, gen.conversation_id, gen.generation_id, partial, meta
+            )
+    except Exception as exc:  # noqa: BLE001 — best-effort, but never silent
+        logging.getLogger(__name__).warning(
+            "failed to persist the failure record for conversation %s: %s: %s",
+            gen.conversation_id,
+            type(exc).__name__,
+            exc,
+        )
+
+
+async def _mark_chat_request(gen: "LiveGeneration", status: str, *, error: str = "") -> None:
+    """Write one status transition to the row. Best-effort and audible: the
+    row is bookkeeping about the answer, never a reason to lose it."""
+    if not gen.intent_id:
+        return
+    try:
+        await db.run_in_thread(db.set_chat_request_status, gen.intent_id, status, error=error)
+        gen.request_status = status
+    except Exception as exc:  # noqa: BLE001 — the answer must not depend on the row
+        logging.getLogger(__name__).log(
+            logging.DEBUG if _shutting_down else logging.WARNING,
+            "chat request %s: could not record status %s: %s: %s",
+            gen.intent_id,
+            status,
+            type(exc).__name__,
+            exc,
+        )
+
+
+async def _settle_chat_request(gen: "LiveGeneration") -> None:
+    """The row's terminal status, from the worker's `finally` — so it runs
+    for a completed answer, a cancelled one and a failed one alike."""
+    if not gen.intent_id:
+        return
+    if gen.cancelled and gen.request_status == "cancelled":
+        return  # an acknowledged Stop stays a Stop, even during shutdown
+    if gen.cancelled:
+        status = "interrupted" if _shutting_down else "cancelled"
+    elif gen.failed:
+        status = "failed"
+    else:
+        status = "completed"
+    if gen.request_status == status:
+        return  # the success path (or /chat/stop) already wrote it
+    error = ""
+    if status == "failed":
+        error = gen.error
+    elif status == "cancelled" and gen.replaced:
+        error = "replaced by a newer message"
+    await _mark_chat_request(gen, status, error=error)
+
+
+async def _store_answer(gen: "LiveGeneration") -> None:
+    """Make the answer durable under its generation_id, whoever is attached.
+
+    Before V29 the server persisted only when NOBODY was attached and left
+    the rest to the viewer — and a viewer is a browser tab, which closes,
+    reloads and loses its network (RC-2). So the server persists ALWAYS,
+    before `done` goes out: when the browser sees the terminal event the
+    answer is already in history. No duplicate can follow: db.add_message
+    dedupes on the (conversation, generation_id) unique index, and the
+    viewer's whole-thread PUT (db.replace_messages) carries this
+    generation_id exactly once.
+    """
+    if not gen.answer or gen.user_id is None or not gen.conversation_id:
+        return
+    meta = dict(gen.final_meta or {})
+    meta.setdefault("generation_id", gen.generation_id)
+    log = logging.getLogger(__name__)
+    try:
+        stored = await db.run_in_thread(
+            db.add_message, gen.user_id, gen.conversation_id, "assistant", gen.answer, meta
+        )
+        if stored is None:
+            log.warning(
+                "answer for conversation %s was not stored: no such conversation for user %s",
+                gen.conversation_id,
+                gen.user_id,
+            )
+            return
+        if stored.get("deduplicated"):
+            # A row under this generation_id already existed — which can only
+            # be a viewer's mid-stream copy (the server persists before
+            # `done`, so no client has finalized yet). Its text may be
+            # truncated and its meta is the leading one plus whatever the
+            # tab folded in; the finished answer with the engine's meta
+            # (route, sources, report files) is the durable copy.
+            await db.run_in_thread(
+                _overwrite_persisted_answer,
+                gen.conversation_id,
+                gen.generation_id,
+                gen.answer,
+                meta,
+            )
+    except Exception as exc:  # noqa: BLE001 — best-effort, but never silent
+        log.warning(
+            "failed to persist the answer for conversation %s: %s: %s",
+            gen.conversation_id,
+            type(exc).__name__,
+            exc,
+        )
+        return
+    gen.persisted = True
+
+
+async def _interrupt_open_requests() -> int:
+    """Startup and shutdown: every request this process could have been
+    running is now 'interrupted'. Never raises — a reconciliation that
+    fails must be logged, not turned into a boot loop."""
+    try:
+        return int(await db.run_in_thread(db.interrupt_open_chat_requests))
+    except Exception:  # noqa: BLE001
+        logging.getLogger(__name__).warning(
+            "could not mark open chat requests interrupted", exc_info=True
+        )
+        return 0
+
+
+#: How often expired chunked upload sessions are swept (seconds).
+_UPLOAD_SWEEP_INTERVAL_S = 600.0
+#: A `finalizing` session untouched for this long belongs to a finaliser
+#: that died; a live one keeps bumping updated_at while it assembles.
+_STALE_FINALIZING_S = 600.0
+
+
+async def _reset_stale_upload_finalisations() -> int:
+    """Startup: sessions a dead process left `finalizing` go back to
+    `uploading`, parts intact, so the next `complete` can finish them."""
+    try:
+        return int(
+            await db.run_in_thread(db.reset_stale_finalizing_upload_sessions, _STALE_FINALIZING_S)
+        )
+    except Exception:  # noqa: BLE001
+        logging.getLogger(__name__).warning(
+            "could not reset stale finalizing upload sessions", exc_info=True
+        )
+        return 0
+
+
+async def _upload_session_sweep_loop() -> None:
+    """Every ten minutes, reclaim the parts of chunked sessions past their
+    TTL (uploads.sweep_expired_upload_sessions). Imported lazily: uploads
+    imports this module's neighbours, and a cycle at import time is exactly
+    the kind of failure that shows up only on a cold start."""
+    while True:
+        await asyncio.sleep(_UPLOAD_SWEEP_INTERVAL_S)
+        try:
+            from . import uploads
+
+            swept = await asyncio.to_thread(uploads.sweep_expired_upload_sessions)
+            if swept:
+                logging.getLogger(__name__).info("swept %d expired upload session(s)", swept)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logging.getLogger(__name__).warning("upload session sweep failed", exc_info=True)
+
+
+def _sse_response(frames: AsyncIterator[str]) -> StreamingResponse:
+    return StreamingResponse(
+        frames,
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+async def _replay_frames(row: dict, stored: dict, session_id: str) -> AsyncIterator[str]:
+    """A completed intent, streamed again from history: the leading meta,
+    the answer as ONE token, the persisted meta, `done` — the events a live
+    answer would have ended with, so the browser's stream code needs no
+    second path. The ids ride on the final meta too: a viewer's persist
+    keys on `meta.generation_id`, and history's copy may have been stored
+    by a client that dropped them."""
+    ids = {
+        "generation_id": row["generation_id"],
+        "intent_id": row["intent_id"],
+        "attempt": int(row.get("attempt") or 1),
+    }
+    yield sse_event("meta", ids)
+    yield sse_event("token", {"text": stored.get("content") or ""})
+    meta = stored.get("meta")
+    if isinstance(meta, dict) and meta:
+        yield sse_event("meta", {**meta, **ids})
+    yield sse_event("done", {"session_id": session_id})
+
+
 @app.post("/chat")
 async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse:
     """Stream SSE events (§10 + V2-DESIGN §2/§3a/§3b).
@@ -924,6 +1367,16 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
         raise HTTPException(status_code=401, detail="Sign in required.")
     signed_in = principal.as_user_row()
     viewer = int(signed_in["id"])
+
+    # V29: the send intent this request belongs to, and the snapshot a resume
+    # would run from — taken BEFORE the feature gate below rewrites the
+    # request, so a resume re-applies whatever the account may use THEN.
+    # `client_intent` gates the additive event shapes (the leading meta, the
+    # ids on the final meta): a client that minted no intent cannot use
+    # them, and keeps the exact event order it was built on.
+    client_intent = request.intent_id is not None
+    intent_id = request.intent_id or uuid.uuid4().hex
+    snapshot, resumable = _request_snapshot(request)
 
     # FEATURE ACCESS (V17, authn/features.py). The composer only offers what
     # this person may use, but the composer is not the gate: rewrite the
@@ -1019,9 +1472,77 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
         if conv_owner != viewer:
             raise HTTPException(status_code=404, detail="conversation not found")
 
+    # DURABLE INTENT (V29). Record the send before anything runs, so the
+    # request survives the process that accepted it (RC-3). A KNOWN intent
+    # never starts a second generation for the same question: it attaches
+    # to the live one, replays the durable answer, or — when the process
+    # that held it is gone — runs a new attempt under a new generation_id.
+    from . import metrics as _metrics
+
+    gen = LiveGeneration(request.conversation_id, viewer)
+    gen.intent_id = intent_id
+    row = await db.run_in_thread(
+        db.create_chat_request,
+        intent_id,
+        viewer,
+        conv_key_outer,
+        gen.generation_id,
+        snapshot,
+        resumable=resumable,
+    )
+    resumed = False
+    if row is None:
+        known = await db.run_in_thread(db.get_chat_request, intent_id)
+        if (
+            known is None
+            or int(known["user_id"]) != viewer
+            or known["conversation_id"] != conv_key_outer
+        ):
+            # Someone else's intent, or this person's from another
+            # conversation: one 409 for both, so the status code cannot say
+            # whether an id exists elsewhere.
+            _metrics.inc("chat_request_total", "chat requests by outcome", result="conflict")
+            raise HTTPException(
+                status_code=409, detail="intent_id belongs to another conversation"
+            )
+        live = _live_generation_for(known["generation_id"])
+        if live is not None:
+            # accepted/running and still in this process: the same stream,
+            # buffer replayed from its leading meta.
+            _metrics.inc("chat_request_total", "chat requests by outcome", result="attached")
+            return _sse_response(live.follow())
+        if known["status"] == "completed":
+            stored = await db.run_in_thread(
+                _persisted_answer, conv_key_outer, known["generation_id"]
+            )
+            if _is_answer(stored):
+                _metrics.inc("chat_request_total", "chat requests by outcome", result="replayed")
+                return _sse_response(_replay_frames(known, stored, request.session_id))
+            # Completed with nothing durable to replay (an empty answer, or
+            # a persist that failed): the person asked again — answer again.
+        # interrupted / accepted / running with no live generation (the
+        # process that held it is gone), failed, cancelled: a new attempt.
+        # THIS body is what runs, not the snapshot — it carries whatever
+        # inline bytes the snapshot could not keep, so a retry from the
+        # browser works even where a server-side resume could not.
+        row = await db.run_in_thread(_retry_chat_request, intent_id, gen.generation_id)
+        if row is None or row["generation_id"] != gen.generation_id:
+            # Raced another retry of the same intent; that one owns it now.
+            other = _live_generation_for(row["generation_id"]) if row else None
+            if other is not None:
+                _metrics.inc("chat_request_total", "chat requests by outcome", result="attached")
+                return _sse_response(other.follow())
+            _metrics.inc("chat_request_total", "chat requests by outcome", result="conflict")
+            raise HTTPException(status_code=409, detail="intent_id is being retried")
+        resumed = True
+    gen.attempt = int(row.get("attempt") or 1)
+
     # A new send for a conversation that is still generating replaces the old
     # generation — the user's newest message wins. Only the owner's newest
-    # message: replacement must never cancel someone else's work.
+    # message: replacement must never cancel someone else's work. A retry of
+    # the SAME intent never reaches here while its generation is live (it
+    # attached above), so what is cancelled here is always a different
+    # question.
     previous = _live_generations.get(conv_key_outer)
     if (
         previous is not None
@@ -1029,10 +1550,38 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
         and previous.task is not None
         and previous.user_id == viewer
     ):
+        # ORCH-02: the cancelled generation's followers get a terminal frame
+        # (see the worker's CancelledError branch) instead of a stream that
+        # merely ends — which a client reads as "finished" and persists as a
+        # complete answer — and the log says which generation lost to which.
+        previous.replaced = True
+        logging.getLogger(__name__).info(
+            "generation %s (intent %s) in conversation %s replaced by generation %s (intent %s)",
+            previous.generation_id,
+            previous.intent_id,
+            conv_key_outer,
+            gen.generation_id,
+            intent_id,
+        )
         previous.task.cancel()
 
-    gen = LiveGeneration(request.conversation_id, viewer)
     _live_generations[conv_key_outer] = gen
+    # The FIRST event names the generation, so the browser can mark its turn
+    # accepted before a single token exists — and a re-attach, which replays
+    # the buffer, starts with it too. Published directly, not through
+    # emit(): it is not the engine's meta and must not count as one. The
+    # engine's final meta is still emitted last and still wins (the client
+    # replaces its meta on every meta event; frontend/lib/streams.ts).
+    if client_intent:
+        await gen.publish(
+            "meta",
+            {"generation_id": gen.generation_id, "intent_id": intent_id, "attempt": gen.attempt},
+        )
+    _metrics.inc(
+        "chat_request_total", "chat requests by outcome", result="resumed" if resumed else "accepted"
+    )
+    if resumed:
+        _metrics.inc("chat_request_resume_total", "chat requests resumed under a new attempt")
 
     # Filled in by the compaction pass; rides out on the final meta so the
     # context meter shows this session's real usage.
@@ -1072,6 +1621,10 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 **data,
                 **meta_extras(data.get("route")),
                 "generation_id": gen.generation_id,
+                # V29: the intent and attempt, on the meta that gets
+                # persisted with the answer — how a reloaded tab matches an
+                # answer to the send it belongs to.
+                **({"intent_id": gen.intent_id, "attempt": gen.attempt} if client_intent else {}),
             }
             # Every file an engine writes into the shared reports dir is
             # advertised on meta.report_files. Binding ownership HERE — the
@@ -1173,6 +1726,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             str(signed_in.get("workspace_name") or ""),
         )
         try:
+            await _mark_chat_request(gen, "running")
             if access_notice:
                 # One line, before any work: the tool the composer offered is
                 # off for this account, and the answer that follows is the
@@ -2182,6 +2736,11 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 knowledge_task.cancel()
             gen.answer = answer
             memory.add_exchange(scoped_session, text, answer)
+            # Durable BEFORE `done`: the row says 'completed' only once the
+            # answer is in history, so a status poll that follows the
+            # terminal event never reads "completed, nothing persisted".
+            await _store_answer(gen)
+            await _mark_chat_request(gen, "completed")
             await gen.publish("done", {"session_id": request.session_id})
 
             # Background compaction: fold early so the next turn almost never
@@ -2205,10 +2764,40 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 )
         except asyncio.CancelledError:
             gen.cancelled = True  # /chat/stop or replaced by a newer send
+            if gen.replaced:
+                # A follower whose stream simply ended would finalize the
+                # truncated text as a complete answer (ORCH-02). Shielded:
+                # the cancellation that brought us here must not cut the
+                # frame that explains it.
+                with contextlib.suppress(Exception):
+                    await asyncio.shield(
+                        gen.publish("error", {"message": _REPLACED_SENTENCE, "code": "replaced"})
+                    )
         except Exception as exc:  # terminal error event (§10)
             gen.failed = True
-            await gen.publish("error", {"message": str(exc)})
+            gen.error, gen.error_code = _failure_sentence(exc)
+            # ORCH-01: the operator's copy — ids and the exception, never the
+            # content. The person's copy is the safe sentence on the wire,
+            # on the row, and in the failure record persisted below.
+            logging.getLogger(__name__).warning(
+                "generation %s (intent %s, attempt %d) in conversation %s failed: %s: %s",
+                gen.generation_id,
+                gen.intent_id,
+                gen.attempt,
+                conv_key_outer,
+                type(exc).__name__,
+                str(exc)[:300],
+            )
+            await gen.publish("error", {"message": gen.error, "code": gen.error_code})
+            with contextlib.suppress(Exception):
+                await asyncio.shield(
+                    _store_failure(gen, "".join(streamed_text), resumable=resumable)
+                )
         finally:
+            # V29: the row's terminal status — cancelled, failed, or
+            # interrupted when the loop is tearing this process down.
+            with contextlib.suppress(Exception):
+                await asyncio.shield(_settle_chat_request(gen))
             # V18 telemetry. HERE rather than in emit(): this block is the one
             # that runs for every outcome, so a cancelled or failed turn is
             # counted as cancelled or failed instead of vanishing from the
@@ -2392,6 +2981,11 @@ async def chat_stop(body: StopRequest, http_request: Request) -> dict:
     if not _owns(gen, viewer):
         return {"stopped": False}  # not yours — indistinguishable from absent
     gen.task.cancel()
+    # V29: the row says so right away. The worker settles it again when the
+    # cancellation lands, but a status poll in between must not read
+    # 'running' for a generation whose Stop was just acknowledged. A viewer
+    # merely disconnecting never comes through here — that is not a cancel.
+    await _mark_chat_request(gen, "cancelled")
     return {"stopped": True}
 
 
@@ -2407,6 +3001,35 @@ async def chat_active(http_request: Request) -> dict:
             for k, g in _live_generations.items()
             if not g.done and _owns(g, viewer)
         ]
+    }
+
+
+@app.get("/chat/requests/{intent_id}")
+async def chat_request_status(intent_id: str, http_request: Request) -> dict:
+    """What the server knows about one send intent (V29).
+
+    The reconciliation a reloaded tab runs before it claims anything about
+    a turn: `live` says a generation for it is in THIS process's registry
+    right now; `answer_persisted` says an assistant message under its
+    generation_id is in history. Not yours → 404, never 403: a 403 would
+    confirm the id exists.
+    """
+    viewer = await _require_viewer(http_request)
+    row = await db.run_in_thread(db.get_chat_request, intent_id)
+    if row is None or int(row["user_id"]) != viewer:
+        raise HTTPException(status_code=404, detail="unknown intent")
+    stored = await db.run_in_thread(
+        _persisted_answer, row["conversation_id"], row["generation_id"]
+    )
+    return {
+        "intent_id": row["intent_id"],
+        "conversation_id": row["conversation_id"],
+        "status": row["status"],
+        "generation_id": row["generation_id"],
+        "attempt": int(row.get("attempt") or 1),
+        "resumable": bool(row.get("resumable")),
+        "answer_persisted": _is_answer(stored),
+        "live": _live_generation_for(row["generation_id"]) is not None,
     }
 
 
@@ -2474,10 +3097,47 @@ async def chat_attach(
     404 once it has finished — the answer is in history at that point."""
     viewer = await _require_viewer(http_request)
     gen = _live_generations.get(conversation_id)
-    if gen is None or gen.done or not _owns(gen, viewer):
+    if gen is not None and not gen.done and _owns(gen, viewer):
+        return StreamingResponse(
+            gen.follow(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+    # V29: nothing live here — but the conversation's newest request may be
+    # one the process that accepted it lost (a deploy, a reboot). When it is
+    # resumable, run it again from its stored snapshot under a new attempt
+    # and stream that; the browser's re-attach after a restart then gets an
+    # answer instead of a 404 it cannot tell from "finished" (RC-3). 404
+    # only when there is nothing live and nothing to resume.
+    latest = await db.run_in_thread(db.latest_chat_request, conversation_id)
+    if (
+        latest is None
+        or int(latest["user_id"]) != viewer
+        or latest["status"] not in _RESUMABLE_STATUSES
+        or not latest.get("resumable")
+    ):
         raise HTTPException(status_code=404, detail="no active generation")
-    return StreamingResponse(
-        gen.follow(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
+    try:
+        request = ChatRequest.model_validate(
+            {**(latest.get("request") or {}), "intent_id": latest["intent_id"]}
+        )
+    except ValidationError as exc:
+        # The snapshot no longer parses (a field the model dropped since it
+        # was stored): nothing can run it, so the row says so instead of
+        # answering 404 on every re-attach forever.
+        logging.getLogger(__name__).warning(
+            "chat request %s cannot be resumed from its snapshot: %s",
+            latest["intent_id"],
+            str(exc)[:200],
+        )
+        with contextlib.suppress(Exception):
+            await db.run_in_thread(
+                db.set_chat_request_status,
+                latest["intent_id"],
+                "failed",
+                error="the stored request could not be resumed",
+            )
+        raise HTTPException(status_code=404, detail="no active generation")
+    # The same door a retry from the browser uses: /chat finds the known
+    # intent with no live generation and runs a new attempt from this body.
+    return await chat(request, http_request)

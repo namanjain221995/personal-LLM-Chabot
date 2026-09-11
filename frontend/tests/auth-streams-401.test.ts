@@ -117,9 +117,28 @@ describe('the 8s active poll treats 401 as session death', () => {
     expect(redirects).toEqual(['/login']);
   });
 
-  it('an ordinary failure stays the quiet empty list', async () => {
+  /**
+   * T-01, 2026-09-10. This used to assert `resolves.toEqual([])` for a 503 —
+   * pinning the conflation that made "I could not ask the server" and
+   * "nothing is running on the server" the same answer. On a reload during
+   * the orchestrator's recreate window that skipped the re-attach and put the
+   * red "never sent" notice on a turn whose generation was running. "Could
+   * not ask" is now a rejection, and the app renders it as `status_unknown`.
+   */
+  it('an ordinary failure REJECTS — it is not an empty list', async () => {
     vi.stubGlobal('fetch', respond(503, { detail: 'down' }));
-    await expect(fetchServerActive()).resolves.toEqual([]);
+    await expect(fetchServerActive()).rejects.toMatchObject({ status: 503 });
+    expect(redirects).toHaveLength(0);
+  });
+
+  it('a dead network rejects too, with no status to report', async () => {
+    vi.stubGlobal(
+      'fetch',
+      async () => {
+        throw new TypeError('Failed to fetch');
+      },
+    );
+    await expect(fetchServerActive()).rejects.toMatchObject({ status: null });
     expect(redirects).toHaveLength(0);
   });
 

@@ -430,6 +430,14 @@ PY
     "$ROOT/scripts/deploy-drain.sh" wait "$svc" \
       --deadline "${DEPLOY_DRAIN_DEADLINE:-90}" --quiet-for 5 >>"$LOG" 2>&1 || true
   done
+  #     LAST, closest to the SIGTERM: chunked uploads being finalised. A
+  #     session killed mid-finalise sits `finalizing` until the next process's
+  #     startup hook returns it to `uploading`, and the person is watching a
+  #     spinner for the whole gap. It is bounded and advisory like everything
+  #     above - exit 2 means it gave up waiting, not that the deploy is unsafe.
+  "$ROOT/scripts/deploy-drain.sh" uploads \
+    --deadline "${DEPLOY_FINALIZE_DEADLINE:-90}" >>"$LOG" 2>&1 \
+    || say "  drain: an upload was still finalising when the deadline passed (see $LOG)"
 
   PRESERVE=1; [ "$FULL" = 1 ] && PRESERVE=
   say "  techsara up  (builds images, recreates changed services, staged health gates$([ -n "$PRESERVE" ] && printf '; main model preserved'))"

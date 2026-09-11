@@ -49,4 +49,25 @@ RUN mkdir -p /reports /data/parquet /data/lancedb /tmp/matplotlib /tmp/cache \
     && chown -R 10001:10001 /data
 
 EXPOSE 8080
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
+# --timeout-graceful-shutdown: how long uvicorn waits for in-flight
+# responses after SIGTERM before it force-closes them and runs the lifespan
+# shutdown hook. WITHOUT IT uvicorn waits forever, and an SSE stream may
+# legitimately run GEN_WALL_CLOCK_S (4,200 s in production) — so compose's
+# `stop_grace_period: 2m` expired first and SIGKILL landed before the hook
+# ever ran (INF-3). That hook is what marks open chat requests `interrupted`
+# and releases the video leases, so losing it is what left a restarted
+# generation with nothing to resume from.
+#
+# 90 s of the 120 s grace, leaving 30 s for the hook itself — whose own work
+# is bounded well inside that (video pipeline.stop() waits at most 5 s for
+# its runs, web_worker.stop() awaits one cancelled task, the pool close and
+# the interrupt UPDATE are single statements).
+#
+# What it means for a stream older than 90 s: it is cut. That is the
+# designed path, not a loss — the request row is marked `interrupted` by the
+# hook that now always runs, and the browser re-attaches through
+# GET /chat/requests/{intent_id} and GET /chat/attach/{conversation_id}
+# (docs/upload-reliability/API.md). A chunked part PUT cut the same way
+# leaves no accepted part and the client re-sends that one part.
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080", \
+     "--timeout-graceful-shutdown", "90"]

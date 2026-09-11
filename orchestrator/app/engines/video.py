@@ -262,14 +262,28 @@ async def _wait_for_analysis(row: dict, emit: Emit) -> dict:
     # because speech and screen are analysed side by side and a line that
     # flipped between them every second would read as two jobs fighting.
     running: Dict[str, Optional[float]] = {}
+    announced_remote = False
     try:
         while True:
             try:
                 event = await asyncio.wait_for(queue.get(), timeout=30.0)
             except asyncio.TimeoutError:
-                fresh = await pipeline.wait_for(analysis_id) if not pipeline.is_running(analysis_id) else None
-                if fresh is not None:
-                    return fresh
+                if pipeline.is_running(analysis_id):
+                    continue
+                fresh = await pipeline.wait_for(analysis_id)
+                if fresh is None or fresh.get("status") not in ("queued", "running"):
+                    return fresh if fresh is not None else row
+                # V29: the row is in flight but not in THIS process — another
+                # process holds its lease (a rolling recreate, a second
+                # orchestrator), so its progress is not ours to forward.
+                # Say so once, keep waiting, and re-ask the pipeline each
+                # round so this process claims the run the moment that
+                # lease lapses instead of answering from a row still marked
+                # 'running'.
+                if not announced_remote:
+                    await emit("status", {"text": "The video is being analysed by another worker…"})
+                    announced_remote = True
+                await pipeline.ensure_running(analysis_id)
                 continue
             stage = str(event.get("stage") or "")
             status = str(event.get("status") or "")

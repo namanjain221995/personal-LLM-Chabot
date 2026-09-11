@@ -272,3 +272,111 @@ groups:
         labels: { severity: warning }
         annotations:
           summary: "Data stores grew {{ $value | humanize1024 }}B in 24h"
+
+  # ------------------------------------------------------------------------
+  # Upload -> analysis -> answer (2026-09-11, docs/upload-reliability/).
+  #
+  # Until this group existed, nothing on this box could tell an operator that
+  # work was STUCK. Every other alert here answers "is a dependency down"; a
+  # video job frozen mid-transcript, a chat request no one resumed and a rail
+  # quietly expiring people's uploads are all invisible to a reachability
+  # probe, and each of them is a person waiting.
+  #
+  # WHERE THE NUMBERS COME FROM. The gauges are published by the orchestrator
+  # from its /health work snapshot (app/health._publish_work_gauges) and
+  # rendered on /metrics, which the `orchestrator` job scrapes every 15 s;
+  # /health itself is called at least every 15 s by the blackbox probe, so the
+  # values are at most a scrape or two stale. That is far inside every `for:`
+  # below. `upload_session_total` is a plain counter the upload rail already
+  # increments (app/uploads._count_session).
+  #
+  # None of these is a paging alert. They are all "go and look", because the
+  # remedy is always a human decision: resume, requeue, or leave it alone.
+  - name: upload-reliability
+    rules:
+      - alert: VideoAnalysisStalled
+        # `updated_at` on video_analyses moves on every stage transition and
+        # on the running stage's heartbeat, so this is "the most silent
+        # running job has said nothing for 30 minutes". A legitimate stage
+        # CAN be long — a 70-minute video's transcript is the worst case
+        # measured here, and it heartbeats throughout — so silence, not
+        # duration, is what this watches. 30 minutes is roughly double the
+        # longest observed gap between heartbeats on the slowest stage.
+        expr: video_running_stage_age_seconds > 1800
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "A video analysis has not changed stage for {{ $value | humanizeDuration }}"
+          description: >-
+            One of the running rows in video_analyses is frozen. The lease
+            keeps it from being requeued while its owner heartbeats, so a
+            wedged owner holds it until VIDEO_LEASE_TTL_S expires. Look at
+            GET /health -> work.video, then the orchestrator log for the
+            analysis id. A GPU fault in the Qwen GDN layer looks exactly like
+            this from out here.
+
+      - alert: ChatRequestsLeftInterrupted
+        # A restart marks every open request `interrupted`, so a deploy makes
+        # this non-zero BY DESIGN for as long as it takes the browsers to come
+        # back and resume. Ten minutes is the "nobody came back" line: the
+        # tabs that were going to reconnect have, and what is left is a person
+        # whose question is durable on the server and unanswered.
+        expr: chat_requests_interrupted > 0
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $value }} chat request(s) interrupted and not resumed for 10m"
+          description: >-
+            These are questions the server accepted and then lost to a
+            restart or a reboot. They are resumable — a browser re-attaching
+            with the same intent_id picks them up (docs/upload-reliability
+            /API.md) — but nothing resumes them on its own without a viewer.
+            Expected briefly after every deploy; sustained means the tabs are
+            gone and the people have not come back.
+
+      - alert: UploadSessionsExpiringInBursts
+        # Expiry is normal in ones: somebody closes a tab mid-upload and the
+        # session ages out 24 h later. Five in fifteen minutes is not that
+        # shape — it is a sweep or a restart reclaiming a batch, which is the
+        # signature F-01/INF-4 produced on 2026-09-09.
+        expr: increase(upload_session_total{result="expired"}[15m]) > 5
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $value | printf \"%.0f\" }} upload sessions expired in 15 minutes"
+          description: >-
+            Individual expiries are people closing tabs. A burst means the
+            rail is losing sessions together: check WORKSPACE_QUOTA_GB against
+            the /data volume, and the workspace sweep in
+            orchestrator/app/core/repo.py.
+
+      - alert: UploadStuckFinalizing
+        # `finalizing` is seconds of work (concatenate, hash, hard-link) even
+        # for a 4 GB video. Fifteen minutes of it means the finaliser died
+        # without the startup hook having run yet, and the person is watching
+        # a spinner that will never move.
+        expr: upload_sessions_open{state="finalizing"} > 0
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "An upload has been finalising for 15 minutes"
+          description: >-
+            Finalisation is a single bounded operation. A row stuck here is a
+            process that died mid-complete; the orchestrator's startup hook
+            (reset_stale_finalizing_upload_sessions) returns it to `uploading`
+            so the browser can resume, but only on the next start.
+
+      - alert: VideoQueueBacklog
+        # The pipeline runs a small number of analyses at a time and paces
+        # itself against live chat, so a queue is normal under load. A queue
+        # that is still there an hour later is not being drained.
+        expr: video_queue_depth{state="queued"} > 3
+        for: 1h
+        labels: { severity: info }
+        annotations:
+          summary: "{{ $value }} video analyses have been queued for an hour"
+          description: >-
+            Either the pipeline is paused behind chat (it yields to live
+            generations by design) or nothing is starting them. GET /health ->
+            work.video separates the two: a running count of zero with a queue
+            means nothing is starting.
