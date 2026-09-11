@@ -37,10 +37,13 @@ const ref: ArtifactRef = {
       inline_url: `/artifacts/${ID}/v/1/file/pptx?disposition=inline`,
     },
   ],
-  preview_kind: 'none',
-  preview_pages: 0,
-  preview_url: '',
-  thumbnail_url: '',
+  // A previewable deck: since 2026-09-12 (CONTRACT-2 §9) a card with
+  // nothing to preview is a download, not an Open, so a `none` fixture
+  // would have no button to open the panel with.
+  preview_kind: 'pages',
+  preview_pages: 9,
+  preview_url: `/artifacts/${ID}/v/1/preview`,
+  thumbnail_url: `/artifacts/${ID}/v/1/preview/1.png?w=240`,
   warnings: [],
   created_at: '2026-09-11T10:00:00Z',
   operation: 'create',
@@ -192,10 +195,56 @@ describe('the file panel splits the workspace, not the shell', () => {
     expect(panelColumn.style.flexBasis).toBe('50%');
     expect(panelColumn.style.width).toBe('');
     expect(panelColumn.className).not.toMatch(/\bshrink-0\b/);
-    expect(panelColumn.className).toMatch(/min-\[900px\]:min-w-0/);
-    // The thread keeps its 45 % of the SAME box.
+    // CONTRACT-2 §9: a column from `md` (768 px), a sheet below it (was 900).
+    expect(panelColumn.className).toMatch(/(^|\s)md:block(\s|$)/);
+    expect(panelColumn.className).toMatch(/(^|\s)md:min-w-0(\s|$)/);
+    expect(panelColumn.className).not.toMatch(/min-\[900px\]/);
+    // …and the pixel clamp: never under 520 (yielding on a narrow row) nor over 960.
+    expect(panelColumn.style.minWidth).toBe('min(520px, 62%)');
+    expect(panelColumn.style.maxWidth).toBe('960px');
+    // The thread shrinks to what the panel leaves and never forces an overflow.
     const conversationColumn = document.querySelector('[data-file-drop-zone]')!;
-    expect(conversationColumn.className).toMatch(/min-\[900px\]:min-w-\[45%\]/);
+    expect(conversationColumn.className).toMatch(/\bmin-w-0\b/);
+    expect(conversationColumn.className).toMatch(/\bflex-1\b/);
+  });
+
+  it('clamps the divider to 45–55 %: Home and End snap to the limits, arrows step by 2', async () => {
+    // CONTRACT-2 §9: "width clamp 45–55 %" (was 30–55).
+    await openDeck();
+    const divider = screen.getByRole('separator', { name: 'Resize the file panel' });
+    expect(divider.getAttribute('aria-valuemin')).toBe('45');
+    expect(divider.getAttribute('aria-valuemax')).toBe('55');
+    expect(divider.getAttribute('aria-valuenow')).toBe('50');
+    await act(async () => {
+      fireEvent.keyDown(divider, { key: 'End' });
+    });
+    expect(screen.getByTestId('artifact-panel-column').style.flexBasis).toBe('45%');
+    await act(async () => {
+      fireEvent.keyDown(divider, { key: 'ArrowRight' });
+    });
+    expect(screen.getByTestId('artifact-panel-column').style.flexBasis).toBe('45%');
+    await act(async () => {
+      fireEvent.keyDown(divider, { key: 'Home' });
+    });
+    expect(screen.getByTestId('artifact-panel-column').style.flexBasis).toBe('55%');
+    await act(async () => {
+      fireEvent.keyDown(divider, { key: 'ArrowRight' });
+    });
+    expect(screen.getByTestId('artifact-panel-column').style.flexBasis).toBe('53%');
+  });
+
+  it('marks the opened file\'s card as current and re-targets the same panel from another card', async () => {
+    await openDeck();
+    const card = screen.getByRole('button', { name: /Open Board deck \(PowerPoint/ });
+    expect(card.getAttribute('aria-current')).toBe('true');
+    expect(screen.getAllByTestId('artifact-panel').length).toBe(1);
+    expect(screen.getByTestId('artifact-panel-subtitle').textContent).toContain('PowerPoint · v1');
+    // Escape from the page closes it and focus lands back on the card.
+    await act(async () => {
+      fireEvent.keyDown(document.body, { key: 'Escape' });
+    });
+    expect(screen.queryByTestId('artifact-panel-column')).toBeNull();
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: /Open Board deck \(PowerPoint/ }));
   });
 
   it('closes from the panel and the shell is back to sidebar + workspace', async () => {

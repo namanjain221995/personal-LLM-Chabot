@@ -13,21 +13,33 @@ import {
   ArtifactRequestError,
   artifactUrls,
   cardDomId,
+  fileCardDomId,
+  fileDownloadUrl,
   fileExtent,
+  fileKey,
+  fileMatchesKey,
+  filePreviewUrl,
+  formatLabel,
   isArtifactId,
+  isFileId,
+  isPreviewable,
   isTerminal,
+  legacyFileKey,
   nextDelay,
   pollJob,
   POLL_MAX_MS,
   POLL_MIN_MS,
+  previewKindFor,
   primaryFile,
+  reportFileUrl,
   stageLabel,
   statusLine,
 } from '@/lib/artifacts';
-import type { ArtifactJob, ArtifactRef } from '@/lib/types';
+import type { ArtifactFile, ArtifactJob, ArtifactRef } from '@/lib/types';
 
 const ID = 'a3f9c2d1e4b5f6a7b8c9d0e1f2a3b4c5';
 const JOB = 'ffffffffffffffffffffffffffffffff';
+const FILE_ID = '0123456789abcdef';
 
 const ref = (over: Partial<ArtifactRef> = {}): ArtifactRef => ({
   artifact_id: ID,
@@ -65,6 +77,15 @@ describe('URLs', () => {
     expect(artifactUrls.version(ID, 2)).toBe(`/api/artifacts/${ID}/v/2`);
     expect(artifactUrls.file(ID, 2, 'pptx')).toBe(`/api/artifacts/${ID}/v/2/file/pptx?disposition=attachment`);
     expect(artifactUrls.file(ID, 2, 'pdf', 'inline')).toBe(`/api/artifacts/${ID}/v/2/file/pdf?disposition=inline`);
+    // CONTRACT-2 §1: csv is a format; §2: files by id, the zip, the grid.
+    expect(artifactUrls.file(ID, 2, 'csv')).toBe(`/api/artifacts/${ID}/v/2/file/csv?disposition=attachment`);
+    expect(artifactUrls.fileById(ID, 2, FILE_ID)).toBe(`/api/artifacts/${ID}/v/2/f/${FILE_ID}?disposition=attachment`);
+    expect(artifactUrls.fileById(ID, 2, FILE_ID, 'inline')).toBe(`/api/artifacts/${ID}/v/2/f/${FILE_ID}?disposition=inline`);
+    expect(artifactUrls.zip(ID, 2)).toBe(`/api/artifacts/${ID}/v/2/zip`);
+    expect(artifactUrls.grid(ID, 2, { file: FILE_ID })).toBe(`/api/artifacts/${ID}/v/2/grid?file=${FILE_ID}`);
+    expect(artifactUrls.grid(ID, 2, { file: FILE_ID, sheet: 'Q3 Results', offset: 200, limit: 200 })).toBe(
+      `/api/artifacts/${ID}/v/2/grid?file=${FILE_ID}&sheet=Q3+Results&offset=200&limit=200`,
+    );
     expect(artifactUrls.preview(ID, 2)).toBe(`/api/artifacts/${ID}/v/2/preview`);
     expect(artifactUrls.page(ID, 2, 4, 1400)).toBe(`/api/artifacts/${ID}/v/2/preview/4.png?w=1400`);
     expect(artifactUrls.page(ID, 2, 4, 240)).toBe(`/api/artifacts/${ID}/v/2/preview/4.png?w=240`);
@@ -85,8 +106,114 @@ describe('URLs', () => {
     expect(isArtifactId(null)).toBe(false);
   });
 
-  it('gives a card a stable DOM id per version', () => {
+  it('builds nothing from anything that is not an id — a file id, a format, a report name', () => {
+    expect(isFileId(FILE_ID)).toBe(true);
+    expect(isFileId(FILE_ID.toUpperCase())).toBe(false);
+    expect(isFileId(FILE_ID.slice(0, 15))).toBe(false);
+    expect(isFileId(`legacy:${FILE_ID}`)).toBe(false);
+    expect(isFileId(ID)).toBe(false);
+    expect(artifactUrls.fileById(ID, 1, `${FILE_ID}/../x`)).toBe('');
+    expect(artifactUrls.fileById(ID, 1, ID)).toBe('');
+    expect(artifactUrls.grid(ID, 1, { file: 'nope' })).toBe('');
+    expect(artifactUrls.file(ID, 1, 'exe')).toBe('');
+    expect(artifactUrls.file(ID, 1, 'zip')).toBe('');
+    expect(artifactUrls.zip('not-an-id', 1)).toBe('');
+    expect(reportFileUrl('brief v1.pdf')).toBe('/api/reports/brief%20v1.pdf');
+    expect(reportFileUrl('../etc/passwd')).toBe('');
+    expect(reportFileUrl('.hidden')).toBe('');
+    expect(reportFileUrl('a%2fb.pdf')).toBe('');
+  });
+
+  it('gives a version group and a file card stable DOM ids', () => {
     expect(cardDomId(ID, 3)).toBe(`artifact-card-${ID}-v3`);
+    expect(fileCardDomId(FILE_ID)).toBe(`artifact-file-${FILE_ID}`);
+    // A legacy key holds a filename: reduced to id-safe characters.
+    expect(fileCardDomId(`${ID}:1:pdf:a b.pdf`)).toBe(`artifact-file-${ID}_1_pdf_a_b_pdf`);
+  });
+});
+
+describe('file identity (CONTRACT-2 §2)', () => {
+  const contractFile = (over: Partial<ArtifactFile> = {}): ArtifactFile => ({
+    file_id: FILE_ID,
+    role: 'primary',
+    format: 'xlsx',
+    filename: 'budget-v1.xlsx',
+    title: 'Budget',
+    mime_type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    size: 1,
+    download_url: `/artifacts/${ID}/v/1/f/${FILE_ID}?disposition=attachment`,
+    inline_url: `/artifacts/${ID}/v/1/f/${FILE_ID}?disposition=inline`,
+    preview_url: `/artifacts/${ID}/v/1/grid?file=${FILE_ID}`,
+    ...over,
+  });
+  const oldFile = (over: Partial<ArtifactFile> = {}): ArtifactFile => ({
+    format: 'xlsx',
+    filename: 'budget-v1.xlsx',
+    mime_type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    size: 1,
+    download_url: `/artifacts/${ID}/v/1/file/xlsx?disposition=attachment`,
+    inline_url: `/artifacts/${ID}/v/1/file/xlsx?disposition=inline`,
+    ...over,
+  });
+  const workbook = ref({ kind: 'workbook', preview_kind: 'grid', preview_pages: 0 });
+
+  it('keys a file by its id, and a file without one by artifact:version:format:filename', () => {
+    expect(fileKey(workbook, contractFile())).toBe(FILE_ID);
+    expect(fileKey(workbook, oldFile())).toBe(`${ID}:1:xlsx:budget-v1.xlsx`);
+    expect(legacyFileKey(workbook, contractFile())).toBe(`${ID}:1:xlsx:budget-v1.xlsx`);
+    // Two CSVs of one version: different ids, different keys.
+    expect(fileKey(workbook, contractFile({ format: 'csv', file_id: 'aaaaaaaaaaaaaaaa' }))).not.toBe(
+      fileKey(workbook, contractFile({ format: 'csv', file_id: 'bbbbbbbbbbbbbbbb' })),
+    );
+    // A file that gained an id still answers to the key its old ref had.
+    expect(fileMatchesKey(workbook, contractFile(), `${ID}:1:xlsx:budget-v1.xlsx`)).toBe(true);
+    expect(fileMatchesKey(workbook, contractFile(), FILE_ID)).toBe(true);
+    expect(fileMatchesKey(workbook, contractFile(), 'other')).toBe(false);
+  });
+
+  it('downloads by id when there is one, by the /file/{format} alias when there is not, and by /api/reports for a legacy report', () => {
+    expect(fileDownloadUrl(workbook, contractFile())).toBe(
+      `/api/artifacts/${ID}/v/1/f/${FILE_ID}?disposition=attachment`,
+    );
+    expect(fileDownloadUrl(workbook, contractFile(), 'inline')).toBe(
+      `/api/artifacts/${ID}/v/1/f/${FILE_ID}?disposition=inline`,
+    );
+    expect(fileDownloadUrl(workbook, oldFile())).toBe(`/api/artifacts/${ID}/v/1/file/xlsx?disposition=attachment`);
+    expect(
+      fileDownloadUrl(workbook, contractFile({ file_id: 'legacy:budget v1.xlsx', filename: 'budget v1.xlsx' })),
+    ).toBe('/api/reports/budget%20v1.xlsx');
+    // A download_url in a history row is never followed as it came.
+    expect(fileDownloadUrl(workbook, oldFile({ download_url: 'https://evil.example/x' }))).toBe(
+      `/api/artifacts/${ID}/v/1/file/xlsx?disposition=attachment`,
+    );
+  });
+
+  it('previews pages for the print formats and the grid for the tabular ones, and nothing for the rest', () => {
+    expect(previewKindFor({ format: 'pdf' })).toBe('pages');
+    expect(previewKindFor({ format: 'docx' })).toBe('pages');
+    expect(previewKindFor({ format: 'pptx' })).toBe('pages');
+    expect(previewKindFor({ format: 'xlsx' })).toBe('grid');
+    expect(previewKindFor({ format: 'csv' })).toBe('grid');
+    expect(previewKindFor({ format: 'txt' })).toBe('none');
+
+    expect(isPreviewable(contractFile(), workbook)).toBe(true);
+    expect(isPreviewable(contractFile({ format: 'csv' }), workbook)).toBe(true);
+    // The server said this file has no preview.
+    expect(isPreviewable(contractFile({ preview_url: '' }), workbook)).toBe(false);
+    // A legacy report file has no panel at all.
+    expect(isPreviewable(contractFile({ file_id: 'legacy:x.xlsx' }), workbook)).toBe(false);
+    // A ref from before per-file previews: the version's kind decides.
+    expect(isPreviewable(oldFile(), workbook)).toBe(true);
+    expect(isPreviewable(oldFile(), ref({ preview_kind: 'none', preview_pages: 0 }))).toBe(false);
+    expect(isPreviewable(oldFile({ format: 'pdf' }), ref({ preview_kind: 'pages', preview_pages: 3 }))).toBe(true);
+    expect(isPreviewable(oldFile({ format: 'pdf' }), ref({ preview_kind: 'pages', preview_pages: 0 }))).toBe(false);
+
+    expect(filePreviewUrl(workbook, contractFile())).toBe(`/api/artifacts/${ID}/v/1/grid?file=${FILE_ID}`);
+    expect(filePreviewUrl(workbook, oldFile())).toBe(`/api/artifacts/${ID}/v/1/sheets`);
+    expect(filePreviewUrl(ref(), contractFile({ format: 'pdf', preview_url: `/artifacts/${ID}/v/1/preview` }))).toBe(
+      `/api/artifacts/${ID}/v/1/preview`,
+    );
+    expect(filePreviewUrl(workbook, contractFile({ preview_url: '' }))).toBe('');
   });
 });
 
@@ -133,12 +260,33 @@ describe('vocabulary', () => {
     }
   });
 
-  it('describes a file by pages, slides or sheets', () => {
+  it('describes a file by pages, slides, sheets, or rows and columns', () => {
     expect(fileExtent({ pages: 1 })).toBe('1 page');
     expect(fileExtent({ pages: 12 })).toBe('12 pages');
     expect(fileExtent({ slides: 8 })).toBe('8 slides');
     expect(fileExtent({ sheets: 2 })).toBe('2 sheets');
     expect(fileExtent({})).toBe('');
+    // CONTRACT-2 §2: rows (data rows, header excluded) and columns.
+    expect(fileExtent({ rows: 500, columns: 11 })).toBe('500 rows · 11 columns');
+    expect(fileExtent({ rows: 1, columns: 1 })).toBe('1 row · 1 column');
+    expect(fileExtent({ rows: 30 })).toBe('30 rows');
+    // One sheet says nothing its rows do not; several are named.
+    expect(fileExtent({ sheets: 1, rows: 30, columns: 11 })).toBe('30 rows · 11 columns');
+    expect(fileExtent({ sheets: 3, rows: 500, columns: 11 })).toBe('3 sheets · 500 rows · 11 columns');
+    expect(fileExtent({ sheets: 1 })).toBe('1 sheet');
+    // `null` is "not counted", never zero.
+    expect(fileExtent({ pages: null, rows: null, columns: null })).toBe('');
+  });
+
+  it('names a format the way a person does', () => {
+    expect(formatLabel('csv')).toBe('CSV');
+    expect(formatLabel('pdf')).toBe('PDF');
+    expect(formatLabel('docx')).toBe('Word');
+    expect(formatLabel('pptx')).toBe('PowerPoint');
+    expect(formatLabel('xlsx')).toBe('Excel');
+    expect(formatLabel('zip')).toBe('ZIP');
+    expect(formatLabel('vtt')).toBe('VTT');
+    expect(formatLabel('')).toBe('File');
   });
 
   it('picks the native format as the primary file', () => {

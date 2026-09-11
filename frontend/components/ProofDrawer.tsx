@@ -33,6 +33,14 @@ interface Section {
 
 export function ProofDrawer({ meta }: { meta: Meta }) {
   const sections: Section[] = [];
+  // 2026-09-12 (CONTRACT-2 §9): a file is rendered ONCE. An artifact turn
+  // carries `artifacts` INSTEAD of `report_files`, so the two never name
+  // the same file today — but a meta that ever carried both would show the
+  // artifact's card in the thread and must not repeat it here.
+  const artifactNames = new Set(
+    (meta.artifacts ?? []).flatMap((ref) => (ref?.files ?? []).map((f) => f.filename)),
+  );
+  const reportFiles = (meta.report_files ?? []).filter((f) => !artifactNames.has(f.filename));
   if (meta.sql) sections.push({ id: 'sql', label: 'View SQL' });
   if (meta.citations?.length) {
     sections.push({ id: 'sources', label: `Sources (${meta.citations.length})` });
@@ -58,8 +66,8 @@ export function ProofDrawer({ meta }: { meta: Meta }) {
   if (meta.chart && chartRows?.length) {
     sections.push({ id: 'chart', label: 'Chart' });
   }
-  if (meta.report_files?.length) {
-    sections.push({ id: 'files', label: `Files (${meta.report_files.length})` });
+  if (reportFiles.length) {
+    sections.push({ id: 'files', label: `Files (${reportFiles.length})` });
   }
 
   // The full-result CSV, when the engine wrote one. The Data section's rows
@@ -80,7 +88,7 @@ export function ProofDrawer({ meta }: { meta: Meta }) {
       new Set<SectionId>(
         meta.chart && chartRows?.length
           ? ['chart']
-          : meta.report_files?.length
+          : reportFiles.length
             ? ['files']
             : [],
       ),
@@ -172,9 +180,7 @@ export function ProofDrawer({ meta }: { meta: Meta }) {
             {s.id === 'chart' && meta.chart && chartRows && (
               <ChartView spec={meta.chart} data={chartRows} />
             )}
-            {s.id === 'files' && meta.report_files && (
-              <FileCards files={meta.report_files} />
-            )}
+            {s.id === 'files' && reportFiles.length > 0 && <FileCards files={reportFiles} />}
           </div>
         ))}
     </div>

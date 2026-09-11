@@ -1,45 +1,35 @@
 'use client';
 
 /**
- * One generated file (one artifact VERSION), as a card in the thread.
+ * One artifact VERSION, as a GROUP in the thread (CONTRACT-2 §9): a header
+ * — the kind's mark, the title, "v2 · Updated", the truthful status line,
+ * the notes, and "Download all" when there are two or more files — over
+ * ONE FileCard PER FILE.
  *
- * Two actions, kept apart on purpose. The card body is ONE button — Open —
- * that hands the ref to the side panel; the Download control is a SIBLING
- * of that button, laid over its corner, so a click on it never reaches
- * onOpen and a click on the card never starts a download (the old FileCards
- * were download-only links, and "open" did not exist). A button may not
- * contain another interactive element, which is what forces the sibling
- * layout — and what makes the separation testable: the two controls have
- * different accessible names and different DOM parents.
+ * Until 2026-09-12 this was the card: one per version, its files as chips
+ * and a download disclosure. A version that is four files ("share XLSX,
+ * Word, PDF and CSV") is four things to open and four to download, so the
+ * card moved down a level (FileCard.tsx) and this became the frame around
+ * them. The exports other modules imported — `ArtifactCard`, `KindIcon` —
+ * keep their names.
  *
  * The status line is TRUTHFUL. While the job runs it names the stage the
  * server reports (useLiveArtifact polls it); it never shows a percentage,
  * because the pipeline has no way to know how far through "Writing the
  * content" it is and a bar that crawls to 90% and waits is a lie people
- * learn to distrust. Once terminal it names the outcome and the notes.
+ * learn to distrust. Once terminal it names the outcome and the notes —
+ * once, here, not on every file card under it.
  */
 
-import type { MouseEvent } from 'react';
-import {
-  artifactUrls,
-  cardDomId,
-  fileExtent,
-  isTerminal,
-  kindLabel,
-  primaryFile,
-  statusLine,
-} from '@/lib/artifacts';
-import { fileKind, formatBytes } from '@/lib/format';
-import type { ArtifactFile, ArtifactJob, ArtifactRef } from '@/lib/types';
-import {
-  IconAlert,
-  IconChevronDown,
-  IconDownload,
-  IconFileText,
-  IconGrid,
-  IconPresentation,
-} from '../icons';
+import { artifactUrls, fileKey, isTerminal, kindLabel, statusLine } from '@/lib/artifacts';
+import { fileKind } from '@/lib/format';
+import type { ArtifactJob, ArtifactRef } from '@/lib/types';
+import { IconAlert, IconFileText, IconGrid, IconPackage, IconPresentation } from '../icons';
 import { Loader } from '../Loader';
+import { FileCard } from './FileCard';
+
+/** Open the panel on one file of one version. `originId` is the card control's DOM id. */
+export type OpenFile = (artifact: ArtifactRef, originId: string, fileKey: string) => void;
 
 /** The kind's mark, tinted like its badge. */
 export function KindIcon({ kind, size = 18 }: { kind: string; size?: number }) {
@@ -48,103 +38,28 @@ export function KindIcon({ kind, size = 18 }: { kind: string; size?: number }) {
   return <IconFileText size={size} />;
 }
 
-function kindTint(kind: string): string {
+export function kindTint(kind: string): string {
   if (kind === 'presentation') return fileKind('x.pptx').className;
   if (kind === 'workbook') return fileKind('x.xlsx').className;
   return fileKind('x.docx').className;
 }
 
-/** "PDF · 3 pages · 120 KB" — one chip per file. */
-function FileChip({ file }: { file: ArtifactFile }) {
-  const kind = fileKind(file.filename || `x.${file.format}`);
-  const extent = fileExtent(file);
-  return (
-    <span
-      className="inline-flex items-center gap-1.5 rounded-md border border-border bg-surface-2 px-1.5 py-0.5 text-[11px] text-muted"
-      title={file.filename}
-    >
-      <span className={`rounded px-1 font-mono text-[10px] font-semibold ${kind.className}`}>
-        {kind.label}
-      </span>
-      {extent && <span>{extent}</span>}
-      <span>{formatBytes(file.size)}</span>
-    </span>
-  );
-}
-
-function stopCardClick(e: MouseEvent) {
-  // The control is a sibling of the Open button, not a child, so this is
-  // belt-and-braces: a portal or a future wrapper must still never turn a
-  // download into an open.
-  e.stopPropagation();
-}
-
-/** The download control: a plain link for one file, a disclosure for several. */
-export function DownloadControl({ artifact, files }: { artifact: ArtifactRef; files: ArtifactFile[] }) {
-  if (files.length === 0) return null;
-  const buttonClass =
-    'inline-flex items-center gap-1 rounded-lg border border-border bg-surface px-2 py-1 text-xs font-medium text-muted transition-colors duration-ts hover:border-accent/50 hover:bg-surface-2 hover:text-ink';
-  if (files.length === 1) {
-    const f = files[0];
-    return (
-      <a
-        href={artifactUrls.file(artifact.artifact_id, artifact.version, f.format, 'attachment')}
-        download={f.filename}
-        onClick={stopCardClick}
-        aria-label={`Download ${f.filename}`}
-        title={`Download ${f.filename}`}
-        className={buttonClass}
-        data-testid="artifact-download"
-      >
-        <IconDownload size={14} />
-        <span className="hidden sm:inline">Download</span>
-      </a>
-    );
-  }
-  return (
-    <details className="relative" onClick={stopCardClick} data-testid="artifact-download">
-      <summary
-        className={`${buttonClass} list-none cursor-pointer [&::-webkit-details-marker]:hidden`}
-        aria-label={`Download ${artifact.title} — choose a format`}
-        title="Download — choose a format"
-      >
-        <IconDownload size={14} />
-        <span className="hidden sm:inline">Download</span>
-        <IconChevronDown size={12} />
-      </summary>
-      <ul
-        role="list"
-        className="absolute right-0 z-20 mt-1 min-w-[200px] overflow-hidden rounded-ts border border-border bg-surface py-1 shadow-xl"
-      >
-        {files.map((f) => {
-          const kind = fileKind(f.filename || `x.${f.format}`);
-          return (
-            <li key={f.format}>
-              <a
-                href={artifactUrls.file(artifact.artifact_id, artifact.version, f.format, 'attachment')}
-                download={f.filename}
-                aria-label={`Download ${f.filename}`}
-                className="flex items-center gap-2 px-3 py-1.5 text-xs text-ink no-underline transition-colors duration-ts hover:bg-surface-2"
-              >
-                <span className={`rounded px-1 font-mono text-[10px] font-semibold ${kind.className}`}>
-                  {kind.label}
-                </span>
-                <span className="min-w-0 flex-1 truncate">{f.filename}</span>
-                <span className="shrink-0 text-faint">{formatBytes(f.size)}</span>
-              </a>
-            </li>
-          );
-        })}
-      </ul>
-    </details>
-  );
+/** "v1 · Created" · "v2 · Updated" · "v2 · Converted" — the version and how it came to be. */
+export function versionText(artifact: Pick<ArtifactRef, 'version' | 'operation'>): string {
+  const how =
+    artifact.operation === 'edit'
+      ? 'Updated'
+      : artifact.operation === 'convert'
+        ? 'Converted'
+        : 'Created';
+  return `v${Math.trunc(artifact.version)} · ${how}`;
 }
 
 export function ArtifactCard({
   artifact,
   job = null,
   error = null,
-  active = false,
+  activeKey = null,
   onOpen,
 }: {
   artifact: ArtifactRef;
@@ -152,77 +67,47 @@ export function ArtifactCard({
   job?: ArtifactJob | null;
   /** A settled refusal from polling, shown under the status line. */
   error?: string | null;
-  /** Is this the version the side panel is showing right now? */
-  active?: boolean;
-  /**
-   * Open the side panel on this version. `originId` is the card button's DOM
-   * id, so the panel can return focus to the exact card that opened it.
-   */
-  onOpen: (artifact: ArtifactRef, originId: string) => void;
+  /** The key (lib/artifacts.ts fileKey) of the file the panel is showing. */
+  activeKey?: string | null;
+  onOpen: OpenFile;
 }) {
   const status = job?.status ?? artifact.status;
   const terminal = isTerminal(status);
   const working = status === 'queued' || status === 'running';
   const failed = status === 'failed' || status === 'cancelled';
-  const files = terminal && !failed ? artifact.files ?? [] : [];
-  const primary = primaryFile(artifact);
-  const domId = cardDomId(artifact.artifact_id, artifact.version);
+  const files = terminal && !failed ? (artifact.files ?? []) : [];
   const line = statusLine(artifact, job);
-  const versionText =
-    artifact.version > 1 || artifact.operation !== 'create'
-      ? `v${artifact.version}${artifact.operation === 'edit' ? ' · edited' : artifact.operation === 'convert' ? ' · converted' : ''}`
-      : 'v1';
+  // Offered only when the server offers it (the field is the signal) and
+  // there is more than one file to bundle; the URL itself is rebuilt from
+  // the validated ids, like every other one.
+  const zipHref =
+    files.length >= 2 && typeof artifact.download_all_url === 'string' && artifact.download_all_url
+      ? artifactUrls.zip(artifact.artifact_id, artifact.version)
+      : '';
+  const zipCount = artifact.package?.count ?? files.length;
 
   return (
     <div
-      className={`relative rounded-ts border bg-surface transition-colors duration-ts ${
-        active ? 'border-accent/60' : 'border-border hover:border-accent/50'
-      }`}
+      className="flex w-full max-w-[680px] flex-col gap-2"
       data-testid="artifact-card"
       data-status={status}
     >
-      <button
-        id={domId}
-        type="button"
-        onClick={() => onOpen(artifact, domId)}
-        aria-label={`Open ${artifact.title} (${kindLabel(artifact.kind)}, ${versionText})`}
-        // `aria-current`, not `aria-pressed`: Open is not a toggle — pressing
-        // it again re-opens, it never closes — and a screen reader that hears
-        // "pressed" expects a second press to unpress. "Current" says exactly
-        // what is true: this is the version the panel is showing.
-        aria-current={active ? 'true' : undefined}
-        className="flex w-full items-start gap-3 rounded-ts p-3 text-left focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60"
-      >
+      <div className="flex items-start gap-2.5 px-0.5">
         <span
           aria-hidden
-          className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-lg ${kindTint(artifact.kind)}`}
+          className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg ${kindTint(artifact.kind)}`}
         >
-          <KindIcon kind={artifact.kind} />
+          <KindIcon kind={artifact.kind} size={16} />
         </span>
-        <span className="min-w-0 flex-1 pr-24 sm:pr-28">
-          <span className="block truncate text-sm font-medium text-ink" title={artifact.title}>
+        <div className="min-w-0 flex-1">
+          <p className="truncate text-sm font-medium text-ink" title={artifact.title}>
             {artifact.title}
-          </span>
-          <span className="mt-0.5 block truncate text-xs text-muted">
-            {kindLabel(artifact.kind)} · {versionText}
-            {primary && files.length > 0 ? (
-              <>
-                {' · '}
-                <span className="font-mono text-[11px]" title={primary.filename}>
-                  {primary.filename}
-                </span>
-              </>
-            ) : null}
-          </span>
-          {files.length > 0 && (
-            <span className="mt-2 flex flex-wrap gap-1.5">
-              {files.map((f) => (
-                <FileChip key={f.format} file={f} />
-              ))}
-            </span>
-          )}
-          <span
-            className={`mt-2 flex items-center gap-1.5 text-xs ${
+          </p>
+          <p className="truncate text-xs text-muted" data-testid="artifact-version">
+            {kindLabel(artifact.kind)} · {versionText(artifact)}
+          </p>
+          <p
+            className={`mt-1 flex items-center gap-1.5 text-xs ${
               failed ? 'text-danger' : working ? 'text-muted' : 'text-faint'
             }`}
             data-testid="artifact-status"
@@ -235,31 +120,74 @@ export function ArtifactCard({
               <span aria-hidden className="h-1.5 w-1.5 shrink-0 rounded-full bg-ok" />
             )}
             <span className="min-w-0 truncate">{line}</span>
-          </span>
+          </p>
           {error && (
-            <span className="mt-1 block text-xs text-danger" role="status">
+            <p className="mt-1 text-xs text-danger" role="status">
               {error}
-            </span>
+            </p>
           )}
           {artifact.warnings && artifact.warnings.length > 0 && terminal && (
-            <span className="mt-1.5 block space-y-0.5" data-testid="artifact-warnings">
+            <ul className="mt-1.5 space-y-0.5" data-testid="artifact-warnings">
               {artifact.warnings.map((w, i) => (
-                <span
+                <li
                   key={`${i}-${w}`}
                   className="flex items-start gap-1.5 text-[11.5px] leading-snug text-warn"
                 >
                   <IconAlert size={12} className="mt-0.5 shrink-0" />
                   <span>{w}</span>
-                </span>
+                </li>
               ))}
-            </span>
+            </ul>
           )}
-        </span>
-      </button>
-      {files.length > 0 && (
-        <div className="absolute right-3 top-3">
-          <DownloadControl artifact={artifact} files={files} />
         </div>
+        {!files.length && (working || failed) && (
+          // No file cards yet (or ever): the header itself is the way into
+          // the panel's status view — the stage while it runs, the
+          // failure and its retry once it has not. Without this a running
+          // version had nothing to click (the 2026-09-12 review).
+          <button
+            type="button"
+            id={`artifact-status-${artifact.artifact_id}-v${Math.trunc(artifact.version)}`}
+            onClick={(e) => onOpen(artifact, (e.currentTarget as HTMLButtonElement).id, '')}
+            aria-label={`${working ? 'Show progress of' : 'Show details of'} ${artifact.title}`}
+            className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-border bg-surface px-2 py-1 text-xs font-medium text-muted transition-colors duration-ts hover:border-accent/50 hover:bg-surface-2 hover:text-ink focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60"
+            data-testid="artifact-open-status"
+          >
+            {working ? 'Progress' : 'Details'}
+          </button>
+        )}
+        {zipHref && (
+          <a
+            href={zipHref}
+            download
+            aria-label={`Download all ${zipCount} files as ZIP`}
+            title={`Download all ${zipCount} files as ZIP`}
+            className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-border bg-surface px-2 py-1 text-xs font-medium text-muted transition-colors duration-ts hover:border-accent/50 hover:bg-surface-2 hover:text-ink focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60"
+            data-testid="artifact-download-all"
+          >
+            <IconPackage size={14} />
+            <span>Download all</span>
+          </a>
+        )}
+      </div>
+      {files.length > 0 && (
+        <ul className="flex flex-col gap-2" aria-label={`Files of ${artifact.title}`}>
+          {files.map((file) => {
+            const key = fileKey(artifact, file);
+            return (
+              <li key={key}>
+                <FileCard
+                  file={file}
+                  artifactRef={artifact}
+                  groupTitle={artifact.title}
+                  status={status}
+                  active={activeKey === key}
+                  onOpen={(k, originId) => onOpen(artifact, originId, k)}
+                />
+              </li>
+            );
+          })}
+        </ul>
       )}
     </div>
   );

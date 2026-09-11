@@ -360,3 +360,53 @@ export const IconGrid = ({ size, className }: IconProps) => (
     <path d="M3 9h18M3 15h18M9 3v18M15 3v18" />
   </svg>
 );
+
+/* 2026-09-12 (Artifact Studio 2): the two marks the per-file cards needed
+   and did not have — a CSV is not a workbook and a ZIP is not a file
+   format. Same 24-grid, same stroke. */
+
+/** A table with a header row — CSV files and the tabular data they carry. */
+export const IconTable = ({ size, className }: IconProps) => (
+  <svg {...base(size, className)}>
+    <rect x="3" y="4" width="18" height="16" rx="2" />
+    <path d="M3 9h18M9 9v11M15 9v11" />
+  </svg>
+);
+
+/** A parcel — the "Download all" ZIP of a version's files. */
+export const IconPackage = ({ size, className }: IconProps) => (
+  <svg {...base(size, className)}>
+    <path d="M21 8 12 3 3 8v8l9 5 9-5Z" />
+    <path d="M3 8l9 5 9-5M12 13v8M7.5 5.5l9 5" />
+  </svg>
+);
+
+/** A page with a folded corner — PDFs, where "file text" reads as Word. */
+export const IconFilePdf = ({ size, className }: IconProps) => (
+  <svg {...base(size, className)}>
+    <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" />
+    <path d="M14 3v5h5M8.5 17v-5h1.8a1.5 1.5 0 0 1 0 3H8.5" />
+  </svg>
+);
+
+/**
+ * The mark for a file FORMAT (CONTRACT-2 §9): one map used by the card and
+ * the panel header, so a CSV cannot be a grid in one place and a page in
+ * the other. Unknown formats get the plain page.
+ */
+export function IconForFormat({ format, size, className }: IconProps & { format: string }) {
+  switch (format) {
+    case 'pptx':
+      return <IconPresentation size={size} className={className} />;
+    case 'xlsx':
+      return <IconGrid size={size} className={className} />;
+    case 'csv':
+      return <IconTable size={size} className={className} />;
+    case 'zip':
+      return <IconPackage size={size} className={className} />;
+    case 'pdf':
+      return <IconFilePdf size={size} className={className} />;
+    default:
+      return <IconFileText size={size} className={className} />;
+  }
+}

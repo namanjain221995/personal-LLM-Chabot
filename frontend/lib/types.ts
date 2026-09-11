@@ -130,24 +130,65 @@ export type ArtifactStatus =
 /** What a person asked for, at the level that picks the renderer set. */
 export type ArtifactKind = 'document' | 'presentation' | 'workbook';
 
-/** A format the studio can actually write and reopen. Nothing else is promised. */
-export type ArtifactFormat = 'pdf' | 'docx' | 'pptx' | 'xlsx';
+/**
+ * A format the studio can actually write and reopen. Nothing else is
+ * promised. `csv` since 2026-09-12 (CONTRACT-2 §1); a ZIP is a ROUTE
+ * (`download_all_url`), never a file format.
+ */
+export type ArtifactFormat = 'pdf' | 'docx' | 'pptx' | 'xlsx' | 'csv';
 
-/** One rendered file of one version. */
+/**
+ * Where one file stands in its version (CONTRACT-2 §2): `primary` is the
+ * kind's native file (docx/pptx/xlsx), `companion` the same content in
+ * another format (the PDF of a deck, the Word/PDF of a workbook), `data` a
+ * CSV of one sheet.
+ */
+export type ArtifactFileRole = 'primary' | 'companion' | 'data';
+
+/**
+ * One rendered file of one version.
+ *
+ * Two generations of this shape are on the wire at once. Refs persisted
+ * before 2026-09-12 carry only the fields below `size`… `inline_url` and
+ * their URLs point at `/file/{format}`; refs minted since (CONTRACT-2 §2)
+ * also carry `file_id`, `role`, `title`, `rows`, `columns`, `preview_url`
+ * and point at `/f/{file_id}`. Everything new is optional so the old rows
+ * still type-check, and lib/artifacts.ts derives a key and a URL for both.
+ */
 export interface ArtifactFile {
+  /**
+   * 16 hex characters, minted by the pipeline from (artifact, version, role,
+   * format, sheet) — the file's identity and the React key. Absent on refs
+   * persisted before it existed.
+   */
+  file_id?: string;
+  role?: ArtifactFileRole | string;
   format: ArtifactFormat | string;
   /** `quarterly-review-v2.pptx` — the download name, never an identity. */
   filename: string;
+  /** The artifact title; for a per-sheet CSV, "<title> — <sheet name>". */
+  title?: string;
   mime_type: string;
   size: number;
   sha256?: string;
-  pages?: number;
-  slides?: number;
-  sheets?: number;
-  /** `/artifacts/{id}/v/{n}/file/{format}?disposition=attachment` */
+  /** Counted by reopening the rendered file; `null` when the format has no such thing. */
+  pages?: number | null;
+  slides?: number | null;
+  sheets?: number | null;
+  /** DATA rows, the header excluded. */
+  rows?: number | null;
+  /** The header's width. */
+  columns?: number | null;
+  /** `/artifacts/{id}/v/{n}/f/{file_id}?disposition=attachment` (legacy: `/file/{format}`). */
   download_url: string;
   /** Same file, `Content-Disposition: inline`. */
   inline_url: string;
+  /**
+   * `/artifacts/{id}/v/{n}/preview` (pages) or `…/grid?file={file_id}`
+   * (xlsx, csv); '' when this file has no preview. Absent on legacy refs,
+   * where the version-level `preview_kind` decides.
+   */
+  preview_url?: string;
 }
 
 /** One version of one artifact, as the chat meta and the API describe it. */
@@ -172,6 +213,14 @@ export interface ArtifactRef {
   parent_version?: number;
   /** `/artifacts/jobs/{job_id}` — polled while `status` is not terminal. */
   status_url: string;
+  /**
+   * `/artifacts/{id}/v/{n}/zip` — every file of the version in one archive.
+   * Present only when the version has two or more files (CONTRACT-2 §2);
+   * absent on refs persisted before the route existed.
+   */
+  download_all_url?: string;
+  /** How many files the ZIP holds, when `download_all_url` is present. */
+  package?: { count: number };
 }
 
 /** GET /artifacts/jobs/{job_id} (docs/artifact-studio/API.md). */

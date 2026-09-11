@@ -22,6 +22,7 @@ import {
 
 const ID = 'a3f9c2d1e4b5f6a7b8c9d0e1f2a3b4c5';
 const JOB = 'ffffffffffffffffffffffffffffffff';
+const FILE_ID = '0123456789abcdef';
 
 describe('resolveArtifactPath — the routes the API defines', () => {
   it.each([
@@ -34,6 +35,12 @@ describe('resolveArtifactPath — the routes the API defines', () => {
     [[ID, 'v', '2'], `/artifacts/${ID}/v/2`, ['GET']],
     [[ID, 'v', '2', 'file', 'pdf'], `/artifacts/${ID}/v/2/file/pdf`, ['GET', 'HEAD']],
     [[ID, 'v', '2', 'file', 'pptx'], `/artifacts/${ID}/v/2/file/pptx`, ['GET', 'HEAD']],
+    // CONTRACT-2 §1: csv is a format the studio writes.
+    [[ID, 'v', '2', 'file', 'csv'], `/artifacts/${ID}/v/2/file/csv`, ['GET', 'HEAD']],
+    // CONTRACT-2 §2: a file by its own id, the zip of a version, the grid.
+    [[ID, 'v', '2', 'f', FILE_ID], `/artifacts/${ID}/v/2/f/${FILE_ID}`, ['GET', 'HEAD']],
+    [[ID, 'v', '2', 'zip'], `/artifacts/${ID}/v/2/zip`, ['GET']],
+    [[ID, 'v', '2', 'grid'], `/artifacts/${ID}/v/2/grid`, ['GET']],
     [[ID, 'v', '2', 'preview'], `/artifacts/${ID}/v/2/preview`, ['GET', 'HEAD']],
     [[ID, 'v', '2', 'preview', '7.png'], `/artifacts/${ID}/v/2/preview/7.png`, ['GET']],
     [[ID, 'v', '2', 'sheets'], `/artifacts/${ID}/v/2/sheets`, ['GET']],
@@ -62,7 +69,18 @@ describe('resolveArtifactPath — the routes the API defines', () => {
     ['non-hex id', ['g'.repeat(32)]],
     ['unknown verb', [ID, 'delete']],
     ['unknown format', [ID, 'v', '1', 'file', 'exe']],
+    ['zip as a file format', [ID, 'v', '1', 'file', 'zip']],
     ['format with traversal', [ID, 'v', '1', 'file', '../pdf']],
+    ['file id that is too short', [ID, 'v', '1', 'f', FILE_ID.slice(0, 15)]],
+    ['file id that is too long', [ID, 'v', '1', 'f', `${FILE_ID}0`]],
+    ['file id in uppercase', [ID, 'v', '1', 'f', FILE_ID.toUpperCase()]],
+    ['file id that is not hex', [ID, 'v', '1', 'f', 'zzzzzzzzzzzzzzzz']],
+    ['file id with traversal', [ID, 'v', '1', 'f', `../${FILE_ID}`]],
+    ['f without an id', [ID, 'v', '1', 'f']],
+    ['a legacy key in the id slot', [ID, 'v', '1', 'f', 'legacy:report.pdf']],
+    ['f with a trailing segment', [ID, 'v', '1', 'f', FILE_ID, 'x']],
+    ['zip with a trailing segment', [ID, 'v', '1', 'zip', 'x']],
+    ['grid with a trailing segment', [ID, 'v', '1', 'grid', 'x']],
     ['negative version', [ID, 'v', '-1']],
     ['non-integer version', [ID, 'v', '1.5']],
     ['page 0', [ID, 'v', '1', 'preview', '0.png']],
@@ -117,6 +135,26 @@ describe('forwardedQuery — only the parameters a route defines', () => {
   it('forwards nothing for a route with no parameters', () => {
     expect(forwardedQuery(null, new URLSearchParams('disposition=inline'))).toBe('');
   });
+  it('keeps a well-formed file id, sheet, offset and limit for the grid and drops the rest', () => {
+    // CONTRACT-2 §2: GET …/grid?file={file_id}&sheet=&offset=&limit=.
+    expect(forwardedQuery('grid', new URLSearchParams(`file=${FILE_ID}&sheet=Data&offset=200&limit=200`))).toBe(
+      `?file=${FILE_ID}&sheet=Data&offset=200&limit=200`,
+    );
+    expect(forwardedQuery('grid', new URLSearchParams(`file=${FILE_ID}&offset=0`))).toBe(`?file=${FILE_ID}&offset=0`);
+    // A bad file id never travels.
+    expect(forwardedQuery('grid', new URLSearchParams('file=..%2F..%2Fetc'))).toBe('');
+    expect(forwardedQuery('grid', new URLSearchParams(`file=${FILE_ID.toUpperCase()}`))).toBe('');
+    expect(forwardedQuery('grid', new URLSearchParams(`file=${ID}`))).toBe('');
+    expect(forwardedQuery('grid', new URLSearchParams(`file=${FILE_ID}&offset=-1&limit=0`))).toBe(`?file=${FILE_ID}`);
+    expect(forwardedQuery('grid', new URLSearchParams(`file=${FILE_ID}&limit=999999`))).toBe(`?file=${FILE_ID}`);
+    // The sheet window's own parameters mean nothing to the grid.
+    expect(forwardedQuery('grid', new URLSearchParams(`file=${FILE_ID}&rows=200&cols=50`))).toBe(`?file=${FILE_ID}`);
+  });
+  it('takes a disposition for a file by id, like a file by format', () => {
+    const r = resolveArtifactPath([ID, 'v', '1', 'f', FILE_ID]);
+    expect(r?.query).toBe('file');
+    expect(forwardedQuery(r!.query, new URLSearchParams('disposition=attachment'))).toBe('?disposition=attachment');
+  });
 });
 
 // --- handlers ---------------------------------------------------------------
@@ -159,6 +197,25 @@ describe('handlers — an unsafe path never becomes a request', () => {
     expect((await GET(req('GET'), ctx(['jobs', JOB, 'cancel']))).status).toBe(404);
     // a file is GET/HEAD; a POST must not reach it.
     expect((await POST(req('POST'), ctx([ID, 'v', '1', 'file', 'pdf']))).status).toBe(404);
+    expect((await POST(req('POST'), ctx([ID, 'v', '1', 'f', FILE_ID]))).status).toBe(404);
+    // the zip and the grid are GET-only: no HEAD, no POST.
+    expect((await HEAD(req('HEAD'), ctx([ID, 'v', '1', 'zip']))).status).toBe(404);
+    expect((await POST(req('POST'), ctx([ID, 'v', '1', 'zip']))).status).toBe(404);
+    expect((await HEAD(req('HEAD'), ctx([ID, 'v', '1', 'grid']))).status).toBe(404);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['a bad file id', [ID, 'v', '1', 'f', 'not-a-file-id']],
+    ['a file id with traversal', [ID, 'v', '1', 'f', `..%2f${FILE_ID}`]],
+    ['a legacy key as a file id', [ID, 'v', '1', 'f', 'legacy:x.pdf']],
+    ['a zip with traversal after it', [ID, 'v', '1', 'zip', '..']],
+    ['a grid with a segment after it', [ID, 'v', '1', 'grid', FILE_ID]],
+  ])('answers 404 for %s without calling upstream', async (_label, path) => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    const res = await GET(req(), ctx(path as string[]));
+    expect(res.status).toBe(404);
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -242,6 +299,109 @@ describe('handlers — passthrough', () => {
     expect(sent.cookie).toBe('ts_session=s1');
     expect(sent.range).toBe('bytes=0-3');
     expect(sent['if-none-match']).toBe('"abc"');
+  });
+
+  it('fetches a file by id with its disposition and passes the bytes and headers through', async () => {
+    vi.stubEnv('ORCHESTRATOR_URL', 'http://orchestrator:8080');
+    const body = new Uint8Array([0x50, 0x4b, 0x03, 0x04]);
+    const fetchMock = stubUpstream(
+      new Response(body, {
+        status: 200,
+        headers: {
+          'content-type': 'text/csv; charset=utf-8',
+          'content-disposition': 'attachment; filename="audit-v1.csv"',
+          'content-length': '4',
+          etag: '"csv1"',
+        },
+      }),
+    );
+    const res = await GET(
+      req('GET', { cookie: 'ts_session=s1', range: 'bytes=0-1' }, `http://localhost:3001/api/artifacts/${ID}/v/1/f/${FILE_ID}?disposition=inline&junk=1`),
+      ctx([ID, 'v', '1', 'f', FILE_ID]),
+    );
+    expect(res.status).toBe(200);
+    expect(new Uint8Array(await res.arrayBuffer())).toEqual(body);
+    expect(res.headers.get('content-type')).toBe('text/csv; charset=utf-8');
+    expect(res.headers.get('content-disposition')).toBe('attachment; filename="audit-v1.csv"');
+    expect(res.headers.get('etag')).toBe('"csv1"');
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe(`http://orchestrator:8080/artifacts/${ID}/v/1/f/${FILE_ID}?disposition=inline`);
+    const sent = init?.headers as Record<string, string>;
+    expect(sent.cookie).toBe('ts_session=s1');
+    expect(sent.range).toBe('bytes=0-1');
+  });
+
+  it('streams the zip through without buffering it, with Content-Disposition, Content-Length and ETag', async () => {
+    // CONTRACT-2 §2: the orchestrator streams the archive; a 200 MB version
+    // must pass through this process a chunk at a time. The upstream body
+    // below hands over its first chunk and then WAITS: a proxy that
+    // buffered before answering could never resolve before `release`.
+    vi.stubEnv('ORCHESTRATOR_URL', 'http://orchestrator:8080');
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const stream = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        controller.enqueue(new Uint8Array([0x50, 0x4b, 0x03, 0x04]));
+        await gate;
+        controller.enqueue(new Uint8Array([0x05, 0x06]));
+        controller.close();
+      },
+    });
+    const fetchMock = stubUpstream(
+      new Response(stream, {
+        status: 200,
+        headers: {
+          'content-type': 'application/zip',
+          'content-disposition': 'attachment; filename="ir-session-audit-v1.zip"',
+          'content-length': '6',
+          etag: '"zip1"',
+        },
+      }),
+    );
+    const answered = GET(
+      req('GET', { cookie: 'ts_session=s1' }, `http://localhost:3001/api/artifacts/${ID}/v/1/zip`),
+      ctx([ID, 'v', '1', 'zip']),
+    );
+    const res = await Promise.race([
+      answered,
+      new Promise<'buffered'>((resolve) => setTimeout(() => resolve('buffered'), 500)),
+    ]);
+    expect(res).not.toBe('buffered');
+    const response = res as Response;
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toBe('application/zip');
+    expect(response.headers.get('content-disposition')).toBe('attachment; filename="ir-session-audit-v1.zip"');
+    expect(response.headers.get('content-length')).toBe('6');
+    expect(response.headers.get('etag')).toBe('"zip1"');
+    expect(response.headers.get('cache-control')).toBe('private, no-store');
+    // The bytes arrive as the upstream sends them.
+    const reader = response.body!.getReader();
+    const first = await reader.read();
+    expect(Array.from(first.value ?? [])).toEqual([0x50, 0x4b, 0x03, 0x04]);
+    release();
+    const second = await reader.read();
+    expect(Array.from(second.value ?? [])).toEqual([0x05, 0x06]);
+    expect((await reader.read()).done).toBe(true);
+    expect(fetchMock.mock.calls[0][0]).toBe(`http://orchestrator:8080/artifacts/${ID}/v/1/zip`);
+  });
+
+  it('forwards the grid query, validated, and passes the JSON through', async () => {
+    vi.stubEnv('ORCHESTRATOR_URL', 'http://orchestrator:8080');
+    const grid = { sheets: ['Audit'], sheet: 'Audit', columns: ['Host'], rows: [['a']], total_rows: 1, total_columns: 1, truncated: false, formulas_as_text: true };
+    const fetchMock = stubUpstream(
+      new Response(JSON.stringify(grid), { status: 200, headers: { 'content-type': 'application/json' } }),
+    );
+    const res = await GET(
+      req('GET', { cookie: 'ts_session=s1' }, `http://localhost:3001/api/artifacts/${ID}/v/1/grid?file=${FILE_ID}&limit=200&sheet=Audit&file2=x&offset=abc`),
+      ctx([ID, 'v', '1', 'grid']),
+    );
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual(grid);
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      `http://orchestrator:8080/artifacts/${ID}/v/1/grid?file=${FILE_ID}&sheet=Audit&limit=200`,
+    );
   });
 
   it('passes a 206 with its Content-Range through', async () => {

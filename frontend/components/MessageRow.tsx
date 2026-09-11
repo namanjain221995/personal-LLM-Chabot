@@ -474,7 +474,12 @@ function MessageRowImpl({
    * visible, which is the honest behaviour of a control with no host.
    */
   onOpenArtifact?: OpenArtifact;
-  /** `artifact_id:version` of the file the panel is showing, to mark its card. */
+  /**
+   * The key (lib/artifacts.ts fileKey — the file id, or the legacy
+   * derivation) of the FILE the panel is showing, to mark its card. One
+   * card per file since 2026-09-12 (CONTRACT-2 §9), so the mark is per
+   * file too.
+   */
   activeArtifactKey?: string | null;
 }) {
   // Hooks live above the user-bubble early return (rules of hooks).
@@ -1262,7 +1267,15 @@ function MessageRowImpl({
               drawer, not inside it — the drawer is the Salesforce proof
               trail by owner decision (ProofDrawer.tsx), and a file card is a
               deliverable, not evidence. `noopOpen` keeps the cards rendering
-              wherever the row is rendered without a host panel. */}
+              wherever the row is rendered without a host panel.
+
+              The older engines' `meta.report_files` render through the SAME
+              card component, inside the drawer's Files section
+              (FileCards → legacyAdapter → FileCard), and the drawer skips any
+              name that also appears here — a file is shown once
+              (CONTRACT-2 §9). The "Memory updated" chip above renders only
+              when `meta.memory_updated` is non-empty; an artifact turn's meta
+              never carries it (§8) and nothing here synthesises one. */}
           {message.meta?.artifacts && message.meta.artifacts.length > 0 && (
             <ArtifactCards
               artifacts={message.meta.artifacts}

@@ -123,7 +123,16 @@ import { ConfirmDialog } from './ConfirmDialog';
 import { ContextMeter } from './ContextMeter';
 import { SummaryPanel } from './SummaryPanel';
 import { ArtifactPanel } from './artifacts/ArtifactPanel';
-import { artifactKey, type OpenArtifact } from './artifacts/ArtifactCards';
+import { type OpenArtifact } from './artifacts/ArtifactCards';
+
+/**
+ * The file panel's width (CONTRACT-2 §9): a share of the workspace row,
+ * clamped 45–55 %, and in pixels never under 520 nor over 960.
+ */
+const PANEL_MIN_PCT = 45;
+const PANEL_MAX_PCT = 55;
+const PANEL_MIN_PX = 520;
+const PANEL_MAX_PX = 960;
 import { EmptyState } from './EmptyState';
 import { Loader } from './Loader';
 import {
@@ -441,21 +450,29 @@ export function ChatApp() {
    * row that opened it scrolling away or re-rendering.
    */
   const [artifactPanel, setArtifactPanel] = useState<{
+    /** Every ref of the message the card sits in — prev/next walk them. */
+    refs: ArtifactRef[];
     artifactId: string;
     version: number;
+    /** The file on show (lib/artifacts.ts fileKey). One card per file since 2026-09-12. */
+    fileKey: string | null;
     originId: string | null;
   } | null>(null);
   /**
    * Width of the panel as a share of the WORKSPACE — the row to the right of
-   * the sidebar — 30–55 %. The conversation therefore keeps at least 45 % of
-   * the same row, which is what the brief asks and what a 768 px thread
-   * column needs on a 1440 px screen to stay readable.
+   * the sidebar — 45–55 % (CONTRACT-2 §9), and in pixels never under 520 nor
+   * over 960 (the style on the column below). The conversation takes what
+   * is left; at the 55 % ceiling that is 45 % of the same row, which is what
+   * a 768 px thread column needs on a 1440 px screen to stay readable.
    *
    * Of the workspace, not the shell: measured against the whole shell the
    * minimums summed to 0.95·W + 266 px (sidebar 260 + divider 6), which is
    * wider than every real screen (1440 px: 194 px over; 1920 px: 170 px
    * over), and `overflow-hidden` on the shell clipped exactly that much off
    * the panel's right edge — where Close, Download and the zoom buttons sit.
+   * The 520 px floor is written as `min(520px, 62%)` for the same reason: on
+   * a workspace narrower than ~840 px a hard 520 plus the thread's own
+   * minimum would overflow the row, and the panel would be clipped again.
    */
   const [artifactPanelPct, setArtifactPanelPct] = useState(50);
   /**
@@ -492,9 +509,15 @@ export function ChatApp() {
   // Stable across renders (MessageRow is memoised on shallow props): a
   // per-render arrow here would re-render every row on every token.
   const openArtifact = useCallback<OpenArtifact>(
-    (ref: ArtifactRef, originId: string) => {
+    (ref: ArtifactRef, originId: string, fileKey: string, siblings: ArtifactRef[]) => {
       rememberThreadScroll();
-      setArtifactPanel({ artifactId: ref.artifact_id, version: ref.version, originId });
+      setArtifactPanel({
+        refs: siblings,
+        artifactId: ref.artifact_id,
+        version: ref.version,
+        fileKey,
+        originId,
+      });
     },
     [rememberThreadScroll],
   );
@@ -502,6 +525,11 @@ export function ChatApp() {
     rememberThreadScroll();
     setArtifactPanel(null);
   }, [rememberThreadScroll]);
+  // Prev/next inside the panel: the column keeps its width, so the thread's
+  // scroll position is left alone — only the marked card changes.
+  const navigateArtifact = useCallback((artifactId: string, version: number, fileKey: string) => {
+    setArtifactPanel((prev) => (prev ? { ...prev, artifactId, version, fileKey } : prev));
+  }, []);
 
   // Restore the thread's place after the column changed width — before
   // paint, so the reader never sees the jump.
@@ -527,14 +555,14 @@ export function ChatApp() {
    * the sidebar's width never enters the arithmetic.
    */
   function clampPanelPct(pct: number): number {
-    return Math.min(55, Math.max(30, Math.round(pct)));
+    return Math.min(PANEL_MAX_PCT, Math.max(PANEL_MIN_PCT, Math.round(pct)));
   }
   function onDividerKeyDown(e: React.KeyboardEvent<HTMLDivElement>) {
     let next: number | null = null;
     if (e.key === 'ArrowLeft') next = artifactPanelPct + 2;
     else if (e.key === 'ArrowRight') next = artifactPanelPct - 2;
-    else if (e.key === 'Home') next = 55;
-    else if (e.key === 'End') next = 30;
+    else if (e.key === 'Home') next = PANEL_MAX_PCT;
+    else if (e.key === 'End') next = PANEL_MIN_PCT;
     if (next === null) return;
     e.preventDefault();
     setArtifactPanelPct(clampPanelPct(next));
@@ -3117,9 +3145,7 @@ export function ChatApp() {
           onDragOverCapture={onDragOver}
           onDragLeaveCapture={onDragLeave}
           onDropCapture={onDrop}
-          className={`relative flex min-w-0 flex-1 flex-col${
-            artifactPanel ? ' min-[900px]:min-w-[45%]' : ''
-          }`}
+          className="relative flex min-w-0 flex-1 flex-col"
         >
           {dragActive && (
             /* Pointer-events-none: an overlay that swallowed the drag would fire
@@ -3284,11 +3310,7 @@ export function ChatApp() {
                     clarificationAnswer={card.answeredWith}
                     onFeedback={on.onFeedback}
                     onOpenArtifact={openArtifact}
-                    activeArtifactKey={
-                      artifactPanel
-                        ? artifactKey(artifactPanel.artifactId, artifactPanel.version)
-                        : null
-                    }
+                    activeArtifactKey={artifactPanel?.fileKey ?? null}
                   />
                   );
                 })}
@@ -3402,15 +3424,22 @@ export function ChatApp() {
           />
         </div>
 
-        {/* 2026-09-11: the generated-file panel. Under 900 px the panel is a
-            fixed full-screen sheet and this wrapper has no box at all
-            (`contents`), so the basis below only ever applies beside the
+        {/* 2026-09-11: the generated-file panel. Under 768 px (`md`) the
+            panel is a fixed full-screen sheet and this wrapper has no box at
+            all (`contents`), so the basis below only ever applies beside the
             thread. The divider is desktop-only for the same reason.
 
             `flex-basis`, and NO `shrink-0`: the percentage is the panel's
             size when everything fits — which, measured against the workspace
             row, it always does — and if a box ever cannot fit the panel
-            yields rather than being clipped by the shell's overflow-hidden. */}
+            yields rather than being clipped by the shell's overflow-hidden.
+            The pixel floor and ceiling (CONTRACT-2 §9) sit on the same box.
+
+            ONE panel instance for the life of an open: clicking another card,
+            or prev/next inside the panel, re-targets it (the cursor props
+            change) rather than remounting it, so focus stays where the
+            person put it and a version's page images survive a step between
+            its PDF and its Word twin. */}
         {artifactPanel && (
           <>
             <div
@@ -3418,26 +3447,30 @@ export function ChatApp() {
               aria-orientation="vertical"
               aria-label="Resize the file panel"
               aria-valuenow={artifactPanelPct}
-              aria-valuemin={30}
-              aria-valuemax={55}
+              aria-valuemin={PANEL_MIN_PCT}
+              aria-valuemax={PANEL_MAX_PCT}
               tabIndex={0}
               onKeyDown={onDividerKeyDown}
               onPointerDown={onDividerPointerDown}
-              className="hidden w-1.5 shrink-0 cursor-col-resize touch-none bg-border transition-colors duration-ts hover:bg-accent/60 focus:outline-none focus-visible:bg-accent min-[900px]:block"
+              className="hidden w-1.5 shrink-0 cursor-col-resize touch-none bg-border transition-colors duration-ts hover:bg-accent/60 focus:outline-none focus-visible:bg-accent md:block"
             />
             <div
               data-testid="artifact-panel-column"
-              className="contents min-[900px]:block min-[900px]:h-full min-[900px]:min-w-0"
-              style={{ flexBasis: `${artifactPanelPct}%` }}
+              className="contents md:block md:h-full md:min-w-0"
+              style={{
+                flexBasis: `${artifactPanelPct}%`,
+                minWidth: `min(${PANEL_MIN_PX}px, 62%)`,
+                maxWidth: `${PANEL_MAX_PX}px`,
+              }}
             >
               <ArtifactPanel
-                // A different file is a fresh panel: state, focus and fetches
-                // all start over rather than being patched across.
-                key={artifactKey(artifactPanel.artifactId, artifactPanel.version)}
+                refs={artifactPanel.refs}
                 artifactId={artifactPanel.artifactId}
                 version={artifactPanel.version}
+                fileKey={artifactPanel.fileKey}
                 originId={artifactPanel.originId}
                 onClose={closeArtifactPanel}
+                onNavigate={navigateArtifact}
               />
             </div>
           </>
