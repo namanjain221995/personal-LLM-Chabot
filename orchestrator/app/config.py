@@ -380,6 +380,33 @@ class Settings:
         self.video_orphan_ttl_hours: int = _int("VIDEO_ORPHAN_TTL_HOURS", 72)
         self.video_maintenance_interval_s: float = _float("VIDEO_MAINTENANCE_INTERVAL_S", 1800.0)
 
+        # --- Artifact Studio (documents, decks, workbooks made in chat) ----
+        # Off switches the intent gate off: a request for a file is answered
+        # in text, as before. Per-member access is the ARTIFACTS feature.
+        self.artifacts_enabled: bool = _bool("ARTIFACTS_ENABLED", True)
+        # Jobs run one at a time by default: rendering is CPU-bound and the
+        # compose stage is a model call that shares the engine with chat.
+        self.artifact_max_concurrent_jobs: int = _int("ARTIFACT_MAX_CONCURRENT_JOBS", 1)
+        self.artifact_lease_ttl_s: float = _float("ARTIFACT_LEASE_TTL_S", 90.0)
+        # A stage that runs longer than this is failed, not waited on.
+        self.artifact_stage_timeout_s: float = _float("ARTIFACT_STAGE_TIMEOUT_S", 600.0)
+        # The renderer subprocess: wall clock and address space. A document
+        # that needs more than this is a page-count or image bomb.
+        self.artifact_render_timeout_s: float = _float("ARTIFACT_RENDER_TIMEOUT_S", 180.0)
+        self.artifact_render_memory_mb: int = _int("ARTIFACT_RENDER_MEMORY_MB", 2048)
+        # Space a job needs on the reports volume before it starts writing.
+        self.artifact_min_free_mb: int = _int("ARTIFACT_MIN_FREE_MB", 512)
+        # Per-person ceiling on published artifact bytes; a job past it is
+        # refused with quota_exceeded before any model call.
+        self.artifact_user_quota_mb: int = _int("ARTIFACT_USER_QUOTA_MB", 2048)
+        # Housekeeping: abandoned working directories (v<N>.tmp) older than
+        # this are removed; published versions are never removed by the sweep.
+        self.artifact_tmp_ttl_hours: int = _int("ARTIFACT_TMP_TTL_HOURS", 24)
+        self.artifact_maintenance_interval_s: float = _float("ARTIFACT_MAINTENANCE_INTERVAL_S", 1800.0)
+        # Max effort visual QA: pages sent to the vision model, downscaled.
+        self.artifact_qa_pages: int = _int("ARTIFACT_QA_PAGES", 4)
+        self.artifact_qa_width: int = _int("ARTIFACT_QA_WIDTH", 896)
+
         # --- Reranker ------------------------------------------------------
         # Backward compatibility: RERANK_ENABLED=false still disables the
         # feature when no backend is named. New profiles select an explicit
