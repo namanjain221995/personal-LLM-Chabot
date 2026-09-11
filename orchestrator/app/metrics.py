@@ -49,6 +49,12 @@ _ALLOWED = {
         "complete", "rejected", "cancelled", "expired",
         # chat_request_total
         "accepted", "attached", "replayed", "resumed", "conflict",
+        # video_jobs_total / video_stage_total / artifact_jobs_total: a job
+        # put back in the queue because its engine was down for the whole
+        # recovery window. video/pipeline.py has reported it since
+        # 2026-09-11 and it folded to "other" until the artifact pipeline
+        # (V31) needed the same word.
+        "deferred",
     },
     # What an upload is FOR. Three values, fixed by the upload rail.
     "purpose": {"dataset", "document", "video"},
@@ -66,7 +72,17 @@ _ALLOWED = {
     "stage": {
         "probe", "audio", "transcript", "frames", "ocr", "vision", "fusion",
         "index", "artifacts",
+        # Artifact Studio stages (app/artifacts/types.STAGES) plus the
+        # runner's publish step, for artifact_stage_seconds and
+        # artifact_corrections_total.
+        "intent", "gather", "outline", "compose", "render", "validate",
+        "visual",  # the Max-effort visual correction pass
+        "preview", "publish",
     },
+    # A file format the Artifact Studio writes (app/artifacts/types.FORMATS):
+    # artifact_render_seconds{format} and artifact_download_total{format}.
+    # Four values, fixed by the renderer set.
+    "format": {"pdf", "docx", "pptx", "xlsx"},
     # Speech to text. The vocabulary is the ASR model's own published set
     # (app/asr.SUPPORTED_LANGUAGES) plus "unknown" for a clip whose language
     # was not identified. Closed for the usual reason: a mis-parsed engine

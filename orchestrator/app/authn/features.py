@@ -42,6 +42,7 @@ class Feature(str, Enum):
     ATTACHMENTS = "attachments"
     VOICE_INPUT = "voice_input"
     VIDEO_ANALYSIS = "video_analysis"
+    ARTIFACTS = "artifacts"
 
 
 @dataclass(frozen=True)
@@ -85,6 +86,16 @@ FEATURES: tuple[FeatureSpec, ...] = (
         ),
         default=True,
         requires=Feature.ATTACHMENTS,
+    ),
+    FeatureSpec(
+        id=Feature.ARTIFACTS,
+        label="Documents, decks and workbooks",
+        hint=(
+            "Ask for a PDF, Word document, PowerPoint or Excel file in chat and "
+            "get a real file with an in-app preview. Off: such requests are "
+            "answered in text."
+        ),
+        default=True,
     ),
     FeatureSpec(
         id=Feature.WEB_SEARCH,

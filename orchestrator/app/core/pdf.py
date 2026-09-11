@@ -11,7 +11,17 @@ from __future__ import annotations
 
 import base64
 import io
+import threading
 from typing import List, Tuple
+
+#: PDFium is NOT thread-safe: two threads inside the library at once
+#: corrupt its state and the process dies (SIGSEGV/SIGABRT reproduced on
+#: 2026-09-11 with 16-80 concurrent preview rasterisations through
+#: asyncio.to_thread). Every pypdfium2 call in this process — the uploaded-
+#: PDF readers below and app/artifacts/render/preview.py — takes this ONE
+#: lock. It serialises the library, not the event loop: the rest of the
+#: process keeps running while one page renders.
+PDFIUM_LOCK = threading.Lock()
 
 # A handful of pages keeps the vision-token budget (and memory) sane; more than
 # this is reported as truncated to the user.
@@ -37,50 +47,52 @@ def extract_pdf_pages(
     """
     import pypdfium2 as pdfium  # lazy: arm64 wheel, no system deps
 
-    pdf = pdfium.PdfDocument(base64.b64decode(_strip_data_url(pdf_base64)))
-    try:
-        pages: List[str] = []
-        used = 0
-        for i in range(len(pdf)):
-            if used >= max_chars:
-                pages.append("")
-                continue
-            page = pdf[i]
-            textpage = page.get_textpage()
-            text = (textpage.get_text_range() or "").strip()
-            textpage.close()
-            page.close()
-            text = text[: max_chars - used]
-            used += len(text)
-            pages.append(text)
-        return pages, len(pdf)
-    finally:
-        pdf.close()
+    with PDFIUM_LOCK:
+        pdf = pdfium.PdfDocument(base64.b64decode(_strip_data_url(pdf_base64)))
+        try:
+            pages: List[str] = []
+            used = 0
+            for i in range(len(pdf)):
+                if used >= max_chars:
+                    pages.append("")
+                    continue
+                page = pdf[i]
+                textpage = page.get_textpage()
+                text = (textpage.get_text_range() or "").strip()
+                textpage.close()
+                page.close()
+                text = text[: max_chars - used]
+                used += len(text)
+                pages.append(text)
+            return pages, len(pdf)
+        finally:
+            pdf.close()
 
 
 def render_pdf_pages(pdf_base64: str, indices: List[int]) -> List[str]:
     """Render just the given page indices to PNG data URLs (for targeted OCR)."""
     import pypdfium2 as pdfium  # lazy
 
-    pdf = pdfium.PdfDocument(base64.b64decode(_strip_data_url(pdf_base64)))
-    try:
-        images: List[str] = []
-        for i in indices:
-            if i < 0 or i >= len(pdf):
-                continue
-            page = pdf[i]
-            bitmap = page.render(scale=RENDER_SCALE)
-            pil = bitmap.to_pil().convert("RGB")
-            buf = io.BytesIO()
-            pil.save(buf, format="PNG")
-            images.append(
-                "data:image/png;base64,"
-                + base64.b64encode(buf.getvalue()).decode()
-            )
-            page.close()
-        return images
-    finally:
-        pdf.close()
+    with PDFIUM_LOCK:
+        pdf = pdfium.PdfDocument(base64.b64decode(_strip_data_url(pdf_base64)))
+        try:
+            images: List[str] = []
+            for i in indices:
+                if i < 0 or i >= len(pdf):
+                    continue
+                page = pdf[i]
+                bitmap = page.render(scale=RENDER_SCALE)
+                pil = bitmap.to_pil().convert("RGB")
+                buf = io.BytesIO()
+                pil.save(buf, format="PNG")
+                images.append(
+                    "data:image/png;base64,"
+                    + base64.b64encode(buf.getvalue()).decode()
+                )
+                page.close()
+            return images
+        finally:
+            pdf.close()
 
 
 def render_pdf(
@@ -94,33 +106,34 @@ def render_pdf(
     import pypdfium2 as pdfium  # lazy: arm64 wheel, no system deps
 
     pdf_bytes = base64.b64decode(_strip_data_url(pdf_base64))
-    pdf = pdfium.PdfDocument(pdf_bytes)
-    try:
-        total = len(pdf)
-        n = min(total, max_pages)
-        images: List[str] = []
-        texts: List[str] = []
-        for i in range(n):
-            page = pdf[i]
-            textpage = page.get_textpage()
-            texts.append(textpage.get_text_range() or "")
-            textpage.close()
+    with PDFIUM_LOCK:
+        pdf = pdfium.PdfDocument(pdf_bytes)
+        try:
+            total = len(pdf)
+            n = min(total, max_pages)
+            images: List[str] = []
+            texts: List[str] = []
+            for i in range(n):
+                page = pdf[i]
+                textpage = page.get_textpage()
+                texts.append(textpage.get_text_range() or "")
+                textpage.close()
 
-            bitmap = page.render(scale=RENDER_SCALE)
-            pil = bitmap.to_pil().convert("RGB")
-            buf = io.BytesIO()
-            pil.save(buf, format="PNG")
-            images.append(
-                "data:image/png;base64,"
-                + base64.b64encode(buf.getvalue()).decode()
-            )
-            page.close()
+                bitmap = page.render(scale=RENDER_SCALE)
+                pil = bitmap.to_pil().convert("RGB")
+                buf = io.BytesIO()
+                pil.save(buf, format="PNG")
+                images.append(
+                    "data:image/png;base64,"
+                    + base64.b64encode(buf.getvalue()).decode()
+                )
+                page.close()
 
-        text = "\n\n".join(
-            f"--- Page {i + 1} ---\n{t.strip()}"
-            for i, t in enumerate(texts)
-            if t.strip()
-        )[:MAX_TEXT_CHARS]
-        return images, text, total
-    finally:
-        pdf.close()
+            text = "\n\n".join(
+                f"--- Page {i + 1} ---\n{t.strip()}"
+                for i, t in enumerate(texts)
+                if t.strip()
+            )[:MAX_TEXT_CHARS]
+            return images, text, total
+        finally:
+            pdf.close()

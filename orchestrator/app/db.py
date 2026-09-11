@@ -1651,6 +1651,133 @@ CREATE INDEX IF NOT EXISTS idx_query_trace_events_stage
 """
 
 
+_MIGRATION_V31 = """
+-- V31 (2026-09-11): Artifact Studio — documents, decks and workbooks made in
+-- chat, as DURABLE, VERSIONED, OWNER-SCOPED things.
+--
+-- `artifacts` is the identity a person edits, converts and reopens: one row
+-- per artifact, keyed by a server-minted uuid4 hex, owned by a user (CASCADE:
+-- a removed account takes its files' rows with it, as report_files does).
+-- `conversation_id` is informational and has no FK, for the same reason
+-- report_files has none and for the same reason the table is NOT in
+-- _SIDE_TABLES: deleting a chat must not take the person's deliverables with
+-- it. An artifact is addressable by id from GET /artifacts without its
+-- conversation, and a file a person downloaded last week is theirs whether
+-- or not the chat that produced it still exists.
+--
+-- `artifact_versions` is immutable once published: what was asked
+-- (operation, instruction, parent_version), what came out (files with
+-- sizes and sha256s, warnings, validation), and which template/renderer
+-- produced it so a later renderer never silently re-renders an old version
+-- differently. `files` is jsonb rather than a fourth table because a version
+-- has at most three files and the API reads them as one unit.
+--
+-- `artifact_jobs` is the unit of work: exactly one job produces exactly one
+-- version. It follows video_analyses (V28/V29) line by line — CHECK-
+-- constrained status, `stage` for the position within running, `progress`
+-- jsonb for the per-stage map (a new stage must not need a migration),
+-- `attempt`, and the V29 lease (`lease_owner`, `lease_expires_at`) renewed by
+-- a heartbeat so startup requeues only rows whose owner is dead — but is
+-- keyed by OWNER + artifact + version, not by content hash: two people asking
+-- for the same document get two artifacts. `idempotency_key` is what a chat
+-- turn retried after a lost acknowledgement presents: the same acceptance
+-- answers with the same job instead of a second one. `error` is a sentence
+-- for a person and `diagnostic_ref` the log correlation id; a stack trace,
+-- DSN, host or path never lands in either.
+CREATE TABLE IF NOT EXISTS artifacts (
+    id               text        PRIMARY KEY,
+    user_id          integer     NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    conversation_id  text        NOT NULL DEFAULT '',
+    title            text        NOT NULL DEFAULT '',
+    kind             text        NOT NULL
+                     CONSTRAINT artifacts_kind CHECK
+                     (kind IN ('document', 'presentation', 'workbook')),
+    current_version  integer     NOT NULL DEFAULT 0,
+    created_at       timestamptz NOT NULL,
+    updated_at       timestamptz NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_artifacts_user
+    ON artifacts (user_id, conversation_id, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS artifact_versions (
+    artifact_id      text        NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,
+    version          integer     NOT NULL,
+    job_id           text        NOT NULL DEFAULT '',
+    parent_version   integer,
+    operation        text        NOT NULL DEFAULT 'create'
+                     CONSTRAINT artifact_versions_operation CHECK
+                     (operation IN ('create', 'edit', 'convert')),
+    instruction      text        NOT NULL DEFAULT '',
+    status           text        NOT NULL DEFAULT 'queued'
+                     CONSTRAINT artifact_versions_status CHECK
+                     (status IN ('queued', 'running', 'completed', 'completed_with_warnings', 'failed', 'cancelled')),
+    formats          jsonb       NOT NULL DEFAULT '[]'::jsonb,
+    files            jsonb       NOT NULL DEFAULT '[]'::jsonb,
+    spec_version     integer     NOT NULL DEFAULT 1,
+    template_id      text        NOT NULL DEFAULT 'generic',
+    template_version text        NOT NULL DEFAULT '',
+    renderer_version text        NOT NULL DEFAULT '',
+    warnings         jsonb       NOT NULL DEFAULT '[]'::jsonb,
+    validation       jsonb       NOT NULL DEFAULT '{}'::jsonb,
+    assumptions      jsonb       NOT NULL DEFAULT '[]'::jsonb,
+    preview_kind     text        NOT NULL DEFAULT 'none',
+    preview_pages    integer     NOT NULL DEFAULT 0,
+    created_at       timestamptz NOT NULL,
+    completed_at     timestamptz,
+    PRIMARY KEY (artifact_id, version)
+);
+
+CREATE TABLE IF NOT EXISTS artifact_jobs (
+    id                text        PRIMARY KEY,
+    user_id           integer     NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    conversation_id   text        NOT NULL DEFAULT '',
+    artifact_id       text        NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,
+    version           integer     NOT NULL,
+    idempotency_key   text        NOT NULL UNIQUE,
+    generation_id     text        NOT NULL DEFAULT '',
+    operation         text        NOT NULL DEFAULT 'create'
+                      CONSTRAINT artifact_jobs_operation CHECK
+                      (operation IN ('create', 'edit', 'convert')),
+    requested_formats jsonb       NOT NULL DEFAULT '[]'::jsonb,
+    selected_formats  jsonb       NOT NULL DEFAULT '[]'::jsonb,
+    format_reason     text        NOT NULL DEFAULT '',
+    effort            text        NOT NULL DEFAULT 'fast',
+    mode              text        NOT NULL DEFAULT 'assistant',
+    template_id       text        NOT NULL DEFAULT 'generic',
+    instruction       text        NOT NULL DEFAULT '',
+    status            text        NOT NULL DEFAULT 'queued'
+                      CONSTRAINT artifact_jobs_status CHECK
+                      (status IN ('queued', 'running', 'completed', 'completed_with_warnings', 'failed', 'cancelled')),
+    stage             text        NOT NULL DEFAULT 'intent',
+    progress          jsonb       NOT NULL DEFAULT '{}'::jsonb,
+    attempt           integer     NOT NULL DEFAULT 0,
+    input_hash        text        NOT NULL DEFAULT '',
+    failure_category  text        NOT NULL DEFAULT '',
+    error             text        NOT NULL DEFAULT '',
+    diagnostic_ref    text        NOT NULL DEFAULT '',
+    lease_owner       text        NOT NULL DEFAULT '',
+    lease_expires_at  timestamptz,
+    created_at        timestamptz NOT NULL,
+    started_at        timestamptz,
+    heartbeat_at      timestamptz,
+    updated_at        timestamptz NOT NULL,
+    completed_at      timestamptz
+);
+CREATE INDEX IF NOT EXISTS idx_artifact_jobs_user
+    ON artifact_jobs (user_id, conversation_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_artifact_jobs_open
+    ON artifact_jobs (status, lease_expires_at) WHERE status IN ('queued', 'running');
+-- The FKs the cascade walks and the join the API makes (job -> version by
+-- job_id), indexed as V29 indexes every FK it cascades through: a user
+-- deletion is users -> artifacts -> artifact_jobs, and without these each
+-- artifact costs a sequential scan of artifact_jobs.
+CREATE INDEX IF NOT EXISTS idx_artifact_jobs_artifact
+    ON artifact_jobs (artifact_id, version);
+CREATE INDEX IF NOT EXISTS idx_artifact_versions_job
+    ON artifact_versions (job_id);
+"""
+
+
 _MIGRATIONS: tuple = (
     (1, _MIGRATION_V1),
     (2, _MIGRATION_V2),
@@ -1682,6 +1809,7 @@ _MIGRATIONS: tuple = (
     (28, _MIGRATION_V28),
     (29, _MIGRATION_V29),
     (30, _MIGRATION_V30),
+    (31, _MIGRATION_V31),
 )
 
 #: The version `init_schema` brings a database up to. Exported so callers (and
@@ -2203,6 +2331,12 @@ _SIDE_TABLES = (
     # V29: a conversation's upload sessions and send intents are its own.
     "upload_sessions",
     "chat_requests",
+    # V31 artifacts, artifact_versions and artifact_jobs are DELIBERATELY
+    # absent, for the reason report_files is: they are the person's
+    # deliverables, addressed by id from GET /artifacts without their
+    # conversation, and a file downloaded last week stays theirs whether or
+    # not the chat that produced it does. They leave with the account (the
+    # users FK cascades), never with a chat.
 )
 
 

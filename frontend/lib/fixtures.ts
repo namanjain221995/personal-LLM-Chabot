@@ -461,6 +461,60 @@ const videoFixture: Fixture = {
   },
 };
 
+// 2026-09-11: Artifact Studio — the answer IS a file. The ref is already
+// terminal so the card shows Ready without polling; with no orchestrator
+// behind MOCK_MODE the panel's version fetch answers 502 and the panel shows
+// its honest failed state, which is the demo's truth.
+const ARTIFACT_MOCK_ID = 'a3f9c2d1e4b5f6a7b8c9d0e1f2a3b4c5';
+const artifactFixture: Fixture = {
+  text:
+    'Your board deck is ready — nine slides: the quarter in numbers, pipeline ' +
+    'by stage, the two risks, and the ask. Open it beside the chat or download ' +
+    'the PowerPoint.',
+  meta: {
+    route: 'artifact',
+    artifacts: [
+      {
+        artifact_id: ARTIFACT_MOCK_ID,
+        version: 1,
+        job_id: 'ffffffffffffffffffffffffffffffff',
+        title: 'Board deck',
+        kind: 'presentation',
+        status: 'completed',
+        files: [
+          {
+            format: 'pptx',
+            filename: 'board-deck-v1.pptx',
+            mime_type:
+              'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+            size: 250_000,
+            slides: 9,
+            download_url: `/artifacts/${ARTIFACT_MOCK_ID}/v/1/file/pptx?disposition=attachment`,
+            inline_url: `/artifacts/${ARTIFACT_MOCK_ID}/v/1/file/pptx?disposition=inline`,
+          },
+          {
+            format: 'pdf',
+            filename: 'board-deck-v1.pdf',
+            mime_type: 'application/pdf',
+            size: 180_000,
+            pages: 9,
+            download_url: `/artifacts/${ARTIFACT_MOCK_ID}/v/1/file/pdf?disposition=attachment`,
+            inline_url: `/artifacts/${ARTIFACT_MOCK_ID}/v/1/file/pdf?disposition=inline`,
+          },
+        ],
+        preview_kind: 'pages',
+        preview_pages: 9,
+        preview_url: `/artifacts/${ARTIFACT_MOCK_ID}/v/1/preview`,
+        thumbnail_url: `/artifacts/${ARTIFACT_MOCK_ID}/v/1/preview/1.png?w=240`,
+        warnings: [],
+        created_at: '2026-09-11T10:00:00Z',
+        operation: 'create',
+        status_url: '/artifacts/jobs/ffffffffffffffffffffffffffffffff',
+      },
+    ],
+  },
+};
+
 export const FIXTURES: Record<Engine, Fixture> = {
   clarify: clarifyFixture,
   sql: sqlFixture,
@@ -475,6 +529,7 @@ export const FIXTURES: Record<Engine, Fixture> = {
   deep_research: deepResearchFixture,
   repo: repoFixture,
   video: videoFixture,
+  artifact: artifactFixture,
 };
 
 /**
@@ -508,6 +563,11 @@ export function pickFixtureEngine(
     !/\b(month|quarter|year|week|today|open|all time|q[1-4]|\d{4})\b/.test(q)
   ) {
     return 'clarify';
+  }
+  // A deck is only ever a generated file; a PDF/DOCX request stays on the
+  // older report route below, which the mock has answered since v1.
+  if (/\b(slides?|deck|presentation|pptx)\b/.test(q)) {
+    return 'artifact';
   }
   if (/\b(report|word file|docx|pdf|one-page|deliverable)\b/.test(q)) {
     return 'report';

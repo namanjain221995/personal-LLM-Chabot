@@ -609,3 +609,61 @@ def test_failure_sentence_classifies_sdk_errors_and_the_wrapper():
     # Never the exception's own text on the wire.
     sentence, _ = main._failure_sentence(_conn_error())
     assert "connection refused" not in sentence.lower()
+
+
+def test_json_completion_records_why_the_answer_stopped(monkeypatch, instant_engine, caplog):
+    """A guided JSON answer cut off at max_tokens is unparseable; the caller
+    reads the finish reason to say so, and the operator's log names the
+    budget (never the content)."""
+    import logging
+
+    monkeypatch.setattr(llm.context, "fit_request", _sized)
+
+    class _Cut(_FlakyClient):
+        @property
+        def _response(self):
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content='{"a": [1, 2', reasoning_content=None), finish_reason="length")],
+                usage=SimpleNamespace(prompt_tokens=10, completion_tokens=64),
+            )
+
+    monkeypatch.setattr(llm, "_client", lambda *a, **k: _Cut(_conn_error, failures=0, response=None))
+    async def call(schema_name="decision"):
+        # Inside the task, as a caller reads it (the ContextVar is task-scoped).
+        llm._set_finish_reason("stop")  # stale from an earlier call: must be cleared, not inherited
+        out = await llm.json_completion([{"role": "user", "content": "x"}], json_schema={"type": "object"}, schema_name=schema_name)
+        return out, llm.get_finish_reason()
+
+    with caplog.at_level(logging.WARNING, logger="app.llm"):
+        out, reason = asyncio.run(call("artifact_workbook"))
+    assert out == '{"a": [1, 2' and reason == "length"
+    assert "artifact_workbook answer truncated at max_tokens=64" in caplog.text and '"a"' not in caplog.text
+
+    monkeypatch.setattr(llm, "_client", lambda *a, **k: _FlakyClient(_conn_error, failures=0, response=None))
+    assert asyncio.run(call())[1] == "stop"
+
+
+def test_json_completion_sizes_the_pool_when_thinking_is_on(monkeypatch, instant_engine):
+    """`max_tokens` is the answer's ceiling; with thinking on the reasoning
+    shares the pool, so the request is floored at MAX_OUTPUT_TOKENS (or the
+    ceiling plus the effort's budget in budgeted mode) — the rule
+    stream_chat already applied. The Artifact Studio's outline (2,500) and
+    review (2,000) calls were the first thinking-on JSON calls, and both
+    ended inside the reasoning block."""
+    seen = []
+
+    async def sized(messages, **kwargs):
+        seen.append(kwargs.get("requested_max_tokens"))
+        return list(messages), kwargs.get("requested_max_tokens") or 64
+
+    monkeypatch.setattr(llm.context, "fit_request", sized)
+    monkeypatch.setattr(llm, "_client", lambda *a, **k: _FlakyClient(_conn_error, failures=0, response=None))
+    monkeypatch.setattr(settings, "max_output_tokens", 65_536)
+    monkeypatch.setattr(settings, "thinking_budget_mode", "unbounded")
+    asyncio.run(llm.json_completion([{"role": "user", "content": "x"}], json_schema={"type": "object"}, max_tokens=2500, thinking=False))
+    asyncio.run(llm.json_completion([{"role": "user", "content": "x"}], json_schema={"type": "object"}, max_tokens=2500, thinking=True, effort="think"))
+    assert seen == [2500, 65_536]
+    monkeypatch.setattr(settings, "thinking_budget_mode", "client")
+    monkeypatch.setattr(settings, "thinking_budget_high", 6000)
+    asyncio.run(llm.json_completion([{"role": "user", "content": "x"}], json_schema={"type": "object"}, max_tokens=2500, thinking=True, effort="think"))
+    assert seen[-1] == 8500

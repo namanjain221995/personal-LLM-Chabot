@@ -333,3 +333,30 @@ export const IconLink = ({ size, className }: IconProps) => (
     <path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7" />
   </svg>
 );
+
+/* -------------------------------------------- Artifact Studio (2026-09-11)
+   The set had a right chevron, a document and a diagram, but no way to say
+   "back", "slides" or "grid" — the three shapes a generated-file card and its
+   viewer need. Same 24-grid, same stroke, so they sit beside the others. */
+
+export const IconChevronLeft = ({ size, className }: IconProps) => (
+  <svg {...base(size, className)}>
+    <path d="m15 6-6 6 6 6" />
+  </svg>
+);
+
+/** A slide on an easel — presentations (.pptx). */
+export const IconPresentation = ({ size, className }: IconProps) => (
+  <svg {...base(size, className)}>
+    <rect x="3" y="4" width="18" height="12" rx="1.5" />
+    <path d="M12 16v4M8 21l4-1 4 1M7 12l3-3 2.5 2L16 8" />
+  </svg>
+);
+
+/** A four-cell grid — workbooks (.xlsx) and the sheet viewer. */
+export const IconGrid = ({ size, className }: IconProps) => (
+  <svg {...base(size, className)}>
+    <rect x="3" y="3" width="18" height="18" rx="2" />
+    <path d="M3 9h18M3 15h18M9 3v18M15 3v18" />
+  </svg>
+);

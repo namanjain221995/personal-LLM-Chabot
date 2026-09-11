@@ -41,9 +41,13 @@ psycopg[binary,pool]>=3.2,<4
 # Reranker (Qwen3-Reranker-0.6B). Imported LAZILY inside the rag engine only —
 # the app and the test suite run without it. Disable at runtime with RERANK_ENABLED=false.
 transformers>=4.51
-# PDF engine for pandoc (pandoc --pdf-engine=weasyprint). Invoked as a
-# subprocess by pandoc; never imported by the app itself.
-weasyprint>=61
+# PDF engine for pandoc (pandoc --pdf-engine=weasyprint) AND, since the
+# Artifact Studio, driven in-process by app/artifacts/render/pdf.py with a
+# custom URL fetcher. PINNED: the fetcher contract changed between 69 and 70
+# (URLFetcherResponse required; `_fail_on_errors` read without a default),
+# and an unpinned rebuild on 2026-09-11 broke every deck PDF in the container
+# while the venv passed. Move the pin deliberately, with the renderer suites.
+weasyprint==70.0
 pypdfium2>=4.30
 pillow>=10.0
 trafilatura>=1.12
@@ -55,3 +59,16 @@ trafilatura>=1.12
 # PyAV/OpenCV in-process would run on the event loop's cores; a child process
 # is bounded by `-threads` and killed on a deadline.
 webrtcvad-wheels>=2.0.14
+# Artifact Studio (2026-09-11): the Office writers behind app/artifacts/render.
+# EXACT pins, identical in requirements-dev.txt, because the files a person
+# downloads are these libraries' output and a silent minor bump changes the
+# bytes. Both are pure-Python wheels (py3-none-any) over lxml, which is
+# already here; python-pptx also pulls XlsxWriter (pure Python) for the
+# workbook embedded in a native chart. Verified downloadable for
+# manylinux2014_aarch64 on cp311 and cp312. Imported lazily only.
+python-pptx==1.0.2
+python-docx==1.1.2
+# XlsxWriter is python-pptx's transitive dependency (the workbook inside a
+# native chart); pinned so that workbook's bytes do not change under a
+# silent minor bump either. Pure Python.
+XlsxWriter==3.2.9

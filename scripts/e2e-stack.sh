@@ -122,10 +122,10 @@ up() {
   # Generous: a first start runs every migration and probes six engines
   # before it answers, and a cold page cache makes that slower still.
   for i in $(seq 1 180); do
-    curl -fsS -m 3 "http://127.0.0.1:$ORCH_PORT/health" >/dev/null 2>&1 && break
+    curl -fsS -m 15 "http://127.0.0.1:$ORCH_PORT/health" >/dev/null 2>&1 && break
     sleep 2
   done
-  curl -fsS -m 3 "http://127.0.0.1:$ORCH_PORT/health" >/dev/null 2>&1 \
+  curl -fsS -m 15 "http://127.0.0.1:$ORCH_PORT/health" >/dev/null 2>&1 \
     || die "orchestrator did not become healthy — docker logs $ORCH"
   for i in $(seq 1 60); do
     curl -fsS -m 3 "http://127.0.0.1:$FRONT_PORT/login" >/dev/null 2>&1 && break

@@ -28,7 +28,12 @@ export type Engine =
   | 'clarify'
   // 2026-09-09: a video attached to the chat — transcribed, read off the
   // screen, summarised, then answered with [m:ss] citations.
-  | 'video';
+  | 'video'
+  // 2026-09-11: Artifact Studio — the turn produced a real file and the
+  // final meta carries `artifacts[]` (docs/artifact-studio/CONTRACT.md §7).
+  // In the union, not beside it: `Record<Engine, …>` tables (EngineBadge,
+  // fixtures) exist so the compiler makes every route account for itself.
+  | 'artifact';
 
 /**
  * Historically two models. There is now ONE (Qwen3.6-35B-A3B) and the picker
@@ -101,6 +106,102 @@ export interface ReportFile {
 }
 
 export type DataRow = Record<string, unknown>;
+
+/* ------------------------------------------------ Artifact Studio (2026-09-11)
+ *
+ * Mirrors orchestrator/app/artifacts/types.py — JOB_STATUSES, FileRef.to_json
+ * and ArtifactRef.to_json — and docs/artifact-studio/CONTRACT.md §7. The
+ * reference is deliberately SMALL: it rides on every history load (the
+ * localStorage quota incident, lib/history.ts), so it carries ids, names,
+ * sizes and relative API paths, never bytes or page images. Every URL is a
+ * path the orchestrator built from ids; the browser prefixes `/api` and
+ * nothing else (lib/artifacts.ts).
+ */
+
+/** A job's coarse state. The last four are terminal. */
+export type ArtifactStatus =
+  | 'queued'
+  | 'running'
+  | 'completed'
+  | 'completed_with_warnings'
+  | 'failed'
+  | 'cancelled';
+
+/** What a person asked for, at the level that picks the renderer set. */
+export type ArtifactKind = 'document' | 'presentation' | 'workbook';
+
+/** A format the studio can actually write and reopen. Nothing else is promised. */
+export type ArtifactFormat = 'pdf' | 'docx' | 'pptx' | 'xlsx';
+
+/** One rendered file of one version. */
+export interface ArtifactFile {
+  format: ArtifactFormat | string;
+  /** `quarterly-review-v2.pptx` — the download name, never an identity. */
+  filename: string;
+  mime_type: string;
+  size: number;
+  sha256?: string;
+  pages?: number;
+  slides?: number;
+  sheets?: number;
+  /** `/artifacts/{id}/v/{n}/file/{format}?disposition=attachment` */
+  download_url: string;
+  /** Same file, `Content-Disposition: inline`. */
+  inline_url: string;
+}
+
+/** One version of one artifact, as the chat meta and the API describe it. */
+export interface ArtifactRef {
+  artifact_id: string;
+  version: number;
+  job_id: string;
+  title: string;
+  kind: ArtifactKind | string;
+  status: ArtifactStatus | string;
+  files: ArtifactFile[];
+  /** `pages` (rasterised PDF twin) · `grid` (workbook) · `none`. */
+  preview_kind: 'pages' | 'grid' | 'none' | string;
+  preview_pages: number;
+  /** `/artifacts/{id}/v/{n}/preview` or `.../sheets`, '' when none. */
+  preview_url: string;
+  /** `/artifacts/{id}/v/{n}/preview/1.png?w=240`, '' when no pages. */
+  thumbnail_url: string;
+  warnings: string[];
+  created_at: string;
+  operation: 'create' | 'edit' | 'convert' | string;
+  parent_version?: number;
+  /** `/artifacts/jobs/{job_id}` — polled while `status` is not terminal. */
+  status_url: string;
+}
+
+/** GET /artifacts/jobs/{job_id} (docs/artifact-studio/API.md). */
+export interface ArtifactJob {
+  job_id: string;
+  artifact_id: string;
+  version: number;
+  status: ArtifactStatus | string;
+  /** intent · gather · outline · compose · render · validate · preview */
+  stage?: string | null;
+  /** The stage's human title, as the server words it. */
+  stage_title?: string | null;
+  progress?: {
+    detail?: string | null;
+    elapsed_s?: number | null;
+    /**
+     * Per-stage outcome so far (`{stage: {status, ms, detail}}`), as the
+     * pipeline records it. Not read by the browser today — the card shows the
+     * CURRENT stage's title — but it is on the wire (api.py job_status) and
+     * a type that omits it would misdescribe the answer.
+     */
+    stages?: Record<string, { status?: string; ms?: number; detail?: string }>;
+  } | null;
+  attempt?: number;
+  failure_category?: string | null;
+  /** The safe user-facing sentence — never a stack trace, DSN, host or path. */
+  error?: string | null;
+  /** Present when terminal and published. */
+  artifact?: ArtifactRef | null;
+}
 
 /**
  * V5 (2026-07-23): a block of long text/code pasted into the composer, shown
@@ -320,6 +421,14 @@ export interface Meta {
   chart_data?: DataRow[];
   citations?: Citation[];
   report_files?: ReportFile[];
+  /**
+   * 2026-09-11 (Artifact Studio): the files this turn produced, one ref per
+   * artifact VERSION. Emitted INSTEAD of `report_files` for artifacts — their
+   * ids resolve through /api/artifacts, never the flat /api/reports route.
+   * Arrives on the single final meta; after a reload the cards rebuild from
+   * it, and a ref whose `status` is not terminal polls its `status_url`.
+   */
+  artifacts?: ArtifactRef[];
   /**
    * Rows inside the full-result export in `report_files` — which is the whole
    * result, not the `data` preview. Set by the Salesforce engine whenever the

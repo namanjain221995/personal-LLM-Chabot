@@ -49,6 +49,7 @@ import { Markdown } from './Markdown';
 import { PastedChip } from './PastedChip';
 import { QuotedContext } from './QuotedContext';
 import { ProofDrawer } from './ProofDrawer';
+import { ArtifactCards, type OpenArtifact } from './artifacts/ArtifactCards';
 import { CopyButton } from './CopyButton';
 import { ReasoningAccordion } from './ReasoningAccordion';
 import { continuationNotice, friendlyError, trimNotice } from '@/lib/errors';
@@ -372,6 +373,8 @@ function MessageRowImpl({
   clarificationAnswer = '',
   onReuseAttachment,
   conversationId = null,
+  onOpenArtifact,
+  activeArtifactKey = null,
 }: {
   message: ChatMessage;
   isLast: boolean;
@@ -464,6 +467,15 @@ function MessageRowImpl({
    * rendered outside a chat) simply means no server-backed preview.
    */
   conversationId?: string | null;
+  /**
+   * 2026-09-11 (Artifact Studio): open a generated file in ChatApp's side
+   * panel. Omitted in contexts with no panel (previews, tests), where the
+   * cards still render and Download still works — Open then does nothing
+   * visible, which is the honest behaviour of a control with no host.
+   */
+  onOpenArtifact?: OpenArtifact;
+  /** `artifact_id:version` of the file the panel is showing, to mark its card. */
+  activeArtifactKey?: string | null;
 }) {
   // Hooks live above the user-bubble early return (rules of hooks).
   const [activityOpen, setActivityOpen] = useState(false);
@@ -1246,6 +1258,19 @@ function MessageRowImpl({
 
           {message.meta && <ProofDrawer meta={message.meta} />}
 
+          {/* 2026-09-11: generated files (Artifact Studio). Beside the proof
+              drawer, not inside it — the drawer is the Salesforce proof
+              trail by owner decision (ProofDrawer.tsx), and a file card is a
+              deliverable, not evidence. `noopOpen` keeps the cards rendering
+              wherever the row is rendered without a host panel. */}
+          {message.meta?.artifacts && message.meta.artifacts.length > 0 && (
+            <ArtifactCards
+              artifacts={message.meta.artifacts}
+              onOpen={onOpenArtifact ?? noopOpen}
+              activeKey={activeArtifactKey}
+            />
+          )}
+
           {!streaming && message.content && message.status !== 'error' && (
             <div
               className={`${ACTION_ROW} ${
@@ -1357,6 +1382,9 @@ function MessageRowImpl({
  * clarification card, the row becoming last) still re-renders, because that
  * is a prop change like any other.
  */
+/** A stable stand-in for `onOpenArtifact` when the row has no host panel. */
+const noopOpen: OpenArtifact = () => undefined;
+
 /** "a.mp4", "a.mp4 and b.mp4", "a.mp4, b.mp4 and c.mp4" — for the unsent notice. */
 function listNames(names: string[]): string {
   if (names.length <= 1) return names.join('');
