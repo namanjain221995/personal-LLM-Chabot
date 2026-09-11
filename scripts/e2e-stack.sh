@@ -178,7 +178,10 @@ purge() {
 
 status() {
   docker ps --filter "name=$PROJECT" --format '{{.Names}}\t{{.Status}}\t{{.Ports}}'
-  curl -fsS -m 3 "http://127.0.0.1:$ORCH_PORT/health" 2>/dev/null | head -c 200 || echo "orchestrator not answering"
+  # 20 s, not 3: /health probes six model engines and answers in about three
+  # seconds when they are idle, longer while a video is being analysed. A
+  # tight timeout here reported a working stack as a dead one.
+  curl -fsS -m 20 "http://127.0.0.1:$ORCH_PORT/health" 2>/dev/null | head -c 200 || echo "orchestrator not answering"
   echo
 }
 
