@@ -401,6 +401,9 @@ class RoutedProvider:
     #: Long enough that a restarting engine is not hammered, short enough that
     #: a recovered one is back before anyone notices it left.
     _COOLDOWN_S = 20.0
+    #: The ceiling on the doubling below. An engine that has been broken for
+    #: ten minutes is checked every ten minutes, not every twenty seconds.
+    _COOLDOWN_MAX_S = 600.0
 
     def __init__(self, engines: Sequence[ASRProvider]) -> None:
         if not engines:
@@ -408,6 +411,10 @@ class RoutedProvider:
         self._engines = list(engines)
         self._active: Dict[int, int] = {i: 0 for i in range(len(self._engines))}
         self._down_until: Dict[int, float] = {i: 0.0 for i in range(len(self._engines))}
+        #: Consecutive failures per engine, reset by the first success. It
+        #: lengthens the stand-down and — just as importantly — is REPORTED,
+        #: because the failure this exists for is invisible otherwise.
+        self._failures: Dict[int, int] = {i: 0 for i in range(len(self._engines))}
         self.name = self._engines[0].name
         self.model = self._engines[0].model
 
@@ -458,7 +465,13 @@ class RoutedProvider:
             self._active[index] += 1
             try:
                 result = await getattr(engine, method)(audio, **kwargs)
+                if self._failures[index]:
+                    log.info(
+                        "ASR engine %s answered again after %d consecutive failures",
+                        getattr(engine, "base_url", index), self._failures[index],
+                    )
                 self._down_until[index] = 0.0
+                self._failures[index] = 0
                 return result
             except ASRRejected:
                 # The engine understood the request and refused the AUDIO.
@@ -466,10 +479,29 @@ class RoutedProvider:
                 raise
             except ASRUnavailable as exc:
                 last = exc
-                self._down_until[index] = time.monotonic() + self._COOLDOWN_S
+                # THE STAND-DOWN LENGTHENS WITH CONSECUTIVE FAILURES, and the
+                # reason is a real outage: on 2026-09-10 one node's engine
+                # answered /health for twelve hours while every transcription
+                # on it died with a CUDA error. A fixed twenty seconds meant a
+                # clip was fed to it every twenty seconds, failed after the
+                # round trip, and was retried elsewhere — so half the fleet
+                # was dead, the work serialised onto one node, and nothing
+                # said so. Doubling turns a permanent fault into a cheap
+                # periodic retry, and the count below makes it visible.
+                self._failures[index] += 1
+                cooldown = min(
+                    self._COOLDOWN_S * (2 ** (self._failures[index] - 1)),
+                    self._COOLDOWN_MAX_S,
+                )
+                self._down_until[index] = time.monotonic() + cooldown
+                metrics.inc(
+                    "asr_engine_standdown_total",
+                    "times a speech engine was stood down after failing a request",
+                )
                 log.warning(
-                    "ASR engine %s is unavailable (%s); standing it down for %.0fs",
-                    getattr(engine, "base_url", index), exc, self._COOLDOWN_S,
+                    "ASR engine %s is unavailable (%s); standing it down for %.0fs "
+                    "(consecutive failures: %d)",
+                    getattr(engine, "base_url", index), exc, cooldown, self._failures[index],
                 )
             finally:
                 self._active[index] -= 1
@@ -490,6 +522,10 @@ class RoutedProvider:
                 "endpoint": getattr(engine, "base_url", ""),
                 "active": self._active[i],
                 "available": self._down_until[i] <= now,
+                # An engine that answers /health and fails every transcription
+                # looks available here without these two.
+                "consecutive_failures": self._failures[i],
+                "standing_down_for_s": max(0, round(self._down_until[i] - now)),
             }
             for i, engine in enumerate(self._engines)
         ]
