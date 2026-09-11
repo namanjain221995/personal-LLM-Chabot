@@ -31,6 +31,20 @@ FOLLOW-UPS. An edit gets the PARENT spec as JSON plus the instruction and
 returns a whole new spec — the renderers then produce a new version. A
 conversion needs no model call at all: the stored spec is rendered again in
 the new format.
+
+ROWS THE MODEL NEVER TYPES (CONTRACT-2 §4, §6; 2026-09-12). A pasted table
+reaches the composer as a material `DataTable` and a sheet built from it
+says `rows_from: "<id>"` with `rows: []`; a dataset that does not exist yet
+is a `generator` recipe with `rows: []`. `_fill_code_made_rows` copies or
+generates the rows BEFORE `spec.parse_body`, so the same validated Sheet
+carries them — a 500-row dataset costs the model a schema, not 25,000
+tokens, and a 34-row audit table keeps every blank cell. A `rewrite` column
+(an audit comment made concise) is the ONE place the model touches a row,
+and it does so cell by cell in batches with per-row ids, one in, one out,
+through `tables.apply_rewrites`, which keeps the original wherever a
+timestamp, a quoted phrase or a figure would change. Coverage is checked
+too: the sections a request named ("include A, B and C") are matched to the
+draft's headings, and a missing one costs one correction at every effort.
 """
 from __future__ import annotations
 
@@ -45,6 +59,7 @@ from pydantic import ValidationError
 from .. import llm
 from ..core.sf_intel.planner import extract_json_object
 from . import spec as S
+from . import tables
 from . import types as T
 
 log = logging.getLogger(__name__)
@@ -106,6 +121,14 @@ class Material:
     #: Things the engine decided the model should know: audience it inferred,
     #: the mode, that Salesforce data is or is not available, today's date.
     notes: List[str] = field(default_factory=list)
+    #: What code did to a pasted table before it became a DataTable
+    #: (CONTRACT-2 §6: rows, blanks, forward_filled, the filled column) —
+    #: the engine's parse report, carried so the completion sentence and the
+    #: files' methodology note can say it.
+    transform: Dict[str, Any] = field(default_factory=dict)
+    #: "500 rows" — the count the person asked for; a generator that says
+    #: another number is set to this one (the model forgets).
+    row_count: Optional[int] = None
 
 
 @dataclass
@@ -131,6 +154,10 @@ class ComposeResult:
     outline: Optional[dict] = None
     review: Optional[dict] = None
     model_calls: int = 0
+    #: CONTRACT-2 §6/§7: {rows, blanks, forward_filled, rewritten,
+    #: kept_original, generated, …} — what code did to the rows, for the
+    #: sentence. Empty for a document, a deck, or a workbook the model typed.
+    transform: Dict[str, Any] = field(default_factory=dict)
 
 
 # ----------------------------------------------------------------- prompts --
@@ -171,7 +198,8 @@ _KIND_GUIDE = {
     ),
     "workbook": (
         "Write a workbook: one sheet per table of data, typed columns, real "
-        "rows from the material only (never invented numbers), totals as "
+        "rows from the material only (never invented numbers — sample data is "
+        "a generator recipe, below), totals as "
         "column+function requests where `column` is the column's HEADER TEXT "
         "exactly as you wrote it in `columns` (the file writes the formula), "
         "a chart per sheet where it helps: its `categories` are the CELLS of "
@@ -213,6 +241,45 @@ def _source_block(sources: Sequence[Source], limit_chars: int) -> str:
         if used >= limit_chars:
             break
     return "\n\n".join(out)
+
+
+def _workbook_guide(req: ComposeRequest) -> str:
+    """The workbook rules the schema alone does not carry (CONTRACT-2 §4,
+    §6): the material tables by id and shape, with the order to use
+    `rows_from` and never retype rows; a `generator` for sample data, with
+    the exact count when one was asked for; `rewrite` for a comment column;
+    `style` for borders, highlights and orientation."""
+    m = req.material
+    lines: List[str] = []
+    if m is not None and m.tables:
+        lines.append(
+            "MATERIAL TABLES. These rows already exist and code copies them into the file. A sheet made "
+            "from one sets rows_from to the table's id and leaves rows EMPTY ([]); never retype, drop, merge "
+            "or reorder rows, and a blank cell stays blank. Give the sheet the same column names in the same "
+            "order (with types), and put a totals row or a chart on it only if asked."
+        )
+        for t in m.tables:
+            lines.append(f"  TABLE {t.id}: {len(t.columns)} columns × {len(t.rows):,} rows: {', '.join(t.columns)}")
+    exact = f" The person asked for exactly {m.row_count:,} rows: the generator's rows MUST be {m.row_count:,}." if m is not None and m.row_count else ""
+    lines.append(
+        "SAMPLE DATA. When the request asks for N sample, dummy, synthetic, test or realistic records, do NOT type "
+        "rows: give the sheet a generator — rows: N, a seed, and ONE recipe per column with the SAME names in the "
+        "SAME order (kinds: id with a pattern such as \"CAND-{n:04d}\"; name; email; choice with values and weights; "
+        "int or float with min and max; date or datetime with start and end; text with a pool of phrases; derived "
+        "from other columns) — and rows: []. Put the consistency rules in the recipes: only_when for a cell that "
+        "exists only in some states (a completion time only when status is Completed), unique for keys, realistic "
+        "ranges." + exact
+    )
+    lines.append(
+        "REWRITE. When asked to humanise, clean up, tidy, professionalise or rewrite a text column (audit comments, "
+        "notes, feedback), keep the rows exactly as they are and add rewrite: [{column, instruction}] to the sheet; "
+        "code rewrites that column cell by cell and keeps timestamps and quoted text. Never rewrite rows yourself."
+    )
+    lines.append(
+        "STYLE. Borders, a bold header, a header fill, a highlighted column (red, amber, green or blue), wrapped text "
+        "and landscape pages go in the sheet's style; a CSV carries data only, the Excel, Word and PDF files carry the style."
+    )
+    return "\n".join(lines)
 
 
 def _table_block(tables: Sequence[DataTable]) -> str:
@@ -267,8 +334,9 @@ def _material_messages(req: ComposeRequest, *, budget: T.EffortBudget) -> List[d
                     f"{tpl['max_bullet_chars']} characters; write to that, never over it.")
         except Exception:  # noqa: BLE001 — the caps are advice; the renderer still fits
             caps = ""
+    guide = f"\n\n{_workbook_guide(req)}" if req.kind == "workbook" else ""
     system = (
-        f"{_ROLE}\n\n{_KIND_GUIDE[req.kind]}{caps}\n\n{_TEMPLATE_GUIDE.get(req.template_id, _TEMPLATE_GUIDE['generic'])}\n\n"
+        f"{_ROLE}\n\n{_KIND_GUIDE[req.kind]}{caps}{guide}\n\n{_TEMPLATE_GUIDE.get(req.template_id, _TEMPLATE_GUIDE['generic'])}\n\n"
         f"{_TONE.get(req.effort, '')} Limits: at most {budget.max_sections} top-level sections, "
         f"{budget.max_slides} slides, {budget.max_sheets} sheets. "
         f"Set template_id to \"{req.template_id}\"."
@@ -369,16 +437,40 @@ async def _compose_once(req: ComposeRequest, budget: T.EffortBudget, *, outline_
             "\n\nYou are EDITING an existing document. Here is its current content as JSON. "
             "Apply the request and return the WHOLE document again with the change applied and "
             "everything else preserved unless the request says otherwise:\n"
-            + req.parent_spec.body.model_dump_json()
+            + body_json_for_prompt(req.parent_spec)
         )
     if extra:
         messages.append({"role": "user", "content": extra})
     return await _json(messages, S.schema_for(req.kind), f"artifact_{req.kind}", thinking=budget.thinking, max_tokens=_max_tokens_for(req.kind, req.effort), effort=req.effort)
 
 
-def _enforce_caps(spec: S.ArtifactSpec, budget: T.EffortBudget) -> List[str]:
+def body_json_for_prompt(spec: S.ArtifactSpec) -> str:
+    """The body as the model re-reads it in an edit or a review: a sheet
+    whose rows are code-made (rows_from / generator) travels with
+    `rows: []`, exactly as the model wrote it. The filled rows are code's
+    to copy or generate again after the edit (`_fill_code_made_rows`);
+    shown, they were 25,000 tokens of prompt for a 500-row dataset (C6,
+    discovery of 2026-09-12) AND an invitation to retype them in the
+    answer — which Fast's 12,000-token ceiling then cut off. Every other
+    kind, and a workbook the model typed, is the plain dump."""
+    body = spec.body
+    if not isinstance(body, S.WorkbookSpec) or not any(sh.rows_are_code_made for sh in body.sheets):
+        return body.model_dump_json()
+    dump = body.model_dump(mode="json", by_alias=True, exclude_none=True)
+    for sheet, raw in zip(body.sheets, dump.get("sheets") or []):
+        if sheet.rows_are_code_made and isinstance(raw, dict):
+            raw["rows"] = []
+    return json.dumps(dump, ensure_ascii=False)
+
+
+def _enforce_caps(spec: S.ArtifactSpec, budget: T.EffortBudget, requested: Sequence[str] = ()) -> List[str]:
     """Trim what the effort level allows rather than refuse: a deck with 14
-    slides at Fast becomes 12 with a warning, not an error."""
+    slides at Fast becomes 12 with a warning, not an error. Two exceptions
+    (CONTRACT-2 §4, §11): a sheet whose rows code copied or generated is
+    held only to the hard ceiling — the effort cap exists for rows the
+    model would type, and a 3,000-row pasted table at Fast is the person's
+    table, not a token bill; and the section cap never falls below the
+    sections the request named plus two."""
     warnings: List[str] = []
     body = spec.body
     if isinstance(body, S.PresentationSpec) and len(body.slides) > budget.max_slides:
@@ -389,14 +481,128 @@ def _enforce_caps(spec: S.ArtifactSpec, budget: T.EffortBudget) -> List[str]:
             warnings.append(f"the workbook was trimmed from {len(body.sheets)} to {budget.max_sheets} sheets")
             body.sheets = body.sheets[: budget.max_sheets]
         for sh in body.sheets:
-            if len(sh.rows) > budget.max_rows_per_sheet:
-                warnings.append(f"sheet {sh.name!r} was cut to {budget.max_rows_per_sheet} rows")
-                sh.rows = sh.rows[: budget.max_rows_per_sheet]
+            cap = T.MAX_ROWS_PER_SHEET if sh.rows_are_code_made else budget.max_rows_per_sheet
+            if len(sh.rows) > cap:
+                warnings.append(f"sheet {sh.name!r} was cut to {cap:,} rows")
+                sh.rows = sh.rows[:cap]
     if isinstance(body, S.DocumentSpec):
         top = sum(1 for b in body.blocks if isinstance(b, S.Heading) and b.level == 1)
-        if top > budget.max_sections:
-            warnings.append(f"the document has {top} top-level sections; this effort level asked for at most {budget.max_sections}")
+        cap = max(budget.max_sections, len(requested) + 2)
+        if top > cap:
+            warnings.append(f"the document has {top} top-level sections; this effort level asked for at most {cap}")
     return warnings
+
+
+# ---------------------------------------------------------------- coverage --
+#
+# WHY. "Include an executive summary, risks and a roadmap" is a requirement,
+# not a suggestion, and a draft that skipped two of the three passed every
+# other check (the schema, the placeholders, the review at Think — and Fast
+# has no review). The sections a request names are parsed here and matched
+# to the draft's headings by word overlap; a missing one costs exactly one
+# correction, naming the sections, at every effort (CONTRACT-2 §11).
+
+_SECTIONS_COLON_RE = re.compile(r"\bsections?\s*:\s*(?P<list>[^.;!?\n]{3,300})", re.I)
+_SECTION_LIST_RE = re.compile(
+    r"\b(?P<verb>includ(?:e|es|ing)|contain(?:s|ing)?|cover(?:s|ing)?|with)\s+"
+    r"(?:the\s+|these\s+)?(?:following\s+)?(?:sections?\s+(?:on|for|about)?\s*)?(?P<list>[^.;:!?\n]{3,300})",
+    re.I,
+)
+_LIST_SPLIT_RE = re.compile(r"\s*(?:,|;|\band\b|&|\bplus\b)\s*", re.I)
+_LEAD_WORDS_RE = re.compile(r"^(?:a|an|the|some|its|our|their|one|two|three|four|five|several|separate|short|brief|detailed|clear|full)\s+", re.I)
+_TRAIL_WORDS_RE = re.compile(r"\s+(?:sections?|parts?|pages?|chapters?|paragraphs?)$", re.I)
+_STOP_WORDS = frozenset({
+    "a", "an", "the", "of", "for", "on", "in", "to", "and", "with", "section", "sections", "part", "parts", "its",
+    "our", "their", "this", "that", "some", "any", "each", "every", "all", "brief", "short", "detailed", "please",
+    "also", "key", "main", "current", "proposed", "clear", "full",
+})
+#: Words that name a file's parts or properties, never its sections.
+_NOT_SECTION_WORDS = frozenset({
+    "row", "rows", "column", "columns", "table", "tables", "chart", "charts", "graph", "graphs", "total", "totals",
+    "file", "files", "format", "formats", "pdf", "docx", "word", "excel", "csv", "xlsx", "pptx", "powerpoint",
+    "slide", "slides", "page", "pages", "logo", "logos", "colour", "colours", "color", "colors", "font", "fonts",
+    "header", "headers", "footer", "footers", "number", "numbers", "data", "record", "records", "image", "images",
+    "picture", "pictures", "sheet", "sheets", "tab", "tabs", "version", "versions", "copy", "copies", "link", "links",
+    "date", "dates", "name", "names", "title", "titles", "bullet", "bullets", "formatting", "style", "styles",
+})
+
+
+def _stem(word: str) -> str:
+    w = re.sub(r"[^a-z0-9]", "", word.lower())
+    if len(w) > 4 and w.endswith("ies"):
+        return w[:-3] + "y"
+    if len(w) > 3 and w.endswith("s") and not w.endswith("ss"):
+        return w[:-1]
+    return w
+
+
+def _content_words(text: str) -> set:
+    return {_stem(w) for w in re.split(r"\s+", text.strip()) if w and _stem(w) and _stem(w) not in _STOP_WORDS}
+
+
+def _section_phrase(raw: str) -> str:
+    text = " ".join(raw.split()).strip(" -–—:'\"")
+    text = _LEAD_WORDS_RE.sub("", text)
+    text = _TRAIL_WORDS_RE.sub("", text)
+    return text.strip()
+
+
+def requested_sections(instruction: str) -> List[str]:
+    """The sections a request names — "include A, B, C and D", "covering
+    A and B", "sections: A, B" — as short phrases, in order, deduplicated.
+    A phrase is a section only when it is one to five words with no digit
+    and at least one content word that does not name a file part (rows,
+    logo, PDF, chart …); "with" needs a list of two or more, because "with
+    a total row" describes the table, not a chapter. Empty when the
+    request names none."""
+    text = " ".join((instruction or "").split())
+    if not text:
+        return []
+    found: List[str] = []
+    seen: set = set()
+
+    def take(raw_list: str, minimum: int) -> None:
+        phrases = [_section_phrase(x) for x in _LIST_SPLIT_RE.split(raw_list) if x and x.strip()]
+        keep: List[str] = []
+        for ph in phrases:
+            words = ph.split()
+            if not ph or not 1 <= len(words) <= 5 or any(ch.isdigit() for ch in ph):
+                continue
+            content = _content_words(ph)
+            if not content or content <= {_stem(w) for w in _NOT_SECTION_WORDS}:
+                continue
+            keep.append(ph)
+        if len(keep) < minimum:
+            return
+        for ph in keep:
+            key = ph.lower()
+            if key not in seen:
+                seen.add(key)
+                found.append(ph)
+
+    for m in _SECTIONS_COLON_RE.finditer(text):
+        take(m.group("list"), 1)
+    for m in _SECTION_LIST_RE.finditer(text):
+        take(m.group("list"), 2 if m.group("verb").lower() == "with" else 1)
+    return found[:12]
+
+
+def _missing_sections(spec: S.ArtifactSpec, requested: Sequence[str]) -> List[str]:
+    """The requested phrases no heading of the document covers: a heading
+    covers a phrase when at least 60% of the phrase's content words are in
+    it (CONTRACT-2 §11)."""
+    body = spec.body
+    if not requested or not isinstance(body, S.DocumentSpec):
+        return []
+    headings = [_content_words(b.text) for b in body.blocks if isinstance(b, S.Heading)]
+    missing: List[str] = []
+    for phrase in requested:
+        words = _content_words(phrase)
+        if not words:
+            continue
+        if not any(len(words & h) / len(words) >= 0.6 for h in headings):
+            missing.append(phrase)
+    return missing
 
 
 async def compose(req: ComposeRequest, *, progress: Optional[Progress] = None) -> ComposeResult:
@@ -477,6 +683,22 @@ async def compose(req: ComposeRequest, *, progress: Optional[Progress] = None) -
     if longer:
         result_warnings.append(f"the edit asked for a shorter document but this version is longer ({longer[1]} words against {longer[0]})")
 
+    # The sections the request named, matched to the headings: ONE
+    # correction at every effort (the budget does not gate it — it is the
+    # request itself), then a warning if the model still cannot.
+    requested = requested_sections(req.instruction or (req.material.instruction if req.material else "")) if req.kind == "document" else []
+    missing = _missing_sections(spec, requested)
+    if missing:
+        await correct(
+            62.0, "adding the requested sections",
+            f"The request asked for these sections, which your draft does not have: {', '.join(missing)}. "
+            "Add each as its own headed section with real content from the material, keep everything else, "
+            "and return the WHOLE document.",
+        )
+        missing = _missing_sections(spec, requested)
+    if missing:
+        result_warnings.append("requested sections not found in the document: " + ", ".join(missing))
+
     # Figures the material never gave. Named on the version at every effort;
     # handed to the reviewer where there is one.
     figures = S.unsupported_figures(spec, material_text(req))
@@ -499,9 +721,38 @@ async def compose(req: ComposeRequest, *, progress: Optional[Progress] = None) -
 
     if figures:
         result_warnings.append("figures not in the material (derived or assumed): " + ", ".join(figures[:8]) + (" …" if len(figures) > 8 else ""))
-    result_warnings.extend(_enforce_caps(spec, budget))
+    result_warnings.extend(_enforce_caps(spec, budget, requested))
+
+    # The rewrite columns, last — on the draft that will be rendered, once,
+    # at every effort: it is the task ("humanise the comments"), not a
+    # nicety, and it costs one model call per batch of rows.
+    if isinstance(spec.body, S.WorkbookSpec) and any(sh.rewrite and sh.rows for sh in spec.body.sheets):
+        await say(90.0, "rewriting the text column")
+    rewrite_calls, rewrite_warnings, rewrite_report = await _rewrite_columns(req, spec)
+    calls += rewrite_calls
+    result_warnings.extend(w for w in rewrite_warnings if w not in result_warnings)
+    transform = _transform_report(req, spec, rewrite_report)
     await say(95.0, "content ready")
-    return ComposeResult(spec=spec, warnings=result_warnings, corrections=corrections, outline=outline_json, review=review_json, model_calls=calls)
+    return ComposeResult(spec=spec, warnings=result_warnings, corrections=corrections, outline=outline_json, review=review_json, model_calls=calls, transform=transform)
+
+
+def _transform_report(req: ComposeRequest, spec: S.ArtifactSpec, rewrite_report: Dict[str, Any]) -> Dict[str, Any]:
+    """CONTRACT-2 §6: what code did to the rows — the engine's parse report
+    (rows, blanks, forward-filled cells) first, then what the spec shows
+    (rows copied by `rows_from`, rows generated), then the rewrite's
+    counts. Empty when nothing was code-made."""
+    out: Dict[str, Any] = dict(req.material.transform) if req.material is not None and req.material.transform else {}
+    body = spec.body
+    if isinstance(body, S.WorkbookSpec):
+        copied = [sh for sh in body.sheets if sh.rows_from]
+        if copied:
+            out.setdefault("rows", sum(len(sh.rows) for sh in copied))
+            out.setdefault("blanks", sum(1 for sh in copied for r in sh.rows for c in r if c is None or (isinstance(c, str) and not c.strip())))
+        generated = [sh for sh in body.sheets if sh.generator is not None]
+        if generated:
+            out["generated"] = sum(len(sh.rows) for sh in generated)
+    out.update(rewrite_report)
+    return out
 
 
 def _gutted(before: S.ArtifactSpec, after: S.ArtifactSpec) -> bool:
@@ -599,24 +850,134 @@ def _reconcile_sources(raw: dict, material: Optional[Material]) -> List[str]:
     return sorted(set(warnings))
 
 
+def _fold(name: Any) -> str:
+    return " ".join(str(name).split()).casefold()
+
+
+def _recipe(column: S.GenColumn) -> Dict[str, Any]:
+    """One column's recipe as tables.generate_rows reads it: the alias
+    (`in`) and no unset field — a None `start` on an id column would be
+    read as a bad id start, an empty `weights` as the wrong number of
+    weights."""
+    return {k: v for k, v in column.model_dump(by_alias=True).items() if v not in (None, [], "")}
+
+
+def _fill_code_made_rows(raw: dict, req: ComposeRequest, notes: List[str]) -> List[str]:
+    """CONTRACT-2 §4/§6, BEFORE parse_body: a sheet with `rows_from` gets
+    the material table's rows verbatim — blanks included, and in place of
+    any rows the model typed; a sheet with a `generator` gets exactly
+    `rows` rows from tables.generate_rows, the recipes put in the sheet's
+    column order first (the row cells follow the recipe order). When the
+    sheet's column count differs from the table's, the table's column
+    names win (a note says so); when the person asked for a count, the
+    generator gets it. Mutates `raw`. Returns the problems the model must
+    repair — an unknown table id, recipes that do not match the columns, a
+    rule the generator refuses — each naming the sheet."""
+    if req.kind != "workbook" or not isinstance(raw, dict) or not isinstance(raw.get("sheets"), list):
+        return []
+    material = req.material
+    known = {t.id: t for t in (material.tables if material is not None else [])}
+    wanted = int(material.row_count) if material is not None and material.row_count else 0
+    with_generator = [sh for sh in raw["sheets"] if isinstance(sh, dict) and isinstance(sh.get("generator"), dict)]
+    problems: List[str] = []
+    for index, sh in enumerate(raw["sheets"]):
+        if not isinstance(sh, dict):
+            continue
+        name = str(sh.get("name") or f"sheet {index + 1}")
+        source = sh.get("rows_from")
+        gen = sh.get("generator")
+        if isinstance(source, str) and source.strip():
+            table = known.get(source.strip())
+            if table is None:
+                ids = ", ".join(repr(t) for t in known) or "none"
+                problems.append(f"sheets.{index}.rows_from: {source!r} names no material table; the tables are {ids}")
+                continue
+            columns = sh.get("columns")
+            if not isinstance(columns, list) or len(columns) != len(table.columns):
+                sh["columns"] = [{"name": c} for c in table.columns]
+                notes.append(f"sheet {name!r}: columns taken from the pasted table")
+            if sh.get("rows"):
+                notes.append(f"sheet {name!r}: the rows the model typed were replaced by the pasted table's")
+            sh["rows"] = _without_trailing_blank_rows([list(r) for r in table.rows], name, notes)
+        elif isinstance(gen, dict):
+            if wanted and len(with_generator) == 1 and gen.get("rows") != wanted:
+                if gen.get("rows"):
+                    notes.append(f"sheet {name!r}: the generator's {gen.get('rows')} rows were set to the {wanted:,} that were asked for")
+                gen["rows"] = wanted
+            try:
+                model = S.Generator.model_validate(gen)
+            except ValidationError as exc:
+                problems.append(f"sheets.{index}.generator: {S.validation_summary(exc, limit=4).replace(chr(10), ' ')}")
+                continue
+            columns = sh.get("columns")
+            names = [c.get("name") for c in columns if isinstance(c, dict) and isinstance(c.get("name"), str)] if isinstance(columns, list) else []
+            recipes = {_fold(c.name): c for c in model.columns}
+            missing = [n for n in names if _fold(n) not in recipes]
+            extra = [c.name for c in model.columns if _fold(c.name) not in {_fold(n) for n in names}]
+            if not names or missing or extra:
+                what = []
+                if missing:
+                    what.append(f"no recipe for column{'s' if len(missing) > 1 else ''} {', '.join(repr(m) for m in missing)}")
+                if extra:
+                    what.append(f"recipe{'s' if len(extra) > 1 else ''} for {', '.join(repr(e) for e in extra)}, which the sheet has no column for")
+                problems.append(f"sheets.{index}.generator: one recipe per column, same names — {'; '.join(what) or 'the sheet has no columns'}")
+                continue
+            data = {"rows": model.rows, "seed": model.seed, "columns": [_recipe(recipes[_fold(n)]) for n in names]}
+            try:
+                rows, _report = tables.generate_rows(data)
+            except ValueError as exc:
+                problems.append(f"sheets.{index}.generator: {exc}")
+                continue
+            sh["rows"] = rows
+    return problems
+
+
+def _without_trailing_blank_rows(rows: List[list], name: str, notes: List[str]) -> List[list]:
+    """A row that is blank in every cell at the END of a table is not a row
+    the XLSX can hold (openpyxl writes nothing for it, so the reopened
+    sheet counts one row fewer than the spec and the CSV) — the review of
+    2026-09-12 reproduced a refused render from a blank line at the end
+    of an uploaded CSV. Interior blank rows stay: they are the person's."""
+    kept = list(rows)
+    dropped = 0
+    while kept and all(c in (None, "") for c in kept[-1]):
+        kept.pop()
+        dropped += 1
+    if dropped:
+        notes.append(f"sheet {name!r}: {dropped} blank row{'s' if dropped != 1 else ''} at the end of the table {'were' if dropped != 1 else 'was'} left out")
+    return kept
+
+
 async def _validate_or_repair(req: ComposeRequest, budget: T.EffortBudget, raw: dict, outline_json: Optional[dict]):
     """parse_body, and on a validation error ONE repair pass with the field
     paths — the same recipe as the Salesforce planner. Returns (spec, repairs).
     The sources manifest is reconciled against the material FIRST, so the
-    model's own list never reaches validation, let alone a page."""
+    model's own list never reaches validation, let alone a page; then the
+    code-made rows are filled (CONTRACT-2 §4), so the Sheet that validates
+    is the one that renders."""
     notes = _reconcile_sources(raw, req.material)
     _pin_template(raw, req)
-    try:
-        return S.parse_body(req.kind, raw), 0, notes
-    except ValidationError as exc:
-        summary = S.validation_summary(exc)
-        log.info("artifact compose: spec invalid, repairing once: %s", summary.replace("\n", " | ")[:400])
+    problems = _fill_code_made_rows(raw, req, notes)
+    if problems:
+        summary = "\n".join(f"- {p}" for p in problems)
+        lead = "The rows could not be filled from your sheet definitions:"
+    else:
+        try:
+            return S.parse_body(req.kind, raw), 0, notes
+        except ValidationError as exc:
+            summary = S.validation_summary(exc)
+            lead = "Your JSON did not match the schema:"
+    log.info("artifact compose: spec invalid, repairing once: %s", summary.replace("\n", " | ")[:400])
     fixed = await _compose_once(
         req, budget, outline_json=outline_json,
-        extra=f"Your JSON did not match the schema:\n{summary}\nReturn the corrected, complete document.",
+        extra=f"{lead}\n{summary}\nReturn the corrected, complete document.",
     )
     notes = _reconcile_sources(fixed, req.material)
     _pin_template(fixed, req)
+    problems = _fill_code_made_rows(fixed, req, notes)
+    if problems:
+        log.info("artifact compose: the repair's rows could not be filled either: %s", " | ".join(problems)[:400])
+        raise ComposeError("model_failure", "The model could not produce a valid document structure.")
     try:
         return S.parse_body(req.kind, fixed), 1, notes
     except ValidationError as exc:
@@ -624,6 +985,116 @@ async def _validate_or_repair(req: ComposeRequest, budget: T.EffortBudget, raw: 
         # that did not take; the content never reaches the log.
         log.info("artifact compose: the repair was invalid too: %s", S.validation_summary(exc).replace("\n", " | ")[:400])
         raise ComposeError("model_failure", "The model could not produce a valid document structure.") from exc
+
+
+# ---------------------------------------------------------------- rewrite --
+
+_REWRITE_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "rewrites": {
+            "type": "array", "maxItems": 200,
+            "items": {
+                "type": "object", "additionalProperties": False,
+                "properties": {"row": {"type": "integer", "minimum": 0}, "text": {"type": "string", "maxLength": 2000}},
+                "required": ["row", "text"],
+            },
+        },
+    },
+    "required": ["rewrites"],
+}
+#: Rows per rewrite call: 40 audit comments of ~100 characters is ~1,500
+#: tokens in and about the same out — one call for the 34-row paste, 13
+#: for a 500-row sheet.
+REWRITE_BATCH_ROWS = 40
+
+
+def _rewrite_tokens(batch: Sequence[Tuple[int, str]]) -> int:
+    """The answer's ceiling for one batch: the originals at ~4 characters a
+    token, doubled (a rewrite may run to twice the original), plus the
+    JSON around each row."""
+    return max(600, min(12_000, sum(len(t) for _, t in batch) // 2 + 24 * len(batch)))
+
+
+def _rewrite_messages(sheet: S.Sheet, rule: S.Rewrite, batch: Sequence[Tuple[int, str]]) -> List[dict]:
+    system = (
+        "You rewrite ONE column of a table, cell by cell. Instruction for every cell: "
+        f"{rule.instruction}. Rules: return exactly one rewrite per row id you are given — no more, no fewer; "
+        "keep every timestamp (such as 00:12:30) and every quoted phrase EXACTLY as written; keep every name, id, "
+        "number, date and outcome; add no fact, figure or opinion; never merge or split rows; a rewrite is at most "
+        "about twice the original's length; when a cell cannot be improved, return it unchanged."
+    )
+    user = (
+        f"Sheet: {sheet.name}\nColumn to rewrite: {rule.column}\nOther columns (context only): "
+        f"{', '.join(c.name for c in sheet.columns if _fold(c.name) != _fold(rule.column))}\n\nCells:\n"
+        + json.dumps([{"row": i, "text": t} for i, t in batch], ensure_ascii=False)
+    )
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def _figures_kept(original: str, rewrite: str) -> bool:
+    """A rewrite may drop a figure or spell it out; it may not introduce one
+    the original did not have (a changed duration is a changed finding)."""
+    return set(S._figures_in_text(rewrite)) <= set(S._figures_in_text(original))
+
+
+async def _rewrite_columns(req: ComposeRequest, spec: S.ArtifactSpec) -> Tuple[int, List[str], Dict[str, Any]]:
+    """CONTRACT-2 §4 `Sheet.rewrite`: every rewrite column of every sheet,
+    row by row in batches of REWRITE_BATCH_ROWS through one JSON call each
+    (thinking off, temperature 0), joined back by row id through
+    tables.apply_rewrites — one in, one out; a reply that loses a
+    timestamp or a quoted span, changes a figure, runs far too long or is
+    empty keeps the original with a warning naming the row; a batch whose
+    call fails keeps every original. Blank cells are never sent and stay
+    blank. Mutates the sheets. Returns (model calls, warnings, {rewritten,
+    kept_original, rewrite_columns})."""
+    body = spec.body
+    if not isinstance(body, S.WorkbookSpec):
+        return 0, [], {}
+    calls = 0
+    warnings: List[str] = []
+    rewritten = 0
+    kept_total = 0
+    columns: List[str] = []
+    for sheet in body.sheets:
+        by_name: Dict[str, int] = {}
+        for j, c in enumerate(sheet.columns):
+            by_name.setdefault(_fold(c.name), j)
+        for rule in sheet.rewrite:
+            j = by_name.get(_fold(rule.column))
+            if j is None or not sheet.rows:
+                continue
+            columns.append(sheet.columns[j].name)
+            batches = tables.rewrite_batches(sheet.rows, j, REWRITE_BATCH_ROWS)
+            originals = {i: text for batch in batches for i, text in batch}
+            replies: Dict[int, str] = {}
+            failed = 0
+            for batch in batches:
+                calls += 1
+                try:
+                    answer = await _json(_rewrite_messages(sheet, rule, batch), _REWRITE_SCHEMA, "artifact_rewrite", thinking=False, max_tokens=_rewrite_tokens(batch))
+                except ComposeError as exc:
+                    failed += len(batch)
+                    log.info("artifact compose: a rewrite batch failed (%s); originals kept", exc.category)
+                    continue
+                for item in answer.get("rewrites") or []:
+                    if isinstance(item, dict) and isinstance(item.get("row"), int) and not isinstance(item.get("row"), bool) and isinstance(item.get("text"), str):
+                        replies[item["row"]] = item["text"]
+            changed = [i for i, text in replies.items() if i in originals and not _figures_kept(originals[i], text)]
+            for i in changed:
+                replies.pop(i)
+                warnings.append(f"sheet {sheet.name!r}, column {rule.column!r}: row {i + 1} kept the original (the rewrite changed a figure)")
+            new_rows, kept, notes = tables.apply_rewrites(sheet.rows, j, replies)
+            sheet.rows = new_rows
+            rewritten += len(originals) - len(kept)
+            kept_total += len(kept)
+            warnings.extend(f"sheet {sheet.name!r}, column {rule.column!r}: {n}" for n in notes[:6])
+            if failed:
+                warnings.append(f"sheet {sheet.name!r}, column {rule.column!r}: {failed} row{'s' if failed != 1 else ''} could not be rewritten (the model call failed) and keep the original")
+    if not columns:
+        return calls, warnings, {}
+    return calls, warnings, {"rewritten": rewritten, "kept_original": kept_total, "rewrite_columns": list(dict.fromkeys(columns))}
 
 
 async def content_review(req: ComposeRequest, spec: S.ArtifactSpec, budget: T.EffortBudget, figures: Sequence[str] = ()) -> dict:
@@ -648,7 +1119,7 @@ async def content_review(req: ComposeRequest, spec: S.ArtifactSpec, budget: T.Ef
             + (f"Figures in the draft that appear nowhere in the material (each is derived, assumed or invented — "
                f"a 'must' unless the draft says which; the fix is to state the assumption or the arithmetic beside "
                f"the figure, or to say the figure is not given — never a placeholder, never a zero): {', '.join(figures[:12])}\n\n" if figures else "")
-            + f"Draft (JSON):\n{spec.body.model_dump_json()[:60_000]}"
+            + f"Draft (JSON):\n{body_json_for_prompt(spec)[:60_000]}"
         )},
     ]
     return await _json(messages, _REVIEW_SCHEMA, "artifact_review", thinking=budget.thinking, max_tokens=2000, effort=req.effort)
@@ -714,6 +1185,9 @@ async def revise(req: ComposeRequest, spec: S.ArtifactSpec, issues: Sequence[dic
     )
     raw = await _compose_once(edit_req, budget, outline_json=None, extra=f"Fix these problems in the document and return the whole document:\n{fix_text}")
     fixed, _, _ = await _validate_or_repair(edit_req, budget, raw, None)
+    # The revised draft's rows were filled afresh from the material; its
+    # rewrite columns are rewritten again so the rendered file has them.
+    await _rewrite_columns(edit_req, fixed)
     return fixed
 
 
@@ -767,5 +1241,5 @@ def material_from_history(history: Sequence[dict], *, max_chars: int = 24_000) -
 __all__ = [
     "ComposeError", "Source", "DataTable", "Material", "ComposeRequest", "ComposeResult",
     "compose", "outline", "content_review", "visual_review", "revise", "classify_intent",
-    "material_from_history",
+    "material_from_history", "requested_sections", "body_json_for_prompt", "REWRITE_BATCH_ROWS",
 ]

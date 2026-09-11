@@ -335,3 +335,71 @@ def test_running_header_footer_and_toc_page_numbers_exist(weasy, tmp_path):
     assert "CONFIDENTIAL" in texts[1]
     assert "Contents" in texts[1] and "1.1" in texts[1]     # the TOC page with numbered entries
     assert "Page 1 of" not in texts[0]                        # the cover carries no footer
+
+
+# ------------------------------------------------------ tabular document --
+
+
+def _page_texts(path):
+    import pypdfium2 as pdfium
+
+    pdf = pdfium.PdfDocument(str(path))
+    try:
+        out = []
+        for i in range(len(pdf)):
+            page = pdf[i]
+            w, h = page.get_size()
+            out.append((w, h, page.get_textpage().get_text_range()))
+        return out
+    finally:
+        pdf.close()
+
+
+def test_workbook_pdf_is_landscape_repeats_the_header_and_has_no_blank_page(weasy, tmp_path):
+    """The PDF twin of the tabular document (CONTRACT-2 §1): landscape
+    pages for a nine-column sheet, the header row on every page, the title
+    and the highlighted header in the text, every row present, no blank
+    trailing page, page numbers."""
+    from app.artifacts import spec as S
+    from app.artifacts.render import html as H
+    from app.artifacts.render.pdf import render_html_pdf
+    from tests.test_artifact_render_xlsx import _styled
+
+    spec = _styled(rows=120, highlight=[S.Highlight(column="Audit Comments", color="red")], wrap=True)
+    spec.body.sheets.append(S.Sheet(name="Summary", columns=[S.Column(name="Outcome"), S.Column(name="Count", type="integer")], rows=[["Selected", 120]]))
+    html = H.workbook_document_html(spec.body)
+    assert "9C0006" in html and "FFC7CE" in html and "table-layout" in H.print_css()
+    pages = render_html_pdf(html, tmp_path / "t.pdf", tmp_path)
+    texts = _page_texts(tmp_path / "t.pdf")
+    assert pages == len(texts) >= 4
+    landscape = [w > h for w, h, _ in texts]
+    assert all(landscape[:-1]) and landscape[-1] is False, "the audit sheet is landscape; the two-column summary sheet is portrait"
+    first = texts[0][2]
+    assert "Audit" in first and "Blank values are blank in the source." in first and "Audit Comments" in first
+    for _, _, text in texts[:-1]:
+        assert "Audit Comments" in text and "Session ID" in text, "the header row repeats on every page of the table"
+        assert "Page " in text
+    assert "Cand 0" in first and "Cand 119" in "".join(t for _, _, t in texts), "every row is there"
+    assert texts[-1][2].strip(), "no blank trailing page"
+    assert "Summary" in texts[-1][2] and "Selected" in texts[-1][2]
+
+
+def test_workbook_pdf_columns_are_not_clipped(weasy, tmp_path):
+    """A 12-column sheet with a 300-character comment: every column's
+    header is in the page text, and the long text wraps within its share
+    rather than running off the page (the column shares are bounded)."""
+    from app.artifacts import spec as S
+    from app.artifacts.render import html as H
+    from app.artifacts.render.pdf import render_html_pdf
+
+    names = [f"Column number {i}" for i in range(1, 12)] + ["Notes"]
+    rows = [[f"v{i}-{j}" for j in range(11)] + ["word " * 60] for i in range(15)]
+    spec = S.WorkbookSpec(title="Wide", sheets=[S.Sheet(name="Wide", columns=[S.Column(name=n) for n in names], rows=rows)])
+    shares = H.column_shares(spec.sheets[0])
+    assert abs(sum(shares) - 1.0) < 0.01 and max(shares) <= H._MAX_COL_SHARE + 0.01 and min(shares) >= H._MIN_COL_SHARE - 0.01
+    render_html_pdf(H.workbook_document_html(spec), tmp_path / "w.pdf", tmp_path)
+    w, h, text = _page_texts(tmp_path / "w.pdf")[0]
+    assert w > h
+    for n in names:
+        assert n.split()[0] in text
+    assert "v14-10" in "".join(t for _, _, t in _page_texts(tmp_path / "w.pdf")), "the last cell of the last column is on the page"

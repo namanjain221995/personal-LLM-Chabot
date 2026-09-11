@@ -18,6 +18,17 @@ twin already shows the real page numbers.
 
 python-docx is imported lazily: tests/test_imports.py asserts the app
 imports without heavy or optional libraries.
+
+THE TABULAR DOCUMENT (`render_workbook_docx`, CONTRACT-2 §1). A workbook
+delivered as Word: the title and a methodology note, then one SECTION per
+sheet — python-docx sections carry their own orientation, so a nine-column
+audit sheet is landscape (page size swapped, not just the flag, or Word
+draws portrait) while a three-column sheet stays portrait — with the full
+table: the header row marked `w:tblHeader` so Word repeats it on every
+page, grid borders, the header shaded as the Excel file shades it, the
+highlighted column in the same red pair, 9.5 pt cells, wrapping, top
+alignment, rows that do not split across pages. The plan (orientation,
+column shares, colours) comes from html.py so the PDF twin agrees.
 """
 from __future__ import annotations
 
@@ -451,4 +462,236 @@ def render_docx(spec: S.DocumentSpec, out_path: str | Path, chart_dir: str | Pat
     return out
 
 
-__all__ = ["render_docx"]
+# ------------------------------------------------------ tabular document --
+
+
+def _section_orientation(section, orientation: str, margin_mm: float = 14) -> None:
+    """Set a section's orientation AND swap its page size: python-docx's
+    `orientation` is a flag Word reads only when the size agrees."""
+    from docx.enum.section import WD_ORIENT
+    from docx.shared import Mm
+
+    if orientation == "landscape":
+        section.orientation = WD_ORIENT.LANDSCAPE
+        section.page_width, section.page_height = Mm(297), Mm(210)
+    else:
+        section.orientation = WD_ORIENT.PORTRAIT
+        section.page_width, section.page_height = Mm(210), Mm(297)
+    section.top_margin = section.bottom_margin = Mm(16)
+    section.left_margin = section.right_margin = Mm(margin_mm)
+    section.header_distance = Mm(8)
+    section.footer_distance = Mm(8)
+
+
+def _repeat_header(row) -> None:
+    from docx.oxml import OxmlElement
+
+    tr_pr = row._tr.get_or_add_trPr()
+    hdr = OxmlElement("w:tblHeader")
+    hdr.set(_qn("w:val"), "true")
+    tr_pr.append(hdr)
+
+
+def _keep_row_whole(row) -> None:
+    """`w:cantSplit`: a row never breaks across pages (a wrapped comment
+    stays with its id)."""
+    from docx.oxml import OxmlElement
+
+    tr_pr = row._tr.get_or_add_trPr()
+    el = OxmlElement("w:cantSplit")
+    el.set(_qn("w:val"), "true")
+    tr_pr.append(el)
+
+
+def _fixed_layout(table) -> None:
+    """`w:tblLayout fixed` so the column widths set below are honoured
+    instead of Word's autofit, which lets a long comment column squeeze a
+    date column to one character per line."""
+    from docx.oxml import OxmlElement
+
+    tbl_pr = table._tbl.tblPr
+    layout = OxmlElement("w:tblLayout")
+    layout.set(_qn("w:type"), "fixed")
+    tbl_pr.append(layout)
+
+
+def _no_borders(table) -> None:
+    """Every edge off, for `style.borders == "none"` (Table Grid draws all)."""
+    from docx.oxml import OxmlElement
+
+    tbl_pr = table._tbl.tblPr
+    borders = OxmlElement("w:tblBorders")
+    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        el = OxmlElement(f"w:{edge}")
+        el.set(_qn("w:val"), "nil")
+        borders.append(el)
+    tbl_pr.append(borders)
+
+
+def _tabular_styles(document) -> None:
+    """The two styles the tabular document adds to the theme's: 9.5 pt
+    cells and a bold header at the same size."""
+    from docx.shared import Pt
+
+    from .html import TABULAR_CELL_PT
+
+    _ensure_styles(document, theme.DOCUMENT_TYPE)
+    for name, bold in (("Table Cell", False), ("Table Head", True)):
+        try:
+            st = document.styles[name]
+        except KeyError:
+            from docx.enum.style import WD_STYLE_TYPE
+
+            st = document.styles.add_style(name, WD_STYLE_TYPE.PARAGRAPH)
+            st.base_style = document.styles["Table Text"]
+        st.font.size = Pt(TABULAR_CELL_PT)
+        st.font.bold = bold
+        st.paragraph_format.space_after = Pt(0)
+        st.paragraph_format.space_before = Pt(0)
+        st.paragraph_format.line_spacing = 1.15
+
+
+def _sheet_table(document, sheet: S.Sheet, section) -> None:
+    from docx.enum.table import WD_TABLE_ALIGNMENT
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.shared import Emu
+
+    from .html import TABULAR_HEADER_FILLS, TABULAR_HIGHLIGHT, column_shares, highlight_columns
+
+    style = sheet.style if sheet.style is not None else S.SheetStyle()
+    numeric = {i for i, c in enumerate(sheet.columns) if c.type != "text"}
+    highlight = highlight_columns(sheet)
+    shares = column_shares(sheet)
+    usable = int(section.page_width - section.left_margin - section.right_margin)
+    widths = [Emu(int(usable * sh)) for sh in shares]
+    fill, ink = TABULAR_HEADER_FILLS.get(style.header_fill, TABULAR_HEADER_FILLS["dark"])
+
+    t = document.add_table(rows=1, cols=len(sheet.columns))
+    t.style = document.styles["Table Grid"]
+    t.alignment = WD_TABLE_ALIGNMENT.CENTER
+    t.autofit = False
+    _fixed_layout(t)
+    if style.borders != "thin":
+        _no_borders(t)
+    head = t.rows[0]
+    _repeat_header(head)
+    for j, (cell, col) in enumerate(zip(head.cells, sheet.columns)):
+        cell.width = widths[j]
+        colour = highlight.get(j)
+        p = cell.paragraphs[0]
+        p.style = document.styles["Table Head" if style.header_bold else "Table Cell"]
+        run = p.add_run(col.name)
+        if colour:
+            h_fill, h_ink, _, _ = TABULAR_HIGHLIGHT[colour]
+            _shade(cell, h_fill)
+            run.font.color.rgb = _rgb(h_ink)
+        else:
+            if fill:
+                _shade(cell, fill)
+            run.font.color.rgb = _rgb(ink)
+        if j in numeric:
+            p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    for r_index, row in enumerate(sheet.rows):
+        new_row = t.add_row()
+        _keep_row_whole(new_row)
+        for j, (cell, value) in enumerate(zip(new_row.cells, row)):
+            cell.width = widths[j]
+            p = cell.paragraphs[0]
+            p.style = document.styles["Table Cell"]
+            run = p.add_run(cell_text(value, j in numeric))
+            colour = highlight.get(j)
+            if colour:
+                _, _, c_fill, c_ink = TABULAR_HIGHLIGHT[colour]
+                _shade(cell, c_fill)
+                run.font.color.rgb = _rgb(c_ink)
+            elif r_index % 2 == 1:
+                _shade(cell, theme.SURFACE)
+            if j in numeric:
+                p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    # Column widths live on the grid too, or Word ignores the cell widths
+    # under a fixed layout.
+    for j, width in enumerate(widths):
+        t.columns[j].width = width
+
+
+def render_workbook_docx(spec: S.WorkbookSpec, out_path: str | Path, *, warnings: Optional[List[str]] = None,
+                         transform: Optional[dict] = None) -> Path:
+    """Write the workbook as a tabular Word document at `out_path`: one
+    section per sheet with its own orientation, the whole table each."""
+    from docx import Document
+    from docx.enum.section import WD_SECTION
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+    from .html import methodology_note, sheet_orientation
+
+    warnings = warnings if warnings is not None else []
+    document = Document()
+    _tabular_styles(document)
+    first = document.sections[0]
+    _section_orientation(first, sheet_orientation(spec.sheets[0]) if spec.sheets else "portrait")
+
+    # Running header (the title) and footer (Page X of Y) on every section:
+    # sections inherit the first one's header and footer unless unlinked.
+    hp = first.header.paragraphs[0]
+    hp.style = document.styles["Header"]
+    run = hp.add_run(spec.title)
+    run.bold = True
+    run.font.color.rgb = _rgb(theme.INK)
+    fp = first.footer.paragraphs[0]
+    fp.style = document.styles["Footer"]
+    fp.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    fp.add_run("Page ")
+    _field(fp, "PAGE", "1")
+    fp.add_run(" of ")
+    _field(fp, "NUMPAGES", "1")
+
+    props = document.core_properties
+    props.title = spec.title
+    props.subject = spec.purpose
+    props.author = "TechSara Local AI"
+    props.created = _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None)
+    props.comments = "Generated by TechSara Local AI Artifact Studio"
+
+    document.add_paragraph(spec.title, style="Title")
+    if spec.purpose:
+        document.add_paragraph(spec.purpose, style="Subtitle")
+    total_rows = sum(len(sh.rows) for sh in spec.sheets)
+    document.add_paragraph(f"{len(spec.sheets)} sheet{'s' if len(spec.sheets) != 1 else ''} · {total_rows:,} rows", style="Caption")
+    document.add_paragraph(methodology_note(spec, transform), style="Caption")
+
+    section = first
+    for k, sheet in enumerate(spec.sheets):
+        if k > 0:
+            section = document.add_section(WD_SECTION.NEW_PAGE)
+            _section_orientation(section, sheet_orientation(sheet))
+        document.add_paragraph(sheet.name, style="Heading 2")
+        if sheet.notes:
+            document.add_paragraph(sheet.notes, style="Caption")
+        _sheet_table(document, sheet, section)
+        document.add_paragraph(f"{len(sheet.rows):,} row{'s' if len(sheet.rows) != 1 else ''} · {len(sheet.columns)} columns", style="Caption")
+
+    if spec.sources or spec.assumptions:
+        section = document.add_section(WD_SECTION.NEW_PAGE)
+        _section_orientation(section, "portrait")
+    if spec.sources:
+        document.add_paragraph("Sources", style="Heading 2")
+        for n, c in enumerate(spec.sources, start=1):
+            bits = [c.title]
+            if c.url:
+                bits.append(c.url)
+            if c.retrieved_at:
+                bits.append(f"retrieved {c.retrieved_at}")
+            if c.note:
+                bits.append(c.note)
+            document.add_paragraph(f"[{n}] " + " — ".join(bits), style="Body")
+    if spec.assumptions:
+        document.add_paragraph("Assumptions", style="Heading 2")
+        for a in spec.assumptions:
+            document.add_paragraph(a, style="Bullet")
+
+    out = Path(out_path)
+    document.save(str(out))
+    return out
+
+
+__all__ = ["render_docx", "render_workbook_docx"]

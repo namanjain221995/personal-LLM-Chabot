@@ -551,7 +551,9 @@ def _check_artifacts() -> dict:
     ADDITIVE, never `status`: a missing PPTX library or a read-only volume
     means "no decks today", not an unavailable chat service — and the
     container healthcheck gates on `status`. The render package reports its
-    own availability through `capabilities()`; it is imported lazily and
+    own availability through `capabilities()` — pdf, docx, pptx, xlsx and,
+    since CONTRACT-2 (2026-09-12), csv, whose writer is the standard
+    library and is therefore always true; it is imported lazily and
     tolerated absent (the package ships separately from the job runner and
     tests import this module without it).
     """
