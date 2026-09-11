@@ -1122,10 +1122,16 @@ def test_video_analysis_is_private_for_sharing():
 
 
 def test_stage_label_vocabulary_matches_the_pipeline():
+    """The `stage` label is shared by the video and artifact pipelines since
+    2026-09-11; every stage either pipeline reports must be in it, and
+    nothing else, so a renamed stage folds to "other" rather than minting a
+    series."""
     from app import metrics
+    from app.artifacts.types import STAGES as ARTIFACT_STAGES
     from app.video.types import STAGES
 
-    assert set(STAGES) == metrics._ALLOWED["stage"]
+    expected = set(STAGES) | set(ARTIFACT_STAGES) | {"publish", "visual"}
+    assert expected == metrics._ALLOWED["stage"]
 
 
 def test_the_chat_request_accepts_a_video_only_send():

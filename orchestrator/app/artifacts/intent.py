@@ -100,8 +100,13 @@ _EDIT_VERBS_RE = re.compile(
     r"use (?:a )?(?:more|less)|go back to|revert to|restore|redo)\b",
     re.I,
 )
+#: A conversion names the SAME content in another form: "convert it to",
+#: "export as", "also as", "a Word version". "Turn this into an Excel
+#: tracker" and "make it a deck" are creation verbs and stay with create —
+#: the content is the conversation's, and the engine makes a new artifact
+#: of the requested kind rather than refusing to convert the latest one.
 _CONVERT_RE = re.compile(
-    rf"\b(?:convert|export|save|turn|make|also|too|as well|another|a copy)\b.*?\b(?:as|to|into|in)\s+(?:an?\s+|the\s+)?{_FORMAT_WORD}\b"
+    rf"\b(?:convert|export|save|also|too|as well|another|a copy)\b.*?\b(?:as|to|into|in)\s+(?:an?\s+|the\s+)?{_FORMAT_WORD}\b"
     rf"|\b(?:also|too)\s+(?:as|in)\s+(?:an?\s+)?{_FORMAT_WORD}\b"
     rf"|\b(?:{_FORMAT_WORD})\s+(?:version|copy|too|as well)\b",
     re.I,

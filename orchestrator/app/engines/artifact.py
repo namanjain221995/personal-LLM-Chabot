@@ -359,15 +359,23 @@ async def run_artifact_engine(
         if intent.version and not intent.formats:
             # "go back to version 1": the same formats that version had.
             ok = [f.get("format") for f in ((parent_row.get("current") or {}).get("files") or []) if f.get("format")]
-        if not ok:
+        if not ok and re.search(r"\bconvert\b", instruction, re.I):
             what = ", ".join(_FORMAT_WORDS.get(b, b) for b in bad) or "that format"
             line = f"A {_KIND_WORDS.get(kind, kind)} cannot be converted to {what}. I can make it as {' or '.join(_FORMAT_WORDS[f] for f in T.FORMATS_FOR_KIND[kind])}."
             await emit("token", {"text": line})
             await emit("meta", {"route": "artifact", "effort": effort})
             return line
-        formats, template_id = ok, str((parent_row.get("current") or {}).get("template_id") or "generic")
-        reason = f"convert: {', '.join(ok)}"
-        warnings = [f"{', '.join(bad)} cannot be produced for a {kind}"] if bad else []
+        if not ok:
+            # "Also give me this as Excel" after a deck: not a conversion the
+            # deck can take — a NEW workbook from the same conversation is
+            # what was asked for.
+            operation, parent, parent_row = "create", None, None
+            decision = F.decide(instruction, explicit_only=intent.formats or None)
+            kind, formats, template_id, reason, warnings = decision.kind, decision.formats, decision.template_id, f"new {decision.kind}: {decision.reason}", list(decision.warnings)
+        else:
+            formats, template_id = ok, str((parent_row.get("current") or {}).get("template_id") or "generic")
+            reason = f"convert: {', '.join(ok)}"
+            warnings = [f"{', '.join(bad)} cannot be produced for a {kind}"] if bad else []
     else:
         decision = F.decide(instruction, explicit_only=intent.formats or None)
         kind, formats, template_id, reason, warnings = decision.kind, decision.formats, decision.template_id, decision.reason, list(decision.warnings)

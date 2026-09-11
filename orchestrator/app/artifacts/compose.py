@@ -229,8 +229,22 @@ def _material_messages(req: ComposeRequest, *, budget: T.EffortBudget) -> List[d
         parts.append("Data (use these numbers as they are; do not recompute totals):\n" + _table_block(m.tables))
     if m.sources:
         parts.append("Sources you may cite, by id:\n" + _source_block(m.sources[: budget.max_sources or len(m.sources)], 40_000))
+    caps = ""
+    if req.kind == "presentation":
+        # The renderer's per-template bullet caps, said up front: a slide
+        # written over them is trimmed with a warning, which is a worse
+        # deck than one written to fit (the first e2e run dropped two
+        # bullets on five of six slides of a CEO deck).
+        try:
+            from .render.theme import PRESENTATION_TEMPLATES
+
+            tpl = PRESENTATION_TEMPLATES.get(req.template_id) or PRESENTATION_TEMPLATES["generic"]
+            caps = (f" Each slide fits at most {tpl['max_bullets']} bullets of at most "
+                    f"{tpl['max_bullet_chars']} characters; write to that, never over it.")
+        except Exception:  # noqa: BLE001 — the caps are advice; the renderer still fits
+            caps = ""
     system = (
-        f"{_ROLE}\n\n{_KIND_GUIDE[req.kind]}\n\n{_TEMPLATE_GUIDE.get(req.template_id, _TEMPLATE_GUIDE['generic'])}\n\n"
+        f"{_ROLE}\n\n{_KIND_GUIDE[req.kind]}{caps}\n\n{_TEMPLATE_GUIDE.get(req.template_id, _TEMPLATE_GUIDE['generic'])}\n\n"
         f"{_TONE.get(req.effort, '')} Limits: at most {budget.max_sections} top-level sections, "
         f"{budget.max_slides} slides, {budget.max_sheets} sheets. "
         f"Set template_id to \"{req.template_id}\"."

@@ -200,6 +200,23 @@ def test_a_conversion_the_kind_cannot_take_is_refused_in_a_sentence(owner, monke
     assert len(_artifacts(owner, "conv-e")) == 1, "nothing new was made"
 
 
+def test_asking_for_a_workbook_after_a_deck_makes_a_new_workbook(owner, monkeypatch):
+    """The first e2e run (2026-09-11): "Turn this into an Excel tracker…"
+    after a deck was read as CONVERT the deck and refused. The content is
+    the conversation's; a new workbook is what was asked for. Only an
+    explicit "convert it to Excel" is refused."""
+    _install(monkeypatch)
+    _turn(owner, "Build a deck for the CEO.", gen="g1")
+    answer, events = _turn(owner, "Turn this into an Excel tracker with the three plans and a total row.", gen="g2")
+    ref = _meta(events)["artifacts"][0]
+    assert ref["kind"] == "workbook" and ref["operation"] == "create" and [f["format"] for f in ref["files"]] == ["xlsx"]
+    assert len(_artifacts(owner, "conv-e")) == 2
+    answer, events = _turn(owner, "Also give me this as Excel.", gen="g3")
+    assert _meta(events)["artifacts"][0]["kind"] == "workbook", "a wish for Excel after a deck is a new workbook, not a refusal"
+    answer, events = _turn(owner, "Convert the deck to Excel.", gen="g4")
+    assert "cannot be converted to Excel" in answer
+
+
 def test_the_named_artifact_is_edited_not_the_latest(owner, monkeypatch):
     seen = []
 

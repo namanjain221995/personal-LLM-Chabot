@@ -2609,7 +2609,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     intent=artifact_intent,
                     conversation_id=conv_key,
                     user_id=viewer,
-                    generation_id=gen.id,
+                    generation_id=gen.generation_id,
                     effort=request.effort,
                     mode=request.mode,
                     web_allowed=bool(search_allowed) and request.mode == "assistant",
