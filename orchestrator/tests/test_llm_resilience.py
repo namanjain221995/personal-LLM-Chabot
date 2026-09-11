@@ -641,3 +641,29 @@ def test_json_completion_records_why_the_answer_stopped(monkeypatch, instant_eng
 
     monkeypatch.setattr(llm, "_client", lambda *a, **k: _FlakyClient(_conn_error, failures=0, response=None))
     assert asyncio.run(call())[1] == "stop"
+
+
+def test_json_completion_sizes_the_pool_when_thinking_is_on(monkeypatch, instant_engine):
+    """`max_tokens` is the answer's ceiling; with thinking on the reasoning
+    shares the pool, so the request is floored at MAX_OUTPUT_TOKENS (or the
+    ceiling plus the effort's budget in budgeted mode) — the rule
+    stream_chat already applied. The Artifact Studio's outline (2,500) and
+    review (2,000) calls were the first thinking-on JSON calls, and both
+    ended inside the reasoning block."""
+    seen = []
+
+    async def sized(messages, **kwargs):
+        seen.append(kwargs.get("requested_max_tokens"))
+        return list(messages), kwargs.get("requested_max_tokens") or 64
+
+    monkeypatch.setattr(llm.context, "fit_request", sized)
+    monkeypatch.setattr(llm, "_client", lambda *a, **k: _FlakyClient(_conn_error, failures=0, response=None))
+    monkeypatch.setattr(settings, "max_output_tokens", 65_536)
+    monkeypatch.setattr(settings, "thinking_budget_mode", "unbounded")
+    asyncio.run(llm.json_completion([{"role": "user", "content": "x"}], json_schema={"type": "object"}, max_tokens=2500, thinking=False))
+    asyncio.run(llm.json_completion([{"role": "user", "content": "x"}], json_schema={"type": "object"}, max_tokens=2500, thinking=True, effort="think"))
+    assert seen == [2500, 65_536]
+    monkeypatch.setattr(settings, "thinking_budget_mode", "client")
+    monkeypatch.setattr(settings, "thinking_budget_high", 6000)
+    asyncio.run(llm.json_completion([{"role": "user", "content": "x"}], json_schema={"type": "object"}, max_tokens=2500, thinking=True, effort="think"))
+    assert seen[-1] == 8500

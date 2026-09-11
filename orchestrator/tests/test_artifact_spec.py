@@ -260,6 +260,31 @@ def test_a_total_names_its_column_by_header_text():
     assert "header text" in S.schema_for("workbook")["$defs"]["Total"]["properties"]["column"]["description"]
 
 
+def test_a_sheet_chart_written_over_the_header_gets_the_cells():
+    """The e2e run of 2026-09-11, twice: `categories: ["Plan"]` — the header
+    where the cells belong — with three values per series."""
+    base = _tracker([])
+    sheet = base["sheets"][0]
+    sheet["charts"] = [{"type": "bar", "title": "Revenue by plan", "categories": ["Plan"], "series": [{"name": "Monthly Revenue", "values": [0, 2360, 1194]}]}]
+    spec = S.parse_body("workbook", base)
+    chart = spec.body.sheets[0].charts[0]
+    assert chart.categories == ["Free", "Team", "Enterprise"] and chart.series[0].values == [0, 2360, 1194]
+    # The header as a bare string, and a series named after a column with no values: filled from the cells.
+    sheet["charts"] = [{"type": "bar", "categories": "plan", "series": [{"name": "monthly revenue"}, {"name": "Target Accounts", "values": [120, 40, 6]}]}]
+    chart = S.parse_body("workbook", base).body.sheets[0].charts[0]
+    assert chart.categories == ["Free", "Team", "Enterprise"]
+    assert chart.series[0].values == [0.0, 2360.0, 1194.0] and chart.series[1].values == [120, 40, 6]
+    # Cells that are not numbers cannot fill a series: still refused, still a repair.
+    sheet["charts"] = [{"type": "bar", "categories": ["Plan"], "series": [{"name": "Seats"}]}]
+    with pytest.raises(ValidationError):
+        S.parse_body("workbook", base)
+    # A chart that really is inconsistent is still refused.
+    sheet["charts"] = [{"type": "bar", "categories": ["Free", "Team"], "series": [{"name": "Monthly Revenue", "values": [0, 2360, 1194]}]}]
+    with pytest.raises(ValidationError):
+        S.parse_body("workbook", base)
+    assert "cells of the label column" in S.schema_for("workbook")["$defs"]["Sheet"]["properties"]["charts"]["description"]
+
+
 def test_figures_the_material_never_gave_are_named():
     """The first Fast brief of the 2026-09-11 e2e run: asked for '$59 a month'
     and '120 team accounts', it wrote a $49 current price, competitors at
@@ -288,9 +313,13 @@ def test_figures_the_material_never_gave_are_named():
         {"layout": "kpis", "title": "Numbers", "kpis": [{"label": "ARR", "value": "$1.2M"}]},
         {"layout": "table", "title": "Tiers", "table": {"columns": ["Tier", "Seats"], "rows": [["Team", "25"], ["Enterprise", "unlimited"]]}},
     ]})
-    assert S.unsupported_figures(deck, "Team is $59 with 25 seats") == ["$1.2"]
+    assert S.unsupported_figures(deck, "Team is $59 with 25 seats") == ["$1.2M"]
+    assert S.unsupported_figures(deck, "Team is $59 with 25 seats; ARR 1,200,000") == []
     wb = S.parse_body("workbook", _tracker([]))
     assert S.unsupported_figures(wb, "Free $0, Team $59, Enterprise $199; accounts 120/40/6") == ["2360", "1194"]
+    # 410k in the material is 410,000 in the draft; 1.2M is $1,200,000.
+    doc = _doc(blocks=[{"type": "paragraph", "text": "Q1 revenue was $410,000 and ARR is $1,200,000; the plan is 3bn."}])
+    assert S.unsupported_figures(S.parse_body("document", doc), "Q1 revenue 410k, ARR 1.2M") == ["3bn"]
 
 
 def test_text_of_covers_every_prose_field():

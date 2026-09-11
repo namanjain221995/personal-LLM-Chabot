@@ -433,8 +433,76 @@ class Sheet(_Strict):
     totals: List[Total] = Field(default_factory=list, max_length=T.MAX_COLUMNS_PER_SHEET)
     freeze_header: bool = True
     autofilter: bool = True
-    charts: List[Chart] = Field(default_factory=list, max_length=4)
+    charts: List[Chart] = Field(
+        default_factory=list, max_length=4,
+        description="Charts over this sheet's rows: `categories` are the cells of the label column in row order (or just that column's header, and the cells are filled in), each series is named after a numeric column and carries that column's cells in row order (or no `values`, and they are filled in).",
+    )
     notes: str = Field(default="", max_length=2000)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _charts_from_columns(cls, data: Any) -> Any:
+        """A sheet chart is drawn over the sheet's own rows, and the model
+        keeps writing it that way — `categories: ["Plan"]` (the header, not
+        the cells) with three values per series (the e2e run of 2026-09-11:
+        "series 'Monthly Revenue' has 3 values for 1 categories", twice).
+        Before Chart validates, a header named where cells belong is
+        replaced by the cells, and a series with no values named after a
+        column gets that column's cells. Anything else is left for the
+        validator to refuse."""
+        if not isinstance(data, dict):
+            return data
+        charts, columns, rows = data.get("charts"), data.get("columns"), data.get("rows")
+        if not (isinstance(charts, list) and charts and isinstance(columns, list) and isinstance(rows, list) and rows):
+            return data
+        names: Dict[str, int] = {}
+        for j, c in enumerate(columns):
+            n = c.get("name") if isinstance(c, dict) else None
+            if isinstance(n, str) and n.strip():
+                names.setdefault(_fold(n), j)
+
+        def cells(j: int) -> List[Any]:
+            return [r[j] if isinstance(r, list) and j < len(r) else None for r in rows]
+
+        def numeric(vals: List[Any]) -> Optional[List[float]]:
+            out: List[float] = []
+            for v in vals:
+                if isinstance(v, bool):
+                    return None
+                if isinstance(v, (int, float)):
+                    out.append(float(v))
+                elif v is None or (isinstance(v, str) and not v.strip()):
+                    out.append(0.0)
+                else:
+                    try:
+                        out.append(float(str(v).replace(",", "").lstrip("$€£").rstrip("%")))
+                    except ValueError:
+                        return None
+            return out
+
+        fixed_charts: List[Any] = []
+        for ch in charts:
+            if not isinstance(ch, dict):
+                fixed_charts.append(ch)
+                continue
+            ch = dict(ch)
+            cats = ch.get("categories")
+            header = cats if isinstance(cats, str) else (cats[0] if isinstance(cats, list) and len(cats) == 1 and isinstance(cats[0], str) else None)
+            if header is not None and _fold(header) in names and len(rows) > 1:
+                ch["categories"] = ["" if v is None else str(v) for v in cells(names[_fold(header)])]
+            n = len(ch["categories"]) if isinstance(ch.get("categories"), list) else 0
+            series = ch.get("series")
+            if isinstance(series, list) and n == len(rows):
+                fixed_series: List[Any] = []
+                for s in series:
+                    if isinstance(s, dict) and not s.get("values") and isinstance(s.get("name"), str) and _fold(s["name"]) in names:
+                        vals = numeric(cells(names[_fold(s["name"])]))
+                        if vals is not None:
+                            s = {**s, "values": vals}
+                    fixed_series.append(s)
+                ch["series"] = fixed_series
+            fixed_charts.append(ch)
+        return {**data, "charts": fixed_charts}
 
     @field_validator("name")
     @classmethod
@@ -656,9 +724,12 @@ def is_formula_like(value: Any) -> bool:
 # material", which is true, not "wrong", which it cannot know.
 
 _FIGURE_RE = re.compile(
-    r"(?<![\w.])(?P<cur>[$€£]\s?)?(?P<num>\d{1,3}(?:,\d{3})+|\d+)(?P<dec>\.\d+)?(?P<pct>\s?(?:%|percent\b))?(?![\w.]\d)",
+    r"(?<![\w.])(?P<cur>[$€£]\s?)?(?P<num>\d{1,3}(?:,\d{3})+|\d+)(?P<dec>\.\d+)?"
+    r"(?:(?P<suf>k|m|mn|bn|b)\b|(?P<pct>\s?(?:%|percent\b)))?(?![\w.]\d)",
     re.IGNORECASE,
 )
+
+_SUFFIX_SCALE = {"k": 1_000, "m": 1_000_000, "mn": 1_000_000, "bn": 1_000_000_000, "b": 1_000_000_000}
 
 #: Keys whose numeric values the reader sees (chart values, table cells, KPI
 #: values); every other number in the structure is an index or a size.
@@ -669,18 +740,30 @@ def _figure_core(m: "re.Match[str]") -> str:
     return m.group("num").replace(",", "") + (m.group("dec") or "")
 
 
+def _figure_cores(m: "re.Match[str]") -> List[str]:
+    """The number as written, and — for `410k`, `1.2M`, `3bn` — expanded,
+    so a draft's 410,000 is found in a material that said 410k."""
+    core = _figure_core(m)
+    suffix = (m.group("suf") or "").lower()
+    if suffix in _SUFFIX_SCALE:
+        return [core, _core_of_number(float(core) * _SUFFIX_SCALE[suffix])]
+    return [core]
+
+
 def _figures_in_text(text: str) -> Dict[str, str]:
     """core → as written, for every number in `text`."""
     out: Dict[str, str] = {}
     for m in _FIGURE_RE.finditer(text or ""):
-        out.setdefault(_figure_core(m), m.group(0).strip())
+        for core in _figure_cores(m):
+            out.setdefault(core, m.group(0).strip())
     return out
 
 
 def _qualifies(m: "re.Match[str]") -> bool:
-    """A figure worth checking: money, a percentage, a decimal, or a count of
-    a thousand or more — not a day count, a step number or a year."""
-    if m.group("cur") or m.group("pct") or m.group("dec"):
+    """A figure worth checking: money, a percentage, a decimal, a count of
+    a thousand or more (`410k` included) — not a day count, a step number
+    or a year."""
+    if m.group("cur") or m.group("pct") or m.group("dec") or m.group("suf"):
         return True
     n = int(m.group("num").replace(",", ""))
     return n >= 1000 and not (1900 <= n <= 2100 and "," not in m.group("num"))
@@ -692,9 +775,9 @@ def _core_of_number(n: Union[int, float]) -> str:
     return str(n)
 
 
-def _numbers_in_structure(node: Any, key: str = "") -> List[Tuple[str, str]]:
-    """(core, as written) for every numeric leaf the reader sees."""
-    found: List[Tuple[str, str]] = []
+def _numbers_in_structure(node: Any, key: str = "") -> List[Tuple[List[str], str]]:
+    """(cores, as written) for every numeric leaf the reader sees."""
+    found: List[Tuple[List[str], str]] = []
     if isinstance(node, dict):
         for k, v in node.items():
             found.extend(_numbers_in_structure(v, k))
@@ -705,9 +788,9 @@ def _numbers_in_structure(node: Any, key: str = "") -> List[Tuple[str, str]]:
         return found
     elif isinstance(node, (int, float)) and key in _FIGURE_VALUE_KEYS:
         core = _core_of_number(node)
-        found.append((core, core))
+        found.append(([core], core))
     elif isinstance(node, str) and key in _FIGURE_VALUE_KEYS:
-        found.extend(_figures_in_text(node).items())
+        found.extend((_figure_cores(m), m.group(0).strip()) for m in _FIGURE_RE.finditer(node))
     return found
 
 
@@ -722,13 +805,15 @@ def unsupported_figures(spec: ArtifactSpec, material_text: str) -> List[str]:
     seen: List[str] = []
     cores: set = set()
     for m in _FIGURE_RE.finditer(text_of(spec)):
-        core = _figure_core(m)
-        if core in known or core in cores or not _qualifies(m):
+        mine = _figure_cores(m)
+        core = mine[-1]
+        if any(c in known for c in mine) or core in cores or not _qualifies(m):
             continue
         cores.add(core)
         seen.append(m.group(0).strip())
-    for core, written in _numbers_in_structure(body.model_dump()):
-        if core in known or core in cores:
+    for mine, written in _numbers_in_structure(body.model_dump()):
+        core = mine[-1]
+        if any(c in known for c in mine) or core in cores:
             continue
         try:
             value = float(core)

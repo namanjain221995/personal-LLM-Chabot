@@ -389,7 +389,11 @@ class Settings:
         self.artifact_max_concurrent_jobs: int = _int("ARTIFACT_MAX_CONCURRENT_JOBS", 1)
         self.artifact_lease_ttl_s: float = _float("ARTIFACT_LEASE_TTL_S", 90.0)
         # A stage that runs longer than this is failed, not waited on.
-        self.artifact_stage_timeout_s: float = _float("ARTIFACT_STAGE_TIMEOUT_S", 600.0)
+        # MEASURED 2026-09-11 (Qwen3.6-35B, TP=2): a Think-effort workbook
+        # is outline + spec + review with thinking on, 252 s for three
+        # rows; two corrections on top approach 450 s, Max adds sources and
+        # a visual pass. 900 s is the wall above that, not a target.
+        self.artifact_stage_timeout_s: float = _float("ARTIFACT_STAGE_TIMEOUT_S", 900.0)
         # The renderer subprocess: wall clock and address space. A document
         # that needs more than this is a page-count or image bomb.
         self.artifact_render_timeout_s: float = _float("ARTIFACT_RENDER_TIMEOUT_S", 180.0)

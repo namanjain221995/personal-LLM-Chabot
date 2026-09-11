@@ -174,8 +174,11 @@ _KIND_GUIDE = {
         "rows from the material only (never invented numbers), totals as "
         "column+function requests where `column` is the column's HEADER TEXT "
         "exactly as you wrote it in `columns` (the file writes the formula), "
-        "a chart per sheet where it helps. For a dashboard, name the first "
-        "sheet 'Dashboard' and give it the summary rows."
+        "a chart per sheet where it helps: its `categories` are the CELLS of "
+        "the label column in row order (one per row, not the header), and "
+        "each series is named after a numeric column and lists that column's "
+        "cells in the same order. For a dashboard, name the first sheet "
+        "'Dashboard' and give it the summary rows."
     ),
 }
 
@@ -278,8 +281,10 @@ def _material_messages(req: ComposeRequest, *, budget: T.EffortBudget) -> List[d
 # ------------------------------------------------------------- the calls --
 
 
-async def _json(messages: List[dict], schema: dict, name: str, *, thinking: bool, max_tokens: int) -> dict:
-    raw = await llm.json_completion(messages, json_schema=schema, schema_name=name, temperature=0.0, max_tokens=max_tokens, thinking=thinking)
+async def _json(messages: List[dict], schema: dict, name: str, *, thinking: bool, max_tokens: int, effort: Optional[str] = None) -> dict:
+    # `max_tokens` is the answer's ceiling; with thinking on, json_completion
+    # sizes the pool the reasoning shares (see its docstring).
+    raw = await llm.json_completion(messages, json_schema=schema, schema_name=name, temperature=0.0, max_tokens=max_tokens, thinking=thinking, effort=effort)
     obj = extract_json_object(raw or "")
     if not isinstance(obj, dict):
         if llm.get_finish_reason() == "length":
@@ -352,7 +357,7 @@ async def outline(req: ComposeRequest, budget: T.EffortBudget) -> dict:
         "uses, whether the request needs current external facts you were not "
         "given, and the assumptions you will make."
     )
-    return await _json(messages, _OUTLINE_SCHEMA, "artifact_outline", thinking=budget.thinking, max_tokens=2500)
+    return await _json(messages, _OUTLINE_SCHEMA, "artifact_outline", thinking=budget.thinking, max_tokens=2500, effort=req.effort)
 
 
 async def _compose_once(req: ComposeRequest, budget: T.EffortBudget, *, outline_json: Optional[dict], extra: str = "") -> dict:
@@ -368,7 +373,7 @@ async def _compose_once(req: ComposeRequest, budget: T.EffortBudget, *, outline_
         )
     if extra:
         messages.append({"role": "user", "content": extra})
-    return await _json(messages, S.schema_for(req.kind), f"artifact_{req.kind}", thinking=budget.thinking, max_tokens=_max_tokens_for(req.kind, req.effort))
+    return await _json(messages, S.schema_for(req.kind), f"artifact_{req.kind}", thinking=budget.thinking, max_tokens=_max_tokens_for(req.kind, req.effort), effort=req.effort)
 
 
 def _enforce_caps(spec: S.ArtifactSpec, budget: T.EffortBudget) -> List[str]:
@@ -572,6 +577,9 @@ async def _validate_or_repair(req: ComposeRequest, budget: T.EffortBudget, raw: 
     try:
         return S.parse_body(req.kind, fixed), 1, notes
     except ValidationError as exc:
+        # Field paths and rule names only — the operator's key to a repair
+        # that did not take; the content never reaches the log.
+        log.info("artifact compose: the repair was invalid too: %s", S.validation_summary(exc).replace("\n", " | ")[:400])
         raise ComposeError("model_failure", "The model could not produce a valid document structure.") from exc
 
 
@@ -599,7 +607,7 @@ async def content_review(req: ComposeRequest, spec: S.ArtifactSpec, budget: T.Ef
             + f"Draft (JSON):\n{spec.body.model_dump_json()[:60_000]}"
         )},
     ]
-    return await _json(messages, _REVIEW_SCHEMA, "artifact_review", thinking=budget.thinking, max_tokens=2000)
+    return await _json(messages, _REVIEW_SCHEMA, "artifact_review", thinking=budget.thinking, max_tokens=2000, effort=req.effort)
 
 
 # ------------------------------------------------------------- visual QA --

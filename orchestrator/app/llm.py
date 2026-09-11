@@ -956,6 +956,7 @@ async def json_completion(
     temperature: float = 0.0,
     max_tokens: Optional[int] = None,
     thinking: bool = False,
+    effort: Optional[str] = None,
 ) -> str:
     """A completion constrained to one JSON schema, with an honest fallback.
 
@@ -963,15 +964,32 @@ async def json_completion(
     When it does not (a 400 on `response_format`), the same request is retried
     unconstrained — the caller still validates, and a validation failure there
     is repaired once before anything falls back to a deterministic path.
+
+    `max_tokens` is the ANSWER's ceiling. With `thinking` on, reasoning and
+    answer draw from one pool, so the request is sized the way `stream_chat`
+    sizes it: the answer ceiling plus the effort's thinking budget in
+    budgeted mode, and floored at MAX_OUTPUT_TOKENS in the default unbounded
+    mode. Until 2026-09-11 the caller's number went through untouched and
+    every thinking-on JSON call here was the first of its kind — the
+    Artifact Studio's outline (2,500) and review (2,000) both ended inside
+    the reasoning block, finish_reason=length, no JSON, and Think effort
+    silently became Fast plus two minutes of thinking.
     """
     client = _openai_client()
     model_id = model or settings.llm_model
     reset_finish_reason()
+    requested = max_tokens
+    if thinking:
+        budget_tokens = thinking_budget(effort) if effort else None
+        if budget_tokens and max_tokens is not None:
+            requested = max_tokens + budget_tokens
+        elif budget_tokens is None:
+            requested = max(max_tokens or 0, settings.max_output_tokens)
     sized, budget = await context.fit_request(
         normalize_system(messages),
         base_url=settings.openai_base_url,
         model=model_id,
-        requested_max_tokens=max_tokens,
+        requested_max_tokens=requested,
     )
     base = dict(
         model=model_id,

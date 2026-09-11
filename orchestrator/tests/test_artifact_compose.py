@@ -39,8 +39,8 @@ class _Model:
         self.answers = list(answers)
         self.calls = []
 
-    async def __call__(self, messages, *, json_schema=None, schema_name="", temperature=0.0, max_tokens=None, thinking=False):
-        self.calls.append({"messages": messages, "schema": schema_name, "thinking": thinking, "max_tokens": max_tokens})
+    async def __call__(self, messages, *, json_schema=None, schema_name="", temperature=0.0, max_tokens=None, thinking=False, effort=None):
+        self.calls.append({"messages": messages, "schema": schema_name, "thinking": thinking, "max_tokens": max_tokens, "effort": effort})
         if not self.answers:
             raise AssertionError("the model was called more times than the script allows")
         answer = self.answers.pop(0)
@@ -134,7 +134,7 @@ def test_think_outlines_reviews_and_corrects_musts(monkeypatch):
     monkeypatch.setattr(llm, "json_completion", model)
     result = asyncio.run(C.compose(_req("think")))
     assert [c["schema"] for c in model.calls] == ["artifact_outline", "artifact_document", "artifact_review", "artifact_document"]
-    assert all(c["thinking"] is True for c in model.calls)
+    assert all(c["thinking"] is True and c["effort"] == "think" for c in model.calls), "the completion layer sizes the thinking pool by effort"
     assert result.outline == outline and result.review == review and result.corrections == 1
     assert "1 October" in result.spec.body.blocks[1].text
     assert "Follow this outline" in model.calls[1]["messages"][0]["content"]
