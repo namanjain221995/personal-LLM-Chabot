@@ -116,6 +116,7 @@ class ComposeOverlayValidationTests(unittest.TestCase):
         user_environment: dict | None = None,
         *,
         model_config: dict | None = None,
+        drop_generated: tuple[str, ...] = (),
     ) -> tuple[SelectedProfile, dict]:
         """Resolve one fixture's Compose plan through Docker Compose itself.
 
@@ -158,6 +159,11 @@ class ComposeOverlayValidationTests(unittest.TestCase):
             # values, exactly as ComposeManager._environment does at runtime.
             generated["TECHSARA_GENERATED_ENV"] = str(generated_env)
             generated["TECHSARA_SECRET_ENV"] = str(secrets_env)
+            # `drop_generated` simulates a generated.env written by an OLDER
+            # launcher that did not know a key yet — the state every checkout
+            # is in between pulling a change and its next `techsara up`.
+            for key in drop_generated:
+                generated.pop(key, None)
             generated_env.write_text(render_env(generated), encoding="utf-8")
             secrets_env.write_text(
                 render_env(
@@ -323,6 +329,30 @@ class ComposeOverlayValidationTests(unittest.TestCase):
         self.assertNotIn("--hf-overrides", native_argv)
         self.assertNotIn("--speculative-config", native_argv)
         self.assertEqual(native_argv[native_argv.index("--max-model-len") + 2], "--gpu-memory-utilization")
+
+    def test_a_stale_generated_env_still_renders_and_carries_neither_new_flag(self) -> None:
+        """A generated.env from before 2026-09-11 lacks the two argument keys.
+
+        Every compose invocation — the cluster scripts, the deploy drain, the
+        launcher's own validation — interpolates the overlays against
+        whatever generated.env is on disk, and a `${KEY:?}` guard on a key an
+        older launcher never wrote broke all of them until the next `up`
+        (observed live on 2026-09-11). The keys default to empty: the command
+        line then carries neither flag and vLLM's own defaults apply until the
+        launcher regenerates the file.
+        """
+        for fixture in ("dgx-spark", "nvidia-large"):
+            with self.subTest(fixture=fixture):
+                _profile, rendered = self._render(
+                    FIXTURES[fixture], model_config=NESTED_CONFIG,
+                    drop_generated=("MAIN_MODEL_PREFIX_CACHING_ARGUMENT", "MAIN_MODEL_SPECULATIVE_ARGUMENT"),
+                )
+                argv = list(rendered["services"]["vllm"]["command"])
+                self.assertNotIn("--speculative-config", argv)
+                self.assertNotIn("--enable-prefix-caching", argv)
+                self.assertNotIn("--no-enable-prefix-caching", argv)
+                self.assertIn("--enable-chunked-prefill", argv)
+                self.assertEqual(argv[argv.index("--enable-chunked-prefill") + 1], "--tool-call-parser")
 
     def test_prefix_caching_is_a_real_switch_on_the_single_node_command_line(self) -> None:
         """MAIN_MODEL_ENABLE_PREFIX_CACHING decides the flag, not just a belief.

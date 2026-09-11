@@ -55,13 +55,17 @@ NCCL_DEBUG_LEVELS = ("VERSION", "WARN", "INFO", "TRACE")
 MTP_SPECULATIVE_CONFIG = '{"method":"mtp","num_speculative_tokens":1}'
 #: Speculative decoding is OFF unless .env asks for it. Until 2026-09-11 the
 #: default was the MTP draft above; it was withdrawn because on the pinned
-#: build (0.26.1rc1.dev77) every CUDA fault the cluster has logged -- three
-#: `misaligned address` / `illegal memory access` faults on rank 1, each
-#: taking the TP=2 collective and 9-15 minutes of serving with it -- is in the
-#: Qwen GDN spec-decode branch (`qwen_gdn_linear_attn.py`, the
-#: `index_select` on mixed spec/non-spec batches), a branch that is
-#: unreachable when `spec_sequence_masks` is None, i.e. without this flag.
-#: See docs/ISSUE/gdn-spec-decode-fault-report.md. Setting the key to
+#: build (0.26.1rc1.dev77) three of the four CUDA faults the cluster has
+#: logged since 28 August -- `misaligned address` / `illegal memory access`
+#: on rank 1, each taking the TP=2 collective and 9-15 minutes of serving
+#: with it -- are in the Qwen GDN spec-decode branch
+#: (`qwen_gdn_linear_attn.py`, the `index_select` on mixed spec/non-spec
+#: batches), a branch that is unreachable when `spec_sequence_masks` is
+#: None, i.e. without this flag. (The fourth, 2026-09-10, was a cuDNN FP8
+#: GEMM launch error under the same mixed load; not proven MTP-gated.) See
+#: docs/ISSUE/gdn-spec-decode-fault-report.md. Measured after the switch:
+#: decode got FASTER, because without spec-decode vLLM keeps FULL CUDA
+#: graphs for decode instead of downgrading to PIECEWISE. Setting the key to
 #: MTP_SPECULATIVE_CONFIG opts back in; the launcher never does it silently.
 DEFAULT_SPECULATIVE_CONFIG = ""
 DEFAULT_MAX_NUM_BATCHED_TOKENS = 8192
@@ -505,10 +509,11 @@ def speculative_config_argument(values: Mapping[str, str]) -> str:
 def prefix_caching_argument(enabled: bool) -> str:
     """``--enable-prefix-caching`` or its explicit negation.
 
-    vLLM's V1 engine defaults prefix caching ON, so merely omitting the flag
-    would leave it enabled; ``--no-enable-prefix-caching`` is what actually
-    turns it off. On the hybrid-Mamba Qwen3.6 the engine itself labels the
-    feature experimental (``mamba_cache_mode=align``), so the launcher always
+    vLLM's own default depends on the model: ON for a dense model, OFF
+    (opt-in "while the feature matures") for a hybrid-Mamba one such as the
+    Qwen3.6-35B-A3B, where the engine labels prefix caching experimental
+    (``mamba_cache_mode=align``). Merely omitting the flag would therefore
+    mean different things on different profiles, so the launcher always
     states the choice explicitly and the running command line shows it.
     """
     return "--enable-prefix-caching" if enabled else "--no-enable-prefix-caching"
