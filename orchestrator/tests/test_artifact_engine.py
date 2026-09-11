@@ -277,7 +277,11 @@ def test_export_of_the_previous_answer_carries_it_as_material(owner, monkeypatch
     _install(monkeypatch, seen=seen)
     history = [{"role": "user", "content": "explain our pricing"}, {"role": "assistant", "content": "Our pricing has three tiers: Free, Team ($59) and Enterprise."}]
     _turn(owner, "Export the previous answer as PDF.", history=history)
-    assert "three tiers" in seen[0]["material"]["previous_answer"] if "previous_answer" in seen[0]["material"] else True
+    # `ctx.material` is read back from material.json — the round trip the
+    # composer depends on, not the dict the engine handed to accept().
+    material = seen[0]["material"]
+    assert "three tiers" in material["previous_answer"]
+    assert isinstance(material["notes"], list) and material["notes"], "the engine's notes (audience, mode, date) reach the composer"
     assert seen[0]["operation"] == "create"
 
 

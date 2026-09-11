@@ -72,7 +72,7 @@ browser  ArtifactCard → ArtifactPanel → PagesViewer / SheetViewer ───�
 
 ## Effort
 
-Effort never decides whether a file is made. Fast: one model call, thinking off, one repair, one placeholder correction, deterministic validation. Think: an outline first, a content review after, two corrections, web sources when the request needs them and the mode allows. Max: the same plus a visual review of the rendered pages by the vision-capable model with one correction pass — an orchestrated workflow, described to the person as exactly that.
+Effort never decides whether a file is made. Fast: one model call, thinking off, one repair, one correction (placeholders, or an edit that asked for less and got more), deterministic validation. Think: an outline first, a content review after, two corrections, web sources when the request needs them and the mode allows. Max: the same plus a visual review of the rendered pages by the vision-capable model with one correction pass — an orchestrated workflow, described to the person as exactly that.
 
 ## What was deliberately not built
 

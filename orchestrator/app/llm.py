@@ -27,7 +27,7 @@ import time
 from collections import OrderedDict
 from collections.abc import Mapping
 from contextvars import ContextVar
-from typing import AsyncIterator, List, Optional, Sequence, Tuple
+from typing import Any, AsyncIterator, List, Optional, Sequence, Tuple
 
 from . import context, metrics
 from .config import settings
@@ -966,6 +966,7 @@ async def json_completion(
     """
     client = _openai_client()
     model_id = model or settings.llm_model
+    reset_finish_reason()
     sized, budget = await context.fit_request(
         normalize_system(messages),
         base_url=settings.openai_base_url,
@@ -997,6 +998,7 @@ async def json_completion(
                 lambda: client.chat.completions.create(**guided),
                 what="json_completion", base_url=settings.openai_base_url,
             )
+            _note_truncation(resp, schema_name, budget)
             return resp.choices[0].message.content or ""
         except _bad_request_error() as exc:
             # A 400 is the documented "this backend has no guided decoding"
@@ -1015,7 +1017,27 @@ async def json_completion(
         lambda: client.chat.completions.create(**base),
         what="json_completion", base_url=settings.openai_base_url,
     )
+    _note_truncation(resp, schema_name, budget)
     return resp.choices[0].message.content or ""
+
+
+def _note_truncation(resp: Any, schema_name: str, budget: Optional[int]) -> None:
+    """A JSON answer cut off at max_tokens is unparseable and the caller
+    reports it as "not JSON"; the caller can tell the two apart through
+    `get_finish_reason()` (set here, as the streaming loop sets it), and the
+    operator sees the budget it hit — the schema and the numbers, never the
+    content. (The 2026-09-11 e2e run lost a workbook to a 180 s repair pass
+    that ran to 12,000 tokens; the log said only "not JSON".)"""
+    try:
+        choice = resp.choices[0]
+        reason = getattr(choice, "finish_reason", None)
+        usage = getattr(resp, "usage", None)
+        produced = getattr(usage, "completion_tokens", None)
+    except (AttributeError, IndexError, TypeError):
+        return
+    _set_finish_reason(reason)
+    if reason == "length":
+        log.warning("json_completion: %s answer truncated at max_tokens=%s (completion_tokens=%s)", schema_name, budget, produced)
 
 
 # ---------------------------------------------------------------------------

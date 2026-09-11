@@ -218,6 +218,48 @@ def test_a_workbook_never_takes_a_formula_from_the_model():
         S.parse_body("workbook", {**wb, "sheets": [wb["sheets"][0], {**wb["sheets"][0], "name": "q1 / plan?"}]})
 
 
+def _tracker(totals):
+    return {
+        "title": "Plans", "template_id": "tracker",
+        "sheets": [{
+            "name": "Pricing Overview",
+            "columns": [{"name": "Plan"}, {"name": "Price", "type": "currency"}, {"name": "Seats"},
+                        {"name": "Target Accounts", "type": "integer"}, {"name": "Monthly Revenue", "type": "currency"}],
+            "rows": [["Free", 0, "5", 120, 0], ["Team", 59, "25", 40, 2360], ["Enterprise", 199, "unlimited", 6, 1194]],
+            "totals": totals,
+        }],
+    }
+
+
+def test_a_total_names_its_column_by_header_text():
+    """The e2e failure of 2026-09-11: five columns, totals over 4 and 5 —
+    the model counted from 1, was told 5 was out of range, and did it again.
+    A header name has no base to get wrong; the renderer still gets an index."""
+    spec = S.parse_body("workbook", _tracker([{"column": "Monthly Revenue"}, {"column": " target  accounts ", "fn": "sum"}]))
+    assert [t.column for t in spec.body.sheets[0].totals] == [4, 3]
+    # Positions from 1 are recognisable as a SET when one is exactly one
+    # past the end and none is 0 — and are shifted together.
+    spec = S.parse_body("workbook", _tracker([{"column": 4, "label": "Total Accounts"}, {"column": 5, "label": "Total Revenue"}]))
+    assert [t.column for t in spec.body.sheets[0].totals] == [3, 4]
+    # Plain 0-based positions are untouched.
+    spec = S.parse_body("workbook", _tracker([{"column": 3}, {"column": 4}]))
+    assert [t.column for t in spec.body.sheets[0].totals] == [3, 4]
+    # A validated spec round-trips (its indexes are resolved, never shifted twice).
+    again = S.parse_body("workbook", json.loads(spec.body.model_dump_json()))
+    assert [t.column for t in again.body.sheets[0].totals] == [3, 4]
+    with pytest.raises(ValidationError) as exc:
+        S.parse_body("workbook", _tracker([{"column": "Revenue"}]))
+    assert "names no column" in S.validation_summary(exc.value) and "'Monthly Revenue'" in S.validation_summary(exc.value)
+    with pytest.raises(ValidationError) as exc:
+        S.parse_body("workbook", _tracker([{"column": 9}]))
+    assert "name the column by its header text" in S.validation_summary(exc.value)
+    with pytest.raises(ValidationError):
+        S.parse_body("workbook", _tracker([{"column": "Plan", "fn": "sum"}]))  # summing text
+    with pytest.raises(ValidationError):
+        S.parse_body("workbook", _tracker([{"column": True}]))
+    assert "header text" in S.schema_for("workbook")["$defs"]["Total"]["properties"]["column"]["description"]
+
+
 def test_text_of_covers_every_prose_field():
     spec = S.parse_body("document", _doc())
     text = S.text_of(spec)

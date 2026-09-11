@@ -71,6 +71,11 @@ def _scrub(value: Any) -> Any:
     return value
 
 
+def _fold(name: str) -> str:
+    """A header as a lookup key: case and inner whitespace do not count."""
+    return " ".join(str(name).split()).casefold()
+
+
 class _Strict(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
@@ -389,11 +394,36 @@ class Column(_Strict):
 
 class Total(_Strict):
     """A totals row the RENDERER writes as a real formula over the column —
-    the model names the column and the function; it never writes `=SUM(`."""
+    the model names the column and the function; it never writes `=SUM(`.
 
-    column: int = Field(ge=0)
+    `column` is the column's header text, or its position. The e2e run of
+    2026-09-11 lost a workbook to `total over column 5 is out of range`: the
+    model counted the five columns from 1, was told the index was out of
+    range, and did it again. A header name has no base to get wrong, so the
+    schema asks for that; a position is still accepted, and Sheet._shape
+    resolves both to a 0-based index before the renderer sees it.
+    """
+
+    column: Union[str, int] = Field(
+        description="The header text of the column to total (exactly as written in `columns`), or its 0-based position.",
+    )
     fn: Literal["sum", "average", "count", "min", "max"] = "sum"
     label: str = Field(default="Total", max_length=40)
+
+    @field_validator("column", mode="before")
+    @classmethod
+    def _column(cls, v: Any) -> Union[str, int]:
+        # Before coercion: a bool would otherwise pass as the position 0/1.
+        if isinstance(v, bool) or not isinstance(v, (str, int)):
+            raise ValueError("a column is a header name or a position")
+        if isinstance(v, int):
+            if v < 0:
+                raise ValueError("a column position cannot be negative")
+            return v
+        name = v.strip()
+        if not name or len(name) > 80:
+            raise ValueError("a column name must be 1-80 characters")
+        return name
 
 
 class Sheet(_Strict):
@@ -424,12 +454,38 @@ class Sheet(_Strict):
         for i, row in enumerate(self.rows):
             if len(row) != width:
                 raise ValueError(f"sheet {self.name!r} row {i + 1} has {len(row)} cells for {width} columns")
+        self._resolve_totals(width)
         for t in self.totals:
-            if t.column >= width:
-                raise ValueError(f"total over column {t.column} is out of range")
             if self.columns[t.column].type == "text" and t.fn != "count":
                 raise ValueError(f"cannot {t.fn} the text column {self.columns[t.column].name!r}")
         return self
+
+    def _resolve_totals(self, width: int) -> None:
+        """Every total's `column` becomes a 0-based index. A header name is
+        matched to a column (case-insensitively, whitespace-insensitively);
+        positions given from 1 — recognisable ONLY when one of them is
+        exactly one past the end and none is 0 — are shifted as a set, since
+        shifting some and not others would total the wrong columns."""
+        by_name = {}
+        for i, c in enumerate(self.columns):
+            by_name.setdefault(_fold(c.name), i)
+        positions = [t.column for t in self.totals if isinstance(t.column, int)]
+        from_one = bool(positions) and max(positions) == width and min(positions) >= 1
+        for t in self.totals:
+            if isinstance(t.column, int):
+                idx = t.column - 1 if from_one else t.column
+                if idx >= width:
+                    raise ValueError(
+                        f"total over column {t.column} is out of range: this sheet has {width} columns; "
+                        "name the column by its header text"
+                    )
+                t.column = idx
+            else:
+                idx = by_name.get(_fold(t.column))
+                if idx is None:
+                    names = ", ".join(repr(c.name) for c in self.columns)
+                    raise ValueError(f"total over column {t.column!r} names no column; the columns are {names}")
+                t.column = idx
 
 
 class WorkbookSpec(_Strict):

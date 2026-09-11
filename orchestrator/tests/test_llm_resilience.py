@@ -609,3 +609,35 @@ def test_failure_sentence_classifies_sdk_errors_and_the_wrapper():
     # Never the exception's own text on the wire.
     sentence, _ = main._failure_sentence(_conn_error())
     assert "connection refused" not in sentence.lower()
+
+
+def test_json_completion_records_why_the_answer_stopped(monkeypatch, instant_engine, caplog):
+    """A guided JSON answer cut off at max_tokens is unparseable; the caller
+    reads the finish reason to say so, and the operator's log names the
+    budget (never the content)."""
+    import logging
+
+    monkeypatch.setattr(llm.context, "fit_request", _sized)
+
+    class _Cut(_FlakyClient):
+        @property
+        def _response(self):
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content='{"a": [1, 2', reasoning_content=None), finish_reason="length")],
+                usage=SimpleNamespace(prompt_tokens=10, completion_tokens=64),
+            )
+
+    monkeypatch.setattr(llm, "_client", lambda *a, **k: _Cut(_conn_error, failures=0, response=None))
+    async def call(schema_name="decision"):
+        # Inside the task, as a caller reads it (the ContextVar is task-scoped).
+        llm._set_finish_reason("stop")  # stale from an earlier call: must be cleared, not inherited
+        out = await llm.json_completion([{"role": "user", "content": "x"}], json_schema={"type": "object"}, schema_name=schema_name)
+        return out, llm.get_finish_reason()
+
+    with caplog.at_level(logging.WARNING, logger="app.llm"):
+        out, reason = asyncio.run(call("artifact_workbook"))
+    assert out == '{"a": [1, 2' and reason == "length"
+    assert "artifact_workbook answer truncated at max_tokens=64" in caplog.text and '"a"' not in caplog.text
+
+    monkeypatch.setattr(llm, "_client", lambda *a, **k: _FlakyClient(_conn_error, failures=0, response=None))
+    assert asyncio.run(call())[1] == "stop"

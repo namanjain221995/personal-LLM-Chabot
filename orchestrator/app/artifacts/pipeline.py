@@ -276,13 +276,19 @@ class _Ctx:
 
 
 def _material(data: Optional[dict]) -> dict:
-    """The conversation-derived material, with every key present."""
+    """The conversation-derived material, with every key present. This is
+    the shape material.json takes and the shape the composer reads back, so
+    a key missing here is silently missing from every document: the first
+    version dropped `previous_answer` (what "export the previous answer"
+    exports) and `notes` (the audience and mode the engine inferred)."""
     data = dict(data or {})
     return {
         "history_text": str(data.get("history_text") or ""),
+        "previous_answer": str(data.get("previous_answer") or ""),
         "sources": list(data.get("sources") or []),
         "tables": list(data.get("tables") or []),
         "uploads_text": str(data.get("uploads_text") or ""),
+        "notes": [str(n) for n in (data.get("notes") or []) if str(n).strip()],
         "salesforce": data.get("salesforce") if isinstance(data.get("salesforce"), dict) else {},
     }
 

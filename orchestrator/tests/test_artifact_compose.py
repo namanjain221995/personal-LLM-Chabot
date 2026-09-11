@@ -85,6 +85,29 @@ def test_two_invalid_answers_are_a_model_failure(monkeypatch):
     assert exc.value.category == "model_failure"
 
 
+def test_an_answer_cut_off_at_the_budget_says_so(monkeypatch):
+    """The 2026-09-11 e2e run: a repair pass ran to max_tokens (180 s) and
+    the person read "did not return the document as JSON". The finish
+    reason the completion layer records tells the two apart."""
+    truncated = '{"title": "Plans", "template_id": "tracker", "sheets": [{"name": "A", "columns": [{"name": "x"}], "rows": [["1"], ["2"'
+
+    class _Cut(_Model):
+        async def __call__(self, *a, **k):
+            llm._set_finish_reason("length")
+            return await super().__call__(*a, **k)
+
+    monkeypatch.setattr(llm, "json_completion", _Cut([truncated]))
+    llm.reset_finish_reason()
+    with pytest.raises(C.ComposeError) as exc:
+        asyncio.run(C.compose(_req("fast", kind="workbook", formats=["xlsx"], template_id="tracker")))
+    assert exc.value.category == "model_failure" and "cut off" in str(exc.value)
+    llm.reset_finish_reason()
+    monkeypatch.setattr(llm, "json_completion", _Model(["not json at all"]))
+    with pytest.raises(C.ComposeError) as exc:
+        asyncio.run(C.compose(_req("fast")))
+    assert "did not return the document as JSON" in str(exc.value)
+
+
 def test_placeholders_get_one_correction_at_fast(monkeypatch):
     holey = _doc_json(blocks=[{"type": "paragraph", "text": "Lorem ipsum. [Insert chart]"}])
     model = _Model([holey, _doc_json()])
@@ -137,6 +160,31 @@ def test_an_edit_carries_the_parent_spec_and_skips_the_outline(monkeypatch):
     assert model.calls[0]["schema"] == "artifact_document", "no outline call for an edit"
     assert "EDITING an existing document" in model.calls[0]["messages"][0]["content"]
     assert "Team tier moves to $59." in model.calls[0]["messages"][0]["content"], "the parent content travels with the edit"
+
+
+def test_shorter_that_came_back_longer_is_corrected_once_then_warned(monkeypatch):
+    """The e2e run of 2026-09-11: 'make the brief shorter' came back as two
+    pages. A deterministic check every effort can afford: one correction
+    naming the word counts, then a visible warning if the model still cannot."""
+    parent = S.parse_body("document", _doc_json(blocks=[{"type": "paragraph", "text": "Team tier moves to fifty-nine dollars next month."}]))
+    longer = _doc_json(blocks=[{"type": "paragraph", "text": "Team tier moves to fifty-nine dollars next month, " * 4 + "and this is a much longer paragraph than before."}])
+    shorter = _doc_json(blocks=[{"type": "paragraph", "text": "Team tier: $59 next month."}])
+    model = _Model([longer, shorter])
+    monkeypatch.setattr(llm, "json_completion", model)
+    result = asyncio.run(C.compose(_req("fast", operation="edit", parent_spec=parent, instruction="Make it shorter and add a warning.")))
+    assert result.corrections == 1 and len(model.calls) == 2 and result.warnings == []
+    assert "asked for a SHORTER document" in model.calls[1]["messages"][-1]["content"]
+    assert "$59" in result.spec.body.blocks[0].text
+    # Still longer after the correction: the version says so.
+    model = _Model([longer, longer])
+    monkeypatch.setattr(llm, "json_completion", model)
+    result = asyncio.run(C.compose(_req("fast", operation="edit", parent_spec=parent, instruction="Condense this.")))
+    assert result.corrections == 1 and any("shorter document but this version is longer" in w for w in result.warnings)
+    # Not an edit, or not asking for less: no check, no call.
+    model = _Model([longer])
+    monkeypatch.setattr(llm, "json_completion", model)
+    result = asyncio.run(C.compose(_req("fast", operation="edit", parent_spec=parent, instruction="Add a section on churn risk.")))
+    assert result.corrections == 0 and len(model.calls) == 1
 
 
 def test_caps_trim_a_deck_with_a_warning_instead_of_refusing(monkeypatch):

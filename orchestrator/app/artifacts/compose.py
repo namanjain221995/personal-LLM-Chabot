@@ -9,7 +9,8 @@ writes CONTENT; it never sees a filename, an id, a URL, or a byte of a file.
 WHAT EFFORT BUYS (types.EFFORT_BUDGETS is the only place the numbers live):
 
     fast   one call: material → spec. Thinking off. One repair if the JSON
-           does not validate; one correction if it holds placeholders.
+           does not validate; one correction if it holds placeholders, or
+           if an edit that asked for less came back with more.
     think  an OUTLINE call first (structure, audience, what each section is
            for), then the spec, then a CONTENT REVIEW (does it cover what was
            asked, are the numbers consistent with the material, is anything
@@ -37,7 +38,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
 
 from pydantic import ValidationError
 
@@ -167,9 +168,10 @@ _KIND_GUIDE = {
     "workbook": (
         "Write a workbook: one sheet per table of data, typed columns, real "
         "rows from the material only (never invented numbers), totals as "
-        "column+function requests (the file writes the formula), a chart per "
-        "sheet where it helps. For a dashboard, name the first sheet "
-        "'Dashboard' and give it the summary rows."
+        "column+function requests where `column` is the column's HEADER TEXT "
+        "exactly as you wrote it in `columns` (the file writes the formula), "
+        "a chart per sheet where it helps. For a dashboard, name the first "
+        "sheet 'Dashboard' and give it the summary rows."
     ),
 }
 
@@ -263,6 +265,11 @@ async def _json(messages: List[dict], schema: dict, name: str, *, thinking: bool
     raw = await llm.json_completion(messages, json_schema=schema, schema_name=name, temperature=0.0, max_tokens=max_tokens, thinking=thinking)
     obj = extract_json_object(raw or "")
     if not isinstance(obj, dict):
+        if llm.get_finish_reason() == "length":
+            # Cut off at the budget: a runaway, or a document that really
+            # was that long. Either way the person should hear the true
+            # shape of it, not "not JSON".
+            raise ComposeError("model_failure", "The model's answer was cut off before the document was complete; a shorter or narrower request should work.")
         raise ComposeError("model_failure", "The model did not return the document as JSON.")
     return obj
 
@@ -415,6 +422,26 @@ async def compose(req: ComposeRequest, *, progress: Optional[Progress] = None) -
     if holes:
         result_warnings.append("placeholder text remains: " + ", ".join(holes[:4]))
 
+    # "Make it shorter" that came back longer is a correction too — a
+    # deterministic one every effort can afford. (The e2e run of 2026-09-11:
+    # a one-page brief asked to be shorter came back as two pages.)
+    longer = _asked_shorter_but_longer(req, spec)
+    if longer and corrections < budget.max_corrections:
+        before, after = longer
+        await say(60.0, "shortening")
+        raw = await _compose_once(
+            req, budget, outline_json=outline_json,
+            extra=f"The request asked for a SHORTER document, but your draft is longer than the one being edited ({after} words against {before}). Cut it well below {before} words, keeping the change that was asked for. Return the whole document.",
+        )
+        calls += 1
+        corrections += 1
+        spec, repaired, notes = await _validate_or_repair(req, budget, raw, outline_json)
+        calls += repaired
+        result_warnings.extend(n for n in notes if n not in result_warnings)
+        longer = _asked_shorter_but_longer(req, spec)
+    if longer:
+        result_warnings.append(f"the edit asked for a shorter document but this version is longer ({longer[1]} words against {longer[0]})")
+
     review_json: Optional[dict] = None
     if budget.content_review and corrections < budget.max_corrections:
         await say(70.0, "reviewing the content")
@@ -438,6 +465,28 @@ async def compose(req: ComposeRequest, *, progress: Optional[Progress] = None) -
     result_warnings.extend(_enforce_caps(spec, budget))
     await say(95.0, "content ready")
     return ComposeResult(spec=spec, warnings=result_warnings, corrections=corrections, outline=outline_json, review=review_json, model_calls=calls)
+
+
+_SHORTER_RE = re.compile(
+    r"\b(shorter|shorten|condense|condensed|trim|tighten|tighter|more concise|concise|cut (?:it |this )?down|"
+    r"half (?:the|its) length|briefer|less wordy|fewer words|shrink)\b",
+    re.IGNORECASE,
+)
+
+
+def _asked_shorter_but_longer(req: ComposeRequest, spec: S.ArtifactSpec) -> Optional[Tuple[int, int]]:
+    """(parent words, new words) when an EDIT asked for less and got more;
+    None otherwise. Words of the prose the person reads (`text_of`), so a
+    deck and a workbook are measured the same way as a document."""
+    if req.operation != "edit" or req.parent_spec is None or not _SHORTER_RE.search(req.instruction or ""):
+        return None
+    before = len(S.text_of(req.parent_spec).split())
+    after = len(S.text_of(spec).split())
+    # A retitled draft is a few words either way; a correction is for a
+    # draft that grew — by more than 5% and more than five words.
+    if before and after > before + max(5, before // 20):
+        return before, after
+    return None
 
 
 def _reconcile_sources(raw: dict, material: Optional[Material]) -> List[str]:
