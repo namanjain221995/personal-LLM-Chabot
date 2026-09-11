@@ -268,7 +268,17 @@ def _workbook_guide(req: ComposeRequest) -> str:
         "int or float with min and max; date or datetime with start and end; text with a pool of phrases; derived "
         "from other columns) — and rows: []. Put the consistency rules in the recipes: only_when for a cell that "
         "exists only in some states (a completion time only when status is Completed), unique for keys, realistic "
-        "ranges." + exact
+        "ranges. Example: \"generator\": {\"rows\": 500, \"seed\": 7, \"columns\": ["
+        "{\"name\": \"candidate_id\", \"kind\": \"id\", \"pattern\": \"CAND-{n:04d}\", \"unique\": true}, "
+        "{\"name\": \"candidate_name\", \"kind\": \"name\", \"unique\": true}, "
+        "{\"name\": \"department\", \"kind\": \"choice\", \"values\": [\"Engineering\", \"Data\", \"Product\"], \"weights\": [5, 3, 2]}, "
+        "{\"name\": \"project_name\", \"kind\": \"text\", \"text\": {\"pool\": [\"Atlas\", \"Beacon\", \"Comet\"]}}, "
+        "{\"name\": \"technical_score\", \"kind\": \"int\", \"min\": 40, \"max\": 100}, "
+        "{\"name\": \"status\", \"kind\": \"choice\", \"values\": [\"Completed\", \"In Progress\", \"Not Started\"]}, "
+        "{\"name\": \"completion_time\", \"kind\": \"int\", \"min\": 30, \"max\": 480, \"only_when\": {\"column\": \"status\", \"in\": [\"Completed\"]}}, "
+        "{\"name\": \"evaluator\", \"kind\": \"name\"}, "
+        "{\"name\": \"evaluation_date\", \"kind\": \"date\", \"start\": \"2026-01-01\", \"end\": \"2026-09-11\"}]}. "
+        "A text column MUST carry a pool; a choice MUST carry values; derived may only name columns in this sheet." + exact
     )
     lines.append(
         "REWRITE. When asked to humanise, clean up, tidy, professionalise or rewrite a text column (audit comments, "
@@ -862,6 +872,96 @@ def _recipe(column: S.GenColumn) -> Dict[str, Any]:
     return {k: v for k, v in column.model_dump(by_alias=True).items() if v not in (None, [], "")}
 
 
+_NAME_ISH = re.compile(r"(^|_|\s)(name|candidate|evaluator|reviewer|interviewer|owner|manager|person|employee|author|assignee|host|agent|lead|contact)(s)?($|_|\s)", re.IGNORECASE)
+_EMAIL_ISH = re.compile(r"e-?mail", re.IGNORECASE)
+_TIME_ISH = re.compile(r"time|duration|hours|minutes|days|elapsed|turnaround", re.IGNORECASE)
+_SCORE_ISH = re.compile(r"score|rating|rate|ratio|percent|pct|accuracy|quality|confidence", re.IGNORECASE)
+_LABEL_ISH = re.compile(r"project|initiative|task|title|subject|topic|campaign|product|feature|module|codename", re.IGNORECASE)
+#: Default pools for category columns the model left without values. Small,
+#: plausible, and only a fallback: a recipe that names its values wins.
+_CHOICE_DEFAULTS = {
+    "status": ["Completed", "In Progress", "Not Started", "On Hold"],
+    "outcome": ["Selected", "Rejected", "On hold"],
+    "department": ["Engineering", "Data", "Product", "Design", "Operations", "Sales", "Marketing", "Finance", "HR"],
+    "team": ["Platform", "Mobile", "Web", "Data", "Infrastructure", "Quality"],
+    "priority": ["Low", "Medium", "High", "Critical"],
+    "level": ["Junior", "Mid", "Senior", "Lead"],
+    "grade": ["A", "B", "C", "D"],
+    "region": ["North", "South", "East", "West", "Central"],
+    "country": ["India", "United States", "United Kingdom", "Germany", "Singapore", "Australia"],
+    "city": ["Mumbai", "Bengaluru", "Delhi", "Hyderabad", "Pune", "Chennai", "Kolkata", "Ahmedabad"],
+    "category": ["Category A", "Category B", "Category C"],
+    "type": ["Type A", "Type B", "Type C"],
+    "stage": ["Screening", "Interview", "Offer", "Closed"],
+    "tier": ["Free", "Team", "Enterprise"],
+    "plan": ["Free", "Team", "Enterprise"],
+    "segment": ["SMB", "Mid-market", "Enterprise"],
+    "channel": ["Web", "Mobile", "Partner", "Direct"],
+}
+_LABEL_POOL = ["Atlas", "Beacon", "Comet", "Delta", "Ember", "Falcon", "Granite", "Harbor", "Ion", "Juniper", "Kestrel", "Lumen",
+               "Meridian", "Nova", "Orion", "Pioneer", "Quartz", "Ridge", "Summit", "Tundra", "Umber", "Vertex", "Willow", "Zenith"]
+
+
+def _usable_recipes(gen: dict, names: List[str], sheet: str, notes: List[str]) -> None:
+    """A recipe the model wrote that the generator cannot follow becomes
+    one it can, decided from the column's name — a `text` column with no
+    pool, a `choice` with no values, a `derived` over columns the sheet
+    does not have. Each decision is a note on the version. WHY: Fast is
+    one call and one repair, and the 2026-09-12 e2e run lost the 500-row
+    dataset to exactly these three shapes twice in a row ("candidate_name
+    is text and needs text.pool", "derived names no column
+    completion_time_raw"). A failed job helps no one; a sensible column
+    with a note does. Mutates `gen` in place."""
+    columns = gen.get("columns")
+    if not isinstance(columns, list):
+        return
+    known = {_fold(n) for n in names}
+    for c in columns:
+        if not isinstance(c, dict):
+            continue
+        name = str(c.get("name") or "")
+        low = name.lower()
+        kind = str(c.get("kind") or "text")
+        text = c.get("text") if isinstance(c.get("text"), dict) else None
+        has_pool = bool(text and isinstance(text.get("pool"), list) and text["pool"])
+        if kind == "text" and not has_pool:
+            word = next((w for w in _CHOICE_DEFAULTS if w in low), None)
+            if _EMAIL_ISH.search(low):
+                c["kind"] = "email"
+            elif _LABEL_ISH.search(low):
+                # "project_name" is a project, not a person: labels before names.
+                c["text"] = {"pool": [f"{name.split('_')[0].title()} {w}" if "_" in name else w for w in _LABEL_POOL]}
+            elif _NAME_ISH.search(low):
+                c["kind"] = "name"
+            else:
+                if word:
+                    c["kind"] = "choice"
+                    c["values"] = list(_CHOICE_DEFAULTS[word])
+                else:
+                    stem = name.replace("_", " ").strip().title() or "Item"
+                    c["kind"] = "id"
+                    c["pattern"] = f"{stem} {{n:03d}}"
+            notes.append(f"sheet {sheet!r}: column {name!r} had no text pool; {c['kind']} values were used")
+            c.pop("text", None) if c["kind"] != "text" else None
+        elif kind == "choice" and not (isinstance(c.get("values"), list) and c["values"]):
+            word = next((w for w in _CHOICE_DEFAULTS if w in low), None)
+            c["values"] = list(_CHOICE_DEFAULTS[word]) if word else ["Option A", "Option B", "Option C"]
+            c.pop("weights", None)
+            notes.append(f"sheet {sheet!r}: column {name!r} had no values; {', '.join(c['values'][:4])}{'…' if len(c['values']) > 4 else ''} were used")
+        elif kind == "derived":
+            derived = c.get("derived") if isinstance(c.get("derived"), dict) else {}
+            inputs = [str(x) for x in (derived.get("columns") or [])]
+            if not inputs or any(_fold(x) not in known or _fold(x) == _fold(name) for x in inputs):
+                c.pop("derived", None)
+                if _TIME_ISH.search(low):
+                    c.update({"kind": "int", "min": 15, "max": 480})
+                elif _SCORE_ISH.search(low):
+                    c.update({"kind": "int", "min": 0, "max": 100})
+                else:
+                    c.update({"kind": "int", "min": 1, "max": 1000})
+                notes.append(f"sheet {sheet!r}: column {name!r} was derived from columns the sheet does not have; a numeric range was used")
+
+
 def _fill_code_made_rows(raw: dict, req: ComposeRequest, notes: List[str]) -> List[str]:
     """CONTRACT-2 §4/§6, BEFORE parse_body: a sheet with `rows_from` gets
     the material table's rows verbatim — blanks included, and in place of
@@ -904,13 +1004,14 @@ def _fill_code_made_rows(raw: dict, req: ComposeRequest, notes: List[str]) -> Li
                 if gen.get("rows"):
                     notes.append(f"sheet {name!r}: the generator's {gen.get('rows')} rows were set to the {wanted:,} that were asked for")
                 gen["rows"] = wanted
+            columns = sh.get("columns")
+            names = [c.get("name") for c in columns if isinstance(c, dict) and isinstance(c.get("name"), str)] if isinstance(columns, list) else []
+            _usable_recipes(gen, names, name, notes)
             try:
                 model = S.Generator.model_validate(gen)
             except ValidationError as exc:
                 problems.append(f"sheets.{index}.generator: {S.validation_summary(exc, limit=4).replace(chr(10), ' ')}")
                 continue
-            columns = sh.get("columns")
-            names = [c.get("name") for c in columns if isinstance(c, dict) and isinstance(c.get("name"), str)] if isinstance(columns, list) else []
             recipes = {_fold(c.name): c for c in model.columns}
             missing = [n for n in names if _fold(n) not in recipes]
             extra = [c.name for c in model.columns if _fold(c.name) not in {_fold(n) for n in names}]
