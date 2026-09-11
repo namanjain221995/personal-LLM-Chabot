@@ -84,6 +84,7 @@ def test_a_required_stage_that_cannot_reach_the_model_defers_the_job(monkeypatch
     assert fresh["error"].startswith(pipeline.DEFERRED_MARK)
     assert "attempt 1" in fresh["error"]
     assert fresh["attempt"] == 1
+    assert fresh["counts"]["deferrals"] == 1
     assert fresh["finished_at"] is None
     assert fresh["stages"]["transcript"]["status"] == "done"
     assert fresh["stages"]["fusion"]["status"] == "deferred"
@@ -123,11 +124,15 @@ def test_a_deferred_job_resumes_from_its_finished_stages(monkeypatch, tmp_path):
     db.delete_video_analysis(row["id"])
 
 
-def test_deferral_is_bounded_by_video_max_attempts(monkeypatch, tmp_path):
+def test_deferral_is_bounded_by_video_max_attempts_counting_deferrals_only(monkeypatch, tmp_path):
+    """The budget is deferrals, not the row's lifetime `attempt`: a run that
+    already cost two attempts for other reasons (a pipeline-version re-run,
+    a re-upload) still gets its full allowance of model outages."""
     from app.video import pipeline
 
     monkeypatch.setattr(settings, "video_max_attempts", 2)
     row = _seed(tmp_path, monkeypatch, "b" * 64)
+    db.update_video_analysis(row["id"], attempt=2)  # two earlier, unrelated attempts
     ran: list[str] = []
 
     async def fusion_down(ctx, progress):
@@ -136,11 +141,44 @@ def test_deferral_is_bounded_by_video_max_attempts(monkeypatch, tmp_path):
 
     monkeypatch.setattr(pipeline, "_STAGE_FNS", _fns(pipeline, ran, {"fusion": fusion_down}))
     asyncio.run(pipeline._run(row["id"]))
-    assert db.get_video_analysis(row["id"])["status"] == "queued"
+    first = db.get_video_analysis(row["id"])
+    assert first["status"] == "queued" and first["counts"]["deferrals"] == 1 and first["attempt"] == 3
     asyncio.run(pipeline._run(row["id"]))
     fresh = db.get_video_analysis(row["id"])
     assert fresh["status"] == "failed"
-    assert "gave up after 2 attempts" in fresh["error"]
+    assert "gave up after 2 deferrals" in fresh["error"]
+    db.delete_video_analysis(row["id"])
+
+
+def test_a_deferral_arms_a_drain_for_the_retry_delay(monkeypatch, tmp_path):
+    """The maintenance tick is half an hour apart; VIDEO_RETRY_DELAY_S is
+    what the operator set, so a timer re-drains then."""
+    from app.video import pipeline
+
+    monkeypatch.setattr(settings, "video_retry_delay_s", 300.0)
+    row = _seed(tmp_path, monkeypatch, "c" * 64)
+    armed: list[float] = []
+
+    async def fusion_down(ctx, progress):
+        raise _unavailable()
+
+    monkeypatch.setattr(pipeline, "_STAGE_FNS", _fns(pipeline, [], {"fusion": fusion_down}))
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        real = loop.call_later
+
+        def spy(delay, callback, *args):
+            armed.append(delay)
+            handle = real(delay, callback, *args)
+            handle.cancel()  # never fire inside the test
+            return handle
+
+        monkeypatch.setattr(loop, "call_later", spy)
+        await pipeline._run(row["id"])
+
+    asyncio.run(scenario())
+    assert 300.0 in armed  # the lease heartbeat arms its own 30 s timer too
     db.delete_video_analysis(row["id"])
 
 

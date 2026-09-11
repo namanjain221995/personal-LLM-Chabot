@@ -329,7 +329,14 @@ async def _wait_for_analysis(row: dict, emit: Emit) -> dict:
                 moved = (percent is not None and prev_pct is not None and abs(percent - prev_pct) >= 5) or percent is None or prev_pct is None
                 if prev_status == "running" and now - prev_t < 3.0 and not moved:
                     continue
-            step_status = "running" if status == "running" else ("failed" if status == "failed" else "done")
+            # A DEFERRED stage (the engine it needs was down for the whole
+            # recovery window; the job is back in the queue) is neither done
+            # nor failed for good — it is shown as still running, with the
+            # detail saying why, until the retry lands.
+            step_status = (
+                "running" if status in ("running", "deferred")
+                else ("failed" if status == "failed" else "done")
+            )
             bits = []
             if status == "running" and percent is not None:
                 bits.append(f"{percent:.0f}%")
@@ -339,6 +346,8 @@ async def _wait_for_analysis(row: dict, emit: Emit) -> dict:
                 bits.append(f"{elapsed:.0f}s")
             if status == "skipped":
                 bits.insert(0, "skipped")
+            elif status == "deferred":
+                bits.insert(0, "waiting for the model, will be retried")
             elif event.get("cached"):
                 bits.insert(0, "cached")
             await emit("step", {"id": _STEP_IDS[stage], "title": STAGE_TITLES[stage], "status": step_status, "detail": " · ".join(bits)})
