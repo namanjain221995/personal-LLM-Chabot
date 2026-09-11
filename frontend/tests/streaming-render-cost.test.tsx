@@ -18,6 +18,23 @@ import type { ChatMessage } from '@/lib/types';
 
 const HISTORY = 100;
 
+/**
+ * These tests are heavy ON PURPOSE — a 100-row thread mounted through the
+ * real providers, then 200 tokens each pushed through React's `act` and a
+ * display frame — because the cost of that work is the thing under test.
+ * What they assert is counters, never elapsed time, so the timeout is not a
+ * budget; it is only the line between "slow" and "hung".
+ *
+ * Vitest's default is 5 s. The streaming test takes 1.35 s on an idle DGX
+ * head and 1.45 s with the rest of this suite running beside it — and
+ * timed out at 5 s on 2026-09-11 in a CI run on that same host while the
+ * orchestrator suite and a Docker image build were competing for it (the
+ * change under test had not touched a single frontend file, and the same
+ * test had passed on the same code minutes earlier). Thirty seconds is
+ * twenty times the measured cost and still a hard stop for a real hang.
+ */
+vi.setConfig({ testTimeout: 30_000 });
+
 const counters = { treeWalks: 0, scrollWrites: 0, markdownParses: 0, markdownChars: 0 };
 
 // Every actual react-markdown invocation, and how much text it was handed.
