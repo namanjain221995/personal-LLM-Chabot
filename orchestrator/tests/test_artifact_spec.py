@@ -260,6 +260,39 @@ def test_a_total_names_its_column_by_header_text():
     assert "header text" in S.schema_for("workbook")["$defs"]["Total"]["properties"]["column"]["description"]
 
 
+def test_figures_the_material_never_gave_are_named():
+    """The first Fast brief of the 2026-09-11 e2e run: asked for '$59 a month'
+    and '120 team accounts', it wrote a $49 current price, competitors at
+    $55-$65, 1,000 active teams and a 95% retention rate. The check names
+    what the material does not contain; it does not judge it."""
+    material = "Create a brief about moving our team plan to $59 a month for the CEO. We have 120 team accounts."
+    doc = _doc(
+        blocks=[
+            {"type": "kpis", "items": [{"label": "Proposed", "value": "$59/month"}, {"label": "Current", "value": "$49/month"}, {"label": "Increase", "value": "+20.4%"}]},
+            {"type": "paragraph", "text": "Competitors are priced between $55 and $65. For a base of 1,000 active teams this is $10,000 a month, or $120,000 a year, over 30 days and 60 days. In 2026 we have 120 accounts, 3 tiers and 5 seats."},
+            {"type": "chart", "chart": {"type": "bar", "categories": ["Now", "Proposed"], "series": [{"name": "MRR", "values": [5880, 7080]}]}},
+        ],
+        assumptions=["Customer retention rate remains at or above 95%."],
+    )
+    spec = S.parse_body("document", doc)
+    figures = S.unsupported_figures(spec, material)
+    # Money, percentages, thousands and the chart's values — not day counts,
+    # small counts, the year, the figures given, or the declared assumption.
+    assert figures == ["$49", "20.4%", "$55", "$65", "1,000", "$10,000", "$120,000", "5880", "7080"]
+    assert "95%" not in figures and "120" not in figures and "$59" not in figures and "30" not in figures and "2026" not in figures and "3" not in figures
+    assert {"$49", "$55", "$65", "$10,000", "$120,000", "1,000", "5880", "7080"} <= set(figures)
+    # Given the figures, nothing is named.
+    assert S.unsupported_figures(spec, material + " current price $49; competitors $55-$65; 1,000 teams; $10,000/month = $120,000/year; MRR 5,880 vs 7,080; +20.4%") == []
+    # A deck and a workbook are checked the same way (slide kpis, table cells, sheet rows).
+    deck = S.parse_body("presentation", {"title": "Plans", "slides": [
+        {"layout": "kpis", "title": "Numbers", "kpis": [{"label": "ARR", "value": "$1.2M"}]},
+        {"layout": "table", "title": "Tiers", "table": {"columns": ["Tier", "Seats"], "rows": [["Team", "25"], ["Enterprise", "unlimited"]]}},
+    ]})
+    assert S.unsupported_figures(deck, "Team is $59 with 25 seats") == ["$1.2"]
+    wb = S.parse_body("workbook", _tracker([]))
+    assert S.unsupported_figures(wb, "Free $0, Team $59, Enterprise $199; accounts 120/40/6") == ["2360", "1194"]
+
+
 def test_text_of_covers_every_prose_field():
     spec = S.parse_body("document", _doc())
     text = S.text_of(spec)

@@ -142,8 +142,12 @@ _ROLE = (
     "material you are given or from the conversation; when the material does "
     "not support a claim you leave it out or say it is an assumption. You "
     "cite a source by its id only, and only ids in the source list. You never "
-    "invent statistics, names, dates or quotations. You never leave "
-    "placeholders such as 'lorem ipsum', '[insert …]', 'TBD' or 'TODO'."
+    "invent statistics, names, dates or quotations. NUMBERS: use only figures "
+    "that appear in the material or follow from them by arithmetic you state; "
+    "when a figure is missing (a current price, a customer count, a rate) say "
+    "it is not given or list it under assumptions — never supply a plausible "
+    "one. You never leave placeholders such as 'lorem ipsum', '[insert …]', "
+    "'TBD' or 'TODO'."
 )
 
 _KIND_GUIDE = {
@@ -216,6 +220,19 @@ def _table_block(tables: Sequence[DataTable]) -> str:
         more = f"\n… {len(t.rows) - 40} more rows (all of them are available to the file)" if len(t.rows) > 40 else ""
         out.append(f"TABLE {t.id}: {t.title}\ncolumns: {' | '.join(t.columns)}\n{body}{more}")
     return "\n\n".join(out)
+
+
+def material_text(req: ComposeRequest) -> str:
+    """Everything the model was given to write from, as one string — what
+    a figure in the draft is looked up in."""
+    m = req.material or Material(instruction=req.instruction)
+    parts = [req.instruction or "", m.instruction, m.history_text, m.previous_answer, m.uploads_text, *m.notes]
+    parts.extend(f"{s.title}\n{s.text}" for s in m.sources)
+    parts.extend(_table_block([t]) for t in m.tables)
+    if req.parent_spec is not None:
+        parts.append(S.text_of(req.parent_spec))
+        parts.append(req.parent_spec.body.model_dump_json())
+    return "\n".join(p for p in parts if p)
 
 
 def _material_messages(req: ComposeRequest, *, budget: T.EffortBudget) -> List[dict]:
@@ -442,11 +459,15 @@ async def compose(req: ComposeRequest, *, progress: Optional[Progress] = None) -
     if longer:
         result_warnings.append(f"the edit asked for a shorter document but this version is longer ({longer[1]} words against {longer[0]})")
 
+    # Figures the material never gave. Named on the version at every effort;
+    # handed to the reviewer where there is one.
+    figures = S.unsupported_figures(spec, material_text(req))
+
     review_json: Optional[dict] = None
     if budget.content_review and corrections < budget.max_corrections:
         await say(70.0, "reviewing the content")
         try:
-            review_json = await content_review(req, spec, budget)
+            review_json = await content_review(req, spec, budget, figures)
             calls += 1
         except ComposeError:
             review_json = None
@@ -461,7 +482,10 @@ async def compose(req: ComposeRequest, *, progress: Optional[Progress] = None) -
             spec, repaired, notes = await _validate_or_repair(req, budget, raw, outline_json)
             calls += repaired
             result_warnings.extend(n for n in notes if n not in result_warnings)
+            figures = S.unsupported_figures(spec, material_text(req))
 
+    if figures:
+        result_warnings.append("figures not in the material (derived or assumed): " + ", ".join(figures[:8]) + (" …" if len(figures) > 8 else ""))
     result_warnings.extend(_enforce_caps(spec, budget))
     await say(95.0, "content ready")
     return ComposeResult(spec=spec, warnings=result_warnings, corrections=corrections, outline=outline_json, review=review_json, model_calls=calls)
@@ -551,7 +575,7 @@ async def _validate_or_repair(req: ComposeRequest, budget: T.EffortBudget, raw: 
         raise ComposeError("model_failure", "The model could not produce a valid document structure.") from exc
 
 
-async def content_review(req: ComposeRequest, spec: S.ArtifactSpec, budget: T.EffortBudget) -> dict:
+async def content_review(req: ComposeRequest, spec: S.ArtifactSpec, budget: T.EffortBudget, figures: Sequence[str] = ()) -> dict:
     """Does the draft do what was asked? A second, adversarial read of the
     spec against the request and the material: coverage, audience, length,
     numbers that disagree with the data, claims without a source, sections
@@ -570,6 +594,8 @@ async def content_review(req: ComposeRequest, spec: S.ArtifactSpec, budget: T.Ef
             f"Request: {req.instruction or m.instruction}\n\n"
             + (f"Data:\n{_table_block(m.tables)}\n\n" if m.tables else "")
             + (f"Sources:\n{_source_block(m.sources[: budget.max_sources or 1], 12_000)}\n\n" if m.sources else "")
+            + (f"Figures in the draft that appear nowhere in the material (each is derived, assumed or invented — "
+               f"a 'must' unless the draft says which): {', '.join(figures[:12])}\n\n" if figures else "")
             + f"Draft (JSON):\n{spec.body.model_dump_json()[:60_000]}"
         )},
     ]

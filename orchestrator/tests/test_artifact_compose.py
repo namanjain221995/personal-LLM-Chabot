@@ -187,6 +187,24 @@ def test_shorter_that_came_back_longer_is_corrected_once_then_warned(monkeypatch
     assert result.corrections == 0 and len(model.calls) == 1
 
 
+def test_figures_the_material_never_gave_are_a_warning_and_a_hint_to_the_reviewer(monkeypatch):
+    invented = _doc_json(blocks=[{"type": "paragraph", "text": "Competitors charge between $55 and $65; 1,000 teams pay $59.", "sources": ["s1"]}])
+    model = _Model([invented])
+    monkeypatch.setattr(llm, "json_completion", model)
+    result = asyncio.run(C.compose(_req("fast")))
+    assert result.corrections == 0, "Fast names them; it does not spend a call on them"
+    assert any(w.startswith("figures not in the material") and "$55" in w and "1,000" in w and "$59" not in w for w in result.warnings), result.warnings
+    # Think: the reviewer is told which figures to look at.
+    outline = {"title": "x", "audience": "", "purpose": "", "sections": [], "needs_current_facts": False, "assumptions": []}
+    model = _Model([outline, invented, {"ok": True, "issues": []}])
+    monkeypatch.setattr(llm, "json_completion", model)
+    asyncio.run(C.compose(_req("think")))
+    review_prompt = model.calls[2]["messages"][-1]["content"]
+    assert "appear nowhere in the material" in review_prompt and "$55" in review_prompt
+    # The role prompt says what to do when a figure is missing.
+    assert "never supply a plausible one" in model.calls[1]["messages"][0]["content"]
+
+
 def test_caps_trim_a_deck_with_a_warning_instead_of_refusing(monkeypatch):
     slides = [{"layout": "bullets", "title": f"Slide {i}", "bullets": ["a"]} for i in range(15)]
     model = _Model([{"title": "Deck", "template_id": "generic", "slides": slides}])

@@ -642,10 +642,108 @@ def is_formula_like(value: Any) -> bool:
     return isinstance(value, str) and value.startswith(_FORMULA_LEADS)
 
 
+# ---------------------------------------------------------------- figures --
+#
+# WHY. The first Fast-effort brief of the 2026-09-11 e2e run was asked for
+# "$59 a month" and "120 team accounts" and came back with a $49 current
+# price, competitors "between $55 and $65", "1,000 active teams" and a 95%
+# retention rate — none of them in the material, one of them declared as an
+# assumption. Fast has no content review, so the deterministic check is the
+# only one it gets: every figure the reader will see is looked up in the
+# material, and the ones that are not there are named on the version as a
+# warning (Think and Max also hand them to the reviewer). A derived figure
+# (120 × $59 = $7,080) is named too — the warning says "not in the
+# material", which is true, not "wrong", which it cannot know.
+
+_FIGURE_RE = re.compile(
+    r"(?<![\w.])(?P<cur>[$€£]\s?)?(?P<num>\d{1,3}(?:,\d{3})+|\d+)(?P<dec>\.\d+)?(?P<pct>\s?(?:%|percent\b))?(?![\w.]\d)",
+    re.IGNORECASE,
+)
+
+#: Keys whose numeric values the reader sees (chart values, table cells, KPI
+#: values); every other number in the structure is an index or a size.
+_FIGURE_VALUE_KEYS = ("values", "rows", "value")
+
+
+def _figure_core(m: "re.Match[str]") -> str:
+    return m.group("num").replace(",", "") + (m.group("dec") or "")
+
+
+def _figures_in_text(text: str) -> Dict[str, str]:
+    """core → as written, for every number in `text`."""
+    out: Dict[str, str] = {}
+    for m in _FIGURE_RE.finditer(text or ""):
+        out.setdefault(_figure_core(m), m.group(0).strip())
+    return out
+
+
+def _qualifies(m: "re.Match[str]") -> bool:
+    """A figure worth checking: money, a percentage, a decimal, or a count of
+    a thousand or more — not a day count, a step number or a year."""
+    if m.group("cur") or m.group("pct") or m.group("dec"):
+        return True
+    n = int(m.group("num").replace(",", ""))
+    return n >= 1000 and not (1900 <= n <= 2100 and "," not in m.group("num"))
+
+
+def _core_of_number(n: Union[int, float]) -> str:
+    if isinstance(n, float):
+        return str(int(n)) if n == int(n) and abs(n) < 1e15 else f"{n:.10g}"
+    return str(n)
+
+
+def _numbers_in_structure(node: Any, key: str = "") -> List[Tuple[str, str]]:
+    """(core, as written) for every numeric leaf the reader sees."""
+    found: List[Tuple[str, str]] = []
+    if isinstance(node, dict):
+        for k, v in node.items():
+            found.extend(_numbers_in_structure(v, k))
+    elif isinstance(node, list):
+        for v in node:
+            found.extend(_numbers_in_structure(v, key))
+    elif isinstance(node, bool):
+        return found
+    elif isinstance(node, (int, float)) and key in _FIGURE_VALUE_KEYS:
+        core = _core_of_number(node)
+        found.append((core, core))
+    elif isinstance(node, str) and key in _FIGURE_VALUE_KEYS:
+        found.extend(_figures_in_text(node).items())
+    return found
+
+
+def unsupported_figures(spec: ArtifactSpec, material_text: str) -> List[str]:
+    """Figures in the spec that appear nowhere in `material_text` (the
+    instruction, the conversation, the uploads, the sources and the tables,
+    joined) and are not declared in the spec's assumptions — as written, in
+    document order, deduplicated. Empty means every figure was given."""
+    known = set(_figures_in_text(material_text))
+    body = spec.body
+    known.update(_figures_in_text("\n".join(getattr(body, "assumptions", None) or [])))
+    seen: List[str] = []
+    cores: set = set()
+    for m in _FIGURE_RE.finditer(text_of(spec)):
+        core = _figure_core(m)
+        if core in known or core in cores or not _qualifies(m):
+            continue
+        cores.add(core)
+        seen.append(m.group(0).strip())
+    for core, written in _numbers_in_structure(body.model_dump()):
+        if core in known or core in cores:
+            continue
+        try:
+            value = float(core)
+        except ValueError:
+            continue
+        if written != core or value >= 1000 or value != int(value):
+            cores.add(core)
+            seen.append(written)
+    return seen
+
+
 __all__ = [
     "SPEC_VERSION", "ArtifactSpec", "DocumentSpec", "PresentationSpec", "WorkbookSpec",
     "Heading", "Paragraph", "Bullets", "Numbered", "TableBlock", "ChartBlock", "Callout",
     "KPI", "KPIRow", "PageBreak", "Slide", "Sheet", "Column", "Total", "Table", "Chart",
     "Series", "Citation", "schema_for", "parse_body", "load", "validation_summary",
-    "text_of", "placeholders_in", "is_formula_like",
+    "text_of", "placeholders_in", "is_formula_like", "unsupported_figures",
 ]
