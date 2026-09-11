@@ -129,7 +129,52 @@ _state: dict = {
     "device": None,
     "load_seconds": None,
     "error": None,
+    #: Consecutive transcriptions that died in the CUDA runtime. See _cuda_died.
+    "cuda_failures": 0,
 }
+
+#: A LOST CUDA CONTEXT IS PERMANENT FOR THIS PROCESS. On 2026-09-10 the worker
+#: replica's context died at 15:02Z (`CUDA error: operation not permitted`,
+#: then `CUDA_ERROR_UNKNOWN` from every cuLaunchKernel) and it kept answering
+#: /health ready:true for twelve hours: `ready` was only ever cleared by a
+#: LOAD failure, so Docker called it healthy, and only the orchestrator's
+#: fail-over to the other replica hid the loss. After this many consecutive
+#: CUDA-runtime failures the process declares itself dead — /health says so,
+#: the orchestrator stands the engine down — and exits, so `restart:
+#: unless-stopped` brings up a fresh context. Ordinary bad-audio failures do
+#: not count and do not accumulate.
+CUDA_DEATH_THRESHOLD = int(os.environ.get("WHISPER_CUDA_DEATH_THRESHOLD", "3"))
+
+
+def _is_cuda_runtime_error(exc: BaseException) -> bool:
+    accelerator = getattr(torch, "AcceleratorError", None)
+    if accelerator is not None and isinstance(exc, accelerator):
+        return True
+    text = str(exc)
+    return "CUDA error" in text or "CUDA_ERROR" in text or "cuda runtime error" in text.lower()
+
+
+def _cuda_died(exc: BaseException) -> bool:
+    """Count a CUDA-runtime failure; True once the process should give up."""
+    if not _is_cuda_runtime_error(exc):
+        _state["cuda_failures"] = 0
+        return False
+    _state["cuda_failures"] += 1
+    if _state["cuda_failures"] < CUDA_DEATH_THRESHOLD:
+        return False
+    _state["ready"] = False
+    _state["error"] = (
+        f"CUDA context lost: {_state['cuda_failures']} consecutive CUDA-runtime failures "
+        f"({type(exc).__name__}: {str(exc)[:160]}); restarting the process"
+    )
+    log.error("%s", _state["error"])
+    return True
+
+
+def _exit_soon(code: int = 3, delay_s: float = 1.0) -> None:
+    """Let the in-flight response leave, then end the process for a restart."""
+    loop = asyncio.get_running_loop()
+    loop.call_later(delay_s, os._exit, code)
 
 
 def _pick_dtype() -> "torch.dtype":
@@ -470,6 +515,7 @@ async def health() -> dict:
         "task": "transcribe",
         "no_speech_threshold": NO_SPEECH_THRESHOLD,
         "error": _state["error"],
+        "cuda_failures": int(_state["cuda_failures"]),
     }
 
 
@@ -535,7 +581,11 @@ async def transcriptions(
             raise
         except Exception as exc:  # noqa: BLE001
             log.exception("transcription failed")
+            if _cuda_died(exc):
+                _exit_soon()
+                raise HTTPException(status_code=503, detail=_state["error"]) from None
             raise HTTPException(status_code=500, detail=f"transcription failed: {exc}") from None
+        _state["cuda_failures"] = 0
 
     result["processing_ms"] = int((time.perf_counter() - started) * 1000)
     if response_format == "text":
