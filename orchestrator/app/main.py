@@ -135,12 +135,26 @@ async def lifespan(_app: FastAPI):
     # The job paces itself against live chat: a generation that is merely
     # WAITING for a video analysis does not count as chatting, or the job
     # would wait for itself.
-    video_pipeline.set_busy_probe(
-        lambda: any(
-            not g.done and not getattr(g, "waiting_on_video", False)
+    def _chat_is_busy() -> bool:
+        # A generation that is merely WAITING on a detached job — a video
+        # analysis, a document being built — is not chatting; counting it
+        # would make the job pace itself against itself.
+        return any(
+            not g.done and not getattr(g, "waiting_on_video", False) and not getattr(g, "waiting_on_job", False)
             for g in list(_live_generations.values())
         )
-    )
+
+    video_pipeline.set_busy_probe(_chat_is_busy)
+    # Artifact Studio (2026-09-11): documents, decks and workbooks made in
+    # chat run as durable jobs with the same lease/heartbeat/requeue shape as
+    # video analyses. The composer — the one model-facing piece — is
+    # installed here so the runner can be tested with a stub.
+    from .artifacts import pipeline as artifact_pipeline
+    from .engines import artifact as artifact_engine
+
+    artifact_pipeline.set_composer(artifact_engine.compose_for_pipeline)
+    artifact_pipeline.install_busy_probe(_chat_is_busy)
+    await artifact_pipeline.start()
     try:
         yield
     finally:
@@ -158,6 +172,7 @@ async def lifespan(_app: FastAPI):
             )
         sweep_task.cancel()
         await video_pipeline.stop()
+        await artifact_pipeline.stop()
         await web_worker.stop()
         await db.run_in_thread(db.close_pool)
 
@@ -228,6 +243,13 @@ app.include_router(audio_router)
 from .video.api import router as video_router  # noqa: E402
 
 app.include_router(video_router)
+# Artifact Studio (2026-09-11): status, previews and downloads for the
+# documents, decks and workbooks made in chat — by id, owner-scoped. The
+# requests themselves ride /chat. Gated on Feature.ARTIFACTS and
+# ARTIFACTS_ENABLED.
+from .artifacts.api import router as artifacts_router  # noqa: E402
+
+app.include_router(artifacts_router)
 app.include_router(memory_router)
 # Conversation sharing. Mounted at the app root because ONE of its routes —
 # /public/shares/{token} — is the only endpoint in this application that
@@ -2522,11 +2544,71 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     _metrics.inc("knowledge_escalation_total", effort=request.effort or "", stage="search")
                     await emit("status", {"text": "Stored knowledge is not enough — searching the web…"})
 
+            # ARTIFACT INTENT — decided by rules on the RESOLVED text, before
+            # the chain, so no engine below can claim a turn that asked for a
+            # file. Off when the deployment or the member has documents off,
+            # when a video is attached to this very turn (the analysis comes
+            # first; the next turn can ask for the deck), when the turn is a
+            # clarification answer, or when Intelligence Mode already handled
+            # it. The classifier is consulted only for the ambiguous band.
+            artifact_intent = None
+            if (
+                settings.artifacts_enabled
+                and request.text
+                and not request.video_uploads
+                and not (sf_outcome is not None and sf_outcome.handled)
+                and feature_access.allowed(principal.features, feature_access.Feature.ARTIFACTS)
+            ):
+                from .artifacts import intent as artifact_intent_rules
+                from .engines import artifact as artifact_engine_mod
+
+                try:
+                    _existing = await db.run_in_thread(
+                        artifact_engine_mod.adb.list_artifacts, viewer, conv_key
+                    )
+                except Exception:  # noqa: BLE001 — no list means "create" semantics
+                    _existing = []
+                _hints = [str(a.get("title") or "") for a in _existing if a.get("title")]
+                artifact_intent = await artifact_intent_rules.decide_with_hook(
+                    text,
+                    artifact_engine_mod.classify_hook if request.effort != "fast" else None,
+                    has_artifacts=bool(_existing),
+                    artifact_hints=_hints,
+                    has_assistant_answer=any(str(h.get("role")) == "assistant" for h in history),
+                )
+
             if sf_outcome is not None and sf_outcome.handled:
                 # Salesforce Intelligence Mode answered, or asked a question and
                 # is now waiting. Either way it already emitted its tokens and
                 # its single meta; there is nothing left for the chain below.
                 answer = sf_outcome.answer
+            elif artifact_intent is not None and artifact_intent.wants_file:
+                # ARTIFACT STUDIO (2026-09-11). A turn that asks for a FILE —
+                # "create a PDF of this", "make a deck for the board", "make
+                # slide 4 shorter", "also as Word" — is answered with one.
+                # This branch sits ABOVE the agent, search, dataset and plain
+                # assistant branches on purpose: each of those answers in
+                # text, and at think/max the orchestration classifier marks
+                # "build me a report" as agent work, which used to swallow the
+                # request. The intent was decided by rules before the chain
+                # (`artifact_intent`, below the clarification block); the job
+                # is durable and outlives this turn; the engine forwards its
+                # stages as steps and ends with the one meta.
+                from .engines import artifact as artifact_engine
+
+                gen.waiting_on_job = True  # see _chat_is_busy in the lifespan
+                answer = await artifact_engine.run_artifact_engine(
+                    text,
+                    history,
+                    emit,
+                    intent=artifact_intent,
+                    conversation_id=conv_key,
+                    user_id=viewer,
+                    generation_id=gen.id,
+                    effort=request.effort,
+                    mode=request.mode,
+                    web_allowed=bool(search_allowed) and request.mode == "assistant",
+                )
             elif request.video_uploads or video_followup:
                 # 2026-09-09: a video attached now, or a question about one
                 # attached earlier. The engine waits for the detached analysis
