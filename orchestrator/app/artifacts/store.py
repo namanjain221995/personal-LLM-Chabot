@@ -358,13 +358,17 @@ def volume_writable() -> bool:
 
 
 def quota_ok(user_id: int, published_bytes: Optional[int] = None) -> bool:
-    """Is this person under ARTIFACT_USER_QUOTA_MB of published bytes?
-    `published_bytes` is what artifacts.db.user_bytes says; passed in so the
-    caller controls the database call (and tests need no database)."""
-    if published_bytes is None:
-        from . import db as adb
+    """Is this person under ARTIFACT_USER_QUOTA_MB?
 
-        published_bytes = adb.user_bytes(user_id)
+    Measured on DISK, not from the rows: a version holds its files, an
+    identical preview.pdf, and up to ~50 MB of page images once a viewer has
+    scrolled it, and the rows count only the files (review, 2026-09-11).
+    `published_bytes` lets a test (or a caller that already walked the tree)
+    hand the number in.
+    """
+    if published_bytes is None:
+        root = os.path.join(reports_dir(), "artifacts", str(int(user_id)))
+        published_bytes = dir_bytes(root) if os.path.isdir(root) else 0
     return int(published_bytes) < int(settings.artifact_user_quota_mb) * 1024 * 1024
 
 

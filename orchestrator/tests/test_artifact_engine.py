@@ -406,3 +406,74 @@ def test_a_clean_visual_review_renders_once_and_fast_never_looks(owner, monkeypa
         assert _meta(events)["artifacts"][0]["status"] == "completed" and calls["n"] == 1, "Fast never asks for a visual review"
     finally:
         pipeline.set_visual_reviewer(None)
+
+
+# ----------------------------------------------------- the review's fixes --
+
+
+def test_a_failing_visual_correction_keeps_the_good_version(owner, monkeypatch):
+    """The revised spec is rendered beside the good files and replaces them
+    only once it succeeds; when its render fails the version that already
+    passed is published, with a note — never a failed job."""
+    renders = []
+
+    async def composer(ctx):
+        return _spec("document", title="Good")
+
+    _install(monkeypatch, composer=composer)
+    real_render = pipeline._render_in_subprocess
+
+    async def render(work_dir, spec, formats, title_slug, version, effort):
+        renders.append(spec.title)
+        if spec.title == "Revised":
+            raise pipeline.RenderFailed("validation_failure", "The document is over the page limit.")
+        return await real_render(work_dir, spec, formats, title_slug, version, effort)
+
+    monkeypatch.setattr(pipeline, "_render_in_subprocess", render)
+
+    async def reviewer(ctx, spec, pages):
+        return _spec("document", title="Revised")
+
+    pipeline.set_visual_reviewer(reviewer)
+    try:
+        answer, events = _turn(owner, "Create a PDF about the pricing change.", effort="max")
+    finally:
+        pipeline.set_visual_reviewer(None)
+    ref = _meta(events)["artifacts"][0]
+    assert ref["status"] == "completed_with_warnings" and renders == ["Good", "Revised"]
+    assert any("could not be applied" in w for w in ref["warnings"])
+    from app.artifacts import store
+
+    assert store.read_spec(store.version_dir(owner, ref["artifact_id"], 1)).title == "Good"
+    assert answer.startswith("Created **Good**")
+
+
+def test_a_resumed_turn_finds_its_job_instead_of_making_a_second_artifact(owner, monkeypatch):
+    """A restart mid-turn gives the retry a new generation id under the same
+    intent id; the acceptance is keyed on the intent, so one send is one
+    artifact."""
+    _install(monkeypatch)
+    events = []
+
+    async def emit(kind, data):
+        events.append((kind, data))
+
+    intent = I.decide("Create a PDF about the pricing change.")
+    first = asyncio.run(engine.run_artifact_engine("Create a PDF about the pricing change.", [], emit, intent=intent, conversation_id="conv-e", user_id=owner, generation_id="gen-A", intent_id="intent-1"))
+    events.clear()
+    asyncio.run(engine.run_artifact_engine("Create a PDF about the pricing change.", [], emit, intent=intent, conversation_id="conv-e", user_id=owner, generation_id="gen-B", intent_id="intent-1"))
+    refs = _meta(events)["artifacts"]
+    assert len(_artifacts(owner, "conv-e")) == 1, "one send, one artifact"
+    assert refs[0]["version"] == 1
+
+
+def test_open_jobs_are_capped_per_person(owner, monkeypatch):
+    _install(monkeypatch)
+    monkeypatch.setattr(settings, "artifact_max_open_jobs_per_user", 1)
+    from app.artifacts import db as adb
+
+    # One job parked in the queue (never started), then a second send.
+    pipeline.accept(user_id=owner, conversation_id="conv-e", generation_id="parked", operation="create", instruction="park", kind="document", formats=["pdf"], effort="fast", mode="assistant", template_id="generic", material={})
+    answer, events = _turn(owner, "Create a PDF about the pricing change.", gen="g2")
+    assert "being built" in answer and "artifacts" not in _meta(events)
+    assert adb.count_open_jobs(owner) == 1

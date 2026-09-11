@@ -21,10 +21,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from typing import Optional
+from typing import Dict, Literal, Optional
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from pydantic import BaseModel, ConfigDict
 from fastapi.responses import FileResponse, JSONResponse
 
 from .. import db, metrics
@@ -41,6 +42,24 @@ router = APIRouter(prefix="/artifacts", tags=["artifacts"])
 #: Sheet-grid bounds the viewer may ask for.
 _GRID_MAX_ROWS = 500
 _GRID_MAX_COLS = 60
+
+#: Page images are rasterised at most this many at a time per process, and
+#: one (version, page, width) at a time: a viewer that scrolls a 40-page
+#: document asks for forty pages in a burst, and PDFium — serialised by a
+#: process-wide lock in any case — must not be asked to do the same page
+#: forty times over. Requests past the bound wait; they do not fail.
+_RASTER_CONCURRENCY = 2
+_raster_gate: Optional[asyncio.Semaphore] = None
+_inflight: Dict[str, "asyncio.Future[None]"] = {}
+
+
+def _raster_slot() -> asyncio.Semaphore:
+    # Not `_gate`: every route has a `_gate` PARAMETER (the feature check),
+    # which shadowed this name inside the handler and made it None.
+    global _raster_gate
+    if _raster_gate is None:
+        _raster_gate = asyncio.Semaphore(_RASTER_CONCURRENCY)
+    return _raster_gate
 
 
 async def require_artifacts(request: Request) -> None:
@@ -251,20 +270,37 @@ async def get_preview_page(
     cache_dir = os.path.join(os.path.dirname(pdf_path), T.PREVIEWS_DIR)
     cached = os.path.join(cache_dir, f"{page}-{width}.png")
     if not os.path.isfile(cached):
-        started = asyncio.get_running_loop().time()
-        try:
-            from .render.preview import rasterise_page
+        key = f"{artifact_id}:{version}:{page}:{width}"
+        pending = _inflight.get(key)
+        if pending is not None:
+            # Somebody is rendering this very page: wait for them.
+            await asyncio.shield(pending)
+        else:
+            fut: "asyncio.Future[None]" = asyncio.get_running_loop().create_future()
+            _inflight[key] = fut
+            try:
+                async with _raster_slot():
+                    started = asyncio.get_running_loop().time()
+                    from .render.preview import rasterise_page
 
-            png = await asyncio.to_thread(rasterise_page, pdf_path, page, width)
-            os.makedirs(cache_dir, exist_ok=True)
-            await asyncio.to_thread(store.write_bytes, cached, png)
-        except IndexError:
-            raise HTTPException(status_code=404, detail="not found")
-        except Exception as exc:  # noqa: BLE001 — a preview that will not render is not a missing file
-            log.warning("artifact preview page failed: %s", type(exc).__name__)
+                    png = await asyncio.to_thread(rasterise_page, pdf_path, page, width)
+                    os.makedirs(cache_dir, exist_ok=True)
+                    await asyncio.to_thread(store.write_bytes, cached, png)
+                    metrics.observe("artifact_preview_seconds", asyncio.get_running_loop().time() - started, "page-image rasterisation")
+            except IndexError:
+                raise HTTPException(status_code=404, detail="not found")
+            except Exception as exc:  # noqa: BLE001 — a preview that will not render is not a missing file
+                log.warning("artifact preview page failed: %s", type(exc).__name__)
+                raise HTTPException(status_code=503, detail="Preview unavailable — download the file instead.")
+            finally:
+                _inflight.pop(key, None)
+                if not fut.done():
+                    fut.set_result(None)
+        if not os.path.isfile(cached):
             raise HTTPException(status_code=503, detail="Preview unavailable — download the file instead.")
-        metrics.observe("artifact_preview_seconds", asyncio.get_running_loop().time() - started, "page-image rasterisation")
-    return FileResponse(cached, media_type="image/png", headers={"Cache-Control": "private, max-age=3600", "X-Content-Type-Options": "nosniff"})
+    # Five minutes, private: long enough for a scroll back up, short enough
+    # that a shared machine does not keep another person's pages for an hour.
+    return FileResponse(cached, media_type="image/png", headers={"Cache-Control": "private, max-age=300", "X-Content-Type-Options": "nosniff"})
 
 
 @router.get("/{artifact_id}/v/{version}/sheets")
@@ -291,6 +327,8 @@ async def get_sheets(
         from .render.preview import sheet_grid
 
         grid = await asyncio.to_thread(sheet_grid, path, sheet, rows, cols)
+    except (KeyError, LookupError):
+        raise HTTPException(status_code=404, detail="not found")
     except Exception as exc:  # noqa: BLE001
         log.warning("artifact sheet grid failed: %s", type(exc).__name__)
         raise HTTPException(status_code=503, detail="Preview unavailable — download the workbook instead.")
@@ -300,31 +338,47 @@ async def get_sheets(
 # ---------------------------------------------------------------- convert --
 
 
+class ConvertBody(BaseModel):
+    """The one field a conversion takes. Any other shape is a 422 from
+    FastAPI, never a 500 — and the value is never echoed back."""
+
+    model_config = ConfigDict(extra="forbid")
+    format: Literal["pdf", "docx", "pptx", "xlsx"]
+
+
 @router.post("/{artifact_id}/convert")
-async def convert_artifact(artifact_id: str, request: Request, user: UserRow = Depends(require_user), _gate: None = Depends(require_artifacts)) -> dict:
-    body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
-    fmt = str((body or {}).get("format") or "").lower()
+async def convert_artifact(artifact_id: str, body: ConvertBody, user: UserRow = Depends(require_user), _gate: None = Depends(require_artifacts)) -> dict:
+    fmt = body.format
     artifact = await db.run_in_thread(adb.get_artifact, _id(artifact_id), int(user["id"]))
     if artifact is None:
         raise HTTPException(status_code=404, detail="not found")
     kind = str(artifact.get("kind") or "document")
     if fmt not in T.FORMATS_FOR_KIND.get(kind, ()):
         options = " or ".join(T.FORMATS_FOR_KIND.get(kind, ()))
-        raise HTTPException(status_code=400, detail=f"A {kind} can be made as {options}, not {fmt or 'that'}.")
+        raise HTTPException(status_code=400, detail=f"A {kind} can be made as {options}.")
     version = int(artifact.get("current_version") or 0)
     if version < 1:
         raise HTTPException(status_code=409, detail="This artifact has no finished version to convert yet.")
+    current = await db.run_in_thread(adb.get_version, artifact_id, version, int(user["id"]))
+    if current and any(f.get("format") == fmt for f in (current.get("files") or [])):
+        raise HTTPException(status_code=409, detail=f"The current version already has a {fmt.upper()} file.")
+    conversation_id = str(artifact.get("conversation_id") or "")
+    # The key names the artifact AND the version: two artifacts converted
+    # to the same format are two jobs, and a convert that failed earlier
+    # is retried rather than handed back as the answer.
+    key = pipeline.idempotency_key(int(user["id"]), conversation_id, f"convert:{artifact_id}:v{version}", "convert", fmt)
     try:
         job = await db.run_in_thread(
             pipeline.accept,
-            user_id=int(user["id"]), conversation_id=str(artifact.get("conversation_id") or ""), generation_id="",
+            user_id=int(user["id"]), conversation_id=conversation_id, generation_id="",
             operation="convert", instruction=f"convert to {fmt}", kind=kind, formats=[fmt], format_reason=f"convert: {fmt}",
             effort="fast", mode="assistant", template_id="generic", parent=(artifact_id, version),
-            idempotency_key=pipeline.idempotency_key(int(user["id"]), str(artifact.get("conversation_id") or ""), f"convert-v{version}", "convert", fmt),
-            title=str(artifact.get("title") or ""),
+            idempotency_key=key, title=str(artifact.get("title") or ""),
         )
     except pipeline.ArtifactRefused as exc:
         raise HTTPException(status_code=409 if getattr(exc, "category", "") in ("quota_exceeded", "storage_failure") else 400, detail=str(exc))
+    if job.get("status") == "failed":
+        job = await pipeline.retry(str(job["id"]), int(user["id"])) or job
     await pipeline.ensure_running(str(job["id"]))
     return {"job_id": job["id"], "artifact_id": job["artifact_id"], "version": int(job["version"])}
 

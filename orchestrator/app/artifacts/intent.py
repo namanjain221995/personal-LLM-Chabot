@@ -35,6 +35,13 @@ from . import formats as F
 
 Action = str  # "create" | "edit" | "convert" | "export" | "none"
 
+#: How much of a message the rules read.
+_DECIDE_CHARS = 4000
+#: A conversation artifact's title is matched as a whole phrase, and only
+#: when it is distinctive enough to mean something: "The" or "Plan" would
+#: turn every later message with an edit verb into an edit.
+_MIN_HINT_CHARS = 6
+
 # ------------------------------------------------------------ vocabulary --
 
 _CREATE_VERBS = (
@@ -106,7 +113,7 @@ _EDIT_VERBS_RE = re.compile(
 #: the content is the conversation's, and the engine makes a new artifact
 #: of the requested kind rather than refusing to convert the latest one.
 _CONVERT_RE = re.compile(
-    rf"\b(?:convert|export|save|also|too|as well|another|a copy)\b.*?\b(?:as|to|into|in)\s+(?:an?\s+|the\s+)?{_FORMAT_WORD}\b"
+    rf"\b(?:convert|export|save|also|too|as well|another|a copy)\b(?:\W+\w+){{0,8}}?\W+(?:as|to|into|in)\s+(?:an?\s+|the\s+)?{_FORMAT_WORD}\b"
     rf"|\b(?:also|too)\s+(?:as|in)\s+(?:an?\s+)?{_FORMAT_WORD}\b"
     rf"|\b(?:{_FORMAT_WORD})\s+(?:version|copy|too|as well)\b",
     re.I,
@@ -158,7 +165,11 @@ def decide(
     one. `has_assistant_answer`: there is a previous assistant turn to
     export.
     """
-    raw = _clean(text)
+    # A request for a file is stated in the first sentences; what follows is
+    # material. The rules run on a bounded prefix, because a regex with a
+    # word gap is quadratic in what it scans and a 250 KB paste held the
+    # event loop for minutes (review, 2026-09-11).
+    raw = _clean(text)[:_DECIDE_CHARS]
     if not raw:
         return ArtifactIntent("none", rule="empty")
     low = raw.lower()
@@ -206,8 +217,12 @@ def decide(
     return ArtifactIntent("none", formats=explicit, rule="no-request")
 
 
+def _usable_hints(hints: Sequence[str]) -> List[str]:
+    return [h for h in hints if h and len(h.strip()) >= _MIN_HINT_CHARS]
+
+
 def _mentions_hint(low: str, hints: Sequence[str]) -> bool:
-    return any(h and h.lower() in low for h in hints)
+    return any(re.search(rf"\b{re.escape(h.lower().strip())}\b", low) for h in _usable_hints(hints))
 
 
 def _which(low: str, hints: Sequence[str]) -> str:
@@ -218,8 +233,8 @@ def _hint(low: str, hints: Sequence[str], *, exclude: Sequence[str] = ()) -> str
     """What the person pointed at: a known artifact label, else the artifact
     noun they used, else the part ("slide 4", "the title"). `exclude` holds
     the words that name the TARGET of a conversion, which are not a hint."""
-    for h in hints:
-        if h and h.lower() in low:
+    for h in _usable_hints(hints):
+        if re.search(rf"\b{re.escape(h.lower().strip())}\b", low):
             return h
     skip = {w.lower() for w in exclude}
     for m in re.finditer(r"\b(?:the )?(deck|presentation|document|report|spreadsheet|workbook|brief|proposal|sop|memo|pdf|docx|pptx|xlsx)\b", low):

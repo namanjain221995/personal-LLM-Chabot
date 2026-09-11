@@ -610,6 +610,16 @@ def accept(
         raise ArtifactRefused("storage_failure", "The reports volume is out of space.")
     if not store.quota_ok(user_id):
         raise ArtifactRefused("quota_exceeded", safe_error("quota_exceeded"))
+    # Work in flight counts too: the quota above sees published bytes only,
+    # and a person who could queue fifty Max-effort jobs would hold the one
+    # render slot and the shared engine against everyone else (review,
+    # 2026-09-11). A small per-person ceiling on queued + running jobs.
+    open_jobs = db.count_open_jobs(int(user_id))
+    if open_jobs >= max(1, int(settings.artifact_max_open_jobs_per_user)):
+        raise ArtifactRefused(
+            "quota_exceeded",
+            f"You already have {open_jobs} document(s) being built. Wait for them to finish, or cancel one, and try again.",
+        )
 
     job_id = uuid.uuid4().hex
     artifact_id = parent[0] if parent is not None else uuid.uuid4().hex
@@ -659,6 +669,13 @@ async def cancel(job_id: str, user_id: int) -> Optional[dict]:
     task = _tasks.get(str(job_id))
     if row.get("status") == "cancelled" and task is not None and not task.done():
         task.cancel()
+    if row.get("status") == "cancelled":
+        # Nothing will retry a cancelled job, so its working directory —
+        # material.json holds the conversation's text — is not kept.
+        work_dir = store.version_workdir(int(user_id), str(row["artifact_id"]), int(row["version"]))
+        if str(job_id) not in _workdirs:
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(store.remove_workdir, work_dir)
     return row
 
 
@@ -902,6 +919,19 @@ async def _run(job_id: str) -> None:
             # window); the heartbeat keeps the row claimed while it waits.
             with recovery_window(settings.llm_recovery_window_s):
                 await _run_stages(job_id, row)
+        except Exception:  # noqa: BLE001 — a failure OUTSIDE a stage (a stage-boundary row write, publication)
+            # Without this the task died, the lease was released, the row
+            # stayed 'running' with no error and nobody was told (review,
+            # 2026-09-11). Record it if the database will let us, and ALWAYS
+            # end the subscribers' wait — the chat turn and the card must
+            # not spin on a job that no longer exists.
+            ref = uuid.uuid4().hex[:12]
+            log.exception("artifact job %s [%s]: the runner failed outside a stage", job_id[:8], ref)
+            try:
+                await _finish(job_id, "failed", "storage_failure", safe_error("storage_failure"), diagnostic_ref=ref)
+            except Exception:  # noqa: BLE001 — the row write is what failed; the event still goes out
+                metrics.inc("artifact_jobs_total", "artifact jobs finished", result="failed")
+                _publish(job_id, {"stage": _DONE, "status": "failed", "detail": safe_error("storage_failure")})
         except asyncio.CancelledError:
             fresh = None
             try:
@@ -973,17 +1003,66 @@ async def _visual_qa(runner: "_Runner", ctx: "_Ctx", stages: Dict[str, dict], pr
         _publish(runner.job_id, {"stage": "validate", "status": "done", "percent": 100, "detail": "layout checked", "elapsed_s": 0})
         return None
     metrics.inc("artifact_corrections_total", "artifact correction passes", stage="visual")
-    ctx.warnings.append("the layout was corrected after a visual check")
-    # A new spec means the files are stale: rewrite it and re-run what
-    # depends on it, keeping the composer-owned stages as they were.
+    # The files on disk are a GOOD version. The revision is rendered next to
+    # them, and only replaces them once it has rendered, validated and
+    # previewed; if it cannot, the good version is published with a note —
+    # a correction must never turn a finished document into a failed job
+    # (review, 2026-09-11).
+    kept = os.path.join(ctx.work_dir, ".before-visual-qa")
+    saved: List[str] = []
+    try:
+        os.makedirs(kept, exist_ok=True)
+        for name in os.listdir(ctx.work_dir):
+            src = os.path.join(ctx.work_dir, name)
+            if os.path.isfile(src) and name != store.MATERIAL_NAME:
+                os.replace(src, os.path.join(kept, name))
+                saved.append(name)
+        previews = os.path.join(ctx.work_dir, T.PREVIEWS_DIR)
+        if os.path.isdir(previews):
+            os.replace(previews, os.path.join(kept, T.PREVIEWS_DIR))
+    except OSError as exc:
+        log.warning("artifact job %s: could not set the visual QA aside: %s", runner.job_id[:8], type(exc).__name__)
+        with contextlib.suppress(OSError):
+            for name in saved:
+                os.replace(os.path.join(kept, name), os.path.join(ctx.work_dir, name))
+        return None
     await asyncio.to_thread(store.write_spec, ctx.work_dir, revised)
+    original_spec, original_report = ctx.spec, ctx.report
     ctx.spec, ctx.report = revised, None
+    before = {name: dict(state) for name, state in stages.items()}
     for name in ("render", "validate", "preview"):
         stages.pop(name, None)
-    for name in (store.RENDER_REPORT_NAME, T.VALIDATION_NAME, store.PREVIEW_META_NAME):
+    failure = await runner.chain(("render", "validate", "preview"))
+    if failure is None and not runner.deferred:
+        ctx.warnings.append("the layout was corrected after a visual check")
         with contextlib.suppress(OSError):
-            os.unlink(os.path.join(ctx.work_dir, name))
-    return await runner.chain(("render", "validate", "preview"))
+            import shutil
+
+            shutil.rmtree(kept, ignore_errors=True)
+        return None
+    # The revision could not be built: put the good version back, exactly
+    # as it was, and say what happened. Nothing about the job fails.
+    log.warning("artifact job %s: the visual correction could not be rendered (%s); keeping the reviewed version", runner.job_id[:8], failure or "deferred")
+    with contextlib.suppress(OSError):
+        for name in os.listdir(ctx.work_dir):
+            path = os.path.join(ctx.work_dir, name)
+            if os.path.isfile(path) and name != store.MATERIAL_NAME:
+                os.unlink(path)
+        stale_previews = os.path.join(ctx.work_dir, T.PREVIEWS_DIR)
+        if os.path.isdir(stale_previews):
+            import shutil
+
+            shutil.rmtree(stale_previews, ignore_errors=True)
+        for name in os.listdir(kept):
+            os.replace(os.path.join(kept, name), os.path.join(ctx.work_dir, name))
+        os.rmdir(kept)
+    ctx.spec, ctx.report = original_spec, original_report
+    stages.clear()
+    stages.update(before)
+    runner.deferred = None
+    runner.failure = None
+    ctx.warnings.append("a visual correction was attempted but could not be applied; the reviewed version is what was published")
+    return None
 
 
 async def _run_stages(job_id: str, row: dict) -> None:
@@ -1535,6 +1614,9 @@ async def start() -> None:
     house. Nothing here blocks startup — the drain runs behind the app."""
     global _maintenance
     if not settings.artifacts_enabled:
+        # Off: no jobs run, but what an enabled deployment left in working
+        # directories is still swept on the same schedule.
+        _maintenance = asyncio.get_running_loop().create_task(_sweep_only_loop(), name="artifact-sweep")
         return
     try:
         requeued = await core_db.run_in_thread(db.requeue_lapsed)
@@ -1599,14 +1681,59 @@ def _deferred_too_recently(row: dict) -> bool:
 
 async def sweep() -> int:
     """Remove abandoned working directories older than the TTL — never one
-    a job in this process is writing, never a published version."""
-    return await asyncio.to_thread(store.sweep_abandoned, settings.artifact_tmp_ttl_hours, skip=set(_workdirs.values()))
+    a job in this process is writing, never one a QUEUED job still needs
+    (its material.json is what it will compose from), never a published
+    version."""
+    keep = set(_workdirs.values())
+    ttl_s = float(settings.artifact_tmp_ttl_hours) * 3600.0
+    try:
+        for job in await core_db.run_in_thread(db.list_jobs, "queued", 500):
+            created = job.get("created_at")  # ISO text from _job_row
+            try:
+                created_dt = datetime.fromisoformat(str(created).replace("Z", "+00:00")) if created else None
+            except ValueError:
+                created_dt = None
+            if created_dt is not None and created_dt.tzinfo is None:
+                created_dt = created_dt.replace(tzinfo=timezone.utc)
+            age = (datetime.now(timezone.utc) - created_dt).total_seconds() if created_dt else 0.0
+            if age > ttl_s:
+                # Queued for longer than the TTL: nothing is going to run it
+                # (the drain would have). Say so on the row, and let its
+                # working directory go with the others.
+                await core_db.run_in_thread(
+                    db.set_job_status, str(job["id"]), "failed",
+                    error="This document was never built. Please ask for it again.",
+                    failure_category="dependency_unavailable", completed=True,
+                )
+                continue
+            keep.add(store.version_workdir(int(job["user_id"]), str(job["artifact_id"]), int(job["version"])))
+    except Exception:  # noqa: BLE001 — a listing that fails keeps the sweep conservative
+        return 0
+    return await asyncio.to_thread(store.sweep_abandoned, settings.artifact_tmp_ttl_hours, skip=keep)
+
+
+async def _sweep_only_loop() -> None:
+    await asyncio.sleep(5.0)
+    while True:
+        try:
+            await sweep()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            log.warning("artifact sweep failed", exc_info=True)
+        await asyncio.sleep(max(60.0, settings.artifact_maintenance_interval_s))
 
 
 async def _maintenance_loop() -> None:
     await asyncio.sleep(5.0)
     while True:
         try:
+            # A row left 'running' by a process that died (or a runner that
+            # failed before it could write) comes back to the queue here,
+            # every pass — not only at the next restart.
+            lapsed = await core_db.run_in_thread(db.requeue_lapsed)
+            if lapsed:
+                log.warning("artifacts: requeued %d job(s) whose lease had lapsed", lapsed)
             await drain_queue()
             removed = await sweep()
             if removed:

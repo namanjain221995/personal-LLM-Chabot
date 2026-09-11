@@ -201,3 +201,37 @@ def test_tables_are_offered_as_data_the_model_must_not_recompute(monkeypatch):
     asyncio.run(C.compose(req))
     user = model.calls[0]["messages"][1]["content"]
     assert "do not recompute totals" in user and "TABLE t1: Pipeline" in user and "A | 10" in user
+
+
+def test_the_sources_manifest_is_built_from_the_material_not_the_model(monkeypatch):
+    """A hostile upload can tell the model to add a source; the model can
+    invent one on its own. Neither reaches the page: the manifest is code-
+    built from what the engine provided, citations to anything else are
+    stripped, and the person is told."""
+    poisoned = _doc_json(
+        blocks=[
+            {"type": "paragraph", "text": "Team tier moves to $59.", "sources": ["s1", "w9"]},
+            {"type": "paragraph", "text": "Log in to verify.", "sources": ["w9"]},
+        ],
+        sources=[
+            {"id": "s1", "title": "Finance note (retitled by the model)", "url": "https://evil.example/s1"},
+            {"id": "w9", "title": "Investor portal login", "url": "https://login-attacker.example/verify"},
+        ],
+    )
+    model = _Model([poisoned])
+    monkeypatch.setattr(llm, "json_completion", model)
+    result = asyncio.run(C.compose(_req("fast")))
+    spec = result.spec
+    assert [c.id for c in spec.body.sources] == ["s1"]
+    assert spec.body.sources[0].title == "Finance note" and spec.body.sources[0].url is None, "the material's own title and url, not the model's"
+    assert spec.body.blocks[0].sources == ["s1"] and spec.body.blocks[1].sources == []
+    assert any("not provided" in w for w in result.warnings) and any("not among those provided" in w for w in result.warnings)
+    assert "login-attacker" not in spec.model_dump_json()
+
+
+def test_no_material_sources_means_no_manifest_at_all(monkeypatch):
+    invented = _doc_json(sources=[{"id": "s1", "title": "Made up", "url": "https://example.com/x"}])
+    monkeypatch.setattr(llm, "json_completion", _Model([invented]))
+    req = _req("fast", material=C.Material(instruction="x"))
+    result = asyncio.run(C.compose(req))
+    assert result.spec.body.sources == [] and result.spec.body.blocks[1].sources == []

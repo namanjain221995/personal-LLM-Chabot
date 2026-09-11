@@ -22,14 +22,26 @@ from typing import Any, Dict, List, Optional
 from .. import types as T
 
 
+def _lock():
+    """The ONE lock every pypdfium2 call in the process takes — owned by
+    core/pdf.py, whose uploaded-PDF readers run in the same worker threads.
+    PDFium is not thread-safe; two threads inside it crash the process
+    (reproduced 2026-09-11: SIGSEGV at 80 concurrent page renders, SIGABRT
+    at 16). The worker subprocess has its own process and its own lock."""
+    from ...core.pdf import PDFIUM_LOCK
+
+    return PDFIUM_LOCK
+
+
 def page_count(pdf_path: str | Path) -> int:
     import pypdfium2 as pdfium  # lazy: arm64 wheel, no system deps
 
-    pdf = pdfium.PdfDocument(str(pdf_path))
-    try:
-        return len(pdf)
-    finally:
-        pdf.close()
+    with _lock():
+        pdf = pdfium.PdfDocument(str(pdf_path))
+        try:
+            return len(pdf)
+        finally:
+            pdf.close()
 
 
 def rasterise_page(pdf_path: str | Path, page: int, width: int) -> bytes:
@@ -40,21 +52,22 @@ def rasterise_page(pdf_path: str | Path, page: int, width: int) -> bytes:
 
     if width < 32 or width > max(T.PREVIEW_WIDTHS) * 2:
         raise ValueError(f"preview width {width} is out of range")
-    pdf = pdfium.PdfDocument(str(pdf_path))
-    try:
-        n = len(pdf)
-        if page < 1 or page > n:
-            raise IndexError(f"page {page} of {n}")
-        pg = pdf[page - 1]
+    with _lock():
+        pdf = pdfium.PdfDocument(str(pdf_path))
         try:
-            page_w, _ = pg.get_size()  # points
-            scale = width / page_w if page_w > 0 else 1.0
-            bitmap = pg.render(scale=scale)
-            pil = bitmap.to_pil().convert("RGB")
+            n = len(pdf)
+            if page < 1 or page > n:
+                raise IndexError(f"page {page} of {n}")
+            pg = pdf[page - 1]
+            try:
+                page_w, _ = pg.get_size()  # points
+                scale = width / page_w if page_w > 0 else 1.0
+                bitmap = pg.render(scale=scale)
+                pil = bitmap.to_pil().convert("RGB")
+            finally:
+                pg.close()
         finally:
-            pg.close()
-    finally:
-        pdf.close()
+            pdf.close()
     if pil.width != width:  # rounding: make the promised width exact
         from PIL import Image
 

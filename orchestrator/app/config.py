@@ -399,6 +399,10 @@ class Settings:
         # Per-person ceiling on published artifact bytes; a job past it is
         # refused with quota_exceeded before any model call.
         self.artifact_user_quota_mb: int = _int("ARTIFACT_USER_QUOTA_MB", 2048)
+        # Queued + running jobs one person may hold at once. The render slot
+        # is single and the engine is shared; fifty queued Max jobs would
+        # be everyone else's afternoon.
+        self.artifact_max_open_jobs_per_user: int = _int("ARTIFACT_MAX_OPEN_JOBS_PER_USER", 3)
         # Housekeeping: abandoned working directories (v<N>.tmp) older than
         # this are removed; published versions are never removed by the sweep.
         self.artifact_tmp_ttl_hours: int = _int("ARTIFACT_TMP_TTL_HOURS", 24)

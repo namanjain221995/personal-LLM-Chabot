@@ -45,8 +45,18 @@ export function isArtifactId(value: unknown): value is string {
   return typeof value === 'string' && ID_RE.test(value);
 }
 
+/**
+ * Every URL is built from a VALIDATED id and an integer version — never from
+ * a string that arrived in a history row. A ref whose id is not an id builds
+ * an empty URL, which the fetch helpers treat as "nothing to load".
+ */
 function versionBase(artifactId: string, version: number): string {
+  if (!isArtifactId(artifactId) || !Number.isFinite(version) || version < 1) return '';
   return `${ARTIFACT_API_PREFIX}/artifacts/${artifactId}/v/${Math.trunc(version)}`;
+}
+
+function jobBase(jobId: string): string {
+  return isArtifactId(jobId) ? `${ARTIFACT_API_PREFIX}/artifacts/jobs/${jobId}` : '';
 }
 
 /** The API surface, as browser URLs (docs/artifact-studio/API.md). */
@@ -56,19 +66,28 @@ export const artifactUrls = {
     `${ARTIFACT_API_PREFIX}/artifacts${
       conversationId ? `?conversation_id=${encodeURIComponent(conversationId)}` : ''
     }`,
-  artifact: (artifactId: string) => `${ARTIFACT_API_PREFIX}/artifacts/${artifactId}`,
+  artifact: (artifactId: string) =>
+    isArtifactId(artifactId) ? `${ARTIFACT_API_PREFIX}/artifacts/${artifactId}` : '',
   version: (artifactId: string, version: number) => versionBase(artifactId, version),
   file: (
     artifactId: string,
     version: number,
     format: string,
     disposition: 'inline' | 'attachment' = 'attachment',
-  ) => `${versionBase(artifactId, version)}/file/${format}?disposition=${disposition}`,
-  preview: (artifactId: string, version: number) =>
-    `${versionBase(artifactId, version)}/preview`,
+  ) => {
+    const base = versionBase(artifactId, version);
+    if (!base || !/^(pdf|docx|pptx|xlsx)$/.test(format)) return '';
+    return `${base}/file/${format}?disposition=${disposition}`;
+  },
+  preview: (artifactId: string, version: number) => {
+    const base = versionBase(artifactId, version);
+    return base ? `${base}/preview` : '';
+  },
   /** One rasterised page (1-based) at one of the two widths the server keeps. */
-  page: (artifactId: string, version: number, page: number, width: 240 | 1400) =>
-    `${versionBase(artifactId, version)}/preview/${Math.trunc(page)}.png?w=${width}`,
+  page: (artifactId: string, version: number, page: number, width: 240 | 1400) => {
+    const base = versionBase(artifactId, version);
+    return base && page >= 1 ? `${base}/preview/${Math.trunc(page)}.png?w=${width}` : '';
+  },
   sheets: (
     artifactId: string,
     version: number,
@@ -79,12 +98,14 @@ export const artifactUrls = {
     if (opts.rows) params.set('rows', String(Math.trunc(opts.rows)));
     if (opts.cols) params.set('cols', String(Math.trunc(opts.cols)));
     const query = params.toString();
-    return `${versionBase(artifactId, version)}/sheets${query ? `?${query}` : ''}`;
+    const base = versionBase(artifactId, version);
+    return base ? `${base}/sheets${query ? `?${query}` : ''}` : '';
   },
-  job: (jobId: string) => `${ARTIFACT_API_PREFIX}/artifacts/jobs/${jobId}`,
-  cancel: (jobId: string) => `${ARTIFACT_API_PREFIX}/artifacts/jobs/${jobId}/cancel`,
-  retry: (jobId: string) => `${ARTIFACT_API_PREFIX}/artifacts/jobs/${jobId}/retry`,
-  convert: (artifactId: string) => `${ARTIFACT_API_PREFIX}/artifacts/${artifactId}/convert`,
+  job: (jobId: string) => jobBase(jobId),
+  cancel: (jobId: string) => (jobBase(jobId) ? `${jobBase(jobId)}/cancel` : ''),
+  retry: (jobId: string) => (jobBase(jobId) ? `${jobBase(jobId)}/retry` : ''),
+  convert: (artifactId: string) =>
+    isArtifactId(artifactId) ? `${ARTIFACT_API_PREFIX}/artifacts/${artifactId}/convert` : '',
 } as const;
 
 /* --------------------------------------------------------------- vocabulary */

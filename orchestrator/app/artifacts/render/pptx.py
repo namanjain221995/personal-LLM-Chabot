@@ -171,15 +171,33 @@ def _chart_type(chart: S.Chart):
     }[chart.type]
 
 
+_FORMULA_LEADS = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _label(text: str) -> str:
+    """A chart label as TEXT for the embedded workbook: leading formula
+    characters are stripped (a label "=Total" reads "Total"), control
+    characters removed, and the length bounded."""
+    out = str(text or "").replace("\t", " ").replace("\r", " ").strip()
+    while out and out[0] in _FORMULA_LEADS:
+        out = out[1:].lstrip()
+    return (out or "-")[:120]
+
+
 def _native_chart(slide, x, y, w, h, chart: S.Chart, body_pt: float) -> None:
     from pptx.chart.data import CategoryChartData
     from pptx.enum.chart import XL_LEGEND_POSITION
     from pptx.util import Inches, Pt
 
     data = CategoryChartData()
-    data.categories = list(chart.categories)
+    # python-pptx writes the chart's data into an EMBEDDED workbook with
+    # XlsxWriter, whose write() turns any string starting with '=' into a
+    # formula cell — so a category or series named "=HYPERLINK(...)" would
+    # be live the moment a reader chose Edit Data (review, 2026-09-11). A
+    # label is text: the formula lead is dropped, never written.
+    data.categories = [_label(c) for c in chart.categories]
     for series in chart.series:
-        data.add_series(series.name, [float(v) for v in series.values])
+        data.add_series(_label(series.name), [float(v) for v in series.values])
     frame = slide.shapes.add_chart(_chart_type(chart), Inches(x), Inches(y), Inches(w), Inches(h), data)
     c = frame.chart
     c.font.size = Pt(max(body_pt - 4, theme.SLIDE_MIN_BODY_PT - 2))

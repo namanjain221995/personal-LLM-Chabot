@@ -21,7 +21,7 @@
 
 import type { MouseEvent } from 'react';
 import {
-  apiUrl,
+  artifactUrls,
   cardDomId,
   fileExtent,
   isTerminal,
@@ -88,7 +88,7 @@ export function DownloadControl({ artifact, files }: { artifact: ArtifactRef; fi
     const f = files[0];
     return (
       <a
-        href={apiUrl(f.download_url)}
+        href={artifactUrls.file(artifact.artifact_id, artifact.version, f.format, 'attachment')}
         download={f.filename}
         onClick={stopCardClick}
         aria-label={`Download ${f.filename}`}
@@ -121,7 +121,7 @@ export function DownloadControl({ artifact, files }: { artifact: ArtifactRef; fi
           return (
             <li key={f.format}>
               <a
-                href={apiUrl(f.download_url)}
+                href={artifactUrls.file(artifact.artifact_id, artifact.version, f.format, 'attachment')}
                 download={f.filename}
                 aria-label={`Download ${f.filename}`}
                 className="flex items-center gap-2 px-3 py-1.5 text-xs text-ink no-underline transition-colors duration-ts hover:bg-surface-2"

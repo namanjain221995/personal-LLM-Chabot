@@ -635,6 +635,16 @@ def requeue_lapsed() -> int:
 # ------------------------------------------------------ quota + health --
 
 
+def count_open_jobs(user_id: int) -> int:
+    """Queued + running jobs of one person — the in-flight half of the quota."""
+    with core.connection() as con:
+        row = con.execute(
+            "SELECT count(*) AS n FROM artifact_jobs WHERE user_id = %s AND status IN ('queued', 'running')",
+            (int(user_id),),
+        ).fetchone()
+    return int(row["n"] if row else 0)
+
+
 def user_bytes(user_id: int) -> int:
     """Bytes this person has PUBLISHED, from the version rows' file sizes.
     The rows are the accounting: a walk of the volume would count working

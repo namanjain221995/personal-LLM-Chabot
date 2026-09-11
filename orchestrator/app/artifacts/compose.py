@@ -393,9 +393,10 @@ async def compose(req: ComposeRequest, *, progress: Optional[Progress] = None) -
     await say(30.0, "writing")
     raw = await _compose_once(req, budget, outline_json=outline_json)
     calls += 1
-    spec, repaired = await _validate_or_repair(req, budget, raw, outline_json)
+    spec, repaired, notes = await _validate_or_repair(req, budget, raw, outline_json)
     calls += repaired
     corrections += repaired
+    result_warnings.extend(notes)
 
     # Placeholders are a correction, bounded by the budget.
     holes = S.placeholders_in(spec)
@@ -407,8 +408,9 @@ async def compose(req: ComposeRequest, *, progress: Optional[Progress] = None) -
         )
         calls += 1
         corrections += 1
-        spec, repaired = await _validate_or_repair(req, budget, raw, outline_json)
+        spec, repaired, notes = await _validate_or_repair(req, budget, raw, outline_json)
         calls += repaired
+        result_warnings.extend(n for n in notes if n not in result_warnings)
         holes = S.placeholders_in(spec)
     if holes:
         result_warnings.append("placeholder text remains: " + ", ".join(holes[:4]))
@@ -421,26 +423,71 @@ async def compose(req: ComposeRequest, *, progress: Optional[Progress] = None) -
             calls += 1
         except ComposeError:
             review_json = None
-        musts = [i for i in (review_json or {}).get("issues", []) if i.get("severity") == "must"]
+        issues = (review_json or {}).get("issues") if isinstance(review_json, dict) else None
+        musts = [i for i in (issues if isinstance(issues, list) else []) if isinstance(i, dict) and i.get("severity") == "must"]
         if musts:
             await say(80.0, f"correcting {len(musts)} issue(s)")
             fix_text = "\n".join(f"- {i['where']}: {i['problem']} → {i['fix']}" for i in musts[:8])
             raw = await _compose_once(req, budget, outline_json=outline_json, extra=f"A reviewer found these problems. Fix each and return the whole document:\n{fix_text}")
             calls += 1
             corrections += 1
-            spec, repaired = await _validate_or_repair(req, budget, raw, outline_json)
+            spec, repaired, notes = await _validate_or_repair(req, budget, raw, outline_json)
             calls += repaired
+            result_warnings.extend(n for n in notes if n not in result_warnings)
 
     result_warnings.extend(_enforce_caps(spec, budget))
     await say(95.0, "content ready")
     return ComposeResult(spec=spec, warnings=result_warnings, corrections=corrections, outline=outline_json, review=review_json, model_calls=calls)
 
 
+def _reconcile_sources(raw: dict, material: Optional[Material]) -> List[str]:
+    """The sources manifest is CODE-BUILT from the material, never taken
+    from the model. The model may cite an id it was given; every entry it
+    invents — a title, a URL, a date — is dropped and the citations to it
+    stripped, because a fabricated reference that passes validation is
+    exactly the injected 'source' a hostile upload would plant (review,
+    2026-09-11). Returns the warnings to show. Mutates `raw` in place."""
+    known = {s.id: s for s in (material.sources if material else [])}
+    warnings: List[str] = []
+    cited: set = set()
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            refs = node.get("sources")
+            if isinstance(refs, list) and node is not raw:
+                kept = [r for r in refs if isinstance(r, str) and r in known]
+                dropped = len(refs) - len(kept)
+                if dropped:
+                    warnings.append(f"{dropped} citation(s) to sources that were not provided were removed")
+                node["sources"] = kept
+                cited.update(kept)
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+
+    body_sources = raw.get("sources")
+    raw["sources"] = None  # so the walk does not treat the manifest as block refs
+    walk(raw)
+    invented = [s for s in (body_sources or []) if not (isinstance(s, dict) and s.get("id") in known)]
+    if invented:
+        warnings.append(f"{len(invented)} source(s) the model listed were not among those provided and were removed")
+    raw["sources"] = [
+        {"id": s.id, "title": s.title[:300], "url": s.url or None, "retrieved_at": s.retrieved_at or None}
+        for sid, s in known.items() if sid in cited
+    ]
+    return sorted(set(warnings))
+
+
 async def _validate_or_repair(req: ComposeRequest, budget: T.EffortBudget, raw: dict, outline_json: Optional[dict]):
     """parse_body, and on a validation error ONE repair pass with the field
-    paths — the same recipe as the Salesforce planner. Returns (spec, repairs)."""
+    paths — the same recipe as the Salesforce planner. Returns (spec, repairs).
+    The sources manifest is reconciled against the material FIRST, so the
+    model's own list never reaches validation, let alone a page."""
+    notes = _reconcile_sources(raw, req.material)
     try:
-        return S.parse_body(req.kind, raw), 0
+        return S.parse_body(req.kind, raw), 0, notes
     except ValidationError as exc:
         summary = S.validation_summary(exc)
         log.info("artifact compose: spec invalid, repairing once: %s", summary.replace("\n", " | ")[:400])
@@ -448,8 +495,9 @@ async def _validate_or_repair(req: ComposeRequest, budget: T.EffortBudget, raw: 
         req, budget, outline_json=outline_json,
         extra=f"Your JSON did not match the schema:\n{summary}\nReturn the corrected, complete document.",
     )
+    notes = _reconcile_sources(fixed, req.material)
     try:
-        return S.parse_body(req.kind, fixed), 1
+        return S.parse_body(req.kind, fixed), 1, notes
     except ValidationError as exc:
         raise ComposeError("model_failure", "The model could not produce a valid document structure.") from exc
 
@@ -538,7 +586,7 @@ async def revise(req: ComposeRequest, spec: S.ArtifactSpec, issues: Sequence[dic
         operation="edit", material=req.material, parent_spec=spec, instruction=req.instruction, author=req.author, date=req.date,
     )
     raw = await _compose_once(edit_req, budget, outline_json=None, extra=f"Fix these problems in the document and return the whole document:\n{fix_text}")
-    fixed, _ = await _validate_or_repair(edit_req, budget, raw, None)
+    fixed, _, _ = await _validate_or_repair(edit_req, budget, raw, None)
     return fixed
 
 

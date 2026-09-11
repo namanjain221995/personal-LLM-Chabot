@@ -208,7 +208,7 @@ def test_the_sheet_grid_is_bounded_and_never_evaluates(alice, monkeypatch):
 
 def test_job_status_cancel_retry_and_convert(alice, monkeypatch):
     client, uid = alice
-    row = _make(uid)
+    row = _make(uid, formats=("pdf",))
     aid, jid = row["artifact_id"], row["id"]
     status = client.get(f"/artifacts/jobs/{jid}").json()
     assert status["status"] == "completed" and status["artifact"]["artifact_id"] == aid and status["stage_title"]
@@ -218,7 +218,12 @@ def test_job_status_cancel_retry_and_convert(alice, monkeypatch):
 
     # Convert: a new version, no new artifact, the kind's formats only.
     resp = client.post(f"/artifacts/{aid}/convert", json={"format": "pptx"})
-    assert resp.status_code == 400 and "can be made as" in resp.json()["detail"]
+    assert resp.status_code == 400 and "can be made as" in resp.json()["detail"] and "pptx" not in resp.json()["detail"].split("as")[1]
+    # Malformed bodies are 422s with nothing echoed, never a 500.
+    assert client.post(f"/artifacts/{aid}/convert", content="{", headers={"content-type": "application/json"}).status_code == 422
+    assert client.post(f"/artifacts/{aid}/convert", json=[1, 2]).status_code == 422
+    assert client.post(f"/artifacts/{aid}/convert", json={"format": "<script>" * 100}).status_code == 422
+    assert client.post(f"/artifacts/{aid}/convert", json={"format": "pdf"}).status_code == 409, "already has a PDF"
     resp = client.post(f"/artifacts/{aid}/convert", json={"format": "docx"})
     assert resp.status_code == 200
     body = resp.json()

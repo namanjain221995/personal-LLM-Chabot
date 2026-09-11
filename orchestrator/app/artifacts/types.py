@@ -184,13 +184,13 @@ PREVIEW_WIDTHS: Tuple[int, ...] = (240, 1400)   # thumbnail, page
 
 # --------------------------------------------------------------- storage --
 
-_ID_RE = re.compile(r"^[a-f0-9]{32}$")
+_ID_RE = re.compile(r"[a-f0-9]{32}")
 
 
 def is_artifact_id(value: str) -> bool:
     """Artifact and job ids are uuid4 hex: 32 lowercase hex characters, and
     nothing else may ever be used to build a path."""
-    return bool(_ID_RE.match(value or ""))
+    return bool(_ID_RE.fullmatch(value or ""))
 
 
 def artifact_dir(reports_dir: str, user_id: int, artifact_id: str) -> str:

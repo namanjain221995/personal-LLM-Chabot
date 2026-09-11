@@ -299,6 +299,24 @@ describe('handlers — passthrough', () => {
     expect(init?.method).toBe('POST');
     expect(init?.body).toBe('{"format":"pdf"}');
   });
+
+  it('refuses a POST body over the cap before reading it, declared or not', async () => {
+    const fetchMock = stubUpstream(new Response('{}', { status: 200 }));
+    const big = '{"format":"' + 'x'.repeat(4096) + '"}';
+    const declared = new Request(`http://localhost:3001/api/artifacts/${ID}/convert`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'content-length': String(big.length), cookie: 'ts_session=s1' },
+      body: big,
+    });
+    expect((await POST(declared, ctx([ID, 'convert']))).status).toBe(413);
+    const undeclared = new Request(`http://localhost:3001/api/artifacts/${ID}/convert`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie: 'ts_session=s1' },
+      body: big,
+    });
+    expect((await POST(undeclared, ctx([ID, 'convert']))).status).toBe(413);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
 });
 
 describe('handlers — failures are truthful and say nothing extra', () => {

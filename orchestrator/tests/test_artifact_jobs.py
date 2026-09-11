@@ -1137,9 +1137,22 @@ def test_the_sweep_removes_an_abandoned_workdir_but_not_one_in_flight(owner, mon
     os.utime(work, (ancient, ancient))
     os.utime(store.version_dir(owner, published["artifact_id"], 1), (ancient, ancient))
     monkeypatch.setattr(settings, "artifact_tmp_ttl_hours", 24)
+    # A job still QUEUED after the TTL is failed with a plain sentence before
+    # its directory goes: material.json is what it would compose from, and a
+    # queued job younger than the TTL keeps it (the review of 2026-09-11).
+    with db.connection() as con:
+        con.execute("UPDATE artifact_jobs SET created_at = created_at - interval '3 days' WHERE id = %s", (abandoned["id"],))
     assert asyncio.run(pipeline.sweep()) == 1
     assert not os.path.exists(work)
     assert store.is_published(owner, published["artifact_id"], 1)
+    stale = adb.get_job(abandoned["id"], owner)
+    assert stale["status"] == "failed" and "never built" in stale["error"]
+
+    fresh = _accept(owner, generation_id="gen-fresh")
+    fresh_work = store.version_workdir(owner, fresh["artifact_id"], 1)
+    os.utime(fresh_work, (ancient, ancient))
+    assert asyncio.run(pipeline.sweep()) == 0, "a queued job's directory is kept while the job is young"
+    assert os.path.exists(fresh_work)
 
 
 # ---------------------------------------------------------- subprocess --

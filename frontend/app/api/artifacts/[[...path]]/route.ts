@@ -33,6 +33,38 @@ export const dynamic = 'force-dynamic';
 /** An optional catch-all: `path` is absent for GET /api/artifacts itself. */
 type Ctx = { params: Promise<{ path?: string[] }> };
 
+/** The largest POST body any artifact route takes: `{"format":"pptx"}` with room. */
+const MAX_POST_BYTES = 1024;
+
+/**
+ * Read a request body of at most `limit` bytes, chunk by chunk, so a body
+ * with no Content-Length (chunked, or a client that lies) can never become
+ * a large buffer in this process. `null` means it was over the limit.
+ */
+async function readBounded(req: Request, limit: number): Promise<string | null> {
+  if (!req.body) return '';
+  const reader = req.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > limit) {
+      await reader.cancel().catch(() => undefined);
+      return null;
+    }
+    chunks.push(value);
+  }
+  const joined = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    joined.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(joined);
+}
+
 const ID = /^[a-f0-9]{32}$/;
 const INT = /^(0|[1-9][0-9]{0,8})$/;
 const POSITIVE_INT = /^[1-9][0-9]{0,8}$/;
@@ -196,12 +228,27 @@ async function proxy(req: Request, ctx: Ctx): Promise<Response> {
     if (value) headers[name] = value;
   }
 
+  // A POST here carries at most `{"format":"pptx"}`; cancel and retry carry
+  // nothing. The body is bounded BEFORE it is read, so a large or absent
+  // Content-Length never becomes a buffer in this process (review, 2026-09-11).
+  let body: string | undefined;
+  if (req.method === 'POST') {
+    const declared = req.headers.get('content-length');
+    if (declared !== null && (!Number.isFinite(Number(declared)) || Number(declared) > MAX_POST_BYTES)) {
+      return Response.json({ detail: 'The request body is too large.' }, { status: 413 });
+    }
+    const bounded = await readBounded(req, MAX_POST_BYTES);
+    if (bounded === null) {
+      return Response.json({ detail: 'The request body is too large.' }, { status: 413 });
+    }
+    body = bounded.length > 0 ? bounded : undefined;
+  }
   let upstream: Response;
   try {
     upstream = await fetch(`${orchestratorUrl}${resolved.upstreamPath}${query}`, {
       method: req.method,
       headers,
-      body: req.method === 'POST' ? await req.text() : undefined,
+      body,
       cache: 'no-store',
       redirect: 'manual',
       signal: req.signal,

@@ -325,8 +325,15 @@ async def run_artifact_engine(
     effort: str = "fast",
     mode: str = "assistant",
     web_allowed: bool = False,
+    intent_id: str = "",
 ) -> str:
-    """The whole turn. Returns the sentence that was streamed."""
+    """The whole turn. Returns the sentence that was streamed.
+
+    `intent_id` is the client's DURABLE id for this send (chat_requests):
+    the acceptance is keyed on it, so a turn resumed after a restart — a new
+    generation under the same intent — finds its job instead of minting a
+    second artifact (review, 2026-09-11). Without one, the generation id.
+    """
     effort = effort if effort in T.EFFORT_BUDGETS else "fast"
     instruction = intent.instruction or text
 
@@ -399,7 +406,10 @@ async def run_artifact_engine(
     if not material.sources and not material.tables:
         material.notes.append("No external sources were gathered; write from the conversation and say where something is an assumption.")
 
-    # 4. Accept — persisted before any model call.
+    # 4. Accept — persisted before any model call, keyed on the send's
+    #    durable identity plus what it targets, so the same send answers
+    #    with the same job and two different edits never share a key.
+    key_seed = (intent_id or generation_id or "") + (f":{parent[0]}:v{parent[1]}" if parent else "")
     try:
         job = await db.run_in_thread(
             pipeline.accept,
@@ -408,6 +418,7 @@ async def run_artifact_engine(
             effort=effort, mode=mode, template_id=template_id, parent=parent,
             requested_formats=intent.formats or None, material=_material_dict(material),
             title=str(parent_row.get("title") or "") if parent_row else "",
+            idempotency_key=pipeline.idempotency_key(int(user_id), conversation_id, key_seed, operation, instruction) if key_seed else "",
         )
     except pipeline.ArtifactRefused as exc:
         line = str(exc) or pipeline.safe_error(getattr(exc, "category", "invalid_request"))

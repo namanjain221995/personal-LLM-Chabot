@@ -2613,6 +2613,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     effort=request.effort,
                     mode=request.mode,
                     web_allowed=bool(search_allowed) and request.mode == "assistant",
+                    intent_id=str(gen.intent_id or ""),
                 )
             elif request.video_uploads or video_followup:
                 # 2026-09-09: a video attached now, or a question about one

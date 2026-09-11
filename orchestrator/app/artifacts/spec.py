@@ -56,8 +56,31 @@ def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
+#: Characters XML cannot carry (Open XML refuses the file; WeasyPrint drops
+#: them silently). Tab, newline and carriage return stay.
+_XML_ILLEGAL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]")
+
+
+def _scrub(value: Any) -> Any:
+    if isinstance(value, str):
+        return _XML_ILLEGAL.sub("", value)
+    if isinstance(value, list):
+        return [_scrub(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _scrub(v) for k, v in value.items()}
+    return value
+
+
 class _Strict(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _no_illegal_characters(cls, data: Any) -> Any:
+        """Every string in every model, before validation: a control
+        character the model emitted must not reach a renderer that will
+        refuse the whole file for it."""
+        return _scrub(data) if isinstance(data, (dict, list)) else data
 
 
 # ---------------------------------------------------------------- shared --
@@ -92,7 +115,18 @@ class Citation(_Strict):
 
 class Series(_Strict):
     name: str = Field(min_length=1, max_length=80)
+    #: Finite only: NaN and infinity are valid JSON to Python and pydantic,
+    #: and crash the chart and PPTX writers.
     values: List[float] = Field(min_length=1, max_length=T.MAX_CHART_POINTS)
+
+    @field_validator("values")
+    @classmethod
+    def _finite(cls, v: List[float]) -> List[float]:
+        import math
+
+        if any(not math.isfinite(x) for x in v):
+            raise ValueError("chart values must be finite numbers")
+        return v
 
 
 class Chart(_Strict):
@@ -104,6 +138,13 @@ class Chart(_Strict):
     type: Literal["bar", "horizontal_bar", "line", "pie"] = "bar"
     title: str = Field(default="", max_length=120)
     categories: List[str] = Field(min_length=1, max_length=T.MAX_CHART_POINTS)
+
+    @field_validator("categories")
+    @classmethod
+    def _category_text(cls, v: List[str]) -> List[str]:
+        # A label, not a paragraph: matplotlib lays out every character of
+        # every tick label, and 200 labels of 10,000 characters cost ~100 s.
+        return [_clip(c, 80) or f"#{i + 1}" for i, c in enumerate(v)]
     series: List[Series] = Field(min_length=1, max_length=8)
     y_label: str = Field(default="", max_length=60)
     caption: str = Field(default="", max_length=300)
@@ -368,8 +409,13 @@ class Sheet(_Strict):
     @field_validator("name")
     @classmethod
     def _sheet_name(cls, v: str) -> str:
-        # Excel forbids these in a sheet name; strip rather than refuse.
-        cleaned = re.sub(r"[\[\]\*\?/\\:]", " ", v).strip()[:31]
+        # Excel forbids these in a sheet name, and one that starts or ends
+        # with an apostrophe cannot be referenced from a formula (the
+        # dashboard's KPI cells point at the data sheet); strip rather than
+        # refuse. "History" is reserved by Excel.
+        cleaned = re.sub(r"[\[\]\*\?/\\:]", " ", v).strip().strip("'").strip()[:31].strip()
+        if cleaned.lower() == "history":
+            cleaned = "History data"
         return cleaned or "Sheet"
 
     @model_validator(mode="after")
