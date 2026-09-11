@@ -35,7 +35,7 @@ _KIND_RULES: Tuple[Tuple[str, str, str], ...] = (
 
 _EXPLICIT_FORMAT: Tuple[Tuple[str, str], ...] = (
     ("pdf", r"\bpdf\b"),
-    ("docx", r"\b(docx|word document|word file|ms word|microsoft word|\.docx|in word|as word|to word)\b"),
+    ("docx", r"\b(docx|word (?:document|file|doc|version|copy|format)|ms word|microsoft word|\.docx|in word|as word|to word)\b"),
     # Format NAMES only. "deck", "slides", "spreadsheet" are kind words: they
     # choose the kind below, and the kind's default formats follow.
     ("pptx", r"\b(pptx|powerpoint|power point|\.pptx)\b"),
