@@ -238,12 +238,27 @@ async def _soak(args, sink) -> list[dict]:
 
         async def worker(wid: int) -> None:
             nonlocal seed
+            streak = 0
             while time.monotonic() < deadline:
                 seed += 1
                 row = await _one(client, args.base, model, seed, sink)
                 rows.append(row)
                 if row["error"]:
-                    print(f"[w{wid}] {row['kind']} seed={row['seed']} ERROR {row['status']} {row['error']}", flush=True)
+                    streak += 1
+                    # Say it once per worker, then back off: a dead port must
+                    # not be hammered ten times a second (the first run did,
+                    # and drowned the monitor in identical lines). The
+                    # failure is already recorded; the monitor thread keeps
+                    # sampling both nodes; the verdict counts every error.
+                    if streak <= 2:
+                        print(f"[w{wid}] {row['kind']} seed={row['seed']} ERROR {row['status']} {row['error']}", flush=True)
+                    elif streak == 3:
+                        print(f"[w{wid}] engine unreachable; backing off (errors still counted)", flush=True)
+                    await asyncio.sleep(min(30.0, 2.0 * streak))
+                else:
+                    if streak >= 3:
+                        print(f"[w{wid}] engine back after {streak} failed attempts", flush=True)
+                    streak = 0
 
         await asyncio.gather(*(worker(i) for i in range(args.concurrency)))
     return rows
