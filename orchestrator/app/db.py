@@ -1778,6 +1778,38 @@ CREATE INDEX IF NOT EXISTS idx_artifact_versions_job
 """
 
 
+_MIGRATION_V32 = """
+-- V32 (2026-09-12): evaluator correlation and reproducible trace envelopes.
+-- V30 is already shipped, so these additions are append-only.
+ALTER TABLE query_traces
+    ADD COLUMN IF NOT EXISTS request_id text NOT NULL DEFAULT '';
+ALTER TABLE query_traces
+    ADD COLUMN IF NOT EXISTS test_case_id text;
+ALTER TABLE query_traces
+    ADD COLUMN IF NOT EXISTS versions jsonb NOT NULL DEFAULT '{}'::jsonb;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_query_traces_request
+    ON query_traces (request_id) WHERE request_id <> '';
+CREATE INDEX IF NOT EXISTS idx_query_traces_test_case
+    ON query_traces (test_case_id, started_at DESC) WHERE test_case_id IS NOT NULL;
+
+ALTER TABLE query_trace_events
+    ADD COLUMN IF NOT EXISTS started_at timestamptz;
+ALTER TABLE query_trace_events
+    ADD COLUMN IF NOT EXISTS completed_at timestamptz;
+ALTER TABLE query_trace_events
+    ADD COLUMN IF NOT EXISTS component_version text NOT NULL DEFAULT '';
+
+-- Existing V30 point events happened at created_at. Preserve that truth
+-- rather than fabricating elapsed spans during migration.
+UPDATE query_trace_events
+   SET started_at = COALESCE(started_at, created_at),
+       completed_at = COALESCE(completed_at, created_at)
+ WHERE started_at IS NULL OR completed_at IS NULL;
+ALTER TABLE query_trace_events ALTER COLUMN started_at SET NOT NULL;
+ALTER TABLE query_trace_events ALTER COLUMN completed_at SET NOT NULL;
+"""
+
+
 _MIGRATIONS: tuple = (
     (1, _MIGRATION_V1),
     (2, _MIGRATION_V2),
@@ -1810,6 +1842,7 @@ _MIGRATIONS: tuple = (
     (29, _MIGRATION_V29),
     (30, _MIGRATION_V30),
     (31, _MIGRATION_V31),
+    (32, _MIGRATION_V32),
 )
 
 #: The version `init_schema` brings a database up to. Exported so callers (and
@@ -5854,6 +5887,9 @@ def start_query_trace(
     original_question: str,
     requested_mode: str,
     resolved_mode: str = "",
+    request_id: str = "",
+    test_case_id: Optional[str] = None,
+    versions: Optional[dict] = None,
 ) -> None:
     """Create the durable root before any routing or retrieval work begins."""
     now = _now()
@@ -5862,8 +5898,8 @@ def start_query_trace(
             """INSERT INTO query_traces
                    (trace_id, conversation_id, user_id, workspace_id,
                     original_question, requested_mode, resolved_mode,
-                    final_status, started_at)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, 'running', %s)
+                    request_id, test_case_id, versions, final_status, started_at)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'running', %s)
                ON CONFLICT (trace_id) DO NOTHING""",
             (
                 trace_id,
@@ -5873,6 +5909,9 @@ def start_query_trace(
                 _text(original_question or ""),
                 _text(requested_mode or ""),
                 _text(resolved_mode or ""),
+                _text(request_id or ""),
+                _text(test_case_id) if test_case_id else None,
+                _json_param(versions or {}),
                 now,
             ),
         )
@@ -5888,23 +5927,31 @@ def append_query_trace_event(
     duration_ms: Optional[int] = None,
     error_type: str = "",
     error_message: str = "",
+    component_version: str = "",
 ) -> None:
     """Append an ordered checkpoint; retries are idempotent by sequence."""
+    completed_at = _now()
+    elapsed = max(0, int(duration_ms or 0))
+    started_at = completed_at - timedelta(milliseconds=elapsed)
     with connection() as con:
         con.execute(
             """INSERT INTO query_trace_events
                    (trace_id, sequence_number, stage, status, created_at,
-                    duration_ms, component, details, error_type, error_message)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    started_at, completed_at, duration_ms, component,
+                    component_version, details, error_type, error_message)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                ON CONFLICT (trace_id, sequence_number) DO NOTHING""",
             (
                 trace_id,
                 int(sequence_number),
                 _text(stage),
                 _text(status),
-                _now(),
+                completed_at,
+                started_at,
+                completed_at,
                 duration_ms,
                 _text(component or ""),
+                _text(component_version or ""),
                 _json_param(details or {}),
                 _text(error_type or ""),
                 _text(error_message or ""),
@@ -5962,8 +6009,9 @@ def get_query_trace(trace_id: str, user_id: int) -> Optional[dict]:
         if root is None:
             return None
         events = con.execute(
-            """SELECT sequence_number, stage, status, created_at, duration_ms,
-                      component, details, error_type, error_message
+            """SELECT sequence_number, stage, status, created_at, started_at,
+                      completed_at, duration_ms, component, component_version,
+                      details, error_type, error_message
                  FROM query_trace_events
                 WHERE trace_id = %s
                 ORDER BY sequence_number""",
@@ -5975,7 +6023,8 @@ def get_query_trace(trace_id: str, user_id: int) -> Optional[dict]:
     trace["events"] = []
     for item in events:
         event = dict(item)
-        event["created_at"] = _iso(event.get("created_at"))
+        for key in ("created_at", "started_at", "completed_at"):
+            event[key] = _iso(event.get(key))
         trace["events"].append(event)
     return trace
 

@@ -115,3 +115,14 @@ def test_sf_live_enabled_off_means_off(monkeypatch):
         assert Settings().sf_live_enabled is True, raw
     monkeypatch.delenv("SF_LIVE_ENABLED", raising=False)
     assert Settings().sf_live_enabled is True
+
+
+def test_salesforce_environment_is_explicit_and_normalized(monkeypatch):
+    from app.config import Settings
+
+    monkeypatch.delenv("SF_ENVIRONMENT", raising=False)
+    assert Settings().sf_environment == "unknown"
+    monkeypatch.setenv("SF_ENVIRONMENT", " PreProd ")
+    assert Settings().sf_environment == "preprod"
+    monkeypatch.setenv("SF_ENVIRONMENT", "  ")
+    assert Settings().sf_environment == "unknown"

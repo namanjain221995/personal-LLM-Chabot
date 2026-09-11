@@ -537,6 +537,12 @@ class Settings:
         self.sf_login_url: str = os.environ.get("SF_LOGIN_URL", "")
         self.sf_private_key_b64: str = os.environ.get("SF_PRIVATE_KEY_B64", "")
         self.sf_api_version: str = os.environ.get("SF_API_VERSION", "v61.0")
+        # Explicit deployment label for provenance/evaluation. Never infer
+        # this from a hostname: aliases and My Domain URLs do not reliably
+        # distinguish production, preprod and sandboxes.
+        self.sf_environment: str = (
+            os.environ.get("SF_ENVIRONMENT", "unknown").strip().lower() or "unknown"
+        )
         self.sf_live_timeout: float = float(os.environ.get("SF_LIVE_TIMEOUT", "45"))
         # _bool, not a bespoke not-in list: the old parse treated "off" (and
         # any typo) as true, silently enabling live lookups.

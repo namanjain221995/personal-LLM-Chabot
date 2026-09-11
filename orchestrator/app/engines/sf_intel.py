@@ -378,6 +378,15 @@ async def run(
         details={
             "salesforce_run_id": run_id,
             "action": decision.action,
+            # Planner-produced normalized prose is not the evaluator's
+            # categorical taxonomy. Keeping those distinct prevents a trace
+            # adapter from manufacturing an apparently correct intent label.
+            "intent": {
+                "normalized_text": decision.normalized_intent,
+                "router_action": decision.action,
+                "confidence": decision.confidence,
+                "reason_code": decision.internal_reason_code,
+            },
             "confidence": decision.confidence,
             "reason_code": decision.internal_reason_code,
             "resolved_slots": intent.resolved_slots,
@@ -750,6 +759,13 @@ async def _execute_live(
             "freshness": "live",
             "pages": result.pages,
             "truncated": result.truncated,
+        },
+        "provenance": {
+            "source": "live_salesforce_records",
+            "environment": settings.sf_environment,
+            "freshness": "live",
+            "query_timestamp": result.queried_at,
+            "objects": [result.object_api_name],
         },
         "status": {**phase.last, "phase": "completed"},
     }
