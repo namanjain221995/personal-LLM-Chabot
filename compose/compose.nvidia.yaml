@@ -43,7 +43,8 @@ services:
       --max-num-seqs ${MODEL_CONCURRENCY:-1}
       --reasoning-parser qwen3
       --enable-chunked-prefill
-      --enable-prefix-caching
+      ${MAIN_MODEL_PREFIX_CACHING_ARGUMENT:-}
+      ${MAIN_MODEL_SPECULATIVE_ARGUMENT:-}
       --tool-call-parser qwen3_xml
       --enable-auto-tool-choice
       ${MAIN_STARTUP_ARGUMENTS:-}

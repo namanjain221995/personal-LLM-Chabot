@@ -33,7 +33,7 @@ except ImportError:  # `unittest discover -s launcher/tests` imports top-level m
 
 from techsara_cli import environment
 from techsara_cli.cli import _compose_files
-from techsara_cli.cluster import ClusterDetectors
+from techsara_cli.cluster import MTP_SPECULATIVE_CONFIG, ClusterDetectors
 from techsara_cli.errors import TechSaraError
 from techsara_cli.environment import RuntimeLayout, build_generated_environment
 from techsara_cli.hardware import HardwareInfo
@@ -293,7 +293,9 @@ class ComposeOverlayValidationTests(unittest.TestCase):
         minutes into a start-up, so it is proved with Compose itself.
         """
         _profile, rendered = self._render(
-            FIXTURES["dgx-spark"], {"MAIN_MODEL_MAX_LEN": "800000"}, model_config=NESTED_CONFIG
+            FIXTURES["dgx-spark"],
+            {"MAIN_MODEL_MAX_LEN": "800000", "CLUSTER_SPECULATIVE_CONFIG": MTP_SPECULATIVE_CONFIG},
+            model_config=NESTED_CONFIG,
         )
         argv = list(rendered["services"]["vllm"]["command"])
         window = argv.index("--max-model-len")
@@ -307,17 +309,43 @@ class ComposeOverlayValidationTests(unittest.TestCase):
         self.assertEqual(parameters["original_max_position_embeddings"], 262144)
         self.assertEqual(parameters["mrope_section"], [11, 11, 10])
         self.assertTrue(parameters["mrope_interleaved"])
-        # The speculative JSON is still whole, so nothing was re-split.
+        # The speculative JSON (opted into above) is still whole, so nothing was re-split.
         self.assertEqual(
             argv[argv.index("--speculative-config") + 1],
             '{"method":"mtp","num_speculative_tokens":1}',
         )
 
-        # A window inside the native one folds the variable away completely.
+        # A window inside the native one folds the variable away completely,
+        # and so does the speculative argument when .env does not ask for it:
+        # the single-node command line carries no --speculative-config at all.
         _profile, native = self._render(FIXTURES["dgx-spark"], model_config=NESTED_CONFIG)
         native_argv = list(native["services"]["vllm"]["command"])
         self.assertNotIn("--hf-overrides", native_argv)
+        self.assertNotIn("--speculative-config", native_argv)
         self.assertEqual(native_argv[native_argv.index("--max-model-len") + 2], "--gpu-memory-utilization")
+
+    def test_prefix_caching_is_a_real_switch_on_the_single_node_command_line(self) -> None:
+        """MAIN_MODEL_ENABLE_PREFIX_CACHING decides the flag, not just a belief.
+
+        vLLM's default is ON, so 'false' has to reach the engine as the
+        explicit negation; and the orchestrator's mirror of the key is the
+        launcher's normalised value, so /health can never report a prefix
+        cache the engine does not have.
+        """
+        for fixture in ("dgx-spark", "nvidia-large"):
+            with self.subTest(fixture=fixture):
+                _profile, on = self._render(FIXTURES[fixture], model_config=NESTED_CONFIG)
+                on_argv = list(on["services"]["vllm"]["command"])
+                self.assertEqual(on_argv.count("--enable-prefix-caching"), 1)
+                self.assertNotIn("--no-enable-prefix-caching", on_argv)
+                self.assertEqual(on["services"]["orchestrator"]["environment"]["MAIN_MODEL_ENABLE_PREFIX_CACHING"], "true")
+                _profile, off = self._render(
+                    FIXTURES[fixture], {"MAIN_MODEL_ENABLE_PREFIX_CACHING": "false"}, model_config=NESTED_CONFIG
+                )
+                off_argv = list(off["services"]["vllm"]["command"])
+                self.assertEqual(off_argv.count("--no-enable-prefix-caching"), 1)
+                self.assertNotIn("--enable-prefix-caching", off_argv)
+                self.assertEqual(off["services"]["orchestrator"]["environment"]["MAIN_MODEL_ENABLE_PREFIX_CACHING"], "false")
 
     def test_an_extended_window_reaches_both_cluster_nodes_through_the_shared_engine_args(self) -> None:
         detectors = ClusterDetectors(
@@ -650,11 +678,10 @@ class ComposeOverlayValidationTests(unittest.TestCase):
         ):
             self.assertIn(flag, command)
         self.assertNotIn("--headless", argv)
-        # The speculative JSON must survive Compose's shell-style split intact.
-        self.assertEqual(
-            argv[argv.index("--speculative-config") + 1],
-            '{"method":"mtp","num_speculative_tokens":1}',
-        )
+        # Speculative decoding is opt-in: the head's command line carries no
+        # --speculative-config unless .env asks for it (see the MTP test below).
+        self.assertNotIn("--speculative-config", argv)
+        self.assertIn("--enable-prefix-caching", argv)
         self.assertEqual(vllm["environment"]["VLLM_HOST_IP"], "192.168.100.1")
         self.assertEqual(vllm["environment"]["NCCL_SOCKET_IFNAME"], "enP2p1s0f1np1")
         self.assertEqual(vllm["environment"]["NCCL_IB_HCA"], "rocep1s0f1")

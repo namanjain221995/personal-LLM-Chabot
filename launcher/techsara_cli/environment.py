@@ -19,7 +19,9 @@ from .cluster import (
     DEFAULT_TENSOR_PARALLEL_SIZE,
     ClusterDetectors,
     ClusterDiscovery,
+    prefix_caching_argument,
     resolve_cluster,
+    speculative_config_argument,
 )
 from .errors import TechSaraError
 from .model_manager import ModelInstall
@@ -180,6 +182,32 @@ def _bool(value: bool) -> str:
 
 def _truthy(value: str | None) -> bool:
     return (value or "").strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
+
+PREFIX_CACHING_KEY = "MAIN_MODEL_ENABLE_PREFIX_CACHING"
+_FALSY = {"0", "false", "no", "off", "disabled"}
+
+
+def resolve_prefix_caching(values: Mapping[str, str]) -> bool:
+    """Whether the main vLLM engine is launched with prefix caching.
+
+    Until 2026-09-11 this key was only a mirror the orchestrator's /health
+    reported as "what the app believes", while the launch flag itself was a
+    literal in three overlays; setting the key to false changed the belief
+    and nothing else. It now decides the flag (dual-mode
+    ``CLUSTER_ENGINE_ARGS`` and the single-node overlays alike) and is
+    re-emitted, normalised, into generated.env so the orchestrator's belief
+    is the launch. Unset means ON, matching vLLM's own default; a value that
+    is neither true- nor false-shaped is an error rather than a silent ON.
+    """
+    raw = str(values.get(PREFIX_CACHING_KEY, "") or "").strip().lower()
+    if not raw or raw in {"1", "true", "yes", "on", "enabled"}:
+        return True
+    if raw in _FALSY:
+        return False
+    raise TechSaraError(
+        f"{PREFIX_CACHING_KEY} must be true or false; got {values.get(PREFIX_CACHING_KEY)!r}"
+    )
 
 
 #: Sidecar KV budgets are a fraction of TOTAL device memory, so on a 122 GiB
@@ -586,6 +614,12 @@ def build_generated_environment(
     # verifies a second Spark on the dgx-spark profile only; every other host
     # resolves to single without touching the network, so its generated.env
     # gains just TECHSARA_CLUSTER_MODE/TECHSARA_CLUSTER_REASON.
+    # The two main-engine switches the overlays used to hard-code. Validated
+    # before anything is generated, like every other knob, and rendered ONCE
+    # here so the dual-mode engine string and the single-node overlays cannot
+    # disagree about them.
+    prefix_caching = resolve_prefix_caching(user_values)
+    speculative_argument = speculative_config_argument(user_values)
     cluster = resolve_cluster(
         user_values,
         profile_id=profile.hardware_profile_id,
@@ -596,6 +630,7 @@ def build_generated_environment(
         detectors=CLUSTER_DETECTORS,
         discovery=CLUSTER_DISCOVERY,
         rope_override=rope_override,
+        enable_prefix_caching=prefix_caching,
     )
     cluster_mode = cluster.mode
     cluster_values = cluster.generated()
@@ -721,6 +756,13 @@ def build_generated_environment(
             else ""
         ),
         "MAIN_STARTUP_ARGUMENTS": shlex.join(main.startup_arguments) if main else "",
+        # The prefix-caching and speculative-decoding flags for the single-node
+        # overlays (compose.dgx-spark.yaml / compose.nvidia.yaml). Always
+        # emitted so interpolation is deterministic; the orchestrator reads the
+        # normalised boolean so /health reports the launch, not a belief.
+        PREFIX_CACHING_KEY: _bool(prefix_caching),
+        "MAIN_MODEL_PREFIX_CACHING_ARGUMENT": prefix_caching_argument(prefix_caching),
+        "MAIN_MODEL_SPECULATIVE_ARGUMENT": speculative_argument,
         "MAIN_GPU_MEMORY_UTILIZATION": {"nvidia-large": "0.82", "nvidia-medium": "0.82", "nvidia-small": "0.85", "nvidia-minimal": "0.82"}.get(profile.hardware_profile_id, "0.35"),
         "VLLM_SHM_SIZE": "16g",
     }

@@ -45,8 +45,8 @@ services:
       --trust-remote-code
       ${MAIN_STARTUP_ARGUMENTS:-}
       --enable-chunked-prefill
-      --enable-prefix-caching
-      --speculative-config '{"method":"mtp","num_speculative_tokens":1}'
+      ${MAIN_MODEL_PREFIX_CACHING_ARGUMENT:-}
+      ${MAIN_MODEL_SPECULATIVE_ARGUMENT:-}
       --tool-call-parser qwen3_xml
       --enable-auto-tool-choice
       --max-num-batched-tokens 8192
