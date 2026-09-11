@@ -44,12 +44,21 @@ Proxy: traversal, encoded segments, unknown routes and methods are 404 before an
 
 ## G. End to end, real model, real renderers (isolated stack, `scripts/artifact_smoke.py`)
 
-| effort | result |
-|---|---|
-| fast, with follow-ups | brief → PDF (1 page, 14 KB) + DOCX (13 paragraphs, 1 table) in 14.3 s; "make it shorter, add a warning callout" → v2 in 9.5 s; "also as Word" → v3 in 1.8 s with no model call; CEO deck → PPTX (6 slides, 46 KB) + 6-page preview in 11.5 s; every file reopened by pypdfium2 / python-docx / python-pptx; every preview page fetched. The workbook turn and the re-run after the fixes are recorded in `.runtime/artifact-smoke-*.json`. |
-| think / max | see the re-run section appended below after the final image |
+Five runs on 2026-09-11 against the isolated stack, each on the image rebuilt from the branch at that point. What each run found is a fix with a unit test in the sections above; the run after it is the evidence the fix took.
 
-Looking at the rendered pages (not only reopening the files) is what found the blank chart slide and the missing title slide; both are now spec-level corrections with tests.
+| run | result | what it found |
+|---|---|---|
+| Fast #1 (before the security fixes) | brief PDF+DOCX 14.3 s; edit v2 9.5 s; "also as Word" v3 1.8 s (no model call); CEO deck PPTX+PDF 11.5 s; workbook | the blank chart slide and the missing title slide (spec-level relabelling, §B); bullets trimmed on five of six slides (caps in the prompt); "$59/ month" wrapping (KPI shrink) |
+| Fast #2 (security fixes) | brief, edit, convert PASS; **deck FAIL** "the layout engine reported an error"; workbook PASS | the rebuilt image resolved `weasyprint>=61` to 70.0, whose fetcher contract a plain function cannot meet; the worker's traceback never reached the log → `AssetFetcher`, the 70.0 pin, stderr logged on an error report (§C, §D) |
+| Fast #3 | brief, edit (2 pages, for "shorter"), convert, deck (7 slides) PASS; **workbook FAIL** after 188 s "did not return the document as JSON" | totals counted from 1 ("column 5 is out of range"), the repair ran to max_tokens → totals by header text, positions-from-1 shifted as a set, `finish_reason` recorded and "cut off" said; "shorter means shorter" correction; `material.json` had dropped `previous_answer` and `notes` (§B, §E) |
+| Fast #4 | brief, edit (1 page), convert, deck PASS; **workbook FAIL** "could not produce a valid document structure" | `categories: ["Plan"]` — the header where the cells belong — twice → `Sheet._charts_from_columns`; the second validation failure is now logged by field path; the first brief had invented a $49 current price, competitors at $55–65, 1,000 teams and 95% retention → `unsupported_figures` warning at every effort, reviewer hint at Think/Max, the role prompt's NUMBERS rule (§B) |
+| **Fast #5** | **PASS, all five turns**: brief PDF+DOCX 12.4 s (1 page; "Not given" where the material had no figure); edit 13.1 s (1 page, warning callout added); Word 2.2 s; CEO deck 6 slides 10.0 s with the warning `figures not in the material (derived or assumed): $10, 20.4%, 5880, 7080`; workbook 10.3 s — 5 typed columns, 3 rows, `=SUM(E2:E4)`, a bar chart over the plan names | — |
+| **Think** | **PASS, all three**: brief 282 s (outline 41 s → write → review → 4 corrections), deck 378 s (6 slides), workbook 314 s; every turn ran outline → review → correction with thinking on | before this run a probe showed the outline and review calls ending inside the reasoning block (`json_completion` sized thinking-on calls at the caller's ceiling) → the pool is sized like `stream_chat`; the stage timeout is 900 s. **Looking at the pages**: the brief's correction pass returned one KPI row on an empty page with `template_id` changed to `generic`; the deck's correction replaced its figures with `[Verified …]` placeholders and drew two zero bars → a correction is held against the draft it corrects (§B: gutted / placeholders / emptied → not applied, said on the version), the template is pinned to the request's decision, bracketed phrases are placeholders, an all-zero chart is refused, a hollow first draft is repaired once |
+| Max | see below |
+
+Measured on the DGX pair (Qwen3.6-35B-A3B-NVFP4, TP=2, chat idle): Fast ≈ 10–14 s per document (one call, thinking off); Think ≈ 280–380 s (three to four calls with thinking on at ~46 tok/s). Effort changes depth, never availability — and the deterministic checks (figures, placeholders, hollow, gutted, shorter, caps) run at every effort.
+
+Looking at the rendered pages (not only reopening the files) is what found the blank chart slide, the missing title slide, the invented figures, the gutted brief and the placeholder deck; none of them fails a schema.
 
 ## Not run
 

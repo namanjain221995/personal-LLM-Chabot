@@ -1,5 +1,80 @@
 # Changelog
 
+## Artifact Studio: a sentence in chat becomes a PDF, Word, PowerPoint or Excel file a person can open, keep, edit and download (2026-09-11)
+
+"Create a professional PDF about this", "make a Word document", "a
+PowerPoint for the CEO", "turn this into an Excel tracker", "make slide 4
+shorter", "also give me that as Word" — each is now a file, in every mode
+(Assistant and Salesforce) and at every effort. The design and the evidence
+are in `docs/artifact-studio/` (`CURRENT_STATE`, `CONTRACT`, `API`,
+`ARCHITECTURE`, `OPERATIONS`, `TEST_PLAN`).
+
+**What a turn does.** `artifacts/intent.decide` reads the resolved text
+with deterministic rules (a bounded 4,000-character prefix; the classifier
+only for one ambiguous shape, and only above Fast); `formats.decide` picks
+the kind, the formats and the template from the words (an explicit format
+wins; "best format" and "all deliverables" have a policy). The engine
+accepts a durable job BEFORE any model call (V31: `artifacts`,
+`artifact_versions`, `artifact_jobs`, idempotent on the intent id so a
+resumed turn finds its job), streams the seven fixed steps, and ends the
+turn with one sentence and ONE meta carrying `artifacts[]` — never a legacy
+`report_files` entry. The composer asks the model for CONTENT as strict
+JSON (`spec.py`: three typed bodies, one envelope, `schema_for(kind)` under
+guided decoding), never for markup, formulas, file names or links; the
+sources manifest is code-built from the material, so an injected "source"
+never reaches a page. Four deterministic renderers — WeasyPrint in-process
+with a deny-all fetcher, python-docx, python-pptx, openpyxl (totals are
+real `=SUM` formulas the renderer writes; every formula-shaped cell from
+the model becomes text) — run in a subprocess with argv, scrubbed env,
+RLIMIT_AS/CPU and killpg; every file is reopened by its own library before
+it is "made"; page images are rasterised under one PDFium lock. Files live
+at `/reports/artifacts/<user>/<artifact>/v<N>/` (owner-scoped, id-keyed,
+`os.replace` of the whole directory), edits and conversions are new
+versions with lineage, and a conversion needs no model call. The browser
+shows a card (Open and Download are different actions), a side panel with
+server-rendered pages or a sheet grid, and a Next proxy that refuses every
+path that is not on its grammar.
+
+**What effort buys.** Fast: one call, thinking off. Think: an outline, a
+content review and corrections. Max: the same plus a visual review of the
+rendered pages by the vision-capable model with one correction pass — an
+orchestrated workflow, described as exactly that. Effort never decides
+whether a file is made, and the deterministic checks run at every effort:
+placeholders (any bracketed phrase), a hollow draft, a correction that
+guts, blanks or empties the document (not applied; said on the version),
+"shorter" that came back longer, a chart of zeros, the template the words
+chose, and figures the material never gave — money, percentages, thousands,
+chart values and cells looked up in everything the model was given and
+named on the version as "not in the material (derived or assumed)".
+
+**What the five end-to-end runs found** (`TEST_PLAN.md` §G, each fix with
+a unit test): the rebuilt image resolved `weasyprint>=61` to 70.0, whose
+fetcher contract a plain function cannot meet, and the worker's traceback
+never reached the log (pinned 70.0; `AssetFetcher`; stderr logged on an
+error report); totals counted from 1 and a repair that ran 180 s to
+`max_tokens` reported as "not JSON" (totals by header text;
+`finish_reason` recorded for non-stream JSON calls); a sheet chart written
+over the header instead of the cells; `json_completion` passing a 2,500
+ceiling through with thinking on, so Think was Fast plus two minutes of
+thinking (the pool is sized like `stream_chat`; the stage timeout is 900
+s); a Fast brief that invented a $49 current price, competitors at $55–65,
+1,000 teams and 95% retention; a Think brief that came back from its review
+as one KPI row on an empty page; a Think deck whose correction replaced its
+figures with "[Verified …]" and drew two zero bars.
+
+**Security review (97 agents, 81 attacks held, 43 findings):** the one
+critical (PDFium is not thread-safe under concurrent page requests) and
+every high and medium are fixed — an open-job cap per person, the quadratic
+intent regex, a DB error leaving a job running, PPTX chart labels as
+formulas, a POST body cap on the proxy, illegal XML characters scrubbed
+before any renderer. The lows that remain are listed in the review output
+and in `TEST_PLAN.md`.
+
+**Measured** on the pair (Qwen3.6-35B-A3B-NVFP4, TP=2, chat idle): Fast
+10–14 s per document; Think 280–380 s; a conversion 2 s; the render
+subprocess 0.7–1.5 s end to end. Tests: 369 backend (offline, private
+PostgreSQL) + 133 browser for the feature; full suites green on the branch.
+
 ## MTP off on the two-node engine: faster, one crash path closed, the GDN prefill fault remains (2026-09-11)
 
 Since 28 August the TP=2 main engine had died four times mid-run, each time
