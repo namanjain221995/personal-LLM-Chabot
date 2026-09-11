@@ -202,6 +202,17 @@ services:
     deploy: *nvidia-devices
     logging: *model-logging
 
+  # EXPLICIT KV BUDGETS for the two 0.6B pooling engines. Without one, vLLM
+  # profiles "free GPU memory" at start-up, and on GB10 unified memory that is
+  # free SYSTEM memory, which moves while the main model and the router are
+  # loading beside it: on 2026-09-09 the embed engine computed a NEGATIVE KV
+  # budget three starts in a row ("Available KV cache memory: -16.18 GiB ...
+  # No available memory for the cache blocks") before the fourth start found
+  # 1.55 GiB. 2 GiB holds ~19,000 tokens for a 4,096-token window (measured
+  # 14,528 tokens at 1.55 GiB), which is more than every real batch needs and
+  # makes the start deterministic. The same lesson as the main model's
+  # --kv-cache-memory-bytes (launcher/techsara_cli/cluster.py) and the OCR
+  # engine's (compose.ocr.yaml).
   vllm-embed:
     image: nvcr.io/nvidia/vllm@sha256:654e563e727be1968487d453de0733fb074cb59adf424c779d0f9e7cfcb2b6b6
     profiles: [embeddings]
@@ -212,6 +223,7 @@ services:
       --port 30003
       --max-model-len 4096
       --gpu-memory-utilization ${EMBED_GPU_MEMORY_UTILIZATION:-0.04}
+      --kv-cache-memory-bytes ${EMBED_KV_CACHE_MEMORY_BYTES:-2147483648}
       --runner pooling
     environment:
       HF_HOME: /root/.cache/huggingface
@@ -251,6 +263,7 @@ services:
       --port 30005
       --max-model-len ${RERANKER_MAX_CONTEXT:-4096}
       --gpu-memory-utilization ${RERANKER_GPU_MEMORY_UTILIZATION:-0.04}
+      --kv-cache-memory-bytes ${RERANKER_KV_CACHE_MEMORY_BYTES:-2147483648}
       --runner pooling
       --convert classify
       --hf-overrides '{"architectures":["Qwen3ForSequenceClassification"],"classifier_from_token":["no","yes"],"is_original_qwen3_reranker":true}'
