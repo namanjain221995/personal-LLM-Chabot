@@ -55,3 +55,16 @@ trafilatura>=1.12
 # PyAV/OpenCV in-process would run on the event loop's cores; a child process
 # is bounded by `-threads` and killed on a deadline.
 webrtcvad-wheels>=2.0.14
+# Artifact Studio (2026-09-11): the Office writers behind app/artifacts/render.
+# EXACT pins, identical in requirements-dev.txt, because the files a person
+# downloads are these libraries' output and a silent minor bump changes the
+# bytes. Both are pure-Python wheels (py3-none-any) over lxml, which is
+# already here; python-pptx also pulls XlsxWriter (pure Python) for the
+# workbook embedded in a native chart. Verified downloadable for
+# manylinux2014_aarch64 on cp311 and cp312. Imported lazily only.
+python-pptx==1.0.2
+python-docx==1.1.2
+# XlsxWriter is python-pptx's transitive dependency (the workbook inside a
+# native chart); pinned so that workbook's bytes do not change under a
+# silent minor bump either. Pure Python.
+XlsxWriter==3.2.9

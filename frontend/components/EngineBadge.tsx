@@ -25,6 +25,8 @@ const ENGINE_LABEL: Record<Engine, string> = {
   clarify: 'Question',
   // 2026-09-09: a video, understood and cited by timestamp.
   video: 'Video',
+  // 2026-09-11: Artifact Studio — the answer is a generated file.
+  artifact: 'File',
 };
 
 const ENGINE_STYLE: Record<Engine, { color: string; ink: string }> = {
@@ -73,6 +75,11 @@ const ENGINE_STYLE: Record<Engine, { color: string; ink: string }> = {
   video: {
     color: 'var(--ts-engine-vision)',
     ink: 'var(--ts-engine-vision-ink)',
+  },
+  // A document the model produced, like Report — the palette says "output".
+  artifact: {
+    color: 'var(--ts-engine-report)',
+    ink: 'var(--ts-engine-report-ink)',
   },
 };
 

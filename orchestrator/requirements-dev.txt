@@ -47,4 +47,11 @@ trafilatura>=1.12
 # imports).
 webrtcvad-wheels>=2.0.14
 pillow>=10.0
+# Artifact Studio: exact, same as requirements.txt (the render tests reopen
+# real .docx/.pptx files with these libraries). WeasyPrint stays out (see
+# above); the PDF-producing render tests skip when it is absent and run for
+# real inside the :cpu image.
+python-pptx==1.0.2
+python-docx==1.1.2
+XlsxWriter==3.2.9
 pytest>=8.0

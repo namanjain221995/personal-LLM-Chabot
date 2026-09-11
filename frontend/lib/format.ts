@@ -79,6 +79,15 @@ const FILE_KIND: Record<string, { label: string; className: string }> = {
   pdf: { label: 'PDF', className: 'file-icon-pdf' },
   xlsx: { label: 'XLS', className: 'file-icon-xlsx' },
   csv: { label: 'CSV', className: 'file-icon-csv' },
+  // 2026-09-11 (Artifact Studio): decks. A .pptx used to fall through to the
+  // grey FILE badge. The tint is the Vision violet — the one identity colour
+  // no other file badge uses (report blue = DOC, danger red = PDF, Records
+  // teal = XLS/CSV) — written as arbitrary utilities so the badge lives beside
+  // its siblings without a fifth rule in globals.css.
+  pptx: {
+    label: 'PPT',
+    className: 'bg-[rgba(109,90,230,0.16)] text-[color:var(--ts-engine-vision-ink)]',
+  },
   // 2026-09-09: video transcripts and their siblings.
   srt: { label: 'SRT', className: 'file-icon-other' },
   vtt: { label: 'VTT', className: 'file-icon-other' },

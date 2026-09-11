@@ -108,6 +108,7 @@ import {
 } from '@/lib/contextMeter';
 import { isCompacting, requestCompact } from '@/lib/compact';
 import type {
+  ArtifactRef,
   ChatMessage,
   ConversationSummary,
   SelectedContext,
@@ -121,6 +122,8 @@ import { SalesforceStarterCard } from './SalesforceStarterCard';
 import { ConfirmDialog } from './ConfirmDialog';
 import { ContextMeter } from './ContextMeter';
 import { SummaryPanel } from './SummaryPanel';
+import { ArtifactPanel } from './artifacts/ArtifactPanel';
+import { artifactKey, type OpenArtifact } from './artifacts/ArtifactCards';
 import { EmptyState } from './EmptyState';
 import { Loader } from './Loader';
 import {
@@ -430,6 +433,39 @@ export function ChatApp() {
     string | null
   >(null);
 
+  /**
+   * 2026-09-11 (Artifact Studio): the generated file open in the side panel,
+   * and the card that opened it — the DOM id focus returns to on close.
+   * One panel for the whole shell, not one per row: a preview is a place the
+   * conversation is READ FROM, like the composer, and it has to survive the
+   * row that opened it scrolling away or re-rendering.
+   */
+  const [artifactPanel, setArtifactPanel] = useState<{
+    artifactId: string;
+    version: number;
+    originId: string | null;
+  } | null>(null);
+  /**
+   * Width of the panel as a share of the WORKSPACE — the row to the right of
+   * the sidebar — 30–55 %. The conversation therefore keeps at least 45 % of
+   * the same row, which is what the brief asks and what a 768 px thread
+   * column needs on a 1440 px screen to stay readable.
+   *
+   * Of the workspace, not the shell: measured against the whole shell the
+   * minimums summed to 0.95·W + 266 px (sidebar 260 + divider 6), which is
+   * wider than every real screen (1440 px: 194 px over; 1920 px: 170 px
+   * over), and `overflow-hidden` on the shell clipped exactly that much off
+   * the panel's right edge — where Close, Download and the zoom buttons sit.
+   */
+  const [artifactPanelPct, setArtifactPanelPct] = useState(50);
+  /**
+   * Where the thread was scrolled when the panel opened or closed, as a
+   * SHARE of its height. The column changes width, the text reflows, and
+   * a pixel offset then points at a different paragraph; the ratio points
+   * at roughly the same one. `bottom` is kept exactly: a reader following a
+   * live answer must still be following it after the layout change.
+   */
+  const artifactScrollRef = useRef<{ ratio: number; bottom: boolean } | null>(null);
   /** NEW-10: a file is being dragged over the conversation column. */
   const [dragActive, setDragActive] = useState(false);
   /** How many nested elements that drag is currently inside — see onDragEnter. */
@@ -437,6 +473,92 @@ export function ChatApp() {
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<ComposerHandle>(null);
+  /**
+   * The workspace row (conversation + divider + panel, NOT the sidebar) —
+   * the divider measures against it, and the panel's percentage is of it.
+   */
+  const layoutRef = useRef<HTMLDivElement>(null);
+
+  const rememberThreadScroll = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const max = el.scrollHeight - el.clientHeight;
+    artifactScrollRef.current = {
+      ratio: max > 0 ? el.scrollTop / max : 0,
+      bottom: max - el.scrollTop < 8,
+    };
+  }, []);
+
+  // Stable across renders (MessageRow is memoised on shallow props): a
+  // per-render arrow here would re-render every row on every token.
+  const openArtifact = useCallback<OpenArtifact>(
+    (ref: ArtifactRef, originId: string) => {
+      rememberThreadScroll();
+      setArtifactPanel({ artifactId: ref.artifact_id, version: ref.version, originId });
+    },
+    [rememberThreadScroll],
+  );
+  const closeArtifactPanel = useCallback(() => {
+    rememberThreadScroll();
+    setArtifactPanel(null);
+  }, [rememberThreadScroll]);
+
+  // Restore the thread's place after the column changed width — before
+  // paint, so the reader never sees the jump.
+  useIsomorphicLayoutEffect(() => {
+    const el = scrollRef.current;
+    const remembered = artifactScrollRef.current;
+    if (!el || !remembered) return;
+    artifactScrollRef.current = null;
+    const max = el.scrollHeight - el.clientHeight;
+    el.scrollTop = remembered.bottom ? el.scrollHeight : Math.round(remembered.ratio * max);
+  }, [artifactPanel]);
+
+  // A file belongs to the conversation it was made in; switching chats closes it.
+  useEffect(() => {
+    setArtifactPanel(null);
+  }, [activeId]);
+
+  /**
+   * The resizable divider, as a keyboard-operable separator (WAI-ARIA
+   * "window splitter"): arrow keys move it 2 % a step, Home/End snap to the
+   * limits, and a pointer drags it. The value is a share of the workspace
+   * row (`layoutRef`), the same box the CSS percentages resolve against, so
+   * the sidebar's width never enters the arithmetic.
+   */
+  function clampPanelPct(pct: number): number {
+    return Math.min(55, Math.max(30, Math.round(pct)));
+  }
+  function onDividerKeyDown(e: React.KeyboardEvent<HTMLDivElement>) {
+    let next: number | null = null;
+    if (e.key === 'ArrowLeft') next = artifactPanelPct + 2;
+    else if (e.key === 'ArrowRight') next = artifactPanelPct - 2;
+    else if (e.key === 'Home') next = 55;
+    else if (e.key === 'End') next = 30;
+    if (next === null) return;
+    e.preventDefault();
+    setArtifactPanelPct(clampPanelPct(next));
+  }
+  function onDividerPointerDown(e: React.PointerEvent<HTMLDivElement>) {
+    const root = layoutRef.current;
+    if (!root) return;
+    e.preventDefault();
+    const target = e.currentTarget;
+    target.setPointerCapture?.(e.pointerId);
+    const rect = root.getBoundingClientRect();
+    function onMove(ev: PointerEvent) {
+      if (rect.width <= 0) return;
+      setArtifactPanelPct(clampPanelPct(((rect.right - ev.clientX) / rect.width) * 100));
+    }
+    function onUp() {
+      target.removeEventListener('pointermove', onMove);
+      target.removeEventListener('pointerup', onUp);
+      target.removeEventListener('pointercancel', onUp);
+    }
+    target.addEventListener('pointermove', onMove);
+    target.addEventListener('pointerup', onUp);
+    target.addEventListener('pointercancel', onUp);
+  }
   /**
    * "Ask TechSara AI" (2026-09-03), in two pieces on purpose.
    *
@@ -2975,294 +3097,351 @@ export function ChatApp() {
         onNewChat={newChat}
       />
 
-      {/* NEW-10: the conversation column is the drop region — the thread, the
-          header and the composer, but deliberately NOT the sidebar, where a
-          dropped file has no meaning. The handlers ignore every drag that is
-          not carrying files, so text and link dragging is untouched. */}
-      <div
-        data-file-drop-zone
-        // CAPTURE, not bubble (NEW-10A): the region must take the event on the
-        // way down, before the <textarea> inside it applies its own default of
-        // typing dropped text into the prompt.
-        onDragEnterCapture={onDragEnter}
-        onDragOverCapture={onDragOver}
-        onDragLeaveCapture={onDragLeave}
-        onDropCapture={onDrop}
-        className="relative flex min-w-0 flex-1 flex-col"
-      >
-        {dragActive && (
-          /* Pointer-events-none: an overlay that swallowed the drag would fire
-             leave/enter against itself and strobe. It paints over the column
-             and changes no layout, so nothing behind it moves. */
-          <div className="pointer-events-none absolute inset-2 z-40 flex items-center justify-center rounded-ts border-2 border-dashed border-accent/60 bg-bg/70">
-            {/* Words, not just a colour — and mounted exactly once per drag,
-                so a screen reader hears it once rather than on every
-                dragenter the pointer generates crossing the message list. */}
-            <span
-              role="status"
-              className="rounded-full border border-accent/40 bg-surface px-4 py-2 text-sm font-medium text-ink shadow-lg"
-            >
-              Drop files to attach
-            </span>
-          </div>
-        )}
-        {/* ChatGPT-parity header: no app name, no chat title. The sidebar owns
-            its own collapse button, so this one only appears once the sidebar
-            is hidden — it is the only way back. The title stays as sr-only
-            text so screen readers still announce which chat is open. */}
-        <header className="flex h-[52px] shrink-0 items-center gap-2 px-3">
-          {!sidebarOpen && (
-            <button
-              // Closing the mobile drawer hands focus back here. The button
-              // only exists while the sidebar is closed, so the drawer cannot
-              // capture it as `document.activeElement` on the way in — it
-              // reads this ref on the way out, by which point React has
-              // re-mounted the button and re-attached it (see Sidebar).
-              ref={sidebarToggleRef}
-              type="button"
-              onClick={() => setSidebarOpen(true)}
-              aria-label="Show sidebar"
-              aria-expanded={false}
-              title="Show sidebar"
-              className="rounded-lg p-2 text-muted transition-colors duration-ts hover:bg-surface-2 hover:text-ink"
-            >
-              <IconSidebar size={17} />
-            </button>
-          )}
-          <h1 className="sr-only">{activeId ? activeTitle : APP_NAME}</h1>
-          {/* Share (2026-09-05). The header's one deliberate addition since
-              the engine badge was removed: an ACTION, not a passive label.
-              It appears only for a conversation that exists and has finished
-              saying something — sharing a half-streamed answer publishes a
-              sentence that stops mid-word — and the label collapses to the
-              icon on a phone the same way the composer's controls do
-              (Composer.tsx), because `display:none` would leave a nameless
-              button rather than a compact one. */}
-          {canShare && (
-            <button
-              type="button"
-              onClick={() => setShareOpen(true)}
-              aria-label="Share conversation"
-              title={
-                streamingHere
-                  ? 'Wait for the answer to finish'
-                  : 'Share conversation'
-              }
-              disabled={streamingHere}
-              className="ml-auto inline-flex h-8 items-center gap-1.5 rounded-lg px-2.5 text-sm text-muted transition-colors duration-ts hover:bg-surface-2 hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-bg disabled:cursor-not-allowed disabled:opacity-40"
-            >
-              <IconShare size={16} />
-              <span className="sr-only md:not-sr-only">Share</span>
-            </button>
-          )}
-        </header>
-        {shareOpen && activeId && (
-          <ShareDialog
-            conversationId={activeId}
-            title={activeTitle}
-            onClose={() => setShareOpen(false)}
-          />
-        )}
-
+      {/* 2026-09-11: the workspace row. Everything right of the sidebar —
+          the conversation, and beside it the file panel and its divider —
+          shares this box, so the panel's 30–55 % and the thread's 45 %
+          minimum are shares of the SAME width and always fit inside it
+          (see artifactPanelPct). `min-w-0` lets it shrink below its
+          content's width instead of pushing the shell into overflow. */}
+      <div ref={layoutRef} data-testid="workspace" className="flex min-w-0 flex-1">
+        {/* NEW-10: the conversation column is the drop region — the thread, the
+            header and the composer, but deliberately NOT the sidebar, where a
+            dropped file has no meaning. The handlers ignore every drag that is
+            not carrying files, so text and link dragging is untouched. */}
         <div
-          ref={scrollRef}
-          className="relative min-h-0 flex-1 overflow-y-auto"
+          data-file-drop-zone
+          // CAPTURE, not bubble (NEW-10A): the region must take the event on the
+          // way down, before the <textarea> inside it applies its own default of
+          // typing dropped text into the prompt.
+          onDragEnterCapture={onDragEnter}
+          onDragOverCapture={onDragOver}
+          onDragLeaveCapture={onDragLeave}
+          onDropCapture={onDrop}
+          className={`relative flex min-w-0 flex-1 flex-col${
+            artifactPanel ? ' min-[900px]:min-w-[45%]' : ''
+          }`}
         >
-          {fatalError ? (
-            <ChatErrorPage
-              error={fatalError}
-              onRetry={retryLastTurn}
-              // Dismiss the page only. The conversation, the failed user
-              // message and its error all stay exactly where they are, and
-              // nothing is re-sent.
-              onReturn={() => setUnreachable(false)}
-            />
-          ) : thread.length === 0 && loadingId !== null && loadingId === activeId ? (
-            /* A conversation with history that has not arrived yet. Showing
-               EmptyState here claimed it was a brand-new chat; showing the
-               previous chat's messages was worse. Neither is true — this is
-               the third state, and it says so.
-
-               `loadingId !== null` is load-bearing: a New Chat has a null
-               activeId AND a null loadingId, and `null === null` would have
-               put a spinner on the one screen that really is empty. */
-            <div
-              data-testid="conversation-loading"
-              role="status"
-              aria-live="polite"
-              className="flex h-full flex-col items-center justify-center gap-3 px-4 py-10"
-            >
-              <Loader size={28} />
-              <p className="text-sm text-muted">Loading conversation…</p>
-            </div>
-          ) : thread.length === 0 ? (
-            <EmptyState />
-          ) : (
-            <div className="mx-auto w-full max-w-thread space-y-6 px-4 py-6">
-              {thread.map((m, i) => {
-                // Only the question the thread is WAITING on is a live control;
-                // every earlier card is a record of a decision already made.
-                const card = cardState(thread, i);
-                // Stable per-id callbacks (M-08). Everything else below is
-                // either the message object itself — which `updateAssistant`
-                // leaves untouched unless it really changed — or a primitive,
-                // so a memoized row re-renders when its own turn changes and
-                // at no other time.
-                const on = rowHandlers(m.id);
-                // What this turn's SEND is doing, decided in one place from
-                // the intent, the server's answer and this tab's own work —
-                // never from "there is no stream here" (F1/F2).
-                const turnView = userTurnView(m, {
-                  isLast: i === thread.length - 1,
-                  streamingHere: isStreaming(activeId),
-                  serverBusy: Boolean(activeId && serverActive.includes(activeId)),
-                  uploadingHere:
-                    datasetUpload?.messageId === m.id &&
-                    datasetUpload.status === 'uploading',
-                  reconciling,
-                  statusUnknown,
-                  reconnect,
-                });
-                return (
-                <MessageRow
-                  key={m.id}
-                  message={m}
-                  isLast={i === thread.length - 1 && m.role === 'assistant'}
-                  turn={turnView}
-                  onStopTurn={stopStreaming}
-                  onSendWithLanded={on.onSendWithLanded}
-                  onRegenerate={on.onRegenerate}
-                  onRetry={on.onRetry}
-                  onReuseAttachment={on.onReuseAttachment}
-                  // 4C: which conversation to ask for a workbook profile or a
-                  // document's extracted text.
-                  conversationId={activeId}
-                  uploadStatus={
-                    datasetUpload?.messageId === m.id
-                      ? datasetUpload.status
-                      : null
-                  }
-                  versions={versions.get(m.id) ?? null}
-                  onSelectVersion={selectBranch}
-                  onEditStart={on.onEditStart}
-                  editing={editingMessageId === m.id}
-                  onEditCancel={on.onEditCancel}
-                  onEditSubmit={on.onEditSubmit}
-                  onShowSummary={on.onShowSummary}
-                  clarificationPending={card.pending}
-                  clarificationAnswer={card.answeredWith}
-                  onFeedback={on.onFeedback}
-                />
-                );
-              })}
+          {dragActive && (
+            /* Pointer-events-none: an overlay that swallowed the drag would fire
+               leave/enter against itself and strobe. It paints over the column
+               and changes no layout, so nothing behind it moves. */
+            <div className="pointer-events-none absolute inset-2 z-40 flex items-center justify-center rounded-ts border-2 border-dashed border-accent/60 bg-bg/70">
+              {/* Words, not just a colour — and mounted exactly once per drag,
+                  so a screen reader hears it once rather than on every
+                  dragenter the pointer generates crossing the message list. */}
+              <span
+                role="status"
+                className="rounded-full border border-accent/40 bg-surface px-4 py-2 text-sm font-medium text-ink shadow-lg"
+              >
+                Drop files to attach
+              </span>
             </div>
           )}
-          {/* NEW-25: what the two IntersectionObservers watch. It is the last
-              thing in the scroller and it is always mounted, so "is the end of
-              the conversation on screen?" is answered by the browser instead
-              of by measuring the document on every scroll event. */}
-          <div ref={bottomRef} aria-hidden className="h-px w-full" />
+          {/* ChatGPT-parity header: no app name, no chat title. The sidebar owns
+              its own collapse button, so this one only appears once the sidebar
+              is hidden — it is the only way back. The title stays as sr-only
+              text so screen readers still announce which chat is open. */}
+          <header className="flex h-[52px] shrink-0 items-center gap-2 px-3">
+            {!sidebarOpen && (
+              <button
+                // Closing the mobile drawer hands focus back here. The button
+                // only exists while the sidebar is closed, so the drawer cannot
+                // capture it as `document.activeElement` on the way in — it
+                // reads this ref on the way out, by which point React has
+                // re-mounted the button and re-attached it (see Sidebar).
+                ref={sidebarToggleRef}
+                type="button"
+                onClick={() => setSidebarOpen(true)}
+                aria-label="Show sidebar"
+                aria-expanded={false}
+                title="Show sidebar"
+                className="rounded-lg p-2 text-muted transition-colors duration-ts hover:bg-surface-2 hover:text-ink"
+              >
+                <IconSidebar size={17} />
+              </button>
+            )}
+            <h1 className="sr-only">{activeId ? activeTitle : APP_NAME}</h1>
+            {/* Share (2026-09-05). The header's one deliberate addition since
+                the engine badge was removed: an ACTION, not a passive label.
+                It appears only for a conversation that exists and has finished
+                saying something — sharing a half-streamed answer publishes a
+                sentence that stops mid-word — and the label collapses to the
+                icon on a phone the same way the composer's controls do
+                (Composer.tsx), because `display:none` would leave a nameless
+                button rather than a compact one. */}
+            {canShare && (
+              <button
+                type="button"
+                onClick={() => setShareOpen(true)}
+                aria-label="Share conversation"
+                title={
+                  streamingHere
+                    ? 'Wait for the answer to finish'
+                    : 'Share conversation'
+                }
+                disabled={streamingHere}
+                className="ml-auto inline-flex h-8 items-center gap-1.5 rounded-lg px-2.5 text-sm text-muted transition-colors duration-ts hover:bg-surface-2 hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-bg disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                <IconShare size={16} />
+                <span className="sr-only md:not-sr-only">Share</span>
+              </button>
+            )}
+          </header>
+          {shareOpen && activeId && (
+            <ShareDialog
+              conversationId={activeId}
+              title={activeTitle}
+              onClose={() => setShareOpen(false)}
+            />
+          )}
+
+          <div
+            ref={scrollRef}
+            className="relative min-h-0 flex-1 overflow-y-auto"
+          >
+            {fatalError ? (
+              <ChatErrorPage
+                error={fatalError}
+                onRetry={retryLastTurn}
+                // Dismiss the page only. The conversation, the failed user
+                // message and its error all stay exactly where they are, and
+                // nothing is re-sent.
+                onReturn={() => setUnreachable(false)}
+              />
+            ) : thread.length === 0 && loadingId !== null && loadingId === activeId ? (
+              /* A conversation with history that has not arrived yet. Showing
+                 EmptyState here claimed it was a brand-new chat; showing the
+                 previous chat's messages was worse. Neither is true — this is
+                 the third state, and it says so.
+
+                 `loadingId !== null` is load-bearing: a New Chat has a null
+                 activeId AND a null loadingId, and `null === null` would have
+                 put a spinner on the one screen that really is empty. */
+              <div
+                data-testid="conversation-loading"
+                role="status"
+                aria-live="polite"
+                className="flex h-full flex-col items-center justify-center gap-3 px-4 py-10"
+              >
+                <Loader size={28} />
+                <p className="text-sm text-muted">Loading conversation…</p>
+              </div>
+            ) : thread.length === 0 ? (
+              <EmptyState />
+            ) : (
+              <div className="mx-auto w-full max-w-thread space-y-6 px-4 py-6">
+                {thread.map((m, i) => {
+                  // Only the question the thread is WAITING on is a live control;
+                  // every earlier card is a record of a decision already made.
+                  const card = cardState(thread, i);
+                  // Stable per-id callbacks (M-08). Everything else below is
+                  // either the message object itself — which `updateAssistant`
+                  // leaves untouched unless it really changed — or a primitive,
+                  // so a memoized row re-renders when its own turn changes and
+                  // at no other time.
+                  const on = rowHandlers(m.id);
+                  // What this turn's SEND is doing, decided in one place from
+                  // the intent, the server's answer and this tab's own work —
+                  // never from "there is no stream here" (F1/F2).
+                  const turnView = userTurnView(m, {
+                    isLast: i === thread.length - 1,
+                    streamingHere: isStreaming(activeId),
+                    serverBusy: Boolean(activeId && serverActive.includes(activeId)),
+                    uploadingHere:
+                      datasetUpload?.messageId === m.id &&
+                      datasetUpload.status === 'uploading',
+                    reconciling,
+                    statusUnknown,
+                    reconnect,
+                  });
+                  return (
+                  <MessageRow
+                    key={m.id}
+                    message={m}
+                    isLast={i === thread.length - 1 && m.role === 'assistant'}
+                    turn={turnView}
+                    onStopTurn={stopStreaming}
+                    onSendWithLanded={on.onSendWithLanded}
+                    onRegenerate={on.onRegenerate}
+                    onRetry={on.onRetry}
+                    onReuseAttachment={on.onReuseAttachment}
+                    // 4C: which conversation to ask for a workbook profile or a
+                    // document's extracted text.
+                    conversationId={activeId}
+                    uploadStatus={
+                      datasetUpload?.messageId === m.id
+                        ? datasetUpload.status
+                        : null
+                    }
+                    versions={versions.get(m.id) ?? null}
+                    onSelectVersion={selectBranch}
+                    onEditStart={on.onEditStart}
+                    editing={editingMessageId === m.id}
+                    onEditCancel={on.onEditCancel}
+                    onEditSubmit={on.onEditSubmit}
+                    onShowSummary={on.onShowSummary}
+                    clarificationPending={card.pending}
+                    clarificationAnswer={card.answeredWith}
+                    onFeedback={on.onFeedback}
+                    onOpenArtifact={openArtifact}
+                    activeArtifactKey={
+                      artifactPanel
+                        ? artifactKey(artifactPanel.artifactId, artifactPanel.version)
+                        : null
+                    }
+                  />
+                  );
+                })}
+              </div>
+            )}
+            {/* NEW-25: what the two IntersectionObservers watch. It is the last
+                thing in the scroller and it is always mounted, so "is the end of
+                the conversation on screen?" is answered by the browser instead
+                of by measuring the document on every scroll event. */}
+            <div ref={bottomRef} aria-hidden className="h-px w-full" />
+          </div>
+
+          {!atBottom && thread.length > 0 && (
+            <div className="pointer-events-none relative">
+              <button
+                type="button"
+                onClick={() => scrollToBottom(true)}
+                className="pointer-events-auto absolute -top-12 left-1/2 z-10 inline-flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-border bg-surface px-3.5 py-1.5 text-xs font-medium shadow-lg transition-colors duration-ts hover:bg-surface-2"
+              >
+                Jump to latest
+                <IconArrowDown size={13} />
+              </button>
+            </div>
+          )}
+
+          {/* The floating action. Fixed-positioned against the viewport, so it
+              lives here rather than inside the scroller — a child of the
+              scrolling column would be clipped by its overflow. */}
+          <SelectionAsk
+            candidate={selectionCandidate}
+            onCandidateChange={setSelectionCandidate}
+            onAsk={(candidate) => {
+              setSelectedContext(candidate.context);
+              selectedContextRef.current = candidate.context;
+              setSelectionCandidate(null);
+              // The next thing the user does is type the follow-up.
+              composerRef.current?.focus();
+            }}
+          />
+
+          <Composer
+            ref={composerRef}
+            streaming={streaming}
+            features={features}
+            disabled={reconciling}
+            // H-01: a dataset upload blocks a second send without pretending a
+            // generation is running — that is what `streaming` would claim.
+            busy={datasetUpload?.status === 'uploading'}
+            onDraftChange={handleDraftChange}
+            meter={
+              <ContextMeter
+                // The last reading the SERVER measured, plus the live draft —
+                // never adjusted by anything the browser assumes a compaction
+                // saved. If the value is stale it is stale honestly; a made-up
+                // smaller number is worse than an old true one.
+                view={meterView(latestUsage(thread), draft)}
+                compacting={compacting}
+                onCompactNow={compactNow}
+                compactDisabled={!activeId || streaming}
+                foldableTurns={foldableTurns}
+                onOpenChange={handleMeterOpenChange}
+              />
+            }
+            prefs={prefs}
+            onPrefsChange={updatePrefs}
+            onSend={sendFromComposer}
+            onStop={stopStreaming}
+            selectedContext={selectedContext}
+            onClearSelectedContext={() => {
+              setSelectedContext(null);
+              selectedContextRef.current = null;
+            }}
+            uploadConversationId={activeId}
+            clarificationPlaceholder={
+              customAnswerFor?.custom_placeholder ??
+              (pending ? pending.custom_placeholder : undefined)
+            }
+            clarification={
+              // The LIVE question, and only while it is live. It renders inside
+              // the composer's own container rather than in the transcript: it
+              // is a temporary control, not a message, so it must stay at the
+              // bottom of a conversation of any length, must not scroll away
+              // while it is being answered, and must leave nothing behind.
+              pending ? (
+                <ClarificationCard
+                  request={pending}
+                  submitting={
+                    submittingClarificationId === pending.clarification_id
+                  }
+                  onSubmit={answerClarification}
+                  onUseComposer={(seed) => answerInComposer(pending, seed)}
+                  onSkip={() => skipClarification(pending)}
+                />
+              ) : null
+            }
+            starter={
+              shouldShowStarter({
+                salesforceEnabled: prefs.salesforce,
+                messageCount: thread.length,
+                streaming,
+                hasPendingClarification: Boolean(pending),
+                optionCount: starterOptions.length,
+              }) ? (
+                <SalesforceStarterCard
+                  options={starterOptions}
+                  onPick={(prompt) => void send(prompt, [])}
+                  onUseComposer={() => composerRef.current?.focus()}
+                />
+              ) : null
+            }
+          />
         </div>
 
-        {!atBottom && thread.length > 0 && (
-          <div className="pointer-events-none relative">
-            <button
-              type="button"
-              onClick={() => scrollToBottom(true)}
-              className="pointer-events-auto absolute -top-12 left-1/2 z-10 inline-flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-border bg-surface px-3.5 py-1.5 text-xs font-medium shadow-lg transition-colors duration-ts hover:bg-surface-2"
-            >
-              Jump to latest
-              <IconArrowDown size={13} />
-            </button>
-          </div>
-        )}
+        {/* 2026-09-11: the generated-file panel. Under 900 px the panel is a
+            fixed full-screen sheet and this wrapper has no box at all
+            (`contents`), so the basis below only ever applies beside the
+            thread. The divider is desktop-only for the same reason.
 
-        {/* The floating action. Fixed-positioned against the viewport, so it
-            lives here rather than inside the scroller — a child of the
-            scrolling column would be clipped by its overflow. */}
-        <SelectionAsk
-          candidate={selectionCandidate}
-          onCandidateChange={setSelectionCandidate}
-          onAsk={(candidate) => {
-            setSelectedContext(candidate.context);
-            selectedContextRef.current = candidate.context;
-            setSelectionCandidate(null);
-            // The next thing the user does is type the follow-up.
-            composerRef.current?.focus();
-          }}
-        />
-
-        <Composer
-          ref={composerRef}
-          streaming={streaming}
-          features={features}
-          disabled={reconciling}
-          // H-01: a dataset upload blocks a second send without pretending a
-          // generation is running — that is what `streaming` would claim.
-          busy={datasetUpload?.status === 'uploading'}
-          onDraftChange={handleDraftChange}
-          meter={
-            <ContextMeter
-              // The last reading the SERVER measured, plus the live draft —
-              // never adjusted by anything the browser assumes a compaction
-              // saved. If the value is stale it is stale honestly; a made-up
-              // smaller number is worse than an old true one.
-              view={meterView(latestUsage(thread), draft)}
-              compacting={compacting}
-              onCompactNow={compactNow}
-              compactDisabled={!activeId || streaming}
-              foldableTurns={foldableTurns}
-              onOpenChange={handleMeterOpenChange}
+            `flex-basis`, and NO `shrink-0`: the percentage is the panel's
+            size when everything fits — which, measured against the workspace
+            row, it always does — and if a box ever cannot fit the panel
+            yields rather than being clipped by the shell's overflow-hidden. */}
+        {artifactPanel && (
+          <>
+            <div
+              role="separator"
+              aria-orientation="vertical"
+              aria-label="Resize the file panel"
+              aria-valuenow={artifactPanelPct}
+              aria-valuemin={30}
+              aria-valuemax={55}
+              tabIndex={0}
+              onKeyDown={onDividerKeyDown}
+              onPointerDown={onDividerPointerDown}
+              className="hidden w-1.5 shrink-0 cursor-col-resize touch-none bg-border transition-colors duration-ts hover:bg-accent/60 focus:outline-none focus-visible:bg-accent min-[900px]:block"
             />
-          }
-          prefs={prefs}
-          onPrefsChange={updatePrefs}
-          onSend={sendFromComposer}
-          onStop={stopStreaming}
-          selectedContext={selectedContext}
-          onClearSelectedContext={() => {
-            setSelectedContext(null);
-            selectedContextRef.current = null;
-          }}
-          uploadConversationId={activeId}
-          clarificationPlaceholder={
-            customAnswerFor?.custom_placeholder ??
-            (pending ? pending.custom_placeholder : undefined)
-          }
-          clarification={
-            // The LIVE question, and only while it is live. It renders inside
-            // the composer's own container rather than in the transcript: it
-            // is a temporary control, not a message, so it must stay at the
-            // bottom of a conversation of any length, must not scroll away
-            // while it is being answered, and must leave nothing behind.
-            pending ? (
-              <ClarificationCard
-                request={pending}
-                submitting={
-                  submittingClarificationId === pending.clarification_id
-                }
-                onSubmit={answerClarification}
-                onUseComposer={(seed) => answerInComposer(pending, seed)}
-                onSkip={() => skipClarification(pending)}
+            <div
+              data-testid="artifact-panel-column"
+              className="contents min-[900px]:block min-[900px]:h-full min-[900px]:min-w-0"
+              style={{ flexBasis: `${artifactPanelPct}%` }}
+            >
+              <ArtifactPanel
+                // A different file is a fresh panel: state, focus and fetches
+                // all start over rather than being patched across.
+                key={artifactKey(artifactPanel.artifactId, artifactPanel.version)}
+                artifactId={artifactPanel.artifactId}
+                version={artifactPanel.version}
+                originId={artifactPanel.originId}
+                onClose={closeArtifactPanel}
               />
-            ) : null
-          }
-          starter={
-            shouldShowStarter({
-              salesforceEnabled: prefs.salesforce,
-              messageCount: thread.length,
-              streaming,
-              hasPendingClarification: Boolean(pending),
-              optionCount: starterOptions.length,
-            }) ? (
-              <SalesforceStarterCard
-                options={starterOptions}
-                onPick={(prompt) => void send(prompt, [])}
-                onUseComposer={() => composerRef.current?.focus()}
-              />
-            ) : null
-          }
-        />
+            </div>
+          </>
+        )}
       </div>
     </div>
   );

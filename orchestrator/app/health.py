@@ -447,6 +447,16 @@ def _publish_work_gauges(work: dict) -> None:
         "chat_requests_interrupted", work.get("chat_requests_interrupted", 0),
         "Chat requests a restart left interrupted and unresumed.",
     )
+    artifacts = work.get("artifacts") or {}
+    for state in ("queued", "running"):
+        metrics.set_gauge(
+            "artifact_queue_depth", artifacts.get(state, 0),
+            "Artifact jobs by pipeline state.", state=state,
+        )
+    metrics.set_gauge(
+        "artifact_oldest_queued_age_seconds", artifacts.get("oldest_queued_age_s", 0),
+        "Seconds the oldest QUEUED artifact job has waited for a worker.",
+    )
 
 
 def _read_work() -> dict:
@@ -487,12 +497,22 @@ def _read_work() -> dict:
             "SELECT count(*) AS n FROM chat_requests WHERE status = 'interrupted'"
         ).fetchone()
         interrupted = int(row["n"])
+    # V31 artifact jobs: the one aggregate here that HAS an accessor
+    # (artifacts.db.work_snapshot — counts only, same idx_artifact_jobs_open
+    # partial index). `oldest_queued_age_s` is the number an operator wants
+    # when a person says "it has been 'queued' for ten minutes": the queue
+    # drains one job at a time, so an old queued row means the worker is
+    # busy or gone, not that the job is slow.
+    from .artifacts import db as artifacts_db  # lazy, same reason as db
+
+    artifacts = artifacts_db.work_snapshot()
     return {
         "status": "ok",
         "live_generations": _live_generation_count(),
         "video": video,
         "uploads": uploads,
         "chat_requests_interrupted": interrupted,
+        "artifacts": artifacts,
     }
 
 
@@ -521,6 +541,58 @@ def _check_work() -> dict:
                 pass
         _work_cache = (_time.monotonic(), work)
         return work
+
+
+def _check_artifacts() -> dict:
+    """The Artifact Studio's dependencies: can this process write under the
+    reports volume, and which renderers the render package says it can run.
+    Blocking (a mkstemp on the volume); callers run it in a thread.
+
+    ADDITIVE, never `status`: a missing PPTX library or a read-only volume
+    means "no decks today", not an unavailable chat service — and the
+    container healthcheck gates on `status`. The render package reports its
+    own availability through `capabilities()`; it is imported lazily and
+    tolerated absent (the package ships separately from the job runner and
+    tests import this module without it).
+    """
+    if not settings.artifacts_enabled:
+        return {"status": "disabled", "detail": "disabled by configuration", "renderers": {}, "volume_writable": False}
+    from .artifacts import store  # lazy: settings-bound paths
+
+    try:
+        writable = bool(store.volume_writable())
+    except Exception as exc:  # noqa: BLE001 — a check never raises
+        writable = False
+        volume_detail = f"{type(exc).__name__}: {str(exc)[:120]}"
+    else:
+        volume_detail = "" if writable else "the artifacts directory under REPORTS_DIR is not writable"
+    renderers: dict = {}
+    render_detail = ""
+    try:
+        from .artifacts.render import capabilities  # lazy: python-docx/pptx/weasyprint live behind it
+
+        caps = capabilities()
+        renderers = dict(caps) if isinstance(caps, dict) else {}
+    except ImportError as exc:
+        render_detail = f"render package unavailable: {str(exc)[:120]}"
+    except Exception as exc:  # noqa: BLE001
+        render_detail = f"{type(exc).__name__}: {str(exc)[:120]}"
+    ok_renderers = all(
+        (isinstance(v, dict) and v.get("status", "ok") == "ok") or v is True or v == "ok"
+        for v in renderers.values()
+    ) if renderers else False
+    out: dict = {
+        "status": "ok" if writable and ok_renderers else "degraded",
+        "renderers": renderers,
+        "volume_writable": writable,
+        "free_mb": store.free_space_mb(),
+    }
+    detail = "; ".join(d for d in (volume_detail, render_detail) if d)
+    if detail:
+        out["detail"] = detail
+    elif not ok_renderers:
+        out["detail"] = "one or more renderers are unavailable"
+    return out
 
 
 async def probe_context_window(client: httpx.AsyncClient) -> dict:
@@ -627,6 +699,7 @@ async def check_dependencies() -> dict:
             probe_context_window(client),
             asyncio.to_thread(_check_web_index),
             asyncio.to_thread(_check_work),
+            asyncio.to_thread(_check_artifacts),
         )
     required_count = len(vllm_targets)
     checks: Dict[str, dict] = {
@@ -641,6 +714,7 @@ async def check_dependencies() -> dict:
     context_result = results[required_count + 5]
     web_index_result = results[required_count + 6]
     work_result = results[required_count + 7]
+    artifacts_result = results[required_count + 8]
 
     endpoint_results = {
         url: checks[name] for name, url in vllm_targets
@@ -727,6 +801,9 @@ async def check_dependencies() -> dict:
     # all. It is what this box is currently doing — live generations, the
     # video queue, open upload sessions, chat requests a restart interrupted —
     # and being busy is never an outage. See `_check_work`.
+    # `artifacts` (V31) is additive like `web_index`: the document renderers
+    # and the reports volume are a feature's dependencies, not the chat
+    # service's, and a missing deck library is "no decks", not an outage.
     return {
         "status": overall,
         "checks": checks,
@@ -735,4 +812,5 @@ async def check_dependencies() -> dict:
         "context": context_result,
         "web_index": web_index_result,
         "work": work_result,
+        "artifacts": artifacts_result,
     }
