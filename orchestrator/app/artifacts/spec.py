@@ -278,6 +278,26 @@ class Slide(_Strict):
     def _bullet_text(cls, v: List[str]) -> List[str]:
         return [_clip(i, 220) for i in v if (i or "").strip()]
 
+    @model_validator(mode="after")
+    def _layout_follows_content(self) -> "Slide":
+        """A slide declared `bullets` that carries a chart and no bullets IS
+        a chart slide; the first real run (2026-09-11) had the model put
+        `bullets` on every slide, and the one with the revenue chart came
+        out blank because the renderer drew the layout it was told. The
+        content decides where the declaration does not use it."""
+        if self.layout == "bullets" and not self.bullets:
+            if self.chart is not None:
+                self.layout = "chart"
+            elif self.table is not None:
+                self.layout = "table"
+            elif self.kpis:
+                self.layout = "kpis"
+            elif self.steps:
+                self.layout = "timeline"
+            elif self.left or self.right:
+                self.layout = "two_column"
+        return self
+
 
 class PresentationSpec(_Strict):
     title: str = Field(min_length=1, max_length=120)
@@ -294,6 +314,18 @@ class PresentationSpec(_Strict):
 
     @model_validator(mode="after")
     def _shape(self) -> "PresentationSpec":
+        # Relabelled, never invented: a first slide with a title and nothing
+        # else IS the title slide whatever it was called, and a last slide
+        # titled like a closing is one. A deck the model wrote without a
+        # title slide is rendered as written — the composer's prompt asks
+        # for one; adding a slide here would be content the model did not
+        # write.
+        first = self.slides[0]
+        if first.layout == "bullets" and not first.bullets and first.chart is None and first.table is None and not first.kpis:
+            first.layout = "title"
+        last = self.slides[-1]
+        if len(self.slides) > 1 and last.layout == "bullets" and re.match(r"^(closing|thank you|thanks|questions|next steps|summary|q\s*&\s*a)\b", last.title.strip().lower() or ""):
+            last.layout = "closing"
         _check_source_refs(self.slides, self.sources)
         for s in self.slides:
             if s.chart is not None:

@@ -169,6 +169,33 @@ def test_a_presentation_validates_its_slides():
         S.parse_body("presentation", {**pres, "slides": [{"layout": "hologram", "title": "x"}]})
 
 
+def test_a_slide_s_layout_follows_its_content_and_a_deck_opens_and_closes():
+    """The first real run: every slide declared `bullets`; the one carrying
+    the chart rendered blank and there was no title slide."""
+    pres = {
+        "title": "Pricing", "subtitle": "FY27", "template_id": "ceo",
+        "slides": [
+            {"layout": "bullets", "title": "Executive Summary", "bullets": ["a", "b"]},
+            {"layout": "bullets", "title": "Revenue", "chart": {"type": "bar", "categories": ["old", "new"], "series": [{"name": "MRR", "values": [5880, 7080]}]}},
+            {"layout": "bullets", "title": "Plans", "table": {"columns": ["Plan", "Price"], "rows": [["Team", 59]]}},
+            {"layout": "bullets", "title": "Numbers", "kpis": [{"label": "ARR", "value": "$1M"}]},
+            {"layout": "bullets", "title": "Closing", "bullets": ["Thank you"]},
+        ],
+    }
+    spec = S.parse_body("presentation", pres)
+    layouts = [s.layout for s in spec.body.slides]
+    assert layouts == ["bullets", "chart", "table", "kpis", "closing"], "relabelled from content; nothing inserted"
+    # A first slide that is only a title is the title slide whatever it was called.
+    pres["slides"].insert(0, {"layout": "bullets", "title": "Pricing", "subtitle": "FY27"})
+    spec = S.parse_body("presentation", pres)
+    assert [s.layout for s in spec.body.slides][:3] == ["title", "bullets", "chart"]
+    # A slide that already declares its layout is left alone.
+    pres["slides"][2]["layout"] = "two_column"
+    pres["slides"][2]["left"] = ["x"]
+    spec = S.parse_body("presentation", pres)
+    assert spec.body.slides[2].layout == "two_column"
+
+
 def test_a_workbook_never_takes_a_formula_from_the_model():
     wb = {
         "title": "Budget", "template_id": "tracker",

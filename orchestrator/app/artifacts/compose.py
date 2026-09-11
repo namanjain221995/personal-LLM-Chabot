@@ -155,11 +155,13 @@ _KIND_GUIDE = {
         "Do not repeat the same content in two blocks."
     ),
     "presentation": (
-        "Write a slide deck: a title slide, then slides with ONE idea each, "
-        "at most six short bullets per slide (under 15 words each), a chart "
-        "slide when numbers compare, a table slide for a small table, a kpis "
-        "slide for headline numbers, a section slide to change topic, a "
-        "closing slide. Speaker notes carry the detail that does not fit on "
+        "Write a slide deck. Use the layouts: the first slide has layout "
+        "'title' (title and subtitle only); a slide whose content is a chart "
+        "has layout 'chart' and its data in `chart` (no bullets); a small "
+        "table is layout 'table'; headline numbers are layout 'kpis'; a "
+        "topic change is layout 'section'; the last slide is layout 'closing'. "
+        "Every other slide is 'bullets' with ONE idea and short bullets (under "
+        "15 words each). Speaker notes carry the detail that does not fit on "
         "the slide."
     ),
     "workbook": (

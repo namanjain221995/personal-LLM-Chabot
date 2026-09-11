@@ -93,7 +93,10 @@ nav.toc a::after { content: leader(".") target-counter(attr(href), page); color:
 /* -------------------------------------------------------------- kpis -- */
 .kpis { display: flex; gap: 8pt; margin: 6pt 0 12pt 0; page-break-inside: avoid; }
 .kpi { flex: 1 1 0; background: var(--surface); border-top: 2.5pt solid var(--accent); padding: 8pt 10pt; }
-.kpi .kpi-value { font-size: var(--kpi-pt); font-weight: bold; color: var(--navy); line-height: 1.1; }
+.kpi .kpi-value { font-size: var(--kpi-pt); font-weight: bold; color: var(--navy); line-height: 1.1; overflow-wrap: normal; word-break: keep-all; hyphens: none; }
+/* A long value shrinks by length (html._kpi_size_class) rather than wrapping inside a token. */
+.kpi .kpi-value.kpi-sm { font-size: calc(var(--kpi-pt) * 0.72); }
+.kpi .kpi-value.kpi-xs { font-size: calc(var(--kpi-pt) * 0.52); line-height: 1.15; }
 .kpi .kpi-label { font-size: var(--small-pt); color: var(--ink-muted); margin-top: 3pt; text-transform: uppercase; letter-spacing: 0.05em; }
 .kpi .kpi-note { font-size: var(--caption-pt); color: var(--ink-faint); margin-top: 2pt; }
 
@@ -168,7 +171,9 @@ body.tpl-training .slide ul.bullets > li::before { content: counter(tb); backgro
 
 .slide .kpi-row { display: flex; gap: 0.3in; margin-top: 0.7in; align-items: flex-start; }
 .slide .kpi-box { flex: 1 1 0; background: var(--surface); border-top: 5pt solid var(--accent); padding: 0.5in 0.3in; text-align: center; min-height: 2.4in; }
-.slide .kpi-box .v { font-size: var(--slide-kpi-pt); font-weight: bold; color: var(--navy); line-height: 1.05; }
+.slide .kpi-box .v { font-size: var(--slide-kpi-pt); font-weight: bold; color: var(--navy); line-height: 1.05; overflow-wrap: normal; word-break: keep-all; hyphens: none; }
+.slide .kpi-box .v.kpi-sm { font-size: calc(var(--slide-kpi-pt) * 0.72); }
+.slide .kpi-box .v.kpi-xs { font-size: calc(var(--slide-kpi-pt) * 0.5); line-height: 1.15; }
 .slide .kpi-box .l { font-size: var(--slide-kpi-label-pt); color: var(--ink-muted); margin-top: 0.15in; text-transform: uppercase; letter-spacing: 0.06em; }
 .slide .kpi-box .n { font-size: calc(var(--slide-kpi-label-pt) - 2pt); color: var(--ink-faint); margin-top: 0.1in; }
 

@@ -41,6 +41,20 @@ e = _html.escape
 _ASSETS_DIR = Path(__file__).resolve().parent / "assets"
 
 
+
+def _kpi_size_class(value: str) -> str:
+    """A KPI value is a big number; a long one ("$59/month", "Existing Team
+    Subscribers") must shrink, not wrap mid-token ("$59/" over "month" —
+    seen on the first real brief, 2026-09-11). The step is by length;
+    print.css sets the sizes and forbids breaking inside the value."""
+    n = len(value or "")
+    if n > 18:
+        return " kpi-xs"
+    if n > 10:
+        return " kpi-sm"
+    return ""
+
+
 def print_css() -> str:
     """The first-party stylesheet, read from assets/print.css."""
     return (_ASSETS_DIR / "print.css").read_text(encoding="utf-8")
@@ -475,7 +489,7 @@ def _chart_html(chart: S.Chart, ordinal: int, index: Dict[str, int]) -> str:
 
 def _kpis_html(row: S.KPIRow) -> str:
     items = "".join(
-        f'<div class="kpi"><div class="kpi-value">{e(k.value)}</div><div class="kpi-label">{e(k.label)}</div>'
+        f'<div class="kpi"><div class="kpi-value{_kpi_size_class(k.value)}">{e(k.value)}</div><div class="kpi-label">{e(k.label)}</div>'
         + (f'<div class="kpi-note">{e(k.note)}</div>' if k.note else "") + "</div>"
         for k in row.items
     )
@@ -714,7 +728,7 @@ def _slide_body_html(s: PlannedSlide, plan: DeckPlan) -> str:
         return _table_html(s.table, index)
     if s.layout == "kpis":
         boxes = "".join(
-            f'<div class="kpi-box"><div class="v">{e(k.value)}</div><div class="l">{e(k.label)}</div>'
+            f'<div class="kpi-box"><div class="v{_kpi_size_class(k.value)}">{e(k.value)}</div><div class="l">{e(k.label)}</div>'
             + (f'<div class="n">{e(k.note)}</div>' if k.note else "") + "</div>"
             for k in s.kpis
         )
