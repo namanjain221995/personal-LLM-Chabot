@@ -350,6 +350,24 @@ class Settings:
         # is visual ("read the code on the slide"). ~525 tokens per 896 px
         # frame on this model.
         self.video_answer_frames: int = _int("VIDEO_ANSWER_FRAMES", 3)
+        # WHICH FILES ARE OFFERED FOR DOWNLOAD. The pipeline keeps writing
+        # all seven formats into the analysis directory — they are content-
+        # addressed, cost nothing to keep, and widening this setting must not
+        # require re-analysing the video — but only these kinds are copied
+        # per user and advertised on the answer. The default is one file
+        # because seven was not a result, it was a menu: four of the seven
+        # are the same words (txt, srt, vtt, json) and every card is named
+        # after the source video, so an answer ended in a grid of near-
+        # identical rows the reader had to decode by file extension.
+        # Kind names are the pipeline's (`transcript_txt`, `transcript_srt`,
+        # `transcript_vtt`, `transcript_json`, `screen_text_txt`,
+        # `screen_text_json`, `summary_md`); `all` restores every one, an
+        # unknown name is ignored, and an empty value means the default.
+        self.video_artifact_kinds: tuple[str, ...] = tuple(
+            kind.strip()
+            for kind in (os.environ.get("VIDEO_ARTIFACT_KINDS", "").strip() or "transcript_vtt").split(",")
+            if kind.strip()
+        )
         # Housekeeping: analyses no conversation refers to any more are
         # deleted after this grace period (a re-upload inside it is free).
         self.video_orphan_ttl_hours: int = _int("VIDEO_ORPHAN_TTL_HOURS", 72)

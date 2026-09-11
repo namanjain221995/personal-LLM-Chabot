@@ -21,6 +21,11 @@ checks the first surviving segment of the later clip against the tail of
 the earlier one textually, because Whisper's timestamps at a clip boundary
 drift by up to a second.
 
+LOOPS. After stitching, `loops.collapse` removes what the decoder repeated
+rather than heard — a phrase cycling inside one cue, or one cue emitted
+dozens of times over a few seconds. 17.9% of a real 2h23m transcript was
+that (2026-09-11); the module has the measurement.
+
 A BUSY ENGINE IS NOT A FAILED VIDEO. `ASRBusy` (the batch pool's queue wait
 ran out) and `ASRUnavailable` (both engines standing down after a 5xx) are
 about the engine at this instant, not about this clip, so a clip that meets
@@ -44,6 +49,7 @@ import time
 from typing import Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
 
 from ..config import settings
+from . import loops
 from .types import Segment
 from .vad import SAMPLE_RATE, Window, plan_windows
 
@@ -373,6 +379,20 @@ async def transcribe_audio(
     pieces: List[Tuple[Window, List[Segment]]] = [(windows[i], results[i]) for i in sorted(results)]
     engine_ms, failures, paced_s = tally["engine_ms"], tally["failures"], tally["paced_s"]
     segments = stitch(pieces)
+    # AND THEN THE LOOPS COME OUT. A Whisper decoder that loses its place
+    # repeats itself — 434 copies of "no" inside one cue, "I am a" as 85 cues
+    # in sixteen seconds — and none of it was said. See video/loops.py for the
+    # measurement and for why this is a post-processing step rather than a
+    # decoder setting. It runs after `stitch` so a seam's duplicate is already
+    # gone and the timeline is monotonic.
+    segments, loop_report = loops.collapse(segments)
+    if loop_report["chars_removed"] or loop_report["cue_runs_merged"]:
+        log.info(
+            "repetition loops removed: %d cue(s) merged from %d run(s), %d character(s)",
+            loop_report["cues_before"] - loop_report["cues_after"],
+            loop_report["cue_runs_merged"],
+            loop_report["chars_removed"],
+        )
     language = dominant_language(segments)
     report = {
         **report,
@@ -383,6 +403,7 @@ async def transcribe_audio(
         "paced_s": round(paced_s, 1),
         "segments": len(segments),
         "chars": sum(len(s.text) for s in segments),
+        "loops": loop_report,
         "wall_s": round(time.perf_counter() - started, 2),
     }
     return segments, language, report

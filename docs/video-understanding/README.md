@@ -76,12 +76,25 @@ records `main+router`.
           │ audio ── ffmpeg → 16 kHz PCM     │ │ frames ── ffmpeg scene+floor → pHash │
           │ transcript ── VAD windows →      │ │ ocr ── Unlimited-OCR, 4-wide          │
           │   whisper, 2 clips in flight,    │ │ vision ── router captions, 3-wide     │
-          │   one per Spark                  │ │                                       │
+          │   one per Spark → stitch →       │ │                                       │
+          │   loops.collapse                 │ │                                       │
           └──────────────────────────────────┘ └───────────────────────────────────────┘
        fusion ── main model, direct ≤60k tokens else map-reduce         understanding.json
         index ── embed → LanceDB /data/lancedb-video (video_chunks)
-    artifacts ── txt/srt/vtt/json/md                                    artifacts/
+    artifacts ── txt/srt/vtt/json/md written; VIDEO_ARTIFACT_KINDS       artifacts/
+                 (default: the .vtt) says which are offered
 ```
+
+**Repetition loops.** Whisper's decoder loses its place and repeats itself
+— on a real 2h23m Gujarati/Hindi/English meeting (2026-09-11) that was
+"no" 434 times inside one cue, "I am a" as 85 cues in sixteen seconds,
+17.9 % of the transcript's characters in all. `video/loops.py` collapses
+a phrase repeated three or more times back to back down to two, and a run
+of three or more identical cues into one cue spanning the run; the stage
+detail says what it removed. It is post-processing on purpose: the decoder
+recipe that is usually reached for was measured and rejected on this
+deployment (compose/whisper/server.py), and a loop is exact and cheap to
+recognise from its output whatever produced it.
 
 The two branches run at the same time: speech on the Sparks' whisper
 engines (two clips in flight, one per node), screen on the OCR and router
@@ -91,8 +104,13 @@ with 8 threads.
 Every stage writes its file, then stamps itself done on the row. A crash,
 a restart, or the same file uploaded next week resumes at the first stage
 without a file. The row also carries the `PIPELINE_VERSION` it was produced
-with: after a bump, the next attach of that file re-runs every stage rather
-than serving a result the fix never reached. `video_attachments` says which
+with: after a bump, the next attach of that file re-runs the stages the bump
+changed rather than serving a result the fix never reached. `_RERUN_FOR` in
+pipeline.py names them per version; a bump it does not describe re-runs
+everything. v3 (loops) re-runs transcript → fusion → index → artifacts and
+keeps speech and screen from disk — the transcript stage repairs its own
+file in milliseconds instead of asking whisper for the recording again.
+`video_attachments` says which
 conversations may see which analysis; nothing in the index is reachable
 without that join.
 

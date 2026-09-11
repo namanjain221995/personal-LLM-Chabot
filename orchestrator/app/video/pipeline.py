@@ -42,7 +42,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from .. import db, metrics
 from ..config import settings
 from . import artifacts as art
-from . import store
+from . import loops, store
 from .types import STAGES, STAGE_TITLES, OcrSpan, Segment, Understanding
 
 log = logging.getLogger(__name__)
@@ -70,12 +70,43 @@ _DONE = "_done"
 #:   1  first cut (2026-09-09)
 #:   2  windows go to the engine with its 30-s silence gate off (a 12-s
 #:      clip with a quiet lead-in came back empty)
-PIPELINE_VERSION = 2
+#:   3  repetition loops are collapsed out of the transcript (video/loops.py:
+#:      17.9% of a real 2h23m transcript was the decoder repeating itself).
+#:      Scoped: see `_RERUN_FOR` — the engines are not asked again.
+PIPELINE_VERSION = 3
+
+#: WHAT A BUMP INVALIDATES, when that is known precisely. A stale row re-runs
+#: the stages named for every version between its own and this one and keeps
+#: the rest from disk; a row from a version with no entry here re-runs
+#: everything, which is the safe reading of "I do not know what changed".
+#: v3 changed how the transcript is CLEANED, not what the engines heard or
+#: saw: whisper, OCR and the captions would produce the same files again, and
+#: for a two-hour recording that is forty minutes of two GPUs to fix text.
+_RERUN_FOR: Dict[int, Tuple[str, ...]] = {
+    3: ("transcript", "fusion", "index", "artifacts"),
+}
+
+#: The engine's transcript has meant the same thing since this version: a
+#: `transcript.json` written by v2 or later is the engine's own words with
+#: the loops still in, and the transcript stage may REPAIR it in place rather
+#: than transcribe again. A future bump that changes what the engine is asked
+#: (a different model, a different window plan) moves this forward.
+_TRANSCRIPT_ENGINE_SINCE = 2
 
 
 def is_current(row: dict) -> bool:
     """True when this row's results came from the code that is running."""
     return int(row.get("pipeline_version") or 1) >= PIPELINE_VERSION
+
+
+def stages_to_rerun(old_version: int) -> Optional[set]:
+    """The stages a row from `old_version` must run again, or None for all."""
+    needed: set = set()
+    for version in range(old_version + 1, PIPELINE_VERSION + 1):
+        if version not in _RERUN_FOR:
+            return None
+        needed.update(_RERUN_FOR[version])
+    return needed
 
 #: Answers "is somebody chatting right now?" — installed by main.py at
 #: startup, because this module must not import main. None = never busy.
@@ -130,6 +161,10 @@ class _Ctx:
     row: dict
     content_hash: str
     source: str
+    #: The pipeline version the row's files on disk were written by. Equal to
+    #: PIPELINE_VERSION on a fresh run; lower on a scoped re-run, where a
+    #: stage may decide to repair its old file instead of recomputing it.
+    from_version: int = PIPELINE_VERSION
     probe: Optional[dict] = None
     segments: Optional[List[Segment]] = None
     language: Optional[str] = None
@@ -439,6 +474,7 @@ async def _run(analysis_id: int) -> None:
 
 async def _run_stages(analysis_id: int, row: dict) -> None:
     """The stages against one row — under a lease this process holds."""
+    old_version = int(row.get("pipeline_version") or 1)
     stale = not is_current(row)
     content_hash = row["content_hash"]
     source = store.source_path(content_hash)
@@ -446,6 +482,24 @@ async def _run_stages(analysis_id: int, row: dict) -> None:
         await _finish(analysis_id, "failed", "the uploaded file is no longer on disk; please attach it again")
         return
     started = time.perf_counter()
+    # A stale row keeps its source; what else it keeps is what the version
+    # bump said it could. `_RERUN_FOR` names the stages a bump changed, and
+    # those (only) are dropped from the row's stage map, so the runner's
+    # cache check runs them again and serves the rest from disk. A bump with
+    # no entry drops everything: the old outputs are exactly what it said
+    # not to trust.
+    stages: Dict[str, dict] = dict(row.get("stages") or {})
+    counts: Dict[str, Any] = dict(row.get("counts") or {})
+    if stale:
+        rerun = stages_to_rerun(old_version)
+        if rerun is None:
+            stages, counts = {}, {}
+        else:
+            stages = {name: state for name, state in stages.items() if name not in rerun}
+            log.info(
+                "video analysis %d: v%d -> v%d re-runs %s and keeps %s",
+                analysis_id, old_version, PIPELINE_VERSION, ", ".join(sorted(rerun)), ", ".join(sorted(stages)) or "nothing",
+            )
     await db.run_in_thread(
         db.update_video_analysis,
         analysis_id,
@@ -454,13 +508,9 @@ async def _run_stages(analysis_id: int, row: dict) -> None:
         attempt=int(row.get("attempt") or 0) + 1,
         started_at=db.now(),
         pipeline_version=PIPELINE_VERSION,
-        **({"stages": {}, "counts": {}} if stale else {}),
+        **({"stages": dict(stages), "counts": dict(counts)} if stale else {}),
     )
-    # A stale row keeps its source and nothing else: every stage re-runs
-    # and overwrites its file, because the old outputs are exactly what
-    # the version bump said not to trust.
-    ctx = _Ctx(row=row, content_hash=content_hash, source=source, counts={} if stale else dict(row.get("counts") or {}))
-    stages: Dict[str, dict] = {} if stale else dict(row.get("stages") or {})
+    ctx = _Ctx(row=row, content_hash=content_hash, source=source, from_version=old_version, counts=counts)
     runner = _Runner(analysis_id, ctx, stages)
 
     failure = await runner.chain(_PRELUDE)
@@ -561,7 +611,24 @@ async def _stage_audio(ctx: _Ctx, progress) -> _StageResult:
     return _StageResult("done", f"{art.fmt_ts(samples / 16000)} of audio")
 
 
+def _reusable_transcript(ctx: _Ctx) -> Optional[Tuple[List[Segment], Optional[str], dict]]:
+    """The stored transcript, when this run may repair it instead of
+    transcribing again: this is a version upgrade, the row's files come from
+    a version whose engine output means the same thing as today's
+    (`_TRANSCRIPT_ENGINE_SINCE`), and the file is there with words in it.
+    None means ask the engine — which a current row always does."""
+    if not _TRANSCRIPT_ENGINE_SINCE <= ctx.from_version < PIPELINE_VERSION:
+        return None
+    data = store.read_json(store.stage_path(ctx.content_hash, "transcript.json")) or {}
+    raw = data.get("segments") or []
+    if not raw:
+        return None
+    segments = [Segment.from_json(s) for s in raw]
+    return segments, (data.get("language") or None), dict(data.get("report") or {})
+
+
 async def _stage_transcript(ctx: _Ctx, progress) -> _StageResult:
+    from . import transcribe as transcribe_mod
     from .transcribe import transcribe_audio
 
     probe = ctx.load_probe()
@@ -575,14 +642,31 @@ async def _stage_transcript(ctx: _Ctx, progress) -> _StageResult:
         ctx.segments, ctx.language, ctx.speech_fraction = [], None, None
         return _StageResult("skipped", "speech-to-text is not enabled on this deployment")
     duration = float(probe.get("duration_s") or 0.0)
-    segments, language, report = await transcribe_audio(
-        wav,
-        total_s=duration,
-        progress=progress,
-        max_window_s=min(settings.video_asr_window_s, settings.asr_max_audio_seconds - 5),
-        max_gap_s=settings.video_asr_max_gap_s,
-        overlap_s=settings.video_asr_overlap_s,
-    )
+    repaired_in_place = _reusable_transcript(ctx)
+    if repaired_in_place is not None:
+        # A scoped re-run (v2 -> v3): the engine's words are already on disk
+        # and only the loops are new. Collapsing them takes milliseconds;
+        # asking whisper again would take the recording's length.
+        raw_segments, language, old_report = repaired_in_place
+        await progress(50.0, "repairing the stored transcript")
+        segments, loop_report = loops.collapse(raw_segments)
+        language = transcribe_mod.dominant_language(segments) or language
+        report = {
+            **old_report,
+            "segments": len(segments),
+            "chars": sum(len(s.text) for s in segments),
+            "loops": loop_report,
+            "repaired_from_version": ctx.from_version,
+        }
+    else:
+        segments, language, report = await transcribe_audio(
+            wav,
+            total_s=duration,
+            progress=progress,
+            max_window_s=min(settings.video_asr_window_s, settings.asr_max_audio_seconds - 5),
+            max_gap_s=settings.video_asr_max_gap_s,
+            overlap_s=settings.video_asr_overlap_s,
+        )
     store.write_json(
         store.stage_path(ctx.content_hash, "transcript.json"),
         {"language": language, "segments": [s.to_json() for s in segments], "report": report},
@@ -597,7 +681,12 @@ async def _stage_transcript(ctx: _Ctx, progress) -> _StageResult:
     })
     if not segments:
         return _StageResult("done", f"no speech detected ({report.get('detector')}, {100 * float(report.get('speech_fraction') or 0):.0f}% speech)", {"language": None})
-    return _StageResult("done", f"{len(segments)} segments · {report.get('windows_done')} clip(s) · {language or 'language unknown'}", {"language": language})
+    detail = f"{len(segments)} segments · {report.get('windows_done')} clip(s) · {language or 'language unknown'}"
+    # A transcript repaired in silence is a transcript nobody can audit.
+    repaired = loops.describe(report.get("loops") or {})
+    if repaired:
+        detail += f" · {repaired}"
+    return _StageResult("done", detail, {"language": language})
 
 
 async def _stage_frames(ctx: _Ctx, progress) -> _StageResult:

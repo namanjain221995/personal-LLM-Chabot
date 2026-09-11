@@ -26,8 +26,20 @@ export function FileCards({ files }: { files: ReportFile[] }) {
                 {kind.label}
               </span>
               <span className="min-w-0 flex-1">
-                <span className="block truncate text-sm font-medium text-ink">
-                  {f.filename}
+                {/*
+                 * Truncated from the LEFT, not the right. These names are
+                 * `<source video>-<hash>-u<id>.transcript.vtt`, and a video
+                 * the person's phone named after a UUID gives every card the
+                 * same 36 leading characters — a plain `truncate` cut off the
+                 * only part that differed. `rtl` scrolls the ellipsis to the
+                 * front; `dir` on the inner span keeps the characters
+                 * themselves in reading order.
+                 */}
+                <span
+                  className="block truncate text-left text-sm font-medium text-ink [direction:rtl]"
+                  title={f.filename}
+                >
+                  <span dir="ltr">{f.filename}</span>
                 </span>
                 <span className="block text-xs text-muted">
                   {f.type.toUpperCase()}
