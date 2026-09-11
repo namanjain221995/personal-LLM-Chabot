@@ -50,7 +50,23 @@ DEFAULT_GPU_MEMORY_UTILIZATION = "0.30"
 GPU_MEMORY_UTILIZATION_RANGE = (0.05, 0.95)
 DEFAULT_NCCL_DEBUG = "INFO"
 NCCL_DEBUG_LEVELS = ("VERSION", "WARN", "INFO", "TRACE")
-DEFAULT_SPECULATIVE_CONFIG = '{"method":"mtp","num_speculative_tokens":1}'
+#: The MTP draft this checkpoint ships (``Qwen3_5MoeMTP``), as the value
+#: ``CLUSTER_SPECULATIVE_CONFIG`` takes to turn speculative decoding ON.
+MTP_SPECULATIVE_CONFIG = '{"method":"mtp","num_speculative_tokens":1}'
+#: Speculative decoding is OFF unless .env asks for it. Until 2026-09-11 the
+#: default was the MTP draft above. It was withdrawn during the GDN fault
+#: investigation (docs/ISSUE/), and it stays off for two measured reasons:
+#: without spec-decode this vLLM build (0.26.1rc1.dev77) keeps FULL CUDA
+#: graphs for decode instead of downgrading to PIECEWISE, and single-stream
+#: decode went from 69 to 101 tok/s (docs/CLUSTER.md, "Engine tuning"); and
+#: the draft's mixed spec/non-spec batches were one path into the build's
+#: GDN `misaligned address` fault. That fault is NOT closed by this switch --
+#: the same day's soak reproduced it in the GDN prefill kernel on an ordinary
+#: mixed prefill+decode batch (docs/ISSUE/gdn-spec-decode-remediation-
+#: 2026-09-11.md, section 1.1); the durable fix is a vLLM build with the
+#: later GDN kernel fixes. Setting the key to MTP_SPECULATIVE_CONFIG opts
+#: back in; the launcher never does it silently.
+DEFAULT_SPECULATIVE_CONFIG = ""
 DEFAULT_MAX_NUM_BATCHED_TOKENS = 8192
 # Explicit per-node KV budget. On GB10 unified memory "free GPU memory" is free
 # system memory and moves while vLLM profiles (page cache from the weight read
@@ -457,11 +473,8 @@ def _nccl_debug(values: Mapping[str, str]) -> str:
 
 
 def _speculative_config(values: Mapping[str, str]) -> str:
-    """Compact JSON for ``--speculative-config``; empty string disables it."""
-    if "CLUSTER_SPECULATIVE_CONFIG" not in values:
-        raw = DEFAULT_SPECULATIVE_CONFIG
-    else:
-        raw = _raw(values, "CLUSTER_SPECULATIVE_CONFIG")
+    """Compact JSON for ``--speculative-config``; empty (or absent) disables it."""
+    raw = _raw(values, "CLUSTER_SPECULATIVE_CONFIG") or DEFAULT_SPECULATIVE_CONFIG
     if not raw:
         return ""
     try:
@@ -469,13 +482,40 @@ def _speculative_config(values: Mapping[str, str]) -> str:
     except ValueError as exc:
         raise TechSaraError(
             "CLUSTER_SPECULATIVE_CONFIG must be a JSON object such as "
-            f'{DEFAULT_SPECULATIVE_CONFIG} or empty to disable speculative decoding; got {raw!r}'
+            f'{MTP_SPECULATIVE_CONFIG} or empty to disable speculative decoding; got {raw!r}'
         ) from exc
     if not isinstance(parsed, dict) or not parsed:
         raise TechSaraError(
             "CLUSTER_SPECULATIVE_CONFIG must be a non-empty JSON object or empty to disable speculative decoding"
         )
     return json.dumps(parsed, separators=(",", ":"))
+
+
+def speculative_config_argument(values: Mapping[str, str]) -> str:
+    """The rendered ``--speculative-config '<json>'`` segment, or ``""``.
+
+    One validator for both deployment shapes: the dual-mode
+    ``CLUSTER_ENGINE_ARGS`` string and the single-node overlay's
+    ``MAIN_MODEL_SPECULATIVE_ARGUMENT`` are built from this same function, so
+    the GDN fault above cannot come back on one path while the other is
+    guarded. Single-quoted so Compose's shell-style split keeps the JSON as
+    one argv element.
+    """
+    config = _speculative_config(values)
+    return f"--speculative-config '{config}'" if config else ""
+
+
+def prefix_caching_argument(enabled: bool) -> str:
+    """``--enable-prefix-caching`` or its explicit negation.
+
+    vLLM's own default depends on the model: ON for a dense model, OFF
+    (opt-in "while the feature matures") for a hybrid-Mamba one such as the
+    Qwen3.6-35B-A3B, where the engine labels prefix caching experimental
+    (``mamba_cache_mode=align``). Merely omitting the flag would therefore
+    mean different things on different profiles, so the launcher always
+    states the choice explicitly and the running command line shows it.
+    """
+    return "--enable-prefix-caching" if enabled else "--no-enable-prefix-caching"
 
 
 def _identifier(values: Mapping[str, str], name: str) -> str:
@@ -512,6 +552,7 @@ def build_engine_arguments(
     master_port: int,
     kv_cache_memory_gib: int = DEFAULT_KV_CACHE_MEMORY_GIB,
     rope_override: str = "",
+    enable_prefix_caching: bool = True,
 ) -> str:
     """The single-line, shell-splittable engine argument string.
 
@@ -531,7 +572,7 @@ def build_engine_arguments(
         "--trust-remote-code",
         shlex.join(list(startup_arguments)),
         "--enable-chunked-prefill",
-        "--enable-prefix-caching",
+        prefix_caching_argument(enable_prefix_caching),
         f"--speculative-config '{speculative_config}'" if speculative_config else "",
         f"--max-num-batched-tokens {int(max_num_batched_tokens)}",
         f"--tensor-parallel-size {int(tensor_parallel_size)}",
@@ -555,6 +596,7 @@ def resolve_cluster_settings(
     vllm_port: int,
     detectors: ClusterDetectors = DEFAULT_DETECTORS,
     rope_override: str = "",
+    enable_prefix_caching: bool = True,
 ) -> dict[str, str]:
     """Validate the user's ``CLUSTER_*`` keys and derive the generated ones.
 
@@ -638,6 +680,7 @@ def resolve_cluster_settings(
         master_port=master_port,
         kv_cache_memory_gib=kv_cache_gib,
         rope_override=rope_override,
+        enable_prefix_caching=enable_prefix_caching,
     )
     return {
         "CLUSTER_HEAD_IP": head_ip,
@@ -693,6 +736,7 @@ def resolve_cluster(
     detectors: ClusterDetectors = DEFAULT_DETECTORS,
     discovery: ClusterDiscovery = DEFAULT_DISCOVERY,
     rope_override: str = "",
+    enable_prefix_caching: bool = True,
 ) -> ClusterResolution:
     """Turn ``CLUSTER_MODE`` (auto|single|dual) into an effective mode.
 
@@ -745,6 +789,7 @@ def resolve_cluster(
         vllm_port=vllm_port,
         detectors=detectors,
         rope_override=rope_override,
+        enable_prefix_caching=enable_prefix_caching,
     )
     worker_ip = settings["CLUSTER_WORKER_IP"]
     ssh_target = _ssh_target(user_values) or discovery.worker_ssh(worker_ip)

@@ -33,6 +33,19 @@ from . import context, metrics
 from .config import settings
 from .context import clip_message_contents
 from .model_capabilities import ModelCapabilities, ReasoningField
+from .resilience import ModelUnavailable, resilient  # noqa: F401 — re-exported for callers
+
+# ---------------------------------------------------------------------------
+# OUTAGE TOLERANCE. Every model call below opens through
+# `resilience.resilient`, which waits for /health and retries through the
+# recoverable failures a restarting engine produces (connection refused, a
+# 5xx from a dying engine) and re-raises everything else untouched — a 4xx,
+# a read timeout, a cancellation. For streams only the OPEN is wrapped: once
+# a token has been forwarded a re-open would duplicate text. The window is
+# short for a person watching a chat and long for a background job; see
+# app/resilience.py for the two windows and the measured outage that sized
+# them.
+# ---------------------------------------------------------------------------
 
 log = logging.getLogger(__name__)
 
@@ -163,14 +176,25 @@ async def _open_stream(client, request: dict):
     outage — so the first refusal drops the option for the whole process and
     the request is retried exactly as it would have been sent before.
     """
+    base_url = str(getattr(client, "base_url", "") or settings.openai_base_url)
     if not _ASK_FOR_USAGE["enabled"]:
         request.pop("stream_options", None)
-        return await client.chat.completions.create(**request)
+        return await resilient(
+            lambda: client.chat.completions.create(**request), what="stream", base_url=base_url,
+        )
     ask = dict(request)
     ask["stream_options"] = {"include_usage": True}
     try:
-        return await client.chat.completions.create(**ask)
-    except Exception as exc:  # noqa: BLE001 — any refusal, not just 400
+        return await resilient(
+            lambda: client.chat.completions.create(**ask), what="stream", base_url=base_url,
+        )
+    except _bad_request_error() as exc:
+        # ONLY a 400 is "the server does not know this option". Until
+        # 2026-09-11 this caught every exception, so the first streamed call
+        # during an engine outage (a connection error) permanently switched
+        # token telemetry off for the process and mis-reported the outage as
+        # a refused option. A transport error now propagates as itself, and
+        # the resilient wrapper above has already waited on it.
         if not _ASK_FOR_USAGE["enabled"]:
             raise
         _ASK_FOR_USAGE["enabled"] = False
@@ -180,7 +204,16 @@ async def _open_stream(client, request: dict):
             type(exc).__name__, exc,
         )
         request.pop("stream_options", None)
-        return await client.chat.completions.create(**request)
+        return await resilient(
+            lambda: client.chat.completions.create(**request), what="stream", base_url=base_url,
+        )
+
+
+def _bad_request_error():
+    """openai.BadRequestError, imported lazily like the client itself."""
+    from openai import BadRequestError
+
+    return BadRequestError
 
 # Local inference servers: the key is a placeholder, never a real secret.
 LOCAL_API_KEY = "local-no-key"
@@ -328,7 +361,10 @@ async def chat_completion(
     if extra_body is not None:
         request["extra_body"] = extra_body
     reset_finish_reason()
-    resp = await client.chat.completions.create(**request)
+    resp = await resilient(
+        lambda: client.chat.completions.create(**request),
+        what="chat_completion", base_url=settings.openai_base_url,
+    )
     _capture_usage(resp)
     _capture_finish(resp)
     _, content = split_reasoning(resp.choices[0].message, settings.main_capabilities)
@@ -381,7 +417,10 @@ async def chat_completion_with_reasoning(
         # in a repetition loop dies at the wall clock instead of holding the
         # whole best-of-N gather hostage.
         resp = await _asyncio.wait_for(
-            client.chat.completions.create(**request),
+            resilient(
+                lambda: client.chat.completions.create(**request),
+                what="chat_completion_with_reasoning", base_url=settings.openai_base_url,
+            ),
             timeout=settings.gen_wall_clock_s,
         )
     except _asyncio.TimeoutError:
@@ -895,7 +934,10 @@ async def chat_with_tools(
     if extra_body is not None:
         request["extra_body"] = extra_body
     reset_finish_reason()
-    resp = await client.chat.completions.create(**request)
+    resp = await resilient(
+        lambda: client.chat.completions.create(**request),
+        what="chat_with_tools", base_url=settings.openai_base_url,
+    )
     _capture_usage(resp)
     _capture_finish(resp)
     message = resp.choices[0].message
@@ -951,19 +993,28 @@ async def json_completion(
             },
         }
         try:
-            resp = await client.chat.completions.create(**guided)
+            resp = await resilient(
+                lambda: client.chat.completions.create(**guided),
+                what="json_completion", base_url=settings.openai_base_url,
+            )
             return resp.choices[0].message.content or ""
-        except Exception as exc:  # noqa: BLE001 — downgrade, never fail here
-            import logging
-
-            logging.getLogger(__name__).info(
+        except _bad_request_error() as exc:
+            # A 400 is the documented "this backend has no guided decoding"
+            # shape and the ONLY one that should downgrade. This used to
+            # catch every exception, so during an engine outage each call
+            # logged a misleading "guided JSON unavailable" and immediately
+            # re-sent an unconstrained request into the same dead port.
+            log.info(
                 "guided JSON unavailable on this backend (%s: %s); retrying "
                 "unconstrained",
                 type(exc).__name__,
                 str(exc)[:160],
             )
 
-    resp = await client.chat.completions.create(**base)
+    resp = await resilient(
+        lambda: client.chat.completions.create(**base),
+        what="json_completion", base_url=settings.openai_base_url,
+    )
     return resp.choices[0].message.content or ""
 
 
@@ -1004,7 +1055,10 @@ async def router_chat_completion(
     extra_body = reasoning_extra_body(settings.router_capabilities, False)
     if extra_body is not None:
         request["extra_body"] = extra_body
-    resp = await client.chat.completions.create(**request)
+    resp = await resilient(
+        lambda: client.chat.completions.create(**request),
+        what="router_chat_completion", base_url=settings.router_base_url,
+    )
     return resp.choices[0].message.content or ""
 
 
@@ -1062,10 +1116,18 @@ async def embed_texts(
     client = _client(settings.embed_base_url, read_timeout=read)
     cap = settings.embed_input_char_cap
     started = time.perf_counter()
+    # A query embedding is on the chat path with its own few-second budget
+    # (embed_query fails soft to EmbedUnavailable), so it gets ONE attempt;
+    # an index/backfill batch is background work and may wait out a restart
+    # of the embedding sidecar.
+    recovery = 0.0 if kind == "query" else None
     try:
-        resp = await client.embeddings.create(
-            model=model or settings.embed_model,
-            input=[t[:cap] for t in texts],
+        resp = await resilient(
+            lambda: client.embeddings.create(
+                model=model or settings.embed_model,
+                input=[t[:cap] for t in texts],
+            ),
+            what=f"embed_{kind}", base_url=settings.embed_base_url, recovery_s=recovery,
         )
     except Exception:
         metrics.inc("embed_requests_total", outcome="error", kind=kind)

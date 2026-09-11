@@ -72,8 +72,10 @@ services:
     # Engine-aware, self-healing health. /v1/models is answered by the API
     # server even when the engine behind it is dead (observed 2026-08-25:
     # worker gone, head "healthy", every completion hung). What actually
-    # happens when the worker disappears: after --distributed-timeout-seconds
-    # (300 s) the cross-node RPC times out, the engine is marked dead and the
+    # happens when the worker disappears: after VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS
+    # (an environment default of 300 s inside vLLM - NOT --distributed-timeout-
+    # seconds, which only bounds torch.distributed init/collectives) the
+    # cross-node RPC times out, the engine is marked dead and the
     # API server closes its listener - but the process does not exit, so
     # `restart: unless-stopped` never fires. Hence:
     #   * /health 200                      -> healthy

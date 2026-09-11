@@ -20,6 +20,7 @@ except ImportError:  # `unittest discover -s launcher/tests` imports top-level m
 from techsara_cli.cluster import (
     DEFAULT_DETECTORS,
     DEFAULT_DISCOVERY,
+    MTP_SPECULATIVE_CONFIG,
     ClusterDetectors,
     ClusterLink,
     WorkerPreflight,
@@ -32,10 +33,12 @@ from techsara_cli.cluster import (
     discover_cluster_peer,
     discover_peer_ip,
     mirror_address,
+    prefix_caching_argument,
     preflight_worker,
     resolve_cluster,
     resolve_cluster_mode,
     resolve_cluster_settings,
+    speculative_config_argument,
 )
 from techsara_cli.errors import TechSaraError
 
@@ -127,7 +130,10 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(values["CLUSTER_NCCL_SOCKET_IFNAME"], "enP2p1s0f1np1")
         self.assertEqual(values["CLUSTER_NCCL_IB_HCA"], "rocep1s0f1")
         self.assertEqual(values["CLUSTER_API_BIND_ADDRESS"], "172.17.0.1")
-        self.assertIn("--speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":1}'", values["CLUSTER_ENGINE_ARGS"])
+        # Speculative decoding is opt-in since 2026-09-11 (the GDN spec-decode
+        # fault, docs/ISSUE/gdn-spec-decode-fault-report.md): absent key, no flag.
+        self.assertNotIn("--speculative-config", values["CLUSTER_ENGINE_ARGS"])
+        self.assertIn("--enable-prefix-caching", values["CLUSTER_ENGINE_ARGS"])
         self.assertIn("--max-num-batched-tokens 8192", values["CLUSTER_ENGINE_ARGS"])
         self.assertEqual(
             set(values),
@@ -209,12 +215,22 @@ class ValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(TechSaraError, "CLUSTER_NCCL_DEBUG"):
             resolve(dual(CLUSTER_NCCL_DEBUG="DEBUG"))
 
-    def test_speculative_config_defaults_disables_on_empty_and_requires_a_json_object(self) -> None:
-        default = resolve(dual())["CLUSTER_ENGINE_ARGS"]
-        self.assertIn("--speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":1}'", default)
-        disabled = resolve(dual(CLUSTER_SPECULATIVE_CONFIG=""))["CLUSTER_ENGINE_ARGS"]
-        self.assertNotIn("--speculative-config", disabled)
-        self.assertIn("--enable-prefix-caching --max-num-batched-tokens 8192", disabled)
+    def test_speculative_config_is_off_unless_asked_for_and_requires_a_json_object(self) -> None:
+        """Absent and empty both mean OFF; the flag must not exist at all.
+
+        The default flipped on 2026-09-11: on the pinned build the MTP draft
+        drives the Qwen GDN layer into a branch that faults with `misaligned
+        address` on mixed batches and takes both ranks down for 9-15 minutes
+        (docs/ISSUE/gdn-spec-decode-fault-report.md). Opting back in is an
+        explicit JSON object in .env, never a launcher default.
+        """
+        for values in (dual(), dual(CLUSTER_SPECULATIVE_CONFIG=""), dual(CLUSTER_SPECULATIVE_CONFIG="   ")):
+            engine = resolve(values)["CLUSTER_ENGINE_ARGS"]
+            self.assertNotIn("--speculative-config", engine)
+            self.assertNotIn("mtp", engine)
+            self.assertIn("--enable-prefix-caching --max-num-batched-tokens 8192", engine)
+        enabled = resolve(dual(CLUSTER_SPECULATIVE_CONFIG=MTP_SPECULATIVE_CONFIG))["CLUSTER_ENGINE_ARGS"]
+        self.assertIn("--speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":1}'", enabled)
         custom = resolve(dual(CLUSTER_SPECULATIVE_CONFIG='{"method": "mtp", "num_speculative_tokens": 2}'))
         self.assertIn(
             "--speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":2}'",
@@ -282,7 +298,7 @@ class EngineArgumentTests(unittest.TestCase):
             "--max-model-len 131072 --gpu-memory-utilization 0.30 --kv-cache-memory-bytes 17179869184 "
             "--kv-cache-dtype fp8 --trust-remote-code "
             "--quantization modelopt --attention-backend flashinfer --enable-chunked-prefill "
-            "--enable-prefix-caching --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":1}' "
+            "--enable-prefix-caching "
             "--max-num-batched-tokens 8192 --tensor-parallel-size 2 --pipeline-parallel-size 1 "
             "--distributed-executor-backend mp --nnodes 2 --master-addr 192.168.100.1 --master-port 29501 "
             "--distributed-timeout-seconds 300",
@@ -331,7 +347,7 @@ class EngineArgumentTests(unittest.TestCase):
         )
 
     def test_engine_arguments_are_shell_splittable_with_json_as_one_element(self) -> None:
-        values = resolve(dual())
+        values = resolve(dual(CLUSTER_SPECULATIVE_CONFIG=MTP_SPECULATIVE_CONFIG))
         argv = shlex.split(values["CLUSTER_ENGINE_ARGS"])
         self.assertIn('{"method":"mtp","num_speculative_tokens":1}', argv)
         self.assertEqual(argv[argv.index("--speculative-config") + 1], '{"method":"mtp","num_speculative_tokens":1}')
@@ -355,6 +371,41 @@ class EngineArgumentTests(unittest.TestCase):
         self.assertNotIn("  ", rendered)
         self.assertIn("--trust-remote-code --enable-chunked-prefill --enable-prefix-caching --max-num-batched-tokens 512", rendered)
         self.assertNotIn("--speculative-config", rendered)
+
+    def test_prefix_caching_is_stated_explicitly_in_both_directions(self) -> None:
+        """vLLM defaults prefix caching ON, so 'off' must be spelled out.
+
+        Omitting the flag would silently leave the experimental Mamba-align
+        prefix cache enabled; the negation is what turns it off, and the
+        running command line then shows which was chosen.
+        """
+        common = dict(
+            context=4096, gpu_memory_utilization="0.30", startup_arguments=(), speculative_config="",
+            max_num_batched_tokens=512, tensor_parallel_size=2, pipeline_parallel_size=1,
+            head_ip=HEAD_IP, master_port=29501,
+        )
+        on = build_engine_arguments(**common)
+        off = build_engine_arguments(**common, enable_prefix_caching=False)
+        self.assertIn("--enable-chunked-prefill --enable-prefix-caching --max-num-batched-tokens 512", on)
+        self.assertIn("--enable-chunked-prefill --no-enable-prefix-caching --max-num-batched-tokens 512", off)
+        self.assertNotIn("--enable-prefix-caching", off.replace("--no-enable-prefix-caching", ""))
+        self.assertEqual(shlex.split(off).count("--no-enable-prefix-caching"), 1)
+        # And through the settings resolver, so the dual-mode string follows the knob.
+        self.assertIn("--no-enable-prefix-caching", resolve(dual(), enable_prefix_caching=False)["CLUSTER_ENGINE_ARGS"])
+        self.assertIn(" --enable-prefix-caching ", resolve(dual())["CLUSTER_ENGINE_ARGS"])
+
+    def test_speculative_and_prefix_arguments_render_from_one_validator(self) -> None:
+        """The single-node overlays and the cluster string share these helpers."""
+        self.assertEqual(speculative_config_argument({}), "")
+        self.assertEqual(speculative_config_argument({"CLUSTER_SPECULATIVE_CONFIG": ""}), "")
+        self.assertEqual(
+            speculative_config_argument({"CLUSTER_SPECULATIVE_CONFIG": '{"method": "mtp", "num_speculative_tokens": 1}'}),
+            "--speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":1}'",
+        )
+        with self.assertRaisesRegex(TechSaraError, "CLUSTER_SPECULATIVE_CONFIG"):
+            speculative_config_argument({"CLUSTER_SPECULATIVE_CONFIG": "mtp"})
+        self.assertEqual(prefix_caching_argument(True), "--enable-prefix-caching")
+        self.assertEqual(prefix_caching_argument(False), "--no-enable-prefix-caching")
 
     def test_startup_arguments_with_spaces_are_quoted(self) -> None:
         rendered = build_engine_arguments(

@@ -1032,14 +1032,27 @@ def _failure_sentence(exc: BaseException) -> tuple[str, str]:
     to the server log, where an engineer looks (ORCH-01)."""
     import httpx
 
-    if isinstance(exc, (asyncio.TimeoutError, TimeoutError, httpx.TimeoutException)):
+    from . import resilience
+
+    # The OpenAI SDK wraps httpx's transport errors in its own hierarchy
+    # (openai.APIConnectionError is NOT an httpx.TransportError, verified in
+    # SDK 2.36 and 3.7), so until 2026-09-11 a 13-minute engine reload was
+    # reported to the person as APPLICATION_ERROR. resilience.py classifies
+    # the SDK shapes; ModelUnavailable is the wrapper giving up after its
+    # window, which is the same sentence: the engine was not there.
+    unavailable = (
+        "The model is temporarily unavailable. It may still be starting up — "
+        "please try again in a moment.",
+        "MODEL_UNAVAILABLE",
+    )
+    if isinstance(exc, resilience.ModelUnavailable):
+        return unavailable
+    if resilience.is_read_timeout(exc) or isinstance(
+        exc, (asyncio.TimeoutError, TimeoutError, httpx.TimeoutException)
+    ):
         return "The model did not answer in time. Please try again.", "TIMEOUT"
-    if isinstance(exc, (httpx.TransportError, ConnectionError)):
-        return (
-            "The model is temporarily unavailable. It may still be starting up — "
-            "please try again in a moment.",
-            "MODEL_UNAVAILABLE",
-        )
+    if isinstance(exc, (httpx.TransportError, ConnectionError)) or resilience.is_recoverable(exc):
+        return unavailable
     return "The answer could not be completed. Please try again.", "APPLICATION_ERROR"
 
 
@@ -1729,6 +1742,13 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
         context.reset_trim_notice()
         llm.reset_usage()
         trace_context = query_trace.activate()
+        # While a model call inside this turn waits for a restarting engine,
+        # the person sees why instead of a silent spinner (app/resilience.py).
+        # A ContextVar, scoped to this task like the accounting above, so it
+        # reaches every engine without threading a callback through them.
+        from .resilience import set_wait_notifier
+
+        set_wait_notifier(lambda line: emit("status", {"text": line}))
         # Who the model is assisting — safe context for prompt builders
         # (engines append identity.identity_line() to their system prompts).
         from .identity import set_identity

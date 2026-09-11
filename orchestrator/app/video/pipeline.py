@@ -41,6 +41,8 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from .. import db, metrics
 from ..config import settings
+from ..asr import ASRBusy, ASRUnavailable
+from ..resilience import ModelUnavailable, recovery_window
 from . import artifacts as art
 from . import loops, store
 from .types import STAGES, STAGE_TITLES, OcrSpan, Segment, Understanding
@@ -152,6 +154,9 @@ async def pace() -> float:
 #: that fails fails the video; an optional one is recorded as failed and the
 #: video is understood from what remains.
 _OPTIONAL = {"ocr", "vision", "index"}
+#: The prefix a deferred row's `error` carries; the drain uses it to tell a
+#: row that is waiting for an engine from one that is simply new.
+DEFERRED_MARK = "waiting for the model"
 
 
 @dataclass
@@ -333,6 +338,9 @@ class _Runner:
         self.analysis_id = analysis_id
         self.ctx = ctx
         self.stages = stages  # shared by every branch; each stage writes only its own key
+        #: Set when a stage gave up waiting for the model engine: the job is
+        #: to be DEFERRED (requeued with its finished stages), not failed.
+        self.deferred: Optional[str] = None
 
     async def stage(self, stage: str) -> Optional[str]:
         """Run one stage. Returns the failure to report when the failure is
@@ -372,19 +380,42 @@ class _Runner:
             raise
         except asyncio.TimeoutError:
             outcome = _StageResult(status="failed", detail=f"did not finish within {settings.video_stage_timeout_s:.0f}s")
+        except (ModelUnavailable, ASRUnavailable, ASRBusy) as exc:
+            # The engine this stage needs was down for the whole recovery
+            # window (a TP=2 reload measured 13 min on 2026-09-10; a whisper
+            # replica losing its CUDA context). That is not this video's
+            # fault. A REQUIRED stage is recorded as deferred — NOT done, so
+            # it re-runs — and _run_stages puts the job back in the queue
+            # with every finished stage kept. An OPTIONAL stage fails soft
+            # exactly as any other failure: the video finishes without it
+            # rather than holding the whole job for a sidecar it can do
+            # without. Until 2026-09-11 both landed in the branch below,
+            # the row read 'failed' and nothing ever re-ran it.
+            if stage in _OPTIONAL:
+                log.warning("video %s: optional stage %s skipped — %s", content_hash[:12], stage, exc)
+                outcome = _StageResult(status="failed", detail=f"{type(exc).__name__}: {str(exc)[:400]}")
+            else:
+                log.warning("video %s: stage %s deferred — %s", content_hash[:12], stage, exc)
+                outcome = _StageResult(status="deferred", detail=f"{DEFERRED_MARK}: {str(exc)[:300]}")
         except Exception as exc:  # noqa: BLE001 — recorded on the row, never a crash
             log.exception("video %s: stage %s failed", content_hash[:12], stage)
             outcome = _StageResult(status="failed", detail=f"{type(exc).__name__}: {str(exc)[:400]}")
         ms = int((time.perf_counter() - stage_started) * 1000)
         stages[stage] = {"status": outcome.status, "ms": ms, "detail": outcome.detail}
         metrics.observe("video_stage_seconds", ms / 1000.0, "wall-clock per pipeline stage", stage=stage)
-        metrics.inc("video_stage_total", "pipeline stages finished", stage=stage, result="ok" if outcome.status != "failed" else "fail")
+        metrics.inc(
+            "video_stage_total", "pipeline stages finished", stage=stage,
+            result={"failed": "fail", "deferred": "deferred"}.get(outcome.status, "ok"),
+        )
         # Both branches write the whole `stages` map; each write carries the
         # union as it stands, so the last one to land is also the most
         # complete one.
         fields = {"stages": dict(stages), "counts": dict(ctx.counts), **outcome.row_fields}
         await db.run_in_thread(db.update_video_analysis, analysis_id, **fields)
         _publish(analysis_id, {"stage": stage, "status": outcome.status, "percent": 100, "detail": outcome.detail, "elapsed_s": round(ms / 1000.0, 1)})
+        if outcome.status == "deferred":
+            self.deferred = f"{STAGE_TITLES.get(stage, stage)}: {outcome.detail}"
+            return self.deferred
         if outcome.status == "failed" and stage not in _OPTIONAL:
             return f"{STAGE_TITLES.get(stage, stage)}: {outcome.detail}"
         return None
@@ -458,7 +489,11 @@ async def _run(analysis_id: int) -> None:
             _heartbeat(analysis_id, run), name=f"video-lease-{analysis_id}"
         ) if run is not None else None
         try:
-            await _run_stages(analysis_id, row)
+            # A background job waits out a full engine reload (the long
+            # window) — nobody is watching a spinner; the lease heartbeat
+            # above keeps the row claimed while it waits.
+            with recovery_window(settings.llm_recovery_window_s):
+                await _run_stages(analysis_id, row)
         finally:
             if heartbeat is not None:
                 heartbeat.cancel()
@@ -522,10 +557,35 @@ async def _run_stages(analysis_id: int, row: dict) -> None:
         failure = next((f for f in failures if f), None)
     if failure is None:
         failure = await runner.chain(_TAIL)
+    if runner.deferred:
+        attempt = int(row.get("attempt") or 0) + 1
+        if attempt < max(1, settings.video_max_attempts):
+            await _defer(analysis_id, runner.deferred, attempt=attempt, total_s=time.perf_counter() - started)
+            return
+        failure = f"{runner.deferred} (gave up after {attempt} attempts)"
     if failure:
         await _finish(analysis_id, "failed", failure, total_s=time.perf_counter() - started)
         return
     await _finish(analysis_id, "done", "", total_s=time.perf_counter() - started)
+
+
+async def _defer(analysis_id: int, why: str, *, attempt: int, total_s: float = 0.0) -> None:
+    """Back to the queue with every finished stage kept.
+
+    Idempotent by construction: stage outputs are files keyed by content
+    hash and the `stages` map on the row, so the next run re-does only the
+    deferred stage; the lease (released by _run's finally) keeps two
+    processes from running the same video at once.
+    """
+    await db.run_in_thread(
+        db.update_video_analysis,
+        analysis_id,
+        status="queued",
+        error=f"{DEFERRED_MARK} (attempt {attempt}): {why}"[:1000],
+        finished_at=None,
+    )
+    metrics.inc("video_jobs_total", "video analyses finished", result="deferred")
+    _publish(analysis_id, {"stage": _DONE, "status": "queued", "detail": f"{DEFERRED_MARK}; will retry", "elapsed_s": round(total_s, 1)})
 
 
 async def _finish(analysis_id: int, status: str, error: str, *, total_s: float = 0.0) -> None:
@@ -748,7 +808,7 @@ def _kept_frames(ctx: _Ctx):
 
 
 async def _stage_ocr(ctx: _Ctx, progress) -> _StageResult:
-    from .screen import ocr_frames
+    from .screen import read_frames
 
     kept = _kept_frames(ctx)
     if not kept:
@@ -765,13 +825,21 @@ async def _stage_ocr(ctx: _Ctx, progress) -> _StageResult:
             k.index for k in sorted(kept, key=lambda k: (-(k.end_s - k.t_s), k.t_s))[:cap]
         )
         subset = [k for k in kept if k.index in chosen]
-        read = await ocr_frames(subset, progress=progress)
-        by_index = {k.index: text for k, text in zip(subset, read)}
+        read = await read_frames(subset, progress=progress)
+        by_index = {k.index: text for k, text in zip(subset, read.texts)}
         texts = [by_index.get(k.index, "") for k in kept]
         note = f" ({cap} of {len(kept)} frames read — the longest-held)"
     else:
-        texts = await ocr_frames(kept, progress=progress)
+        read = await read_frames(kept, progress=progress)
+        texts = read.texts
         note = ""
+    if read.summary.get("status") == "unavailable":
+        # The OCR sidecar answered nothing for any frame. Stamping 'done'
+        # here (as this stage did until 2026-09-11) cached the outage as
+        # "no readable text" for the life of these bytes; a failed OPTIONAL
+        # stage lets the video finish without OCR and re-reads the frames
+        # on the next run instead.
+        return _StageResult("failed", f"OCR engine unavailable: {str(read.summary.get('detail') or '')[:200]}")
     store.write_json(store.stage_path(ctx.content_hash, "ocr.json"), {"texts": texts})
     legible = sum(1 for t in texts if t.strip())
     ctx.counts.update({"ocr_frames": legible, "ocr_chars": sum(len(t) for t in texts)})
@@ -931,9 +999,32 @@ async def drain_queue(limit: int = 4) -> int:
     except Exception:  # noqa: BLE001
         return 0
     for row in rows:
+        if _deferred_too_recently(row):
+            continue
         if await ensure_running(int(row["id"])):
             started += 1
     return started
+
+
+def _deferred_too_recently(row: dict) -> bool:
+    """A row the model outage sent back to the queue waits VIDEO_RETRY_DELAY_S
+    before its next try, so a still-down engine is not polled by every
+    maintenance pass; a new upload is never delayed."""
+    if not str(row.get("error") or "").startswith(DEFERRED_MARK):
+        return False
+    updated = row.get("updated_at")
+    if not updated:
+        return False
+    try:
+        from datetime import datetime, timezone
+
+        stamp = datetime.fromisoformat(str(updated).replace("Z", "+00:00"))
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - stamp).total_seconds()
+    except ValueError:
+        return False
+    return age < float(settings.video_retry_delay_s)
 
 
 async def reap_orphans() -> int:

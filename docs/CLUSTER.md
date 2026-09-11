@@ -161,7 +161,13 @@ CLUSTER_WORKER_SSH=techsphere@10.100.184.2   # optional; default <your user>@<di
 CLUSTER_TENSOR_PARALLEL_SIZE=2        # TP × PP must be 2
 CLUSTER_PIPELINE_PARALLEL_SIZE=1
 CLUSTER_GPU_MEMORY_UTILIZATION=0.30
-CLUSTER_KV_CACHE_MEMORY_GIB=16        # explicit per-node KV budget (see Memory: why not profiled)
+CLUSTER_KV_CACHE_MEMORY_GIB=8         # explicit per-node KV budget (see Memory: why not profiled;
+                                      # 8 since 2026-08-29 for the 1M window, was 16)
+CLUSTER_SPECULATIVE_CONFIG=           # EMPTY = no speculative decoding (the default since 2026-09-11:
+                                      # the MTP draft faults the Qwen GDN layer on this build, see
+                                      # "Failure behaviour"); opt in with {"method":"mtp","num_speculative_tokens":1}
+MAIN_MODEL_ENABLE_PREFIX_CACHING=false  # a REAL switch since 2026-09-11 (both ranks, and single-node);
+                                      # off: vLLM calls the hybrid-Mamba prefix cache experimental
 # MAIN_MODEL_MAX_LEN=800000           # served window; above the model's native 262,144 the
                                       # launcher auto-enables YaRN and refuses windows this
                                       # KV budget cannot hold (35B-A3B: the 4x-native ceiling,
@@ -220,13 +226,54 @@ scripts/cluster-worker.sh start|stop|down|restart|status|logs
 scripts/cluster-up.sh / cluster-down.sh       # aliases of ./techsara up / down + status report
 ```
 
+### Changing an engine argument (the only procedure that restarts the pair)
+
+Every main-engine flag lives in ONE launcher-rendered string,
+`CLUSTER_ENGINE_ARGS` in `.runtime/generated.env`, which the head overlay and
+the worker's `~/.techsara-cluster/worker.env` interpolate verbatim (vLLM's mp
+executor requires byte-identical engine configuration on both ranks). Nothing
+edits it by hand, and — deliberately — no routine deploy applies it: a
+`scripts/deploy.sh` without `--full` runs `techsara up` with
+`TECHSARA_PRESERVE_MAIN_MODEL=1`, which re-renders the file, probes the
+running engine and leaves it alone. The running command line and the file
+then disagree until someone asks for the reload out loud. So:
+
+1. Edit `.env` (for example `CLUSTER_SPECULATIVE_CONFIG=` or
+   `MAIN_MODEL_ENABLE_PREFIX_CACHING=false`). Back it up first; it is
+   gitignored and holds credentials.
+2. Preview without touching anything: `./techsara up --dry-run` renders the
+   plan into a temporary runtime directory and validates it with Compose.
+3. Apply: `./techsara up` from a shell on the head (no preserve flag), or
+   `scripts/deploy.sh --full`, or the Pipeline's `workflow_dispatch` with
+   `full` ticked. In dual mode this runs `cluster-sync.sh` (regenerates and
+   ships `worker.env`), `cluster-worker.sh start` (Compose recreates the
+   worker because its command changed; it waits at the rendezvous), then
+   recreates the head and waits for its health gate. Expect ~6 minutes with a
+   warm `torch.compile` cache, up to ~10 cold; both engine ports refuse
+   connections for that window (the orchestrator's model calls wait it out,
+   see `orchestrator/app/resilience.py`).
+4. Prove it from the running containers, never from the files:
+   `scripts/cluster-verify-engine.sh --probe` reads `docker inspect` on BOTH
+   nodes, compares the two argument lists, checks the retained logs for the
+   drafter / CUDA-fault / Xid signatures, and sends one completion with GPU
+   sampling on both Sparks. `scripts/cluster-status.sh --probe` remains the
+   broader health report.
+5. Capture the start-up log before it rotates (json-file, 3 x 10 MB;
+   NCCL INFO at start-up alone is ~1,600 lines): `docker logs
+   sf-local-ai-vllm-1 > .runtime/logs/head-start-$(date +%s).log`.
+
+`scripts/cluster-worker.sh restart` does NOT apply a new `worker.env` (it is
+a plain `docker compose restart`); `./techsara redetect` only rewrites the
+hardware/profile files.
+
 In dual mode `up` runs `scripts/cluster-sync.sh` and `scripts/cluster-worker.sh
 start` right before its `vllm` stage (the worker must be waiting when the head
 rendezvous starts), prints the head/worker line, and a failure there points at
 `cluster-status.sh` instead of the single-node context-lowering retry (which
 cannot fix a missing worker). Both containers use `restart: unless-stopped` and wait up
-to `--distributed-timeout-seconds 300` for each other, so after a reboot of
-either machine the pair re-rendezvous on its own.
+to `--distributed-timeout-seconds 300` (the torch.distributed rendezvous /
+collective timeout) for each other, so after a reboot of either machine the
+pair re-rendezvous on its own.
 
 Example `scripts/cluster-status.sh --probe` output (2026-08-29, 35B-A3B at the 800K window):
 
@@ -324,14 +371,15 @@ Nothing here is a guess; numbers are single-stream unless stated.
 
 | Knob | Tried / read | Result | Decision |
 |---|---|---|---|
-| `CLUSTER_SPECULATIVE_CONFIG` MTP `num_speculative_tokens` 1 → 2 | restarted, measured | decode **59–72 tok/s vs 76–81** at k=1; per-draft-token acceptance 62 % (1.25 accepted per step vs ~1.9). vLLM warns at start-up that re-running the single MTP layer lowers acceptance — it does. | keep **1** |
+| `CLUSTER_SPECULATIVE_CONFIG` MTP `num_speculative_tokens` 1 → 2 | restarted, measured | decode **59–72 tok/s vs 76–81** at k=1; per-draft-token acceptance 62 % (1.25 accepted per step vs ~1.9). vLLM warns at start-up that re-running the single MTP layer lowers acceptance — it does. | superseded below |
+| `CLUSTER_SPECULATIVE_CONFIG` MTP k=1 → **OFF** (2026-09-11) | restarted, measured, same seeds (`scripts/cluster-bench.sh`, 512 in / 128 out unless stated) | c=1: **69.4 → 100.7 tok/s**, TPOT 12.8 → 9.3 ms, TTFT p50 123 → 90 ms; c=4: **158.6 → 238.7 tok/s**; c=10 (2048 in / 256 out): **250.4 → 283.9 tok/s**, E2E p99 13.8 → 9.6 s; 32K prefill TTFT **4.70 → 4.10 s**. The draft's 86 % acceptance (1.86 tokens/step on live traffic) was worth less than the PIECEWISE-only CUDA graphs it forced: per-step launch overhead on a TP=2 pair is the cost that FULL decode graphs remove. It also removes the spec/non-spec mixed-batch path into this build's GDN `misaligned address` fault — but NOT the fault itself: the same day's mixed-workload soak reproduced it in the GDN *prefill* kernel (`fused_post_conv_prep`) 27 min in, with MTP off (`docs/ISSUE/gdn-spec-decode-remediation-2026-09-11.md` §1.1). The durable fix is a vLLM build with the later GDN kernel fixes, accepted with `scripts/cluster-soak.py`. | **OFF** (the default since 2026-09-11; opt in per `.env.example`) |
 | `CLUSTER_MAX_NUM_BATCHED_TOKENS` 8192 → 16384 | restarted, measured | prefill 3.9–4.0K tok/s vs 4.0–5.1K at 8192 (noise or slightly worse); +45 s torch.compile for the new range | keep **8192** |
 | `MAIN_MODEL_MAX_LEN` 800000 → 1000000 (with `CLUSTER_KV_CACHE_MEMORY_GIB` 16 → **8**) | restarted, laddered, needle-verified | At KV 16 GiB a real 949,915-token request exhausted unified memory (`NVRM: ... NV_ERR_NO_MEMORY`) and restarted the engine — twice. The KV cache was reserving room for 2.95M tokens in a window that can use 1M; at **8 GiB** the pool still holds 1,494,824 tokens and prefill working memory goes from ~19 GiB to ~37 GiB. The same prompt then completed in 878 s with **3/3 needles recalled**, engine healthy. 262,051 (109 s) and 449,844 (248 s) also 3/3 | **1,000,000, KV 8 GiB** |
 | Decode vs window | five-run medians, same prompts | 69.9 tok/s at 850K, 71.2 at 1M — within noise. An earlier claim that 1M "costs ~10 % decode" compared a median against a single run on a quieter machine and is withdrawn | no window penalty established |
 | `--moe-backend` | read | the experts are `W4A16_NVFP4`, so only the Marlin kernel can run them (`modelopt.py`: every W4A4 backend rejects itself); vLLM selects Marlin on its own and rejects the explicit flag | no lever |
-| Full CUDA graphs for decode | read | FlashInfer on GB10 (sm 12.1) only supports `UNIFORM_SINGLE_TOKEN_DECODE`; with MTP the engine downgrades to `PIECEWISE` (visible in the start-up log). `triton_attn` declares full-graph support and is the untested A/B | not tried (needs a manifest change + A/B) |
+| Full CUDA graphs for decode | **measured 2026-09-11** | FlashInfer on GB10 (sm 12.1) only supports `UNIFORM_SINGLE_TOKEN_DECODE`, so WITH MTP the engine downgrades to `PIECEWISE`. Without `--speculative-config` the start-up log shows both `Capturing CUDA graphs (mixed prefill-decode, PIECEWISE)` and `Capturing CUDA graphs (decode, FULL)` (35 sizes, 33 s, 3.4 GiB on the head). This is what turned the MTP removal into a gain | **on, by removing MTP** |
 | GDN prefill kernel | read | FlashInfer/CuteDSL GDN prefill needs SM90/SM100; sm 12.1 gets Triton/FLA | no lever |
-| Prefix caching | metrics | **0 hits of 40,863 queries**: the hybrid model forces `mamba_cache_mode=align` and an attention block of 2112 tokens, so a prefix shorter than 2112 tokens can never hit. `--mamba-block-size` / `--mamba-cache-mode all` would enable hits for the shared system prompt at the cost of KV budget (experimental in this build) | recommended experiment for a maintenance window |
+| Prefix caching | metrics, then **switched off 2026-09-11** | On 2026-08-29: **0 hits of 40,863 queries** — the hybrid model forces `mamba_cache_mode=align` and an attention block of 2112 tokens, so a prefix shorter than 2112 tokens can never hit. By 2026-09-11 longer conversations cleared that block: 8.1 % (7 d) / 16.0 % (24 h) of prompt tokens hit, all from prompts > 2112 tokens. Switched OFF with `MAIN_MODEL_ENABLE_PREFIX_CACHING=false` (now a real switch) because vLLM labels the Mamba-align cache experimental and stability outranks that tail saving while the GDN incident closes; the KV pool grew from 1,494,824 to 1,663,201 tokens without the 2112-token padding. Re-enable = one `.env` line + a reload; measure TTFT on multi-turn chats when you do | **off**; revisit after 7 days of clean running |
 | `--enable-expert-parallel` | read | all-to-all token dispatch across ~22 Gb/s RoCE is latency-bound; TP already shards the 512-wide expert FFNs evenly | not tried |
 | `--gpu-memory-utilization` | log | ignored for KV sizing when `--kv-cache-memory-bytes` is set (engine says so at start-up) | – |
 
@@ -349,11 +397,21 @@ request; that is what tensor parallelism means.
 Tested on 2026-08-25 by killing the worker under a running cluster (twice,
 because the first design did not pass). What actually happens when the worker
 disappears: the head's API server keeps answering `/v1/models` and `/health`
-(200) while every completion hangs; after `--distributed-timeout-seconds`
-(now 300 s) the cross-node RPC times out (`RPC call to sample_tokens timed
-out`), the engine is marked dead and the API server **closes its listener
-without exiting** - so nothing restarts on its own, and the orchestrator's
-`/health` only then reports `vllm: error`. The current design, which is what
+(200) while every completion hangs; after `VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS`
+(vLLM's own environment default, 300 s; verified 2026-09-11 in
+`vllm/envs.py` and `v1/executor/multiproc_executor.py` — NOT
+`--distributed-timeout-seconds`, which only bounds torch.distributed
+init/collectives) the cross-node RPC times out (`RPC call to sample_tokens
+timed out`), the engine is marked dead and the API server **closes its
+listener without exiting** - so nothing restarts on its own, and the
+orchestrator's `/health` only then reports `vllm: error`. Kept at 300 s on
+2026-09-11 after weighing it: chunked prefill bounds every RPC to one
+8,192-token step (a few seconds even inside a 1M-token prompt), so a
+shorter clock would not abort a long prefill — but a first-shape Triton JIT
+compile inside a step has cost up to ~70 s and a swapping head can stall a
+step, and the watchdog already proves a hang in ~5 min, so the 2-3 minutes a
+150 s clock would save per incident is not worth a false engine death until
+those two stalls are measured. The current design, which is what
 the overlay ships:
 
 * **Head healthcheck** (`init: true`, tini at PID 1): `/health` 200 →

@@ -38,6 +38,14 @@ import os
 # module import. The feature has its own coverage in tests/test_clarify.py,
 # which exercises both modes explicitly.
 os.environ.setdefault("CLARIFY_MODE", "ambiguous")
+# The outage-tolerance wrapper (app/resilience.py) waits for the engine's
+# /health for up to two minutes on a connection error before giving up. A
+# test that hands a caller a dead client is asserting how the caller reacts,
+# not how long it waits, so the suite runs with both windows at zero; the
+# waiting behaviour itself has its own coverage in tests/test_llm_resilience.py,
+# which sets the windows explicitly per test.
+os.environ.setdefault("LLM_INTERACTIVE_RECOVERY_S", "0")
+os.environ.setdefault("LLM_RECOVERY_WINDOW_S", "0")
 
 from urllib.parse import unquote, urlsplit  # noqa: E402
 

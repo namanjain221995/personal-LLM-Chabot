@@ -60,7 +60,13 @@ services:
     # restarted head is a new torch.distributed process group that the old
     # worker can never rejoin, so the worker restarts itself when the head
     # reports its engine dead (5xx) or - once this worker has been up for
-    # 15 minutes - when the head has been unreachable for 10 checks (5 min).
+    # 15 minutes - when the head has been unreachable for 4 checks (2 min).
+    # Four, not ten (2026-09-11): a head whose API process exits outright
+    # (the EngineDeadError path, seen at 07:09Z that day) answers 000, not
+    # 5xx, so this rule is the only thing that re-pairs the worker, and the
+    # old five minutes were a third of the whole outage. A head reload always
+    # needs a fresh worker anyway; the head's own healthcheck uses the same
+    # four misses, and the head's rendezvous waits 300 s for us.
     # Start-up is never interrupted: while the pair is still loading, an
     # unreachable head only keeps this container in "starting". `init: true`
     # + killing the real `vllm serve` process (not PID 1) is what makes the
@@ -79,11 +85,11 @@ services:
           n=$$(( $$(cat /tmp/head-missed 2>/dev/null || echo 0) + 1 )); echo $$n > /tmp/head-missed;
           age=$$(ps -o etimes= -p "$$main" | tr -d ' ');
           case "$$code" in 5*) echo "head engine dead (HTTP $$code): restarting worker to rejoin the next process group"; kill -9 "$$main";; esac;
-          if [ "$${age:-0}" -gt 900 ] && [ "$$n" -ge 10 ]; then echo "head unreachable for $$n checks after $${age}s: restarting worker"; kill -9 "$$main"; fi;
+          if [ "$${age:-0}" -gt 900 ] && [ "$$n" -ge 4 ]; then echo "head unreachable for $$n checks after $${age}s: restarting worker"; kill -9 "$$main"; fi;
           exit 1
       interval: 30s
       timeout: 15s
-      retries: 10
+      retries: 4
       start_period: 30m
     logging:
       driver: json-file
