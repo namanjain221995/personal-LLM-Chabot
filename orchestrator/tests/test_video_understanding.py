@@ -511,8 +511,109 @@ def test_overview_renders_from_the_analysis_without_a_model():
     from app.engines import video as engine
 
     md = engine.overview_markdown(_row())
-    for needle in ("**meeting.mp4**", "10:32", "## Summary", "## Chapters", "**[1:00]** Pricing", "## Decisions", "$59", "transcript files are attached"):
+    for needle in ("**meeting.mp4**", "10:32", "## Summary", "## Chapters", "**[1:00]** Pricing", "## Decisions", "$59"):
         assert needle in md
+
+
+def test_the_overview_promises_only_the_files_that_were_published():
+    """It used to claim "the transcript files are attached below" on every
+    attach turn — including deployments with no reports directory, where
+    nothing is attached at all, and now that the default is ONE file."""
+    from app.engines import video as engine
+
+    none_published = engine.overview_markdown(_row())
+    assert "attached" not in none_published
+
+    one = engine.overview_markdown(_row(), files=[{"filename": "meeting.transcript.vtt"}])
+    assert "The transcript is attached below." in one
+
+    several = engine.overview_markdown(
+        _row(),
+        files=[{"filename": "meeting.transcript.vtt"}, {"filename": "meeting.summary.md"}],
+    )
+    assert "The transcript files are attached below." in several
+
+
+_ALL_ARTIFACT_KINDS = [
+    ("transcript_txt", "transcript.txt"),
+    ("transcript_srt", "transcript.srt"),
+    ("transcript_vtt", "transcript.vtt"),
+    ("transcript_json", "transcript.json"),
+    ("screen_text_txt", "screen_text.txt"),
+    ("screen_text_json", "screen_text.json"),
+    ("summary_md", "summary.md"),
+]
+
+
+@pytest.fixture()
+def analysis_with_every_artifact(tmp_path, monkeypatch):
+    """A finished analysis whose seven artifact files exist on disk."""
+    from app.video import store
+
+    monkeypatch.setattr(settings, "video_data_dir", str(tmp_path / "video"))
+    monkeypatch.setattr(settings, "reports_dir", str(tmp_path / "reports"))
+    os.makedirs(settings.reports_dir, exist_ok=True)
+    row = _row(artifacts=[
+        {"kind": kind, "filename": name, "media_type": "text/plain", "bytes": 4}
+        for kind, name in _ALL_ARTIFACT_KINDS
+    ])
+    out_dir = store.artifacts_dir(row["content_hash"])
+    os.makedirs(out_dir, exist_ok=True)
+    for _, name in _ALL_ARTIFACT_KINDS:
+        with open(os.path.join(out_dir, name), "w", encoding="utf-8") as fh:
+            fh.write("body")
+    return row
+
+
+def _publish(row, kinds, monkeypatch):
+    from app.engines import video as engine
+
+    monkeypatch.setattr(settings, "video_artifact_kinds", kinds)
+    return asyncio.run(engine.publish_artifacts(row, user_id=1))
+
+
+def test_only_the_configured_artifact_kinds_are_offered_for_download(
+    analysis_with_every_artifact, monkeypatch
+):
+    """Seven cards under one answer was a menu, not a result: four of them
+    are the same words in four formats, and each is named after the source
+    video, so they read identically. VIDEO_ARTIFACT_KINDS picks; the default
+    is the WebVTT transcript alone."""
+    files = _publish(analysis_with_every_artifact, ("transcript_vtt",), monkeypatch)
+    assert [f["type"] for f in files] == ["vtt"]
+    assert files[0]["filename"].endswith(".transcript.vtt")
+    assert files[0]["size"] == 4
+
+    # The others were NOT copied into the reports directory — only the one
+    # asked for, so nothing unadvertised is reachable by guessing a name.
+    assert sorted(os.listdir(settings.reports_dir)) == [files[0]["filename"]]
+
+
+def test_widening_the_kinds_needs_no_re_analysis(analysis_with_every_artifact, monkeypatch):
+    """The pipeline writes all seven whatever this is set to, so changing it
+    publishes the rest from the SAME analysis on the next turn."""
+    row = analysis_with_every_artifact
+    assert [f["type"] for f in _publish(row, ("transcript_vtt",), monkeypatch)] == ["vtt"]
+
+    widened = _publish(row, ("transcript_srt", "summary_md", "not_a_kind"), monkeypatch)
+    assert sorted(f["type"] for f in widened) == ["md", "srt"]
+
+    every = _publish(row, ("all",), monkeypatch)
+    assert len(every) == len(_ALL_ARTIFACT_KINDS)
+
+
+def test_the_kinds_setting_reads_a_comma_list_and_defaults_to_vtt(monkeypatch):
+    from app.config import Settings
+
+    monkeypatch.delenv("VIDEO_ARTIFACT_KINDS", raising=False)
+    assert Settings().video_artifact_kinds == ("transcript_vtt",)
+
+    monkeypatch.setenv("VIDEO_ARTIFACT_KINDS", "  transcript_srt , summary_md ,, ")
+    assert Settings().video_artifact_kinds == ("transcript_srt", "summary_md")
+
+    # An operator who blanks the variable gets the default, not zero files.
+    monkeypatch.setenv("VIDEO_ARTIFACT_KINDS", "   ")
+    assert Settings().video_artifact_kinds == ("transcript_vtt",)
 
 
 def test_pinned_block_is_bounded_and_names_a_failed_analysis():

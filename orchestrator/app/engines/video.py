@@ -32,7 +32,9 @@ ARTIFACTS ride on `meta.report_files`, which main.py binds to the viewer and
 GET /reports/{filename} serves. `report_files.filename` is a global primary
 key bound to whoever first advertised it, so the files are copied under a
 per-user name — the same video attached by two people is two sets of files,
-each downloadable by its owner.
+each downloadable by its owner. Which formats are offered is
+`VIDEO_ARTIFACT_KINDS`, the WebVTT transcript alone by default; the pipeline
+writes all seven regardless, so widening the setting needs no re-analysis.
 """
 from __future__ import annotations
 
@@ -186,8 +188,15 @@ def pinned_block(videos: Sequence[dict], *, max_chars: int) -> str:
     return "\n\n".join(parts)
 
 
-def overview_markdown(row: dict) -> str:
-    """The attach-turn answer, rendered from the analysis without a model."""
+def overview_markdown(row: dict, *, files: Sequence[dict] = ()) -> str:
+    """The attach-turn answer, rendered from the analysis without a model.
+
+    `files` is what `publish_artifacts` actually published for this row. The
+    closing line promises only what is there: it used to say "the transcript
+    files are attached below" unconditionally, which was a lie on any
+    deployment with no reports directory, and reads wrong now that the
+    default is a single file.
+    """
     u = Understanding.from_json(row.get("understanding") or {})
     name = _display_name(row)
     duration = _duration_s(row)
@@ -230,7 +239,12 @@ def overview_markdown(row: dict) -> str:
             + (u.not_covered or "no speech was transcribed and nothing legible was on screen."),
             "",
         ]
-    out.append("_Ask anything about it — what was said, what was on screen, when something happened — and I'll cite the timestamps. The transcript files are attached below._")
+    closing = "_Ask anything about it — what was said, what was on screen, when something happened — and I'll cite the timestamps."
+    if len(files) == 1:
+        closing += " The transcript is attached below."
+    elif len(files) > 1:
+        closing += " The transcript files are attached below."
+    out.append(closing + "_")
     return "\n".join(out)
 
 
@@ -455,13 +469,24 @@ def _slug(name: str) -> str:
 
 async def publish_artifacts(row: dict, *, user_id: Optional[int]) -> List[dict]:
     """Copy the analysis's files into the reports directory under a name
-    that is unique per user, and describe them for meta.report_files."""
+    that is unique per user, and describe them for meta.report_files.
+
+    Only the kinds named by `VIDEO_ARTIFACT_KINDS` (default: the WebVTT
+    transcript) are copied and advertised. The pipeline still writes all
+    seven into the analysis directory, so widening the setting publishes the
+    others on the next turn WITHOUT re-analysing the video — which is why
+    this filters here rather than in the pipeline.
+    """
     if not settings.reports_dir or user_id is None:
         return []
+    wanted = set(settings.video_artifact_kinds)
+    every_kind = "all" in wanted
     out: List[dict] = []
     src_dir = store.artifacts_dir(row["content_hash"])
     prefix = f"{_slug(_display_name(row))}-{row['content_hash'][:8]}-u{int(user_id)}"
     for a in row.get("artifacts") or []:
+        if not every_kind and str(a.get("kind") or "") not in wanted:
+            continue
         name = str(a.get("filename") or "")
         src = os.path.join(src_dir, name)
         if not name or not os.path.isfile(src):
@@ -543,8 +568,11 @@ async def run_video_engine(
     done = [r for r in rows if r.get("status") == "done"]
     parts: List[str] = []
     report_files: List[dict] = []
+    published: List[List[dict]] = []
     for r in done:
-        report_files.extend(await publish_artifacts(r, user_id=user_id))
+        files = await publish_artifacts(r, user_id=user_id)
+        published.append(files)
+        report_files.extend(files)
 
     if failed and not done:
         lines = [f"I couldn't analyse **{_display_name(r)}**: {r.get('error') or 'the analysis failed'}." for r in failed]
@@ -555,8 +583,8 @@ async def run_video_engine(
 
     if attach_turn and is_placeholder(message):
         # The understanding, straight from the analysis.
-        for r in done:
-            parts.append(overview_markdown(r))
+        for r, files in zip(done, published):
+            parts.append(overview_markdown(r, files=files))
         for r in failed:
             parts.append(f"I couldn't analyse **{_display_name(r)}**: {r.get('error') or 'the analysis failed'}.")
         text = "\n\n---\n\n".join(parts)
