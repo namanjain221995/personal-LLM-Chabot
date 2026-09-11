@@ -70,9 +70,24 @@ _RECOVERY_S: ContextVar[Optional[float]] = ContextVar("_llm_recovery_s", default
 #: wrapper waits, so a chat can show "the model is restarting" instead of a
 #: silent spinner. Set by the chat worker; a job that has no one watching
 #: leaves it unset.
-_NOTIFY: ContextVar[Optional[Callable[[str], Awaitable[None]]]] = ContextVar(
-    "_llm_wait_notify", default=None
-)
+class _Notifier:
+    """The callback plus whether it has already spoken for this outage.
+
+    A chat turn is several model calls — the route classification and the
+    answer run in sibling tasks and wait on the same outage — and the person
+    should read the line once. Child tasks get a COPY of the context but the
+    same holder object, so the flag is shared where a plain ContextVar[bool]
+    would not be.
+    """
+
+    __slots__ = ("fn", "announced")
+
+    def __init__(self, fn: Callable[[str], Awaitable[None]]) -> None:
+        self.fn = fn
+        self.announced = False
+
+
+_NOTIFY: ContextVar[Optional[_Notifier]] = ContextVar("_llm_wait_notify", default=None)
 
 
 class ModelUnavailable(RuntimeError):
@@ -111,7 +126,7 @@ def recovery_window(seconds: Optional[float]) -> Iterator[None]:
 @contextlib.contextmanager
 def wait_notifier(notify: Optional[Callable[[str], Awaitable[None]]]) -> Iterator[None]:
     """Route the wrapper's "waiting for the model" line to ``notify``."""
-    token = _NOTIFY.set(notify)
+    token = _NOTIFY.set(_Notifier(notify) if notify is not None else None)
     try:
         yield
     finally:
@@ -121,7 +136,7 @@ def wait_notifier(notify: Optional[Callable[[str], Awaitable[None]]]) -> Iterato
 def set_wait_notifier(notify: Optional[Callable[[str], Awaitable[None]]]) -> None:
     """Bind the notifier to the CURRENT task for the rest of its life — for a
     worker that owns its task (the chat worker) and has no block to wrap."""
-    _NOTIFY.set(notify)
+    _NOTIFY.set(_Notifier(notify) if notify is not None else None)
 
 
 def effective_recovery_s() -> float:
@@ -248,7 +263,6 @@ async def wait_for_engine(
     poll = float(poll_s if poll_s is not None else settings.llm_health_poll_s)
     started = time.monotonic()
     last_log = started
-    notified = False
     while True:
         if await engine_answers(base_url):
             waited = time.monotonic() - started
@@ -256,19 +270,23 @@ async def wait_for_engine(
                 log.info("llm.resilient what=%s base_url=%s engine back after %.1fs", what, base_url, waited)
             metrics.observe("llm_engine_wait_seconds", waited,
                             "Seconds spent waiting for a model engine to answer /health", outcome="recovered")
+            holder = _NOTIFY.get()
+            if holder is not None:
+                holder.announced = False
             return True
         elapsed = time.monotonic() - started
         if elapsed >= deadline_s:
             metrics.observe("llm_engine_wait_seconds", elapsed,
                             "Seconds spent waiting for a model engine to answer /health", outcome="gave_up")
             return False
-        notify = _NOTIFY.get()
-        if notify is not None and not notified:
-            notified = True
+        holder = _NOTIFY.get()
+        if holder is not None and not holder.announced:
+            holder.announced = True
+            minutes = max(1, int(round(deadline_s / 60.0)))
             with contextlib.suppress(Exception):
-                await notify(
+                await holder.fn(
                     "The model is restarting — waiting for it to come back "
-                    f"(up to {int(deadline_s) // 60 or 1} min)…"
+                    f"(up to {minutes} min)…"
                 )
         now = time.monotonic()
         if now - last_log >= 60.0:

@@ -242,7 +242,49 @@ def test_wait_notifier_is_told_once_while_waiting(clock, monkeypatch):
 
     assert asyncio.run(run()) is True
     assert len(lines) == 1
-    assert "restarting" in lines[0]
+    assert "restarting" in lines[0] and "up to 10 min" in lines[0]
+
+    # A chat turn is several model calls waiting on the SAME outage: one line.
+    lines.clear()
+    calls["probe"] = 0
+
+    async def probe_two_calls(base_url, timeout=None):
+        calls["probe"] += 1
+        return calls["probe"] in (3, 6)
+
+    monkeypatch.setattr(resilience, "engine_answers", probe_two_calls)
+
+    async def two_waits():
+        with resilience.wait_notifier(notify):
+            first = await resilience.wait_for_engine("http://vllm:8000/v1", deadline_s=600, what="route")
+            # The engine answered (and the flag reset), then died again before
+            # the answer call: that is a NEW outage and earns a new line.
+            second = await resilience.wait_for_engine("http://vllm:8000/v1", deadline_s=600, what="answer")
+            return first, second
+
+    assert asyncio.run(two_waits()) == (True, True)
+    assert len(lines) == 2
+
+    # Sibling tasks (the route classification and the answer of one turn)
+    # wait on the same outage at the same time: still one line.
+    lines.clear()
+    calls["probe"] = 0
+
+    async def probe_both(base_url, timeout=None):
+        calls["probe"] += 1
+        return calls["probe"] >= 6
+
+    monkeypatch.setattr(resilience, "engine_answers", probe_both)
+
+    async def concurrent():
+        with resilience.wait_notifier(notify):
+            return await asyncio.gather(
+                resilience.wait_for_engine("http://vllm:8000/v1", deadline_s=600, what="route"),
+                resilience.wait_for_engine("http://vllm:8000/v1", deadline_s=600, what="answer"),
+            )
+
+    assert asyncio.run(concurrent()) == [True, True]
+    assert len(lines) == 1
 
 
 def test_engine_answers_requires_health_and_models_to_be_200():

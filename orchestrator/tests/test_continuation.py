@@ -344,11 +344,31 @@ def test_the_deadline_stops_the_run(model, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_a_failure_in_the_first_segment_produces_nothing_but_says_so(model):
-    fake = model([(RuntimeError("engine died"), None)])
-    result, _ = collect(total_max_tokens=1_000_000)
+def test_a_failure_before_the_first_token_propagates(model):
+    """NONE is not a partial answer. The worker's _failure_sentence turns the
+    exception into the error event the client renders (MODEL_UNAVAILABLE for
+    an engine outage); swallowing it here produced an empty "successful"
+    answer with no error at all (seen live 2026-09-11, router restart)."""
+    model([(RuntimeError("engine died"), None)])
+    with pytest.raises(RuntimeError, match="engine died"):
+        collect(total_max_tokens=1_000_000)
+
+
+def test_a_failure_after_the_first_tokens_keeps_them_and_says_so(monkeypatch):
+    """The user has already SEEN this text: keep it, mark the stop."""
+
+    async def dies_midway(messages, **kwargs):
+        yield "token", "A solid "
+        yield "token", "opening. "
+        raise RuntimeError("engine died")
+
+    monkeypatch.setattr(llm, "stream_chat_events", dies_midway)
+    monkeypatch.setattr(llm, "get_finish_reason", lambda: None)
+    monkeypatch.setattr(llm, "get_usage", lambda: None)
+    result, streamed = collect(total_max_tokens=1_000_000)
     assert result.stop_reason == STOP_ERROR
-    assert result.text == ""
+    assert result.text == "A solid opening. "
+    assert streamed == result.text
     assert result.errors and "engine died" in result.errors[0]
 
 

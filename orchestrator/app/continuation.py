@@ -420,8 +420,16 @@ async def stream_long_completion(
         except Exception as exc:  # noqa: BLE001 — recorded, not swallowed
             errors.append(f"segment {index}: {type(exc).__name__}: {exc}")
             log.exception("long generation failed in segment %d", index)
-            # Everything already written stays. A partial answer beats none.
+            # Everything already written stays. A partial answer beats none —
+            # but NONE is not a partial answer. When the first segment dies
+            # before a single token (the model was unreachable for the whole
+            # recovery window, say) the failure must reach the worker, whose
+            # _failure_sentence tells the person MODEL_UNAVAILABLE; swallowing
+            # it here produced an empty "successful" answer with no error
+            # event at all (seen live 2026-09-11 during a router restart).
             if index == 0:
+                if not produced and not pending:
+                    raise
                 return _result(STOP_ERROR)
             stop = STOP_ERROR
             break
