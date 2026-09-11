@@ -81,8 +81,10 @@ _ALLOWED = {
     },
     # A file format the Artifact Studio writes (app/artifacts/types.FORMATS):
     # artifact_render_seconds{format} and artifact_download_total{format}.
-    # Four values, fixed by the renderer set.
-    "format": {"pdf", "docx", "pptx", "xlsx"},
+    # Five values, fixed by the renderer set (csv since 2026-09-12,
+    # CONTRACT-2 §1), plus "zip" for the download metric only: the bundle
+    # route `GET …/zip` is downloaded and counted, but never rendered.
+    "format": {"pdf", "docx", "pptx", "xlsx", "csv", "zip"},
     # Speech to text. The vocabulary is the ASR model's own published set
     # (app/asr.SUPPORTED_LANGUAGES) plus "unknown" for a clip whose language
     # was not identified. Closed for the usual reason: a mis-parsed engine

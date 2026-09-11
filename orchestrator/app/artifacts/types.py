@@ -20,26 +20,48 @@ ArtifactKind = Literal["document", "presentation", "workbook"]
 KINDS: Tuple[str, ...] = ("document", "presentation", "workbook")
 
 #: A file format we can actually write and reopen. A format is never
-#: promised that is not in this table.
-FileFormat = Literal["pdf", "docx", "pptx", "xlsx"]
-FORMATS: Tuple[str, ...] = ("pdf", "docx", "pptx", "xlsx")
+#: promised that is not in this table. CSV joined on 2026-09-12 (CONTRACT-2
+#: §1): a workbook sheet as a portable data file — data only, no styling.
+FileFormat = Literal["pdf", "docx", "pptx", "xlsx", "csv"]
+FORMATS: Tuple[str, ...] = ("pdf", "docx", "pptx", "xlsx", "csv")
 
 MIME_TYPES: Dict[str, str] = {
     "pdf": "application/pdf",
     "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
     "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "csv": "text/csv; charset=utf-8",
+    #: A ZIP is a ROUTE (`GET …/zip` bundles a version's files), never a
+    #: file format: it is in this table for the response header only and
+    #: deliberately NOT in FORMATS, so no renderer is ever asked for one.
+    "zip": "application/zip",
     "png": "image/png",
     "json": "application/json",
 }
 
 #: Which formats each kind may be rendered to. A conversion request outside
-#: this table is refused with a plain sentence, not attempted.
+#: this table is refused with a plain sentence, not attempted. The first
+#: entry is the kind's NATIVE format (the `primary` file role below). A
+#: workbook can be delivered as an editable spreadsheet, a portable data
+#: file, and a tabular Word/PDF document (landscape, repeating header) from
+#: the same spec; a document or a deck can NOT be a csv/xlsx.
 FORMATS_FOR_KIND: Dict[str, Tuple[str, ...]] = {
-    "document": ("pdf", "docx"),
+    "document": ("docx", "pdf"),
     "presentation": ("pptx", "pdf"),
-    "workbook": ("xlsx",),
+    "workbook": ("xlsx", "csv", "docx", "pdf"),
 }
+
+#: The role a file plays in a version (CONTRACT-2 §2): `primary` is the
+#: kind's native file (docx/pptx/xlsx), `companion` the same content in
+#: another format (the PDF of a deck, the Word/PDF of a workbook), `data`
+#: a CSV of one sheet.
+FileRole = Literal["primary", "companion", "data"]
+FILE_ROLES: Tuple[str, ...] = ("primary", "companion", "data")
+
+#: Which formats a page preview (rasterised PDF) can stand for, and which
+#: are read as a grid.
+PAGE_FORMATS: Tuple[str, ...] = ("pdf", "docx", "pptx")
+GRID_FORMATS: Tuple[str, ...] = ("xlsx", "csv")
 
 # ---------------------------------------------------------------- stages --
 
@@ -179,6 +201,10 @@ MAX_TABLE_COLUMNS = 12
 MAX_CHART_POINTS = 200
 MAX_TEXT_CHARS = 200_000      # the whole spec's prose, summed
 MAX_FILE_BYTES = 50 * 1024 * 1024
+#: `GET …/zip` is refused when the version's recorded sizes sum past this:
+#: the bundle is streamed, so the bound is on what a person downloads, not
+#: on memory.
+MAX_ZIP_BYTES = 200 * 1024 * 1024
 MAX_PREVIEW_PAGES = 40        # pages rasterised for the viewer
 PREVIEW_WIDTHS: Tuple[int, ...] = (240, 1400)   # thumbnail, page
 
@@ -227,11 +253,38 @@ def slug_for(title: str, fallback: str = "document") -> str:
     return base or fallback
 
 
-def download_name(title: str, version: int, fmt: str) -> str:
+def download_name(title: str, version: int, fmt: str, part: Optional[str] = None) -> str:
     """`quarterly-review-v2.pptx` — human, collision-safe within one artifact
     (the version is in the name), and the version directory keeps two
-    artifacts with the same title apart."""
-    return f"{slug_for(title)}-v{int(version)}.{fmt}"
+    artifacts with the same title apart. `part` names one piece of a
+    multi-part delivery — the per-sheet CSV of a multi-sheet workbook —
+    and lands as `quarterly-review-v2-pipeline.csv`; an empty part is no
+    part, so a one-sheet workbook keeps the plain name."""
+    stem = f"{slug_for(title)}-v{int(version)}"
+    if part and part.strip():
+        stem = f"{stem}-{slug_for(part, fallback='part')}"
+    return f"{stem}.{fmt}"
+
+
+_FILE_ID_RE = re.compile(r"[a-f0-9]{16}")
+
+
+def file_id_for(artifact_id: str, version: int, role: str, fmt: str, sheet: str = "") -> str:
+    """The identity of one file in one version: sixteen hex characters of
+    sha1 over (artifact, version, role, format, sheet). Code-minted from
+    what the file IS, never from bytes or a clock, so a retry, a re-render
+    and a history reload all agree on it, and a legacy row (no id stored)
+    can be given the same id it would have had (pipeline.ref_for)."""
+    import hashlib
+
+    key = f"{artifact_id}:{int(version)}:{role}:{fmt}:{sheet or ''}"
+    return hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
+
+
+def is_file_id(value: str) -> bool:
+    """Sixteen lowercase hex characters, and nothing else may name a file
+    in a URL."""
+    return bool(_FILE_ID_RE.fullmatch(value or ""))
 
 
 # ------------------------------------------------------------ references --
@@ -239,6 +292,15 @@ def download_name(title: str, version: int, fmt: str) -> str:
 
 @dataclass
 class FileRef:
+    """One file of one version, as stored in `artifact_versions.files` and
+    sent on the wire (CONTRACT-2 §2). The positional fields are the
+    original four-format contract; everything after `sheets` was added on
+    2026-09-12 with a default, so a stored row from before then still
+    loads. `file_id` is minted by the pipeline with `file_id_for`, never
+    by a worker; an empty one marks a legacy ref (URLs fall back to the
+    `/file/{format}` alias). `rows` counts DATA rows (header excluded) and
+    `columns` the header, both validated after render by reopening."""
+
     format: str
     filename: str
     mime_type: str
@@ -247,12 +309,21 @@ class FileRef:
     pages: Optional[int] = None
     slides: Optional[int] = None
     sheets: Optional[int] = None
+    file_id: str = ""
+    role: str = "primary"
+    title: str = ""
+    rows: Optional[int] = None
+    columns: Optional[int] = None
 
     def to_json(self) -> dict:
-        out = {"format": self.format, "filename": self.filename, "mime_type": self.mime_type, "size": self.size}
+        out = {"format": self.format, "filename": self.filename, "mime_type": self.mime_type, "size": self.size, "role": self.role or "primary"}
+        if self.file_id:
+            out["file_id"] = self.file_id
+        if self.title:
+            out["title"] = self.title
         if self.sha256:
             out["sha256"] = self.sha256
-        for key in ("pages", "slides", "sheets"):
+        for key in ("pages", "slides", "sheets", "rows", "columns"):
             value = getattr(self, key)
             if value is not None:
                 out[key] = value
@@ -285,11 +356,35 @@ class ArtifactRef:
     def base_path(self) -> str:
         return f"/artifacts/{self.artifact_id}/v/{self.version}"
 
+    def _file_urls(self, f: dict) -> None:
+        """Per-file URLs, by id when the file has one and by format (the
+        alias route, first file of that format) when it does not — a ref
+        persisted before ids existed still downloads. A grid format is
+        previewed from its own file; a page format from the version's
+        rasterised preview, which exists whenever the version has pages
+        (a `pages` version always; a `grid` version when its Word/PDF
+        companion was rendered — the pipeline counts that PDF's pages).
+        With no pages the URL is "", which the browser reads as
+        "download only"."""
+        fid = f.get("file_id") or ""
+        fmt = f.get("format") or ""
+        if fid:
+            f["download_url"] = f"{self.base_path}/f/{fid}?disposition=attachment"
+            f["inline_url"] = f"{self.base_path}/f/{fid}?disposition=inline"
+        else:
+            f["download_url"] = f"{self.base_path}/file/{fmt}?disposition=attachment"
+            f["inline_url"] = f"{self.base_path}/file/{fmt}?disposition=inline"
+        if fmt in GRID_FORMATS:
+            f["preview_url"] = f"{self.base_path}/grid?file={fid}" if fid else f"{self.base_path}/sheets"
+        elif fmt in PAGE_FORMATS and (self.preview_kind == "pages" or self.preview_pages > 0):
+            f["preview_url"] = f"{self.base_path}/preview"
+        else:
+            f["preview_url"] = ""
+
     def to_json(self) -> dict:
         files = [f.to_json() for f in self.files]
         for f in files:
-            f["download_url"] = f"{self.base_path}/file/{f['format']}?disposition=attachment"
-            f["inline_url"] = f"{self.base_path}/file/{f['format']}?disposition=inline"
+            self._file_urls(f)
         out = {
             "artifact_id": self.artifact_id,
             "version": self.version,
@@ -311,4 +406,9 @@ class ArtifactRef:
         }
         if self.parent_version is not None:
             out["parent_version"] = self.parent_version
+        if len(files) >= 2:
+            # One click for the whole delivery: the zip route bundles every
+            # file of the version. A single file needs no bundle.
+            out["download_all_url"] = f"{self.base_path}/zip"
+            out["package"] = {"count": len(files)}
         return out
