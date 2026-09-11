@@ -10,8 +10,7 @@ MEASURED, on the 2h23m Gujarati/Hindi/English recording a person uploaded on
 2026-09-11 (analysis 28, 1,698 cues, 114,266 characters):
 
     "no" 434 times inside ONE cue
-    "It will happen," 110 times back to back
-    "It will match with the IDC," 55 times
+    a three-word phrase 110 times back to back, a six-word phrase 55 times
     "यूज़" 55 times, "ਹ" with its vowel sign 59 times inside a single word
     "I am a" as 85 SEPARATE cues spanning 15.9 seconds — five a second
     265 of the 1,698 cues were part of a run of identical consecutive cues
@@ -57,12 +56,12 @@ _KEEP = 2
 _MIN_RUN = 3
 
 #: The longest repeated phrase looked for, in words. Sized from the recording
-#: rather than guessed: "It will match with the IDC," is six and "is not
-#: possible to develop only with an extension, it" is TEN, repeated 40 times
-#: inside one cue — a limit of eight left that one cue, 2,178 characters of
-#: it, untouched. Sixteen clears the longest loop seen with room over, and the
-#: longest genuine cue in the same transcript (113 words) contains no
-#: back-to-back repeat at all, so nothing real is within reach of it.
+#: rather than guessed: the longest phrases the recording looped were six
+#: words (55 times) and TEN words (40 times inside one cue) — a limit of
+#: eight left that one cue, 2,178 characters of it, untouched. Sixteen clears
+#: the longest loop seen with room over, and the longest genuine cue in the
+#: same transcript (113 words) contains no back-to-back repeat at all, so
+#: nothing real is within reach of it.
 _MAX_PHRASE_WORDS = 16
 
 #: Identical characters in a row kept inside one word. Three: no script writes
@@ -79,9 +78,9 @@ def _collapse_phrases(words: Sequence[str]) -> Tuple[List[str], int]:
     """Collapse every run of a back-to-back repeated phrase.
 
     Walks left to right; at each position it looks for the repeated block that
-    COVERS THE MOST WORDS, so "It will happen, it will happen, …" is found as a
-    three-word phrase repeated 110 times rather than as no single-word run at
-    all. Returns the words kept and how many were dropped.
+    COVERS THE MOST WORDS, so a three-word phrase repeated 110 times is found
+    as that phrase rather than as no single-word run at all. Returns the
+    words kept and how many were dropped.
     """
     out: List[str] = []
     dropped = 0

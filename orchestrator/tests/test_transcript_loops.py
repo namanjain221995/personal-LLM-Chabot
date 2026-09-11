@@ -30,13 +30,15 @@ def test_two_in_a_row_is_speech_and_is_left_alone():
 
 
 def test_a_repeated_phrase_is_found_as_a_phrase():
-    """From the recording: "It will happen," 110 times and "It will match
-    with the IDC," 55 times. Scanning single words alone finds neither — no
-    individual word repeats — so the scan takes the longest block it can."""
-    text = loops.clean_text("It will happen, " * 110)
-    assert text == "It will happen, It will happen,"
+    """From the recording: a three-word phrase 110 times and a six-word
+    phrase 55 times (the words themselves are the speaker's, so synthetic
+    ones of the same length stand in). Scanning single words alone finds
+    neither — no individual word repeats — so the scan takes the longest
+    block it can."""
+    text = loops.clean_text("it will happen, " * 110)
+    assert text == "it will happen, it will happen,"
 
-    six = "It will match with the IDC, "
+    six = "one two three four five six, "
     assert loops.clean_text(six * 55) == (six + six).strip()
 
 
@@ -44,7 +46,7 @@ def test_a_ten_word_loop_is_within_reach():
     """From the recording, and the reason the phrase limit is not eight: one
     cue repeated a TEN-word phrase 40 times, 2,178 characters of it, and
     survived an earlier eight-word limit completely intact."""
-    ten = "is not possible to develop only with an extension, it "
+    ten = "w1 w2 w3 w4 w5 w6 w7 w8 w9 w10, "
     assert loops.clean_text(ten * 40) == (ten + ten).strip()
 
 
@@ -56,7 +58,7 @@ def test_a_long_genuine_cue_is_not_touched():
 
 
 def test_the_speech_around_a_loop_survives_it():
-    assert loops.clean_text("सबका देजिए " + "फॉल्ड " * 53 + "और बस") == "सबका देजिए फॉल्ड फॉल्ड और बस"
+    assert loops.clean_text("before " + "फॉल्ड " * 53 + "after") == "before फॉल्ड फॉल्ड after"
 
 
 def test_a_character_cycling_inside_one_word_is_cut_to_three():

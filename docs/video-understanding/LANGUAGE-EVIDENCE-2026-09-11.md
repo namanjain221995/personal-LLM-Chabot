@@ -1,8 +1,8 @@
 # Speech-to-text on a Gujarati / Hindi / English meeting — what was measured
 
 Date: 2026-09-11. Recording: the 2h23m meeting behind analysis 28 (a user's
-own upload; nothing from it is quoted beyond short fragments needed to show
-the engine's behaviour). Engine: `openai/whisper-large-v3`, revision
+own upload; nothing said in it is quoted — only the tokens the decoder
+repeated, which are artefacts rather than speech). Engine: `openai/whisper-large-v3`, revision
 `06f233fe`, the worker Spark. Probe: `scripts/asr_language_probe.py`.
 
 ## The complaint
@@ -24,8 +24,8 @@ understand the language" when a person speaks Hindi or Gujarati.
 
 Repetition, counted exactly:
 
-* "no" 434 times inside one cue; "It will happen," 110 times; "It will match
-  with the IDC," 55 times; a ten-word phrase 40 times (2,178 characters).
+* "no" 434 times inside one cue; a three-word phrase 110 times; a six-word phrase 55 times; a ten-word
+  phrase 40 times (2,178 characters).
 * "I am a" as 85 separate cues between 2177.8 s and 2193.8 s — five a second.
 * 265 of 1,698 cues were part of a run of identical consecutive cues.
 * **17.9 % of the transcript's characters were the decoder repeating itself.**
@@ -37,15 +37,15 @@ Repetition, counted exactly:
 | window | setting | detected | chars | time | what came back |
 |---|---|---|---|---|---|
 | 790 s | auto | `pa` | 363 | 68 s | Punjabi script, one phrase ×12, then a character loop |
-| | `gu` | `gu` | 605 | **145 s** | real Gujarati ("આલ્ગોરિધમ લેવલ જીરો ચેન્જ હશે"), then "હશે" ×25 |
+| | `gu` | `gu` | 605 | **145 s** | real Gujarati words (a sentence about an algorithm-level change), then one verb ×25 |
 | | `hi` | `hi` | 226 | 23 s | "सब्सक्राइब" ×16 — the YouTube-caption hallucination |
 | | `en` | `en` | 832 | 17 s | fluent English, no loop — a **translation** of the Gujarati |
-| 2150 s | auto | `en` | 619 | 15 s | fluent English — a translation of Hindi ("Now that you are looking at me…") |
+| 2150 s | auto | `en` | 619 | 15 s | fluent English — a translation of the Hindi that `hi` returns below, not a transcription |
 | | `gu` | `gu` | 352 | 70 s | Hindi words in Gujarati letters, then a loop |
-| | `hi` | `hi` | 447 | 49 s | **correct Hindi** ("अभी आपको मुझे देख रहे हैं तो ऐसे लग रहा है…"), then "सब्सक्राइब" |
+| | `hi` | `hi` | 447 | 49 s | **correct Hindi** (the sentence the `en` row translated), then "सब्सक्राइब" |
 | | `en` | `en` | 619 | 16 s | same translation as auto |
 | 6690 s | auto | `en` | 684 | 11 s | fluent English — a translation of Gujarati |
-| | `gu` | `gu` | 924 | **277 s** | real Gujarati ("આપડે સિસ્ટમ ડિઝાઇન કરેલી છે"), badly mangled |
+| | `gu` | `gu` | 924 | **277 s** | real Gujarati (a sentence about the system design), badly mangled |
 | | `hi` | `hi` | 283 | 26 s | "सब्सक्राइब" ×20 |
 | | `en` | `en` | 684 | 16 s | same translation as auto |
 
@@ -53,7 +53,7 @@ Repetition, counted exactly:
 
 1. **The speaker switches between Gujarati, Hindi and English within
    minutes.** Both Hindi and Gujarati are genuinely present (the `hi` output
-   at 2150 s and the `gu` output at 6690 s are the actual words).
+   at 2150 s and the `gu` output at 6690 s are the words that were said).
 2. **"Transcribe" is not honoured when the engine decides the language is
    English.** With `task=transcribe` and `<|en|>`, Whisper produces an
    English *translation* of Hindi/Gujarati speech. Auto-detect chose `en`
