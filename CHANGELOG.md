@@ -1,6 +1,6 @@
 # Changelog
 
-## The two-node engine stops dying, and gets faster doing it (2026-09-11)
+## MTP off on the two-node engine: faster, one crash path closed, the GDN prefill fault remains (2026-09-11)
 
 Since 28 August the TP=2 main engine had died four times mid-run, each time
 taking 9–15 minutes to serve again. The analysis of 2026-09-10
@@ -35,7 +35,22 @@ tokens on the same 8 GiB because the prefix cache's 2112-token block padding
 is gone. Prefix caching was hitting 8–16 % of prompt tokens on the
 long-conversation tail; it is off as a stability trade (vLLM calls it
 experimental on this hybrid model) and is one `.env` line to bring back.
-SOAK_SENTENCE_PLACEHOLDER
+**And then the soak said no.** Twenty-seven minutes into a mixed
+workload at concurrency 10 (`scripts/cluster-soak.py`: short turns, long
+documents and 32K pastes in flight together) rank 0 faulted with the same
+`misaligned address` — in the GDN layer's *prefill* Triton kernel
+(`fused_post_conv_prep`) on a mixed prefill+decode batch, a path that runs
+only *without* spec-decode. So the analysis attributed the earlier faults to
+the wrong line (an asynchronous CUDA error surfaces at the next call that
+checks, and `index_select` checks): the bug is in this build's GDN kernels
+on mixed batches, MTP merely made such batches more frequent. The engine
+change stands — faster, one manifestation gone — but this vLLM build is not
+crash-free under mixed load, and the durable fix is a build with the later
+GDN kernel fixes, accepted with the same soak. Recovery from that fault took
+11 m 47 s unassisted (engine self-exit, Docker restart, worker self-restart
+at its 10-miss rule — now 4 — and a re-pair inside the rendezvous window).
+Long context afterwards: 262K in 78.5 s and 500K in 242 s with 3/3 needles;
+950K deliberately not run on a head with 29 GiB of headroom.
 
 **The orchestrator waits out a restart instead of dying on it.**
 `app/resilience.py` is the one retry layer every model call in `app/llm.py`
@@ -67,9 +82,18 @@ engine argument" runbook in `docs/CLUSTER.md`, which also stops blaming
 corrections (one pipeline workflow, `DEPLOY_ON_PUSH` unset means deploy, the
 withdrawn 13 Gb/s fabric claim, test counts).
 
-**Not done, specified:** moving the 22 GiB router to the worker (the head
-swaps continuously while the worker has ~40 GiB free), an Alertmanager (no
-alert has reached a human in 11.7 days), a completion-based wedge alert.
+**Failure tests on the isolated e2e tier:** a router restart under Fast
+chats (the person sees "The model is restarting…", the chat completes when it
+is back) and an engine restart under a Smart chat plus a video job (the chat
+fails fast with `MODEL_UNAVAILABLE` at 120 s; the video's fusion stage waits
+75 s under its 20-minute window and completes). The Fast-mode path that
+turned that 120 s wait into an empty "successful" answer was fixed the same
+hour (`continuation.py`: nothing produced is not a partial answer).
+
+**Not done, specified:** the vLLM build upgrade that actually closes the
+fault, moving the 22 GiB router to the worker (the head swaps continuously
+while the worker has ~40 GiB free), an Alertmanager (no alert has reached a
+human in 11.7 days), a completion-based wedge alert.
 
 ## Enterprise login, workspaces and an audited admin surface (2026-09-01)
 

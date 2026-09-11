@@ -54,19 +54,18 @@ NCCL_DEBUG_LEVELS = ("VERSION", "WARN", "INFO", "TRACE")
 #: ``CLUSTER_SPECULATIVE_CONFIG`` takes to turn speculative decoding ON.
 MTP_SPECULATIVE_CONFIG = '{"method":"mtp","num_speculative_tokens":1}'
 #: Speculative decoding is OFF unless .env asks for it. Until 2026-09-11 the
-#: default was the MTP draft above; it was withdrawn because on the pinned
-#: build (0.26.1rc1.dev77) three of the four CUDA faults the cluster has
-#: logged since 28 August -- `misaligned address` / `illegal memory access`
-#: on rank 1, each taking the TP=2 collective and 9-15 minutes of serving
-#: with it -- are in the Qwen GDN spec-decode branch
-#: (`qwen_gdn_linear_attn.py`, the `index_select` on mixed spec/non-spec
-#: batches), a branch that is unreachable when `spec_sequence_masks` is
-#: None, i.e. without this flag. (The fourth, 2026-09-10, was a cuDNN FP8
-#: GEMM launch error under the same mixed load; not proven MTP-gated.) See
-#: docs/ISSUE/gdn-spec-decode-fault-report.md. Measured after the switch:
-#: decode got FASTER, because without spec-decode vLLM keeps FULL CUDA
-#: graphs for decode instead of downgrading to PIECEWISE. Setting the key to
-#: MTP_SPECULATIVE_CONFIG opts back in; the launcher never does it silently.
+#: default was the MTP draft above. It was withdrawn during the GDN fault
+#: investigation (docs/ISSUE/), and it stays off for two measured reasons:
+#: without spec-decode this vLLM build (0.26.1rc1.dev77) keeps FULL CUDA
+#: graphs for decode instead of downgrading to PIECEWISE, and single-stream
+#: decode went from 69 to 101 tok/s (docs/CLUSTER.md, "Engine tuning"); and
+#: the draft's mixed spec/non-spec batches were one path into the build's
+#: GDN `misaligned address` fault. That fault is NOT closed by this switch --
+#: the same day's soak reproduced it in the GDN prefill kernel on an ordinary
+#: mixed prefill+decode batch (docs/ISSUE/gdn-spec-decode-remediation-
+#: 2026-09-11.md, section 1.1); the durable fix is a vLLM build with the
+#: later GDN kernel fixes. Setting the key to MTP_SPECULATIVE_CONFIG opts
+#: back in; the launcher never does it silently.
 DEFAULT_SPECULATIVE_CONFIG = ""
 DEFAULT_MAX_NUM_BATCHED_TOKENS = 8192
 # Explicit per-node KV budget. On GB10 unified memory "free GPU memory" is free

@@ -13,11 +13,21 @@ Every claim below is tagged **VERIFIED** (observed on the running system), **CHA
 **VERIFIED** — from the installed source, not inferred:
 
 - `vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py:1249-1255` runs `mixed_qkv.index_select(0, non_spec_token_indx)` only inside `if spec_sequence_masks is not None`, and `vllm/v1/attention/backends/gdn_attn.py:189-198` sets `spec_sequence_masks = None` whenever `not self.use_spec_decode`. Without `--speculative-config` the branch cannot execute.
-- Three of the four CUDA faults in the worker's retained log are in that branch: 2026-09-01 19:46:49Z (`illegal memory access`), 2026-09-01 23:36:49Z and 2026-09-02 08:28:54Z (`misaligned address`), each matched by `Xid 13` (Misaligned Address, GPC 3) and `Xid 43` in the worker's kernel log, each followed by the head's collective hanging and a 9–15 minute reload.
+- Three of the four CUDA faults in the worker's retained log were *reported* at that branch (see §1.1 for why the reporting line is not the faulting kernel): 2026-09-01 19:46:49Z (`illegal memory access`), 2026-09-01 23:36:49Z and 2026-09-02 08:28:54Z (`misaligned address`), each matched by `Xid 13` (Misaligned Address, GPC 3) and `Xid 43` in the worker's kernel log, each followed by the head's collective hanging and a 9–15 minute reload.
 - The fourth, 2026-09-10 21:31:42Z, is a **different site**: `torch.ops.vllm.bmm_fp8` → FlashInfer `fp8_gemm_sm100` → cuDNN `execute` → `cuLaunchKernelEx` err 1 (`CUDA_ERROR_INVALID_VALUE`) inside the compiled graph of the attention projections (the checkpoint's 130 FP8 `linear_attn`/`self_attn` projections), under the same mixed load, with no Xid. Its relation to MTP is plausible (spec-decode shapes the batches) but **not proven**; the soak in §7 is the evidence that matters for it.
 - Both nodes: identical image digest `vllm/vllm-openai@sha256:24f2f89…`, byte-identical engine arguments, NCCL 2.30.7 over both RoCE rails (`Using network IB`, no socket fallback). The fault-to-serving timeline of the 2026-09-10 event, from Prometheus + both logs: fault 21:31:42Z → GPUs pinned at 96 % with `generation_tokens_total` frozen → head engine died at +300 s (`VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS`, an environment default inside vLLM — **not** `--distributed-timeout-seconds` as the analysis and `docs/CLUSTER.md` said) → container healthcheck killed the API process → Docker's restart policy restarted the container at 21:38:25Z → worker rejoined 21:41:36Z → serving 21:45:43Z. **14 minutes.**
 
-The report's "it is not hardware" discriminator stands: since the 2026-09-10 reboot both kernels show 0 Xid, and the OCR and whisper engines on the very GPU that threw every Xid restarted 9 and 0 times (lifetime) against the main engine's 23 engine starts in 11.7 days (Prometheus `changes(process_start_time_seconds[14d])`).
+The report's "it is not hardware" discriminator stands: since the 2026-09-10 reboot both kernels showed 0 Xid until the event below, and the OCR and whisper engines on the very GPU that threw every Xid restarted 9 and 0 times (lifetime) against the main engine's 23 engine starts in 11.7 days (Prometheus `changes(process_start_time_seconds[14d])`).
+
+### 1.1 What the soak then proved — the report's conclusion was too narrow (**VERIFIED** 2026-09-11 07:05:33Z)
+
+27 minutes into the mixed-workload soak (§7, concurrency 10, MTP **off**, prefix caching **off**) **rank 0 faulted**: `RuntimeError: Triton Error [CUDA]: misaligned address` raised by `qwen_gdn_linear_attn.py:1348 _forward_core` → `vllm/third_party/flash_linear_attention/ops/fused_gdn_prefill_post_conv.py:215 fused_post_conv_prep`, with `Xid 13` (Graphics Exception, class 0xcec0) and `Xid 31` (MMU fault, GPC2, `@ 0x0`) in the head's kernel log, then `terminate called after throwing c10::AcceleratorError`. That is the GDN layer's **prefill path on a mixed prefill+decode batch** — the code takes it only when `split_non_spec = (spec_sequence_masks is None and num_prefills > 0 and num_decodes > 0)`, i.e. exactly *without* spec-decode — not the `index_select` branch.
+
+Consequences:
+
+- The misalignment bug in this build's GDN Triton kernels is **not confined to spec-decode**. It fires on mixed prefill+decode batches — which is what the uniform benchmark rungs never produce and what the analysis pipeline and the soak produce continuously. The three "`index_select`" faults of 1–2 September are almost certainly the same asynchronous CUDA error surfacing at the next synchronising call (`index_select` checks errors; the Triton launch that preceded it does not), which the analysis read as the crash site. MTP made mixed steps more frequent; it is not required.
+- The engine change stands on its own merits — it is faster (§3) and removes one manifestation — but **it does not make this vLLM build crash-free under mixed load**. The durable fix is a vLLM build whose GDN kernels are fixed (§13, item 1); until then the recovery path (§11) and the orchestrator's outage tolerance (§4) are what limit the damage.
+- Recovery, this time, unassisted: fault 07:05:33Z → EngineCore waited 3 × 60 s on the dead worker process (`No available shared memory broadcast block`) → API exit and Docker restart 07:09:20Z → the worker's healthcheck restarted rank 1 at 07:14:14Z (its 10-miss rule; now 4) → re-paired inside the head's rendezvous window → serving 07:17:20Z. **11 min 47 s**, no watchdog action needed (it correctly saw a fast 5xx, not a hang). Logs preserved: `.runtime/logs/head-fault-20260911T070843Z.log`, `worker-at-head-fault-…`, `head-kernel-…`; apport wrote `/var/crash/_usr_bin_python3.12.0.crash` (845 KB) during those minutes.
 
 ## 2. What was changed
 
@@ -127,18 +137,21 @@ Off, for now. The report's "0.99×, none" was true on 2026-08-29 (0 hits of 40,8
 | B — repeated sequential (bench c=1, 8 + 8 + 8 requests) | **PASS** — 100.7 tok/s, TTFT p99 95 ms |
 | C — concurrent (bench c=4 ×32, c=10 ×40) | **PASS** — 238.7 / 283.9 tok/s, 0 failures |
 | D — mixed workload (`scripts/cluster-soak.py`: 60 % short chat turns, 30 % 3–9K-token documents, 10 % 24–32K pastes, thinking on for a third, all in flight together at concurrency 10) | see E |
-| E — sustained soak, concurrency 10, 60 minutes, both nodes monitored every 30 s for CUDA faults, Xid, engine restarts, frozen `generation_tokens_total`, watchdog events | SOAK_RESULT_PLACEHOLDER |
+| E — sustained soak, concurrency 10, both nodes monitored every 30 s for CUDA faults, Xid, engine restarts, frozen `generation_tokens_total`, watchdog events | **FAIL at 27 min** — 1,400+ requests clean (short TTFT p50 0.42 s, medium 0.85 s, long 3.0 s), then the rank-0 GDN prefill fault of §1.1; the monitor caught it on the first sample (faults 7, Xid 2, tokens frozen at 286,496 with 10 running) and the recovery in §1.1 followed. Log: `.runtime/logs/cluster-soak-20260911-120831.jsonl`. The harness had no backoff on a dead port (fixed the same hour). |
 | Launcher suite | 474 passed (`env -u TECHSARA_MODEL_CACHE python3 -m unittest discover -s launcher/tests`) |
 | Orchestrator suite | 3,154 collected, all passed against a private test database (`TEST_DATABASE_URL=…/test_gdn_lead` on the throwaway `pg-test`) |
 | CI ruff gate (E9/F63/F7/F82) | clean |
 | Compose validation | the full 4-file chain + 3 env files + 4 profiles renders (`docker compose config`); the verify script and every `scripts/cluster-*.sh` run against the live stack |
-| Long context (§9) | LONGCTX_PLACEHOLDER |
-| Failure testing (§10) | FAILURE_PLACEHOLDER |
+| Long context (§9) | 8K / 32K / 131K / 262K / **500K** accepted with 3/3 needles each; 950K **not run** (memory-constrained head, §9) |
+| Failure testing (§10) | router restart under Fast chats: PASS; engine restart under a Smart chat + a video job: PASS (chat → `MODEL_UNAVAILABLE` after 120 s; video waited 75 s and completed) |
 
 ## 8. Other changes in this programme
 
 - **Embed and reranker engines** get an explicit `--kv-cache-memory-bytes 2 GiB` (`EMBED_KV_CACHE_MEMORY_BYTES` / `RERANKER_KV_CACHE_MEMORY_BYTES`): on 2026-09-09 the embed engine computed a *negative* KV budget three starts in a row while the head's free memory moved under it. Verified after the restart: `GPU KV cache size: 18,720 tokens`, ready in 42 s.
-- **Whisper healthcheck** (`compose/whisper/server.py`): after `WHISPER_CUDA_DEATH_THRESHOLD`=3 consecutive CUDA-runtime failures the server sets `ready=false`, records why on `/health` (with a `cuda_failures` counter) and exits so `restart: unless-stopped` gives it a fresh CUDA context. WHISPER_DEPLOY_PLACEHOLDER
+- **Whisper healthcheck** (`compose/whisper/server.py`): after `WHISPER_CUDA_DEATH_THRESHOLD`=3 consecutive CUDA-runtime failures the server sets `ready=false`, records why on `/health` (with a `cuda_failures` counter) and exits so `restart: unless-stopped` gives it a fresh CUDA context. **Deployed** 07:26–07:28Z, one replica at a time (head 22 s load, worker 24 s), `ASR_BASE_URLS` unchanged; the death logic was unit-checked inside the built image.
+- **Worker healthcheck** (`compose/compose.cluster-worker.yaml`): a head whose API process exits outright answers 000, not 5xx, so the worker's "head unreachable" rule was the only thing re-pairing it — and its ten misses (5 min) were a third of the 07:05Z outage. Now four misses (2 min), the same as the head's own rule; the head's rendezvous waits 300 s for the worker, so re-pairing on the first attempt stays likely. Shipped to the worker and applied at the 07:29Z restart (`Healthcheck.Retries: 4` on the running container).
+- **`scripts/cluster-soak.py`** — backs off on a dead port instead of hammering it (the first run drowned the monitor in identical lines).
+- **`orchestrator/app/continuation.py`** — a first segment that dies before producing a single token now propagates the exception (seen live: the Fast-mode answer path turned a 120 s `ModelUnavailable` into an empty "successful" answer with no error event); a partial answer is still kept. `resilience.py` announces the wait once per outage per turn even when the route classification and the answer wait in sibling tasks, and rounds the window it names.
 - **`scripts/cluster-verify-engine.sh`** — proves the engine configuration from `docker inspect` on both nodes, compares the two argument lists, greps both retained logs and kernel journals, and (`--probe`) sends one completion with GPU sampling on both Sparks.
 - **`scripts/cluster-soak.py`** — the mixed-workload soak with the two-node monitor and a PASS/FAIL verdict.
 - **`docs/CLUSTER.md`** — the "changing an engine argument" runbook (there was none; a routine deploy deliberately cannot restart the engine), corrected timeout attribution, the measured tuning rows.
@@ -146,11 +159,28 @@ Off, for now. The report's "0.99×, none" was true on 2026-08-29 (0 hits of 40,8
 
 ## 9. Long-context validation
 
-LONGCTX_DETAIL_PLACEHOLDER
+`orchestrator/scripts/validate_long_context.py --base-url http://127.0.0.1:8000/v1 --sizes 8192,32768,131072,262144 --max-output 128`, then `--sizes 500000`, real-tokenizer prompts via `/tokenize`, three needles at 2 % / 50 % / 97 % (**TESTED** 07:35–07:41Z, engine idle):
+
+| Requested | Prompt tokens | Latency | Needles | 2026-08-29 (MTP on) |
+|---|---|---|---|---|
+| 8,192 | 8,119 | 1.3 s | 3/3 | — |
+| 32,768 | 32,725 | 4.5 s | 3/3 | — |
+| 131,072 | 131,005 | 26.1 s | 3/3 | — |
+| 262,144 | 262,051 | **78.5 s** | 3/3 | 109 s |
+| 500,000 | 499,805 | **242.4 s** | 3/3 | 248 s (449,844 tokens) |
+| ~950,000 | — | **not run** | — | 878 s |
+
+The 500K run was guarded (abort on head `MemAvailable` < 6 GiB; it never dropped below 28 GiB). 950K was **deliberately not run**: on 2026-08-29 that prefill exhausted unified memory and restarted the engine until the head had ~37 GiB of headroom, the head has 27–30 GiB today (§5), and the day had already cost two engine restarts. The 1M window is served (`max_model_len 1,000,000`, KV pool 1,663,201 tokens = 1.66× a 1M request) and 500K is proven; the practical tested ceiling on this head, as it is loaded today, is 500K. The `NV_ERR_NO_MEMORY` kernel lines logged 07:33:03–07:34:01Z are the engine's *start-up* allocation retries (the same pattern at every boot), not the 500K run.
 
 ## 10. Failure testing
 
-FAILURE_DETAIL_PLACEHOLDER
+On the isolated e2e tier (`scripts/e2e-stack.sh`, rebuilt from this branch, shared engines, a seeded QA user) — **TESTED**:
+
+**A — router engine restart under Fast-mode chats** (07:18:51Z, `docker restart sf-local-ai-vllm-router-1`, replica back ~2.5 min later): eight sequential chats; q1–q2 before the restart answered normally; q3 and q4 received the `status` event "The model is restarting — waiting for it to come back…"; q4 waited 41 s and completed with 72 tokens; q5–q8 normal. q3 spanned the whole 120 s interactive window and exposed the empty-answer swallow in `continuation.py` (fixed above; the orchestrator had classified it correctly — `ModelUnavailable` after 120 s and 1 attempt).
+
+**B — main-engine restart under a Smart chat and a video job** (07:29:13Z, a clean pair restart that also applied the worker-healthcheck change): the Smart chat, started while the engine was down, showed the "restarting" status at 0.2 s and was closed after 120 s as `failed` with the `MODEL_UNAVAILABLE` sentence (persisted on its `chat_requests` row and in the worker's log). The video job (`analysis_id 22`, submitted at 07:33Z while the engine was still down) ran probe → audio → transcript → frames → OCR → vision normally, then its **fusion** stage hit `APIConnectionError`, logged `llm.resilient what=json_completion … still waiting for the engine (60s of 1200s)`, saw the engine back after 75.4 s, completed fusion (84.4 s stage time) and delivered the answer 96 s after submission. No stranded row, no retry loop, no operator action.
+
+**C — unplanned: the 07:05Z fault itself** (§1.1) — the full self-healing chain end to end: engine self-exit, Docker restart, worker self-restart, re-pair, 11 m 47 s.
 
 ## 11. Watchdog and timeouts (**VERIFIED**, decisions recorded)
 
@@ -165,7 +195,7 @@ FAILURE_DETAIL_PLACEHOLDER
 
 ## 13. Known limitations and follow-ups
 
-1. **The soak is one hour.** The historical faults fired 4–9 hours apart under a multi-hour sweep. The strongest evidence will be the worker-side pipeline's next sweeps and the 24 h/7 d Prometheus counters (`changes(process_start_time_seconds{job="vllm-main"}[7d])` should stay at the 06:26Z start).
+1. **The fault class is not closed on this vLLM build** (§1.1). The GDN Triton kernels in `0.26.1rc1.dev77+g6f91edf96` (nightly 2026-07-29) misalign on mixed prefill+decode batches whether or not spec-decode is on. The durable fix is a build whose GDN/FLA kernels carry the later fixes (candidates from the 2026-09-03 diagnosis: v0.28.0 with "GDN gates aligned with speculative tokens" #51812, the fused post-conv kernel work #51674, and later); it must be pulled to both nodes (same digest; the router and OCR share it), validated on sm 12.1 / CUDA 13 / the NVFP4 checkpoint / YaRN 1M, and accepted with `scripts/cluster-verify-engine.sh --probe` plus **`scripts/cluster-soak.py --minutes 120 --concurrency 10`** — the reproducer that fired at 27 minutes today. Until then, the worker-side analysis pipeline (concurrency 10, mixed) should expect a fault every few hours and needs its client patched (`interview-analysis-client/`); the orchestrator's own jobs now survive the reload.
 2. **Router to the worker** — the single largest head-memory fix (≈22 GiB) — is specified, not done: a `router` Compose profile + `ROUTER_REMOTE_BASE_URL` in `launcher/techsara_cli/environment.py` (mirror `remote_ocr_url`), the launcher probing the remote engine instead of starting `vllm-router`, `scripts/router.sh` + `compose/compose.router.yaml` (mirror `scripts/ocr.sh` / `compose.ocr.yaml`, host-bound to 192.168.9.68:30002, same image digest, explicit KV budget), a `file_sd` scrape target, and tests for the profile logic. It touches the intent classifier on every chat turn and Fast mode, so it deserves its own change window.
 3. **Head swap.** Until the router moves: stop the non-production residents the owner does not need (`pg-test`, `litellm-dgx`, `techsara-e2e-*` between QA runs, `portainer`, `zealous_williamson`) and the second vscode-server tree; do not add swap; lower `vm.swappiness` only after the residents are trimmed.
 4. **Alerting**: add an Alertmanager and a route; a rule on `changes(process_start_time_seconds{job="vllm-main"}[1h]) > 1`; a wedge rule keyed on a blackbox *completion* probe rather than GPU utilisation; larger `chat_*` histogram buckets in `orchestrator/app/metrics.py` (they cap at 30 s).
