@@ -127,12 +127,18 @@ PRIVATE_ROUTES: Dict[str, str] = {
     "rag": "documents from this workspace",
     # V28: an answer grounded on a video someone uploaded IS that video.
     "video": "an uploaded video",
+    # A turn answered with a generated file: the file is the answer.
+    "artifact": "generated files held in this workspace",
 }
 
 #: Meta keys whose PRESENCE means the answer drew on something private, even
 #: when the route looks innocuous — an agent turn that reached Salesforce is a
 #: Salesforce turn.
 PRIVATE_META_KEYS: Dict[str, str] = {
+    # Artifact Studio (2026-09-11): a generated document, deck or workbook
+    # is the owner's file; its reference carries owner-scoped URLs a reader
+    # of the share could not open and a title that may be the whole point.
+    "artifacts": "generated files held in this workspace",
     "salesforce_sources": "Salesforce records",
     "salesforce_scope": "Salesforce records",
     "salesforce_error": "Salesforce records",

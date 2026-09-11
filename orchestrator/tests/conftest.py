@@ -68,6 +68,11 @@ _APP_TABLES = (
     # V28 video: attachments carry a user FK (cascade) but a NULL-user row
     # (bare API call) would survive; the analysis table has no FK at all.
     "video_attachments",
+    # V31 (2026-09-11): artifact jobs and versions cascade from artifacts,
+    # which cascade from users; children first so TRUNCATE reads plainly.
+    "artifact_jobs",
+    "artifact_versions",
+    "artifacts",
     # V29 (2026-09-10): upload sessions and send intents cascade from users
     # and conversations, but naming them keeps a truncation explicit.
     "upload_sessions",
