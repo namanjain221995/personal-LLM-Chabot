@@ -1,0 +1,35 @@
+Host	Candidate	Date	Session ID	Meeting ID	Interview Duration (min)	Ratio of Interview Post-Session	Outcome	Audit Comments
+Ravi Sharma	Priya Nair	2026-08-03	S-1041	MTG-77812	42	0.81	Selected	candiate was confident, ansered all q's. at 00:12:30 host asked abt system design, good explanation
+	Arjun Mehta	2026-08-03	S-1042	MTG-77813	38	0.66	Rejected	weak on basics. host had to repeat questn twice (00:05:10). no follow up
+	Sneha Iyer		S-1043	MTG-77814	51	0.90	Selected	very good comunication; post session ratio high; host praised her at 00:40:02
+Kavita Rao	Deepak Joshi	2026-08-04	S-1044	MTG-77820	29		On hold	session cut short due to network issue at 00:20:15, need to reschedule
+    Meera Pillai    2026-08-04        MTG-77821    45    0.72    Selected    solid. minor grammer issues but technically strong
+	Rohan Desai	2026-08-04	S-1046	MTG-77822		0.40	Rejected	did not prepare, could not explain own project. host remaind polite
+Suresh Kumar	Anjali Verma	2026-08-05	S-1047	MTG-77830	47	0.85	Selected	excellent; host spent extra 5 min on culture fit (00:41:00 - 00:46:00)
+	Vikram Singh	2026-08-05	S-1048	MTG-77831	33	0.55	Rejected	avg. answers were short, host promted many times
+	Neha Gupta			MTG-77832	40	0.78	Selected	good analitical skills, clear about expectations	
+	Karan Malhotra	2026-08-05	S-1050	MTG-77833	36	0.61	On hold	host unsure; candidate strong in one area only. recheck at panel
+Ravi Sharma	Pooja Reddy	2026-08-06	S-1051	MTG-77840	44	0.83	Selected	confident and precise. at 00:15:45 explained the tradeoffs very well
+    Amit Patel    2026-08-06    S-1052    MTG-77841    31    0.47    Rejected    kept switching topics; host had difficulty to keep on track
+	Divya Menon	2026-08-06	S-1053		49	0.88	Selected	great. mentioned prior audit experiance. no concerns
+	Sanjay Bhat		S-1054	MTG-77843	27		Rejected	left early (00:27:00), said had another call
+Kavita Rao	Lakshmi Krishnan	2026-08-07	S-1055	MTG-77850	46	0.80	Selected	well prepared; asked good questions back to host at 00:38:10
+	Nikhil Jain	2026-08-07	S-1056	MTG-77851	35	0.58	On hold	borderline. host recomends second round
+	Ritu Saxena	2026-08-07	S-1057	MTG-77852	41	0.74	Selected	good, slighly nervous at start but recoverd
+	Harsh Vardhan	2026-08-07		MTG-77853				no show. host waited 15 min
+Suresh Kumar	Ananya Das	2026-08-08	S-1059	MTG-77860	48	0.86	Selected	strong candidate, clear, structured answers, host impressed
+	Manish Tiwari	2026-08-08	S-1060	MTG-77861	30	0.50	Rejected	basic knowlege gaps. at 00:10:00 could not define key terms
+    Shreya Kulkarni    2026-08-08    S-1061    MTG-77862    43    0.79    Selected    good all round. recomended
+	Varun Chopra		S-1062	MTG-77863	39	0.63	On hold	host felt candidate was reading answers (00:22:40). verify in next round
+Ravi Sharma	Isha Agarwal	2026-08-10	S-1063	MTG-77870	45	0.82	Selected	very articulate; post session ratio consistant with performance
+	Tarun Mishra	2026-08-10	S-1064	MTG-77871	34	0.52	Rejected	did not meet bar; host was fair and gave feedback at end (00:33:20)
+	Gauri Shinde	2026-08-10	S-1065	MTG-77872	50	0.91	Selected	outstanding. best of the day per host
+	Yash Thakur	2026-08-10			28	0.45	Rejected	audio problems for first 8 mins, then weak answers
+Kavita Rao	Bhavna Sood	2026-08-11	S-1067	MTG-77880	42	0.77	Selected	steady and reliable answers. host noted good attitude	
+	Pranav Nambiar	2026-08-11	S-1068	MTG-77881	37	0.60	On hold	mixed; strong coding, weak on explaining. host suggests pairing round
+	Simran Kaur	2026-08-11	S-1069	MTG-77882	46	0.84	Selected	clear and confident; asked about team at 00:44:00
+	Aditya Rao	2026-08-11	S-1070	MTG-77883			Rejected	session ended abruptly (00:18:05) candidate dropped, no reconnection
+Suresh Kumar	Farah Khan	2026-08-12	S-1071	MTG-77890	44	0.80	Selected	good; some hesitation on scenario q but overall fine
+	Rahul Bose	2026-08-12	S-1072	MTG-77891	32	0.49	Rejected	under prepared, host had to lead the whole conversation
+	Kritika Sen		S-1073	MTG-77892	41	0.75	Selected	well structured, a bit slow but accurate. host ok
+	Om Prakash	2026-08-12	S-1074	MTG-77893	39	0.68	On hold	decent. recheck refrences before final
