@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from ...config import settings
-from .. import salesforce
+from .. import salesforce, tracing
 from .models import SalesforceQueryPlan
 from .plan import (
     MAX_LIMIT,
@@ -370,13 +370,53 @@ async def execute_salesforce_query_plan(
     real progress ("Retrieved 400 records so far") without this function knowing
     what an SSE event is.
     """
-    compiled = await compile_and_validate(plan)
+    validation_started = time.perf_counter()
+    try:
+        compiled = await compile_and_validate(plan)
+    except Exception as exc:
+        await tracing.event(
+            "QUERY_PLAN_VALIDATED",
+            status="failed",
+            component="orchestrator.app.core.sf_intel.tools.compile_and_validate",
+            details={"plan": plan},
+            duration_ms=round((time.perf_counter() - validation_started) * 1000),
+            error=exc,
+        )
+        raise
+    await tracing.event(
+        "QUERY_PLAN_VALIDATED",
+        component="orchestrator.app.core.sf_intel.tools.compile_and_validate",
+        details={
+            "object_api_name": compiled.object_api_name,
+            "result_mode": compiled.result_mode,
+            "columns": compiled.columns,
+            "soql": compiled.soql,
+        },
+        duration_ms=round((time.perf_counter() - validation_started) * 1000),
+    )
     queried_at = _now_iso()
+    query_started = time.perf_counter()
     try:
         page = await salesforce.run_soql_page(compiled.soql)
-    except salesforce.UnsafeSoql:
+    except salesforce.UnsafeSoql as exc:
+        await tracing.event(
+            "QUERY_EXECUTED",
+            status="failed",
+            component="orchestrator.app.core.salesforce.run_soql_page",
+            details={"source": "live_salesforce", "soql": compiled.soql},
+            duration_ms=round((time.perf_counter() - query_started) * 1000),
+            error=exc,
+        )
         raise
     except Exception as exc:  # noqa: BLE001
+        await tracing.event(
+            "QUERY_EXECUTED",
+            status="failed",
+            component="orchestrator.app.core.salesforce.run_soql_page",
+            details={"source": "live_salesforce", "soql": compiled.soql},
+            duration_ms=round((time.perf_counter() - query_started) * 1000),
+            error=exc,
+        )
         raise SalesforceToolError(f"the Salesforce query failed: {exc}") from exc
 
     rows: List[Dict[str, Any]] = list(page["rows"])
@@ -489,7 +529,7 @@ async def execute_salesforce_query_plan(
         except Exception as exc:  # noqa: BLE001 — the first page is still a valid answer
             log.warning("full-list fetch failed, keeping the first page: %s", str(exc)[:200])
 
-    return QueryResult(
+    result = QueryResult(
         soql=compiled.soql,
         object_api_name=compiled.object_api_name,
         rows=rows[:MAX_TOTAL_RECORDS],
@@ -506,6 +546,23 @@ async def execute_salesforce_query_plan(
         queried_at=queried_at,
         columns=compiled.columns,
     )
+    await tracing.event(
+        "QUERY_EXECUTED",
+        component="orchestrator.app.core.salesforce.run_soql_page",
+        details={
+            "source": "live_salesforce",
+            "object_api_name": result.object_api_name,
+            "soql": result.soql,
+            "returned_rows": len(result.rows),
+            "matched_rows": result.total_size,
+            "pages": result.pages,
+            "truncated": result.truncated,
+            "queried_at": result.queried_at,
+            "result_columns": result.columns,
+        },
+        duration_ms=round((time.perf_counter() - query_started) * 1000),
+    )
+    return result
 
 
 def _now_iso() -> str:

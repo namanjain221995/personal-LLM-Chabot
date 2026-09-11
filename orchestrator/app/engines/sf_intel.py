@@ -30,7 +30,8 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence
 
 from .. import llm
 from ..config import settings
-from ..core import org_brief
+from ..core import brain, org_brief
+from ..core import tracing
 from ..core.exports import export_csv, slugify
 from ..core.sf_intel import budget as ctx_budget
 from ..core.sf_intel import (
@@ -188,6 +189,18 @@ async def run(
     phase = _Phases(emit, run_id)
     state = await sf_state.load_state(conversation_id)
     state.source_enabled = source_enabled
+    await tracing.event(
+        "SALESFORCE_STATE_LOADED",
+        component="orchestrator.app.core.sf_intel.state",
+        details={
+            "salesforce_run_id": run_id,
+            "pending_clarification_id": state.pending_clarification_id,
+            "carried_slots": state.carried_slots(),
+            "last_query_summary": state.last_query_summary,
+            "source_enabled": source_enabled,
+            "planner_enabled": use_planner,
+        },
+    )
     # `meta` is trust metadata: it must say which planner actually decided this
     # turn. Reporting "intelligence" while the kill switch had the model off
     # would make the one flag that changes the answer invisible in the record
@@ -295,6 +308,18 @@ async def run(
         conversation_summary=state.last_query_summary,
         recent_turns=_recent(history, 6),
     )
+    await tracing.event(
+        "INTENT_CLASSIFIED",
+        component="orchestrator.app.core.sf_intel.interpret",
+        details={
+            "salesforce_run_id": run_id,
+            "original_request": intent.original_user_text,
+            "planning_text": planning_text,
+            "resolved_text": resolved_text,
+            "resolved_slots_before_planning": intent.resolved_slots,
+            "clarification_rounds": len(intent.clarification_history),
+        },
+    )
 
     # ---- 4. the decision -----------------------------------------------------
     if use_planner:
@@ -302,6 +327,20 @@ async def run(
         hinted = _objects_hinted_by(reading.text, state)
         schema_summary, _available = await tools.get_salesforce_schema(
             grounding, objects=hinted
+        )
+        await tracing.event(
+            "METADATA_RETRIEVED",
+            component="orchestrator.app.core.sf_intel.tools.get_salesforce_schema",
+            details={
+                "salesforce_run_id": run_id,
+                "hinted_objects": hinted,
+            "available_objects": _available,
+            "matched_brain_packs": [
+                pack.get("name", "") for pack in brain.matched_packs(grounding)
+            ],
+            "required_metric_tables": org_brief.tables_for(grounding),
+            "schema_evidence": tracing.text_fingerprint(schema_summary),
+            },
         )
         candidates, people_facts = await _entity_candidates(reading.text, hinted)
         decision = await planner.plan(
@@ -333,6 +372,20 @@ async def run(
     sf_state.decision_slots(decision, intent)
     assumptions.extend(decision.assumptions)
     await sf_state.save_intent(intent)
+    await tracing.event(
+        "QUERY_PLAN_CREATED",
+        component="orchestrator.app.core.sf_intel.planner",
+        details={
+            "salesforce_run_id": run_id,
+            "action": decision.action,
+            "confidence": decision.confidence,
+            "reason_code": decision.internal_reason_code,
+            "resolved_slots": intent.resolved_slots,
+            "assumptions": decision.assumptions,
+            "structured_query_plan": decision.structured_query_plan,
+            "clarification": decision.clarification_draft,
+        },
+    )
     log.info(
         "salesforce planner: run=%s action=%s reason=%s slots=%s",
         run_id,
@@ -596,6 +649,19 @@ async def _execute_live(
     verification = _verify(result, computed)
     if verification:
         computed["verification_notes"] = verification
+    await tracing.event(
+        "RESULT_VERIFIED",
+        component="orchestrator.app.engines.sf_intel._verify",
+        details={
+            "object_api_name": result.object_api_name,
+            "returned_rows": len(result.rows),
+            "matched_rows": result.total_size,
+            "computed": computed,
+            "verification_notes": verification,
+            "verification_scope": "query_result_consistency_only",
+            "business_definition_verified": False,
+        },
+    )
 
     await phase("drafting_answer")
     scope = _scope_line(intent)

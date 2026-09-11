@@ -24,6 +24,7 @@ from .share_api import router as share_router
 from .authn.analytics_api import router as analytics_router
 from .authn.shares_api import router as shares_admin_router
 from .config import settings
+from .core.tracing import TraceRecorder
 
 # App-module logging was silently dropped: uvicorn configures only its own
 # loggers, and with no root handler every app `log.info/warning/error` —
@@ -1590,6 +1591,9 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
     )
     if resumed:
         _metrics.inc("chat_request_resume_total", "chat requests resumed under a new attempt")
+    # Reuse generation_id so SSE, messages, usage and detailed checkpoints all
+    # share one correlation key.
+    query_trace = TraceRecorder(gen.generation_id)
 
     # Filled in by the compaction pass; rides out on the final meta so the
     # context meter shows this session's real usage.
@@ -1724,6 +1728,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
         # same per-task scope).
         context.reset_trim_notice()
         llm.reset_usage()
+        trace_context = query_trace.activate()
         # Who the model is assisting — safe context for prompt builders
         # (engines append identity.identity_line() to their system prompts).
         from .identity import set_identity
@@ -1735,6 +1740,27 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
         )
         try:
             await _mark_chat_request(gen, "running")
+            await query_trace.start(
+                conversation_id=conv_key_outer,
+                user_id=viewer,
+                workspace_id=principal.workspace_id,
+                question=text,
+                requested_mode=str(request.mode or ""),
+            )
+            await query_trace.event(
+                "REQUEST_RECEIVED",
+                component="orchestrator.app.main.chat",
+                details={
+                    "requested_mode": request.mode,
+                    "effort": request.effort,
+                    "model_choice": request.model,
+                    "force_live": request.sf_live,
+                    "has_attachments": bool(
+                        request.pdf_data or request.image_data or request.video_uploads
+                    ),
+                    "history_messages_supplied": len(request.history_messages or ()),
+                },
+            )
             if access_notice:
                 # One line, before any work: the tool the composer offered is
                 # off for this account, and the answer that follows is the
@@ -1917,6 +1943,23 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     orchestration_state.update(
                         {"agent": effective.agent, "search": effective.search}
                     )
+                query_trace.resolved_mode = (
+                    "agent"
+                    if effective.agent
+                    else "web_search"
+                    if effective.search
+                    else request.mode
+                )
+                await query_trace.event(
+                    "MODE_RESOLVED",
+                    component="orchestrator.app.engines.orchestrate",
+                    details={
+                        "requested_mode": request.mode,
+                        "resolved_mode": query_trace.resolved_mode,
+                        "agent": effective.agent,
+                        "search": effective.search,
+                    },
+                )
 
             if signed_in is not None and request.text:
                 user_id = int(signed_in["id"])
@@ -2271,6 +2314,16 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     retrieved=retrieved,
                 )
                 context_state.update(info)
+            await query_trace.event(
+                "CONTEXT_ASSEMBLED",
+                component="orchestrator.app.compaction",
+                details={
+                    "input_history_messages": len(full_history),
+                    "effective_history_messages": len(history),
+                    "context": context_state,
+                    "input_trimmed": context.get_trim_notice() or {},
+                },
+            )
 
             # SALESFORCE INTELLIGENCE MODE (2026-08-11).
             #
@@ -2749,6 +2802,31 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             # terminal event never reads "completed, nothing persisted".
             await _store_answer(gen)
             await _mark_chat_request(gen, "completed")
+            await query_trace.event(
+                "RESPONSE_GENERATED",
+                component="orchestrator.app.main.worker",
+                details={
+                    "answer_characters": len(answer or ""),
+                    "selected_route": (gen.final_meta or {}).get("route", ""),
+                    "has_data": bool((gen.final_meta or {}).get("data")),
+                    "final_meta_keys": sorted((gen.final_meta or {}).keys()),
+                },
+            )
+            await query_trace.event(
+                "RESPONSE_VALIDATED",
+                status="skipped",
+                component="orchestrator.app.main.worker",
+                details={"reason": "semantic_answer_validator_not_implemented"},
+            )
+            await query_trace.finish(
+                "ok",
+                route=str((gen.final_meta or {}).get("route") or ""),
+                resolved_mode=query_trace.resolved_mode or str(request.mode or ""),
+                meta={
+                    "answer_characters": len(answer or ""),
+                    "final_meta_keys": sorted((gen.final_meta or {}).keys()),
+                },
+            )
             await gen.publish("done", {"session_id": request.session_id})
 
             # Background compaction: fold early so the next turn almost never
@@ -2781,6 +2859,14 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     await asyncio.shield(
                         gen.publish("error", {"message": _REPLACED_SENTENCE, "code": "replaced"})
                     )
+            with contextlib.suppress(Exception):
+                await asyncio.shield(
+                    query_trace.finish(
+                        "cancelled",
+                        route=str((gen.final_meta or {}).get("route") or ""),
+                        resolved_mode=query_trace.resolved_mode or str(request.mode or ""),
+                    )
+                )
         except Exception as exc:  # terminal error event (§10)
             gen.failed = True
             gen.error, gen.error_code = _failure_sentence(exc)
@@ -2801,6 +2887,18 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 await asyncio.shield(
                     _store_failure(gen, "".join(streamed_text), resumable=resumable)
                 )
+            await query_trace.event(
+                "REQUEST_FAILED",
+                status="failed",
+                component="orchestrator.app.main.worker",
+                error=exc,
+            )
+            await query_trace.finish(
+                "error",
+                route=str((gen.final_meta or {}).get("route") or ""),
+                resolved_mode=query_trace.resolved_mode or str(request.mode or ""),
+                error=exc,
+            )
         finally:
             # V29: the row's terminal status — cancelled, failed, or
             # interrupted when the loop is tearing this process down.
@@ -2823,6 +2921,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             # that may still be propagating through this task.
             with contextlib.suppress(Exception):
                 await asyncio.shield(_finalize_generation(conv_key_outer, gen))
+            query_trace.deactivate(trace_context)
 
     gen.task = asyncio.create_task(worker())
 
@@ -2831,6 +2930,16 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@app.get("/chat/trace/{trace_id}")
+async def query_trace(trace_id: str, http_request: Request) -> dict:
+    """Authenticated diagnostic timeline for one generation owned by caller."""
+    viewer = await _require_viewer(http_request)
+    row = await db.run_in_thread(db.get_query_trace, trace_id, viewer)
+    if row is None:
+        raise HTTPException(status_code=404, detail="query trace not found")
+    return row
 
 
 @app.get("/chat/salesforce/{conversation_id}")
