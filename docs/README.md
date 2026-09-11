@@ -22,6 +22,7 @@ source.
 | Hardware matrix, model policy, state, fallback and upgrades | [`PORTABLE-RUNTIME.md`](PORTABLE-RUNTIME.md) |
 | Two-node DGX Spark cluster (`CLUSTER_MODE=dual`): topology, generated config, scripts, benchmarks, limitations | [`CLUSTER.md`](CLUSTER.md) |
 | Move the OCR engine to the worker (`scripts/ocr.sh`), the hand-over, and how to go back | [`ocr-on-the-worker.md`](ocr-on-the-worker.md) |
+| The 2026-09 engine crashes (MTP spec-decode on the Qwen GDN layer): root cause, remediation, measurements, rollback | [`ISSUE/`](ISSUE/) |
 | Current files and entrypoints | [`00-INVENTORY.md`](00-INVENTORY.md) |
 | Launcher plus application request flows | [`01-codebase/CRITICAL-PATHS.md`](01-codebase/CRITICAL-PATHS.md) |
 | Base Compose and runtime overlays | [`01-codebase/infra-docker-compose.md`](01-codebase/infra-docker-compose.md) |
@@ -64,7 +65,10 @@ policy remains relevant.
 
 | Path | Purpose |
 |---|---|
-| [`CLUSTER.md`](CLUSTER.md) | two-node DGX Spark cluster: what TP=2 sharding is and is not, measured interconnect and benchmarks, `CLUSTER_*` configuration, `scripts/cluster-*.sh`, failure behaviour, limitations |
+| [`CLUSTER.md`](CLUSTER.md) | two-node DGX Spark cluster: what TP=2 sharding is and is not, measured interconnect and benchmarks, `CLUSTER_*` configuration, the engine-argument change runbook, `scripts/cluster-*.sh`, failure behaviour, limitations |
+| [`ISSUE/gdn-spec-decode-fault-report.md`](ISSUE/gdn-spec-decode-fault-report.md) | 2026-09-10 root-cause analysis of the TP=2 engine dying mid-run (MTP speculative decoding driving the Qwen GDN layer into a faulting branch) |
+| [`ISSUE/gdn-spec-decode-remediation-2026-09-11.md`](ISSUE/gdn-spec-decode-remediation-2026-09-11.md) | what was changed, verified, measured (before/after), tested and left open; cluster topology, memory/CPU map, rollback |
+| [`ISSUE/interview-analysis-client/`](ISSUE/interview-analysis-client/) | ready-to-apply patches for the worker-side interview-analysis pipeline's LLM client and sweep runner |
 | [`00-INVENTORY.md`](00-INVENTORY.md) | regenerated repository composition, entrypoints, configs, tests and generated/ignored state |
 | [`01-codebase/CRITICAL-PATHS.md`](01-codebase/CRITICAL-PATHS.md) | current launcher Flow 0 plus historical detailed application flows |
 | [`01-codebase/infra-docker-compose.md`](01-codebase/infra-docker-compose.md) | current base/overlay/service/network/volume/env topology |

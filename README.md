@@ -172,7 +172,7 @@ referenced by immutable digest in [`compose.yaml`](compose.yaml) and
 │   └── search/                 searxng, tavily, brave providers
 ├── orchestrator/scripts/       validate_packs.py, compile_brain_source.py, validate_long_context.py,
 │                               build_dictionary_from_metadata.py, migrate_sqlite_to_postgres.py, backfill_titles.py
-├── orchestrator/tests/         82 files, ~1,516 tests (needs a test PostgreSQL)
+├── orchestrator/tests/         136 files, ~3,150 tests (needs a test PostgreSQL)
 ├── sync-worker/syncworker/     main.py (cycle), sf_auth.py (JWT / client credentials), sf_client.py
 │                               (REST + Bulk 2.0), objects.py (config + CLI), storage.py (Parquet + DuckDB),
 │                               rag_index.py + chunking.py + embedding_index.py (LanceDB), secrets.py
@@ -181,7 +181,7 @@ referenced by immutable digest in [`compose.yaml`](compose.yaml) and
 ├── frontend/app/               page.tsx (the app), layout.tsx, api/* proxy routes
 ├── frontend/components/        39 components (ChatApp, Composer, MessageRow, ProofDrawer, ChartView, ...)
 ├── frontend/lib/               38 headless modules (sse, streams, history, images, chartOption, ...)
-├── frontend/tests/             47 files, 761 cases
+├── frontend/tests/             122 files, 1,920 cases
 ├── brain/packs/                21 YAML knowledge packs the model reads on every Salesforce question
 ├── brain/sources/              the raw documents, SOPs, org schema and metadata they were compiled from
 ├── scripts/                    two-node cluster tooling: cluster-status/doctor/test/bench/logs/sync/worker/up/down
@@ -372,7 +372,7 @@ topology, failure tests and limitations in [`docs/CLUSTER.md`](docs/CLUSTER.md))
 | Concurrency 4 (512 in / 128 out) | 54 tok/s | 53 tok/s | **135 tok/s** (TPOT 24 ms) |
 | Concurrency 16 | 123 tok/s | 105 tok/s | **243 tok/s** (TPOT 53 ms) |
 | KV cache | 542k tokens | ~950k tokens per node | **~2.98M tokens per node** |
-| NCCL over both RoCE rails | – | 22 Gb/s, 17.6 µs (each link caps at ~13 Gb/s — see §24) | same fabric |
+| NCCL over both RoCE rails | – | 171.6 Gb/s busbw (2026-09-07; the earlier ~13 Gb/s cap was a measurement error — see `docs/CLUSTER.md`) | same fabric |
 
 The 27B columns are the dense model this cluster was built on (kept in the
 manifest as `dgx-qwen38-27b-nvfp4`); the main model was switched to the
@@ -440,7 +440,7 @@ the keys that matter most — every key is documented in the example file:
 | Local secrets | `POSTGRES_DB/USER/PASSWORD`, `SESSION_SECRET`, `PGADMIN_DEFAULT_EMAIL/PASSWORD`, `SEARXNG_SECRET` — blank = generated into `.runtime/secrets.env`; pool knobs `APP_DB_POOL_*`, `APP_DB_STATEMENT_TIMEOUT_MS` |
 | Ports / exposure | `FRONTEND_PORT=3000`, `ORCHESTRATOR_PORT=8080`, `POSTGRES_PORT`, `PGADMIN_PORT`, `TECHSARA_BIND_ADDRESS=127.0.0.1` (literal IP only), `PUBLISH_MODEL_PORTS=false`, `VLLM_PORT=8000`, `VLLM_ROUTER_PORT=8002`, `VLLM_EMBED_PORT=8003`, `VLLM_OCR_PORT=8004`, `LLAMA_CPP_PORT=8000` |
 | Optional services | `SEARCH_ENABLED`, `SEARCH_PROVIDER=searxng|tavily|brave`, `TAVILY_API_KEY`, `BRAVE_API_KEY`, `COMPOSE_PROFILES=search,admin` |
-| Two-node cluster | `CLUSTER_MODE=auto|single|dual`; optional overrides `CLUSTER_HEAD_IP`, `CLUSTER_WORKER_IP`, `_2` variants, `CLUSTER_WORKER_SSH`, `CLUSTER_MASTER_PORT=29501`, `CLUSTER_TENSOR_PARALLEL_SIZE=2`, `CLUSTER_PIPELINE_PARALLEL_SIZE=1`, `CLUSTER_GPU_MEMORY_UTILIZATION=0.30`, `CLUSTER_KV_CACHE_MEMORY_GIB=16`, `CLUSTER_NCCL_*`, `CLUSTER_SPECULATIVE_CONFIG`, `CLUSTER_MAX_NUM_BATCHED_TOKENS` |
+| Two-node cluster | `CLUSTER_MODE=auto|single|dual`; optional overrides `CLUSTER_HEAD_IP`, `CLUSTER_WORKER_IP`, `_2` variants, `CLUSTER_WORKER_SSH`, `CLUSTER_MASTER_PORT=29501`, `CLUSTER_TENSOR_PARALLEL_SIZE=2`, `CLUSTER_PIPELINE_PARALLEL_SIZE=1`, `CLUSTER_GPU_MEMORY_UTILIZATION=0.30`, `CLUSTER_KV_CACHE_MEMORY_GIB=8`, `CLUSTER_NCCL_*`, `CLUSTER_SPECULATIVE_CONFIG` (EMPTY = no speculative decoding, the default since 2026-09-11 — the MTP draft faults the Qwen GDN layer on the pinned vLLM and was slower anyway; see `docs/ISSUE/`), `MAIN_MODEL_ENABLE_PREFIX_CACHING` (a real switch on both ranks; `false` here), `CLUSTER_MAX_NUM_BATCHED_TOKENS` |
 | Search / fetch / repos | `SEARCH_MAX_RESULTS`, `SEARCH_SOURCE_CHAR_BUDGET`, `SEARCH_RATE_PER_MIN`, `SEARCH_CACHE_TTL`, `FETCH_TIMEOUT_MS`, `FETCH_MAX_BYTES`, `URL_ANALYSIS_ENABLED`, `URL_MAX_PAGES`, `REPO_ANALYSIS_ENABLED`, `REPO_MAX_MB`, `REPO_MAX_FILES`, `WORKSPACE_TTL_HOURS=24`, `WORKSPACE_QUOTA_GB=20` |
 | Web memory / crawler | `WEB_MEMORY_ENABLED`, `LANCEDB_WEB_DIR`, `WEB_PAGE_TTL_S=86400`, `WEB_PAGE_FRESH_TTL_S=3600`, `WEB_CRAWL_ENABLED`, `WEB_CRAWL_MAX_PAGES=1000`, `WEB_CRAWL_MAX_MINUTES=15`, `WEB_CRAWL_MAX_DEPTH=4`, `WEB_CRAWL_CONCURRENCY=3`, `WEB_CRAWL_DELAY_MS=400`, `WEB_EXPAND_AFTER_SEARCH`, `WEB_EXPAND_PAGES_PER_DOMAIN=8`, `WEB_EXPAND_MAX_DOMAINS=3` |
 | Deep Research | `DEEP_RESEARCH_ENABLED`, `DEEP_RESEARCH_MAX_ITERATIONS=3`, `DEEP_RESEARCH_MAX_QUERIES_PER_ITERATION=5`, `DEEP_RESEARCH_SOURCES_PER_ITERATION=10`, `DEEP_RESEARCH_MAX_SOURCES=24`, `DEEP_RESEARCH_MIN_SOURCES=6`, `DEEP_RESEARCH_TIMEOUT_S=600`, `DEEP_RESEARCH_REPORT_MAX_TOKENS=6000` — every default is derived from measurement, see [`docs/01-codebase/deep-research.md`](docs/01-codebase/deep-research.md) |
@@ -495,9 +495,11 @@ Three honest costs before you raise it:
    12.7 s and 169.7K in 42.3 s (≈4,000–5,000 tok/s; fit `1.75e-04·n + 4.38e-10·n²`),
    which extrapolates to 262K ≈ 1.3 min, 400K ≈ 2.3 min and
    800K ≈ 7 min — the raised timeout is kept because it is harmless
-   and still the right value should the 27B come back. A conversation that
-   *grows* to 800K is unaffected either way: prefix caching means each turn
-   only prefills the new tokens.
+   and still the right value should the 27B come back. (Prefix caching on the
+   main engine is OFF since 2026-09-11 — vLLM calls it experimental on this
+   hybrid-Mamba model — so a conversation that *grows* re-prefills its
+   history each turn; measured 32K prefill is 4.1 s, and `docs/CLUSTER.md`
+   records the trade.)
 2. **Concurrency at full length drops** to 1.49× — one 1M request at a time.
    That is the deliberate trade for the window: `CLUSTER_KV_CACHE_MEMORY_GIB`
    is 8, not 16, because the KV cache and the prefill share one pool.
@@ -945,10 +947,10 @@ MOCK_MODE=true npm run dev        # UI-only development
 
 | Suite | Scope | Size |
 |---|---|---|
-| Launcher | mocks + temp dirs; `test_compose_overlays.py` renders all 13 host fixtures (and the DGX dual-mode fixture) through real `docker compose config` and asserts platform invariants (loopback publication, digest-pinned images, no developer paths); skips without Compose ≥ 2.24 | 355 tests, all green on 2026-08-25 |
-| Orchestrator | SSE contract, routing, Salesforce Intelligence (engine, plans, clarification), org brief / brain / dictionary, charts, live Salesforce, security (SQL guard, SSRF, archives, report paths, DB guard), history, memory, context budgets, reasoning; every app table is truncated before each test | 82 files, ~1,516 tests |
+| Launcher | mocks + temp dirs; `test_compose_overlays.py` renders all 13 host fixtures (and the DGX dual-mode fixture) through real `docker compose config` and asserts platform invariants (loopback publication, digest-pinned images, no developer paths); skips without Compose ≥ 2.24 | 474 tests, all green on 2026-09-11 |
+| Orchestrator | SSE contract, routing, Salesforce Intelligence (engine, plans, clarification), org brief / brain / dictionary, charts, live Salesforce, security (SQL guard, SSRF, archives, report paths, DB guard), history, memory, context budgets, reasoning; every app table is truncated before each test | 136 files, ~3,150 tests, all green on 2026-09-11 |
 | Sync worker | discovery, JWT/secrets, Bulk fallback, upserts, deletes, watermarks, chunking, embedding integrity, CLI | 157 tests |
-| Frontend | Vitest; 35 pure-logic files in Node, 12 component files in jsdom (`// @vitest-environment jsdom`) | 47 files, 761 cases |
+| Frontend | Vitest; 35 pure-logic files in Node, 12 component files in jsdom (`// @vitest-environment jsdom`) | 122 files, 1,920 cases |
 
 Notes: CI runs these suites on every pull request and on every push to `main` or
 `dev` (see §22.1); the local commands above stay the fast inner loop.
@@ -959,17 +961,20 @@ narrative and numbers go into a dated `CHANGELOG.md` entry.
 
 ### 22.1 Continuous integration and deployment
 
-Two workflows. [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs the
-four suites on GitHub-hosted runners — the launcher one across Python 3.11 and
-3.12, so six job runs — behind a `ci-ok` gate job. [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml)
-runs on a **self-hosted runner on the DGX Spark itself**, because the deploy
-target *is* this machine: it owns the GPU, the 41 GB model cache, the named
-volumes and the `.env`. Nothing is copied anywhere and the workflow needs no
-secret.
+One workflow, [`.github/workflows/pipeline.yml`](.github/workflows/pipeline.yml)
+(since 2026-09-02): policy checks, the four suites on GitHub-hosted runners —
+the launcher one across Python 3.11 and 3.12 — schema, security and image
+jobs behind a `ci-ok` gate, then a `deploy` job on a **self-hosted runner on
+the DGX Spark itself**, because the deploy target *is* this machine: it owns
+the GPU, the 41 GB model cache, the named volumes and the `.env`. Nothing is
+copied anywhere and the workflow needs no secret.
 
-**What a merge to `main` does.** CI runs; only if it goes green does Deploy
-start (`workflow_run`, never `push`, so untested code cannot reach the box).
-Deploy then runs [`scripts/deploy.sh`](scripts/deploy.sh) against the production
+**What a merge to `main` does.** CI runs; only if it goes green does the
+deploy job start, and it starts on every push to `main` unless the repository
+variable `DEPLOY_ON_PUSH` is set to `false`/`0`/`no`/`off` (an UNSET variable
+means deploy — verified 2026-09-11; the workflow's own header comment says the
+opposite and is wrong). `workflow_dispatch` takes `ref`, `deploy`, `full` and
+`branch` inputs. Deploy runs [`scripts/deploy.sh`](scripts/deploy.sh) against the production
 checkout, which takes a lock, refuses a dirty tree, resolves the target commit
 **remote-first**, moves the checkout, runs `./techsara up`, and then refuses to
 call it a success until the stack answers: orchestrator `/health`, the frontend,
@@ -1055,7 +1060,7 @@ numbers, counts, topology and finding status are not current): the rest of
 
 ## 24. Known limitations and drift
 
-- **Cluster fabric**: both RoCE links measure ~13 Gb/s per direction for RDMA *and* TCP with clean counters; the cause needs root-level investigation (`mlxlink`, `mlxconfig`, MTU 9000, `iommu.passthrough`) and neither node has passwordless sudo. Until fixed, dual mode is a latency/capacity win, not a throughput win.
+- **Cluster fabric**: healthy — 171.6 Gb/s NCCL busbw across both RoCE rails (2026-09-07, 97% of NVIDIA's reference); the earlier "~13 Gb/s per link" figure was a measurement error and is withdrawn. Two documented, untested improvements remain: GPUDirect RDMA is disabled (no `nvidia_peermem`, the image's libmlx5 lacks dmabuf registration, so NCCL host-bounces), and the rail netdevs run MTU 1500 (RoCE `active_mtu` 1024 of a possible 4096).
 - **No pipeline parallelism** for the multimodal `Qwen3_5ForConditionalGeneration` class in the pinned vLLM build.
 - **Node 2 runs an unrelated older `sf-local-ai` stack** (Qwen3.6-35B on port 8000) that competes for its memory; it was left untouched.
 - **Health semantics**: `/health` may report `degraded` transiently during sync writes (§12); `/v1/models` on the main model answers even when the engine is dead — use `scripts/cluster-status.sh --probe` or a real completion as the truth.

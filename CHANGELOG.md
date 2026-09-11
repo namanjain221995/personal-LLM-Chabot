@@ -1,5 +1,76 @@
 # Changelog
 
+## The two-node engine stops dying, and gets faster doing it (2026-09-11)
+
+Since 28 August the TP=2 main engine had died four times mid-run, each time
+taking 9–15 minutes to serve again. The analysis of 2026-09-10
+(`docs/ISSUE/gdn-spec-decode-fault-report.md`) traced three of the four to
+one line of the pinned vLLM: with MTP speculative decoding on, the Qwen GDN
+(Mamba) layer runs an `index_select` on mixed spec/non-spec batches that
+faults with `CUDA error: misaligned address` on rank 1, the collective
+hangs, and the pair reloads. The branch is unreachable without
+`--speculative-config`. This entry is the remediation; the full record with
+every measurement is `docs/ISSUE/gdn-spec-decode-remediation-2026-09-11.md`.
+
+**Engine (both ranks, verified from `docker inspect` on both nodes).**
+`--speculative-config` is gone and `--no-enable-prefix-caching` is stated.
+The launcher now treats `CLUSTER_SPECULATIVE_CONFIG` absent-or-empty as OFF
+(the MTP JSON is an explicit opt-in), renders the same choice into the
+single-node overlays so `CLUSTER_MODE=auto` degrading to single cannot bring
+MTP back on its own, and turns `MAIN_MODEL_ENABLE_PREFIX_CACHING` from a
+`/health` belief into the flag itself, re-emitted normalised so the belief
+is the launch. `scripts/cluster-verify-engine.sh --probe` proves the running
+configuration from both containers, both retained logs, both kernel
+journals and one completion with GPU sampling on both Sparks: 25/25.
+
+**Measured, same seeds, same tool (`scripts/cluster-bench.sh`).** The
+analysis expected a 10–20 % decode cost. Without spec-decode vLLM keeps
+FULL CUDA graphs for decode instead of downgrading to PIECEWISE, and on a
+TP=2 pair that launch overhead was worth more than the draft's 86 %
+acceptance: single-stream decode **69.4 → 100.7 tok/s** (TPOT 12.8 → 9.3 ms,
+TTFT p50 123 → 90 ms), concurrency 4 **158.6 → 238.7 tok/s**, concurrency
+10 with 2K prompts **250.4 → 283.9 tok/s** (E2E p99 13.8 → 9.6 s), 32K-token
+prefill **4.70 → 4.10 s**; the KV pool grew from 1,494,824 to 1,663,201
+tokens on the same 8 GiB because the prefix cache's 2112-token block padding
+is gone. Prefix caching was hitting 8–16 % of prompt tokens on the
+long-conversation tail; it is off as a stability trade (vLLM calls it
+experimental on this hybrid model) and is one `.env` line to bring back.
+SOAK_SENTENCE_PLACEHOLDER
+
+**The orchestrator waits out a restart instead of dying on it.**
+`app/resilience.py` is the one retry layer every model call in `app/llm.py`
+opens through: it retries only what a restart can fix (connection
+refused/reset, a connect timeout, 5xx, a dying stream's error chunk — never
+a 4xx, a read timeout or a cancellation), polls `/health` until the engine
+answers, backs off with jitter, and is bounded by two windows: 120 s for a
+person watching a chat (then the `MODEL_UNAVAILABLE` sentence the client
+already knows, which a 13-minute outage used to mis-report as
+`APPLICATION_ERROR`) and 20 minutes for a background job. A video job whose
+required stage cannot reach its engine is deferred back to the queue with
+its finished stages kept, up to five attempts, instead of stranded as
+`failed`; an OCR outage is no longer cached as "no readable text". Waits and
+give-ups are counted in Prometheus because the head's container log lost
+the entire incident window to rotation. 24 new tests; the full suite passes.
+The report's own pipeline (`interview_analysis`, a separate repository on the
+worker) gets the equivalent fix as ready-to-apply patches under
+`docs/ISSUE/interview-analysis-client/`.
+
+**Also.** Explicit 2 GiB KV budgets for the embed and reranker engines (the
+embed engine had computed a negative budget three starts in a row on
+2026-09-09); the whisper server declares itself dead and exits after three
+consecutive CUDA-runtime failures (the worker replica had served CUDA-dead
+for twelve hours with `/health` green); `scripts/cluster-soak.py` (a mixed
+workload at concurrency 10 with a two-node fault monitor); a "changing an
+engine argument" runbook in `docs/CLUSTER.md`, which also stops blaming
+`--distributed-timeout-seconds` for the 300 s engine-death clock
+(`VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS`, kept at 300 s deliberately); README
+corrections (one pipeline workflow, `DEPLOY_ON_PUSH` unset means deploy, the
+withdrawn 13 Gb/s fabric claim, test counts).
+
+**Not done, specified:** moving the 22 GiB router to the worker (the head
+swaps continuously while the worker has ~40 GiB free), an Alertmanager (no
+alert has reached a human in 11.7 days), a completion-based wedge alert.
+
 ## Enterprise login, workspaces and an audited admin surface (2026-09-01)
 
 TechSara became a real multi-user workspace. A login system existed once, was
