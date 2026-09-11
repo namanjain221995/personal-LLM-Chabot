@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
 import os
+import zipfile
 
 import pytest
 from fastapi.testclient import TestClient
@@ -71,8 +73,8 @@ def _install(monkeypatch):
     monkeypatch.setattr(pipeline, "_rasterise_page", lambda pdf, page, width: b"\x89PNG-" + str(width).encode())
 
 
-def _make(owner_id: int, *, kind="document", formats=("pdf", "docx"), conv="conv-api") -> dict:
-    job = pipeline.accept(user_id=owner_id, conversation_id=conv, generation_id=f"g-{kind}", operation="create", instruction="Make it",
+def _make(owner_id: int, *, kind="document", formats=("pdf", "docx"), conv="conv-api", gen=None) -> dict:
+    job = pipeline.accept(user_id=owner_id, conversation_id=conv, generation_id=gen or f"g-{kind}", operation="create", instruction="Make it",
                           kind=kind, formats=list(formats), effort="fast", mode="assistant", template_id="generic", material={})
 
     async def run():
@@ -204,6 +206,274 @@ def test_the_sheet_grid_is_bounded_and_never_evaluates(alice, monkeypatch):
     # A document version has no workbook to grid.
     doc = _make(uid, conv="conv-api-2")
     assert client.get(f"/artifacts/{doc['artifact_id']}/v/1/sheets").status_code == 404
+
+
+# ------------------------------------------------ files by id, zip, grid --
+
+
+def _files_of(client, aid: str, version: int = 1) -> dict:
+    """{format: file dict} of a version as the API describes it."""
+    return {f["format"]: f for f in client.get(f"/artifacts/{aid}/v/{version}").json()["files"]}
+
+
+def test_a_file_is_served_by_its_id_with_the_same_rules_as_by_format(alice, login_client, monkeypatch):
+    """CONTRACT-2 §2: /f/{file_id} is the URL every FileRef carries —
+    owner-scoped, inline vs attachment, HEAD, Range, ETag exactly as
+    /file/{fmt}, which stays as the first-of-format alias."""
+    client, uid = alice
+    row = _make(uid)
+    aid = row["artifact_id"]
+    files = _files_of(client, aid)
+    pdf = files["pdf"]
+    assert T.is_file_id(pdf["file_id"]) and pdf["role"] == "companion" and files["docx"]["role"] == "primary"
+    assert pdf["download_url"] == f"/artifacts/{aid}/v/1/f/{pdf['file_id']}?disposition=attachment"
+    assert pdf["title"] == "Quarterly Review"
+
+    down = client.get(f"/artifacts/{aid}/v/1/f/{pdf['file_id']}")
+    assert down.status_code == 200 and down.content == _PDF
+    assert down.headers["content-type"].startswith("application/pdf")
+    assert down.headers["content-disposition"].startswith('attachment; filename="quarterly-review-v1.pdf"')
+    assert "filename*=UTF-8''" in down.headers["content-disposition"]
+    assert down.headers["cache-control"] == "private, no-store"
+    assert down.headers["etag"] == f'"{hashlib.sha256(_PDF).hexdigest()}"'
+    assert down.headers["accept-ranges"] == "bytes"
+    inline = client.get(f"/artifacts/{aid}/v/1/f/{pdf['file_id']}", params={"disposition": "inline"})
+    assert inline.status_code == 200 and inline.headers["content-disposition"].startswith("inline;")
+    assert client.get(f"/artifacts/{aid}/v/1/f/{pdf['file_id']}", params={"disposition": "open"}).status_code == 422
+    head = client.head(f"/artifacts/{aid}/v/1/f/{pdf['file_id']}")
+    assert head.status_code == 200 and head.content == b"" and int(head.headers["content-length"]) == len(_PDF)
+    part = client.get(f"/artifacts/{aid}/v/1/f/{pdf['file_id']}", headers={"Range": "bytes=0-9"})
+    assert part.status_code == 206 and part.content == _PDF[:10] and part.headers["content-range"] == f"bytes 0-9/{len(_PDF)}"
+    docx = client.get(f"/artifacts/{aid}/v/1/f/{files['docx']['file_id']}")
+    assert docx.status_code == 200 and docx.headers["content-type"].startswith(T.MIME_TYPES["docx"])
+    assert docx.content == b"docx bytes" * 100
+    # The by-format alias still answers the same bytes.
+    assert client.get(f"/artifacts/{aid}/v/1/file/pdf").content == _PDF
+    # Counted under the format label (the `result` label folds to "other":
+    # metrics.py's result vocabulary predates inline/attachment).
+    assert sum(v for k, v in metrics._counters["artifact_download_total"].items() if ("format", "pdf") in k) >= 2
+
+    # A stranger: 404, the same as a missing one. An id this version does
+    # not have: 404.
+    bob = login_client("api-bob")
+    assert bob.get(f"/artifacts/{aid}/v/1/f/{pdf['file_id']}").status_code == 404
+    assert bob.head(f"/artifacts/{aid}/v/1/f/{pdf['file_id']}").status_code == 404
+    assert client.get(f"/artifacts/{aid}/v/1/f/{'0' * 16}").status_code == 404
+    assert client.get(f"/artifacts/{aid}/v/2/f/{pdf['file_id']}").status_code == 404
+
+
+def test_a_malformed_file_id_is_404_before_any_lookup(alice, monkeypatch):
+    client, uid = alice
+    row = _make(uid)
+    aid = row["artifact_id"]
+    looked = {"n": 0}
+    real = adb.get_version
+
+    def counting(*args, **kw):
+        looked["n"] += 1
+        return real(*args, **kw)
+
+    monkeypatch.setattr(adb, "get_version", counting)
+    for bad in ("../../etc/passwd", "a" * 15, "a" * 17, "A" * 16, "g" * 16, "0123456789abcde%2e", "x"):
+        assert client.get(f"/artifacts/{aid}/v/1/f/{bad}").status_code == 404, bad
+        assert client.get(f"/artifacts/{aid}/v/1/grid", params={"file": bad}).status_code == 404, bad
+    assert looked["n"] == 0, "no row was read for an id that is not an id"
+    assert client.get(f"/artifacts/{'b' * 32}/v/1/f/{'a' * 16}").status_code == 404
+
+
+def test_a_legacy_version_row_downloads_by_both_urls(alice):
+    """A version persisted before file ids: the API synthesises the id
+    (pipeline.ref_for) and /f/{id} resolves it; /file/{fmt} still works."""
+    client, uid = alice
+    row = _make(uid)
+    aid = row["artifact_id"]
+    with db.connection() as con:
+        stripped = [{k: v for k, v in f.items() if k not in ("file_id", "role", "title", "rows", "columns")} for f in adb.get_version(aid, 1, uid)["files"]]
+        con.execute("UPDATE artifact_versions SET files = %s WHERE artifact_id = %s AND version = %s", (db._json_param(stripped), aid, 1))
+    files = _files_of(client, aid)
+    assert files["pdf"]["file_id"] == T.file_id_for(aid, 1, "companion", "pdf") and files["pdf"]["role"] == "companion"
+    assert files["docx"]["file_id"] == T.file_id_for(aid, 1, "primary", "docx") and files["docx"]["title"] == "Quarterly Review"
+    assert client.get(f"/artifacts/{aid}/v/1/f/{files['pdf']['file_id']}").content == _PDF
+    assert client.get(f"/artifacts/{aid}/v/1/file/pdf").content == _PDF
+    bundle = client.get(f"/artifacts/{aid}/v/1/zip")
+    assert bundle.status_code == 200 and sorted(zipfile.ZipFile(io.BytesIO(bundle.content)).namelist()) == ["quarterly-review-v1.docx", "quarterly-review-v1.pdf"]
+
+
+def test_the_zip_route_streams_every_file_of_the_version(alice, login_client, monkeypatch):
+    """CONTRACT-2 §2: one bundle, ZIP_STORED, entries named by filename,
+    read through a 64 KiB chunker (the response never holds a file
+    whole); 413 past MAX_ZIP_BYTES; 404 for a stranger and for a version
+    with no file."""
+    client, uid = alice
+    row = _make(uid, kind="workbook", formats=("xlsx", "csv", "pdf"))
+    aid = row["artifact_id"]
+    version = client.get(f"/artifacts/{aid}/v/1").json()
+    assert version["package"] == {"count": 3} and version["download_all_url"] == f"/artifacts/{aid}/v/1/zip"
+    assert [f["role"] for f in version["files"]] == ["primary", "data", "companion"]
+
+    from app.artifacts import api as api_mod
+
+    reads = {"n": 0}
+    real_open = open
+
+    def chunk_watch(path, mode="r", *a, **kw):
+        fh = real_open(path, mode, *a, **kw)
+        if mode == "rb":
+            real_read = fh.read
+
+            def read(n=-1):
+                reads["n"] += 1
+                assert n == api_mod._ZIP_CHUNK, "the zip route reads in 64 KiB pieces, never the whole file"
+                return real_read(n)
+
+            fh.read = read
+        return fh
+
+    monkeypatch.setattr(api_mod, "open", chunk_watch, raising=False)
+    resp = client.get(f"/artifacts/{aid}/v/1/zip")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "application/zip"
+    assert resp.headers["content-disposition"].startswith('attachment; filename="budget-v1.zip"')
+    assert resp.headers["cache-control"] == "private, no-store"
+    assert reads["n"] >= 3
+    bundle = zipfile.ZipFile(io.BytesIO(resp.content))
+    assert bundle.testzip() is None
+    infos = {i.filename: i for i in bundle.infolist()}
+    assert set(infos) == {"budget-v1.xlsx", "budget-v1.csv", "budget-v1.pdf"}
+    assert all(i.compress_type == zipfile.ZIP_STORED for i in infos.values())
+    assert infos["budget-v1.pdf"].file_size == len(_PDF) and bundle.read("budget-v1.pdf") == _PDF
+    assert infos["budget-v1.csv"].file_size == len(b"csv bytes" * 100) and bundle.read("budget-v1.xlsx") == b"xlsx bytes" * 100
+    assert sum(v for k, v in metrics._counters["artifact_download_total"].items() if ("format", "zip") in k) == 1.0
+
+    monkeypatch.setattr(T, "MAX_ZIP_BYTES", 100)
+    too_big = client.get(f"/artifacts/{aid}/v/1/zip")
+    assert too_big.status_code == 413 and "one by one" in too_big.json()["detail"]
+    monkeypatch.setattr(T, "MAX_ZIP_BYTES", 200 * 1024 * 1024)
+
+    bob = login_client("api-bob")
+    assert bob.get(f"/artifacts/{aid}/v/1/zip").status_code == 404
+    # A version with no file yet (queued): 404, not an empty archive.
+    queued = pipeline.accept(user_id=uid, conversation_id="conv-api", generation_id="g-queued", operation="create", instruction="Make it",
+                             kind="document", formats=["pdf"], effort="fast", mode="assistant", template_id="generic", material={})
+    assert client.get(f"/artifacts/{queued['artifact_id']}/v/1/zip").status_code == 404
+    assert client.get(f"/artifacts/{aid}/v/9/zip").status_code == 404
+
+
+def _real_grid_render():
+    """A render whose xlsx and csv are REAL files (openpyxl, the csv
+    module): the grid route reads them back."""
+    async def render(work_dir, spec, formats, title_slug, version, effort):
+        from openpyxl import Workbook
+
+        files = []
+        for fmt in formats:
+            name = f"{title_slug}-v{version}.{fmt}"
+            path = os.path.join(work_dir, name)
+            if fmt == "xlsx":
+                wb = Workbook()
+                ws = wb.active
+                ws.title = "Data"
+                ws.append(["Item", "Cost"])
+                for i in range(1, 6):
+                    ws.append([f"item {i}", i * 10])
+                ws.append(["Total", "=SUM(B2:B6)"])
+                other = wb.create_sheet("Notes")
+                other.append(["Note"])
+                other.append(["hello"])
+                wb.save(path)
+                facts = {"sheets": 2, "rows": 6, "columns": 2}
+            elif fmt == "csv":
+                with open(path, "w", encoding="utf-8", newline="") as fh:
+                    fh.write("Item,Cost\r\n" + "".join(f"item {i},{i * 10}\r\n" for i in range(1, 6)))
+                facts = {"rows": 5, "columns": 2, "sheet": "Data", "title": "Data"}
+            else:
+                with open(path, "wb") as fh:
+                    fh.write(_PDF)
+                facts = {"pages": 3}
+            body = open(path, "rb").read()
+            files.append({"format": fmt, "filename": name, "size": len(body), "sha256": hashlib.sha256(body).hexdigest(), **facts})
+        with open(os.path.join(work_dir, T.PREVIEW_PDF_NAME), "wb") as fh:
+            fh.write(_PDF)
+        return {"files": files, "preview_pdf": T.PREVIEW_PDF_NAME, "preview_kind": "grid", "preview_pages": 0, "warnings": [], "validation": {}, "chart_files": [], "timings": {}}
+
+    return render
+
+
+def test_the_grid_route_pages_through_a_csv_and_an_xlsx_sheet(alice, login_client, monkeypatch):
+    """CONTRACT-2 §11: /grid?file=<id>&sheet=&offset=&limit= for BOTH grid
+    formats, one shape — sheets, sheet, columns, rows, total_rows,
+    total_columns, truncated, formulas_as_text — formulas as text; bounds
+    refused by validation; /sheets stays as the xlsx alias."""
+    client, uid = alice
+    monkeypatch.setattr(pipeline, "_render_in_subprocess", _real_grid_render())
+    row = _make(uid, kind="workbook", formats=("xlsx", "csv"))
+    aid = row["artifact_id"]
+    files = _files_of(client, aid)
+    csv_id, xlsx_id = files["csv"]["file_id"], files["xlsx"]["file_id"]
+    assert files["csv"]["rows"] == 5 and files["csv"]["columns"] == 2 and files["csv"]["title"] == "Budget — Data"
+    assert files["csv"]["preview_url"] == f"/artifacts/{aid}/v/1/grid?file={csv_id}"
+
+    page = client.get(f"/artifacts/{aid}/v/1/grid", params={"file": csv_id, "offset": 1, "limit": 2})
+    assert page.status_code == 200 and page.headers["cache-control"] == "private, no-store"
+    grid = page.json()
+    assert set(grid) >= {"sheets", "sheet", "columns", "rows", "total_rows", "total_columns", "truncated", "formulas_as_text"}
+    assert grid["columns"] == ["Item", "Cost"] and grid["rows"] == [["item 2", "20"], ["item 3", "30"]]
+    assert grid["total_rows"] == 5 and grid["total_columns"] == 2 and grid["truncated"] is True and grid["formulas_as_text"] is True
+    assert len(grid["sheets"]) == 1 and grid["sheet"] == grid["sheets"][0]
+    whole = client.get(f"/artifacts/{aid}/v/1/grid", params={"file": csv_id}).json()
+    assert len(whole["rows"]) == 5 and whole["truncated"] is False
+
+    page = client.get(f"/artifacts/{aid}/v/1/grid", params={"file": xlsx_id, "offset": 1, "limit": 2})
+    assert page.status_code == 200
+    grid = page.json()
+    assert grid["sheets"] == ["Data", "Notes"] and grid["sheet"] == "Data"
+    assert grid["columns"] == ["Item", "Cost"] and grid["rows"] == [["item 2", 20], ["item 3", 30]]
+    assert grid["total_rows"] == 6 and grid["total_columns"] == 2 and grid["truncated"] is True and grid["formulas_as_text"] is True
+    last = client.get(f"/artifacts/{aid}/v/1/grid", params={"file": xlsx_id, "offset": 5, "limit": 10}).json()
+    assert last["rows"] == [["Total", "=SUM(B2:B6)"]] and last["truncated"] is False, "the formula is text, never a number"
+    notes = client.get(f"/artifacts/{aid}/v/1/grid", params={"file": xlsx_id, "sheet": "Notes"}).json()
+    assert notes["sheet"] == "Notes" and notes["rows"] == [["hello"]]
+    assert client.get(f"/artifacts/{aid}/v/1/grid", params={"file": xlsx_id, "sheet": "Nope"}).status_code == 404
+    # No file named: the workbook's xlsx.
+    assert client.get(f"/artifacts/{aid}/v/1/grid").json()["sheet"] == "Data"
+    # Bounds: refused, never clamped silently.
+    assert client.get(f"/artifacts/{aid}/v/1/grid", params={"file": csv_id, "limit": 501}).status_code == 422
+    assert client.get(f"/artifacts/{aid}/v/1/grid", params={"file": csv_id, "offset": -1}).status_code == 422
+    assert client.get(f"/artifacts/{aid}/v/1/grid", params={"file": xlsx_id, "sheet": "s" * 32}).status_code == 422
+    assert client.get(f"/artifacts/{aid}/v/1/grid", params={"file": "0" * 16}).status_code == 404
+    # The xlsx alias still answers its own shape.
+    alias = client.get(f"/artifacts/{aid}/v/1/sheets").json()
+    assert alias["sheet"]["name"] == "Data" and alias["sheet"]["formulas"]
+    bob = login_client("api-bob")
+    assert bob.get(f"/artifacts/{aid}/v/1/grid", params={"file": csv_id}).status_code == 404
+    # A document version has no grid.
+    doc = _make(uid, conv="conv-api-3")
+    pdf_id = _files_of(client, doc["artifact_id"])["pdf"]["file_id"]
+    assert client.get(f"/artifacts/{doc['artifact_id']}/v/1/grid", params={"file": pdf_id}).status_code == 404
+    assert client.get(f"/artifacts/{doc['artifact_id']}/v/1/grid").status_code == 404
+
+
+def test_convert_a_workbook_to_csv(alice):
+    client, uid = alice
+    row = _make(uid, kind="workbook", formats=("xlsx",))
+    aid = row["artifact_id"]
+    assert client.post(f"/artifacts/{aid}/convert", json={"format": "pptx"}).status_code == 400
+    assert client.post(f"/artifacts/{aid}/convert", json={"format": "xlsx"}).status_code == 409
+    resp = client.post(f"/artifacts/{aid}/convert", json={"format": "csv"})
+    assert resp.status_code == 200 and resp.json()["version"] == 2
+
+    async def wait():
+        pipeline.reset_for_tests()
+        await pipeline.ensure_running(resp.json()["job_id"])
+        return await pipeline.wait_for(resp.json()["job_id"])
+
+    assert asyncio.run(wait())["status"] == "completed"
+    files = _files_of(client, aid, 2)
+    assert list(files) == ["csv"] and files["csv"]["role"] == "data" and files["csv"]["mime_type"] == "text/csv; charset=utf-8"
+    # A document cannot become a csv: the refusal names what it can be.
+    doc = _make(uid, conv="conv-api-4")
+    refused = client.post(f"/artifacts/{doc['artifact_id']}/convert", json={"format": "csv"})
+    assert refused.status_code == 400 and "docx or pdf" in refused.json()["detail"]
 
 
 def test_job_status_cancel_retry_and_convert(alice, monkeypatch):

@@ -236,11 +236,16 @@ def test_acceptance_writes_material_and_records_the_format_decision(owner):
 
 
 def test_acceptance_refuses_a_format_the_kind_cannot_take(owner):
+    # Re-pinned 2026-09-12 (CONTRACT-2 §1): a workbook may now carry pdf
+    # (a tabular document from the same spec); a document can never be a
+    # csv, so that is the genuinely impossible pair.
     with pytest.raises(pipeline.ArtifactRefused) as exc:
-        _accept(owner, kind="workbook", formats=["pdf"])
+        _accept(owner, kind="document", formats=["csv"])
     assert exc.value.category == "invalid_request"
     row = _accept(owner, kind="presentation", formats=["pdf", "pptx", "xlsx"])
     assert row["selected_formats"] == ["pdf", "pptx"]
+    wb = _accept(owner, generation_id="gen-wb", kind="workbook", formats=["xlsx", "csv", "docx", "pdf"])
+    assert wb["selected_formats"] == ["xlsx", "csv", "docx", "pdf"]
 
 
 def test_quota_refusal_happens_before_any_row(owner, monkeypatch):
@@ -326,9 +331,14 @@ def test_a_job_runs_every_stage_publishes_atomically_and_fans_out_steps(owner, m
     stamped = fresh["progress"]["stages"]
     assert all(stamped[s]["status"] == "done" for s in ("compose", "render", "validate", "preview"))
     assert stamped["outline"]["status"] == "skipped"
-    # The ArtifactRef the card is built from.
+    # The ArtifactRef the card is built from. Since CONTRACT-2 §2 a file
+    # is addressed by the id the pipeline minted for it, not by format.
     ref = pipeline.ref_for(fresh, version).to_json()
-    assert ref["status"] == "completed" and ref["files"][0]["download_url"].endswith("/file/pdf?disposition=attachment")
+    assert ref["status"] == "completed"
+    first = ref["files"][0]
+    assert first["download_url"] == f"/artifacts/{row['artifact_id']}/v/1/f/{first['file_id']}?disposition=attachment"
+    assert first["inline_url"].endswith(f"/f/{first['file_id']}?disposition=inline") and first["preview_url"].endswith("/v/1/preview")
+    assert ref["download_all_url"] == f"/artifacts/{row['artifact_id']}/v/1/zip" and ref["package"] == {"count": 2}
     assert ref["thumbnail_url"] == f"/artifacts/{row['artifact_id']}/v/1/preview/1.png?w=240"
     assert ref["status_url"] == f"/artifacts/jobs/{row['id']}"
     # Metrics.
@@ -1154,6 +1164,317 @@ def test_the_sweep_removes_an_abandoned_workdir_but_not_one_in_flight(owner, mon
     os.utime(fresh_work, (ancient, ancient))
     assert asyncio.run(pipeline.sweep()) == 0, "a queued job's directory is kept while the job is young"
     assert os.path.exists(fresh_work)
+
+
+# ------------------------------------------------- file identity (§2/§3/§11) --
+
+
+def _workbook_spec(title: str = "IR Session Audit", *, generator_rows: int = 0, sheets=("Data",)) -> S.ArtifactSpec:
+    """A workbook whose first sheet's rows are typed, or — with
+    `generator_rows` — made by code from a one-column recipe."""
+    body = {"title": title, "sheets": []}
+    for i, name in enumerate(sheets):
+        sheet = {"name": name, "columns": [{"name": "Host"}, {"name": "Score", "type": "integer"}], "rows": [["a", 1], ["b", 2], ["c", 3]]}
+        if generator_rows and i == 0:
+            sheet["rows"] = []
+            sheet["generator"] = {"rows": generator_rows, "seed": 7, "columns": [
+                {"name": "Host", "kind": "name"}, {"name": "Score", "kind": "int", "min": 1, "max": 9},
+            ]}
+        body["sheets"].append(sheet)
+    return S.parse_body("workbook", body)
+
+
+def _csv_bytes(rows: int, header=("Host", "Score")) -> bytes:
+    lines = [",".join(header)] + [f"h{i},{i}" for i in range(1, rows + 1)]
+    return ("\r\n".join(lines) + "\r\n").encode("utf-8")
+
+
+def _workbook_render(*, csv_rows=3, per_sheet=(), companion_pdf=True, extra=None):
+    """A render of a workbook version in the CONTRACT-2 §3 report shape:
+    the xlsx (primary), a CSV per sheet (data; per-sheet names when the
+    workbook has several sheets), and docx/pdf companions when selected.
+    preview.pdf is written only with `companion_pdf`."""
+    async def render(work_dir, spec, formats, title_slug, version, effort):
+        files = []
+
+        def put(name, body, **facts):
+            with open(os.path.join(work_dir, name), "wb") as fh:
+                fh.write(body)
+            files.append({"filename": name, "size": len(body), "sha256": hashlib.sha256(body).hexdigest(), **facts})
+
+        sheet_names = [s.name for s in spec.body.sheets]
+        for fmt in formats:
+            if fmt == "csv":
+                if per_sheet:
+                    for name in per_sheet:
+                        put(f"{title_slug}-v{version}-{T.slug_for(name)}.csv", _csv_bytes(csv_rows), format="csv", role="data", sheet=name, title=name, rows=csv_rows, columns=2)
+                else:
+                    put(f"{title_slug}-v{version}.csv", _csv_bytes(csv_rows), format="csv", role="data", sheet=sheet_names[0], title=sheet_names[0], rows=csv_rows, columns=2)
+            elif fmt == "xlsx":
+                put(f"{title_slug}-v{version}.xlsx", b"PK xlsx bytes " * 20, format="xlsx", role="primary", sheets=len(sheet_names), rows=csv_rows, columns=2)
+            else:
+                put(f"{title_slug}-v{version}.{fmt}", f"{fmt} companion bytes ".encode() * 20, format=fmt, role="companion", pages=2 if fmt == "pdf" else None)
+        if companion_pdf:
+            with open(os.path.join(work_dir, T.PREVIEW_PDF_NAME), "wb") as fh:
+                fh.write(b"%PDF-1.7 companion")
+        report = {"files": files, "preview_pdf": T.PREVIEW_PDF_NAME if companion_pdf else None, "preview_kind": "grid", "preview_pages": 0,
+                  "warnings": [], "validation": {"reopened": True}, "chart_files": [], "timings": {f: 0.01 for f in formats}}
+        if extra is not None:
+            extra(work_dir, report)
+        return report
+
+    return render
+
+
+def test_a_workbook_version_publishes_four_files_with_minted_ids_roles_and_counts(owner, monkeypatch):
+    """CONTRACT-2 §1-§3: xlsx (primary), csv (data), docx and pdf
+    (companions) from one spec; every FileRef carries a code-minted
+    file_id, its role, its title, rows/columns; the manifest and the
+    published directory hold all four; the wire ref bundles them."""
+    _install_render(monkeypatch, _workbook_render())
+    pipeline.set_composer(_composer(_workbook_spec()))
+    row = _accept(owner, kind="workbook", formats=["xlsx", "csv", "docx", "pdf"])
+    fresh = _run(row["id"])
+    assert fresh["status"] == "completed", fresh
+    version = adb.get_version(row["artifact_id"], 1, owner)
+    files = version["files"]
+    assert [f["format"] for f in files] == ["xlsx", "csv", "docx", "pdf"]
+    assert [f["role"] for f in files] == ["primary", "data", "companion", "companion"]
+    for f in files:
+        assert T.is_file_id(f["file_id"]) and f["mime_type"] == T.MIME_TYPES[f["format"]]
+    xlsx, csv_file, docx, pdf = files
+    assert csv_file["file_id"] == T.file_id_for(row["artifact_id"], 1, "data", "csv", "Data")
+    assert xlsx["file_id"] == T.file_id_for(row["artifact_id"], 1, "primary", "xlsx")
+    assert pdf["file_id"] == T.file_id_for(row["artifact_id"], 1, "companion", "pdf")
+    assert csv_file["filename"] == "ir-session-audit-v1.csv" and csv_file["rows"] == 3 and csv_file["columns"] == 2
+    assert csv_file["title"] == "IR Session Audit — Data" and xlsx["title"] == "IR Session Audit"
+    assert csv_file["mime_type"] == "text/csv; charset=utf-8" and pdf["pages"] == 2
+    final = store.version_dir(owner, row["artifact_id"], 1)
+    assert {"ir-session-audit-v1.xlsx", "ir-session-audit-v1.csv", "ir-session-audit-v1.docx", "ir-session-audit-v1.pdf"} <= set(os.listdir(final))
+    manifest = store.read_manifest(owner, row["artifact_id"], 1)
+    assert set(manifest["sha256s"]) == {f["filename"] for f in files}
+    assert (("format", "csv"),) in metrics._hists["artifact_render_seconds"]
+    ref = pipeline.ref_for(fresh, version).to_json()
+    assert ref["package"] == {"count": 4} and ref["download_all_url"] == f"/artifacts/{row['artifact_id']}/v/1/zip"
+    by_fmt = {f["format"]: f for f in ref["files"]}
+    assert by_fmt["csv"]["preview_url"] == f"/artifacts/{row['artifact_id']}/v/1/grid?file={csv_file['file_id']}"
+    assert by_fmt["xlsx"]["preview_url"].endswith(f"/grid?file={xlsx['file_id']}")
+    assert by_fmt["csv"]["download_url"] == f"/artifacts/{row['artifact_id']}/v/1/f/{csv_file['file_id']}?disposition=attachment"
+
+
+def test_file_ids_are_stable_across_a_retry_and_never_the_workers(owner, monkeypatch):
+    """The id is minted from (artifact, version, role, format, sheet): a
+    second attempt of the same version mints the same ids, and an id the
+    worker writes into its report is ignored."""
+    attempts = {"n": 0}
+
+    def plant(work_dir, report):
+        for f in report["files"]:
+            f["file_id"] = "deadbeefdeadbeef"
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise pipeline.RenderFailed("renderer_failure", "first try fails")
+
+    _install_render(monkeypatch, _workbook_render(extra=plant))
+    pipeline.set_composer(_composer(_workbook_spec()))
+    row = _accept(owner, kind="workbook", formats=["xlsx", "csv"])
+    assert _run(row["id"])["status"] == "failed"
+    fresh = asyncio.run(_retry_and_wait(row["id"], owner))
+    assert fresh["status"] == "completed" and fresh["attempt"] == 2
+    files = adb.get_version(row["artifact_id"], 1, owner)["files"]
+    assert "deadbeefdeadbeef" not in {f["file_id"] for f in files}
+    assert {f["file_id"] for f in files} == {
+        T.file_id_for(row["artifact_id"], 1, "primary", "xlsx"), T.file_id_for(row["artifact_id"], 1, "data", "csv", "Data"),
+    }
+    # A second, independent version of the same content mints DIFFERENT ids.
+    assert T.file_id_for(row["artifact_id"], 2, "primary", "xlsx") != files[0]["file_id"]
+
+
+def test_per_sheet_csv_names_are_accepted_and_distinct(owner, monkeypatch):
+    """A two-sheet workbook delivers one CSV per sheet, named
+    download_name(title, version, 'csv', part=<sheet>), each with its own
+    id and title (CONTRACT-2 §2); the plain name is still accepted for the
+    one-sheet case."""
+    _install_render(monkeypatch, _workbook_render(per_sheet=("Data", "Pipeline")))
+    pipeline.set_composer(_composer(_workbook_spec(sheets=("Data", "Pipeline"))))
+    row = _accept(owner, kind="workbook", formats=["xlsx", "csv"])
+    fresh = _run(row["id"])
+    assert fresh["status"] == "completed", fresh
+    files = adb.get_version(row["artifact_id"], 1, owner)["files"]
+    csvs = [f for f in files if f["format"] == "csv"]
+    assert [f["filename"] for f in csvs] == ["ir-session-audit-v1-data.csv", "ir-session-audit-v1-pipeline.csv"]
+    assert [f["title"] for f in csvs] == ["IR Session Audit — Data", "IR Session Audit — Pipeline"]
+    assert csvs[0]["file_id"] != csvs[1]["file_id"]
+    assert csvs[1]["file_id"] == T.file_id_for(row["artifact_id"], 1, "data", "csv", "Pipeline")
+    final = store.version_dir(owner, row["artifact_id"], 1)
+    assert {"ir-session-audit-v1-data.csv", "ir-session-audit-v1-pipeline.csv"} <= set(os.listdir(final)), "per-sheet CSVs survive publication"
+    ref = pipeline.ref_for(fresh, adb.get_version(row["artifact_id"], 1, owner)).to_json()
+    assert len({f["file_id"] for f in ref["files"]}) == 3 and ref["package"] == {"count": 3}
+
+
+def test_a_sheet_named_after_the_title_and_a_precomposed_label_both_keep_their_sheet(owner, monkeypatch):
+    """The review of 2026-09-12: the old `startswith(title)` rule collapsed
+    a sheet called "IR Session Audit 2025" — and a renderer that already
+    reported "<title> — <sheet>" — back to the bare title on the wire."""
+    def relabel(work_dir, report):
+        for f in report["files"]:
+            if f.get("sheet") == "Pipeline":
+                f["title"] = "IR Session Audit — Pipeline"  # already composed by the renderer
+    _install_render(monkeypatch, _workbook_render(per_sheet=("IR Session Audit 2025", "Pipeline"), extra=relabel))
+    pipeline.set_composer(_composer(_workbook_spec(sheets=("IR Session Audit 2025", "Pipeline"))))
+    row = _accept(owner, kind="workbook", formats=["xlsx", "csv"])
+    fresh = _run(row["id"])
+    assert fresh["status"] == "completed", fresh
+    csvs = [f for f in adb.get_version(row["artifact_id"], 1, owner)["files"] if f["format"] == "csv"]
+    assert [f["title"] for f in csvs] == ["IR Session Audit — IR Session Audit 2025", "IR Session Audit — Pipeline"]
+
+
+def test_the_transform_report_reaches_the_render_job(owner, monkeypatch):
+    """CONTRACT-2 §6: what code did to the pasted table (hosts forward-filled,
+    blanks kept) is printed in the Word/PDF methodology note — so it must
+    travel from the composer to the render worker, through a restart."""
+    seen = {}
+    real_render = pipeline._render_in_subprocess
+
+    async def render(work_dir, spec, formats, title_slug, version, effort, *, transform=None):
+        seen["transform"] = transform
+        return await _workbook_render()(work_dir, spec, formats, title_slug, version, effort)
+
+    monkeypatch.setattr(pipeline, "_render_in_subprocess", render)
+    monkeypatch.setattr(pipeline, "_page_count", lambda pdf: 1)
+    monkeypatch.setattr(pipeline, "_rasterise_page", lambda pdf, page, width: b"\x89PNG")
+
+    async def composer(ctx):
+        ctx.record_transform({"rows": 34, "blanks": 19, "forward_filled": 25})
+        return _workbook_spec()
+
+    pipeline.set_composer(composer)
+    row = _accept(owner, kind="workbook", formats=["xlsx", "csv"])
+    assert _run(row["id"])["status"] == "completed"
+    assert seen["transform"] == {"rows": 34, "blanks": 19, "forward_filled": 25}
+    # And the real subprocess writer puts it in the job file the worker reads.
+    work = os.path.join(store.reports_dir(), "transform-probe")
+    os.makedirs(work, exist_ok=True)
+    try:
+        asyncio.run(real_render(work, _workbook_spec(), ["xlsx"], "x", 1, "fast", transform={"rows": 2}))
+    except pipeline.RenderFailed:
+        pass  # the job file is written before the worker runs; its outcome is not this test's
+    assert json.load(open(os.path.join(work, store.JOB_NAME)))["transform"] == {"rows": 2}
+
+
+def test_the_material_round_trip_keeps_row_count_and_transform():
+    m = pipeline._material({"history_text": "h", "row_count": "500", "transform": {"rows": 34}})
+    assert m["row_count"] == 500 and m["transform"] == {"rows": 34}
+    assert pipeline._material({})["row_count"] is None and pipeline._material({})["transform"] == {}
+
+
+def test_two_files_for_one_role_format_sheet_are_refused(owner, monkeypatch):
+    def duplicate(work_dir, report):
+        report["files"].append(dict(report["files"][-1]))
+
+    _install_render(monkeypatch, _workbook_render(extra=duplicate))
+    pipeline.set_composer(_composer(_workbook_spec()))
+    row = _accept(owner, kind="workbook", formats=["xlsx", "csv"])
+    fresh = _run(row["id"])
+    assert fresh["status"] == "failed" and fresh["failure_category"] == "validation_failure"
+    assert "two csv files" in fresh["error"]
+
+
+def test_a_csv_whose_rows_differ_from_the_generator_is_not_published(owner, monkeypatch):
+    """CONTRACT-2 §11, belt and braces: the spec's generator promised 5
+    rows; the CSV on disk has 3. The pipeline counts the rows from the
+    bytes — a renderer that REPORTS 5 over a 3-row file is caught the
+    same way — and refuses with both numbers in the sentence."""
+    _install_render(monkeypatch, _workbook_render(csv_rows=3))
+    pipeline.set_composer(_composer(_workbook_spec(generator_rows=5)))
+    row = _accept(owner, kind="workbook", formats=["xlsx", "csv"])
+    fresh = _run(row["id"])
+    assert fresh["status"] == "failed" and fresh["failure_category"] == "validation_failure"
+    assert "3 data rows" in fresh["error"] and "5 were asked for" in fresh["error"]
+    assert not store.is_published(owner, row["artifact_id"], 1)
+
+    def lie(work_dir, report):
+        for f in report["files"]:
+            if f["format"] == "csv":
+                f["rows"] = 5
+
+    _install_render(monkeypatch, _workbook_render(csv_rows=3, extra=lie))
+    row2 = _accept(owner, generation_id="gen-lie", kind="workbook", formats=["xlsx", "csv"])
+    fresh2 = _run(row2["id"])
+    assert fresh2["status"] == "failed" and "3 data rows" in fresh2["error"] and "reported 5" in fresh2["error"]
+
+    # The promised count, delivered: published, rows recorded from the bytes.
+    _install_render(monkeypatch, _workbook_render(csv_rows=5))
+    row3 = _accept(owner, generation_id="gen-ok", kind="workbook", formats=["xlsx", "csv"])
+    fresh3 = _run(row3["id"])
+    assert fresh3["status"] == "completed", fresh3
+    csv_file = next(f for f in adb.get_version(row3["artifact_id"], 1, owner)["files"] if f["format"] == "csv")
+    assert csv_file["rows"] == 5
+
+
+def test_a_grid_version_with_a_pdf_companion_gets_pages_and_a_thumbnail(owner, monkeypatch):
+    """Wave 1's addendum: ArtifactRef links a pdf/docx companion of a grid
+    version to /preview only while preview_pages > 0, so the preview
+    stage counts the companion's pages and rasterises page 1 exactly as
+    for a pages version — preview_kind stays 'grid'. Without a
+    preview.pdf the companion is download-only and nothing is warned."""
+    _install_render(monkeypatch, _workbook_render(companion_pdf=True))
+    pipeline.set_composer(_composer(_workbook_spec()))
+    row = _accept(owner, kind="workbook", formats=["xlsx", "csv", "pdf"])
+    fresh = _run(row["id"])
+    assert fresh["status"] == "completed", fresh
+    version = adb.get_version(row["artifact_id"], 1, owner)
+    assert version["preview_kind"] == "grid" and version["preview_pages"] == 2
+    final = store.version_dir(owner, row["artifact_id"], 1)
+    assert set(os.listdir(os.path.join(final, "previews"))) == {"1-240.png", "1-1400.png"}
+    ref = pipeline.ref_for(fresh, version).to_json()
+    by_fmt = {f["format"]: f for f in ref["files"]}
+    assert by_fmt["pdf"]["preview_url"] == f"/artifacts/{row['artifact_id']}/v/1/preview"
+    assert by_fmt["xlsx"]["preview_url"].startswith(f"/artifacts/{row['artifact_id']}/v/1/grid?file=")
+    assert ref["preview_url"].endswith("/v/1/sheets") and ref["thumbnail_url"].endswith("/v/1/preview/1.png?w=240")
+
+    _install_render(monkeypatch, _workbook_render(companion_pdf=False))
+    row2 = _accept(owner, generation_id="gen-no-pdf", kind="workbook", formats=["xlsx", "csv", "docx"])
+    fresh2 = _run(row2["id"])
+    assert fresh2["status"] == "completed", fresh2
+    version2 = adb.get_version(row2["artifact_id"], 1, owner)
+    assert version2["preview_kind"] == "grid" and version2["preview_pages"] == 0 and version2["warnings"] == []
+    ref2 = pipeline.ref_for(fresh2, version2).to_json()
+    assert {f["format"]: f["preview_url"] for f in ref2["files"]}["docx"] == "", "download-only without a page preview"
+    assert ref2["thumbnail_url"] == ""
+
+
+def test_ref_for_upgrades_a_legacy_version_row_without_file_ids():
+    """A row persisted before 2026-09-12 has files with no file_id, role,
+    title, rows or columns. On the wire every file still carries them:
+    the id is the one the pipeline would have minted (so it is stable
+    across reloads), the role follows the kind's native format, the title
+    is the version's, rows/columns are None (CONTRACT-2 §2)."""
+    aid = "c" * 32
+    job = {"artifact_id": aid, "version": 3, "id": "j" * 32, "status": "completed", "kind": "document", "title": "Old Report"}
+    legacy = {"files": [
+        {"format": "pdf", "filename": "old-report-v3.pdf", "mime_type": "application/pdf", "size": 10, "sha256": "a" * 64, "pages": 4},
+        {"format": "docx", "filename": "old-report-v3.docx", "mime_type": T.MIME_TYPES["docx"], "size": 20, "sha256": "b" * 64},
+    ], "preview_kind": "pages", "preview_pages": 4, "title": "Old Report", "kind": "document"}
+    ref = pipeline.ref_for(job, legacy)
+    pdf, docx = ref.files
+    assert (pdf.role, docx.role) == ("companion", "primary"), "docx is a document's native format (FORMATS_FOR_KIND)"
+    assert pdf.file_id == T.file_id_for(aid, 3, "companion", "pdf") and docx.file_id == T.file_id_for(aid, 3, "primary", "docx")
+    assert pdf.title == "Old Report" and pdf.rows is None and pdf.columns is None and pdf.pages == 4
+    wire = ref.to_json()
+    assert wire["files"][0]["download_url"] == f"/artifacts/{aid}/v/3/f/{pdf.file_id}?disposition=attachment"
+    assert wire["files"][0]["preview_url"] == f"/artifacts/{aid}/v/3/preview"
+    assert wire["download_all_url"] == f"/artifacts/{aid}/v/3/zip" and wire["package"] == {"count": 2}
+    # The same row read twice gives the same ids — a reload never re-keys a card.
+    assert [f.file_id for f in pipeline.ref_for(job, legacy).files] == [pdf.file_id, docx.file_id]
+    # A deck: pptx primary, pdf companion; a workbook: xlsx primary.
+    deck = pipeline.ref_for({**job, "kind": "presentation"}, {"files": [{"format": "pdf", "filename": "d-v3.pdf", "size": 1}, {"format": "pptx", "filename": "d-v3.pptx", "size": 1}], "kind": "presentation"})
+    assert [f.role for f in deck.files] == ["companion", "primary"]
+    book = pipeline.ref_for({**job, "kind": "workbook"}, {"files": [{"format": "xlsx", "filename": "b-v3.xlsx", "size": 1}], "kind": "workbook", "preview_kind": "grid"})
+    assert book.files[0].role == "primary" and book.to_json()["files"][0]["preview_url"] == f"/artifacts/{aid}/v/3/grid?file={book.files[0].file_id}"
+    # A row that already carries an id keeps it, whatever the derivation says.
+    kept = pipeline.ref_for(job, {"files": [{"format": "pdf", "filename": "x-v3.pdf", "size": 1, "file_id": "0123456789abcdef", "role": "primary", "title": "Sheet — A", "rows": 7, "columns": 2}]})
+    assert kept.files[0].file_id == "0123456789abcdef" and kept.files[0].role == "primary" and kept.files[0].rows == 7 and kept.files[0].title == "Sheet — A"
 
 
 # ---------------------------------------------------------- subprocess --

@@ -1646,6 +1646,19 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
     # finished; when it hasn't, the facts still persist — only the chip is
     # skipped for this turn.
     memory_state: dict = {}
+    # The extraction task, and the gate it waits on before touching the
+    # model or the table (facts.remember_after_route). An ARTIFACT turn
+    # resolves the gate False and cancels the task before its engine runs,
+    # so a request for a file never becomes a saved fact and the meta never
+    # carries `memory_updated` (CONTRACT-2 §8); every other route resolves
+    # it True the moment the route is known, and the worker's `finally`
+    # resolves whatever is still pending so the task cannot wait forever.
+    fact_task: Optional["asyncio.Task[list]"] = None
+    fact_gate: "asyncio.Future[bool]" = asyncio.get_running_loop().create_future()
+
+    def _release_facts(extract: bool) -> None:
+        if not fact_gate.done():
+            fact_gate.set_result(bool(extract))
     # Salesforce Intelligence Mode extras (assumptions, resolved scope, the
     # final phase) merged into whichever engine's meta ends up being emitted.
     salesforce_state: dict = {}
@@ -1761,8 +1774,12 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
     async def worker() -> None:
         # `text` is rebound when the user answers a clarifying question, so it
         # must be declared here — a `nonlocal` further down would come after
-        # the reads above it and fail to compile.
-        nonlocal text
+        # the reads above it and fail to compile. `fact_task` is assigned
+        # below only on a signed-in assistant turn and read by the artifact
+        # branch on every turn: without the declaration the assignment
+        # would make it a local of this function and the read an
+        # UnboundLocalError on every other path.
+        nonlocal text, fact_task
         # Per-request state: this task owns its own trim record, and its own
         # token accounting (V18 — llm._usage is a ContextVar with exactly the
         # same per-task scope).
@@ -2018,8 +2035,8 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     #    ref keeps it alive past this request if need be.
                     if settings.fact_extraction_enabled:
                         fact_task = asyncio.create_task(
-                            facts.remember_from_message(
-                                user_id, request.text, request.conversation_id
+                            facts.remember_after_route(
+                                fact_gate, user_id, request.text, request.conversation_id
                             )
                         )
                         _background_tasks.add(fact_task)
@@ -2573,14 +2590,26 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     )
                 except Exception:  # noqa: BLE001 — no list means "create" semantics
                     _existing = []
-                _hints = [str(a.get("title") or "") for a in _existing if a.get("title")]
+                # Only a PUBLISHED artifact can be edited, so only one counts
+                # (CONTRACT-2 §8 wave 3): a row whose first attempt failed
+                # used to make the retry — "create the PDF again" — read as
+                # an edit of nothing, and the engine then "Updated" a title
+                # nobody had seen.
+                _published = [
+                    a for a in _existing
+                    if str((a.get("current") or {}).get("status") or "") in ("completed", "completed_with_warnings")
+                ]
+                _hints = [str(a.get("title") or "") for a in _published if a.get("title")]
                 artifact_intent = await artifact_intent_rules.decide_with_hook(
                     text,
                     artifact_engine_mod.classify_hook if request.effort != "fast" else None,
-                    has_artifacts=bool(_existing),
+                    has_artifacts=bool(_published),
                     artifact_hints=_hints,
                     has_assistant_answer=any(str(h.get("role")) == "assistant" for h in history),
                 )
+            # The route is known: memory may (or, for a file request, may
+            # not) be written from this message — see fact_gate above.
+            _release_facts(not (artifact_intent is not None and artifact_intent.wants_file))
 
             if sf_outcome is not None and sf_outcome.handled:
                 # Salesforce Intelligence Mode answered, or asked a question and
@@ -2601,6 +2630,15 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 # stages as steps and ends with the one meta.
                 from .engines import artifact as artifact_engine
 
+                # CONTRACT-2 §8: a request for a file is a task, not a fact.
+                # The extraction task is held at its gate (released False
+                # above) and cancelled here for good measure, and whatever
+                # it may already have surfaced is dropped, so this turn's
+                # meta never carries `memory_updated` and no `user_facts`
+                # row is written from a document request.
+                if fact_task is not None and not fact_task.done():
+                    fact_task.cancel()
+                memory_state.pop("facts", None)
                 gen.waiting_on_job = True  # see _chat_is_busy in the lifespan
                 answer = await artifact_engine.run_artifact_engine(
                     text,
@@ -3008,6 +3046,10 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 error=exc,
             )
         finally:
+            # A turn that left before its route was decided (an error, a
+            # cancel) still lets the message be remembered, as it always
+            # was; only a decided artifact turn says no.
+            _release_facts(True)
             # V29: the row's terminal status — cancelled, failed, or
             # interrupted when the loop is tearing this process down.
             with contextlib.suppress(Exception):

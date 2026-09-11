@@ -30,9 +30,12 @@ their step events through `ctx.progress_stage`). The runner itself runs
 SUBPROCESS: argument array, scrubbed environment, RLIMIT_AS/RLIMIT_CPU,
 wall-clock timeout that kills the process group), `validate` (the render
 report reread; every file present, non-empty, under MAX_FILE_BYTES, its
-sha256 recomputed), `preview` (page 1 rasterised at both PREVIEW_WIDTHS so
-the card has a thumbnail; the rest on demand), then publishes: manifest,
-atomic rename, and the version/artifact/job rows in one transaction.
+sha256 recomputed, a CSV's rows counted, and its `file_id` minted here
+from (artifact, version, role, format, sheet) — CONTRACT-2 §2 — never
+taken from the worker), `preview` (page 1 rasterised at both
+PREVIEW_WIDTHS so the card has a thumbnail; the rest on demand), then
+publishes: manifest, atomic rename, and the version/artifact/job rows in
+one transaction.
 
 ONE JOB AT A TIME (ARTIFACT_MAX_CONCURRENT_JOBS=1). Rendering is CPU-bound
 (python-docx, python-pptx, WeasyPrint, matplotlib) and runs in a child
@@ -275,6 +278,9 @@ class _Ctx:
         return self.material
 
 
+TRANSFORM_NAME = "transform.json"
+
+
 def _material(data: Optional[dict]) -> dict:
     """The conversation-derived material, with every key present. This is
     the shape material.json takes and the shape the composer reads back, so
@@ -290,6 +296,10 @@ def _material(data: Optional[dict]) -> dict:
         "uploads_text": str(data.get("uploads_text") or ""),
         "notes": [str(n) for n in (data.get("notes") or []) if str(n).strip()],
         "salesforce": data.get("salesforce") if isinstance(data.get("salesforce"), dict) else {},
+        # CONTRACT-2: the exact count the person asked for, and what the
+        # engine's table parser did — both must survive a requeue.
+        "row_count": int(data["row_count"]) if str(data.get("row_count") or "").isdigit() else None,
+        "transform": dict(data["transform"]) if isinstance(data.get("transform"), dict) else {},
     }
 
 
@@ -382,6 +392,16 @@ class ComposeContext:
         """A correction or caveat worth showing on the card."""
         if text and text not in self._ctx.warnings:
             self._ctx.warnings.append(str(text)[:300])
+
+    def record_transform(self, transform: Optional[dict]) -> None:
+        """What code did to the data (rows copied, blanks kept, hosts
+        forward-filled, comments rewritten) — kept beside the spec as
+        transform.json so the render stage, which may run in another
+        attempt after a restart, can print it in the Word/PDF methodology
+        note. Until 2026-09-12 the report reached the sentence but never
+        the render job."""
+        if isinstance(transform, dict) and transform:
+            store.write_json(os.path.join(self._ctx.work_dir, TRANSFORM_NAME), dict(transform))
 
     async def progress(self, percent: Optional[float], detail: str) -> None:
         await self._progress(percent, detail)
@@ -695,24 +715,73 @@ async def retry(job_id: str, user_id: int) -> Optional[dict]:
     return row
 
 
+def _int_or_none(value: Any) -> Optional[int]:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _file_role(kind: str, fmt: str, given: Any = None) -> str:
+    """The role a file plays in its version (CONTRACT-2 §2): the render
+    report's word when it is one of types.FILE_ROLES, else derived from
+    the kind — its native format (the first of FORMATS_FOR_KIND) is
+    `primary`, a csv is `data`, any other format `companion`. The derived
+    rule is what a legacy row (no role stored) gets in ref_for."""
+    role = str(given or "")
+    if role in T.FILE_ROLES:
+        return role
+    if fmt == "csv":
+        return "data"
+    native = (T.FORMATS_FOR_KIND.get(kind) or ("",))[0]
+    return "primary" if fmt == native else "companion"
+
+
+def _file_ref(f: dict, artifact_id: str, version: int, kind: str, title: str) -> T.FileRef:
+    """A stored file dict as the FileRef the wire carries — UPGRADED when
+    the row predates file ids (CONTRACT-2 §2): the id is minted here from
+    (artifact, version, role, format) exactly as the pipeline would have
+    minted it, the role from the kind's native format, the title from the
+    version, rows/columns None. A row that carries an id keeps it — a
+    history reload and a fresh publish agree on every id."""
+    fmt = str(f.get("format") or "")
+    role = _file_role(kind, fmt, f.get("role"))
+    file_id = str(f.get("file_id") or "")
+    if not T.is_file_id(file_id):
+        sheet = str(f.get("sheet") or "") if role == "data" else ""
+        file_id = T.file_id_for(artifact_id, version, role, fmt, sheet)
+    return T.FileRef(
+        format=fmt, filename=str(f.get("filename") or ""),
+        mime_type=str(f.get("mime_type") or T.MIME_TYPES.get(fmt, "application/octet-stream")),
+        size=int(f.get("size") or 0), sha256=str(f.get("sha256") or ""),
+        pages=_int_or_none(f.get("pages")), slides=_int_or_none(f.get("slides")), sheets=_int_or_none(f.get("sheets")),
+        file_id=file_id, role=role, title=str(f.get("title") or title or ""),
+        rows=_int_or_none(f.get("rows")), columns=_int_or_none(f.get("columns")),
+    )
+
+
 def ref_for(job: dict, version: Optional[dict] = None) -> T.ArtifactRef:
     """The ArtifactRef for a job row (with `kind`/`title` joined by load_job)
-    and, when published, its version row."""
+    and, when published, its version row. Every file on the wire carries
+    `file_id`, `role` and `title`, a legacy row's synthesised (`_file_ref`)."""
     version = version or {}
+    artifact_id = str(job["artifact_id"])
+    version_number = int(job["version"])
+    title = str(version.get("title") or job.get("title") or "")
+    kind = str(version.get("kind") or job.get("kind") or "document")
     files = [
-        T.FileRef(
-            format=str(f.get("format")), filename=str(f.get("filename")), mime_type=str(f.get("mime_type") or T.MIME_TYPES.get(str(f.get("format")), "application/octet-stream")),
-            size=int(f.get("size") or 0), sha256=str(f.get("sha256") or ""),
-            pages=f.get("pages"), slides=f.get("slides"), sheets=f.get("sheets"),
-        )
+        _file_ref(f, artifact_id, version_number, kind, title)
         for f in (version.get("files") or [])
+        if isinstance(f, dict)
     ]
     return T.ArtifactRef(
-        artifact_id=str(job["artifact_id"]),
-        version=int(job["version"]),
+        artifact_id=artifact_id,
+        version=version_number,
         job_id=str(job["id"]),
-        title=str(version.get("title") or job.get("title") or ""),
-        kind=str(version.get("kind") or job.get("kind") or "document"),
+        title=title,
+        kind=kind,
         status=str(job.get("status") or "queued"),
         files=files,
         preview_kind=str(version.get("preview_kind") or "none"),
@@ -1315,7 +1384,11 @@ async def _stage_render(runner: _Runner, ctx: _Ctx, progress) -> _StageResult:
     title_slug = T.slug_for(spec.title)
     await progress(5.0, f"{', '.join(formats)} · {settings.artifact_render_timeout_s:.0f}s budget")
     render_started = time.perf_counter()
-    report = await _render_in_subprocess(ctx.work_dir, spec, formats, title_slug, int(ctx.job["version"]), str(ctx.job.get("effort") or "fast"))
+    transform = await asyncio.to_thread(store.read_json, os.path.join(ctx.work_dir, TRANSFORM_NAME))
+    # The keyword travels only when there is a report: the render function
+    # is replaced in every test suite by writers that predate it.
+    extra = {"transform": transform} if isinstance(transform, dict) and transform else {}
+    report = await _render_in_subprocess(ctx.work_dir, spec, formats, title_slug, int(ctx.job["version"]), str(ctx.job.get("effort") or "fast"), **extra)
     if not isinstance(report, dict):
         raise RenderFailed("renderer_failure", safe_error("renderer_failure"))
     report = dict(report)
@@ -1337,7 +1410,10 @@ async def _stage_validate(runner: _Runner, ctx: _Ctx, progress) -> _StageResult:
     report = ctx.load_report()
     spec = ctx.load_spec()
     selected = [f for f in (ctx.job.get("selected_formats") or []) if f in T.FORMATS_FOR_KIND[spec.kind]]
-    checked = await asyncio.to_thread(_validate_files, ctx.work_dir, report, selected, spec.title, int(ctx.job["version"]))
+    checked = await asyncio.to_thread(
+        _validate_files, ctx.work_dir, report, selected, spec.title, int(ctx.job["version"]),
+        artifact_id=str(ctx.job["artifact_id"]), spec=spec,
+    )
     problems: List[str] = checked["problems"]
     if problems:
         raise StageFailure("validation_failure", safe_error("validation_failure", problems[0]))
@@ -1357,20 +1433,66 @@ async def _stage_validate(runner: _Runner, ctx: _Ctx, progress) -> _StageResult:
     return _StageResult("done", detail)
 
 
-def _validate_files(work_dir: str, report: dict, selected: Sequence[str], title: str, version: int) -> dict:
+def _generator_rows(spec: Optional[ArtifactSpec]) -> Dict[str, int]:
+    """Sheet name (folded) → the row count its generator promised. Only a
+    workbook has these; only a sheet whose rows are code-made from a
+    generator has a number the file MUST match (CONTRACT-2 §11)."""
+    out: Dict[str, int] = {}
+    sheets = getattr(getattr(spec, "body", None), "sheets", None) or []
+    for sheet in sheets:
+        gen = getattr(sheet, "generator", None)
+        if gen is not None and getattr(gen, "rows", None):
+            out[str(sheet.name).strip().lower()] = int(gen.rows)
+    return out
+
+
+def _csv_data_rows(path: str) -> int:
+    """The data rows of a CSV (the header excluded), counted by the stdlib
+    reader in one pass: the number a person was promised, read from the
+    bytes that will be served — never from what the renderer said."""
+    import csv
+
+    count = 0
+    with open(path, "r", encoding="utf-8", errors="strict", newline="") as fh:
+        for index, _record in enumerate(csv.reader(fh)):
+            if index:
+                count += 1
+    return count
+
+
+def _validate_files(work_dir: str, report: dict, selected: Sequence[str], title: str, version: int, *,
+                    artifact_id: str = "", spec: Optional[ArtifactSpec] = None) -> dict:
     """Blocking: reopen-by-stat every file the render report names. The
-    renderer already reopened them structurally (page counts, zip parts);
-    this is the runner's independent check that what it is about to publish
-    is there, non-empty, within the ceiling, hashes to what was claimed —
-    and is NAMED what the contract names it, types.download_name(title,
-    version, fmt). The version row records the filename verbatim and
-    store.resolve_version_file refuses a name whose extension is not the
-    format, so a report naming e.g. 'spec.json.bak' for pdf used to publish
-    a COMPLETED version whose download and inline URLs 404'd."""
+    renderer already reopened them structurally (page counts, zip parts,
+    row counts); this is the runner's independent check that what it is
+    about to publish is there, non-empty, within the ceiling, hashes to
+    what was claimed — and is NAMED what the contract names it:
+    types.download_name(title, version, fmt) for the kind's native file and
+    its companions, download_name(..., part=<sheet>) for the per-sheet CSV
+    of a workbook (CONTRACT-2 §2). The version row records the filename
+    verbatim and store.resolve_version_file refuses a name whose extension
+    is not the format, so a report naming e.g. 'spec.json.bak' for pdf used
+    to publish a COMPLETED version whose download and inline URLs 404'd.
+
+    IDENTITY IS MINTED HERE. `file_id` = types.file_id_for(artifact_id,
+    version, role, format, sheet) — from what the file IS, so a retry and a
+    re-render agree on it — and an id the worker wrote into its report is
+    ignored. One file per (role, format, sheet); the role comes from the
+    report when it names one (`_file_role`). `rows`, `columns` and the
+    file's `title` (the sheet's, for a data file) ride into the FileRef.
+
+    BELT AND BRACES (§11): a CSV's data rows are counted from the bytes,
+    and a count that differs from what the renderer reported, or from the
+    rows the spec's generator promised for that sheet, is a
+    validation_failure with both numbers — "exactly 500 rows" is checked
+    by the process that publishes, not only by the one that rendered."""
     files: List[dict] = []
     problems: List[str] = []
     warnings: List[str] = []
     seen_formats: List[str] = []
+    seen_keys: List[Tuple[str, str, str]] = []
+    kind = str(getattr(spec, "kind", "") or report.get("kind") or "document")
+    promised = _generator_rows(spec)
     real_root = os.path.realpath(work_dir)
     for entry in report.get("files") or []:
         if not isinstance(entry, dict):
@@ -1380,9 +1502,17 @@ def _validate_files(work_dir: str, report: dict, selected: Sequence[str], title:
         if fmt not in T.FORMATS or not filename:
             problems.append(f"the renderer named a file it may not write ({fmt or 'unknown format'})")
             continue
-        expected = T.download_name(title, version, fmt)
-        if filename != expected:
-            problems.append(f"the {fmt} file is not named {expected}")
+        role = _file_role(kind, fmt, entry.get("role"))
+        sheet = str(entry.get("sheet") or "").strip() if role == "data" else ""
+        expected = [T.download_name(title, version, fmt)]
+        if sheet:
+            expected.append(T.download_name(title, version, fmt, part=sheet))
+        if filename not in expected:
+            problems.append(f"the {fmt} file is not named {' or '.join(expected)}")
+            continue
+        key = (role, fmt, sheet.lower())
+        if key in seen_keys:
+            problems.append(f"the renderer named two {fmt} files for the same {role}{' sheet ' + sheet if sheet else ''}")
             continue
         path = os.path.realpath(os.path.join(work_dir, filename))
         if not path.startswith(real_root + os.sep):
@@ -1404,13 +1534,42 @@ def _validate_files(work_dir: str, report: dict, selected: Sequence[str], title:
         if claimed and claimed != digest:
             problems.append(f"the {fmt} file changed after it was rendered")
             continue
+        rows = _int_or_none(entry.get("rows"))
+        columns = _int_or_none(entry.get("columns"))
+        if fmt == "csv":
+            try:
+                counted = _csv_data_rows(path)
+            except (OSError, ValueError, UnicodeDecodeError):
+                problems.append(f"the csv file{' for ' + sheet if sheet else ''} could not be read back")
+                continue
+            if rows is not None and rows != counted:
+                problems.append(f"the csv file{' for ' + sheet if sheet else ''} has {counted:,} data rows; the renderer reported {rows:,}")
+                continue
+            rows = counted
+            wanted = promised.get(sheet.lower()) if sheet else (next(iter(promised.values())) if len(promised) == 1 else None)
+            if wanted is not None and rows != wanted:
+                problems.append(f"the csv file{' for ' + sheet if sheet else ''} has {rows:,} data rows; {wanted:,} were asked for")
+                continue
+        label = str(entry.get("title") or "").strip() or sheet
+        if role == "data" and label and label != title:
+            # "<title> — <sheet>" (CONTRACT-2 §2): composed here from the
+            # sheet name the renderer reports; a label the renderer already
+            # composed is kept as it is, and a sheet whose name merely
+            # starts with the artifact title is still a sheet (the review
+            # of 2026-09-12 found the old startswith rule collapsing it).
+            file_title = label if label.startswith(f"{title} — ") else f"{title} — {label}"
+        else:
+            file_title = title
         ref = T.FileRef(
             format=fmt, filename=filename, mime_type=T.MIME_TYPES.get(fmt, "application/octet-stream"),
             size=int(size), sha256=digest,
-            pages=entry.get("pages"), slides=entry.get("slides"), sheets=entry.get("sheets"),
+            pages=_int_or_none(entry.get("pages")), slides=_int_or_none(entry.get("slides")), sheets=_int_or_none(entry.get("sheets")),
+            file_id=T.file_id_for(artifact_id, version, role, fmt, sheet) if artifact_id else "",
+            role=role, title=file_title, rows=rows, columns=columns,
         )
         files.append(ref.to_json())
         seen_formats.append(fmt)
+        seen_keys.append(key)
     for fmt in selected:
         if fmt not in seen_formats:
             problems.append(f"the {fmt} file was not produced")
@@ -1439,11 +1598,24 @@ def _preview_pdf_path(work_dir: str, preview_pdf: Any) -> Optional[str]:
 
 
 async def _stage_preview(runner: _Runner, ctx: _Ctx, progress) -> _StageResult:
+    """Page 1 of preview.pdf at both PREVIEW_WIDTHS, and the page count the
+    viewer may ask for. For a `pages` version the PDF is the document; a
+    version without one becomes `none` with a warning. For a `grid`
+    version (a workbook) the real preview is the sheet grid, but when the
+    render left a preview.pdf — the Word/PDF companion of the workbook, or
+    the summary sheet — its pages are counted and its first page
+    rasterised exactly as for a pages version, so the card has a thumbnail
+    and the companion is previewable (types.ArtifactRef links a pdf/docx
+    companion of a grid version to /preview only while preview_pages > 0).
+    `preview_kind` stays `grid`; with no PDF the companion is download-only
+    and nothing is warned about — the grid is the preview."""
     report = ctx.load_report()
     preview_kind = str(report.get("preview_kind") or "none")
+    if preview_kind not in ("pages", "grid"):
+        preview_kind = "none"
     preview_pages = 0
     thumbnails: List[str] = []
-    if preview_kind == "pages":
+    if preview_kind != "none":
         pdf = _preview_pdf_path(ctx.work_dir, report.get("preview_pdf"))
         if pdf is not None and os.path.isfile(pdf) and os.path.getsize(pdf) > 0:
             try:
@@ -1462,18 +1634,16 @@ async def _stage_preview(runner: _Runner, ctx: _Ctx, progress) -> _StageResult:
                         log.warning("artifact job %s: thumbnail at %d px failed: %s", runner.job_id[:8], width, type(exc).__name__)
                         ctx.warnings.append("the card's thumbnail could not be made")
                         break
-        else:
+        elif preview_kind == "pages":
             preview_kind = "none"
             ctx.warnings.append("no page preview could be made for this version")
-    elif preview_kind == "grid":
-        preview_pages = int(report.get("preview_pages") or 0)
-    else:
-        preview_kind = "none"
     meta = {"preview_kind": preview_kind, "preview_pages": preview_pages, "thumbnails": thumbnails}
     await asyncio.to_thread(store.write_json, os.path.join(ctx.work_dir, store.PREVIEW_META_NAME), meta)
     if preview_kind == "pages":
         return _StageResult("done", f"{preview_pages} page(s) · thumbnail {'ready' if thumbnails else 'missing'}")
-    return _StageResult("done", "grid preview" if preview_kind == "grid" else "no preview for this kind")
+    if preview_kind == "grid":
+        return _StageResult("done", f"grid preview · {preview_pages} companion page(s)" if preview_pages else "grid preview")
+    return _StageResult("done", "no preview for this kind")
 
 
 _STAGE_FNS = {
@@ -1552,7 +1722,8 @@ def _kill_group(proc: "asyncio.subprocess.Process") -> None:
             pass
 
 
-async def _render_in_subprocess(work_dir: str, spec: ArtifactSpec, formats: Sequence[str], title_slug: str, version: int, effort: str) -> dict:
+async def _render_in_subprocess(work_dir: str, spec: ArtifactSpec, formats: Sequence[str], title_slug: str, version: int, effort: str,
+                                *, transform: Optional[dict] = None) -> dict:
     """Run `python -m app.artifacts.render.worker <job.json>` in a child
     process and return its render report as a dict.
 
@@ -1572,6 +1743,7 @@ async def _render_in_subprocess(work_dir: str, spec: ArtifactSpec, formats: Sequ
         "title_slug": title_slug,
         "version": int(version),
         "effort": effort,
+        **({"transform": dict(transform)} if transform else {}),
     })
     try:
         os.unlink(report_path)

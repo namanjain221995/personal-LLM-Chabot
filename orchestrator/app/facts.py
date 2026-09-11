@@ -14,6 +14,7 @@ Everything degrades to "no memory update" on failure — never a failed chat.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -111,6 +112,33 @@ def _flatten(text: str) -> str:
 
 def _normalized(text: str) -> str:
     return " ".join((text or "").lower().split()).rstrip(".")
+
+
+async def remember_after_route(
+    gate: "asyncio.Future[bool]",
+    user_id: int,
+    user_text: str,
+    conversation_id: Optional[str],
+    *,
+    complete=None,
+) -> List[dict]:
+    """`remember_from_message`, held until the turn knows its route.
+
+    The chat turn starts extraction the moment it has the message, before
+    it knows whether the message is a request for a FILE. A request for a
+    file is not a fact about the person ("make me a PDF of the audit" is a
+    task), yet the extractor is a prompt and prompts are not guarantees —
+    so an artifact turn must never reach the model with it, let alone the
+    `user_facts` table (CONTRACT-2 §8). Cancelling the task is not enough:
+    the extractor's first awaits are thread hops and it often FINISHES
+    before the artifact intent is decided. The turn therefore resolves
+    `gate` once the route is known — True to extract as before (still
+    concurrent with the answer, which starts after the same decision),
+    False to do nothing — and every path out of the turn resolves it, so
+    the task never waits forever."""
+    if not await gate:
+        return []
+    return await remember_from_message(user_id, user_text, conversation_id, complete=complete)
 
 
 async def remember_from_message(

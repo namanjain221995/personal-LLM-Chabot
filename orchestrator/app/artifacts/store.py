@@ -8,15 +8,16 @@ ONE DIRECTORY PER VERSION, OWNER-SCOPED AND ID-KEYED (types.version_dir):
             manifest.json       {artifact_id, version, files, sha256s, preview, warnings, ...}
             spec.json           the ArtifactSpec the files were rendered from
             validation.json     what the validate stage found
-            <slug>-v1.pdf       one file per format
-            <slug>-v1.docx
+            <slug>-v1.pdf       one file per (role, format, sheet): the kind's
+            <slug>-v1.docx      native file, its companions in other formats,
+            <slug>-v1-data.csv  and a CSV per sheet of a workbook (CONTRACT-2 §2)
             preview.pdf         the canonical preview (pages for the viewer)
             previews/1-240.png  rasterised pages, cached on first request
         v2.tmp/                 WORKING — a job that has not published yet
 
 A PUBLISHED DIRECTORY HOLDS EXACTLY THAT (CONTRACT §6): manifest.json,
-spec.json, validation.json, one file per format, preview.pdf when the kind
-has one, and previews/. Everything else the working directory accumulates
+spec.json, validation.json, the rendered files the manifest lists,
+preview.pdf when the kind has one, and previews/. Everything else the working directory accumulates
 is SCRATCH and is removed before the rename — `material.json` (the
 conversation history, uploads text and Salesforce data the turn gathered;
 needed only to resume a job BEFORE it publishes, and a copy of chat content
@@ -58,7 +59,7 @@ import os
 import shutil
 import tempfile
 import time
-from typing import Any, List, Optional, Sequence
+from typing import Any, List, Optional, Sequence, Tuple
 
 from ..config import settings
 from . import spec as S
@@ -77,7 +78,10 @@ JOB_NAME = "render-job.json"
 #: not (module docstring). `publish()` removes these before the rename.
 SCRATCH_NAMES = (RENDER_REPORT_NAME, MATERIAL_NAME, PREVIEW_META_NAME, JOB_NAME, ".mpl")
 #: What a published directory may hold besides the rendered files and the
-#: previews directory.
+#: previews directory. The rendered files are named per version (slug +
+#: version + an optional sheet part, types.download_name), so they cannot
+#: be listed here: `publish()` protects every name the manifest's `files`
+#: carries — the per-sheet CSVs of a workbook included — the same way.
 PUBLISHED_NAMES = frozenset({T.MANIFEST_NAME, T.SPEC_NAME, T.VALIDATION_NAME, T.PREVIEW_PDF_NAME, T.PREVIEWS_DIR})
 
 
@@ -246,13 +250,30 @@ def build_manifest(
     }
 
 
-def _remove_scratch(work_dir: str, extra: Sequence[str]) -> None:
+def published_names(manifest: Optional[dict]) -> frozenset:
+    """Every name a published directory keeps: the fixed ones plus the
+    rendered files the manifest lists (basenames — a manifest is written
+    by build_manifest from the validate stage's list, never by a request).
+    A scratch list that names one of these is refused, not followed."""
+    names = set(PUBLISHED_NAMES)
+    for entry in (manifest or {}).get("files") or []:
+        base = os.path.basename(str((entry or {}).get("filename") or "")) if isinstance(entry, dict) else ""
+        if base:
+            names.add(base)
+    return frozenset(names)
+
+
+def _remove_scratch(work_dir: str, extra: Sequence[str], keep: Optional[frozenset] = None) -> None:
     """Drop the scratch (SCRATCH_NAMES plus `extra` basenames the renderer
     named, e.g. its chart PNGs) from a working directory. Basenames only —
-    a name with a path component cannot reach outside the directory."""
+    a name with a path component cannot reach outside the directory. `keep`
+    (published_names of the manifest) is never removed whatever the caller
+    lists: a per-sheet CSV named as scratch by mistake would otherwise
+    publish a version whose download 404s."""
+    keep = keep if keep is not None else PUBLISHED_NAMES
     for name in [*SCRATCH_NAMES, *extra]:
         base = os.path.basename(str(name or ""))
-        if not base or base in PUBLISHED_NAMES:
+        if not base or base in keep:
             continue
         path = os.path.join(work_dir, base)
         if os.path.isdir(path) and not os.path.islink(path):
@@ -283,7 +304,7 @@ def publish(work_dir: str, manifest: dict, *, scratch: Sequence[str] = ()) -> st
         return final
     if not os.path.isdir(work_dir):
         raise StorageError("the working directory is gone")
-    _remove_scratch(work_dir, scratch)
+    _remove_scratch(work_dir, scratch, keep=published_names(manifest))
     write_json(os.path.join(work_dir, T.MANIFEST_NAME), manifest)
     _fsync_tree(work_dir)
     if os.path.isdir(final):
@@ -451,15 +472,61 @@ def _inside(root: str, path: str) -> str:
     return real
 
 
+def _safe_published_name(fmt: str, filename: str) -> bool:
+    """A name the version row may carry for a rendered file: a bare
+    basename (no separator of either kind, no leading dot) whose extension
+    is `fmt`, `fmt` a type we serve (every MIME_TYPES key), and never one
+    of the directory's fixed names — manifest.json, spec.json,
+    validation.json and preview.pdf are the version's bookkeeping and its
+    preview, served (or not) by their own routes, and no rendered file is
+    ever named like them (types.download_name)."""
+    if fmt not in T.MIME_TYPES or not filename:
+        return False
+    if "/" in filename or "\\" in filename or filename.startswith(".") or filename in ("..", "."):
+        return False
+    if filename in PUBLISHED_NAMES:
+        return False
+    return filename.endswith("." + fmt)
+
+
 def resolve_version_file(user_id: int, artifact_id: str, version: int, fmt: str, filename: str) -> str:
     """The absolute path of one published file, verified to sit inside the
     version directory. `filename` is what the version row recorded (built
-    by types.download_name — never request-supplied); `fmt` must be one of
-    the formats we write and match the extension. Raises PathRefused."""
-    if fmt not in T.FORMATS or not filename.endswith("." + fmt) or "/" in filename or filename.startswith("."):
+    by types.download_name — never request-supplied); `fmt` must be a type
+    we serve (a MIME_TYPES key) and match the extension. Raises PathRefused."""
+    if not _safe_published_name(fmt, filename):
         raise PathRefused("not a file this version has")
     root = version_dir(user_id, artifact_id, version)
     return _inside(root, os.path.join(root, filename))
+
+
+def resolve_file_by_id(user_id: int, artifact_id: str, version: int, file_id: str,
+                       files: Optional[Sequence[dict]] = None) -> Tuple[str, dict]:
+    """`(path, entry)` for the file `file_id` names in this version — the
+    entry is the version row's dict for it (file_id, role, format,
+    filename, title, size, sha256, …) and the path is verified to sit
+    inside the version directory.
+
+    `files` is the version row's list as the pipeline stores it (with a
+    legacy row's ids synthesised by pipeline.ref_for, so a version from
+    before ids existed resolves too); when the caller has none, the
+    manifest on disk is read, which carries the same list. A value that
+    is not a file id, an id no entry carries, an entry whose name has a
+    separator or whose extension is not its format, and a path outside
+    the directory are all PathRefused — the API answers 404 to each."""
+    if not T.is_file_id(file_id):
+        raise PathRefused("not a file id")
+    if files is None:
+        manifest = read_manifest(user_id, artifact_id, version) or {}
+        files = list(manifest.get("files") or [])
+    for entry in files:
+        if not isinstance(entry, dict) or str(entry.get("file_id") or "") != file_id:
+            continue
+        fmt = str(entry.get("format") or "")
+        filename = str(entry.get("filename") or "")
+        path = resolve_version_file(user_id, artifact_id, version, fmt, filename)
+        return path, dict(entry)
+    raise PathRefused("not a file this version has")
 
 
 def resolve_preview_pdf(user_id: int, artifact_id: str, version: int) -> str:
@@ -496,10 +563,10 @@ def write_bytes(path: str, data: bytes) -> int:
 
 __all__ = [
     "StorageError", "PathRefused", "RENDER_REPORT_NAME", "MATERIAL_NAME", "PREVIEW_META_NAME", "JOB_NAME",
-    "SCRATCH_NAMES", "PUBLISHED_NAMES",
+    "SCRATCH_NAMES", "PUBLISHED_NAMES", "published_names",
     "artifact_dir", "version_dir", "version_workdir", "is_published", "ensure_workdir",
     "read_json", "write_json", "write_spec", "read_spec", "sha256_file",
     "build_manifest", "publish", "read_manifest", "remove_workdir",
     "free_space_ok", "free_space_mb", "volume_writable", "quota_ok", "dir_bytes",
-    "sweep_abandoned", "resolve_version_file", "resolve_preview_pdf", "preview_png_path", "write_bytes",
+    "sweep_abandoned", "resolve_version_file", "resolve_file_by_id", "resolve_preview_pdf", "preview_png_path", "write_bytes",
 ]
