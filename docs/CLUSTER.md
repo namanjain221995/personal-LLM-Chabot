@@ -423,7 +423,7 @@ the overlay ships:
 * **Worker healthcheck**: `vllm serve` + `VLLM::Worker` processes alive
   **and** head `/health` 200. A restarted head is a new process group the old
   worker can never rejoin, so the worker kills itself on head 5xx, or, once
-  it has been up 15 min, after 10 unreachable checks (5 min).
+  it has been up 15 min, after 4 unreachable checks (2 min; 10 until 2026-09-11).
 * Docker semantics to know: a process that dies is restarted by the policy;
   `docker stop`/`docker kill` are *manual* stops and are not - use
   `scripts/cluster-worker.sh start` / `docker start` after those.
