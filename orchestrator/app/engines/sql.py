@@ -19,7 +19,7 @@ from typing import Awaitable, Callable, List, Optional, Sequence, Tuple
 from . import NO_DATA_MESSAGE, recent_turns
 from .. import llm
 from ..config import settings
-from ..core import chart_decision, org_brief, sf_dictionary
+from ..core import brain, chart_decision, org_brief, sf_dictionary, tracing
 from ..core.chart_pipeline import ChartResult, build_chart
 from ..core.exports import cap_rows, export_csv, export_xlsx, slugify, preview_row_limit
 from ..core.schema_cache import format_schema, relevant_schema, schema_cache
@@ -702,6 +702,20 @@ async def generate_and_run_sql(
     joins = sf_dictionary.join_map(list(sliced))
     if joins:
         schema_text = f"{schema_text}\n\n{joins}"
+    await tracing.event(
+        "METADATA_RETRIEVED",
+        component="orchestrator.app.core.schema_cache.relevant_schema",
+        details={
+            "source": "local_salesforce_warehouse",
+            "selected_tables": list(sliced),
+            "required_metric_tables": org_brief.tables_for(ground),
+            "matched_brain_packs": [
+                pack.get("name", "") for pack in brain.matched_packs(ground)
+            ],
+            "schema_evidence": tracing.text_fingerprint(schema_text),
+            "join_map_included": bool(joins),
+        },
+    )
     # The default cap is the SUMMARY cap, not the 500-row preview cap: the
     # deterministic figures are computed over what is fetched, and fetching
     # 501 rows of a 33,000-row result made "authoritative" totals cover 1.5%
@@ -727,6 +741,11 @@ async def generate_and_run_sql(
         )
     if not raw.strip():
         raise EmptySql("the model did not produce a SQL statement")
+    await tracing.event(
+        "QUERY_PLAN_CREATED",
+        component="orchestrator.app.engines.sql._ask_sql",
+        details={"attempt": 1, "dialect": "duckdb", "sql": raw},
+    )
     if not references_a_known_table(raw, schema):
         # No FROM against anything we hold: the model is inventing a result
         # rather than reading data. Refuse instead of answering.
@@ -734,20 +753,74 @@ async def generate_and_run_sql(
             "the question refers to data that is not in the local warehouse"
         )
     try:
+        validation_started = time.perf_counter()
         sql = guard_sql(raw)
+        await tracing.event(
+            "QUERY_PLAN_VALIDATED",
+            component="orchestrator.app.core.sql_guard.guard_sql",
+            details={"attempt": 1, "dialect": "duckdb", "sql": sql},
+            duration_ms=round((time.perf_counter() - validation_started) * 1000),
+        )
+        execution_started = time.perf_counter()
         columns, rows = _execute(sql, cap)
+        await tracing.event(
+            "QUERY_EXECUTED",
+            component="orchestrator.app.engines.sql._execute",
+            details={
+                "source": "local_salesforce_warehouse",
+                "attempt": 1,
+                "sql": sql,
+                "returned_rows": len(rows),
+                "columns": columns,
+                "fetch_cap": cap,
+            },
+            duration_ms=round((time.perf_counter() - execution_started) * 1000),
+        )
         return sql, columns, rows
     except WarehouseBusy:
         # A locked file is not a SQL mistake — retrying the model cannot help.
         raise
     except Exception as exc:  # one retry on guard/execution error (§8)
+        await tracing.event(
+            "QUERY_ATTEMPT_FAILED",
+            status="failed",
+            component="orchestrator.app.engines.sql.generate_and_run_sql",
+            details={"attempt": 1, "sql": raw},
+            error=exc,
+        )
         raw2 = await _ask_sql(
             question, schema_text, history, previous_sql=raw,
             error=_enriched_error(str(exc), raw, schema),
             grounding_question=ground,
         )
+        await tracing.event(
+            "QUERY_PLAN_CREATED",
+            component="orchestrator.app.engines.sql._ask_sql",
+            details={"attempt": 2, "dialect": "duckdb", "sql": raw2},
+        )
+        validation_started = time.perf_counter()
         sql2 = guard_sql(raw2)
+        await tracing.event(
+            "QUERY_PLAN_VALIDATED",
+            component="orchestrator.app.core.sql_guard.guard_sql",
+            details={"attempt": 2, "dialect": "duckdb", "sql": sql2},
+            duration_ms=round((time.perf_counter() - validation_started) * 1000),
+        )
+        execution_started = time.perf_counter()
         columns, rows = _execute(sql2, cap)
+        await tracing.event(
+            "QUERY_EXECUTED",
+            component="orchestrator.app.engines.sql._execute",
+            details={
+                "source": "local_salesforce_warehouse",
+                "attempt": 2,
+                "sql": sql2,
+                "returned_rows": len(rows),
+                "columns": columns,
+                "fetch_cap": cap,
+            },
+            duration_ms=round((time.perf_counter() - execution_started) * 1000),
+        )
         return sql2, columns, rows
 
 
@@ -1218,8 +1291,17 @@ async def run_sql_engine(
             return "".join(parts)
 
         try:
+            live_started = time.perf_counter()
             soql, live_rows = await fetch_live(message, history)
         except Exception as exc:
+            await tracing.event(
+                "QUERY_EXECUTED",
+                status="failed",
+                component="orchestrator.app.engines.live_sf.fetch_live",
+                details={"source": "live_salesforce_fallback"},
+                duration_ms=round((time.perf_counter() - live_started) * 1000),
+                error=exc,
+            )
             if force_live:
                 # With the Live toggle on, the warehouse was skipped BY
                 # CHOICE — "not in the local warehouse" would be a lie here.
@@ -1239,6 +1321,17 @@ async def run_sql_engine(
             await emit("meta", {"route": "sql"})
             return text
 
+        await tracing.event(
+            "QUERY_EXECUTED",
+            component="orchestrator.app.engines.live_sf.fetch_live",
+            details={
+                "source": "live_salesforce_fallback",
+                "soql": soql,
+                "returned_rows": len(live_rows),
+            },
+            duration_ms=round((time.perf_counter() - live_started) * 1000),
+        )
+
         parts: List[str] = []
         # Same mechanism as the warehouse branch: counts and ratios are
         # computed over every returned row, and the model quotes them.
@@ -1250,6 +1343,18 @@ async def run_sql_engine(
         live_computed = deterministic_summary(
             live_columns,
             [[r.get(c) for c in live_columns] for r in live_rows],
+        )
+        await tracing.event(
+            "RESULT_VERIFIED",
+            component="orchestrator.app.engines.sql.deterministic_summary",
+            details={
+                "source": "live_salesforce_fallback",
+                "returned_rows": len(live_rows),
+                "columns": live_columns,
+                "computed": live_computed,
+                "verification_scope": "deterministic_result_summary_only",
+                "business_definition_verified": False,
+            },
         )
         # The chart is decided BEFORE the narration streams, for the same
         # reason the warehouse branch does it: the narration can only be told
@@ -1399,6 +1504,19 @@ async def run_sql_engine(
             + " — state every figure as covering those rows, never as the "
             "whole population"
         )
+
+    await tracing.event(
+        "RESULT_VERIFIED",
+        component="orchestrator.app.engines.sql.deterministic_summary",
+        details={
+            "source": "local_salesforce_warehouse",
+            "returned_rows": len(rows),
+            "columns": columns,
+            "computed": computed,
+            "verification_scope": "deterministic_result_summary_only",
+            "business_definition_verified": False,
+        },
+    )
 
     parts: List[str] = []
     async for token in llm.stream_chat_completion(
