@@ -607,3 +607,109 @@ def test_the_understanding_round_trips_its_limitations():
     back = Understanding.from_json(u.to_json())
     assert back.limitations == u.limitations
     assert Understanding.from_json({"summary": "s"}).limitations == [], "old files still load"
+
+
+# --------------------------------------------------- the fleet's memory ---
+
+
+def test_a_persistently_broken_engine_is_stood_down_for_longer_each_time(monkeypatch):
+    """2026-09-10: one node's speech engine answered /health for twelve hours
+    while every transcription on it died with a CUDA error. A fixed 20 s
+    stand-down meant a clip was fed to it every 20 s, failed after the round
+    trip, and was retried elsewhere — half the fleet dead, the work serialised
+    onto one node, and nothing saying so.
+
+    The clock is driven here rather than waited on: what is under test is the
+    length of the next stand-down, not the passage of time.
+    """
+    import asyncio
+
+    from app import asr
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(asr.time, "monotonic", lambda: clock["t"])
+
+    class Dead:
+        name, model, base_url = "dead", "m", "http://dead:30007/v1"
+
+        async def transcribe_segments(self, audio, **kwargs):
+            raise asr.ASRUnavailable("CUDA error: unknown error")
+
+        async def health(self):
+            return True  # exactly what the broken engine did, for twelve hours
+
+    class Live:
+        name, model, base_url = "live", "m", "http://live:30007/v1"
+
+        async def transcribe_segments(self, audio, **kwargs):
+            return asr.TranscriptSegments(
+                text="ok", language="English", language_code="en",
+                provider="live", model="m", engine_ms=1,
+                segments=({"start": 0.0, "end": 1.0, "text": "ok"},),
+            )
+
+        async def health(self):
+            return True
+
+    router = asr.RoutedProvider([Dead(), Live()])
+    waits = []
+
+    async def scenario():
+        for _ in range(4):
+            out = await router.transcribe_segments(b"x", filename="a.wav", content_type="audio/wav")
+            assert out.text == "ok", "the live engine keeps answering throughout"
+            dead = router.stats()[0]
+            waits.append(dead["standing_down_for_s"])
+            # Let the stand-down lapse, so the next call tries it again — which
+            # is what a long transcription does over and over.
+            clock["t"] += dead["standing_down_for_s"] + 1
+
+    asyncio.run(scenario())
+    assert waits == sorted(waits) and waits[-1] > waits[0], f"the wait must grow: {waits}"
+    assert waits[0] == asr.RoutedProvider._COOLDOWN_S, waits
+    assert waits[-1] <= asr.RoutedProvider._COOLDOWN_MAX_S, waits
+    dead, live = router.stats()
+    assert dead["consecutive_failures"] == 4, "the count is what makes this visible"
+    assert live["consecutive_failures"] == 0 and live["available"] is True
+    # /health alone would have called the dead engine available the whole time.
+    assert asyncio.run(Dead().health()) is True
+
+
+def test_one_success_forgives_an_engine_completely():
+    """A node that reboots must rejoin by itself, with no penalty carried."""
+    import asyncio
+
+    from app import asr
+
+    class Flaky:
+        name, model, base_url = "flaky", "m", "http://flaky:30007/v1"
+        fail = True
+
+        async def transcribe_segments(self, audio, **kwargs):
+            if Flaky.fail:
+                raise asr.ASRUnavailable("down")
+            return asr.TranscriptSegments(
+                text="back", language="English", language_code="en",
+                provider="flaky", model="m", engine_ms=1, segments=(),
+            )
+
+        async def health(self):
+            return True
+
+    router = asr.RoutedProvider([Flaky()])
+
+    async def scenario():
+        for _ in range(3):
+            try:
+                await router.transcribe_segments(b"x", filename="a.wav", content_type="audio/wav")
+            except asr.ASRUnavailable:
+                pass
+        assert router.stats()[0]["consecutive_failures"] == 3
+        Flaky.fail = False
+        out = await router.transcribe_segments(b"x", filename="a.wav", content_type="audio/wav")
+        assert out.text == "back"
+        return router.stats()[0]
+
+    after = asyncio.run(scenario())
+    assert after["consecutive_failures"] == 0
+    assert after["standing_down_for_s"] == 0 and after["available"] is True

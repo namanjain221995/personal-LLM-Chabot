@@ -217,22 +217,28 @@ def test_the_series_reaches_the_bucket_the_window_ends_in(console):
     root, _admin, _member = console
     from datetime import datetime, timezone
 
-    _event(_uid("mo"), hours_ago=0.02, output_tokens=7)  # about a minute ago
+    # The event has to land in the CURRENT hour, and "about a minute ago" only
+    # does that after the first minute of one. Run this suite at 03:00:30 — CI
+    # did, on 2026-09-11 — and a 72-second-old event sits in the 02:00 bucket,
+    # the 03:00 bucket is legitimately empty, and the off-by-one this test
+    # guards looks like a regression. Clamp the offset to the top of this hour
+    # and read the clock ONCE, so the assertion and the data agree.
+    now = datetime.now(timezone.utc)
+    now_hour = now.replace(minute=0, second=0, microsecond=0)
+    seconds_into_hour = now.minute * 60 + now.second
+    _event(_uid("mo"), hours_ago=min(72, seconds_into_hour) / 3600.0, output_tokens=7)
 
     hourly = root.get(
         "/admin/api/analytics/overview", params={"range": "24h"}
     ).json()
     last = hourly["series"]["usage"][-1]
-    now_hour = datetime.now(timezone.utc).replace(
-        minute=0, second=0, microsecond=0
-    )
     assert datetime.fromisoformat(last["bucket"]) == now_hour
     assert last["requests"] >= 1, "the event from a minute ago fell off the end"
 
     daily = root.get(
         "/admin/api/analytics/overview", params={"range": "30d"}
     ).json()
-    today = datetime.now(timezone.utc).date()
+    today = now.date()  # the same reading, for the same reason
     assert datetime.fromisoformat(daily["series"]["usage"][-1]["bucket"]).date() == today
     assert daily["series"]["usage"][-1]["requests"] >= 1
 

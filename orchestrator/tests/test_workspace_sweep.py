@@ -22,6 +22,8 @@ from __future__ import annotations
 import os
 import time
 
+import json
+
 import pytest
 
 from app import db
@@ -392,3 +394,22 @@ def test_work_is_cached_so_a_polling_probe_is_cheap(owner, fresh_work_cache, mon
 
     assert first is second
     assert len(calls) == 1
+
+
+def test_the_health_route_actually_returns_the_work_section(login_client):
+    """`check_dependencies` computed `work` and the /health ROUTE dropped it,
+    so nothing outside the process could see it — the same way `web_index`
+    was computed and dropped before 2026-09-06. Found by reading the live
+    payload after the deploy, not by reading the code."""
+    body = login_client("health-work").get("/health").json()
+    assert "work" in body, f"/health returned {sorted(body)} — no work section"
+    work = body["work"]
+    assert isinstance(work, dict)
+    # What an operator needs to tell busy from stalled from failed.
+    for key in ("live_generations", "video", "uploads", "chat_requests_interrupted"):
+        assert key in work, f"work is missing {key}: {sorted(work)}"
+    assert set(work["video"]) >= {"queued", "running"}
+    assert set(work["uploads"]) >= {"uploading", "finalizing"}
+    # No identifiers, ever: this endpoint is unauthenticated inside the network.
+    blob = json.dumps(work)
+    assert "@" not in blob and "conv-" not in blob

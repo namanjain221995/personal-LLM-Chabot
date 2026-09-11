@@ -859,6 +859,14 @@ async def health() -> dict:
         # process. `status` is untouched: a stale index is a degraded answer,
         # not an outage, and the container healthcheck gates on `status`.
         "web_index": report.get("web_index", {}),
+        # Additive (2026-09-11): what the orchestrator has IN FLIGHT — live
+        # generations, the video queue, open upload sessions, and requests a
+        # restart left interrupted. `check_dependencies` computes it and this
+        # route dropped it on the floor, exactly as it did with `web_index`
+        # above, so an operator could not tell "busy" from "stalled" from
+        # outside the process. `status` is untouched: being busy is not an
+        # outage, and the container healthcheck gates on `status`.
+        "work": report.get("work", {}),
     }
 
 

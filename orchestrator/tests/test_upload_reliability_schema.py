@@ -170,3 +170,31 @@ def test_a_stale_tab_cannot_overwrite_a_newer_thread(login_client):
     assert r.status_code == 200
     r = client.put(f"/history/conversations/{conv}/messages", json={"messages": stale["messages"][:1]})
     assert r.status_code == 409 and "shrink" in r.json()["detail"]
+
+
+# --------------------------------------------------- idempotent create ---
+
+
+def test_creating_the_same_conversation_twice_is_not_an_error_for_its_owner(login_client):
+    """The client calls create to ENSURE a conversation exists before pushing
+    its thread, then swallows the 409 — so the healthy path was answering
+    with an error the browser logged to the console next to real failures
+    (seen on production 2026-09-11). Someone else's id is still a conflict."""
+    alice = login_client("conv-owner")
+    first = alice.post("/history/conversations", json={"id": "conv-idem", "title": "First"})
+    assert first.status_code in (200, 201), first.text
+
+    # Renamed after creation: an ensure-exists call must not undo that.
+    # (PUT renames; POST .../title asks the server to GENERATE one.)
+    assert alice.put("/history/conversations/conv-idem", json={"title": "Renamed"}).status_code == 200
+
+    again = alice.post("/history/conversations", json={"id": "conv-idem", "title": "Second"})
+    assert again.status_code == 200, again.text
+    assert again.json()["id"] == "conv-idem"
+    assert again.json()["title"] == "Renamed", "an ensure-exists call must not retitle"
+
+    # Another account asking for the same id is a real conflict.
+    bob = login_client("conv-other")
+    clash = bob.post("/history/conversations", json={"id": "conv-idem", "title": "Mine"})
+    assert clash.status_code == 409, clash.text
+    assert alice.get("/history/conversations/conv-idem").json()["title"] == "Renamed"
