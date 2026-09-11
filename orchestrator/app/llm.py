@@ -33,7 +33,7 @@ from . import context, metrics
 from .config import settings
 from .context import clip_message_contents
 from .model_capabilities import ModelCapabilities, ReasoningField
-from .resilience import ModelUnavailable, resilient  # noqa: F401 — re-exported for callers
+from .resilience import ModelUnavailable, resilient, sidecar_recovery_s  # noqa: F401 — re-exported for callers
 
 # ---------------------------------------------------------------------------
 # OUTAGE TOLERANCE. Every model call below opens through
@@ -1055,9 +1055,12 @@ async def router_chat_completion(
     extra_body = reasoning_extra_body(settings.router_capabilities, False)
     if extra_body is not None:
         request["extra_body"] = extra_body
+    # A sidecar: on an interactive turn it gets one attempt and the caller's
+    # fallback (every caller has one); a job with a recovery window waits.
     resp = await resilient(
         lambda: client.chat.completions.create(**request),
         what="router_chat_completion", base_url=settings.router_base_url,
+        recovery_s=sidecar_recovery_s(),
     )
     return resp.choices[0].message.content or ""
 
@@ -1117,10 +1120,12 @@ async def embed_texts(
     cap = settings.embed_input_char_cap
     started = time.perf_counter()
     # A query embedding is on the chat path with its own few-second budget
-    # (embed_query fails soft to EmbedUnavailable), so it gets ONE attempt;
-    # an index/backfill batch is background work and may wait out a restart
-    # of the embedding sidecar.
-    recovery = 0.0 if kind == "query" else None
+    # (embed_query fails soft to EmbedUnavailable), so it gets ONE attempt.
+    # Everything else is a sidecar call: one attempt on an interactive turn
+    # too (recall and dense retrieval fall back to lexical-only in under a
+    # second, which is what they did before the wrapper existed), and the
+    # full window only where nobody is watching — an index or backfill batch.
+    recovery = 0.0 if kind == "query" else sidecar_recovery_s()
     try:
         resp = await resilient(
             lambda: client.embeddings.create(
