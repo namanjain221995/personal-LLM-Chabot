@@ -146,6 +146,33 @@ def effective_recovery_s() -> float:
     return max(0.0, float(settings.llm_interactive_recovery_s))
 
 
+def sidecar_recovery_s() -> float:
+    """The window a SIDECAR call — the router, an embedding — may wait.
+
+    The interactive default exists for the main model: the person is waiting
+    for the answer itself and nothing can stand in for it. A sidecar on the
+    chat path is different — every caller has a fallback (the route
+    classifier falls back to a plain plan, recall and dense retrieval fall
+    back to lexical-only, the Salesforce router to the main model) and those
+    fallbacks cost well under a second. Waiting the interactive window on
+    each of them turned a down embedding engine into a two-minute stall per
+    turn — and a down router plus a down embedder into four — on turns the
+    main model could have answered at once, with the person told "the model
+    is restarting" about an engine that was not the model (review finding,
+    2026-09-11; the embed engine has been down while the main model was up
+    on 2026-09-09 and under the launcher RestartCount bug).
+
+    So: on an interactive turn — recognised by the wait notifier the chat
+    worker binds to its task — a sidecar makes ONE attempt and fails to its
+    fallback. Anywhere else (an indexer, a title job, a video stage inside its
+    ``recovery_window``) it waits like any other call, because there nobody
+    is watching and the fallback is the worse outcome.
+    """
+    if _NOTIFY.get() is not None:
+        return 0.0
+    return effective_recovery_s()
+
+
 # ---------------------------------------------------------------------------
 # Classification. Verified against openai 2.36.0 (the container) and 3.7.0
 # (the venv): the hierarchy is APIError → {APIConnectionError → APITimeoutError,
@@ -282,7 +309,9 @@ async def wait_for_engine(
         holder = _NOTIFY.get()
         if holder is not None and not holder.announced:
             holder.announced = True
-            minutes = max(1, int(round(deadline_s / 60.0)))
+            # An operator may set the window to `inf` (config reads a bare
+            # float); a wait must not then die converting it to an integer.
+            minutes = max(1, int(round(min(deadline_s, 1e9) / 60.0)))
             with contextlib.suppress(Exception):
                 await holder.fn(
                     "The model is restarting — waiting for it to come back "

@@ -457,6 +457,141 @@ def test_query_embeddings_get_one_attempt_batches_wait(monkeypatch, clock):
     assert vectors == [[0.1]] and batch.calls == 2 and polls["n"] == 1
 
 
+def _embed_engine(failures: int):
+    class Embed:
+        def __init__(self):
+            self.calls = 0
+            self.embeddings = SimpleNamespace(create=self._create)
+
+        async def _create(self, **kwargs):
+            self.calls += 1
+            if self.calls <= failures:
+                raise _conn_error()
+            return SimpleNamespace(data=[SimpleNamespace(index=0, embedding=[0.1])])
+
+    return Embed()
+
+
+def test_sidecars_fail_fast_on_an_interactive_turn(monkeypatch, clock):
+    """The review finding of 2026-09-11: the interactive window is per model
+    CALL, and a chat turn makes several sidecar calls before the main model
+    is asked — recall's embedding, the route classifier. With the embedding
+    engine down and the main model healthy, a Smart turn waited the whole
+    window on the embedder (and then again on the router) before falling
+    back to what it would have done in under a second — and told the person
+    "the model is restarting" about an engine that was not the model.
+
+    On an interactive turn — the chat worker binds a wait notifier to its
+    task — a sidecar gets ONE attempt and its caller's fallback."""
+    polls = {"n": 0}
+
+    async def probe(base_url, timeout=None):
+        polls["n"] += 1
+        return True
+
+    monkeypatch.setattr(resilience, "engine_answers", probe)
+    monkeypatch.setattr(settings, "llm_interactive_recovery_s", 120.0)
+    monkeypatch.setattr(llm.context, "fit_request", _sized)
+    said: list[str] = []
+
+    async def notify(text):
+        said.append(text)
+
+    async def interactive_turn():
+        resilience.set_wait_notifier(notify)
+        # recall.retrieve_block's call shape: the default kind, on the chat path.
+        embed = _embed_engine(failures=1)
+        monkeypatch.setattr(llm, "_client", lambda *a, **k: embed)
+        with pytest.raises(resilience.ModelUnavailable):
+            await llm.embed_texts(["what did we decide?"])
+        assert embed.calls == 1
+        # orchestrate.decide's call shape.
+        router = _FlakyClient(_conn_error, failures=1, response=None)
+        monkeypatch.setattr(llm, "_client", lambda *a, **k: router)
+        with pytest.raises(resilience.ModelUnavailable):
+            await llm.router_chat_completion([{"role": "user", "content": "route me"}])
+        assert len(router.calls) == 1
+
+    asyncio.run(interactive_turn())
+    assert polls["n"] == 0, "no /health polling on a sidecar during a person's turn"
+    assert clock.slept == [], "and no waiting"
+    assert said == [], "and nobody is told the model is restarting"
+
+
+def test_sidecars_still_wait_where_nobody_is_watching(monkeypatch, clock):
+    """The other half of the same rule: an indexer, a title job, a video
+    stage inside its recovery window — no notifier is bound, so a sidecar
+    waits out the restart like any other call. This is the author's
+    original intent for background work and it is kept."""
+    polls = {"n": 0}
+
+    async def probe(base_url, timeout=None):
+        polls["n"] += 1
+        return True
+
+    monkeypatch.setattr(resilience, "engine_answers", probe)
+    monkeypatch.setattr(settings, "llm_interactive_recovery_s", 120.0)
+    monkeypatch.setattr(llm.context, "fit_request", _sized)
+
+    async def background_job():
+        assert resilience._NOTIFY.get() is None
+        embed = _embed_engine(failures=1)
+        monkeypatch.setattr(llm, "_client", lambda *a, **k: embed)
+        assert await llm.embed_texts(["chunk"]) == [[0.1]]
+        assert embed.calls == 2
+        router = _FlakyClient(_conn_error, failures=1, response=None)
+        monkeypatch.setattr(llm, "_client", lambda *a, **k: router)
+        assert await llm.router_chat_completion([{"role": "user", "content": "title this"}]) == "hello"
+        assert len(router.calls) == 2
+
+    asyncio.run(background_job())
+    assert polls["n"] == 2
+
+
+def test_an_infinite_window_does_not_crash_the_wait(monkeypatch, clock):
+    """`LLM_INTERACTIVE_RECOVERY_S=inf` is accepted by config; the notifier's
+    "(up to N min)" used to convert it to an integer and raise OverflowError
+    out of the wait — turning a patient chat into an application error."""
+    async def up(base_url, timeout=None):
+        return True
+
+    monkeypatch.setattr(resilience, "engine_answers", up)
+    said = []
+
+    async def notify(text):
+        said.append(text)
+
+    async def run():
+        resilience.set_wait_notifier(notify)
+        calls = {"n": 0}
+
+        async def op():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise _conn_error()
+            return "ok"
+
+        return await resilience.resilient(op, what="t", base_url="http://x", recovery_s=float("inf"))
+
+    assert asyncio.run(run()) == "ok"
+
+
+def test_the_main_model_still_waits_on_an_interactive_turn(monkeypatch, instant_engine):
+    """The rule is about sidecars. The main model — the answer itself, with
+    nothing to stand in for it — keeps the interactive window on a person's
+    turn; this is what the branch was for."""
+    monkeypatch.setattr(llm.context, "fit_request", _sized)
+    client = _FlakyClient(_conn_error, failures=1, response=None)
+    monkeypatch.setattr(llm, "_client", lambda *a, **k: client)
+
+    async def turn():
+        resilience.set_wait_notifier(lambda text: asyncio.sleep(0))
+        return await llm.chat_completion([{"role": "user", "content": "hi"}], thinking=False)
+
+    assert asyncio.run(turn()) == "hello"
+    assert len(client.calls) == 2
+
+
 # ---------------------------------------------------------------------------
 # What the person is told
 # ---------------------------------------------------------------------------

@@ -117,6 +117,20 @@ def _display_name(row: dict) -> str:
     return str(row.get("display_name") or row.get("filename") or "video")
 
 
+def _waiting_sentence(row: dict) -> str:
+    """What to say about an analysis the pipeline deferred rather than ran.
+
+    The row's `error` names the stage and the engine's address; neither is
+    for the person. What they need is that nothing was lost and nothing is
+    theirs to do.
+    """
+    return (
+        f"**{_display_name(row)}** is waiting for the model to come back. "
+        "The analysis keeps what it has finished and will be retried on its own — "
+        "ask me about this video again in a few minutes."
+    )
+
+
 def is_placeholder(message: str) -> bool:
     text = (message or "").strip().rstrip(".").lower()
     return not text or text == VIDEO_ONLY_PROMPT.rstrip(".").lower()
@@ -315,7 +329,14 @@ async def _wait_for_analysis(row: dict, emit: Emit) -> dict:
                 moved = (percent is not None and prev_pct is not None and abs(percent - prev_pct) >= 5) or percent is None or prev_pct is None
                 if prev_status == "running" and now - prev_t < 3.0 and not moved:
                     continue
-            step_status = "running" if status == "running" else ("failed" if status == "failed" else "done")
+            # A DEFERRED stage (the engine it needs was down for the whole
+            # recovery window; the job is back in the queue) is neither done
+            # nor failed for good — it is shown as still running, with the
+            # detail saying why, until the retry lands.
+            step_status = (
+                "running" if status in ("running", "deferred")
+                else ("failed" if status == "failed" else "done")
+            )
             bits = []
             if status == "running" and percent is not None:
                 bits.append(f"{percent:.0f}%")
@@ -325,6 +346,8 @@ async def _wait_for_analysis(row: dict, emit: Emit) -> dict:
                 bits.append(f"{elapsed:.0f}s")
             if status == "skipped":
                 bits.insert(0, "skipped")
+            elif status == "deferred":
+                bits.insert(0, "waiting for the model, will be retried")
             elif event.get("cached"):
                 bits.insert(0, "cached")
             await emit("step", {"id": _STEP_IDS[stage], "title": STAGE_TITLES[stage], "status": step_status, "detail": " · ".join(bits)})
@@ -566,6 +589,16 @@ async def run_video_engine(
 
     failed = [r for r in rows if r.get("status") == "failed"]
     done = [r for r in rows if r.get("status") == "done"]
+    # THE THIRD BUCKET. A row that is neither done nor failed came back from
+    # `_wait_for_analysis` because the pipeline DEFERRED it: a required stage
+    # could not reach its engine for the whole recovery window and the job
+    # went back to the queue with its finished stages kept. Until 2026-09-11
+    # such a row fell through both lists and the attach turn streamed an
+    # EMPTY answer — persisted as completed, with no hint that anything would
+    # be retried — where a failure would at least have said "I couldn't
+    # analyse". A wait is not a failure and not a success; it is told as what
+    # it is. (A question turn already lists these under 'pending'.)
+    waiting = [r for r in rows if r.get("status") not in ("done", "failed")]
     parts: List[str] = []
     report_files: List[dict] = []
     published: List[List[dict]] = []
@@ -574,12 +607,14 @@ async def run_video_engine(
         published.append(files)
         report_files.extend(files)
 
-    if failed and not done:
+    if not done:
         lines = [f"I couldn't analyse **{_display_name(r)}**: {r.get('error') or 'the analysis failed'}." for r in failed]
-        text = "\n\n".join(lines)
-        await emit("token", {"text": text})
-        await emit("meta", {"route": "video", "effort": picked, "video": _video_meta(rows, [], [])})
-        return text
+        lines += [_waiting_sentence(r) for r in waiting]
+        if lines:
+            text = "\n\n".join(lines)
+            await emit("token", {"text": text})
+            await emit("meta", {"route": "video", "effort": picked, "video": _video_meta(rows, [], [])})
+            return text
 
     if attach_turn and is_placeholder(message):
         # The understanding, straight from the analysis.
@@ -587,6 +622,8 @@ async def run_video_engine(
             parts.append(overview_markdown(r, files=files))
         for r in failed:
             parts.append(f"I couldn't analyse **{_display_name(r)}**: {r.get('error') or 'the analysis failed'}.")
+        for r in waiting:
+            parts.append(_waiting_sentence(r))
         text = "\n\n---\n\n".join(parts)
         # Stream it in pieces so the UI's caret moves; the content is fixed.
         for piece in _chunks(text, 400):

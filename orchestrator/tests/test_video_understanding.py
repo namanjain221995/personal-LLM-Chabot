@@ -704,6 +704,61 @@ def test_the_engine_waits_forwards_steps_and_renders_the_overview(monkeypatch):
     asyncio.run(scenario())
 
 
+def test_a_deferred_analysis_is_explained_not_answered_with_nothing(monkeypatch):
+    """Review finding of 2026-09-11 on the resilience branch: when a required
+    stage could not reach its engine for the whole recovery window, the
+    pipeline DEFERS the job (status back to 'queued', finished stages kept)
+    and the attach turn — which only knew 'done' and 'failed' — streamed an
+    empty answer that was then persisted as completed. A wait is told as a
+    wait."""
+    async def scenario():
+        from app.engines import video as engine
+        from app.video import pipeline
+
+        pipeline.reset_for_tests()
+        deferred = _row(status="queued", error=f"{pipeline.DEFERRED_MARK} (attempt 1): Understanding the video: model at http://vllm:8000 unavailable")
+        deferred["understanding"] = {}
+
+        async def fake_ensure(analysis_id):
+            pipeline._publish(7, {"stage": "_done", "status": "queued", "detail": f"{pipeline.DEFERRED_MARK}; will retry"})
+            return True
+
+        async def fake_wait(analysis_id):
+            return deferred
+
+        monkeypatch.setattr(pipeline, "ensure_running", fake_ensure)
+        monkeypatch.setattr(pipeline, "wait_for", fake_wait)
+        monkeypatch.setattr(pipeline, "is_running", lambda aid: False)
+        monkeypatch.setattr(settings, "reports_dir", "")
+        events = []
+
+        async def emit(kind, data):
+            events.append((kind, data))
+
+        answer = await engine.run_video_engine("Analyze the attached video.", [deferred], [], emit, conversation_id="c1", effort="fast", user_id=1, attach_turn=True)
+        assert answer.strip(), "a deferred analysis must not come back as an empty answer"
+        assert "meeting.mp4" in answer and "waiting for the model" in answer and "retried" in answer
+        assert "vllm:8000" not in answer, "the engine's address is not for the person"
+        tokens = "".join(d["text"] for k, d in events if k == "token")
+        assert tokens == answer
+        metas = [d for k, d in events if k == "meta"]
+        assert len(metas) == 1 and metas[0]["video"]["videos"][0]["status"] == "queued"
+
+        # The same row alongside a finished one: the finished one is rendered
+        # and the waiting one is named after it, not dropped.
+        done = _row(id=8, display_name="second.mp4")
+
+        async def wait_either(analysis_id):
+            return deferred if int(analysis_id) == 7 else done
+
+        monkeypatch.setattr(pipeline, "wait_for", wait_either)
+        events.clear()
+        answer = await engine.run_video_engine("Analyze the attached video.", [deferred, done], [], emit, conversation_id="c1", effort="fast", user_id=1, attach_turn=True)
+        assert "## Summary" in answer and "meeting.mp4** is waiting for the model" in answer
+
+    asyncio.run(scenario())
+
+
 def test_a_question_goes_to_the_model_with_evidence_and_citations_asked_for(monkeypatch):
     async def scenario():
         from app import llm

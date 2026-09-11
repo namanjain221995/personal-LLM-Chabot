@@ -558,18 +558,23 @@ async def _run_stages(analysis_id: int, row: dict) -> None:
     if failure is None:
         failure = await runner.chain(_TAIL)
     if runner.deferred:
-        attempt = int(row.get("attempt") or 0) + 1
-        if attempt < max(1, settings.video_max_attempts):
-            await _defer(analysis_id, runner.deferred, attempt=attempt, total_s=time.perf_counter() - started)
+        # Deferrals are counted on their own (counts["deferrals"]), not on
+        # the row's lifetime `attempt`: a pipeline-version re-run or a
+        # re-upload also bumps `attempt`, and must not eat the budget a model
+        # outage is allowed.
+        deferrals = int((ctx.counts or {}).get("deferrals") or 0) + 1
+        if deferrals < max(1, settings.video_max_attempts):
+            ctx.counts["deferrals"] = deferrals
+            await _defer(analysis_id, runner.deferred, attempt=deferrals, counts=dict(ctx.counts), total_s=time.perf_counter() - started)
             return
-        failure = f"{runner.deferred} (gave up after {attempt} attempts)"
+        failure = f"{runner.deferred} (gave up after {deferrals} deferrals)"
     if failure:
         await _finish(analysis_id, "failed", failure, total_s=time.perf_counter() - started)
         return
     await _finish(analysis_id, "done", "", total_s=time.perf_counter() - started)
 
 
-async def _defer(analysis_id: int, why: str, *, attempt: int, total_s: float = 0.0) -> None:
+async def _defer(analysis_id: int, why: str, *, attempt: int, counts: Dict[str, Any], total_s: float = 0.0) -> None:
     """Back to the queue with every finished stage kept.
 
     Idempotent by construction: stage outputs are files keyed by content
@@ -582,10 +587,23 @@ async def _defer(analysis_id: int, why: str, *, attempt: int, total_s: float = 0
         analysis_id,
         status="queued",
         error=f"{DEFERRED_MARK} (attempt {attempt}): {why}"[:1000],
+        counts=counts,
         finished_at=None,
     )
     metrics.inc("video_jobs_total", "video analyses finished", result="deferred")
     _publish(analysis_id, {"stage": _DONE, "status": "queued", "detail": f"{DEFERRED_MARK}; will retry", "elapsed_s": round(total_s, 1)})
+    # The maintenance tick is 30 minutes apart; VIDEO_RETRY_DELAY_S is the
+    # retry delay the operator actually set, so arm a drain for then. The
+    # drain itself still honours the delay and the lease, so an early tick
+    # or a second timer is harmless.
+    try:
+        loop = asyncio.get_running_loop()
+        loop.call_later(
+            max(1.0, float(settings.video_retry_delay_s)),
+            lambda: loop.create_task(drain_queue(), name=f"video-redrain-{analysis_id}"),
+        )
+    except RuntimeError:  # no running loop (tests calling this synchronously)
+        pass
 
 
 async def _finish(analysis_id: int, status: str, error: str, *, total_s: float = 0.0) -> None:
