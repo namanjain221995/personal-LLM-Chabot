@@ -828,6 +828,88 @@ def test_an_analysis_from_an_older_pipeline_is_rerun_not_served(monkeypatch, tmp
     db.delete_video_analysis(row["id"])
 
 
+def test_a_v2_analysis_is_repaired_without_asking_the_engines_again(monkeypatch, tmp_path):
+    """v3 changed how the transcript is CLEANED, not what whisper, OCR or the
+    captioner produce. A v2 row re-runs the transcript (in place, from its own
+    file), fusion, index and artifacts — and serves probe, audio, frames, OCR
+    and vision from disk. For a two-hour recording the difference is forty
+    minutes of two GPUs."""
+    from app.video import pipeline, store
+
+    monkeypatch.setattr(settings, "video_data_dir", str(tmp_path / "video"))
+    monkeypatch.setattr(settings, "asr_enabled", True)
+    content_hash = "e" * 64
+    os.makedirs(store.analysis_dir(content_hash), exist_ok=True)
+    src = tmp_path / "clip.mp4"
+    src.write_bytes(b"\x00" * 64)
+    store.adopt_source(content_hash, str(src), "clip.mp4")
+    row = db.upsert_video_analysis(content_hash, 64, "video/mp4", "clip.mp4")
+    for stage in pipeline.STAGES:
+        if pipeline._OUTPUTS.get(stage):
+            store.write_json(store.stage_path(content_hash, pipeline._OUTPUTS[stage]), {"old": True})
+    store.write_json(store.stage_path(content_hash, "probe.json"), {"has_audio": True, "duration_s": 20.0})
+    # The v2 transcript, loops and all: "I am a" as 85 cues, "no" 434 times.
+    looped = [{"start": 0.0, "end": 1.0, "text": "The plan is", "language": "en"}]
+    looped += [{"start": 1.0 + i * 0.2, "end": 1.4 + i * 0.2, "text": "I am a", "language": "en"} for i in range(85)]
+    looped += [{"start": 18.0, "end": 19.0, "text": "no " * 434, "language": "en"}]
+    store.write_json(
+        store.stage_path(content_hash, "transcript.json"),
+        {"language": "en", "segments": looped, "report": {"engine_ms": 12345, "windows_done": 3, "speech_fraction": 0.9}},
+    )
+    db.update_video_analysis(
+        row["id"], status="done", pipeline_version=2,
+        stages={s: {"status": "done", "ms": 1, "detail": "old"} for s in pipeline.STAGES},
+        counts={"segments": 87, "frames_kept": 12},
+    )
+
+    ran = []
+
+    async def stub(ctx, progress):
+        return pipeline._StageResult("done", "fresh")
+
+    async def engine_must_not_be_called(*a, **kw):
+        raise AssertionError("the speech engine was asked to transcribe a v2 recording again")
+
+    from app.video import transcribe
+    monkeypatch.setattr(transcribe, "transcribe_audio", engine_must_not_be_called)
+    real_transcript = pipeline._STAGE_FNS["transcript"]
+    fns = {s: (lambda ctx, progress, _s=s: (ran.append(_s), stub(ctx, progress))[1]) for s in pipeline.STAGES}
+    fns["transcript"] = lambda ctx, progress: (ran.append("transcript"), real_transcript(ctx, progress))[1]
+    monkeypatch.setattr(pipeline, "_STAGE_FNS", fns)
+
+    async def scenario():
+        assert await pipeline.ensure_running(row["id"]) is True
+        return await pipeline.wait_for(row["id"])
+
+    fresh = asyncio.run(scenario())
+    assert fresh["status"] == "done", fresh.get("error")
+    assert int(fresh["pipeline_version"]) == pipeline.PIPELINE_VERSION
+    assert sorted(ran) == ["artifacts", "fusion", "index", "transcript"], "speech and screen engines must stay cached"
+    for kept in ("probe", "audio", "frames", "ocr", "vision"):
+        assert fresh["stages"][kept]["detail"] == "old", f"{kept} must be served from disk"
+    assert "repeated cue(s) merged" in fresh["stages"]["transcript"]["detail"]
+
+    repaired = store.read_json(store.stage_path(content_hash, "transcript.json"))
+    texts = [s["text"] for s in repaired["segments"]]
+    assert texts == ["The plan is", "I am a", "no no"]
+    assert repaired["report"]["engine_ms"] == 12345, "the original engine report is kept"
+    assert repaired["report"]["repaired_from_version"] == 2
+    assert fresh["counts"]["segments"] == 3
+    assert fresh["counts"]["frames_kept"] == 12, "counts from the kept stages survive"
+    db.delete_video_analysis(row["id"])
+
+
+def test_stages_to_rerun_is_precise_only_where_a_bump_is_described():
+    from app.video import pipeline
+
+    assert pipeline.stages_to_rerun(2) == {"transcript", "fusion", "index", "artifacts"}
+    # v1 -> v2 is not described, so a v1 row re-runs everything (the test
+    # above this one pins that behaviour end to end).
+    assert pipeline.stages_to_rerun(1) is None
+    assert pipeline.stages_to_rerun(0) is None
+    assert pipeline.stages_to_rerun(pipeline.PIPELINE_VERSION) == set()
+
+
 def test_speech_and_screen_branches_run_side_by_side(monkeypatch, tmp_path):
     """Transcription and frame reading never read each other's output, so
     they run at the same time and the job is as long as the longer one.
