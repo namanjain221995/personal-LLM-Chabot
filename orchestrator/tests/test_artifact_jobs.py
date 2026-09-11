@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import time
 
@@ -1169,7 +1170,7 @@ def test_render_env_is_scrubbed(monkeypatch, tmp_path):
     assert set(env) <= {"PATH", "HOME", "LANG", "PYTHONPATH", "MPLCONFIGDIR", "FONTCONFIG_FILE"}
 
 
-def test_the_render_subprocess_protocol_reads_the_report_and_the_error(monkeypatch, tmp_path):
+def test_the_render_subprocess_protocol_reads_the_report_and_the_error(monkeypatch, tmp_path, caplog):
     """A stand-in worker module: proves the argv/cwd/report contract without
     the real render package (which ships separately)."""
     fake_pkg = tmp_path / "pkg" / "app" / "artifacts" / "render"
@@ -1183,6 +1184,7 @@ def test_the_render_subprocess_protocol_reads_the_report_and_the_error(monkeypat
         "assert os.getcwd() == os.path.realpath(out), (os.getcwd(), out)\n"
         "if job['spec']['document']['title'] == 'boom':\n"
         "    json.dump({'error': {'category': 'renderer_failure', 'message': 'no fonts'}}, open(os.path.join(out, 'render-report.json'), 'w'))\n"
+        "    print('Traceback (most recent call last):\\n  File x\\nAssertionError: URL fetcher must return', file=sys.stderr)\n"
         "    sys.exit(1)\n"
         "name = f\"{job['title_slug']}-v{job['version']}.pdf\"\n"
         "open(os.path.join(out, name), 'wb').write(b'%PDF')\n"
@@ -1196,9 +1198,13 @@ def test_the_render_subprocess_protocol_reads_the_report_and_the_error(monkeypat
     assert report["files"][0]["filename"] == "ok-v1.pdf" and (work / "ok-v1.pdf").read_bytes() == b"%PDF"
     assert json.load(open(work / store.JOB_NAME))["formats"] == ["pdf"]
 
-    with pytest.raises(pipeline.RenderFailed) as exc:
-        asyncio.run(pipeline._render_in_subprocess(str(work), _spec("boom"), ["pdf"], "boom", 1, "fast"))
+    with caplog.at_level(logging.WARNING, logger="app.artifacts.pipeline"):
+        with pytest.raises(pipeline.RenderFailed) as exc:
+            asyncio.run(pipeline._render_in_subprocess(str(work), _spec("boom"), ["pdf"], "boom", 1, "fast"))
     assert exc.value.category == "renderer_failure" and exc.value.message == "no fonts"
+    # The person gets the sentence; the operator's log gets the worker's
+    # stderr (the traceback), which exists nowhere else.
+    assert "URL fetcher must return" in caplog.text and "renderer_failure" in caplog.text
 
 
 def test_the_render_subprocess_is_killed_on_timeout(monkeypatch, tmp_path):

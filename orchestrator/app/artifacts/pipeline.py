@@ -1594,10 +1594,16 @@ async def _render_in_subprocess(work_dir: str, spec: ArtifactSpec, formats: Sequ
         raise
     report = store.read_json(report_path)
     error = report.get("error") if isinstance(report, dict) else None
+    tail = (stderr or b"")[-2000:].decode("utf-8", "replace")
     if isinstance(error, dict):
+        # The worker's report is the sentence the person sees; its stderr —
+        # the traceback, when there was one — is the operator's, and only
+        # exists here. (The 2026-09-11 e2e run lost a WeasyPrint API break
+        # behind "the layout engine reported an error" because this branch
+        # raised before looking at stderr.)
+        log.warning("artifact render worker reported %s: %s", error.get("category"), tail.strip() or "(no stderr)")
         raise RenderFailed(str(error.get("category") or "renderer_failure"), str(error.get("message") or safe_error("renderer_failure")))
     if proc.returncode != 0 or not isinstance(report, dict):
-        tail = (stderr or b"")[-2000:].decode("utf-8", "replace")
         if proc.returncode is not None and proc.returncode < 0:
             log.error("artifact render worker killed by signal %d (rlimit?): %s", -proc.returncode, tail)
             raise RenderFailed("renderer_failure", "the renderer ran out of memory or time")

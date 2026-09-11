@@ -18,7 +18,8 @@ runner kills it on the wall-clock timeout. What this module enforces is the
 PAGE CAP: a document over types.MAX_PAGES is a page-count bomb and is
 refused after the count, with a sentence, not shipped.
 
-MEASURED (2026-09-11, aarch64 host, WeasyPrint 69, in
+MEASURED (2026-09-11, aarch64 host, WeasyPrint 69 — 70 renders the same
+suites within the same bounds, in
 test_artifact_render_version.py): an empty page renders in ~0.06 s; a
 10-section executive report (two charts, three tables, cover, contents) to
 PDF + DOCX in ~0.8 s; a 12-slide deck to PPTX + its 13-page preview PDF in
@@ -32,7 +33,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any, Callable, Dict
+from typing import Any, Callable
 from urllib.parse import unquote, urlsplit
 
 from .. import types as T
@@ -46,17 +47,38 @@ class RefusedFetch(ValueError):
     """The renderer asked for a resource it may not have."""
 
 
-def make_url_fetcher(assets_dir: str | Path) -> Callable[..., Dict[str, Any]]:
+class AssetFetcher:
     """A WeasyPrint `url_fetcher` that serves ONLY `<assets_dir>/<bare name>.png`.
 
     WeasyPrint resolves every reference against `base_url` before calling the
     fetcher, so a bare `chart-1.png` arrives as `file:///<assets_dir>/chart-1.png`.
     Anything else — a different scheme, a different directory, a traversal
     that normalises elsewhere, a symlink out of the directory — is refused.
-    """
-    root = Path(assets_dir).resolve()
 
-    def fetch(url: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+    WHY AN OBJECT AND NOT A FUNCTION. WeasyPrint 70 (the version the image
+    resolves `weasyprint>=61` to since 2026-09-11) changed the fetcher
+    contract in two ways a plain function cannot meet: the result must be a
+    `weasyprint.urls.URLFetcherResponse` (a dict was deprecated in 69 and is
+    an AssertionError in 70), and on a fetcher error it reads
+    `url_fetcher._fail_on_errors` with no default — so a refusal, the very
+    thing this fetcher exists to do, raised AttributeError out of the render
+    instead of the logged URLFetchingError. The e2e smoke of 2026-09-11 found
+    it: every deck PDF failed in the container while the venv (69) passed.
+    """
+
+    #: Read by WeasyPrint when the fetcher raises. False: the refusal is a
+    #: logged URLFetchingError and a gap in the page, never a failed render.
+    _fail_on_errors = False
+
+    def __init__(self, assets_dir: str | Path) -> None:
+        self.root = Path(assets_dir).resolve()
+
+    def __call__(self, url: str, *args: Any, **kwargs: Any) -> Any:
+        return self.fetch(url)
+
+    def resolve(self, url: str) -> Path:
+        """The file `url` may be served from, or RefusedFetch."""
+        root = self.root
         parts = urlsplit(url)
         if parts.scheme != "file" or parts.netloc not in ("", "localhost"):
             raise RefusedFetch(f"refused {parts.scheme or 'relative'} reference")
@@ -74,11 +96,28 @@ def make_url_fetcher(assets_dir: str | Path) -> Callable[..., Dict[str, Any]]:
         real = path.resolve()
         if real.parent != root or not real.is_file():
             raise RefusedFetch("refused reference outside the assets directory")
+        return real
+
+    def fetch(self, url: str) -> Any:
+        real = self.resolve(url)
         with open(real, "rb") as fh:
             data = fh.read()
-        return {"string": data, "mime_type": _ALLOWED_SUFFIXES[suffix], "redirected_url": url}
+        return _response(url, data, _ALLOWED_SUFFIXES[real.suffix.lower()])
 
-    return fetch
+
+def _response(url: str, data: bytes, mime_type: str) -> Any:
+    """What the installed WeasyPrint wants back from a fetcher: its
+    URLFetcherResponse (69+), or the dict older releases understood."""
+    try:
+        from weasyprint.urls import URLFetcherResponse  # lazy: native libs
+    except ImportError:  # pragma: no cover - weasyprint < 69, or not installed (the unit tests)
+        return {"string": data, "mime_type": mime_type, "redirected_url": url}
+    return URLFetcherResponse(url, body=data, headers={"Content-Type": mime_type})
+
+
+def make_url_fetcher(assets_dir: str | Path) -> Callable[..., Any]:
+    """The fetcher `render_html_pdf` hands WeasyPrint; see AssetFetcher."""
+    return AssetFetcher(assets_dir)
 
 
 def render_html_pdf(html: str, out_path: str | Path, assets_dir: str | Path, *, max_pages: int = T.MAX_PAGES) -> int:

@@ -32,7 +32,7 @@ Worth alerting on: `artifact_queue_depth{state="queued"} > 5` for 10 minutes (a 
 
 ## Logs
 
-Prefix `artifact job <8 chars> [<diagnostic ref>]`. A person-facing error never carries a path, a host, a DSN or a traceback; the `diagnostic_ref` on the job row (visible in `GET /artifacts/jobs/{id}`) is the key into the log. The render worker's stderr is captured to the log at WARNING on a non-zero exit.
+Prefix `artifact job <8 chars> [<diagnostic ref>]`. A person-facing error never carries a path, a host, a DSN or a traceback; the `diagnostic_ref` on the job row (visible in `GET /artifacts/jobs/{id}`) is the key into the log. The render worker's stderr (its traceback, when there is one) is logged at WARNING as `artifact render worker reported <category>: …` whenever the worker reports an error, and at ERROR when it crashes or is killed — the line just before the job's `stage render failed` line.
 
 ## Restarts and deploys
 
@@ -42,7 +42,7 @@ A rolling deploy recreates the orchestrator: running jobs lose their process, th
 
 ## Rendering dependencies
 
-`python-pptx==1.0.2`, `python-docx==1.1.2` (pure Python; `lxml` was already present), `openpyxl`, `matplotlib`, `weasyprint` (already installed for pandoc's PDF path; the Artifact Studio drives it in-process with a deny-all URL fetcher), `pypdfium2` (page images; NOT thread-safe — every call takes `core.pdf.PDFIUM_LOCK`). Fonts are the image's Liberation and DejaVu families; Indic, CJK and Arabic text renders as missing glyphs and is recorded as a warning on the version, not a failure. `GET /health` reports which renderers import.
+`python-pptx==1.0.2`, `python-docx==1.1.2` (pure Python; `lxml` was already present), `openpyxl`, `matplotlib`, `weasyprint==70.0` (was already installed for pandoc's PDF path; the Artifact Studio drives it in-process with a deny-all URL fetcher — pinned because the fetcher contract changed between 69 and 70 and an unpinned rebuild broke every deck PDF in the container while the venv passed; move the pin with the renderer suites), `pypdfium2` (page images; NOT thread-safe — every call takes `core.pdf.PDFIUM_LOCK`). Fonts are the image's Liberation and DejaVu families; Indic, CJK and Arabic text renders as missing glyphs and is recorded as a warning on the version, not a failure. `GET /health` reports which renderers import.
 
 ## Runbook: a job that will not finish
 

@@ -42,10 +42,32 @@ def assets(tmp_path):
 # --------------------------------------------------------------- fetcher --
 
 
+def _body(resource) -> bytes:
+    return resource["string"] if isinstance(resource, dict) else resource.read()
+
+
+def _mime(resource) -> str:
+    return resource["mime_type"] if isinstance(resource, dict) else resource.content_type
+
+
 def test_fetcher_serves_only_a_bare_png_inside_the_assets_dir(assets):
     fetch = P.make_url_fetcher(assets)
     ok = fetch(f"file://{assets}/chart-1.png")
-    assert ok["mime_type"] == "image/png" and ok["string"][:8] == b"\x89PNG\r\n\x1a\n"
+    assert _mime(ok) == "image/png" and _body(ok)[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_fetcher_meets_the_installed_weasyprints_contract(weasy, assets):
+    """Through WeasyPrint's OWN `fetch()`, not ours: 70 asserts the result is
+    a URLFetcherResponse and reads `_fail_on_errors` on a refusal (a plain
+    function raised AttributeError there — the 2026-09-11 e2e failure)."""
+    from weasyprint.urls import URLFetchingError, fetch as weasy_fetch
+
+    fetcher = P.make_url_fetcher(assets)
+    with weasy_fetch(fetcher, f"file://{assets}/chart-1.png") as resource:
+        assert resource.read()[:8] == b"\x89PNG\r\n\x1a\n" and resource.content_type == "image/png"
+    with pytest.raises(URLFetchingError):
+        with weasy_fetch(fetcher, "http://127.0.0.1:1/x.png"):
+            pass
 
 
 @pytest.mark.parametrize("url", [
@@ -116,21 +138,16 @@ def test_a_hostile_page_produces_no_fetch(weasy, assets, listener, monkeypatch):
     a recording fetcher that must have refused every attempt."""
     port = listener
     attempts: list = []
-    real = P.make_url_fetcher
 
-    def recording(assets_dir):
-        inner = real(assets_dir)
-
-        def fetch(url, *a, **k):
+    class Recording(P.AssetFetcher):
+        def fetch(self, url):
             try:
-                return inner(url, *a, **k)
+                return super().fetch(url)
             except P.RefusedFetch as exc:
                 attempts.append((url, str(exc)))
                 raise
 
-        return fetch
-
-    monkeypatch.setattr(P, "make_url_fetcher", recording)
+    monkeypatch.setattr(P, "make_url_fetcher", Recording)
     html = (
         "<!DOCTYPE html><html><head><style>"
         f"@import url('http://127.0.0.1:{port}/import.css');"
