@@ -160,16 +160,53 @@ class Client:
         return self.http.put(f"{self.base}{self.p['chunked']}/{conv}/{upload_id}/part/{index}", content=body, headers=headers)
 
     def _raw_put(self, conv: str, upload_id: str, index: int, body: bytes, headers: Dict[str, str]) -> httpx.Response:
-        """A PUT whose body is deliberately short of its declared length."""
-        def short_body():
-            yield body
+        """A PUT that declares one length and then stops early — over a raw
+        socket, because an HTTP client will not do this.
+
+        This is the wire condition a closed tab produces: headers promise N
+        bytes, fewer arrive, the connection ends. httpx refuses to send it
+        (LocalProtocolError), and a chunked body closed early is a different
+        condition the server may read differently, so the socket is the only
+        honest way to reproduce what actually happened.
+        """
+        import socket
+        from urllib.parse import urlsplit
+
+        parts = urlsplit(self.base)
+        host = parts.hostname or "127.0.0.1"
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+        path = f"{parts.path}{self.p['chunked']}/{conv}/{upload_id}/part/{index}"
+        lines = [f"PUT {path} HTTP/1.1", f"Host: {host}:{port}", "Connection: close"]
+        for key, value in {**headers, "Cookie": self.http.headers.get("Cookie", "")}.items():
+            if value:
+                lines.append(f"{key}: {value}")
+        head = ("\r\n".join(lines) + "\r\n\r\n").encode()
+        sock = socket.create_connection((host, port), timeout=30)
         try:
-            return self.http.put(
-                f"{self.base}{self.p['chunked']}/{conv}/{upload_id}/part/{index}",
-                content=short_body(), headers=headers,
-            )
-        except httpx.HTTPError as exc:
-            return httpx.Response(599, request=httpx.Request("PUT", "http://x"), text=str(exc))
+            sock.sendall(head)
+            sock.sendall(body)
+            # Close WITHOUT sending the rest. The server is left waiting for
+            # bytes that will never come.
+            sock.shutdown(socket.SHUT_WR)
+            raw = b""
+            try:
+                while len(raw) < 4096:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    raw += chunk
+            except OSError:
+                pass
+        finally:
+            sock.close()
+        code = 0
+        if raw.startswith(b"HTTP/"):
+            try:
+                code = int(raw.split(b" ", 2)[1])
+            except (IndexError, ValueError):
+                code = 0
+        return httpx.Response(code or 599, request=httpx.Request("PUT", f"{self.base}{path}"),
+                              text=raw.decode("utf-8", "replace")[:400])
 
     def session(self, conv: str, upload_id: str) -> httpx.Response:
         return self.http.get(f"{self.base}{self.p['chunked']}/{conv}/{upload_id}")
@@ -297,6 +334,26 @@ def conv_id(tag: str) -> str:
     return f"qa-{tag}-{uuid.uuid4().hex[:8]}"
 
 
+def unique_copy(path: str, into: str) -> str:
+    """The same video, different bytes.
+
+    An analysis is keyed by the sha256 of the file and shared by everyone who
+    attaches it, so a scenario that needs a REAL analysis to watch cannot use
+    a file an earlier scenario already analysed — it would be answered from
+    the cache in a millisecond, which is correct behaviour and useless here.
+    A trailing `free` box is legal MP4 padding that every demuxer skips, so
+    the copy plays identically and hashes differently.
+    """
+    import struct
+
+    blob = open(path, "rb").read()
+    pad = struct.pack(">I", 24) + b"free" + os.urandom(16)
+    out = os.path.join(into, f"{os.path.splitext(os.path.basename(path))[0]}-{uuid.uuid4().hex[:8]}.mp4")
+    with open(out, "wb") as fh:
+        fh.write(blob + pad)
+    return out
+
+
 def assistant_rows(thread: dict) -> List[dict]:
     return [m for m in thread.get("messages", []) if m.get("role") == "assistant"]
 
@@ -306,6 +363,9 @@ def assistant_rows(thread: dict) -> List[dict]:
 
 def scenarios(a: Client, b: Optional[Client], fixtures: str, report: Report, *, heavy: bool) -> None:
     """`a` is the person under test; `b` is a second account, for isolation."""
+    import tempfile
+
+    tmpdir = tempfile.mkdtemp(prefix="qa-unique-")
     small = os.path.join(fixtures, "fixture_20mb.mp4")
     under = os.path.join(fixtures, "fixture_89mb.mp4")   # below the chunk threshold
     over = os.path.join(fixtures, "fixture_97mb.mp4")    # above it: two parts
@@ -317,7 +377,10 @@ def scenarios(a: Client, b: Optional[Client], fixtures: str, report: Report, *, 
     # 1 ─ a normal single MP4, selection to a persisted answer.
     def case1() -> dict:
         conv = conv_id("normal")
-        up = a.upload_file(conv, small)
+        # Fresh bytes every run: an analysis is content-addressed, so reusing
+        # a file an earlier run analysed would answer from the cache and prove
+        # only that the cache works.
+        up = a.upload_file(conv, unique_copy(small, tmpdir))
         intent = uuid.uuid4().hex
         turn = a.chat(conv, "", intent_id=intent, video_uploads=[{"upload_id": up["upload_id"], "name": up["filename"]}])
         assert turn["status"] == 200, f"chat answered {turn['status']}"
@@ -453,7 +516,7 @@ def scenarios(a: Client, b: Optional[Client], fixtures: str, report: Report, *, 
     # 7/8 ─ every viewer leaves; the server still finishes and stores the answer.
     def case7() -> dict:
         conv = conv_id("detach")
-        up = a.upload_file(conv, small)
+        up = a.upload_file(conv, unique_copy(small, tmpdir))
         intent = uuid.uuid4().hex
         # Cut the connection as soon as the first progress step arrives.
         turn = a.chat(conv, "", intent_id=intent,
@@ -480,7 +543,7 @@ def scenarios(a: Client, b: Optional[Client], fixtures: str, report: Report, *, 
     # 6 ─ leaving and coming back does not restart the analysis.
     def case6() -> dict:
         conv = conv_id("reattach")
-        up = a.upload_file(conv, small)
+        up = a.upload_file(conv, unique_copy(small, tmpdir))
         intent = uuid.uuid4().hex
         first = a.chat(conv, "", intent_id=intent,
                        video_uploads=[{"upload_id": up["upload_id"], "name": up["filename"]}],
@@ -523,8 +586,8 @@ def scenarios(a: Client, b: Optional[Client], fixtures: str, report: Report, *, 
     # 3d ─ a small and a large file in one turn, the 20/400 pairing in miniature.
     def case3d() -> dict:
         conv = conv_id("pair")
-        u1 = a.upload_file(conv, small)
-        u2 = a.upload_file(conv, big)
+        u1 = a.upload_file(conv, unique_copy(small, tmpdir))
+        u2 = a.upload_file(conv, unique_copy(big, tmpdir))
         intent = uuid.uuid4().hex
         turn = a.chat(conv, "", intent_id=intent, video_uploads=[
             {"upload_id": u1["upload_id"], "name": u1["filename"]},

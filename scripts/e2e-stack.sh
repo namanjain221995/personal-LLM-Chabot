@@ -105,6 +105,7 @@ up() {
     -v "$ROOT/brain/packs:/data/brain:ro" \
     -v "$HOME/Documents/project/Model:/models:ro" \
     --add-host host.docker.internal:host-gateway \
+    --add-host vllm:host-gateway \
     -p "127.0.0.1:$ORCH_PORT:8080" \
     --restart no "$ORCH_IMAGE" >/dev/null
   docker network connect sf-local-ai_inference "$ORCH" 2>/dev/null || true
@@ -118,7 +119,9 @@ up() {
     --init --restart no "$FRONT_IMAGE" >/dev/null
 
   local i
-  for i in $(seq 1 90); do
+  # Generous: a first start runs every migration and probes six engines
+  # before it answers, and a cold page cache makes that slower still.
+  for i in $(seq 1 180); do
     curl -fsS -m 3 "http://127.0.0.1:$ORCH_PORT/health" >/dev/null 2>&1 && break
     sleep 2
   done
