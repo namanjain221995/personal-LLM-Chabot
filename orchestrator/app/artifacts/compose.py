@@ -427,19 +427,41 @@ async def compose(req: ComposeRequest, *, progress: Optional[Progress] = None) -
     corrections += repaired
     result_warnings.extend(notes)
 
+    async def correct(pct: float, detail: str, extra: str, *, allow_shrink: bool = False) -> None:
+        """One correction pass: the whole document again with `extra`, then
+        validated, then HELD AGAINST THE DRAFT IT CORRECTS. A correction that
+        returns a fraction of the content is not applied — the Think brief
+        of the 2026-09-11 e2e run came back from its review as one KPI row
+        on an empty page. Shrinking is allowed only when it was asked for."""
+        nonlocal spec, calls, corrections
+        await say(pct, detail)
+        raw = await _compose_once(req, budget, outline_json=outline_json, extra=extra)
+        calls += 1
+        corrections += 1
+        candidate, repaired, notes = await _validate_or_repair(req, budget, raw, outline_json)
+        calls += repaired
+        result_warnings.extend(n for n in notes if n not in result_warnings)
+        why = _worse(spec, candidate, allow_shrink=allow_shrink)
+        if why:
+            result_warnings.append(f"a correction {why} and was not applied; the draft before it is what you see")
+            log.info("artifact compose: a correction (%s) %s; kept the draft", detail, why)
+            return
+        spec = candidate
+
+    # A draft with no body — a KPI row and nothing else, a deck of one
+    # slide, a workbook with no rows — is repaired once before anything
+    # else is done to it.
+    hollow = S.hollow(spec)
+    if hollow and corrections < budget.max_corrections:
+        await correct(50.0, "adding the missing body", f"Your draft is incomplete: {hollow}. Write the whole document, every section with its content.", allow_shrink=True)
+        hollow = S.hollow(spec)
+    if hollow:
+        result_warnings.append(f"the document is thin: {hollow}")
+
     # Placeholders are a correction, bounded by the budget.
     holes = S.placeholders_in(spec)
     if holes and corrections < budget.max_corrections:
-        await say(55.0, "removing placeholders")
-        raw = await _compose_once(
-            req, budget, outline_json=outline_json,
-            extra=f"Your draft still contains placeholder text: {', '.join(holes[:6])}. Replace every placeholder with real content from the material, or remove it. Return the whole document.",
-        )
-        calls += 1
-        corrections += 1
-        spec, repaired, notes = await _validate_or_repair(req, budget, raw, outline_json)
-        calls += repaired
-        result_warnings.extend(n for n in notes if n not in result_warnings)
+        await correct(55.0, "removing placeholders", f"Your draft still contains placeholder text: {', '.join(holes[:6])}. Replace every placeholder with real content from the material, or remove it. Return the whole document.")
         holes = S.placeholders_in(spec)
     if holes:
         result_warnings.append("placeholder text remains: " + ", ".join(holes[:4]))
@@ -450,16 +472,7 @@ async def compose(req: ComposeRequest, *, progress: Optional[Progress] = None) -
     longer = _asked_shorter_but_longer(req, spec)
     if longer and corrections < budget.max_corrections:
         before, after = longer
-        await say(60.0, "shortening")
-        raw = await _compose_once(
-            req, budget, outline_json=outline_json,
-            extra=f"The request asked for a SHORTER document, but your draft is longer than the one being edited ({after} words against {before}). Cut it well below {before} words, keeping the change that was asked for. Return the whole document.",
-        )
-        calls += 1
-        corrections += 1
-        spec, repaired, notes = await _validate_or_repair(req, budget, raw, outline_json)
-        calls += repaired
-        result_warnings.extend(n for n in notes if n not in result_warnings)
+        await correct(60.0, "shortening", f"The request asked for a SHORTER document, but your draft is longer than the one being edited ({after} words against {before}). Cut it well below {before} words, keeping the change that was asked for. Return the whole document.", allow_shrink=True)
         longer = _asked_shorter_but_longer(req, spec)
     if longer:
         result_warnings.append(f"the edit asked for a shorter document but this version is longer ({longer[1]} words against {longer[0]})")
@@ -479,14 +492,9 @@ async def compose(req: ComposeRequest, *, progress: Optional[Progress] = None) -
         issues = (review_json or {}).get("issues") if isinstance(review_json, dict) else None
         musts = [i for i in (issues if isinstance(issues, list) else []) if isinstance(i, dict) and i.get("severity") == "must"]
         if musts:
-            await say(80.0, f"correcting {len(musts)} issue(s)")
             fix_text = "\n".join(f"- {i['where']}: {i['problem']} → {i['fix']}" for i in musts[:8])
-            raw = await _compose_once(req, budget, outline_json=outline_json, extra=f"A reviewer found these problems. Fix each and return the whole document:\n{fix_text}")
-            calls += 1
-            corrections += 1
-            spec, repaired, notes = await _validate_or_repair(req, budget, raw, outline_json)
-            calls += repaired
-            result_warnings.extend(n for n in notes if n not in result_warnings)
+            shrink_asked = any(re.search(r"too long|shorter|shorten|cut|trim|condense", f"{i.get('problem', '')} {i.get('fix', '')}", re.IGNORECASE) for i in musts)
+            await correct(80.0, f"correcting {len(musts)} issue(s)", f"A reviewer found these problems. Fix each and return the WHOLE document with every section, not only the parts you changed:\n{fix_text}", allow_shrink=shrink_asked)
             figures = S.unsupported_figures(spec, material_text(req))
 
     if figures:
@@ -494,6 +502,30 @@ async def compose(req: ComposeRequest, *, progress: Optional[Progress] = None) -
     result_warnings.extend(_enforce_caps(spec, budget))
     await say(95.0, "content ready")
     return ComposeResult(spec=spec, warnings=result_warnings, corrections=corrections, outline=outline_json, review=review_json, model_calls=calls)
+
+
+def _gutted(before: S.ArtifactSpec, after: S.ArtifactSpec) -> bool:
+    """True when `after` keeps less than half of `before` — by words of
+    prose, or by parts (blocks, slides, sheets)."""
+    words_before = len(S.text_of(before).split())
+    words_after = len(S.text_of(after).split())
+    parts_before, parts_after = S.part_count(before), S.part_count(after)
+    if words_before >= 40 and words_after < words_before * 0.5:
+        return True
+    return parts_before >= 3 and parts_after < parts_before * 0.5
+
+
+def _worse(before: S.ArtifactSpec, after: S.ArtifactSpec, *, allow_shrink: bool) -> str:
+    """Why `after` is a worse document than `before`, or "" — the reasons a
+    correction is refused: it dropped most of the content (unless less was
+    asked for), it introduced placeholders, or it emptied the body."""
+    if not allow_shrink and _gutted(before, after):
+        return "dropped most of the content"
+    if S.placeholders_in(after) and not S.placeholders_in(before):
+        return "replaced content with placeholders"
+    if S.hollow(after) and not S.hollow(before):
+        return "emptied the document"
+    return ""
 
 
 _SHORTER_RE = re.compile(
@@ -516,6 +548,15 @@ def _asked_shorter_but_longer(req: ComposeRequest, spec: S.ArtifactSpec) -> Opti
     if before and after > before + max(5, before // 20):
         return before, after
     return None
+
+
+def _pin_template(raw: dict, req: ComposeRequest) -> None:
+    """The template was decided from the request's words before the model
+    was called; the model is told which, and still changes it (the Think
+    brief of 2026-09-11 came back `generic` from its correction pass and
+    rendered as a report). Code decides; the model writes content."""
+    if isinstance(raw, dict) and req.template_id in S.templates_for(req.kind):
+        raw["template_id"] = req.template_id
 
 
 def _reconcile_sources(raw: dict, material: Optional[Material]) -> List[str]:
@@ -564,6 +605,7 @@ async def _validate_or_repair(req: ComposeRequest, budget: T.EffortBudget, raw: 
     The sources manifest is reconciled against the material FIRST, so the
     model's own list never reaches validation, let alone a page."""
     notes = _reconcile_sources(raw, req.material)
+    _pin_template(raw, req)
     try:
         return S.parse_body(req.kind, raw), 0, notes
     except ValidationError as exc:
@@ -574,6 +616,7 @@ async def _validate_or_repair(req: ComposeRequest, budget: T.EffortBudget, raw: 
         extra=f"Your JSON did not match the schema:\n{summary}\nReturn the corrected, complete document.",
     )
     notes = _reconcile_sources(fixed, req.material)
+    _pin_template(fixed, req)
     try:
         return S.parse_body(req.kind, fixed), 1, notes
     except ValidationError as exc:
@@ -603,7 +646,8 @@ async def content_review(req: ComposeRequest, spec: S.ArtifactSpec, budget: T.Ef
             + (f"Data:\n{_table_block(m.tables)}\n\n" if m.tables else "")
             + (f"Sources:\n{_source_block(m.sources[: budget.max_sources or 1], 12_000)}\n\n" if m.sources else "")
             + (f"Figures in the draft that appear nowhere in the material (each is derived, assumed or invented — "
-               f"a 'must' unless the draft says which): {', '.join(figures[:12])}\n\n" if figures else "")
+               f"a 'must' unless the draft says which; the fix is to state the assumption or the arithmetic beside "
+               f"the figure, or to say the figure is not given — never a placeholder, never a zero): {', '.join(figures[:12])}\n\n" if figures else "")
             + f"Draft (JSON):\n{spec.body.model_dump_json()[:60_000]}"
         )},
     ]

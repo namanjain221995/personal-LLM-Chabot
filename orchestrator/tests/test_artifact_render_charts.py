@@ -73,7 +73,9 @@ def test_pie_folds_past_eight_slices(tmp_path):
 
 
 def test_pie_with_no_positive_values_does_not_crash(tmp_path):
-    c = chart(type="pie", series=[S.Series(name="s", values=[0, 0, 0])])
+    # All-zero is refused by the spec now (a chart the model emptied); a
+    # pie of negatives and zeros still reaches the renderer and must not crash.
+    c = chart(type="pie", series=[S.Series(name="s", values=[-1, 0, -2])])
     assert charts.render_chart_png(c, tmp_path / "zero.png").stat().st_size > 0
 
 

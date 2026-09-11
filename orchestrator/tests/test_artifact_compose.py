@@ -201,8 +201,80 @@ def test_figures_the_material_never_gave_are_a_warning_and_a_hint_to_the_reviewe
     asyncio.run(C.compose(_req("think")))
     review_prompt = model.calls[2]["messages"][-1]["content"]
     assert "appear nowhere in the material" in review_prompt and "$55" in review_prompt
+    assert "never a placeholder, never a zero" in review_prompt, "the reviewer is told what the fix is, so the correction does not blank the figures"
     # The role prompt says what to do when a figure is missing.
     assert "never supply a plausible one" in model.calls[1]["messages"][0]["content"]
+
+
+def _full_doc():
+    return _doc_json(blocks=[
+        {"type": "kpis", "items": [{"label": "Price", "value": "$59"}]},
+        {"type": "heading", "level": 1, "text": "Objective"},
+        {"type": "paragraph", "text": "Team tier moves to $59 to align with market rates and improve margin without hurting retention.", "sources": ["s1"]},
+        {"type": "heading", "level": 1, "text": "Risks"},
+        {"type": "bullets", "items": ["Churn among price-sensitive teams", "Support load during the transition", "Competitor response"]},
+        {"type": "callout", "kind": "warning", "text": "Validate price sensitivity before the announcement goes out."},
+    ])
+
+
+def test_a_correction_that_guts_the_document_is_not_applied(monkeypatch):
+    """The Think brief of the 2026-09-11 e2e run came back from its review
+    as one KPI row on an empty page. A correction is held against the draft
+    it corrects; less than half the content means the draft stands."""
+    outline = {"title": "x", "audience": "", "purpose": "", "sections": [], "needs_current_facts": False, "assumptions": []}
+    review = {"ok": False, "issues": [{"where": "Objective", "problem": "no effective date", "fix": "add it", "severity": "must"}]}
+    gutted = _doc_json(blocks=[{"type": "kpis", "items": [{"label": "Price", "value": "$59"}]}])
+    model = _Model([outline, _full_doc(), review, gutted])
+    monkeypatch.setattr(llm, "json_completion", model)
+    result = asyncio.run(C.compose(_req("think", template_id="brief")))
+    assert len(result.spec.body.blocks) == 6, "the reviewed draft, not the gutted correction"
+    assert result.corrections == 1 and any("dropped most of the content" in w for w in result.warnings)
+    assert "WHOLE document with every section" in model.calls[3]["messages"][-1]["content"]
+    # When the reviewer asked for less, halving is the fix, not a fault.
+    review = {"ok": False, "issues": [{"where": "all", "problem": "far too long for a brief", "fix": "cut it to the essentials", "severity": "must"}]}
+    half = _doc_json(blocks=_full_doc()["blocks"][:2] + [{"type": "paragraph", "text": "Team tier moves to $59."}])
+    model = _Model([outline, _full_doc(), review, half])
+    monkeypatch.setattr(llm, "json_completion", model)
+    result = asyncio.run(C.compose(_req("think", template_id="brief")))
+    assert len(result.spec.body.blocks) == 3 and not any("dropped most" in w for w in result.warnings)
+    # A correction that swaps figures for placeholders (the Think deck of
+    # 2026-09-11: "[Verified Current Monthly Revenue]" in every tile) is
+    # refused the same way.
+    review = {"ok": False, "issues": [{"where": "kpis", "problem": "$59 is not in the material", "fix": "state the assumption", "severity": "must"}]}
+    bracketed = _doc_json(blocks=_full_doc()["blocks"][1:] + [{"type": "kpis", "items": [{"label": "Price", "value": "[Verified Price]"}]}])
+    model = _Model([outline, _full_doc(), review, bracketed])
+    monkeypatch.setattr(llm, "json_completion", model)
+    result = asyncio.run(C.compose(_req("think", template_id="brief")))
+    assert result.spec.body.blocks[0].type == "kpis" and result.spec.body.blocks[0].items[0].value == "$59"
+    assert any("replaced content with placeholders" in w for w in result.warnings)
+
+
+def test_a_hollow_first_draft_is_repaired_once(monkeypatch):
+    hollow = _doc_json(blocks=[{"type": "kpis", "items": [{"label": "Price", "value": "$59"}]}])
+    model = _Model([hollow, _full_doc()])
+    monkeypatch.setattr(llm, "json_completion", model)
+    result = asyncio.run(C.compose(_req("fast", template_id="brief")))
+    assert len(result.spec.body.blocks) == 6 and result.corrections == 1 and result.warnings == []
+    assert "incomplete" in model.calls[1]["messages"][-1]["content"]
+    model = _Model([hollow, hollow])
+    monkeypatch.setattr(llm, "json_completion", model)
+    result = asyncio.run(C.compose(_req("fast", template_id="brief")))
+    assert any(w.startswith("the document is thin") for w in result.warnings)
+
+
+def test_the_template_is_the_requests_decision_not_the_models(monkeypatch):
+    """The Think brief of 2026-09-11 came back `generic` from its correction
+    and rendered as a report. The words decided `brief`; the model writes
+    content."""
+    model = _Model([_doc_json(template_id="executive_report")])
+    monkeypatch.setattr(llm, "json_completion", model)
+    result = asyncio.run(C.compose(_req("fast", template_id="brief")))
+    assert result.spec.body.template_id == "brief"
+    # A template the kind does not know is left to the model's default.
+    model = _Model([_doc_json(template_id="sop")])
+    monkeypatch.setattr(llm, "json_completion", model)
+    result = asyncio.run(C.compose(_req("fast", template_id="ceo")))
+    assert result.spec.body.template_id == "sop"
 
 
 def test_caps_trim_a_deck_with_a_warning_instead_of_refusing(monkeypatch):

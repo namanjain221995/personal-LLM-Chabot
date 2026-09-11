@@ -149,6 +149,30 @@ def test_placeholders_are_found():
     found = S.placeholders_in(spec)
     assert any(p.lower().startswith("lorem") for p in found) and any(p.lower().startswith("[insert") for p in found)
     assert S.placeholders_in(S.parse_body("document", _doc())) == []
+    # Any bracketed phrase is a placeholder — a slide's KPI tile included —
+    # but a citation mark like [1] is not.
+    deck = S.parse_body("presentation", {"title": "Plans", "slides": [
+        {"layout": "kpis", "title": "Numbers", "kpis": [{"label": "MRR", "value": "[Verified Current Monthly Revenue]"}]},
+        {"layout": "bullets", "title": "Why", "bullets": ["Support costs rose [1].", "Rates justify it."]},
+    ]})
+    assert S.placeholders_in(deck) == ["[Verified Current Monthly Revenue]"]
+
+
+def test_a_chart_of_zeros_is_refused():
+    with pytest.raises(ValidationError) as exc:
+        S.Chart.model_validate({"type": "bar", "categories": ["Old", "New"], "series": [{"name": "Revenue", "values": [0, 0]}]})
+    assert "every value is 0" in str(exc.value)
+    with pytest.raises(ValidationError):
+        S.parse_body("document", _doc(blocks=[{"type": "chart", "chart": {"type": "bar", "categories": ["Old", "New"], "series": [{"name": "Revenue", "values": [0, 0]}]}}]))
+    assert S.Chart.model_validate({"type": "bar", "categories": ["Old", "New"], "series": [{"name": "Revenue", "values": [0, 1]}]}).series[0].values == [0, 1]
+
+
+def test_hollow_names_what_is_missing():
+    assert S.hollow(S.parse_body("document", _doc())) == ""
+    assert "no paragraphs" in S.hollow(S.parse_body("document", _doc(blocks=[{"type": "heading", "level": 1, "text": "Only a heading"}, {"type": "kpis", "items": [{"label": "ARR", "value": "$4.2M"}]}])))
+    assert "fewer than two slides" in S.hollow(S.parse_body("presentation", {"title": "x", "slides": [{"layout": "title", "title": "x"}, {"layout": "bullets", "title": "one", "bullets": ["a"]}]}))
+    assert "no sheet has any rows" in S.hollow(S.parse_body("workbook", {"title": "x", "sheets": [{"name": "A", "columns": [{"name": "c"}]}]}))
+    assert S.part_count(S.parse_body("document", _doc())) == 8
 
 
 def test_a_presentation_validates_its_slides():

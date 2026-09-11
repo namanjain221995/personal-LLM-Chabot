@@ -163,6 +163,11 @@ class Chart(_Strict):
                 raise ValueError(f"series {s.name!r} has {len(s.values)} values for {n} categories")
         if self.type == "pie" and len(self.series) != 1:
             raise ValueError("a pie chart has exactly one series")
+        if all(v == 0 for s in self.series for v in s.values):
+            # Every value zero is a chart the model emptied rather than
+            # filled (the Think deck of 2026-09-11 drew two zero bars after
+            # its review); it is refused so the repair drops or fills it.
+            raise ValueError("the chart has no data: every value is 0 — fill it from the material or leave the chart out")
         return self
 
 
@@ -687,6 +692,10 @@ def text_of(spec: ArtifactSpec) -> str:
         for s in body.slides:
             parts.extend([s.title, s.subtitle, *s.bullets, *s.left, *s.right, s.notes])
             parts.extend(f"{a} {b}" for a, b in s.steps)
+            parts.extend(f"{k.label} {k.value} {k.note}" for k in s.kpis)
+            if s.table is not None:
+                parts.extend(s.table.columns)
+                parts.extend(str(c) for row in s.table.rows for c in row if c is not None)
     elif isinstance(body, WorkbookSpec):
         for s in body.sheets:
             parts.extend(c.name for c in s.columns)
@@ -694,8 +703,12 @@ def text_of(spec: ArtifactSpec) -> str:
     return "\n".join(p for p in parts if p)
 
 
+#: Bracketed phrases are placeholders whatever the word inside: the Think
+#: deck of 2026-09-11 came back from its correction with "[Verified Current
+#: Monthly Revenue]" in every KPI tile. A bare number in brackets ([1]) is a
+#: citation mark and is not matched.
 _PLACEHOLDER_RE = re.compile(
-    r"lorem ipsum|\[insert[^\]]*\]|\[placeholder[^\]]*\]|\bTBD\b|\bTODO\b|xxx+|\[chart here\]|\[image here\]",
+    r"lorem ipsum|\[(?!\d+\])[A-Za-z][^\]\n]{1,80}\]|\bTBD\b|\bTODO\b|xxx+",
     re.IGNORECASE,
 )
 
@@ -704,6 +717,48 @@ def placeholders_in(spec: ArtifactSpec) -> List[str]:
     """Placeholder text the model left behind. A document with these is not
     finished; the caller asks for a correction rather than shipping it."""
     return sorted({m.group(0) for m in _PLACEHOLDER_RE.finditer(text_of(spec))})
+
+
+def templates_for(kind: str) -> Tuple[str, ...]:
+    """The template ids a kind's body accepts — read from the Literal, so
+    the composer's pin can never name one the validator would refuse."""
+    body = _BODY_FOR_KIND.get(kind)
+    if body is None:
+        return ()
+    return tuple(body.model_fields["template_id"].annotation.__args__)
+
+
+def part_count(spec: ArtifactSpec) -> int:
+    """Blocks, slides or sheets — the coarse size a correction is held to."""
+    body = spec.body
+    if isinstance(body, DocumentSpec):
+        return len(body.blocks)
+    if isinstance(body, PresentationSpec):
+        return len(body.slides)
+    if isinstance(body, WorkbookSpec):
+        return sum(1 + len(s.rows) for s in body.sheets)
+    return 0
+
+
+_BODY_BLOCKS = (Paragraph, Bullets, Numbered, TableBlock, ChartBlock, Callout)
+
+
+def hollow(spec: ArtifactSpec) -> str:
+    """Why the spec has no body, or "" when it has one. A KPI row on an
+    empty page (the Think brief of 2026-09-11), a deck of one slide, a
+    workbook with no rows: valid to the schema, useless to the reader."""
+    body = spec.body
+    if isinstance(body, DocumentSpec):
+        if not any(isinstance(b, _BODY_BLOCKS) for b in body.blocks):
+            return "it has no paragraphs, lists, tables or charts — only headings or headline numbers"
+    elif isinstance(body, PresentationSpec):
+        content = [s for s in body.slides if s.layout not in ("title", "section", "closing")]
+        if len(content) < 2:
+            return "it has fewer than two slides with content"
+    elif isinstance(body, WorkbookSpec):
+        if not any(s.rows for s in body.sheets):
+            return "no sheet has any rows"
+    return ""
 
 
 def is_formula_like(value: Any) -> bool:
@@ -830,5 +885,5 @@ __all__ = [
     "Heading", "Paragraph", "Bullets", "Numbered", "TableBlock", "ChartBlock", "Callout",
     "KPI", "KPIRow", "PageBreak", "Slide", "Sheet", "Column", "Total", "Table", "Chart",
     "Series", "Citation", "schema_for", "parse_body", "load", "validation_summary",
-    "text_of", "placeholders_in", "is_formula_like", "unsupported_figures",
+    "text_of", "placeholders_in", "is_formula_like", "unsupported_figures", "templates_for", "part_count", "hollow",
 ]
