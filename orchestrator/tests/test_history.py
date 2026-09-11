@@ -52,12 +52,31 @@ def test_create_list_and_detail(alice):
     assert detail["messages"] == []
 
 
-def test_client_supplied_id_and_conflict(alice):
+def test_client_supplied_id_and_conflict(alice, login_client):
+    """Create is idempotent FOR ITS OWNER and a conflict for anyone else.
+
+    It answered 409 for the owner too until 2026-09-11. The only caller uses
+    it to ensure a conversation exists before pushing its thread and then
+    swallows the 409 (see history.ts pushAll), so the healthy path was
+    answering with an error that the browser logged to the console beside
+    real failures — which is how a 409 on every sync came to be reported as
+    a fault. A second create returns the STORED row: a conversation renamed
+    since it was created must not be retitled by an ensure-exists call.
+    """
     resp = alice.post("/history/conversations", json={"id": "conv-1", "title": "Mine"})
     assert resp.status_code == 200
     assert resp.json()["id"] == "conv-1"
+
     dup = alice.post("/history/conversations", json={"id": "conv-1", "title": "Again"})
-    assert dup.status_code == 409
+    assert dup.status_code == 200
+    assert dup.json() == resp.json(), "an ensure-exists call must change nothing"
+
+    # Someone else's id is still a real conflict, and tells them nothing about it.
+    other = login_client("conv-1-clash")
+    clash = other.post("/history/conversations", json={"id": "conv-1", "title": "Mine now"})
+    assert clash.status_code == 409
+    assert alice.get("/history/conversations/conv-1").json()["title"] == "Mine"
+
     bad = alice.post("/history/conversations", json={"id": "not ok!", "title": "x"})
     assert bad.status_code == 400
 

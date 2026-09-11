@@ -133,7 +133,19 @@ def create_conversation(
     try:
         return db.create_conversation(int(user["id"]), conversation_id, title)
     except db.IntegrityError:
-        raise HTTPException(status_code=409, detail="conversation id already exists")
+        # IDEMPOTENT FOR THE OWNER (2026-09-11). The client calls this to
+        # ensure a conversation exists before pushing its thread — the
+        # comment on the caller says so — and then swallows the 409. So the
+        # common, healthy path was answering with an error the browser dutifully
+        # logged to the console, where it sat next to real failures and made
+        # them harder to see. Someone ELSE's id is still a genuine conflict.
+        #
+        # The stored row is returned UNCHANGED: a conversation renamed after
+        # it was created must not be retitled by a later ensure-exists call.
+        existing = db.get_conversation(int(user["id"]), conversation_id)
+        if existing is None:
+            raise HTTPException(status_code=409, detail="conversation id already exists")
+        return existing
 
 
 @router.get("/conversations/{conversation_id}")
