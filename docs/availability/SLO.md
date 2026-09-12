@@ -108,15 +108,20 @@ objective that was not exercised is marked **not measured**, not assumed.)
 
 | Measurement | Value | Source |
 |---|---|---|
-| rank death → RECOVERING | **not measured** | drill 3 record |
-| dead rank reaped | **not measured** | drill 3 record (`worker.started_at` − `last_fault.at`) |
-| fault → READY (warm / cold) | **not measured** | drills 3–5, `techsara_vllm_recovery_duration_seconds` |
-| queued request: status line seen, row `queued` | **not measured** | drill 5 / 15 record |
-| queued request resumed after READY, same generation | **not measured** | drill 15 record, `llm_resumed_generations_total` |
-| duplicate-final-answer check (drill 14) | **not measured** | drill 14 record + the `DUPLICATES` SQL |
-| readiness sequence duration and participation (both GPUs) | **not measured** | `techsara_vllm_participation_ok`, `.signals.gpus` |
-| cold start with warm kernel cache vs cleared cache | **not measured** | `techsara_vllm_cold_start_seconds` before/after `--clear-kernel-cache` |
-| 120-min soak on the pinned build | **not measured** | `scripts/cluster-soak.py` |
+| rank death → RECOVERING (drill 3, `kill -9 VLLM::Worker_TP1`) | **6 s** to leave READY, RECOVERING with `worker_rank_dead` | `.runtime/drills/20260912T094545Z/drill-3-*.log` |
+| head EngineCore death → RECOVERING (drill 4) | **4 s**, `head_engine_dead` | `.runtime/drills/20260912T095049Z/drill-4-*.log` |
+| dead rank reaped | no core-dump hold observed: the worker container restarted 7 s after the kill (09:45:46 → 09:45:53) | drill 3 record (`ulimits core: 1` in force on both ranks) |
+| fault → READY, warm caches (candidate B) | drill 3 **176 s**, drill 4 **172 s**; three coordinated restarts (drill 16) 180 / 186 / 188 s; the pair reloaded worker-first every time | drill 3, 4, 16 records; `techsara_vllm_recovery_duration_seconds` |
+| head API death (drill 5, `vllm serve` exits, Docker restarts the head in 5 s) | detection 5 s, but READY only after **767 s**: the new head waited at the rendezvous for a worker still paired with the old head — the v2 controller did not re-pair the worker (finding, fixed the same day: rule "head restarted externally → worker re-paired") | `.runtime/drills/20260912T095548Z/drill-5-*.log`, controller log 09:55–10:09Z |
+| queued request: accepted (200), status line shown, row `queued`, `llm_queued_generations` > 0 | **yes** — the line `Main model is recovering—your request is safely queued.` was read; the drill's own grep failed on an ASCII-escaped em-dash (script bug, fixed) | drill 15 record |
+| queued request resumed after READY, same generation, primary only | **yes**: the same generation completed (143 chars), first token after READY, `engine=primary` | drill 15 record |
+| duplicate-final-answer check (drill 14) | **one assistant message** for one intent sent twice and resumed once | drill 14 record |
+| `llm_queued_generations` drains after the resume | **no** — stayed 1 until the next `/health` refresh (finding, fixed the same day) | drill 15 record |
+| readiness sequence and participation | non-stream ✓ stream ✓ progress 64 tokens ✓; two concurrent 200–215-token probes; **head 94 % / worker 92–93 %** on every start today (first B start, three drill-16 starts, drills 3/4/5) | controller log, `.signals.gpus` |
+| cold start on candidate B | first (cold torch.compile 20.6 s, graph capture 11 s, init 61 s): container start 08:39:59Z → API accepting ≈ 08:43:45Z (**≈ 3 m 46 s**); warm-cache restarts reached READY 172–188 s after the request | `docker logs sf-local-ai-vllm-1`, drill records |
+| A/B matrix, 11 phases, candidate B | **0 failed requests, 0 Xid, 0 restarts**; ~950K needle 3/3 (949,9xx tokens, 1,189 tok/s prefill, 803 s); mixed 10 min at c=10: 692 requests vs 550 on A; c16 306.7 vs 269.6 tok/s; c10 TTFT p95 0.32 vs 0.60 s; 32K prefill 8.6K vs 7.8K tok/s; 128K 5.2K vs 5.0K tok/s; one 2.8 s inter-token stall in c10 on B | `docs/availability/ab/compare-A-vs-B-20260912.md` |
+| 120-min soak on candidate B | see §5.1 (filled in when the soak completes) | `scripts/cluster-soak.py` |
+| 48–72 h canary | **not measured — still unproven** | production run after the merge |
 
 ## 6. Acceptance checklist
 
