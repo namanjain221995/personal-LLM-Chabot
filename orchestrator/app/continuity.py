@@ -324,7 +324,13 @@ class Hold:
         if kind == RECOVERY:
             _queued += 1
             _publish_queued()
-        await self._park_row()
+            # Only a RECOVERY wait parks the row: `queued` means "resume when
+            # the main model is READY", and the sweep acts on it. A lane wait
+            # happens while the engine IS serving — its row keeps the ordinary
+            # V29 accepted/running durability and must neither be counted as
+            # waiting for the primary nor be picked up by the READY sweep
+            # (review round 2: lane parks inflated the durable queued count).
+            await self._park_row()
         log.info("continuity generation=%s intent=%s queued kind=%s",
                  getattr(self.gen, "generation_id", "?"), getattr(self.gen, "intent_id", "?"), kind)
         if line is not None and not self.announced:

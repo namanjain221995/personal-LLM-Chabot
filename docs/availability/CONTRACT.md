@@ -286,7 +286,7 @@ it and is documented as such):
   `requests_running ≤ ADMISSION_LONG_IDLE_MAX=0` (from `/metrics`, via the
   controller's engine sample) for `ADMISSION_LONG_WAIT_S=600` at most, and holds
   the NORMAL semaphore fully until its first token so no new prefill mixes with
-  the large one. Every wait is durable (V29 row status `queued`) and truthful:
+  the large one. A lane wait is durable through the ordinary V29 `accepted`/`running` row (it happens while the engine is serving; only a RECOVERY wait parks a row as `queued`) and truthful:
   `Waiting for the model to finish current work before your large document (N ahead).`
 Metrics: `llm_admission_lane_active{lane}`, `llm_admission_waiting{lane}`,
 `llm_admission_wait_seconds{lane}` (histogram), `llm_admission_rejections_total{reason}`.

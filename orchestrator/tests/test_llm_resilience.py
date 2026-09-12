@@ -702,3 +702,35 @@ def test_json_completion_sizes_the_pool_when_thinking_is_on(monkeypatch, instant
     monkeypatch.setattr(settings, "thinking_budget_high", 6000)
     asyncio.run(llm.json_completion([{"role": "user", "content": "x"}], json_schema={"type": "object"}, max_tokens=2500, thinking=True, effort="think"))
     assert seen[-1] == 8500
+
+
+def test_an_error_chunk_carrying_vllms_own_4xx_is_malformed_not_engine_death():
+    """vLLM refuses some streamed requests after the headers (a prompt over
+    the window, a bad sampling parameter): 200, then {"error": {"code": 400,
+    "type": "BadRequestError"}}. The SDK raises that as a bare APIError — the
+    same class as a dying engine — so the code/type inside decide. A client
+    mistake is never retried and never opens the breaker (review round 2)."""
+    import openai
+
+    from app import resilience
+
+    chunk_4xx = openai.APIError(
+        "prompt exceeds the model's maximum context",
+        request=None,
+        body={"error": {"message": "too long", "type": "BadRequestError", "code": 400}},
+    )
+    assert resilience.error_chunk_is_client_error(chunk_4xx)
+    assert not resilience.is_recoverable(chunk_4xx)
+    assert resilience.failure_reason(chunk_4xx) == "malformed"
+
+    dying = openai.APIError(
+        "EngineCore encountered an issue", request=None,
+        body={"error": {"message": "EngineDeadError", "type": "InternalServerError", "code": 500}},
+    )
+    assert not resilience.error_chunk_is_client_error(dying)
+    assert resilience.is_recoverable(dying)
+    assert resilience.failure_reason(dying) in ("engine_dead", "worker_lost")
+
+    bare = openai.APIError("connection lost mid-stream", request=None, body=None)
+    assert not resilience.error_chunk_is_client_error(bare)
+    assert resilience.is_recoverable(bare)

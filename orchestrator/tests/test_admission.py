@@ -437,7 +437,7 @@ def test_closing_a_stream_early_releases_its_lane():
 # ---------------------------------------------------------------------------
 
 
-def test_a_held_turn_parks_its_row_for_an_admission_wait_and_resumes_without_a_new_attempt(monkeypatch):
+def test_a_held_turn_does_not_park_its_row_for_an_admission_wait_and_resumes_without_a_new_attempt(monkeypatch):
     from types import SimpleNamespace
 
     parked: list = []
@@ -467,7 +467,10 @@ def test_a_held_turn_parks_its_row_for_an_admission_wait_and_resumes_without_a_n
         await asyncio.wait_for(b.entered.wait(), 1.0)
         tc = asyncio.create_task(_run(c))
         await asyncio.sleep(0.1)
-        assert parked == ["i"] and gen.request_status == "queued"
+        # A lane wait happens while the engine is serving: the row keeps its
+        # ordinary V29 status and is never `queued` (that word means "resume
+        # when READY" and the sweep acts on it) — review round 2.
+        assert parked == [] and gen.request_status == "running"
         # A lane wait is durable, but it is not a generation waiting for
         # the PRIMARY (CONTRACT §7.2; round 2, continuity.py:193).
         assert _gauge("llm_queued_generations") == 0.0
@@ -475,7 +478,7 @@ def test_a_held_turn_parks_its_row_for_an_admission_wait_and_resumes_without_a_n
         a.release.set()
         await ta
         await asyncio.wait_for(c.entered.wait(), 1.0)
-        assert resumed == [False], "an admission wait is not a new attempt"
+        assert resumed == [], "nothing was parked, so nothing is resumed in the database"
         assert gen.attempt == 1 and gen.retry_reason == "none" and gen.request_status == "running"
         assert _gauge("llm_queued_generations") == 0.0
         assert "llm_queue_wait_seconds" not in metrics._hists, "lane waits have their own histogram"

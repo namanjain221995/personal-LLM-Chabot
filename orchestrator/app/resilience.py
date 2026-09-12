@@ -324,6 +324,40 @@ def is_connection_error(exc: BaseException) -> bool:
     )
 
 
+#: vLLM validates a request AFTER the headers went out: a streamed request it
+#: refuses (a prompt over the window, a bad sampling parameter, a tool schema
+#: it cannot follow) arrives as a 200 followed by one {"error": {...}} chunk
+#: carrying vLLM's own status ("code": 400) and type ("BadRequestError").
+#: The SDK raises that chunk as a bare ``openai.APIError`` — the same shape
+#: as an engine dying mid-stream — so the code and type inside the chunk are
+#: what tell a client mistake (never retried, §4 'malformed') from a dead
+#: engine (retried/queued). Bounded on purpose: only the numeric code and a
+#: few type names are read; the message text never reaches a label.
+_CLIENT_ERROR_TYPES = ("badrequest", "validation", "notfound", "invalid", "unprocessable")
+
+
+def error_chunk_is_client_error(exc: BaseException) -> bool:
+    """True when a bare APIError's chunk says the REQUEST was wrong (4xx)."""
+    try:
+        import openai
+    except ImportError:  # pragma: no cover
+        return False
+    if not isinstance(exc, openai.APIError) or isinstance(exc, openai.APIStatusError):
+        return False
+    code = getattr(exc, "code", None)
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        inner = body.get("error") if isinstance(body.get("error"), dict) else body
+        code = code if code is not None else inner.get("code")
+        kind = str(inner.get("type") or "").lower()
+        if any(mark in kind for mark in _CLIENT_ERROR_TYPES):
+            return True
+    try:
+        return 400 <= int(code) < 500
+    except (TypeError, ValueError):
+        return False
+
+
 def is_recoverable(exc: BaseException) -> bool:
     """Whether a restart of the engine could make this call succeed.
 
@@ -346,9 +380,10 @@ def is_recoverable(exc: BaseException) -> bool:
         return status >= 500 or status == 429
     if isinstance(exc, openai.APIError):
         # Not a status error and not a connection error: the engine answered
-        # 200 and then sent an error chunk (EngineDeadError mid-stream) — the
-        # request itself was fine.
-        return True
+        # 200 and then sent an error chunk. EngineDeadError mid-stream is
+        # recoverable; vLLM's own 4xx inside the chunk (a request it refused
+        # after the headers) is the client's mistake and never retried.
+        return not error_chunk_is_client_error(exc)
     return False
 
 
@@ -407,7 +442,10 @@ def failure_reason(exc: BaseException) -> Optional[str]:
             return _dead_half(exc)
         return "malformed"
     if isinstance(exc, openai.APIError):
-        # The dying-stream shape: 200, then an {"error": …} chunk.
+        # The dying-stream shape: 200, then an {"error": …} chunk — unless
+        # the chunk carries vLLM's own 4xx, which is a malformed request.
+        if error_chunk_is_client_error(exc):
+            return "malformed"
         return _dead_half(exc)
     return None
 
