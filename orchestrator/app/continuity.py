@@ -186,6 +186,12 @@ _queued = 0
 #: an expired hold, or by a process that is gone. The published gauge is
 #: the larger of the two (see _publish_queued).
 _durable_queued = 0
+#: When (time.monotonic) the observation `_durable_queued` came from. Two
+#: observers deliver counts out of turn — a /health snapshot read in a
+#: thread, a resume's own re-count, a sweep's — and the LATER observation
+#: is the truth: a count taken before this stamp is dropped, never
+#: published over a fresher one.
+_durable_observed_at = 0.0
 
 
 def _publish_queued() -> None:
@@ -193,9 +199,13 @@ def _publish_queued() -> None:
     in the database). The in-memory count is exact for what THIS process
     holds and moves at once; the durable count catches what an expired
     hold or a dead process left `queued` (it is refreshed by the /health
-    work snapshot, by every sweep and by every park), so a long DOWN never
-    reads as "nothing queued" while thirty rows wait. max(), not the sum:
-    a held generation's row is one of the `queued` rows."""
+    work snapshot, by every sweep, by every park AND by every resume that
+    moves a row out of `queued` — drill 5 of 2026-09-12 read "still 1"
+    after the queued turn had resumed and completed, because the /health
+    snapshot taken during the outage was the last word on the durable
+    half), so a long DOWN never reads as "nothing queued" while thirty
+    rows wait. max(), not the sum: a held generation's row is one of the
+    `queued` rows."""
     metrics.set_gauge(
         "llm_queued_generations", float(max(_queued, _durable_queued)),
         "Accepted generations waiting for the primary model (held in this process or durably queued).",
@@ -206,20 +216,34 @@ def queued_count() -> int:
     return _queued
 
 
-def note_durable_queued(count: int) -> None:
-    """The durable `queued` row count, as the /health work snapshot read
-    it (app/health.py); folded into the gauge."""
-    global _durable_queued
+def note_durable_queued(count: int, *, observed_at: Optional[float] = None) -> None:
+    """The durable `queued` row count, as an observer read it — the
+    /health work snapshot (app/health.py), a sweep, a resume — folded
+    into the gauge. `observed_at` (time.monotonic) is when the count was
+    taken; None means "just now". An observation older than the one
+    already published is dropped: a /health snapshot that read the row
+    as `queued` a moment before the resume moved it must not land AFTER
+    the resume's own re-count and pin the gauge at the stale value."""
+    global _durable_queued, _durable_observed_at
+    stamp = time.monotonic() if observed_at is None else float(observed_at)
+    if stamp < _durable_observed_at:
+        return
+    _durable_observed_at = stamp
     _durable_queued = max(0, int(count))
     _publish_queued()
 
 
 async def _refresh_durable_queued() -> None:
-    """Re-count the `queued` rows now (a thread hop; best-effort)."""
+    """Re-count the `queued` rows now (a thread hop; best-effort). Stamped
+    from BEFORE the read, so a slower observer that started earlier can
+    never overwrite this one with what it saw."""
+    observed_at = time.monotonic()
     try:
-        note_durable_queued(await db.run_in_thread(db.count_chat_requests, "queued"))
+        count = await db.run_in_thread(db.count_chat_requests, "queued")
     except Exception:  # noqa: BLE001 — a gauge refresh never breaks a turn
         log.debug("continuity: could not count queued rows", exc_info=True)
+        return
+    note_durable_queued(count, observed_at=observed_at)
 
 
 class Hold:
@@ -377,7 +401,17 @@ class Hold:
         """The wait is over and the call goes through: the row is `running`
         again under the SAME generation; a recovery wait is a new attempt
         (`attempt` + 1, `retry_reason = recovery`), counted once. Raises
-        LeaseLost when the row now belongs to another generation."""
+        LeaseLost when the row now belongs to another generation.
+
+        The gauge moves HERE, both halves: `_clear()` publishes the
+        in-process drop, and when this call moved the durable row out of
+        `queued` (or found it taken, or Stopped), the durable half is
+        re-counted at once. Before drill 5 of 2026-09-12 the durable half
+        was refreshed only by /health, a sweep and a park — never by the
+        resume — so the /health snapshot that had counted this very row
+        during the outage kept `llm_queued_generations` at 1 after the
+        turn had resumed and completed on the primary (max(0, stale 1)),
+        until the next /health happened to run."""
         if self.kind is None:
             return
         kind = self.kind
@@ -385,6 +419,9 @@ class Hold:
         recovery = kind == RECOVERY
         new_attempt = recovery and not self.resumed_once
         gen = self.gen
+        #: Whether the durable row left `queued` under this call — it was
+        #: moved to `running` here, or a Stop had already moved it.
+        row_left_queued = False
         if self.row_parked and getattr(gen, "intent_id", None):
             try:
                 row = await db.run_in_thread(
@@ -398,6 +435,7 @@ class Hold:
                 gen.request_status = "running"
                 gen.attempt = int(row.get("attempt") or gen.attempt)
                 self.row_parked = False
+                row_left_queued = True
             else:
                 owner = await self._row_owner()
                 if owner is not None and owner != gen.generation_id:
@@ -408,12 +446,16 @@ class Hold:
                     log.warning("continuity generation=%s intent=%s lease lost to generation %s",
                                 gen.generation_id, gen.intent_id, owner)
                     self.lost = LeaseLost(str(gen.intent_id), owner)
+                    # Theirs now, and `running` under their lease: the
+                    # durable half must not keep counting it as queued.
+                    await _refresh_durable_queued()
                     raise self.lost
                 # A Stop landed meanwhile (the row is `cancelled`): the
                 # cancellation reaches this task on its own; the attempt
                 # still moves so the ledger is truthful about the wait.
                 if new_attempt:
                     gen.attempt = int(getattr(gen, "attempt", 1)) + 1
+                row_left_queued = owner is not None  # the row exists and is not `queued` any more
         elif new_attempt:
             gen.attempt = int(getattr(gen, "attempt", 1)) + 1
         if recovery:
@@ -426,7 +468,9 @@ class Hold:
         log.info("continuity generation=%s intent=%s resumed kind=%s after %.0fs attempt=%s",
                  getattr(gen, "generation_id", "?"), getattr(gen, "intent_id", "?"), kind, waited,
                  getattr(gen, "attempt", "?"))
-        self._clear()
+        self._clear()  # the in-process half drops and is published
+        if row_left_queued:
+            await _refresh_durable_queued()  # …and the durable half is re-counted now
 
     async def _row_owner(self) -> Optional[str]:
         """The generation the row names now, or None when it cannot be read."""
@@ -818,9 +862,10 @@ def describe() -> dict:
 
 def reset() -> None:
     """Tests only."""
-    global _queued, _durable_queued, _sweep_task, _sweep_lock, _installed, _pending_trigger
+    global _queued, _durable_queued, _durable_observed_at, _sweep_task, _sweep_lock, _installed, _pending_trigger
     _queued = 0
     _durable_queued = 0
+    _durable_observed_at = 0.0
     _sweep_task = None
     _sweep_lock = None
     _pending_trigger = None

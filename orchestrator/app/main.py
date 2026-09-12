@@ -1406,7 +1406,16 @@ async def _settle_chat_request(gen: "LiveGeneration") -> None:
         error = gen.error
     elif status == "cancelled" and gen.replaced:
         error = "replaced by a newer message"
+    was_queued = gen.request_status == "queued"
     await _mark_chat_request(gen, status, error=error)
+    if was_queued:
+        # A Stop while queued leaves the `queued` count behind: the in-process
+        # half dropped with the hold, the durable half only re-counts on the
+        # next /health snapshot. Re-count now so llm_queued_generations tells
+        # the truth at once (drill 15, 2026-09-12).
+        from . import continuity
+
+        await continuity._refresh_durable_queued()
 
 
 async def _store_answer(gen: "LiveGeneration") -> None:

@@ -97,7 +97,12 @@ def scan_compile_error_lines(text: str) -> Optional[str]:
 
 
 #: Failure categories (contract §4). Nothing else may ever appear as a
-#: ``category`` label value.
+#: ``category`` label value. ``head_restarted_externally`` (2026-09-12,
+#: drill 5): a head start the controller did NOT perform — Docker's restart
+#: policy after ``vllm serve`` exited, an operator's ``docker restart`` —
+#: while rank 1 was still paired with the previous head; the controller's
+#: response is a worker re-pair (sentinel ``POST /restart``), never a head
+#: restart, so it is an incident category but not a pair-restart attempt.
 FAILURE_CATEGORIES: Tuple[str, ...] = (
     "none",
     "worker_rank_dead",
@@ -110,6 +115,7 @@ FAILURE_CATEGORIES: Tuple[str, ...] = (
     "budget_exhausted",
     "manual",
     "cold_start_timeout",
+    "head_restarted_externally",
 )
 
 

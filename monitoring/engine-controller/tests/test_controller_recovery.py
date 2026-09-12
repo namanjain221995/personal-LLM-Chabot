@@ -12,8 +12,11 @@ import re
 import socket
 import time
 
-from common import FAILURE_CATEGORIES
-from controller import ATTEMPT_OUTCOMES, Handler, PROBE_OUTCOMES, STATES, STEPS, WORKER_RESTART_OUTCOMES
+from common import FAILURE_CATEGORIES, utc_stamp
+from controller import (
+    ATTEMPT_OUTCOMES, EXTERNAL_REPAIR_OUTCOMES, Handler, PROBE_OUTCOMES, STATES, STEPS, WORKER_RESTART_OUTCOMES,
+)
+from fakes import HEAD_PROCESSES
 
 
 def _steps(world):
@@ -62,7 +65,8 @@ def test_worker_rank_dead_triggers_recovery_in_one_observation_with_the_choreogr
     assert _steps(world) == ["confirm", "capture", "stop_pair", "wait_load", "canary", "mark_ready", "verify"]
     assert world.ctl.state == "READY"
     assert world.ctl.rec.in_progress is False and world.ctl.rec.step == "verify"
-    assert world.ctl.attempts_total == {"started": 1, "succeeded": 1, "failed": 0, "budget_exhausted": 0}
+    assert world.ctl.attempts_total == {"started": 1, "succeeded": 1, "failed": 0, "budget_exhausted": 0,
+                                        "repaired_worker": 0}
     assert world.ctl.recovery_duration_s is not None
     assert world.ctl.incident["ended_at"] is None
     # the readiness evidence (GPU maxima) is in the incident dir
@@ -173,6 +177,355 @@ def test_a_worker_re_created_by_its_restart_policy_during_wait_load_does_not_fai
     world.head.mode = "healthy"
     world.drive_recovery_to_ready()
     assert world.ctl.attempts_total["succeeded"] == 1
+
+
+# ---------------------------------------------------------------------------
+# The worker re-pair after an EXTERNAL head start (drill 5, 2026-09-12)
+# ---------------------------------------------------------------------------
+
+NO_ATTEMPTS = {"started": 0, "succeeded": 0, "failed": 0, "budget_exhausted": 0, "repaired_worker": 0}
+
+
+def _head_api_killed_then_docker_restarts_it(world):
+    """Drill 5's first ten seconds: ``kill -9`` of the head's ``vllm serve``
+    (connection refused, the process table empty of it), one controller tick
+    (DETECT head_api_dead 1 of 2, DEGRADED), then Docker's restart policy
+    brings the container back 5 s later — started_at moves, restart_count
+    +1, nothing listens on :8000 while the new head loads. The controller
+    performed none of it."""
+    world.head.stop()
+    world.head_container.processes = [p for p in world.head_container.processes
+                                      if "vllm serve" not in p and "VLLM::" not in p]
+    world.tick()
+    assert world.ctl.state == "DEGRADED" and world.ctl.rec.in_progress is False, world.ctl.reason
+    world.clock.advance(5)
+    world.head_container.started_at = world.clock.time()
+    world.head_container.restart_count += 1
+
+
+def test_an_external_head_restart_with_a_stale_worker_re_pairs_the_worker_once_without_a_pair_restart(world, caplog):
+    """Drill 5 (2026-09-12 09:55:49Z): the head's API process was killed,
+    Docker restarted the container within 5 s, the controller correctly went
+    STARTING — and nothing re-paired the worker. Rank 1 stayed in the dead
+    head's process group, the new head waited out its 300 s rendezvous and
+    exited, Docker restarted it again, and only the worker's last-resort
+    healthcheck tier (900 s / 8 misses) restarted the worker: READY 767 s
+    after the break instead of ~180 s. v1's worker healthcheck did the
+    re-pair on a 5xx; in v2 the controller is the single authority and must
+    own it: ONE sentinel restart, no head restart, no budget, no cooldown,
+    an incident with its evidence, the STARTING reason saying so."""
+    caplog.set_level(logging.INFO, logger="controller")
+    world.make_ready()
+    assert world.ctl.worker["rank_joined"] is True             # rank 1 joined to the head that is about to die
+    cooldown_until = world.clock.time() + 600.0                # a cooldown from an earlier recovery is no bar
+    world.ctl.cooldown_until = cooldown_until
+    _head_api_killed_then_docker_restarts_it(world)
+
+    world.tick()
+    # the worker was restarted through the sentinel; the head was NOT restarted; no recovery ran
+    assert world.order == ["sentinel_restart"]
+    assert world.head_restarts == [] and world.ctl.rec.in_progress is False and world.ctl.rec.step == "idle"
+    assert world.ctl.budget.used() == 0 and world.ctl.cooldown_until == cooldown_until
+    assert world.ctl.attempts_total == {**NO_ATTEMPTS, "repaired_worker": 1}
+    assert world.ctl.state == "STARTING", world.ctl.reason
+    assert world.ctl.reason.startswith("head restarted outside the controller; worker re-paired; "), world.ctl.reason
+    assert world.ctl.last_failure_category == "head_restarted_externally"
+    inc = world.ctl.incident
+    assert inc is not None and inc["category"] == "head_restarted_externally"
+    assert inc["ended_at"] is None and inc["attempts"] == 0      # no pair-restart attempt was made
+    snap = world.ctl.snapshot()
+    rep = snap["recovery"]["external_repair"]
+    assert rep["outcome"] == "ok" and rep["incident_id"] == inc["id"] and rep["ended_at"] >= rep["at"]
+    assert set(EXTERNAL_REPAIR_OUTCOMES) >= {"ok", "refused", "unreachable", "failed", "dry_run", "lock_held",
+                                            "lock_unavailable", "not_needed", "no_evidence"}
+    assert set(WORKER_RESTART_OUTCOMES) - {"none", "skipped"} <= set(EXTERNAL_REPAIR_OUTCOMES)
+    assert "rank 1 joined" in rep["detail"] and "before the new head" in rep["detail"]
+    assert rep["head_started_at"] == world.ctl.head["started_at"]
+    assert snap["recovery"]["head_start_origin"] == "external"
+    assert snap["incident"]["id"] == inc["id"]
+    # the worker sentinel's restart was the choreography's POST /restart
+    assert len(world.sentinel.restart_calls) == 1 and world.sentinel.restart_calls[0]["peer"] == "127.0.0.1"
+    # evidence captured into the incident dir, like a recovery, named by the head start
+    tag = f"repair-{utc_stamp(world.ctl.head['started_at'])}"
+    inc_dir = os.path.join(world.cfg.incident_dir, inc["id"])
+    assert sorted(os.listdir(inc_dir)) == sorted(
+        [f"head-logs-{tag}.txt", f"worker-diagnostics-{tag}.txt", f"state-{tag}.json", f"{tag}.json"])
+    assert "worker log line 1" in open(os.path.join(inc_dir, f"worker-diagnostics-{tag}.txt")).read()
+    captured = json.load(open(os.path.join(inc_dir, f"state-{tag}.json")))
+    assert captured["state"] == "STARTING" and captured["reason"].startswith(
+        "head restarted outside the controller; re-pairing the worker")
+    assert json.load(open(os.path.join(inc_dir, f"{tag}.json")))["outcome"] == "ok"
+    # metrics: the bounded category one-hot, the bounded outcome counter, the budget untouched
+    text = world.ctl.metrics_text()
+    assert 'techsara_vllm_last_failure_category{category="head_restarted_externally"} 1' in text
+    assert 'techsara_vllm_recovery_attempts_total{outcome="repaired_worker"} 1' in text
+    assert 'techsara_vllm_recovery_attempts_total{outcome="started"} 0' in text
+    assert "techsara_vllm_restart_budget_remaining 3" in text
+    assert "techsara_vllm_recovery_in_progress 0" in text
+    assert 'techsara_vllm_state{state="STARTING"} 1' in text
+    # the log carries the incident id and the reason
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("NOT performed by the controller" in m for m in msgs)
+    assert any(inc["id"] in m and "head restarted outside the controller" in m for m in msgs)
+    assert any(inc["id"] in m and "worker restarted via the sentinel" in m and "budget untouched" in m for m in msgs)
+    assert not any("RECOVERING" in m for m in msgs)
+
+    # once per head incarnation: the head loads for a while, nothing else is restarted
+    world.tick(3, advance=10)
+    assert world.order == ["sentinel_restart"]
+    assert world.ctl.state == "STARTING" and "worker re-paired" in world.ctl.reason
+
+    # the new head opens its API, the controller proves the pair, the incident ends by the usual path
+    world.head_container.processes = list(HEAD_PROCESSES)
+    world.head.start()
+    world.clock.advance(world.cfg.canary_interval_fast_s + 1)
+    world.settle()
+    assert world.ctl.state == "READY", world.ctl.reason
+    assert "head restarted outside" not in world.ctl.reason
+    for _ in range(3):
+        world.clock.advance(world.cfg.canary_interval_s + 1)
+        world.settle()
+    assert world.ctl.incident["ended_at"] is not None
+    assert world.order == ["sentinel_restart"] and world.head_restarts == []
+    assert world.ctl.attempts_total == {**NO_ATTEMPTS, "repaired_worker": 1}
+
+
+def test_a_spent_recovery_budget_does_not_block_the_re_pair(world):
+    """The budget bounds PAIR restarts (destructive, a head restart each);
+    a worker re-pair after a head start the controller did not perform is
+    what makes that external restart succeed, and costs no head restart."""
+    world.make_ready()
+    for _ in range(world.cfg.recovery_budget):
+        world.ctl.budget.record()
+    assert world.ctl.budget.exhausted()
+    _head_api_killed_then_docker_restarts_it(world)
+    world.tick()
+    assert world.order == ["sentinel_restart"] and world.head_restarts == []
+    assert world.ctl.attempts_total == {**NO_ATTEMPTS, "repaired_worker": 1}
+    assert world.ctl.budget.used() == world.cfg.recovery_budget          # untouched by the re-pair
+    assert "techsara_vllm_restart_budget_remaining 0" in world.ctl.metrics_text()
+    assert world.ctl.snapshot()["recovery"]["external_repair"]["outcome"] == "ok"
+
+
+def test_the_controllers_own_pair_restart_never_triggers_the_external_re_pair(world):
+    """The choreography restarts the worker FIRST and then the head: the head
+    start it observes next is its own (rec.restart_issued_at set, the attempt
+    in progress) and must not be answered with a second worker restart."""
+    world.make_ready()
+    world.heal_on_restart()
+    world.head.mode = "engine_dead"
+    world.tick()
+    assert world.ctl.rec.in_progress and world.ctl.rec.restart_issued_at is not None
+    world.drive_recovery_to_ready()
+    assert world.order == ["sentinel_restart", "docker_restart"]
+    assert world.ctl.snapshot()["recovery"]["head_start_origin"] == "controller"
+    assert world.ctl.snapshot()["recovery"]["external_repair"] is None
+    assert world.ctl.attempts_total == {**NO_ATTEMPTS, "started": 1, "succeeded": 1}
+    assert world.ctl.last_failure_category == "head_engine_dead"
+    for _ in range(3):
+        world.clock.advance(world.cfg.canary_interval_s + 1)
+        world.settle()
+    assert world.order == ["sentinel_restart", "docker_restart"]
+    assert world.ctl.state == "READY"
+
+
+def test_a_head_restart_the_controller_issued_is_its_own_even_when_the_attempt_ended_before_it_was_observed(world):
+    """The attempt fails at stop_pair on a daemon error, but the restart had
+    been applied (a late reply); the moved started_at seen on the next tick
+    is still the controller's own — no re-pair of a worker the choreography
+    just restarted."""
+    world.make_ready()
+    world.heal_on_restart()
+    world.docker.restart_reply_delay_s = 0.0
+    world.head.mode = "engine_dead"
+    world.tick()
+    assert world.ctl.rec.in_progress
+    # the attempt fails right after the head restart was applied
+    world.ctl._fail_attempt("cold_start_timeout", "forced by the test", world.clock.time())
+    assert world.ctl.rec.in_progress is False
+    world.clock.advance(5)
+    world.tick()
+    assert world.ctl.snapshot()["recovery"]["head_start_origin"] == "controller"
+    assert world.order == ["sentinel_restart", "docker_restart"]
+    assert world.ctl.attempts_total["repaired_worker"] == 0
+
+
+def test_a_head_restart_applied_by_the_daemon_after_a_failed_attempt_is_still_the_controllers_own(world):
+    """stop_pair failed (the daemon answered 500 and three re-inspects showed
+    no change), the attempt ended — and then the daemon applied the restart
+    anyway. The moved started_at within OWN_RESTART_WINDOW_S of
+    rec.restart_issued_at is the controller's restart: the worker the
+    choreography restarted seconds earlier is not restarted again."""
+    world.make_ready()
+    world.heal_on_restart()
+    world.docker.fail_restart = True
+    world.head.mode = "engine_dead"
+    world.tick()
+    assert world.ctl.rec.in_progress is False and world.ctl.attempts_total["failed"] == 1
+    assert world.ctl.rec.restart_issued_at is not None and world.order == ["sentinel_restart"]
+    world.clock.advance(30)
+    world.head_container.started_at = world.clock.time()      # applied late by the daemon
+    world.head_container.restart_count += 1
+    world.head.mode = "healthy"
+    world.tick()
+    assert world.ctl.snapshot()["recovery"]["head_start_origin"] == "controller"
+    assert world.ctl.snapshot()["recovery"]["external_repair"] is None
+    assert world.order == ["sentinel_restart"] and world.ctl.attempts_total["repaired_worker"] == 0
+
+
+def test_a_worker_that_already_restarted_after_the_external_head_start_is_left_alone(world):
+    """The worker's own restart policy (or its last-resort tier, or an
+    operator) re-created it after the new head started: it is waiting at the
+    right rendezvous, and restarting it again would only delay the pair."""
+    world.make_ready()
+    _head_api_killed_then_docker_restarts_it(world)
+    world.clock.advance(2)
+    world.sentinel.container["started_at"] = world.clock.time()          # newer than the head's
+    world.sentinel.container["restart_count"] += 1
+    world.sentinel.rank_joined = False                                   # VLLM::Worker, waiting
+    world.tick(3, advance=5)
+    assert world.order == [] and world.sentinel.restart_calls == []
+    assert world.ctl.rec.in_progress is False and world.ctl.attempts_total == NO_ATTEMPTS
+    assert world.ctl.state == "STARTING", world.ctl.reason
+    assert world.ctl.reason.startswith("head restarted outside the controller; worker already re-paired; ")
+    rep = world.ctl.snapshot()["recovery"]["external_repair"]
+    assert rep["outcome"] == "not_needed" and rep["incident_id"] is None
+    assert world.ctl.incident is None and world.ctl.last_failure_category == "none"
+
+
+def test_an_external_head_restart_whose_pair_is_already_up_is_not_re_paired(world):
+    """A head start observed late (the Docker socket was unobservable while
+    it happened) with /health already 200: rank 1 joined, whatever the
+    timestamps say."""
+    world.make_ready()
+    world.heal_on_restart(start_api=True)
+    world.docker.stop()
+    world.tick()
+    assert world.ctl.state == "DEGRADED" and world.ctl.docker_ok is False
+    world.clock.advance(5)
+    world.head_container.started_at = world.clock.time()
+    world.head_container.restart_count += 1
+    world.docker.start()
+    world.clock.advance(200)
+    world.tick()
+    assert world.ctl.snapshot()["recovery"]["head_start_origin"] == "external"
+    assert world.sentinel.restart_calls == [] and world.order == []
+    assert world.ctl.snapshot()["recovery"]["external_repair"]["outcome"] == "not_needed"
+    assert world.ctl.attempts_total == NO_ATTEMPTS
+
+
+def test_the_external_re_pair_is_skipped_and_logged_while_another_actor_holds_the_lock(world, caplog):
+    """cluster-up.sh / cluster-recover.sh hold the engine lock across a pair
+    start: the head start they cause is theirs, and so is the worker — the
+    controller stands aside once, says so, and never comes back for it when
+    the lock frees."""
+    caplog.set_level(logging.INFO, logger="controller")
+    world.make_ready()
+    holder = os.open(world.cfg.lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+    fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        _head_api_killed_then_docker_restarts_it(world)
+        world.tick()
+        assert world.sentinel.restart_calls == [] and world.order == []
+        assert world.ctl.rec.in_progress is False and world.ctl.attempts_total == NO_ATTEMPTS
+        assert world.ctl.state == "STARTING", world.ctl.reason
+        assert world.ctl.reason.startswith(
+            "head restarted outside the controller; worker re-pair skipped (lock held by another actor); ")
+        rep = world.ctl.snapshot()["recovery"]["external_repair"]
+        assert rep["outcome"] == "lock_held" and rep["incident_id"] is None
+        assert world.ctl.incident is None and world.ctl.last_failure_category == "none"
+        msgs = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any("another actor holds the recovery lock" in m and "worker re-pair skipped" in m for m in msgs)
+        assert world.cfg.lock_path not in world.ctl.reason
+    finally:
+        fcntl.flock(holder, fcntl.LOCK_UN)
+        os.close(holder)
+    # the lock frees: still nothing for THIS head start (once per incarnation)
+    world.tick(3, advance=10)
+    assert world.sentinel.restart_calls == [] and world.order == []
+    # the controller's OWN lock is released after a re-pair: the next external start can take it
+    world.clock.advance(5)
+    world.head_container.started_at = world.clock.time()
+    world.head_container.restart_count += 1
+    world.tick()
+    assert world.order == ["sentinel_restart"]
+    probe = os.open(world.cfg.lock_path, os.O_RDWR)
+    try:
+        fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(probe, fcntl.LOCK_UN)
+    finally:
+        os.close(probe)
+
+
+def test_single_node_mode_never_re_pairs_after_an_external_head_restart(world):
+    """No sentinel, no rank 1: an external head restart is a cold start to
+    prove, nothing more."""
+    world.cfg.sentinel_url = ""
+    world.ctl.sentinel.base_url = ""
+    world.ctl.worker["configured"] = False
+    world.cfg.worker_gpu_exporter_url = ""
+    world.head_container.processes = [p for p in world.head_container.processes if "Worker_TP" not in p]
+    world.make_ready()
+    _head_api_killed_then_docker_restarts_it(world)
+    world.tick(3, advance=5)
+    assert world.sentinel.restart_calls == [] and world.order == []
+    assert world.ctl.state == "STARTING", world.ctl.reason
+    assert "head restarted outside" not in world.ctl.reason
+    assert world.ctl.snapshot()["recovery"]["external_repair"] is None
+    assert world.ctl.attempts_total == NO_ATTEMPTS and world.ctl.incident is None
+    assert "techsara_vllm_worker_reachable" not in world.ctl.metrics_text()
+
+
+def test_the_re_pair_waits_for_a_reachable_sentinel_and_uses_the_workers_age_when_the_rank_was_never_seen(world):
+    """The sentinel was down for the whole previous incarnation (rank never
+    reported joined or alive) and is down at the tick the head start is
+    observed: nothing is decided until it answers, and then the worker's age
+    against the new head's is evidence enough on its own."""
+    world.sentinel.stop()
+    world.settle()                                        # proven while the sentinel was unreachable
+    assert world.ctl.proof is not None and world.ctl.worker["rank_joined"] is None
+    assert world.ctl.state == "DEGRADED" and world.ctl._worker_rank_seen_alive is False
+    _head_api_killed_then_docker_restarts_it(world)
+    world.tick(2, advance=5)
+    assert world.ctl.snapshot()["recovery"]["external_repair"] is None     # undecided: nobody to ask
+    world.sentinel.start()
+    world.ctl.sentinel.base_url = world.sentinel.url
+    world.tick(advance=5)
+    assert world.order == ["sentinel_restart"]
+    rep = world.ctl.snapshot()["recovery"]["external_repair"]
+    assert rep["outcome"] == "ok" and "before the new head" in rep["detail"] and "joined" not in rep["detail"]
+    assert world.ctl.attempts_total == {**NO_ATTEMPTS, "repaired_worker": 1}
+
+
+def test_a_refused_re_pair_is_logged_once_and_not_retried_for_that_head_start(world, caplog):
+    """A token mismatch (403) is the operator's to fix (`techsara up`); a
+    second POST could only restart a worker that has just come back."""
+    caplog.set_level(logging.INFO, logger="controller")
+    world.make_ready()
+    world.sentinel.restart_status = 403
+    _head_api_killed_then_docker_restarts_it(world)
+    world.tick(3, advance=5)
+    assert len(world.sentinel.restart_calls) == 1 and world.order == []
+    rep = world.ctl.snapshot()["recovery"]["external_repair"]
+    assert rep["outcome"] == "refused" and rep["incident_id"] == world.ctl.incident["id"]
+    assert world.ctl.attempts_total["repaired_worker"] == 0
+    assert world.ctl.last_failure_category == "head_restarted_externally"
+    assert world.ctl.reason.startswith("head restarted outside the controller; worker re-pair refused; ")
+    msgs = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    assert any("worker re-pair refused" in m and "last-resort healthcheck tier" in m for m in msgs)
+    assert 'techsara_vllm_recovery_attempts_total{outcome="repaired_worker"} 0' in world.ctl.metrics_text()
+
+
+def test_dry_run_logs_the_re_pair_instead_of_restarting_the_worker(world, caplog):
+    caplog.set_level(logging.INFO, logger="controller")
+    world.cfg.dry_run = True
+    world.make_ready()
+    _head_api_killed_then_docker_restarts_it(world)
+    world.tick()
+    assert world.sentinel.restart_calls == [] and world.order == []
+    assert world.ctl.snapshot()["recovery"]["external_repair"]["outcome"] == "dry_run"
+    assert world.ctl.attempts_total["repaired_worker"] == 0
+    assert any("DRY_RUN: would POST" in r.getMessage() and "worker re-pair" in r.getMessage() for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------
@@ -819,7 +1172,8 @@ def test_an_exception_inside_the_choreography_fails_the_attempt_and_releases_the
     world.tick()
     assert world.ctl.rec.in_progress is False
     assert _lock_is_free(world.cfg.lock_path)
-    assert world.ctl.attempts_total == {"started": 1, "succeeded": 0, "failed": 1, "budget_exhausted": 0}
+    assert world.ctl.attempts_total == {"started": 1, "succeeded": 0, "failed": 1, "budget_exhausted": 0,
+                                        "repaired_worker": 0}
     assert world.ctl.rec.last["outcome"] == "failed" and world.ctl.rec.last["step"] == "capture"
     assert world.ctl.rec.last["detail"] == "controller error during capture: RuntimeError"
     assert "not JSON-serialisable" not in json.dumps(world.ctl.snapshot())    # the class, never the text
@@ -1280,7 +1634,8 @@ def test_a_head_restart_answered_late_by_docker_is_re_inspected_not_failed(world
     assert len(world.head_restarts) == 1
     time.sleep(1.0)                                       # let the fake daemon's late reply finish
     world.drive_recovery_to_ready()
-    assert world.ctl.attempts_total == {"started": 1, "succeeded": 1, "failed": 0, "budget_exhausted": 0}
+    assert world.ctl.attempts_total == {"started": 1, "succeeded": 1, "failed": 0, "budget_exhausted": 0,
+                                        "repaired_worker": 0}
 
 
 def test_worker_restart_outcome_is_recorded_per_attempt_and_a_refusal_is_visible(world):

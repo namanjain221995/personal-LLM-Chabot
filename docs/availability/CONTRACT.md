@@ -78,7 +78,8 @@ Rules that must hold everywhere:
 
 `none`, `worker_rank_dead`, `head_engine_dead`, `head_api_dead`,
 `wedged_frozen_tokens`, `canary_timeout`, `canary_http_error`,
-`connect_error`, `budget_exhausted`, `manual`, `cold_start_timeout`.
+`connect_error`, `budget_exhausted`, `manual`, `cold_start_timeout`,
+`head_restarted_externally` (v2: Docker or an operator restarted the head; the controller re-pairs the worker without a pair restart and without spending the budget).
 
 Orchestrator error classes (breaker input, `llm_breaker_failures_total{reason}`):
 `connection`, `readiness`, `request_timeout`, `queue_timeout`, `engine_dead`,
@@ -336,7 +337,7 @@ techsara_vllm_both_ranks_ok                        0/1
 techsara_vllm_container_restart_count{rank="0|1"}
 techsara_vllm_recovery_in_progress                 0/1
 techsara_vllm_recovery_step{step="idle|detect|confirm|capture|stop_pair|wait_load|canary|mark_ready|verify"}  one-hot
-techsara_vllm_recovery_attempts_total{outcome="started|succeeded|failed|budget_exhausted"}   counter
+techsara_vllm_recovery_attempts_total{outcome="started|succeeded|failed|budget_exhausted|repaired_worker"}   counter
 techsara_vllm_restart_budget_remaining
 techsara_vllm_incident_start_timestamp_seconds     0 when none
 techsara_vllm_last_failure_category{category="..."} one-hot over §4

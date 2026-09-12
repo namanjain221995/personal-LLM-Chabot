@@ -29,7 +29,7 @@ cd /path/to/worktree
 /home/techsphere/Documents/project/personal-LLM-Chabot/orchestrator/.venv/bin/python -m pytest monitoring/engine-controller/tests -q
 ```
 
-113 tests, ~70 s (the hung-API, handler-timeout and choreography-heartbeat
+125 tests, ~75 s (the hung-API, handler-timeout and choreography-heartbeat
 cases wait real seconds). The fixture points `MEMINFO_PATH` at a file saying
 60 GiB, so no test depends on the memory of the box it runs on.
 Lint: `ruff check monitoring/engine-controller`. Tests named after a review
@@ -105,7 +105,7 @@ curl -s -X POST -H 'Content-Type: application/json' -d '{"reason":"manual","cate
 
 | method + path | who | answer |
 |---|---|---|
-| `GET /state` | anyone | the §6.2 JSON (plus additive fields: `readiness` (with `participation_probes[]`: per concurrent step-4 completion `ok`, `outcome`, `http_status`, `connect_s`, `ttft_s`, `total_s`, `tokens`, `terminal`), `signals.gpus`, `signals.head_memory` (`available_bytes` — null when unreadable, never 0 — `observed_at`, `min_bytes`, `low`), `head_container.rank_process_alive`, `head_container.docker_ok`, `worker.started_ago_s` (the sentinel's own measure of the worker container's age — a duration on Node 2's clock; null from an older sentinel), `worker.clock_skew_s` (the sentinel's `observed_at` minus the controller's read time: Node 2's clock against Node 1's, what an operator reads when NTP fails), `canary.kind`, `canary.health_at_start`, `canary.started_at`, `canary.in_flight`, `canary.outstanding_s`, `canary.consecutive_timeouts`, `canary.consecutive_http_errors`, `canary.failing_since` (when the first probe of the current failure streak started; null while the canary passes), `recovery.steps`, `recovery.blocked`, `recovery.blocked_detail`, `recovery.manual_pending`, `recovery.worker_restart`, `recovery.verify_successes`, `recovery.last.detail` and `recovery.last.step` (why and where a failed attempt ended — an exception is named by its class only), `last_failure_category`, `cold_start_detail`, `cold_start_seconds`, `recovery_duration_seconds`, `single_node`, `dry_run`). `generated_at` keeps advancing through a blocking recovery step (`CHOREOGRAPHY_HEARTBEAT_S`); every other timestamp is the observation's own. Every error rendered here is a **bounded kind** (`worker.error` ∈ refused/timeout/unreachable/broken/http_NNN/malformed; `head_container.docker_error` ∈ socket_missing/refused/timeout/broken/malformed/api_NNN; `recovery.blocked` ∈ cooldown/lock_held/lock_unavailable/budget_exhausted/head_memory_low) — no socket path, address or exception text |
+| `GET /state` | anyone | the §6.2 JSON (plus additive fields: `readiness` (with `participation_probes[]`: per concurrent step-4 completion `ok`, `outcome`, `http_status`, `connect_s`, `ttft_s`, `total_s`, `tokens`, `terminal`), `signals.gpus`, `signals.head_memory` (`available_bytes` — null when unreadable, never 0 — `observed_at`, `min_bytes`, `low`), `head_container.rank_process_alive`, `head_container.docker_ok`, `worker.started_ago_s` (the sentinel's own measure of the worker container's age — a duration on Node 2's clock; null from an older sentinel), `worker.clock_skew_s` (the sentinel's `observed_at` minus the controller's read time: Node 2's clock against Node 1's, what an operator reads when NTP fails), `canary.kind`, `canary.health_at_start`, `canary.started_at`, `canary.in_flight`, `canary.outstanding_s`, `canary.consecutive_timeouts`, `canary.consecutive_http_errors`, `canary.failing_since` (when the first probe of the current failure streak started; null while the canary passes), `recovery.steps`, `recovery.blocked`, `recovery.blocked_detail`, `recovery.manual_pending`, `recovery.worker_restart`, `recovery.verify_successes`, `recovery.last.detail` and `recovery.last.step` (why and where a failed attempt ended — an exception is named by its class only), `recovery.head_start_origin` ∈ first/controller/external, `recovery.external_repair` (the last worker re-pair decision after an external head start: `head_started_at`, `incident_id`, `at`, `ended_at`, `outcome` ∈ ok/refused/unreachable/failed/dry_run/lock_held/lock_unavailable/not_needed/no_evidence, `detail`; null until one), `last_failure_category`, `cold_start_detail`, `cold_start_seconds`, `recovery_duration_seconds`, `single_node`, `dry_run`). `generated_at` keeps advancing through a blocking recovery step (`CHOREOGRAPHY_HEARTBEAT_S`); every other timestamp is the observation's own. Every error rendered here is a **bounded kind** (`worker.error` ∈ refused/timeout/unreachable/broken/http_NNN/malformed; `head_container.docker_error` ∈ socket_missing/refused/timeout/broken/malformed/api_NNN; `recovery.blocked` ∈ cooldown/lock_held/lock_unavailable/budget_exhausted/head_memory_low) — no socket path, address or exception text |
 | `GET /metrics` | anyone | Prometheus text, every §7.1 v2 name |
 | `GET /healthz` | anyone | `200 ok` (process liveness only) |
 | `POST /recover` | **127.0.0.1 only**, else 403 (the peer is checked *before* the body is read) | body `{"reason":"manual","category":"manual"}` → `202` queued for the next tick, with the `incident` id that will be used; **`429`** `{"reason":"cooldown","retry_after_s":…}` or `{"reason":"recovery budget exhausted", …}` — a manual recovery is subject to the same budget and cooldown as an automatic one (the escalation past them is `scripts/cluster-recover.sh --force` under the engine lock, not this endpoint); `409` if a recovery is in progress. The accepted request is visible in the very next `/state` read (`recovery.manual_pending: true`, `recovery.step: "confirm"`), so a follower never reads a pre-request document |
@@ -204,6 +204,19 @@ Evaluated once per tick, first match wins:
   the controller watched from within 120 s of its beginning (redeployed beside
   an hour-old head, its own first proof is not the head's cold start; the
   series is omitted).
+- **Every head start has an origin** (`recovery.head_start_origin`): `first`
+  (the first start this controller process observed — bookkeeping only),
+  `controller` (its own STOP_STALE_PAIR: the attempt was in progress, the
+  head restart it issued was applied and not yet observed, or the start
+  falls within `OWN_RESTART_WINDOW_S` = 120 s of `rec.restart_issued_at` —
+  a daemon that applied it after the reply timeout and the re-inspects) or `external`
+  (Docker's restart policy after `vllm serve` exited, an operator's `docker
+  restart`). An external start with rank 1 still paired with the previous
+  head is answered with **one worker re-pair per head incarnation** (below):
+  the sentinel's `POST /restart`, never a head restart. What the sentinel
+  said about rank 1 in the incarnation that just ended (`rank_joined`, the
+  seen-alive gate) is read *before* the per-incarnation resets, because it
+  is the evidence that the worker belongs to the dead head.
 
 ### Detection → confirmation (contract §6.3)
 
@@ -294,6 +307,60 @@ budget was spent and an operator (or the last-resort healthcheck) brought the
 pair back. The next failure then opens a new incident id with its own
 evidence directory.
 
+### The worker re-pair after an external head start (drill 5, 2026-09-12)
+
+Drill 5 (`kill -9` of the head's `vllm serve`, 09:55:49Z): Docker's restart
+policy brought the head container back within 5 s, the controller logged
+`head container restarted` and went STARTING — and nothing re-paired the
+worker. Rank 1 (`VLLM::Worker_TP1`) stayed in the dead head's process group,
+the new head waited out `--distributed-timeout-seconds` (300 s) at the
+rendezvous and exited, Docker restarted it again at 10:01:25Z, and only the
+worker's last-resort healthcheck tier (age > 900 s, 8 misses) restarted the
+worker at 10:06:06Z: READY 767 s after the break instead of ~180 s. v1's
+worker healthcheck did this re-pair on a 5xx; v2 made the healthchecks
+report-only and the controller the single authority, so the controller owns
+the case:
+
+```
+observe      head.started_at moved while no recovery is in progress and the controller did not issue
+             the restart (origin = external); cluster mode only (a sentinel is configured)
+evidence     the worker is still the previous head's rank: the sentinel reported rank 1 joined (or the
+             rank process alive) for the incarnation that just ended, OR the worker container is OLDER
+             than the new head (started_ago_s > the head's age — one clock, as trigger 1(a); an older
+             sentinel without the field falls back to two clocks). Waits, undecided, while the
+             sentinel is unreachable (nothing to read, nobody to ask). NOT done when: the new head
+             already answers /health 200 or is proven (rank 1 joined, whatever the timestamps say);
+             the worker started AFTER the new head (its restart policy, its last-resort tier or an
+             operator got there first); nothing says the rank was paired (never reported joined or
+             alive for the previous head and the worker's age is unknown)
+lock         the same flock as a recovery — held by another actor (cluster-up.sh, cluster-recover.sh)
+             → that actor is restarting the pair and owns the worker too: skipped, one WARNING, and
+             not retried for this head start; released right after the POST
+incident     head_restarted_externally opened (or the open one kept), last_failure_category set,
+             the STARTING state published with the reason before anything blocks
+capture      <INCIDENT_DIR>/<id>/head-logs-repair-<head start stamp>.txt, worker-diagnostics-…,
+             state-…json, and repair-<stamp>.json with the outcome afterwards
+restart      sentinel POST /restart, the choreography heartbeat covering the wait; outcome recorded as
+             recovery.external_repair.outcome ∈ ok|refused|unreachable|failed|dry_run|lock_held|
+             lock_unavailable|not_needed|no_evidence; `ok` counts
+             techsara_vllm_recovery_attempts_total{outcome="repaired_worker"}
+after        STARTING carries `head restarted outside the controller; worker re-paired` in its reason
+             until the readiness sequence passes; the incident ends by the usual path (three canary
+             successes). ONCE per head incarnation whatever the sentinel answered: a refused (token
+             mismatch) or unreachable sentinel is logged at ERROR and left to the operator or the
+             worker's last-resort tier — a second POST could only restart a worker that has just come back
+```
+
+Not a pair restart: **no head is touched**, so it is neither charged to
+`RECOVERY_BUDGET` nor blocked by the cooldown, and it counts as neither
+`started` nor an incident `attempt`. It never fires for the controller's own
+choreography (STOP_STALE_PAIR restarts the worker first; the head start it
+then observes is its own even when the attempt failed before the start was
+seen, or the daemon applied the restart late — within 120 s of
+`rec.restart_issued_at`), never in single-node mode, and never while a recovery is in progress
+(an external restart *during* the controller's own `wait_load` is bounded by
+that attempt's cold-start budget, not re-paired).
+
 ### Metrics notes (contract §7.1 v2)
 
 Every name in §7.1 is rendered with only the bounded labels:
@@ -304,7 +371,12 @@ own timestamp) are the v2 additions; `techsara_vllm_recovery_worker_restart{outc
 is an extra one-hot beyond the contract list, and
 `techsara_vllm_head_mem_available_bytes` (the head host's `MemAvailable` as of
 the last tick — the input of the head-memory precondition, and what the
-runbook's memory check reads) is an extra gauge. Series whose value is not known
+runbook's memory check reads) is an extra gauge. The bounded sets carry two
+2026-09-12 additions: the category `head_restarted_externally` (the one-hot
+`techsara_vllm_last_failure_category`, and the incident's category) and the
+outcome `repaired_worker` on `techsara_vllm_recovery_attempts_total` (a
+worker re-pair after an external head start — not a `started` attempt, not
+budgeted, so `techsara_vllm_restart_budget_remaining` does not move). Series whose value is not known
 are **omitted rather than faked**: `head_mem_available_bytes` when
 `/proc/meminfo` cannot be read; `head_container_running` and
 `head_engine_process_alive` when the Docker socket is unobservable (or the
@@ -326,7 +398,10 @@ minted here).
 (`incident=<id> attempt=<n> step=<step>`), per restart, one per readiness
 sequence outcome (with both participation probes' TTFT/total), one WARNING per
 confirmed failure when the head is short of memory before STOP_STALE_PAIR,
-one WARNING **per kind** of Docker API error other than a 404 (`docker API
+one WARNING per worker re-pair after an external head start (with the
+evidence and the incident id; the `head container restarted` INFO says
+whether the start was the controller's own or `NOT performed by the
+controller`), one WARNING **per kind** of Docker API error other than a 404 (`docker API
 unusable: api_400 — …`, with the `DOCKER_API_VERSION` hint for a 4xx; an
 INFO when it answers again — never once per tick, never only at DEBUG: while
 it holds no recovery can start), one ERROR with traceback per exception

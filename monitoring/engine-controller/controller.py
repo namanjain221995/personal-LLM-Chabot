@@ -75,6 +75,18 @@ The rules that shape the code, each from the contract:
   * An incident ends when the engine proves healthy again by ANY path —
     three consecutive completion successes — not only after a recovery this
     program performed.
+  * A head start this program did NOT perform (Docker's restart policy after
+    ``vllm serve`` exited, an operator's ``docker restart``) leaves rank 1
+    paired with a head that no longer exists: it never rejoins the new
+    head's process group, the new head waits out its rendezvous timeout
+    (300 s) and exits, and only the worker's last-resort healthcheck tier
+    re-pairs it minutes later (drill 5, 2026-09-12: READY 767 s after the
+    break instead of ~180). Since v2 made the healthchecks report-only, the
+    re-pair is THIS program's: when ``started_at`` moves outside a recovery
+    and the worker is older than the new head (or was reported joined to
+    the previous one), the sentinel is asked ONCE per head incarnation to
+    restart the worker — under the lock, outside the pair-restart budget and
+    the cooldown (no head is restarted), never in single-node mode.
 
 Standard library only, like the exporter it is modelled on
 (monitoring/exporters/dgx-gpu): it runs on ``python:3.12-slim`` with a
@@ -156,11 +168,23 @@ STEPS: Tuple[str, ...] = (
     "idle", "detect", "confirm", "capture", "stop_pair", "wait_load", "canary", "mark_ready", "verify",
 )
 PROBE_OUTCOMES: Tuple[str, ...] = ("ok", "timeout", "http_error", "connect_error")
-ATTEMPT_OUTCOMES: Tuple[str, ...] = ("started", "succeeded", "failed", "budget_exhausted")
+#: ``repaired_worker`` counts the worker re-pairs after an EXTERNAL head
+#: start (a sentinel restart only, no head restart): not a pair-restart
+#: attempt, so it is neither ``started`` nor charged to the budget.
+ATTEMPT_OUTCOMES: Tuple[str, ...] = ("started", "succeeded", "failed", "budget_exhausted", "repaired_worker")
 #: How the worker half of STOP_STALE_PAIR went, per attempt (a 403 from a
 #: token skew used to be swallowed: the head restarted alone and the stale
 #: worker could never rejoin it).
 WORKER_RESTART_OUTCOMES: Tuple[str, ...] = ("none", "ok", "refused", "unreachable", "failed", "skipped", "dry_run")
+#: How the one worker re-pair owed to an external head start went
+#: (``recovery.external_repair.outcome``): the sentinel's reply, or why it
+#: was not asked — ``lock_held``/``lock_unavailable`` (another actor is
+#: restarting the pair, or the lock directory is missing), ``not_needed``
+#: (the worker had already restarted after the head, or the pair was
+#: already up), ``no_evidence`` (nothing said the worker was paired with the
+#: previous head).
+EXTERNAL_REPAIR_OUTCOMES: Tuple[str, ...] = ("none", "ok", "refused", "unreachable", "failed", "dry_run",
+                                             "lock_held", "lock_unavailable", "not_needed", "no_evidence")
 #: The verdict of readiness step 4 (contract §5 v2).
 PARTICIPATION_VERDICTS: Tuple[str, ...] = ("pending", "ok", "unobserved", "failed", "skipped")
 #: What a cold-start timeout looked like: the API never served a completion
@@ -212,6 +236,13 @@ ENGINE_CORE_TITLE = "VLLM::EngineCore"
 #: controller did not watch (it was redeployed beside a running head): its
 #: cold start is not measured rather than reported as the head's age.
 COLD_START_WATCH_GRACE_S = 120.0
+
+#: A head start within this long after the restart the controller issued
+#: (``rec.restart_issued_at``) is that restart, even when the attempt had
+#: already ended (a daemon that applied it after the reply timeout and the
+#: three re-inspects): ``_restart_head`` itself spans at most t=10 plus the
+#: reply timeout plus the re-inspects, well inside this.
+OWN_RESTART_WINDOW_S = 120.0
 
 #: The choreography heartbeat stops on its own after this long: every
 #: blocking call it covers is bounded by its own timeout (sentinel restart
@@ -1181,6 +1212,26 @@ class Controller:
         self._cold_start_detail_for: Optional[float] = None
         self.cold_start_detail = "none"
 
+        #: Who started the current head incarnation — ``first`` (the first
+        #: start this process observed: bookkeeping only), ``controller``
+        #: (its own STOP_STALE_PAIR) or ``external`` (Docker's restart
+        #: policy, an operator) — and the one worker re-pair an external
+        #: start is owed while rank 1 is still paired with the previous head.
+        self._head_start_origin = "first"
+        #: Set by STOP_STALE_PAIR once the head restart was applied and
+        #: consumed by the next observed start: that start is the
+        #: controller's own even if the attempt ended before it was seen.
+        self._own_restart_pending = False
+        #: What the sentinel said about rank 1 in the incarnation that just
+        #: ended (joined / alive), captured BEFORE the per-incarnation resets.
+        self._prev_rank_paired = ""
+        self._repair_pending = False
+        #: A note carried in the STARTING reason for the current incarnation
+        #: (``head restarted outside the controller; worker re-paired``).
+        self._starting_note = ""
+        #: The last re-pair decision, published as ``recovery.external_repair``.
+        self.external_repair: Optional[dict] = None
+
         self.pending: Dict[str, Pending] = {}
         self.confirmed: Optional[Tuple[str, str, float]] = None  # (category, detail, first_at)
         self.rec = Recovery()
@@ -1223,9 +1274,38 @@ class Controller:
         ``_proven_since_head_start`` compares the proof against the start
         on its own."""
         first = self._prev_head_started_at is None
+        # Who started it, and was rank 1 paired with the incarnation that just
+        # ended? Both are read BEFORE the resets below: ``rank_joined`` and the
+        # seen-alive gate are about the previous head, and the recovery flags
+        # say whether this start is the controller's own STOP_STALE_PAIR
+        # (``rec.restart_issued_at`` set, the attempt in progress — or applied
+        # and not yet observed). Drill 5 (2026-09-12): a head Docker restarted
+        # 5 s after ``vllm serve`` was killed, with the worker still joined to
+        # the dead head's process group.
+        issued = self.rec.restart_issued_at
+        if first:
+            origin = "first"
+        elif (self.rec.in_progress or self._own_restart_pending
+              or (issued is not None and issued - 1.0 <= started_at <= issued + OWN_RESTART_WINDOW_S)):
+            origin = "controller"
+        else:
+            origin = "external"
+        self._own_restart_pending = False
+        paired = ""
+        if not first and self.sentinel.configured:
+            if self.worker.get("rank_joined") is True:
+                paired = "the sentinel reported rank 1 joined (VLLM::Worker_TP1) to the previous head"
+            elif self._worker_rank_seen_alive:
+                paired = "the sentinel reported the rank process alive for the previous head start"
+        self._head_start_origin = origin
+        self._prev_rank_paired = paired
+        self._repair_pending = origin == "external" and self.sentinel.configured
+        self._starting_note = ""
         if not first:
-            log.info("head container restarted: started_at %.0f -> %.0f (restart_count %s)",
-                     self._prev_head_started_at, started_at, info.get("RestartCount"))
+            log.info("head container restarted: started_at %.0f -> %.0f (restart_count %s; %s)",
+                     self._prev_head_started_at, started_at, info.get("RestartCount"),
+                     "the controller's own restart" if origin == "controller" else
+                     "NOT performed by the controller")
         self._prev_head_started_at = started_at
         # The cold-start budget counts from when WE first saw this start:
         # a controller (re)deployed next to an hour-old healthy head must
@@ -2170,21 +2250,22 @@ class Controller:
                       "releasing the recovery lock", rec.incident_id, rec.attempt, rec.step, type(exc).__name__)
         self._fail_attempt(rec.category, f"controller error during {rec.step}: {type(exc).__name__}", now)
 
-    def _incident_path(self) -> str:
-        return os.path.join(self.cfg.incident_dir, self.rec.incident_id or "unknown")
+    def _incident_path(self, incident_id: Optional[str] = None) -> str:
+        return os.path.join(self.cfg.incident_dir, incident_id or self.rec.incident_id or "unknown")
 
-    def _write_evidence(self, name: str, text: str) -> None:
+    def _write_evidence(self, name: str, text: str, incident_id: Optional[str] = None) -> None:
         """One file in the incident directory, owned like the mount so the
         checkout owner can read and clean it. Nothing here may raise: a
         full disk must not stop a recovery."""
-        target = self._incident_path()
+        incident_id = incident_id or self.rec.incident_id
+        target = self._incident_path(incident_id)
         try:
             created = not os.path.isdir(target)
             os.makedirs(target, exist_ok=True)
             if created:
                 _adopt_owner_path(target, self.cfg.incident_dir, log)
         except OSError as exc:
-            log.error("incident=%s cannot create %s: %s", self.rec.incident_id, target, exc)
+            log.error("incident=%s cannot create %s: %s", incident_id, target, exc)
             return
         try:
             path = os.path.join(target, name)
@@ -2192,25 +2273,30 @@ class Controller:
                 fh.write(text)
                 _adopt_owner(fh.fileno(), self.cfg.incident_dir, log)
         except OSError as exc:
-            log.error("incident=%s cannot write %s: %s", self.rec.incident_id, name, exc)
+            log.error("incident=%s cannot write %s: %s", incident_id, name, exc)
 
-    def _capture_diagnostics(self) -> None:
-        """Evidence BEFORE anything is restarted (§6.3)."""
-        rec = self.rec
-        n = rec.attempt
+    def _capture_diagnostics(self, tag: Optional[str] = None, incident_id: Optional[str] = None) -> None:
+        """Evidence BEFORE anything is restarted (§6.3): the head's log tail,
+        the worker's (sentinel /diagnostics) and the /state document, named
+        by the attempt number — or by ``tag`` for a worker re-pair after an
+        external head start (``repair-<head start stamp>``)."""
+        n = tag or str(self.rec.attempt)
+        incident_id = incident_id or self.rec.incident_id
         try:
-            self._write_evidence(f"head-logs-{n}.txt", self.docker.logs(self.cfg.head_container, tail=400, timeout=30.0))
+            self._write_evidence(f"head-logs-{n}.txt", self.docker.logs(self.cfg.head_container, tail=400, timeout=30.0),
+                                 incident_id)
         except DockerError as exc:
-            self._write_evidence(f"head-logs-{n}.txt", f"(unavailable: {exc.kind})\n")
+            self._write_evidence(f"head-logs-{n}.txt", f"(unavailable: {exc.kind})\n", incident_id)
         if self.sentinel.configured:
             try:
-                self._write_evidence(f"worker-diagnostics-{n}.txt", self.sentinel.diagnostics())
+                self._write_evidence(f"worker-diagnostics-{n}.txt", self.sentinel.diagnostics(), incident_id)
             except (ConnectFailed, ReadTimeout) as exc:
-                self._write_evidence(f"worker-diagnostics-{n}.txt", f"(unavailable: {type(exc).__name__})\n")
+                self._write_evidence(f"worker-diagnostics-{n}.txt", f"(unavailable: {type(exc).__name__})\n",
+                                     incident_id)
         with self._snap_lock:
             snap = self._snapshot
-        self._write_evidence(f"state-{n}.json", json.dumps(snap, indent=2, sort_keys=True) + "\n")
-        log.info("incident=%s diagnostics captured in %s", rec.incident_id, self._incident_path())
+        self._write_evidence(f"state-{n}.json", json.dumps(snap, indent=2, sort_keys=True) + "\n", incident_id)
+        log.info("incident=%s diagnostics captured in %s", incident_id, self._incident_path(incident_id))
 
     def _restart_head(self) -> bool:
         """``docker restart`` of the head, and the truth about whether it
@@ -2285,6 +2371,9 @@ class Controller:
         if not self._restart_head():
             log.error("incident=%s head restart failed", rec.incident_id)
             return False
+        # The next head start observed is this restart, even if the attempt
+        # ends before the next tick sees it: never "external".
+        self._own_restart_pending = True
         log.warning("incident=%s head container %s restarted (t=%d)", rec.incident_id, self.cfg.head_container,
                     self.cfg.head_restart_timeout_s)
         return True
@@ -2383,6 +2472,158 @@ class Controller:
         self.rec.verifying = False
         self.rec.step = "idle"
         self.rec.steps.append({"step": "idle", "at": now})
+
+    # ------------------------------------------------------------------
+    # The worker re-pair after an EXTERNAL head start (drill 5, 2026-09-12)
+    # ------------------------------------------------------------------
+
+    #: The STARTING reason's note per re-pair outcome.
+    _REPAIR_NOTES: Dict[str, str] = {
+        "ok": "head restarted outside the controller; worker re-paired",
+        "dry_run": "head restarted outside the controller; worker re-pair (dry run)",
+        "not_needed": "head restarted outside the controller; worker already re-paired",
+        "no_evidence": "head restarted outside the controller; worker not re-paired (no evidence of a stale rank)",
+        "lock_held": "head restarted outside the controller; worker re-pair skipped (lock held by another actor)",
+        "lock_unavailable": "head restarted outside the controller; worker re-pair skipped (recovery lock unavailable)",
+    }
+
+    def _repair_worker_after_external_head_start(self, now: float, mono: float) -> None:
+        """A head start the controller did NOT perform, with rank 1 still
+        paired with the previous head: ask the sentinel ONCE per head
+        incarnation to restart the worker, so a fresh rank 1 is waiting at
+        the new head's rendezvous instead of the new head waiting out its
+        ``--distributed-timeout-seconds`` (300 s), exiting, being restarted
+        by Docker and waiting again until the worker's last-resort
+        healthcheck tier fires (drill 5: READY 767 s after the break instead
+        of ~180 s). v1's worker healthcheck did this on a 5xx; v2 made the
+        healthchecks report-only, so the single authority owns the case.
+
+        Not a pair restart: no head is touched, so neither the budget nor
+        the cooldown applies and nothing is counted as ``started``. The lock
+        still applies — another actor holding it is restarting the pair and
+        owns the worker too: skipped and logged, once. Never in single-node
+        mode (nothing to re-pair), never for the controller's own restart
+        (STOP_STALE_PAIR restarted the worker first), never when the worker
+        already started after the head (its restart policy, its last-resort
+        tier or an operator got there first).
+        """
+        if not self._repair_pending or self.rec.in_progress or not self.sentinel.configured:
+            return
+        head, w = self.head, self.worker
+        started = head.get("started_at")
+        if started is None or not head.get("running") or not self.docker_ok:
+            return                      # between states: the next observed start decides afresh
+        hs = float(started)
+        if self.api.get("health") == 200 or self._proven_since_head_start():
+            # The pair is up: whatever the timestamps say, rank 1 joined.
+            self._finish_repair("not_needed", "the new head already answers /health 200: rank 1 joined", hs, now)
+            return
+        if not w.get("reachable"):
+            return                      # nothing to read and nobody to ask: look again next tick
+        ago = w.get("started_ago_s")
+        ws = w.get("started_at")
+        head_age = now - hs
+        worker_older: Optional[bool]
+        if ago is not None:
+            # One clock (as trigger 1(a)): the sentinel's duration against
+            # the head's age on this node's clock.
+            worker_older = float(ago) > head_age
+            age_detail = (f"the worker container started {float(ago) - head_age:.0f}s before the new head "
+                          f"(sentinel clock)")
+        elif ws is not None:
+            worker_older = float(ws) < hs
+            age_detail = (f"the worker container started {hs - float(ws):.0f}s before the new head "
+                          f"(two clocks: the sentinel sent no started_ago_s)")
+        else:
+            worker_older, age_detail = None, ""
+        if worker_older is False:
+            self._finish_repair("not_needed", "the worker container started after the new head: already re-paired",
+                                hs, now)
+            return
+        evidence = [e for e in (self._prev_rank_paired, age_detail if worker_older else "") if e]
+        if not evidence:
+            self._finish_repair("no_evidence", "nothing says the worker was paired with the previous head (the "
+                                "rank was never reported joined or alive for it and the worker's age is unknown)",
+                                hs, now)
+            return
+        detail = "; ".join(evidence)
+        if not self._try_lock():
+            kind = "lock_unavailable" if self._lock_error else "lock_held"
+            log.warning("head restarted outside the controller (started_at %.0f) and %s, but %s: that actor is "
+                        "restarting the pair — worker re-pair skipped for this head start",
+                        hs, detail, self._lock_error or "another actor holds the recovery lock")
+            self._finish_repair(kind, detail, hs, now)
+            return
+        try:
+            self._perform_worker_repair(detail, hs, now, mono)
+        finally:
+            self._release_lock()
+
+    def _finish_repair(self, outcome: str, detail: str, head_started: float, now: float) -> None:
+        """The decision for this head incarnation, without a sentinel call."""
+        self._repair_pending = False
+        self.external_repair = {"head_started_at": head_started, "incident_id": None, "at": now, "ended_at": now,
+                                "outcome": outcome, "detail": detail}
+        self._starting_note = self._REPAIR_NOTES.get(outcome, "")
+        if outcome not in ("lock_held", "lock_unavailable"):
+            log.info("head restarted outside the controller (started_at %.0f): no worker re-pair — %s",
+                     head_started, detail)
+
+    def _perform_worker_repair(self, detail: str, head_started: float, now: float, mono: float) -> None:
+        """Under the lock: the incident (opened, or the open one), the
+        evidence into its directory, the STARTING state published, the
+        sentinel's ``POST /restart`` with the heartbeat covering the wait,
+        the outcome recorded and counted (``repaired_worker``)."""
+        category = "head_restarted_externally"
+        opened = self.incident is None or self.incident.get("ended_at") is not None
+        if opened:
+            self.incident = {"id": utc_stamp(now), "started_at": now, "category": category, "attempts": 0,
+                             "ended_at": None}
+        incident_id = self.incident["id"]
+        self.last_failure_category = category
+        self.verify_successes = 0
+        tag = f"repair-{utc_stamp(head_started)}"
+        # Once per head incarnation, whatever the sentinel answers: a refused
+        # or unreachable sentinel is the operator's, and a second POST could
+        # only restart a worker that has just come back.
+        self._repair_pending = False
+        self.external_repair = {"head_started_at": head_started, "incident_id": incident_id, "at": now,
+                                "ended_at": None, "outcome": "none", "detail": detail}
+        log.warning("incident=%s %s: head restarted outside the controller (started_at %.0f, restart_count %s) "
+                    "while %s; asking the sentinel to restart the worker so a fresh rank 1 waits at the new "
+                    "head's rendezvous (no head restart; not a budgeted pair restart)",
+                    incident_id, "opened: head_restarted_externally" if opened else "head_restarted_externally",
+                    head_started, self.head.get("restart_count"), detail)
+        self._starting_note = "head restarted outside the controller; re-pairing the worker"
+        self._evaluate(now, mono)
+        self._publish(now)
+        self._start_heartbeat()
+        try:
+            self._capture_diagnostics(tag, incident_id)
+            if self.cfg.dry_run:
+                log.warning("incident=%s DRY_RUN: would POST %s/restart (worker re-pair)", incident_id,
+                            self.sentinel.base_url)
+                outcome, reply = "dry_run", {}
+            else:
+                outcome, reply = self.sentinel.restart()
+        finally:
+            self._stop_heartbeat()
+        if outcome not in EXTERNAL_REPAIR_OUTCOMES:   # the sentinel client's kinds are a subset; keep it bounded
+            outcome = "failed"
+        self.external_repair.update({"outcome": outcome, "ended_at": self.clock.time()})
+        self._starting_note = self._REPAIR_NOTES.get(outcome, f"head restarted outside the controller; worker "
+                                                              f"re-pair {outcome}")
+        if outcome == "ok":
+            self.attempts_total["repaired_worker"] += 1
+            log.warning("incident=%s worker restarted via the sentinel (restarted_at=%s): re-paired with the new "
+                        "head; no head restart, budget untouched (%d/%d used)", incident_id,
+                        reply.get("restarted_at"), self.budget.used(), self.cfg.recovery_budget)
+        elif outcome != "dry_run":
+            log.error("incident=%s worker re-pair %s: rank 1 stays paired with the previous head until the "
+                      "worker's last-resort healthcheck tier restarts it (or an operator does)",
+                      incident_id, outcome)
+        self._write_evidence(f"{tag}.json", json.dumps(self.external_repair, indent=2, sort_keys=True) + "\n",
+                             incident_id)
 
     # ------------------------------------------------------------------
     # Cold-start diagnosis (contract §6.6)
@@ -2533,6 +2774,11 @@ class Controller:
                     why = f"readiness sequence running ({self.canary.elapsed_s(mono):.0f}s)"
                 else:
                     why = "readiness sequence not passed yet"
+                if self._starting_note:
+                    # An operator reading STARTING after a head start the
+                    # controller did not perform must see what was done about
+                    # the worker (drill 5).
+                    why = f"{self._starting_note}; {why}"
                 self._set_state("STARTING", f"{why} ({age:.0f}s since container start; tcp {api.get('tcp')}, "
                                             f"health {health})" if age is not None else why, now)
             else:
@@ -2621,6 +2867,13 @@ class Controller:
         else:
             self._detect(now, mono)
             self._act_on_confirmed(now, mono)
+            if not self.rec.in_progress:
+                try:
+                    self._repair_worker_after_external_head_start(now, mono)
+                except Exception:  # noqa: BLE001 — once per incarnation; never a tick that dies every 5 s
+                    self._repair_pending = False
+                    log.exception("controller error during the worker re-pair after an external head start; "
+                                  "giving it up for this head start")
         self._evaluate(now, mono)
         self._schedule_canary(now, mono)
         self._publish(now)
@@ -2709,6 +2962,8 @@ class Controller:
                 "verify_successes": self.verify_successes,
                 "steps": list(rec.steps[-20:]),
                 "last": rec.last,
+                "head_start_origin": self._head_start_origin,
+                "external_repair": dict(self.external_repair) if self.external_repair else None,
             },
             "last_failure_category": self.last_failure_category,
             "cold_start_detail": self.cold_start_detail,

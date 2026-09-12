@@ -7,6 +7,7 @@
 #   scripts/recovery-tests/engine_failure_drills.sh --only 16 --yes      # 3 restarts, whole budget
 #   scripts/recovery-tests/engine_failure_drills.sh --only 17 --yes      # cache clear, cold start
 #   scripts/recovery-tests/engine_failure_drills.sh --all --yes
+#   scripts/recovery-tests/engine_failure_drills.sh --selftest             # no cluster: the drill-15 sentence round-trip
 #
 # Each drill breaks one thing on purpose and then PROVES the recovery with a
 # deterministic barrier: the controller's /state reaching a named state within
@@ -35,6 +36,14 @@
 # DRILL_EMAIL / DRILL_PASSWORD (VIDEO_SMOKE_EMAIL / VIDEO_SMOKE_PASSWORD are
 # accepted too, as in README.md). Without them those assertions are SKIPPED
 # and say so; the infrastructure half of drill 5 still runs.
+#
+# --selftest runs drill 15's sentence check against a local fake orchestrator
+# (stdlib python3, no cluster, no --yes): the helper's JSON must carry the
+# queued sentence byte for byte. On 2026-09-12 the helper printed it with
+# json.dumps' default ensure_ascii=True -- the em dash came out as \u2014 and
+# the drill's grep -F for the literal sentence failed although the person had
+# read it. The self-test feeds the sentence, as app/sse.py puts it on the wire,
+# through the same parser and the same assertion function the drill uses.
 #
 # Drills 16 and 17 restart the pair on purpose, under the engine lock, and
 # assert the GDN prefill kernel line on BOTH ranks (candidate B,
@@ -113,21 +122,22 @@ list_drills() {
 }
 
 # ------------------------------------------------------------------- options
-ONLY=""; ALL=0; YES=0; DRY=0
+ONLY=""; ALL=0; YES=0; DRY=0; SELFTEST=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --list) list_drills; exit 0 ;;
+    --selftest) SELFTEST=1 ;;
     --only) ONLY="${2:?--only needs a drill number (or a,b,c)}"; shift ;;
     --only=*) ONLY="${1#--only=}" ;;
     --all) ALL=1 ;;
     --yes) YES=1 ;;
     --dry-run) DRY=1 ;;
-    -h|--help) sed -n '2,45p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,51p' "$0"; exit 0 ;;
     *) die "unknown option: $1 (try --list)" ;;
   esac
   shift
 done
-[ -n "$ONLY" ] || [ "$ALL" = 1 ] || { list_drills; echo; die "nothing selected: --only N[,N...] or --all (and --yes)"; }
+[ -n "$ONLY" ] || [ "$ALL" = 1 ] || [ "$SELFTEST" = 1 ] || { list_drills; echo; die "nothing selected: --only N[,N...] or --all (and --yes), or --selftest"; }
 
 # ------------------------------------------------------------------ records
 stamp() { printf '%s / %s IST' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(TZ=Asia/Kolkata date +%H:%M:%S)"; }
@@ -349,12 +359,17 @@ precondition_ready() {
 # line: status, answer length, the engine named on the meta, status lines,
 # error text. Stdlib only, so it runs on the host python3. The session
 # cookie is Secure and pinned by hand for plain http (README.md recipe).
+# The line is UTF-8 with ensure_ascii=False, written to the raw stdout
+# buffer: the shell greps it for the literal queued sentence (an em dash),
+# and json.dumps' default would print that as \u2014 (the 2026-09-12 miss).
 orch_chat() { # orch_chat CONVERSATION INTENT MESSAGE TIMEOUT -> json line
   python3 - "$ORCH_URL" "$1" "$2" "$3" "$4" <<'PY'
 import http.client, json, os, sys, time, urllib.parse
 base, conv, intent, message, timeout = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], float(sys.argv[5])
 u = urllib.parse.urlsplit(base)
 out = {"status": 0, "answer_len": 0, "engine": None, "status_lines": [], "error": None, "events": 0, "elapsed_s": 0.0, "first_token_at": None}
+def emit(o):
+    sys.stdout.buffer.write((json.dumps(o, ensure_ascii=False) + "\n").encode("utf-8")); sys.stdout.buffer.flush()
 def conn():
     return http.client.HTTPConnection(u.hostname, u.port or 80, timeout=timeout)
 try:
@@ -363,7 +378,7 @@ try:
               headers={"Content-Type": "application/json"})
     r = c.getresponse(); r.read()
     if r.status != 200:
-        out["error"] = "login HTTP %d" % r.status; print(json.dumps(out)); sys.exit(0)
+        out["error"] = "login HTTP %d" % r.status; emit(out); sys.exit(0)
     cookie = (r.getheader("set-cookie") or "").split(";", 1)[0].strip()
     c.close()
     body = {"message": message, "messages": [{"role": "user", "content": message}], "session_id": conv, "conversation_id": conv,
@@ -374,7 +389,7 @@ try:
     r = c.getresponse()
     out["status"] = r.status
     if r.status != 200:
-        out["error"] = r.read(400).decode("utf-8", "replace"); out["elapsed_s"] = round(time.time() - t0, 1); print(json.dumps(out)); sys.exit(0)
+        out["error"] = r.read(400).decode("utf-8", "replace"); out["elapsed_s"] = round(time.time() - t0, 1); emit(out); sys.exit(0)
     kind = None; answer = 0
     for raw in r:
         line = raw.decode("utf-8", "replace").rstrip("\r\n")
@@ -395,7 +410,7 @@ try:
     out["elapsed_s"] = round(time.time() - t0, 1)
 except Exception as exc:  # noqa: BLE001 - the summary IS the point
     out["error"] = "%s: %s" % (type(exc).__name__, str(exc)[:200])
-print(json.dumps(out))
+emit(out)
 PY
 }
 orch_assistant_count() { # orch_assistant_count CONVERSATION -> number of assistant rows (or "?")
@@ -418,6 +433,89 @@ except Exception as exc:  # noqa: BLE001
 PY
 }
 json_field() { python3 -c 'import json,sys; d=json.loads(sys.argv[1]); v=d.get(sys.argv[2]); print("" if v is None else v)' "$1" "$2"; }
+# assert_queued_sentence CHAT_JSON: drill 15's sentence check -- the exact
+# sentence, byte for byte, in orch_chat's JSON line. ONE function, so the
+# self-test below exercises the very grep the drill runs.
+assert_queued_sentence() {
+  if printf '%s' "$1" | grep -qF -- "$QUEUED_SENTENCE"; then assert_pass "15: the person read the queued sentence"
+  else assert_fail "15: the queued sentence was not shown (status lines: $(json_field "$1" status_lines))"; fi
+}
+
+# --selftest: orch_chat against a local fake orchestrator that answers the
+# login and streams one chat exactly as app/sse.py does on the wire (UTF-8,
+# the em dash unescaped, a keep-alive comment between frames), then the
+# drill's own assertion on the result. Exit 0 when the sentence round-trips.
+selftest() {
+  local dir pid port out t0 n
+  dir="$(mktemp -d)"
+  python3 - "$QUEUED_SENTENCE" >"$dir/port" 2>"$dir/server.err" <<'PY' &
+import http.server, json, sys
+sentence = sys.argv[1]
+class Fake(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+    def _send(self, status, body, ctype, extra=()):
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        for k, v in extra:
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        if self.path == "/auth/login":
+            self._send(200, b"{}", "application/json", [("Set-Cookie", "ts_session=selftest; Path=/; HttpOnly; Secure")])
+            return
+        if self.path == "/chat":
+            def frame(event, data):
+                return "event: %s\ndata: %s\n\n" % (event, json.dumps(data, ensure_ascii=False))  # app/sse.py's shape
+            body = "".join([
+                frame("meta", {"generation_id": "gen-selftest", "intent_id": "int-selftest", "attempt": 1}),
+                frame("status", {"text": sentence}),
+                ": keep-alive\n\n",
+                frame("meta", {"generation_id": "gen-selftest", "intent_id": "int-selftest", "attempt": 2, "engine": "primary"}),
+                frame("token", {"text": "ok"}),
+                frame("done", {}),
+            ]).encode("utf-8")
+            self._send(200, body, "text/event-stream")
+            return
+        self._send(404, b"", "text/plain")
+srv = http.server.HTTPServer(("127.0.0.1", 0), Fake)
+print(srv.server_address[1], flush=True)
+srv.serve_forever()
+PY
+  pid=$!
+  t0="$(date +%s)"; port=""
+  while [ -z "$port" ]; do
+    port="$(head -n 1 "$dir/port" 2>/dev/null || true)"
+    [ -n "$port" ] && break
+    kill -0 "$pid" 2>/dev/null || { cat "$dir/server.err" >&2; die "selftest: the fake orchestrator did not start"; }
+    [ $(( $(date +%s) - t0 )) -lt 10 ] || { kill "$pid" 2>/dev/null || true; die "selftest: no port from the fake orchestrator in 10s"; }
+    sleep 0.2
+  done
+  section "selftest: drill 15's queued-sentence round-trip (fake orchestrator on 127.0.0.1:$port)"
+  ORCH_URL="http://127.0.0.1:$port"
+  out="$(DRILL_EMAIL=selftest DRILL_PASSWORD=selftest orch_chat conv-selftest int-selftest "hello" 20)"
+  kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
+  rm -rf "$dir"
+  rec "  orch_chat: $out"
+  if [ "$(json_field "$out" status)" = 200 ]; then assert_pass "the fake chat was accepted (HTTP 200)"; else assert_fail "orch_chat did not get HTTP 200: $(json_field "$out" error)"; fi
+  # THE assertion drill 15 runs, on the helper's real output.
+  assert_queued_sentence "$out"
+  if printf '%s' "$out" | grep -qF -- '\u2014'; then assert_fail "the helper still escapes the em dash as \\u2014 (ensure_ascii)"; else assert_pass "the helper emits the sentence as UTF-8, not as a \\u2014 escape"; fi
+  n="$(printf '%s' "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["status_lines"].count(sys.argv[1]))' "$QUEUED_SENTENCE")"
+  if [ "$n" = 1 ]; then assert_pass "status_lines carries the sentence exactly once, decoded"; else assert_fail "status_lines carries the sentence $n times: $(json_field "$out" status_lines)"; fi
+  if [ "$(json_field "$out" answer_len)" = 2 ] && [ "$(json_field "$out" engine)" = primary ] && [ -n "$(json_field "$out" first_token_at)" ]; then assert_pass "tokens, engine and first_token_at parsed through the keep-alive comment"; else assert_fail "the parser lost a frame: $out"; fi
+  # The negative control: the pre-fix shape (json.dumps with its default
+  # ensure_ascii=True) must NOT satisfy the grep -- so the pass above is a
+  # proof of the round-trip, not a tautology.
+  if python3 -c 'import json,sys; print(json.dumps({"status_lines": [sys.argv[1]]}))' "$QUEUED_SENTENCE" | grep -qF -- "$QUEUED_SENTENCE"; then
+    assert_fail "negative control: the ASCII-escaped shape matched the grep, so this self-test proves nothing"
+  else assert_pass "negative control: the ASCII-escaped shape (the 2026-09-12 miss) does not match the grep"; fi
+  printf '\nselftest: %d passed, %d failed\n' "$DRILL_PASSES" "$DRILL_FAILS"
+  [ "$DRILL_FAILS" -eq 0 ]
+}
 
 # ==================================================================== drills
 drill_1() {
@@ -539,7 +637,7 @@ drill_5() {
     # and the same generation resumes when READY returns. A 200 with nothing
     # in it is the blank bubble (RC-2); an error is a broken promise.
     if [ "$sa" = 200 ]; then assert_pass "15: the chat POSTed during the outage was accepted (HTTP 200)"; else assert_fail "15: the chat was refused (HTTP $sa${err_a:+: $err_a})"; fi
-    if printf '%s' "$chat_a" | grep -qF "$QUEUED_SENTENCE"; then assert_pass "15: the person read the queued sentence"; else assert_fail "15: the queued sentence was not shown (status lines: $(json_field "$chat_a" status_lines))"; fi
+    assert_queued_sentence "$chat_a"
     if [ "${la:-0}" -gt 0 ] && [ -z "$err_a" ]; then assert_pass "15: the SAME generation completed after the recovery (${la} chars)";
     elif [ -n "$err_a" ]; then assert_fail "15: the queued chat ended in an error instead of resuming: $err_a";
     else assert_fail "15: the queued chat never completed (HTTP $sa, 0 chars, no error text)"; fi
@@ -547,7 +645,11 @@ drill_5() {
     if [ -n "$first_a" ] && [ -n "$t_ready" ] && [ "$first_a" -ge "$((t_ready - 30))" ]; then assert_pass "15: the first token arrived after READY returned (queued, then resumed)"; else rec "  15: first token at ${first_a:--}, READY since ${t_ready:--} (informational)"; fi
     local seen; seen="$(prom_range_values 'llm_queued_generations' "$t0" "$(date +%s)")"
     if printf ' %s ' "$seen" | grep -qE ' [1-9][0-9]* '; then assert_pass "15: llm_queued_generations rose above 0 during the outage"; else assert_fail "15: llm_queued_generations never rose above 0 (values: '${seen:-<none>}')"; fi
-    if [ "$(prom_scalar 'llm_queued_generations')" = 0 ]; then assert_pass "15: the queue drained after recovery"; else assert_fail "15: llm_queued_generations still $(prom_scalar 'llm_queued_generations')"; fi
+    # A barrier, not an instant read: the orchestrator drops the gauge at the
+    # resume (both halves, app/continuity.py Hold.resume) but Prometheus
+    # scrapes it every 15 s (monitoring/prometheus/prometheus.yml, job
+    # orchestrator), so the value can lag the completed chat by a scrape.
+    if wait_prom_value 'llm_queued_generations' 0 60; then assert_pass "15: the queue drained after recovery (llm_queued_generations back to 0 within 60s)"; else assert_fail "15: llm_queued_generations still $(prom_scalar 'llm_queued_generations') 60s after the queued chat completed"; fi
     # 14: exactly one assistant message for the intent, whichever POST won --
     # and exactly one, not two, after the resume (durability §8.4).
     local count
@@ -729,6 +831,7 @@ drill_13() {
 }
 
 # ------------------------------------------------------------------- main
+if [ "$SELFTEST" = 1 ]; then selftest && exit 0; exit 1; fi
 echo "============================================================"
 echo "ENGINE FAILURE DRILLS   ($(stamp))"
 echo "============================================================"

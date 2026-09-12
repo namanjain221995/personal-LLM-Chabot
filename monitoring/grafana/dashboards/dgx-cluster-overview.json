@@ -1,6 +1,6 @@
 {
   "uid": "dgx-cluster-overview",
-  "title": "DGX Spark AI Cluster \u2014 Live Overview",
+  "title": "DGX Spark AI Cluster — Live Overview",
   "description": "One screen for the whole two-node cluster. Every vLLM number describes the distributed engine as a whole; every hardware number is per physical Spark. The engine state tile comes from a real completion (the engine controller), never from a process being alive; MONITORING_UNKNOWN means the telemetry is missing, not that the model is down.",
   "tags": [
     "dgx-spark"
@@ -108,7 +108,7 @@
       "id": 2,
       "type": "stat",
       "title": "Spark 1",
-      "description": "Head node \u2014 runs the API server and every service.",
+      "description": "Head node — runs the API server and every service.",
       "datasource": {
         "type": "prometheus",
         "uid": "dgx-prometheus"
@@ -184,7 +184,7 @@
       "id": 3,
       "type": "stat",
       "title": "Spark 2",
-      "description": "Worker node \u2014 runs the headless vLLM rank 1.",
+      "description": "Worker node — runs the headless vLLM rank 1.",
       "datasource": {
         "type": "prometheus",
         "uid": "dgx-prometheus"
@@ -260,7 +260,7 @@
       "id": 4,
       "type": "stat",
       "title": "vLLM engine",
-      "description": "THE engine state, from a real completion \u2014 not from a process being alive. cluster:vllm_service_state:code: the controller's state (readiness sequence: non-stream + stream completion, token progress, both GPUs, rank alive), overridden to QUEUEING while the primary is not READY/BUSY/DOWN and the orchestrator holds accepted requests durably queued for it (there is no fallback model: the same generation resumes when READY returns). DOWN stays DOWN with a queue. MONITORING_UNKNOWN means the telemetry is missing or the controller's verdict is stale (its snapshot stamp > 30 s old), never that the model is down \u2014 on 2026-09-11 'UP' here was a lie for five minutes; this tile cannot tell that lie.",
+      "description": "THE engine state, from a real completion — not from a process being alive. cluster:vllm_service_state:code: the controller's state (readiness sequence: non-stream + stream completion, token progress, both GPUs, rank alive), overridden to QUEUEING while the primary is not READY/BUSY/DOWN and the orchestrator holds accepted requests durably queued for it (there is no fallback model: the same generation resumes when READY returns). DOWN stays DOWN with a queue. MONITORING_UNKNOWN means the telemetry is missing or the controller's verdict is stale (its snapshot stamp > 30 s old), never that the model is down — on 2026-09-11 'UP' here was a lie for five minutes; this tile cannot tell that lie.",
       "datasource": {
         "type": "prometheus",
         "uid": "dgx-prometheus"
@@ -363,7 +363,7 @@
       "id": 56,
       "type": "stat",
       "title": "Readiness",
-      "description": "The v2 readiness sequence (CONTRACT \u00a75), as the controller last proved it. 'proven' = the last canary completion succeeded (techsara_vllm_synthetic_success) AND both GPUs were seen working during the last readiness sequence (techsara_vllm_participation_ok). 'GPUs unproven' = the canary passes but the participation probe did not sample both GPU exporters above 30 % \u2014 on a TP=2 engine a finished completion already proves the all-reduce ran on both ranks, so this is a missing exporter sample, not a missing rank; the state tile will read DEGRADED. 'canary failing' = the last canary did not complete. 'unknown' = no canary has run since the controller started, or it is not scraped \u2014 absent is not zero.",
+      "description": "The v2 readiness sequence (CONTRACT §5), as the controller last proved it. 'proven' = the last canary completion succeeded (techsara_vllm_synthetic_success) AND both GPUs were seen working during the last readiness sequence (techsara_vllm_participation_ok). 'GPUs unproven' = the canary passes but the participation probe did not sample both GPU exporters above 30 % — on a TP=2 engine a finished completion already proves the all-reduce ran on both ranks, so this is a missing exporter sample, not a missing rank; the state tile will read DEGRADED. 'canary failing' = the last canary did not complete. 'unknown' = no canary has run since the controller started, or it is not scraped — absent is not zero.",
       "datasource": {
         "type": "prometheus",
         "uid": "dgx-prometheus"
@@ -446,7 +446,7 @@
       "id": 5,
       "type": "stat",
       "title": "Queued requests",
-      "description": "Generations the orchestrator has accepted and durably queued for the main model (llm_queued_generations). Non-zero while the primary is not READY: each one is a person reading \u201cMain model is recovering\u2014your request is safely queued.\u201d and the same generation resumes, exactly once, when READY returns. Orange past zero; VllmRequestsQueued fires after 2 minutes of it. 'none' when the orchestrator is not being scraped \u2014 absent is not zero.",
+      "description": "Generations the orchestrator has accepted and durably queued for the main model (llm_queued_generations). Non-zero while the primary is not READY: each one is a person reading “Main model is recovering—your request is safely queued.” and the same generation resumes, exactly once, when READY returns. Orange past zero; VllmRequestsQueued fires after 2 minutes of it. 'none' when the orchestrator is not being scraped — absent is not zero.",
       "datasource": {
         "type": "prometheus",
         "uid": "dgx-prometheus"
@@ -515,7 +515,7 @@
       "id": 6,
       "type": "stat",
       "title": "Worker rank",
-      "description": "Is the VLLM::Worker_TP1 process alive on Spark 2, per the worker sentinel? A TP=2 completion cannot finish without it. 'unknown' while the sentinel is unreachable \u2014 a 0 nobody can vouch for is not shown as ABSENT.",
+      "description": "Is the VLLM::Worker_TP1 process alive on Spark 2, per the worker sentinel? A TP=2 completion cannot finish without it. 'unknown' while the sentinel is unreachable — a 0 nobody can vouch for is not shown as ABSENT.",
       "datasource": {
         "type": "prometheus",
         "uid": "dgx-prometheus"
@@ -663,7 +663,7 @@
       "id": 8,
       "type": "stat",
       "title": "Canary TTFT",
-      "description": "Time to first token of the last SUCCESSFUL canary (2 tokens, no tools). ~0.4 s idle; the controller calls > 10 s DEGRADED. Shown only while the canary succeeds \u2014 a failed probe's timing is not a measurement.",
+      "description": "Time to first token of the last SUCCESSFUL canary (2 tokens, no tools). ~0.4 s idle; the controller calls > 10 s DEGRADED. Shown only while the canary succeeds — a failed probe's timing is not a measurement.",
       "datasource": {
         "type": "prometheus",
         "uid": "dgx-prometheus"
@@ -1130,7 +1130,7 @@
       "id": 15,
       "type": "stat",
       "title": "Reason",
-      "description": "The controller's last failure category (CONTRACT \u00a74, a bounded set \u2014 never free text). 'none' after a clean start or once VERIFY_STABILITY passes. Stays at the last category until the next incident, so read it with the state tile.",
+      "description": "The controller's last failure category (CONTRACT §4, a bounded set — never free text). 'none' after a clean start or once VERIFY_STABILITY passes. Stays at the last category until the next incident, so read it with the state tile.",
       "datasource": {
         "type": "prometheus",
         "uid": "dgx-prometheus"
@@ -1218,6 +1218,10 @@
                 },
                 "cold_start_timeout": {
                   "text": "cold_start_timeout",
+                  "color": "#F43F5E"
+                },
+                "head_restarted_externally": {
+                  "text": "head restarted externally (worker re-paired)",
                   "color": "#F43F5E"
                 }
               }
@@ -2686,7 +2690,7 @@
     {
       "id": 38,
       "type": "row",
-      "title": "Live correlation \u2014 same time axis, so a tokens/sec dip can be explained",
+      "title": "Live correlation — same time axis, so a tokens/sec dip can be explained",
       "gridPos": {
         "h": 1,
         "w": 24,
@@ -2894,7 +2898,7 @@
       "id": 41,
       "type": "timeseries",
       "title": "GPU utilisation",
-      "description": "Both lines should move together \u2014 they are one distributed model.",
+      "description": "Both lines should move together — they are one distributed model.",
       "datasource": {
         "type": "prometheus",
         "uid": "dgx-prometheus"
@@ -3412,7 +3416,7 @@
       "id": 44,
       "type": "timeseries",
       "title": "GPU temperature",
-      "description": "Correlate a tokens/sec dip here first \u2014 thermal throttling is visible.",
+      "description": "Correlate a tokens/sec dip here first — thermal throttling is visible.",
       "datasource": {
         "type": "prometheus",
         "uid": "dgx-prometheus"

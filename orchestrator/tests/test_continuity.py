@@ -21,7 +21,12 @@ pinned:
 4. a row whose answer already exists is healed and counted
    `duplicate_suppressed`, never run again;
 5. Stop while queued: cancelled, the queue gauge back to zero, the row a
-   Stop, no resume.
+   Stop, no resume;
+6. the gauge's durable half (drill 5, 2026-09-12): a /health snapshot that
+   counted the held row during the outage is superseded by the resume's
+   own re-count — `llm_queued_generations` is 0 the moment the turn
+   resumes, with no /health and no sweep in between — and an older
+   observation never overwrites a fresher one.
 """
 from __future__ import annotations
 
@@ -1287,6 +1292,69 @@ def test_llm_queued_generations_counts_durably_queued_rows(engine, as_user):
 
     asyncio.run(scenario())
     assert _gauge("llm_queued_generations") == 2.0, "re-counted after the sweep"
+
+
+def test_llm_queued_generations_drops_when_the_held_turn_resumes_without_a_health_call(engine):
+    """Drill 5 of 2026-09-12 (.runtime/drills/20260912T095548Z): 'FAIL 15:
+    llm_queued_generations still 1' after the queued turn had resumed and
+    completed on the primary. The gauge is max(holds in this process, rows
+    `queued` in the database); /health's work snapshot had counted the held
+    row during the outage, and the durable half was refreshed only by
+    /health, a sweep and a park — never by the RESUME that moved the row
+    queued → running — so max(0, stale 1) stayed 1 until the next /health.
+    Here: a /health snapshot lands while the turn is queued, READY resumes
+    the same generation, and NO /health (and no sweep) runs afterwards."""
+    from app import health
+
+    async def scenario():
+        _verdict("RECOVERING")
+        async with _async_client() as client:
+            request = asyncio.create_task(client.post("/chat", json=_body("gd-1", "int-gd-1")))
+            await _wait_until(lambda: _status("int-gd-1") == "queued")
+            assert _gauge("llm_queued_generations") == 1.0, "the hold"
+            # /health looks while the row is queued — as the blackbox probe
+            # and the container healthcheck do every 15 s / 30 s.
+            await asyncio.to_thread(lambda: health._publish_work_gauges(health._read_work()))
+            assert _gauge("chat_requests_queued") == 1.0
+            assert continuity.describe()["queued_rows"] == 1
+            assert _gauge("llm_queued_generations") == 1.0
+            _verdict("READY")
+            resp = await request
+            await _wait_until(lambda: _status("int-gd-1") == "completed")
+        return resp
+
+    resp = asyncio.run(scenario())
+    events = _parse_sse(resp.text)
+    assert events[-1][0] == "done"
+    assert [d["text"] for k, d in events if k == "status"] == [continuity.QUEUED_LINE]
+    assert len(engine.stream_calls) == 1
+    assert db.get_chat_request("int-gd-1")["status"] == "completed"
+    # Both halves are down, and the row count was re-read by the resume
+    # itself: no /health and no sweep ran between READY and here.
+    assert continuity.describe()["queued_generations"] == 0
+    assert continuity.describe()["queued_rows"] == 0, "the resume re-counted the durable half"
+    assert _gauge("llm_queued_generations") == 0.0
+    assert "llm_queued_generations 0" in metrics.render()
+
+
+def test_a_stale_durable_count_never_overrides_a_fresher_one():
+    """The durable half has two observers that deliver out of turn — the
+    /health snapshot (read in a thread) and a resume's own re-count. The
+    LATER observation is the truth: a count taken before the resume moved
+    the row must not land after the resume's re-count and pin the gauge."""
+    t0 = time.monotonic() - 10.0  # observations in the recent past; "just now" is newer than all of them
+    continuity.note_durable_queued(1, observed_at=t0)
+    assert _gauge("llm_queued_generations") == 1.0
+    continuity.note_durable_queued(0, observed_at=t0 + 0.5)  # the resume re-counted
+    assert _gauge("llm_queued_generations") == 0.0
+    continuity.note_durable_queued(1, observed_at=t0 + 0.1)  # /health's older read lands late
+    assert _gauge("llm_queued_generations") == 0.0, "an older observation is dropped"
+    assert continuity.describe()["queued_rows"] == 0
+    continuity.note_durable_queued(2)  # "just now": newer than anything before
+    assert _gauge("llm_queued_generations") == 2.0
+    continuity.reset()
+    continuity.note_durable_queued(3, observed_at=t0)  # reset forgets the stamp
+    assert _gauge("llm_queued_generations") == 3.0
 
 
 def test_the_breaker_closing_sweeps_when_the_controller_is_unreachable(engine, as_user, monkeypatch):

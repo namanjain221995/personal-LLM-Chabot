@@ -18,7 +18,7 @@ import time
 import asyncio
 import importlib.util
 import threading
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import httpx
 
@@ -406,8 +406,11 @@ def _live_generation_count() -> int:
     return sum(1 for gen in list(registry.values()) if not getattr(gen, "done", False))
 
 
-def _publish_work_gauges(work: dict) -> None:
-    """Mirror the snapshot into the Prometheus registry.
+def _publish_work_gauges(work: dict, *, observed_at: Optional[float] = None) -> None:
+    """Mirror the snapshot into the Prometheus registry. `observed_at`
+    (time.monotonic, taken BEFORE `_read_work` ran) dates the durable
+    queued count for app/continuity.py, which keeps the later of two
+    observations; None means "just now".
 
     WHY HERE. app/metrics.py is a passive registry: a gauge only exists once
     something sets it, and nothing on the request path knows these numbers —
@@ -454,10 +457,16 @@ def _publish_work_gauges(work: dict) -> None:
         "Chat requests durably queued for the main model (V32 status queued).",
     )
     # …and folded into `llm_queued_generations` (CONTRACT §7.2) as the
-    # durable half of that gauge (app/continuity._publish_queued).
+    # durable half of that gauge (app/continuity._publish_queued). Dated
+    # from before the read: this runs in a thread, and a resume that moved
+    # the row out of `queued` while the read was in flight has re-counted
+    # already — its fresher count wins, this one is dropped (drill 5,
+    # 2026-09-12: the durable half pinned the gauge at 1 after the resume).
     from . import continuity
 
-    continuity.note_durable_queued(int(work.get("chat_requests_queued", 0) or 0))
+    continuity.note_durable_queued(
+        int(work.get("chat_requests_queued", 0) or 0), observed_at=observed_at,
+    )
     artifacts = work.get("artifacts") or {}
     for state in ("queued", "running"):
         metrics.set_gauge(
@@ -547,13 +556,14 @@ def _check_work() -> dict:
         taken_at, cached = _work_cache
         if cached and _time.monotonic() - taken_at < _WORK_TTL_SECONDS:
             return cached
+        observed_at = _time.monotonic()  # before the read: dates the counts (see _publish_work_gauges)
         try:
             work = _read_work()
         except Exception as exc:  # noqa: BLE001 — additive, never fatal
             work = {"status": "unknown", "detail": f"{type(exc).__name__}: {exc}"[:200]}
         else:
             try:
-                _publish_work_gauges(work)
+                _publish_work_gauges(work, observed_at=observed_at)
             except Exception:  # noqa: BLE001 — a metric never breaks a probe
                 pass
         _work_cache = (_time.monotonic(), work)
