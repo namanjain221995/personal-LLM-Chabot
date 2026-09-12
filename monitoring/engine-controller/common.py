@@ -27,7 +27,9 @@ What lives here, and why it is shared rather than duplicated:
     across engines, matched by EXACT name (``vllm:num_requests_waiting`` has
     a sibling ``vllm:num_requests_waiting_by_reason`` that a prefix match
     would fold in); ``parse_gpu_utilization`` — the one dgx-gpu exporter
-    series the participation probe samples (contract §5 v2 step 4).
+    series the participation probe samples (contract §5 v2 step 4);
+    ``read_mem_available`` — the host's ``MemAvailable`` from
+    ``/proc/meminfo`` (the head-memory precondition of a recovery).
   * Every error that can reach ``/state`` carries a bounded ``kind``
     (``DockerUnavailable.kind``, ``DockerError.kind``, ``ConnectFailed.kind``)
     so the published document never repeats a socket path, a host:port or
@@ -596,6 +598,53 @@ def parse_gpu_utilization(text: str, metric: str = "dgx_gpu_utilization_percent"
             continue
         best = value if best is None else max(best, value)
     return best
+
+
+# ---------------------------------------------------------------------------
+# Host memory (the head-memory precondition of a recovery)
+# ---------------------------------------------------------------------------
+
+#: ``/proc/meminfo`` prints kibibytes with a ``kB`` suffix (and nothing else
+#: for the memory rows); anything unexpected is "not observed", never zero.
+_MEMINFO_UNITS: Dict[str, int] = {"kb": 1024, "mb": 1024 * 1024, "gb": 1024 ** 3, "b": 1, "": 1}
+
+
+def parse_meminfo_available(text: str) -> Optional[int]:
+    """``MemAvailable`` of a ``/proc/meminfo`` document, in bytes, or
+    ``None`` when the row is absent or malformed. ``MemAvailable`` is the
+    kernel's own estimate of what a new process can take without swapping
+    (page cache included) — the number the runbook's memory check reads
+    and the one a fresh 21.8 GiB weight load actually has to fit in."""
+    for line in text.splitlines():
+        if not line.startswith("MemAvailable:"):
+            continue
+        parts = line.split(":", 1)[1].split()
+        if not parts:
+            return None
+        try:
+            value = int(parts[0])
+        except ValueError:
+            return None
+        unit = parts[1].lower() if len(parts) > 1 else ""
+        factor = _MEMINFO_UNITS.get(unit)
+        if factor is None or value < 0:
+            return None
+        return value * factor
+    return None
+
+
+def read_mem_available(path: str = "/proc/meminfo") -> Optional[int]:
+    """The host's ``MemAvailable`` in bytes, or ``None`` when it cannot be
+    read. With ``network_mode: host`` and no lxcfs, ``/proc/meminfo``
+    inside the controller's container IS the host's (verified 2026-09-12:
+    identical ``MemTotal``, ``MemAvailable`` within 11 MB of the host's
+    reading at the same instant). Never raises: a missing ``/proc`` must
+    not stop a recovery, it only leaves the precondition unobserved."""
+    try:
+        with open(path, "r", encoding="ascii", errors="replace") as fh:
+            return parse_meminfo_available(fh.read(64 * 1024))
+    except (OSError, ValueError):
+        return None
 
 
 # ---------------------------------------------------------------------------

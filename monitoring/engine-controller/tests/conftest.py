@@ -20,7 +20,14 @@ from common import DockerClient  # noqa: E402
 from controller import Config, Controller  # noqa: E402
 from fakes import (  # noqa: E402
     FakeClock, FakeContainer, FakeDocker, FakeGpuExporter, FakeHead, FakeSentinel, HEAD_PROCESSES, WORKER_PROCESSES,
+    write_meminfo,
 )
+
+#: What the fake /proc/meminfo says unless a test lowers it: comfortably
+#: above the 30 GiB default, so no recovery test depends on THIS box's
+#: memory (a dev box below the threshold would otherwise shift every
+#: restart by one tick).
+FIXTURE_MEM_AVAILABLE_GIB = 60.0
 
 
 @dataclass
@@ -38,6 +45,11 @@ class World:
     tmp: str
 
     # -- driving ----------------------------------------------------------
+
+    def set_mem_available(self, gib: float) -> None:
+        """Rewrite the fake /proc/meminfo the controller reads (kB rows, as
+        the kernel prints them)."""
+        write_meminfo(self.cfg.meminfo_path, gib)
 
     def tick(self, n: int = 1, advance: float = 0.0) -> None:
         for _ in range(n):
@@ -108,6 +120,8 @@ def world(tmp_path):
     worker_gpu = FakeGpuExporter(util=91.0)
     worker_gpu.start()
     os.makedirs(str(tmp_path / "locks"), exist_ok=True)   # the bind mount pre-exists on the host
+    meminfo = str(tmp_path / "meminfo")
+    write_meminfo(meminfo, FIXTURE_MEM_AVAILABLE_GIB)
     cfg = Config(
         head_container="head",
         head_api_url=head.url,
@@ -140,6 +154,7 @@ def world(tmp_path):
         docker_socket=str(tmp_path / "docker.sock"),
         lock_path=str(tmp_path / "locks" / "engine-recovery.lock"),
         incident_dir=str(tmp_path / "incidents"),
+        meminfo_path=meminfo,           # the controller's default is the real /proc/meminfo
         dry_run=False,
     )
     ctl = Controller(cfg, DockerClient(cfg.docker_socket, timeout=5.0), clock)

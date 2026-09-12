@@ -29,14 +29,16 @@ cd /path/to/worktree
 /home/techsphere/Documents/project/personal-LLM-Chabot/orchestrator/.venv/bin/python -m pytest monitoring/engine-controller/tests -q
 ```
 
-91 tests, ~50 s (the hung-API and handler-timeout cases wait real seconds).
+98 tests, ~55 s (the hung-API and handler-timeout cases wait real seconds).
+The fixture points `MEMINFO_PATH` at a file saying 60 GiB, so no test depends
+on the memory of the box it runs on.
 Lint: `ruff check monitoring/engine-controller`. Tests named after a review
 finding (`[blocker]`/`[major]`/`[minor]` in their docstring) reproduce that
 finding's scenario from `docs/availability/REVIEW-FINDINGS-round1.md`.
 
 A read-only smoke test against the live head, without touching anything
 (`DRY_RUN=1` logs the restarts it would perform instead of doing them; the
-readiness sequence still runs three small completions):
+readiness sequence still runs four small completions — the last two at once):
 
 ```sh
 cd monitoring/engine-controller
@@ -91,6 +93,8 @@ curl -s -X POST -H 'Content-Type: application/json' -d '{"reason":"manual","cate
 | `DOCKER_SOCKET` / `DOCKER_API_VERSION` | `/var/run/docker.sock` / `1.53` | |
 | `RECOVERY_LOCK_PATH` | `${LOCK_DIR:-/run/techsara/locks}/engine-recovery.lock` | the host flock shared with `scripts/lib/engine-lock.sh`; `.runtime/locks` is bind-mounted at `LOCK_DIR`. **The directory must pre-exist** (a missing bind mount is refused, never created: a lock inside the container's own overlay is one nobody on the host contends for). The file is created `0666` and chowned to the directory's owner, so the shell wrappers run as the checkout owner can open it |
 | `INCIDENT_DIR` | `${INCIDENTS_DIR:-/run/techsara/incidents}` | one directory per incident id, owned like the mount; `.runtime/incidents` is bind-mounted there |
+| `HEAD_MIN_MEM_AVAILABLE_BYTES` | `32212254720` (30 GiB) | the head-memory precondition of STOP_STALE_PAIR: a fresh model load reads 21.8 GiB of weights through the page cache and the rank allocates ~25 GiB; on 2026-09-12 07:11 IST a new CUDA context failed with `NV_ERR_NO_MEMORY` at that edge while `free` still showed 32 GiB. Below this the controller logs a WARNING with the number and the runbook pointer (`docs/availability/RUNBOOK.md` §7) and holds **one tick** (`recovery.blocked = head_memory_low`), then restarts anyway — a dead engine must still be restarted; the warning is what the operator needs. `0` disables the check; an unreadable `/proc/meminfo` never holds anything |
+| `MEMINFO_PATH` | `/proc/meminfo` | where `MemAvailable` is read. The controller runs with `network_mode: host` and no lxcfs, so the container's `/proc/meminfo` **is** the host's (verified 2026-09-12: identical `MemTotal`, `MemAvailable` within 11 MB of the host's reading at the same instant). Tests point it at a file |
 | `DRY_RUN` | `0` | `1`: every restart is logged instead of performed; everything else (probes, the readiness sequence, the lock) runs for real |
 | `CONTROLLER_LOG_LEVEL` | `INFO` | |
 
@@ -98,7 +102,7 @@ curl -s -X POST -H 'Content-Type: application/json' -d '{"reason":"manual","cate
 
 | method + path | who | answer |
 |---|---|---|
-| `GET /state` | anyone | the §6.2 JSON (plus additive fields: `readiness`, `signals.gpus`, `head_container.rank_process_alive`, `head_container.docker_ok`, `canary.kind`, `canary.health_at_start`, `canary.started_at`, `canary.in_flight`, `canary.outstanding_s`, `recovery.steps`, `recovery.blocked`, `recovery.blocked_detail`, `recovery.manual_pending`, `recovery.worker_restart`, `recovery.verify_successes`, `last_failure_category`, `cold_start_detail`, `cold_start_seconds`, `recovery_duration_seconds`, `single_node`, `dry_run`). Every error rendered here is a **bounded kind** (`worker.error` ∈ refused/timeout/unreachable/broken/http_NNN/malformed; `head_container.docker_error` ∈ socket_missing/refused/timeout/broken/malformed/api_NNN; `recovery.blocked` ∈ cooldown/lock_held/lock_unavailable/budget_exhausted) — no socket path, address or exception text |
+| `GET /state` | anyone | the §6.2 JSON (plus additive fields: `readiness` (with `participation_probes[]`: per concurrent step-4 completion `ok`, `outcome`, `http_status`, `connect_s`, `ttft_s`, `total_s`, `tokens`, `terminal`), `signals.gpus`, `signals.head_memory` (`available_bytes` — null when unreadable, never 0 — `observed_at`, `min_bytes`, `low`), `head_container.rank_process_alive`, `head_container.docker_ok`, `canary.kind`, `canary.health_at_start`, `canary.started_at`, `canary.in_flight`, `canary.outstanding_s`, `recovery.steps`, `recovery.blocked`, `recovery.blocked_detail`, `recovery.manual_pending`, `recovery.worker_restart`, `recovery.verify_successes`, `last_failure_category`, `cold_start_detail`, `cold_start_seconds`, `recovery_duration_seconds`, `single_node`, `dry_run`). Every error rendered here is a **bounded kind** (`worker.error` ∈ refused/timeout/unreachable/broken/http_NNN/malformed; `head_container.docker_error` ∈ socket_missing/refused/timeout/broken/malformed/api_NNN; `recovery.blocked` ∈ cooldown/lock_held/lock_unavailable/budget_exhausted/head_memory_low) — no socket path, address or exception text |
 | `GET /metrics` | anyone | Prometheus text, every §7.1 v2 name |
 | `GET /healthz` | anyone | `200 ok` (process liveness only) |
 | `POST /recover` | **127.0.0.1 only**, else 403 (the peer is checked *before* the body is read) | body `{"reason":"manual","category":"manual"}` → `202` queued for the next tick, with the `incident` id that will be used; **`429`** `{"reason":"cooldown","retry_after_s":…}` or `{"reason":"recovery budget exhausted", …}` — a manual recovery is subject to the same budget and cooldown as an automatic one (the escalation past them is `scripts/cluster-recover.sh --force` under the engine lock, not this endpoint); `409` if a recovery is in progress. The accepted request is visible in the very next `/state` read (`recovery.manual_pending: true`, `recovery.step: "confirm"`), so a follower never reads a pre-request document |
@@ -118,7 +122,7 @@ start** — after every start and recovery, and after any external restart
 | 1 | non-streaming `/v1/chat/completions`, `READINESS_MAX_TOKENS` tokens, `ignore_eos`, thinking off, temperature 0, seed 7 | not 200, no `finish_reason`, error object | `non_stream_ok` |
 | 2 | streaming, same length; TTFT and total latency measured; terminal chunk seen | timeout, error chunk, no terminal chunk | `stream_ok` (this step's timing is what `signals.canary` shows) |
 | 3 | `vllm:generation_tokens_total` on `/metrics` grew by ≥ the tokens steps 1+2 received (up to three re-reads `READINESS_PROGRESS_RETRY_S` apart: the stat logger records an iteration in the same loop turn that streams its last chunk) | `/metrics` unavailable, or the delta is short | `progress_ok`, `tokens_expected`, `tokens_delta` |
-| 4 | a `PARTICIPATION_MAX_TOKENS` streaming completion while both GPU exporters are sampled every `PARTICIPATION_SAMPLE_S` (plus `PARTICIPATION_TAIL_S`); both must reach `PARTICIPATION_MIN_UTIL` at least once | `failed`: both exporters answered and a GPU stayed below the threshold. **`unobserved`** (an exporter never answered, or answered without the series): evidence missing, not evidence against — on a TP=2 engine the finished completion already needed both ranks, so READY is not withheld; the state is DEGRADED with the reason saying so. `skipped`: no exporter configured on a single node (in cluster mode a missing worker exporter is `unobserved`) | `participation`; the maxima in `signals.gpus` and, after a recovery, in `<incident>/readiness-<attempt>.json` |
+| 4 | **two** `PARTICIPATION_MAX_TOKENS` streaming completions started **together** (two sockets, two threads, both started before either is awaited — `PARTICIPATION_PROBES = 2`, deliberately not a knob) while both GPU exporters are sampled every `PARTICIPATION_SAMPLE_S` (plus `PARTICIPATION_TAIL_S`); **both completions must finish** and both GPUs must reach `PARTICIPATION_MIN_UTIL` at least once. Why two at once: the candidate build compiles its multi-sequence GDN prefill kernel in memory at the first scheduler step that batches ≥ 2 prefills (≈ 3 s per rank, on no on-disk cache — contract §6.6, `CANDIDATE-B.md` §2.6); one probe would leave that to the first two real users after READY. The pair runs even when no exporter is configured (the warm-up is theirs; the exporters only decide the verdict) | a probe that does not complete fails the step (`failed_step: participation`, detail `probe k/2 <outcome>: … (n/2 completed; both must)`; no GPU verdict). `failed`: both exporters answered and a GPU stayed below the threshold. **`unobserved`** (an exporter never answered, or answered without the series): evidence missing, not evidence against — on a TP=2 engine the finished completions already needed both ranks, so READY is not withheld; the state is DEGRADED with the reason saying so. `skipped`: no exporter configured on a single node (in cluster mode a missing worker exporter is `unobserved`) | `participation`; per probe `participation_probes[]` (TTFT, total, tokens, outcome); the maxima in `signals.gpus` and, after a recovery, in `<incident>/readiness-<attempt>.json` |
 | 5 | the sentinel reports the rank process alive (`VLLM::Worker` waiting or `VLLM::Worker_TP1` joined) | the sentinel is reachable and says `false` (unreachable = not a block; DEGRADED) | `rank_alive` |
 
 `passed` needs 1–3 true, 4 in {ok, unobserved, skipped}, 5 not false. The
@@ -201,7 +205,11 @@ Every step is written to `/state` (`recovery.step`, `recovery.steps[]`) and
 logged with the incident id before the next begins:
 
 ```
-confirm      lock taken (flock, non-blocking; held by another actor → stand by, retry each tick)
+confirm      head-memory precondition: MemAvailable < HEAD_MIN_MEM_AVAILABLE_BYTES (30 GiB) → WARNING
+             with the number and the runbook pointer, recovery.blocked = head_memory_low for ONE tick,
+             then the same confirmed failure proceeds at the next tick (a manual request is held, not
+             dropped); unobserved memory never holds
+             lock taken (flock, non-blocking; held by another actor → stand by, retry each tick)
              budget recorded, incident opened (or attempts+1 of the open one; an incident older than
              RECOVERY_WINDOW_S is closed and a new id opened), jitter 0–RECOVERY_JITTER_S,
              any probe in flight discarded
@@ -223,7 +231,8 @@ wait_load    /health 200 from the NEW container start (started_at ≥ the time t
 canary       the §5 v2 readiness sequence (fast interval); it counts only if it STARTED after both the
              new container's started_at and the moment stop_pair returned
 mark_ready   lock released, cooldown armed, READY, recovery_duration measured, attempts_total{succeeded},
-             readiness-<attempt>.json (per-step verdicts + GPU maxima) written to the incident dir
+             readiness-<attempt>.json (per-step verdicts, both participation probes' timings, GPU
+             maxima) written to the incident dir
 verify       three consecutive canary successes → incident.ended_at; a failure resets the count
 ```
 
@@ -246,8 +255,12 @@ Every name in §7.1 is rendered with only the bounded labels:
 `techsara_vllm_participation_ok` (both GPUs seen working during the last
 readiness sequence) and `techsara_vllm_generated_at_seconds` (the snapshot's
 own timestamp) are the v2 additions; `techsara_vllm_recovery_worker_restart{outcome}`
-is an extra one-hot beyond the contract list. Series whose value is not known
-are **omitted rather than faked**: `head_container_running` and
+is an extra one-hot beyond the contract list, and
+`techsara_vllm_head_mem_available_bytes` (the head host's `MemAvailable` as of
+the last tick — the input of the head-memory precondition, and what the
+runbook's memory check reads) is an extra gauge. Series whose value is not known
+are **omitted rather than faked**: `head_mem_available_bytes` when
+`/proc/meminfo` cannot be read; `head_container_running` and
 `head_engine_process_alive` when the Docker socket is unobservable (or the
 process was never seen); `worker_container_running`, `worker_rank_alive` and
 `container_restart_count{rank="1"}` when the sentinel did not answer, and all
@@ -265,7 +278,8 @@ minted here).
 `[controller] <UTC time> LEVEL …`. One line per state transition
 (`state A -> B reason=… incident=…`), per DETECT/CONFIRM, per recovery step
 (`incident=<id> attempt=<n> step=<step>`), per restart, one per readiness
-sequence outcome. Nothing private: the probe prompt is a constant, response
+sequence outcome (with both participation probes' TTFT/total), one WARNING per
+confirmed failure when the head is short of memory before STOP_STALE_PAIR. Nothing private: the probe prompt is a constant, response
 text is discarded as read; exception text and paths stay in the log and
 never reach `/state`.
 
@@ -330,7 +344,11 @@ in 4,185 lines of the healthy head log.
 in the cluster overlay; `ROUTER_HEALTH_URL` (was `FALLBACK_HEALTH_URL`) and
 `HEAD_GPU_EXPORTER_URL` pointing at an address the host network can reach
 (the dgx-gpu exporter sits on the `application` bridge: publish `9835` on
-`127.0.0.1` or pass its bridge address).
+`127.0.0.1` or pass its bridge address). `HEAD_MIN_MEM_AVAILABLE_BYTES` is
+not plumbed through compose yet: the 30 GiB default applies until the sre
+workstream adds an `ENGINE_HEAD_MIN_MEM_AVAILABLE_BYTES` pass-through beside
+the other `ENGINE_*` keys. `/proc/meminfo` needs no mount — with
+`network_mode: host` and no lxcfs the container reads the host's.
 
 `vllm-worker-sentinel` (worker): same image, `network_mode: host`,
 `/var/run/docker.sock` RW, `./sentinel.py` and `./common.py` bind-mounted

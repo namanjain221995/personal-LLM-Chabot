@@ -2,6 +2,8 @@
 timestamps, the multiplexed log stream, the exposition renderer, the budget."""
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from common import Budget, MetricsDoc, demux_docker_stream, parse_docker_time, parse_vllm_metrics
@@ -118,3 +120,40 @@ def test_error_kinds_are_bounded_and_never_carry_a_path_or_address(tmp_path):
         fetch("http://127.0.0.1:1/health", connect_timeout=0.5, read_timeout=0.5)
     assert info.value.kind == "refused" and info.value.refused is True
     assert ConnectFailed("x", refused=False).kind == "broken"
+
+
+def test_parse_meminfo_available_reads_the_kernel_shape_and_reports_absence(tmp_path):
+    from common import parse_meminfo_available, read_mem_available
+    from fakes import meminfo_text
+
+    # the kernel's exact shape: right-aligned kB rows, MemAvailable after MemTotal/MemFree
+    text = meminfo_text(45.3)
+    assert parse_meminfo_available(text) == int(45.3 * 1024 * 1024) * 1024
+    assert parse_meminfo_available("MemTotal:       127600812 kB\nMemFree:  33000000 kB\n") is None
+    assert parse_meminfo_available("MemAvailable:   not-a-number kB\n") is None
+    assert parse_meminfo_available("MemAvailable:\n") is None
+    assert parse_meminfo_available("MemAvailable: 12 parsecs\n") is None
+    assert parse_meminfo_available("MemAvailable: 4096\n") == 4096       # unitless = bytes
+    assert parse_meminfo_available("MemAvailable: -1 kB\n") is None
+    assert parse_meminfo_available("MemAvailableX: 5 kB\nMemAvailable: 5 kB\n") == 5 * 1024
+    # the file reader never raises: missing → None
+    assert read_mem_available(str(tmp_path / "missing")) is None
+    path = tmp_path / "meminfo"
+    path.write_text(text, encoding="ascii")
+    assert read_mem_available(str(path)) == int(45.3 * 1024 * 1024) * 1024
+
+
+@pytest.mark.skipif(not os.path.exists("/proc/meminfo"), reason="no procfs")
+def test_read_mem_available_agrees_with_the_real_proc_meminfo():
+    """The controller reads the HOST's /proc/meminfo (host network, no
+    lxcfs — verified 2026-09-12 against `free -b` on this host): the parser
+    must agree with a direct read of the live row."""
+    from common import read_mem_available
+
+    value = read_mem_available()
+    assert value is not None and value > 0
+    with open("/proc/meminfo", encoding="ascii") as fh:
+        row = next(line for line in fh if line.startswith("MemAvailable:"))
+    live_kb = int(row.split()[1])
+    # the kernel's estimate moves between the two reads; a few hundred MB either way
+    assert abs(value - live_kb * 1024) < 2 * 1024 ** 3

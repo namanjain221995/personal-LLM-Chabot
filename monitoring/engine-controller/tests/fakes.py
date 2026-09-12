@@ -308,6 +308,18 @@ class FakeHead:
         #: The dying-stream shape: 200, then an error chunk before any token
         #: (EngineDeadError mid-stream).
         self.error_chunk_in_stream = False
+        #: Concurrency evidence: completions in flight right now, the
+        #: high-water mark, and per-request (start, end) on the real
+        #: monotonic clock — how a test proves two probes overlapped.
+        self.in_flight = 0
+        self.max_in_flight = 0
+        self.spans: List[Tuple[dict, float, float]] = []
+        self._flight_lock = threading.Lock()
+        #: Fail exactly ONE completion: the first request for which this
+        #: predicate is true gets a 500, then the hook clears itself (under
+        #: a lock, so two concurrent matching requests see one failure and
+        #: one success whichever arrives first).
+        self.fail_once_when: Optional[Callable[[dict], bool]] = None
 
     @property
     def url(self) -> str:
@@ -378,6 +390,18 @@ class FakeHead:
                 head.last_request = req
                 if isinstance(req, dict):
                     head.requests.append(req)
+                started = time.monotonic()
+                with head._flight_lock:
+                    head.in_flight += 1
+                    head.max_in_flight = max(head.max_in_flight, head.in_flight)
+                try:
+                    self._complete(req)
+                finally:
+                    with head._flight_lock:
+                        head.in_flight -= 1
+                    head.spans.append((req if isinstance(req, dict) else {}, started, time.monotonic()))
+
+            def _complete(self, req) -> None:
                 if head.mode == "engine_dead":
                     self._send(500, json.dumps({"error": {"message": "EngineDeadError", "type": "InternalServerError"}}).encode())
                     return
@@ -387,6 +411,15 @@ class FakeHead:
                     return
                 if head.completion_status != 200:
                     self._send(head.completion_status, b'{"error":"scripted"}')
+                    return
+                fail_once = False
+                with head._flight_lock:
+                    hook = head.fail_once_when
+                    if hook is not None and isinstance(req, dict) and hook(req):
+                        head.fail_once_when = None
+                        fail_once = True
+                if fail_once:
+                    self._send(500, b'{"error":"scripted once"}')
                     return
                 if head.completion_delay_s:
                     time.sleep(head.completion_delay_s)
@@ -608,5 +641,28 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
+def meminfo_text(available_gib: float, total_gib: float = 121.7) -> str:
+    """A ``/proc/meminfo`` document in the kernel's exact shape (kB rows,
+    right-aligned) with the given ``MemAvailable`` — the rows before and
+    after it are there so a parser that grabs the first number it sees is
+    caught."""
+    total_kb = int(total_gib * 1024 * 1024)
+    avail_kb = int(available_gib * 1024 * 1024)
+    return (
+        f"MemTotal:       {total_kb:>9} kB\n"
+        f"MemFree:        {max(0, avail_kb - 12_000_000):>9} kB\n"
+        f"MemAvailable:   {avail_kb:>9} kB\n"
+        f"Buffers:        {1_000_000:>9} kB\n"
+        f"Cached:         {11_000_000:>9} kB\n"
+        f"SwapTotal:      {16_777_212:>9} kB\n"
+        f"SwapFree:       {4_000_000:>9} kB\n"
+    )
+
+
+def write_meminfo(path: str, available_gib: float) -> None:
+    with open(path, "w", encoding="ascii") as fh:
+        fh.write(meminfo_text(available_gib))
+
+
 __all__ = ["FakeClock", "FakeContainer", "FakeDocker", "FakeGpuExporter", "FakeHead", "FakeSentinel",
-           "HEAD_PROCESSES", "WORKER_PROCESSES", "free_port", "rfc3339"]
+           "HEAD_PROCESSES", "WORKER_PROCESSES", "free_port", "meminfo_text", "rfc3339", "write_meminfo"]

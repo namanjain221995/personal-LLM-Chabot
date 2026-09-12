@@ -27,10 +27,17 @@ The rules that shape the code, each from the contract:
 
   * READY needs the §5 v2 READINESS SEQUENCE to have passed for the head
     container's current start — a non-streaming completion, a streaming one,
-    token-counter progress, both GPUs seen working, the rank alive — and a
-    completion success within the last two probe intervals since. STARTING
-    vs DOWN with no proof yet is decided by the head's ``started_at`` against
-    ``COLD_START_BUDGET_S``.
+    token-counter progress, both GPUs seen working during TWO concurrent
+    256-token completions (which also compile the candidate build's
+    multi-sequence GDN prefill kernel before a user can, §6.6), the rank
+    alive — and a completion success within the last two probe intervals
+    since. STARTING vs DOWN with no proof yet is decided by the head's
+    ``started_at`` against ``COLD_START_BUDGET_S``.
+  * Before STOP_STALE_PAIR the head's ``MemAvailable`` is checked against
+    what a fresh model load needs (``HEAD_MIN_MEM_AVAILABLE_BYTES``, 30 GiB):
+    too little is a WARNING with the number and the runbook pointer and ONE
+    tick of ``recovery.blocked = head_memory_low`` — then the restart goes
+    ahead regardless, because a dead engine must still be restarted.
   * Nothing that happened against a PREVIOUS head incarnation counts: every
     probe records when it started, and a result whose start predates the
     head's ``started_at`` is discarded; every counter resets when
@@ -95,6 +102,7 @@ from common import (
     parse_gpu_utilization,
     parse_vllm_metrics,
     read_json_body,
+    read_mem_available,
     run_periodically,
     scan_compile_error_lines,
     send_json,
@@ -144,8 +152,23 @@ PARTICIPATION_VERDICTS: Tuple[str, ...] = ("pending", "ok", "unobserved", "faile
 #: (``compile`` — the kernel cache, contract §6.6).
 COLD_START_DETAILS: Tuple[str, ...] = ("none", "load", "readiness", "compile")
 #: Why a confirmed failure is not being acted on (``recovery.blocked``).
-BLOCKED_KINDS: Tuple[str, ...] = ("", "cooldown", "lock_held", "lock_unavailable", "budget_exhausted")
+#: ``head_memory_low`` holds for exactly ONE tick (the warning the operator
+#: needs); the others hold for as long as their condition does.
+BLOCKED_KINDS: Tuple[str, ...] = ("", "cooldown", "lock_held", "lock_unavailable", "budget_exhausted",
+                                  "head_memory_low")
 READINESS_STEPS: Tuple[str, ...] = ("non_stream", "stream", "progress", "participation", "rank_alive")
+#: Readiness step 4 sends this many participation completions AT ONCE (two
+#: sockets, started together). One request proves both ranks; two batched
+#: in one step also make the engine compile the candidate build's
+#: multi-sequence GDN prefill kernel — built in memory at the first step
+#: that batches ≥ 2 prefills, ≈ 3 s per rank, covered by no on-disk cache
+#: (contract §6.6, CANDIDATE-B §2.6) — BEFORE the first two real users hit
+#: it after READY. Not a knob: a single probe would silently lose the
+#: warm-up.
+PARTICIPATION_PROBES = 2
+#: Where the runbook's memory check lives; the WARNING points at it.
+HEAD_MEMORY_RUNBOOK = "docs/availability/RUNBOOK.md §7 (Memory check)"
+GIB = 1024 ** 3
 
 #: Which state a CONFIRMED failure maps to while the controller cannot act
 #: on it yet (cooldown, another actor holds the lock, budget spent). A wedge
@@ -222,6 +245,15 @@ class Config:
     docker_api_version: str = "1.53"
     lock_path: str = "/run/techsara/locks/engine-recovery.lock"
     incident_dir: str = "/run/techsara/incidents"
+    #: The head-memory precondition of STOP_STALE_PAIR: a fresh model load
+    #: reads 21.8 GiB of weights and allocates ~25 GiB; on 2026-09-12 07:11
+    #: IST a new CUDA context failed with NV_ERR_NO_MEMORY at the memory
+    #: edge. Below this the controller WARNS for one tick, then restarts
+    #: anyway (a dead engine must still be restarted). 0 disables the check.
+    head_min_mem_available_bytes: int = 30 * GIB
+    #: The host's /proc/meminfo (host network, no lxcfs: the container's
+    #: view is the host's); a test points it at a file.
+    meminfo_path: str = "/proc/meminfo"
     dry_run: bool = False
 
     @classmethod
@@ -272,6 +304,8 @@ class Config:
             docker_api_version=env_str("DOCKER_API_VERSION", "1.53"),
             lock_path=env_str("RECOVERY_LOCK_PATH", os.path.join(lock_dir, "engine-recovery.lock")),
             incident_dir=env_str("INCIDENT_DIR", env_str("INCIDENTS_DIR", "/run/techsara/incidents")),
+            head_min_mem_available_bytes=max(0, env_int("HEAD_MIN_MEM_AVAILABLE_BYTES", 30 * GIB)),
+            meminfo_path=env_str("MEMINFO_PATH", "/proc/meminfo"),
             dry_run=env_bool("DRY_RUN", False),
         )
 
@@ -286,7 +320,11 @@ class ReadinessResult:
     """The §5 v2 sequence, step by step. ``None`` = the step did not run
     (an earlier one failed); ``participation`` is one of
     ``PARTICIPATION_VERDICTS``; ``rank_alive`` is filled in by the
-    controller from the sentinel when the result is harvested."""
+    controller from the sentinel when the result is harvested.
+    ``participation_probes`` holds one entry per concurrent step-4
+    completion (``PARTICIPATION_PROBES`` of them, started together): its
+    outcome, TTFT, total latency and token count — the evidence that the
+    multi-sequence path ran, and how long each request took."""
     non_stream_ok: Optional[bool] = None
     stream_ok: Optional[bool] = None
     progress_ok: Optional[bool] = None
@@ -298,6 +336,7 @@ class ReadinessResult:
     tokens_expected: int = 0
     tokens_delta: Optional[float] = None
     gpus: dict = field(default_factory=dict)
+    participation_probes: List[dict] = field(default_factory=list)
     started_at: float = 0.0
     at: float = 0.0
 
@@ -306,7 +345,8 @@ class ReadinessResult:
             "non_stream_ok": self.non_stream_ok, "stream_ok": self.stream_ok, "progress_ok": self.progress_ok,
             "participation": self.participation, "rank_alive": self.rank_alive, "passed": self.passed,
             "failed_step": self.failed_step, "detail": self.detail, "tokens_expected": self.tokens_expected,
-            "tokens_delta": self.tokens_delta, "started_at": self.started_at, "at": self.at,
+            "tokens_delta": self.tokens_delta, "participation_probes": [dict(p) for p in self.participation_probes],
+            "started_at": self.started_at, "at": self.at,
         }
 
 
@@ -549,6 +589,52 @@ class GpuUtilSampler:
                 "reachable": self.samples > 0}
 
 
+def _probe_doc(index: int, res: CanaryResult) -> dict:
+    """What ``/state`` keeps of one participation probe: counts and timing,
+    never text."""
+    return {"probe": index, "ok": res.ok, "outcome": res.outcome, "http_status": res.http_status,
+            "connect_s": res.connect_s, "ttft_s": res.ttft_s, "total_s": res.total_s, "tokens": res.tokens,
+            "terminal": res.terminal, "detail": res.detail, "started_at": res.started_at, "at": res.at}
+
+
+def run_participation_probes(cfg: Config, clock: Clock, model: str, count: int = PARTICIPATION_PROBES,
+                             runner=run_canary) -> List[CanaryResult]:
+    """``count`` streaming ``PARTICIPATION_MAX_TOKENS`` completions, each on
+    its own socket and thread, all started before any is awaited, all
+    awaited before returning — so the engine sees them in one scheduler
+    step and, on the candidate build, compiles the multi-sequence GDN
+    prefill kernel here rather than under the first two real users. Every
+    thread returns a ``CanaryResult`` (a crash inside one is a result, not
+    an exception): the caller requires all of them to be ``ok``."""
+    results: List[Optional[CanaryResult]] = [None] * count
+
+    def one(i: int) -> None:
+        try:
+            results[i] = runner(cfg, clock, model, max_tokens=cfg.participation_max_tokens, ignore_eos=True)
+        except Exception as exc:  # noqa: BLE001 — a probe bug must not kill the sequence
+            log.exception("participation probe %d crashed", i + 1)
+            wall = clock.time()
+            results[i] = CanaryResult(False, "http_error", "canary_http_error", None, None, None, 0.0, 0, False,
+                                      wall, wall, f"probe crashed: {type(exc).__name__}")
+
+    threads = [threading.Thread(target=one, args=(i,), name=f"participation-{i + 1}", daemon=True)
+               for i in range(count)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        # Each probe bounds itself (connect + read timeouts, and the
+        # CANARY_TIMEOUT_S wall inside run_canary), so this join ends.
+        t.join()
+    out: List[CanaryResult] = []
+    for r in results:
+        if r is None:  # cannot happen (the thread always assigns); a missing probe is a failed one
+            wall = clock.time()
+            r = CanaryResult(False, "http_error", "canary_http_error", None, None, None, 0.0, 0, False,
+                             wall, wall, "no probe result")
+        out.append(r)
+    return out
+
+
 def _metrics_generation_total(cfg: Config, clock: Clock) -> Optional[float]:
     try:
         status, body = fetch(cfg.head_api_url + "/metrics", connect_timeout=cfg.probe_timeout_s,
@@ -571,15 +657,23 @@ def run_readiness_sequence(cfg: Config, clock: Clock, model: str, worker_expecte
          tokens steps 1+2 received (re-read a few times: the stat logger
          records an iteration in the same loop turn that streams its chunk,
          a few milliseconds either way);
-      4. a ``PARTICIPATION_MAX_TOKENS`` streaming completion while both GPU
-         exporters are sampled every ``PARTICIPATION_SAMPLE_S``; both must
-         reach ``PARTICIPATION_MIN_UTIL`` at least once. An exporter that
-         never answered — or, in cluster mode (``worker_expected``), a worker
+      4. ``PARTICIPATION_PROBES`` (two) ``PARTICIPATION_MAX_TOKENS`` streaming
+         completions started TOGETHER on two sockets — so one scheduler
+         step batches ≥ 2 prefills and the candidate build compiles its
+         multi-sequence GDN prefill kernel now, not under the first two
+         real users (contract §6.6) — while both GPU exporters are sampled
+         every ``PARTICIPATION_SAMPLE_S``. BOTH completions must finish
+         (each one's TTFT and total latency is recorded in
+         ``participation_probes``) and both GPUs must reach
+         ``PARTICIPATION_MIN_UTIL`` at least once. An exporter that never
+         answered — or, in cluster mode (``worker_expected``), a worker
          exporter that is not configured at all — makes the verdict
          ``unobserved``: evidence missing, not evidence against, because on
-         a TP=2 engine the finished completion has already proved the
+         a TP=2 engine the finished completions have already proved the
          all-reduce ran on both ranks. Both reachable and one GPU flat is
-         ``failed``. No exporter configured on a single node is ``skipped``.
+         ``failed``. No exporter configured on a single node is ``skipped``
+         — the two completions still run (the kernel warm-up is not about
+         the exporters).
 
     The returned ``CanaryResult`` is the STREAM step's (TTFT, latency, tokens
     — the routine canary's shape) with ``ok`` = every completion succeeded
@@ -633,36 +727,45 @@ def run_readiness_sequence(cfg: Config, clock: Clock, model: str, worker_expecte
         return finish(st, "progress",
                       f"generation_tokens_total grew by {rd.tokens_delta:.0f} for {expected} tokens received")
 
-    # 4. both GPUs participating
+    # 4. two concurrent participation probes — both must finish — while
+    #    both GPUs are sampled. The probes run whether or not an exporter is
+    #    configured: the multi-sequence kernel warm-up is theirs to do, the
+    #    exporters only decide the verdict.
     urls = {"head": cfg.head_gpu_exporter_url, "worker": cfg.worker_gpu_exporter_url}
     factory = sampler_factory or (lambda url: GpuUtilSampler(url, cfg.gpu_util_metric, cfg.participation_sample_s,
                                                               min(1.0, cfg.probe_timeout_s), clock))
     samplers = {node: factory(url) for node, url in urls.items() if url}
+    for s in samplers.values():
+        s.start()
+    probes = run_participation_probes(cfg, clock, model)
+    rd.participation_probes = [_probe_doc(i + 1, r) for i, r in enumerate(probes)]
+    all_ok = all(r.ok for r in probes)
+    if all_ok and samplers:
+        # Real time, not the injectable clock: the exporter's 1.5 s cache
+        # and nvidia-smi's trailing window are on the wall clock.
+        time.sleep(cfg.participation_tail_s)
+    results = {node: s.stop() for node, s in samplers.items()}
+    rd.gpus = {
+        "head_util": (results.get("head") or {}).get("max"),
+        "worker_util": (results.get("worker") or {}).get("max"),
+        "head_samples": (results.get("head") or {}).get("samples"),
+        "worker_samples": (results.get("worker") or {}).get("samples"),
+        "sampled_at": clock.time() if samplers else None,
+    }
+    if not all_ok:
+        # The first probe that did not complete carries the result; the
+        # detail says how the other went, so "one of two hung" reads as such.
+        k, bad = next((i, r) for i, r in enumerate(probes) if not r.ok)
+        done = sum(1 for r in probes if r.ok)
+        return finish(bad, "participation",
+                      f"participation probe {k + 1}/{PARTICIPATION_PROBES} {bad.outcome}: {bad.detail} "
+                      f"({done}/{PARTICIPATION_PROBES} completed; both must)")
     if not samplers and not worker_expected:
         rd.participation = "skipped"
-        rd.gpus = {"head_util": None, "worker_util": None, "sampled_at": None}
     elif not samplers:
         rd.participation = "unobserved"
         rd.detail = "no GPU exporter configured: participation unobserved (the completions finished on a TP=2 engine)"
-        rd.gpus = {"head_util": None, "worker_util": None, "sampled_at": None}
     else:
-        for s in samplers.values():
-            s.start()
-        pp = run_canary(cfg, clock, model, max_tokens=cfg.participation_max_tokens, ignore_eos=True)
-        if pp.ok:
-            # Real time, not the injectable clock: the exporter's 1.5 s cache
-            # and nvidia-smi's trailing window are on the wall clock.
-            time.sleep(cfg.participation_tail_s)
-        results = {node: s.stop() for node, s in samplers.items()}
-        rd.gpus = {
-            "head_util": (results.get("head") or {}).get("max"),
-            "worker_util": (results.get("worker") or {}).get("max"),
-            "head_samples": (results.get("head") or {}).get("samples"),
-            "worker_samples": (results.get("worker") or {}).get("samples"),
-            "sampled_at": clock.time(),
-        }
-        if not pp.ok:
-            return finish(pp, "participation", f"participation probe {pp.outcome}: {pp.detail}")
         unreachable = [node for node, r in results.items() if not r["reachable"]]
         if worker_expected and "worker" not in results:
             unreachable.append("worker (exporter not configured)")
@@ -938,6 +1041,15 @@ class Controller:
         self.router_available = False
         self._router_next_mono: Optional[float] = None
         self.gpus: dict = {"head_util": None, "worker_util": None, "sampled_at": None}
+        #: The host's MemAvailable (bytes) as of the last tick; ``None`` when
+        #: /proc/meminfo could not be read (unobserved, never zero).
+        self.head_memory: dict = {"available_bytes": None, "observed_at": None,
+                                  "min_bytes": cfg.head_min_mem_available_bytes, "low": None}
+        self._meminfo_error_logged = False
+        #: The confirmed failure (category, first_at) the head-memory
+        #: WARNING was already given for: the block lasts one tick per
+        #: confirmation, never longer.
+        self._mem_warned_for: Optional[Tuple[str, float]] = None
 
         self.model_id: str = cfg.canary_model
         self.last_canary: Optional[CanaryResult] = None
@@ -1203,6 +1315,26 @@ class Controller:
         self.router = {"configured": True, "health": status, "observed_at": now}
         self.router_available = status == 200
 
+    def _observe_head_memory(self, now: float) -> None:
+        """The host's ``MemAvailable``, every tick (a 64 KiB read of
+        ``/proc/meminfo``): published as ``signals.head_memory`` and the
+        ``techsara_vllm_head_mem_available_bytes`` gauge, and consulted
+        once per confirmed failure before STOP_STALE_PAIR."""
+        available = read_mem_available(self.cfg.meminfo_path)
+        if available is None and not self._meminfo_error_logged:
+            self._meminfo_error_logged = True
+            log.warning("cannot read MemAvailable from %s: the head-memory precondition is unobserved "
+                        "(never a block)", self.cfg.meminfo_path)
+        elif available is not None:
+            self._meminfo_error_logged = False
+        minimum = self.cfg.head_min_mem_available_bytes
+        self.head_memory = {
+            "available_bytes": available,
+            "observed_at": now if available is not None else self.head_memory.get("observed_at"),
+            "min_bytes": minimum,
+            "low": (available < minimum) if (available is not None and minimum > 0) else None,
+        }
+
     def _harvest_canary(self, now: float) -> None:
         res = self.canary.collect()
         if res is None:
@@ -1289,11 +1421,14 @@ class Controller:
             return
         self._rank_wait_logged = False
         self.proof = {"probe_started_at": res.started_at, "passed_at": res.at, "head_started_at": head_started}
+        probes = " ".join(
+            f"probe{p.get('probe')}=ttft {p.get('ttft_s') if p.get('ttft_s') is not None else -1:.2f}s/"
+            f"total {p.get('total_s') or 0:.2f}s/{p.get('tokens')}tok" for p in rd.participation_probes)
         log.info("readiness sequence passed: non_stream=%s stream=%s progress=%s (delta %s for %d) "
-                 "participation=%s (head %s%%, worker %s%%) rank_alive=%s in %.1fs",
+                 "participation=%s (head %s%%, worker %s%%; %d concurrent %s) rank_alive=%s in %.1fs",
                  rd.non_stream_ok, rd.stream_ok, rd.progress_ok, rd.tokens_delta, rd.tokens_expected,
-                 rd.participation, self.gpus.get("head_util"), self.gpus.get("worker_util"), rd.rank_alive,
-                 res.at - res.started_at)
+                 rd.participation, self.gpus.get("head_util"), self.gpus.get("worker_util"),
+                 len(rd.participation_probes), probes or "(no probes)", rd.rank_alive, res.at - res.started_at)
         if head_started is not None and self._cold_start_measured_for != head_started:
             # cold_start_seconds: head start -> first proof of THAT start,
             # measured once; a DEGRADED->READY flap hours later must not
@@ -1547,6 +1682,8 @@ class Controller:
             if manual:
                 log.warning("manual recovery dropped: recovery budget exhausted")
             return
+        if self._head_memory_low_first_tick(category, first_at, manual, manual_at):
+            return
         if not self._try_lock():
             kind = "lock_unavailable" if self._lock_error else "lock_held"
             self._block(kind, self._lock_error or "another actor holds the recovery lock", category)
@@ -1562,6 +1699,48 @@ class Controller:
         self.rec.blocked = ""
         self.rec.blocked_detail = ""
         self._start_recovery(category, detail, first_at, now, mono)
+
+    # -- the head-memory precondition -----------------------------------
+
+    def _head_memory_low_first_tick(self, category: str, first_at: float, manual: bool,
+                                    manual_at: Optional[float]) -> bool:
+        """The precondition of STOP_STALE_PAIR: is the head short of the
+        memory a fresh model load needs? A fresh load reads 21.8 GiB of
+        weights through the page cache and the rank allocates ~25 GiB; on
+        2026-09-12 07:11 IST a new CUDA context failed with
+        ``NV_ERR_NO_MEMORY`` at exactly that edge while ``free`` still
+        showed 32 GiB. Below ``HEAD_MIN_MEM_AVAILABLE_BYTES`` the controller
+        WARNS with the number and the runbook pointer and holds for ONE
+        tick (``recovery.blocked = head_memory_low``); on the next tick the
+        same confirmed failure proceeds regardless — a dead engine must
+        still be restarted, the warning is what the operator needs — so
+        nothing here can block indefinitely. Unobserved memory (no
+        ``/proc/meminfo``) never blocks. Returns True when this tick is the
+        one being held."""
+        minimum = self.cfg.head_min_mem_available_bytes
+        available = self.head_memory.get("available_bytes")
+        if minimum <= 0 or available is None or available >= minimum:
+            return False
+        ident = (category, float(first_at))
+        if self._mem_warned_for == ident:
+            log.info("head MemAvailable still %.1f GiB (< %.0f GiB) at the next tick: proceeding with the %s "
+                     "recovery anyway — a dead engine must be restarted", available / GIB, minimum / GIB, category)
+            return False
+        self._mem_warned_for = ident
+        detail = f"MemAvailable {available / GIB:.1f} GiB < {minimum / GIB:.0f} GiB"
+        log.warning("head memory low before STOP_STALE_PAIR: MemAvailable %.1f GiB (%d bytes) is below "
+                    "HEAD_MIN_MEM_AVAILABLE_BYTES %.0f GiB — a fresh model load reads 21.8 GiB of weights and "
+                    "allocates ~25 GiB, and on 2026-09-12 07:11 IST a new CUDA context failed with "
+                    "NV_ERR_NO_MEMORY at this edge; see %s. Holding one tick; the %s recovery proceeds at the "
+                    "next tick if the failure is still confirmed",
+                    available / GIB, available, minimum / GIB, HEAD_MEMORY_RUNBOOK, category)
+        self._block("head_memory_low", detail, category)
+        if manual:
+            # The operator's request is held for the same one tick, not dropped.
+            with self._snap_lock:
+                self._manual_pending = True
+                self._manual_requested_at = manual_at
+        return True
 
     # -- the lock -------------------------------------------------------
 
@@ -2103,6 +2282,7 @@ class Controller:
         now = self.clock.time()
         mono = self.clock.mono()
         self._observe_head(now)
+        self._observe_head_memory(now)
         self._observe_api(now)
         self._observe_worker(now)
         self._observe_router(now, mono)
@@ -2140,7 +2320,7 @@ class Controller:
         rd = self.readiness
         base = {"non_stream_ok": None, "stream_ok": None, "progress_ok": None, "participation": "pending",
                 "rank_alive": None, "passed": False, "failed_step": "", "detail": "", "tokens_expected": 0,
-                "tokens_delta": None, "started_at": None, "at": None}
+                "tokens_delta": None, "participation_probes": [], "started_at": None, "at": None}
         if rd is not None:
             base.update(rd.doc())
         base["proven_since_head_start"] = self._proven_since_head_start()
@@ -2180,6 +2360,7 @@ class Controller:
                 "canary": self._canary_doc(),
                 "router": dict(self.router),
                 "gpus": dict(self.gpus),
+                "head_memory": dict(self.head_memory),
             },
             "recovery": {
                 "in_progress": rec.in_progress,
@@ -2298,6 +2479,11 @@ class Controller:
                 "Canary failures since the last success.")
         d.gauge("techsara_vllm_generation_frozen_seconds", eng.get("frozen_seconds") or 0,
                 "Seconds neither token counter moved while requests were running (0 when idle).")
+        mem = sig.get("head_memory") or {}
+        if mem.get("available_bytes") is not None:
+            d.gauge("techsara_vllm_head_mem_available_bytes", mem["available_bytes"],
+                    "The head host's MemAvailable (/proc/meminfo) as of the last tick; the recovery warns below "
+                    "HEAD_MIN_MEM_AVAILABLE_BYTES for one tick, then restarts anyway.")
         if head.get("running") is not None:
             d.gauge("techsara_vllm_head_container_running", int(bool(head["running"])), "Head container running.")
         if head.get("engine_process_alive") is not None:
@@ -2449,14 +2635,19 @@ def main() -> int:
     log.info(
         "listening on %s:%d; head=%s api=%s sentinel=%s token=%s router=%s gpu_exporters=head:%s worker:%s "
         "lock=%s incidents=%s canary=%.0fs/%.0fs timeout=%.0fs frozen=%.0fs cold_start=%.0fs budget=%d/%.0fs "
-        "cooldown=%.0fs poll=%.0fs participation>=%.0f%% dry_run=%s",
+        "cooldown=%.0fs poll=%.0fs participation>=%.0f%% x%d head_min_mem=%s dry_run=%s",
         cfg.bind, cfg.port, cfg.head_container, cfg.head_api_url, cfg.sentinel_url or "(single node)",
         "set" if cfg.sentinel_token else "unset", cfg.router_health_url or "(not configured)",
         "set" if cfg.head_gpu_exporter_url else "unset", "set" if cfg.worker_gpu_exporter_url else "unset (skipped)",
         cfg.lock_path, cfg.incident_dir, cfg.canary_interval_s, cfg.canary_interval_fast_s, cfg.canary_timeout_s,
         cfg.frozen_s, cfg.cold_start_budget_s, cfg.recovery_budget, cfg.recovery_window_s, cfg.recovery_cooldown_s,
-        cfg.poll_s, cfg.participation_min_util, cfg.dry_run,
+        cfg.poll_s, cfg.participation_min_util, PARTICIPATION_PROBES,
+        (f"{cfg.head_min_mem_available_bytes / GIB:.0f}GiB" if cfg.head_min_mem_available_bytes > 0 else "off"),
+        cfg.dry_run,
     )
+    if read_mem_available(cfg.meminfo_path) is None:
+        log.warning("cannot read MemAvailable from %s: the head-memory precondition will stay unobserved",
+                    cfg.meminfo_path)
     if not os.path.isdir(os.path.dirname(cfg.lock_path) or "."):
         log.error("recovery lock directory %s is missing (bind mount?): recoveries will stand by until it exists",
                   os.path.dirname(cfg.lock_path))

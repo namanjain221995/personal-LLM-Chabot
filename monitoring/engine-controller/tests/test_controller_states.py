@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 
 import pytest
 
@@ -125,13 +126,15 @@ def test_ready_only_after_the_readiness_sequence_in_order(world):
     world.tick()
     assert world.ctl.state == "READY", world.ctl.reason
     assert world.ctl.primary_ready is True
-    # the order: non-stream 32 → stream 32 → (token progress) → participation 256
-    assert _shapes(world) == [(False, 32, True), (True, 32, True), (True, 256, True)]
+    # the order: non-stream 32 → stream 32 → (token progress) → TWO participation 256s at once
+    assert _shapes(world) == [(False, 32, True), (True, 32, True), (True, 256, True), (True, 256, True)]
     snap = world.ctl.snapshot()
     rd = snap["readiness"]
     assert rd["non_stream_ok"] is True and rd["stream_ok"] is True and rd["progress_ok"] is True
     assert rd["participation"] == "ok" and rd["rank_alive"] is True and rd["passed"] is True
     assert rd["tokens_expected"] == 64 and rd["tokens_delta"] >= 64
+    assert [p["probe"] for p in rd["participation_probes"]] == [1, 2]
+    assert all(p["ok"] and p["tokens"] == 256 and p["total_s"] > 0 for p in rd["participation_probes"])
     assert rd["proven_since_head_start"] is True
     gpus = snap["signals"]["gpus"]
     assert gpus["head_util"] == 93.0 and gpus["worker_util"] == 91.0 and gpus["sampled_at"] is not None
@@ -232,6 +235,72 @@ def test_readiness_gate_token_progress_blocks_ready(world):
     assert world.ctl.state == "READY", world.ctl.reason
 
 
+def _participation_spans(world):
+    """(start, end) on the real monotonic clock of every 256-token completion."""
+    return sorted((s, e) for req, s, e in world.head.spans if int(req.get("max_tokens") or 0) == 256)
+
+
+def test_participation_probes_are_two_concurrent_requests_started_together(world):
+    """Contract §6.6: the candidate build compiles its multi-sequence GDN
+    prefill kernel at the first step that batches ≥ 2 prefills, so step 4
+    must put two prefills in front of the engine AT ONCE — two sockets,
+    both started before either is awaited — and record both."""
+    world.head.completion_delay_s = 0.3          # real seconds before the first byte of every completion
+    t0 = time.monotonic()
+    world.settle()
+    elapsed = time.monotonic() - t0
+    assert world.ctl.state == "READY", world.ctl.reason
+    spans = _participation_spans(world)
+    assert len(spans) == 2
+    # both were in flight at the same moment: the later start precedes the earlier end
+    assert max(s for s, _ in spans) < min(e for _, e in spans), spans
+    assert world.head.max_in_flight >= 2
+    # …and the step cost one delay, not two (sequential would be ≥ 0.6 s for the pair alone)
+    assert elapsed < 0.3 * 3 + 1.5, elapsed
+    rd = world.ctl.readiness
+    probes = rd.participation_probes
+    assert [p["probe"] for p in probes] == [1, 2]
+    for p in probes:
+        assert p["ok"] is True and p["outcome"] == "ok" and p["tokens"] == 256 and p["terminal"] is True
+        assert p["ttft_s"] is not None and p["ttft_s"] >= 0.25          # the delay is before the first byte
+        assert p["total_s"] >= p["ttft_s"] and p["http_status"] == 200
+    # the evidence reaches /state and survives JSON
+    doc = json.loads(json.dumps(world.ctl.snapshot()))["readiness"]
+    assert len(doc["participation_probes"]) == 2 and doc["participation_probes"][1]["ttft_s"] >= 0.25
+    # the GPU maxima were sampled across both
+    assert world.ctl.snapshot()["signals"]["gpus"] == {"head_util": 93.0, "worker_util": 91.0,
+                                                       "sampled_at": rd.gpus["sampled_at"]}
+
+
+def test_participation_requires_both_probes_to_complete(world):
+    """One of the two 256-token completions fails (a 500, whichever the
+    engine picks up first): the step fails, READY is withheld, the passing
+    one is recorded beside it, and the next sequence passes."""
+    world.head.fail_once_when = lambda req: int(req.get("max_tokens") or 0) == 256
+    world.settle()
+    assert world.ctl.state == "STARTING", world.ctl.reason
+    rd = world.ctl.readiness
+    assert rd.non_stream_ok and rd.stream_ok and rd.progress_ok
+    assert rd.failed_step == "participation" and rd.passed is False
+    assert rd.participation == "pending"                           # no GPU verdict on an incomplete step
+    assert "1/2 completed; both must" in rd.detail and "http_error" in rd.detail
+    assert "readiness sequence failed at participation" in world.ctl.reason
+    # both were sent, both recorded: exactly one ok, one 500
+    assert _shapes(world)[-2:] == [(True, 256, True), (True, 256, True)]
+    assert sorted(p["ok"] for p in rd.participation_probes) == [False, True]
+    bad = next(p for p in rd.participation_probes if not p["ok"])
+    assert bad["outcome"] == "http_error" and bad["http_status"] == 500 and bad["tokens"] == 0
+    good = next(p for p in rd.participation_probes if p["ok"])
+    assert good["tokens"] == 256 and good["total_s"] > 0
+    assert world.ctl.last_canary.outcome == "http_error" and world.ctl.primary_ready is False
+    assert world.head.fail_once_when is None                       # the fake fired exactly once
+    # the sequence is re-run at the fast interval and passes once both complete
+    world.clock.advance(world.cfg.canary_interval_fast_s + 1)
+    world.settle()
+    assert world.ctl.state == "READY", world.ctl.reason
+    assert all(p["ok"] for p in world.ctl.readiness.participation_probes)
+
+
 def test_readiness_gate_participation_failed_blocks_ready_and_records_the_maxima(world):
     """Both exporters answer; the worker GPU never reaches 30 %: 'failed'."""
     world.worker_gpu.util = 3.0
@@ -281,6 +350,10 @@ def test_readiness_participation_skipped_when_no_exporter_is_configured_on_a_sin
     assert rd.participation == "skipped" and rd.passed is True
     assert world.ctl.state == "READY", world.ctl.reason
     assert world.head_gpu.scrapes == 0 and world.worker_gpu.scrapes == 0
+    # the two concurrent completions still run: the kernel warm-up is theirs, not the exporters'
+    assert _shapes(world)[-2:] == [(True, 256, True), (True, 256, True)]
+    assert len(rd.participation_probes) == 2 and all(p["ok"] for p in rd.participation_probes)
+    assert rd.gpus["sampled_at"] is None
 
 
 def test_readiness_participation_is_unobserved_in_cluster_mode_without_a_worker_exporter(world):
@@ -487,9 +560,12 @@ def test_state_document_shape(world):
         assert key in snap
     assert "fallback_available" not in snap
     sig = snap["signals"]
-    for key in ("head_container", "worker", "api", "engine", "canary", "router", "gpus"):
+    for key in ("head_container", "worker", "api", "engine", "canary", "router", "gpus", "head_memory"):
         assert key in sig
     assert "fallback" not in sig
+    assert set(("available_bytes", "observed_at", "min_bytes", "low")) <= set(sig["head_memory"])
+    assert sig["head_memory"]["available_bytes"] == 60 * 1024 ** 3 and sig["head_memory"]["low"] is False
+    assert sig["head_memory"]["min_bytes"] == 30 * 1024 ** 3
     assert set(("running", "health", "restart_count", "started_at", "engine_process_alive", "observed_at")) <= set(sig["head_container"])
     assert set(("reachable", "container_running", "rank_process_alive", "restart_count", "started_at", "last_fault", "observed_at")) <= set(sig["worker"])
     assert set(("tcp", "health", "models", "metrics", "observed_at")) <= set(sig["api"])
@@ -497,7 +573,8 @@ def test_state_document_shape(world):
     assert set(("ok", "http_status", "connect_s", "ttft_s", "total_s", "tokens", "terminal", "error_category", "at", "last_success_at", "consecutive_failures")) <= set(sig["canary"])
     assert set(("configured", "health", "observed_at")) <= set(sig["router"])
     assert set(("head_util", "worker_util", "sampled_at")) <= set(sig["gpus"])
-    assert set(("non_stream_ok", "stream_ok", "progress_ok", "participation", "rank_alive")) <= set(snap["readiness"])
+    assert set(("non_stream_ok", "stream_ok", "progress_ok", "participation", "rank_alive",
+                "participation_probes")) <= set(snap["readiness"])
     rec = snap["recovery"]
     assert set(("in_progress", "step", "attempts_in_window", "budget", "window_s", "cooldown_until", "last",
                 "manual_pending", "worker_restart", "blocked")) <= set(rec)

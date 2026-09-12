@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import logging
 import os
 import re
 import socket
@@ -658,6 +659,123 @@ def test_budget_exhausted_with_a_sentinel_only_trigger_and_a_passing_canary_is_d
     assert world.ctl.state == "DEGRADED" and len(world.head_restarts) == 1
 
 
+# ---------------------------------------------------------------------------
+# The head-memory precondition of STOP_STALE_PAIR
+# ---------------------------------------------------------------------------
+
+GIB = 1024 ** 3
+
+
+def _memory_warnings(caplog):
+    return [r for r in caplog.records if r.levelname == "WARNING" and "head memory low" in r.message]
+
+
+def test_low_head_memory_warns_once_and_delays_the_restart_by_exactly_one_tick(world, caplog):
+    """A fresh model load reads 21.8 GiB of weights and allocates ~25 GiB;
+    on 2026-09-12 07:11 IST a new CUDA context failed with NV_ERR_NO_MEMORY
+    at that edge. Below HEAD_MIN_MEM_AVAILABLE_BYTES the controller warns
+    with the number and the runbook pointer and holds ONE tick — then
+    restarts anyway: a dead engine must still be restarted."""
+    caplog.set_level(logging.INFO, logger="controller")
+    world.make_ready()
+    world.heal_on_restart()
+    world.set_mem_available(17.9)                    # what the head had at 22:10Z on 09-11
+    world.head.mode = "engine_dead"
+
+    world.tick()                                     # tick 1: confirmed, held, warned
+    assert world.ctl.confirmed is not None and world.ctl.confirmed[0] == "head_engine_dead"
+    assert world.ctl.rec.in_progress is False
+    assert world.ctl.rec.blocked == "head_memory_low"
+    assert world.ctl.rec.blocked_detail == "MemAvailable 17.9 GiB < 30 GiB"
+    assert world.ctl.state == "DOWN" and "blocked: head_memory_low" in world.ctl.reason, world.ctl.reason
+    assert world.head_restarts == [] and world.sentinel.restart_calls == []
+    warnings = _memory_warnings(caplog)
+    assert len(warnings) == 1
+    msg = warnings[0].getMessage()
+    assert "17.9 GiB" in msg and str(int(17.9 * 1024 * 1024) * 1024) in msg     # the number, twice
+    assert "30 GiB" in msg and "RUNBOOK.md §7" in msg and "NV_ERR_NO_MEMORY" in msg
+    assert "next tick" in msg
+    snap = world.ctl.snapshot()
+    mem = snap["signals"]["head_memory"]
+    assert mem["available_bytes"] == int(17.9 * 1024 * 1024) * 1024 and mem["low"] is True
+    assert mem["observed_at"] == snap["generated_at"]
+    assert snap["recovery"]["blocked"] == "head_memory_low"
+    assert f"techsara_vllm_head_mem_available_bytes {mem['available_bytes']}" in world.ctl.metrics_text()
+
+    world.tick()                                     # tick 2: still confirmed, still low → proceeds
+    assert world.ctl.rec.in_progress and world.ctl.rec.category == "head_engine_dead"
+    assert world.ctl.rec.blocked == ""
+    assert world.order == ["sentinel_restart", "docker_restart"]
+    assert len(_memory_warnings(caplog)) == 1                      # warned once, not again
+    assert any("proceeding" in r.message and "dead engine" in r.message for r in caplog.records
+               if r.levelname == "INFO")
+    world.drive_recovery_to_ready()
+    assert world.ctl.state == "READY"
+
+    # a NEW confirmed failure gets its own warning and its own one-tick hold
+    world.head.mode = "engine_dead"
+    world.tick()
+    assert world.ctl.rec.in_progress is False and world.ctl.rec.blocked == "head_memory_low"
+    assert len(_memory_warnings(caplog)) == 2
+    world.tick()
+    assert world.ctl.rec.in_progress and len(world.head_restarts) == 2
+
+
+def test_head_memory_ok_unobserved_or_disabled_never_delays_the_restart(world, caplog):
+    # enough memory (the fixture's 60 GiB): the restart is on the confirming tick, no warning
+    world.make_ready()
+    world.heal_on_restart()
+    world.head.mode = "engine_dead"
+    world.tick()
+    assert world.ctl.rec.in_progress and len(world.head_restarts) == 1
+    assert _memory_warnings(caplog) == []
+    world.drive_recovery_to_ready()
+
+    # unobserved (no /proc/meminfo): the signal is null, the metric is omitted, nothing is held
+    world.cfg.meminfo_path = os.path.join(world.tmp, "no-such-meminfo")
+    world.tick()
+    mem = world.ctl.snapshot()["signals"]["head_memory"]
+    assert mem["available_bytes"] is None and mem["low"] is None
+    assert "techsara_vllm_head_mem_available_bytes" not in world.ctl.metrics_text()
+    assert sum(1 for r in caplog.records if "cannot read MemAvailable" in r.message) == 1
+    world.tick(2)
+    assert sum(1 for r in caplog.records if "cannot read MemAvailable" in r.message) == 1   # logged once
+    world.head.mode = "engine_dead"
+    world.tick()
+    assert world.ctl.rec.in_progress and len(world.head_restarts) == 2
+    assert _memory_warnings(caplog) == []
+    world.drive_recovery_to_ready()
+
+    # disabled (HEAD_MIN_MEM_AVAILABLE_BYTES=0): low memory is published but never acted on
+    world.cfg.meminfo_path = os.path.join(world.tmp, "meminfo")
+    world.cfg.head_min_mem_available_bytes = 0
+    world.set_mem_available(5.0)
+    world.head.mode = "engine_dead"
+    world.tick()
+    mem = world.ctl.snapshot()["signals"]["head_memory"]
+    assert mem["available_bytes"] == 5 * GIB and mem["low"] is None and mem["min_bytes"] == 0
+    assert world.ctl.rec.in_progress and len(world.head_restarts) == 3
+    assert _memory_warnings(caplog) == []
+
+
+def test_a_manual_recovery_is_held_one_tick_by_low_head_memory_not_dropped(world, caplog):
+    world.make_ready()
+    world.heal_on_restart()
+    world.set_mem_available(20.0)
+    status, _ = world.ctl.request_manual_recovery()
+    assert status == 202
+    world.tick()
+    assert world.ctl.rec.in_progress is False and world.ctl.rec.blocked == "head_memory_low"
+    assert world.ctl.snapshot()["recovery"]["manual_pending"] is True      # kept, not dropped
+    assert world.head_restarts == [] and len(_memory_warnings(caplog)) == 1
+    world.tick()
+    assert world.ctl.rec.in_progress and world.ctl.rec.category == "manual"
+    assert world.order == ["sentinel_restart", "docker_restart"]
+    assert len(_memory_warnings(caplog)) == 1
+    world.drive_recovery_to_ready()
+    assert world.ctl.state == "READY"
+
+
 def test_jitter_is_applied_before_acting(world):
     world.cfg.recovery_jitter_s = 5.0
     world.make_ready()
@@ -978,7 +1096,7 @@ CONTRACT_METRICS = [
     "techsara_vllm_cold_start_seconds",
     "techsara_vllm_recovery_duration_seconds",
 ]
-EXTRA_METRICS = ["techsara_vllm_recovery_worker_restart"]
+EXTRA_METRICS = ["techsara_vllm_recovery_worker_restart", "techsara_vllm_head_mem_available_bytes"]
 
 ALLOWED_LABELS = {
     "state": set(STATES),
