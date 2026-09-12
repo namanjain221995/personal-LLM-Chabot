@@ -1,5 +1,86 @@
 # Changelog
 
+## Artifact Studio 2: CSV, the file card, generated and pasted data, and the requests that went wrong (2026-09-12)
+
+Three reported failures, each reproduced live on the isolated stack before
+anything was changed: "Create a CSV dataset containing 500 realistic sample
+records …" was answered as a Python script in the chat (`csv` was not a
+format at all); "Create a professional PDF report on AI in Indian
+Businesses … Make it visually professional" after a poem was published as
+**v2 of the poem**, as Word, saying "Updated" (the trailing "make it …"
+turned a creation into an edit); and a pasted 34-row audit table reached
+the model as a 4,000-character prefix with its tabs and newlines collapsed.
+Design and evidence: `docs/artifact-studio/` (`CONTRACT.md` §1–§7b,
+`API.md` "The file reference", `TEST_PLAN.md` §H with the screenshots).
+
+**Intent.** A create verb in the FIRST clause wins over anything a later
+sentence says; `share | provide | deliver` and a bare format list with an
+object create; `csv`, `dataset`, `records` are nouns; `cvs`, `spread
+sheet`, `xlxs`, `powerpint` are recognised; "XLSX, Word, PDF and CSV" is
+honoured in order; questions about formats and requests for code stay
+text; the engine gets the untruncated text. `has_artifacts` counts
+completed rows only, so a failed first attempt no longer turns the retry
+into an edit.
+
+**CSV and the file.** `csv` is a format (`text/csv; charset=utf-8`, RFC
+4180, no BOM, formula leads neutralised with a visible apostrophe, a plain
+negative number left alone, a 200,000-character cell cut at Excel's
+limit); a workbook is delivered as xlsx, one CSV per sheet, and the same
+tables as a landscape Word/PDF document with a repeated header, borders, a
+bold header and highlighted columns from `Sheet.style`. Every file has a
+code-minted `file_id` and a role (primary / companion / data), rows and
+columns counted by reopening it, per-file URLs by id (`/f/{id}`), a grid
+route for csv and xlsx, and a streamed ZIP of the version (`/zip`,
+ZIP_STORED, 64 KiB reads, 200 MB bound). Refs persisted before ids are
+upgraded on the way out; `/file/{format}` and `/sheets` stay as aliases.
+
+**Data by code, not by the model.** A pasted table (tab, pipe, space or
+comma; parsed from the raw text of this and the last three turns) becomes
+a material table the model may only reference (`rows_from`): code copies
+its rows verbatim, blanks included, forward-fills a leading group column
+only on evidence, and records every transformation. "N sample records"
+becomes a generator recipe (ids, names from built-in pools, choices,
+ranges, dates, derived columns, `only_when` blanks, uniqueness) that code
+runs with a fixed seed to make **exactly N rows** — and a recipe the code
+cannot follow becomes one it can, with a note, instead of a failed job. A
+text column asked to be humanised is rewritten in 40-row batches, one
+reply per row, and the original is kept whenever a reply loses a
+timestamp, a quoted span or invents a figure. Requested sections are
+checked against the headings and corrected once at every effort; caps
+never trim a requested section.
+
+**The card.** One card per file (icon, title, "Format · size · 500 rows ·
+11 columns", Download that never opens, a body that opens the panel) under
+a version header with the status, the notes once, and "Download all" when
+there are two or more; legacy `report_files` render through the same card;
+the panel steps through the version's files and the message's versions,
+shows csv and xlsx as a grid (dates as dates), clamps 45–55 % with a 520
+px floor on desktop and is a full sheet under 768 px. The sentence says
+what was done — "Created the CSV dataset with 500 validated records.",
+"Done — I preserved 34 audit rows and created four files. 19 blank source
+fields stay blank; 25 host names were filled from the row above; comments
+were rewritten for clarity without changing the findings." — never
+"Updated" for a new artifact, and never a "Memory updated" chip: fact
+extraction waits behind the intent decision and runs only for
+non-artifact turns.
+
+**Durability.** A lease orphaned by a restart is requeued within 30 s (the
+restart drill found a job stuck until the 30-minute sweep); the transform
+report travels to the render job through `transform.json`; a CSV whose
+rows differ from the generator's count or the renderer's claim is refused
+before publication.
+
+**Evidence.** Backend artifact family 705 tests (private PostgreSQL, real
+renderers); the whole orchestrator suite green; frontend 2126 tests, `tsc`
+clean, lint 0 errors, production build; CI now installs WeasyPrint's
+native libraries and runs the PDF suites it had been skipping (45 skips
+→ listed with `-rs`). End to end on the isolated stack with the real
+model: A (500 rows, 11 s), B (new artifact, 4-page PDF, every section), C
+(four files + ZIP, 20 s), D (four questions stay text), E (v2/v3
+"Updated", v4 "Converted"), and the restart drill (published 26 s after
+the restart). Merged `origin/Jayesh` (query tracking and the evaluation
+pipeline, V32) into `dev` on the way.
+
 ## Artifact Studio: a sentence in chat becomes a PDF, Word, PowerPoint or Excel file a person can open, keep, edit and download (2026-09-11)
 
 "Create a professional PDF about this", "make a Word document", "a
