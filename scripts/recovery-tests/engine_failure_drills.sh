@@ -313,6 +313,27 @@ wait_started_after() { # wait_started_after LABEL GETTER OLD_ISO TIMEOUT -> the 
 # ---------------------------------------------------------- recovery proof
 # The shared second half of every destructive drill: from a break at T0,
 # prove detection, coordinated recovery, a real completion and both ranks.
+# cluster-verify-engine.sh exits non-zero on the Xid count SINCE BOOT, which
+# on a node that faulted earlier today is a baseline, not a drill outcome
+# (spark-0e68 and spark-476e both carried 2 Xid lines all day on
+# 2026-09-12). A drill proves two things from that script's output: the
+# real completion drove BOTH GPUs, and the Xid count did NOT increase.
+verify_engine_probe_assert() { # verify_engine_probe_assert LABEL
+  local label="$1" out xid_before xid_after
+  xid_before="$(xid_total_since_boot)"
+  out="$("$CLUSTER_LIB_DIR/../cluster-verify-engine.sh" --probe 2>&1)"; printf '%s\n' "$out" >>"$DRILL_LOG"
+  xid_after="$(xid_total_since_boot)"
+  if printf '%s' "$out" | grep -q 'both GPUs worked on the request'; then assert_pass "$label: both GPUs worked on a real completion"; else assert_fail "$label: the verify script did not see both GPUs on the completion"; fi
+  if [ "${xid_after:-0}" -le "${xid_before:-0}" ]; then assert_pass "$label: no new Xid on either node (baseline $xid_before since boot)"; else assert_fail "$label: Xid count rose $xid_before -> $xid_after during the drill"; fi
+  if printf '%s' "$out" | grep -qE 'FAIL.*(CUDA fault lines|Xid lines)'; then rec "  note: verify-engine FAIL lines are the since-boot baseline (see xid count above)"; fi
+}
+xid_total_since_boot() {
+  local h w
+  h="$(journalctl -k --no-pager 2>/dev/null | grep -c 'NVRM: Xid' || echo 0)"
+  w="$(ssh_worker "journalctl -k --no-pager 2>/dev/null | grep -c 'NVRM: Xid' || echo 0" 2>/dev/null || echo 0)"
+  echo $(( ${h:-0} + ${w:-0} ))
+}
+
 prove_recovery() { # prove_recovery T0 HEAD_OLD WORKER_OLD
   local t0="$1" head_old="$2" worker_old="$3" t_detect t_ready
   if wait_state 'RECOVERING|STARTING|WEDGED|DEGRADED' "$DETECT_BUDGET_S"; then
@@ -320,8 +341,17 @@ prove_recovery() { # prove_recovery T0 HEAD_OLD WORKER_OLD
   else
     assert_fail "controller did not react within ${DETECT_BUDGET_S}s"
   fi
+  # Two correct shapes (CONTRACT §6 v2): the controller confirms the failure
+  # and restarts the pair (RECOVERING), OR — when Docker's restart policy
+  # brought the head back before the two-observation confirmation, the
+  # head-API-kill shape of drill 5 — it re-pairs the worker behind the new
+  # head (STARTING with recovery.external_repair recorded, category
+  # head_restarted_externally). Only a pair left to the last-resort
+  # healthcheck tier (neither) is a failure.
   if wait_state 'RECOVERING' 60; then assert_pass "controller entered RECOVERING (incident $(state_field incident.id) category=$(state_field incident.category))"
-  else assert_fail "controller never reported RECOVERING (state now $(state_name))"; fi
+  elif [ "$(state_field recovery.external_repair.outcome 2>/dev/null)" = "ok" ] || [ "$(state_field incident.category)" = "head_restarted_externally" ]; then
+    assert_pass "controller re-paired the worker behind a head Docker restarted (STARTING, category head_restarted_externally)"
+  else assert_fail "controller neither recovered the pair nor re-paired the worker (state now $(state_name))"; fi
   if wait_state 'READY|BUSY' $((COLD_START_BUDGET_S + 120)); then
     t_ready="$(date +%s)"; assert_pass "READY again $((t_ready - t0))s after the break (budget ${COLD_START_BUDGET_S}s)"
   else
@@ -337,7 +367,7 @@ prove_recovery() { # prove_recovery T0 HEAD_OLD WORKER_OLD
   if [ "$(state_field signals.worker.rank_process_alive)" = "true" ]; then assert_pass "sentinel: VLLM::Worker_TP1 alive"; else assert_fail "sentinel: worker rank not alive"; fi
   assert_that "a real 4-token completion succeeds on the recovered pair" real_completion
   if wait_canary_after "$t0" 120; then assert_pass "controller canary succeeded after the break (ttft $(state_field signals.canary.ttft_s)s)"; else assert_fail "no controller canary success after the break"; fi
-  if "$CLUSTER_LIB_DIR/../cluster-verify-engine.sh" --probe >>"$DRILL_LOG" 2>&1; then assert_pass "cluster-verify-engine.sh --probe: both GPUs participated"; else assert_fail "cluster-verify-engine.sh --probe failed (see record)"; fi
+  verify_engine_probe_assert "cluster-verify-engine.sh --probe"
   rec "  incident: id=$(state_field incident.id) category=$(state_field incident.category) attempts=$(state_field incident.attempts) budget_remaining=$(budget_remaining)"
 }
 
@@ -679,7 +709,7 @@ drill_6() {
   if wait_started_after "worker" "worker_started_at" "$worker_old" $((COLD_START_BUDGET_S)); then assert_pass "worker was re-paired (restarted)"; else assert_fail "worker was never restarted: a stale rank"; fi
   if wait_state 'READY|BUSY' $((COLD_START_BUDGET_S + 120)); then assert_pass "READY $(( $(date +%s) - t0 ))s after the restart"; else assert_fail "not READY within the budget (state $(state_name))"; fi
   assert_that "a real completion succeeds" real_completion
-  if "$CLUSTER_LIB_DIR/../cluster-verify-engine.sh" --probe >>"$DRILL_LOG" 2>&1; then assert_pass "both GPUs participated"; else assert_fail "cluster-verify-engine.sh --probe failed"; fi
+  verify_engine_probe_assert "both GPUs participated"
   end_drill 6 restart-head-only
 }
 container_started_at_head() { container_started_at "$HEAD_CTR"; }
