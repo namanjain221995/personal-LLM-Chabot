@@ -169,3 +169,135 @@ groups:
         expr: >-
           sum(rate(vllm:prefix_cache_hits_total{service="main"}[5m]))
           / clamp_min(sum(rate(vllm:prefix_cache_queries_total{service="main"}[5m])), 1)
+
+  # --------------------------------------------------------- availability
+  # The engine's top-level state (docs/availability/CONTRACT.md §2, §7.3 —
+  # v2, strict one-model mode: only the main model answers a person, and
+  # while it is not READY their requests are durably QUEUED, never answered
+  # by anything else).
+  #
+  # ABSENCE IS A STATE OF ITS OWN HERE. None of these rules ends in
+  # `or vector(0)`: when the controller is not being scraped the rule produces
+  # NO sample, Grafana renders its `noValue` text (MONITORING_UNKNOWN) and
+  # VllmMonitoringUnknown fires on absent_over_time(). Filling the gap with a
+  # zero would turn "we cannot see" into "READY"/"DOWN"-shaped numbers, which
+  # is exactly the lie up{job="vllm-main"}==1 told for five minutes on
+  # 2026-09-11 while the engine was wedged.
+  #
+  # A STALE VERDICT IS ABSENCE TOO (v2). The controller stamps every snapshot
+  # with techsara_vllm_generated_at_seconds. Its tick is 5 s, the scrape 5 s
+  # and this group 5 s, so a fresh verdict is never more than ~15 s old; one
+  # that is > 30 s old means the tick stopped (an exception before publish, a
+  # blocked observe) while the HTTP thread keeps serving the LAST snapshot
+  # with fresh scrape timestamps — the same "process alive, answers stale"
+  # blind spot the programme exists to remove, one level up. The derived
+  # state and the state name drop their sample in that case (the three age
+  # rules deliberately do not — a frozen snapshot is exactly when an age
+  # must keep climbing), and a controller that exports no stamp at all is
+  # treated the same way: an unproven verdict is MONITORING_UNKNOWN (§2:
+  # "inference status unproven"), never READY.
+  #
+  # Named differently from the alert group of the same purpose in alerts.yml
+  # (`vllm-availability`) on purpose: promtool orders groups by NAME when a
+  # test pins group_eval_order, and two groups with one name evaluate in an
+  # unstable order.
+  - name: vllm-state
+    interval: 5s
+    rules:
+      # How long since Prometheus last got a sample of the main engine's
+      # token counter. Not the same thing as "tokens are moving" — a wedged
+      # engine keeps serving a FROZEN counter with a fresh timestamp (signal
+      # 12 lives in the controller for that reason). Note what this can and
+      # cannot see: a scrape that fails or a family that disappears writes a
+      # staleness marker, so this series goes ABSENT rather than growing
+      # (VllmScrapeTargetDown owns that); it only climbs when Prometheus
+      # itself stops ingesting. The dashboard tile and VllmMetricsStale's
+      # `prometheus_age` branch read it with that in mind.
+      - record: cluster:vllm_metrics_age_seconds
+        expr: time() - max(timestamp(vllm:generation_tokens_total{service="main"}))
+        labels: { service: main }
+
+      # THE DERIVED TOP-LEVEL STATE, one number for the whole platform (§7.3):
+      #   7 (QUEUEING) when the controller's state is not READY/BUSY/DOWN
+      #                and the orchestrator holds ≥ 1 accepted generation
+      #                durably queued for the main model
+      #   otherwise    the controller's own code. DOWN stays 8 with a queue:
+      #                nobody is being answered and nobody will be until an
+      #                operator acts, which is a page, not a wait
+      #   no sample    when the controller's verdict is stale (> 30 s) or
+      #                carries no freshness stamp (see the group comment)
+      #
+      # Written as a chain of `and`/`or` over selectively matched series so
+      # that presence is preserved exactly:
+      #   * controller absent            -> no sample at all (never 0)
+      #   * orchestrator absent          -> the controller code passes through
+      #     (`or on()` keeps the right-hand side only when the left is empty)
+      # clamp(x, 7, 7) is "the constant 7, but only where x exists" — the
+      # `and`/`unless` filters decide WHEN, the clamp decides WHAT.
+      #
+      # Everything is max()'d because each input is a single series by
+      # construction (one controller, one orchestrator) and the join must not
+      # care about instance/job labels; `service="main"` is put back below.
+      # Proven by monitoring/prometheus/tests/recording_availability.yml.
+      - record: cluster:vllm_service_state:code
+        expr: >-
+          (
+            (
+              clamp(max(techsara_vllm_state_code), 7, 7)
+                and on() (max(techsara_vllm_state_code) < 2 or max(techsara_vllm_state_code) > 3)
+                and on() (max(llm_queued_generations) > 0)
+                unless on() (max(techsara_vllm_state_code) == 8)
+            )
+            or on()
+            max(techsara_vllm_state_code)
+          )
+          and on() ((time() - max(techsara_vllm_generated_at_seconds)) <= 30)
+        labels: { service: main }
+
+      # Seconds since the last REAL completion the controller saw succeed.
+      # The only "is it alive" number that cannot be faked by a process that
+      # is merely running; the overview's tile, and VllmReadyUnproven's
+      # evidence that a READY verdict is a lie. The controller exports 0
+      # until its first success after a start, and 0 is "none yet", not
+      # 1970 — so the `> 0` keeps that as an absent series (the tile reads
+      # `no data`) instead of a 56-year age. Deliberately NOT gated on
+      # freshness: a frozen controller snapshot is exactly when this number
+      # must keep climbing.
+      - record: cluster:vllm_last_success_age_seconds
+        expr: time() - (max(techsara_vllm_last_success_timestamp_seconds) > 0)
+        labels: { service: main }
+
+      # Duration of the CURRENT incident. The controller exports 0 when there
+      # is none, so the `> 0` filter makes "no incident" an absent series
+      # rather than a 1.7-billion-second one; Grafana shows `none`.
+      - record: cluster:vllm_incident_duration_seconds
+        expr: >-
+          time() - (max(techsara_vllm_incident_start_timestamp_seconds) > 0)
+        labels: { service: main }
+
+      # THE STATE NAME AS A LABEL: one series, value 1, whose `state` label
+      # is the controller's current state name — for `scripts/monitoring.sh
+      # verify`, ad-hoc queries and anyone who wants the name without decoding
+      # the number. The name is the controller's one-hot while the verdict is
+      # fresh; if the one-hot is missing or the verdict is stale it is
+      # MONITORING_UNKNOWN (the contract's own name for "cannot vouch",
+      # never a value outside the nine of §2); with no controller at all it
+      # is absent.
+      #
+      # NO ALERT JOINS ON THIS SERIES, and none may: a `* on() group_left(state)`
+      # join makes the live name part of the alert's IDENTITY, so every
+      # READY<->BUSY flip (81 in six hours, measured) resets `for:` and a
+      # critical alert never reaches firing; and after a Prometheus restart
+      # two recorded names can coexist for the 5-minute lookback and turn the
+      # join into a many-to-many error. Alerts carry the FIXED state they
+      # speak for as a label and the live name as the `state_now` annotation
+      # (read straight from the one-hot, which has no restart artefact).
+      # Not part of CONTRACT §7.3 — a helper owned by the monitoring workstream.
+      - record: cluster:vllm_state_name:current
+        expr: >-
+          (
+            (techsara_vllm_state == 1)
+              and on() ((time() - max(techsara_vllm_generated_at_seconds)) <= 30)
+          )
+          or on()
+          label_replace(clamp(techsara_vllm_state_code, 1, 1), "state", "MONITORING_UNKNOWN", "", "")

@@ -1,0 +1,479 @@
+# promtool unit tests for the vllm-state recording rules
+# (docs/availability/CONTRACT.md §7.3 v2, monitoring/prometheus/rules/recording.yml).
+#
+# Run from the repo root with the SAME pinned Prometheus image the stack
+# runs, so the PromQL that passes here is the PromQL that evaluates in
+# production. List the test files explicitly — `/p/tests/*.yml` is a path
+# inside the container, the host shell cannot expand it and promtool does
+# not glob:
+#
+#   IMG=$(grep -o 'prom/prometheus@sha256:[0-9a-f]*' compose/compose.monitoring.yaml | head -1)
+#   docker run --rm -v "$PWD/monitoring/prometheus:/p:ro" --entrypoint promtool "$IMG" \
+#     test rules /p/tests/recording_availability.yml /p/tests/alerts_availability.yml
+#
+# Time in these tests starts at Unix epoch 0, so `time()` inside a rule is
+# simply the eval_time in seconds. Series carry the labels the real scrape
+# attaches (prometheus.yml job labels) so the join behaviour is the real one.
+#
+# FRESHNESS. Every rule in the group drops its sample when the controller's
+# own stamp (techsara_vllm_generated_at_seconds) is more than 30 s behind
+# time(), or missing. A "fresh" stamp here is the series '0+5x60': the
+# sample at t = 5k carries the value 5k, so at any eval_time the age is
+# 0-4 s, exactly what a 5 s tick + 5 s scrape produces.
+#
+# The cases the contract demands for cluster:vllm_service_state:code (v2):
+#   READY, queue empty          -> 2
+#   RECOVERING, queue > 0       -> 7 (QUEUEING)
+#   DOWN, queue empty           -> 8
+#   DOWN, queue > 0             -> 8 (DOWN is never QUEUEING: nobody is answered)
+#   controller absent           -> NO sample (absence preserved)
+#   controller stale (> 30 s)   -> NO sample (a frozen verdict is not a verdict)
+#   orchestrator absent         -> the controller code passes through
+
+rule_files:
+  - ../rules/recording.yml
+
+evaluation_interval: 5s
+
+# Recording groups first, then the alert groups that read their output, so an
+# alert always sees the sample recorded at the SAME timestamp. Without this
+# promtool's tie-break between groups is unstable and an alert can read the
+# previous evaluation's value (5 s older).
+group_eval_order:
+  - dgx-gpu
+  - dgx-host
+  - vllm
+  - vllm-state
+  - availability
+  - vllm-health
+  - vllm-availability
+  - monitoring-self
+
+# Label sets (YAML anchors are not allowed inside `series:` strings, so they
+# are spelled out; keep them identical to prometheus.yml):
+#   controller:   instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"
+#   orchestrator: instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator"
+
+tests:
+  # ---------------------------------------------------------------- READY
+  - interval: 5s
+    name: "READY with an empty queue is 2"
+    input_series:
+      - series: 'techsara_vllm_state_code{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '2x24'
+      - series: 'techsara_vllm_generated_at_seconds{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0+5x24'
+      - series: 'llm_queued_generations{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator"}'
+        values: '0x24'
+    promql_expr_test:
+      - expr: cluster:vllm_service_state:code
+        eval_time: 1m
+        exp_samples:
+          - labels: 'cluster:vllm_service_state:code{service="main"}'
+            value: 2
+
+  # ------------------------------------------------------ RECOVERING + queue
+  - interval: 5s
+    name: "RECOVERING while the orchestrator holds queued generations is 7 (QUEUEING)"
+    input_series:
+      - series: 'techsara_vllm_state_code{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '6x24'
+      - series: 'techsara_vllm_generated_at_seconds{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0+5x24'
+      - series: 'llm_queued_generations{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator"}'
+        values: '2x24'
+    promql_expr_test:
+      - expr: cluster:vllm_service_state:code
+        eval_time: 1m
+        exp_samples:
+          - labels: 'cluster:vllm_service_state:code{service="main"}'
+            value: 7
+
+  # ------------------------------------------------------- DOWN, no queue
+  - interval: 5s
+    name: "DOWN with an empty queue is 8"
+    input_series:
+      - series: 'techsara_vllm_state_code{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '8x24'
+      - series: 'techsara_vllm_generated_at_seconds{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0+5x24'
+      - series: 'llm_queued_generations{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator"}'
+        values: '0x24'
+    promql_expr_test:
+      - expr: cluster:vllm_service_state:code
+        eval_time: 1m
+        exp_samples:
+          - labels: 'cluster:vllm_service_state:code{service="main"}'
+            value: 8
+
+  # ------------------------------------------------------ DOWN, queue > 0
+  # DOWN means the budget is spent or the last recovery failed: nobody is
+  # being answered and nobody will be until an operator acts. A queue does
+  # not soften that into QUEUEING — it is the head-count of people waiting
+  # on the page VllmPrimaryDown raises.
+  - interval: 5s
+    name: "DOWN with queued generations stays 8, never 7"
+    input_series:
+      - series: 'techsara_vllm_state_code{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '8x24'
+      - series: 'techsara_vllm_generated_at_seconds{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0+5x24'
+      - series: 'llm_queued_generations{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator"}'
+        values: '3x24'
+    promql_expr_test:
+      - expr: cluster:vllm_service_state:code
+        eval_time: 1m
+        exp_samples:
+          - labels: 'cluster:vllm_service_state:code{service="main"}'
+            value: 8
+
+  # --------------------------------------------------- controller absent
+  # The orchestrator alone cannot say what the engine is doing; with no
+  # controller series there must be NO derived sample, whatever the queue
+  # says. This is the `or vector(0)` trap the contract forbids.
+  - interval: 5s
+    name: "controller absent -> no sample, even with a queue reported"
+    input_series:
+      - series: 'llm_queued_generations{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator"}'
+        values: '2x24'
+    promql_expr_test:
+      - expr: cluster:vllm_service_state:code
+        eval_time: 1m
+        exp_samples: []
+
+  - interval: 5s
+    name: "controller absent and orchestrator absent -> no sample"
+    input_series: []
+    promql_expr_test:
+      - expr: cluster:vllm_service_state:code
+        eval_time: 1m
+        exp_samples: []
+
+  # A controller that WAS there and went away (scrape failure writes a
+  # staleness marker) must disappear on the next evaluation, not linger for
+  # the 5-minute lookback as a READY that no longer exists.
+  - interval: 5s
+    name: "controller goes stale (marker) -> the derived state disappears with it"
+    input_series:
+      - series: 'techsara_vllm_state_code{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '2x6 stale'
+      - series: 'techsara_vllm_generated_at_seconds{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0+5x6 stale'
+      - series: 'llm_queued_generations{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator"}'
+        values: '0x24'
+    promql_expr_test:
+      - expr: cluster:vllm_service_state:code
+        eval_time: 25s
+        exp_samples:
+          - labels: 'cluster:vllm_service_state:code{service="main"}'
+            value: 2
+      - expr: cluster:vllm_service_state:code
+        eval_time: 45s
+        exp_samples: []
+
+  # ------------------------------------------------- the freshness gate
+  # The controller keeps being scraped (its HTTP thread is alive) but its
+  # tick stopped at t=60: the stamp freezes while the state code keeps
+  # arriving with fresh scrape timestamps. At 30 s of age the verdict is
+  # dropped; when the tick resumes at t=180 the sample returns at once.
+  - interval: 5s
+    name: "controller stamp frozen -> no sample after 30s; returns when the tick resumes"
+    input_series:
+      - series: 'techsara_vllm_state_code{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '2x48'
+      - series: 'techsara_vllm_generated_at_seconds{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0+5x12 60x23 180+5x12'
+      - series: 'llm_queued_generations{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator"}'
+        values: '0x48'
+    promql_expr_test:
+      - expr: cluster:vllm_service_state:code
+        eval_time: 1m
+        exp_samples:
+          - labels: 'cluster:vllm_service_state:code{service="main"}'
+            value: 2
+      # 25 s old: still inside the budget
+      - expr: cluster:vllm_service_state:code
+        eval_time: 1m25s
+        exp_samples:
+          - labels: 'cluster:vllm_service_state:code{service="main"}'
+            value: 2
+      # 35 s old: the verdict is frozen; the tile reads MONITORING_UNKNOWN
+      - expr: cluster:vllm_service_state:code
+        eval_time: 1m35s
+        exp_samples: []
+      - expr: cluster:vllm_service_state:code
+        eval_time: 2m30s
+        exp_samples: []
+      # the tick is back
+      - expr: cluster:vllm_service_state:code
+        eval_time: 3m10s
+        exp_samples:
+          - labels: 'cluster:vllm_service_state:code{service="main"}'
+            value: 2
+
+  # A controller that exports a state but no stamp at all (an older build)
+  # is unproven, so the derived state is absent — never READY on trust.
+  - interval: 5s
+    name: "controller exports no freshness stamp -> no sample"
+    input_series:
+      - series: 'techsara_vllm_state_code{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '2x24'
+      - series: 'llm_queued_generations{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator"}'
+        values: '0x24'
+    promql_expr_test:
+      - expr: cluster:vllm_service_state:code
+        eval_time: 1m
+        exp_samples: []
+
+  # ------------------------------------------------- orchestrator absent
+  - interval: 5s
+    name: "orchestrator absent -> the controller code passes through (WEDGED)"
+    input_series:
+      - series: 'techsara_vllm_state_code{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '5x24'
+      - series: 'techsara_vllm_generated_at_seconds{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0+5x24'
+    promql_expr_test:
+      - expr: cluster:vllm_service_state:code
+        eval_time: 1m
+        exp_samples:
+          - labels: 'cluster:vllm_service_state:code{service="main"}'
+            value: 5
+
+  - interval: 5s
+    name: "orchestrator absent -> DOWN passes through as 8"
+    input_series:
+      - series: 'techsara_vllm_state_code{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '8x24'
+      - series: 'techsara_vllm_generated_at_seconds{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0+5x24'
+    promql_expr_test:
+      - expr: cluster:vllm_service_state:code
+        eval_time: 1m
+        exp_samples:
+          - labels: 'cluster:vllm_service_state:code{service="main"}'
+            value: 8
+
+  # ------------------------------------------------------- the edge cases
+  # READY/BUSY always win: a queue that lags the recovery by a poll (the
+  # resume sweep has not run yet) must not paint a working primary as
+  # QUEUEING — VllmRequestsQueued watches a queue that does not drain.
+  - interval: 5s
+    name: "BUSY with a lagging queue stays 3; READY with a lagging queue stays 2"
+    input_series:
+      - series: 'techsara_vllm_state_code{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '3x12 2x12'
+      - series: 'techsara_vllm_generated_at_seconds{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0+5x24'
+      - series: 'llm_queued_generations{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator"}'
+        values: '1x24'
+    promql_expr_test:
+      - expr: cluster:vllm_service_state:code
+        eval_time: 30s
+        exp_samples:
+          - labels: 'cluster:vllm_service_state:code{service="main"}'
+            value: 3
+      - expr: cluster:vllm_service_state:code
+        eval_time: 1m30s
+        exp_samples:
+          - labels: 'cluster:vllm_service_state:code{service="main"}'
+            value: 2
+
+  # Every other controller state with a queue is QUEUEING: the primary is
+  # not answering and people are waiting on it.
+  - interval: 5s
+    name: "STARTING, WEDGED and MONITORING_UNKNOWN with a queue are all 7"
+    input_series:
+      - series: 'techsara_vllm_state_code{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '1x12 5x12 0x12'
+      - series: 'techsara_vllm_generated_at_seconds{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0+5x36'
+      - series: 'llm_queued_generations{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator"}'
+        values: '4x36'
+    promql_expr_test:
+      - expr: cluster:vllm_service_state:code
+        eval_time: 30s
+        exp_samples: [{ labels: 'cluster:vllm_service_state:code{service="main"}', value: 7 }]
+      - expr: cluster:vllm_service_state:code
+        eval_time: 1m30s
+        exp_samples: [{ labels: 'cluster:vllm_service_state:code{service="main"}', value: 7 }]
+      - expr: cluster:vllm_service_state:code
+        eval_time: 2m30s
+        exp_samples: [{ labels: 'cluster:vllm_service_state:code{service="main"}', value: 7 }]
+
+  # A full incident, sample by sample: READY -> WEDGED -> RECOVERING (the
+  # orchestrator's first queued request lands a poll later) -> READY, the
+  # queue drained by the resume sweep a poll after that.
+  - interval: 5s
+    name: "an incident end to end"
+    input_series:
+      - series: 'techsara_vllm_state_code{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '2 2 5 5 6 6 6 6 2 2 2 2'
+      - series: 'techsara_vllm_generated_at_seconds{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0+5x11'
+      - series: 'llm_queued_generations{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator"}'
+        values: '0 0 0 0 0 1 2 2 2 2 0 0'
+    promql_expr_test:
+      - expr: cluster:vllm_service_state:code
+        eval_time: 5s
+        exp_samples: [{ labels: 'cluster:vllm_service_state:code{service="main"}', value: 2 }]
+      - expr: cluster:vllm_service_state:code
+        eval_time: 15s
+        exp_samples: [{ labels: 'cluster:vllm_service_state:code{service="main"}', value: 5 }]
+      - expr: cluster:vllm_service_state:code
+        eval_time: 20s
+        exp_samples: [{ labels: 'cluster:vllm_service_state:code{service="main"}', value: 6 }]
+      - expr: cluster:vllm_service_state:code
+        eval_time: 30s
+        exp_samples: [{ labels: 'cluster:vllm_service_state:code{service="main"}', value: 7 }]
+      - expr: cluster:vllm_service_state:code
+        eval_time: 40s
+        exp_samples: [{ labels: 'cluster:vllm_service_state:code{service="main"}', value: 2 }]
+      - expr: cluster:vllm_service_state:code
+        eval_time: 55s
+        exp_samples: [{ labels: 'cluster:vllm_service_state:code{service="main"}', value: 2 }]
+
+  # ------------------------------------------------ the two age rules
+  - interval: 5s
+    name: "last-success age and incident duration are time() minus the controller's stamps"
+    input_series:
+      # 0 ("no success since start") for the first 25 s, then a success at t=30.
+      - series: 'techsara_vllm_last_success_timestamp_seconds{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0x5 30x18'
+      # 0 for the first minute (no incident), then an incident that began at t=60.
+      - series: 'techsara_vllm_incident_start_timestamp_seconds{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0x12 60x12'
+    promql_expr_test:
+      # No success yet -> no series, NOT time()-0.
+      - expr: cluster:vllm_last_success_age_seconds
+        eval_time: 20s
+        exp_samples: []
+      - expr: cluster:vllm_last_success_age_seconds
+        eval_time: 1m30s
+        exp_samples:
+          - labels: 'cluster:vllm_last_success_age_seconds{service="main"}'
+            value: 60
+      # No incident -> no series, NOT time()-0.
+      - expr: cluster:vllm_incident_duration_seconds
+        eval_time: 30s
+        exp_samples: []
+      - expr: cluster:vllm_incident_duration_seconds
+        eval_time: 2m
+        exp_samples:
+          - labels: 'cluster:vllm_incident_duration_seconds{service="main"}'
+            value: 60
+
+  # The last-success age is deliberately NOT gated on freshness: a frozen
+  # controller snapshot is exactly when it must keep climbing, so that
+  # VllmReadyUnproven can contradict the frozen READY.
+  - interval: 5s
+    name: "last-success age keeps climbing while the controller stamp is frozen"
+    input_series:
+      - series: 'techsara_vllm_last_success_timestamp_seconds{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '30x48'
+      - series: 'techsara_vllm_generated_at_seconds{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '60x48'
+    promql_expr_test:
+      - expr: cluster:vllm_last_success_age_seconds
+        eval_time: 4m
+        exp_samples:
+          - labels: 'cluster:vllm_last_success_age_seconds{service="main"}'
+            value: 210
+
+  - interval: 5s
+    name: "controller absent -> no age series either"
+    input_series: []
+    promql_expr_test:
+      - expr: cluster:vllm_last_success_age_seconds
+        eval_time: 1m
+        exp_samples: []
+      - expr: cluster:vllm_incident_duration_seconds
+        eval_time: 1m
+        exp_samples: []
+
+  # metrics age: fresh while samples arrive, climbs when they stop arriving
+  # WITHOUT a staleness marker (the "Prometheus is falling behind" shape),
+  # and vanishes when the target is marked stale (the "target is gone" shape,
+  # which is VllmScrapeTargetDown's job, not this rule's).
+  - interval: 5s
+    name: "metrics age follows the newest vLLM sample"
+    input_series:
+      - series: 'vllm:generation_tokens_total{instance="host.docker.internal:8000",job="vllm-main",service="main",role="head",engine_scope="cluster",engine="0",model_name="m"}'
+        values: '100+10x12 _x24'
+    promql_expr_test:
+      - expr: cluster:vllm_metrics_age_seconds
+        eval_time: 1m
+        exp_samples:
+          - labels: 'cluster:vllm_metrics_age_seconds{service="main"}'
+            value: 0
+      - expr: cluster:vllm_metrics_age_seconds
+        eval_time: 3m
+        exp_samples:
+          - labels: 'cluster:vllm_metrics_age_seconds{service="main"}'
+            value: 120
+
+  - interval: 5s
+    name: "metrics age disappears with a stale target"
+    input_series:
+      - series: 'vllm:generation_tokens_total{instance="host.docker.internal:8000",job="vllm-main",service="main",role="head",engine_scope="cluster",engine="0",model_name="m"}'
+        values: '100+10x6 stale'
+    promql_expr_test:
+      - expr: cluster:vllm_metrics_age_seconds
+        eval_time: 1m
+        exp_samples: []
+
+  # ------------------------------------------------ the state-name helper
+  # One series, value 1, `state` = the controller's name while its verdict
+  # is fresh; MONITORING_UNKNOWN (one of the nine, never "unknown") when the
+  # one-hot is missing or the verdict is stale; absent with no controller.
+  - interval: 5s
+    name: "state name is the one-hot while fresh, MONITORING_UNKNOWN once the stamp freezes, absent with no controller"
+    input_series:
+      - series: 'techsara_vllm_state_code{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '2x36 stale'
+      - series: 'techsara_vllm_state{state="READY",instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '1x36 stale'
+      - series: 'techsara_vllm_state{state="DOWN",instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0x36 stale'
+      # fresh for the first two minutes, frozen at 120 afterwards
+      - series: 'techsara_vllm_generated_at_seconds{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0+5x24 120x12 stale'
+    promql_expr_test:
+      - expr: cluster:vllm_state_name:current
+        eval_time: 30s
+        exp_samples:
+          - labels: 'cluster:vllm_state_name:current{state="READY",instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+            value: 1
+      # stamp 5 s old at t=125: still the name
+      - expr: cluster:vllm_state_name:current
+        eval_time: 2m5s
+        exp_samples:
+          - labels: 'cluster:vllm_state_name:current{state="READY",instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+            value: 1
+      # stamp frozen at 120: at t=160 the verdict is 40 s old
+      - expr: cluster:vllm_state_name:current
+        eval_time: 2m40s
+        exp_samples:
+          - labels: 'cluster:vllm_state_name:current{state="MONITORING_UNKNOWN",instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+            value: 1
+      # controller gone
+      - expr: cluster:vllm_state_name:current
+        eval_time: 3m30s
+        exp_samples: []
+
+  # The code without the one-hot (a controller build that exports only the
+  # number) is a state we cannot NAME: the helper says MONITORING_UNKNOWN
+  # rather than inventing a value outside the nine.
+  - interval: 5s
+    name: "state name with the code but no one-hot is MONITORING_UNKNOWN"
+    input_series:
+      - series: 'techsara_vllm_state_code{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '4x24'
+      - series: 'techsara_vllm_generated_at_seconds{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0+5x24'
+    promql_expr_test:
+      - expr: cluster:vllm_state_name:current
+        eval_time: 1m
+        exp_samples:
+          - labels: 'cluster:vllm_state_name:current{state="MONITORING_UNKNOWN",instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+            value: 1

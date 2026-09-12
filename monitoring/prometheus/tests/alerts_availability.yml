@@ -1,0 +1,1748 @@
+# promtool unit tests for the vllm-availability alert group, the renamed
+# VllmScrapeTargetDown, VllmQueueBacklog and PrometheusRuleEvaluationFailing
+# (docs/availability/CONTRACT.md §7.4 v2, monitoring/prometheus/rules/alerts.yml).
+# Run the same way as recording_availability.yml (see its header — list the
+# two test files explicitly).
+#
+# promtool compares labels AND every annotation of each expected alert, so
+# these tests also prove the annotation templates render ($value, $labels,
+# and the `state_now` / `queued` templates that run a query) and pin their
+# wording. `alertname` is added by promtool and not listed.
+#
+# Time starts at Unix 0; `time()` in a rule is the eval_time in seconds, so a
+# since-stamp of 0 means "in this state since the start of the test", and a
+# fresh controller stamp is the series '0+5xN' (see the recording tests).
+#
+# Label sets are the real ones (prometheus.yml job labels) so the
+# `and on()` / `unless on()` gates run against what production will scrape.
+#
+# WHAT THE STATE-CHURN CASES PROVE. The v1 rules joined the controller's
+# live state name into five alerts' labels; every state change mid-incident
+# reset `for:` and the review reproduced VllmGenerationFrozen never firing
+# on the 2026-09-11 progression. Each of those alerts now has a case where
+# the state flips while the alert is pending and firing, and the alert must
+# fire on schedule regardless.
+#
+# WHAT THE STALE-MARKER CASES PROVE. A firing critical alert must clear when
+# the controller disappears (a scrape failure writes staleness markers), not
+# linger for the 5-minute lookback — so no rule may wrap a controller gauge
+# in last_over_time() or `or vector()`.
+
+rule_files:
+  - ../rules/recording.yml
+  - ../rules/alerts.yml
+
+evaluation_interval: 5s
+
+# Recording groups first, then the alert groups that read their output, so an
+# alert always sees the sample recorded at the SAME timestamp. Without this
+# promtool's tie-break between groups is unstable and an alert can read the
+# previous evaluation's value (5 s older).
+group_eval_order:
+  - dgx-gpu
+  - dgx-host
+  - vllm
+  - vllm-state
+  - availability
+  - vllm-health
+  - vllm-availability
+  - monitoring-self
+
+# ---------------------------------------------------------------------------
+# Shorthand for the label sets (YAML anchors are not allowed inside `series:`
+# strings, so they are spelled out; keep them identical to prometheus.yml.)
+#   controller:   instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"
+#   vllm-main:    instance="host.docker.internal:8000",job="vllm-main",service="main",role="head",engine_scope="cluster"
+#   orchestrator: instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator"
+#   prometheus:   instance="localhost:9090",job="prometheus",node="spark-1",role="head"
+
+tests:
+  # ================================================ VllmMonitoringUnknown
+  - interval: 5s
+    name: "MonitoringUnknown fires when the controller series is absent, labelled with what is missing"
+    input_series:
+      - series: 'up{instance="host.docker.internal:8000",job="vllm-main",service="main",role="head",engine_scope="cluster"}'
+        values: '1x60'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: VllmMonitoringUnknown
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: main
+              state: MONITORING_UNKNOWN
+              missing: controller_state
+            exp_annotations:
+              summary: "vLLM engine state cannot be observed (controller_state)"
+              description: >-
+                Inference may be fine. Nothing on this page can vouch for the
+                engine either way, so the overview shows MONITORING_UNKNOWN
+                rather than guessing. controller_state / vllm_scrape_target: a
+                scrape is missing. controller_observation: the controller
+                itself cannot see the engine. controller_stale: the controller's
+                snapshot is frozen (its tick stopped; the state it still serves
+                is the last one it computed). controller_stamp: the controller
+                exports no freshness stamp. Fix the telemetry, then read the
+                state — and do not restart anything on the strength of this.
+              state_now: MONITORING_UNKNOWN
+              since: "≥ 1m before this fired (the alert's for:); the absence branches add their 2m absent_over_time window"
+              reason: "controller_state: no samples for 2m (controller_state, vllm_scrape_target), state code 0 (controller_observation), snapshot stamp > 30s old (controller_stale), or no stamp exported (controller_stamp)"
+              runbook: docs/availability/RUNBOOK.md#monitoring-unknown
+              safe_command: "curl -s http://127.0.0.1:9838/healthz; curl -s http://127.0.0.1:9838/state | jq '.state,.generated_at,.reason'; docker ps --filter name=engine-controller; curl -s http://127.0.0.1:9090/api/v1/targets | jq '.data.activeTargets[] | select(.labels.job==\"engine-controller\" or .labels.job==\"vllm-main\") | {job:.labels.job,health,lastError}'"
+
+  - interval: 5s
+    name: "MonitoringUnknown fires on a missing vllm-main scrape job, labelled vllm_scrape_target"
+    input_series:
+      - series: 'techsara_vllm_state_code{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '2x60'
+      - series: 'techsara_vllm_generated_at_seconds{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0+5x60'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: VllmMonitoringUnknown
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: main
+              state: MONITORING_UNKNOWN
+              missing: vllm_scrape_target
+              job: vllm-main
+            exp_annotations:
+              summary: "vLLM engine state cannot be observed (vllm_scrape_target)"
+              description: >-
+                Inference may be fine. Nothing on this page can vouch for the
+                engine either way, so the overview shows MONITORING_UNKNOWN
+                rather than guessing. controller_state / vllm_scrape_target: a
+                scrape is missing. controller_observation: the controller
+                itself cannot see the engine. controller_stale: the controller's
+                snapshot is frozen (its tick stopped; the state it still serves
+                is the last one it computed). controller_stamp: the controller
+                exports no freshness stamp. Fix the telemetry, then read the
+                state — and do not restart anything on the strength of this.
+              state_now: MONITORING_UNKNOWN
+              since: "≥ 1m before this fired (the alert's for:); the absence branches add their 2m absent_over_time window"
+              reason: "vllm_scrape_target: no samples for 2m (controller_state, vllm_scrape_target), state code 0 (controller_observation), snapshot stamp > 30s old (controller_stale), or no stamp exported (controller_stamp)"
+              runbook: docs/availability/RUNBOOK.md#monitoring-unknown
+              safe_command: "curl -s http://127.0.0.1:9838/healthz; curl -s http://127.0.0.1:9838/state | jq '.state,.generated_at,.reason'; docker ps --filter name=engine-controller; curl -s http://127.0.0.1:9090/api/v1/targets | jq '.data.activeTargets[] | select(.labels.job==\"engine-controller\" or .labels.job==\"vllm-main\") | {job:.labels.job,health,lastError}'"
+
+  - interval: 5s
+    name: "MonitoringUnknown does NOT fire when the controller reports DOWN with a fresh stamp — that is observed, not unknown"
+    input_series:
+      - series: 'techsara_vllm_state_code{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '8x60'
+      - series: 'techsara_vllm_generated_at_seconds{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0+5x60'
+      - series: 'up{instance="host.docker.internal:8000",job="vllm-main",service="main",role="head",engine_scope="cluster"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: VllmMonitoringUnknown
+        exp_alerts: []
+
+  - interval: 5s
+    name: "MonitoringUnknown clears once the controller is scraped again"
+    input_series:
+      - series: 'techsara_vllm_state_code{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '_x40 2x30'
+      - series: 'techsara_vllm_generated_at_seconds{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '_x40 200+5x30'
+      - series: 'up{instance="host.docker.internal:8000",job="vllm-main",service="main",role="head",engine_scope="cluster"}'
+        values: '1x70'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: VllmMonitoringUnknown
+        exp_alerts:
+          - exp_labels: { severity: warning, service: main, state: MONITORING_UNKNOWN, missing: controller_state }
+            exp_annotations:
+              summary: "vLLM engine state cannot be observed (controller_state)"
+              description: >-
+                Inference may be fine. Nothing on this page can vouch for the
+                engine either way, so the overview shows MONITORING_UNKNOWN
+                rather than guessing. controller_state / vllm_scrape_target: a
+                scrape is missing. controller_observation: the controller
+                itself cannot see the engine. controller_stale: the controller's
+                snapshot is frozen (its tick stopped; the state it still serves
+                is the last one it computed). controller_stamp: the controller
+                exports no freshness stamp. Fix the telemetry, then read the
+                state — and do not restart anything on the strength of this.
+              state_now: MONITORING_UNKNOWN
+              since: "≥ 1m before this fired (the alert's for:); the absence branches add their 2m absent_over_time window"
+              reason: "controller_state: no samples for 2m (controller_state, vllm_scrape_target), state code 0 (controller_observation), snapshot stamp > 30s old (controller_stale), or no stamp exported (controller_stamp)"
+              runbook: docs/availability/RUNBOOK.md#monitoring-unknown
+              safe_command: "curl -s http://127.0.0.1:9838/healthz; curl -s http://127.0.0.1:9838/state | jq '.state,.generated_at,.reason'; docker ps --filter name=engine-controller; curl -s http://127.0.0.1:9090/api/v1/targets | jq '.data.activeTargets[] | select(.labels.job==\"engine-controller\" or .labels.job==\"vllm-main\") | {job:.labels.job,health,lastError}'"
+      - eval_time: 5m
+        alertname: VllmMonitoringUnknown
+        exp_alerts: []
+
+  # The controller is present and says it cannot observe (state 0) — the
+  # v1 rules had no branch for this and the tile sat grey with an empty
+  # alert list. Six minutes of 0 with a fresh stamp and the scrape target up.
+  - interval: 5s
+    name: "MonitoringUnknown fires when the controller itself reports MONITORING_UNKNOWN (code 0)"
+    input_series:
+      - series: 'techsara_vllm_state_code{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0x72'
+      - series: 'techsara_vllm_state{state="MONITORING_UNKNOWN",instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '1x72'
+      - series: 'techsara_vllm_generated_at_seconds{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0+5x72'
+      - series: 'up{instance="host.docker.internal:8000",job="vllm-main",service="main",role="head",engine_scope="cluster"}'
+        values: '1x72'
+      - series: 'llm_queued_generations{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator"}'
+        values: '0x72'
+    alert_rule_test:
+      - eval_time: 30s
+        alertname: VllmMonitoringUnknown
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: VllmMonitoringUnknown
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: main
+              state: MONITORING_UNKNOWN
+              missing: controller_observation
+              instance: host.docker.internal:9838
+              job: engine-controller
+              role: head
+              engine_scope: cluster
+            exp_annotations:
+              summary: "vLLM engine state cannot be observed (controller_observation)"
+              description: >-
+                Inference may be fine. Nothing on this page can vouch for the
+                engine either way, so the overview shows MONITORING_UNKNOWN
+                rather than guessing. controller_state / vllm_scrape_target: a
+                scrape is missing. controller_observation: the controller
+                itself cannot see the engine. controller_stale: the controller's
+                snapshot is frozen (its tick stopped; the state it still serves
+                is the last one it computed). controller_stamp: the controller
+                exports no freshness stamp. Fix the telemetry, then read the
+                state — and do not restart anything on the strength of this.
+              state_now: MONITORING_UNKNOWN
+              since: "≥ 1m before this fired (the alert's for:); the absence branches add their 2m absent_over_time window"
+              reason: "controller_observation: no samples for 2m (controller_state, vllm_scrape_target), state code 0 (controller_observation), snapshot stamp > 30s old (controller_stale), or no stamp exported (controller_stamp)"
+              runbook: docs/availability/RUNBOOK.md#monitoring-unknown
+              safe_command: "curl -s http://127.0.0.1:9838/healthz; curl -s http://127.0.0.1:9838/state | jq '.state,.generated_at,.reason'; docker ps --filter name=engine-controller; curl -s http://127.0.0.1:9090/api/v1/targets | jq '.data.activeTargets[] | select(.labels.job==\"engine-controller\" or .labels.job==\"vllm-main\") | {job:.labels.job,health,lastError}'"
+      # ...and the derived state is 0 (the tile says MONITORING_UNKNOWN), and
+      # nothing else in the group mistakes it for DOWN.
+      - eval_time: 6m
+        alertname: VllmPrimaryDown
+        exp_alerts: []
+
+  # The frozen-snapshot case: the controller's HTTP thread keeps serving a
+  # READY snapshot whose stamp stopped at t=60. From t=90 the verdict is
+  # stale; the alert fires a minute later, and the derived state has no
+  # sample so the tile is grey at the same moment.
+  - interval: 5s
+    name: "MonitoringUnknown fires on a stale controller stamp (controller_stale), carrying the age"
+    input_series:
+      - series: 'techsara_vllm_state_code{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '2x60'
+      - series: 'techsara_vllm_state{state="READY",instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '1x60'
+      - series: 'techsara_vllm_generated_at_seconds{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0+5x12 60x48'
+      - series: 'up{instance="host.docker.internal:8000",job="vllm-main",service="main",role="head",engine_scope="cluster"}'
+        values: '1x60'
+    alert_rule_test:
+      - eval_time: 1m20s
+        alertname: VllmMonitoringUnknown
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: VllmMonitoringUnknown
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: main
+              state: MONITORING_UNKNOWN
+              missing: controller_stale
+              instance: host.docker.internal:9838
+              job: engine-controller
+              role: head
+              engine_scope: cluster
+            exp_annotations:
+              summary: "vLLM engine state cannot be observed (controller_stale)"
+              description: >-
+                Inference may be fine. Nothing on this page can vouch for the
+                engine either way, so the overview shows MONITORING_UNKNOWN
+                rather than guessing. controller_state / vllm_scrape_target: a
+                scrape is missing. controller_observation: the controller
+                itself cannot see the engine. controller_stale: the controller's
+                snapshot is frozen (its tick stopped; the state it still serves
+                is the last one it computed). controller_stamp: the controller
+                exports no freshness stamp. Fix the telemetry, then read the
+                state — and do not restart anything on the strength of this.
+              state_now: READY
+              since: "≥ 1m before this fired (the alert's for:); the absence branches add their 2m absent_over_time window"
+              reason: "controller_stale: no samples for 2m (controller_state, vllm_scrape_target), state code 0 (controller_observation), snapshot stamp > 30s old (controller_stale), or no stamp exported (controller_stamp)"
+              runbook: docs/availability/RUNBOOK.md#monitoring-unknown
+              safe_command: "curl -s http://127.0.0.1:9838/healthz; curl -s http://127.0.0.1:9838/state | jq '.state,.generated_at,.reason'; docker ps --filter name=engine-controller; curl -s http://127.0.0.1:9090/api/v1/targets | jq '.data.activeTargets[] | select(.labels.job==\"engine-controller\" or .labels.job==\"vllm-main\") | {job:.labels.job,health,lastError}'"
+
+  - interval: 5s
+    name: "MonitoringUnknown fires when the controller exports no freshness stamp (controller_stamp)"
+    input_series:
+      - series: 'techsara_vllm_state_code{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '2x60'
+      - series: 'up{instance="host.docker.internal:8000",job="vllm-main",service="main",role="head",engine_scope="cluster"}'
+        values: '1x60'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: VllmMonitoringUnknown
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: main
+              state: MONITORING_UNKNOWN
+              missing: controller_stamp
+              instance: host.docker.internal:9838
+              job: engine-controller
+              role: head
+              engine_scope: cluster
+            exp_annotations:
+              summary: "vLLM engine state cannot be observed (controller_stamp)"
+              description: >-
+                Inference may be fine. Nothing on this page can vouch for the
+                engine either way, so the overview shows MONITORING_UNKNOWN
+                rather than guessing. controller_state / vllm_scrape_target: a
+                scrape is missing. controller_observation: the controller
+                itself cannot see the engine. controller_stale: the controller's
+                snapshot is frozen (its tick stopped; the state it still serves
+                is the last one it computed). controller_stamp: the controller
+                exports no freshness stamp. Fix the telemetry, then read the
+                state — and do not restart anything on the strength of this.
+              state_now: MONITORING_UNKNOWN
+              since: "≥ 1m before this fired (the alert's for:); the absence branches add their 2m absent_over_time window"
+              reason: "controller_stamp: no samples for 2m (controller_state, vllm_scrape_target), state code 0 (controller_observation), snapshot stamp > 30s old (controller_stale), or no stamp exported (controller_stamp)"
+              runbook: docs/availability/RUNBOOK.md#monitoring-unknown
+              safe_command: "curl -s http://127.0.0.1:9838/healthz; curl -s http://127.0.0.1:9838/state | jq '.state,.generated_at,.reason'; docker ps --filter name=engine-controller; curl -s http://127.0.0.1:9090/api/v1/targets | jq '.data.activeTargets[] | select(.labels.job==\"engine-controller\" or .labels.job==\"vllm-main\") | {job:.labels.job,health,lastError}'"
+
+  # ==================================================== VllmEngineWedged
+  - interval: 5s
+    name: "EngineWedged fires after 30s of state 5, carrying the time in state"
+    input_series:
+      - series: 'techsara_vllm_state_code{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '5x60'
+      - series: 'techsara_vllm_state{state="WEDGED",instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '1x60'
+      - series: 'techsara_vllm_state_since_timestamp_seconds{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0x60'
+    alert_rule_test:
+      # 20s in: pending, not firing.
+      - eval_time: 20s
+        alertname: VllmEngineWedged
+        exp_alerts: []
+      - eval_time: 45s
+        alertname: VllmEngineWedged
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              service: main
+              state: WEDGED
+              instance: host.docker.internal:9838
+              job: engine-controller
+              role: head
+              engine_scope: cluster
+            exp_annotations:
+              summary: "vLLM engine WEDGED for 45s — requests in flight, no tokens moving"
+              description: >-
+                The head still answers /health, /v1/models and /metrics, but the
+                engine is not completing anything. Every in-flight request will
+                fail when vLLM's own 300 s execute timeout fires. The controller
+                is about to run a coordinated recovery (or already is — check
+                .recovery in /state); do not restart containers by hand while it
+                holds the lock. New requests are being queued by the orchestrator
+                and resume on the same generation when READY returns.
+              state_now: WEDGED
+              since: "45s in WEDGED (controller since-stamp); confirmed ≥ 30s before this fired"
+              reason: "controller state WEDGED: token counters frozen with requests running, or the canary outstanding ≥ 60s while /health answers 200"
+              runbook: docs/availability/RUNBOOK.md#wedged
+              safe_command: "curl -s http://127.0.0.1:9838/state | jq '.state,.reason,.incident,.signals.engine,.recovery'"
+
+  - interval: 5s
+    name: "EngineWedged does not fire for READY, and stops when the controller moves on to RECOVERING"
+    input_series:
+      - series: 'techsara_vllm_state_code{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '2x12 5x12 6x24'
+      - series: 'techsara_vllm_state_since_timestamp_seconds{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0x12 60x12 120x24'
+    alert_rule_test:
+      - eval_time: 55s
+        alertname: VllmEngineWedged
+        exp_alerts: []
+      - eval_time: 2m30s
+        alertname: VllmEngineWedged
+        exp_alerts: []
+
+  # Stale-marker case (CONTRACT §10): firing at 1m45s, gone at 3m once the
+  # controller's series carry staleness markers — nothing lingers for the
+  # 5-minute lookback.
+  - interval: 5s
+    name: "EngineWedged clears when the controller goes stale"
+    input_series:
+      - series: 'techsara_vllm_state_code{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '5x24 stale'
+      - series: 'techsara_vllm_state{state="WEDGED",instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '1x24 stale'
+      - series: 'techsara_vllm_state_since_timestamp_seconds{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0x24 stale'
+    alert_rule_test:
+      - eval_time: 1m45s
+        alertname: VllmEngineWedged
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              service: main
+              state: WEDGED
+              instance: host.docker.internal:9838
+              job: engine-controller
+              role: head
+              engine_scope: cluster
+            exp_annotations:
+              summary: "vLLM engine WEDGED for 1m 45s — requests in flight, no tokens moving"
+              description: >-
+                The head still answers /health, /v1/models and /metrics, but the
+                engine is not completing anything. Every in-flight request will
+                fail when vLLM's own 300 s execute timeout fires. The controller
+                is about to run a coordinated recovery (or already is — check
+                .recovery in /state); do not restart containers by hand while it
+                holds the lock. New requests are being queued by the orchestrator
+                and resume on the same generation when READY returns.
+              state_now: WEDGED
+              since: "1m 45s in WEDGED (controller since-stamp); confirmed ≥ 30s before this fired"
+              reason: "controller state WEDGED: token counters frozen with requests running, or the canary outstanding ≥ 60s while /health answers 200"
+              runbook: docs/availability/RUNBOOK.md#wedged
+              safe_command: "curl -s http://127.0.0.1:9838/state | jq '.state,.reason,.incident,.signals.engine,.recovery'"
+      - eval_time: 3m
+        alertname: VllmEngineWedged
+        exp_alerts: []
+
+  # ====================================================== VllmPrimaryDown
+  - interval: 5s
+    name: "PrimaryDown fires when DOWN with a fresh verdict and an empty queue"
+    input_series:
+      - series: 'techsara_vllm_state_code{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '8x60'
+      - series: 'techsara_vllm_state{state="DOWN",instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '1x60'
+      - series: 'techsara_vllm_generated_at_seconds{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0+5x60'
+      - series: 'llm_queued_generations{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: VllmPrimaryDown
+        exp_alerts:
+          - exp_labels: { severity: critical, service: main, state: DOWN }
+            exp_annotations:
+              summary: "Primary model DOWN — nothing answers users; queued requests are held"
+              description: >-
+                The main model is not serving and the controller has stopped
+                restarting it: the recovery budget is exhausted
+                (VllmRecoveryBudgetExhausted will be firing too) or the last
+                recovery failed. There is no fallback model. Requests people
+                send are accepted and queued (`queued` below) and resume on
+                their own generation once READY returns; until an operator acts
+                nobody gets an answer.
+              state_now: DOWN
+              queued: "0"
+              since: "≥ 1m before this fired (the alert's for:); the controller's DOWN transition is techsara_vllm_state_since_timestamp_seconds"
+              reason: "controller state DOWN (fresh verdict); the failure category is on the overview's Reason tile and in /state .incident.category"
+              runbook: docs/availability/RUNBOOK.md#primary-down
+              safe_command: "curl -s http://127.0.0.1:9838/state | jq '.state,.reason,.incident,.recovery'; curl -s http://127.0.0.1:8080/metrics | grep -E '^llm_queued_generations'"
+
+  # DOWN with people waiting is still DOWN (the derived state never turns 8
+  # into 7); the queue is the head-count in the annotation.
+  - interval: 5s
+    name: "PrimaryDown fires when DOWN with queued requests, and carries the count"
+    input_series:
+      - series: 'techsara_vllm_state_code{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '8x60'
+      - series: 'techsara_vllm_state{state="DOWN",instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '1x60'
+      - series: 'techsara_vllm_generated_at_seconds{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0+5x60'
+      - series: 'llm_queued_generations{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator"}'
+        values: '4x60'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: VllmPrimaryDown
+        exp_alerts:
+          - exp_labels: { severity: critical, service: main, state: DOWN }
+            exp_annotations:
+              summary: "Primary model DOWN — nothing answers users; queued requests are held"
+              description: >-
+                The main model is not serving and the controller has stopped
+                restarting it: the recovery budget is exhausted
+                (VllmRecoveryBudgetExhausted will be firing too) or the last
+                recovery failed. There is no fallback model. Requests people
+                send are accepted and queued (`queued` below) and resume on
+                their own generation once READY returns; until an operator acts
+                nobody gets an answer.
+              state_now: DOWN
+              queued: "4"
+              since: "≥ 1m before this fired (the alert's for:); the controller's DOWN transition is techsara_vllm_state_since_timestamp_seconds"
+              reason: "controller state DOWN (fresh verdict); the failure category is on the overview's Reason tile and in /state .incident.category"
+              runbook: docs/availability/RUNBOOK.md#primary-down
+              safe_command: "curl -s http://127.0.0.1:9838/state | jq '.state,.reason,.incident,.recovery'; curl -s http://127.0.0.1:8080/metrics | grep -E '^llm_queued_generations'"
+
+  - interval: 5s
+    name: "PrimaryDown fires when DOWN and the orchestrator is not scraped at all (queued: unknown)"
+    input_series:
+      - series: 'techsara_vllm_state_code{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '8x60'
+      - series: 'techsara_vllm_generated_at_seconds{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0+5x60'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: VllmPrimaryDown
+        exp_alerts:
+          - exp_labels: { severity: critical, service: main, state: DOWN }
+            exp_annotations:
+              summary: "Primary model DOWN — nothing answers users; queued requests are held"
+              description: >-
+                The main model is not serving and the controller has stopped
+                restarting it: the recovery budget is exhausted
+                (VllmRecoveryBudgetExhausted will be firing too) or the last
+                recovery failed. There is no fallback model. Requests people
+                send are accepted and queued (`queued` below) and resume on
+                their own generation once READY returns; until an operator acts
+                nobody gets an answer.
+              state_now: MONITORING_UNKNOWN
+              queued: unknown
+              since: "≥ 1m before this fired (the alert's for:); the controller's DOWN transition is techsara_vllm_state_since_timestamp_seconds"
+              reason: "controller state DOWN (fresh verdict); the failure category is on the overview's Reason tile and in /state .incident.category"
+              runbook: docs/availability/RUNBOOK.md#primary-down
+              safe_command: "curl -s http://127.0.0.1:9838/state | jq '.state,.reason,.incident,.recovery'; curl -s http://127.0.0.1:8080/metrics | grep -E '^llm_queued_generations'"
+
+  - interval: 5s
+    name: "PrimaryDown does not fire with no controller (absence is MonitoringUnknown's)"
+    input_series:
+      - series: 'llm_queued_generations{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: VllmPrimaryDown
+        exp_alerts: []
+
+  # A DOWN whose stamp froze is not a DOWN we can vouch for: the derived
+  # state drops out and MonitoringUnknown (controller_stale) carries it.
+  - interval: 5s
+    name: "PrimaryDown does not fire on a stale DOWN verdict"
+    input_series:
+      - series: 'techsara_vllm_state_code{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '8x60'
+      - series: 'techsara_vllm_generated_at_seconds{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: VllmPrimaryDown
+        exp_alerts: []
+
+  # ===================================================== VllmReadyUnproven
+  # The controller says READY with a fresh stamp but its last real success
+  # was at t=30 and nothing since: the canary thread is dead. Age exceeds
+  # 120 from t=155, for: 1m -> firing from 3m35s; a success at t=240 clears it.
+  - interval: 5s
+    name: "ReadyUnproven fires when READY is claimed with no success for over 2m, and clears on the next success"
+    input_series:
+      - series: 'techsara_vllm_state_code{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '2x72'
+      - series: 'techsara_vllm_state{state="READY",instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '1x72'
+      - series: 'techsara_vllm_generated_at_seconds{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0+5x72'
+      - series: 'techsara_vllm_last_success_timestamp_seconds{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '30x48 240x24'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: VllmReadyUnproven
+        exp_alerts: []
+      - eval_time: 3m45s
+        alertname: VllmReadyUnproven
+        exp_alerts:
+          - exp_labels: { severity: critical, service: main, state: MONITORING_UNKNOWN }
+            exp_annotations:
+              summary: "Controller claims READY but has proven nothing for 3m 15s — treat the state as unknown"
+              description: >-
+                No real completion has succeeded on the primary for over two
+                minutes while the controller reports READY/BUSY. The canary is
+                stuck, dead, or its result is not reaching the state machine.
+                Do not trust the engine tile until a completion succeeds; run
+                a real probe, and read the controller's log before its state.
+              state_now: READY
+              since: "last success 3m 15s ago; ≥ 1m before this fired (the alert's for:)"
+              reason: "cluster:vllm_last_success_age_seconds > 120 while techsara_vllm_state_code is 2 or 3"
+              runbook: docs/availability/RUNBOOK.md#ready-unproven
+              safe_command: "curl -s http://127.0.0.1:9838/state | jq '.state,.generated_at,.signals.canary'; docker logs --tail 50 sf-local-ai-engine-controller-1; scripts/cluster-verify-engine.sh --probe"
+      - eval_time: 4m30s
+        alertname: VllmReadyUnproven
+        exp_alerts: []
+
+  - interval: 5s
+    name: "ReadyUnproven is silent while the controller is honest (DEGRADED with an old success)"
+    input_series:
+      - series: 'techsara_vllm_state_code{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '4x72'
+      - series: 'techsara_vllm_generated_at_seconds{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0+5x72'
+      - series: 'techsara_vllm_last_success_timestamp_seconds{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '30x72'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: VllmReadyUnproven
+        exp_alerts: []
+
+  # ========================================= VllmRecoveryBudgetExhausted
+  - interval: 5s
+    name: "RecoveryBudgetExhausted fires on the category while DOWN, and clears when the engine comes back by itself"
+    input_series:
+      - series: 'techsara_vllm_last_failure_category{category="budget_exhausted",instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '1x60'
+      - series: 'techsara_vllm_last_failure_category{category="none",instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0x60'
+      - series: 'techsara_vllm_state_code{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '8x30 2x30'
+      - series: 'techsara_vllm_state{state="DOWN",instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '1x30 0x30'
+      - series: 'techsara_vllm_state{state="READY",instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0x30 1x30'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: VllmRecoveryBudgetExhausted
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              service: main
+              state: DOWN
+              category: budget_exhausted
+              instance: host.docker.internal:9838
+              job: engine-controller
+              role: head
+              engine_scope: cluster
+            exp_annotations:
+              summary: "vLLM recovery budget exhausted — automatic restarts stopped"
+              description: >-
+                Something is failing faster than a restart fixes it. Evidence for
+                every attempt is under .runtime/incidents/<id>/. A human decides
+                whether to restart again; the controller will not. Queued
+                requests stay queued until it does.
+              state_now: DOWN
+              since: "≥ 15s before this fired; the budget window is .recovery.window_s in /state"
+              reason: "failure category budget_exhausted: RECOVERY_BUDGET recoveries started inside RECOVERY_WINDOW_S and the engine is still DOWN"
+              runbook: docs/availability/RUNBOOK.md#recovery-budget-exhausted
+              safe_command: "curl -s http://127.0.0.1:9838/state | jq '.recovery'; ls -t .runtime/incidents | head -3"
+      - eval_time: 3m
+        alertname: VllmRecoveryBudgetExhausted
+        exp_alerts: []
+
+  # ================================================ VllmWorkerRankAbsent
+  - interval: 5s
+    name: "WorkerRankAbsent fires after 1m with the sentinel reachable and the engine not restarting; the live name is an annotation"
+    input_series:
+      - series: 'techsara_vllm_worker_rank_alive{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0x60'
+      - series: 'techsara_vllm_worker_reachable{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '1x60'
+      - series: 'techsara_vllm_state_code{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '4x60'
+      - series: 'techsara_vllm_state{state="DEGRADED",instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '1x60'
+      - series: 'techsara_vllm_state{state="READY",instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: VllmWorkerRankAbsent
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              service: main
+              state: DOWN
+              instance: host.docker.internal:9838
+              job: engine-controller
+              role: head
+              engine_scope: cluster
+            exp_annotations:
+              summary: "vLLM worker rank (Spark 2) is absent and no recovery is running"
+              description: >-
+                The sentinel reports no VLLM::Worker_TP1 process in the worker
+                container and no recovery is in progress. The head will hang on
+                its next collective. If the controller has budget it acts within
+                one observation; if this persists, the budget is gone.
+              state_now: DEGRADED
+              since: "≥ 1m before this fired (the alert's for:); the sentinel's own record is .signals.worker.last_fault in /state"
+              reason: "worker rank process not alive per the sentinel, sentinel reachable, controller not in STARTING/RECOVERING"
+              runbook: docs/availability/RUNBOOK.md#worker-rank-absent
+              safe_command: "curl -s http://127.0.0.1:9838/state | jq '.signals.worker,.recovery'"
+
+  - interval: 5s
+    name: "WorkerRankAbsent is silent during RECOVERING, and when the sentinel is unreachable"
+    input_series:
+      - series: 'techsara_vllm_worker_rank_alive{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0x60'
+      # first two minutes: recovering (reachable); last three: sentinel gone
+      - series: 'techsara_vllm_worker_reachable{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '1x24 0x36'
+      - series: 'techsara_vllm_state_code{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '6x24 4x36'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: VllmWorkerRankAbsent
+        exp_alerts: []
+      - eval_time: 4m30s
+        alertname: VllmWorkerRankAbsent
+        exp_alerts: []
+
+  # State churn: the controller walks READY -> DEGRADED -> DOWN -> DEGRADED
+  # every 20 s while the rank stays dead. With the v1 join every hop was a
+  # new alert instance and `for:` never completed; now the label set is
+  # fixed and the alert fires at for + one evaluation.
+  - interval: 5s
+    name: "WorkerRankAbsent fires on schedule while the controller state churns"
+    input_series:
+      - series: 'techsara_vllm_worker_rank_alive{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0x60'
+      - series: 'techsara_vllm_worker_reachable{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '1x60'
+      - series: 'techsara_vllm_state_code{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '2 2 2 2 4 4 4 4 8 8 8 8 4 4 4 4 2 2 2 2 4 4 4 4 8 8 8 8 4 4 4 4 2 2 2 2 4 4 4 4 8 8 8 8 4 4 4 4 2 2 2 2 4 4 4 4 8 8 8 8'
+      - series: 'techsara_vllm_state{state="READY",instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '1 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 1 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 1 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 1 1 1 1 0 0 0 0 0 0 0 0'
+      - series: 'techsara_vllm_state{state="DEGRADED",instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0 0 0 0 1 1 1 1 0 0 0 0 1 1 1 1 0 0 0 0 1 1 1 1 0 0 0 0 1 1 1 1 0 0 0 0 1 1 1 1 0 0 0 0 1 1 1 1 0 0 0 0 1 1 1 1 0 0 0 0'
+      - series: 'techsara_vllm_state{state="DOWN",instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0 0 0 0 0 0 0 0 1 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 1 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 1 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 55s
+        alertname: VllmWorkerRankAbsent
+        exp_alerts: []
+      # t=65: sample 13 -> DEGRADED
+      - eval_time: 1m5s
+        alertname: VllmWorkerRankAbsent
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              service: main
+              state: DOWN
+              instance: host.docker.internal:9838
+              job: engine-controller
+              role: head
+              engine_scope: cluster
+            exp_annotations:
+              summary: "vLLM worker rank (Spark 2) is absent and no recovery is running"
+              description: >-
+                The sentinel reports no VLLM::Worker_TP1 process in the worker
+                container and no recovery is in progress. The head will hang on
+                its next collective. If the controller has budget it acts within
+                one observation; if this persists, the budget is gone.
+              state_now: DEGRADED
+              since: "≥ 1m before this fired (the alert's for:); the sentinel's own record is .signals.worker.last_fault in /state"
+              reason: "worker rank process not alive per the sentinel, sentinel reachable, controller not in STARTING/RECOVERING"
+              runbook: docs/availability/RUNBOOK.md#worker-rank-absent
+              safe_command: "curl -s http://127.0.0.1:9838/state | jq '.signals.worker,.recovery'"
+      # t=210: sample 42 -> DOWN; still the same alert instance, still firing
+      - eval_time: 3m30s
+        alertname: VllmWorkerRankAbsent
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              service: main
+              state: DOWN
+              instance: host.docker.internal:9838
+              job: engine-controller
+              role: head
+              engine_scope: cluster
+            exp_annotations:
+              summary: "vLLM worker rank (Spark 2) is absent and no recovery is running"
+              description: >-
+                The sentinel reports no VLLM::Worker_TP1 process in the worker
+                container and no recovery is in progress. The head will hang on
+                its next collective. If the controller has budget it acts within
+                one observation; if this persists, the budget is gone.
+              state_now: DOWN
+              since: "≥ 1m before this fired (the alert's for:); the sentinel's own record is .signals.worker.last_fault in /state"
+              reason: "worker rank process not alive per the sentinel, sentinel reachable, controller not in STARTING/RECOVERING"
+              runbook: docs/availability/RUNBOOK.md#worker-rank-absent
+              safe_command: "curl -s http://127.0.0.1:9838/state | jq '.signals.worker,.recovery'"
+
+  # Two one-hot values at 1 (a controller bug) used to turn the join into a
+  # many-to-many error and silence the alert. Now the alert fires, and the
+  # annotation refuses to pick one: an ambiguous one-hot cannot be named.
+  - interval: 5s
+    name: "WorkerRankAbsent still fires when the controller's one-hot is malformed (two states at 1); state_now is MONITORING_UNKNOWN"
+    input_series:
+      - series: 'techsara_vllm_worker_rank_alive{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0x60'
+      - series: 'techsara_vllm_worker_reachable{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '1x60'
+      - series: 'techsara_vllm_state_code{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '4x60'
+      - series: 'techsara_vllm_state{state="READY",instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '1x60'
+      - series: 'techsara_vllm_state{state="DEGRADED",instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '1x60'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: VllmWorkerRankAbsent
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              service: main
+              state: DOWN
+              instance: host.docker.internal:9838
+              job: engine-controller
+              role: head
+              engine_scope: cluster
+            exp_annotations:
+              summary: "vLLM worker rank (Spark 2) is absent and no recovery is running"
+              description: >-
+                The sentinel reports no VLLM::Worker_TP1 process in the worker
+                container and no recovery is in progress. The head will hang on
+                its next collective. If the controller has budget it acts within
+                one observation; if this persists, the budget is gone.
+              state_now: MONITORING_UNKNOWN
+              since: "≥ 1m before this fired (the alert's for:); the sentinel's own record is .signals.worker.last_fault in /state"
+              reason: "worker rank process not alive per the sentinel, sentinel reachable, controller not in STARTING/RECOVERING"
+              runbook: docs/availability/RUNBOOK.md#worker-rank-absent
+              safe_command: "curl -s http://127.0.0.1:9838/state | jq '.signals.worker,.recovery'"
+
+  - interval: 5s
+    name: "WorkerRankAbsent still fires when the controller exports the code but not the one-hot (state_now MONITORING_UNKNOWN)"
+    input_series:
+      - series: 'techsara_vllm_worker_rank_alive{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0x60'
+      - series: 'techsara_vllm_worker_reachable{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '1x60'
+      - series: 'techsara_vllm_state_code{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '4x60'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: VllmWorkerRankAbsent
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              service: main
+              state: DOWN
+              instance: host.docker.internal:9838
+              job: engine-controller
+              role: head
+              engine_scope: cluster
+            exp_annotations:
+              summary: "vLLM worker rank (Spark 2) is absent and no recovery is running"
+              description: >-
+                The sentinel reports no VLLM::Worker_TP1 process in the worker
+                container and no recovery is in progress. The head will hang on
+                its next collective. If the controller has budget it acts within
+                one observation; if this persists, the budget is gone.
+              state_now: MONITORING_UNKNOWN
+              since: "≥ 1m before this fired (the alert's for:); the sentinel's own record is .signals.worker.last_fault in /state"
+              reason: "worker rank process not alive per the sentinel, sentinel reachable, controller not in STARTING/RECOVERING"
+              runbook: docs/availability/RUNBOOK.md#worker-rank-absent
+              safe_command: "curl -s http://127.0.0.1:9838/state | jq '.signals.worker,.recovery'"
+
+  # Stale-marker case: firing at 1m45s, gone at 3m.
+  - interval: 5s
+    name: "WorkerRankAbsent clears when the controller goes stale"
+    input_series:
+      - series: 'techsara_vllm_worker_rank_alive{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0x24 stale'
+      - series: 'techsara_vllm_worker_reachable{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '1x24 stale'
+      - series: 'techsara_vllm_state_code{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '8x24 stale'
+      - series: 'techsara_vllm_state{state="DOWN",instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '1x24 stale'
+    alert_rule_test:
+      - eval_time: 1m45s
+        alertname: VllmWorkerRankAbsent
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              service: main
+              state: DOWN
+              instance: host.docker.internal:9838
+              job: engine-controller
+              role: head
+              engine_scope: cluster
+            exp_annotations:
+              summary: "vLLM worker rank (Spark 2) is absent and no recovery is running"
+              description: >-
+                The sentinel reports no VLLM::Worker_TP1 process in the worker
+                container and no recovery is in progress. The head will hang on
+                its next collective. If the controller has budget it acts within
+                one observation; if this persists, the budget is gone.
+              state_now: DOWN
+              since: "≥ 1m before this fired (the alert's for:); the sentinel's own record is .signals.worker.last_fault in /state"
+              reason: "worker rank process not alive per the sentinel, sentinel reachable, controller not in STARTING/RECOVERING"
+              runbook: docs/availability/RUNBOOK.md#worker-rank-absent
+              safe_command: "curl -s http://127.0.0.1:9838/state | jq '.signals.worker,.recovery'"
+      - eval_time: 3m
+        alertname: VllmWorkerRankAbsent
+        exp_alerts: []
+
+  # ================================================ VllmGenerationFrozen
+  - interval: 5s
+    name: "GenerationFrozen fires with requests running, not with an idle scheduler"
+    input_series:
+      - series: 'techsara_vllm_generation_frozen_seconds{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0+5x60'
+      - series: 'techsara_vllm_state_code{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '3x60'
+      - series: 'techsara_vllm_state{state="BUSY",instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '1x60'
+      # 9 requests running for the whole test — the 2026-09-11 shape.
+      - series: 'vllm:num_requests_running{instance="host.docker.internal:8000",job="vllm-main",service="main",role="head",engine_scope="cluster",engine="0",model_name="m"}'
+        values: '9x60'
+    alert_rule_test:
+      # frozen_seconds reaches 95 at t=95s; +30s for -> firing from ~2m05s
+      - eval_time: 1m30s
+        alertname: VllmGenerationFrozen
+        exp_alerts: []
+      - eval_time: 2m30s
+        alertname: VllmGenerationFrozen
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              service: main
+              state: WEDGED
+              instance: host.docker.internal:9838
+              job: engine-controller
+              role: head
+              engine_scope: cluster
+            exp_annotations:
+              summary: "vLLM token counters frozen for 2m 30s with requests running"
+              description: >-
+                Requests are scheduled but no prompt or generation token has been
+                counted for over 90 seconds. This is the exact shape of the
+                2026-09-11 wedge: a dead rank with the head blocked in a
+                collective, /health still green.
+              state_now: BUSY
+              since: "2m 30s frozen (controller measurement); ≥ 30s before this fired"
+              reason: "generation_tokens_total and prompt_tokens_total unchanged for > 90s while num_requests_running > 0"
+              runbook: docs/availability/RUNBOOK.md#generation-frozen
+              safe_command: "curl -s http://127.0.0.1:9838/state | jq '.signals.engine,.signals.canary'"
+
+  - interval: 5s
+    name: "GenerationFrozen is silent when nothing is running (an idle engine has frozen counters by definition)"
+    input_series:
+      - series: 'techsara_vllm_generation_frozen_seconds{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '600x60'
+      - series: 'techsara_vllm_state_code{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '2x60'
+      - series: 'vllm:num_requests_running{instance="host.docker.internal:8000",job="vllm-main",service="main",role="head",engine_scope="cluster",engine="0",model_name="m"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: VllmGenerationFrozen
+        exp_alerts: []
+
+  # THE 2026-09-11 PROGRESSION, as the controller really walks it: BUSY for
+  # 60 s, DEGRADED ("canary outstanding") for 40 s, WEDGED for one tick,
+  # RECOVERING from t=105. frozen_seconds > 90 holds from t=95; the review
+  # reproduced the v1 rule never firing on exactly this input because each
+  # state hop reset `for:`. It must fire at 2m05s and stay firing.
+  - interval: 5s
+    name: "GenerationFrozen fires on the 2026-09-11 progression while the controller state hops BUSY -> DEGRADED -> WEDGED -> RECOVERING"
+    input_series:
+      - series: 'techsara_vllm_generation_frozen_seconds{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0+5x60'
+      - series: 'techsara_vllm_state_code{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '3x12 4x8 5 6x40'
+      - series: 'techsara_vllm_state{state="BUSY",instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '1x12 0x49'
+      - series: 'techsara_vllm_state{state="DEGRADED",instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0x12 1x8 0x41'
+      - series: 'techsara_vllm_state{state="WEDGED",instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0x20 1 0x40'
+      - series: 'techsara_vllm_state{state="RECOVERING",instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0x21 1x40'
+      - series: 'vllm:num_requests_running{instance="host.docker.internal:8000",job="vllm-main",service="main",role="head",engine_scope="cluster",engine="0",model_name="m"}'
+        values: '9x60'
+    alert_rule_test:
+      - eval_time: 1m45s
+        alertname: VllmGenerationFrozen
+        exp_alerts: []
+      - eval_time: 2m10s
+        alertname: VllmGenerationFrozen
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              service: main
+              state: WEDGED
+              instance: host.docker.internal:9838
+              job: engine-controller
+              role: head
+              engine_scope: cluster
+            exp_annotations:
+              summary: "vLLM token counters frozen for 2m 10s with requests running"
+              description: >-
+                Requests are scheduled but no prompt or generation token has been
+                counted for over 90 seconds. This is the exact shape of the
+                2026-09-11 wedge: a dead rank with the head blocked in a
+                collective, /health still green.
+              state_now: RECOVERING
+              since: "2m 10s frozen (controller measurement); ≥ 30s before this fired"
+              reason: "generation_tokens_total and prompt_tokens_total unchanged for > 90s while num_requests_running > 0"
+              runbook: docs/availability/RUNBOOK.md#generation-frozen
+              safe_command: "curl -s http://127.0.0.1:9838/state | jq '.signals.engine,.signals.canary'"
+
+  # ========================================= VllmRepeatedRecoveryFailure
+  # Two failures in an hour while the state flips READY<->BUSY every 10 s
+  # (20 flips an hour under normal load, measured): the alert must reach
+  # firing regardless of the churn.
+  - interval: 5s
+    name: "RepeatedRecoveryFailure fires on the second failed attempt in an hour, through READY/BUSY churn"
+    input_series:
+      # registered at 0, fails at t=1m and t=3m
+      - series: 'techsara_vllm_recovery_attempts_total{outcome="failed",instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0x12 1x24 2x36'
+      - series: 'techsara_vllm_state_code{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '2 2 3 3 2 2 3 3 2 2 3 3 2 2 3 3 2 2 3 3 2 2 3 3 2 2 3 3 2 2 3 3 2 2 3 3 2 2 3 3 2 2 3 3 2 2 3 3 2 2 3 3 2 2 3 3 2 2 3 3 2 2 3 3 2 2 3 3 2 2 3 3'
+      - series: 'techsara_vllm_state{state="READY",instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0'
+      - series: 'techsara_vllm_state{state="BUSY",instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: VllmRepeatedRecoveryFailure
+        exp_alerts: []
+      # t=300: sample 60 -> READY
+      - eval_time: 5m
+        alertname: VllmRepeatedRecoveryFailure
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              service: main
+              state: DOWN
+              outcome: failed
+              instance: host.docker.internal:9838
+              job: engine-controller
+              role: head
+              engine_scope: cluster
+            exp_annotations:
+              summary: "2 vLLM recoveries failed in the last hour"
+              description: >-
+                Each failed attempt has its diagnostics under
+                .runtime/incidents/<id>/ (head log tail, worker log tail, /state
+                at detection). Read those before trying a third time — a rank
+                that dies on load is a different problem from one that dies
+                under mixed prefill+decode load.
+              state_now: READY
+              since: "window: the last 1h; ≥ 1m before this fired"
+              reason: "increase(techsara_vllm_recovery_attempts_total{outcome=\"failed\"}[1h]) >= 2"
+              runbook: docs/availability/RUNBOOK.md#repeated-recovery-failure
+              safe_command: "ls -t .runtime/incidents | head -5; curl -s http://127.0.0.1:9838/state | jq '.recovery'"
+
+  # ==================================================== VllmMetricsStale
+  # Branch 1, the contract's expression: Prometheus stops ingesting vLLM
+  # samples at t=1m (no staleness marker — the target is not gone, the
+  # ingest stalled). Note this is the ONLY shape the age branch can see.
+  - interval: 5s
+    name: "MetricsStale (prometheus_age) fires when vLLM samples stop arriving while the canary succeeds, and only then"
+    input_series:
+      - series: 'vllm:generation_tokens_total{instance="host.docker.internal:8000",job="vllm-main",service="main",role="head",engine_scope="cluster",engine="0",model_name="m"}'
+        values: '100+10x12 _x60'
+      # canary succeeding until t=4m, failing after
+      - series: 'techsara_vllm_synthetic_success{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '1x48 0x36'
+      - series: 'techsara_vllm_head_metrics_ok{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '1x84'
+      - series: 'techsara_vllm_state_code{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '2x48 5x36'
+      - series: 'techsara_vllm_state{state="READY",instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '1x48 0x36'
+      - series: 'techsara_vllm_state{state="WEDGED",instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0x48 1x36'
+    alert_rule_test:
+      # the last vLLM sample is at t=60s: age crosses 60 at ~2m05s, pending
+      # for 1m, firing from ~3m10s.
+      - eval_time: 2m45s
+        alertname: VllmMetricsStale
+        exp_alerts: []
+      - eval_time: 3m30s
+        alertname: VllmMetricsStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: main
+              state: DEGRADED
+              cause: prometheus_age
+            exp_annotations:
+              summary: "vLLM /metrics are not reaching Prometheus while the canary succeeds (prometheus_age)"
+              description: >-
+                Dashboards and token-rate rules are reading stale or missing
+                data; the engine itself completed a canary. prometheus_age:
+                Prometheus has ingested no new vLLM sample for over a minute —
+                look at Prometheus's own health first. head_metrics_endpoint:
+                the head's /metrics did not answer the controller — a hung
+                handler on an otherwise working engine; VllmScrapeTargetDown
+                is firing beside this one.
+              state_now: READY
+              since: "≥ 1m before this fired (the alert's for:)"
+              reason: "prometheus_age with techsara_vllm_synthetic_success == 1"
+              runbook: docs/availability/RUNBOOK.md#metrics-stale
+              safe_command: "curl -s -o /dev/null -w '%{http_code} %{time_total}s\n' http://127.0.0.1:8000/metrics; ./scripts/monitoring.sh status"
+      # canary failing from t=4m: stale metrics on a dead engine are not
+      # this alert's business
+      - eval_time: 5m
+        alertname: VllmMetricsStale
+        exp_alerts: []
+
+  # Branch 2: the head's /metrics stops answering the controller at t=1m
+  # (the real scrape writes a staleness marker — modelled here — so the age
+  # branch cannot see it) while the canary keeps succeeding.
+  - interval: 5s
+    name: "MetricsStale (head_metrics_endpoint) fires when the controller's own /metrics GET fails while the canary succeeds"
+    input_series:
+      - series: 'vllm:generation_tokens_total{instance="host.docker.internal:8000",job="vllm-main",service="main",role="head",engine_scope="cluster",engine="0",model_name="m"}'
+        values: '100+10x12 stale'
+      - series: 'techsara_vllm_synthetic_success{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '1x48 0x24'
+      - series: 'techsara_vllm_head_metrics_ok{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '1x12 0x60'
+      - series: 'techsara_vllm_state_code{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '2x12 4x60'
+      - series: 'techsara_vllm_state{state="DEGRADED",instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0x12 1x60'
+    alert_rule_test:
+      - eval_time: 1m30s
+        alertname: VllmMetricsStale
+        exp_alerts: []
+      - eval_time: 2m30s
+        alertname: VllmMetricsStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: main
+              state: DEGRADED
+              cause: head_metrics_endpoint
+            exp_annotations:
+              summary: "vLLM /metrics are not reaching Prometheus while the canary succeeds (head_metrics_endpoint)"
+              description: >-
+                Dashboards and token-rate rules are reading stale or missing
+                data; the engine itself completed a canary. prometheus_age:
+                Prometheus has ingested no new vLLM sample for over a minute —
+                look at Prometheus's own health first. head_metrics_endpoint:
+                the head's /metrics did not answer the controller — a hung
+                handler on an otherwise working engine; VllmScrapeTargetDown
+                is firing beside this one.
+              state_now: DEGRADED
+              since: "≥ 1m before this fired (the alert's for:)"
+              reason: "head_metrics_endpoint with techsara_vllm_synthetic_success == 1"
+              runbook: docs/availability/RUNBOOK.md#metrics-stale
+              safe_command: "curl -s -o /dev/null -w '%{http_code} %{time_total}s\n' http://127.0.0.1:8000/metrics; ./scripts/monitoring.sh status"
+      # canary failing from t=4m -> silent
+      - eval_time: 5m
+        alertname: VllmMetricsStale
+        exp_alerts: []
+
+  # ================================================== VllmRequestsQueued
+  # Three requests queued from t=30 during a recovery: firing from 2m35s.
+  # The queue drains at t=4m (READY from t=3m30s, the resume sweep a poll
+  # later); VllmQueueDrained follows 30 s after that.
+  - interval: 5s
+    name: "RequestsQueued fires after 2m of a non-empty queue, then QueueDrained once it empties"
+    input_series:
+      - series: 'llm_queued_generations{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator"}'
+        values: '0x6 3x42 0x36'
+      - series: 'techsara_vllm_state_code{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '6x42 2x42'
+      - series: 'techsara_vllm_state{state="RECOVERING",instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '1x42 0x42'
+      - series: 'techsara_vllm_state{state="READY",instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0x42 1x42'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: VllmRequestsQueued
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: VllmRequestsQueued
+        exp_alerts:
+          - exp_labels: { severity: warning, service: main, state: QUEUEING }
+            exp_annotations:
+              summary: "3 request(s) queued for the main model for over 2m"
+              description: >-
+                People are waiting. If the engine is STARTING/RECOVERING this
+                clears when READY returns and the resume sweep runs (each queued
+                generation resumes exactly once, on its own id). If state_now is
+                READY/BUSY and the queue is not draining, the resume sweep is the
+                thing to look at, not the engine. If it is DOWN, VllmPrimaryDown
+                is the page and this is the head-count.
+              state_now: RECOVERING
+              since: "queue non-empty for ≥ 2m before this fired (the alert's for:)"
+              reason: "llm_queued_generations > 0 on the orchestrator for 2 minutes"
+              runbook: docs/availability/RUNBOOK.md#requests-queued
+              safe_command: "curl -s http://127.0.0.1:8080/metrics | grep -E '^llm_(queued_generations|breaker_state|engine_state_code|resumed_generations_total)'; curl -s http://127.0.0.1:9838/state | jq '.state,.reason'"
+      - eval_time: 4m30s
+        alertname: VllmRequestsQueued
+        exp_alerts: []
+      - eval_time: 4m20s
+        alertname: VllmQueueDrained
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: VllmQueueDrained
+        exp_alerts:
+          - exp_labels: { severity: info, service: main, state: READY }
+            exp_annotations:
+              summary: "The request queue has drained"
+              description: >-
+                Requests that were queued while the main model was unavailable
+                have all been resumed within the last 15 minutes. Each resumed
+                on its own generation id; the outcomes are in
+                llm_resumed_generations_total{outcome}.
+              state_now: READY
+              since: "queue empty for ≥ 30s after being non-empty within 15m"
+              reason: "llm_queued_generations returned to 0"
+              runbook: docs/availability/RUNBOOK.md#recovery-timeline
+              safe_command: "curl -s http://127.0.0.1:8080/metrics | grep -E '^llm_(queued_generations|resumed_generations_total)'"
+
+  - interval: 5s
+    name: "RequestsQueued is silent with an empty queue, and QueueDrained needs a queue to have existed"
+    input_series:
+      - series: 'llm_queued_generations{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: VllmRequestsQueued
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: VllmQueueDrained
+        exp_alerts: []
+
+  # ================================================ VllmScrapeTargetDown
+  - interval: 5s
+    name: "ScrapeTargetDown fires on up==0 with no controller, without a state label"
+    input_series:
+      - series: 'up{instance="host.docker.internal:8000",job="vllm-main",service="main",role="head",engine_scope="cluster"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: VllmScrapeTargetDown
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: main
+              instance: host.docker.internal:8000
+              job: vllm-main
+              role: head
+              engine_scope: cluster
+            exp_annotations:
+              summary: "vLLM main /metrics is not answering Prometheus"
+              description: >-
+                The head's API server is not serving /metrics and the controller
+                is not restarting it. Read the engine state before assuming an
+                outage: the overview's "vLLM engine" tile, or GET /state on the
+                controller.
+              state_now: MONITORING_UNKNOWN
+              since: "at least 1m before this fired (the alert's for:); startsAt is the first missed scrape"
+              reason: "scrape of host.docker.internal:8000/metrics failing, controller not in STARTING/RECOVERING"
+              runbook: docs/availability/RUNBOOK.md#scrape-target-down
+              safe_command: "curl -s http://127.0.0.1:9838/state | jq '.state,.reason,.signals.api'"
+
+  # Silenced while the controller restarts the pair; when the controller
+  # then reports DOWN the alert fires and its annotation says DOWN — the v1
+  # rule labelled this MONITORING_UNKNOWN next to a DOWN tile.
+  - interval: 5s
+    name: "ScrapeTargetDown is silent during RECOVERING and STARTING, fires again if the engine is DOWN and says so"
+    input_series:
+      - series: 'up{instance="host.docker.internal:8000",job="vllm-main",service="main",role="head",engine_scope="cluster"}'
+        values: '0x72'
+      - series: 'techsara_vllm_state_code{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '6x24 1x24 8x24'
+      - series: 'techsara_vllm_state{state="DOWN",instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0x48 1x24'
+      - series: 'techsara_vllm_state{state="RECOVERING",instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '1x24 0x48'
+      - series: 'techsara_vllm_state{state="STARTING",instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0x24 1x24 0x24'
+    alert_rule_test:
+      - eval_time: 1m50s
+        alertname: VllmScrapeTargetDown
+        exp_alerts: []
+      - eval_time: 3m50s
+        alertname: VllmScrapeTargetDown
+        exp_alerts: []
+      - eval_time: 5m30s
+        alertname: VllmScrapeTargetDown
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: main
+              instance: host.docker.internal:8000
+              job: vllm-main
+              role: head
+              engine_scope: cluster
+            exp_annotations:
+              summary: "vLLM main /metrics is not answering Prometheus"
+              description: >-
+                The head's API server is not serving /metrics and the controller
+                is not restarting it. Read the engine state before assuming an
+                outage: the overview's "vLLM engine" tile, or GET /state on the
+                controller.
+              state_now: DOWN
+              since: "at least 1m before this fired (the alert's for:); startsAt is the first missed scrape"
+              reason: "scrape of host.docker.internal:8000/metrics failing, controller not in STARTING/RECOVERING"
+              runbook: docs/availability/RUNBOOK.md#scrape-target-down
+              safe_command: "curl -s http://127.0.0.1:9838/state | jq '.state,.reason,.signals.api'"
+
+  # ===================================================== VllmQueueBacklog
+  - interval: 5s
+    name: "QueueBacklog fires on a sustained scheduler backlog, without a state label, and names the live state"
+    input_series:
+      - series: 'vllm:num_requests_waiting{instance="host.docker.internal:8000",job="vllm-main",service="main",role="head",engine_scope="cluster",engine="0",model_name="m"}'
+        values: '8x84'
+      - series: 'techsara_vllm_state_code{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '5x84'
+      - series: 'techsara_vllm_state{state="WEDGED",instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '1x84'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: VllmQueueBacklog
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: VllmQueueBacklog
+        exp_alerts:
+          - exp_labels: { severity: warning, service: main }
+            exp_annotations:
+              summary: "8 requests waiting on the vLLM scheduler"
+              description: >-
+                Sustained queueing. Correlate with KV cache usage and GPU
+                utilisation on the LLM Performance dashboard to tell capacity
+                pressure from a stall; if state_now is WEDGED this is the stall.
+              state_now: WEDGED
+              since: "at least 5m before this fired (the alert's for:)"
+              reason: "more than 5 requests waiting on the scheduler for 5 minutes"
+              runbook: docs/availability/RUNBOOK.md#queue-backlog
+              safe_command: "scripts/cluster-status.sh"
+
+  # ================================================== VllmCanaryTtftHigh
+  # TTFT over 10 s for the whole window while the state flips READY<->BUSY
+  # every 10 s: fires at 5m + one evaluation, clears when the canary fails.
+  - interval: 5s
+    name: "CanaryTtftHigh needs 5m over 10s AND a succeeding canary, through READY/BUSY churn"
+    input_series:
+      - series: 'techsara_vllm_synthetic_ttft_seconds{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '12.5x120'
+      - series: 'techsara_vllm_synthetic_success{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '1x84 0x36'
+      - series: 'techsara_vllm_state_code{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '2 2 3 3 2 2 3 3 2 2 3 3 2 2 3 3 2 2 3 3 2 2 3 3 2 2 3 3 2 2 3 3 2 2 3 3 2 2 3 3 2 2 3 3 2 2 3 3 2 2 3 3 2 2 3 3 2 2 3 3 2 2 3 3 2 2 3 3 2 2 3 3 2 2 3 3 2 2 3 3 2 2 3 3 2 2 3 3 2 2 3 3 2 2 3 3 2 2 3 3 2 2 3 3 2 2 3 3 2 2 3 3 2 2 3 3 2 2 3 3 2 2 3 3'
+      - series: 'techsara_vllm_state{state="READY",instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0'
+      - series: 'techsara_vllm_state{state="BUSY",instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: VllmCanaryTtftHigh
+        exp_alerts: []
+      # t=360: sample 72 -> READY
+      - eval_time: 6m
+        alertname: VllmCanaryTtftHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: main
+              state: DEGRADED
+              instance: host.docker.internal:9838
+              job: engine-controller
+              role: head
+              engine_scope: cluster
+            exp_annotations:
+              summary: "Canary time-to-first-token 12.5s"
+              description: >-
+                The engine answers, slowly. Usually queueing (VllmQueueBacklog),
+                KV pressure (VllmKvCacheNearlyFull) or head swap activity
+                (HeadSwapActivity) — the correlation strip on the overview lines
+                them up.
+              state_now: READY
+              since: "TTFT > 10s on every canary for ≥ 5m before this fired"
+              reason: "techsara_vllm_synthetic_ttft_seconds > 10 with the canary succeeding"
+              runbook: docs/availability/RUNBOOK.md#canary-ttft-high
+              safe_command: "curl -s http://127.0.0.1:9838/state | jq '.signals.canary,.signals.engine'"
+      - eval_time: 8m
+        alertname: VllmCanaryTtftHigh
+        exp_alerts: []
+
+  # ==================================================== HeadSwapActivity
+  - interval: 5s
+    name: "HeadSwapActivity: 600 pages/s on the head for 10 minutes fires with no controller; the worker never does"
+    input_series:
+      - series: 'node_vmstat_pswpout{instance="host.docker.internal:9100",job="node",node="spark-1",role="head"}'
+        values: '0+3000x150'
+      - series: 'node_vmstat_pswpout{instance="192.168.9.68:9100",job="node",node="spark-2",role="worker"}'
+        values: '0+3000x150'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: HeadSwapActivity
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: main
+              state: DEGRADED
+              instance: host.docker.internal:9100
+              job: node
+              node: spark-1
+              role: head
+            exp_annotations:
+              summary: "Head is swapping out 600 pages/s"
+              description: >-
+                Unified memory pressure on Spark 1 outside a model reload. Check
+                what grew (a second engine, a video job, the OCR engine back on
+                the head) on the Host dashboard; an LLM that is paging answers
+                late, then not at all.
+              state_now: MONITORING_UNKNOWN
+              since: "≥ 5m of sustained swap-out before this fired"
+              reason: "rate(node_vmstat_pswpout{node=\"spark-1\"}[5m]) > 500 pages/s, controller not in STARTING/RECOVERING"
+              runbook: docs/availability/RUNBOOK.md#head-swap-activity
+              safe_command: "free -g; docker stats --no-stream | sort -k4 -h | tail -8"
+
+  # Every model reload swaps (7 episodes ≥ 5 min in 48 h, all reloads): the
+  # alert is silenced while the controller says STARTING or RECOVERING and
+  # fires once the engine is READY and the swapping has not stopped.
+  - interval: 5s
+    name: "HeadSwapActivity is silent during STARTING/RECOVERING and fires once READY if the swapping continues"
+    input_series:
+      - series: 'node_vmstat_pswpout{instance="host.docker.internal:9100",job="node",node="spark-1",role="head"}'
+        values: '0+3000x240'
+      # RECOVERING 0-5m, STARTING 5-10m, READY from 10m
+      - series: 'techsara_vllm_state_code{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '6x60 1x60 2x120'
+      - series: 'techsara_vllm_state{state="READY",instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0x120 1x120'
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: HeadSwapActivity
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: HeadSwapActivity
+        exp_alerts: []
+      - eval_time: 16m
+        alertname: HeadSwapActivity
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: main
+              state: DEGRADED
+              instance: host.docker.internal:9100
+              job: node
+              node: spark-1
+              role: head
+            exp_annotations:
+              summary: "Head is swapping out 600 pages/s"
+              description: >-
+                Unified memory pressure on Spark 1 outside a model reload. Check
+                what grew (a second engine, a video job, the OCR engine back on
+                the head) on the Host dashboard; an LLM that is paging answers
+                late, then not at all.
+              state_now: READY
+              since: "≥ 5m of sustained swap-out before this fired"
+              reason: "rate(node_vmstat_pswpout{node=\"spark-1\"}[5m]) > 500 pages/s, controller not in STARTING/RECOVERING"
+              runbook: docs/availability/RUNBOOK.md#head-swap-activity
+              safe_command: "free -g; docker stats --no-stream | sort -k4 -h | tail -8"
+
+  # ===================================================== NcclTcpFallback
+  - interval: 5s
+    name: "NcclTcpFallback: socket bytes on the RoCE netdev with idle IB counters while real requests run"
+    input_series:
+      # 20 MB/s of TCP on rail-A's netdev on the head, nothing on the IB port
+      - series: 'node_network_transmit_bytes_total{device="enp1s0f1np1",instance="host.docker.internal:9100",job="node",node="spark-1",role="head"}'
+        values: '0+100000000x100'
+      - series: 'node_network_transmit_bytes_total{device="enP2p1s0f1np1",instance="host.docker.internal:9100",job="node",node="spark-1",role="head"}'
+        values: '0x100'
+      - series: 'node_infiniband_port_data_transmitted_bytes_total{device="rocep1s0f1",port="1",instance="host.docker.internal:9100",job="node",node="spark-1",role="head"}'
+        values: '5000000x100'
+      - series: 'node_infiniband_port_data_transmitted_bytes_total{device="roceP2p1s0f1",port="1",instance="host.docker.internal:9100",job="node",node="spark-1",role="head"}'
+        values: '5000000x100'
+      - series: 'vllm:num_requests_running{instance="host.docker.internal:8000",job="vllm-main",service="main",role="head",engine_scope="cluster",engine="0",model_name="m"}'
+        values: '2x100'
+      - series: 'techsara_vllm_state_code{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '3x100'
+      - series: 'techsara_vllm_state{state="BUSY",instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '1x100'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: NcclTcpFallback
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: NcclTcpFallback
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: main
+              state: DEGRADED
+              node: spark-1
+            exp_annotations:
+              summary: "spark-1: NCCL traffic appears to be on TCP, not RDMA (20MB/s on the RoCE netdevs)"
+              description: >-
+                Requests are running, the RoCE netdev counters are carrying
+                megabytes per second and the InfiniBand port counters are not.
+                That is what NCCL looks like after it gave up on the IB
+                transport. Decode will be several times slower than the 100
+                tok/s baseline. Confirm from the head's log (NET/IB vs
+                NET/Socket at group init) before acting; a long rsync over the
+                fabric address while requests run looks the same from here.
+              state_now: BUSY
+              since: "≥ 3m before this fired (the alert's for:)"
+              reason: "RoCE netdev tx > 10 MB/s while IB port tx < 1 MB/s on the same node, with requests running and the controller not in STARTING/RECOVERING"
+              runbook: docs/availability/RUNBOOK.md#nccl-tcp-fallback
+              safe_command: "scripts/cluster-status.sh; docker logs sf-local-ai-vllm-1 2>&1 | grep -m3 'NCCL INFO NET/'"
+
+  # The model-sync false positive: tens of GB rsynced over the rail-A
+  # address while only the canary generates tokens (nothing running) — the
+  # v1 "tokens flowing" gate fired on every model deploy. Silent now.
+  - interval: 5s
+    name: "NcclTcpFallback is silent during a model sync with only the canary running"
+    input_series:
+      - series: 'node_network_transmit_bytes_total{device="enp1s0f1np1",instance="host.docker.internal:9100",job="node",node="spark-1",role="head"}'
+        values: '0+100000000x100'
+      - series: 'node_infiniband_port_data_transmitted_bytes_total{device="rocep1s0f1",port="1",instance="host.docker.internal:9100",job="node",node="spark-1",role="head"}'
+        values: '5000000x100'
+      - series: 'node_infiniband_port_data_transmitted_bytes_total{device="roceP2p1s0f1",port="1",instance="host.docker.internal:9100",job="node",node="spark-1",role="head"}'
+        values: '5000000x100'
+      - series: 'vllm:generation_tokens_total{instance="host.docker.internal:8000",job="vllm-main",service="main",role="head",engine_scope="cluster",engine="0",model_name="m"}'
+        values: '0+2x100'
+      - series: 'vllm:num_requests_running{instance="host.docker.internal:8000",job="vllm-main",service="main",role="head",engine_scope="cluster",engine="0",model_name="m"}'
+        values: '0x100'
+      - series: 'techsara_vllm_state_code{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '2x100'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: NcclTcpFallback
+        exp_alerts: []
+
+  - interval: 5s
+    name: "NcclTcpFallback is silent during RECOVERING even with requests reported running"
+    input_series:
+      - series: 'node_network_transmit_bytes_total{device="enp1s0f1np1",instance="host.docker.internal:9100",job="node",node="spark-1",role="head"}'
+        values: '0+100000000x100'
+      - series: 'node_infiniband_port_data_transmitted_bytes_total{device="rocep1s0f1",port="1",instance="host.docker.internal:9100",job="node",node="spark-1",role="head"}'
+        values: '5000000x100'
+      - series: 'node_infiniband_port_data_transmitted_bytes_total{device="roceP2p1s0f1",port="1",instance="host.docker.internal:9100",job="node",node="spark-1",role="head"}'
+        values: '5000000x100'
+      - series: 'vllm:num_requests_running{instance="host.docker.internal:8000",job="vllm-main",service="main",role="head",engine_scope="cluster",engine="0",model_name="m"}'
+        values: '9x100'
+      - series: 'techsara_vllm_state_code{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '6x100'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: NcclTcpFallback
+        exp_alerts: []
+
+  - interval: 5s
+    name: "NcclTcpFallback is silent when the IB counters carry the traffic (RDMA working, netdev busy with something else)"
+    input_series:
+      - series: 'node_network_transmit_bytes_total{device="enp1s0f1np1",instance="host.docker.internal:9100",job="node",node="spark-1",role="head"}'
+        values: '0+100000000x100'
+      - series: 'node_infiniband_port_data_transmitted_bytes_total{device="rocep1s0f1",port="1",instance="host.docker.internal:9100",job="node",node="spark-1",role="head"}'
+        values: '0+500000000x100'
+      - series: 'node_infiniband_port_data_transmitted_bytes_total{device="roceP2p1s0f1",port="1",instance="host.docker.internal:9100",job="node",node="spark-1",role="head"}'
+        values: '0+100000000x100'
+      - series: 'vllm:num_requests_running{instance="host.docker.internal:8000",job="vllm-main",service="main",role="head",engine_scope="cluster",engine="0",model_name="m"}'
+        values: '4x100'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: NcclTcpFallback
+        exp_alerts: []
+
+  # ===================================================== RoceRailMissing
+  - interval: 5s
+    name: "RoceRailMissing: rail 2 flat at zero while rail 1 on the same node moves"
+    input_series:
+      - series: 'node_infiniband_port_data_transmitted_bytes_total{device="rocep1s0f1",port="1",instance="host.docker.internal:9100",job="node",node="spark-1",role="head"}'
+        values: '0+500000000x100'
+      - series: 'node_infiniband_port_data_transmitted_bytes_total{device="roceP2p1s0f1",port="1",instance="host.docker.internal:9100",job="node",node="spark-1",role="head"}'
+        values: '7000000x100'
+      # the worker's rails are both moving: no alert there
+      - series: 'node_infiniband_port_data_transmitted_bytes_total{device="rocep1s0f1",port="1",instance="192.168.9.68:9100",job="node",node="spark-2",role="worker"}'
+        values: '0+500000000x100'
+      - series: 'node_infiniband_port_data_transmitted_bytes_total{device="roceP2p1s0f1",port="1",instance="192.168.9.68:9100",job="node",node="spark-2",role="worker"}'
+        values: '0+100000000x100'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: RoceRailMissing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: main
+              state: DEGRADED
+              node: spark-1
+              device: roceP2p1s0f1
+            exp_annotations:
+              summary: "RoCE rail roceP2p1s0f1 on spark-1 carried nothing while the other rail was busy"
+              description: >-
+                NCCL is running on one rail. The engine still works — one rail
+                is PCIe-bound near 109 Gb/s — but the split is gone and a second
+                failure takes the fabric down. RoceLinkDown says whether the
+                port itself is down; if it is not, NCCL_IB_HCA and the head's
+                NET/IB init lines are the next thing to read.
+              state_now: MONITORING_UNKNOWN
+              since: "≥ 3m before this fired (the alert's for:)"
+              reason: "roceP2p1s0f1 at 0 B/s for 3 minutes while the other rail on spark-1 exceeded 1 MB/s"
+              runbook: docs/availability/RUNBOOK.md#roce-rail-missing
+              safe_command: "scripts/cluster-status.sh; cat /sys/class/infiniband/{rocep1s0f1,roceP2p1s0f1}/ports/1/state"
+
+  - interval: 5s
+    name: "RoceRailMissing is silent on an idle fabric (both rails at zero is idle, not a missing rail)"
+    input_series:
+      - series: 'node_infiniband_port_data_transmitted_bytes_total{device="rocep1s0f1",port="1",instance="host.docker.internal:9100",job="node",node="spark-1",role="head"}'
+        values: '7000000x100'
+      - series: 'node_infiniband_port_data_transmitted_bytes_total{device="roceP2p1s0f1",port="1",instance="host.docker.internal:9100",job="node",node="spark-1",role="head"}'
+        values: '7000000x100'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: RoceRailMissing
+        exp_alerts: []
+
+  # ================================================= the info notices
+  - interval: 5s
+    name: "the recovery story in order: RecoveryStarted, RecoveredRestart, PrimaryRestored, QueueDrained"
+    input_series:
+      # WEDGED 0-1m, RECOVERING 1-4m, READY from 4m
+      - series: 'techsara_vllm_state_code{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '5x12 6x36 2x72'
+      - series: 'techsara_vllm_state{state="WEDGED",instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '1x12 0x108'
+      - series: 'techsara_vllm_state{state="RECOVERING",instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0x12 1x36 0x72'
+      - series: 'techsara_vllm_state{state="READY",instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0x48 1x72'
+      - series: 'techsara_vllm_recovery_in_progress{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0x12 1x36 0x72'
+      - series: 'techsara_vllm_recovery_attempts_total{outcome="succeeded",instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"}'
+        values: '0x48 1x72'
+      # requests queue up from 1m30s; the resume sweep drains them at 4m30s
+      - series: 'llm_queued_generations{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator"}'
+        values: '0x18 2x36 0x66'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: VllmRecoveryStarted
+        exp_alerts:
+          - exp_labels:
+              severity: info
+              service: main
+              state: RECOVERING
+              instance: host.docker.internal:9838
+              job: engine-controller
+              role: head
+              engine_scope: cluster
+            exp_annotations:
+              summary: "vLLM coordinated recovery in progress"
+              description: >-
+                The controller holds the recovery lock and is walking the
+                choreography (capture diagnostics → restart the pair → wait for
+                the model → readiness sequence → resume queued → verify).
+                Measured 3.5-5.5 minutes. Requests arriving meanwhile are
+                queued by the orchestrator and resume when READY returns.
+              state_now: RECOVERING
+              since: "the moment recovery_in_progress went to 1"
+              reason: "techsara_vllm_recovery_in_progress == 1; the current step is techsara_vllm_recovery_step"
+              runbook: docs/availability/RUNBOOK.md#recovery-timeline
+              safe_command: "curl -s http://127.0.0.1:9838/state | jq '.recovery,.incident'"
+      - eval_time: 5m
+        alertname: VllmRecoveryStarted
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: VllmRecoveredRestart
+        exp_alerts:
+          - exp_labels:
+              severity: info
+              service: main
+              state: READY
+              outcome: succeeded
+              instance: host.docker.internal:9838
+              job: engine-controller
+              role: head
+              engine_scope: cluster
+            exp_annotations:
+              summary: "vLLM recovered by an automatic restart in the last 30m"
+              description: >-
+                The engine is serving again after a controller-driven restart.
+                The incident directory holds what it saw before restarting; the
+                fault class is worth a look while it is fresh.
+              state_now: READY
+              since: "a recovery succeeded within the last 30m"
+              reason: "increase(techsara_vllm_recovery_attempts_total{outcome=\"succeeded\"}[30m]) > 0"
+              runbook: docs/availability/RUNBOOK.md#recovery-timeline
+              safe_command: "ls -t .runtime/incidents | head -1 | xargs -I{} cat .runtime/incidents/{}/state.json"
+      - eval_time: 5m
+        alertname: VllmPrimaryRestored
+        exp_alerts:
+          - exp_labels:
+              severity: info
+              service: main
+              state: READY
+              instance: host.docker.internal:9838
+              job: engine-controller
+              role: head
+              engine_scope: cluster
+            exp_annotations:
+              summary: "Primary model is READY again"
+              description: >-
+                The readiness sequence passed on the primary after an outage in
+                the last 15 minutes. The orchestrator's breaker closes on the
+                controller's READY and its own canary, then resumes every queued
+                generation exactly once; VllmQueueDrained follows when it has.
+              state_now: READY
+              since: "READY for ≥ 30s after being ≥ WEDGED within 15m"
+              reason: "techsara_vllm_state_code back to 2/3 after a max_over_time[15m] of ≥ 5"
+              runbook: docs/availability/RUNBOOK.md#recovery-timeline
+              safe_command: "curl -s http://127.0.0.1:9838/state | jq '.state,.since,.signals.canary'"
+      - eval_time: 3m
+        alertname: VllmPrimaryRestored
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: VllmQueueDrained
+        exp_alerts:
+          - exp_labels: { severity: info, service: main, state: READY }
+            exp_annotations:
+              summary: "The request queue has drained"
+              description: >-
+                Requests that were queued while the main model was unavailable
+                have all been resumed within the last 15 minutes. Each resumed
+                on its own generation id; the outcomes are in
+                llm_resumed_generations_total{outcome}.
+              state_now: READY
+              since: "queue empty for ≥ 30s after being non-empty within 15m"
+              reason: "llm_queued_generations returned to 0"
+              runbook: docs/availability/RUNBOOK.md#recovery-timeline
+              safe_command: "curl -s http://127.0.0.1:8080/metrics | grep -E '^llm_(queued_generations|resumed_generations_total)'"
+      - eval_time: 3m
+        alertname: VllmQueueDrained
+        exp_alerts: []
+
+  # ======================================= PrometheusRuleEvaluationFailing
+  # The self-scrape runs every 30 s. One rule error at t=2m30s: the alert
+  # fires 5m later and clears once the failure leaves the 10m window.
+  - interval: 30s
+    name: "PrometheusRuleEvaluationFailing fires 5m after a rule evaluation error and clears when it ages out"
+    input_series:
+      - series: 'prometheus_rule_evaluation_failures_total{rule_group="/etc/prometheus/rules/alerts.yml;vllm-availability",instance="localhost:9090",job="prometheus",node="spark-1",role="head"}'
+        values: '0x5 1x40'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: PrometheusRuleEvaluationFailing
+        exp_alerts: []
+      - eval_time: 8m
+        alertname: PrometheusRuleEvaluationFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: monitoring
+              rule_group: "/etc/prometheus/rules/alerts.yml;vllm-availability"
+              instance: localhost:9090
+              job: prometheus
+              node: spark-1
+              role: head
+            exp_annotations:
+              summary: "Prometheus rule group /etc/prometheus/rules/alerts.yml;vllm-availability is failing to evaluate"
+              description: >-
+                One or more rules in this group errored at evaluation time in
+                the last 10 minutes; any alert they would have raised is silent
+                and any recording rule they own has a gap. The error text is on
+                Prometheus's /rules page (lastError) and in its log.
+              since: "failures within the last 10m, sustained ≥ 5m before this fired"
+              reason: "increase(prometheus_rule_evaluation_failures_total[10m]) > 0"
+              runbook: docs/availability/RUNBOOK.md#rule-evaluation-failing
+              safe_command: "curl -s http://127.0.0.1:9090/api/v1/rules | jq '.data.groups[] | select(.rules[]?.lastError != \"\") | {name, file, errors: [.rules[] | select(.lastError != \"\") | {name, lastError}]}'"
+      - eval_time: 15m
+        alertname: PrometheusRuleEvaluationFailing
+        exp_alerts: []

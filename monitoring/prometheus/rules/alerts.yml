@@ -41,15 +41,41 @@ groups:
         annotations:
           summary: "nvidia-smi not answering on {{ $labels.node }}"
 
-      - alert: VllmDown
-        expr: up{job="vllm-main"} == 0
+      # WAS `VllmDown`, critical. Renamed and demoted on 2026-09-12 because
+      # `up` answers a narrower question than its old name claimed: on
+      # 2026-09-11 it read 1 for the first five minutes of a ten-minute
+      # outage (the API server kept answering /metrics while the engine
+      # behind it was dead), and then read 0 for the five minutes the
+      # controller-driven restart is DESIGNED to take. Neither reading was
+      # "the model is down". The engine's real state is techsara_vllm_state_code
+      # and the vllm-availability group below; this alert now means exactly
+      # what it measures — the scrape target disappeared — and is silenced
+      # while the controller reports it is restarting the pair on purpose
+      # (STARTING/RECOVERING). With no controller at all it still fires.
+      #
+      # It carries NO fixed `state` label: a missing scrape target proves
+      # nothing about the engine's state, and the controller may well be
+      # reporting DOWN at the same moment (a label saying MONITORING_UNKNOWN
+      # next to a DOWN tile would contradict §2). The live name is the
+      # `state_now` annotation, which is not part of the alert's identity.
+      - alert: VllmScrapeTargetDown
+        expr: >-
+          up{job="vllm-main"} == 0
+            unless on() (techsara_vllm_state_code == 1 or techsara_vllm_state_code == 6)
         for: 1m
-        labels: { severity: critical }
+        labels: { severity: warning, service: main }
         annotations:
-          summary: "vLLM main model is not serving metrics"
+          summary: "vLLM main /metrics is not answering Prometheus"
           description: >-
-            The distributed engine's only API server is unreachable. Chat,
-            search and Deep Research are all down while this is true.
+            The head's API server is not serving /metrics and the controller
+            is not restarting it. Read the engine state before assuming an
+            outage: the overview's "vLLM engine" tile, or GET /state on the
+            controller.
+          state_now: '{{ with query "techsara_vllm_state == 1" }}{{ if eq (len .) 1 }}{{ (index . 0).Labels.state }}{{ else }}MONITORING_UNKNOWN{{ end }}{{ else }}MONITORING_UNKNOWN{{ end }}'
+          since: "at least 1m before this fired (the alert's for:); startsAt is the first missed scrape"
+          reason: "scrape of host.docker.internal:8000/metrics failing, controller not in STARTING/RECOVERING"
+          runbook: docs/availability/RUNBOOK.md#scrape-target-down
+          safe_command: "curl -s http://127.0.0.1:9838/state | jq '.state,.reason,.signals.api'"
 
       - alert: ServiceProbeFailing
         expr: probe_success == 0
@@ -143,15 +169,27 @@ groups:
   - name: vllm-health
     rules:
       - alert: VllmQueueBacklog
+        # A WEDGED engine also shows a frozen scheduler (running stuck at 9
+        # for the whole of 2026-09-11 22:15-22:20, waiting frozen with it),
+        # so a queue that is not DRAINING is VllmGenerationFrozen's job; this
+        # one is capacity. Which is why it carries no fixed `state` label: a
+        # backlog looks the same from BUSY and from WEDGED, and this rule
+        # cannot tell them apart (it must not depend on the controller being
+        # up — it is an engine-scrape rule). The live name is `state_now`.
         expr: cluster:vllm_requests_waiting:current > 5
         for: 5m
-        labels: { severity: warning }
+        labels: { severity: warning, service: main }
         annotations:
           summary: "{{ $value }} requests waiting on the vLLM scheduler"
           description: >-
             Sustained queueing. Correlate with KV cache usage and GPU
             utilisation on the LLM Performance dashboard to tell capacity
-            pressure from a stall.
+            pressure from a stall; if state_now is WEDGED this is the stall.
+          state_now: '{{ with query "techsara_vllm_state == 1" }}{{ if eq (len .) 1 }}{{ (index . 0).Labels.state }}{{ else }}MONITORING_UNKNOWN{{ end }}{{ else }}MONITORING_UNKNOWN{{ end }}'
+          since: "at least 5m before this fired (the alert's for:)"
+          reason: "more than 5 requests waiting on the scheduler for 5 minutes"
+          runbook: docs/availability/RUNBOOK.md#queue-backlog
+          safe_command: "scripts/cluster-status.sh"
 
       - alert: VllmKvCacheNearlyFull
         expr: cluster:vllm_kv_cache_usage_percent:current > 90
@@ -169,6 +207,629 @@ groups:
         labels: { severity: info }
         annotations:
           summary: "vLLM is preempting requests"
+
+  # ------------------------------------------------------------------------
+  # Engine availability (docs/availability/CONTRACT.md §7.4 v2, 2026-09-12).
+  #
+  # WHY THIS GROUP EXISTS. On 2026-09-11 22:15 the worker rank on Spark 2
+  # died in a GDN prefill kernel. For the next five minutes every check this
+  # file had — `up`, /health, /v1/models, the shell watchdog — said the
+  # engine was fine while ten requests hung and generation_tokens_total sat
+  # frozen at 2,138,504. The only true statement about an LLM engine is a
+  # real completion finishing, so every alert here keys on what the engine
+  # CONTROLLER (monitoring/engine-controller, job engine-controller) proved
+  # with its canary, or on counters that cannot move without both ranks.
+  #
+  # STRICT ONE-MODEL MODE (v2). Nothing but nvidia/Qwen3.6-35B-A3B-NVFP4
+  # answers a person. While it is not READY the orchestrator accepts and
+  # durably QUEUES every request (llm_queued_generations) and resumes the
+  # same generation when READY returns; there is no fallback model, so no
+  # rule here mentions one, and "DOWN" means nobody is being answered.
+  #
+  # RULES OF CONSTRUCTION, applied to every rule in this group:
+  #  1. Nothing thresholds a MISSING series as a failure. Absence is exactly
+  #     one alert's business (VllmMonitoringUnknown), and it is worded as
+  #     "monitoring cannot see", never as "inference is down".
+  #  2. No `or vector(0)`. Ever.
+  #  3. Where a rule needs two series, they come from the SAME scrape
+  #     (`and on()` / `unless on()` against the controller's own gauges) so
+  #     they are present or absent together; a host-level rule never depends
+  #     on the controller being up.
+  #  4. The `state` label is FIXED per alert: the §2 state the alert speaks
+  #     for, never the controller's live name. A label is identity — the v1
+  #     rules joined the live name in with `* on() group_left(state)` and
+  #     every READY<->BUSY flip (81 in six hours under normal load) resolved
+  #     the pending alert and restarted `for:`, so the critical alerts for
+  #     the 2026-09-11 shape could never reach firing. The live name is the
+  #     `state_now` ANNOTATION (annotations are not identity), read straight
+  #     from the one-hot; when the controller's verdict is stale it is the
+  #     frozen name, and VllmMonitoringUnknown says so.
+  #  5. Every alert carries: labels `service`, `state` (except the two that
+  #     prove nothing about the state: VllmScrapeTargetDown, VllmQueueBacklog),
+  #     and annotations `state_now`, `since`, `reason`, `runbook`
+  #     (docs/availability/RUNBOOK.md#anchor) and `safe_command` (read-only,
+  #     or the runbook's one sanctioned recovery entry point). Never request
+  #     content, ids, or hostnames of people.
+  #
+  # `since`: Prometheus stamps every alert with startsAt; the annotation says
+  # how far behind the first observation that stamp is (the rule's `for:`)
+  # and, where the controller exports its own transition time, carries it.
+  #
+  # Evaluated every 5 s, like the vllm-state recording group it reads and
+  # the controller scrape it keys on, so a `for:` here means what it says
+  # (+ one 5 s evaluation) and the unit tests' timings ARE production's.
+  # At the global 15 s a 30 s `for:` was 30-45 s, and the state must be
+  # visible within one controller tick.
+  - name: vllm-availability
+    interval: 5s
+    rules:
+      # ---------------------------------------------------------- critical
+      - alert: VllmEngineWedged
+        # State 5 is the controller's CONFIRMED wedge: two consecutive
+        # observations of frozen token counters with requests in flight, or
+        # a canary outstanding 60 s while /health still says 200. $value is
+        # how long it has been in that state, from the controller's own
+        # since-stamp (same scrape as the code, so present together). 30 s
+        # more here filters one scrape of a state it is already leaving.
+        expr: >-
+          (time() - techsara_vllm_state_since_timestamp_seconds)
+            and on() (techsara_vllm_state_code == 5)
+        for: 30s
+        labels: { severity: critical, service: main, state: WEDGED }
+        annotations:
+          summary: "vLLM engine WEDGED for {{ $value | humanizeDuration }} — requests in flight, no tokens moving"
+          description: >-
+            The head still answers /health, /v1/models and /metrics, but the
+            engine is not completing anything. Every in-flight request will
+            fail when vLLM's own 300 s execute timeout fires. The controller
+            is about to run a coordinated recovery (or already is — check
+            .recovery in /state); do not restart containers by hand while it
+            holds the lock. New requests are being queued by the orchestrator
+            and resume on the same generation when READY returns.
+          state_now: '{{ with query "techsara_vllm_state == 1" }}{{ if eq (len .) 1 }}{{ (index . 0).Labels.state }}{{ else }}MONITORING_UNKNOWN{{ end }}{{ else }}MONITORING_UNKNOWN{{ end }}'
+          since: "{{ $value | humanizeDuration }} in WEDGED (controller since-stamp); confirmed ≥ 30s before this fired"
+          reason: "controller state WEDGED: token counters frozen with requests running, or the canary outstanding ≥ 60s while /health answers 200"
+          runbook: docs/availability/RUNBOOK.md#wedged
+          safe_command: "curl -s http://127.0.0.1:9838/state | jq '.state,.reason,.incident,.signals.engine,.recovery'"
+
+      - alert: VllmPrimaryDown
+        # The DERIVED state (recording.yml) is 8 exactly when the controller
+        # says DOWN with a FRESH verdict; a queue never turns DOWN into
+        # QUEUEING, because DOWN means the restart budget is spent or the
+        # last recovery failed and nobody is being answered until a human
+        # acts. Every accepted request is held in the orchestrator's durable
+        # queue (never lost, never answered by another model) — that is what
+        # makes this a page and not a wait. A stale controller verdict drops
+        # the derived sample instead, and VllmMonitoringUnknown carries it.
+        expr: cluster:vllm_service_state:code == 8
+        for: 1m
+        labels: { severity: critical, service: main, state: DOWN }
+        annotations:
+          summary: "Primary model DOWN — nothing answers users; queued requests are held"
+          description: >-
+            The main model is not serving and the controller has stopped
+            restarting it: the recovery budget is exhausted
+            (VllmRecoveryBudgetExhausted will be firing too) or the last
+            recovery failed. There is no fallback model. Requests people
+            send are accepted and queued (`queued` below) and resume on
+            their own generation once READY returns; until an operator acts
+            nobody gets an answer.
+          state_now: '{{ with query "techsara_vllm_state == 1" }}{{ if eq (len .) 1 }}{{ (index . 0).Labels.state }}{{ else }}MONITORING_UNKNOWN{{ end }}{{ else }}MONITORING_UNKNOWN{{ end }}'
+          queued: '{{ with query "max(llm_queued_generations)" }}{{ (index . 0).Value | printf "%.0f" }}{{ else }}unknown{{ end }}'
+          since: "≥ 1m before this fired (the alert's for:); the controller's DOWN transition is techsara_vllm_state_since_timestamp_seconds"
+          reason: "controller state DOWN (fresh verdict); the failure category is on the overview's Reason tile and in /state .incident.category"
+          runbook: docs/availability/RUNBOOK.md#primary-down
+          safe_command: "curl -s http://127.0.0.1:9838/state | jq '.state,.reason,.incident,.recovery'; curl -s http://127.0.0.1:8080/metrics | grep -E '^llm_queued_generations'"
+
+      - alert: VllmReadyUnproven
+        # READY (§2) means a real canary success within the last two probe
+        # intervals — 60 s. A controller that still says READY/BUSY while
+        # its own last-success stamp is more than four intervals old is
+        # contradicting itself: its tick is publishing (or its snapshot is
+        # frozen and VllmMonitoringUnknown is firing beside this) but the
+        # canary thread has stopped proving anything. Either way the green
+        # tile is unproven, which is the one thing this programme promised
+        # never to show again — so the fixed state here is MONITORING_UNKNOWN
+        # ("inference status unproven"), and it is critical because the
+        # controller is the single recovery authority and it is not looking.
+        expr: >-
+          cluster:vllm_last_success_age_seconds > 120
+            and on() (techsara_vllm_state_code == 2 or techsara_vllm_state_code == 3)
+        for: 1m
+        labels: { severity: critical, service: main, state: MONITORING_UNKNOWN }
+        annotations:
+          summary: "Controller claims READY but has proven nothing for {{ $value | humanizeDuration }} — treat the state as unknown"
+          description: >-
+            No real completion has succeeded on the primary for over two
+            minutes while the controller reports READY/BUSY. The canary is
+            stuck, dead, or its result is not reaching the state machine.
+            Do not trust the engine tile until a completion succeeds; run
+            a real probe, and read the controller's log before its state.
+          state_now: '{{ with query "techsara_vllm_state == 1" }}{{ if eq (len .) 1 }}{{ (index . 0).Labels.state }}{{ else }}MONITORING_UNKNOWN{{ end }}{{ else }}MONITORING_UNKNOWN{{ end }}'
+          since: "last success {{ $value | humanizeDuration }} ago; ≥ 1m before this fired (the alert's for:)"
+          reason: "cluster:vllm_last_success_age_seconds > 120 while techsara_vllm_state_code is 2 or 3"
+          runbook: docs/availability/RUNBOOK.md#ready-unproven
+          safe_command: "curl -s http://127.0.0.1:9838/state | jq '.state,.generated_at,.signals.canary'; docker logs --tail 50 sf-local-ai-engine-controller-1; scripts/cluster-verify-engine.sh --probe"
+
+      - alert: VllmRecoveryBudgetExhausted
+        # RECOVERY_BUDGET restarts per RECOVERY_WINDOW_S were used up and the
+        # controller has stopped taking destructive action on purpose. It
+        # keeps probing and will return to READY by itself if the canary
+        # passes, which is why this is gated on the state still being DOWN:
+        # the category label lingers after the engine recovers on its own.
+        expr: >-
+          techsara_vllm_last_failure_category{category="budget_exhausted"} == 1
+            and on() (techsara_vllm_state_code == 8)
+        for: 15s
+        labels: { severity: critical, service: main, state: DOWN }
+        annotations:
+          summary: "vLLM recovery budget exhausted — automatic restarts stopped"
+          description: >-
+            Something is failing faster than a restart fixes it. Evidence for
+            every attempt is under .runtime/incidents/<id>/. A human decides
+            whether to restart again; the controller will not. Queued
+            requests stay queued until it does.
+          state_now: '{{ with query "techsara_vllm_state == 1" }}{{ if eq (len .) 1 }}{{ (index . 0).Labels.state }}{{ else }}MONITORING_UNKNOWN{{ end }}{{ else }}MONITORING_UNKNOWN{{ end }}'
+          since: "≥ 15s before this fired; the budget window is .recovery.window_s in /state"
+          reason: "failure category {{ $labels.category }}: RECOVERY_BUDGET recoveries started inside RECOVERY_WINDOW_S and the engine is still DOWN"
+          runbook: docs/availability/RUNBOOK.md#recovery-budget-exhausted
+          safe_command: "curl -s http://127.0.0.1:9838/state | jq '.recovery'; ls -t .runtime/incidents | head -3"
+
+      - alert: VllmWorkerRankAbsent
+        # The sentinel on Spark 2 saw the VLLM::Worker_TP1 process gone (or a
+        # fatal signature in its log) and the controller is NOT restarting
+        # the pair. A TP=2 completion cannot finish without rank 1, so this
+        # is an outage in the making that WEDGED will confirm within 90 s;
+        # it exists so the cause is named before the symptom. The fixed
+        # state is DOWN because that is what a one-rank TP=2 engine is,
+        # whatever the controller has confirmed so far.
+        #   * gated on the sentinel being reachable: an unreachable sentinel
+        #     is DEGRADED, not a dead rank (a 0 we cannot vouch for is not 0)
+        #   * silenced during STARTING/RECOVERING, when the rank is expected
+        #     to be down while the pair restarts
+        expr: >-
+          (techsara_vllm_worker_rank_alive == 0)
+            and on() (techsara_vllm_worker_reachable == 1)
+            unless on() (techsara_vllm_state_code == 1 or techsara_vllm_state_code == 6)
+        for: 1m
+        labels: { severity: critical, service: main, state: DOWN }
+        annotations:
+          summary: "vLLM worker rank (Spark 2) is absent and no recovery is running"
+          description: >-
+            The sentinel reports no VLLM::Worker_TP1 process in the worker
+            container and no recovery is in progress. The head will hang on
+            its next collective. If the controller has budget it acts within
+            one observation; if this persists, the budget is gone.
+          state_now: '{{ with query "techsara_vllm_state == 1" }}{{ if eq (len .) 1 }}{{ (index . 0).Labels.state }}{{ else }}MONITORING_UNKNOWN{{ end }}{{ else }}MONITORING_UNKNOWN{{ end }}'
+          since: "≥ 1m before this fired (the alert's for:); the sentinel's own record is .signals.worker.last_fault in /state"
+          reason: "worker rank process not alive per the sentinel, sentinel reachable, controller not in STARTING/RECOVERING"
+          runbook: docs/availability/RUNBOOK.md#worker-rank-absent
+          safe_command: "curl -s http://127.0.0.1:9838/state | jq '.signals.worker,.recovery'"
+
+      - alert: VllmGenerationFrozen
+        # Signal 12: the controller's own measurement of how long neither
+        # token counter has moved while the scheduler reports requests
+        # running. 90 s is the contract's WEDGED threshold; the running gate
+        # is Prometheus's scrape of the engine (present or absent with it —
+        # if /metrics is gone the canary alerts own the case). The fixed
+        # state is WEDGED: that is the §2 name for exactly this signal,
+        # whether the controller has confirmed it yet or moved on to
+        # RECOVERING (state_now says which).
+        expr: >-
+          (techsara_vllm_generation_frozen_seconds > 90)
+            and on() (cluster:vllm_requests_running:current > 0)
+        for: 30s
+        labels: { severity: critical, service: main, state: WEDGED }
+        annotations:
+          summary: "vLLM token counters frozen for {{ $value | humanizeDuration }} with requests running"
+          description: >-
+            Requests are scheduled but no prompt or generation token has been
+            counted for over 90 seconds. This is the exact shape of the
+            2026-09-11 wedge: a dead rank with the head blocked in a
+            collective, /health still green.
+          state_now: '{{ with query "techsara_vllm_state == 1" }}{{ if eq (len .) 1 }}{{ (index . 0).Labels.state }}{{ else }}MONITORING_UNKNOWN{{ end }}{{ else }}MONITORING_UNKNOWN{{ end }}'
+          since: "{{ $value | humanizeDuration }} frozen (controller measurement); ≥ 30s before this fired"
+          reason: "generation_tokens_total and prompt_tokens_total unchanged for > 90s while num_requests_running > 0"
+          runbook: docs/availability/RUNBOOK.md#generation-frozen
+          safe_command: "curl -s http://127.0.0.1:9838/state | jq '.signals.engine,.signals.canary'"
+
+      - alert: VllmRepeatedRecoveryFailure
+        # Two failed coordinated recoveries in an hour: the restart is not
+        # the fix. NOTE for the controller: a counter that first appears at
+        # 1 shows an increase() of 0 — outcome label values must be
+        # registered at 0 on startup for this to see the first failures.
+        expr: increase(techsara_vllm_recovery_attempts_total{outcome="failed"}[1h]) >= 2
+        for: 1m
+        labels: { severity: critical, service: main, state: DOWN }
+        annotations:
+          summary: "{{ $value | printf \"%.0f\" }} vLLM recoveries failed in the last hour"
+          description: >-
+            Each failed attempt has its diagnostics under
+            .runtime/incidents/<id>/ (head log tail, worker log tail, /state
+            at detection). Read those before trying a third time — a rank
+            that dies on load is a different problem from one that dies
+            under mixed prefill+decode load.
+          state_now: '{{ with query "techsara_vllm_state == 1" }}{{ if eq (len .) 1 }}{{ (index . 0).Labels.state }}{{ else }}MONITORING_UNKNOWN{{ end }}{{ else }}MONITORING_UNKNOWN{{ end }}'
+          since: "window: the last 1h; ≥ 1m before this fired"
+          reason: "increase(techsara_vllm_recovery_attempts_total{outcome=\"failed\"}[1h]) >= 2"
+          runbook: docs/availability/RUNBOOK.md#repeated-recovery-failure
+          safe_command: "ls -t .runtime/incidents | head -5; curl -s http://127.0.0.1:9838/state | jq '.recovery'"
+
+      # ----------------------------------------------------------- warning
+      - alert: VllmMonitoringUnknown
+        # THE ONLY ALERT THAT FIRES ON ABSENCE, and it says what it knows:
+        # the telemetry is missing or unproven. It does not say the model is
+        # down, because it cannot know that. Five branches, each labelled
+        # with what is missing so they do not collapse into one anonymous
+        # alert (and so two can fire side by side when two things are wrong):
+        #   controller_state        no techsara_vllm_state_code for 2 minutes
+        #                           — the controller is down, or its scrape is
+        #   vllm_scrape_target      no `up` series for the vllm-main job at
+        #                           all (the job was removed, or Prometheus
+        #                           just started) — `up == 0` is NOT absence
+        #                           and is VllmScrapeTargetDown's case
+        #   controller_observation  the controller is scraped and reports 0:
+        #                           it cannot observe (Docker socket, head
+        #                           TCP) and the canary is not recently
+        #                           proven — inference status unknown, said
+        #                           by the one thing that could know
+        #   controller_stale        the snapshot's own stamp is > 30 s old:
+        #                           the tick stopped and /metrics is serving
+        #                           the LAST verdict with fresh scrape times.
+        #                           The derived state drops its sample at the
+        #                           same threshold (recording.yml), so the
+        #                           tile and this alert agree
+        #   controller_stamp        the controller exports a state but no
+        #                           freshness stamp at all (an older build):
+        #                           an unstamped verdict is unproven, and the
+        #                           derived state is deliberately absent
+        # The extra minute absorbs a controller restart and Prometheus's own
+        # first evaluations after a reload.
+        expr: >-
+          label_replace(absent_over_time(techsara_vllm_state_code[2m]), "missing", "controller_state", "", "")
+          or
+          label_replace(absent_over_time(up{job="vllm-main"}[2m]), "missing", "vllm_scrape_target", "", "")
+          or
+          label_replace(techsara_vllm_state_code == 0, "missing", "controller_observation", "", "")
+          or
+          label_replace((time() - techsara_vllm_generated_at_seconds) > 30, "missing", "controller_stale", "", "")
+          or
+          label_replace(techsara_vllm_state_code unless on() techsara_vllm_generated_at_seconds, "missing", "controller_stamp", "", "")
+        for: 1m
+        labels: { severity: warning, service: main, state: MONITORING_UNKNOWN }
+        annotations:
+          summary: "vLLM engine state cannot be observed ({{ $labels.missing }})"
+          description: >-
+            Inference may be fine. Nothing on this page can vouch for the
+            engine either way, so the overview shows MONITORING_UNKNOWN
+            rather than guessing. controller_state / vllm_scrape_target: a
+            scrape is missing. controller_observation: the controller
+            itself cannot see the engine. controller_stale: the controller's
+            snapshot is frozen (its tick stopped; the state it still serves
+            is the last one it computed). controller_stamp: the controller
+            exports no freshness stamp. Fix the telemetry, then read the
+            state — and do not restart anything on the strength of this.
+          state_now: '{{ with query "techsara_vllm_state == 1" }}{{ if eq (len .) 1 }}{{ (index . 0).Labels.state }}{{ else }}MONITORING_UNKNOWN{{ end }}{{ else }}MONITORING_UNKNOWN{{ end }}'
+          since: "≥ 1m before this fired (the alert's for:); the absence branches add their 2m absent_over_time window"
+          reason: "{{ $labels.missing }}: no samples for 2m (controller_state, vllm_scrape_target), state code 0 (controller_observation), snapshot stamp > 30s old (controller_stale), or no stamp exported (controller_stamp)"
+          runbook: docs/availability/RUNBOOK.md#monitoring-unknown
+          safe_command: "curl -s http://127.0.0.1:9838/healthz; curl -s http://127.0.0.1:9838/state | jq '.state,.generated_at,.reason'; docker ps --filter name=engine-controller; curl -s http://127.0.0.1:9090/api/v1/targets | jq '.data.activeTargets[] | select(.labels.job==\"engine-controller\" or .labels.job==\"vllm-main\") | {job:.labels.job,health,lastError}'"
+
+      - alert: VllmMetricsStale
+        # The engine completes the canary but its metrics are not reaching
+        # this Prometheus. Two ways that happens, kept apart by the `cause`
+        # label because they are diagnosed in different places:
+        #   prometheus_age         cluster:vllm_metrics_age_seconds > 60 — the
+        #                          CONTRACT's expression. Be precise about
+        #                          what it can see: a failed scrape or a
+        #                          vanished family writes a staleness marker
+        #                          and the age series goes ABSENT, so this
+        #                          branch only fires when Prometheus itself
+        #                          stops ingesting, and it self-clears at the
+        #                          5-minute lookback by construction.
+        #   head_metrics_endpoint  the controller's own GET /metrics on the
+        #                          head failed (techsara_vllm_head_metrics_ok
+        #                          == 0) while its canary succeeded — the
+        #                          "hung /metrics handler" case, observed from
+        #                          the same scrape as the canary gauge so the
+        #                          two are present or absent together.
+        #                          VllmScrapeTargetDown fires beside it; this
+        #                          one adds the diagnosis "the engine is fine".
+        # Without the canary gate both would page for an engine that is
+        # simply gone (a case the state alerts own).
+        expr: >-
+          (
+            label_replace(max(cluster:vllm_metrics_age_seconds) > 60, "cause", "prometheus_age", "", "")
+            or
+            label_replace(max(techsara_vllm_head_metrics_ok) == 0, "cause", "head_metrics_endpoint", "", "")
+          )
+          and on() (max(techsara_vllm_synthetic_success) == 1)
+        for: 1m
+        labels: { severity: warning, service: main, state: DEGRADED }
+        annotations:
+          summary: "vLLM /metrics are not reaching Prometheus while the canary succeeds ({{ $labels.cause }})"
+          description: >-
+            Dashboards and token-rate rules are reading stale or missing
+            data; the engine itself completed a canary. prometheus_age:
+            Prometheus has ingested no new vLLM sample for over a minute —
+            look at Prometheus's own health first. head_metrics_endpoint:
+            the head's /metrics did not answer the controller — a hung
+            handler on an otherwise working engine; VllmScrapeTargetDown
+            is firing beside this one.
+          state_now: '{{ with query "techsara_vllm_state == 1" }}{{ if eq (len .) 1 }}{{ (index . 0).Labels.state }}{{ else }}MONITORING_UNKNOWN{{ end }}{{ else }}MONITORING_UNKNOWN{{ end }}'
+          since: "≥ 1m before this fired (the alert's for:)"
+          reason: "{{ $labels.cause }} with techsara_vllm_synthetic_success == 1"
+          runbook: docs/availability/RUNBOOK.md#metrics-stale
+          safe_command: "curl -s -o /dev/null -w '%{http_code} %{time_total}s\n' http://127.0.0.1:8000/metrics; ./scripts/monitoring.sh status"
+
+      - alert: VllmRequestsQueued
+        # The orchestrator has accepted requests it cannot send to the main
+        # model and is holding them, durably, for two minutes. Every one of
+        # them is a person reading "Main model is recovering—your request is
+        # safely queued." A short queue during a recovery is the design; two
+        # minutes is past the point where the resume sweep should have
+        # drained it after READY (state_now says whether the primary is
+        # back). Not gated on the controller: a queue is a fact the
+        # orchestrator alone can state, and it must be visible even when the
+        # controller is not.
+        expr: max(llm_queued_generations) > 0
+        for: 2m
+        labels: { severity: warning, service: main, state: QUEUEING }
+        annotations:
+          summary: "{{ $value | printf \"%.0f\" }} request(s) queued for the main model for over 2m"
+          description: >-
+            People are waiting. If the engine is STARTING/RECOVERING this
+            clears when READY returns and the resume sweep runs (each queued
+            generation resumes exactly once, on its own id). If state_now is
+            READY/BUSY and the queue is not draining, the resume sweep is the
+            thing to look at, not the engine. If it is DOWN, VllmPrimaryDown
+            is the page and this is the head-count.
+          state_now: '{{ with query "techsara_vllm_state == 1" }}{{ if eq (len .) 1 }}{{ (index . 0).Labels.state }}{{ else }}MONITORING_UNKNOWN{{ end }}{{ else }}MONITORING_UNKNOWN{{ end }}'
+          since: "queue non-empty for ≥ 2m before this fired (the alert's for:)"
+          reason: "llm_queued_generations > 0 on the orchestrator for 2 minutes"
+          runbook: docs/availability/RUNBOOK.md#requests-queued
+          safe_command: "curl -s http://127.0.0.1:8080/metrics | grep -E '^llm_(queued_generations|breaker_state|engine_state_code|resumed_generations_total)'; curl -s http://127.0.0.1:9838/state | jq '.state,.reason'"
+
+      - alert: VllmCanaryTtftHigh
+        # The canary took over 10 s to first token, five minutes running.
+        # On a healthy engine at c=1 it takes ~0.4 s; 10 s is the contract's
+        # DEGRADED line. Gated on the canary succeeding: a failed canary's
+        # TTFT is not a measurement.
+        expr: >-
+          (techsara_vllm_synthetic_ttft_seconds > 10)
+            and on() (techsara_vllm_synthetic_success == 1)
+        for: 5m
+        labels: { severity: warning, service: main, state: DEGRADED }
+        annotations:
+          summary: "Canary time-to-first-token {{ $value | printf \"%.1f\" }}s"
+          description: >-
+            The engine answers, slowly. Usually queueing (VllmQueueBacklog),
+            KV pressure (VllmKvCacheNearlyFull) or head swap activity
+            (HeadSwapActivity) — the correlation strip on the overview lines
+            them up.
+          state_now: '{{ with query "techsara_vllm_state == 1" }}{{ if eq (len .) 1 }}{{ (index . 0).Labels.state }}{{ else }}MONITORING_UNKNOWN{{ end }}{{ else }}MONITORING_UNKNOWN{{ end }}'
+          since: "TTFT > 10s on every canary for ≥ 5m before this fired"
+          reason: "techsara_vllm_synthetic_ttft_seconds > 10 with the canary succeeding"
+          runbook: docs/availability/RUNBOOK.md#canary-ttft-high
+          safe_command: "curl -s http://127.0.0.1:9838/state | jq '.signals.canary,.signals.engine'"
+
+      - alert: HeadSwapActivity
+        # Pages swapped OUT per second on the head. On a unified-memory GB10
+        # the model weights and KV cache ARE host memory, so sustained
+        # swap-out means the LLM's working set is being evicted and TTFT will
+        # climb. 500 pages/s is 2 MB/s. Measured 2026-09-10/11: bursts of
+        # 500-10,000 pages/s lasting 2-22 minutes, the long ones lining up
+        # with model reloads after the 07:05 and 22:15 faults (7 episodes ≥
+        # 5 min in 48 h, every one during a reload) — so it is silenced
+        # while the controller reports STARTING/RECOVERING, when a 25 GiB
+        # rank being loaded evicts whatever else is resident by design. It
+        # matters when it fires WITHOUT a reload, and that is now the only
+        # time it fires. With no controller at all it still fires.
+        expr: >-
+          rate(node_vmstat_pswpout{node="spark-1"}[5m]) > 500
+            unless on() (techsara_vllm_state_code == 1 or techsara_vllm_state_code == 6)
+        for: 5m
+        labels: { severity: warning, service: main, state: DEGRADED }
+        annotations:
+          summary: "Head is swapping out {{ $value | printf \"%.0f\" }} pages/s"
+          description: >-
+            Unified memory pressure on Spark 1 outside a model reload. Check
+            what grew (a second engine, a video job, the OCR engine back on
+            the head) on the Host dashboard; an LLM that is paging answers
+            late, then not at all.
+          state_now: '{{ with query "techsara_vllm_state == 1" }}{{ if eq (len .) 1 }}{{ (index . 0).Labels.state }}{{ else }}MONITORING_UNKNOWN{{ end }}{{ else }}MONITORING_UNKNOWN{{ end }}'
+          since: "≥ 5m of sustained swap-out before this fired"
+          reason: "rate(node_vmstat_pswpout{node=\"spark-1\"}[5m]) > 500 pages/s, controller not in STARTING/RECOVERING"
+          runbook: docs/availability/RUNBOOK.md#head-swap-activity
+          safe_command: "free -g; docker stats --no-stream | sort -k4 -h | tail -8"
+
+      - alert: NcclTcpFallback
+        # BEST EFFORT — inferred, not reported. NCCL never says "I fell back
+        # to sockets" in any metric, but the fallback has a signature this
+        # box measured (docs/MONITORING.md, "read the IB counters, never
+        # netdev"): RDMA traffic is invisible to the netdev counters of the
+        # RoCE NICs (170 kB over a 300-token generation) while the IB port
+        # counters carry it (678 MB). NCCL_SOCKET_IFNAME is pinned to the
+        # rail-A netdev, so a socket transport moves those hundreds of MB
+        # THROUGH netdev instead. Hence: real requests running, the RoCE
+        # netdevs carrying ≥ 10 MB/s for three minutes, and the IB counters
+        # on the same node near idle.
+        #
+        # The load gate is `requests_running > 0`, NOT "tokens flowing":
+        # the canary generates tokens every 30 s, so a tokens gate was always
+        # true and scripts/cluster-sync.sh — which rsyncs a model over the
+        # rail-A address (tens of GB, minutes) — fired this on every model
+        # deploy. The 0.4 s canary is almost never sampled as running; real
+        # load is. STARTING/RECOVERING are silenced as well, since a sync
+        # precedes a start. A sync during real load still looks the same
+        # from here; the description says so.
+        expr: >-
+          (
+            sum by (node) (rate(node_network_transmit_bytes_total{device=~".*np[0-9]"}[1m])) > 10e6
+              and on(node) (node:roce_transmit_bytes_per_second:sum < 1e6)
+          )
+          and on() (cluster:vllm_requests_running:current > 0)
+          unless on() (techsara_vllm_state_code == 1 or techsara_vllm_state_code == 6)
+        for: 3m
+        labels: { severity: warning, service: main, state: DEGRADED }
+        annotations:
+          summary: "{{ $labels.node }}: NCCL traffic appears to be on TCP, not RDMA ({{ $value | humanize }}B/s on the RoCE netdevs)"
+          description: >-
+            Requests are running, the RoCE netdev counters are carrying
+            megabytes per second and the InfiniBand port counters are not.
+            That is what NCCL looks like after it gave up on the IB
+            transport. Decode will be several times slower than the 100
+            tok/s baseline. Confirm from the head's log (NET/IB vs
+            NET/Socket at group init) before acting; a long rsync over the
+            fabric address while requests run looks the same from here.
+          state_now: '{{ with query "techsara_vllm_state == 1" }}{{ if eq (len .) 1 }}{{ (index . 0).Labels.state }}{{ else }}MONITORING_UNKNOWN{{ end }}{{ else }}MONITORING_UNKNOWN{{ end }}'
+          since: "≥ 3m before this fired (the alert's for:)"
+          reason: "RoCE netdev tx > 10 MB/s while IB port tx < 1 MB/s on the same node, with requests running and the controller not in STARTING/RECOVERING"
+          runbook: docs/availability/RUNBOOK.md#nccl-tcp-fallback
+          safe_command: "scripts/cluster-status.sh; docker logs sf-local-ai-vllm-1 2>&1 | grep -m3 'NCCL INFO NET/'"
+
+      - alert: RoceRailMissing
+        # BEST EFFORT. Both rails carry every TP=2 collective (measured split
+        # ~81/19, never 100/0), so one rail at exactly 0 B/s while the other
+        # rail on the same node moves > 1 MB/s is a rail NCCL is not using.
+        # Checked against 7 days of history (1,324 busy minutes): zero such
+        # minutes on a healthy fabric. A canary alone may not light the
+        # smaller rail, which is why the gate is the OTHER rail moving, not
+        # tokens flowing.
+        expr: >-
+          node:roce_transmit_bytes_per_second:rail == 0
+            and on(node) (max by (node) (node:roce_transmit_bytes_per_second:rail) > 1e6)
+        for: 3m
+        labels: { severity: warning, service: main, state: DEGRADED }
+        annotations:
+          summary: "RoCE rail {{ $labels.device }} on {{ $labels.node }} carried nothing while the other rail was busy"
+          description: >-
+            NCCL is running on one rail. The engine still works — one rail
+            is PCIe-bound near 109 Gb/s — but the split is gone and a second
+            failure takes the fabric down. RoceLinkDown says whether the
+            port itself is down; if it is not, NCCL_IB_HCA and the head's
+            NET/IB init lines are the next thing to read.
+          state_now: '{{ with query "techsara_vllm_state == 1" }}{{ if eq (len .) 1 }}{{ (index . 0).Labels.state }}{{ else }}MONITORING_UNKNOWN{{ end }}{{ else }}MONITORING_UNKNOWN{{ end }}'
+          since: "≥ 3m before this fired (the alert's for:)"
+          reason: "{{ $labels.device }} at 0 B/s for 3 minutes while the other rail on {{ $labels.node }} exceeded 1 MB/s"
+          runbook: docs/availability/RUNBOOK.md#roce-rail-missing
+          safe_command: "scripts/cluster-status.sh; cat /sys/class/infiniband/{rocep1s0f1,roceP2p1s0f1}/ports/1/state"
+
+      # VllmConfigDrift IS NOT DEFINED, on purpose. There is no drift signal
+      # in Prometheus: the engine reports its live cache configuration as
+      # labels on vllm:cache_config_info, but nothing exports the INTENDED
+      # configuration to compare it with, and a change after a deliberate
+      # deploy is not drift. scripts/cluster-verify-engine.sh reads the real
+      # command line of BOTH ranks from the running containers and is the
+      # drift check; run it after every deploy (docs/availability/RUNBOOK.md
+      # #config-drift).
+
+      # -------------------------------------------------------------- info
+      # Notices, not pages: they exist so the alert list tells the story of a
+      # recovery in order — started, restored, queue drained — without
+      # anyone reading a log.
+      - alert: VllmRecoveryStarted
+        expr: techsara_vllm_recovery_in_progress == 1
+        for: 0s
+        labels: { severity: info, service: main, state: RECOVERING }
+        annotations:
+          summary: "vLLM coordinated recovery in progress"
+          description: >-
+            The controller holds the recovery lock and is walking the
+            choreography (capture diagnostics → restart the pair → wait for
+            the model → readiness sequence → resume queued → verify).
+            Measured 3.5-5.5 minutes. Requests arriving meanwhile are
+            queued by the orchestrator and resume when READY returns.
+          state_now: '{{ with query "techsara_vllm_state == 1" }}{{ if eq (len .) 1 }}{{ (index . 0).Labels.state }}{{ else }}MONITORING_UNKNOWN{{ end }}{{ else }}MONITORING_UNKNOWN{{ end }}'
+          since: "the moment recovery_in_progress went to 1"
+          reason: "techsara_vllm_recovery_in_progress == 1; the current step is techsara_vllm_recovery_step"
+          runbook: docs/availability/RUNBOOK.md#recovery-timeline
+          safe_command: "curl -s http://127.0.0.1:9838/state | jq '.recovery,.incident'"
+
+      - alert: VllmRecoveredRestart
+        # A recovery restarted the pair and its canary passed, within the
+        # last 30 minutes. Same counter caveat as VllmRepeatedRecoveryFailure.
+        expr: increase(techsara_vllm_recovery_attempts_total{outcome="succeeded"}[30m]) > 0
+        for: 0s
+        labels: { severity: info, service: main, state: READY }
+        annotations:
+          summary: "vLLM recovered by an automatic restart in the last 30m"
+          description: >-
+            The engine is serving again after a controller-driven restart.
+            The incident directory holds what it saw before restarting; the
+            fault class is worth a look while it is fresh.
+          state_now: '{{ with query "techsara_vllm_state == 1" }}{{ if eq (len .) 1 }}{{ (index . 0).Labels.state }}{{ else }}MONITORING_UNKNOWN{{ end }}{{ else }}MONITORING_UNKNOWN{{ end }}'
+          since: "a recovery succeeded within the last 30m"
+          reason: "increase(techsara_vllm_recovery_attempts_total{outcome=\"succeeded\"}[30m]) > 0"
+          runbook: docs/availability/RUNBOOK.md#recovery-timeline
+          safe_command: "ls -t .runtime/incidents | head -1 | xargs -I{} cat .runtime/incidents/{}/state.json"
+
+      - alert: VllmPrimaryRestored
+        # READY/BUSY now, and WEDGED, RECOVERING or DOWN at some point in the
+        # last 15 minutes: the all-clear.
+        expr: >-
+          (techsara_vllm_state_code == 2 or techsara_vllm_state_code == 3)
+            and on() (max_over_time(techsara_vllm_state_code[15m]) >= 5)
+        for: 30s
+        labels: { severity: info, service: main, state: READY }
+        annotations:
+          summary: "Primary model is READY again"
+          description: >-
+            The readiness sequence passed on the primary after an outage in
+            the last 15 minutes. The orchestrator's breaker closes on the
+            controller's READY and its own canary, then resumes every queued
+            generation exactly once; VllmQueueDrained follows when it has.
+          state_now: '{{ with query "techsara_vllm_state == 1" }}{{ if eq (len .) 1 }}{{ (index . 0).Labels.state }}{{ else }}MONITORING_UNKNOWN{{ end }}{{ else }}MONITORING_UNKNOWN{{ end }}'
+          since: "READY for ≥ 30s after being ≥ WEDGED within 15m"
+          reason: "techsara_vllm_state_code back to 2/3 after a max_over_time[15m] of ≥ 5"
+          runbook: docs/availability/RUNBOOK.md#recovery-timeline
+          safe_command: "curl -s http://127.0.0.1:9838/state | jq '.state,.since,.signals.canary'"
+
+      - alert: VllmQueueDrained
+        # The queue was non-empty within the last 15 minutes and is empty
+        # now: every generation that waited has been resumed (or expired —
+        # llm_resumed_generations_total says which). The end of the story.
+        expr: >-
+          max(llm_queued_generations) == 0
+            and on() (max(max_over_time(llm_queued_generations[15m])) > 0)
+        for: 30s
+        labels: { severity: info, service: main, state: READY }
+        annotations:
+          summary: "The request queue has drained"
+          description: >-
+            Requests that were queued while the main model was unavailable
+            have all been resumed within the last 15 minutes. Each resumed
+            on its own generation id; the outcomes are in
+            llm_resumed_generations_total{outcome}.
+          state_now: '{{ with query "techsara_vllm_state == 1" }}{{ if eq (len .) 1 }}{{ (index . 0).Labels.state }}{{ else }}MONITORING_UNKNOWN{{ end }}{{ else }}MONITORING_UNKNOWN{{ end }}'
+          since: "queue empty for ≥ 30s after being non-empty within 15m"
+          reason: "llm_queued_generations returned to 0"
+          runbook: docs/availability/RUNBOOK.md#recovery-timeline
+          safe_command: "curl -s http://127.0.0.1:8080/metrics | grep -E '^llm_(queued_generations|resumed_generations_total)'"
+
+  # ------------------------------------------------------------------------
+  # Monitoring watching itself. A rule that errors at evaluation time is
+  # logged by Prometheus and counted, and otherwise silent: the alert it
+  # would have raised simply never exists. The v1 availability rules had
+  # exactly that failure mode (a many-to-many join on the live state name)
+  # and nothing on any dashboard would have said so.
+  - name: monitoring-self
+    rules:
+      - alert: PrometheusRuleEvaluationFailing
+        expr: increase(prometheus_rule_evaluation_failures_total[10m]) > 0
+        for: 5m
+        labels: { severity: warning, service: monitoring }
+        annotations:
+          summary: "Prometheus rule group {{ $labels.rule_group }} is failing to evaluate"
+          description: >-
+            One or more rules in this group errored at evaluation time in
+            the last 10 minutes; any alert they would have raised is silent
+            and any recording rule they own has a gap. The error text is on
+            Prometheus's /rules page (lastError) and in its log.
+          since: "failures within the last 10m, sustained ≥ 5m before this fired"
+          reason: "increase(prometheus_rule_evaluation_failures_total[10m]) > 0"
+          runbook: docs/availability/RUNBOOK.md#rule-evaluation-failing
+          safe_command: "curl -s http://127.0.0.1:9090/api/v1/rules | jq '.data.groups[] | select(.rules[]?.lastError != \"\") | {name, file, errors: [.rules[] | select(.lastError != \"\") | {name, lastError}]}'"
 
   - name: containers
     rules:

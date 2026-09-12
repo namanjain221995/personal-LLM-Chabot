@@ -94,6 +94,29 @@ scrape_configs:
         regex: ".*_created$"
         action: drop
 
+  # --- The engine controller: the ONLY source of "is inference working" ----
+  # monitoring/engine-controller/controller.py, on the head, host network.
+  # It is the thing that runs the real canary completion, watches the worker
+  # rank through the sentinel, and drives recovery — so techsara_vllm_state_code
+  # is the top-level engine state and every availability alert keys on it
+  # (docs/availability/CONTRACT.md §2, §7.1). Same `service`/`role`/
+  # `engine_scope` labels as vllm-main because it describes the same one
+  # distributed engine, not a node.
+  #
+  # 5 s because the state must be visible within one canary interval: on
+  # 2026-09-11 the engine was wedged for five minutes while /health, /metrics
+  # and `up` all said fine (docs/availability/INCIDENT-2026-09-11-vllm.md).
+  #
+  # THE WORKER SENTINEL (:9839 on Spark 2) IS DELIBERATELY NOT SCRAPED. It
+  # binds to the RoCE rail-A address, which is the NCCL fabric this file's
+  # header says monitoring must never touch, and the controller already
+  # folds everything it reports into the techsara_vllm_worker_* gauges.
+  - job_name: engine-controller
+    scrape_interval: 5s
+    static_configs:
+      - targets: ["host.docker.internal:9838"]
+        labels: { service: main, role: head, engine_scope: cluster }
+
   # --- The single-node model services -------------------------------------
   # Scraped over the internal `application` network by SERVICE NAME, not via
   # the host's published ports. Those ports are debug-only and now bind to

@@ -29,6 +29,7 @@
   },
   "panels": [
     {
+      "id": 1,
       "type": "text",
       "title": "Scope",
       "gridPos": {
@@ -43,6 +44,7 @@
       }
     },
     {
+      "id": 2,
       "type": "row",
       "title": "Tokens",
       "gridPos": {
@@ -55,6 +57,7 @@
       "panels": []
     },
     {
+      "id": 3,
       "type": "stat",
       "title": "Total tokens (range)",
       "description": "",
@@ -108,12 +111,14 @@
                 "value": null
               }
             ]
-          }
+          },
+          "noValue": "no data"
         },
         "overrides": []
       }
     },
     {
+      "id": 4,
       "type": "stat",
       "title": "Output tokens (range)",
       "description": "",
@@ -167,12 +172,14 @@
                 "value": null
               }
             ]
-          }
+          },
+          "noValue": "no data"
         },
         "overrides": []
       }
     },
     {
+      "id": 5,
       "type": "stat",
       "title": "Input tokens (range)",
       "description": "",
@@ -226,12 +233,14 @@
                 "value": null
               }
             ]
-          }
+          },
+          "noValue": "no data"
         },
         "overrides": []
       }
     },
     {
+      "id": 6,
       "type": "stat",
       "title": "Total tokens/sec",
       "description": "",
@@ -285,12 +294,14 @@
                 "value": null
               }
             ]
-          }
+          },
+          "noValue": "no data"
         },
         "overrides": []
       }
     },
     {
+      "id": 7,
       "type": "stat",
       "title": "Output tokens/sec",
       "description": "",
@@ -344,12 +355,14 @@
                 "value": null
               }
             ]
-          }
+          },
+          "noValue": "no data"
         },
         "overrides": []
       }
     },
     {
+      "id": 8,
       "type": "row",
       "title": "Cache and speculative decoding",
       "gridPos": {
@@ -362,6 +375,7 @@
       "panels": []
     },
     {
+      "id": 9,
       "type": "gauge",
       "title": "KV cache used",
       "description": "Above ~90% vLLM starts preempting requests.",
@@ -420,12 +434,14 @@
                 "value": 90
               }
             ]
-          }
+          },
+          "noValue": "no data"
         },
         "overrides": []
       }
     },
     {
+      "id": 10,
       "type": "gauge",
       "title": "Prefix cache hit rate",
       "description": "High means multi-turn chats are reusing prefill work.",
@@ -484,15 +500,17 @@
                 "value": 70
               }
             ]
-          }
+          },
+          "noValue": "no data"
         },
         "overrides": []
       }
     },
     {
+      "id": 11,
       "type": "gauge",
       "title": "Spec-decode acceptance",
-      "description": "MTP speculative decoding: the share of drafted tokens the model accepted. Higher means the speculation is paying off.",
+      "description": "MTP speculative decoding: the share of drafted tokens the model accepted. Higher means the speculation is paying off. No data while speculative decoding is off: vLLM does not export the vllm:spec_decode_* family at all then (MTP disabled 2026-09-11, docs/ISSUE/gdn-spec-decode-remediation-2026-09-11.md).",
       "datasource": {
         "type": "prometheus",
         "uid": "dgx-prometheus"
@@ -548,15 +566,17 @@
                 "value": 70
               }
             ]
-          }
+          },
+          "noValue": "no data"
         },
         "overrides": []
       }
     },
     {
+      "id": 12,
       "type": "bargauge",
       "title": "Spec-decode acceptance by position",
-      "description": "Acceptance falls with draft depth. This deployment runs num_speculative_tokens=1, so only position 0 exists.",
+      "description": "Acceptance falls with draft depth; with num_speculative_tokens=1 only position 0 exists. No data while speculative decoding is off: vLLM does not export the vllm:spec_decode_* family at all then (MTP disabled 2026-09-11, docs/ISSUE/gdn-spec-decode-remediation-2026-09-11.md).",
       "datasource": {
         "type": "prometheus",
         "uid": "dgx-prometheus"
@@ -616,12 +636,14 @@
                 "value": 70
               }
             ]
-          }
+          },
+          "noValue": "no data"
         },
         "overrides": []
       }
     },
     {
+      "id": 13,
       "type": "timeseries",
       "title": "Request hopper: running / waiting",
       "description": "",
@@ -688,7 +710,7 @@
             "fillOpacity": 18,
             "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true,
+            "spanNulls": false,
             "stacking": {
               "mode": "none",
               "group": "A"
@@ -740,6 +762,7 @@
       }
     },
     {
+      "id": 14,
       "type": "row",
       "title": "Throughput",
       "gridPos": {
@@ -752,6 +775,7 @@
       "panels": []
     },
     {
+      "id": 15,
       "type": "timeseries",
       "title": "Token throughput over time",
       "description": "",
@@ -818,7 +842,7 @@
             "fillOpacity": 8,
             "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true,
+            "spanNulls": false,
             "stacking": {
               "mode": "none",
               "group": "A"
@@ -870,6 +894,7 @@
       }
     },
     {
+      "id": 16,
       "type": "timeseries",
       "title": "Prompt vs output token mix",
       "description": "Stacked, so the split between prefill and decode work is visible.",
@@ -936,7 +961,7 @@
             "fillOpacity": 35,
             "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true,
+            "spanNulls": false,
             "stacking": {
               "mode": "normal",
               "group": "A"
@@ -988,9 +1013,10 @@
       }
     },
     {
+      "id": 17,
       "type": "timeseries",
       "title": "Request rate / success / errors",
-      "description": "",
+      "description": "5xx/sec is a true zero only while the engine is counting requests at all: the error series does not exist until the first 5xx, so the zero is derived from the total request rate (0 \u00d7 total) and is absent, not 0, when vLLM is unreachable.",
       "datasource": {
         "type": "prometheus",
         "uid": "dgx-prometheus"
@@ -1018,7 +1044,7 @@
             "type": "prometheus",
             "uid": "dgx-prometheus"
           },
-          "expr": "sum(rate(http_requests_total{service=\"main\",status=~\"5..\"}[5m])) or vector(0)",
+          "expr": "sum(rate(http_requests_total{service=\"main\",status=~\"5..\"}[5m])) or (0 * sum(rate(http_requests_total{service=\"main\"}[5m])))",
           "refId": "B",
           "editorMode": "code",
           "legendFormat": "5xx/sec",
@@ -1053,7 +1079,7 @@
             "fillOpacity": 8,
             "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true,
+            "spanNulls": false,
             "stacking": {
               "mode": "none",
               "group": "A"
@@ -1105,6 +1131,7 @@
       }
     },
     {
+      "id": 18,
       "type": "row",
       "title": "Latency",
       "gridPos": {
@@ -1117,6 +1144,7 @@
       "panels": []
     },
     {
+      "id": 19,
       "type": "timeseries",
       "title": "Time to first token  p50 / p95 / p99",
       "description": "Fine-grained buckets - these percentiles are meaningful.",
@@ -1194,7 +1222,7 @@
             "fillOpacity": 8,
             "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true,
+            "spanNulls": false,
             "stacking": {
               "mode": "none",
               "group": "A"
@@ -1276,6 +1304,7 @@
       }
     },
     {
+      "id": 20,
       "type": "timeseries",
       "title": "Inter-token latency (TPOT)",
       "description": "The gap between streamed tokens - what 'feels' fast to a reader.",
@@ -1353,7 +1382,7 @@
             "fillOpacity": 8,
             "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true,
+            "spanNulls": false,
             "stacking": {
               "mode": "none",
               "group": "A"
@@ -1435,6 +1464,7 @@
       }
     },
     {
+      "id": 21,
       "type": "timeseries",
       "title": "End-to-end request latency",
       "description": "Queue to last token. NOTE: this family's buckets start at 0.3 s, so percentiles are coarse for short requests.",
@@ -1512,7 +1542,7 @@
             "fillOpacity": 8,
             "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true,
+            "spanNulls": false,
             "stacking": {
               "mode": "none",
               "group": "A"
@@ -1594,6 +1624,7 @@
       }
     },
     {
+      "id": 22,
       "type": "timeseries",
       "title": "Queue and prefill time (means)",
       "description": "Means, not percentiles, on purpose: these families share a coarse ladder whose first bucket is 0.3 s, and observed queue time is ~16 microseconds - every sample lands in bucket one, so a p95 would read 0.3 s and be meaningless.",
@@ -1671,7 +1702,7 @@
             "fillOpacity": 8,
             "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true,
+            "spanNulls": false,
             "stacking": {
               "mode": "none",
               "group": "A"
@@ -1738,6 +1769,7 @@
       }
     },
     {
+      "id": 23,
       "type": "timeseries",
       "title": "Engine iteration size",
       "description": "How much work each forward pass carries - the batching picture.",
@@ -1815,7 +1847,7 @@
             "fillOpacity": 8,
             "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true,
+            "spanNulls": false,
             "stacking": {
               "mode": "none",
               "group": "A"
@@ -1882,6 +1914,7 @@
       }
     },
     {
+      "id": 24,
       "type": "row",
       "title": "Request shape and HTTP",
       "gridPos": {
@@ -1894,6 +1927,7 @@
       "panels": []
     },
     {
+      "id": 25,
       "type": "timeseries",
       "title": "Prompt size distribution",
       "description": "",
@@ -1970,7 +2004,7 @@
             "fillOpacity": 8,
             "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true,
+            "spanNulls": false,
             "stacking": {
               "mode": "none",
               "group": "A"
@@ -2052,6 +2086,7 @@
       }
     },
     {
+      "id": 26,
       "type": "timeseries",
       "title": "Output size distribution",
       "description": "",
@@ -2128,7 +2163,7 @@
             "fillOpacity": 8,
             "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true,
+            "spanNulls": false,
             "stacking": {
               "mode": "none",
               "group": "A"
@@ -2210,6 +2245,7 @@
       }
     },
     {
+      "id": 27,
       "type": "timeseries",
       "title": "Finished requests by reason",
       "description": "'length' means the output cap was hit; 'stop' is a natural finish.",
@@ -2261,7 +2297,7 @@
             "fillOpacity": 8,
             "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true,
+            "spanNulls": false,
             "stacking": {
               "mode": "none",
               "group": "A"
@@ -2282,6 +2318,7 @@
       }
     },
     {
+      "id": 28,
       "type": "timeseries",
       "title": "HTTP latency by handler (p95)",
       "description": "Which API route is slow, independent of the model itself.",
@@ -2336,7 +2373,7 @@
             "fillOpacity": 8,
             "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true,
+            "spanNulls": false,
             "stacking": {
               "mode": "none",
               "group": "A"
@@ -2357,6 +2394,7 @@
       }
     },
     {
+      "id": 29,
       "type": "timeseries",
       "title": "HTTP requests by status",
       "description": "Anything but 2xx sustained is worth a look.",
@@ -2408,7 +2446,7 @@
             "fillOpacity": 30,
             "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true,
+            "spanNulls": false,
             "stacking": {
               "mode": "normal",
               "group": "A"
@@ -2429,6 +2467,7 @@
       }
     },
     {
+      "id": 30,
       "type": "row",
       "title": "The other model services",
       "gridPos": {
@@ -2441,6 +2480,7 @@
       "panels": []
     },
     {
+      "id": 31,
       "type": "timeseries",
       "title": "Auxiliary model throughput",
       "description": "Router, embeddings and reranker on Spark 1; OCR on whichever node scripts/ocr.sh put it (its node label says).",
@@ -2506,7 +2546,7 @@
             "fillOpacity": 8,
             "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true,
+            "spanNulls": false,
             "stacking": {
               "mode": "none",
               "group": "A"
@@ -2527,6 +2567,7 @@
       }
     },
     {
+      "id": 32,
       "type": "timeseries",
       "title": "Auxiliary model queue",
       "description": "",
@@ -2592,7 +2633,7 @@
             "fillOpacity": 8,
             "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true,
+            "spanNulls": false,
             "stacking": {
               "mode": "none",
               "group": "A"

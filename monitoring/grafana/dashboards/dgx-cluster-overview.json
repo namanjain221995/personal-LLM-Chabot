@@ -1,7 +1,7 @@
 {
   "uid": "dgx-cluster-overview",
   "title": "DGX Spark AI Cluster \u2014 Live Overview",
-  "description": "One screen for the whole two-node cluster. Every vLLM number describes the distributed engine as a whole; every hardware number is per physical Spark.",
+  "description": "One screen for the whole two-node cluster. Every vLLM number describes the distributed engine as a whole; every hardware number is per physical Spark. The engine state tile comes from a real completion (the engine controller), never from a process being alive; MONITORING_UNKNOWN means the telemetry is missing, not that the model is down.",
   "tags": [
     "dgx-spark"
   ],
@@ -29,6 +29,7 @@
   },
   "panels": [
     {
+      "id": 1,
       "type": "stat",
       "title": "Cluster",
       "description": "UP only when BOTH Sparks are reporting host metrics.",
@@ -38,7 +39,7 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 3,
+        "w": 2,
         "x": 0,
         "y": 0
       },
@@ -104,6 +105,7 @@
       }
     },
     {
+      "id": 2,
       "type": "stat",
       "title": "Spark 1",
       "description": "Head node \u2014 runs the API server and every service.",
@@ -113,8 +115,8 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 3,
-        "x": 3,
+        "w": 2,
+        "x": 2,
         "y": 0
       },
       "targets": [
@@ -179,6 +181,7 @@
       }
     },
     {
+      "id": 3,
       "type": "stat",
       "title": "Spark 2",
       "description": "Worker node \u2014 runs the headless vLLM rank 1.",
@@ -188,8 +191,8 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 3,
-        "x": 6,
+        "w": 2,
+        "x": 4,
         "y": 0
       },
       "targets": [
@@ -254,17 +257,18 @@
       }
     },
     {
+      "id": 4,
       "type": "stat",
-      "title": "vLLM",
-      "description": "The distributed engine's single API server, on Spark 1.",
+      "title": "vLLM engine",
+      "description": "THE engine state, from a real completion \u2014 not from a process being alive. cluster:vllm_service_state:code: the controller's state (readiness sequence: non-stream + stream completion, token progress, both GPUs, rank alive), overridden to QUEUEING while the primary is not READY/BUSY/DOWN and the orchestrator holds accepted requests durably queued for it (there is no fallback model: the same generation resumes when READY returns). DOWN stays DOWN with a queue. MONITORING_UNKNOWN means the telemetry is missing or the controller's verdict is stale (its snapshot stamp > 30 s old), never that the model is down \u2014 on 2026-09-11 'UP' here was a lie for five minutes; this tile cannot tell that lie.",
       "datasource": {
         "type": "prometheus",
         "uid": "dgx-prometheus"
       },
       "gridPos": {
         "h": 4,
-        "w": 3,
-        "x": 9,
+        "w": 4,
+        "x": 6,
         "y": 0
       },
       "targets": [
@@ -273,7 +277,7 @@
             "type": "prometheus",
             "uid": "dgx-prometheus"
           },
-          "expr": "up{job=\"vllm-main\"}",
+          "expr": "cluster:vllm_service_state:code",
           "refId": "A",
           "editorMode": "code",
           "instant": true,
@@ -300,35 +304,436 @@
           "decimals": null,
           "mappings": [
             {
+              "type": "value",
               "options": {
                 "0": {
-                  "text": "DOWN"
+                  "text": "MONITORING_UNKNOWN",
+                  "color": "#94A3B8"
                 },
                 "1": {
-                  "text": "UP"
+                  "text": "STARTING",
+                  "color": "#38BDF8"
+                },
+                "2": {
+                  "text": "READY",
+                  "color": "#2DD4BF"
+                },
+                "3": {
+                  "text": "BUSY",
+                  "color": "#2DD4BF"
+                },
+                "4": {
+                  "text": "DEGRADED",
+                  "color": "#FACC15"
+                },
+                "5": {
+                  "text": "WEDGED",
+                  "color": "#FB923C"
+                },
+                "6": {
+                  "text": "RECOVERING",
+                  "color": "#FB923C"
+                },
+                "7": {
+                  "text": "QUEUEING",
+                  "color": "#FB923C"
+                },
+                "8": {
+                  "text": "DOWN",
+                  "color": "#F43F5E"
                 }
-              },
-              "type": "value"
+              }
             }
           ],
           "thresholds": {
             "mode": "absolute",
             "steps": [
               {
-                "color": "#F43F5E",
+                "color": "#94A3B8",
                 "value": null
-              },
-              {
-                "color": "#2DD4BF",
-                "value": 1
               }
             ]
-          }
+          },
+          "noValue": "MONITORING_UNKNOWN"
         },
         "overrides": []
       }
     },
     {
+      "id": 56,
+      "type": "stat",
+      "title": "Readiness",
+      "description": "The v2 readiness sequence (CONTRACT \u00a75), as the controller last proved it. 'proven' = the last canary completion succeeded (techsara_vllm_synthetic_success) AND both GPUs were seen working during the last readiness sequence (techsara_vllm_participation_ok). 'GPUs unproven' = the canary passes but the participation probe did not sample both GPU exporters above 30 % \u2014 on a TP=2 engine a finished completion already proves the all-reduce ran on both ranks, so this is a missing exporter sample, not a missing rank; the state tile will read DEGRADED. 'canary failing' = the last canary did not complete. 'unknown' = no canary has run since the controller started, or it is not scraped \u2014 absent is not zero.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 3,
+        "x": 10,
+        "y": 0
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "2 * techsara_vllm_participation_ok + techsara_vllm_synthetic_success",
+          "refId": "A",
+          "editorMode": "code",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "decimals": null,
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "3": {
+                  "text": "proven",
+                  "color": "#2DD4BF"
+                },
+                "1": {
+                  "text": "GPUs unproven",
+                  "color": "#FACC15"
+                },
+                "2": {
+                  "text": "canary failing",
+                  "color": "#F43F5E"
+                },
+                "0": {
+                  "text": "unproven",
+                  "color": "#F43F5E"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "unknown"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Queued requests",
+      "description": "Generations the orchestrator has accepted and durably queued for the main model (llm_queued_generations). Non-zero while the primary is not READY: each one is a person reading \u201cMain model is recovering\u2014your request is safely queued.\u201d and the same generation resumes, exactly once, when READY returns. Orange past zero; VllmRequestsQueued fires after 2 minutes of it. 'none' when the orchestrator is not being scraped \u2014 absent is not zero.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 2,
+        "x": 13,
+        "y": 0
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "llm_queued_generations",
+          "refId": "A",
+          "editorMode": "code",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "decimals": 0,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              },
+              {
+                "color": "#2DD4BF",
+                "value": 0
+              },
+              {
+                "color": "#FB923C",
+                "value": 1
+              }
+            ]
+          },
+          "noValue": "none"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Worker rank",
+      "description": "Is the VLLM::Worker_TP1 process alive on Spark 2, per the worker sentinel? A TP=2 completion cannot finish without it. 'unknown' while the sentinel is unreachable \u2014 a 0 nobody can vouch for is not shown as ABSENT.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 3,
+        "x": 15,
+        "y": 0
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "techsara_vllm_worker_rank_alive and on() (techsara_vllm_worker_reachable == 1)",
+          "refId": "A",
+          "editorMode": "code",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "decimals": null,
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "1": {
+                  "text": "alive",
+                  "color": "#2DD4BF"
+                },
+                "0": {
+                  "text": "ABSENT",
+                  "color": "#F43F5E"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "unknown"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Last successful inference",
+      "description": "Seconds since the controller's canary last completed a real streamed completion on the primary. The only liveness number here that a hung process cannot fake. Yellow past one minute (two canary intervals), red past five. 'no data' while the controller has seen no success since it started (STARTING), or is not being scraped.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 3,
+        "x": 18,
+        "y": 0
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "cluster:vllm_last_success_age_seconds",
+          "refId": "A",
+          "editorMode": "code",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 0,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              },
+              {
+                "color": "#2DD4BF",
+                "value": 0
+              },
+              {
+                "color": "#FACC15",
+                "value": 60
+              },
+              {
+                "color": "#F43F5E",
+                "value": 300
+              }
+            ]
+          },
+          "noValue": "no data"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 8,
+      "type": "stat",
+      "title": "Canary TTFT",
+      "description": "Time to first token of the last SUCCESSFUL canary (2 tokens, no tools). ~0.4 s idle; the controller calls > 10 s DEGRADED. Shown only while the canary succeeds \u2014 a failed probe's timing is not a measurement.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 3,
+        "x": 21,
+        "y": 0
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "techsara_vllm_synthetic_ttft_seconds and on() (techsara_vllm_synthetic_success == 1)",
+          "refId": "A",
+          "editorMode": "code",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 2,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              },
+              {
+                "color": "#2DD4BF",
+                "value": 0
+              },
+              {
+                "color": "#FACC15",
+                "value": 3
+              },
+              {
+                "color": "#F43F5E",
+                "value": 10
+              }
+            ]
+          },
+          "noValue": "no data"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 9,
       "type": "stat",
       "title": "Running requests",
       "description": "Whole distributed engine, not per node.",
@@ -339,8 +744,8 @@
       "gridPos": {
         "h": 4,
         "w": 3,
-        "x": 12,
-        "y": 0
+        "x": 0,
+        "y": 4
       },
       "targets": [
         {
@@ -382,12 +787,14 @@
                 "value": null
               }
             ]
-          }
+          },
+          "noValue": "no data"
         },
         "overrides": []
       }
     },
     {
+      "id": 10,
       "type": "stat",
       "title": "Waiting requests",
       "description": "Sustained non-zero means the scheduler is capacity-bound.",
@@ -398,8 +805,8 @@
       "gridPos": {
         "h": 4,
         "w": 3,
-        "x": 15,
-        "y": 0
+        "x": 3,
+        "y": 4
       },
       "targets": [
         {
@@ -453,12 +860,14 @@
                 "value": 20
               }
             ]
-          }
+          },
+          "noValue": "no data"
         },
         "overrides": []
       }
     },
     {
+      "id": 11,
       "type": "stat",
       "title": "Tokens/sec",
       "description": "Generation tokens/sec across the cluster (1m rate).",
@@ -469,8 +878,8 @@
       "gridPos": {
         "h": 4,
         "w": 3,
-        "x": 18,
-        "y": 0
+        "x": 6,
+        "y": 4
       },
       "targets": [
         {
@@ -512,12 +921,14 @@
                 "value": null
               }
             ]
-          }
+          },
+          "noValue": "no data"
         },
         "overrides": []
       }
     },
     {
+      "id": 12,
       "type": "stat",
       "title": "Requests/sec",
       "description": "",
@@ -528,8 +939,8 @@
       "gridPos": {
         "h": 4,
         "w": 3,
-        "x": 21,
-        "y": 0
+        "x": 9,
+        "y": 4
       },
       "targets": [
         {
@@ -571,12 +982,274 @@
                 "value": null
               }
             ]
-          }
+          },
+          "noValue": "no data"
         },
         "overrides": []
       }
     },
     {
+      "id": 13,
+      "type": "stat",
+      "title": "Incident duration",
+      "description": "How long the current incident has been open, from the controller's first detection. 'none' when there is no open incident (the series is absent by design, not zero).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 4
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "cluster:vllm_incident_duration_seconds",
+          "refId": "A",
+          "editorMode": "code",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 0,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              },
+              {
+                "color": "#FB923C",
+                "value": 1
+              }
+            ]
+          },
+          "noValue": "none"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 14,
+      "type": "stat",
+      "title": "Recovery attempts (1h)",
+      "description": "Coordinated recoveries the controller STARTED in the last hour. The budget is 3 per hour; at 3 it stops restarting and goes DOWN with category budget_exhausted.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 16,
+        "y": 4
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "increase(techsara_vllm_recovery_attempts_total{outcome=\"started\"}[1h])",
+          "refId": "A",
+          "editorMode": "code",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "decimals": 0,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              },
+              {
+                "color": "#2DD4BF",
+                "value": 0
+              },
+              {
+                "color": "#FACC15",
+                "value": 1
+              },
+              {
+                "color": "#F43F5E",
+                "value": 3
+              }
+            ]
+          },
+          "noValue": "no data"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 15,
+      "type": "stat",
+      "title": "Reason",
+      "description": "The controller's last failure category (CONTRACT \u00a74, a bounded set \u2014 never free text). 'none' after a clean start or once VERIFY_STABILITY passes. Stays at the last category until the next incident, so read it with the state tile.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 4
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "techsara_vllm_last_failure_category == 1",
+          "refId": "A",
+          "editorMode": "code",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "/^category$/",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "decimals": null,
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "none": {
+                  "text": "none",
+                  "color": "#2DD4BF"
+                },
+                "worker_rank_dead": {
+                  "text": "worker_rank_dead",
+                  "color": "#F43F5E"
+                },
+                "head_engine_dead": {
+                  "text": "head_engine_dead",
+                  "color": "#F43F5E"
+                },
+                "head_api_dead": {
+                  "text": "head_api_dead",
+                  "color": "#F43F5E"
+                },
+                "wedged_frozen_tokens": {
+                  "text": "wedged_frozen_tokens",
+                  "color": "#FB923C"
+                },
+                "canary_timeout": {
+                  "text": "canary_timeout",
+                  "color": "#FB923C"
+                },
+                "canary_http_error": {
+                  "text": "canary_http_error",
+                  "color": "#FB923C"
+                },
+                "connect_error": {
+                  "text": "connect_error",
+                  "color": "#FB923C"
+                },
+                "budget_exhausted": {
+                  "text": "budget_exhausted",
+                  "color": "#F43F5E"
+                },
+                "manual": {
+                  "text": "manual",
+                  "color": "#38BDF8"
+                },
+                "cold_start_timeout": {
+                  "text": "cold_start_timeout",
+                  "color": "#F43F5E"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "unknown"
+        },
+        "overrides": []
+      },
+      "transformations": [
+        {
+          "id": "labelsToFields",
+          "options": {
+            "mode": "columns",
+            "keepLabels": [
+              "category"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": 16,
       "type": "stat",
       "title": "GPU utilisation - per Spark",
       "description": "Both GPUs should move together - they are one distributed model.",
@@ -588,7 +1261,7 @@
         "h": 5,
         "w": 5,
         "x": 0,
-        "y": 4
+        "y": 8
       },
       "targets": [
         {
@@ -645,6 +1318,7 @@
       }
     },
     {
+      "id": 17,
       "type": "stat",
       "title": "GPU temperature - per Spark",
       "description": "Amber at 86 C (the part's own slowdown point), red at 90 C (shutdown). The die is shared with the CPU complex, so heavy CPU load moves this too.",
@@ -656,7 +1330,7 @@
         "h": 5,
         "w": 5,
         "x": 5,
-        "y": 4
+        "y": 8
       },
       "targets": [
         {
@@ -717,6 +1391,7 @@
       }
     },
     {
+      "id": 18,
       "type": "stat",
       "title": "GPU power - per Spark + combined",
       "description": "Accelerator rail only - NOT whole-machine AC draw, which this hardware cannot measure at all.",
@@ -728,7 +1403,7 @@
         "h": 5,
         "w": 6,
         "x": 10,
-        "y": 4
+        "y": 8
       },
       "targets": [
         {
@@ -789,6 +1464,7 @@
       }
     },
     {
+      "id": 19,
       "type": "stat",
       "title": "Unified memory - per Spark",
       "description": "GB10 has no separate VRAM: model weights and KV cache live in host memory, so this IS the GPU memory figure.",
@@ -800,7 +1476,7 @@
         "h": 5,
         "w": 4,
         "x": 16,
-        "y": 4
+        "y": 8
       },
       "targets": [
         {
@@ -861,6 +1537,7 @@
       }
     },
     {
+      "id": 20,
       "type": "gauge",
       "title": "KV cache used",
       "description": "One distributed engine, so this is cluster-wide by nature. Above ~90% vLLM starts preempting requests.",
@@ -872,7 +1549,7 @@
         "h": 5,
         "w": 4,
         "x": 20,
-        "y": 4
+        "y": 8
       },
       "targets": [
         {
@@ -925,6 +1602,7 @@
       }
     },
     {
+      "id": 21,
       "type": "stat",
       "title": "Combined GPU power",
       "description": "Spark 1 + Spark 2 accelerator power.",
@@ -936,7 +1614,7 @@
         "h": 4,
         "w": 5,
         "x": 0,
-        "y": 9
+        "y": 13
       },
       "targets": [
         {
@@ -984,6 +1662,7 @@
       }
     },
     {
+      "id": 22,
       "type": "stat",
       "title": "Hottest GPU",
       "description": "The hotter of the two Sparks.",
@@ -995,7 +1674,7 @@
         "h": 4,
         "w": 5,
         "x": 5,
-        "y": 9
+        "y": 13
       },
       "targets": [
         {
@@ -1055,6 +1734,7 @@
       }
     },
     {
+      "id": 23,
       "type": "stat",
       "title": "Avg GPU utilisation",
       "description": "Averaged across both GPUs.",
@@ -1066,7 +1746,7 @@
         "h": 4,
         "w": 5,
         "x": 10,
-        "y": 9
+        "y": 13
       },
       "targets": [
         {
@@ -1122,6 +1802,7 @@
       }
     },
     {
+      "id": 24,
       "type": "stat",
       "title": "Total GPU memory allocated",
       "description": "Sum of CUDA context allocations on both Sparks. There is no capacity denominator on a unified-memory part.",
@@ -1133,7 +1814,7 @@
         "h": 4,
         "w": 5,
         "x": 15,
-        "y": 9
+        "y": 13
       },
       "targets": [
         {
@@ -1181,6 +1862,7 @@
       }
     },
     {
+      "id": 25,
       "type": "stat",
       "title": "RoCE traffic",
       "description": "NCCL tensor-parallel traffic between the Sparks.",
@@ -1192,7 +1874,7 @@
         "h": 4,
         "w": 4,
         "x": 20,
-        "y": 9
+        "y": 13
       },
       "targets": [
         {
@@ -1253,6 +1935,7 @@
       }
     },
     {
+      "id": 26,
       "type": "stat",
       "title": "CPU utilisation - per Spark",
       "description": "Host CPU, not the GPU. High CPU with idle GPUs usually means tokenisation, retrieval or the sync worker - not inference.",
@@ -1264,7 +1947,7 @@
         "h": 4,
         "w": 5,
         "x": 0,
-        "y": 13
+        "y": 17
       },
       "targets": [
         {
@@ -1321,6 +2004,7 @@
       }
     },
     {
+      "id": 27,
       "type": "stat",
       "title": "Avg CPU utilisation",
       "description": "Averaged across both Sparks.",
@@ -1332,7 +2016,7 @@
         "h": 4,
         "w": 4,
         "x": 5,
-        "y": 13
+        "y": 17
       },
       "targets": [
         {
@@ -1388,6 +2072,7 @@
       }
     },
     {
+      "id": 28,
       "type": "stat",
       "title": "Ethernet traffic - per Spark",
       "description": "Real LAN / internet throughput on the physical NICs. Virtual interfaces are excluded: counting veth and bridge alongside the NIC overstated spark-1 by 3.5x. This is NOT the RoCE fabric - RDMA bypasses these counters entirely.",
@@ -1399,7 +2084,7 @@
         "h": 4,
         "w": 7,
         "x": 9,
-        "y": 13
+        "y": 17
       },
       "targets": [
         {
@@ -1460,6 +2145,7 @@
       }
     },
     {
+      "id": 29,
       "type": "stat",
       "title": "Combined ethernet",
       "description": "Both Sparks together - the cluster's total traffic to the outside world.",
@@ -1471,7 +2157,7 @@
         "h": 4,
         "w": 4,
         "x": 16,
-        "y": 13
+        "y": 17
       },
       "targets": [
         {
@@ -1532,6 +2218,7 @@
       }
     },
     {
+      "id": 30,
       "type": "stat",
       "title": "Data transferred",
       "description": "Total bytes in + out over the dashboard's selected time range - change the range at the top right and this follows it.",
@@ -1543,7 +2230,7 @@
         "h": 4,
         "w": 4,
         "x": 20,
-        "y": 13
+        "y": 17
       },
       "targets": [
         {
@@ -1591,18 +2278,20 @@
       }
     },
     {
+      "id": 31,
       "type": "row",
       "title": "Databases and data stores",
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 17
+        "y": 21
       },
       "collapsed": false,
       "panels": []
     },
     {
+      "id": 32,
       "type": "stat",
       "title": "PostgreSQL",
       "description": "Conversations, messages, web memory, research runs.",
@@ -1614,7 +2303,7 @@
         "h": 4,
         "w": 3,
         "x": 0,
-        "y": 18
+        "y": 22
       },
       "targets": [
         {
@@ -1678,6 +2367,7 @@
       }
     },
     {
+      "id": 33,
       "type": "stat",
       "title": "Database size",
       "description": "",
@@ -1689,7 +2379,7 @@
         "h": 4,
         "w": 4,
         "x": 3,
-        "y": 18
+        "y": 22
       },
       "targets": [
         {
@@ -1737,6 +2427,7 @@
       }
     },
     {
+      "id": 34,
       "type": "stat",
       "title": "DB connections",
       "description": "Against PostgreSQL's default max_connections of 100.",
@@ -1748,7 +2439,7 @@
         "h": 4,
         "w": 3,
         "x": 7,
-        "y": 18
+        "y": 22
       },
       "targets": [
         {
@@ -1804,6 +2495,7 @@
       }
     },
     {
+      "id": 35,
       "type": "stat",
       "title": "Biggest tables",
       "description": "Live row estimates.",
@@ -1815,7 +2507,7 @@
         "h": 4,
         "w": 6,
         "x": 10,
-        "y": 18
+        "y": 22
       },
       "targets": [
         {
@@ -1864,6 +2556,7 @@
       }
     },
     {
+      "id": 36,
       "type": "stat",
       "title": "Warehouse snapshot age",
       "description": "How stale the Salesforce data is. A climbing age means answers come from an old copy while everything still looks healthy.",
@@ -1875,7 +2568,7 @@
         "h": 4,
         "w": 4,
         "x": 16,
-        "y": 18
+        "y": 22
       },
       "targets": [
         {
@@ -1931,6 +2624,7 @@
       }
     },
     {
+      "id": 37,
       "type": "stat",
       "title": "Data on disk",
       "description": "DuckDB + LanceDB + Parquet + reports combined.",
@@ -1942,7 +2636,7 @@
         "h": 4,
         "w": 4,
         "x": 20,
-        "y": 18
+        "y": 22
       },
       "targets": [
         {
@@ -1990,18 +2684,130 @@
       }
     },
     {
+      "id": 38,
       "type": "row",
       "title": "Live correlation \u2014 same time axis, so a tokens/sec dip can be explained",
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 22
+        "y": 26
       },
       "collapsed": false,
       "panels": []
     },
     {
+      "id": 39,
+      "type": "state-timeline",
+      "title": "Engine state",
+      "description": "cluster:vllm_service_state:code over time, on the same axis as everything below it. A gap is a gap: nothing here draws a line across missing telemetry, and a stale controller verdict (snapshot stamp > 30 s old) is a gap too. QUEUEING is the primary not READY/BUSY/DOWN with requests held for it. With no series at all Grafana prints its own empty-result message for this panel type ('Data does not have a time field'); that is the same condition the tile above shows as MONITORING_UNKNOWN.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 24,
+        "x": 0,
+        "y": 27
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "cluster:vllm_service_state:code",
+          "refId": "A",
+          "editorMode": "code",
+          "legendFormat": "engine",
+          "range": true
+        }
+      ],
+      "options": {
+        "mergeValues": true,
+        "showValue": "auto",
+        "alignValue": "left",
+        "rowHeight": 0.9,
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "#94A3B8"
+          },
+          "custom": {
+            "lineWidth": 0,
+            "fillOpacity": 80,
+            "spanNulls": false
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "MONITORING_UNKNOWN",
+                  "color": "#94A3B8"
+                },
+                "1": {
+                  "text": "STARTING",
+                  "color": "#38BDF8"
+                },
+                "2": {
+                  "text": "READY",
+                  "color": "#2DD4BF"
+                },
+                "3": {
+                  "text": "BUSY",
+                  "color": "#2DD4BF"
+                },
+                "4": {
+                  "text": "DEGRADED",
+                  "color": "#FACC15"
+                },
+                "5": {
+                  "text": "WEDGED",
+                  "color": "#FB923C"
+                },
+                "6": {
+                  "text": "RECOVERING",
+                  "color": "#FB923C"
+                },
+                "7": {
+                  "text": "QUEUEING",
+                  "color": "#FB923C"
+                },
+                "8": {
+                  "text": "DOWN",
+                  "color": "#F43F5E"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 40,
       "type": "timeseries",
       "title": "Tokens/sec",
       "description": "If this drops, read the next three panels left to right.",
@@ -2013,7 +2819,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 23
+        "y": 31
       },
       "targets": [
         {
@@ -2064,7 +2870,7 @@
             "fillOpacity": 8,
             "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true,
+            "spanNulls": false,
             "stacking": {
               "mode": "none",
               "group": "A"
@@ -2085,6 +2891,7 @@
       }
     },
     {
+      "id": 41,
       "type": "timeseries",
       "title": "GPU utilisation",
       "description": "Both lines should move together \u2014 they are one distributed model.",
@@ -2096,7 +2903,7 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 23
+        "y": 31
       },
       "targets": [
         {
@@ -2278,6 +3085,7 @@
       }
     },
     {
+      "id": 42,
       "type": "timeseries",
       "title": "Requests running vs waiting",
       "description": "",
@@ -2289,7 +3097,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 23
+        "y": 31
       },
       "targets": [
         {
@@ -2340,7 +3148,7 @@
             "fillOpacity": 8,
             "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true,
+            "spanNulls": false,
             "stacking": {
               "mode": "none",
               "group": "A"
@@ -2392,6 +3200,7 @@
       }
     },
     {
+      "id": 43,
       "type": "timeseries",
       "title": "GPU power",
       "description": "",
@@ -2403,7 +3212,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 30
+        "y": 38
       },
       "targets": [
         {
@@ -2600,6 +3409,7 @@
       }
     },
     {
+      "id": 44,
       "type": "timeseries",
       "title": "GPU temperature",
       "description": "Correlate a tokens/sec dip here first \u2014 thermal throttling is visible.",
@@ -2611,7 +3421,7 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 30
+        "y": 38
       },
       "targets": [
         {
@@ -2796,6 +3606,7 @@
       }
     },
     {
+      "id": 45,
       "type": "timeseries",
       "title": "Unified memory used",
       "description": "Memory pressure on a unified-memory machine.",
@@ -2807,7 +3618,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 30
+        "y": 38
       },
       "targets": [
         {
@@ -2989,6 +3800,7 @@
       }
     },
     {
+      "id": 46,
       "type": "timeseries",
       "title": "RoCE interconnect throughput - per Spark",
       "description": "Traffic here while a prompt generates is the proof the two Sparks are exchanging tensors. Measured from the InfiniBand counters - RDMA is invisible to ordinary network counters.",
@@ -3000,7 +3812,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 37
+        "y": 45
       },
       "targets": [
         {
@@ -3196,6 +4008,7 @@
       }
     },
     {
+      "id": 47,
       "type": "timeseries",
       "title": "Database throughput",
       "description": "PostgreSQL read throughput, 8 KiB blocks converted to bytes/sec. 'from disk' should stay near zero - anything else means the working set no longer fits in shared_buffers.",
@@ -3207,7 +4020,7 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 37
+        "y": 45
       },
       "targets": [
         {
@@ -3313,6 +4126,7 @@
       }
     },
     {
+      "id": 48,
       "type": "timeseries",
       "title": "KV cache utilisation",
       "description": "A tokens/sec dip with this near 100% is capacity, not heat.",
@@ -3324,7 +4138,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 37
+        "y": 45
       },
       "targets": [
         {
@@ -3364,7 +4178,7 @@
             "fillOpacity": 8,
             "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true,
+            "spanNulls": false,
             "stacking": {
               "mode": "none",
               "group": "A"
@@ -3401,6 +4215,7 @@
       }
     },
     {
+      "id": 49,
       "type": "timeseries",
       "title": "CPU utilisation - per Spark",
       "description": "On the same time axis as tokens/sec above, so a throughput dip that is CPU-bound rather than GPU-bound is visible.",
@@ -3412,7 +4227,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 44
+        "y": 52
       },
       "targets": [
         {
@@ -3507,6 +4322,7 @@
       }
     },
     {
+      "id": 50,
       "type": "timeseries",
       "title": "Ethernet throughput - per Spark",
       "description": "TX and RX on the physical NICs of each Spark.",
@@ -3518,7 +4334,7 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 44
+        "y": 52
       },
       "targets": [
         {
@@ -3624,6 +4440,7 @@
       }
     },
     {
+      "id": 51,
       "type": "timeseries",
       "title": "Ethernet throughput - cluster total",
       "description": "Both Sparks summed. Compare with RoCE throughput to the left: this is traffic leaving the cluster, that is traffic between the two nodes.",
@@ -3635,7 +4452,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 44
+        "y": 52
       },
       "targets": [
         {
@@ -3741,18 +4558,20 @@
       }
     },
     {
+      "id": 52,
       "type": "row",
       "title": "Service health",
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 51
+        "y": 59
       },
       "collapsed": false,
       "panels": []
     },
     {
+      "id": 53,
       "type": "stat",
       "title": "Application endpoints",
       "description": "Orchestrator, frontend and SearXNG expose no metrics; these are HTTP probes.",
@@ -3764,7 +4583,7 @@
         "h": 4,
         "w": 12,
         "x": 0,
-        "y": 52
+        "y": 60
       },
       "targets": [
         {
@@ -3829,6 +4648,7 @@
       }
     },
     {
+      "id": 54,
       "type": "stat",
       "title": "Model services",
       "description": "Router, embeddings, reranker and OCR (OCR runs on the worker when scripts/ocr.sh put it there).",
@@ -3840,7 +4660,7 @@
         "h": 4,
         "w": 8,
         "x": 12,
-        "y": 52
+        "y": 60
       },
       "targets": [
         {
@@ -3905,6 +4725,7 @@
       }
     },
     {
+      "id": 55,
       "type": "stat",
       "title": "Data",
       "description": "Full detail on the Databases / Data Stores dashboard.",
@@ -3916,7 +4737,7 @@
         "h": 4,
         "w": 4,
         "x": 20,
-        "y": 52
+        "y": 60
       },
       "targets": [
         {
