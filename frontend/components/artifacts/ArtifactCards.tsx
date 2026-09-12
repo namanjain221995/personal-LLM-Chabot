@@ -1,15 +1,19 @@
 'use client';
 
 /**
- * The cards for `meta.artifacts` under an assistant turn: one card per
- * artifact VERSION, grouped by artifact so "make slide 4 shorter" (a new
- * version of the same deck) reads as a revision of the file above it, not
- * as an unrelated second file.
+ * The cards for `meta.artifacts` under an assistant turn: one GROUP per
+ * artifact version (ArtifactCard — a header over one FileCard per file),
+ * grouped by artifact so "make slide 4 shorter" (a new version of the same
+ * deck) reads as a revision of the files above it, not as an unrelated
+ * second set.
  *
- * Each card owns its own liveness (useLiveArtifact): a ref the meta left
+ * Each group owns its own liveness (useLiveArtifact): a ref the meta left
  * non-terminal polls the server on its own and repaints itself, so a
- * hundred-message thread never runs a hundred polls — only the cards that
+ * hundred-message thread never runs a hundred polls — only the groups that
  * are actually unfinished ask, and they stop the moment they hear.
+ *
+ * The whole section is clamped to the width of one card (680 px): the cards
+ * belong to the assistant's column of prose, not to the viewport.
  */
 
 import { useMemo } from 'react';
@@ -17,9 +21,19 @@ import type { ArtifactRef } from '@/lib/types';
 import { ArtifactCard } from './ArtifactCard';
 import { useLiveArtifact } from './useLiveArtifact';
 
-export type OpenArtifact = (artifact: ArtifactRef, originId: string) => void;
+/**
+ * Open the panel on one file. `siblings` is every ref of the same message,
+ * in meta order, so the panel can step prev/next across the message's
+ * versions and not only within one (CONTRACT-2 §9).
+ */
+export type OpenArtifact = (
+  artifact: ArtifactRef,
+  originId: string,
+  fileKey: string,
+  siblings: ArtifactRef[],
+) => void;
 
-/** `artifact_id:version` — what the panel and the cards compare. */
+/** `artifact_id:version` — what identifies one version group. */
 export function artifactKey(artifactId: string, version: number): string {
   return `${artifactId}:${version}`;
 }
@@ -42,13 +56,15 @@ export function groupArtifacts(refs: ArtifactRef[]): ArtifactRef[][] {
   );
 }
 
-function LiveCard({
+function LiveGroup({
   artifact,
-  active,
+  siblings,
+  activeKey,
   onOpen,
 }: {
   artifact: ArtifactRef;
-  active: boolean;
+  siblings: ArtifactRef[];
+  activeKey: string | null;
   onOpen: OpenArtifact;
 }) {
   const live = useLiveArtifact(artifact);
@@ -57,8 +73,8 @@ function LiveCard({
       artifact={live.ref}
       job={live.job}
       error={live.error}
-      active={active}
-      onOpen={onOpen}
+      activeKey={activeKey}
+      onOpen={(ref, originId, key) => onOpen(ref, originId, key, siblings)}
     />
   );
 }
@@ -70,31 +86,28 @@ export function ArtifactCards({
 }: {
   artifacts: ArtifactRef[];
   onOpen: OpenArtifact;
-  /** `artifactKey(id, version)` of the version the panel is showing. */
+  /** The key (lib/artifacts.ts fileKey) of the FILE the panel is showing. */
   activeKey?: string | null;
 }) {
   const groups = useMemo(() => groupArtifacts(artifacts), [artifacts]);
   if (groups.length === 0) return null;
   return (
-    <section aria-label="Generated files" className="mt-3 flex flex-col gap-3" data-testid="artifact-cards">
+    <section
+      aria-label="Generated files"
+      className="mt-3 flex w-full max-w-[680px] flex-col gap-4"
+      data-testid="artifact-cards"
+    >
       {groups.map((group) => (
-        <div key={group[0].artifact_id} className="flex flex-col gap-2">
-          {group.length > 1 && (
-            <p className="text-[11px] font-medium uppercase tracking-wide text-faint">
-              {group[0].title} · {group.length} versions
-            </p>
-          )}
-          <ul className="flex flex-col gap-2">
-            {group.map((ref) => (
-              <li key={artifactKey(ref.artifact_id, ref.version)}>
-                <LiveCard
-                  artifact={ref}
-                  active={activeKey === artifactKey(ref.artifact_id, ref.version)}
-                  onOpen={onOpen}
-                />
-              </li>
-            ))}
-          </ul>
+        <div key={group[0].artifact_id} className="flex flex-col gap-3">
+          {group.map((ref) => (
+            <LiveGroup
+              key={artifactKey(ref.artifact_id, ref.version)}
+              artifact={ref}
+              siblings={artifacts}
+              activeKey={activeKey}
+              onOpen={onOpen}
+            />
+          ))}
         </div>
       ))}
     </section>

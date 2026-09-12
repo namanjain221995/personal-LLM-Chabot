@@ -768,6 +768,8 @@ async def generate_and_run_sql(
             component="orchestrator.app.engines.sql._execute",
             details={
                 "source": "local_salesforce_warehouse",
+                "environment": settings.sf_environment,
+                "freshness": "synced_snapshot",
                 "attempt": 1,
                 "sql": sql,
                 "returned_rows": len(rows),
@@ -813,6 +815,8 @@ async def generate_and_run_sql(
             component="orchestrator.app.engines.sql._execute",
             details={
                 "source": "local_salesforce_warehouse",
+                "environment": settings.sf_environment,
+                "freshness": "synced_snapshot",
                 "attempt": 2,
                 "sql": sql2,
                 "returned_rows": len(rows),
@@ -1287,7 +1291,17 @@ async def run_sql_engine(
                 await emit(kind, {"text": delta})
                 if kind == "token":
                     parts.append(delta)
-            await emit("meta", {"route": "sql"})
+            await emit(
+                "meta",
+                {
+                    "route": "sql",
+                    "provenance": {
+                        "source": "live_salesforce_metadata",
+                        "environment": settings.sf_environment,
+                        "freshness": "live",
+                    },
+                },
+            )
             return "".join(parts)
 
         try:
@@ -1298,7 +1312,11 @@ async def run_sql_engine(
                 "QUERY_EXECUTED",
                 status="failed",
                 component="orchestrator.app.engines.live_sf.fetch_live",
-                details={"source": "live_salesforce_fallback"},
+                details={
+                    "source": "live_salesforce_fallback",
+                    "environment": settings.sf_environment,
+                    "freshness": "live",
+                },
                 duration_ms=round((time.perf_counter() - live_started) * 1000),
                 error=exc,
             )
@@ -1326,6 +1344,8 @@ async def run_sql_engine(
             component="orchestrator.app.engines.live_sf.fetch_live",
             details={
                 "source": "live_salesforce_fallback",
+                "environment": settings.sf_environment,
+                "freshness": "live",
                 "soql": soql,
                 "returned_rows": len(live_rows),
             },
@@ -1365,6 +1385,11 @@ async def run_sql_engine(
         live_meta: dict = {
             "route": "sql", "sql": soql,
             "data": live_preview, "truncated": False,
+            "provenance": {
+                "source": "live_salesforce_records",
+                "environment": settings.sf_environment,
+                "freshness": "live",
+            },
         }
         if live_preview and isinstance(live_preview[0], dict):
             await attach_chart(
@@ -1462,6 +1487,11 @@ async def run_sql_engine(
         "sql": sql,
         "data": [dict(zip(columns, row)) for row in preview],
         "truncated": truncated,
+        "provenance": {
+            "source": "duckdb_snapshot",
+            "environment": settings.sf_environment,
+            "freshness": "synced_snapshot",
+        },
     }
 
     if wants_export:

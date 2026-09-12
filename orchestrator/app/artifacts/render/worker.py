@@ -11,7 +11,10 @@ PYTHONPATH/MPLCONFIGDIR/FONTCONFIG_FILE, `preexec_fn` setting RLIMIT_AS to
 artifact_render_memory_mb and RLIMIT_CPU to artifact_render_timeout_s, and
 `asyncio.wait_for` killing the process group on the wall clock.
 
-PROTOCOL. job.json: {spec, formats, out_dir, title_slug, version, effort}.
+PROTOCOL. job.json: {spec, formats, out_dir, title_slug, version, effort,
+transform?} — `transform` is the caller's report of what code did to a
+pasted table (CONTRACT-2 §6), optional, echoed in the report and read by the
+tabular document's methodology note.
 On success `<out_dir>/render-report.json` holds RenderReport.to_json() and
 the exit code is 0. On a RenderError the same file holds
 {error: {category, message}} and the exit code is 1; the traceback, when
@@ -71,10 +74,11 @@ def run_job(job: Dict[str, Any]) -> Dict[str, Any]:
         title_slug = str(job.get("title_slug") or "document")
         version = int(job.get("version") or 1)
         effort = str(job.get("effort") or "fast")
+        transform = job.get("transform") if isinstance(job.get("transform"), dict) else None
     except Exception as exc:  # a malformed job is the caller's bug, but still a sentence
         return {"error": {"category": "invalid_request", "message": "The render job could not be read."}, "detail": type(exc).__name__}
     try:
-        report = render_version(spec, formats, out_dir, title_slug=title_slug, version=version, effort=effort)
+        report = render_version(spec, formats, out_dir, title_slug=title_slug, version=version, effort=effort, transform=transform)
     except RenderError as exc:
         return {"error": {"category": exc.category, "message": exc.message}}
     except MemoryError:

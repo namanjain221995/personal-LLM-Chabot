@@ -29,22 +29,37 @@ from collections.abc import Mapping
 from contextvars import ContextVar
 from typing import Any, AsyncIterator, List, Optional, Sequence, Tuple
 
+from . import admission as _admission
+from . import breaker as _breaker
 from . import context, metrics
 from .config import settings
 from .context import clip_message_contents
 from .model_capabilities import ModelCapabilities, ReasoningField
-from .resilience import ModelUnavailable, resilient, sidecar_recovery_s  # noqa: F401 — re-exported for callers
+from .resilience import ModelUnavailable, resilient, sidecar_recovery_s, wait_admitted  # noqa: F401 — re-exported for callers
 
 # ---------------------------------------------------------------------------
 # OUTAGE TOLERANCE. Every model call below opens through
 # `resilience.resilient`, which waits for /health and retries through the
 # recoverable failures a restarting engine produces (connection refused, a
 # 5xx from a dying engine) and re-raises everything else untouched — a 4xx,
-# a read timeout, a cancellation. For streams only the OPEN is wrapped: once
-# a token has been forwarded a re-open would duplicate text. The window is
-# short for a person watching a chat and long for a background job; see
-# app/resilience.py for the two windows and the measured outage that sized
-# them.
+# a read timeout, a cancellation. For streams the OPEN and the FIRST CHUNK
+# are wrapped (the headers prove nothing; a body that dies before its first
+# token is a failed open, CONTRACT §8.4): once a token has been forwarded a
+# re-open would duplicate text. The window is short for a person watching a
+# chat and long for a background job; see app/resilience.py for the two
+# windows and the measured outage that sized them.
+#
+# STRICT ONE-MODEL MODE (2026-09-12, docs/availability/CONTRACT.md v2 §1,
+# §6.7, §8.2–8.3). Only the main model answers a person; nothing stands in
+# for it. Every call to it goes through ONE choke point — `_primary_send`
+# / `_open_stream` — which is where the circuit breaker is consulted
+# before the first attempt (an OPEN breaker means the engine is not
+# touched, the caller is queued on the READY event and the chat worker's
+# row says so), where the admission lanes size the prompt and hold a slot
+# (app/admission.py), and where a stream's first chunk — not its headers —
+# settles the breaker. The router (`router_chat_completion`) is an internal
+# classifier and never receives a user-answer request: `stream_chat_events`
+# asserts the engine it streams from.
 # ---------------------------------------------------------------------------
 
 log = logging.getLogger(__name__)
@@ -168,6 +183,63 @@ def _capture_finish(chunk) -> None:
     _set_finish_reason(getattr(choices[0], "finish_reason", None))
 
 
+def _is_primary(base_url: str) -> bool:
+    """Is this endpoint the main model's? The breaker registry is the one
+    place that maps URLs to engines, so the two can never disagree."""
+    return _breaker.engine_for_base_url(base_url) == _breaker.MAIN
+
+
+async def _fit(
+    messages: Sequence[dict],
+    *,
+    base_url: str,
+    model: str,
+    requested_max_tokens: Optional[int] = None,
+    what: str,
+    recovery_s: Optional[float] = None,
+) -> Tuple[List[dict], int]:
+    """`context.fit_request`, behind the breaker.
+
+    Sizing asks the engine's `/tokenize` for the exact prompt count, and
+    every entry point sizes BEFORE it sends — so with the breaker OPEN this
+    process kept touching the port it had declared dead, once per queued
+    turn (round-2 review, llm.py:406; CONTRACT §8.2: "while OPEN, no
+    caller polls the dead port"). The sizing therefore waits at the gate
+    first, exactly as the send would: a chat turn queues on its hold (and
+    parks at the window), a sidecar with no window fails to its fallback
+    at once — and only an engine the breaker admits is asked to count.
+    """
+    if _is_primary(base_url) and not _breaker.main_allows():
+        await wait_admitted(what=what, base_url=base_url, recovery_s=recovery_s)
+    return await context.fit_request(
+        messages, base_url=base_url, model=model, requested_max_tokens=requested_max_tokens,
+    )
+
+
+async def _primary_send(client, request: dict, *, what: str, base_url: str, stream: bool = False):
+    """THE choke point for a call to the main model (module header).
+
+    Per attempt, in order: the breaker (inside `resilient`, before anything
+    is sent), the admission lane (inside the attempt, so a request queued
+    for a recovering engine holds no lane slot for the whole reload), the
+    engine. A sidecar endpoint that happens to come through here (the
+    vision URL on a profile that points it elsewhere) has no breaker and
+    no lane and gets the plain wrapper.
+    """
+
+    def create():
+        return client.chat.completions.create(**request)
+
+    if _is_primary(base_url):
+        op = lambda: _admission.run(  # noqa: E731 — a named closure reads worse here
+            create, messages=request.get("messages") or [], base_url=base_url,
+            model=str(request.get("model") or settings.llm_model), stream=stream,
+        )
+    else:
+        op = create
+    return await resilient(op, what=what, base_url=base_url, stream=stream)
+
+
 async def _open_stream(client, request: dict):
     """Open a streamed completion, asking for usage when the server allows it.
 
@@ -175,19 +247,20 @@ async def _open_stream(client, request: dict):
     it answers 400, which would otherwise turn a telemetry nicety into a total
     outage — so the first refusal drops the option for the whole process and
     the request is retried exactly as it would have been sent before.
+
+    The stream comes back wrapped (resilience.GuardedStream): its first
+    chunk is what tells the breaker the engine served, and a body that
+    dies is reported as the failure it is. Consume it with `_consume` so
+    an early exit closes it and releases its lane.
     """
     base_url = str(getattr(client, "base_url", "") or settings.openai_base_url)
     if not _ASK_FOR_USAGE["enabled"]:
         request.pop("stream_options", None)
-        return await resilient(
-            lambda: client.chat.completions.create(**request), what="stream", base_url=base_url,
-        )
+        return await _primary_send(client, request, what="stream", base_url=base_url, stream=True)
     ask = dict(request)
     ask["stream_options"] = {"include_usage": True}
     try:
-        return await resilient(
-            lambda: client.chat.completions.create(**ask), what="stream", base_url=base_url,
-        )
+        return await _primary_send(client, ask, what="stream", base_url=base_url, stream=True)
     except _bad_request_error() as exc:
         # ONLY a 400 is "the server does not know this option". Until
         # 2026-09-11 this caught every exception, so the first streamed call
@@ -204,9 +277,22 @@ async def _open_stream(client, request: dict):
             type(exc).__name__, exc,
         )
         request.pop("stream_options", None)
-        return await resilient(
-            lambda: client.chat.completions.create(**request), what="stream", base_url=base_url,
-        )
+        return await _primary_send(client, request, what="stream", base_url=base_url, stream=True)
+
+
+@contextlib.asynccontextmanager
+async def _consume(stream):
+    """Iterate a stream and, on ANY early exit — the wall-clock guard, a
+    thinking overrun, the consumer being cancelled or closed — close it, so
+    the breaker permit and the admission lane it holds are released. A
+    stream read to its end is left alone (its close is a no-op)."""
+    try:
+        yield stream
+    finally:
+        closer = getattr(stream, "close", None)
+        if closer is not None:
+            with contextlib.suppress(Exception):
+                await closer()
 
 
 def _bad_request_error():
@@ -343,13 +429,14 @@ async def chat_completion(
     off the wrong object. The streaming path already learned this lesson (see
     stream_chat_completion); this is the same fix for the non-streaming one.
     """
-    client = _openai_client()
     model_id = model or settings.llm_model
-    sized, budget = await context.fit_request(
+    client = _openai_client()
+    sized, budget = await _fit(
         normalize_system(messages),
         base_url=settings.openai_base_url,
         model=model_id,
         requested_max_tokens=max_tokens,
+        what="chat_completion",
     )
     request = dict(
         model=model_id,
@@ -361,10 +448,7 @@ async def chat_completion(
     if extra_body is not None:
         request["extra_body"] = extra_body
     reset_finish_reason()
-    resp = await resilient(
-        lambda: client.chat.completions.create(**request),
-        what="chat_completion", base_url=settings.openai_base_url,
-    )
+    resp = await _primary_send(client, request, what="chat_completion", base_url=settings.openai_base_url)
     _capture_usage(resp)
     _capture_finish(resp)
     _, content = split_reasoning(resp.choices[0].message, settings.main_capabilities)
@@ -386,7 +470,6 @@ async def chat_completion_with_reasoning(
     follows the effort (fast/low: off), with the same budget-grown max_tokens
     as the streaming path.
     """
-    client = _openai_client()
     model_id = model or settings.llm_model
     thinking_on = wants_thinking("smart", effort)
     budget_tokens = thinking_budget(effort) if thinking_on else None
@@ -398,11 +481,14 @@ async def chat_completion_with_reasoning(
             # Unbounded thinking: floor at MAX_OUTPUT_TOKENS so thinking +
             # answer always fit (same policy as the streaming path).
             requested = max(max_tokens or 0, settings.max_output_tokens)
-    sized, budget = await context.fit_request(
+
+    client = _openai_client()
+    sized, budget = await _fit(
         normalize_system(messages),
         base_url=settings.openai_base_url,
         model=model_id,
         requested_max_tokens=requested,
+        what="chat_completion_with_reasoning",
     )
     request = dict(
         model=model_id, messages=sized, temperature=temperature, max_tokens=budget
@@ -417,10 +503,8 @@ async def chat_completion_with_reasoning(
         # in a repetition loop dies at the wall clock instead of holding the
         # whole best-of-N gather hostage.
         resp = await _asyncio.wait_for(
-            resilient(
-                lambda: client.chat.completions.create(**request),
-                what="chat_completion_with_reasoning", base_url=settings.openai_base_url,
-            ),
+            _primary_send(client, request, what="chat_completion_with_reasoning",
+                          base_url=settings.openai_base_url),
             timeout=settings.gen_wall_clock_s,
         )
     except _asyncio.TimeoutError:
@@ -444,13 +528,14 @@ async def stream_chat_completion(
     thinking: bool = True,
 ) -> AsyncIterator[str]:
     """Streaming chat completion; yields text deltas."""
-    client = _openai_client()
     model_id = model or settings.llm_model
-    sized, budget = await context.fit_request(
+    client = _openai_client()
+    sized, budget = await _fit(
         normalize_system(messages),
         base_url=settings.openai_base_url,
         model=model_id,
         requested_max_tokens=max_tokens,
+        what="stream",
     )
     request = dict(
         model=model_id,
@@ -467,16 +552,16 @@ async def stream_chat_completion(
     if extra_body is not None:
         request["extra_body"] = extra_body
     reset_finish_reason()
-    stream = await _open_stream(client, request)
-    async for chunk in stream:
-        _capture_usage(chunk)
-        _capture_finish(chunk)
-        if not chunk.choices:
-            continue
-        delta = chunk.choices[0].delta
-        content = _delta_value(delta, "content") if delta is not None else None
-        if content:
-            yield str(content)
+    async with _consume(await _open_stream(client, request)) as stream:
+        async for chunk in stream:
+            _capture_usage(chunk)
+            _capture_finish(chunk)
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            content = _delta_value(delta, "content") if delta is not None else None
+            if content:
+                yield str(content)
 
 
 # ---------------------------------------------------------------------------
@@ -486,11 +571,13 @@ async def stream_chat_completion(
 def resolve_model_choice(choice: str) -> Tuple[str, str, str]:
     """Resolve a V2 model choice to (base_url, api_key, served model id).
 
-    "smart" (default) → MAIN_MODEL on OPENAI_BASE_URL; "fast" → ROUTER_MODEL
-    on ROUTER_BASE_URL.
+    Every choice resolves to MAIN_MODEL on OPENAI_BASE_URL. "fast" used to
+    name the router engine; in strict one-model mode (CONTRACT v2 §1) the
+    router is a classifier and may not write a person's answer, and "fast"
+    is what it always really meant — the same model with the reasoning
+    pass off (`wants_thinking`). A client that still sends the old value
+    (a stored preference) is served honestly rather than refused.
     """
-    if choice == "fast":
-        return settings.router_base_url, LOCAL_API_KEY, settings.router_model
     return settings.openai_base_url, settings.openai_api_key, settings.llm_model
 
 
@@ -500,10 +587,27 @@ def served_model_id(choice: str) -> str:
 
 
 def capabilities_for_model_choice(choice: str) -> ModelCapabilities:
-    """Capabilities for the endpoint selected by a V2 model choice."""
-    if choice == "fast":
-        return settings.router_capabilities
+    """Capabilities for the endpoint selected by a V2 model choice — the
+    main model's, whatever the choice (see resolve_model_choice)."""
     return settings.main_capabilities
+
+
+class AnswerEngineViolation(RuntimeError):
+    """A user-facing answer was about to be streamed from an engine that is
+    not the main model. Never expected to fire: `resolve_model_choice`
+    returns the main model for every choice. It exists so the invariant of
+    CONTRACT v2 §1 is checked where the answer is produced, not assumed."""
+
+
+def assert_answer_engine(base_url: str) -> None:
+    """The guard `stream_chat_events` runs before it opens the answer stream."""
+    if _is_primary(base_url):
+        return
+    log.error(
+        "llm.answer_engine REFUSED: a user answer would have come from %s, not the main model (CONTRACT v2 §1)",
+        "the router" if base_url.rstrip("/") == settings.router_base_url.rstrip("/") else "another engine",
+    )
+    raise AnswerEngineViolation("user answers come from the main model only")
 
 
 def wants_thinking(model_choice: str = "smart", effort: str = "medium") -> bool:
@@ -662,7 +766,6 @@ async def stream_chat_events(
     and ("token", <delta.content>) for answer text (V2-DESIGN §3a).
     """
     base_url, api_key, model_id = resolve_model_choice(model_choice)
-    client = _client(base_url, api_key)
     thinking_on = wants_thinking(model_choice, effort)
     budget_tokens = thinking_budget(effort) if thinking_on else None
     # Sizing: reasoning and answer draw from one max_tokens pool, and the
@@ -678,14 +781,19 @@ async def stream_chat_events(
             requested = max_tokens + budget_tokens
         elif budget_tokens is None:
             requested = max(max_tokens or 0, settings.max_output_tokens)
+    shaped_messages = apply_reasoning_effort(messages, effort, model_choice)
+    capabilities = capabilities_for_model_choice(model_choice)
+    # The answer a person reads comes from the main model, whatever the
+    # picker said (CONTRACT v2 §1): checked here, where it is produced.
+    assert_answer_engine(base_url)
+    client = _client(base_url, api_key)
     # Size the call to the window of the model that will actually serve it.
-    # "fast" resolves to a much smaller window than "smart", so a fixed
-    # max_tokens that is fine on one is a 400 on the other.
-    sized, budget = await context.fit_request(
-        normalize_system(apply_reasoning_effort(messages, effort, model_choice)),
+    sized, budget = await _fit(
+        normalize_system(shaped_messages),
         base_url=base_url,
         model=model_id,
         requested_max_tokens=requested,
+        what="stream",
     )
     request = dict(
         model=model_id,
@@ -694,7 +802,6 @@ async def stream_chat_events(
         max_tokens=budget,
         stream=True,
     )
-    capabilities = capabilities_for_model_choice(model_choice)
     # THE picker's real mechanism on the DGX runtime: Smart thinks, Fast does
     # not. Other runtimes omit this vLLM-specific extension entirely.
     extra_body = reasoning_extra_body(capabilities, thinking_on)
@@ -723,85 +830,87 @@ async def stream_chat_events(
 
     started = _time.monotonic()
     reset_finish_reason()
-    stream = await _open_stream(client, request)
-    async for chunk in stream:
-        _capture_finish(chunk)
-        elapsed = _time.monotonic() - started
-        if elapsed > settings.gen_wall_clock_s:
-            log.error(
-                "GENERATION WALL CLOCK EXCEEDED: %.0fs > %.0fs on %s "
-                "(effort %r, %d reasoning + %d answer chunks) — killing the "
-                "stream and returning what was produced",
-                elapsed, settings.gen_wall_clock_s, model_id, effort,
-                reasoning_seen, token_seen,
-            )
-            with contextlib.suppress(Exception):
-                await stream.close()
-            # Not "length": the model had room left, we took it away. A
-            # continuation loop must be able to tell those apart — one is
-            # worth resuming, the other means something is wrong.
-            _finish_reason.set(WALL_CLOCK_FINISH)
-            yield (
-                "token",
-                f"\n\n[generation stopped after {int(elapsed)}s — wall-clock "
-                "guard; the text above is what was produced]",
-            )
-            return
-        _capture_usage(chunk)
-        if not chunk.choices:
-            continue
-        delta = chunk.choices[0].delta
-        if delta is None:
-            continue
-        # vLLM extension field; absent on models without a reasoning stream.
-        # vLLM has shipped the thinking delta under both names: `reasoning`
-        # (v0.20+, e.g. the 26.05 NGC image) and `reasoning_content` (older).
-        reasoning = _reasoning_delta(delta, capabilities)
-        if reasoning:
-            reasoning_seen += 1
-            if cap is not None and reasoning_seen > cap:
-                # Forced closure: the model is looping in its own head. Stop
-                # paying for it and answer the question directly — the
-                # reasoning shown so far stays on screen, the answer comes
-                # from a thinking-off pass over the identical prompt.
-                log.warning(
-                    "thinking overran its budget (%d tokens, cap %d) at "
-                    "effort %r on %s; forcing closure and answering without "
-                    "thinking",
-                    budget_tokens, cap, effort, model_id,
+    async with _consume(await _open_stream(client, request)) as stream:
+        async for chunk in stream:
+            _capture_finish(chunk)
+            elapsed = _time.monotonic() - started
+            if elapsed > settings.gen_wall_clock_s:
+                log.error(
+                    "GENERATION WALL CLOCK EXCEEDED: %.0fs > %.0fs on %s "
+                    "(effort %r, %d reasoning + %d answer chunks) — killing the "
+                    "stream and returning what was produced",
+                    elapsed, settings.gen_wall_clock_s, model_id, effort,
+                    reasoning_seen, token_seen,
                 )
                 with contextlib.suppress(Exception):
                     await stream.close()
-                fallback = dict(request)
-                # The retry only writes the ANSWER, so the caller's original
-                # ceiling is the honest budget for it.
-                fallback["max_tokens"] = (
-                    min(budget, max_tokens) if max_tokens is not None else budget
+                # Not "length": the model had room left, we took it away. A
+                # continuation loop must be able to tell those apart — one is
+                # worth resuming, the other means something is wrong.
+                _finish_reason.set(WALL_CLOCK_FINISH)
+                yield (
+                    "token",
+                    f"\n\n[generation stopped after {int(elapsed)}s — wall-clock "
+                    "guard; the text above is what was produced]",
                 )
-                fb_extra = reasoning_extra_body(capabilities, False)
-                if fb_extra is not None:
-                    fallback["extra_body"] = fb_extra
-                else:
-                    fallback.pop("extra_body", None)
-                reset_finish_reason()
-                fb_stream = await _open_stream(client, fallback)
-                async for fb_chunk in fb_stream:
-                    _capture_usage(fb_chunk)
-                    _capture_finish(fb_chunk)
-                    if not fb_chunk.choices:
-                        continue
-                    fb_delta = fb_chunk.choices[0].delta
-                    if fb_delta is None:
-                        continue
-                    fb_content = _delta_value(fb_delta, "content")
-                    if fb_content:
-                        yield "token", str(fb_content)
                 return
-            yield "reasoning", reasoning
-        content = _delta_value(delta, "content")
-        if content:
-            token_seen += 1
-            yield "token", str(content)
+            _capture_usage(chunk)
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            if delta is None:
+                continue
+            # vLLM extension field; absent on models without a reasoning stream.
+            # vLLM has shipped the thinking delta under both names: `reasoning`
+            # (v0.20+, e.g. the 26.05 NGC image) and `reasoning_content` (older).
+            reasoning = _reasoning_delta(delta, capabilities)
+            if reasoning:
+                reasoning_seen += 1
+                if cap is not None and reasoning_seen > cap:
+                    # Forced closure: the model is looping in its own head. Stop
+                    # paying for it and answer the question directly — the
+                    # reasoning shown so far stays on screen, the answer comes
+                    # from a thinking-off pass over the identical prompt.
+                    log.warning(
+                        "thinking overran its budget (%d tokens, cap %d) at "
+                        "effort %r on %s; forcing closure and answering without "
+                        "thinking",
+                        budget_tokens, cap, effort, model_id,
+                    )
+                    with contextlib.suppress(Exception):
+                        await stream.close()
+                    # The same engine asked again without thinking — never
+                    # another engine.
+                    retry = dict(request)
+                    # The retry only writes the ANSWER, so the caller's original
+                    # ceiling is the honest budget for it.
+                    retry["max_tokens"] = (
+                        min(budget, max_tokens) if max_tokens is not None else budget
+                    )
+                    fb_extra = reasoning_extra_body(capabilities, False)
+                    if fb_extra is not None:
+                        retry["extra_body"] = fb_extra
+                    else:
+                        retry.pop("extra_body", None)
+                    reset_finish_reason()
+                    async with _consume(await _open_stream(client, retry)) as fb_stream:
+                        async for fb_chunk in fb_stream:
+                            _capture_usage(fb_chunk)
+                            _capture_finish(fb_chunk)
+                            if not fb_chunk.choices:
+                                continue
+                            fb_delta = fb_chunk.choices[0].delta
+                            if fb_delta is None:
+                                continue
+                            fb_content = _delta_value(fb_delta, "content")
+                            if fb_content:
+                                yield "token", str(fb_content)
+                    return
+                yield "reasoning", reasoning
+            content = _delta_value(delta, "content")
+            if content:
+                token_seen += 1
+                yield "token", str(content)
     # Usage telemetry (log-only): with budgets off this is the record of what
     # unbounded thinking actually cost, and the data a future budget decision
     # would be made from.
@@ -916,10 +1025,11 @@ async def chat_with_tools(
             requested = max_tokens + budget_tokens
         elif budget_tokens is None:
             requested = max(max_tokens or 0, settings.max_output_tokens)
-    sized, budget = await context.fit_request(
+    sized, budget = await _fit(
         normalize_system(messages),
         base_url=settings.openai_base_url,
         model=model_id,
+        what="chat_with_tools",
         requested_max_tokens=requested,
     )
     request = dict(
@@ -934,10 +1044,7 @@ async def chat_with_tools(
     if extra_body is not None:
         request["extra_body"] = extra_body
     reset_finish_reason()
-    resp = await resilient(
-        lambda: client.chat.completions.create(**request),
-        what="chat_with_tools", base_url=settings.openai_base_url,
-    )
+    resp = await _primary_send(client, request, what="chat_with_tools", base_url=settings.openai_base_url)
     _capture_usage(resp)
     _capture_finish(resp)
     message = resp.choices[0].message
@@ -975,7 +1082,6 @@ async def json_completion(
     the reasoning block, finish_reason=length, no JSON, and Think effort
     silently became Fast plus two minutes of thinking.
     """
-    client = _openai_client()
     model_id = model or settings.llm_model
     reset_finish_reason()
     requested = max_tokens
@@ -985,11 +1091,14 @@ async def json_completion(
             requested = max_tokens + budget_tokens
         elif budget_tokens is None:
             requested = max(max_tokens or 0, settings.max_output_tokens)
-    sized, budget = await context.fit_request(
+
+    client = _openai_client()
+    sized, budget = await _fit(
         normalize_system(messages),
         base_url=settings.openai_base_url,
         model=model_id,
         requested_max_tokens=requested,
+        what="json_completion",
     )
     base = dict(
         model=model_id,
@@ -1012,10 +1121,7 @@ async def json_completion(
             },
         }
         try:
-            resp = await resilient(
-                lambda: client.chat.completions.create(**guided),
-                what="json_completion", base_url=settings.openai_base_url,
-            )
+            resp = await _primary_send(client, guided, what="json_completion", base_url=settings.openai_base_url)
             _note_truncation(resp, schema_name, budget)
             return resp.choices[0].message.content or ""
         except _bad_request_error() as exc:
@@ -1031,10 +1137,7 @@ async def json_completion(
                 str(exc)[:160],
             )
 
-    resp = await resilient(
-        lambda: client.chat.completions.create(**base),
-        what="json_completion", base_url=settings.openai_base_url,
-    )
+    resp = await _primary_send(client, base, what="json_completion", base_url=settings.openai_base_url)
     _note_truncation(resp, schema_name, budget)
     return resp.choices[0].message.content or ""
 
@@ -1070,19 +1173,26 @@ async def router_chat_completion(
 ) -> str:
     """Router model (ROUTER_MODEL on ROUTER_BASE_URL); returns assistant text.
 
-    These are classification calls ("which engine?", "search: yes/no"), so a
-    long message is CLIPPED rather than sent whole — the opening of a message
-    determines its class, and the router's window is far smaller than the main
-    model's.
+    INTERNAL ONLY (CONTRACT v2 §1): these are classification calls ("which
+    engine?", "search: yes/no", a frame caption), never a person's answer —
+    the router has no breaker, no queue and no lane because nothing a person
+    reads comes from it; `stream_chat_events` refuses to stream from its
+    URL. A long message is CLIPPED rather than sent whole — the opening of a
+    message determines its class, and the router's window is far smaller
+    than the main model's.
     """
     client = _client(settings.router_base_url)
-    sized, budget = await context.fit_request(
+    # Sized like a sidecar too: on a profile that points the router at the
+    # main URL, an OPEN breaker means one refused attempt, not a /tokenize.
+    sized, budget = await _fit(
         normalize_system(
             clip_message_contents(messages, settings.router_input_char_cap)
         ),
         base_url=settings.router_base_url,
         model=settings.router_model,
         requested_max_tokens=max_tokens,
+        what="router_chat_completion",
+        recovery_s=sidecar_recovery_s(),
     )
     request = dict(
         model=settings.router_model,
@@ -1117,23 +1227,21 @@ async def vision_chat_stream(
     [{"type": "text", ...}, {"type": "image_url", "image_url": {"url": "data:..."}}].
     """
     client = _client(settings.vision_base_url)
-    stream = await _open_stream(
-        client,
-        dict(
-            model=settings.vision_model,
-            messages=normalize_system(messages),
-            temperature=temperature,
-            max_tokens=max_tokens,
-            stream=True,
-        ),
+    request = dict(
+        model=settings.vision_model,
+        messages=normalize_system(messages),
+        temperature=temperature,
+        max_tokens=max_tokens,
+        stream=True,
     )
-    async for chunk in stream:
-        _capture_usage(chunk)
-        if not chunk.choices:
-            continue
-        delta = chunk.choices[0].delta
-        if delta and delta.content:
-            yield delta.content
+    async with _consume(await _open_stream(client, request)) as stream:
+        async for chunk in stream:
+            _capture_usage(chunk)
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            if delta and delta.content:
+                yield delta.content
 
 
 async def embed_texts(

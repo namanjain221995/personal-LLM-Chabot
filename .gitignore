@@ -96,7 +96,13 @@ build/
 # ---------------------------------------------------------------------------
 # Node / Next.js
 # ---------------------------------------------------------------------------
-node_modules/
+# No trailing slash: `node_modules/` matches only a DIRECTORY, and a
+# frontend/node_modules that is a symlink (a shared install, a worktree
+# pointing at the main checkout's) is a file to git -- it showed up as
+# untracked and a `git add -A` would have committed the link (review round
+# 2). The bare name ignores the directory and the symlink alike, at any
+# depth, and nothing in this tree legitimately carries that name.
+node_modules
 .next/
 out/
 .turbo/

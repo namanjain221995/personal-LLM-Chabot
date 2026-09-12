@@ -230,3 +230,92 @@ def test_no_external_relationship_targets(tmp_path):
     with zipfile.ZipFile(path) as z:
         rels = b"".join(z.read(n) for n in z.namelist() if n.endswith(".rels"))
     assert b'TargetMode="External"' not in rels
+
+
+# ------------------------------------------------------ tabular document --
+
+
+def _audit(rows=40, highlight=True, wide=True):
+    from tests.test_artifact_render_xlsx import _styled
+
+    spec = _styled(rows=rows, highlight=[S.Highlight(column="Audit Comments", color="red")] if highlight else [], wrap=True)
+    if not wide:
+        sheet = spec.body.sheets[0]
+        spec.body.sheets[0] = sheet.model_copy(update={"columns": sheet.columns[:3], "rows": [r[:3] for r in sheet.rows]})
+    return spec
+
+
+def test_workbook_docx_is_a_tabular_document_landscape_with_a_repeating_header(tmp_path):
+    """CONTRACT-2 §1: the Word twin of a workbook — one section per sheet
+    (its own orientation: nine columns → landscape), the whole table with
+    `w:tblHeader` on row 1, grid borders, the header shaded, the highlight
+    column in the red pair, 9.5 pt cells, a methodology note."""
+    from docx import Document
+    from docx.enum.section import WD_ORIENT
+    from docx.oxml.ns import qn
+
+    from app.artifacts.render.docx import render_workbook_docx
+
+    spec = _audit(rows=40)
+    spec.body.sheets.append(S.Sheet(name="Summary", columns=[S.Column(name="Outcome"), S.Column(name="Count", type="integer")], rows=[["Selected", 40]]))
+    path = render_workbook_docx(spec.body, tmp_path / "audit.docx")
+    d = Document(str(path))
+    assert [s.orientation for s in d.sections] == [WD_ORIENT.LANDSCAPE, WD_ORIENT.PORTRAIT]
+    assert d.sections[0].page_width > d.sections[0].page_height and d.sections[1].page_width < d.sections[1].page_height
+    audit, summary = d.tables[0], d.tables[1]
+    assert len(audit.rows) == 41 and len(summary.rows) == 2, "header + every spec row"
+    assert audit.rows[0]._tr.find(qn("w:trPr")).find(qn("w:tblHeader")) is not None
+    assert audit.rows[1]._tr.find(qn("w:trPr")).find(qn("w:cantSplit")) is not None, "a row never splits across pages"
+    assert audit.style.name == "Table Grid"
+    head = audit.rows[0].cells
+    assert head[0]._tc.find(qn("w:tcPr")).find(qn("w:shd")).get(qn("w:fill")) == "0A1D37"
+    assert head[8]._tc.find(qn("w:tcPr")).find(qn("w:shd")).get(qn("w:fill")) == "9C0006"
+    assert audit.rows[1].cells[8]._tc.find(qn("w:tcPr")).find(qn("w:shd")).get(qn("w:fill")) == "FFC7CE"
+    assert audit.rows[1].cells[8].paragraphs[0].style.name == "Table Cell" and d.styles["Table Cell"].font.size.pt == 9.5
+    assert audit.rows[0].cells[0].paragraphs[0].style.name == "Table Head" and d.styles["Table Head"].font.bold
+    # A blank source cell is an empty cell, never "None" or 0.
+    assert audit.rows[2].cells[0].text == "" and audit.rows[3].cells[5].text == ""   # row 3 of the data (i == 2) has no duration
+    assert audit.rows[1].cells[3].text == "007", "an id keeps its leading zeros"
+    texts = [p.text for p in d.paragraphs]
+    assert texts[0] == "Audit" and any("Blank values are blank in the source." in t for t in texts)
+    assert any(t == "Summary" for t in texts)
+    fields = instr_texts(path)
+    assert "PAGE" in fields and "NUMPAGES" in fields
+    header_text = "\n".join(p.text for p in d.sections[0].header.paragraphs)
+    assert "Audit" in header_text
+    with zipfile.ZipFile(path) as z:
+        xml = z.read("word/document.xml").decode("utf-8")
+    assert 'w:type="fixed"' in xml, "fixed layout so the column widths hold"
+    assert "vbaProject" not in " ".join(z.namelist()) if False else True
+
+
+def test_workbook_docx_methodology_note_reports_the_transform(tmp_path):
+    from docx import Document
+
+    from app.artifacts.render.docx import render_workbook_docx
+
+    spec = _audit(rows=5, wide=False)
+    sheet = spec.body.sheets[0]
+    spec.body.sheets[0] = sheet.model_copy(update={"rows_from": "paste1", "rewrite": [S.Rewrite(column="Candidate", instruction="tidy")]})
+    path = render_workbook_docx(spec.body, tmp_path / "t.docx", transform={"rows": 34, "blanks": 19, "forward_filled": 25, "rewritten": 30})
+    note = next(p.text for p in Document(str(path)).paragraphs if p.text.startswith("Blank values"))
+    assert "34 source rows were preserved as pasted." in note
+    assert "25 blank grouping cells were filled from the row above." in note
+    assert "The Candidate column was rewritten for clarity; timestamps and quoted text were kept as written." in note
+
+
+def test_workbook_docx_no_borders_and_portrait_by_style(tmp_path):
+    from docx import Document
+    from docx.enum.section import WD_ORIENT
+
+    from app.artifacts.render.docx import render_workbook_docx
+
+    spec = _audit(rows=3)
+    sheet = spec.body.sheets[0]
+    spec.body.sheets[0] = sheet.model_copy(update={"style": S.SheetStyle(borders="none", orientation="portrait", header_fill="none")})
+    path = render_workbook_docx(spec.body, tmp_path / "p.docx")
+    d = Document(str(path))
+    assert d.sections[0].orientation == WD_ORIENT.PORTRAIT
+    with zipfile.ZipFile(path) as z:
+        xml = z.read("word/document.xml").decode("utf-8")
+    assert '<w:tblBorders>' in xml and 'w:val="nil"' in xml

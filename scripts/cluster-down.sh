@@ -3,11 +3,18 @@
 # removed), then the worker on Node 2 (its cache volume is kept). Since
 # 2026-08-25 `./techsara down` already stops the worker itself in dual mode;
 # this wrapper is kept for muscle memory and for --worker-only/--head-only.
+# It holds the engine recovery lock throughout, so the engine controller (which
+# `techsara down` removes with the rest of the head stack, but which a
+# --worker-only stop leaves running) cannot start a recovery of a pair that is
+# being stopped on purpose (contract §6.3).
 # Usage: scripts/cluster-down.sh [--head-only|--worker-only]
 # shellcheck source=lib/cluster-common.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib/cluster-common.sh"
+# shellcheck source=lib/engine-lock.sh
+. "$CLUSTER_LIB_DIR/engine-lock.sh"
 cluster_load_settings
 mode="${1:-all}"
+engine_lock_acquire "${ENGINE_LOCK_WAIT:-1200}" "cluster-down.sh $mode" || exit 2
 if [ "$mode" != "--worker-only" ]; then
   section "Node 1: ./techsara down"
   ( cd "$ROOT" && ./techsara down )
@@ -20,4 +27,5 @@ if [ "$mode" != "--head-only" ] && [ "$CLUSTER_MODE" = "dual" ]; then
     log_info "no worker deployment found on $CLUSTER_WORKER_SSH; nothing to stop"
   fi
 fi
+engine_lock_release
 echo "done"

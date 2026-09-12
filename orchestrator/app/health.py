@@ -18,7 +18,7 @@ import time
 import asyncio
 import importlib.util
 import threading
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import httpx
 
@@ -183,7 +183,6 @@ def _check_duckdb(path: str) -> dict:
     # "error" on a transient lock made /health flap for a warehouse that was
     # about to be readable (2026-08-29).
     deadline = time.monotonic() + _HEALTH_LOCK_WAIT_SECONDS
-    last: Exception | None = None
     while True:
         try:
             con = duckdb.connect(
@@ -201,7 +200,6 @@ def _check_duckdb(path: str) -> dict:
                 con.close()
             return {"status": "ok"}
         except Exception as exc:  # noqa: BLE001 — never raises, by contract
-            last = exc
             if time.monotonic() >= deadline:
                 return {"status": "error", "detail": f"{type(exc).__name__}: {exc}"}
             time.sleep(0.25)
@@ -408,8 +406,11 @@ def _live_generation_count() -> int:
     return sum(1 for gen in list(registry.values()) if not getattr(gen, "done", False))
 
 
-def _publish_work_gauges(work: dict) -> None:
-    """Mirror the snapshot into the Prometheus registry.
+def _publish_work_gauges(work: dict, *, observed_at: Optional[float] = None) -> None:
+    """Mirror the snapshot into the Prometheus registry. `observed_at`
+    (time.monotonic, taken BEFORE `_read_work` ran) dates the durable
+    queued count for app/continuity.py, which keeps the later of two
+    observations; None means "just now".
 
     WHY HERE. app/metrics.py is a passive registry: a gauge only exists once
     something sets it, and nothing on the request path knows these numbers —
@@ -447,6 +448,25 @@ def _publish_work_gauges(work: dict) -> None:
         "chat_requests_interrupted", work.get("chat_requests_interrupted", 0),
         "Chat requests a restart left interrupted and unresumed.",
     )
+    # V32: rows parked for the main model — in THIS process (the in-memory
+    # `llm_queued_generations`) or by one that is gone — that the resume
+    # sweep will pick up on the next READY. The durable count, as opposed
+    # to the live one.
+    metrics.set_gauge(
+        "chat_requests_queued", work.get("chat_requests_queued", 0),
+        "Chat requests durably queued for the main model (V32 status queued).",
+    )
+    # …and folded into `llm_queued_generations` (CONTRACT §7.2) as the
+    # durable half of that gauge (app/continuity._publish_queued). Dated
+    # from before the read: this runs in a thread, and a resume that moved
+    # the row out of `queued` while the read was in flight has re-counted
+    # already — its fresher count wins, this one is dropped (drill 5,
+    # 2026-09-12: the durable half pinned the gauge at 1 after the resume).
+    from . import continuity
+
+    continuity.note_durable_queued(
+        int(work.get("chat_requests_queued", 0) or 0), observed_at=observed_at,
+    )
     artifacts = work.get("artifacts") or {}
     for state in ("queued", "running"):
         metrics.set_gauge(
@@ -473,6 +493,7 @@ def _read_work() -> dict:
     video = {"queued": 0, "running": 0, "oldest_running_age_s": 0}
     uploads = {"uploading": 0, "finalizing": 0}
     interrupted = 0
+    queued = 0
     with db.connection() as con:
         for row in con.execute(
             "SELECT status, count(*) AS n FROM video_analyses "
@@ -493,10 +514,14 @@ def _read_work() -> dict:
             "WHERE status IN ('uploading', 'finalizing') GROUP BY status"
         ).fetchall():
             uploads[row["status"]] = int(row["n"])
-        row = con.execute(
-            "SELECT count(*) AS n FROM chat_requests WHERE status = 'interrupted'"
-        ).fetchone()
-        interrupted = int(row["n"])
+        for row in con.execute(
+            "SELECT status, count(*) AS n FROM chat_requests "
+            "WHERE status IN ('interrupted', 'queued') GROUP BY status"
+        ).fetchall():
+            if row["status"] == "interrupted":
+                interrupted = int(row["n"])
+            else:
+                queued = int(row["n"])
     # V31 artifact jobs: the one aggregate here that HAS an accessor
     # (artifacts.db.work_snapshot — counts only, same idx_artifact_jobs_open
     # partial index). `oldest_queued_age_s` is the number an operator wants
@@ -512,6 +537,7 @@ def _read_work() -> dict:
         "video": video,
         "uploads": uploads,
         "chat_requests_interrupted": interrupted,
+        "chat_requests_queued": queued,
         "artifacts": artifacts,
     }
 
@@ -530,13 +556,14 @@ def _check_work() -> dict:
         taken_at, cached = _work_cache
         if cached and _time.monotonic() - taken_at < _WORK_TTL_SECONDS:
             return cached
+        observed_at = _time.monotonic()  # before the read: dates the counts (see _publish_work_gauges)
         try:
             work = _read_work()
         except Exception as exc:  # noqa: BLE001 — additive, never fatal
             work = {"status": "unknown", "detail": f"{type(exc).__name__}: {exc}"[:200]}
         else:
             try:
-                _publish_work_gauges(work)
+                _publish_work_gauges(work, observed_at=observed_at)
             except Exception:  # noqa: BLE001 — a metric never breaks a probe
                 pass
         _work_cache = (_time.monotonic(), work)
@@ -551,7 +578,9 @@ def _check_artifacts() -> dict:
     ADDITIVE, never `status`: a missing PPTX library or a read-only volume
     means "no decks today", not an unavailable chat service — and the
     container healthcheck gates on `status`. The render package reports its
-    own availability through `capabilities()`; it is imported lazily and
+    own availability through `capabilities()` — pdf, docx, pptx, xlsx and,
+    since CONTRACT-2 (2026-09-12), csv, whose writer is the standard
+    library and is therefore always true; it is imported lazily and
     tolerated absent (the package ships separately from the job runner and
     tests import this module without it).
     """
@@ -661,6 +690,61 @@ async def probe_context_window(client: httpx.AsyncClient) -> dict:
     return out
 
 
+def answer_engine_not_serving() -> str:
+    """Why the answer engine is not taking calls right now, or "" when it
+    is: the controller's fresh verdict says not serving, or the main
+    breaker is OPEN (held by the controller, or opened by observed
+    failures). A HALF_OPEN breaker is probing and an unknown verdict is
+    not a verdict (CONTRACT §8.1), so neither is reported here. In-memory
+    only; never raises."""
+    from . import breaker, engine_state  # lazy, like engine_availability
+
+    try:
+        reasons = []
+        snap = engine_state.snapshot()
+        if engine_state.serving() is False and snap is not None:
+            reasons.append(f"controller says {snap.state}")
+        brk = breaker.get(breaker.MAIN).describe()
+        if brk["state"] == breaker.OPEN:
+            held = brk.get("held_open_by")
+            reasons.append(f"breaker OPEN ({'held by ' + str(held) if held else brk.get('last_reason', '')})")
+        return "; ".join(reasons)
+    except Exception:  # noqa: BLE001 — additive, never fatal
+        return ""
+
+
+def engine_availability() -> dict:
+    """The orchestrator's own view of the main engine (CONTRACT §8): the
+    controller's last verdict, the circuit breaker, the generations held
+    for the engine (app/continuity.py) and the admission lanes
+    (app/admission.py).
+
+    In-memory only, by design — the poller, the breaker and the lanes
+    already hold the answer, and /health is called every 30 s by the
+    container healthcheck and every 15 s by the blackbox probe. It rides
+    INSIDE the main model's `checks` entry so the existing readers see it
+    next to the probe it qualifies, and it never changes that entry's
+    `status`: the breaker being OPEN means the orchestrator is protecting
+    itself, not that this process is unhealthy — the container healthcheck
+    gates on `status`, and restarting the orchestrator would not bring the
+    engine back (it would only park every queued generation). Never raises.
+    """
+    from . import admission, breaker, continuity, engine_state  # lazy: keep import cost off the probe path
+
+    try:
+        return {
+            "controller": engine_state.describe(),
+            "breakers": {name: brk.describe() for name, brk in breaker.all_breakers().items()},
+            "queue": continuity.describe(),
+            "admission": admission.describe(),
+            # One-model mode (CONTRACT v2 §1): stated, so a reader of an
+            # older report is not left looking for the fallback block.
+            "answer_engine": "main",
+        }
+    except Exception as exc:  # noqa: BLE001 — additive, never fatal
+        return {"status": "unknown", "detail": f"{type(exc).__name__}: {exc}"[:200]}
+
+
 async def check_dependencies() -> dict:
     """Probe every §8 dependency concurrently.
 
@@ -708,6 +792,26 @@ async def check_dependencies() -> dict:
     }
     checks["duckdb"] = results[required_count]
     checks["app_db"] = results[required_count + 1]
+    # The engine-availability view (2026-09-12) rides on the main model's
+    # entry — see engine_availability for why there and why it cannot move
+    # `status`. `seen` maps the URL to the name it was probed under, so a
+    # profile that shares the main endpoint with other roles still finds it.
+    main_name = seen.get(settings.openai_base_url, "")
+    if isinstance(checks.get(main_name), dict):
+        # A copy: a probe stub may hand the same dict to every service.
+        checks[main_name] = {**checks[main_name], "engine": engine_availability()}
+        # `/health` 200 proves nothing (CONTRACT §2): the entry's `status`
+        # follows the controller's verdict and the breaker, so a reader of
+        # checks.vllm.status alone never reads a wedge as healthy (round-2
+        # review, health.py:764). `reachable` keeps the probe's own answer.
+        not_serving = answer_engine_not_serving()
+        if not_serving and checks[main_name].get("status") == "ok":
+            checks[main_name] = {
+                **checks[main_name],
+                "status": "degraded",
+                "reachable": True,
+                "detail": f"answer engine not serving: {not_serving}",
+            }
     embedding_index_result = results[required_count + 2]
     ocr_result = results[required_count + 3]
     reranker_result = results[required_count + 4]

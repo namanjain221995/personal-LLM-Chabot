@@ -403,7 +403,12 @@ async def execute_salesforce_query_plan(
             "QUERY_EXECUTED",
             status="failed",
             component="orchestrator.app.core.salesforce.run_soql_page",
-            details={"source": "live_salesforce", "soql": compiled.soql},
+            details={
+                "source": "live_salesforce",
+                "environment": settings.sf_environment,
+                "freshness": "live",
+                "soql": compiled.soql,
+            },
             duration_ms=round((time.perf_counter() - query_started) * 1000),
             error=exc,
         )
@@ -413,7 +418,12 @@ async def execute_salesforce_query_plan(
             "QUERY_EXECUTED",
             status="failed",
             component="orchestrator.app.core.salesforce.run_soql_page",
-            details={"source": "live_salesforce", "soql": compiled.soql},
+            details={
+                "source": "live_salesforce",
+                "environment": settings.sf_environment,
+                "freshness": "live",
+                "soql": compiled.soql,
+            },
             duration_ms=round((time.perf_counter() - query_started) * 1000),
             error=exc,
         )
@@ -551,6 +561,8 @@ async def execute_salesforce_query_plan(
         component="orchestrator.app.core.salesforce.run_soql_page",
         details={
             "source": "live_salesforce",
+            "environment": settings.sf_environment,
+            "freshness": "live",
             "object_api_name": result.object_api_name,
             "soql": result.soql,
             "returned_rows": len(result.rows),

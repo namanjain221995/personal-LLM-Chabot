@@ -77,9 +77,13 @@ def test_publish_strips_the_scratch_and_keeps_what_the_contract_lists(reports):
     """CONTRACT §6. material.json (chat content), render-job.json and
     render-report.json (absolute paths), preview.json, the matplotlib cache
     and the renderer's chart PNGs were all being renamed into the immutable
-    published directory and kept forever."""
+    published directory and kept forever. transform.json (what code did
+    to the pasted table — a column label from the paste, counts) followed
+    them in on 2026-09-12: it is read by the render stage and by nothing
+    after publication (security review 2026-09-12, #4)."""
     work = store.ensure_workdir(USER, ART, 1)
-    for name in (store.MATERIAL_NAME, store.JOB_NAME, store.RENDER_REPORT_NAME, store.PREVIEW_META_NAME):
+    assert store.TRANSFORM_NAME in store.SCRATCH_NAMES
+    for name in (store.MATERIAL_NAME, store.JOB_NAME, store.RENDER_REPORT_NAME, store.PREVIEW_META_NAME, store.TRANSFORM_NAME):
         store.write_json(os.path.join(work, name), {"secret": "history text", "path": work})
     os.makedirs(os.path.join(work, ".mpl"))
     with open(os.path.join(work, ".mpl", "fontlist.json"), "w") as fh:
@@ -201,6 +205,78 @@ def test_a_symlink_out_of_the_version_directory_is_refused(reports):
     store.publish(work, store.build_manifest(artifact_id=ART, version=1, files=[]))
     with pytest.raises(store.PathRefused):
         store.resolve_version_file(USER, ART, 1, "pdf", "leak-v1.pdf")
+
+
+def test_resolve_file_by_id_uses_the_row_and_stays_inside_the_directory(reports):
+    """CONTRACT-2 §2: a file is found by the id the pipeline minted, through
+    the version row's list — never a request-supplied name. The list's
+    entry is checked like a by-format name (a bare basename whose
+    extension is its format) and the path for containment; a value that
+    is not an id is refused before anything is looked at."""
+    work = store.ensure_workdir(USER, ART, 1)
+    for name in ("quarterly-review-v1.docx", "quarterly-review-v1-data.csv"):
+        with open(os.path.join(work, name), "wb") as fh:
+            fh.write(b"PK")
+    outside = reports / "secret.pdf"
+    outside.write_bytes(b"%PDF")
+    os.symlink(str(outside), os.path.join(work, "quarterly-review-v1.pdf"))
+    docx_id = T.file_id_for(ART, 1, "primary", "docx")
+    csv_id = T.file_id_for(ART, 1, "data", "csv", "Data")
+    pdf_id = T.file_id_for(ART, 1, "companion", "pdf")
+    files = [
+        {"file_id": docx_id, "role": "primary", "format": "docx", "filename": "quarterly-review-v1.docx", "size": 2},
+        {"file_id": csv_id, "role": "data", "format": "csv", "filename": "quarterly-review-v1-data.csv", "size": 2, "title": "Quarterly Review — Data"},
+        {"file_id": pdf_id, "role": "companion", "format": "pdf", "filename": "quarterly-review-v1.pdf", "size": 4},
+    ]
+    store.publish(work, store.build_manifest(artifact_id=ART, version=1, files=files))
+    root = store.version_dir(USER, ART, 1)
+
+    path, entry = store.resolve_file_by_id(USER, ART, 1, csv_id, files)
+    assert path == os.path.realpath(os.path.join(root, "quarterly-review-v1-data.csv"))
+    assert entry["title"] == "Quarterly Review — Data" and entry["role"] == "data"
+    # With no list given, the manifest on disk is the list.
+    assert store.resolve_file_by_id(USER, ART, 1, docx_id)[0].endswith("/v1/quarterly-review-v1.docx")
+    # A symlink out of the directory, even when the row names it.
+    with pytest.raises(store.PathRefused):
+        store.resolve_file_by_id(USER, ART, 1, pdf_id, files)
+    # Not an id: refused before any list is read.
+    for bad in ("", "..", "../" + docx_id, docx_id[:15], docx_id.upper(), "g" * 16, "/etc/passwd"):
+        with pytest.raises(store.PathRefused):
+            store.resolve_file_by_id(USER, ART, 1, bad, files)
+    # An id the version does not have.
+    with pytest.raises(store.PathRefused):
+        store.resolve_file_by_id(USER, ART, 1, T.file_id_for(ART, 2, "primary", "docx"), files)
+    # A row entry that names a path, a hidden file, or a wrong extension
+    # cannot reach outside — whatever wrote the row.
+    for entry in (
+        {"file_id": docx_id, "format": "docx", "filename": "../v2/quarterly-review-v2.docx"},
+        {"file_id": docx_id, "format": "docx", "filename": "previews/../quarterly-review-v1.docx"},
+        {"file_id": docx_id, "format": "docx", "filename": "sub\\quarterly-review-v1.docx"},
+        {"file_id": docx_id, "format": "docx", "filename": ".quarterly-review-v1.docx"},
+        {"file_id": docx_id, "format": "pdf", "filename": "quarterly-review-v1.docx"},
+        {"file_id": docx_id, "format": "exe", "filename": "quarterly-review-v1.exe"},
+        {"file_id": docx_id, "format": "json", "filename": "manifest.json"},
+    ):
+        with pytest.raises(store.PathRefused):
+            store.resolve_file_by_id(USER, ART, 1, docx_id, [entry])
+    # resolve_version_file now takes every type we serve, still by extension.
+    assert store.resolve_version_file(USER, ART, 1, "csv", "quarterly-review-v1-data.csv").endswith("-data.csv")
+    with pytest.raises(store.PathRefused):
+        store.resolve_version_file(USER, ART, 1, "csv", "quarterly-review-v1.docx")
+
+
+def test_publish_never_removes_a_file_the_manifest_lists(reports):
+    """A per-sheet CSV named as scratch by a confused caller stays: the
+    published names are the fixed ones plus the manifest's files."""
+    work = store.ensure_workdir(USER, ART, 1)
+    for name in ("audit-v1.xlsx", "audit-v1-data.csv", "audit-v1-pipeline.csv", "chart-1.png"):
+        with open(os.path.join(work, name), "wb") as fh:
+            fh.write(b"x")
+    files = [{"format": "xlsx", "filename": "audit-v1.xlsx", "size": 1}, {"format": "csv", "filename": "audit-v1-data.csv", "size": 1}, {"format": "csv", "filename": "audit-v1-pipeline.csv", "size": 1}]
+    manifest = store.build_manifest(artifact_id=ART, version=1, files=files)
+    assert store.published_names(manifest) >= {"audit-v1.xlsx", "audit-v1-data.csv", "audit-v1-pipeline.csv", T.MANIFEST_NAME}
+    final = store.publish(work, manifest, scratch=["chart-1.png", "audit-v1-pipeline.csv"])
+    assert set(os.listdir(final)) == {"manifest.json", "previews", "audit-v1.xlsx", "audit-v1-data.csv", "audit-v1-pipeline.csv"}
 
 
 def test_free_space_and_volume_writable(reports, monkeypatch):

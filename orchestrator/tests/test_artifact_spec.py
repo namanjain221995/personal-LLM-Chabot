@@ -27,6 +27,14 @@ def test_every_kind_maps_to_real_formats_only():
         assert kind in T.KINDS
         for f in fmts:
             assert f in T.FORMATS and f in T.MIME_TYPES
+    # CONTRACT-2 §1 (2026-09-12): csv is a format; a workbook is delivered
+    # as xlsx, csv, and a tabular Word/PDF; zip is a route, not a format.
+    assert "csv" in T.FORMATS and T.MIME_TYPES["csv"] == "text/csv; charset=utf-8"
+    assert T.FORMATS_FOR_KIND["workbook"] == ("xlsx", "csv", "docx", "pdf")
+    assert T.FORMATS_FOR_KIND["document"] == ("docx", "pdf") and T.FORMATS_FOR_KIND["presentation"] == ("pptx", "pdf")
+    assert T.MIME_TYPES["zip"] == "application/zip" and "zip" not in T.FORMATS
+    assert T.MAX_ZIP_BYTES == 200 * 1024 * 1024
+    assert set(T.PAGE_FORMATS) | set(T.GRID_FORMATS) == set(T.FORMATS)
 
 
 def test_effort_decides_depth_never_availability():
@@ -54,6 +62,29 @@ def test_download_names_are_safe_and_versioned():
     assert T.download_name("../../etc/passwd", 1, "pdf") == "etc-passwd-v1.pdf"
     assert T.download_name("", 1, "pdf") == "document-v1.pdf"
     assert len(T.slug_for("x" * 500)) <= 60
+    # A part — the per-sheet CSV of a multi-sheet workbook (CONTRACT-2 §2).
+    assert T.download_name("IR Session Audit", 2, "csv", part="Pipeline Q3") == "ir-session-audit-v2-pipeline-q3.csv"
+    assert T.download_name("IR Session Audit", 2, "csv", part="../x") == "ir-session-audit-v2-x.csv"
+    assert T.download_name("IR Session Audit", 2, "csv", part="") == "ir-session-audit-v2.csv"
+    assert T.download_name("IR Session Audit", 2, "csv", part="   ") == "ir-session-audit-v2.csv"
+    assert T.download_name("IR Session Audit", 2, "csv", None) == "ir-session-audit-v2.csv"
+
+
+def test_file_ids_are_deterministic_and_shaped():
+    aid = "a" * 32
+    fid = T.file_id_for(aid, 1, "primary", "xlsx")
+    assert T.is_file_id(fid) and len(fid) == 16
+    assert fid == T.file_id_for(aid, 1, "primary", "xlsx") == T.file_id_for(aid, 1, "primary", "xlsx", "")
+    # Every ingredient changes the id; the sheet keeps two CSVs apart.
+    assert len({
+        fid, T.file_id_for(aid, 2, "primary", "xlsx"), T.file_id_for(aid, 1, "companion", "xlsx"),
+        T.file_id_for(aid, 1, "primary", "csv"), T.file_id_for("b" * 32, 1, "primary", "xlsx"),
+        T.file_id_for(aid, 1, "data", "csv", "Pipeline"), T.file_id_for(aid, 1, "data", "csv", "Summary"),
+    }) == 7
+    import hashlib
+    assert fid == hashlib.sha1(f"{aid}:1:primary:xlsx:".encode()).hexdigest()[:16]
+    for bad in ("", "A" * 16, "g" * 16, "a" * 15, "a" * 17, "a" * 32, "legacy:x.pdf"):
+        assert not T.is_file_id(bad)
 
 
 def test_artifact_ref_builds_relative_urls_by_code():
@@ -68,6 +99,56 @@ def test_artifact_ref_builds_relative_urls_by_code():
     assert j["thumbnail_url"].endswith("/preview/1.png?w=240")
     assert j["status_url"] == f"/artifacts/jobs/{'c' * 32}"
     assert "http" not in json.dumps(j), "no host ever appears in a reference"
+    # A legacy ref (no file_id): the alias URLs, the default role, no id on
+    # the wire, no bundle for one file. CONTRACT-2 §2.
+    f = j["files"][0]
+    assert "file_id" not in f and f["role"] == "primary" and "rows" not in f and "columns" not in f
+    assert f["inline_url"] == f"/artifacts/{'b' * 32}/v/1/file/pdf?disposition=inline"
+    assert f["preview_url"] == f"/artifacts/{'b' * 32}/v/1/preview"
+    assert "download_all_url" not in j and "package" not in j
+
+
+def test_artifact_ref_with_file_ids_builds_per_file_urls_and_a_bundle():
+    """CONTRACT-2 §2: every file carries file_id, role, title, rows and
+    columns; URLs go by id; a grid format is previewed from its own file;
+    two or more files get the zip route and a package count."""
+    aid, jid = "b" * 32, "c" * 32
+    xlsx_id = T.file_id_for(aid, 3, "primary", "xlsx")
+    csv_id = T.file_id_for(aid, 3, "data", "csv", "Pipeline")
+    pdf_id = T.file_id_for(aid, 3, "companion", "pdf")
+    ref = T.ArtifactRef(
+        artifact_id=aid, version=3, job_id=jid, title="IR Session Audit", kind="workbook", status="completed",
+        files=[
+            T.FileRef("xlsx", "ir-session-audit-v3.xlsx", T.MIME_TYPES["xlsx"], 4096, "s1", sheets=2, file_id=xlsx_id, role="primary", title="IR Session Audit", rows=30, columns=8),
+            T.FileRef("csv", "ir-session-audit-v3-pipeline.csv", T.MIME_TYPES["csv"], 512, "s2", file_id=csv_id, role="data", title="IR Session Audit — Pipeline", rows=30, columns=8),
+            T.FileRef("pdf", "ir-session-audit-v3.pdf", T.MIME_TYPES["pdf"], 8192, "s3", pages=2, file_id=pdf_id, role="companion", title="IR Session Audit"),
+        ],
+        preview_kind="grid",
+    )
+    j = ref.to_json()
+    base = f"/artifacts/{aid}/v/3"
+    x, c, p = j["files"]
+    assert (x["file_id"], x["role"], x["title"], x["rows"], x["columns"], x["sheets"]) == (xlsx_id, "primary", "IR Session Audit", 30, 8, 2)
+    assert x["download_url"] == f"{base}/f/{xlsx_id}?disposition=attachment" and x["inline_url"] == f"{base}/f/{xlsx_id}?disposition=inline"
+    assert x["preview_url"] == f"{base}/grid?file={xlsx_id}"
+    assert (c["role"], c["mime_type"], c["preview_url"]) == ("data", "text/csv; charset=utf-8", f"{base}/grid?file={csv_id}")
+    assert c["filename"] == T.download_name("IR Session Audit", 3, "csv", part="Pipeline")
+    # The PDF companion of a grid version is previewed as pages only when
+    # the pipeline counted them (preview_pages); with none it is download-only.
+    assert p["download_url"] == f"{base}/f/{pdf_id}?disposition=attachment" and p["preview_url"] == "" and p["pages"] == 2
+    assert j["download_all_url"] == f"{base}/zip" and j["package"] == {"count": 3}
+    ref.preview_pages = 2
+    assert ref.to_json()["files"][2]["preview_url"] == f"{base}/preview"
+    assert "http" not in json.dumps(j)
+    # The version-level preview of a grid version is the legacy alias; a
+    # pages version previews its page formats from the version.
+    assert j["preview_url"] == f"{base}/sheets"
+    ref.preview_kind, ref.preview_pages = "pages", 2
+    j = ref.to_json()
+    assert j["preview_url"] == f"{base}/preview" and j["files"][2]["preview_url"] == f"{base}/preview"
+    # Positional construction (the original four-format contract) still works.
+    legacy = T.FileRef("pdf", "x.pdf", T.MIME_TYPES["pdf"], 1, "sha", 2, None, None)
+    assert legacy.file_id == "" and legacy.role == "primary" and legacy.title == "" and legacy.rows is None
 
 
 # ------------------------------------------------------------------ spec --
@@ -346,6 +427,173 @@ def test_figures_the_material_never_gave_are_named():
     assert S.unsupported_figures(S.parse_body("document", doc), "Q1 revenue 410k, ARR 1.2M") == ["3bn"]
 
 
+# ---------------------------------------------------- code-made rows --
+
+
+def _gen_sheet(**over):
+    sheet = {
+        "name": "Evaluations",
+        "columns": [
+            {"name": "candidate_id"}, {"name": "candidate_name"}, {"name": "status"},
+            {"name": "technical_score", "type": "integer"}, {"name": "completion_time", "type": "date"}, {"name": "comment"},
+        ],
+        "generator": {"rows": 500, "seed": 7, "columns": [
+            {"name": "candidate_id", "kind": "id", "pattern": "CAND-{n:04d}", "unique": True},
+            {"name": "candidate_name", "kind": "name"},
+            {"name": "status", "kind": "choice", "values": ["Completed", "In Progress"], "weights": [3, 1]},
+            {"name": "technical_score", "kind": "int", "min": 0, "max": 100},
+            {"name": "completion_time", "kind": "date", "start": "2026-01-01", "end": "2026-06-30", "only_when": {"column": "status", "in": ["Completed"]}},
+            {"name": "comment", "kind": "text", "text": {"pool": ["Strong work", "Needs follow-up"]}},
+        ]},
+        "rewrite": [{"column": "comment", "instruction": "concise professional audit comment"}],
+        "style": {"highlight": [{"column": "status", "color": "red"}], "orientation": "auto", "header_fill": "light"},
+    }
+    sheet.update(over)
+    return sheet
+
+
+def _gen_wb(**over):
+    return {"title": "Evaluation dataset", "template_id": "data", "sheets": [_gen_sheet(**over)]}
+
+
+def test_a_generator_sheet_validates_empty_and_filled():
+    """CONTRACT-2 §4: the model's answer has no rows; the composer fills
+    them and re-parses, and rows_from/generator stay as provenance — so
+    both states validate, the empty one is not hollow, and the generated
+    numbers are never "figures the material never gave"."""
+    spec = S.parse_body("workbook", _gen_wb())
+    sheet = spec.body.sheets[0]
+    assert sheet.rows == [] and sheet.rows_are_code_made and sheet.generator.rows == 500 and sheet.generator.seed == 7
+    assert sheet.generator.columns[4].only_when.in_ == ["Completed"]
+    assert S.hollow(spec) == "" and S.part_count(spec) == 1
+    assert S.unsupported_figures(spec, "500 rows") == []
+    # The stored spec loads back, with `in` under its alias.
+    again = S.load(json.loads(spec.model_dump_json()))
+    assert again == spec
+    assert json.loads(spec.body.sheets[0].generator.columns[4].only_when.model_dump_json(by_alias=True)) == {"column": "status", "in": ["Completed"]}
+    # Filled: the rows are present, the generator stays, a chart over the
+    # header is drawn over the first MAX_CHART_POINTS rows only.
+    filled = json.loads(spec.body.model_dump_json())
+    filled["sheets"][0]["rows"] = [[f"CAND-{i:04d}", "Asha Rao", "Completed", 40 + i % 60, "2026-02-02", "ok"] for i in range(1, 501)]
+    filled["sheets"][0]["charts"] = [{"type": "bar", "categories": "candidate_id", "series": [{"name": "technical_score"}]}]
+    spec2 = S.parse_body("workbook", filled)
+    sheet2 = spec2.body.sheets[0]
+    assert len(sheet2.rows) == 500 and sheet2.rows_are_code_made and sheet2.generator is not None
+    assert S.part_count(spec2) == 501 and S.hollow(spec2) == ""
+    chart = sheet2.charts[0]
+    assert len(chart.categories) == T.MAX_CHART_POINTS == len(chart.series[0].values)
+    assert chart.categories[0] == "CAND-0001" and chart.series[0].values[0] == 41.0
+    assert S.unsupported_figures(spec2, "500 rows") == [], "code-made rows are not the model's figures"
+    # A chart over a small sheet is unchanged (the pin from test_a_sheet_chart_written_over_the_header_gets_the_cells).
+    small = _tracker([])
+    small["sheets"][0]["charts"] = [{"type": "bar", "categories": ["Plan"], "series": [{"name": "Monthly Revenue"}]}]
+    assert S.parse_body("workbook", small).body.sheets[0].charts[0].categories == ["Free", "Team", "Enterprise"]
+
+
+def test_a_rows_from_sheet_validates_empty_and_names_its_table():
+    wb = {"title": "IR Session Audit", "sheets": [{"name": "Audit", "columns": [{"name": "Host"}, {"name": "Finding"}], "rows_from": "paste1",
+                                                   "rewrite": [{"column": "Finding", "instruction": "concise"}], "style": {"borders": "none", "wrap": True}}]}
+    spec = S.parse_body("workbook", wb)
+    sheet = spec.body.sheets[0]
+    assert sheet.rows_from == "paste1" and sheet.rows == [] and sheet.rows_are_code_made
+    assert S.hollow(spec) == "" and S.part_count(spec) == 1
+    assert sheet.style.borders == "none" and sheet.style.wrap is True and sheet.style.header_bold is True and sheet.style.header_fill == "dark" and sheet.style.orientation == "auto"
+    # Filled, the provenance stays.
+    filled = json.loads(spec.body.model_dump_json())
+    filled["sheets"][0]["rows"] = [["h1", "f1"], ["", "f2"]]
+    spec2 = S.parse_body("workbook", filled)
+    assert spec2.body.sheets[0].rows_from == "paste1" and len(spec2.body.sheets[0].rows) == 2
+    # A blank rows_from is no rows_from; a sheet with neither and no rows is still hollow.
+    wb["sheets"][0]["rows_from"] = "  "
+    del wb["sheets"][0]["rewrite"]
+    assert "no sheet has any rows" in S.hollow(S.parse_body("workbook", wb))
+    with pytest.raises(ValidationError):
+        S.parse_body("workbook", {**wb, "sheets": [{**wb["sheets"][0], "rows_from": "../x"}]})
+
+
+def _refused(mut, needle):
+    wb = _gen_wb()
+    mut(wb["sheets"][0])
+    with pytest.raises(ValidationError) as exc:
+        S.parse_body("workbook", wb)
+    summary = S.validation_summary(exc.value)
+    assert needle in summary, summary
+
+
+def test_generator_recipes_are_checked_by_name():
+    _refused(lambda s: s["generator"]["columns"].pop(), "no recipe for column 'comment'")
+    _refused(lambda s: s["generator"]["columns"].append({"name": "ghost", "kind": "int"}), "recipe for 'ghost', which the sheet has no column for")
+    _refused(lambda s: s["generator"].update(rows=0), "greater than or equal to 1")
+    _refused(lambda s: s["generator"].update(rows=T.MAX_ROWS_PER_SHEET + 1), f"less than or equal to {T.MAX_ROWS_PER_SHEET}")
+    _refused(lambda s: s["generator"]["columns"][2].pop("values"), "is a choice and needs `values`")
+    _refused(lambda s: s["generator"]["columns"][2].update(weights=[1]), "has 1 weights for 2 values")
+    _refused(lambda s: s["generator"]["columns"][2].update(weights=[0, 0]), "not all zero")
+    _refused(lambda s: s["generator"]["columns"][4]["only_when"].update(column="nope"), "only_when names no column 'nope'")
+    _refused(lambda s: s["generator"]["columns"][4]["only_when"].update(column="completion_time"), "only_when cannot read itself")
+    _refused(lambda s: s["generator"]["columns"].__setitem__(5, {"name": "comment", "kind": "derived", "derived": {"op": "sum", "columns": ["nope"]}}), "derived names no column 'nope'")
+    _refused(lambda s: s["generator"]["columns"].__setitem__(5, {"name": "comment", "kind": "derived", "derived": {"op": "sum", "columns": ["candidate_name"]}}), "which is name, not a number")
+    _refused(lambda s: s["generator"]["columns"].__setitem__(5, {"name": "comment", "kind": "derived", "derived": {"op": "diff", "columns": ["technical_score"]}}), "diff takes exactly two columns")
+    _refused(lambda s: s["generator"]["columns"].__setitem__(5, {"name": "comment", "kind": "derived"}), "needs `derived: {op, columns}`")
+    _refused(lambda s: s["generator"]["columns"].__setitem__(5, {"name": "comment", "kind": "text"}), "needs `text: {pool: [...]}`")
+    _refused(lambda s: s["generator"]["columns"][3].update(unique=True), "unique is only meaningful for id, name, email, text")
+    _refused(lambda s: s["generator"]["columns"][0].update(pattern="{x}"), "must contain {n}")
+    _refused(lambda s: s["generator"]["columns"][0].update(pattern="{n}-{x}"), "must use only {n}")
+    _refused(lambda s: s["generator"]["columns"][4].update(start="soon"), "is not an ISO date")
+    _refused(lambda s: s["generator"]["columns"][4].update(start="2026-07-01"), "is after end")
+    _refused(lambda s: s["generator"]["columns"][3].update(min=5, max=1), "min 5 is above max 1")
+    _refused(lambda s: s["generator"]["columns"][3].update(kind="hologram"), "kind")
+    _refused(lambda s: s["generator"]["columns"].append({"name": "Candidate_ID", "kind": "int"}), "two generator columns are named")
+    _refused(lambda s: s.update(rows_from="paste1"), "rows come from one place")
+    # Recipes given in another order are put in the sheet's order.
+    wb = _gen_wb()
+    wb["sheets"][0]["generator"]["columns"].reverse()
+    names = [c.name for c in S.parse_body("workbook", wb).body.sheets[0].generator.columns]
+    assert names == [c["name"] for c in wb["sheets"][0]["columns"]]
+    # A derived column over numbers, with concat over anything.
+    wb = _gen_wb()
+    wb["sheets"][0]["columns"].append({"name": "total", "type": "number"})
+    wb["sheets"][0]["generator"]["columns"].append({"name": "total", "kind": "derived", "derived": {"op": "sum", "columns": ["technical_score"]}})
+    wb["sheets"][0]["columns"].append({"name": "label"})
+    wb["sheets"][0]["generator"]["columns"].append({"name": "label", "kind": "derived", "derived": {"op": "concat", "columns": ["candidate_id", "candidate_name"]}})
+    assert len(S.parse_body("workbook", wb).body.sheets[0].generator.columns) == 8
+
+
+def test_rewrite_and_style_name_existing_columns():
+    _refused(lambda s: s["rewrite"][0].update(column="nope"), "rewrite names no column 'nope'")
+    _refused(lambda s: s["style"]["highlight"][0].update(column="nope"), "highlight names no column 'nope'")
+    _refused(lambda s: s["style"]["highlight"][0].update(color="purple"), "color")
+    _refused(lambda s: s["style"].update(orientation="sideways"), "orientation")
+    _refused(lambda s: s["style"].update(borders="thick"), "borders")
+    _refused(lambda s: s["rewrite"][0].update(instruction=""), "instruction")
+    # Header text is matched like a total's: case and inner whitespace do not count.
+    wb = _gen_wb()
+    wb["sheets"][0]["rewrite"][0]["column"] = " COMMENT "
+    wb["sheets"][0]["style"]["highlight"][0]["column"] = "Status"
+    spec = S.parse_body("workbook", wb)
+    assert spec.body.sheets[0].style.highlight[0].color == "red" and spec.body.sheets[0].style.header_fill == "light"
+
+
+def test_the_workbook_schema_describes_the_new_fields():
+    schema = S.schema_for("workbook")
+    sheet = schema["$defs"]["Sheet"]["properties"]
+    for name in ("rows_from", "generator", "rewrite", "style"):
+        assert name in sheet and sheet[name].get("description"), name
+    assert "never retype the rows" in sheet["rows_from"]["description"]
+    assert "Leave `rows` empty" in sheet["generator"]["description"]
+    gen = schema["$defs"]["Generator"]["properties"]
+    assert gen["rows"]["maximum"] == T.MAX_ROWS_PER_SHEET and gen["seed"]["default"] == 42
+    col = schema["$defs"]["GenColumn"]["properties"]
+    assert set(col) >= {"name", "kind", "pattern", "values", "weights", "min", "max", "decimals", "start", "end", "unique", "only_when", "derived", "text"}
+    assert "CAND-{n:04d}" in col["pattern"]["description"]
+    assert set(col["kind"]["enum"]) == {"id", "name", "email", "choice", "int", "float", "date", "datetime", "text", "derived"}
+    assert list(schema["$defs"]["OnlyWhen"]["properties"]) == ["column", "in"], "the model writes `in`, as the contract says"
+    assert set(schema["$defs"]["Derived"]["properties"]["op"]["enum"]) == {"sum", "mean", "min", "max", "diff", "concat"}
+    style = schema["$defs"]["SheetStyle"]["properties"]
+    assert style["borders"]["default"] == "thin" and style["header_bold"]["default"] is True and style["orientation"]["default"] == "auto"
+    assert set(schema["$defs"]["Highlight"]["properties"]["color"]["enum"]) == {"red", "amber", "green", "blue"}
+    assert "Rewrite" in schema["$defs"] and "column" in schema["$defs"]["Rewrite"]["properties"]
+
+
 def test_text_of_covers_every_prose_field():
     spec = S.parse_body("document", _doc())
     text = S.text_of(spec)
@@ -387,3 +635,16 @@ def test_an_impossible_explicit_format_is_dropped_with_a_warning():
     assert d.kind == "workbook"
     ok, bad = formats.formats_for_conversion("presentation", ["xlsx", "pdf"])
     assert (ok, bad) == (["pdf"], ["xlsx"])
+    # A workbook may now be converted to Word/PDF (CONTRACT-2 §1); a
+    # document still cannot become a csv.
+    assert formats.formats_for_conversion("workbook", ["docx", "pdf", "csv"]) == (["docx", "pdf", "csv"], [])
+    assert formats.formats_for_conversion("document", ["csv"]) == ([], ["csv"])
+
+
+def test_an_id_pattern_is_read_before_it_is_ever_formatted():
+    """Security review 2026-09-12: `{n:0999999999d}` is a valid format that
+    allocates a gigabyte per call; the spec's own probe was the first one."""
+    with pytest.raises(ValidationError) as exc:
+        S.GenColumn.model_validate({"name": "id", "kind": "id", "pattern": "X-{n:0999999999d}"})
+    assert "width" in str(exc.value)
+    assert S.GenColumn.model_validate({"name": "id", "kind": "id", "pattern": "X-{n:06d}"}).pattern == "X-{n:06d}"

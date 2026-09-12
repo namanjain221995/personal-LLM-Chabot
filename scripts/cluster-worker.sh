@@ -5,8 +5,12 @@
 . "$(dirname "${BASH_SOURCE[0]}")/lib/cluster-common.sh"
 cluster_load_settings
 require_dual_mode
-cmd="${1:-status}"; shift || true
-case "$cmd" in
+# `action`, not `cmd`: cluster-common.sh's head_compose declares a local
+# ARRAY named cmd, and shellcheck (SC2178/SC2128) rightly refuses the same
+# name used as a string in a file that sources it (monitoring.sh renamed for
+# the same reason).
+action="${1:-status}"; shift || true
+case "$action" in
   start)
     ssh_worker "test -f $WORKER_REMOTE_DIR/worker.env -a -f $WORKER_REMOTE_DIR/compose.cluster-worker.yaml" \
       || die "worker files missing on $CLUSTER_WORKER_SSH; run scripts/cluster-sync.sh first"

@@ -52,7 +52,8 @@ browser  ArtifactCard → ArtifactPanel → PagesViewer / SheetViewer ───�
 | the runner | the render worker | one JSON file in the working directory; a separate process with limits; a JSON report or a categorised error back; never the database, never the network |
 | the renderers | validation | a file is "made" only when its own library reopens it; PDFs are counted and capped; Office files are checked for macros and external relationships |
 | the working directory | the published version | `os.replace` of the whole directory after fsync; the rows say `completed` only after that; a crash between the two is reconciled by `is_published` on the next attempt |
-| the API | the browser | ids and integers only in paths; relative URLs built by code on both sides; `inline` vs `attachment` are different actions; page images rasterised once under a process-wide PDFium lock |
+| the API | the browser | ids and integers only in paths (artifact ids, versions, 16-hex file ids); relative URLs built by code on both sides; `inline` vs `attachment` are different actions; a ZIP is streamed, never assembled in memory; page images rasterised once under a process-wide PDFium lock |
+| a version | the cards | one FileCard per file under a version header; "Download all" only when the server offers `download_all_url`; legacy `report_files` through the same card via an adapter; the panel steps through files and versions |
 
 ## What runs where
 
@@ -65,6 +66,33 @@ browser  ArtifactCard → ArtifactPanel → PagesViewer / SheetViewer ───�
 | visual QA | the runner, Max only | `ARTIFACT_QA_PAGES` pages at `ARTIFACT_QA_WIDTH`; one revision pass |
 | page images on demand | the API, `asyncio.to_thread` | one PDFium lock process-wide; 2 rasterisations at a time; one render per (version, page, width); `MAX_PREVIEW_PAGES` |
 | housekeeping | the maintenance task | requeue lapsed leases, drain the queue, fail jobs queued past the TTL, sweep abandoned `v<N>.tmp` — never a published dir |
+
+## Data by code (since 2026-09-12)
+
+```
+the turn's raw text (tabs, newlines intact) + the last three user turns
+  └ tables.parse_table   delimiter by evidence (tab · | · runs of spaces · csv.Sniffer), header = first line,
+                          one row per line with its source line number, blanks None, widths padded and recorded,
+                          never a row dropped or merged; the largest block in a longer message; 10k rows / 5 MB cap
+  └ tables.forward_fill  a leading group column (host/candidate/owner…) filled from the row above only on evidence,
+                          each fill recorded → DataTable(id="paste1") in the material + a transform report
+composer  ── the prompt lists "TABLE paste1: 9 columns × 34 rows: Host, …" and orders rows_from: "paste1", rows: []
+          ── "N sample records" → Sheet.generator (a recipe per column) and rows: []
+          ── _fill_code_made_rows BEFORE parse_body: rows copied verbatim / tables.generate_rows(seed) exactly N;
+             a recipe the code cannot follow becomes one it can, with a note (text→name/label/choice, derived→range)
+          ── _rewrite_columns AFTER the draft: one column, 40-row JSON batches, one reply per row,
+             tables.apply_rewrites keeps the original when a timestamp, a quoted span or a figure would change
+          ── requested_sections(instruction) checked against the headings → one correction; caps floor
+render    ── workbook: xlsx (primary, SheetStyle: borders, bold header, fills, red highlight, wrap, text ids)
+             + one CSV per sheet (data; RFC 4180; formula leads neutralised; exactly the rows)
+             + docx/pdf companions: one landscape section per sheet, repeated header, methodology note from transform.json
+validate  ── every file reopened; xlsx rows per sheet and csv rows vs the spec ("the CSV has 499 data rows; 500 were required")
+pipeline  ── file_id = sha1(artifact:version:role:format:sheet)[:16] minted here; a generator count that the CSV does not match is refused
+sentence  ── from the published spec and the reopened files: "Created the CSV dataset with 500 validated records." /
+             "Done — I preserved 34 audit rows and created four files. 19 blank source fields stay blank; …"
+```
+
+The model never types a row that code could copy or generate; the model never sees a file, an id or a URL; the person never reads a sentence whose counts the code did not check.
 
 ## Versions and lineage
 

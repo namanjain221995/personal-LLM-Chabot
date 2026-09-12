@@ -484,6 +484,7 @@ services:
       SF_CLIENT_SECRET: ${SF_CLIENT_SECRET:-}
       SF_LOGIN_URL: ${SF_LOGIN_URL:-}
       SF_API_VERSION: ${SF_API_VERSION:-v61.0}
+      SF_ENVIRONMENT: ${SF_ENVIRONMENT:-unknown}
       SF_LIVE_ENABLED: ${SF_LIVE_ENABLED:-true}
       # RAG citation links open records in this Lightning org. Without it the
       # code default (techsara's org) silently produces wrong links elsewhere.

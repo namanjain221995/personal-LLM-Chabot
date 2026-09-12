@@ -380,8 +380,12 @@ manifest as `dgx-qwen38-27b-nvfp4`); the main model was switched to the
 active per token, so decode is ~3× faster and the KV cache 3× cheaper per
 token). Dual mode with the dense 27B bought faster replies and roughly double
 context headroom, not peak throughput, on this fabric. Pipeline parallelism was tried and refused by vLLM
-for this multimodal model class. The head and worker heal themselves after a
-crash (measured: worker killed → completions back in 584 s with no operator).
+for this multimodal model class. Self-healing after a rank crash is the engine
+controller's job since 2026-09-12 — detection, the coordinated restart, and
+the durable queue that keeps every request until the same model resumes it
+(no other model ever answers), with the measured before/after numbers and the
+targets, are in [`docs/availability/SLO.md`](docs/availability/SLO.md)
+(procedures: [`docs/availability/RUNBOOK.md`](docs/availability/RUNBOOK.md)).
 
 ```bash
 scripts/cluster-status.sh --probe   # both nodes, RDMA links, NCCL transport, live GPU activity on both GB10s
@@ -423,7 +427,7 @@ runtime overlay from [`compose/`](compose/), in this order: runtime overlay →
 - Network **`application`** is a normal bridge; **`inference`** is `internal: true` — model containers are `expose`-only and reachable solely from the orchestrator and sync-worker unless `PUBLISH_MODEL_PORTS=true`.
 - Named volumes (the persistent data boundary): `sf-local-ai_pgdata`, `sf-local-ai_data` (DuckDB, LanceDB, Parquet, workspaces, brain mount point), `sf-local-ai_reports`, `sf-local-ai_pgadmin`, `sf-local-ai_hf-cache`.
 - On a Mac the model servers are **native host processes**; containers reach them through authenticated loopback bridges on 18100/18103/18105 (`launcher/techsara_cli/bridge.py`).
-- Model services on DGX share one 128 GB unified pool with measured `--gpu-memory-utilization` shares: main 0.35, router 0.17, OCR 0.14, embed 0.04, reranker 0.04 (dual mode: main 0.30 per node + explicit 16 GiB KV).
+- Model services on DGX share one 128 GB unified pool with measured `--gpu-memory-utilization` shares: main 0.35, router 0.17, OCR 0.14, embed 0.04, reranker 0.04 (dual mode: main 0.30 per node + an explicit 8 GiB KV budget, `--kv-cache-memory-bytes 8589934592`, since the 1M window of 2026-08-29).
 - Compose profiles are derived automatically: `embeddings`, `reranker`, `ocr` from the selected models; `search` from `SEARCH_ENABLED=true` + `SEARCH_PROVIDER=searxng`; `admin` from `COMPOSE_PROFILES`.
 
 ---
@@ -647,7 +651,7 @@ user or conversation column. Details and the diagram:
 | `vision.py` | `vision` | Up to 5 images through the multimodal main model; invoices/contracts return a JSON block first | any attached image |
 | `document.py` + `ocr.py` | `vision` | PDF/DOCX/plain: every page's text layer, OCR sidecar (`baidu/Unlimited-OCR`) for thin pages (≤40), first pages also as images; full text stored for later turns | `pdf` attached |
 | `report.py` | `report` | ≤6 planned sections filled via sql/rag, matplotlib PNGs, Markdown → `.docx` + `.pdf` (pandoc + WeasyPrint) into `/reports` | router `report` |
-| `artifact.py` | `artifact` | **The Artifact Studio.** "Create a PDF / Word / PowerPoint / Excel about this", "make slide 4 shorter", "also as Word" → a durable job (V31), the model writes CONTENT as a validated spec, code renders PDF/DOCX/PPTX/XLSX in a limited subprocess, every file reopened, a card + side-panel viewer, versions with lineage; Fast/Think/Max change depth (outline, review, a visual pass over the rendered pages), never availability. See [`docs/artifact-studio/`](docs/artifact-studio/) | `artifacts/intent.decide` on the resolved text, every mode |
+| `artifact.py` | `artifact` | **The Artifact Studio.** "Create a PDF / Word / PowerPoint / Excel / CSV about this", "create a CSV dataset of 500 records", "clean up this pasted table and share it as XLSX, CSV, Word and PDF", "make slide 4 shorter", "also as Word" → a durable job (V31), the model writes CONTENT as a validated spec (rows come from code: a pasted table copied verbatim, a seeded generator for sample data), code renders PDF/DOCX/PPTX/XLSX/CSV in a limited subprocess, every file reopened and counted, one card per file with Download all, a side-panel viewer (pages or grid), versions with lineage; Fast/Think/Max change depth (outline, review, a visual pass over the rendered pages), never availability. See [`docs/artifact-studio/`](docs/artifact-studio/) | `artifacts/intent.decide` on the resolved text, every mode |
 | `chat.py` | `chat` | Plain streamed completion (assistant or Salesforce small-talk prompt) | assistant mode, router `chat` |
 | `agent.py` | `agent` | PLAN → EXECUTE (≤8 steps of `sql|rag|llm|web|salesforce`, concurrency 3, `step` events) → SYNTHESIZE; grounded on the user's own sentence, not the planner's paraphrase | agent toggle or auto-plan |
 | `search.py` | `search` | Query rewrite (router model) → 1–6 parallel queries → round-robin merge, per-domain cap → **cross-encoder rerank** → warm store or SSRF-safe fetch (16 concurrent) → extraction → tiered budget → memory chunks → cited answer; SERP cache + per-user rate limit | assistant mode + search wanted |
@@ -777,7 +781,7 @@ code in [`orchestrator/app/core/sf_intel/`](orchestrator/app/core/sf_intel/) and
 
 - **Charts** (`core/chart_*`, `frontend/lib/chartOption.ts`): nine types (bar, line, area, pie, scatter, horizontal bar, donut, funnel, histogram). `CHART_TRIGGER_MODE=explicit` charts on request; `hybrid` also charts four deterministic shapes (time series, single-metric category comparison, trusted stage funnel, small part-to-whole). The model only ever sees column *profiles*, never cell values; the frontend adapter is a security boundary (no wire field can become an ECharts function). Charts are decided *before* the narrative streams so the model stops drawing ASCII bars.
 - **Reports**: `.docx` + `.pdf` in the `reports` volume, downloadable through `/reports/{filename}` with path-traversal-safe names; also CSV/XLSX exports of SQL results (100k-row cap).
-- **Artifacts** (`app/artifacts/`, [`docs/artifact-studio/`](docs/artifact-studio/)): documents, decks and workbooks asked for in chat, stored id-keyed and owner-scoped under `/reports/artifacts/<user>/<artifact>/v<N>/`, served by `/artifacts/…` (inline preview, attachment download, page images, sheet grid, job status, cancel/retry/convert), rendered in a subprocess with a deny-all URL fetcher, formulas neutralised, macros and external relationships refused. Member feature `artifacts`; `ARTIFACTS_ENABLED` for the deployment.
+- **Artifacts** (`app/artifacts/`, [`docs/artifact-studio/`](docs/artifact-studio/)): documents, decks, workbooks and CSV datasets asked for in chat, stored id-keyed and owner-scoped under `/reports/artifacts/<user>/<artifact>/v<N>/`, served by `/artifacts/…` (a file by its id, a ZIP of a version, inline preview, attachment download, page images, a grid for xlsx and csv, job status, cancel/retry/convert), rendered in a subprocess with a deny-all URL fetcher, formulas neutralised in xlsx and csv, macros and external relationships refused. Pasted tables are parsed by code (`app/artifacts/tables.py`) and copied into the file row for row; sample datasets are generated by code from a model-written recipe. Member feature `artifacts`; `ARTIFACTS_ENABLED` for the deployment.
 - **Uploads**: images (≤5 × 10 MB) and PDFs travel inline; datasets stream to `POST /uploads` (≤200 MB, ZIP/XLSX inspected with four independent bomb caps, depth 1, never `extractall`) into `/data/workspaces` (24 h TTL, 20 GB quota); a profile — never the raw file — is what the model sees.
 - **Documents**: every page read, scanned pages OCR'd, stored in `documents` and re-injected on later turns.
 - **Web search**: SearXNG (self-hosted, `COMPOSE_PROFILES=search`, ten engines beyond the defaults because the stock ones CAPTCHA), Tavily or Brave; all fetches go through `core/net.py` (DNS resolved first, private/loopback/metadata ranges refused, redirects re-checked, size/time bounded).
@@ -1038,6 +1042,7 @@ Current (2026-08):
 
 - [`docs/AUTH.md`](docs/AUTH.md) — **authentication, workspaces, RBAC, audit**: sessions, persistent login, invitations, bootstrap, member privacy, admin surface
 - [`docs/MONITORING.md`](docs/MONITORING.md) — the Grafana/Prometheus observability platform for the two DGX Sparks
+- [`docs/availability/`](docs/availability/README.md) — **the main model's availability (2026-09-12)**: [`RUNBOOK.md`](docs/availability/RUNBOOK.md) (what to do when an alert fires), [`CONTRACT.md`](docs/availability/CONTRACT.md) (the binding states, signals, metrics), [`ARCHITECTURE.md`](docs/availability/ARCHITECTURE.md) (controller, sentinel, breaker, request continuity, admission lanes), [`INCIDENT-2026-09-11-vllm.md`](docs/availability/INCIDENT-2026-09-11-vllm.md), [`ADR-0002-high-availability.md`](docs/availability/ADR-0002-high-availability.md), [`SLO.md`](docs/availability/SLO.md), [`CANDIDATE-B.md`](docs/availability/CANDIDATE-B.md), [`MEMORY-BUDGET.md`](docs/availability/MEMORY-BUDGET.md), [`VLLM-UPGRADE-RESEARCH.md`](docs/availability/VLLM-UPGRADE-RESEARCH.md)
 - [`docs/FLOWS.md`](docs/FLOWS.md) — **every flow as a diagram**: the three answering modes, all five models, engine dispatch, crawler, web memory, citations, Salesforce, streaming
 - [`docs/01-codebase/deep-research.md`](docs/01-codebase/deep-research.md) — the iterative research engine: loop, budgets, citation validation, category routing, `research_runs`
 - [`docs/README.md`](docs/README.md) — index and reading order

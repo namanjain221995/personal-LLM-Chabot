@@ -1,7 +1,7 @@
 # Local test/dev requirements (host Python 3.12; containers pin 3.11 — accepted difference).
-# Identical to requirements.txt EXCEPT: no transformers, no weasyprint (heavy /
-# native; both are lazy at runtime), plus pytest. The whole test suite runs
-# OFFLINE — no vLLM servers, no GPU, no torch.
+# Identical to requirements.txt EXCEPT: no transformers (heavy; lazy at
+# runtime), plus pytest. WeasyPrint IS here (see the Artifact Studio block).
+# The whole test suite runs OFFLINE — no vLLM servers, no GPU, no torch.
 fastapi>=0.115
 # FastAPI raises at ROUTE-DEFINITION time when a route declares File()/Form()
 # without this, so `import app.uploads` fails and 16 test modules cannot be
@@ -48,10 +48,15 @@ trafilatura>=1.12
 webrtcvad-wheels>=2.0.14
 pillow>=10.0
 # Artifact Studio: exact, same as requirements.txt (the render tests reopen
-# real .docx/.pptx files with these libraries). WeasyPrint stays out (see
-# above); the PDF-producing render tests skip when it is absent and run for
-# real inside the :cpu image.
+# real .docx/.pptx files with these libraries). WeasyPrint and pypdfium2 are
+# IN since 2026-09-12: with them absent CI reported "45 skipped" — every
+# PDF-producing render test, the page-count validation and the visual QA
+# rasteriser were silently skipped while production ran them for real, and
+# a silently skipped suite is not a pass. The pipeline job installs the
+# Pango/Cairo/GDK-PixBuf libraries WeasyPrint links (see pipeline.yml).
 python-pptx==1.0.2
 python-docx==1.1.2
+weasyprint==70.0
+pypdfium2>=4.30
 XlsxWriter==3.2.9
 pytest>=8.0

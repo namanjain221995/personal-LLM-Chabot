@@ -597,6 +597,52 @@ a {
   color: var(--ts-text-muted);
 }
 
+/* 2026-09-12 (Artifact Studio 2): the two tints the per-file cards were
+   missing. Decks take the Vision violet — the one identity colour no other
+   badge uses (the same rule lib/format.ts applied inline); a ZIP is a
+   package of the others, so it is plain. */
+.file-icon-pptx {
+  background: rgba(109, 90, 230, 0.16);
+  color: var(--ts-engine-vision-ink);
+}
+
+.file-icon-zip {
+  background: var(--ts-surface-2);
+  color: var(--ts-text);
+}
+
+/* ----------------------------------------------------------- file cards
+
+   One card per generated file (components/artifacts/FileCard.tsx). The
+   accent is a 3 px inset rule on the left in the format's colour, so a row
+   of four cards — Excel, CSV, Word, PDF — reads as four different things
+   without four different layouts. The active card (the one the panel is
+   showing) swaps it for the accent. */
+.file-card {
+  box-shadow: inset 3px 0 0 0 var(--file-card-accent, transparent);
+}
+
+.file-card[data-format='pdf'] {
+  --file-card-accent: var(--ts-danger);
+}
+
+.file-card[data-format='docx'] {
+  --file-card-accent: var(--ts-engine-report-ink);
+}
+
+.file-card[data-format='pptx'] {
+  --file-card-accent: var(--ts-engine-vision-ink);
+}
+
+.file-card[data-format='xlsx'],
+.file-card[data-format='csv'] {
+  --file-card-accent: var(--ts-engine-rag-ink);
+}
+
+.file-card[data-active='true'] {
+  --file-card-accent: var(--ts-accent-strong);
+}
+
 /* ------------------------------------------- TechSara Reasoning Star (SVG)
 
    A radial starburst of 12 rays that rotates while the backend is working.

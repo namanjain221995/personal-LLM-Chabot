@@ -462,15 +462,21 @@ const videoFixture: Fixture = {
 };
 
 // 2026-09-11: Artifact Studio — the answer IS a file. The ref is already
-// terminal so the card shows Ready without polling; with no orchestrator
+// terminal so the cards show Ready without polling; with no orchestrator
 // behind MOCK_MODE the panel's version fetch answers 502 and the panel shows
 // its honest failed state, which is the demo's truth.
+//
+// 2026-09-12: in the CONTRACT-2 §2 shape — a file id, role and title per
+// file, per-file preview URLs, and `download_all_url` for the ZIP — so the
+// demo shows one card per file under one header with "Download all". The
+// older shape (no ids, /file/{format} URLs) is what history still hands
+// back for turns before this date; it is pinned in tests/artifact-card.
 const ARTIFACT_MOCK_ID = 'a3f9c2d1e4b5f6a7b8c9d0e1f2a3b4c5';
 const artifactFixture: Fixture = {
   text:
-    'Your board deck is ready — nine slides: the quarter in numbers, pipeline ' +
-    'by stage, the two risks, and the ask. Open it beside the chat or download ' +
-    'the PowerPoint.',
+    'Created the Board deck in PowerPoint and PDF — nine slides: the quarter ' +
+    'in numbers, pipeline by stage, the two risks, and the ask. Open either ' +
+    'beside the chat or download them together.',
   meta: {
     route: 'artifact',
     artifacts: [
@@ -483,23 +489,31 @@ const artifactFixture: Fixture = {
         status: 'completed',
         files: [
           {
+            file_id: '5b1e0c7d9a3f2e4c',
+            role: 'primary',
             format: 'pptx',
             filename: 'board-deck-v1.pptx',
+            title: 'Board deck',
             mime_type:
               'application/vnd.openxmlformats-officedocument.presentationml.presentation',
             size: 250_000,
             slides: 9,
-            download_url: `/artifacts/${ARTIFACT_MOCK_ID}/v/1/file/pptx?disposition=attachment`,
-            inline_url: `/artifacts/${ARTIFACT_MOCK_ID}/v/1/file/pptx?disposition=inline`,
+            download_url: `/artifacts/${ARTIFACT_MOCK_ID}/v/1/f/5b1e0c7d9a3f2e4c?disposition=attachment`,
+            inline_url: `/artifacts/${ARTIFACT_MOCK_ID}/v/1/f/5b1e0c7d9a3f2e4c?disposition=inline`,
+            preview_url: `/artifacts/${ARTIFACT_MOCK_ID}/v/1/preview`,
           },
           {
+            file_id: '9d4a2b6f0e1c3a5b',
+            role: 'companion',
             format: 'pdf',
             filename: 'board-deck-v1.pdf',
+            title: 'Board deck',
             mime_type: 'application/pdf',
             size: 180_000,
             pages: 9,
-            download_url: `/artifacts/${ARTIFACT_MOCK_ID}/v/1/file/pdf?disposition=attachment`,
-            inline_url: `/artifacts/${ARTIFACT_MOCK_ID}/v/1/file/pdf?disposition=inline`,
+            download_url: `/artifacts/${ARTIFACT_MOCK_ID}/v/1/f/9d4a2b6f0e1c3a5b?disposition=attachment`,
+            inline_url: `/artifacts/${ARTIFACT_MOCK_ID}/v/1/f/9d4a2b6f0e1c3a5b?disposition=inline`,
+            preview_url: `/artifacts/${ARTIFACT_MOCK_ID}/v/1/preview`,
           },
         ],
         preview_kind: 'pages',
@@ -510,6 +524,8 @@ const artifactFixture: Fixture = {
         created_at: '2026-09-11T10:00:00Z',
         operation: 'create',
         status_url: '/artifacts/jobs/ffffffffffffffffffffffffffffffff',
+        download_all_url: `/artifacts/${ARTIFACT_MOCK_ID}/v/1/zip`,
+        package: { count: 2 },
       },
     ],
   },

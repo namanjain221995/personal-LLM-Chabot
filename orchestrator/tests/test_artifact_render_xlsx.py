@@ -267,7 +267,7 @@ def test_sheet_grid_returns_formulas_as_text_and_honours_bounds(tmp_path):
     pipe = preview.sheet_grid(path, "Pipeline", max_rows=5, max_cols=3)
     assert pipe["sheet"]["columns"] == ["Deal", "Close date", "Amount"]
     assert len(pipe["sheet"]["rows"]) == 5 and pipe["sheet"]["truncated"] is True
-    assert pipe["sheet"]["rows"][0][1] == "2026-02-02T00:00:00"   # a date, serialised
+    assert pipe["sheet"]["rows"][0][1] == "2026-02-02"   # a date cell reads back as midnight; the grid shows the date
     full = preview.sheet_grid(path, "Pipeline", max_rows=200, max_cols=50)
     assert full["sheet"]["formulas"]["C32"] == "=SUM(C2:C31)"
     assert full["sheet"]["truncated"] is False
@@ -287,3 +287,140 @@ def test_sheet_grid_skips_hidden_sheets(tmp_path):
     wb.save(str(path))
     names = [s["name"] for s in preview.sheet_grid(path, None, 10, 10)["sheets"]]
     assert "Notes" not in names and "Pipeline" in names
+
+
+# ---------------------------------------------------------------- style --
+
+
+def _styled(rows=6, **style):
+    """A nine-column audit-shaped sheet with a style (CONTRACT-2 §4)."""
+    columns = [S.Column(name="Host"), S.Column(name="Candidate"), S.Column(name="Date", type="date"), S.Column(name="Session ID"),
+               S.Column(name="Meeting ID"), S.Column(name="Duration", type="integer"), S.Column(name="Ratio", type="number"),
+               S.Column(name="Outcome"), S.Column(name="Audit Comments")]
+    data = []
+    for i in range(rows):
+        data.append([
+            "Ravi Sharma" if i % 3 == 0 else None, f"Cand {i}", "2026-08-03" if i % 2 == 0 else None, "007" if i == 0 else f"S-{1041 + i}",
+            f"MTG-{77812 + i}", 42 if i != 2 else None, 0.81, "Selected", "a long comment " * 8,
+        ])
+    return S.ArtifactSpec(kind="workbook", workbook=S.WorkbookSpec(title="Audit", sheets=[
+        S.Sheet(name="Audit", columns=columns, rows=data, style=S.SheetStyle(**style) if style else None),
+    ]))
+
+
+def test_default_style_is_thin_black_borders_bold_navy_header_and_top_aligned_cells(tmp_path):
+    """A sheet with no style gets SheetStyle's defaults (CONTRACT-2 §4)."""
+    from openpyxl import load_workbook
+
+    from app.artifacts.render.xlsx import BORDER_COLOUR
+
+    path, _ = render(_styled(), tmp_path)
+    ws = load_workbook(str(path))["Audit"]
+    for ref in ("A1", "I1", "A2", "I2", "E7"):
+        b = ws[ref].border
+        assert (b.left.style, b.right.style, b.top.style, b.bottom.style) == ("thin",) * 4, ref
+        assert b.left.color.rgb.endswith(BORDER_COLOUR) and b.top.color.rgb.endswith(BORDER_COLOUR), ref
+    assert ws["A1"].font.bold and ws["A1"].fill.fgColor.rgb.endswith("0A1D37") and ws["A1"].font.color.rgb.endswith("FFFFFF")
+    assert ws["I2"].alignment.vertical == "top" and ws["I2"].alignment.wrap_text in (None, False)
+    # Blanks are blank cells, never 0 or "".
+    assert ws["A3"].value is None and ws["C3"].value is None and ws["F4"].value is None
+    # An id with leading zeros is text in a text column; a date column holds dates.
+    assert ws["D2"].value == "007" and ws["D2"].data_type == "s"
+    assert ws["C2"].value == dt.datetime(2026, 8, 3) and ws["C2"].number_format == "yyyy-mm-dd"
+
+
+def test_leading_zero_ids_are_never_coerced_even_in_a_numeric_column(tmp_path):
+    from openpyxl import load_workbook
+
+    spec = S.ArtifactSpec(kind="workbook", workbook=S.WorkbookSpec(title="w", sheets=[
+        S.Sheet(name="p", columns=[S.Column(name="code", type="integer"), S.Column(name="n", type="integer")], rows=[["007", "7"], ["00123", "0"], ["0", "0.5"]]),
+    ]))
+    path, _ = render(spec, tmp_path, "zeros.xlsx")
+    ws = load_workbook(str(path))["p"]
+    assert ws["A2"].value == "007" and ws["A2"].data_type == "s"
+    assert ws["A3"].value == "00123" and ws["A3"].data_type == "s"
+    assert ws["A4"].value == 0 and ws["B2"].value == 7 and ws["B3"].value == 0 and ws["B4"].value == 0.5
+
+
+def test_highlight_column_uses_readable_red_pairs_and_wrap_top_aligns(tmp_path):
+    """CONTRACT-2 §4 SheetStyle: the highlighted column's header is white
+    on dark red (9C0006) and its cells dark red on light red (FFC7CE) —
+    the pairs pinned exactly; wrap sets wrap_text and top alignment."""
+    from openpyxl import load_workbook
+
+    from app.artifacts.render.xlsx import HIGHLIGHT_COLOURS
+
+    assert HIGHLIGHT_COLOURS["red"] == ("9C0006", "FFFFFF", "FFC7CE", "9C0006")
+    path, _ = render(_styled(highlight=[S.Highlight(column="audit comments", color="red")], wrap=True), tmp_path, "hl.xlsx")
+    ws = load_workbook(str(path))["Audit"]
+    assert ws["I1"].fill.fgColor.rgb.endswith("9C0006") and ws["I1"].font.color.rgb.endswith("FFFFFF") and ws["I1"].font.bold
+    assert ws["I2"].fill.fgColor.rgb.endswith("FFC7CE") and ws["I2"].font.color.rgb.endswith("9C0006")
+    assert ws["H2"].fill.fill_type is None, "only the named column is highlighted"
+    assert ws["I2"].alignment.wrap_text is True and ws["I2"].alignment.vertical == "top"
+    assert ws["A1"].alignment.wrap_text is True
+    assert ws.column_dimensions["I"].width <= 45, "a wrapped comment column is a paragraph, not a strip"
+    # Every other colour has its pair too.
+    for colour, (h_fill, _, c_fill, c_font) in HIGHLIGHT_COLOURS.items():
+        p, _ = render(_styled(highlight=[S.Highlight(column="Outcome", color=colour)]), tmp_path, f"{colour}.xlsx")
+        w = load_workbook(str(p))["Audit"]
+        assert w["H1"].fill.fgColor.rgb.endswith(h_fill) and w["H2"].fill.fgColor.rgb.endswith(c_fill) and w["H2"].font.color.rgb.endswith(c_font)
+
+
+def test_header_fill_light_none_and_no_borders(tmp_path):
+    from openpyxl import load_workbook
+
+    path, _ = render(_styled(header_fill="light", borders="none", header_bold=False), tmp_path, "light.xlsx")
+    ws = load_workbook(str(path))["Audit"]
+    assert ws["A1"].fill.fgColor.rgb.endswith("ECECEC") and ws["A1"].font.color.rgb.endswith("0D0D0D")
+    assert not ws["A1"].font.bold
+    assert ws["A2"].border.left is None or ws["A2"].border.left.style is None
+    assert ws["A2"].border.top is None or ws["A2"].border.top.style is None
+    assert ws["A1"].border.bottom.style == "thin", "no-borders keeps a rule under the header"
+    path, _ = render(_styled(header_fill="none"), tmp_path, "none.xlsx")
+    ws = load_workbook(str(path))["Audit"]
+    assert ws["A1"].fill.fill_type is None and ws["A1"].font.bold and ws["A1"].font.color.rgb.endswith("0D0D0D")
+
+
+def test_is_landscape_follows_the_style_and_the_six_column_rule():
+    from app.artifacts.render.xlsx import is_landscape
+
+    nine = _styled().body.sheets[0]
+    assert is_landscape(nine) is True                         # auto, 9 columns
+    assert is_landscape(nine.model_copy(update={"style": S.SheetStyle(orientation="portrait")})) is False
+    three = workbook().body.sheets[1]                          # Regions: 3 columns
+    assert is_landscape(three) is False
+    assert is_landscape(three.model_copy(update={"style": S.SheetStyle(orientation="landscape")})) is True
+
+
+def test_a_chart_over_a_long_sheet_aggregates_to_top_20_and_other(tmp_path):
+    """Charts over > MAX_CHART_POINTS rows aggregate rather than fail: the
+    series summed per category, the top 20 by value, then "Other" — from
+    a data block beside the sheet the chart still references."""
+    from openpyxl import load_workbook
+
+    from app.artifacts.render.xlsx import CHART_TOP_CATEGORIES, aggregate_chart
+
+    rows = [[f"Region {i % 30}", 10 + i] for i in range(500)]
+    # As the model writes it: the label column's header for categories and
+    # a series named after the numeric column (spec.Sheet fills the cells).
+    sheet = S.Sheet.model_validate({
+        "name": "Sales", "columns": [{"name": "Region"}, {"name": "Amount", "type": "number"}], "rows": rows,
+        "charts": [{"type": "bar", "title": "Amount by region", "categories": ["Region"], "series": [{"name": "Amount"}]}],
+    })
+    spec = S.ArtifactSpec(kind="workbook", workbook=S.WorkbookSpec(title="w", template_id="dashboard", sheets=[sheet]))
+    chart = spec.body.sheets[0].charts[0]
+    assert len(chart.categories) == T.MAX_CHART_POINTS, "the spec keeps the chart under its cap"
+    cats, values = aggregate_chart(spec.body.sheets[0], chart, 0, [1])
+    assert len(cats) == CHART_TOP_CATEGORIES + 1 and cats[-1] == "Other"
+    assert values[0][-1] == sum(v for r, v in rows if r not in cats[:-1])
+    assert values[0][0] == max(values[0][:-1]), "top categories first"
+    path, warnings = render(spec, tmp_path, "agg.xlsx")
+    assert warnings == []
+    wb = load_workbook(str(path))
+    ws = wb["Sales"]
+    assert len(ws._charts) == 1
+    ref = ws._charts[0].series[0].val.numRef.f
+    assert ref == f"'Sales'!$O$2:$O${1 + CHART_TOP_CATEGORIES + 1}", ref
+    assert ws["N1"].value == "Amount by region" and ws["N22"].value == "Other" and ws["O22"].value == values[0][-1]
+    # The dashboard draws the same aggregate from the same block.
+    assert len(wb["Dashboard"]._charts) == 1 and wb["Dashboard"]._charts[0].series[0].val.numRef.f == ref

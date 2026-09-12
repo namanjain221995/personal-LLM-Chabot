@@ -778,3 +778,229 @@ def test_a_failure_mid_report_keeps_the_sources_already_read(monkeypatch):
     running = {s["id"] for s in steps if s["status"] == "running"}
     settled = {s["id"] for s in steps if s["status"] in ("done", "failed")}
     assert running == settled
+
+
+# ---------------------------------------------------------------------------
+# Round-2 review, deep_research.py:3154 (blocker): a run during a recovery
+# parks — before its budgets, and when a budget cuts a held wait
+# ---------------------------------------------------------------------------
+
+
+def _plant_verdict(state: str) -> None:
+    import time as _time
+
+    from app import engine_state
+
+    engine_state._record(
+        engine_state.parse_state_document(
+            {"schema": 1, "generated_at": _time.time(), "state": state,
+             "state_code": engine_state.STATE_CODES[state], "reason": "test",
+             "primary_ready": state in engine_state.SERVING},
+            observed_at=_time.monotonic(),
+        ),
+        "",
+    )
+
+
+@pytest.fixture()
+def held_turn(monkeypatch):
+    """A chat turn's hold on the task (no row), a fresh breaker, no
+    controller poller, and the main URL the breaker knows."""
+    from app import breaker, continuity, engine_state, metrics
+
+    metrics.reset()
+    breaker.reset()
+    engine_state.reset()
+    continuity.reset()
+    monkeypatch.setattr(settings, "openai_base_url", "http://vllm-main.test:8000/v1")
+    monkeypatch.setattr(settings, "engine_controller_url", "")
+    monkeypatch.setattr(settings, "llm_interactive_recovery_s", 0.0)
+    monkeypatch.setattr(settings, "llm_breaker_cooldown_s", 0.0)
+    said: list = []
+
+    async def notify(line: str) -> None:
+        said.append(line)
+
+    def bind():
+        gen = SimpleNamespace(intent_id=None, generation_id="g", attempt=1, retry_reason="none",
+                              request_status="running", parked=False)
+        return continuity.bind(gen, notify), gen
+
+    yield bind, said
+    breaker.reset()
+    engine_state.reset()
+    continuity.reset()
+    metrics.reset()
+
+
+def test_a_deep_research_turn_started_during_a_recovery_parks_before_planning(monkeypatch, held_turn):
+    """The blocker: the run must wait for the main model BEFORE any stage
+    budget starts, and park (QueuedForRecovery) when the queue window
+    closes — no planning call, no empty report written as 'done'."""
+    from app import continuity
+
+    bind, said = held_turn
+    monkeypatch.setattr(settings, "llm_queue_max_wait_s", 0.4)
+    monkeypatch.setattr(settings, "deep_research_timeout_s", 600.0)
+    planned: list = []
+
+    async def planning(messages, **kw):
+        planned.append(kw.get("schema_name"))
+        return json.dumps({"subquestions": ["a"], "queries": ["q1"]})
+
+    _wire(monkeypatch)
+    monkeypatch.setattr(dr.llm, "json_completion", planning)
+    closed: list = []
+    monkeypatch.setattr(dr.db, "finish_research_run", lambda *a, **k: closed.append(a[1]))
+    events, emit = _emitter()
+
+    async def scenario():
+        hold, gen = bind()
+        _plant_verdict("RECOVERING")
+        with pytest.raises(continuity.QueuedForRecovery):
+            await dr.run_deep_research_engine("q", [], emit, effort="fast", conversation_id="c1", user_id=1)
+        assert dr._admission().total == 0, "the research slot is released"
+        return gen
+
+    gen = asyncio.run(scenario())
+    assert planned == [], "parked before planning: no stage budget was spent"
+    assert said == [continuity.QUEUED_LINE, continuity.EXPIRED_LINE]
+    assert gen.parked is True
+    assert closed == [], "no run row was opened, so none is closed"
+    assert [k for k, _ in events if k == "meta"] == [], "no report, no meta"
+
+
+def test_a_deep_research_turn_queued_at_start_runs_with_full_budgets_after_ready(monkeypatch, held_turn):
+    """The same start, READY before the window closes: the run proceeds
+    as the SAME generation (attempt 2, retry_reason recovery) with its
+    stage budgets untouched by the wait."""
+    from app import continuity
+
+    bind, said = held_turn
+    monkeypatch.setattr(settings, "llm_queue_max_wait_s", 30.0)
+    monkeypatch.setattr(settings, "deep_research_timeout_s", 600.0)
+    _wire(monkeypatch, sources=_sources(2), report="Report [1].")
+    events, emit = _emitter()
+    starts: list = []
+    original_state = dr.ResearchState
+
+    class RecordingState(original_state):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            starts.append(self.started_at)
+
+    monkeypatch.setattr(dr, "ResearchState", RecordingState)
+
+    async def scenario():
+        hold, gen = bind()
+        _plant_verdict("RECOVERING")
+        run = asyncio.create_task(
+            dr.run_deep_research_engine("q", [], emit, effort="fast", conversation_id="c1", user_id=1)
+        )
+        await asyncio.sleep(0.3)
+        assert not run.done() and said == [continuity.QUEUED_LINE]
+        import time as _time
+
+        ready_at = _time.monotonic()
+        _plant_verdict("READY")
+        out = await asyncio.wait_for(run, 10.0)
+        return gen, out, ready_at
+
+    gen, out, ready_at = asyncio.run(scenario())
+    assert "Report" in out
+    assert gen.attempt == 2 and gen.retry_reason == "recovery" and not gen.parked
+    assert said == [continuity.QUEUED_LINE]
+    assert starts and starts[0] >= ready_at - 0.05, "the budget clock starts after the wait"
+
+
+def test_a_stage_budget_that_cuts_a_held_wait_parks_the_run_instead_of_a_stage_timeout(monkeypatch, held_turn):
+    """Mid-run: the engine goes away while a stage is queued for it and
+    the stage's own budget fires. That is not a stage timeout — the run
+    parks: QueuedForRecovery propagates past _bounded, `cut_short` stays
+    empty, the person reads the second sentence once."""
+    from app import continuity
+
+    bind, said = held_turn
+    monkeypatch.setattr(settings, "deep_research_timeout_s", 100.0)
+    state = dr.ResearchState(research_id="r" * 32, conversation_id="c", question="q", user_id=1,
+                             today="2026-09-12", now_year=2026)
+    import time as _time
+
+    state.started_at = _time.monotonic() - (state.gather_budget_s - 0.2)  # 0.2 s of gathering budget left
+
+    async def queued_stage(hold):
+        # What resilience._admit does for a call held at the gate…
+        await hold.enter(continuity.RECOVERY)
+        try:
+            await asyncio.sleep(30)
+        except BaseException:
+            # …and what resilient() does when the budget cancels it.
+            hold.abandon()
+            raise
+
+    async def scenario():
+        hold, gen = bind()
+        with pytest.raises(continuity.QueuedForRecovery):
+            await dr._bounded(state, "planning", queued_stage(hold))
+        return gen
+
+    gen = asyncio.run(scenario())
+    assert state.cut_short == [], "not reported as a stage timeout"
+    assert gen.parked is True
+    assert said == [continuity.QUEUED_LINE, continuity.EXPIRED_LINE]
+
+
+def test_a_stage_budget_that_fires_on_a_slow_stage_is_still_a_stage_timeout(monkeypatch, held_turn):
+    """The counterpart: a stage that is merely slow (the engine serving)
+    is cut short exactly as before."""
+    bind, said = held_turn
+    monkeypatch.setattr(settings, "deep_research_timeout_s", 100.0)
+    state = dr.ResearchState(research_id="r" * 32, conversation_id="c", question="q", user_id=1,
+                             today="2026-09-12", now_year=2026)
+    import time as _time
+
+    state.started_at = _time.monotonic() - (state.gather_budget_s - 0.2)
+
+    async def slow_stage():
+        await asyncio.sleep(30)
+
+    async def scenario():
+        bind()
+        return await dr._bounded(state, "planning", slow_stage(), default="d")
+
+    assert asyncio.run(scenario()) == (False, "d")
+    assert state.cut_short == ["planning"] and said == []
+
+
+@pytest.mark.parametrize("stage", ["plan", "claims", "assess", "verify"])
+def test_deep_research_stage_handlers_re_raise_the_park(monkeypatch, held_turn, stage):
+    """The 'upgrade, never a gate' handlers of the four main-model stages
+    let QueuedForRecovery through (deep_research.py:833/1370/1673/1832)."""
+    from app import continuity
+
+    bind, said = held_turn
+
+    async def parked(*a, **k):
+        raise continuity.QueuedForRecovery(900.0)
+
+    monkeypatch.setattr(dr.llm, "json_completion", parked)
+    state = dr.ResearchState(research_id="r" * 32, conversation_id="c", question="q", user_id=1,
+                             today="2026-09-12", now_year=2026)
+    state.subquestions = ["a"]
+
+    async def scenario():
+        bind()
+        if stage == "plan":
+            await dr._plan("q", [], "fast", state)
+        elif stage == "claims":
+            record = dr.SourceRecord(n=1, title="Doc 1", url="https://example.com/p1", text="body " * 30,
+                                     query="q", iteration=1)
+            state.sources.append(record)
+            await dr._extract_claims(state, [record], "fast", None)
+        elif stage == "assess":
+            await dr._assess(state, "fast")
+        else:
+            await dr._verify(state, "fast")
+
+    with pytest.raises(continuity.QueuedForRecovery):
+        asyncio.run(scenario())

@@ -666,6 +666,119 @@ describe('a stream that dies after the request was accepted', () => {
 });
 
 /* ====================================================================== */
+/* 9b. A request held for the main model (strict one-model mode)          */
+/* ====================================================================== */
+
+describe('a request the server holds while the main model recovers', () => {
+  //: orchestrator/app/continuity.py — the two sentences, verbatim.
+  const QUEUED_LINE = 'Main model is recovering—your request is safely queued.';
+  const EXPIRED_LINE =
+    'The main model is still recovering. Your request is kept and will resume automatically.';
+  const queuedReport = (live: boolean) =>
+    ok({
+      intent_id: 'i1',
+      status: 'queued',
+      generation_id: 'g1',
+      attempt: 1,
+      resumable: true,
+      answer_persisted: false,
+      live,
+    });
+
+  it('after a reload says queued — not working, not failed — and attaches when the resume runs', async () => {
+    wire.request = async () => queuedReport(false);
+    await reopen('conv-1', [
+      userTurn({ meta: { intent: { id: 'i1', state: 'accepted', generation_id: 'g1' } } }),
+    ]);
+    await waitFor(() => expect(screen.getByTestId('turn-queued')).toBeTruthy());
+    const turn = screen.getByTestId('turn-queued');
+    expect(turn.textContent).toContain('Waiting for the main model to recover…');
+    expect(turn.querySelector('button')).toBeNull();
+    expect(notice()).toBeNull();
+    expect(screen.queryByRole('alert')).toBeNull();
+    // Written down as queued, so the next reload starts from the truth.
+    const lastUser = saves.at(-1)!.messages.find((m) => m.role === 'user');
+    expect(lastUser?.meta?.intent?.state).toBe('queued');
+
+    // Two more polls, still queued: the turn keeps saying so and nothing
+    // escalates — no Retry, no "checking", no attach.
+    for (let i = 0; i < 2; i += 1) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(8000);
+      });
+      await settle();
+    }
+    expect(screen.getByTestId('turn-queued')).toBeTruthy();
+    expect(attachAsks).toBe(0);
+
+    // The resume sweep runs the row: `live` turns true and the poll attaches.
+    const live = sse();
+    wire.request = async () => queuedReport(true);
+    wire.attach = async () => streamReply(live);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(8000);
+    });
+    await waitFor(() => expect(attachAsks).toBe(1));
+    await act(async () => {
+      live.send('meta', { generation_id: 'g1', intent_id: 'i1', attempt: 2 });
+      live.send('token', { text: 'Back, and answered.' });
+      live.send('done', {});
+      live.close();
+    });
+    await settle();
+    expect(answers().join(' ')).toContain('Back, and answered.');
+    expect(notice()).toBeNull();
+    expect(screen.queryByTestId('turn-queued')).toBeNull();
+  });
+
+  it('a live stream that is parked shows the server sentence, no failure, and no Retry', async () => {
+    const s = sse();
+    wire.chat = async () => streamReply(s);
+    renderApp(ChatApp, Providers);
+    await settle();
+    await pressSend('slow question');
+    await settle();
+    const intent = String(chatPosts[0].intent_id);
+    await act(async () => {
+      s.send('meta', { generation_id: 'g1', intent_id: intent, attempt: 1 });
+      s.send('status', { text: QUEUED_LINE });
+    });
+    // The queued line renders as the live status — not the generic wait.
+    // A second event rides the frame clock, and jsdom's frame is an
+    // interval — the one timer this file fakes — so it is stepped.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(50);
+    });
+    expect(screen.getByText(QUEUED_LINE)).toBeTruthy();
+    expect(screen.queryByLabelText('Waiting for the first token')).toBeNull();
+
+    wire.request = async () => queuedReport(false);
+    await act(async () => {
+      s.send('error', { message: EXPIRED_LINE, code: 'MODEL_RECOVERING', resumable: true });
+      s.close();
+    });
+    await settle();
+    const status = screen.getByTestId('queued-turn');
+    expect(status.textContent).toContain(EXPIRED_LINE);
+    expect(status.textContent).toContain('Waiting for the main model to recover…');
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Retry' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Resume' })).toBeNull();
+    expect(notice()).toBeNull();
+    // RC-2: the empty placeholder was not stored as an answer; the send was.
+    expect(
+      saves.some((save) =>
+        save.messages.some((m) => m.role === 'assistant' && m.content.trim() === ''),
+      ),
+    ).toBe(false);
+    const lastUser = saves.at(-1)!.messages.find((m) => m.role === 'user');
+    expect(lastUser?.meta?.intent).toMatchObject({ state: 'queued', reason: EXPIRED_LINE });
+    // The composer is free: a parked request locks nothing.
+    expect((box() as HTMLTextAreaElement).disabled).toBe(false);
+  });
+});
+
+/* ====================================================================== */
 /* 10. The conditional history write                                      */
 /* ====================================================================== */
 

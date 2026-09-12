@@ -211,6 +211,16 @@ services:
       # composer hides the picker when this is false (folded into /auth/me).
       # Every other VIDEO_* knob reaches the container through env_file.
       VIDEO_ANALYSIS_ENABLED: ${VIDEO_ANALYSIS_ENABLED:-false}
+      # NEVER THE WORKER SENTINEL'S RESTART TOKEN. `env_file` above feeds
+      # `.env` to this service wholesale, and an operator may set
+      # CLUSTER_SENTINEL_TOKEN there to bring their own (the launcher copies
+      # it into .runtime/controller.env, the one layer the engine-controller
+      # service reads). `environment:` OVERRIDES `env_file`, so this literal
+      # blank is what keeps the value that authorises POST /restart of the
+      # worker rank out of the process that handles untrusted input --
+      # `docker inspect` of this container shows the key empty whatever .env
+      # says (review round 2). Nothing in the orchestrator reads it.
+      CLUSTER_SENTINEL_TOKEN: ""
     volumes:
       - data:/data
       # The Salesforce brain packs, read-only and LIVE: core/brain.py re-reads

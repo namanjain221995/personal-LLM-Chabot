@@ -81,6 +81,18 @@ services:
     network_mode: host
     shm_size: 8g
     ipc: host
+    # CORE DUMPS OFF, THE ONLY WAY THAT WORKS WITH APPORT (contract §6.5).
+    # Same vLLM image class as the main engine, same failure: the host's
+    # core_pattern is a PIPE to apport, and apport 2.28.3 reads the whole
+    # core into its report regardless of the limit -- `core: 0` does NOT
+    # stop it. RLIMIT_CORE == 1 does: the kernel aborts a pipe dump
+    # ("RLIMIT_CORE is set to 1, aborting core", fs/coredump.c) BEFORE
+    # apport is spawned. Measured on the same image and a 1.5 GB heap:
+    # unlimited = 18.3 s held + a 4.2 MB report; 1 = 1.28 s, no report.
+    ulimits:
+      core:
+        soft: 1
+        hard: 1
     restart: unless-stopped
     healthcheck:
       # Probes the address the server ACTUALLY binds, by reading the same two

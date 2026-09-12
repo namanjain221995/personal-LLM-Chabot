@@ -30,9 +30,12 @@ their step events through `ctx.progress_stage`). The runner itself runs
 SUBPROCESS: argument array, scrubbed environment, RLIMIT_AS/RLIMIT_CPU,
 wall-clock timeout that kills the process group), `validate` (the render
 report reread; every file present, non-empty, under MAX_FILE_BYTES, its
-sha256 recomputed), `preview` (page 1 rasterised at both PREVIEW_WIDTHS so
-the card has a thumbnail; the rest on demand), then publishes: manifest,
-atomic rename, and the version/artifact/job rows in one transaction.
+sha256 recomputed, a CSV's rows counted, and its `file_id` minted here
+from (artifact, version, role, format, sheet) — CONTRACT-2 §2 — never
+taken from the worker), `preview` (page 1 rasterised at both
+PREVIEW_WIDTHS so the card has a thumbnail; the rest on demand), then
+publishes: manifest, atomic rename, and the version/artifact/job rows in
+one transaction.
 
 ONE JOB AT A TIME (ARTIFACT_MAX_CONCURRENT_JOBS=1). Rendering is CPU-bound
 (python-docx, python-pptx, WeasyPrint, matplotlib) and runs in a child
@@ -275,6 +278,11 @@ class _Ctx:
         return self.material
 
 
+#: Kept as a name here for the callers that import it; the constant lives
+#: with the other scratch in store.py, where SCRATCH_NAMES can see it.
+TRANSFORM_NAME = store.TRANSFORM_NAME
+
+
 def _material(data: Optional[dict]) -> dict:
     """The conversation-derived material, with every key present. This is
     the shape material.json takes and the shape the composer reads back, so
@@ -290,6 +298,10 @@ def _material(data: Optional[dict]) -> dict:
         "uploads_text": str(data.get("uploads_text") or ""),
         "notes": [str(n) for n in (data.get("notes") or []) if str(n).strip()],
         "salesforce": data.get("salesforce") if isinstance(data.get("salesforce"), dict) else {},
+        # CONTRACT-2: the exact count the person asked for, and what the
+        # engine's table parser did — both must survive a requeue.
+        "row_count": int(data["row_count"]) if str(data.get("row_count") or "").isdigit() else None,
+        "transform": dict(data["transform"]) if isinstance(data.get("transform"), dict) else {},
     }
 
 
@@ -382,6 +394,17 @@ class ComposeContext:
         """A correction or caveat worth showing on the card."""
         if text and text not in self._ctx.warnings:
             self._ctx.warnings.append(str(text)[:300])
+
+    def record_transform(self, transform: Optional[dict]) -> None:
+        """What code did to the data (rows copied, blanks kept, hosts
+        forward-filled, comments rewritten) — kept beside the spec as
+        transform.json so the render stage, which may run in another
+        attempt after a restart, can print it in the Word/PDF methodology
+        note. Until 2026-09-12 the report reached the sentence but never
+        the render job. Scratch (store.SCRATCH_NAMES): it is read by the
+        render stage and by nothing after publication."""
+        if isinstance(transform, dict) and transform:
+            store.write_json(os.path.join(self._ctx.work_dir, store.TRANSFORM_NAME), dict(transform))
 
     async def progress(self, percent: Optional[float], detail: str) -> None:
         await self._progress(percent, detail)
@@ -484,6 +507,13 @@ def is_running(job_id: str) -> bool:
     return task is not None and not task.done()
 
 
+def _held_jobs() -> List[str]:
+    """The jobs this process has a live task for — running a stage, or
+    parked on the render slot. What the lapsed-lease pass and the sweep
+    must leave alone, whatever the row's timestamps say."""
+    return [jid for jid, task in _tasks.items() if not task.done()]
+
+
 async def ensure_running(job_id: str) -> bool:
     """Start the job for this row unless it is running or already terminal.
 
@@ -544,6 +574,31 @@ _make_key = idempotency_key
 def _input_hash(instruction: str, formats: Sequence[str], effort: str, template_id: str, parent: Optional[Tuple[str, int]]) -> str:
     raw = "\x1f".join([" ".join((instruction or "").split()).lower(), ",".join(formats), effort or "", template_id or "", f"{parent[0]}:{parent[1]}" if parent else ""])
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
+def refuse_over_budget(user_id: int) -> None:
+    """The three refusals every new attempt meets — accept() and retry()
+    alike. Blocking. The volume's free space; the person's published bytes
+    (ARTIFACT_USER_QUOTA_MB); and their work in flight: the quota sees
+    published bytes only, and a person who could queue fifty Max-effort
+    jobs would hold the one render slot and the shared engine against
+    everyone else (review, 2026-09-11) — a small per-person ceiling on
+    queued + running jobs. Until 2026-09-12 only accept() asked; retry()
+    put a failed row straight back in the queue, so a model outage (which
+    fails every job as dependency_unavailable after three deferrals) let
+    anyone requeue all of theirs at once past the ceiling, and an
+    over-quota person kept publishing bytes through retries (security
+    review 2026-09-12)."""
+    if not store.free_space_ok():
+        raise ArtifactRefused("storage_failure", "The reports volume is out of space.")
+    if not store.quota_ok(user_id):
+        raise ArtifactRefused("quota_exceeded", safe_error("quota_exceeded"))
+    open_jobs = db.count_open_jobs(int(user_id))
+    if open_jobs >= max(1, int(settings.artifact_max_open_jobs_per_user)):
+        raise ArtifactRefused(
+            "quota_exceeded",
+            f"You already have {open_jobs} document(s) being built. Wait for them to finish, or cancel one, and try again.",
+        )
 
 
 def accept(
@@ -612,20 +667,7 @@ def accept(
         existing["created"] = False
         return existing
 
-    if not store.free_space_ok():
-        raise ArtifactRefused("storage_failure", "The reports volume is out of space.")
-    if not store.quota_ok(user_id):
-        raise ArtifactRefused("quota_exceeded", safe_error("quota_exceeded"))
-    # Work in flight counts too: the quota above sees published bytes only,
-    # and a person who could queue fifty Max-effort jobs would hold the one
-    # render slot and the shared engine against everyone else (review,
-    # 2026-09-11). A small per-person ceiling on queued + running jobs.
-    open_jobs = db.count_open_jobs(int(user_id))
-    if open_jobs >= max(1, int(settings.artifact_max_open_jobs_per_user)):
-        raise ArtifactRefused(
-            "quota_exceeded",
-            f"You already have {open_jobs} document(s) being built. Wait for them to finish, or cancel one, and try again.",
-        )
+    refuse_over_budget(int(user_id))
 
     job_id = uuid.uuid4().hex
     artifact_id = parent[0] if parent is not None else uuid.uuid4().hex
@@ -685,8 +727,56 @@ async def cancel(job_id: str, user_id: int) -> Optional[dict]:
     return row
 
 
+#: What a retry answers when the sweep has taken the working directory the
+#: attempt would compose from. A sentence, not a category name: it is
+#: what the card shows.
+RETRY_SOURCE_GONE = "This request can no longer be retried — please ask for it again."
+
+
+def _retry_has_its_source(row: dict) -> bool:
+    """Whether another attempt of this job composes from what the turn
+    gathered. A convert re-renders its parent's stored spec and reads no
+    material; a version already on disk owes only its bookkeeping; a job
+    whose compose stage is cached (its stamp AND spec.json — the resume
+    rule) needs no material either. Otherwise material.json must still be
+    in the working directory. Until 2026-09-12 a retry pressed a day after
+    the failure — the sweep having removed v<N>.tmp — composed from EMPTY
+    material and handed over a document written from the instruction alone,
+    with no word that the conversation, uploads and pasted table it was
+    meant to use were gone (security review 2026-09-12)."""
+    if str(row.get("operation") or "create") == "convert":
+        return True
+    user_id, artifact_id, version = int(row["user_id"]), str(row["artifact_id"]), int(row["version"])
+    if store.is_published(user_id, artifact_id, version):
+        return True
+    work_dir = store.version_workdir(user_id, artifact_id, version)
+    stages = dict((row.get("progress") or {}).get("stages") or {})
+    compose_cached = (stages.get("compose") or {}).get("status") == "done" and os.path.isfile(os.path.join(work_dir, T.SPEC_NAME))
+    return compose_cached or os.path.isfile(os.path.join(work_dir, store.MATERIAL_NAME))
+
+
+def _check_retry(row: dict) -> None:
+    """Everything a retry must pass BEFORE its row moves (blocking): the
+    refusals an acceptance meets, then that there is something to compose
+    from. Raises ArtifactRefused; the row is left exactly as it was."""
+    refuse_over_budget(int(row["user_id"]))
+    if not _retry_has_its_source(row):
+        raise ArtifactRefused("source_unavailable", RETRY_SOURCE_GONE)
+
+
 async def retry(job_id: str, user_id: int) -> Optional[dict]:
-    """A failed job, back in the queue for the SAME version; started at once."""
+    """A failed job, back in the queue for the SAME version; started at
+    once. None for a job that is not the caller's; a job in any state but
+    'failed' is handed back untouched (the API says 409 for a finished
+    one). A failed job is refused — `ArtifactRefused`, nothing written —
+    exactly where accept() would refuse a new one (`refuse_over_budget`),
+    and when the sweep has taken what it would compose from."""
+    row = await core_db.run_in_thread(db.get_job, str(job_id), int(user_id))
+    if row is None:
+        return None
+    if row.get("status") != "failed":
+        return row
+    await core_db.run_in_thread(_check_retry, row)
     row = await core_db.run_in_thread(db.retry_job, str(job_id), int(user_id))
     if row is None:
         return None
@@ -695,24 +785,102 @@ async def retry(job_id: str, user_id: int) -> Optional[dict]:
     return row
 
 
+def _int_or_none(value: Any) -> Optional[int]:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _file_role(kind: str, fmt: str, given: Any = None) -> str:
+    """The role a file plays in its version (CONTRACT-2 §2): the render
+    report's word when it is one of types.FILE_ROLES, else derived from
+    the kind — its native format (the first of FORMATS_FOR_KIND) is
+    `primary`, a csv is `data`, any other format `companion`. The derived
+    rule is what a legacy row (no role stored) gets in ref_for."""
+    role = str(given or "")
+    if role in T.FILE_ROLES:
+        return role
+    if fmt == "csv":
+        return "data"
+    native = (T.FORMATS_FOR_KIND.get(kind) or ("",))[0]
+    return "primary" if fmt == native else "companion"
+
+
+def _file_ref(f: dict, artifact_id: str, version: int, kind: str, title: str) -> Optional[T.FileRef]:
+    """A stored file dict as the FileRef the wire carries — UPGRADED when
+    the row predates file ids (CONTRACT-2 §2): the id is minted here from
+    (artifact, version, role, format) exactly as the pipeline would have
+    minted it, the role from the kind's native format, the title from the
+    version, rows/columns None. A row that carries an id keeps it — a
+    history reload and a fresh publish agree on every id.
+
+    None for an entry whose `size` is not a number (text like "abc" or
+    "4021.0", a list): the caller skips it. A missing or empty size is the
+    legacy shape and reads as 0, as it always did."""
+    fmt = str(f.get("format") or "")
+    role = _file_role(kind, fmt, f.get("role"))
+    file_id = str(f.get("file_id") or "")
+    if not T.is_file_id(file_id):
+        sheet = str(f.get("sheet") or "") if role == "data" else ""
+        file_id = T.file_id_for(artifact_id, version, role, fmt, sheet)
+    raw_size = f.get("size")
+    size = 0 if raw_size is None or raw_size == "" else _int_or_none(raw_size)
+    if size is None or size < 0:
+        return None
+    return T.FileRef(
+        format=fmt, filename=str(f.get("filename") or ""),
+        mime_type=str(f.get("mime_type") or T.MIME_TYPES.get(fmt, "application/octet-stream")),
+        size=size, sha256=str(f.get("sha256") or ""),
+        pages=_int_or_none(f.get("pages")), slides=_int_or_none(f.get("slides")), sheets=_int_or_none(f.get("sheets")),
+        file_id=file_id, role=role, title=str(f.get("title") or title or ""),
+        rows=_int_or_none(f.get("rows")), columns=_int_or_none(f.get("columns")),
+    )
+
+
+def _file_refs(version: dict, artifact_id: str, version_number: int, kind: str, title: str) -> List[T.FileRef]:
+    """The version row's `files` as FileRefs — every entry that can be
+    described, and a log line for each that cannot. Until 2026-09-12 one
+    entry whose size was text (a bad migration, a manual edit, a writer
+    that stores size as text) raised out of `int()` here and took the
+    version, its files, the listing, the artifact and the job routes down
+    with a 500; a non-dict entry was dropped without a word (security
+    review 2026-09-12). Nothing a caller of the API can put here: the rows
+    are written by the pipeline alone."""
+    raw = version.get("files")
+    if raw and not isinstance(raw, list):
+        log.warning("artifact %s v%d: the files column is malformed (%s, not a list); no file is served", artifact_id[:8], version_number, type(raw).__name__)
+        return []
+    files: List[T.FileRef] = []
+    for index, entry in enumerate(raw or []):
+        ref = _file_ref(entry, artifact_id, version_number, kind, title) if isinstance(entry, dict) else None
+        if ref is None:
+            what = f"size {entry.get('size')!r}" if isinstance(entry, dict) else type(entry).__name__
+            log.warning("artifact %s v%d: files entry %d is malformed (%s); skipped", artifact_id[:8], version_number, index, what)
+            continue
+        files.append(ref)
+    return files
+
+
 def ref_for(job: dict, version: Optional[dict] = None) -> T.ArtifactRef:
     """The ArtifactRef for a job row (with `kind`/`title` joined by load_job)
-    and, when published, its version row."""
+    and, when published, its version row. Every file on the wire carries
+    `file_id`, `role` and `title`, a legacy row's synthesised (`_file_ref`);
+    an entry that cannot be described is skipped (`_file_refs`)."""
     version = version or {}
-    files = [
-        T.FileRef(
-            format=str(f.get("format")), filename=str(f.get("filename")), mime_type=str(f.get("mime_type") or T.MIME_TYPES.get(str(f.get("format")), "application/octet-stream")),
-            size=int(f.get("size") or 0), sha256=str(f.get("sha256") or ""),
-            pages=f.get("pages"), slides=f.get("slides"), sheets=f.get("sheets"),
-        )
-        for f in (version.get("files") or [])
-    ]
+    artifact_id = str(job["artifact_id"])
+    version_number = int(job["version"])
+    title = str(version.get("title") or job.get("title") or "")
+    kind = str(version.get("kind") or job.get("kind") or "document")
+    files = _file_refs(version, artifact_id, version_number, kind, title)
     return T.ArtifactRef(
-        artifact_id=str(job["artifact_id"]),
-        version=int(job["version"]),
+        artifact_id=artifact_id,
+        version=version_number,
         job_id=str(job["id"]),
-        title=str(version.get("title") or job.get("title") or ""),
-        kind=str(version.get("kind") or job.get("kind") or "document"),
+        title=title,
+        kind=kind,
         status=str(job.get("status") or "queued"),
         files=files,
         preview_kind=str(version.get("preview_kind") or "none"),
@@ -869,6 +1037,16 @@ async def _heartbeat(job_id: str, run: "asyncio.Task[None]") -> None:
     one's lease lapsed; two runs would now race for the same working
     directory, so this one stands down. A row that turned `cancelled` under
     us (the API in another process) stops the run the same way.
+
+    A row that turned `queued` under us was requeued by ANOTHER process's
+    lapsed-lease pass (this one's leaves a row it holds alone — db.
+    requeue_lapsed): our beat was late, not dead. The run stands down
+    CLEANLY — no terminal event, the lease released by _run's exit — and
+    the next attempt is started once it has, from the stages on disk (the
+    chat turn's 30 s re-kick and the drain would find it too). Until
+    2026-09-12 the run went on, publish_version refused the 'queued' row
+    and the card was told 'cancelled' about a version that was on disk
+    (security review 2026-09-12).
     """
     ttl = float(settings.artifact_lease_ttl_s)
     interval = max(1.0, ttl / 3.0)
@@ -884,8 +1062,20 @@ async def _heartbeat(job_id: str, run: "asyncio.Task[None]") -> None:
             log.warning("artifact job %s: the lease was taken by another owner; standing down", job_id[:8])
             run.cancel()
             return
-        if row is not None and row.get("status") == "cancelled":
+        status = str((row or {}).get("status") or "")
+        if status == "cancelled":
             log.info("artifact job %s: cancelled by its owner; stopping", job_id[:8])
+            run.cancel()
+            return
+        if status == "queued":
+            log.warning("artifact job %s: requeued by another process while this one ran it (a late heartbeat); standing down for the next attempt", job_id[:8])
+            metrics.inc("artifact_lease_requeued_total", "artifact runs stood down because their row was requeued under them")
+            loop = asyncio.get_running_loop()
+            # Once the run has exited (lease released): the next attempt,
+            # here or wherever the lease goes first. Not during a shutdown.
+            run.add_done_callback(
+                lambda _t: None if loop.is_closed() else loop.create_task(ensure_running(job_id), name=f"artifact-rerun-{job_id[:8]}")
+            )
             run.cancel()
             return
 
@@ -1315,7 +1505,11 @@ async def _stage_render(runner: _Runner, ctx: _Ctx, progress) -> _StageResult:
     title_slug = T.slug_for(spec.title)
     await progress(5.0, f"{', '.join(formats)} · {settings.artifact_render_timeout_s:.0f}s budget")
     render_started = time.perf_counter()
-    report = await _render_in_subprocess(ctx.work_dir, spec, formats, title_slug, int(ctx.job["version"]), str(ctx.job.get("effort") or "fast"))
+    transform = await asyncio.to_thread(store.read_json, os.path.join(ctx.work_dir, store.TRANSFORM_NAME))
+    # The keyword travels only when there is a report: the render function
+    # is replaced in every test suite by writers that predate it.
+    extra = {"transform": transform} if isinstance(transform, dict) and transform else {}
+    report = await _render_in_subprocess(ctx.work_dir, spec, formats, title_slug, int(ctx.job["version"]), str(ctx.job.get("effort") or "fast"), **extra)
     if not isinstance(report, dict):
         raise RenderFailed("renderer_failure", safe_error("renderer_failure"))
     report = dict(report)
@@ -1337,7 +1531,10 @@ async def _stage_validate(runner: _Runner, ctx: _Ctx, progress) -> _StageResult:
     report = ctx.load_report()
     spec = ctx.load_spec()
     selected = [f for f in (ctx.job.get("selected_formats") or []) if f in T.FORMATS_FOR_KIND[spec.kind]]
-    checked = await asyncio.to_thread(_validate_files, ctx.work_dir, report, selected, spec.title, int(ctx.job["version"]))
+    checked = await asyncio.to_thread(
+        _validate_files, ctx.work_dir, report, selected, spec.title, int(ctx.job["version"]),
+        artifact_id=str(ctx.job["artifact_id"]), spec=spec,
+    )
     problems: List[str] = checked["problems"]
     if problems:
         raise StageFailure("validation_failure", safe_error("validation_failure", problems[0]))
@@ -1357,21 +1554,70 @@ async def _stage_validate(runner: _Runner, ctx: _Ctx, progress) -> _StageResult:
     return _StageResult("done", detail)
 
 
-def _validate_files(work_dir: str, report: dict, selected: Sequence[str], title: str, version: int) -> dict:
+def _generator_rows(spec: Optional[ArtifactSpec]) -> Dict[str, int]:
+    """Sheet name (folded) → the row count its generator promised. Only a
+    workbook has these; only a sheet whose rows are code-made from a
+    generator has a number the file MUST match (CONTRACT-2 §11)."""
+    out: Dict[str, int] = {}
+    sheets = getattr(getattr(spec, "body", None), "sheets", None) or []
+    for sheet in sheets:
+        gen = getattr(sheet, "generator", None)
+        if gen is not None and getattr(gen, "rows", None):
+            out[str(sheet.name).strip().lower()] = int(gen.rows)
+    return out
+
+
+def _csv_data_rows(path: str) -> int:
+    """The data rows of a CSV (the header excluded), counted by the stdlib
+    reader in one pass: the number a person was promised, read from the
+    bytes that will be served — never from what the renderer said."""
+    import csv
+
+    count = 0
+    with open(path, "r", encoding="utf-8", errors="strict", newline="") as fh:
+        for index, _record in enumerate(csv.reader(fh)):
+            if index:
+                count += 1
+    return count
+
+
+def _validate_files(work_dir: str, report: dict, selected: Sequence[str], title: str, version: int, *,
+                    artifact_id: str = "", spec: Optional[ArtifactSpec] = None) -> dict:
     """Blocking: reopen-by-stat every file the render report names. The
-    renderer already reopened them structurally (page counts, zip parts);
-    this is the runner's independent check that what it is about to publish
-    is there, non-empty, within the ceiling, hashes to what was claimed —
-    and is NAMED what the contract names it, types.download_name(title,
-    version, fmt). The version row records the filename verbatim and
-    store.resolve_version_file refuses a name whose extension is not the
-    format, so a report naming e.g. 'spec.json.bak' for pdf used to publish
-    a COMPLETED version whose download and inline URLs 404'd."""
+    renderer already reopened them structurally (page counts, zip parts,
+    row counts); this is the runner's independent check that what it is
+    about to publish is there, non-empty, within the ceiling, hashes to
+    what was claimed — and is NAMED what the contract names it:
+    types.download_name(title, version, fmt) for the kind's native file and
+    its companions, download_name(..., part=<sheet>) for the per-sheet CSV
+    of a workbook (CONTRACT-2 §2). The version row records the filename
+    verbatim and store.resolve_version_file refuses a name whose extension
+    is not the format, so a report naming e.g. 'spec.json.bak' for pdf used
+    to publish a COMPLETED version whose download and inline URLs 404'd.
+
+    IDENTITY IS MINTED HERE. `file_id` = types.file_id_for(artifact_id,
+    version, role, format, sheet) — from what the file IS, so a retry and a
+    re-render agree on it — and an id the worker wrote into its report is
+    ignored. One file per (role, format, sheet); the role comes from the
+    report when it names one (`_file_role`). `rows`, `columns` and the
+    file's `title` (the sheet's, for a data file) ride into the FileRef.
+
+    BELT AND BRACES (§11): a CSV's data rows are counted from the bytes,
+    and a count that differs from what the renderer reported, or from the
+    rows the spec's generator promised for that sheet, is a
+    validation_failure with both numbers — "exactly 500 rows" is checked
+    by the process that publishes, not only by the one that rendered."""
     files: List[dict] = []
     problems: List[str] = []
     warnings: List[str] = []
     seen_formats: List[str] = []
+    seen_keys: List[Tuple[str, str, str]] = []
+    kind = str(getattr(spec, "kind", "") or report.get("kind") or "document")
+    promised = _generator_rows(spec)
     real_root = os.path.realpath(work_dir)
+    # A per-sheet CSV is titled by its sheet only when there is more than
+    # one (a one-sheet workbook's CSV is the workbook, not "Book — Sheet1").
+    data_files = sum(1 for e in (report.get("files") or []) if isinstance(e, dict) and str(e.get("role") or "") == "data")
     for entry in report.get("files") or []:
         if not isinstance(entry, dict):
             continue
@@ -1380,9 +1626,17 @@ def _validate_files(work_dir: str, report: dict, selected: Sequence[str], title:
         if fmt not in T.FORMATS or not filename:
             problems.append(f"the renderer named a file it may not write ({fmt or 'unknown format'})")
             continue
-        expected = T.download_name(title, version, fmt)
-        if filename != expected:
-            problems.append(f"the {fmt} file is not named {expected}")
+        role = _file_role(kind, fmt, entry.get("role"))
+        sheet = str(entry.get("sheet") or "").strip() if role == "data" else ""
+        expected = [T.download_name(title, version, fmt)]
+        if sheet:
+            expected.append(T.download_name(title, version, fmt, part=sheet))
+        if filename not in expected:
+            problems.append(f"the {fmt} file is not named {' or '.join(expected)}")
+            continue
+        key = (role, fmt, sheet.lower())
+        if key in seen_keys:
+            problems.append(f"the renderer named two {fmt} files for the same {role}{' sheet ' + sheet if sheet else ''}")
             continue
         path = os.path.realpath(os.path.join(work_dir, filename))
         if not path.startswith(real_root + os.sep):
@@ -1404,13 +1658,42 @@ def _validate_files(work_dir: str, report: dict, selected: Sequence[str], title:
         if claimed and claimed != digest:
             problems.append(f"the {fmt} file changed after it was rendered")
             continue
+        rows = _int_or_none(entry.get("rows"))
+        columns = _int_or_none(entry.get("columns"))
+        if fmt == "csv":
+            try:
+                counted = _csv_data_rows(path)
+            except (OSError, ValueError, UnicodeDecodeError):
+                problems.append(f"the csv file{' for ' + sheet if sheet else ''} could not be read back")
+                continue
+            if rows is not None and rows != counted:
+                problems.append(f"the csv file{' for ' + sheet if sheet else ''} has {counted:,} data rows; the renderer reported {rows:,}")
+                continue
+            rows = counted
+            wanted = promised.get(sheet.lower()) if sheet else (next(iter(promised.values())) if len(promised) == 1 else None)
+            if wanted is not None and rows != wanted:
+                problems.append(f"the csv file{' for ' + sheet if sheet else ''} has {rows:,} data rows; {wanted:,} were asked for")
+                continue
+        label = str(entry.get("title") or "").strip() or sheet
+        if role == "data" and label and label != title and data_files > 1:
+            # "<title> — <sheet>" (CONTRACT-2 §2): composed here from the
+            # sheet name the renderer reports; a label the renderer already
+            # composed is kept as it is, and a sheet whose name merely
+            # starts with the artifact title is still a sheet (the review
+            # of 2026-09-12 found the old startswith rule collapsing it).
+            file_title = label if label.startswith(f"{title} — ") else f"{title} — {label}"
+        else:
+            file_title = title
         ref = T.FileRef(
             format=fmt, filename=filename, mime_type=T.MIME_TYPES.get(fmt, "application/octet-stream"),
             size=int(size), sha256=digest,
-            pages=entry.get("pages"), slides=entry.get("slides"), sheets=entry.get("sheets"),
+            pages=_int_or_none(entry.get("pages")), slides=_int_or_none(entry.get("slides")), sheets=_int_or_none(entry.get("sheets")),
+            file_id=T.file_id_for(artifact_id, version, role, fmt, sheet) if artifact_id else "",
+            role=role, title=file_title, rows=rows, columns=columns,
         )
         files.append(ref.to_json())
         seen_formats.append(fmt)
+        seen_keys.append(key)
     for fmt in selected:
         if fmt not in seen_formats:
             problems.append(f"the {fmt} file was not produced")
@@ -1439,11 +1722,24 @@ def _preview_pdf_path(work_dir: str, preview_pdf: Any) -> Optional[str]:
 
 
 async def _stage_preview(runner: _Runner, ctx: _Ctx, progress) -> _StageResult:
+    """Page 1 of preview.pdf at both PREVIEW_WIDTHS, and the page count the
+    viewer may ask for. For a `pages` version the PDF is the document; a
+    version without one becomes `none` with a warning. For a `grid`
+    version (a workbook) the real preview is the sheet grid, but when the
+    render left a preview.pdf — the Word/PDF companion of the workbook, or
+    the summary sheet — its pages are counted and its first page
+    rasterised exactly as for a pages version, so the card has a thumbnail
+    and the companion is previewable (types.ArtifactRef links a pdf/docx
+    companion of a grid version to /preview only while preview_pages > 0).
+    `preview_kind` stays `grid`; with no PDF the companion is download-only
+    and nothing is warned about — the grid is the preview."""
     report = ctx.load_report()
     preview_kind = str(report.get("preview_kind") or "none")
+    if preview_kind not in ("pages", "grid"):
+        preview_kind = "none"
     preview_pages = 0
     thumbnails: List[str] = []
-    if preview_kind == "pages":
+    if preview_kind != "none":
         pdf = _preview_pdf_path(ctx.work_dir, report.get("preview_pdf"))
         if pdf is not None and os.path.isfile(pdf) and os.path.getsize(pdf) > 0:
             try:
@@ -1462,18 +1758,16 @@ async def _stage_preview(runner: _Runner, ctx: _Ctx, progress) -> _StageResult:
                         log.warning("artifact job %s: thumbnail at %d px failed: %s", runner.job_id[:8], width, type(exc).__name__)
                         ctx.warnings.append("the card's thumbnail could not be made")
                         break
-        else:
+        elif preview_kind == "pages":
             preview_kind = "none"
             ctx.warnings.append("no page preview could be made for this version")
-    elif preview_kind == "grid":
-        preview_pages = int(report.get("preview_pages") or 0)
-    else:
-        preview_kind = "none"
     meta = {"preview_kind": preview_kind, "preview_pages": preview_pages, "thumbnails": thumbnails}
     await asyncio.to_thread(store.write_json, os.path.join(ctx.work_dir, store.PREVIEW_META_NAME), meta)
     if preview_kind == "pages":
         return _StageResult("done", f"{preview_pages} page(s) · thumbnail {'ready' if thumbnails else 'missing'}")
-    return _StageResult("done", "grid preview" if preview_kind == "grid" else "no preview for this kind")
+    if preview_kind == "grid":
+        return _StageResult("done", f"grid preview · {preview_pages} companion page(s)" if preview_pages else "grid preview")
+    return _StageResult("done", "no preview for this kind")
 
 
 _STAGE_FNS = {
@@ -1552,7 +1846,8 @@ def _kill_group(proc: "asyncio.subprocess.Process") -> None:
             pass
 
 
-async def _render_in_subprocess(work_dir: str, spec: ArtifactSpec, formats: Sequence[str], title_slug: str, version: int, effort: str) -> dict:
+async def _render_in_subprocess(work_dir: str, spec: ArtifactSpec, formats: Sequence[str], title_slug: str, version: int, effort: str,
+                                *, transform: Optional[dict] = None) -> dict:
     """Run `python -m app.artifacts.render.worker <job.json>` in a child
     process and return its render report as a dict.
 
@@ -1572,6 +1867,7 @@ async def _render_in_subprocess(work_dir: str, spec: ArtifactSpec, formats: Sequ
         "title_slug": title_slug,
         "version": int(version),
         "effort": effort,
+        **({"transform": dict(transform)} if transform else {}),
     })
     try:
         os.unlink(report_path)
@@ -1631,7 +1927,7 @@ async def start() -> None:
         _maintenance = asyncio.get_running_loop().create_task(_sweep_only_loop(), name="artifact-sweep")
         return
     try:
-        requeued = await core_db.run_in_thread(db.requeue_lapsed)
+        requeued = await core_db.run_in_thread(db.requeue_lapsed, owner=_OWNER, held=_held_jobs())
         if requeued:
             log.info("requeued %d artifact job(s) interrupted by a restart", requeued)
     except Exception:  # noqa: BLE001
@@ -1672,53 +1968,81 @@ async def drain_queue(limit: int = 4) -> int:
     return started
 
 
+def _stamp(value: Any) -> Optional[datetime]:
+    """A row's ISO text timestamp (db._job_row) as an aware datetime; None
+    for an empty or unreadable one."""
+    if not value:
+        return None
+    try:
+        stamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return stamp.replace(tzinfo=timezone.utc) if stamp.tzinfo is None else stamp
+
+
 def _deferred_too_recently(row: dict) -> bool:
     """A row a model outage sent back waits _RETRY_DELAY_S before its next
     try, so a still-down engine is not polled by every maintenance pass; a
     new acceptance is never delayed."""
     if not str(row.get("error") or "").startswith(DEFERRED_MARK):
         return False
-    updated = row.get("updated_at")
-    if not updated:
+    stamp = _stamp(row.get("updated_at"))
+    if stamp is None:
         return False
-    try:
-        stamp = datetime.fromisoformat(str(updated).replace("Z", "+00:00"))
-        if stamp.tzinfo is None:
-            stamp = stamp.replace(tzinfo=timezone.utc)
-        age = (datetime.now(timezone.utc) - stamp).total_seconds()
-    except ValueError:
+    return (datetime.now(timezone.utc) - stamp).total_seconds() < _RETRY_DELAY_S
+
+
+def _lease_live(row: dict) -> bool:
+    """A lease another process (or this one) holds on the row and has not
+    let lapse — a queued row between its claim and mark_running."""
+    if not str(row.get("lease_owner") or ""):
         return False
-    return age < _RETRY_DELAY_S
+    expires = _stamp(row.get("lease_expires_at"))
+    return expires is not None and expires > datetime.now(timezone.utc)
+
+
+#: What the sweep writes on a row that sat in the queue past the TTL.
+NEVER_BUILT = "This document was never built. Please ask for it again."
 
 
 async def sweep() -> int:
     """Remove abandoned working directories older than the TTL — never one
     a job in this process is writing, never one a QUEUED job still needs
     (its material.json is what it will compose from), never a published
-    version."""
+    version.
+
+    A queued row is stale when its LAST CHANGE (updated_at — a retry, a
+    deferral and every heartbeat bump it) is older than the TTL, and only
+    when no runner holds it: not a task in this process (parked on the
+    render slot behind a Max-effort job, or between its claim and
+    mark_running) and not a live lease from another. The write is guarded
+    on the row still being queued. Until 2026-09-12 the age was created_at
+    and the write unconditional: a day-old failure retried while the queue
+    was busy was failed by the next pass as 'never built', and the write
+    landed on a RUNNING row too — the run then found its row failed,
+    publish_version answered 'cancelled', and the version sat on disk with
+    nothing pointing at it (security review 2026-09-12)."""
     keep = set(_workdirs.values())
     ttl_s = float(settings.artifact_tmp_ttl_hours) * 3600.0
     try:
         for job in await core_db.run_in_thread(db.list_jobs, "queued", 500):
-            created = job.get("created_at")  # ISO text from _job_row
-            try:
-                created_dt = datetime.fromisoformat(str(created).replace("Z", "+00:00")) if created else None
-            except ValueError:
-                created_dt = None
-            if created_dt is not None and created_dt.tzinfo is None:
-                created_dt = created_dt.replace(tzinfo=timezone.utc)
-            age = (datetime.now(timezone.utc) - created_dt).total_seconds() if created_dt else 0.0
-            if age > ttl_s:
-                # Queued for longer than the TTL: nothing is going to run it
-                # (the drain would have). Say so on the row, and let its
-                # working directory go with the others.
-                await core_db.run_in_thread(
-                    db.set_job_status, str(job["id"]), "failed",
-                    error="This document was never built. Please ask for it again.",
-                    failure_category="dependency_unavailable", completed=True,
+            job_id = str(job["id"])
+            work_dir = store.version_workdir(int(job["user_id"]), str(job["artifact_id"]), int(job["version"]))
+            stamp = _stamp(job.get("updated_at")) or _stamp(job.get("created_at"))
+            age = (datetime.now(timezone.utc) - stamp).total_seconds() if stamp else 0.0
+            if age > ttl_s and not is_running(job_id) and not _lease_live(job):
+                # Queued for longer than the TTL and nobody has it: nothing
+                # is going to run it (the drain would have). Say so on the
+                # row — if it is still queued — and let its working
+                # directory go with the others.
+                moved = await core_db.run_in_thread(
+                    db.set_job_status, job_id, "failed",
+                    error=NEVER_BUILT, failure_category="dependency_unavailable", completed=True,
+                    only_from=("queued",),
                 )
-                continue
-            keep.add(store.version_workdir(int(job["user_id"]), str(job["artifact_id"]), int(job["version"])))
+                if moved:
+                    continue
+            keep.add(work_dir)
     except Exception:  # noqa: BLE001 — a listing that fails keeps the sweep conservative
         return 0
     return await asyncio.to_thread(store.sweep_abandoned, settings.artifact_tmp_ttl_hours, skip=keep)
@@ -1736,30 +2060,45 @@ async def _sweep_only_loop() -> None:
         await asyncio.sleep(max(60.0, settings.artifact_maintenance_interval_s))
 
 
+#: How often lapsed leases are put back in the queue. One indexed query;
+#: the cost is nothing, the latency is what a person waits after a deploy.
+REQUEUE_INTERVAL_S = 30.0
+
+
 async def _maintenance_loop() -> None:
+    """Two cadences. LAPSED LEASES every REQUEUE_INTERVAL_S: a row left
+    'running' by a process that died comes back to the queue within the
+    lease TTL plus half a minute. Until 2026-09-12 this ran once at startup
+    and then every ARTIFACT_MAINTENANCE_INTERVAL_S (30 minutes): the
+    restart test restarted the orchestrator mid-compose, the startup pass
+    ran BEFORE the dead process's 90 s lease had expired, and the job then
+    sat 'running' for the 15 minutes the test waited — a person would have
+    waited up to 30. THE SWEEP of abandoned working directories keeps the
+    long interval; it walks the reports volume."""
     await asyncio.sleep(5.0)
+    next_sweep = time.monotonic()
     while True:
         try:
-            # A row left 'running' by a process that died (or a runner that
-            # failed before it could write) comes back to the queue here,
-            # every pass — not only at the next restart.
-            lapsed = await core_db.run_in_thread(db.requeue_lapsed)
+            lapsed = await core_db.run_in_thread(db.requeue_lapsed, owner=_OWNER, held=_held_jobs())
             if lapsed:
                 log.warning("artifacts: requeued %d job(s) whose lease had lapsed", lapsed)
-            await drain_queue()
-            removed = await sweep()
-            if removed:
-                log.info("artifacts: swept %d abandoned working directory(ies)", removed)
+                await drain_queue()
+            if time.monotonic() >= next_sweep:
+                await drain_queue()
+                removed = await sweep()
+                if removed:
+                    log.info("artifacts: swept %d abandoned working directory(ies)", removed)
+                next_sweep = time.monotonic() + max(60.0, settings.artifact_maintenance_interval_s)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001
             log.warning("artifact maintenance pass failed", exc_info=True)
-        await asyncio.sleep(max(60.0, settings.artifact_maintenance_interval_s))
+        await asyncio.sleep(REQUEUE_INTERVAL_S)
 
 
 __all__ = [
     "ArtifactRefused", "StageFailure", "RenderFailed", "ComposeContext", "DEFERRED_MARK", "RUNNER_STAGES",
     "set_composer", "install_busy_probe", "pace", "stage_timeout", "idempotency_key", "accept", "cancel", "retry", "ref_for",
-    "ensure_running", "is_running", "wait_for", "subscribe", "unsubscribe",
+    "ensure_running", "is_running", "wait_for", "subscribe", "unsubscribe", "refuse_over_budget", "RETRY_SOURCE_GONE",
     "start", "stop", "drain_queue", "sweep", "reset_for_tests", "render_env", "safe_error",
 ]

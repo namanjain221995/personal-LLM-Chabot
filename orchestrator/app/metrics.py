@@ -15,7 +15,7 @@ Every function is called from request paths and must never raise.
 from __future__ import annotations
 
 import threading
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, List, Tuple
 
 _lock = threading.Lock()
 
@@ -30,6 +30,25 @@ _TYPE: Dict[str, str] = {}
 
 #: Seconds. Tuned for retrieval and small fetches, not for model generation.
 _BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0)
+
+#: Seconds, for the waits of the availability programme (docs/availability/
+#: CONTRACT.md §7.2): a generation queued for a recovering engine waits
+#: minutes, not milliseconds — a TP=2 reload measured 3 m 32 s warm and
+#: 5 m 20 s cold, the queue window is 900 s — and on the default buckets every
+#: such wait landed in +Inf, which is no histogram at all (review manifest
+#: §13.4). Ends at the queue window plus the long recovery window.
+_WAIT_BUCKETS = (1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 900.0, 1200.0, 1800.0)
+
+#: Histograms whose observations are engine waits use the wide buckets.
+_BUCKETS_BY_METRIC = {
+    "llm_engine_wait_seconds": _WAIT_BUCKETS,
+    "llm_queue_wait_seconds": _WAIT_BUCKETS,
+    "llm_admission_wait_seconds": _WAIT_BUCKETS,
+}
+
+
+def _buckets_for(name: str) -> Tuple[float, ...]:
+    return _BUCKETS_BY_METRIC.get(name, _BUCKETS)
 
 #: Closed label vocabularies. Anything else becomes "other" rather than a new
 #: series — a typo in a call site must not be able to grow the index.
@@ -67,6 +86,22 @@ _ALLOWED = {
     # migration; anything else folds to "other" rather than minting a series.
     "state": {"queued", "running", "uploading", "finalizing"},
     "job": {"index", "refresh", "expand"},
+    # The circuit breaker in front of the main model engine (app/breaker.py,
+    # docs/availability/CONTRACT.md §7.2): llm_breaker_state{engine},
+    # llm_breaker_transitions_total{engine,to} and
+    # llm_breaker_failures_total{engine,reason}, plus the durability
+    # ledger's chat_request_attempts_total{engine}. ONE engine exists in
+    # strict one-model mode (CONTRACT v2 §1: nothing stands in for the
+    # TP=2 model) and three breaker states; a base URL or a state string
+    # that is neither folds to "other" rather than minting a series.
+    # `reason` and `outcome` are shared with other counters' free
+    # vocabularies, so the availability metrics bound them PER METRIC in
+    # _ALLOWED_BY_METRIC below.
+    "engine": {"main"},
+    "to": {"CLOSED", "OPEN", "HALF_OPEN"},
+    # Long-context admission (app/admission.py, CONTRACT §6.7): the two
+    # lanes of llm_admission_lane_active / _waiting / _wait_seconds.
+    "lane": {"normal", "long"},
     # Video understanding pipeline stages (app/video/types.STAGES). Closed so
     # a renamed stage folds to "other" rather than minting a series.
     "stage": {
@@ -81,8 +116,10 @@ _ALLOWED = {
     },
     # A file format the Artifact Studio writes (app/artifacts/types.FORMATS):
     # artifact_render_seconds{format} and artifact_download_total{format}.
-    # Four values, fixed by the renderer set.
-    "format": {"pdf", "docx", "pptx", "xlsx"},
+    # Five values, fixed by the renderer set (csv since 2026-09-12,
+    # CONTRACT-2 §1), plus "zip" for the download metric only: the bundle
+    # route `GET …/zip` is downloaded and counted, but never rendered.
+    "format": {"pdf", "docx", "pptx", "xlsx", "csv", "zip"},
     # Speech to text. The vocabulary is the ASR model's own published set
     # (app/asr.SUPPORTED_LANGUAGES) plus "unknown" for a clip whose language
     # was not identified. Closed for the usual reason: a mis-parsed engine
@@ -117,10 +154,36 @@ _ALLOWED = {
 }
 
 
-def _clean(labels: Dict[str, str]) -> Tuple[Tuple[str, str], ...]:
+#: Closed vocabularies that hold for ONE metric only — the label name is
+#: shared with counters whose values are free (`reason` on
+#: knowledge_degraded_total, `outcome` on embed_requests_total), so bounding
+#: it globally would fold theirs, and leaving it unbounded would let a typo
+#: in an availability call site mint a series. Every value the availability
+#: modules emit is listed here (CONTRACT §4 for the breaker's reasons, §7.2
+#: for the rest); tests/test_breaker.py pins breaker.REASONS to this set.
+_ALLOWED_BY_METRIC: Dict[str, Dict[str, set]] = {
+    "llm_breaker_failures_total": {
+        "reason": {
+            "connection", "readiness", "request_timeout", "queue_timeout",
+            "engine_dead", "worker_lost", "capacity", "malformed", "cancelled",
+        },
+    },
+    "llm_retry_total": {"reason": {"connection", "engine_error"}},
+    "llm_engine_unavailable_total": {"reason": {"connection", "engine_error", "breaker_open"}},
+    "llm_engine_wait_seconds": {"outcome": {"recovered", "gave_up", "interrupted"}},
+    "llm_resumed_generations_total": {"outcome": {"resumed", "expired", "duplicate_suppressed"}},
+    "llm_admission_rejections_total": {"reason": {"capacity", "timeout"}},
+    # The durability ledger's counter (main._attempt_record): the CONTRACT
+    # §8.4 terminal vocabulary.
+    "chat_request_attempts_total": {"terminal_state": {"completed", "interrupted", "failed", "cancelled"}},
+}
+
+
+def _clean(labels: Dict[str, str], name: str = "") -> Tuple[Tuple[str, str], ...]:
     out = []
+    per_metric = _ALLOWED_BY_METRIC.get(name, {})
     for key, value in sorted(labels.items()):
-        allowed = _ALLOWED.get(key)
+        allowed = per_metric.get(key, _ALLOWED.get(key))
         v = str(value)
         if allowed is not None and v not in allowed:
             v = "other"
@@ -138,7 +201,7 @@ def _declare(name: str, kind: str, help_text: str) -> None:
 def inc(name: str, help_text: str = "", **labels: str) -> None:
     try:
         _declare(name, "counter", help_text or name)
-        key = _clean(labels)
+        key = _clean(labels, name)
         with _lock:
             _counters.setdefault(name, {})
             _counters[name][key] = _counters[name].get(key, 0.0) + 1.0
@@ -149,7 +212,7 @@ def inc(name: str, help_text: str = "", **labels: str) -> None:
 def set_gauge(name: str, value: float, help_text: str = "", **labels: str) -> None:
     try:
         _declare(name, "gauge", help_text or name)
-        key = _clean(labels)
+        key = _clean(labels, name)
         with _lock:
             _gauges.setdefault(name, {})
             _gauges[name][key] = float(value)
@@ -160,12 +223,13 @@ def set_gauge(name: str, value: float, help_text: str = "", **labels: str) -> No
 def observe(name: str, seconds: float, help_text: str = "", **labels: str) -> None:
     try:
         _declare(name, "histogram", help_text or name)
-        key = _clean(labels)
+        key = _clean(labels, name)
+        buckets = _buckets_for(name)
         with _lock:
             _hists.setdefault(name, {})
-            counts, total, n = _hists[name].get(key, ([0] * len(_BUCKETS), 0.0, 0))
+            counts, total, n = _hists[name].get(key, ([0] * len(buckets), 0.0, 0))
             counts = list(counts)
-            for i, edge in enumerate(_BUCKETS):
+            for i, edge in enumerate(buckets):
                 if seconds <= edge:
                     counts[i] += 1
             _hists[name][key] = (counts, total + float(seconds), n + 1)
@@ -269,12 +333,13 @@ def render() -> str:
     for name, series in sorted(hists.items()):
         lines.append(f"# HELP {name} {_HELP.get(name, name)}")
         lines.append(f"# TYPE {name} histogram")
+        buckets = _buckets_for(name)
         for key, (counts, total, n) in sorted(series.items()):
             # The le= label is built OUTSIDE the f-string. A backslash inside
             # an f-string expression is only legal from Python 3.12 (PEP 701),
             # and the containers run 3.11 — this file parsed fine on the dev
             # box and on the 3.12 image, then failed to import in CI.
-            for edge, c in zip(_BUCKETS, counts):
+            for edge, c in zip(buckets, counts):
                 edge_label = 'le="{}"'.format(edge)
                 lines.append(
                     "{}_bucket{} {}".format(name, _fmt_labels(key, edge_label), c)

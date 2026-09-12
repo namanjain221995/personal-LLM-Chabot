@@ -81,6 +81,51 @@ CLUSTER_KV_CACHE_DTYPE = "fp8"
 MINIMUM_MAX_NUM_BATCHED_TOKENS = 256
 DISTRIBUTED_TIMEOUT_SECONDS = 300
 DEFAULT_API_BIND_ADDRESS = "0.0.0.0"
+#: ``--gdn-prefill-backend`` (candidate B, docs/availability/CANDIDATE-B.md).
+#: The flag is spelled the same in the pinned build and in the candidate
+#: ``vllm/vllm-openai@sha256:819ec9c0...`` (``engine/arg_utils.py``:
+#: ``choices=["flashinfer", "triton", "cutedsl"]``); on the pinned build it is
+#: accepted and ignored on GB10, on the candidate it moves the GDN prefill
+#: recurrence onto FlashInfer's SM120 kernel. Empty = the flag is absent and
+#: the engine's own ``auto`` resolution applies. Both ranks must agree, so it
+#: is rendered into CLUSTER_ENGINE_ARGS exactly like the speculative config.
+GDN_PREFILL_BACKENDS = ("flashinfer", "triton", "cutedsl")
+#: The per-rank engine PROCESS environment (candidate B): each entry is a
+#: ``CLUSTER_*`` .env key, the vLLM variable it becomes, and the values it
+#: may take. Rendered ONLY when set -- an empty ``VLLM_ALLREDUCE_USE_FLASHINFER``
+#: is ``int("")`` inside vLLM's envs module, i.e. a crash at import -- so these
+#: never go through a compose ``environment:`` map (whose empty default would
+#: set the empty string) but through ``.runtime/engine.env``, an ``env_file``
+#: both ranks read (the head from the cluster overlay, the worker from the
+#: copy scripts/cluster-sync.sh ships).
+CLUSTER_ENGINE_ENV_KEYS = (
+    ("CLUSTER_VLLM_ALLREDUCE_USE_FLASHINFER", "VLLM_ALLREDUCE_USE_FLASHINFER", ("0", "1")),
+    ("CLUSTER_VLLM_USE_V2_MODEL_RUNNER", "VLLM_USE_V2_MODEL_RUNNER", ("0", "1")),
+)
+#: The worker sentinel restarts the worker on its own only when this is 1
+#: (contract §6.4); the controller is the single recovery authority, so the
+#: production value is 0 and the launcher never turns it on by itself.
+DEFAULT_SENTINEL_AUTONOMOUS = "0"
+#: The head's and the worker's Docker healthchecks are report-only except one
+#: last-resort kill after this many consecutive misses (30 s apart): 8 is
+#: four minutes, long after the controller (10 s) would have acted, so the
+#: two can never race (contract §6). Both nodes read the same number.
+DEFAULT_HEALTHCHECK_KILL_AFTER = 8
+HEALTHCHECK_KILL_AFTER_RANGE = (2, 120)
+#: The kill tier's AGE GUARD: the vLLM process must be older than this many
+#: seconds before the last-resort kill may fire, so a cold start is never
+#: interrupted. It follows the controller's cold-start budget
+#: (ENGINE_COLD_START_BUDGET_S, contract §6.3; 900 s = the measured 5 m 20 s
+#: cold load with margin) unless VLLM_HEALTHCHECK_MIN_AGE_S says otherwise --
+#: a raised budget for a slower image must reach the healthchecks too, or
+#: the head is killed at 15 min + 4 min of misses while still legitimately
+#: loading (review round 2). Shipped to the worker in worker.env.
+DEFAULT_COLD_START_BUDGET_S = 900
+COLD_START_BUDGET_RANGE = (60, 86400)
+#: The healthchecks' `start_period` in both cluster compose files, for the
+#: validation message: an age guard longer than it is fine (Docker keeps the
+#: container "starting" only that long; the guard is the script's own).
+HEALTHCHECK_START_PERIOD_S = 1800
 INFINIBAND_SYSFS = Path("/sys/class/infiniband")
 #: Parent of both ``net/<ifname>/operstate`` and ``infiniband/<hca>/device/net``.
 CLASS_SYSFS = Path("/sys/class")
@@ -505,6 +550,150 @@ def speculative_config_argument(values: Mapping[str, str]) -> str:
     return f"--speculative-config '{config}'" if config else ""
 
 
+def _gdn_prefill_backend(values: Mapping[str, str]) -> str:
+    """``CLUSTER_GDN_PREFILL_BACKEND``: one of the engine's choices, or ``""``."""
+    raw = _raw(values, "CLUSTER_GDN_PREFILL_BACKEND").lower()
+    if raw and raw not in GDN_PREFILL_BACKENDS:
+        raise TechSaraError(
+            "CLUSTER_GDN_PREFILL_BACKEND must be one of "
+            f"{', '.join(GDN_PREFILL_BACKENDS)} or empty to leave the flag out; got {values.get('CLUSTER_GDN_PREFILL_BACKEND')!r}"
+        )
+    return raw
+
+
+def gdn_prefill_backend_argument(values: Mapping[str, str]) -> str:
+    """The rendered ``--gdn-prefill-backend <name>`` segment, or ``""``.
+
+    One validator for both deployment shapes, like ``speculative_config_argument``:
+    the dual-mode ``CLUSTER_ENGINE_ARGS`` string and the single-node overlay's
+    ``MAIN_MODEL_GDN_PREFILL_ARGUMENT`` come from here, so a candidate-B
+    evaluation cannot run one kernel on one path and another kernel elsewhere.
+    """
+    backend = _gdn_prefill_backend(values)
+    return f"--gdn-prefill-backend {backend}" if backend else ""
+
+
+def engine_process_environment(values: Mapping[str, str]) -> dict[str, str]:
+    """The vLLM process variables both ranks get, from the ``CLUSTER_VLLM_*`` keys.
+
+    Only the keys that are SET appear (see ``CLUSTER_ENGINE_ENV_KEYS`` for why
+    an empty value must never be rendered); every value is validated against
+    the bounded set the engine accepts.
+    """
+    rendered: dict[str, str] = {}
+    for user_key, engine_key, allowed in CLUSTER_ENGINE_ENV_KEYS:
+        raw = _raw(values, user_key)
+        if not raw:
+            continue
+        if raw not in allowed:
+            raise TechSaraError(
+                f"{user_key} must be one of {', '.join(allowed)} or empty to leave {engine_key} unset; got {raw!r}"
+            )
+        rendered[engine_key] = raw
+    return rendered
+
+
+def render_engine_env(process_environment: Mapping[str, str]) -> str:
+    """``.runtime/engine.env`` (and the worker's copy): one ``KEY=value`` per line.
+
+    Always written, even when empty, so the ``env_file`` entry on both ranks
+    is deterministic and a stale copy on the worker is caught by the sha256
+    check in scripts/cluster-sync.sh rather than by a different engine config.
+    """
+    lines = [
+        "# Generated by the launcher: the vLLM PROCESS environment of BOTH ranks",
+        "# (compose.cluster-dgx-spark.yaml env_file; shipped verbatim to the worker",
+        "# by scripts/cluster-sync.sh). Do not edit; set CLUSTER_VLLM_* in .env.",
+    ]
+    lines.extend(f"{key}={value}" for key, value in sorted(process_environment.items()))
+    return "\n".join(lines) + "\n"
+
+
+def _sentinel_autonomous(values: Mapping[str, str]) -> str:
+    raw = _raw(values, "CLUSTER_SENTINEL_AUTONOMOUS") or DEFAULT_SENTINEL_AUTONOMOUS
+    if raw not in ("0", "1"):
+        raise TechSaraError(
+            f"CLUSTER_SENTINEL_AUTONOMOUS must be 0 (the controller alone restarts the pair) or 1; got {raw!r}"
+        )
+    return raw
+
+
+def healthcheck_kill_after(values: Mapping[str, str]) -> int:
+    """``VLLM_HEALTHCHECK_KILL_AFTER``: consecutive misses before the last-resort kill."""
+    return _int(
+        values, "VLLM_HEALTHCHECK_KILL_AFTER", DEFAULT_HEALTHCHECK_KILL_AFTER,
+        minimum=HEALTHCHECK_KILL_AFTER_RANGE[0], maximum=HEALTHCHECK_KILL_AFTER_RANGE[1],
+    )
+
+
+def cold_start_budget_s(values: Mapping[str, str]) -> int:
+    """``ENGINE_COLD_START_BUDGET_S``: the controller's WAIT_FOR_MODEL_LOAD budget."""
+    return _int(
+        values, "ENGINE_COLD_START_BUDGET_S", DEFAULT_COLD_START_BUDGET_S,
+        minimum=COLD_START_BUDGET_RANGE[0], maximum=COLD_START_BUDGET_RANGE[1],
+    )
+
+
+def healthcheck_min_age_s(values: Mapping[str, str]) -> int:
+    """``VLLM_HEALTHCHECK_MIN_AGE_S``: the kill tier's age guard on both nodes.
+
+    Defaults to the cold-start budget; an explicit value shorter than that
+    budget is refused, because it would let the healthcheck kill a head (or
+    worker) the controller is still legitimately waiting for.
+    """
+    budget = cold_start_budget_s(values)
+    min_age = _int(
+        values, "VLLM_HEALTHCHECK_MIN_AGE_S", budget,
+        minimum=COLD_START_BUDGET_RANGE[0], maximum=COLD_START_BUDGET_RANGE[1],
+    )
+    if min_age < budget:
+        raise TechSaraError(
+            f"VLLM_HEALTHCHECK_MIN_AGE_S={min_age} is shorter than ENGINE_COLD_START_BUDGET_S={budget}: "
+            "the healthchecks' last-resort kill would interrupt a cold start the controller still allows; "
+            "raise it to at least the budget (or leave it empty to follow the budget; the healthchecks' "
+            f"start_period is {HEALTHCHECK_START_PERIOD_S}s and does not stop the script's own kill)"
+        )
+    return min_age
+
+
+def worker_management_ip(values: Mapping[str, str]) -> str:
+    """The worker's MANAGEMENT address for the controller's participation probe.
+
+    Three sources, first one wins: ``CLUSTER_WORKER_MGMT_IP``,
+    ``MONITORING_WORKER_BIND`` (scripts/monitoring.sh's older spelling; a
+    hostname there is that script's business and is skipped here), and the
+    host of ``OCR_REMOTE_BASE_URL`` -- the address scripts/ocr.sh recorded when
+    it put the OCR engine on the worker, which IS the worker's management
+    address on this production (``http://192.168.9.68:30004/v1``) and is
+    derived exactly the way scripts/lib/cluster-common.sh
+    write_ocr_scrape_target does (scheme off, first path segment). Without
+    this, the launcher rendered an empty exporter URL on a box whose .env
+    names neither monitoring key, and the controller sat in DEGRADED
+    ("participation unobserved") for the life of the deployment (review
+    round 2). Only a literal IPv4 is accepted from the URL; anything else
+    leaves the sample unobservable, never a failure.
+    """
+    ip = _ipv4(values, "CLUSTER_WORKER_MGMT_IP", required=False)
+    if ip:
+        return ip
+    try:
+        ip = _ipv4(values, "MONITORING_WORKER_BIND", required=False)
+    except TechSaraError:
+        ip = ""
+    if ip:
+        return ip
+    remote = _raw(values, "OCR_REMOTE_BASE_URL")
+    if not remote:
+        return ""
+    # http://192.168.9.68:30004/v1 -> 192.168.9.68:30004 -> 192.168.9.68
+    host_port = remote.split("://", 1)[-1].split("/", 1)[0]
+    host = host_port.rsplit(":", 1)[0] if host_port.count(":") == 1 else host_port
+    try:
+        return str(ipaddress.IPv4Address(host))
+    except ValueError:
+        return ""
+
+
 def prefix_caching_argument(enabled: bool) -> str:
     """``--enable-prefix-caching`` or its explicit negation.
 
@@ -553,6 +742,7 @@ def build_engine_arguments(
     kv_cache_memory_gib: int = DEFAULT_KV_CACHE_MEMORY_GIB,
     rope_override: str = "",
     enable_prefix_caching: bool = True,
+    gdn_prefill_backend: str = "",
 ) -> str:
     """The single-line, shell-splittable engine argument string.
 
@@ -571,6 +761,7 @@ def build_engine_arguments(
         f"--kv-cache-dtype {CLUSTER_KV_CACHE_DTYPE}",
         "--trust-remote-code",
         shlex.join(list(startup_arguments)),
+        f"--gdn-prefill-backend {gdn_prefill_backend}" if gdn_prefill_backend else "",
         "--enable-chunked-prefill",
         prefix_caching_argument(enable_prefix_caching),
         f"--speculative-config '{speculative_config}'" if speculative_config else "",
@@ -637,6 +828,16 @@ def resolve_cluster_settings(
     utilization = _gpu_memory_utilization(user_values)
     nccl_debug = _nccl_debug(user_values)
     speculative = _speculative_config(user_values)
+    gdn_backend = _gdn_prefill_backend(user_values)
+    engine_environment = engine_process_environment(user_values)
+    sentinel_autonomous = _sentinel_autonomous(user_values)
+    kill_after = healthcheck_kill_after(user_values)
+    min_age = healthcheck_min_age_s(user_values)
+    # The worker's MANAGEMENT address (the one Prometheus scrapes its GPU
+    # exporter on), for the controller's participation probe (contract §5
+    # step 4): the cluster key, monitoring.sh's older spelling, or the host
+    # scripts/ocr.sh recorded in OCR_REMOTE_BASE_URL (see worker_management_ip).
+    worker_mgmt_ip = worker_management_ip(user_values)
     batched_tokens = _int(
         user_values, "CLUSTER_MAX_NUM_BATCHED_TOKENS", DEFAULT_MAX_NUM_BATCHED_TOKENS,
         minimum=MINIMUM_MAX_NUM_BATCHED_TOKENS,
@@ -681,12 +882,14 @@ def resolve_cluster_settings(
         kv_cache_memory_gib=kv_cache_gib,
         rope_override=rope_override,
         enable_prefix_caching=enable_prefix_caching,
+        gdn_prefill_backend=gdn_backend,
     )
     return {
         "CLUSTER_HEAD_IP": head_ip,
         "CLUSTER_WORKER_IP": worker_ip,
         "CLUSTER_HEAD_IP_2": head_ip_2,
         "CLUSTER_WORKER_IP_2": worker_ip_2,
+        "CLUSTER_WORKER_MGMT_IP": worker_mgmt_ip,
         "CLUSTER_MASTER_PORT": str(master_port),
         "CLUSTER_TENSOR_PARALLEL_SIZE": str(tensor_parallel),
         "CLUSTER_PIPELINE_PARALLEL_SIZE": str(pipeline_parallel),
@@ -697,6 +900,18 @@ def resolve_cluster_settings(
         "CLUSTER_NCCL_IB_HCA": hca,
         "CLUSTER_API_BIND_ADDRESS": api_bind,
         "CLUSTER_ENGINE_ARGS": engine_args,
+        # Candidate-B knobs, recorded so scripts/cluster-sync.sh ships the
+        # same values and cluster-status.sh can print what both ranks run.
+        "CLUSTER_GDN_PREFILL_BACKEND": gdn_backend,
+        # The per-rank process environment as one line, for the record; the
+        # file both ranks actually read is rendered by render_engine_env().
+        "CLUSTER_ENGINE_ENV": " ".join(f"{k}={v}" for k, v in sorted(engine_environment.items())),
+        "CLUSTER_SENTINEL_AUTONOMOUS": sentinel_autonomous,
+        "VLLM_HEALTHCHECK_KILL_AFTER": str(kill_after),
+        # The kill tier's age guard, resolved here so both compose files
+        # interpolate the same number (scripts/cluster-sync.sh ships it in
+        # worker.env) and the launcher has validated it against the budget.
+        "VLLM_HEALTHCHECK_MIN_AGE_S": str(min_age),
     }
 
 

@@ -31,12 +31,28 @@ services:
       NCCL_IB_DISABLE: "0"
       NCCL_DEBUG: ${CLUSTER_NCCL_DEBUG:-INFO}
       NCCL_DEBUG_SUBSYS: ${CLUSTER_NCCL_DEBUG_SUBSYS:-INIT,NET}
+    # The per-rank process environment (candidate B): the byte-identical copy
+    # of the head's .runtime/engine.env, shipped by scripts/cluster-sync.sh.
+    # Only the keys that are SET appear in it -- see the head overlay for why
+    # an empty VLLM_ALLREDUCE_USE_FLASHINFER must never be rendered.
+    env_file:
+      - path: ./engine.env
+        required: false
     volumes:
       - type: bind
         source: ${CLUSTER_WORKER_MODEL_CACHE:?CLUSTER_WORKER_MODEL_CACHE must be set}
         target: /models
         read_only: true
       - hf-cache:/root/.cache/huggingface
+      # COMPILED-KERNEL CACHE (contract §6.6): this rank's torch.compile /
+      # Inductor / Triton artefacts (VLLM_CACHE_ROOT) and FlashInfer JIT
+      # output (FLASHINFER_WORKSPACE_BASE/.cache/flashinfer), one named
+      # volume mounted at both paths exactly like the head's, so a recovery
+      # reuses them instead of recompiling. Emptied only by
+      # scripts/cluster-recover.sh --clear-kernel-cache on the head, never by
+      # the sentinel or the controller.
+      - kernel-cache:/root/.cache/vllm
+      - kernel-cache:/root/.cache/flashinfer
     network_mode: host
     ipc: host
     shm_size: 32g
@@ -46,6 +62,19 @@ services:
       - IPC_LOCK
     ulimits:
       memlock: -1
+      # CORE DUMPS OFF, THE ONLY WAY THAT WORKS WITH APPORT (contract §6.5).
+      # The host's core_pattern is a PIPE to apport, and apport 2.28.3 reads
+      # the whole core into its report regardless of the limit -- `core: 0`
+      # does NOT stop it. RLIMIT_CORE == 1 does: the kernel aborts a pipe
+      # dump ("RLIMIT_CORE is set to 1, aborting core", fs/coredump.c)
+      # BEFORE apport is spawned. Measured on the same image and a 1.5 GB
+      # heap: unlimited = 18.3 s held + a 4.2 MB report; 1 = 1.28 s, no
+      # report. On 2026-09-11 THIS rank -- 25 GiB -- was held for 3 min 59 s
+      # writing a 3.5 GB report, and the head waited on the corpse the whole
+      # time.
+      core:
+        soft: 1
+        hard: 1
     deploy:
       resources:
         reservations:
@@ -55,23 +84,32 @@ services:
               capabilities: [gpu]
     restart: unless-stopped
     stop_grace_period: 2m
-    # A headless node has no HTTP endpoint of its own, so "healthy" means: the
-    # TP worker process is alive AND the head's engine answers /health. A
-    # restarted head is a new torch.distributed process group that the old
-    # worker can never rejoin, so the worker restarts itself when the head
-    # reports its engine dead (5xx) or - once this worker has been up for
-    # 15 minutes - when the head has been unreachable for 4 checks (2 min).
-    # Four, not ten (2026-09-11): a head whose API process exits outright
-    # (the EngineDeadError path, seen at 07:09Z that day) answers 000, not
-    # 5xx, so this rule is the only thing that re-pairs the worker, and the
-    # old five minutes were a third of the whole outage. A head reload always
-    # needs a fresh worker anyway; the head's own healthcheck uses the same
-    # four misses, and the head's rendezvous waits 300 s for us.
-    # Start-up is never interrupted: while the pair is still loading, an
-    # unreachable head only keeps this container in "starting". `init: true`
-    # + killing the real `vllm serve` process (not PID 1) is what makes the
-    # container exit so `restart: unless-stopped` brings it back; the pgrep
-    # patterns use [ ] so they never match this healthcheck's own shell.
+    # REPORT-ONLY, WITH ONE LAST-RESORT TIER (contract §6, v2). A headless
+    # node has no HTTP endpoint of its own, so "healthy" means: the TP worker
+    # process is alive AND the head's engine answers /health. A restarted head
+    # is a new torch.distributed process group that the old worker can never
+    # rejoin -- but re-pairing is the CONTROLLER's job (it restarts this
+    # container first, through the sentinel's POST /restart, then the head),
+    # and in round 1 this check's immediate kill on a 5xx raced that
+    # choreography: the worker restarted itself, joined the head's FIRST
+    # restart, and was stale by the controller's second. So:
+    #   * head /health 200                          -> healthy, counter reset
+    #   * anything else (000, 5xx)                  -> exit 1 (report only)
+    #   * VLLM_HEALTHCHECK_KILL_AFTER consecutive misses (default 8 = 4 min)
+    #     on a process older than VLLM_HEALTHCHECK_MIN_AGE_S (the launcher's
+    #     resolution of ENGINE_COLD_START_BUDGET_S; 900 by default) -> kill
+    #     the vllm process so Docker restarts the container and the rank
+    #     waits at the next rendezvous.
+    # The same number and the same age guard as the head's check, shipped
+    # in worker.env by scripts/cluster-sync.sh; four minutes is long after a
+    # live controller would have acted and covers the day the controller is
+    # down and a head reload needs a fresh worker (the head's rendezvous
+    # waits 300 s for us). Start-up is never interrupted: while the pair is
+    # still loading, an unreachable head only keeps this container in
+    # "starting". `init: true` + killing the real `vllm serve` process (not
+    # PID 1) is what makes the container exit so `restart: unless-stopped`
+    # brings it back; the pgrep patterns use [ ] so they never match this
+    # healthcheck's own shell.
     init: true
     healthcheck:
       test:
@@ -84,8 +122,8 @@ services:
           if [ "$$code" = 200 ]; then rm -f /tmp/head-missed; exit 0; fi;
           n=$$(( $$(cat /tmp/head-missed 2>/dev/null || echo 0) + 1 )); echo $$n > /tmp/head-missed;
           age=$$(ps -o etimes= -p "$$main" | tr -d ' ');
-          case "$$code" in 5*) echo "head engine dead (HTTP $$code): restarting worker to rejoin the next process group"; kill -9 "$$main";; esac;
-          if [ "$${age:-0}" -gt 900 ] && [ "$$n" -ge 4 ]; then echo "head unreachable for $$n checks after $${age}s: restarting worker"; kill -9 "$$main"; fi;
+          echo "head /health=$$code (miss $$n of ${VLLM_HEALTHCHECK_KILL_AFTER:-8}; the engine controller re-pairs this rank, this check only reports)";
+          if [ "$${age:-0}" -gt "${VLLM_HEALTHCHECK_MIN_AGE_S:-${ENGINE_COLD_START_BUDGET_S:-900}}" ] && [ "$$n" -ge "${VLLM_HEALTHCHECK_KILL_AFTER:-8}" ]; then echo "head unreachable for $$n consecutive checks after $${age}s (age guard ${VLLM_HEALTHCHECK_MIN_AGE_S:-${ENGINE_COLD_START_BUDGET_S:-900}}s) and no controller acted: LAST RESORT, restarting the worker"; kill -9 "$$main"; fi;
           exit 1
       interval: 30s
       timeout: 15s
@@ -97,6 +135,88 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  # --- Worker sentinel (contract §6.4) -------------------------------------
+  # The head's engine controller cannot see this node's process table, and
+  # on 2026-09-11 the worker's own executor took 4 min 51 s to notice its
+  # rank was dead (apport was holding the corpse). The sentinel watches the
+  # rank process and the fatal log signatures through this node's Docker
+  # socket, answers GET /state and /diagnostics to the controller, restarts
+  # the worker container on the controller's POST /restart, and nothing
+  # else: SENTINEL_AUTONOMOUS=0 (the default and the production value) is
+  # what makes the controller the SINGLE recovery authority (contract §6);
+  # =1 (a bounded self-restart, 3 an hour) exists only for a deployment
+  # without a controller.
+  #
+  # BINDING. CLUSTER_WORKER_IP is the RoCE rail-A address: a point-to-point
+  # link only the head can reach. Never the management LAN, never 0.0.0.0.
+  # Bound INSIDE the process, not published, for the reason
+  # compose.monitoring-worker.yaml gives: a published port on an address
+  # that does not exist yet at boot leaves the container dead with
+  # RestartCount=0.
+  #
+  # THE TOKEN IS THE REAL GATE. Without one, POST /restart is accepted from
+  # CLUSTER_HEAD_IP -- and that address is also the MASQUERADE source of
+  # every bridge-network container on the head (orchestrator, searxng,
+  # pgadmin, cloudflared), so the IP check tells "the head" from "the LAN",
+  # not "the controller" from "any container on the head". That is why
+  # scripts/cluster-sync.sh always ships a token (the launcher mints it into
+  # .runtime/controller.env on the head) and why worker.env is 0600.
+  #
+  # The Docker socket is mounted WRITABLE, which is root-equivalent on this
+  # host -- it is the price of restarting the worker without an ssh hop, it
+  # is the only thing this container does with it, and the image is
+  # digest-pinned to the same python@sha256 the head's controller runs;
+  # scripts/cluster-sync.sh pulls it here.
+  vllm-worker-sentinel:
+    image: ${CLUSTER_SENTINEL_IMAGE:-python@sha256:2c941e860699f878900b0edc2403613c234d4b32eda3cc9fa7036991a2a63c4a}
+    command: ["python", "-u", "/app/sentinel.py"]
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Shipped by scripts/cluster-sync.sh into ~/.techsara-cluster/ next to
+      # this file, from monitoring/engine-controller/ on the head.
+      - ./sentinel.py:/app/sentinel.py:ro
+      - ./common.py:/app/common.py:ro
+    environment:
+      # THE CODE IS PART OF THE DEFINITION: sentinel.py and common.py are
+      # bind mounts, and `up -d` recreates only on a definition change, so
+      # scripts/cluster-sync.sh writes the sha256 of the two files it just
+      # shipped (`cat sentinel.py common.py | sha256sum`) into worker.env;
+      # a changed digest recreates this container on the routine deploy's
+      # `cluster-worker.sh start vllm-worker-sentinel`, an unchanged one
+      # leaves it running (review round 2; the head's controller carries
+      # ENGINE_CONTROLLER_CODE_SHA the same way).
+      SENTINEL_CODE_SHA: ${SENTINEL_CODE_SHA:-}
+      SENTINEL_BIND: ${CLUSTER_WORKER_IP:?CLUSTER_WORKER_IP must be set}
+      SENTINEL_PORT: "9839"
+      WORKER_CONTAINER: sf-local-ai-worker-vllm-worker-1
+      CLUSTER_HEAD_IP: ${CLUSTER_HEAD_IP:?CLUSTER_HEAD_IP must be set}
+      # Shipped in worker.env (0600) from the head's .runtime/controller.env.
+      # Empty only if an operator blanked it on both nodes: then POST
+      # /restart is accepted from CLUSTER_HEAD_IP, with the caveat above.
+      CLUSTER_SENTINEL_TOKEN: ${CLUSTER_SENTINEL_TOKEN:-}
+      # 0 = acts only on the controller's POST /restart (contract §6.4).
+      SENTINEL_AUTONOMOUS: ${CLUSTER_SENTINEL_AUTONOMOUS:-0}
+    # python:3.12-slim has no curl; the same stdlib probe the exporters use,
+    # against the address the server actually binds.
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://${CLUSTER_WORKER_IP:-127.0.0.1}:9839/healthz', timeout=3).status==200 else 1)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
 volumes:
   hf-cache:
     name: sf-local-ai-worker_hf-cache
+  # This rank's compiled-kernel cache (contract §6.6); the head's is
+  # sf-local-ai_vllm-kernel-cache. Survives `down` (no -v anywhere) and is
+  # emptied only by scripts/cluster-recover.sh --clear-kernel-cache.
+  kernel-cache:
+    name: sf-local-ai-worker_kernel-cache

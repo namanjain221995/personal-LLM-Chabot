@@ -528,9 +528,9 @@ def _assumptions_html(assumptions: Sequence[str]) -> str:
     return f'<section class="assumptions"><h2>Assumptions</h2><ul>{items}</ul></section>'
 
 
-def _root_vars(t: theme.TypeScale) -> str:
+def _root_vars(t: theme.TypeScale, extra: str = "") -> str:
     return (
-        ":root{"
+        ":root{" + extra +
         f"--font-sans:{theme.CSS_SANS};--font-serif:{theme.CSS_SERIF};--font-mono:{theme.CSS_MONO};"
         f"--ink:{theme.INK};--ink-muted:{theme.INK_MUTED};--ink-faint:{theme.INK_FAINT};--surface:{theme.SURFACE};"
         f"--border:{theme.BORDER};--accent:{theme.ACCENT};--navy:{theme.NAVY};--boardroom:{theme.BOARDROOM};"
@@ -832,9 +832,207 @@ def workbook_summary_html(spec: S.WorkbookSpec, max_rows: int = 25, max_cols: in
     )
 
 
+# ------------------------------------------------------ tabular document --
+#
+# WHY. "XLSX, Word, PDF and CSV of this audit" (CONTRACT-2 §1) is four files
+# from one WorkbookSpec; the Word and PDF are the TABULAR DOCUMENT — every
+# sheet as a section with its whole table, landscape when the sheet's style
+# says so or when it has more than six columns, the header row repeated on
+# every page, the highlighted column in the same red the Excel file uses, a
+# methodology note that says blank means blank, page numbers, the title. The
+# HTML below is the PDF's source and the plan docx.py follows (sections,
+# orientation, widths, colours), so the two documents agree.
+
+#: The tabular document's type: 9.5 pt cells, never under 9 — a 500-row
+#: audit at 8 pt is the "unreadable PDF" complaint.
+TABULAR_CELL_PT = 9.5
+#: Column width shares are clipped to this range of a table's width so a
+#: one-character column keeps a readable cell and a comment column cannot
+#: crowd the others out.
+_MIN_COL_SHARE = 0.05
+_MAX_COL_SHARE = 0.45
+#: How many rows are sampled for a column's width.
+_WIDTH_SAMPLE_ROWS = 300
+
+TABULAR_HIGHLIGHT = {
+    "red": ("#9C0006", "#FFFFFF", "#FFC7CE", "#9C0006"),
+    "amber": ("#9C5700", "#FFFFFF", "#FFEB9C", "#9C5700"),
+    "green": ("#006100", "#FFFFFF", "#C6EFCE", "#006100"),
+    "blue": ("#1F4E78", "#FFFFFF", "#DDEBF7", "#1F4E78"),
+}
+TABULAR_HEADER_FILLS = {
+    "dark": (theme.NAVY, theme.WHITE),
+    "light": (theme.SURFACE_2, theme.INK),
+    "none": ("", theme.INK),
+}
+
+
+def column_shares(sheet: S.Sheet) -> List[float]:
+    """Each column's share of the table width, from the longest text in
+    the header and a sample of its cells (square-rooted, so a 300-character
+    comment does not take 80% of the page and a date column is not
+    squeezed to nothing), clipped to [_MIN_COL_SHARE, _MAX_COL_SHARE] and
+    normalised to sum to 1. Long text WRAPS inside its share; nothing is
+    clipped."""
+    import math
+
+    weights: List[float] = []
+    for j, col in enumerate(sheet.columns):
+        longest = len(col.name)
+        for row in sheet.rows[:_WIDTH_SAMPLE_ROWS]:
+            v = row[j] if j < len(row) else None
+            if v is not None:
+                longest = max(longest, len(str(v)))
+        weights.append(math.sqrt(max(longest, 3)))
+    total = sum(weights) or 1.0
+    shares = [min(max(w / total, _MIN_COL_SHARE), _MAX_COL_SHARE) for w in weights]
+    total = sum(shares)
+    return [round(sh / total, 4) for sh in shares]
+
+
+def sheet_orientation(sheet: S.Sheet) -> str:
+    """`landscape` or `portrait` for the sheet's section (CONTRACT-2 §4:
+    `auto` is landscape past six columns) — one rule, read by the DOCX
+    writer too."""
+    style = sheet.style if sheet.style is not None else S.SheetStyle()
+    if style.orientation == "auto":
+        return "landscape" if len(sheet.columns) > 6 else "portrait"
+    return style.orientation
+
+
+def highlight_columns(sheet: S.Sheet) -> Dict[int, str]:
+    """Column index → colour name for the style's highlighted columns."""
+    style = sheet.style if sheet.style is not None else S.SheetStyle()
+    by_name: Dict[str, int] = {}
+    for j, c in enumerate(sheet.columns):
+        by_name.setdefault(" ".join(c.name.split()).casefold(), j)
+    out: Dict[int, str] = {}
+    for h in style.highlight:
+        j = by_name.get(" ".join(h.column.split()).casefold())
+        if j is not None:
+            out[j] = h.color
+    return out
+
+
+def methodology_note(spec: S.WorkbookSpec, transform: Optional[dict] = None) -> str:
+    """The one-paragraph note under the title: blank means blank, plus
+    what code did to a pasted table (`transform`, the engine's report when
+    the pipeline passes one) or what the spec itself records (rows copied
+    from a pasted table, generated, a column rewritten)."""
+    bits = ["Blank values are blank in the source."]
+    t = transform or {}
+    copied = [sh for sh in spec.sheets if sh.rows_from]
+    generated = [sh for sh in spec.sheets if sh.generator is not None]
+    if t.get("rows"):
+        bits.append(f"{int(t['rows']):,} source row{'s were' if int(t['rows']) != 1 else ' was'} preserved as pasted.")
+    elif copied:
+        n = sum(len(sh.rows) for sh in copied)
+        bits.append(f"{n:,} row{'s were' if n != 1 else ' was'} copied verbatim from the pasted table.")
+    if t.get("forward_filled"):
+        bits.append(f"{int(t['forward_filled']):,} blank grouping cell{'s were' if int(t['forward_filled']) != 1 else ' was'} filled from the row above.")
+    rewritten = [r.column for sh in spec.sheets for r in sh.rewrite]
+    if t.get("rewritten") or rewritten:
+        cols = ", ".join(dict.fromkeys(rewritten)) or "comment"
+        bits.append(f"The {cols} column was rewritten for clarity; timestamps and quoted text were kept as written.")
+    if generated:
+        n = sum(len(sh.rows) for sh in generated)
+        bits.append(f"{n:,} row{'s were' if n != 1 else ' was'} generated from a column recipe (seed {generated[0].generator.seed}).")
+    return " ".join(bits)
+
+
+def _tabular_table_html(sheet: S.Sheet) -> str:
+    numeric = {i for i, c in enumerate(sheet.columns) if c.type != "text"}
+    highlight = highlight_columns(sheet)
+    style = sheet.style if sheet.style is not None else S.SheetStyle()
+    shares = column_shares(sheet)
+    cols = "".join(f'<col style="width:{sh * 100:.2f}%">' for sh in shares)
+    fill, ink = TABULAR_HEADER_FILLS.get(style.header_fill, TABULAR_HEADER_FILLS["dark"])
+    head_cells = []
+    for i, c in enumerate(sheet.columns):
+        cls = "num" if i in numeric else "txt"
+        colour = highlight.get(i)
+        if colour:
+            h_fill, h_ink, _, _ = TABULAR_HIGHLIGHT[colour]
+            head_cells.append(f'<th class="{cls} hl hl-{e(colour)}" style="background:{h_fill};color:{h_ink}">{e(c.name)}</th>')
+        else:
+            bg = f"background:{fill};" if fill else "background:none;"
+            head_cells.append(f'<th class="{cls}" style="{bg}color:{ink}">{e(c.name)}</th>')
+    body_rows = []
+    for row in sheet.rows:
+        cells = []
+        for i, v in enumerate(row):
+            cls = "num" if i in numeric else "txt"
+            colour = highlight.get(i)
+            text = e(cell_text(v, i in numeric))
+            if colour:
+                _, _, c_fill, c_ink = TABULAR_HIGHLIGHT[colour]
+                cells.append(f'<td class="{cls} hl" style="background:{c_fill};color:{c_ink}">{text}</td>')
+            else:
+                cells.append(f'<td class="{cls}">{text}</td>')
+        body_rows.append(f"<tr>{''.join(cells)}</tr>")
+    classes = "data tabular" + (" borders" if style.borders == "thin" else " no-borders") + (" wrap" if style.wrap else "")
+    bold = "" if style.header_bold else ' data-header-bold="no"'
+    return (
+        f'<table class="{classes}"{bold}><colgroup>{cols}</colgroup>'
+        f'<thead><tr>{"".join(head_cells)}</tr></thead><tbody>{"".join(body_rows)}</tbody></table>'
+    )
+
+
+def workbook_document_html(spec: S.WorkbookSpec, transform: Optional[dict] = None) -> str:
+    """The tabular document as one HTML page: title, methodology note, then
+    one section per sheet — a heading and the FULL table — each on its
+    own named page (`landscape` / `portrait`) so orientation follows the
+    sheet. The header row repeats on every page (print.css `thead
+    {display: table-header-group}`), rows never split across pages, and
+    there is no trailing page break, so no blank last page."""
+    first = sheet_orientation(spec.sheets[0]) if spec.sheets else "portrait"
+    # The title block shares the first sheet's named page: a change of page
+    # name is a page break in WeasyPrint, and a title alone on page 1 with
+    # the table starting on page 2 is the blank-looking first page.
+    parts = [
+        '<div class="running-header"><span class="title">' + e(spec.title) + "</span></div>",
+        '<div class="running-footer"></div>',
+        f'<div class="front {first}"><header class="titleblock"><h1 class="doc-title">{e(spec.title)}</h1>'
+        + (f'<div class="subtitle">{e(spec.purpose)}</div>' if spec.purpose else "")
+        + f'<div class="byline">{len(spec.sheets)} sheet{"s" if len(spec.sheets) != 1 else ""} · '
+        + f'{sum(len(sh.rows) for sh in spec.sheets):,} rows</div></header>'
+        + f'<p class="methodology">{e(methodology_note(spec, transform))}</p></div>',
+    ]
+    sections: List[str] = []
+    for k, sheet in enumerate(spec.sheets):
+        orientation = sheet_orientation(sheet)
+        cls = f"sheet {orientation}" + (" first" if k == 0 else "")
+        note = f"<p class=\"sheet-note\">{e(sheet.notes)}</p>" if sheet.notes else ""
+        sections.append(
+            f'<section class="{cls}"><h2>{e(sheet.name)}</h2>{note}{_tabular_table_html(sheet)}'
+            f'<p class="sheet-count">{len(sheet.rows):,} row{"s" if len(sheet.rows) != 1 else ""} · {len(sheet.columns)} columns</p></section>'
+        )
+    parts.append(f"<main>{''.join(sections)}</main>")
+    parts.append(_sources_html(spec.sources))
+    parts.append(_assumptions_html(spec.assumptions))
+    t = theme.DOCUMENT_TYPE
+    footer = (
+        '@bottom-center{content:"Page " counter(page) " of " counter(pages);'
+        f"font-family:{theme.CSS_SANS};font-size:8.5pt;color:{theme.INK_FAINT}}}"
+    )
+    header = "@top-center{content:element(header);width:100%;vertical-align:bottom;padding-bottom:4pt}"
+    pages = (
+        f"@page{{size:A4 {first};margin:16mm 14mm 16mm 14mm;{header}{footer}}}"
+        f"@page landscape{{size:A4 landscape;margin:16mm 14mm 16mm 14mm;{header}{footer}}}"
+        f"@page portrait{{size:A4 portrait;margin:16mm 14mm 16mm 14mm;{header}{footer}}}"
+    )
+    return (
+        '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">'
+        f"<title>{e(spec.title)}</title><style>{_root_vars(t, f'--tabular-pt:{TABULAR_CELL_PT}pt;')}{print_css()}{pages}</style></head>"
+        f'<body class="doc tpl-tabular">{"".join(parts)}</body></html>'
+    )
+
+
 __all__ = [
     "print_css", "format_number", "cell_text", "spec_charts", "chart_filename",
     "PlannedHeading", "DocumentPlan", "plan_document", "PlannedSlide", "DeckPlan", "plan_deck", "fit_bullets",
     "fit_table", "BULLET_BOXES", "TABLE_MAX_ROWS", "TABLE_MAX_COLS",
     "citation_numbers", "document_html", "deck_html", "workbook_summary_html",
+    "workbook_document_html", "column_shares", "sheet_orientation", "highlight_columns", "methodology_note",
+    "TABULAR_CELL_PT", "TABULAR_HIGHLIGHT", "TABULAR_HEADER_FILLS",
 ]

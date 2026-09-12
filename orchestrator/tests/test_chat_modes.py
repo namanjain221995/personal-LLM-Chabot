@@ -60,11 +60,16 @@ def test_smart_resolves_to_main_model():
     assert llm.served_model_id("smart") == settings.llm_model
 
 
-def test_fast_resolves_to_router_model():
+def test_fast_resolves_to_the_main_model_too():
+    """Strict one-model mode (availability CONTRACT v2 §1): the router is a
+    classifier and never writes a person's answer, so "fast" — a stored
+    preference an old tab may still send — is the main model with the
+    reasoning pass off, exactly what `wants_thinking` always made of it."""
     base_url, _key, model = llm.resolve_model_choice("fast")
-    assert base_url == settings.router_base_url
-    assert model == settings.router_model
-    assert llm.served_model_id("fast") == settings.router_model
+    assert base_url == settings.openai_base_url
+    assert model == settings.llm_model
+    assert llm.served_model_id("fast") == settings.llm_model
+    assert llm.capabilities_for_model_choice("fast") is settings.main_capabilities
 
 
 def test_effort_is_expressed_as_thinking_not_a_system_line():
@@ -177,10 +182,24 @@ def test_stream_chat_events_fast_model_no_effort_line(monkeypatch):
         monkeypatch, [(None, "hey")], model_choice="fast", effort="high"
     )
     assert events == [("token", "hey")]
-    assert rec["base_url"] == settings.router_base_url
+    # One model serves every picker choice (CONTRACT v2 §1); "fast" only
+    # switches the reasoning pass off.
+    assert rec["base_url"] == settings.openai_base_url
     kwargs = rec["chat_kwargs"]
-    assert kwargs["model"] == settings.router_model
+    assert kwargs["model"] == settings.llm_model
     assert kwargs["messages"] == [{"role": "user", "content": "hi"}]
+    assert kwargs["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}
+
+
+def test_the_answer_stream_refuses_any_engine_but_the_main_model(monkeypatch):
+    """The guard where the answer is produced: a base URL that is not the
+    main model's — the router's, say — is refused before a stream opens."""
+    monkeypatch.setattr(
+        llm, "resolve_model_choice",
+        lambda choice: (settings.router_base_url, llm.LOCAL_API_KEY, settings.router_model),
+    )
+    with pytest.raises(llm.AnswerEngineViolation):
+        _collect_events(monkeypatch, [(None, "hey")], model_choice="smart", effort="fast")
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +266,10 @@ def test_assistant_mode_bypasses_router_and_duckdb(monkeypatch):
     # attached to the same detached generation); the rest of the contract is
     # unchanged.
     assert meta.pop("generation_id")
+    # The query-tracing branch (merged 2026-09-12) puts the trace and request
+    # ids on every meta, like generation_id: identities, not the contract
+    # under test here.
+    assert meta.pop("trace_id") and meta.pop("request_id")
     # The knowledge pre-pass reports how it served the turn (ADR-0001 D12:
     # `decision`, plus `degraded` when the judge was missing). Its VALUE
     # depends on the offline corpus and the classifier, so only its shape is
@@ -277,7 +300,7 @@ def test_assistant_mode_fast_model_reports_router_model(monkeypatch):
             json={"message": "hi", "mode": "assistant", "model": "fast", "effort": "low"},
         )
     events = dict(_parse_sse(resp.text))
-    assert events["meta"]["model"] == settings.router_model
+    assert events["meta"]["model"] == settings.llm_model  # one model, whatever the picker said
     # Legacy "low" normalizes at the API boundary; meta reports canonical.
     assert events["meta"]["effort"] == "fast"
     assert rec["model_choice"] == "fast"
@@ -307,6 +330,10 @@ def test_salesforce_mode_chat_route_streams_via_graph(monkeypatch):
     assert kinds == ["token", "meta", "done"]
     meta = dict(events[1][1])
     assert meta.pop("generation_id")
+    # The query-tracing branch (merged 2026-09-12) puts the trace and request
+    # ids on every meta, like generation_id: identities, not the contract
+    # under test here.
+    assert meta.pop("trace_id") and meta.pop("request_id")
     assert meta == {
         "route": "chat",
         "mode": "salesforce",

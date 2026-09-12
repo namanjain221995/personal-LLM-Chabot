@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from pathlib import Path
 
 from app.core import tracing
+from app.main import ChatRequest
 
 
 def test_sanitize_redacts_secrets_and_bounds_payloads():
@@ -40,7 +43,11 @@ def test_recorder_orders_events_and_finishes_once(monkeypatch):
         calls.append((fn.__name__, args, kwargs))
 
     monkeypatch.setattr(tracing.db, "run_in_thread", fake_run_in_thread)
-    recorder = tracing.TraceRecorder("generation-1")
+    recorder = tracing.TraceRecorder(
+        "generation-1",
+        test_case_id="SF-DATA-001",
+        versions={"application": "test", "database_schema": 32},
+    )
 
     async def go():
         await recorder.start(
@@ -67,6 +74,11 @@ def test_recorder_orders_events_and_finishes_once(monkeypatch):
     assert calls[2][1][1] == 2
     assert calls[1][1][5] == {"token": "[redacted]"}
     assert calls[3][2]["selected_route"] == "sql"
+    assert recorder.request_id.startswith("req_")
+    assert len(recorder.request_id) == 36
+    assert calls[0][2]["test_case_id"] == "SF-DATA-001"
+    assert calls[0][2]["versions"]["trace_schema"] == "1.0.0"
+    assert calls[1][1][-1] == tracing.PIPELINE_VERSION
 
 
 def test_context_helper_is_a_noop_without_active_trace(monkeypatch):
@@ -84,7 +96,11 @@ def test_trace_round_trips_through_the_database(isolated_app_db):
 
     user_id = db.create_user("tracer", "!x")
     db.create_conversation(user_id, "conversation-1", "traced")
-    recorder = tracing.TraceRecorder("generation-db-1")
+    recorder = tracing.TraceRecorder(
+        "generation-db-1",
+        test_case_id="SF-DATA-001",
+        versions={"application": "test", "database_schema": db.LATEST_SCHEMA_VERSION},
+    )
 
     async def go():
         await recorder.start(
@@ -113,6 +129,12 @@ def test_trace_round_trips_through_the_database(isolated_app_db):
     assert trace["error_type"] == "RuntimeError"
     assert trace["error_stage"] == "QUERY_EXECUTED"
     assert trace["completed_at"] is not None
+    assert trace["request_id"] == recorder.request_id
+    assert trace["test_case_id"] == "SF-DATA-001"
+    assert trace["versions"]["pipeline"] == tracing.PIPELINE_VERSION
+    assert all(e["started_at"] for e in trace["events"])
+    assert all(e["completed_at"] for e in trace["events"])
+    assert all(e["component_version"] == tracing.PIPELINE_VERSION for e in trace["events"])
     assert [e["sequence_number"] for e in trace["events"]] == [1, 2]
     assert trace["events"][0]["details"] == {"token": "[redacted]", "ok": 1}
     assert trace["events"][1]["status"] == "failed"
@@ -136,3 +158,27 @@ def test_trace_round_trips_through_the_database(isolated_app_db):
             ("generation-db-1",),
         ).fetchone()
     assert left["n"] == 0
+
+
+def test_trace_schema_covers_the_persisted_evaluation_contract():
+    path = Path(__file__).resolve().parents[2] / "evaluation" / "schemas" / "trace.schema.json"
+    schema = json.loads(path.read_text(encoding="utf-8"))
+
+    required = set(schema["required"])
+    assert {"trace_id", "request_id", "versions", "events"} <= required
+    assert "test_case_id" in schema["properties"]
+    event_required = set(schema["$defs"]["event"]["required"])
+    assert {"stage", "status", "started_at", "completed_at", "duration_ms"} <= event_required
+
+
+def test_chat_request_accepts_only_a_case_identifier_not_golden_data():
+    request = ChatRequest(message="question", test_case_id="SF-DATA-001")
+    assert request.test_case_id == "SF-DATA-001"
+    assert not hasattr(request, "expected")
+
+    try:
+        ChatRequest(message="question", test_case_id="bad id with spaces")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("invalid test_case_id was accepted")

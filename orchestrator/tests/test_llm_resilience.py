@@ -223,6 +223,9 @@ def test_recovery_window_context_sets_the_task_default(monkeypatch):
 
 
 def test_wait_notifier_is_told_once_while_waiting(clock, monkeypatch):
+    """The person reads the ONE exact sentence of CONTRACT §8.3 while the
+    main model is waited for — never the old "restarting (up to N min)"
+    line — and only for the main model: a sidecar's wait says nothing."""
     lines: list[str] = []
     calls = {"probe": 0}
 
@@ -235,14 +238,26 @@ def test_wait_notifier_is_told_once_while_waiting(clock, monkeypatch):
 
     monkeypatch.setattr(resilience, "engine_answers", probe)
     monkeypatch.setattr(settings, "llm_health_poll_s", 5.0)
+    monkeypatch.setattr(settings, "openai_base_url", "http://vllm:8000/v1")
 
     async def run():
         with resilience.wait_notifier(notify):
             return await resilience.wait_for_engine("http://vllm:8000/v1", deadline_s=600, what="t")
 
     assert asyncio.run(run()) is True
-    assert len(lines) == 1
-    assert "restarting" in lines[0] and "up to 10 min" in lines[0]
+    assert lines == [resilience.QUEUED_LINE]
+    assert resilience.QUEUED_LINE == "Main model is recovering—your request is safely queued."
+
+    # A sidecar (no breaker) waiting says nothing: it is not the model.
+    lines.clear()
+    calls["probe"] = 0
+
+    async def sidecar():
+        with resilience.wait_notifier(notify):
+            return await resilience.wait_for_engine("http://vllm-embed:30003/v1", deadline_s=600, what="t")
+
+    assert asyncio.run(sidecar()) is True
+    assert lines == []
 
     # A chat turn is several model calls waiting on the SAME outage: one line.
     lines.clear()
@@ -339,10 +354,30 @@ class _FlakyClient:
 
     @property
     def _response(self):
-        return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content="hello", reasoning_content=None), finish_reason="stop")],
-            usage=None,
-        )
+        return _Reply()
+
+
+class _Reply:
+    """One answer, readable both ways: `.choices` for a non-streaming call,
+    and one chunk then the end when iterated as a stream (the wrapper pulls
+    a stream's first chunk inside the attempt since the round-2 review)."""
+
+    def __init__(self) -> None:
+        self.choices = [SimpleNamespace(message=SimpleNamespace(content="hello", reasoning_content=None), finish_reason="stop")]
+        self.usage = None
+        self._sent = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self._sent:
+            raise StopAsyncIteration
+        self._sent = True
+        return SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="hello"), finish_reason="stop")], usage=None)
+
+    async def close(self):
+        return None
 
 
 @pytest.fixture()
@@ -667,3 +702,35 @@ def test_json_completion_sizes_the_pool_when_thinking_is_on(monkeypatch, instant
     monkeypatch.setattr(settings, "thinking_budget_high", 6000)
     asyncio.run(llm.json_completion([{"role": "user", "content": "x"}], json_schema={"type": "object"}, max_tokens=2500, thinking=True, effort="think"))
     assert seen[-1] == 8500
+
+
+def test_an_error_chunk_carrying_vllms_own_4xx_is_malformed_not_engine_death():
+    """vLLM refuses some streamed requests after the headers (a prompt over
+    the window, a bad sampling parameter): 200, then {"error": {"code": 400,
+    "type": "BadRequestError"}}. The SDK raises that as a bare APIError — the
+    same class as a dying engine — so the code/type inside decide. A client
+    mistake is never retried and never opens the breaker (review round 2)."""
+    import openai
+
+    from app import resilience
+
+    chunk_4xx = openai.APIError(
+        "prompt exceeds the model's maximum context",
+        request=None,
+        body={"error": {"message": "too long", "type": "BadRequestError", "code": 400}},
+    )
+    assert resilience.error_chunk_is_client_error(chunk_4xx)
+    assert not resilience.is_recoverable(chunk_4xx)
+    assert resilience.failure_reason(chunk_4xx) == "malformed"
+
+    dying = openai.APIError(
+        "EngineCore encountered an issue", request=None,
+        body={"error": {"message": "EngineDeadError", "type": "InternalServerError", "code": 500}},
+    )
+    assert not resilience.error_chunk_is_client_error(dying)
+    assert resilience.is_recoverable(dying)
+    assert resilience.failure_reason(dying) in ("engine_dead", "worker_lost")
+
+    bare = openai.APIError("connection lost mid-stream", request=None, body=None)
+    assert not resilience.error_chunk_is_client_error(bare)
+    assert resilience.is_recoverable(bare)

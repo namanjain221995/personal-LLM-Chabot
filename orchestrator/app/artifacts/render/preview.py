@@ -11,6 +11,12 @@ read-only with `data_only=False`, so a formula cell is returned as its TEXT
 (`=SUM(B2:B41)`) and is never evaluated by this code — the browser shows the
 formula, exactly as the API contract says. Hidden sheets are excluded; bounds
 are enforced so a 10,000-row sheet does not become a 10,000-row JSON.
+
+`grid_for()` is the one shape the `GET …/grid` route serves for an xlsx AND
+a csv (CONTRACT-2 §11): `sheets`, `sheet`, `columns`, `rows`, `total_rows`,
+`total_columns`, `truncated`, `formulas_as_text: true` — an xlsx through
+`sheet_grid` (trimmed to the sheet's real last column, paged by offset), a
+csv through render/csv.read_csv_grid (one pass, one page in memory).
 """
 from __future__ import annotations
 
@@ -82,7 +88,13 @@ def _json_value(value: Any) -> Any:
         if isinstance(value, float) and (value != value or value in (float("inf"), float("-inf"))):
             return str(value)
         return value
-    if isinstance(value, (_dt.datetime, _dt.date)):
+    if isinstance(value, _dt.datetime):
+        # openpyxl reads a date cell back as a datetime at midnight; the
+        # grid shows the date a person typed, not "2026-08-03T00:00:00".
+        if value.hour == value.minute == value.second == value.microsecond == 0 and value.tzinfo is None:
+            return value.date().isoformat()
+        return value.isoformat()
+    if isinstance(value, _dt.date):
         return value.isoformat()
     return str(value)
 
@@ -111,11 +123,16 @@ def sheet_grid(xlsx_path: str | Path, sheet: Optional[str], max_rows: int, max_c
                     break
             else:
                 raise KeyError(sheet)
+        # Trimmed to the sheet's real last column: iter_rows pads every row
+        # to max_col, and a three-column sheet used to come back as sixty
+        # columns, fifty-seven of them blank.
+        real_cols = int(chosen.max_column or 0)
+        width = max(1, min(max_cols, real_cols)) if real_cols else max_cols
         columns: List[str] = []
         rows: List[List[Any]] = []
         formulas: Dict[str, str] = {}
         truncated = False
-        for r_index, row in enumerate(chosen.iter_rows(min_row=1, max_col=max_cols, values_only=False), start=1):
+        for r_index, row in enumerate(chosen.iter_rows(min_row=1, max_col=width, values_only=False), start=1):
             if r_index == 1:
                 columns = ["" if c.value is None else str(c.value) for c in row]
                 continue
@@ -146,4 +163,49 @@ def sheet_grid(xlsx_path: str | Path, sheet: Optional[str], max_rows: int, max_c
         wb.close()
 
 
-__all__ = ["page_count", "rasterise_page", "sheet_grid"]
+def grid_for(path: str | Path, fmt: str, *, sheet: Optional[str] = "", offset: int = 0, limit: int = 500,
+             max_cols: int = 60, title: str = "") -> Dict[str, Any]:
+    """CONTRACT-2 §11: the grid dict for one file. `sheets` lists the
+    workbook's visible sheet names (for a csv, the one name the file has:
+    `title`, else its stem); `sheet` is the one shown; `rows` is the page
+    from `offset` (0-based data rows) of at most `limit`; `total_rows` and
+    `total_columns` are the whole sheet's; `truncated` says a row or a
+    column lies outside the page. Formulas are text, never evaluated.
+    Raises KeyError for a sheet the workbook does not have."""
+    offset = max(0, int(offset))
+    limit = max(1, min(int(limit), T.MAX_ROWS_PER_SHEET))
+    max_cols = max(1, min(int(max_cols), T.MAX_COLUMNS_PER_SHEET))
+    if fmt == "csv":
+        from .csv import read_csv_grid  # lazy: keeps this module's imports light
+
+        page = read_csv_grid(path, offset=offset, limit=limit, max_cols=max_cols)
+        name = (title or "").strip() or Path(path).stem
+        return {
+            "sheets": [name], "sheet": name, "columns": list(page["columns"]), "rows": list(page["rows"]),
+            "total_rows": int(page["total_rows"]), "total_columns": int(page["total_columns"]),
+            "truncated": bool(page["truncated"]), "formulas_as_text": True,
+        }
+    if fmt != "xlsx":
+        raise ValueError(f"no grid for {fmt}")
+    # sheet_grid reads from the top: the page is sliced out of offset+limit
+    # rows, which is one read and at most the page plus its offset in
+    # memory (a 10,000-row sheet paged at 500 costs 10,000 rows once, on
+    # the last page — acceptable for a viewer that pages forward).
+    raw = sheet_grid(path, sheet or None, max_rows=offset + limit, max_cols=max_cols)
+    chosen = raw.get("sheet") or {}
+    listing = raw.get("sheets") or []
+    names = [str(s.get("name")) for s in listing]
+    all_rows = list(chosen.get("rows") or [])
+    page_rows = all_rows[offset: offset + limit]
+    facts = next((s for s in listing if str(s.get("name")) == str(chosen.get("name"))), {})
+    total_rows = max(0, int(facts.get("rows") or 0) - 1) if facts else len(all_rows)
+    total_columns = int(facts.get("cols") or len(chosen.get("columns") or []))
+    return {
+        "sheets": names, "sheet": str(chosen.get("name") or ""), "columns": list(chosen.get("columns") or []),
+        "rows": page_rows, "total_rows": total_rows, "total_columns": total_columns,
+        "truncated": total_rows > offset + len(page_rows) or total_columns > max_cols,
+        "formulas_as_text": True,
+    }
+
+
+__all__ = ["page_count", "rasterise_page", "sheet_grid", "grid_for"]

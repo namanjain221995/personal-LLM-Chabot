@@ -62,32 +62,60 @@ services:
       # status/doctor scripts read those lines to prove RDMA (not TCP) is used.
       NCCL_DEBUG: ${CLUSTER_NCCL_DEBUG:-INFO}
       NCCL_DEBUG_SUBSYS: ${CLUSTER_NCCL_DEBUG_SUBSYS:-INIT,NET}
+    # THE PER-RANK PROCESS ENVIRONMENT (candidate B). VLLM_ALLREDUCE_USE_FLASHINFER
+    # and VLLM_USE_V2_MODEL_RUNNER are read by vLLM as int(...) -- an empty
+    # string is a crash at import -- so they are never listed under
+    # `environment:` with an empty default. The launcher renders ONLY the keys
+    # that are set (CLUSTER_VLLM_* in .env) into .runtime/engine.env, and
+    # scripts/cluster-sync.sh ships the identical bytes to the worker, which
+    # reads its copy the same way: both ranks get the same variables or none.
+    env_file:
+      - path: ${TECHSARA_ENGINE_ENV:-.runtime/engine.env}
+        required: false
     devices:
       - /dev/infiniband:/dev/infiniband
     cap_add:
       - IPC_LOCK
+    # `core: 1` (no core dumps, contract §6.5) comes from the base overlay;
+    # Compose merges the two `ulimits` maps, so it is not repeated here.
     ulimits:
       memlock: -1
     stop_grace_period: 2m
-    # Engine-aware, self-healing health. /v1/models is answered by the API
-    # server even when the engine behind it is dead (observed 2026-08-25:
-    # worker gone, head "healthy", every completion hung). What actually
-    # happens when the worker disappears: after VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS
-    # (an environment default of 300 s inside vLLM - NOT --distributed-timeout-
-    # seconds, which only bounds torch.distributed init/collectives) the
-    # cross-node RPC times out, the engine is marked dead and the
-    # API server closes its listener - but the process does not exit, so
-    # `restart: unless-stopped` never fires. Hence:
-    #   * /health 200                      -> healthy
-    #   * /health 5xx (engine reported dead) -> kill the vllm process now
-    #   * no answer (000) while the process is younger than 15 min -> still
-    #     starting (a cold start takes 4-7 min), just report unhealthy
-    #   * no answer for 4 consecutive checks (2 min) after that -> the engine
-    #     died: kill the vllm process
-    # `init: true` puts tini at PID 1 so killing the real `vllm serve` process
-    # ends the container and Docker restarts it (PID 1 itself ignores signals
-    # it has no handler for, which is why `kill 1` is not used). The pgrep
-    # patterns use [ ] so they never match this healthcheck's own shell.
+    # REPORT-ONLY, WITH ONE LAST-RESORT TIER (contract §6, v2). Exactly one
+    # actor restarts the pair: the engine controller (`engine-controller`
+    # below). It confirms a dead engine (/health 5xx) in one observation, a
+    # dead worker rank through the sentinel in <= 5 s, and restarts the PAIR
+    # in order under the recovery lock, typically within 10 s. This
+    # healthcheck therefore does NOT act on 5xx any more: in round 1 its
+    # immediate kill landed in the 7-17 s the controller needs to capture
+    # diagnostics and restart the worker first, so the head was restarted
+    # twice -- the second time under a worker that had already joined the
+    # first restart's rendezvous, i.e. a stale rank and a burned budget
+    # unit. Tiering now:
+    #   * /health 200                              -> healthy, counter reset
+    #   * anything else (000, 5xx)                 -> exit 1 (docker ps shows
+    #     unhealthy; the controller has the real verdict) and count the miss
+    #   * VLLM_HEALTHCHECK_KILL_AFTER consecutive misses (default 8 = 4 min
+    #     at this interval) on a process older than VLLM_HEALTHCHECK_MIN_AGE_S
+    #     -> kill the vllm process so Docker restarts the container. Four
+    #     minutes is long after a live controller would have acted (10 s)
+    #     and after its whole cold-start budget would NOT have, so this
+    #     fires only when the controller is down or wrong -- the case it
+    #     exists for. The age guard keeps a cold start (4-7 min) from ever
+    #     being interrupted: it is the launcher-resolved
+    #     VLLM_HEALTHCHECK_MIN_AGE_S (default = the controller's
+    #     ENGINE_COLD_START_BUDGET_S, itself 900 by default), so a raised
+    #     budget for a slower image reaches this check too instead of a
+    #     hard-wired 15 min killing a head that is still legitimately
+    #     loading (review round 2). The same knob is shipped to the worker.
+    # Why a kill at all: /v1/models and /health are answered by the API
+    # server even when the engine behind it is dead (2026-08-25), and after
+    # vLLM's 300 s cross-node RPC timeout the API closes its listener but the
+    # process does not exit, so `restart: unless-stopped` never fires.
+    # `init: true` puts tini at PID 1 so killing the real `vllm serve`
+    # process ends the container (PID 1 ignores signals it has no handler
+    # for, which is why `kill 1` is not used). The pgrep patterns use [ ] so
+    # they never match this healthcheck's own shell.
     init: true
     healthcheck:
       test:
@@ -99,13 +127,26 @@ services:
           if [ "$$code" = 200 ]; then rm -f /tmp/health-missed; exit 0; fi;
           n=$$(( $$(cat /tmp/health-missed 2>/dev/null || echo 0) + 1 )); echo $$n > /tmp/health-missed;
           age=$$(ps -o etimes= -p "$$main" | tr -d ' ');
-          case "$$code" in 5*) echo "vLLM engine dead (HTTP $$code): restarting the head"; kill -9 "$$main";; esac;
-          if [ "$${age:-0}" -gt 900 ] && [ "$$n" -ge 4 ]; then echo "vLLM API unreachable for $$n checks after $${age}s: restarting the head"; kill -9 "$$main"; fi;
+          echo "vLLM /health=$$code (miss $$n of ${VLLM_HEALTHCHECK_KILL_AFTER:-8}; the engine controller decides, this check only reports)";
+          if [ "$${age:-0}" -gt "${VLLM_HEALTHCHECK_MIN_AGE_S:-${ENGINE_COLD_START_BUDGET_S:-900}}" ] && [ "$$n" -ge "${VLLM_HEALTHCHECK_KILL_AFTER:-8}" ]; then echo "vLLM /health failed $$n consecutive checks after $${age}s (age guard ${VLLM_HEALTHCHECK_MIN_AGE_S:-${ENGINE_COLD_START_BUDGET_S:-900}}s) and no controller acted: LAST RESORT, restarting the head"; kill -9 "$$main"; fi;
           exit 1
       interval: 30s
       timeout: 15s
       retries: 4
       start_period: 30m
+
+  # Dual mode: the head is host-network on CLUSTER_API_BIND_ADDRESS:VLLM_PORT
+  # (0.0.0.0 when published, otherwise the Docker bridge gateway -- both
+  # reachable from the host network, and the launcher-generated URL says
+  # which), and the worker sentinel (compose.cluster-worker.yaml) listens on
+  # the worker's RoCE rail-A address, which only this host can reach. The
+  # sentinel token comes from .runtime/controller.env (base overlay, env_file):
+  # scripts/cluster-sync.sh ships that same value in the worker's env and
+  # checks the two agree without printing either.
+  engine-controller:
+    environment:
+      HEAD_API_URL: ${ENGINE_HEAD_API_URL:-${TECHSARA_ENGINE_HEAD_API_URL:-http://${CLUSTER_API_BIND_ADDRESS:-127.0.0.1}:${VLLM_PORT:-8000}}}
+      SENTINEL_URL: http://${CLUSTER_WORKER_IP:?CLUSTER_WORKER_IP must be generated}:9839
 
   orchestrator:
     extra_hosts:

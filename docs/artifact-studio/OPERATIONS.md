@@ -8,7 +8,7 @@
 | feature `artifacts` (admin console, per member) | on | off for a member: text answers, 403 on the API |
 | `ARTIFACT_MAX_CONCURRENT_JOBS` | 1 | render slots in this process |
 | `ARTIFACT_MAX_OPEN_JOBS_PER_USER` | 3 | queued + running jobs one person may hold |
-| `ARTIFACT_LEASE_TTL_S` | 90 | a job whose heartbeat stops for this long is requeued by the maintenance pass |
+| `ARTIFACT_LEASE_TTL_S` | 90 | a job whose heartbeat stops for this long is requeued — the lease check runs every 30 s (`pipeline.REQUEUE_INTERVAL_S`), so a job orphaned by a restart is back in the queue within TTL + 30 s; until 2026-09-12 it waited for the 30-minute sweep |
 | `ARTIFACT_STAGE_TIMEOUT_S` | 900 | any stage past this fails (compose is `max(this, LLM_RECOVERY_WINDOW_S + 60)`); a Think compose measured 252 s with thinking on for three calls |
 | `ARTIFACT_RENDER_TIMEOUT_S` / `ARTIFACT_RENDER_MEMORY_MB` | 180 / 2048 | the render subprocess's wall clock and address space |
 | `ARTIFACT_MIN_FREE_MB` | 512 | acceptance and render refuse below this much free space on the reports volume |
@@ -36,7 +36,7 @@ Prefix `artifact job <8 chars> [<diagnostic ref>]`. A person-facing error never 
 
 ## Restarts and deploys
 
-A rolling deploy recreates the orchestrator: running jobs lose their process, their lease lapses within `ARTIFACT_LEASE_TTL_S`, the new process requeues them at startup (and the maintenance pass keeps doing so), and each resumes at the first stage without an output file — a job interrupted during render does not compose again. The chat turn re-attaches through `chat_requests` and its acceptance is keyed on the intent id, so the retry finds the same job. Nothing about a deploy touches published versions.
+A rolling deploy recreates the orchestrator: running jobs lose their process, their lease lapses within `ARTIFACT_LEASE_TTL_S`, the new process requeues them at startup and every 30 s after (the restart drill of 2026-09-12 caught a job stuck for the 30-minute sweep because its lease had not yet expired at startup), and each resumes at the first stage without an output file — a job interrupted during render does not compose again. The chat turn re-attaches through `chat_requests` and its acceptance is keyed on the intent id, so the retry finds the same job. Nothing about a deploy touches published versions.
 
 `deploy-rollback.sh` refuses to roll below V31 (the migration is additive: three tables, no changes to existing ones).
 

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import shlex
 import stat
+import subprocess
 import tempfile
 import unittest
 from dataclasses import replace
@@ -30,8 +32,10 @@ from techsara_cli.environment import (
     effective_user_environment,
     has_salesforce_credentials,
     main_context_notices,
+    prepare_controller_secrets,
     prepare_local_secrets,
     profile_context_length,
+    write_engine_env,
 )
 from techsara_cli.errors import TechSaraError
 from techsara_cli.model_manager import ModelInstall
@@ -152,6 +156,45 @@ class SecretPreparationTests(EnvironmentCase):
         self.assertNotEqual(values["SESSION_SECRET"], "change-me-session")
         self.assertNotIn("user-postgres", self.layout.secrets_env.read_text(encoding="utf-8"))
         self.assertNotIn("user-openai", self.layout.secrets_env.read_text(encoding="utf-8"))
+
+    def test_controller_token_lives_in_its_own_layer_and_the_user_value_wins(self) -> None:
+        """contract §6.4: ONE token for both nodes, in a 0600 file only the
+        engine-controller service reads -- never in secrets.env, which the
+        orchestrator inherits wholesale (review round 1, security)."""
+        with patch("techsara_cli.environment.secure_token", return_value="fixture-token-" + "t" * 40):
+            first = prepare_controller_secrets(self.layout, {})
+        self.assertEqual(first, {"CLUSTER_SENTINEL_TOKEN": "fixture-token-" + "t" * 40})
+        self.assertEqual(stat.S_IMODE(self.layout.controller_env.stat().st_mode), 0o600)
+        self.assertEqual(self.layout.controller_env, self.layout.runtime_dir / "controller.env")
+        with patch(
+            "techsara_cli.environment.secure_token",
+            side_effect=AssertionError("a second run must reuse the token, not mint one"),
+        ):
+            second = prepare_controller_secrets(self.layout, {})
+        self.assertEqual(second, first)
+        # .env wins on the head, and therefore (cluster-sync.sh reads this
+        # file) on the worker: there is no second precedence to disagree with.
+        user = prepare_controller_secrets(self.layout, {"CLUSTER_SENTINEL_TOKEN": " bring-your-own "})
+        self.assertEqual(user["CLUSTER_SENTINEL_TOKEN"], "bring-your-own")
+        self.assertEqual(parse_env_file(self.layout.controller_env)["CLUSTER_SENTINEL_TOKEN"], "bring-your-own")
+        # And a copy the v1 draft of cluster-sync.sh minted into secrets.env is retired.
+        profile = select_profile(cpu(), REPO_ROOT, reuse_running_models=True)
+        self.layout.secrets_env.write_text("CLUSTER_SENTINEL_TOKEN=stale-v1-copy\n", encoding="utf-8")
+        values, _warnings = prepare_local_secrets(self.layout, profile, {})
+        self.assertNotIn("CLUSTER_SENTINEL_TOKEN", values)
+        self.assertNotIn("stale-v1-copy", self.layout.secrets_env.read_text(encoding="utf-8"))
+
+    def test_engine_env_is_written_next_to_generated_env_only_with_the_keys_that_are_set(self) -> None:
+        self.assertEqual(write_engine_env(self.layout, {}), {})
+        text = self.layout.engine_env.read_text(encoding="utf-8")
+        self.assertEqual(self.layout.engine_env, self.layout.runtime_dir / "engine.env")
+        self.assertEqual([line for line in text.splitlines() if not line.startswith("#")], [])
+        self.assertEqual(stat.S_IMODE(self.layout.engine_env.stat().st_mode), 0o644)
+        written = write_engine_env(self.layout, {"CLUSTER_VLLM_ALLREDUCE_USE_FLASHINFER": "0"})
+        self.assertEqual(written, {"VLLM_ALLREDUCE_USE_FLASHINFER": "0"})
+        self.assertEqual(parse_env_file(self.layout.engine_env), {"VLLM_ALLREDUCE_USE_FLASHINFER": "0"})
+        with self.assertRaisesRegex(TechSaraError, "CLUSTER_VLLM_USE_V2_MODEL_RUNNER"):
+            write_engine_env(self.layout, {"CLUSTER_VLLM_USE_V2_MODEL_RUNNER": "maybe"})
 
     def test_switching_away_from_native_removes_only_ephemeral_api_aliases(self) -> None:
         native = select_profile(mac(64), REPO_ROOT, reuse_running_models=True)
@@ -673,6 +716,160 @@ class ClusterEnvironmentTests(EnvironmentCase):
         self.assertEqual(values["CLUSTER_API_BIND_ADDRESS"], "0.0.0.0")
         self.assertEqual(values["TECHSARA_PUBLISH_MODEL_PORTS"], "true")
 
+    def test_engine_controller_router_health_url_follows_the_published_router_port(self) -> None:
+        """The controller is host-network: only a PUBLISHED router is reachable.
+
+        v2: the router is an internal classifier; its health is a DEGRADED
+        signal, never a serving path, so the key is TECHSARA_ROUTER_HEALTH_URL.
+        """
+        profile = select_profile(nvidia(128, dgx=True), REPO_ROOT)
+        # Not published: nothing to probe, and the controller must be told so
+        # with an empty value rather than a URL that will never answer.
+        self.assertEqual(self._generate(profile, dict(self.DUAL))["TECHSARA_ROUTER_HEALTH_URL"], "")
+        published = self._generate(profile, {**self.DUAL, "PUBLISH_MODEL_PORTS": "true"})
+        self.assertEqual(published["TECHSARA_ROUTER_HEALTH_URL"], "http://127.0.0.1:8002/health")
+        custom = self._generate(
+            profile,
+            {**self.DUAL, "PUBLISH_MODEL_PORTS": "true", "VLLM_ROUTER_PORT": "18002",
+             "TECHSARA_MODEL_BIND_ADDRESS": "192.168.9.54"},
+        )
+        self.assertEqual(custom["TECHSARA_ROUTER_HEALTH_URL"], "http://192.168.9.54:18002/health")
+        # A shared router IS the main model: nothing separate to probe.
+        shared = replace(profile, router_model=profile.main_model, router_shared=True)
+        self.assertEqual(
+            self._generate(shared, {**self.DUAL, "PUBLISH_MODEL_PORTS": "true"})["TECHSARA_ROUTER_HEALTH_URL"],
+            "",
+        )
+        self.assertEqual(
+            environment.router_health_url(
+                publish_model_ports=True, router_shared=False, model_bind_address="0.0.0.0", router_port=8002
+            ),
+            "http://127.0.0.1:8002/health",
+        )
+        self.assertNotIn("TECHSARA_FALLBACK_HEALTH_URL", published, "v2 has no fallback engine")
+
+    def test_engine_controller_head_url_follows_where_the_head_actually_listens(self) -> None:
+        """Review round 1 blocker: a hard-wired 127.0.0.1 let the controller
+        publish DOWN for a healthy engine whenever the ports were not published.
+
+        Dual mode: the host-network head binds CLUSTER_API_BIND_ADDRESS, which
+        is 0.0.0.0 (reached on loopback) when published and the Docker bridge
+        gateway otherwise -- reachable from the host network either way.
+        Single node: only a PUBLISHED port reaches the bridge; empty means the
+        launcher does not start the controller.
+        """
+        profile = select_profile(nvidia(128, dgx=True), REPO_ROOT)
+        unpublished = self._generate(profile, dict(self.DUAL))
+        self.assertEqual(unpublished["CLUSTER_API_BIND_ADDRESS"], "172.17.0.1")
+        self.assertEqual(unpublished["TECHSARA_ENGINE_HEAD_API_URL"], "http://172.17.0.1:8000")
+        published = self._generate(profile, {**self.DUAL, "PUBLISH_MODEL_PORTS": "true", "VLLM_PORT": "18000"})
+        self.assertEqual(published["TECHSARA_ENGINE_HEAD_API_URL"], "http://127.0.0.1:18000")
+        single = self._generate(profile, {"CLUSTER_MODE": "single"})
+        self.assertEqual(single["TECHSARA_ENGINE_HEAD_API_URL"], "")
+        single_published = self._generate(
+            profile, {"CLUSTER_MODE": "single", "PUBLISH_MODEL_PORTS": "true", "TECHSARA_MODEL_BIND_ADDRESS": "192.168.9.54"}
+        )
+        self.assertEqual(single_published["TECHSARA_ENGINE_HEAD_API_URL"], "http://192.168.9.54:8000")
+        self.assertEqual(
+            environment.engine_head_api_url(
+                cluster_mode="single", publish_model_ports=True, model_bind_address="0.0.0.0",
+                api_bind_address="", vllm_port="8000",
+            ),
+            "http://127.0.0.1:8000",
+        )
+
+    def test_gpu_exporter_urls_for_the_participation_probe_are_dual_mode_only(self) -> None:
+        profile = select_profile(nvidia(128, dgx=True), REPO_ROOT)
+        dual = self._generate(profile, dict(self.DUAL))
+        # The full scrape path, as the controller's own default spells it.
+        self.assertEqual(dual["TECHSARA_HEAD_GPU_EXPORTER_URL"], "http://127.0.0.1:9835/metrics")
+        # No management address known: the worker sample is "not observable", never a made-up host.
+        self.assertEqual(dual["TECHSARA_WORKER_GPU_EXPORTER_URL"], "")
+        with_worker = self._generate(profile, {**self.DUAL, "CLUSTER_WORKER_MGMT_IP": "192.168.9.68"})
+        self.assertEqual(with_worker["TECHSARA_WORKER_GPU_EXPORTER_URL"], "http://192.168.9.68:9835/metrics")
+        single = self._generate(profile, {"CLUSTER_MODE": "single"})
+        self.assertEqual(single["TECHSARA_HEAD_GPU_EXPORTER_URL"], "")
+        self.assertEqual(single["TECHSARA_WORKER_GPU_EXPORTER_URL"], "")
+
+    def test_worker_gpu_exporter_url_renders_from_the_remote_ocr_host_on_this_production(self) -> None:
+        """Review round 2 (sre, major): THIS production's .env has no
+        CLUSTER_WORKER_MGMT_IP and an empty MONITORING_WORKER_BIND, only the
+        OCR_REMOTE_BASE_URL scripts/ocr.sh wrote -- and the worker exporter URL
+        rendered empty, so the readiness sequence never observed participation
+        and the controller stayed DEGRADED. The OCR host is the worker's
+        management address, and the URL must render from it."""
+        profile = select_profile(nvidia(128, dgx=True), REPO_ROOT)
+        production = {
+            **self.DUAL,
+            "MONITORING_WORKER_BIND": "",
+            "OCR_REMOTE_BASE_URL": "http://192.168.9.68:30004/v1",
+        }
+        values = self._generate(profile, production)
+        self.assertEqual(values["CLUSTER_WORKER_MGMT_IP"], "192.168.9.68")
+        self.assertEqual(values["TECHSARA_WORKER_GPU_EXPORTER_URL"], "http://192.168.9.68:9835/metrics")
+        self.assertEqual(values["TECHSARA_HEAD_GPU_EXPORTER_URL"], "http://127.0.0.1:9835/metrics")
+        # The OCR engine itself still resolves to the remote address (unchanged behaviour).
+        self.assertEqual(values["OCR_BASE_URL"], "http://192.168.9.68:30004/v1")
+        # An explicit management key still outranks the derived host.
+        explicit = self._generate(profile, {**production, "CLUSTER_WORKER_MGMT_IP": "10.0.0.9"})
+        self.assertEqual(explicit["TECHSARA_WORKER_GPU_EXPORTER_URL"], "http://10.0.0.9:9835/metrics")
+
+    def test_controller_code_sha_is_generated_from_the_controller_program_and_changes_only_with_it(self) -> None:
+        """Review round 2 (sre, major): a routine deploy never restarted the
+        engine controller when only its CODE changed, because the program is a
+        bind mount and `up -d` recreates on a definition change only. The
+        launcher renders the sha256 of controller.py+common.py into generated.env
+        (ENGINE_CONTROLLER_CODE_SHA, part of the service's environment): the
+        same bytes give the same digest -- no recreate -- and a changed byte a
+        different one."""
+        program = self.project / "monitoring" / "engine-controller"
+        program.mkdir(parents=True)
+        (program / "controller.py").write_bytes(b"print('controller v1')\n")
+        (program / "common.py").write_bytes(b"VERSION = 1\n")
+        expected = hashlib.sha256(b"print('controller v1')\nVERSION = 1\n").hexdigest()
+        self.assertEqual(environment.controller_code_sha(self.project), expected)
+        # The shell side computes it the same way (scripts/cluster-sync.sh
+        # sentinel_code_sha: `cat a b | sha256sum`), so the two never differ.
+        shell = subprocess.run(
+            ["bash", "-c", 'cat "$1" "$2" | sha256sum | cut -d" " -f1', "_", str(program / "controller.py"), str(program / "common.py")],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        self.assertEqual(shell, expected)
+        profile = select_profile(nvidia(128, dgx=True), REPO_ROOT)
+        first = self._generate(profile, dict(self.DUAL))
+        self.assertEqual(first["ENGINE_CONTROLLER_CODE_SHA"], expected)
+        # Unchanged code, a second `up`: the identical digest, so the
+        # engine-controller definition is unchanged and `up -d` recreates nothing.
+        second = self._generate(profile, dict(self.DUAL))
+        self.assertEqual(second["ENGINE_CONTROLLER_CODE_SHA"], first["ENGINE_CONTROLLER_CODE_SHA"])
+        # A one-byte change in either file is a new digest, i.e. a definition change.
+        (program / "common.py").write_bytes(b"VERSION = 2\n")
+        changed = self._generate(profile, dict(self.DUAL))
+        self.assertNotEqual(changed["ENGINE_CONTROLLER_CODE_SHA"], first["ENGINE_CONTROLLER_CODE_SHA"])
+        self.assertEqual(changed["ENGINE_CONTROLLER_CODE_SHA"], hashlib.sha256(b"print('controller v1')\nVERSION = 2\n").hexdigest())
+        # Single mode renders it too (the controller runs on one node as well).
+        self.assertEqual(self._generate(profile, {"CLUSTER_MODE": "single"})["ENGINE_CONTROLLER_CODE_SHA"], changed["ENGINE_CONTROLLER_CODE_SHA"])
+        # No program (a checkout without the controller): empty, never an error.
+        (program / "controller.py").unlink()
+        self.assertEqual(environment.controller_code_sha(self.project), "")
+        self.assertEqual(self._generate(profile, dict(self.DUAL))["ENGINE_CONTROLLER_CODE_SHA"], "")
+
+    def test_main_model_image_must_be_digest_pinned_and_gdn_argument_renders_for_both_shapes(self) -> None:
+        """Candidate B: only the MAIN engine's image may move, and only to a digest."""
+        profile = select_profile(nvidia(128, dgx=True), REPO_ROOT)
+        candidate = "vllm/vllm-openai@sha256:" + "8" * 64
+        values = self._generate(profile, {**self.DUAL, "MAIN_MODEL_IMAGE": candidate, "CLUSTER_GDN_PREFILL_BACKEND": "flashinfer"})
+        self.assertNotIn("MAIN_MODEL_IMAGE", values, "the compose file reads the .env key directly")
+        self.assertEqual(values["MAIN_MODEL_GDN_PREFILL_ARGUMENT"], "--gdn-prefill-backend flashinfer")
+        self.assertIn("--gdn-prefill-backend flashinfer", values["CLUSTER_ENGINE_ARGS"])
+        self.assertEqual(values["CLUSTER_GDN_PREFILL_BACKEND"], "flashinfer")
+        self.assertEqual(self._generate(profile, dict(self.DUAL))["MAIN_MODEL_GDN_PREFILL_ARGUMENT"], "")
+        for bad in ("vllm/vllm-openai:latest", "vllm/vllm-openai:nightly", "sha256:" + "8" * 64, "vllm/vllm-openai@sha256:abc"):
+            with self.subTest(image=bad), self.assertRaisesRegex(TechSaraError, "MAIN_MODEL_IMAGE"):
+                self._generate(profile, {**self.DUAL, "MAIN_MODEL_IMAGE": bad})
+        self.assertEqual(environment.main_model_image({}), "")
+        self.assertEqual(environment.main_model_image({"MAIN_MODEL_IMAGE": f" {candidate} "}), candidate)
+
     def test_dual_mode_is_rejected_on_every_non_dgx_profile(self) -> None:
         for name, hardware in (("nvidia-large", nvidia(80)), ("local-minimal", cpu()), ("mac", mac(64))):
             with self.subTest(profile=name), self.assertRaisesRegex(
@@ -1090,3 +1287,34 @@ class SidecarMemoryKnobTests(EnvironmentCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StageControllerCodeTests(unittest.TestCase):
+    """The controller's program is staged under .runtime/ for its bind mount
+    (a checkout of the working directory must not empty the container's /app)."""
+
+    def test_stages_the_three_files_atomically_and_idempotently(self) -> None:
+        import tempfile
+
+        from techsara_cli.environment import (
+            ENGINE_CONTROLLER_CODE_FILES,
+            ENGINE_CONTROLLER_DIR,
+            RuntimeLayout,
+            stage_controller_code,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / ENGINE_CONTROLLER_DIR
+            src.mkdir(parents=True)
+            for name in ENGINE_CONTROLLER_CODE_FILES + ("sentinel.py",):
+                (src / name).write_text(f"# {name}\n", encoding="utf-8")
+            layout = RuntimeLayout.for_project(root) if hasattr(RuntimeLayout, "for_project") else RuntimeLayout(project_root=root, runtime_dir=root / ".runtime")
+            target = stage_controller_code(layout)
+            self.assertEqual(target, root / ".runtime" / "engine-controller")
+            for name in ENGINE_CONTROLLER_CODE_FILES + ("sentinel.py",):
+                self.assertEqual((target / name).read_text(encoding="utf-8"), f"# {name}\n")
+            self.assertFalse(list(target.glob(".*.tmp")), "no temp files are left behind")
+            (src / "controller.py").write_text("# changed\n", encoding="utf-8")
+            stage_controller_code(layout)
+            self.assertEqual((target / "controller.py").read_text(encoding="utf-8"), "# changed\n")

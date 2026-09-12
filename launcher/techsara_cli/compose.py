@@ -118,6 +118,12 @@ class ComposeManager:
         values.update(parse_env_file(self.generated_env))
         values["TECHSARA_GENERATED_ENV"] = str(self.generated_env)
         values["TECHSARA_SECRET_ENV"] = str(self.secrets_env)
+        # The DGX overlays' two optional env_file layers sit next to
+        # generated.env; generated.env itself names them, this is the
+        # fallback for a generated.env written before they existed.
+        runtime = self.generated_env.parent
+        values.setdefault("TECHSARA_CONTROLLER_ENV", str(runtime / "controller.env"))
+        values.setdefault("TECHSARA_ENGINE_ENV", str(runtime / "engine.env"))
         return values
 
     def run(self, *args: str, timeout: float = 300.0) -> object:

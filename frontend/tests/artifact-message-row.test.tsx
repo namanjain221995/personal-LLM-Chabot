@@ -9,6 +9,7 @@
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import type { OpenArtifact } from '@/components/artifacts/ArtifactCards';
 import { MessageRow } from '@/components/MessageRow';
 import type { ArtifactRef, ChatMessage, Meta } from '@/lib/types';
 
@@ -59,7 +60,7 @@ const answer = (meta: Meta): ChatMessage => ({
   meta,
 });
 
-function renderAnswer(meta: Meta, onOpenArtifact?: (a: ArtifactRef, originId: string) => void) {
+function renderAnswer(meta: Meta, onOpenArtifact?: OpenArtifact) {
   return render(
     <MessageRow
       message={answer(meta)}
@@ -72,12 +73,44 @@ function renderAnswer(meta: Meta, onOpenArtifact?: (a: ArtifactRef, originId: st
 }
 
 describe('MessageRow · meta.artifacts', () => {
-  it('renders one card per ref and keeps the proof drawer for the same meta', () => {
+  it('renders one group per ref, one card per file, and keeps the proof drawer for the same meta', () => {
+    // CONTRACT-2 §9: one FileCard per file under a version header.
     renderAnswer({ route: 'artifact', artifacts: [ref()], sql: 'SELECT 1' });
     expect(screen.getAllByTestId('artifact-card').length).toBe(1);
+    expect(screen.getAllByTestId('file-card').length).toBe(1);
     expect(screen.getByRole('button', { name: /Open Onboarding SOP/ })).toBeTruthy();
     // The proof drawer is untouched: its SQL section is still offered.
     expect(screen.getByText('View SQL')).toBeTruthy();
+  });
+
+  it('renders legacy report_files through the SAME card component, and a file only once', () => {
+    // CONTRACT-2 §9: `meta.report_files` render through FileCard via the
+    // legacy adapter (inside the drawer's Files section), never twice for
+    // one file — a name that is also an artifact file is left to the
+    // artifact's own card.
+    renderAnswer({
+      route: 'report',
+      report_files: [
+        { filename: 'pipeline-review.docx', type: 'docx', size: 48_213 },
+        { filename: 'onboarding-sop-v1.docx', type: 'docx', size: 40_000 },
+      ],
+      artifacts: [ref()],
+    });
+    // The artifact's card in the thread …
+    expect(screen.getAllByTestId('artifact-card').length).toBe(1);
+    // … and the drawer offers only the report file the artifact does not cover.
+    expect(screen.getByRole('button', { name: 'Files (1)' })).toBeTruthy();
+    const cards = screen.getAllByTestId('file-card');
+    expect(cards.length).toBe(2);
+    // The drawer sits above the artifact cards in the row.
+    expect(cards.map((c) => c.getAttribute('data-file-key'))).toEqual([
+      'legacy:pipeline-review.docx',
+      `${ID}:1:docx:onboarding-sop-v1.docx`,
+    ]);
+    expect(screen.getByRole('link', { name: 'Download pipeline-review.docx' }).getAttribute('href')).toBe(
+      '/api/reports/pipeline-review.docx',
+    );
+    expect(screen.getAllByRole('link', { name: 'Download onboarding-sop-v1.docx' }).length).toBe(1);
   });
 
   it('renders no card section when the key is absent or empty', () => {
@@ -88,11 +121,31 @@ describe('MessageRow · meta.artifacts', () => {
     expect(screen.queryByTestId('artifact-cards')).toBeNull();
   });
 
-  it('hands Open to the host with the ref and the card id', () => {
+  it('hands Open to the host with the ref, the card id, the file key and the message siblings', () => {
+    // CONTRACT-2 §9: the panel opens on a (group, fileKey); the card id is
+    // the FILE card's (was `artifact-card-<id>-v1` for the version card).
     const onOpen = vi.fn();
     renderAnswer({ route: 'artifact', artifacts: [ref()] }, onOpen);
     fireEvent.click(screen.getByRole('button', { name: /Open Onboarding SOP/ }));
-    expect(onOpen).toHaveBeenCalledWith(expect.objectContaining({ artifact_id: ID }), `artifact-card-${ID}-v1`);
+    expect(onOpen).toHaveBeenCalledWith(
+      expect.objectContaining({ artifact_id: ID }),
+      `artifact-file-${ID}_1_docx_onboarding-sop-v1_docx`,
+      `${ID}:1:docx:onboarding-sop-v1.docx`,
+      [expect.objectContaining({ artifact_id: ID })],
+    );
+  });
+
+  it('marks the card of the file the panel is showing', () => {
+    render(
+      <MessageRow
+        message={answer({ route: 'artifact', artifacts: [ref()] })}
+        isLast
+        onRegenerate={vi.fn()}
+        onRetry={vi.fn()}
+        activeArtifactKey={`${ID}:1:docx:onboarding-sop-v1.docx`}
+      />,
+    );
+    expect(screen.getByRole('button', { name: /Open Onboarding SOP/ }).getAttribute('aria-current')).toBe('true');
   });
 
   it('still renders and downloads without a host panel', () => {
@@ -100,6 +153,23 @@ describe('MessageRow · meta.artifacts', () => {
     expect(screen.getByRole('link', { name: 'Download onboarding-sop-v1.docx' })).toBeTruthy();
     // Open without a host is a no-op, not a crash.
     fireEvent.click(screen.getByRole('button', { name: /Open Onboarding SOP/ }));
+  });
+});
+
+describe('MessageRow · no "Memory updated" chip on an artifact turn', () => {
+  it('renders no chip when the meta carries no memory_updated — nothing is synthesised', () => {
+    // CONTRACT-2 §8/§9: the backend no longer sends `memory_updated` on an
+    // artifact turn and the frontend must not invent one.
+    renderAnswer({ route: 'artifact', artifacts: [ref()], effort: 'think', model: 'qwen' });
+    expect(screen.queryByText('Memory updated')).toBeNull();
+    const { unmount } = renderAnswer({ route: 'artifact', artifacts: [ref()], memory_updated: [] });
+    expect(screen.queryByText('Memory updated')).toBeNull();
+    unmount();
+  });
+
+  it('still renders the chip exactly as before when a turn does carry facts', () => {
+    renderAnswer({ route: 'chat', memory_updated: ['Prefers concise answers'] });
+    expect(screen.getByText('Memory updated').getAttribute('title')).toBe('Prefers concise answers');
   });
 });
 

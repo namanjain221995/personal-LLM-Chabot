@@ -13,8 +13,9 @@
  * Path validation is the part that matters here. The optional catch-all
  * accepts any number of segments — none at all is the listing — so the route
  * matches them against the SMALL closed grammar the API defines: ids are 32
- * lowercase hex, versions and pages are integers, formats are the four the
- * studio writes. It answers 404 for anything else BEFORE an upstream request
+ * lowercase hex, file ids 16 (CONTRACT-2 §2), versions and pages are
+ * integers, formats are the five the studio writes. It answers 404 for
+ * anything else BEFORE an upstream request
  * exists. Traversal, encoded separators, a `..`, an unknown verb: none of
  * them becomes an outbound request, exactly as the /api/reports proxy refuses
  * an unsafe filename. A wrong METHOD on a known path gets the same 404, not a
@@ -25,6 +26,12 @@
  * Unlike the reports proxy this one passes `Range` up and `Content-Range` /
  * `Accept-Ranges` / `ETag` down: a page viewer that seeks, or a browser that
  * resumes a download, must not be forced to re-fetch a whole file.
+ *
+ * Nothing is buffered on the way back. The body is the upstream's own
+ * ReadableStream handed to the Response — which is what lets `/zip` work at
+ * all: the orchestrator streams the archive (ZIP_STORED, 64 KiB reads) and
+ * a 200 MB version must pass through this process at the size of one chunk,
+ * not of the whole file.
  */
 
 export const runtime = 'nodejs';
@@ -66,9 +73,11 @@ async function readBounded(req: Request, limit: number): Promise<string | null> 
 }
 
 const ID = /^[a-f0-9]{32}$/;
+/** A file id: the first 16 hex characters of the pipeline's sha1 (CONTRACT-2 §2). */
+const FILE_ID = /^[a-f0-9]{16}$/;
 const INT = /^(0|[1-9][0-9]{0,8})$/;
 const POSITIVE_INT = /^[1-9][0-9]{0,8}$/;
-const FORMATS = new Set(['pdf', 'docx', 'pptx', 'xlsx']);
+const FORMATS = new Set(['pdf', 'docx', 'pptx', 'xlsx', 'csv']);
 const PAGE_PNG = /^([1-9][0-9]{0,4})\.png$/;
 /** A segment that still holds a separator, a dot-segment or encoding. */
 const BAD_SEGMENT = /[\\/%]|\.\./;
@@ -94,12 +103,21 @@ const QUERY_RULES: Record<string, Record<string, (value: string) => boolean>> = 
     rows: (v) => POSITIVE_INT.test(v) && Number(v) <= 10_000,
     cols: (v) => POSITIVE_INT.test(v) && Number(v) <= 200,
   },
+  // /grid (xlsx AND csv, CONTRACT-2 §2): the file is named by id, the window
+  // by offset/limit. A malformed `file` is dropped like any other bad value;
+  // the upstream then refuses the request as its own 422, not as ours.
+  grid: {
+    file: (v) => FILE_ID.test(v),
+    sheet: (v) => v.length > 0 && v.length <= SHEET_NAME_MAX && !CONTROL_CHARS.test(v),
+    offset: (v) => INT.test(v),
+    limit: (v) => POSITIVE_INT.test(v) && Number(v) <= 10_000,
+  },
 };
 
 export interface ResolvedArtifactPath {
   /** The upstream path, rebuilt from validated pieces — never the raw input. */
   upstreamPath: string;
-  /** Which query rule set applies (`list` · `file` · `page` · `sheets` · none). */
+  /** Which query rule set applies (`list` · `file` · `page` · `sheets` · `grid` · none). */
   query: keyof typeof QUERY_RULES | null;
   /** Methods the route accepts. */
   methods: readonly string[];
@@ -160,6 +178,22 @@ export function resolveArtifactPath(segments: readonly string[]): ResolvedArtifa
   if (fourth === 'file') {
     if (fifth === undefined || !FORMATS.has(fifth)) return null;
     return { upstreamPath: `${base}/file/${fifth}`, query: 'file', methods: ['GET', 'HEAD'] };
+  }
+  // /artifacts/{id}/v/{n}/f/{file_id} — one file by its own id, the same
+  // headers, ETag, Range and disposition rules as /file/{format}.
+  if (fourth === 'f') {
+    if (fifth === undefined || !FILE_ID.test(fifth)) return null;
+    return { upstreamPath: `${base}/f/${fifth}`, query: 'file', methods: ['GET', 'HEAD'] };
+  }
+  // /artifacts/{id}/v/{n}/zip — every file of the version, streamed.
+  if (fourth === 'zip') {
+    if (fifth !== undefined) return null;
+    return { upstreamPath: `${base}/zip`, query: null, methods: ['GET'] };
+  }
+  // /artifacts/{id}/v/{n}/grid?file=&sheet=&offset=&limit=
+  if (fourth === 'grid') {
+    if (fifth !== undefined) return null;
+    return { upstreamPath: `${base}/grid`, query: 'grid', methods: ['GET'] };
   }
   if (fourth === 'preview') {
     if (fifth === undefined) {

@@ -1778,6 +1778,58 @@ CREATE INDEX IF NOT EXISTS idx_artifact_versions_job
 """
 
 
+_MIGRATION_V32 = """
+-- V32 (2026-09-12): evaluator correlation and reproducible trace envelopes.
+-- V30 is already shipped, so these additions are append-only.
+ALTER TABLE query_traces
+    ADD COLUMN IF NOT EXISTS request_id text NOT NULL DEFAULT '';
+ALTER TABLE query_traces
+    ADD COLUMN IF NOT EXISTS test_case_id text;
+ALTER TABLE query_traces
+    ADD COLUMN IF NOT EXISTS versions jsonb NOT NULL DEFAULT '{}'::jsonb;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_query_traces_request
+    ON query_traces (request_id) WHERE request_id <> '';
+CREATE INDEX IF NOT EXISTS idx_query_traces_test_case
+    ON query_traces (test_case_id, started_at DESC) WHERE test_case_id IS NOT NULL;
+
+ALTER TABLE query_trace_events
+    ADD COLUMN IF NOT EXISTS started_at timestamptz;
+ALTER TABLE query_trace_events
+    ADD COLUMN IF NOT EXISTS completed_at timestamptz;
+ALTER TABLE query_trace_events
+    ADD COLUMN IF NOT EXISTS component_version text NOT NULL DEFAULT '';
+
+-- Existing V30 point events happened at created_at. Preserve that truth
+-- rather than fabricating elapsed spans during migration.
+UPDATE query_trace_events
+   SET started_at = COALESCE(started_at, created_at),
+       completed_at = COALESCE(completed_at, created_at)
+ WHERE started_at IS NULL OR completed_at IS NULL;
+ALTER TABLE query_trace_events ALTER COLUMN started_at SET NOT NULL;
+ALTER TABLE query_trace_events ALTER COLUMN completed_at SET NOT NULL;
+"""
+
+
+_MIGRATION_V33 = """
+-- V33 (2026-09-12): availability programme, strict one-model mode
+-- (docs/availability/CONTRACT.md §8.3). A chat request the main model cannot
+-- take right now — its breaker is OPEN, or the controller reports it
+-- STARTING / WEDGED / RECOVERING / DOWN — is neither failed nor answered by
+-- another model: the row goes `queued`, the person reads one truthful line,
+-- and the SAME generation resumes when the model is READY. A row a process
+-- parked (the wait outran LLM_QUEUE_MAX_WAIT_S) or lost stays `queued` until
+-- the resume sweep (app/continuity.py) or the browser's re-attach picks it
+-- up. Same shape as V14's `web_crawls_status` widening: drop and re-add the
+-- CHECK, and let the open-rows index see the new state.
+ALTER TABLE chat_requests DROP CONSTRAINT IF EXISTS chat_requests_status;
+ALTER TABLE chat_requests ADD CONSTRAINT chat_requests_status CHECK
+    (status IN ('accepted', 'running', 'queued', 'completed', 'failed', 'cancelled', 'interrupted'));
+DROP INDEX IF EXISTS idx_chat_requests_open;
+CREATE INDEX IF NOT EXISTS idx_chat_requests_open
+    ON chat_requests (status) WHERE status IN ('accepted', 'running', 'queued', 'interrupted');
+"""
+
+
 _MIGRATIONS: tuple = (
     (1, _MIGRATION_V1),
     (2, _MIGRATION_V2),
@@ -1810,6 +1862,8 @@ _MIGRATIONS: tuple = (
     (29, _MIGRATION_V29),
     (30, _MIGRATION_V30),
     (31, _MIGRATION_V31),
+    (32, _MIGRATION_V32),
+    (33, _MIGRATION_V33),
 )
 
 #: The version `init_schema` brings a database up to. Exported so callers (and
@@ -5776,7 +5830,9 @@ def resume_chat_request(
     racing to resume the same intent cannot both win — the loser sees the
     row unchanged and attaches to the winner's generation instead."""
     ts = _now()
-    allowed = ["interrupted", "accepted", "running"] + (["failed", "cancelled"] if reopen_finished else [])
+    # `queued` (V32): a row parked for a recovering model is open too — the
+    # resume sweep and the browser's re-attach both come through here.
+    allowed = ["interrupted", "accepted", "running", "queued"] + (["failed", "cancelled"] if reopen_finished else [])
     with connection() as con:
         if expected_generation_id is None:
             row = con.execute(
@@ -5832,12 +5888,110 @@ def delete_failure_record(conversation_id: str, generation_id: str) -> bool:
 
 def interrupt_open_chat_requests() -> int:
     """Startup (or orderly shutdown): every request this process could have
-    been running is now 'interrupted'. Returns how many."""
+    been running is now 'interrupted'. Returns how many. A `queued` row is
+    left as it is: it says the truth about itself whichever process held
+    it (waiting for the main model), and the resume sweep reads it by name."""
     with connection() as con:
         rows = con.execute(
             "UPDATE chat_requests SET status = 'interrupted', updated_at = %s "
             "WHERE status IN ('accepted', 'running') RETURNING intent_id",
             (_now(),),
+        ).fetchall()
+    return len(rows)
+
+
+def park_chat_request(intent_id: str, generation_id: str) -> Optional[dict]:
+    """V32 (CONTRACT §8.3 step 1): the generation is waiting for the main
+    model — the row says `queued`. Conditional on the generation the caller
+    holds and on the row being live (accepted/running), so a Stop that
+    landed meanwhile is never overwritten. Returns the row when it moved."""
+    with connection() as con:
+        row = con.execute(
+            "UPDATE chat_requests SET status = 'queued', updated_at = %s "
+            "WHERE intent_id = %s AND generation_id = %s AND status IN ('accepted', 'running') "
+            "RETURNING *",
+            (_now(), intent_id, generation_id),
+        ).fetchone()
+    return _chat_request_row(row) if row is not None else None
+
+
+def resume_queued_chat_request(intent_id: str, generation_id: str, *, new_attempt: bool) -> Optional[dict]:
+    """V32 (CONTRACT §8.3 step 4): the SAME generation goes on — the row is
+    `running` again under the generation it already names, and, for a
+    recovery (not a mere admission wait), `attempt` moves on by one.
+    Conditional on `queued` + the generation, so a sweep or a re-attach
+    that took the row over meanwhile wins and this caller sees None."""
+    with connection() as con:
+        row = con.execute(
+            "UPDATE chat_requests SET status = 'running', "
+            "attempt = attempt + %s, updated_at = %s "
+            "WHERE intent_id = %s AND generation_id = %s AND status = 'queued' RETURNING *",
+            (1 if new_attempt else 0, _now(), intent_id, generation_id),
+        ).fetchone()
+    return _chat_request_row(row) if row is not None else None
+
+
+def list_resumable_chat_requests(statuses: Sequence[str], *, max_age_s: float, limit: int = 200) -> list:
+    """Rows the resume sweep may act on (CONTRACT §8.4 v2): in one of
+    `statuses` and resumable from their snapshot. Oldest first.
+
+    `max_age_s` bounds `interrupted` rows ONLY, measured from `created_at`
+    — the moment the send was accepted: an interrupted row accepted longer
+    ago than that is a request nobody is waiting for any more, and
+    re-running it would only surprise a thread. A `queued` row is listed
+    whatever its age: it was parked on purpose, for exactly this sweep,
+    and CONTRACT §2 (DOWN) promises it is never lost — a recovery that
+    outlasts the age limit (a budget-exhausted night) must still resume
+    every parked request when an operator brings the pair back.
+    """
+    with connection() as con:
+        rows = con.execute(
+            "SELECT * FROM chat_requests WHERE status = ANY(%s) AND resumable "
+            "AND (status = 'queued' OR created_at > %s - (%s * interval '1 second')) "
+            "ORDER BY created_at LIMIT %s",
+            (list(statuses), _now(), float(max_age_s), int(limit)),
+        ).fetchall()
+    return [_chat_request_row(r) for r in rows]
+
+
+def count_chat_requests(status: str) -> int:
+    """How many rows are in `status` right now (the durable half of
+    `llm_queued_generations`, app/continuity.py)."""
+    with connection() as con:
+        row = con.execute(
+            "SELECT count(*) AS n FROM chat_requests WHERE status = %s", (status,)
+        ).fetchone()
+    return int(row["n"]) if row else 0
+
+
+def generation_streamed(generation_id: str) -> bool:
+    """Did this attempt reach a viewer with at least one token? The attempt
+    ledger (usage_events, one row per generation_id, written by the chat
+    worker's finally — so by an orderly shutdown, not by a crash) records
+    `ttft_ms` only when a token was streamed. CONTRACT §8.4: such an
+    attempt is never re-run by itself."""
+    with connection() as con:
+        row = con.execute(
+            "SELECT ttft_ms FROM usage_events WHERE generation_id = %s", (str(generation_id),)
+        ).fetchone()
+    return row is not None and row["ttft_ms"] is not None
+
+
+def cancel_parked_chat_requests(conversation_id: str, *, keep: Sequence[str]) -> int:
+    """A newer send in the conversation supersedes every row still parked
+    `queued` for it (CONTRACT §8.3 with the /chat rule "the newest message
+    wins"): they are `cancelled` with the same error a replaced live
+    generation carries, so the resume sweep never answers an old question
+    below the newer exchange. `keep` names the intents that must not be
+    touched — the new send itself and any generation this process still
+    holds (its own worker writes its terminal status). Returns how many."""
+    ts = _now()
+    with connection() as con:
+        rows = con.execute(
+            "UPDATE chat_requests SET status = 'cancelled', error = %s, updated_at = %s, finished_at = %s "
+            "WHERE conversation_id = %s AND status = 'queued' AND NOT (intent_id = ANY(%s)) "
+            "RETURNING intent_id",
+            ("replaced by a newer message", ts, ts, conversation_id, list(keep)),
         ).fetchall()
     return len(rows)
 
@@ -5854,6 +6008,9 @@ def start_query_trace(
     original_question: str,
     requested_mode: str,
     resolved_mode: str = "",
+    request_id: str = "",
+    test_case_id: Optional[str] = None,
+    versions: Optional[dict] = None,
 ) -> None:
     """Create the durable root before any routing or retrieval work begins."""
     now = _now()
@@ -5862,8 +6019,8 @@ def start_query_trace(
             """INSERT INTO query_traces
                    (trace_id, conversation_id, user_id, workspace_id,
                     original_question, requested_mode, resolved_mode,
-                    final_status, started_at)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, 'running', %s)
+                    request_id, test_case_id, versions, final_status, started_at)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'running', %s)
                ON CONFLICT (trace_id) DO NOTHING""",
             (
                 trace_id,
@@ -5873,6 +6030,9 @@ def start_query_trace(
                 _text(original_question or ""),
                 _text(requested_mode or ""),
                 _text(resolved_mode or ""),
+                _text(request_id or ""),
+                _text(test_case_id) if test_case_id else None,
+                _json_param(versions or {}),
                 now,
             ),
         )
@@ -5888,23 +6048,31 @@ def append_query_trace_event(
     duration_ms: Optional[int] = None,
     error_type: str = "",
     error_message: str = "",
+    component_version: str = "",
 ) -> None:
     """Append an ordered checkpoint; retries are idempotent by sequence."""
+    completed_at = _now()
+    elapsed = max(0, int(duration_ms or 0))
+    started_at = completed_at - timedelta(milliseconds=elapsed)
     with connection() as con:
         con.execute(
             """INSERT INTO query_trace_events
                    (trace_id, sequence_number, stage, status, created_at,
-                    duration_ms, component, details, error_type, error_message)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    started_at, completed_at, duration_ms, component,
+                    component_version, details, error_type, error_message)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                ON CONFLICT (trace_id, sequence_number) DO NOTHING""",
             (
                 trace_id,
                 int(sequence_number),
                 _text(stage),
                 _text(status),
-                _now(),
+                completed_at,
+                started_at,
+                completed_at,
                 duration_ms,
                 _text(component or ""),
+                _text(component_version or ""),
                 _json_param(details or {}),
                 _text(error_type or ""),
                 _text(error_message or ""),
@@ -5962,8 +6130,9 @@ def get_query_trace(trace_id: str, user_id: int) -> Optional[dict]:
         if root is None:
             return None
         events = con.execute(
-            """SELECT sequence_number, stage, status, created_at, duration_ms,
-                      component, details, error_type, error_message
+            """SELECT sequence_number, stage, status, created_at, started_at,
+                      completed_at, duration_ms, component, component_version,
+                      details, error_type, error_message
                  FROM query_trace_events
                 WHERE trace_id = %s
                 ORDER BY sequence_number""",
@@ -5975,7 +6144,8 @@ def get_query_trace(trace_id: str, user_id: int) -> Optional[dict]:
     trace["events"] = []
     for item in events:
         event = dict(item)
-        event["created_at"] = _iso(event.get("created_at"))
+        for key in ("created_at", "started_at", "completed_at"):
+            event[key] = _iso(event.get(key))
         trace["events"].append(event)
     return trace
 

@@ -16,9 +16,17 @@
  * stops on the first terminal status or the caller's AbortSignal, whichever
  * comes first. A card that polled forever after its answer arrived would be
  * the same class of leak as a stream nobody closed.
+ *
+ * 2026-09-12 (CONTRACT-2 §2): a file has an IDENTITY of its own — `file_id`,
+ * 16 hex characters the pipeline mints — and the cards are one per file,
+ * keyed by it. Refs persisted before that carry no id, so `fileKey` derives
+ * one from what they do carry, and `fileDownloadUrl` builds the older
+ * `/file/{format}` URL for them. The legacy `report_files` of the older
+ * engines are folded into the same helpers through a `legacy:` key
+ * (components/artifacts/legacyAdapter.ts) so there is ONE card component.
  */
 
-import type { ArtifactJob, ArtifactRef } from './types';
+import type { ArtifactFile, ArtifactJob, ArtifactRef } from './types';
 
 /* ------------------------------------------------------------------ paths */
 
@@ -39,11 +47,26 @@ export function apiUrl(relative: string): string {
 }
 
 const ID_RE = /^[a-f0-9]{32}$/;
+const FILE_ID_RE = /^[a-f0-9]{16}$/;
 
 /** uuid4 hex, exactly as the orchestrator mints artifact and job ids. */
 export function isArtifactId(value: unknown): value is string {
   return typeof value === 'string' && ID_RE.test(value);
 }
+
+/**
+ * A file id as the pipeline mints it: the first 16 hex characters of a
+ * sha1 (CONTRACT-2 §2). The legacy adapter's `legacy:<filename>` keys and
+ * the derived `id:version:format:filename` keys are NOT file ids — they
+ * key a card, and only a real id ever reaches a URL.
+ */
+export function isFileId(value: unknown): value is string {
+  return typeof value === 'string' && FILE_ID_RE.test(value);
+}
+
+/** Every format the studio writes (types.FORMATS). `zip` is a route, not a format. */
+export const FORMATS: readonly string[] = ['pdf', 'docx', 'pptx', 'xlsx', 'csv'];
+const FORMAT_RE = /^(pdf|docx|pptx|xlsx|csv)$/;
 
 /**
  * Every URL is built from a VALIDATED id and an integer version — never from
@@ -69,6 +92,7 @@ export const artifactUrls = {
   artifact: (artifactId: string) =>
     isArtifactId(artifactId) ? `${ARTIFACT_API_PREFIX}/artifacts/${artifactId}` : '',
   version: (artifactId: string, version: number) => versionBase(artifactId, version),
+  /** The first file of a format — the pre-file_id URL, kept as an alias upstream. */
   file: (
     artifactId: string,
     version: number,
@@ -76,8 +100,43 @@ export const artifactUrls = {
     disposition: 'inline' | 'attachment' = 'attachment',
   ) => {
     const base = versionBase(artifactId, version);
-    if (!base || !/^(pdf|docx|pptx|xlsx)$/.test(format)) return '';
+    if (!base || !FORMAT_RE.test(format)) return '';
     return `${base}/file/${format}?disposition=${disposition}`;
+  },
+  /** One file by its own id (CONTRACT-2 §2) — same headers, ETag and Range rules as `file`. */
+  fileById: (
+    artifactId: string,
+    version: number,
+    fileId: string,
+    disposition: 'inline' | 'attachment' = 'attachment',
+  ) => {
+    const base = versionBase(artifactId, version);
+    if (!base || !isFileId(fileId)) return '';
+    return `${base}/f/${fileId}?disposition=${disposition}`;
+  },
+  /** Every file of the version in one ZIP (streamed; only offered for ≥ 2 files). */
+  zip: (artifactId: string, version: number) => {
+    const base = versionBase(artifactId, version);
+    return base ? `${base}/zip` : '';
+  },
+  /**
+   * The grid window of one xlsx or csv file. `file` is required by the
+   * route; a missing or malformed id builds nothing rather than a request
+   * the proxy would refuse.
+   */
+  grid: (
+    artifactId: string,
+    version: number,
+    opts: { file: string; sheet?: string; offset?: number; limit?: number },
+  ) => {
+    const base = versionBase(artifactId, version);
+    if (!base || !isFileId(opts.file)) return '';
+    const params = new URLSearchParams();
+    params.set('file', opts.file);
+    if (opts.sheet) params.set('sheet', opts.sheet);
+    if (opts.offset) params.set('offset', String(Math.trunc(opts.offset)));
+    if (opts.limit) params.set('limit', String(Math.trunc(opts.limit)));
+    return `${base}/grid?${params.toString()}`;
   },
   preview: (artifactId: string, version: number) => {
     const base = versionBase(artifactId, version);
@@ -307,6 +366,34 @@ export function fetchSheets(
   return getJson<SheetsResponse>(artifactUrls.sheets(artifactId, version, opts), signal);
 }
 
+/**
+ * GET /artifacts/{id}/v/{n}/grid?file= — one xlsx or csv file's window
+ * (CONTRACT-2 §11 `render.preview.grid_for`). Flatter than `/sheets`:
+ * `sheets` is the list of NAMES (a csv has exactly one, its title), the
+ * window is at the top level, and the totals say how much the file really
+ * holds. Formulas arrive as text inside the cells (`formulas_as_text`), so
+ * there is no address map to draw the ƒ marker from.
+ */
+export interface GridResponse {
+  sheets: string[];
+  sheet: string;
+  columns: string[];
+  rows: unknown[][];
+  total_rows: number;
+  total_columns: number;
+  truncated: boolean;
+  formulas_as_text?: boolean;
+}
+
+export function fetchGrid(
+  artifactId: string,
+  version: number,
+  opts: { file: string; sheet?: string; offset?: number; limit?: number },
+  signal?: AbortSignal,
+): Promise<GridResponse> {
+  return getJson<GridResponse>(artifactUrls.grid(artifactId, version, opts), signal);
+}
+
 /* ----------------------------------------------------------------- polling */
 
 /** First wait after a non-terminal answer, and the ceiling the backoff hits. */
@@ -395,20 +482,49 @@ export async function pollJob(jobId: string, opts: PollOptions = {}): Promise<Ar
 
 /* ------------------------------------------------------------- small helpers */
 
-/** "3 pages" · "12 slides" · "2 sheets" — whichever the file carries. */
+/**
+ * "3 pages" · "12 slides" · "2 sheets" · "500 rows · 11 columns" —
+ * whichever the file carries (CONTRACT-2 §2). Rows are DATA rows, the
+ * header excluded, as the validator counted them by reopening the file; a
+ * count the server did not make (`null`, absent) is simply not said.
+ */
 export function fileExtent(file: {
-  pages?: number;
-  slides?: number;
-  sheets?: number;
+  pages?: number | null;
+  slides?: number | null;
+  sheets?: number | null;
+  rows?: number | null;
+  columns?: number | null;
 }): string {
-  if (typeof file.pages === 'number') return `${file.pages} ${file.pages === 1 ? 'page' : 'pages'}`;
-  if (typeof file.slides === 'number') {
-    return `${file.slides} ${file.slides === 1 ? 'slide' : 'slides'}`;
+  const parts: string[] = [];
+  const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`;
+  if (typeof file.pages === 'number') parts.push(plural(file.pages, 'page'));
+  if (typeof file.slides === 'number') parts.push(plural(file.slides, 'slide'));
+  // One sheet is the ordinary case for a workbook and says nothing its row
+  // count does not; several are worth naming.
+  if (typeof file.sheets === 'number' && (file.sheets !== 1 || typeof file.rows !== 'number')) {
+    parts.push(plural(file.sheets, 'sheet'));
   }
-  if (typeof file.sheets === 'number') {
-    return `${file.sheets} ${file.sheets === 1 ? 'sheet' : 'sheets'}`;
+  if (typeof file.rows === 'number') {
+    parts.push(plural(file.rows, 'row'));
+    if (typeof file.columns === 'number') parts.push(plural(file.columns, 'column'));
   }
-  return '';
+  return parts.join(' · ');
+}
+
+/** The word a person uses for the format: "PDF", "Word", "PowerPoint", "Excel", "CSV". */
+export const FORMAT_LABELS: Record<string, string> = {
+  pdf: 'PDF',
+  docx: 'Word',
+  pptx: 'PowerPoint',
+  xlsx: 'Excel',
+  csv: 'CSV',
+  zip: 'ZIP',
+};
+
+export function formatLabel(format?: string | null): string {
+  if (!format) return 'File';
+  const key = format.toLowerCase();
+  return FORMAT_LABELS[key] ?? key.toUpperCase();
 }
 
 /**
@@ -425,7 +541,141 @@ export function primaryFile(ref: ArtifactRef): ArtifactRef['files'][number] | un
   );
 }
 
-/** The DOM id a card carries, so the panel can hand focus back to it. */
+/* ------------------------------------------------------------ file identity */
+
+/**
+ * The prefix of a key the legacy adapter mints for a `report_files` entry
+ * (`legacy:<filename>`). Such a file lives under /api/reports, has no id
+ * and no preview, and never reaches an /artifacts URL.
+ */
+export const LEGACY_KEY_PREFIX = 'legacy:';
+
+export function isLegacyKey(key: unknown): key is string {
+  return typeof key === 'string' && key.startsWith(LEGACY_KEY_PREFIX);
+}
+
+/** The key a ref persisted before file ids existed gets: `artifact_id:version:format:filename`. */
+export function legacyFileKey(ref: Pick<ArtifactRef, 'artifact_id' | 'version'>, file: ArtifactFile): string {
+  return `${ref.artifact_id}:${Math.trunc(ref.version)}:${file.format}:${file.filename}`;
+}
+
+/**
+ * What a card is keyed by and what the panel is opened on: the server's
+ * `file_id` when the ref carries one, else the derived legacy key. Two CSVs
+ * of one version have different ids; two files of different formats have
+ * different legacy keys; nothing collides.
+ */
+export function fileKey(ref: Pick<ArtifactRef, 'artifact_id' | 'version'>, file: ArtifactFile): string {
+  if (typeof file.file_id === 'string' && file.file_id) return file.file_id;
+  return legacyFileKey(ref, file);
+}
+
+/** Does this key name this file — by id, or by the legacy derivation of a file that has since gained one? */
+export function fileMatchesKey(
+  ref: Pick<ArtifactRef, 'artifact_id' | 'version'>,
+  file: ArtifactFile,
+  key: string,
+): boolean {
+  return fileKey(ref, file) === key || legacyFileKey(ref, file) === key;
+}
+
+/**
+ * A `report_files` name as the /api/reports proxy will accept it: one plain
+ * segment (its `isSafeReportName`). Anything else builds no URL here rather
+ * than a request the proxy answers 400 to.
+ */
+function isSafeReportName(name: string): boolean {
+  if (!name || name !== name.trim()) return false;
+  if (name.includes('/') || name.includes('\\') || name.includes('..')) return false;
+  if (name.startsWith('.') || name.includes('\0')) return false;
+  return !/%2e|%2f|%5c|%00/i.test(name);
+}
+
+/** The browser URL of a legacy report file: `/api/reports/<encoded filename>`. */
+export function reportFileUrl(filename: string): string {
+  return isSafeReportName(filename) ? `/api/reports/${encodeURIComponent(filename)}` : '';
+}
+
+/**
+ * The URL Download points at. Built from VALIDATED pieces in every case —
+ * the 16-hex file id, the 32-hex artifact id, the known format, the safe
+ * report name — never from a string that arrived in a history row. For a
+ * contract-shaped ref the result is character for character the ref's own
+ * `download_url` prefixed with /api; for a ref persisted before file ids
+ * it is the `/file/{format}` alias the server keeps (CONTRACT-2 §2).
+ */
+export function fileDownloadUrl(
+  ref: Pick<ArtifactRef, 'artifact_id' | 'version'>,
+  file: ArtifactFile,
+  disposition: 'inline' | 'attachment' = 'attachment',
+): string {
+  if (isLegacyKey(file.file_id)) return reportFileUrl(file.filename);
+  if (isFileId(file.file_id)) {
+    return artifactUrls.fileById(ref.artifact_id, ref.version, file.file_id, disposition);
+  }
+  return artifactUrls.file(ref.artifact_id, ref.version, file.format, disposition);
+}
+
+/** Formats with a preview: pages for the print formats, a grid for the tabular ones. */
+const PAGES_FORMATS = new Set(['pdf', 'docx', 'pptx']);
+const GRID_FORMATS = new Set(['xlsx', 'csv']);
+
+/** `pages` · `grid` · `none` — which viewer this file gets, by its format. */
+export function previewKindFor(file: Pick<ArtifactFile, 'format'>): 'pages' | 'grid' | 'none' {
+  if (PAGES_FORMATS.has(file.format)) return 'pages';
+  if (GRID_FORMATS.has(file.format)) return 'grid';
+  return 'none';
+}
+
+/**
+ * Can the panel show this file? pdf/docx/pptx through the version's page
+ * images, xlsx/csv through the grid. A file whose own `preview_url` is ''
+ * (the server rendered no preview for it) and a legacy report file (no
+ * panel at all) are not — their card body downloads instead. A ref from
+ * before per-file previews falls back to the version's `preview_kind`.
+ */
+export function isPreviewable(
+  file: ArtifactFile,
+  ref?: Pick<ArtifactRef, 'preview_kind' | 'preview_pages'> | null,
+): boolean {
+  if (isLegacyKey(file.file_id)) return false;
+  const kind = previewKindFor(file);
+  if (kind === 'none') return false;
+  if (typeof file.preview_url === 'string') return file.preview_url !== '';
+  if (!ref) return true;
+  if (kind === 'pages') return ref.preview_kind === 'pages' && ref.preview_pages > 0;
+  return ref.preview_kind === 'grid' || ref.preview_kind === 'pages';
+}
+
+/**
+ * The URL the panel loads the preview from: the version's page set for the
+ * print formats, the file's grid window for the tabular ones (`/sheets`
+ * for a workbook file that has no id yet). '' when there is nothing to load.
+ */
+export function filePreviewUrl(
+  ref: Pick<ArtifactRef, 'artifact_id' | 'version' | 'preview_kind' | 'preview_pages'>,
+  file: ArtifactFile,
+): string {
+  if (!isPreviewable(file, ref)) return '';
+  const kind = previewKindFor(file);
+  if (kind === 'pages') return artifactUrls.preview(ref.artifact_id, ref.version);
+  if (isFileId(file.file_id)) {
+    return artifactUrls.grid(ref.artifact_id, ref.version, { file: file.file_id });
+  }
+  return artifactUrls.sheets(ref.artifact_id, ref.version);
+}
+
+/** The DOM id a version group carries (kept for the group header). */
 export function cardDomId(artifactId: string, version: number): string {
   return `artifact-card-${artifactId}-v${Math.trunc(version)}`;
+}
+
+/**
+ * The DOM id a FILE card's control carries, so the panel can hand focus
+ * back to the exact card that opened it. A key is free text (a legacy key
+ * holds a filename), so it is reduced to id-safe characters; the prefix
+ * keeps it from colliding with the version id above.
+ */
+export function fileCardDomId(key: string): string {
+  return `artifact-file-${key.replace(/[^A-Za-z0-9_-]+/g, '_')}`;
 }

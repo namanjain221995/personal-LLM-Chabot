@@ -23,6 +23,23 @@ front: one KPI cell per total (a formula that points at the data sheet's
 totals row) and every chart, so the workbook opens on the summary. Data
 sheets follow. openpyxl is imported lazily; the file is reopened by
 validate.py.
+
+STYLE (CONTRACT-2 §4, `spec.SheetStyle`). A sheet without a style gets the
+defaults — thin black borders on every cell, a bold header on a navy fill —
+and a sheet with one gets what it says: header fill dark/light/none with a
+font that reads on it, a highlighted column in the red/amber/green/blue
+pairs Excel's own conditional formats use (dark text on a light fill for
+the cells, white on the dark tone for the header), wrapped text, top
+alignment. A CSV carries none of this; the Word/PDF companions carry the
+same pairs (docx.py, html.py) so the four files agree.
+
+LONG SHEETS AND CHARTS. A chart over a 500-row sheet is not 500 bars: past
+types.MAX_CHART_POINTS rows the chart is drawn over an aggregate — the
+series summed per distinct category, the top CHART_TOP_CATEGORIES by the
+first series and an "Other" bucket — written as a data block beside the
+sheet and referenced from there, so the chart still points at real cells.
+`sheet_titles` is the one place the workbook's sheet names are derived, so
+validate.py can find each spec sheet in the file it reopens.
 """
 from __future__ import annotations
 
@@ -46,6 +63,28 @@ _NUMBER_FORMATS = {
 _FN_NAMES = {"sum": "SUM", "average": "AVERAGE", "count": "COUNTA", "min": "MIN", "max": "MAX"}
 _FORMULA_LEADS = ("=", "+", "-", "@", "\t", "\r")
 _ISO_DATE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})(?:[T ].*)?$")
+#: "007", "00123": an identifier written with leading zeros, which a number
+#: would lose. Never coerced, whatever the column type says.
+_LEADING_ZERO_RE = re.compile(r"^\s*[-+]?0\d")
+
+#: The highlight pairs (header fill, header font, cell fill, cell font),
+#: the tones Excel's built-in conditional formats use — dark text on a
+#: light fill reads at better than 7:1; white on the dark tone above 4.5:1.
+HIGHLIGHT_COLOURS = {
+    "red": ("9C0006", "FFFFFF", "FFC7CE", "9C0006"),
+    "amber": ("9C5700", "FFFFFF", "FFEB9C", "9C5700"),
+    "green": ("006100", "FFFFFF", "C6EFCE", "006100"),
+    "blue": ("1F4E78", "FFFFFF", "DDEBF7", "1F4E78"),
+}
+#: Header fills by SheetStyle.header_fill: (fill or None, font colour).
+HEADER_FILLS = {
+    "dark": (theme.NAVY.lstrip("#").upper(), theme.WHITE.lstrip("#").upper()),
+    "light": (theme.SURFACE_2.lstrip("#").upper(), theme.INK.lstrip("#").upper()),
+    "none": (None, theme.INK.lstrip("#").upper()),
+}
+BORDER_COLOUR = "000000"
+#: How many categories an aggregated chart keeps before "Other".
+CHART_TOP_CATEGORIES = 20
 
 #: Sheet names Excel refuses: over 31 chars or with []:*?/\ — the spec
 #: already strips those (spec.Sheet._sheet_name); this is the last guard.
@@ -55,6 +94,56 @@ _SHEET_BAD_RE = re.compile(r"[\[\]:*?/\\]")
 def safe_sheet_name(name: str, fallback: str) -> str:
     cleaned = _SHEET_BAD_RE.sub(" ", name or "").strip()[:31].strip()
     return cleaned or fallback
+
+
+def sheet_titles(spec: S.WorkbookSpec) -> List[str]:
+    """The worksheet title each spec sheet gets, in spec order — the one
+    derivation the writer and the validator share, so a sheet renamed to
+    stay legal ("Notes: [draft]" → "Notes   draft", a second "Data" →
+    "Data-2", "Dashboard" on a dashboard workbook → "Dashboard data") is
+    found again when the file is reopened."""
+    used: set = set()
+    out: List[str] = []
+    for index, sheet in enumerate(spec.sheets[: T.MAX_SHEETS]):
+        title = safe_sheet_name(sheet.name, f"Sheet{index + 1}")
+        if title.lower() == "dashboard" and spec.template_id == "dashboard":
+            title = safe_sheet_name(f"{title} data", f"Sheet{index + 1}")
+        while title.lower() in used:  # Excel compares titles case-insensitively
+            title = safe_sheet_name(f"{title[:28]}-{index + 1}", f"Sheet{index + 1}")
+        used.add(title.lower())
+        out.append(title)
+    return out
+
+
+def sheet_style(sheet: S.Sheet) -> S.SheetStyle:
+    """The sheet's style, or the defaults when the model gave none."""
+    return sheet.style if sheet.style is not None else S.SheetStyle()
+
+
+def is_landscape(sheet: S.Sheet) -> bool:
+    """CONTRACT-2 §4: `auto` is landscape when the sheet has more than six
+    columns; the tabular Word/PDF documents read this too."""
+    style = sheet_style(sheet)
+    if style.orientation == "auto":
+        return len(sheet.columns) > 6
+    return style.orientation == "landscape"
+
+
+def highlight_for(sheet: S.Sheet) -> dict:
+    """Column index → highlight colour name, for the columns the style
+    names (matched by folded header text, as the spec validated them)."""
+    style = sheet_style(sheet)
+    if not style.highlight:
+        return {}
+    by_name = {}
+    for j, c in enumerate(sheet.columns):
+        by_name.setdefault(" ".join(c.name.split()).casefold(), j)
+    out = {}
+    for h in style.highlight:
+        j = by_name.get(" ".join(h.column.split()).casefold())
+        if j is not None:
+            out[j] = h.color
+    return out
 
 
 def is_formula_like(value: Any) -> bool:
@@ -109,6 +198,10 @@ def _as_number(value: Any) -> Optional[float]:
     if isinstance(value, (int, float)):
         return float(value)
     if isinstance(value, str):
+        if _LEADING_ZERO_RE.match(value):
+            # "007" is an identifier: as a number it is 7, and the file
+            # would have silently lost two characters of a key.
+            return None
         cleaned = value.strip().replace(",", "")
         if cleaned.endswith("%"):
             cleaned = cleaned[:-1]
@@ -161,27 +254,49 @@ def _write_sheet(ws, sheet: S.Sheet, warnings: List[str]) -> dict:
 
     n_cols = len(sheet.columns)
     n_rows = len(sheet.rows)
-    header_font = Font(bold=True, color=theme.WHITE.lstrip("#").upper(), name=theme.OFFICE_SANS)
-    header_fill = PatternFill("solid", fgColor=theme.NAVY.lstrip("#").upper())
+    style = sheet_style(sheet)
+    highlight = highlight_for(sheet)
+    fill_hex, header_colour = HEADER_FILLS.get(style.header_fill, HEADER_FILLS["dark"])
+    header_font = Font(bold=style.header_bold, color=header_colour, name=theme.OFFICE_SANS)
+    header_fill = PatternFill("solid", fgColor=fill_hex) if fill_hex else None
     body_font = Font(name=theme.OFFICE_SANS)
-    thin = Side(style="thin", color=theme.BORDER.lstrip("#").upper())
+    thin = Side(style="thin", color=BORDER_COLOUR)
+    grid = Border(left=thin, right=thin, top=thin, bottom=thin) if style.borders == "thin" else Border()
+    header_border = grid if style.borders == "thin" else Border(bottom=Side(style="thin", color=theme.BORDER.lstrip("#").upper()))
 
     for j, col in enumerate(sheet.columns):
         cell = ws.cell(row=1, column=j + 1)
         _write_text(cell, col.name)
-        cell.font = header_font
-        cell.fill = header_fill
-        cell.alignment = Alignment(horizontal="right" if col.type != "text" else "left", vertical="center")
-        cell.border = Border(bottom=thin)
+        colour = highlight.get(j)
+        if colour:
+            h_fill, h_font, _, _ = HIGHLIGHT_COLOURS[colour]
+            cell.font = Font(bold=style.header_bold, color=h_font, name=theme.OFFICE_SANS)
+            cell.fill = PatternFill("solid", fgColor=h_fill)
+        else:
+            cell.font = header_font
+            if header_fill is not None:
+                cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="right" if col.type != "text" else "left", vertical="center", wrap_text=style.wrap)
+        cell.border = header_border
 
     scales = {j: (_percent_scale(sheet, j, warnings) if col.type == "percent" else 1.0) for j, col in enumerate(sheet.columns)}
+    cell_fills = {}
+    cell_fonts = {}
+    for j, colour in highlight.items():
+        _, _, c_fill, c_font = HIGHLIGHT_COLOURS[colour]
+        cell_fills[j] = PatternFill("solid", fgColor=c_fill)
+        cell_fonts[j] = Font(color=c_font, name=theme.OFFICE_SANS)
     for i, row in enumerate(sheet.rows):
         for j, value in enumerate(row):
             cell = ws.cell(row=i + 2, column=j + 1)
             _write_value(cell, value, sheet.columns[j].type, percent_scale=scales[j])
-            cell.font = body_font
-            if sheet.columns[j].type != "text":
-                cell.alignment = Alignment(horizontal="right")
+            cell.font = cell_fonts.get(j, body_font)
+            if j in cell_fills:
+                cell.fill = cell_fills[j]
+            # Top-aligned so a wrapped comment reads from the row's top edge,
+            # next to the id it belongs to.
+            cell.alignment = Alignment(horizontal="right" if sheet.columns[j].type != "text" else None, vertical="top", wrap_text=style.wrap)
+            cell.border = grid
 
     first_row, last_row = 2, n_rows + 1
     totals_row = None
@@ -206,7 +321,9 @@ def _write_sheet(ws, sheet: S.Sheet, warnings: List[str]) -> dict:
                     label.font = Font(bold=True, name=theme.OFFICE_SANS)
                     label_written = True
 
-    # Widths: the spec's width, or the longest of header/sampled values.
+    # Widths: the spec's width, or the longest of header/sampled values —
+    # capped lower when text wraps, so a long comment column is a readable
+    # paragraph rather than a 60-character strip.
     for j, col in enumerate(sheet.columns):
         if col.width:
             width = col.width
@@ -216,7 +333,7 @@ def _write_sheet(ws, sheet: S.Sheet, warnings: List[str]) -> dict:
                 v = row[j]
                 if v is not None:
                     longest = max(longest, len(str(v)))
-            width = min(max(longest + 2, 8), 60)
+            width = min(max(longest + 2, 8), 45 if style.wrap else 60)
         ws.column_dimensions[_column_letter(j)].width = width
     ws.row_dimensions[1].height = 20
 
@@ -253,6 +370,37 @@ def _chart_columns(sheet: S.Sheet, chart: S.Chart) -> Tuple[Optional[int], List[
     return cat_col, series_cols
 
 
+def aggregate_chart(sheet: S.Sheet, chart: S.Chart, cat_col: int, series_cols: List[int]) -> Tuple[List[str], List[List[float]]]:
+    """The chart's data over EVERY row of a long sheet, summed per distinct
+    category: the top CHART_TOP_CATEGORIES categories by the first series'
+    total, in that order, then "Other" for the rest when there is a rest.
+    Returns (categories, one value list per series)."""
+    totals: dict = {}
+    order: List[str] = []
+    for row in sheet.rows:
+        raw = row[cat_col] if cat_col < len(row) else None
+        key = "" if raw is None else str(raw).strip()
+        if not key:
+            key = "(blank)"
+        if key not in totals:
+            totals[key] = [0.0] * len(series_cols)
+            order.append(key)
+        for s_index, j in enumerate(series_cols):
+            n = _as_number(row[j] if j < len(row) else None)
+            if n is not None:
+                totals[key][s_index] += n
+    ranked = sorted(order, key=lambda k: (-totals[k][0], order.index(k)))
+    top = ranked[:CHART_TOP_CATEGORIES]
+    rest = ranked[CHART_TOP_CATEGORIES:]
+    categories = list(top)
+    values = [[totals[k][s] for k in top] for s in range(len(series_cols))]
+    if rest:
+        categories.append("Other")
+        for s in range(len(series_cols)):
+            values[s].append(sum(totals[k][s] for k in rest))
+    return categories, values
+
+
 def _draw_charts(ws, sheet: S.Sheet, layout: dict, n_cols: int) -> None:
     from openpyxl.chart import BarChart, LineChart, PieChart, Reference
 
@@ -261,25 +409,37 @@ def _draw_charts(ws, sheet: S.Sheet, layout: dict, n_cols: int) -> None:
     # Charts whose data is not in the sheet's columns get their numbers in a
     # block to the right, so the chart still references real cells.
     aux_col = n_cols + 12
+    layout["chart_blocks"] = {}
     for k, chart in enumerate(sheet.charts):
         cat_col, series_cols = _chart_columns(sheet, chart)
         n_points = len(chart.categories)
-        if cat_col is not None and series_cols and n_points <= len(sheet.rows):
+        over_columns = cat_col is not None and series_cols and n_points <= len(sheet.rows)
+        if over_columns and len(sheet.rows) > T.MAX_CHART_POINTS:
+            # A long sheet: the chart is the aggregate, not the first 200
+            # rows — written beside the sheet like any other data block.
+            categories, values = aggregate_chart(sheet, chart, cat_col, series_cols)
+            names = [s.name for s in chart.series]
+            over_columns = False
+        else:
+            categories, values, names = list(chart.categories), [list(s.values) for s in chart.series], [s.name for s in chart.series]
+        n_points = len(categories)
+        if over_columns:
             cats_ref = Reference(ws, min_col=cat_col + 1, min_row=2, max_row=1 + n_points)
             data_refs = [(Reference(ws, min_col=j + 1, min_row=1, max_row=1 + n_points), True) for j in series_cols]
         else:
-            top = 1 + k * (n_points + 3)
+            top = 1 + sum(layout["chart_blocks"][b]["rows"] + 3 for b in layout["chart_blocks"])
             head = ws.cell(row=top, column=aux_col)
             _write_text(head, chart.title or "Chart data")
             head.font = _bold()
-            for i, cat in enumerate(chart.categories):
+            for i, cat in enumerate(categories):
                 _write_text(ws.cell(row=top + 1 + i, column=aux_col), cat)
-            for s_index, series in enumerate(chart.series):
-                _write_text(ws.cell(row=top, column=aux_col + 1 + s_index), series.name)
-                for i, v in enumerate(series.values):
+            for s_index, name in enumerate(names):
+                _write_text(ws.cell(row=top, column=aux_col + 1 + s_index), name)
+                for i, v in enumerate(values[s_index]):
                     ws.cell(row=top + 1 + i, column=aux_col + 1 + s_index, value=float(v))
             cats_ref = Reference(ws, min_col=aux_col, min_row=top + 1, max_row=top + n_points)
-            data_refs = [(Reference(ws, min_col=aux_col + 1 + s, min_row=top, max_row=top + n_points), True) for s in range(len(chart.series))]
+            data_refs = [(Reference(ws, min_col=aux_col + 1 + s, min_row=top, max_row=top + n_points), True) for s in range(len(names))]
+            layout["chart_blocks"][k] = {"top": top, "col": aux_col, "rows": n_points, "series": len(names)}
 
         if chart.type == "pie":
             c = PieChart()
@@ -376,10 +536,13 @@ def _draw_dashboard_charts(ws, data_ws, sheet: S.Sheet, layout: dict, start_row:
     from openpyxl.chart import BarChart, LineChart, PieChart, Reference
 
     row = start_row
-    for chart in sheet.charts:
+    blocks = layout.get("chart_blocks") or {}
+    for k, chart in enumerate(sheet.charts):
         cat_col, series_cols = _chart_columns(sheet, chart)
         n_points = len(chart.categories)
-        if cat_col is None or not series_cols or n_points > len(sheet.rows):
+        block = blocks.get(k)
+        over_columns = cat_col is not None and series_cols and n_points <= len(sheet.rows) and block is None
+        if not over_columns and block is None:
             continue  # its data block lives on the data sheet; the chart is there
         if chart.type == "pie":
             c = PieChart()
@@ -390,9 +553,15 @@ def _draw_dashboard_charts(ws, data_ws, sheet: S.Sheet, layout: dict, start_row:
             c.type = "bar" if chart.type == "horizontal_bar" else "col"
         c.title = chart.title or None
         c.height, c.width = 8.5, 16
-        for j in series_cols:
-            c.add_data(Reference(data_ws, min_col=j + 1, min_row=1, max_row=1 + n_points), titles_from_data=True)
-        c.set_categories(Reference(data_ws, min_col=cat_col + 1, min_row=2, max_row=1 + n_points))
+        if block is not None:
+            top, col, n_points = block["top"], block["col"], block["rows"]
+            for s_index in range(block["series"]):
+                c.add_data(Reference(data_ws, min_col=col + 1 + s_index, min_row=top, max_row=top + n_points), titles_from_data=True)
+            c.set_categories(Reference(data_ws, min_col=col, min_row=top + 1, max_row=top + n_points))
+        else:
+            for j in series_cols:
+                c.add_data(Reference(data_ws, min_col=j + 1, min_row=1, max_row=1 + n_points), titles_from_data=True)
+            c.set_categories(Reference(data_ws, min_col=cat_col + 1, min_row=2, max_row=1 + n_points))
         for i, series in enumerate(c.series):
             colour = theme.series_colour(i).lstrip("#").upper()
             if chart.type == "line":
@@ -410,15 +579,8 @@ def render_xlsx(spec: S.WorkbookSpec, out_path: str | Path, *, warnings: Optiona
     warnings = warnings if warnings is not None else []
     wb = Workbook()
     wb.remove(wb.active)
-    used: set = set()
     layouts: List[Tuple[S.Sheet, str, dict]] = []
-    for index, sheet in enumerate(spec.sheets[: T.MAX_SHEETS]):
-        title = safe_sheet_name(sheet.name, f"Sheet{index + 1}")
-        if title.lower() == "dashboard" and spec.template_id == "dashboard":
-            title = safe_sheet_name(f"{title} data", f"Sheet{index + 1}")
-        while title.lower() in used:  # Excel compares titles case-insensitively
-            title = safe_sheet_name(f"{title[:28]}-{index + 1}", f"Sheet{index + 1}")
-        used.add(title.lower())
+    for sheet, title in zip(spec.sheets[: T.MAX_SHEETS], sheet_titles(spec)):
         if len(sheet.rows) > T.MAX_ROWS_PER_SHEET:
             warnings.append(f"Sheet {sheet.name!r}: {len(sheet.rows):,} rows were cut to the {T.MAX_ROWS_PER_SHEET:,}-row ceiling.")
             sheet = sheet.model_copy(update={"rows": sheet.rows[: T.MAX_ROWS_PER_SHEET]})
@@ -456,4 +618,7 @@ def render_xlsx(spec: S.WorkbookSpec, out_path: str | Path, *, warnings: Optiona
     return out
 
 
-__all__ = ["render_xlsx", "is_formula_like", "safe_sheet_name"]
+__all__ = [
+    "render_xlsx", "is_formula_like", "safe_sheet_name", "sheet_titles", "sheet_style", "is_landscape",
+    "highlight_for", "aggregate_chart", "HIGHLIGHT_COLOURS", "HEADER_FILLS", "BORDER_COLOUR", "CHART_TOP_CATEGORIES",
+]

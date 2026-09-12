@@ -53,6 +53,7 @@ import { ArtifactCards, type OpenArtifact } from './artifacts/ArtifactCards';
 import { CopyButton } from './CopyButton';
 import { ReasoningAccordion } from './ReasoningAccordion';
 import { continuationNotice, friendlyError, trimNotice } from '@/lib/errors';
+import { copyForCategory } from '@/lib/errorTypes';
 import {
   IconAlert,
   IconBook,
@@ -335,6 +336,8 @@ export type UserTurnKind =
   | 'unsent'
   | 'working'
   | 'interrupted'
+  /** Held for the main model's recovery (CONTRACT §8.3) — waiting, not lost. */
+  | 'queued'
   | 'failed'
   | 'status_unknown';
 
@@ -474,7 +477,12 @@ function MessageRowImpl({
    * visible, which is the honest behaviour of a control with no host.
    */
   onOpenArtifact?: OpenArtifact;
-  /** `artifact_id:version` of the file the panel is showing, to mark its card. */
+  /**
+   * The key (lib/artifacts.ts fileKey — the file id, or the legacy
+   * derivation) of the FILE the panel is showing, to mark its card. One
+   * card per file since 2026-09-12 (CONTRACT-2 §9), so the mark is per
+   * file too.
+   */
   activeArtifactKey?: string | null;
 }) {
   // Hooks live above the user-bubble early return (rules of hooks).
@@ -941,7 +949,9 @@ function MessageRowImpl({
                   : `turn-${turn.kind}`
               }
             >
-              {turn.kind === 'working' || turn.kind === 'interrupted' ? (
+              {turn.kind === 'working' ||
+              turn.kind === 'interrupted' ||
+              turn.kind === 'queued' ? (
                 <Loader size={16} />
               ) : turn.kind === 'status_unknown' ? null : (
                 <IconAlert size={13} className="shrink-0 text-danger" />
@@ -999,6 +1009,10 @@ function MessageRowImpl({
                   Retry
                 </button>
               )}
+              {/* No action on a queued turn, on purpose: the server resumes
+                  THIS generation when the model is back, and a Retry here
+                  would only queue the question a second time behind it. */}
+              {turn.kind === 'queued' && <QueuedIndicator />}
               {turn.kind === 'working' && onStopTurn && (
                 <button
                   type="button"
@@ -1016,6 +1030,11 @@ function MessageRowImpl({
   }
 
   const streaming = message.status === 'streaming';
+  // Parked for the main model (see the block below): the live status while
+  // the stream layer holds the row, the persisted code after a reload.
+  const queued =
+    message.status === 'queued' ||
+    message.meta?.error?.code === 'MODEL_RECOVERING';
   // V2: reasoning + steps live on the message while streaming and inside
   // meta once persisted (§4d/§4e) — read whichever is present.
   const reasoningText = message.meta?.reasoning ?? message.reasoning ?? '';
@@ -1211,7 +1230,30 @@ function MessageRowImpl({
             </p>
           )}
 
-          {(message.status === 'error' || message.meta?.error) &&
+          {/* 2026-09-12: the request is parked for the main model's recovery
+              (CONTRACT §8.3 step 5). Live, the stream marks the row `queued`;
+              after a reload only `meta.error` with the MODEL_RECOVERING code
+              survives — the same record, and neither is a failure. The
+              server's own sentence is the status; no red, no Retry (the
+              server resumes this very generation), one small honest
+              indicator of what is being waited for. */}
+          {queued && (
+            <div
+              role="status"
+              data-testid="queued-turn"
+              className="mt-2 flex flex-wrap items-center gap-2 text-sm text-muted"
+            >
+              <Loader size={16} />
+              <span className="min-w-0">
+                {message.meta?.error?.message ||
+                  copyForCategory('MODEL_RECOVERING').message}
+              </span>
+              <QueuedIndicator />
+            </div>
+          )}
+
+          {!queued &&
+            (message.status === 'error' || message.meta?.error) &&
             (() => {
               // Raw upstream payloads ("Error code: 400 - {'error': …}") are
               // unreadable in a chat thread AND are not the user's business:
@@ -1262,7 +1304,15 @@ function MessageRowImpl({
               drawer, not inside it — the drawer is the Salesforce proof
               trail by owner decision (ProofDrawer.tsx), and a file card is a
               deliverable, not evidence. `noopOpen` keeps the cards rendering
-              wherever the row is rendered without a host panel. */}
+              wherever the row is rendered without a host panel.
+
+              The older engines' `meta.report_files` render through the SAME
+              card component, inside the drawer's Files section
+              (FileCards → legacyAdapter → FileCard), and the drawer skips any
+              name that also appears here — a file is shown once
+              (CONTRACT-2 §9). The "Memory updated" chip above renders only
+              when `meta.memory_updated` is non-empty; an artifact turn's meta
+              never carries it (§8) and nothing here synthesises one. */}
           {message.meta?.artifacts && message.meta.artifacts.length > 0 && (
             <ArtifactCards
               artifacts={message.meta.artifacts}
@@ -1271,7 +1321,7 @@ function MessageRowImpl({
             />
           )}
 
-          {!streaming && message.content && message.status !== 'error' && (
+          {!streaming && !queued && message.content && message.status !== 'error' && (
             <div
               className={`${ACTION_ROW} ${
                 isLast || versions ? 'opacity-100' : ACTION_ROW_HIDDEN
@@ -1414,6 +1464,19 @@ function uploadingLabel(message: ChatMessage): string {
 }
 
 /**
+ * The one thing a parked turn is waiting for, said in as few words as it
+ * takes. Small and quiet on purpose: the sentence beside it is the status;
+ * this only names the wait so the row does not read as a frozen spinner.
+ */
+function QueuedIndicator() {
+  return (
+    <span className="text-xs text-faint" data-testid="queued-indicator">
+      Waiting for the main model to recover…
+    </span>
+  );
+}
+
+/**
  * The sentence for each state, written to be TRUE of every case that reaches
  * it (T-02 / F9).
  *
@@ -1431,6 +1494,11 @@ function turnSentence(turn: UserTurnView): string {
   }
   if (turn.kind === 'status_unknown') {
     return 'Checking with the server…';
+  }
+  if (turn.kind === 'queued') {
+    // The server's own sentence when the turn carries it; the category's
+    // copy says the same thing when only the status is known.
+    return turn.reason || copyForCategory('MODEL_RECOVERING').message;
   }
   // The reason, when there is one, already names the files it is about —
   // repeating them underneath it reads as two different problems.

@@ -110,6 +110,33 @@ table.data tbody tr:nth-child(even) td { background: var(--surface); }
 table.data th.num, table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
 table.data tr { page-break-inside: avoid; }
 
+/* --------------------------------------------------- tabular document -- */
+/* The Word/PDF twins of a workbook (html.workbook_document_html): every
+ * sheet is a section on its own named page so orientation follows the
+ * sheet; the table is fixed-layout with per-column % widths from content,
+ * so nothing is clipped — long text wraps inside its column; the header
+ * row repeats on every page; a row never splits across pages. */
+body.tpl-tabular p.methodology { font-size: var(--small-pt); color: var(--ink-muted); margin: 0 0 10pt 0; }
+body.tpl-tabular section.sheet { page-break-before: always; }
+body.tpl-tabular section.sheet.first { page-break-before: auto; }
+body.tpl-tabular section.sheet.landscape, body.tpl-tabular div.front.landscape { page: landscape; }
+body.tpl-tabular section.sheet.portrait, body.tpl-tabular div.front.portrait { page: portrait; }
+body.tpl-tabular section.sources, body.tpl-tabular section.assumptions { page: portrait; }
+body.tpl-tabular section.sheet h2 { margin-top: 0; page-break-after: avoid; }
+body.tpl-tabular p.sheet-note { font-size: var(--small-pt); color: var(--ink-muted); }
+body.tpl-tabular p.sheet-count { font-size: var(--caption-pt); color: var(--ink-faint); margin-top: 4pt; page-break-before: avoid; }
+table.data.tabular { table-layout: fixed; width: 100%; font-size: var(--tabular-pt, 9.5pt); line-height: 1.25; margin: 4pt 0 0 0; }
+table.data.tabular th, table.data.tabular td { overflow-wrap: anywhere; word-break: break-word; white-space: normal;
+  padding: 3pt 4pt; vertical-align: top; }
+table.data.tabular th { font-weight: bold; }
+table.data.tabular[data-header-bold="no"] th { font-weight: normal; }
+table.data.tabular.borders th, table.data.tabular.borders td { border: 0.6pt solid #000; }
+table.data.tabular.no-borders td { border-bottom: 0.5pt solid var(--border); }
+table.data.tabular tbody tr:nth-child(even) td { background: transparent; }
+table.data.tabular tbody tr:nth-child(even) td:not(.hl) { background: var(--surface); }
+table.data.tabular thead { display: table-header-group; }
+table.data.tabular tr { page-break-inside: avoid; }
+
 /* ------------------------------------------------------------ charts -- */
 figure.chart { margin: 8pt 0 12pt 0; page-break-inside: avoid; text-align: center; }
 figure.chart img { width: 100%; max-width: 6.3in; height: auto; }

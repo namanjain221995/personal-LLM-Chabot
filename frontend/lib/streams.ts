@@ -24,7 +24,7 @@ import type { ClarificationResponse } from './clarification';
 import { getHistoryStore, newId } from './history';
 import { foldTurnForModel } from './selectedContext';
 import type { ChatPrefs } from './prefs';
-import { toClientError } from './errorTypes';
+import { copyForCategory, toClientError } from './errorTypes';
 import { foldStreamState, mergeStep, readChatStream } from './sse';
 import type {
   BranchMeta,
@@ -39,7 +39,9 @@ export type StreamStatus =
   | 'done'
   | 'stopped'
   | 'error'
-  | 'unreachable';
+  | 'unreachable'
+  /** Parked for the main model's recovery; the reconnect loop is watching. */
+  | 'queued';
 
 /**
  * What this tab knows about a stream it LOST — the "connection knowledge"
@@ -588,6 +590,44 @@ function markInterrupted(s: LiveStream): void {
 }
 
 /**
+ * The request is PARKED: the main model is recovering and the server holds
+ * the generation for it (CONTRACT §8.3 step 5). Reached from the stream's
+ * terminal frame `{code: "MODEL_RECOVERING", resumable: true}` — sent when
+ * the wait outran LLM_QUEUE_MAX_WAIT_S — and from the reconnect loop when
+ * GET /chat/requests answers `queued`.
+ *
+ * Not a failure, and rendered as none: the turn shows the server's own
+ * sentence, no red, no Retry (a retry would only queue the question a second
+ * time — the server resumes THIS generation by itself). What is written down
+ * is the same shape an interruption leaves — the intent on the question and
+ * `meta.error` on the answer, code `MODEL_RECOVERING` — because that is the
+ * shape a reload reads back, and the shape the server's resume sweep knows to
+ * discard before it writes the real answer (continuity.py, "the viewer's copy
+ * of EXPIRED_LINE"). `line` is the server's sentence when the frame carried
+ * it; the category's copy stands in when only the status is known.
+ */
+function markQueued(s: LiveStream, line?: string): void {
+  const message = line ?? copyForCategory('MODEL_RECOVERING').message;
+  updateAssistant(
+    s,
+    withLiveProgressRetired({ status: 'queued', errorMessage: undefined }),
+  );
+  markPersistedError(s, {
+    message,
+    code: 'MODEL_RECOVERING',
+    status: null,
+    resumable: true,
+  });
+  s.status = 'queued';
+  s.reconnect = { attempt: 0, statusUnknown: false, exhausted: false };
+  // The placeholder is NOT stored here, for the same reason as an
+  // interruption (RC-2): the answer is still the server's. The state of the
+  // send is, and the sentence rides with it so a reload can show it.
+  patchIntent(s, { state: 'queued', reason: message }, { persist: true });
+  notifyNow(s.conversationId);
+}
+
+/**
  * How hard, and for how long, a lost stream is chased.
  *
  * Exported so a test can drive the whole loop deterministically (base 0, no
@@ -599,6 +639,14 @@ export const reconnectPolicy = {
   capMs: 30_000,
   attempts: 20,
   jitter: true,
+  /**
+   * The cadence while the server answers `queued`. A fixed, slow interval
+   * rather than the backoff: the request is safe and its state is known, so
+   * the only question is "has the model come back yet" — and a recovery is
+   * minutes long (cold start measured at 5 m 20 s), so nothing is gained by
+   * asking faster, and nothing lost by asking for as long as it takes.
+   */
+  queuedMs: 10_000,
 };
 
 function backoffFor(attempt: number): number {
@@ -633,8 +681,18 @@ function setReconnect(s: LiveStream, view: ReconnectView): void {
  * Bounded on purpose: ~20 asks with exponential backoff to a 30 s cap, then
  * it stops and leaves an explicit Retry. A tab left open for a week must not
  * poll a dead endpoint for a week.
+ *
+ * One answer is exempt from the budget: `queued` (2026-09-12). That is the
+ * server saying the request is held for the main model's recovery — a
+ * live-but-waiting state with a known owner, not a silence to give up on.
+ * While it lasts the loop asks every `reconnectPolicy.queuedMs` and charges
+ * nothing; the pass that finds `live` attaches, as for any other running
+ * generation.
  */
-async function reconnectInterrupted(s: LiveStream): Promise<void> {
+async function reconnectInterrupted(
+  s: LiveStream,
+  options?: { queued?: boolean },
+): Promise<void> {
   const conversationId = s.conversationId;
   const intentId = s.intentId;
   if (!intentId) {
@@ -647,8 +705,15 @@ async function reconnectInterrupted(s: LiveStream): Promise<void> {
     }
     return;
   }
-  for (let attempt = 0; attempt < reconnectPolicy.attempts; attempt += 1) {
-    await wait(backoffFor(attempt));
+  // Asks charged to the budget. A `queued` answer is not one of them: the
+  // server has said exactly where the request is — held for the main model
+  // (CONTRACT §8.3) — so the loop only has to look again, at the slow fixed
+  // cadence, for as long as that stays the answer. Budget and backoff are
+  // for the case where nobody can tell us anything.
+  let attempt = 0;
+  let queued = options?.queued === true;
+  while (attempt < reconnectPolicy.attempts) {
+    await wait(queued ? reconnectPolicy.queuedMs : backoffFor(attempt));
     // Another stream took this conversation over (the user re-sent, or an
     // attach succeeded elsewhere): this loop no longer speaks for it.
     if (streams.get(conversationId) !== s) return;
@@ -661,7 +726,9 @@ async function reconnectInterrupted(s: LiveStream): Promise<void> {
       return;
     }
     if (report.kind === 'unavailable') {
-      setReconnect(s, { attempt: attempt + 1, statusUnknown: true, exhausted: false });
+      queued = false;
+      attempt += 1;
+      setReconnect(s, { attempt, statusUnknown: true, exhausted: false });
       continue;
     }
     if (report.kind === 'unknown-intent') {
@@ -671,7 +738,18 @@ async function reconnectInterrupted(s: LiveStream): Promise<void> {
       notifyNow(conversationId);
       return;
     }
-    setReconnect(s, { attempt: attempt + 1, statusUnknown: false, exhausted: false });
+    if (report.status === 'queued' && !report.live) {
+      // Parked for the resume sweep. Said on screen once (the turn may have
+      // reached here as an interruption), then simply watched: `live` turning
+      // true is the resume running, and the next pass attaches to it.
+      if (s.status !== 'queued') markQueued(s);
+      queued = true;
+      setReconnect(s, { attempt, statusUnknown: false, exhausted: false });
+      continue;
+    }
+    queued = false;
+    attempt += 1;
+    setReconnect(s, { attempt, statusUnknown: false, exhausted: false });
     if (report.live || (report.status === 'interrupted' && report.resumable)) {
       const outcome = await attachStream(conversationId);
       if (outcome === 'attached') return;
@@ -896,6 +974,15 @@ async function consume(s: LiveStream, body: ReadableStream<Uint8Array>) {
     } else if (ev.kind === 'error') {
       sawTerminal = true;
       settleReasoningClock(s);
+      if (ev.code === 'MODEL_RECOVERING' && ev.resumable) {
+        // The wait for the main model outran the queue window: the row is
+        // parked, not failed, and the server says so in this exact sentence.
+        // Keep asking — slowly — until the resume runs it (attach) or it
+        // finishes without us (adopt the answer).
+        markQueued(s, ev.message);
+        void reconnectInterrupted(s, { queued: true });
+        break;
+      }
       finalize(s, { status: 'error', errorMessage: ev.message });
       break;
     } else if (ev.kind === 'done') {
