@@ -97,6 +97,20 @@ class RuntimeLayout:
         """The vLLM PROCESS environment both ranks read (``.runtime/engine.env``)."""
         return self.runtime_dir / "engine.env"
 
+    @property
+    def controller_code_dir(self) -> Path:
+        """Where the engine controller's program is STAGED for its container
+        (``.runtime/engine-controller``, bind-mounted read-only as /app).
+
+        Not the repository path: the deploy pipeline checks out ``main`` in
+        this very working directory, and a bind mount of a tracked directory
+        is emptied by that checkout (the link-count-0 trap, 2026-09-05) --
+        a controller recreated while the tree was on a branch without the
+        program would then start against an empty /app. ``.runtime/`` is
+        ignored by git and survives every checkout.
+        """
+        return self.runtime_dir / "engine-controller"
+
 
 
 DGX_COMPOSE_OVERLAY = "compose/compose.dgx-spark.yaml"
@@ -609,6 +623,27 @@ def worker_gpu_exporter_url(worker_mgmt_ip: str) -> str:
 ENGINE_CONTROLLER_DIR = Path("monitoring") / "engine-controller"
 ENGINE_CONTROLLER_CODE_FILES = ("controller.py", "common.py")
 ENGINE_CONTROLLER_CODE_SHA_KEY = "ENGINE_CONTROLLER_CODE_SHA"
+
+
+def stage_controller_code(layout: RuntimeLayout) -> Path:
+    """Copy the controller's program into ``layout.controller_code_dir``.
+
+    Called by every ``techsara up`` before the engine-controller service is
+    (re)created, so the container mounts a copy that a later ``git checkout``
+    of the working directory cannot empty. Files are written whole and moved
+    into place, so a container recreated mid-copy never sees a half file;
+    the code digest (``controller_code_sha``) is still taken from the
+    repository copy, which is what the deploy record names.
+    """
+    source = layout.project_root / ENGINE_CONTROLLER_DIR
+    target = layout.controller_code_dir
+    target.mkdir(parents=True, exist_ok=True)
+    for name in ENGINE_CONTROLLER_CODE_FILES + ("sentinel.py",):
+        data = (source / name).read_bytes()
+        tmp = target / f".{name}.tmp"
+        tmp.write_bytes(data)
+        tmp.replace(target / name)
+    return target
 
 
 def controller_code_sha(project_root: Path) -> str:

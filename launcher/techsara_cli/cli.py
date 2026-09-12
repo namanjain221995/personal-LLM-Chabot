@@ -36,6 +36,7 @@ from .environment import (
     profile_context_length,
     remote_ocr_url,
     write_engine_env,
+    stage_controller_code,
 )
 from .errors import PrerequisiteError, TechSaraError
 from .hardware import HardwareInfo, detect_hardware
@@ -1668,6 +1669,7 @@ def _cmd_up(args: argparse.Namespace, *, root: Path) -> int:
             # The sentinel token, in its own 0600 layer that only the
             # engine-controller service reads (never secrets.env).
             prepare_controller_secrets(layout, user_env)
+            stage_controller_code(layout)
             if (user_env.get("CLUSTER_SENTINEL_TOKEN") or "").strip():
                 # .env is an env_file of the orchestrator (compose.yaml
                 # x-runtime-env); compose.yaml blanks this one key there, and

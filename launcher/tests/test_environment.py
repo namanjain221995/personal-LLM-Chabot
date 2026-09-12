@@ -1287,3 +1287,34 @@ class SidecarMemoryKnobTests(EnvironmentCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StageControllerCodeTests(unittest.TestCase):
+    """The controller's program is staged under .runtime/ for its bind mount
+    (a checkout of the working directory must not empty the container's /app)."""
+
+    def test_stages_the_three_files_atomically_and_idempotently(self) -> None:
+        import tempfile
+
+        from techsara_cli.environment import (
+            ENGINE_CONTROLLER_CODE_FILES,
+            ENGINE_CONTROLLER_DIR,
+            RuntimeLayout,
+            stage_controller_code,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / ENGINE_CONTROLLER_DIR
+            src.mkdir(parents=True)
+            for name in ENGINE_CONTROLLER_CODE_FILES + ("sentinel.py",):
+                (src / name).write_text(f"# {name}\n", encoding="utf-8")
+            layout = RuntimeLayout.for_project(root) if hasattr(RuntimeLayout, "for_project") else RuntimeLayout(project_root=root, runtime_dir=root / ".runtime")
+            target = stage_controller_code(layout)
+            self.assertEqual(target, root / ".runtime" / "engine-controller")
+            for name in ENGINE_CONTROLLER_CODE_FILES + ("sentinel.py",):
+                self.assertEqual((target / name).read_text(encoding="utf-8"), f"# {name}\n")
+            self.assertFalse(list(target.glob(".*.tmp")), "no temp files are left behind")
+            (src / "controller.py").write_text("# changed\n", encoding="utf-8")
+            stage_controller_code(layout)
+            self.assertEqual((target / "controller.py").read_text(encoding="utf-8"), "# changed\n")

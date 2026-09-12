@@ -157,7 +157,12 @@ services:
     restart: unless-stopped
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - ./monitoring/engine-controller:/app:ro
+      # The STAGED copy under .runtime/ (launcher: stage_controller_code), not
+      # the repository directory: a `git checkout main` in this working dir
+      # -- every pipeline deploy does one -- empties a bind mount of a tracked
+      # path for the running container (link count 0), and .runtime/ is the
+      # one place a checkout never touches.
+      - ./.runtime/engine-controller:/app:ro
       # The recovery lock and the incident evidence live on the HOST, under
       # .runtime/, so scripts/lib/engine-lock.sh (cluster-up/down/recover,
       # deploy.sh), the launcher's own `techsara up` and the controller
