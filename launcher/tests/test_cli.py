@@ -13,9 +13,11 @@ import json
 import os
 import runpy
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import urllib.error
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
@@ -1692,6 +1694,15 @@ class ComposeStartupTests(unittest.TestCase):
         self.assertEqual(generated["MAIN_CONCURRENCY"], "1")
         publish.assert_called_once()
 
+    def _root(self) -> Path:
+        """A real project root: `techsara up` takes the engine recovery flock
+        under <root>/.runtime/locks, so a fixture path must exist."""
+        temporary = tempfile.TemporaryDirectory(prefix="techsara-cli-root-")
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        (root / ".runtime" / "locks").mkdir(parents=True)
+        return root
+
     @staticmethod
     def _cluster_generated() -> dict[str, str]:
         return {
@@ -1704,6 +1715,9 @@ class ComposeStartupTests(unittest.TestCase):
             "CLUSTER_HEAD_IP": "192.168.100.1",
             "CLUSTER_WORKER_IP": "192.168.100.2",
             "CLUSTER_MASTER_PORT": "29501",
+            # Where the controller reaches the head; empty would mean "do not
+            # start the controller" (see the single-node test below).
+            "TECHSARA_ENGINE_HEAD_API_URL": "http://127.0.0.1:8000",
         }
 
     @staticmethod
@@ -1742,7 +1756,7 @@ class ComposeStartupTests(unittest.TestCase):
             with self.assertRaisesRegex(TechSaraError, "scripts/cluster-status.sh.*scripts/cluster-logs.sh worker") as caught:
                 cli._start_compose(
                     compose, profile, generated, salesforce_ready=False, search_enabled=False, dry_run=False,
-                    root=Path("/fixture/root"),
+                    root=self._root(),
                 )
         self.assertIsInstance(caught.exception.__cause__, TechSaraError)
         self.assertEqual(scripts.call_count, 2)
@@ -1771,7 +1785,7 @@ class ComposeStartupTests(unittest.TestCase):
         ):
             result = cli._start_compose(
                 compose, profile, generated, salesforce_ready=False, search_enabled=False, dry_run=False,
-                root=Path("/fixture/root"),
+                root=self._root(),
             )
         self.assertEqual(result["startup_retry_context"], 0)
         compose.probe_internal_model.assert_any_call("http://vllm:8000/v1", "main")
@@ -1785,7 +1799,7 @@ class ComposeStartupTests(unittest.TestCase):
         generated = self._cluster_generated()
         compose = Mock()
         compose.profiles = ()
-        root = Path("/fixture/root")
+        root = self._root()
         events: list[str] = []
         compose.up_service.side_effect = lambda service, **_kwargs: events.append(f"up:{service}")
 
@@ -1826,12 +1840,276 @@ class ComposeStartupTests(unittest.TestCase):
             with self.assertRaisesRegex(TechSaraError, "scripts/cluster-sync.sh failed with exit status 2"):
                 cli._start_compose(
                     compose, profile, generated, salesforce_ready=False, search_enabled=False, dry_run=False,
-                    root=Path("/fixture/root"),
+                    root=self._root(),
                 )
         scripts.assert_called_once()
-        self.assertEqual(scripts.call_args.args[:2], (Path("/fixture/root"), "cluster-sync.sh"))
+        self.assertEqual(scripts.call_args.args[1], "cluster-sync.sh")
         self.assertNotIn(call("vllm"), compose.up_service.call_args_list)
         health.assert_not_called()
+
+    def test_engine_controller_starts_only_after_the_head_is_proven_on_dgx_spark(self) -> None:
+        """The controller's cold-start budget must never race the launcher's first load."""
+        profile = self._cluster_profile()
+        generated = self._cluster_generated()
+        compose = Mock()
+        compose.profiles = ()
+        events: list[str] = []
+        compose.up_service.side_effect = lambda service, **_kwargs: events.append(f"up:{service}")
+        compose.probe_internal_model.side_effect = (
+            lambda _url, _model, kind="chat": events.append(f"probe:{kind}")
+        )
+        docker_calls: list[list[str]] = []
+
+        def runner(args, **_kwargs):
+            docker_calls.append(list(args))
+            if args[:3] == ["docker", "ps", "-a"]:
+                return SimpleNamespace(returncode=0, stdout="abc123\n", stderr="")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        compose.runner = runner
+        health_result = {"status": "healthy", "checks": {"app_db": {"status": "ok"}}}
+        with (
+            patch.object(cli, "_probe_orchestrator", return_value=health_result),
+            patch.object(cli, "_run_cluster_script"),
+            redirect_stdout(io.StringIO()),
+        ):
+            cli._start_compose(
+                compose, profile, generated, salesforce_ready=False, search_enabled=False, dry_run=False,
+                root=self._root(),
+            )
+        head = events.index("up:vllm")
+        proven = events.index("probe:chat")
+        controller = events.index("up:engine-controller")
+        self.assertLess(head, proven)
+        self.assertLess(proven, controller)
+        self.assertLess(controller, events.index("up:orchestrator"))
+        self.assertIn(
+            call.wait_service("engine-controller", timeout=120.0, reporter=cli._step),
+            compose.method_calls,
+        )
+        # The retired shell watchdog is removed by name AND service label, once.
+        self.assertEqual(docker_calls[0][:3], ["docker", "ps", "-a"])
+        self.assertIn("name=^/sf-local-ai-vllm-watchdog-1$", docker_calls[0])
+        self.assertIn("label=com.docker.compose.service=vllm-watchdog", docker_calls[0])
+        self.assertEqual(docker_calls[1], ["docker", "rm", "-f", "abc123"])
+        self.assertEqual(len(docker_calls), 2)
+
+    def test_the_pair_is_restarted_under_the_engine_lock_with_no_controller_alive(self) -> None:
+        """contract §6: one actor restarts the pair. The previous `up`'s
+        controller is stopped BEFORE the worker/head are touched, the flock is
+        held from before the worker restart until after the controller is
+        back, and it is released afterwards (review round 1, major)."""
+        profile = self._cluster_profile()
+        generated = self._cluster_generated()
+        root = self._root()
+        lock_file = root / ".runtime" / "locks" / "engine-recovery.lock"
+        compose = Mock()
+        compose.profiles = ()
+        events: list[str] = []
+
+        def held_now() -> bool:
+            # Another process can take the flock only if this one does not hold it.
+            probe = subprocess.run(
+                ["flock", "-n", str(lock_file), "true"], capture_output=True, check=False,
+            )
+            return probe.returncode != 0
+
+        compose.stop_service.side_effect = lambda service: events.append(f"stop:{service} locked={held_now()}")
+        compose.up_service.side_effect = lambda service, **_kwargs: events.append(f"up:{service} locked={held_now()}")
+
+        def script(_root, name, *args, reporter, timeout):
+            events.append(f"script:{name} {' '.join(args)}".strip() + f" locked={held_now()}")
+            # The launcher tells its children who holds the lock, as engine-lock.sh does.
+            self.assertEqual(os.environ.get(cli.ENGINE_LOCK_HELD_BY), str(os.getpid()))
+
+        health_result = {"status": "healthy", "checks": {"app_db": {"status": "ok"}}}
+        with (
+            patch.object(cli, "_probe_orchestrator", return_value=health_result),
+            patch.object(cli, "_run_cluster_script", side_effect=script),
+            patch.dict(os.environ, {}, clear=False),
+            redirect_stdout(io.StringIO()),
+        ):
+            os.environ.pop(cli.ENGINE_LOCK_HELD_BY, None)
+            cli._start_compose(
+                compose, profile, generated, salesforce_ready=False, search_enabled=False, dry_run=False, root=root,
+            )
+        stop = events.index("stop:engine-controller locked=True")
+        sync = events.index("script:cluster-sync.sh locked=True")
+        worker = events.index("script:cluster-worker.sh start locked=True")
+        head = events.index("up:vllm locked=True")
+        controller = events.index("up:engine-controller locked=True")
+        self.assertLess(stop, sync)
+        self.assertLess(sync, worker)
+        self.assertLess(worker, head)
+        self.assertLess(head, controller)
+        # Services outside the pair are started without the lock, and it is
+        # released once the controller is back.
+        self.assertIn("up:postgres locked=False", events)
+        self.assertIn("up:orchestrator locked=False", events)
+        self.assertFalse(held_now())
+        self.assertNotIn(cli.ENGINE_LOCK_HELD_BY, os.environ)
+
+    def test_a_routine_deploy_still_ships_and_starts_the_worker_sentinel(self) -> None:
+        """TECHSARA_PRESERVE_MAIN_MODEL (every push to main) leaves the pair
+        alone but must not leave the controller without its sentinel: the
+        sentinel is shipped (--env-only) and started by name BEFORE the
+        controller is (re)created, so it is created with the token."""
+        profile = self._cluster_profile()
+        generated = self._cluster_generated()
+        compose = Mock()
+        compose.profiles = ()
+        events: list[str] = []
+        compose.up_service.side_effect = lambda service, **_kwargs: events.append(f"up:{service}")
+        compose.stop_service.side_effect = lambda service: events.append(f"stop:{service}")
+
+        def script(_root, name, *args, reporter, timeout):
+            events.append(f"script:{name} {' '.join(args)}".strip())
+
+        health_result = {"status": "healthy", "checks": {"app_db": {"status": "ok"}}}
+        with (
+            patch.object(cli, "_probe_orchestrator", return_value=health_result),
+            patch.object(cli, "_run_cluster_script", side_effect=script),
+            patch.dict(os.environ, {"TECHSARA_PRESERVE_MAIN_MODEL": "1"}, clear=False),
+            redirect_stdout(io.StringIO()),
+        ):
+            cli._start_compose(
+                compose, profile, generated, salesforce_ready=False, search_enabled=False, dry_run=False,
+                root=self._root(),
+            )
+        self.assertNotIn("up:vllm", events, "a routine deploy never restarts a serving main model")
+        self.assertNotIn("stop:engine-controller", events, "a live controller keeps guarding a pair that is not restarted")
+        self.assertNotIn("script:cluster-sync.sh", events, "the model is not re-synced on a routine deploy")
+        sync = events.index("script:cluster-sync.sh --env-only")
+        sentinel = events.index("script:cluster-worker.sh start vllm-worker-sentinel")
+        controller = events.index("up:engine-controller")
+        self.assertLess(sync, sentinel)
+        self.assertLess(sentinel, controller)
+
+    def test_the_controller_is_not_started_when_the_head_is_not_observable(self) -> None:
+        """An empty generated head URL (single node, ports unpublished): a
+        controller that cannot connect must not publish STARTING/DOWN for a
+        healthy engine (contract §2), so it is not started, and a leftover
+        one is stopped."""
+        profile = self._cluster_profile()
+        generated = {**self._cluster_generated(), "TECHSARA_CLUSTER_MODE": "single", "TECHSARA_ENGINE_HEAD_API_URL": ""}
+        compose = Mock()
+        compose.profiles = ()
+        stdout = io.StringIO()
+        health_result = {"status": "healthy", "checks": {"app_db": {"status": "ok"}}}
+        with (
+            patch.object(cli, "_probe_orchestrator", return_value=health_result),
+            patch.object(cli, "_run_cluster_script") as scripts,
+            redirect_stdout(stdout),
+        ):
+            cli._start_compose(
+                compose, profile, generated, salesforce_ready=False, search_enabled=False, dry_run=False,
+                root=self._root(),
+            )
+        scripts.assert_not_called()
+        self.assertNotIn(call.up_service("engine-controller"), compose.method_calls)
+        self.assertIn(call.stop_service("engine-controller"), compose.method_calls)
+        self.assertIn("Engine controller: NOT started", stdout.getvalue())
+        compose.runner.assert_not_called()
+
+    def test_engine_recovery_lock_waits_for_the_holder_and_names_it(self) -> None:
+        root = self._root()
+        lock_file = root / ".runtime" / "locks" / "engine-recovery.lock"
+        lock_file.write_text("engine-controller pid=4242 at=1757630000\n", encoding="utf-8")
+        # `flock FILE sleep` execs sleep holding the descriptor, so the whole
+        # session must go, not just flock itself.
+        holder = subprocess.Popen(["flock", str(lock_file), "sleep", "30"], start_new_session=True)
+        self.addCleanup(lambda: os.killpg(holder.pid, signal.SIGKILL) if holder.poll() is None else None)
+        deadline = time.monotonic() + 5
+        while subprocess.run(["flock", "-n", str(lock_file), "true"], check=False).returncode == 0:
+            self.assertLess(time.monotonic(), deadline, "the helper process never took the lock")
+            time.sleep(0.05)
+        lines: list[str] = []
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(cli.ENGINE_LOCK_HELD_BY, None)
+            with self.assertRaisesRegex(TechSaraError, "engine recovery lock is still held.*engine-controller pid=4242"):
+                cli.EngineRecoveryLock(root, wait_s=0.5).acquire("test", reporter=lines.append)
+        self.assertTrue(any("waiting up to 0s" in line or "waiting up to 1s" in line for line in lines), lines)
+        os.killpg(holder.pid, signal.SIGKILL)
+        holder.wait()
+        # Free again: taken, the holder file names this process, released.
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(cli.ENGINE_LOCK_HELD_BY, None)
+            lock = cli.EngineRecoveryLock(root, wait_s=5).acquire("test", reporter=lines.append)
+            self.assertIn(f"pid={os.getpid()}", (root / ".runtime" / "locks" / "engine-recovery.holder").read_text())
+            self.assertNotEqual(subprocess.run(["flock", "-n", str(lock_file), "true"], check=False).returncode, 0)
+            with redirect_stdout(io.StringIO()):
+                lock.release()
+            self.assertEqual(subprocess.run(["flock", "-n", str(lock_file), "true"], check=False).returncode, 0)
+        # An ancestor already holding it (cluster-up.sh, deploy.sh): reentrant, nothing taken.
+        with patch.dict(os.environ, {cli.ENGINE_LOCK_HELD_BY: str(os.getpid())}, clear=False):
+            inherited = cli.EngineRecoveryLock(root, wait_s=5).acquire("child", reporter=lines.append)
+            self.assertEqual(subprocess.run(["flock", "-n", str(lock_file), "true"], check=False).returncode, 0)
+            inherited.release()
+        self.assertTrue(any("already held by pid" in line for line in lines), lines)
+
+    def test_engine_recovery_lock_opens_a_read_only_lock_file(self) -> None:
+        """The controller creates the lock as root 0644 when it is missing; a
+        file this user cannot write is still lockable (flock on O_RDONLY)."""
+        if os.geteuid() == 0:
+            self.skipTest("root can write any file")
+        root = self._root()
+        lock_file = root / ".runtime" / "locks" / "engine-recovery.lock"
+        lock_file.write_text("", encoding="utf-8")
+        lock_file.chmod(0o444)
+        with patch.dict(os.environ, {}, clear=False), redirect_stdout(io.StringIO()):
+            os.environ.pop(cli.ENGINE_LOCK_HELD_BY, None)
+            lock = cli.EngineRecoveryLock(root, wait_s=2).acquire("read-only", reporter=lambda _line: None)
+            self.assertNotEqual(subprocess.run(["flock", "-n", str(lock_file), "true"], check=False).returncode, 0)
+            lock.release()
+
+    def test_engine_controller_is_not_started_on_profiles_without_the_dgx_overlay(self) -> None:
+        profile = selected(nvidia(80))
+        generated = {
+            "EMBED_BASE_URL": "http://embed/v1",
+            "EMBED_MODEL": "embed",
+            "ROUTER_BASE_URL": "http://router/v1",
+            "ROUTER_MODEL": "router",
+            "OPENAI_BASE_URL": "http://main/v1",
+            "MAIN_MODEL": "main",
+        }
+        compose = Mock()
+        compose.profiles = ()
+        with (
+            patch.object(cli, "_probe_orchestrator", return_value={"status": "healthy", "checks": {}}),
+            redirect_stdout(io.StringIO()),
+        ):
+            cli._start_compose(
+                compose, profile, generated, salesforce_ready=False, search_enabled=False, dry_run=False,
+            )
+        self.assertNotIn(call.up_service("engine-controller"), compose.method_calls)
+        compose.runner.assert_not_called()
+
+    def test_engine_controller_host_paths_are_created_by_the_operator_not_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cli._prepare_engine_controller_paths(root)
+            lock = root / ".runtime" / "locks" / "engine-recovery.lock"
+            self.assertTrue(lock.is_file())
+            self.assertTrue((root / ".runtime" / "incidents").is_dir())
+            # Idempotent: a second call neither fails nor truncates.
+            lock.write_text("engine-controller pid=1 at=0\n", encoding="utf-8")
+            cli._prepare_engine_controller_paths(root)
+            self.assertEqual(lock.read_text(encoding="utf-8"), "engine-controller pid=1 at=0\n")
+
+    def test_retiring_the_legacy_watchdog_is_idempotent(self) -> None:
+        calls: list[list[str]] = []
+
+        def absent(args, **_kwargs):
+            calls.append(list(args))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        self.assertFalse(cli._retire_legacy_watchdog(absent, reporter=lambda _line: None))
+        self.assertEqual(len(calls), 1, "nothing to remove: no `docker rm` is attempted")
+
+        def listing_fails(args, **_kwargs):
+            return SimpleNamespace(returncode=1, stdout="", stderr="daemon down")
+
+        self.assertFalse(cli._retire_legacy_watchdog(listing_fails, reporter=lambda _line: None))
 
     def test_single_mode_never_touches_the_cluster_scripts(self) -> None:
         profile = self._cluster_profile()
@@ -1846,7 +2124,7 @@ class ComposeStartupTests(unittest.TestCase):
         ):
             cli._start_compose(
                 compose, profile, generated, salesforce_ready=False, search_enabled=False, dry_run=False,
-                root=Path("/fixture/root"),
+                root=self._root(),
             )
         scripts.assert_not_called()
 

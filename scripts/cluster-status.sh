@@ -7,6 +7,8 @@
 # shellcheck source=lib/cluster-common.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib/cluster-common.sh"
 PROBE=0; BRIEF=0
+# --brief is accepted for compatibility; the report has no short form yet.
+# shellcheck disable=SC2034
 for a in "$@"; do case "$a" in --probe) PROBE=1 ;; --brief) BRIEF=1 ;; -h|--help) sed -n '2,7p' "$0"; exit 0 ;; *) die "unknown option $a" ;; esac; done
 cluster_load_settings
 
@@ -23,7 +25,7 @@ node_report() { # node_report LABEL IP IP2   (runs locally)
     if [ "$st" = "ACTIVE" ]; then check_pass "$label link $i ACTIVE" >/dev/null; else check_fail "$label link $i not ACTIVE" >/dev/null; fi
     i=B
   done
-  [ -n "$gpu" ] && check_pass "$label GPU visible" >/dev/null || check_fail "$label GPU not visible" >/dev/null
+  if [ -n "$gpu" ]; then check_pass "$label GPU visible" >/dev/null; else check_fail "$label GPU not visible" >/dev/null; fi
 }
 
 echo "========================================"
@@ -45,10 +47,10 @@ for a in '${CLUSTER_WORKER_IP}' '${CLUSTER_WORKER_IP_2:-}'; do [ -n \"\$a\" ] ||
     rh="$(printf '%s\n' "$remote" | sed -n 's/^HOST=//p')"; gpu="$(printf '%s\n' "$remote" | sed -n 's/^GPU=//p')"
     printf '  Reachable: YES (%s)\n  GPU: %s\n  GPU utilization: %s%%\n  GPU processes: %s\n' "$rh" "${gpu:-none}" "$(printf '%s\n' "$remote" | sed -n 's/^UTIL=//p')" "$(printf '%s\n' "$remote" | sed -n 's/^PROCS=//p')"
     check_pass "node2 reachable" >/dev/null
-    [ -n "$gpu" ] && check_pass "node2 GPU visible" >/dev/null || check_fail "node2 GPU not visible" >/dev/null
+    if [ -n "$gpu" ]; then check_pass "node2 GPU visible" >/dev/null; else check_fail "node2 GPU not visible" >/dev/null; fi
     i=A; printf '%s\n' "$remote" | sed -n 's/^LINK=//p' | while IFS='|' read -r st ifn a hca mtu; do
       [ -n "$st" ] && printf '  RDMA link %s: %s  (%s %s hca=%s mtu=%s)\n' "$i" "$st" "$ifn" "$a" "$hca" "$mtu"; i=B; done
-    printf '%s\n' "$remote" | sed -n 's/^LINK=//p' | grep -q '^ACTIVE' && check_pass "node2 link A ACTIVE" >/dev/null || check_fail "node2 link A not ACTIVE" >/dev/null
+    if printf '%s\n' "$remote" | sed -n 's/^LINK=//p' | grep -q '^ACTIVE'; then check_pass "node2 link A ACTIVE" >/dev/null; else check_fail "node2 link A not ACTIVE" >/dev/null; fi
   else
     echo "  Reachable: NO (ssh $CLUSTER_WORKER_SSH failed)"; check_fail "node2 unreachable" >/dev/null
   fi
@@ -62,14 +64,92 @@ hid="$(head_container_id || true)"
 if [ -n "$hid" ]; then
   read -r hstate hhealth < <(head_compose ps --format json vllm 2>/dev/null | compose_ps_state)
   printf '  Head (vllm, node-rank 0): %s / %s\n' "$hstate" "$hhealth"
-  [ "$hhealth" = "healthy" ] && check_pass "head healthy" >/dev/null || check_fail "head not healthy ($hstate/$hhealth)" >/dev/null
+  if [ "$hhealth" = "healthy" ]; then check_pass "head healthy" >/dev/null; else check_fail "head not healthy ($hstate/$hhealth)" >/dev/null; fi
 else
   echo "  Head (vllm): NOT RUNNING"; check_fail "head container not running" >/dev/null
 fi
 if [ "$CLUSTER_MODE" = "dual" ]; then
   read -r wstate whealth < <(worker_compose ps --format json 2>/dev/null | compose_ps_state || echo "absent -")
   printf '  Worker (vllm-worker, node-rank 1): %s / %s\n' "$wstate" "$whealth"
-  [ "$whealth" = "healthy" ] && check_pass "worker healthy" >/dev/null || check_fail "worker not healthy ($wstate/$whealth)" >/dev/null
+  if [ "$whealth" = "healthy" ]; then check_pass "worker healthy" >/dev/null; else check_fail "worker not healthy ($wstate/$whealth)" >/dev/null; fi
+fi
+
+echo
+echo "Engine controller (contract §6: the state the orchestrator and Grafana read)"
+# Non-fatal by design: a checkout that predates the controller, or a stack
+# started without it, must still get the rest of this report. Everything
+# below the first line is what /state says, rendered; nothing is inferred.
+ctl_url="${ENGINE_CONTROLLER_URL:-http://127.0.0.1:9838}"
+if ctl_state="$(curl -fsS -m 5 "$ctl_url/state" 2>/dev/null)"; then
+  if printf '%s' "$ctl_state" | python3 -c '
+import json, sys, time
+from datetime import datetime, timezone, timedelta
+IST = timezone(timedelta(hours=5, minutes=30))
+def when(ts):
+    if not ts: return "-"
+    d = datetime.fromtimestamp(float(ts), tz=timezone.utc)
+    return "%s / %s IST (%s ago)" % (d.strftime("%Y-%m-%dT%H:%M:%SZ"), d.astimezone(IST).strftime("%H:%M:%S"), str(timedelta(seconds=int(time.time() - float(ts)))))
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print("  /state: unreadable"); sys.exit(0)
+sig = d.get("signals") or {}; rec = d.get("recovery") or {}; inc = d.get("incident")
+can = sig.get("canary") or {}; wk = sig.get("worker") or {}; eng = sig.get("engine") or {}; rt = sig.get("router") or {}; gpus = sig.get("gpus") or {}
+print("  State: %s (%s)   reason: %s" % (d.get("state"), d.get("state_code"), d.get("reason") or "-"))
+print("  Since: %s" % when(d.get("since")))
+# v2, strict one-model mode: the router is an internal classifier (a DEGRADED
+# signal when unhealthy), never a serving path; nothing else answers users.
+print("  Primary ready: %s   router (classifier) available: %s (configured=%s, health=%s)" % (d.get("primary_ready"), d.get("router_available"), rt.get("configured"), rt.get("health")))
+print("  Both GPUs seen working in the last readiness sequence: head=%s%% worker=%s%% sampled %s" % (gpus.get("head_util", "-"), gpus.get("worker_util", "-"), when(gpus.get("sampled_at")) if gpus.get("sampled_at") else "-"))
+if inc:
+    print("  Incident: %s category=%s attempts=%s started %s%s" % (inc.get("id"), inc.get("category"), inc.get("attempts"), when(inc.get("started_at")), "" if inc.get("ended_at") is None else " ended " + when(inc.get("ended_at"))))
+else:
+    print("  Incident: none")
+print("  Canary: ok=%s http=%s ttft=%ss total=%ss tokens=%s terminal=%s failures=%s last_success %s" % (
+    can.get("ok"), can.get("http_status"), can.get("ttft_s"), can.get("total_s"), can.get("tokens"), can.get("terminal"),
+    can.get("consecutive_failures"), when(can.get("last_success_at"))))
+print("  Worker: reachable=%s container=%s rank_alive=%s restarts=%s last_fault=%s" % (
+    wk.get("reachable"), wk.get("container_running"), wk.get("rank_process_alive"), wk.get("restart_count"),
+    (wk.get("last_fault") or {}).get("signature") if wk.get("last_fault") else "none"))
+print("  Engine: running=%s waiting=%s frozen=%ss" % (eng.get("requests_running"), eng.get("requests_waiting"), eng.get("frozen_seconds")))
+budget = rec.get("budget"); used = rec.get("attempts_in_window")
+remaining = (budget - used) if isinstance(budget, int) and isinstance(used, int) else "?"
+print("  Recovery: in_progress=%s step=%s budget remaining=%s/%s (window %ss) cooldown_until=%s" % (
+    rec.get("in_progress"), rec.get("step"), remaining, budget, rec.get("window_s"), when(rec.get("cooldown_until")) if rec.get("cooldown_until") else "-"))
+code = d.get("state_code")
+sys.exit(0 if code in (2, 3) else 3)
+'; then check_pass "engine controller: READY/BUSY" >/dev/null; else check_warn "engine controller reports a non-ready state (see above)" >/dev/null; fi
+else
+  echo "  not deployed (no answer at $ctl_url/state; the engine-controller service starts with ./techsara up)"
+  check_warn "engine controller not answering" >/dev/null
+fi
+if [ "$CLUSTER_MODE" = "dual" ]; then
+  # THE SENTINEL TOKEN MUST AGREE ON BOTH NODES (contract §6.4): a worker whose
+  # sentinel expects another token answers 403 to every POST /restart and the
+  # controller falls back to head-only recoveries -- the slow re-pair of
+  # 2026-09-11. Compared as digests; neither value is printed.
+  local_sha="$(env_get "$RUNTIME_DIR/controller.env" CLUSTER_SENTINEL_TOKEN 2>/dev/null | sha256sum | cut -d' ' -f1)"
+  remote_sha="$(ssh_worker "grep -m1 '^CLUSTER_SENTINEL_TOKEN=' $WORKER_REMOTE_DIR/worker.env 2>/dev/null | cut -d= -f2-" 2>/dev/null | tr -d '\n' | sha256sum | cut -d' ' -f1)"
+  running_sha="$(docker inspect sf-local-ai-engine-controller-1 --format '{{json .Config.Env}}' 2>/dev/null \
+    | python3 -c 'import hashlib,json,sys; env=dict(x.split("=",1) for x in json.load(sys.stdin) if "=" in x); print(hashlib.sha256(env.get("CLUSTER_SENTINEL_TOKEN","").encode()).hexdigest())' 2>/dev/null || true)"
+  if [ ! -f "$RUNTIME_DIR/controller.env" ]; then
+    printf '  Sentinel token: not minted yet (.runtime/controller.env; ./techsara up or scripts/cluster-sync.sh --env-only)\n'
+    check_warn "sentinel token not minted" >/dev/null
+  elif [ "$local_sha" != "$remote_sha" ]; then
+    printf '  Sentinel token: the worker has a DIFFERENT token than .runtime/controller.env (scripts/cluster-sync.sh --env-only)\n'
+    check_fail "sentinel token differs between head and worker" >/dev/null
+  elif [ -n "$running_sha" ] && [ "$running_sha" != "$local_sha" ]; then
+    printf '  Sentinel token: the RUNNING engine-controller carries another token than .runtime/controller.env (recreate it: ./techsara up)\n'
+    check_fail "running engine-controller token differs from controller.env" >/dev/null
+  else
+    printf '  Sentinel token: head and worker agree\n'
+    check_pass "sentinel token agrees on both nodes" >/dev/null
+  fi
+  # Candidate B (docs/availability/CANDIDATE-B.md): what both ranks run.
+  printf '  Main engine image: %s\n' "$(docker inspect sf-local-ai-vllm-1 --format '{{.Config.Image}}' 2>/dev/null || echo '-')"
+  gdn="$(env_get "$GENERATED_ENV" CLUSTER_GDN_PREFILL_BACKEND 2>/dev/null || true)"
+  eenv="$(env_get "$GENERATED_ENV" CLUSTER_ENGINE_ENV 2>/dev/null || true)"
+  printf '  GDN prefill backend flag: %s   engine env: %s\n' "${gdn:-(absent: engine auto)}" "${eenv:-(none)}"
 fi
 
 echo

@@ -192,6 +192,10 @@ class ComposeOverlayValidationTests(unittest.TestCase):
                 command += ["--profile", name]
             command += ["config", "--format", "json"]
             environment = dict(os.environ)
+            # The user's .env is an --env-file layer at runtime
+            # (ComposeManager.command); here its keys ride the process
+            # environment, which Compose ranks above every --env-file.
+            environment.update({key: str(value) for key, value in (user_environment or {}).items()})
             environment.update(
                 TECHSARA_GENERATED_ENV=str(generated_env),
                 TECHSARA_SECRET_ENV=str(secrets_env),
@@ -426,17 +430,18 @@ class ComposeOverlayValidationTests(unittest.TestCase):
                         source = str(volume.get("source", ""))
                         # The Docker control socket is a SYSTEM path, identical
                         # on every host -- nothing developer-specific to leak.
-                        # Exactly one service may hold it: the engine watchdog,
-                        # which exists to `docker restart` a hung vLLM head and
-                        # can do that no other way. Anything else acquiring the
-                        # socket (it is root-equivalent) must fail this test
-                        # and argue its case here.
+                        # Exactly one service may hold it: the engine
+                        # controller (which replaced the shell watchdog on
+                        # 2026-09-12), which exists to restart a dead vLLM
+                        # pair and can do that no other way. Anything else
+                        # acquiring the socket (it is root-equivalent) must
+                        # fail this test and argue its case here.
                         if source == "/var/run/docker.sock":
                             self.assertEqual(
                                 service,
-                                "vllm-watchdog",
+                                "engine-controller",
                                 f"{name}/{service} must not mount the Docker "
-                                "socket; only the watchdog holds it",
+                                "socket; only the engine controller holds it",
                             )
                             continue
                         self.assertTrue(
@@ -449,6 +454,166 @@ class ComposeOverlayValidationTests(unittest.TestCase):
                             context.startswith(root),
                             f"{name}/{service} builds from outside the project: {context}",
                         )
+
+    def test_the_dgx_overlay_replaces_the_shell_watchdog_with_the_engine_controller(self) -> None:
+        """contract §6: host network, docker socket RW, the lock and incident dirs, core dumps off."""
+        _profile, rendered = self._render(FIXTURES["dgx-spark"])
+        services = rendered["services"]
+        self.assertNotIn("vllm-watchdog", services)
+        controller = services["engine-controller"]
+        self.assertEqual(controller["network_mode"], "host")
+        self.assertEqual(controller["command"], ["python", "-u", "/app/controller.py"])
+        self.assertNotIn("profiles", controller, "the controller always runs, like the watchdog did")
+        targets = {v["target"]: v for v in controller["volumes"]}
+        self.assertFalse(targets["/var/run/docker.sock"].get("read_only", False))
+        self.assertTrue(targets["/app"]["read_only"])
+        self.assertIn("/run/techsara/locks", targets)
+        self.assertIn("/run/techsara/incidents", targets)
+        env = controller["environment"]
+        self.assertEqual(env["HEAD_CONTAINER"], "sf-local-ai-vllm-1")
+        # A single node with the model ports NOT published (the .env.example
+        # default): the head is on the bridge, unreachable from the host
+        # network, so the URL is EMPTY -- the launcher then does not start
+        # the controller (review round 1 blocker: a hard-wired loopback URL
+        # published DOWN for a healthy engine). No fallback URL exists in v2.
+        self.assertEqual(env["HEAD_API_URL"], "")
+        self.assertEqual(env["SENTINEL_URL"], "")
+        self.assertEqual(env["ROUTER_HEALTH_URL"], "")
+        self.assertNotIn("FALLBACK_HEALTH_URL", env)
+        self.assertEqual(env["HEAD_GPU_EXPORTER_URL"], "")
+        self.assertEqual(env["WORKER_GPU_EXPORTER_URL"], "")
+        self.assertEqual(env["PARTICIPATION_MIN_UTIL"], "30")
+        self.assertEqual(env["COLD_START_BUDGET_S"], "900")
+        self.assertEqual(env["RECOVERY_BUDGET"], "3")
+        # The token is NOT an `environment:` entry (that would override the
+        # env_file layer with an empty string) and never reaches the
+        # orchestrator, which inherits secrets.env wholesale.
+        self.assertNotIn("CLUSTER_SENTINEL_TOKEN", env)
+        self.assertNotIn("CLUSTER_SENTINEL_TOKEN", services["orchestrator"]["environment"])
+        for name in ("vllm", "vllm-router", "vllm-ocr"):
+            self.assertEqual(
+                services[name]["ulimits"]["core"], {"soft": 1, "hard": 1},
+                f"{name}: core dumps must be off (RLIMIT_CORE == 1, contract §6.5)",
+            )
+        # contract §6.6: the compiled-kernel caches persist in ONE named
+        # volume mounted at both cache roots; only the main engine has it.
+        mounts = {(v["source"], v["target"]) for v in services["vllm"]["volumes"] if v["type"] == "volume"}
+        self.assertIn(("vllm-kernel-cache", "/root/.cache/vllm"), mounts)
+        self.assertIn(("vllm-kernel-cache", "/root/.cache/flashinfer"), mounts)
+        self.assertEqual(rendered["volumes"]["vllm-kernel-cache"]["name"], "sf-local-ai_vllm-kernel-cache")
+        self.assertNotIn("vllm-kernel-cache", {v["source"] for v in services["vllm-router"]["volumes"]})
+        # Candidate B: only the MAIN engine's image follows MAIN_MODEL_IMAGE;
+        # router and OCR stay on the pinned digest.
+        pinned = "vllm/vllm-openai@sha256:24f2f8975d011ea7f7066a547886a08a1fd3c4bf0880463487fae4f01ce723c6"
+        self.assertEqual(services["vllm"]["image"], pinned)
+        self.assertEqual(services["vllm-router"]["image"], pinned)
+        self.assertEqual(services["vllm-ocr"]["image"], pinned)
+
+    def test_single_node_with_published_ports_points_the_controller_at_the_published_head(self) -> None:
+        _profile, rendered = self._render(
+            FIXTURES["dgx-spark"], {"PUBLISH_MODEL_PORTS": "true", "TECHSARA_MODEL_BIND_ADDRESS": "192.168.9.54"}
+        )
+        env = rendered["services"]["engine-controller"]["environment"]
+        self.assertEqual(env["HEAD_API_URL"], "http://192.168.9.54:8000")
+        self.assertEqual(env["ROUTER_HEALTH_URL"], "http://192.168.9.54:8002/health")
+
+    def test_candidate_b_swaps_only_the_main_engine_image_and_renders_the_gdn_flag(self) -> None:
+        candidate = "vllm/vllm-openai@sha256:819ec9c063412e5730d1b0e82046ba540d1bf991f3c4f661a849aae8a0c52374"
+        _profile, rendered = self._render(
+            FIXTURES["dgx-spark"],
+            {"MAIN_MODEL_IMAGE": candidate, "CLUSTER_GDN_PREFILL_BACKEND": "flashinfer"},
+            model_config=NESTED_CONFIG,
+        )
+        services = rendered["services"]
+        self.assertEqual(services["vllm"]["image"], candidate)
+        self.assertTrue(services["vllm-router"]["image"].endswith("24f2f8975d011ea7f7066a547886a08a1fd3c4bf0880463487fae4f01ce723c6"))
+        self.assertTrue(services["vllm-ocr"]["image"].endswith("24f2f8975d011ea7f7066a547886a08a1fd3c4bf0880463487fae4f01ce723c6"))
+        argv = list(services["vllm"]["command"])
+        self.assertEqual(argv[argv.index("--gdn-prefill-backend") + 1], "flashinfer")
+        # And without the knob the flag is absent, not empty.
+        _profile, plain = self._render(FIXTURES["dgx-spark"], model_config=NESTED_CONFIG)
+        self.assertNotIn("--gdn-prefill-backend", list(plain["services"]["vllm"]["command"]))
+
+    def test_dual_mode_points_the_controller_at_the_worker_sentinel(self) -> None:
+        detectors = ClusterDetectors(
+            ifname_for_ip=lambda ip: {"192.168.100.1": "enP2p1s0f1np1"}.get(ip),
+            hcas_for_ifnames=lambda names: ["rocep1s0f1" for name in names if name == "enP2p1s0f1np1"],
+            docker_bridge_gateway=lambda: "172.17.0.1",
+        )
+        with (
+            patch.object(environment, "CLUSTER_DETECTORS", detectors),
+            patch.object(environment, "CLUSTER_DISCOVERY", fake_discovery()),
+        ):
+            _profile, rendered = self._render(
+                FIXTURES["dgx-spark"],
+                {
+                    "CLUSTER_MODE": "dual",
+                    "CLUSTER_HEAD_IP": "192.168.100.1",
+                    "CLUSTER_WORKER_IP": "192.168.100.2",
+                    "PUBLISH_MODEL_PORTS": "true",
+                },
+            )
+        services = rendered["services"]
+        env = services["engine-controller"]["environment"]
+        self.assertEqual(env["SENTINEL_URL"], "http://192.168.100.2:9839")
+        self.assertEqual(env["HEAD_API_URL"], "http://127.0.0.1:8000")
+        self.assertEqual(env["ROUTER_HEALTH_URL"], "http://127.0.0.1:8002/health")
+        self.assertEqual(env["HEAD_GPU_EXPORTER_URL"], "http://127.0.0.1:9835")
+        self.assertEqual(env["WORKER_GPU_EXPORTER_URL"], "", "no management address given: not observable, not invented")
+        self.assertNotIn("CLUSTER_SENTINEL_TOKEN", env, "the token comes from the controller.env layer only")
+        # The cluster overlay's memlock and the base overlay's core limit merge.
+        self.assertEqual(services["vllm"]["ulimits"]["core"], {"soft": 1, "hard": 1})
+        self.assertEqual(services["vllm"]["ulimits"]["memlock"], -1)
+        # The head healthcheck is report-only with one last-resort tier: no
+        # 5xx kill, the miss count comes from VLLM_HEALTHCHECK_KILL_AFTER.
+        test = services["vllm"]["healthcheck"]["test"][1]
+        self.assertNotIn("5*)", test)
+        self.assertIn('-ge "8"', test)
+        self.assertIn("-gt 900", test)
+        self.assertEqual(test.count("kill -9"), 1)
+
+    def test_unpublished_dual_mode_points_the_controller_at_the_bridge_gateway(self) -> None:
+        """PUBLISH_MODEL_PORTS=false (the .env.example default): the head binds
+        the Docker bridge gateway, and the controller must follow it there."""
+        detectors = ClusterDetectors(
+            ifname_for_ip=lambda ip: {"192.168.100.1": "enP2p1s0f1np1"}.get(ip),
+            hcas_for_ifnames=lambda names: ["rocep1s0f1" for name in names if name == "enP2p1s0f1np1"],
+            docker_bridge_gateway=lambda: "172.17.0.1",
+        )
+        with (
+            patch.object(environment, "CLUSTER_DETECTORS", detectors),
+            patch.object(environment, "CLUSTER_DISCOVERY", fake_discovery()),
+        ):
+            _profile, rendered = self._render(
+                FIXTURES["dgx-spark"],
+                {
+                    "CLUSTER_MODE": "dual",
+                    "CLUSTER_HEAD_IP": "192.168.100.1",
+                    "CLUSTER_WORKER_IP": "192.168.100.2",
+                    "CLUSTER_WORKER_MGMT_IP": "192.168.9.68",
+                    "VLLM_HEALTHCHECK_KILL_AFTER": "12",
+                },
+            )
+        services = rendered["services"]
+        env = services["engine-controller"]["environment"]
+        argv = list(services["vllm"]["command"])
+        self.assertEqual(argv[argv.index("--host") + 1], "172.17.0.1")
+        self.assertEqual(env["HEAD_API_URL"], "http://172.17.0.1:8000")
+        self.assertEqual(env["ROUTER_HEALTH_URL"], "", "an unpublished router is not reachable from the host network")
+        self.assertEqual(env["WORKER_GPU_EXPORTER_URL"], "http://192.168.9.68:9835")
+        self.assertIn('-ge "12"', services["vllm"]["healthcheck"]["test"][1])
+        # And a generated.env from an OLDER launcher (no generated head URL)
+        # still resolves to the bind address rather than to loopback.
+        with (
+            patch.object(environment, "CLUSTER_DETECTORS", detectors),
+            patch.object(environment, "CLUSTER_DISCOVERY", fake_discovery()),
+        ):
+            _profile, older = self._render(
+                FIXTURES["dgx-spark"],
+                {"CLUSTER_MODE": "dual", "CLUSTER_HEAD_IP": "192.168.100.1", "CLUSTER_WORKER_IP": "192.168.100.2"},
+                drop_generated=("TECHSARA_ENGINE_HEAD_API_URL",),
+            )
+        self.assertEqual(older["services"]["engine-controller"]["environment"]["HEAD_API_URL"], "http://172.17.0.1:8000")
 
     def test_no_compose_source_file_hard_codes_a_developer_home_directory(self) -> None:
         for path in [REPO_ROOT / "compose.yaml", *sorted((REPO_ROOT / "compose").glob("*.yaml"))]:

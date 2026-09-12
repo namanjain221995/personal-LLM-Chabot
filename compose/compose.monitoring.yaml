@@ -181,6 +181,13 @@ services:
     pid: host
     networks:
       - application
+    # Published on LOOPBACK ONLY for the engine controller (host network,
+    # compose.dgx-spark.yaml), which samples this exporter and the worker's
+    # during its readiness sequence to record that BOTH GPUs did the work
+    # (docs/availability/CONTRACT.md §5 step 4). Prometheus keeps scraping
+    # it over the application network; nothing off-box can reach this port.
+    ports:
+      - "127.0.0.1:9835:9835"
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:9835/healthz', timeout=3).status==200 else 1)\""]

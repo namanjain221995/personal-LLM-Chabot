@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import ipaddress
 import os
+import re
 import shlex
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,7 +20,10 @@ from .cluster import (
     DEFAULT_TENSOR_PARALLEL_SIZE,
     ClusterDetectors,
     ClusterDiscovery,
+    engine_process_environment,
+    gdn_prefill_backend_argument,
     prefix_caching_argument,
+    render_engine_env,
     resolve_cluster,
     speculative_config_argument,
 )
@@ -75,6 +79,23 @@ class RuntimeLayout:
         for path in (self.runtime_dir, self.locks_dir, self.logs_dir, self.pids_dir):
             path.mkdir(parents=True, exist_ok=True)
 
+    @property
+    def controller_env(self) -> Path:
+        """The engine controller's own secret layer (``.runtime/controller.env``).
+
+        Read by exactly one compose service (``engine-controller``, via
+        ``env_file``) and shipped to the worker sentinel by
+        scripts/cluster-sync.sh -- never by ``secrets.env``, which every
+        runtime service inherits wholesale (the orchestrator included, which
+        handles untrusted input and must not hold the restart token).
+        """
+        return self.runtime_dir / "controller.env"
+
+    @property
+    def engine_env(self) -> Path:
+        """The vLLM PROCESS environment both ranks read (``.runtime/engine.env``)."""
+        return self.runtime_dir / "engine.env"
+
 
 
 DGX_COMPOSE_OVERLAY = "compose/compose.dgx-spark.yaml"
@@ -105,6 +126,11 @@ def prepare_local_secrets(
             values.pop(key, None)
         elif not _configured(values.get(key)):
             values[key] = secure_token(size)
+    # The worker sentinel's restart token lives in controller.env (see
+    # prepare_controller_secrets), never here: this file is fed wholesale to
+    # the orchestrator. A copy an earlier cluster-sync.sh draft minted into
+    # secrets.env is retired on the next `up` so no service inherits it.
+    values.pop("CLUSTER_SENTINEL_TOKEN", None)
 
     native = profile.runtime_backend == "native-vllm-metal"
     if native:
@@ -137,6 +163,44 @@ def prepare_local_secrets(
     layout.runtime_dir.mkdir(parents=True, exist_ok=True)
     atomic_write_text(layout.secrets_env, render_env(values), mode=0o600)
     return values, warnings
+
+
+def prepare_controller_secrets(
+    layout: RuntimeLayout,
+    user_env: Mapping[str, str],
+) -> dict[str, str]:
+    """Create/reuse the worker sentinel's restart token in ``controller.env`` (0600).
+
+    ONE source of truth for both nodes (contract §6.4): a value the operator
+    set in .env wins and is copied here, otherwise the existing token is kept,
+    otherwise one is minted. scripts/cluster-sync.sh reads THIS file for the
+    worker's copy and compares it with what the head's compose renders, so the
+    two nodes cannot disagree the way the .env-vs-secrets.env precedence split
+    let them (review round 1). Never printed, never in generated.env.
+    """
+    existing = parse_env_file(layout.controller_env) if layout.controller_env.is_file() else {}
+    values = dict(existing)
+    configured = (user_env.get("CLUSTER_SENTINEL_TOKEN") or "").strip()
+    if configured:
+        values["CLUSTER_SENTINEL_TOKEN"] = configured
+    elif not (values.get("CLUSTER_SENTINEL_TOKEN") or "").strip():
+        values["CLUSTER_SENTINEL_TOKEN"] = secure_token(32)
+    layout.runtime_dir.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(layout.controller_env, render_env(values), mode=0o600)
+    return values
+
+
+def write_engine_env(layout: RuntimeLayout, user_env: Mapping[str, str]) -> dict[str, str]:
+    """Render ``.runtime/engine.env`` (0644, no secrets) from the ``CLUSTER_VLLM_*`` keys.
+
+    Written on every ``up`` next to generated.env so the file always reflects
+    .env; the cluster overlay reads it as an ``env_file`` and
+    scripts/cluster-sync.sh ships the identical bytes to the worker.
+    """
+    process_environment = engine_process_environment(user_env)
+    layout.runtime_dir.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(layout.engine_env, render_engine_env(process_environment), mode=0o644)
+    return process_environment
 
 
 def effective_user_environment(layout: RuntimeLayout) -> dict[str, str]:
@@ -462,6 +526,90 @@ def resolve_published_port(values: Mapping[str, str], name: str) -> int:
     return port
 
 
+def _host_for_bind(bind_address: str) -> str:
+    """Where a listener bound to ``bind_address`` is reached from this host.
+
+    0.0.0.0 (or nothing) answers on loopback; a specific address answers on
+    that address only -- the rule scripts/lib/cluster-common.sh:api_host
+    encodes for the shell side.
+    """
+    return "127.0.0.1" if bind_address in {"0.0.0.0", ""} else bind_address
+
+
+def router_health_url(
+    *,
+    publish_model_ports: bool,
+    router_shared: bool,
+    model_bind_address: str,
+    router_port: str | int,
+) -> str:
+    """The router's /health as seen from the HOST network, or "" when unreachable.
+
+    v2 (strict one-model mode): the router is an internal classifier, never a
+    serving path; its health is one DEGRADED signal for the controller
+    (contract §2). A published port on 0.0.0.0 is reached on loopback; a
+    published port on a specific address is reached on that address. Nothing
+    published, or no separate router (``router_shared``: the main model
+    answers as the router), means there is nothing to probe.
+    """
+    if not publish_model_ports or router_shared:
+        return ""
+    return f"http://{_host_for_bind(model_bind_address)}:{int(router_port)}/health"
+
+
+def engine_head_api_url(
+    *,
+    cluster_mode: str,
+    publish_model_ports: bool,
+    model_bind_address: str,
+    api_bind_address: str,
+    vllm_port: str | int,
+) -> str:
+    """Where the engine controller (host network) reaches the vLLM head, or "".
+
+    Derived from where the head ACTUALLY listens, never assumed (review round
+    1 blocker: a hard-wired 127.0.0.1 with PUBLISH_MODEL_PORTS=false left the
+    controller unable to connect, and it published DOWN for a healthy engine):
+    dual mode binds the host at CLUSTER_API_BIND_ADDRESS (0.0.0.0, or the
+    Docker bridge gateway when the ports are not published -- reachable from
+    the host network either way); a single node is on the bridge and reachable
+    from the host network only through a PUBLISHED port. Empty means "not
+    observable": the launcher then does not start the controller at all, so
+    nothing publishes a state the orchestrator would act on.
+    """
+    if cluster_mode == "dual":
+        return f"http://{_host_for_bind(api_bind_address)}:{int(vllm_port)}"
+    if not publish_model_ports:
+        return ""
+    return f"http://{_host_for_bind(model_bind_address)}:{int(vllm_port)}"
+
+
+#: The head's GPU exporter as compose.monitoring.yaml publishes it (127.0.0.1
+#: only) for the controller's participation probe (contract §5 step 4).
+HEAD_GPU_EXPORTER_URL = "http://127.0.0.1:9835"
+GPU_EXPORTER_PORT = 9835
+_IMAGE_DIGEST_REFERENCE = re.compile(r"^[a-z0-9][a-z0-9._/-]{0,254}@sha256:[0-9a-f]{64}$")
+
+
+def main_model_image(values: Mapping[str, str]) -> str:
+    """``MAIN_MODEL_IMAGE``: a digest-pinned vLLM image for the main engine, or "".
+
+    Candidate B (docs/availability/CANDIDATE-B.md) swaps only the MAIN engine's
+    image on both ranks; the router and the OCR engine stay on the pinned
+    digest in the overlay. A tag would move under a deploy, so only
+    ``repository@sha256:<64 hex>`` is accepted; the worker gets the same
+    reference through scripts/cluster-sync.sh (it reads the head's rendered
+    image), which is what keeps the two ranks byte-identical.
+    """
+    raw = str(values.get("MAIN_MODEL_IMAGE", "") or "").strip()
+    if raw and not _IMAGE_DIGEST_REFERENCE.fullmatch(raw):
+        raise TechSaraError(
+            "MAIN_MODEL_IMAGE must be a digest-pinned reference such as "
+            f"vllm/vllm-openai@sha256:<64 hex digits> (or empty for the overlay's pin); got {raw!r}"
+        )
+    return raw
+
+
 def _external_url(value: str, name: str) -> str:
     url = value.strip().rstrip("/")
     parsed = urlsplit(url)
@@ -620,6 +768,8 @@ def build_generated_environment(
     # disagree about them.
     prefix_caching = resolve_prefix_caching(user_values)
     speculative_argument = speculative_config_argument(user_values)
+    gdn_prefill_argument = gdn_prefill_backend_argument(user_values)
+    main_model_image(user_values)
     cluster = resolve_cluster(
         user_values,
         profile_id=profile.hardware_profile_id,
@@ -711,6 +861,10 @@ def build_generated_environment(
         "TECHSARA_MODEL_CACHE": str(cache),
         "TECHSARA_GENERATED_ENV": str(layout.generated_env),
         "TECHSARA_SECRET_ENV": str(layout.secrets_env),
+        # The two env_file layers the DGX overlays read (paths only, no
+        # secrets): the controller's token file and the per-rank engine env.
+        "TECHSARA_CONTROLLER_ENV": str(layout.controller_env),
+        "TECHSARA_ENGINE_ENV": str(layout.engine_env),
         "TECHSARA_BIND_ADDRESS": bind_address,
         "TECHSARA_MODEL_BIND_ADDRESS": model_bind_address,
         "TECHSARA_PUBLISH_MODEL_PORTS": _bool(publish_model_ports),
@@ -763,6 +917,7 @@ def build_generated_environment(
         PREFIX_CACHING_KEY: _bool(prefix_caching),
         "MAIN_MODEL_PREFIX_CACHING_ARGUMENT": prefix_caching_argument(prefix_caching),
         "MAIN_MODEL_SPECULATIVE_ARGUMENT": speculative_argument,
+        "MAIN_MODEL_GDN_PREFILL_ARGUMENT": gdn_prefill_argument,
         "MAIN_GPU_MEMORY_UTILIZATION": {"nvidia-large": "0.82", "nvidia-medium": "0.82", "nvidia-small": "0.85", "nvidia-minimal": "0.82"}.get(profile.hardware_profile_id, "0.35"),
         "VLLM_SHM_SIZE": "16g",
     }
@@ -791,6 +946,38 @@ def build_generated_environment(
     # whether or not it is layered in.
     for name in MODEL_PORT_DEFAULTS:
         values[name] = str(resolve_published_port(user_values, name))
+    # What the engine controller (compose.dgx-spark.yaml, host network) can
+    # reach, generated from the real bind addresses so the compose files never
+    # assume loopback (contract §2: an unreachable probe is MONITORING_UNKNOWN,
+    # never DOWN). The router lives on the bridge, so from the host network it
+    # is reachable only through its published port; when the model ports are
+    # not published -- or when the router IS the main model -- the value is
+    # empty and the controller reports the router as "not configured", never
+    # as unhealthy. The head URL follows the same rule; empty means the
+    # launcher leaves the controller unstarted (cli._start_compose).
+    values["TECHSARA_ROUTER_HEALTH_URL"] = router_health_url(
+        publish_model_ports=publish_model_ports,
+        router_shared=bool(profile.router_shared),
+        model_bind_address=model_bind_address,
+        router_port=values["VLLM_ROUTER_PORT"],
+    )
+    values["TECHSARA_ENGINE_HEAD_API_URL"] = engine_head_api_url(
+        cluster_mode=cluster_mode,
+        publish_model_ports=publish_model_ports,
+        model_bind_address=model_bind_address,
+        api_bind_address=cluster_values.get("CLUSTER_API_BIND_ADDRESS", ""),
+        vllm_port=values["VLLM_PORT"],
+    )
+    # The two GPU exporters the controller samples during its participation
+    # probe (contract §5 step 4): the head's, published on loopback by
+    # compose.monitoring.yaml, and the worker's on its management address.
+    # Dual mode only -- one GPU has no second rank to prove. Empty = not
+    # observable (the controller records the probe as unproven, not failed).
+    worker_mgmt_ip = cluster_values.get("CLUSTER_WORKER_MGMT_IP", "")
+    values["TECHSARA_HEAD_GPU_EXPORTER_URL"] = HEAD_GPU_EXPORTER_URL if cluster_mode == "dual" else ""
+    values["TECHSARA_WORKER_GPU_EXPORTER_URL"] = (
+        f"http://{worker_mgmt_ip}:{GPU_EXPORTER_PORT}" if cluster_mode == "dual" and worker_mgmt_ip else ""
+    )
     values.update(cluster_values)
     if family == "external":
         for prefix in ("MAIN", "ROUTER", "AGENT", "VISION", "EMBED", "OCR", "RERANKER"):

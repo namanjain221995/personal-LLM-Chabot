@@ -94,6 +94,13 @@ cd "$ROOT"
 # shellcheck source=lib/deploy-common.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib/deploy-common.sh"
 DR_ROOT="$ROOT"
+# The engine recovery lock (contract §6.3): the engine controller holds it
+# while it restarts the vLLM pair, and `apply` below holds it across
+# `techsara down`/`up` so a deploy and an automatic recovery never restart
+# the pair at the same time. Same root as the deploy lock.
+ENGINE_LOCK_ROOT="$ROOT"
+# shellcheck source=lib/engine-lock.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib/engine-lock.sh"
 
 LOG_DIR="$ROOT/.runtime/logs"; mkdir -p "$LOG_DIR" "$ROOT/.runtime/locks"
 STAMP="$(date +%Y%m%d-%H%M%S)"
@@ -365,6 +372,59 @@ land() {  # land <sha> - make the production checkout BE <sha>, non-destructivel
   return 0
 }
 
+# ------------------------------------------------- the engine's guard services
+# ONE ACTOR RESTARTS THE PAIR, ACROSS A ROLLBACK TOO (contract §2, §6). A
+# service that is gone from the compose files of the tree being applied is
+# invisible to `up`: Compose leaves its container running as an orphan, with
+# its restart policy and -- for these two -- its Docker socket. Rolling back
+# to a tree that predates the engine controller would therefore leave the
+# controller alive next to the old shell watchdog that tree starts (and the
+# worker's sentinel next to whatever the old compose does), which is the
+# multi-actor pattern of 2026-09-11, unattended, at 3 a.m. (review round 1).
+# `--remove-orphans` is not the tool: the launcher's chain does not include
+# the monitoring/tunnel overlays, so Prometheus and Grafana would count as
+# orphans too. Two named guards, reconciled by hand against the rendered
+# chain of the tree that was just applied, and logged in the deploy record.
+ENGINE_CONTROLLER_CONTAINER="sf-local-ai-engine-controller-1"
+LEGACY_WATCHDOG_CONTAINER="sf-local-ai-vllm-watchdog-1"
+rendered_services() {  # the service names the applied tree's chain renders
+  # The prefix is shell-quoted (shlex.join), consumed with eval like
+  # deploy-drain.sh does; state.json is what the `techsara up` just wrote.
+  local prefix
+  prefix="$(dr_compose_prefix 2>/dev/null)" || return 1
+  ( cd "$ROOT" && eval "$prefix" config --services 2>/dev/null )
+}
+retire_container_if_unrendered() {  # retire_container_if_unrendered NAME SERVICE SERVICES
+  local name="$1" service="$2" services="$3" id
+  printf '%s\n' "$services" | grep -qx "$service" && return 0
+  id="$(docker ps -a --filter "name=^/${name}\$" --filter "label=com.docker.compose.service=${service}" --format '{{.ID}}' 2>/dev/null | head -n 1)"
+  [ -n "$id" ] || return 0
+  if docker rm -f "$id" >/dev/null 2>&1; then
+    say "  guards: removed $name - the applied tree's compose chain has no '$service' service, and an orphaned guard would restart the engine on its own"
+  else
+    say "  guards: WARNING could not remove the orphaned $name; remove it by hand: docker rm -f $name"
+  fi
+}
+reconcile_engine_guards() {
+  local services
+  services="$(rendered_services)" || { say "  guards: could not render the applied chain; leaving the guard containers as they are"; return 0; }
+  retire_container_if_unrendered "$ENGINE_CONTROLLER_CONTAINER" engine-controller "$services"
+  retire_container_if_unrendered "$LEGACY_WATCHDOG_CONTAINER" vllm-watchdog "$services"
+  # The worker's sentinel: shipped and started by the applied tree's
+  # cluster-sync.sh when that tree knows it; when the compose file the tree
+  # ships no longer defines the service, the running one must go as well.
+  if grep -q '^TECHSARA_CLUSTER_MODE=dual$' "$ROOT/.runtime/generated.env" 2>/dev/null \
+     && [ -f "$ROOT/compose/compose.cluster-worker.yaml" ] \
+     && ! grep -q '^  vllm-worker-sentinel:' "$ROOT/compose/compose.cluster-worker.yaml" \
+     && [ -x "$ROOT/scripts/cluster-worker.sh" ]; then
+    if "$ROOT/scripts/cluster-worker.sh" stop vllm-worker-sentinel >>"$LOG" 2>&1; then
+      say "  guards: stopped the worker sentinel - the applied tree's worker compose does not define it"
+    else
+      say "  guards: WARNING could not stop the worker sentinel (scripts/cluster-worker.sh stop vllm-worker-sentinel)"
+    fi
+  fi
+}
+
 # --------------------------------------------------------------------- deploy
 MANIFEST=""     # set by apply(): the release manifest the digest gate checks against
 apply() {  # apply <sha> - move the checkout and bring the stack up
@@ -407,13 +467,22 @@ for service, meta in sorted(manifest["images"].items()):
     print("    %-14s %s" % (service, meta["id"]))
 PY
 
+  # ONE ACTOR RESTARTS THE ENGINE PAIR AT A TIME. --full restarts it on
+  # purpose; a routine deploy restarts it too whenever the launcher finds the
+  # engine "not serving" (the preserve flag is ignored for a corpse) -- which
+  # is exactly the moment the engine controller is restarting it as well.
+  # Waiting here (default 20 min) rides out a recovery in progress; the lock
+  # is released as soon as `techsara up` returns so the health gate below
+  # never runs under it.
+  engine_lock_acquire "${ENGINE_LOCK_WAIT:-1200}" "deploy.sh apply $sha$([ "$FULL" = 1 ] && printf ' --full')" \
+    || { say "  engine lock: held by another actor (a recovery in progress?); not restarting anything"; return 1; }
   if [ "$FULL" = 1 ]; then
     # Every container goes, models included. `down` never passes -v, so the
     # database, warehouse, vector index and reports all survive; what is paid
     # for is time, not data: the main model reloads (~6-10 min) and the auxiliary
     # model servers restart behind it.
     say "  full restart: techsara down, then up (volumes preserved; expect ~10-15 min)"
-    ( cd "$ROOT" && ./techsara down ) >>"$LOG" 2>&1 || return 1
+    ( cd "$ROOT" && ./techsara down ) >>"$LOG" 2>&1 || { engine_lock_release; return 1; }
   fi
   # A routine deploy NEVER restarts the main model: reloading it is 15-25
   # minutes of the site answering nothing. The launcher probes the running
@@ -441,7 +510,10 @@ PY
 
   PRESERVE=1; [ "$FULL" = 1 ] && PRESERVE=
   say "  techsara up  (builds images, recreates changed services, staged health gates$([ -n "$PRESERVE" ] && printf '; main model preserved'))"
-  ( cd "$ROOT" && TECHSARA_PRESERVE_MAIN_MODEL="$PRESERVE" ./techsara up ) >>"$LOG" 2>&1 || return 1
+  ( cd "$ROOT" && TECHSARA_PRESERVE_MAIN_MODEL="$PRESERVE" ./techsara up ) >>"$LOG" 2>&1 || { engine_lock_release; return 1; }
+  # Still under the lock: an orphaned guard removed here cannot be mid-recovery.
+  reconcile_engine_guards
+  engine_lock_release
 
   # (4) THE DIGEST GATE. `techsara up` builds again into a warm cache and must
   #     therefore land on the same ids. If it did not - a base image moved, an
@@ -458,7 +530,7 @@ PY
 
 # ---------------------------------------------------------------- health gate
 health() {
-  local orch front api bind port
+  local orch front port
   # Ports and bind address follow the generated env, not an assumption.
   port="$(grep -m1 '^ORCHESTRATOR_PORT=' "$ROOT/.env" 2>/dev/null | cut -d= -f2)"; port="${port:-8080}"
   front="$(grep -m1 '^FRONTEND_PORT=' "$ROOT/.env" 2>/dev/null | cut -d= -f2)"; front="${front:-3000}"

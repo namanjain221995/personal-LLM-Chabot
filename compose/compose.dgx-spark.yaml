@@ -31,7 +31,14 @@ services:
     deploy: *nvidia-devices
 
   vllm:
-    image: vllm/vllm-openai@sha256:24f2f8975d011ea7f7066a547886a08a1fd3c4bf0880463487fae4f01ce723c6
+    # CANDIDATE B (docs/availability/CANDIDATE-B.md): only the MAIN engine's
+    # image may move, and only to a digest the launcher has validated
+    # (MAIN_MODEL_IMAGE in .env; environment.main_model_image). The router
+    # and the OCR engine below stay on the pinned digest -- one variable at
+    # a time. In dual mode scripts/cluster-sync.sh reads the image THIS
+    # service renders to and ships the same reference to the worker, so the
+    # two ranks cannot run different builds.
+    image: ${MAIN_MODEL_IMAGE:-vllm/vllm-openai@sha256:24f2f8975d011ea7f7066a547886a08a1fd3c4bf0880463487fae4f01ce723c6}
     command: >
       ${MAIN_MODEL_CONTAINER_PATH:?MAIN_MODEL_CONTAINER_PATH must be generated}
       --served-model-name ${MAIN_MODEL:?MAIN_MODEL must be generated}
@@ -44,6 +51,7 @@ services:
       --reasoning-parser qwen3
       --trust-remote-code
       ${MAIN_STARTUP_ARGUMENTS:-}
+      ${MAIN_MODEL_GDN_PREFILL_ARGUMENT:-}
       --enable-chunked-prefill
       ${MAIN_MODEL_PREFIX_CACHING_ARGUMENT:-}
       ${MAIN_MODEL_SPECULATIVE_ARGUMENT:-}
@@ -59,12 +67,43 @@ services:
         target: /models
         read_only: true
       - hf-cache:/root/.cache/huggingface
+      # COMPILED-KERNEL CACHE (contract §6.6). vLLM keeps its torch.compile
+      # artefacts (and, via TORCHINDUCTOR_CACHE_DIR / TRITON_CACHE_DIR, the
+      # Inductor and Triton caches) under VLLM_CACHE_ROOT = /root/.cache/vllm;
+      # FlashInfer JIT-compiles into FLASHINFER_WORKSPACE_BASE/.cache/flashinfer
+      # = /root/.cache/flashinfer (both verified inside the pinned image and
+      # the candidate: vllm.envs.VLLM_CACHE_ROOT, flashinfer.jit.env). In a
+      # container's writable layer they die with every recreate, so every
+      # recovery paid the 50 s compile (2026-09-11 head log: "torch.compile
+      # took 50.20 s") and a FlashInfer GDN JIT would cost more. ONE named
+      # volume, mounted at both paths: the two trees never collide
+      # (torch_compile_cache/ vs <flashinfer version>/ and cubins/), one
+      # name per node is what `scripts/cluster-recover.sh --clear-kernel-cache`
+      # empties, and a stale cache is a cold_start_timeout the controller
+      # reports, never something it deletes on its own. The worker mounts
+      # its own (compose.cluster-worker.yaml); each rank compiles for its
+      # own GPU on its own node.
+      - vllm-kernel-cache:/root/.cache/vllm
+      - vllm-kernel-cache:/root/.cache/flashinfer
     expose:
       - "30000"
     networks:
       - inference
     shm_size: 32g
     ipc: host
+    # CORE DUMPS OFF, THE ONLY WAY THAT WORKS WITH APPORT (contract §6.5).
+    # The host's core_pattern is a PIPE to apport, and apport 2.28.3 reads the
+    # whole core into its report regardless of the limit -- `core: 0` does
+    # NOT stop it. RLIMIT_CORE == 1 does: the kernel aborts a pipe dump
+    # ("RLIMIT_CORE is set to 1, aborting core", fs/coredump.c) BEFORE apport
+    # is spawned. Measured on the same image and a 1.5 GB heap: unlimited =
+    # 18.3 s held + a 4.2 MB report; 1 = 1.28 s, no report. On 2026-09-11 the
+    # 25 GiB worker rank was held for 3 min 59 s writing a 3.5 GB report,
+    # which is why its executor noticed the dead rank five minutes late.
+    ulimits:
+      core:
+        soft: 1
+        hard: 1
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:30000/v1/models -o /dev/null || exit 1"]
@@ -75,98 +114,101 @@ services:
     deploy: *nvidia-devices
     logging: *model-logging
 
-  # --- Engine watchdog ----------------------------------------------------
-  # The ONE failure nothing else catches: the worker on Spark 2 dies, its
-  # container restarts and waits at the rendezvous -- but the head's rank 0
-  # cannot re-admit a fresh rank 1, so it spins in NCCL at ~100% GPU forever.
-  # /health keeps answering 200 in 2ms throughout (the API process is fine;
-  # the engine behind it is not), the head logs NOTHING, and every real
-  # request hangs. Found live 2026-09-01: spark-1 pinned at 96%, spark-2 at
-  # 0%, RoCE at 0 B/s, generations timing out, health green.
-  #
-  # So the probe is FUNCTIONAL: a 2-token completion. Three rules, each paid
-  # for the same night with a live outage caused by the versions without it:
-  #
-  #   ARM ONLY AFTER PROOF. Nothing counts until one completion has
-  #   SUCCEEDED since the API last came up. "Ready" is demonstrated, not
-  #   inferred -- and a probe that is itself broken (as the first one was,
-  #   see the extraction note below: every probe 404'd) can then never fire
-  #   at all: it never proves anything, so it never arms, so it never
-  #   restarts. The three restarts of a healthy engine on 2026-09-01
-  #   (21:06, 21:22, 21:35) are what this rule buys.
-  #
-  #   ONLY TIMEOUTS COUNT. A fast HTTP error is an error, not a hang -- the
-  #   container healthcheck below already kills the process on 5xx, and
-  #   counting fast failures is how a loading engine got shot at 60-second
-  #   intervals. The watchdog's whole mandate is one signature: a PROVEN
-  #   engine whose generations stop returning.
-  #
-  #   NEVER LOOP. At most one restart per 45 minutes; a second trigger
-  #   stands down loudly instead. Even a detection bug can now cost at most
-  #   one reload per window, not an evening.
-  #
-  # The worker needs no watchdog of its own: it exits and retries the
-  # rendezvous in a loop, so a freshly restarted head pairs with it within
-  # minutes. That same dance covers a reboot of either Spark end to end.
+  # --- Engine controller ---------------------------------------------------
+  # Replaces the shell `vllm-watchdog` (2026-09-12). The watchdog probed one
+  # 2-token completion a minute and restarted the head after two 120 s
+  # timeouts; on 2026-09-11 that was 4 min 51 s of a dead worker rank that
+  # nobody noticed while /health, /v1/models and /metrics all answered 200,
+  # then a head restart the still-running worker could never rejoin. The
+  # controller (monitoring/engine-controller/controller.py) is a state
+  # machine over twenty signals -- Docker process tables on BOTH nodes, a
+  # streaming canary with TTFT, token-counter freshness, the worker
+  # sentinel -- that publishes a state (/state, /metrics on :9838) the
+  # orchestrator and Grafana read, restarts the PAIR in the right order
+  # (worker first, then the head) under a host flock, keeps a budget of
+  # three recoveries an hour, and captures diagnostics before it touches
+  # anything. docs/availability/ARCHITECTURE.md is the design;
+  # docs/availability/CONTRACT.md is the binding contract for every name
+  # below. It always runs (no profile), like the watchdog it replaces.
   #
   # The Docker socket is mounted WRITABLE, which is root-equivalent on this
   # host -- it is the price of being able to restart the engine, it is the
   # only thing this container does with it, and the image is digest-pinned.
-  vllm-watchdog:
-    image: docker@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
+  #
+  # Host networking because the head is host-network in dual mode and the
+  # worker sentinel lives on the RoCE address only the head can reach.
+  # Consequence: every URL below is generated by the launcher from where the
+  # listener ACTUALLY binds (environment.engine_head_api_url,
+  # router_health_url) and never assumed to be loopback -- in round 1 a
+  # hard-wired 127.0.0.1 with PUBLISH_MODEL_PORTS=false (the .env.example
+  # default) left the controller unable to connect and publishing DOWN for a
+  # healthy engine, which the orchestrator then acted on. An EMPTY head URL
+  # means "not observable": the launcher does not start this service at all
+  # (cli._start_main_engine_and_controller) rather than let it publish
+  # STARTING/DOWN it cannot prove (contract §2). The router (bridge network)
+  # is reachable from here only through its PUBLISHED port; empty = the
+  # controller reports the router as not configured, never as unhealthy --
+  # and in strict one-model mode (v2) the router is an internal classifier
+  # whose health is a DEGRADED signal, never a serving path.
+  engine-controller:
+    image: python@sha256:2c941e860699f878900b0edc2403613c234d4b32eda3cc9fa7036991a2a63c4a
+    command: ["python", "-u", "/app/controller.py"]
     network_mode: host
     restart: unless-stopped
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      - ./monitoring/engine-controller:/app:ro
+      # The recovery lock and the incident evidence live on the HOST, under
+      # .runtime/, so scripts/lib/engine-lock.sh (cluster-up/down/recover,
+      # deploy.sh), the launcher's own `techsara up` and the controller
+      # contend for the same inode, and an incident's `docker logs` capture
+      # survives the controller itself being recreated.
+      - ./.runtime/locks:/run/techsara/locks
+      - ./.runtime/incidents:/run/techsara/incidents
+    # THE SENTINEL TOKEN COMES FROM ITS OWN LAYER, not from secrets.env:
+    # compose.yaml feeds secrets.env wholesale into the orchestrator (the
+    # service that handles untrusted input), and the restart secret must
+    # not sit in that process's environment. The launcher writes
+    # .runtime/controller.env (0600, prepare_controller_secrets) and
+    # scripts/cluster-sync.sh ships the same value to the worker sentinel;
+    # .env's CLUSTER_SENTINEL_TOKEN wins on both nodes through that one
+    # file, so the two can never disagree. Not listed under `environment:`
+    # on purpose -- `environment:` overrides `env_file`, and an empty
+    # default here would blank the token.
+    env_file:
+      - path: ${TECHSARA_CONTROLLER_ENV:-.runtime/controller.env}
+        required: false
     environment:
-      WATCHDOG_TARGET: ${VLLM_WATCHDOG_TARGET:-sf-local-ai-vllm-1}
-      WATCHDOG_PORT: ${VLLM_WATCHDOG_PORT:-8000}
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - |
-        echo "[watchdog] guarding $${WATCHDOG_TARGET}: arms only after a PROVEN completion, only timeouts count, max one restart per 45 min"
-        ARMED=0
-        FAILS=0
-        LAST_RESTART=0
-        while true; do
-          sleep 60
-          models="$$(wget -q -O- -T 5 "http://127.0.0.1:$${WATCHDOG_PORT}/v1/models" 2>/dev/null)" || { ARMED=0; FAILS=0; continue; }
-          # FIRST id, not last: sed's greedy .* here once matched the LAST
-          # "id" in the payload -- a modelperm-* permission id -- so every
-          # probe POSTed a nonexistent model, 404'd in 0s, and the counting
-          # logic turned a broken probe into three restarts of a perfectly
-          # healthy engine (2026-09-01, the whole evening). grep -o takes
-          # matches in order; head -1 is the model.
-          model="$$(printf %s "$$models" | grep -oE '"id": ?"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"$$/\1/')"
-          [ -z "$$model" ] && continue
-          body="{\"model\":\"$$model\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":2,\"temperature\":0,\"chat_template_kwargs\":{\"enable_thinking\":false}}"
-          T0="$$(date +%s)"
-          if wget -q -O /dev/null -T 120 --header 'Content-Type: application/json' --post-data "$$body" "http://127.0.0.1:$${WATCHDOG_PORT}/v1/chat/completions" 2>/dev/null; then
-            [ "$$ARMED" = 0 ] && echo "[watchdog] engine PROVEN ready - armed"
-            ARMED=1; FAILS=0; continue
-          fi
-          EL="$$(( $$(date +%s) - T0 ))"
-          if [ "$$ARMED" = 0 ]; then
-            echo "[watchdog] probe failed while unarmed ($${EL}s) - engine still warming; not counted"
-            continue
-          fi
-          if [ "$$EL" -lt 100 ]; then
-            echo "[watchdog] fast HTTP error ($${EL}s) - an error, not a hang; not counted (the container healthcheck owns 5xx)"
-            continue
-          fi
-          FAILS="$$((FAILS+1))"
-          echo "[watchdog] generation TIMED OUT ($${EL}s) on a proven-ready engine ($$FAILS/2)"
-          if [ "$$FAILS" -ge 2 ]; then
-            NOW="$$(date +%s)"
-            if [ "$$((NOW - LAST_RESTART))" -lt 2700 ]; then
-              echo "[watchdog] STANDING DOWN: already restarted within 45 min - refusing to loop; needs a human"
-              ARMED=0; FAILS=0; continue
-            fi
-            echo "[watchdog] hung engine: restarting $${WATCHDOG_TARGET}"
-            docker restart -t 30 "$${WATCHDOG_TARGET}" || echo "[watchdog] restart FAILED"
-            LAST_RESTART="$$NOW"; ARMED=0; FAILS=0
-          fi
-        done
+      HEAD_CONTAINER: ${ENGINE_HEAD_CONTAINER:-sf-local-ai-vllm-1}
+      HEAD_API_URL: ${ENGINE_HEAD_API_URL:-${TECHSARA_ENGINE_HEAD_API_URL:-}}
+      # No worker sentinel on one node; the cluster overlay sets it.
+      SENTINEL_URL: ""
+      ROUTER_HEALTH_URL: ${TECHSARA_ROUTER_HEALTH_URL:-}
+      # The GPU exporters sampled during the readiness sequence's
+      # participation probe (contract §5 step 4): the head's is published on
+      # loopback by compose.monitoring.yaml, the worker's is on its
+      # management address (CLUSTER_WORKER_MGMT_IP). Dual mode only; empty =
+      # not observable, recorded as unproven rather than failed.
+      HEAD_GPU_EXPORTER_URL: ${TECHSARA_HEAD_GPU_EXPORTER_URL:-}
+      WORKER_GPU_EXPORTER_URL: ${TECHSARA_WORKER_GPU_EXPORTER_URL:-}
+      PARTICIPATION_MIN_UTIL: ${ENGINE_PARTICIPATION_MIN_UTIL:-30}
+      CONTROLLER_PORT: "9838"
+      LOCK_DIR: /run/techsara/locks
+      INCIDENTS_DIR: /run/techsara/incidents
+      CANARY_INTERVAL_S: ${ENGINE_CANARY_INTERVAL_S:-30}
+      CANARY_TIMEOUT_S: ${ENGINE_CANARY_TIMEOUT_S:-60}
+      COLD_START_BUDGET_S: ${ENGINE_COLD_START_BUDGET_S:-900}
+      RECOVERY_BUDGET: ${ENGINE_RECOVERY_BUDGET:-3}
+      RECOVERY_WINDOW_S: ${ENGINE_RECOVERY_WINDOW_S:-3600}
+      RECOVERY_COOLDOWN_S: ${ENGINE_RECOVERY_COOLDOWN_S:-120}
+    # python:3.12-slim has no curl; the probe is the same stdlib one-liner the
+    # dgx-gpu exporter uses (compose.monitoring.yaml).
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:9838/healthz', timeout=3).status==200 else 1)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
     logging: *model-logging
 
   vllm-router:
@@ -192,6 +234,19 @@ services:
       - "30002"
     networks:
       - inference
+    # CORE DUMPS OFF, THE ONLY WAY THAT WORKS WITH APPORT (contract §6.5).
+    # The host's core_pattern is a PIPE to apport, and apport 2.28.3 reads the
+    # whole core into its report regardless of the limit -- `core: 0` does
+    # NOT stop it. RLIMIT_CORE == 1 does: the kernel aborts a pipe dump
+    # ("RLIMIT_CORE is set to 1, aborting core", fs/coredump.c) BEFORE apport
+    # is spawned. Measured on the same image and a 1.5 GB heap: unlimited =
+    # 18.3 s held + a 4.2 MB report; 1 = 1.28 s, no report. On 2026-09-11 the
+    # 25 GiB worker rank was held for 3 min 59 s writing a 3.5 GB report,
+    # which is why its executor noticed the dead rank five minutes late.
+    ulimits:
+      core:
+        soft: 1
+        hard: 1
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:30002/v1/models -o /dev/null || exit 1"]
@@ -322,6 +377,19 @@ services:
       - inference
     shm_size: 8g
     ipc: host
+    # CORE DUMPS OFF, THE ONLY WAY THAT WORKS WITH APPORT (contract §6.5).
+    # The host's core_pattern is a PIPE to apport, and apport 2.28.3 reads the
+    # whole core into its report regardless of the limit -- `core: 0` does
+    # NOT stop it. RLIMIT_CORE == 1 does: the kernel aborts a pipe dump
+    # ("RLIMIT_CORE is set to 1, aborting core", fs/coredump.c) BEFORE apport
+    # is spawned. Measured on the same image and a 1.5 GB heap: unlimited =
+    # 18.3 s held + a 4.2 MB report; 1 = 1.28 s, no report. On 2026-09-11 the
+    # 25 GiB worker rank was held for 3 min 59 s writing a 3.5 GB report,
+    # which is why its executor noticed the dead rank five minutes late.
+    ulimits:
+      core:
+        soft: 1
+        hard: 1
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:30004/v1/models -o /dev/null || exit 1"]
@@ -331,3 +399,10 @@ services:
       start_period: 10m
     deploy: *nvidia-devices
     logging: *model-logging
+
+volumes:
+  # The head's compiled-kernel cache (contract §6.6; see the vllm service).
+  # Named like hf-cache in compose.yaml so `docker volume ls` reads the same
+  # way on both nodes (the worker's is sf-local-ai-worker_kernel-cache).
+  vllm-kernel-cache:
+    name: sf-local-ai_vllm-kernel-cache

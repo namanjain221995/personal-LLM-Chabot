@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -29,9 +30,11 @@ from .environment import (
     effective_user_environment,
     has_salesforce_credentials,
     main_context_notices,
+    prepare_controller_secrets,
     prepare_local_secrets,
     profile_context_length,
     remote_ocr_url,
+    write_engine_env,
 )
 from .errors import PrerequisiteError, TechSaraError
 from .hardware import HardwareInfo, detect_hardware
@@ -235,6 +238,201 @@ def _compose_files(
         # adds to `vllm` and switches that one service to host networking.
         files.append(root / CLUSTER_COMPOSE_OVERLAY)
     return files
+
+
+def _has_engine_controller(profile: SelectedProfile) -> bool:
+    """Only the DGX overlay declares the ``engine-controller`` service.
+
+    It replaced the shell ``vllm-watchdog`` there on 2026-09-12
+    (docs/availability/ARCHITECTURE.md); the other NVIDIA overlays never had a
+    watchdog and gain no controller from this.
+    """
+    return DGX_COMPOSE_OVERLAY in profile.compose_files
+
+
+#: The container of the shell watchdog the engine controller replaced. The
+#: service is gone from compose.dgx-spark.yaml, and a service that is gone from
+#: the file is invisible to `up`: Compose warns about the orphan and leaves it
+#: running -- restarting the head on its own 45-minute rule beside a controller
+#: that holds a lock it knows nothing about. `--remove-orphans` is NOT the fix:
+#: the launcher's chain does not include the monitoring, tunnel and OCR
+#: overlays, so to Compose Prometheus, Grafana and cloudflared are orphans too
+#: and the flag would remove them. One named container, by name, idempotently.
+LEGACY_WATCHDOG_CONTAINER = "sf-local-ai-vllm-watchdog-1"
+
+
+def _prepare_engine_controller_paths(root: Path) -> None:
+    """Create the controller's host-side files as THIS user before it starts.
+
+    The controller runs as root inside its container and bind-mounts
+    .runtime/locks and .runtime/incidents. Whatever it creates there is
+    root-owned, and a root-owned 0644 lock file cannot be opened for writing
+    by scripts/lib/engine-lock.sh (cluster-up/down/recover, deploy.sh): the
+    scripts would read the lock as permanently held. Touching the lock and
+    the incidents directory here, as the operator, keeps both sides able to
+    take the same flock (contract §6.3).
+    """
+    locks = root / ".runtime" / "locks"
+    try:
+        locks.mkdir(parents=True, exist_ok=True)
+        (locks / "engine-recovery.lock").touch(exist_ok=True)
+        (root / ".runtime" / "incidents").mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        # Never the reason an `up` fails: the controller creates what it needs
+        # itself; only the shell side of the lock is at stake, and it says so.
+        _step(
+            f"Engine controller: could not prepare {locks} as this user ({exc}); "
+            "if scripts/lib/engine-lock.sh reports the lock permanently held, chown the file"
+        )
+
+
+#: How long `techsara up` waits for a recovery in progress before giving up,
+#: the same default as scripts/lib/engine-lock.sh (a recovery is measured at
+#: 3-6 minutes from detection to READY; waiting it out beats a second restart).
+ENGINE_LOCK_WAIT_S = 1200.0
+#: The variable scripts/lib/engine-lock.sh reads to recognise an ancestor that
+#: already holds the lock, so cluster-sync.sh/cluster-worker.sh started from
+#: here skip instead of deadlocking against their own parent.
+ENGINE_LOCK_HELD_BY = "ENGINE_LOCK_HELD_BY"
+
+
+class EngineRecoveryLock:
+    """The flock the engine controller and the cluster scripts take before a
+    pair restart (contract §6.3), taken by ``techsara up`` for the same reason:
+    on 2026-09-11 three actors restarted the head inside ten minutes, and a
+    head restarted twice is two process groups the worker cannot both join.
+    The v1 launcher restarted the pair unlocked while the previous `up`'s
+    controller was still live (review round 1); this closes that.
+
+    Same inode as ``.runtime/locks/engine-recovery.lock`` on the host --
+    ``/run/techsara/locks/engine-recovery.lock`` inside the controller -- and
+    the same ``LOCK_EX`` semantics, so the three sides exclude each other.
+    Reentrant the way engine-lock.sh is: when an ancestor (cluster-up.sh,
+    deploy.sh) already holds it, ``ENGINE_LOCK_HELD_BY`` names a live pid and
+    nothing is taken here. A root-owned lock file (the controller creates it
+    as root when it is missing) is opened read-only: flock works on O_RDONLY.
+    """
+
+    def __init__(self, root: Path, *, wait_s: float = ENGINE_LOCK_WAIT_S) -> None:
+        self.path = root / ".runtime" / "locks" / "engine-recovery.lock"
+        self.holder_path = self.path.with_name("engine-recovery.holder")
+        self.wait_s = wait_s
+        self._fd: int | None = None
+        self._inherited = False
+
+    def _holder(self) -> str:
+        lines: list[str] = []
+        for path in (self.holder_path, self.path):
+            try:
+                text = path.read_text(encoding="utf-8").strip()
+            except OSError:
+                continue
+            if text:
+                lines.append(text)
+        return "; ".join(" ".join(line.split()) for line in lines) or "(the holder left no metadata)"
+
+    def acquire(self, purpose: str, *, reporter: Callable[[str], None] | None = None) -> "EngineRecoveryLock":
+        report = reporter or _step
+        ancestor = os.environ.get(ENGINE_LOCK_HELD_BY, "").strip()
+        if ancestor.isdigit():
+            try:
+                os.kill(int(ancestor), 0)
+                self._inherited = True
+                report(f"Engine lock: already held by pid {ancestor} (an ancestor); not re-locking for '{purpose}'")
+                return self
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self._fd = os.open(self.path, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o644)
+        except PermissionError:
+            self._fd = os.open(self.path, os.O_RDONLY)
+        deadline = time.monotonic() + self.wait_s
+        announced = False
+        while True:
+            try:
+                fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except (BlockingIOError, InterruptedError):
+                if not announced:
+                    report(
+                        "Engine lock: another actor is restarting the engine pair; waiting up to "
+                        f"{self.wait_s:.0f}s for '{purpose}' (holder: {self._holder()})"
+                    )
+                    announced = True
+                if time.monotonic() >= deadline:
+                    os.close(self._fd)
+                    self._fd = None
+                    raise TechSaraError(
+                        f"the engine recovery lock is still held after {self.wait_s:.0f}s "
+                        f"(holder: {self._holder()}); not restarting anything beside it. "
+                        "Check: curl -s http://127.0.0.1:9838/state | python3 -m json.tool"
+                    )
+                time.sleep(2.0)
+        # The same metadata engine-lock.sh writes, so an operator blocked by
+        # this `up` is told who, not just "busy". Best effort, like there.
+        try:
+            self.holder_path.write_text(
+                f"purpose={purpose}\npid={os.getpid()}\nactor={os.environ.get('SUDO_USER') or os.environ.get('USER') or 'unknown'}\n"
+                f"origin=techsara up\nstarted_at={datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}\n",
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+        os.environ[ENGINE_LOCK_HELD_BY] = str(os.getpid())
+        report(f"Engine lock: acquired for '{purpose}'")
+        return self
+
+    def release(self) -> None:
+        if self._inherited or self._fd is None:
+            return
+        if os.environ.get(ENGINE_LOCK_HELD_BY) == str(os.getpid()):
+            os.environ.pop(ENGINE_LOCK_HELD_BY, None)
+        try:
+            self.holder_path.write_text("", encoding="utf-8")
+        except OSError:
+            pass
+        try:
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+        finally:
+            os.close(self._fd)
+            self._fd = None
+        _step("Engine lock: released")
+
+
+def _retire_legacy_watchdog(
+    runner: Callable[..., object] = run_command,
+    reporter: Callable[[str], None] | None = None,
+) -> bool:
+    """Remove the retired shell watchdog's container if it still exists.
+
+    Filtered by name AND by the compose service label so a container that
+    merely shares the name is never touched. Returns True when one was removed.
+    """
+    report = reporter or _step
+    listed = runner(
+        [
+            "docker", "ps", "-a",
+            "--filter", f"name=^/{LEGACY_WATCHDOG_CONTAINER}$",
+            "--filter", "label=com.docker.compose.service=vllm-watchdog",
+            "--format", "{{.ID}}",
+        ],
+        timeout=15.0,
+    )
+    if getattr(listed, "returncode", 1) != 0:
+        return False
+    container_id = str(getattr(listed, "stdout", "") or "").strip().splitlines()
+    if not container_id:
+        return False
+    removed = runner(["docker", "rm", "-f", container_id[0]], timeout=60.0)
+    if getattr(removed, "returncode", 1) != 0:
+        report(
+            f"Engine controller: could not remove the legacy {LEGACY_WATCHDOG_CONTAINER} "
+            "(remove it by hand: docker rm -f " + LEGACY_WATCHDOG_CONTAINER + ")"
+        )
+        return False
+    report(f"Engine controller: removed the legacy shell watchdog ({LEGACY_WATCHDOG_CONTAINER})")
+    return True
 
 
 def _has_reranker_service(profile: SelectedProfile) -> bool:
@@ -567,6 +765,9 @@ def _write_configuration(
     atomic_write_json(layout.hardware_file, hardware.to_dict())
     atomic_write_json(layout.profile_file, profile.to_dict())
     atomic_write_text(layout.generated_env, render_env(generated), mode=0o644)
+    # The per-rank vLLM process environment (candidate B), next to
+    # generated.env; both compose files read it as an env_file.
+    write_engine_env(layout, user_environment or {})
     return generated
 
 
@@ -652,6 +853,7 @@ def _cmd_up_dry(args: argparse.Namespace, *, root: Path) -> int:
             print(line)
         atomic_write_text(layout.generated_env, render_env(generated), mode=0o644)
         atomic_write_text(layout.secrets_env, render_env(secrets), mode=0o600)
+        write_engine_env(layout, user_env)
         profiles = _compose_profiles(profile, user_env, skip_ocr=args.skip_ocr)
         compose = ComposeManager(
             root,
@@ -884,6 +1086,92 @@ def _step(message: str) -> None:
     print(message, flush=True)
 
 
+def _start_main_engine_and_controller(
+    compose: ComposeManager,
+    profile: SelectedProfile,
+    generated: dict[str, str],
+    *,
+    cluster: bool,
+    preserve_main: bool,
+    controller: bool,
+    project_root: Path,
+    record_probe: Callable[..., None],
+    publish_generated: Callable[[], None],
+) -> int:
+    """Start (or keep) the main engine, prove it, then start the controller.
+
+    Split out of ``_start_compose`` so the whole sequence runs under one
+    engine-lock ``try/finally``. Returns the safer context window a retry fell
+    back to (0 when the first start succeeded).
+    """
+    retry_context = 0
+    if not preserve_main:
+        try:
+            if cluster:
+                _step(
+                    "cluster: starting vLLM head (node-rank 0) on "
+                    f"{generated.get('CLUSTER_HEAD_IP', '?')}:{generated.get('CLUSTER_MASTER_PORT', '?')}; "
+                    f"the worker on {generated.get('CLUSTER_WORKER_IP', '?')} must be running "
+                    "(scripts/cluster-worker.sh start)"
+                )
+            _step("Starting the main model (vllm) - this is the longest step...")
+            compose.up_service("vllm")
+            compose.wait_service("vllm", timeout=2400.0, reporter=_step)
+            record_probe("main", generated["OPENAI_BASE_URL"], generated["MAIN_MODEL"])
+        except TechSaraError as exc:
+            if cluster:
+                # The safer-context retry recreates only the head; it cannot
+                # help when the worker is missing, unreachable, or mismatched.
+                raise TechSaraError(
+                    f"the two-node vLLM head did not become ready ({exc}). Check both nodes with "
+                    "scripts/cluster-status.sh and the worker output with scripts/cluster-logs.sh worker"
+                ) from exc
+            if not profile.startup_retry_context:
+                raise
+            retry_context = profile.startup_retry_context
+            generated["MODEL_MAX_CONTEXT"] = str(retry_context)
+            generated["DEFAULT_MAX_CONTEXT"] = str(retry_context)
+            generated["REPORT_MAX_CONTEXT"] = str(retry_context)
+            generated["MAIN_CONTEXT_LENGTH"] = str(retry_context)
+            # The retry window is inside the model's native one, so the YaRN
+            # override that belonged to the wider window must go with it.
+            generated["MAIN_MODEL_ROPE_OVERRIDE"] = ""
+            generated["MODEL_CONCURRENCY"] = "1"
+            generated["MAIN_CONCURRENCY"] = "1"
+            publish_generated()
+            compose.validate()
+            compose.up_service("vllm", force_recreate=True)
+            compose.wait_service("vllm", timeout=2400.0, reporter=_step)
+            record_probe("main", generated["OPENAI_BASE_URL"], generated["MAIN_MODEL"])
+    if not controller:
+        return retry_context
+    if not (generated.get("TECHSARA_ENGINE_HEAD_API_URL") or "").strip():
+        # A single node without published model ports: the head is on the
+        # bridge and the host-network controller cannot reach it. A controller
+        # that cannot observe must not publish STARTING/DOWN for a healthy
+        # engine (contract §2), so it is not started at all, and says so.
+        _step(
+            "Engine controller: NOT started - the vLLM head is not reachable from the host network "
+            "(PUBLISH_MODEL_PORTS is off on a single node); set PUBLISH_MODEL_PORTS=true to run it"
+        )
+        compose.stop_service("engine-controller")
+        return retry_context
+    # AFTER the head has been proven serving by the probe above, never
+    # before: the controller's cold-start budget (900 s) must not be
+    # racing a first load that the launcher itself allows 2400 s for.
+    # Started on every `up` -- it is stateless (its lock and evidence
+    # are host files) and a definition change just recreates it. The
+    # legacy watchdog is removed only once the controller is healthy,
+    # so the head is never left with no guard at all; the two overlap
+    # for seconds, and the watchdog needs four minutes to act.
+    _step("Starting the engine controller (engine-controller)...")
+    _prepare_engine_controller_paths(project_root)
+    compose.up_service("engine-controller")
+    compose.wait_service("engine-controller", timeout=120.0, reporter=_step)
+    _retire_legacy_watchdog(compose.runner, reporter=_step)
+    return retry_context
+
+
 def _start_compose(
     compose: ComposeManager,
     profile: SelectedProfile,
@@ -1086,52 +1374,56 @@ def _start_compose(
                 _step("Main model: not serving - preserve flag ignored, starting it normally...")
                 preserve_main = False
         cluster = _cluster_mode(generated) == "dual"
-        if cluster and not preserve_main:
-            # Node 2 first: the head's rendezvous waits for the worker, and a
-            # sync/start failure here must surface as itself, not as a head
-            # readiness timeout.
-            _step("cluster: preparing the worker host (scripts/cluster-sync.sh)...")
-            _run_cluster_script(project_root, "cluster-sync.sh", reporter=_step, timeout=3600.0)
-            _step("cluster: starting the vLLM worker (scripts/cluster-worker.sh start)...")
-            _run_cluster_script(project_root, "cluster-worker.sh", "start", reporter=_step, timeout=300.0)
-        if not preserve_main:
-            try:
-                if cluster:
-                    _step(
-                        "cluster: starting vLLM head (node-rank 0) on "
-                        f"{generated.get('CLUSTER_HEAD_IP', '?')}:{generated.get('CLUSTER_MASTER_PORT', '?')}; "
-                        f"the worker on {generated.get('CLUSTER_WORKER_IP', '?')} must be running "
-                        "(scripts/cluster-worker.sh start)"
-                    )
-                _step("Starting the main model (vllm) - this is the longest step...")
-                compose.up_service("vllm")
-                compose.wait_service("vllm", timeout=2400.0, reporter=_step)
-                record_probe("main", generated["OPENAI_BASE_URL"], generated["MAIN_MODEL"])
-            except TechSaraError as exc:
-                if cluster:
-                    # The safer-context retry recreates only the head; it cannot
-                    # help when the worker is missing, unreachable, or mismatched.
-                    raise TechSaraError(
-                        f"the two-node vLLM head did not become ready ({exc}). Check both nodes with "
-                        "scripts/cluster-status.sh and the worker output with scripts/cluster-logs.sh worker"
-                    ) from exc
-                if not profile.startup_retry_context:
-                    raise
-                retry_context = profile.startup_retry_context
-                generated["MODEL_MAX_CONTEXT"] = str(retry_context)
-                generated["DEFAULT_MAX_CONTEXT"] = str(retry_context)
-                generated["REPORT_MAX_CONTEXT"] = str(retry_context)
-                generated["MAIN_CONTEXT_LENGTH"] = str(retry_context)
-                # The retry window is inside the model's native one, so the YaRN
-                # override that belonged to the wider window must go with it.
-                generated["MAIN_MODEL_ROPE_OVERRIDE"] = ""
-                generated["MODEL_CONCURRENCY"] = "1"
-                generated["MAIN_CONCURRENCY"] = "1"
-                publish_generated()
-                compose.validate()
-                compose.up_service("vllm", force_recreate=True)
-                compose.wait_service("vllm", timeout=2400.0, reporter=_step)
-                record_probe("main", generated["OPENAI_BASE_URL"], generated["MAIN_MODEL"])
+        controller = _has_engine_controller(profile)
+        # ONE ACTOR RESTARTS THE PAIR (contract §6). From here to the controller
+        # start below, this process holds the engine recovery lock: the
+        # controller of the previous `up` cannot start a recovery of a pair
+        # the launcher is in the middle of starting, and a recovery already
+        # in progress is waited out rather than restarted a second time.
+        engine_lock = EngineRecoveryLock(project_root).acquire("techsara up") if controller else None
+        try:
+            if controller and not preserve_main:
+                # No controller may be alive while the pair is restarted on
+                # purpose: a live one would read the worker's new start as
+                # `worker_rank_dead` and restart the head under the launcher
+                # (the multi-actor pattern of 2026-09-11). It is started again,
+                # against the proven pair, below. A stop of a service that has
+                # no container yet is a no-op.
+                _step("Engine controller: stopping the previous controller for the pair restart...")
+                compose.stop_service("engine-controller")
+            if cluster and not preserve_main:
+                # Node 2 first: the head's rendezvous waits for the worker, and a
+                # sync/start failure here must surface as itself, not as a head
+                # readiness timeout.
+                _step("cluster: preparing the worker host (scripts/cluster-sync.sh)...")
+                _run_cluster_script(project_root, "cluster-sync.sh", reporter=_step, timeout=3600.0)
+                _step("cluster: starting the vLLM worker (scripts/cluster-worker.sh start)...")
+                _run_cluster_script(project_root, "cluster-worker.sh", "start", reporter=_step, timeout=300.0)
+            elif cluster and controller:
+                # A ROUTINE deploy (the preserve flag, every push to main)
+                # leaves the pair alone -- but not the sentinel: without this
+                # the worker never receives sentinel.py, the token or the
+                # compose file, the controller sits in DEGRADED ("worker
+                # sentinel unreachable") and every recovery degrades to a
+                # head-only restart, the slow re-pair of 2026-09-11 (review
+                # round 1). `--env-only` ships files and the token without
+                # touching the model; `up -d` of the named sentinel service
+                # never recreates vllm-worker.
+                _step("cluster: shipping the worker sentinel (scripts/cluster-sync.sh --env-only)...")
+                _run_cluster_script(project_root, "cluster-sync.sh", "--env-only", reporter=_step, timeout=600.0)
+                _step("cluster: starting the worker sentinel (scripts/cluster-worker.sh start vllm-worker-sentinel)...")
+                _run_cluster_script(
+                    project_root, "cluster-worker.sh", "start", "vllm-worker-sentinel",
+                    reporter=_step, timeout=300.0,
+                )
+            retry_context = _start_main_engine_and_controller(
+                compose, profile, generated,
+                cluster=cluster, preserve_main=preserve_main, controller=controller,
+                project_root=project_root, record_probe=record_probe, publish_generated=publish_generated,
+            )
+        finally:
+            if engine_lock is not None:
+                engine_lock.release()
         if _yes(generated.get("VISION_ENABLED")):
             try:
                 record_probe(
@@ -1227,6 +1519,10 @@ def _cmd_up(args: argparse.Namespace, *, root: Path) -> int:
         models, runtimes = load_model_manifest(root)
         user_env = parse_env_file(root / ".env")
         secrets, secret_warnings = prepare_local_secrets(layout, profile, user_env)
+        if _has_engine_controller(profile):
+            # The sentinel token, in its own 0600 layer that only the
+            # engine-controller service reads (never secrets.env).
+            prepare_controller_secrets(layout, user_env)
         effective = dict(user_env)
         effective.update(secrets)
         manager = _model_manager(layout, hardware, runtimes, user_env)

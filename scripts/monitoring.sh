@@ -99,6 +99,7 @@ sync_worker_monitoring() {
   # scp, not rsync: two small files, and rsync is not guaranteed on the worker.
   local remote_dir
   remote_dir="$(ssh_worker "echo $WORKER_REMOTE_DIR")"
+  # shellcheck disable=SC2086  # the ssh options are a word list on purpose
   scp -q -o BatchMode=yes ${CLUSTER_WORKER_SSH_OPTS:-} \
     "$ROOT/compose/compose.monitoring-worker.yaml" \
     "$ROOT/monitoring/exporters/dgx-gpu/dgx_gpu_exporter.py" \
@@ -123,8 +124,10 @@ print("%.2f" % float(r[0]["value"][1]) if r else "-")
 '
 }
 
-cmd="${1:-status}"; shift || true
-case "$cmd" in
+# `action`, not `cmd`: cluster-common's head_compose declares a local ARRAY
+# of that name, and one name for two shapes trips shellcheck (SC2178/SC2128).
+action="${1:-status}"; shift || true
+case "$action" in
   up)
     ensure_grafana_password
     log_info "starting Grafana + Prometheus on this node"
@@ -161,7 +164,8 @@ case "$cmd" in
     head_monitoring_compose stop \
       prometheus grafana node-exporter dgx-gpu-exporter cadvisor blackbox-exporter \
       postgres-exporter data-stores-exporter "$@"
-    is_dual_mode && worker_monitoring_compose "$(worker_mgmt_ip)" stop || true
+    # Best effort on the worker: a stop must never fail because Node 2 is away.
+    if is_dual_mode; then worker_monitoring_compose "$(worker_mgmt_ip)" stop || true; fi
     ;;
   restart)
     head_monitoring_compose restart \
@@ -217,6 +221,40 @@ for t in sorted(ts, key=lambda x: (x["labels"].get("job", ""), x["labels"].get("
     printf '  waiting requests     %s\n'     "$(prom_scalar 'cluster:vllm_requests_waiting:current')"
     printf '  generation tokens/s  %s\n'     "$(prom_scalar 'cluster:vllm_generation_tokens_per_second:rate1m')"
     printf '  KV cache used        %s %%\n'  "$(prom_scalar 'cluster:vllm_kv_cache_usage_percent:current')"
+    echo
+    # The engine controller (contract §6/§7.1) is scraped as job
+    # `engine-controller`; the derived top-level state is the recording rule
+    # cluster:vllm_service_state:code (contract §7.3). "-" here is
+    # MONITORING_UNKNOWN by definition (no sample), never DOWN -- the
+    # dashboard renders the same absence as noValue.
+    echo "== engine controller =="
+    ctl_up="$(prom_scalar 'up{job="engine-controller"}')"
+    if [ "$ctl_up" = "-" ]; then
+      echo "  scrape target: not configured or never scraped (prometheus.yml job engine-controller; monitoring workstream)"
+    else
+      printf '  scrape target up       %s\n' "$ctl_up"
+    fi
+    state_code="$(prom_scalar 'techsara_vllm_state_code')"
+    state_name="$(prom_query 'techsara_vllm_state{}==1' | python3 -c '
+import json, sys
+r = json.load(sys.stdin).get("data", {}).get("result", [])
+print(r[0]["metric"].get("state", "?") if r else "MONITORING_UNKNOWN (no sample)")
+')"
+    printf '  controller state       %s (%s)\n' "$state_name" "$state_code"
+    printf '  derived service state  %s   (cluster:vllm_service_state:code; 7=QUEUEING 8=DOWN)\n' "$(prom_scalar 'cluster:vllm_service_state:code')"
+    printf '  canary success         %s   ttft %s s   last success %s s ago\n' \
+      "$(prom_scalar 'techsara_vllm_synthetic_success')" \
+      "$(prom_scalar 'techsara_vllm_synthetic_ttft_seconds')" \
+      "$(prom_scalar 'cluster:vllm_last_success_age_seconds')"
+    printf '  worker rank alive      %s   both ranks ok %s   restart budget left %s\n' \
+      "$(prom_scalar 'techsara_vllm_worker_rank_alive')" \
+      "$(prom_scalar 'techsara_vllm_both_ranks_ok')" \
+      "$(prom_scalar 'techsara_vllm_restart_budget_remaining')"
+    # v2, strict one-model mode: nothing answers for the main model; accepted
+    # generations wait in a durable queue and resume on READY (contract §8.3).
+    printf '  orchestrator queue     %s generation(s) queued for the primary   breaker(main) %s (0 closed, 1 open, 2 half-open)\n' \
+      "$(prom_scalar 'llm_queued_generations')" \
+      "$(prom_scalar 'llm_breaker_state{engine="main"}')"
     echo
     echo "== targets down =="
     prom_query 'up == 0' | python3 -c '

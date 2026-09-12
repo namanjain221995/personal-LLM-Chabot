@@ -41,10 +41,13 @@ DR_PROJECT="${TECHSARA_COMPOSE_PROJECT:-sf-local-ai}"
 
 #: The application images. Everything else in the chain is already pinned to a
 #: registry digest by the compose files themselves, so these three are the only
-#: mutable tags a deploy can get wrong.
+#: mutable tags a deploy can get wrong. (Read by the scripts that source this
+#: file -- deploy-preflight.sh, deploy-rollback.sh -- hence the SC2034 waiver.)
+# shellcheck disable=SC2034
 DR_APP_SERVICES=(orchestrator sync-worker frontend)
 
 #: The compose files that MUST all be present in the chain, in this order.
+# shellcheck disable=SC2034
 DR_REQUIRED_COMPOSE_FILES=(
   compose.yaml
   compose/compose.dgx-spark.yaml
@@ -56,9 +59,11 @@ dr_now()  { date -u +%Y-%m-%dT%H:%M:%SZ; }
 dr_stamp(){ date -u +%Y%m%d-%H%M%SZ; }
 
 DR_LOG="${DR_LOG:-}"
-dr_say()  { printf '%s %s\n' "$(date -u +%H:%M:%S)" "$*" | { [ -n "$DR_LOG" ] && tee -a "$DR_LOG" || cat; }; }
-dr_warn() { printf '%s WARN  %s\n' "$(date -u +%H:%M:%S)" "$*" | { [ -n "$DR_LOG" ] && tee -a "$DR_LOG" || cat; } >&2; }
-dr_die()  { printf '%s ERROR %s\n' "$(date -u +%H:%M:%S)" "$*" | { [ -n "$DR_LOG" ] && tee -a "$DR_LOG" || cat; } >&2; exit 1; }
+# To the log as well when one is set; plain stdout otherwise.
+_dr_out() { if [ -n "$DR_LOG" ]; then tee -a "$DR_LOG"; else cat; fi; }
+dr_say()  { printf '%s %s\n' "$(date -u +%H:%M:%S)" "$*" | _dr_out; }
+dr_warn() { printf '%s WARN  %s\n' "$(date -u +%H:%M:%S)" "$*" | _dr_out >&2; }
+dr_die()  { printf '%s ERROR %s\n' "$(date -u +%H:%M:%S)" "$*" | _dr_out >&2; exit 1; }
 
 dr_need() { command -v "$1" >/dev/null 2>&1 || dr_die "$1 is not on PATH"; }
 
@@ -205,8 +210,8 @@ dr_lock_acquire() {
 dr_lock_release() {
   [ "${DEPLOY_LOCK_HELD_BY:-}" = "$$" ] || return 0
   unset DEPLOY_LOCK_HELD_BY
-  [ -n "$DR_LOCK_HOLDER_FILE" ] && : >"$DR_LOCK_HOLDER_FILE" 2>/dev/null || true
-  [ -n "$DR_LOCK_FD" ] && eval "exec ${DR_LOCK_FD}>&-" 2>/dev/null || true
+  if [ -n "$DR_LOCK_HOLDER_FILE" ]; then : >"$DR_LOCK_HOLDER_FILE" 2>/dev/null || true; fi
+  if [ -n "$DR_LOCK_FD" ]; then eval "exec ${DR_LOCK_FD}>&-" 2>/dev/null || true; fi
   DR_LOCK_FD=""
 }
 
