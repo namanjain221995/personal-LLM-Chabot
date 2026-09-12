@@ -212,8 +212,8 @@ describe('ArtifactCard — one FileCard per file under a version header', () => 
     expect(screen.getAllByTestId('artifact-warnings').length).toBe(1);
     expect(screen.getByTestId('artifact-warnings').textContent).toContain('Two bullets were shortened.');
     expect(screen.getByTestId('artifact-status').textContent).toContain('Ready · 1 note');
-    // Each card carries the small chip; the notes themselves are not repeated.
-    expect(screen.getAllByTestId('file-card-status').map((c) => c.textContent)).toEqual(['With notes', 'With notes']);
+    // The notes live in the header once; no card repeats a "With notes" chip.
+    expect(screen.queryAllByTestId('file-card-status')).toEqual([]);
   });
 
   it('names an edited version "v2 · Updated" and a converted one "v2 · Converted"', () => {

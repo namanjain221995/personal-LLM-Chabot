@@ -510,9 +510,17 @@ def _sentence(ref: T.ArtifactRef, operation: str, warnings: Sequence[str], *, tr
     if data_only_note and operation == "create":
         note = data_only_note.strip().rstrip(".")
         line += f" {note[0].upper()}{note[1:]}."
-    if warnings:
-        line += " " + " ".join(f"_{w.rstrip('.')}._" for w in list(warnings)[:2])
+    said = [w for w in warnings if not _CELL_NOTE_RE.match(str(w))][:2]
+    if said:
+        line += " " + " ".join(f"_{w.rstrip('.')}._" for w in said)
     return line
+
+
+#: A per-cell or per-sheet note ("sheet 'Audit', column 'Comments': row 21:
+#: kept the original …") belongs on the card's notes, not in the sentence
+#: the person reads first — the 2026-09-12 screenshots showed two lines of
+#: it before the cards.
+_CELL_NOTE_RE = re.compile(r"^sheet '", re.IGNORECASE)
 
 
 async def _forward_progress(job_id: str, emit: Emit) -> Optional[dict]:

@@ -185,7 +185,8 @@ def test_workbook_in_four_formats_is_four_kinds_of_file(tmp_path):
     wire = report.to_json()["files"]
     assert wire[1]["sheet"] == "Pipeline" and wire[1]["role"] == "data" and wire[1]["title"] == "Pipeline"
     # Through the pipeline's own reopen the wire title is composed from
-    # the sheet's (tests/test_artifact_jobs.py pins "IR Session Audit — Data").
+    # the sheet's when the workbook has several (a one-sheet CSV keeps the
+    # plain title; tests/test_artifact_jobs.py pins both).
     from app.artifacts import pipeline as P
 
     checked = P._validate_files(str(tmp_path), report.to_json(), ["xlsx", "csv", "docx", "pdf"], "Sales tracker", 1, artifact_id="a" * 32, spec=spec)

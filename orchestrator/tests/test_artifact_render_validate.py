@@ -210,3 +210,15 @@ def test_grid_for_reads_a_csv_and_an_xlsx_in_one_shape(tmp_path):
     assert preview.grid_for(tmp_path / "d.csv", "csv")["sheets"] == ["d"], "no title: the file's stem"
     with pytest.raises(ValueError):
         preview.grid_for(tmp_path / "d.csv", "pdf")
+
+
+def test_grid_shows_a_date_cell_as_a_date():
+    """openpyxl reads a date cell back as a datetime at midnight; the grid
+    showed "2026-08-03T00:00:00" in the 2026-09-12 screenshots."""
+    import datetime as _dt
+
+    from app.artifacts.render import preview
+
+    assert preview._json_value(_dt.datetime(2026, 8, 3)) == "2026-08-03"
+    assert preview._json_value(_dt.datetime(2026, 8, 3, 9, 30)) == "2026-08-03T09:30:00"
+    assert preview._json_value(_dt.date(2026, 8, 3)) == "2026-08-03"

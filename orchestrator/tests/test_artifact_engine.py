@@ -697,6 +697,9 @@ def test_the_sentence_follows_the_contract_and_never_says_updated_on_a_create():
     line = engine._sentence(_ref([csv, xlsx]), "create", ["one cell was neutralised"], dataset=True, data_only_note="the CSV carries the data only; the formatting is in the Excel file")
     assert line == "Created the dataset with 500 validated records as CSV and Excel. The CSV carries the data only; the formatting is in the Excel file. _one cell was neutralised._"
     assert engine._sentence(_ref([xlsx, csv]), "edit", [], transform=transform, dataset=True) == "Updated **IR Session Audit** as Excel and CSV."
+    # A per-cell note stays on the card; the sentence carries only warnings worth a sentence.
+    noisy = ["sheet 'Audit', column 'Audit Comments': row 21: kept the original (rewrite is 80 characters for an original of 26)", "1 rewritten cell kept the original wording"]
+    assert engine._sentence(_ref([xlsx, csv, docx, pdf]), "create", noisy) == "Created **IR Session Audit** in Excel, CSV, Word and PDF. _1 rewritten cell kept the original wording._"
     # A format the words table does not know is said by its id, never a KeyError.
     odd = T.FileRef(format="ods", filename="x.ods", mime_type="m", size=1)
     assert engine._sentence(_ref([odd]), "create", []) == "Created **IR Session Audit** as ODS."

@@ -1494,6 +1494,9 @@ def _validate_files(work_dir: str, report: dict, selected: Sequence[str], title:
     kind = str(getattr(spec, "kind", "") or report.get("kind") or "document")
     promised = _generator_rows(spec)
     real_root = os.path.realpath(work_dir)
+    # A per-sheet CSV is titled by its sheet only when there is more than
+    # one (a one-sheet workbook's CSV is the workbook, not "Book — Sheet1").
+    data_files = sum(1 for e in (report.get("files") or []) if isinstance(e, dict) and str(e.get("role") or "") == "data")
     for entry in report.get("files") or []:
         if not isinstance(entry, dict):
             continue

@@ -88,7 +88,13 @@ def _json_value(value: Any) -> Any:
         if isinstance(value, float) and (value != value or value in (float("inf"), float("-inf"))):
             return str(value)
         return value
-    if isinstance(value, (_dt.datetime, _dt.date)):
+    if isinstance(value, _dt.datetime):
+        # openpyxl reads a date cell back as a datetime at midnight; the
+        # grid shows the date a person typed, not "2026-08-03T00:00:00".
+        if value.hour == value.minute == value.second == value.microsecond == 0 and value.tzinfo is None:
+            return value.date().isoformat()
+        return value.isoformat()
+    if isinstance(value, _dt.date):
         return value.isoformat()
     return str(value)
 

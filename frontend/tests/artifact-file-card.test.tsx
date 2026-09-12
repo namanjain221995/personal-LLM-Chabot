@@ -108,12 +108,15 @@ describe('FileCard — layout', () => {
     expect(screen.getByTitle('onboarding-sop-v1.pdf').textContent).toBe('Ref title');
   });
 
-  it('shows a status chip only when the version is not plain completed', () => {
+  it('shows a status chip only when the version is not usable yet — never for notes the header already lists', () => {
     const { unmount } = render(<FileCard file={file()} artifactRef={ref()} status="completed" />);
     expect(screen.queryByTestId('file-card-status')).toBeNull();
     unmount();
-    render(<FileCard file={file()} artifactRef={ref()} status="completed_with_warnings" />);
-    expect(screen.getByTestId('file-card-status').textContent).toBe('With notes');
+    const second = render(<FileCard file={file()} artifactRef={ref()} status="completed_with_warnings" />);
+    expect(screen.queryByTestId('file-card-status')).toBeNull();
+    second.unmount();
+    render(<FileCard file={file()} artifactRef={ref()} status="running" />);
+    expect(screen.getByTestId('file-card-status')).toBeTruthy();
   });
 });
 

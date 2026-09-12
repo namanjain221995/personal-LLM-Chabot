@@ -1289,7 +1289,9 @@ def test_a_workbook_version_publishes_four_files_with_minted_ids_roles_and_count
     assert xlsx["file_id"] == T.file_id_for(row["artifact_id"], 1, "primary", "xlsx")
     assert pdf["file_id"] == T.file_id_for(row["artifact_id"], 1, "companion", "pdf")
     assert csv_file["filename"] == "ir-session-audit-v1.csv" and csv_file["rows"] == 3 and csv_file["columns"] == 2
-    assert csv_file["title"] == "IR Session Audit — Data" and xlsx["title"] == "IR Session Audit"
+    # A one-sheet workbook's CSV is the workbook: no " — Data" suffix (the
+    # 2026-09-12 screenshots showed "Book — Sheet" on every one-sheet CSV).
+    assert csv_file["title"] == "IR Session Audit" and xlsx["title"] == "IR Session Audit"
     assert csv_file["mime_type"] == "text/csv; charset=utf-8" and pdf["pages"] == 2
     final = store.version_dir(owner, row["artifact_id"], 1)
     assert {"ir-session-audit-v1.xlsx", "ir-session-audit-v1.csv", "ir-session-audit-v1.docx", "ir-session-audit-v1.pdf"} <= set(os.listdir(final))

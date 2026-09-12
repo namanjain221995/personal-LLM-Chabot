@@ -113,12 +113,11 @@ export function FileCard({
   const previewUnavailable =
     !previewable && !isLegacyKey(file.file_id) && previewKindFor(file) !== 'none';
   const tint = fileKind(`x.${file.format}`).className;
-  const chip =
-    status && status !== 'completed'
-      ? status === 'completed_with_warnings'
-        ? 'With notes'
-        : statusLabel(status)
-      : null;
+  // The notes of a completed version are shown once, in the group header
+  // ("Ready · 2 notes" and the list) — a chip repeating "With notes" on
+  // every file under it said nothing four times (the 2026-09-12
+  // screenshots). A chip is for a version that is NOT usable yet.
+  const chip = status && status !== 'completed' && status !== 'completed_with_warnings' ? statusLabel(status) : null;
 
   function onKeyDown(e: KeyboardEvent<HTMLButtonElement>) {
     // A native button activates on Enter and Space by itself; handling the
