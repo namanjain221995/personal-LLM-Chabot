@@ -46,6 +46,12 @@ os.environ.setdefault("CLARIFY_MODE", "ambiguous")
 # which sets the windows explicitly per test.
 os.environ.setdefault("LLM_INTERACTIVE_RECOVERY_S", "0")
 os.environ.setdefault("LLM_RECOVERY_WINDOW_S", "0")
+# The queue window of one-model mode (app/continuity.py): a chat turn holds
+# its request for the main model for up to fifteen minutes in production. The
+# suite runs it at zero for the same reason as the two above; the queueing
+# behaviour has its own coverage in tests/test_continuity.py, which sets the
+# window explicitly per test.
+os.environ.setdefault("LLM_QUEUE_MAX_WAIT_S", "0")
 
 from urllib.parse import unquote, urlsplit  # noqa: E402
 

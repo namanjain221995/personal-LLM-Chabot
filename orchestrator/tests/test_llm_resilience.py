@@ -223,6 +223,9 @@ def test_recovery_window_context_sets_the_task_default(monkeypatch):
 
 
 def test_wait_notifier_is_told_once_while_waiting(clock, monkeypatch):
+    """The person reads the ONE exact sentence of CONTRACT §8.3 while the
+    main model is waited for — never the old "restarting (up to N min)"
+    line — and only for the main model: a sidecar's wait says nothing."""
     lines: list[str] = []
     calls = {"probe": 0}
 
@@ -235,14 +238,26 @@ def test_wait_notifier_is_told_once_while_waiting(clock, monkeypatch):
 
     monkeypatch.setattr(resilience, "engine_answers", probe)
     monkeypatch.setattr(settings, "llm_health_poll_s", 5.0)
+    monkeypatch.setattr(settings, "openai_base_url", "http://vllm:8000/v1")
 
     async def run():
         with resilience.wait_notifier(notify):
             return await resilience.wait_for_engine("http://vllm:8000/v1", deadline_s=600, what="t")
 
     assert asyncio.run(run()) is True
-    assert len(lines) == 1
-    assert "restarting" in lines[0] and "up to 10 min" in lines[0]
+    assert lines == [resilience.QUEUED_LINE]
+    assert resilience.QUEUED_LINE == "Main model is recovering—your request is safely queued."
+
+    # A sidecar (no breaker) waiting says nothing: it is not the model.
+    lines.clear()
+    calls["probe"] = 0
+
+    async def sidecar():
+        with resilience.wait_notifier(notify):
+            return await resilience.wait_for_engine("http://vllm-embed:30003/v1", deadline_s=600, what="t")
+
+    assert asyncio.run(sidecar()) is True
+    assert lines == []
 
     # A chat turn is several model calls waiting on the SAME outage: one line.
     lines.clear()

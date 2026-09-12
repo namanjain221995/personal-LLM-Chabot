@@ -35,6 +35,19 @@ def _int(name: str, default: int) -> int:
     return int(raw)
 
 
+def _controller_state_url(value: str) -> str:
+    """`http://host:9838` → `http://host:9838/state`; a URL that already names
+    a path is kept as given. Blank stays blank (the poller is off)."""
+    url = (value or "").strip()
+    if not url:
+        return ""
+    from urllib.parse import urlsplit
+
+    if urlsplit(url).path.strip("/") == "":
+        return url.rstrip("/") + "/state"
+    return url
+
+
 def _float(name: str, default: float) -> float:
     raw = os.environ.get(name)
     if raw is None or raw.strip() == "":
@@ -1384,6 +1397,78 @@ class Settings:
         self.llm_retry_base_s: float = _float("LLM_RETRY_BASE_S", 2.0)
         self.llm_retry_cap_s: float = _float("LLM_RETRY_CAP_S", 30.0)
         self.llm_health_poll_s: float = _float("LLM_HEALTH_POLL_S", 5.0)
+        # --- The circuit breaker in front of each engine (app/breaker.py) ---
+        # 2026-09-11 22:15Z: a worker rank died and the head kept answering
+        # /health, /v1/models and /metrics with 200 for five minutes while
+        # every completion hung, so the wait-and-retry layer above — which
+        # trusts /health — waited on a port that was never going to answer.
+        # The breaker counts what actually happened to real calls: after
+        # LLM_BREAKER_FAILURES counted failures inside LLM_BREAKER_WINDOW_S
+        # it OPENS and nothing polls the engine but one canary call every
+        # LLM_BREAKER_COOLDOWN_S (docs/availability/CONTRACT.md §8.2). It
+        # also opens at once when the engine controller reports the engine
+        # WEDGED / RECOVERING / DOWN / STARTING — see ENGINE_CONTROLLER_URL.
+        self.llm_breaker_failures: int = _int("LLM_BREAKER_FAILURES", 3)
+        self.llm_breaker_window_s: float = _float("LLM_BREAKER_WINDOW_S", 30.0)
+        self.llm_breaker_cooldown_s: float = _float("LLM_BREAKER_COOLDOWN_S", 10.0)
+        # --- The engine controller's verdict (app/engine_state.py) ---------
+        # The controller (compose service `engine-controller`, CONTRACT §6)
+        # runs the real canary against the head and publishes one of nine
+        # states at GET /state. The orchestrator polls it every
+        # ENGINE_STATE_POLL_S and treats a snapshot older than 15 s, or an
+        # unreachable controller, as UNKNOWN — which never opens the
+        # breaker: only observed failures and observed bad states do. An
+        # empty URL (or a poll interval of 0) switches the poller off.
+        # The same variable name serves scripts/cluster-recover.sh and
+        # scripts/cluster-status.sh as a BASE URL (`http://127.0.0.1:9838`),
+        # so a value without a path is completed to its /state document here
+        # rather than making the two shapes fight (review finding 2026-09-12).
+        self.engine_controller_url: str = _controller_state_url(
+            os.environ.get("ENGINE_CONTROLLER_URL", "http://vllm:9838/state")
+        )
+        self.engine_state_poll_s: float = _float("ENGINE_STATE_POLL_S", 5.0)
+        # The breaker's single HALF_OPEN canary is whichever real call
+        # arrives first, and a non-streaming call can run for minutes (a
+        # Max-effort candidate thinking, a compaction summary). After this
+        # many seconds an outstanding canary stops blocking everyone else
+        # and the next caller probes too; the late outcome is then an
+        # ordinary one (review finding 2026-09-12, breaker.py:183). Sized
+        # like the controller's CANARY_TIMEOUT_S.
+        self.llm_breaker_canary_hold_s: float = _float("LLM_BREAKER_CANARY_HOLD_S", 60.0)
+        # --- Continuity in one-model mode (app/continuity.py, CONTRACT §8.3)
+        # Only the main model may answer a person. While its breaker is OPEN
+        # or the controller reports it STARTING / WEDGED / RECOVERING / DOWN,
+        # a chat turn is not failed and not answered by anything else: its
+        # row goes `queued`, the person reads one truthful line, and the
+        # SAME generation resumes when the controller reports READY. This
+        # is how long a turn waits before the row is parked for the resume
+        # sweep: a cold start measured 5 m 20 s, plus margin.
+        self.llm_queue_max_wait_s: float = _float("LLM_QUEUE_MAX_WAIT_S", 900.0)
+        # The resume sweep (CONTRACT §8.4) runs rows a process parked or a
+        # restart interrupted when the controller reports READY; a row older
+        # than this is left alone — nobody is waiting for it, and a thread
+        # would only be surprised by an answer to a day-old question.
+        self.llm_resume_max_age_s: float = _float("LLM_RESUME_MAX_AGE_S", 24 * 3600.0)
+        # --- Long-context admission (app/admission.py, CONTRACT §6.7) ------
+        # Two lanes in front of the engine. A prompt at or below the
+        # threshold takes the NORMAL lane (ADMISSION_NORMAL_MAX concurrent
+        # generations); above it, the LONG lane runs ONE at a time, first
+        # draining the normal lane and waiting for the engine to report
+        # `requests_running` at or below ADMISSION_LONG_IDLE_MAX (from the
+        # controller's engine sample) for at most ADMISSION_LONG_WAIT_S, so a
+        # 131k-token prefill never mixes with nine others — the exact load
+        # shape of the 2026-09-11 GDN fault (docs/availability/INCIDENT-…).
+        self.admission_long_threshold_tokens: int = _int("ADMISSION_LONG_THRESHOLD_TOKENS", 131072)
+        self.admission_normal_max: int = _int("ADMISSION_NORMAL_MAX", 10)
+        self.admission_long_max: int = _int("ADMISSION_LONG_MAX", 1)
+        self.admission_long_idle_max: int = _int("ADMISSION_LONG_IDLE_MAX", 0)
+        self.admission_long_wait_s: float = _float("ADMISSION_LONG_WAIT_S", 600.0)
+        # How long a NORMAL-lane caller may wait for a slot before it is
+        # refused (`llm_admission_rejections_total{reason="timeout"}`), and
+        # how deep either lane's waiting line may grow before a newcomer is
+        # refused at once (`reason="capacity"`) instead of joining it.
+        self.admission_normal_wait_s: float = _float("ADMISSION_NORMAL_WAIT_S", 600.0)
+        self.admission_max_waiting: int = _int("ADMISSION_MAX_WAITING", 100)
         self.schema_cache_ttl: float = _float("SCHEMA_CACHE_TTL", 300.0)
         # §8 /health: per-dependency probe timeout — short so /health answers
         # quickly even when every vLLM service is down.

@@ -183,7 +183,6 @@ def _check_duckdb(path: str) -> dict:
     # "error" on a transient lock made /health flap for a warehouse that was
     # about to be readable (2026-08-29).
     deadline = time.monotonic() + _HEALTH_LOCK_WAIT_SECONDS
-    last: Exception | None = None
     while True:
         try:
             con = duckdb.connect(
@@ -201,7 +200,6 @@ def _check_duckdb(path: str) -> dict:
                 con.close()
             return {"status": "ok"}
         except Exception as exc:  # noqa: BLE001 — never raises, by contract
-            last = exc
             if time.monotonic() >= deadline:
                 return {"status": "error", "detail": f"{type(exc).__name__}: {exc}"}
             time.sleep(0.25)
@@ -447,6 +445,14 @@ def _publish_work_gauges(work: dict) -> None:
         "chat_requests_interrupted", work.get("chat_requests_interrupted", 0),
         "Chat requests a restart left interrupted and unresumed.",
     )
+    # V32: rows parked for the main model — in THIS process (the in-memory
+    # `llm_queued_generations`) or by one that is gone — that the resume
+    # sweep will pick up on the next READY. The durable count, as opposed
+    # to the live one.
+    metrics.set_gauge(
+        "chat_requests_queued", work.get("chat_requests_queued", 0),
+        "Chat requests durably queued for the main model (V32 status queued).",
+    )
     artifacts = work.get("artifacts") or {}
     for state in ("queued", "running"):
         metrics.set_gauge(
@@ -473,6 +479,7 @@ def _read_work() -> dict:
     video = {"queued": 0, "running": 0, "oldest_running_age_s": 0}
     uploads = {"uploading": 0, "finalizing": 0}
     interrupted = 0
+    queued = 0
     with db.connection() as con:
         for row in con.execute(
             "SELECT status, count(*) AS n FROM video_analyses "
@@ -493,10 +500,14 @@ def _read_work() -> dict:
             "WHERE status IN ('uploading', 'finalizing') GROUP BY status"
         ).fetchall():
             uploads[row["status"]] = int(row["n"])
-        row = con.execute(
-            "SELECT count(*) AS n FROM chat_requests WHERE status = 'interrupted'"
-        ).fetchone()
-        interrupted = int(row["n"])
+        for row in con.execute(
+            "SELECT status, count(*) AS n FROM chat_requests "
+            "WHERE status IN ('interrupted', 'queued') GROUP BY status"
+        ).fetchall():
+            if row["status"] == "interrupted":
+                interrupted = int(row["n"])
+            else:
+                queued = int(row["n"])
     # V31 artifact jobs: the one aggregate here that HAS an accessor
     # (artifacts.db.work_snapshot — counts only, same idx_artifact_jobs_open
     # partial index). `oldest_queued_age_s` is the number an operator wants
@@ -512,6 +523,7 @@ def _read_work() -> dict:
         "video": video,
         "uploads": uploads,
         "chat_requests_interrupted": interrupted,
+        "chat_requests_queued": queued,
         "artifacts": artifacts,
     }
 
@@ -663,6 +675,38 @@ async def probe_context_window(client: httpx.AsyncClient) -> dict:
     return out
 
 
+def engine_availability() -> dict:
+    """The orchestrator's own view of the main engine (CONTRACT §8): the
+    controller's last verdict, the circuit breaker, the generations held
+    for the engine (app/continuity.py) and the admission lanes
+    (app/admission.py).
+
+    In-memory only, by design — the poller, the breaker and the lanes
+    already hold the answer, and /health is called every 30 s by the
+    container healthcheck and every 15 s by the blackbox probe. It rides
+    INSIDE the main model's `checks` entry so the existing readers see it
+    next to the probe it qualifies, and it never changes that entry's
+    `status`: the breaker being OPEN means the orchestrator is protecting
+    itself, not that this process is unhealthy — the container healthcheck
+    gates on `status`, and restarting the orchestrator would not bring the
+    engine back (it would only park every queued generation). Never raises.
+    """
+    from . import admission, breaker, continuity, engine_state  # lazy: keep import cost off the probe path
+
+    try:
+        return {
+            "controller": engine_state.describe(),
+            "breakers": {name: brk.describe() for name, brk in breaker.all_breakers().items()},
+            "queue": continuity.describe(),
+            "admission": admission.describe(),
+            # One-model mode (CONTRACT v2 §1): stated, so a reader of an
+            # older report is not left looking for the fallback block.
+            "answer_engine": "main",
+        }
+    except Exception as exc:  # noqa: BLE001 — additive, never fatal
+        return {"status": "unknown", "detail": f"{type(exc).__name__}: {exc}"[:200]}
+
+
 async def check_dependencies() -> dict:
     """Probe every §8 dependency concurrently.
 
@@ -710,6 +754,14 @@ async def check_dependencies() -> dict:
     }
     checks["duckdb"] = results[required_count]
     checks["app_db"] = results[required_count + 1]
+    # The engine-availability view (2026-09-12) rides on the main model's
+    # entry — see engine_availability for why there and why it cannot move
+    # `status`. `seen` maps the URL to the name it was probed under, so a
+    # profile that shares the main endpoint with other roles still finds it.
+    main_name = seen.get(settings.openai_base_url, "")
+    if isinstance(checks.get(main_name), dict):
+        # A copy: a probe stub may hand the same dict to every service.
+        checks[main_name] = {**checks[main_name], "engine": engine_availability()}
     embedding_index_result = results[required_count + 2]
     ocr_result = results[required_count + 3]
     reranker_result = results[required_count + 4]

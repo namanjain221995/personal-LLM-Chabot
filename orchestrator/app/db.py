@@ -1810,6 +1810,26 @@ ALTER TABLE query_trace_events ALTER COLUMN completed_at SET NOT NULL;
 """
 
 
+_MIGRATION_V33 = """
+-- V33 (2026-09-12): availability programme, strict one-model mode
+-- (docs/availability/CONTRACT.md §8.3). A chat request the main model cannot
+-- take right now — its breaker is OPEN, or the controller reports it
+-- STARTING / WEDGED / RECOVERING / DOWN — is neither failed nor answered by
+-- another model: the row goes `queued`, the person reads one truthful line,
+-- and the SAME generation resumes when the model is READY. A row a process
+-- parked (the wait outran LLM_QUEUE_MAX_WAIT_S) or lost stays `queued` until
+-- the resume sweep (app/continuity.py) or the browser's re-attach picks it
+-- up. Same shape as V14's `web_crawls_status` widening: drop and re-add the
+-- CHECK, and let the open-rows index see the new state.
+ALTER TABLE chat_requests DROP CONSTRAINT IF EXISTS chat_requests_status;
+ALTER TABLE chat_requests ADD CONSTRAINT chat_requests_status CHECK
+    (status IN ('accepted', 'running', 'queued', 'completed', 'failed', 'cancelled', 'interrupted'));
+DROP INDEX IF EXISTS idx_chat_requests_open;
+CREATE INDEX IF NOT EXISTS idx_chat_requests_open
+    ON chat_requests (status) WHERE status IN ('accepted', 'running', 'queued', 'interrupted');
+"""
+
+
 _MIGRATIONS: tuple = (
     (1, _MIGRATION_V1),
     (2, _MIGRATION_V2),
@@ -1843,6 +1863,7 @@ _MIGRATIONS: tuple = (
     (30, _MIGRATION_V30),
     (31, _MIGRATION_V31),
     (32, _MIGRATION_V32),
+    (33, _MIGRATION_V33),
 )
 
 #: The version `init_schema` brings a database up to. Exported so callers (and
@@ -5809,7 +5830,9 @@ def resume_chat_request(
     racing to resume the same intent cannot both win — the loser sees the
     row unchanged and attaches to the winner's generation instead."""
     ts = _now()
-    allowed = ["interrupted", "accepted", "running"] + (["failed", "cancelled"] if reopen_finished else [])
+    # `queued` (V32): a row parked for a recovering model is open too — the
+    # resume sweep and the browser's re-attach both come through here.
+    allowed = ["interrupted", "accepted", "running", "queued"] + (["failed", "cancelled"] if reopen_finished else [])
     with connection() as con:
         if expected_generation_id is None:
             row = con.execute(
@@ -5865,7 +5888,9 @@ def delete_failure_record(conversation_id: str, generation_id: str) -> bool:
 
 def interrupt_open_chat_requests() -> int:
     """Startup (or orderly shutdown): every request this process could have
-    been running is now 'interrupted'. Returns how many."""
+    been running is now 'interrupted'. Returns how many. A `queued` row is
+    left as it is: it says the truth about itself whichever process held
+    it (waiting for the main model), and the resume sweep reads it by name."""
     with connection() as con:
         rows = con.execute(
             "UPDATE chat_requests SET status = 'interrupted', updated_at = %s "
@@ -5873,6 +5898,52 @@ def interrupt_open_chat_requests() -> int:
             (_now(),),
         ).fetchall()
     return len(rows)
+
+
+def park_chat_request(intent_id: str, generation_id: str) -> Optional[dict]:
+    """V32 (CONTRACT §8.3 step 1): the generation is waiting for the main
+    model — the row says `queued`. Conditional on the generation the caller
+    holds and on the row being live (accepted/running), so a Stop that
+    landed meanwhile is never overwritten. Returns the row when it moved."""
+    with connection() as con:
+        row = con.execute(
+            "UPDATE chat_requests SET status = 'queued', updated_at = %s "
+            "WHERE intent_id = %s AND generation_id = %s AND status IN ('accepted', 'running') "
+            "RETURNING *",
+            (_now(), intent_id, generation_id),
+        ).fetchone()
+    return _chat_request_row(row) if row is not None else None
+
+
+def resume_queued_chat_request(intent_id: str, generation_id: str, *, new_attempt: bool) -> Optional[dict]:
+    """V32 (CONTRACT §8.3 step 4): the SAME generation goes on — the row is
+    `running` again under the generation it already names, and, for a
+    recovery (not a mere admission wait), `attempt` moves on by one.
+    Conditional on `queued` + the generation, so a sweep or a re-attach
+    that took the row over meanwhile wins and this caller sees None."""
+    with connection() as con:
+        row = con.execute(
+            "UPDATE chat_requests SET status = 'running', "
+            "attempt = attempt + %s, updated_at = %s "
+            "WHERE intent_id = %s AND generation_id = %s AND status = 'queued' RETURNING *",
+            (1 if new_attempt else 0, _now(), intent_id, generation_id),
+        ).fetchone()
+    return _chat_request_row(row) if row is not None else None
+
+
+def list_resumable_chat_requests(statuses: Sequence[str], *, max_age_s: float, limit: int = 200) -> list:
+    """Rows the resume sweep may act on (CONTRACT §8.4 v2): in one of
+    `statuses`, resumable from their snapshot, and touched within
+    `max_age_s` — an old row is a request nobody is waiting for any more,
+    and re-running it would only surprise a thread. Oldest first."""
+    with connection() as con:
+        rows = con.execute(
+            "SELECT * FROM chat_requests WHERE status = ANY(%s) AND resumable "
+            "AND updated_at > %s - (%s * interval '1 second') "
+            "ORDER BY created_at LIMIT %s",
+            (list(statuses), _now(), float(max_age_s), int(limit)),
+        ).fetchall()
+    return [_chat_request_row(r) for r in rows]
 
 
 # ---------------------------------------------------------------------------
