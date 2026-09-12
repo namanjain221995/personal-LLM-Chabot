@@ -128,12 +128,17 @@ affinity. See *Limitations*. GPUDirect RDMA is disabled by NCCL on GB10
 ## Memory
 
 `--gpu-memory-utilization 0.30` per node is the ceiling vLLM enforces (of the
-121 GB pool each GB10 reports), and `--kv-cache-memory-bytes` (16 GiB per
-node, `CLUSTER_KV_CACHE_MEMORY_GIB`) fixes the KV budget explicitly: weights
-11.35 GiB + CUDA graphs 2.62 GiB + KV 16 GiB + activations ≈ 31 GiB per node
-for the 35B-A3B, ≈ 2.98M tokens of fp8 KV per node (27B: weights 10.6 GiB +
-graphs 1.3 GiB, ≈ 950k tokens; single-node 27B: 18.6 GiB / 542k tokens at
-0.35). Why explicit rather than profiled: on GB10 "free GPU memory" is free
+121 GB pool each GB10 reports), and `--kv-cache-memory-bytes` (**8 GiB per
+node** since the 1M window of 2026-08-29 — `--kv-cache-memory-bytes
+8589934592`, `CLUSTER_KV_CACHE_MEMORY_GIB=8`; the launcher's default is still
+16) fixes the KV budget explicitly: weights 11.35 GiB + CUDA graphs 2.62 GiB +
+KV 8 GiB + activations ≈ 23 GiB per node for the 35B-A3B (24.8 GiB measured
+per rank, `availability/MEMORY-BUDGET.md`), a pool of 1,663,201 fp8 KV tokens
+per node with prefix caching off (1,494,824 with it on; 2.98M at the old
+16 GiB, which starved the prefill of a real 949,915-token request — see
+"Engine tuning" below). 27B figures for comparison: weights 10.6 GiB + graphs
+1.3 GiB, ≈ 950k tokens at 16 GiB; single-node 27B: 18.6 GiB / 542k tokens at
+0.35. Why explicit rather than profiled: on GB10 "free GPU memory" is free
 *system* memory, and it moves while vLLM profiles (page cache from the 22 GB
 weight read is released, other containers breathe). vLLM asserts that free
 memory did not *grow* during profiling (`Error in memory profiling. Initial
@@ -393,6 +398,25 @@ engine at max 79 % / Node 2 at max 76 % (p50 70 %) SM — both GPUs work every
 request; that is what tensor parallelism means.
 
 ## Failure behaviour
+
+**Availability and recovery (2026-09-12).** What follows is the pair's own
+behaviour and the Docker healthchecks — now the *last resort*. Since
+2026-09-12 the first responder is the engine controller
+(`monitoring/engine-controller/`, compose service `engine-controller`), which
+proves the engine with a real completion every 30 s (and a five-step readiness
+sequence after every start), sees a dead worker rank through the sentinel on
+Node 2 within seconds, and is the **only** actor that restarts the pair — in
+order (worker first), under one lock, with a budget; the orchestrator's circuit
+breaker keeps every request that arrives meanwhile durably queued and resumes
+it on the same model once READY (no other model answers). The `vllm-watchdog`
+described below no longer exists. Read [`availability/README.md`](availability/README.md):
+the runbook ([`availability/RUNBOOK.md`](availability/RUNBOOK.md) — including
+`scripts/cluster-recover.sh`, the one sanctioned way to restart the pair, and
+why `docker restart` of the head alone is wrong), the binding contract
+([`availability/CONTRACT.md`](availability/CONTRACT.md)), the design
+([`availability/ARCHITECTURE.md`](availability/ARCHITECTURE.md)), the measured
+numbers ([`availability/SLO.md`](availability/SLO.md)) and the incident that
+caused it ([`availability/INCIDENT-2026-09-11-vllm.md`](availability/INCIDENT-2026-09-11-vllm.md)).
 
 Tested on 2026-08-25 by killing the worker under a running cluster (twice,
 because the first design did not pass). What actually happens when the worker

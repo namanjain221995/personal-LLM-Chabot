@@ -62,6 +62,10 @@ never come up as `admin/admin` on a LAN with no firewall.
 
           vLLM :8000 /metrics  <- ONE endpoint, whole distributed engine
           vLLM :8002/:8003/:8004/:8005  router / embed / OCR / reranker
+          engine-controller :9838  <- the real canary; /state, /metrics
+                 |  RoCE rail A (10.100.184.0/24) — the ONE monitoring
+                 v  hop that must use the fabric, see below
+          vllm-worker-sentinel :9839              Spark 2 (not scraped)
 ```
 
 **Scraping never touches the RoCE fabric.** Prometheus reaches Spark 2 over
@@ -81,9 +85,37 @@ traffic — monitoring must not compete with the thing it measures.
 | blackbox-exporter 0.25.0 | Spark 1 | HTTP liveness for services with no `/metrics` |
 | postgres-exporter 0.16.0 | Spark 1 | PostgreSQL server statistics |
 | `data-stores-exporter` (custom) | Spark 1 | DuckDB / LanceDB / Parquet size + freshness |
+| `engine-controller` (custom) | Spark 1 | the vLLM engine's **real** state: a streamed canary completion every 30 s, both ranks, coordinated recovery; `techsara_vllm_*` |
+| `vllm-worker-sentinel` (custom) | Spark 2 | watches the worker rank process for the controller; **not scraped** (see Ports) |
 
 Loki/Promtail are deliberately **not** included: this is metric observability,
 and log aggregation would be a second storage system to run and bound.
+
+### Ports
+
+| Port | What | Where it binds | Scraped by |
+|---|---|---|---|
+| 3300 | Grafana | `MONITORING_BIND_ADDRESS` (loopback) | — |
+| 9090 | Prometheus | `MONITORING_BIND_ADDRESS` (loopback) | itself, 30 s |
+| 9100 | node-exporter | host network, both Sparks (Spark 2: management IP only) | `node`, 10 s |
+| 9835 | `dgx-gpu-exporter` | both Sparks (Spark 2: management IP only) | `dgx-gpu`, 5 s |
+| 9836 | `data-stores-exporter` | `application` network | `data-stores`, 30 s |
+| 9187 | postgres-exporter | `application` network | `postgres`, 15 s |
+| 8080 | cAdvisor | `application` network | `cadvisor`, 15 s |
+| 9115 | blackbox-exporter | `application` network | `blackbox-http`, 15 s |
+| 8000 | vLLM main engine `/metrics` | head, host network | `vllm-main`, 5 s |
+| 30002 / 30003 / 30005 / 30004 | router / embed / reranker / OCR `/metrics` | `application` network (OCR: wherever `scripts/ocr.sh` put it) | `vllm-aux`, 15 s |
+| **9838** | **`engine-controller`** — `/state`, `/metrics`, `/healthz`; `POST /recover` from loopback only | head, host network, all interfaces | **`engine-controller`, 5 s** |
+| **9839** | **`vllm-worker-sentinel`** — `/state`, `/diagnostics`, `POST /restart` | Spark 2, **the RoCE rail-A address only** (`CLUSTER_WORKER_IP`) | **nobody** |
+
+The sentinel is the one exception to "monitoring never touches the RoCE
+fabric", and it is an exception for the controller, not for Prometheus: it
+binds to the rail-A address because that is a point-to-point link only the
+head can reach, so a `POST /restart` can never arrive from the office LAN. Its
+few bytes a second ride a fabric that moves a gigabyte a second under load.
+Prometheus still does not scrape it — everything it knows is folded into the
+controller's `techsara_vllm_worker_*` gauges, scraped over the management LAN
+like everything else.
 
 ---
 
@@ -254,6 +286,176 @@ Latency percentiles are only shown where the histogram buckets support them:
 
 ---
 
+## Engine state — what each top-level state means and which signal drives it
+
+**A process being alive proves nothing.** On 2026-09-11 the worker rank on
+Spark 2 died at 22:15:50 UTC in a GDN prefill kernel. For the next five
+minutes `up{job="vllm-main"}` read 1, `/health` and `/v1/models` answered
+200, `/metrics` kept serving — with `generation_tokens_total` frozen at
+2,138,504 and `num_requests_running` frozen at 9 — and the overview's "vLLM"
+tile said **UP**. Ten requests hung until vLLM's own 300 s execute timeout
+turned them into HTTP 500s. Only then did `up` go to 0, and the "vLLM DOWN"
+that Grafana finally showed described the five minutes the restart was
+*designed* to take, not the five minutes that mattered.
+
+So the engine's state on the overview no longer comes from Prometheus asking
+whether a port answers. It comes from the **engine controller**
+(`monitoring/engine-controller/`, compose service `engine-controller`, port
+9838), which every 30 s sends the engine a real streamed chat completion,
+watches the worker rank through the sentinel on Spark 2, and publishes one of
+exactly nine states. The contract is
+[`availability/CONTRACT.md`](availability/CONTRACT.md) (v2, **strict
+one-model mode**: only `nvidia/Qwen3.6-35B-A3B-NVFP4` ever answers a person;
+there is no fallback model, and while the primary is not READY the
+orchestrator holds every accepted request in a durable queue and resumes the
+same generation when READY returns). This table is the operator's view of it.
+
+| Code | State | What it means | The signal that decides it | Alert |
+|---|---|---|---|---|
+| 0 | `MONITORING_UNKNOWN` | the telemetry cannot be observed, or the controller's verdict is unproven. **Never rendered as DOWN.** | the controller cannot observe (it exports 0); **or** Grafana finds no series at all (`noValue`); **or** the controller's snapshot stamp `techsara_vllm_generated_at_seconds` is more than 30 s old (a frozen tick) — the derived state drops its sample; **or** `absent_over_time(techsara_vllm_state_code[2m])` | `VllmMonitoringUnknown` (warning, labelled with *what* is missing: `controller_state`, `vllm_scrape_target`, `controller_observation`, `controller_stale`, `controller_stamp`); `VllmReadyUnproven` (critical) when READY is claimed with no real success for 2 minutes |
+| 1 | `STARTING` | containers up, model loading; the readiness sequence has not passed since the head started; cold-start budget (900 s) not exceeded | head `started_at` newer than the last proven readiness | none — `VllmScrapeTargetDown`, `HeadSwapActivity` and `NcclTcpFallback` are silenced here |
+| 2 | `READY` | the **readiness sequence** passed and a canary succeeded within the last two probe intervals: (1) a non-streaming completion, (2) a streaming completion with TTFT measured and a terminal chunk seen, (3) `generation_tokens_total` on `/metrics` advanced by at least the tokens received, (4) both GPU exporters seen above 30 % during a 256-token participation probe, (5) the sentinel reports the rank process alive | `techsara_vllm_synthetic_success` + `techsara_vllm_participation_ok` + `techsara_vllm_worker_rank_alive` + `cluster:vllm_last_success_age_seconds` | `VllmPrimaryRestored` (info) when it follows an outage |
+| 3 | `BUSY` | READY, and `vllm:num_requests_running > 0` | as READY, plus the scheduler gauge | `VllmQueueBacklog` (warning) if waiting > 5 for 5 m |
+| 4 | `DEGRADED` | the canary still succeeds but a non-critical signal failed: sentinel unreachable, metrics stale, canary TTFT > 10 s, the router *classifier* unhealthy (it routes intents; it never answers a person), a GPU exporter unreachable | `techsara_vllm_worker_reachable`, `techsara_vllm_head_metrics_ok`, `techsara_vllm_synthetic_ttft_seconds`, `techsara_vllm_router_available`, `techsara_vllm_participation_ok` | `VllmCanaryTtftHigh`, `VllmMetricsStale`, `HeadSwapActivity`, `NcclTcpFallback`, `RoceRailMissing` (all warning) |
+| 5 | `WEDGED` | requests exist but neither token counter moves for ≥ 90 s, or the canary has been outstanding ≥ 60 s while `/health` still answers 200; two consecutive observations | `techsara_vllm_generation_frozen_seconds` with running > 0; canary timeout | `VllmEngineWedged` (critical, 30 s), `VllmGenerationFrozen` (critical), `VllmWorkerRankAbsent` (critical) |
+| 6 | `RECOVERING` | a coordinated recovery holds the lock: diagnostics captured, the pair restarted worker-first, model reloading, readiness sequence pending, queued generations resumed once it passes | `techsara_vllm_recovery_in_progress`, `techsara_vllm_recovery_step` | `VllmRecoveryStarted` (info); `VllmRepeatedRecoveryFailure` (critical) after two failures in an hour |
+| 7 | `QUEUEING` | the primary is not READY/BUSY/DOWN **and** the orchestrator holds ≥ 1 accepted generation durably queued for it; the person reads *Main model is recovering—your request is safely queued.* and the **same** generation resumes when READY returns | derived in Prometheus (`cluster:vllm_service_state:code`): controller state ∉ {2, 3, 8} and `llm_queued_generations > 0` | `VllmRequestsQueued` (warning, after 2 m); `VllmQueueDrained` (info) when it ends |
+| 8 | `DOWN` | the primary is not serving and the restart budget is exhausted or the last recovery failed; **nothing answers users** — queued requests are held (never lost, never answered by another model) until an operator acts | controller state 8 with a fresh verdict. A queue never softens 8 into 7 | `VllmPrimaryDown` (critical, 1 m), `VllmRecoveryBudgetExhausted` (critical) |
+
+The overview's **vLLM engine** tile and the **Engine state** timeline in the
+correlation strip both read `cluster:vllm_service_state:code`. The tiles next
+to it are the signals behind the state, so a bad state can be read without
+leaving the page: **Readiness** (proven / GPUs unproven / canary failing /
+unproven / unknown — steps 2 and 4 of the readiness sequence, from
+`techsara_vllm_synthetic_success` and `techsara_vllm_participation_ok`),
+**Queued requests** (`llm_queued_generations`, the head-count of people
+waiting; `none` when the orchestrator is not scraped), **Worker rank** (alive
+/ ABSENT / unknown), **Last successful inference** (seconds since a real
+completion — the one liveness number a hung process cannot fake), **Canary
+TTFT**, **Incident duration**, **Recovery attempts (1h)** against the budget
+of 3, and **Reason** (the controller's last failure category, a bounded set).
+
+### What "no data" means, and why it is never zero
+
+Every one of those tiles distinguishes *absent* from *zero*. The engine tile
+shows `MONITORING_UNKNOWN`, the readiness and rank tiles `unknown`, the queue
+tile `none`, the incident tile `none`, the counters `no data`. None of the
+recording rules behind them ends in `or vector(0)`: when the controller is
+not being scraped, `cluster:vllm_service_state:code` produces **no sample**,
+and the one alert that fires on absence — `VllmMonitoringUnknown` — is worded
+as *monitoring cannot see*, not as *inference is down*, because that is all it
+knows. The same rule governs the vLLM scrape: a gap in the token-rate series
+is drawn as a gap (`spanNulls` is off on every vLLM panel), because on
+2026-09-11 a bridged line would have hidden the whole outage.
+
+**A stale verdict is absence too.** The controller stamps every snapshot with
+`techsara_vllm_generated_at_seconds`. Its tick is 5 s, the scrape 5 s and the
+rule group 5 s, so a live verdict is never more than ~15 s old. If the tick
+stops (an exception before publish, a blocked observe) the controller's HTTP
+thread keeps serving the *last* snapshot with fresh scrape timestamps — the
+"process alive, answers stale" blind spot moved one level up. So when the
+stamp is more than 30 s old every `vllm-state` rule drops its sample, the tile
+turns grey, and `VllmMonitoringUnknown{missing="controller_stale"}` fires a
+minute later. A controller that exports no stamp at all is treated the same
+way (`missing="controller_stamp"`): an unstamped verdict is unproven, never
+READY on trust. Independently, `VllmReadyUnproven` (critical) fires when the
+controller still claims READY/BUSY while `cluster:vllm_last_success_age_seconds`
+— deliberately *not* gated on freshness — passes 120 s: a READY that has
+proven nothing for four canary intervals is a lie, whether the tick is frozen
+or the canary thread is dead.
+
+`VllmDown` — `up{job="vllm-main"} == 0`, critical — is now
+`VllmScrapeTargetDown`, a warning, silenced while the controller reports
+STARTING or RECOVERING. It says exactly what it measures: the scrape target
+disappeared. Whether the *model* is down is the controller's call.
+
+### The rules, and how they are proven
+
+`monitoring/prometheus/rules/recording.yml` (group `vllm-state`)
+derives five series from the controller's gauges; `alerts.yml` (group
+`vllm-availability`, plus `PrometheusRuleEvaluationFailing` in
+`monitoring-self`) holds the alerts above. Every alert carries the label
+`service` and — where it speaks for one — a **fixed** `state` label (the §2
+state the alert is about: `VllmGenerationFrozen` is always `WEDGED`,
+`VllmWorkerRankAbsent` always `DOWN`), never the controller's live name. A
+label is part of the alert's identity: the first version joined the live
+name in with `* on() group_left(state)`, and every READY↔BUSY flip (81 in six
+hours under normal load) resolved the pending alert and restarted `for:`, so
+the critical alerts for the 2026-09-11 shape could never reach firing. The
+live name is now the `state_now` **annotation** (read from the controller's
+one-hot; `MONITORING_UNKNOWN` when it is missing or ambiguous), beside
+`since`, `reason`, `runbook` (`docs/availability/RUNBOOK.md#<anchor>`) and
+`safe_command` — a read-only command, or the runbook's one sanctioned
+recovery entry point. Two alerts prove nothing about the state and carry no
+`state` label at all: `VllmScrapeTargetDown` and `VllmQueueBacklog`.
+
+Both files are unit-tested with `promtool test rules`
+(`monitoring/prometheus/tests/`) — the absent-series, stale-marker,
+frozen-stamp and state-churn cases included — using the same pinned image
+the stack runs:
+
+```bash
+IMG=$(grep -o 'prom/prometheus@sha256:[0-9a-f]*' compose/compose.monitoring.yaml | head -1)
+docker run --rm -v "$PWD/monitoring/prometheus:/p:ro" --entrypoint promtool "$IMG" \
+  check rules /p/rules/alerts.yml /p/rules/recording.yml
+docker run --rm -v "$PWD/monitoring/prometheus:/p:ro" --entrypoint promtool "$IMG" \
+  test rules /p/tests/recording_availability.yml /p/tests/alerts_availability.yml
+```
+
+(List the test files explicitly: `/p/tests/*.yml` is a path inside the
+container, so the host shell cannot expand it, and promtool does not glob.)
+
+**Apply** a change to any of these files with `./scripts/monitoring.sh
+restart`. Not `curl -X POST :9090/-/reload`: `prometheus.yml` is a
+*single-file* bind mount (`compose/compose.monitoring.yaml`), and a `git
+checkout` or an editor that writes-and-renames replaces the file's inode, so
+the running container keeps reading the old one — `/-/reload` re-reads the
+`rules/` directory mount (a new inode inside a directory is fine) but not a
+replaced `prometheus.yml`, and a new scrape job silently never appears.
+Grafana re-reads the provisioned dashboards on its own within 30 s.
+**Roll back** the same way:
+`git checkout <previous-sha> -- monitoring/prometheus monitoring/grafana/dashboards && ./scripts/monitoring.sh restart`.
+
+**There is no Alertmanager.** Every alert above is visible on Prometheus's
+`/alerts` page and in Grafana's alert list, and nowhere else: nothing pages
+anyone until a receiver is configured. That was true before this work and is
+still true — the alerts are now *correct*, not yet *delivered*.
+
+The runbook anchors the alerts link to (`docs/availability/RUNBOOK.md`):
+`#wedged`, `#primary-down`, `#ready-unproven`, `#recovery-budget-exhausted`,
+`#worker-rank-absent`, `#generation-frozen`, `#repeated-recovery-failure`,
+`#monitoring-unknown`, `#metrics-stale`, `#requests-queued`,
+`#queue-backlog`, `#canary-ttft-high`, `#head-swap-activity`,
+`#nccl-tcp-fallback`, `#roce-rail-missing`, `#scrape-target-down`,
+`#recovery-timeline` (the four info notices), `#rule-evaluation-failing` and
+`#config-drift`.
+
+Three alerts deserve a note on what they can and cannot see. `NcclTcpFallback`
+is **inferred, not reported**: it reads the signature this page measured
+under "read the IB counters, never netdev" — RDMA bytes never appear on the
+RoCE NICs' netdev counters, so megabytes per second *there* while the IB port
+counters idle and real requests run is NCCL on sockets; it is gated on
+`requests_running > 0` (not on tokens flowing, which the canary makes always
+true) and silenced during STARTING/RECOVERING, because `scripts/cluster-sync.sh`
+rsyncs a model over the rail-A address before every start and used to fire it
+on every deploy. `RoceRailMissing` is one rail at exactly zero while the
+other rail on the same node moves (zero such minutes in seven days of
+history). `VllmMetricsStale` has two branches, told apart by its `cause`
+label: `prometheus_age` is the contract's `cluster:vllm_metrics_age_seconds >
+60`, which can only see Prometheus itself falling behind (a failed scrape
+or a vanished family writes a staleness marker and the age series goes
+*absent*, so it self-clears at the 5-minute lookback by construction);
+`head_metrics_endpoint` is the controller's own `GET /metrics` failing while
+its canary succeeds — the hung-handler case, which `VllmScrapeTargetDown`
+also reports. `VllmConfigDrift` is **not defined**: nothing exports the
+intended configuration to compare the live `vllm:cache_config_info` labels
+against; `scripts/cluster-verify-engine.sh` is the drift check.
+`PrometheusRuleEvaluationFailing` watches the watchers: a rule that errors at
+evaluation time is otherwise silent, and the alert it would have raised
+simply never exists.
+
+---
+
 ## Dashboards
 
 Provisioned from `monitoring/grafana/dashboards/` — no manual import. Grafana
@@ -261,7 +463,7 @@ opens on the overview by default.
 
 | Dashboard | For |
 |---|---|
-| **DGX Spark AI Cluster — Live Overview** | the always-on screen: status cards, combined power, max temp, tokens/sec, and a correlation strip on one time axis |
+| **DGX Spark AI Cluster — Live Overview** | the always-on screen: the engine state and the signals behind it, combined power, max temp, tokens/sec, and a correlation strip (engine-state timeline first) on one time axis |
 | **GPU / Thermal / Power** | per-Spark GPU detail, combined power and energy, throttling |
 | **vLLM / LLM Performance** | throughput, TTFT/ITL percentiles, KV cache, prefix cache, preemptions |
 | **Interconnect / NCCL / RoCE** | per-rail RX/TX, port state, IB errors, management LAN shown separately |
@@ -353,7 +555,7 @@ cheap, honest signals.
 
 | Job | Interval | Why |
 |---|---|---|
-| `dgx-gpu`, `vllm-main` | **5 s** | the panels that must feel live |
+| `dgx-gpu`, `vllm-main`, `engine-controller` | **5 s** | the panels that must feel live; the engine state within one canary interval |
 | `node` | 10 s | host metrics move slowly |
 | `cadvisor`, `vllm-aux`, `blackbox` | 15 s | |
 | `prometheus` (self) | 30 s | |
@@ -511,6 +713,29 @@ Common causes: the worker exporters bound to loopback instead of the
 management IP (set `MONITORING_WORKER_BIND`), or the management LAN is down
 while RoCE is fine — the cluster keeps serving and only monitoring breaks.
 
+### The engine tile says MONITORING_UNKNOWN
+
+That is the telemetry, not the model. Either the controller is not being
+scraped, or it is scraped but its verdict is stale — `VllmMonitoringUnknown`'s
+`missing` label says which:
+
+```bash
+curl -s http://127.0.0.1:9838/healthz                 # controller liveness
+curl -s http://127.0.0.1:9838/state | jq '.state,.generated_at,.reason'
+date +%s                                              # generated_at more than 30 s behind this = a frozen tick
+docker ps --filter name=engine-controller
+docker logs --tail 50 sf-local-ai-engine-controller-1  # "tick failed" lines = the exception before publish
+```
+
+If the controller answers here with a current `generated_at` but the tile
+stays grey, it is the scrape: `./scripts/monitoring.sh status` shows the
+`engine-controller` target and its last error. If `generated_at` is old, the
+controller's HTTP thread is serving a snapshot its tick no longer refreshes;
+restarting the *controller* container (never the engine) is the fix, and the
+log says why it stopped. While the tile is grey nothing on the page vouches
+for the engine either way — the honest next step is a real completion
+(`scripts/cluster-verify-engine.sh --probe`), not an engine restart.
+
 ### No vLLM metrics
 
 ```bash
@@ -575,7 +800,10 @@ docker logs sf-local-ai-cadvisor-1 | grep "docker container factory"
         labels: { node: spark-3, role: worker }
 ```
 
-4. `curl -X POST http://127.0.0.1:9090/-/reload`
+4. `./scripts/monitoring.sh restart` — not `/-/reload`: `prometheus.yml` is a
+   single-file bind mount, and an editor that writes-and-renames (or a `git
+   checkout`) replaces its inode, which a reload does not follow (see "The
+   rules, and how they are proven").
 
 Nothing else changes: the exporters are identical everywhere, and every
 dashboard aggregates by label rather than by a hardcoded node list.
@@ -616,12 +844,14 @@ monitoring/
   prometheus/prometheus.yml            scrape config + topology labels
   prometheus/rules/recording.yml       cluster aggregates
   prometheus/rules/alerts.yml          alert rules
+  prometheus/tests/*.yml               promtool unit tests for the availability rules
   grafana/provisioning/datasources/    Prometheus datasource (uid dgx-prometheus)
   grafana/provisioning/dashboards/     dashboard provider
   grafana/dashboards/*.json            the five dashboards
   blackbox/blackbox.yml                HTTP probe module
   exporters/dgx-gpu/dgx_gpu_exporter.py   the GB10 GPU exporter
   exporters/data-stores/data_stores_exporter.py  DuckDB/LanceDB/Parquet sizes
+  engine-controller/                   the controller (head) and sentinel (worker); docs/availability/
 compose/compose.monitoring.yaml        Spark 1 stack (profile: monitoring)
 compose/compose.monitoring-worker.yaml Spark 2 exporters (own project)
 scripts/monitoring.sh                  up/down/status/logs/verify/url
@@ -645,5 +875,8 @@ scripts/monitoring.sh                  up/down/status/logs/verify/url
   its two exporters.
 * **No DuckDB/LanceDB row counts** — only size, file count and freshness. See
   the reasoning above.
+* **NCCL transport and rail health are inferred**, from netdev-vs-IB counter
+  shapes, not reported by NCCL; `VllmConfigDrift` has no signal at all (see
+  "Engine state").
 * **Alerts are local**, visible in Prometheus and Grafana. No paging
   integration, by choice.

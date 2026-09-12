@@ -380,8 +380,12 @@ manifest as `dgx-qwen38-27b-nvfp4`); the main model was switched to the
 active per token, so decode is ~3× faster and the KV cache 3× cheaper per
 token). Dual mode with the dense 27B bought faster replies and roughly double
 context headroom, not peak throughput, on this fabric. Pipeline parallelism was tried and refused by vLLM
-for this multimodal model class. The head and worker heal themselves after a
-crash (measured: worker killed → completions back in 584 s with no operator).
+for this multimodal model class. Self-healing after a rank crash is the engine
+controller's job since 2026-09-12 — detection, the coordinated restart, and
+the durable queue that keeps every request until the same model resumes it
+(no other model ever answers), with the measured before/after numbers and the
+targets, are in [`docs/availability/SLO.md`](docs/availability/SLO.md)
+(procedures: [`docs/availability/RUNBOOK.md`](docs/availability/RUNBOOK.md)).
 
 ```bash
 scripts/cluster-status.sh --probe   # both nodes, RDMA links, NCCL transport, live GPU activity on both GB10s
@@ -423,7 +427,7 @@ runtime overlay from [`compose/`](compose/), in this order: runtime overlay →
 - Network **`application`** is a normal bridge; **`inference`** is `internal: true` — model containers are `expose`-only and reachable solely from the orchestrator and sync-worker unless `PUBLISH_MODEL_PORTS=true`.
 - Named volumes (the persistent data boundary): `sf-local-ai_pgdata`, `sf-local-ai_data` (DuckDB, LanceDB, Parquet, workspaces, brain mount point), `sf-local-ai_reports`, `sf-local-ai_pgadmin`, `sf-local-ai_hf-cache`.
 - On a Mac the model servers are **native host processes**; containers reach them through authenticated loopback bridges on 18100/18103/18105 (`launcher/techsara_cli/bridge.py`).
-- Model services on DGX share one 128 GB unified pool with measured `--gpu-memory-utilization` shares: main 0.35, router 0.17, OCR 0.14, embed 0.04, reranker 0.04 (dual mode: main 0.30 per node + explicit 16 GiB KV).
+- Model services on DGX share one 128 GB unified pool with measured `--gpu-memory-utilization` shares: main 0.35, router 0.17, OCR 0.14, embed 0.04, reranker 0.04 (dual mode: main 0.30 per node + an explicit 8 GiB KV budget, `--kv-cache-memory-bytes 8589934592`, since the 1M window of 2026-08-29).
 - Compose profiles are derived automatically: `embeddings`, `reranker`, `ocr` from the selected models; `search` from `SEARCH_ENABLED=true` + `SEARCH_PROVIDER=searxng`; `admin` from `COMPOSE_PROFILES`.
 
 ---
@@ -1038,6 +1042,7 @@ Current (2026-08):
 
 - [`docs/AUTH.md`](docs/AUTH.md) — **authentication, workspaces, RBAC, audit**: sessions, persistent login, invitations, bootstrap, member privacy, admin surface
 - [`docs/MONITORING.md`](docs/MONITORING.md) — the Grafana/Prometheus observability platform for the two DGX Sparks
+- [`docs/availability/`](docs/availability/README.md) — **the main model's availability (2026-09-12)**: [`RUNBOOK.md`](docs/availability/RUNBOOK.md) (what to do when an alert fires), [`CONTRACT.md`](docs/availability/CONTRACT.md) (the binding states, signals, metrics), [`ARCHITECTURE.md`](docs/availability/ARCHITECTURE.md) (controller, sentinel, breaker, request continuity, admission lanes), [`INCIDENT-2026-09-11-vllm.md`](docs/availability/INCIDENT-2026-09-11-vllm.md), [`ADR-0002-high-availability.md`](docs/availability/ADR-0002-high-availability.md), [`SLO.md`](docs/availability/SLO.md), [`CANDIDATE-B.md`](docs/availability/CANDIDATE-B.md), [`MEMORY-BUDGET.md`](docs/availability/MEMORY-BUDGET.md), [`VLLM-UPGRADE-RESEARCH.md`](docs/availability/VLLM-UPGRADE-RESEARCH.md)
 - [`docs/FLOWS.md`](docs/FLOWS.md) — **every flow as a diagram**: the three answering modes, all five models, engine dispatch, crawler, web memory, citations, Salesforce, streaming
 - [`docs/01-codebase/deep-research.md`](docs/01-codebase/deep-research.md) — the iterative research engine: loop, budgets, citation validation, category routing, `research_runs`
 - [`docs/README.md`](docs/README.md) — index and reading order

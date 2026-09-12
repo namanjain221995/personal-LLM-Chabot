@@ -1,5 +1,214 @@
 # Changelog
 
+## The main model's outage is detected in seconds, recovered in order, and every request that arrives meanwhile is kept and resumed by the same model (2026-09-12)
+
+On 2026-09-11 at 22:15:50Z the worker rank of the TP=2 main engine died in a
+GDN prefill kernel (`Xid 13` + `Xid 31`, `misaligned address`) under nine
+concurrent mixed requests. The engine answered nothing for **11 min 00 s**,
+and for the first **5 min 03 s** of that every existing signal — `/health`,
+`/v1/models`, `/metrics`, Prometheus `up`, GPU utilisation at 96 % — said it
+was fine, because all of them are answered by the head's API process and the
+engine behind it was hung in a collective waiting for a rank that no longer
+existed. The record is `docs/availability/INCIDENT-2026-09-11-vllm.md`; the
+five independent delays it names are what this entry removes. The fault
+itself is not fixed here: `docs/availability/VLLM-UPGRADE-RESEARCH.md`
+establishes that **no released vLLM build closes the class** (upstream #49926
+and #37431 reproduce the same signature on this model and GPU on every build
+from 0.23 to 0.28.1, with and without MTP, prefix caching or CUDA graphs), so
+production stays pinned on `sha256:24f2f897…` and the one candidate — the
+post-`f6326f5` build with `--gdn-prefill-backend flashinfer`, then the
+secondary engine knobs one at a time, Track A `flashinfer_b12x` fifth — waits
+for a change window, the A/B harness and the 120-min soak
+(`docs/availability/CANDIDATE-B.md`).
+
+**One model answers, and nothing stands in for it.** The product requirement
+that shaped this round (`docs/availability/CONTRACT.md` v2, strict one-model
+mode): only `nvidia/Qwen3.6-35B-A3B-NVFP4` may generate what a person reads.
+The earlier design of the same day — the router engine answering plain chat
+from an 8B model while the pair reloaded — is withdrawn and its code
+**deleted, not disabled** (`orchestrator/app/fallback.py`, every `FALLBACK_*`
+key, `llm_fallback_active`, the two alerts that keyed on it;
+`docs/availability/ADR-0002-high-availability.md`, "Fallback answer model
+rejected by product requirement"). The router is the internal classifier it
+always was. Stated plainly: with one 35B instance, no request is answered
+while that instance reloads; the only way to serve answers *during* a reload
+is a second TP=2 replica of the same model (Option C, two more DGX Sparks).
+What the programme guarantees instead is that the reload costs a person a
+*wait*, never a *loss*.
+
+**A process being alive proves nothing; only a proven completion does.** The
+shell `vllm-watchdog` (one 2-token probe a minute, two 120 s timeouts to act —
+it always lost the race to vLLM's own 300 s RPC timeout) is replaced by an
+**engine controller** (`monitoring/engine-controller/controller.py`, compose
+service `engine-controller`, port 9838 on the head, started by `./techsara up`
+only after the head has been proven serving) — **the single recovery
+authority**. Before any READY it runs the five-step readiness sequence: a
+non-streaming completion, a streaming one with its terminal chunk, the token
+counters on `/metrics` moved by at least the tokens received, **both GPU
+exporters above 30 % during a 256-token participation probe**, and the worker
+rank process reported alive; between, a streamed 4-token canary every 30 s.
+It reads twenty signals — the Docker process tables on both nodes,
+TCP/`/health`/`/metrics` on the head at the address the head actually binds
+(`ENGINE_HEAD_API_URL`, launcher-generated; an empty one is "not observable",
+never DOWN), the movement of the token counters against
+`num_requests_running`, the router classifier's health as a DEGRADED input —
+and publishes exactly **nine states** (`MONITORING_UNKNOWN`, `STARTING`,
+`READY`, `BUSY`, `DEGRADED`, `WEDGED`, `RECOVERING`, `QUEUEING`, `DOWN`) at
+`GET /state` and as `techsara_vllm_*` metrics, with its snapshot's own
+timestamp so a stuck tick reads as unknown rather than as the last state it
+published. A **worker sentinel** (`sentinel.py`, service `vllm-worker-sentinel`
+on Spark 2, bound to the RoCE rail-A address, token-gated on every endpoint,
+shipped by `scripts/cluster-sync.sh` on every `up`) watches the rank process
+and the fatal log signatures through that node's Docker socket, so a dead rank
+is seen in ≤ 5 s instead of after `VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS` — and
+restarts the worker **only when the controller tells it to**
+(`SENTINEL_AUTONOMOUS=0`). The Docker healthchecks become report-only, with one
+last-resort kill tier that fires after `VLLM_HEALTHCHECK_KILL_AFTER`
+consecutive misses (default 8 = 4 min), so no second actor can race a live
+controller. Recovery is one choreography under one host `flock`
+(`.runtime/locks/engine-recovery.lock`, shared with `scripts/lib/engine-lock.sh`
+by `cluster-up/down/recover.sh`, `deploy.sh` and now the launcher's own `up`):
+diagnostics captured to `.runtime/incidents/<id>/` **before** anything
+restarts, the **worker first** (so it is waiting at the rendezvous — on
+2026-09-11 it re-joined the old head's store and was reset twice), then the
+head, then the readiness sequence on the *new* head, then the orchestrator
+resumes what queued, then three more canaries before the incident closes
+(also when the engine came back by itself or by an operator). Budget: 3
+recoveries an hour, manual ones included, a 120 s cooldown, then
+`DOWN`/`budget_exhausted` with no further destructive action and the queue
+held; a passing canary is the tie-breaker even against a sentinel document
+that says otherwise. Both ranks keep their compiled kernels
+(`/root/.cache/vllm`, `/root/.cache/flashinfer`) on persistent volumes so a
+recovery does not recompile (50 s cold, longer for the FlashInfer GDN JIT);
+`scripts/cluster-recover.sh --force --clear-kernel-cache` is the one way to
+empty them, under the lock. The binding names are
+`docs/availability/CONTRACT.md`; the design, `docs/availability/ARCHITECTURE.md`.
+
+**The 4 min 51 s that apport spent holding the corpse is gone.** The host's
+`core_pattern` pipes to apport, which read the whole 25 GiB rank into a 3.5 GB
+crash report while the executor waited to reap a child that had not exited;
+`core: 0` does not stop it (apport 2.28.3 reads the core regardless), but
+`RLIMIT_CORE == 1` makes the kernel abort a pipe dump before apport is spawned.
+Measured on the same image and a 1.5 GB heap: **18.3 s held with unlimited,
+1.28 s with `core: 1`**, no report. `ulimits: core: {soft: 1, hard: 1}` is now
+on the head, the worker, the router and the OCR engine (`compose/*.yaml`); it
+takes effect when each container is next created (the first `--full` deploy).
+
+**The orchestrator stops sending people into a dead port, keeps every request
+that arrives while the pair reloads, and resumes it on the same generation.**
+A circuit breaker for the main engine (`app/breaker.py`: CLOSED → OPEN after 3
+counted failures in 30 s, or at once when the controller reports
+STARTING/WEDGED/RECOVERING/DOWN; OPEN → HALF_OPEN after 10 s; one bounded
+canary decides, settled on its **first token**, not on the response headers —
+vLLM sends headers before it schedules anything, and "200, hang, an
+`EngineDeadError` chunk" was the incident's shape) sits in front of
+`resilient()`, which no longer polls `/health` while the breaker is open — on
+2026-09-11 `/health` was the lie. `app/engine_state.py` polls the controller
+every 5 s and treats an unreachable or stale verdict as **unknown, which never
+opens the breaker**. `app/continuity.py` does what the deleted fallback did
+not: while the primary is not READY, every request class — plain chat, tools,
+vision, Deep Research, video, the artifact composer — is **persisted first**
+(the V29 `chat_requests` row, status `queued`, its `generation_id` and
+`intent_id` fixed for its whole life), told exactly once *Main model is
+recovering—your request is safely queued.* with the stream kept alive by
+heartbeats, waits on the controller's READY event up to
+`LLM_QUEUE_MAX_WAIT_S=900` (never polling the dead port), and then the **same**
+generation resumes exactly once (`attempt` + 1, `retry_reason=recovery`) — the
+V29 guards make a second answer impossible. A wait that outlives the budget
+leaves the row `queued` with *The main model is still recovering. Your request
+is kept and will resume automatically.* — never a 500 — and the resume sweep
+(at READY and at orchestrator start-up, under a lease) takes it. Every attempt
+records `attempt`, `engine` (always the primary), `retry_reason`,
+`terminal_state`; a durable answer is replayed whatever the request row says,
+so a retry can never append a second answer
+(`orchestrator/tests/test_generation_durability.py`, 13 tests). `app/admission.py`
+adds two lanes in front of vLLM — NORMAL (prompt ≤ 131,072 tokens, 10
+concurrent) and LONG (one at a time, started only when the engine is idle,
+holding the NORMAL lane until its first token, the wait durable and told:
+*Waiting for the model to finish current work before your large document (N
+ahead).*) — because nine concurrent mixed prefill+decode requests is the
+fault's trigger shape. Exposed as `llm_queued_generations`,
+`llm_queue_wait_seconds`, `llm_resumed_generations_total{outcome}`,
+`llm_admission_*`, `llm_breaker_*`.
+
+**Monitoring says what it knows and never guesses.** Prometheus scrapes the
+controller every 5 s; `cluster:vllm_service_state:code` derives the top-level
+state (7 `QUEUEING` when the orchestrator holds requests for a primary that is
+not READY/BUSY; 8 `DOWN` on the controller's verdict alone) and drops the
+sample when the controller's snapshot is older than 30 s; no rule ends in `or
+vector(0)`, so a missing sample renders as `MONITORING_UNKNOWN`, never DOWN.
+The alerts of CONTRACT §7.4 in `monitoring/prometheus/rules/alerts.yml` — the
+criticals `VllmEngineWedged`, `VllmPrimaryDown` (nobody answers; the queue is
+held), `VllmReadyUnproven` (READY claimed but no proven completion for 120 s —
+the false-healthy blind spot, moved one level up and closed),
+`VllmRecoveryBudgetExhausted`, `VllmWorkerRankAbsent`, `VllmGenerationFrozen`,
+`VllmRepeatedRecoveryFailure`; the warnings, `VllmRequestsQueued` among them;
+the info notices `VllmRecoveryStarted`, `VllmRecoveredRestart`,
+`VllmPrimaryRestored`, `VllmQueueDrained` that tell one recovery's story in
+order — each carry `service`, a *fixed* `state` (the live name is an
+annotation, so a transition cannot reset the `for:` clock), `since`, `reason`,
+a `runbook` anchor in `docs/availability/RUNBOOK.md` and a read-only
+`safe_command`; `VllmDown` is renamed `VllmScrapeTargetDown` and demoted,
+because `up == 0` described the five minutes the restart was designed to take
+and said nothing about the five that mattered. Both dashboards gain the state
+tiles; the rules are unit-tested with `promtool test rules`
+(`monitoring/prometheus/tests/`), stale-series and state-churn cases included.
+There is still no Alertmanager.
+
+**Operations.** `scripts/cluster-recover.sh` is the one recovery entry point
+(`POST /recover` on loopback, then `/state` followed with UTC and IST clocks —
+it waits until the controller has taken *its* request before judging;
+`--force` does the same choreography by hand when the controller has stood
+down, `--clear-kernel-cache` empties both cache volumes first).
+`scripts/cluster-status.sh` renders the controller's `/state`;
+`scripts/monitoring.sh status` shows the controller block;
+`scripts/recovery-tests/engine_failure_drills.sh` breaks one thing at a time
+(Prometheus only, a rank, EngineCore, the API process, a head-only or
+worker-only restart) and proves the recovery against `/state`, Prometheus, a
+real completion, and — drills 14 and 15 — exactly one assistant message for a
+repeated `intent_id` and a queued request resumed on the same generation.
+`scripts/cluster-ab.py` and `scripts/cluster-cpu.sh` are the candidate
+harness and the CPU-topology measurement. The runbook has one section per
+alert anchor, plus queued requests and the exactly-once SQL, who may restart
+what, kernel caches, the candidate image switch (`MAIN_MODEL_IMAGE`,
+`CLUSTER_GDN_PREFILL_BACKEND`, the both-rank grep, rollback), CPU topology,
+boot and host recovery, and the twelve deployment steps mapped onto
+`deploy.sh` — whose rollback now removes the guards a target ref does not
+define, so an orphaned controller cannot keep restarting the pair beside the
+restored watchdog.
+
+**Files.** New: `monitoring/engine-controller/{controller.py,sentinel.py,common.py,README.md,tests/}`,
+`orchestrator/app/{breaker,engine_state,continuity,admission}.py` and their
+test files, `orchestrator/tests/test_generation_durability.py`,
+`scripts/cluster-recover.sh`, `scripts/lib/engine-lock.sh`,
+`scripts/recovery-tests/engine_failure_drills.sh`, `scripts/cluster-ab.py`,
+`scripts/cluster-cpu.sh`, `monitoring/prometheus/tests/{alerts,recording}_availability.yml`,
+`docs/availability/` (CONTRACT, INCIDENT, ADR-0002, SLO, MEMORY-BUDGET,
+RUNBOOK, ARCHITECTURE, CANDIDATE-B, REVIEW-MANIFEST, REVIEW-FINDINGS-round1,
+VLLM-UPGRADE-RESEARCH, README). Deleted: `orchestrator/app/fallback.py` and
+its tests, the `vllm-watchdog` service. Changed: `compose/compose.dgx-spark.yaml`
+(watchdog → controller, `ulimits`, the kernel-cache volume),
+`compose/compose.cluster-dgx-spark.yaml` (head API URL, healthcheck tier),
+`compose/compose.cluster-worker.yaml` (sentinel, `ulimits`, the cache volume),
+`compose/compose.ocr.yaml`, `launcher/techsara_cli/{cli,environment,cluster}.py`
++ tests, `orchestrator/app/{llm,resilience,config,health,metrics,main,db}.py`
+(the `queued` status is a migration),
+`scripts/{cluster-up,cluster-down,cluster-status,cluster-sync,cluster-doctor,monitoring,deploy}.sh`,
+`monitoring/prometheus/{prometheus.yml,rules/alerts.yml,rules/recording.yml}`,
+both Grafana dashboards, `docs/MONITORING.md`, `docs/CLUSTER.md`, `.env.example`.
+Test counts for this entry are reported per workstream in the pull request
+(controller, orchestrator availability + durability, launcher, promtool,
+shellcheck); an empty run, a timeout or a skip is not a pass.
+
+**Targets** (`docs/availability/SLO.md`; measured by the drills, not assumed;
+the acceptance checklist is §6 there): rank death → state ≠ READY in ≤ 30 s
+(was 5 min 03 s); dead rank reaped in ≤ 10 s (was 4 min 51 s); a request
+arriving during the outage accepted and told the truth ≤ 10 s after detection,
+resumed on the same generation ≤ 30 s after READY (was: lost); primary READY
+again — proven by the readiness sequence — ≤ 6 min warm (was 11 min 00 s);
+zero requests lost, duplicated, or answered by another model; zero false-UP
+minutes; zero false-DOWN minutes from missing data alone.
+
 ## Artifact Studio 2: CSV, the file card, generated and pasted data, and the requests that went wrong (2026-09-12)
 
 Three reported failures, each reproduced live on the isolated stack before

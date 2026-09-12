@@ -21,6 +21,7 @@ source.
 | Deep Research: the loop, budgets, citation validation | [`01-codebase/deep-research.md`](01-codebase/deep-research.md) |
 | Hardware matrix, model policy, state, fallback and upgrades | [`PORTABLE-RUNTIME.md`](PORTABLE-RUNTIME.md) |
 | Two-node DGX Spark cluster (`CLUSTER_MODE=dual`): topology, generated config, scripts, benchmarks, limitations | [`CLUSTER.md`](CLUSTER.md) |
+| **The main model's availability** (2026-09-12): what to do when an alert fires, the engine controller and worker sentinel, the orchestrator's breaker, request continuity and admission lanes, the 2026-09-11 incident, the ADR, the SLOs, the engine candidate | [`availability/`](availability/README.md) — start with [`RUNBOOK.md`](availability/RUNBOOK.md) |
 | Move the OCR engine to the worker (`scripts/ocr.sh`), the hand-over, and how to go back | [`ocr-on-the-worker.md`](ocr-on-the-worker.md) |
 | The 2026-09 engine crashes (MTP spec-decode on the Qwen GDN layer): root cause, remediation, measurements, rollback | [`ISSUE/`](ISSUE/) |
 | Current files and entrypoints | [`00-INVENTORY.md`](00-INVENTORY.md) |
@@ -66,6 +67,7 @@ policy remains relevant.
 | Path | Purpose |
 |---|---|
 | [`CLUSTER.md`](CLUSTER.md) | two-node DGX Spark cluster: what TP=2 sharding is and is not, measured interconnect and benchmarks, `CLUSTER_*` configuration, the engine-argument change runbook, `scripts/cluster-*.sh`, failure behaviour, limitations |
+| [`availability/`](availability/README.md) | the main model's availability programme (2026-09-12, v2 strict one-model mode): `CONTRACT.md` (binding), `RUNBOOK.md`, `ARCHITECTURE.md`, `INCIDENT-2026-09-11-vllm.md`, `ADR-0002-high-availability.md`, `SLO.md`, `CANDIDATE-B.md`, `MEMORY-BUDGET.md`, `VLLM-UPGRADE-RESEARCH.md`, `REVIEW-MANIFEST.md`, `REVIEW-FINDINGS-round1.md` |
 | [`ISSUE/gdn-spec-decode-fault-report.md`](ISSUE/gdn-spec-decode-fault-report.md) | 2026-09-10 root-cause analysis of the TP=2 engine dying mid-run (MTP speculative decoding driving the Qwen GDN layer into a faulting branch) |
 | [`ISSUE/gdn-spec-decode-remediation-2026-09-11.md`](ISSUE/gdn-spec-decode-remediation-2026-09-11.md) | what was changed, verified, measured (before/after), tested and left open; cluster topology, memory/CPU map, rollback |
 | [`ISSUE/interview-analysis-client/`](ISSUE/interview-analysis-client/) | ready-to-apply patches for the worker-side interview-analysis pipeline's LLM client and sweep runner |
