@@ -112,6 +112,20 @@ DEFAULT_SENTINEL_AUTONOMOUS = "0"
 #: two can never race (contract §6). Both nodes read the same number.
 DEFAULT_HEALTHCHECK_KILL_AFTER = 8
 HEALTHCHECK_KILL_AFTER_RANGE = (2, 120)
+#: The kill tier's AGE GUARD: the vLLM process must be older than this many
+#: seconds before the last-resort kill may fire, so a cold start is never
+#: interrupted. It follows the controller's cold-start budget
+#: (ENGINE_COLD_START_BUDGET_S, contract §6.3; 900 s = the measured 5 m 20 s
+#: cold load with margin) unless VLLM_HEALTHCHECK_MIN_AGE_S says otherwise --
+#: a raised budget for a slower image must reach the healthchecks too, or
+#: the head is killed at 15 min + 4 min of misses while still legitimately
+#: loading (review round 2). Shipped to the worker in worker.env.
+DEFAULT_COLD_START_BUDGET_S = 900
+COLD_START_BUDGET_RANGE = (60, 86400)
+#: The healthchecks' `start_period` in both cluster compose files, for the
+#: validation message: an age guard longer than it is fine (Docker keeps the
+#: container "starting" only that long; the guard is the script's own).
+HEALTHCHECK_START_PERIOD_S = 1800
 INFINIBAND_SYSFS = Path("/sys/class/infiniband")
 #: Parent of both ``net/<ifname>/operstate`` and ``infiniband/<hca>/device/net``.
 CLASS_SYSFS = Path("/sys/class")
@@ -612,6 +626,74 @@ def healthcheck_kill_after(values: Mapping[str, str]) -> int:
     )
 
 
+def cold_start_budget_s(values: Mapping[str, str]) -> int:
+    """``ENGINE_COLD_START_BUDGET_S``: the controller's WAIT_FOR_MODEL_LOAD budget."""
+    return _int(
+        values, "ENGINE_COLD_START_BUDGET_S", DEFAULT_COLD_START_BUDGET_S,
+        minimum=COLD_START_BUDGET_RANGE[0], maximum=COLD_START_BUDGET_RANGE[1],
+    )
+
+
+def healthcheck_min_age_s(values: Mapping[str, str]) -> int:
+    """``VLLM_HEALTHCHECK_MIN_AGE_S``: the kill tier's age guard on both nodes.
+
+    Defaults to the cold-start budget; an explicit value shorter than that
+    budget is refused, because it would let the healthcheck kill a head (or
+    worker) the controller is still legitimately waiting for.
+    """
+    budget = cold_start_budget_s(values)
+    min_age = _int(
+        values, "VLLM_HEALTHCHECK_MIN_AGE_S", budget,
+        minimum=COLD_START_BUDGET_RANGE[0], maximum=COLD_START_BUDGET_RANGE[1],
+    )
+    if min_age < budget:
+        raise TechSaraError(
+            f"VLLM_HEALTHCHECK_MIN_AGE_S={min_age} is shorter than ENGINE_COLD_START_BUDGET_S={budget}: "
+            "the healthchecks' last-resort kill would interrupt a cold start the controller still allows; "
+            "raise it to at least the budget (or leave it empty to follow the budget; the healthchecks' "
+            f"start_period is {HEALTHCHECK_START_PERIOD_S}s and does not stop the script's own kill)"
+        )
+    return min_age
+
+
+def worker_management_ip(values: Mapping[str, str]) -> str:
+    """The worker's MANAGEMENT address for the controller's participation probe.
+
+    Three sources, first one wins: ``CLUSTER_WORKER_MGMT_IP``,
+    ``MONITORING_WORKER_BIND`` (scripts/monitoring.sh's older spelling; a
+    hostname there is that script's business and is skipped here), and the
+    host of ``OCR_REMOTE_BASE_URL`` -- the address scripts/ocr.sh recorded when
+    it put the OCR engine on the worker, which IS the worker's management
+    address on this production (``http://192.168.9.68:30004/v1``) and is
+    derived exactly the way scripts/lib/cluster-common.sh
+    write_ocr_scrape_target does (scheme off, first path segment). Without
+    this, the launcher rendered an empty exporter URL on a box whose .env
+    names neither monitoring key, and the controller sat in DEGRADED
+    ("participation unobserved") for the life of the deployment (review
+    round 2). Only a literal IPv4 is accepted from the URL; anything else
+    leaves the sample unobservable, never a failure.
+    """
+    ip = _ipv4(values, "CLUSTER_WORKER_MGMT_IP", required=False)
+    if ip:
+        return ip
+    try:
+        ip = _ipv4(values, "MONITORING_WORKER_BIND", required=False)
+    except TechSaraError:
+        ip = ""
+    if ip:
+        return ip
+    remote = _raw(values, "OCR_REMOTE_BASE_URL")
+    if not remote:
+        return ""
+    # http://192.168.9.68:30004/v1 -> 192.168.9.68:30004 -> 192.168.9.68
+    host_port = remote.split("://", 1)[-1].split("/", 1)[0]
+    host = host_port.rsplit(":", 1)[0] if host_port.count(":") == 1 else host_port
+    try:
+        return str(ipaddress.IPv4Address(host))
+    except ValueError:
+        return ""
+
+
 def prefix_caching_argument(enabled: bool) -> str:
     """``--enable-prefix-caching`` or its explicit negation.
 
@@ -750,16 +832,12 @@ def resolve_cluster_settings(
     engine_environment = engine_process_environment(user_values)
     sentinel_autonomous = _sentinel_autonomous(user_values)
     kill_after = healthcheck_kill_after(user_values)
+    min_age = healthcheck_min_age_s(user_values)
     # The worker's MANAGEMENT address (the one Prometheus scrapes its GPU
     # exporter on), for the controller's participation probe (contract §5
-    # step 4). MONITORING_WORKER_BIND is the older spelling of the same
-    # address in scripts/monitoring.sh; either works, the cluster key wins.
-    worker_mgmt_ip = _ipv4(user_values, "CLUSTER_WORKER_MGMT_IP", required=False)
-    if not worker_mgmt_ip:
-        try:
-            worker_mgmt_ip = _ipv4(user_values, "MONITORING_WORKER_BIND", required=False)
-        except TechSaraError:
-            worker_mgmt_ip = ""  # a hostname there is monitoring.sh's business, not a cluster error
+    # step 4): the cluster key, monitoring.sh's older spelling, or the host
+    # scripts/ocr.sh recorded in OCR_REMOTE_BASE_URL (see worker_management_ip).
+    worker_mgmt_ip = worker_management_ip(user_values)
     batched_tokens = _int(
         user_values, "CLUSTER_MAX_NUM_BATCHED_TOKENS", DEFAULT_MAX_NUM_BATCHED_TOKENS,
         minimum=MINIMUM_MAX_NUM_BATCHED_TOKENS,
@@ -830,6 +908,10 @@ def resolve_cluster_settings(
         "CLUSTER_ENGINE_ENV": " ".join(f"{k}={v}" for k, v in sorted(engine_environment.items())),
         "CLUSTER_SENTINEL_AUTONOMOUS": sentinel_autonomous,
         "VLLM_HEALTHCHECK_KILL_AFTER": str(kill_after),
+        # The kill tier's age guard, resolved here so both compose files
+        # interpolate the same number (scripts/cluster-sync.sh ships it in
+        # worker.env) and the launcher has validated it against the budget.
+        "VLLM_HEALTHCHECK_MIN_AGE_S": str(min_age),
     }
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import ipaddress
 import os
 import re
@@ -585,9 +586,53 @@ def engine_head_api_url(
 
 
 #: The head's GPU exporter as compose.monitoring.yaml publishes it (127.0.0.1
-#: only) for the controller's participation probe (contract §5 step 4).
-HEAD_GPU_EXPORTER_URL = "http://127.0.0.1:9835"
+#: only) for the controller's participation probe (contract §5 step 4). The
+#: full scrape path, the way the controller's own default names it
+#: (controller.py Config.head_gpu_exporter_url): the exporter answers
+#: identically on `/` and `/metrics`, but the URL the controller fetches is
+#: used verbatim, so the launcher renders the one that is documented.
 GPU_EXPORTER_PORT = 9835
+HEAD_GPU_EXPORTER_URL = f"http://127.0.0.1:{GPU_EXPORTER_PORT}/metrics"
+
+
+def worker_gpu_exporter_url(worker_mgmt_ip: str) -> str:
+    """The worker's dgx-gpu exporter on its management address, or "" when
+    that address is unknown (the controller then records the participation
+    probe as unobserved rather than failed)."""
+    ip = (worker_mgmt_ip or "").strip()
+    return f"http://{ip}:{GPU_EXPORTER_PORT}/metrics" if ip else ""
+
+
+#: The engine controller's program, bind-mounted read-only into its container
+#: (compose.dgx-spark.yaml: ./monitoring/engine-controller:/app), and the two
+#: files of it the controller process actually imports.
+ENGINE_CONTROLLER_DIR = Path("monitoring") / "engine-controller"
+ENGINE_CONTROLLER_CODE_FILES = ("controller.py", "common.py")
+ENGINE_CONTROLLER_CODE_SHA_KEY = "ENGINE_CONTROLLER_CODE_SHA"
+
+
+def controller_code_sha(project_root: Path) -> str:
+    """sha256 of the controller's code as ONE digest, or "" when it is absent.
+
+    `docker compose up -d` recreates a container only when its DEFINITION
+    changed; a bind-mounted program is not part of the definition, so a
+    routine deploy that changed only controller.py used to leave the old
+    module running in memory while the deploy record said the commit was
+    live (review round 2). Rendered into the service's environment as
+    ENGINE_CONTROLLER_CODE_SHA, the digest makes a code change a definition
+    change -- and an unchanged one leaves the container exactly as it is.
+    The bytes of controller.py then common.py, in that order, hashed as one
+    stream: `cat controller.py common.py | sha256sum` on the shell side
+    (scripts/cluster-sync.sh does the same for the sentinel's two files).
+    """
+    digest = hashlib.sha256()
+    directory = project_root / ENGINE_CONTROLLER_DIR
+    for name in ENGINE_CONTROLLER_CODE_FILES:
+        try:
+            digest.update((directory / name).read_bytes())
+        except OSError:
+            return ""
+    return digest.hexdigest()
 _IMAGE_DIGEST_REFERENCE = re.compile(r"^[a-z0-9][a-z0-9._/-]{0,254}@sha256:[0-9a-f]{64}$")
 
 
@@ -976,8 +1021,12 @@ def build_generated_environment(
     worker_mgmt_ip = cluster_values.get("CLUSTER_WORKER_MGMT_IP", "")
     values["TECHSARA_HEAD_GPU_EXPORTER_URL"] = HEAD_GPU_EXPORTER_URL if cluster_mode == "dual" else ""
     values["TECHSARA_WORKER_GPU_EXPORTER_URL"] = (
-        f"http://{worker_mgmt_ip}:{GPU_EXPORTER_PORT}" if cluster_mode == "dual" and worker_mgmt_ip else ""
+        worker_gpu_exporter_url(worker_mgmt_ip) if cluster_mode == "dual" else ""
     )
+    # The controller's code digest (see controller_code_sha): part of the
+    # engine-controller service definition, so a code-only change recreates
+    # the container on the next `up` and an unchanged one does not.
+    values[ENGINE_CONTROLLER_CODE_SHA_KEY] = controller_code_sha(layout.project_root)
     values.update(cluster_values)
     if family == "external":
         for prefix in ("MAIN", "ROUTER", "AGENT", "VISION", "EMBED", "OCR", "RERANKER"):

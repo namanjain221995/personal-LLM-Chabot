@@ -11,6 +11,8 @@
 #      engine-controller renders -- checked, never printed
 #
 # Idempotent and non-destructive: it never deletes anything on either node.
+# --env-only (the routine deploy path) ships step 3 and still makes sure the
+# sentinel's image is on the worker (step 1's second half) before naming it.
 # Usage: scripts/cluster-sync.sh [--image-only|--model-only|--env-only] [--via-link-2]
 # shellcheck source=lib/cluster-common.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib/cluster-common.sh"
@@ -26,8 +28,10 @@ SENTINEL_FILES=(sentinel.py common.py)
 ENGINE_ENV_LOCAL="$RUNTIME_DIR/engine.env"
 CONTROLLER_ENV="$RUNTIME_DIR/controller.env"
 # The keys the worker's compose file interpolates that the launcher does not
-# prefix CLUSTER_ (the healthcheck's last-resort tier, contract §6).
-WORKER_PLAIN_KEYS='MAIN_MODEL|MAIN_MODEL_CONTAINER_PATH|MODEL_MAX_CONTEXT|VLLM_PORT|TECHSARA_CLUSTER_MODE|VLLM_HEALTHCHECK_KILL_AFTER'
+# prefix CLUSTER_ (the healthcheck's last-resort tier and its age guard,
+# contract §6; VLLM_HEALTHCHECK_MIN_AGE_S is the launcher's resolution of
+# ENGINE_COLD_START_BUDGET_S, so both nodes guard a cold start the same way).
+WORKER_PLAIN_KEYS='MAIN_MODEL|MAIN_MODEL_CONTAINER_PATH|MODEL_MAX_CONTEXT|VLLM_PORT|TECHSARA_CLUSTER_MODE|VLLM_HEALTHCHECK_KILL_AFTER|VLLM_HEALTHCHECK_MIN_AGE_S'
 
 # The image the sentinel runs on is whatever the head's engine-controller
 # service resolves to (digest-pinned in compose.dgx-spark.yaml), read back
@@ -36,6 +40,52 @@ WORKER_PLAIN_KEYS='MAIN_MODEL|MAIN_MODEL_CONTAINER_PATH|MODEL_MAX_CONTEXT|VLLM_P
 head_controller_image() {
   head_compose config --format json 2>/dev/null \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["services"]["engine-controller"]["image"])'
+}
+
+# sentinel_code_sha: ONE digest of the sentinel program the worker runs
+# (sentinel.py then common.py, hashed as one stream -- the same scheme the
+# launcher uses for the head's controller, environment.controller_code_sha).
+# Written into worker.env as SENTINEL_CODE_SHA and interpolated into the
+# sentinel service's environment (compose.cluster-worker.yaml): the program
+# is a bind mount, and `up -d` recreates a container only on a DEFINITION
+# change, so without this a routine deploy that changed only sentinel.py
+# left the old module running in memory (review round 2). An unchanged
+# digest is an unchanged definition: the sentinel is left running.
+sentinel_code_sha() {
+  cat "${SENTINEL_FILES[@]/#/$SENTINEL_SRC_DIR/}" | sha256sum | cut -d' ' -f1
+}
+
+# ensure_sentinel_image: the digest-pinned python image the sentinel runs on
+# is present on the worker -- pulled there, or streamed from the head with
+# docker save | docker load when the registry is unreachable. Sets
+# SENTINEL_IMAGE_REF to the reference the worker can resolve. Run by the
+# image stage AND by --env-only (the routine deploy path): writing
+# CLUSTER_SENTINEL_IMAGE into worker.env without this made the worker pull
+# from Docker Hub in the middle of a deploy, with no fallback, and a flaky
+# registry then failed `cluster-worker.sh start vllm-worker-sentinel` and
+# rolled the whole deploy back (review round 2).
+ensure_sentinel_image() {
+  local simage
+  simage="$(head_controller_image)" || die "could not resolve the head engine-controller image from docker compose config (is compose.dgx-spark.yaml current?)"
+  log_info "controller image: $simage"
+  if ssh_worker "docker image inspect '$simage' --format '{{.Id}}'" >/dev/null 2>&1; then
+    check_pass "sentinel image present on worker"
+  else
+    log_info "pulling on worker (same digest; ~50 MB)..."
+    if ssh_worker "docker pull '$simage'" >/dev/null; then
+      check_pass "sentinel image pulled on worker"
+    else
+      log_info "pull failed; streaming the image over the cluster link with docker save | docker load"
+      # The head pulls this image only when the launcher starts the
+      # controller, which is AFTER this script on a first `up`; a fresh head
+      # has nothing to save yet (review round 1).
+      docker image inspect "$simage" >/dev/null 2>&1 || docker pull "$simage" >/dev/null || die "the head has no $simage to stream and cannot pull it"
+      docker save "$simage" | ssh_worker "docker load" || die "could not transfer the sentinel image to the worker"
+      check_warn "sentinel image loaded via docker save/load: no registry digest on the worker, so CLUSTER_SENTINEL_IMAGE will use the image ID"
+    fi
+  fi
+  SENTINEL_IMAGE_REF="$simage"
+  ssh_worker "docker image inspect '$simage'" >/dev/null 2>&1 || SENTINEL_IMAGE_REF="$(docker image inspect "$simage" --format '{{.Id}}')"
 }
 
 # ensure_sentinel_token: the shared secret for the sentinel's POST /restart
@@ -135,26 +185,7 @@ if [ "$DO_IMAGE" = 1 ]; then
   ssh_worker "docker image inspect '$image'" >/dev/null 2>&1 || WORKER_IMAGE_REF="$local_id"
 
   section "sentinel image"
-  simage="$(head_controller_image)" || die "could not resolve the head engine-controller image from docker compose config (is compose.dgx-spark.yaml current?)"
-  log_info "controller image: $simage"
-  if ssh_worker "docker image inspect '$simage' --format '{{.Id}}'" >/dev/null 2>&1; then
-    check_pass "sentinel image present on worker"
-  else
-    log_info "pulling on worker (same digest; ~50 MB)..."
-    if ssh_worker "docker pull '$simage'" >/dev/null; then
-      check_pass "sentinel image pulled on worker"
-    else
-      log_info "pull failed; streaming the image over the cluster link with docker save | docker load"
-      # The head pulls this image only when the launcher starts the
-      # controller, which is AFTER this script on a first `up`; a fresh head
-      # has nothing to save yet (review round 1).
-      docker image inspect "$simage" >/dev/null 2>&1 || docker pull "$simage" >/dev/null || die "the head has no $simage to stream and cannot pull it"
-      docker save "$simage" | ssh_worker "docker load" || die "could not transfer the sentinel image to the worker"
-      check_warn "sentinel image loaded via docker save/load: no registry digest on the worker, so CLUSTER_SENTINEL_IMAGE will use the image ID"
-    fi
-  fi
-  SENTINEL_IMAGE_REF="$simage"
-  ssh_worker "docker image inspect '$simage'" >/dev/null 2>&1 || SENTINEL_IMAGE_REF="$(docker image inspect "$simage" --format '{{.Id}}')"
+  ensure_sentinel_image
 fi
 
 if [ "$DO_MODEL" = 1 ]; then
@@ -213,10 +244,20 @@ if [ "$DO_ENV" = 1 ]; then
     check_fail "engine.env on the worker does not match the head's copy"
   fi
 
+  if [ "$DO_IMAGE" != 1 ]; then
+    # --env-only (the routine deploy): the sentinel image must exist on the
+    # worker BEFORE worker.env names it, or `cluster-worker.sh start
+    # vllm-worker-sentinel` pulls it from the registry mid-deploy with no
+    # save/load fallback. ~50 MB, a no-op when it is already there.
+    section "sentinel image"
+    ensure_sentinel_image
+  fi
+
   section "worker environment"
   [ -n "${WORKER_IMAGE_REF:-}" ] || WORKER_IMAGE_REF="$(head_vllm_image)"
   [ -n "${SENTINEL_IMAGE_REF:-}" ] || SENTINEL_IMAGE_REF="$(head_controller_image)"
   sentinel_token="$(ensure_sentinel_token)"
+  sentinel_sha="$(sentinel_code_sha)"
   # Interface/HCA names on the WORKER are detected there (they may differ).
   remote_facts="$(ssh_worker "$(detect_snippet); ifn=\$(detect_ifname_for_ip '$CLUSTER_WORKER_IP'); echo IFNAME=\$ifn; hca=\$(detect_hca_for_ifname \"\$ifn\" 2>/dev/null); echo HCA=\$hca; ifn2=''; hca2=''; if [ -n '${CLUSTER_WORKER_IP_2:-}' ]; then ifn2=\$(detect_ifname_for_ip '${CLUSTER_WORKER_IP_2:-}'); hca2=\$(detect_hca_for_ifname \"\$ifn2\" 2>/dev/null); fi; echo IFNAME2=\$ifn2; echo HCA2=\$hca2")"
   w_ifname="$(printf '%s\n' "$remote_facts" | sed -n 's/^IFNAME=//p')"
@@ -236,6 +277,9 @@ if [ "$DO_ENV" = 1 ]; then
     grep -E "^($WORKER_PLAIN_KEYS|CLUSTER_[A-Z0-9_]+)=" "$GENERATED_ENV"
     echo "CLUSTER_VLLM_IMAGE=$WORKER_IMAGE_REF"
     echo "CLUSTER_SENTINEL_IMAGE=$SENTINEL_IMAGE_REF"
+    # The digest of the two files shipped above: a code change is a
+    # definition change for the sentinel service (see sentinel_code_sha).
+    echo "SENTINEL_CODE_SHA=$sentinel_sha"
     echo "CLUSTER_WORKER_MODEL_CACHE=$CLUSTER_WORKER_MODEL_CACHE"
     echo "CLUSTER_WORKER_NCCL_SOCKET_IFNAME=$w_ifname"
     echo "CLUSTER_WORKER_NCCL_IB_HCA=$w_hcas"
@@ -249,6 +293,7 @@ if [ "$DO_ENV" = 1 ]; then
   scp_to_worker "$WORKER_COMPOSE_LOCAL" "$WORKER_ENV_LOCAL" ".techsara-cluster"
   ssh_worker "cd $WORKER_REMOTE_DIR && chmod 0600 cluster-worker.env && mv -f cluster-worker.env worker.env"
   if worker_compose config --quiet; then check_pass "worker compose config validates on $remote_host"; else check_fail "worker compose config is invalid (see above)"; fi
+  check_pass "sentinel code sha ${sentinel_sha:0:12} in worker.env (a changed sha recreates vllm-worker-sentinel on the next start; an unchanged one leaves it running)"
 
   # THE TWO NODES MUST AGREE ON THE TOKEN (contract §6.4). Compared as
   # digests: the head's rendered engine-controller environment (env_file

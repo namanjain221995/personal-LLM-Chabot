@@ -124,6 +124,40 @@ class ComposeOverlayValidationTests(unittest.TestCase):
         way a completed download would, so the launcher can read the geometry a
         user-owned context window is measured against.
         """
+        profile, stdout = self._compose_config(
+            hardware, user_environment, model_config=model_config, drop_generated=drop_generated,
+            config_args=("--format", "json"),
+        )
+        return profile, json.loads(stdout)
+
+    def _service_hash(
+        self,
+        hardware: HardwareInfo,
+        user_environment: dict | None,
+        service: str,
+    ) -> str:
+        """Compose's own config hash for one service -- the value `up -d`
+        compares with the running container's label to decide whether to
+        recreate it, so equality here IS "no recreate"."""
+        _profile, stdout = self._compose_config(
+            hardware, user_environment, config_args=(f"--hash={service}",),
+        )
+        name, _sep, digest = stdout.strip().partition(" ")
+        self.assertEqual(name, service, stdout)
+        self.assertTrue(digest, stdout)
+        return digest
+
+    def _compose_config(
+        self,
+        hardware: HardwareInfo,
+        user_environment: dict | None = None,
+        *,
+        model_config: dict | None = None,
+        drop_generated: tuple[str, ...] = (),
+        config_args: tuple[str, ...] = ("--format", "json"),
+    ) -> tuple[SelectedProfile, str]:
+        """Run `docker compose ... config <config_args>` for one fixture and
+        return its stdout, with the launcher's real file chain and env files."""
         with tempfile.TemporaryDirectory(prefix="techsara-overlay-") as temporary:
             workspace = Path(temporary)
             cache_root = workspace / "models"
@@ -190,7 +224,7 @@ class ComposeOverlayValidationTests(unittest.TestCase):
             # its profile is inactive would still be a latent failure.
             for name in ("embeddings", "ocr", "search", "admin"):
                 command += ["--profile", name]
-            command += ["config", "--format", "json"]
+            command += ["config", *config_args]
             environment = dict(os.environ)
             # The user's .env is an --env-file layer at runtime
             # (ComposeManager.command); here its keys ride the process
@@ -209,7 +243,60 @@ class ComposeOverlayValidationTests(unittest.TestCase):
                 0,
                 f"docker compose config failed for {profile.hardware_profile_id}:\n{result.stderr[-2000:]}",
             )
-            return profile, json.loads(result.stdout)
+            return profile, result.stdout
+
+    #: A worker.env the way scripts/cluster-sync.sh writes it (the keys the
+    #: worker file interpolates), minus anything host-specific.
+    WORKER_ENV = {
+        "CLUSTER_VLLM_IMAGE": "vllm/vllm-openai@sha256:" + "2" * 64,
+        "MAIN_MODEL_CONTAINER_PATH": "/models/repos/main",
+        "MAIN_MODEL": "Qwen/Qwen3.6-35B-A3B-NVFP4",
+        "CLUSTER_ENGINE_ARGS": "--max-model-len 262144 --tensor-parallel-size 2 --nnodes 2 --master-addr 192.168.100.1 --master-port 29501",
+        "CLUSTER_WORKER_IP": "192.168.100.2",
+        "CLUSTER_HEAD_IP": "192.168.100.1",
+        "CLUSTER_WORKER_NCCL_SOCKET_IFNAME": "enP2p1s0f1np1",
+        "CLUSTER_WORKER_NCCL_IB_HCA": "rocep1s0f1",
+        "VLLM_PORT": "8000",
+        "VLLM_HEALTHCHECK_KILL_AFTER": "8",
+        "CLUSTER_SENTINEL_TOKEN": "fixture-sentinel-token",
+    }
+
+    def _worker_config(self, worker_env: dict, *config_args: str) -> str:
+        """`docker compose config` for compose/compose.cluster-worker.yaml the
+        way scripts/cluster-worker.sh runs it on Node 2 (its own project, one
+        --env-file), against a worker.env written here."""
+        with tempfile.TemporaryDirectory(prefix="techsara-worker-") as temporary:
+            workspace = Path(temporary)
+            env_path = workspace / "worker.env"
+            # A FIXED cache path: the bind source is part of the vllm-worker
+            # definition, and a per-run temporary path would move its hash.
+            env_path.write_text(
+                render_env({"CLUSTER_WORKER_MODEL_CACHE": "/srv/techsara/models", **worker_env}), encoding="utf-8",
+            )
+            command = [
+                "docker", "compose", "--project-name", "sf-local-ai-worker-test",
+                "--env-file", str(env_path),
+                "-f", str(REPO_ROOT / "compose" / "compose.cluster-worker.yaml"),
+                "config", *(config_args or ("--format", "json")),
+            ]
+            # Nothing from this process's environment may leak into the render:
+            # the worker reads worker.env and nothing else.
+            environment = {k: v for k, v in os.environ.items() if not k.startswith(("CLUSTER_", "VLLM_", "ENGINE_", "SENTINEL_"))}
+            result = subprocess.run(
+                command, capture_output=True, text=True, timeout=180, check=False,
+                cwd=REPO_ROOT, env=environment,
+            )
+            self.assertEqual(result.returncode, 0, f"worker compose config failed:\n{result.stderr[-2000:]}")
+            return result.stdout
+
+    def _render_worker(self, worker_env: dict) -> dict:
+        return json.loads(self._worker_config(worker_env))
+
+    def _worker_service_hash(self, worker_env: dict, service: str) -> str:
+        name, _sep, digest = self._worker_config(worker_env, f"--hash={service}").strip().partition(" ")
+        self.assertEqual(name, service)
+        self.assertTrue(digest)
+        return digest
 
     def test_every_supported_host_fixture_resolves_and_keeps_its_platform_invariants(self) -> None:
         model_services = {"vllm", "vllm-router", "vllm-embed", "vllm-ocr", "vllm-vision", "llama-cpp"}
@@ -489,7 +576,8 @@ class ComposeOverlayValidationTests(unittest.TestCase):
         # env_file layer with an empty string) and never reaches the
         # orchestrator, which inherits secrets.env wholesale.
         self.assertNotIn("CLUSTER_SENTINEL_TOKEN", env)
-        self.assertNotIn("CLUSTER_SENTINEL_TOKEN", services["orchestrator"]["environment"])
+        # ... and is BLANKED for the orchestrator (compose.yaml), which inherits .env wholesale.
+        self.assertEqual(services["orchestrator"]["environment"].get("CLUSTER_SENTINEL_TOKEN", ""), "")
         for name in ("vllm", "vllm-router", "vllm-ocr"):
             self.assertEqual(
                 services[name]["ulimits"]["core"], {"soft": 1, "hard": 1},
@@ -558,7 +646,7 @@ class ComposeOverlayValidationTests(unittest.TestCase):
         self.assertEqual(env["SENTINEL_URL"], "http://192.168.100.2:9839")
         self.assertEqual(env["HEAD_API_URL"], "http://127.0.0.1:8000")
         self.assertEqual(env["ROUTER_HEALTH_URL"], "http://127.0.0.1:8002/health")
-        self.assertEqual(env["HEAD_GPU_EXPORTER_URL"], "http://127.0.0.1:9835")
+        self.assertEqual(env["HEAD_GPU_EXPORTER_URL"], "http://127.0.0.1:9835/metrics")
         self.assertEqual(env["WORKER_GPU_EXPORTER_URL"], "", "no management address given: not observable, not invented")
         self.assertNotIn("CLUSTER_SENTINEL_TOKEN", env, "the token comes from the controller.env layer only")
         # The cluster overlay's memlock and the base overlay's core limit merge.
@@ -569,7 +657,7 @@ class ComposeOverlayValidationTests(unittest.TestCase):
         test = services["vllm"]["healthcheck"]["test"][1]
         self.assertNotIn("5*)", test)
         self.assertIn('-ge "8"', test)
-        self.assertIn("-gt 900", test)
+        self.assertIn('-gt "900"', test, "the age guard follows the default cold-start budget")
         self.assertEqual(test.count("kill -9"), 1)
 
     def test_unpublished_dual_mode_points_the_controller_at_the_bridge_gateway(self) -> None:
@@ -600,7 +688,7 @@ class ComposeOverlayValidationTests(unittest.TestCase):
         self.assertEqual(argv[argv.index("--host") + 1], "172.17.0.1")
         self.assertEqual(env["HEAD_API_URL"], "http://172.17.0.1:8000")
         self.assertEqual(env["ROUTER_HEALTH_URL"], "", "an unpublished router is not reachable from the host network")
-        self.assertEqual(env["WORKER_GPU_EXPORTER_URL"], "http://192.168.9.68:9835")
+        self.assertEqual(env["WORKER_GPU_EXPORTER_URL"], "http://192.168.9.68:9835/metrics")
         self.assertIn('-ge "12"', services["vllm"]["healthcheck"]["test"][1])
         # And a generated.env from an OLDER launcher (no generated head URL)
         # still resolves to the bind address rather than to loopback.
@@ -614,6 +702,112 @@ class ComposeOverlayValidationTests(unittest.TestCase):
                 drop_generated=("TECHSARA_ENGINE_HEAD_API_URL",),
             )
         self.assertEqual(older["services"]["engine-controller"]["environment"]["HEAD_API_URL"], "http://172.17.0.1:8000")
+
+    def test_the_controller_code_sha_is_part_of_its_definition_and_an_unchanged_one_does_not_recreate(self) -> None:
+        """Review round 2 (sre, major): a routine deploy never restarted the
+        engine controller when only its CODE changed -- the program is a bind
+        mount, and `up -d` recreates on a definition change only. The
+        launcher's ENGINE_CONTROLLER_CODE_SHA is rendered into the service
+        environment; proven here with Compose's own config hash, the value
+        `up -d` compares with the container's label: the SAME code gives the
+        same hash (no recreate), a changed digest a different one."""
+        fixture = FIXTURES["dgx-spark"]
+        with patch.object(environment, "controller_code_sha", return_value="a" * 64):
+            _profile, rendered = self._render(fixture)
+            first = self._service_hash(fixture, None, "engine-controller")
+            again = self._service_hash(fixture, None, "engine-controller")
+        self.assertEqual(rendered["services"]["engine-controller"]["environment"]["ENGINE_CONTROLLER_CODE_SHA"], "a" * 64)
+        self.assertEqual(first, again, "unchanged code: an unchanged definition, so `up -d` recreates nothing")
+        with patch.object(environment, "controller_code_sha", return_value="b" * 64):
+            changed = self._service_hash(fixture, None, "engine-controller")
+        self.assertNotEqual(changed, first, "changed code: a changed definition, so `up -d` recreates the controller")
+        # A generated.env from an OLDER launcher (no digest yet) still renders, with an empty value.
+        with patch.object(environment, "controller_code_sha", return_value="a" * 64):
+            _profile, older = self._render(fixture, drop_generated=("ENGINE_CONTROLLER_CODE_SHA",))
+        self.assertEqual(older["services"]["engine-controller"]["environment"]["ENGINE_CONTROLLER_CODE_SHA"], "")
+        # The real digest of the checked-in program is what the launcher renders by default.
+        _profile, real = self._render(fixture)
+        self.assertEqual(
+            real["services"]["engine-controller"]["environment"]["ENGINE_CONTROLLER_CODE_SHA"],
+            environment.controller_code_sha(REPO_ROOT),
+        )
+        self.assertRegex(real["services"]["engine-controller"]["environment"]["ENGINE_CONTROLLER_CODE_SHA"], r"^[0-9a-f]{64}$")
+
+    def test_the_worker_file_carries_the_sentinel_code_sha_and_recreates_only_when_it_changes(self) -> None:
+        """The worker half of the same finding: scripts/cluster-sync.sh writes
+        SENTINEL_CODE_SHA (sha256 of sentinel.py+common.py) into worker.env and
+        the sentinel service's environment renders it, so `cluster-worker.sh
+        start vllm-worker-sentinel` (= `up -d`) recreates the sentinel exactly
+        when the shipped program changed."""
+        with_sha = {**self.WORKER_ENV, "SENTINEL_CODE_SHA": "c" * 64}
+        rendered = self._render_worker(with_sha)
+        sentinel = rendered["services"]["vllm-worker-sentinel"]
+        self.assertEqual(sentinel["environment"]["SENTINEL_CODE_SHA"], "c" * 64)
+        self.assertEqual(sentinel["environment"]["CLUSTER_SENTINEL_TOKEN"], "fixture-sentinel-token")
+        first = self._worker_service_hash(with_sha, "vllm-worker-sentinel")
+        self.assertEqual(first, self._worker_service_hash(with_sha, "vllm-worker-sentinel"), "unchanged: no recreate")
+        self.assertNotEqual(first, self._worker_service_hash({**self.WORKER_ENV, "SENTINEL_CODE_SHA": "d" * 64}, "vllm-worker-sentinel"))
+        # The sentinel's digest never touches the vllm-worker definition (a pair reload).
+        self.assertEqual(
+            self._worker_service_hash(with_sha, "vllm-worker"),
+            self._worker_service_hash({**self.WORKER_ENV, "SENTINEL_CODE_SHA": "d" * 64}, "vllm-worker"),
+        )
+        # A worker.env from the previous cluster-sync.sh (no digest) still renders.
+        older = self._render_worker(self.WORKER_ENV)
+        self.assertEqual(older["services"]["vllm-worker-sentinel"]["environment"]["SENTINEL_CODE_SHA"], "")
+
+    def test_the_kill_tier_age_guard_follows_the_cold_start_budget_on_both_nodes(self) -> None:
+        """Review round 2 (sre, minor): the last-resort kill's age guard was a
+        hard-wired 900 s on both nodes while ENGINE_COLD_START_BUDGET_S is a
+        knob; a raised budget was killed at 15 min + 4 min of misses. Both
+        healthchecks now read VLLM_HEALTHCHECK_MIN_AGE_S, which the launcher
+        resolves from the budget (and ships to the worker in worker.env)."""
+        detectors = ClusterDetectors(
+            ifname_for_ip=lambda ip: {"192.168.100.1": "enP2p1s0f1np1"}.get(ip),
+            hcas_for_ifnames=lambda names: ["rocep1s0f1" for name in names if name == "enP2p1s0f1np1"],
+            docker_bridge_gateway=lambda: "172.17.0.1",
+        )
+        dual = {"CLUSTER_MODE": "dual", "CLUSTER_HEAD_IP": "192.168.100.1", "CLUSTER_WORKER_IP": "192.168.100.2"}
+        with (
+            patch.object(environment, "CLUSTER_DETECTORS", detectors),
+            patch.object(environment, "CLUSTER_DISCOVERY", fake_discovery()),
+        ):
+            _profile, budget = self._render(FIXTURES["dgx-spark"], {**dual, "ENGINE_COLD_START_BUDGET_S": "1500"})
+            _profile, explicit = self._render(
+                FIXTURES["dgx-spark"], {**dual, "ENGINE_COLD_START_BUDGET_S": "1500", "VLLM_HEALTHCHECK_MIN_AGE_S": "2000"},
+            )
+            # A generated.env from the previous launcher (no resolved key): the
+            # compose file itself falls back to the budget, then to 900.
+            _profile, older = self._render(
+                FIXTURES["dgx-spark"], {**dual, "ENGINE_COLD_START_BUDGET_S": "1200"},
+                drop_generated=("VLLM_HEALTHCHECK_MIN_AGE_S",),
+            )
+        head = budget["services"]["vllm"]["healthcheck"]["test"][1]
+        self.assertIn('-gt "1500"', head)
+        self.assertNotIn("-gt 900", head)
+        self.assertEqual(budget["services"]["engine-controller"]["environment"]["COLD_START_BUDGET_S"], "1500")
+        self.assertIn('-gt "2000"', explicit["services"]["vllm"]["healthcheck"]["test"][1])
+        self.assertIn('-gt "1200"', older["services"]["vllm"]["healthcheck"]["test"][1])
+        # The worker reads the shipped key, and an older worker.env keeps 900.
+        worker = self._render_worker({**self.WORKER_ENV, "VLLM_HEALTHCHECK_MIN_AGE_S": "1500"})
+        self.assertIn('-gt "1500"', worker["services"]["vllm-worker"]["healthcheck"]["test"][1])
+        self.assertIn('-gt "900"', self._render_worker(self.WORKER_ENV)["services"]["vllm-worker"]["healthcheck"]["test"][1])
+
+    def test_the_sentinel_token_never_reaches_the_orchestrator_even_when_the_environment_carries_it(self) -> None:
+        """Review round 2 (sre, minor): compose.yaml's x-runtime-env feeds .env
+        wholesale to the orchestrator, so a bring-your-own CLUSTER_SENTINEL_TOKEN
+        set there landed in the process that handles untrusted input.
+        `environment:` overrides `env_file`, and the orchestrator now blanks
+        the key as a literal -- whatever the surrounding environment says."""
+        token = "fixture-bring-your-own-restart-token"
+        _profile, rendered = self._render(FIXTURES["dgx-spark"], {"CLUSTER_SENTINEL_TOKEN": token})
+        services = rendered["services"]
+        self.assertEqual(services["orchestrator"]["environment"]["CLUSTER_SENTINEL_TOKEN"], "")
+        self.assertNotIn(token, json.dumps(services["orchestrator"]))
+        # And no service takes it from the interpolation environment: the
+        # controller gets it from its controller.env layer only.
+        for name, definition in services.items():
+            self.assertNotIn(token, json.dumps(definition.get("environment") or {}), name)
 
     def test_no_compose_source_file_hard_codes_a_developer_home_directory(self) -> None:
         for path in [REPO_ROOT / "compose.yaml", *sorted((REPO_ROOT / "compose").glob("*.yaml"))]:

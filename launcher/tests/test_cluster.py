@@ -147,17 +147,19 @@ class ValidationTests(unittest.TestCase):
                 "CLUSTER_GPU_MEMORY_UTILIZATION", "CLUSTER_KV_CACHE_MEMORY_GIB", "CLUSTER_NCCL_DEBUG", "CLUSTER_NCCL_SOCKET_IFNAME",
                 "CLUSTER_NCCL_IB_HCA", "CLUSTER_API_BIND_ADDRESS", "CLUSTER_ENGINE_ARGS",
                 "CLUSTER_GDN_PREFILL_BACKEND", "CLUSTER_ENGINE_ENV", "CLUSTER_SENTINEL_AUTONOMOUS",
-                "VLLM_HEALTHCHECK_KILL_AFTER",
+                "VLLM_HEALTHCHECK_KILL_AFTER", "VLLM_HEALTHCHECK_MIN_AGE_S",
             },
         )
         # Candidate B is opt-in: no GDN flag, no process environment, the
-        # sentinel is not autonomous, the healthcheck's last resort is 8 misses.
+        # sentinel is not autonomous, the healthcheck's last resort is 8 misses
+        # on a process older than the cold-start budget (900 s).
         self.assertNotIn("--gdn-prefill-backend", values["CLUSTER_ENGINE_ARGS"])
         self.assertEqual(values["CLUSTER_GDN_PREFILL_BACKEND"], "")
         self.assertEqual(values["CLUSTER_ENGINE_ENV"], "")
         self.assertEqual(values["CLUSTER_WORKER_MGMT_IP"], "")
         self.assertEqual(values["CLUSTER_SENTINEL_AUTONOMOUS"], "0")
         self.assertEqual(values["VLLM_HEALTHCHECK_KILL_AFTER"], "8")
+        self.assertEqual(values["VLLM_HEALTHCHECK_MIN_AGE_S"], "900")
 
     def test_gdn_prefill_backend_renders_like_the_speculative_config(self) -> None:
         """Candidate B: the flag is spelled as vLLM spells it and lands on BOTH ranks.
@@ -224,6 +226,64 @@ class ValidationTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(TechSaraError, "CLUSTER_WORKER_MGMT_IP must be a literal IPv4"):
             resolve(dual(CLUSTER_WORKER_MGMT_IP="spark-2"))
+
+    def test_worker_management_ip_is_derived_from_the_remote_ocr_url_when_the_monitoring_keys_are_unset(self) -> None:
+        """Review round 2 (sre, major): THIS production's .env names neither
+        CLUSTER_WORKER_MGMT_IP nor MONITORING_WORKER_BIND, so the worker's
+        exporter URL rendered empty and the controller stayed DEGRADED
+        ("participation unobserved") for the life of the deployment. The host
+        scripts/ocr.sh recorded in OCR_REMOTE_BASE_URL IS the worker's
+        management address, derived the way cluster-common.sh's
+        write_ocr_scrape_target derives its scrape target."""
+        # The production shape: only the OCR key, with a port and a path.
+        self.assertEqual(
+            resolve(dual(OCR_REMOTE_BASE_URL="http://192.168.9.68:30004/v1"))["CLUSTER_WORKER_MGMT_IP"],
+            "192.168.9.68",
+        )
+        # Without a port or a path, and with a trailing slash, the same host.
+        self.assertEqual(resolve(dual(OCR_REMOTE_BASE_URL="http://192.168.9.68"))["CLUSTER_WORKER_MGMT_IP"], "192.168.9.68")
+        self.assertEqual(resolve(dual(OCR_REMOTE_BASE_URL="https://192.168.9.68:30004/"))["CLUSTER_WORKER_MGMT_IP"], "192.168.9.68")
+        # The explicit keys still win over the derived host, in their order.
+        self.assertEqual(
+            resolve(dual(OCR_REMOTE_BASE_URL="http://192.168.9.68:30004/v1", CLUSTER_WORKER_MGMT_IP="10.0.0.9"))["CLUSTER_WORKER_MGMT_IP"],
+            "10.0.0.9",
+        )
+        self.assertEqual(
+            resolve(dual(OCR_REMOTE_BASE_URL="http://192.168.9.68:30004/v1", MONITORING_WORKER_BIND="10.0.0.9"))["CLUSTER_WORKER_MGMT_IP"],
+            "10.0.0.9",
+        )
+        # A hostname in the OCR URL is not an IPv4 literal: unobservable, never an error.
+        self.assertEqual(resolve(dual(OCR_REMOTE_BASE_URL="http://spark-2:30004/v1"))["CLUSTER_WORKER_MGMT_IP"], "")
+        # MONITORING_WORKER_BIND as a hostname is skipped, and the OCR host is then used.
+        self.assertEqual(
+            resolve(dual(MONITORING_WORKER_BIND="spark-2", OCR_REMOTE_BASE_URL="http://192.168.9.68:30004/v1"))["CLUSTER_WORKER_MGMT_IP"],
+            "192.168.9.68",
+        )
+        # A cleared key (scripts/ocr.sh down) leaves nothing to derive from.
+        self.assertEqual(resolve(dual(OCR_REMOTE_BASE_URL=""))["CLUSTER_WORKER_MGMT_IP"], "")
+
+    def test_healthcheck_min_age_follows_the_cold_start_budget_and_is_never_shorter(self) -> None:
+        """Review round 2 (sre, minor): the kill tier's age guard was a
+        hard-wired 900 s on both nodes while ENGINE_COLD_START_BUDGET_S is a
+        knob, so a raised budget could not be honoured -- the healthcheck
+        killed a head still legitimately loading. The launcher resolves the
+        guard from the budget, ships it to both files, and refuses an
+        explicit value shorter than the budget."""
+        self.assertEqual(resolve(dual())["VLLM_HEALTHCHECK_MIN_AGE_S"], "900")
+        self.assertEqual(resolve(dual(ENGINE_COLD_START_BUDGET_S="1500"))["VLLM_HEALTHCHECK_MIN_AGE_S"], "1500")
+        self.assertEqual(resolve(dual(VLLM_HEALTHCHECK_MIN_AGE_S="2000"))["VLLM_HEALTHCHECK_MIN_AGE_S"], "2000")
+        self.assertEqual(
+            resolve(dual(ENGINE_COLD_START_BUDGET_S="1500", VLLM_HEALTHCHECK_MIN_AGE_S="1800"))["VLLM_HEALTHCHECK_MIN_AGE_S"],
+            "1800",
+        )
+        with self.assertRaisesRegex(TechSaraError, "VLLM_HEALTHCHECK_MIN_AGE_S=1200 is shorter than ENGINE_COLD_START_BUDGET_S=1500"):
+            resolve(dual(ENGINE_COLD_START_BUDGET_S="1500", VLLM_HEALTHCHECK_MIN_AGE_S="1200"))
+        with self.assertRaisesRegex(TechSaraError, "VLLM_HEALTHCHECK_MIN_AGE_S=600 is shorter than ENGINE_COLD_START_BUDGET_S=900"):
+            resolve(dual(VLLM_HEALTHCHECK_MIN_AGE_S="600"))
+        for key, bad in (("VLLM_HEALTHCHECK_MIN_AGE_S", "30"), ("VLLM_HEALTHCHECK_MIN_AGE_S", "soon"),
+                         ("ENGINE_COLD_START_BUDGET_S", "10"), ("ENGINE_COLD_START_BUDGET_S", "1e9")):
+            with self.subTest(key=key, value=bad), self.assertRaisesRegex(TechSaraError, key):
+                resolve(dual(**{key: bad}))
 
     def test_dual_mode_is_only_supported_on_the_dgx_spark_profile(self) -> None:
         for profile_id in ("nvidia-large", "local-minimal", "mac-128gb-plus", "external-development"):

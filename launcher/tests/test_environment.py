@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import shlex
 import stat
+import subprocess
 import tempfile
 import unittest
 from dataclasses import replace
@@ -779,14 +781,78 @@ class ClusterEnvironmentTests(EnvironmentCase):
     def test_gpu_exporter_urls_for_the_participation_probe_are_dual_mode_only(self) -> None:
         profile = select_profile(nvidia(128, dgx=True), REPO_ROOT)
         dual = self._generate(profile, dict(self.DUAL))
-        self.assertEqual(dual["TECHSARA_HEAD_GPU_EXPORTER_URL"], "http://127.0.0.1:9835")
+        # The full scrape path, as the controller's own default spells it.
+        self.assertEqual(dual["TECHSARA_HEAD_GPU_EXPORTER_URL"], "http://127.0.0.1:9835/metrics")
         # No management address known: the worker sample is "not observable", never a made-up host.
         self.assertEqual(dual["TECHSARA_WORKER_GPU_EXPORTER_URL"], "")
         with_worker = self._generate(profile, {**self.DUAL, "CLUSTER_WORKER_MGMT_IP": "192.168.9.68"})
-        self.assertEqual(with_worker["TECHSARA_WORKER_GPU_EXPORTER_URL"], "http://192.168.9.68:9835")
+        self.assertEqual(with_worker["TECHSARA_WORKER_GPU_EXPORTER_URL"], "http://192.168.9.68:9835/metrics")
         single = self._generate(profile, {"CLUSTER_MODE": "single"})
         self.assertEqual(single["TECHSARA_HEAD_GPU_EXPORTER_URL"], "")
         self.assertEqual(single["TECHSARA_WORKER_GPU_EXPORTER_URL"], "")
+
+    def test_worker_gpu_exporter_url_renders_from_the_remote_ocr_host_on_this_production(self) -> None:
+        """Review round 2 (sre, major): THIS production's .env has no
+        CLUSTER_WORKER_MGMT_IP and an empty MONITORING_WORKER_BIND, only the
+        OCR_REMOTE_BASE_URL scripts/ocr.sh wrote -- and the worker exporter URL
+        rendered empty, so the readiness sequence never observed participation
+        and the controller stayed DEGRADED. The OCR host is the worker's
+        management address, and the URL must render from it."""
+        profile = select_profile(nvidia(128, dgx=True), REPO_ROOT)
+        production = {
+            **self.DUAL,
+            "MONITORING_WORKER_BIND": "",
+            "OCR_REMOTE_BASE_URL": "http://192.168.9.68:30004/v1",
+        }
+        values = self._generate(profile, production)
+        self.assertEqual(values["CLUSTER_WORKER_MGMT_IP"], "192.168.9.68")
+        self.assertEqual(values["TECHSARA_WORKER_GPU_EXPORTER_URL"], "http://192.168.9.68:9835/metrics")
+        self.assertEqual(values["TECHSARA_HEAD_GPU_EXPORTER_URL"], "http://127.0.0.1:9835/metrics")
+        # The OCR engine itself still resolves to the remote address (unchanged behaviour).
+        self.assertEqual(values["OCR_BASE_URL"], "http://192.168.9.68:30004/v1")
+        # An explicit management key still outranks the derived host.
+        explicit = self._generate(profile, {**production, "CLUSTER_WORKER_MGMT_IP": "10.0.0.9"})
+        self.assertEqual(explicit["TECHSARA_WORKER_GPU_EXPORTER_URL"], "http://10.0.0.9:9835/metrics")
+
+    def test_controller_code_sha_is_generated_from_the_controller_program_and_changes_only_with_it(self) -> None:
+        """Review round 2 (sre, major): a routine deploy never restarted the
+        engine controller when only its CODE changed, because the program is a
+        bind mount and `up -d` recreates on a definition change only. The
+        launcher renders the sha256 of controller.py+common.py into generated.env
+        (ENGINE_CONTROLLER_CODE_SHA, part of the service's environment): the
+        same bytes give the same digest -- no recreate -- and a changed byte a
+        different one."""
+        program = self.project / "monitoring" / "engine-controller"
+        program.mkdir(parents=True)
+        (program / "controller.py").write_bytes(b"print('controller v1')\n")
+        (program / "common.py").write_bytes(b"VERSION = 1\n")
+        expected = hashlib.sha256(b"print('controller v1')\nVERSION = 1\n").hexdigest()
+        self.assertEqual(environment.controller_code_sha(self.project), expected)
+        # The shell side computes it the same way (scripts/cluster-sync.sh
+        # sentinel_code_sha: `cat a b | sha256sum`), so the two never differ.
+        shell = subprocess.run(
+            ["bash", "-c", 'cat "$1" "$2" | sha256sum | cut -d" " -f1', "_", str(program / "controller.py"), str(program / "common.py")],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        self.assertEqual(shell, expected)
+        profile = select_profile(nvidia(128, dgx=True), REPO_ROOT)
+        first = self._generate(profile, dict(self.DUAL))
+        self.assertEqual(first["ENGINE_CONTROLLER_CODE_SHA"], expected)
+        # Unchanged code, a second `up`: the identical digest, so the
+        # engine-controller definition is unchanged and `up -d` recreates nothing.
+        second = self._generate(profile, dict(self.DUAL))
+        self.assertEqual(second["ENGINE_CONTROLLER_CODE_SHA"], first["ENGINE_CONTROLLER_CODE_SHA"])
+        # A one-byte change in either file is a new digest, i.e. a definition change.
+        (program / "common.py").write_bytes(b"VERSION = 2\n")
+        changed = self._generate(profile, dict(self.DUAL))
+        self.assertNotEqual(changed["ENGINE_CONTROLLER_CODE_SHA"], first["ENGINE_CONTROLLER_CODE_SHA"])
+        self.assertEqual(changed["ENGINE_CONTROLLER_CODE_SHA"], hashlib.sha256(b"print('controller v1')\nVERSION = 2\n").hexdigest())
+        # Single mode renders it too (the controller runs on one node as well).
+        self.assertEqual(self._generate(profile, {"CLUSTER_MODE": "single"})["ENGINE_CONTROLLER_CODE_SHA"], changed["ENGINE_CONTROLLER_CODE_SHA"])
+        # No program (a checkout without the controller): empty, never an error.
+        (program / "controller.py").unlink()
+        self.assertEqual(environment.controller_code_sha(self.project), "")
+        self.assertEqual(self._generate(profile, dict(self.DUAL))["ENGINE_CONTROLLER_CODE_SHA"], "")
 
     def test_main_model_image_must_be_digest_pinned_and_gdn_argument_renders_for_both_shapes(self) -> None:
         """Candidate B: only the MAIN engine's image may move, and only to a digest."""

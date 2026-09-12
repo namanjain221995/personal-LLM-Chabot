@@ -96,12 +96,18 @@ services:
     #   * anything else (000, 5xx)                 -> exit 1 (docker ps shows
     #     unhealthy; the controller has the real verdict) and count the miss
     #   * VLLM_HEALTHCHECK_KILL_AFTER consecutive misses (default 8 = 4 min
-    #     at this interval) on a process older than 15 min -> kill the vllm
-    #     process so Docker restarts the container. Four minutes is long
-    #     after a live controller would have acted (10 s) and after its whole
-    #     cold-start budget would NOT have (900 s), so this fires only when
-    #     the controller is down or wrong -- the case it exists for. The age
-    #     guard keeps a cold start (4-7 min) from ever being interrupted.
+    #     at this interval) on a process older than VLLM_HEALTHCHECK_MIN_AGE_S
+    #     -> kill the vllm process so Docker restarts the container. Four
+    #     minutes is long after a live controller would have acted (10 s)
+    #     and after its whole cold-start budget would NOT have, so this
+    #     fires only when the controller is down or wrong -- the case it
+    #     exists for. The age guard keeps a cold start (4-7 min) from ever
+    #     being interrupted: it is the launcher-resolved
+    #     VLLM_HEALTHCHECK_MIN_AGE_S (default = the controller's
+    #     ENGINE_COLD_START_BUDGET_S, itself 900 by default), so a raised
+    #     budget for a slower image reaches this check too instead of a
+    #     hard-wired 15 min killing a head that is still legitimately
+    #     loading (review round 2). The same knob is shipped to the worker.
     # Why a kill at all: /v1/models and /health are answered by the API
     # server even when the engine behind it is dead (2026-08-25), and after
     # vLLM's 300 s cross-node RPC timeout the API closes its listener but the
@@ -122,7 +128,7 @@ services:
           n=$$(( $$(cat /tmp/health-missed 2>/dev/null || echo 0) + 1 )); echo $$n > /tmp/health-missed;
           age=$$(ps -o etimes= -p "$$main" | tr -d ' ');
           echo "vLLM /health=$$code (miss $$n of ${VLLM_HEALTHCHECK_KILL_AFTER:-8}; the engine controller decides, this check only reports)";
-          if [ "$${age:-0}" -gt 900 ] && [ "$$n" -ge "${VLLM_HEALTHCHECK_KILL_AFTER:-8}" ]; then echo "vLLM /health failed $$n consecutive checks after $${age}s and no controller acted: LAST RESORT, restarting the head"; kill -9 "$$main"; fi;
+          if [ "$${age:-0}" -gt "${VLLM_HEALTHCHECK_MIN_AGE_S:-${ENGINE_COLD_START_BUDGET_S:-900}}" ] && [ "$$n" -ge "${VLLM_HEALTHCHECK_KILL_AFTER:-8}" ]; then echo "vLLM /health failed $$n consecutive checks after $${age}s (age guard ${VLLM_HEALTHCHECK_MIN_AGE_S:-${ENGINE_COLD_START_BUDGET_S:-900}}s) and no controller acted: LAST RESORT, restarting the head"; kill -9 "$$main"; fi;
           exit 1
       interval: 30s
       timeout: 15s

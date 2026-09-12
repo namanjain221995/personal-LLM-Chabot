@@ -24,6 +24,7 @@ from .cluster import CLUSTER_COMPOSE_OVERLAY, discover_cluster_peer, resolve_clu
 from .compose import ComposeManager, docker_project_has_running_models
 from .environment import (
     DGX_COMPOSE_OVERLAY,
+    ENGINE_CONTROLLER_CODE_SHA_KEY,
     RuntimeLayout,
     _truthy,
     build_generated_environment,
@@ -1164,12 +1165,118 @@ def _start_main_engine_and_controller(
     # legacy watchdog is removed only once the controller is healthy,
     # so the head is never left with no guard at all; the two overlap
     # for seconds, and the watchdog needs four minutes to act.
-    _step("Starting the engine controller (engine-controller)...")
+    # The controller's CODE is part of its definition (ENGINE_CONTROLLER_CODE_SHA
+    # in generated.env, compose.dgx-spark.yaml): `up -d` recreates the
+    # container when controller.py/common.py changed and leaves it running
+    # when they did not -- never `--force-recreate`, which would restart a
+    # healthy controller on every deploy. The digest is narrated so the
+    # deploy log proves which code the controller runs.
+    code_sha = (generated.get(ENGINE_CONTROLLER_CODE_SHA_KEY) or "").strip()
+    _step(
+        "Starting the engine controller (engine-controller"
+        + (f", code sha {code_sha[:12]}; a changed sha recreates the container" if code_sha else "")
+        + ")..."
+    )
     _prepare_engine_controller_paths(project_root)
     compose.up_service("engine-controller")
-    compose.wait_service("engine-controller", timeout=120.0, reporter=_step)
+    row = compose.wait_service("engine-controller", timeout=120.0, reporter=_step)
+    # "Up 4 seconds (healthy)" vs "Up 3 days (healthy)": the deploy log shows
+    # whether this `up` recreated the controller or left it running.
+    status = str(row.get("Status") or "").strip() if isinstance(row, Mapping) else ""
+    if status:
+        _step(f"  engine-controller: {status}")
     _retire_legacy_watchdog(compose.runner, reporter=_step)
     return retry_context
+
+
+#: The pre-controller (v0) head/worker healthcheck's immediate kill on a
+#: /health 5xx -- the `case "$code" in 5*) ... kill -9` branch round 1 removed
+#: because it fired inside the 10-20 s the controller needs to capture
+#: diagnostics and restart the worker FIRST, so every dead engine was
+#: restarted twice and the worker paired with the wrong head.
+LEGACY_HEALTHCHECK_KILL_MARKER = "5*)"
+
+
+def _head_definition_drift(compose: ComposeManager, service: str = "vllm") -> str:
+    """Why the RUNNING head differs from what the current files render, or "".
+
+    A routine deploy preserves a serving head even though its definition
+    changed -- that change waits for a --full deploy, by design. What must not
+    stay silent is WHICH definition is live: on this production the head and
+    the worker were created from the pre-controller overlay, so beside the new
+    controller the old healthcheck still kills the API on the first 5xx and
+    races the controller's worker-first choreography (review round 2, major).
+    Compose's own comparison decides -- the rendered config hash against the
+    label the container was created with, the test `up -d` applies -- and the
+    live healthcheck's text says whether it is the v0 kill. Anything that
+    cannot be read is "" (never a reason to fail an `up`).
+    """
+    try:
+        rows = compose.ps(service)
+    except TechSaraError:
+        return ""
+    if not isinstance(rows, list) or not rows or not isinstance(rows[0], Mapping):
+        return ""
+    container = str(rows[0].get("ID") or rows[0].get("Id") or "").strip()
+    if not container:
+        return ""
+    inspected = compose.runner(
+        [
+            "docker", "inspect", container, "--format",
+            '{{index .Config.Labels "com.docker.compose.config-hash"}}\t{{json .Config.Healthcheck.Test}}',
+        ],
+        timeout=15.0,
+    )
+    if getattr(inspected, "returncode", 1) != 0:
+        return ""
+    running_hash, _tab, healthcheck = str(getattr(inspected, "stdout", "") or "").strip().partition("\t")
+    try:
+        rendered = compose.run("config", f"--hash={service}", timeout=60.0)
+    except TechSaraError:
+        return ""
+    words = str(getattr(rendered, "stdout", "") or "").split()
+    rendered_hash = words[-1] if len(words) >= 2 and words[0] == service else ""
+    if not rendered_hash or not running_hash or rendered_hash == running_hash:
+        return ""
+    if LEGACY_HEALTHCHECK_KILL_MARKER in healthcheck and "kill" in healthcheck:
+        return (
+            "the running head was created from the PRE-CONTROLLER definition: its healthcheck still kills the "
+            "API on the first /health 5xx (within 30 s) and races the controller's worker-first recovery, so a "
+            "dead engine is restarted twice and the worker pairs with the wrong head; apply the current "
+            "definition (report-only healthcheck, core: 1, kernel-cache volume) with scripts/deploy.sh --full "
+            "in an announced window"
+        )
+    return (
+        "the running head was created from an older definition than the current files render (compose "
+        "config hash differs); the change waits for scripts/deploy.sh --full"
+    )
+
+
+def _restart_controller_after_failure(compose: ComposeManager, project_root: Path) -> bool:
+    """Start the engine controller again after a failed pair restart.
+
+    Called from the ``finally`` of the pair restart in ``_start_compose``
+    when the launcher had stopped the previous controller on purpose and then
+    failed before ``_start_main_engine_and_controller`` could start it again
+    (cluster-sync.sh, the worker start, the head's readiness gate, a failed
+    probe). Whatever state the pair is in, a live controller is better than
+    none: it observes, publishes, and recovers under the same lock and
+    budget (contract §6); a stopped one is invisible to
+    ``restart: unless-stopped`` and leaves only the healthchecks' 4-minute
+    last resort. Returns True when the start command succeeded.
+    """
+    _step("Engine controller: the pair restart failed - starting the controller again so the pair is not left unguarded...")
+    _prepare_engine_controller_paths(project_root)
+    try:
+        compose.up_service("engine-controller")
+    except TechSaraError as exc:
+        _step(
+            f"Engine controller: could not start it again ({exc}); start it by hand once the pair is sorted: "
+            "TECHSARA_PRESERVE_MAIN_MODEL=1 ./techsara up, or docker start sf-local-ai-engine-controller-1"
+        )
+        return False
+    _step("Engine controller: started again (it will prove the pair with its own readiness sequence)")
+    return True
 
 
 def _start_compose(
@@ -1200,6 +1307,7 @@ def _start_compose(
     disabled: list[str] = []
     router_fallback = False
     retry_context = 0
+    main_model_drift = ""
     capability_results: dict[str, dict[str, Any]] = {}
 
     def capability_key(kind: str) -> str:
@@ -1365,14 +1473,6 @@ def _start_compose(
         # start (and its health gates) runs -- preserving a corpse helps
         # nobody.
         preserve_main = _truthy(os.environ.get("TECHSARA_PRESERVE_MAIN_MODEL"))
-        if preserve_main:
-            try:
-                _step("Main model: preserve flag set - probing the running engine instead of touching it...")
-                record_probe("main", generated["OPENAI_BASE_URL"], generated["MAIN_MODEL"])
-                _step("Main model: serving; left untouched (definition changes wait for a --full deploy)")
-            except TechSaraError:
-                _step("Main model: not serving - preserve flag ignored, starting it normally...")
-                preserve_main = False
         cluster = _cluster_mode(generated) == "dual"
         controller = _has_engine_controller(profile)
         # ONE ACTOR RESTARTS THE PAIR (contract §6). From here to the controller
@@ -1381,7 +1481,33 @@ def _start_compose(
         # the launcher is in the middle of starting, and a recovery already
         # in progress is waited out rather than restarted a second time.
         engine_lock = EngineRecoveryLock(project_root).acquire("techsara up") if controller else None
+        # Set only between the deliberate stop below and the controller's
+        # return in _start_main_engine_and_controller: while it is True an
+        # exception escaping this block leaves the head without any guard.
+        controller_stopped = False
         try:
+            if preserve_main:
+                # The probe runs UNDER the lock, never before it: a recovery
+                # in progress (the head reloading) fails a probe run outside
+                # the lock, drops the preserve flag, and the launcher then
+                # waits for the lock only to restart the pair the controller
+                # has just recovered (review round 2). Locked first, the
+                # probe sees the recovered, serving pair and leaves it alone.
+                try:
+                    _step("Main model: preserve flag set - probing the running engine instead of touching it...")
+                    record_probe("main", generated["OPENAI_BASE_URL"], generated["MAIN_MODEL"])
+                    _step("Main model: serving; left untouched (definition changes wait for a --full deploy)")
+                except TechSaraError:
+                    _step("Main model: not serving - preserve flag ignored, starting it normally...")
+                    preserve_main = False
+                else:
+                    # Preserved, so say WHICH definition is live: the v0
+                    # healthcheck beside the controller is a double restart
+                    # on the next fault, and only a --full deploy ends it.
+                    # Loud in the deploy log and recorded in state.json.
+                    main_model_drift = _head_definition_drift(compose)
+                    if main_model_drift:
+                        _step(f"Main model: WARNING - {main_model_drift}")
             if controller and not preserve_main:
                 # No controller may be alive while the pair is restarted on
                 # purpose: a live one would read the worker's new start as
@@ -1391,6 +1517,7 @@ def _start_compose(
                 # no container yet is a no-op.
                 _step("Engine controller: stopping the previous controller for the pair restart...")
                 compose.stop_service("engine-controller")
+                controller_stopped = True
             if cluster and not preserve_main:
                 # Node 2 first: the head's rendezvous waits for the worker, and a
                 # sync/start failure here must surface as itself, not as a head
@@ -1421,7 +1548,22 @@ def _start_compose(
                 cluster=cluster, preserve_main=preserve_main, controller=controller,
                 project_root=project_root, record_probe=record_probe, publish_generated=publish_generated,
             )
+            # Returned: the controller is back (or deliberately left stopped
+            # because the head is not observable -- that path says so).
+            controller_stopped = False
         finally:
+            if controller_stopped:
+                # EVERY failure path restarts the controller (review round 2):
+                # a stopped service is one `restart: unless-stopped` never
+                # brings back, and a `techsara up` that died in
+                # cluster-sync.sh or at the head's readiness gate used to
+                # leave the pair with no actor to recover it until the next
+                # successful `up`. Started here, still under the lock, so it
+                # takes its own first look at the pair only once the lock is
+                # released a line below. Best effort: the original error is
+                # the one the operator must see, so a failure to start it is
+                # reported, never raised over it.
+                _restart_controller_after_failure(compose, project_root)
             if engine_lock is not None:
                 engine_lock.release()
         if _yes(generated.get("VISION_ENABLED")):
@@ -1495,6 +1637,9 @@ def _start_compose(
         "status": "running", "orchestrator": health,
         "disabled_features": disabled, "router_fallback": router_fallback,
         "startup_retry_context": retry_context,
+        # "" when the preserved head matches the current definition (or no
+        # head was preserved); otherwise why it differs, for the deploy record.
+        "main_model_definition_drift": main_model_drift,
         "capability_results": list(capability_results.values()),
     }
 
@@ -1523,6 +1668,15 @@ def _cmd_up(args: argparse.Namespace, *, root: Path) -> int:
             # The sentinel token, in its own 0600 layer that only the
             # engine-controller service reads (never secrets.env).
             prepare_controller_secrets(layout, user_env)
+            if (user_env.get("CLUSTER_SENTINEL_TOKEN") or "").strip():
+                # .env is an env_file of the orchestrator (compose.yaml
+                # x-runtime-env); compose.yaml blanks this one key there, and
+                # the bring-your-own value belongs in controller.env alone.
+                _step(
+                    "CLUSTER_SENTINEL_TOKEN is set in .env: honoured on both nodes through "
+                    f"{layout.controller_env}, blanked for the orchestrator by compose.yaml; "
+                    "prefer setting it in that file only and removing it from .env (.env.example)"
+                )
         effective = dict(user_env)
         effective.update(secrets)
         manager = _model_manager(layout, hardware, runtimes, user_env)

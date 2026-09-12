@@ -1248,6 +1248,7 @@ class ComposeStartupTests(unittest.TestCase):
                 "disabled_features": [],
                 "router_fallback": False,
                 "startup_retry_context": 0,
+                "main_model_definition_drift": "",
             },
         )
         by_name = {item["name"]: item for item in capabilities}
@@ -1984,6 +1985,280 @@ class ComposeStartupTests(unittest.TestCase):
         controller = events.index("up:engine-controller")
         self.assertLess(sync, sentinel)
         self.assertLess(sentinel, controller)
+
+    def test_a_routine_deploy_starts_the_controller_without_force_recreate_and_narrates_its_code_sha(self) -> None:
+        """Review round 2 (sre, major): a routine deploy never restarted the
+        controller when only its CODE changed. The fix makes the code part of
+        the DEFINITION (ENGINE_CONTROLLER_CODE_SHA in the service environment,
+        rendered by the launcher), so plain `up -d` recreates on a code change
+        and -- the other half of the contract -- an unchanged digest recreates
+        nothing: the launcher must therefore never pass --force-recreate for
+        the controller, and it says which code it started."""
+        profile = self._cluster_profile()
+        sha = "a" * 64
+        generated = {**self._cluster_generated(), "ENGINE_CONTROLLER_CODE_SHA": sha}
+        compose = Mock()
+        compose.profiles = ()
+        stdout = io.StringIO()
+        health_result = {"status": "healthy", "checks": {"app_db": {"status": "ok"}}}
+        with (
+            patch.object(cli, "_probe_orchestrator", return_value=health_result),
+            patch.object(cli, "_run_cluster_script"),
+            patch.dict(os.environ, {"TECHSARA_PRESERVE_MAIN_MODEL": "1"}, clear=False),
+            redirect_stdout(stdout),
+        ):
+            cli._start_compose(
+                compose, profile, generated, salesforce_ready=False, search_enabled=False, dry_run=False,
+                root=self._root(),
+            )
+        controller_ups = [item for item in compose.up_service.call_args_list if item.args == ("engine-controller",)]
+        self.assertEqual(controller_ups, [call("engine-controller")], "plain `up -d`: Compose decides from the definition")
+        self.assertNotIn(call("engine-controller", force_recreate=True), compose.up_service.call_args_list)
+        self.assertIn(f"code sha {sha[:12]}; a changed sha recreates the container", stdout.getvalue())
+
+    def test_the_preserve_probe_runs_under_the_engine_lock_not_before_it(self) -> None:
+        """Review round 2 (sre, minor): the main-model probe that decides
+        preserve_main ran BEFORE the lock was taken, so a hand-run
+        TECHSARA_PRESERVE_MAIN_MODEL=1 up during a controller recovery failed
+        the probe, dropped preserve, waited for the lock and then restarted
+        the freshly recovered pair. Locked first, the probe sees the recovered
+        pair and the launcher leaves it alone."""
+        profile = self._cluster_profile()
+        generated = self._cluster_generated()
+        root = self._root()
+        lock_file = root / ".runtime" / "locks" / "engine-recovery.lock"
+        compose = Mock()
+        compose.profiles = ()
+        events: list[str] = []
+
+        def held_now() -> bool:
+            probe = subprocess.run(["flock", "-n", str(lock_file), "true"], capture_output=True, check=False)
+            return probe.returncode != 0
+
+        def probe(_url, _model, kind="chat"):
+            events.append(f"probe:{kind} locked={held_now()}")
+            return {"kind": kind, "supported": True}
+
+        compose.probe_internal_model.side_effect = probe
+        compose.up_service.side_effect = lambda service, **_kwargs: events.append(f"up:{service} locked={held_now()}")
+        health_result = {"status": "healthy", "checks": {"app_db": {"status": "ok"}}}
+        with (
+            patch.object(cli, "_probe_orchestrator", return_value=health_result),
+            patch.object(cli, "_run_cluster_script", side_effect=lambda *_a, **_k: events.append(f"script locked={held_now()}")),
+            patch.dict(os.environ, {"TECHSARA_PRESERVE_MAIN_MODEL": "1"}, clear=False),
+            redirect_stdout(io.StringIO()),
+        ):
+            os.environ.pop(cli.ENGINE_LOCK_HELD_BY, None)
+            cli._start_compose(
+                compose, profile, generated, salesforce_ready=False, search_enabled=False, dry_run=False, root=root,
+            )
+        # The FIRST main probe is the preserve decision, and it is locked.
+        main_probes = [item for item in events if item.startswith("probe:chat")]
+        self.assertEqual(main_probes[0], "probe:chat locked=True")
+        self.assertNotIn("up:vllm locked=True", events, "a serving pair is preserved")
+        self.assertIn("up:engine-controller locked=True", events)
+        self.assertFalse(held_now(), "released after the controller is back")
+
+    def test_a_failed_pair_restart_starts_the_controller_again_on_every_failure_path(self) -> None:
+        """Review round 2 (sre, major): the launcher stopped the previous
+        controller before restarting the pair and nothing restarted it when a
+        later step failed -- a stopped service `restart: unless-stopped` never
+        brings back, so the pair was left with no recovery actor until the next
+        successful `up`. Every failure path after the stop must start it again
+        (logged), while the original error still surfaces, and the lock is
+        still held while it starts and released afterwards."""
+        profile = self._cluster_profile()
+
+        def scripted(fail_script: str | None):
+            def script(_root, name, *args, reporter, timeout):
+                label = f"{name} {' '.join(args)}".strip()
+                events.append(f"script:{label}")
+                if fail_script and label == fail_script:
+                    raise TechSaraError(f"scripts/{label} failed with exit status 2")
+            return script
+
+        failure_paths = {
+            "cluster-sync": dict(fail_script="cluster-sync.sh", wait_fails=False, probe_fails=False),
+            "worker-start": dict(fail_script="cluster-worker.sh start", wait_fails=False, probe_fails=False),
+            "head-readiness": dict(fail_script=None, wait_fails=True, probe_fails=False),
+            "head-probe": dict(fail_script=None, wait_fails=False, probe_fails=True),
+        }
+        for label, path in failure_paths.items():
+            with self.subTest(failure=label):
+                generated = self._cluster_generated()
+                root = self._root()
+                lock_file = root / ".runtime" / "locks" / "engine-recovery.lock"
+                compose = Mock()
+                compose.profiles = ()
+                events: list[str] = []
+
+                def held_now() -> bool:
+                    probe = subprocess.run(["flock", "-n", str(lock_file), "true"], capture_output=True, check=False)
+                    return probe.returncode != 0
+
+                compose.stop_service.side_effect = lambda service: events.append(f"stop:{service}")
+                compose.up_service.side_effect = lambda service, **_kwargs: events.append(f"up:{service} locked={held_now()}")
+
+                def wait(service, **_kwargs):
+                    if service == "vllm" and path["wait_fails"]:
+                        raise TechSaraError("service vllm did not become healthy before timeout")
+                    return {}
+
+                def probe(_url, _model, kind="chat"):
+                    if kind == "chat" and path["probe_fails"]:
+                        raise TechSaraError("Docker Compose run failed: probe")
+                    return {"kind": kind, "supported": True}
+
+                compose.wait_service.side_effect = wait
+                compose.probe_internal_model.side_effect = probe
+                stdout = io.StringIO()
+                with (
+                    patch.object(cli, "_probe_orchestrator") as health,
+                    patch.object(cli, "_run_cluster_script", side_effect=scripted(path["fail_script"])),
+                    patch.dict(os.environ, {}, clear=False),
+                    redirect_stdout(stdout),
+                ):
+                    os.environ.pop(cli.ENGINE_LOCK_HELD_BY, None)
+                    os.environ.pop("TECHSARA_PRESERVE_MAIN_MODEL", None)
+                    with self.assertRaises(TechSaraError) as caught:
+                        cli._start_compose(
+                            compose, profile, generated, salesforce_ready=False, search_enabled=False,
+                            dry_run=False, root=root,
+                        )
+                # The ORIGINAL error is what the operator sees.
+                self.assertNotIn("could not start it again", str(caught.exception))
+                stop = events.index("stop:engine-controller")
+                restart = events.index("up:engine-controller locked=True")
+                self.assertLess(stop, restart, "stopped for the restart, started again after the failure")
+                self.assertEqual(events.count("up:engine-controller locked=True"), 1)
+                self.assertIn("starting the controller again so the pair is not left unguarded", stdout.getvalue())
+                self.assertIn("Engine controller: started again", stdout.getvalue())
+                self.assertFalse(held_now(), "the lock is released after the controller is back")
+                self.assertNotIn(cli.ENGINE_LOCK_HELD_BY, os.environ)
+                health.assert_not_called()
+                self.assertNotIn("up:orchestrator locked=False", events, "the failure still stops the start-up")
+
+    def test_a_controller_that_cannot_be_started_again_is_reported_without_masking_the_failure(self) -> None:
+        """The restart after a failed pair restart is best effort: when
+        `up -d engine-controller` itself fails, the operator is told how to
+        start it by hand and still sees the error that stopped the deploy."""
+        profile = self._cluster_profile()
+        generated = self._cluster_generated()
+        root = self._root()
+        compose = Mock()
+        compose.profiles = ()
+
+        def up(service, **_kwargs):
+            if service == "engine-controller":
+                raise TechSaraError("Docker Compose up -d failed: no such image")
+
+        compose.up_service.side_effect = up
+        stdout = io.StringIO()
+        with (
+            patch.object(cli, "_probe_orchestrator"),
+            patch.object(cli, "_run_cluster_script", side_effect=TechSaraError("scripts/cluster-sync.sh failed with exit status 2")),
+            patch.dict(os.environ, {}, clear=False),
+            redirect_stdout(stdout),
+        ):
+            os.environ.pop(cli.ENGINE_LOCK_HELD_BY, None)
+            os.environ.pop("TECHSARA_PRESERVE_MAIN_MODEL", None)
+            with self.assertRaisesRegex(TechSaraError, "scripts/cluster-sync.sh failed with exit status 2"):
+                cli._start_compose(
+                    compose, profile, generated, salesforce_ready=False, search_enabled=False, dry_run=False, root=root,
+                )
+        self.assertIn(call("engine-controller"), compose.up_service.call_args_list)
+        self.assertIn("could not start it again (Docker Compose up -d failed: no such image)", stdout.getvalue())
+        self.assertIn("docker start sf-local-ai-engine-controller-1", stdout.getvalue())
+        self.assertNotIn(cli.ENGINE_LOCK_HELD_BY, os.environ)
+
+    def test_a_preserved_head_created_from_the_v0_definition_is_called_out_and_recorded(self) -> None:
+        """Review round 2 (sre, major): on this production the head and the
+        worker were created from the pre-controller overlay whose healthcheck
+        kills the API on the first 5xx, racing the controller's worker-first
+        choreography -- and no launcher step said so. The preserve path now
+        compares Compose's config hash of the running container with the
+        rendered one, names the v0 kill branch when the live healthcheck still
+        carries it, and records the drift in the result (state.json)."""
+        v0_test = json.dumps([
+            "CMD-SHELL",
+            'code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8000/health); '
+            'case "$code" in 200) exit 0 ;; 5*) kill -9 "$(pgrep -o -f vllm)" ;; esac; exit 1',
+        ])
+
+        def fake_compose(*, running_hash: str, rendered_hash: str, healthcheck: str) -> SimpleNamespace:
+            calls: list[list[str]] = []
+
+            def runner(args, **_kwargs):
+                calls.append(list(args))
+                if args[:2] == ["docker", "inspect"]:
+                    return SimpleNamespace(returncode=0, stdout=f"{running_hash}\t{healthcheck}\n", stderr="")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            def run(*args, timeout=0.0):
+                calls.append(["compose", *args])
+                self.assertEqual(args, ("config", "--hash=vllm"))
+                return SimpleNamespace(returncode=0, stdout=f"vllm {rendered_hash}\n", stderr="")
+
+            return SimpleNamespace(
+                ps=lambda service: [{"ID": "abc123def456", "Service": service, "State": "running"}],
+                runner=runner, run=run, calls=calls,
+            )
+
+        legacy = fake_compose(running_hash="old", rendered_hash="new", healthcheck=v0_test)
+        reason = cli._head_definition_drift(legacy)
+        self.assertIn("PRE-CONTROLLER definition", reason)
+        self.assertIn("kills the API on the first /health 5xx", reason)
+        self.assertIn("scripts/deploy.sh --full", reason)
+        self.assertEqual(legacy.calls[0][:3], ["docker", "inspect", "abc123def456"])
+        # Same hash: nothing to say, whatever the text looks like.
+        self.assertEqual(cli._head_definition_drift(fake_compose(running_hash="same", rendered_hash="same", healthcheck=v0_test)), "")
+        # A different hash without the kill branch: an older definition, said plainly.
+        report_only = json.dumps(["CMD-SHELL", "exit 1"])
+        self.assertIn("older definition", cli._head_definition_drift(fake_compose(running_hash="old", rendered_hash="new", healthcheck=report_only)))
+        # Nothing readable (no container, a failed inspect, a Mock compose): "", never an error.
+        self.assertEqual(cli._head_definition_drift(SimpleNamespace(ps=lambda _s: [], runner=None, run=None)), "")
+        broken = fake_compose(running_hash="old", rendered_hash="new", healthcheck=v0_test)
+        broken.runner = lambda args, **_k: SimpleNamespace(returncode=1, stdout="", stderr="no such container")
+        self.assertEqual(cli._head_definition_drift(broken), "")
+        self.assertEqual(cli._head_definition_drift(Mock()), "")
+
+        # Through the preserve path: the step line is loud and the result records it.
+        profile = self._cluster_profile()
+        generated = self._cluster_generated()
+        compose = Mock()
+        compose.profiles = ()
+        stdout = io.StringIO()
+        health_result = {"status": "healthy", "checks": {"app_db": {"status": "ok"}}}
+        with (
+            patch.object(cli, "_probe_orchestrator", return_value=health_result),
+            patch.object(cli, "_run_cluster_script"),
+            patch.object(cli, "_head_definition_drift", return_value="the running head was created from the PRE-CONTROLLER definition: fixture") as drift,
+            patch.dict(os.environ, {"TECHSARA_PRESERVE_MAIN_MODEL": "1"}, clear=False),
+            redirect_stdout(stdout),
+        ):
+            result = cli._start_compose(
+                compose, profile, generated, salesforce_ready=False, search_enabled=False, dry_run=False,
+                root=self._root(),
+            )
+        drift.assert_called_once_with(compose)
+        self.assertIn("Main model: WARNING - the running head was created from the PRE-CONTROLLER definition: fixture", stdout.getvalue())
+        self.assertEqual(result["main_model_definition_drift"], "the running head was created from the PRE-CONTROLLER definition: fixture")
+        self.assertNotIn("up:vllm", stdout.getvalue(), "still preserved: the warning never restarts the pair")
+        # Not preserved (a --full or a dead engine): no drift check, an empty record.
+        with (
+            patch.object(cli, "_probe_orchestrator", return_value=health_result),
+            patch.object(cli, "_run_cluster_script"),
+            patch.object(cli, "_head_definition_drift") as drift,
+            patch.dict(os.environ, {}, clear=False),
+            redirect_stdout(io.StringIO()),
+        ):
+            os.environ.pop("TECHSARA_PRESERVE_MAIN_MODEL", None)
+            result = cli._start_compose(
+                Mock(profiles=()), profile, self._cluster_generated(), salesforce_ready=False, search_enabled=False,
+                dry_run=False, root=self._root(),
+            )
+        drift.assert_not_called()
+        self.assertEqual(result["main_model_definition_drift"], "")
 
     def test_the_controller_is_not_started_when_the_head_is_not_observable(self) -> None:
         """An empty generated head URL (single node, ports unpublished): a

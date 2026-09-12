@@ -179,6 +179,16 @@ services:
       - path: ${TECHSARA_CONTROLLER_ENV:-.runtime/controller.env}
         required: false
     environment:
+      # THE CODE IS PART OF THE DEFINITION. /app is a bind mount, and
+      # `docker compose up -d` recreates a container only when its
+      # definition changed -- so a routine deploy that changed nothing but
+      # controller.py used to print "Running" and leave the OLD module in
+      # memory while the deploy record said the commit was live (review
+      # round 2). The launcher renders the sha256 of controller.py+common.py
+      # into generated.env (environment.controller_code_sha); a changed
+      # digest is a changed definition, an unchanged one recreates nothing.
+      # The worker's sentinel carries SENTINEL_CODE_SHA the same way.
+      ENGINE_CONTROLLER_CODE_SHA: ${ENGINE_CONTROLLER_CODE_SHA:-}
       HEAD_CONTAINER: ${ENGINE_HEAD_CONTAINER:-sf-local-ai-vllm-1}
       HEAD_API_URL: ${ENGINE_HEAD_API_URL:-${TECHSARA_ENGINE_HEAD_API_URL:-}}
       # No worker sentinel on one node; the cluster overlay sets it.

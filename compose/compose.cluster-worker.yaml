@@ -96,8 +96,10 @@ services:
     #   * head /health 200                          -> healthy, counter reset
     #   * anything else (000, 5xx)                  -> exit 1 (report only)
     #   * VLLM_HEALTHCHECK_KILL_AFTER consecutive misses (default 8 = 4 min)
-    #     on a process older than 15 min -> kill the vllm process so Docker
-    #     restarts the container and the rank waits at the next rendezvous.
+    #     on a process older than VLLM_HEALTHCHECK_MIN_AGE_S (the launcher's
+    #     resolution of ENGINE_COLD_START_BUDGET_S; 900 by default) -> kill
+    #     the vllm process so Docker restarts the container and the rank
+    #     waits at the next rendezvous.
     # The same number and the same age guard as the head's check, shipped
     # in worker.env by scripts/cluster-sync.sh; four minutes is long after a
     # live controller would have acted and covers the day the controller is
@@ -121,7 +123,7 @@ services:
           n=$$(( $$(cat /tmp/head-missed 2>/dev/null || echo 0) + 1 )); echo $$n > /tmp/head-missed;
           age=$$(ps -o etimes= -p "$$main" | tr -d ' ');
           echo "head /health=$$code (miss $$n of ${VLLM_HEALTHCHECK_KILL_AFTER:-8}; the engine controller re-pairs this rank, this check only reports)";
-          if [ "$${age:-0}" -gt 900 ] && [ "$$n" -ge "${VLLM_HEALTHCHECK_KILL_AFTER:-8}" ]; then echo "head unreachable for $$n consecutive checks after $${age}s and no controller acted: LAST RESORT, restarting the worker"; kill -9 "$$main"; fi;
+          if [ "$${age:-0}" -gt "${VLLM_HEALTHCHECK_MIN_AGE_S:-${ENGINE_COLD_START_BUDGET_S:-900}}" ] && [ "$$n" -ge "${VLLM_HEALTHCHECK_KILL_AFTER:-8}" ]; then echo "head unreachable for $$n consecutive checks after $${age}s (age guard ${VLLM_HEALTHCHECK_MIN_AGE_S:-${ENGINE_COLD_START_BUDGET_S:-900}}s) and no controller acted: LAST RESORT, restarting the worker"; kill -9 "$$main"; fi;
           exit 1
       interval: 30s
       timeout: 15s
@@ -177,6 +179,15 @@ services:
       - ./sentinel.py:/app/sentinel.py:ro
       - ./common.py:/app/common.py:ro
     environment:
+      # THE CODE IS PART OF THE DEFINITION: sentinel.py and common.py are
+      # bind mounts, and `up -d` recreates only on a definition change, so
+      # scripts/cluster-sync.sh writes the sha256 of the two files it just
+      # shipped (`cat sentinel.py common.py | sha256sum`) into worker.env;
+      # a changed digest recreates this container on the routine deploy's
+      # `cluster-worker.sh start vllm-worker-sentinel`, an unchanged one
+      # leaves it running (review round 2; the head's controller carries
+      # ENGINE_CONTROLLER_CODE_SHA the same way).
+      SENTINEL_CODE_SHA: ${SENTINEL_CODE_SHA:-}
       SENTINEL_BIND: ${CLUSTER_WORKER_IP:?CLUSTER_WORKER_IP must be set}
       SENTINEL_PORT: "9839"
       WORKER_CONTAINER: sf-local-ai-worker-vllm-worker-1

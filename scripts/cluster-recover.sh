@@ -22,9 +22,12 @@
 #       cold_start_timeout, or torch._dynamo / flashinfer.jit / nvcc /
 #       cuda_nvrtc errors in the head log): under the lock, stop BOTH ranks,
 #       empty BOTH kernel-cache volumes (sf-local-ai_vllm-kernel-cache here,
-#       sf-local-ai-worker_kernel-cache on the worker), start the pair and
-#       prove it. The next start recompiles (~50 s per rank measured, more
-#       for a FlashInfer GDN JIT). Asks for confirmation unless --yes.
+#       sf-local-ai-worker_kernel-cache on the worker), start the pair --
+#       BOTH ranks from their CURRENT compose definitions (the worker from
+#       the shipped worker.env, the head with `up -d --no-deps vllm` on the
+#       launcher's own chain from .runtime/state.json) -- and prove it. The
+#       next start recompiles (~50 s per rank measured, more for a
+#       FlashInfer GDN JIT). Asks for confirmation unless --yes.
 #
 # Exit status: 0 when a real completion succeeded on the recovered pair,
 # 1 when it did not, 2 on a usage or precondition error.
@@ -39,6 +42,12 @@
 . "$(dirname "${BASH_SOURCE[0]}")/lib/cluster-common.sh"
 # shellcheck source=lib/engine-lock.sh
 . "$CLUSTER_LIB_DIR/engine-lock.sh"
+# dr_compose_prefix: the launcher's compose chain as state.json recorded it,
+# CHECKED for the four required files in order (a subset resolves the head to
+# a definition without the cluster overlay and the orchestrator to the stale
+# :cpu image). Nothing else of deploy-common.sh is used here.
+# shellcheck source=lib/deploy-common.sh
+. "$CLUSTER_LIB_DIR/deploy-common.sh"
 
 CONTROLLER_URL="${ENGINE_CONTROLLER_URL:-http://127.0.0.1:9838}"
 HEAD_CTR="${ENGINE_HEAD_CONTAINER:-sf-local-ai-vllm-1}"
@@ -61,7 +70,7 @@ while [ $# -gt 0 ]; do
     --yes) YES=1 ;;
     --timeout) TIMEOUT="${2:?--timeout needs seconds}"; shift ;;
     --timeout=*) TIMEOUT="${1#--timeout=}" ;;
-    -h|--help) sed -n '2,36p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,40p' "$0"; exit 0 ;;
     *) die "unknown option: $1" ;;
   esac
   shift
@@ -327,7 +336,10 @@ empty_volume() {
     if docker volume inspect "$volume" >/dev/null 2>&1; then
       docker run --rm -v "$volume:/cache" "$image" sh -c 'find /cache -mindepth 1 -delete && echo emptied' | sed "s/^/  $label: /"
     else
-      echo "  $label: absent (nothing to empty)"
+      # A head created before the volume existed keeps its cache in the
+      # container's writable layer; the recreate from the current
+      # definition (step 6) discards that layer and mounts the volume.
+      echo "  $label: absent (nothing to empty; the head container predates the volume -- its recreate below creates and mounts it)"
     fi
   fi
 }
@@ -337,6 +349,28 @@ empty_volume() {
 head_controller_image() {
   head_compose config --format json 2>/dev/null \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["services"]["engine-controller"]["image"])'
+}
+
+# head_compose_current ARGS...: docker compose for the head project with the
+# chain the launcher LAST USED (.runtime/state.json via deploy-common.sh's
+# dr_compose_prefix, which refuses a subset or a wrong order). The prefix is
+# shlex-quoted, so it is consumed with eval and the caller's arguments are
+# expanded by eval itself, never re-split.
+head_compose_current() {
+  local prefix
+  prefix="$(dr_compose_prefix)" || return 1
+  ( cd "$ROOT" && eval "$prefix" '"$@"' )
+}
+
+# head_definition_drifted: 0 when the head container was created from a
+# definition other than the one the current files render (Compose's own
+# config hash, the same test `up -d` applies), so the operator is told a
+# recreate is coming rather than surprised by one.
+head_definition_drifted() {
+  local rendered running
+  rendered="$(head_compose_current config --hash vllm 2>/dev/null | awk '{print $2}')" || return 1
+  running="$(docker inspect "$HEAD_CTR" --format '{{index .Config.Labels "com.docker.compose.config-hash"}}' 2>/dev/null)" || return 1
+  [ -n "$rendered" ] && [ -n "$running" ] && [ "$rendered" != "$running" ]
 }
 
 clear_kernel_cache() {
@@ -382,9 +416,25 @@ clear_kernel_cache() {
 
   section "5/7 start the WORKER first (it must be waiting at the rendezvous)"
   worker_compose up -d vllm-worker || die "worker start failed; the head is still stopped -- scripts/cluster-recover.sh --force once the worker is up"
-  section "6/7 start the head"
-  docker start "$HEAD_CTR" >/dev/null || die "head start failed"
-  say "head started; the caches are cold, so expect the full compile on top of the load (budget ${COLD_START_BUDGET_S:-900}s)"
+  section "6/7 start the head from its CURRENT compose definition"
+  # BOTH RANKS FROM THE CURRENT DEFINITIONS. Step 5 (re)creates the worker
+  # from the worker.env every routine deploy re-ships (engine args, image),
+  # while `docker start` of the head's EXISTING container would bring back
+  # the command, image, ulimits and mounts it was created with -- after any
+  # routine deploy that changed an engine argument, two ranks with two
+  # configurations, which vLLM's mp executor refuses at the rendezvous
+  # (review round 2). `up -d --no-deps vllm` with the launcher's own chain
+  # recreates the head when its definition changed and otherwise starts
+  # the stopped container as it is -- the same rule the worker gets.
+  if head_definition_drifted; then
+    say "the head's definition changed since its container was created (image/command/ulimits/volumes): it is RECREATED from the current files"
+  fi
+  head_compose_current up -d --no-deps vllm >/dev/null || die "head start failed (docker compose up -d --no-deps vllm with the chain from .runtime/state.json)"
+  if docker inspect "$HEAD_CTR" --format '{{range .Mounts}}{{.Name}} {{end}}' 2>/dev/null | grep -qw "$HEAD_KERNEL_CACHE_VOLUME"; then
+    say "head started with $HEAD_KERNEL_CACHE_VOLUME mounted; the caches are cold, so expect the full compile on top of the load (budget ${COLD_START_BUDGET_S:-900}s)"
+  else
+    say "WARNING: the head container does not mount $HEAD_KERNEL_CACHE_VOLUME even after the recreate (is compose.dgx-spark.yaml current in the chain state.json names?); its cache lives in the writable layer"
+  fi
 
   # 7/7 wait, real completion, both ranks.
   local rc=0
