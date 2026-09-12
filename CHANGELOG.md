@@ -243,7 +243,7 @@ c10 TTFT p95 0.32 vs 0.60 s; 32K prefill 8.6K vs 7.8K tok/s; 128K 5.2K vs
 inter-token stall in `c10_short` on B. A's 950K figure does not exist: the
 shell watchdog restarted the head under it at 01:20Z. The 120-min soak
 (`scripts/cluster-soak.py --minutes 120 --concurrency 10`) started 10:50Z and
-is **PASS** — 120.1 min, c=10, 8,851/8,851 ok, 0 faults, 0 restarts, Xid unchanged (10:50–12:51Z); its result is appended by the lead.
+is **PASS** — 120.1 min, c=10, 8,851/8,851 ok, 0 faults, 0 restarts, Xid unchanged (10:50–12:51Z).
 The secondary engine knobs and Track A are not run.
 
 **Files.** New: `monitoring/engine-controller/{controller.py,sentinel.py,common.py,README.md,tests/}`,

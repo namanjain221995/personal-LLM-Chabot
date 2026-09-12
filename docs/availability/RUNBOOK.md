@@ -625,7 +625,7 @@ head 08:39:59Z, `Application startup complete` 08:43:45Z (≈ 3 m 46 s; the
 launcher counted `ready after 229s`), the GDN line on both ranks at 08:41:04Z.
 Step 4 passed (verify probe 23/2, the 2 = the Xid baseline). The A/B matrix
 is in `ab/compare-A-vs-B-20260912.md`; the 120-min soak started 10:50Z and is
-in progress at the time of writing (result appended by the lead); the 48–72 h
+**PASS** (120.1 min at c=10, 8,851/8,851 requests ok, 0 faults, 0 restarts, Xid unchanged, 10:50–12:51Z); the 48–72 h
 canary is **still unproven**; the secondary tests are not run. Production
 runs B now; the pinned digest `24f2f897…` is the rollback (step 5), cached on
 both nodes.

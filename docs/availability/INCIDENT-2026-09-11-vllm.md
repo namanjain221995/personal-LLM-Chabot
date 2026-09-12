@@ -195,7 +195,7 @@ not measured: the old shell watchdog restarted the head under the first A run at
 
 The 120-min soak on B (`scripts/cluster-soak.py --minutes 120 --concurrency 10`, started 10:50Z,
 `.runtime/logs/soak-B-20260912T1050Z.log`) is ****PASS** — 120.1 min, c=10, 8,851/8,851 ok, 0 faults, 0 restarts, Xid unchanged (10:50–12:51Z); result
-appended by the lead.** The 48–72 h canary has not started: **still unproven.**
+recorded above.** The 48–72 h canary has not started: **still unproven.**
 
 ## 6. Remaining risks
 
