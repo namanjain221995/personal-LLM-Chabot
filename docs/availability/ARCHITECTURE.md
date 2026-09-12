@@ -125,8 +125,8 @@ DOWN — a false DOWN is an outage of its own once the orchestrator acts on it
 there is no `VLLM::Worker_TP*` process and no sentinel; the controller must not
 infer death from a process name it never saw.
 
-**Detection → confirmation** (`controller.py`, CONTRACT §6.3): the five
-triggers are `worker_rank_dead` (the sentinel saw the rank gone, a fatal log
+**Detection → confirmation** (`controller.py`, CONTRACT §6.3): the
+budgeted triggers are `worker_rank_dead` (the sentinel saw the rank gone, a fatal log
 signature newer than the head's `started_at`, or a worker start newer than the
 head's — one observation, **also during the recovery's own `wait_load`**, so a
 rank that dies on load fails the attempt with its real category instead of
@@ -137,11 +137,53 @@ running **and** the canary outstanding ≥ 60 s while `/health` answers 200 — 
 observations) and `canary_timeout` (two consecutive timeouts on a proven
 engine, regardless of whether `/health` answers — a hung API process is exactly
 the case; exempt only while a **fresh** `/metrics` sample shows the counters
-moving: a saturated scheduler starving a 4-token probe is not a wedge). The
-canary counters reset whenever the head's `started_at` changes, so timeouts
-accumulated during a load never confirm against the head that just finished
-loading. The confirmed category is published as its state (WEDGED / DOWN)
-before RECOVERING, so the log always reads DETECT → CONFIRM → RECOVERING.
+moving: a saturated scheduler starving a 4-token probe is not a wedge),
+`canary_http_error` (three consecutive canary probes the engine *answered*
+with an error — a 5xx, an error chunk, a stream without a terminal chunk —
+on a proven engine whose `/health` was 200 when each probe started; errors
+are answers, so the saturation exemption does not apply) and the bound on
+the in-between: a proven engine that has failed every canary for
+`CANARY_FAIL_DEGRADED_MAX_S=120` while `/health` answers 200 is confirmed a
+wedge under the last failure's kind. The canary counters reset whenever the
+head's `started_at` changes, so timeouts accumulated during a load never
+confirm against the head that just finished loading. The confirmed category
+is published as its state (WEDGED / DOWN) before RECOVERING, so the log
+always reads DETECT → CONFIRM → RECOVERING.
+
+**One non-budgeted rule: a head restarted by someone else is re-paired**
+(added 2026-09-12 after drill 5, commit `6a667f6`). Docker's
+`restart: unless-stopped` brings a head whose API process died back within
+seconds — faster than the two observations `head_api_dead` needs — and an
+operator's bare `docker restart` does the same. The new head is a new
+process group; the worker is still joined to the old one and waits at the
+wrong rendezvous. When the head's `started_at` moves without the controller
+having moved it, and the sentinel had reported the rank joined to the
+previous head or the worker container is older than the new head, the
+controller takes the lock, opens (or continues) an incident with category
+`head_restarted_externally`, captures diagnostics, and sends the sentinel
+one `POST /restart` for the **worker** — no head restart, no budget spent,
+one attempt per head incarnation — then runs the readiness sequence on the
+pair. `/state` shows STARTING with `head restarted outside the controller;
+re-pairing the worker`, `recovery.external_repair{outcome, detail,
+head_started_at}` and `recovery.head_start_origin: external`; the metric is
+`techsara_vllm_recovery_attempts_total{outcome="repaired_worker"}`. A
+refused or unreachable sentinel is recorded, not retried: rank 1 then stays
+with the previous head until the worker's last-resort healthcheck tier or an
+operator restarts it. Measured: 767 s to READY without the rule (the first
+drill-5 run, `.runtime/drills/20260912T095548Z/`), 165 s and 161 s with it
+(drill 6 and the drill-5 re-run).
+
+**What the wedge rule cannot see (observed 2026-09-12 09:04–09:16Z,
+`INCIDENT-2026-09-11-vllm.md` §7.2).** Rule 5's exemption assumes a long
+prefill moves `prompt_tokens_total`. On this build one ~950K-token request
+prefilling alone moved neither counter for 680 s (Prometheus:
+`vllm:prompt_tokens_total` flat 09:03–09:15Z, then +950,436 at once when the
+prefill finished, while `vllm:kv_cache_usage_perc` rose 0.088 → 0.557); the canary timed out 12
+times behind it; the controller confirmed WEDGED and attempted a recovery,
+which only the spent budget refused. A legitimate single long prefill is
+indistinguishable from a wedge by the counters the controller reads today.
+Open; the fix belongs to the controller (a controller-visible "long prefill
+in progress" signal, or a different bound when exactly one request runs).
 
 **The choreography**, every step written to `/state` (`.recovery.step`) and
 logged with the incident id:
@@ -161,11 +203,21 @@ mark_ready     lock released; cooldown 120 s armed; READY; recovery_duration mea
 resume_queued  the orchestrator resumes every durably queued generation exactly once (§4, §5)
 verify         three consecutive canary successes → incident.ended_at — whenever an incident is
                open, not only after a controller-driven success (self-heal, operator restart)
+
+the external-restart branch (head started_at moved, not by the controller):
+repair         lock; incident head_restarted_externally; capture; sentinel POST /restart (worker only);
+               STARTING with the re-pair reason; then canary → mark_ready → resume_queued → verify as above;
+               budget untouched; counted as attempts_total{outcome="repaired_worker"}
 ```
 
 Worker first because of §1: a worker restarted first is already waiting at the
 rendezvous when the new head arrives; on 2026-09-11 the worker instead joined
-the *old* head's TCP store and was reset, twice.
+the *old* head's TCP store and was reset, twice. On 2026-09-12 the drills
+measured the choreography on candidate B with warm kernel caches: READY
+188 / 186 / 180 s after three manual `POST /recover` (drill 16), 176 s after a
+killed worker rank (drill 3, detection 6 s), 172 s after a killed EngineCore
+(drill 4, detection 4 s); the worker container started 0.3–3 s before the
+head every time (`RUNBOOK.md` §12.1).
 
 **The lock.** One `flock` on the host file `.runtime/locks/engine-recovery.lock`
 (bind-mounted into the controller at `/run/techsara/locks`; created as the
@@ -221,8 +273,13 @@ is spawned. Measured on the same image: 18.3 s held → 1.28 s. On 2026-09-11 th
 volume at `/root/.cache/vllm` and `/root/.cache/flashinfer` (`vllm-kernel-cache`
 on the head project, `sf-local-ai-worker_kernel-cache` on the worker), so a
 recovery reuses the validated torch.compile / FlashInfer JIT artefacts instead
-of recompiling them (cold compile measured 50 s; a FlashInfer GDN JIT is
-longer — it is part of every reload's cost otherwise). A stale or broken cache
+of recompiling them (cold compile measured 50 s on the pinned build; on
+candidate B, 2026-09-12: `torch.compile took 20.56 s` and `init engine …
+61.28 s` on the first start, **4.96 / 3.27 / 4.94 s** and **27.2 / 28.8 /
+26.7 s** on the restarts that followed, the FlashInfer autotuner reporting
+`Config cache hit` — `.runtime/incidents/20260912T08{45,50,55}*/head-logs-1.txt`;
+the SM120 GDN prefill kernel itself is still compiled in memory on every rank
+start, `CANDIDATE-B.md` §8.3). A stale or broken cache
 shows as `cold_start_timeout` or a compile-error signature in the head log
 (`torch._dynamo`, `flashinfer.jit`, `nvcc`, `cuda_nvrtc`); the controller
 never deletes a cache — `scripts/cluster-recover.sh --clear-kernel-cache`

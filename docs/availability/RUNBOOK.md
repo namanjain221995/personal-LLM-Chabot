@@ -350,7 +350,11 @@ ls -l .runtime/locks/            # the lock file must be openable by the checkou
 head is a new `torch.distributed` process group; the running worker is still
 in the old one, joins the old head's TCP store, and is reset when that head
 dies (2026-09-11 22:21:10 → 22:22:44: two worker restarts, one wasted
-rendezvous). Nor `scripts/cluster-worker.sh restart` alone: the head loses rank
+rendezvous). Since 2026-09-12 (`6a667f6`) the controller copes: it sees the
+head's `started_at` move, re-pairs the worker through the sentinel and runs
+the readiness sequence (§12; drill 6: READY 165 s after the bare restart) —
+still a reload nobody is answered during, and still not a procedure. Nor
+`scripts/cluster-worker.sh restart` alone: the head loses rank
 1, hangs its next collective, and only vLLM's 300 s
 `VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS` ends it. Nor anything while `.recovery.in_progress`
 is `true` or the lock is held. Nor a restart of the orchestrator to "clear"
@@ -399,7 +403,16 @@ generation_id`, the one-message-per-generation index, the compare-and-swap in
 did not get to (the wait expired, the orchestrator restarted) are taken by the
 **resume sweep** when the controller reports READY and at orchestrator
 start-up, under a lease, exactly once; a durable answer found first is
-replayed instead of re-generated.
+replayed instead of re-generated. The sweep's rules as implemented
+(`continuity.py`, module docstring): a `queued` row is resumed **whatever its
+age** (a parked request is a promise); an `interrupted` row is resumed only
+within `LLM_RESUME_MAX_AGE_S=3600` of its `created_at` — the moment the send
+was accepted, not the interruption; an `interrupted` attempt that had
+**already streamed tokens is never re-run** — the partial the person read
+stays, the row is settled `failed` with `The answer was interrupted after it
+had started; what was written is kept above. Retry to ask again.` (or `… and
+could not be resumed. …` when no partial exists), so a person may retry. Two
+sweep triggers never drop each other.
 
 **Watch it.**
 
@@ -488,6 +501,57 @@ reports, or acts only on that actor's instruction, or waits for its lock.
 | the orchestrator | open/close its breaker, queue and resume requests | touch any container | continuously |
 | a person | everything above through the scripts | `docker restart` / `docker compose up` on `vllm` or `vllm-worker` by hand | after reading `/state` |
 
+**A head restarted by someone else is re-paired, not restarted again** (rule
+added 2026-09-12 after drill 5, commit `6a667f6`; CONTRACT §6.3). When the
+head's `started_at` moves and the controller did not move it — Docker's
+`restart: unless-stopped` after the API process died, or an operator's bare
+`docker restart` — the controller does **not** open a budgeted pair recovery.
+It takes the lock, records the incident with category
+`head_restarted_externally`, and asks the sentinel (`POST /restart`) to
+restart the **worker** so a fresh rank 1 waits at the new head's rendezvous;
+the head is left alone; the budget is untouched; the outcome is published as
+`recovery.external_repair` in `/state` and counted as
+`techsara_vllm_recovery_attempts_total{outcome="repaired_worker"}`. The state
+reads STARTING with the reason `head restarted outside the controller;
+re-pairing the worker` until the readiness sequence passes. Before this rule
+the new head waited at the rendezvous for a worker still joined to the old
+head, and only the two last-resort healthcheck tiers ended it: 767 s to READY
+in the first drill-5 run of 2026-09-12 (`.runtime/drills/20260912T095548Z/`).
+After it: 165 s (drill 6) and 161 s (drill 5 re-run). If the sentinel refuses
+or is unreachable the controller records that outcome (`refused`,
+`unreachable`) and logs that rank 1 stays paired with the previous head until
+the worker's last-resort tier or an operator restarts it. When another actor
+holds the engine lock at that moment (`scripts/cluster-recover.sh --force`,
+`cluster-up.sh`, a deploy) the controller records `lock_held` and leaves the
+pair to that actor — the rule never races a restart in progress.
+
+### 12.1 Drills of 2026-09-12 — the evidence
+
+All records are under `.runtime/drills/<utc>/` in the deploy checkout
+(gitignored; each prints UTC and IST) with the wrapper logs in
+`.runtime/logs/drill*.log`. All on candidate B (`sha256:819ec9c0…`), warm
+kernel caches after the first start of 08:39:59Z. "Detection" = the break
+to the controller leaving READY; "READY" = the break to READY through the
+full readiness sequence.
+
+| Drill | Record (`.runtime/drills/…`) | Verdict on file | Detection | READY | Notes |
+|---|---|---|---|---|---|
+| 16 three coordinated restarts (`POST /recover`) | `20260912T084519Z/drill-16-tp2-repeated-startup.log` | PASS 19/0 | — | 188 / 186 / 180 s | worker 2–3 s before the head each time; GDN line on both ranks each time; `torch.compile` 4.96 / 3.27 s on the reuse starts vs 20.56 s cold; budget 0/3 left at 08:58:39Z |
+| 3 `kill -9 VLLM::Worker_TP1` | `20260912T094545Z/drill-3-kill-worker-rank-process.log` | 11 pass / 1 fail | 6 s, `worker_rank_dead` | 176 s | worker container restarted 7 s after the kill; worker before head; the FAIL is the verify script's exit status: the since-boot Xid baseline (2 per node all day) plus, from this drill on, one fault-pattern line in the worker's retained log (`died unexpectedly`, the killed rank's own aftermath); re-baselined in `e3faf59` |
+| 4 `kill -9 VLLM::EngineCore` | `20260912T095049Z/drill-4-kill-head-enginecore.log` | 11 pass / 1 fail | 4 s, `head_engine_dead` | 172 s | same baseline FAIL |
+| 5 `kill -9` the head API, first run | `20260912T095548Z/drill-5-kill-head-api.log` | 14 pass / 5 fail | 5 s | **767 s** | the finding: Docker restarted the head in 5 s, the controller did not re-pair the worker; the two last-resort tiers ended it (head 10:01:23Z, worker 10:06:06Z). Fixed in `6a667f6` |
+| 15 / 14 on it | `20260912T095548Z/drill-5-chat-{a,b}.json` | (in the record) | — | — | both chats 200 after 779.9 / 774.9 s; sentence read; same generation (143 chars) after READY; `llm_queued_generations` stayed 1 after the resume — fixed in `6a667f6`; one assistant row for the intent sent twice |
+| 6 bare `docker restart -t 10` of the head | `20260912T104332Z/drill-6-restart-head-only.log` | 5 pass / 1 fail | 3 s | 165 s | worker re-paired in 12 s; no second head restart; the FAIL is the baseline |
+| 5 re-run after `6a667f6` | `20260912T104624Z/drill-5-kill-head-api.log` | 17 pass / 2 fail | 5 s | 161 s | STARTING, `re-pairing the worker`; worker restarted 11 s after the new head; `head_restarted_externally`, budget 3/3; the FAILs are the drill's own RECOVERING barrier (made a pass in `e3faf59`) and the baseline |
+| 15 / 14 on the re-run | `20260912T104624Z/drill-5-chat-{a,b}.json` | (in the record) | — | — | both chats 200 after 174.8 / 169.9 s; sentence read; same generation (130 chars) after READY; queue drained to 0 within 60 s; one assistant row |
+
+Not run: drills 1, 2 (monitoring-only), 7 (worker-only restart), 8, 9
+(network, manual), a wait forced past `LLM_QUEUE_MAX_WAIT_S`, the two-request
+admission test. No drill was re-run after `e3faf59`, so the verdicts on file
+are as listed. The wedge rule's behaviour under the ~950K needle
+(WEDGED 09:04–09:16Z, restart refused only by the spent budget) is
+`INCIDENT-2026-09-11-vllm.md` §7.2 and §17 `#wedged` below.
+
 How to see that the rule holds: after any recovery, `RestartCount` moved by
 exactly one on each container (`docker inspect sf-local-ai-vllm-1 --format
 '{{.RestartCount}} {{.State.StartedAt}}'`; worker via `scripts/cluster-status.sh`),
@@ -550,6 +614,21 @@ scheduled change window ([`CANDIDATE-B.md`](CANDIDATE-B.md),
 batched-token knobs, then Track A `--moe-backend flashinfer_b12x` fifth — run
 one variable at a time after it). This section is the switch itself; the
 verdict is the soak's.
+
+**Executed 2026-09-12 08:39Z** (`.runtime/logs/techsara-up-candidateB-20260912T0839Z.log`):
+`MAIN_MODEL_IMAGE=vllm/vllm-openai@sha256:819ec9c0…` (image ID `5a0f8b91…`
+on both nodes, `cluster-sync` 13 pass), `CLUSTER_GDN_PREFILL_BACKEND=flashinfer`,
+`VLLM_USE_V2_MODEL_RUNNER=0` and `VLLM_ALLREDUCE_USE_FLASHINFER=0` in
+`.runtime/engine.env` (2 variables, sha256-matched on the worker), the
+kernel-cache volume created on the worker, one pair reload: worker 08:39:29Z,
+head 08:39:59Z, `Application startup complete` 08:43:45Z (≈ 3 m 46 s; the
+launcher counted `ready after 229s`), the GDN line on both ranks at 08:41:04Z.
+Step 4 passed (verify probe 23/2, the 2 = the Xid baseline). The A/B matrix
+is in `ab/compare-A-vs-B-20260912.md`; the 120-min soak started 10:50Z and is
+in progress at the time of writing (result appended by the lead); the 48–72 h
+canary is **still unproven**; the secondary tests are not run. Production
+runs B now; the pinned digest `24f2f897…` is the rollback (step 5), cached on
+both nodes.
 
 1. **Before.** READY, `incident: null`, lock free (§1, §9), the 120-min soak
    baseline for the pinned build recorded, and the rollback insurance in
@@ -715,6 +794,20 @@ receiver.
   §9, `scripts/cluster-recover.sh` (or `--force` when it stood down).
 - **Page:** if WEDGED persists > 5 min with `in_progress: false`, or the
   category is `budget_exhausted`.
+- **Known false positive (2026-09-12 09:04–09:16Z,
+  `INCIDENT-2026-09-11-vllm.md` §7.2):** one ~950K-token prompt prefilling
+  alone. Neither token counter moves during a single long chunked prefill
+  on this build, the canary queues behind it, and the rule confirms a wedge;
+  the restart was refused only because the budget was spent. Before acting
+  on WEDGED with `.signals.engine.requests_running == 1`, read
+  `curl -s http://127.0.0.1:8000/metrics | grep -E '^vllm:(num_requests_running|prompt_tokens_total|kv_cache_usage_perc)'`
+  twice, 30 s apart: a rising `kv_cache_usage_perc` with one request running
+  is a prefill in progress, not a wedge (Prometheus, 09:03–09:15Z:
+  `prompt_tokens_total` flat at 694,469 while `kv_cache_usage_perc` rose
+  0.088 → 0.557; the prompt is counted only when its prefill finishes) — do
+  not `--force`; wait for it
+  (≈ 13 min at 950K) or cancel the request at its client. Owner of the fix:
+  the controller workstream.
 
 ### <a id="primary-down"></a>VllmPrimaryDown (critical)
 
@@ -1186,17 +1279,18 @@ From `ADR-0002-high-availability.md` ("Follow-ups"), owned there; listed here so
 the runbook says what it cannot do yet:
 
 1. **The fault class is open in every released vLLM build**
-   (`VLLM-UPGRADE-RESEARCH.md`): production stays pinned on `sha256:24f2f897…`;
-   the cached `nightly` images contain no fix and are not to be deployed. In a
-   scheduled change window, each gated by the 120-min soak and §6.4 of the
-   research report, run one variable at a time by `scripts/cluster-ab.py` and
-   recorded in `CANDIDATE-B.md`: **first, Track B** — the post-`f6326f5`
-   candidate (`nightly-385dce36…`) with `--gdn-prefill-backend flashinfer` on
-   both ranks (§14); **then the secondary tests** `--max-num-partial-prefills 1`,
-   `--max-long-partial-prefills 1`, `--max-num-batched-tokens 4096` vs `8192`,
-   `--max-num-seqs 10` vs default, and **fifth, Track A** `--moe-backend
-   flashinfer_b12x`. The class counts as closed only after ≥ 7 days of
-   production with no controller incident of category ≠ `none`.
+   (`VLLM-UPGRADE-RESEARCH.md`). **Track B is deployed** (2026-09-12 08:39Z,
+   §14): the post-`f6326f5` candidate (`nightly-385dce36…`, `sha256:819ec9c0…`)
+   with `--gdn-prefill-backend flashinfer` on both ranks; the A/B matrix passed
+   its criteria (`CANDIDATE-B.md` §6.4); the 120-min soak is in progress; the
+   promotion decision is taken after the **48–72 h canary**, which has not
+   started. Rollback is the pinned digest `sha256:24f2f897…`, cached on both
+   nodes (§14 step 5). Then the secondary tests, one variable at a time by
+   `scripts/cluster-ab.py`: `--long-prefill-token-threshold` + the LONG lane,
+   `--max-num-batched-tokens 4096` vs `8192`, `--max-num-seqs 10` vs default,
+   and **fifth, Track A** `--moe-backend flashinfer_b12x`. The class counts as
+   closed only after ≥ 7 days of production with no controller incident of
+   category ≠ `none`.
 2. **Router to the worker** (≈ 22 GiB off the head). Memory only; a separate
    change window.
 3. **Option C hardware** (two more DGX Sparks, two TP=2 replicas of the same
@@ -1208,7 +1302,11 @@ the runbook says what it cannot do yet:
    are in `../ISSUE/interview-analysis-client/`.
 
 Also open, from the incident report: no Alertmanager or notification channel
-(needs credentials — every alert fires to nobody); `SLO.md` §5 and §6 to be
-filled from the drills (`scripts/recovery-tests/engine_failure_drills.sh
---list`) and the soak; drills 8 and 9 (network blips) are manual procedures
-printed by the drill script and need a person at the worker's console.
+(needs credentials — every alert fires to nobody); **the wedge rule under a
+long solo prefill** (`INCIDENT-2026-09-11-vllm.md` §7.2: the token counters do
+not move during a single ~950K prefill, the controller called it WEDGED, and
+only the spent budget stopped a pair restart — owner: controller); drills 1,
+2 and 7 and a forced wait past `LLM_QUEUE_MAX_WAIT_S` not run (§12.1); the
+`DUPLICATES`/`LOST`/`ANOTHER MODEL` SQL of §10 not run against production
+today; drills 8 and 9 (network blips) are manual procedures printed by the
+drill script and need a person at the worker's console.

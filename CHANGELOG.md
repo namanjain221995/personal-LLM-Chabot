@@ -14,12 +14,17 @@ five independent delays it names are what this entry removes. The fault
 itself is not fixed here: `docs/availability/VLLM-UPGRADE-RESEARCH.md`
 establishes that **no released vLLM build closes the class** (upstream #49926
 and #37431 reproduce the same signature on this model and GPU on every build
-from 0.23 to 0.28.1, with and without MTP, prefix caching or CUDA graphs), so
-production stays pinned on `sha256:24f2f897…` and the one candidate — the
-post-`f6326f5` build with `--gdn-prefill-backend flashinfer`, then the
-secondary engine knobs one at a time, Track A `flashinfer_b12x` fifth — waits
-for a change window, the A/B harness and the 120-min soak
-(`docs/availability/CANDIDATE-B.md`).
+from 0.23 to 0.28.1, with and without MTP, prefix caching or CUDA graphs).
+What could be done the same day was: the controller, the sentinel and the
+orchestrator's continuity went to production at 08:29Z; the one engine
+candidate — the post-`f6326f5` build with `--gdn-prefill-backend flashinfer`
+on both ranks — followed at 08:39Z after the A/B matrix on the production
+image, and is under the 120-min soak as this is written; the drills were run
+against the live pair and one of them found a hole, fixed before the day was
+out (below). The 48–72 h canary that decides the candidate's promotion has
+not started: the class is **still unproven** closed, and the pinned digest
+`sha256:24f2f897…` stays cached on both nodes as the rollback
+(`docs/availability/CANDIDATE-B.md` §6.5).
 
 **One model answers, and nothing stands in for it.** The product requirement
 that shaped this round (`docs/availability/CONTRACT.md` v2, strict one-model
@@ -92,7 +97,9 @@ crash report while the executor waited to reap a child that had not exited;
 Measured on the same image and a 1.5 GB heap: **18.3 s held with unlimited,
 1.28 s with `core: 1`**, no report. `ulimits: core: {soft: 1, hard: 1}` is now
 on the head, the worker, the router and the OCR engine (`compose/*.yaml`); it
-takes effect when each container is next created (the first `--full` deploy).
+took effect on the head and the worker with the pair reload of 2026-09-12
+08:39Z (drill 3's killed rank was reaped and its container restarted within
+7 s, no apport hold), and on the router and OCR when they are next created.
 
 **The orchestrator stops sending people into a dead port, keeps every request
 that arrives while the pair reloads, and resumes it on the same generation.**
@@ -177,6 +184,68 @@ boot and host recovery, and the twelve deployment steps mapped onto
 define, so an orphaned controller cannot keep restarting the pair beside the
 restored watchdog.
 
+**What the live drills of 2026-09-12 measured** (records under
+`.runtime/drills/<utc>/` in the deploy checkout; `docs/availability/RUNBOOK.md`
+§12.1 and `SLO.md` §5–§6 carry every number with its source). Three
+coordinated restarts through `POST /recover`: READY **188 / 186 / 180 s**
+after each request, the worker restarted 2–3 s before the head every time,
+the FlashInfer GDN line on both ranks every time, the compiled-kernel caches
+reused (`torch.compile` 20.56 s on the first start of the new build, then
+4.96 / 3.27 s; `init engine` 61 s, then 27–29 s). A killed worker rank:
+detected in **6 s**, READY in **176 s**. A killed head EngineCore: **4 s**,
+**172 s**. A bare `docker restart` of the head by hand: seen in 3 s, the
+worker re-paired in 12 s, READY in 165 s. A request sent twice during the
+outage with one `intent_id`: HTTP 200 for both, the sentence *Main model is
+recovering—your request is safely queued.* read, one assistant message, the
+same generation completed on the primary with its first token after READY,
+`llm_queued_generations` back to 0 within 60 s. Not run today: the
+monitoring-only drills 1 and 2, the worker-only restart (drill 7), the
+network blips (8, 9), a wait forced past `LLM_QUEUE_MAX_WAIT_S`, the
+two-request admission-lane test; the exactly-once SQL was not run against
+production.
+
+**The drill that failed, and what it fixed the same day.** Killing the head's
+API process (drill 5, first run 09:55Z) took **767 s** to READY, not the
+≈ 3 min of every other drill. Docker's restart policy brought the head back
+in 5 s — faster than the controller's two-observation `head_api_dead` rule —
+and the controller went STARTING **without re-pairing the worker**, which was
+still joined to the old head's process group; the new head waited at the
+rendezvous until the two last-resort healthcheck tiers killed the head again
+(10:01Z) and then the worker (10:06Z). The queued request survived it (both
+chats answered after 780 s, one assistant message) and `llm_queued_generations`
+stayed at 1 after the resume. Both are fixed in commit `6a667f6`: a head whose
+`started_at` moved without the controller is re-paired at once — the worker
+restarted through the sentinel, no head restart, no budget spent, category
+`head_restarted_externally`, counted as `repaired_worker` — and the queue
+gauge drains after a resume or a Stop; the re-run at 10:46Z reached READY in
+**161 s** with the worker re-paired 11 s after the new head. Commit `e3faf59`
+made the drills read that shape as a pass and stopped the verify probe failing
+on the kernel's since-boot Xid count (2 per node all day; a drill now asserts
+no *new* Xid). A second finding is open: under the A/B's ~950K-token needle
+the controller confirmed WEDGED (neither token counter moves during one long
+chunked prefill on this build, and the 4-token canary queues behind it) and a
+pair restart was refused only because the drills had spent the hourly budget
+minutes before — the same design flaw that made the old shell watchdog
+restart the head under the A-baseline needle at 01:20Z that morning
+(`INCIDENT-2026-09-11-vllm.md` §7). Owner: the controller workstream.
+
+**Candidate B in production, measured.** `vllm/vllm-openai@sha256:819ec9c0…`
+(image ID `5a0f8b91…` on both nodes) with `--gdn-prefill-backend flashinfer`,
+`VLLM_USE_V2_MODEL_RUNNER=0` and `VLLM_ALLREDUCE_USE_FLASHINFER=0` on both
+ranks, `ulimits core: 1` and the kernel-cache volumes in force from its first
+start (worker 08:39:29Z, head 08:39:59Z, API accepting 08:43:45Z). The A/B
+matrix (`docs/availability/ab/compare-A-vs-B-20260912.md`, same harness and
+seed on both images): B **0 failed requests, 0 Xid, 0 restarts** over 11
+phases; the ~950K needle 3/3 (949,9xx tokens, 1,189 tok/s prefill, 799 s);
+`mixed` 10 min at c=10 **692 vs 550** requests; c16 306.7 vs 269.6 tok/s;
+c10 TTFT p95 0.32 vs 0.60 s; 32K prefill 8.6K vs 7.8K tok/s; 128K 5.2K vs
+5.0K tok/s (TTFT 25.0 vs 26.3 s, the ≤ 1.3 × criterion); one 2.8 s
+inter-token stall in `c10_short` on B. A's 950K figure does not exist: the
+shell watchdog restarted the head under it at 01:20Z. The 120-min soak
+(`scripts/cluster-soak.py --minutes 120 --concurrency 10`) started 10:50Z and
+is in progress at the time of writing; its result is appended by the lead.
+The secondary engine knobs and Track A are not run.
+
 **Files.** New: `monitoring/engine-controller/{controller.py,sentinel.py,common.py,README.md,tests/}`,
 `orchestrator/app/{breaker,engine_state,continuity,admission}.py` and their
 test files, `orchestrator/tests/test_generation_durability.py`,
@@ -184,8 +253,9 @@ test files, `orchestrator/tests/test_generation_durability.py`,
 `scripts/recovery-tests/engine_failure_drills.sh`, `scripts/cluster-ab.py`,
 `scripts/cluster-cpu.sh`, `monitoring/prometheus/tests/{alerts,recording}_availability.yml`,
 `docs/availability/` (CONTRACT, INCIDENT, ADR-0002, SLO, MEMORY-BUDGET,
-RUNBOOK, ARCHITECTURE, CANDIDATE-B, REVIEW-MANIFEST, REVIEW-FINDINGS-round1,
-VLLM-UPGRADE-RESEARCH, README). Deleted: `orchestrator/app/fallback.py` and
+RUNBOOK, ARCHITECTURE, CANDIDATE-B, REVIEW-MANIFEST, REVIEW-FINDINGS-round1
+and -round2, VLLM-UPGRADE-RESEARCH, README, `ab/` — the A/B runs and the
+comparison). Deleted: `orchestrator/app/fallback.py` and
 its tests, the `vllm-watchdog` service. Changed: `compose/compose.dgx-spark.yaml`
 (watchdog → controller, `ulimits`, the kernel-cache volume),
 `compose/compose.cluster-dgx-spark.yaml` (head API URL, healthcheck tier),
@@ -196,18 +266,25 @@ its tests, the `vllm-watchdog` service. Changed: `compose/compose.dgx-spark.yaml
 `scripts/{cluster-up,cluster-down,cluster-status,cluster-sync,cluster-doctor,monitoring,deploy}.sh`,
 `monitoring/prometheus/{prometheus.yml,rules/alerts.yml,rules/recording.yml}`,
 both Grafana dashboards, `docs/MONITORING.md`, `docs/CLUSTER.md`, `.env.example`.
-Test counts for this entry are reported per workstream in the pull request
-(controller, orchestrator availability + durability, launcher, promtool,
-shellcheck); an empty run, a timeout or a skip is not a pass.
+Test counts: controller `python3 -m pytest monitoring/engine-controller/tests
+-q` → 125 passed (75 s); `promtool check rules` → 49 alert + 36 recording
+rules; `promtool test rules` on the two availability test files → SUCCESS,
+SUCCESS (all 2026-09-12, exit 0); the orchestrator availability + durability,
+launcher and `shellcheck` counts are reported by the lead in the pull request.
+An empty run, a timeout or a skip is not a pass.
 
-**Targets** (`docs/availability/SLO.md`; measured by the drills, not assumed;
-the acceptance checklist is §6 there): rank death → state ≠ READY in ≤ 30 s
-(was 5 min 03 s); dead rank reaped in ≤ 10 s (was 4 min 51 s); a request
-arriving during the outage accepted and told the truth ≤ 10 s after detection,
-resumed on the same generation ≤ 30 s after READY (was: lost); primary READY
-again — proven by the readiness sequence — ≤ 6 min warm (was 11 min 00 s);
-zero requests lost, duplicated, or answered by another model; zero false-UP
-minutes; zero false-DOWN minutes from missing data alone.
+**Targets and what was measured** (`docs/availability/SLO.md` §2, §5; the
+acceptance checklist with a status per row is §6 there): rank death → state
+≠ READY in ≤ 30 s — **6 s** (was 5 min 03 s); dead rank reaped in ≤ 10 s —
+the worker container restarted **7 s** after the kill, no apport hold (was
+4 min 51 s); a request arriving during the outage accepted and told the
+truth, resumed on the same generation after READY — **yes, twice** (was:
+lost); primary READY again, proven by the readiness sequence, ≤ 6 min warm —
+**161–188 s** (was 11 min 00 s); zero requests lost, duplicated or answered
+by another model in the drills (the SQL over production not run today);
+false-UP minutes zero; one false-not-serving window of 11 min 45 s under a
+long solo prefill (open). Still unproven: seven clean production days, and
+the 48–72 h canary of candidate B.
 
 ## Artifact Studio 2: CSV, the file card, generated and pasted data, and the requests that went wrong (2026-09-12)
 

@@ -108,27 +108,94 @@ for it while it reloads):
    `cluster-doctor.sh` false-FAIL fix; the launcher generates `ENGINE_HEAD_API_URL` and
    `ENGINE_CONTROLLER_URL` from the real bind address and layout; compiled-kernel cache volumes
    on both ranks (`/root/.cache/vllm`, `/root/.cache/flashinfer`).
-7. **Candidate B plan** (`docs/availability/CANDIDATE-B.md`, `scripts/cluster-ab.py`,
-   `scripts/cluster-cpu.sh`): the post-`f6326f5` build (`nightly-385dce36…`, the first with the
-   FlashInfer SM120 GDN prefill kernel) with `--gdn-prefill-backend flashinfer` on both ranks
-   (`MAIN_MODEL_IMAGE`, `CLUSTER_GDN_PREFILL_BACKEND`) is evaluated **first**, one variable at a
-   time, behind the 120-min soak and the research report's §6.4 criteria; then the secondary
-   engine knobs (`--max-num-partial-prefills 1`, `--max-long-partial-prefills 1`,
-   `--max-num-batched-tokens 4096` vs `8192`, `--max-num-seqs 10`) and, fifth, Track A
-   `--moe-backend flashinfer_b12x`. Seven clean production days before the class is called closed.
+7. **Candidate B — deployed to production 2026-09-12 08:39Z** (`docs/availability/CANDIDATE-B.md`,
+   `scripts/cluster-ab.py`, `scripts/cluster-cpu.sh`): the post-`f6326f5` build
+   (`nightly-385dce36…`, image `vllm/vllm-openai@sha256:819ec9c0…`, image ID `5a0f8b91…` on both
+   nodes) with `--gdn-prefill-backend flashinfer` on both ranks (`MAIN_MODEL_IMAGE`,
+   `CLUSTER_GDN_PREFILL_BACKEND`), `VLLM_USE_V2_MODEL_RUNNER=0` and
+   `VLLM_ALLREDUCE_USE_FLASHINFER=0` in both ranks' process environment (`.runtime/engine.env`,
+   2 variables, sha256-matched on the worker), `ulimits core: 1` and the kernel-cache volumes in
+   force from this start. Both ranks logged `Using FlashInfer GDN prefill kernel
+   (requested=flashinfer, head_k_dim=128).` on the first start (08:41:04Z, `Worker_TP0` and
+   `Worker_TP1`) and on every restart a record captured (drill 16 × 3, drills 3 and 6; §5,
+   `CANDIDATE-B.md` §6.3). The A/B matrix is measured (§5); the 120-min
+   soak is in progress at the time of writing; the 48–72 h canary is **still unproven**. The
+   secondary engine knobs (`--long-prefill-token-threshold` + the LONG lane,
+   `--max-num-batched-tokens 4096` vs `8192`, `--max-num-seqs 10`, then Track A
+   `--moe-backend flashinfer_b12x` fifth) are not run. Seven clean production days before the
+   class is called closed. Record: `.runtime/logs/techsara-up-candidateB-20260912T0839Z.log`.
 8. Docs: `CONTRACT.md` v2, `ADR-0002`, `SLO.md` (SLO B = request continuity availability; the
    acceptance checklist), `MEMORY-BUDGET.md`, `RUNBOOK.md`, `ARCHITECTURE.md`, `docs/MONITORING.md`,
    this report.
 
 Not done here, tracked: a released vLLM build that closes the fault class does not exist
-(`VLLM-UPGRADE-RESEARCH.md`) — Candidate B needs a change window; router-to-worker (memory
-only); no Alertmanager/notification channel (needs credentials); the second tenant's client-side
-patches are the owner's call; Option C (+2 Sparks) is the only way to serve answers *during* a
-reload.
+(`VLLM-UPGRADE-RESEARCH.md`) — Candidate B is deployed and under soak, its promotion decision
+waits for the 48–72 h canary; router-to-worker (memory only); no Alertmanager/notification
+channel (needs credentials); the second tenant's client-side patches are the owner's call;
+Option C (+2 Sparks) is the only way to serve answers *during* a reload; drills 1, 2 and 7 and
+a forced wait past `LLM_QUEUE_MAX_WAIT_S` were not run today (§5); the wedge rule's blind spot
+under a long solo prefill (§7.2) is open.
 
 ## 5. Verification
 
-Filled in from the drills and the soak (see `SLO.md` §5 and the pull request): each drill records UTC + IST timestamps, the state transitions observed through `/state`, the time to RECOVERING and to READY, and what happened to the orchestrator request issued during the drill: it must have been accepted, told `Main model is recovering—your request is safely queued.`, and resumed on the **same** generation by the main model once READY (drills 5, 14, 15; the exactly-once SQL of `SLO.md` §3 returning no rows). No drill may show an answer from another model.
+What was deployed and what the live drills of 2026-09-12 measured. Every drill record is under
+`.runtime/drills/<utc>/` in the deploy checkout (gitignored) and prints UTC and IST; the wrapper
+logs are `.runtime/logs/drill*.log`. Prometheus (`127.0.0.1:9090`) holds the controller series
+for the whole day. `SLO.md` §5 carries the same numbers against the objectives; §6 there is the
+acceptance checklist with a status per row.
+
+### 5.1 Deployment, 08:29Z–08:44Z (14:00–14:14 IST)
+
+| UTC | What | Record |
+|---|---|---|
+| 08:29Z | routine `./techsara up` on the availability branch: the running head left untouched (preserve flag; the launcher warned it still ran the pre-controller definition), the worker sentinel shipped and started (`sha256` of `sentinel.py`/`common.py` matched, token equal on both nodes), the engine controller started (code sha `273824e40483`, healthy after 7 s), **the legacy shell watchdog removed** (`sf-local-ai-vllm-watchdog-1`), the orchestrator restarted with continuity, admission and the engine-state client (`healthy/degraded contract verified`) | `.runtime/logs/techsara-up-availability-20260912T0829Z.log` |
+| 08:36:57Z | Prometheus restarted with the new configuration (`process_start_time_seconds{job="prometheus"}`; last successful config load 08:36:59Z): **13 groups / 85 rules** (`availability`, `vllm-availability` 18 alerts, `vllm-state` 5 recording rules among them) | `GET 127.0.0.1:9090/api/v1/rules`, counted 10:53Z; `prometheus_config_last_reload_success_timestamp_seconds` |
+| 08:39Z | **one pair reload onto candidate B**: worker container 08:39:29Z, head 08:39:59Z; `sf-local-ai-worker_kernel-cache` volume created; head log: GDN line 08:41:04Z on both ranks, `Dynamo bytecode transform 6.67 s`, `Compiling a graph … 11.21 s`, `torch.compile took 20.56 s`, CUDA graphs 51 piecewise + 35 full (≈ 10 s), `init engine … 61.28 s`, `Application startup complete` 08:43:45.67Z (**≈ 3 m 46 s** container start → API accepting); the launcher counted `vllm: ready after 229s`; controller healthy 7 s later; verify probe 23 pass / 2 fail (the two fails are the since-boot Xid baseline, 2 per node) | `.runtime/logs/techsara-up-candidateB-20260912T0839Z.log`, `.runtime/incidents/20260912T084520Z/head-logs-1.txt`, `.runtime/incidents/20260911T223140Z-vllm-down/80-verify-engine-B-first-start.txt` |
+
+### 5.2 The drills
+
+All on candidate B, warm kernel caches after the first start. "Detection" is the time from the
+break to the controller leaving READY; "READY" is the time from the break to READY through the
+full readiness sequence (non-streaming, streaming, token progress, both GPUs, rank alive).
+
+| Drill | Record | Detection | READY | What the record shows |
+|---|---|---|---|---|
+| 16 — three coordinated restarts (`POST /recover`, manual) | `20260912T084519Z/drill-16-tp2-repeated-startup.log`, **PASS 19/0** | — | **188 / 186 / 180 s** after each request | worker restarted 2–3 s before the head every time (08:45:33 vs 08:45:36, 08:50:41 vs 08:50:44, 08:55:49 vs 08:55:52); the GDN line on `Worker_TP0` and `Worker_TP1` every time; a real 4-token completion after each; `torch.compile` 4.96 / 3.27 s and `init engine` 27.2 / 28.8 s on the reuse starts (`.runtime/incidents/20260912T085030Z`, `…085538Z` head logs) vs 20.56 / 61.28 s cold; budget 0 of 3 left at 08:58:39Z |
+| 3 — `kill -9 VLLM::Worker_TP1` on the worker | `20260912T094545Z/drill-3-kill-worker-rank-process.log`, 11 pass / 1 fail | **6 s** (`worker_rank_dead`) | **176 s** | worker container restarted 7 s after the kill (09:45:46 → 09:45:53), head 3 s later; worker before head; rank alive; canary TTFT 0.051 s; verify probe: both GPUs 93 % / 91 %. The one FAIL is `cluster-verify-engine.sh --probe` exiting non-zero on its since-boot Xid count (2 per node, unchanged all day) and, from this drill on, one line matching its fault pattern in the worker container's retained log (`died unexpectedly` is in the pattern, `cluster-verify-engine.sh:94`; consistent with the executor logging the rank this drill killed — the captured diagnostics do not show the line, so this is an inference) — re-baselined in commit `e3faf59` |
+| 4 — `kill -9 VLLM::EngineCore` on the head | `20260912T095049Z/drill-4-kill-head-enginecore.log`, 11 pass / 1 fail | **4 s** (`head_engine_dead: /health 503`) | **172 s** | both containers restarted, worker first (09:51:00.45 vs 09:51:00.77); canary TTFT 0.044 s; both GPUs 93 % / 92 %; the same baseline FAIL |
+| 5 — `kill -9` the head's `vllm serve` API, **first run** | `20260912T095548Z/drill-5-kill-head-api.log`, 14 pass / 5 fail | 5 s (DEGRADED 09:55:54Z) | **767 s** | **the finding of the day.** Docker's restart policy brought the head back in 5 s (RestartCount 1); the controller went STARTING and did **not** re-pair the worker, so the new head waited at the rendezvous for a rank still joined to the old head. The head was restarted again at 10:01:23Z (RestartCount 2 — the shape of the head's last-resort healthcheck tier, 8 misses after the start period) and the worker at 10:06:06Z (RestartCount 1, the worker's tier); READY at 10:08:36Z. Fixed the same day: commit `6a667f6`, rule "head restarted externally → worker re-paired" (category `head_restarted_externally`, outcome `repaired_worker`, no head restart, budget untouched) |
+| 15 / 14 on that run | same record, `drill-5-chat-{a,b}.json` | — | — | both `POST /chat` (5 s apart, same `intent_id`) answered HTTP 200 after 779.9 / 774.9 s; the status line `Main model is recovering—your request is safely queued.` was read; the same generation completed (143 chars), first token after READY; `llm_queued_generations` rose (1 at 09:56:15Z) and **stayed 1** after the resume (the second finding, fixed in `6a667f6`); one assistant row for the intent sent twice. The drill's own "sentence not shown" FAIL was an ASCII-escaped em-dash in its grep (fixed in `6a667f6`) |
+| 6 — `docker restart -t 10` of the head by hand, no lock | `20260912T104332Z/drill-6-restart-head-only.log`, 5 pass / 1 fail (baseline) | **3 s** (DEGRADED 10:43:36Z) | **165 s** | the controller re-paired the worker in 12 s (worker restarted 10:43:46Z, `head restarted outside the controller; worker re-paired`), no second head restart (head RestartCount 0, worker 0); both GPUs 93 % / 90 % |
+| 5 — **re-run** after `6a667f6` | `20260912T104624Z/drill-5-kill-head-api.log`, 17 pass / 2 fail | **5 s** | **161 s** | STARTING with `re-pairing the worker` at 10:46:31Z; worker restarted 10:46:39Z, 11 s after the new head; incident `20260912T104339Z` category `head_restarted_externally`, `budget_remaining=3`; the two FAILs are the drill's own barrier (it still expected RECOVERING; the re-pair shape was made a pass in `e3faf59`) and the Xid baseline |
+| 15 / 14 on the re-run | same record | — | — | both chats HTTP 200 after 174.8 / 169.9 s, the sentence read (compared unescaped), the same generation completed (130 chars) after READY, `llm_queued_generations` 1 → **0 within 60 s**, `llm_queue_wait_seconds` count 1 / sum 171.2 s, `llm_resumed_generations_total{outcome="resumed"}` = 1 after the orchestrator restart of 10:42Z; one assistant row for the intent sent twice |
+
+Not run today: drills 1 and 2 (monitoring-only failures), drill 7 (worker-only restart), drills 8
+and 9 (network blips, manual), a wait forced past `LLM_QUEUE_MAX_WAIT_S=900` (the longest wait was
+780 s), the two-request admission-lane test. No drill was re-run after `e3faf59`; the records of
+drills 3, 4, 5 (re-run) and 6 therefore carry a FAIL verdict on their face for the two assertion
+shapes that commit corrected, and the numbers above are read from their PASS lines.
+
+On the "engine=primary" line of drills 15: the drill's chat client records `"engine": null` in
+`drill-5-chat-{a,b}.json` — the terminal frame of a resumed generation carried no `engine` field
+— and the assertion treats an absent field as the primary (`engine_failure_drills.sh:674`). The
+positive proof that no other model answered is that none exists to answer (`fallback.py`
+deleted; `grep -rn fallback orchestrator/app` finds no answer path) and the SQL of `SLO.md` §3,
+which was not run today.
+
+### 5.3 The A/B matrix and the soak
+
+`docs/availability/ab/compare-A-vs-B-20260912.md` and the two SUMMARY files. A (production image
+`24f2f897…`, run `20260912T0514Z`, 10 phases, 856 s) and B (`819ec9c0…`, run `20260912T0859Z`,
+11 phases, 1,639 s), same harness, same seed: B **0 failed requests, 0 Xid, 0 restarts, no
+alarms** over 11 phases; the ~950K needle 3/3 (949,9xx tokens, 1,189 tok/s prefill, 799 s);
+`mixed` 10 min at c=10: **692 vs 550** requests; c16 306.7 vs 269.6 tok/s; c10 TTFT p95 0.32 vs
+0.60 s; 32K prefill 8.6K vs 7.8K tok/s; 128K 5.2K vs 5.0K tok/s (TTFT 25.0 vs 26.3 s = 0.95 ×,
+pass criterion ≤ 1.3 ×); one 2.8 s inter-token stall in `c10_short` on B. A's 950K figure was
+not measured: the old shell watchdog restarted the head under the first A run at 01:20Z (§7.1).
+
+The 120-min soak on B (`scripts/cluster-soak.py --minutes 120 --concurrency 10`, started 10:50Z,
+`.runtime/logs/soak-B-20260912T1050Z.log`) is **in progress at the time of writing; result
+appended by the lead.** The 48–72 h canary has not started: **still unproven.**
 
 ## 6. Remaining risks
 
@@ -142,3 +209,72 @@ Filled in from the drills and the soak (see `SLO.md` §5 and the pull request): 
 - The second tenant calls the raw port and is outside the breaker, the queue and the admission
   lanes; it still sees HTTP 500 / connection refused during a reload.
 - Nothing pages a human: alerts are visible on Prometheus/Grafana only.
+- **Candidate B is 11 clean A/B phases and one drill day old.** The upstream MTBFs are 9–72 h;
+  the soak is in progress and the 48–72 h canary is still unproven. Rollback is §6.5 of
+  `CANDIDATE-B.md` (a pair reload; requests queue meanwhile).
+- **The wedge rule cannot tell a long solo prefill from a wedge** (§7.2): with budget available
+  the controller would have restarted the pair under the ~950K needle. Open, owner: controller.
+
+## 7. Two more events of 2026-09-12, both self-inflicted
+
+### 7.1 01:20:01Z (06:50 IST) — the shell watchdog restarted the head under the A-baseline needle test
+
+Source: `.runtime/incidents/20260911T223140Z-vllm-down/00-TIMELINE.md` (addendum),
+`.runtime/ab/A-baseline-20260912T0109Z/needles.txt`, Prometheus `up{job="vllm-main"}` and
+`process_start_time_seconds{job="vllm-main"}`.
+
+| UTC | IST | Event |
+|---|---|---|
+| 01:12:03 | 06:42:03 | `validate_long_context.py --sizes 32768,131072,262144,950000` against production (the A baseline): 32K 4.9 s, 128K 27.1 s, 262K 83.2 s, needles 3/3 each |
+| ≈01:14 | ≈06:44 | the 950K request (949,915 prompt tokens) submitted while the second tenant had 3–4 requests running: the engine logged `Deferred: 1`, `Running: 3–4, Waiting: 2–4`, 0.2–0.6 tok/s, KV usage 25 % → 38 % over 6 min |
+| 01:17:01 | 06:47:01 | shell watchdog: probe TIMED OUT (120 s) (1/2) — its 2-token probe was queued behind the 950K prefill |
+| **01:20:01** | **06:50:01** | second timeout → `docker restart -t 30 sf-local-ai-vllm-1` (SIGTERM 01:20:02, SIGKILL 01:20:32, new head process 01:20:32Z per `process_start_time_seconds`); the 950K client saw `Server disconnected` at 381.1 s; the tenant's 3 running + 2 waiting requests were killed; `up{job="vllm-main"}` 0 from 01:20:30Z |
+| 01:21:38 | 06:51:38 | the worker's healthcheck restarted the worker (RestartCount 3); re-paired |
+| 01:25 | 06:55 | `up` 1 again; serving |
+
+Impact: one A-baseline measurement lost (A has no 950K figure; the compare table shows `—`),
+the second tenant's five requests failed, ≈ 5 min of no inference at night. Lessons, all folded
+into the programme the same day: (1) "two probe timeouts = hang" cannot distinguish saturation
+from a wedge — the v2 controller's rule 5 exempts a canary that times out while the token
+counters move, bounded by `CANARY_STARVATION_S=300`; (2) a ~950K prefill on this engine takes
+≈ 10–13 min and starves everything else — the reason for the exclusive LONG lane (CONTRACT §6.7);
+(3) never run the 950K test with the shell watchdog armed — it was removed at 08:29Z.
+`CANDIDATE-B.md` §8.2 attributes this kill to the head's healthcheck; the 30 s SIGTERM→SIGKILL gap
+is the watchdog's `docker restart -t 30`, and the timeline addendum is the record.
+
+### 7.2 09:04:15Z–09:16:00Z (14:34–14:46 IST) — the v2 controller called the ~950K needle on B a wedge; only the spent budget stopped a restart
+
+Source: Prometheus `techsara_vllm_state_code`, `techsara_vllm_generation_frozen_seconds`,
+`techsara_vllm_synthetic_probes_total{outcome="timeout"}`,
+`techsara_vllm_recovery_attempts_total{outcome="budget_exhausted"}`,
+`techsara_vllm_last_failure_category`, `llm_breaker_transitions_total` (all queried 10:55Z);
+`docs/availability/ab/B-20260912T0859Z-SUMMARY.md` (`needle_950k`: controller states seen
+`DEGRADED, WEDGED`).
+
+The B matrix's `needle_950k` phase (one request, 949,9xx tokens, 799 s, answered 3/3) ran on an
+otherwise idle engine from ≈09:02Z. vLLM's own counters, as Prometheus scraped them from the
+head (`job="vllm-main"`, 1-min samples): `vllm:prompt_tokens_total` **flat at 694,469 from
+09:03Z to 09:15Z**, then +950,436 at 09:16Z — the whole prompt is counted when the request
+finishes its prefill, not per chunk; `vllm:generation_tokens_total` flat at 22,660;
+`vllm:num_requests_running` 1; `vllm:kv_cache_usage_perc` **rising 0.088 → 0.557** over the same
+minutes (the prefill's real progress); `techsara_vllm_head_metrics_ok` 1 throughout. So neither
+counter the controller reads moved — its `generation_frozen_seconds` climbed from 15 s (09:02Z)
+to 680 s (09:14Z) with 1 request running — and the 4-token canary queued behind the prefill:
+12 consecutive timeouts (09:04Z → 09:16Z).
+The controller went DEGRADED at 09:02:15Z, **WEDGED at 09:04:15Z**, and attempted a recovery;
+the attempt was refused with `budget_exhausted` (counter 0 → 1 at ≈09:05Z,
+`last_failure_category=budget_exhausted`) because drill 16 had spent the 3-per-hour budget at
+08:58:39Z. The pair was **not** restarted; the needle completed; the controller returned to
+DEGRADED at 09:16:00Z and BUSY at 09:16:15Z. The orchestrator's breaker opened on the WEDGED
+verdict at 09:04:30Z and went HALF_OPEN at 09:16:15Z — a person's request in that window would
+have been queued, not lost.
+
+With budget available the controller would have restarted the pair under the needle: the same
+design flaw as §7.1 (a legitimate long prefill is indistinguishable from a wedge by the token
+counters alone), reproduced on the v2 controller. The saturation exemption of rule 5 requires the
+counters to move; on this build they do not move during a single long prefill, while
+`vllm:kv_cache_usage_perc` does. **Open finding,
+owner: controller workstream.** The options are theirs to weigh: a controller-visible signal that
+a long prefill is in progress (the LONG lane's admission, or a per-request progress figure from
+the engine), or a longer bound when exactly one request is running. Until then a >131K prompt through the raw port (the second tenant, the A/B harness) can
+cost a pair restart; the orchestrator's LONG lane sends the same shape.

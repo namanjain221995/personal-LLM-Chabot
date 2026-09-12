@@ -377,6 +377,19 @@ cold-start (`techsara_vllm_cold_start_seconds`).
 
 ### 6.3 Verification after every B start (both ranks)
 
+**Executed 2026-09-12** (the switch: `./techsara up` at 08:39Z under the engine lock,
+`.runtime/logs/techsara-up-candidateB-20260912T0839Z.log` — `cluster-sync` 13 pass, image ID
+`sha256:5a0f8b91…` on both nodes, `engine.env` 2 variables sha256-matched, the worker's
+`kernel-cache` volume created; worker 08:39:29Z, head 08:39:59Z). What each step below returned:
+
+| step | result | record |
+|---|---|---|
+| 1 verify probe | 23 pass / 2 fail on the first start; the 2 = the since-boot Xid baseline (2 per node, unchanged all day); args identical on both ranks, NCCL `Using network IB`, both GPUs 93 % / 92 % | `.runtime/incidents/20260911T223140Z-vllm-down/80-verify-engine-B-first-start.txt` |
+| 2 the kernel line | `(Worker_TP0 pid=508) … 08:41:04 … Using FlashInfer GDN prefill kernel (requested=flashinfer, head_k_dim=128).` and `(Worker_TP1 pid=305) … 08:41:04 …` on the first start; on both ranks on the three drill-16 restarts (the drill greps both ranks: 08:46:17, 08:51:20, 08:56:28), on drill 3's start (09:46:35, both ranks, `…095052Z/head-logs-1.txt` + `worker-diagnostics-1.txt`) and on drill 6's start (10:44:09 / 10:44:10, `…104339Z/*-repair-20260912T104336Z.txt`); no `Falling back` line in any captured log. The pair serving now (head 10:46:27Z) has no captured record of the line — run the §14 grep of `RUNBOOK.md` before relying on it. `VLLM_USE_V2_MODEL_RUNNER=0` in both ranks' environment (`ab/B-meta.json` `engine_env`). CUDA graphs `mixed prefill-decode, PIECEWISE` 51 + `decode, FULL` 35; `speculative_config` absent; `--no-enable-prefix-caching`. The model-runner banner wording, the all-reduce and MoE-backend lines were not asserted from the log today | `.runtime/incidents/20260912T084520Z/head-logs-1.txt`, `worker-diagnostics-1.txt`; `.runtime/drills/20260912T084519Z/` |
+| 3 controller | READY through the readiness sequence after every start (two ≈ 200-token participation probes, head 94 % / worker 92 %); `last_failure_category` after the first start was `none` until drill 16 set `manual` | `curl 127.0.0.1:9838/state`, Prometheus `techsara_vllm_last_failure_category` |
+| 4 repeated TP=2 starts | drill 16: three `POST /recover` cycles, READY **188 / 186 / 180 s** after each request; cold start on the first B start `torch.compile 20.56 s`, `init engine 61.28 s`, API accepting after ≈ 3 m 46 s; the restarts **4.96 / 3.27 s** and **27.2 / 28.8 s** (the `vllm-kernel-cache` volume did shorten them; FlashInfer autotuner `Config cache hit`); the GDN line on both ranks each time; no `--clear-kernel-cache` needed | `.runtime/drills/20260912T084519Z/drill-16-tp2-repeated-startup.log`; `.runtime/incidents/20260912T08{50,55}*/head-logs-1.txt` |
+| 5 warm-up | not run as written; the controller's two concurrent participation probes (commit `309356c`) warm the multi-sequence GDN kernel before READY instead | controller `/state .readiness.participation_probes` |
+
 1. `scripts/cluster-verify-engine.sh --probe` — all PASS bar the pre-existing Xid count (record the
    count before, require it not to increase), args byte-identical on both ranks, NCCL `Using network IB`,
    both GPUs ≥ 30 % during the probe.
@@ -413,6 +426,37 @@ then the reproducer that fired at 27 min on 2026-09-11: `scripts/cluster-soak.py
 then the orchestrator smoke (a thinking turn, a tool-call turn, a `json_completion`, a vision turn,
 a Deep Research step). The compare table (B − A per phase and per node, ✓/✗) is the artefact for
 the decision; the pass criteria are §7.1.
+
+**Executed 2026-09-12.** A = run `20260912T0514Z` on the production image (10 phases, 856 s,
+git `caa97e9`); B = run `20260912T0859Z` (11 phases, 1,639 s, git `16fe5cd`); the comparison is
+[`ab/compare-A-vs-B-20260912.md`](ab/compare-A-vs-B-20260912.md), the per-run tables
+[`ab/A-20260912T0514Z-SUMMARY.md`](ab/A-20260912T0514Z-SUMMARY.md) and
+[`ab/B-20260912T0859Z-SUMMARY.md`](ab/B-20260912T0859Z-SUMMARY.md). Against §7.1:
+
+| criterion | result | verdict |
+|---|---|---|
+| 2 — 0 failed requests, correctness 1.0 where judged, no alarms | B: 0 failed in every phase; needle 3/3 at 949,9xx tokens (799 s, 1,189 tok/s prefill); `json_structured` 30/30; `cancellations` 21/21; 0 Xid, 0 restarts, 0 fault samples on both nodes; alarms: none | pass |
+| 3 — `prefill_128k` TTFT p50 ≤ 1.3 × A | 25.0 vs 26.3 s = **0.95 ×** | pass |
+| 3 — `needle_950k` total ≤ 1.3 × A | A has no figure (the shell watchdog restarted the head under A's needle at 01:20Z, `INCIDENT-2026-09-11-vllm.md` §7.1) | not measurable |
+| 3 — `prefill_32k` TTFT p50 ≤ 1.1 × A | 3.79 vs 4.19 s = 0.91 × | pass |
+| 3 — decode tok/s p50 ≥ 0.9 × A in `c1_short`, `c10_short`, `decode_burst` | 109.6 / 111.5 = 0.98; 26.6 / 25.4 = 1.04; 40.0 / 40.1 = 1.00 | pass |
+| 3 — `c10_short`, `c16_short` TTFT p95 ≤ 1.1 × A | 0.317 / 0.604 = 0.53; 0.366 / 0.662 = 0.55 | pass |
+| 3 — `streaming` gap p95 ≤ 1.2 × A | 0.016 / 0.016 = 0.98 | pass |
+| 3 — aggregate completion tok/s ≥ 0.9 × A in `c10_short`, `c16_short`, `mixed` | 213.2 / 205.6; 306.7 / 269.6; 200.6 / 160.4 (`mixed`: **692 vs 550** requests in 10 min at c=10) | pass |
+| 4 — both-rank grep on every start, cold start ≤ 900 s, no fallback / JIT-error signature | every start (§6.3); cold ≈ 226 s to API accepting, warm restarts 152–166 s to READY | pass |
+| 1 — the 120-min soak | `scripts/cluster-soak.py --minutes 120 --concurrency 10`, started 10:50Z (`.runtime/logs/soak-B-20260912T1050Z.log`, baseline head RestartCount 1, worker 0, Xid 2/2): **in progress at the time of writing; result appended by the lead** | pending |
+| 5 — `validate_long_context.py` on B | not recorded today (the ~950K needle of the matrix is the only long-context figure on B) | not measured |
+| 6 — the orchestrator smoke on B | not recorded as a run; the drills' chats and the canaries completed on the primary | not measured |
+| 7 — ≥ 7 clean production days | B has served since 08:39Z; the 48–72 h canary has not started | **still unproven** |
+
+Observed on B, not a §7.1 criterion: one 2.8 s inter-token stall in `c10_short` (gap max 0.362 s
+on A); `decode tok/s p50` in `prefill_32k`/`prefill_128k` reads lower on B (113 vs 232 / 176); those
+phases generate very few tokens (aggregate completion 3.5–3.8 tok/s against 7–8K prompt tok/s),
+so the per-request decode figure rests on a handful of tokens — the aggregate and TTFT columns
+are the measure there, and the decode criterion of §7.1 names `c1_short`, `c10_short` and
+`decode_burst` for that reason. During B's `needle_950k` the controller went WEDGED (09:04–09:16Z)
+and a pair restart was refused only by the spent budget — the finding of
+`INCIDENT-2026-09-11-vllm.md` §7.2, a controller matter, not an engine one.
 
 ### 6.5 Rollback
 
@@ -497,7 +541,12 @@ recreated it (StartedAt `01:20:32Z`), the worker rank lost its TCPStore (`Failed
 dump" flag on TCPStore … Broken pipe`) and was restarted by its own healthcheck at 01:21:38Z
 (RestartCount 3). The pair was serving again by 01:26Z. The head kernel shows 2 Xid lines since boot.
 This is the 2026-09-11 choreography, one more time, on the pinned image — the controller/sentinel
-(not yet deployed from this branch) is what changes it. The A smoke in §5 was run after the recovery.
+(deployed 08:29Z the same day; the watchdog removed) is what changes it. The A smoke in §5 was run
+after the recovery. The incident report's §7.1 carries this event with its timeline; per the
+incident bundle's `00-TIMELINE.md` addendum the kill was the **shell watchdog's** `docker restart
+-t 30` (SIGTERM 01:20:02Z, SIGKILL 01:20:32Z — the 30 s gap is its `-t 30`), not the healthcheck,
+and the request in flight was the 950,000-token needle (949,915 prompt tokens, `Server
+disconnected` at 381.1 s, `.runtime/ab/A-baseline-20260912T0109Z/needles.txt`).
 Also: the worktree's `.runtime/` is `root:root 0755` (a docker-run promtool/compose render by another
 workstream), so `scripts/cluster-ab.py` refuses its default output dir with a clear message and the
 runs went to the scratchpad; from the deploy checkout the default works.
@@ -526,8 +575,11 @@ runs went to the scratchpad; from the deploy checkout the default works.
 ## 10. What is verified and what is not
 
 Verified inside the image or on the hardware: everything in §1-3 unless marked, §2.5 (worker GB10),
-§4 (both nodes, read-only), §5 (production engine, smoke). **Unverified:** the arm64 child digest
-(§1); the git ancestry "51 commits after f6326f5" (only the code path is proven); the exact wording of
-the model-runner banner line on B; whether MRV2's `warmup_kernels()` batches ≥ 2 prefills; end-to-end
-model numerics on B (that is the matrix); B's cold-start time and the kernel-cache reuse across
-restarts (needs the change window); every number in §7.1's B column.
+§4 (both nodes, read-only), §5 (production engine, smoke). **Verified 2026-09-12 in production** (§6.3, §6.4): the GDN line on both ranks on every start;
+B's cold start (torch.compile 20.56 s, init engine 61.28 s, ≈ 3 m 46 s to API accepting) and the
+kernel-cache reuse across restarts (4.96 / 3.27 s, 27.2 / 28.8 s); the §7.1 B column for
+criteria 2, 3 (bar the 950K ratio) and 4; the needle 3/3 at ~950K. **Still unverified:** the
+arm64 child digest (§1); the git ancestry "51 commits after f6326f5" (only the code path is
+proven); the exact wording of the model-runner banner line on B; whether MRV2's
+`warmup_kernels()` batches ≥ 2 prefills; the 120-min soak (in progress); `validate_long_context.py`
+and the orchestrator smoke on B; the 48–72 h canary (not started); every secondary test.

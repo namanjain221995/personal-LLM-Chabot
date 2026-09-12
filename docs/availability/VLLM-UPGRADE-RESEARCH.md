@@ -2,6 +2,14 @@
 
 Workstream: research (read-only). No file in the worktree was created or edited. All findings below are from upstream sources fetched 2026-09-12 (GitHub API/pages, Docker Hub API, docs.vllm.ai, vllm.ai blog, NVIDIA playbook, the HF model card as shipped in the local checkpoint) plus read-only inspection of the running head container (`docker inspect`, `docker logs`, `docker exec … cat` of installed vLLM source) and a local diff of the installed GDN sources against `v0.29.0`.
 
+> **Status note (2026-09-12, docs workstream).** This is the research record as written before
+> the change window. What followed the same day: Track B (`nightly-385dce36…`, `sha256:819ec9c0…`,
+> `--gdn-prefill-backend flashinfer`) was deployed to production at 08:39Z after the A/B matrix on
+> the production image (`CANDIDATE-B.md` §6.3–§6.4, `ab/compare-A-vs-B-20260912.md`); the 120-min
+> soak is in progress; the 48–72 h canary is still unproven; Track A is not run. Where this record
+> says "fallback" it means the v1 stand-in answer model, withdrawn by CONTRACT v2 (strict
+> one-model mode): nothing answers while the primary reloads; requests queue and resume.
+
 ## Executive summary
 
 1. **No released or nightly vLLM build contains a fix for this fault class, and the two PRs the 2026-09-03 diagnosis relied on do not apply.** `#51812` ("Align Qwen GDN gates with speculative tokens", merged 2026-08-11) is a correctness fix for the spec-decode gate ordering; `#51674` (fused CUDA post-conv **MTP decode** kernel, merged 2026-08-14) explicitly "does NOT touch fused_gdn_prefill_post_conv.py, the prefill path, or mixed prefill+decode batches". `fused_gdn_prefill_post_conv.py` has had **zero commits** since it was moved on 2026-07-16 (#48500). I diffed the installed `qwen_gdn_linear_attn.py`, `gdn_attn.py` and `causal_conv1d.py` against `v0.29.0`: the non-speculative mixed prefill+decode path (`split_non_spec` → `causal_conv1d_fn` → `fused_post_conv_prep` → `chunk_gated_delta_rule`) is functionally unchanged; the only diffs are MTP/spec-decode work, refactors, and PDL launch flags added to `causal_conv1d` by the Kimi-K3 PRs.

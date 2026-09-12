@@ -172,25 +172,35 @@ objectives each architecture can meet.
    2026-09-12): the two PRs the 2026-09-03 note relied on (#51812, #51674) are MTP-only; upstream
    issues #49926 and #37431 reproduce the same Xid 13/31 signature on this model and GPU on every
    build from 0.23 to 0.28.1 (including a two-DGX-Spark TP=2 pair on 2026-09-07 with Model Runner
-   V2), with and without MTP, prefix caching, CUDA graphs or mixed batches. Production stays
-   pinned on `sha256:24f2f897…`; the `nightly` images cached on both nodes (`sha256:7d5128a9…`)
-   contain no fix and are **not** to be deployed. What remains is one candidate and a set of
-   secondary tests, in a scheduled change window, each gated by the 120-min soak and the research
-   report's §6.4 criteria, run **one variable at a time** by `scripts/cluster-ab.py` and recorded
-   in `docs/availability/CANDIDATE-B.md`:
-   - **Track B, evaluated first:** the post-`f6326f5` candidate (the first nightly after #55715
-     "FlashInfer GDN prefill kernel on SM12x", merged 2026-09-08 — `nightly-385dce36…`, digest
-     `sha256:819ec9c0…`) with `--gdn-prefill-backend flashinfer` set explicitly on both ranks
+   V2), with and without MTP, prefix caching, CUDA graphs or mixed batches. The `nightly` images
+   cached on both nodes before this work (`sha256:7d5128a9…`) contain no fix and are **not** to
+   be deployed. One candidate and a set of secondary tests, each gated by the 120-min soak and
+   the research report's §6.4 criteria, run **one variable at a time** by `scripts/cluster-ab.py`
+   and recorded in `docs/availability/CANDIDATE-B.md`:
+   - **Track B — deployed to production 2026-09-12 08:39Z and under soak:** the post-`f6326f5`
+     candidate (the first nightly after #55715 "FlashInfer GDN prefill kernel on SM12x", merged
+     2026-09-08 — `nightly-385dce36…`, digest `sha256:819ec9c0…`, image ID `5a0f8b91…` on both
+     nodes) with `--gdn-prefill-backend flashinfer` set explicitly on both ranks
      (`CLUSTER_GDN_PREFILL_BACKEND`, rendered into `CLUSTER_ENGINE_ARGS`), image selected by
      `MAIN_MODEL_IMAGE` for the `vllm` and `vllm-worker` services only (router and OCR stay on the
-     proven digest), `VLLM_ALLREDUCE_USE_FLASHINFER=0` on both ranks. It moves
-     `chunk_gated_delta_rule` off the Triton kernel the py-spy captures sat in.
-   - **Secondary tests, one at a time, after Track B's verdict:** `--max-num-partial-prefills 1`;
-     `--max-long-partial-prefills 1`; `--max-num-batched-tokens 4096` vs `8192`;
-     `--max-num-seqs 10` vs default; and **fifth, Track A** `--moe-backend flashinfer_b12x`
-     (the only positive stability reports for this class on GB10 come from that backend; it
-     executes the W4A16 checkpoint as W4A4 and adds ≈ 5 GiB per rank, so it needs the output-
-     quality check of the research report's §6.4 as well as the soak).
+     proven digest), `VLLM_ALLREDUCE_USE_FLASHINFER=0` and `VLLM_USE_V2_MODEL_RUNNER=0` on both
+     ranks. It moves `chunk_gated_delta_rule` off the Triton kernel the py-spy captures sat in.
+     Both ranks logged the FlashInfer GDN line on the first start and on every start a record
+     captured (the three coordinated restarts of drill 16, drills 3 and 6; `CANDIDATE-B.md` §6.3). The A/B matrix (`ab/compare-A-vs-B-20260912.md`): 0 failed requests,
+     0 Xid, 0 restarts over 11 phases, the ~950K needle 3/3, `mixed` 692 vs 550 requests in
+     10 min at c=10, `prefill_128k` TTFT 0.95 × A. The 120-min soak started 10:50Z and is in
+     progress at the time of writing; **the promotion decision is taken after the 48–72 h
+     canary**, which has not started — until then B is a candidate that happens to be serving,
+     and the pinned digest `sha256:24f2f897…` (cached on both nodes) is the rollback
+     (`CANDIDATE-B.md` §6.5).
+   - **Secondary tests, one at a time, after the canary's verdict:** `--long-prefill-token-threshold`
+     with the orchestrator's LONG lane (the `--max-num-partial-prefills` / `--max-long-partial-prefills`
+     flags named earlier do not exist in either build, `CANDIDATE-B.md` §8.3);
+     `--max-num-batched-tokens 4096` vs `8192`; `--max-num-seqs 10` vs default; and **fifth,
+     Track A** `--moe-backend flashinfer_b12x` (the only positive stability reports for this
+     class on GB10 come from that backend; it executes the W4A16 checkpoint as W4A4 and adds
+     ≈ 5 GiB per rank, so it needs the output-quality check of the research report's §6.4 as
+     well as the soak). None run yet.
    A 120-min pass is necessary, not sufficient: upstream MTBFs are 9–72 h, so the class counts as
    closed only after ≥ 7 days of production with no controller incident of category ≠ `none`.
 2. Router to the worker (memory only, ≈ 22 GiB off the head).
@@ -199,3 +209,14 @@ objectives each architecture can meet.
    load shape that fires the fault — and is outside the orchestrator's admission lanes and
    continuity; its client-side patches (`docs/ISSUE/interview-analysis-client/`) remain the
    mitigation on its side.
+5. **The wedge rule under a long solo prefill** (found 2026-09-12 09:04Z,
+   `INCIDENT-2026-09-11-vllm.md` §7.2): neither token counter moves during one ~950K-token
+   chunked prefill on this build; the controller confirmed WEDGED and a pair restart was refused
+   only by the spent budget. The decision's premise — a real completion, not a process, proves
+   the engine — holds; the rule needs a signal for "a long prefill is in progress". Owner:
+   controller workstream.
+6. **What 2026-09-12 changed in the decision's mechanics:** a head restarted outside the
+   controller (Docker's restart policy, an operator) is re-paired — the worker restarted through
+   the sentinel, no head restart, no budget — instead of waiting for the last-resort healthcheck
+   tiers (767 s → 161–165 s to READY; commit `6a667f6`, CONTRACT §6.3). The single-authority
+   rule is unchanged: the controller is still the only actor that restarts anything.

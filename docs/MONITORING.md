@@ -313,11 +313,11 @@ same generation when READY returns). This table is the operator's view of it.
 | Code | State | What it means | The signal that decides it | Alert |
 |---|---|---|---|---|
 | 0 | `MONITORING_UNKNOWN` | the telemetry cannot be observed, or the controller's verdict is unproven. **Never rendered as DOWN.** | the controller cannot observe (it exports 0); **or** Grafana finds no series at all (`noValue`); **or** the controller's snapshot stamp `techsara_vllm_generated_at_seconds` is more than 30 s old (a frozen tick) — the derived state drops its sample; **or** `absent_over_time(techsara_vllm_state_code[2m])` | `VllmMonitoringUnknown` (warning, labelled with *what* is missing: `controller_state`, `vllm_scrape_target`, `controller_observation`, `controller_stale`, `controller_stamp`); `VllmReadyUnproven` (critical) when READY is claimed with no real success for 2 minutes |
-| 1 | `STARTING` | containers up, model loading; the readiness sequence has not passed since the head started; cold-start budget (900 s) not exceeded | head `started_at` newer than the last proven readiness | none — `VllmScrapeTargetDown`, `HeadSwapActivity` and `NcclTcpFallback` are silenced here |
+| 1 | `STARTING` | containers up, model loading; the readiness sequence has not passed since the head started; cold-start budget (900 s) not exceeded. Also the shape of a head restarted **outside** the controller (Docker's restart policy, an operator): the reason reads `head restarted outside the controller; re-pairing the worker`, the controller has restarted the worker through the sentinel, no head restart, no budget spent (category `head_restarted_externally`, `techsara_vllm_recovery_attempts_total{outcome="repaired_worker"}`) | head `started_at` newer than the last proven readiness | none — `VllmScrapeTargetDown`, `HeadSwapActivity` and `NcclTcpFallback` are silenced here |
 | 2 | `READY` | the **readiness sequence** passed and a canary succeeded within the last two probe intervals: (1) a non-streaming completion, (2) a streaming completion with TTFT measured and a terminal chunk seen, (3) `generation_tokens_total` on `/metrics` advanced by at least the tokens received, (4) both GPU exporters seen above 30 % during a 256-token participation probe, (5) the sentinel reports the rank process alive | `techsara_vllm_synthetic_success` + `techsara_vllm_participation_ok` + `techsara_vllm_worker_rank_alive` + `cluster:vllm_last_success_age_seconds` | `VllmPrimaryRestored` (info) when it follows an outage |
 | 3 | `BUSY` | READY, and `vllm:num_requests_running > 0` | as READY, plus the scheduler gauge | `VllmQueueBacklog` (warning) if waiting > 5 for 5 m |
 | 4 | `DEGRADED` | the canary still succeeds but a non-critical signal failed: sentinel unreachable, metrics stale, canary TTFT > 10 s, the router *classifier* unhealthy (it routes intents; it never answers a person), a GPU exporter unreachable | `techsara_vllm_worker_reachable`, `techsara_vllm_head_metrics_ok`, `techsara_vllm_synthetic_ttft_seconds`, `techsara_vllm_router_available`, `techsara_vllm_participation_ok` | `VllmCanaryTtftHigh`, `VllmMetricsStale`, `HeadSwapActivity`, `NcclTcpFallback`, `RoceRailMissing` (all warning) |
-| 5 | `WEDGED` | requests exist but neither token counter moves for ≥ 90 s, or the canary has been outstanding ≥ 60 s while `/health` still answers 200; two consecutive observations | `techsara_vllm_generation_frozen_seconds` with running > 0; canary timeout | `VllmEngineWedged` (critical, 30 s), `VllmGenerationFrozen` (critical), `VllmWorkerRankAbsent` (critical) |
+| 5 | `WEDGED` | requests exist but neither token counter moves for ≥ 90 s, or the canary has been outstanding ≥ 60 s while `/health` still answers 200; two consecutive observations; or three canary probes answered with an error; or every canary failing for 120 s. **Known false positive:** one long prompt prefilling alone — on 2026-09-12 09:04–09:16Z a ~950K-token needle moved neither counter for 680 s and the controller read WEDGED for 11 min 45 s while the engine was working (the restart was refused only by the spent budget; `availability/INCIDENT-2026-09-11-vllm.md` §7.2) | `techsara_vllm_generation_frozen_seconds` with running > 0; canary timeout | `VllmEngineWedged` (critical, 30 s), `VllmGenerationFrozen` (critical), `VllmWorkerRankAbsent` (critical) |
 | 6 | `RECOVERING` | a coordinated recovery holds the lock: diagnostics captured, the pair restarted worker-first, model reloading, readiness sequence pending, queued generations resumed once it passes | `techsara_vllm_recovery_in_progress`, `techsara_vllm_recovery_step` | `VllmRecoveryStarted` (info); `VllmRepeatedRecoveryFailure` (critical) after two failures in an hour |
 | 7 | `QUEUEING` | the primary is not READY/BUSY/DOWN **and** the orchestrator holds ≥ 1 accepted generation durably queued for it; the person reads *Main model is recovering—your request is safely queued.* and the **same** generation resumes when READY returns | derived in Prometheus (`cluster:vllm_service_state:code`): controller state ∉ {2, 3, 8} and `llm_queued_generations > 0` | `VllmRequestsQueued` (warning, after 2 m); `VllmQueueDrained` (info) when it ends |
 | 8 | `DOWN` | the primary is not serving and the restart budget is exhausted or the last recovery failed; **nothing answers users** — queued requests are held (never lost, never answered by another model) until an operator acts | controller state 8 with a fresh verdict. A queue never softens 8 into 7 | `VllmPrimaryDown` (critical, 1 m), `VllmRecoveryBudgetExhausted` (critical) |
@@ -333,7 +333,21 @@ waiting; `none` when the orchestrator is not scraped), **Worker rank** (alive
 / ABSENT / unknown), **Last successful inference** (seconds since a real
 completion — the one liveness number a hung process cannot fake), **Canary
 TTFT**, **Incident duration**, **Recovery attempts (1h)** against the budget
-of 3, and **Reason** (the controller's last failure category, a bounded set).
+of 3, and **Reason** (the controller's last failure category, a bounded set
+that now includes `head_restarted_externally`).
+
+What the series showed on 2026-09-12, the first day the controller ran in
+production (Prometheus, `techsara_vllm_state_code` at 15 s resolution): the
+controller went live at 08:44Z on candidate B; RECOVERING → READY three times
+for drill 16 (08:45–08:58Z, 179–186 s each by
+`techsara_vllm_recovery_duration_seconds`); DEGRADED → WEDGED → DEGRADED →
+BUSY under the A/B needle (09:02–09:16Z, the false positive above, with
+`llm_breaker_transitions_total{to="OPEN"}` +1 at 09:04:30Z); RECOVERING →
+READY for drills 3 and 4 (09:46Z, 09:51Z; 170 and 168 s); STARTING for
+12 min 45 s in the first drill-5 run (09:56–10:08Z, `cold_start_seconds`
+428 s — the un-re-paired worker) and for ≈ 2.7 min in drill 6 and the drill-5
+re-run (10:43Z, 10:46Z; `repaired_worker` 2); `llm_queued_generations` 1 → 0
+at 10:09:00Z and again at 10:49:30Z; BUSY from 10:50:45Z under the soak.
 
 ### What "no data" means, and why it is never zero
 

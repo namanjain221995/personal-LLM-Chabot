@@ -197,6 +197,46 @@ Triggers (DETECT → CONFIRM), as implemented in v2:
    requests running (saturation, not a wedge; bounded by `CANARY_STARVATION_S`).
    All per-incarnation counters reset when the head's `started_at` changes, so a
    restart the controller did not perform never inherits stale timeouts.
+6. Three consecutive canary probes the engine **answered** with an error (a
+   5xx, an error chunk, a stream without a terminal chunk, no tokens) on a
+   proven engine whose `/health` was not 5xx when each probe started →
+   `canary_http_error`. The three probes are the observations; the saturation
+   exemption does not apply (an error is an answer, not a starved request).
+7. The bound on DEGRADED "awaiting confirmation": a proven engine that has
+   failed every canary, of any kind, for `CANARY_FAIL_DEGRADED_MAX_S=120`
+   while `/health` answers 200 → confirmed under the last failure's kind
+   (`canary_timeout` or `canary_http_error`); the saturation exemption still
+   holds for timeouts.
+
+**Not a trigger, and not budgeted — the external-restart rule (v2, 2026-09-12,
+commit `6a667f6`):** when the head's `started_at` moves and the controller
+did not move it (Docker's restart policy after the API process died; an
+operator's bare `docker restart`), and the sentinel had reported rank 1
+joined to the previous head or the worker container is older than the new
+head, the controller takes the lock, records the incident under category
+`head_restarted_externally`, captures diagnostics, sends the sentinel one
+`POST /restart` for the **worker** — no head restart, no budget spent, once
+per head incarnation — and publishes STARTING with the reason `head restarted
+outside the controller; re-pairing the worker`, `recovery.external_repair
+{outcome, detail, head_started_at, incident_id}` and
+`recovery.head_start_origin: external`; counted as
+`techsara_vllm_recovery_attempts_total{outcome="repaired_worker"}`. A refused
+or unreachable sentinel is recorded (`refused`, `unreachable`), never
+retried. The readiness sequence then decides READY as after any start.
+Measured: 767 s to READY without the rule (drill 5, 2026-09-12 09:55Z),
+165 s and 161 s with it (drill 6, drill 5 re-run).
+
+**Known gap in trigger 4/5 (observed 2026-09-12 09:04–09:16Z,
+`INCIDENT-2026-09-11-vllm.md` §7.2):** during one ~950K-token chunked prefill
+running alone, neither `vllm:generation_tokens_total` nor
+`vllm:prompt_tokens_total` moved on this build (Prometheus: `prompt_tokens_total`
+flat at 694,469 from 09:03Z to 09:15Z, then +950,436 at once — the prompt is
+counted when its prefill finishes; `frozen_seconds` reached 680 s with
+`requests_running == 1`; `kv_cache_usage_perc` rose 0.088 → 0.557 meanwhile)
+and the canary timed out 12 times behind it; the controller confirmed WEDGED and its recovery attempt was refused only
+because the budget was spent. The exemption of trigger 5 cannot see a long
+solo prefill. Owner: controller workstream; the contract will name the
+signal once it exists.
 
 Choreography (states published at every step; every step logged with the
 incident id; diagnostics captured **before** anything is restarted):

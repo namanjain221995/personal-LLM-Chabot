@@ -9,15 +9,26 @@ only `nvidia/Qwen3.6-35B-A3B-NVFP4` ever answers a person. The wider cluster
 [`../CLUSTER.md`](../CLUSTER.md); the observability platform is
 [`../MONITORING.md`](../MONITORING.md).
 
+**Where it stands (2026-09-12 ≈ 11:00Z).** The controller, the sentinel and
+the orchestrator's continuity have run in production since 08:29Z; candidate
+B (`sha256:819ec9c0…`, `--gdn-prefill-backend flashinfer`) has served since
+08:39Z; the live drills of the day are recorded (`RUNBOOK.md` §12.1: READY
+161–188 s after a break, detection 3–6 s, queued requests resumed on the same
+generation); one drill found that a head restarted outside the controller
+was not re-paired (767 s to READY) — fixed the same day (`6a667f6`). The
+120-min soak on B is in progress; the 48–72 h canary is **still unproven**;
+the wedge rule's blind spot under a long solo prefill is open
+(`INCIDENT-2026-09-11-vllm.md` §7.2).
+
 | Read | When you need | It is |
 |---|---|---|
-| [`RUNBOOK.md`](RUNBOOK.md) | **something is wrong now** | the operator's procedures: status, real probe, both-GPU proof, logs and evidence, Xid / memory / RDMA checks, the coordinated restart, queued requests and the exactly-once checks, who may restart what, kernel caches, the candidate image switch, CPU topology, rollback; one section per alert anchor; boot and host recovery; deployment without avoidable outage |
+| [`RUNBOOK.md`](RUNBOOK.md) | **something is wrong now** | the operator's procedures: status, real probe, both-GPU proof, logs and evidence, Xid / memory / RDMA checks, the coordinated restart, queued requests and the exactly-once checks, who may restart what (with the head-restarted-externally rule) and the drills of 2026-09-12 as evidence (§12.1), kernel caches, the candidate image switch as executed, CPU topology, rollback; one section per alert anchor; boot and host recovery; deployment without avoidable outage |
 | [`CONTRACT.md`](CONTRACT.md) | the exact name of anything | **binding** (v2): the nine states, the twenty signals, the failure categories, the readiness sequence, the controller's HTTP/JSON, kernel caches, admission lanes, every metric name, the alerts, the orchestrator's breaker and continuity rules, file ownership, testing rules |
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | to understand why it is built this way | the TP=2 primary and its single-replica limit, the process model and what each endpoint proves, the controller and sentinel as the single recovery authority, the orchestrator's breaker, continuity and admission lanes, request durability and the resume sweep, monitoring semantics |
-| [`INCIDENT-2026-09-11-vllm.md`](INCIDENT-2026-09-11-vllm.md) | what happened | the timeline to the second, the five independent delays that made a sub-second fault an 11-minute outage, the hypothesis matrix, the corrective actions and the Candidate B plan |
+| [`INCIDENT-2026-09-11-vllm.md`](INCIDENT-2026-09-11-vllm.md) | what happened | the timeline to the second, the five independent delays that made a sub-second fault an 11-minute outage, the hypothesis matrix, the corrective actions; §5 the deployment and the drills of 2026-09-12 with their records; §7 the two self-inflicted events of that day (the watchdog under the A needle at 01:20Z; the controller's WEDGED under the B needle) |
 | [`ADR-0002-high-availability.md`](ADR-0002-high-availability.md) | why this option | options A–E compared; Option A hardened + request continuity chosen; the stand-in answer model (D) rejected by product requirement; Option C (+2 Sparks) named as the only way to serve answers during a reload; the follow-ups |
-| [`SLO.md`](SLO.md) | the numbers | four SLOs with their PromQL/SQL (B = request continuity availability), the detection/recovery objectives measured before and targeted after, why 99.99 % is out of reach on one replica, the acceptance checklist |
-| [`CANDIDATE-B.md`](CANDIDATE-B.md) | the engine candidate | the post-`f6326f5` build with `--gdn-prefill-backend flashinfer`, evaluated first; the secondary engine knobs one at a time (Track A `flashinfer_b12x` fifth); the A/B harness and its records |
+| [`SLO.md`](SLO.md) | the numbers | four SLOs with their PromQL/SQL (B = request continuity availability), the detection/recovery objectives measured before and after (§5, from the drills), why 99.99 % is out of reach on one replica, the acceptance checklist with a status per row (§6: met / met with note / not measured, each with its record) |
+| [`CANDIDATE-B.md`](CANDIDATE-B.md) | the engine candidate | the post-`f6326f5` build with `--gdn-prefill-backend flashinfer` — **deployed 2026-09-12 08:39Z**, the switch and the A/B matrix executed and recorded (§6.3, §6.4, `ab/`), the soak in progress, the canary unproven; the secondary engine knobs one at a time (Track A `flashinfer_b12x` fifth), not run |
 | [`MEMORY-BUDGET.md`](MEMORY-BUDGET.md) | what fits on which Spark | the unified-memory map of both nodes, the placement verdicts, the limits in force and what happens past each |
 | [`VLLM-UPGRADE-RESEARCH.md`](VLLM-UPGRADE-RESEARCH.md) | whether a newer vLLM fixes it | it does not: the fault class is open on every released build; what the candidates are, the validation plan, the rollback insurance |
 | [`REVIEW-MANIFEST.md`](REVIEW-MANIFEST.md) | what was reviewed, file by file | the read-only review of the code production was running during the incident, findings tagged by owning workstream |

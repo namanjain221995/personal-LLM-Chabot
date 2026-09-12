@@ -10,7 +10,7 @@ buffers), so the column sum over-counts by a few GiB and is read as a ceiling.
 | Resident | GPU alloc (GiB) | cgroup / RSS (GiB) | Placement verdict |
 |---|---|---|---|
 | Main model rank 0 (`VLLM::Worker_TP0`, weights ½ of 21.8 + 8 GiB KV budget + graphs) | 24.8 | 15.9 (container) | stays — TP=2 measured win |
-| Router `Qwen3-VL-8B-Instruct-FP8` (also the **fallback**) | 20.8 | 1.2 | **move to the worker** (next change window; ≈ 22 GiB freed, and the fallback then survives a head loss) |
+| Router `Qwen3-VL-8B-Instruct-FP8` (a classifier only — v2 strict one-model mode, it never answers a person) | 20.8 | 1.2 | **move to the worker** (next change window; ≈ 22 GiB freed — memory alone, ADR-0002 consequences) |
 | Embed `Qwen3-Embedding-0.6B` (2 GiB KV budget) | 3.9 | 0.3 | stays (on the chat path, 12–180 ms calls) |
 | Reranker `Qwen3-Reranker-0.6B` (2 GiB KV budget) | 3.9 | 0.3 | stays |
 | Whisper replica | 3.3 | 0.1 | stays (one per node) |
@@ -51,10 +51,9 @@ addresses, and why nothing new may be loaded on the head (ADR-0002).
 
 | Limit | Configured | Tested | Safe production maximum | Over the limit |
 |---|---|---|---|---|
-| Context window | 1,000,000 tokens (`--max-model-len`) | needle at 949,915 tokens (2026-08-30); 32K prefill 4.1 s; 20K on the fallback | 1,000,000 at ≤ 1.66 concurrent full-window requests (KV budget 8 GiB → 1,663,201 tokens) | vLLM rejects the request (400) — never retried |
+| Context window | 1,000,000 tokens (`--max-model-len`) | needle at 949,915 tokens (2026-08-30; again 3/3 on candidate B 2026-09-12, `ab/B-20260912T0859Z-SUMMARY.md`); 32K prefill 4.1 s | 1,000,000 at ≤ 1.66 concurrent full-window requests (KV budget 8 GiB → 1,663,201 tokens) | vLLM rejects the request (400) — never retried |
 | KV cache | `--kv-cache-memory-bytes 8589934592` per rank | yes | as configured | requests queue (`num_requests_waiting`); `VllmKvCacheNearlyFull` at 90 % |
 | Batched tokens / step | `--max-num-batched-tokens 8192` (chunked prefill) | yes | as configured | bounds every RPC to one 8,192-token step |
 | Concurrent sequences | vLLM default (`MAIN_MODEL_MAX_NUM_SEQS=0`) | 10 concurrent mixed (soak) | 10 — the second tenant's load; **the load under which the GDN fault fires on this build** | queue; the orchestrator's `_LLM_SEM` caps its own generations at 2 |
 | GPU memory utilisation | 0.30 per rank | yes | as configured (explicit KV budget makes it deterministic) | start fails with a negative KV budget (seen 2026-09-09 on embed before the explicit budget) |
-| Fallback input | 24,000 tokens (`FALLBACK_MAX_INPUT_TOKENS`) | 20,000 answered correctly | 24,000 of the 49,152 window | history truncated, oldest turns first |
-| Recovery restarts | 3 per hour | drill | 3 | controller stands down (DOWN, `budget_exhausted`), fallback stays, critical alert |
+| Recovery restarts | 3 per hour | drill 16 spent all 3 on 2026-09-12 08:45–08:58Z; the controller then refused its own attempt at 09:05Z (`budget_exhausted`) | 3 | controller stands down (DOWN, `budget_exhausted`), queued requests held (never answered elsewhere), critical alert |
