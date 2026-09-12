@@ -36,10 +36,19 @@ are in the report so the completion sentence can say so.
 CELL LENGTH. Excel refuses a cell over 32,767 characters and the stdlib
 reader refuses a field over 131,072 (csv.Error) — a well-formed file with a
 200,000-character comment made validate_csv refuse and read_csv_grid crash.
-write_csv cuts a cell at 32,767 characters (Excel's limit) and counts the
-cuts in the report; and the process-wide field limit is raised to 1 MiB
-below, so a file this module did not write is read without a crash and
-refused, if at all, by a rule that names the row.
+write_csv cuts a FIELD at 32,767 characters (Excel's limit) — the field as
+written, apostrophe included, so a neutralised cell is not one over
+(security review 2026-09-12, #6) — and counts the cuts in the report; and
+the process-wide field limit is raised to 1 MiB below, so a file this
+module did not write is read without a crash and refused, if at all, by a
+rule that names the row.
+
+INVISIBLE CHARACTERS. U+FEFF (the byte-order mark Excel's "CSV UTF-8"
+export writes into the first header, which a paste then carries), U+200B
+and U+2060 are stripped from every cell with the control range: they are
+zero-width, they hid a formula lead from `is_formula_lead` ("\\ufeff=cmd"
+starts with U+FEFF, not "="), and a header that began with U+FEFF put the
+three BOM bytes at the start of the file the validator refuses (#5).
 
 `validate_csv` is the `validate` stage's reopen for this format (the same
 shape as validate.py's validators: a function of the path returning the
@@ -69,8 +78,11 @@ FORMULA_LEADS: Tuple[str, ...] = ("=", "+", "-", "@", "\t", "\r")
 #: formula, and is never neutralised (CONTRACT-2 / wave 2b brief).
 PLAIN_NUMBER_RE = re.compile(r"^[-+]?\d[\d,]*(\.\d+)?%?$")
 #: spec.py's _XML_ILLEGAL: NUL, the C0 controls XML refuses, the two
-#: non-characters. Tab, LF and CR stay (LF/CR are legal inside a quoted field).
-_ILLEGAL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]")
+#: non-characters — plus the zero-width U+200B, U+2060 and U+FEFF (see
+#: INVISIBLE CHARACTERS above). Tab, LF and CR stay (LF/CR are legal
+#: inside a quoted field); the zero-width joiner and non-joiner stay too
+#: (Indic scripts and emoji sequences need them).
+_ILLEGAL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\u200b\u2060\ufeff\ufffe\uffff]")
 _BOM = b"\xef\xbb\xbf"
 #: Column types (spec.ColumnType) whose text values are written as bare
 #: numbers when they parse as one: "1,000" → 1000. A CSV has no number
@@ -205,14 +217,16 @@ def write_csv(columns: Sequence[str], rows: Iterable[Sequence[Any]], path: str |
         out: List[str] = []
         for j, value in enumerate(values):
             text = cell_text(value, types[j])
-            if len(text) > MAX_CELL_CHARS:
-                text = text[:MAX_CELL_CHARS]
-                cut += 1
             field = neutralise(text)
             if field != text:
                 neutralised += 1
                 if len(cells) < _REPORTED_CELLS:
                     cells.append((line, j + 1))
+            if len(field) > MAX_CELL_CHARS:
+                # The FIELD is cut, after the apostrophe went in: a cut
+                # text plus an apostrophe was 32,768 characters (#6).
+                field = field[:MAX_CELL_CHARS]
+                cut += 1
             out.append(field)
         return out
 

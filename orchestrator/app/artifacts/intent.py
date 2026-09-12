@@ -34,6 +34,20 @@ plus a bare "it" won. The creation verb in the FIRST clause is the
 request; what follows is how to do it. So the positional create rule runs
 before the edit block (CONTRACT-2 §5), and only the conversion shapes
 ("Create a PDF version too.") are looked at before it.
+
+A NEGATED VERB IS NOT A REQUEST. "Don't create a PDF, just answer here"
+was a create (security review of 2026-09-12, #9): the rules saw the verb
+and the noun and never the "don't". A negation right before a creation
+verb — don't, never, no need to, must not, without, rather than —
+takes that clause out of every rule's view (`_without_negated_clauses`),
+so the rest of the message decides: "Don't create a Word doc, create a
+PDF instead" is still a PDF, and "don't forget to create a PDF" is not a
+negation of the verb.
+
+THE PASTE IS NOT THE PROSE. The row count ("500 rows") is read from the
+text BEFORE the first table line (a tab, a pipe, a comma-separated
+record) — never from a pasted cell, which would otherwise steer the
+generator to the number a comment happened to contain (#3).
 """
 from __future__ import annotations
 
@@ -152,6 +166,37 @@ _IMPERATIVE_EDIT_RE = re.compile(
 #: Polite imperatives are requests: "can you make…", "could you create…".
 _POLITE_RE = re.compile(r"^\s*(?:can|could|would|will|please|pls|kindly)\b\s*(?:you|u)?\s*(?:please\s+)?", re.I)
 
+#: A negation, then at most a few adverbs, then a creation verb (any form:
+#: "making", "created") and the rest of that clause up to a comma, an
+#: "and" or a clause end — the words the rules must not read. "Don't
+#: forget to" and "don't hesitate to" are not here on purpose: they ask
+#: for the file; nor is "stop" ("stop making excuses and create a PDF").
+_NEGATION = (
+    r"(?:don['’]?t|dont|do not|never|no need to|there'?s no need to|(?:must|should|shall|will|would|can|could)\s+not|"
+    r"mustn['’]?t|shouldn['’]?t|won['’]?t|wouldn['’]?t|can['’]?t|cannot|rather than|instead of|without|not(?:\s+to)?)"
+)
+_NEGATION_ADVERBS = r"(?:just|simply|actually|really|even|ever|also|then|please|bother(?:\s+to)?|go\s+and|go\s+ahead\s+and|try\s+to|need\s+to|have\s+to|want\s+to|you\s+to)"
+_NEGATED_VERBS = (
+    r"(?:mak(?:e|es|ing)|creat(?:e|es|ing|ed)|generat(?:e|es|ing)|build(?:s|ing)?|writ(?:e|es|ing)|draft(?:s|ing)?|prepar(?:e|es|ing)|"
+    r"produc(?:e|es|ing)|compil(?:e|es|ing)|assembl(?:e|es|ing)|put(?:ting)?\s+together|design(?:s|ing)?|develop(?:s|ing)?|export(?:s|ing)?|"
+    r"sav(?:e|es|ing)|download(?:s|ing)?|print(?:s|ing)?|render(?:s|ing)?|giv(?:e|es|ing)\s+me|send(?:s|ing)?\s+me|turn(?:s|ing)?|"
+    r"convert(?:s|ing)?|shar(?:e|es|ing)|provid(?:e|es|ing)|deliver(?:s|ing)?|hand(?:s|ing)?\s+(?:over|me)|supply(?:ing)?)"
+)
+_NEGATED_CLAUSE_RE = re.compile(rf"\b{_NEGATION}\s+(?:{_NEGATION_ADVERBS}\s+)*{_NEGATED_VERBS}\b(?:(?!\band\b)[^.;:!?,\n])*", re.I)
+#: "I can't make a spreadsheet myself, can you build one?" — a first-person
+#: negation describes the person, not the instruction; it is left in place
+#: so the request after it still reads as a request (the security-fix
+#: review of 2026-09-12 found the clause rule swallowing it).
+_FIRST_PERSON_NEGATION_RE = re.compile(rf"\b(?:i|we)\s+(?:{_NEGATION_ADVERBS}\s+)*(?:{_NEGATION})\b", re.I)
+#: "not a Word document", "rather than a deck", "instead of Excel": a
+#: format the person ruled out, which must not become one of the files.
+_NEGATED_FORMAT_RE = re.compile(rf"\b(?:not|never|no|rather than|instead of|don['’]?t\s+want|do\s+not\s+want|no\s+need\s+for)\s+(?:(?:as|in|into|to)\s+)?(?:an?\s+|the\s+)?{_FORMAT_WORD}\b", re.I)
+#: A line of a pasted table: a tab, a pipe, or a comma/semicolon record
+#: of four or more cells with no space after the separators (a CSV export;
+#: a sentence puts a space after its commas). The prose the row count is
+#: read from ends at the first such line (#3).
+_TABLE_LINE_RE = re.compile(r"\t|\||(?:[^,;\n]*[,;](?![ \t])){3}")
+
 # --- follow-ups --------------------------------------------------------------
 
 _REFERENCE_RE = re.compile(
@@ -234,6 +279,48 @@ def _first_clause(low: str) -> str:
     return low[: m.start()] if m else low
 
 
+def _without_negated_clauses(low: str) -> str:
+    """`low` with every negated creation clause blanked (#9): the rules
+    then read "don't create a pdf, just answer here" as ", just answer
+    here", and "create a pdf, not a word document" as "create a pdf,
+    document". A FIRST-PERSON negation ("I can't make a spreadsheet
+    myself, can you build one?") describes the person, not the
+    instruction, and is left alone. Bounded input (the caller cut it at
+    _DECIDE_CHARS); the patterns have no nested quantifier over a word gap."""
+    def clause(m: "re.Match[str]") -> str:
+        head = low[max(0, m.start() - 12):m.start()]
+        return m.group(0) if _FIRST_PERSON_NEGATION_RE.search(head + m.group(0)[:24]) else " "
+
+    return _NEGATED_FORMAT_RE.sub(" ", _NEGATED_CLAUSE_RE.sub(clause, low))
+
+
+def _prose_before_table(original: str) -> str:
+    """The lines before the first table line (#3): what the row count is
+    read from. A message with no table line is all prose. Linear: one
+    regex per line, stopping at the first hit, over the decision's prefix
+    of the text."""
+    head = original[:_DECIDE_CHARS]
+    table = None
+    if "\n" in head.strip():  # a table is never one line; a one-line turn is never parsed
+        try:
+            from .tables import parse_table
+
+            table = parse_table(head)
+        except Exception:  # noqa: BLE001 — the parser is a courtesy here; the line scan below is the rule
+            table = None
+    if table is not None and getattr(table, "prose_before", None) is not None:
+        # The parser knows every delimiter it accepts (a 3-column comma
+        # paste, a space-aligned table), so its prose_before is the honest
+        # cut (security-fix review 2026-09-12, #3 residual).
+        return " ".join(str(table.prose_before).split())
+    out: List[str] = []
+    for line in head.splitlines():
+        if _TABLE_LINE_RE.search(line):
+            break
+        out.append(line)
+    return " ".join(" ".join(out).split())
+
+
 def _row_count(low: str) -> Optional[int]:
     m = _ROW_COUNT_RE.search(low)
     if not m:
@@ -280,9 +367,11 @@ def decide(
     raw = _clean(original)[:_DECIDE_CHARS]
     if not raw:
         return ArtifactIntent("none", rule="empty")
-    low = raw.lower()
+    # The rules read the text with its negated creation clauses blanked
+    # (#9); `raw` — the instruction the composer gets — keeps them.
+    low = _without_negated_clauses(raw.lower())
     explicit = F.explicit_formats(low)
-    rows = _row_count(low)
+    rows = _row_count(_without_negated_clauses(_prose_before_table(original).lower()))
 
     def made(action: Action, **kw) -> ArtifactIntent:
         kw.setdefault("formats", explicit)
@@ -408,4 +497,10 @@ async def decide_with_hook(
     verdict.rule = f"classifier:{verdict.rule or 'model'}"
     if not verdict.raw_text:
         verdict.raw_text = text or ""
+    # The verdict's instruction is the DECISION's view like the rules'
+    # (whitespace-collapsed, cut at _DECIDE_CHARS), whatever the hook put
+    # there: a hook that echoed the whole message handed a 60 KB paste to
+    # the engine's format regexes on the event loop (security review of
+    # 2026-09-12, #8). The rules' own `intent.instruction` is that view.
+    verdict.instruction = _clean(verdict.instruction)[:_DECIDE_CHARS] or intent.instruction or _clean(text)[:_DECIDE_CHARS]
     return verdict

@@ -137,8 +137,28 @@ def _published_ref(job: Optional[dict], version_row: dict) -> dict:
 def _version_files(version_row: dict) -> List[dict]:
     """The version's files as the wire sees them — every entry with a
     `file_id`, a legacy row's synthesised by pipeline.ref_for, so a version
-    from before ids existed is served by id like any other."""
+    from before ids existed is served by id like any other — and an entry
+    the row holds in a shape that cannot be described (a text size, not a
+    dict) left out with a log line, so every route reads the list the same
+    way and a corrupt entry is a 404 for its file, never a 500 for the
+    version (security review 2026-09-12)."""
     return [f.to_json() for f in pipeline.ref_for({"artifact_id": version_row["artifact_id"], "version": version_row["version"], "id": version_row.get("job_id") or ""}, version_row).files]
+
+
+def _first_of_format(version_row: dict, fmt: str) -> Optional[dict]:
+    """The FIRST file of a format — what the `/file/{fmt}` and `/sheets`
+    aliases serve — read through `_version_files` like the id routes."""
+    return next((f for f in _version_files(version_row) if f.get("format") == fmt), None)
+
+
+#: The refusal categories that are a 409 (the person's own state: full
+#: storage, too many jobs open, nothing left to retry from) rather than a
+#: 400 (a request that cannot be a document).
+_CONFLICT_CATEGORIES = frozenset({"quota_exceeded", "storage_failure", "source_unavailable"})
+
+
+def _refused(exc: pipeline.ArtifactRefused) -> HTTPException:
+    return HTTPException(status_code=409 if getattr(exc, "category", "") in _CONFLICT_CATEGORIES else 400, detail=str(exc))
 
 
 def _resolve_by_id(user_id: int, artifact_id: str, version: int, file_id: str, files: Sequence[dict]) -> Tuple[str, dict]:
@@ -212,7 +232,13 @@ async def cancel_job(job_id: str, user: UserRow = Depends(require_user), _gate: 
 
 @router.post("/jobs/{job_id}/retry")
 async def retry_job(job_id: str, user: UserRow = Depends(require_user), _gate: None = Depends(require_artifacts)) -> dict:
-    row = await pipeline.retry(_id(job_id), int(user["id"]))
+    """409 with a sentence where accept() would refuse a new job (storage,
+    the open-jobs ceiling) and when the sweep has taken what the retry
+    would compose from; the row is left failed either way."""
+    try:
+        row = await pipeline.retry(_id(job_id), int(user["id"]))
+    except pipeline.ArtifactRefused as exc:
+        raise _refused(exc)
     if row is None:
         raise HTTPException(status_code=404, detail="not found")
     if row.get("status") in ("completed", "completed_with_warnings", "cancelled"):
@@ -260,7 +286,7 @@ async def get_file(
     if fmt not in T.FORMATS:
         raise HTTPException(status_code=404, detail="not found")
     row = await _version_or_404(artifact_id, version, user)
-    entry = next((f for f in (row.get("files") or []) if f.get("format") == fmt), None)
+    entry = _first_of_format(row, fmt)
     if entry is None:
         raise HTTPException(status_code=404, detail="not found")
     try:
@@ -470,7 +496,7 @@ async def get_sheets(
     _gate: None = Depends(require_artifacts),
 ) -> JSONResponse:
     row = await _version_or_404(artifact_id, version, user)
-    entry = next((f for f in (row.get("files") or []) if f.get("format") == "xlsx"), None)
+    entry = _first_of_format(row, "xlsx")
     if entry is None:
         raise HTTPException(status_code=404, detail="not found")
     try:
@@ -602,7 +628,7 @@ async def convert_artifact(artifact_id: str, body: ConvertBody, user: UserRow = 
     if version < 1:
         raise HTTPException(status_code=409, detail="This artifact has no finished version to convert yet.")
     current = await db.run_in_thread(adb.get_version, artifact_id, version, int(user["id"]))
-    if current and any(f.get("format") == fmt for f in (current.get("files") or [])):
+    if current and _first_of_format(current, fmt) is not None:
         raise HTTPException(status_code=409, detail=f"The current version already has a {fmt.upper()} file.")
     conversation_id = str(artifact.get("conversation_id") or "")
     # The key names the artifact AND the version: two artifacts converted
@@ -618,9 +644,14 @@ async def convert_artifact(artifact_id: str, body: ConvertBody, user: UserRow = 
             idempotency_key=key, title=str(artifact.get("title") or ""),
         )
     except pipeline.ArtifactRefused as exc:
-        raise HTTPException(status_code=409 if getattr(exc, "category", "") in ("quota_exceeded", "storage_failure") else 400, detail=str(exc))
+        raise _refused(exc)
     if job.get("status") == "failed":
-        job = await pipeline.retry(str(job["id"]), int(user["id"])) or job
+        # A convert that failed earlier is retried, not handed back — and
+        # meets the refusals a retry meets (the same 409s).
+        try:
+            job = await pipeline.retry(str(job["id"]), int(user["id"])) or job
+        except pipeline.ArtifactRefused as exc:
+            raise _refused(exc)
     await pipeline.ensure_running(str(job["id"]))
     return {"job_id": job["id"], "artifact_id": job["artifact_id"], "version": int(job["version"])}
 

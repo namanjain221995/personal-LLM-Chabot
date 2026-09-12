@@ -77,9 +77,13 @@ def test_publish_strips_the_scratch_and_keeps_what_the_contract_lists(reports):
     """CONTRACT §6. material.json (chat content), render-job.json and
     render-report.json (absolute paths), preview.json, the matplotlib cache
     and the renderer's chart PNGs were all being renamed into the immutable
-    published directory and kept forever."""
+    published directory and kept forever. transform.json (what code did
+    to the pasted table — a column label from the paste, counts) followed
+    them in on 2026-09-12: it is read by the render stage and by nothing
+    after publication (security review 2026-09-12, #4)."""
     work = store.ensure_workdir(USER, ART, 1)
-    for name in (store.MATERIAL_NAME, store.JOB_NAME, store.RENDER_REPORT_NAME, store.PREVIEW_META_NAME):
+    assert store.TRANSFORM_NAME in store.SCRATCH_NAMES
+    for name in (store.MATERIAL_NAME, store.JOB_NAME, store.RENDER_REPORT_NAME, store.PREVIEW_META_NAME, store.TRANSFORM_NAME):
         store.write_json(os.path.join(work, name), {"secret": "history text", "path": work})
     os.makedirs(os.path.join(work, ".mpl"))
     with open(os.path.join(work, ".mpl", "fontlist.json"), "w") as fh:

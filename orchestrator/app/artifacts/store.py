@@ -22,13 +22,17 @@ is SCRATCH and is removed before the rename — `material.json` (the
 conversation history, uploads text and Salesforce data the turn gathered;
 needed only to resume a job BEFORE it publishes, and a copy of chat content
 that would otherwise sit outside every retention path, since deleting a
-conversation deliberately leaves artifacts alone), `render-job.json` and
-`render-report.json` (absolute paths of this process's volume), the
-renderer's `preview.json` and matplotlib cache, and the chart PNGs the
-renderer embedded. What the row needs from the report and the preview meta
-after publication (preview_kind, preview_pages, warnings) travels in the
-manifest, so a crash between the rename and the row update can still be
-completed from the directory alone.
+conversation deliberately leaves artifacts alone), `transform.json` (what
+code did to a pasted table, written by the composer for the render stage
+of a later attempt; it carries a column label from the person's own paste
+and is read by nothing after publication — it slipped into v<N>/ for a day
+in 2026-09-12 because it was named in the pipeline and not here),
+`render-job.json` and `render-report.json` (absolute paths of this
+process's volume), the renderer's `preview.json` and matplotlib cache, and
+the chart PNGs the renderer embedded. What the row needs from the report
+and the preview meta after publication (preview_kind, preview_pages,
+warnings) travels in the manifest, so a crash between the rename and the
+row update can still be completed from the directory alone.
 
 PUBLICATION IS A RENAME. Every stage writes into `v<N>.tmp/`; `publish()`
 fsyncs what is there, writes the manifest, fsyncs the parent, and
@@ -74,9 +78,13 @@ RENDER_REPORT_NAME = "render-report.json"
 MATERIAL_NAME = "material.json"
 PREVIEW_META_NAME = "preview.json"
 JOB_NAME = "render-job.json"
+#: The composer's account of what code did to the data (rows copied, blanks
+#: kept, hosts forward-filled), for the render stage's methodology note.
+#: Named HERE, beside the other scratch, so the list below cannot miss it.
+TRANSFORM_NAME = "transform.json"
 #: The scratch a working directory carries that a published version must
 #: not (module docstring). `publish()` removes these before the rename.
-SCRATCH_NAMES = (RENDER_REPORT_NAME, MATERIAL_NAME, PREVIEW_META_NAME, JOB_NAME, ".mpl")
+SCRATCH_NAMES = (RENDER_REPORT_NAME, MATERIAL_NAME, PREVIEW_META_NAME, JOB_NAME, TRANSFORM_NAME, ".mpl")
 #: What a published directory may hold besides the rendered files and the
 #: previews directory. The rendered files are named per version (slug +
 #: version + an optional sheet part, types.download_name), so they cannot
@@ -562,7 +570,7 @@ def write_bytes(path: str, data: bytes) -> int:
 
 
 __all__ = [
-    "StorageError", "PathRefused", "RENDER_REPORT_NAME", "MATERIAL_NAME", "PREVIEW_META_NAME", "JOB_NAME",
+    "StorageError", "PathRefused", "RENDER_REPORT_NAME", "MATERIAL_NAME", "PREVIEW_META_NAME", "JOB_NAME", "TRANSFORM_NAME",
     "SCRATCH_NAMES", "PUBLISHED_NAMES", "published_names",
     "artifact_dir", "version_dir", "version_workdir", "is_published", "ensure_workdir",
     "read_json", "write_json", "write_spec", "read_spec", "sha256_file",

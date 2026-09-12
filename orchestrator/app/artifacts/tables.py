@@ -33,6 +33,7 @@ from __future__ import annotations
 import csv
 import io
 import re
+import string
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from random import Random
@@ -46,6 +47,15 @@ from . import types as T
 #: bytes, as the name says.
 MAX_PASTE_ROWS = 10_000
 MAX_PASTE_BYTES = 5 * 1024 * 1024
+#: Stripped from a paste before a line is split (security review of
+#: 2026-09-12, #5 and #7): NUL, which no output format can carry (spec.py
+#: scrubs it from every string) and which is the sentinel `_try_pipe` uses
+#: for an escaped pipe — a NUL in a cell came out as a literal `|`; and
+#: U+FEFF, the byte-order mark Excel's "CSV UTF-8" export writes, which
+#: `str.strip` does not remove and which made the first header `\ufeffId`
+#: (every lookup by column name broke, and a formula lead hidden behind it
+#: reached the CSV writer unneutralised).
+_PASTE_STRIP_RE = re.compile("[\x00\ufeff]")
 
 #: The stdlib reader refuses a field over 131,072 characters with
 #: csv.Error; a pasted comment column can be longer than that and the
@@ -166,6 +176,8 @@ _SPACE_RUN_SPLIT = re.compile(r"( {2,})")
 _SPACE_RUN_RE = re.compile(r"\S {2,}\S")
 #: A markdown rule line: `|---|:---:|`, `---|---`, `| ---- |`.
 _PIPE_RULE_RE = re.compile(r"^\s*\|?(?:\s*:?-{2,}:?\s*\|)*\s*:?-{2,}:?\s*\|?\s*$")
+#: The sentinel for an escaped `\|` in a markdown cell. NUL cannot collide
+#: with pasted text because parse_table strips every NUL first (#7).
 _ESCAPED_PIPE = "\x00"
 #: How many lines a quoted field may span before the quote is taken for a
 #: stray one (prose with an unbalanced `"` must not swallow the message).
@@ -196,6 +208,9 @@ def parse_table(text: Optional[str]) -> Optional[ParsedTable]:
     with no separator at all is one cell in the first column, with a
     warning. Rows are never dropped or merged."""
     if not text or not text.strip():
+        return None
+    text = _PASTE_STRIP_RE.sub("", text)
+    if not text.strip():
         return None
     truncated = False
     original_nonempty = 0
@@ -597,6 +612,14 @@ def _try_csv(lines: Sequence[str]) -> Optional[ParsedTable]:
 
 
 def _try_csv_with(lines: Sequence[str], delimiter: str) -> Optional[ParsedTable]:
+    # A comma table needs three records of two or more cells, so at least
+    # three lines carry the delimiter. Counted before the reader is opened:
+    # the quoted-record reader costs two csv.reader calls per line, and a
+    # 5 MB paste of unbalanced quotes with no comma in it spent most of
+    # its ten seconds here, twice — once per delimiter (security review
+    # 2026-09-12, #10).
+    if sum(1 for line in lines if delimiter in line) < 3:
+        return None
     records = _quoted_records(lines, delimiter)
     block = _pick_block([len(r.cells or []) >= 2 for r in records], min_lines=3, max_gap=1)
     if block is None:
@@ -798,6 +821,27 @@ def quoted_spans(text: Optional[str]) -> List[str]:
 # ------------------------------------------------------------- generator --
 
 GEN_KINDS: Tuple[str, ...] = ("id", "name", "email", "choice", "int", "float", "date", "datetime", "text", "derived")
+#: What one generator may build, checked BEFORE it is built (security
+#: review of 2026-09-12, #11). The generator runs in the orchestrator
+#: process — the render sandbox's memory limit does not cover it — and a
+#: schema-valid recipe could ask for a gigabyte per cell: an id pattern
+#: `{n:0999999999d}` formats every row to a billion characters (the
+#: schema's own `format(n=1)` probe allocated it), and seven derived
+#: `concat` columns of twenty copies each are 20^7 copies of the first
+#: cell. So: rows × columns at most GEN_MAX_CELLS (half the product of
+#: the sheet ceilings — a 10,000-row sheet may have 30 generated columns,
+#: a 60-column sheet 5,000 rows); a generated cell at most
+#: GEN_MAX_CELL_CHARS; a generated sheet at most GEN_MAX_CHARS in all
+#: (10,000 rows × 60 columns of thirteen-character cells fit); an id
+#: pattern's width or precision at most GEN_MAX_ID_WIDTH, and its `start`
+#: within GEN_MAX_ID_START, so an id is never longer than the pattern plus
+#: a few dozen digits.
+GEN_MAX_CELLS = (T.MAX_ROWS_PER_SHEET * T.MAX_COLUMNS_PER_SHEET) // 2
+GEN_MAX_CELL_CHARS = 2_000
+GEN_MAX_CHARS = 8_000_000
+GEN_MAX_ID_WIDTH = 40
+GEN_MAX_ID_START = 10 ** 15
+GEN_MAX_ID_PATTERN_CHARS = 200
 DERIVED_OPS: Tuple[str, ...] = ("sum", "mean", "min", "max", "diff", "concat")
 #: RFC 2606 reserved domains — a synthetic address must never be deliverable.
 EMAIL_DOMAINS: Tuple[str, ...] = ("example.com", "example.org", "example.net")
@@ -875,15 +919,21 @@ def generate_rows(generator: Dict[str, Any]) -> Tuple[List[List[Any]], Dict[str,
         if col.get("kind") not in GEN_KINDS:
             raise ValueError(f"column {col['name']!r}: kind must be one of {', '.join(GEN_KINDS)}, got {col.get('kind')!r}")
         names.append(col["name"])
+    if n * len(columns) > GEN_MAX_CELLS:
+        raise ValueError(f"{n:,} rows × {len(columns)} columns is {n * len(columns):,} cells; the most one sheet may generate is {GEN_MAX_CELLS:,}")
 
     rng = Random(seed)
     values: _Values = {}
     blanks_by_rule: Dict[str, int] = {}
     unique_checked: List[str] = []
+    chars = 0
     for col in _dependency_order(columns):
         name, kind = col["name"], col["kind"]
         unique = bool(col.get("unique")) or kind in ("id", "email")
         cells = _COLUMN_GENERATORS[kind](col, n, rng, values, unique)
+        chars += sum(len(c) if isinstance(c, str) else 8 for c in cells if c is not None)
+        if chars > GEN_MAX_CHARS:
+            raise ValueError(f"the generated sheet would be more than {GEN_MAX_CHARS:,} characters in all (at column {name!r}); fewer rows or shorter cells are needed")
         if kind == "derived":
             blanks = sum(1 for c in cells if c is None)
             if blanks:
@@ -968,13 +1018,49 @@ def _assert_unique(name: str, cells: Sequence[Any]) -> None:
         seen.add(c)
 
 
+_FORMAT_SPEC_DIGITS_RE = re.compile(r"\d+")
+
+
+def id_pattern_problem(pattern: Any) -> Optional[str]:
+    """Why `pattern` is not an id pattern the generator will format, or
+    None. Read with string.Formatter — NEVER formatted: `{n:0999999999d}`
+    is a valid format that allocates a gigabyte per call, and the schema's
+    own `format(n=1)` probe was the first allocation (security review
+    2026-09-12, #11). The pattern may hold only the field `n`, with a
+    conversion and a format spec whose width and precision are at most
+    GEN_MAX_ID_WIDTH and which nests no field."""
+    if not isinstance(pattern, str) or "{n" not in pattern:
+        return 'id pattern must contain {n}, e.g. "CAND-{n:04d}"'
+    if len(pattern) > GEN_MAX_ID_PATTERN_CHARS:
+        return f"id pattern is {len(pattern)} characters long; the most is {GEN_MAX_ID_PATTERN_CHARS}"
+    try:
+        parts = list(string.Formatter().parse(pattern))
+    except ValueError as exc:
+        return f"bad id pattern ({exc})"
+    for _literal, field_name, format_spec, _conversion in parts:
+        if field_name is None:
+            continue
+        if field_name != "n":
+            return f"id pattern must use only {{n}} (found {{{field_name}}})"
+        spec = format_spec or ""
+        if "{" in spec or "}" in spec:
+            return "id pattern must not have a nested field in its format spec"
+        for digits in _FORMAT_SPEC_DIGITS_RE.findall(spec):
+            if int(digits) > GEN_MAX_ID_WIDTH:
+                return f"id pattern width {digits} is more than {GEN_MAX_ID_WIDTH} characters"
+    return None
+
+
 def _gen_id(col: Dict[str, Any], n: int, rng: Random, values: _Values, unique: bool) -> List[Any]:
     pattern = col.get("pattern") or "{n}"
-    if not isinstance(pattern, str) or "{n" not in pattern:
-        raise ValueError(f"column {col['name']!r}: id pattern must contain {{n}}, e.g. \"CAND-{{n:04d}}\"")
+    problem = id_pattern_problem(pattern)
+    if problem:
+        raise ValueError(f"column {col['name']!r}: {problem}")
     start = col.get("start", 1)
     if isinstance(start, bool) or not isinstance(start, int):
         raise ValueError(f"column {col['name']!r}: id start must be an integer")
+    if abs(start) > GEN_MAX_ID_START:
+        raise ValueError(f"column {col['name']!r}: id start must be within ±{GEN_MAX_ID_START:,}")
     try:
         return [pattern.format(n=start + i) for i in range(n)]
     except (KeyError, ValueError, IndexError) as exc:
@@ -1176,7 +1262,12 @@ def _gen_derived(col: Dict[str, Any], n: int, rng: Random, values: _Values, uniq
             out.append(None)
             continue
         if op == "concat":
-            out.append(sep.join(str(v) for v in inputs))
+            joined = sep.join(str(v) for v in inputs)
+            if len(joined) > GEN_MAX_CELL_CHARS:
+                # Checked per cell, before the column is built up: a
+                # concat over a concat doubles every level (#11).
+                raise ValueError(f"column {col['name']!r}: a concat cell would be {len(joined):,} characters; the most a generated cell holds is {GEN_MAX_CELL_CHARS:,}")
+            out.append(joined)
             continue
         nums = [parse_number(v) for v in inputs]
         if any(x is None for x in nums):
@@ -1277,6 +1368,27 @@ def apply_rewrites(
     return out, sorted(kept), warnings
 
 
+#: The words that turn a finding around. A rewrite must carry as many of
+#: them as the original: "did not pass" → "passed" and "no follow up" →
+#: "follow-up was done" invert the audit (security review 2026-09-12, #2),
+#: while "did not pass" → "didn't pass" keeps the count. Contractions are
+#: matched on their `n't`; the bare words at word boundaries, so "knot",
+#: "note" and "nothing"-vs-"no" are counted right.
+_NEGATION_RE = re.compile(r"\b(?:not|no|never|none|nothing|nobody|neither|nor|without|cannot)\b|(?<=\w)n['’]t\b", re.IGNORECASE)
+
+
+def negations_in(text: Optional[str]) -> int:
+    """How many negation words `text` carries (see _NEGATION_RE)."""
+    return len(_NEGATION_RE.findall(text or ""))
+
+
+def _as_whole_words(span: str, text: str) -> bool:
+    """Is `span` in `text` as whole words — not "no" inside "not"? (#2: the
+    quoted "no" of `said "no" to a retry` was found inside "did not want a
+    retry", and the guarantee that quoted text survives was hollow.)"""
+    return re.search(rf"(?<!\w){re.escape(span)}(?!\w)", text) is not None
+
+
 def _rewrite_problem(original: str, reply: Any, max_ratio: float, floor: int) -> Optional[str]:
     if not isinstance(reply, str) or not reply.strip():
         return "empty rewrite"
@@ -1288,14 +1400,18 @@ def _rewrite_problem(original: str, reply: Any, max_ratio: float, floor: int) ->
         if ts not in text:
             return f"timestamp {ts} missing"
     for span in quoted_spans(original):
-        if span not in text:
+        if not _as_whole_words(span, text):
             return f"quoted text {span!r} missing"
+    before, after = negations_in(original), negations_in(text)
+    if before != after:
+        return f"a negation was changed: {before} in the original, {after} in the rewrite"
     return None
 
 
 __all__ = [
     "MAX_PASTE_ROWS", "MAX_PASTE_BYTES", "ParsedTable", "parse_table", "forward_fill",
-    "normalise_date", "parse_number", "timestamps_in", "quoted_spans",
-    "GEN_KINDS", "DERIVED_OPS", "EMAIL_DOMAINS", "generate_rows",
+    "normalise_date", "parse_number", "timestamps_in", "quoted_spans", "negations_in",
+    "GEN_KINDS", "DERIVED_OPS", "EMAIL_DOMAINS", "GEN_MAX_CELLS", "GEN_MAX_CELL_CHARS", "GEN_MAX_CHARS",
+    "GEN_MAX_ID_WIDTH", "generate_rows", "id_pattern_problem",
     "rewrite_batches", "apply_rewrites",
 ]

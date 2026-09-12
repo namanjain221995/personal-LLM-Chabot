@@ -241,6 +241,29 @@ def test_tabular_document_row_ceiling_is_a_sentence(tmp_path, monkeypatch):
     assert not (tmp_path / "w-v1.pdf").exists()
 
 
+def test_tabular_document_cell_ceiling_is_a_sentence_before_the_render_starts(tmp_path, monkeypatch):
+    """Security review 2026-09-12 (#13): the tabular Word/PDF was refused
+    on ROWS alone, so a schema-valid 2,000 × 60 sheet (under the 6,000-row
+    ceiling) ran the worker to its 2 GB limit for 77-149 s per attempt.
+    The bound is cells (rows × columns) and text in all, refused before a
+    byte is rendered, and the Excel/CSV files are still offered."""
+    import app.artifacts.render as R
+
+    monkeypatch.setattr(R, "TABULAR_MAX_CELLS", 100)
+    with pytest.raises(RenderError) as exc:
+        render_version(workbook(rows=30), ["xlsx", "docx", "pdf"], str(tmp_path), title_slug="w", version=1)
+    assert exc.value.category == "invalid_request" and "Excel or CSV" in exc.value.message and "193 cells" in exc.value.message
+    assert not (tmp_path / "w-v1.pdf").exists() and not (tmp_path / "w-v1.docx").exists() and not (tmp_path / "w-v1.xlsx").exists()
+    monkeypatch.setattr(R, "TABULAR_MAX_CELLS", 100_000)
+    monkeypatch.setattr(R, "TABULAR_MAX_CHARS", 500)
+    with pytest.raises(RenderError) as exc:
+        render_version(workbook(rows=30), ["pdf"], str(tmp_path), title_slug="w", version=1)
+    assert exc.value.category == "invalid_request" and "characters" in exc.value.message and "Excel or CSV" in exc.value.message
+    # The production numbers: a 3,000-row, 9-column audit (27,000 cells) fits; 2,000 × 60 does not.
+    assert 3_000 * 9 <= R.TABULAR_MAX_CELLS < 2_000 * 60
+    assert R.TABULAR_MAX_CELLS < R.TABULAR_MAX_ROWS * T.MAX_COLUMNS_PER_SHEET
+
+
 def test_csv_row_count_mismatch_is_refused_by_validation(tmp_path, monkeypatch):
     """Belt and braces (CONTRACT-2 §11): the worker's own reopen counts the
     CSV's rows against the sheet; a writer that lost a row is caught here

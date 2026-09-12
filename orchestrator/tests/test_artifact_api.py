@@ -19,7 +19,7 @@ from fastapi.testclient import TestClient
 
 from app import db, metrics
 from app.artifacts import db as adb
-from app.artifacts import pipeline
+from app.artifacts import pipeline, store
 from app.artifacts import spec as S
 from app.artifacts import types as T
 from app.config import settings
@@ -410,7 +410,9 @@ def test_the_grid_route_pages_through_a_csv_and_an_xlsx_sheet(alice, login_clien
     aid = row["artifact_id"]
     files = _files_of(client, aid)
     csv_id, xlsx_id = files["csv"]["file_id"], files["xlsx"]["file_id"]
-    assert files["csv"]["rows"] == 5 and files["csv"]["columns"] == 2 and files["csv"]["title"] == "Budget — Data"
+    # One data file: the CSV keeps the bare title — "<title> — <sheet>" is
+    # for a multi-sheet book's per-sheet CSVs only (fe12ec7, a786ebb).
+    assert files["csv"]["rows"] == 5 and files["csv"]["columns"] == 2 and files["csv"]["title"] == "Budget"
     assert files["csv"]["preview_url"] == f"/artifacts/{aid}/v/1/grid?file={csv_id}"
 
     page = client.get(f"/artifacts/{aid}/v/1/grid", params={"file": csv_id, "offset": 1, "limit": 2})
@@ -516,6 +518,145 @@ def test_job_status_cancel_retry_and_convert(alice, monkeypatch):
     adb.set_job_status(jid, "failed", error="boom", failure_category="renderer_failure")
     resp = client.post(f"/artifacts/jobs/{jid}/retry")
     assert resp.status_code == 200 and resp.json()["status"] in ("queued", "running", "completed")
+
+
+def _failing_render(monkeypatch, knob: dict) -> None:
+    """The installed render, failing while knob["fail"] is set."""
+    real = pipeline._render_in_subprocess
+
+    async def render(*args, **kw):
+        if knob["fail"]:
+            raise pipeline.RenderFailed("renderer_failure", "boom")
+        return await real(*args, **kw)
+
+    monkeypatch.setattr(pipeline, "_render_in_subprocess", render)
+
+
+def _fail(uid: int, *, gen: str, conv: str = "conv-retry") -> dict:
+    job = pipeline.accept(user_id=uid, conversation_id=conv, generation_id=gen, operation="create", instruction="Make it",
+                          kind="document", formats=["pdf"], effort="fast", mode="assistant", template_id="generic",
+                          material={"history_text": "the conversation"})
+
+    async def run():
+        await pipeline.ensure_running(job["id"])
+        return await pipeline.wait_for(job["id"])
+
+    row = asyncio.run(run())
+    assert row["status"] == "failed", row
+    return row
+
+
+def test_retry_answers_409_over_the_ceiling_the_quota_or_without_material(alice, monkeypatch):
+    """Security review 2026-09-12 (#1, #5): POST /retry answered 200
+    {queued} for every failed job however many the person already had
+    open and however full their storage was — accept() refused the same
+    person at the same moment — and a retry whose working directory the
+    sweep had removed composed a document from nothing. Each is a 409
+    with a sentence now, and the row stays failed."""
+    client, uid = alice
+    knob = {"fail": True}
+    _failing_render(monkeypatch, knob)
+    real_ensure = pipeline.ensure_running
+    monkeypatch.setattr(settings, "artifact_max_open_jobs_per_user", 1)
+    failed = [_fail(uid, gen=f"g-{i}")["id"] for i in range(3)]
+    assert adb.count_open_jobs(uid) == 0
+    # Hold the runner off so the first retry stays queued — and counts.
+    monkeypatch.setattr(pipeline, "ensure_running", lambda jid: asyncio.sleep(0))
+    first = client.post(f"/artifacts/jobs/{failed[0]}/retry")
+    assert first.status_code == 200 and first.json()["status"] == "queued"
+    second = client.post(f"/artifacts/jobs/{failed[1]}/retry")
+    assert second.status_code == 409 and "1 document(s) being built" in second.json()["detail"]
+    assert adb.count_open_jobs(uid) == 1 and adb.get_job(failed[1], uid)["status"] == "failed"
+    assert client.post(f"/artifacts/jobs/{failed[0]}/cancel").json()["status"] == "cancelled"
+
+    monkeypatch.setattr(settings, "artifact_user_quota_mb", 0)
+    over = client.post(f"/artifacts/jobs/{failed[1]}/retry")
+    assert over.status_code == 409 and "storage is full" in over.json()["detail"]
+    assert adb.get_job(failed[1], uid)["status"] == "failed" and adb.user_bytes(uid) == 0
+    monkeypatch.setattr(settings, "artifact_user_quota_mb", 1024)
+
+    # The sweep took the failed job's working directory (material.json with it).
+    row = adb.get_job(failed[2], uid)
+    work = store.version_workdir(uid, row["artifact_id"], 1)
+    assert os.path.isfile(os.path.join(work, store.MATERIAL_NAME))
+    store.remove_workdir(work)
+    gone = client.post(f"/artifacts/jobs/{failed[2]}/retry")
+    assert gone.status_code == 409
+    assert gone.json()["detail"] == "This request can no longer be retried — please ask for it again."
+    assert adb.get_job(failed[2], uid)["status"] == "failed" and adb.count_open_jobs(uid) == 0
+    # A job that is not the caller's is 404 before any of it.
+    assert client.post(f"/artifacts/jobs/{'0' * 32}/retry").status_code == 404
+
+    # The convert route's own failed -> retry path meets the same refusals.
+    knob["fail"] = False
+    monkeypatch.setattr(pipeline, "ensure_running", real_ensure)
+    done = _make(uid, formats=("pdf",), conv="conv-convert-retry")
+    knob["fail"] = True
+    accepted = client.post(f"/artifacts/{done['artifact_id']}/convert", json={"format": "docx"})
+    assert accepted.status_code == 200
+
+    async def wait():
+        pipeline.reset_for_tests()
+        await pipeline.ensure_running(accepted.json()["job_id"])
+        return await pipeline.wait_for(accepted.json()["job_id"])
+
+    assert asyncio.run(wait())["status"] == "failed"
+    monkeypatch.setattr(settings, "artifact_user_quota_mb", 0)
+    again = client.post(f"/artifacts/{done['artifact_id']}/convert", json={"format": "docx"})
+    assert again.status_code == 409 and "storage is full" in again.json()["detail"]
+    assert adb.get_job(accepted.json()["job_id"], uid)["status"] == "failed"
+
+
+def _set_files(aid: str, version: int, files) -> None:
+    with db.connection() as con:
+        con.execute("UPDATE artifact_versions SET files = %s WHERE artifact_id = %s AND version = %s", (db._json_param(files), aid, version))
+
+
+def test_a_corrupt_files_row_degrades_to_404_never_500(alice, monkeypatch):
+    """Security review 2026-09-12 (#6): one version row whose files carried
+    a text size ("abc") — a bad migration, a manual edit, a writer that
+    stores size as text — raised ValueError out of every artifact route
+    (the version, /f, /file, /zip, /grid, the artifact, the listing, the
+    job), and a non-dict entry raised AttributeError out of the /file and
+    /sheets aliases. A malformed entry is skipped: the version lists what
+    is sound, a file that cannot be described is 404."""
+    client, uid = alice
+    monkeypatch.setattr(pipeline, "_render_in_subprocess", _real_grid_render())
+    row = _make(uid, kind="workbook", formats=("xlsx", "csv"), conv="conv-corrupt")
+    aid, jid = row["artifact_id"], row["id"]
+    files = adb.get_version(aid, 1, uid)["files"]
+    xlsx = next(f for f in files if f["format"] == "xlsx")
+    routes = [
+        f"/artifacts/{aid}/v/1", f"/artifacts/{aid}/v/1/f/{xlsx['file_id']}", f"/artifacts/{aid}/v/1/file/xlsx",
+        f"/artifacts/{aid}/v/1/zip", f"/artifacts/{aid}/v/1/grid", f"/artifacts/{aid}/v/1/sheets",
+        f"/artifacts/{aid}", "/artifacts?conversation_id=conv-corrupt", f"/artifacts/jobs/{jid}",
+    ]
+    assert all(client.get(path).status_code == 200 for path in routes)
+
+    # Every entry's size is text: nothing can be described, nothing is served, nothing crashes.
+    _set_files(aid, 1, [{**f, "size": "abc"} for f in files])
+    codes = {path: client.get(path).status_code for path in routes}
+    assert codes == {
+        routes[0]: 200, routes[1]: 404, routes[2]: 404, routes[3]: 404, routes[4]: 404, routes[5]: 404,
+        routes[6]: 200, routes[7]: 200, routes[8]: 200,
+    }, codes
+    assert client.get(f"/artifacts/{aid}/v/1").json()["files"] == []
+    assert client.get(f"/artifacts/jobs/{jid}").json()["artifact"]["files"] == []
+    # One bad entry among good ones: the good ones are still served by every route.
+    _set_files(aid, 1, [xlsx, "x", 1, None, [xlsx], {**next(f for f in files if f["format"] == "csv"), "size": "1e3"}])
+    served = _files_of(client, aid)
+    assert list(served) == ["xlsx"] and served["xlsx"]["file_id"] == xlsx["file_id"]
+    assert client.get(f"/artifacts/{aid}/v/1/f/{xlsx['file_id']}").status_code == 200
+    assert client.get(f"/artifacts/{aid}/v/1/file/xlsx").status_code == 200
+    assert client.get(f"/artifacts/{aid}/v/1/sheets").status_code == 200
+    assert client.get(f"/artifacts/{aid}/v/1/grid").status_code == 200
+    assert client.get(f"/artifacts/{aid}/v/1/zip").status_code == 200
+    assert client.get(f"/artifacts/{aid}/v/1/file/csv").status_code == 404
+    # The list itself is not a list: an empty version, and the convert route still answers.
+    _set_files(aid, 1, "not a list")
+    assert client.get(f"/artifacts/{aid}/v/1").json()["files"] == []
+    assert client.get(f"/artifacts/{aid}/v/1/file/xlsx").status_code == 404
+    assert client.post(f"/artifacts/{aid}/convert", json={"format": "csv"}).status_code in (200, 409)
 
 
 def test_the_feature_gate_answers_403_when_documents_are_off(alice, monkeypatch):

@@ -13,10 +13,12 @@ THE LEASE (V29 shape, V31 table). `claim_lease` takes or renews a row for one
 process; it succeeds only when nobody holds it, the holder is this process,
 or the holder's lease has lapsed. `release_lease` is owner-scoped so a run
 whose lease was taken over cannot release the new owner's. `requeue_lapsed`
-is what startup runs: rows still 'running' whose lease has expired belong to
-a process that died, and go back to the queue with their finished stages on
-disk. The claim bumps `updated_at` and `heartbeat_at` so the stalled-job
-signal in /health moves with the heartbeat (health.py reads updated_at).
+is what startup and the maintenance pass run: rows still 'running' whose
+lease has expired belong to a process that died, and go back to the queue
+with their finished stages on disk — never a row the calling process still
+holds a task for (its heartbeat is late, not dead). The claim bumps
+`updated_at` and `heartbeat_at` so the stalled-job signal in /health moves
+with the heartbeat (health.py reads updated_at).
 
 ONE TRANSACTION WHERE IT MATTERS. `create_artifact_job` inserts the artifact,
 the version and the job together, or returns the job that already carries the
@@ -617,17 +619,31 @@ def lease_holder(job_id: str) -> str:
     return str((row or {}).get("lease_owner") or "")
 
 
-def requeue_lapsed() -> int:
-    """At startup: a row left 'running' whose lease has lapsed belongs to a
-    process that died. Back to the queue; its stage files are on disk."""
+def requeue_lapsed(*, owner: str = "", held: Sequence[str] = ()) -> int:
+    """At startup and every REQUEUE_INTERVAL_S: a row left 'running' whose
+    lease has lapsed belongs to a process that died. Back to the queue; its
+    stage files are on disk.
+
+    EXCEPT A ROW THE CALLING PROCESS STILL RUNS. `held` names the jobs the
+    caller has a live task for and `owner` is its lease name: a row among
+    them whose lease has lapsed is a heartbeat that is LATE (a saturated
+    pool, a stop-the-world pause), not a process that died, and the same
+    UPDATE leaves it alone. Until 2026-09-12 the pass flipped such a row to
+    'queued' under its own run; the next beat re-claimed it, the run went
+    on, `publish_version` found no 'running' row and answered 'cancelled'
+    — the person was told the file was cancelled although it was built,
+    and the version sat on disk unrecorded until the next drain (security
+    review 2026-09-12). A row another process flipped is the heartbeat's
+    to notice (pipeline._heartbeat stands the run down)."""
     now = core._now()
     with core.connection() as con:
         rows = con.execute(
             "UPDATE artifact_jobs SET status = 'queued', updated_at = %s, "
             "lease_owner = '', lease_expires_at = NULL "
             "WHERE status = 'running' "
-            "AND (lease_expires_at IS NULL OR lease_expires_at < %s) RETURNING id",
-            (now, now),
+            "AND (lease_expires_at IS NULL OR lease_expires_at < %s) "
+            "AND NOT (lease_owner = %s AND id = ANY(%s::text[])) RETURNING id",
+            (now, now, owner or "", [str(j) for j in held]),
         ).fetchall()
     return len(rows)
 

@@ -42,15 +42,28 @@ tokens, and a 34-row audit table keeps every blank cell. A `rewrite` column
 (an audit comment made concise) is the ONE place the model touches a row,
 and it does so cell by cell in batches with per-row ids, one in, one out,
 through `tables.apply_rewrites`, which keeps the original wherever a
-timestamp, a quoted phrase or a figure would change. Coverage is checked
-too: the sections a request named ("include A, B and C") are matched to the
-draft's headings, and a missing one costs one correction at every effort.
+timestamp, a quoted phrase, a figure or a negation would change. Coverage is
+checked too: the sections a request named ("include A, B and C") are matched
+to the draft's headings, and a missing one costs one correction at every
+effort.
+
+WHAT THE MODEL CANNOT STEER (security review of 2026-09-12). A pasted
+table's headers are the table's — the model's `columns` on a `rows_from`
+sheet contribute types, never names or order (#1: an injected cell had the
+headers swapped over verbatim rows); a rewrite rule on an outcome column or
+a short categorical one is refused, a batch may answer only the rows it was
+shown, and a job spends at most REWRITE_MAX_BATCHES rewrite calls (#2, #4,
+#12); a generator's id pattern is read before the schema formats it, and the
+fill runs in a thread, so a recipe can neither allocate a gigabyte per cell
+nor hold the event loop while 10,000 rows are made (#11).
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
+import statistics
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -761,6 +774,11 @@ def _transform_report(req: ComposeRequest, spec: S.ArtifactSpec, rewrite_report:
         generated = [sh for sh in body.sheets if sh.generator is not None]
         if generated:
             out["generated"] = sum(len(sh.rows) for sh in generated)
+        typed = [sh for sh in body.sheets if not sh.rows_are_code_made and sh.rows]
+        if copied and typed:
+            # The sentence must not call these preserved (#1).
+            out["typed_rows"] = sum(len(sh.rows) for sh in typed)
+            out["typed_sheets"] = [sh.name for sh in typed]
     out.update(rewrite_report)
     return out
 
@@ -962,15 +980,74 @@ def _usable_recipes(gen: dict, names: List[str], sheet: str, notes: List[str]) -
                 notes.append(f"sheet {sheet!r}: column {name!r} was derived from columns the sheet does not have; a numeric range was used")
 
 
+def _columns_of_table(model_columns: Any, table: DataTable, name: str, notes: List[str]) -> List[dict]:
+    """The `rows_from` sheet's columns: the TABLE's names, in the table's
+    order, always — the model contributes only the type, width and format
+    of a column it named as pasted (security review of 2026-09-12, #1: a
+    count match let the model's names sit over rows copied in the table's
+    order, so 'Candidate' headed the hosts and 'Outcome' became 'Result'
+    in a file the sentence certified as preserved). A note names what the
+    model wrote that was not taken."""
+    given: Dict[str, dict] = {}
+    if isinstance(model_columns, list):
+        for c in model_columns:
+            if isinstance(c, dict) and isinstance(c.get("name"), str) and c["name"].strip():
+                given.setdefault(_fold(c["name"]), c)
+    out: List[dict] = []
+    for column in table.columns:
+        extra = given.get(_fold(column), {})
+        out.append({**{k: v for k, v in extra.items() if k != "name"}, "name": column})
+    written = [str(c.get("name")) for c in model_columns if isinstance(c, dict) and isinstance(c.get("name"), str)] if isinstance(model_columns, list) else []
+    if [_fold(w) for w in written] != [_fold(c) for c in table.columns]:
+        unknown = [w for w in written if _fold(w) not in {_fold(c) for c in table.columns}]
+        if unknown:
+            why = f" (the model's {', '.join(repr(u) for u in unknown[:4])} {'were' if len(unknown) != 1 else 'was'} not)"
+        elif len(written) == len(table.columns):
+            why = " (the model's order was not)"
+        else:
+            why = ""
+        notes.append(f"sheet {name!r}: columns taken from the pasted table{why}")
+    return out
+
+
+def _drop_unknown_references(sh: dict, columns: Sequence[str], name: str, notes: List[str]) -> None:
+    """A rewrite rule, a highlight or a total that names a column the
+    pasted table does not have — the model's renamed header, now gone
+    (#1) — is dropped with a note rather than left for the validator to
+    refuse and a repair pass to retype. Mutates `sh`."""
+    known = {_fold(c) for c in columns}
+
+    def keep(items: Any, key: str, what: str) -> List[Any]:
+        kept: List[Any] = []
+        for item in items if isinstance(items, list) else []:
+            column = item.get(key) if isinstance(item, dict) else None
+            if isinstance(column, str) and _fold(column) not in known:
+                notes.append(f"sheet {name!r}: the {what} on {column!r} was dropped; the pasted table has no such column")
+                continue
+            kept.append(item)
+        return kept
+
+    if isinstance(sh.get("rewrite"), list):
+        sh["rewrite"] = keep(sh["rewrite"], "column", "rewrite")
+    if isinstance(sh.get("totals"), list):
+        sh["totals"] = keep(sh["totals"], "column", "total")
+    style = sh.get("style")
+    if isinstance(style, dict) and isinstance(style.get("highlight"), list):
+        style["highlight"] = keep(style["highlight"], "column", "highlight")
+
+
 def _fill_code_made_rows(raw: dict, req: ComposeRequest, notes: List[str]) -> List[str]:
-    """CONTRACT-2 §4/§6, BEFORE parse_body: a sheet with `rows_from` gets
-    the material table's rows verbatim — blanks included, and in place of
-    any rows the model typed; a sheet with a `generator` gets exactly
-    `rows` rows from tables.generate_rows, the recipes put in the sheet's
-    column order first (the row cells follow the recipe order). When the
-    sheet's column count differs from the table's, the table's column
-    names win (a note says so); when the person asked for a count, the
-    generator gets it. Mutates `raw`. Returns the problems the model must
+    """Blocking (the async caller runs it in a thread, #11). CONTRACT-2
+    §4/§6, BEFORE parse_body: a sheet with `rows_from` gets the material
+    table's rows verbatim — blanks included, and in place of any rows the
+    model typed — under the TABLE's column names in the table's order
+    (`_columns_of_table`); a sheet with a `generator` gets exactly `rows`
+    rows from tables.generate_rows, the recipes put in the sheet's column
+    order first (the row cells follow the recipe order), after its id
+    patterns were read — never formatted — for a width that would
+    allocate gigabytes (#11). When the person asked for a count, the
+    generator gets it. A sheet the model typed beside a copied one is
+    noted (#1). Mutates `raw`. Returns the problems the model must
     repair — an unknown table id, recipes that do not match the columns, a
     rule the generator refuses — each naming the sheet."""
     if req.kind != "workbook" or not isinstance(raw, dict) or not isinstance(raw.get("sheets"), list):
@@ -979,6 +1056,7 @@ def _fill_code_made_rows(raw: dict, req: ComposeRequest, notes: List[str]) -> Li
     known = {t.id: t for t in (material.tables if material is not None else [])}
     wanted = int(material.row_count) if material is not None and material.row_count else 0
     with_generator = [sh for sh in raw["sheets"] if isinstance(sh, dict) and isinstance(sh.get("generator"), dict)]
+    copied_any = any(isinstance(sh, dict) and isinstance(sh.get("rows_from"), str) and sh["rows_from"].strip() in known for sh in raw["sheets"])
     problems: List[str] = []
     for index, sh in enumerate(raw["sheets"]):
         if not isinstance(sh, dict):
@@ -992,10 +1070,8 @@ def _fill_code_made_rows(raw: dict, req: ComposeRequest, notes: List[str]) -> Li
                 ids = ", ".join(repr(t) for t in known) or "none"
                 problems.append(f"sheets.{index}.rows_from: {source!r} names no material table; the tables are {ids}")
                 continue
-            columns = sh.get("columns")
-            if not isinstance(columns, list) or len(columns) != len(table.columns):
-                sh["columns"] = [{"name": c} for c in table.columns]
-                notes.append(f"sheet {name!r}: columns taken from the pasted table")
+            sh["columns"] = _columns_of_table(sh.get("columns"), table, name, notes)
+            _drop_unknown_references(sh, table.columns, name, notes)
             if sh.get("rows"):
                 notes.append(f"sheet {name!r}: the rows the model typed were replaced by the pasted table's")
             sh["rows"] = _without_trailing_blank_rows([list(r) for r in table.rows], name, notes)
@@ -1007,6 +1083,12 @@ def _fill_code_made_rows(raw: dict, req: ComposeRequest, notes: List[str]) -> Li
             columns = sh.get("columns")
             names = [c.get("name") for c in columns if isinstance(c, dict) and isinstance(c.get("name"), str)] if isinstance(columns, list) else []
             _usable_recipes(gen, names, name, notes)
+            bad_pattern = _id_pattern_problem(gen)
+            if bad_pattern:
+                # Before the schema validator, whose own `format(n=1)` probe
+                # would be the first gigabyte (#11).
+                problems.append(f"sheets.{index}.generator: {bad_pattern}")
+                continue
             try:
                 model = S.Generator.model_validate(gen)
             except ValidationError as exc:
@@ -1029,8 +1111,30 @@ def _fill_code_made_rows(raw: dict, req: ComposeRequest, notes: List[str]) -> Li
             except ValueError as exc:
                 problems.append(f"sheets.{index}.generator: {exc}")
                 continue
+            except MemoryError:
+                # The generator's own bounds should have refused first; a
+                # recipe that still exhausts memory is the model's to
+                # repair, never an escape into the shared process (#11).
+                problems.append(f"sheets.{index}.generator: the recipe needs more memory than a sheet may use; fewer rows or shorter cells")
+                continue
             sh["rows"] = rows
+        elif copied_any and isinstance(sh.get("rows"), list) and sh["rows"]:
+            n = len(sh["rows"])
+            notes.append(f"sheet {name!r}: {n} row{'s were' if n != 1 else ' was'} typed by the model, not copied from the pasted table")
     return problems
+
+
+def _id_pattern_problem(gen: dict) -> str:
+    """The first id column of `gen` whose pattern tables.id_pattern_problem
+    refuses, as a sentence naming the column; "" when every pattern is
+    fine. Read from the raw recipe so the check runs before any code
+    formats the pattern."""
+    for c in gen.get("columns") or []:
+        if isinstance(c, dict) and c.get("kind") == "id" and c.get("pattern") is not None:
+            problem = tables.id_pattern_problem(c.get("pattern"))
+            if problem:
+                return f"column {str(c.get('name') or '?')!r}: {problem}"
+    return ""
 
 
 def _without_trailing_blank_rows(rows: List[list], name: str, notes: List[str]) -> List[list]:
@@ -1058,7 +1162,9 @@ async def _validate_or_repair(req: ComposeRequest, budget: T.EffortBudget, raw: 
     is the one that renders."""
     notes = _reconcile_sources(raw, req.material)
     _pin_template(raw, req)
-    problems = _fill_code_made_rows(raw, req, notes)
+    # In a thread: a 10,000-row generator or copy is CPU the event loop
+    # must not spend (#11); the fill mutates `raw` and `notes` in place.
+    problems = await asyncio.to_thread(_fill_code_made_rows, raw, req, notes)
     if problems:
         summary = "\n".join(f"- {p}" for p in problems)
         lead = "The rows could not be filled from your sheet definitions:"
@@ -1075,7 +1181,7 @@ async def _validate_or_repair(req: ComposeRequest, budget: T.EffortBudget, raw: 
     )
     notes = _reconcile_sources(fixed, req.material)
     _pin_template(fixed, req)
-    problems = _fill_code_made_rows(fixed, req, notes)
+    problems = await asyncio.to_thread(_fill_code_made_rows, fixed, req, notes)
     if problems:
         log.info("artifact compose: the repair's rows could not be filled either: %s", " | ".join(problems)[:400])
         raise ComposeError("model_failure", "The model could not produce a valid document structure.")
@@ -1109,6 +1215,29 @@ _REWRITE_SCHEMA = {
 #: tokens in and about the same out — one call for the 34-row paste, 13
 #: for a 500-row sheet.
 REWRITE_BATCH_ROWS = 40
+#: Rewrite calls one compose job may make, over every sheet and rule —
+#: 60 batches is 2,400 rows, a large audit. A 10,000-row paste with one
+#: rule was 250 sequential calls on the engine chat shares, and the
+#: schema allows 60 rules × 8 sheets (security review 2026-09-12, #12);
+#: the rows past the budget keep their wording, with a warning.
+REWRITE_MAX_BATCHES = 60
+#: A column whose cells are these words is an OUTCOME, not prose: a
+#: rewrite rule on it is refused before the model sees a cell (#2: every
+#: 'Rejected' came back 'Selected'). The words are matched whole, case
+#: and whitespace folded, over the column's non-blank cells.
+_OUTCOME_WORDS = frozenset({
+    "selected", "rejected", "pass", "fail", "passed", "failed", "yes", "no", "y", "n", "true", "false", "approved", "declined",
+    "accepted", "hired", "not hired", "on hold", "hold", "completed", "complete", "incomplete", "pending", "open", "closed", "done",
+    "not done", "ok", "not ok", "go", "no go", "success", "failure", "successful", "unsuccessful", "won", "lost", "active", "inactive",
+    "high", "medium", "low", "critical", "positive", "negative", "neutral", "strong", "weak", "good", "bad", "poor", "excellent",
+    "shortlisted", "waitlisted", "withdrawn", "offer", "no offer", "n/a", "na", "-",
+})
+#: A column is categorical — a status, a grade, a stage — when it has at
+#: least this many filled cells, no more than a quarter of them distinct,
+#: and a median length under _CATEGORICAL_MEDIAN_CHARS. A three-row
+#: comment column (three distinct comments) is not caught by this.
+_CATEGORICAL_MIN_CELLS = 8
+_CATEGORICAL_MEDIAN_CHARS = 20
 
 
 def _rewrite_tokens(batch: Sequence[Tuple[int, str]]) -> int:
@@ -1140,16 +1269,35 @@ def _figures_kept(original: str, rewrite: str) -> bool:
     return set(S._figures_in_text(rewrite)) <= set(S._figures_in_text(original))
 
 
+def _not_prose(cells: Sequence[str]) -> str:
+    """Why this column must not be rewritten, or "": its cells are outcome
+    words (at least 60% of them), or it is a short categorical column
+    (#2). `cells` are the non-blank values, stripped."""
+    if not cells:
+        return ""
+    folded = [" ".join(c.lower().split()) for c in cells]
+    outcomes = sum(1 for c in folded if c in _OUTCOME_WORDS)
+    if outcomes * 5 >= len(folded) * 3:
+        return f"its cells are outcomes ({', '.join(sorted({c for c in cells if ' '.join(c.lower().split()) in _OUTCOME_WORDS})[:3])})"
+    distinct = len(set(folded))
+    if len(folded) >= _CATEGORICAL_MIN_CELLS and distinct * 4 <= len(folded) and statistics.median(len(c) for c in folded) < _CATEGORICAL_MEDIAN_CHARS:
+        return f"it is a category column ({distinct} distinct short values in {len(folded)} cells)"
+    return ""
+
+
 async def _rewrite_columns(req: ComposeRequest, spec: S.ArtifactSpec) -> Tuple[int, List[str], Dict[str, Any]]:
     """CONTRACT-2 §4 `Sheet.rewrite`: every rewrite column of every sheet,
     row by row in batches of REWRITE_BATCH_ROWS through one JSON call each
     (thinking off, temperature 0), joined back by row id through
     tables.apply_rewrites — one in, one out; a reply that loses a
-    timestamp or a quoted span, changes a figure, runs far too long or is
-    empty keeps the original with a warning naming the row; a batch whose
-    call fails keeps every original. Blank cells are never sent and stay
-    blank. Mutates the sheets. Returns (model calls, warnings, {rewritten,
-    kept_original, rewrite_columns})."""
+    timestamp or a quoted span, changes a figure or a negation, runs far
+    too long or is empty keeps the original with a warning naming the row;
+    a batch whose call fails keeps every original; a reply for a row the
+    batch was not shown is ignored (#4). A rule on an outcome or category
+    column is refused and dropped from the sheet (#2), and one job makes
+    at most REWRITE_MAX_BATCHES calls in all (#12). Blank cells are never
+    sent and stay blank. Mutates the sheets. Returns (model calls,
+    warnings, {rewritten, kept_original, rewrite_columns})."""
     body = spec.body
     if not isinstance(body, S.WorkbookSpec):
         return 0, [], {}
@@ -1158,21 +1306,36 @@ async def _rewrite_columns(req: ComposeRequest, spec: S.ArtifactSpec) -> Tuple[i
     rewritten = 0
     kept_total = 0
     columns: List[str] = []
+    budget = int(REWRITE_MAX_BATCHES)
+    unbudgeted = 0
     for sheet in body.sheets:
         by_name: Dict[str, int] = {}
         for j, c in enumerate(sheet.columns):
             by_name.setdefault(_fold(c.name), j)
+        refused: List[S.Rewrite] = []
         for rule in sheet.rewrite:
             j = by_name.get(_fold(rule.column))
             if j is None or not sheet.rows:
                 continue
-            columns.append(sheet.columns[j].name)
             batches = tables.rewrite_batches(sheet.rows, j, REWRITE_BATCH_ROWS)
+            why = _not_prose([text for batch in batches for _, text in batch])
+            if why:
+                # The rule leaves the spec too: the file's methodology note
+                # and the sentence must not say the column was rewritten.
+                refused.append(rule)
+                warnings.append(f"sheet {sheet.name!r}, column {rule.column!r}: not rewritten — {why}")
+                continue
+            columns.append(sheet.columns[j].name)
             originals = {i: text for batch in batches for i, text in batch}
             replies: Dict[int, str] = {}
             failed = 0
             for batch in batches:
+                if budget <= 0:
+                    unbudgeted += len(batch)
+                    continue
+                budget -= 1
                 calls += 1
+                shown = {i for i, _ in batch}
                 try:
                     answer = await _json(_rewrite_messages(sheet, rule, batch), _REWRITE_SCHEMA, "artifact_rewrite", thinking=False, max_tokens=_rewrite_tokens(batch))
                 except ComposeError as exc:
@@ -1180,7 +1343,8 @@ async def _rewrite_columns(req: ComposeRequest, spec: S.ArtifactSpec) -> Tuple[i
                     log.info("artifact compose: a rewrite batch failed (%s); originals kept", exc.category)
                     continue
                 for item in answer.get("rewrites") or []:
-                    if isinstance(item, dict) and isinstance(item.get("row"), int) and not isinstance(item.get("row"), bool) and isinstance(item.get("text"), str):
+                    # A batch answers only the rows it was shown (#4).
+                    if isinstance(item, dict) and isinstance(item.get("row"), int) and not isinstance(item.get("row"), bool) and item["row"] in shown and isinstance(item.get("text"), str):
                         replies[item["row"]] = item["text"]
             changed = [i for i, text in replies.items() if i in originals and not _figures_kept(originals[i], text)]
             for i in changed:
@@ -1193,6 +1357,10 @@ async def _rewrite_columns(req: ComposeRequest, spec: S.ArtifactSpec) -> Tuple[i
             warnings.extend(f"sheet {sheet.name!r}, column {rule.column!r}: {n}" for n in notes[:6])
             if failed:
                 warnings.append(f"sheet {sheet.name!r}, column {rule.column!r}: {failed} row{'s' if failed != 1 else ''} could not be rewritten (the model call failed) and keep the original")
+        if refused:
+            sheet.rewrite = [r for r in sheet.rewrite if r not in refused]
+    if unbudgeted:
+        warnings.append(f"{unbudgeted:,} row{'s' if unbudgeted != 1 else ''} kept the original wording: the rewrite budget of {REWRITE_MAX_BATCHES} batches ({REWRITE_MAX_BATCHES * REWRITE_BATCH_ROWS:,} rows) for one file was spent")
     if not columns:
         return calls, warnings, {}
     return calls, warnings, {"rewritten": rewritten, "kept_original": kept_total, "rewrite_columns": list(dict.fromkeys(columns))}
@@ -1342,5 +1510,5 @@ def material_from_history(history: Sequence[dict], *, max_chars: int = 24_000) -
 __all__ = [
     "ComposeError", "Source", "DataTable", "Material", "ComposeRequest", "ComposeResult",
     "compose", "outline", "content_review", "visual_review", "revise", "classify_intent",
-    "material_from_history", "requested_sections", "body_json_for_prompt", "REWRITE_BATCH_ROWS",
+    "material_from_history", "requested_sections", "body_json_for_prompt", "REWRITE_BATCH_ROWS", "REWRITE_MAX_BATCHES",
 ]

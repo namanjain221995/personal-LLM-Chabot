@@ -536,7 +536,8 @@ def test_generator_recipes_are_checked_by_name():
     _refused(lambda s: s["generator"]["columns"].__setitem__(5, {"name": "comment", "kind": "derived"}), "needs `derived: {op, columns}`")
     _refused(lambda s: s["generator"]["columns"].__setitem__(5, {"name": "comment", "kind": "text"}), "needs `text: {pool: [...]}`")
     _refused(lambda s: s["generator"]["columns"][3].update(unique=True), "unique is only meaningful for id, name, email, text")
-    _refused(lambda s: s["generator"]["columns"][0].update(pattern="{x}"), "must use only {n}")
+    _refused(lambda s: s["generator"]["columns"][0].update(pattern="{x}"), "must contain {n}")
+    _refused(lambda s: s["generator"]["columns"][0].update(pattern="{n}-{x}"), "must use only {n}")
     _refused(lambda s: s["generator"]["columns"][4].update(start="soon"), "is not an ISO date")
     _refused(lambda s: s["generator"]["columns"][4].update(start="2026-07-01"), "is after end")
     _refused(lambda s: s["generator"]["columns"][3].update(min=5, max=1), "min 5 is above max 1")
@@ -638,3 +639,12 @@ def test_an_impossible_explicit_format_is_dropped_with_a_warning():
     # document still cannot become a csv.
     assert formats.formats_for_conversion("workbook", ["docx", "pdf", "csv"]) == (["docx", "pdf", "csv"], [])
     assert formats.formats_for_conversion("document", ["csv"]) == ([], ["csv"])
+
+
+def test_an_id_pattern_is_read_before_it_is_ever_formatted():
+    """Security review 2026-09-12: `{n:0999999999d}` is a valid format that
+    allocates a gigabyte per call; the spec's own probe was the first one."""
+    with pytest.raises(ValidationError) as exc:
+        S.GenColumn.model_validate({"name": "id", "kind": "id", "pattern": "X-{n:0999999999d}"})
+    assert "width" in str(exc.value)
+    assert S.GenColumn.model_validate({"name": "id", "kind": "id", "pattern": "X-{n:06d}"}).pattern == "X-{n:06d}"

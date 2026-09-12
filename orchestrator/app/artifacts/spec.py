@@ -527,6 +527,14 @@ class GenColumn(_Strict):
         if self.kind == "text" and self.text is None:
             raise ValueError(f"{who} is text and needs `text: {{pool: [...]}}`")
         if self.kind == "id" and self.pattern:
+            # Read, never formatted first: `{n:0999999999d}` is a valid
+            # format that allocates a gigabyte per call (security review
+            # 2026-09-12); tables.id_pattern_problem inspects the spec.
+            from .tables import id_pattern_problem
+
+            problem = id_pattern_problem(self.pattern)
+            if problem:
+                raise ValueError(f"{who}: {problem}")
             try:
                 self.pattern.format(n=1)
             except (KeyError, IndexError, ValueError) as exc:

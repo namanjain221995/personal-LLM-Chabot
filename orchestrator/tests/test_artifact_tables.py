@@ -10,6 +10,7 @@ or invented.
 """
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import pytest
@@ -639,3 +640,127 @@ def test_apply_rewrites_keeps_the_original_when_a_reply_breaks_a_rule():
     assert 2 not in kept
     out, kept, warnings = X.apply_rewrites(ROWS, 1, {2: "x" * 13}, floor=0)
     assert 2 in kept
+
+
+# ------------------------------------------ security review 2026-09-12 --
+
+
+def test_a_bom_and_nuls_in_a_paste_are_stripped_before_the_split():
+    """#5 / #7: a paste copied from a UTF-8-BOM CSV kept U+FEFF in its first
+    header ('\\ufeffId'), which broke every lookup by column name and hid a
+    formula lead from the CSV neutraliser; and a NUL inside a markdown
+    cell came out as a literal pipe, because NUL was the sentinel for an
+    escaped `\\|`. Both are stripped before a line is split."""
+    table = X.parse_table("﻿Id\tName\n1\tAlice\n2\tBob\n")
+    assert table is not None and table.columns == ["Id", "Name"]
+    hostile = X.parse_table("﻿=cmd|' /C calc'!A0\tName\n1\tAlice\n2\tBob\n")
+    assert hostile is not None and hostile.columns[0] == "=cmd|' /C calc'!A0", "the lead is visible to the neutraliser again"
+    piped = X.parse_table("| Id | Comment |\n|---|---|\n| 1 | a\x00b |\n| 2 | c\\|d\x00e |\n")
+    assert piped is not None and piped.rows == [["1", "ab"], ["2", "c|de"]]
+    assert X.parse_table("\x00\x00") is None
+
+
+def test_the_csv_path_is_skipped_when_the_delimiter_never_occurs(monkeypatch):
+    """#10: a 5 MB paste of `a"b` lines (an unbalanced quote per line, no
+    comma anywhere) spent most of its ten seconds in the comma and
+    semicolon readers, two csv.reader calls per line for a delimiter the
+    text does not contain. The reader is not opened for a delimiter fewer
+    than three lines carry."""
+    calls = {"n": 0}
+    real = X._read_csv
+
+    def counting(text, delimiter):
+        calls["n"] += 1
+        return real(text, delimiter)
+
+    monkeypatch.setattr(X, "_read_csv", counting)
+    text = 'a"b\n' * 50_000
+    started = time.perf_counter()
+    assert X.parse_table(text) is None
+    assert calls["n"] == 0, "no comma, no semicolon: the csv reader was never opened"
+    assert time.perf_counter() - started < 2.0
+    # A real comma CSV with quoted, multi-line cells still parses.
+    table = X.parse_table('Id,Name,Comment\n1,A,"multi\nline"\n2,B,plain\n3,C,"x"\n')
+    assert table is not None and table.delimiter == "comma" and len(table.rows) == 3 and calls["n"] > 0
+
+
+def test_id_pattern_problem_refuses_a_width_that_would_allocate_gigabytes():
+    """#11: `{n:0999999999d}` passed every check (the schema validator's
+    own `format(n=1)` allocated the gigabyte) and OOMed the orchestrator
+    process. The pattern is read, never formatted, before a row is made."""
+    assert X.id_pattern_problem("CAND-{n:04d}") is None
+    assert X.id_pattern_problem("{n}") is None and X.id_pattern_problem("row {n!r}") is None
+    assert "width" in X.id_pattern_problem("{n:0999999999d}")
+    assert "width" in X.id_pattern_problem("{n:.999999999f}")
+    assert "nested" in X.id_pattern_problem("{n:{n}d}")
+    assert "{n}" in X.id_pattern_problem("X")
+    assert "{n}" in X.id_pattern_problem("{m}")
+    assert "only" in X.id_pattern_problem("{n}-{m}") and "only" in X.id_pattern_problem("{n}{}")
+    assert "long" in X.id_pattern_problem("x" * 300 + "{n}")
+    with pytest.raises(ValueError, match="width"):
+        X.generate_rows({"rows": 5, "columns": [{"name": "a", "kind": "id", "pattern": "{n:0999999999d}"}]})
+    with pytest.raises(ValueError, match="start"):
+        X.generate_rows({"rows": 5, "columns": [{"name": "a", "kind": "id", "pattern": "{n}", "start": 10 ** 40}]})
+
+
+def test_generate_rows_bounds_the_cells_the_cell_length_and_the_whole_sheet():
+    """#11: seven derived concat columns over twenty copies each are 20^7
+    copies of the first cell. A concat cell past GEN_MAX_CELL_CHARS, a
+    sheet past GEN_MAX_CHARS or past GEN_MAX_CELLS is refused by name
+    before it is built."""
+    chain = [{"name": "c0", "kind": "text", "text": {"pool": ["x" * 200]}}]
+    for k in range(1, 8):
+        chain.append({"name": f"c{k}", "kind": "derived", "derived": {"op": "concat", "columns": [f"c{k - 1}"] * 20}})
+    with pytest.raises(ValueError, match="c1.*concat.*characters"):
+        X.generate_rows({"rows": 5, "columns": chain})
+    assert X.GEN_MAX_CELL_CHARS < 20 * 200
+    # The whole sheet: 10,000 rows of 300-character phrases in ten columns is 30 million characters.
+    wide = [{"name": f"t{k}", "kind": "text", "text": {"pool": ["y" * 300]}} for k in range(10)]
+    with pytest.raises(ValueError, match="characters in all"):
+        X.generate_rows({"rows": T.MAX_ROWS_PER_SHEET, "columns": wide})
+    assert X.GEN_MAX_CHARS < T.MAX_ROWS_PER_SHEET * 10 * 300
+    # rows × columns is bounded too (GEN_MAX_CELLS), whatever the cells hold.
+    many = [{"name": f"i{k}", "kind": "int"} for k in range(T.MAX_COLUMNS_PER_SHEET)]
+    with pytest.raises(ValueError, match="cells"):
+        X.generate_rows({"rows": T.MAX_ROWS_PER_SHEET, "columns": many})
+    assert X.GEN_MAX_CELLS < T.MAX_ROWS_PER_SHEET * T.MAX_COLUMNS_PER_SHEET
+    # A sensible sheet is untouched: 2,000 rows × 13 columns of the fixture recipe.
+    rows, _ = X.generate_rows({**GENERATOR, "rows": 2000})
+    assert len(rows) == 2000 and len({r[1] for r in rows}) == 2000
+
+
+def test_apply_rewrites_keeps_the_negations_and_matches_quotes_as_whole_words():
+    """#2: the rewrite guard let 'did not pass' become 'passed', and found
+    the quoted "no" inside 'not'. A rewrite that changes the number of
+    negations keeps the original; a quoted span must survive as a whole
+    word, not as a substring of another."""
+    rows = [
+        ["a", "did not pass the basics"],
+        ["b", 'candidate said "no" to a retry'],
+        ["c", "no follow up, host said nothing good about it"],
+        ["d", "host didn't wait; candidate never answered"],
+    ]
+    out, kept, warnings = X.apply_rewrites(rows, 1, {
+        0: "passed the basics",
+        1: "candidate did not want a retry",
+        2: "follow-up was done; the host praised it",
+        3: "host waited and the candidate answered",
+    })
+    assert out == rows and kept == [0, 1, 2, 3]
+    assert warnings == [
+        "row 1: kept the original (a negation was changed: 1 in the original, 0 in the rewrite)",
+        "row 2: kept the original (quoted text 'no' missing)",
+        "row 3: kept the original (a negation was changed: 2 in the original, 0 in the rewrite)",
+        "row 4: kept the original (a negation was changed: 2 in the original, 0 in the rewrite)",
+    ]
+    # Faithful rewrites keep the count, contractions included, and the quote as a word.
+    out, kept, warnings = X.apply_rewrites(rows, 1, {
+        0: "Didn't pass the basics.",
+        1: 'The candidate said "no" to a retry.',
+        2: "No follow-up; the host said nothing good about it.",
+        3: "The host did not wait and the candidate never answered.",
+    })
+    assert kept == [] and warnings == []
+    assert out[0][1] == "Didn't pass the basics." and out[3][1].startswith("The host did not wait")
+    assert X.negations_in("cannot, won't, without, none, nobody, neither/nor") == 7
+    assert X.negations_in("nothing here is a knot or a note") == 1

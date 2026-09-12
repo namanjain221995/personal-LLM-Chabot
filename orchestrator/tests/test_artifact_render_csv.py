@@ -371,3 +371,37 @@ def test_grid_reader_returns_formulas_as_text_and_keeps_newlines(tmp_path):
     grid = C.read_csv_grid(path)
     assert grid["rows"] == [["'=SUM(A1)", "two\nlines"], ["-2", ""]]
     assert grid["total_rows"] == 2 and grid["truncated"] is False
+
+
+# ------------------------------------------ security review 2026-09-12 --
+
+
+def test_a_byte_order_mark_in_a_cell_is_stripped_so_the_lead_is_neutralised_and_the_file_validates(tmp_path):
+    """#5: a header copied from a UTF-8-BOM CSV kept U+FEFF, so the CSV
+    started with the three BOM bytes (validate_csv refused the whole
+    render) and a formula lead behind the mark was not neutralised. The
+    invisible zero-width characters (U+FEFF, U+200B, U+2060) are stripped
+    from every cell before the lead is looked at."""
+    path = tmp_path / "bom.csv"
+    report = C.write_csv(["﻿Id", "Name"], [["﻿=cmd|' /C calc'!A0", "​Alice⁠"], ["2", "Bob"]], path)
+    assert not path.read_bytes().startswith(b"\xef\xbb\xbf")
+    records = _read(path)
+    assert records[0] == ["Id", "Name"]
+    assert records[1] == ["'=cmd|' /C calc'!A0", "Alice"], "the lead behind the mark is neutralised, the marks are gone"
+    assert report["neutralised"] == 1 and report["neutralised_cells"] == [(2, 1)]
+    assert C.validate_csv(path)["ok"]
+    assert C.cell_text("﻿=1") == "=1" and C.is_formula_lead(C.cell_text("﻿=1"))
+
+
+def test_a_neutralised_cell_is_cut_so_the_apostrophe_fits_in_excels_limit(tmp_path):
+    """#6: the cut came before the apostrophe, so every cut formula-led
+    cell was 32,768 characters — one over the limit the module promises."""
+    path = tmp_path / "cut.csv"
+    report = C.write_csv(["Cell"], [["=" + "A" * 200_000], ["B" * 200_000], ["=" + "C" * 32_766]], path)
+    records = _read(path)
+    assert len(records[1][0]) == C.MAX_CELL_CHARS and records[1][0].startswith("'=A")
+    assert len(records[2][0]) == C.MAX_CELL_CHARS
+    assert records[3][0] == "'=" + "C" * 32_765 and len(records[3][0]) == C.MAX_CELL_CHARS, "exactly at the limit before the apostrophe: cut by one"
+    assert report["cut_cells"] == 3 and report["neutralised"] == 2
+    assert all(len(cell) <= C.MAX_CELL_CHARS for record in records for cell in record)
+    assert C.validate_csv(path, expected_rows=3)["ok"]

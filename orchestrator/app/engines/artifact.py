@@ -31,7 +31,17 @@ turns are parsed with tables.parse_table; the first table found travels as
 and the leading column is forward-filled only on evidence (a grouping header
 such as Host with blank continuation rows). What code did is the `transform`
 the completion sentence reports. An uploaded CSV in this conversation's
-dataset workspace is read the same way as "upload1".
+dataset workspace is read the same way as "upload1". The parse runs in a
+thread within a byte budget (security review of 2026-09-12, #10): four
+worst-case pastes held the event loop — every stream, heartbeat and health
+probe — for 43 seconds when it ran inline and unbounded.
+
+THE ENGINE'S REGEXES READ THE DECISION'S VIEW. Every instruction this
+module runs a regex over (formats.decide, the data-shaped test, the
+sentence's "audit") is whitespace-collapsed and cut at intent._DECIDE_CHARS
+first, as the rules cut theirs: the classifier path once handed the full
+message through, and a 60 KB paste cost seven seconds of event loop in
+formats' word-gap regex (#8).
 
 WHAT THE ENGINE NEVER DOES: invent an id, a filename, a URL or a completion
 state; paste the document into the chat; emit more than one meta.
@@ -52,6 +62,7 @@ from ..artifacts import pipeline
 from ..artifacts import tables
 from ..artifacts import types as T
 from ..artifacts import db as adb
+from ..artifacts import intent as intent_rules
 from ..artifacts.intent import ArtifactIntent
 from ..config import settings
 
@@ -179,26 +190,57 @@ def _turn_text(turn: dict) -> str:
     return str(content or "")
 
 
+def _decision_text(text: str) -> str:
+    """The rules' view of a message: whitespace collapsed, cut at
+    intent._DECIDE_CHARS — the only text this module runs a regex over
+    (#8). intent.decide builds `instruction` the same way; this is for an
+    intent that reached the engine with more than that."""
+    return " ".join((text or "").split())[:intent_rules._DECIDE_CHARS]
+
+
+def _utf8_len(text: str) -> int:
+    """UTF-8 bytes of `text`, without encoding a text that is over the
+    paste cap by its character count alone (a character is at least one
+    byte)."""
+    return len(text) if len(text) > tables.MAX_PASTE_BYTES else len(text.encode("utf-8"))
+
+
 def _pasted_tables(raw_text: str, history: Sequence[dict]) -> Tuple[List[C.DataTable], Dict[str, Any], List[str]]:
-    """The tables pasted into this turn and the last _TABLE_HISTORY_TURNS
-    user turns, newest first — at most two, as `paste1` and `paste2`
-    (CONTRACT-2 §11). Each is parsed by tables.parse_table (every line a
-    row, blanks kept) and its leading column forward-filled ONLY on
-    evidence (tables.forward_fill's rules: a grouping header, a text
-    column, ≥ 30% blank, every blank run under a filled cell). Returns the
-    tables, the transform report of the first (rows, blanks,
-    forward_filled, the filled column's label, the parse warnings) and
-    the notes the composer should read. A paste past the size caps is
-    returned with `truncated` in the report so the caller can refuse."""
-    texts: List[str] = [raw_text or ""]
+    """Blocking (the caller runs it in a thread). The tables pasted into
+    this turn and the last _TABLE_HISTORY_TURNS user turns, newest first
+    — at most two, as `paste1` and `paste2` (CONTRACT-2 §11). Each is
+    parsed by tables.parse_table (every line a row, blanks kept) and its
+    leading column forward-filled ONLY on evidence (tables.forward_fill's
+    rules: a grouping header, a text column, ≥ 30% blank, every blank run
+    under a filled cell). Returns the tables, the transform report of the
+    first (rows, blanks, forward_filled, the filled column's label, the
+    parse warnings) and the notes the composer should read. A paste past
+    the size caps is returned with `truncated` in the report so the
+    caller can refuse.
+
+    BOUNDED BEFORE A BYTE IS PARSED (#10). The turn's own text is cut at
+    the paste cap plus one character (parse_table then reports it
+    truncated, and the caller refuses with the count of the rows it saw);
+    a history turn over the cap is skipped — it was refused when it was
+    sent, or was never a table — and the turns are parsed newest first
+    only while the whole budget (tables.MAX_PASTE_BYTES, the same cap)
+    is unspent. So one request parses at most ~5 MB, in a thread, and a
+    history the client wrote cannot multiply that."""
+    cap = int(tables.MAX_PASTE_BYTES)
+    texts: List[str] = [(raw_text or "")[: cap + 1]]
     users = [t for t in history if str(t.get("role")) == "user"]
     texts.extend(_turn_text(t) for t in reversed(users[-_TABLE_HISTORY_TURNS:]))
     out: List[C.DataTable] = []
     transform: Dict[str, Any] = {}
     notes: List[str] = []
-    for text in texts:
+    budget = cap
+    for index, text in enumerate(texts):
         if len(out) >= 2:
             break
+        size = _utf8_len(text)
+        if index > 0 and (size > cap or size > budget):
+            continue
+        budget -= size
         try:
             parsed = tables.parse_table(text)
         except Exception as exc:  # noqa: BLE001 — a paste the parser chokes on is prose
@@ -494,6 +536,15 @@ def _sentence(ref: T.ArtifactRef, operation: str, warnings: Sequence[str], *, tr
             subject = "comments" if not cols or any("comment" in c.lower() for c in cols) else f"the {cols[0]} column"
             verb = "were" if subject == "comments" else "was"
             clauses.append(f"{subject} {verb} rewritten for clarity without changing the findings")
+        if t.get("typed_rows"):
+            # Rows the MODEL wrote beside the preserved ones — a summary
+            # sheet, or a sheet an injected cell asked for (security
+            # review 2026-09-12, #1): "preserved" must not cover them.
+            n = int(t["typed_rows"])
+            names = [str(x) for x in (t.get("typed_sheets") or [])]
+            where = (" and ".join([", ".join(names[:-1]), names[-1]]) if len(names) > 1 else names[0]) if names else "another"
+            clauses.append(f"{n:,} row{'s' if n != 1 else ''} on the {where} sheet{'s' if len(names) > 1 else ''} "
+                           f"{'were' if n != 1 else 'was'} written by the model, not copied from the paste")
         if clauses:
             line += " " + "; ".join(clauses) + "."
     elif dataset and any(f.format == "csv" and f.rows for f in ref.files):
@@ -600,7 +651,7 @@ async def run_artifact_engine(
     second artifact (review, 2026-09-11). Without one, the generation id.
     """
     effort = effort if effort in T.EFFORT_BUDGETS else "fast"
-    instruction = intent.instruction or text
+    instruction = _decision_text(intent.instruction or text)
     raw_text = intent.raw_text or text
 
     # 1. What exists already, for follow-ups. A create that the rules
@@ -671,7 +722,7 @@ async def run_artifact_engine(
     if operation == "create":
         # The pasted table(s), parsed from the ORIGINAL text — never from
         # the flattened instruction (CONTRACT-2 §6) — and the uploads.
-        pasted, transform, table_notes = _pasted_tables(raw_text, history)
+        pasted, transform, table_notes = await asyncio.to_thread(_pasted_tables, raw_text, history)
         if transform.get("truncated"):
             total = int(transform.get("total_rows") or 0)
             line = (f"The pasted table has {total:,} rows; the most I can take from one message is {tables.MAX_PASTE_ROWS:,} "
@@ -785,6 +836,10 @@ async def _published_transform(user_id: int, artifact_id: str, version: int) -> 
     if copied:
         out["rows"] = sum(len(sh.rows) for sh in copied)
         out["blanks"] = sum(1 for sh in copied for r in sh.rows for c in r if c is None or (isinstance(c, str) and not c.strip()))
+        typed = [sh for sh in sheets if not getattr(sh, "rows_are_code_made", False) and sh.rows]
+        if typed:
+            out["typed_rows"] = sum(len(sh.rows) for sh in typed)
+            out["typed_sheets"] = [sh.name for sh in typed]
     generated = [sh for sh in sheets if getattr(sh, "generator", None) is not None]
     if generated:
         out["generated"] = sum(len(sh.rows) for sh in generated)
@@ -817,7 +872,9 @@ async def classify_hook(text: str) -> Optional[ArtifactIntent]:
     verdict = await C.classify_intent(text)
     if not verdict or not verdict.get("wants_file"):
         return None
-    return ArtifactIntent("create", rule="model", instruction=text)
+    # The decision's view of the text, as the rules build it — never the
+    # whole message (#8); decide_with_hook keeps the original in raw_text.
+    return ArtifactIntent("create", rule="model", instruction=_decision_text(text))
 
 
 __all__ = ["run_artifact_engine", "compose_for_pipeline", "visual_reviewer", "classify_hook"]

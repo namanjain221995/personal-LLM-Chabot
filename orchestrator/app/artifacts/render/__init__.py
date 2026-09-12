@@ -178,6 +178,20 @@ TABULAR_MAX_PAGES = 200
 #: And python-docx writes ~400 rows a second (measured: 500×7 in 1.3 s), so
 #: the tabular Word document is refused past this many rows in total.
 TABULAR_MAX_ROWS = 6_000
+#: Rows alone did not bound the render's cost (security review of
+#: 2026-09-12, #13): a schema-valid 2,000 × 60 sheet — a third of the row
+#: ceiling — ran the worker to its 2 GB limit in 77 s, and 6,000 × 60 in
+#: 149 s, each attempt holding the single render slot. What the layout
+#: engine pays for is CELLS and text: the 500×7 figure above is 3,500
+#: cells; a 3,000-row, 9-column audit (27,000 cells) is a legitimate
+#: table and fits; 6,000 × 7 (42,000) ran to 376 pages and was refused by
+#: the page cap after 37 s, so the cell ceiling sits just under it, and
+#: a 60-column sheet may run to 666 rows. The text ceiling keeps a table
+#: of long comments inside the same budget: 40,000 cells × 50 characters.
+#: Both are checked before the subprocess starts; the Excel and CSV files
+#: still carry the whole table.
+TABULAR_MAX_CELLS = 40_000
+TABULAR_MAX_CHARS = 400_000  # measured 2026-09-12: 1.98 M chars of 50-char cells took 510 s in-process; the render window is 180 s
 
 
 @contextlib.contextmanager
@@ -290,6 +304,12 @@ def render_version(spec: S.ArtifactSpec, formats: Sequence[str], out_dir: str, *
     elif isinstance(body, S.WorkbookSpec):
         spec_for_validation = body
         report.transform.update(_spec_transform(body))
+        tabular = [f for f in ("docx", "pdf") if f in wanted]
+        if tabular:
+            # Refused before ANY file is written — the xlsx included — so
+            # a request that cannot end in a Word/PDF spends nothing of
+            # the render slot (#13).
+            _refuse_oversized_tabular(body)
         if "xlsx" in wanted:
             with timed("xlsx"):
                 add("primary", "xlsx", _render_xlsx(body, out, T.download_name(title_slug, version, "xlsx"), report))
@@ -297,15 +317,7 @@ def render_version(spec: S.ArtifactSpec, formats: Sequence[str], out_dir: str, *
             with timed("csv"):
                 for sheet, path, title, slug in _render_csvs(body, out, title_slug, version, report):
                     add("data", "csv", path, title=title, sheet=sheet.name, sheet_slug=slug)
-        tabular = [f for f in ("docx", "pdf") if f in wanted]
         if tabular:
-            total = sum(len(sh.rows) for sh in body.sheets)
-            if total > TABULAR_MAX_ROWS:
-                raise RenderError(
-                    "invalid_request",
-                    f"The Word/PDF version of this table would carry {total:,} rows; the ceiling is {TABULAR_MAX_ROWS:,}. "
-                    "Ask for the Excel or CSV file for a table this long.",
-                )
             max_pages = TABULAR_MAX_PAGES
             html = H.workbook_document_html(body, report.transform)
             if "docx" in tabular:
@@ -355,6 +367,33 @@ def render_version(spec: S.ArtifactSpec, formats: Sequence[str], out_dir: str, *
     if isinstance(body, S.PresentationSpec) and report.preview_pages != len(plan.slides):
         raise RenderError("validation_failure", "The slide preview does not have one page per slide.")
     return report
+
+
+def _refuse_oversized_tabular(body: S.WorkbookSpec) -> None:
+    """The tabular Word/PDF's three ceilings — rows, cells, characters of
+    cell text (see TABULAR_MAX_ROWS / _CELLS / _CHARS) — as one
+    invalid_request sentence that points at the Excel or CSV file."""
+    total = sum(len(sh.rows) for sh in body.sheets)
+    if total > TABULAR_MAX_ROWS:
+        raise RenderError(
+            "invalid_request",
+            f"The Word/PDF version of this table would carry {total:,} rows; the ceiling is {TABULAR_MAX_ROWS:,}. "
+            "Ask for the Excel or CSV file for a table this long.",
+        )
+    cells = sum(len(sh.rows) * len(sh.columns) for sh in body.sheets)
+    if cells > TABULAR_MAX_CELLS:
+        raise RenderError(
+            "invalid_request",
+            f"The Word/PDF version of this table would carry {cells:,} cells; the ceiling is {TABULAR_MAX_CELLS:,}. "
+            "Ask for the Excel or CSV file for a table this wide.",
+        )
+    chars = sum(len(c) if isinstance(c, str) else 8 for sh in body.sheets for r in sh.rows for c in r if c is not None)
+    if chars > TABULAR_MAX_CHARS:
+        raise RenderError(
+            "invalid_request",
+            f"The Word/PDF version of this table would carry {chars:,} characters of cell text; the ceiling is {TABULAR_MAX_CHARS:,}. "
+            "Ask for the Excel or CSV file for a table this large.",
+        )
 
 
 def _spec_transform(body: S.WorkbookSpec) -> Dict[str, object]:
@@ -510,4 +549,4 @@ def _render_xlsx(body: S.WorkbookSpec, out: Path, name: str, report: RenderRepor
     return target
 
 
-__all__ = ["RenderError", "RenderReport", "RenderedFile", "render_version", "capabilities", "TABULAR_MAX_PAGES", "TABULAR_MAX_ROWS"]
+__all__ = ["RenderError", "RenderReport", "RenderedFile", "render_version", "capabilities", "TABULAR_MAX_PAGES", "TABULAR_MAX_ROWS", "TABULAR_MAX_CELLS", "TABULAR_MAX_CHARS"]

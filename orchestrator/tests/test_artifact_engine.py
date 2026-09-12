@@ -597,7 +597,9 @@ def test_scenario_c_a_pasted_audit_table_is_preserved_across_four_files_and_the_
     assert [(f["role"], f["format"]) for f in ref["files"]] == [("primary", "xlsx"), ("data", "csv"), ("companion", "docx"), ("companion", "pdf")]
     assert ref["package"] == {"count": 4} and ref["download_all_url"].endswith("/zip")
     csv_file = next(f for f in ref["files"] if f["format"] == "csv")
-    assert csv_file["rows"] == 34 and csv_file["title"] == "IR Session Audit — Audit"
+    # A one-sheet workbook's CSV is the workbook, not "Book — Sheet" (the
+    # suffix is for a multi-sheet book only; pipeline._validate_files).
+    assert csv_file["rows"] == 34 and csv_file["title"] == "IR Session Audit"
     assert ref["preview_kind"] == "grid" and ref["preview_pages"] >= 1, "the PDF companion gives the grid version its pages"
     # The sentence: the transform, never "Updated", the data-only clause.
     assert answer.startswith("Done — I preserved 34 audit rows and created four files. 19 blank source fields stay blank; "
@@ -794,3 +796,129 @@ def test_compose_for_pipeline_puts_the_parents_copied_sheet_back_as_the_table_on
     assert req.material.tables[0].columns == ["Host", "Note"] and req.material.tables[0].rows == [["a", None], ["b", "x"]]
     asyncio.run(engine.compose_for_pipeline(Ctx("create")))
     assert captured["req"].material.tables == []
+
+
+# ------------------------------------------ security review 2026-09-12 --
+
+
+def test_the_classifier_hook_and_the_engines_regexes_see_the_decisions_view_of_the_text(owner, monkeypatch):
+    """#8: classify_hook returned an intent whose `instruction` was the
+    untruncated message, and run_artifact_engine ran formats.decide (a
+    regex with a word gap, quadratic over a comma-separated digit run) on
+    it on the event loop: 60 KB took seven seconds, a megabyte half an
+    hour. The hook bounds its verdict like the rules do, and the engine
+    bounds every instruction it runs a regex over."""
+    async def sure(text):
+        return {"wants_file": True, "kind": "workbook", "confidence": 0.95}
+
+    monkeypatch.setattr(C, "classify_intent", sure)
+    huge = "Build a hiring tracker with columns candidate, stage, owner, next step - that is what I need, ok? Data follows: " + "1," * 30000
+    verdict = asyncio.run(engine.classify_hook(huge))
+    assert verdict is not None and verdict.action == "create"
+    assert len(verdict.instruction) <= I._DECIDE_CHARS and verdict.instruction.startswith("Build a hiring tracker")
+
+    seen = {}
+    real = engine.F.decide
+
+    def recording(text, **kw):
+        seen["len"] = len(text)
+        return real(text, **kw)
+
+    monkeypatch.setattr(engine.F, "decide", recording)
+    composed = []
+    _install(monkeypatch, seen=composed)
+    events = []
+
+    async def emit(kind, data):
+        events.append((kind, data))
+
+    # An intent that still carries the whole text (an older hook, a
+    # caller that built one by hand) is bounded by the engine itself.
+    intent = I.ArtifactIntent("create", rule="classifier:model", instruction=huge, raw_text=huge)
+    asyncio.run(engine.run_artifact_engine(huge, [], emit, intent=intent, conversation_id="conv-e", user_id=owner, generation_id="gen-h"))
+    assert seen["len"] <= I._DECIDE_CHARS
+    assert len(composed[0]["instruction"]) <= I._DECIDE_CHARS, "the job's instruction is the decision's view too"
+    assert _meta(events)["artifacts"][0]["status"] == "completed"
+
+
+def test_pasted_tables_are_parsed_off_the_event_loop_and_within_a_byte_budget(owner, monkeypatch):
+    """#10: _pasted_tables parsed the current turn plus three history
+    turns synchronously on the event loop — four worst-case 5 MB pastes
+    held every stream, heartbeat and health probe for 43 seconds. The
+    parse now runs in a thread, a history turn over the paste cap is
+    never parsed, and the turns are read newest first until the byte
+    budget (one paste cap) is spent."""
+    import time as _time
+
+    from app.artifacts import tables as X
+
+    real = X.parse_table
+    parsed = []
+
+    def slow(text):
+        parsed.append(len(text.encode("utf-8")))
+        _time.sleep(0.3)
+        return real(text)
+
+    monkeypatch.setattr(X, "parse_table", slow)
+    _install(monkeypatch)
+    small = "Name\tScore\nA\t1\nB\t2\n"
+    fixture = _AUDIT.read_text(encoding="utf-8")
+    history = [{"role": "user", "content": fixture}, {"role": "assistant", "content": "ok"}, {"role": "user", "content": small}]
+    events = []
+
+    async def emit(kind, data):
+        events.append((kind, data))
+
+    async def run():
+        gaps = []
+
+        async def heartbeat():
+            last = _time.monotonic()
+            while True:
+                await asyncio.sleep(0.01)
+                now = _time.monotonic()
+                gaps.append(now - last)
+                last = now
+
+        beat = asyncio.create_task(heartbeat())
+        text = "Now make it an Excel file."
+        intent = I.decide(text)
+        await engine.run_artifact_engine(text, history, emit, intent=intent, conversation_id="conv-e", user_id=owner, generation_id="gen-p")
+        beat.cancel()
+        return max(gaps, default=float("inf"))
+
+    stall = asyncio.run(run())
+    assert len(parsed) == 3, "the turn and both user turns were looked at"
+    assert stall < 0.25, f"the event loop stalled {stall:.2f}s while the tables were parsed"
+    assert _meta(events)["artifacts"][0]["status"] == "completed"
+
+    # The byte budget: with the paste cap at 2,000 bytes, the 3 KB fixture
+    # in history is never parsed; two 1,100-byte turns spend the budget
+    # after the first (the newest).
+    parsed.clear()
+    monkeypatch.setattr(X, "parse_table", lambda text: (parsed.append(len(text.encode("utf-8"))), real(text))[1])
+    monkeypatch.setattr(X, "MAX_PASTE_BYTES", 2000)
+    tables_, transform, _ = engine._pasted_tables("Now make it an Excel file.", [{"role": "user", "content": fixture}, {"role": "user", "content": small}])
+    assert [t.id for t in tables_] == ["paste1"] and len(tables_[0].rows) == 2
+    assert len(fixture.encode("utf-8")) > 2000 and len(fixture.encode("utf-8")) not in parsed, "a history turn over the cap is skipped, not parsed"
+    parsed.clear()
+    older = "Name\tScore\n" + "\n".join(f"row{i}\t{i}" for i in range(120))
+    newer = "Name\tScore\n" + "\n".join(f"new{i}\t{i}" for i in range(120))
+    assert 1000 < len(older.encode("utf-8")) < 2000 and len(older) == len(newer)
+    tables_, _, _ = engine._pasted_tables("Now make it an Excel file.", [{"role": "user", "content": older}, {"role": "user", "content": newer}])
+    assert [t.id for t in tables_] == ["paste1"] and tables_[0].rows[0][0] == "new0", "the newest turn is read first"
+    assert parsed == [len("Now make it an Excel file."), len(newer.encode("utf-8"))], "the budget was spent before the older turn"
+
+
+def test_the_sentence_says_which_rows_the_model_typed_beside_the_preserved_ones():
+    """#1: a workbook built from a paste can carry a sheet the model typed
+    (a Bonus sheet with an invented row, a dashboard's summary); the
+    sentence said only 'preserved N rows'. It names the typed sheets."""
+    xlsx = T.FileRef(format="xlsx", filename="x.xlsx", mime_type="m", size=1, role="primary", rows=3)
+    transform = {"rows": 3, "blanks": 0, "typed_rows": 1, "typed_sheets": ["Bonus"]}
+    line = engine._sentence(_ref([xlsx]), "create", [], transform=transform, instruction="make an excel of this audit")
+    assert line == "Done — I preserved 3 audit rows and created one file. 1 row on the Bonus sheet was written by the model, not copied from the paste."
+    transform = {"rows": 34, "typed_rows": 5, "typed_sheets": ["Dashboard", "Summary"]}
+    line = engine._sentence(_ref([xlsx]), "create", [], transform=transform, instruction="make an excel of these rows")
+    assert line.endswith("5 rows on the Dashboard and Summary sheets were written by the model, not copied from the paste.")
