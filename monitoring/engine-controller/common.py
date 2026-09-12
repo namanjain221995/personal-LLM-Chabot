@@ -543,6 +543,16 @@ VLLM_SERIES = {
     "vllm:num_requests_waiting": "requests_waiting",
     "vllm:generation_tokens_total": "generation_tokens_total",
     "vllm:prompt_tokens_total": "prompt_tokens_total",
+    # Two more PROGRESS witnesses (2026-09-12, the ~950K needle on candidate
+    # B): vLLM counts a prompt's tokens only when its prefill FINISHES, so
+    # during one chunked 950K prefill both token counters sat flat for
+    # 12 minutes while requests were running — the exact shape of a wedge —
+    # and the controller confirmed WEDGED at 09:04:15Z (its restart was
+    # refused only by the budget). The scheduler-step counter advances on
+    # every iteration, chunked prefills included, and the KV usage rises
+    # with every chunk; either one moving means the engine is working.
+    "vllm:iteration_tokens_total_count": "iterations_total",
+    "vllm:kv_cache_usage_perc": "kv_cache_usage",
 }
 
 

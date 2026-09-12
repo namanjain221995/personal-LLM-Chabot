@@ -643,6 +643,60 @@ def test_wedged_from_frozen_tokens_and_outstanding_canary_with_two_observation_c
     assert world.ctl.state == "READY"
 
 
+def test_a_single_huge_prefill_with_flat_token_counters_is_saturation_not_a_wedge(world):
+    """2026-09-12 09:02–09:16Z, candidate B, the ~950K needle: vLLM counts a
+    prompt's tokens only when its prefill FINISHES, so both token counters sat
+    flat for 12 minutes with one request running while the scheduler stepped
+    through the chunks and the KV usage rose 0.09 → 0.56; the canary starved
+    behind it. The controller confirmed WEDGED at 09:04:15Z (the restart was
+    refused only by the budget). With the step counter and the KV usage as
+    progress witnesses the engine is DEGRADED (saturated), never restarted."""
+    world.cfg.canary_timeout_s = 300.0
+    world.make_ready()
+    world.heal_on_restart()
+    world.head.mode = "wedged"             # completions never answer: the canary starves
+    world.head.running = 1.0
+    world.head.progress_per_scrape = 0      # both token counters flat …
+    world.head.iterations = 1000.0          # … but the scheduler steps every scrape
+    world.head.iterations_per_scrape = 3
+    world.head.kv_per_scrape = 0.004        # … and the KV usage climbs chunk by chunk
+    world.tick()
+    world.clock.advance(world.cfg.canary_interval_s + 1)
+    world.tick()                            # the canary starts and hangs
+    assert world.ctl.canary.in_flight
+    for _ in range(8):                      # 13+ minutes of a starved canary on a stepping engine
+        world.clock.advance(100)
+        world.tick()
+    assert world.ctl.engine["frozen_seconds"] < world.cfg.frozen_s, "the witnesses moved: not frozen"
+    assert "wedged_frozen_tokens" not in world.ctl.pending
+    assert world.ctl.rec.in_progress is False
+    assert "WEDGED" not in [tr["to"] for tr in world.ctl.transitions]
+    assert "RECOVERING" not in [tr["to"] for tr in world.ctl.transitions]
+    assert world.order == []
+    assert "saturation" in (world.ctl._saturation_note or "") or world.ctl.state in ("DEGRADED", "BUSY", "READY")
+
+
+def test_a_build_without_the_step_counter_still_detects_a_true_wedge(world):
+    """A head whose /metrics lacks the step/KV series (older builds) keeps the
+    token-counter rule: flat counters with requests running and a starved
+    canary is still a wedge."""
+    world.cfg.canary_timeout_s = 300.0
+    world.make_ready()
+    world.heal_on_restart()
+    world.head.mode = "wedged"
+    world.head.running = 9.0
+    world.head.iterations = None
+    world.tick()
+    world.clock.advance(world.cfg.canary_interval_s + 1)
+    world.tick()
+    world.clock.advance(95)
+    world.tick()
+    world.tick()
+    assert [tr["to"] for tr in world.ctl.transitions][-2:] == ["WEDGED", "RECOVERING"]
+    world.head.release.set()
+    world.drive_recovery_to_ready()
+
+
 def test_frozen_counters_without_requests_is_not_a_wedge(world):
     world.make_ready()
     world.head.running = 0.0
@@ -762,12 +816,16 @@ def test_canary_timeouts_on_a_progressing_engine_are_saturation_not_a_wedge(worl
     assert world.ctl.rec.in_progress is False and world.head_restarts == []
     assert world.ctl.state == "DEGRADED" and "saturation" in world.ctl.reason, world.ctl.reason
     assert world.ctl.engine["frozen_seconds"] == 0.0
-    # …but not forever: past the starvation ceiling it is a wedge after all
+    # …and STILL not a wedge past the starvation ceiling: a progressing engine
+    # is never restarted (2026-09-12: one ~950K prefill held the canary for
+    # 13 minutes while every progress witness moved). Past the ceiling the
+    # reason only says so.
     world.clock.advance(world.cfg.canary_starvation_s)
     world.ctl.tick()
     world.ctl.canary.join(3.0)
     world.ctl.tick()
-    assert world.ctl.rec.in_progress and world.ctl.rec.category == "canary_timeout"
+    assert world.ctl.rec.in_progress is False and world.head_restarts == []
+    assert "large prefill" in (world.ctl._saturation_note or ""), world.ctl._saturation_note
     world.head.release.set()
 
 
@@ -932,10 +990,11 @@ def test_the_degraded_bound_keeps_the_saturation_exemption_for_timeouts(world):
     assert world.clock.time() - world.ctl.failing_since >= world.cfg.canary_fail_degraded_max_s
     assert world.ctl.rec.in_progress is False and world.head_restarts == []
     assert world.ctl.state == "DEGRADED" and "saturation" in world.ctl.reason, world.ctl.reason
-    # past the starvation ceiling the same streak is a wedge (rule 5 or 7: canary_timeout either way)
+    # past the starvation ceiling the same streak is STILL saturation while the
+    # engine progresses: neither rule 5 nor rule 7 restarts a working engine
     world.clock.advance(world.cfg.canary_starvation_s)
     world.ctl.tick()
-    assert world.ctl.rec.in_progress and world.ctl.rec.category == "canary_timeout"
+    assert world.ctl.rec.in_progress is False and world.head_restarts == []
     world.head.release.set()
 
 

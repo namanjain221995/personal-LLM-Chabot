@@ -280,6 +280,11 @@ def canary_engine_fault_kind(res: "CanaryResult") -> str:
 # ---------------------------------------------------------------------------
 
 
+#: The engine series a usable /metrics sample must carry (common.VLLM_SERIES
+#: keys); the step counter and the KV usage are progress witnesses, optional.
+REQUIRED_ENGINE_SERIES = ("requests_running", "requests_waiting", "generation_tokens_total", "prompt_tokens_total")
+
+
 @dataclass
 class Config:
     bind: str = "0.0.0.0"
@@ -1450,7 +1455,10 @@ class Controller:
             api["metrics"] = status
             if status == 200 and body:
                 sample = parse_vllm_metrics(body.decode("utf-8", "replace"))
-                if any(v is None for v in sample.values()):
+                # The four scheduler/token series are required; the two
+                # progress witnesses (step counter, KV usage) are optional —
+                # a build without them keeps the token-counter rule.
+                if any(sample.get(k) is None for k in REQUIRED_ENGINE_SERIES):
                     sample = None
                     api["metrics"] = 0  # answered, but without the engine series: not usable
         self.api = api
@@ -1467,15 +1475,26 @@ class Controller:
         """
         running = float(s["requests_running"] or 0.0)
         tokens = (float(s["generation_tokens_total"] or 0.0), float(s["prompt_tokens_total"] or 0.0))
-        moved = self._prev_tokens is None or tokens != self._prev_tokens
+        # Progress is ANY witness moving: a token counter, the scheduler-step
+        # counter (every iteration, including each chunk of a huge prefill
+        # that has not finished — vLLM counts prompt tokens only at the end
+        # of a prefill), or the KV usage (rises chunk by chunk). On
+        # 2026-09-12 a single ~950K prefill kept both token counters flat
+        # for 12 minutes; the step counter and the KV usage never stopped.
+        iterations = float(s.get("iterations_total") or 0.0) if s.get("iterations_total") is not None else None
+        kv = float(s.get("kv_cache_usage") or 0.0) if s.get("kv_cache_usage") is not None else None
+        witnesses = (tokens[0], tokens[1], iterations, None if kv is None else round(kv, 4))
+        moved = self._prev_tokens is None or witnesses != self._prev_tokens
         if moved or running <= 0:
             self._last_progress_at = now
-        self._prev_tokens = tokens
+        self._prev_tokens = witnesses
         self.engine = {
             "requests_running": running,
             "requests_waiting": float(s["requests_waiting"] or 0.0),
             "generation_tokens_total": tokens[0],
             "prompt_tokens_total": tokens[1],
+            "iterations_total": iterations,
+            "kv_cache_usage": kv,
             "frozen_seconds": max(0.0, now - self._last_progress_at) if running > 0 else 0.0,
             "observed_at": now,
         }
@@ -1843,12 +1862,21 @@ class Controller:
         d5 = f"{self.consecutive_timeouts} consecutive canary timeouts" if c5 else ""
         progressing = bool(fresh and (eng.get("requests_running") or 0) > 0
                            and eng.get("frozen_seconds", 0.0) < cfg.frozen_s)
-        starved = progressing and outstanding < cfg.canary_starvation_s
+        # A PROGRESSING engine is never a wedge, however long the canary
+        # starves behind it: one ~950K prefill legitimately holds a 4-token
+        # request for many minutes (2026-09-12, 09:02–09:16Z), and calling
+        # that a hang is exactly the shell watchdog's mistake of 01:20Z.
+        # Starvation is reported as DEGRADED (and VllmCanaryTtftHigh);
+        # CANARY_STARVATION_S now only decides when the note says "long".
+        starved = progressing
         if c5 and starved:
             c5 = False
             self._saturation_note = (f"canary timed out twice but the engine is progressing "
                                      f"({eng.get('requests_running'):.0f} running, "
-                                     f"{eng.get('requests_waiting') or 0:.0f} waiting): saturation, not a wedge")
+                                     f"{eng.get('requests_waiting') or 0:.0f} waiting, "
+                                     f"kv {100 * float(eng.get('kv_cache_usage') or 0):.0f}%): saturation, not a wedge"
+                                     + (f"; canary starved {outstanding:.0f}s (> {cfg.canary_starvation_s:.0f}s: a large prefill is holding the scheduler)"
+                                        if outstanding >= cfg.canary_starvation_s else ""))
         else:
             self._saturation_note = ""
         out["canary_timeout"] = (c5, d5)
@@ -1881,8 +1909,11 @@ class Controller:
         # on a progressing engine, bounded by CANARY_STARVATION_S).
         kind = canary_engine_fault_kind(res) if res is not None else ""
         failing_for = (now - float(self.failing_since)) if self.failing_since is not None else 0.0
+        # … and never while the engine demonstrably progresses (rule 7 is a
+        # bound on "awaiting confirmation", not a licence to restart a busy
+        # engine whose canary is merely starved).
         c7 = bool(proven and kind and health == 200 and failing_for >= cfg.canary_fail_degraded_max_s
-                  and not (kind == "canary_timeout" and starved))
+                  and not progressing)
         for key in ("canary_failing:timeout", "canary_failing:http_error"):
             out[key] = (False, "")
         if c7:

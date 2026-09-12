@@ -338,6 +338,12 @@ class FakeHead:
         #: The stream sends its tokens and then ends the body WITHOUT a
         #: finish_reason chunk or [DONE] (the head died mid-stream).
         self.truncate_stream = False
+        #: The two progress witnesses of a chunked prefill (None = not exposed,
+        #: like a build without them): the scheduler-step count and KV usage.
+        self.iterations = None
+        self.kv_usage = 0.0
+        self.iterations_per_scrape = 0
+        self.kv_per_scrape = 0.0
 
     @property
     def url(self) -> str:
@@ -345,6 +351,9 @@ class FakeHead:
 
     def metrics_text(self) -> str:
         self.gen_total += self.progress_per_scrape
+        if self.iterations is not None:
+            self.iterations += self.iterations_per_scrape
+            self.kv_usage = round(self.kv_usage + self.kv_per_scrape, 6)
         lbl = f'engine="0",model_name="{self.model_id}"'
         return (
             "# HELP vllm:num_requests_running Number of requests in model execution batches.\n"
@@ -357,6 +366,13 @@ class FakeHead:
             f"vllm:prompt_tokens_total{{{lbl}}} {self.prompt_total}\n"
             "# TYPE vllm:generation_tokens_total counter\n"
             f"vllm:generation_tokens_total{{{lbl}}} {self.gen_total}\n"
+            + (
+                "# TYPE vllm:iteration_tokens_total histogram\n"
+                f"vllm:iteration_tokens_total_count{{{lbl}}} {self.iterations}\n"
+                "# TYPE vllm:kv_cache_usage_perc gauge\n"
+                f"vllm:kv_cache_usage_perc{{{lbl}}} {self.kv_usage}\n"
+                if self.iterations is not None else ""
+            )
         )
 
     def start(self) -> None:

@@ -506,3 +506,16 @@ holds it after the container is gone), and the incident directories are
 evidence. If a recovery was in progress at rollback time, `docker ps` shows
 whether the head is back; `scripts/cluster-status.sh` reports the pair
 without the controller.
+
+
+## Progress witnesses (2026-09-12)
+
+`vllm:prompt_tokens_total` counts a prompt only when its prefill **finishes**, so a single
+chunked ~950K prefill keeps both token counters flat for minutes with a request running —
+the shape of a wedge. The controller therefore treats **any** of four witnesses moving as
+progress: `generation_tokens_total`, `prompt_tokens_total`, `iteration_tokens_total_count`
+(one per scheduler step, chunks included) and `kv_cache_usage_perc` (rises per chunk). A
+progressing engine is never a wedge: rules 4, 5 and 7 all require no witness to move; a
+canary starved behind a large prefill is DEGRADED ("saturation, not a wedge", with the
+starvation time once it exceeds `CANARY_STARVATION_S`). Builds without the two extra series
+keep the token-counter rule.

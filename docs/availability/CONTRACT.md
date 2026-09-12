@@ -64,7 +64,7 @@ Rules that must hold everywhere:
 | 9 | `/metrics` scrape available | controller: GET `/metrics` | `techsara_vllm_head_metrics_ok` |
 | 10 | metrics sample fresh | Prometheus: `time() - timestamp(vllm:generation_tokens_total{service="main"})` | recording rule `cluster:vllm_metrics_age_seconds` |
 | 11 | synthetic completion | controller canary (§5) | `techsara_vllm_synthetic_success` and friends |
-| 12 | token generation progressing | controller: `vllm:generation_tokens_total` + `vllm:prompt_tokens_total` deltas vs `num_requests_running` | `techsara_vllm_generation_frozen_seconds` |
+| 12 | engine progressing | controller: any of `vllm:generation_tokens_total`, `vllm:prompt_tokens_total`, `vllm:iteration_tokens_total_count` (scheduler steps) or `vllm:kv_cache_usage_perc` moving vs `num_requests_running` (v2.1: a chunked ~950K prefill keeps both token counters flat for minutes) | `techsara_vllm_generation_frozen_seconds` |
 | 13 | both ranks participating | a TP=2 completion cannot finish without rank 1 (synchronous all-reduce) **and** sentinel says rank alive; longer proof: `scripts/cluster-verify-engine.sh --probe` (both GPUs sampled) | `techsara_vllm_both_ranks_ok` |
 | 14 | orchestrator can reach the model | orchestrator `/health` dependency probe | existing `health` + `llm_engine_state_code` |
 | 15 | primary model active | orchestrator breaker CLOSED | `llm_breaker_state{engine="main"} == 0` |
@@ -193,8 +193,9 @@ Triggers (DETECT → CONFIRM), as implemented in v2:
 5. Two consecutive canary timeouts on a **proven** engine (each counted only if
    `/health` answered 200 when that probe started) → `canary_timeout`,
    regardless of what `/health` answers now (a hung API is a wedge too) —
-   **unless** a fresh `/metrics` sample shows the token counters moving with
-   requests running (saturation, not a wedge; bounded by `CANARY_STARVATION_S`).
+   **unless** a fresh `/metrics` sample shows any progress witness moving with
+   requests running (saturation, not a wedge — never a restart, however long the
+   canary starves; past `CANARY_STARVATION_S` the reason names the large prefill).
    All per-incarnation counters reset when the head's `started_at` changes, so a
    restart the controller did not perform never inherits stale timeouts.
 6. Three consecutive canary probes the engine **answered** with an error (a
