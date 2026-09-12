@@ -23,7 +23,7 @@ import {
 const useIsomorphicLayoutEffect =
   typeof window !== 'undefined' ? useLayoutEffect : useEffect;
 import { fetchMe, handleSessionEnd, userScopeKey } from '@/lib/auth';
-import { toClientError, type ClientError } from '@/lib/errorTypes';
+import { copyForCategory, toClientError, type ClientError } from '@/lib/errorTypes';
 import { downloadMarkdown } from '@/lib/exportMarkdown';
 import {
   getHistoryStore,
@@ -223,6 +223,7 @@ export function intentForRetry(question: ChatMessage | undefined): string {
     'waiting_for_attachments',
     'submitting',
     'accepted',
+    'queued',
     'processing',
   ];
   return intent?.id && reusable.includes(intent.state)
@@ -301,6 +302,15 @@ export function userTurnView(
       ...base,
       kind: ctx.reconnect?.statusUnknown ? 'status_unknown' : 'interrupted',
       resuming: Boolean(ctx.reconnect && !ctx.reconnect.exhausted),
+    };
+  }
+  if (intent?.state === 'queued') {
+    // Held for the main model's recovery (CONTRACT §8.3): the server has the
+    // request and will resume it. Waiting, never a failure — and "checking"
+    // only when the reconnect itself could not ask.
+    return {
+      ...base,
+      kind: ctx.reconnect?.statusUnknown ? 'status_unknown' : 'queued',
     };
   }
   // The server is generating for this conversation, or said it accepted the
@@ -925,6 +935,25 @@ export function ChatApp() {
           reason: 'The server stopped working on this answer.',
         });
         await loadInto(id, true);
+        return;
+      }
+      if (report.status === 'queued') {
+        // Parked for the main model's recovery (CONTRACT §8.3 step 5): held,
+        // not failed, not "never sent". The turn says so — in the server's
+        // own words when it already has them — and the poll keeps looking;
+        // the tick that finds `live` attaches to the resumed generation.
+        markIntentState(id, last.id, {
+          state: 'queued',
+          // A reason carried over from an earlier failure of the same
+          // intent describes something else; only a queued turn's is kept.
+          reason:
+            (last.meta?.intent?.state === 'queued'
+              ? last.meta.intent.reason
+              : undefined) ?? copyForCategory('MODEL_RECOVERING').message,
+          ...(report.generationId ? { generation_id: report.generationId } : {}),
+          attempt: report.attempt,
+        });
+        settleLoading(id);
         return;
       }
       // accepted / running with nothing live in this process yet: the answer

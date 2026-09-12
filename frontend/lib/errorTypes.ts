@@ -29,6 +29,15 @@ export type ErrorCategory =
   | 'APPLICATION_ERROR'
   | 'NETWORK_ERROR'
   | 'UNAUTHENTICATED'
+  /**
+   * Not a failure. The main model is recovering and the server is HOLDING
+   * the request (docs/availability/CONTRACT.md §8.3): the row is `queued`,
+   * the same generation resumes when the model is READY, and nothing has
+   * to be sent again. A category all the same, so the one place that turns
+   * a code into copy has a truthful sentence for the stream's parked frame —
+   * and so no component can mistake that frame for an error to paint red.
+   */
+  | 'MODEL_RECOVERING'
   | 'UNKNOWN_ERROR';
 
 /**
@@ -100,6 +109,16 @@ const COPY: Record<ErrorCategory, Copy> = {
     title: 'Signed out',
     message: 'Your session has ended. Please sign in again to continue.',
     // Retrying without a session yields the same 401; signing in is the fix.
+    retryable: false,
+  },
+  MODEL_RECOVERING: {
+    title: 'Main model recovering',
+    message:
+      'The main model is recovering. Your request is kept and will resume ' +
+      'automatically.',
+    // Nothing to retry: the server holds the request and resumes the SAME
+    // generation when the model is back. A second send would only queue a
+    // second copy of the question behind the first.
     retryable: false,
   },
   UNKNOWN_ERROR: {

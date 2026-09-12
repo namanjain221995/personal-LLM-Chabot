@@ -357,6 +357,14 @@ export type SendIntentState =
   | 'waiting_for_attachments'
   | 'submitting'
   | 'accepted'
+  /**
+   * 2026-09-12: accepted and HELD for the main model, which is recovering
+   * (docs/availability/CONTRACT.md §8.3). Live-but-waiting: the server keeps
+   * the request and resumes the same generation when the model is READY.
+   * Never a failure, never "never sent"; `reason` carries the server's own
+   * sentence for the turn to show.
+   */
+  | 'queued'
   | 'processing'
   | 'completed'
   | 'failed'
@@ -754,7 +762,13 @@ export interface ResearchRun {
   verification_rounds?: number;
 }
 
-export type MessageStatus = 'streaming' | 'done' | 'stopped' | 'error';
+/**
+ * `queued` (2026-09-12): the answer's stream ended with the main model still
+ * recovering and the request parked server-side — waiting, not failed. The
+ * durable copy is `meta.error` with code `MODEL_RECOVERING` (the same shape a
+ * reload finds); this live status is what tells the row not to paint it red.
+ */
+export type MessageStatus = 'streaming' | 'done' | 'stopped' | 'error' | 'queued';
 
 export interface ChatMessage {
   id: string;

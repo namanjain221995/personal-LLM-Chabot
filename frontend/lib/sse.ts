@@ -164,7 +164,20 @@ export type ChatStreamEvent =
     }
   | { kind: 'meta'; meta: import('./types').Meta }
   | { kind: 'done' }
-  | { kind: 'error'; message: string };
+  | {
+      kind: 'error';
+      message: string;
+      /**
+       * The server's classification of the terminal frame, when it sends
+       * one. `MODEL_RECOVERING` with `resumable: true` is not a failure at
+       * all — the request is parked for the main model and resumes as the
+       * same generation (CONTRACT §8.3 step 5); lib/streams.ts renders it
+       * as a queued turn. Both optional: an older orchestrator sends only
+       * the sentence.
+       */
+      code?: string;
+      resumable?: boolean;
+    };
 
 /**
  * Map one raw SSE event to the chat contract.
@@ -258,13 +271,21 @@ export function toChatStreamEvent(ev: SSEEvent): ChatStreamEvent | null {
       case 'done':
         return { kind: 'done' };
       case 'error': {
-        const parsed = JSON.parse(ev.data) as { message?: unknown };
+        const parsed = JSON.parse(ev.data) as {
+          message?: unknown;
+          code?: unknown;
+          resumable?: unknown;
+        };
         return {
           kind: 'error',
           message:
             typeof parsed.message === 'string'
               ? parsed.message
               : 'The engine reported an error without details.',
+          ...(typeof parsed.code === 'string' ? { code: parsed.code } : {}),
+          ...(typeof parsed.resumable === 'boolean'
+            ? { resumable: parsed.resumable }
+            : {}),
         };
       }
       default:
