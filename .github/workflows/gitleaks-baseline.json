@@ -21,9 +21,18 @@
     "TO ADD an entry: only after establishing the value is not a real secret.",
     "TO REMOVE: the gate tells you when an entry stops being reported.",
     "",
-    "REACHABILITY: a fingerprint is <commit>:<file>:<rule>:<line>, so an entry is only ever reported if CI's clone CONTAINS that commit. This baseline was first built from the local repository, which had unpushed branches, and one entry (scripts/application_isolation.py, commit 34a7e3c, reachable only from backup/assignment-20260906, feat/general-ai-20260906 and rescue/codex-techsara-release-20260905) was therefore STALE on the first real run: the gate correctly failed because a baselined finding was not reported. Only add fingerprints whose commit is reachable from a pushed branch. If those branches are ever pushed, the finding returns as NEW and the gate will say so -- which is the intended behaviour, not a regression."
+    "REACHABILITY: a fingerprint is <commit>:<file>:<rule>:<line>, so an entry is only ever reported if CI's clone CONTAINS that commit. This baseline was first built from the local repository, which had unpushed branches, and one entry (scripts/application_isolation.py, commit 34a7e3c, reachable only from backup/assignment-20260906, feat/general-ai-20260906 and rescue/codex-techsara-release-20260905) was therefore STALE on the first real run: the gate correctly failed because a baselined finding was not reported. Only add fingerprints whose commit is reachable from a pushed branch. If those branches are ever pushed, the finding returns as NEW and the gate will say so -- which is the intended behaviour, not a regression.",
+    "",
+    "2026-09-12 (reviewed, three more entropy hits, none a credential):",
+    "  * frontend/tests/artifact-card.test.tsx, commit 321cf70, lines 336 and 369",
+    "                            - the fixture file id `activeKey=\"fedcba…\"` a card test",
+    "                              passes to mark the file the panel is showing: the",
+    "                              16-hex file-id SHAPE of CONTRACT-2 §2, accepted nowhere;",
+    "  * docs/availability/ADR-0002-high-availability.md, commit d2d15a7, line 95",
+    "                            - prose naming the config key ADMISSION_NORMAL_MAX",
+    "                              and its value 10 beside the word `tokens`."
   ],
-  "reviewed": "2026-09-07",
+  "reviewed": "2026-09-12",
   "findings": [
     {
       "fingerprint": "187d950902882905b969149fdd2ffc8f24eb73d5:docs/_evidence/sync-worker.md:generic-api-key:230",
@@ -96,6 +105,24 @@
       "rule": "generic-api-key",
       "file": "launcher/tests/test_environment.py",
       "line": 221
+    },
+    {
+      "fingerprint": "321cf701b98ae438a60ca25932a0ed9573e76d3f:frontend/tests/artifact-card.test.tsx:generic-api-key:336",
+      "rule": "generic-api-key",
+      "file": "frontend/tests/artifact-card.test.tsx",
+      "line": 336
+    },
+    {
+      "fingerprint": "321cf701b98ae438a60ca25932a0ed9573e76d3f:frontend/tests/artifact-card.test.tsx:generic-api-key:369",
+      "rule": "generic-api-key",
+      "file": "frontend/tests/artifact-card.test.tsx",
+      "line": 369
+    },
+    {
+      "fingerprint": "d2d15a78c50d9ae6e266baebe34fc944bb0481b0:docs/availability/ADR-0002-high-availability.md:generic-api-key:95",
+      "rule": "generic-api-key",
+      "file": "docs/availability/ADR-0002-high-availability.md",
+      "line": 95
     }
   ]
 }
