@@ -598,3 +598,110 @@ def test_a_controller_restart_that_says_starting_does_not_queue_anyone(world, mo
     out = _turn(world, lambda: llm.chat_completion(_HISTORY, thinking=False))
     assert out == "from the main model" and world.said == []
     assert world.breaker.state == breaker.CLOSED
+
+
+# ---------------------------------------------------------------------------
+# Round-2 review findings (docs/availability/REVIEW-FINDINGS-round2.md)
+# ---------------------------------------------------------------------------
+
+
+def test_sizing_never_asks_tokenize_of_an_engine_the_breaker_refuses(world, monkeypatch):
+    """llm.py:406 (CONTRACT §8.2 'while OPEN, no caller polls the dead
+    port'): the prompt sizing (a /tokenize round trip) waits at the gate
+    like the send does, so a queued turn touches the port only once the
+    breaker admits it — and the person is told through the same hold."""
+    _verdict("RECOVERING", world.clock)
+    world.clock.on_sleep = _poller(world.clock, "RECOVERING", ready_after_s=20.0)
+    sized_at: list = []
+    passthrough = llm.context.fit_request  # the world's stub
+
+    async def fit(messages, **kwargs):
+        sized_at.append(world.clock.now)
+        return await passthrough(messages, **kwargs)
+
+    monkeypatch.setattr(llm.context, "fit_request", fit)
+    out = _turn(world, lambda: llm.chat_completion(_HISTORY, thinking=False), queue_s=900.0)
+    assert out == "from the main model"
+    assert sized_at and all(t >= 1000.0 + 20.0 for t in sized_at), sized_at
+    assert world.said == [continuity.QUEUED_LINE]
+    assert _counter("llm_resumed_generations_total", outcome="resumed") == 1
+
+
+def test_a_sidecar_on_the_main_url_fails_fast_without_the_hold(world, monkeypatch):
+    """resilience.py:549: a sidecar call on the MAIN URL (router configured
+    onto the main endpoint) has no window: it never enters the turn's
+    hold, never speaks, never parks — and never touches /tokenize either."""
+    monkeypatch.setattr(settings, "router_base_url", MAIN_URL)
+    _verdict("RECOVERING", world.clock)
+    world.clock.on_sleep = _poller(world.clock, "RECOVERING", ready_after_s=1e9)
+    with pytest.raises(resilience.ModelUnavailable):
+        _turn(world, lambda: llm.router_chat_completion(_HISTORY), queue_s=900.0)
+    assert world.sized == [] and world.main.calls == []
+    assert world.said == []
+    assert _counter("llm_resumed_generations_total", outcome="expired") == 0
+    assert _counter("llm_engine_unavailable_total", what="router_chat_completion", reason="breaker_open") == 1
+
+
+def test_wait_admitted_queues_on_the_hold_and_parks_at_the_window(world):
+    """resilience.wait_admitted (the Deep Research up-front park): the gate
+    without a call — queued on the hold, resumed on READY as attempt 2, or
+    parked with the second sentence when the window closes."""
+    _verdict("RECOVERING", world.clock)
+    world.clock.on_sleep = _poller(world.clock, "RECOVERING", ready_after_s=20.0)
+    gens: list = []
+
+    async def wait_then_report():
+        await resilience.wait_admitted(what="deep_research", base_url=MAIN_URL)
+        gens.append(continuity.current().gen)
+
+    _turn(world, wait_then_report, queue_s=900.0)
+    assert world.said == [continuity.QUEUED_LINE]
+    assert gens[0].attempt == 2 and gens[0].retry_reason == "recovery"
+    assert world.main.calls == []
+    world.said.clear()
+    _verdict("DOWN", world.clock)
+    world.clock.on_sleep = _poller(world.clock, "DOWN", ready_after_s=1e9)
+    with pytest.raises(continuity.QueuedForRecovery):
+        _turn(world, lambda: resilience.wait_admitted(what="deep_research", base_url=MAIN_URL), queue_s=60.0)
+    assert world.said == [continuity.QUEUED_LINE, continuity.EXPIRED_LINE]
+    assert _counter("llm_resumed_generations_total", outcome="expired") == 1
+
+
+def test_best_of_candidates_carry_the_park_out_once(world, monkeypatch):
+    """continuity.py:187 (both lenses): three candidates queue on the one
+    hold; the window parks the turn ONCE — one EXPIRED_LINE, one expired
+    count — and generate_candidates raises QueuedForRecovery instead of
+    returning error candidates that fall through to a second wait."""
+    from app.core import best_of
+
+    monkeypatch.setattr(settings, "extra_high_samples", 3)
+    _verdict("DOWN", world.clock)
+    world.clock.on_sleep = _poller(world.clock, "DOWN", ready_after_s=1e9)
+    with pytest.raises(continuity.QueuedForRecovery):
+        _turn(world, lambda: best_of.generate_candidates(_HISTORY, n=3, temperature=0.3, max_tokens=64),
+              queue_s=60.0)
+    assert world.said == [continuity.QUEUED_LINE, continuity.EXPIRED_LINE]
+    assert _counter("llm_resumed_generations_total", outcome="expired") == 1
+    assert world.main.calls == []
+
+
+def test_a_parked_turns_next_call_raises_at_once_instead_of_waiting_a_second_window(world):
+    """continuity.py:187: after the park, a further main-model call of the
+    same turn (the single-stream fallthrough after best-of-N) raises
+    QueuedForRecovery immediately: no second window, no repeated lines."""
+    _verdict("DOWN", world.clock)
+    world.clock.on_sleep = _poller(world.clock, "DOWN", ready_after_s=1e9)
+
+    async def two_calls():
+        try:
+            await llm.chat_completion(_HISTORY, thinking=False)
+        except continuity.QueuedForRecovery:
+            pass  # an "upgrade, never a gate" handler swallowed it
+        before = world.clock.now
+        with pytest.raises(continuity.QueuedForRecovery):
+            await llm.chat_completion(_HISTORY, thinking=False)
+        assert world.clock.now == before, "no second wait"
+
+    _turn(world, two_calls, queue_s=60.0)
+    assert world.said == [continuity.QUEUED_LINE, continuity.EXPIRED_LINE]
+    assert _counter("llm_resumed_generations_total", outcome="expired") == 1

@@ -710,28 +710,31 @@ def test_a_restart_with_the_answer_already_persisted_replays_instead_of_answerin
         {"route": "chat", "generation_id": "gen-dead-1", "intent_id": "int-dead-1", "attempt": 1},
     )
     with TestClient(app) as client:
-        assert db.get_chat_request("int-dead-1")["status"] == "interrupted"
-        report = client.get("/chat/requests/int-dead-1").json()
-        assert report["status"] == "interrupted" and report["answer_persisted"] is True
-        # The browser's re-attach after the restart.
-        resp = client.get("/chat/attach/dead-1")
-        assert resp.status_code == 200
-        events = _parse_sse(resp.text)
-        assert [k for k, _ in events] == ["meta", "token", "meta", "done"]
-        assert events[0][1] == {"generation_id": "gen-dead-1", "intent_id": "int-dead-1", "attempt": 1}
-        assert events[1][1] == {"text": "The whole answer."}
-        assert calls == [], "the answer exists: the model is not run again"
+        # Startup marked the row `interrupted`; the start-up sweep (round 2:
+        # it lists interrupted rows too) finds the durable answer and HEALS
+        # the row to `completed` — the answer wins, nothing runs.
+        import time as _time
+
+        deadline = _time.monotonic() + 8.0
+        while _time.monotonic() < deadline and db.get_chat_request("int-dead-1")["status"] != "completed":
+            _time.sleep(0.05)
         row = db.get_chat_request("int-dead-1")
         assert row["status"] == "completed" and row["attempt"] == 1 and row["generation_id"] == "gen-dead-1"
-        assert client.get("/chat/requests/int-dead-1").json()["status"] == "completed"
-        # Nothing to resume any more; a repeat of the send replays too.
+        report = client.get("/chat/requests/int-dead-1").json()
+        assert report["status"] == "completed" and report["answer_persisted"] is True
+        assert calls == [], "the answer exists: the model is not run again"
+        # The browser's re-attach after the restart: finished — load history.
         assert client.get("/chat/attach/dead-1").status_code == 404
+        # A repeat of the send replays the durable answer.
         again = _parse_sse(client.post("/chat", json=_body("dead-1", "int-dead-1", message="what happened?")).text)
+        assert [k for k, _ in again] == ["meta", "token", "meta", "done"]
+        assert again[0][1] == {"generation_id": "gen-dead-1", "intent_id": "int-dead-1", "attempt": 1}
         assert again[1][1] == {"text": "The whole answer."} and calls == []
     assert [m["role"] for m in db.list_messages("dead-1")] == ["user", "assistant"]
     assert len(_assistant_rows("dead-1")) == 1
-    assert _counter("chat_request_total", result="replayed") == 2
+    assert _counter("chat_request_total", result="replayed") == 1
     assert _counter("chat_request_total", result="resumed") == 0
+    assert _counter("llm_resumed_generations_total", outcome="duplicate_suppressed") == 1
 
 
 def test_a_restart_mid_stream_resumes_once_under_attempt_two(monkeypatch):
@@ -740,9 +743,12 @@ def test_a_restart_mid_stream_resumes_once_under_attempt_two(monkeypatch):
     real lifespan exit — the row is marked `interrupted`, the loop teardown
     cancels the worker, which records the attempt as interrupted (not
     cancelled: nobody pressed Stop) and persists nothing. Process two's
-    startup finds the row, the browser re-attaches, and the question is
-    answered ONCE more under attempt 2 with `retry_reason: lost_process` —
-    one assistant row in the thread, two attempts in the ledger."""
+    start-up sweep finds the row and — CONTRACT §8.4, round 2: the attempt
+    had streamed a token, so nothing re-runs it by itself — settles it
+    `failed` for a Retry; the browser's re-attach ends like a finished one
+    (404) and the PERSON's retry answers ONCE more under attempt 2 with
+    `retry_reason: failed` — one assistant row in the thread, two attempts
+    in the ledger."""
     calls: list = []
     body = _body("boot-1", "int-boot-1")
 
@@ -790,19 +796,33 @@ def test_a_restart_mid_stream_resumes_once_under_attempt_two(monkeypatch):
     monkeypatch.setattr(app_main, "_shutting_down", False)
     monkeypatch.setattr(llm, "stream_chat_events", _fake_stream([("token", "Hello again")], calls))
     with TestClient(app) as client:
-        assert db.get_chat_request("int-boot-1")["status"] == "interrupted"
+        # The start-up sweep settles the row: the ledger says a token had
+        # streamed, so the attempt is not re-run by itself (§8.4).
+        import time as _time
+
+        deadline = _time.monotonic() + 8.0
+        while _time.monotonic() < deadline and db.get_chat_request("int-boot-1")["status"] != "failed":
+            _time.sleep(0.05)
+        from app import continuity
+
         report = client.get("/chat/requests/int-boot-1").json()
         assert report == {
             "intent_id": "int-boot-1",
             "conversation_id": "boot-1",
-            "status": "interrupted",
+            "status": "failed",
             "generation_id": gen.generation_id,
             "attempt": 1,
             "resumable": True,
             "answer_persisted": False,
             "live": False,
         }
-        events = _parse_sse(client.get("/chat/attach/boot-1").text)
+        assert db.get_chat_request("int-boot-1")["error"] == continuity.INTERRUPTED_NOTHING_KEPT
+        assert calls == [1], "nothing re-ran it"
+        # The browser's automatic re-attach: finished — load history (the
+        # failed turn with its Retry).
+        assert client.get("/chat/attach/boot-1").status_code == 404
+        # The person's Retry: attempt 2, once.
+        events = _parse_sse(client.post("/chat", json=body).text)
         assert events[0][1]["intent_id"] == "int-boot-1" and events[0][1]["attempt"] == 2
         assert events[-1][0] == "done"
         assert "".join(d["text"] for k, d in events if k == "token") == "Hello again"
@@ -817,7 +837,7 @@ def test_a_restart_mid_stream_resumes_once_under_attempt_two(monkeypatch):
     assert len(rows) == 1 and rows[0]["generation_id"] == row["generation_id"]
     assert [(r["attempt"], r["retry_reason"], r["terminal_state"]) for r in _ledger("int-boot-1")] == [
         (1, "none", "interrupted"),
-        (2, "lost_process", "completed"),
+        (2, "failed", "completed"),
     ]
     assert _counter("chat_request_resume_total") == 1
 

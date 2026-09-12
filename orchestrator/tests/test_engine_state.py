@@ -334,11 +334,16 @@ def test_health_carries_the_snapshot_and_the_breakers_without_probing(clock, mon
     monkeypatch.setattr(health, "_check_app_db", lambda: {"status": "ok"})
     monkeypatch.setattr(health, "_check_embedding_index", lambda: {"status": "empty"})
     report = asyncio.run(health.check_dependencies())
-    # The view rides on the main model's entry and never moves `status`:
-    # an OPEN breaker is the orchestrator protecting itself, not a reason
-    # to restart the orchestrator.
-    assert report["status"] == "ok"
-    assert report["checks"]["vllm"]["status"] == "ok"
+    # The view rides on the main model's entry — and since the round-2
+    # review (health.py:764) that entry's `status` follows the verdict: a
+    # /health that answers 200 proves nothing (CONTRACT §2), so a reader of
+    # checks.vllm.status alone must not read a WEDGED engine as healthy.
+    # The probe's own answer survives as `reachable`. The container
+    # healthcheck gates on /healthz, not on this field.
+    assert report["status"] == "degraded"
+    assert report["checks"]["vllm"]["status"] == "degraded"
+    assert report["checks"]["vllm"]["reachable"] is True
+    assert report["checks"]["vllm"]["detail"] == "answer engine not serving: controller says WEDGED; breaker OPEN (held by WEDGED)"
     engine = report["checks"]["vllm"]["engine"]
     assert engine["controller"]["state"] == "WEDGED"
     assert engine["breakers"]["main"]["state"] == "OPEN"
@@ -416,16 +421,19 @@ def test_starting_from_a_controller_restart_does_not_open(clock):
 
 
 @pytest.mark.parametrize(
-    "extra",
+    "make_extra",
     [
-        {"incident": {"id": "20260912T000000Z", "category": "head_engine_dead"}},
-        {"signals": {"head_container": {"running": True, "started_at": _time.time() - 30.0, "engine_process_alive": True}}},
-        {"signals": {"head_container": {"running": False, "started_at": _time.time() - 7200.0}}},
-        {"signals": {"head_container": {"running": True, "started_at": _time.time() - 7200.0, "engine_process_alive": False}}},
-        {"signals": {}},  # nothing to qualify it with: taken at its word
+        lambda: {"incident": {"id": "20260912T000000Z", "category": "head_engine_dead"}},
+        # Built at RUN time, not at collection: a long session between the
+        # two would age a 30 s-old head past the cold-start budget.
+        lambda: {"signals": {"head_container": {"running": True, "started_at": _time.time() - 30.0, "engine_process_alive": True}}},
+        lambda: {"signals": {"head_container": {"running": False, "started_at": _time.time() - 7200.0}}},
+        lambda: {"signals": {"head_container": {"running": True, "started_at": _time.time() - 7200.0, "engine_process_alive": False}}},
+        lambda: {"signals": {}},  # nothing to qualify it with: taken at its word
     ],
 )
-def test_a_real_starting_opens(clock, extra):
+def test_a_real_starting_opens(clock, make_extra):
+    extra = make_extra()
     controller = _Controller()
     controller.reply = (200, _doc("STARTING", primary_ready=False, **extra))
     asyncio.run(_poll(controller))
@@ -502,3 +510,83 @@ def test_controller_url_accepts_the_scripts_base_url_shape():
     assert _controller_state_url("http://127.0.0.1:9838/") == "http://127.0.0.1:9838/state"
     assert _controller_state_url("http://vllm:9838/state") == "http://vllm:9838/state"
     assert _controller_state_url("") == ""
+
+
+# ---------------------------------------------------------------------------
+# Round 2 (engine_state.py:356): the READY edge after ANY not-serving gap
+# ---------------------------------------------------------------------------
+
+
+def test_the_ready_edge_fires_after_an_unknown_gap(clock):
+    """READY → (controller unreachable/stale, or MONITORING_UNKNOWN) → READY
+    is an edge: the engine may have died and been restarted inside a gap in
+    which nothing was proven, with rows parked by the breaker's own
+    failures. Only a fresh SERVING snapshot after SERVING is not one."""
+    controller = _Controller()
+    fired: list = []
+    engine_state.on_ready(lambda: fired.append(1))
+
+    async def run():
+        await _poll(controller)  # READY
+        assert fired == [1]
+        await _poll(controller)  # READY again: no edge
+        assert fired == [1]
+        # The controller goes away long enough for the snapshot to go stale.
+        controller.error = httpx.ConnectError("gone")
+        for _ in range(3):
+            clock.now += engine_state.stale_after_s()
+            await _poll(controller)
+        assert engine_state.unknown() and fired == [1]
+        controller.error = None
+        controller.reply = (200, _doc("READY"))
+        await _poll(controller)
+        assert fired == [1, 1], "READY after an unreachable gap is an edge"
+        # MONITORING_UNKNOWN is a gap of its own kind.
+        controller.reply = (200, _doc("MONITORING_UNKNOWN"))
+        await _poll(controller)
+        assert fired == [1, 1]
+        controller.reply = (200, _doc("READY"))
+        await _poll(controller)
+        assert fired == [1, 1, 1], "READY after MONITORING_UNKNOWN is an edge"
+        # A single failed poll inside the freshness window is not a gap.
+        controller.error = httpx.ConnectError("blip")
+        await _poll(controller)
+        assert not engine_state.unknown()
+        controller.error = None
+        await _poll(controller)
+        assert fired == [1, 1, 1], "a blip shorter than the freshness window fires nothing"
+
+    asyncio.run(run())
+
+
+def test_health_reports_a_serving_engine_as_ok(clock, monkeypatch):
+    """The counterpart of the WEDGED case above (health.py:764): READY with
+    a CLOSED breaker leaves the main entry `ok`; no `reachable`/`detail`
+    is added when there is nothing to say."""
+    from app import health
+
+    controller = _Controller()
+    asyncio.run(_poll(controller))
+
+    async def endpoint_ok(client, base_url):
+        return {"status": "ok"}
+
+    async def optional_disabled(client):
+        return {"status": "disabled", "detail": "disabled by configuration"}
+
+    monkeypatch.setattr(health, "_probe_vllm", endpoint_ok)
+    monkeypatch.setattr(health, "_probe_ocr", optional_disabled)
+    monkeypatch.setattr(health, "_probe_reranker", optional_disabled)
+    monkeypatch.setattr(health, "_check_duckdb", lambda path: {"status": "ok"})
+    monkeypatch.setattr(health, "_check_app_db", lambda: {"status": "ok"})
+    monkeypatch.setattr(health, "_check_embedding_index", lambda: {"status": "empty"})
+    report = asyncio.run(health.check_dependencies())
+    assert report["status"] == "ok" and report["checks"]["vllm"]["status"] == "ok"
+    assert "detail" not in report["checks"]["vllm"]
+    assert health.answer_engine_not_serving() == ""
+    # The breaker opening on observed failures alone (no verdict) is reported too.
+    engine_state.reset()
+    brk = breaker.get(breaker.MAIN)
+    for _ in range(3):
+        brk.record_failure("connection", permit=brk.acquire())
+    assert health.answer_engine_not_serving().startswith("breaker OPEN (3xconnection")

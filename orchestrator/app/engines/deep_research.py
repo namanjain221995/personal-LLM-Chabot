@@ -73,7 +73,9 @@ from typing import Awaitable, Callable, Dict, FrozenSet, List, Optional, Sequenc
 from urllib.parse import urlparse
 
 from .. import continuation, db, llm
-from ..continuity import QueuedForRecovery
+from .. import continuity
+from ..continuity import LeaseLost, QueuedForRecovery
+from ..resilience import wait_admitted
 from ..config import settings
 # `extract` is deliberately NOT imported any more: every head slice this
 # module used to take (`extract.truncate_chars`) is now the search path's
@@ -753,6 +755,7 @@ async def _bounded(state: ResearchState, stage: str, coro, default=None):
     try:
         return True, await asyncio.wait_for(coro, left)
     except asyncio.TimeoutError:
+        await _park_if_cut(state, stage)
         state.cut_short.append(stage)
         log.warning(
             "research[%s] %s stopped at the run's time budget "
@@ -762,6 +765,20 @@ async def _bounded(state: ResearchState, stage: str, coro, default=None):
             float(settings.deep_research_timeout_s or 0.0),
         )
         return False, default
+
+
+async def _park_if_cut(state: ResearchState, stage: str) -> None:
+    """A stage budget that fired while the stage was QUEUED for the main
+    model cut a held wait, not a slow stage (round-2 review,
+    deep_research.py:3154): the engine is away, and the run must park —
+    the row stays `queued`, the person reads EXPIRED_LINE, and the resume
+    sweep opens a fresh run when the model is READY — rather than report a
+    stage timeout and write an empty report as 'done'. The hold knows
+    (continuity.Hold.cut); `park()` raises QueuedForRecovery."""
+    hold = continuity.current()
+    if hold is not None and hold.cut:
+        _rlog(state, "%s was queued for the main model when the budget fired: parking the run", stage)
+        await hold.park()
 
 
 # ---------------------------------------------------------------------------
@@ -830,6 +847,8 @@ async def _plan(question: str, history: Sequence[dict], effort: str, state: Opti
                 thinking=False,
             )
         data = extract_json_object(raw) or {}
+    except (QueuedForRecovery, LeaseLost):
+        raise  # the run is parked for the main model (CONTRACT §8.3), not planned without it
     except Exception:  # noqa: BLE001 — planning is an upgrade, never a gate
         log.warning("research planning failed; falling back to the raw question", exc_info=True)
         data = {}
@@ -1367,6 +1386,8 @@ async def _extract_claims(
                 thinking=False,
             )
         data = extract_json_object(raw) or {}
+    except (QueuedForRecovery, LeaseLost):
+        raise  # parked for the main model: the run ends here, never with a thinner report
     except Exception:  # noqa: BLE001 — claims are an upgrade, never a gate
         log.warning("claim extraction failed for round %d", state.iterations, exc_info=True)
         return
@@ -1670,6 +1691,8 @@ async def _assess(state: ResearchState, effort: str) -> dict:
                 thinking=False,
             )
         data = extract_json_object(raw) or {}
+    except (QueuedForRecovery, LeaseLost):
+        raise  # parked for the main model: not an auditor outage
     except Exception:  # noqa: BLE001
         # NOT "sufficient". Returning that made an auditor OUTAGE indis-
         # tinguishable from an audit that found nothing missing: the step
@@ -1829,6 +1852,8 @@ async def _verify(state: ResearchState, effort: str) -> Tuple[dict, List[str]]:
                 thinking=False,
             )
         data = extract_json_object(raw) or {}
+    except (QueuedForRecovery, LeaseLost):
+        raise  # parked for the main model: nothing is written "as is"
     except Exception:  # noqa: BLE001 — verification is an upgrade, never a gate
         log.warning("verification pass failed; writing from the evidence as is", exc_info=True)
         return {}, []
@@ -2805,6 +2830,16 @@ async def _run(
     conversation_id: str,
     user_id: Optional[int],
 ) -> str:
+    # Strict one-model mode (docs/availability/CONTRACT.md §8.3, round-2
+    # review deep_research.py:3154): a run started while the main model is
+    # not serving waits for it HERE — on the chat turn's hold, the row
+    # `queued`, the person told once — before a single stage budget starts.
+    # A wait that outruns LLM_QUEUE_MAX_WAIT_S parks the turn
+    # (QueuedForRecovery) before planning; the resume sweep opens a fresh
+    # run when the model is READY. Without this the planning stage's own
+    # budget cancelled the queued wait and the run "completed" with an
+    # empty report.
+    await wait_admitted(what="deep_research", base_url=settings.openai_base_url)
     now = datetime.now(timezone.utc)
     state = ResearchState(
         research_id=uuid.uuid4().hex,
@@ -3153,6 +3188,7 @@ async def _run(
         try:
             await asyncio.wait_for(_stream_report(), state.report_budget_s())
         except asyncio.TimeoutError:
+            await _park_if_cut(state, "report")
             state.report_cut_short = True
             state.cut_short.append("report")
             log.warning(

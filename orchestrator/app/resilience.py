@@ -453,6 +453,7 @@ async def wait_for_engine(
     poll_s: Optional[float] = None,
     what: str = "",
     interrupt: Optional[Callable[[], bool]] = None,
+    hold: Optional["_continuity.Hold"] = None,
 ) -> bool:
     """Wait until the engine is back or ``deadline_s`` elapses. True if it is.
 
@@ -472,14 +473,15 @@ async def wait_for_engine(
     ends early with False. ``resilient`` passes the breaker: the moment it
     opens, a /health that still answers 200 is no longer worth asking
     (that is exactly the 2026-09-11 shape), and the caller goes back to
-    the breaker's gate instead.
+    the breaker's gate instead. ``hold`` is the chat turn's hold when the
+    caller owns one (``resilient`` decides: a call with no window never
+    enters it); a direct caller of this function waits without one.
     """
     poll = float(poll_s if poll_s is not None else settings.llm_health_poll_s)
     started = time.monotonic()
     last_log = started
     engine = _breaker.engine_for_base_url(base_url)
     main = engine == _breaker.MAIN
-    hold = _hold_for(engine)
 
     def _observe(outcome: str) -> None:
         metrics.observe("llm_engine_wait_seconds", time.monotonic() - started,
@@ -541,13 +543,27 @@ async def _give_up(
     """The window closed. A chat turn's request is PARKED, not failed
     (CONTRACT §8.3 step 5: the row stays `queued`, the person reads the
     second sentence, the sweep resumes it) — QueuedForRecovery. Anything
-    else gets ModelUnavailable, the give-up every job already handles."""
+    else gets ModelUnavailable, the give-up every job already handles.
+
+    ``hold`` is None for a call that does not own the turn's hold (a
+    sidecar with no window, a job): such a call can never park the turn
+    (round-2 review, resilience.py:549). The owning call parks whenever
+    it is still waiting at the gate — and also when its window closed on
+    a failed attempt while the engine is (now) away: the breaker refuses
+    or the controller says not serving. A person is never told
+    MODEL_UNAVAILABLE for an engine that is being waited out (§8.3 v2).
+    """
     metrics.inc("llm_engine_unavailable_total",
                 "Model calls abandoned after the recovery window", what=what, reason=reason)
     log.error("llm.resilient what=%s base_url=%s attempt=%d waited_s=%.0f GIVING UP: %s: %s",
               what, base_url, attempts, waited_s, type(last).__name__, str(last)[:200])
-    if hold is not None and hold.waiting:
-        await hold.expire()  # raises QueuedForRecovery
+    if hold is not None:
+        if hold.waiting:
+            await hold.expire()  # raises QueuedForRecovery
+        brk = _breaker.for_base_url(base_url)
+        if brk is not None and (not brk.allows() or engine_state.serving() is False):
+            await hold.enter(_continuity.RECOVERY, line=None)  # the row goes `queued`; EXPIRED_LINE follows
+            await hold.expire()  # raises QueuedForRecovery
     raise ModelUnavailable(base_url, waited_s, attempts, last) from last
 
 
@@ -559,6 +575,7 @@ async def _admit(
     started: float,
     window: float,
     attempts: int,
+    hold: Optional["_continuity.Hold"] = None,
 ) -> "_breaker.Permit":
     """Hold the caller at the breaker until it is admitted.
 
@@ -568,10 +585,10 @@ async def _admit(
     breaker in memory. On a chat turn the hold is durable — the row says
     `queued` and the person is told once (CONTRACT §8.3); the moment the
     breaker admits the call, the SAME generation resumes as a new attempt.
-    The log says so once a minute, never once per tick.
+    The log says so once a minute, never once per tick. ``hold`` is the
+    turn's hold when the caller owns one (``resilient`` decides).
     """
     last_log = time.monotonic()
-    hold = _hold_for(brk.engine)
     while True:
         permit = brk.acquire()
         if permit is not None:
@@ -596,6 +613,52 @@ async def _admit(
         await _gate_sleep(min(_BREAKER_GATE_POLL_S, remaining))
 
 
+#: "No chunk held" — distinct from None, which a stream may legitimately yield.
+_NO_CHUNK = object()
+
+
+async def wait_admitted(*, what: str, base_url: str, recovery_s: Optional[float] = None) -> None:
+    """Wait at the breaker's gate WITHOUT making a call — for a caller that
+    must know the engine is admitting before it spends anything of its own
+    (Deep Research parks before its stage budgets start; the prompt sizing
+    asks /tokenize only of an engine the breaker admits). Same semantics as
+    the gate inside ``resilient``: a chat turn queues on its hold and, at
+    the window, parks (QueuedForRecovery); anything else gets
+    ModelUnavailable. Returns at once for an engine with no breaker or a
+    breaker that admits. Acquires no permit: the call that follows does."""
+    brk = _breaker.for_base_url(base_url)
+    if brk is None or brk.allows():
+        return
+    window = float(recovery_s) if recovery_s is not None else effective_recovery_s(brk.engine)
+    hold = _hold_for(brk.engine) if window > 0 else None
+    started = time.monotonic()
+    last_log = started
+    try:
+        while not brk.allows():
+            elapsed = time.monotonic() - started
+            remaining = window - elapsed
+            if remaining <= 0:
+                refused = BreakerOpen(brk.engine, brk.state)
+                await _give_up(hold, what=what, base_url=base_url, waited_s=elapsed,
+                               attempts=0, last=refused, reason="breaker_open")
+            if hold is not None:
+                await hold.enter(_continuity.RECOVERY)
+            elif brk.engine == _breaker.MAIN:
+                await _tell_once(QUEUED_LINE)
+            now = time.monotonic()
+            if now - last_log >= 60.0:
+                last_log = now
+                log.warning("llm.resilient what=%s base_url=%s queued behind breaker %s=%s (%.0fs of %.0fs)",
+                            what, base_url, brk.engine, brk.state, elapsed, window)
+            await _gate_sleep(min(_BREAKER_GATE_POLL_S, remaining))
+        if hold is not None and hold.waiting:
+            await hold.resume()
+    except BaseException:
+        if hold is not None and hold.waiting:
+            hold.abandon()
+        raise
+
+
 class GuardedStream:
     """A streamed completion whose FIRST CHUNK settles the breaker permit.
 
@@ -603,30 +666,70 @@ class GuardedStream:
     request, so ``create(stream=True)`` returning proves nothing about the
     engine (the 2026-09-11 wedge answered every open and sent no token).
     The permit — and, for a HALF_OPEN canary, the breaker's next state — is
-    therefore decided here: the first body chunk records success; an
-    exception before it records the failure against the permit (a canary
-    re-opens the breaker); an exception after it is counted as an ordinary
-    failure (a stream is never re-opened after a token, CONTRACT §8.4); a
-    stream closed or dropped before any chunk releases the permit so a
-    HALF_OPEN breaker is not pinned by a probe nobody read.
+    therefore decided by the first body chunk, which ``prime()`` pulls
+    INSIDE the retry loop's attempt (round-2 review, resilience.py:663):
+    the chunk records success and is replayed to the consumer; an
+    exception before it is the attempt's failure — recorded against the
+    permit (a canary re-opens the breaker) and retried or queued like a
+    refused connection, never handed to the consumer; an exception after
+    it is counted as an ordinary failure (a stream is never re-opened
+    after a token, CONTRACT §8.4); a stream that ends or is closed before
+    any chunk releases the permit so a HALF_OPEN breaker is not pinned by
+    a probe nobody read.
 
     Iterates exactly like the stream it wraps and forwards ``close()`` (or
     ``aclose()``: the SDK's stream has the former, an async generator the
     latter).
     """
 
-    __slots__ = ("_stream", "_brk", "_permit", "_settled", "_iter", "_holder", "exhausted")
+    __slots__ = ("_stream", "_brk", "_permit", "_settled", "_iter", "_holder", "_hold", "_first", "exhausted")
 
-    def __init__(self, stream, brk: Optional["_breaker.Breaker"], permit, holder) -> None:
+    def __init__(self, stream, brk: Optional["_breaker.Breaker"], permit, holder, hold=None) -> None:
         self._stream = stream
         self._brk = brk
         self._permit = permit
         self._settled = False
         self._iter = None
         self._holder = holder
+        #: The chat turn's hold, when the opening call owned one.
+        self._hold = hold
+        #: The first chunk, pulled by ``prime()`` inside the retry loop and
+        #: replayed by the first ``__anext__``.
+        self._first = _NO_CHUNK
         #: True once the wrapped stream said StopAsyncIteration: a consumer
         #: that closes an exhausted stream "to be safe" closes nothing.
         self.exhausted = False
+
+    async def prime(self) -> None:
+        """Pull the FIRST chunk now, inside the attempt that opened the
+        stream (CONTRACT §8.4: a retry is allowed before the first token).
+        vLLM sends the headers before the engine has scheduled anything, so
+        a stream that dies before its first chunk — the head restarted
+        under it, the dying-stream error chunk — is a failed OPEN: the
+        exception propagates to ``_resilient``, which records it against
+        the permit and retries or queues exactly as it would a refused
+        connection (round-2 review, resilience.py:663). An empty stream
+        proves nothing and releases the permit, as before."""
+        if self._iter is None:
+            self._iter = self._stream.__aiter__()
+        try:
+            chunk = await self._iter.__anext__()
+        except StopAsyncIteration:
+            self.exhausted = True
+            self._release()
+            return
+        except BaseException:
+            # Settled by the caller's record_failure(permit); a later close()
+            # must not hand the permit back a second time. The wrapped
+            # stream is closed here because no consumer ever receives it.
+            self._settled = True
+            closer = getattr(self._stream, "close", None) or getattr(self._stream, "aclose", None)
+            if closer is not None:
+                with contextlib.suppress(Exception):
+                    await closer()
+            raise
+        self._succeed()
+        self._first = chunk
 
     @property
     def stream(self):
@@ -637,6 +740,11 @@ class GuardedStream:
         return self
 
     async def __anext__(self):
+        if self._first is not _NO_CHUNK:
+            chunk, self._first = self._first, _NO_CHUNK
+            return chunk
+        if self.exhausted:
+            raise StopAsyncIteration
         if self._iter is None:
             self._iter = self._stream.__aiter__()
         try:
@@ -659,6 +767,8 @@ class GuardedStream:
             self._brk.record_success(self._permit)
         if self._holder is not None:
             self._holder.announced = False  # the engine served: the next outage earns a new line
+        if self._hold is not None:
+            self._hold.served()
 
     def _fail(self, exc: BaseException) -> None:
         if self._brk is None:
@@ -719,7 +829,12 @@ async def resilient(
     """
     brk = _breaker.for_base_url(base_url)
     window = float(recovery_s) if recovery_s is not None else effective_recovery_s(brk.engine if brk else None)
-    hold = _hold_for(brk.engine) if brk is not None else None
+    # The turn's hold belongs to a call that has a window to wait — the
+    # answer and its siblings. A sidecar on the main URL (window 0,
+    # sidecar_recovery_s) never enters it and never expires it: it makes
+    # its one attempt and fails to its own fallback (round-2 review,
+    # resilience.py:549).
+    hold = _hold_for(brk.engine) if brk is not None and window > 0 else None
     try:
         return await _resilient(op, brk=brk, hold=hold, window=window, what=what, base_url=base_url, stream=stream)
     except BaseException:
@@ -736,14 +851,24 @@ async def _resilient(op, *, brk, hold, window: float, what: str, base_url: str, 
     attempt = 0
     while True:
         permit = None
+        if hold is not None and hold.lost is not None:
+            # The row belongs to another resumer's generation now: this
+            # turn must not answer, whatever swallowed the first raise.
+            raise hold.lost
         if brk is not None:
             # An OPEN breaker is consulted BEFORE the first attempt: a dead
             # engine sees no request from here, only the breaker's canary.
             permit = await _admit(brk, what=what, base_url=base_url, started=started,
-                                  window=window, attempts=attempt)
+                                  window=window, attempts=attempt, hold=hold)
         attempt += 1
         try:
             result = await op()
+            if stream:
+                # The first chunk is part of the OPEN (GuardedStream.prime):
+                # a body that dies before it is this attempt's failure and
+                # is retried or queued below, never handed to the caller.
+                result = GuardedStream(result, brk, permit, _NOTIFY.get(), hold)
+                await result.prime()
         except BaseException as exc:  # noqa: BLE001 — classified below, re-raised when not ours
             if brk is not None:
                 brk.record_failure(failure_reason(exc), permit=permit)
@@ -766,7 +891,8 @@ async def _resilient(op, *, brk, hold, window: float, what: str, base_url: str, 
                 # Unless the breaker has opened meanwhile — then nothing is
                 # polled either; the gate above waits on the breaker.
                 blocked = (lambda: not brk.allows()) if brk is not None else None
-                if not await wait_for_engine(base_url, deadline_s=remaining, what=what, interrupt=blocked):
+                if not await wait_for_engine(base_url, deadline_s=remaining, what=what, interrupt=blocked,
+                                             hold=hold):
                     if brk is not None and not brk.allows():
                         # Interrupted by the breaker, not by the clock: back to
                         # the top, where the gate queues.
@@ -783,12 +909,14 @@ async def _resilient(op, *, brk, hold, window: float, what: str, base_url: str, 
                 # the row goes on as the same generation, new attempt.
                 await hold.resume()
             if stream:
-                # Settled by the first chunk, not here (class docstring).
-                return GuardedStream(result, brk, permit, _NOTIFY.get())  # type: ignore[return-value]
+                # Settled by its first chunk, already pulled (prime above).
+                return result
             if brk is not None:
                 brk.record_success(permit)
                 holder = _NOTIFY.get()
                 if holder is not None:
                     # The engine served: the next outage earns a new line.
                     holder.announced = False
+                if hold is not None:
+                    hold.served()
             return result

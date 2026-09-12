@@ -346,6 +346,10 @@ class LiveGeneration:
         # terminal branch and by _settle_chat_request (the row is NOT
         # failed) and _attempt_record (the attempt was interrupted).
         self.parked = False
+        # The row this generation was resuming was taken over by another
+        # resumer (continuity.LeaseLost): the turn ends without answering
+        # and without touching the row, which is theirs now.
+        self.lease_lost = False
 
     async def publish(self, event: str, data: dict) -> None:
         async with self.cond:
@@ -545,10 +549,11 @@ def _attempt_record(gen: LiveGeneration, *, streamed: bool) -> dict:
         # An acknowledged Stop stays a Stop, even during shutdown.
         stopped = gen.request_status == "cancelled"
         terminal = "interrupted" if _shutting_down and not stopped else "cancelled"
-    elif getattr(gen, "parked", False):
-        # Parked for the resume sweep (CONTRACT §8.3 step 5): the attempt
-        # did not finish, nothing was answered, and the next attempt of the
-        # same intent carries retry_reason "recovery".
+    elif getattr(gen, "parked", False) or getattr(gen, "lease_lost", False):
+        # Parked for the resume sweep (CONTRACT §8.3 step 5), or taken over
+        # by another resumer: the attempt did not finish, nothing was
+        # answered, and the next attempt of the same intent carries
+        # retry_reason "recovery".
         terminal = "interrupted"
     elif gen.failed:
         terminal = "interrupted" if streamed else "failed"
@@ -1126,6 +1131,16 @@ def _request_snapshot(request: "ChatRequest") -> tuple[dict, bool]:
     return body, not had_inline
 
 
+#: Generations between their compare-and-swap on the request row and their
+#: registration in `_live_generations` (see the known-intent path of /chat):
+#: generation_id → (generation, claimed_at), so a concurrent resumer of the
+#: same intent attaches instead of starting an attempt of its own. A claim
+#: is milliseconds long; one left behind by an unexpected exit in between
+#: is ignored after _CLAIM_TTL_S rather than trusted forever.
+_resuming: dict = {}
+_CLAIM_TTL_S = 30.0
+
+
 def _live_generation_for(generation_id: str) -> Optional["LiveGeneration"]:
     """The registry entry running this generation, if it is still going.
     The registry is keyed by conversation; a request row names a generation,
@@ -1133,7 +1148,19 @@ def _live_generation_for(generation_id: str) -> Optional["LiveGeneration"]:
     for candidate in list(_live_generations.values()):
         if candidate.generation_id == generation_id and not candidate.done:
             return candidate
+    claim = _resuming.get(generation_id)
+    if claim is not None:
+        claimed, at = claim
+        if not claimed.done and _time_monotonic() - at <= _CLAIM_TTL_S:
+            return claimed
+        _resuming.pop(generation_id, None)
     return None
+
+
+def _time_monotonic() -> float:
+    from time import monotonic
+
+    return monotonic()
 
 
 def _persisted_answer(conversation_id: str, generation_id: str) -> Optional[dict]:
@@ -1142,6 +1169,18 @@ def _persisted_answer(conversation_id: str, generation_id: str) -> Optional[dict
     if row is None or row.get("role") != "assistant":
         return None
     return {"content": row["content"], "meta": row["meta"]}
+
+
+def _interrupted_after_tokens(conversation_id: str, generation_id: str) -> bool:
+    """Did this interrupted attempt reach a viewer with a token (thread)?
+    The ledger's ttft (an orderly shutdown wrote it) or the viewer's kept
+    partial (all a crash leaves) — CONTRACT §8.4 says such an attempt is
+    never re-run by itself."""
+    from . import continuity as _continuity_mod
+
+    if db.generation_streamed(generation_id):
+        return True
+    return _continuity_mod._is_partial(_persisted_answer(conversation_id, generation_id))
 
 
 def _is_answer(stored: Optional[dict]) -> bool:
@@ -1172,6 +1211,22 @@ def _overwrite_persisted_answer(
 #: message arrived for the conversation (ORCH-02). `code` is what the client
 #: keys on; the sentence is what a person reads.
 _REPLACED_SENTENCE = "This answer was replaced by a newer message."
+#: A queued request another process resumed under its own lease
+#: (continuity.LeaseLost): the same `replaced` code, so the client does
+#: not paint it red, and a sentence that says where the answer went.
+_TAKEN_OVER_SENTENCE = "This request was resumed elsewhere; its answer will appear in the conversation."
+#: A parked turn whose row nothing can resume by itself (inline bytes the
+#: server does not keep): truthful, and a Retry the browser can make.
+_NOT_RESUMABLE_SENTENCE = (
+    "The main model is still recovering, and this request carried files the server "
+    "cannot re-send by itself — please try again once the model is back."
+)
+
+
+def _conversation_is_live(conv_key: str) -> bool:
+    """Is a generation running for this conversation in this process?"""
+    live = _live_generations.get(conv_key)
+    return live is not None and not live.done
 
 
 def _failure_sentence(exc: BaseException) -> tuple[str, str]:
@@ -1201,7 +1256,10 @@ def _failure_sentence(exc: BaseException) -> tuple[str, str]:
     from . import admission
 
     if isinstance(exc, admission.AdmissionRejected):
-        # The engine is up; its lane did not free in time (CONTRACT §6.7).
+        # The engine is up; its lane did not free in time, or the line was
+        # already too deep to join (CONTRACT §6.7) — said as what it is.
+        if exc.reason == "capacity":
+            return "The model's queue is full right now. Please try again in a moment.", "TIMEOUT"
         return "The model is busy and could not start your request in time. Please try again.", "TIMEOUT"
     if resilience.is_read_timeout(exc) or isinstance(
         exc, (asyncio.TimeoutError, TimeoutError, httpx.TimeoutException)
@@ -1221,7 +1279,9 @@ def _discard_failure_record(conversation_id: str, generation_id: str) -> None:
     db.delete_failure_record(conversation_id, generation_id)
 
 
-def _retry_chat_request(intent_id: str, generation_id: str) -> Optional[dict]:
+def _retry_chat_request(
+    intent_id: str, generation_id: str, *, expected_generation_id: Optional[str] = None
+) -> Optional[dict]:
     """A new attempt of a known intent under `generation_id` (in a thread).
 
     db.resume_chat_request moves only an OPEN row (interrupted, or
@@ -1229,11 +1289,16 @@ def _retry_chat_request(intent_id: str, generation_id: str) -> Optional[dict]:
     cancelled, or completed with nothing durable to replay — is reopened
     first: the person asked again, and one row per intent is the invariant,
     so that same row carries the new attempt. A failed attempt's persisted
-    failure record is discarded with it.
+    failure record is discarded with it. `expected_generation_id` is the
+    generation the CALLER saw on the row when it decided to retry: a row
+    another resumer moved since then is left as it is (the caller attaches
+    to that resumer's generation), never moved a second time.
     """
     row = db.get_chat_request(intent_id)
     if row is None:
         return None
+    if expected_generation_id is not None and row["generation_id"] != expected_generation_id:
+        return row  # somebody else's attempt is already the row's
     # One conditional step: the row moves only from the generation this
     # caller saw, so two callers racing to retry the same intent cannot both
     # start an attempt — the loser reads the row unchanged and attaches to
@@ -1244,7 +1309,13 @@ def _retry_chat_request(intent_id: str, generation_id: str) -> Optional[dict]:
         reopen_finished=row["status"] in ("completed", "failed", "cancelled"),
         expected_generation_id=row["generation_id"],
     )
-    if row["status"] == "failed" and resumed is not None and resumed["generation_id"] == generation_id:
+    if row["status"] in ("failed", "interrupted") and resumed is not None and resumed["generation_id"] == generation_id:
+        # A person asked again: the new attempt supersedes the previous
+        # attempt's record — the failure sentence, or the partial a tab
+        # kept when the attempt was interrupted after its first token
+        # (round-2 review, continuity.py:425: never a second answer beside
+        # a kept partial). The automatic paths (the sweep, /chat/attach)
+        # never re-run such an attempt; only this door does.
         _discard_failure_record(row["conversation_id"], row["generation_id"])
     return resumed
 
@@ -1309,10 +1380,19 @@ async def _settle_chat_request(gen: "LiveGeneration") -> None:
     for a completed answer, a cancelled one and a failed one alike."""
     if not gen.intent_id:
         return
+    if getattr(gen, "lease_lost", False):
+        return  # the row belongs to another resumer's generation now
     if gen.cancelled and gen.request_status == "cancelled":
         return  # an acknowledged Stop stays a Stop, even during shutdown
     if getattr(gen, "parked", False) and not gen.cancelled:
         return  # parked for the resume sweep: the row stays `queued` (CONTRACT §8.3 step 5)
+    if gen.cancelled and _shutting_down and gen.request_status == "queued":
+        # A hold torn down by an orderly shutdown: the row already says the
+        # truth about itself (`queued`, waiting for the main model) and the
+        # next process's sweep reads it by name; rewriting it `interrupted`
+        # would only bind it to LLM_RESUME_MAX_AGE_S (round-2 review,
+        # continuity.py:486).
+        return
     if gen.cancelled:
         status = "interrupted" if _shutting_down else "cancelled"
     elif gen.failed:
@@ -1570,6 +1650,11 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
         raise HTTPException(status_code=401, detail="Sign in required.")
     signed_in = principal.as_user_row()
     viewer = int(signed_in["id"])
+    # The resume sweep (app/continuity.py) comes through this route with a
+    # synthetic request: it may resume, never displace.
+    from . import continuity as _continuity_mod
+
+    sweep_caller = bool(getattr(http_request.state, _continuity_mod.RESUME_SWEEP_STATE, False))
 
     # V29: the send intent this request belongs to, and the snapshot a resume
     # would run from — taken BEFORE the feature gate below rewrites the
@@ -1742,16 +1827,35 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
         # inline bytes the snapshot could not keep, so a retry from the
         # browser works even where a server-side resume could not.
         gen.retry_reason = _RETRY_REASONS.get(str(known["status"]), "none")
-        row = await db.run_in_thread(_retry_chat_request, intent_id, gen.generation_id)
-        if row is None or row["generation_id"] != gen.generation_id:
-            # Raced another retry of the same intent; that one owns it now.
-            other = _live_generation_for(row["generation_id"]) if row else None
-            if other is not None:
-                _metrics.inc("chat_request_total", "chat requests by outcome", result="attached")
-                return _sse_response(other.follow())
-            _metrics.inc("chat_request_total", "chat requests by outcome", result="conflict")
-            raise HTTPException(status_code=409, detail="intent_id is being retried")
+        if sweep_caller and _conversation_is_live(conv_key_outer):
+            # The resume sweep never displaces a person's live generation
+            # (its "newest message wins" is a person's rule): the row stays
+            # as it is for the next READY or the browser's re-attach.
+            raise HTTPException(status_code=409, detail="conversation busy; the row waits")
+        # Claimed BEFORE the compare-and-swap: from the moment the row names
+        # this generation, another resumer of the same intent (a browser's
+        # re-attach racing the sweep) must find it here and attach to it,
+        # not read the row as `accepted` with nobody live and start a third
+        # attempt in the gap before the registration below.
+        _resuming[gen.generation_id] = (gen, _time_monotonic())
+        try:
+            row = await db.run_in_thread(
+                _retry_chat_request, intent_id, gen.generation_id,
+                expected_generation_id=known["generation_id"],
+            )
+            if row is None or row["generation_id"] != gen.generation_id:
+                # Raced another retry of the same intent; that one owns it now.
+                other = _live_generation_for(row["generation_id"]) if row else None
+                if other is not None:
+                    _metrics.inc("chat_request_total", "chat requests by outcome", result="attached")
+                    return _sse_response(other.follow())
+                _metrics.inc("chat_request_total", "chat requests by outcome", result="conflict")
+                raise HTTPException(status_code=409, detail="intent_id is being retried")
+        except BaseException:
+            _resuming.pop(gen.generation_id, None)
+            raise
         resumed = True
+        setattr(http_request.state, _continuity_mod.RESUMED_GENERATION_STATE, gen.generation_id)
     gen.attempt = int(row.get("attempt") or 1)
 
     # A new send for a conversation that is still generating replaces the old
@@ -1767,6 +1871,14 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
         and previous.task is not None
         and previous.user_id == viewer
     ):
+        if sweep_caller:
+            # A person's send landed in the gap between the sweep's busy
+            # check and here (round-2 review, continuity.py:398): the person
+            # wins. The compare-and-swap above already moved the row to this
+            # generation; put it back where the next sweep finds it.
+            _resuming.pop(gen.generation_id, None)
+            await db.run_in_thread(db.set_chat_request_status, intent_id, "queued")
+            raise HTTPException(status_code=409, detail="conversation busy; the row waits")
         # ORCH-02: the cancelled generation's followers get a terminal frame
         # (see the worker's CancelledError branch) instead of a stream that
         # merely ends — which a client reads as "finished" and persists as a
@@ -1781,8 +1893,26 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             intent_id,
         )
         previous.task.cancel()
+    if not resumed and not sweep_caller:
+        # The newest message wins over PARKED questions too (round-2 review,
+        # main.py:1775): a row left `queued` by an expired hold or a dead
+        # process, with no live generation in this process, would otherwise
+        # be resumed by the sweep and answered below this newer exchange.
+        # A row this process still holds is cancelled through its task
+        # (above), which writes its own status.
+        keep = [intent_id] + [g.intent_id for g in _live_generations.values() if g.intent_id]
+        with contextlib.suppress(Exception):
+            superseded = await db.run_in_thread(
+                db.cancel_parked_chat_requests, conv_key_outer, keep=keep
+            )
+            if superseded:
+                logging.getLogger(__name__).info(
+                    "%d parked request(s) in conversation %s superseded by intent %s",
+                    superseded, conv_key_outer, intent_id,
+                )
 
     _live_generations[conv_key_outer] = gen
+    _resuming.pop(gen.generation_id, None)
     # One correlation envelope per HTTP attempt. `test_case_id` is only a
     # join key; golden expectations remain in the offline evaluator.
     query_trace = TraceRecorder(
@@ -3232,15 +3362,38 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             # stream ends with a terminal frame that names the parked
             # state, so a client that only knows `done`/`error` does not
             # read an empty answer as a finished one.
-            gen.parked = True
-            logging.getLogger(__name__).warning(
-                "generation %s (intent %s, attempt %d) in conversation %s parked after %.0fs: "
-                "main model still recovering; row stays queued",
-                gen.generation_id, gen.intent_id, gen.attempt, conv_key_outer, exc.waited_s,
-            )
-            await gen.publish(
-                "error", {"message": _continuity.EXPIRED_LINE, "code": _continuity.PARKED_CODE, "resumable": True}
-            )
+            if resumable and gen.request_status == "queued":
+                gen.parked = True
+                logging.getLogger(__name__).warning(
+                    "generation %s (intent %s, attempt %d) in conversation %s parked after %.0fs: "
+                    "main model still recovering; row stays queued",
+                    gen.generation_id, gen.intent_id, gen.attempt, conv_key_outer, exc.waited_s,
+                )
+                await gen.publish(
+                    "error",
+                    {"message": _continuity.EXPIRED_LINE, "code": _continuity.PARKED_CODE, "resumable": True},
+                )
+            else:
+                # Nothing can resume this row by itself — the snapshot
+                # carried inline bytes the server does not keep, or the row
+                # could not be parked — so the promise of EXPIRED_LINE would
+                # be false (round-2 review, main.py:3242). The turn fails
+                # with a truthful sentence and a Retry the browser can make
+                # (it still has the bytes); the row is `failed`, not left
+                # `queued` for a sweep that filters it out.
+                gen.parked = False  # the hold marked it; the row is settled `failed` instead
+                gen.failed = True
+                gen.error = _NOT_RESUMABLE_SENTENCE
+                gen.error_code = "MODEL_UNAVAILABLE"
+                logging.getLogger(__name__).warning(
+                    "generation %s (intent %s, attempt %d) in conversation %s could not be parked "
+                    "after %.0fs (resumable=%s, row=%s): failed for a person's retry",
+                    gen.generation_id, gen.intent_id, gen.attempt, conv_key_outer, exc.waited_s,
+                    resumable, gen.request_status,
+                )
+                await gen.publish("error", {"message": gen.error, "code": gen.error_code, "resumable": False})
+                with contextlib.suppress(Exception):
+                    await asyncio.shield(_store_failure(gen, "".join(streamed_text), resumable=False))
             with contextlib.suppress(Exception):
                 await asyncio.shield(
                     query_trace.finish(
@@ -3248,6 +3401,25 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                         route=str((gen.final_meta or {}).get("route") or ""),
                         resolved_mode=query_trace.resolved_mode or str(request.mode or ""),
                         error=exc,
+                    )
+                )
+        except _continuity.LeaseLost as exc:
+            # Another process resumed this request under its own generation
+            # while this one slept on READY: theirs is the answer. No frame
+            # that reads as a failure — the row (and the answer to come) is
+            # not this generation's any more — and no status write.
+            gen.lease_lost = True
+            logging.getLogger(__name__).warning(
+                "generation %s (intent %s, attempt %d) in conversation %s: %s",
+                gen.generation_id, gen.intent_id, gen.attempt, conv_key_outer, exc,
+            )
+            await gen.publish("error", {"message": _TAKEN_OVER_SENTENCE, "code": "replaced"})
+            with contextlib.suppress(Exception):
+                await asyncio.shield(
+                    query_trace.finish(
+                        "cancelled",
+                        route=str((gen.final_meta or {}).get("route") or ""),
+                        resolved_mode=query_trace.resolved_mode or str(request.mode or ""),
                     )
                 )
         except asyncio.CancelledError:
@@ -3639,6 +3811,25 @@ async def chat_attach(
         or latest["status"] not in _RESUMABLE_STATUSES
         or not latest.get("resumable")
     ):
+        raise HTTPException(status_code=404, detail="no active generation")
+    if latest["status"] == "interrupted" and await db.run_in_thread(
+        _interrupted_after_tokens, latest["conversation_id"], latest["generation_id"]
+    ):
+        # CONTRACT §8.4: after the first token the attempt stays interrupted
+        # and nothing re-runs it by itself — the partial the tab kept is in
+        # history, and a second answer must not be appended beside it. The
+        # row is settled `failed` (the same settlement the resume sweep
+        # makes) so the person is offered a Retry, and this re-attach ends
+        # like a finished one: 404, load history.
+        from . import continuity as _continuity_mod
+
+        with contextlib.suppress(Exception):
+            await db.run_in_thread(
+                db.set_chat_request_status, latest["intent_id"], "failed",
+                error=_continuity_mod.interrupted_after_tokens_sentence(
+                    await db.run_in_thread(_persisted_answer, latest["conversation_id"], latest["generation_id"])
+                ),
+            )
         raise HTTPException(status_code=404, detail="no active generation")
     try:
         request = ChatRequest.model_validate(

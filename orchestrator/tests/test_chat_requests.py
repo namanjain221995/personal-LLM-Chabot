@@ -338,8 +338,10 @@ def test_a_lost_request_is_resumed_by_attach_under_a_new_attempt(hello_stream, a
     assert db.get_chat_request("int-lost")["status"] == "accepted"
 
     with TestClient(app) as client:
-        # Startup marked what the dead process held.
-        assert db.get_chat_request("int-lost")["status"] == "interrupted"
+        # Startup marked what the dead process held — and its resume sweep
+        # (round 2: it lists interrupted rows) may already be running the
+        # new attempt; the browser's re-attach then attaches to it. Either
+        # way: one attempt 2, one answer.
         resp = client.get("/chat/attach/lost-1")
         assert resp.status_code == 200
         events = _parse_sse(resp.text)
@@ -356,7 +358,8 @@ def test_a_lost_request_is_resumed_by_attach_under_a_new_attempt(hello_stream, a
     assert row["generation_id"] == leading["generation_id"]
     assert _message_rows("lost-1", leading["generation_id"]) == 1
     assert hello_stream == [1]
-    assert metrics._counters["chat_request_total"] == {(("result", "resumed"),): 1.0}
+    assert metrics._counters["chat_request_total"][(("result", "resumed"),)] == 1.0
+    assert metrics._counters["chat_request_total"].get((("result", "attached"),), 0.0) <= 1.0
     assert metrics._counters["chat_request_resume_total"] == {(): 1.0}
 
 

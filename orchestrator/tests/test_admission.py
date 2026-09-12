@@ -3,11 +3,13 @@
 Offline: fake engine calls (async functions and async iterators), the
 controller's engine sample planted directly, no network. What is pinned:
 the NORMAL lane is a semaphore of ADMISSION_NORMAL_MAX; the LONG lane runs
-one at a time, drains the NORMAL lane, waits for the engine to be idle
-(bounded) and holds the NORMAL lane closed until its first token; every
-wait says its sentence once with how many are ahead; the bounded waits
-reject with `timeout` and a too-deep line with `capacity`; the metrics
-carry the lane and the reason; a stream releases its lane when it ends.
+one at a time, waits for the engine to be idle (bounded) WITHOUT closing
+the NORMAL lane, and holds the NORMAL lane closed from its admission until
+its first token (round 2, admission.py:296); every wait says its sentence
+once — the contract's exact sentences — with how many are ahead; the
+bounded waits reject with `timeout` and a too-deep line with `capacity`;
+the metrics carry the lane and the reason; a stream releases its lane
+when it ends.
 """
 from __future__ import annotations
 
@@ -140,11 +142,11 @@ def test_the_normal_lane_admits_up_to_its_capacity_and_the_next_waits_with_the_l
         await asyncio.sleep(0.1)
         assert not c.entered.is_set(), "the third waits"
         assert _gauge("llm_admission_waiting", lane="normal") == 1.0
-        assert said == ["Waiting for the model to finish current work (2 ahead)."]
+        assert said == ["Waiting for a free slot on the main model (2 ahead)."]
         a.release.set()
         await ta
         await asyncio.wait_for(c.entered.wait(), 1.0)
-        assert said == ["Waiting for the model to finish current work (2 ahead)."], "said once"
+        assert said == ["Waiting for a free slot on the main model (2 ahead)."], "said once"
         b.release.set()
         c.release.set()
         assert await tb == "answer" and await tc == "answer"
@@ -225,7 +227,11 @@ class _Chunks:
         self.closed = True
 
 
-def test_a_long_request_drains_the_normal_lane_waits_for_idle_and_reopens_at_its_first_token():
+def test_a_long_request_waits_for_idle_without_closing_normal_and_holds_it_from_admission_to_first_token():
+    """Round 2 (admission.py:296): the NORMAL lane keeps admitting while a
+    LONG request waits for the engine to be idle — with the second tenant
+    at c=10 that wait can run its whole bound — and is closed only from
+    the long request's admission to its first token."""
     said: list = []
 
     async def notify(line):
@@ -245,45 +251,72 @@ def test_a_long_request_drains_the_normal_lane_waits_for_idle_and_reopens_at_its
 
         long_task = asyncio.create_task(_run(open_long, chars=30_000, stream=True))
         await asyncio.sleep(0.1)
-        # Holds the LONG slot, has closed NORMAL, and waits for `a` to finish.
+        # Holds the LONG slot and waits for the engine to be idle — NORMAL
+        # is NOT closed for that wait.
         lanes = admission.lanes()
-        assert lanes.long.active == 1 and lanes.normal.closed is True
+        assert lanes.long.active == 1 and lanes.normal.closed is False
         assert not opened.is_set()
-        # A newcomer to NORMAL waits behind the closed lane.
+        # A newcomer to NORMAL is admitted during the idle wait.
         b = _Call()
         tb = asyncio.create_task(_run(b))
-        await asyncio.sleep(0.05)
-        assert not b.entered.is_set()
-        # `a` finishes: NORMAL is drained, but the engine still reports work.
+        await asyncio.wait_for(b.entered.wait(), 1.0)
+        assert lanes.normal.active == 2
+        # Both finish; the engine still reports work: the long request waits on.
         a.release.set()
-        await ta
+        b.release.set()
+        await asyncio.gather(ta, tb)
         await asyncio.sleep(0.1)
         assert not opened.is_set(), "waits for the engine to be idle"
+        assert lanes.normal.closed is False
         _sample(running=0)
         stream = await asyncio.wait_for(long_task, 2.0)
         assert opened.is_set()
-        # Opened, no token yet: NORMAL stays closed.
+        # ADMITTED, no token yet: NORMAL is closed now — a newcomer waits.
+        assert lanes.normal.closed is True
+        c = _Call()
+        tc = asyncio.create_task(_run(c))
         await asyncio.sleep(0.05)
-        assert lanes.normal.closed is True and not b.entered.is_set()
+        assert not c.entered.is_set()
         chunks = []
         async for chunk in stream:
             chunks.append(chunk)
             if len(chunks) == 1:
                 # The first token: the prefill is over, NORMAL reopens.
                 assert lanes.normal.closed is False
-                await asyncio.wait_for(b.entered.wait(), 1.0)
+                await asyncio.wait_for(c.entered.wait(), 1.0)
         assert chunks == ["first", "second"]
         assert lanes.long.active == 0, "released when the stream ended"
-        b.release.set()
-        await tb
+        c.release.set()
+        await tc
         assert said == [
-            # The large document, behind the one request that was running…
+            # The large document, behind the one request the engine was running…
             "Waiting for the model to finish current work before your large document (1 ahead).",
-            # …and the newcomer, behind the closed lane it found.
-            "Waiting for the model to finish current work (1 ahead).",
+            # …and the newcomer, behind the closed lane it found (1 ahead: the long one).
+            "Waiting for a free slot on the main model (1 ahead).",
         ]
         assert _gauge("llm_admission_lane_active", lane="long") == 0.0
         assert metrics._hists["llm_admission_wait_seconds"][(("lane", "long"),)][2] == 1
+
+    asyncio.run(run())
+
+
+def test_time_behind_a_long_requests_closure_does_not_count_against_a_normal_waiter(monkeypatch):
+    """Round 2 (admission.py:296): a NORMAL waiter is never refused with
+    `timeout` for time it spent behind a LONG request's closure."""
+    monkeypatch.setattr(settings, "admission_normal_wait_s", 0.3)
+
+    async def run():
+        lanes = admission.lanes()
+        await lanes.normal.set_closed(True)
+        a = _Call()
+        ta = asyncio.create_task(_run(a))
+        await asyncio.sleep(0.5)  # longer than its whole bound, all of it behind the closure
+        assert not ta.done() and not a.entered.is_set()
+        await lanes.normal.set_closed(False)
+        await asyncio.wait_for(a.entered.wait(), 1.0)
+        a.release.set()
+        assert await ta == "answer"
+        assert _counter("llm_admission_rejections_total", reason="timeout") == 0
 
     asyncio.run(run())
 
@@ -435,19 +468,31 @@ def test_a_held_turn_parks_its_row_for_an_admission_wait_and_resumes_without_a_n
         tc = asyncio.create_task(_run(c))
         await asyncio.sleep(0.1)
         assert parked == ["i"] and gen.request_status == "queued"
-        assert _gauge("llm_queued_generations") == 1.0
+        # A lane wait is durable, but it is not a generation waiting for
+        # the PRIMARY (CONTRACT §7.2; round 2, continuity.py:193).
+        assert _gauge("llm_queued_generations") == 0.0
+        assert _gauge("llm_admission_waiting", lane="normal") == 1.0
         a.release.set()
         await ta
         await asyncio.wait_for(c.entered.wait(), 1.0)
         assert resumed == [False], "an admission wait is not a new attempt"
         assert gen.attempt == 1 and gen.retry_reason == "none" and gen.request_status == "running"
         assert _gauge("llm_queued_generations") == 0.0
+        assert "llm_queue_wait_seconds" not in metrics._hists, "lane waits have their own histogram"
         b.release.set()
         c.release.set()
         await asyncio.gather(tb, tc)
 
     asyncio.run(run())
-    assert said == ["Waiting for the model to finish current work (2 ahead)."]
+    assert said == ["Waiting for a free slot on the main model (2 ahead)."]
+
+
+def test_the_normal_lane_sentence_is_the_contracts_verbatim():
+    """Round 2 (admission.py:71): CONTRACT §8.3 fixes the sentence."""
+    assert admission.NORMAL_LINE == "Waiting for a free slot on the main model ({n} ahead)."
+    assert admission.LONG_LINE == (
+        "Waiting for the model to finish current work before your large document ({n} ahead)."
+    )
 
 
 def test_the_lane_label_is_bounded_and_health_describes_the_lanes():

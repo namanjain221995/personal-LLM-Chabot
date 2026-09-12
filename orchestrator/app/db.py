@@ -5933,17 +5933,67 @@ def resume_queued_chat_request(intent_id: str, generation_id: str, *, new_attemp
 
 def list_resumable_chat_requests(statuses: Sequence[str], *, max_age_s: float, limit: int = 200) -> list:
     """Rows the resume sweep may act on (CONTRACT §8.4 v2): in one of
-    `statuses`, resumable from their snapshot, and touched within
-    `max_age_s` — an old row is a request nobody is waiting for any more,
-    and re-running it would only surprise a thread. Oldest first."""
+    `statuses` and resumable from their snapshot. Oldest first.
+
+    `max_age_s` bounds `interrupted` rows ONLY, measured from `created_at`
+    — the moment the send was accepted: an interrupted row accepted longer
+    ago than that is a request nobody is waiting for any more, and
+    re-running it would only surprise a thread. A `queued` row is listed
+    whatever its age: it was parked on purpose, for exactly this sweep,
+    and CONTRACT §2 (DOWN) promises it is never lost — a recovery that
+    outlasts the age limit (a budget-exhausted night) must still resume
+    every parked request when an operator brings the pair back.
+    """
     with connection() as con:
         rows = con.execute(
             "SELECT * FROM chat_requests WHERE status = ANY(%s) AND resumable "
-            "AND updated_at > %s - (%s * interval '1 second') "
+            "AND (status = 'queued' OR created_at > %s - (%s * interval '1 second')) "
             "ORDER BY created_at LIMIT %s",
             (list(statuses), _now(), float(max_age_s), int(limit)),
         ).fetchall()
     return [_chat_request_row(r) for r in rows]
+
+
+def count_chat_requests(status: str) -> int:
+    """How many rows are in `status` right now (the durable half of
+    `llm_queued_generations`, app/continuity.py)."""
+    with connection() as con:
+        row = con.execute(
+            "SELECT count(*) AS n FROM chat_requests WHERE status = %s", (status,)
+        ).fetchone()
+    return int(row["n"]) if row else 0
+
+
+def generation_streamed(generation_id: str) -> bool:
+    """Did this attempt reach a viewer with at least one token? The attempt
+    ledger (usage_events, one row per generation_id, written by the chat
+    worker's finally — so by an orderly shutdown, not by a crash) records
+    `ttft_ms` only when a token was streamed. CONTRACT §8.4: such an
+    attempt is never re-run by itself."""
+    with connection() as con:
+        row = con.execute(
+            "SELECT ttft_ms FROM usage_events WHERE generation_id = %s", (str(generation_id),)
+        ).fetchone()
+    return row is not None and row["ttft_ms"] is not None
+
+
+def cancel_parked_chat_requests(conversation_id: str, *, keep: Sequence[str]) -> int:
+    """A newer send in the conversation supersedes every row still parked
+    `queued` for it (CONTRACT §8.3 with the /chat rule "the newest message
+    wins"): they are `cancelled` with the same error a replaced live
+    generation carries, so the resume sweep never answers an old question
+    below the newer exchange. `keep` names the intents that must not be
+    touched — the new send itself and any generation this process still
+    holds (its own worker writes its terminal status). Returns how many."""
+    ts = _now()
+    with connection() as con:
+        rows = con.execute(
+            "UPDATE chat_requests SET status = 'cancelled', error = %s, updated_at = %s, finished_at = %s "
+            "WHERE conversation_id = %s AND status = 'queued' AND NOT (intent_id = ANY(%s)) "
+            "RETURNING intent_id",
+            ("replaced by a newer message", ts, ts, conversation_id, list(keep)),
+        ).fetchall()
+    return len(rows)
 
 
 # ---------------------------------------------------------------------------

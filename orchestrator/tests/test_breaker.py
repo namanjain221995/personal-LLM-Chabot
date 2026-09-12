@@ -445,27 +445,57 @@ def _half_open(clock):
     return brk
 
 
+class _HungThenEmpty:
+    """A fake SDK stream whose first chunk never comes until `release` is
+    set — and then there is none (the server closed the body)."""
+
+    def __init__(self) -> None:
+        self.release = asyncio.Event()
+        self.closed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        await self.release.wait()
+        raise StopAsyncIteration
+
+    async def close(self):
+        self.closed = True
+
+
 def test_a_half_open_canary_that_only_opened_a_stream_does_not_close_the_breaker(clock, monkeypatch):
     """The 2026-09-11 shape for this process's own traffic: vLLM sends the
     headers before the engine has scheduled anything, so `create()` returns
     and no chunk ever comes. Headers prove nothing: the breaker stays
-    HALF_OPEN with the canary out until a chunk (or an error) arrives."""
+    HALF_OPEN with the canary out until a chunk (or an error) arrives —
+    and since the round-2 review the first chunk is pulled INSIDE the
+    resilient attempt, so `resilient()` itself does not return until the
+    body says something. An empty body proves nothing either: the permit
+    is handed back, not counted."""
     from app import resilience
 
     url = _main_url(monkeypatch)
     brk = _half_open(clock)
-    hung = _Chunks([])
+    hung = _HungThenEmpty()
 
     async def run():
-        stream = await resilience.resilient(lambda: _coro(hung), what="stream", base_url=url, stream=True)
-        assert isinstance(stream, resilience.GuardedStream)
+        opening = asyncio.create_task(
+            resilience.resilient(lambda: _coro(hung), what="stream", base_url=url, stream=True)
+        )
+        await asyncio.sleep(0.05)
+        assert not opening.done(), "headers alone do not return the stream"
         assert brk.state == HALF_OPEN and brk.describe()["canary_in_flight"] is True
         # Nobody else is admitted while the probe has produced nothing.
         assert not brk.allows()
+        hung.release.set()
+        stream = await opening
+        assert isinstance(stream, resilience.GuardedStream) and stream.exhausted
         return stream
 
     stream = asyncio.run(run())
-    # The consumer gives up on it: the permit is handed back, not counted.
+    # The body was empty: the permit is handed back, not counted.
+    assert brk.state == HALF_OPEN and brk.allows()
     asyncio.run(stream.close())
     assert brk.state == HALF_OPEN and brk.allows()
 
@@ -484,13 +514,16 @@ def test_the_first_chunk_closes_the_breaker_and_a_body_death_before_it_reopens(c
     brk = _half_open(clock)
 
     async def dies_before_a_token():
+        # The death before the first token is the OPEN's failure (round-2
+        # review, resilience.py:663): it never reaches a consumer. With no
+        # window to retry in (this is not a chat turn) the wrapper gives up.
         exc = openai.APIError("EngineDeadError: engine core died", request=httpx.Request("POST", url), body=None)
-        stream = await resilience.resilient(
-            lambda: _coro(_Chunks([], die_at=0, exc=exc)), what="stream", base_url=url, stream=True
-        )
-        with pytest.raises(openai.APIError):
-            async for _ in stream:
-                pass
+        with pytest.raises(resilience.ModelUnavailable) as info:
+            await resilience.resilient(
+                lambda: _coro(_Chunks([], die_at=0, exc=exc)), what="stream", base_url=url, stream=True,
+                recovery_s=0.0,
+            )
+        assert info.value.last is exc
 
     asyncio.run(dies_before_a_token())
     assert brk.state == OPEN

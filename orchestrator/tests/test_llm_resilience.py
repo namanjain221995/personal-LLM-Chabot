@@ -354,10 +354,30 @@ class _FlakyClient:
 
     @property
     def _response(self):
-        return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content="hello", reasoning_content=None), finish_reason="stop")],
-            usage=None,
-        )
+        return _Reply()
+
+
+class _Reply:
+    """One answer, readable both ways: `.choices` for a non-streaming call,
+    and one chunk then the end when iterated as a stream (the wrapper pulls
+    a stream's first chunk inside the attempt since the round-2 review)."""
+
+    def __init__(self) -> None:
+        self.choices = [SimpleNamespace(message=SimpleNamespace(content="hello", reasoning_content=None), finish_reason="stop")]
+        self.usage = None
+        self._sent = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self._sent:
+            raise StopAsyncIteration
+        self._sent = True
+        return SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="hello"), finish_reason="stop")], usage=None)
+
+    async def close(self):
+        return None
 
 
 @pytest.fixture()

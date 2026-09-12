@@ -30,6 +30,7 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from . import CODE_INSTRUCTION, DIAGRAM_INSTRUCTION, recent_turns
 from .. import llm
+from ..continuity import LeaseLost, QueuedForRecovery
 from ..config import settings
 
 Emit = Callable[[str, dict], Awaitable[None]]
@@ -263,6 +264,8 @@ async def make_plan(
             raw = await llm.chat_completion(prompt, temperature=0.1, max_tokens=6000)
             plan = parse_agent_plan(raw)
             return plan if salesforce else _coerce_no_salesforce(plan)
+        except (QueuedForRecovery, LeaseLost):
+            raise  # parked for the main model (CONTRACT §8.3): no fallback plan, the turn waits
         except Exception as exc:
             last_error = str(exc)[:400]
     return _fallback_plan(message)
@@ -522,6 +525,8 @@ async def execute_steps(
                     user_id,
                     conversation_id,
                 )
+            except (QueuedForRecovery, LeaseLost):
+                raise  # parked for the main model: not a failed step
             except Exception as exc:
                 detail = _shorten(str(exc) or exc.__class__.__name__, 200)
                 await emit(
@@ -540,7 +545,15 @@ async def execute_steps(
             )
             return {"step": step, "status": "done", "output": output, "meta": sub_meta}
 
-    return list(await asyncio.gather(*(run(step) for step in plan.steps)))
+    # Every failure is caught inside `run`; the one exception that escapes
+    # is the park (QueuedForRecovery). Gathered with return_exceptions so
+    # every sibling step ends (a parked hold ends them at once) before it is
+    # raised once, rather than leaving sibling tasks to raise unread.
+    results = await asyncio.gather(*(run(step) for step in plan.steps), return_exceptions=True)
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
+    return list(results)
 
 
 _CITE_RE = re.compile(r"\[(\d+)\]")

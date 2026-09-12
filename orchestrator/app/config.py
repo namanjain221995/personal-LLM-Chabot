@@ -1445,9 +1445,13 @@ class Settings:
         # sweep: a cold start measured 5 m 20 s, plus margin.
         self.llm_queue_max_wait_s: float = _float("LLM_QUEUE_MAX_WAIT_S", 900.0)
         # The resume sweep (CONTRACT §8.4) runs rows a process parked or a
-        # restart interrupted when the controller reports READY; a row older
+        # restart interrupted when the controller reports READY (and at
+        # start-up). An `interrupted` row ACCEPTED (created_at) longer ago
         # than this is left alone — nobody is waiting for it, and a thread
-        # would only be surprised by an answer to a day-old question.
+        # would only be surprised by an answer to a day-old question. A
+        # `queued` row is never bound by it: it was parked on purpose and
+        # CONTRACT §2 (DOWN) promises it is never lost, however long the
+        # operator takes.
         self.llm_resume_max_age_s: float = _float("LLM_RESUME_MAX_AGE_S", 3600.0)
         # --- Long-context admission (app/admission.py, CONTRACT §6.7) ------
         # Two lanes in front of the engine. A prompt at or below the
@@ -1466,9 +1470,15 @@ class Settings:
         # How long a NORMAL-lane caller may wait for a slot before it is
         # refused (`llm_admission_rejections_total{reason="timeout"}`), and
         # how deep either lane's waiting line may grow before a newcomer is
-        # refused at once (`reason="capacity"`) instead of joining it.
+        # refused at once (`reason="capacity"`) instead of joining it. The
+        # depth is sized for the rush after a recovery: the resume sweep
+        # runs up to 200 parked rows at once (continuity._SWEEP_LIMIT) on
+        # top of every turn this process held through the outage, and a
+        # request promised "will resume automatically" must not be refused
+        # by its own lane the moment the model is back (round-2 review,
+        # admission.py:129).
         self.admission_normal_wait_s: float = _float("ADMISSION_NORMAL_WAIT_S", 600.0)
-        self.admission_max_waiting: int = _int("ADMISSION_MAX_WAITING", 100)
+        self.admission_max_waiting: int = _int("ADMISSION_MAX_WAITING", 400)
         self.schema_cache_ttl: float = _float("SCHEMA_CACHE_TTL", 300.0)
         # §8 /health: per-dependency probe timeout — short so /health answers
         # quickly even when every vLLM service is down.

@@ -157,7 +157,13 @@ _last_error: str = ""
 _last_attempt_at: Optional[float] = None
 _task: Optional[asyncio.Task] = None
 #: Whether the last published verdict was "serving" — the edge the READY
-#: listeners fire on. None until the first verdict.
+#: listeners fire on. None until the first verdict, and None again after
+#: ANY gap in which the engine was not proven serving: a bad state, a
+#: MONITORING_UNKNOWN, an unreachable or stale controller. The engine may
+#: have died and been restarted inside such a gap (the breaker then opened
+#: from observed failures and rows were parked), so the next fresh SERVING
+#: snapshot is an edge and the resume sweep runs (round-2 review,
+#: engine_state.py:356). A spurious sweep costs one indexed query.
 _was_serving: Optional[bool] = None
 #: Called (synchronously, on the poller's loop) when the verdict turns from
 #: not-serving/unknown to serving: the resume sweep (app/continuity.py).
@@ -347,6 +353,9 @@ def _publish_event(snap: Optional[EngineSnapshot]) -> None:
     else:
         now_serving = None  # MONITORING_UNKNOWN, QUEUEING: no verdict either way
     if now_serving is None:
+        # No verdict: the event is left alone, but the engine is no longer
+        # PROVEN serving — the next fresh SERVING snapshot is an edge.
+        _was_serving = None
         return
     for event in list(_events.values()):
         if now_serving:
@@ -361,6 +370,14 @@ def _publish_event(snap: Optional[EngineSnapshot]) -> None:
                 fn()
             except Exception:  # noqa: BLE001 — a listener must never break the poller
                 log.exception("llm.engine_state READY listener failed")
+
+
+def _note_unknown() -> None:
+    """The verdict is unknown (unreachable or stale controller): whatever
+    was proven before is no longer proven, so the next fresh SERVING
+    snapshot fires the READY edge (see `_was_serving`)."""
+    global _was_serving
+    _was_serving = None
 
 
 # ---------------------------------------------------------------------------
@@ -477,6 +494,8 @@ def _record(snap: Optional[EngineSnapshot], error: str) -> None:
     _publish(_snapshot if fresh else None)
     if fresh:
         _publish_event(_snapshot)
+    else:
+        _note_unknown()
 
 
 async def poll_once(client=None) -> Optional[EngineSnapshot]:
@@ -532,6 +551,7 @@ async def _loop() -> None:
             # long enough, even though nothing new arrived to publish.
             if unknown():
                 _publish(None)
+                _note_unknown()
                 now = time.monotonic()
                 if unknown_since is None:
                     unknown_since = now

@@ -453,6 +453,11 @@ def _publish_work_gauges(work: dict) -> None:
         "chat_requests_queued", work.get("chat_requests_queued", 0),
         "Chat requests durably queued for the main model (V32 status queued).",
     )
+    # …and folded into `llm_queued_generations` (CONTRACT §7.2) as the
+    # durable half of that gauge (app/continuity._publish_queued).
+    from . import continuity
+
+    continuity.note_durable_queued(int(work.get("chat_requests_queued", 0) or 0))
     artifacts = work.get("artifacts") or {}
     for state in ("queued", "running"):
         metrics.set_gauge(
@@ -675,6 +680,29 @@ async def probe_context_window(client: httpx.AsyncClient) -> dict:
     return out
 
 
+def answer_engine_not_serving() -> str:
+    """Why the answer engine is not taking calls right now, or "" when it
+    is: the controller's fresh verdict says not serving, or the main
+    breaker is OPEN (held by the controller, or opened by observed
+    failures). A HALF_OPEN breaker is probing and an unknown verdict is
+    not a verdict (CONTRACT §8.1), so neither is reported here. In-memory
+    only; never raises."""
+    from . import breaker, engine_state  # lazy, like engine_availability
+
+    try:
+        reasons = []
+        snap = engine_state.snapshot()
+        if engine_state.serving() is False and snap is not None:
+            reasons.append(f"controller says {snap.state}")
+        brk = breaker.get(breaker.MAIN).describe()
+        if brk["state"] == breaker.OPEN:
+            held = brk.get("held_open_by")
+            reasons.append(f"breaker OPEN ({'held by ' + str(held) if held else brk.get('last_reason', '')})")
+        return "; ".join(reasons)
+    except Exception:  # noqa: BLE001 — additive, never fatal
+        return ""
+
+
 def engine_availability() -> dict:
     """The orchestrator's own view of the main engine (CONTRACT §8): the
     controller's last verdict, the circuit breaker, the generations held
@@ -762,6 +790,18 @@ async def check_dependencies() -> dict:
     if isinstance(checks.get(main_name), dict):
         # A copy: a probe stub may hand the same dict to every service.
         checks[main_name] = {**checks[main_name], "engine": engine_availability()}
+        # `/health` 200 proves nothing (CONTRACT §2): the entry's `status`
+        # follows the controller's verdict and the breaker, so a reader of
+        # checks.vllm.status alone never reads a wedge as healthy (round-2
+        # review, health.py:764). `reachable` keeps the probe's own answer.
+        not_serving = answer_engine_not_serving()
+        if not_serving and checks[main_name].get("status") == "ok":
+            checks[main_name] = {
+                **checks[main_name],
+                "status": "degraded",
+                "reachable": True,
+                "detail": f"answer engine not serving: {not_serving}",
+            }
     embedding_index_result = results[required_count + 2]
     ocr_result = results[required_count + 3]
     reranker_result = results[required_count + 4]

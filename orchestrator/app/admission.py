@@ -12,14 +12,22 @@ reaches vLLM:
     NORMAL   prompt ≤ ADMISSION_LONG_THRESHOLD_TOKENS: at most
              ADMISSION_NORMAL_MAX generations at once (a semaphore);
     LONG     above the threshold: ONE at a time. Before it starts, the
-             NORMAL lane is closed and drained (nothing new is admitted,
-             what is running finishes), the engine is asked — through the
-             controller's engine sample, never /metrics itself — to report
-             `requests_running` ≤ ADMISSION_LONG_IDLE_MAX, for at most
-             ADMISSION_LONG_WAIT_S, and the NORMAL lane stays closed until
-             the long request's FIRST TOKEN: no new prefill mixes with the
-             large one. Then the lane reopens and the long generation
-             decodes beside ordinary traffic like any other.
+             engine is asked — through the controller's engine sample,
+             never /metrics itself — to report `requests_running` ≤
+             ADMISSION_LONG_IDLE_MAX, for at most ADMISSION_LONG_WAIT_S.
+             The NORMAL lane keeps admitting during that wait: the second
+             tenant's raw-port traffic can keep the engine busy for the
+             whole bound, and closing NORMAL for it would turn one large
+             document into ten minutes of no answers for everyone else
+             (round-2 review, admission.py:296). From the moment the long
+             request is ADMITTED — idle reached, or the wait expired and
+             it proceeds — the NORMAL lane is closed until the long
+             request's FIRST TOKEN: no new prefill mixes with the large
+             one. Then the lane reopens and the long generation decodes
+             beside ordinary traffic like any other. Time a NORMAL waiter
+             spends behind that closure does not count against its own
+             bound: it is never refused with `timeout` for a wait it did
+             not choose.
 
 The second tenant's raw-port traffic is outside these lanes (it does not
 pass through this process); that is documented, not solved, here.
@@ -68,7 +76,7 @@ LANES = (NORMAL, LONG)
 #: (CONTRACT §6.7), and its sibling for an ordinary request waiting for a
 #: slot. `{n}` is how many requests are ahead in the lane.
 LONG_LINE = "Waiting for the model to finish current work before your large document ({n} ahead)."
-NORMAL_LINE = "Waiting for the model to finish current work ({n} ahead)."
+NORMAL_LINE = "Waiting for a free slot on the main model ({n} ahead)."
 
 #: How often a waiter re-reads the lane and the engine sample while it
 #: waits. In-memory; the lane's condition wakes it earlier.
@@ -130,17 +138,26 @@ class Lane:
             metrics.inc("llm_admission_rejections_total", "Requests the admission lanes refused, by reason.",
                         reason="capacity")
             raise AdmissionRejected(self.name, "capacity", 0.0)
-        ahead = self.active + self.waiting
+        # How many are ahead: the requests in and waiting for this lane —
+        # and, behind a closure, the one LONG request that holds it.
+        ahead = self.active + self.waiting + (1 if self.closed else 0)
         self.waiting += 1
         self._publish()
         told = False
+        last = started
         try:
             async with self.cond:
                 while not self.free():
                     if not told and on_wait is not None:
                         told = True
                         await on_wait(ahead)
-                    remaining = timeout - (time.monotonic() - started)
+                    now = time.monotonic()
+                    if self.closed:
+                        # A LONG request holds the lane: that time is its
+                        # wait, not this caller's — the bound is deferred.
+                        started += now - last
+                    last = now
+                    remaining = timeout - (now - started)
                     if remaining <= 0:
                         metrics.inc("llm_admission_rejections_total",
                                     "Requests the admission lanes refused, by reason.", reason="timeout")
@@ -221,21 +238,29 @@ async def _say(line: str) -> None:
     await resilience.notify(line)
 
 
-async def _wait_for_idle(deadline: float) -> bool:
-    """Wait until the controller's engine sample says the engine is idle
-    (`requests_running` ≤ ADMISSION_LONG_IDLE_MAX) or `deadline` passes.
-    A controller that is unknown cannot be waited on — the drained NORMAL
-    lane is then the whole protection, and the log says so once."""
+def _ahead(ls: "Lanes") -> Optional[int]:
+    """How much work is in front of a long request: the engine's own
+    `requests_running` from the controller's sample, or — with no sample —
+    this process's NORMAL occupancy. None when idle by that measure."""
     idle_max = max(0, int(settings.admission_long_idle_max))
+    sample = engine_state.engine_load()
+    running = int(sample["requests_running"]) if sample is not None else int(ls.normal.active)
+    return running if running > idle_max else None
+
+
+async def _wait_for_idle(deadline: float, ls: "Lanes") -> bool:
+    """Wait until the engine is idle — the controller's engine sample says
+    `requests_running` ≤ ADMISSION_LONG_IDLE_MAX, or, with no sample (an
+    unknown controller), this process's own NORMAL lane is that empty — or
+    `deadline` passes. The NORMAL lane is NOT closed meanwhile (module
+    docstring); the log says once when the sample is unknown."""
     said_unknown = False
     while True:
-        sample = engine_state.engine_load()
-        if sample is None:
-            if not said_unknown:
-                said_unknown = True
-                log.info("admission: controller engine sample unknown; long request proceeds after the lane drains")
-            return True
-        if sample["requests_running"] <= idle_max:
+        if engine_state.engine_load() is None and not said_unknown:
+            said_unknown = True
+            log.info("admission: controller engine sample unknown; the long request waits for this "
+                     "process's own lane to be idle")
+        if _ahead(ls) is None:
             return True
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -291,29 +316,21 @@ async def _admit(lane: str, on_wait) -> _Ticket:
 
     ticket.waited_s = await ls.long.acquire(timeout=budget, on_wait=tell)
     try:
-        # Close the NORMAL lane and let it drain; then wait for the engine
-        # to be idle. Both against the one budget.
+        # Wait for the engine to be idle — the NORMAL lane keeps admitting
+        # meanwhile (module docstring) — against what is left of the budget.
+        deadline = started + budget
+        ahead = _ahead(ls)
+        if ahead is not None:
+            await tell(ahead)
+        if not await _wait_for_idle(deadline, ls):
+            # The bound is "at most": the engine never went idle (the other
+            # tenant, most likely). The closed lane below is the protection
+            # the orchestrator can give; the request goes in and the log says.
+            log.warning("admission: engine not idle after %.0fs; long request proceeds", budget)
+        # ADMITTED: from here to the first token nothing new is admitted to
+        # NORMAL, so no other prefill of ours mixes with the large one.
         await ls.normal.set_closed(True)
         ticket.long_holds_normal = True
-        deadline = started + budget
-        sample = engine_state.engine_load()
-        busy = sample is not None and sample["requests_running"] > max(0, int(settings.admission_long_idle_max))
-        if ls.normal.active > 0 or busy:
-            await tell(ls.normal.active)
-        async with ls.normal.cond:
-            while ls.normal.active > 0:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    metrics.inc("llm_admission_rejections_total",
-                                "Requests the admission lanes refused, by reason.", reason="timeout")
-                    raise AdmissionRejected(LONG, "timeout", time.monotonic() - started)
-                with contextlib.suppress(asyncio.TimeoutError):
-                    await asyncio.wait_for(ls.normal.cond.wait(), min(_POLL_S, remaining))
-        if not await _wait_for_idle(deadline):
-            # The bound is "at most": the engine never went idle (the other
-            # tenant, most likely). The drained lane is the protection the
-            # orchestrator can give; the request goes in and the log says.
-            log.warning("admission: engine not idle after %.0fs; long request proceeds", budget)
         ticket.waited_s = time.monotonic() - started
         return ticket
     except BaseException:

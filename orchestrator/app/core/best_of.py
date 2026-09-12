@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
 from .. import llm
+from ..continuity import LeaseLost, QueuedForRecovery
 
 log = logging.getLogger(__name__)
 
@@ -50,6 +51,9 @@ class Candidate:
     reasoning: str = ""
     answer: str = ""
     error: str = ""
+    #: The main model was away for the whole queue window and the turn is
+    #: parked (continuity.QueuedForRecovery): not an empty candidate.
+    parked: Optional[RuntimeError] = None
 
     @property
     def usable(self) -> bool:
@@ -71,6 +75,13 @@ async def _generate_one(
             max_tokens=max_tokens,
         )
         return Candidate(index=index, reasoning=reasoning, answer=answer)
+    except (QueuedForRecovery, LeaseLost) as exc:
+        # Not a bad sample: the turn is parked for the main model (CONTRACT
+        # §8.3) or its row was taken over by another resumer, and nothing
+        # may stand in. Carried back so generate_candidates raises it once,
+        # after every sibling has ended (a parked hold ends them at once),
+        # instead of leaving sibling tasks to raise unread.
+        return Candidate(index=index, parked=exc)
     except Exception as exc:  # noqa: BLE001 — one bad sample must not kill the turn
         log.warning("best-of-N candidate %d failed: %s", index, str(exc)[:200])
         return Candidate(index=index, error=str(exc)[:300])
@@ -83,8 +94,11 @@ async def generate_candidates(
     temperature: float,
     max_tokens: Optional[int],
 ) -> List[Candidate]:
-    """N full candidates, generated concurrently — never sequentially."""
-    return list(
+    """N full candidates, generated concurrently — never sequentially.
+    Raises QueuedForRecovery when the turn was parked for the main model
+    while a candidate waited: the caller must not fall through to a
+    single stream (which would only park again)."""
+    candidates = list(
         await asyncio.gather(
             *(
                 _generate_one(
@@ -94,6 +108,10 @@ async def generate_candidates(
             )
         )
     )
+    for candidate in candidates:
+        if candidate.parked is not None:
+            raise candidate.parked
+    return candidates
 
 
 async def select_best(

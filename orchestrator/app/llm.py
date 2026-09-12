@@ -35,18 +35,19 @@ from . import context, metrics
 from .config import settings
 from .context import clip_message_contents
 from .model_capabilities import ModelCapabilities, ReasoningField
-from .resilience import ModelUnavailable, resilient, sidecar_recovery_s  # noqa: F401 — re-exported for callers
+from .resilience import ModelUnavailable, resilient, sidecar_recovery_s, wait_admitted  # noqa: F401 — re-exported for callers
 
 # ---------------------------------------------------------------------------
 # OUTAGE TOLERANCE. Every model call below opens through
 # `resilience.resilient`, which waits for /health and retries through the
 # recoverable failures a restarting engine produces (connection refused, a
 # 5xx from a dying engine) and re-raises everything else untouched — a 4xx,
-# a read timeout, a cancellation. For streams only the OPEN is wrapped: once
-# a token has been forwarded a re-open would duplicate text. The window is
-# short for a person watching a chat and long for a background job; see
-# app/resilience.py for the two windows and the measured outage that sized
-# them.
+# a read timeout, a cancellation. For streams the OPEN and the FIRST CHUNK
+# are wrapped (the headers prove nothing; a body that dies before its first
+# token is a failed open, CONTRACT §8.4): once a token has been forwarded a
+# re-open would duplicate text. The window is short for a person watching a
+# chat and long for a background job; see app/resilience.py for the two
+# windows and the measured outage that sized them.
 #
 # STRICT ONE-MODEL MODE (2026-09-12, docs/availability/CONTRACT.md v2 §1,
 # §6.7, §8.2–8.3). Only the main model answers a person; nothing stands in
@@ -186,6 +187,33 @@ def _is_primary(base_url: str) -> bool:
     """Is this endpoint the main model's? The breaker registry is the one
     place that maps URLs to engines, so the two can never disagree."""
     return _breaker.engine_for_base_url(base_url) == _breaker.MAIN
+
+
+async def _fit(
+    messages: Sequence[dict],
+    *,
+    base_url: str,
+    model: str,
+    requested_max_tokens: Optional[int] = None,
+    what: str,
+    recovery_s: Optional[float] = None,
+) -> Tuple[List[dict], int]:
+    """`context.fit_request`, behind the breaker.
+
+    Sizing asks the engine's `/tokenize` for the exact prompt count, and
+    every entry point sizes BEFORE it sends — so with the breaker OPEN this
+    process kept touching the port it had declared dead, once per queued
+    turn (round-2 review, llm.py:406; CONTRACT §8.2: "while OPEN, no
+    caller polls the dead port"). The sizing therefore waits at the gate
+    first, exactly as the send would: a chat turn queues on its hold (and
+    parks at the window), a sidecar with no window fails to its fallback
+    at once — and only an engine the breaker admits is asked to count.
+    """
+    if _is_primary(base_url) and not _breaker.main_allows():
+        await wait_admitted(what=what, base_url=base_url, recovery_s=recovery_s)
+    return await context.fit_request(
+        messages, base_url=base_url, model=model, requested_max_tokens=requested_max_tokens,
+    )
 
 
 async def _primary_send(client, request: dict, *, what: str, base_url: str, stream: bool = False):
@@ -403,11 +431,12 @@ async def chat_completion(
     """
     model_id = model or settings.llm_model
     client = _openai_client()
-    sized, budget = await context.fit_request(
+    sized, budget = await _fit(
         normalize_system(messages),
         base_url=settings.openai_base_url,
         model=model_id,
         requested_max_tokens=max_tokens,
+        what="chat_completion",
     )
     request = dict(
         model=model_id,
@@ -454,11 +483,12 @@ async def chat_completion_with_reasoning(
             requested = max(max_tokens or 0, settings.max_output_tokens)
 
     client = _openai_client()
-    sized, budget = await context.fit_request(
+    sized, budget = await _fit(
         normalize_system(messages),
         base_url=settings.openai_base_url,
         model=model_id,
         requested_max_tokens=requested,
+        what="chat_completion_with_reasoning",
     )
     request = dict(
         model=model_id, messages=sized, temperature=temperature, max_tokens=budget
@@ -500,11 +530,12 @@ async def stream_chat_completion(
     """Streaming chat completion; yields text deltas."""
     model_id = model or settings.llm_model
     client = _openai_client()
-    sized, budget = await context.fit_request(
+    sized, budget = await _fit(
         normalize_system(messages),
         base_url=settings.openai_base_url,
         model=model_id,
         requested_max_tokens=max_tokens,
+        what="stream",
     )
     request = dict(
         model=model_id,
@@ -757,11 +788,12 @@ async def stream_chat_events(
     assert_answer_engine(base_url)
     client = _client(base_url, api_key)
     # Size the call to the window of the model that will actually serve it.
-    sized, budget = await context.fit_request(
+    sized, budget = await _fit(
         normalize_system(shaped_messages),
         base_url=base_url,
         model=model_id,
         requested_max_tokens=requested,
+        what="stream",
     )
     request = dict(
         model=model_id,
@@ -993,10 +1025,11 @@ async def chat_with_tools(
             requested = max_tokens + budget_tokens
         elif budget_tokens is None:
             requested = max(max_tokens or 0, settings.max_output_tokens)
-    sized, budget = await context.fit_request(
+    sized, budget = await _fit(
         normalize_system(messages),
         base_url=settings.openai_base_url,
         model=model_id,
+        what="chat_with_tools",
         requested_max_tokens=requested,
     )
     request = dict(
@@ -1060,11 +1093,12 @@ async def json_completion(
             requested = max(max_tokens or 0, settings.max_output_tokens)
 
     client = _openai_client()
-    sized, budget = await context.fit_request(
+    sized, budget = await _fit(
         normalize_system(messages),
         base_url=settings.openai_base_url,
         model=model_id,
         requested_max_tokens=requested,
+        what="json_completion",
     )
     base = dict(
         model=model_id,
@@ -1148,13 +1182,17 @@ async def router_chat_completion(
     than the main model's.
     """
     client = _client(settings.router_base_url)
-    sized, budget = await context.fit_request(
+    # Sized like a sidecar too: on a profile that points the router at the
+    # main URL, an OPEN breaker means one refused attempt, not a /tokenize.
+    sized, budget = await _fit(
         normalize_system(
             clip_message_contents(messages, settings.router_input_char_cap)
         ),
         base_url=settings.router_base_url,
         model=settings.router_model,
         requested_max_tokens=max_tokens,
+        what="router_chat_completion",
+        recovery_s=sidecar_recovery_s(),
     )
     request = dict(
         model=settings.router_model,
