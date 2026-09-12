@@ -247,6 +247,10 @@ def test_assistant_mode_bypasses_router_and_duckdb(monkeypatch):
     # attached to the same detached generation); the rest of the contract is
     # unchanged.
     assert meta.pop("generation_id")
+    # The query-tracing branch (merged 2026-09-12) puts the trace and request
+    # ids on every meta, like generation_id: identities, not the contract
+    # under test here.
+    assert meta.pop("trace_id") and meta.pop("request_id")
     # The knowledge pre-pass reports how it served the turn (ADR-0001 D12:
     # `decision`, plus `degraded` when the judge was missing). Its VALUE
     # depends on the offline corpus and the classifier, so only its shape is
@@ -307,6 +311,10 @@ def test_salesforce_mode_chat_route_streams_via_graph(monkeypatch):
     assert kinds == ["token", "meta", "done"]
     meta = dict(events[1][1])
     assert meta.pop("generation_id")
+    # The query-tracing branch (merged 2026-09-12) puts the trace and request
+    # ids on every meta, like generation_id: identities, not the contract
+    # under test here.
+    assert meta.pop("trace_id") and meta.pop("request_id")
     assert meta == {
         "route": "chat",
         "mode": "salesforce",
