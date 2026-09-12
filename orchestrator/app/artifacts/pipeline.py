@@ -1554,7 +1554,7 @@ def _validate_files(work_dir: str, report: dict, selected: Sequence[str], title:
                 problems.append(f"the csv file{' for ' + sheet if sheet else ''} has {rows:,} data rows; {wanted:,} were asked for")
                 continue
         label = str(entry.get("title") or "").strip() or sheet
-        if role == "data" and label and label != title:
+        if role == "data" and label and label != title and data_files > 1:
             # "<title> — <sheet>" (CONTRACT-2 §2): composed here from the
             # sheet name the renderer reports; a label the renderer already
             # composed is kept as it is, and a sheet whose name merely

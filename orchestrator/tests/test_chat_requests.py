@@ -149,6 +149,10 @@ def test_post_chat_records_the_intent_and_the_durable_answer(hello_stream):
         # The FIRST event names the generation, before any token exists.
         assert kinds[0] == "meta" and kinds[-1] == "done"
         leading = events[0][1]
+        # The query-tracing branch (merged 2026-09-12) adds the trace and
+        # request ids to the leading meta: identities, popped like the
+        # generation id.
+        assert leading.pop("trace_id") and leading.pop("request_id")
         assert leading == {
             "generation_id": leading["generation_id"],
             "intent_id": "int-1",
@@ -303,7 +307,10 @@ def test_a_completed_intent_replays_the_persisted_answer(monkeypatch):
         events = _parse_sse(resp.text)
     kinds = [e for e, _ in events]
     assert kinds == ["meta", "token", "meta", "done"]
-    assert events[0][1] == {"generation_id": generation_id, "intent_id": "int-done", "attempt": 1}
+    first = dict(events[0][1])
+    first.pop("trace_id", None)  # a replayed answer needs no new trace; a live turn carries one
+    first.pop("request_id", None)
+    assert first == {"generation_id": generation_id, "intent_id": "int-done", "attempt": 1}
     assert events[1][1] == {"text": "Hello!"}
     assert events[2][1]["route"] == "chat" and events[2][1]["generation_id"] == generation_id
     assert calls == [1], "a replay never runs the model again"

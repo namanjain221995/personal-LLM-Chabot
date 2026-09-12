@@ -267,7 +267,7 @@ def test_sheet_grid_returns_formulas_as_text_and_honours_bounds(tmp_path):
     pipe = preview.sheet_grid(path, "Pipeline", max_rows=5, max_cols=3)
     assert pipe["sheet"]["columns"] == ["Deal", "Close date", "Amount"]
     assert len(pipe["sheet"]["rows"]) == 5 and pipe["sheet"]["truncated"] is True
-    assert pipe["sheet"]["rows"][0][1] == "2026-02-02T00:00:00"   # a date, serialised
+    assert pipe["sheet"]["rows"][0][1] == "2026-02-02"   # a date cell reads back as midnight; the grid shows the date
     full = preview.sheet_grid(path, "Pipeline", max_rows=200, max_cols=50)
     assert full["sheet"]["formulas"]["C32"] == "=SUM(C2:C31)"
     assert full["sheet"]["truncated"] is False
