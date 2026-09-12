@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://techsara.local/schemas/salesforce-trace-v1.json",
+  "title": "TechSara Salesforce Evaluation Trace",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "trace_id",
+    "request_id",
+    "conversation_id",
+    "original_question",
+    "requested_mode",
+    "resolved_mode",
+    "selected_route",
+    "final_status",
+    "started_at",
+    "total_duration_ms",
+    "versions",
+    "events"
+  ],
+  "properties": {
+    "trace_id": {"type": "string", "minLength": 1},
+    "request_id": {"type": "string", "pattern": "^req_[A-Fa-f0-9]{32}$"},
+    "test_case_id": {"type": ["string", "null"], "maxLength": 128},
+    "conversation_id": {"type": "string", "minLength": 1},
+    "user_id": {"type": ["integer", "null"]},
+    "workspace_id": {"type": ["string", "null"]},
+    "original_question": {"type": "string"},
+    "requested_mode": {"type": "string"},
+    "resolved_mode": {"type": "string"},
+    "selected_route": {"type": "string"},
+    "final_status": {
+      "type": "string",
+      "enum": ["running", "ok", "error", "cancelled"]
+    },
+    "started_at": {"type": "string", "format": "date-time"},
+    "completed_at": {"type": ["string", "null"], "format": "date-time"},
+    "total_duration_ms": {"type": ["integer", "null"], "minimum": 0},
+    "error_stage": {"type": "string"},
+    "error_type": {"type": "string"},
+    "error_message": {"type": "string"},
+    "versions": {
+      "type": "object",
+      "additionalProperties": {"type": ["string", "integer", "number", "boolean", "null"]},
+      "required": ["trace_schema", "pipeline", "application", "database_schema"]
+    },
+    "meta": {"type": "object"},
+    "events": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/event"}
+    }
+  },
+  "$defs": {
+    "event": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "sequence_number",
+        "stage",
+        "status",
+        "started_at",
+        "completed_at",
+        "duration_ms",
+        "component",
+        "component_version",
+        "details",
+        "error_type",
+        "error_message"
+      ],
+      "properties": {
+        "sequence_number": {"type": "integer", "minimum": 1},
+        "stage": {"type": "string", "minLength": 1},
+        "status": {
+          "type": "string",
+          "enum": ["running", "success", "failed", "info", "skipped"]
+        },
+        "created_at": {"type": "string", "format": "date-time"},
+        "started_at": {"type": "string", "format": "date-time"},
+        "completed_at": {"type": "string", "format": "date-time"},
+        "duration_ms": {"type": ["integer", "null"], "minimum": 0},
+        "component": {"type": "string"},
+        "component_version": {"type": "string"},
+        "details": {"type": "object"},
+        "error_type": {"type": "string"},
+        "error_message": {"type": "string"}
+      }
+    }
+  }
+}

@@ -11,12 +11,16 @@ import contextvars
 import hashlib
 import json
 import logging
+import uuid
 from time import perf_counter
 from typing import Any, Dict, Optional
 
 from .. import db
 
 log = logging.getLogger(__name__)
+
+TRACE_SCHEMA_VERSION = "1.0.0"
+PIPELINE_VERSION = "salesforce-eval-trace-v1"
 
 _current: contextvars.ContextVar[Optional["TraceRecorder"]] = contextvars.ContextVar(
     "query_trace_recorder", default=None
@@ -80,14 +84,30 @@ def text_fingerprint(value: str) -> dict:
 
 
 class TraceRecorder:
-    def __init__(self, trace_id: str) -> None:
+    def __init__(
+        self,
+        trace_id: str,
+        *,
+        request_id: str = "",
+        test_case_id: Optional[str] = None,
+        versions: Optional[dict] = None,
+    ) -> None:
         self.trace_id = trace_id
+        self.request_id = request_id or f"req_{uuid.uuid4().hex}"
+        self.test_case_id = test_case_id
         self._sequence = 0
         self._started = perf_counter()
         self._finished = False
         self._last_stage = ""
         self.selected_route = ""
         self.resolved_mode = ""
+        self.versions = {
+            "trace_schema": TRACE_SCHEMA_VERSION,
+            "pipeline": PIPELINE_VERSION,
+            "prompt": "unversioned",
+            "metadata_index": "runtime",
+            **(versions or {}),
+        }
 
     def activate(self) -> contextvars.Token:
         return _current.set(self)
@@ -114,6 +134,9 @@ class TraceRecorder:
                 workspace_id,
                 question,
                 requested_mode,
+                request_id=self.request_id,
+                test_case_id=self.test_case_id,
+                versions=sanitize(self.versions),
             )
         except Exception:
             log.warning("query trace root could not be persisted trace_id=%s", self.trace_id, exc_info=True)
@@ -127,6 +150,7 @@ class TraceRecorder:
         details: Optional[dict] = None,
         duration_ms: Optional[int] = None,
         error: Optional[BaseException] = None,
+        component_version: str = PIPELINE_VERSION,
     ) -> None:
         if self._finished:
             return
@@ -142,6 +166,8 @@ class TraceRecorder:
             json.dumps(
                 {
                     "trace_id": self.trace_id,
+                    "request_id": self.request_id,
+                    "test_case_id": self.test_case_id,
                     "sequence": self._sequence,
                     "stage": stage,
                     "status": status,
@@ -163,6 +189,7 @@ class TraceRecorder:
                 duration_ms,
                 error_type,
                 error_message,
+                component_version,
             )
         except Exception:
             log.warning("query trace event could not be persisted trace_id=%s stage=%s", self.trace_id, stage, exc_info=True)

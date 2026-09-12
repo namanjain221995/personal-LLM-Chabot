@@ -194,6 +194,8 @@ _CONVERSATION_ID_RE = _re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 #: A send intent (V29): browser-minted, one per press of Send, re-sent on
 #: every retry of that message. Same alphabet as a conversation id.
 _INTENT_ID_RE = _re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+#: Offline evaluation correlation only. It carries no expected answer.
+_TEST_CASE_ID_RE = _re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 
 app = FastAPI(title="TechSara Orchestrator", version="0.2.0", lifespan=lifespan)
 
@@ -579,6 +581,16 @@ class ChatRequest(BaseModel):
     # starting another (docs/upload-reliability/API.md). Absent from old
     # clients: the server mints one and keeps the event shapes they expect.
     intent_id: Optional[str] = None
+    # Supplied only by the offline evaluation runner. The application receives
+    # the stable case identifier, never the expected plan, query or answer.
+    test_case_id: Optional[str] = None
+
+    @field_validator("test_case_id")
+    @classmethod
+    def _valid_test_case_id(cls, value: Optional[str]) -> Optional[str]:
+        if value is not None and not _TEST_CASE_ID_RE.fullmatch(value):
+            raise ValueError("test_case_id must be 1-128 characters of [A-Za-z0-9_.-]")
+        return value
 
     @field_validator("intent_id")
     @classmethod
@@ -1615,6 +1627,19 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
         previous.task.cancel()
 
     _live_generations[conv_key_outer] = gen
+    # One correlation envelope per HTTP attempt. `test_case_id` is only a
+    # join key; golden expectations remain in the offline evaluator.
+    query_trace = TraceRecorder(
+        gen.generation_id,
+        test_case_id=request.test_case_id,
+        versions={
+            "application": app.version,
+            "database_schema": db.LATEST_SCHEMA_VERSION,
+            "salesforce_api": settings.sf_api_version,
+            "model_choice": request.model,
+            "model": llm.served_model_id(request.model),
+        },
+    )
     # The FIRST event names the generation, so the browser can mark its turn
     # accepted before a single token exists — and a re-attach, which replays
     # the buffer, starts with it too. Published directly, not through
@@ -1624,16 +1649,20 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
     if client_intent:
         await gen.publish(
             "meta",
-            {"generation_id": gen.generation_id, "intent_id": intent_id, "attempt": gen.attempt},
+            {
+                "generation_id": gen.generation_id,
+                "trace_id": query_trace.trace_id,
+                "request_id": query_trace.request_id,
+                "intent_id": intent_id,
+                "attempt": gen.attempt,
+                **({"test_case_id": request.test_case_id} if request.test_case_id else {}),
+            },
         )
     _metrics.inc(
         "chat_request_total", "chat requests by outcome", result="resumed" if resumed else "accepted"
     )
     if resumed:
         _metrics.inc("chat_request_resume_total", "chat requests resumed under a new attempt")
-    # Reuse generation_id so SSE, messages, usage and detailed checkpoints all
-    # share one correlation key.
-    query_trace = TraceRecorder(gen.generation_id)
 
     # Filled in by the compaction pass; rides out on the final meta so the
     # context meter shows this session's real usage.
@@ -1669,12 +1698,14 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
     # Living-knowledge extras: the sources a locally-grounded answer used, so
     # the Sources panel can show provenance for an answer that never searched.
     knowledge_state: dict = {}
+    provenance_recorded = False
     # Wall clock for the route-mix / TTFT metrics stamped on meta.
     from time import perf_counter as _perf_counter
 
     _timing: dict = {"started": _perf_counter(), "first_token": None}
 
     async def emit(event: str, data: dict) -> None:
+        nonlocal provenance_recorded
         if event == "token":
             # Kept so the meta below can say which sources the answer cited.
             # Bounded: only the markers matter, and a marker is a few bytes.
@@ -1686,6 +1717,9 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 **data,
                 **meta_extras(data.get("route")),
                 "generation_id": gen.generation_id,
+                "trace_id": query_trace.trace_id,
+                "request_id": query_trace.request_id,
+                **({"test_case_id": request.test_case_id} if request.test_case_id else {}),
                 # V29: the intent and attempt, on the meta that gets
                 # persisted with the answer — how a reloaded tab matches an
                 # answer to the send it belongs to.
@@ -1749,6 +1783,30 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     data["knowledge"]["decision"] = knowledge_state["decision"]
                 if knowledge_state.get("degraded"):
                     data["knowledge"]["degraded"] = knowledge_state["degraded"]
+            # Local RAG provenance is created only after the actual sources
+            # have been merged. Search/network sources deliberately do not get
+            # relabelled as the org knowledge base.
+            if (
+                not data.get("provenance")
+                and data.get("sources")
+                and (data.get("knowledge") or {}).get("from_local_memory")
+            ):
+                cited = [row for row in data["sources"] if row.get("cited")]
+                data["provenance"] = {
+                    "source": "org_knowledge_base",
+                    "environment": settings.sf_environment,
+                    "freshness": (data.get("knowledge") or {}).get("freshness")
+                    or "metadata_snapshot",
+                    "retrieved_source_count": len(data["sources"]),
+                    "cited_source_count": len(cited),
+                }
+            if isinstance(data.get("provenance"), dict) and not provenance_recorded:
+                provenance_recorded = True
+                await query_trace.event(
+                    "PROVENANCE_RECORDED",
+                    component="orchestrator.app.main.emit",
+                    details=data["provenance"],
+                )
             # Route mix and time to first token, orchestrator-side (vLLM's
             # own TTFT excludes every pre-pass — the number that matters to
             # the person waiting is this one).
@@ -1816,6 +1874,8 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 component="orchestrator.app.main.chat",
                 details={
                     "requested_mode": request.mode,
+                    "request_id": query_trace.request_id,
+                    "test_case_id": request.test_case_id,
                     "effort": request.effort,
                     "model_choice": request.model,
                     "force_live": request.sf_live,
@@ -2971,6 +3031,11 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 meta={
                     "answer_characters": len(answer or ""),
                     "final_meta_keys": sorted((gen.final_meta or {}).keys()),
+                    **(
+                        {"provenance": (gen.final_meta or {})["provenance"]}
+                        if isinstance((gen.final_meta or {}).get("provenance"), dict)
+                        else {}
+                    ),
                 },
             )
             await gen.publish("done", {"session_id": request.session_id})
