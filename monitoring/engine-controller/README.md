@@ -29,12 +29,13 @@ cd /path/to/worktree
 /home/techsphere/Documents/project/personal-LLM-Chabot/orchestrator/.venv/bin/python -m pytest monitoring/engine-controller/tests -q
 ```
 
-98 tests, ~55 s (the hung-API and handler-timeout cases wait real seconds).
-The fixture points `MEMINFO_PATH` at a file saying 60 GiB, so no test depends
-on the memory of the box it runs on.
+113 tests, ~70 s (the hung-API, handler-timeout and choreography-heartbeat
+cases wait real seconds). The fixture points `MEMINFO_PATH` at a file saying
+60 GiB, so no test depends on the memory of the box it runs on.
 Lint: `ruff check monitoring/engine-controller`. Tests named after a review
 finding (`[blocker]`/`[major]`/`[minor]` in their docstring) reproduce that
-finding's scenario from `docs/availability/REVIEW-FINDINGS-round1.md`.
+finding's scenario from `docs/availability/REVIEW-FINDINGS-round1.md` and
+`REVIEW-FINDINGS-round2.md`.
 
 A read-only smoke test against the live head, without touching anything
 (`DRY_RUN=1` logs the restarts it would perform instead of doing them; the
@@ -79,7 +80,8 @@ curl -s -X POST -H 'Content-Type: application/json' -d '{"reason":"manual","cate
 | `CANARY_TIMEOUT_S` / `CANARY_CONNECT_TIMEOUT_S` | `60` / `5` | read budget of one probe / TCP connect budget |
 | `CANARY_MODEL` | *(empty)* | override the model id (default: first id of `/v1/models`) |
 | `CANARY_OUTSTANDING_S` | `60` | the wedge rule's "canary outstanding ≥" threshold |
-| `CANARY_STARVATION_S` | `300` | ceiling on the saturation exemption of trigger 5 (below) |
+| `CANARY_STARVATION_S` | `300` | ceiling on the saturation exemption of triggers 5 and 7 (below) |
+| `CANARY_FAIL_DEGRADED_MAX_S` | `120` | the bound on DEGRADED "awaiting confirmation" (trigger 7): a proven engine that has failed every canary for this long while `/health` still answers 200 is confirmed WEDGED, as `canary_timeout` or `canary_http_error` by the last failure's kind |
 | `TTFT_DEGRADED_S` | `10` | canary TTFT above this → DEGRADED |
 | `FROZEN_S` | `90` | token counters frozen ≥ this with requests running → wedge signal |
 | `COLD_START_BUDGET_S` | `900` | STARTING → DOWN without a readiness proof; also the recovery's wait-for-model-load budget |
@@ -90,6 +92,7 @@ curl -s -X POST -H 'Content-Type: application/json' -d '{"reason":"manual","cate
 | `WORKER_RANK_GRACE_S` | `120` | a rank process absent this long after the worker container start counts as dead |
 | `HEAD_RESTART_TIMEOUT_S` | `10` | `docker restart -t` for the head |
 | `POLL_S` / `PROBE_TIMEOUT_S` | `5` / `5` | observation loop period / per-probe HTTP timeout |
+| `CHOREOGRAPHY_HEARTBEAT_S` | `5` | while the tick thread is inside a blocking recovery call (sentinel `POST /restart` up to 125 s, `docker restart` up to 70 s, diagnostics up to 55 s) a helper thread re-stamps the published snapshot's `generated_at` this often, so the freshness rules (§7.3: 30 s, §8.1: 15 s) measure the controller's liveness, not a step's length. Stops on its own after 600 s (every call it covers has a shorter timeout; past that a stale snapshot is the truth) |
 | `DOCKER_SOCKET` / `DOCKER_API_VERSION` | `/var/run/docker.sock` / `1.53` | |
 | `RECOVERY_LOCK_PATH` | `${LOCK_DIR:-/run/techsara/locks}/engine-recovery.lock` | the host flock shared with `scripts/lib/engine-lock.sh`; `.runtime/locks` is bind-mounted at `LOCK_DIR`. **The directory must pre-exist** (a missing bind mount is refused, never created: a lock inside the container's own overlay is one nobody on the host contends for). The file is created `0666` and chowned to the directory's owner, so the shell wrappers run as the checkout owner can open it |
 | `INCIDENT_DIR` | `${INCIDENTS_DIR:-/run/techsara/incidents}` | one directory per incident id, owned like the mount; `.runtime/incidents` is bind-mounted there |
@@ -102,7 +105,7 @@ curl -s -X POST -H 'Content-Type: application/json' -d '{"reason":"manual","cate
 
 | method + path | who | answer |
 |---|---|---|
-| `GET /state` | anyone | the §6.2 JSON (plus additive fields: `readiness` (with `participation_probes[]`: per concurrent step-4 completion `ok`, `outcome`, `http_status`, `connect_s`, `ttft_s`, `total_s`, `tokens`, `terminal`), `signals.gpus`, `signals.head_memory` (`available_bytes` — null when unreadable, never 0 — `observed_at`, `min_bytes`, `low`), `head_container.rank_process_alive`, `head_container.docker_ok`, `canary.kind`, `canary.health_at_start`, `canary.started_at`, `canary.in_flight`, `canary.outstanding_s`, `recovery.steps`, `recovery.blocked`, `recovery.blocked_detail`, `recovery.manual_pending`, `recovery.worker_restart`, `recovery.verify_successes`, `last_failure_category`, `cold_start_detail`, `cold_start_seconds`, `recovery_duration_seconds`, `single_node`, `dry_run`). Every error rendered here is a **bounded kind** (`worker.error` ∈ refused/timeout/unreachable/broken/http_NNN/malformed; `head_container.docker_error` ∈ socket_missing/refused/timeout/broken/malformed/api_NNN; `recovery.blocked` ∈ cooldown/lock_held/lock_unavailable/budget_exhausted/head_memory_low) — no socket path, address or exception text |
+| `GET /state` | anyone | the §6.2 JSON (plus additive fields: `readiness` (with `participation_probes[]`: per concurrent step-4 completion `ok`, `outcome`, `http_status`, `connect_s`, `ttft_s`, `total_s`, `tokens`, `terminal`), `signals.gpus`, `signals.head_memory` (`available_bytes` — null when unreadable, never 0 — `observed_at`, `min_bytes`, `low`), `head_container.rank_process_alive`, `head_container.docker_ok`, `worker.started_ago_s` (the sentinel's own measure of the worker container's age — a duration on Node 2's clock; null from an older sentinel), `worker.clock_skew_s` (the sentinel's `observed_at` minus the controller's read time: Node 2's clock against Node 1's, what an operator reads when NTP fails), `canary.kind`, `canary.health_at_start`, `canary.started_at`, `canary.in_flight`, `canary.outstanding_s`, `canary.consecutive_timeouts`, `canary.consecutive_http_errors`, `canary.failing_since` (when the first probe of the current failure streak started; null while the canary passes), `recovery.steps`, `recovery.blocked`, `recovery.blocked_detail`, `recovery.manual_pending`, `recovery.worker_restart`, `recovery.verify_successes`, `recovery.last.detail` and `recovery.last.step` (why and where a failed attempt ended — an exception is named by its class only), `last_failure_category`, `cold_start_detail`, `cold_start_seconds`, `recovery_duration_seconds`, `single_node`, `dry_run`). `generated_at` keeps advancing through a blocking recovery step (`CHOREOGRAPHY_HEARTBEAT_S`); every other timestamp is the observation's own. Every error rendered here is a **bounded kind** (`worker.error` ∈ refused/timeout/unreachable/broken/http_NNN/malformed; `head_container.docker_error` ∈ socket_missing/refused/timeout/broken/malformed/api_NNN; `recovery.blocked` ∈ cooldown/lock_held/lock_unavailable/budget_exhausted/head_memory_low) — no socket path, address or exception text |
 | `GET /metrics` | anyone | Prometheus text, every §7.1 v2 name |
 | `GET /healthz` | anyone | `200 ok` (process liveness only) |
 | `POST /recover` | **127.0.0.1 only**, else 403 (the peer is checked *before* the body is read) | body `{"reason":"manual","category":"manual"}` → `202` queued for the next tick, with the `incident` id that will be used; **`429`** `{"reason":"cooldown","retry_after_s":…}` or `{"reason":"recovery budget exhausted", …}` — a manual recovery is subject to the same budget and cooldown as an automatic one (the escalation past them is `scripts/cluster-recover.sh --force` under the engine lock, not this endpoint); `409` if a recovery is in progress. The accepted request is visible in the very next `/state` read (`recovery.manual_pending: true`, `recovery.step: "confirm"`), so a follower never reads a pre-request document |
@@ -119,9 +122,9 @@ start** — after every start and recovery, and after any external restart
 
 | step | what | fails when | `/state.readiness` |
 |---|---|---|---|
-| 1 | non-streaming `/v1/chat/completions`, `READINESS_MAX_TOKENS` tokens, `ignore_eos`, thinking off, temperature 0, seed 7 | not 200, no `finish_reason`, error object | `non_stream_ok` |
-| 2 | streaming, same length; TTFT and total latency measured; terminal chunk seen | timeout, error chunk, no terminal chunk | `stream_ok` (this step's timing is what `signals.canary` shows) |
-| 3 | `vllm:generation_tokens_total` on `/metrics` grew by ≥ the tokens steps 1+2 received (up to three re-reads `READINESS_PROGRESS_RETRY_S` apart: the stat logger records an iteration in the same loop turn that streams its last chunk) | `/metrics` unavailable, or the delta is short | `progress_ok`, `tokens_expected`, `tokens_delta` |
+| 1 | non-streaming `/v1/chat/completions`, `READINESS_MAX_TOKENS` tokens, `ignore_eos`, thinking off, temperature 0, seed 7 | not 200, no `finish_reason`, error object, **no tokens** (a `finish_reason` on empty text proves nothing) | `non_stream_ok` |
+| 2 | streaming, same length; TTFT and total latency measured; terminal chunk seen, at least one content token | timeout, error chunk, no terminal chunk, **no tokens** (a bare `[DONE]`) | `stream_ok` (this step's timing is what `signals.canary` shows) |
+| 3 | `vllm:generation_tokens_total` on `/metrics` grew by ≥ the tokens steps 1+2 **actually received, and by ≥ 1** (up to three re-reads `READINESS_PROGRESS_RETRY_S` apart: the stat logger records an iteration in the same loop turn that streams its last chunk) — with steps 1 and 2 each requiring a token the expectation is ≥ 2, and the floor keeps the step from ever degenerating to `delta ≥ 0` | `/metrics` unavailable, or the delta is short | `progress_ok`, `tokens_expected`, `tokens_delta` |
 | 4 | **two** `PARTICIPATION_MAX_TOKENS` streaming completions started **together** (two sockets, two threads, both started before either is awaited — `PARTICIPATION_PROBES = 2`, deliberately not a knob) while both GPU exporters are sampled every `PARTICIPATION_SAMPLE_S` (plus `PARTICIPATION_TAIL_S`); **both completions must finish** and both GPUs must reach `PARTICIPATION_MIN_UTIL` at least once. Why two at once: the candidate build compiles its multi-sequence GDN prefill kernel in memory at the first scheduler step that batches ≥ 2 prefills (≈ 3 s per rank, on no on-disk cache — contract §6.6, `CANDIDATE-B.md` §2.6); one probe would leave that to the first two real users after READY. The pair runs even when no exporter is configured (the warm-up is theirs; the exporters only decide the verdict) | a probe that does not complete fails the step (`failed_step: participation`, detail `probe k/2 <outcome>: … (n/2 completed; both must)`; no GPU verdict). `failed`: both exporters answered and a GPU stayed below the threshold. **`unobserved`** (an exporter never answered, or answered without the series): evidence missing, not evidence against — on a TP=2 engine the finished completions already needed both ranks, so READY is not withheld; the state is DEGRADED with the reason saying so. `skipped`: no exporter configured on a single node (in cluster mode a missing worker exporter is `unobserved`) | `participation`; per probe `participation_probes[]` (TTFT, total, tokens, outcome); the maxima in `signals.gpus` and, after a recovery, in `<incident>/readiness-<attempt>.json` |
 | 5 | the sentinel reports the rank process alive (`VLLM::Worker` waiting or `VLLM::Worker_TP1` joined) | the sentinel is reachable and says `false` (unreachable = not a block; DEGRADED) | `rank_alive` |
 
@@ -131,8 +134,23 @@ the head's `started_at`, so a sequence that began against the previous
 container can never prove the new one.
 
 The **routine canary** is step 2 alone with the exact §5 body (`max_tokens`
-4, no `ignore_eos`), every `CANARY_INTERVAL_S` once proven. Its failures are
-what triggers 4 and 5 count.
+4, no `ignore_eos`), every `CANARY_INTERVAL_S` once proven. A terminal chunk
+without a single content token is a **failure** (`http_error`, detail `no
+tokens`), never a success with a warning. Its failures are what triggers 4,
+5, 6 and 7 count; which of them a failure feeds is decided by its kind:
+
+| the probe saw | outcome | counts toward |
+|---|---|---|
+| no response / stream still open past `CANARY_TIMEOUT_S` | `timeout` | `consecutive_timeouts` (5), the streak (7, as `canary_timeout`) |
+| HTTP 5xx; a 200 with an error chunk, a stream without a terminal chunk, a non-JSON or error body, **no tokens** | `http_error` | `consecutive_http_errors` (6), the streak (7, as `canary_http_error`) |
+| HTTP 4xx — the API *rejected the request* (a changed request shape after an upgrade, a 429 under load) | `http_error` | nothing: a restart cannot fix it and calling it a wedge would queue users on a serving engine; the DEGRADED reason says `not counted as an engine fault` |
+| connect refused / timed out | `connect_error` | the streak only (7, as `canary_timeout`; a refused connect is trigger 3's) |
+| the probe itself crashed (no HTTP status) | `http_error` | nothing: a bug here is not evidence about the engine |
+
+`consecutive_*` counters and the streak reset on any success, on a new head
+incarnation and when a recovery starts; a timeout resets the HTTP-error
+streak and vice versa (the two rules count *consecutive* failures of one
+kind — the bound of trigger 7 is what catches a mix).
 
 `primary_ready` in `/state` = proven for this start **and** a completion
 success within 2 × `CANARY_INTERVAL_S`.
@@ -150,9 +168,9 @@ Evaluated once per tick, first match wins:
 | budget exhausted and not `primary_ready` | `DOWN` (`budget_exhausted`) |
 | head API connect **timed out / unreachable** (not refused) and not `primary_ready` | `MONITORING_UNKNOWN` |
 | head container missing / exited | `DOWN`; `restarting`/`created` → `STARTING` |
-| `primary_ready` | `DEGRADED` if any of: sentinel unreachable, sentinel sees no rank, `/health` ≠ 200, `/metrics` unusable, TTFT > `TTFT_DEGRADED_S`, the latest canary failed ("awaiting confirmation"), configured router unhealthy, a head process *seen alive for this incarnation* has vanished, participation `unobserved` — else `BUSY` if `requests_running > 0`, else `READY` |
+| `primary_ready` | `DEGRADED` if any of: sentinel unreachable, sentinel sees no rank (worded `never seen for this head start: unconfirmed, not a trigger` when the rank was never reported alive for this head incarnation), `/health` ≠ 200, `/metrics` unusable, TTFT > `TTFT_DEGRADED_S`, the latest canary failed ("awaiting confirmation", with the bound: `WEDGED as <kind> in Ns unless a canary passes`), configured router unhealthy, a head process *seen alive for this incarnation* has vanished, participation `unobserved` — else `BUSY` if `requests_running > 0`, else `READY` |
 | not proven for this start | `STARTING` (reason: which readiness step failed and why) until `COLD_START_BUDGET_S` has elapsed **under the controller's observation**, then `DOWN` (`cold_start_timeout`; not a restart trigger — probing continues and READY returns by itself when the sequence passes). `cold_start_detail` says what it looked like: `load` (never served a completion), `readiness` (completions worked, the sequence never passed), **`compile`** (a compile-error signature — `torch._dynamo`, `flashinfer.jit`, `nvcc`, `cuda_nvrtc` on an error-marked line — in the head log: the persistent kernel cache, contract §6.6; the reason names `scripts/cluster-recover.sh --clear-kernel-cache`; the controller never deletes a cache itself) |
-| proven once since this start, canary now stale/failing/outstanding, nothing confirmed | `DEGRADED` "… awaiting confirmation" (the honest in-between: not READY, not yet WEDGED) |
+| proven once since this start, canary now stale/failing/outstanding, nothing confirmed | `DEGRADED` "… awaiting confirmation" (the honest in-between: not READY, not yet WEDGED). **Bounded**: three consecutive HTTP errors (trigger 6) or `CANARY_FAIL_DEGRADED_MAX_S` of consecutive failures with `/health` 200 (trigger 7) confirm a wedge; only a failure that is not the engine's (a 4xx, a probe crash) can hold DEGRADED longer, and the reason says so |
 
 ### Per-incarnation rules (the review blockers)
 
@@ -171,7 +189,17 @@ Evaluated once per tick, first match wins:
   are `null` until first seen). A TP=1 engine (vLLM's `uni` executor — the
   router's real process table has only `vllm serve` and `VLLM::EngineCore`)
   has no `VLLM::Worker_TP` process and is never DEGRADED or restarted for
-  lacking one.
+  lacking one. The same gate applies to the **worker's** rank as the sentinel
+  reports it: trigger 1(c) fires only once the sentinel has reported
+  `rank_process_alive: true` at least once since the current head start
+  (a pair proven while the sentinel was unreachable, then a sentinel that
+  does not recognise the build's process title, is DEGRADED — never a
+  restart of a healthy pair).
+- Cross-host time is never compared. The sentinel reports `started_ago_s`
+  (its container's age on Node 2's clock alone) and trigger 1(a) sets it
+  against the controller's own time since the last proven completion; a
+  Node 2 clock ten minutes off no longer turns every recovery into a fresh
+  `worker_rank_dead` (or hides a real one).
 - `cold_start_seconds` is measured once per head start, and only for a start
   the controller watched from within 120 s of its beginning (redeployed beside
   an hour-old head, its own first proof is not the head's cold start; the
@@ -181,19 +209,26 @@ Evaluated once per tick, first match wins:
 
 | # | category | condition | observations |
 |---|---|---|---|
-| 1 | `worker_rank_dead` | sentinel reachable and: (a) the head proven and the worker container `started_at` newer than the **last proven completion**; (b) `last_fault.at` newer than the head's `started_at` **and** than the worker's own `started_at` (a fatal signature in the worker's current incarnation after the current head start — no `proven` gate, so a rank dying while the head loads is caught); (c) the head proven and no `VLLM::Worker` process at all ≥ `WORKER_RANK_GRACE_S` after the worker's start | 1 |
+| 1 | `worker_rank_dead` | sentinel reachable and: (a) the head proven and the worker container started **after the last proven completion** — on one clock: the sentinel's `started_ago_s` (Node 2's duration) < the controller's time since that completion (an older sentinel without the field falls back to comparing its `started_at` with the completion time, two clocks, and the detail says so); (b) `last_fault.at` newer than the head's `started_at` **and** than the worker's own `started_at` (a fatal signature in the worker's current incarnation after the current head start — no `proven` gate, so a rank dying while the head loads is caught); (c) the head proven, the rank **seen alive for this head start** by the sentinel, and now no `VLLM::Worker` process at all ≥ `WORKER_RANK_GRACE_S` after the worker's start | 1 |
 | 2 | `head_engine_dead` | `/health` 5xx | 1 |
 | 2′ | `head_engine_dead` | `vllm serve`/`VLLM::EngineCore`/`VLLM::Worker_TP*` seen alive for this incarnation and now missing from the head's process table, on a proven engine (the 07:05Z case: rank 0 died and the head sat in a collective for 3 min) | 2 consecutive ticks |
 | 3 | `head_api_dead` | TCP refused / connect error while the container runs, after READY | 2, ≥ `HEAD_API_DEAD_GAP_S` apart |
 | 4 | `wedged_frozen_tokens` | `frozen_seconds ≥ FROZEN_S` with `requests_running > 0`, canary outstanding ≥ `CANARY_OUTSTANDING_S` (counted from the first probe since the last success, across timeouts), `/health` 200 | 2 |
 | 5 | `canary_timeout` | two consecutive canary timeouts on a proven engine, **whatever `/health` says** (a hung API answers nothing) — **exempt while the engine is progressing** on a *fresh* `/metrics` sample (counters moved within `FROZEN_S` with requests running) and the canary has been outstanding < `CANARY_STARVATION_S`: a saturated FCFS scheduler starving a 4-token request is not a wedge | the two probes |
+| 6 | `canary_http_error` | three consecutive canary HTTP errors **the engine answered** (5xx, an error chunk, a stream without a terminal chunk, no tokens — a 4xx never counts) on a proven engine, each counted only if `/health` was not 5xx when that probe started (a 5xx is trigger 2's). **No saturation exemption**: an error is an answer, not a request starved of a slot. State `WEDGED` (the API answers, completions do not) | the three probes |
+| 7 | `canary_timeout` **or** `canary_http_error` (the last failure's kind) | the bound on DEGRADED: a proven engine whose every canary has failed for ≥ `CANARY_FAIL_DEGRADED_MAX_S` (counted from the start of the first failed probe) while `/health` answers 200 — whichever mix of timeouts and errors got it there (alternating kinds confirm neither 5 nor 6). For the timeout kind the saturation exemption of 5 still holds up to `CANARY_STARVATION_S`; a failure that is not the engine's (4xx, probe crash) never confirms | the streak's length |
 
 Trigger 1(a) compares against the last proven completion rather than the
 head's `started_at` (the contract's wording): once proven, that instant is
 newer than the head's start anyway, and it removes the false positive of a
 worker that legitimately started a moment after the head (either order
 happens under the last-resort healthchecks) and then served completions.
-1(b) is the contract's fault-signature half, restored without the gate.
+The comparison is `started_ago_s < now − last_success_at`: the sentinel's
+document is at most one of its polls old, which can only make the reported
+age *smaller* than the truth, and a false positive would need a TP=2
+completion finishing within that poll of the worker container's start —
+which a rank that has to load the model cannot do. 1(b) is the contract's
+fault-signature half, restored without the gate.
 
 A confirmed category is published as its state (`WEDGED`/`DOWN`) **before**
 `RECOVERING`, so the transition log always reads DETECT → CONFIRM →
@@ -211,8 +246,10 @@ confirm      head-memory precondition: MemAvailable < HEAD_MIN_MEM_AVAILABLE_BYT
              dropped); unobserved memory never holds
              lock taken (flock, non-blocking; held by another actor → stand by, retry each tick)
              budget recorded, incident opened (or attempts+1 of the open one; an incident older than
-             RECOVERY_WINDOW_S is closed and a new id opened), jitter 0–RECOVERY_JITTER_S,
-             any probe in flight discarded
+             RECOVERY_WINDOW_S is closed and a new id opened), deadline armed (COLD_START_BUDGET_S from
+             here, re-armed from the restart at wait_load: a recovery in progress always has one),
+             the choreography heartbeat armed (generated_at keeps advancing through every blocking call
+             below), jitter 0–RECOVERY_JITTER_S, any probe in flight discarded
 capture      <INCIDENT_DIR>/<id>/head-logs-<attempt>.txt   (docker logs --tail 400, de-multiplexed)
                                  worker-diagnostics-<attempt>.txt (sentinel /diagnostics)
                                  state-<attempt>.json      (the /state document)
@@ -241,6 +278,15 @@ A failed head restart, a cold-start timeout or a worker fault during
 confirmation starts the next attempt of the same incident until the budget is
 spent → `DOWN`, `budget_exhausted`, **no further destructive action**, probing
 continues, READY again by itself when the readiness sequence passes.
+
+So does an **unexpected exception** anywhere inside a recovery tick — between
+the lock and `wait_load`, or while advancing `wait_load`/`canary`: it is
+logged at ERROR **with its traceback**, the attempt is failed (lock released,
+cooldown armed, `recovery.last.detail = "controller error during <step>:
+<ExceptionClass>"`) and the next confirmation tries again. A RECOVERING that
+nobody advances, with the flock held, is the one outcome worse than a failed
+recovery: the orchestrator would queue every request forever and
+`cluster-recover.sh` could not take the lock.
 
 **An incident ends by any path**: three consecutive canary successes on a
 proven engine close it whether the last attempt succeeded, failed, or the
@@ -279,9 +325,14 @@ minted here).
 (`state A -> B reason=… incident=…`), per DETECT/CONFIRM, per recovery step
 (`incident=<id> attempt=<n> step=<step>`), per restart, one per readiness
 sequence outcome (with both participation probes' TTFT/total), one WARNING per
-confirmed failure when the head is short of memory before STOP_STALE_PAIR. Nothing private: the probe prompt is a constant, response
-text is discarded as read; exception text and paths stay in the log and
-never reach `/state`.
+confirmed failure when the head is short of memory before STOP_STALE_PAIR,
+one WARNING **per kind** of Docker API error other than a 404 (`docker API
+unusable: api_400 — …`, with the `DOCKER_API_VERSION` hint for a 4xx; an
+INFO when it answers again — never once per tick, never only at DEBUG: while
+it holds no recovery can start), one ERROR with traceback per exception
+inside a recovery tick. Nothing private: the probe prompt is a constant,
+response text is discarded as read; exception text and paths stay in the
+log and never reach `/state`.
 
 ## `sentinel.py`
 
@@ -306,7 +357,7 @@ never reach `/state`.
 
 | method + path | who | answer |
 |---|---|---|
-| `GET /state` | anyone on the link; the token when configured | `{"container": {"running","health","restart_count","started_at",…}, "rank_process_alive", "rank_joined", "last_fault": null or {"at","signature"}, "autonomous", "self_restarts_in_window", "observed_at", …}` |
+| `GET /state` | anyone on the link; the token when configured | `{"container": {"running","health","restart_count","started_at",…}, "started_ago_s", "rank_process_alive", "rank_joined", "last_fault": null or {"at","signature"}, "autonomous", "self_restarts_in_window", "observed_at", …}` — `started_ago_s` = `observed_at − container.started_at`, both on this host's clock: the container's age as a duration, which the controller compares with its own clock (§6.3 trigger 1(a)) so the two hosts' wall clocks are never set against each other; `null` when there is no container |
 | `GET /diagnostics` | same | the worker container's last 400 log lines, plain text |
 | `GET /healthz` | a local peer, or anyone with the token | `200 ok` |
 | `POST /restart` | `CLUSTER_HEAD_IP` **and** the token when configured (checked *before* the body is read) | `docker restart -t 5` → `{"restarted_at": …}`; `403` otherwise; `502` `{"error": "<bounded docker kind>"}` if Docker refused |

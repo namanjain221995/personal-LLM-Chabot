@@ -15,7 +15,9 @@ Three small HTTP servers stand in for the real world:
     the readiness sequence's progress step sees what vLLM would show.
   * ``FakeSentinel`` — the worker sentinel's three endpoints, recording every
     ``POST /restart`` with its peer and token; optionally requiring the token
-    on every endpoint like the real one.
+    on every endpoint like the real one; ``clock_skew_s`` shifts every
+    wall-clock stamp it sends (Node 2's clock against Node 1's) while the
+    ``started_ago_s`` duration stays true, as on a real skewed pair.
   * ``FakeGpuExporter`` — one dgx-gpu exporter, serving a scripted
     utilisation for the participation probe.
 
@@ -138,6 +140,10 @@ class FakeDocker:
         #: it — the "SIGKILL of a 25 GiB process plus re-create takes longer
         #: than the client waits" case.
         self.restart_reply_delay_s = 0.0
+        #: When set, every inspect (``/json``) answers this status with a
+        #: daemon-style message — the "client version 1.53 is too new" 400,
+        #: or a 500 — instead of the container document.
+        self.inspect_status: Optional[int] = None
 
     def add(self, container: FakeContainer) -> FakeContainer:
         self.containers[container.name] = container
@@ -172,6 +178,11 @@ class FakeDocker:
                     self._send(404, json.dumps({"message": f"No such container: {name}"}).encode())
                     return
                 if op == "json":
+                    if docker.inspect_status is not None:
+                        self._send(docker.inspect_status, json.dumps(
+                            {"message": f"scripted daemon error {docker.inspect_status} "
+                                        f"(client version too new / internal error)"}).encode())
+                        return
                     self._send(200, json.dumps(c.to_json()).encode())
                 elif op == "top":
                     if not c.running:
@@ -320,6 +331,13 @@ class FakeHead:
         #: a lock, so two concurrent matching requests see one failure and
         #: one success whichever arrives first).
         self.fail_once_when: Optional[Callable[[dict], bool]] = None
+        #: Every completion terminates without output: a finish_reason on
+        #: empty content (non-stream) or role chunk + finish chunk + [DONE]
+        #: with no content chunk (stream) — the zero-token "ok".
+        self.empty_completions = False
+        #: The stream sends its tokens and then ends the body WITHOUT a
+        #: finish_reason chunk or [DONE] (the head died mid-stream).
+        self.truncate_stream = False
 
     @property
     def url(self) -> str:
@@ -427,6 +445,8 @@ class FakeHead:
                 # vLLM with ignore_eos generates exactly max_tokens; without
                 # it the model stops after "ok" (one content chunk).
                 n_tokens = max(0, max_tokens - head.short_by) if (req or {}).get("ignore_eos") else 1
+                if head.empty_completions:
+                    n_tokens = 0
                 if not head.freeze_counters_for_completions:
                     head.gen_total += n_tokens
                     head.prompt_total += 8
@@ -457,6 +477,10 @@ class FakeHead:
                 chunk({**base, "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]})
                 for _ in range(n_tokens):
                     chunk({**base, "choices": [{"index": 0, "delta": {"content": "ok"}, "finish_reason": None}]})
+                if head.truncate_stream:
+                    self.wfile.write(b"0\r\n\r\n")
+                    self.wfile.flush()
+                    return
                 chunk({**base, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
                 done = b"data: [DONE]\n\n"
                 self.wfile.write(f"{len(done):x}\r\n".encode() + done + b"\r\n0\r\n\r\n")
@@ -504,16 +528,33 @@ class FakeSentinel:
         #: When set, every endpoint requires this X-Sentinel-Token (as the
         #: real sentinel does once configured).
         self.required_token: Optional[str] = None
+        #: Node 2's clock minus Node 1's: every wall-clock stamp on the wire
+        #: (``container.started_at``, ``observed_at``, ``restarted_at``) is
+        #: shifted by this; ``started_ago_s`` — a duration on Node 2 alone —
+        #: is not. Internal bookkeeping stays on the shared fake clock.
+        self.clock_skew_s = 0.0
+        #: ``False`` = an older sentinel that does not send ``started_ago_s``.
+        self.report_started_ago = True
+        #: Real seconds ``POST /restart`` blocks before answering (the
+        #: docker restart -t 5 plus the container's own start).
+        self.restart_delay_s = 0.0
 
     @property
     def url(self) -> str:
         return f"http://127.0.0.1:{self.port}"
 
     def state(self) -> dict:
-        return {"container": dict(self.container), "rank_process_alive": self.rank_process_alive,
-                "rank_joined": self.rank_joined, "last_fault": self.last_fault,
-                "self_restarts_in_window": self.self_restarts_in_window, "autonomous": False,
-                "observed_at": self.clock.time()}
+        now = self.clock.time()
+        container = dict(self.container)
+        if container.get("started_at") is not None:
+            container["started_at"] = float(container["started_at"]) + self.clock_skew_s
+        doc = {"container": container, "rank_process_alive": self.rank_process_alive,
+               "rank_joined": self.rank_joined, "last_fault": self.last_fault,
+               "self_restarts_in_window": self.self_restarts_in_window, "autonomous": False,
+               "observed_at": now + self.clock_skew_s}
+        if self.report_started_ago and self.container.get("started_at") is not None:
+            doc["started_ago_s"] = max(0.0, now - float(self.container["started_at"]))
+        return doc
 
     def start(self) -> None:
         sentinel = self
@@ -558,12 +599,15 @@ class FakeSentinel:
                 if sentinel.restart_status != 200:
                     self._send(sentinel.restart_status, b'{"error":"scripted"}')
                     return
+                if sentinel.restart_delay_s:
+                    time.sleep(sentinel.restart_delay_s)
+                    at = sentinel.clock.time()
                 sentinel.container["restart_count"] += 1
                 sentinel.container["started_at"] = at
                 sentinel.rank_process_alive = True
                 sentinel.rank_joined = True
                 sentinel.events.append(("sentinel_restart", at))
-                self._send(200, json.dumps({"restarted_at": at}).encode())
+                self._send(200, json.dumps({"restarted_at": at + sentinel.clock_skew_s}).encode())
 
             def log_message(self, fmt, *args):
                 pass

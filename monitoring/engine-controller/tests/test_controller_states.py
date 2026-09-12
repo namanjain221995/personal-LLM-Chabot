@@ -217,6 +217,59 @@ def test_an_error_chunk_in_the_stream_is_a_canary_http_error_not_a_success(world
     assert world.ctl.last_canary.detail == "readiness stream: error chunk in stream"
 
 
+def test_zero_token_completions_never_pass_the_readiness_sequence_or_the_routine_canary(world):
+    """[major] round 2, controller.py:725 — a finish_reason on empty text
+    (or a stream carrying only [DONE]) passed every readiness step: expected
+    became 0 and step 3 degenerated to delta >= 0, so a head that emits
+    nothing was READY and the orchestrator resumed every queued generation
+    against it. A completion proves nothing without a token."""
+    world.head.short_by = 32                            # 32 asked, 0 generated: the terminal chunk on empty text
+    world.settle()
+    rd = world.ctl.readiness
+    assert rd.failed_step == "non_stream" and rd.non_stream_ok is False and rd.stream_ok is None
+    assert world.ctl.last_canary.detail == "readiness non_stream: no tokens"
+    assert world.ctl.last_canary.tokens == 0 and world.ctl.last_canary.terminal is True
+    assert world.ctl.last_canary.outcome == "http_error" and world.ctl.last_canary.http_status == 200
+    assert world.ctl.state == "STARTING" and world.ctl.proof is None, world.ctl.reason
+    assert rd.tokens_expected == 0 and rd.progress_ok is None
+    # step 3 expects at least the tokens received, and at least one: a
+    # single token from each of steps 1 and 2 is enough, zero never is
+    world.head.short_by = 31
+    world.clock.advance(world.cfg.canary_interval_fast_s + 1)
+    world.settle()
+    assert world.ctl.state == "READY", world.ctl.reason
+    rd = world.ctl.readiness
+    assert rd.tokens_expected == 2 and rd.tokens_delta >= 2 and rd.progress_ok is True
+    # the routine canary: a terminal chunk with no content is a FAILURE, not a warning
+    world.head.short_by = 0
+    world.head.empty_completions = True
+    world.clock.advance(world.cfg.canary_interval_s + 1)
+    world.settle()
+    res = world.ctl.last_canary
+    assert res.kind == "routine" and res.ok is False and res.detail == "no tokens" and res.tokens == 0
+    assert world.ctl.consecutive_failures == 1 and world.ctl.consecutive_http_errors == 1
+    assert world.ctl.state == "DEGRADED" and "no tokens" in world.ctl.reason, world.ctl.reason
+    assert world.ctl.snapshot()["signals"]["canary"]["ok"] is False
+    assert "techsara_vllm_synthetic_success 0" in world.ctl.metrics_text()
+    assert "techsara_vllm_synthetic_tokens 0" in world.ctl.metrics_text()
+    # …and it counts toward rule 6 like any other error the engine answered
+    world.heal_on_restart()
+    for _ in range(2):
+        world.clock.advance(world.cfg.canary_interval_fast_s + 1)
+        world.settle()
+    assert world.ctl.rec.in_progress and world.ctl.rec.category == "canary_http_error"
+
+
+def test_a_stream_without_a_terminal_chunk_is_not_a_success(world):
+    world.make_ready()
+    world.head.truncate_stream = True
+    world.clock.advance(world.cfg.canary_interval_s + 1)
+    world.settle()
+    res = world.ctl.last_canary
+    assert res.ok is False and res.outcome == "http_error" and res.terminal is False and res.tokens == 1
+    assert res.detail == "stream ended without a terminal chunk"
+
+
 def test_readiness_gate_token_progress_blocks_ready(world):
     world.head.freeze_counters_for_completions = True
     world.settle()
@@ -567,10 +620,14 @@ def test_state_document_shape(world):
     assert sig["head_memory"]["available_bytes"] == 60 * 1024 ** 3 and sig["head_memory"]["low"] is False
     assert sig["head_memory"]["min_bytes"] == 30 * 1024 ** 3
     assert set(("running", "health", "restart_count", "started_at", "engine_process_alive", "observed_at")) <= set(sig["head_container"])
-    assert set(("reachable", "container_running", "rank_process_alive", "restart_count", "started_at", "last_fault", "observed_at")) <= set(sig["worker"])
+    assert set(("reachable", "container_running", "rank_process_alive", "restart_count", "started_at", "last_fault", "observed_at",
+                "started_ago_s", "clock_skew_s")) <= set(sig["worker"])
+    assert 3500 < sig["worker"]["started_ago_s"] < 3700 and abs(sig["worker"]["clock_skew_s"]) < 5
     assert set(("tcp", "health", "models", "metrics", "observed_at")) <= set(sig["api"])
     assert set(("requests_running", "requests_waiting", "generation_tokens_total", "prompt_tokens_total", "frozen_seconds", "observed_at")) <= set(sig["engine"])
-    assert set(("ok", "http_status", "connect_s", "ttft_s", "total_s", "tokens", "terminal", "error_category", "at", "last_success_at", "consecutive_failures")) <= set(sig["canary"])
+    assert set(("ok", "http_status", "connect_s", "ttft_s", "total_s", "tokens", "terminal", "error_category", "at", "last_success_at", "consecutive_failures",
+                "consecutive_timeouts", "consecutive_http_errors", "failing_since")) <= set(sig["canary"])
+    assert sig["canary"]["consecutive_http_errors"] == 0 and sig["canary"]["failing_since"] is None
     assert set(("configured", "health", "observed_at")) <= set(sig["router"])
     assert set(("head_util", "worker_util", "sampled_at")) <= set(sig["gpus"])
     assert set(("non_stream_ok", "stream_ok", "progress_ok", "participation", "rank_alive",

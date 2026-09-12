@@ -419,6 +419,462 @@ def test_canary_timeouts_on_a_progressing_engine_are_saturation_not_a_wedge(worl
 
 
 # ---------------------------------------------------------------------------
+# Trigger 6: three consecutive canary HTTP errors (round-2 [major] :1590)
+# ---------------------------------------------------------------------------
+
+
+def _probe_once(world, advance=None):
+    """Advance past the canary interval, start a probe, let it finish, harvest."""
+    world.clock.advance(world.cfg.canary_interval_fast_s + 1 if advance is None else advance)
+    world.ctl.tick()
+    world.ctl.canary.join(5.0)
+    world.ctl.tick()
+
+
+def test_three_consecutive_canary_http_errors_on_a_proven_engine_confirm_canary_http_error(world):
+    """[major] round 2, controller.py:1590 — a proven engine whose every
+    completion fails fast while /health, /v1/models and /metrics answer 200
+    used to sit in DEGRADED 'awaiting confirmation' forever (a SERVING state
+    to the orchestrator). Three consecutive HTTP errors are the three
+    observations; the saturation exemption does not apply."""
+    world.make_ready()
+    world.heal_on_restart()
+    world.head.completion_status = 500
+    # nine requests "running" and the counters moving: saturation would
+    # exempt a TIMEOUT, never an error — an error is an answer
+    world.head.running = 9.0
+    world.head.progress_per_scrape = 500.0
+    world.clock.advance(world.cfg.canary_interval_s + 1)
+    world.ctl.tick()
+    world.ctl.canary.join(5.0)
+    world.ctl.tick()                                    # error 1 → DEGRADED, awaiting confirmation
+    assert world.ctl.consecutive_http_errors == 1 and world.ctl.rec.in_progress is False
+    assert world.ctl.state == "DEGRADED" and "awaiting confirmation" in world.ctl.reason, world.ctl.reason
+    assert "WEDGED as canary_http_error in" in world.ctl.reason
+    assert world.ctl.snapshot()["signals"]["canary"]["consecutive_http_errors"] == 1
+    _probe_once(world)                                  # error 2, at the FAST interval
+    assert world.ctl.consecutive_http_errors == 2 and world.ctl.rec.in_progress is False
+    _probe_once(world)                                  # error 3 → confirmed
+    assert world.ctl.probes_total["http_error"] == 3
+    assert world.ctl.rec.in_progress and world.ctl.rec.category == "canary_http_error", world.ctl.reason
+    assert "3 consecutive canary HTTP errors" in world.ctl.rec.reason and "HTTP 500" in world.ctl.rec.reason
+    assert [t["to"] for t in world.ctl.transitions][-2:] == ["WEDGED", "RECOVERING"]
+    assert world.ctl.last_failure_category == "canary_http_error"
+    assert world.order == ["sentinel_restart", "docker_restart"]
+    world.head.progress_per_scrape = 0.0
+    world.drive_recovery_to_ready()
+    assert world.ctl.state == "READY" and world.ctl.consecutive_http_errors == 0
+    assert 'techsara_vllm_last_failure_category{category="canary_http_error"} 1' in world.ctl.metrics_text()
+
+
+def test_the_dying_stream_shapes_count_as_canary_http_errors_and_a_4xx_does_not(world):
+    """Rule 6 counts what the ENGINE answered: an error chunk in a 200
+    stream, a stream that ends without a terminal chunk, a 5xx. A 4xx is a
+    request the API rejected — a restart cannot fix it, and calling it a
+    wedge would queue users on a serving engine — so it never counts and
+    the DEGRADED reason says why."""
+    world.make_ready()
+    world.heal_on_restart()
+    world.head.error_chunk_in_stream = True
+    world.clock.advance(world.cfg.canary_interval_s + 1)
+    world.ctl.tick()
+    world.ctl.canary.join(5.0)
+    world.ctl.tick()
+    assert world.ctl.last_canary.detail == "error chunk in stream" and world.ctl.consecutive_http_errors == 1
+    world.head.error_chunk_in_stream = False
+    world.head.truncate_stream = True
+    _probe_once(world)
+    assert world.ctl.last_canary.detail == "stream ended without a terminal chunk"
+    assert world.ctl.consecutive_http_errors == 2 and world.ctl.rec.in_progress is False
+    world.head.truncate_stream = False
+    world.head.completion_status = 503
+    _probe_once(world)
+    assert world.ctl.rec.in_progress and world.ctl.rec.category == "canary_http_error"
+    world.drive_recovery_to_ready()
+    # a 4xx: not the engine's fault, never confirmed, said so
+    world.head.completion_status = 400
+    for _ in range(4):
+        _probe_once(world)
+    assert world.ctl.probes_total["http_error"] >= 7
+    assert world.ctl.consecutive_http_errors == 0 and world.ctl.consecutive_failures == 4
+    assert world.ctl.rec.in_progress is False and len(world.head_restarts) == 1
+    assert world.ctl.state == "DEGRADED", world.ctl.reason
+    assert "HTTP 400: not counted as an engine fault" in world.ctl.reason
+    assert "canary_http_error" not in world.ctl.pending
+
+
+# ---------------------------------------------------------------------------
+# Rule 7: DEGRADED with a failing canary is bounded (round-2 correctness :2247)
+# ---------------------------------------------------------------------------
+
+
+def test_degraded_with_a_failing_canary_is_bounded_and_becomes_wedged_per_the_failure_kind(world):
+    """[contract] round 2 — DEGRADED is 'the canary still succeeds'; a proven
+    engine failing every canary for CANARY_FAIL_DEGRADED_MAX_S with /health
+    200 is WEDGED (canary_timeout or canary_http_error by the last failure's
+    kind). Timeouts alternating with errors confirm neither rule 5 nor 6 —
+    this is the bound that catches the mix."""
+    world.cfg.canary_timeout_s = 0.5
+    world.cfg.canary_fail_degraded_max_s = 120.0
+    world.make_ready()
+    world.heal_on_restart()
+    world.head.wedged_hold_s = 1.5
+    kinds = []                                          # outcome of every probe that actually ran
+
+    def probes_run():
+        return world.ctl.probes_total["http_error"] + world.ctl.probes_total["timeout"]
+
+    for i in range(20):
+        if i % 2 == 0:
+            world.head.mode = "healthy"
+            world.head.completion_status = 500
+        else:
+            world.head.completion_status = 200
+            world.head.mode = "wedged"                  # /health still 200; only completions hang
+        before = probes_run()
+        _probe_once(world, advance=(world.cfg.canary_interval_s + 1) if i == 0 else None)
+        world.head.release.set()
+        world.head.release = __import__("threading").Event()
+        if probes_run() > before:
+            kinds.append("timeout" if i % 2 else "http_error")
+        if world.ctl.rec.in_progress:
+            break                                       # the bound fires on the first tick past it, before a new probe
+        assert world.ctl.last_canary.outcome == kinds[-1]
+        assert world.ctl.consecutive_timeouts <= 1 and world.ctl.consecutive_http_errors <= 1
+        assert world.ctl.state == "DEGRADED", world.ctl.reason
+    assert world.ctl.rec.in_progress, (kinds, world.ctl.reason)
+    assert set(kinds) == {"http_error", "timeout"} and len(kinds) >= 10
+    expected = "canary_timeout" if kinds[-1] == "timeout" else "canary_http_error"
+    assert world.ctl.rec.category == expected, (kinds, world.ctl.rec.reason)
+    assert f"last: {kinds[-1]}" in world.ctl.rec.reason
+    assert "every canary failed for" in world.ctl.rec.reason and "/health answers 200" in world.ctl.rec.reason
+    assert [t["to"] for t in world.ctl.transitions][-2:] == ["WEDGED", "RECOVERING"]
+    # it took the bound, not fewer probes
+    assert world.ctl.probes_total["http_error"] + world.ctl.probes_total["timeout"] >= 10
+    world.head.mode = "healthy"
+    world.head.completion_status = 200
+    world.drive_recovery_to_ready()
+    assert world.ctl.failing_since is None
+
+
+def test_the_degraded_bound_keeps_the_saturation_exemption_for_timeouts(world):
+    """Rule 7 with the last failure a TIMEOUT on a progressing engine
+    (counters moving, requests running) stays exempt until
+    CANARY_STARVATION_S, exactly like rule 5: a starved canary on a busy
+    scheduler is not a wedge."""
+    world.cfg.canary_timeout_s = 0.5
+    world.cfg.canary_fail_degraded_max_s = 60.0
+    world.cfg.canary_starvation_s = 300.0
+    world.make_ready()
+    world.heal_on_restart()
+    world.head.mode = "wedged"
+    world.head.wedged_hold_s = 1.5
+    world.head.running = 9.0
+    world.head.progress_per_scrape = 500.0
+    for i in range(8):                                  # ~90 s of consecutive timeouts, engine progressing
+        _probe_once(world, advance=(world.cfg.canary_interval_s + 1) if i == 0 else None)
+        world.head.release.set()
+        world.head.release = __import__("threading").Event()
+    assert world.ctl.failing_since is not None
+    assert world.clock.time() - world.ctl.failing_since >= world.cfg.canary_fail_degraded_max_s
+    assert world.ctl.rec.in_progress is False and world.head_restarts == []
+    assert world.ctl.state == "DEGRADED" and "saturation" in world.ctl.reason, world.ctl.reason
+    # past the starvation ceiling the same streak is a wedge (rule 5 or 7: canary_timeout either way)
+    world.clock.advance(world.cfg.canary_starvation_s)
+    world.ctl.tick()
+    assert world.ctl.rec.in_progress and world.ctl.rec.category == "canary_timeout"
+    world.head.release.set()
+
+
+# ---------------------------------------------------------------------------
+# Trigger 1(c): the seen-alive gate (round-2 [minor] :1530)
+# ---------------------------------------------------------------------------
+
+
+def test_worker_rank_absent_is_not_a_trigger_until_the_sentinel_has_seen_the_rank_alive_for_this_head_start(world):
+    """[minor] round 2, controller.py:1530 — the pair proven while the
+    sentinel was unreachable, then a sentinel that comes up on a build whose
+    worker title it does not recognise reports rank_process_alive:false: a
+    name never observed alive for this head start is unknown, not absent,
+    and must not restart a healthy pair. Seen alive then gone still does."""
+    world.sentinel.stop()
+    world.settle()
+    assert world.ctl.proof is not None and world.ctl.state == "DEGRADED" and "sentinel" in world.ctl.reason
+    world.sentinel.start()
+    world.ctl.sentinel.base_url = world.sentinel.url
+    world.sentinel.rank_process_alive = False           # never seen alive for this head start
+    world.sentinel.container["started_at"] = world.clock.time() - 3600
+    for _ in range(4):
+        world.clock.advance(world.cfg.worker_rank_grace_s)
+        world.settle()
+    assert world.ctl.worker["rank_process_alive"] is False and world.ctl.worker["reachable"] is True
+    assert "worker_rank_dead" not in world.ctl.pending
+    assert world.ctl.rec.in_progress is False and world.head_restarts == [] and world.sentinel.restart_calls == []
+    assert world.ctl.state == "DEGRADED" and "never seen for this head start" in world.ctl.reason, world.ctl.reason
+    # the sentinel sees the rank once: from now on its absence past the grace counts
+    world.heal_on_restart()
+    world.sentinel.rank_process_alive = True
+    world.settle()
+    assert world.ctl.state == "READY", world.ctl.reason
+    world.sentinel.rank_process_alive = False
+    world.clock.advance(world.cfg.worker_rank_grace_s + 1)
+    world.tick()                                        # one observation: confirmed, restarted
+    assert world.ctl.rec.in_progress and world.ctl.rec.category == "worker_rank_dead"
+    assert "seen alive for this head start" in world.ctl.rec.reason
+    assert world.order == ["sentinel_restart", "docker_restart"]
+    # a restarted head is a new incarnation: the gate closes again until the rank is seen
+    world.sentinel.rank_process_alive = False           # the fake's restart said True; override before the next look
+    world.tick()                                        # the new started_at is observed here
+    assert world.ctl._worker_rank_seen_alive is False
+    world.sentinel.rank_process_alive = True
+    world.drive_recovery_to_ready()
+    assert world.ctl._worker_rank_seen_alive is True
+
+
+# ---------------------------------------------------------------------------
+# Trigger 1(a): one clock, never two (round-2 [minor] :1525)
+# ---------------------------------------------------------------------------
+
+
+def test_trigger_1a_uses_the_sentinels_own_clock_so_node_2_skew_never_confirms_a_recovered_pair(world):
+    """[minor] round 2, controller.py:1525 — with Node 2's clock 10 minutes
+    ahead, the worker's started_at (Node 2) landed after the readiness
+    proof (Node 1) of every recovery: RECOVERING again right after
+    MARK_READY, three times, budget_exhausted on a healthy pair. The
+    sentinel now reports started_ago_s (a duration on its own clock) and
+    the controller compares it with its own time since the last proof."""
+    world.sentinel.clock_skew_s = 600.0                 # Node 2 ten minutes AHEAD
+    world.make_ready()
+    world.heal_on_restart()
+    assert world.ctl.worker["clock_skew_s"] is not None and 595 < world.ctl.worker["clock_skew_s"] < 605
+    assert world.ctl.worker["started_ago_s"] is not None and 3590 < world.ctl.worker["started_ago_s"] < 3700
+    world.head.mode = "engine_dead"
+    world.tick()
+    assert world.ctl.rec.in_progress and world.ctl.rec.category == "head_engine_dead"
+    world.drive_recovery_to_ready()
+    assert world.ctl.state == "READY"
+    # the sentinel's started_at on the wire IS newer than the proof (two clocks) …
+    assert world.ctl.worker["started_at"] > world.ctl.last_success_at
+    # … and yet the pair is left alone: on one clock the worker started BEFORE the proof
+    for _ in range(4):
+        world.clock.advance(world.cfg.canary_interval_s + 1)
+        world.settle()
+    assert "worker_rank_dead" not in world.ctl.pending
+    assert len(world.head_restarts) == 1 and world.ctl.attempts_total["started"] == 1
+    assert world.ctl.state == "READY", world.ctl.reason
+
+    # Node 2 ten minutes BEHIND: a real worker restart right after a canary
+    # success used to be missed by (a); on one clock it is caught at once
+    world.sentinel.clock_skew_s = -600.0
+    world.clock.advance(world.cfg.canary_interval_s + 1)
+    world.settle()
+    assert world.ctl.state == "READY"
+    world.clock.advance(5)
+    world.sentinel.container["started_at"] = world.clock.time()     # restarted 5 s after the last proof
+    world.tick()
+    assert world.ctl.rec.in_progress and world.ctl.rec.category == "worker_rank_dead"
+    assert "sentinel clock" in world.ctl.rec.reason and "after the last proven completion" in world.ctl.rec.reason
+    world.drive_recovery_to_ready()
+
+
+def test_trigger_1a_falls_back_to_the_two_clock_comparison_for_a_sentinel_without_started_ago_s(world):
+    world.sentinel.report_started_ago = False           # an older sentinel
+    world.make_ready()
+    world.heal_on_restart()
+    assert world.ctl.worker["started_ago_s"] is None
+    world.clock.advance(5)
+    world.sentinel.container["started_at"] = world.clock.time()
+    world.tick()
+    assert world.ctl.rec.in_progress and world.ctl.rec.category == "worker_rank_dead"
+    assert "two clocks" in world.ctl.rec.reason
+    world.drive_recovery_to_ready()
+    world.tick(3)
+    assert "worker_rank_dead" not in world.ctl.pending
+
+
+# ---------------------------------------------------------------------------
+# The snapshot stays fresh through a blocking choreography (round-2 [minor] :2394)
+# ---------------------------------------------------------------------------
+
+
+def test_generated_at_keeps_advancing_while_a_choreography_call_blocks(world):
+    """[minor] round 2, controller.py:2394 — generated_at was frozen for the
+    whole sentinel POST /restart (up to 125 s) and docker restart (up to
+    70 s), so §7.3's 30 s freshness rule derived MONITORING_UNKNOWN in the
+    middle of a recovery the controller was actively running."""
+    import threading
+
+    world.cfg.choreography_heartbeat_s = 0.05
+    world.sentinel.restart_delay_s = 1.0                # real seconds inside STOP_STALE_PAIR
+    world.make_ready()
+    world.heal_on_restart()
+    world.head.mode = "engine_dead"
+    samples = []
+    stop = threading.Event()
+
+    def sample():
+        while not stop.is_set():
+            snap = world.ctl.snapshot()
+            samples.append((snap["recovery"]["step"], snap["generated_at"], snap["state"]))
+            time.sleep(0.02)
+
+    t = threading.Thread(target=sample, daemon=True)
+    t.start()
+    world.tick()                                        # confirm → capture → stop_pair (blocks 1 s) → wait_load
+    stop.set()
+    t.join(2.0)
+    assert world.ctl.rec.in_progress and world.ctl.rec.step == "wait_load"
+    assert world.ctl.heartbeat_active is False          # armed only for the blocking region
+    stamps = [g for step, g, _ in samples if step == "stop_pair"]
+    assert len(stamps) >= 5, samples
+    assert max(stamps) - min(stamps) >= 0.5, (min(stamps), max(stamps))
+    assert all(state == "RECOVERING" for step, _, state in samples if step in ("capture", "stop_pair"))
+    # the steps are stamped when they begin, not with the tick's start time
+    steps = {s["step"]: s["at"] for s in world.ctl.rec.steps}
+    assert steps["wait_load"] - steps["stop_pair"] >= 0.9
+    # once the tick thread is out of the choreography nothing re-stamps the snapshot on its own
+    before = world.ctl.snapshot()["generated_at"]
+    time.sleep(0.3)
+    assert world.ctl.snapshot()["generated_at"] == before
+    world.drive_recovery_to_ready()
+    assert world.ctl.heartbeat_active is False
+
+
+# ---------------------------------------------------------------------------
+# Docker API errors are said out loud (round-2 [minor] :1164)
+# ---------------------------------------------------------------------------
+
+
+def _docker_warnings(caplog):
+    return [r for r in caplog.records if r.levelname == "WARNING" and "docker API unusable" in r.message]
+
+
+def test_docker_api_errors_are_logged_at_warning_once_per_kind(world, caplog):
+    """[minor] round 2, controller.py:1164 — a 400 ('client version 1.53 is
+    too new') or 500 from the daemon was logged at DEBUG only; the
+    controller sat in MONITORING_UNKNOWN for good with docker_error as the
+    only clue."""
+    caplog.set_level(logging.INFO, logger="controller")
+    world.make_ready()
+    world.docker.inspect_status = 400
+    world.tick(3)
+    assert world.ctl.docker_ok is False and world.ctl.docker_error == "api_400"
+    warnings = _docker_warnings(caplog)
+    assert len(warnings) == 1, [r.message for r in warnings]
+    msg = warnings[0].getMessage()
+    assert "api_400" in msg and "DOCKER_API_VERSION=1.53" in msg and "no recovery can start" in msg
+    assert world.ctl.state == "DEGRADED"                # a fresh completion: not UNKNOWN
+    world.clock.advance(2 * world.cfg.canary_interval_s + 1)
+    world.tick()
+    assert world.ctl.state == "MONITORING_UNKNOWN", world.ctl.reason
+    assert len(_docker_warnings(caplog)) == 1           # still once
+    world.docker.inspect_status = None
+    world.tick()
+    assert world.ctl.docker_ok is True
+    assert any(r.levelname == "INFO" and "docker API answering again (was api_400)" in r.message
+               for r in caplog.records)
+    world.docker.inspect_status = 500
+    world.tick(2)
+    assert len(_docker_warnings(caplog)) == 2 and "api_500" in _docker_warnings(caplog)[1].getMessage()
+    world.docker.stop()
+    world.tick(2)
+    assert len(_docker_warnings(caplog)) == 3 and "socket_missing" in _docker_warnings(caplog)[2].getMessage()
+    assert world.cfg.docker_socket not in json.dumps(world.ctl.snapshot())
+
+
+# ---------------------------------------------------------------------------
+# An exception inside a recovery never pins RECOVERING (round-2 [minor] :1983)
+# ---------------------------------------------------------------------------
+
+
+def _lock_is_free(path: str) -> bool:
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o666)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return True
+        except BlockingIOError:
+            return False
+    finally:
+        os.close(fd)
+
+
+def test_an_exception_inside_the_choreography_fails_the_attempt_and_releases_the_lock_with_a_traceback(
+        world, caplog, monkeypatch):
+    """[minor] round 2, controller.py:1983 — an unexpected exception between
+    the lock and wait_load was swallowed by run_periodically and left
+    rec.in_progress True with the flock held: RECOVERING forever, every
+    request queued, cluster-recover.sh unable to take the lock."""
+    caplog.set_level(logging.INFO, logger="controller")
+    world.make_ready()
+    world.heal_on_restart()
+    original = world.ctl._capture_diagnostics
+
+    def boom():
+        raise RuntimeError("a snapshot value that is not JSON-serialisable")
+
+    monkeypatch.setattr(world.ctl, "_capture_diagnostics", boom)
+    world.head.mode = "engine_dead"
+    world.tick()
+    assert world.ctl.rec.in_progress is False
+    assert _lock_is_free(world.cfg.lock_path)
+    assert world.ctl.attempts_total == {"started": 1, "succeeded": 0, "failed": 1, "budget_exhausted": 0}
+    assert world.ctl.rec.last["outcome"] == "failed" and world.ctl.rec.last["step"] == "capture"
+    assert world.ctl.rec.last["detail"] == "controller error during capture: RuntimeError"
+    assert "not JSON-serialisable" not in json.dumps(world.ctl.snapshot())    # the class, never the text
+    errors = [r for r in caplog.records if r.levelname == "ERROR" and "controller error during step capture" in r.message]
+    assert len(errors) == 1 and errors[0].exc_info is not None
+    assert "Traceback" in caplog.text and "RuntimeError: a snapshot value" in caplog.text
+    assert world.head_restarts == [] and world.sentinel.restart_calls == []
+    assert world.ctl.state != "RECOVERING", world.ctl.reason
+    assert world.ctl.heartbeat_active is False
+    # the next confirmation (cooldown 0 here) is attempt 2 and, with the bug gone, succeeds
+    monkeypatch.setattr(world.ctl, "_capture_diagnostics", original)
+    world.tick()
+    assert world.ctl.rec.in_progress and world.ctl.rec.attempt == 2 and len(world.head_restarts) == 1
+    world.drive_recovery_to_ready()
+    assert world.ctl.attempts_total["succeeded"] == 1
+
+
+def test_an_exception_while_advancing_a_recovery_fails_the_attempt_too(world, caplog, monkeypatch):
+    caplog.set_level(logging.INFO, logger="controller")
+    world.make_ready()
+    world.heal_on_restart()
+    world.head.mode = "engine_dead"
+    world.tick()
+    assert world.ctl.rec.in_progress and world.ctl.rec.step == "wait_load"
+    assert world.ctl.rec.deadline_mono is not None
+
+    def boom():
+        raise KeyError("started_at")
+
+    monkeypatch.setattr(world.ctl, "_worker_fault_after_head_start", boom)
+    world.tick()
+    assert world.ctl.rec.in_progress is False and _lock_is_free(world.cfg.lock_path)
+    assert world.ctl.rec.last["detail"] == "controller error during wait_load: KeyError"
+    assert any(r.exc_info is not None and "controller error during step wait_load" in r.message
+               for r in caplog.records)
+
+
+def test_a_recovery_in_progress_always_has_a_deadline(world):
+    """The deadline is set at confirmation and re-set from the restart at
+    wait_load, so no step can be held open without one."""
+    world.make_ready()
+    world.head.mode = "engine_dead"
+    seen = []
+    original_step = world.ctl._step
+
+    def spy(step):
+        seen.append((step, world.ctl.rec.deadline_mono is not None))
+        original_step(step)
+
+    world.ctl._step = spy
+    world.tick()
+    assert seen == [("capture", True), ("stop_pair", True), ("wait_load", True)]
+
+
+# ---------------------------------------------------------------------------
 # MARK_READY takes only the new head's own proof
 # ---------------------------------------------------------------------------
 

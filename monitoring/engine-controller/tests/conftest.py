@@ -76,6 +76,10 @@ class World:
         def on_restart(_c: FakeContainer) -> None:
             head.mode = "healthy"
             head.running = 0.0
+            head.completion_status = 200
+            head.error_chunk_in_stream = False
+            head.empty_completions = False
+            head.truncate_stream = False
             head.release.set()
             head.release = threading.Event()
             if start_api and head._server is None:

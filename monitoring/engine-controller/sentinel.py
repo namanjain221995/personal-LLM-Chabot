@@ -340,11 +340,19 @@ class Sentinel:
 
     def _publish(self, now: float) -> None:
         c = self.container
+        started_at = c.get("started_at")
         snap = {
             "schema": 1,
             "container": {"running": c.get("running"), "health": c.get("health"),
-                          "restart_count": c.get("restart_count"), "started_at": c.get("started_at"),
+                          "restart_count": c.get("restart_count"), "started_at": started_at,
                           "status": c.get("status"), "exists": c.get("exists")},
+            # How long ago the container started, measured on THIS host's
+            # clock alone (observed_at − started_at, both Node 2's): the
+            # controller sets it against its own time since the last proven
+            # completion (§6.3 trigger 1(a)) so Node 2's wall clock is never
+            # compared with Node 1's — a skewed NTP must not turn every
+            # recovery into a fresh worker_rank_dead.
+            "started_ago_s": (max(0.0, now - float(started_at)) if started_at is not None else None),
             "rank_process_alive": self.rank_process_alive,
             "rank_joined": self.rank_joined,
             "last_fault": dict(self.last_fault) if self.last_fault else None,

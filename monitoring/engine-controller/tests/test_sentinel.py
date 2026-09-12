@@ -29,6 +29,33 @@ def test_state_document_shape(worker_world):
     assert snap["autonomous"] is False
     assert snap["self_restarts_in_window"] == 0
     assert isinstance(snap["observed_at"], float)
+    assert isinstance(snap["started_ago_s"], float)
+
+
+def test_state_document_carries_started_ago_s_measured_on_its_own_clock(worker_world):
+    """[minor] round 2, controller.py:1525 — trigger 1(a) compared the
+    worker's started_at (Node 2's clock) with the head's last proven
+    completion (Node 1's). The sentinel now reports the START AGE as a
+    duration on its own clock (observed_at − started_at, both Node 2's), so
+    the controller never has to compare two hosts' wall clocks."""
+    w = worker_world
+    w.sentinel.tick()
+    snap = json.loads(json.dumps(w.sentinel.snapshot()))
+    assert abs(snap["started_ago_s"] - (snap["observed_at"] - snap["container"]["started_at"])) < 1e-3
+    assert 3599 < snap["started_ago_s"] < 3601
+    w.clock.advance(100)
+    w.sentinel.tick()
+    assert 3699 < w.sentinel.snapshot()["started_ago_s"] < 3701
+    # a head-driven restart: the age starts over
+    status, _ = w.sentinel.restart_requested("127.0.0.1")
+    assert status == 200
+    assert w.sentinel.snapshot()["started_ago_s"] < 1.0
+    # no container, no age (never a negative or a zero that means "just now")
+    w.docker.containers.clear()
+    w.sentinel.tick()
+    snap = w.sentinel.snapshot()
+    assert snap["container"]["exists"] is False
+    assert snap["started_ago_s"] is None or snap["started_ago_s"] >= 0
 
 
 def test_sentinel_is_not_autonomous_by_default_and_reports_a_fatal_signature_within_one_poll(worker_world):

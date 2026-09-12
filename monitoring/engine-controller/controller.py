@@ -50,7 +50,24 @@ The rules that shape the code, each from the contract:
   * Detection is DETECT → CONFIRM with the observation counts of §6.3, and
     every recovery step is published in /state and logged with the incident
     id before the next one starts, so the orchestrator queues on RECOVERING
-    and an operator can read what happened after the fact.
+    and an operator can read what happened after the fact. While a step
+    blocks (a sentinel restart, a docker restart) a heartbeat re-stamps the
+    snapshot so freshness measures this process, not the step.
+  * A canary proves nothing without a token: a terminal chunk on empty text
+    is a failure (``no tokens``), and the token-progress step expects at
+    least the tokens actually received, never zero.
+  * DEGRADED is bounded. Three consecutive HTTP errors from a proven engine
+    (rule 6), or CANARY_FAIL_DEGRADED_MAX_S of any consecutive failures with
+    /health still 200 (rule 7), confirm a wedge — an engine that answers
+    /health while no completion gets through is exactly what 2026-09-11
+    looked like for five minutes. Errors are not starvation: rule 6 has no
+    saturation exemption.
+  * Cross-host time is never compared: the sentinel reports how long ago the
+    worker started (a duration on its own clock) and the controller sets it
+    against how long ago its own last proven completion was.
+  * An unexpected exception inside a recovery fails the attempt, releases
+    the lock and is logged with its traceback — RECOVERING with the flock
+    held and nobody advancing it is worse than a failed recovery.
   * The controller ALONE performs destructive recovery (v2 §6). The sentinel
     acts only on this program's ``POST /restart``; the Docker healthchecks
     are report-only except a last-resort tier minutes later; a manual
@@ -176,6 +193,7 @@ GIB = 1024 ** 3
 CONFIRMED_STATE: Dict[str, str] = {
     "wedged_frozen_tokens": "WEDGED",
     "canary_timeout": "WEDGED",
+    "canary_http_error": "WEDGED",   # /health answers, completions do not: a wedge, not a dead process
     "worker_rank_dead": "DOWN",
     "head_engine_dead": "DOWN",
     "head_api_dead": "DOWN",
@@ -194,6 +212,35 @@ ENGINE_CORE_TITLE = "VLLM::EngineCore"
 #: controller did not watch (it was redeployed beside a running head): its
 #: cold start is not measured rather than reported as the head's age.
 COLD_START_WATCH_GRACE_S = 120.0
+
+#: The choreography heartbeat stops on its own after this long: every
+#: blocking call it covers is bounded by its own timeout (sentinel restart
+#: 5 + 120 s, docker restart t + 60 s plus three re-inspects, diagnostics
+#: 30 + 20 s — under 300 s in total), so a beat still running past this is
+#: a bug, and a stale snapshot (MONITORING_UNKNOWN) is then the truth.
+CHOREOGRAPHY_HEARTBEAT_MAX_S = 600.0
+
+
+def canary_engine_fault_kind(res: "CanaryResult") -> str:
+    """Which canary failures are the ENGINE's — ``canary_timeout`` or
+    ``canary_http_error`` (rules 6 and 7 count them) — and which are the
+    probe's (``""``): a 4xx is a request the API rejected (a changed request
+    shape after an upgrade, a 429 under load) — restarting the pair cannot
+    fix it and calling it a wedge would queue users on a serving engine; a
+    result without an HTTP status is a probe crash (a bug here), not
+    evidence about the engine. A connect error is folded into the timeout
+    kind for rule 7 only: a completion the API would not take while
+    ``/health`` still answers is the same shape as one it never answers."""
+    if res.ok:
+        return ""
+    if res.outcome in ("timeout", "connect_error"):
+        return "canary_timeout"
+    if res.outcome == "http_error":
+        status = res.http_status
+        if status is None or 400 <= int(status) < 500:
+            return ""
+        return "canary_http_error"
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +275,10 @@ class Config:
     canary_model: str = ""            # override; default = first id of /v1/models
     canary_outstanding_s: float = 60.0
     canary_starvation_s: float = 300.0
+    #: How long a PROVEN engine may fail every canary (any kind) with
+    #: /health still 200 before DEGRADED "awaiting confirmation" becomes a
+    #: confirmed WEDGED (rule 7): the bound on the honest in-between.
+    canary_fail_degraded_max_s: float = 120.0
     ttft_degraded_s: float = 10.0
     frozen_s: float = 90.0
     cold_start_budget_s: float = 900.0
@@ -241,6 +292,12 @@ class Config:
     poll_s: float = 5.0
     probe_timeout_s: float = 5.0
     router_probe_interval_s: float = 30.0
+    #: While the tick thread is inside a blocking choreography call (sentinel
+    #: POST /restart up to 125 s, docker restart up to 70 s, diagnostics up
+    #: to 55 s) a helper thread re-stamps the published snapshot's
+    #: ``generated_at`` this often, so the freshness rules of §7.3 / §8.1
+    #: measure the controller's liveness, not the length of a step.
+    choreography_heartbeat_s: float = 5.0
     docker_socket: str = "/var/run/docker.sock"
     docker_api_version: str = "1.53"
     lock_path: str = "/run/techsara/locks/engine-recovery.lock"
@@ -286,6 +343,7 @@ class Config:
             canary_model=env_str("CANARY_MODEL", ""),
             canary_outstanding_s=env_float("CANARY_OUTSTANDING_S", 60.0),
             canary_starvation_s=env_float("CANARY_STARVATION_S", 300.0),
+            canary_fail_degraded_max_s=env_float("CANARY_FAIL_DEGRADED_MAX_S", 120.0),
             ttft_degraded_s=env_float("TTFT_DEGRADED_S", 10.0),
             frozen_s=env_float("FROZEN_S", 90.0),
             cold_start_budget_s=env_float("COLD_START_BUDGET_S", 900.0),
@@ -300,6 +358,7 @@ class Config:
             probe_timeout_s=env_float("PROBE_TIMEOUT_S", 5.0),
             router_probe_interval_s=env_float("ROUTER_PROBE_INTERVAL_S",
                                               env_float("FALLBACK_PROBE_INTERVAL_S", 30.0)),
+            choreography_heartbeat_s=env_float("CHOREOGRAPHY_HEARTBEAT_S", 5.0),
             docker_socket=env_str("DOCKER_SOCKET", "/var/run/docker.sock"),
             docker_api_version=env_str("DOCKER_API_VERSION", "1.53"),
             lock_path=env_str("RECOVERY_LOCK_PATH", os.path.join(lock_dir, "engine-recovery.lock")),
@@ -482,14 +541,20 @@ def run_canary(cfg: Config, clock: Clock, model: str, max_tokens: Optional[int] 
     if not terminal:
         return done(False, "http_error", "canary_http_error", 200, connect_s, ttft, tokens, False,
                     "stream ended without a terminal chunk")
+    if tokens < 1:
+        # A terminal chunk with no content is not a completion: an engine
+        # that ends every request without output (finish_reason on empty
+        # text, or a bare [DONE]) must never prove itself with it.
+        return done(False, "http_error", "canary_http_error", 200, connect_s, ttft, 0, True, "no tokens")
     return done(True, "ok", "none", 200, connect_s, ttft, tokens, True)
 
 
 def run_non_stream(cfg: Config, clock: Clock, model: str, max_tokens: int) -> CanaryResult:
     """Readiness step 1: the same request without streaming. A finished
-    JSON completion with a ``finish_reason`` proves the whole path the
-    orchestrator's non-streaming callers use; ``usage.completion_tokens``
-    is what the token-progress step expects to see on ``/metrics``."""
+    JSON completion with a ``finish_reason`` AND at least one token proves
+    the whole path the orchestrator's non-streaming callers use;
+    ``usage.completion_tokens`` is what the token-progress step expects to
+    see on ``/metrics``. Zero tokens is a failure (detail ``no tokens``)."""
     body = _canary_body(model, max_tokens, False, True)
     started_wall = clock.time()
     t0 = clock.mono()
@@ -532,6 +597,8 @@ def run_non_stream(cfg: Config, clock: Clock, model: str, max_tokens: int) -> Ca
         tokens = 1  # no usage block: at least the content we saw
     if not terminal:
         return done(False, "http_error", "canary_http_error", 200, None, tokens, False, "no finish_reason")
+    if tokens < 1:
+        return done(False, "http_error", "canary_http_error", 200, None, 0, True, "no tokens")
     return done(True, "ok", "none", 200, None, tokens, True)
 
 
@@ -651,12 +718,14 @@ def run_readiness_sequence(cfg: Config, clock: Clock, model: str, worker_expecte
     """Contract §5 v2, steps 1–4 in order (step 5, the sentinel's rank
     verdict, is the controller's at harvest time):
 
-      1. non-streaming completion, ``READINESS_MAX_TOKENS`` tokens;
-      2. streaming completion, same length, TTFT measured, terminal chunk;
+      1. non-streaming completion, ``READINESS_MAX_TOKENS`` tokens — at
+         least one token received, or the step fails (``no tokens``);
+      2. streaming completion, same length, TTFT measured, terminal chunk,
+         at least one token;
       3. ``vllm:generation_tokens_total`` on /metrics grew by at least the
-         tokens steps 1+2 received (re-read a few times: the stat logger
-         records an iteration in the same loop turn that streams its chunk,
-         a few milliseconds either way);
+         tokens steps 1+2 actually received, and by at least one (re-read a
+         few times: the stat logger records an iteration in the same loop
+         turn that streams its chunk, a few milliseconds either way);
       4. ``PARTICIPATION_PROBES`` (two) ``PARTICIPATION_MAX_TOKENS`` streaming
          completions started TOGETHER on two sockets — so one scheduler
          step batches ≥ 2 prefills and the candidate build compiles its
@@ -711,7 +780,13 @@ def run_readiness_sequence(cfg: Config, clock: Clock, model: str, worker_expecte
     expected += st.tokens
     rd.tokens_expected = expected
 
-    # 3. token progress on /metrics
+    # 3. token progress on /metrics — the counter must have grown by at
+    #    least the tokens steps 1 and 2 actually received, and by at least
+    #    one: with both steps requiring a token, ``expected`` is ≥ 2 here;
+    #    the floor keeps the step from ever degenerating to ``delta >= 0``.
+    if expected < 1:
+        return finish(st, "progress", f"no tokens received by steps 1 and 2 ({expected}): nothing to measure")
+    expected = max(expected, 1)
     after = _metrics_generation_total(cfg, clock)
     tries = 0
     while after is not None and before is not None and after - before < expected and tries < 3:
@@ -971,6 +1046,18 @@ class SentinelClient:
 # ---------------------------------------------------------------------------
 
 
+def _opt_float(value) -> Optional[float]:
+    """A number from a peer's JSON, or ``None`` — never an exception and
+    never a bool masquerading as one."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if out == out else None  # NaN is not a reading
+
+
 @dataclass
 class Pending:
     """A trigger condition that has held for ``count`` consecutive ticks."""
@@ -1026,6 +1113,12 @@ class Controller:
         # Signals — dicts because they are published as-is in /state.
         self.docker_ok: Optional[bool] = None
         self.docker_error = ""
+        #: The Docker error kind last logged at WARNING: each kind is logged
+        #: once when it appears (and an INFO when the API answers again),
+        #: never once per tick — but never only at DEBUG either: a daemon
+        #: that answers 400 to every inspect leaves the controller unable to
+        #: observe or act, and that must be said out loud.
+        self._docker_error_logged = ""
         self.head: dict = {"exists": None, "running": None, "status": None, "health": None,
                            "restart_count": None, "started_at": None, "finished_at": None,
                            "engine_process_alive": None, "rank_process_alive": None, "observed_at": None}
@@ -1035,8 +1128,14 @@ class Controller:
                              "prompt_tokens_total": None, "frozen_seconds": 0.0, "observed_at": None}
         self.worker: dict = {"configured": bool(cfg.sentinel_url), "reachable": None, "container_running": None,
                              "health": None, "rank_process_alive": None, "rank_joined": None,
-                             "restart_count": None, "started_at": None, "last_fault": None,
+                             "restart_count": None, "started_at": None, "started_ago_s": None,
+                             "clock_skew_s": None, "last_fault": None,
                              "self_restarts_in_window": None, "autonomous": None, "observed_at": None, "error": ""}
+        #: Trigger 1(c)'s gate: the sentinel has reported the rank process
+        #: alive at least once since the current head start. A rank never
+        #: seen alive for this incarnation is "unknown", never "absent"
+        #: (the same rule the head-side process table follows).
+        self._worker_rank_seen_alive = False
         self.router: dict = {"configured": bool(cfg.router_health_url), "health": None, "observed_at": None}
         self.router_available = False
         self._router_next_mono: Optional[float] = None
@@ -1056,6 +1155,13 @@ class Controller:
         self.last_success_at: Optional[float] = None
         self.consecutive_failures = 0
         self.consecutive_timeouts = 0
+        #: Rule 6: consecutive canary HTTP errors the ENGINE answered (5xx,
+        #: an error chunk, a stream without a terminal chunk, no tokens) on
+        #: a proven engine; a 4xx or a probe crash is not counted.
+        self.consecutive_http_errors = 0
+        #: Rule 7's clock: when the first probe of the current failure
+        #: streak STARTED (wall); ``None`` while the canary passes.
+        self.failing_since: Optional[float] = None
         self._next_canary_mono: Optional[float] = None
         self._no_model_logged = False
         self.probes_total: Dict[str, int] = {k: 0 for k in PROBE_OUTCOMES}
@@ -1097,6 +1203,8 @@ class Controller:
 
         self._snap_lock = threading.Lock()
         self._snapshot: dict = {}
+        self._heartbeat_stop: Optional[threading.Event] = None
+        self._heartbeat_thread: Optional[threading.Thread] = None
         self._publish(now)
 
     # ------------------------------------------------------------------
@@ -1128,10 +1236,13 @@ class Controller:
         self._cold_start_detail_for = None
         self.cold_start_detail = "none"
         self._head_procs_seen = {"engine": False, "rank": False}
+        self._worker_rank_seen_alive = False
         if first:
             return
         self.consecutive_failures = 0
         self.consecutive_timeouts = 0
+        self.consecutive_http_errors = 0
+        self.failing_since = None
         self.last_canary = None
         self.proof = None
         self.readiness = None
@@ -1142,29 +1253,48 @@ class Controller:
         self.canary.discard()
         self._next_canary_mono = None
 
+    def _docker_unusable(self, exc: DockerError) -> None:
+        """The Docker API cannot be used to observe the head: keep the last
+        known head facts (``started_at`` in particular: the readiness rule
+        compares against it), publish the bounded kind, and say so at
+        WARNING — once per kind, not once per tick. While this holds no
+        trigger that needs ``docker_ok`` can fire and no recovery can
+        start; a controller that only whispered it at DEBUG sat in
+        MONITORING_UNKNOWN for good with ``docker_error`` as the only clue."""
+        self.docker_ok = False
+        self.docker_error = exc.kind
+        if exc.kind != self._docker_error_logged:
+            self._docker_error_logged = exc.kind
+            hint = ""
+            if not isinstance(exc, DockerUnavailable) and 400 <= exc.status < 500:
+                hint = (f" (a 4xx from the daemon usually means DOCKER_API_VERSION={self.cfg.docker_api_version} "
+                        f"is not accepted by it)")
+            log.warning("docker API unusable: %s — %s%s. The head cannot be observed and no recovery can start "
+                        "until this clears; the state is MONITORING_UNKNOWN (DEGRADED while a completion is fresh)",
+                        exc.kind, exc, hint)
+
+    def _docker_usable(self) -> None:
+        self.docker_ok = True
+        self.docker_error = ""
+        if self._docker_error_logged:
+            log.info("docker API answering again (was %s)", self._docker_error_logged)
+            self._docker_error_logged = ""
+
     def _observe_head(self, now: float) -> None:
         try:
             info = self.docker.inspect(self.cfg.head_container)
         except DockerUnavailable as exc:
-            # Keep the last known head facts (started_at in particular: the
-            # readiness rule compares against it) but say we could not look.
-            self.docker_ok = False
-            self.docker_error = exc.kind
-            log.debug("docker inspect: %s", exc)
+            self._docker_unusable(exc)
             return
         except DockerError as exc:
-            self.docker_ok = True
-            self.docker_error = ""
             if exc.status == 404:
+                self._docker_usable()
                 self.head.update({"exists": False, "running": False, "status": "absent", "health": None,
                                   "engine_process_alive": None, "rank_process_alive": None, "observed_at": now})
                 return
-            self.docker_ok = False
-            self.docker_error = exc.kind
-            log.debug("docker inspect: %s", exc)
+            self._docker_unusable(exc)
             return
-        self.docker_ok = True
-        self.docker_error = ""
+        self._docker_usable()
         state = info.get("State") or {}
         running = bool(state.get("Running"))
         started_at = parse_docker_time(state.get("StartedAt"))
@@ -1277,21 +1407,33 @@ class Controller:
         if doc is None:
             self.worker.update({"reachable": False, "container_running": None, "health": None,
                                 "rank_process_alive": None, "rank_joined": None, "restart_count": None,
-                                "started_at": None, "last_fault": None, "self_restarts_in_window": None,
+                                "started_at": None, "started_ago_s": None, "clock_skew_s": None,
+                                "last_fault": None, "self_restarts_in_window": None,
                                 "autonomous": None, "observed_at": now, "error": err})
             return
         container = doc.get("container") or {}
         fault = doc.get("last_fault")
         if not isinstance(fault, dict):
             fault = None
+        rank_alive = doc.get("rank_process_alive")
+        if rank_alive is True:
+            self._worker_rank_seen_alive = True
+        # Two clocks (§6.3 trigger 1(a)): the sentinel's ``started_at`` and
+        # ``observed_at`` are Node 2's; ``started_ago_s`` (observed_at −
+        # started_at, both on Node 2) is a duration, which crosses hosts
+        # intact. ``clock_skew_s`` is what an operator reads when NTP fails.
+        started_ago = _opt_float(doc.get("started_ago_s"))
+        observed = _opt_float(doc.get("observed_at"))
         self.worker.update({
             "reachable": True,
             "container_running": container.get("running"),
             "health": container.get("health"),
-            "rank_process_alive": doc.get("rank_process_alive"),
+            "rank_process_alive": rank_alive,
             "rank_joined": doc.get("rank_joined"),
             "restart_count": container.get("restart_count"),
             "started_at": container.get("started_at"),
+            "started_ago_s": started_ago if (started_ago is not None and started_ago >= 0) else None,
+            "clock_skew_s": (observed - now) if observed is not None else None,
             "last_fault": fault,
             "self_restarts_in_window": doc.get("self_restarts_in_window"),
             "autonomous": doc.get("autonomous"),
@@ -1354,8 +1496,8 @@ class Controller:
             self.last_success_at = res.at
             self.consecutive_failures = 0
             self.consecutive_timeouts = 0
-            if res.tokens == 0:
-                log.warning("canary completed with a terminal chunk but no content tokens")
+            self.consecutive_http_errors = 0
+            self.failing_since = None
             proven = self._proven_since_head_start()
             # VERIFY_STABILITY by any path: an open incident ends on three
             # consecutive successes on a PROVEN engine whether the last
@@ -1372,20 +1514,36 @@ class Controller:
         else:
             self.consecutive_failures += 1
             self.verify_successes = 0
+            if self.failing_since is None:
+                # Rule 7's clock starts when the first probe of the streak
+                # started: the engine has not completed a canary since.
+                self.failing_since = res.started_at
+            h = res.health_at_start
+            # Rules 5 and 6 count a failure only on a PROVEN engine whose
+            # /health was not 5xx when the probe started: failures while a
+            # head loads are STARTING (the cold-start budget's business), a
+            # 5xx is trigger 2's. /health silent (None) with TCP up DOES
+            # count — that is the hung-API shape.
+            countable = self._proven_since_head_start() and not (h is not None and 500 <= int(h) < 600)
+            kind = canary_engine_fault_kind(res)
             if res.outcome == "timeout":
-                # Rule 5 counts a timeout only on a PROVEN engine whose
-                # /health was not 5xx when the probe started: timeouts while
-                # a head loads are STARTING (the cold-start budget's business),
-                # a 5xx is trigger 2's. /health silent (None) with TCP up
-                # DOES count — that is the hung-API shape.
-                h = res.health_at_start
-                if self._proven_since_head_start() and not (h is not None and 500 <= int(h) < 600):
+                self.consecutive_http_errors = 0
+                if countable:
                     self.consecutive_timeouts += 1
                 else:
                     log.info("canary timeout not counted toward canary_timeout (proven=%s, health at start=%s)",
                              self._proven_since_head_start(), h)
-            else:
+            elif kind == "canary_http_error":
                 self.consecutive_timeouts = 0
+                if countable:
+                    self.consecutive_http_errors += 1
+                else:
+                    log.info("canary http_error not counted toward canary_http_error (proven=%s, health at start=%s)",
+                             self._proven_since_head_start(), h)
+            else:
+                # A connect error, a 4xx or a probe crash: neither streak.
+                self.consecutive_timeouts = 0
+                self.consecutive_http_errors = 0
             # The confirming second probe should not wait out a slow interval
             # scheduled while everything looked fine.
             mono = self.clock.mono()
@@ -1411,7 +1569,8 @@ class Controller:
         if rd.passed and rd.rank_alive is False:
             if not self._rank_wait_logged:
                 self._rank_wait_logged = True
-                log.info("readiness steps 1-4 passed but the sentinel does not see the rank process; waiting")
+                log.info("readiness steps 1-4 passed but the sentinel does not see the rank process (seen alive for "
+                         "this head start: %s); waiting", self._worker_rank_seen_alive)
             rd.passed = False
             rd.failed_step = "rank_alive"
             rd.detail = "sentinel reports no VLLM::Worker process on the worker"
@@ -1515,21 +1674,49 @@ class Controller:
         # (re)started after it means the rank that participated is gone; a
         # worker that legitimately started seconds after the head (either
         # order happens under the last-resort healthchecks) but then served
-        # completions is left alone. (b) a fatal signature in the worker's
-        # current incarnation after the current head start — no proven gate.
-        # (c) no VLLM::Worker process at all past the grace, on a proven engine.
+        # completions is left alone. The comparison is made on ONE clock:
+        # the sentinel reports how long ago the worker started (a duration
+        # measured on Node 2 alone) and the controller compares it with
+        # how long ago its own last proven completion was — Node 2's wall
+        # clock never meets Node 1's. An older sentinel without
+        # ``started_ago_s`` falls back to the two-clock comparison.
+        # (b) a fatal signature in the worker's current incarnation after
+        # the current head start — no proven gate. (c) no VLLM::Worker
+        # process at all past the grace, on a proven engine, and only once
+        # the sentinel has reported the rank alive for THIS head
+        # incarnation (a name never observed alive is unknown, not absent —
+        # the head-side process rule, applied to the worker too).
         c1, d1 = False, ""
         if w["configured"] and w["reachable"]:
             ws = w.get("started_at")
+            ago = w.get("started_ago_s")
             fault_detail = self._worker_fault_after_head_start()
-            if proven and self.last_success_at is not None and ws and float(ws) > float(self.last_success_at):
-                c1, d1 = True, (f"worker container started {float(ws) - float(self.last_success_at):.0f}s "
-                                f"after the last proven completion")
+            restarted_after_proof, d1a = False, ""
+            if proven and self.last_success_at is not None:
+                since_success = now - float(self.last_success_at)
+                if ago is not None:
+                    # The sentinel's document is at most one of its polls old,
+                    # which can only make ``ago`` SMALLER than the truth; a
+                    # false positive would need a TP=2 completion finishing
+                    # within that poll of the worker container's start, which
+                    # a rank that has to load the model cannot do.
+                    if float(ago) < since_success:
+                        restarted_after_proof = True
+                        d1a = (f"worker container started {since_success - float(ago):.0f}s after the last "
+                               f"proven completion (sentinel clock)")
+                elif ws and float(ws) > float(self.last_success_at):
+                    restarted_after_proof = True
+                    d1a = (f"worker container started {float(ws) - float(self.last_success_at):.0f}s after the "
+                           f"last proven completion (two clocks: the sentinel sent no started_ago_s)")
+            if restarted_after_proof:
+                c1, d1 = True, d1a
             elif fault_detail:
                 c1, d1 = True, fault_detail
-            elif (proven and w.get("rank_process_alive") is False and w.get("container_running")
-                  and ws and now - float(ws) >= cfg.worker_rank_grace_s):
-                c1, d1 = True, "sentinel reports the rank process absent"
+            elif (proven and self._worker_rank_seen_alive and w.get("rank_process_alive") is False
+                  and w.get("container_running")
+                  and ((ago is not None and float(ago) >= cfg.worker_rank_grace_s)
+                       or (ago is None and ws and now - float(ws) >= cfg.worker_rank_grace_s))):
+                c1, d1 = True, "sentinel reports the rank process absent (seen alive for this head start)"
         out["worker_rank_dead"] = (c1, d1)
 
         # 2. head engine dead — /health 5xx, one observation …
@@ -1576,7 +1763,8 @@ class Controller:
         d5 = f"{self.consecutive_timeouts} consecutive canary timeouts" if c5 else ""
         progressing = bool(fresh and (eng.get("requests_running") or 0) > 0
                            and eng.get("frozen_seconds", 0.0) < cfg.frozen_s)
-        if c5 and progressing and outstanding < cfg.canary_starvation_s:
+        starved = progressing and outstanding < cfg.canary_starvation_s
+        if c5 and starved:
             c5 = False
             self._saturation_note = (f"canary timed out twice but the engine is progressing "
                                      f"({eng.get('requests_running'):.0f} running, "
@@ -1584,6 +1772,43 @@ class Controller:
         else:
             self._saturation_note = ""
         out["canary_timeout"] = (c5, d5)
+
+        # 6. three consecutive canary HTTP errors the ENGINE answered (5xx,
+        # an error chunk, a stream without a terminal chunk, no tokens) on a
+        # proven engine whose /health was not 5xx when each probe started
+        # (a 5xx is trigger 2's). The three probes are the observations.
+        # The saturation exemption does NOT apply: an error is an answer,
+        # not a request starved of a scheduler slot. Without this rule a
+        # head that answers /health, /v1/models and /metrics 200 while
+        # every completion fails fast sat in DEGRADED — a SERVING state to
+        # the orchestrator — for good.
+        res = self.last_canary
+        c6 = bool(proven and self.consecutive_http_errors >= 3)
+        d6 = ""
+        if c6:
+            d6 = (f"{self.consecutive_http_errors} consecutive canary HTTP errors"
+                  f" (last: HTTP {res.http_status}, {res.detail})" if res is not None else
+                  f"{self.consecutive_http_errors} consecutive canary HTTP errors")
+        out["canary_http_error"] = (c6, d6)
+
+        # 7. the bound on DEGRADED "awaiting confirmation": a proven engine
+        # that has failed every canary for CANARY_FAIL_DEGRADED_MAX_S while
+        # /health answers 200 is a wedge (§2: the canary cannot get through
+        # while the API says fine), whichever mix of failure kinds got it
+        # there — timeouts alternating with errors confirm neither rule 5
+        # nor 6. The category follows the LAST failure's kind; the
+        # saturation exemption still holds for timeouts (a starved canary
+        # on a progressing engine, bounded by CANARY_STARVATION_S).
+        kind = canary_engine_fault_kind(res) if res is not None else ""
+        failing_for = (now - float(self.failing_since)) if self.failing_since is not None else 0.0
+        c7 = bool(proven and kind and health == 200 and failing_for >= cfg.canary_fail_degraded_max_s
+                  and not (kind == "canary_timeout" and starved))
+        for key in ("canary_failing:timeout", "canary_failing:http_error"):
+            out[key] = (False, "")
+        if c7:
+            out["canary_failing:timeout" if kind == "canary_timeout" else "canary_failing:http_error"] = (
+                True, f"every canary failed for {failing_for:.0f}s (≥ {cfg.canary_fail_degraded_max_s:.0f}s) "
+                      f"while /health answers 200; last: {res.outcome} ({res.detail})")
         return out
 
     #: (pending key, category, observations needed, minimum seconds between first and confirming observation)
@@ -1594,6 +1819,9 @@ class Controller:
         ("head_api_dead", "head_api_dead", 2, -1.0),   # -1: use cfg.head_api_dead_gap_s
         ("wedged_frozen_tokens", "wedged_frozen_tokens", 2, 0.0),
         ("canary_timeout", "canary_timeout", 1, 0.0),  # the two observations are the two probes
+        ("canary_http_error", "canary_http_error", 1, 0.0),  # the three observations are the three probes
+        ("canary_failing:timeout", "canary_timeout", 1, 0.0),       # rule 7: the streak's length is the confirmation
+        ("canary_failing:http_error", "canary_http_error", 1, 0.0),
     )
 
     def _detect(self, now: float, mono: float) -> None:
@@ -1801,11 +2029,61 @@ class Controller:
 
     # -- the choreography (contract §6.3) --------------------------------
 
-    def _step(self, step: str, now: float) -> None:
+    def _step(self, step: str) -> None:
+        # Stamped and published with the CURRENT time, not the tick's start:
+        # the previous step may have blocked for a minute, and a snapshot
+        # published with a minute-old ``generated_at`` is stale on arrival.
+        at = self.clock.time()
         self.rec.step = step
-        self.rec.steps.append({"step": step, "at": now})
+        self.rec.steps.append({"step": step, "at": at})
         log.info("incident=%s attempt=%d step=%s", self.rec.incident_id, self.rec.attempt, step)
-        self._publish(now)
+        self._publish(at)
+
+    # -- the choreography heartbeat --------------------------------------
+
+    def _touch_snapshot(self, now: float) -> None:
+        """Re-stamp the published snapshot's ``generated_at`` without
+        touching its contents: "the controller is alive and still in the
+        step it last published". Reads nothing the tick thread mutates."""
+        with self._snap_lock:
+            if self._snapshot:
+                self._snapshot = {**self._snapshot, "generated_at": now}
+
+    def _heartbeat_loop(self, stop: threading.Event) -> None:
+        started = self.clock.mono()
+        while not stop.wait(self.cfg.choreography_heartbeat_s):
+            if self.clock.mono() - started > CHOREOGRAPHY_HEARTBEAT_MAX_S:
+                log.error("choreography heartbeat stopped after %.0fs: a blocking recovery call has outlived "
+                          "every timeout it has (a bug); the snapshot goes stale on purpose",
+                          CHOREOGRAPHY_HEARTBEAT_MAX_S)
+                return
+            self._touch_snapshot(self.clock.time())
+
+    def _start_heartbeat(self) -> None:
+        """Armed while the tick thread is inside the blocking choreography
+        (jitter, diagnostics, sentinel POST /restart, docker restart); the
+        freshness rules (§7.3: 30 s; §8.1: 15 s) then measure the
+        controller's liveness rather than a step's length, so a legitimate
+        recovery is never rendered MONITORING_UNKNOWN half-way through."""
+        self._stop_heartbeat()
+        stop = threading.Event()
+        thread = threading.Thread(target=self._heartbeat_loop, args=(stop,), name="choreography-heartbeat",
+                                  daemon=True)
+        self._heartbeat_stop, self._heartbeat_thread = stop, thread
+        thread.start()
+
+    def _stop_heartbeat(self) -> None:
+        stop, thread = self._heartbeat_stop, self._heartbeat_thread
+        self._heartbeat_stop = self._heartbeat_thread = None
+        if stop is not None:
+            stop.set()
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(self.cfg.choreography_heartbeat_s + 1.0)
+
+    @property
+    def heartbeat_active(self) -> bool:
+        t = self._heartbeat_thread
+        return t is not None and t.is_alive()
 
     def _start_recovery(self, category: str, detail: str, first_at: float, now: float, mono: float) -> None:
         stale = (self.incident is not None and self.incident.get("ended_at") is None
@@ -1826,30 +2104,51 @@ class Controller:
         self.confirmed = None
         self.consecutive_failures = 0
         self.consecutive_timeouts = 0
+        self.consecutive_http_errors = 0
+        self.failing_since = None
         self.verify_successes = 0
         # Nothing in flight may be harvested as this recovery's proof.
         self.canary.discard()
         self.last_canary = None
         self.proof = None
         self.readiness = None
+        # A recovery in progress ALWAYS has a deadline: set here from the
+        # confirmation, re-set at wait_load from the restart (the contract's
+        # budget), so no step can be held open without one.
         self.rec = Recovery(in_progress=True, step="confirm", category=category, reason=detail,
                             incident_id=self.incident["id"], attempt=self.incident["attempts"],
-                            started_at=now, detect_at=first_at, last=self.rec.last)
+                            started_at=now, detect_at=first_at, deadline_mono=mono + self.cfg.cold_start_budget_s,
+                            last=self.rec.last)
         self.rec.steps.append({"step": "confirm", "at": now})
         self.last_failure_category = category
         self._set_state("RECOVERING", f"{category}: {detail}", now)
         log.warning("incident=%s attempt=%d/%d RECOVERING (%s: %s)", self.rec.incident_id, self.rec.attempt,
                     self.cfg.recovery_budget, category, detail)
         self._publish(now)
+        self._start_heartbeat()
+        try:
+            self._choreograph(category, now)
+        except Exception as exc:  # noqa: BLE001 — the lock must never outlive the tick that took it
+            self._fail_attempt_on_error(exc, now)
+        finally:
+            self._stop_heartbeat()
+
+    def _choreograph(self, category: str, now: float) -> None:
+        """confirm → capture → stop_pair → wait_load, on the tick thread.
+        Anything unexpected raised in here is the caller's to turn into a
+        failed attempt: a RECOVERING that nobody advances, with the flock
+        held, is the one outcome worse than a failed recovery (the
+        orchestrator queues every request forever and cluster-recover.sh
+        cannot take the lock)."""
         if self.cfg.recovery_jitter_s > 0:
             delay = random.uniform(0.0, self.cfg.recovery_jitter_s)
             log.info("incident=%s jitter %.1fs before acting", self.rec.incident_id, delay)
             self.clock.sleep(delay)
 
-        self._step("capture", now)
+        self._step("capture")
         self._capture_diagnostics()
 
-        self._step("stop_pair", now)
+        self._step("stop_pair")
         if not self._stop_stale_pair(now):
             self._fail_attempt(category, "head restart failed", now)
             return
@@ -1858,8 +2157,18 @@ class Controller:
         # head during the blocking calls above can never satisfy
         # "started after the restart".
         self.rec.restart_at = self.clock.time()
-        self._step("wait_load", now)
+        self._step("wait_load")
         self.rec.deadline_mono = self.clock.mono() + self.cfg.cold_start_budget_s
+
+    def _fail_attempt_on_error(self, exc: BaseException, now: float) -> None:
+        """An unexpected exception inside a recovery tick: logged WITH the
+        traceback, the attempt failed (lock released, cooldown armed) so
+        the next confirmation can try again, and the exception's class —
+        never its text — in ``recovery.last``."""
+        rec = self.rec
+        log.exception("incident=%s attempt=%d controller error during step %s (%s): failing the attempt and "
+                      "releasing the recovery lock", rec.incident_id, rec.attempt, rec.step, type(exc).__name__)
+        self._fail_attempt(rec.category, f"controller error during {rec.step}: {type(exc).__name__}", now)
 
     def _incident_path(self) -> str:
         return os.path.join(self.cfg.incident_dir, self.rec.incident_id or "unknown")
@@ -2004,7 +2313,7 @@ class Controller:
             else:
                 rec.load_fault = None
             if self.api.get("health") == 200 and restarted:
-                self._step("canary", now)
+                self._step("canary")
                 self._next_canary_mono = mono  # probe now, not at the next slow interval
             elif deadline_passed:
                 self._fail_attempt("cold_start_timeout", self._cold_start_reason(
@@ -2026,7 +2335,7 @@ class Controller:
     def _mark_ready(self, now: float) -> None:
         rec = self.rec
         res = self.last_canary
-        self._step("mark_ready", now)
+        self._step("mark_ready")
         self._release_lock()
         rec.in_progress = False
         self.cooldown_until = now + self.cfg.recovery_cooldown_s
@@ -2056,6 +2365,7 @@ class Controller:
         self.last_failure_category = category if category in FAILURE_CATEGORIES else "none"
         rec.last = {"incident": rec.incident_id, "attempt": rec.attempt, "category": rec.category,
                     "outcome": "failed", "failure": category, "failure_detail": self.cold_start_detail,
+                    "detail": detail[:200], "step": rec.step,
                     "worker_restart": rec.worker_restart, "started_at": rec.started_at, "ended_at": now,
                     "duration_s": (now - rec.started_at) if rec.started_at else None}
         log.error("incident=%s attempt=%d FAILED: %s (%s); cooldown %.0fs, budget remaining %d",
@@ -2180,7 +2490,9 @@ class Controller:
             if w["configured"] and not w.get("reachable"):
                 degraded.append(f"worker sentinel unreachable ({w.get('error') or 'no answer'})")
             elif w["configured"] and w.get("rank_process_alive") is False:
-                degraded.append("sentinel reports the rank process absent")
+                degraded.append("sentinel reports the rank process absent" if self._worker_rank_seen_alive else
+                                "sentinel does not see the rank process (never seen for this head start: "
+                                "unconfirmed, not a trigger)")
             if health != 200:
                 degraded.append(f"/health {health if health is not None else 'no answer'}")
             if api.get("metrics") != 200:
@@ -2192,7 +2504,7 @@ class Controller:
                 # Still within the freshness window of the last success, but
                 # the latest probe failed: not READY, not yet confirmed.
                 degraded.append(f"last canary {res.outcome} ({res.detail}); {self.consecutive_failures} consecutive; "
-                                f"awaiting confirmation")
+                                f"awaiting confirmation{self._failing_bound_text(now)}")
             if self.router["configured"] and not self.router_available:
                 degraded.append(f"router (internal classifier) unhealthy ({self.router.get('health') or 'no answer'})")
             if head.get("engine_process_alive") is False or head.get("rank_process_alive") is False:
@@ -2244,7 +2556,21 @@ class Controller:
             why = f"last canary {res.outcome} ({res.detail}); {self.consecutive_failures} consecutive"
         else:
             why = "canary result stale"
-        self._set_state("DEGRADED", f"{why}; awaiting confirmation", now)
+        self._set_state("DEGRADED", f"{why}; awaiting confirmation{self._failing_bound_text(now)}", now)
+
+    def _failing_bound_text(self, now: float) -> str:
+        """How long DEGRADED "awaiting confirmation" can last (rule 7), or
+        why it will not end by itself (a failure that is not the engine's)."""
+        res = self.last_canary
+        if res is None or res.ok or self.failing_since is None:
+            return ""
+        kind = canary_engine_fault_kind(res)
+        if not kind:
+            return (f" (HTTP {res.http_status}: not counted as an engine fault — a restart cannot fix a request "
+                    f"the API rejects; check the canary body against this build)" if res.http_status is not None
+                    else " (probe error, not the engine's)")
+        left = self.cfg.canary_fail_degraded_max_s - (now - float(self.failing_since))
+        return f" (WEDGED as {kind} in {max(0.0, left):.0f}s unless a canary passes)"
 
     # ------------------------------------------------------------------
     # Canary scheduling
@@ -2288,7 +2614,10 @@ class Controller:
         self._observe_router(now, mono)
         self._harvest_canary(now)
         if self.rec.in_progress:
-            self._advance_recovery(now, mono)
+            try:
+                self._advance_recovery(now, mono)
+            except Exception as exc:  # noqa: BLE001 — same rule as the choreography: never a pinned RECOVERING
+                self._fail_attempt_on_error(exc, now)
         else:
             self._detect(now, mono)
             self._act_on_confirmed(now, mono)
@@ -2307,6 +2636,7 @@ class Controller:
                "kind": None, "health_at_start": None,
                "last_success_at": self.last_success_at, "consecutive_failures": self.consecutive_failures,
                "consecutive_timeouts": self.consecutive_timeouts,
+               "consecutive_http_errors": self.consecutive_http_errors, "failing_since": self.failing_since,
                "in_flight": self.canary.in_flight, "in_flight_kind": self.canary.kind if self.canary.in_flight else None,
                "outstanding_s": self.canary.outstanding_s(self.clock.mono())}
         if res is not None:
@@ -2536,6 +2866,7 @@ class Controller:
         return d.render()
 
     def shutdown(self) -> None:
+        self._stop_heartbeat()
         self._release_lock()
 
 
