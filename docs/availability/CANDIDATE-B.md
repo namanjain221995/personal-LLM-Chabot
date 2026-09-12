@@ -444,7 +444,7 @@ git `caa97e9`); B = run `20260912T0859Z` (11 phases, 1,639 s, git `16fe5cd`); th
 | 3 — `streaming` gap p95 ≤ 1.2 × A | 0.016 / 0.016 = 0.98 | pass |
 | 3 — aggregate completion tok/s ≥ 0.9 × A in `c10_short`, `c16_short`, `mixed` | 213.2 / 205.6; 306.7 / 269.6; 200.6 / 160.4 (`mixed`: **692 vs 550** requests in 10 min at c=10) | pass |
 | 4 — both-rank grep on every start, cold start ≤ 900 s, no fallback / JIT-error signature | every start (§6.3); cold ≈ 226 s to API accepting, warm restarts 152–166 s to READY | pass |
-| 1 — the 120-min soak | `scripts/cluster-soak.py --minutes 120 --concurrency 10`, started 10:50Z (`.runtime/logs/soak-B-20260912T1050Z.log`, baseline head RestartCount 1, worker 0, Xid 2/2): **in progress at the time of writing; result appended by the lead** | pending |
+| 1 — the 120-min soak | `scripts/cluster-soak.py --minutes 120 --concurrency 10`, started 10:50Z (`.runtime/logs/soak-B-20260912T1050Z.log`, baseline head RestartCount 1, worker 0, Xid 2/2): ****PASS** — 120.1 min, c=10, 8,851/8,851 ok, 0 faults, 0 restarts, Xid unchanged (10:50–12:51Z)** | pending |
 | 5 — `validate_long_context.py` on B | not recorded today (the ~950K needle of the matrix is the only long-context figure on B) | not measured |
 | 6 — the orchestrator smoke on B | not recorded as a run; the drills' chats and the canaries completed on the primary | not measured |
 | 7 — ≥ 7 clean production days | B has served since 08:39Z; the 48–72 h canary has not started | **still unproven** |

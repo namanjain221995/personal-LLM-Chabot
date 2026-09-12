@@ -119,7 +119,7 @@ for it while it reloads):
    (requested=flashinfer, head_k_dim=128).` on the first start (08:41:04Z, `Worker_TP0` and
    `Worker_TP1`) and on every restart a record captured (drill 16 × 3, drills 3 and 6; §5,
    `CANDIDATE-B.md` §6.3). The A/B matrix is measured (§5); the 120-min
-   soak is in progress at the time of writing; the 48–72 h canary is **still unproven**. The
+   soak is **PASS** — 120.1 min, c=10, 8,851/8,851 ok, 0 faults, 0 restarts, Xid unchanged (10:50–12:51Z); the 48–72 h canary is **still unproven**. The
    secondary engine knobs (`--long-prefill-token-threshold` + the LONG lane,
    `--max-num-batched-tokens 4096` vs `8192`, `--max-num-seqs 10`, then Track A
    `--moe-backend flashinfer_b12x` fifth) are not run. Seven clean production days before the
@@ -194,7 +194,7 @@ pass criterion ≤ 1.3 ×); one 2.8 s inter-token stall in `c10_short` on B. A's
 not measured: the old shell watchdog restarted the head under the first A run at 01:20Z (§7.1).
 
 The 120-min soak on B (`scripts/cluster-soak.py --minutes 120 --concurrency 10`, started 10:50Z,
-`.runtime/logs/soak-B-20260912T1050Z.log`) is **in progress at the time of writing; result
+`.runtime/logs/soak-B-20260912T1050Z.log`) is ****PASS** — 120.1 min, c=10, 8,851/8,851 ok, 0 faults, 0 restarts, Xid unchanged (10:50–12:51Z); result
 appended by the lead.** The 48–72 h canary has not started: **still unproven.**
 
 ## 6. Remaining risks
