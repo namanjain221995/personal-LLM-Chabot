@@ -73,6 +73,7 @@ from typing import Awaitable, Callable, Dict, FrozenSet, List, Optional, Sequenc
 from urllib.parse import urlparse
 
 from .. import continuation, db, llm
+from ..continuity import QueuedForRecovery
 from ..config import settings
 # `extract` is deliberately NOT imported any more: every head slice this
 # module used to take (`extract.truncate_chars`) is now the search path's
@@ -3281,6 +3282,21 @@ async def _run(
             )
         except Exception:  # noqa: BLE001 — cancellation still wins
             log.warning("could not mark the cancelled research run", exc_info=True)
+        raise
+    except QueuedForRecovery:
+        # Strict one-model mode (docs/availability/CONTRACT.md §8.3): the main
+        # model is recovering and the chat worker has parked this turn as
+        # `queued` to resume the SAME generation when it is READY. Closing the
+        # run as "failed" here would hand the person a "research run failed"
+        # text answer for an outage that is being waited out — the very thing
+        # the parked state exists to avoid. Close the run the way the restart
+        # sweep does (status 'failed', detail says why — the CHECK admits no
+        # 'interrupted') and let the hold win; the resumed generation opens a
+        # fresh run.
+        await _close_run(
+            await run_row_id(), state, "failed", "".join(parts), _sources_meta(state),
+            "interrupted: waiting for the main model to recover",
+        )
         raise
     except Exception as exc:  # noqa: BLE001
         log.warning("deep research failed", exc_info=True)

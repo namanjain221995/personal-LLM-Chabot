@@ -303,7 +303,7 @@ def test_a_recovering_engine_queues_the_turn_and_ready_resumes_the_same_generati
     assert said == [continuity.QUEUED_LINE], "exactly one line, the exact one"
     assert "".join(d["text"] for k, d in events if k == "token") == "from the main model"
     metas = [d for k, d in events if k == "meta"]
-    assert metas[0] == {"generation_id": first_generation, "intent_id": "int-q-1", "attempt": 1}
+    assert {k: v for k, v in metas[0].items() if k not in ('request_id', 'trace_id')} == {"generation_id": first_generation, "intent_id": "int-q-1", "attempt": 1}
     assert metas[-1]["generation_id"] == first_generation and metas[-1]["attempt"] == 2
     assert len(engine.stream_calls) == 1, "one open, once READY"
     assert gen.generation_id == first_generation and gen.attempt == 2 and gen.retry_reason == "recovery"

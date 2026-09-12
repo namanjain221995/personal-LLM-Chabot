@@ -1448,7 +1448,7 @@ class Settings:
         # restart interrupted when the controller reports READY; a row older
         # than this is left alone — nobody is waiting for it, and a thread
         # would only be surprised by an answer to a day-old question.
-        self.llm_resume_max_age_s: float = _float("LLM_RESUME_MAX_AGE_S", 24 * 3600.0)
+        self.llm_resume_max_age_s: float = _float("LLM_RESUME_MAX_AGE_S", 3600.0)
         # --- Long-context admission (app/admission.py, CONTRACT §6.7) ------
         # Two lanes in front of the engine. A prompt at or below the
         # threshold takes the NORMAL lane (ADMISSION_NORMAL_MAX concurrent
