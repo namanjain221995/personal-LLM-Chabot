@@ -11,6 +11,7 @@ resume — the parts a person's document depends on when the process dies.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
@@ -691,6 +692,47 @@ def test_stop_cancels_runs_releases_leases_and_start_requeues_them(owner, monkey
 
     fresh = asyncio.run(restart())
     assert fresh["status"] == "completed"
+
+
+def test_a_lapsed_lease_is_requeued_within_seconds_not_at_the_next_sweep(owner, monkeypatch):
+    """The restart drill of 2026-09-12: the orchestrator restarted 7 s into
+    a compose, the startup pass ran before the dead lease had expired, and
+    the job sat 'running' for the 15 minutes the test waited because the
+    only later pass was the 30-minute sweep. The lease check now has its
+    own cadence; the sweep keeps its interval and is NOT run each time."""
+    _install_render(monkeypatch)
+    pipeline.set_composer(_composer())
+    row = _accept(owner)
+    adb.update_job(row["id"], status="running")
+    with db.connection() as con:
+        con.execute("UPDATE artifact_jobs SET lease_owner = 'dead:1:0', lease_expires_at = now() - interval '1 minute' WHERE id = %s", (row["id"],))
+    monkeypatch.setattr(pipeline, "REQUEUE_INTERVAL_S", 0.05)
+    monkeypatch.setattr(settings, "artifact_maintenance_interval_s", 1800.0)
+    sweeps = []
+
+    async def counting_sweep():
+        sweeps.append(1)
+        return 0
+
+    monkeypatch.setattr(pipeline, "sweep", counting_sweep)
+
+    async def scenario():
+        real_sleep = asyncio.sleep
+        monkeypatch.setattr(pipeline.asyncio, "sleep", lambda s: real_sleep(min(s, 0.05)))
+        task = asyncio.create_task(pipeline._maintenance_loop())
+        try:
+            await _wait_until(lambda: adb.load_job(row["id"])["status"] in ("completed", "completed_with_warnings", "failed"), timeout=10.0)
+            fresh = adb.load_job(row["id"])
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            await pipeline.stop()
+        return fresh
+
+    fresh = asyncio.run(scenario())
+    assert fresh["status"] == "completed", fresh
+    assert len(sweeps) == 1, "the first pass sweeps once (its clock starts at zero); the requeue passes after it do not"
 
 
 # ------------------------------------------------------------- cancel --

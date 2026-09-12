@@ -1908,25 +1908,40 @@ async def _sweep_only_loop() -> None:
         await asyncio.sleep(max(60.0, settings.artifact_maintenance_interval_s))
 
 
+#: How often lapsed leases are put back in the queue. One indexed query;
+#: the cost is nothing, the latency is what a person waits after a deploy.
+REQUEUE_INTERVAL_S = 30.0
+
+
 async def _maintenance_loop() -> None:
+    """Two cadences. LAPSED LEASES every REQUEUE_INTERVAL_S: a row left
+    'running' by a process that died comes back to the queue within the
+    lease TTL plus half a minute. Until 2026-09-12 this ran once at startup
+    and then every ARTIFACT_MAINTENANCE_INTERVAL_S (30 minutes): the
+    restart test restarted the orchestrator mid-compose, the startup pass
+    ran BEFORE the dead process's 90 s lease had expired, and the job then
+    sat 'running' for the 15 minutes the test waited — a person would have
+    waited up to 30. THE SWEEP of abandoned working directories keeps the
+    long interval; it walks the reports volume."""
     await asyncio.sleep(5.0)
+    next_sweep = time.monotonic()
     while True:
         try:
-            # A row left 'running' by a process that died (or a runner that
-            # failed before it could write) comes back to the queue here,
-            # every pass — not only at the next restart.
             lapsed = await core_db.run_in_thread(db.requeue_lapsed)
             if lapsed:
                 log.warning("artifacts: requeued %d job(s) whose lease had lapsed", lapsed)
-            await drain_queue()
-            removed = await sweep()
-            if removed:
-                log.info("artifacts: swept %d abandoned working directory(ies)", removed)
+                await drain_queue()
+            if time.monotonic() >= next_sweep:
+                await drain_queue()
+                removed = await sweep()
+                if removed:
+                    log.info("artifacts: swept %d abandoned working directory(ies)", removed)
+                next_sweep = time.monotonic() + max(60.0, settings.artifact_maintenance_interval_s)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001
             log.warning("artifact maintenance pass failed", exc_info=True)
-        await asyncio.sleep(max(60.0, settings.artifact_maintenance_interval_s))
+        await asyncio.sleep(REQUEUE_INTERVAL_S)
 
 
 __all__ = [
