@@ -1446,14 +1446,20 @@ def test_the_sweep_ages_a_queued_job_by_its_last_change_and_never_fails_one_a_ru
     no only_from, so it landed on a RUNNING row too: the run then found
     its row failed, publish_version answered 'cancelled', and the version
     sat on disk with nothing pointing at it."""
-    gate = asyncio.Event()
-    knob = {"fail": True}
+    # One gate per job, keyed by the work dir the stub is handed: the retry's
+    # render must be HELD while the busy job's is released, or the retry
+    # finishes inside a poll interval and step (b) never sees it running
+    # (CI run #129 on 2026-09-12 timed out exactly there; one shared gate
+    # released both).
+    gates = {"busy": asyncio.Event(), "old": asyncio.Event()}
+    knob = {"fail": True, "old_work": ""}
 
-    async def render(*args, **kw):
+    async def render(work_dir, *args, **kw):
         if knob["fail"]:
             raise pipeline.RenderFailed("renderer_failure", "boom")
-        await gate.wait()
-        return await _fake_render(*args, **kw)
+        mine = "old" if os.path.realpath(work_dir) == os.path.realpath(knob["old_work"]) else "busy"
+        await gates[mine].wait()
+        return await _fake_render(work_dir, *args, **kw)
 
     _install_render(monkeypatch, render)
     pipeline.set_composer(_composer())
@@ -1466,6 +1472,7 @@ def test_the_sweep_ages_a_queued_job_by_its_last_change_and_never_fails_one_a_ru
     other = int(db.create_user("artifact-slot-holder", "hash"))
     busy = _accept(other, generation_id="gen-busy")
     work = store.version_workdir(owner, old["artifact_id"], 1)
+    knob["old_work"] = work
 
     async def scenario():
         assert await pipeline.ensure_running(busy["id"])
@@ -1482,18 +1489,18 @@ def test_the_sweep_ages_a_queued_job_by_its_last_change_and_never_fails_one_a_ru
             con.execute("UPDATE artifact_jobs SET updated_at = now() - interval '25 hours' WHERE id = %s", (old["id"],))
         assert await pipeline.sweep() == 0
         assert adb.load_job(old["id"])["status"] == "queued" and os.path.isdir(work)
-        # (b) The row is RUNNING (the slot is free, the retry is in its render): same.
-        gate.set()
+        # (b) The row is RUNNING (the slot is free, the retry is in its render,
+        # held on its own gate): same.
+        gates["busy"].set()
         assert (await pipeline.wait_for(busy["id"]))["status"] == "completed"
         await _wait_until(lambda: adb.load_job(old["id"])["stage"] == "render" and adb.load_job(old["id"])["status"] == "running")
-        gate.clear()
         with db.connection() as con:
             con.execute("UPDATE artifact_jobs SET updated_at = now() - interval '25 hours' WHERE id = %s", (old["id"],))
         assert await pipeline.sweep() == 0
         assert adb.load_job(old["id"])["status"] == "running"
         # The write the sweep makes never lands on a row that is not queued.
         assert adb.set_job_status(old["id"], "failed", error="never built", failure_category="dependency_unavailable", completed=True, only_from=("queued",)) is False
-        gate.set()
+        gates["old"].set()
         return await pipeline.wait_for(old["id"])
 
     final = asyncio.run(scenario())
