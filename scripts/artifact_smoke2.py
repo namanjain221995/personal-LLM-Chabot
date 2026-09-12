@@ -211,20 +211,20 @@ def scenario_c(client, base, effort, t0, check, *, restart: bool = False):
         def _restart_when_composing():
             # Wait until the job is running, then restart the container. The
             # stream this thread's caller holds will break; the job must not.
-            time.sleep(25)
+            time.sleep(float(os.environ.get("SMOKE2_RESTART_AFTER_S", "7")))
             print(f"[{base_smoke._clock(t0)}] RESTARTING techsara-e2e-orchestrator mid-job", flush=True)
             subprocess.run(["docker", "restart", "techsara-e2e-orchestrator"], check=False, capture_output=True)
         stopper = threading.Thread(target=_restart_when_composing, daemon=True)
         stopper.start()
     try:
-        turn, refs = _turn(client, base, conv, [], prompt, effort, t0, check, expect_artifact=not restart)
-    except (httpx.HTTPError, SystemExit) as exc:
+        turn, refs = _turn(client, base, conv, [], prompt, effort, t0, check, expect_artifact=True)
+    except (httpx.HTTPError, SystemExit, json.JSONDecodeError) as exc:
         if not restart:
             raise
         print(f"[{base_smoke._clock(t0)}] the stream broke as expected ({type(exc).__name__}); waiting for the job to finish after the restart", flush=True)
         turn, refs = {"answer": ""}, []
-    if restart:
-        # Wait for /health, then find the version through the listing and poll.
+    if restart and not refs:
+        # The stream broke: wait for /health, then find the version through the listing and poll.
         for _ in range(120):
             try:
                 if client.get(f"{base}/health", timeout=15).status_code == 200:
