@@ -132,7 +132,8 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(values["CLUSTER_NCCL_DEBUG"], "INFO")
         self.assertEqual(values["CLUSTER_NCCL_SOCKET_IFNAME"], "enP2p1s0f1np1")
         self.assertEqual(values["CLUSTER_NCCL_IB_HCA"], "rocep1s0f1")
-        self.assertEqual(values["CLUSTER_API_BIND_ADDRESS"], "172.17.0.1")
+        self.assertEqual(values["CLUSTER_API_BIND_ADDRESS"], "0.0.0.0")
+        self.assertEqual(values["CLUSTER_BRIDGE_GATEWAY"], "172.17.0.1")
         # Speculative decoding is opt-in since 2026-09-11 (the GDN spec-decode
         # fault, docs/ISSUE/gdn-spec-decode-fault-report.md): absent key, no flag.
         self.assertNotIn("--speculative-config", values["CLUSTER_ENGINE_ARGS"])
@@ -145,7 +146,7 @@ class ValidationTests(unittest.TestCase):
                 "CLUSTER_WORKER_MGMT_IP",
                 "CLUSTER_MASTER_PORT", "CLUSTER_TENSOR_PARALLEL_SIZE", "CLUSTER_PIPELINE_PARALLEL_SIZE",
                 "CLUSTER_GPU_MEMORY_UTILIZATION", "CLUSTER_KV_CACHE_MEMORY_GIB", "CLUSTER_NCCL_DEBUG", "CLUSTER_NCCL_SOCKET_IFNAME",
-                "CLUSTER_NCCL_IB_HCA", "CLUSTER_API_BIND_ADDRESS", "CLUSTER_ENGINE_ARGS",
+                "CLUSTER_NCCL_IB_HCA", "CLUSTER_API_BIND_ADDRESS", "CLUSTER_BRIDGE_GATEWAY", "CLUSTER_ENGINE_ARGS",
                 "CLUSTER_GDN_PREFILL_BACKEND", "CLUSTER_ENGINE_ENV", "CLUSTER_SENTINEL_AUTONOMOUS",
                 "VLLM_HEALTHCHECK_KILL_AFTER", "VLLM_HEALTHCHECK_MIN_AGE_S",
             },
@@ -414,33 +415,37 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(values["CLUSTER_NCCL_IB_HCA"], "")
         self.assertEqual(values["CLUSTER_NCCL_SOCKET_IFNAME"], "enP2p1s0f1np1")
 
-    def test_the_head_never_binds_every_interface_whatever_the_publish_opt_in_says(self) -> None:
-        """Audit F050 (2026-09-13). This test used to be
-        ``test_api_bind_address_follows_the_publish_opt_in`` and pinned
-        ``PUBLISH_MODEL_PORTS=true`` -> ``0.0.0.0``, a gateway-less host ->
-        ``0.0.0.0``, and "no bridge probe when publishing". That was the
-        insecure behaviour itself: the head has no --api-key, and the audit
-        measured ``GET /v1/models`` answering 200 unauthenticated on the office
-        LAN, the tailnet and both RoCE rails because of exactly this branch. The
-        secure contract: the bridge gateway either way, loopback when the
-        gateway cannot be read (fail closed), and 0.0.0.0 never."""
-        self.assertEqual(resolve(dual(), publish_model_ports=True)["CLUSTER_API_BIND_ADDRESS"], "172.17.0.1")
-        self.assertEqual(resolve(dual(), publish_model_ports=False)["CLUSTER_API_BIND_ADDRESS"], "172.17.0.1")
-        unknown = fake_detectors(gateway=None)
+    def test_the_head_api_bind_covers_the_rail_address_the_worker_healthcheck_dials_whatever_the_publish_opt_in_says(self) -> None:
+        """2026-09-13, owner option A. 229031c pinned the bridge gateway here
+        (and loopback without one). The worker's vllm-worker healthcheck curls
+        http://CLUSTER_HEAD_IP:8000/health and kill -9s its rank after 8
+        misses, so a head that does not answer on CLUSTER_HEAD_IP takes the
+        TP=2 engine down on its next recreate. vLLM takes one --host and the
+        other callers sit on the bridge and on loopback, so the bind is the
+        wildcard production runs; the host packet filter closes the LAN."""
         for publish in (True, False):
-            with self.subTest(publish_model_ports=publish):
-                bind = resolve(dual(), publish_model_ports=publish, detectors=unknown)["CLUSTER_API_BIND_ADDRESS"]
-                self.assertEqual(bind, "127.0.0.1")
-                self.assertNotEqual(bind, "0.0.0.0")
-        # Publishing no longer skips the bridge probe: the bind comes from it.
+            for gateway in ("172.17.0.1", None):
+                with self.subTest(publish_model_ports=publish, gateway=gateway):
+                    values = resolve(dual(), publish_model_ports=publish, detectors=fake_detectors(gateway=gateway))
+                    self.assertIn(values["CLUSTER_API_BIND_ADDRESS"], {"0.0.0.0", values["CLUSTER_HEAD_IP"]})
+                    self.assertEqual(values["CLUSTER_API_BIND_ADDRESS"], "0.0.0.0")
+
+    def test_the_bridge_gateway_is_its_own_key_and_never_the_head_bind(self) -> None:
+        """The controller's bind and URL read CLUSTER_BRIDGE_GATEWAY. Derived
+        from the head's bind they rendered "127.0.0.1,0.0.0.0", a wildcard
+        9838. Unreadable gateway: empty, which compose turns into loopback."""
+        self.assertEqual(resolve(dual())["CLUSTER_BRIDGE_GATEWAY"], "172.17.0.1")
+        self.assertEqual(resolve(dual(), detectors=fake_detectors(gateway=None))["CLUSTER_BRIDGE_GATEWAY"], "")
         probed: list[str] = []
         detectors = ClusterDetectors(
             ifname_for_ip=fake_detectors().ifname_for_ip,
             hcas_for_ifnames=fake_detectors().hcas_for_ifnames,
-            docker_bridge_gateway=lambda: probed.append("bridge") or "172.17.0.1",
+            docker_bridge_gateway=lambda: probed.append("bridge") or "172.17.0.9",
         )
-        resolve(dual(), publish_model_ports=True, detectors=detectors)
+        values = resolve(dual(), publish_model_ports=True, detectors=detectors)
         self.assertEqual(probed, ["bridge"])
+        self.assertEqual(values["CLUSTER_BRIDGE_GATEWAY"], "172.17.0.9")
+        self.assertNotEqual(values["CLUSTER_API_BIND_ADDRESS"], values["CLUSTER_BRIDGE_GATEWAY"])
 
 
 class EngineArgumentTests(unittest.TestCase):

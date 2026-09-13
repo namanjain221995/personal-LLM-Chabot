@@ -80,16 +80,28 @@ KV_CACHE_MEMORY_GIB_RANGE = (2, 96)
 CLUSTER_KV_CACHE_DTYPE = "fp8"
 MINIMUM_MAX_NUM_BATCHED_TOKENS = 256
 DISTRIBUTED_TIMEOUT_SECONDS = 300
-#: Where the host-network head listens when the Docker bridge gateway cannot
-#: be read. Loopback, never 0.0.0.0: the engine has no --api-key, so a wildcard
-#: bind is unauthenticated inference for every host that can route here. On
-#: 2026-09-13 the developer-platform audit (F050/F042/F012/F065) measured
-#: `GET /v1/models` answering 200 with no credential on the office LAN
-#: (192.168.9.54), the tailnet (100.94.16.2) and both RoCE rails, because
-#: PUBLISH_MODEL_PORTS=true selected this constant and it was "0.0.0.0". A
-#: loopback fallback fails CLOSED -- the orchestrator cannot reach the head and
-#: says so -- instead of failing open onto every interface.
-DEFAULT_API_BIND_ADDRESS = "127.0.0.1"
+#: Where the host-network cluster head listens: EVERY interface, on purpose.
+#:
+#: 2026-09-13, owner decision (option A). Commit 229031c narrowed this to the
+#: Docker bridge gateway after the developer-platform audit (F050/F042/F012/
+#: F065) reached the unauthenticated engine on the office LAN and the tailnet.
+#: That bind would have taken the two-node engine DOWN on its next recreate:
+#: vLLM takes ONE --host, and the head's callers sit on four networks at once --
+#:   * rail A (enp1s0f1np1): the WORKER's vllm-worker healthcheck curls
+#:     http://CLUSTER_HEAD_IP:8000/health every 30 s and kill -9s its own rank
+#:     after 8 misses (120 hits/h from 10.100.184.2 in the head's access log),
+#:     and the interview-analysis tenant on the worker posts completions to
+#:     http://CLUSTER_HEAD_IP:8000/v1;
+#:   * the application bridge / docker0 (172.17.0.1 via vllm:host-gateway and
+#:     host.docker.internal): orchestrator, sync-worker, Prometheus, litellm;
+#:   * lo: the head's own healthcheck, deploy.sh's completion gate, the
+#:     cluster-*.sh scripts and the CI verify job (127.0.0.1:8000).
+#: Only 0.0.0.0 serves all of them, which is what production runs today
+#: (docker inspect: --host 0.0.0.0; ss: 0.0.0.0:8000). The LAN and tailnet
+#: exposure is closed by the host packet filter instead (scripts/host-guard.sh,
+#: operator actions OA-4/OA-6: port 8000 dropped on enP7s7 and tailscale0).
+#: Do not narrow this again without first moving every cross-node caller.
+DEFAULT_API_BIND_ADDRESS = "0.0.0.0"
 #: ``--gdn-prefill-backend`` (candidate B, docs/availability/CANDIDATE-B.md).
 #: The flag is spelled the same in the pinned build and in the candidate
 #: ``vllm/vllm-openai@sha256:819ec9c0...`` (``engine/arg_utils.py``:
@@ -805,8 +817,9 @@ def resolve_cluster_settings(
     ``detectors``.
 
     ``publish_model_ports`` is accepted and deliberately does NOT move the
-    head's bind address (audit F050, 2026-09-13): the head listens on the
-    Docker bridge gateway, or on loopback, either way.
+    head's bind address: in dual mode the head listens on every interface
+    whether or not the ports are published (see DEFAULT_API_BIND_ADDRESS for
+    the cross-node callers that require it, 2026-09-13).
     """
     if profile_id != CLUSTER_PROFILE_ID:
         raise TechSaraError("CLUSTER_MODE=dual is only supported on the dgx-spark profile")
@@ -877,22 +890,21 @@ def resolve_cluster_settings(
                 ifnames.append(second)
         hca = ",".join(detectors.hcas_for_ifnames(ifnames))
 
-    # The head binds the Docker bridge gateway whether or not the model ports
-    # are published. That is the address every legitimate caller already
-    # dials: the orchestrator and sync-worker resolve `vllm` to it through
-    # `extra_hosts: vllm:host-gateway`, Prometheus through
-    # host.docker.internal, and the engine controller through the URL
-    # environment.engine_head_api_url derives from this value. A host on the
-    # LAN reaches it only by deliberately routing 172.17.0.0/16 through this
-    # machine (Linux accepts a packet for any local address on any NIC), so
-    # this narrows the exposure to hosts on the same segment that try; the
-    # host packet filter of audit F042 is the backstop that closes it.
-    # PUBLISH_MODEL_PORTS used to switch this to 0.0.0.0, which put the
-    # unauthenticated main engine on the LAN, the tailnet and the RoCE rails
-    # (audit F050, 2026-09-13); in dual mode the published overlay's port
-    # mapping is reset anyway, so the flag had no other effect on the head.
-    # It still publishes the auxiliary models.
-    api_bind = detectors.docker_bridge_gateway() or DEFAULT_API_BIND_ADDRESS
+    # The head's bind and the bridge gateway are two different facts, and
+    # 229031c conflated them. The head binds every interface in dual mode,
+    # published or not: before 2026-09-13 the UNPUBLISHED branch already bound
+    # the bridge gateway, which the worker's healthcheck (dialling
+    # CLUSTER_HEAD_IP on rail A) cannot reach either, so that branch was the
+    # same latent outage. See DEFAULT_API_BIND_ADDRESS for every caller.
+    api_bind = DEFAULT_API_BIND_ADDRESS
+    # The gateway is still what the engine controller's own /state and
+    # /metrics must add to loopback (the orchestrator polls vllm:9838 through
+    # host-gateway, Prometheus scrapes host.docker.internal:9838), and the
+    # address it dials the head on. Its own key, so compose never derives the
+    # controller's bind from the head's: "127.0.0.1,0.0.0.0" would collapse to
+    # a wildcard 9838 (live since 02:54:50Z on 127.0.0.1 + 172.17.0.1).
+    # Empty when unreadable; compose falls back to loopback, never wider.
+    bridge_gateway = detectors.docker_bridge_gateway() or ""
 
     engine_args = build_engine_arguments(
         context=context,
@@ -924,6 +936,7 @@ def resolve_cluster_settings(
         "CLUSTER_NCCL_SOCKET_IFNAME": socket_ifname,
         "CLUSTER_NCCL_IB_HCA": hca,
         "CLUSTER_API_BIND_ADDRESS": api_bind,
+        "CLUSTER_BRIDGE_GATEWAY": bridge_gateway,
         "CLUSTER_ENGINE_ARGS": engine_args,
         # Candidate-B knobs, recorded so scripts/cluster-sync.sh ships the
         # same values and cluster-status.sh can print what both ranks run.

@@ -115,28 +115,37 @@ run_on() { # run_on <node> — script on stdin
   fi
 }
 
-# The address the engine binds. On the worker: CLUSTER_WORKER_IP, the RoCE
-# rail-A address — never 0.0.0.0, and no longer the management LAN.
+# The address the engine binds. On the worker: its MANAGEMENT address (the
+# enP7s7 address, 192.168.9.68 today), read over ssh -- never 0.0.0.0, and
+# never a 10.100.x RoCE address.
 #
-# WHY THE RAIL (audit F051, 2026-09-13). This used to read the worker's enP7s7
-# address over ssh, on the reasoning that the rails belong to the main model's
-# tensor-parallel traffic. The audit measured what that bought:
-# `GET http://192.168.9.68:30007/health` answered 200 from the office LAN, and
-# the server has no authentication, so anyone there could upload audio and
-# burn the worker GPU the TP=2 pair shares. The rail is a point-to-point link
-# between the two Sparks: the head and its containers reach the worker there,
-# nothing on the LAN does, and a few dictated clips are noise on it. The
-# worker sentinel already binds the same address (SENTINEL_BIND in
-# compose/compose.cluster-worker.yaml). The old ssh read also had a quieter
-# fault: when it failed it printed NOTHING and the engine was started with an
-# empty WHISPER_BIND. Now a missing or wildcard address stops here.
+# WHY NOT THE RAIL (owner decision, option A, 2026-09-13). Commit 229031c
+# moved this bind to CLUSTER_WORKER_IP after the developer-platform audit
+# (F051) reached the unauthenticated server from the office LAN. Every
+# consumer dials the management address: the running orchestrator and the e2e
+# orchestrator carry ASR_BASE_URL/ASR_BASE_URLS=http://192.168.9.68:30007/v1
+# (this script does not recreate them), and scripts/asr_language_probe.py
+# defaults to it. Worse, record_endpoints MERGES, so a rail bind would have
+# left the dead 192.168.9.68 entry FIRST in ASR_BASE_URLS and dictation
+# round-robining onto a refused address even after an orchestrator recreate.
+# A rail bind is not a boundary either (weak-host model: a LAN host routing
+# 10.100.184.2 via the worker reaches it on enP7s7). So the engine stays where
+# production runs it, and the LAN/tailnet exposure is closed by the host
+# packet filter (scripts/host-guard.sh, operator actions OA-4/OA-6: 30007
+# accepted on enP7s7 from the head 192.168.9.54 only, dropped on tailscale0).
+# Do not rebind it without first moving every consumer above.
+#
+# The old ssh read printed NOTHING when it failed, and the engine was started
+# with an empty WHISPER_BIND; 229031c made that stop here, and so does this.
 whisper_bind_address() {
+  local address
   if [ "$1" = worker ] && is_dual_mode; then
-    case "${CLUSTER_WORKER_IP:-}" in
-      "") die "CLUSTER_WORKER_IP is not set in .env; the worker's speech engine binds that RoCE rail address and nothing wider" ;;
-      0.0.0.0|::|"[::]") die "CLUSTER_WORKER_IP is '$CLUSTER_WORKER_IP'; it must be the worker's RoCE rail address, never a wildcard (audit F051)" ;;
+    address="$(ssh_worker "ip -4 -br addr show ${WHISPER_MANAGEMENT_IFNAME:-enP7s7} 2>/dev/null | awk '{print \$3}' | cut -d/ -f1" </dev/null)" || address=""
+    case "$address" in
+      "") die "could not read the worker's ${WHISPER_MANAGEMENT_IFNAME:-enP7s7} address over ssh ($CLUSTER_WORKER_SSH); set WHISPER_MANAGEMENT_IFNAME if its management interface is named differently" ;;
+      0.0.0.0|::|"[::]") die "the worker's ${WHISPER_MANAGEMENT_IFNAME:-enP7s7} address read back as '$address'; the speech engine never binds a wildcard" ;;
     esac
-    printf '%s' "$CLUSTER_WORKER_IP"
+    printf '%s' "$address"
   else
     # The head's engine is reached by the orchestrator over the docker bridge,
     # so it binds the gateway address rather than loopback, which a container

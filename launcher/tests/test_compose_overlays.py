@@ -644,11 +644,11 @@ class ComposeOverlayValidationTests(unittest.TestCase):
         services = rendered["services"]
         env = services["engine-controller"]["environment"]
         self.assertEqual(env["SENTINEL_URL"], "http://192.168.100.2:9839")
-        # Audit F050 (2026-09-13): this was "http://127.0.0.1:8000", which is
-        # only where a head bound to 0.0.0.0 answers. That wildcard put the
-        # unauthenticated engine on the LAN, the tailnet and the rails; the
-        # head now binds the bridge gateway even with PUBLISH_MODEL_PORTS=true,
-        # and the controller must dial it there (loopback would see nothing).
+        # 2026-09-13 (owner option A): the head binds 0.0.0.0 so the worker's
+        # rail-A healthcheck reaches it, and the controller dials it through
+        # CLUSTER_BRIDGE_GATEWAY -- the serving path the orchestrator uses, and
+        # the exact value the running controller carries, so regenerating the
+        # env recreates nothing.
         self.assertEqual(env["HEAD_API_URL"], "http://172.17.0.1:8000")
         self.assertEqual(env["ROUTER_HEALTH_URL"], "http://127.0.0.1:8002/health")
         self.assertEqual(env["HEAD_GPU_EXPORTER_URL"], "http://127.0.0.1:9835/metrics")
@@ -666,8 +666,10 @@ class ComposeOverlayValidationTests(unittest.TestCase):
         self.assertEqual(test.count("kill -9"), 1)
 
     def test_unpublished_dual_mode_points_the_controller_at_the_bridge_gateway(self) -> None:
-        """PUBLISH_MODEL_PORTS=false (the .env.example default): the head binds
-        the Docker bridge gateway, and the controller must follow it there."""
+        """PUBLISH_MODEL_PORTS=false (the .env.example default): the head still
+        binds every interface -- the worker's healthcheck dials CLUSTER_HEAD_IP,
+        which a bridge-gateway bind never covered (2026-09-13, owner option A)
+        -- and the controller dials it through the bridge gateway."""
         detectors = ClusterDetectors(
             ifname_for_ip=lambda ip: {"192.168.100.1": "enP2p1s0f1np1"}.get(ip),
             hcas_for_ifnames=lambda names: ["rocep1s0f1" for name in names if name == "enP2p1s0f1np1"],
@@ -690,13 +692,14 @@ class ComposeOverlayValidationTests(unittest.TestCase):
         services = rendered["services"]
         env = services["engine-controller"]["environment"]
         argv = list(services["vllm"]["command"])
-        self.assertEqual(argv[argv.index("--host") + 1], "172.17.0.1")
+        self.assertEqual(argv[argv.index("--host") + 1], "0.0.0.0")
         self.assertEqual(env["HEAD_API_URL"], "http://172.17.0.1:8000")
         self.assertEqual(env["ROUTER_HEALTH_URL"], "", "an unpublished router is not reachable from the host network")
         self.assertEqual(env["WORKER_GPU_EXPORTER_URL"], "http://192.168.9.68:9835/metrics")
         self.assertIn('-ge "12"', services["vllm"]["healthcheck"]["test"][1])
-        # And a generated.env from an OLDER launcher (no generated head URL)
-        # still resolves to the bind address rather than to loopback.
+        # The controller's URL never came from TECHSARA_ENGINE_HEAD_API_URL in
+        # dual mode (the launcher now generates the loopback URL of a 0.0.0.0
+        # head there): dropping it changes nothing.
         with (
             patch.object(environment, "CLUSTER_DETECTORS", detectors),
             patch.object(environment, "CLUSTER_DISCOVERY", fake_discovery()),
@@ -1070,7 +1073,7 @@ class ComposeOverlayValidationTests(unittest.TestCase):
             "--master-addr 192.168.100.1",
             "--master-port 29501",
             "--distributed-executor-backend mp",
-            "--host 172.17.0.1",
+            "--host 0.0.0.0",
             "--port 8000",
             "--gpu-memory-utilization 0.30",
             "--quantization modelopt",
@@ -1104,18 +1107,17 @@ class ComposeOverlayValidationTests(unittest.TestCase):
             self.assertFalse(rendered["services"][service].get("ports"))
 
         # With the publish opt-in the head listens on every interface at the
-        # configured port; the cluster overlay still strips the port mapping
-        # the published overlay adds, because a host-mode container has none.
+        # configured port, exactly as without it; the cluster overlay still
+        # strips the port mapping the published overlay adds, because a
+        # host-mode container has none.
         published_vllm = published["services"]["vllm"]
         self.assertEqual(published_vllm.get("network_mode"), "host")
         self.assertFalse(published_vllm.get("ports"))
-        # Audit F050 (2026-09-13): this was "--host 0.0.0.0 --port 18000".
-        # PUBLISH_MODEL_PORTS used to put the unauthenticated head on every
-        # host interface (reached from the LAN, the tailnet and both rails).
-        # The opt-in still moves the port; it no longer moves the bind.
+        # 229031c (2026-09-13) pinned "--host 172.17.0.1" here, a bind the
+        # worker's rail-A healthcheck cannot reach; the owner kept production's
+        # 0.0.0.0 (option A) and the host packet filter closes the LAN.
         published_command = " ".join(published_vllm["command"])
-        self.assertIn("--host 172.17.0.1 --port 18000", published_command)
-        self.assertNotIn("--host 0.0.0.0", published_command)
+        self.assertIn("--host 0.0.0.0 --port 18000", published_command)
         self.assertEqual(
             published["services"]["orchestrator"]["environment"]["OPENAI_BASE_URL"],
             "http://vllm:18000/v1",

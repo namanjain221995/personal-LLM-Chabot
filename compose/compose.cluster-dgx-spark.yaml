@@ -18,13 +18,19 @@
 # and to see the ConnectX-7 netdevs for RoCE v2 GIDs. A bridged container has
 # neither. Consequences, all handled here:
 #   * the OpenAI API listens on the host at CLUSTER_API_BIND_ADDRESS:VLLM_PORT,
-#     which the launcher sets to the Docker bridge gateway (loopback when it
-#     cannot read one) WHETHER OR NOT PUBLISH_MODEL_PORTS is set. It was
-#     0.0.0.0 when published until 2026-09-13, and the developer-platform
-#     audit (F050) measured the unauthenticated engine answering on the office
-#     LAN, the tailnet and both RoCE rails. A 0.0.0.0 in an older
-#     generated.env is rewritten by `./techsara redetect`; the running head
-#     keeps its old --host until it is recreated;
+#     which the launcher sets to 0.0.0.0 in dual mode, published or not. It
+#     MUST cover every network a caller dials from, and --host takes one
+#     address: the WORKER's vllm-worker healthcheck curls
+#     http://CLUSTER_HEAD_IP:8000/health over rail A and kill -9s its own rank
+#     after 8 misses, the interview-analysis tenant on the worker posts to
+#     CLUSTER_HEAD_IP:8000/v1, the orchestrator/sync-worker/Prometheus dial
+#     the bridge gateway, and the scripts and CI dial 127.0.0.1. Commit
+#     229031c (2026-09-13) narrowed it to the bridge gateway, which would have
+#     taken the two-node engine down on its next recreate; the owner chose
+#     option A: keep the bind production runs, and close the office-LAN and
+#     tailnet exposure (audit F050/F042) with the host packet filter
+#     (scripts/host-guard.sh, operator actions OA-4/OA-6). Do not narrow it
+#     without first moving those cross-node callers;
 #   * `networks`, `expose` and `ports` inherited from the base overlays are
 #     reset (host-mode containers cannot carry them);
 #   * orchestrator and sync-worker resolve the service name `vllm` to the host
@@ -140,28 +146,37 @@ services:
       start_period: 30m
 
   # Dual mode: the head is host-network on CLUSTER_API_BIND_ADDRESS:VLLM_PORT
-  # (the Docker bridge gateway, reachable from the host network; the
-  # launcher-generated URL says which address), and the worker sentinel
-  # (compose.cluster-worker.yaml) listens on
-  # the worker's RoCE rail-A address, which only this host can reach. The
-  # sentinel token comes from .runtime/controller.env (base overlay, env_file):
-  # scripts/cluster-sync.sh ships that same value in the worker's env and
-  # checks the two agree without printing either.
+  # (every interface; see the note at the top of this file), and the worker
+  # sentinel (compose.cluster-worker.yaml) listens on the worker's RoCE rail-A
+  # address, which only this host can reach. The sentinel token comes from
+  # .runtime/controller.env (base overlay, env_file): scripts/cluster-sync.sh
+  # ships that same value in the worker's env and checks the two agree
+  # without printing either.
   #
   # The controller's own /state and /metrics listen on loopback (the
   # healthcheck, scripts/cluster-status.sh, and POST /recover, which is
-  # loopback-only) AND on the same bridge gateway as the head: the
-  # orchestrator polls http://vllm:9838/state through `vllm:host-gateway`,
-  # and Prometheus scrapes host.docker.internal:9838. It listened on 0.0.0.0
-  # until 2026-09-13, which published the engine's state, the recovery
-  # budget and the incident timeline to the office LAN (developer-platform
-  # audit, alongside F050). An older generated.env still carrying
-  # CLUSTER_API_BIND_ADDRESS=0.0.0.0 renders "127.0.0.1,0.0.0.0", which the
-  # controller collapses to 0.0.0.0 rather than failing to bind twice.
+  # loopback-only) AND on the Docker bridge gateway: the orchestrator polls
+  # http://vllm:9838/state through `vllm:host-gateway`, and Prometheus scrapes
+  # host.docker.internal:9838. It listened on 0.0.0.0 until 2026-09-13, which
+  # published the engine's state, the recovery budget and the incident
+  # timeline to the office LAN (developer-platform audit, beside F050); no
+  # caller is off-host, so this narrow bind is kept (live since the 02:54:50Z
+  # recreate, every consumer connected).
+  #
+  # Both values below read CLUSTER_BRIDGE_GATEWAY, the launcher's own key, and
+  # NOT CLUSTER_API_BIND_ADDRESS. 229031c derived them from the head's bind;
+  # with the head back on 0.0.0.0 that rendered "127.0.0.1,0.0.0.0", which
+  # the controller collapses to a wildcard 9838 -- silently re-widening it on
+  # the next controller recreate. HEAD_API_URL dials the head through the
+  # same gateway the orchestrator's chat traffic uses, so the canary follows
+  # the serving path, and it renders exactly what the running controller
+  # carries (http://172.17.0.1:8000), so regenerating the env recreates
+  # nothing. An unreadable gateway renders loopback, never a wildcard.
+  # ENGINE_HEAD_API_URL / ENGINE_CONTROLLER_BIND in .env still override.
   engine-controller:
     environment:
-      HEAD_API_URL: ${ENGINE_HEAD_API_URL:-${TECHSARA_ENGINE_HEAD_API_URL:-http://${CLUSTER_API_BIND_ADDRESS:-127.0.0.1}:${VLLM_PORT:-8000}}}
-      CONTROLLER_BIND: ${ENGINE_CONTROLLER_BIND:-127.0.0.1,${CLUSTER_API_BIND_ADDRESS:-127.0.0.1}}
+      HEAD_API_URL: ${ENGINE_HEAD_API_URL:-http://${CLUSTER_BRIDGE_GATEWAY:-127.0.0.1}:${VLLM_PORT:-8000}}
+      CONTROLLER_BIND: ${ENGINE_CONTROLLER_BIND:-127.0.0.1,${CLUSTER_BRIDGE_GATEWAY:-127.0.0.1}}
       SENTINEL_URL: http://${CLUSTER_WORKER_IP:?CLUSTER_WORKER_IP must be generated}:9839
 
   orchestrator:
