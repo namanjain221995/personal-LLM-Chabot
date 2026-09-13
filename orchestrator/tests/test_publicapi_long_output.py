@@ -133,10 +133,14 @@ def test_a_sidecar_wall_clock_has_its_own_floor_and_rate():
     assert planning.wall_clock_for(router, 24_576) == pytest.approx(60 + 24_576 / 20)
 
 
-def test_a_long_footprint_takes_the_one_at_a_time_gate_and_a_normal_one_takes_none():
+def test_an_answer_planned_above_800k_takes_the_one_at_a_time_gate_and_a_normal_one_takes_none():
+    # Integration 2026-09-13: by the PLANNED OUTPUT, never the prompt; above
+    # PUBLIC_API_MAIN_SOLO_OUTPUT_TOKENS (800,000) two answers are the whole KV pool.
     short = planning.plan_generation(_request(), _flagship())
-    long = planning.plan_generation(_request(max_output_tokens=200_000), _flagship())
+    extended = planning.plan_generation(_request(max_output_tokens=200_000), _flagship())
+    long = planning.plan_generation(_request(max_output_tokens=900_000), _flagship())
     assert short.gate_engine is None
+    assert extended.gate_engine == "main.extended"
     assert long.gate_engine == "main.long"
 
 
@@ -487,7 +491,7 @@ def test_with_limits_off_a_one_million_request_reserves_the_default_output_at_ad
     assert seen == [8192]
 
 
-def test_a_long_footprint_request_holds_the_main_long_gate_while_it_runs(api, platform, engine, monkeypatch):
+def test_an_answer_planned_above_800k_holds_the_main_long_gate_while_it_runs(api, platform, engine, monkeypatch):
     seen = []
     real_hold = capacity.hold
 
@@ -500,13 +504,72 @@ def test_a_long_footprint_request_holds_the_main_long_gate_while_it_runs(api, pl
 
     long = api.post(
         "/v1/responses",
-        json={"model": "techsara-35b", "input": "hi", "max_output_tokens": 500_000},
+        json={"model": "techsara-35b", "input": "hi", "max_output_tokens": 900_000},
         headers=_auth(),
     )
     short = api.post("/v1/responses", json={"model": "techsara-35b", "input": "hi"}, headers=_auth())
 
     assert long.status_code == short.status_code == 200
     assert seen == [("main.long", 0)]
+
+
+@pytest.mark.parametrize("mode", ["sync", "stream", "background"])
+def test_a_long_answer_admitted_before_its_status_line_hands_that_ticket_to_its_generation(
+    api, platform, monkeypatch, mode
+):
+    """One accounting (integration 2026-09-13), through the mounted routes: the
+    main gate admits the answer into admission's LONG_OUTPUT lane before the
+    status line — in the handler for sync and stream, inside the job for
+    background — and the producer task that calls the engine sees exactly that
+    ticket (a ContextVar, carried into the tasks Starlette and the generation
+    create) as /v1 work; the ticket is released when the request ends."""
+    from app import admission
+
+    monkeypatch.setenv("ADMISSION_KV_METRICS_URL", "off")
+    tickets: List[Any] = []
+    seen: List[tuple] = []
+    real_preadmit = admission.preadmit
+
+    async def spy(*args, **kwargs):
+        ticket = await real_preadmit(*args, **kwargs)
+        tickets.append(ticket)
+        return ticket
+
+    def fake(messages, **kwargs):
+        async def run():
+            pre = admission._preadmitted.get()
+            seen.append((pre is not None and pre is tickets[-1], getattr(pre, "lane", None),
+                         admission.current_origin()))
+            yield ("token", "ok")
+
+        return run()
+
+    monkeypatch.setattr(admission, "preadmit", spy)
+    monkeypatch.setattr(llm, "stream_chat_events", fake)
+    monkeypatch.setattr(llm, "reset_usage", lambda: None)
+    monkeypatch.setattr(llm, "get_usage", lambda: None)
+
+    body: Dict[str, Any] = {"model": "techsara-35b", "input": "Write a long essay.", "max_output_tokens": 100_000}
+    if mode == "stream":
+        body["stream"] = True
+    if mode == "background":
+        body["background"] = True
+    response = api.post("/v1/responses", json=body, headers=_auth())
+    assert response.status_code == (202 if mode == "background" else 200), response.text
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and not (tickets and tickets[0].released and seen):
+        time.sleep(0.05)
+    if mode == "background":
+        rid = response.json()["id"]
+        while time.monotonic() < deadline:
+            if api.get(f"/v1/responses/{rid}", headers=_auth()).json()["status"] == "completed":
+                break
+            time.sleep(0.05)
+
+    assert len(tickets) == 1 and tickets[0] is not None
+    assert tickets[0].lane == admission.LONG_OUTPUT and tickets[0].origin == admission.ORIGIN_V1
+    assert seen == [(True, admission.LONG_OUTPUT, admission.ORIGIN_V1)]
+    assert tickets[0].released
 
 
 def test_a_background_job_waits_queued_for_the_long_gate_and_a_cancel_there_never_asks_the_model(
@@ -518,7 +581,7 @@ def test_a_background_job_waits_queued_for_the_long_gate_and_a_cancel_there_neve
     with api.portal.wrap_async_context_manager(capacity.hold("main.long", wait_s=1)):
         created = api.post(
             "/v1/responses",
-            json={"model": "techsara-35b", "input": "hi", "background": True, "max_output_tokens": 500_000},
+            json={"model": "techsara-35b", "input": "hi", "background": True, "max_output_tokens": 900_000},
             headers=_auth(),
         ).json()
         time.sleep(0.3)
@@ -543,7 +606,7 @@ def test_a_background_job_that_never_gets_capacity_fails_retry_safe(api, platfor
     with api.portal.wrap_async_context_manager(capacity.hold("main.long", wait_s=1)):
         created = api.post(
             "/v1/responses",
-            json={"model": "techsara-35b", "input": "hi", "background": True, "max_output_tokens": 500_000},
+            json={"model": "techsara-35b", "input": "hi", "background": True, "max_output_tokens": 900_000},
             headers=_auth(),
         ).json()
         deadline = time.monotonic() + 10

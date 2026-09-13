@@ -75,9 +75,11 @@ class GenerationPlan:
     wall_clock_s: float
     temperature: float
     clamped: bool
-    #: The capacity gate this generation must hold, or None (a techsara-35b
-    #: request at or under the default output ceiling is gated by the shared
-    #: admission lanes alone, as before 2026-09-13).
+    #: The capacity gate this generation must hold, or None. techsara-35b:
+    #: decided by the PLANNED OUTPUT only (`main_gate_for`); at or under the
+    #: default output ceiling the shared admission lanes alone decide, as
+    #: before 2026-09-13 — including a long prompt, which is admission's LONG
+    #: lane on the exact count.
     gate_engine: Optional[str]
     gate_weight_tokens: int
     yield_to_chat: bool
@@ -212,12 +214,39 @@ def main_extended_output_tokens() -> int:
     )
 
 
-def main_long_footprint_tokens() -> int:
-    """PUBLIC_API_MAIN_LONG_FOOTPRINT_TOKENS: above this input + planned
-    output, a techsara-35b generation takes the one-at-a-time `main.long`
-    gate. Defaults to the chat app's own long-admission threshold (131,072)."""
-    default = int(getattr(settings, "admission_long_threshold_tokens", 131_072) or 131_072)
-    return max(1, registry.setting_int("PUBLIC_API_MAIN_LONG_FOOTPRINT_TOKENS", default))
+def main_solo_output_tokens() -> int:
+    """PUBLIC_API_MAIN_SOLO_OUTPUT_TOKENS (800,000): above this PLANNED output
+    a techsara-35b generation takes `main.long`, one at a time.
+
+    WHY A NUMBER OF OUTPUT TOKENS (integration 2026-09-13). The main engine's
+    KV pool holds 1,663,201 tokens (vllm:cache_config_info, 2026-09-13): two
+    answers of more than ~800,000 tokens are the whole pool, with nothing left
+    for a chat turn. admission's KV budget already never admits two at the
+    default ADMISSION_KV_RESERVE_FRACTION (0.35); this rule does not depend on
+    that setting, and it is decided before the status line, so the second one
+    is a real 503 rather than a lane wait."""
+    return max(1, registry.setting_int("PUBLIC_API_MAIN_SOLO_OUTPUT_TOKENS", 800_000))
+
+
+def main_gate_for(planned_max_output_tokens: int) -> Optional[str]:
+    """The main-engine gate for a techsara-35b answer of this planned size.
+
+    BY THE PLANNED OUTPUT, NEVER BY THE PROMPT (integration 2026-09-13). The
+    previous rule charged `main.long` on input + output with the input at its
+    UTF-8 byte bound, so any document over ~123 KB — 35-47k real tokens of
+    prose, a NORMAL prompt for admission's exact count — went through the
+    one-at-a-time gate even at the default 8,192-token output, and a single
+    1M-output job refused every such document for its whole life (rereview
+    probe P7/P9: 503 after 0.5 s). The prompt's size is admission's decision,
+    on the exact /tokenize count (app/admission.py SIZING), in its LONG lane —
+    one at a time, KV-charged, chat first — which a digit prompt cannot game
+    either: /tokenize counts every digit."""
+    planned = int(planned_max_output_tokens)
+    if planned > main_solo_output_tokens():
+        return "main.long"
+    if planned > main_extended_output_tokens():
+        return "main.extended"
+    return None
 
 
 # -------------------------------------------------------------- the plan --
@@ -328,24 +357,23 @@ def plan_generation(
         planned = requested
     for_engine = requested if model.engine == registry.ENGINE_MAIN else planned
 
-    # The GATE's size is taken at the byte bound, never the estimate
-    # (adversarial review 2026-09-13): the Qwen pre-tokenizer isolates every
-    # digit, so a 120,000-digit prompt estimated at 40,008 tokens and slipped
-    # under the long threshold with 90,000 tokens of output while really
-    # holding 210,007 tokens of KV; and on the router four digit prompts the
-    # gate charged 24,032 tokens really demanded 56,028, over the whole pool.
-    # A caller cannot push the bound below the truth. The cost — prose counted
-    # at up to 4x its real size — only ever makes PUBLIC work wait for its
-    # gate; the clamp above still uses the estimate, so no answer is shortened.
+    # The ROUTER gate's token charge is taken at the byte bound, never the
+    # estimate (adversarial review 2026-09-13): the Qwen pre-tokenizer
+    # isolates every digit, and four digit prompts the gate charged 24,032
+    # tokens really demanded 56,028, over the whole router pool. A caller
+    # cannot push the bound below the truth; the clamp above still uses the
+    # estimate, so no answer is shortened.
+    #
+    # The MAIN engine's gates are not sized by the prompt at all (see
+    # `main_gate_for`): the byte bound over-counts prose up to ~4x, and on a
+    # one-at-a-time gate that turned every ~123 KB document into a request
+    # that queued behind a 1M-output job. Admission sizes the prompt exactly.
     footprint = int(bounded) + planned
     gate: Optional[str] = None
     weight = 0
     yield_to_chat = False
     if model.engine == registry.ENGINE_MAIN:
-        if footprint > main_long_footprint_tokens():
-            gate = "main.long"
-        elif planned > main_extended_output_tokens():
-            gate = "main.extended"
+        gate = main_gate_for(planned)
     elif model.engine == registry.ENGINE_ROUTER:
         gate, weight = registry.ENGINE_ROUTER, footprint
     elif model.engine == registry.ENGINE_OCR:
@@ -434,7 +462,8 @@ __all__ = [
     "applied_max_output_tokens",
     "check_endpoint",
     "main_extended_output_tokens",
-    "main_long_footprint_tokens",
+    "main_gate_for",
+    "main_solo_output_tokens",
     "plan_generation",
     "reservation_output_tokens",
     "upper_bound_with_image_bound",

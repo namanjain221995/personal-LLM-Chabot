@@ -79,8 +79,8 @@ project — and can be submitted again.
 
 Some engines have a small public queue in front of them, because the TechSara
 chat application uses them too and keeps priority: \`techsara-8b-vision\`,
-\`techsara-ocr\`, and \`${MODEL_ID}\` for a very long generation (a prompt plus
-\`max_output_tokens\` of more than about 131,000 tokens). A background job on
+\`techsara-ocr\`, and \`${MODEL_ID}\` for a long generation (\`max_output_tokens\`
+of more than 8,192 tokens). A background job on
 one of them **waits in \`queued\` for its turn — for up to an hour** — rather
 than failing the moment the queue is full. A synchronous or streaming request
 waits only about 30 seconds before it is refused with \`503\`, which is one more

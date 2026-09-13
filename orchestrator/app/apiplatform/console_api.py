@@ -2609,6 +2609,9 @@ async def _enter_capacity_gate(plan: Any) -> Optional[contextlib.AsyncExitStack]
         log.error("the plan names capacity gate %r but publicapi.capacity is missing", engine)
         raise api_errors.model_unavailable()
     gate = contextlib.AsyncExitStack()
+    # A main gate admits the answer into admission's LONG_OUTPUT lane before
+    # the status line, as /v1 does (capacity.py); the other gates count only.
+    extra: Dict[str, Any] = {"work": plan} if str(engine).startswith("main.") else {}
     try:
         await gate.enter_async_context(
             capacity.hold(
@@ -2623,6 +2626,7 @@ async def _enter_capacity_gate(plan: Any) -> Optional[contextlib.AsyncExitStack]
                 # The OCR engine shares a GPU with a main-model rank, so its
                 # gate first waits (bounded) for chat to be idle.
                 yield_to_chat=bool(getattr(plan, "yield_to_chat", False)),
+                **extra,
             )
         )
     except BaseException:

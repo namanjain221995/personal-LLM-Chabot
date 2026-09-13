@@ -1439,15 +1439,17 @@ class Settings:
         )
         # Capacity gates (publicapi/capacity.py): one per shared engine, for
         # every caller, first come first served; a refusal is 503
-        # model_unavailable with Retry-After, never 429. `main.long` runs one
-        # at a time; `main.extended` (planned output over
-        # PUBLIC_API_MAIN_EXTENDED_OUTPUT_TOKENS) two, so long-lived public
-        # work holds at most 3 of the chat app's 10 NORMAL admission slots
-        # (adversarial review 2026-09-13: ten 130k-token answers took all 10).
-        # NOT declared here: PUBLIC_API_MAIN_LONG_FOOTPRINT_TOKENS, the input +
-        # output rule the rereview found sending ordinary documents through
-        # `main.long` (byte-bound regression); the planning fix replaces it,
-        # and its reader keeps the environment fallback until then.
+        # model_unavailable with Retry-After, never 429. The main gates are
+        # chosen from the PLANNED OUTPUT only (integration 2026-09-13; the
+        # input + output footprint at the byte bound sent ordinary documents
+        # through `main.long`): `main.long` one at a time above
+        # PUBLIC_API_MAIN_SOLO_OUTPUT_TOKENS — two such answers are the whole KV
+        # pool — and `main.extended` above PUBLIC_API_MAIN_EXTENDED_OUTPUT_TOKENS,
+        # capped by admission's LONG_OUTPUT seats and KV budget.
+        # PUBLIC_API_MAIN_EXTENDED_MAX_CONCURRENT is the gate's own count, used
+        # when admission does not take the answer into LONG_OUTPUT (a LONG
+        # prompt, or thresholds set apart) or has no front door.
+        self.public_api_main_solo_output_tokens: int = _int("PUBLIC_API_MAIN_SOLO_OUTPUT_TOKENS", 800_000)
         self.public_api_main_long_max_concurrent: int = _int("PUBLIC_API_MAIN_LONG_MAX_CONCURRENT", 1)
         # Defaults to the public default output (the public CEILING before
         # 2026-09-13), read from its own setting as the reader does.

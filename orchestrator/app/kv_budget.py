@@ -86,7 +86,7 @@ import re
 import time
 import weakref
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 from .config import settings
 
@@ -431,16 +431,20 @@ class Ledger:
     def __len__(self) -> int:
         return len(self._entries)
 
-    def since(self, at: float, kind: Optional[str] = None) -> int:
+    def since(self, at: float, kind: Optional[str] = None, *,
+              except_origin_lane: Optional[Tuple[str, str]] = None) -> int:
         """Charges admitted at or after `at` (of `kind`, or all): what a
         waiter that arrived at `at` has seen admitted past it (module
-        docstring, BACKFILL)."""
+        docstring, BACKFILL). `except_origin_lane` leaves out one (origin,
+        lane)'s charges (admission: a chat waiter under
+        ADMISSION_CHAT_LONG_BESIDE_V1_ANSWERS=proceed)."""
         return sum(e.charge for e in self._entries.values()
-                   if e.admitted_at >= at and (kind is None or e.kind == kind))
+                   if e.admitted_at >= at and (kind is None or e.kind == kind)
+                   and (except_origin_lane is None or (e.origin, e.lane) != tuple(except_origin_lane)))
 
-    def by_origin(self, origin: str, kind: Optional[str] = None) -> int:
+    def by_origin(self, origin: str, kind: Optional[str] = None, *, lane: Optional[str] = None) -> int:
         return sum(e.charge for e in self._entries.values()
-                   if e.origin == origin and (kind is None or e.kind == kind))
+                   if e.origin == origin and (kind is None or e.kind == kind) and (lane is None or e.lane == lane))
 
     def oldest_age_s(self, now: Optional[float] = None) -> float:
         if not self._entries:

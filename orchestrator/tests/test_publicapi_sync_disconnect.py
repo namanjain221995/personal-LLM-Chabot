@@ -44,6 +44,10 @@ class _HangsAfterAToken:
         self.started = threading.Event()
         self.closed = threading.Event()
         self.calls = 0
+        #: Read inside the generation, on the server's loop, before `started`:
+        #: the main.long gate count and the admission ticket this call holds.
+        self.gate_in_flight_at_start: Any = None
+        self.ticket: Any = None
 
     def __call__(self, messages, **kwargs):
         self.calls += 1
@@ -52,6 +56,10 @@ class _HangsAfterAToken:
     async def _run(self):
         try:
             yield ("token", "partial ")
+            from app import admission
+
+            self.gate_in_flight_at_start = capacity.snapshot()["main.long"]["in_flight"]
+            self.ticket = admission._preadmitted.get()
             self.started.set()
             await asyncio.sleep(3600)
             yield ("token", "never")
@@ -213,11 +221,15 @@ def test_an_abandoned_synchronous_long_request_gives_its_gate_and_slot_back_with
     _raw_post_then_reset(
         served_api,
         "/v1/responses",
-        {"model": "techsara-35b", "input": "Write a book.", "max_output_tokens": 200_000},
+        {"model": "techsara-35b", "input": "Write a book.", "max_output_tokens": 900_000},
         engine,
     )
-    assert capacity.snapshot()["main.long"]["in_flight"] == 1
+    # Read by the generation itself: asserting it from here raced the release,
+    # which can land before this line (flaky before the gates integration too).
+    assert engine.gate_in_flight_at_start == 1
+    assert engine.ticket is not None and engine.ticket.lane == "long_output"
     released = _wait(lambda: capacity.snapshot()["main.long"]["in_flight"] == 0, 10)
+    assert _wait(lambda: engine.ticket.released, 5) < 1.0
 
     assert released < 1.0
     assert engine.closed.wait(5)

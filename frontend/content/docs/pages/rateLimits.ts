@@ -66,7 +66,7 @@ engine pass through a small queue of their own:
 
 | Model | Public requests at once | A request that cannot start |
 | --- | --- | --- |
-| \`techsara-35b\` | Shared with chat in the engine's own queue; answers planned above 8,192 tokens two at a time, and very long generations (prompt plus \`max_output_tokens\` over about 131,000 tokens) one at a time — both stepping aside while a large chat document is waiting | \`503\`, \`Retry-After\` 60 s for a long generation |
+| \`techsara-35b\` | Shared with chat in the engine's own queue; answers planned above 8,192 tokens two at a time and within the engine's memory, and answers planned above 800,000 tokens one at a time — all stepping aside while a large chat document is waiting, and for up to 30 minutes after one could not start beside them | \`503\`, \`Retry-After\` 60 s for a long generation |
 | \`techsara-8b-vision\` | 4, and a bounded share of the engine's memory | \`503\`, \`Retry-After\` 5 s |
 | \`techsara-ocr\` | 2, stepping aside briefly while someone is chatting | \`503\`, \`Retry-After\` 5 s |
 | \`techsara-embed\` | 2, and a bounded share of the engine's memory | \`503\`, \`Retry-After\` 5 s |

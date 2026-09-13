@@ -713,12 +713,16 @@ and sidecar requests wait ≤ `PUBLIC_API_GATE_WAIT_S` (30 s) **before** the sta
 line; background jobs wait ≤ `PUBLIC_API_BACKGROUND_GATE_WAIT_S` (3,600 s) inside
 the job while `queued`. Chat-app paths never take a gate. Gauges
 `public_api_engine_in_flight` / `public_api_engine_waiting` by engine.
-`main.long` applies above a 131,072-token footprint (input at its byte bound +
-planned output); `main.extended` (2 at a time) to any other flagship request
-planning more than 8,192 output tokens; at or under 8,192 the shared admission
-NORMAL lanes remain the only gate. Both main gates step aside while a chat
-request is in the LONG admission lane. Router gate weights are also byte-bound.
-Changed after the adversarial review of 2026-09-13 (CONTRACT §12.3).
+`main.long` applies to flagship requests planning more than 800,000 output
+tokens (`PUBLIC_API_MAIN_SOLO_OUTPUT_TOKENS`), one at a time; `main.extended` to
+any other flagship request planning more than 8,192. Both admit the answer into
+admission's LONG_OUTPUT lane before the status line and hand the ticket and the
+planned output to the generation; at or under 8,192 the shared admission NORMAL
+lanes remain the only gate. The prompt never picks a gate. Both main gates step
+aside while a chat LONG request is before its first token. Chat documents beside
+a running public long answer follow `ADMISSION_CHAT_LONG_BESIDE_V1_ANSWERS`
+(CONTRACT §12.3). Router gate weights are byte-bound. Changed by the
+integration of 2026-09-13 (CONTRACT §12.3).
 
 A synchronous generation watches its connection
 (`streaming.run_to_completion_watching`) and is cancelled at a disconnect. A
@@ -755,8 +759,8 @@ restart-failed long job with a new key.
 
 * ~~`config.py` declares the `PUBLIC_API_*` settings of CONTRACT §12.4 (until
   then readers fall back to `os.environ` with the same parse rules).~~ Landed
-  (integration 2026-09-13), with the three webhook settings, except
-  `PUBLIC_API_MAIN_LONG_FOOTPRINT_TOKENS`; pinned by
+  (integration 2026-09-13), with the three webhook settings and
+  `PUBLIC_API_MAIN_SOLO_OUTPUT_TOKENS` (the footprint setting is gone); pinned by
   `tests/test_public_api_settings_declared.py`.
 * ~~`llm.py`: `wall_clock_s` / `wall_clock_marker` on `stream_chat_events`,
   `get_applied_max_tokens()`.~~ Landed (integration 2026-09-13).
@@ -768,9 +772,11 @@ restart-failed long job with a new key.
   mounted app refuses image and audio bodies over 1 MiB.~~ Landed (integration
   2026-09-13): `main._public_api_body_cap`; the strict xfail in
   `test_publicapi_mount.py` is a plain test now.
-* `admission.py`: `_ahead` leaves out `capacity.public_long_lived_decoding()`,
-  so a chat LONG request is not held for the whole idle wait by a decoding
-  public job (strict xfail in `test_publicapi_main_engine_priority.py`).
+* ~~`admission.py`: `_ahead` leaves out `capacity.public_long_lived_decoding()`.~~
+  Superseded (integration 2026-09-13): public long answers are admitted into
+  LONG_OUTPUT, so admission counts them once; whether a chat document may run
+  beside them is `ADMISSION_CHAT_LONG_BESIDE_V1_ANSWERS` (owner decision,
+  default `refuse`).
 * `asr.py`: `RoutedProvider.reserve(index)`, the clean seam for
   `sidecars.counted_in_dictation_routing` (which uses `_active` until then).
 * `scripts/docs_examples_run.py` needs specs for the new and re-ordered example

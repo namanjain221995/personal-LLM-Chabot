@@ -115,10 +115,24 @@ def test_a_v1_document_loop_closes_chat_normal_only_within_its_budget():
 
 
 def test_small_v1_long_answers_are_not_held_behind_chat_documents_that_cannot_fit():
-    # First build: 7 of 9 admitted, a 600 s wait behind each document.
-    run = bench.run_scenario("doomed_chat_doc_blocks_v1", bench.Config())["runs"]["with"]
+    # First build: 7 of 9 admitted, a 600 s wait behind each document. The KV
+    # arbiter's backfill is what fixed that, so it is measured with the
+    # BACK TO BACK hold off: the hold is a separate, deliberate rule.
+    run = bench.run_scenario("doomed_chat_doc_blocks_v1", bench.Config(v1_long_output_chat_hold_s=0.0))["runs"]["with"]
     assert run["admitted"]["v1_small_long"] == run["requests"]["v1_small_long"] == 9
     assert run["wait_s_by_lane"]["long_output"]["max"] == 0.0
+
+
+def test_the_back_to_back_hold_refuses_small_v1_long_answers_after_a_doomed_chat_document():
+    # The cost of ADMISSION_V1_LONG_OUTPUT_CHAT_HOLD_S at its default, pinned
+    # so a change to it is a visible decision: each refused 950K document holds
+    # new /v1 long answers, including 16K ones that could never keep it out,
+    # and here no document gets in either, because the 400K job outlives the
+    # scenario.
+    run = bench.run_scenario("doomed_chat_doc_blocks_v1", bench.Config())["runs"]["with"]
+    assert run["admitted"]["chat_long"] == 0
+    assert run["admitted"]["v1_small_long"] < run["requests"]["v1_small_long"]
+    assert run["rejected"].get("long_output/timeout", 0) > 0
 
 
 def test_chat_long_answers_pass_v1_heads_that_cannot_fit_and_the_v1_result_is_unchanged():

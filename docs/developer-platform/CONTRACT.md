@@ -648,8 +648,9 @@ and the single-terminal rule are inherited, not reimplemented.
                   wall clock, gate                                         (§8.3)
   → meter         quotas.reserve (limits only with PUBLIC_API_ENFORCE_LIMITS)
   ├─ techsara-35b
-  │    → gate 'main.long' when input (byte bound) + planned output > 131,072,
+  │    → gate 'main.long' when planned output > 800,000,
   │      else gate 'main.extended' when planned output > 8,192, else no gate
+  │      (the prompt never picks a gate; admission's LONG lane sizes it)
   │    → llm.stream_chat_events(messages, model_choice="smart", effort="fast",
   │                             temperature=…, max_tokens=…, wall_clock_s=…,
   │                             wall_clock_marker=False)
@@ -779,8 +780,8 @@ admitted only when no other public request holds that engine. Released in
 
 | gate | public concurrency | public KV budget (tokens) | weight | yields to chat | Retry-After |
 |---|---|---|---|---|---|
-| `main.long` | 1 | none | — | to a chat LONG request | 60 s |
-| `main.extended` | 2 | none | — | to a chat LONG request | 60 s |
+| `main.long` | 1, then one of admission's LONG_OUTPUT seats | admission's KV budget | — | to a chat LONG request | 60 s |
+| `main.extended` | 2 — admission's LONG_OUTPUT seats | admission's KV budget | — | to a chat LONG request | 60 s |
 | `router` | 4 | 24,576 | input at its byte bound + planned output | no | 5 s |
 | `ocr` | 2 | none | — | yes | 5 s |
 | `embed` | 2 | 8,192 | Σ min(upper bound, 4,096) per engine call | no | 5 s |
@@ -797,30 +798,49 @@ Why these numbers:
   charged 24,032 tokens really demanded 56,028 — over the whole 52,512-token
   pool. The bound over-counts prose (up to about 4×), which only ever makes
   public work wait; the output clamp still uses the estimate.
-* **`main.long`** applies to a `techsara-35b` request whose input (byte bound)
-  plus planned output exceeds `PUBLIC_API_MAIN_LONG_FOOTPRINT_TOKENS` (default
-  `ADMISSION_LONG_THRESHOLD_TOKENS`, 131,072). The KV pool holds 1.66 full
-  windows; one public long-footprint generation plus one chat full-window prompt
-  exceeds it only when both reach full size, and vLLM allocates KV lazily as
-  output grows. A cap of one makes that rare; engine-level priority scheduling is
-  the real fix (operator decision).
+* **The main gates are chosen from the planned output only** (integration
+  2026-09-13). Sizing `main.long` by input at its byte bound plus output sent
+  every ~123 KB document (35–47k real tokens) through the one-at-a-time gate,
+  and one 1M-output job refused them all. A long prompt is admission's LONG
+  lane, decided on the exact `/tokenize` count at the call.
+* **One accounting.** A main gate admits the answer into admission's
+  LONG_OUTPUT lane (`admission.preadmit`: its seats, 2, and its KV budget)
+  BEFORE the status line and hands the ticket to the generation
+  (`admission.use_preadmitted`), together with the planned output: a retry
+  inside the generation is admitted into LONG_OUTPUT again, a LONG prompt is
+  charged prompt plus output, and a pre-admitted call waits out a LONG closure
+  raised after its grant. An answer admission does not take into LONG_OUTPUT (a
+  LONG prompt, or `ADMISSION_V1_LONG_OUTPUT_THRESHOLD_TOKENS` set above
+  `PUBLIC_API_MAIN_EXTENDED_OUTPUT_TOKENS`) is capped by the gate's own count,
+  `PUBLIC_API_MAIN_EXTENDED_MAX_CONCURRENT` (2).
+* **`main.long`** applies to a `techsara-35b` request planning more than
+  `PUBLIC_API_MAIN_SOLO_OUTPUT_TOKENS` (800,000). The KV pool is 1,663,201
+  tokens: two such answers are the whole pool, so the gate runs them one at a
+  time whatever `ADMISSION_KV_RESERVE_FRACTION` is; at 800,000 and below a
+  second answer is admission's KV decision.
 * **`main.extended`** applies to every other `techsara-35b` request that plans
   more than `PUBLIC_API_MAIN_EXTENDED_OUTPUT_TOKENS` (default 8,192 — the public
   default, and the public ceiling before 2026-09-13). Measured by the review: with
   no gate below 131,072, ten public 130,000-token answers held all ten of the
   chat application's NORMAL admission slots for about 22 minutes each and a chat
-  turn was refused. Two at a time plus one `main.long` leaves chat at least 7 of
-  the 10 NORMAL slots against long-lived public work. A request at or under 8,192
-  holds a slot for at most about 115 s at 71 tok/s — what public work could
-  already do — and takes no public gate: the shared NORMAL lanes remain its gate.
-* **Both main gates step aside for a chat LONG request** (a large-document turn
-  in the admission LONG lane, `capacity.chat_long_admission_present`), for the
-  whole gate wait. That request waits for the engine to be idle for up to
-  `ADMISSION_LONG_WAIT_S` (600 s), and a multi-hour public generation that
-  starts meanwhile keeps it waiting all of it. Not solved here: a public job
-  ALREADY decoding still counts as "not idle" — the fix is in `admission._ahead`
-  (integration; `capacity.public_long_lived_decoding()` is the count to leave
-  out).
+  turn was refused; in LONG_OUTPUT they hold at most its two seats. A request at
+  or under 8,192 holds a slot for at most about 115 s at 71 tok/s and takes no
+  public gate: the shared NORMAL lanes remain its gate.
+* **Both main gates step aside for a chat LONG request still before its first
+  token** (waiting for its seat or KV, waiting for the engine to go idle, or
+  holding the lanes closed; `capacity.chat_long_admission_present`), for the
+  whole gate wait. A chat document already decoding does not hold public work.
+* **Chat documents beside a public long answer are an owner setting**
+  (`ADMISSION_CHAT_LONG_BESIDE_V1_ANSWERS`, app/admission.py). With `refuse`
+  (the default) a decoding public long answer is work in front of a chat LONG
+  request — the GDN fault rule — so while a public 1M answer runs (up to about
+  5.8 h) a chat document above 131,072 tokens waits `ADMISSION_LONG_WAIT_S`
+  (600 s) and is refused, and its KV cannot fit beside the answer's 1,008,176
+  tokens either. With `proceed` the document goes in beside public long answers
+  (a large prefill beside up to two decodes, chosen knowingly), within the
+  managed limit. Either way, after such a refusal no new public long answer is
+  admitted for `ADMISSION_V1_LONG_OUTPUT_CHAT_HOLD_S` (1,800 s) or until a chat
+  document runs, so consecutive public jobs cannot keep chat documents out.
 * **`router`**: the public budget is 47% of the 52,512-token pool, so chat keeps
   at least 27,936 tokens (about twelve concurrent freshness classifications).
 * **`ocr`**: engine `--max-num-seqs 8`; chat `read_images` batches use 4 and
@@ -861,8 +881,7 @@ measured; the OCR and whisper figures are from 2026-09-08/09.
 
 Every `PUBLIC_API_*` value below follows `config.py`'s `_int` / `_float` rules
 (blank means the default; a malformed value fails at start-up). `config.py`
-declares them since the 2026-09-13 integration (all but
-`PUBLIC_API_MAIN_LONG_FOOTPRINT_TOKENS`); readers still use
+declares them since the 2026-09-13 integration; readers still use
 `getattr(settings, <lower name>, None)` with an `os.environ` fallback parsed by
 the same rules, so a reader running beside an older `config.py` gets the same
 defaults. The webhook settings are additionally clamped at use
@@ -882,10 +901,10 @@ defaults. The webhook settings are additionally clamped at use
 | `PUBLIC_API_GEN_WALL_CLOCK_S` | 21,600 | hard wall clock for any `/v1` generation |
 | `PUBLIC_API_MAIN_PREFILL_ALLOWANCE_S` | 900 | wall-clock formula |
 | `PUBLIC_API_MAIN_MIN_DECODE_TOKENS_PER_S` | 50 | wall-clock formula |
-| `PUBLIC_API_MAIN_LONG_FOOTPRINT_TOKENS` | 131,072 | `main.long` threshold |
+| `PUBLIC_API_MAIN_SOLO_OUTPUT_TOKENS` | 800,000 | `main.long` threshold (planned output) |
 | `PUBLIC_API_MAIN_LONG_MAX_CONCURRENT` | 1 | `main.long` |
 | `PUBLIC_API_MAIN_EXTENDED_OUTPUT_TOKENS` | 8,192 | `main.extended` threshold (planned output) |
-| `PUBLIC_API_MAIN_EXTENDED_MAX_CONCURRENT` | 2 | `main.extended` |
+| `PUBLIC_API_MAIN_EXTENDED_MAX_CONCURRENT` | 2 | `main.extended` when admission does not take the answer |
 | `PUBLIC_API_GATE_WAIT_S` | 30 | gate wait before the status line |
 | `PUBLIC_API_BACKGROUND_GATE_WAIT_S` | 3,600 | gate wait inside a background job |
 | `PUBLIC_API_YIELD_TO_CHAT_MAX_WAIT_S` | 10 | yield bound |

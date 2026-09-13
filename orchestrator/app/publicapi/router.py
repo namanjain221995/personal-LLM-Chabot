@@ -1161,7 +1161,9 @@ async def _generate(
 def _capacity_gate(plan: planning.GenerationPlan) -> Any:
     """The capacity gate a synchronous or streaming generation holds, or a
     no-op when its engine needs none (NORMAL-lane techsara-35b work is gated
-    by the shared admission lanes inside `llm.stream_chat_events`)."""
+    by the shared admission lanes inside `llm.stream_chat_events`). A main
+    gate is given the plan: it admits the answer into admission's LONG_OUTPUT
+    lane before the status line (capacity.py, one accounting)."""
     if not plan.gate_engine:
         return contextlib.nullcontext()
     return capacity.hold(
@@ -1169,6 +1171,7 @@ def _capacity_gate(plan: planning.GenerationPlan) -> Any:
         weight_tokens=plan.gate_weight_tokens,
         wait_s=capacity.sync_wait_s(),
         yield_to_chat=plan.yield_to_chat,
+        work=plan,
     )
 
 

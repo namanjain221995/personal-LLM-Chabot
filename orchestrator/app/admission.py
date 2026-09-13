@@ -115,6 +115,35 @@ waiter that runs out of its bound this way is refused `timeout` with
 Retry-After 60. Chat LONG requests are not budgeted: the closure is the price
 of a person's own document.
 
+CHAT DOCUMENTS BESIDE PUBLIC LONG ANSWERS (integration review 2026-09-13).
+Once publicapi admits its long answers into LONG_OUTPUT (THE PUBLIC FRONT
+DOOR below), LONG BESIDE LONG ANSWERS applies to them: while one /v1 answer of
+up to 1,000,000 tokens decodes (up to ~5.8 h) a chat document above the LONG
+threshold waits its whole bound and is refused, and its KV cannot fit either
+(1,008,176 of the 1,081,080-token budget are committed). That trades the GDN
+fault shape against a chat outage one API key can cause, so it is ONE owner
+setting, ADMISSION_CHAT_LONG_BESIDE_V1_ANSWERS:
+
+- `refuse` (the default, the rule above unchanged): a chat LONG request is
+  refused past its bound while any long answer of this process is on the
+  engine, and it fits the long-work budget like any other charge;
+- `proceed`: when every long answer of this process is /v1, a chat LONG
+  request does not count their decodes as work in front of it (it still
+  waits for everything else, and closes the lanes for its prefill), is not
+  refused because of them, and its KV test does not count their charges
+  against the long-work budget — only the managed limit bounds it, so a
+  143K document fits beside a 1M answer and a 950K one still does not. That
+  is a large prefill beside up to two decodes: the fault shape the rule
+  above exists to avoid, chosen knowingly. /v1 LONG requests and chat's own
+  long answers keep the `refuse` rule.
+
+Either way, BACK TO BACK is bounded: when a chat LONG request is refused while
+/v1 long answers are on this process's engine, no new /v1 long answer is
+admitted for ADMISSION_V1_LONG_OUTPUT_CHAT_HOLD_S (1800 s; 0 = off) or until a
+chat LONG request is admitted, whichever is first — a person retrying the
+document gets the engine when the running answers end, instead of the next
+public job.
+
 KV BUDGET (app/kv_budget.py has the arithmetic and the 2026-09-13 numbers).
 LONG and LONG_OUTPUT requests commit a projected, block-exact charge —
 (3 + ceil(min(prompt + max_tokens, window) / 2096)) × 2096; 1,008,176 tokens
@@ -251,7 +280,7 @@ from typing import Awaitable, Callable, Deque, Dict, Iterator, List, Optional, S
 
 from . import context, continuity, engine_state, kv_budget, metrics
 from .config import settings
-from .kv_budget import _s_float, _s_int
+from .kv_budget import _s_float, _s_int, _s_str
 
 log = logging.getLogger(__name__)
 
@@ -371,10 +400,33 @@ def v1_long_closure_window_s() -> float:
     return max(0.0, _s_float("admission_v1_long_closure_window_s", "ADMISSION_V1_LONG_CLOSURE_WINDOW_S", 7200.0))
 
 
+BESIDE_REFUSE = "refuse"
+BESIDE_PROCEED = "proceed"
+
+
+def chat_long_beside_v1_answers() -> str:
+    # "refuse" (default) or "proceed" (module docstring, CHAT DOCUMENTS BESIDE
+    # PUBLIC LONG ANSWERS): the owner's choice between the GDN fault shape and
+    # chat large-document turns refused for the life of a public long answer.
+    value = (_s_str("admission_chat_long_beside_v1_answers", "ADMISSION_CHAT_LONG_BESIDE_V1_ANSWERS",
+                    BESIDE_REFUSE) or BESIDE_REFUSE).lower()
+    if value not in (BESIDE_REFUSE, BESIDE_PROCEED):
+        raise ValueError(f"ADMISSION_CHAT_LONG_BESIDE_V1_ANSWERS must be {BESIDE_REFUSE!r} or "
+                         f"{BESIDE_PROCEED!r}, not {value!r}")
+    return value
+
+
+def v1_long_output_chat_hold_s() -> float:
+    # 1800 s (module docstring, BACK TO BACK): three times a chat document's
+    # 600 s bound, so a person who retries after a refusal is still inside it.
+    return max(0.0, _s_float("admission_v1_long_output_chat_hold_s", "ADMISSION_V1_LONG_OUTPUT_CHAT_HOLD_S", 1800.0))
+
+
 # A malformed value fails at import — at boot, like config.py — not per request.
 for _check in (long_output_max_seqs, v1_long_output_threshold_tokens, chat_long_output_threshold_tokens,
                long_output_wait_s, long_output_retry_after_s, chat_weight, chat_reserved_normal_slots,
-               v1_kv_promote_s, v1_long_closure_duty, v1_long_closure_window_s):
+               v1_kv_promote_s, v1_long_closure_duty, v1_long_closure_window_s, chat_long_beside_v1_answers,
+               v1_long_output_chat_hold_s):
     _check()
 del _check
 
@@ -830,7 +882,8 @@ class _KvArbiter:
         ls = self.ls
         if w.lane == LONG_OUTPUT:
             lo = ls.long_output
-            return lo.closed or lo.active >= lo.capacity or ls.long_idle_waiting > 0
+            return (lo.closed or lo.active >= lo.capacity or ls.long_idle_waiting > 0
+                    or (w.origin == ORIGIN_V1 and ls.v1_long_output_held()))
         lg = ls.long
         if lg.active >= lg.capacity:
             return True
@@ -838,6 +891,21 @@ class _KvArbiter:
 
     def budget(self) -> int:
         return kv_budget.budget_tokens(kv_budget.cached())
+
+    def _borrows(self, w: _Waiter) -> bool:
+        """Under ADMISSION_CHAT_LONG_BESIDE_V1_ANSWERS=proceed a chat waiter's
+        long-work budget does not count /v1 long answers' charges (the managed
+        limit still does; module docstring, CHAT DOCUMENTS BESIDE PUBLIC LONG
+        ANSWERS)."""
+        return (w.origin == ORIGIN_CHAT and self.ls.long_output.active_by_origin.get(ORIGIN_CHAT, 0) == 0
+                and chat_long_beside_v1_answers() == BESIDE_PROCEED)
+
+    @staticmethod
+    def _fits_long(led: "kv_budget.Ledger", charge: int, budget: int, borrows: bool) -> bool:
+        if not borrows:
+            return led.fits(charge, budget)
+        committed = led.committed - led.by_origin(ORIGIN_V1, kv_budget.LONG_WORK, lane=LONG_OUTPUT)
+        return committed <= 0 or committed + int(charge) <= int(budget)
 
     def _promoted(self, h: _Waiter, budget: int, limit: int) -> bool:
         """A /v1 head that has waited ADMISSION_V1_KV_PROMOTE_S and that chat
@@ -868,17 +936,23 @@ class _KvArbiter:
                      + [w for w in chat if w.enqueued_at >= v1_head.enqueued_at])
         else:
             order = chat + v1
-        protected: List[Tuple[_Waiter, int, int]] = []
+        protected: List[Tuple[_Waiter, int, int, bool]] = []
         for w in order:
+            v1_answer = w.origin == ORIGIN_V1 and w.lane == LONG_OUTPUT
             if (not self._gate_blocked(w)
-                    and led.fits(w.charge, budget) and led.fits_managed(w.charge, limit)
-                    and all(since_long + w.charge + h.charge <= budget and since_all + w.charge + h.charge <= limit
-                            for h, since_long, since_all in protected)):
+                    and self._fits_long(led, w.charge, budget, self._borrows(w))
+                    and led.fits_managed(w.charge, limit)
+                    and all(since_long + (0 if borrows and v1_answer else w.charge) + h.charge <= budget
+                            and since_all + w.charge + h.charge <= limit
+                            for h, since_long, since_all, borrows in protected)):
                 return w
             if w is chat_head or w is v1_head:
                 # It keeps its place in KV: what is admitted past it from here
                 # on may never push its wait further (kv_budget, BACKFILL).
-                protected.append((w, led.since(w.enqueued_at, kv_budget.LONG_WORK), led.since(w.enqueued_at)))
+                borrows = self._borrows(w)
+                since_long = led.since(w.enqueued_at, kv_budget.LONG_WORK,
+                                       except_origin_lane=(ORIGIN_V1, LONG_OUTPUT) if borrows else None)
+                protected.append((w, since_long, led.since(w.enqueued_at), borrows))
         return None
 
     def _pump(self) -> None:
@@ -968,6 +1042,36 @@ class Lanes:
         self.long_idle_waiting = 0
         #: [start, end or None] of /v1-origin LONG closures (THE /v1 CLOSURE BUDGET).
         self.v1_closures: Deque[List[Optional[float]]] = deque()
+        #: When a chat LONG request was last refused while /v1 long answers
+        #: were on the engine (module docstring, BACK TO BACK), or None.
+        self.chat_long_refused_at: Optional[float] = None
+        #: Pre-admitted LONG_OUTPUT calls waiting out a closure before they are
+        #: sent (`_wait_out_closure`): active in the lane, not on the engine.
+        self.long_output_parked = 0
+
+    def note_chat_long_refused(self, origin_: str) -> None:
+        """A LONG request was refused: if it was chat's and /v1 long answers
+        are on the engine, hold new /v1 long answers (BACK TO BACK)."""
+        if (_fold(origin_) == ORIGIN_CHAT and self.long_output.active_by_origin.get(ORIGIN_V1, 0) > 0
+                and v1_long_output_chat_hold_s() > 0):
+            if self.chat_long_refused_at is None:
+                log.warning("admission: a chat large document was refused beside %d public long answer(s); "
+                            "new public long answers are held for up to %.0f s",
+                            self.long_output.active_by_origin.get(ORIGIN_V1, 0), v1_long_output_chat_hold_s())
+            self.chat_long_refused_at = time.monotonic()
+            metrics.inc("llm_admission_v1_long_output_chat_holds_total",
+                        "Chat LONG refusals beside /v1 long answers that held new /v1 long answers.")
+
+    def v1_long_output_held(self, now: Optional[float] = None) -> bool:
+        """Are new /v1 long answers held for a refused chat document?"""
+        at = self.chat_long_refused_at
+        if at is None:
+            return False
+        hold = v1_long_output_chat_hold_s()
+        if hold <= 0 or (time.monotonic() if now is None else now) - at >= hold:
+            self.chat_long_refused_at = None
+            return False
+        return True
 
     def get(self, name: str) -> Lane:
         if name == LONG:
@@ -1124,23 +1228,37 @@ async def _say(line: str) -> None:
     await resilience.notify(line)
 
 
-def _ahead(ls: "Lanes") -> Optional[int]:
+def _beside_v1_answers_proceeds(ls: "Lanes", origin_: str) -> bool:
+    """ADMISSION_CHAT_LONG_BESIDE_V1_ANSWERS=proceed applies to this LONG
+    request: it is chat's, and every long answer of this process is /v1
+    (module docstring, CHAT DOCUMENTS BESIDE PUBLIC LONG ANSWERS)."""
+    return (_fold(origin_) == ORIGIN_CHAT
+            and ls.long_output.active_by_origin.get(ORIGIN_CHAT, 0) == 0
+            and chat_long_beside_v1_answers() == BESIDE_PROCEED)
+
+
+def _ahead(ls: "Lanes", origin_: str = ORIGIN_CHAT) -> Optional[int]:
     """How much work is in front of a long request: the engine's own
     `requests_running` from the controller's sample — every sequence,
     LONG_OUTPUT decoders included (a decode is half of the GDN fault shape;
     module docstring, LONG BESIDE LONG ANSWERS) — or, with no sample, this
-    process's NORMAL and LONG_OUTPUT occupancy. None when idle by that
-    measure."""
+    process's NORMAL and LONG_OUTPUT occupancy less the pre-admitted calls
+    parked behind a closure (they are not on the engine). Under
+    ADMISSION_CHAT_LONG_BESIDE_V1_ANSWERS=proceed a chat request does not count
+    /v1 long answers that are decoding. None when idle by that measure."""
     idle_max = max(0, int(settings.admission_long_idle_max))
     sample = engine_state.engine_load()
     if sample is not None:
         running = int(sample["requests_running"])
     else:
-        running = int(ls.normal.active) + int(ls.long_output.active)
+        running = int(ls.normal.active) + int(ls.long_output.active) - int(ls.long_output_parked)
+    if _beside_v1_answers_proceeds(ls, origin_):
+        running -= int(ls.long_output.decoding)
+    running = max(0, running)
     return running if running > idle_max else None
 
 
-async def _wait_for_idle(deadline: float, ls: "Lanes") -> bool:
+async def _wait_for_idle(deadline: float, ls: "Lanes", origin_: str = ORIGIN_CHAT) -> bool:
     """Wait until the engine is idle — the controller's engine sample says
     `requests_running` ≤ ADMISSION_LONG_IDLE_MAX, or, with no sample (an
     unknown controller), this process's own lanes are that empty — or
@@ -1152,7 +1270,7 @@ async def _wait_for_idle(deadline: float, ls: "Lanes") -> bool:
             said_unknown = True
             log.info("admission: controller engine sample unknown; the long request waits for this "
                      "process's own lane to be idle")
-        if _ahead(ls) is None:
+        if _ahead(ls, origin_) is None:
             return True
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -1165,7 +1283,7 @@ class _Ticket:
     synchronous and idempotent (module docstring, KV BUDGET)."""
 
     __slots__ = ("lane", "lanes", "origin", "long_holds_normal", "released", "waited_s", "_closure_timer",
-                 "kv_key", "decoding", "loop", "_closure_interval")
+                 "kv_key", "decoding", "loop", "_closure_interval", "claimed")
 
     def __init__(self, lane: str, lanes_: Lanes, origin_: str = ORIGIN_CHAT) -> None:
         self.lane = lane
@@ -1184,6 +1302,9 @@ class _Ticket:
         except RuntimeError:
             self.loop = None
         self._closure_interval: Optional[List[Optional[float]]] = None
+        #: A pre-admitted ticket a call has taken (`_take_preadmitted`): no
+        #: call in another context copy may use it or give it back.
+        self.claimed = False
 
     def close_lanes(self) -> None:
         """ADMITTED: nothing new into NORMAL or LONG_OUTPUT until the first
@@ -1192,6 +1313,9 @@ class _Ticket:
         ls.normal.set_closed_nowait(True, pump=False)
         ls.long_output.set_closed_nowait(True, pump=False)
         self.long_holds_normal = True
+        if self.origin == ORIGIN_CHAT:
+            # BACK TO BACK: the chat document the hold was for is in.
+            ls.chat_long_refused_at = None
         if self.origin == ORIGIN_V1:
             interval: List[Optional[float]] = [time.monotonic(), None]
             ls.v1_closures.append(interval)
@@ -1355,8 +1479,12 @@ async def _admit(
     # waiting for the seat is already in the KV order.
     charge = _charge(ls, tokens, max_tokens, base_url)
     key = object()
-    ticket.waited_s = await ls.kv.acquire(lane=LONG, origin=origin_, charge=charge, key=key, tokens=tokens,
-                                          timeout=budget, on_wait=tell)
+    try:
+        ticket.waited_s = await ls.kv.acquire(lane=LONG, origin=origin_, charge=charge, key=key, tokens=tokens,
+                                              timeout=budget, on_wait=tell)
+    except AdmissionRejected:
+        ls.note_chat_long_refused(origin_)
+        raise
     ticket.kv_key = key
     try:
         deadline = started + budget
@@ -1364,19 +1492,20 @@ async def _admit(
         # meanwhile (module docstring); new LONG_OUTPUT admissions do not.
         ls.long_idle_waiting += 1
         try:
-            ahead = _ahead(ls)
+            ahead = _ahead(ls, origin_)
             if ahead is not None:
                 await tell(ahead)
-            idle = await _wait_for_idle(deadline, ls)
+            idle = await _wait_for_idle(deadline, ls, origin_)
         finally:
             ls.long_idle_waiting = max(0, ls.long_idle_waiting - 1)
         if not idle:
             waited = time.monotonic() - started
-            if ls.long_output.active > 0:
+            if ls.long_output.active > 0 and not _beside_v1_answers_proceeds(ls, origin_):
                 # Our own long answers decode for hours: proceeding would make
                 # the fault shape routine (LONG BESIDE LONG ANSWERS).
                 log.warning("admission: engine not idle after %.0fs with %d long answer(s) on it; "
                             "long request refused", budget, ls.long_output.active)
+                ls.note_chat_long_refused(origin_)
                 raise _reject(LONG, "timeout", waited)
             if _fold(origin_) == ORIGIN_V1 and ls.normal.queue.depth(ORIGIN_CHAT) > 0:
                 log.warning("admission: engine not idle after %.0fs and a chat turn waits for NORMAL; "
@@ -1496,13 +1625,32 @@ async def run(
     """
     tokens = await prompt_tokens(messages, base_url=base_url, model=model)
     origin_ = current_origin()
+    if max_tokens is None:
+        # A gated public answer's planned output (`use_preadmitted`): a retry
+        # after its pre-admitted ticket was released, and a prompt that is
+        # LONG (never pre-admitted), are still admitted AS the long answer they
+        # are — a LONG_OUTPUT seat, and a KV charge that includes the output.
+        max_tokens = _planned_max_tokens.get()
     lane = lane_for(tokens, max_tokens, origin_)
     line = LONG_LINE if lane == LONG else LONG_OUTPUT_LINE if lane == LONG_OUTPUT else NORMAL_LINE
 
     async def on_wait(ahead: int) -> None:
         await _say(line.format(n=ahead))
 
-    ticket = await _admit(lane, on_wait, origin_=origin_, tokens=tokens, max_tokens=max_tokens, base_url=base_url)
+    pre = _take_preadmitted(lane)
+    if pre is not None:
+        # Admitted before the status line (THE PUBLIC FRONT DOOR): the seat
+        # and the KV charge are already this call's; admitting it again would
+        # count the same answer twice. It was granted before any LONG request
+        # that has closed the lanes since: that closure holds it too.
+        ticket, lane = pre, pre.lane
+        try:
+            ticket.waited_s += await _wait_out_closure(ticket.lanes)
+        except BaseException:
+            ticket.release_nowait()
+            raise
+    else:
+        ticket = await _admit(lane, on_wait, origin_=origin_, tokens=tokens, max_tokens=max_tokens, base_url=base_url)
     # Everything between the grant and the stream's hand-off releases the
     # ticket if it raises: `hold.resume()` raises LeaseLost on purpose and
     # awaits the database, where a Stop can cancel it — a ticket lost there
@@ -1524,6 +1672,138 @@ async def run(
         return _LaneStream(result, ticket)  # type: ignore[return-value]
     ticket.release_nowait()
     return result
+
+
+# ---------------------------------------------------------------------------
+# The public front door (integration 2026-09-13)
+# ---------------------------------------------------------------------------
+#
+# ONE ACCOUNTING OF LONG PUBLIC WORK. A /v1 answer planned above the v1
+# long-output threshold must be refused with a real HTTP 503 BEFORE its status
+# line (a synchronous caller behind Cloudflare's 100 s, a stream that has not
+# sent its 200) and a background job must wait `queued`, not `in_progress`.
+# The engine call that would take the LONG_OUTPUT lane runs later, inside the
+# generation. Until this date publicapi kept its own gates for that
+# (`main.long` 1, `main.extended` 2) AND this module kept LONG_OUTPUT (seats and
+# KV), so one answer was queued twice, with two bounds, and admission's idle
+# test was asked to subtract a second count of the same decoders.
+#
+# Now publicapi.capacity admits the answer HERE, before the status line, with
+# its own bound (`preadmit`), and hands the ticket to the generation through a
+# ContextVar (`use_preadmitted`); `run` uses that ticket instead of admitting
+# the same answer again. The seat, the KV charge, the decoding count and the
+# release all stay this module's. A prompt that is LONG by the count `run`
+# takes is not pre-admitted (the LONG lane accounts it at the call); a
+# pre-admitted ticket whose call turns out LONG is released first.
+#
+# THE PLANNED OUTPUT TRAVELS WITH THE TICKET (integration review 2026-09-13).
+# The engine call names no max_tokens, so a second `run` in the generation — a
+# retry after a recoverable engine error before the first chunk, the
+# stream_options re-send, a window retry — used to be NORMAL: the answer left
+# LONG_OUTPUT, and three 300K answers ran beside two seats. And a LONG prompt
+# was charged its prompt only. `use_preadmitted` now also carries the planned
+# output, which every `run` in the block that names none is admitted with.
+#
+# A PRE-ADMITTED CALL HONOURS A LATER CLOSURE. The ticket is granted before the
+# status line; the call is sent later (the row write, `_fit`, a background
+# job's in_progress update). A LONG request admitted in between closes the
+# lanes for its prefill, and the pre-admitted call waits that out
+# (`_wait_out_closure`) instead of sending a prefill into it.
+#
+# A TICKET IS CLAIMED ONCE. `_take_preadmitted` clears the ContextVar only in
+# the taker's context copy; the claim mark keeps a call in another copy (the
+# gate's own context, a task created before the take) from using the ticket
+# a running generation holds, or releasing it.
+
+
+_preadmitted: ContextVar[Optional["_Ticket"]] = ContextVar("admission_preadmitted", default=None)
+_planned_max_tokens: ContextVar[Optional[int]] = ContextVar("admission_planned_max_tokens", default=None)
+
+
+def _take_preadmitted(lane: str) -> Optional["_Ticket"]:
+    """The pre-admitted ticket for THIS call, once. Cleared in the calling
+    context, so a retry in the same task is admitted on its own; a released
+    ticket (the first attempt's stream ended) is never reused, and a ticket a
+    call in another context copy has claimed is never used or released here."""
+    pre = _preadmitted.get()
+    if pre is None:
+        return None
+    _preadmitted.set(None)
+    if pre.released or pre.claimed:
+        return None
+    pre.claimed = True
+    if lane == LONG:
+        pre.release_nowait()
+        return None
+    return pre
+
+
+async def _wait_out_closure(ls: "Lanes") -> float:
+    """A pre-admitted LONG_OUTPUT call waits, before it is sent, while a LONG
+    request holds the lanes closed or is waiting for the engine to go idle —
+    the two states that hold a LONG_OUTPUT grant (`_KvArbiter._gate_blocked`)
+    — for at most LONG_CLOSURE_MAX_S in total, like any waiter's deferral;
+    past that it is refused `timeout`. Returns the seconds waited."""
+    started = time.monotonic()
+    if not (ls.long_output.closed or ls.long_idle_waiting > 0):
+        return 0.0
+    ls.long_output_parked += 1
+    try:
+        while ls.long_output.closed or ls.long_idle_waiting > 0:
+            waited = time.monotonic() - started
+            if waited >= LONG_CLOSURE_MAX_S:
+                raise _reject(LONG_OUTPUT, "timeout", waited)
+            await asyncio.sleep(min(_POLL_S, LONG_CLOSURE_MAX_S - waited))
+    finally:
+        ls.long_output_parked = max(0, ls.long_output_parked - 1)
+    return time.monotonic() - started
+
+
+async def preadmit(
+    messages: Sequence[dict],
+    *,
+    base_url: str,
+    model: str,
+    max_tokens: Optional[int],
+    wait_s: float,
+) -> "Optional[_Ticket]":
+    """Admit a long answer now, for a call that will be made later in this
+    context (publicapi's gate, before the status line).
+
+    Returns the LONG_OUTPUT ticket, or None when the call would not take the
+    LONG_OUTPUT lane (an ordinary answer, or a prompt that is LONG: those are
+    admitted by `run` itself). Raises AdmissionRejected as `run` would, after
+    at most `wait_s` of the caller's own wait. The caller releases the ticket
+    (`release_nowait`, idempotent) when its request ends, whatever happened to
+    the call."""
+    tokens = await prompt_tokens(messages, base_url=base_url, model=model)
+    origin_ = current_origin()
+    if lane_for(tokens, max_tokens, origin_) != LONG_OUTPUT:
+        return None
+    bound = _wait_bound.set(max(0.0, float(wait_s)))
+    try:
+        return await _admit(LONG_OUTPUT, None, origin_=origin_, tokens=tokens, max_tokens=max_tokens,
+                            base_url=base_url)
+    finally:
+        _wait_bound.reset(bound)
+
+
+@contextlib.contextmanager
+def use_preadmitted(ticket: "Optional[_Ticket]", *, max_tokens: Optional[int] = None) -> Iterator[None]:
+    """Make `ticket` the one the next `run` in this context (and in every task
+    created inside the block) uses, and `max_tokens` the planned output every
+    `run` in the block is admitted with when its caller names none. `ticket`
+    may be None (a LONG prompt, or an answer admission does not take into
+    LONG_OUTPUT): the planned output still applies."""
+    token = _preadmitted.set(ticket)
+    planned = _planned_max_tokens.set(None if max_tokens is None else int(max_tokens))
+    try:
+        yield
+    finally:
+        with contextlib.suppress(ValueError):  # exited from another context
+            _planned_max_tokens.reset(planned)
+        with contextlib.suppress(ValueError):
+            _preadmitted.reset(token)
 
 
 def describe() -> dict:
@@ -1551,6 +1831,10 @@ def describe() -> dict:
         "waiting": lo.waiting if lo else 0,
         "closed": bool(lo.closed) if lo else False,
         "decoding": lo.decoding if lo else 0,
+    }
+    out["chat_documents_beside_v1_answers"] = {
+        "policy": chat_long_beside_v1_answers(),
+        "v1_long_answers_held": bool(ls.v1_long_output_held()) if ls is not None else False,
     }
     p = kv_budget.cached()
     out["kv"] = {

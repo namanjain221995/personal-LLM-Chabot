@@ -322,6 +322,9 @@ async def _take_capacity(
                 wait_s=capacity.background_wait_s(),
                 yield_to_chat=spec.yield_to_chat,
                 abandon=job.cancel,
+                # A main gate admits the answer into admission's LONG_OUTPUT
+                # lane while the row is still `queued` (capacity.py).
+                work=spec,
             )
         )
     except capacity.Abandoned:

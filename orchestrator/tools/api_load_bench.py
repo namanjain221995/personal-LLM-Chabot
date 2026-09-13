@@ -721,6 +721,10 @@ class Config:
     v1_kv_promote_s: float = 300.0
     v1_closure_duty: float = 0.10
     v1_closure_window_s: float = 7200.0
+    #: ADMISSION_V1_LONG_OUTPUT_CHAT_HOLD_S (admission, BACK TO BACK): after a
+    #: chat LONG refusal beside /v1 long answers, new /v1 long answers are held
+    #: this long. 1800 is the build; 0 is the counterfactual of no hold.
+    v1_long_output_chat_hold_s: float = 1800.0
 
 
 @dataclass
@@ -776,6 +780,7 @@ def _patches(cfg: Config, clock: VirtualClock, engine_ref: dict, reqs_by_id: Dic
         ("admission_kv_unmanaged_headroom_fraction", cfg.headroom), ("admission_v1_kv_promote_s", cfg.v1_kv_promote_s),
         ("admission_v1_long_closure_duty", cfg.v1_closure_duty),
         ("admission_v1_long_closure_window_s", cfg.v1_closure_window_s),
+        ("admission_v1_long_output_chat_hold_s", cfg.v1_long_output_chat_hold_s),
     ):
         stack.enter_context(mock.patch.object(settings, name, value, create=True))
     shim = types.SimpleNamespace(monotonic=clock.time, time=lambda: 1.8e9 + clock.now, sleep=time.sleep,

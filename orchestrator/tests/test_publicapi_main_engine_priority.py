@@ -10,12 +10,17 @@ The findings:
 
 * public answers below the 131,072-token long footprint took NO gate, and ten
   130,000-token answers held all ten NORMAL admission slots — a chat turn was
-  refused (`main.extended`, 2 at a time, for planned output above 8,192);
+  refused (`main.extended` for planned output above 8,192: since the
+  integration of 2026-09-13 it admits the answer into admission's LONG_OUTPUT
+  lane, two seats, before the status line);
 * gate footprints were charged from the 3-chars-per-token estimate, which a
-  digit prompt pushes to a third of the truth (byte bound now);
+  digit prompt pushes to a third of the truth (the router gate: byte bound;
+  the main engine: no gate on the prompt at all, admission's exact count);
 * a chat large-document turn waited the whole long-lane idle bound behind a
-  running public long job (the main gates step aside for it; the rest needs
-  admission.py — pinned below by a strict xfail);
+  running public long job (the main gates step aside for it while it is before
+  its first token; the running job is counted once, in admission's
+  LONG_OUTPUT lane, and what admission's idle test does with it is
+  admission's policy — see tests/test_publicapi_gates_one_accounting.py);
 * a public clip made the next dictation wait behind it (see
   test_publicapi_capacity.py and the routing test at the end).
 """
@@ -108,9 +113,13 @@ def _scaled(monkeypatch):
         "PUBLIC_API_MAIN_EXTENDED_OUTPUT_TOKENS",
         "PUBLIC_API_MAIN_EXTENDED_MAX_CONCURRENT",
         "PUBLIC_API_MAIN_LONG_MAX_CONCURRENT",
-        "PUBLIC_API_MAIN_LONG_FOOTPRINT_TOKENS",
+        "PUBLIC_API_MAIN_SOLO_OUTPUT_TOKENS",
+        "ADMISSION_LONG_OUTPUT_MAX_SEQS",
+        "ADMISSION_KV_RESERVE_FRACTION",
     ):
         monkeypatch.delenv(name, raising=False)
+    # The KV pool is the 2026-09-13 setting; the suite never reads /metrics.
+    monkeypatch.setenv("ADMISSION_KV_METRICS_URL", "off")
 
     async def estimate_count(base_url, model, messages):
         return context.estimate_messages(messages), 1_000_000
@@ -184,21 +193,40 @@ def test_the_extended_gate_has_the_argued_defaults():
         (8192, None),
         (8193, "main.extended"),
         (130_000, "main.extended"),  # the review's case: no gate at all before
-        (200_000, "main.long"),
+        (200_000, "main.extended"),
+        (800_000, "main.extended"),
+        (800_001, "main.long"),  # two of these are the whole 1,663,201-token KV pool
     ],
 )
 def test_a_flagship_answer_planned_above_the_old_public_ceiling_takes_a_main_gate(max_output_tokens, gate):
     assert _plan(max_output_tokens).gate_engine == gate
 
 
-def test_a_digit_prompt_is_sized_for_the_long_gate_at_its_byte_bound_not_its_estimate():
+def test_a_digit_prompt_is_charged_its_real_kv_by_admission_not_its_estimate(monkeypatch):
     """120,000 digits are 120,000 real tokens (the Qwen pre-tokenizer isolates
     digits) and estimate at ~40,008: with 90,000 tokens of output the estimate
-    put the footprint at 130,008 — under the 131,072 threshold."""
+    put the footprint at 130,008 — under the 131,072 threshold. The planner
+    no longer sizes a main gate by the prompt (the byte bound sent ordinary
+    documents through the one-at-a-time gate); the answer's gate admits it
+    into LONG_OUTPUT with the KV charge taken on the exact /tokenize count."""
     plan = _plan(90_000, text="7" * 120_000)
     assert plan.estimated_input_tokens + plan.planned_max_output_tokens <= 131_072
     assert plan.footprint_tokens >= 120_000 + plan.planned_max_output_tokens
-    assert plan.gate_engine == "main.long"
+    assert plan.gate_engine == "main.extended"
+
+    async def exact(base_url, model, messages):
+        return sum(len(str(m.get("content") or "")) for m in messages), 1_000_000
+
+    monkeypatch.setattr(context, "count_tokens", exact)
+
+    async def scenario():
+        async with capacity.hold(plan.gate_engine, wait_s=1, work=plan):
+            return admission.lanes().ledger.committed
+
+    from app import kv_budget
+
+    committed = asyncio.run(scenario())
+    assert committed >= kv_budget.charge_tokens(120_000, 90_000, block_size=2096, window=1_000_000)
 
 
 def test_the_router_gate_charges_a_digit_prompt_at_least_its_digits_so_four_cannot_fill_the_pool(monkeypatch):
@@ -312,91 +340,65 @@ def test_a_main_gate_steps_aside_while_a_chat_large_document_waits_for_an_idle_e
     assert after is False
 
 
-def test_a_public_long_prompt_in_the_long_lane_does_not_make_other_public_work_wait_for_it(monkeypatch):
+def test_a_public_long_prompt_past_its_first_token_does_not_make_other_public_work_wait_for_it(monkeypatch):
     async def scenario():
         lanes = admission.lanes()
-        lanes.long.active = 1  # the public request's own LONG ticket
-        with capacity.PublicMainGeneration(possibly_long_prompt=True, long_lived=True):
-            mine = capacity.chat_long_admission_present()
-        lanes.long.active = 0
+        lanes.long.active = 1  # a LONG ticket decoding: not idle-waiting, not closed
+        try:
+            with capacity.PublicMainGeneration(possibly_long_prompt=True, long_lived=True):
+                mine = capacity.chat_long_admission_present()
+        finally:
+            lanes.long.active = 0
         return mine
 
     assert asyncio.run(scenario()) is False
 
 
-def test_a_long_lived_public_generation_is_counted_as_decoding_only_after_its_first_token(fake_main):
-    plan = _plan(200_000)
-    assert plan.gate_engine == "main.long"
-    fake_main.tick = 0.02
-    seen: List[int] = []
-
-    async def scenario():
-        generation = streaming.Generation(_spec(plan, "resp_track", max_tokens=30))
-        before = capacity.public_long_lived_decoding()
-        async for chunk in generation.stream():
-            if chunk.kind == streaming.TOKEN_KIND:
-                seen.append(capacity.public_long_lived_decoding())
-        await generation.aclose()
-        return before, capacity.public_long_lived_decoding()
-
-    before, after = asyncio.run(scenario())
-    assert before == 0 and after == 0
-    # Counted while decoding; the last chunk may be read after the producer
-    # (and so the count) has already finished.
-    assert seen[0] == 1 and max(seen) == 1
-
-
-def test_a_default_sized_public_generation_is_never_counted_as_long_lived(fake_main):
-    plan = _plan()
-    assert plan.gate_engine is None
-
-    async def scenario():
-        generation = streaming.Generation(_spec(plan, "resp_short", max_tokens=5))
-        counts = [capacity.public_long_lived_decoding() async for _ in generation.stream()]
-        await generation.aclose()
-        return counts
-
-    assert set(asyncio.run(scenario())) == {0}
-
-
-def _admission_leaves_out_public_decodes() -> bool:
-    return "public_long_lived_decoding" in inspect.getsource(admission)
-
-
-@pytest.mark.xfail(
-    not _admission_leaves_out_public_decodes(),
-    strict=True,
-    reason=(
-        "needs integration in app/admission.py (not this wave's file): _ahead must subtract "
-        "publicapi.capacity.public_long_lived_decoding() from requests_running (or from the "
-        "NORMAL occupancy without a sample). Strict: when it lands this XPASSes and the marker goes."
-    ),
-)
-def test_a_chat_large_document_is_not_held_for_the_whole_idle_wait_by_a_running_public_long_job(
-    fake_main, monkeypatch
-):
-    """The review's M3, scaled: 600 s → 3 s. A public 1M-token job (small
-    prompt) is decoding; a chat large-document turn must start without
-    waiting the whole long-lane idle bound."""
-    monkeypatch.setattr(settings, "admission_long_wait_s", 3.0)
+def test_a_running_public_1m_job_is_counted_once_in_admissions_long_output_lane(fake_main, monkeypatch):
+    """The review's M3 hand-off, reconciled (integration 2026-09-13): the
+    fixer's `public_long_lived_decoding` seam and admission's LONG_OUTPUT
+    decoding count were two counts of the same job, and wiring both would have
+    subtracted it twice. There is ONE: the job is admitted into LONG_OUTPUT by
+    its gate, marked decoding by admission at its first token, and nothing in
+    publicapi counts it again. (Whether a chat document may prefill beside it
+    is admission's GDN policy, not this module's.)"""
     plan = _plan(1_000_000, text="Write everything you know.")
     assert plan.gate_engine == "main.long"
+    assert not hasattr(capacity, "public_long_lived_decoding")
+    assert "public_long_lived_decoding" not in inspect.getsource(admission)
 
     async def scenario():
         async def job():
-            async with capacity.hold(plan.gate_engine, wait_s=1):
+            async with capacity.hold(plan.gate_engine, wait_s=1, work=plan):
                 return await streaming.run_to_completion(_spec(plan, "resp_bg", max_tokens=100_000))
 
         running = asyncio.ensure_future(job())
         try:
             await asyncio.sleep(0.3)
-            assert capacity.public_long_lived_decoding() == 1
-            return await asyncio.wait_for(_chat_first_token(DOC), 10)
+            lanes = admission.lanes()
+            return (lanes.long_output.active, lanes.long_output.decoding, lanes.normal.active,
+                    len(lanes.ledger), capacity.snapshot()["main.long"]["in_flight"])
         finally:
             running.cancel()
             await asyncio.gather(running, return_exceptions=True)
 
-    assert asyncio.run(scenario()) < 1.5
+    assert asyncio.run(scenario()) == (1, 1, 0, 1, 1)
+
+
+def test_a_default_sized_public_generation_takes_no_long_output_seat(fake_main):
+    plan = _plan()
+    assert plan.gate_engine is None
+    seen: List[tuple] = []
+
+    async def scenario():
+        generation = streaming.Generation(_spec(plan, "resp_short", max_tokens=5))
+        async for _ in generation.stream():
+            lanes = admission.lanes()
+            seen.append((lanes.long_output.active, lanes.normal.active_by_origin[admission.ORIGIN_V1]))
+        await generation.aclose()
+
+    asyncio.run(scenario())
+    assert seen[0] == (0, 1)
 
 
 # ------------------------------------------------------ dictation routing --
