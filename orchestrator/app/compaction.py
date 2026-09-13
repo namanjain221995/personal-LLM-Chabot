@@ -276,6 +276,49 @@ def should_compact(budget: Budget, threshold: float) -> bool:
     return cap > 0 and budget.used > cap
 
 
+#: Slack added to `context.upper_bound_messages` before it may stand in for
+#: an exact count: the chat template's own tokens (role headers, the
+#: generation primer, a thinking tag) are a handful per message, and the
+#: bound already charges eight per message plus eight.
+_BOUND_SLACK_TOKENS = 64
+
+
+def _certainly_no_compaction(
+    probe: Sequence[dict], *, base_url: str, requested_max_tokens: Optional[int]
+) -> bool:
+    """True when NO exact count of `probe` could make `should_compact` fire.
+
+    `context.upper_bound_messages` charges text at its UTF-8 byte length, and
+    a byte-level BPE never spends more than a token per byte, so the exact
+    count cannot exceed it. Only plain-text prompts qualify (an image part
+    is sized by a header heuristic, not a bound), and only once the serving
+    window is known — the first turn of a process always counts.
+    """
+    window = context._window_cache.get(base_url)
+    if not window:
+        return False
+    if any(not isinstance(m.get("content"), str) for m in probe):
+        return False
+    bound = context.upper_bound_messages(probe) + _BOUND_SLACK_TOKENS
+    cap = int(settings.context_compact_max_tokens or 0)
+    if cap > 0 and bound > cap:
+        return False
+    reserved = output_reservation(requested_max_tokens, window)
+    usable = usable_budget(window, reserved)
+    return bound / usable <= settings.context_compact_threshold
+
+
+def _budget_info(budget: Budget, summarized_turns: int) -> dict:
+    return {
+        "tokens_used": budget.used,
+        "usable_budget": budget.usable,
+        "window": budget.window,
+        "reserved_output": budget.output_reserved,
+        "fraction": round(budget.fraction, 4),
+        "summarized_turns": summarized_turns,
+    }
+
+
 async def prepare(
     conversation_id: str,
     history: Sequence[dict],
@@ -292,12 +335,87 @@ async def prepare(
     Returns (history, info) where info feeds the answer's meta: the context
     meter reads it, and a compaction is reported to the user.
     """
-    row = await db.run_in_thread(db.get_summary, conversation_id)
+    candidate, info, _pending = await prepare_deferred(
+        conversation_id,
+        history,
+        current_text,
+        base_url=base_url,
+        model=model,
+        requested_max_tokens=requested_max_tokens,
+        emit=emit,
+        retrieved=retrieved,
+        defer_measure=False,
+    )
+    return candidate, info  # type: ignore[return-value]
+
+
+async def prepare_deferred(
+    conversation_id: str,
+    history: Sequence[dict],
+    current_text: str,
+    *,
+    base_url: str,
+    model: str,
+    requested_max_tokens: Optional[int] = None,
+    emit: Optional[Emit] = None,
+    retrieved: Optional[str] = None,
+    summary_reader: Optional[Callable[[], Awaitable[Optional[dict]]]] = None,
+    defer_measure: bool = True,
+) -> Tuple[List[dict], Optional[dict], "Optional[asyncio.Future[dict]]"]:
+    """`prepare`, without making the answer wait for the meter's count.
+
+    Returns (history, info, pending): exactly one of `info` and `pending` is
+    set. `pending` resolves to the very dict `prepare` would have returned.
+
+    WHY (2026-09-13): `measure` asks the engine's /tokenize for an exact
+    count on every turn, and on nearly every turn the answer is already
+    known without it — traced turns used 0.12-0.41% of the 1M window
+    (query_trace_events, n=46) against a 40,000-token compaction cap. When
+    the byte bound proves no count could trigger compaction, the prompt is
+    assembled at once and the exact count (still what the meter shows) runs
+    beside the answer instead of in front of it. Anything near a threshold,
+    anything multimodal, and the first turn of a process count exactly,
+    first, as before.
+
+    `summary_reader` hands in the stored summary row when the caller already
+    started reading it concurrently with the rest of the context.
+    """
+    if summary_reader is not None:
+        row = await summary_reader()
+    else:
+        row = await db.run_in_thread(db.get_summary, conversation_id)
     summary = row["summary"] if row else None
     covers = row["covers_through"] if row else 0
 
     candidate = assemble(history, summary, covers, retrieved)
     probe = list(candidate) + [{"role": "user", "content": current_text}]
+
+    if defer_measure and _certainly_no_compaction(
+        probe, base_url=base_url, requested_max_tokens=requested_max_tokens
+    ):
+        summarized = covers if summary else 0
+        # Taken now, as `prepare` does before returning: the notice belongs
+        # to THIS turn, not to whichever turn is running when the count ends.
+        pending_notice = take_pending_notice(conversation_id)
+
+        async def settle() -> dict:
+            budget = await measure(
+                probe,
+                base_url=base_url,
+                model=model,
+                requested_max_tokens=requested_max_tokens,
+            )
+            info = _budget_info(budget, summarized)
+            if pending_notice:
+                info["compacted"] = pending_notice
+            return info
+
+        task = asyncio.ensure_future(settle())
+        # Never "exception was never retrieved": a turn that fails before
+        # its meta never reads the count.
+        task.add_done_callback(lambda t: t.cancelled() or t.exception())
+        return candidate, None, task
+
     budget = await measure(
         probe,
         base_url=base_url,
@@ -343,16 +461,10 @@ async def prepare(
                 break  # nothing left to give up; fit_request clips from here
             keep = max(MIN_KEEP_RECENT, keep // 2)
 
-    info = {
-        "tokens_used": budget.used,
-        "usable_budget": budget.usable,
-        "window": budget.window,
-        "reserved_output": budget.output_reserved,
-        "fraction": round(budget.fraction, 4),
-        "summarized_turns": (
-            compacted["covers_through"] if compacted else (covers if summary else 0)
-        ),
-    }
+    info = _budget_info(
+        budget,
+        compacted["covers_through"] if compacted else (covers if summary else 0),
+    )
     if compacted:
         info["compacted"] = {"folded_turns": compacted["folded"], "background": False}
     else:
@@ -361,7 +473,7 @@ async def prepare(
         pending = take_pending_notice(conversation_id)
         if pending:
             info["compacted"] = pending
-    return candidate, info
+    return candidate, info, None
 
 
 async def maybe_background_compact(

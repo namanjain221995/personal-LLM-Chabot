@@ -1481,7 +1481,34 @@ async def embed_texts(
 
 
 class EmbedUnavailable(RuntimeError):
-    """A query embedding did not happen (busy past the wait, or failed)."""
+    """A query embedding did not happen (busy past the wait, or failed).
+
+    `reason` says which (2026-09-13): "busy" (no slot inside the wait),
+    "timeout" (the sidecar call ran out of time), "error" (it failed or
+    returned nothing) or "empty" (nothing to embed). In-conversation recall
+    counts the block it drops by it and retries only what may pass on a
+    second try (recall.retrieve_block)."""
+
+    def __init__(self, message: str = "", *, reason: str = "error") -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+def _is_timeout(exc: BaseException) -> bool:
+    """A timeout anywhere in the failure's chain: the OpenAI client's
+    APITimeoutError, httpx's ReadTimeout, asyncio's, or resilience's
+    ModelUnavailable wrapping one of them (`.last`). Matched by class name
+    so this module needs neither client library to classify."""
+    seen = set()
+    node: Optional[BaseException] = exc
+    while node is not None and id(node) not in seen:
+        seen.add(id(node))
+        if isinstance(node, (TimeoutError, asyncio.TimeoutError)):
+            return True
+        if any("Timeout" in cls.__name__ for cls in type(node).__mro__):
+            return True
+        node = getattr(node, "last", None) or node.__cause__
+    return False
 
 
 #: Qwen3-Embedding is asymmetric: queries carry an instruction, documents do
@@ -1513,8 +1540,14 @@ async def embed_query(
     instruction: Optional[str] = None,
     wait: Optional[float] = None,
     timeout: Optional[float] = None,
+    normalise: bool = True,
 ) -> List[float]:
     """ONE embedding of a query, cached and bounded (ADR-0001 D10/D13).
+
+    `normalise=False` embeds `text` exactly as given (2026-09-13): for a
+    caller whose vector must stay byte-for-byte the one it computed before it
+    moved onto this bounded path (recall.retrieve_block at Fast). When the
+    text has no whitespace to collapse it is the same call, cache and flight.
 
     The same question was embedded up to three times per turn (recall, the
     dense half of retrieval, site Q&A). One LRU keyed on (model,
@@ -1525,13 +1558,93 @@ async def embed_query(
     """
     clean = " ".join((text or "").split())
     if not clean:
-        raise EmbedUnavailable("empty query")
+        raise EmbedUnavailable("empty query", reason="empty")
+    if not normalise:
+        clean = text
     key = (settings.embed_model, instruction or "", clean)
     hit = _EMBED_LRU.get(key)
     if hit is not None:
         _EMBED_LRU.move_to_end(key)
         metrics.inc("embed_requests_total", outcome="cache", kind="query")
         return list(hit)
+    # SINGLE-FLIGHT (2026-09-13, plan item 4). Context assembly now runs
+    # cross-chat recall and in-conversation recall concurrently, and both
+    # embed the SAME question with no instruction: the LRU above only helps
+    # the second caller once the first has finished, so without this the
+    # concurrency bought a second sidecar round trip for an identical
+    # vector. A caller that arrives while the vector is being made joins
+    # that call. The work runs in its own task and every caller waits on it
+    # through `shield`, so one caller's cancellation (a turn replaced by a
+    # newer message) never fails the others; the task still fills the LRU.
+    #
+    # Two corrections (2026-09-13, second prover pass, probe embed_probe.py):
+    #   - a flight nobody waits for any more is CANCELLED, which releases its
+    #     EMBED_MAX_INFLIGHT slot at once, as a cancelled caller did before
+    #     single-flight. The Fast topical path cancels retrieval on every
+    #     pre-check miss; abandoned flights held all the slots of a hung
+    #     sidecar and the next question failed 'busy' after 1.0 s (HEAD: ok
+    #     in 0.01 s);
+    #   - a caller joins only a flight with ITS OWN budget (wait, timeout):
+    #     a default-budget caller that joined recall's short-budget retry
+    #     failed 'busy' after 0.04 s (HEAD: ok in 0.291 s).
+    loop = asyncio.get_running_loop()
+    flight_key = (key, wait, timeout)
+    flight = _EMBED_INFLIGHT.get(flight_key)
+    if flight is not None and flight.loop is loop and not flight.task.done() and not flight.abandoned:
+        metrics.inc("embed_requests_total", outcome="cache", kind="query")
+        return list(await flight.wait())
+    task = loop.create_task(
+        _embed_query_uncached(key, instruction, clean, wait=wait, timeout=timeout)
+    )
+    flight = _EmbedFlight(loop, task)
+    _EMBED_INFLIGHT[flight_key] = flight
+
+    def _landed(done: "asyncio.Task", _key=flight_key) -> None:
+        current = _EMBED_INFLIGHT.get(_key)
+        if current is not None and current.task is done:
+            _EMBED_INFLIGHT.pop(_key, None)
+        if not done.cancelled():
+            done.exception()  # retrieved: a joiner may never have awaited it
+
+    task.add_done_callback(_landed)
+    return list(await flight.wait())
+
+
+class _EmbedFlight:
+    """One query embedding being made, and how many callers wait for it."""
+
+    def __init__(self, loop: asyncio.AbstractEventLoop, task: "asyncio.Task") -> None:
+        self.loop = loop
+        self.task = task
+        self.waiters = 0
+        #: Cancelled because its last caller left; never joined again.
+        self.abandoned = False
+
+    async def wait(self) -> List[float]:
+        self.waiters += 1
+        try:
+            return await asyncio.shield(self.task)
+        finally:
+            self.waiters -= 1
+            if self.waiters == 0 and not self.task.done():
+                self.abandoned = True
+                self.task.cancel()
+
+
+#: (lru key, wait, timeout) -> _EmbedFlight for query embeddings being made
+#: right now. The loop is kept so a test's finished loop never hands its
+#: task on.
+_EMBED_INFLIGHT: dict = {}
+
+
+async def _embed_query_uncached(
+    key: tuple,
+    instruction: Optional[str],
+    clean: str,
+    *,
+    wait: Optional[float],
+    timeout: Optional[float],
+) -> List[float]:
     sem = _embed_semaphore()
     deadline = float(wait if wait is not None else settings.embed_wait_s)
     queued = time.perf_counter()
@@ -1540,7 +1653,7 @@ async def embed_query(
             await sem.acquire()
     except TimeoutError:
         metrics.inc("embed_requests_total", outcome="busy", kind="query")
-        raise EmbedUnavailable("embedding service busy") from None
+        raise EmbedUnavailable("embedding service busy", reason="busy") from None
     metrics.observe("embed_queue_seconds", time.perf_counter() - queued, kind="query")
     try:
         vectors = await embed_texts(
@@ -1549,11 +1662,11 @@ async def embed_query(
             kind="query",
         )
     except Exception as exc:  # noqa: BLE001 — one outcome for callers
-        raise EmbedUnavailable(str(exc)) from exc
+        raise EmbedUnavailable(str(exc), reason="timeout" if _is_timeout(exc) else "error") from exc
     finally:
         sem.release()
     if not vectors or not vectors[0]:
-        raise EmbedUnavailable("empty embedding")
+        raise EmbedUnavailable("empty embedding", reason="error")
     _EMBED_LRU[key] = list(vectors[0])
     _EMBED_LRU.move_to_end(key)
     while len(_EMBED_LRU) > _EMBED_LRU_MAX:
@@ -1563,3 +1676,4 @@ async def embed_query(
 
 def embed_cache_clear() -> None:
     _EMBED_LRU.clear()
+    _EMBED_INFLIGHT.clear()

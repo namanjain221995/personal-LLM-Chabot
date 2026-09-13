@@ -335,6 +335,22 @@ def measured_prompt_tokens(messages: Sequence[dict], base_url: str) -> Optional[
     return found[2]
 
 
+#: /tokenize answers with the whole token-id list beside the count, so its
+#: body grows with the prompt: ~6 bytes a token, ~600 KB for a 100K-token
+#: prompt, and `json.loads` of that ran on the event loop, stalling every
+#: other stream in flight (plan item 4, 2026-09-13). A body past this size is
+#: parsed in a worker thread instead; a small one is cheaper to parse inline
+#: than to hand to a thread.
+_TOKENIZE_JSON_INLINE_BYTES = 64 * 1024
+
+
+async def _tokenize_json(resp) -> dict:
+    body = getattr(resp, "content", b"") or b""
+    if len(body) <= _TOKENIZE_JSON_INLINE_BYTES:
+        return resp.json()
+    return await asyncio.to_thread(resp.json)
+
+
 async def count_tokens(
     base_url: str, model: str, messages: Sequence[dict]
 ) -> Tuple[int, Optional[int]]:
@@ -359,7 +375,7 @@ async def count_tokens(
         client = _tokenize_client()
         resp = await client.post(f"{service_root(base_url)}/tokenize", json=payload)
         resp.raise_for_status()
-        data = resp.json()
+        data = await _tokenize_json(resp)
         count = int(data["count"])
         window = data.get("max_model_len")
         window = int(window) if window else None

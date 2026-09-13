@@ -102,3 +102,34 @@ HEARTBEAT_SECONDS: float = float(os.environ.get("SSE_HEARTBEAT_SECONDS", "15"))
 def sse_comment(note: str = "keep-alive") -> str:
     """Format an SSE comment frame. Ignored by clients; keeps the pipe warm."""
     return f": {note}\n\n"
+
+
+# --- relay coalescing ----------------------------------------------------
+# One HTTP body write per token was the relay's shape until 2026-09-13: every
+# decoded token became its own ASGI send, its own chunk through the Next.js
+# proxy and Cloudflare, and its own parse + React render in the browser.
+# Measured the same week: the engine decodes ~105 tok/s single-stream while
+# people SAW a p50 of 87.6 tok/s after MTP was turned off (usage_events,
+# n=13) — a 15-35% loss after the engine, largest on short answers. At
+# ~9.4 ms per token a 25 ms frame carries two or three tokens, cutting those
+# writes ~2-3x, and the FIRST frame after a quiet spell is never held back
+# (LiveGeneration.follow), so time to first token does not move.
+#
+# Frames are concatenated, never merged: the bytes on the wire are exactly
+# the per-event frames laid end to end, which every SSE parser already has
+# to accept because TCP coalesces writes anyway. 0 turns coalescing off.
+# Named as config.py would name it (SSE_COALESCE_MS); read here, beside
+# SSE_HEARTBEAT_SECONDS, with config.py's blank-means-default rule.
+def _coalesce_seconds() -> float:
+    raw = os.environ.get("SSE_COALESCE_MS")
+    if raw is None or raw.strip() == "":
+        return 0.025
+    return max(0.0, float(raw)) / 1000.0
+
+
+COALESCE_SECONDS: float = _coalesce_seconds()
+
+#: Events that stream at decode speed and so are worth holding a few ms to
+#: share a write. Everything else (status, step, meta, done, error) is rare
+#: and is simply carried by the next write.
+STREAMED_EVENTS = ("token", "reasoning")
