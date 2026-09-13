@@ -499,7 +499,9 @@ def test_the_normal_lane_sentence_is_the_contracts_verbatim():
 
 
 def test_the_lane_label_is_bounded_and_health_describes_the_lanes():
-    assert metrics._ALLOWED["lane"] == {"normal", "long"}
+    # A subset, not equality: metrics.py gains "long_output" in its own diff
+    # (2026-09-13, needs integration); until then that lane reads lane="other".
+    assert {"normal", "long"} <= metrics._ALLOWED["lane"]
     assert metrics._ALLOWED_BY_METRIC["llm_admission_rejections_total"]["reason"] == {"capacity", "timeout"}
 
     async def run():
@@ -507,6 +509,16 @@ def test_the_lane_label_is_bounded_and_health_describes_the_lanes():
         assert shown["normal"] == {"capacity": 2, "active": 0, "waiting": 0, "closed": False}
         assert shown["long"] == {"capacity": 1, "active": 0, "waiting": 0, "closed": False}
         assert shown["long_threshold_tokens"] == 1000
+        # The LONG_OUTPUT lane, the KV budget and the per-origin lines (2026-09-13).
+        assert set(shown["long_output"]) == {"capacity", "active", "waiting", "closed", "decoding"}
+        assert shown["long_output"]["active"] == 0 and shown["long_output"]["decoding"] == 0
+        assert set(shown["kv"]) == {"pool_tokens", "block_size", "source", "budget_tokens",
+                                    "committed_tokens", "reserve_fraction", "oldest_charge_age_s",
+                                    # The managed limit and the /v1 closure budget (adversarial review, same day).
+                                    "normal_v1_committed_tokens", "managed_limit_tokens",
+                                    "v1_long_closure_s_in_window"}
+        assert shown["kv"]["committed_tokens"] == 0 and shown["kv"]["normal_v1_committed_tokens"] == 0
+        assert shown["origin_waiting"] == {"chat": 0, "v1": 0}
 
     asyncio.run(run())
     # Outside a loop: the limits, no occupancy.
