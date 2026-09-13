@@ -54,6 +54,10 @@ class Candidate:
     #: The main model was away for the whole queue window and the turn is
     #: parked (continuity.QueuedForRecovery): not an empty candidate.
     parked: Optional[RuntimeError] = None
+    #: The tokens THIS candidate's engine call reported (llm.get_usage() read
+    #: inside the candidate's own task), or None when nothing was reported.
+    #: Carried out of the task because the task's context dies with it.
+    usage: Optional[dict] = None
 
     @property
     def usable(self) -> bool:
@@ -67,6 +71,14 @@ async def _generate_one(
     temperature: float,
     max_tokens: Optional[int],
 ) -> Candidate:
+    # Each gathered candidate runs in its own asyncio task, and a task runs
+    # in a COPY of the parent's context: whatever llm._usage it records dies
+    # with the task, and the copy STARTS with the parent's running total.
+    # Reset here so the candidate measures only its own call, then carry the
+    # figure out on the Candidate for generate_candidates to fold back into
+    # the turn (2026-09-13: F045 made the candidates record, the gather
+    # dropped it all — best-of-N turns still reached the ledger unmeasured).
+    llm.reset_usage()
     try:
         reasoning, answer = await llm.chat_completion_with_reasoning(
             messages,
@@ -74,17 +86,43 @@ async def _generate_one(
             temperature=temperature,
             max_tokens=max_tokens,
         )
-        return Candidate(index=index, reasoning=reasoning, answer=answer)
+        return Candidate(
+            index=index, reasoning=reasoning, answer=answer, usage=llm.get_usage()
+        )
     except (QueuedForRecovery, LeaseLost) as exc:
         # Not a bad sample: the turn is parked for the main model (CONTRACT
         # §8.3) or its row was taken over by another resumer, and nothing
         # may stand in. Carried back so generate_candidates raises it once,
         # after every sibling has ended (a parked hold ends them at once),
         # instead of leaving sibling tasks to raise unread.
-        return Candidate(index=index, parked=exc)
+        return Candidate(index=index, parked=exc, usage=llm.get_usage())
     except Exception as exc:  # noqa: BLE001 — one bad sample must not kill the turn
         log.warning("best-of-N candidate %d failed: %s", index, str(exc)[:200])
-        return Candidate(index=index, error=str(exc)[:300])
+        # A call can report usage and still fail after (a parse of the
+        # response, say): tokens the engine spent are counted even so.
+        return Candidate(index=index, error=str(exc)[:300], usage=llm.get_usage())
+
+
+def _fold_usage(candidates: Sequence[Candidate]) -> None:
+    """Add every candidate's reported usage to the CALLER's turn total.
+
+    Only candidates that reported contribute. When none did, the caller's
+    llm._usage is left exactly as it was — None stays None ("not measured"),
+    never a fabricated zero with a call count (2026-09-13, F045 follow-up).
+    """
+    reported = [c.usage for c in candidates if c.usage]
+    if not reported:
+        return
+    prev = llm.get_usage() or {"prompt_tokens": 0, "completion_tokens": 0, "calls": 0}
+    llm._usage.set(
+        {
+            "prompt_tokens": prev["prompt_tokens"]
+            + sum(int(u.get("prompt_tokens") or 0) for u in reported),
+            "completion_tokens": prev["completion_tokens"]
+            + sum(int(u.get("completion_tokens") or 0) for u in reported),
+            "calls": prev["calls"] + sum(int(u.get("calls") or 0) for u in reported),
+        }
+    )
 
 
 async def generate_candidates(
@@ -108,6 +146,8 @@ async def generate_candidates(
             )
         )
     )
+    # Before the parked re-raise: tokens spent before the park are spent.
+    _fold_usage(candidates)
     for candidate in candidates:
         if candidate.parked is not None:
             raise candidate.parked
