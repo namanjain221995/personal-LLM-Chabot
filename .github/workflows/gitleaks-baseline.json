@@ -190,24 +190,6 @@
       "rule": "generic-api-key",
       "file": "docs/developer-platform/STANDARDS.md",
       "line": 803
-    },
-    {
-      "fingerprint": "1a866fc5504866cd3263efed9368bf828d6186fb:orchestrator/tests/test_api_platform_webhook_growth.py:generic-api-key:46",
-      "rule": "generic-api-key",
-      "file": "orchestrator/tests/test_api_platform_webhook_growth.py",
-      "line": 46
-    },
-    {
-      "fingerprint": "3c39f3829bef7802952d7b4dc0fed978ea8ef65c:frontend/content/docs/pages/longOutput.ts:generic-api-key:228",
-      "rule": "generic-api-key",
-      "file": "frontend/content/docs/pages/longOutput.ts",
-      "line": 228
-    },
-    {
-      "fingerprint": "af2f92502d9d4fde17fb9840c6387097e78d4139:frontend/tests/fe-audit-chat-responsive.test.tsx:generic-api-key:137",
-      "rule": "generic-api-key",
-      "file": "frontend/tests/fe-audit-chat-responsive.test.tsx",
-      "line": 137
     }
   ]
 }
