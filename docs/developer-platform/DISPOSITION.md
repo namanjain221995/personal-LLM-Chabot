@@ -97,7 +97,7 @@ proposed owner.
 |---|---|---|---|---|---|---|---|
 | F064 | P0 | CONFIRMED | cicd | A fork pull request can execute arbitrary code on the production DGX as a sudo+docker user | **OPERATOR ACTION** | Cannot be fixed in code: on a `pull_request` event GitHub runs the workflow file from the pull request's own head, so every guard in `pipeline.yml` and `workflow_policy.py` is editable by the attacker. `on: pull_request:` is unchanged. Immediate remedy OA-1, durable fix OA-2. | repository owner |
 | F050 | P0 | CONFIRMED | edge-devops | The main model's raw OpenAI API is unauthenticated and reachable from the office LAN, the … | **PARTLY FIXED** | Option A (owner, 2026-09-13): the dual-mode head keeps `--host 0.0.0.0` (`launcher/techsara_cli/cluster.py` `DEFAULT_API_BIND_ADDRESS`), because vLLM takes one `--host` and its callers sit on lo, docker0, the app bridge and RoCE rail A — the worker's `vllm-worker` healthcheck curls `http://10.100.184.1:8000/health` and kills its rank after 8 misses. The narrower bridge-gateway bind of commit 229031c would have taken the TP=2 engine down on its next recreate and is reverted. Exposure is closed by `scripts/host-guard.sh` (table `inet techsara_guard`; tests `launcher/tests/test_host_guard.py`): tcp 8000-8005, 9100, 9835, 9838 accepted from lo, the Docker bridges (172.16.0.0/12 on docker0/br-*) and both rails; dropped on `enP7s7` (office LAN), `tailscale0` and any other ingress, IPv4 and IPv6. `.env.example` and the single-node published overlays still bind 8000 to `TECHSARA_MODEL_BIND_ADDRESS`. **Not live** until OA-4. | infrastructure hardening wave (script); repository owner (OA-4) |
-| F065 | P1 | ADJUSTED | cicd | The raw, unauthenticated vLLM OpenAI API is bound to 0.0.0.0:8000 and the verify gate is blind … | **PARTLY FIXED** | Half (1): as F050 — the bind stays wide under option A and the host guard closes it (OA-4). Half (2): `verify` reads the live listener (`.github/workflows/scripts/engine_bind.py check`, commit 2fd37f3), which is RED against the deliberate `0.0.0.0:8000` as written; under option A the CI/CD owner is changing it to accept a wildcard only when it is guarded, and the owner turns that into an enforced gate by setting `ENGINE_EXPOSURE_ENFORCE=true` once `scripts/host-guard.sh verify` passes (OA-4 step 4). | CI/CD (verify gate); repository owner (OA-4) |
+| F065 | P1 | ADJUSTED | cicd | The raw, unauthenticated vLLM OpenAI API is bound to 0.0.0.0:8000 and the verify gate is blind … | **PARTLY FIXED** | Half (1): as F050 — the bind stays wide under option A and the host guard closes it (OA-4). Half (2): FIXED. `verify` no longer judges the bind address; its last step asks whether the engine API can be reached from outside the cluster and answers by behaviour (`.github/workflows/scripts/engine_bind.py check`, tests `.github/workflows/scripts/tests/test_engine_bind.py`). A wildcard passes only when, from the worker over ssh, the head's cluster-fabric address (kernel-checked: an RDMA link with no default route and the worker on its subnet) accepts a connection on the engine port and every other global address refuses or drops it while its ssh port stays reachable. Anything unprovable fails. The report names roles, never addresses. The gate is always enforced — there is no switch — so it stays RED until OA-4 is applied, which is the true state. | CI/CD (verify gate); repository owner (OA-4) |
 | F066 | P1 | CONFIRMED | cicd | workflow_policy P4 accepts an INVERTED branch guard, so a self-hosted job restricted to "every … | **DEFERRED** | Not fixed. P4 still tests `refs/heads/<default>` as a substring and skips the pull_request check when the condition contains `!=`, so an inverted guard passes. Low value until OA-1/OA-2, because the policy job itself runs from the pull request head (F064). | CI/CD |
 | F067 | P1 | CONFIRMED | cicd | The whole gate architecture assumes branch protection that does not exist; `CI passed` is not a … | **OPERATOR ACTION** | Repository settings, not code: required reviewers and a `main`-only branch policy on the `production` environment, and a ruleset on `main` requiring `CI passed` and one review. OA-5. | repository owner |
 | N021 | P1 | FOUND IN VERIFICATION | cicd | P4 is skipped entirely when `runs-on` is an expression: a matrix can smuggle `self-hosted` past … | **DEFERRED** | Not fixed. `_runs_on_text` still stringifies a `${{ }}` expression, so a matrix can smuggle `self-hosted` past P4. | CI/CD |
@@ -362,12 +362,11 @@ sudo scripts/host-guard.sh apply
 #    office LAN to 192.168.9.54:8000 must TIME OUT. Exits 1 on any FAIL.
 scripts/host-guard.sh verify
 
-# 4. Only after step 3 passes: make the pipeline enforce the guarded exposure.
-gh variable set ENGINE_EXPOSURE_ENFORCE --body true --repo namanjain221995/personal-LLM-Chabot
+# 4. Nothing to switch on: the next deploy's "Verify production" step proves
+#    the same thing from the worker and turns green by itself.
 ```
 
-Set the variable to the literal `true`: an unset Actions variable is `null`,
-not `false`. After step 3 also send one real chat, open Grafana (every
+After step 3 also send one real chat, open Grafana (every
 Prometheus target still UP), and from an office laptop confirm
 `curl -m 5 http://192.168.9.54:8000/v1/models` times out.
 
@@ -706,7 +705,7 @@ the console.
 
 | proposed owner | findings |
 |---|---|
-| CI/CD | F066, N021, N022, F073, N024; the remainder of N023; the `ENGINE_EXPOSURE_ENFORCE` gate of F065 (OA-4 step 4) and F074 (a dispatch-only rollback job); the dispatch job of OA-2 |
+| CI/CD | F066, N021, N022, F073, N024; the remainder of N023; F074 (a dispatch-only rollback job); the dispatch job of OA-2 |
 | Orchestrator wiring (`app/main.py`) | F017, F021, F022, F014, N015; remainders of F023 (chat routes) and F030(a); a start-up sweep for orphaned background responses (F025) |
 | Database | F035, F038, F039, N011; remainders of F036, F040 (`usage_events`, `query_traces`, `chat_requests` retention), F041, N009 |
 | Frontend BFF hardening | F079, F009, F011, N001; remainders of F006 and F030(b) |

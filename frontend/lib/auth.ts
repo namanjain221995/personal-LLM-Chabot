@@ -232,24 +232,25 @@ const PUBLIC_PAGES = new Set(['/login', '/accept-invite', '/access-removed']);
 const PUBLIC_PREFIXES = ['/share/'] as const;
 
 /**
- * WHY /docs IS NOT IN THE LIST ABOVE (2026-09-12, CONTRACT §17).
+ * THE DEVELOPER DOCUMENTATION IS PUBLIC (owner decision, 2026-09-13).
  *
- * The developer documentation is for signed-in people: "signed-in users may
- * read the documentation" is the whole of what the contract grants, and it
- * grants it to every member — reading /docs needs no capability, unlike the
- * console at /api, which needs `api.console.access`. So /docs takes the
- * ordinary road through `authRedirect`: a signed-in visitor is let through at
- * any depth, a signed-out one goes to /login like every other page.
+ * Until 2026-09-13 /docs was for signed-in people only (CONTRACT §17). The
+ * owner published it: anyone can read /docs and every page under it, signed
+ * in or not. It is static reference text rendered from frontend/content/docs
+ * with no session call, so publishing it exposes no workspace data.
  *
- * That is a decision, not an oversight, and the alternative was considered.
- * Adding '/docs/' to PUBLIC_PREFIXES would publish the documentation to the
- * internet, and it would do so INCONSISTENTLY, because the depth guard below
- * admits exactly one segment: /docs/quickstart would be public while
- * /docs/guides/webhooks bounced to sign-in. A gate that depends on how deep a
- * page happens to sit is worse than either answer. Should the documentation
- * ever be published, it needs a prefix rule with no depth guard, its own
- * review, and a note here saying so.
+ * Deliberately NOT a PUBLIC_PREFIXES entry: that list's depth guard admits
+ * exactly one segment, which would have published /docs/quickstart and
+ * bounced /docs/guides/webhooks to sign-in. The docs need the whole subtree,
+ * so they get their own rule with no depth guard — and only the subtree:
+ * `/docsx` and `/docs-private` are ordinary gated pages. The developer
+ * CONSOLE at /api is unaffected and stays signed-in and capability-gated.
  */
+const PUBLIC_TREES = ['/docs'] as const;
+
+function isPublicTreePage(page: string): boolean {
+  return PUBLIC_TREES.some((root) => page === root || page.startsWith(`${root}/`));
+}
 
 function isPublicPrefixPage(page: string): boolean {
   return PUBLIC_PREFIXES.some(
@@ -311,6 +312,8 @@ export function authRedirect(
   // A shared conversation opens for anyone holding the link — that is what a
   // share IS. The token in the path is the credential; the server checks it.
   if (isPublicPrefixPage(page)) return null;
+  // The developer documentation, at any depth (owner decision, 2026-09-13).
+  if (isPublicTreePage(page)) return null;
   return '/login';
 }
 

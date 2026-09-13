@@ -306,6 +306,35 @@ function serveMe(capabilities: string[]) {
 }
 
 describe('the admin sidebar', () => {
+  it('links to the developer platform at /api for an admin who may open the console', async () => {
+    // Owner request 2026-09-13: API keys, projects and usage are one click from
+    // the admin rail, for exactly the capability the console itself requires.
+    serveMe([...BASE_CAPS, 'api.console.access']);
+    render(
+      <AdminLayout>
+        <div />
+      </AdminLayout>,
+    );
+    await waitFor(() => expect(screen.getAllByText('Members').length).toBeGreaterThan(0));
+    const rail = within(screen.getByRole('navigation'));
+    expect(rail.getByText('Developer')).toBeTruthy();
+    const link = rail.getByRole('link', { name: 'API platform' });
+    expect(link.getAttribute('href')).toBe('/api');
+  });
+
+  it('does not draw the developer platform link without the console capability', async () => {
+    serveMe(BASE_CAPS.filter((c) => c !== 'api.console.access'));
+    render(
+      <AdminLayout>
+        <div />
+      </AdminLayout>,
+    );
+    await waitFor(() => expect(screen.getAllByText('Members').length).toBeGreaterThan(0));
+    const rail = within(screen.getByRole('navigation'));
+    expect(rail.queryByRole('link', { name: 'API platform' })).toBeNull();
+    expect(rail.queryByText('Developer')).toBeNull();
+  });
+
   it('hides the analytics and infrastructure sections without the capability', async () => {
     serveMe(BASE_CAPS);
     render(

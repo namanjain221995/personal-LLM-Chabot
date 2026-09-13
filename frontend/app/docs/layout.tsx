@@ -6,15 +6,10 @@ import { DocsShell } from '@/components/docs/DocsShell';
 /**
  * /docs — the TechSara developer documentation (CONTRACT §17).
  *
- * Signed-in people only, and that is decided at the edge, not here: `/docs`
- * is deliberately absent from the public-page list in lib/auth.ts, so a
- * signed-out visitor is redirected to /login at any depth. Reading the
- * documentation needs no capability — unlike the console at /api, which needs
- * `api.console.access`.
- *
- * `noindex` because the site is not public. If it is ever published, that is
- * a decision with its own review (the note in lib/auth.ts says what would
- * have to change), and this line is one of the things it would change.
+ * Public, at any depth (owner decision, 2026-09-13): lib/auth.ts lets a
+ * signed-out visitor read /docs and everything under it. Nothing here reads a
+ * session. The console at /api is unaffected — signed in, and it needs
+ * `api.console.access`. Search engines may index it now that it is public.
  */
 export const metadata: Metadata = {
   title: {
@@ -24,7 +19,7 @@ export const metadata: Metadata = {
   description:
     'Build against the TechSara developer platform: the Responses API, ' +
     'streaming, background responses, webhooks, errors and rate limits.',
-  robots: { index: false, follow: false },
+  robots: { index: true, follow: true },
 };
 
 export default function DocsLayout({ children }: { children: ReactNode }) {
