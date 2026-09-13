@@ -410,7 +410,7 @@ describe('every section has an empty state and invents no numbers', () => {
     { tab: 'projects', routes: { projects: { projects: [] } }, expect: /No projects yet/i },
     { tab: 'keys', routes: { projects: { projects: [] } }, expect: /No projects, so no keys/i },
     { tab: 'models', routes: { models: { models: [] } }, expect: /No models are published/i },
-    { tab: 'playground', routes: { models: { models: [] } }, expect: /No model is published/i },
+    { tab: 'playground', routes: { models: { models: [] } }, expect: /No chat model is published/i },
     { tab: 'usage', routes: { projects: { projects: [] } }, expect: /No projects to measure/i },
     { tab: 'logs', routes: { projects: { projects: [] } }, expect: /No projects to log/i },
     { tab: 'webhooks', routes: { projects: { projects: [] } }, expect: /No projects to notify/i },
@@ -520,14 +520,18 @@ describe('the projects table', () => {
 
 describe('the scopes the console offers', () => {
   it('is exactly the closed vocabulary the server declares, and nothing more', () => {
-    // orchestrator/app/apiplatform/scopes.py: Scope has these four members and
-    // `validate` raises UnknownScopeError for anything else, so a fifth box on
-    // this form would be a key the platform refuses to mint.
+    // orchestrator/app/apiplatform/scopes.py: Scope has these seven members
+    // (the last three since 2026-09-13, with the embeddings, rerank and speech
+    // endpoints) and `validate` raises UnknownScopeError for anything else, so
+    // an eighth box on this form would be a key the platform refuses to mint.
     expect(SCOPES.map((s) => s.id)).toEqual([
       'models.read',
       'responses.read',
       'responses.write',
       'usage.read',
+      'embeddings.write',
+      'rerank.write',
+      'audio.write',
     ]);
   });
 
@@ -537,6 +541,9 @@ describe('the scopes the console offers', () => {
     expect(hints['responses.read']).toBe('Read responses created by this project.');
     expect(hints['responses.write']).toBe('Create and cancel responses.');
     expect(hints['usage.read']).toBe('Read this project’s usage counters.');
+    expect(hints['embeddings.write']).toBe('Create embeddings.');
+    expect(hints['rerank.write']).toBe('Rerank documents against a query.');
+    expect(hints['audio.write']).toBe('Transcribe audio.');
   });
 
   it('names no webhook scope, because the platform defines none', () => {
@@ -889,7 +896,14 @@ describe('the show-once key after the dialog closes', () => {
     expect(post.url).toBe(`/api/devplatform/${consolePaths.keys(PROJECT.id)}`);
     expect(JSON.parse(String(post.init.body))).toEqual({
       name: 'Production server',
-      scopes: ['models.read', 'responses.read', 'responses.write'],
+      scopes: [
+        'models.read',
+        'responses.read',
+        'responses.write',
+        'embeddings.write',
+        'rerank.write',
+        'audio.write',
+      ],
     });
     expect(Object.keys(window.sessionStorage)).toHaveLength(0);
     expect(Object.keys(window.localStorage)).toHaveLength(0);
@@ -1020,6 +1034,15 @@ describe('the limits form', () => {
 
   it('sends a 0 as a 0, because zero means zero allowed', () => {
     expect(limitsChanges(NONE, { ...blank, rpm: '0' })).toEqual({ rpm: 0 });
+  });
+
+  it('accepts a 1,000,000-token output ceiling and refuses one above it, as the server does', () => {
+    expect(limitsChanges(NONE, { ...blank, max_output_tokens: '1000000' })).toEqual({
+      max_output_tokens: 1_000_000,
+    });
+    expect(() => limitsChanges(NONE, { ...blank, max_output_tokens: '1000001' })).toThrow(
+      'Max output tokens per request must be at most 1,000,000.',
+    );
   });
 
   it('sends nothing for a field left empty, so it keeps inheriting', () => {
@@ -1440,7 +1463,12 @@ describe('the models table', () => {
       'PUT models/techsara-35b': () => jsonResponse({ model: { id: 'techsara-35b', enabled: false } }),
     });
     render(<ConsoleShell me={SUPER_ADMIN} />);
-    await waitFor(() => expect(screen.getByText('Chat · Streaming · Vision')).toBeTruthy());
+    const badges = await screen.findAllByRole('list', { name: 'techsara-35b capabilities' });
+    expect(within(badges[0]!).getAllByRole('listitem').map((li) => li.textContent)).toEqual([
+      'Chat',
+      'Streaming',
+      'Vision',
+    ]);
     const user = userEvent.setup();
     await user.click(screen.getByRole('switch', { name: /publish techsara-35b/i }));
     await waitFor(() => expect(calls.some((c) => c.method === 'PUT')).toBe(true));
@@ -1905,5 +1933,380 @@ describe('the project select on a narrow screen', () => {
     expect(wrapper.className).toContain('max-w-full');
     expect(wrapper.className).toContain('[&_select]:max-w-full');
     expect(within(wrapper).getByLabelText('Project')).toBeTruthy();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Every model TechSara runs, and 1,000,000 output tokens (owner request,
+// 2026-09-13)
+// ---------------------------------------------------------------------------
+
+const CHAT_ENDPOINTS = ['/v1/responses', '/v1/chat/completions'];
+
+function capabilities(...on: string[]) {
+  const flags = ['chat', 'streaming', 'vision', 'ocr', 'embeddings', 'rerank', 'audio_transcription', 'tools', 'background'];
+  return Object.fromEntries(flags.map((flag) => [flag, on.includes(flag)])) as Record<string, boolean>;
+}
+
+/** The six catalogue entries as `console_api._console_model` sends them. */
+const CATALOGUE = [
+  {
+    id: 'techsara-35b', object: 'model', owned_by: 'techsara', status: 'available', kind: 'chat',
+    capabilities: capabilities('chat', 'streaming', 'vision', 'background'), endpoints: CHAT_ENDPOINTS,
+    context_window: 1_000_000, max_input_tokens: 999_232, max_output_tokens: 1_000_000,
+    default_max_output_tokens: 8192, limits: { max_images_per_request: 16 }, enabled: true,
+  },
+  {
+    id: 'techsara-8b-vision', object: 'model', owned_by: 'techsara', status: 'available', kind: 'chat',
+    capabilities: capabilities('chat', 'streaming', 'vision', 'background'), endpoints: CHAT_ENDPOINTS,
+    context_window: 24_576, max_input_tokens: 24_320, max_output_tokens: 24_576,
+    default_max_output_tokens: 8192, limits: { max_images_per_request: 8 }, enabled: true,
+  },
+  {
+    id: 'techsara-ocr', object: 'model', owned_by: 'techsara', status: 'available', kind: 'chat',
+    capabilities: capabilities('chat', 'streaming', 'vision', 'ocr', 'background'), endpoints: CHAT_ENDPOINTS,
+    context_window: 8192, max_input_tokens: 7936, max_output_tokens: 8192,
+    default_max_output_tokens: 8192, limits: { max_images_per_request: 1 }, enabled: true,
+  },
+  {
+    id: 'techsara-embed', object: 'model', owned_by: 'techsara', status: 'available', kind: 'embedding',
+    capabilities: capabilities('embeddings'), endpoints: ['/v1/embeddings'],
+    context_window: 4096, max_input_tokens: 4096, max_output_tokens: null, default_max_output_tokens: null,
+    limits: { max_inputs_per_request: 256, embedding_dimensions: 1024 }, enabled: true,
+  },
+  {
+    id: 'techsara-rerank', object: 'model', owned_by: 'techsara', status: 'available', kind: 'rerank',
+    capabilities: capabilities('rerank'), endpoints: ['/v1/rerank'],
+    context_window: 4096, max_input_tokens: 4096, max_output_tokens: null, default_max_output_tokens: null,
+    limits: { max_documents_per_request: 100 }, enabled: false,
+  },
+  {
+    id: 'techsara-whisper', object: 'model', owned_by: 'techsara', status: 'not_configured', kind: 'transcription',
+    capabilities: capabilities('audio_transcription'), endpoints: ['/v1/audio/transcriptions'],
+    context_window: null, max_input_tokens: null, max_output_tokens: null, default_max_output_tokens: null,
+    limits: { max_audio_seconds: 300, max_audio_bytes: 26_214_400, response_formats: ['json', 'text', 'verbose_json'] },
+    enabled: true,
+  },
+];
+
+const cardFacts = (id: string) =>
+  Object.fromEntries(
+    Array.from(screen.getByTestId(`model-card-${id}`).querySelectorAll('dt')).map((dt) => [
+      dt.textContent,
+      dt.nextElementSibling?.textContent,
+    ]),
+  );
+
+describe('the models page lists every model the platform runs', () => {
+  function mountModels(me: Me = SUPER_ADMIN) {
+    state.search = new URLSearchParams('tab=models');
+    const calls = route({
+      'GET models': () => jsonResponse({ models: CATALOGUE, can_manage: true }),
+      'PUT models/techsara-whisper': () => jsonResponse({ model: { id: 'techsara-whisper', enabled: false } }),
+    });
+    render(<ConsoleShell me={me} />);
+    return calls;
+  }
+
+  it('shows all six with their kind and capability badges, and a publish switch on each', async () => {
+    mountModels();
+    const table = (await screen.findByRole('switch', { name: /publish techsara-35b/i })).closest('table')!;
+    for (const model of CATALOGUE) {
+      expect(within(table).getByRole('switch', { name: `Publish ${model.id} to API keys` })).toBeTruthy();
+    }
+    const badges = (id: string) =>
+      within(within(table).getByRole('list', { name: `${id} capabilities` }))
+        .getAllByRole('listitem')
+        .map((li) => li.textContent);
+    expect(badges('techsara-35b')).toEqual(['Chat', 'Streaming', 'Vision', 'Background']);
+    expect(badges('techsara-ocr')).toEqual(['Chat', 'Streaming', 'Vision', 'OCR', 'Background']);
+    expect(badges('techsara-embed')).toEqual(['Embeddings']);
+    expect(badges('techsara-rerank')).toEqual(['Rerank']);
+    expect(badges('techsara-whisper')).toEqual(['Speech-to-text']);
+    expect(within(table).getByText('Speech-to-text model')).toBeTruthy();
+    expect(within(table).getByText('Reranker')).toBeTruthy();
+  });
+
+  it('draws techsara-35b’s output ceiling as 1.0M in the table and 1,000,000 on its card', async () => {
+    mountModels();
+    const row = (await screen.findByRole('switch', { name: /publish techsara-35b/i })).closest('tr')!;
+    const cells = Array.from(row.querySelectorAll('td')).map((td) => td.textContent);
+    // Context window, max input (999,232 = the window less the safety margin
+    // and the minimum output), max output.
+    expect(cells.slice(1, 4)).toEqual(['1.0M', '999K', '1.0M']);
+    expect(cardFacts('techsara-35b')).toMatchObject({
+      'Context window': '1,000,000',
+      'Max input tokens': '999,232',
+      'Max output tokens': '1,000,000',
+      'Default output tokens': '8,192',
+      'Images per request': '16',
+    });
+    expect(screen.getByTestId('model-card-techsara-35b').textContent).toContain(
+      'must stream or run in the background',
+    );
+    expect(screen.getByTestId('model-card-techsara-35b').textContent).toContain('about 2.8–4.0 hours');
+    // A 24,576-token ceiling finishes in minutes and gets no such warning.
+    expect(screen.getByTestId('model-card-techsara-8b-vision').textContent).not.toContain('background');
+  });
+
+  it('gives each kind the ceilings that apply to it and no dash for one that does not', async () => {
+    mountModels();
+    await screen.findByTestId('model-card-techsara-embed');
+    expect(cardFacts('techsara-embed')).toEqual({
+      'Max tokens per input': '4,096',
+      'Inputs per request': '256',
+      'Embedding dimensions': '1,024',
+    });
+    expect(cardFacts('techsara-rerank')).toEqual({
+      'Max tokens per query and document': '4,096',
+      'Documents per request': '100',
+    });
+    expect(cardFacts('techsara-whisper')).toEqual({
+      'Max audio length': '300 s (5 min)',
+      'Max audio file': '25 MiB',
+      'Response formats': 'json, text, verbose_json',
+    });
+    const embedCard = screen.getByTestId('model-card-techsara-embed');
+    expect(within(embedCard).getByText('POST /v1/embeddings')).toBeTruthy();
+    expect(within(screen.getByTestId('model-card-techsara-35b')).getByText('POST /v1/chat/completions')).toBeTruthy();
+  });
+
+  it('says a model is not configured on this deployment rather than hiding it, and it can still be withdrawn', async () => {
+    const calls = mountModels();
+    const row = (await screen.findByRole('switch', { name: /publish techsara-whisper/i })).closest('tr')!;
+    expect(within(row).getByText('Not configured on this deployment')).toBeTruthy();
+    expect(
+      within(screen.getByTestId('model-card-techsara-whisper')).getByText('Not configured on this deployment'),
+    ).toBeTruthy();
+    // A configured model says nothing of the kind.
+    const main = screen.getByRole('switch', { name: /publish techsara-35b/i }).closest('tr')!;
+    expect(within(main).queryByText('Not configured on this deployment')).toBeNull();
+
+    const user = userEvent.setup();
+    await user.click(screen.getByRole('switch', { name: /publish techsara-whisper/i }));
+    await waitFor(() => expect(calls.some((c) => c.method === 'PUT')).toBe(true));
+    expect(calls.find((c) => c.method === 'PUT')!.url).toBe('/api/devplatform/models/techsara-whisper');
+  });
+
+  it('keeps every publish switch on a 400px phone, with the ceilings on the cards instead of the table', async () => {
+    mountModels();
+    for (const model of CATALOGUE) {
+      expectReachableOnPhone(await screen.findByRole('switch', { name: `Publish ${model.id} to API keys` }));
+    }
+    const row = screen.getByRole('switch', { name: /publish techsara-35b/i }).closest('tr')!;
+    const ceilings = Array.from(row.querySelectorAll('td')).slice(1, 4);
+    for (const cell of ceilings) expect(cell.className.split(/\s+/)).toContain('hidden');
+    // The badges wrap inside their own cell rather than running under the switch.
+    const identity = row.querySelector('td')!.firstElementChild as HTMLElement;
+    expect(identity.className).toContain('whitespace-normal');
+  });
+
+  it('still renders an orchestrator that predates the catalogue, as the chat model it is', async () => {
+    state.search = new URLSearchParams('tab=models');
+    route({ 'GET models': () => jsonResponse({ models: [MODEL], can_manage: false }) });
+    render(<ConsoleShell me={ADMIN} />);
+    const card = await screen.findByTestId('model-card-techsara-35b');
+    expect(within(card).getByText('Chat model')).toBeTruthy();
+    expect(within(card).getByText('POST /v1/responses')).toBeTruthy();
+    expect(cardFacts('techsara-35b')['Context window']).toBe('—');
+    expect(cardFacts('techsara-35b')['Max output tokens']).toBe('8,192');
+  });
+});
+
+describe('the playground targets every chat model', () => {
+  function mountPlayground(answer?: (init: RequestInit) => Response) {
+    state.search = new URLSearchParams('tab=playground');
+    const calls = route({
+      'GET models': () => jsonResponse({ models: CATALOGUE, can_manage: false }),
+      'POST playground/execute': (_url, init) =>
+        answer ? answer(init) : jsonResponse({ error: { message: 'unused' } }, 500),
+    });
+    render(<ConsoleShell me={ADMIN} />);
+    return calls;
+  }
+
+  const modelSelect = () => screen.getByLabelText('Model') as HTMLSelectElement;
+  const maxOutput = () => screen.getByLabelText('Max output tokens') as HTMLInputElement;
+
+  it('offers the published chat models, lists OCR as needing an image, and leaves out the other kinds', async () => {
+    mountPlayground();
+    await waitFor(() => expect(modelSelect().options.length).toBeGreaterThan(0));
+    const options = Array.from(modelSelect().options).map((o) => ({ id: o.value, disabled: o.disabled, text: o.textContent }));
+    expect(options).toEqual([
+      { id: 'techsara-35b', disabled: false, text: 'techsara-35b' },
+      { id: 'techsara-8b-vision', disabled: false, text: 'techsara-8b-vision' },
+      { id: 'techsara-ocr', disabled: true, text: 'techsara-ocr (needs an image — not in the playground yet)' },
+    ]);
+  });
+
+  it('bounds max output tokens by the chosen model: 1,000,000 on techsara-35b, 24,576 on techsara-8b-vision', async () => {
+    mountPlayground();
+    const user = userEvent.setup();
+    await user.type(await screen.findByLabelText('Input'), 'Write a very long answer.');
+    expect(maxOutput().max).toBe('1000000');
+    expect(screen.getByTestId('playground-max-output-hint').textContent).toContain('Up to 1,000,000 for techsara-35b.');
+    expect(screen.getByTestId('playground-max-output-hint').textContent).toContain('about 2.8–4.0 hours');
+
+    await user.clear(maxOutput());
+    await user.type(maxOutput(), '1000000');
+    expect((screen.getByRole('button', { name: 'Run' }) as HTMLButtonElement).disabled).toBe(false);
+
+    await user.clear(maxOutput());
+    await user.type(maxOutput(), '1000001');
+    expect(screen.getByTestId('playground-max-output-hint').textContent).toBe(
+      'Enter a whole number from 1 to 1,000,000.',
+    );
+    expect(maxOutput().getAttribute('aria-invalid')).toBe('true');
+    expect((screen.getByRole('button', { name: 'Run' }) as HTMLButtonElement).disabled).toBe(true);
+
+    await user.clear(maxOutput());
+    await user.type(maxOutput(), '30000');
+    await user.selectOptions(modelSelect(), 'techsara-8b-vision');
+    expect(maxOutput().max).toBe('24576');
+    expect(screen.getByTestId('playground-max-output-hint').textContent).toBe(
+      'Enter a whole number from 1 to 24,576.',
+    );
+    expect((screen.getByRole('button', { name: 'Run' }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it('sends a 1,000,000-token request for the chosen model and puts the same model in the snippet', async () => {
+    const s = controlledStream();
+    const calls = mountPlayground(
+      () => new Response(s.stream, { status: 200, headers: { 'content-type': 'text/event-stream' } }),
+    );
+    const user = userEvent.setup();
+    await user.type(await screen.findByLabelText('Input'), 'Everything, please.');
+    await user.clear(maxOutput());
+    await user.type(maxOutput(), '1000000');
+    expect(screen.getByTestId('playground-snippet').textContent).toContain('"max_output_tokens": 1000000');
+    await user.click(screen.getByRole('button', { name: 'Run' }));
+    await waitFor(() => expect(calls.some((c) => c.method === 'POST')).toBe(true));
+    expect(JSON.parse(String(calls.find((c) => c.method === 'POST')!.init.body))).toMatchObject({
+      model: 'techsara-35b',
+      max_output_tokens: 1_000_000,
+      stream: true,
+    });
+    s.close();
+
+    await user.selectOptions(modelSelect(), 'techsara-8b-vision');
+    await waitFor(() =>
+      expect(screen.getByTestId('playground-snippet').textContent).toContain('"model": "techsara-8b-vision"'),
+    );
+  });
+
+  it('shows the output ceiling the terminal event says was applied, and when the answer stopped there', async () => {
+    const s = controlledStream();
+    mountPlayground(
+      () => new Response(s.stream, { status: 200, headers: { 'content-type': 'text/event-stream' } }),
+    );
+    const user = userEvent.setup();
+    await user.type(await screen.findByLabelText('Input'), 'Say hello');
+    await user.click(screen.getByRole('button', { name: 'Run' }));
+    s.push(frame('response.created', 1, { response: { status: 'queued', usage: null, max_output_tokens: 512 } }));
+    s.push(frame('response.output_text.done', 2, { text: 'Hello' }));
+    s.push(
+      frame('response.completed', 3, {
+        response: {
+          status: 'completed',
+          usage: { input_tokens: 5, output_tokens: 498, total_tokens: 503 },
+          max_output_tokens: 498,
+          incomplete_details: { reason: 'max_output_tokens' },
+        },
+      }),
+    );
+    s.close();
+    const applied = await screen.findByTestId('playground-applied-ceiling');
+    expect(applied.textContent).toBe(
+      'Output ceiling applied: 498 tokens — the answer stopped because it reached this ceiling.',
+    );
+  });
+
+  it('says nothing about an applied ceiling the server did not report', async () => {
+    const s = controlledStream();
+    mountPlayground(
+      () => new Response(s.stream, { status: 200, headers: { 'content-type': 'text/event-stream' } }),
+    );
+    const user = userEvent.setup();
+    await user.type(await screen.findByLabelText('Input'), 'Say hello');
+    await user.click(screen.getByRole('button', { name: 'Run' }));
+    s.push(frame('response.completed', 1, { response: { status: 'completed', usage: null } }));
+    s.close();
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Run' })).toBeTruthy());
+    await waitFor(() => expect(document.querySelectorAll('section[aria-label="Response"] ol li')).toHaveLength(1));
+    expect(screen.queryByTestId('playground-applied-ceiling')).toBeNull();
+  });
+});
+
+describe('the helpers behind the playground bounds', () => {
+  it('reads an applied ceiling from a terminal response and treats a missing one as unknown', async () => {
+    const { readAppliedCeiling } = await import('@/components/devplatform/Playground');
+    expect(readAppliedCeiling({ response: { max_output_tokens: 999_000, incomplete_details: null } })).toEqual({
+      maxOutputTokens: 999_000,
+      stoppedAtCeiling: false,
+    });
+    expect(readAppliedCeiling({ response: { usage: null } })).toEqual({ maxOutputTokens: null, stoppedAtCeiling: false });
+    expect(readAppliedCeiling({ max_output_tokens: 7, incomplete_details: { reason: 'max_output_tokens' } })).toEqual({
+      maxOutputTokens: 7,
+      stoppedAtCeiling: true,
+    });
+  });
+
+  it('refuses a max output that is empty, fractional, zero or over the ceiling', async () => {
+    const { maxOutputProblem } = await import('@/components/devplatform/Playground');
+    expect(maxOutputProblem('1000000', 1_000_000)).toBeNull();
+    expect(maxOutputProblem('1', 1_000_000)).toBeNull();
+    for (const bad of ['', '0', '-3', '2.5', 'abc', '1000001']) {
+      expect(maxOutputProblem(bad, 1_000_000)).toBe('Enter a whole number from 1 to 1,000,000.');
+    }
+    // An unreported ceiling still refuses what can never be valid, and leaves the rest to the server.
+    expect(maxOutputProblem('5000000', null)).toBeNull();
+    expect(maxOutputProblem('0', null)).toBe('Enter a whole number of at least 1.');
+  });
+});
+
+describe('the streaming snippets', () => {
+  const streamed = {
+    baseUrl: 'https://ai.techsarasolutions.com',
+    model: 'techsara-8b-vision',
+    input: 'Describe "this".',
+    stream: true,
+    temperature: 0.2,
+    maxOutputTokens: 1_000_000,
+  };
+
+  it('reads the Python event stream line by line with a per-chunk timeout, in Python literals', () => {
+    const snippet = pythonSnippet(streamed);
+    expect(snippet).toContain('with httpx.stream(');
+    expect(snippet).toContain('"stream": True');
+    expect(snippet).not.toMatch(/:\s(true|false|null)\b/);
+    expect(snippet).toContain('timeout=httpx.Timeout(30.0, read=60.0)');
+    expect(snippet).toContain('for line in response.iter_lines():');
+    expect(snippet).not.toContain('response.json()');
+    expect(snippet).toContain('"model": "techsara-8b-vision"');
+    expect(snippet).toContain('"max_output_tokens": 1000000');
+    expect(snippet).toContain('"input": "Describe \\"this\\"."');
+  });
+
+  it('keeps the synchronous Python snippet on response.json()', () => {
+    const snippet = pythonSnippet({ ...streamed, stream: false });
+    expect(snippet).toContain('httpx.post(');
+    expect(snippet).toContain('print(response.json())');
+    expect(snippet).not.toContain('"stream"');
+  });
+
+  it('reads the JavaScript body as a stream and asks curl not to buffer', () => {
+    const js = javascriptSnippet(streamed);
+    expect(js).toContain('for await (const chunk of response.body)');
+    expect(js).not.toContain('response.json()');
+    expect(javascriptSnippet({ ...streamed, stream: false })).toContain('console.log(await response.json());');
+    expect(curlSnippet(streamed).startsWith('curl -N https://ai.techsarasolutions.com/v1/responses')).toBe(true);
+    expect(curlSnippet({ ...streamed, stream: false }).startsWith('curl https://')).toBe(true);
+  });
+
+  it('writes nested values and empty containers as Python', async () => {
+    const { pythonLiteral } = await import('@/components/devplatform/snippets');
+    expect(pythonLiteral({ a: [true, null, 1.5], b: {}, c: [] })).toBe(
+      '{\n    "a": [\n        True,\n        None,\n        1.5\n    ],\n    "b": {},\n    "c": []\n}',
+    );
   });
 });

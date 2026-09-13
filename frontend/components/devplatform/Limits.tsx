@@ -62,14 +62,23 @@ import type { ProjectLimits } from './types';
 type LimitKey = Exclude<keyof ProjectLimits, 'enforced'>;
 
 /** One row of the form: CONTRACT §12's name, default and the smallest value. */
-const FIELDS: { key: LimitKey; label: string; hint: string; min: number }[] = [
+const FIELDS: { key: LimitKey; label: string; hint: string; min: number; max?: number }[] = [
   { key: 'rpm', label: 'Requests per minute', hint: 'Platform default 60. A sliding window, counted durably.', min: 0 },
   { key: 'input_tpm', label: 'Input tokens per minute', hint: 'Platform default 200,000.', min: 0 },
   { key: 'output_tpm', label: 'Output tokens per minute', hint: 'Platform default 60,000.', min: 0 },
   { key: 'max_concurrency', label: 'Concurrent requests', hint: 'Platform default 4. The quota gate sits in FRONT of the shared admission lanes so one key cannot starve the chat app.', min: 0 },
   { key: 'daily_token_quota', label: 'Daily token quota', hint: 'Platform default 2,000,000, reset daily and surviving a restart.', min: 0 },
-  { key: 'max_input_tokens', label: 'Max input tokens per request', hint: "Platform default: the model's ceiling.", min: 1 },
-  { key: 'max_output_tokens', label: 'Max output tokens per request', hint: 'Platform default 8,192, never above the model ceiling.', min: 1 },
+  { key: 'max_input_tokens', label: 'Max input tokens per request', hint: "Platform default: the model's ceiling.", min: 1, max: 10_000_000 },
+  // Bounded at 1,000,000 (2026-09-13): techsara-35b's output ceiling is its
+  // whole context window, and `console_api.LimitsRequest` refuses more — so the
+  // form says the bound before the server has to.
+  {
+    key: 'max_output_tokens',
+    label: 'Max output tokens per request',
+    hint: "Platform default: the model's ceiling — up to 1,000,000 on techsara-35b. A request that names no ceiling still gets 8,192.",
+    min: 1,
+    max: 1_000_000,
+  },
 ];
 
 /**
@@ -107,7 +116,7 @@ export function limitsChanges(
   unlimited = false,
 ): Partial<Record<LimitKey, number>> {
   const body: Partial<Record<LimitKey, number>> = {};
-  for (const { key, label, min } of FIELDS) {
+  for (const { key, label, min, max } of FIELDS) {
     // Not enforced, so not offered and never sent (2026-09-13): a PUT of a
     // usage limit while the switch is off would be a save that does nothing.
     if (unlimited && USAGE_LIMIT_KEYS.includes(key)) continue;
@@ -122,6 +131,9 @@ export function limitsChanges(
     }
     if (!/^\d+$/.test(text) || Number(text) < min) {
       throw new Error(`${label} must be a whole number of at least ${min}.`);
+    }
+    if (max !== undefined && Number(text) > max) {
+      throw new Error(`${label} must be at most ${max.toLocaleString()}.`);
     }
     const value = Number(text);
     if (value !== saved[key]) body[key] = value;
@@ -269,6 +281,7 @@ export function LimitsPanel() {
                 <input
                   type="number"
                   min={field.min}
+                  max={field.max}
                   step={1}
                   inputMode="numeric"
                   value={draft ? draft[field.key] : ''}

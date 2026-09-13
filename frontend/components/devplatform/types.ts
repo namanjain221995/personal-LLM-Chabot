@@ -100,28 +100,130 @@ export interface CreatedKey {
 }
 
 /**
- * The code-level registry (CONTRACT §15) as `PublicModel.to_wire()` writes it,
- * plus the database's narrowing flag.
+ * What a public model is, in the registry's words (CONTRACT §15, 2026-09-13).
+ * A chat model answers /v1/responses and /v1/chat/completions; the other three
+ * each have one endpoint of their own.
+ */
+export type ModelKind = 'chat' | 'embedding' | 'rerank' | 'transcription';
+
+/**
+ * The capability flags `console_api._console_model` sends — always all nine
+ * from a current orchestrator. Every flag after the first four is optional
+ * because a pre-catalogue orchestrator sends only chat, streaming, vision and
+ * tools (and sometimes embeddings); a missing flag reads as false.
+ */
+export interface ModelCapabilities {
+  chat: boolean;
+  streaming: boolean;
+  vision: boolean;
+  tools: boolean;
+  embeddings?: boolean;
+  rerank?: boolean;
+  audio_transcription?: boolean;
+  ocr?: boolean;
+  background?: boolean;
+}
+
+/**
+ * Per-model technical limits, only the ones that apply to the model. These
+ * are engine facts (an image count, a vector size, an audio length), not
+ * usage limits — the public API has none of those by owner decision.
+ */
+export interface ModelLimits {
+  max_images_per_request?: number;
+  max_inputs_per_request?: number;
+  max_documents_per_request?: number;
+  embedding_dimensions?: number;
+  max_audio_seconds?: number;
+  max_audio_bytes?: number;
+  response_formats?: string[];
+}
+
+/**
+ * One catalogued public model as `console_api._console_model` builds it: the
+ * registry's public rendering, from an allow-list, plus the database's
+ * narrowing flag.
+ *
+ * EVERY MODEL THE PLATFORM RUNS since 2026-09-13, including one this
+ * deployment has not configured (`status: 'not_configured'`) — the page says
+ * so rather than hiding it. `null` ceilings are "not reported", drawn as "—";
+ * a non-generative model's `max_output_tokens` is null because it has none.
+ * The fields added in that wave are optional so the page still renders
+ * against an orchestrator that predates them.
  */
 export interface ConsoleModel {
   id: string;
+  /** `available`, or `not_configured` when this deployment runs no engine for it. */
   status: string;
   /** False when a `public_models` row disabled it. The DB can only narrow. */
   enabled: boolean;
-  capabilities: {
-    chat: boolean;
-    streaming: boolean;
-    vision: boolean;
-    tools: boolean;
-    embeddings?: boolean;
-  };
+  kind?: ModelKind;
+  capabilities: ModelCapabilities;
+  /** Public `/v1` paths only; the server drops anything else. */
+  endpoints?: string[];
+  context_window?: number | null;
   max_input_tokens: number | null;
   max_output_tokens: number | null;
+  /** What a request gets when it names no max_output_tokens. */
+  default_max_output_tokens?: number | null;
+  limits?: ModelLimits;
 }
 
 export interface ModelList {
   models: ConsoleModel[];
   can_manage: boolean;
+}
+
+/**
+ * The model's kind, from the server when it says, else inferred the way
+ * `console_api._model_kind` infers it — so an older orchestrator's one model
+ * still reads as the chat model it is.
+ */
+export function modelKind(model: ConsoleModel): ModelKind {
+  if (
+    model.kind === 'chat' ||
+    model.kind === 'embedding' ||
+    model.kind === 'rerank' ||
+    model.kind === 'transcription'
+  ) {
+    return model.kind;
+  }
+  const caps = model.capabilities ?? ({} as ModelCapabilities);
+  if (caps.audio_transcription) return 'transcription';
+  if (caps.rerank) return 'rerank';
+  if (caps.embeddings && !caps.chat) return 'embedding';
+  return 'chat';
+}
+
+/** True when this deployment runs an engine for the model. */
+export function modelConfigured(model: ConsoleModel): boolean {
+  return model.status !== 'not_configured';
+}
+
+/**
+ * How long a full-ceiling answer takes at the MEASURED decode speeds of the
+ * main model (71–72 tokens/s at 500K–1M context, ~101 single-stream after the
+ * 2026-09-11 remediation): "about 2.8–4.0 hours" for 1,000,000 tokens.
+ */
+export function longAnswerHours(tokens: number): string {
+  const fast = tokens / 100 / 3600;
+  const slow = tokens / 70 / 3600;
+  return `about ${fast.toFixed(1)}–${slow.toFixed(1)} hours`;
+}
+
+/** The public endpoints a model is served on, from the server or by kind. */
+export function modelEndpoints(model: ConsoleModel): string[] {
+  if (Array.isArray(model.endpoints)) return model.endpoints;
+  switch (modelKind(model)) {
+    case 'embedding':
+      return ['/v1/embeddings'];
+    case 'rerank':
+      return ['/v1/rerank'];
+    case 'transcription':
+      return ['/v1/audio/transcriptions'];
+    default:
+      return ['/v1/responses', '/v1/chat/completions'];
+  }
 }
 
 /** One day of `GET /usage`. The ledger sums counts, so these are measured. */
@@ -249,6 +351,12 @@ export const SCOPES: { id: string; label: string; hint: string }[] = [
   { id: 'responses.read', label: 'Read responses', hint: 'Read responses created by this project.' },
   { id: 'responses.write', label: 'Create responses', hint: 'Create and cancel responses.' },
   { id: 'usage.read', label: 'Read usage', hint: 'Read this project’s usage counters.' },
+  // 2026-09-13: the three endpoints for the embeddings, rerank and speech
+  // models. Keys minted before these existed keep their stored scopes and do
+  // not gain them; a new key does, by default.
+  { id: 'embeddings.write', label: 'Create embeddings', hint: 'Create embeddings.' },
+  { id: 'rerank.write', label: 'Rerank documents', hint: 'Rerank documents against a query.' },
+  { id: 'audio.write', label: 'Transcribe audio', hint: 'Transcribe audio.' },
 ];
 
 /** Webhook events a project may subscribe to (CONTRACT §14). */
