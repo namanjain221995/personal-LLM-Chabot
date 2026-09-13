@@ -32,6 +32,7 @@ for earlier attempts), given at the bottom and run here against planted rows.
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 from types import SimpleNamespace
 
@@ -682,6 +683,80 @@ def test_a_client_that_disconnects_mid_stream_reconnects_to_exactly_one_final_me
     assert [k for k, _ in _parse_sse(replay.text)] == ["meta", "token", "meta", "done"]
     assert len(_assistant_rows("dc-1")) == 1
     assert [(r["attempt"], r["terminal_state"]) for r in _ledger("int-dc-1")] == [(1, "completed")]
+
+
+def test_a_disconnect_while_a_frame_is_in_flight_detaches_the_reader_at_once(monkeypatch):
+    """The race behind the intermittent wait in test 5 (Pipeline run
+    34745115268), made deterministic, for every way a live generation is
+    streamed: the POST /chat that started it, a POST /chat that re-sends the
+    same intent and joins it, and GET /chat/attach.
+
+    A disconnect cancels the response wherever it is suspended. Usually that
+    is inside `LiveGeneration.follow()` (parked on the condition), and its
+    `finally` gives the subscriber back at once. But when a frame was just
+    published, the follower wakes before the cancellation arrives, yields the
+    frame, and the response is inside `send` with it: the cancellation lands
+    OUTSIDE the generator, which is left suspended at `yield`. Its `finally`
+    (`subscribers -= 1`) then waits for the cyclic garbage collector, which
+    may not run for the rest of the generation, and until it does
+    `_finalize_generation` believes a reader is still attached. The response
+    must close its body iterator itself.
+
+    Collection is paused for the scenario so a gen-0 pass cannot free the
+    stranded generator and hide the leak. Nothing waits on wall time for the
+    release: the count must be back to zero by the time the cancelled request
+    has returned.
+    """
+    calls: list = []
+
+    async def drop_while_a_frame_is_in_flight(gen, task) -> None:
+        # Attached, and parked on the condition with the buffer drained (the
+        # condition's waiter queue is the only sign of the latter).
+        await _wait_until(lambda: gen.subscribers == 1 and len(gen.cond._waiters) == 1)
+        # Publish and drop in the same loop pass: publish() takes an
+        # uncontended lock without suspending, so the follower is woken
+        # before the cancellation reaches the response.
+        await gen.publish("status", {"text": "still working"})
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert gen.subscribers == 0, "a reader that is gone is still counted"
+
+    async def scenario():
+        gate = asyncio.Event()
+        monkeypatch.setattr(
+            llm, "stream_chat_events", _gated_stream(gate, [("token", "Hello ")], calls, [("token", "world!")])
+        )
+        async with _async_client() as client:
+            collecting = gc.isenabled()
+            gc.disable()
+            try:
+                first = asyncio.create_task(client.post("/chat", json=_body("dc-2", "int-dc-2")))
+                await _wait_until(lambda: bool(calls))
+                gen = _live_generations["dc-2"]
+                # The tab that started the send drops (POST /chat)...
+                await drop_while_a_frame_is_in_flight(gen, first)
+                # ...a reload re-sends the same intent and joins the live
+                # generation (POST /chat again), then drops as well...
+                again = asyncio.create_task(client.post("/chat", json=_body("dc-2", "int-dc-2")))
+                await drop_while_a_frame_is_in_flight(gen, again)
+                # ...and so does a reconnect by conversation (GET /chat/attach).
+                await drop_while_a_frame_is_in_flight(gen, asyncio.create_task(client.get("/chat/attach/dc-2")))
+            finally:
+                if collecting:
+                    gc.enable()
+
+            assert not gen.done and not gen.cancelled, "the generation is detached from every request"
+            gate.set()
+            await _wait_until(lambda: gen.done and "dc-2" not in _live_generations)
+            assert gen.subscribers == 0
+        return gen
+
+    gen = asyncio.run(scenario())
+    assert calls == [1]
+    rows = _assistant_rows("dc-2")
+    assert len(rows) == 1 and rows[0]["content"] == "Hello world!" and rows[0]["generation_id"] == gen.generation_id
+    assert [(r["attempt"], r["terminal_state"]) for r in _ledger("int-dc-2")] == [(1, "completed")]
 
 
 # ---------------------------------------------------------------------------

@@ -84,6 +84,17 @@ services:
               capabilities: [gpu]
     restart: unless-stopped
     stop_grace_period: 2m
+    # OUT-OF-MEMORY ORDER, INERT UNTIL SET: the same key, the same recommended
+    # value (-450: after every process at 0 or above and systemd-journald,
+    # before dockerd/docker-proxy at -500 and dbus/snapd/containerd below that;
+    # never -1000, which hands the kill to dockerd and so restarts every
+    # container on this node) and the same reasoning as the head's vllm service
+    # (compose.dgx-spark.yaml, OPERATIONS.md section 14). scripts/cluster-sync.sh
+    # writes ENGINE_OOM_SCORE_ADJ into worker.env only when the head's env
+    # files set it; unset, this line renders nothing and the definition hash is
+    # unchanged. `cluster-worker.sh start vllm-worker-sentinel` (the routine
+    # deploy) never converges this service -- the sentinel has no depends_on.
+    oom_score_adj: ${ENGINE_OOM_SCORE_ADJ:-0}
     # REPORT-ONLY, WITH ONE LAST-RESORT TIER (contract §6, v2). A headless
     # node has no HTTP endpoint of its own, so "healthy" means: the TP worker
     # process is alive AND the head's engine answers /health. A restarted head

@@ -55,6 +55,52 @@ sentinel_code_sha() {
   cat "${SENTINEL_FILES[@]/#/$SENTINEL_SRC_DIR/}" | sha256sum | cut -d' ' -f1
 }
 
+# engine_oom_score_adj: the ONE oom_score_adj both ranks' compose files
+# interpolate (${ENGINE_OOM_SCORE_ADJ:-0}; OPERATIONS.md section 14), resolved
+# EXACTLY the way the launcher resolves it for the head: its own dotenv parser
+# (launcher/techsara_cli/utils.py parse_env_file -- the compose-go rules, so an
+# inline ` # comment`, trailing whitespace, CRLF and quotes read as Compose
+# reads them), layered .env < secrets.env < generated.env over the process
+# environment (compose.py _environment), where a key that is PRESENT but
+# empty still wins its layer (it renders as 0). Prints "" when nothing sets a
+# value -- then worker.env gains no line, the vllm-worker definition hash is
+# unchanged, and nothing is recreated.
+#
+# Refused BEFORE worker.env is rewritten: a value that is not an integer in
+# [-1000, 1000] (the head's `docker compose config` fails on it too), and a
+# key EXPORTED in this shell with a different value from the files (the
+# launcher renders the files' value, a plain `docker compose` -- the recovery
+# script's -- the exported one: two ranks created from two numbers is the
+# state this script exists to prevent). A value at or below -500 is shipped,
+# so both ranks still agree, but warned about: it ranks the engine below
+# dockerd, which the kernel then kills first, restarting every container.
+engine_oom_score_adj() {
+  local v
+  v="$(PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$ROOT/launcher" python3 -c '
+import os, sys
+from pathlib import Path
+from techsara_cli.utils import parse_env_file
+key = "ENGINE_OOM_SCORE_ADJ"
+exported = os.environ.get(key)
+value = exported
+for layer in sys.argv[1:]:
+    if layer and Path(layer).is_file():
+        value = parse_env_file(Path(layer)).get(key, value)
+if exported is not None and value != exported:
+    sys.exit(f"{key} is exported in this shell as {exported!r} but the env files set {value!r}")
+sys.stdout.write(value or "")
+' "$ENV_FILE" "${SECRETS_ENV:-}" "$GENERATED_ENV")" \
+    || die "cannot resolve ENGINE_OOM_SCORE_ADJ (see above); unset the exported variable or fix the env files (worker.env was not rewritten)"
+  [ -n "$v" ] || return 0
+  if ! [[ "$v" =~ ^-?[0-9]{1,4}$ ]] || [ "$v" -lt -1000 ] || [ "$v" -gt 1000 ]; then
+    die "ENGINE_OOM_SCORE_ADJ='$v' is not an integer in [-1000, 1000]; fix it in .env (worker.env was not rewritten)"
+  fi
+  if [ "$v" -le -500 ]; then
+    printf 'warning: ENGINE_OOM_SCORE_ADJ=%s ranks the engine at or below dockerd (-500): the kernel kills dockerd first, which restarts every container on the node, engine included. OPERATIONS.md section 14 recommends -450.\n' "$v" >&2
+  fi
+  printf '%s' "$v"
+}
+
 # ensure_sentinel_image: the digest-pinned python image the sentinel runs on
 # is present on the worker -- pulled there, or streamed from the head with
 # docker save | docker load when the registry is unreachable. Sets
@@ -258,6 +304,9 @@ if [ "$DO_ENV" = 1 ]; then
   [ -n "${SENTINEL_IMAGE_REF:-}" ] || SENTINEL_IMAGE_REF="$(head_controller_image)"
   sentinel_token="$(ensure_sentinel_token)"
   sentinel_sha="$(sentinel_code_sha)"
+  # Resolved (and validated) before worker.env is touched; `die` inside a
+  # command substitution only ends the subshell, so the exit status is checked.
+  oom_adj="$(engine_oom_score_adj)" || exit 2
   # Interface/HCA names on the WORKER are detected there (they may differ).
   remote_facts="$(ssh_worker "$(detect_snippet); ifn=\$(detect_ifname_for_ip '$CLUSTER_WORKER_IP'); echo IFNAME=\$ifn; hca=\$(detect_hca_for_ifname \"\$ifn\" 2>/dev/null); echo HCA=\$hca; ifn2=''; hca2=''; if [ -n '${CLUSTER_WORKER_IP_2:-}' ]; then ifn2=\$(detect_ifname_for_ip '${CLUSTER_WORKER_IP_2:-}'); hca2=\$(detect_hca_for_ifname \"\$ifn2\" 2>/dev/null); fi; echo IFNAME2=\$ifn2; echo HCA2=\$hca2")"
   w_ifname="$(printf '%s\n' "$remote_facts" | sed -n 's/^IFNAME=//p')"
@@ -284,6 +333,10 @@ if [ "$DO_ENV" = 1 ]; then
     echo "CLUSTER_WORKER_NCCL_SOCKET_IFNAME=$w_ifname"
     echo "CLUSTER_WORKER_NCCL_IB_HCA=$w_hcas"
     echo "CLUSTER_WORKER_SSH=$CLUSTER_WORKER_SSH"
+    # Only when set: an absent key keeps vllm-worker's definition (and hash)
+    # byte-for-byte what it was, so a routine deploy's --env-only sync can
+    # never turn into a worker recreate through this line.
+    if [ -n "$oom_adj" ]; then echo "ENGINE_OOM_SCORE_ADJ=$oom_adj"; fi
     # generated.env never carries the token (it lives in controller.env), so
     # it is appended exactly once, last.
     echo "CLUSTER_SENTINEL_TOKEN=$sentinel_token"
@@ -294,6 +347,11 @@ if [ "$DO_ENV" = 1 ]; then
   ssh_worker "cd $WORKER_REMOTE_DIR && chmod 0600 cluster-worker.env && mv -f cluster-worker.env worker.env"
   if worker_compose config --quiet; then check_pass "worker compose config validates on $remote_host"; else check_fail "worker compose config is invalid (see above)"; fi
   check_pass "sentinel code sha ${sentinel_sha:0:12} in worker.env (a changed sha recreates vllm-worker-sentinel on the next start; an unchanged one leaves it running)"
+  if [ -n "$oom_adj" ]; then
+    check_pass "ENGINE_OOM_SCORE_ADJ=$oom_adj in worker.env (applied to vllm-worker only when that container is next CREATED; a running rank keeps the value it was created with)"
+  else
+    log_info "ENGINE_OOM_SCORE_ADJ not set: vllm-worker keeps Docker's default oom_score_adj (0) and its definition is unchanged"
+  fi
 
   # THE TWO NODES MUST AGREE ON THE TOKEN (contract §6.4). Compared as
   # digests: the head's rendered engine-controller environment (env_file

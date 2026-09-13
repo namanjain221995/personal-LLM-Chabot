@@ -699,7 +699,6 @@ connected right now to a guarded port would lose its next connection.
 sudo scripts/host-guard.sh plan       # the exact ruleset; changes nothing, needs no root
 sudo scripts/host-guard.sh apply      # self-test + preflight, nft -c -f, one atomic nft -f
 scripts/host-guard.sh verify          # table/state, loopback probes; from the worker: rail -> 200, LAN -> timeout
-gh variable set ENGINE_EXPOSURE_ENFORCE --body true --repo namanjain221995/personal-LLM-Chabot   # only after verify passes
 ```
 
 Run `verify` straight after `apply`. **If its rail probe fails, remove the
@@ -712,6 +711,44 @@ sudo scripts/host-guard.sh remove     # rollback: deletes table inet techsara_gu
 
 Also check one real chat, every Prometheus target UP, and from an office
 laptop `curl -m 5 http://192.168.9.54:8000/v1/models` timing out.
+
+### The deploy gate that proves it
+
+The last step of the pipeline's `Verify production` job, "The engine API cannot
+be reached from outside the cluster" (`.github/workflows/scripts/engine_bind.py
+check`), asks the question by behaviour after every deploy. A listener on the
+engine port bound to a specific address other than loopback or
+`CLUSTER_API_BIND_ADDRESS` fails, as before. A wildcard listener (`0.0.0.0`,
+`::`, `*`, or the IPv4-mapped `::ffff:0.0.0.0`), or a wildcard in
+`generated.env`, is the approved shape and passes only on proof from the
+worker: over `ssh -o BatchMode=yes -o StrictHostKeyChecking=yes` to
+`CLUSTER_WORKER_SSH`, a TCP connect to the head's fabric address
+(`CLUSTER_HEAD_IP`) on the engine port must succeed, and a connect to every
+other global address the kernel lists on the head (`ip -j addr`) must fail
+while the same address still answers on the ssh port, which the filter never
+judges. Exempt from probing: loopback; the second rail `CLUSTER_HEAD_IP_2`;
+`docker0` and `br-<12 hex>` bridges that have no member but `veth*` and no
+default route; and the link-local addresses of `veth*` and of the fabric links.
+A fabric address is trusted only if the kernel agrees it is a cluster link: no
+default route leaves through its interface (`ip -j route show table all
+default`) and the paired `CLUSTER_WORKER_IP` / `CLUSTER_WORKER_IP_2` is on its
+subnet. ssh failing (including an unknown worker host key), the fabric connect
+failing, python3 missing on the worker, no `generated.env`, a deployment that
+is not `dual`, a fabric address that does not look like a cluster link, a head
+with no non-cluster address at all, and a link-local address a wildcard covers
+(this gate does not probe link-local addresses): each is a failure, never a
+pass, and there is no variable that softens it. The gate uses the runner
+user's own ssh keys, `~/.ssh/config` and `known_hosts`, not
+`CLUSTER_WORKER_SSH_OPTS`. The report names roles, counts and interface
+classes only (the Actions log is public). It is **red until the head guard is applied** — on
+2026-09-13 it reported the office LAN and tailnet IPv4 addresses accepting the
+connection — and turns green on the next deploy after `apply` and `verify`
+pass, with no change to the pipeline. The same check can be run by hand on
+the head, read-only:
+
+```bash
+python3 .github/workflows/scripts/engine_bind.py check --generated-env .runtime/generated.env
+```
 
 ### Worker (OA-6)
 
@@ -746,3 +783,455 @@ office laptop `curl -m 5 http://192.168.9.68:30004/v1/models` times out.
 * Not covered: Docker-published ports (`0.0.0.0:8080`, `:3000`, `:9000`)
   traverse Docker's FORWARD path, not the input hook (DISPOSITION.md OA-7,
   OA-8).
+
+## 14. Out-of-memory protection for the engine pair
+
+**The requirement:** the kernel must not OOM-kill the main vLLM engine, and
+putting protection in place must cause no model downtime.
+
+**What `oom_score_adj` can and cannot do.** It decides the ORDER in which the
+kernel picks victims. It cannot make a victim unnecessary. On GB10 the engine's
+memory is unified GPU memory that the kernel does not count, and the only OOM
+these nodes have had (the worker, 2026-07-22) was started by the UVM driver.
+The kernel first killed four user-session processes. Together they freed about
+3 MB of anonymous memory and did not end the OOM. It then killed three
+`VLLM::EngineCore` processes, and freeing their GPU memory ended it. A
+UVM-driven OOM ends only when a process that holds GPU memory dies.
+
+So when a deficit is larger than all the expendable GPU memory on a node,
+something that takes the engine down still dies:
+
+* **At `-1000` (or `-999`)** that is **dockerd** (`-500`). Both nodes run with
+  `LiveRestore=false` and `docker.service` has `Restart=always` with
+  `RestartUSec=2s`. When dockerd comes back, it stops and restarts **every**
+  container on the node: the engine rank, and on the head also postgres, the
+  orchestrator and the tunnel. Next the kernel kills docker-proxy, dbus, snapd
+  and the containerd shims. If nothing killable is left, the kernel panics
+  with "System is deadlocked on memory". `kernel.panic` is `0` on both nodes,
+  so the node **hangs** until someone power-cycles it. It does not reboot.
+* **At `-450` (recommended)** the engine rank still dies, but LAST among the
+  application: every process at or above `-449` on that node is killed before
+  it — on the head postgres (crash recovery), the orchestrator, the frontend,
+  cloudflared, the engine controller, user sessions and systemd-journald; on
+  the worker the sentinel and journald. Each comes back only through
+  `restart: unless-stopped`, and the controller's 172–188 s pair recovery
+  (drills 3, 4 and 16, docs/availability/SLO.md) starts only after the
+  controller container itself is back. Measured projection (re-review,
+  2026-09-13): head rank 259 of the kill order after 12.4 GiB host + 27.3 GiB
+  GPU freed, worker rank 191 after 5.0 + 20.6 GiB; today the head rank is 30
+  and the worker rank 89.
+
+**The trade-off the owner accepts with `-450`.** Small and medium OOMs — the
+kind that today kill the engine almost first — no longer touch it. In an OOM
+larger than all the expendable memory on the node, the application services
+fare WORSE than today (they die before the engine instead of after it), and the
+engine dies anyway. This is a decision for the owner to confirm, not a free win.
+
+No value delivers "never". The design is:
+
+* **Engine at `-450`:** after every other killable process that matters,
+  before the Docker plumbing.
+* **Expendable GPU holders first:** OCR, speech and the auxiliary engines, as
+  much GPU memory as possible ahead of postgres and the orchestrator.
+* **Alerts:** MemAvailable and swap alerts early enough for a person to act
+  first.
+* **Root decisions**, listed under "Root-only decisions" below.
+
+**Docker applies a container's `oom_score_adj` only when it creates the
+container.** Compose recreates a container whenever its definition changes. So
+**no model reload is ever scheduled just to apply these values.** While the
+engines run, root sets the values on the running processes (the bridge below).
+The compose switches carry the values into the next recreate that happens
+anyway.
+
+### The order, with the recommended values
+
+The kernel kills the eligible process with the highest badness. Badness is
+host RSS + swap + page tables in thousandths of RAM+swap, plus
+`oom_score_adj`. On these nodes 1 point of adj is about 186 MB on the head
+and 154 MB on the worker. So any positive adj outweighs a container's real
+RSS, and the adj alone sets the order. The list runs from first victim to
+last:
+
+| adj | who | what killing it frees |
+| --- | --- | --- |
+| 900 | OCR engine (`ocr`, worker; compose.ocr.yaml) | ~15.2 GiB GPU |
+| 800 | speech (`whisper`, both nodes; compose.whisper.yaml) | 3.3 GiB (head) / 4.9 GiB (worker) GPU |
+| 700 | vllm-router, vllm-embed, vllm-reranker (head), `AUX_ENGINE_OOM_SCORE_ADJ=700` | 16.5 + 4.0 + 4.0 GiB GPU |
+| 600 | grafana, cadvisor, postgres-exporter, data-stores-exporter, blackbox-exporter | little (host RSS) |
+| 500 | prometheus, node-exporter, dgx-gpu-exporter (both nodes) — after the dashboards, they hold the incident's evidence | little |
+| 300 / 200 / 100 | user-slice processes set by systemd, not this repository: `code`, `chrome` (+300; the worker's 2026-07-16/22/28 kills), the GitHub `Runner.Listener` (+200), `systemd --user`, gnome-shell, Xwayland (+100) | little |
+| 0 | every application service: postgres, orchestrator, frontend, sync-worker, searxng, pgadmin, engine-controller, sentinel, cloudflared; `pg-test`, `litellm-dgx`, `ir-team-automation-postgres` | host RSS; among these the largest goes first |
+| -250 | systemd-journald | little |
+| **-450** | **the two vLLM ranks** (head `vllm`, worker `vllm-worker`), `ENGINE_OOM_SCORE_ADJ=-450` | ~25.4 GiB GPU per rank |
+| -500 | dockerd, docker-proxy — killing dockerd restarts every container on the node | — |
+| -900 / -998 / -999 | dbus-daemon, snapd / the containerd shims (including the engine's own) / containerd | — |
+| -1000 | sshd, systemd-udevd, multipathd: never chosen | — |
+
+The engine at `-450` stays after journald and before dockerd while its host
+RSS + swap stays below about 37 GiB on the head and 30 GiB on the worker. At
+that point its badness reaches journald's. Today it is 4.4 GiB and 8.6 GiB.
+`launcher/tests/test_oom_score_adj.py::OomOrderProjectionTests` holds this
+arithmetic against the measured values. A test that fails there means the
+recommended number has to be looked at again.
+
+**Why the auxiliary engines matter.** On the head today, the only
+positive-adj GPU holder is whisper, at 3.3 GiB. Suppose the engine becomes
+ineligible or drops to -450 while the router, embed and reranker stay at 0.
+Then the kernel reaches the orchestrator after about 32 GiB of killed memory,
+and postgres after about 37 GiB. Today those figures are about 55 GiB and
+63 GiB, because the engine rank itself absorbs the kill. **No value on any
+other head service gives that margin back**: the 21–25 GiB it loses is the
+engine rank's own GPU memory, which no longer absorbs the kill (re-review
+2026-09-13: GPU freed before the orchestrator 48.8 → 27.3 GiB with or without
+the auxiliary switch). `AUX_ENGINE_OOM_SCORE_ADJ=700` only keeps the router,
+embed and reranker reliably AHEAD of postgres and the orchestrator — today
+their lead is 4–6 score points, about 1 GiB of RSS+swap — and ahead of
+sync-worker and user sessions. It adds order, not margin. The orchestrator
+degrades without the three: router fallback, in-process reranking, and
+embeddings off until the service is back. `restart: unless-stopped` restarts
+them. The launcher's readiness wait counts only restarts that happen during
+its own wait, so a restart after an OOM does not disable a role at the next
+deploy.
+
+No service has, or gains, a hard memory limit (`mem_limit`, `memswap_limit`,
+`deploy.resources.limits.memory`, `oom_kill_disable`). The engines' memory is
+not charged to their cgroup, so a limit would only bound their small host RSS
+and add a second way to be killed, at a size nobody has measured. The test
+`test_no_compose_file_gives_any_service_a_hard_memory_limit` makes adding one
+a deliberate decision.
+
+### Right now, as root, without restarting anything (the bridge)
+
+**Documentation only. Nothing in this repository runs this, and it needs
+root.** The engine processes belong to root. The kernel also refuses to lower
+`oom_score_adj` without `CAP_SYS_RESOURCE`. Writing the value does not signal,
+pause or restart anything. It only changes the number the OOM killer reads,
+so it costs no downtime. **This is the zero-downtime protection for the pair
+that is running now.**
+
+Apply it to every process in each container. `docker top` prints host PIDs
+and needs no root. `choom` is in util-linux 2.39.3 on both nodes.
+
+On the head:
+
+```bash
+set_adj() { local c=$1 adj=$2 p
+  for p in $(docker top "$c" -eo pid | tail -n +2); do sudo choom -n "$adj" -p "$p"; done
+  for p in $(docker top "$c" -eo pid | tail -n +2); do
+    printf '%s %-24s %s %-16s adj=%s score=%s\n' "$(date +%T)" "$c" "$p" "$(cat /proc/$p/comm)" "$(cat /proc/$p/oom_score_adj)" "$(cat /proc/$p/oom_score)"
+  done
+}
+set_adj sf-local-ai-vllm-1 -450
+for c in sf-local-ai-vllm-router-1 sf-local-ai-vllm-embed-1 sf-local-ai-vllm-reranker-1; do set_adj "$c" 700; done
+```
+
+On the worker, in `ssh -t "$CLUSTER_WORKER_SSH"` so that `sudo` can prompt,
+define the same function and run `set_adj sf-local-ai-worker-vllm-worker-1 -450`.
+Optionally also run `set_adj sf-local-ai-ocr-ocr-1 900`, and `set_adj` with
+`800` on each node's whisper container.
+
+The engine lines must read `adj=-450`. On 2026-09-13, before any change, the
+engine processes were at adj 0 with scores 666–682 on the head and 666–703 on
+the worker.
+
+What the bridge does not cover:
+
+* **A container restart undoes it.** That includes the engine controller's
+  recovery, a sentinel `POST /restart`, `cluster-recover.sh --force` and a
+  host reboot. New processes start from the container's creation-time value,
+  which is 0 today. `docker inspect -f '{{.State.StartedAt}}' <container>`
+  shows whether a container has restarted since the bridge was applied. To
+  re-apply it automatically, root can install a timer. The following is
+  documentation only and has not been executed. The file
+  `/usr/local/sbin/techsara-oom-bridge` (root, mode 0755) is idempotent and
+  writes only a value that differs:
+
+  ```bash
+  #!/bin/bash
+  set -u
+  apply() { local c=$1 adj=$2 p
+    [ "$(docker inspect -f '{{.State.Running}}' "$c" 2>/dev/null)" = true ] || return 0
+    for p in $(docker top "$c" -eo pid | tail -n +2); do
+      [ "$(cat /proc/$p/oom_score_adj 2>/dev/null)" = "$adj" ] || choom -n "$adj" -p "$p" >/dev/null 2>&1
+    done
+  }
+  apply sf-local-ai-vllm-1 -450                      # worker copy: apply sf-local-ai-worker-vllm-worker-1 -450
+  for c in sf-local-ai-vllm-router-1 sf-local-ai-vllm-embed-1 sf-local-ai-vllm-reranker-1; do apply "$c" 700; done
+  ```
+
+  The unit pair, and enabling it:
+
+  ```bash
+  # /etc/systemd/system/techsara-oom-bridge.service
+  #   [Service]
+  #   Type=oneshot
+  #   ExecStart=/usr/local/sbin/techsara-oom-bridge
+  # /etc/systemd/system/techsara-oom-bridge.timer
+  #   [Timer]
+  #   OnBootSec=2min
+  #   OnUnitActiveSec=30s
+  #   [Install]
+  #   WantedBy=timers.target
+  sudo systemctl daemon-reload && sudo systemctl enable --now techsara-oom-bridge.timer
+  ```
+
+  After a restart, a rank runs at 0 for up to 30 s. Once `docker inspect`
+  shows the right `HostConfig.OomScoreAdj` on every container (see "Carrying
+  the values into containers"), the timer does nothing, and it can be
+  removed. Remove it too if the recommended numbers ever change, or it will
+  fight the new ones.
+* **Only processes inside the container are covered.** The engine's
+  `containerd-shim` lives in `/system.slice/containerd.service` at -998,
+  which is already below the engine. A process started later with
+  `docker exec` gets the container's creation-time value, not the bridge's.
+  The healthcheck's `curl` is one of these. It is tiny and is killed early,
+  and a killed healthcheck counts as one miss.
+* **It is not a memory budget.** A rank can still fail a CUDA allocation when
+  unified memory runs out.
+
+### Root-only decisions (the owner's call; not done by this repository)
+
+* **`kernel.panic`:** today a memory deadlock panic hangs the node. To have
+  it reboot instead, set `sudo sysctl -w kernel.panic=10` and persist it in
+  `/etc/sysctl.d/`. The trade-off: a node that reboots comes back without
+  someone at the console, but it also comes back without its crash state.
+* **Docker `live-restore`:** with `"live-restore": true` in
+  `/etc/docker/daemon.json`, a dockerd that dies no longer takes the
+  containers down with it. Docker documents `live-restore` as an option that
+  a configuration reload applies (`sudo systemctl reload docker`, which sends
+  SIGHUP and restarts no container). This has not been tried on these nodes.
+  Verify with `docker info --format '{{.LiveRestoreEnabled}}'`. If the reload
+  does not take it, only a dockerd restart applies it. With live-restore
+  still off, that restart restarts every container on the node, both engine
+  ranks included, so it belongs in its own owner-approved window. One caveat:
+  while dockerd is down, a container that writes logs faster than the log
+  pipe buffers can block.
+* **Alerting:** alert on MemAvailable (for example below 8 GiB) and on swap use
+  rising, early enough for a person to stop `pg-test`, the e2e stack or a
+  desktop session before the kernel acts. The head reached MemAvailable
+  3.20 GiB with 23 GiB in swap.
+
+### What was measured (2026-09-13, read-only)
+
+No container on either node has a memory limit. Both nodes run with
+`vm.panic_on_oom=0`, `kernel.panic=0`, `vm.overcommit_memory=0`,
+`oom_kill_allocating_task=0` and `LiveRestore=false`. No systemd-oomd or
+earlyoom runs. RAM is 121.7 GiB on each node, with 64 GiB of swap on the head
+and 32 GiB on the worker. Every container has `HostConfig.OomScoreAdj` 0.
+
+The `oom_score` shown in `/proc` is `(badness_permille + 1000) * 2/3`, so 666
+means "adj 0, almost nothing counted". GPU memory is not counted.
+
+| node | process (container) | adj | oom_score | host RSS / swap | GPU (unified) |
+| --- | --- | --- | --- | --- | --- |
+| head | `VLLM::Worker_TP` (sf-local-ai-vllm-1) | 0 | **682**, the highest container process | 0.7 GiB / 3.7 GiB | 25.4 GiB |
+| head | sync-worker python | 0 | 676 | 1.9 GiB / 1.0 GiB | — |
+| head | vllm-router EngineCore | 0 | 674 | 0.1 GiB / 2.1 GiB | 16.5 GiB |
+| head | vllm-embed, vllm-reranker EngineCore | 0 | 672 | 0.1 GiB / 1.5 GiB | 4.0 GiB each |
+| head | orchestrator uvicorn | 0 | 670 | 1.0 GiB | — |
+| head | whisper | 0 | 668 | 30 MB / 0.5 GiB | 3.3 GiB |
+| worker | `VLLM::Worker_TP` (sf-local-ai-worker-vllm-worker-1) | 0 | **703**, the highest on the node | 8.6 GiB | 25.4 GiB |
+| worker | OCR EngineCore (sf-local-ai-ocr-ocr-1) | 0 | 696 | 1.1 GiB / 5.9 GiB | 15.2 GiB |
+| worker | whisper | 0 | 675 | 0.2 GiB / 2.1 GiB | 4.9 GiB |
+| both | systemd-journald | -250 | 500 | 40–64 MB | — |
+| both | dockerd (docker-proxy the same) | -500 | 334–335 | 0.45 GiB (head) / 0.1 GiB (worker) | — |
+| both | dbus-daemon, snapd | -900 | 67 | — | — |
+| both | containerd-shim / containerd | -998 / -999 | 2 / 1 | — | — |
+| both | sshd, systemd-udevd, multipathd | -1000 | 0 | — | — |
+
+At 13:22:00 on 2026-07-22 the worker's kernel log reads
+`kthreadd invoked oom-killer: gfp_mask=0x102dc2(GFP_HIGHUSER|__GFP_ZERO|__GFP_NOWARN)`.
+It then shows these kills, in order:
+
+1. `gnome-system-mo`, anon-rss 360 kB, `oom_score_adj:100`
+2. `mutter-x11-fram`, anon-rss 624 kB
+3. `gdbus`, anon-rss 1216 kB
+4. `systemd`, anon-rss 1280 kB
+5. three `VLLM::EngineCor` processes, anon-rss 616 kB, 940 kB and 1020 kB, at `oom_score_adj:0`
+
+Kills of `code` and `chrome` at `oom_score_adj:300` followed on 2026-07-16,
+07-22 and 07-28.
+
+### When a value reaches a container, and why nothing reloads to apply it
+
+This table shows what each path does to the engine containers. A path that
+runs `up` recreates a service whose rendered definition has changed.
+
+| path | head `vllm` | worker `vllm-worker` | evidence |
+| --- | --- | --- | --- |
+| Routine deploy (Pipeline `deploy` → `scripts/deploy.sh`, `PRESERVE=1`), engine answers the probe | **not touched**: `up vllm` is skipped | **not touched**: only `cluster-sync.sh --env-only` (writes files, runs `config --quiet`) and `cluster-worker.sh start vllm-worker-sentinel` | deploy.sh:511-513; cli.py:1476, 1490-1503, 1110-1121, 1530-1546; cluster-worker.sh:17; the sentinel has no `depends_on` |
+| Routine deploy, **one** probe fails (a single 90 s urlopen, no retry) | `up -d --no-deps vllm`: **recreated if drifted** | full `cluster-sync.sh` + `cluster-worker.sh start` (all services): **recreated if drifted** | compose.py:42, 298; cli.py:1501-1503, 1512-1529, 1120 |
+| `./techsara up` or `scripts/cluster-up.sh` by hand, without the flag | recreated if drifted | recreated if drifted | same lines |
+| `CLUSTER_MODE=auto` falls back to single-node (peer not found, ssh failed) | the single-node chain also renders the switch (it is declared in compose.dgx-spark.yaml) | — | cluster.py:1025, 1053 |
+| `scripts/deploy.sh --full` | recreated (`techsara down` first) | recreated | deploy.sh:484-485 |
+| `scripts/cluster-recover.sh --clear-kernel-cache` | `up -d --no-deps vllm` after a stop | `up -d vllm-worker` after a stop | cluster-recover.sh:407-432 |
+| `scripts/cluster-recover.sh --force` | `docker restart`: keeps its old value | `compose restart`: keeps its old value | cluster-recover.sh:307, 311 |
+| Engine controller recovery, sentinel `POST /restart` | Docker API restart: keeps its old value | Docker API restart: keeps its old value | common.py; sentinel.py |
+| Pipeline verify "A rolling deploy did not restart the main model" | only reads `State.StartedAt` | — | pipeline.yml |
+
+A literal `oom_score_adj` on the engines would mark both ranks as drifted the
+moment it shipped. After that, one probe that times out behind a long prefill,
+or one hand-run `up`, would reload the model. So the engines instead carry
+switches:
+
+* `vllm` in compose.dgx-spark.yaml, the file both head chains share, and
+  `vllm-worker` in compose.cluster-worker.yaml carry
+  `oom_score_adj: ${ENGINE_OOM_SCORE_ADJ:-0}`.
+* vllm-router, vllm-embed and vllm-reranker in compose.dgx-spark.yaml carry
+  `oom_score_adj: ${AUX_ENGINE_OOM_SCORE_ADJ:-0}`.
+
+When a variable is unset, empty or 0, Compose leaves the key out and the hash
+does not change. Measured read-only with the production `--env-file` layers,
+comparing each service's rendered definition from `git show HEAD:` files with
+this tree (dual chain with the dev bind address, and the single-node chain):
+
+* **Unset:** all 11 head services are identical.
+* **`ENGINE_OOM_SCORE_ADJ=-450`:** only `vllm` changes.
+* **`AUX_ENGINE_OOM_SCORE_ADJ=700`:** only the three auxiliary engines change.
+
+In production the keys sit in `.env`, which is also the orchestrator's
+`env_file`, so the orchestrator's definition changes too. A routine deploy
+recreates it in the normal rolling way.
+
+The folded hashes of this tree, with the keys unset, equal the running labels
+for:
+
+* head `vllm` (`e4fd2c7b…`), `vllm-router` (`f4abd761…`), `vllm-embed`
+  (`2762d953…`), `vllm-reranker` (`547777d3…`), postgres, sync-worker and
+  searxng;
+* worker `vllm-worker` (`a6d7c89d…`) and `vllm-worker-sentinel`
+  (`dcc7a5bd…`), measured with the shipped `worker.env`.
+
+The sentinel's hash does not change when the key is set.
+
+**How the worker gets the same number.** `scripts/cluster-sync.sh`
+(`engine_oom_score_adj`) resolves `ENGINE_OOM_SCORE_ADJ` the way the launcher
+does:
+
+* it uses the launcher's own `parse_env_file`, so an inline `# comment`,
+  trailing spaces, CRLF and quotes read the way Compose reads them;
+* it layers `.env` < `.runtime/secrets.env` < `.runtime/generated.env` on top
+  of the process environment, and a key that is present but empty still wins
+  its layer.
+
+It writes the key into `worker.env` only when it is set. It stops before
+rewriting `worker.env` in two cases:
+
+* the value is not an integer in [-1000, 1000];
+* the key is **exported** in the shell with a different value from the files.
+  The launcher lets the files win, but a plain `docker compose` (the recovery
+  script's) lets the exported value win.
+
+It warns, but still ships, when a value is at or below -500.
+
+#### Carrying the values into containers
+
+* **Engines (`ENGINE_OOM_SCORE_ADJ=-450`).** Add the line to `.env` only
+  **immediately before a recreate that is happening for its own reason**:
+  * an owner-approved `scripts/deploy.sh --full`; set the key, then start the
+    deploy;
+  * during an incident where the pair is already down and
+    `scripts/cluster-recover.sh --clear-kernel-cache` is being run anyway; run
+    `scripts/cluster-sync.sh --env-only` first so the worker gets the key.
+
+  **Never leave the key in `.env` ahead of that moment.** While the key is set
+  and the ranks have not yet been recreated, both ranks are drifted, and a
+  single false-negative 90 s preserve probe during a routine deploy reloads a
+  serving pair. **Before any head recreate:** the folded-hash recipe below
+  must print the running label for `vllm`; otherwise the recreate also applies
+  some other drift. Once both
+  containers show `HostConfig.OomScoreAdj=-450`, the key stays in `.env` for
+  good. Removing it is also a definition change.
+* **Auxiliary engines (`AUX_ENGINE_OOM_SCORE_ADJ=700`).** The launcher runs
+  `up -d --no-deps` on these services in every deploy. Setting the key
+  therefore reloads the router, embed and reranker models, **never the main
+  engine**, on the next routine deploy. It also recreates the orchestrator, as
+  noted above. Set it before a deploy at a quiet time. First check
+  `free -g`: the router needs about 21 GiB free while it loads, and the old
+  container is stopped first. The bridge covers them until then.
+* **Side stacks** (literal values). These are applied by the next
+  `scripts/monitoring.sh up`, `scripts/whisper.sh up` (add `--all-nodes` for
+  both nodes) or `scripts/ocr.sh up`. No deploy runs any of these. Each one
+  recreates only its own containers: telemetry has a short gap, and speech or
+  OCR is unavailable while its model loads.
+
+Verify on each node with
+`docker inspect -f '{{.Name}} {{.HostConfig.OomScoreAdj}}' $(docker ps -q)`,
+and for the processes use the `set_adj` read-back loop without the `choom`
+line. A process at the right value in a container whose
+`HostConfig.OomScoreAdj` is still 0 carries only the bridge, and its next
+restart drops the value.
+
+#### Two facts to know before any head recreate
+
+1. **Prove the head is not drifted — do not assume it.** Run the folded-hash
+   recipe below and compare it with the running container's label. As of
+   2026-09-13 production contains 02b509f, `generated.env` binds `0.0.0.0` and
+   the folded hash equals the running label (`e4fd2c7b…`); the earlier
+   `172.17.0.1` bind drift is gone. A mismatch means something else would be
+   applied by the recreate — find it before recreating.
+2. **`docker compose config --hash` is wrong for services with `env_file`**
+   on Compose 5.0.2. It hashes the model before `env_file` is folded in, while
+   `up` writes the label from the folded model. Use the folded hash instead.
+   This recipe is read-only:
+
+```bash
+cd /home/techsphere/Documents/project/personal-LLM-Chabot
+mapfile -t chain < <(python3 -c 'import json; a=json.load(open(".runtime/state.json"))["compose_command"]; print("\n".join(a[:a.index("up")]))')
+s=vllm   # or any head service without depends_on
+"${chain[@]}" config --format json 2>/dev/null \
+  | python3 -c 'import json,sys; s=sys.argv[1]; d=json.load(sys.stdin); print(json.dumps({"name": d["name"], "services": {s: d["services"][s]}, "networks": d.get("networks", {}), "volumes": d.get("volumes", {})}))' "$s" \
+  | docker compose --project-name sf-local-ai --profile embeddings --profile reranker -f - config --hash "$s"
+docker inspect "sf-local-ai-$s-1" --format '{{index .Config.Labels "com.docker.compose.config-hash"}}'
+# worker, in a shell ON the worker:
+#   cd ~/.techsara-cluster && docker compose -p sf-local-ai-worker --env-file worker.env -f compose.cluster-worker.yaml config --format json \
+#     | python3 -c '<same one-liner, s=vllm-worker>' vllm-worker | docker compose -p sf-local-ai-worker -f - config --hash vllm-worker
+```
+
+### Values
+
+| service | file | switch or value | recommended | reaches the container |
+| --- | --- | --- | --- | --- |
+| head `vllm`, worker `vllm-worker` | compose.dgx-spark.yaml, compose.cluster-worker.yaml | `${ENGINE_OOM_SCORE_ADJ:-0}` | **-450** | only at a recreate that happens anyway (`--full`, incident); the bridge until then |
+| vllm-router, vllm-embed, vllm-reranker | compose.dgx-spark.yaml | `${AUX_ENGINE_OOM_SCORE_ADJ:-0}` | **700** | the next deploy after the key is set (aux models reload, not the main engine) |
+| `ocr` | compose.ocr.yaml | 900 | — | `scripts/ocr.sh up` |
+| `whisper` (both nodes) | compose.whisper.yaml | 800 | — | `scripts/whisper.sh up` |
+| grafana, cadvisor, postgres-exporter, data-stores-exporter, blackbox-exporter | compose.monitoring.yaml | 600 | — | `scripts/monitoring.sh up` |
+| prometheus, node-exporter, dgx-gpu-exporter (head and worker) | compose.monitoring.yaml, compose.monitoring-worker.yaml | 500 | — | `scripts/monitoring.sh up` |
+| postgres, orchestrator, frontend, sync-worker, searxng, pgadmin, engine-controller, sentinel, cloudflared | launcher chain / worker / tunnel | unchanged (0) | — | — |
+
+Tests that pin this: `launcher/tests/test_oom_score_adj.py` and
+`test_compose_overlays.py::test_the_engine_oom_switches_are_inert_until_set_on_both_head_chains_and_touch_nothing_else`.
+They check:
+
+* each switch and value is on the right service;
+* inert switches hash like no key, using real Compose;
+* both head chains render the engine switch;
+* the resolver parses like the launcher and like Compose, honours an
+  exported key and refuses a conflicting one;
+* every launcher call that can create the head is behind
+  `not preserve_main`;
+* outside a pair restart, the worker calls are only `--env-only` and the named
+  sentinel start;
+* recoveries only restart;
+* the order arithmetic holds against the measured values;
+* this section recommends the pinned numbers and schedules no reload.
+
+### Not changed, on purpose
+
+* **Engine switches:** `-450` is recommended, not `-1000` or `-999`. The
+  projection places `-999` after dockerd too, so it is not "the last victim".
+* **postgres, the orchestrator, the frontend and cloudflared:** they serve
+  users, and a literal value on them would recreate them for this change
+  alone. The engine controller and the sentinel are the recovery actors.
+  searxng and pgadmin are too small to matter.
+* **Outside this repository's compose files:**
+  * head: `pg-test` (4.3 GiB), `litellm-dgx`, `portainer`, `techsara-e2e-*`;
+  * worker: `ir-team-automation-postgres`.
+
+  Their owners can recreate them with `docker run --oom-score-adj 600`.
+  Stopping `pg-test` and the e2e stack while idle frees memory now.
+* **`.env.example`** should document `ENGINE_OOM_SCORE_ADJ` and
+  `AUX_ENGINE_OOM_SCORE_ADJ` next to `ENGINE_COLD_START_BUDGET_S`. That file
+  is outside this change's scope.

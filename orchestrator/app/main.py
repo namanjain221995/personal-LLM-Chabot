@@ -2611,8 +2611,29 @@ async def _upload_session_sweep_loop() -> None:
             logging.getLogger(__name__).warning("upload session sweep failed", exc_info=True)
 
 
+class _ClosingStreamingResponse(StreamingResponse):
+    """A StreamingResponse that always closes its body iterator.
+
+    Starlette abandons `body_iterator` when the response task is cancelled
+    (a client disconnect cancels `stream_response`). If the cancellation lands
+    while the generator is suspended at its `yield` (the frame is in flight to
+    `send`), its `finally` does not run until the cyclic GC frees the
+    frames/traceback cycle holding it, which can be never on an idle loop —
+    so LiveGeneration.subscribers stayed 1 for a reader that was gone.
+    `aclose()` runs that `finally` now, deterministically.
+    """
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            aclose = getattr(self.body_iterator, "aclose", None)
+            if aclose is not None:
+                await aclose()
+
+
 def _sse_response(frames: AsyncIterator[str]) -> StreamingResponse:
-    return StreamingResponse(
+    return _ClosingStreamingResponse(
         frames,
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
@@ -4597,11 +4618,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
 
     gen.task = asyncio.create_task(worker())
 
-    return StreamingResponse(
-        gen.follow(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
+    return _sse_response(gen.follow())
 
 
 @app.get("/chat/trace/{trace_id}")
@@ -4958,11 +4975,7 @@ async def chat_attach(
     viewer = await _require_viewer(http_request)
     gen = _live_generations.get(conversation_id)
     if gen is not None and not gen.done and _owns(gen, viewer):
-        return StreamingResponse(
-            gen.follow(),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-        )
+        return _sse_response(gen.follow())
     # V29: nothing live here — but the conversation's newest request may be
     # one the process that accepted it lost (a deploy, a reboot). When it is
     # resumable, run it again from its stored snapshot under a new attempt
