@@ -24,7 +24,7 @@ import time
 import uuid
 from typing import Optional
 
-from fastapi import (APIRouter, Depends, File, Form, HTTPException, Request,
+from fastapi import (APIRouter, Depends, HTTPException, Request,
                      UploadFile)
 from fastapi.responses import FileResponse, JSONResponse, Response
 from starlette.requests import ClientDisconnect
@@ -94,22 +94,103 @@ async def require_attachments(request: Request) -> None:
         )
 
 
+#: Form-parser bounds for the two multipart routes (2026-09-13). Starlette's
+#: own defaults are 1000 files and 1000 fields; a real client sends one file
+#: and at most seven short fields, and every extra part is another spool file
+#: or another string held in memory.
+_FORM_MAX_FILES = 1
+_FORM_MAX_FIELDS = 16
+#: A plain (non-file) field is an id, a filename, a purpose or a number.
+_FORM_MAX_FIELD_BYTES = 64 * 1024
+
+
+async def _read_form(request: Request, *, max_files: int):
+    """Parse the multipart body — called only AFTER the caller is known.
+
+    AUTHENTICATE FIRST (2026-09-13, wave-2 verifier). These two routes used to
+    declare `File(...)`/`Form(...)` parameters, and FastAPI parses a declared
+    body BEFORE it resolves any dependency — so `require_user` ran after the
+    whole multipart form had been spooled to temp storage. An anonymous caller
+    could make this process write ~4 GiB of temp disk per request (measured:
+    300 MiB pulled before the 401). With no body parameters, FastAPI leaves the
+    stream untouched until the handler asks for it here, by which point the
+    session, the attachment permission and the deployment switch have all been
+    checked. A body that is not a form at all is a 400, never a 500.
+    """
+    try:
+        return await request.form(
+            max_files=max_files,
+            max_fields=_FORM_MAX_FIELDS,
+            max_part_size=_FORM_MAX_FIELD_BYTES,
+        )
+    except HTTPException:
+        raise
+    except ClientDisconnect:
+        raise HTTPException(status_code=408, detail="The connection closed before the upload finished.")
+    except TypeError as exc:
+        # NOT the caller's fault, so never a 400 (2026-09-13, wave-3
+        # re-verifier): `Request.form(max_part_size=…)` exists only from
+        # Starlette 0.44, and on an older resolve this call raises TypeError
+        # ("unexpected keyword argument"). Swallowed below, it turned EVERY
+        # upload into "The upload was not a valid form." with nothing in the
+        # logs. requirements.txt now pins starlette>=0.44; this makes a
+        # regression of that pin a loud 500 instead of a quiet outage.
+        if "keyword argument" in str(exc):
+            raise
+        raise HTTPException(status_code=400, detail="The upload was not a valid form.")
+    except Exception:  # noqa: BLE001 — multipart.MultiPartException and kin
+        raise HTTPException(status_code=400, detail="The upload was not a valid form.")
+
+
+def _form_text(form, name: str, *, default: Optional[str] = None, required: bool = False) -> Optional[str]:
+    value = form.get(name)
+    if value is None:
+        if required:
+            raise HTTPException(status_code=422, detail=f"{name} is required")
+        return default
+    if not isinstance(value, str):
+        raise HTTPException(status_code=422, detail=f"{name} must be a text field")
+    return value
+
+
+def _form_int(form, name: str) -> Optional[int]:
+    value = _form_text(form, name)
+    if value is None or value.strip() == "":
+        return None
+    try:
+        return int(value.strip())
+    except ValueError:
+        raise HTTPException(status_code=422, detail=f"{name} must be an integer")
+
+
 @router.post("")
 async def create_upload(
     request: Request,
-    file: UploadFile = File(...),
-    conversation_id: str = Form(...),
-    # "dataset" (extract + profile, the original is dropped), "document"
-    # (keep the original byte-for-byte; PDFs/DOCX are not datasets and must
-    # not be profiled as one -- and the chat engine needs the actual bytes)
-    # or "video" (2026-09-09: keep the original, hash it, start the analysis
-    # job behind the response — see app/video/api.attach_upload).
-    purpose: str = Form("dataset"),
+    # The form — `file`, `conversation_id`, and `purpose`: "dataset" (extract
+    # + profile, the original is dropped), "document" (keep the original
+    # byte-for-byte; PDFs/DOCX are not datasets and must not be profiled as
+    # one -- and the chat engine needs the actual bytes) or "video"
+    # (2026-09-09: keep the original, hash it, start the analysis job behind
+    # the response — see app/video/api.attach_upload) — is read in the body
+    # of this function, after the two dependencies below. See `_read_form`.
     user: UserRow = Depends(require_user),
     _attachments: None = Depends(require_attachments),
 ) -> dict:
     if not settings.dataset_uploads_enabled:
         raise HTTPException(status_code=404, detail="dataset uploads are disabled")
+    form = await _read_form(request, max_files=_FORM_MAX_FILES)
+    try:
+        return await _create_upload_from_form(request, form, user)
+    finally:
+        await form.close()
+
+
+async def _create_upload_from_form(request: Request, form, user: UserRow) -> dict:
+    file = form.get("file")
+    if file is None or isinstance(file, str):
+        raise HTTPException(status_code=422, detail="file is required")
+    conversation_id = _form_text(form, "conversation_id", required=True)
+    purpose = _form_text(form, "purpose", default="dataset")
     if purpose == "video":
         # Its own gate (403 for the member, 404 for the deployment), checked
         # BEFORE any byte lands so a refused upload leaves nothing behind.
@@ -335,7 +416,9 @@ async def download_upload(
     here", and only the second is worth telling the user to re-attach for.
     """
     # Ownership first, and STRICTLY: `is None` counts as refused, exactly as in
-    # list_uploads. An unowned conversation must not be readable by anyone.
+    # list_uploads. An unowned conversation must not be readable by anyone, and
+    # a reserved-shape id is refused before ownership is even consulted.
+    _refuse_reserved_conversation_key(conversation_id, "upload not found")
     owner = await db.run_in_thread(db.conversation_owner, conversation_id)
     if owner is None or owner != int(user["id"]):
         raise HTTPException(status_code=404, detail="upload not found")
@@ -418,6 +501,7 @@ async def document_text(
     touches the filesystem here (this is a database lookup keyed by exact
     name), and keeping it out of the path keeps it out of route matching too.
     """
+    _refuse_reserved_conversation_key(conversation_id, "document not found")
     owner = await db.run_in_thread(db.conversation_owner, conversation_id)
     if owner is None or owner != int(user["id"]):
         raise HTTPException(status_code=404, detail="document not found")
@@ -442,6 +526,7 @@ def list_uploads(
 ) -> dict:
     # STRICT: a conversation with no row has no uploads to list, and one
     # owned by someone else is indistinguishable from that.
+    _refuse_reserved_conversation_key(conversation_id, "conversation not found")
     owner = db.conversation_owner(conversation_id)
     if owner is None or owner != int(user["id"]):
         raise HTTPException(status_code=404, detail="conversation not found")
@@ -495,6 +580,30 @@ _last_sweep_at: float = 0.0
 
 
 _CONVERSATION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+#: The synthetic conversation key a BARE /chat call falls back to,
+#: `u<user id>-<session id>` (app/main.py, `scoped_session`). It is not a
+#: conversation and must never be claimable as one — F034 of the 2026-09-12
+#: audit, confirmed P1. The same expression lives in `app/main.py` as
+#: `_SYNTHETIC_CONV_KEY_RE`; it is spelled out again rather than imported
+#: because `main` imports THIS module to mount its router, so importing back
+#: would be a cycle. If one changes, change both.
+_SYNTHETIC_CONV_KEY_RE = re.compile(r"^u\d+-")
+
+
+def _refuse_reserved_conversation_key(conversation_id: str, detail: str) -> None:
+    """Refuse the reserved `u<digits>-` shape, whoever owns the row.
+
+    Applied on the READ routes too, not only where an id is claimed. Since
+    2026-09-13 `POST /history/conversations` refuses the shape at creation as
+    well, but a row of this shape created BEFORE that (the history route
+    accepted `u7-default` until then) still names its creator as owner, and
+    every `owner == user` check in this file would answer for them honestly —
+    handing over the text a bare /chat stored under the victim's key
+    (`engines/document.save_document`). Refusing the SHAPE does not depend on
+    who owns what, so it holds for those rows too.
+    """
+    if _SYNTHETIC_CONV_KEY_RE.match(conversation_id or ""):
+        raise HTTPException(status_code=404, detail=detail)
 
 
 async def _own(conversation_id: str, user: UserRow) -> None:
@@ -506,7 +615,17 @@ async def _own(conversation_id: str, user: UserRow) -> None:
     extracted text landed under an id that whoever sent the next /chat with
     it would inherit (pre-seeding). Claiming first closes that: after this
     returns, the id belongs to this user or the request is refused.
+
+    THE SECOND DOOR (2026-09-12, F034). /chat is not the only route that can
+    claim an id — this one claims too, so refusing `u<digits>-…` there and not
+    here would have shut the front door and left this one open: an uploader
+    could claim `u7-default`, and from that moment user 7's bare calls would be
+    writing into a conversation somebody else owns, with the uploader's own
+    documents and extracted text already sitting in it. Checked BEFORE the
+    ownership lookup, so the shape is refused whether or not a row exists.
     """
+    if _SYNTHETIC_CONV_KEY_RE.match(conversation_id or ""):
+        raise HTTPException(status_code=422, detail="invalid conversation id")
     owner = await db.run_in_thread(db.conversation_owner, conversation_id)
     if owner is None:
         if not _CONVERSATION_ID_RE.match(conversation_id or ""):
@@ -530,6 +649,7 @@ async def _owned(conversation_id: str, user: UserRow) -> None:
     conversation before any session could exist under it, so an unowned id
     has no session to show and is refused exactly like someone else's.
     """
+    _refuse_reserved_conversation_key(conversation_id, "upload not found")
     owner = await db.run_in_thread(db.conversation_owner, conversation_id)
     if owner is None or owner != int(user["id"]):
         raise HTTPException(status_code=404, detail="upload not found")
@@ -779,20 +899,28 @@ async def _sweep_quietly() -> None:
 @router.post("/chunked/init")
 async def chunked_init(
     request: Request,
-    conversation_id: str = Form(...),
-    filename: str = Form(...),
-    purpose: str = Form("document"),
-    # Optional expectation (V29). A client that declares them lets `complete`
-    # tell a missing FINAL part from a finished file; one that does not gets
-    # the old behaviour, where the last part present is taken as the last.
-    size: Optional[int] = Form(None),
-    parts: Optional[int] = Form(None),
-    part_size: Optional[int] = Form(None),
+    # The form — `conversation_id`, `filename`, `purpose`, and the optional
+    # expectation (V29) `size`, `parts`, `part_size` — is read after the two
+    # dependencies below, never before them (`_read_form`). A client that
+    # declares the expectation lets `complete` tell a missing FINAL part from
+    # a finished file; one that does not gets the old behaviour, where the
+    # last part present is taken as the last.
     user: UserRow = Depends(require_user),
     _attachments: None = Depends(require_attachments),
 ) -> dict:
     if not settings.dataset_uploads_enabled:
         raise HTTPException(status_code=404, detail="uploads are disabled")
+    # No file belongs in an init: the bytes arrive as parts.
+    form = await _read_form(request, max_files=0)
+    try:
+        conversation_id = _form_text(form, "conversation_id", required=True)
+        filename = _form_text(form, "filename", required=True)
+        purpose = _form_text(form, "purpose", default="document")
+        size = _form_int(form, "size")
+        parts = _form_int(form, "parts")
+        part_size = _form_int(form, "part_size")
+    finally:
+        await form.close()
     if purpose not in ("dataset", "document", "video"):
         raise HTTPException(status_code=400, detail="unknown upload purpose")
     if purpose == "video":

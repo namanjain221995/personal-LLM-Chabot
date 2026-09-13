@@ -4,17 +4,20 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import logging
 import mimetypes
 import os
+import sys
 import uuid
 from datetime import datetime, timezone
 from typing import AsyncIterator, List, Literal, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
-from pydantic import BaseModel, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from . import context, db, llm
 from .auth import UserRow, require_user, router as auth_router
@@ -173,6 +176,18 @@ async def lifespan(_app: FastAPI):
     artifact_pipeline.set_visual_reviewer(artifact_engine.visual_reviewer)
     artifact_pipeline.install_busy_probe(_chat_is_busy)
     await artifact_pipeline.start()
+    # The developer platform (CONTRACT-3). Two pieces of wiring, both here
+    # because both need the pool open and the schema applied.
+    _configure_api_key_pepper()
+    webhook_worker = await _start_webhook_worker()
+    # Retention for the platform's tables (CONTRACT-3 §13/§16): idempotency
+    # claims past 24 h, minute counters, expired responses, delivered webhooks.
+    # `db.prune_api_platform` existed from wave 1 and NOTHING CALLED IT
+    # (wave-2 verifier, 2026-09-13), so every one of those tables grew without
+    # bound. On the artifact maintenance cadence, like the other sweeps here.
+    api_prune_task = asyncio.get_running_loop().create_task(
+        _api_platform_prune_loop(), name="api-platform-prune"
+    )
     try:
         yield
     finally:
@@ -189,12 +204,109 @@ async def lifespan(_app: FastAPI):
                 interrupted_requests,
             )
         sweep_task.cancel()
+        api_prune_task.cancel()
+        await _stop_webhook_worker(webhook_worker)
         await video_pipeline.stop()
         await artifact_pipeline.stop()
         await web_worker.stop()
         await continuity.stop()
         await engine_state.stop()
         await db.run_in_thread(db.close_pool)
+
+
+def _configure_api_key_pepper() -> None:
+    """Bind the API-key pepper to its durable store (CONTRACT-3 §5).
+
+    `apiplatform/keys.py` hashes every key secret as HMAC-SHA256(pepper,
+    secret). It refuses to invent a pepper on its own, and it must be told
+    where one lives exactly once per process, at start-up — which is here,
+    because this is the only module that is allowed to know about both the
+    key package and `db`.
+
+    THE SAVER IS INSERT-IF-ABSENT AND MUST STAY THAT WAY. `db.set_platform_secret`
+    is `INSERT … ON CONFLICT DO NOTHING` followed by a re-read, so two processes
+    racing on a fresh install converge on ONE pepper. An overwriting saver would
+    invalidate every stored `key_hash` in the workspace at once, and the symptom
+    would be every customer's key answering 401 simultaneously with nothing in
+    the logs to say why.
+
+    Wrapped because a platform that cannot be wired must not stop the chat
+    application from starting: the API surface then refuses keys (which is the
+    safe direction), and the ERROR line says so.
+    """
+    try:
+        from .apiplatform import keys as api_keys
+
+        api_keys.configure_pepper_store(
+            loader=lambda: db.get_platform_secret(api_keys.PEPPER_SECRET_NAME),
+            saver=lambda value: db.set_platform_secret(
+                api_keys.PEPPER_SECRET_NAME, value
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 — never a secret in the message
+        logging.getLogger(__name__).error(
+            "the API key pepper store could not be wired (%s); API keys will be "
+            "refused until it is",
+            type(exc).__name__,
+        )
+
+
+async def _start_webhook_worker():
+    """Start the webhook delivery loop.
+
+    CONTRACT-3 §14: a background response's `response.completed` reaches the
+    project's endpoint through a durable queue (`api_webhook_deliveries`, V34),
+    drained by one in-process loop — the same shape as `web_worker` and
+    `continuity` above, and for the same reason: the queue is a PostgreSQL
+    table, so a restart resumes rather than forgets and no second container is
+    needed to send a few HTTPS requests a minute. `worker.start()` is itself
+    idempotent and does nothing when the platform is switched off, so there is
+    no gate to duplicate here.
+
+    Imported defensively, like the `/v1` router below and for the same reason:
+    `app/apiplatform/webhooks/` belongs to another engineer in this wave, and a
+    half-written module there must not stop this process from serving chat.
+    Returns the module when it started and None when it did not, so the
+    shutdown half has something unambiguous to check rather than guessing.
+    """
+    try:
+        from .apiplatform.webhooks import worker as webhook_worker
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).info(
+            "webhook delivery loop not started: %s", type(exc).__name__
+        )
+        return None
+    try:
+        started = webhook_worker.start()
+        if inspect.isawaitable(started):
+            # `start()` is sync in web_worker/continuity and a coroutine in the
+            # video and artifact pipelines. Accepting both means this wiring
+            # does not change the day the worker's author picks one.
+            await started
+        return webhook_worker
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).error(
+            "webhook delivery loop failed to start: %s: %s",
+            type(exc).__name__,
+            exc,
+        )
+        return None
+
+
+async def _stop_webhook_worker(worker) -> None:
+    """Stop the delivery loop. Never raises: shutdown has other work to do."""
+    if worker is None:
+        return
+    try:
+        stopping = worker.stop()
+        if inspect.isawaitable(stopping):
+            await stopping
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).warning(
+            "webhook delivery loop did not stop cleanly: %s: %s",
+            type(exc).__name__,
+            exc,
+        )
 
 
 import re as _re
@@ -213,17 +325,652 @@ _CONVERSATION_ID_RE = _re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 #: A send intent (V29): browser-minted, one per press of Send, re-sent on
 #: every retry of that message. Same alphabet as a conversation id.
 _INTENT_ID_RE = _re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+#: A bare call's session label. SAME shape rule as a conversation id since
+#: 2026-09-12 (F034): it is half of the synthetic conversation key below, so an
+#: unvalidated session_id was an unvalidated conversation key — free to contain
+#: a path separator, a newline, or 4 KB of anything, and it is what names the
+#: in-process generation registry, the per-conversation document store and the
+#: Salesforce Intelligence state row.
+_SESSION_ID_RE = _re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+#: The SYNTHETIC conversation key a bare call gets: `u<user id>-<session id>`
+#: (see `scoped_session` in POST /chat). It lives in the SAME namespace as the
+#: ids clients choose, and that shared namespace is F034 (audit 2026-09-12,
+#: confirmed P1): user A could send `conversation_id="u7-default"`, claim it as
+#: an ordinary conversation, and thereafter own the key that user 7's bare
+#: calls fall back to — reading their fetched pages, their indexed repository
+#: chunks and their pending Salesforce clarification, and cancelling their
+#: generations. Nothing legitimate produces such an id: the browser mints a
+#: UUID (`newId()` in frontend/lib/history.ts) and a branch is `b-<uuid>`, so
+#: refusing this shape costs nothing and closes the namespace.
+_SYNTHETIC_CONV_KEY_RE = _re.compile(r"^u\d+-")
 #: Offline evaluation correlation only. It carries no expected answer.
 _TEST_CASE_ID_RE = _re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 
-app = FastAPI(title="TechSara Orchestrator", version="0.2.0", lifespan=lifespan)
+
+def _checked_session_id(value: str) -> str:
+    """The session label of a bare call, validated like the conversation id it
+    becomes half of (F034, 2026-09-12).
+
+    Until this existed `session_id` was an unconstrained string concatenated
+    straight into the synthetic conversation key, so it could carry anything at
+    all — a path separator, a newline, four kilobytes of text — into the keys
+    of the live-generation registry, the per-conversation URL/document/
+    repository stores and the Salesforce state table. Same alphabet and length
+    as a conversation id, because the two share one namespace.
+    """
+    if not _SESSION_ID_RE.fullmatch(value or ""):
+        raise ValueError("session_id must be 1-64 characters of [A-Za-z0-9_-]")
+    return value
+
+
+def _refuse_reserved_conversation_key(conversation_id: str) -> None:
+    """404 for a Salesforce lookup on an id shaped like somebody's bare-call key.
+
+    Belt to the braces of the ownership check beside it, and not redundant:
+    ownership is not the only way such a row can come to exist. Until
+    2026-09-13 `POST /history/conversations` accepted any id of the plain
+    conversation-id shape, `u7-default` included, so an attacker who could not
+    send it to /chat could CREATE the row there, become its owner, and read
+    user 7's Salesforce state through the two routes below, which would see
+    `owner == viewer` and answer honestly. history.py refuses the shape at
+    creation now; rows created before that still exist, and these two routes
+    will not serve them to anybody.
+    """
+    if _SYNTHETIC_CONV_KEY_RE.match(conversation_id or ""):
+        raise HTTPException(status_code=404, detail="conversation not found")
+
+
+def _reject_synthetic_conversation_id(value: Optional[str]) -> Optional[str]:
+    """Refuse a client-chosen id that looks like somebody's bare-call key.
+
+    The other half of F034. The claim path in POST /chat is careful about ids
+    that ALREADY belong to someone; the hole was the id that belongs to nobody
+    YET — `u7-default` is not a conversation, so `db.conversation_owner`
+    returns None, so the first caller to name it is handed the claim, and from
+    then on it is their conversation and user 7's bare calls write into it.
+    Refused at the door, once, rather than at each place the key is used.
+
+    Deliberately shape-only: it does NOT ask whether the number is the caller's
+    own user id. `u7-default` is refused for user 7 as well, because a caller
+    who wants that conversation can simply use their real one, and a rule with
+    an exception is a rule somebody will find the edge of.
+    """
+    if value is not None and _SYNTHETIC_CONV_KEY_RE.match(value):
+        raise ValueError("conversation_id must not begin with u<digits>- (reserved)")
+    return value
+
+#: Paths under the public developer API (CONTRACT-3 §1/§3). Everything about
+#: `/v1` is different from the chat app: the credential is an `Authorization`
+#: header and never the `ts_session` cookie, the error envelope is §9's rather
+#: than FastAPI's `{"detail": …}`, and the body cap is §12's 1 MiB. The prefix
+#: is named ONCE here so the three places that must agree cannot drift.
+_PUBLIC_API_PREFIX = "/v1/"
+_PUBLIC_API_ROOT = "/v1"
+
+
+def _is_public_api_path(path: str) -> bool:
+    """True for `/v1` and anything under it, and for nothing else.
+
+    `/v1betaX` must NOT match: a prefix test written as `startswith("/v1")`
+    would exempt a future route with a longer name from the CSRF middleware
+    below, which is precisely the kind of quiet widening this programme exists
+    to avoid.
+    """
+    return path == _PUBLIC_API_ROOT or path.startswith(_PUBLIC_API_PREFIX)
+
+
+# --------------------------------------------------------------- body size
+#
+# F016/F033 (audit 2026-09-12, confirmed P1): nothing in this process bounded a
+# request body. The first fix (2026-09-12) put ONE 128 MiB cap on every route
+# that was not an upload or `/v1`, sized for the largest legitimate /chat body.
+#
+# THE SECOND FIX, 2026-09-13 (wave-2 verifier, "unauthenticated memory
+# exhaustion is still open"). FastAPI reads and json-decodes a body BEFORE any
+# auth dependency runs, so a cap sized for /chat was a cap any anonymous caller
+# could spend on /auth/login: a 32 MiB `[{},{},…]` with no cookie took the
+# process from 158 to 989 MiB of RSS before answering 422, ~3 GB per request
+# at the cap, repeatable concurrently on a port published beside the engine.
+#
+# So the cap is now PER ROUTE FAMILY and, above the small default, PER
+# CREDENTIAL:
+#
+#   * every route gets 1 MiB — the largest legitimate body of any form, login,
+#     preference, share or console mutation is a few KiB;
+#   * the handful of routes that really carry large bodies (POST /chat, the
+#     whole-thread history sync, the microphone, the upload rail) get their
+#     documented larger cap ONLY once the request's `ts_session` cookie has
+#     resolved to a live session. Resolution is the same `resolve_principal_sync`
+#     the route's own `require_user` runs, cached on the request state, so the
+#     route does not pay for it twice;
+#   * an anonymous caller is held to 1 MiB on every route, whatever it names.
+#
+# The session is resolved LAZILY: a body that fits inside 1 MiB never costs a
+# lookup, and one that does not is decided either up front from its declared
+# `Content-Length` or at the moment the counted bytes cross 1 MiB. Nothing is
+# buffered here in either case.
+
+_MIB = 1024 * 1024
+
+#: Every route not named in `body_cap_for`: 1 MiB (2026-09-13). Overridable
+#: with MAX_REQUEST_BODY_BYTES, which only ever TIGHTENS it in practice.
+_DEFAULT_MAX_BODY_BYTES = _MIB
+
+#: POST /chat, for a signed-in caller: 128 MiB.
+#:
+#: /chat carries its attachments INLINE as base64 — images (`images`, up to
+#: MAX_IMAGES), a small PDF (`pdf`) — which is why
+#: `frontend/app/api/chat/route.ts` sets MAX_CHAT_BODY_BYTES to exactly this
+#: number. Base64 costs a third on top of the bytes, so 128 MiB of body is
+#: ~96 MiB of attachment; anything larger already streams to `/uploads` and
+#: rides the chat body as a reference. Matching the proxy's number on purpose:
+#: the two caps refuse the same request.
+_CHAT_MAX_BODY_BYTES = 128 * _MIB
+
+#: The whole-thread routes, for a signed-in caller: 32 MiB. PUT/POST
+#: `/history/conversations/{id}/messages` and POST `/chat/compact` carry a
+#: conversation's messages, and a paste has no size limit on the input path
+#: (composer paste is inline, 2026-09-06), so a long chat is legitimately
+#: megabytes. 32 MiB is `MAX_PROXY_BODY_BYTES` in `frontend/lib/proxy.ts`, the
+#: bound these routes already have on the public hostname.
+_CONVERSATION_SYNC_MAX_BODY_BYTES = 32 * _MIB
+
+#: Multipart framing allowance: the boundary, the filename, and the
+#: `conversation_id`/`purpose` fields that travel beside the file. The same
+#: 1 MiB `frontend/app/api/upload/route.ts` allows.
+_MULTIPART_FRAMING_BYTES = _MIB
+
+_HISTORY_MESSAGES_PATH_RE = _re.compile(r"^/history/conversations/[^/]+/messages$")
+_CHUNKED_PART_PATH_RE = _re.compile(r"^/uploads/chunked/[^/]+/[^/]+/part/[^/]+$")
+
+
+class BodyCap:
+    """What one request may send: `anonymous` bytes without a session, and
+    `signed_in` bytes once its session cookie resolves. For every small family
+    the two are the same number and no session is ever looked up."""
+
+    __slots__ = ("family", "anonymous", "signed_in")
+
+    def __init__(self, family: str, anonymous: int, signed_in: int) -> None:
+        self.family = family
+        self.anonymous = int(anonymous)
+        self.signed_in = max(int(signed_in), int(anonymous))
+
+    def __repr__(self) -> str:  # pragma: no cover — test failure output
+        return f"BodyCap({self.family!r}, {self.anonymous}, {self.signed_in})"
+
+
+def _positive_int_setting(attribute: str, env: str, default: int) -> int:
+    """A byte cap from `settings` (when the config owner adds it) or the
+    environment. A typo or a non-positive value keeps the default: a mistyped
+    variable must never silently REMOVE a cap."""
+    configured = getattr(settings, attribute, None)
+    if configured is None:
+        raw = (os.environ.get(env) or "").strip()
+        if not raw:
+            return default
+        try:
+            configured = int(raw)
+        except ValueError:
+            logging.getLogger(__name__).warning("%s is not an integer; using the default", env)
+            return default
+    configured = int(configured)
+    return configured if configured > 0 else default
+
+
+def _max_request_body_bytes() -> int:
+    """The default cap every route gets, read at call time."""
+    return _positive_int_setting(
+        "max_request_body_bytes", "MAX_REQUEST_BODY_BYTES", _DEFAULT_MAX_BODY_BYTES
+    )
+
+
+def _chat_max_body_bytes() -> int:
+    return _positive_int_setting(
+        "chat_max_request_body_bytes", "CHAT_MAX_REQUEST_BODY_BYTES", _CHAT_MAX_BODY_BYTES
+    )
+
+
+def _single_shot_upload_max_body_bytes() -> int:
+    """POST /uploads: what `_stream_to_disk` will actually accept, plus framing.
+
+    CORRECTED 2026-09-13 (wave-2 verifier). This used to be
+    `max(UPLOAD_MAX_MB, VIDEO_MAX_UPLOAD_MB)` on the premise that a single-shot
+    video could be 4096 MB. It cannot: `uploads._stream_to_disk` counts every
+    purpose against `UPLOAD_MAX_MB` (200), and only the CHUNKED rail applies
+    the per-purpose `_cap_total`. The ceiling was therefore ~20x anything the
+    route would keep, while the multipart parser spooled whatever arrived to
+    temp storage — measured, an unauthenticated POST pulled 300 MiB before its
+    401. Read from `settings` at call time so raising UPLOAD_MAX_MB for one
+    deployment moves this with it.
+    """
+    return int(settings.upload_max_mb) * _MIB + _MULTIPART_FRAMING_BYTES
+
+
+def _chunked_part_max_body_bytes() -> int:
+    """One chunked part is a RAW body (`request.stream()`), not multipart, and
+    the route refuses anything over `uploads._PART_CAP` (90 MiB) itself."""
+    from .uploads import _PART_CAP
+
+    return int(_PART_CAP)
+
+
+def _audio_max_body_bytes() -> int:
+    """POST /audio/transcribe streams the recording itself under
+    `ASR_MAX_UPLOAD_BYTES`; the middleware must not refuse below that."""
+    return int(getattr(settings, "asr_max_upload_bytes", 0) or 0)
+
+
+def _public_api_max_body_bytes() -> int:
+    """CONTRACT-3 §8/§12: 1 MiB on `/v1`, refused BEFORE parsing.
+
+    Imported defensively because `app/publicapi/models.py` is another wave's
+    file and this module must import cleanly whatever state that wave is in.
+    """
+    try:
+        from .publicapi.models import max_body_bytes
+
+        return int(max_body_bytes())
+    except Exception:  # noqa: BLE001 — a missing sibling must not unmount /chat
+        return _MIB
+
+
+def body_cap_for(method: str, path: str) -> BodyCap:
+    """The cap for one request line. Separate from the middleware so a test can
+    assert the table without building a request.
+
+    Method-aware on purpose: the large caps belong to the one verb that carries
+    the large body, so `PUT /chat` or `POST /uploads/chunked/init` (a form of
+    five short fields) is held to the default like everything else.
+    """
+    method = (method or "GET").upper()
+    default = _max_request_body_bytes()
+    if _is_public_api_path(path):
+        # Not session-gated: `/v1` never reads the cookie (CONTRACT-3 §1), and
+        # its cap is already the small one.
+        public = _public_api_max_body_bytes()
+        return BodyCap("public-api", public, public)
+    if method == "POST" and path == "/chat":
+        return BodyCap("chat", default, _chat_max_body_bytes())
+    if (method in ("PUT", "POST") and _HISTORY_MESSAGES_PATH_RE.match(path)) or (
+        method == "POST" and path == "/chat/compact"
+    ):
+        return BodyCap("conversation-sync", default, _CONVERSATION_SYNC_MAX_BODY_BYTES)
+    if method == "POST" and path == "/audio/transcribe":
+        return BodyCap("audio", default, _audio_max_body_bytes())
+    if method == "POST" and path == "/uploads":
+        return BodyCap("upload", default, _single_shot_upload_max_body_bytes())
+    if method == "PUT" and _CHUNKED_PART_PATH_RE.match(path):
+        return BodyCap("upload-part", default, _chunked_part_max_body_bytes())
+    return BodyCap("default", default, default)
+
+
+def body_limit_for_path(path: str, method: str = "POST") -> int:
+    """The LARGEST body one path accepts — the signed-in cap. Kept for callers
+    that ask one number of a path; an anonymous caller gets `body_cap_for(…)
+    .anonymous`, which is the default everywhere."""
+    return body_cap_for(method, path).signed_in
+
+
+async def _carries_live_session(scope) -> bool:
+    """Whether this request's session cookie resolves to a signed-in person.
+
+    Only ever asked when a body has outgrown the anonymous cap on a route whose
+    signed-in cap is larger. Uses the SAME resolver as `require_user` and
+    leaves its answer cached on `request.state`, so the route that follows does
+    not look the session up again. Any failure — the database is down, the
+    cookie is garbage — is "no": the small cap is the safe way round.
+    """
+    from starlette.requests import Request as _StarletteRequest
+
+    request = _StarletteRequest(scope)
+    try:
+        from .authn import principal as _principal
+
+        # Looked up through the module, never bound at import, so this is the
+        # resolver `require_user` calls — whatever that is in this process.
+        # Without a cookie it returns without touching the database.
+        principal = await db.run_in_thread(_principal.resolve_principal_sync, request)
+    except Exception as exc:  # noqa: BLE001 — refusing is the fallback
+        logging.getLogger(__name__).info(
+            "body cap: session could not be resolved (%s); applying the anonymous cap",
+            type(exc).__name__,
+        )
+        return False
+    return principal is not None
+
+
+class RequestBodyTooLarge(HTTPException):
+    """Raised out of the wrapped `receive` when a body outgrows its cap.
+
+    An exception rather than a short read: handing the route a TRUNCATED body
+    would turn "too large" into "malformed JSON", or worse, into a half-written
+    upload that looked complete.
+
+    It subclasses `HTTPException` for one specific reason, found while testing
+    a chunked body (2026-09-12). FastAPI parses a request body inside
+    `try: … except Exception: raise HTTPException(400, "There was an error
+    parsing the body")`, with exactly one exemption — an `HTTPException` is
+    re-raised untouched. A plain exception raised from `receive` was therefore
+    swallowed and answered `400 There was an error parsing the body`, which is
+    both the wrong status and a misleading one: the body was not malformed, it
+    was too big. Inheriting puts the refusal back in our hands, and the
+    dedicated handler registered below renders whichever envelope the surface
+    owes — Starlette resolves handlers by walking `type(exc).__mro__`, so the
+    more specific class wins over the generic `HTTPException` handler.
+    """
+
+    def __init__(self, limit: int) -> None:
+        super().__init__(
+            status_code=413,
+            detail=f"The request body is larger than {limit} bytes.",
+        )
+        self.limit = limit
+
+
+class RequestBodySizeLimitMiddleware:
+    """Refuse an over-sized body with 413, BEFORE anything parses it.
+
+    Plain ASGI, not `BaseHTTPMiddleware`, because this has to wrap `receive`:
+    `BaseHTTPMiddleware` only sees a `Request` object, by which point the body
+    is whatever the route asked for. Two doors, because either alone is a hole:
+
+    1. `Content-Length`, when the caller declares one. Cheapest possible
+       refusal — not a byte of the body is read, which is the whole point of
+       "before it is parsed".
+    2. a counting wrapper, for a body with NO declared length (HTTP/1.1
+       chunked transfer, and any client that simply lies). Nothing is buffered:
+       the count rides the frames as they already flow to the route, so a
+       200 MiB upload still crosses this process one MiB at a time.
+
+    AND ONE GUARANTEE (2026-09-13): once the count has crossed the cap, the
+    response the application starts is REPLACED with the 413, whatever it is.
+    A route class that catches every exception — `/v1`'s `PublicRoute` turns
+    anything it did not construct into a 500 `internal_error` — would otherwise
+    turn "too large" into "our fault", and the caller would retry it.
+
+    The 413 body is `{"detail": …}` — the shape `HTTPException` produces
+    everywhere else and the frontend's upload proxy already renders — except on
+    `/v1`, which owes CONTRACT-3 §9's envelope, `X-Request-Id` (§7) and its own
+    CORS headers (§3.2), and gets all three here.
+    """
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            return await self.app(scope, receive, send)
+        path = scope.get("path") or "/"
+        cap = body_cap_for(scope.get("method") or "GET", path)
+        limit = cap.anonymous
+        session_checked = cap.signed_in <= cap.anonymous
+
+        async def admit(size: int) -> bool:
+            """Whether `size` bytes fit, raising the cap to the signed-in one
+            the first time the anonymous cap is not enough."""
+            nonlocal limit, session_checked
+            if size <= limit:
+                return True
+            if not session_checked:
+                session_checked = True
+                if await _carries_live_session(scope):
+                    limit = cap.signed_in
+            return size <= limit
+
+        declared = _declared_content_length(scope)
+        if declared is not None and not await admit(declared):
+            response = _too_large_response(scope, limit)
+            return await response(scope, receive, send)
+
+        counted = 0
+        exceeded = False
+        started = False
+        replaced = False
+
+        async def counting_receive():
+            nonlocal counted, exceeded
+            if exceeded:
+                # The route asked again after being refused. Do not read one
+                # more byte off the socket on its behalf.
+                raise RequestBodyTooLarge(limit)
+            message = await receive()
+            if message.get("type") == "http.request":
+                counted += len(message.get("body") or b"")
+                if not await admit(counted):
+                    exceeded = True
+                    raise RequestBodyTooLarge(limit)
+            return message
+
+        async def guarded_send(message):
+            nonlocal started, replaced
+            kind = message.get("type")
+            if kind == "http.response.start":
+                if exceeded:
+                    replaced = True
+                    started = True
+                    response = _too_large_response(scope, limit)
+                    await response(scope, _no_more_body, send)
+                    return
+                started = True
+            elif replaced:
+                return  # the route's own body belongs to the response we dropped
+            await send(message)
+
+        try:
+            await self.app(scope, counting_receive, guarded_send)
+        except RequestBodyTooLarge:
+            if started:
+                # The route had already begun answering (a streamed response
+                # that reads its body late). The status line is spent, so the
+                # only honest move is to stop feeding it; logged because it is
+                # the one path here that cannot say 413.
+                if not replaced:
+                    logging.getLogger(__name__).warning(
+                        "body over the %d byte cap on %s after the response began",
+                        limit,
+                        path,
+                    )
+                return
+            response = _too_large_response(scope, limit)
+            await response(scope, _no_more_body, send)
+
+
+async def _no_more_body():
+    """A `receive` for the 413 itself: the refused body is never read further."""
+    return {"type": "http.disconnect"}
+
+
+def _declared_content_length(scope) -> Optional[int]:
+    """The caller's own `Content-Length`, or None when it is absent or not a
+    plain non-negative integer. A malformed value is treated as ABSENT, never
+    as zero: the counting wrapper is then what decides, which is the safe way
+    round."""
+    for name, value in scope.get("headers") or ():
+        if name == b"content-length":
+            try:
+                declared = int(value.decode("latin-1").strip())
+            except (ValueError, UnicodeDecodeError):
+                return None
+            return declared if declared >= 0 else None
+    return None
+
+
+def _scope_header(scope, name: bytes) -> Optional[str]:
+    for key, value in scope.get("headers") or ():
+        if key == name:
+            try:
+                return value.decode("latin-1")
+            except UnicodeDecodeError:  # pragma: no cover — latin-1 decodes anything
+                return None
+    return None
+
+
+#: Mirrors `publicapi/router.py` (another wave's file): headers a browser
+#: client may READ off a cross-origin `/v1` response.
+_PUBLIC_API_EXPOSE_HEADERS = "X-Request-Id, RateLimit, RateLimit-Policy, Retry-After"
+
+
+def _public_api_decoration(scope) -> tuple:
+    """`(request_id, headers)` every `/v1` response owes that main.py renders
+    itself (CONTRACT-3 §7 and §3.2).
+
+    ADDED 2026-09-13 (wave-2 verifier): the 413 from this file carried no
+    `X-Request-Id`, `request_id: null`, and no CORS headers — `BrowserCors…`
+    skips `/v1` and the router's `_decorate` never runs for a response the
+    router did not produce — so a developer's browser SDK saw an opaque CORS
+    failure instead of `request_too_large`. The request id reuses the one the
+    router minted when it got that far; the origin is ECHOED, never `*`, and
+    `Access-Control-Allow-Credentials` is never sent.
+    """
+    import uuid as _uuid
+
+    state = scope.get("state") or {}
+    request_id = state.get("public_request_id") or f"req_{_uuid.uuid4().hex}"
+    headers = {"X-Request-Id": request_id}
+    origin = _scope_header(scope, b"origin")
+    if origin:
+        headers["Access-Control-Allow-Origin"] = origin
+        headers["Vary"] = "Origin"
+        headers["Access-Control-Expose-Headers"] = _PUBLIC_API_EXPOSE_HEADERS
+    return request_id, headers
+
+
+def _too_large_response(scope, limit: int):
+    """The 413, in whichever envelope the surface owes."""
+    from fastapi.responses import JSONResponse
+
+    path = scope.get("path") or "/"
+    if _is_public_api_path(path):
+        request_id, headers = _public_api_decoration(scope)
+        try:
+            from .publicapi import errors as _public_errors
+
+            api_error = _public_errors.request_too_large(limit)
+            headers.update(api_error.headers())
+            return JSONResponse(
+                status_code=api_error.status,
+                content=api_error.envelope(request_id),
+                headers=headers,
+            )
+        except Exception:  # noqa: BLE001 — never fail to refuse
+            logging.getLogger(__name__).debug(
+                "public error envelope unavailable", exc_info=True
+            )
+            return JSONResponse(
+                status_code=413,
+                content={
+                    "error": {
+                        "message": f"The request body is larger than the {int(limit)} byte limit.",
+                        "type": "invalid_request_error",
+                        "code": "request_too_large",
+                        "param": None,
+                        "request_id": request_id,
+                    }
+                },
+                headers=headers,
+            )
+    return JSONResponse(
+        status_code=413,
+        content={"detail": f"The request body is larger than {limit} bytes."},
+    )
+
+
+class BrowserCorsExceptPublicApi:
+    """`CORSMiddleware` for the chat application, and nothing at all for `/v1`.
+
+    CONTRACT-3 §3.2 names two rules that pull in opposite directions: the
+    browser allowlist here must NOT be widened (it carries
+    `allow_credentials=True`, so every origin on it may drive the session
+    cookie), and `/v1` must answer a preflight from ANY origin with 204 and
+    must never send `Access-Control-Allow-Credentials`.
+
+    Starlette's CORSMiddleware sits outside the router and answers every
+    preflight itself, before routing — so with it in the path both rules were
+    broken at once (measured 2026-09-12, `OPTIONS /v1/responses` from a
+    developer's origin): `400 Disallowed CORS origin`, carrying
+    `access-control-allow-credentials: true`. A developer's browser app could
+    not make a single call, and the one header the contract forbids was on the
+    reply that refused them.
+
+    Widening the allowlist to fix it would have handed those same origins the
+    session cookie on `/chat`. So the allowlist is untouched and the middleware
+    is simply not applied to `/v1`, which does its own CORS in the router —
+    permissive on preflight (it carries no credential and reveals nothing) and
+    authorized on the actual request against the project's `allowed_origins`.
+    """
+
+    def __init__(self, app, **options) -> None:
+        self.app = app
+        self.cors = CORSMiddleware(app, **options)
+        # Kept so a test can read the allowlist back off the running stack and
+        # prove it was not widened.
+        self.options = options
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http" and _is_public_api_path(scope.get("path") or "/"):
+            return await self.app(scope, receive, send)
+        return await self.cors(scope, receive, send)
+
+
+def _dev_docs_enabled() -> bool:
+    """Whether FastAPI's own interactive schema is served.
+
+    F013/F026/F053/F076 of the 2026-09-12 audit, all one bug: `/docs`, `/redoc`
+    and `/openapi.json` were served UNAUTHENTICATED on a port bound to every
+    interface, and the document enumerated all 94 routes — the admin surface,
+    the analytics console, the share governance routes and every path parameter
+    they take. That is a free map of the application for anyone on the LAN, and
+    since 2026-09-02 the same process is reachable through the Cloudflare
+    tunnel's host network. Nothing in the product reads these three paths: the
+    frontend talks to named routes, and the PUBLIC developer schema is a
+    different document served by the `/v1` router (CONTRACT-3 §7,
+    `GET /v1/openapi.json`), which is deliberately the public surface only.
+
+    So it is OFF unless somebody explicitly turns it on for a development box.
+    Read through `getattr` first because `app/config.py` is a single-owner file
+    in this programme (OWNERSHIP.md) and this module must not need an edit
+    there to be deployable; the environment variable is the fallback.
+    """
+    configured = getattr(settings, "dev_docs_enabled", None)
+    if configured is not None:
+        return bool(configured)
+    raw = (os.environ.get("ORCHESTRATOR_DEV_DOCS") or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+_DEV_DOCS = _dev_docs_enabled()
+
+app = FastAPI(
+    title="TechSara Orchestrator",
+    version="0.2.0",
+    lifespan=lifespan,
+    # None means "do not mount the route at all" — not "mount it and refuse",
+    # which would still confirm the application's identity to a scanner.
+    docs_url="/docs" if _DEV_DOCS else None,
+    redoc_url="/redoc" if _DEV_DOCS else None,
+    openapi_url="/openapi.json" if _DEV_DOCS else None,
+)
+
+# F016/F033 (audit 2026-09-12, both P1): there was no body-size limit anywhere
+# in this process. Starlette reads whatever a caller sends, so a single POST
+# with a 4 GB JSON body was a memory-exhaustion button on a box that also runs
+# the inference engine — and the frontend proxy's cap (added the same day) is
+# not a boundary, because the orchestrator is reachable directly on the LAN
+# (CONTRACT-3 §18). Added BEFORE the CORS middleware in this file so it ends up
+# INSIDE it in the stack: a 413 then still carries the CORS headers a browser
+# needs to read the status, instead of surfacing as an opaque network error.
+app.add_middleware(RequestBodySizeLimitMiddleware)
 
 # Local platform: ONLY the local Next.js frontend origins are allowed. A
 # wildcard here would let any web page the user visits cross-origin read
 # /reports and drive /chat against the synced Salesforce data (§1/§12).
 # V2: allow_credentials so the ts_session cookie flows on /auth + /history.
+#
+# NOT widened for the developer platform, and not applied to it either — see
+# BrowserCorsExceptPublicApi above for why those are the same decision.
 app.add_middleware(
-    CORSMiddleware,
+    BrowserCorsExceptPublicApi,
     allow_origins=settings.cors_allow_origins,
     allow_credentials=True,
     allow_methods=["*"],
@@ -242,6 +989,21 @@ _TRUSTED_ORIGINS = set(settings.cors_allow_origins)
 
 @app.middleware("http")
 async def _reject_cross_site_writes(request: Request, call_next):
+    # CONTRACT-3 §3.1 — the ONE exemption. `/v1` is key-authenticated and
+    # cookie-blind: it reads `Authorization` and ignores `Cookie` entirely, so
+    # there is no ambient credential for a hostile page to ride and CSRF does
+    # not apply to it. Leaving it in would not have made anything safer, it
+    # would simply have broken the product: a developer's browser app sends its
+    # OWN origin on every `POST /v1/responses`, so every such call would be 403
+    # before the key was even read — a check that cannot distinguish an attack
+    # from the intended use is not a control.
+    #
+    # This is not a widening of authentication. A `/v1` request still proves
+    # who it is with a key the router resolves (CONTRACT-3 §4), and the
+    # project's own `allowed_origins` list is what decides whether a browser
+    # origin may use that key. Deliberately NOT extended to any other path.
+    if _is_public_api_path(request.url.path):
+        return await call_next(request)
     if request.method not in ("GET", "HEAD", "OPTIONS"):
         origin = request.headers.get("origin")
         if origin and origin not in _TRUSTED_ORIGINS:
@@ -251,6 +1013,129 @@ async def _reject_cross_site_writes(request: Request, call_next):
                 status_code=403, content={"detail": "cross-site request refused"}
             )
     return await call_next(request)
+
+
+# F015 (audit 2026-09-12, confirmed P1): a 422 from POST /chat echoed the
+# ENTIRE request body back to the caller. FastAPI's default handler serialises
+# `exc.errors()` verbatim, and pydantic v2 puts the offending value in each
+# error's `input` key — for a body-level failure that value is the whole body,
+# so one malformed field returned the conversation history, the base64 of every
+# attached image and whatever else the request carried. Two ways that bites:
+# the echo lands in proxy logs and error trackers that were never meant to hold
+# message content, and it is a free amplifier (a few hundred bytes of request
+# for megabytes of response).
+#
+# What a caller actually needs is WHICH field is wrong and WHY, which is `loc`
+# and `msg`. `input` and `ctx` are dropped — `ctx` because it carries the value
+# too for several pydantic error types, and because it can hold a raw exception
+# object that is not JSON-serialisable. `url` (pydantic's documentation link)
+# goes as well: it names the library and version, which is a free fingerprint.
+#
+# Registered for EVERY route, not just /chat: the same handler covers /history,
+# /uploads, the admin surface and anything added later, so this cannot regress
+# by someone adding a new POST.
+#
+# BOUNDED (2026-09-13, wave-3 re-verifier). Dropping `input` stopped the echo
+# but not the amplification: the handler still returned ONE entry per failing
+# element, so a cookie-less 1 MiB `{"message":"hi","images":[{},…]}` came back
+# as a 33,090,737-byte 422 (~430x) and cost +429 MiB of RSS. The response now
+# carries at most `history.MAX_VALIDATION_ERRORS` entries, each with a bounded
+# `msg` and `loc`, plus the total when there were more. The large-body routes
+# also stopped letting FastAPI build the error list at all (see
+# `history.read_validated_body`); this bound is what holds for every other
+# route.
+@app.exception_handler(RequestValidationError)
+async def _validation_error_without_input_echo(
+    request: Request, exc: RequestValidationError
+):
+    from fastapi.responses import JSONResponse
+
+    from .history import MAX_VALIDATION_ERRORS, bounded_validation_errors
+
+    errors = exc.errors()
+    total = getattr(exc, "error_total", None)
+    if not isinstance(total, int):
+        total = len(errors)
+    content: dict = {"detail": bounded_validation_errors(errors)}
+    if total > MAX_VALIDATION_ERRORS:
+        content["errors_total"] = total
+    return JSONResponse(status_code=422, content=content)
+
+
+@app.exception_handler(RequestBodyTooLarge)
+async def _body_too_large(request: Request, exc: RequestBodyTooLarge):
+    """The 413 for a body whose size only became known while it was arriving.
+
+    The `Content-Length` door in the middleware answers directly, because the
+    route has not started; this is the OTHER door — a chunked body, or a client
+    that under-declared — where the refusal surfaces as an exception raised out
+    of `receive` in the middle of the route's own read. One renderer for both,
+    so `/v1` is owed CONTRACT-3 §9's envelope and gets it either way.
+    """
+    return _too_large_response(request.scope, exc.limit)
+
+
+from starlette.exceptions import HTTPException as _StarletteHTTPException  # noqa: E402
+
+
+@app.exception_handler(_StarletteHTTPException)
+async def _http_exception_in_the_surfaces_own_envelope(
+    request: Request, exc: _StarletteHTTPException
+):
+    """FastAPI's `{"detail": …}` everywhere, except under `/v1`.
+
+    ADDED 2026-09-13 (wave-2 verifier, CONTRACT-3 §9 "Error, everywhere"): an
+    unmatched `/v1` path answered FastAPI's `405 {"detail":"Method Not
+    Allowed"}` with `allow: OPTIONS` — the router's preflight catch-all
+    `OPTIONS /v1/{rest:path}` makes every unknown path "exist" for OPTIONS
+    only — and with no request id and no CORS headers, so an SDK parsing the
+    one shape the contract promises got a different one, and a browser client
+    got nothing it could read. The router's own `PublicRoute` cannot help: a
+    path that matches no route never reaches it.
+
+    A 405 whose only allowed method is OPTIONS is that catch-all, not a real
+    method mismatch, so it is answered as the 404 it is. The code is
+    `invalid_request_error`: §9's table is closed and has no generic
+    "no such route" code, and a request for a path the API does not have is a
+    malformed request. The HTTP status stays the true one.
+    """
+    from fastapi.exception_handlers import http_exception_handler
+
+    if not _is_public_api_path(request.url.path):
+        return await http_exception_handler(request, exc)
+    from fastapi.responses import JSONResponse
+
+    status = int(exc.status_code)
+    allow = ((exc.headers or {}).get("Allow") or (exc.headers or {}).get("allow") or "").upper()
+    if status == 405 and allow.replace(" ", "") in ("", "OPTIONS"):
+        status = 404
+    request_id, headers = _public_api_decoration(request.scope)
+    if status == 404:
+        message, code, kind = "Unknown API route.", "invalid_request_error", "invalid_request_error"
+    elif status == 405:
+        message, code, kind = "Method not allowed on this API route.", "invalid_request_error", "invalid_request_error"
+        headers["Allow"] = allow
+    elif status == 413:
+        message, code, kind = "The request body is too large.", "request_too_large", "invalid_request_error"
+    elif status >= 500:
+        message, code, kind = "Something went wrong on our side.", "internal_error", "server_error"
+    else:
+        # Never `exc.detail`: a detail written for the chat application is not
+        # vetted for the public surface (§9, no internals on the wire).
+        message, code, kind = "The request could not be processed.", "invalid_request_error", "invalid_request_error"
+    return JSONResponse(
+        status_code=status,
+        content={
+            "error": {
+                "message": message,
+                "type": kind,
+                "code": code,
+                "param": None,
+                "request_id": request_id,
+            }
+        },
+        headers=headers,
+    )
 
 
 app.include_router(auth_router)
@@ -286,6 +1171,70 @@ app.include_router(analytics_router)
 # Share governance, same shape and for the same reason: deciding what may
 # leave the workspace is SUPER_ADMIN's, not the day-to-day admin's.
 app.include_router(shares_admin_router)
+
+# ---------------------------------------------------------------- /v1 mount
+#
+# The public developer API (CONTRACT-3 §2, §7). Mounted LAST so the order of
+# this file reads as "the product, then the platform", and because `/v1` shares
+# no path prefix with anything above it.
+#
+# The import is defensive ON PURPOSE and this is not a style choice. Nine
+# engineers are building this programme in one tree at once, and
+# `app/publicapi/router.py` belongs to another of them. An unguarded import
+# would mean that a syntax error, a half-finished module or a missing
+# dependency in ANY file that router touches takes down /chat, /history,
+# /auth and the admin console with it — the whole chat application would fail
+# to start because a developer-platform module was mid-edit. The failure is
+# logged at ERROR so it is impossible to ship this state without noticing, and
+# `PUBLIC_API_MOUNTED` says out loud whether the surface is there, so a test
+# and an operator can both ask instead of guessing from a 404.
+#
+# Nothing here weakens the mount: if the router imports, it is included with
+# its own prefix and its own dependencies exactly as written by its owner.
+PUBLIC_API_MOUNTED = False
+PUBLIC_API_MOUNT_ERROR: Optional[str] = None
+try:
+    from .publicapi.router import router as public_api_router  # noqa: E402
+
+    app.include_router(public_api_router)
+    PUBLIC_API_MOUNTED = True
+except Exception as _public_api_exc:  # noqa: BLE001 — see the comment above
+    PUBLIC_API_MOUNT_ERROR = type(_public_api_exc).__name__
+    logging.getLogger(__name__).error(
+        "the public developer API (/v1) is NOT mounted: %s: %s",
+        type(_public_api_exc).__name__,
+        _public_api_exc,
+    )
+
+# ------------------------------------------------------ developer console
+#
+# The console's backend (CONTRACT-3 §2, §6, §17): `apiplatform/console_api.py`,
+# prefix `/admin/api/developers`, every route gated on an `api.*` capability.
+#
+# MOUNTED 2026-09-13 BECAUSE IT NEVER WAS (wave-2 verifier). Wave 1 wrote the
+# router and its suite, and the suite mounted the router onto the app itself
+# "until the wiring lands" — so every console test was green while
+# `GET /admin/api/developers/overview` answered 404 in the running process and
+# the console at `/api` had no backend at all. `test_publicapi_mount.py` now
+# asserts the path through the app WITHOUT that fixture.
+#
+# Guarded exactly like `/v1` above and for the same reason: a half-written
+# platform module must not stop /chat from starting, and the flag says out
+# loud which state the process is in.
+CONSOLE_API_MOUNTED = False
+CONSOLE_API_MOUNT_ERROR: Optional[str] = None
+try:
+    from .apiplatform.console_api import router as console_api_router  # noqa: E402
+
+    app.include_router(console_api_router)
+    CONSOLE_API_MOUNTED = True
+except Exception as _console_api_exc:  # noqa: BLE001 — see the /v1 comment above
+    CONSOLE_API_MOUNT_ERROR = type(_console_api_exc).__name__
+    logging.getLogger(__name__).error(
+        "the developer console API (/admin/api/developers) is NOT mounted: %s: %s",
+        type(_console_api_exc).__name__,
+        _console_api_exc,
+    )
 
 
 class LiveGeneration:
@@ -643,14 +1592,18 @@ class ChatRequest(BaseModel):
     accepted; `message` wins when both are present.
     """
 
-    messages: Optional[List[ChatMessage]] = None
+    # Every list here is `fail_fast` (2026-09-13): without it pydantic builds
+    # one error per bad element — 32 MiB of `[{},…]` measured 11,184,811
+    # errors and +12 GB before the 422. A test walks this model and fails on
+    # a list field added without it.
+    messages: Optional[List[ChatMessage]] = Field(default=None, fail_fast=True)
     message: Optional[str] = None
     session_id: str = "default"
     image: Optional[str] = None
     image_base64: Optional[str] = None
     # 2026-08-05: up to MAX_IMAGES images in one turn (composer multi-upload).
     # `image`/`image_base64` remain the single-image back-compat spelling.
-    images: Optional[List[str]] = None
+    images: Optional[List[str]] = Field(default=None, fail_fast=True)
     # --- V2 optional fields (defaults preserve v1 behavior) ---
     conversation_id: Optional[str] = None
     mode: Literal["salesforce", "assistant"] = "salesforce"
@@ -675,13 +1628,13 @@ class ChatRequest(BaseModel):
     # JSON body would kill the browser tab and both servers. Up to five per
     # message: [{"upload_id": "<32 hex>", "name": "contract.pdf"}, ...].
     # Small documents may still ride inline in `pdf` exactly as before.
-    pdf_uploads: Optional[List[dict]] = None
+    pdf_uploads: Optional[List[dict]] = Field(default=None, fail_fast=True)
     # 2026-09-09: videos ALWAYS stream to /uploads (purpose=video) first —
     # nothing that size rides a JSON body — and the request carries
     # references: [{"upload_id": "<32 hex>", "name": "standup.mp4"}, ...].
     # The analysis is a detached job started at upload time; the chat turn
     # attaches to it (engines/video.py).
-    video_uploads: Optional[List[dict]] = None
+    video_uploads: Optional[List[dict]] = Field(default=None, fail_fast=True)
     # Phase 1: web search — "off" (never), "on" (force), "auto" (model decides).
     web_search: Literal["off", "auto", "on"] = "off"
     # Salesforce Intelligence Mode: the answer to a clarifying question this
@@ -713,6 +1666,16 @@ class ChatRequest(BaseModel):
         if value is not None and not _INTENT_ID_RE.fullmatch(value):
             raise ValueError("intent_id must be 1-64 characters of [A-Za-z0-9_-]")
         return value
+
+    @field_validator("session_id")
+    @classmethod
+    def _valid_session_id(cls, value: str) -> str:
+        return _checked_session_id(value)
+
+    @field_validator("conversation_id")
+    @classmethod
+    def _conversation_id_is_not_synthetic(cls, value: Optional[str]) -> Optional[str]:
+        return _reject_synthetic_conversation_id(value)
 
     @property
     def pdf_data(self) -> Optional[str]:
@@ -1529,6 +2492,106 @@ async def _reset_stale_upload_finalisations() -> int:
         return 0
 
 
+#: The first platform prune waits this long after start-up, so it never
+#: competes with the lifespan's own reconciliation queries.
+_API_PLATFORM_PRUNE_FIRST_DELAY_S = 60.0
+
+
+def _api_platform_prune_interval_s() -> float:
+    """The artifact maintenance cadence (ARTIFACT_MAINTENANCE_INTERVAL_S,
+    30 min), floored at a minute exactly as `artifacts.pipeline` floors it."""
+    return max(60.0, float(settings.artifact_maintenance_interval_s))
+
+
+async def run_api_platform_prune() -> Optional[dict]:
+    """One retention pass. Never raises: a failed prune is retried on the next
+    tick, and it must not take the loop — or the lifespan — down with it.
+
+    EVERYTHING inside the try (2026-09-13, wave-3 re-verifier): the log line
+    that reads `removed.values()` used to sit after it, so a return that was
+    not a dict raised AttributeError out of here and ended the loop for the
+    life of the process, silently.
+    """
+    try:
+        removed = await db.run_in_thread(db.prune_api_platform)
+        if isinstance(removed, dict) and any(removed.values()):
+            logging.getLogger(__name__).info("api platform prune removed %s", removed)
+        return removed if isinstance(removed, dict) else None
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001
+        logging.getLogger(__name__).warning("api platform prune failed", exc_info=True)
+        return None
+
+
+async def run_rotated_key_expiry() -> Optional[int]:
+    """Record the revocation of every key whose rotation overlap has ended.
+
+    `db.expire_rotated_keys` existed and was tested, and nothing scheduled it
+    (2026-09-13): the resolver already refuses a key past its deadline, but
+    the console listed the rotated-out key as live forever. Same contract as
+    the prune: never raises, logs, retries next tick.
+
+    `db.prune_api_platform` now also runs this sweep at its end. Scheduled
+    here as well, on purpose: the prune's retention statements run first and
+    under a statement timeout, and a prune that raises part-way would skip
+    the revocation record with it. The sweep is idempotent, so the second
+    call in a healthy tick finds nothing and costs one indexed query.
+    """
+    try:
+        revoked = await db.run_in_thread(db.expire_rotated_keys)
+        count = len(revoked) if isinstance(revoked, list) else 0
+        if count:
+            logging.getLogger(__name__).info(
+                "api platform: revoked %d key(s) whose rotation overlap ended", count
+            )
+        return count
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001
+        logging.getLogger(__name__).warning("rotated key expiry failed", exc_info=True)
+        return None
+
+
+#: The sweeps the platform maintenance loop runs, in order. Looked up by name
+#: at each tick so a test can substitute one.
+_API_PLATFORM_SWEEPS = ("run_api_platform_prune", "run_rotated_key_expiry")
+
+
+async def _api_platform_maintenance_tick() -> None:
+    """One tick: every sweep, each isolated from the others. A sweep that
+    raises anyway (they are written not to) is logged here and the next one
+    still runs."""
+    module = sys.modules[__name__]
+    for name in _API_PLATFORM_SWEEPS:
+        try:
+            await getattr(module, name)()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logging.getLogger(__name__).warning("api platform sweep %s failed", name, exc_info=True)
+
+
+async def _api_platform_prune_loop() -> None:
+    """Runs until cancelled at shutdown. Nothing but cancellation leaves it:
+    the tick is guarded, and so is the interval read (a settings value that
+    stops parsing must not end retention either)."""
+    await asyncio.sleep(_API_PLATFORM_PRUNE_FIRST_DELAY_S)
+    while True:
+        try:
+            await _api_platform_maintenance_tick()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logging.getLogger(__name__).warning("api platform maintenance tick failed", exc_info=True)
+        try:
+            interval = _api_platform_prune_interval_s()
+        except Exception:  # noqa: BLE001
+            logging.getLogger(__name__).warning("api platform maintenance interval unreadable", exc_info=True)
+            interval = 30 * 60.0
+        await asyncio.sleep(interval)
+
+
 async def _upload_session_sweep_loop() -> None:
     """Every ten minutes, reclaim the parts of chunked sessions past their
     TTL (uploads.sweep_expired_upload_sessions). Imported lazily: uploads
@@ -1577,6 +2640,28 @@ async def _replay_frames(row: dict, stored: dict, session_id: str) -> AsyncItera
 
 
 @app.post("/chat")
+async def chat_route(http_request: Request) -> StreamingResponse:
+    """POST /chat: the principal FIRST, the body second (2026-09-13).
+
+    `chat` used to be the route itself, with `request: ChatRequest` declared,
+    so FastAPI decoded and validated the body before the sign-in check in the
+    handler ran. The wave-3 re-verifier measured a cookie-less 1 MiB body of
+    `images:[{},…]` at +429 MiB of RSS and a 33 MiB 422 (16 concurrent:
+    +4980 MiB) on a box whose unified memory also holds the engine. Now an
+    anonymous caller is refused 401 without a byte of its body being read, and
+    a signed-in body is parsed by the bounded reader. `chat` itself keeps its
+    signature: the resume sweep (app/continuity.py) and the re-attach path
+    call it with a model they built themselves.
+    """
+    from .authn.principal import current_principal
+    from .history import read_validated_body
+
+    if await current_principal(http_request) is None:
+        raise HTTPException(status_code=401, detail="Sign in required.")
+    request = await read_validated_body(http_request, ChatRequest)
+    return await chat(request, http_request)
+
+
 async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse:
     """Stream SSE events (§10 + V2-DESIGN §2/§3a/§3b).
 
@@ -3545,11 +4630,8 @@ async def salesforce_context(
     id someone guessed must not disclose what it is asking about.
     """
     viewer = await _require_viewer(http_request)
+    _refuse_reserved_conversation_key(conversation_id)
     owner = await db.run_in_thread(db.conversation_owner, conversation_id)
-    # STRICT: an unowned id discloses nothing either. (A brand-new chat asks
-    # for starter options before its first message creates the row — that id
-    # has no state to leak, so it answers the same empty payload the owner
-    # would see.)
     if owner is not None and owner != viewer:
         raise HTTPException(status_code=404, detail="conversation not found")
 
@@ -3557,8 +4639,42 @@ async def salesforce_context(
 
     if not settings.salesforce_intelligence_enabled:
         return {"enabled": False, "options": [], "pending_clarification": None}
+    # FAIL CLOSED on an id whose owner cannot be determined (2026-09-12,
+    # confirmed P1, same class as the /chat claim above).
+    #
+    # The old comment here said an unowned id "has no state to leak". That was
+    # untrue in two ways, and both were reachable:
+    #
+    #  * `sf_conversation_state` and `sf_clarifications` are keyed by
+    #    conversation id and have NO foreign key to `conversations`. Deleting a
+    #    CHAT is fine — `db.delete_conversation` clears both through
+    #    `_SIDE_TABLES` — but deleting an ACCOUNT is not: `conversations.user_id`
+    #    cascades from `users`, the conversation row goes with it, and nothing
+    #    reaches the Salesforce state, which is left owned by nobody.
+    #    `starter_options` then hands the next caller that state — the
+    #    "continue" option is built from `state.last_query_summary`, which is
+    #    the departed colleague's Salesforce question in plain text;
+    #  * a BARE call (no conversation_id) keys its Salesforce state under the
+    #    synthetic `u<user id>-<session id>`, which is not a conversation row
+    #    either — so `GET /chat/salesforce/u7-default` read user 7's last
+    #    question and pending clarification for anyone who asked.
+    #
+    # The fix cannot be a 404: the starter card is drawn for a NEW chat, whose
+    # id has deliberately not been claimed yet (the claim happens on the first
+    # message), and refusing would remove the card from every new chat. So the
+    # card is computed against a throwaway id that exists nowhere. The generic
+    # catalogue — which objects this connection can reach — is unchanged,
+    # because it is a property of the org and not of the conversation, while
+    # everything that IS conversation state (the continuation option, the
+    # pending clarification) reads as absent, which for an id this caller does
+    # not own is the only honest answer.
+    #
+    # NOT a claim, unlike POST /chat: claiming an unowned id here would hand
+    # the caller whatever orphaned state was sitting under it, which is the
+    # very thing this closes.
+    state_key = conversation_id if owner == viewer else uuid.uuid4().hex
     try:
-        return await sf_intel.starter_options(conversation_id)
+        return await sf_intel.starter_options(state_key)
     except Exception as exc:  # noqa: BLE001 — a starter card is never fatal
         logging.getLogger(__name__).info(
             "salesforce context unavailable for %s: %s", conversation_id, exc
@@ -3583,8 +4699,24 @@ async def salesforce_cancel(
     dismissed.
     """
     viewer = await _require_viewer(http_request)
+    _refuse_reserved_conversation_key(body.conversation_id)
     owner = await db.run_in_thread(db.conversation_owner, body.conversation_id)
-    if owner is not None and owner != viewer:
+    # FAIL CLOSED, and here it really is a refusal (2026-09-12, confirmed P1).
+    # `owner is not None and owner != viewer` let an UNOWNED id through, and a
+    # pending clarification can sit under an id that owns nothing: a bare call
+    # parks it under the synthetic `u<user id>-<session id>`, and a deleted
+    # ACCOUNT leaves `sf_clarifications` rows behind, because that table has no
+    # foreign key to `conversations` and `conversations` cascades from `users`
+    # (deleting a CHAT is clean — `db.delete_conversation` clears it through
+    # `_SIDE_TABLES`). So anyone could cancel anyone else's pending question —
+    # a write, not merely a read — and the next Salesforce turn in that chat
+    # would silently stop resuming it.
+    #
+    # Unlike the GET above there is nothing to preserve: a question you can
+    # cancel is one that was asked in a conversation you own, and a brand-new
+    # chat has none. 404 rather than 403, so the reply cannot say whether the
+    # id exists (the refusal style of every other owner check in this file).
+    if owner != viewer:
         raise HTTPException(status_code=404, detail="conversation not found")
 
     from .core.sf_intel import state as sf_intel_state
@@ -3596,6 +4728,21 @@ async def salesforce_cancel(
 class StopRequest(BaseModel):
     conversation_id: Optional[str] = None
     session_id: str = "default"
+
+    # The third door onto the same namespace (F034): /chat/stop rebuilds the
+    # synthetic key itself, so it takes the same two rules. Nothing was
+    # reachable through it — `_owns` compares the generation's user id before
+    # anything is cancelled — but leaving one spelling of the key unvalidated
+    # is how the next person concludes the shape is allowed somewhere.
+    @field_validator("session_id")
+    @classmethod
+    def _valid_session_id(cls, value: str) -> str:
+        return _checked_session_id(value)
+
+    @field_validator("conversation_id")
+    @classmethod
+    def _conversation_id_is_not_synthetic(cls, value: Optional[str]) -> Optional[str]:
+        return _reject_synthetic_conversation_id(value)
 
 
 async def _prepare_knowledge(
@@ -3739,22 +4886,31 @@ async def chat_request_status(intent_id: str, http_request: Request) -> dict:
 
 class CompactRequest(BaseModel):
     conversation_id: str
-    messages: Optional[List[ChatMessage]] = None
+    # fail_fast: see ChatRequest.messages.
+    messages: Optional[List[ChatMessage]] = Field(default=None, fail_fast=True)
 
 
 @app.post("/chat/compact")
-async def chat_compact(body: CompactRequest, http_request: Request) -> dict:
+async def chat_compact(http_request: Request) -> dict:
     """Compact a conversation on demand ("Compact now" in the meter popover).
 
     Folds everything except the most recent turns, regardless of how full the
     window currently is.
+
+    Signed in BEFORE the body is parsed (2026-09-13): with `body:
+    CompactRequest` declared, an anonymous 1 MiB body was validated — and its
+    per-element 422 built — before the 401 below could run. The conversation
+    id lives IN the body, so ownership is checked right after the parse; the
+    parse itself is the bounded one.
     """
     from . import compaction
     from .auth import current_user
+    from .history import read_validated_body
 
     user = await db.run_in_thread(current_user, http_request)
     if user is None:
         raise HTTPException(status_code=401, detail="sign in required")
+    body = await read_validated_body(http_request, CompactRequest)
     owner = await db.run_in_thread(db.conversation_owner, body.conversation_id)
     if owner is None or owner != int(user["id"]):
         raise HTTPException(status_code=404, detail="conversation not found")
