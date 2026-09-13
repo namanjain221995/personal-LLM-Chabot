@@ -237,6 +237,14 @@ class StreamOutcome:
     #: The output ceiling APPLIED (2026-09-13): the planned value until the
     #: generation has run, the exact value after.
     max_output_tokens: Optional[int] = None
+    #: True only for a BACKGROUND response, the one mode whose text is kept
+    #: (SCHEMA-V34; CONTRACT §16 keeps no synchronous or streamed text). When
+    #: set, `background.persisted_generation_fields` puts `output_text` in the
+    #: SAME row update as the terminal status, so a caller polling
+    #: `GET /v1/responses/{id}` can never read `completed`/`failed` with an
+    #: empty `output` in between two writes (CONTRACT §8.3 promises the text
+    #: a timed-out response produced).
+    keep_text: bool = False
 
     def chat_finish_reason(self) -> str:
         return chat_finish_reason(self.finish_reason)

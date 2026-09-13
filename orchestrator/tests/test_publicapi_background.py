@@ -1264,3 +1264,105 @@ def test_our_own_wall_clock_stop_is_never_stored_as_a_finish_reason(project):
     assert final["finish_reason"] is None
     # The partial answer is kept for the caller who waited hours for it.
     assert final["output_text"] == "partial"
+
+
+# ---------------------------------------------------------------------------
+# A finished row is never readable without its text (2026-09-14)
+# ---------------------------------------------------------------------------
+
+
+def _terminal_writes(monkeypatch, *, text_only_delay_s: float = 0.0) -> list:
+    """Every row `db.update_api_response` returns, recorded as it is written.
+
+    The delay reproduces the race a loaded runner hit: the terminal status
+    committed, the text written by a SECOND update a moment later, and a
+    poller reading the row in between saw `failed` with `output: []`. Any
+    returned row is exactly what a concurrent `GET` could have read at that
+    instant, so a terminal row without text in this list IS the bug, whether
+    or not a poller happened to land in the window."""
+    seen: list = []
+    original = db.update_api_response
+
+    def spy(response_id, project_id, /, **fields):
+        if text_only_delay_s and set(fields) == {"output_text"}:
+            time.sleep(text_only_delay_s)
+        row = original(response_id, project_id, **fields)
+        seen.append((dict(fields), dict(row) if row is not None else None))
+        return row
+
+    monkeypatch.setattr(db, "update_api_response", spy)
+    return seen
+
+
+def _finished_without_text(seen: list) -> list:
+    return [
+        row
+        for _fields, row in seen
+        if row is not None
+        and row.get("status") in ("completed", "failed", "cancelled")
+        and not row.get("output_text")
+    ]
+
+
+def test_the_terminal_status_and_the_text_are_one_write_so_no_poller_reads_a_finished_row_with_no_output(
+    monkeypatch, project
+):
+    seen = _terminal_writes(monkeypatch, text_only_delay_s=0.6)
+
+    class _Stopped:
+        def __init__(self, spec):
+            self.spec, self.usage = spec, {"prompt_tokens": 5, "completion_tokens": 2}
+            self.error = errors.timeout(1_000)
+            self.first_token_at = None
+            self.finish_reason = "wall_clock"
+
+        async def stream(self):
+            yield _Chunk("token", "partial ")
+            yield _Chunk("token", "answer")
+
+        async def aclose(self):
+            return None
+
+    background.set_generation_factory(_Stopped)
+
+    async def scenario():
+        row = await _start(project)
+        await background.drain(timeout=10)
+        return await db.run_in_thread(db.get_api_response, row["id"], project["id"])
+
+    final = asyncio.run(scenario())
+
+    assert final["status"] == "failed" and final["error_code"] == "timeout"
+    assert final["output_text"] == "partial answer"
+    assert _finished_without_text(seen) == []
+    # And the normal path needs no second, text-only write at all.
+    assert [fields for fields, _row in seen if set(fields) == {"output_text"}] == []
+
+
+def test_a_recorder_that_fails_still_leaves_the_text_behind_through_the_repair(monkeypatch, project):
+    """The repair write is for a hook that never wrote the row; it must not
+    come back as the normal path."""
+    seen = _terminal_writes(monkeypatch)
+
+    async def on_finish(outcome):
+        raise RuntimeError("the ledger is down")
+
+    background.set_generation_factory(_generation([("token", "kept")]))
+
+    async def scenario():
+        row = await _start(project, on_finish=on_finish)
+        await background.drain(timeout=10)
+        return await db.run_in_thread(db.get_api_response, row["id"], project["id"])
+
+    final = asyncio.run(scenario())
+
+    assert final["output_text"] == "kept"
+    assert [fields for fields, _row in seen if set(fields) == {"output_text"}] == [{"output_text": "kept"}]
+
+
+def test_a_synchronous_outcome_never_carries_text_into_the_row():
+    """CONTRACT §16: only a background response keeps its text."""
+    outcome = streaming.StreamOutcome(response_id="resp_x", model=MODEL.id, created_at=0, text="secret")
+    assert "output_text" not in background.persisted_generation_fields(outcome)
+    outcome.keep_text = True
+    assert background.persisted_generation_fields(outcome)["output_text"] == "secret"

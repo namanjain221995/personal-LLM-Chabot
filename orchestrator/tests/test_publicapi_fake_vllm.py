@@ -247,6 +247,51 @@ def test_a_wall_clock_stop_records_counted_usage_when_the_engine_sends_usage_onl
     assert ledger["meta"]["usage_source"] == streaming.USAGE_COUNTED_AT_STOP
 
 
+def test_a_timed_out_background_response_is_never_readable_as_finished_without_its_partial_text(
+    api, platform, monkeypatch
+):
+    """The race behind an intermittent IndexError in the test above on a loaded
+    runner (2026-09-14): the router's recorder committed `failed`, and the text
+    followed in a second update, so a poll in between read `output: []`.
+    Delaying ONLY a text-only write widened that window from microseconds to
+    0.6 s and made it fail every time; with the text in the status update, the
+    delay has nothing to delay."""
+    monkeypatch.setattr(settings, "gen_wall_clock_s", 1.0)
+    monkeypatch.setattr(settings, "public_api_gen_wall_clock_s", 1.0, raising=False)
+    FAKE.tokens = 6
+    FAKE.delay = 0.4
+    returned: List[Dict[str, Any]] = []
+    original = db.update_api_response
+
+    def spy(response_id, project_id, /, **fields):
+        if set(fields) == {"output_text"}:
+            time.sleep(0.6)
+        row = original(response_id, project_id, **fields)
+        if row is not None:
+            returned.append(dict(row))
+        return row
+
+    monkeypatch.setattr(db, "update_api_response", spy)
+
+    created = api.post(
+        "/v1/responses", json={"model": "techsara-35b", "input": "Write long.", "background": True}, headers=_auth()
+    )
+    assert created.status_code == 202, created.text
+    response_id = created.json()["id"]
+    final = _await_terminal(api, response_id)
+
+    assert final["status"] == "failed" and final["error"]["code"] == "timeout"
+    assert final["output"] and final["output"][0]["content"][0]["text"]
+    finished_empty = [
+        row
+        for row in returned
+        if row["id"] == response_id
+        and row.get("status") in ("completed", "failed", "cancelled")
+        and not row.get("output_text")
+    ]
+    assert finished_empty == []
+
+
 def test_a_completed_answer_still_takes_its_usage_from_the_engine(api, platform, monkeypatch):
     rows: List[Dict[str, Any]] = []
 

@@ -348,6 +348,7 @@ async def _run(
         model=spec.model,
         created_at=spec.created_at,
         max_output_tokens=spec.planned,
+        keep_text=True,
     )
     pieces: List[str] = []
     generation: Any = None
@@ -495,21 +496,26 @@ async def _settle(
     else:
         await _record_outcome(job, outcome)
 
-    if outcome.text:
-        # The ONE place output text is stored, and only for a background
-        # response: its caller has no stream to read it from (SCHEMA-V34, and
-        # pruned by the project's retention window). Written even for a
-        # cancelled job — throwing away half an answer because somebody
-        # pressed stop is what people report as data loss.
-        with contextlib.suppress(Exception):
-            await db.run_in_thread(
+    row = await db.run_in_thread(db.get_api_response, job.response_id, job.project_id)
+    if outcome.text and row is not None and not row.get("output_text"):
+        # A REPAIR, not the normal path. The text normally lands in the same
+        # UPDATE as the terminal status (`persisted_generation_fields`), which
+        # is what keeps a poller from ever reading a finished row with no
+        # output. It is missing here only when that write did not happen — the
+        # hook raised before it, or a hook that does not use the shared fields
+        # — and throwing away half an answer because a ledger was down is what
+        # people report as data loss. Written even for a cancelled job.
+        try:
+            row = await db.run_in_thread(
                 db.update_api_response,
                 job.response_id,
                 job.project_id,
                 output_text=outcome.text,
+            ) or row
+        except Exception:  # noqa: BLE001
+            log.warning(
+                "background response %s could not store its text", job.response_id, exc_info=True
             )
-
-    row = await db.run_in_thread(db.get_api_response, job.response_id, job.project_id)
     if row is not None:
         await _notify(row, job.workspace_id)
 
@@ -546,8 +552,17 @@ async def _record_outcome(job: _Job, outcome: streaming.StreamOutcome) -> None:
 def persisted_generation_fields(outcome: streaming.StreamOutcome) -> Dict[str, Any]:
     """The V35 columns for an outcome: the applied ceiling, and the finish
     reason when it is one the column (and the wire) knows. Our own wall-clock
-    stop is a failure recorded in `error_code`, never a finish."""
+    stop is a failure recorded in `error_code`, never a finish.
+
+    And, for a background response (`keep_text`), `output_text` — the ONE
+    place output text is stored (SCHEMA-V34, pruned by the project's retention
+    window). It rides in the same UPDATE as the terminal status on purpose: a
+    separate, later write left a window in which `GET /v1/responses/{id}`
+    answered `failed` with `output: []` for a response that had produced text
+    (reproduced 2026-09-14 by delaying only that write)."""
     fields: Dict[str, Any] = {}
+    if outcome.keep_text and outcome.text:
+        fields["output_text"] = outcome.text
     if outcome.max_output_tokens is not None and int(outcome.max_output_tokens) >= 1:
         fields["max_output_tokens"] = int(outcome.max_output_tokens)
     if outcome.finish_reason in ("stop", "length"):
