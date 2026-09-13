@@ -194,8 +194,9 @@ class TheExpectationFileIsParsedStrictly(unittest.TestCase):
             REPO_EXPECTATION.read_text(encoding="utf-8")
         )
         self.assertEqual(problems, [])
-        # CONTRACT-3 §7 names exactly these eight operations. If the contract
-        # changes, this test and the file change together, deliberately.
+        # CONTRACT-3 §7 names exactly these eleven operations (the last three
+        # added by the 2026-09-13 owner request). If the contract changes,
+        # this test and the file change together, deliberately.
         self.assertEqual(
             wanted,
             {
@@ -205,6 +206,9 @@ class TheExpectationFileIsParsedStrictly(unittest.TestCase):
                 "GET /v1/responses/{id}",
                 "POST /v1/responses/{id}/cancel",
                 "POST /v1/chat/completions",
+                "POST /v1/embeddings",
+                "POST /v1/rerank",
+                "POST /v1/audio/transcriptions",
                 "GET /v1/usage",
                 "GET /v1/openapi.json",
             },

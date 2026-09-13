@@ -1411,6 +1411,117 @@ class Settings:
             max(3600.0, 2.0 * float(self.gen_wall_clock_s)),
         )
 
+        # --- Every model on /v1, and 1,000,000 output tokens (2026-09-13) ---
+        # Declared here by the integration of the six-model wave. Until now
+        # each reader fell back to os.environ through `registry.setting_int` /
+        # `setting_float` (or `webhooks.queue._setting_number`) with THIS
+        # file's `_int` / `_float` rule, so the defaults below are the ones
+        # that were already in force; declaring them makes them visible and
+        # makes a malformed value fail at start-up like every other setting.
+        # The readers prefer the attribute, so a test that wants a different
+        # value sets `settings.<name>` (or deletes it to exercise the
+        # environment path). CONTRACT §8.3, §12.3, §12.4 are the reference.
+        #
+        # The public ceiling for `max_output_tokens` (owner decision): not the
+        # chat app's MODEL_MAX_OUTPUT, which `/v1` no longer reads.
+        self.public_api_max_output_tokens: int = _int("PUBLIC_API_MAX_OUTPUT_TOKENS", 1_000_000)
+        # Wall clock per generation: min(this, max(floor, prefill allowance +
+        # planned output / minimum decode rate)). The floor for techsara-35b
+        # is GEN_WALL_CLOCK_S; 900 s is the measured full-window prefill
+        # (878 s at 949,915 tokens, 2026-08-29) and 50 tok/s sits under the
+        # measured 71-101. A 1,000,000-token request gets 20,900 s.
+        self.public_api_gen_wall_clock_s: float = _float("PUBLIC_API_GEN_WALL_CLOCK_S", 21_600.0)
+        self.public_api_main_prefill_allowance_s: float = _float(
+            "PUBLIC_API_MAIN_PREFILL_ALLOWANCE_S", 900.0
+        )
+        self.public_api_main_min_decode_tokens_per_s: float = _float(
+            "PUBLIC_API_MAIN_MIN_DECODE_TOKENS_PER_S", 50.0
+        )
+        # Capacity gates (publicapi/capacity.py): one per shared engine, for
+        # every caller, first come first served; a refusal is 503
+        # model_unavailable with Retry-After, never 429. `main.long` runs one
+        # at a time; `main.extended` (planned output over
+        # PUBLIC_API_MAIN_EXTENDED_OUTPUT_TOKENS) two, so long-lived public
+        # work holds at most 3 of the chat app's 10 NORMAL admission slots
+        # (adversarial review 2026-09-13: ten 130k-token answers took all 10).
+        # NOT declared here: PUBLIC_API_MAIN_LONG_FOOTPRINT_TOKENS, the input +
+        # output rule the rereview found sending ordinary documents through
+        # `main.long` (byte-bound regression); the planning fix replaces it,
+        # and its reader keeps the environment fallback until then.
+        self.public_api_main_long_max_concurrent: int = _int("PUBLIC_API_MAIN_LONG_MAX_CONCURRENT", 1)
+        # Defaults to the public default output (the public CEILING before
+        # 2026-09-13), read from its own setting as the reader does.
+        self.public_api_main_extended_output_tokens: int = _int(
+            "PUBLIC_API_MAIN_EXTENDED_OUTPUT_TOKENS", self.public_api_default_max_output_tokens
+        )
+        self.public_api_main_extended_max_concurrent: int = _int(
+            "PUBLIC_API_MAIN_EXTENDED_MAX_CONCURRENT", 2
+        )
+        # How long a sync / streaming / embeddings / rerank / transcription
+        # request waits for its gate BEFORE the status line (under
+        # Cloudflare's 100 s origin timeout); a background job waits inside
+        # its task with the row `queued`; a gate that yields to chat waits for
+        # chat at most this long per attempt.
+        self.public_api_gate_wait_s: float = _float("PUBLIC_API_GATE_WAIT_S", 30.0)
+        self.public_api_background_gate_wait_s: float = _float(
+            "PUBLIC_API_BACKGROUND_GATE_WAIT_S", 3600.0
+        )
+        self.public_api_yield_to_chat_max_wait_s: float = _float(
+            "PUBLIC_API_YIELD_TO_CHAT_MAX_WAIT_S", 10.0
+        )
+        # techsara-8b-vision (vllm-router): the public window is half the
+        # engine's 49,152, and raising it needs a larger router KV cache, not
+        # just this number.
+        self.public_api_router_context_tokens: int = _int("PUBLIC_API_ROUTER_CONTEXT_TOKENS", 24_576)
+        self.public_api_router_max_concurrent: int = _int("PUBLIC_API_ROUTER_MAX_CONCURRENT", 4)
+        self.public_api_router_kv_budget_tokens: int = _int(
+            "PUBLIC_API_ROUTER_KV_BUDGET_TOKENS", 24_576
+        )
+        # techsara-ocr (Unlimited-OCR on the worker Spark, max_model_len 8,192).
+        self.public_api_ocr_context_tokens: int = _int("PUBLIC_API_OCR_CONTEXT_TOKENS", 8192)
+        self.public_api_ocr_max_concurrent: int = _int("PUBLIC_API_OCR_MAX_CONCURRENT", 2)
+        # techsara-embed / techsara-rerank: the engines' own --max-model-len is
+        # 4,096 (not EMBED_/RERANKER_CONTEXT_LENGTH, which say 32,768).
+        self.public_api_embed_context_tokens: int = _int("PUBLIC_API_EMBED_CONTEXT_TOKENS", 4096)
+        self.public_api_embed_max_concurrent: int = _int("PUBLIC_API_EMBED_MAX_CONCURRENT", 2)
+        self.public_api_embed_kv_budget_tokens: int = _int("PUBLIC_API_EMBED_KV_BUDGET_TOKENS", 8192)
+        self.public_api_embed_max_inputs: int = _int("PUBLIC_API_EMBED_MAX_INPUTS", 256)
+        self.public_api_rerank_context_tokens: int = _int("PUBLIC_API_RERANK_CONTEXT_TOKENS", 4096)
+        self.public_api_rerank_max_concurrent: int = _int("PUBLIC_API_RERANK_MAX_CONCURRENT", 2)
+        self.public_api_rerank_kv_budget_tokens: int = _int(
+            "PUBLIC_API_RERANK_KV_BUDGET_TOKENS", 8192
+        )
+        self.public_api_rerank_max_documents: int = _int("PUBLIC_API_RERANK_MAX_DOCUMENTS", 100)
+        # techsara-whisper: one public clip fleet-wide, yielding to dictation;
+        # 300 s of audio decodes in ~43 s, inside the 100 s origin timeout.
+        self.public_api_asr_max_concurrent: int = _int("PUBLIC_API_ASR_MAX_CONCURRENT", 1)
+        self.public_api_max_audio_seconds: int = _int("PUBLIC_API_MAX_AUDIO_SECONDS", 300)
+        # Body caps (app/main.py asks publicapi.models.body_cap_for): 25 MiB of
+        # audio in a 26 MiB multipart body; 20 MiB on the two generating
+        # routes, which carry image parts (each at most 10 MiB decoded). The
+        # text inside any body is still held to PUBLIC_API_MAX_BODY_BYTES.
+        self.public_api_max_audio_bytes: int = _int("PUBLIC_API_MAX_AUDIO_BYTES", 26_214_400)
+        self.public_api_max_audio_body_bytes: int = _int("PUBLIC_API_MAX_AUDIO_BODY_BYTES", 27_262_976)
+        self.public_api_max_media_body_bytes: int = _int("PUBLIC_API_MAX_MEDIA_BODY_BYTES", 20_971_520)
+        self.public_api_max_image_bytes: int = _int("PUBLIC_API_MAX_IMAGE_BYTES", 10_485_760)
+
+        # --- Webhook delivery growth (security fixes, 2026-09-13) ------------
+        # apiplatform/webhooks/queue.py clamps each at use (retention 1 day to
+        # its ceiling, grace 0 to the retention window, pending cap at least
+        # 1) and treats a non-finite value as malformed. History of a settled
+        # delivery is kept this many days; a disabled endpoint's pending
+        # queue survives this long before it is settled as dropped; an
+        # endpoint holds at most this many undelivered events.
+        self.public_api_webhook_delivery_retention_days: int = _int(
+            "PUBLIC_API_WEBHOOK_DELIVERY_RETENTION_DAYS", 30
+        )
+        self.public_api_webhook_disabled_grace_seconds: float = _float(
+            "PUBLIC_API_WEBHOOK_DISABLED_GRACE_SECONDS", 3600.0
+        )
+        self.public_api_webhook_max_pending_per_endpoint: int = _int(
+            "PUBLIC_API_WEBHOOK_MAX_PENDING_PER_ENDPOINT", 1000
+        )
+
         # --- Conversation sharing (V20) ---
         # Off-by-default at the RISKY end only: sharing inside the workspace
         # is on, sharing to the open internet is a decision a super admin

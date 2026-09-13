@@ -575,6 +575,34 @@ def _public_api_max_body_bytes() -> int:
         return _MIB
 
 
+def _public_api_body_cap(method: str, path: str) -> int:
+    """The `/v1` cap for one request line, from the public API's own table.
+
+    INTEGRATED 2026-09-13 (the six-model wave). CONTRACT §8/§12 now give the
+    two generating routes 20 MiB (`PUBLIC_API_MAX_MEDIA_BODY_BYTES`, image
+    parts) and `POST /v1/audio/transcriptions` 26 MiB
+    (`PUBLIC_API_MAX_AUDIO_BODY_BYTES`); every other `/v1` line keeps the
+    1 MiB of `PUBLIC_API_MAX_BODY_BYTES`. The Next edge enforces the same
+    table, and before this the middleware capped every `/v1` path at 1 MiB,
+    so an image request or an audio upload over 1 MiB was refused before the
+    router saw it. `publicapi.models.body_cap_for` is the one table; this
+    only asks it. Anonymous and signed-in are the same number on `/v1`, which
+    never reads the session cookie — the router's key check and its own text
+    limit (`ResponsesRequest.text_bytes`, 1 MiB) still apply after parsing.
+
+    Same defensive import as `_public_api_max_body_bytes`: a broken sibling
+    falls back to the small cap, never to no cap and never to an unmounted
+    `/chat`.
+    """
+    try:
+        from .publicapi.models import body_cap_for as public_body_cap_for
+
+        cap = int(public_body_cap_for(method, path))
+    except Exception:  # noqa: BLE001 — a missing sibling must not unmount /chat
+        return _public_api_max_body_bytes()
+    return cap if cap > 0 else _public_api_max_body_bytes()
+
+
 def body_cap_for(method: str, path: str) -> BodyCap:
     """The cap for one request line. Separate from the middleware so a test can
     assert the table without building a request.
@@ -586,9 +614,10 @@ def body_cap_for(method: str, path: str) -> BodyCap:
     method = (method or "GET").upper()
     default = _max_request_body_bytes()
     if _is_public_api_path(path):
-        # Not session-gated: `/v1` never reads the cookie (CONTRACT-3 §1), and
-        # its cap is already the small one.
-        public = _public_api_max_body_bytes()
+        # Not session-gated: `/v1` never reads the cookie (CONTRACT-3 §1). The
+        # per-route public table decides (20 MiB images, 26 MiB audio, else
+        # 1 MiB) — see `_public_api_body_cap`.
+        public = _public_api_body_cap(method, path)
         return BodyCap("public-api", public, public)
     if method == "POST" and path == "/chat":
         return BodyCap("chat", default, _chat_max_body_bytes())

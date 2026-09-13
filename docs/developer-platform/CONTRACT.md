@@ -306,16 +306,12 @@ under exactly the image rules of §8.1. There is no `background`.
 **Setting.** `PUBLIC_API_MAX_OUTPUT_TOKENS` (default 1,000,000). The chat
 application's `MODEL_MAX_OUTPUT` is not changed and is no longer read by `/v1`.
 
-**Not yet live on this deployment:** until `llm.stream_chat_events` accepts
-`wall_clock_s` (an integration change to `llm.py`), every `techsara-35b`
-generation is still stopped at the chat application's `GEN_WALL_CLOCK_S`
-(4,200 s in `.env`: about 298,000–424,000 tokens at 71–101 tok/s), ending
-`failed` with `timeout` and its partial output. The ceiling is accepted and the
-clamp applies; only the length is capped. `registry.per_request_wall_clock_live()`
-answers the question at run time, and the `max_output_tokens` description in
-`GET /v1/openapi.json` carries the same caveat for exactly as long as it is true.
-This paragraph goes in the change that lands the llm.py integration (a test
-holds the two together).
+**Live since the llm.py integration (2026-09-13):** `llm.stream_chat_events`
+accepts `wall_clock_s`, so a `techsara-35b` generation runs to its own wall
+clock below, not the chat application's `GEN_WALL_CLOCK_S`.
+`registry.per_request_wall_clock_live()` answers the question at run time; while
+it is false the `max_output_tokens` description in `GET /v1/openapi.json`
+carries a not-yet-live caveat, and a test holds this section to the same answer.
 
 **Ceilings** (registry, read at call time):
 
@@ -404,9 +400,11 @@ says which: `usage_events.meta.usage_source` is `counted_at_stop` for these,
 `engine` otherwise (§16).
 
 **Enforcement.** `techsara-35b`: `llm.stream_chat_events(wall_clock_s=…,
-wall_clock_marker=False)` once `llm.py` accepts them (`streaming.py`
-feature-detects the signature); until then llm's own `GEN_WALL_CLOCK_S` applies
-and a `/v1` generation is still cut at about 70 minutes. Independently the
+wall_clock_marker=False)` (`streaming.py` feature-detects the signature, so an
+llm.py without the parameter falls back to `GEN_WALL_CLOCK_S`). The call's
+engine request carries a per-request httpx read timeout equal to its wall clock
+whenever that is longer than `LLM_REQUEST_TIMEOUT`, so the transport never gives
+up first; chat-app calls are unchanged. Independently the
 `streaming.Generation` consumer cancels the producer at `wall_clock_s + 30 s`.
 Sidecars: `publicapi/engines.stream_chat` enforces `wall_clock_s` itself.
 
@@ -862,9 +860,13 @@ measured; the OCR and whisper figures are from 2026-09-08/09.
 ### 12.4 Settings
 
 Every `PUBLIC_API_*` value below follows `config.py`'s `_int` / `_float` rules
-(blank means the default). Until `config.py` declares them, readers use
+(blank means the default; a malformed value fails at start-up). `config.py`
+declares them since the 2026-09-13 integration (all but
+`PUBLIC_API_MAIN_LONG_FOOTPRINT_TOKENS`); readers still use
 `getattr(settings, <lower name>, None)` with an `os.environ` fallback parsed by
-the same rules, so the defaults hold either way.
+the same rules, so a reader running beside an older `config.py` gets the same
+defaults. The webhook settings are additionally clamped at use
+(`apiplatform/webhooks/queue.py`).
 
 | setting | default | governs |
 |---|---|---|
@@ -908,7 +910,11 @@ every `/v1` generation is a streamed engine call, even `stream: false`, so the
 httpx read timeout bounds the longest silence between chunks, not the whole
 generation. Main: `llm_request_timeout` (= `GEN_WALL_CLOCK_S`, 4,200 s) must be
 ≥ the longest legitimate silence, the 878 s full-window prefill; a start-up check
-logs an error when it is below `PUBLIC_API_MAIN_PREFILL_ALLOWANCE_S`. Sidecars use
+logs an error when it is below `PUBLIC_API_MAIN_PREFILL_ALLOWANCE_S`. A call whose
+own wall clock is longer than `llm_request_timeout` is sent with a per-request
+read timeout equal to that clock (`llm._transport_timeout_for`), so the transport
+never gives up before the application does, and the shared client — whose cache
+would otherwise close a client still streaming — is not rebuilt. Sidecars use
 the fixed read timeouts of §11. `LLM_MAX_RETRIES` stays 0.
 
 ## 13. Idempotency

@@ -115,6 +115,9 @@ def test_the_flagship_offers_one_million_output_tokens_and_keeps_the_eight_thous
 def test_the_output_ceiling_is_the_public_setting_and_never_the_chat_apps_model_max_output(monkeypatch):
     monkeypatch.setattr(settings, "model_max_context", 1_000_000)
     monkeypatch.setattr(settings, "model_max_output", 8192)
+    # The environment path: config.py declares the attribute since the
+    # 2026-09-13 integration, and a declared attribute wins over the variable.
+    monkeypatch.delattr(settings, "public_api_max_output_tokens", raising=False)
     monkeypatch.setenv("PUBLIC_API_MAX_OUTPUT_TOKENS", "300000")
     assert registry.resolve_public_model("techsara-35b").max_output_tokens == 300_000
     # config.py's rule: blank means the default.

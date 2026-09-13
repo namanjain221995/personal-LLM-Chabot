@@ -238,7 +238,7 @@ def test_ten_public_long_answers_cannot_take_the_chat_apps_normal_slots(fake_mai
     refused after the (scaled) admission wait. Now two run, eight are refused
     at the public gate, and the chat turn gets its first token at once."""
     monkeypatch.setattr(settings, "admission_normal_wait_s", 2.0)
-    monkeypatch.setenv("PUBLIC_API_GATE_WAIT_S", "0.2")
+    monkeypatch.setattr(settings, "public_api_gate_wait_s", 0.2, raising=False)
     plan = _plan(130_000)
 
     async def scenario():

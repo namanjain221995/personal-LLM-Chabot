@@ -355,8 +355,8 @@ def test_the_capacity_gate_refuses_a_sidecar_stream_before_its_status_line(api, 
     from app.publicapi import capacity
 
     fake = sidecar(FakeSidecar())
-    monkeypatch.setenv("PUBLIC_API_GATE_WAIT_S", "0.05")
-    monkeypatch.setenv("PUBLIC_API_ROUTER_MAX_CONCURRENT", "1")
+    monkeypatch.setattr(settings, "public_api_gate_wait_s", 0.05, raising=False)
+    monkeypatch.setattr(settings, "public_api_router_max_concurrent", 1, raising=False)
 
     # The gate lives on the app's own event loop, so it is held from there.
     with api.portal.wrap_async_context_manager(capacity.hold("router", wait_s=1)):

@@ -12,7 +12,8 @@ Two questions, both of which have to be answered on every commit once
      at THEIR build time, not ours;
 
   2. does its operation set match `public-api-surface.txt`? CONTRACT-3 §7
-     names eight endpoints and says what is deliberately NOT exposed
+     names eleven endpoints (eight until the 2026-09-13 owner request added
+     embeddings, rerank and transcriptions) and says what is deliberately NOT exposed
      (Salesforce, RAG and web search, deep research, uploads, artifacts,
      memory, conversation history, admin analytics). A route added to the
      public router by accident — a stray `@router.get` on a debugging

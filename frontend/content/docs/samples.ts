@@ -65,8 +65,10 @@ export const MODEL_IDS = [
  * while this is false, and tests/docs-site.test.tsx ties the value to llm.py
  * itself: the day `stream_chat_events` accepts `wall_clock_s`, the test fails
  * until this is flipped to `true` — nobody has to remember.
+ *
+ * Flipped 2026-09-13 in the change that landed `wall_clock_s` in llm.py.
  */
-export const LONG_OUTPUT_WALL_CLOCK_LIVE: boolean = false;
+export const LONG_OUTPUT_WALL_CLOCK_LIVE: boolean = true;
 
 /** The caveat while the per-request wall clock is not yet enforced. */
 export const WALL_CLOCK_PENDING_NOTE =

@@ -122,11 +122,11 @@ _AUDIO_ROUTES = ("/v1/audio/transcriptions",)
 
 
 def body_cap_for(method: str, path: str) -> int:
-    """The transport body cap for one `/v1` request line — THE SEAM for the
-    application's body-size middleware (`app/main.py::body_cap_for`, another
-    owner's file), which today caps every `/v1` path at `max_body_bytes()` and
-    so refuses an image request before this router sees it. Until main.py
-    calls this, images through the mounted app are limited to 1 MiB bodies."""
+    """The transport body cap for one `/v1` request line — THE table the
+    application's body-size middleware asks (`app/main.py::body_cap_for`, via
+    `_public_api_body_cap`, since the 2026-09-13 integration). A new `/v1`
+    route whose body may exceed `max_body_bytes()` is added here, and the
+    mounted app follows with no edit to main.py."""
     normalised = "/" + str(path or "").strip("/")
     if str(method or "").upper() == "POST":
         if normalised in _MEDIA_ROUTES:

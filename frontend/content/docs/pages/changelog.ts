@@ -50,7 +50,10 @@ behaviour on \`/v1\` appears here.
 * **The wall clock follows the request.** A generation's time limit is now sized to
   its \`max_output_tokens\`, up to six hours, and a generation that reaches it
   keeps the text it had written.
-${LONG_OUTPUT_WALL_CLOCK_LIVE ? '' : `* ${WALL_CLOCK_PENDING_NOTE}\n`}* **Capacity queues per engine.** The engines are shared with the TechSara chat
+${LONG_OUTPUT_WALL_CLOCK_LIVE ? `* **The per-request wall clock is live.** A \`techsara-35b\` generation is no longer
+  stopped at the chat application's 70-minute clock: it runs to its own, so a
+  1,000,000-token answer can finish.
+` : `* ${WALL_CLOCK_PENDING_NOTE}\n`}* **Capacity queues per engine.** The engines are shared with the TechSara chat
   application, which keeps priority. Public requests to each wait in a small
   queue; one that cannot start in time is \`503 model_unavailable\` with
   \`Retry-After\` — capacity shared by every caller, never a \`429\` and never a

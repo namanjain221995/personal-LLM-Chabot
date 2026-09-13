@@ -208,9 +208,16 @@ def test_a_wall_clock_stop_records_counted_usage_when_the_engine_sends_usage_onl
 ):
     """CONTRACT §8.3 promised the partial output AND its usage; vLLM's usage
     chunk is the stream's last, and the wall clock closes the stream before
-    it, so the row said `usage: null`. Scaled: GEN_WALL_CLOCK_S = 1 s, six
-    tokens 0.4 s apart — the guard fires on the third chunk."""
+    it, so the row said `usage: null`. Scaled: the request's own wall clock is
+    1 s (PUBLIC_API_GEN_WALL_CLOCK_S, the ceiling of every /v1 clock), six
+    tokens 0.4 s apart — the guard fires on the third chunk.
+
+    Scaled through the PUBLIC ceiling since the llm.py integration
+    (2026-09-13): llm.stream_chat_events now enforces the per-request clock,
+    so shrinking only GEN_WALL_CLOCK_S (a floor under the 900 s prefill
+    allowance) no longer cuts a /v1 generation — which is the point."""
     monkeypatch.setattr(settings, "gen_wall_clock_s", 1.0)
+    monkeypatch.setattr(settings, "public_api_gen_wall_clock_s", 1.0, raising=False)
     FAKE.tokens = 6
     FAKE.delay = 0.4
     rows: List[Dict[str, Any]] = []
@@ -317,18 +324,13 @@ def test_contract_section_9_says_the_applied_ceiling_may_exceed_the_planned_one_
     assert applied == 998_728 > 998_480
 
 
-@pytest.mark.xfail(
-    not registry.per_request_wall_clock_live(),
-    strict=True,
-    reason=(
-        "needs integration in app/llm.py: stream_chat_events(..., wall_clock_s=None, "
-        "wall_clock_marker=True). Strict: XPASSes the day it lands; then drop the marker, the "
-        "CONTRACT §8.3 caveat and set LONG_OUTPUT_WALL_CLOCK_LIVE in the docs."
-    ),
-)
 def test_a_million_token_stream_is_not_cut_at_the_chat_apps_wall_clock(api, platform, monkeypatch):
     """Scaled: GEN_WALL_CLOCK_S = 1 s; the engine streams 8 tokens 0.4 s apart
-    (3.2 s); a 1,000,000-token request's own clock is 20,900 s."""
+    (3.2 s); a 1,000,000-token request's own clock is 20,900 s.
+
+    Was a strict xfail until llm.stream_chat_events accepted `wall_clock_s`
+    (integration 2026-09-13); tests/test_llm_per_request_wall_clock.py pins the
+    llm.py side on an injected clock."""
     monkeypatch.setattr(settings, "gen_wall_clock_s", 1.0)
     FAKE.tokens = 8
     FAKE.delay = 0.4

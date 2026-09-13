@@ -123,7 +123,7 @@ def test_the_wall_clock_is_sized_from_the_planned_output(planned, expected):
 
 
 def test_the_wall_clock_never_exceeds_the_public_hard_ceiling(monkeypatch):
-    monkeypatch.setenv("PUBLIC_API_GEN_WALL_CLOCK_S", "10000")
+    monkeypatch.setattr(settings, "public_api_gen_wall_clock_s", 10_000.0, raising=False)
     assert planning.wall_clock_for(_flagship(), 1_000_000) == 10_000.0
 
 
@@ -513,7 +513,7 @@ def test_a_background_job_waits_queued_for_the_long_gate_and_a_cancel_there_neve
     api, platform, engine, monkeypatch
 ):
     calls = engine(["never"])
-    monkeypatch.setenv("PUBLIC_API_BACKGROUND_GATE_WAIT_S", "30")
+    monkeypatch.setattr(settings, "public_api_background_gate_wait_s", 30.0, raising=False)
 
     with api.portal.wrap_async_context_manager(capacity.hold("main.long", wait_s=1)):
         created = api.post(
@@ -538,7 +538,7 @@ def test_a_background_job_waits_queued_for_the_long_gate_and_a_cancel_there_neve
 
 def test_a_background_job_that_never_gets_capacity_fails_retry_safe(api, platform, engine, monkeypatch):
     calls = engine(["never"])
-    monkeypatch.setenv("PUBLIC_API_BACKGROUND_GATE_WAIT_S", "0.2")
+    monkeypatch.setattr(settings, "public_api_background_gate_wait_s", 0.2, raising=False)
 
     with api.portal.wrap_async_context_manager(capacity.hold("main.long", wait_s=1)):
         created = api.post(

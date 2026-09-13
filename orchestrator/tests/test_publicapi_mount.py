@@ -578,15 +578,39 @@ def _png_of(padding: int) -> bytes:
     return raw + struct.pack(">I", len(pad)) + b"tEXt" + pad + struct.pack(">I", zlib.crc32(b"tEXt" + pad))
 
 
-@pytest.mark.xfail(
-    not _main_uses_the_public_per_route_caps(),
-    strict=True,
-    reason=(
-        "needs integration in app/main.py (another owner's file): body_cap_for must use "
-        "publicapi.models.body_cap_for(method, path) for /v1 paths. Strict: when it lands, "
-        "this XPASSes and the marker must go."
-    ),
-)
+def test_main_py_asks_the_public_per_route_table_for_every_v1_cap():
+    """Integration 2026-09-13: `app.main.body_cap_for` delegates `/v1` to
+    `publicapi.models.body_cap_for` — one table, the one the edge mirrors."""
+    assert _main_uses_the_public_per_route_caps()
+    for method, path in (
+        ("POST", "/v1/embeddings"),
+        ("POST", "/v1/rerank"),
+        ("GET", "/v1/responses"),
+        ("POST", "/v1/responses/resp_x/cancel"),
+        ("GET", "/v1/models"),
+    ):
+        assert app_main.body_cap_for(method, path).signed_in == 1024 * 1024, (method, path)
+    # Anonymous and signed-in are one number on /v1: it never reads a cookie.
+    for path in ("/v1/responses", "/v1/audio/transcriptions"):
+        cap = app_main.body_cap_for("POST", path)
+        assert cap.anonymous == cap.signed_in and cap.family == "public-api"
+
+
+def test_the_v1_caps_follow_the_public_settings_and_a_broken_table_falls_back_to_one_mib(monkeypatch):
+    from app.publicapi import models as public_models
+
+    monkeypatch.setattr(settings, "public_api_max_media_body_bytes", 8 * 1024 * 1024, raising=False)
+    monkeypatch.setattr(settings, "public_api_max_audio_body_bytes", 12 * 1024 * 1024, raising=False)
+    assert app_main.body_cap_for("POST", "/v1/chat/completions").signed_in == 8 * 1024 * 1024
+    assert app_main.body_cap_for("POST", "/v1/audio/transcriptions").signed_in == 12 * 1024 * 1024
+
+    def broken(method, path):
+        raise RuntimeError("half-deployed sibling")
+
+    monkeypatch.setattr(public_models, "body_cap_for", broken)
+    assert app_main.body_cap_for("POST", "/v1/responses").signed_in == 1024 * 1024
+
+
 def test_the_mounted_app_lets_an_image_request_and_an_audio_upload_over_one_mib_reach_the_router():
     """Adversarial review 2026-09-13: CONTRACT §8 advertises 20 MiB on the two
     generation routes and 26 MiB on transcriptions, the Next edge enforces
@@ -619,6 +643,52 @@ def test_the_mounted_app_lets_an_image_request_and_an_audio_upload_over_one_mib_
     )
     assert imaged.status_code == 401, imaged.text[:200]
     assert audio.status_code == 401, audio.text[:200]
+
+
+def test_a_twenty_mib_audio_upload_and_a_large_image_request_pass_the_middleware_and_the_caps_still_hold():
+    """The integration's acceptance numbers through the mounted app: a 20 MiB
+    audio upload (under the 26 MiB transcription cap) and an image request of
+    about 6.5 MiB (under the 20 MiB generation cap) reach the router — 401,
+    because they carry no key — while one byte over each cap is still the
+    middleware's 413 in the public envelope."""
+    import base64
+
+    from app.publicapi import models as public_models
+
+    client = TestClient(app)
+    audio = client.post(
+        "/v1/audio/transcriptions",
+        files={"file": ("standup.wav", b"\x00" * (20 * 1024 * 1024), "audio/wav")},
+        data={"model": "techsara-whisper"},
+    )
+    assert audio.status_code == 401, audio.text[:200]
+    assert audio.json()["error"]["code"] != "request_too_large"
+
+    image = base64.b64encode(_png_of(5 * 1024 * 1024)).decode()
+    imaged = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "techsara-8b-vision",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Read the slide."},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image}"}},
+                    ],
+                }
+            ],
+        },
+    )
+    assert imaged.status_code == 401, imaged.text[:200]
+
+    for path, cap in (
+        ("/v1/audio/transcriptions", public_models.max_audio_body_bytes()),
+        ("/v1/responses", public_models.max_media_body_bytes()),
+    ):
+        over = client.post(path, content=b"x" * (cap + 1), headers={"content-type": "application/json"})
+        assert over.status_code == 413, (path, over.text[:200])
+        assert over.json()["error"]["code"] == "request_too_large"
 
 
 def test_a_body_over_one_mib_on_a_text_only_public_route_is_still_refused_by_the_middleware():

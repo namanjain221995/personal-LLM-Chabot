@@ -120,7 +120,7 @@ def test_an_image_whose_bytes_are_not_its_declared_type_is_refused(api, engine):
 
 
 def test_an_image_larger_than_the_per_image_limit_is_refused(api, engine, monkeypatch):
-    monkeypatch.setenv("PUBLIC_API_MAX_IMAGE_BYTES", str(len(PNG_BYTES) - 1))
+    monkeypatch.setattr(settings, "public_api_max_image_bytes", len(PNG_BYTES) - 1, raising=False)
     response = _responses(api, [{"type": "input_image", "image_url": f"data:image/png;base64,{PNG}"}])
     assert response.status_code == 400
     assert engine == []
@@ -199,7 +199,7 @@ def test_text_beyond_the_mebibyte_rule_is_a_413_even_inside_the_larger_media_bod
 
 
 def test_a_body_over_the_media_cap_is_refused_before_it_is_parsed(api, engine, monkeypatch):
-    monkeypatch.setenv("PUBLIC_API_MAX_MEDIA_BODY_BYTES", "3000")
+    monkeypatch.setattr(settings, "public_api_max_media_body_bytes", 3000, raising=False)
     monkeypatch.setattr("app.publicapi.models.max_body_bytes", lambda: 2000)
     response = _responses(api, [{"type": "input_text", "text": "y" * 4000}])
     assert response.status_code == 413

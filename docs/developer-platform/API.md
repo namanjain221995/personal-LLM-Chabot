@@ -682,11 +682,14 @@ prefill + planned / min_tps))`. Confirm in `planning.py`, and in
 `inspect.signature` feature-detection of `stream_chat_events(wall_clock_s=…,
 wall_clock_marker=False)`.
 
-**Until `llm.py` accepts `wall_clock_s`, every `techsara-35b` generation is still
-cut at `GEN_WALL_CLOCK_S` (4,200 s).** The public docs carry a caveat for that,
-driven by `LONG_OUTPUT_WALL_CLOCK_LIVE` in `frontend/content/docs/samples.ts`,
-and `frontend/tests/docs-site.test.tsx` fails the day the parameter appears in
-`llm.py` until the switch is flipped.
+**`llm.py` accepts `wall_clock_s` (integration 2026-09-13)**, so a `techsara-35b`
+generation runs to its planned wall clock rather than `GEN_WALL_CLOCK_S`
+(4,200 s), with a per-request read timeout of the same length when that is longer
+than `LLM_REQUEST_TIMEOUT`. `LONG_OUTPUT_WALL_CLOCK_LIVE` in
+`frontend/content/docs/samples.ts` is `true`, and
+`frontend/tests/docs-site.test.tsx` holds it to `llm.py`'s signature.
+`llm.get_applied_max_tokens()` is the `max_tokens` `_fit` sent (or the
+forced-closure retry's). Pinned by `tests/test_llm_per_request_wall_clock.py`.
 
 Response object keys `max_output_tokens` (planned on early snapshots, applied on
 the terminal) and `incomplete_details` (`{"reason": "max_output_tokens"}` on a
@@ -750,16 +753,21 @@ restart-failed long job with a new key.
 
 ### 13.7 Outside this wave's reach (integration items)
 
-* `config.py` declares the `PUBLIC_API_*` settings of CONTRACT §12.4 (until
-  then readers fall back to `os.environ` with the same parse rules).
-* `llm.py`: `wall_clock_s` / `wall_clock_marker` on `stream_chat_events`,
-  `get_applied_max_tokens()`.
-* `.github/workflows/scripts/public-api-surface.txt` gains the three routes; the
-  `api_contract` gate is red until it does.
-* `main.py`: `body_cap_for` uses `publicapi.models.body_cap_for(method, path)`
+* ~~`config.py` declares the `PUBLIC_API_*` settings of CONTRACT §12.4 (until
+  then readers fall back to `os.environ` with the same parse rules).~~ Landed
+  (integration 2026-09-13), with the three webhook settings, except
+  `PUBLIC_API_MAIN_LONG_FOOTPRINT_TOKENS`; pinned by
+  `tests/test_public_api_settings_declared.py`.
+* ~~`llm.py`: `wall_clock_s` / `wall_clock_marker` on `stream_chat_events`,
+  `get_applied_max_tokens()`.~~ Landed (integration 2026-09-13).
+* ~~`.github/workflows/scripts/public-api-surface.txt` gains the three routes; the
+  `api_contract` gate is red until it does.~~ Landed (integration 2026-09-13,
+  owner-approved): the surface file lists all eleven operations.
+* ~~`main.py`: `body_cap_for` uses `publicapi.models.body_cap_for(method, path)`
   for `/v1` (20 MiB generation routes, 26 MiB transcriptions); until then the
-  mounted app refuses image and audio bodies over 1 MiB. A strict xfail in
-  `test_publicapi_mount.py` flips when it lands.
+  mounted app refuses image and audio bodies over 1 MiB.~~ Landed (integration
+  2026-09-13): `main._public_api_body_cap`; the strict xfail in
+  `test_publicapi_mount.py` is a plain test now.
 * `admission.py`: `_ahead` leaves out `capacity.public_long_lived_decoding()`,
   so a chat LONG request is not held for the whole idle wait by a decoding
   public job (strict xfail in `test_publicapi_main_engine_priority.py`).

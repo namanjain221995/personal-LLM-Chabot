@@ -186,7 +186,7 @@ def test_an_abandoned_wait_raises_abandoned_rather_than_a_capacity_error():
 
 
 def test_the_wait_bound_is_read_at_call_time_from_the_setting(monkeypatch):
-    monkeypatch.setenv("PUBLIC_API_GATE_WAIT_S", "2.5")
+    monkeypatch.setattr(settings, "public_api_gate_wait_s", 2.5, raising=False)
     assert capacity.sync_wait_s() == 2.5
     monkeypatch.setattr(settings, "public_api_router_max_concurrent", 1, raising=False)
     assert capacity.snapshot()["router"]["max_concurrent"] == 1
@@ -199,7 +199,7 @@ def _install_video_probe(monkeypatch, busy):
 
 
 def test_public_ocr_work_waits_while_a_chat_generation_is_running_and_then_goes_anyway(monkeypatch):
-    monkeypatch.setenv("PUBLIC_API_YIELD_TO_CHAT_MAX_WAIT_S", "0.2")
+    monkeypatch.setattr(settings, "public_api_yield_to_chat_max_wait_s", 0.2, raising=False)
     probes = []
 
     def busy():
