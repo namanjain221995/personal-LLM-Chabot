@@ -11,9 +11,20 @@
 #   2. It is the rollback path if a launcher-managed start needs to be reverted.
 #
 # It is NOT portable: it hard-codes one developer's model directory as the
-# `VLLM_MODELS_DIR` default, uses floating `:nightly`/`:latest` tags, and
-# publishes model APIs on 0.0.0.0. The launcher-managed files fix all three.
-# Do not add features here; add them to compose.yaml and the overlays.
+# `VLLM_MODELS_DIR` default and uses floating `:nightly`/`:latest` tags. The
+# launcher-managed files fix both. Do not add features here; add them to
+# compose.yaml and the overlays.
+#
+# ONE EXCEPTION TO "UNMODIFIED", 2026-09-13: the five model APIs (8000-8004)
+# were published on 0.0.0.0 with no authentication, and the developer-platform
+# audit (F065) cited this file for it. A rollback must not reopen that, so
+# they now bind ${TECHSARA_MODEL_BIND_ADDRESS:-127.0.0.1}, like the overlays.
+# Nothing in this stack dials the host ports: the orchestrator uses
+# http://vllm:30000/v1 on the compose network.
+#
+# SECOND EXCEPTION, 2026-09-13: the developer-platform settings on the
+# orchestrator and frontend services (see the comment there), so a rollback
+# does not run /v1 on code defaults with the pepper silently unset.
 # =============================================================================
 # TechSara Local AI Analysis Platform — docker-compose (spec §6, model serving per
 # the vLLM design: owner override of spec §4 on 2026-07-22 — all models on vLLM).
@@ -141,7 +152,7 @@ services:
       # Local weights, read-only: nothing in the container may modify them.
       - ${VLLM_MODELS_DIR:-/home/techsphere/Documents/projects/vllm_models}:/models:ro
     ports:
-      - "8000:30000"
+      - "${TECHSARA_MODEL_BIND_ADDRESS:-127.0.0.1}:8000:30000"
     shm_size: 32g
     ipc: host
     restart: unless-stopped
@@ -188,7 +199,7 @@ services:
     volumes:
       - hf-cache:/root/.cache/huggingface
     ports:
-      - "8001:30001"
+      - "${TECHSARA_MODEL_BIND_ADDRESS:-127.0.0.1}:8001:30001"
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:30001/health || exit 1"]
@@ -257,7 +268,7 @@ services:
       - hf-cache:/root/.cache/huggingface
       - ${VLLM_MODELS_DIR:-/home/techsphere/Documents/projects/vllm_models}:/models:ro
     ports:
-      - "8002:30002"
+      - "${TECHSARA_MODEL_BIND_ADDRESS:-127.0.0.1}:8002:30002"
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:30002/health || exit 1"]
@@ -288,7 +299,7 @@ services:
     volumes:
       - hf-cache:/root/.cache/huggingface
     ports:
-      - "8003:30003"
+      - "${TECHSARA_MODEL_BIND_ADDRESS:-127.0.0.1}:8003:30003"
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:30003/health || exit 1"]
@@ -334,7 +345,7 @@ services:
       - hf-cache:/root/.cache/huggingface
       - ${VLLM_MODELS_DIR:-/home/techsphere/Documents/projects/vllm_models}:/models:ro
     ports:
-      - "8004:30004"
+      - "${TECHSARA_MODEL_BIND_ADDRESS:-127.0.0.1}:8004:30004"
     shm_size: 8g
     ipc: host
     restart: unless-stopped
@@ -543,6 +554,42 @@ services:
       BRAIN_MAX_CHARS: ${BRAIN_MAX_CHARS:-4000}
       LEARNED_EXAMPLES_ENABLED: ${LEARNED_EXAMPLES_ENABLED:-true}
       LEARNED_EXAMPLES_K: ${LEARNED_EXAMPLES_K:-2}
+      # SECOND EXCEPTION TO "UNMODIFIED", 2026-09-13: the developer platform.
+      # The image this file builds serves `/v1` and the API-key console, and
+      # this service has no `env_file`, so a rollback to this file would
+      # otherwise run them on nothing but code defaults. Same names and the
+      # same blank-means-the-code-default rule as compose.yaml; documented in
+      # .env.example, "Developer platform".
+      #
+      # API_KEY_PEPPER is listed here (unlike compose.yaml) because there is
+      # no env_file to carry it. It lives in .runtime/secrets.env, which
+      # Compose does NOT read by default, so run a rollback with
+      #   docker compose --env-file .env --env-file .runtime/secrets.env \
+      #     -f docker-compose.yml up -d
+      # Without the secrets layer it is blank, keys fall back to the
+      # in-database pepper, and every key minted under the real one is 401.
+      API_KEY_PEPPER: ${API_KEY_PEPPER:-}
+      PUBLIC_API_TRUSTED_PROXIES: ${PUBLIC_API_TRUSTED_PROXIES:-}
+      PUBLIC_API_MAX_BODY_BYTES: ${PUBLIC_API_MAX_BODY_BYTES:-}
+      PUBLIC_API_IDEMPOTENCY_TTL_HOURS: ${PUBLIC_API_IDEMPOTENCY_TTL_HOURS:-}
+      PUBLIC_API_IDEMPOTENCY_IN_FLIGHT_LEASE_SECONDS: ${PUBLIC_API_IDEMPOTENCY_IN_FLIGHT_LEASE_SECONDS:-}
+      PUBLIC_API_KEY_ROTATION_OVERLAP_HOURS: ${PUBLIC_API_KEY_ROTATION_OVERLAP_HOURS:-}
+      PUBLIC_API_DEFAULT_RPM: ${PUBLIC_API_DEFAULT_RPM:-}
+      PUBLIC_API_DEFAULT_INPUT_TPM: ${PUBLIC_API_DEFAULT_INPUT_TPM:-}
+      PUBLIC_API_DEFAULT_OUTPUT_TPM: ${PUBLIC_API_DEFAULT_OUTPUT_TPM:-}
+      PUBLIC_API_DEFAULT_MAX_CONCURRENCY: ${PUBLIC_API_DEFAULT_MAX_CONCURRENCY:-}
+      PUBLIC_API_DEFAULT_DAILY_TOKEN_QUOTA: ${PUBLIC_API_DEFAULT_DAILY_TOKEN_QUOTA:-}
+      PUBLIC_API_RATELIMIT_JITTER_SECONDS: ${PUBLIC_API_RATELIMIT_JITTER_SECONDS:-}
+      PUBLIC_API_DEFAULT_MAX_OUTPUT_TOKENS: ${PUBLIC_API_DEFAULT_MAX_OUTPUT_TOKENS:-}
+      PUBLIC_API_QUOTA_GATE_WAIT_SECONDS: ${PUBLIC_API_QUOTA_GATE_WAIT_SECONDS:-}
+      API_PLAYGROUND_RPM: ${API_PLAYGROUND_RPM:-}
+      API_PLAYGROUND_INPUT_TPM: ${API_PLAYGROUND_INPUT_TPM:-}
+      API_PLAYGROUND_OUTPUT_TPM: ${API_PLAYGROUND_OUTPUT_TPM:-}
+      API_PLAYGROUND_MAX_CONCURRENCY: ${API_PLAYGROUND_MAX_CONCURRENCY:-}
+      API_PLAYGROUND_DAILY_TOKEN_QUOTA: ${API_PLAYGROUND_DAILY_TOKEN_QUOTA:-}
+      MAX_REQUEST_BODY_BYTES: ${MAX_REQUEST_BODY_BYTES:-}
+      CHAT_MAX_REQUEST_BODY_BYTES: ${CHAT_MAX_REQUEST_BODY_BYTES:-}
+      ORCHESTRATOR_DEV_DOCS: ${ORCHESTRATOR_DEV_DOCS:-}
     volumes:
       - data:/data
       # The Salesforce brain packs, read-only and LIVE: core/brain.py re-reads
@@ -684,6 +731,10 @@ services:
     environment:
       ORCHESTRATOR_URL: http://orchestrator:8080
       NEXT_PUBLIC_APP_NAME: "TechSara AI"
+      # The developer platform's public edge (2026-09-13); see compose.yaml.
+      TRUSTED_CLIENT_IP_HEADER: ${TRUSTED_CLIENT_IP_HEADER:-}
+      TRUSTED_FORWARDED_PROTO: ${TRUSTED_FORWARDED_PROTO:-}
+      PUBLIC_API_MAX_BODY_BYTES: ${PUBLIC_API_MAX_BODY_BYTES:-}
     ports:
       - "3000:3000"
     restart: unless-stopped

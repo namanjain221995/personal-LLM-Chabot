@@ -19,6 +19,17 @@
 # main model's tensor-parallel shards talk over. On the head it binds the
 # docker bridge gateway (172.17.0.1), which the orchestrator's container can
 # reach and nothing off-box can.
+#
+# THE MANAGEMENT ADDRESS IS ITSELF AN EXPOSURE. The developer-platform audit
+# (F051, 2026-09-13) measured `GET http://192.168.9.68:30007/health` answering
+# 200 from the office LAN: the server has no authentication, so any host there
+# can upload audio and burn the worker GPU the main model's TP=2 pair shares.
+# The address comes from scripts/whisper.sh (whisper_bind_address); the
+# audit's fix is to derive the worker's bind from CLUSTER_WORKER_IP, the RoCE
+# rail the worker sentinel already binds, and to rewrite ASR_BASE_URL and
+# ASR_BASE_URLS in the same change. Until then this file at least has no LAN
+# literal of its own: WHISPER_BIND is required, so a `docker compose up` run
+# by hand fails instead of silently binding the office network.
 
 services:
   whisper:
@@ -30,7 +41,7 @@ services:
       # The process binds this itself; Docker does not publish a port to it.
       # See the HOST NETWORKING note below — this is the same failure the
       # monitoring stack hit on 2026-08-31 and the same fix.
-      WHISPER_BIND: "${WHISPER_BIND:-192.168.9.68}"
+      WHISPER_BIND: "${WHISPER_BIND:?WHISPER_BIND must be set; scripts/whisper.sh derives it per node}"
       WHISPER_PORT: "${WHISPER_PORT:-30007}"
       WHISPER_MAX_AUDIO_SECONDS: "${WHISPER_MAX_AUDIO_SECONDS:-600}"
       HF_HOME: /cache/huggingface

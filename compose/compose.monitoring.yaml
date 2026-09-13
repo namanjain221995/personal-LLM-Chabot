@@ -134,10 +134,19 @@ services:
       - --path.procfs=/host/proc
       - --path.sysfs=/host/sys
       # Prometheus runs on the bridge network and reaches this through the
-      # host gateway, so loopback-only would make it unreachable. This is
-      # read-only telemetry; MONITORING_NODE_BIND tightens it to a specific
-      # interface where a firewall is not available (ufw is off on both nodes).
-      - --web.listen-address=${MONITORING_NODE_BIND:-0.0.0.0}:9100
+      # host gateway (host.docker.internal:9100 = the Docker bridge gateway),
+      # so loopback-only would make it unreachable -- and so does anything
+      # wider. The default was 0.0.0.0 with MONITORING_NODE_BIND named as the
+      # tightening "where a firewall is not available (ufw is off on both
+      # nodes)", and nobody set it: the developer-platform audit (F056,
+      # 2026-09-13) read every mount point, interface, systemd unit and
+      # InfiniBand counter of this host from the office LAN, unauthenticated.
+      # 172.17.0.1 is Docker's default bridge gateway and what this host's
+      # `docker network inspect bridge` reports; a host with a different
+      # `bip` sets MONITORING_NODE_BIND to its own gateway, and a wrong value
+      # fails loudly (node-exporter cannot bind, the `node` target goes DOWN)
+      # instead of quietly widening.
+      - --web.listen-address=${MONITORING_NODE_BIND:-172.17.0.1}:9100
       - --collector.netdev
       - --collector.netclass
       # The infiniband collector is what actually measures the RoCE fabric.
@@ -204,10 +213,19 @@ services:
   # metric came back with id="/" and no container name. Forcing
   # DOCKER_API_VERSION does not help - the version is compiled in.
   #
-  # /var/run is mounted read-only for the daemon socket, which is what supplies
-  # container NAMES. That is the one privilege this stack takes, and it is the
-  # minimum for the "which container is restarting?" question to be answerable;
-  # nothing here is privileged, and no other service gets the socket.
+  # /var/run is mounted for the daemon socket, which is what supplies container
+  # NAMES, the minimum for the "which container is restarting?" question to be
+  # answerable. THE `:ro` DOES NOT MAKE THE DOCKER API READ-ONLY, and this
+  # comment used to imply it did: a read-only bind forbids writes to the
+  # directory, not connect() on a unix socket, and cadvisor runs as uid 0, so
+  # anything executing inside it can create a privileged container and mount
+  # the host root (developer-platform audit F057, 2026-09-13). Narrowing the
+  # bind to /var/run/docker.sock:ro removes no privilege either. That is an
+  # ACCEPTED, root-equivalent risk, bounded by: the image is digest-pinned,
+  # the container publishes no port, and container labels are not stored.
+  # The real fix is a read-only docker-socket-proxy sidecar (GET /containers,
+  # /info, /version only) with cadvisor pointed at it via --docker=tcp://...,
+  # verified against the container dashboards before it replaces this mount.
   cadvisor:
     image: gcr.io/cadvisor/cadvisor@sha256:f40e65878e25c2e78ea037f73a449527a0fb994e303dc3e34cb6b187b4b91435
     profiles: [monitoring]

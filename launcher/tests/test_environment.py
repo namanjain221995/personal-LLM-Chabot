@@ -713,7 +713,11 @@ class ClusterEnvironmentTests(EnvironmentCase):
         )
         self.assertEqual(values["OPENAI_BASE_URL"], "http://vllm:18000/v1")
         self.assertEqual(values["VLLM_PORT"], "18000")
-        self.assertEqual(values["CLUSTER_API_BIND_ADDRESS"], "0.0.0.0")
+        # Audit F050 (2026-09-13): this was "0.0.0.0". The publish opt-in used
+        # to move the unauthenticated head onto every interface; it must not,
+        # so the head stays on the bridge gateway the fake detectors report.
+        self.assertEqual(values["CLUSTER_API_BIND_ADDRESS"], "172.17.0.1")
+        self.assertNotEqual(values["CLUSTER_API_BIND_ADDRESS"], "0.0.0.0")
         self.assertEqual(values["TECHSARA_PUBLISH_MODEL_PORTS"], "true")
 
     def test_engine_controller_router_health_url_follows_the_published_router_port(self) -> None:
@@ -753,8 +757,9 @@ class ClusterEnvironmentTests(EnvironmentCase):
         publish DOWN for a healthy engine whenever the ports were not published.
 
         Dual mode: the host-network head binds CLUSTER_API_BIND_ADDRESS, which
-        is 0.0.0.0 (reached on loopback) when published and the Docker bridge
-        gateway otherwise -- reachable from the host network either way.
+        is the Docker bridge gateway whether or not the ports are published
+        (loopback if the gateway cannot be read) -- never 0.0.0.0 since audit
+        F050 (2026-09-13).
         Single node: only a PUBLISHED port reaches the bridge; empty means the
         launcher does not start the controller.
         """
@@ -763,7 +768,12 @@ class ClusterEnvironmentTests(EnvironmentCase):
         self.assertEqual(unpublished["CLUSTER_API_BIND_ADDRESS"], "172.17.0.1")
         self.assertEqual(unpublished["TECHSARA_ENGINE_HEAD_API_URL"], "http://172.17.0.1:8000")
         published = self._generate(profile, {**self.DUAL, "PUBLISH_MODEL_PORTS": "true", "VLLM_PORT": "18000"})
-        self.assertEqual(published["TECHSARA_ENGINE_HEAD_API_URL"], "http://127.0.0.1:18000")
+        # Audit F050 (2026-09-13): this was "http://127.0.0.1:18000", the URL
+        # of a head bound to 0.0.0.0 -- the unauthenticated wildcard bind the
+        # audit reached from the LAN. Published or not, the head is on the
+        # bridge gateway now, and the controller follows it there.
+        self.assertEqual(published["CLUSTER_API_BIND_ADDRESS"], "172.17.0.1")
+        self.assertEqual(published["TECHSARA_ENGINE_HEAD_API_URL"], "http://172.17.0.1:18000")
         single = self._generate(profile, {"CLUSTER_MODE": "single"})
         self.assertEqual(single["TECHSARA_ENGINE_HEAD_API_URL"], "")
         single_published = self._generate(

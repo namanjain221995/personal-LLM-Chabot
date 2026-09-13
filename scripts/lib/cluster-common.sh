@@ -87,7 +87,12 @@ cluster_load_settings() {
   VLLM_PORT="${VLLM_PORT:-8000}"
   CLUSTER_WORKER_SSH="${CLUSTER_WORKER_SSH:-$(id -un)@${CLUSTER_WORKER_IP:-}}"
   CLUSTER_WORKER_MODEL_CACHE="${CLUSTER_WORKER_MODEL_CACHE:-${TECHSARA_MODEL_CACHE:-}}"
-  CLUSTER_API_BIND_ADDRESS="${CLUSTER_API_BIND_ADDRESS:-0.0.0.0}"
+  # Loopback when generated.env does not say, never 0.0.0.0: the launcher's
+  # own fallback (cluster.py DEFAULT_API_BIND_ADDRESS) moved to 127.0.0.1 for
+  # audit F050/F042 (2026-09-13), which reached the unauthenticated head on
+  # the LAN, the tailnet and both rails through a wildcard bind. The two
+  # defaults must agree, or these scripts probe an address the head is not on.
+  CLUSTER_API_BIND_ADDRESS="${CLUSTER_API_BIND_ADDRESS:-127.0.0.1}"
   CLUSTER_TENSOR_PARALLEL_SIZE="${CLUSTER_TENSOR_PARALLEL_SIZE:-2}"
   CLUSTER_PIPELINE_PARALLEL_SIZE="${CLUSTER_PIPELINE_PARALLEL_SIZE:-1}"
   CLUSTER_GPU_MEMORY_UTILIZATION="${CLUSTER_GPU_MEMORY_UTILIZATION:-0.30}"
@@ -102,7 +107,9 @@ require_dual_mode() {
 }
 
 api_host() {
-  case "${CLUSTER_API_BIND_ADDRESS:-0.0.0.0}" in
+  # A generated.env written before F050 still says 0.0.0.0; the head answers
+  # on loopback then, so that mapping stays until every node has been re-upped.
+  case "${CLUSTER_API_BIND_ADDRESS:-127.0.0.1}" in
     0.0.0.0|"") printf '127.0.0.1' ;;
     *) printf '%s' "$CLUSTER_API_BIND_ADDRESS" ;;
   esac

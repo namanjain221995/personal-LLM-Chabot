@@ -414,12 +414,25 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(values["CLUSTER_NCCL_IB_HCA"], "")
         self.assertEqual(values["CLUSTER_NCCL_SOCKET_IFNAME"], "enP2p1s0f1np1")
 
-    def test_api_bind_address_follows_the_publish_opt_in(self) -> None:
-        self.assertEqual(resolve(dual(), publish_model_ports=True)["CLUSTER_API_BIND_ADDRESS"], "0.0.0.0")
+    def test_the_head_never_binds_every_interface_whatever_the_publish_opt_in_says(self) -> None:
+        """Audit F050 (2026-09-13). This test used to be
+        ``test_api_bind_address_follows_the_publish_opt_in`` and pinned
+        ``PUBLISH_MODEL_PORTS=true`` -> ``0.0.0.0``, a gateway-less host ->
+        ``0.0.0.0``, and "no bridge probe when publishing". That was the
+        insecure behaviour itself: the head has no --api-key, and the audit
+        measured ``GET /v1/models`` answering 200 unauthenticated on the office
+        LAN, the tailnet and both RoCE rails because of exactly this branch. The
+        secure contract: the bridge gateway either way, loopback when the
+        gateway cannot be read (fail closed), and 0.0.0.0 never."""
+        self.assertEqual(resolve(dual(), publish_model_ports=True)["CLUSTER_API_BIND_ADDRESS"], "172.17.0.1")
         self.assertEqual(resolve(dual(), publish_model_ports=False)["CLUSTER_API_BIND_ADDRESS"], "172.17.0.1")
         unknown = fake_detectors(gateway=None)
-        self.assertEqual(resolve(dual(), publish_model_ports=False, detectors=unknown)["CLUSTER_API_BIND_ADDRESS"], "0.0.0.0")
-        # The bridge probe is not needed when publishing on every interface.
+        for publish in (True, False):
+            with self.subTest(publish_model_ports=publish):
+                bind = resolve(dual(), publish_model_ports=publish, detectors=unknown)["CLUSTER_API_BIND_ADDRESS"]
+                self.assertEqual(bind, "127.0.0.1")
+                self.assertNotEqual(bind, "0.0.0.0")
+        # Publishing no longer skips the bridge probe: the bind comes from it.
         probed: list[str] = []
         detectors = ClusterDetectors(
             ifname_for_ip=fake_detectors().ifname_for_ip,
@@ -427,7 +440,7 @@ class ValidationTests(unittest.TestCase):
             docker_bridge_gateway=lambda: probed.append("bridge") or "172.17.0.1",
         )
         resolve(dual(), publish_model_ports=True, detectors=detectors)
-        self.assertEqual(probed, [])
+        self.assertEqual(probed, ["bridge"])
 
 
 class EngineArgumentTests(unittest.TestCase):
