@@ -684,7 +684,23 @@ def accept_invitation(
             else:
                 # Invited an address that already has an account (e.g. a
                 # deactivated ex-member re-invited): claim it — set the new
-                # credentials and reactivate.
+                # credentials and reactivate. WHO may do this is decided by
+                # the caller (authn/api.accept_invitation applies the F028
+                # rank rule in invites.py) before this function runs.
+                #
+                # Every session the account still holds dies here. A
+                # deactivated account's leftover sessions are dormant, not
+                # dead — Principal refuses them only while status is not
+                # 'active' — so reactivating the row without this would wake
+                # every browser that was signed in before, next to the new
+                # credentials (AUDIT.md F028 accepting side, 2026-09-13). A
+                # claim sets a new password, so the reason the old browsers
+                # are told is the password-reset one they already understand.
+                con.execute(
+                    """UPDATE auth_sessions SET revoked_at = now(), revoke_reason = %s
+                       WHERE user_id = %s AND revoked_at IS NULL""",
+                    (REVOKE_PASSWORD_RESET, user["id"]),
+                )
                 user = con.execute(
                     """UPDATE users SET display_name = %s, password_hash = %s,
                            status = 'active', password_changed_at = now()
@@ -695,10 +711,17 @@ def accept_invitation(
                         user["id"],
                     ),
                 ).fetchone()
+            # DO NOTHING, not DO UPDATE SET role: an existing membership keeps
+            # the role it has. The upsert used to rewrite it to the
+            # invitation's role, which is how a claimed deactivated SUPER
+            # ADMIN quietly became a 'member' with no role-change event in
+            # the audit log (AUDIT.md F028, 2026-09-13). Changing a role is
+            # POST /admin/api/members/{id}/role, with its own rank check and its
+            # own audit row; an invitation only ever creates a membership.
             con.execute(
                 """INSERT INTO workspace_memberships (workspace_id, user_id, role)
                    VALUES (%s, %s, %s)
-                   ON CONFLICT (workspace_id, user_id) DO UPDATE SET role = EXCLUDED.role""",
+                   ON CONFLICT (workspace_id, user_id) DO NOTHING""",
                 (inv["workspace_id"], user["id"], inv["role"]),
             )
             con.execute(

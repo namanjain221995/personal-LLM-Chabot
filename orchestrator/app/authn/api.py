@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 
 from .. import db
 from ..config import settings
-from . import passwords, sessions, store
+from . import invites, passwords, sessions, store
 from .principal import (
     Principal,
     _build as build_principal,
@@ -380,6 +380,46 @@ async def invitation_info(token: str) -> dict:
     }
 
 
+def _claim_refusal_at_acceptance(inv: Dict[str, Any]) -> Optional[invites.Refusal]:
+    """The F028 rank rule, applied again where the account is actually handed
+    over.
+
+    The issuing side (`admin_api.create_invitation`) refuses an invitation
+    that would claim an account its sender does not outrank — but only for
+    invitations created after that fix (2026-09-13). Every invitation already
+    sitting in `workspace_invitations` was issued under the old rule, and
+    accepting one still set a new password on the existing account,
+    reactivated it and signed the acceptor in as that person (AUDIT.md F028,
+    accepting side). So acceptance re-asks the same question of the same pure
+    function, with the INVITER as the actor.
+
+    The inviter's rank is read NOW, not remembered from issue time, and it
+    fails closed: an inviter who has since been removed, deactivated or
+    deleted (`invited_by` is ON DELETE SET NULL) carries no authority, and an
+    empty role outranks nothing — so such an invitation may still bring in a
+    brand-new address (no account is claimed) but never an existing one.
+    """
+    target_user = store.get_user_by_email(inv["email"])
+    if target_user is None:
+        return None
+    inviter_role = ""
+    if inv.get("invited_by") is not None:
+        inviter = store.get_user(int(inv["invited_by"]))
+        inviter_member = store.membership(int(inv["invited_by"])) if inviter else None
+        if (
+            inviter is not None
+            and str(inviter.get("status") or "") == "active"
+            and inviter_member is not None
+            and str(inviter_member.get("workspace_id")) == str(inv["workspace_id"])
+        ):
+            inviter_role = str(inviter_member["role"])
+    return invites.claim_refusal(
+        inviter_role,
+        target_user=target_user,
+        target_membership=store.membership(int(target_user["id"])),
+    )
+
+
 class AcceptInvitationRequest(BaseModel):
     token: str = Field(min_length=10, max_length=200)
     name: str = Field(default="", max_length=200)
@@ -398,6 +438,34 @@ async def accept_invitation(
     def work() -> Dict[str, Any]:
         inv = _live_invitation(body.token)
         if inv is None:
+            raise HTTPException(
+                status_code=404, detail="This invitation is no longer valid."
+            )
+        refusal = _claim_refusal_at_acceptance(inv)
+        if refusal is not None:
+            if refusal.audited:
+                # Recorded before the 404: the acceptor is anonymous, but an
+                # invitation that would have handed over an account above its
+                # inviter's rank is exactly the event the log must keep.
+                target = store.get_user_by_email(inv["email"])
+                store.record_audit(
+                    workspace_id=inv["workspace_id"],
+                    actor_user_id=inv["invited_by"],
+                    action="invitation_claim_refused",
+                    target_user_id=int(target["id"]) if target else None,
+                    resource_type="invitation",
+                    resource_id=inv["id"],
+                    meta={
+                        "role": inv["role"],
+                        "reason": refusal.reason,
+                        "target_role": refusal.target_role,
+                    },
+                    ip=ip,
+                    user_agent=user_agent,
+                )
+            # 404 like every other unacceptable invitation: the accept page is
+            # public, and a distinct answer would say "this address has an
+            # account you may not reach" to whoever holds the link.
             raise HTTPException(
                 status_code=404, detail="This invitation is no longer valid."
             )

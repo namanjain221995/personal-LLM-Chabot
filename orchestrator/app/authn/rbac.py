@@ -49,6 +49,37 @@ class Cap(str, Enum):
     #: conversation; that stays behind WORKSPACE_CONTENT_READ and its audit.
     SHARES_MANAGE = "shares.manage"
 
+    # --- the developer platform (CONTRACT-3 §6, 2026-09-12) ---------------
+    #
+    # These gate the BROWSER surface only — the console at /api and the
+    # admin API behind it. A request authenticated by an API key resolves a
+    # project and its scopes instead and never carries a capability: the two
+    # vocabularies are separate on purpose, so a leaked key can never be
+    # mistaken for an administrator, and a demoted administrator cannot be
+    # re-admitted by a key they once created.
+    #
+    # Everything here except the last two is granted to ADMIN: running
+    # projects and keys is workspace work. Deciding which models the platform
+    # serves publicly, and lifting a workspace's ceilings, are infrastructure
+    # decisions and stay with SUPER_ADMIN for the same reason ANALYTICS_READ
+    # does.
+    API_CONSOLE_ACCESS = "api.console.access"
+    API_PROJECTS_READ = "api.projects.read"
+    API_PROJECTS_MANAGE = "api.projects.manage"
+    API_KEYS_CREATE = "api.keys.create"
+    API_KEYS_REVOKE = "api.keys.revoke"
+    API_USAGE_READ = "api.usage.read"
+    API_LOGS_READ = "api.logs.read"
+    API_WEBHOOKS_MANAGE = "api.webhooks.manage"
+    #: Which models the public API may expose at all. SUPER_ADMIN only, and
+    #: absent from _ADMIN_CAPS deliberately: an admin runs projects, not the
+    #: question of what this platform serves to the internet.
+    API_MODELS_MANAGE = "api.models.manage"
+    #: Raise a project's rate, token or concurrency ceiling above the
+    #: workspace default. SUPER_ADMIN only — those ceilings are what stop one
+    #: developer key from starving the chat application of admission slots.
+    API_LIMITS_MANAGE = "api.limits.manage"
+
 
 #: What each role can do. SUPER_ADMIN is computed as "everything" so a new
 #: capability can never be forgotten from it.
@@ -60,6 +91,14 @@ _ADMIN_CAPS: FrozenSet[Cap] = frozenset(
         Cap.INVITES_MANAGE,
         Cap.WORKSPACE_CONTENT_READ,
         Cap.SESSIONS_MANAGE,
+        Cap.API_CONSOLE_ACCESS,
+        Cap.API_PROJECTS_READ,
+        Cap.API_PROJECTS_MANAGE,
+        Cap.API_KEYS_CREATE,
+        Cap.API_KEYS_REVOKE,
+        Cap.API_USAGE_READ,
+        Cap.API_LOGS_READ,
+        Cap.API_WEBHOOKS_MANAGE,
     }
 )
 

