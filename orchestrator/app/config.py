@@ -1249,6 +1249,150 @@ class Settings:
             "SESSION_SECRET_FILE", "/data/.session_secret"
         )
 
+        # --- The developer platform (CONTRACT-3, 2026-09-13) ---------------
+        #
+        # `/v1`, its API keys, and the quota engine in front of them. Every
+        # value here is read by `app/apiplatform/` or `app/publicapi/`; none of
+        # it changes the chat application's behaviour for people who never
+        # touch the developer platform (CONTRACT-3 §18).
+        #
+        # THE PEPPER. `key_hash = HMAC-SHA256(pepper, secret)` and this is the
+        # pepper (CONTRACT-3 §5). It is the INTENDED source and the stronger of
+        # the two: NIST SP 800-63B is normative that "the secret key value
+        # SHALL be stored separately from the hashed passwords", and an
+        # environment variable on the host satisfies that where the fallback —
+        # a generated value in `platform_secrets`, the same database that holds
+        # the digests — does not. Blank is the honest default: the platform
+        # then generates and persists one so a fresh install works without a
+        # deploy-time secret, and `apiplatform/keys.py` documents that as the
+        # weaker path.
+        #
+        # ADDED 2026-09-13 BECAUSE IT WAS MISSING. Wave 1 shipped
+        # `keys._configured_pepper()` reading `getattr(settings,
+        # "api_key_pepper", "")` against a Settings class that had no such
+        # attribute, so the getattr default won on every single call and every
+        # installation silently ran the in-database fallback — with no warning,
+        # no startup check, and two tests that passed only because
+        # `monkeypatch.setattr(..., raising=False)` CREATED the attribute they
+        # were asserting on. Read straight from the environment here, and
+        # `test_the_pepper_setting_is_plumbed` fails if this line is ever
+        # removed again.
+        #
+        # Shorter than `keys.MIN_PEPPER_CHARS` (32) is REFUSED at use, not
+        # silently accepted — a short pepper that "works" is a security
+        # property quietly downgraded.
+        self.api_key_pepper: str = os.environ.get("API_KEY_PEPPER", "").strip()
+
+        # The `/v1` request body cap (CONTRACT-3 §8: "≤ 1 MiB (configurable)",
+        # §12 "body bytes 1 MiB, before parsing"). `publicapi/models.py`
+        # already reads this name through a getattr with the same default, so
+        # naming it here is what makes the limit actually operable.
+        self.public_api_max_body_bytes: int = _int(
+            "PUBLIC_API_MAX_BODY_BYTES", 1_048_576
+        )
+
+        # How long an `Idempotency-Key` claim is honoured (CONTRACT-3 §13:
+        # "retained 24 h"). A float because `db.claim_idempotency` takes hours
+        # as a float and a test wants to claim a window of seconds.
+        self.public_api_idempotency_ttl_hours: float = _float(
+            "PUBLIC_API_IDEMPOTENCY_TTL_HOURS", 24.0
+        )
+
+        # CONTRACT-3 §12's default ceilings, in ONE runtime-readable place.
+        # `api_projects` carries the same numbers as DDL defaults, and these
+        # are the fallback the quota engine uses when a row does not answer
+        # (a NULL column, or a project row that predates a new limit). Two
+        # copies is one too many, so the quota engine reads the ROW first and
+        # only falls back here — see `apiplatform/quotas.py::limits_for`.
+        self.public_api_default_rpm: int = _int("PUBLIC_API_DEFAULT_RPM", 60)
+        self.public_api_default_input_tpm: int = _int(
+            "PUBLIC_API_DEFAULT_INPUT_TPM", 200_000
+        )
+        self.public_api_default_output_tpm: int = _int(
+            "PUBLIC_API_DEFAULT_OUTPUT_TPM", 60_000
+        )
+        self.public_api_default_max_concurrency: int = _int(
+            "PUBLIC_API_DEFAULT_MAX_CONCURRENCY", 4
+        )
+        self.public_api_default_daily_token_quota: int = _int(
+            "PUBLIC_API_DEFAULT_DAILY_TOKEN_QUOTA", 2_000_000
+        )
+        # The output reservation a generation gets at admission when the
+        # caller does not say how many tokens it wants (CONTRACT-3 §12: "8,192
+        # default"). 2026-09-13, wave-3 re-verify: output was not reserved at
+        # all, so a burst of max_concurrency long generations could overshoot
+        # output_tpm and the daily quota by max_concurrency x max_output_tokens
+        # before a single one settled. `quotas.reserve` now charges this (or
+        # the request's own max_output_tokens) up front and settles it to the
+        # measured count.
+        self.public_api_default_max_output_tokens: int = _int(
+            "PUBLIC_API_DEFAULT_MAX_OUTPUT_TOKENS", 8192
+        )
+        # How long a request may wait for the in-process quota gate of its
+        # project before it is answered 429 instead (2026-09-13, wave-3
+        # re-verify). The wait happens on a worker THREAD, never while holding
+        # a pooled PostgreSQL connection — but those threads are shared with
+        # the chat app's `run_in_thread` too, so the wait is bounded: a key
+        # flooding one project must not park the whole thread pool.
+        self.public_api_quota_gate_wait_seconds: float = _float(
+            "PUBLIC_API_QUOTA_GATE_WAIT_SECONDS", 5.0
+        )
+
+        # Jitter, in seconds, added to the advertised `RateLimit` window and to
+        # the `Retry-After` computed with it.
+        #
+        # draft-ietf-httpapi-ratelimit-headers-11 asks for this by name and
+        # gives the worked example: without it every client throttled in the
+        # same minute returns at exactly the same second and the stampede that
+        # follows is worse than the load that caused the throttle. Both numbers
+        # come from ONE draw so `Retry-After` can never point earlier than the
+        # end of the window it is paired with, which the same draft makes a
+        # SHOULD NOT. Set it to 0 in a test that needs an exact second.
+        self.public_api_ratelimit_jitter_seconds: float = _float(
+            "PUBLIC_API_RATELIMIT_JITTER_SECONDS", 3.0
+        )
+
+        # The proxies whose `X-Forwarded-For` the `/v1` ip_allowlist believes,
+        # as a comma-separated list of addresses or CIDRs (v4 or v6).
+        #
+        # WHY A LIST AND NOT AUTH_TRUST_PROXY_HEADERS (2026-09-13, wave-2
+        # review). The old rule believed the header whenever that global
+        # boolean was on, and production runs with it on while the
+        # orchestrator is published on 0.0.0.0:8080 — so anyone on the LAN
+        # holding a leaked key could send `X-Forwarded-For: <an allowlisted
+        # address>` and walk past the one control meant to pin a key to its
+        # owner's servers. A forwarded address is now honoured ONLY when the
+        # socket peer is inside this set (normally the frontend container's
+        # network, which rewrites the header itself); otherwise the socket
+        # peer is the address. EMPTY trusts nobody, which fails closed: an
+        # allowlisted project reached through an unlisted proxy is refused.
+        self.public_api_trusted_proxies: tuple = tuple(
+            item.strip()
+            for item in os.environ.get("PUBLIC_API_TRUSTED_PROXIES", "").split(",")
+            if item.strip()
+        )
+
+        # How long a rotated-out key keeps working beside its replacement
+        # (CONTRACT-3 §5 "rotate, optional overlap window"). Written onto the
+        # OLD key as `rotation_expires_at` by `projects.rotate_key`, and the
+        # resolver refuses that key from the instant it passes. Bounded by
+        # `keys.MAX_ROTATION_OVERLAP` (30 days) at use.
+        self.public_api_key_rotation_overlap_hours: float = _float(
+            "PUBLIC_API_KEY_ROTATION_OVERLAP_HOURS", 168.0
+        )
+
+        # How long an `in_flight` idempotency claim may sit before a retry is
+        # allowed to take it over (2026-09-13, wave-2 review). A process that
+        # dies mid-generation never marks its claim finished, and before this
+        # the key read "still running" for the whole 24 h retention — and,
+        # past that, until a prune happened to run. Twice the generation wall
+        # clock, floored at an hour, so a claim is never reclaimed while the
+        # generation that owns it can still be alive.
+        self.public_api_idempotency_in_flight_lease_seconds: float = _float(
+            "PUBLIC_API_IDEMPOTENCY_IN_FLIGHT_LEASE_SECONDS",
+            max(3600.0, 2.0 * float(self.gen_wall_clock_s)),
+        )
+
         # --- Conversation sharing (V20) ---
         # Off-by-default at the RISKY end only: sharing inside the workspace
         # is on, sharing to the open internet is a decision a super admin
