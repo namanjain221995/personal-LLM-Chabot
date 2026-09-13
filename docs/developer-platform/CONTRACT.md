@@ -237,14 +237,14 @@ Error, everywhere, including mid-stream:
 | `origin_not_allowed` | 403 | browser origin outside the project's allowlist |
 | `model_not_found` | 404 | unknown model, or one this key may not use |
 | `response_not_found` | 404 | not this project's response |
-| `idempotency_conflict` | 409 | same key, different body |
+| `idempotency_conflict` | 409 | same key, different body; or same body while the first is still running — `Retry-After` |
 | `request_too_large` | 413 | body over the cap |
 | `context_length_exceeded` | 400 | prompt over the model's input ceiling |
-| `rate_limit_error` | 429 | RPM/TPM exceeded — `Retry-After` |
-| `quota_exceeded` | 429 | daily/monthly token quota — `Retry-After` |
-| `concurrency_limit_exceeded` | 429 | too many in flight — `Retry-After` |
+| `rate_limit_error` | 429 | RPM/TPM exceeded, only when limits are enforced — `Retry-After` |
+| `quota_exceeded` | 429 | daily/monthly token quota, only when limits are enforced — `Retry-After` |
+| `concurrency_limit_exceeded` | 429 | too many of the project's requests in flight, only when limits are enforced — `Retry-After` |
 | `model_recovering` | 503 | engine restarting — `Retry-After`, retry-safe |
-| `model_unavailable` | 503 | engine down |
+| `model_unavailable` | 503 | engine down, or at capacity (shared admission lanes full) — `Retry-After` |
 | `timeout` | 504 | generation exceeded the wall clock |
 | `internal_error` | 500 | anything else — never a traceback |
 
@@ -331,6 +331,9 @@ Token counts are written **once per request**, never per token.
 * same key + same body fingerprint → the original response is returned (or, if it
   is still running, the caller attaches to it); the model is not invoked twice;
 * same key + different fingerprint → `409 idempotency_conflict`;
+* same key + same fingerprint while the first is still running → `409
+  idempotency_conflict` with `Retry-After` (2026-09-13: it was a `429`, which
+  named a rate limit the API no longer enforces);
 * the claim is `INSERT … ON CONFLICT DO NOTHING RETURNING id` — zero rows means
   someone else claimed it, which is the race-free primitive.
 

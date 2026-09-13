@@ -26,6 +26,13 @@ WHAT EACH GROUP PINS:
    path ratchets a project's limit down to zero over a day of ordinary errors,
    and the only fix is a restart.
 
+0. THE LIMITS ARE OFF BY DEFAULT (owner decision, 2026-09-13). The public API
+   has no request, token, daily or concurrency limit unless
+   PUBLIC_API_ENFORCE_LIMITS is true. Every enforcement test in this file runs
+   WITH THE SWITCH ON (the autouse fixture below) so that code stays tested;
+   section 7 runs with it off and proves nothing is refused, no header
+   advertises a limit, and the ledgers are still written exactly once.
+
 4. THE WORK RUNS ONCE. Two identical idempotent requests invoke the model
    once; two different bodies under one key are a 409, not a replay of
    somebody else's answer.
@@ -69,6 +76,10 @@ def _engine_state(monkeypatch):
     """
     monkeypatch.setattr(settings, "api_key_pepper", TEST_PEPPER)
     monkeypatch.setattr(settings, "public_api_ratelimit_jitter_seconds", 0.0)
+    # ENFORCED for every test in this file unless it asks for `unlimited`
+    # (2026-09-13): the default is off, and the enforcement code must keep
+    # its tests for the operator who turns it back on.
+    monkeypatch.setattr(settings, "public_api_enforce_limits", True)
     keys.reset_pepper_cache()
     quotas.reset_concurrency()
     yield
@@ -254,7 +265,14 @@ def test_the_daily_quota_survives_a_process_restart_because_a_fresh_interpreter_
     )
     import json
 
-    env = dict(os.environ, APP_DATABASE_URL=settings.app_database_url)
+    # The fresh interpreter reads the switch from the environment, not from
+    # this process's monkeypatch; the test is about enforcement surviving a
+    # restart, so it runs the child with enforcement on.
+    env = dict(
+        os.environ,
+        APP_DATABASE_URL=settings.app_database_url,
+        PUBLIC_API_ENFORCE_LIMITS="true",
+    )
     result = subprocess.run(
         [
             sys.executable,
@@ -1633,3 +1651,302 @@ def test_an_idempotency_claim_decides_and_reads_on_one_clock_even_when_the_host_
     retried = idempotency.claim(caller.project_id, "v1_responses", "skewed", {"input": "x"})
 
     assert retried.claimed is True
+
+
+# ---------------------------------------------------------------------------
+# 7. Unlimited by default (owner decision, 2026-09-13)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def unlimited(monkeypatch):
+    """PUBLIC_API_ENFORCE_LIMITS as it ships: off."""
+    monkeypatch.setattr(settings, "public_api_enforce_limits", False)
+
+
+def test_the_limits_are_off_unless_the_operator_sets_the_switch(monkeypatch):
+    """The default IS the decision: a fresh `Settings` with nothing in the
+    environment enforces nothing, and only an explicit true turns it on."""
+    from app.config import Settings
+
+    monkeypatch.delenv("PUBLIC_API_ENFORCE_LIMITS", raising=False)
+    assert Settings().public_api_enforce_limits is False
+    monkeypatch.setenv("PUBLIC_API_ENFORCE_LIMITS", "")
+    assert Settings().public_api_enforce_limits is False
+    monkeypatch.setenv("PUBLIC_API_ENFORCE_LIMITS", "false")
+    assert Settings().public_api_enforce_limits is False
+    monkeypatch.setenv("PUBLIC_API_ENFORCE_LIMITS", "true")
+    assert Settings().public_api_enforce_limits is True
+
+
+def test_with_the_limits_off_a_burst_far_above_the_old_rate_is_admitted_and_counted_once_each(
+    caller, unlimited
+):
+    """150 simultaneous requests against a project whose stored rpm is 1 —
+    the burst that admits exactly one when enforced. All 150 are admitted,
+    and the ledgers show 150 requests: counted once each, never refused,
+    never double-counted."""
+    projects.update_project(caller.project_id, caller.workspace_id, rpm=1)
+    stored_rpm_one = _reresolve(caller)
+
+    admitted, refused, unexpected = _burst([stored_rpm_one] * 150, now=NOON)
+
+    assert unexpected == []
+    assert refused == []
+    assert len(admitted) == 150
+    usage = ledger(stored_rpm_one, at=NOON)
+    assert usage["minute"]["requests"] == 150
+    assert usage["daily"]["requests"] == 150
+    assert usage["daily"]["rate_limited"] == 0
+
+
+def test_with_the_limits_off_read_routes_from_many_keys_are_all_admitted_and_counted(
+    caller, unlimited
+):
+    """The key's own tightening is a limit too: a key parked at rpm=0 and its
+    siblings are all admitted, and every request lands in the project's day."""
+    parked = _key_in(caller, "parked", rpm=0)
+    siblings = [_key_in(caller, f"sibling-{n}") for n in range(4)]
+
+    admitted, refused, unexpected = _burst(
+        ([parked] * 20) + [one for one in siblings for _ in range(20)],
+        now=NOON,
+        kind="read",
+    )
+
+    assert unexpected == [] and refused == []
+    assert len(admitted) == 100
+    assert ledger(caller, at=NOON)["daily"]["requests"] == 100
+    assert ledger(parked, at=NOON)["minute"]["requests"] == 20
+
+
+def test_with_the_limits_off_a_huge_token_volume_is_admitted_and_recorded_as_measured(
+    caller, unlimited
+):
+    """Token limits of 1,000 a minute and 1,000 a day, and twenty generations
+    of a million input tokens each: all admitted, none refused, and once each
+    is settled the ledgers hold exactly what was measured — twenty million in,
+    eight million out — once."""
+    projects.update_project(
+        caller.project_id,
+        caller.workspace_id,
+        input_tpm=1_000,
+        output_tpm=1_000,
+        daily_token_quota=1_000,
+    )
+    metered = _reresolve(caller)
+
+    reservations = [
+        quotas.reserve(
+            metered,
+            kind="sync",
+            estimated_input_tokens=1_000_000,
+            max_output_tokens=500_000,
+            now=NOON,
+        )
+        for _ in range(20)
+    ]
+    assert all(r.enforced is False for r in reservations)
+    during = ledger(metered, at=NOON)
+    assert during["minute"]["requests"] == 20
+    assert during["minute"]["input_tokens"] == 20_000_000
+
+    for reservation in reservations:
+        reservation.settle(1_000_000, 400_000, "completed", now=NOON)
+        # A second settlement is a no-op, exactly as when enforced.
+        reservation.settle(1_000_000, 400_000, "completed", now=NOON)
+
+    after = ledger(metered, at=NOON)
+    assert after["minute"] == {
+        "requests": 20,
+        "input_tokens": 20_000_000,
+        "output_tokens": 8_000_000,
+    }
+    assert after["daily"]["input_tokens"] == 20_000_000
+    assert after["daily"]["output_tokens"] == 8_000_000
+    assert after["daily"]["rate_limited"] == 0
+
+
+def test_with_the_limits_off_limits_stored_as_zero_refuse_nothing(caller, unlimited):
+    """Zero means zero ONLY when enforced. With the switch off a project
+    frozen at rpm=0, input_tpm=0, output_tpm=0, daily_token_quota=0 and
+    max_concurrency=0 still runs — and still records."""
+    projects.update_project(
+        caller.project_id,
+        caller.workspace_id,
+        rpm=0,
+        input_tpm=0,
+        output_tpm=0,
+        daily_token_quota=0,
+        max_concurrency=0,
+    )
+    frozen = _reresolve(caller)
+
+    quotas.reserve(frozen, kind="stream", estimated_input_tokens=10, now=NOON)
+    quotas.reserve(frozen, kind="read", now=NOON)
+    with quotas.concurrency_slot(frozen, "stream"):
+        assert quotas.in_flight(frozen) == 1
+
+    assert ledger(frozen, at=NOON)["daily"]["requests"] == 2
+
+
+def test_with_the_limits_off_many_concurrent_generations_all_get_a_slot_and_give_it_back(
+    caller, unlimited
+):
+    """Fifty simultaneous generations against max_concurrency=4 across sync,
+    stream and background: every slot granted, the counter still honest
+    while they run, and zero once they finish."""
+    every_key = [caller] + [_key_in(caller, f"k{n}", max_concurrency=1) for n in range(4)]
+    gate = threading.Barrier(50)
+    lock = threading.Lock()
+    seen = {"granted": 0, "peak": 0, "now": 0, "refused": 0}
+    release = threading.Event()
+    kinds = ("sync", "stream", "background")
+
+    def hold(n):
+        gate.wait(timeout=30)
+        try:
+            lease = quotas.take_slot(every_key[n % 5], kinds[n % 3])
+        except errors.ApiError:
+            with lock:
+                seen["refused"] += 1
+            return
+        with lock:
+            seen["granted"] += 1
+            seen["now"] += 1
+            seen["peak"] = max(seen["peak"], seen["now"])
+        release.wait(timeout=30)
+        with lock:
+            seen["now"] -= 1
+        lease.release()
+
+    threads = [threading.Thread(target=hold, args=(n,)) for n in range(50)]
+    for thread in threads:
+        thread.start()
+    deadline = datetime.now(timezone.utc) + timedelta(seconds=20)
+    while seen["granted"] + seen["refused"] < 50 and datetime.now(timezone.utc) < deadline:
+        threading.Event().wait(0.02)
+    assert quotas.in_flight(caller) == 50
+    release.set()
+    for thread in threads:
+        thread.join(timeout=60)
+
+    assert seen["refused"] == 0
+    assert seen["granted"] == 50
+    assert seen["peak"] == 50
+    assert quotas.in_flight(caller) == 0
+
+
+def test_with_the_limits_off_no_ratelimit_field_is_built_anywhere(caller, unlimited):
+    """A `RateLimit-Policy` of q=60 on an API that admits the 61st request is
+    a false statement a client would throttle itself by. Both builders — the
+    reservation's and the refusal path's — return nothing."""
+    reservation = quotas.reserve(caller, kind="read", now=NOON)
+    assert reservation.headers() == {}
+    assert reservation.window is None
+    assert reservation.requests_remaining is None
+    assert quotas.limit_headers(caller, remaining=0) == {}
+    assert quotas.limit_headers(caller, at=NOON) == {}
+
+
+def test_the_same_reservation_advertises_ratelimit_again_once_the_switch_is_on(
+    caller, monkeypatch
+):
+    """The switch is read per call, not at import: turning it on makes the
+    next request carry both fields again."""
+    monkeypatch.setattr(settings, "public_api_enforce_limits", False)
+    assert quotas.reserve(caller, kind="read", now=NOON).headers() == {}
+    monkeypatch.setattr(settings, "public_api_enforce_limits", True)
+    headers = quotas.reserve(caller, kind="read", now=NOON).headers()
+    assert set(headers) == {"RateLimit", "RateLimit-Policy"}
+
+
+def test_with_the_limits_off_a_busy_project_gate_never_turns_into_a_429(
+    caller, unlimited, monkeypatch
+):
+    """The process gate's bounded wait is itself a refusal (429 after
+    `public_api_quota_gate_wait_seconds`). With nothing to decide the gate is
+    not taken at all, so a request is admitted even while another thread
+    holds the project's gate."""
+    monkeypatch.setattr(settings, "public_api_quota_gate_wait_seconds", 0.0)
+    holding = threading.Event()
+    done = threading.Event()
+
+    def hold_the_gate():
+        with quotas._project_gate(caller.project_id):
+            holding.set()
+            done.wait(timeout=30)
+
+    holder = threading.Thread(target=hold_the_gate)
+    holder.start()
+    try:
+        assert holding.wait(timeout=10)
+        quotas.reserve(caller, kind="sync", estimated_input_tokens=5, now=NOON)
+    finally:
+        done.set()
+        holder.join(timeout=30)
+    assert ledger(caller, at=NOON)["minute"]["requests"] == 1
+
+
+def test_an_unknown_kind_is_still_an_error_with_the_limits_off(caller, unlimited):
+    """Unlimited is not unvalidated: a kind nobody declared is a programming
+    error in both modes, and nothing is written for it."""
+    with pytest.raises(ValueError):
+        quotas.reserve(caller, kind="bulk", now=NOON)
+    with pytest.raises(ValueError):
+        quotas.take_slot(caller, "bulk")
+    assert ledger(caller, at=NOON)["daily"]["requests"] == 0
+
+
+def test_an_unlimited_reservation_uses_one_pooled_connection(
+    caller, unlimited, one_connection_at_a_time
+):
+    reservation = quotas.reserve(
+        caller, kind="stream", estimated_input_tokens=50, max_output_tokens=100
+    )
+    reservation.settle(40, 60, "completed")
+    assert one_connection_at_a_time == []
+
+
+@pytest.mark.parametrize("enforced", [True, False])
+def test_a_settlement_writes_every_minute_row_before_the_daily_row(
+    caller, monkeypatch, enforced
+):
+    """`reserve` locks minute(now) then the daily row. A settlement that
+    crosses a minute boundary used to lock the daily row BETWEEN its two
+    minute rows, so it and a reservation in the new minute could each hold
+    the row the other wanted — a deadlock PostgreSQL resolves by failing one.
+    Unlimited admission runs bursts unserialised, which makes that likelier;
+    one statement order removes the cycle."""
+    monkeypatch.setattr(settings, "public_api_enforce_limits", enforced)
+    reservation = quotas.reserve(
+        caller, kind="sync", estimated_input_tokens=100, max_output_tokens=50, now=NOON
+    )
+    tables = []
+    real = db.connection
+
+    class Recording:
+        def __init__(self, con):
+            self._con = con
+
+        def execute(self, sql, *args, **kwargs):
+            text = " ".join(str(sql).split())
+            for table in ("api_usage_minute", "api_usage_daily"):
+                if table in text and not text.startswith("SELECT"):
+                    tables.append(table)
+            return self._con.execute(sql, *args, **kwargs)
+
+    @contextlib.contextmanager
+    def recording():
+        with real() as con:
+            yield Recording(con)
+
+    monkeypatch.setattr(db, "connection", recording)
+    reservation.settle(80, 30, "completed", now=NOON + timedelta(seconds=45))
+
+    assert tables == [
+        "api_usage_minute",
+        "api_usage_minute",
+        "api_usage_daily",
+        "api_usage_daily",
+    ]

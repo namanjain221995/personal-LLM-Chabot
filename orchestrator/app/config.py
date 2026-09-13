@@ -1298,6 +1298,24 @@ class Settings:
             "PUBLIC_API_IDEMPOTENCY_TTL_HOURS", 24.0
         )
 
+        # WHETHER THE PUBLIC API'S USAGE LIMITS ARE ENFORCED AT ALL (owner
+        # decision, 2026-09-13, explicit and final): the developer API has no
+        # requests-per-minute limit, no tokens-per-minute limit, no daily or
+        # monthly token quota and no per-project concurrency cap. ONE switch,
+        # default FALSE = unlimited, read at the one place that decides
+        # admission (`apiplatform/quotas.py::reserve` and `take_slot`) so
+        # `/v1`, background jobs and the console playground all inherit it.
+        # Off: nothing is ever refused with rate_limit_error, quota_exceeded or
+        # concurrency_limit_exceeded by the quota engine, usage is STILL
+        # written to both ledgers once per request, and no RateLimit /
+        # RateLimit-Policy header is sent (it would advertise a limit that does
+        # not exist). True restores the enforcement below unchanged, so that
+        # code stays tested and available. NOT covered by this switch, because
+        # they are technical safety limits rather than usage limits: the
+        # model's context window, max_output_tokens ceilings, the body size
+        # cap (413) and the engine's shared admission queue.
+        self.public_api_enforce_limits: bool = _bool("PUBLIC_API_ENFORCE_LIMITS", False)
+
         # CONTRACT-3 §12's default ceilings, in ONE runtime-readable place.
         # `api_projects` carries the same numbers as DDL defaults, and these
         # are the fallback the quota engine uses when a row does not answer

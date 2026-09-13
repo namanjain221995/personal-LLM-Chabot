@@ -191,6 +191,8 @@ server.
 
 ~~~typescript
 const RETRYABLE = new Set([
+  // quota_exceeded and concurrency_limit_exceeded arrive only if an operator
+  // enables limits; listing them costs nothing.
   "rate_limit_error", "quota_exceeded", "concurrency_limit_exceeded",
   "model_recovering", "model_unavailable", "timeout",
 ]);
@@ -212,7 +214,9 @@ export async function postWithRetry(
     if (response.ok) return response.json();
 
     const { error } = (await response.json()) as ApiErrorBody;
-    if (!RETRYABLE.has(error.code) || attempt === attempts - 1) {
+    // A 409 with Retry-After is this key's first request, still running.
+    const running = response.status === 409 && response.headers.has("Retry-After");
+    if ((!RETRYABLE.has(error.code) && !running) || attempt === attempts - 1) {
       throw new TechSaraError(error.code, error.request_id, error.message);
     }
     const after = Number(response.headers.get("Retry-After") ?? 2 ** attempt);

@@ -428,6 +428,35 @@ def concurrency_limit_exceeded(retry_after: float) -> ApiError:
     )
 
 
+def model_at_capacity(retry_after: float) -> ApiError:
+    """The shared engine's admission queue is full (2026-09-13).
+
+    Not a per-client limit — the owner removed every rate, token, quota and
+    concurrency limit from /v1 — but the one physical fact that remains: a
+    single engine serves the chat application and the API together, and when
+    its admission lanes are full a request cannot start yet. That is a 503
+    with Retry-After in the model_unavailable family, and it says plainly that
+    retrying is safe; a 429 "concurrency limit" would name a limit that does
+    not exist."""
+    return ApiError(
+        "model_unavailable",
+        "The model is at capacity right now. This request is safe to retry.",
+        retry_after=retry_after,
+    )
+
+
+def idempotency_in_progress(retry_after: float = 2) -> ApiError:
+    """The first attempt with this Idempotency-Key is still running
+    (2026-09-13). A 409, as the Idempotency-Key draft answers an outstanding
+    request — not a 429, which read as a rate limit the API no longer has."""
+    return ApiError(
+        "idempotency_conflict",
+        "A request with this Idempotency-Key is still running. Retry shortly to receive its result.",
+        param="Idempotency-Key",
+        retry_after=retry_after,
+    )
+
+
 def model_recovering(retry_after: float) -> ApiError:
     """The engine is restarting and the request is safe to send again. Named
     apart from `model_unavailable` because retrying THIS one works."""

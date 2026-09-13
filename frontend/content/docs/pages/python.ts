@@ -126,6 +126,8 @@ import random
 import time
 
 RETRYABLE = {
+    # quota_exceeded and concurrency_limit_exceeded arrive only if an operator
+    # enables limits; listing them costs nothing.
     "rate_limit_error", "quota_exceeded", "concurrency_limit_exceeded",
     "model_recovering", "model_unavailable", "timeout",
 }
@@ -144,7 +146,9 @@ def post_with_retry(api: httpx.Client, path: str, payload: dict, *, attempts: in
             return response.json()
         body = response.json()
         code = body.get("error", {}).get("code", "")
-        if code not in RETRYABLE or attempt == attempts - 1:
+        # A 409 with Retry-After is this key's first request, still running.
+        running = response.status_code == 409 and "Retry-After" in response.headers
+        if (code not in RETRYABLE and not running) or attempt == attempts - 1:
             raise TechSaraError(body)
         wait = float(response.headers.get("Retry-After", 2 ** attempt))
         time.sleep(wait + random.uniform(0, 1))   # jitter, so a fleet does not

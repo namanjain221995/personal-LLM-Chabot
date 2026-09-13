@@ -45,9 +45,9 @@ Presenting one resolves, in order, before any work starts:
 7. the project's **origin allowlist**, for a browser request — outside it is
    \`403 origin_not_allowed\`;
 8. then the request itself, before any generation starts:
-   * **rate, quota and concurrency** — over any of them is \`429\` with
-     \`Retry-After\`, and every request that presents a valid key counts
-     against the project's [rate limits](/docs/rate-limits), reads included;
+   * **usage** — every request that presents a valid key is recorded,
+     reads included, but none is refused for volume: the API enforces no
+     request, token, daily or concurrency [limits](/docs/rate-limits);
    * the **model allowlist** — a model this key may not use is \`404\`, never
      \`403\`, so the API never confirms the existence of something you are
      not allowed to see;
@@ -154,7 +154,7 @@ curl -i ${API_BASE_URL}/models \\
 
 \`200\` with a model list means the key, the service account, the project and
 the workspace are all live and the key holds \`models.read\`. The check is a
-request like any other and counts against the project's requests per minute.
+request like any other; there is no per-minute or daily allowance for it to use up.
 A \`401\` means the credential is not usable — see [errors](/docs/errors) for the
 difference between that and a \`403\`.
 

@@ -407,7 +407,8 @@ def _terminal(names: List[str]) -> List[str]:
 
 
 def j_curl(expect: List[int], obj: Optional[str] = None, status: Optional[str] = None,
-           headers: Iterable[str] = (), contains: Optional[str] = None) -> Callable[[Run, Dict], Verdict]:
+           headers: Iterable[str] = (), contains: Optional[str] = None,
+           absent_headers: Iterable[str] = ()) -> Callable[[Run, Dict], Verdict]:
     def judge(run: Run, ctx: Dict) -> Verdict:
         got = bash_bodies(run.stdout)
         codes = [c for c, _ in got]
@@ -437,6 +438,13 @@ def j_curl(expect: List[int], obj: Optional[str] = None, status: Optional[str] =
                 return False, f"HTTP {codes}; header {h} absent from the -i output"
         if headers:
             facts.append("headers present: " + ", ".join(headers))
+        # A header the documentation says is NOT sent is a claim too (the
+        # RateLimit pair, 2026-09-13): its presence fails the sample.
+        for h in absent_headers:
+            if re.search(rf"^{re.escape(h)}:", got[-1][1], re.I | re.M):
+                return False, f"HTTP {codes}; header {h} present in the -i output, documented as not sent"
+        if absent_headers:
+            facts.append("headers absent: " + ", ".join(absent_headers))
         if contains and contains not in got[-1][1]:
             return False, f"HTTP {codes}; {contains!r} not in the body: {got[-1][1][-200:]}"
         if contains:
@@ -610,7 +618,11 @@ def build_specs() -> Dict[Tuple[str, int], Spec]:
                           tail='\nwith client() as api:\n    body = send_with_retry(api, {"model": MODEL, "input": "Name one ocean."})\nprint("STATUS", body["status"])\n',
                           judge=j_prog([200], check=expect_tag("STATUS", _status_is("completed"), "completed")))
 
-    S["rate-limits", 1] = Spec("RateLimit:", "check", reason="example header values", check=chk_ratelimit)
+    # 2026-09-13, owner decision: the API enforces no usage limits and sends no
+    # RateLimit headers, so the rate-limits page has no header sample left to
+    # check (it was `S["rate-limits", 1]`, judged by chk_ratelimit). The page
+    # is prose now; the self-test's "no spec names a block that no longer
+    # exists" is what keeps a stale entry from coming back.
 
     S["idempotency", 1] = Spec("export TECHSARA_API_KEY=", "run", judge=ok_resp)
     S["idempotency", 2] = Spec("import uuid", "run", pre=(("python", 2),),
@@ -678,8 +690,14 @@ def build_specs() -> Dict[Tuple[str, int], Spec]:
                         judge=j_curl([200], obj="response", status="cancelled|queued|in_progress|completed"))
     S["curl", 8] = Spec('curl "$TECHSARA_BASE_URL/usage"', "run", pre=cpre, judge=j_curl([200], obj="list"))
     S["curl", 9] = Spec('curl "$TECHSARA_BASE_URL/openapi.json"', "run", pre=cpre, judge=j_curl([200], contains='"openapi"'))
+    # 2026-09-13, owner decision: with PUBLIC_API_ENFORCE_LIMITS off (the
+    # default) no RateLimit header is sent — one would advertise a limit that
+    # does not exist — so the page now says `-i` shows X-Request-Id and NO
+    # RateLimit header, and the judge holds the server to both halves. A stack
+    # still sending the headers fails this sample rather than passing it.
     S["curl", 10] = Spec('curl -i "$TECHSARA_BASE_URL/models"', "run", pre=cpre,
-                         judge=j_curl([200], headers=("x-request-id", "ratelimit", "ratelimit-policy")))
+                         judge=j_curl([200], headers=("x-request-id",),
+                                      absent_headers=("ratelimit", "ratelimit-policy")))
     S["curl", 11] = Spec('curl -sS -i "$TECHSARA_BASE_URL/responses"', "run", pre=cpre,
                          reason="demonstrates the documented 400 — judged by that outcome",
                          judge=j_curl([400], contains='"param":"top_p"'))
@@ -805,13 +823,6 @@ def chk_stream_transcript(sample: Sample, ctx: Dict) -> Verdict:
             problems.append(f"{n}: " + "; ".join(shape_diff(doc, reals[0])))
     return not problems, ("every documented frame's fields occur on the same event in a real stream"
                           if not problems else "MISMATCH " + " | ".join(problems))
-
-
-def chk_ratelimit(sample: Sample, ctx: Dict) -> Verdict:
-    h = ctx["refs"].get("models", {}).get("headers", {})
-    rl, pol = h.get("ratelimit", ""), h.get("ratelimit-policy", "")
-    ok = bool(re.fullmatch(r'"requests";r=\d+;t=\d+', rl)) and '"requests";q=' in pol and ";w=" in pol
-    return ok, f"real headers on GET /models: RateLimit: {rl!r}; RateLimit-Policy: {pol!r}"
 
 
 def chk_signature_header(sample: Sample, ctx: Dict) -> Verdict:
@@ -1281,6 +1292,16 @@ def self_test() -> int:
       not j(Run(0, '{"error":{}}\n@@HTTP 401@@\n', "", 1), {})[0])
     t("the curl judge fails a completed response with no output text",
       not j(Run(0, '{"object":"response","status":"completed","output":[]}\n@@HTTP 200@@\n', "", 1), {})[0])
+    jh = j_curl([200], headers=("x-request-id",), absent_headers=("ratelimit", "ratelimit-policy"))
+    bare = Run(0, 'HTTP/1.1 200 OK\r\nx-request-id: r\r\n\r\n{"object":"list"}\n@@HTTP 200@@\n', "", 1)
+    limited = Run(0, 'HTTP/1.1 200 OK\r\nx-request-id: r\r\nratelimit: "requests";r=41;t=23\r\n'
+                     'ratelimit-policy: "requests";q=60;w=60\r\n\r\n{"object":"list"}\n@@HTTP 200@@\n', "", 1)
+    t("the curl headers judge passes a response with X-Request-Id and no RateLimit header (limits off)",
+      jh(bare, {})[0], jh(bare, {})[1])
+    t("the curl headers judge fails a response that still advertises a RateLimit header",
+      not jh(limited, {})[0], jh(limited, {})[1])
+    t("the curl headers judge still fails a response missing a documented header",
+      not jh(Run(0, 'HTTP/1.1 200 OK\r\n\r\n{}\n@@HTTP 200@@\n', "", 1), {})[0])
     stream_ok = Run(0, 'event: response.created\ndata: {}\n\nevent: response.output_text.delta\ndata: {}\n\n'
                     'event: response.completed\ndata: {}\n\n\n@@HTTP 200@@\n', "", 1)
     t("the stream judge passes events with a delta and one terminal", j_curl_stream(stream_ok, {})[0])

@@ -18,12 +18,17 @@ cannot run says SKIP and why, and a SKIP is reported in the summary.
 
     VIDEO_SMOKE_EMAIL=… VIDEO_SMOKE_PASSWORD=… \
       python scripts/devapi_smoke.py --base http://127.0.0.1:8081
+
+UNLIMITED BY DEFAULT (owner decision, 2026-09-13). The public API enforces no
+request, token, daily or concurrency limit unless the stack runs with
+PUBLIC_API_ENFORCE_LIMITS=true, so the default run proves the opposite of what
+it used to: a 70-request burst is admitted in full and no response carries a
+`RateLimit` or `RateLimit-Policy` field. `--limits enforced` runs the old
+429 check against a stack started with the switch on.
 """
 from __future__ import annotations
 
 import argparse
-import hashlib
-import hmac
 import json
 import os
 import re
@@ -171,7 +176,7 @@ def cookie_is_not_a_credential(client: httpx.Client, base: str) -> None:
           f"{r.status_code} with a valid ts_session cookie")
 
 
-def non_streaming(base: str, token: str) -> Optional[str]:
+def non_streaming(base: str, token: str, limits: str = "unlimited") -> Optional[str]:
     section("a non-streaming response")
     with httpx.Client(timeout=300) as c:
         t = time.monotonic()
@@ -194,8 +199,16 @@ def non_streaming(base: str, token: str) -> Optional[str]:
               json.dumps(usage) if usage else "null (not measured — honest)")
         check("a request id is returned in a header", bool(r.headers.get("x-request-id")),
               r.headers.get("x-request-id", "absent"))
-        check("rate-limit headers are present", bool(r.headers.get("ratelimit") or r.headers.get("ratelimit-policy")),
-              r.headers.get("ratelimit", "absent"))
+        if limits == "enforced":
+            check("rate-limit headers are present", bool(r.headers.get("ratelimit") or r.headers.get("ratelimit-policy")),
+                  r.headers.get("ratelimit", "absent"))
+        else:
+            # A RateLimit field on an unlimited API advertises a ceiling that
+            # does not exist, and a client would throttle itself by it.
+            check("no rate-limit headers are sent (the API is unlimited)",
+                  not r.headers.get("ratelimit") and not r.headers.get("ratelimit-policy"),
+                  f"ratelimit={r.headers.get('ratelimit', 'absent')} "
+                  f"ratelimit-policy={r.headers.get('ratelimit-policy', 'absent')}")
         return body.get("id")
 
 
@@ -323,11 +336,39 @@ def tenant_isolation(client: httpx.Client, base: str, token: str) -> None:
     check("the console lists this workspace's projects", listed_ok, f"{len(mine)} project(s)")
 
 
+#: The burst both checks send: above the old default of 60 requests a minute,
+#: so an enforcing stack would refuse part of it and an unlimited one must not.
+BURST = 70
+
+
+def unlimited(base: str, token: str) -> None:
+    """The owner decision of 2026-09-13, end to end: 70 quick requests — ten
+    more than the old 60/minute default — all succeed, none is a 429, and no
+    response carries a RateLimit field."""
+    section("no usage limits (PUBLIC_API_ENFORCE_LIMITS off)")
+    codes: List[int] = []
+    advertised: List[str] = []
+    with httpx.Client(timeout=60) as c:
+        for _ in range(BURST):
+            r = c.get(f"{base}/v1/models", headers={"Authorization": f"Bearer {token}"})
+            codes.append(r.status_code)
+            for name in ("ratelimit", "ratelimit-policy"):
+                if r.headers.get(name):
+                    advertised.append(f"{name}: {r.headers[name]}")
+    check(f"a burst of {BURST} requests is admitted in full", codes == [200] * BURST,
+          f"{len(codes)} requests, {codes.count(200)} allowed, {codes.count(429)} refused, "
+          f"other={sorted({c for c in codes if c not in (200, 429)})}")
+    check("no response in the burst carries a RateLimit or RateLimit-Policy header", not advertised,
+          advertised[0] if advertised else f"none on {len(codes)} responses")
+
+
 def rate_limit(base: str, token: str) -> None:
-    section("rate limiting")
+    """Only with `--limits enforced`, against a stack started with
+    PUBLIC_API_ENFORCE_LIMITS=true: the enforcement code stays available."""
+    section("rate limiting (PUBLIC_API_ENFORCE_LIMITS on)")
     codes: List[int] = []
     with httpx.Client(timeout=60) as c:
-        for _ in range(70):
+        for _ in range(BURST):
             r = c.get(f"{base}/v1/models", headers={"Authorization": f"Bearer {token}"})
             codes.append(r.status_code)
             if r.status_code == 429:
@@ -411,6 +452,9 @@ def member_is_refused(base: str) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--base", required=True, help="orchestrator base URL, e.g. http://127.0.0.1:8081 (the e2e stack)")
+    ap.add_argument("--limits", choices=("unlimited", "enforced"), default="unlimited",
+                    help="what the stack's PUBLIC_API_ENFORCE_LIMITS is: unlimited (the default, "
+                         "owner decision 2026-09-13) proves a burst is admitted; enforced proves the 429")
     ap.add_argument("--allow-production", action="store_true", help="refuse-by-default guard for a non-e2e base URL")
     args = ap.parse_args()
 
@@ -432,13 +476,16 @@ def main() -> int:
             no_internal_disclosure(base, token)
             openapi_document(base, token)
             cors(base)
-            non_streaming(base, token)
+            non_streaming(base, token, args.limits)
             streaming(base, token)
             idempotency(base, token)
             tenant_isolation(client, base, token)
             if project_id:
                 background_and_webhook(client, base, token, project_id)
-            rate_limit(base, token)
+            if args.limits == "enforced":
+                rate_limit(base, token)
+            else:
+                unlimited(base, token)
 
     failures = [r for r in _results if r[0] == FAIL]
     skips = [r for r in _results if r[0] == SKIP]

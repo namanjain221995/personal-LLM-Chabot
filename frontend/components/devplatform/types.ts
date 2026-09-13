@@ -32,6 +32,13 @@ export interface ProjectLimits {
   daily_token_quota: number | null;
   max_input_tokens: number | null;
   max_output_tokens: number | null;
+  /**
+   * Whether the usage ceilings above are enforced at all (owner decision,
+   * 2026-09-13: PUBLIC_API_ENFORCE_LIMITS, default false — the public API is
+   * unlimited). Optional because a pre-switch orchestrator does not send it,
+   * and that orchestrator DID enforce; read it through `limitsEnforcement`.
+   */
+  enforced?: boolean;
 }
 
 /**
@@ -217,7 +224,11 @@ export interface ConsoleOverview {
       output_tokens: number;
       errors: number;
     };
+    /** See ProjectLimits.enforced; absent from a pre-switch orchestrator. */
+    limits_enforced?: boolean;
   };
+  limits_enforced?: boolean;
+  limits?: { enforced?: boolean };
   capabilities: Record<string, boolean>;
 }
 

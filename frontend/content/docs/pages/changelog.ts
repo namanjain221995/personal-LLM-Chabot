@@ -11,7 +11,39 @@ export const changelog: DocPage = {
 Dates are the date of the change in this repository. Anything that alters
 behaviour on \`/v1\` appears here.
 
-## 2026-09-13 — examples executed
+## 2026-09-13 — usage limits removed
+
+* **The API no longer enforces any usage limit, by decision.** There is no
+  limit on requests per minute or tokens per minute, no daily or monthly
+  token quota and no per-project concurrency cap. No \`/v1\` request is
+  refused with \`rate_limit_error\`, \`quota_exceeded\` or
+  \`concurrency_limit_exceeded\` for volume, and no response carries a
+  \`RateLimit\` or \`RateLimit-Policy\` header any more.
+* **Two refusals that are not limits changed code, so that no \`429\` is
+  sent at all.** The engine's shared queue being full is now
+  \`503 model_unavailable\` ("at capacity", retry-safe, with
+  \`Retry-After\`) instead of \`429 concurrency_limit_exceeded\`. Repeating
+  an \`Idempotency-Key\` whose first request is still running is now
+  \`409 idempotency_conflict\` with \`Retry-After\` instead of
+  \`429 rate_limit_error\`; a \`409\` without \`Retry-After\` is still
+  the different-body conflict and is not retryable. The retry samples on the
+  [errors](/docs/errors), [Python](/docs/python) and
+  [JavaScript](/docs/javascript) pages handle both.
+* **What did not change**: the model's context window
+  (\`400 context_length_exceeded\`), the \`max_output_tokens\` ceiling, the
+  1 MiB body cap (\`413\`), the engine's shared queue, and
+  \`503 model_recovering\` with \`Retry-After\` while the model restarts.
+  Usage is still recorded once per request, so the console, the request log
+  and \`GET /v1/usage\` read exactly as before.
+* The limits remain in the code behind one operator setting,
+  \`PUBLIC_API_ENFORCE_LIMITS\`, off by default. See
+  [rate limits](/docs/rate-limits).
+* **Examples are marked as not executed again.** The pages changed with the
+  decision — the \`curl -i\` sample no longer shows \`RateLimit\` headers —
+  so the run recorded below no longer covers what the pages say. The notice
+  on every page changes back when the examples have been run again.
+
+## 2026-09-13 — the first end-to-end run of the examples
 
 * Every runnable example on these pages was executed against a running
   TechSara stack through the public \`/v1\` edge with a real test key, by
@@ -55,7 +87,8 @@ behaviour on \`/v1\` appears here.
   requests per minute, reads included; a limit of \`0\` allows nothing; a
   background response holds a concurrency slot for its whole life; what an
   idempotent replay returns; and the mid-stream failure shapes on both
-  streaming dialects.
+  streaming dialects. (The limits in this bullet apply only where an operator
+  enables them since the removal recorded above.)
 * Documentation keys (\`tsk_live_0123456789abcdef_…\`) are deliberately
   invalid: the shape is perfect and the checksum is wrong, so pasting one
   gives a clean \`401\` rather than anything that looks like it might work.

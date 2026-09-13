@@ -20,8 +20,8 @@ Keys are created in the developer console at [\`${CONSOLE_PATH}\`](${CONSOLE_PAT
 which needs the \`api.console.access\` capability — a workspace admin has it;
 a member does not. Ask an admin if the console is not there for you.
 
-A key belongs to a **project**, which carries the limits, the model allowlist
-and the retention window, and to a **service account**, which is the named
+A key belongs to a **project**, which carries the model allowlist, the
+retention window and the usage record, and to a **service account**, which is the named
 machine identity inside that project. Give each deployed service its own key
 so revoking one does not stop the others.
 

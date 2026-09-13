@@ -83,7 +83,7 @@ API with a signed-in person's session.
 1. [Quickstart](/docs/quickstart) — a key and a first answer.
 2. [Authentication](/docs/authentication) — keys, scopes, environments.
 3. [API-key security](/docs/key-security) — how keys are built, stored and rotated.
-4. [Errors](/docs/errors) and [rate limits](/docs/rate-limits) — what production will actually hand you.
+4. [Errors](/docs/errors) and [rate limits](/docs/rate-limits) — what production will actually hand you (no usage limits; a \`503\` during a model restart).
 
 The model id you will use everywhere is \`${MODEL_ID}\`. Its real context and
 output ceilings are reported by [the models endpoint](/docs/models) — read

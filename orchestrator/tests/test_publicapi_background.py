@@ -37,6 +37,7 @@ from app import db
 from app.apiplatform import quotas
 from app.apiplatform.resolver import ApiCaller, CallerLimits
 from app.apiplatform.webhooks import sender
+from app.config import settings
 from app.publicapi import background, errors, streaming
 from app.publicapi.registry import declared_models
 
@@ -51,6 +52,19 @@ class _Chunk:
 
     kind: str
     text: str = ""
+
+
+@pytest.fixture()
+def limits_enforced(monkeypatch):
+    """PUBLIC_API_ENFORCE_LIMITS=true for one test.
+
+    The owner decision of 2026-09-13 made the public API unlimited by default,
+    so every test below that pins a concurrency REFUSAL asks for enforcement
+    explicitly: the enforcement code stays available to an operator, so it
+    stays tested. The unlimited default has its own tests, which do not use
+    this fixture.
+    """
+    monkeypatch.setattr(settings, "public_api_enforce_limits", True)
 
 
 @pytest.fixture(autouse=True)
@@ -625,6 +639,7 @@ def test_cancelling_a_response_that_never_existed_reads_as_missing(project):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("limits_enforced")
 def test_a_project_cannot_have_more_background_jobs_in_flight_than_its_limit(project):
     """CONTRACT-3 §12: the process-local gate. Without it one key's batch job
     would take every admission lane the chat app shares."""
@@ -649,6 +664,7 @@ def test_a_project_cannot_have_more_background_jobs_in_flight_than_its_limit(pro
     assert int(error.headers()["Retry-After"]) >= 1
 
 
+@pytest.mark.usefixtures("limits_enforced")
 def test_a_refused_job_writes_no_row_at_all(project):
     gate, entered = asyncio.Event(), asyncio.Event()
     background.set_generation_factory(_generation(gate=gate, entered=entered))
@@ -666,6 +682,7 @@ def test_a_refused_job_writes_no_row_at_all(project):
     assert len(asyncio.run(scenario())) == 1
 
 
+@pytest.mark.usefixtures("limits_enforced")
 def test_a_row_the_router_claimed_is_closed_when_the_ceiling_refuses_it(project):
     """A row left `queued` with nobody running it is precisely what the
     restart sweep exists to clean up. Manufacturing one on a path that knows
@@ -813,7 +830,10 @@ def test_the_engine_state_decides_which_retry_code_a_failed_job_records(
     assert asyncio.run(scenario())["error_code"] == expected
 
 
-def test_a_full_admission_lane_is_recorded_as_a_concurrency_429_not_a_failure_of_ours(project):
+def test_a_full_admission_lane_is_recorded_as_the_model_at_capacity_not_a_limit_or_a_failure_of_ours(project):
+    """The shared engine's lanes being full is capacity, not a per-caller
+    limit (owner decision 2026-09-13): recorded as model_unavailable, which is
+    retryable, never as a concurrency limit the API no longer enforces."""
     class AdmissionRejected(RuntimeError):
         pass
 
@@ -824,7 +844,7 @@ def test_a_full_admission_lane_is_recorded_as_a_concurrency_429_not_a_failure_of
         await background.drain(timeout=10)
         return await db.run_in_thread(db.get_api_response, row["id"], project["id"])
 
-    assert asyncio.run(scenario())["error_code"] == "concurrency_limit_exceeded"
+    assert asyncio.run(scenario())["error_code"] == "model_unavailable"
 
 
 # ---------------------------------------------------------------------------
@@ -832,6 +852,7 @@ def test_a_full_admission_lane_is_recorded_as_a_concurrency_429_not_a_failure_of
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("limits_enforced")
 def test_a_background_job_is_refused_while_the_projects_streams_hold_every_slot(project):
     """The verifier's bypass: a key at its limit of streams could still start
     `max_concurrency` background jobs, because the two were counted in
@@ -852,6 +873,7 @@ def test_a_background_job_is_refused_while_the_projects_streams_hold_every_slot(
     assert rows == []
 
 
+@pytest.mark.usefixtures("limits_enforced")
 def test_a_running_job_holds_its_projects_slot_until_it_has_finished(project):
     gate, entered = asyncio.Event(), asyncio.Event()
     background.set_generation_factory(_generation(gate=gate, entered=entered))
@@ -1135,3 +1157,42 @@ def test_a_row_created_after_this_process_started_is_never_treated_as_an_orphan(
 
     assert untouched["status"] == "queued"
     assert db.get_api_response(row["id"], project["id"])["status"] == "queued"
+
+
+# ---------------------------------------------------------------------------
+# Unlimited by default (owner decision, 2026-09-13)
+# ---------------------------------------------------------------------------
+
+
+def test_with_the_limits_off_jobs_beyond_the_projects_ceiling_all_run_and_give_their_slots_back(
+    project,
+):
+    """Six background jobs held open at once in a project whose ceiling is one
+    — the shape that refuses the second job when enforced. With
+    PUBLIC_API_ENFORCE_LIMITS off every job is accepted, all six are counted
+    in flight while they run, a sync request beside them still gets a slot,
+    and every slot comes back when they finish."""
+    assert settings.public_api_enforce_limits is False
+    gate, entered = asyncio.Event(), asyncio.Event()
+    background.set_generation_factory(_generation(gate=gate, entered=entered))
+    caller = _caller(project, max_concurrency=1)
+
+    async def scenario():
+        rows = [await background.start(_spec(), caller=caller) for _ in range(6)]
+        await entered.wait()
+        during = quotas.in_flight(caller, "background")
+        with quotas.concurrency_slot(caller, "sync"):
+            beside = quotas.in_flight(caller)
+        gate.set()
+        await background.drain(timeout=10)
+        await asyncio.sleep(0)
+        stored = await db.run_in_thread(db.list_api_responses, project["id"])
+        return rows, during, beside, quotas.in_flight(caller), stored
+
+    rows, during, beside, after, stored = asyncio.run(scenario())
+
+    assert len({row["id"] for row in rows}) == 6
+    assert during == 6
+    assert beside == 7
+    assert after == 0
+    assert sorted(str(row["status"]) for row in stored) == ["completed"] * 6

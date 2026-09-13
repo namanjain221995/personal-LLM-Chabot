@@ -114,9 +114,9 @@ curl -i "$TECHSARA_BASE_URL/models" \\
   -H "Authorization: Bearer $TECHSARA_API_KEY"
 ~~~
 
-\`-i\` prints \`X-Request-Id\` (log it), \`RateLimit\` and
-\`RateLimit-Policy\` (see [rate limits](/docs/rate-limits)) and, on a
-\`429\` or \`503\`, \`Retry-After\`.
+\`-i\` prints \`X-Request-Id\` (log it) and, on a \`503\`,
+\`Retry-After\`. There is no \`RateLimit\` header to read: the API enforces
+no usage limits (see [rate limits](/docs/rate-limits)).
 
 ## When something is wrong
 

@@ -85,6 +85,28 @@ the lines to replace.
 
 TOKENS ARE WRITTEN ONCE PER REQUEST. Never per token, never per SSE event.
 
+UNLIMITED UNLESS THE OPERATOR SAYS OTHERWISE (owner decision, 2026-09-13,
+explicit and final). The public developer API has NO request, token-per-minute,
+daily-quota or concurrency limit. `settings.public_api_enforce_limits`
+(PUBLIC_API_ENFORCE_LIMITS, default false) is read HERE and nowhere else that
+decides: `reserve()` and `take_slot()` are the only two admission decisions,
+and `/v1`, background jobs and the console playground all go through them, so
+every caller inherits the switch without a check of its own.
+
+  * OFF (the default): `reserve()` still writes the request counter and the
+    token reservation to BOTH ledgers in one transaction — the console usage
+    page, the request logs and `/v1/usage` read those rows — but it reads no
+    window, takes neither lock and never raises; `take_slot()` still counts
+    in-flight generations (the console reads the counter) but never refuses;
+    `limit_headers()` returns nothing, because a `RateLimit` field would
+    advertise a ceiling that does not exist.
+  * ON: everything documented above, byte for byte as before the switch.
+
+What the switch does NOT touch, because those are technical safety limits and
+not usage limits: the model's context window, the max_output_tokens ceilings,
+the request body cap and the engine's shared admission queue (a full lane is
+still a 429 `concurrency_limit_exceeded` from `streaming.engine_error`).
+
 WHAT THIS MODULE DOES NOT DO. It never decides WHO the caller is — that is
 `resolver.py`. It emits no quota state for an unauthenticated caller: every
 public function here takes an `ApiCaller`, and there is no way to obtain one
@@ -120,6 +142,13 @@ WINDOW_SECONDS = 60
 #: a caller in Kolkata gets a reset at 05:30 local, and the documentation says
 #: so rather than the code pretending otherwise.
 DAY_SECONDS = 86_400
+
+def limits_enforced() -> bool:
+    """Whether the usage limits are enforced — read on EVERY call, never
+    cached at import, so an operator's change and a test's monkeypatch take
+    effect on the next request (owner decision 2026-09-13; default False)."""
+    return bool(getattr(settings, "public_api_enforce_limits", False))
+
 
 #: `Retry-After` is integer seconds with a floor of 1 (RFC 9110 + the OpenAI
 #: compatibility schema STANDARDS.md copies). A zero invites the retry storm
@@ -466,10 +495,13 @@ class Reservation:
 
     caller: ApiCaller
     at: datetime
-    window: WindowState
+    #: None when the limits are not enforced: no window is read to decide
+    #: anything (owner decision 2026-09-13).
+    window: Optional[WindowState]
     #: Requests still available AFTER this one was reserved — the smaller of
-    #: the project's remainder and the key's own.
-    requests_remaining: int
+    #: the project's remainder and the key's own. None when unlimited: there
+    #: is no remainder of a limit that does not exist.
+    requests_remaining: Optional[int]
     #: The effective window, in seconds, for the `RateLimit` field's `t`.
     window_seconds: int
     kind: str = "sync"
@@ -479,6 +511,10 @@ class Reservation:
     #: max_output_tokens (or the default), capped at the limits it is checked
     #: against. Settled to the measured count exactly once.
     reserved_output_tokens: int = 0
+    #: Whether this reservation was DECIDED against the limits. False means it
+    #: was only recorded (PUBLIC_API_ENFORCE_LIMITS off), and it then carries
+    #: no `RateLimit` fields.
+    enforced: bool = True
 
     @property
     def reserved_tokens(self) -> int:
@@ -497,7 +533,12 @@ class Reservation:
         `requests_remaining` is passed explicitly because `self.window` was
         read BEFORE the reservation was written: recomputing from it would
         advertise one more request than the caller actually has left.
+
+        Empty for an unenforced reservation (owner decision 2026-09-13): the
+        fields would advertise a limit that does not exist.
         """
+        if not self.enforced:
+            return {}
         return limit_headers(
             self.caller,
             window=self.window,
@@ -697,6 +738,10 @@ def reserve(
 
     Concurrency is NOT checked here; it is a slot held for the duration of
     the work — `concurrency_slot()` / `take_slot()`, taken after this returns.
+
+    WITH THE LIMITS OFF (PUBLIC_API_ENFORCE_LIMITS=false, the default since the
+    owner decision of 2026-09-13) the same kinds are validated and the same
+    rows are written, and nothing is decided: see `_record_unenforced`.
     """
     if kind not in RESERVE_KINDS:
         raise ValueError(f"unknown reservation kind {kind!r}")
@@ -706,6 +751,15 @@ def reserve(
     wanted_input = max(0, int(estimated_input_tokens or 0))
     reserved_input = wanted_input if generating else 0
     reserved_output = _output_charge(caller, max_output_tokens) if generating else 0
+
+    if not limits_enforced():
+        return _record_unenforced(
+            caller,
+            kind=kind,
+            reserved_input=reserved_input,
+            reserved_output=reserved_output,
+            now=now,
+        )
 
     with _project_gate(caller.project_id):
         with db.connection() as con:
@@ -759,6 +813,56 @@ def reserve(
         kind=kind,
         reserved_input_tokens=reserved_input,
         reserved_output_tokens=reserved_output,
+    )
+
+
+def _record_unenforced(
+    caller: ApiCaller,
+    *,
+    kind: str,
+    reserved_input: int,
+    reserved_output: int,
+    now: Optional[datetime],
+) -> Reservation:
+    """Count this request in both ledgers and admit it — no decision at all.
+
+    THE LIMITS ARE OFF (owner decision 2026-09-13), BUT USAGE IS NOT. The
+    request counter, the input estimate and the output reservation are written
+    exactly as an enforced admission writes them, in ONE transaction on ONE
+    connection, and settled the same way by `record_usage(reservation=…)`, so
+    the console's usage page, the request logs and `/v1/usage` are unchanged.
+
+    WHY NEITHER LOCK IS TAKEN. The process gate and the advisory lock exist so
+    that concurrent DECISIONS see each other's reservations; with no decision
+    there is nothing to serialise, and each upsert is already atomic on its own
+    row. Keeping the gate would also keep its one refusal — a 429 when a
+    project's gate is busy for longer than the bounded wait — which is exactly
+    the limit the owner removed. Nothing is ever raised here but a database
+    error.
+    """
+    with db.connection() as con:
+        moment = _now(now) if now is not None else _database_now(con)
+        con.execute(
+            _UPSERT_MINUTE_SQL,
+            (
+                caller.project_id, caller.key_id, _bucket(moment), 1,
+                reserved_input, reserved_output,
+            ),
+        )
+        con.execute(
+            _UPSERT_DAILY_SQL,
+            (caller.project_id, moment.date(), 1, reserved_input, reserved_output, 0, 0),
+        )
+    return Reservation(
+        caller=caller,
+        at=moment,
+        window=None,
+        requests_remaining=None,
+        window_seconds=WINDOW_SECONDS,
+        kind=kind,
+        reserved_input_tokens=reserved_input,
+        reserved_output_tokens=reserved_output,
+        enforced=False,
     )
 
 
@@ -894,18 +998,24 @@ def take_slot(caller: ApiCaller, kind: str) -> SlotLease:
     the project's ceiling, then — only for a key that tightens its own share —
     the key's in-flight count against the key's. A limit of 0 refuses every
     request (zero means zero; the first cut floored it at 1).
+
+    WITH THE LIMITS OFF (owner decision 2026-09-13) the slot is still taken
+    and counted — the console and `in_flight()` read the counter, and the
+    lease is released the same way — but it is never refused. The engine's
+    own shared admission queue still stands behind it.
     """
     if kind not in SLOT_KINDS:
         raise ValueError(f"unknown concurrency kind {kind!r}")
+    enforced = limits_enforced()
     limits = caller.limits
     project_limit = max(0, int(limits.project_concurrency_limit))
     key_limit = limits.key_max_concurrency
     with _in_flight_lock:
         held = int(_in_flight.get(caller.project_id, 0))
         key_held = int(_key_in_flight.get(caller.key_id, 0))
-        if held >= project_limit or (
+        if enforced and (held >= project_limit or (
             key_limit is not None and key_held >= max(0, int(key_limit))
-        ):
+        )):
             # One second: a slot is freed by a request FINISHING, and nothing
             # about the window tells us when that is.
             raise errors.concurrency_limit_exceeded(_jittered(MIN_RETRY_AFTER))
@@ -994,6 +1104,14 @@ def record_usage(
         # The same clock `reserve` used, so a measured count lands in the
         # bucket the database calls "now", not the one this host does.
         moment = _now(now) if now is not None else _database_now(con)
+        # EVERY MINUTE ROW BEFORE ANY DAILY ROW (2026-09-13, with the switch
+        # to unlimited). The first cut went minute(reserved) → daily →
+        # minute(now) → daily, while `reserve` locks minute(now) → daily. A
+        # settlement crossing a minute boundary and a reservation landing in
+        # the new minute then held one row each and waited for the other —
+        # a deadlock PostgreSQL breaks by failing one of them, and one that
+        # unlimited admission (no gate serialising a burst) makes likelier at
+        # every minute boundary. One order, no cycle.
         if reserved or reserved_out:
             con.execute(
                 "UPDATE api_usage_minute "
@@ -1005,6 +1123,11 @@ def record_usage(
                     caller.project_id, caller.key_id, _bucket(reservation.at),
                 ),
             )
+        con.execute(
+            _UPSERT_MINUTE_SQL,
+            (caller.project_id, caller.key_id, _bucket(moment), 0, spent_in, spent_out),
+        )
+        if reserved or reserved_out:
             con.execute(
                 "UPDATE api_usage_daily "
                 "   SET input_tokens = GREATEST(0, input_tokens - %s), "
@@ -1012,10 +1135,6 @@ def record_usage(
                 " WHERE project_id = %s AND day = %s",
                 (reserved, reserved_out, caller.project_id, reservation.at.date()),
             )
-        con.execute(
-            _UPSERT_MINUTE_SQL,
-            (caller.project_id, caller.key_id, _bucket(moment), 0, spent_in, spent_out),
-        )
         con.execute(
             _UPSERT_DAILY_SQL,
             (caller.project_id, moment.date(), 0, spent_in, spent_out, 1 if failed else 0, 0),
@@ -1051,7 +1170,15 @@ def limit_headers(
     WHY THE TOKEN QUOTAS ARE NOT ADVERTISED. `qu` has three registered units:
     `requests`, `content-bytes`, `concurrent-requests`. LLM tokens are none of
     them; the token limits are documented in `/docs` and still enforced.
+
+    NOTHING AT ALL WHEN THE LIMITS ARE OFF (owner decision 2026-09-13). A
+    `RateLimit-Policy` of `q=60` on an API that admits the 61st request is a
+    false statement a client would throttle itself by. This is the one place
+    both fields are built, so every route — and every refusal path — inherits
+    the omission.
     """
+    if not limits_enforced():
+        return {}
     moment = _now(at)
     limits = caller.limits
     if remaining is None:
@@ -1086,6 +1213,7 @@ __all__ = [
     "in_flight",
     "key_in_flight",
     "limit_headers",
+    "limits_enforced",
     "limits_for",
     "read_window",
     "record_usage",

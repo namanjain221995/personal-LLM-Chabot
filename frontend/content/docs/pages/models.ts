@@ -116,7 +116,8 @@ allowlist; if it is empty, every public model is available to it.
 
 A project can set lower input and output ceilings of its own, which then
 apply to every key in it.
-See [rate limits](/docs/rate-limits) for the per-project limits that sit on
-top of these.
+These are the limits that apply: the API enforces no per-project request,
+token or concurrency limits on top of them — see
+[rate limits](/docs/rate-limits).
 `.trim(),
 };

@@ -179,8 +179,8 @@ POST /v1/responses/{id}/cancel
 
 Requires \`responses.write\`, and is **idempotent** — cancelling an
 already-finished or already-cancelled response is not an error, so a retry
-after a network failure is safe. Like every call that presents a key, it
-counts against the project's [rate limits](/docs/rate-limits).
+after a network failure is safe. Like every call that presents a key, it is
+recorded in the project's [usage](/docs/usage).
 
 ~~~bash
 curl -X POST ${API_BASE_URL}/responses/${EXAMPLE_RESPONSE_ID}/cancel \\

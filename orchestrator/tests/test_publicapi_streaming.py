@@ -496,15 +496,17 @@ def test_a_wedged_engine_is_model_unavailable_rather_than_recovering(
     assert outcome.error.code == "model_unavailable"
 
 
-def test_a_refused_admission_lane_is_a_429_not_a_500(engine, measured):
+def test_a_refused_admission_lane_is_a_retryable_503_not_a_500_or_a_limit(engine, measured):
+    """The engine at capacity, not a per-caller limit (owner decision
+    2026-09-13, every /v1 limit removed): 503 with Retry-After."""
     measured(None)
     engine(_FakeEngine([], fail=_AdmissionRejected("NORMAL lane refused the request")))
 
     outcome = _run(streaming.run_to_completion(_spec()))
 
     assert outcome.error is not None
-    assert outcome.error.code == "concurrency_limit_exceeded"
-    assert outcome.error.status == 429
+    assert outcome.error.code == "model_unavailable"
+    assert outcome.error.status == 503
     assert "Retry-After" in outcome.error.headers()
 
 

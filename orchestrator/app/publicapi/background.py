@@ -179,7 +179,11 @@ async def start(
     `errors.ApiError` (429 `concurrency_limit_exceeded`) when the project is
     already at its ceiling — the ceiling of `caller`'s PROJECT, shared with
     every synchronous and streaming request of that project, never a number
-    from the request (CONTRACT-3 §8, §12).
+    from the request (CONTRACT-3 §8, §12). ONLY WITH PUBLIC_API_ENFORCE_LIMITS
+    on: by default (owner decision 2026-09-13) `take_slot` counts the job and
+    never refuses it, so the refusal branch below is not taken; a full engine
+    admission lane (a technical limit the owner kept) is still recorded on the
+    row as `concurrency_limit_exceeded` by the job itself.
 
     THE SLOT IS HELD FOR THE WHOLE JOB and released by a done-callback on the
     task, not by a `finally` inside it: a task cancelled before its first step

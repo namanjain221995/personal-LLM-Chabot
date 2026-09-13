@@ -34,8 +34,8 @@ your key, service account, project and workspace are all live.
 
 Do not treat it as a generation health check. The API answering does not
 prove the model is currently serving — that is what the two 503 codes below
-are for. And do not poll it every second: a probe is a request and counts
-against your [rate limits](/docs/rate-limits).
+are for. And do not poll it every second: a probe is a request, recorded in your
+[usage](/docs/usage) like any other.
 
 ## What the 503s mean
 
@@ -56,8 +56,10 @@ exists so you can tell "still queued" from "connection dead" — see
 
 Two things that are not outages and look like one:
 
-* **\`429\` under load.** Your project reached a limit. The platform is
-  healthy; your concurrency is not. See [rate limits](/docs/rate-limits).
+* **A slow answer under load.** The API enforces no usage
+  [limits](/docs/rate-limits), so heavy traffic is not refused — it waits
+  its turn for the engine it shares with the chat application. The platform
+  is healthy; it is busy.
 * **A slow first token.** A long prompt takes real time to read before the
   first token appears. [Stream](/docs/streaming), so you can see the
   difference between slow and stuck.

@@ -33,6 +33,7 @@ import pytest
 from app import db
 from app.apiplatform import console_api, keys as key_tools
 from app.authn import store
+from app.config import settings
 from app.apiplatform import quotas
 from app.publicapi import events as api_events
 from app.publicapi import registry, streaming
@@ -43,6 +44,19 @@ WORKSPACE_B = "ws-console-beta"
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def limits_enforced(monkeypatch):
+    """PUBLIC_API_ENFORCE_LIMITS=true for one test.
+
+    The owner decision of 2026-09-13 made the public API unlimited by default,
+    so every test below that pins a rate, quota or concurrency REFUSAL (or the
+    RateLimit fields) asks for enforcement explicitly: the enforcement code
+    stays available to an operator, so it stays tested. The unlimited default
+    has its own tests, which do not use this fixture.
+    """
+    monkeypatch.setattr(settings, "public_api_enforce_limits", True)
 
 
 @pytest.fixture(autouse=True)
@@ -253,13 +267,21 @@ def test_an_anonymous_caller_is_refused_before_any_capability_is_considered(
     assert client.post("/admin/api/developers/projects", json={"name": "x"}).status_code == 401
 
 
-def test_an_admin_may_run_projects_and_keys_but_not_models_or_limits(admin, root):
+@pytest.mark.parametrize("enforced", [True, False], ids=["enforced", "unlimited"])
+def test_an_admin_may_run_projects_and_keys_but_not_models_or_limits(
+    admin, root, monkeypatch, enforced
+):
     """The capability split of CONTRACT-3 §6, asserted from both sides.
 
     An admin runs the workspace's projects; deciding which models this
     platform serves to the internet, and lifting the ceilings that protect the
     chat application's admission lanes, stay with the super admin.
+
+    In BOTH modes of PUBLIC_API_ENFORCE_LIMITS (owner decision 2026-09-13):
+    the capability split does not change, but what the ceilings READ as does —
+    the stored number when enforced, null beside `enforced: false` when not.
     """
+    monkeypatch.setattr(settings, "public_api_enforce_limits", enforced)
     project = _make_project(admin)
     assert _make_key(admin, project["id"])["key"]["status"] == "active"
 
@@ -283,7 +305,9 @@ def test_an_admin_may_run_projects_and_keys_but_not_models_or_limits(admin, root
     limits = admin.get(f"/admin/api/developers/projects/{project['id']}/limits")
     assert limits.status_code == 200
     assert limits.json()["can_manage"] is False
-    assert limits.json()["limits"]["rpm"] == 60
+    assert limits.json()["limits"]["rpm"] == (60 if enforced else None)
+    assert limits.json()["limits"]["enforced"] is enforced
+    assert limits.json()["limits_enforced"] is enforced
 
     # The super admin can do both.
     assert (
@@ -294,7 +318,9 @@ def test_an_admin_may_run_projects_and_keys_but_not_models_or_limits(admin, root
     )
     assert root.get(f"/admin/api/developers/projects/{project['id']}/limits").json()[
         "limits"
-    ]["rpm"] == 120
+    ]["rpm"] == (120 if enforced else None)
+    # Stored either way, for the day enforcement is switched on.
+    assert db.get_api_project(project["id"], store.default_workspace()["id"])["rpm"] == 120
     toggled = root.put(
         f"/admin/api/developers/models/{registry.PUBLIC_MODEL_IDS[0]}",
         json={"enabled": False},
@@ -1348,6 +1374,7 @@ def test_a_playground_body_at_most_the_cap_is_accepted(admin, fake_model, monkey
 # ---- (b) the playground goes through the quota engine -------------------------
 
 
+@pytest.mark.usefixtures("limits_enforced")
 def test_concurrent_playground_runs_are_held_to_the_workspace_allowance(admin, monkeypatch):
     """Twelve concurrent runs, each held open by the engine: exactly the
     allowance's `max_concurrency` get a lane, every other one is a 429 with a
@@ -1401,6 +1428,7 @@ def test_concurrent_playground_runs_are_held_to_the_workspace_allowance(admin, m
     assert len(fake.calls) == 2
 
 
+@pytest.mark.usefixtures("limits_enforced")
 def test_concurrent_playground_runs_cannot_exceed_the_allowance_rate_limit(
     admin, fake_model, monkeypatch
 ):
@@ -1439,6 +1467,7 @@ def test_concurrent_playground_runs_cannot_exceed_the_allowance_rate_limit(
     assert projects == 1
 
 
+@pytest.mark.usefixtures("limits_enforced")
 def test_a_playground_allowance_of_zero_means_no_runs_at_all(admin, fake_model, monkeypatch):
     fake = fake_model()
     monkeypatch.setenv("API_PLAYGROUND_RPM", "0")
@@ -1450,6 +1479,7 @@ def test_a_playground_allowance_of_zero_means_no_runs_at_all(admin, fake_model, 
     assert fake.calls == []
 
 
+@pytest.mark.usefixtures("limits_enforced")
 def test_the_playground_allowance_is_per_workspace(admin, other_workspace, fake_model, monkeypatch):
     fake_model()
     monkeypatch.setenv("API_PLAYGROUND_RPM", "1")
@@ -1536,6 +1566,7 @@ def test_a_streamed_playground_slot_comes_back_even_if_the_body_never_starts():
     assert quotas.in_flight(caller) == 0
 
 
+@pytest.mark.usefixtures("limits_enforced")
 def test_a_streamed_playground_run_over_the_allowance_is_a_429_status_not_a_dead_stream(
     admin, fake_model, monkeypatch
 ):
@@ -1552,9 +1583,11 @@ def test_a_streamed_playground_run_over_the_allowance_is_a_429_status_not_a_dead
     assert fake.calls == []
 
 
-def test_an_admission_refusal_in_the_playground_is_the_v1_429_not_a_500(admin, monkeypatch):
+def test_an_admission_refusal_in_the_playground_is_the_v1_503_not_a_500(admin, monkeypatch):
     """One pump since 2026-09-13: the engine refusals map to the §9 codes
-    `/v1` uses, with a Retry-After, instead of the console's own 500."""
+    `/v1` uses, with a Retry-After, instead of the console's own 500 — and a
+    full admission lane is the engine at capacity (503 model_unavailable),
+    not a concurrency limit."""
     from app import llm
 
     class AdmissionRejected(Exception):
@@ -1572,12 +1605,13 @@ def test_an_admission_refusal_in_the_playground_is_the_v1_429_not_a_500(admin, m
 
     response = admin.post(PLAYGROUND, json={"model": registry.PUBLIC_MODEL_IDS[0], "input": "hi"})
 
-    assert response.status_code == 429, response.text
-    assert response.json()["error"]["code"] == "concurrency_limit_exceeded"
+    assert response.status_code == 503, response.text
+    assert response.json()["error"]["code"] == "model_unavailable"
     assert "Retry-After" in response.headers
     assert "NORMAL" not in response.text
 
 
+@pytest.mark.usefixtures("limits_enforced")
 def test_a_playground_run_carries_the_ratelimit_headers(admin, fake_model):
     fake_model()
     response = admin.post(PLAYGROUND, json={"model": registry.PUBLIC_MODEL_IDS[0], "input": "hi"})
@@ -2047,6 +2081,7 @@ def _playground_ledger(workspace_id: str) -> Dict[str, int]:
 
 
 @pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.usefixtures("limits_enforced")
 def test_a_playground_run_refused_a_concurrency_slot_gives_its_input_estimate_back(
     admin, fake_model, monkeypatch, stream
 ):
@@ -2208,3 +2243,128 @@ def test_the_overview_and_usage_panels_cost_the_same_queries_for_one_project_or_
     only = admin.get("/admin/api/developers/usage", params={"project_id": first["id"]}).json()
     assert [p["id"] for p in only["projects"]] == [first["id"]]
     assert only["totals"]["requests"] == 1
+
+
+
+# ---------------------------------------------------------------------------
+# Unlimited by default (owner decision, 2026-09-13)
+# ---------------------------------------------------------------------------
+
+
+def test_with_the_limits_off_the_limits_payload_says_unlimited_rather_than_a_number(
+    admin, root
+):
+    """A console that shows `rpm: 60` beside an API that admits the 61st
+    request shows a number nothing enforces. With the switch off the five
+    usage limits are null beside `enforced: false`, on the project, the
+    project list and the limits route; the two per-request token ceilings are
+    technical limits and still read as stored."""
+    project = _make_project(admin)
+    root.put(
+        f"/admin/api/developers/projects/{project['id']}/limits",
+        json={"rpm": 120, "max_output_tokens": 2048},
+    )
+
+    read = admin.get(f"/admin/api/developers/projects/{project['id']}/limits").json()
+    listed = admin.get("/admin/api/developers/projects").json()["projects"]
+    mine = next(p for p in listed if p["id"] == project["id"])
+
+    for limits in (read["limits"], mine["limits"]):
+        assert limits["enforced"] is False
+        for field in ("rpm", "input_tpm", "output_tpm", "max_concurrency", "daily_token_quota"):
+            assert limits[field] is None, field
+        assert limits["max_output_tokens"] == 2048
+    assert read["limits_enforced"] is False
+
+
+def test_with_the_limits_off_a_limit_change_is_audited_with_the_stored_numbers(root):
+    """The audit trail records what a change moved from and to, whether or not
+    anything enforces it — never a `from: null` invented by the display rule."""
+    project = _make_project(root)
+
+    response = root.put(
+        f"/admin/api/developers/projects/{project['id']}/limits", json={"rpm": 120}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["limits"]["rpm"] is None
+    changed = _audit_rows("api_limits_changed")[-1]["meta"]["changed"]
+    assert changed == {"rpm": {"from": 60, "to": 120}}
+
+
+def test_the_overview_says_whether_limits_are_enforced(admin, monkeypatch):
+    assert admin.get("/admin/api/developers/overview").json()["stats"]["limits_enforced"] is False
+    monkeypatch.setattr(settings, "public_api_enforce_limits", True)
+    assert admin.get("/admin/api/developers/overview").json()["stats"]["limits_enforced"] is True
+
+
+def test_with_the_limits_off_concurrent_playground_runs_beyond_the_allowance_all_run(
+    admin, monkeypatch
+):
+    """The enforced test's twelve held-open runs against an allowance of two
+    concurrent and five a minute: every one reaches the engine, every one is
+    200 without a RateLimit field, and each is counted once in the
+    allowance's ledger."""
+    from app import llm
+
+    fake = GatedModel()
+    monkeypatch.setattr(llm, "stream_chat_events", fake.stream)
+    monkeypatch.setattr(llm, "get_usage", fake.usage)
+    monkeypatch.setenv("API_PLAYGROUND_MAX_CONCURRENCY", "2")
+    monkeypatch.setenv("API_PLAYGROUND_RPM", "5")
+    monkeypatch.setenv("API_PLAYGROUND_OUTPUT_TPM", "1")
+    monkeypatch.setenv("API_PLAYGROUND_DAILY_TOKEN_QUOTA", "1")
+
+    import threading
+    import time as _time
+
+    def release_when_every_run_is_in_the_engine():
+        deadline = _time.monotonic() + 30
+        while fake.started < 12 and _time.monotonic() < deadline:
+            _time.sleep(0.02)
+        fake.gate.set()
+
+    releaser = threading.Thread(target=release_when_every_run_is_in_the_engine)
+    releaser.start()
+    try:
+        results = _concurrently(
+            12,
+            lambda index: admin.post(
+                PLAYGROUND, json={"model": registry.PUBLIC_MODEL_IDS[0], "input": f"q{index}"}
+            ),
+        )
+    finally:
+        fake.gate.set()
+        releaser.join()
+
+    assert [r.status_code for r in results] == [200] * 12, [r.status_code for r in results]
+    for response in results:
+        assert "RateLimit" not in response.headers
+        assert "RateLimit-Policy" not in response.headers
+    assert fake.started == 12
+    workspace_id = store.default_workspace()["id"]
+    with db.connection() as con:
+        day = con.execute(
+            "SELECT COALESCE(SUM(requests), 0) AS requests, "
+            "       COALESCE(SUM(rate_limited), 0) AS rate_limited "
+            "  FROM api_usage_daily WHERE project_id = %s",
+            (console_api.playground_project_id(workspace_id),),
+        ).fetchone()
+    assert int(day["requests"]) == 12
+    assert int(day["rate_limited"]) == 0
+
+
+def test_with_the_limits_off_a_playground_allowance_of_zero_still_runs(
+    admin, fake_model, monkeypatch
+):
+    """The enforced mode's "zero means no runs at all" is a usage limit, and
+    the owner removed usage limits: with the switch off the run happens."""
+    fake = fake_model()
+    monkeypatch.setenv("API_PLAYGROUND_RPM", "0")
+    monkeypatch.setenv("API_PLAYGROUND_MAX_CONCURRENCY", "0")
+
+    response = admin.post(PLAYGROUND, json={"model": registry.PUBLIC_MODEL_IDS[0], "input": "hi"})
+
+    assert response.status_code == 200, response.text
+    assert "RateLimit" not in response.headers
+    assert len(fake.calls) == 1

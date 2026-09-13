@@ -75,6 +75,25 @@ function repoFile(...parts: string[]): string {
   return readFileSync(join(REPO_ROOT, ...parts), 'utf8');
 }
 
+/** One `## heading` section of a page body, up to the next `## ` heading. */
+function sectionOf(body: string, heading: string): string {
+  const start = body.indexOf(`## ${heading}\n`);
+  expect(start, `## ${heading}`).toBeGreaterThanOrEqual(0);
+  const next = body.indexOf('\n## ', start + 3);
+  return body.slice(start, next === -1 ? undefined : next);
+}
+
+/** A body with its fenced samples removed, cut into prose units: a blank-line
+ * paragraph, or one table row on its own (a whole table is one paragraph,
+ * and one honest row must not excuse its neighbours). */
+function proseUnitsOf(body: string): string[] {
+  const prose = body.replace(/^~~~[^\n]*\n[\s\S]*?^~~~$/gm, '');
+  return prose
+    .split(/\n\s*\n/)
+    .flatMap((block) => (block.trimStart().startsWith('|') ? block.split('\n') : [block]))
+    .filter((unit) => unit.trim() !== '');
+}
+
 const CONTRACT = repoFile('docs', 'developer-platform', 'CONTRACT.md');
 const REGISTRY_PY = repoFile('orchestrator', 'app', 'publicapi', 'registry.py');
 const KEYS_PY = repoFile('orchestrator', 'app', 'apiplatform', 'keys.py');
@@ -717,29 +736,40 @@ describe('the shipped router', () => {
     expect(row('Body bytes')).toBe('1 MiB');
   });
 
-  it('describes the limits the way the shared quota interface enforces them', () => {
+  it('describes the enforced limits, under the operator switch only, the way the shared quota interface enforces them', () => {
     // The platform-services wave's interface, as the integration lead fixed
     // it on 2026-09-13: per PROJECT, reserved atomically, every authenticated
     // route metered, one concurrency count across sync/stream/background,
     // and 0 meaning zero. If those names are not in quotas.py the page is
     // describing a platform that does not exist, and this fails.
+    // 2026-09-13, owner decision: those limits are enforced only with
+    // PUBLIC_API_ENFORCE_LIMITS on, so every one of these sentences must sit
+    // inside the operator section, never in the part a default reader reads.
     const quotasPy = repoFile('orchestrator', 'app', 'apiplatform', 'quotas.py');
     expect(quotasPy).toMatch(/^def reserve\(/m);
     expect(quotasPy).toContain('pg_advisory_xact_lock');
     expect(quotasPy).toMatch(/def concurrency_slot\(\s*caller[^)]*kind/);
 
     const page = findDocPage('rate-limits')!.body;
-    expect(page).toContain('Limits belong to the **project**');
-    expect(page).toContain('summed across all of the project\'s keys');
-    expect(page).toContain('*tighten*');
-    expect(page).toContain('## Every request counts');
-    expect(page).toContain('reads included');
-    expect(page).toContain('## Zero means zero');
-    expect(page).toContain('A limit set to `0` allows nothing.');
-    expect(page).toContain('holds one from its `202`');
+    const enforced = sectionOf(page, 'If an operator enables limits');
+    const unlimited = page.replace(enforced, '');
+    for (const sentence of [
+      'limits belong to the **project**',
+      'summed across all of the project\'s keys',
+      '*tighten*',
+      'A limit set to `0` allows nothing.',
+      'holds one from its `202`',
+      'A `401` carries no quota headers at all',
+    ]) {
+      expect(enforced, sentence).toContain(sentence);
+      expect(unlimited, sentence).not.toContain(sentence);
+    }
+    expect(page).toContain('## Usage is still recorded');
+    expect(sectionOf(page, 'Usage is still recorded')).toContain('reads included');
     // The old per-key wording and the promise of a header on a 401 are gone.
     expect(page).not.toMatch(/every `\/v1` response carries/i);
-    expect(page).toContain('A `401` carries no quota headers at all');
+    expect(page).not.toContain('## Every request counts');
+    expect(page).not.toContain('## Zero means zero');
   });
 
   it('meters every route that takes a key, as the limits page says', () => {
@@ -793,7 +823,7 @@ describe('the shipped router', () => {
     expect(page).toContain('end_date');
   });
 
-  it('sends the rate-limit headers in the shape the limits page prints', () => {
+  it('prints the enforced-mode rate-limit headers in the shape quotas.py sends, inside the operator section only', () => {
     const quotas = repoFile('orchestrator', 'app', 'apiplatform', 'quotas.py');
     // The two draft-11 field names, and the item and parameter spellings
     // the sample on the page uses. Not the f-string byte for byte: the quota
@@ -803,10 +833,15 @@ describe('the shipped router', () => {
     expect(quotas).toMatch(/"RateLimit": f'"requests";r=\{[a-z_]+\};t=\{[a-z_]+\}'/);
     expect(quotas).toContain('"concurrency";q=');
     expect(quotas).toContain('qu="concurrent-requests"');
-    const page = findDocPage('rate-limits')!.body;
+    // 2026-09-13: sent only with PUBLIC_API_ENFORCE_LIMITS on, so the page
+    // shows the shape only under the operator heading, and as prose — there
+    // is no header sample left for docs_examples_run.py to hold to a server
+    // that, by default, sends none.
+    const page = sectionOf(findDocPage('rate-limits')!.body, 'If an operator enables limits');
     expect(page).toContain('RateLimit: "requests";r=');
     expect(page).toContain('"concurrency";q=');
     expect(page).toContain('qu="concurrent-requests"');
+    expect(page).not.toContain('~~~');
   });
 
   it('signs webhooks with the header the webhook page tells you to verify', () => {
@@ -847,6 +882,123 @@ describe('the shipped router', () => {
     const page = findDocPage('webhooks')!.body;
     expect(page).toContain('**6 attempts**');
     expect(page).toContain('10 seconds');
+  });
+});
+
+describe('the unlimited API (owner decision, 2026-09-13)', () => {
+  // The owner removed every usage limit from the public API: no requests or
+  // tokens per minute, no daily or monthly quota, no per-project concurrency
+  // cap, and no RateLimit headers. The server keeps the enforced mode behind
+  // PUBLIC_API_ENFORCE_LIMITS (default false). A documentation site that
+  // still promised 429s and headers would have a reader build throttling for
+  // a limit that does not exist — these tests hold every page to the default.
+
+  it('reads the switch that makes the API unlimited, defaulting to false, in config.py', () => {
+    const configPy = repoFile('orchestrator', 'app', 'config.py');
+    expect(configPy).toMatch(/_bool\("PUBLIC_API_ENFORCE_LIMITS", False\)/);
+  });
+
+  it('says first, before any table, that there are no usage limits and no RateLimit headers', () => {
+    const page = findDocPage('rate-limits')!;
+    const intro = page.body.slice(0, page.body.indexOf('\n## '));
+    expect(intro).toContain('**The API currently enforces no usage limits.**');
+    expect(intro).toContain('no limit on tokens per minute');
+    expect(intro).toContain('no daily or monthly token quota');
+    expect(intro).toContain('no cap on how many requests a project runs at once');
+    expect(intro).toMatch(/no response carries a\s+`RateLimit` or `RateLimit-Policy` header/);
+    expect(intro).not.toContain('|');
+    expect(page.summary).toMatch(/no usage limits/);
+  });
+
+  it('keeps the technical limits and the 503 backoff that did not go away', () => {
+    const errorsPy = repoFile('orchestrator', 'app', 'publicapi', 'errors.py');
+    expect(errorsPy).toMatch(/"model_recovering": _CodeSpec\(503, /);
+    expect(errorsPy).toMatch(/"request_too_large": _CodeSpec\(413, /);
+    expect(errorsPy).toMatch(/"context_length_exceeded": _CodeSpec\(400, /);
+
+    const page = findDocPage('rate-limits')!.body;
+    const kept = sectionOf(page, 'What still applies');
+    expect(kept).toContain('| Body bytes | 1 MiB |');
+    expect(kept).toContain('`413 request_too_large`');
+    expect(kept).toContain('`400 context_length_exceeded`');
+    expect(kept).toContain('8,192');
+    expect(kept).toContain("The engine's queue");
+
+    const backoff = sectionOf(page, 'Backing off on 503');
+    expect(backoff).toContain('`503 model_recovering`');
+    expect(backoff).toContain('`Retry-After`');
+    expect(backoff).toMatch(/jitter/i);
+    expect(backoff).toMatch(/Cap your attempts/);
+  });
+
+  it('says usage is still recorded, because the ledgers are still written once per request', () => {
+    const section = sectionOf(findDocPage('rate-limits')!.body, 'Usage is still recorded');
+    expect(section).toContain('still counted, once');
+    expect(section).toContain('`GET /v1/usage`');
+  });
+
+  it('names a usage-limit refusal or a RateLimit header on no page, except as the operator-enabled mode', () => {
+    // A unit that names one of these must also say why it is not a default
+    // behaviour: the operator switch, the engine's own queue (a technical
+    // limit the owner kept), or that the API enforces none.
+    const excuse = /operator|engine|enforces no|no longer enforces|\bno\b[^.]*`RateLimit`|neither/i;
+    const named = /`quota_exceeded`|`concurrency_limit_exceeded`|`RateLimit(?:-Policy)?`/;
+    const offenders: string[] = [];
+    for (const page of DOC_PAGES) {
+      const body =
+        page.slug === 'rate-limits'
+          ? page.body.replace(sectionOf(page.body, 'If an operator enables limits'), '')
+          : page.body;
+      for (const unit of proseUnitsOf(body)) {
+        if (named.test(unit) && !excuse.test(unit)) offenders.push(`${page.slug}: ${unit.slice(0, 120)}`);
+      }
+    }
+    expect(offenders).toEqual([]);
+
+    // The exact claims the pages made before the decision, each of which is
+    // now false on a default deployment.
+    const retired = [
+      /counts against (?:your|the project's)\s+\[rate limits\]/,
+      /Read the `RateLimit` headers/,
+      /Your project reached a limit/,
+      /Rate-limit headers\*\* on every response/,
+      /`RateLimit` headers, which are live/,
+      /\*\*rate, quota and concurrency\*\* — over any of them is `429`/,
+      /Rate and token limits \| A key whose abuse has a ceiling/,
+      /prints `X-Request-Id` \(log it\), `RateLimit`/,
+      /refused with `429 concurrency_limit_exceeded` and a/,
+    ];
+    for (const page of DOC_PAGES) {
+      for (const claim of retired) expect(page.body, `${page.slug} ${claim}`).not.toMatch(claim);
+    }
+  });
+
+  it('marks the three 429 codes in every retry sample as arriving only when an operator enables limits', () => {
+    for (const slug of ['errors', 'python', 'javascript']) {
+      const body = findDocPage(slug)!.body;
+      expect(body, slug).toContain('"quota_exceeded", "concurrency_limit_exceeded"');
+      expect(body, slug).toMatch(/quota_exceeded and concurrency_limit_exceeded arrive only if an operator\s+(?:#|\/\/) enables limits/);
+    }
+  });
+
+  it('records the removal in the changelog, dated 2026-09-13, as a decision, newest first', () => {
+    const changelog = findDocPage('changelog')!.body;
+    const headings = docHeadingsOf(changelog).map((heading) => heading.text);
+    expect(headings[0]).toBe('2026-09-13 — usage limits removed');
+    const entry = sectionOf(changelog, '2026-09-13 — usage limits removed');
+    expect(entry).toContain('by decision');
+    expect(entry).toContain('`PUBLIC_API_ENFORCE_LIMITS`, off by default');
+    expect(entry).toContain('`503 model_recovering` with `Retry-After`');
+  });
+
+  it('shows no RateLimit header in the curl sample, and the example runner fails a server that sends one', () => {
+    const curl = findDocPage('curl')!.body;
+    expect(curl).toContain('There is no `RateLimit` header to read');
+    const runner = repoFile('scripts', 'docs_examples_run.py');
+    expect(runner).toContain('absent_headers=("ratelimit", "ratelimit-policy")');
+    expect(runner).not.toMatch(/^def chk_ratelimit\(/m);
+    expect(runner).not.toMatch(/^\s+S\["rate-limits", \d+\] = Spec\(/m);
+    expect(findDocPage('rate-limits')!.body).not.toContain('~~~');
   });
 });
 

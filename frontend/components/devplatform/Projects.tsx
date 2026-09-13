@@ -44,7 +44,8 @@ import {
   ConsoleTable,
   EnvironmentChip,
   MonoValue,
-  limitText,
+  limitsEnforcement,
+  usageLimitText,
   useProjects,
 } from './shared';
 import { useConsoleStatus } from './status';
@@ -195,7 +196,7 @@ export function ProjectsPanel({ me }: { me: Me }) {
         {!loading && !error && projects.length === 0 ? (
           <ConsoleEmpty
             title="No projects yet"
-            body="Every API key belongs to a project, so this is the first thing to create. A project carries the model allowlist, the rate limits and the request log for everything done with its keys."
+            body="Every API key belongs to a project, so this is the first thing to create. A project carries the model allowlist, its limits and the request log for everything done with its keys."
             action={
               manage ? (
                 <button
@@ -232,7 +233,11 @@ export function ProjectsPanel({ me }: { me: Me }) {
         }}
       />
 
-      <ProjectDetailDialog project={detail} onClose={() => setDetail(null)} />
+      <ProjectDetailDialog
+        project={detail}
+        enforcement={limitsEnforcement(detail?.limits, detail, data)}
+        onClose={() => setDetail(null)}
+      />
 
       <ConfirmDialog
         open={disableTarget !== null}
@@ -352,9 +357,12 @@ function CreateProjectDialog({
 /** Read-only settings, so a person can check a limit without leaving the tab. */
 function ProjectDetailDialog({
   project,
+  enforcement,
   onClose,
 }: {
   project: Project | null;
+  /** `limitsEnforcement` of the project and its list; null = pre-switch server. */
+  enforcement: boolean | null;
   onClose: () => void;
 }) {
   return (
@@ -368,22 +376,22 @@ function ProjectDetailDialog({
         <dl className="space-y-2 text-sm">
           <Row label="Project id" value={project.id} mono />
           <Row label="Environment" value={project.environment} />
-          <Row label="Requests / minute" value={limitText(project.limits.rpm)} />
+          <Row label="Requests / minute" value={usageLimitText(project.limits.rpm, enforcement)} />
           <Row
             label="Input tokens / minute"
-            value={limitText(project.limits.input_tpm)}
+            value={usageLimitText(project.limits.input_tpm, enforcement)}
           />
           <Row
             label="Output tokens / minute"
-            value={limitText(project.limits.output_tpm)}
+            value={usageLimitText(project.limits.output_tpm, enforcement)}
           />
           <Row
             label="Concurrent requests"
-            value={limitText(project.limits.max_concurrency)}
+            value={usageLimitText(project.limits.max_concurrency, enforcement)}
           />
           <Row
             label="Daily token quota"
-            value={limitText(project.limits.daily_token_quota)}
+            value={usageLimitText(project.limits.daily_token_quota, enforcement)}
           />
           <Row
             label="Log retention"

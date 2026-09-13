@@ -1110,3 +1110,109 @@ def test_the_compatibility_dialect_has_its_own_error_frame():
     # It does not end the stream: a client library waits for the sentinel.
     assert chunks.finished is False
     assert chunks.done() == events.DONE_SENTINEL
+
+
+# ---------------------------------------------------------------------------
+# The public document follows PUBLIC_API_ENFORCE_LIMITS (owner decision,
+# 2026-09-13: unlimited by default)
+# ---------------------------------------------------------------------------
+
+
+def _operations(document):
+    for path, item in document["paths"].items():
+        for method, operation in item.items():
+            yield f"{method.upper()} {path}", operation
+
+
+def test_with_the_limits_off_the_public_document_advertises_no_usage_limit(monkeypatch):
+    """A client generator turns every documented 429 and RateLimit header into
+    throttling code. With the limits off: no RateLimit header anywhere, no
+    limit code anywhere, and no 429 on ANY route — the server sends none. The
+    two refusals that remain on the generating routes are documented as what
+    they are: a 409 whose Retry-After marks a still-running Idempotency-Key,
+    and a 503 that names the engine at capacity."""
+    from app.publicapi.openapi import public_openapi
+
+    monkeypatch.setattr(settings, "public_api_enforce_limits", False)
+    document = public_openapi()
+    text = json.dumps(document)
+    paths = json.dumps(document["paths"])
+
+    assert "RateLimit" not in text
+    for code in ("quota_exceeded", "rate_limit_error", "concurrency_limit_exceeded"):
+        assert code not in paths, code
+    generating = {"POST /v1/responses", "POST /v1/chat/completions"}
+    for name, operation in _operations(document):
+        responses = operation["responses"]
+        assert "429" not in responses, name
+        if name in generating:
+            assert "still running" in responses["409"]["description"], name
+            assert responses["409"]["headers"]["Retry-After"]["required"] is False
+            assert "at capacity" in responses["503"]["description"], name
+            assert "Retry-After" in responses["503"]["headers"]
+    assert "no request, token-per-minute, daily or concurrency limits" in (
+        document["info"]["description"]
+    )
+
+
+def test_with_the_limits_on_the_public_document_is_what_it_was_before_the_switch(monkeypatch):
+    """Enforced, the document keeps every limit it advertised: RateLimit on
+    the success responses, `rate_limit_error` on every authenticated route and
+    `quota_exceeded` / `concurrency_limit_exceeded` on the generating ones."""
+    from app.publicapi.openapi import public_openapi
+
+    monkeypatch.setattr(settings, "public_api_enforce_limits", True)
+    document = public_openapi()
+
+    for name, operation in _operations(document):
+        responses = operation["responses"]
+        if name == "GET /v1/openapi.json":
+            continue
+        assert "RateLimit" in responses["200"]["headers"], name
+        assert "rate_limit_error" in responses["429"]["description"], name
+    create = document["paths"]["/v1/responses"]["post"]["responses"]["429"]["description"]
+    assert "quota_exceeded" in create and "concurrency_limit_exceeded" in create
+    assert "limits: usage is recorded" not in document["info"]["description"]
+
+
+def test_both_forms_of_the_public_document_are_valid_openapi_3_1(monkeypatch):
+    """The CI contract gate validates whichever document the default builds;
+    both must pass its structural checks and publish the same operations."""
+    import importlib.util
+    from pathlib import Path
+
+    from app.publicapi.openapi import public_openapi
+
+    gate_path = Path(__file__).resolve().parents[2] / ".github/workflows/scripts/api_contract.py"
+    if not gate_path.is_file():  # an image built from orchestrator/ alone
+        pytest.skip(f"the CI contract gate is not in this checkout ({gate_path})")
+    spec = importlib.util.spec_from_file_location("api_contract_gate", gate_path)
+    gate = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gate)
+
+    shapes = {}
+    for enforced in (False, True):
+        monkeypatch.setattr(settings, "public_api_enforce_limits", enforced)
+        document = public_openapi()
+        assert gate.validate_openapi_31(document) == [], enforced
+        shapes[enforced] = gate.document_operations(document)
+    assert shapes[False] == shapes[True]
+
+
+def test_a_full_engine_and_an_outstanding_idempotent_request_are_not_limit_errors():
+    """Owner decision 2026-09-13: no rate, token, quota or concurrency limit on
+    /v1. The two refusals that remain are physical facts, and they must not be
+    spelled as limits: the shared engine at capacity is a retryable 503, and a
+    repeat of a still-running Idempotency-Key is a 409."""
+    from app.publicapi import router as public_router, streaming
+
+    class AdmissionRejected(RuntimeError):
+        pass
+
+    capacity = streaming.engine_error(AdmissionRejected("lanes full"))
+    assert (capacity.code, capacity.status) == ("model_unavailable", 503)
+    assert int(capacity.headers()["Retry-After"]) >= 1
+
+    running = public_router._still_running()
+    assert (running.code, running.status) == ("idempotency_conflict", 409)
+    assert "still running" in running.message and int(running.headers()["Retry-After"]) >= 1
