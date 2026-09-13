@@ -1,0 +1,58 @@
+{
+  "about": "Every metric the Developer API dashboard (monitoring/grafana/dashboards/dgx-developer-api.json) and monitoring/prometheus/rules/developer-api.yml query, with its status on 2026-09-13. check_metrics.py proves this against a running Prometheus; tests/test_developer_api_monitoring.py proves every queried name is listed here. Histograms are listed by base name; their _bucket/_sum/_count series belong to the entry.",
+  "statuses": {
+    "live": "Has series in production Prometheus now.",
+    "event_driven": "Emitted by merged code, but the series only exists after the first event (a counter or histogram registered on first use). Absent is normal.",
+    "pending": "Emitted by code that is written but not merged or not deployed. Absent until it is; panels are titled [pending].",
+    "proposed": "Nothing emits it. The README's metric contract says what to emit, where, and with which closed label values. Panels are titled [proposed]."
+  },
+  "metrics": {
+    "vllm:num_requests_running": {"status": "live", "type": "gauge", "source": "vLLM engines, jobs vllm-main and vllm-aux (label service)"},
+    "vllm:num_requests_waiting": {"status": "live", "type": "gauge", "source": "vLLM engines"},
+    "vllm:kv_cache_usage_perc": {"status": "live", "type": "gauge", "source": "vLLM engines (0-1)"},
+    "vllm:generation_tokens_total": {"status": "live", "type": "counter", "source": "vLLM engines"},
+    "vllm:prompt_tokens_total": {"status": "live", "type": "counter", "source": "vLLM engines; counted when a prefill ENDS"},
+    "vllm:iteration_tokens_total": {"status": "live", "type": "histogram", "source": "vLLM engines; _count is scheduler iterations, also counted at prefill end"},
+    "vllm:num_preemptions_total": {"status": "live", "type": "counter", "source": "vLLM engines"},
+    "vllm:time_to_first_token_seconds": {"status": "live", "type": "histogram", "source": "vLLM engines"},
+    "vllm:e2e_request_latency_seconds": {"status": "live", "type": "histogram", "source": "vLLM engines"},
+    "http_requests_total": {"status": "live", "type": "counter", "source": "vLLM engines' HTTP instrumentation (labels handler, method, status as a class 2xx/4xx/5xx)"},
+    "llm_admission_lane_active": {"status": "event_driven", "type": "gauge", "source": "orchestrator/app/admission.py Lane._publish (label lane); set only when a lane is used, so absent after an orchestrator start until the first generation. Hourly samples: present 2026-09-12 11:43Z, 18:43Z-09-13 02:43Z, 07:43Z-08:43Z; absent in between with the orchestrator up."},
+    "llm_admission_waiting": {"status": "event_driven", "type": "gauge", "source": "orchestrator/app/admission.py Lane._publish (label lane); same lazy publication as llm_admission_lane_active. Never above 0 in the hours it existed."},
+    "llm_admission_rejections_total": {"status": "event_driven", "type": "counter", "source": "orchestrator/app/admission.py (label reason: capacity, timeout)"},
+    "node_memory_MemAvailable_bytes": {"status": "live", "type": "gauge", "source": "node-exporter, job node (label node)"},
+    "node_memory_SwapFree_bytes": {"status": "live", "type": "gauge", "source": "node-exporter"},
+    "node_memory_SwapTotal_bytes": {"status": "live", "type": "gauge", "source": "node-exporter"},
+    "pg_stat_user_tables_n_tup_ins": {"status": "live", "type": "counter", "source": "postgres-exporter, job postgres (labels datname, relname)"},
+    "pg_stat_user_tables_n_tup_upd": {"status": "live", "type": "counter", "source": "postgres-exporter"},
+    "techsara_vllm_state": {"status": "live", "type": "gauge", "source": "engine controller one-hot (label state); read by the state_now annotation"},
+    "upload_sessions_open": {"status": "live", "type": "gauge", "source": "orchestrator/app/health._publish_work_gauges on every /health call (label state: uploading, finalizing). The chat app's chunked upload rail, not the public /v1 Files API (design only on 2026-09-13)."},
+
+    "asr_queue_depth": {"status": "event_driven", "type": "gauge", "source": "orchestrator/app/asr.py _Pool.__aenter__; created on the first transcription. Present 2026-09-04 to 09-11 18:41Z, none since.", "defect": "POOL (dictation) and BATCH_POOL (video) both publish this unlabelled gauge, last writer wins: reproduced 2026-09-13 with the module, one dictation in flight and a video clip that entered and left BATCH_POOL left asr_active_requests at 0. Fix in asr.py: a `pool` label (dictation, video) declared in metrics.py."},
+    "asr_active_requests": {"status": "event_driven", "type": "gauge", "source": "orchestrator/app/asr.py _Pool.__aenter__/__aexit__", "defect": "same POOL/BATCH_POOL overwrite as asr_queue_depth"},
+    "asr_requests_total": {"status": "event_driven", "type": "counter", "source": "orchestrator/app/asr.transcribe, dictation only (label result: ok, fail). Public /v1/audio/transcriptions does not pass through it (publicapi/sidecars.py sends its own request)."},
+    "asr_batch_requests_total": {"status": "event_driven", "type": "counter", "source": "orchestrator/app/asr.transcribe_segments, video analysis clips (label result: ok, fail)"},
+    "asr_request_duration_seconds": {"status": "event_driven", "type": "histogram", "source": "orchestrator/app/asr.transcribe, successful dictation only, orchestrator wall clock"},
+    "asr_batch_request_duration_seconds": {"status": "event_driven", "type": "histogram", "source": "orchestrator/app/asr.transcribe_segments, successful video clips only"},
+    "upload_session_total": {"status": "event_driven", "type": "counter", "source": "orchestrator/app/uploads._count_session (labels purpose: dataset, document, video; result: complete, rejected, cancelled, expired)"},
+    "upload_part_bytes_total": {"status": "event_driven", "type": "counter", "source": "orchestrator/app/uploads._count_part_bytes (label purpose)"},
+    "upload_finalize_seconds": {"status": "event_driven", "type": "histogram", "source": "orchestrator/app/uploads._finalise_session (label purpose)"},
+
+    "public_api_engine_in_flight": {"status": "pending", "type": "gauge", "source": "orchestrator/app/publicapi/capacity.py _publish (developer-platform worktree, not merged)", "labels": {"engine": ["main.long", "router", "ocr", "embed", "rerank", "asr"]}, "defect": "orchestrator/app/metrics.py bounds the label name `engine` to {main} globally, so every gate is exported as engine=\"other\" and the last gate published overwrites the rest. Fix: _ALLOWED_BY_METRIC entries for this metric and public_api_engine_waiting listing the six gate names."},
+    "public_api_engine_waiting": {"status": "pending", "type": "gauge", "source": "orchestrator/app/publicapi/capacity.py _publish", "labels": {"engine": ["main.long", "router", "ocr", "embed", "rerank", "asr"]}, "defect": "same engine-label fold as public_api_engine_in_flight", "proposed_labels": {"mode": ["sync", "stream", "background"]}, "note": "Without a mode label a background job waiting up to PUBLIC_API_BACKGROUND_GATE_WAIT_S (3,600 s) by design looks the same as a sync caller about to be refused; PublicApiGateWaitSustained leaves main.long out for that reason."},
+    "techsara_host_guard_table_present": {"status": "pending", "type": "gauge", "source": "monitoring/exporters/host-guard/host_guard_textfile.sh, once root installs it and node-exporter runs with --collector.textfile.directory"},
+    "techsara_host_guard_check_ok": {"status": "pending", "type": "gauge", "source": "monitoring/exporters/host-guard/host_guard_textfile.sh"},
+    "techsara_host_guard_check_timestamp_seconds": {"status": "pending", "type": "gauge", "source": "monitoring/exporters/host-guard/host_guard_textfile.sh"},
+
+    "public_api_requests_total": {"status": "proposed", "type": "counter", "labels": {"route": ["responses", "chat_completions", "embeddings", "rerank", "audio_transcriptions", "files", "uploads", "models", "other"], "model": ["techsara-35b", "techsara-8b-vision", "techsara-ocr", "techsara-embed", "techsara-rerank", "techsara-whisper", "none", "other"], "status": ["200", "202", "400", "401", "403", "404", "409", "413", "415", "422", "499", "500", "502", "503", "504", "other"], "error": ["none", "invalid_request_error", "context_length_exceeded", "invalid_api_key", "insufficient_scope", "origin_not_allowed", "model_not_found", "response_not_found", "idempotency_conflict", "request_too_large", "model_recovering", "model_unavailable", "at_capacity", "timeout", "internal_error", "other"]}},
+    "public_api_request_duration_seconds": {"status": "proposed", "type": "histogram", "labels": {"route": "as public_api_requests_total", "model": "as public_api_requests_total", "mode": ["sync", "stream", "background"]}, "buckets": [0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120, 300, 600, 1800, 3600, 7200, 14400, 21600]},
+    "public_api_ttft_seconds": {"status": "proposed", "type": "histogram", "labels": {"route": "as public_api_requests_total", "model": "as public_api_requests_total"}, "buckets": [0.1, 0.25, 0.5, 1, 1.5, 2, 2.5, 5, 10, 30, 60, 120, 300, 600, 900, 1800]},
+    "public_api_streams_in_flight": {"status": "proposed", "type": "gauge", "labels": {"route": "as public_api_requests_total", "model": "as public_api_requests_total"}},
+    "public_api_background_jobs": {"status": "proposed", "type": "gauge", "labels": {"status": ["queued", "in_progress"]}},
+    "public_api_background_jobs_total": {"status": "proposed", "type": "counter", "labels": {"status": ["completed", "failed", "cancelled"]}},
+    "public_api_output_tokens_total": {"status": "proposed", "type": "counter", "labels": {"model": "as public_api_requests_total"}},
+    "public_api_capacity_refusals_total": {"status": "proposed", "type": "counter", "labels": {"engine": ["main", "main.long", "router", "ocr", "embed", "rerank", "asr"]}},
+    "usage_events_written_total": {"status": "proposed", "type": "counter", "labels": {"result": ["ok", "fail"]}},
+    "public_api_usage_settle_total": {"status": "proposed", "type": "counter", "labels": {"result": ["ok", "fail"]}}
+  }
+}

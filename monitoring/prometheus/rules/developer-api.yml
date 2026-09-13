@@ -1,0 +1,565 @@
+# Alerts for the developer platform release (2026-09-13): the public /v1 API,
+# the shared engines it now loads, and the host conditions that take those
+# engines down. Loaded by the same `rule_files: /etc/prometheus/rules/*.yml`
+# glob as alerts.yml; nothing in alerts.yml or recording.yml is changed.
+#
+# EVERY METRIC HERE HAS A STATUS, declared in
+# monitoring/developer-api/metrics-contract.json and explained in
+# monitoring/developer-api/README.md:
+#   live          in production Prometheus on 2026-09-13
+#   event_driven  merged code creates the series on first use, so it is
+#                 absent after an orchestrator start until that happens
+#   pending       emitted by code in the developer-platform worktree, not merged
+#   proposed      no code emits it yet; the contract says exactly what to emit
+# A rule on a pending or proposed metric is INERT until the metric exists:
+# an absent series never fires (no rule here uses `or vector(0)` or treats
+# absence as failure — the same construction rules as the vllm-availability
+# group). monitoring/developer-api/check_metrics.py proves the split against
+# a running Prometheus.
+#
+# NOTHING HERE REACHES A PERSON YET (2026-09-13). Prometheus has no
+# Alertmanager: GET /api/v1/alertmanagers returns
+# {"activeAlertmanagers":[],"droppedAlertmanagers":[]}, and docs/MONITORING.md
+# says "nothing pages anyone until a receiver is configured". Every alert below
+# shows on Prometheus's /alerts page and in Grafana's alert list, and nowhere
+# else. A severity and a `for:` say how urgent a condition is, not that anyone
+# is told; a one-minute critical OOM warning is only an early warning once the
+# owner configures a receiver (README, "How it reaches production").
+#
+# WHAT IS ALREADY COVERED. alerts.yml keeps VllmKvCacheNearlyFull (main > 90%
+# for 5m, warning), VllmPreemptionsHappening (main, any, info),
+# VllmGenerationFrozen / VllmEngineWedged (the controller's verdict),
+# HeadSwapActivity (head swap-out, silenced during reloads),
+# UnifiedMemoryPressure (memory used > 92% for 5m, i.e. MemAvailable under
+# ~9.7 GiB on these 121.7 GiB nodes), and UploadSessionsExpiringInBursts /
+# UploadStuckFinalizing for the chunked upload rail. The rules below add what
+# those cannot say: every auxiliary engine, a sustained escalation, a wedge
+# rule that does not need the controller, speech-to-text failures and queueing,
+# and per-node memory headroom that is NOT silenced during a reload — the
+# kernel's OOM killer does not care why memory ran out. One overlap is kept on
+# purpose and named where it is (NodeMemAvailableLow).
+
+groups:
+  # ------------------------------------------------------------------------
+  # OOM warning, one alert per node (the node-exporter job labels each
+  # target with `node`). Recommended by the OOM kill-order work
+  # (docs/developer-platform/OPERATIONS.md §14: "MemAvailable and swap alerts
+  # early enough for a person to act first"). They can be that only once a
+  # receiver exists (header); until then they are a record on /alerts.
+  #
+  # Calibrated on 14 days of this cluster's history (2026-08-30 → 09-13, both
+  # nodes 121.7 GiB RAM; swap 64 GiB head, 32 GiB worker):
+  #   MemAvailable < 8 GiB   head: on 6 days (09-03, 09-04, 09-06, 09-08,
+  #                          09-09, 09-12), 12 separate runs at 60 s
+  #                          resolution; lowest 3.08 GiB at 2026-09-12 22:37Z
+  #                          (36.3 GiB at 22:25Z, under 8 GiB 22:28–22:39Z,
+  #                          55 GiB again at 22:40:30Z). CAUSE NOT ESTABLISHED:
+  #                          the main engine was not restarted (vllm-main
+  #                          process_start_time_seconds stayed 2026-09-12
+  #                          10:46:27Z), no container started, the kernel
+  #                          counted no OOM kill, per-process GPU memory
+  #                          (dgx_gpu_process_memory_bytes) did not move, and
+  #                          no container was above ~2.8 GiB. Worker: never
+  #                          (lowest 11.3 GiB).
+  #   swap +2 GiB in 15 min  head: ~3 a day ON ITS OWN — model reloads push
+  #                          idle pages out while plenty is still available —
+  #                          so it is only an alert together with
+  #                          MemAvailable < 16 GiB: 8 episodes in 14 days, the
+  #                          four of 14+ minutes being real pressure
+  #   swap used              head peak 72% (45.8 of 64 GiB), worker 43%
+  #
+  # FINDING THE HOLDER. On GB10 an engine's memory is unified GPU memory that
+  # neither `docker stats` nor a process's RSS counts (OPERATIONS.md §14): on
+  # 2026-09-13 docker stats listed the main engine container at 3.25 GiB while
+  # nvidia-smi showed its rank holding 24.8 GiB, and the router at 845 MiB
+  # against 16.2 GiB. So the first command lists GPU holders
+  # (nvidia-smi) AND host RSS (ps); the 09-12 dip above was visible to neither
+  # docker stats nor the GPU view, which is why both are there.
+  #
+  # WHAT TO FREE, in the order of OPERATIONS.md §14: work that costs nobody
+  # first (pg-test, the e2e stack, a desktop session, a running test suite);
+  # then the expendable GPU holders — the OCR engine, speech, the auxiliary
+  # engines — which free the most but each takes a public model offline;
+  # postgres, the orchestrator and the main engine pair never.
+  - name: node-memory
+    rules:
+      - alert: NodeMemAvailableLow
+        # Overlaps alerts.yml's UnifiedMemoryPressure (> 92% used for 5m, about
+        # MemAvailable < 9.7 GiB here), and the two co-fire. Kept because it is
+        # earlier on a fast drain — on 2026-09-12 the head went from 36.3 GiB
+        # to 7.0 GiB in three minutes — and because it carries the OOM
+        # runbook and a command that can see GPU memory, which
+        # UnifiedMemoryPressure does not.
+        expr: node_memory_MemAvailable_bytes{job="node"} < 8 * 1024 * 1024 * 1024
+        for: 2m
+        labels: { severity: warning, service: host }
+        annotations:
+          summary: "{{ $labels.node }}: only {{ $value | humanize1024 }}B of memory available"
+          description: >-
+            Below 8 GiB of MemAvailable on a unified-memory node, where model
+            weights and KV cache are host memory. Two minutes of it means the
+            OOM killer is one allocation burst away. Find the holder with a
+            command that sees GPU memory, then free what costs nobody (pg-test,
+            the e2e stack, a desktop session), then the expendable GPU holders
+            (OCR, speech, auxiliary engines); never postgres or the main
+            engine.
+          runbook: monitoring/developer-api/README.md#node-memory
+          safe_command: "free -g; nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv; ps -eo pid,rss,comm --sort=-rss | head -8"
+
+      - alert: NodeMemAvailableCritical
+        expr: node_memory_MemAvailable_bytes{job="node"} < 4 * 1024 * 1024 * 1024
+        for: 1m
+        labels: { severity: critical, service: host }
+        annotations:
+          summary: "{{ $labels.node }}: {{ $value | humanize1024 }}B of memory available — OOM kill imminent"
+          description: >-
+            Below 4 GiB. The kernel has OOM-killed an engine rank on this
+            hardware before (worker, 2026-07-22); with ranks at the default
+            oom_score_adj the engine is the likeliest victim. Free memory now,
+            in the order of OPERATIONS.md §14: what costs nobody, then OCR,
+            speech and the auxiliary engines.
+          runbook: monitoring/developer-api/README.md#node-memory
+          safe_command: "free -g; nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv; ps -eo pid,rss,comm --sort=-rss | head -8"
+
+      - alert: NodeSwapRisingUnderMemoryPressure
+        # delta() of SwapFree over 15 minutes, negated: bytes pushed INTO swap.
+        # Gated on MemAvailable < 16 GiB because swap growth with memory to
+        # spare is the kernel's ordinary reclaim of idle pages.
+        expr: >-
+          (-delta(node_memory_SwapFree_bytes{job="node"}[15m]) > 2 * 1024 * 1024 * 1024)
+            and on(node) (node_memory_MemAvailable_bytes{job="node"} < 16 * 1024 * 1024 * 1024)
+        for: 5m
+        labels: { severity: warning, service: host }
+        annotations:
+          summary: "{{ $labels.node }}: swap grew {{ $value | humanize1024 }}B in 15m with under 16 GiB available"
+          description: >-
+            Memory is draining into swap while available memory is already
+            low: the working set no longer fits. On these nodes that is model
+            memory being paged, so latency climbs before anything is killed.
+          runbook: monitoring/developer-api/README.md#node-memory
+          safe_command: "free -g; vmstat 5 3"
+
+      - alert: NodeSwapNearlyExhausted
+        expr: >-
+          100 * (1 - node_memory_SwapFree_bytes{job="node"} / node_memory_SwapTotal_bytes{job="node"}) > 80
+            and on(node) (node_memory_SwapTotal_bytes{job="node"} > 0)
+        for: 5m
+        labels: { severity: warning, service: host }
+        annotations:
+          summary: "{{ $labels.node }}: swap {{ $value | printf \"%.0f\" }}% used"
+          description: >-
+            When swap is full the next shortfall goes straight to the OOM
+            killer. Highest seen in 14 days was 72% on the head.
+          runbook: monitoring/developer-api/README.md#node-memory
+          safe_command: "free -g; swapon --show"
+
+  # ------------------------------------------------------------------------
+  # Engine pressure on EVERY engine the public API now exposes. The
+  # auxiliary engines (job vllm-aux: router = techsara-8b-vision, ocr =
+  # techsara-ocr, embed = techsara-embed, reranker = techsara-rerank) are
+  # shared with the chat app, which calls the router on every turn.
+  # 14-day history: KV peak main 59.5%, router 34%, ocr 25%, embed 28%;
+  # preemptions 0 on every engine.
+  - name: engine-pressure
+    rules:
+      - alert: VllmMainKvCacheSaturatedSustained
+        # The escalation of VllmKvCacheNearlyFull (5m, warning). Fifteen
+        # minutes above 90% on the TP=2 engine means vLLM is preempting and
+        # recomputing — a near-full-window chat prompt costs ~15 min to
+        # recompute. One public 1M-token generation plus a full-window chat
+        # prompt can exceed the 1.66-window KV pool on its own.
+        expr: max(vllm:kv_cache_usage_perc{job="vllm-main"}) * 100 > 90
+        for: 15m
+        labels: { severity: critical, service: main, state: DEGRADED }
+        annotations:
+          summary: "Main engine KV cache {{ $value | printf \"%.0f\" }}% used for 15 minutes"
+          description: >-
+            Sustained saturation on the one engine that answers both the chat
+            app and techsara-35b. Look at what holds it: a long public
+            generation (public_api_engine_in_flight{engine="main.long"}),
+            a full-window chat prompt, or both.
+          state_now: '{{ with query "techsara_vllm_state == 1" }}{{ if eq (len .) 1 }}{{ (index . 0).Labels.state }}{{ else }}MONITORING_UNKNOWN{{ end }}{{ else }}MONITORING_UNKNOWN{{ end }}'
+          runbook: monitoring/developer-api/README.md#kv-cache-saturated
+          safe_command: "curl -s http://127.0.0.1:9838/state | jq '.state,.signals.engine'"
+
+      - alert: VllmAuxKvCacheSaturatedSustained
+        expr: max by (service) (vllm:kv_cache_usage_perc{job="vllm-aux"}) * 100 > 90
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.service }} engine KV cache {{ $value | printf \"%.0f\" }}% used for 10 minutes"
+          description: >-
+            The router's pool is 1.07 of its window, so one long public
+            request can hold it while every chat turn needs it for
+            classification. The public capacity gate bounds public use; if
+            this fires, check the gate for this engine on the Developer API
+            dashboard before raising any public setting.
+          runbook: monitoring/developer-api/README.md#kv-cache-saturated
+
+      - alert: EnginePreemptionsIncreasing
+        # More than five in 15 minutes, sustained 5 minutes: not a blip.
+        # Zero preemptions on any engine in the 14 days before this release.
+        expr: sum by (service) (increase(vllm:num_preemptions_total{job=~"vllm-main|vllm-aux"}[15m])) > 5
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.service }} engine preempted {{ $value | printf \"%.0f\" }} requests in 15 minutes"
+          description: >-
+            vLLM is evicting running requests to make KV room and will
+            recompute them. Users see this as latency, not errors. Pair it
+            with the KV panel for the same engine.
+          runbook: monitoring/developer-api/README.md#preemptions
+
+      - alert: EngineHttp5xxRatioHigh
+        # The engines' own HTTP instrumentation (status is a class: 2xx, 4xx,
+        # 5xx). Covers chat and public traffic together, and exists today.
+        #
+        # INFERENCE HANDLERS ONLY, on both sides of the ratio (fixed
+        # 2026-09-13 after review). Probes and cheap non-generating calls
+        # (/v1/models, /health, /metrics, /ping, /version, /tokenize,
+        # /detokenize, /openapi.json, and `none` for unmatched paths) answer
+        # even when inference is broken, and they outnumber it: 7-day medians
+        # per 10 minutes were main /v1/models 70.6 against
+        # /v1/chat/completions 10.1, and router and ocr /v1/models 19.5 against
+        # chat/completions 0. Counting them let a router or OCR engine fail
+        # 100% of its real requests below the old 20-request floor, and let
+        # main fail 3 of 10 completions at 3/80 = 3.75%. So there is no request
+        # floor any more: 2 of 2 failed completions on a quiet engine fire.
+        #
+        # AT LEAST TWO FAILURES. On 2026-09-13 embed fails one request in
+        # every ~35 minutes on ~2 requests a minute (40 of ~3,260 in 24 h),
+        # which holds its 10-minute ratio near 1/20 = 5.0% — on the line, where
+        # increase()'s extrapolation decides. One isolated failure is the
+        # engine log's business, not an alert.
+        #
+        # Replayed over 14 days (60 s steps): 1 episode that holds 5 minutes,
+        # embed 2026-09-06 01:14Z — the same single episode the old
+        # probe-diluted rule had, so removing the floor added no noise.
+        #
+        # A handler's 5xx series is created on its first failure after an
+        # engine start, and a series that first appears at 1 shows an
+        # increase() of 0; so on a freshly started engine it takes a third
+        # failure to fire. The promtool cases start their series at 0.
+        expr: >-
+          100 * sum by (service) (increase(http_requests_total{job=~"vllm-main|vllm-aux", handler!~"/v1/models|/health|/metrics|/ping|/version|/tokenize|/detokenize|/openapi.json|none", status="5xx"}[10m]))
+            / sum by (service) (increase(http_requests_total{job=~"vllm-main|vllm-aux", handler!~"/v1/models|/health|/metrics|/ping|/version|/tokenize|/detokenize|/openapi.json|none"}[10m])) > 5
+          and on(service) sum by (service) (increase(http_requests_total{job=~"vllm-main|vllm-aux", handler!~"/v1/models|/health|/metrics|/ping|/version|/tokenize|/detokenize|/openapi.json|none", status="5xx"}[10m])) >= 2
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.service }} engine answered {{ $value | printf \"%.1f\" }}% of inference requests with 5xx over 10m"
+          description: >-
+            The engine itself is failing requests (not the orchestrator in
+            front of it). Read the engine's own log for the handler named on
+            the Developer API dashboard's engine 5xx panel.
+          runbook: monitoring/developer-api/README.md#engine-5xx
+
+      - alert: VllmWedgeSignatureFromEngineCounters
+        # The 2026-09-01 / 09-11 wedge read straight from the engine's own
+        # scrape, WITHOUT the engine controller: requests running for the
+        # whole window while no progress witness moved. The witnesses are the
+        # ones the controller learned the hard way (memory note, 2026-09-12):
+        # a ~950K-token prefill keeps generation_tokens_total,
+        # prompt_tokens_total AND iteration_tokens_total_count flat for ~14
+        # minutes (they count at prefill END), and only kv_cache_usage_perc
+        # moves — so a KV value that changed at all is progress.
+        #
+        # Replayed over 14 days: fires on all 10 known fault episodes and not
+        # on the 2026-09-12 09:03Z needle_950k prefill, which the counters-
+        # only version (and the controller at the time) called WEDGED.
+        #
+        # Not gated on the controller on purpose (rule 3 of alerts.yml's
+        # vllm-availability group: a rule on the engine's scrape never
+        # depends on the controller being up). With the controller healthy
+        # its recovery restarts the head, the engine series vanish and this
+        # never reaches firing; it fires when nothing else acted.
+        expr: >-
+          (min(min_over_time(vllm:num_requests_running{job="vllm-main"}[3m])) > 0)
+            and on() (sum(increase(vllm:generation_tokens_total{job="vllm-main"}[3m])) == 0)
+            and on() (sum(increase(vllm:prompt_tokens_total{job="vllm-main"}[3m])) == 0)
+            and on() (sum(increase(vllm:iteration_tokens_total_count{job="vllm-main"}[3m])) == 0)
+            and on() (max(changes(vllm:kv_cache_usage_perc{job="vllm-main"}[3m])) == 0)
+        for: 1m
+        labels: { severity: critical, service: main, state: WEDGED }
+        annotations:
+          summary: "Main engine: {{ $value | printf \"%.0f\" }} request(s) running and nothing has moved for 3 minutes"
+          description: >-
+            No generated token, no prompt token, no scheduler iteration and no
+            change in KV usage for three minutes while requests are running.
+            That is a dead rank with the head blocked in a collective, with
+            /health still green. If the controller is up it should already be
+            recovering (state_now); if it is not, this is the only alert that
+            can say so.
+          state_now: '{{ with query "techsara_vllm_state == 1" }}{{ if eq (len .) 1 }}{{ (index . 0).Labels.state }}{{ else }}MONITORING_UNKNOWN{{ end }}{{ else }}MONITORING_UNKNOWN{{ end }}'
+          runbook: docs/availability/RUNBOOK.md#wedged
+          safe_command: "curl -s http://127.0.0.1:9838/state | jq '.state,.recovery'; scripts/cluster-status.sh"
+
+      - alert: AuxEngineWedgeSignature
+        # Same signature per auxiliary engine. No controller watches these.
+        # 14-day replay: zero episodes, including 90 minutes of continuous
+        # load on all four engines on 2026-09-10.
+        expr: >-
+          (min by (service) (min_over_time(vllm:num_requests_running{job="vllm-aux"}[3m])) > 0)
+            and on(service) (sum by (service) (increase(vllm:generation_tokens_total{job="vllm-aux"}[3m])) == 0)
+            and on(service) (sum by (service) (increase(vllm:prompt_tokens_total{job="vllm-aux"}[3m])) == 0)
+            and on(service) (sum by (service) (increase(vllm:iteration_tokens_total_count{job="vllm-aux"}[3m])) == 0)
+            and on(service) (max by (service) (changes(vllm:kv_cache_usage_perc{job="vllm-aux"}[3m])) == 0)
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.service }} engine: {{ $value | printf \"%.0f\" }} request(s) running and nothing has moved for 3 minutes"
+          description: >-
+            The engine holds requests and makes no progress. The chat app
+            degrades around a missing router, embedder or reranker, but public
+            calls to this engine will hang until their read timeout. A restart
+            of this one service is the usual remedy; it is an operator's call.
+          runbook: monitoring/developer-api/README.md#aux-engine-wedged
+
+  # ------------------------------------------------------------------------
+  # The public API itself. Label vocabularies are closed (README, metric
+  # contract); `job="orchestrator"` is the orchestrator's own /metrics.
+  - name: developer-api
+    rules:
+      - alert: LlmAdmissionWaitSustained
+        # EVENT-DRIVEN. The admission lanes in front of the main engine are
+        # shared by chat and /v1. admission.Lane._publish() sets the gauge
+        # only when a lane is used, so after an orchestrator start there is no
+        # series until the first generation: hourly samples show it present
+        # 2026-09-12 11:43Z, 18:43Z → 09-13 02:43Z and 07:43Z → 08:43Z, absent
+        # in between while the orchestrator was up. In those hours nobody
+        # waited (max 0). Absent never fires.
+        expr: max by (lane) (llm_admission_waiting{job="orchestrator"}) > 0
+        for: 5m
+        labels: { severity: warning, service: main }
+        annotations:
+          summary: "{{ $value | printf \"%.0f\" }} generation(s) waiting for the {{ $labels.lane }} admission lane for 5 minutes"
+          description: >-
+            Requests are queued in the orchestrator before they reach the
+            engine. Behind a LONG request holding the lane this is by design
+            for up to the lane's wait bound; sustained, it is capacity.
+          runbook: monitoring/developer-api/README.md#capacity-waits
+
+      - alert: LlmAdmissionRejections
+        # LIVE once incremented: the counter is registered on its first
+        # rejection, and a series that first appears at 1 shows an increase()
+        # of 0 — so the very first rejection after a restart is not seen here.
+        expr: sum by (reason) (increase(llm_admission_rejections_total{job="orchestrator"}[10m])) > 0
+        for: 1m
+        labels: { severity: warning, service: main }
+        annotations:
+          summary: "Admission lanes refused {{ $value | printf \"%.0f\" }} generation(s) in 10 minutes ({{ $labels.reason }})"
+          description: >-
+            Each is a chat turn or a /v1 call answered "at capacity". Nothing
+            was lost — the caller was told to retry — but people were turned
+            away.
+          runbook: monitoring/developer-api/README.md#capacity-waits
+
+      - alert: PublicApiGateWaitSustained
+        # PENDING: public_api_engine_waiting comes from publicapi/capacity.py
+        # (not merged).
+        #
+        # UNRELIABLE UNTIL orchestrator/app/metrics.py lists the gate names
+        # (README, "known defect"). Today every gate publishes to the same
+        # folded series engine="other", last writer wins: an idle gate that
+        # publishes waiting=0 overwrites a router gate with waiters, so this
+        # rule can stay silent while people wait.
+        #
+        # NOT main.long. That gate admits one long generation at a time, and a
+        # background job waits behind it for up to
+        # PUBLIC_API_BACKGROUND_GATE_WAIT_S (3,600 s) by design, so a queue of
+        # them holds this gauge above 0 for hours with nothing wrong. A sync
+        # or stream request there gives up after PUBLIC_API_GATE_WAIT_S (30 s)
+        # with a 503, which PublicApiAtCapacityRefusals counts. Background jobs
+        # on the other gates wait the same way; the gauge has no mode label
+        # to tell them apart (README proposes `mode`), so on those gates this
+        # warning can also be by design — read the background jobs panel.
+        expr: max by (engine) (public_api_engine_waiting{job="orchestrator", engine!="main.long"}) > 0
+        for: 10m
+        labels: { severity: warning, service: orchestrator }
+        annotations:
+          summary: "{{ $value | printf \"%.0f\" }} public request(s) waiting for the {{ $labels.engine }} capacity gate for 10 minutes"
+          description: >-
+            Public work on a shared engine is queued behind other public work.
+            Sync and stream requests give up after the gate wait and answer
+            503 with Retry-After; background jobs wait up to an hour by design,
+            so check the Developer API dashboard's background jobs panel before
+            treating this as a capacity shortage.
+          runbook: monitoring/developer-api/README.md#capacity-waits
+
+      - alert: PublicApiAtCapacityRefusals
+        # PROPOSED metric: public_api_capacity_refusals_total{engine}.
+        expr: sum by (engine) (increase(public_api_capacity_refusals_total{job="orchestrator"}[10m])) > 5
+        for: 5m
+        labels: { severity: warning, service: orchestrator }
+        annotations:
+          summary: "{{ $value | printf \"%.0f\" }} public request(s) refused at capacity on {{ $labels.engine }} in 10 minutes"
+          description: >-
+            Callers are getting 503 model_unavailable "at capacity". Not a
+            usage limit — the engine is shared with the chat app and full.
+          runbook: monitoring/developer-api/README.md#capacity-waits
+
+      - alert: PublicApi5xxRatioHigh
+        # PROPOSED metric: public_api_requests_total{route,model,status,error}.
+        # `error` carries in-band stream failures too (HTTP 200, then
+        # response.failed), so the selector is on error, not status. Left out
+        # on purpose: at_capacity (PublicApiAtCapacityRefusals) and
+        # model_recovering (the engine is restarting and said so; the
+        # vllm-availability alerts own that).
+        #
+        # PER MODEL (fixed 2026-09-13 after review). One ratio across all six
+        # models let a busy one hide a broken one: 1,000 good embeddings and
+        # 30 failed OCR calls is 2.9% overall while techsara-ocr is 100% down.
+        # For the same reason there is no request floor per model — a quiet
+        # model is exactly the one a floor hides — but at least THREE
+        # failures: the official SDKs retry a 5xx twice by default, so one
+        # caller request that fails through its retries is three failures,
+        # and one transient failure that a retry fixed is one. Uncalibrated:
+        # the metric does not exist yet.
+        expr: >-
+          100 * sum by (model) (increase(public_api_requests_total{job="orchestrator", error=~"internal_error|timeout|model_unavailable"}[10m]))
+            / sum by (model) (increase(public_api_requests_total{job="orchestrator"}[10m])) > 5
+          and on(model) sum by (model) (increase(public_api_requests_total{job="orchestrator", error=~"internal_error|timeout|model_unavailable"}[10m])) >= 3
+        for: 5m
+        labels: { severity: warning, service: orchestrator }
+        annotations:
+          summary: "Public API: {{ $labels.model }} failed {{ $value | printf \"%.1f\" }}% of requests server-side over 10 minutes"
+          description: >-
+            internal_error, timeout or model_unavailable (not at capacity)
+            outcomes on /v1, including streams that failed after their 200.
+            The orchestrator log line "unhandled error on the public API
+            (request_id=…)" names each internal_error.
+          runbook: monitoring/developer-api/README.md#public-api-5xx
+
+  # ------------------------------------------------------------------------
+  # Speech to text: the whisper-large-v3 replicas behind techsara-whisper,
+  # dictation and video analysis. The engine exposes no /metrics
+  # (prometheus.yml, "SPEECH TO TEXT HAS NO SCRAPE JOB"), so the orchestrator's
+  # own asr_* series are the view. Added 2026-09-13 after review: the model was
+  # published with no alert on it.
+  #
+  # WHAT THESE SEE AND WHAT THEY DO NOT. asr_* count the chat app's DICTATION
+  # (asr.transcribe, pool POOL) and VIDEO clips (asr.transcribe_segments, pool
+  # BATCH_POOL). Public /v1/audio/transcriptions calls do NOT pass through
+  # them: publicapi/sidecars.py sends its own request to the replica dictation
+  # does not prefer. So a broken whisper replica shows here through dictation
+  # and video; public whisper traffic alone shows only in the proposed
+  # public_api_requests_total{model="techsara-whisper"} and the pending
+  # public_api_engine_*{engine="asr"}.
+  #
+  # EVENT-DRIVEN. Every asr_* series is created on first use. Production had
+  # them 2026-09-04 → 09-11 18:41Z and none since the orchestrator restarted
+  # (no dictation or video since), so both rules are silent until speech is
+  # used. A counter's first increment after a restart is invisible to
+  # increase().
+  #
+  # 7 days of real use (09-04 → 09-11): 46 dictation attempts (7 failed),
+  # 283 video clips (6 failed), asr_queue_depth never above 0,
+  # asr_active_requests at most 2.
+  - name: speech-to-text
+    rules:
+      - alert: AsrFailureRatioHigh
+        # Over 20% failed with at least two failures in 15 minutes, per path.
+        # Replayed over 14 days: dictation once (2026-09-08 00:45Z, two
+        # failures), video once (2026-09-11 02:05Z); both were real failures,
+        # cause not investigated. A lone failure (four other dictation windows)
+        # does not fire.
+        expr: >-
+          (
+            label_replace(
+              100 * sum(increase(asr_requests_total{job="orchestrator", result="fail"}[15m]))
+                / sum(increase(asr_requests_total{job="orchestrator"}[15m])),
+              "path", "dictation", "", "")
+            > 20
+            and on() sum(increase(asr_requests_total{job="orchestrator", result="fail"}[15m])) >= 2
+          )
+          or
+          (
+            label_replace(
+              100 * sum(increase(asr_batch_requests_total{job="orchestrator", result="fail"}[15m]))
+                / sum(increase(asr_batch_requests_total{job="orchestrator"}[15m])),
+              "path", "video", "", "")
+            > 20
+            and on() sum(increase(asr_batch_requests_total{job="orchestrator", result="fail"}[15m])) >= 2
+          )
+        for: 5m
+        labels: { severity: warning, service: asr }
+        annotations:
+          summary: "Speech to text: {{ $value | printf \"%.0f\" }}% of {{ $labels.path }} transcriptions failed over 15 minutes"
+          description: >-
+            The whisper replicas are failing the chat app's own transcriptions,
+            so techsara-whisper callers are very likely failing too (they reach
+            the same replicas by another path that these counters do not see).
+            The orchestrator's GET /audio/health (an administrator session
+            with analytics access) names each replica's state; the
+            orchestrator log has the engine error.
+          runbook: monitoring/developer-api/README.md#speech-to-text
+          safe_command: "scripts/whisper.sh status"
+
+      - alert: AsrQueueSustained
+        # A dictation waiter gives up after ASR_QUEUE_WAIT_S (8 s) with
+        # "busy", so five minutes of a non-zero queue is a steady stream of
+        # people being turned away, not one slow clip. 14-day history: never
+        # above 0.
+        #
+        # KNOWN DEFECT (asr.py, not this file): POOL and BATCH_POOL publish
+        # the SAME unlabelled asr_queue_depth and asr_active_requests, last
+        # writer wins (reproduced 2026-09-13: with one dictation in flight, a
+        # video clip entering and leaving BATCH_POOL left
+        # asr_active_requests at 0). So this can miss a queue while video
+        # clips move; it cannot invent one.
+        expr: max(asr_queue_depth{job="orchestrator"}) > 0
+        for: 5m
+        labels: { severity: warning, service: asr }
+        annotations:
+          summary: "Speech to text: {{ $value | printf \"%.0f\" }} transcription(s) waiting for a slot for 5 minutes"
+          description: >-
+            Every whisper slot has been busy for five minutes. Dictation
+            callers are being told "busy" after an 8-second wait. whisper
+            decodes one clip per replica, and public transcriptions yield to
+            dictation, so public callers are waiting or getting 503 too.
+          runbook: monitoring/developer-api/README.md#speech-to-text
+
+  # ------------------------------------------------------------------------
+  # The host packet filter (table `inet techsara_guard`, OPERATIONS.md §13)
+  # does not survive a reboot. `nft list` needs root (verified: "Operation
+  # not permitted (you must be root)"), and no network probe from inside the
+  # cluster can tell a filtered port from an open one, so there is NO signal
+  # for this today. PENDING: monitoring/exporters/host-guard/ writes one as a
+  # node-exporter textfile when root installs it and node-exporter is given
+  # --collector.textfile.directory (README, "host packet filter"). Until then
+  # these rules have nothing to read and stay silent. The writer's `source`
+  # label says how it knows: `nft` (run as root, authoritative) or
+  # `state_file` (run as anyone: the apply script's /run marker, which a reboot
+  # clears but a hand-flushed ruleset does not).
+  - name: host-guard
+    rules:
+      - alert: HostGuardTableMissing
+        expr: >-
+          (techsara_host_guard_table_present{job="node"} == 0)
+            and on(node) (techsara_host_guard_check_ok{job="node"} == 1)
+        for: 2m
+        labels: { severity: critical, service: host }
+        annotations:
+          summary: "{{ $labels.node }}: the host packet filter table is not loaded (checked by {{ $labels.source }})"
+          description: >-
+            The nftables table that limits who can reach the engine ports is
+            gone — usually a reboot, since it is not persisted by default.
+            Re-apply it with the documented procedure.
+          runbook: docs/developer-platform/OPERATIONS.md#13-the-host-packet-filter-on-the-engine-ports
+          safe_command: '{{ if eq $labels.role "worker" }}bash ~/.techsara-cluster/host-guard.sh verify --role worker{{ else }}scripts/host-guard.sh verify{{ end }}'
+
+      - alert: HostGuardSignalUnproven
+        # The checker ran but nft failed, or the checker stopped writing.
+        # Worded as "cannot see", never as "missing".
+        expr: >-
+          label_replace(techsara_host_guard_check_ok{job="node"} == 0, "cause", "check_failed", "", "")
+          or
+          label_replace((time() - techsara_host_guard_check_timestamp_seconds{job="node"}) > 900, "cause", "check_stale", "", "")
+        for: 5m
+        labels: { severity: warning, service: host }
+        annotations:
+          summary: "{{ $labels.node }}: host packet filter state unknown ({{ $labels.cause }})"
+          description: >-
+            The textfile check could not run nft, or has not written for
+            15 minutes. The filter may be fine; monitoring cannot tell.
+          runbook: monitoring/developer-api/README.md#host-packet-filter
