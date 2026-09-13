@@ -1,0 +1,66 @@
+{
+  "context": {
+    "fraction": 0.001,
+    "reserved_output": 8192,
+    "summarized_turns": 2,
+    "tokens_used": 942,
+    "usable_budget": 991296,
+    "window": 1000000
+  },
+  "knowledge": {
+    "decision": "static_topical",
+    "freshness": "static",
+    "from_local_memory": true
+  },
+  "route": "chat",
+  "sources": [
+    {
+      "cited": false,
+      "domain": "benchlm.test",
+      "fetched_at": "2026-08-30T06:00:00+00:00",
+      "from_store": true,
+      "n": 1,
+      "origin": "search",
+      "read": true,
+      "snippet": "The BenchLM Reasoning Leaderboard scores general-purpose language models on a private held-out set of multi-step reasoning problems. Scores are the mean of three runs and are reported out of 100. This page introduces the methodology; the ranking table follows below. Nothing in this introductory paragraph contains an individual model score. Evaluated on the BenchLM-Reasoning v4 suite. Population: 1",
+      "title": "BenchLM Reasoning Leaderboard — methodology and ranking",
+      "url": "https://benchlm.test/leaderboard-full"
+    },
+    {
+      "cited": false,
+      "domain": "benchlm.test",
+      "fetched_at": "2026-08-30T06:00:00+00:00",
+      "from_store": true,
+      "n": 2,
+      "origin": "search",
+      "read": true,
+      "snippet": "The BenchLM Reasoning Leaderboard scores general-purpose language models on a private held-out set of multi-step reasoning problems. Scores are the mean of three runs and are reported out of 100. This page introduces the methodology; the ranking table follows below. Nothing in this introductory paragraph contains an individual model score. Evaluated on the BenchLM-Reasoning v4 suite. Population: 1",
+      "title": "BenchLM Reasoning Leaderboard — March 2026",
+      "url": "https://benchlm.test/leaderboard"
+    },
+    {
+      "cited": false,
+      "domain": "benchlm.test",
+      "fetched_at": "2026-08-30T06:00:00+00:00",
+      "from_store": true,
+      "n": 3,
+      "origin": "search",
+      "read": true,
+      "snippet": "About BenchLM BenchLM is an independent evaluation project. We publish reasoning, coding and retrieval leaderboards, describe our methodology openly, and re-run every suite quarterly. Methodology Each model is run three times against a held-out problem set. We report the mean. Runs are executed on identical hardware with identical decoding parameters. We do not accept payment from model providers ",
+      "title": "BenchLM — About the benchmark",
+      "url": "https://benchlm.test/methodology"
+    },
+    {
+      "cited": false,
+      "domain": "benchlm.test",
+      "fetched_at": "2026-08-30T06:00:00+00:00",
+      "from_store": true,
+      "n": 4,
+      "origin": "search",
+      "read": true,
+      "snippet": "The same ranking as the table view, rendered as cards. Scores are out of 100 and are the mean of three runs on BenchLM-Reasoning v4. This paragraph states no individual score. #1 Aurora-Max Reasoning 93.4 Cost / 1M tok $12.00 #2 Meridian-Pro Reasoning 92.1 Cost / 1M tok $9.50 #3 Solaris-9 Reasoning 91.7 Cost / 1M tok $8.00 #4 Kestrel-XL Reasoning 90.2 Cost / 1M tok $11.25 #5 Vantage-4 Reasoning 89",
+      "title": "BenchLM Reasoning Leaderboard (card view) — March 2026",
+      "url": "https://benchlm.test/cards"
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "context": {
+    "fraction": 0.0009,
+    "reserved_output": 8192,
+    "summarized_turns": 2,
+    "tokens_used": 935,
+    "usable_budget": 991296,
+    "window": 1000000
+  },
+  "route": "chat"
+}

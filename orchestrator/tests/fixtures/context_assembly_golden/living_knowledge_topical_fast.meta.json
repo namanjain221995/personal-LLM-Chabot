@@ -1,0 +1,42 @@
+{
+  "context": {
+    "fraction": 0.0011,
+    "reserved_output": 8192,
+    "summarized_turns": 2,
+    "tokens_used": 1081,
+    "usable_budget": 991296,
+    "window": 1000000
+  },
+  "knowledge": {
+    "decision": "static_topical",
+    "freshness": "static",
+    "from_local_memory": true
+  },
+  "route": "chat",
+  "sources": [
+    {
+      "cited": false,
+      "domain": "docs.example.org",
+      "fetched_at": "2026-08-30T06:00:00+00:00",
+      "from_store": true,
+      "n": 1,
+      "origin": "search",
+      "read": true,
+      "snippet": "Badger setts are ventilated by their many entrances. Air enters the lower tunnels and leaves through the higher ones, so a sett breathes without any chimney. Chambers sit off the main tunnels and are lined with dry bedding that the badgers air out on warm mornings. Badger setts are ventilated by their many entrances. Air enters the lower tunnels and leaves through the higher ones, so a sett breath",
+      "title": "How badger setts breathe",
+      "url": "https://docs.example.org/setts/ventilation"
+    },
+    {
+      "cited": false,
+      "domain": "wildlife.example.net",
+      "fetched_at": "2026-08-30T06:00:00+00:00",
+      "from_store": true,
+      "n": 2,
+      "origin": "search",
+      "read": true,
+      "snippet": "Badgers are nocturnal. Their setts can be centuries old and span many entrances. Badgers are nocturnal. Their setts can be centuries old and span many entrances. Badgers are nocturnal. Their setts can be centuries old and span many entrances. Badgers are nocturnal. Their setts can be centuries old and span many entrances. ",
+      "title": "Badger facts",
+      "url": "https://wildlife.example.net/badger-facts"
+    }
+  ]
+}
