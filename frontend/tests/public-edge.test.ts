@@ -28,12 +28,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  DEFAULT_PUBLIC_API_AUDIO_BODY_BYTES,
   DEFAULT_PUBLIC_API_BODY_BYTES,
+  DEFAULT_PUBLIC_API_MEDIA_BODY_BYTES,
   GET,
   OPTIONS,
   POST,
   RESPONSE_HEADER_ALLOWLIST,
   publicApiBodyBytes,
+  publicApiBodyBytesFor,
   upstreamPathFor,
 } from '@/app/v1/[[...path]]/route';
 
@@ -104,6 +107,8 @@ beforeEach(() => {
   errors = [];
   vi.stubEnv('ORCHESTRATOR_URL', 'http://orchestrator:8080');
   vi.stubEnv('PUBLIC_API_MAX_BODY_BYTES', '');
+  vi.stubEnv('PUBLIC_API_MAX_MEDIA_BODY_BYTES', '');
+  vi.stubEnv('PUBLIC_API_MAX_AUDIO_BODY_BYTES', '');
   // The default posture everywhere but the Cloudflare tunnel: no ingress
   // header is believed, so nothing is forwarded about where a caller came from.
   vi.stubEnv('TRUSTED_CLIENT_IP_HEADER', '');
@@ -474,7 +479,8 @@ describe('the request body cap', () => {
   it('refuses a declared oversize body with 413 before the orchestrator is called', async () => {
     const fetchSpy = vi.fn();
     vi.stubGlobal('fetch', fetchSpy);
-    vi.stubEnv('PUBLIC_API_MAX_BODY_BYTES', '1024');
+    // /v1/responses takes the MEDIA cap since 2026-09-13 (image input).
+    vi.stubEnv('PUBLIC_API_MAX_MEDIA_BODY_BYTES', '1024');
     const headers = new Headers();
     headers.set('content-type', 'application/json');
     headers.set('authorization', KEY);
@@ -497,7 +503,8 @@ describe('the request body cap', () => {
     // over the bytes that arrive rather than over what the caller claimed.
     const fetchSpy = vi.fn();
     vi.stubGlobal('fetch', fetchSpy);
-    vi.stubEnv('PUBLIC_API_MAX_BODY_BYTES', '1024');
+    // /v1/responses takes the MEDIA cap since 2026-09-13 (image input).
+    vi.stubEnv('PUBLIC_API_MAX_MEDIA_BODY_BYTES', '1024');
     const body = new ReadableStream<Uint8Array>({
       start(controller) {
         for (let i = 0; i < 8; i += 1) controller.enqueue(encoder.encode('x'.repeat(512)));
@@ -519,7 +526,8 @@ describe('the request body cap', () => {
 
   it('answers the 413 in the contract’s error envelope, not a proxy’s own shape', async () => {
     vi.stubGlobal('fetch', vi.fn());
-    vi.stubEnv('PUBLIC_API_MAX_BODY_BYTES', '1024');
+    // /v1/responses takes the MEDIA cap since 2026-09-13 (image input).
+    vi.stubEnv('PUBLIC_API_MAX_MEDIA_BODY_BYTES', '1024');
     const headers = new Headers();
     headers.set('content-type', 'application/json');
     headers.set('content-length', String(1024 * 64));
@@ -552,12 +560,113 @@ describe('the request body cap', () => {
 
   it('lets a body at the cap through untouched', async () => {
     const calls = capture(() => Response.json({ id: 'resp_1' }));
-    vi.stubEnv('PUBLIC_API_MAX_BODY_BYTES', '1024');
+    // /v1/responses takes the MEDIA cap since 2026-09-13 (image input).
+    vi.stubEnv('PUBLIC_API_MAX_MEDIA_BODY_BYTES', '1024');
     const payload = JSON.stringify({ model: 'techsara-35b', input: 'x'.repeat(900) });
     expect(payload.length).toBeLessThanOrEqual(1024);
     const res = await POST(post(payload, { authorization: KEY }), ctx('responses'));
     expect(res.status).toBe(200);
     expect(decoder.decode(calls[0].init.body as ArrayBuffer)).toBe(payload);
+  });
+});
+
+/**
+ * 2026-09-13: image input on the generating routes and audio uploads on
+ * /v1/audio/transcriptions. One cap for everything would either refuse every
+ * real recording at the edge (1 MiB) or hand every JSON route 26 MiB of this
+ * process's memory; each path gets the size the orchestrator enforces for it,
+ * from the same environment variable.
+ */
+describe('the per-path body caps', () => {
+  it('are 26 MiB for audio, 20 MiB for the generating routes and 1 MiB elsewhere', () => {
+    expect(DEFAULT_PUBLIC_API_AUDIO_BODY_BYTES).toBe(27_262_976);
+    expect(DEFAULT_PUBLIC_API_MEDIA_BODY_BYTES).toBe(20_971_520);
+    expect(publicApiBodyBytesFor(['audio', 'transcriptions'])).toBe(27_262_976);
+    expect(publicApiBodyBytesFor(['responses'])).toBe(20_971_520);
+    expect(publicApiBodyBytesFor(['chat', 'completions'])).toBe(20_971_520);
+    expect(publicApiBodyBytesFor(['embeddings'])).toBe(1024 * 1024);
+    expect(publicApiBodyBytesFor(['rerank'])).toBe(1024 * 1024);
+    // Exact paths, not prefixes: a cancel carries no image.
+    expect(publicApiBodyBytesFor(['responses', 'resp_1', 'cancel'])).toBe(1024 * 1024);
+    expect(publicApiBodyBytesFor(['audio'])).toBe(1024 * 1024);
+  });
+
+  it('read the orchestrator’s own variables, and ignore nonsense', () => {
+    vi.stubEnv('PUBLIC_API_MAX_AUDIO_BODY_BYTES', '4096');
+    vi.stubEnv('PUBLIC_API_MAX_MEDIA_BODY_BYTES', '2048');
+    vi.stubEnv('PUBLIC_API_MAX_BODY_BYTES', '1024');
+    expect(publicApiBodyBytesFor(['audio', 'transcriptions'])).toBe(4096);
+    expect(publicApiBodyBytesFor(['responses'])).toBe(2048);
+    expect(publicApiBodyBytesFor(['embeddings'])).toBe(1024);
+    vi.stubEnv('PUBLIC_API_MAX_AUDIO_BODY_BYTES', '-5');
+    expect(publicApiBodyBytesFor(['audio', 'transcriptions'])).toBe(27_262_976);
+  });
+
+  it('let a 2 MiB image request through to /v1/responses but not to /v1/embeddings', async () => {
+    const calls = capture(() => Response.json({ ok: true }));
+    const payload = JSON.stringify({ model: 'techsara-35b', input: 'x'.repeat(2 * 1024 * 1024) });
+
+    const accepted = await POST(post(payload, { authorization: KEY }), ctx('responses'));
+    const refused = await POST(
+      new Request('http://localhost:3001/v1/embeddings', {
+        method: 'POST',
+        body: payload,
+        headers: { 'content-type': 'application/json', authorization: KEY },
+      }),
+      ctx('embeddings'),
+    );
+
+    expect(accepted.status).toBe(200);
+    expect(refused.status).toBe(413);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toBe('http://orchestrator:8080/v1/responses');
+  });
+
+  it('carry a multipart audio upload byte for byte, boundary and all', async () => {
+    const calls = capture(() => Response.json({ text: 'hello', usage: null }));
+    const form = new FormData();
+    const audio = new Uint8Array(5 * 1024 * 1024);
+    for (let i = 0; i < audio.length; i += 997) audio[i] = i % 251;
+    form.set('model', 'techsara-whisper');
+    form.set('file', new Blob([audio], { type: 'audio/wav' }), 'clip.wav');
+    const source = new Request('http://localhost:3001/v1/audio/transcriptions', {
+      method: 'POST',
+      body: form,
+      headers: { authorization: KEY },
+    });
+    const contentType = source.headers.get('content-type') ?? '';
+    const expected = new Uint8Array(await source.clone().arrayBuffer());
+
+    const res = await POST(source, ctx('audio', 'transcriptions'));
+
+    expect(res.status).toBe(200);
+    expect(contentType.startsWith('multipart/form-data; boundary=')).toBe(true);
+    expect(sentHeaders(calls[0])['content-type']).toBe(contentType);
+    const sent = new Uint8Array(calls[0].init.body as ArrayBuffer);
+    expect(sent.byteLength).toBe(expected.byteLength);
+    expect(Buffer.compare(Buffer.from(sent), Buffer.from(expected))).toBe(0);
+  });
+
+  it('refuse an audio upload over its cap with 413 before the orchestrator is called', async () => {
+    const fetchSpy = vi.fn();
+    vi.stubGlobal('fetch', fetchSpy);
+    vi.stubEnv('PUBLIC_API_MAX_AUDIO_BODY_BYTES', '4096');
+    const form = new FormData();
+    form.set('model', 'techsara-whisper');
+    form.set('file', new Blob([new Uint8Array(8192)], { type: 'audio/wav' }), 'a.wav');
+
+    const res = await POST(
+      new Request('http://localhost:3001/v1/audio/transcriptions', {
+        method: 'POST',
+        body: form,
+        headers: { authorization: KEY },
+      }),
+      ctx('audio', 'transcriptions'),
+    );
+
+    expect(res.status).toBe(413);
+    expect(((await res.json()) as { error: { code: string } }).error.code).toBe('request_too_large');
+    expect(fetchSpy).not.toHaveBeenCalled();
   });
 });
 

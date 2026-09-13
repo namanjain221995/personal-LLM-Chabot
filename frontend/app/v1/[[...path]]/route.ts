@@ -65,7 +65,9 @@
  *   orchestrator owns the timeout that ends a wedged one (§9 `timeout`);
  * · it does not parse, validate or rewrite the body. Validation is stated once,
  *   server-side (§8), and a second copy here would drift and start refusing
- *   requests the API accepts.
+ *   requests the API accepts. A `multipart/form-data` upload
+ *   (`/v1/audio/transcriptions`) crosses with its Content-Type — and so its
+ *   boundary — untouched, for the same reason.
  */
 
 import {
@@ -86,7 +88,27 @@ export const dynamic = 'force-dynamic';
 export const DEFAULT_PUBLIC_API_BODY_BYTES = 1024 * 1024;
 
 /**
- * The body cap, read at call time from the SAME environment variable the
+ * 20 MiB for the two generating routes, since they accept inline images
+ * (2026-09-13, owner request: every model TechSara runs on /v1). The TEXT in
+ * such a request still obeys the 1 MiB rule — that is the orchestrator's
+ * check, made after parsing — so this number only bounds what images add.
+ */
+export const DEFAULT_PUBLIC_API_MEDIA_BODY_BYTES = 20 * 1024 * 1024;
+
+/**
+ * 26 MiB for a transcription upload: a 25 MiB audio file plus room for the
+ * multipart boundaries and form fields (2026-09-13). Equal to the
+ * orchestrator's PUBLIC_API_MAX_AUDIO_BODY_BYTES default.
+ */
+export const DEFAULT_PUBLIC_API_AUDIO_BODY_BYTES = 26 * 1024 * 1024;
+
+function envBytes(name: string, fallback: number): number {
+  const raw = Number(process.env[name] ?? '');
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : fallback;
+}
+
+/**
+ * The JSON body cap, read at call time from the SAME environment variable the
  * orchestrator reads (`PUBLIC_API_MAX_BODY_BYTES`, app/publicapi/models.py
  * `max_body_bytes()`), so a deployment that tightens or loosens the limit
  * moves both halves at once.
@@ -98,10 +120,63 @@ export const DEFAULT_PUBLIC_API_BODY_BYTES = 1024 * 1024;
  * honest wherever it is raised.
  */
 export function publicApiBodyBytes(): number {
-  const raw = Number(process.env.PUBLIC_API_MAX_BODY_BYTES ?? '');
-  return Number.isFinite(raw) && raw > 0
-    ? Math.floor(raw)
-    : DEFAULT_PUBLIC_API_BODY_BYTES;
+  return envBytes('PUBLIC_API_MAX_BODY_BYTES', DEFAULT_PUBLIC_API_BODY_BYTES);
+}
+
+/**
+ * The cap for ONE request, by path (2026-09-13). Three sizes, each read from
+ * the environment variable the orchestrator reads for the same route, so the
+ * edge and the server refuse at the same byte:
+ *
+ *   /v1/audio/transcriptions              PUBLIC_API_MAX_AUDIO_BODY_BYTES  26 MiB
+ *   /v1/responses, /v1/chat/completions   PUBLIC_API_MAX_MEDIA_BODY_BYTES  20 MiB
+ *   everything else                       PUBLIC_API_MAX_BODY_BYTES         1 MiB
+ *
+ * Exact paths only. `/v1/responses/{id}/cancel` has no body worth 20 MiB, and
+ * a prefix match would hand every future route under a generous path the
+ * generous cap without anybody deciding it should have one.
+ */
+export function publicApiBodyBytesFor(parts: string[]): number {
+  const path = parts.join('/');
+  if (path === 'audio/transcriptions') {
+    return envBytes('PUBLIC_API_MAX_AUDIO_BODY_BYTES', DEFAULT_PUBLIC_API_AUDIO_BODY_BYTES);
+  }
+  if (path === 'responses' || path === 'chat/completions') {
+    return envBytes('PUBLIC_API_MAX_MEDIA_BODY_BYTES', DEFAULT_PUBLIC_API_MEDIA_BODY_BYTES);
+  }
+  return publicApiBodyBytes();
+}
+
+/**
+ * The body, bounded, held ONCE when its length is declared.
+ *
+ * `readBoundedBody` gathers chunks and then joins them, so for a moment a
+ * 26 MiB upload is in this process twice. With an honest Content-Length the
+ * final buffer is allocated up front and each chunk is copied straight in:
+ * one copy of the audio, which is the promise the transcription route makes
+ * end to end. A body that runs past its declared length is refused like one
+ * over the cap — the declaration is what the allocation trusted. Without a
+ * declaration (chunked) the bounded reader is used as before.
+ */
+async function readBody(req: Request, limit: number): Promise<Uint8Array | null> {
+  const declared = Number(req.headers.get('content-length') ?? '');
+  if (!req.body || !Number.isFinite(declared) || declared <= 0 || declared > limit) {
+    return readBoundedBody(req, limit);
+  }
+  const buffer = new Uint8Array(declared);
+  const reader = req.body.getReader();
+  let offset = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (offset + value.byteLength > declared) {
+      await reader.cancel().catch(() => undefined);
+      return null;
+    }
+    buffer.set(value, offset);
+    offset += value.byteLength;
+  }
+  return offset === declared ? buffer : buffer.subarray(0, offset);
 }
 
 /* -------------------------------------------------------- the headers -- */
@@ -328,7 +403,7 @@ async function handle(
   const { path } = await ctx.params;
   const { search } = new URL(req.url);
   const upstreamPath = upstreamPathFor(path ?? [], search);
-  const limit = publicApiBodyBytes();
+  const limit = publicApiBodyBytesFor(path ?? []);
 
   let body: ArrayBuffer | undefined;
   if (req.method !== 'GET' && req.method !== 'HEAD' && req.method !== 'OPTIONS') {
@@ -344,12 +419,18 @@ async function handle(
         `The request body is larger than the ${limit} byte limit.`,
       );
     if (declaredBodyOverLimit(req, limit)) return refuse();
-    const read = await readBoundedBody(req, limit);
+    const read = await readBody(req, limit);
     if (read === null) return refuse();
     // The buffer rather than the view, because TypeScript's BodyInit does not
-    // admit a Uint8Array; readBoundedBody allocates it at exactly the body's
-    // length, so the two describe the same bytes.
-    body = read.byteLength > 0 ? (read.buffer as ArrayBuffer) : undefined;
+    // admit a Uint8Array. Both readers allocate it at exactly the body's
+    // length, so the two describe the same bytes — except a short body under
+    // a declared length, whose view is sliced (a copy of what arrived).
+    body =
+      read.byteLength === 0
+        ? undefined
+        : read.byteLength === read.buffer.byteLength
+          ? (read.buffer as ArrayBuffer)
+          : (read.slice().buffer as ArrayBuffer);
   }
 
   let upstream: Response;
